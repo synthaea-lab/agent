@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Shared event types and the Sensor/EventSink contract"
 license.workspace = true
 edition.workspace = true
+publish.workspace = true
 
 [dependencies]
 serde = { workspace = true }

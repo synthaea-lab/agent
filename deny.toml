@@ -27,6 +27,9 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Version-less path dependencies between workspace crates are the normal internal
+# wiring, not the registry-wildcard hazard the deny is for.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

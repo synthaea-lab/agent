@@ -75,6 +75,9 @@ version = "0.1.0"
 [[package]]
 name = "rules"
 version = "0.1.0"
+dependencies = [
+ "schema",
+]
 
 [[package]]
 name = "schema"

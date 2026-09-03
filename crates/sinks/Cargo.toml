@@ -4,5 +4,6 @@ version = "0.1.0"
 description = "Local event outputs: JSONL, syslog/CEF export"
 license.workspace = true
 edition.workspace = true
+publish.workspace = true
 
 [dependencies]

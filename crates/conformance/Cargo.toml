@@ -4,5 +4,6 @@ version = "0.1.0"
 description = "Sensor conformance suite: proves what each platform actually delivers"
 license.workspace = true
 edition.workspace = true
+publish.workspace = true
 
 [dependencies]

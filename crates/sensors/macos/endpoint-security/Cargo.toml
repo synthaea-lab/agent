@@ -4,5 +4,6 @@ version = "0.1.0"
 description = "macOS sensor: EndpointSecurity-based telemetry"
 license.workspace = true
 edition.workspace = true
+publish.workspace = true
 
 [dependencies]

@@ -4,5 +4,6 @@ version = "0.1.0"
 description = "Bounded local state: entity store and event spool"
 license.workspace = true
 edition.workspace = true
+publish.workspace = true
 
 [dependencies]

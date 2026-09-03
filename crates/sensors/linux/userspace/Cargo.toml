@@ -4,5 +4,6 @@ version = "0.1.0"
 description = "Linux sensor: userspace side of the eBPF probes"
 license.workspace = true
 edition.workspace = true
+publish.workspace = true
 
 [dependencies]

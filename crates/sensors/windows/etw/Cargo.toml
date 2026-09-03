@@ -4,5 +4,6 @@ version = "0.1.0"
 description = "Windows sensor: ETW-based telemetry"
 license.workspace = true
 edition.workspace = true
+publish.workspace = true
 
 [dependencies]

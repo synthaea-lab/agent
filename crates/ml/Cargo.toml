@@ -4,5 +4,6 @@ version = "0.1.0"
 description = "On-device ML inference (ONNX) and feature extraction"
 license.workspace = true
 edition.workspace = true
+publish.workspace = true
 
 [dependencies]

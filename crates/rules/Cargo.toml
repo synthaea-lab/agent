@@ -4,5 +4,7 @@ version = "0.1.0"
 description = "Rule engine: stateless and stateful detections"
 license.workspace = true
 edition.workspace = true
+publish.workspace = true
 
 [dependencies]
+schema = { path = "../schema" }

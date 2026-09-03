@@ -7,7 +7,7 @@ its code comes from. Dependency direction between them is enforced by
 
 | Crate | Purpose | Status | Source |
 | --- | --- | --- | --- |
-| `schema` | Event types + `Sensor`/`EventSink` contract — the platform boundary everything depends on | skeleton | migrate from `old/` |
+| `schema` | Event types + `Sensor`/`EventSink` contract — the platform boundary everything depends on | **migrated** | `old/` (PR #40) |
 | `sensors/linux/userspace` | Linux sensor, userspace side (loads/drains eBPF probes) | skeleton | migrate from `old/` |
 | `sensors/linux/ebpf` | Linux kernel probes (eBPF, GPLv2, excluded from workspace) | skeleton | migrate from `old/` |
 | `sensors/linux/audit` | Linux fallback sensor (auditd + fanotify) | skeleton | new development |
@@ -15,7 +15,7 @@ its code comes from. Dependency direction between them is enforced by
 | `sensors/windows/driver` | Windows kernel driver (minifilter, ELAM/PPL) — not a member | planned | new development |
 | `sensors/macos/endpoint-security` | macOS sensor (EndpointSecurity) | skeleton | new development |
 | `sensors/macos/network-extension` | macOS network/DNS sensor (NetworkExtension) | skeleton | new development |
-| `rules` | Rule engine — stateless + stateful detections | skeleton | migrate from `old/` |
+| `rules` | Rule engine — stateless + stateful detections | **migrated** | `old/` (issue #6) |
 | `sigma` | Sigma rule parsing and compilation | skeleton | migrate from `old/` |
 | `correlator` | Correlation + scoring — builds cases from detections | skeleton | migrate from `old/` |
 | `ml` | On-device ONNX inference + feature extraction | skeleton | migrate from `old/` |

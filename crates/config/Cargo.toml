@@ -4,5 +4,6 @@ version = "0.1.0"
 description = "Agent configuration loading and validation"
 license.workspace = true
 edition.workspace = true
+publish.workspace = true
 
 [dependencies]

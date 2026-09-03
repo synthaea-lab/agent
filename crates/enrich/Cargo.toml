@@ -4,5 +4,6 @@ version = "0.1.0"
 description = "Cross-platform enrichment: hashing, code signing, file metadata"
 license.workspace = true
 edition.workspace = true
+publish.workspace = true
 
 [dependencies]
