@@ -30,6 +30,8 @@ fn exec_event(cmdline: &str) -> ExecEvent {
         argv: vec![],
         parent_comm: None,
         parent_image_path: None,
+        sha256: None,
+        signature: None,
     }
 }
 

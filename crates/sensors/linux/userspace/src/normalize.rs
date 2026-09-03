@@ -48,6 +48,8 @@ pub fn exec(event: &wire::ExecEvent, boot_epoch_offset_ns: u64) -> Event {
         // stays None until the probe captures it (capabilities say so honestly).
         parent_comm: None,
         parent_image_path: None,
+        sha256: None,
+        signature: None,
     })
 }
 

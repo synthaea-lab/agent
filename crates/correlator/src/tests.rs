@@ -34,6 +34,8 @@ fn exec_with_meta(meta: EventMeta, image_path: &str) -> Event {
         argv: vec![],
         parent_comm: None,
         parent_image_path: None,
+        sha256: None,
+        signature: None,
     })
 }
 

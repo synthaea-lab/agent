@@ -255,6 +255,8 @@ mod tests {
             argv: vec![],
             parent_comm: None,
             parent_image_path: None,
+            sha256: None,
+            signature: None,
         });
         spool.push(&event).unwrap();
         let got: Vec<Event> = spool.drain_oldest().unwrap();

@@ -11,6 +11,7 @@ schema = { path = "../crates/schema" }
 rules = { path = "../crates/rules" }
 correlator = { path = "../crates/correlator" }
 sigma = { path = "../crates/sigma" }
+enrich = { path = "../crates/enrich" }
 sinks = { path = "../crates/sinks" }
 
 anyhow = "1"

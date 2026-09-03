@@ -51,6 +51,8 @@ fn exec_unix_golden() {
             .into(),
             parent_comm: None,
             parent_image_path: None,
+            sha256: None,
+            signature: None,
         }),
         "exec",
     );
@@ -75,6 +77,8 @@ fn exec_windows_golden() {
             argv: vec![],
             parent_comm: None,
             parent_image_path: None,
+            sha256: None,
+            signature: None,
         }),
         "exec_windows",
     );
@@ -103,6 +107,8 @@ fn exec_lineage_golden() {
             parent_image_path: Some(
                 r"C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE".into(),
             ),
+            sha256: None,
+            signature: None,
         }),
         "exec_lineage",
     );
@@ -150,6 +156,8 @@ fn detection_ml_golden() {
             argv: ["python3", "-c", "print(1)"].map(String::from).into(),
             parent_comm: Some("bash".into()),
             parent_image_path: None,
+            sha256: None,
+            signature: None,
         })],
     };
     let serialized = serde_json::to_value(&detection).unwrap();
@@ -195,6 +203,29 @@ fn connect_v6_golden() {
 }
 
 #[test]
+fn exec_enriched_golden() {
+    assert_golden(
+        &Event::Exec(ExecEvent {
+            meta: EventMeta {
+                pid: 6001,
+                ppid: 700,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_005_000_000_000,
+                comm: "payload".into(),
+            },
+            image_path: "/tmp/payload".into(),
+            cmdline: "/tmp/payload".into(),
+            argv: vec!["/tmp/payload".into()],
+            parent_comm: None,
+            parent_image_path: None,
+            sha256: Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into()),
+            signature: Some(schema::Signature::Unsigned),
+        }),
+        "exec_enriched",
+    );
+}
+
+#[test]
 fn unbounded_cmdline_survives() {
     // Audit F-4: multi-kilobyte encoded command lines must round-trip untouched.
     let long = format!("powershell.exe -EncodedCommand {}", "A".repeat(8 * 1024));
@@ -211,6 +242,8 @@ fn unbounded_cmdline_survives() {
         argv: vec![],
         parent_comm: None,
         parent_image_path: None,
+        sha256: None,
+        signature: None,
     });
     let back: Event = serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
     match &back {
@@ -236,6 +269,8 @@ fn meta_accessor_covers_all_variants() {
             argv: vec![],
             parent_comm: None,
             parent_image_path: None,
+            sha256: None,
+            signature: None,
         }),
         Event::FileOpen(FileOpenEvent {
             meta: meta.clone(),

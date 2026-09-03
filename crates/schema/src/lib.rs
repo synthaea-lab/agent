@@ -96,6 +96,28 @@ pub struct ExecEvent {
     /// EndpointSecurity provide it; eBPF may only have the parent `comm`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_image_path: Option<String>,
+    /// SHA-256 of the executed image, filled by the agent's enrichment stage (not by
+    /// sensors) — the join key for IOC hash matching and fleet-level correlation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Code-signature verdict for the executed image, filled by enrichment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
+}
+
+/// Code-signature verdict (Authenticode on Windows, codesign on macOS; Linux has no
+/// standard equivalent and reports `Unsupported`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Signature {
+    /// Signed and the chain verified.
+    Valid,
+    /// Signed but verification failed (broken chain, revoked, tampered).
+    Invalid,
+    /// No signature present.
+    Unsigned,
+    /// The platform has no signature scheme, or verification errored.
+    Unsupported,
 }
 
 /// File open/create.

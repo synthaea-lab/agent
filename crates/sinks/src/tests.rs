@@ -21,6 +21,8 @@ fn exec_event(comm: &str, cmdline: &str) -> Event {
         argv: vec![],
         parent_comm: None,
         parent_image_path: None,
+        sha256: None,
+        signature: None,
     })
 }
 

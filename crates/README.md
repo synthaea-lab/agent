@@ -22,7 +22,7 @@ its code comes from. Dependency direction between them is enforced by
 | `ml` | On-device ONNX inference + feature extraction | skeleton | migrate from `old/` |
 | `yara` | YARA-X file and memory scanning, feeding detections to the correlator | skeleton | new development |
 | `intel` | IOC matching: hash/IP/domain indicator sets, canary-ring distributed | skeleton | new development |
-| `enrich` | Cross-platform enrichment: hashing, code signing, file metadata | skeleton | new development |
+| `enrich` | Cross-platform enrichment: cached SHA-256 + code-signature verdicts | **built** | issue #16 |
 | `policy` | Policy model shared by agent and control plane (versioned, signed) | skeleton | new development |
 | `config` | Local agent configuration loading and validation | skeleton | new development |
 | `store` | Bounded local state: LRU-bounded maps (BoundedMap) + durable event spool | **built** | issue #15 |

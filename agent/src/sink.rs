@@ -20,6 +20,8 @@ pub(crate) struct DetectionSink {
     /// folder exists — otherwise the agent runs without a Sigma engine, and that is
     /// not an error (the load failure path IS an error: content present but broken).
     sigma: Option<sigma::SigmaEngine>,
+    /// Hash + code-signature enrichment, cached by (path, mtime, size).
+    enricher: Mutex<enrich::Enricher>,
     /// One alert per line in alerts.ndjson.
     alert_log: JsonlWriter,
     /// Raw event log (one normalized event per line) for calibration/ML training.
@@ -38,6 +40,7 @@ impl DetectionSink {
             rule_state: Mutex::new(rule_state),
             correlator: Mutex::new(correlator::CorrelationEngine::new()),
             sigma: load_sigma_rules(),
+            enricher: Mutex::new(enrich::Enricher::new()),
             alert_log: JsonlWriter::open(alerts_path)?,
             events_log: JsonlWriter::open(events_path)?,
         })
@@ -83,7 +86,22 @@ fn now_epoch_ns() -> u64 {
 }
 
 impl EventSink for DetectionSink {
-    fn on_event(&self, event: Event) {
+    fn on_event(&self, mut event: Event) {
+        // Enrichment first, so the logged event and every engine see hash+signature.
+        // Budgeted: cache hit is a stat; miss is one bounded hash + one offline
+        // signature check (see crates/enrich docs).
+        if let Event::Exec(e) = &mut event
+            && !e.image_path.is_empty()
+            && e.sha256.is_none()
+        {
+            let enrichment = self
+                .enricher
+                .lock()
+                .unwrap()
+                .enrich(std::path::Path::new(&e.image_path));
+            e.sha256 = enrichment.sha256;
+            e.signature = Some(enrichment.signature);
+        }
         self.events_log.write(&event);
         let mut alerts = Vec::new();
         for alert in self.correlator.lock().unwrap().on_event(event.clone()) {
