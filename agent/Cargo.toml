@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 schema = { path = "../crates/schema" }
 rules = { path = "../crates/rules" }
+correlator = { path = "../crates/correlator" }
 sinks = { path = "../crates/sinks" }
 
 anyhow = "1"

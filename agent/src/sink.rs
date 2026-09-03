@@ -15,6 +15,7 @@ use sinks::{AlertRecord, JsonlWriter};
 /// if several sensors ever share one sink.
 pub(crate) struct DetectionSink {
     rule_state: Mutex<rules::RuleState>,
+    correlator: Mutex<correlator::CorrelationEngine>,
     /// One alert per line in alerts.ndjson.
     alert_log: JsonlWriter,
     /// Raw event log (one normalized event per line) for calibration/ML training.
@@ -31,6 +32,7 @@ impl DetectionSink {
     ) -> std::io::Result<Self> {
         Ok(Self {
             rule_state: Mutex::new(rule_state),
+            correlator: Mutex::new(correlator::CorrelationEngine::new()),
             alert_log: JsonlWriter::open(alerts_path)?,
             events_log: JsonlWriter::open(events_path)?,
         })
@@ -60,6 +62,9 @@ impl EventSink for DetectionSink {
     fn on_event(&self, event: Event) {
         self.events_log.write(&event);
         let mut alerts = Vec::new();
+        for alert in self.correlator.lock().unwrap().on_event(event.clone()) {
+            self.emit(alert.technique, &alert.message);
+        }
         match &event {
             Event::Exec(e) => {
                 alerts.extend(rules::evaluate_exec(e));

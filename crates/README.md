@@ -18,7 +18,7 @@ its code comes from. Dependency direction between them is enforced by
 | `sensors/macos/network-extension` | macOS network/DNS sensor (NetworkExtension) | skeleton | new development |
 | `rules` | Rule engine — stateless + stateful detections | **migrated** | `old/` (issue #6) |
 | `sigma` | Sigma rule parsing and compilation | **migrated** | `old/` (issue #11) |
-| `correlator` | Correlation + scoring — builds cases from detections | skeleton | migrate from `old/` |
+| `correlator` | Correlation + scoring — builds cases from detections | **migrated** | `old/` (issue #12) |
 | `ml` | On-device ONNX inference + feature extraction | skeleton | migrate from `old/` |
 | `yara` | YARA-X file and memory scanning, feeding detections to the correlator | skeleton | new development |
 | `enrich` | Cross-platform enrichment: hashing, code signing, file metadata | skeleton | new development |

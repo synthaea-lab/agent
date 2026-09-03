@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "correlator",
  "env_logger",
  "libc",
  "log",
@@ -346,6 +347,9 @@ version = "0.1.0"
 [[package]]
 name = "correlator"
 version = "0.1.0"
+dependencies = [
+ "schema",
+]
 
 [[package]]
 name = "crc32fast"
@@ -499,11 +503,6 @@ dependencies = [
 [[package]]
 name = "ml"
 version = "0.1.0"
-dependencies = [
- "schema",
- "serde_json",
- "thiserror",
-]
 
 [[package]]
 name = "num_enum"

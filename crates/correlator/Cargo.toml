@@ -1,9 +1,10 @@
 [package]
 name = "correlator"
 version = "0.1.0"
-description = "Temporal correlation and scoring — builds cases from detections"
+description = "Temporal correlation and scoring: co-occurrence rules and Bayesian belief per entity"
 license.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+schema = { path = "../schema" }
