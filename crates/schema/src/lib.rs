@@ -1,11 +1,131 @@
 //! # schema
 //!
-//! The platform boundary of the agent. Defines:
+//! The platform boundary of the agent: the normalized event model shared by every
+//! sensor, the rule engine, the correlator, and the ML feature extractors, plus the
+//! [`sensor`] contract every platform sensor implements.
 //!
-//! - The internal event model (process, file, network, registry, ...) shared by every
-//!   sensor, the rule engine, the correlator, and the ML feature extractors.
-//! - The `Sensor` / `EventSink` contract that every platform sensor implements.
-//! - Schema versioning rules for exporters.
+//! ## Semi-frozen API
 //!
-//! This crate must stay platform-agnostic and dependency-light: everything else in the
-//! workspace depends on it. To be migrated from `old/crates/synthaea-schema`.
+//! Every crate in the workspace depends on this one. Changes to public types ripple
+//! everywhere and need explicit justification in review — prefer additive changes
+//! (new fields with serde defaults, new [`Event`] variants) over reshaping what exists.
+//! Any change visible in serialization bumps [`SCHEMA_VERSION`] and adds a new
+//! `tests/fixtures/v<N>/` directory; existing fixture files are never edited.
+//!
+//! ## What this crate is not
+//!
+//! Not the wire format. Sensors normalize their platform's native representation into
+//! these types; fixed-size `repr(C)` structs for the eBPF ring buffer live with the
+//! Linux sensor pair (`sensors/linux`), ETW layouts with `sensors/windows/etw`. The
+//! old iteration let the eBPF wire format (fixed 256-byte buffers, `TASK_COMM_LEN`)
+//! define the shared model; that is deliberately undone here — command lines and paths
+//! are unbounded owned strings (Windows encoded-PowerShell command lines run to
+//! kilobytes), and user identity is per-platform instead of a bare Unix uid.
+
+use serde::{Deserialize, Serialize};
+
+pub mod sensor;
+
+/// Version of the serialized event model. Bumped on any serialization-visible change,
+/// together with a new golden-fixture directory (see crate docs).
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// Identity of the user a process runs as, per platform.
+///
+/// A bare `uid: u32` cannot represent Windows (audit finding F-3: SYSTEM spawning
+/// `cmd.exe` and a standard user doing the same were the same event). `Unknown` is for
+/// sensors that genuinely cannot attribute (they should say so in their capabilities,
+/// not fabricate a value).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "os", rename_all = "snake_case")]
+pub enum User {
+    Unix {
+        uid: u32,
+        gid: u32,
+    },
+    Windows {
+        /// String SID (e.g. `S-1-5-18`).
+        sid: String,
+        /// Integrity level RID (e.g. 0x2000 medium, 0x3000 high, 0x4000 system),
+        /// when the sensor can read the token.
+        integrity_level: Option<u32>,
+    },
+    Unknown,
+}
+
+/// Metadata common to every event: identity of the emitting process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventMeta {
+    pub pid: u32,
+    /// Parent PID — essential for most detections (process-tree rules).
+    pub ppid: u32,
+    pub user: User,
+    /// Nanoseconds since the UNIX epoch. Sensors normalize their platform clock
+    /// (boot-relative eBPF timestamps, ETW FILETIME) before emitting.
+    pub timestamp_ns: u64,
+    /// Short process name (Linux `comm`, image basename elsewhere). Unbounded here;
+    /// platform truncation (e.g. the kernel's 15 bytes for `comm`) is a sensor
+    /// property reported by conformance, not a schema limit.
+    pub comm: String,
+}
+
+/// Process execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecEvent {
+    pub meta: EventMeta,
+    /// Full path of the executed image, as the platform reports it (normalized to a
+    /// drive-letter path on Windows — audit F-5).
+    pub image_path: String,
+    /// The command line as one string, unbounded (audit F-1/F-4: this field is what
+    /// the base64 rule, encoded-PowerShell Sigma rules, and the ML cmdline features
+    /// evaluate — it must never be a truncated placeholder for the image path).
+    pub cmdline: String,
+    /// Argument vector where the platform provides one (Unix execve). Empty on
+    /// platforms that only have a flat command line (Windows); consumers fall back
+    /// to [`ExecEvent::cmdline`].
+    pub argv: Vec<String>,
+}
+
+/// File open/create.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileOpenEvent {
+    pub meta: EventMeta,
+    pub path: String,
+    /// Platform-native open/access flags (Linux `open(2)` flags, Windows create
+    /// dispositions). Rules match primarily on `path`; flag interpretation is
+    /// per-platform and documented by each sensor.
+    pub flags: u32,
+}
+
+/// Outbound network connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectEvent {
+    pub meta: EventMeta,
+    /// Destination address, v4 or v6 (audit F-7: v6 is first-class, not an unset flag).
+    pub daddr: core::net::IpAddr,
+    pub dport: u16,
+}
+
+/// The normalized event envelope.
+///
+/// `#[non_exhaustive]`: new telemetry categories (registry, DNS, image load, ...) are
+/// added as variants without breaking sinks — consumers must have a fall-through arm
+/// and treat unknown categories as "not for me".
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Event {
+    Exec(ExecEvent),
+    FileOpen(FileOpenEvent),
+    Connect(ConnectEvent),
+}
+
+impl Event {
+    pub fn meta(&self) -> &EventMeta {
+        match self {
+            Event::Exec(e) => &e.meta,
+            Event::FileOpen(e) => &e.meta,
+            Event::Connect(e) => &e.meta,
+        }
+    }
+}
