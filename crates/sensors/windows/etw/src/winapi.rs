@@ -66,11 +66,43 @@ pub(crate) fn read_process_cmdline(pid: u32) -> Option<String> {
     }
 }
 
+/// PEB (x64): `ProcessParameters` pointer offset.
+const PEB_PROCESS_PARAMETERS: usize = 0x20;
+/// `RTL_USER_PROCESS_PARAMETERS` (x64): `CommandLine` `UNICODE_STRING` offset
+/// (`Length: u16`, `MaximumLength: u16`, pad, `Buffer: *mut u16` at +0x8).
+const PARAMS_CMDLINE_LENGTH: usize = 0x70;
+const PARAMS_CMDLINE_BUFFER: usize = 0x78;
+
+/// Reads one plain-old-data value out of the target's address space.
+///
+/// # Safety
+///
+/// `T` must be valid for any bit pattern (used here with `usize` and `u16`);
+/// `addr` is only ever passed to the kernel as a remote address, never
+/// dereferenced locally.
+unsafe fn read_remote<T: Copy>(handle: HANDLE, addr: usize) -> Option<T> {
+    // SAFETY: the destination is a local zeroed T and the length is exactly
+    // size_of::<T>(); the return code is checked.
+    unsafe {
+        let mut value: T = core::mem::zeroed();
+        if ReadProcessMemory(
+            handle,
+            addr as *const _,
+            (&mut value as *mut T).cast(),
+            size_of::<T>(),
+            core::ptr::null_mut(),
+        ) == 0
+        {
+            return None;
+        }
+        Some(value)
+    }
+}
+
+/// The PEB walk: `PEB → ProcessParameters → CommandLine{Length, Buffer}`.
 unsafe fn read_cmdline_from_handle(handle: HANDLE) -> Option<String> {
-    // SAFETY: every ReadProcessMemory call passes a valid destination pointer
-    // with a matching length, checks the return code, and the final read is
-    // bounded by the UNICODE_STRING's own u16 length; pointers read from the
-    // target's PEB are used only as remote addresses, never dereferenced locally.
+    // SAFETY: NtQueryInformationProcess writes into a local zeroed struct of the
+    // exact size passed; remote pointers flow only through read_remote.
     unsafe {
         let mut pbi: ProcessBasicInformation = core::mem::zeroed();
         let mut ret_len = 0u32;
@@ -86,45 +118,18 @@ unsafe fn read_cmdline_from_handle(handle: HANDLE) -> Option<String> {
         {
             return None;
         }
+        let peb = pbi.peb_base_address as usize;
 
-        // PEB (x64): ProcessParameters pointer at offset 0x20.
-        let mut params_ptr: usize = 0;
-        if ReadProcessMemory(
-            handle,
-            (pbi.peb_base_address as usize + 0x20) as *const _,
-            (&mut params_ptr as *mut usize).cast(),
-            size_of::<usize>(),
-            core::ptr::null_mut(),
-        ) == 0
-            || params_ptr == 0
-        {
+        let params: usize = read_remote(handle, peb + PEB_PROCESS_PARAMETERS)?;
+        if params == 0 {
             return None;
         }
-
-        // RTL_USER_PROCESS_PARAMETERS (x64): CommandLine UNICODE_STRING at 0x70
-        // (Length: u16, MaximumLength: u16, pad, Buffer: *mut u16 at +0x8).
-        let mut len_bytes: u16 = 0;
-        if ReadProcessMemory(
-            handle,
-            (params_ptr + 0x70) as *const _,
-            (&mut len_bytes as *mut u16).cast(),
-            2,
-            core::ptr::null_mut(),
-        ) == 0
-            || len_bytes == 0
-        {
+        let len_bytes: u16 = read_remote(handle, params + PARAMS_CMDLINE_LENGTH)?;
+        if len_bytes == 0 {
             return None;
         }
-        let mut buf_ptr: usize = 0;
-        if ReadProcessMemory(
-            handle,
-            (params_ptr + 0x78) as *const _,
-            (&mut buf_ptr as *mut usize).cast(),
-            size_of::<usize>(),
-            core::ptr::null_mut(),
-        ) == 0
-            || buf_ptr == 0
-        {
+        let buf_ptr: usize = read_remote(handle, params + PARAMS_CMDLINE_BUFFER)?;
+        if buf_ptr == 0 {
             return None;
         }
 
@@ -132,6 +137,7 @@ unsafe fn read_cmdline_from_handle(handle: HANDLE) -> Option<String> {
         // the UNICODE_STRING's own u16 length (64KB), which is the OS's bound.
         let n_u16 = (len_bytes as usize) / 2;
         let mut wide = vec![0u16; n_u16];
+        // SAFETY: the destination buffer holds exactly len_bytes bytes.
         if ReadProcessMemory(
             handle,
             buf_ptr as *const _,
