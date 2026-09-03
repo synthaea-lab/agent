@@ -24,6 +24,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod detection;
 pub mod sensor;
 
 /// Version of the serialized event model. Bumped on any serialization-visible change,
@@ -84,6 +85,17 @@ pub struct ExecEvent {
     /// platforms that only have a flat command line (Windows); consumers fall back
     /// to [`ExecEvent::cmdline`].
     pub argv: Vec<String>,
+    /// Parent process short name, captured by the sensor *at exec time*. Lineage is a
+    /// first-class detection input (parent→child transition rarity, ancestry
+    /// features — see "Behavior over time" in `docs/detection/ml.md`); sensors that
+    /// can attribute the parent fill this rather than leaving consumers to join on
+    /// `meta.ppid` later, which races against pid reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_comm: Option<String>,
+    /// Full image path of the parent, where the platform resolves it (ETW and
+    /// EndpointSecurity provide it; eBPF may only have the parent `comm`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_image_path: Option<String>,
 }
 
 /// File open/create.

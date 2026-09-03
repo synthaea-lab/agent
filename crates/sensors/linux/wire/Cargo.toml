@@ -1,0 +1,9 @@
+[package]
+name = "sensor-linux-wire"
+version = "0.1.0"
+description = "Ring-buffer wire format shared by the Linux eBPF probes and their userspace loader"
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]

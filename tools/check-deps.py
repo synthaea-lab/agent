@@ -26,6 +26,7 @@ DETECTION = {"rules", "sigma", "correlator", "ml", "yara", "enrich"}
 LEAF = {"response", "transport", "ipc", "sinks", "updater", "config", "store",
         "conformance"}
 BINARIES = {"agent", "watchdog", "cli"}
+WIRE_CRATES = {"sensor-linux-wire"}
 
 
 def allowed(crate: str) -> set[str] | None:
@@ -37,7 +38,9 @@ def allowed(crate: str) -> set[str] | None:
     if crate == "policy":
         return {SCHEMA}
     if crate.startswith("sensor-"):
-        return {SCHEMA}
+        # A platform's wire crate (its kernel<->userspace ABI) is shared within that
+        # platform's sensor pair — e.g. sensor-linux -> sensor-linux-wire.
+        return {SCHEMA} | {c for c in WIRE_CRATES if crate.startswith(c.removesuffix("-wire"))}
     if crate in DETECTION:
         return BASE | DETECTION | {"store"}
     if crate in LEAF:

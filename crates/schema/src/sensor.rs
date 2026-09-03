@@ -27,6 +27,9 @@ pub struct Capabilities {
     /// True when emitted events carry real user attribution ([`crate::User`] not
     /// `Unknown`).
     pub user_attribution: bool,
+    /// True when exec events carry parent lineage
+    /// ([`crate::ExecEvent::parent_comm`] / `parent_image_path`).
+    pub parent_lineage: bool,
 }
 
 /// Receives the normalized events produced by a [`Sensor`], whatever the platform.

@@ -28,6 +28,8 @@ fn exec_event(cmdline: &str) -> ExecEvent {
         image_path: String::new(),
         cmdline: cmdline.to_string(),
         argv: vec![],
+        parent_comm: None,
+        parent_image_path: None,
     }
 }
 

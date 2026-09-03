@@ -18,6 +18,7 @@ members = [
     "crates/policy",
     "crates/config",
     "crates/store",
+    "crates/sensors/linux/wire",
     "crates/sensors/linux/userspace",
     "crates/sensors/linux/audit",
     "crates/sensors/windows/etw",

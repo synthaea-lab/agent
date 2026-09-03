@@ -1,0 +1,24 @@
+# Excluded from the workspace (see the root Cargo.toml): targets bpfel-unknown-none
+# and is compiled by the userspace crate's build.rs via aya-build (nightly rustc +
+# bpf-linker required — lab/provisioning/linux-toolchain.sh installs them).
+[package]
+name = "sensor-linux-ebpf"
+version = "0.1.0"
+description = "Linux kernel probes (eBPF): exec, file open, connect tracepoints"
+# The in-kernel license string is "Dual MIT/GPL" (see main.rs) — GPL-compatible, as
+# required by the verifier for most helpers. A kernel constraint, not a preference.
+license = "GPL-2.0-only OR MIT"
+edition = "2024"
+publish = false
+
+[dependencies]
+sensor-linux-wire = { path = "../wire" }
+aya-ebpf = { version = "0.2.1", default-features = false }
+aya-log-ebpf = { version = "0.2.0", default-features = false }
+
+[build-dependencies]
+which = { version = "6.0.0", default-features = false }
+
+[[bin]]
+name = "sensor-linux-ebpf"
+path = "src/main.rs"

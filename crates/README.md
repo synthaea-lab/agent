@@ -8,8 +8,9 @@ its code comes from. Dependency direction between them is enforced by
 | Crate | Purpose | Status | Source |
 | --- | --- | --- | --- |
 | `schema` | Event types + `Sensor`/`EventSink` contract — the platform boundary everything depends on | **migrated** | `old/` (PR #40) |
-| `sensors/linux/userspace` | Linux sensor, userspace side (loads/drains eBPF probes) | skeleton | migrate from `old/` |
-| `sensors/linux/ebpf` | Linux kernel probes (eBPF, GPLv2, excluded from workspace) | skeleton | migrate from `old/` |
+| `sensors/linux/wire` | Ring-buffer ABI shared by the Linux probes and loader | **migrated** | `old/` schema wire structs (issue #4) |
+| `sensors/linux/userspace` | Linux sensor, userspace side (loads/drains eBPF probes, normalizes) | **migrated** | `old/` (issue #5) |
+| `sensors/linux/ebpf` | Linux kernel probes (eBPF, excluded from workspace) | **migrated** | `old/` (issue #4) |
 | `sensors/linux/audit` | Linux fallback sensor (auditd + fanotify) | skeleton | new development |
 | `sensors/windows/etw` | Windows sensor (ETW; cmdline, registry, DNS, AMSI, ... per audit) | skeleton | migrate from `old/` |
 | `sensors/windows/driver` | Windows kernel driver (minifilter, ELAM/PPL) — not a member | planned | new development |
