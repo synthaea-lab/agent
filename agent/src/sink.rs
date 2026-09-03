@@ -177,3 +177,65 @@ impl EventSink for DetectionSink {
         }
     }
 }
+
+// ── BaselineSink ──────────────────────────────────────────────────────────────
+
+/// Minimal sink for ML baseline capture: records only the cmdlines of exec events
+/// that trigger NO deterministic rule — the "known benign under current rules"
+/// corpus consumed by `synthaea_ml` training. Migrated from the old agent's
+/// BaselineSink, now platform-neutral (any sensor speaking the contract feeds it).
+pub(crate) struct BaselineSink {
+    rule_state: Mutex<rules::RuleState>,
+    out: JsonlWriter,
+    count: std::sync::atomic::AtomicU64,
+}
+
+/// One baseline record — the format `synthaea_ml/training` consumes.
+#[derive(serde::Serialize)]
+struct BaselineRecord<'a> {
+    cmdline: &'a str,
+}
+
+impl BaselineSink {
+    pub(crate) fn new(
+        rule_state: rules::RuleState,
+        output: &std::path::Path,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            rule_state: Mutex::new(rule_state),
+            out: JsonlWriter::open(output)?,
+            count: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+}
+
+impl EventSink for BaselineSink {
+    fn on_event(&self, event: Event) {
+        match &event {
+            Event::Exec(e) => {
+                // Evaluate the deterministic rules — alerting cmdlines are excluded
+                // from the baseline (they are exactly what the model must not learn
+                // as normal).
+                let det_alerts = rules::evaluate_exec(e);
+                let state_alerts = self.rule_state.lock().unwrap().on_exec(e);
+                if !det_alerts.is_empty() || !state_alerts.is_empty() {
+                    return;
+                }
+                self.out.write(&BaselineRecord {
+                    cmdline: &e.cmdline,
+                });
+                let n = self
+                    .count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                if n.is_multiple_of(10) {
+                    eprintln!("[baseline] {n} cmdlines captured...");
+                }
+            }
+            // File events feed the stateful rules' history (download tracking) so
+            // exclusion decisions stay accurate; connects are irrelevant here.
+            Event::FileOpen(e) => self.rule_state.lock().unwrap().on_file_open(e),
+            _ => {}
+        }
+    }
+}

@@ -25,6 +25,7 @@ dependencies = [
  "rules",
  "schema",
  "sensor-linux",
+ "serde",
  "sigma",
  "sinks",
  "yara",

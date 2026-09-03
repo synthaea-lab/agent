@@ -36,6 +36,14 @@ enum Command {
         #[arg(long, default_value = "events.jsonl")]
         events: std::path::PathBuf,
     },
+    /// Captures a baseline of healthy activity to train the ML models: records the
+    /// command lines of exec events that trigger no deterministic rule, as
+    /// JSON-Lines consumable by synthaea_ml training. Run ~10 min on a clean host.
+    CaptureBaseline {
+        /// JSON-Lines output file.
+        #[arg(long, default_value = "baseline_capture.jsonl")]
+        output: std::path::PathBuf,
+    },
     /// Raw capture of all events as JSON-Lines, without evaluating any rules —
     /// feeds ML baseline/calibration work.
     CaptureEvents {
@@ -51,6 +59,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Status => commands::cmd_status(),
         Command::Run { alerts, events } => commands::cmd_run(&alerts, &events),
+        Command::CaptureBaseline { output } => commands::cmd_capture_baseline(&output),
         Command::CaptureEvents { output } => commands::cmd_capture_events(&output),
     }
 }
