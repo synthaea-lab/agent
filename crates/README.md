@@ -27,7 +27,7 @@ its code comes from. Dependency direction between them is enforced by
 | `response` | Response actions — kill, quarantine, isolate | skeleton | new development |
 | `transport` | Agent ↔ control-plane comms — mTLS, store-and-forward | skeleton | new development |
 | `ipc` | Local IPC: agent ↔ endpoint UI/CLI (named pipe / Unix socket) | skeleton | new development |
-| `sinks` | Local outputs: JSONL, syslog/CEF export | skeleton | migrate from `old/agent` |
+| `sinks` | Local outputs: JSONL, syslog/CEF export | **migrated** | `old/agent` (issue #7) |
 | `updater` | Agent self-update + content/model distribution client (canary rings) | skeleton | new development |
 | `conformance` | Sensor conformance suite — generates the capability matrix | skeleton | new development |
 

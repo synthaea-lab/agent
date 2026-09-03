@@ -157,6 +157,11 @@ version = "0.1.0"
 [[package]]
 name = "sinks"
 version = "0.1.0"
+dependencies = [
+ "schema",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "store"

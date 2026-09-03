@@ -1,9 +1,12 @@
 [package]
 name = "sinks"
 version = "0.1.0"
-description = "Local event outputs: JSONL, syslog/CEF export"
+description = "Local event outputs: JSONL today, syslog/CEF as follow-up sinks"
 license.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+schema = { path = "../schema" }
+serde = { workspace = true }
+serde_json = { workspace = true }
