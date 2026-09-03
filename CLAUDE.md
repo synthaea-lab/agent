@@ -4,9 +4,11 @@ Multi-platform EDR/XDR (Windows/Linux/macOS) with on-device ML. Rust agent works
 Python training pipeline (`ml/`) + control plane (`server/`: Next.js + PostgreSQL, ADR-0001).
 Everything — code, comments, docs, commits — is in **English**.
 
-The previous iteration lives untracked in `old/`. Code is migrated from it crate by crate,
-**with its tests**, after review — never copied wholesale. Docs are written fresh, not
-copied (`docs/README.md` has the index).
+The previous iteration lived in a local `old/` clone during migration (now deleted; its
+history and final working-tree translations are on github.com/synthaea-lab/edr, branch
+`pre-migration-translations` — the source for the remaining #20/#67 migrations).
+`old/...` paths in code comments are historical provenance. Docs are written fresh,
+never copied (`docs/README.md` has the index).
 
 ## Dependency direction (enforced by `tools/check-deps.py`, run in CI)
 
