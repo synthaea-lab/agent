@@ -1,9 +1,11 @@
 //! `watchdog` — kill resistance for the agent. Migrated from `old/watchdog`.
 //!
-//! Three CLI subcommands:
-//!   install   — installs the watchdog as a system service (systemd / SC Manager) with auto-restart
+//! Four CLI subcommands:
+//!   install   — installs the watchdog as a system service with auto-restart
 //!   uninstall — uninstalls the service
-//!   run       — pure-Rust supervision loop (fallback without service rights, or SCM service mode)
+//!   status    — shows the service state as the platform's service manager sees it
+//!   run       — pure-Rust supervision loop (service entry point, or fallback without
+//!               service rights)
 //!
 //! Kill resistance is the same two layers on every OS: the service manager runs the
 //! watchdog (never the agent directly), and the watchdog's supervision loop spawns and
@@ -12,6 +14,10 @@
 //!   Windows: the watchdog is the Windows service; `sc failure` restart policy. (sc stop)
 //!   Linux  : systemd unit with `Restart=always RestartSec=5s`.  (systemctl stop)
 //!   macOS  : launchd daemon with `KeepAlive`.                   (launchctl bootout)
+//!
+//! On Unix a stop request arrives as SIGTERM (systemd stop, launchctl bootout); the
+//! watchdog traps it, kills the agent, and exits — the same clean-stop semantics the
+//! Windows SCM control handler provides.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -19,7 +25,7 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use clap::{Parser, Subcommand};
 
-// The service constants are consumed by the Windows/SCM and Linux/systemd arms only.
+// The service constants are consumed by the platform service arms.
 #[cfg_attr(not(windows), allow(dead_code))]
 const SERVICE_NAME: &str = "SynthaEDR";
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -66,8 +72,11 @@ enum Command {
     /// Stops and uninstalls the service.
     Uninstall,
 
+    /// Shows the service state as the platform's service manager sees it.
+    Status,
+
     /// Direct supervision loop — respawns the agent if dead.
-    /// Also used as the entry point when the watchdog is launched by the Windows SCM.
+    /// Also the entry point when launched by the service manager.
     Run {
         /// Path to the agent binary (default: same folder as this binary).
         #[arg(long)]
@@ -181,6 +190,7 @@ fn watchdog_loop(
         loop {
             if stop_flag.load(Ordering::SeqCst) {
                 let _ = child.kill();
+                let _ = child.wait();
                 return;
             }
             match child.try_wait() {
@@ -206,9 +216,10 @@ fn watchdog_loop(
     }
 }
 
-// ── Subcommand: run (CLI fallback, no SCM) ────────────────────────────────────
+// ── Subcommand: run (service entry point on Unix, CLI fallback everywhere) ────
 
 fn cmd_run(agent_bin: Option<PathBuf>, alerts: PathBuf, restart_delay: u64) -> anyhow::Result<()> {
+    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
     let agent = resolve_agent_bin(agent_bin)?;
@@ -219,10 +230,49 @@ fn cmd_run(agent_bin: Option<PathBuf>, alerts: PathBuf, restart_delay: u64) -> a
         agent.display(),
         alerts.display()
     );
-    eprintln!("[watchdog] Ctrl+C to stop the watchdog (the agent will be stopped too)");
 
-    let stop = AtomicBool::new(false);
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Unix clean stop: systemd stop / launchctl bootout / Ctrl+C set the flag,
+    // the loop kills the agent and exits — the same semantics the Windows SCM
+    // control handler provides.
+    #[cfg(unix)]
+    for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        signal_hook::flag::register(sig, stop.clone())
+            .with_context(|| format!("registering handler for signal {sig}"))?;
+    }
+    eprintln!("[watchdog] Ctrl+C / SIGTERM stops the watchdog (the agent will be stopped too)");
+
     watchdog_loop(&agent, &alerts, restart_delay, &stop);
+    eprintln!("[watchdog] stopped.");
+    Ok(())
+}
+
+// ── Subcommand: status ────────────────────────────────────────────────────────
+
+/// Shows the service manager's view. The query command's own exit code is
+/// informational (a stopped or absent service is a valid answer, not an error).
+fn cmd_status() -> anyhow::Result<()> {
+    let (program, args): (&str, &[&str]) = if cfg!(windows) {
+        ("sc", &["query", SERVICE_NAME])
+    } else if cfg!(target_os = "linux") {
+        (
+            "systemctl",
+            &["status", "synthaea-agent.service", "--no-pager"],
+        )
+    } else if cfg!(target_os = "macos") {
+        ("launchctl", &["print", "system/com.synthaea.agent"])
+    } else {
+        bail!("status is only supported on Windows, Linux, and macOS")
+    };
+
+    let status = std::process::Command::new(program)
+        .args(args)
+        .status()
+        .with_context(|| format!("cannot launch {program}"))?;
+    if !status.success() {
+        println!("[watchdog] service not running or not installed ({program} exited {status}).");
+    }
     Ok(())
 }
 
@@ -350,7 +400,7 @@ fn cmd_install(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Result<()
 
     println!("[watchdog] service \"{SERVICE_NAME}\" installed and started.");
     println!("  Alerts: {}", out_abs.display());
-    println!("  Check: sc query {SERVICE_NAME}");
+    println!("  Check: watchdog status");
     println!("  Uninstall: watchdog uninstall");
     Ok(())
 }
@@ -422,7 +472,7 @@ fn cmd_install(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Result<()
 
     println!("[watchdog] systemd service installed and started.");
     println!("  Alerts: {}", alerts_abs.display());
-    println!("  Check: systemctl status synthaea-agent");
+    println!("  Check: watchdog status");
     println!(
         "  Logs : journalctl -u synthaea-agent -f (watchdog); agent output in {}",
         child_log_path()
@@ -465,8 +515,14 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// The daemon runs the watchdog (layer 2), which supervises the agent (layer 1) —
+/// same shape as the Windows SCM service and the systemd unit.
 #[cfg(target_os = "macos")]
-fn launchd_plist(agent: &std::path::Path, alerts: &std::path::Path) -> String {
+fn launchd_plist(
+    watchdog: &std::path::Path,
+    agent: &std::path::Path,
+    alerts: &std::path::Path,
+) -> String {
     let work_dir = agent.parent().unwrap_or_else(|| std::path::Path::new("/"));
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -477,8 +533,10 @@ fn launchd_plist(agent: &std::path::Path, alerts: &std::path::Path) -> String {
     <string>{label}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{agent}</string>
+        <string>{watchdog}</string>
         <string>run</string>
+        <string>--agent-bin</string>
+        <string>{agent}</string>
         <string>--alerts</string>
         <string>{alerts}</string>
     </array>
@@ -491,13 +549,14 @@ fn launchd_plist(agent: &std::path::Path, alerts: &std::path::Path) -> String {
     <key>ThrottleInterval</key>
     <integer>5</integer>
     <key>StandardOutPath</key>
-    <string>/var/log/synthaea-agent.log</string>
+    <string>/var/log/synthaea-watchdog.log</string>
     <key>StandardErrorPath</key>
-    <string>/var/log/synthaea-agent.log</string>
+    <string>/var/log/synthaea-watchdog.log</string>
 </dict>
 </plist>
 "#,
         label = LAUNCHD_LABEL,
+        watchdog = xml_escape(&watchdog.to_string_lossy()),
         agent = xml_escape(&agent.to_string_lossy()),
         alerts = xml_escape(&alerts.to_string_lossy()),
         work_dir = xml_escape(&work_dir.to_string_lossy()),
@@ -512,23 +571,33 @@ fn cmd_install(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Result<()
     let agent_abs = agent
         .canonicalize()
         .with_context(|| format!("canonicalize {}", agent.display()))?;
+    let watchdog_abs = std::env::current_exe()
+        .context("current_exe")?
+        .canonicalize()
+        .context("canonicalize watchdog")?;
 
-    // launchd daemons start with `/` as working directory — a relative alerts
-    // path must be pinned down before it lands in the plist.
+    // launchd daemons start with `/` as working directory — pin the alerts path
+    // down before it lands in the plist.
     let alerts_abs =
         std::path::absolute(&alerts).with_context(|| format!("absolutize {}", alerts.display()))?;
     if let Some(parent) = alerts_abs.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
 
-    std::fs::write(LAUNCHD_PLIST, launchd_plist(&agent_abs, &alerts_abs))
-        .with_context(|| format!("writing {LAUNCHD_PLIST} (root required)"))?;
+    std::fs::write(
+        LAUNCHD_PLIST,
+        launchd_plist(&watchdog_abs, &agent_abs, &alerts_abs),
+    )
+    .with_context(|| format!("writing {LAUNCHD_PLIST} (root required)"))?;
     run_launchctl(&["bootstrap", "system", LAUNCHD_PLIST])?;
 
     println!("[watchdog] launchd daemon installed and started.");
     println!("  Alerts: {}", alerts_abs.display());
-    println!("  Check: sudo launchctl print system/{LAUNCHD_LABEL}");
-    println!("  Logs : /var/log/synthaea-agent.log");
+    println!("  Check: watchdog status");
+    println!(
+        "  Logs : /var/log/synthaea-watchdog.log (watchdog); agent output in {}",
+        child_log_path()
+    );
     println!("  Uninstall: watchdog uninstall");
     Ok(())
 }
@@ -576,6 +645,7 @@ fn run_cli() -> anyhow::Result<()> {
     match cli.command {
         Command::Install { agent_bin, alerts } => cmd_install(agent_bin, alerts),
         Command::Uninstall => cmd_uninstall(),
+        Command::Status => cmd_status(),
         Command::Run {
             agent_bin,
             alerts,
@@ -622,7 +692,7 @@ mod tests {
         );
         assert_eq!(
             strip_unc_prefix(PathBuf::from("/opt/synthaea/agent")),
-            PathBuf::from("/opt/synthaea/agent")
+            PathBuf::from(r"/opt/synthaea/agent")
         );
     }
 
@@ -643,15 +713,24 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn launchd_plist_escapes_paths_and_pins_the_working_directory() {
+    fn launchd_plist_runs_the_watchdog_and_escapes_paths() {
         let plist = launchd_plist(
+            std::path::Path::new("/opt/A&B/watchdog"),
             std::path::Path::new("/opt/A&B/agent"),
             std::path::Path::new("/var/lib/synthaea/alerts.ndjson"),
         );
         assert!(plist.contains("<string>com.synthaea.agent</string>"));
-        assert!(plist.contains("<string>/opt/A&amp;B/agent</string>"));
-        assert!(plist.contains("<key>WorkingDirectory</key>\n    <string>/opt/A&amp;B</string>"));
+        // launchd runs the watchdog, which supervises the agent.
+        assert!(
+            plist.contains("<string>/opt/A&amp;B/watchdog</string>\n        <string>run</string>")
+        );
+        assert!(
+            plist.contains(
+                "<string>--agent-bin</string>\n        <string>/opt/A&amp;B/agent</string>"
+            )
+        );
         assert!(plist.contains("<string>/var/lib/synthaea/alerts.ndjson</string>"));
+        assert!(plist.contains("<key>WorkingDirectory</key>\n    <string>/opt/A&amp;B</string>"));
         assert!(plist.contains("<key>KeepAlive</key>\n    <true/>"));
     }
 }
