@@ -33,6 +33,7 @@ its code comes from. Dependency direction between them is enforced by
 | `sinks` | Local outputs: JSONL, syslog/CEF export | **migrated** | `old/agent` (issue #7) |
 | `updater` | Agent self-update + content/model distribution client (canary rings) | skeleton | new development |
 | `conformance` | Sensor conformance suite — generates the capability matrix | skeleton | new development |
+| `tamper` | Runtime tamper protection: self-integrity, sensor-silence, protected resources | skeleton | new development |
 
 The binaries live outside this folder: `agent/` (the pipeline host), `watchdog/`, and
 `cli/` (admin tool, an `ipc` client).

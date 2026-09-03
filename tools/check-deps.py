@@ -24,7 +24,7 @@ SCHEMA = "schema"
 BASE = {"schema", "policy"}
 DETECTION = {"rules", "sigma", "correlator", "ml", "yara", "enrich", "intel"}
 LEAF = {"response", "transport", "ipc", "sinks", "updater", "config", "store",
-        "conformance", "live-response"}
+        "conformance", "live-response", "tamper"}
 BINARIES = {"agent", "watchdog", "cli"}
 WIRE_CRATES = {"sensor-linux-wire"}
 

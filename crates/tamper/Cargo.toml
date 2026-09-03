@@ -1,0 +1,9 @@
+[package]
+name = "tamper"
+version = "0.1.0"
+description = "Runtime tamper protection: self-integrity, sensor-silence detection, protected-resource monitoring"
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
