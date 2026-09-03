@@ -392,6 +392,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "deception"
+version = "0.1.0"
+
+[[package]]
+name = "device-control"
+version = "0.1.0"
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -508,6 +516,10 @@ dependencies = [
 
 [[package]]
 name = "intel"
+version = "0.1.0"
+
+[[package]]
+name = "inventory"
 version = "0.1.0"
 
 [[package]]

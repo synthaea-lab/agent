@@ -35,6 +35,9 @@ its code comes from. Dependency direction between them is enforced by
 | `conformance` | Sensor conformance suite — generates the capability matrix | skeleton | new development |
 | `tamper` | Runtime tamper protection: self-integrity, sensor-silence, protected resources | skeleton | new development |
 | `mesh` | Agent peer mesh: signed attestation heartbeats + heighten-only posture gossip | skeleton | new development |
+| `deception` | Per-host canaries and decoy credentials — near-zero-FP tripwires | skeleton | new development |
+| `device-control` | Removable-media telemetry + policy-gated control (USB first) | skeleton | new development |
+| `inventory` | Diffed asset inventory: packages, services, autoruns, ports | skeleton | new development |
 
 The binaries live outside this folder: `agent/` (the pipeline host), `watchdog/`, and
 `cli/` (admin tool, an `ipc` client).
