@@ -5,11 +5,13 @@
 //!   uninstall — uninstalls the service
 //!   run       — pure-Rust supervision loop (fallback without service rights, or SCM service mode)
 //!
-//! Windows: the watchdog itself is the Windows service. It answers the SCM, then spawns the
-//!          agent as a child process and restarts it automatically if the process dies.
-//!          Resistance: taskkill on the agent → the watchdog restarts it; taskkill on the
-//!          watchdog → the SCM restarts it (sc failure policy). To kill it for good: sc stop.
-//! Linux  : systemd with `Restart=always RestartSec=5s`.
+//! Kill resistance is the same two layers on every OS: the service manager runs the
+//! watchdog (never the agent directly), and the watchdog's supervision loop spawns and
+//! respawns the agent. Kill the agent → the watchdog restarts it; kill the watchdog →
+//! the service manager restarts it. To stop it for good, go through the service manager:
+//!   Windows: the watchdog is the Windows service; `sc failure` restart policy. (sc stop)
+//!   Linux  : systemd unit with `Restart=always RestartSec=5s`.  (systemctl stop)
+//!   macOS  : launchd daemon with `KeepAlive`.                   (launchctl bootout)
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -29,6 +31,11 @@ const DEFAULT_ALERTS: &str = "alerts.ndjson";
 
 #[cfg(target_os = "linux")]
 const SYSTEMD_UNIT: &str = "/etc/systemd/system/synthaea-agent.service";
+
+#[cfg(target_os = "macos")]
+const LAUNCHD_LABEL: &str = "com.synthaea.agent";
+#[cfg(target_os = "macos")]
+const LAUNCHD_PLIST: &str = "/Library/LaunchDaemons/com.synthaea.agent.plist";
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -115,7 +122,7 @@ fn child_log_path() -> &'static str {
     }
 }
 
-// ── Shared supervision loop (Windows + Linux) ─────────────────────────────────
+// ── Shared supervision loop (all platforms) ───────────────────────────────────
 
 /// Restarts the agent in a loop until `stop_flag` becomes true.
 fn watchdog_loop(
@@ -379,21 +386,33 @@ fn cmd_install(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Result<()
         .canonicalize()
         .with_context(|| format!("canonicalize {}", agent.display()))?;
 
-    if let Some(parent) = alerts.parent() {
+    // The unit runs the watchdog (layer 2), which supervises the agent (layer 1) —
+    // same shape as the Windows SCM service and the launchd daemon.
+    let watchdog_abs = std::env::current_exe()
+        .context("current_exe")?
+        .canonicalize()
+        .context("canonicalize watchdog")?;
+
+    // Services start with `/` as working directory — pin the alerts path down
+    // before it lands in the unit file.
+    let alerts_abs =
+        std::path::absolute(&alerts).with_context(|| format!("absolutize {}", alerts.display()))?;
+    if let Some(parent) = alerts_abs.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
-    let out_str = alerts.to_string_lossy();
 
     let unit = format!(
         "[Unit]\nDescription={desc}\nAfter=network.target\n\n\
-         [Service]\nType=simple\nExecStart={agent} run --alerts {out}\n\
+         [Service]\nType=simple\n\
+         ExecStart=\"{watchdog}\" run --agent-bin \"{agent}\" --alerts \"{out}\"\n\
          Restart=always\nRestartSec=5s\nUser=root\n\
          StandardOutput=journal\nStandardError=journal\n\
-         SyslogIdentifier=synthaea-agent\n\n\
+         SyslogIdentifier=synthaea-watchdog\n\n\
          [Install]\nWantedBy=multi-user.target\n",
         desc = SERVICE_DESC,
+        watchdog = watchdog_abs.display(),
         agent = agent_abs.display(),
-        out = out_str,
+        out = alerts_abs.display(),
     );
 
     std::fs::write(SYSTEMD_UNIT, &unit)
@@ -402,8 +421,12 @@ fn cmd_install(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Result<()
     run_systemctl(&["enable", "--now", "synthaea-agent.service"])?;
 
     println!("[watchdog] systemd service installed and started.");
+    println!("  Alerts: {}", alerts_abs.display());
     println!("  Check: systemctl status synthaea-agent");
-    println!("  Logs : journalctl -u synthaea-agent -f");
+    println!(
+        "  Logs : journalctl -u synthaea-agent -f (watchdog); agent output in {}",
+        child_log_path()
+    );
     Ok(())
 }
 
@@ -431,16 +454,119 @@ fn run_systemctl(args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Unsupported platform stubs ────────────────────────────────────────────────
+// ── macOS: launchd ────────────────────────────────────────────────────────────
 
-#[cfg(not(any(windows, target_os = "linux")))]
-fn cmd_install(_: Option<PathBuf>, _: PathBuf) -> anyhow::Result<()> {
-    bail!("install is only supported on Windows and Linux")
+/// Minimal escaping for text nodes in the generated plist (paths may contain
+/// `&`, `<`, `>` — anything else is legal as-is inside an XML text node).
+#[cfg(target_os = "macos")]
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn launchd_plist(agent: &std::path::Path, alerts: &std::path::Path) -> String {
+    let work_dir = agent.parent().unwrap_or_else(|| std::path::Path::new("/"));
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{agent}</string>
+        <string>run</string>
+        <string>--alerts</string>
+        <string>{alerts}</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{work_dir}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>StandardOutPath</key>
+    <string>/var/log/synthaea-agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/synthaea-agent.log</string>
+</dict>
+</plist>
+"#,
+        label = LAUNCHD_LABEL,
+        agent = xml_escape(&agent.to_string_lossy()),
+        alerts = xml_escape(&alerts.to_string_lossy()),
+        work_dir = xml_escape(&work_dir.to_string_lossy()),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn cmd_install(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Result<()> {
+    let agent = resolve_agent_bin(agent_bin)?;
+    anyhow::ensure!(agent.exists(), "agent not found: {}", agent.display());
+
+    let agent_abs = agent
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", agent.display()))?;
+
+    // launchd daemons start with `/` as working directory — a relative alerts
+    // path must be pinned down before it lands in the plist.
+    let alerts_abs =
+        std::path::absolute(&alerts).with_context(|| format!("absolutize {}", alerts.display()))?;
+    if let Some(parent) = alerts_abs.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+
+    std::fs::write(LAUNCHD_PLIST, launchd_plist(&agent_abs, &alerts_abs))
+        .with_context(|| format!("writing {LAUNCHD_PLIST} (root required)"))?;
+    run_launchctl(&["bootstrap", "system", LAUNCHD_PLIST])?;
+
+    println!("[watchdog] launchd daemon installed and started.");
+    println!("  Alerts: {}", alerts_abs.display());
+    println!("  Check: sudo launchctl print system/{LAUNCHD_LABEL}");
+    println!("  Logs : /var/log/synthaea-agent.log");
+    println!("  Uninstall: watchdog uninstall");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn cmd_uninstall() -> anyhow::Result<()> {
-    bail!("uninstall is only supported on Windows and Linux")
+    // bootout fails when the daemon is not loaded — like the systemd/SCM arms,
+    // uninstall still removes the on-disk definition in that case.
+    let _ = run_launchctl(&["bootout", &format!("system/{LAUNCHD_LABEL}")]);
+    if std::path::Path::new(LAUNCHD_PLIST).exists() {
+        std::fs::remove_file(LAUNCHD_PLIST).with_context(|| format!("removing {LAUNCHD_PLIST}"))?;
+    }
+    println!("[watchdog] {LAUNCHD_LABEL} daemon uninstalled.");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_launchctl(args: &[&str]) -> anyhow::Result<()> {
+    let status = std::process::Command::new("launchctl")
+        .args(args)
+        .status()
+        .context("cannot launch launchctl")?;
+    if !status.success() {
+        bail!("launchctl {} failed ({})", args.join(" "), status);
+    }
+    Ok(())
+}
+
+// ── Unsupported platform stubs ────────────────────────────────────────────────
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn cmd_install(_: Option<PathBuf>, _: PathBuf) -> anyhow::Result<()> {
+    bail!("install is only supported on Windows, Linux, and macOS")
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn cmd_uninstall() -> anyhow::Result<()> {
+    bail!("uninstall is only supported on Windows, Linux, and macOS")
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -513,5 +639,19 @@ mod tests {
     fn explicit_agent_path_wins() {
         let p = resolve_agent_bin(Some(PathBuf::from("/x/agent"))).unwrap();
         assert_eq!(p, PathBuf::from("/x/agent"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_plist_escapes_paths_and_pins_the_working_directory() {
+        let plist = launchd_plist(
+            std::path::Path::new("/opt/A&B/agent"),
+            std::path::Path::new("/var/lib/synthaea/alerts.ndjson"),
+        );
+        assert!(plist.contains("<string>com.synthaea.agent</string>"));
+        assert!(plist.contains("<string>/opt/A&amp;B/agent</string>"));
+        assert!(plist.contains("<key>WorkingDirectory</key>\n    <string>/opt/A&amp;B</string>"));
+        assert!(plist.contains("<string>/var/lib/synthaea/alerts.ndjson</string>"));
+        assert!(plist.contains("<key>KeepAlive</key>\n    <true/>"));
     }
 }

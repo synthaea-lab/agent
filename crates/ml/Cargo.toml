@@ -8,7 +8,9 @@ publish.workspace = true
 
 [dependencies]
 schema = { path = "../schema" }
+correlator = { path = "../correlator" }
 thiserror = { workspace = true }
+ort = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

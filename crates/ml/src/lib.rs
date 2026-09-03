@@ -6,14 +6,18 @@
 //! channel, never embedded (ADR-0002). Must be bounded in CPU and memory — inference
 //! happens on the endpoint.
 //!
-//! What exists today is the explanation side of the "never a bare score" commitment
-//! (`docs/detection/ml.md`): [`forest`] parses tree structure back out of the model
-//! file and computes per-feature path attributions that ship on every ML detection.
-//! Feature extraction and the `ort` scoring wrapper are migrated next
-//! (`old/crates/synthaea-ml`).
+//! - [`features`] — the feature extractors, each a Rust/Python parity seam pinned by a
+//!   shared golden fixture;
+//! - [`forest`] — tree structure parsed back out of the ONNX model, for per-feature
+//!   attribution (the explanation side of "never a bare score", `docs/detection/ml.md`);
+//! - [`scorer`] — [`CmdlineScorer`], which runs the model through `ort` and pairs each
+//!   score with its attribution.
 
 mod proto;
 
+pub mod features;
 pub mod forest;
+pub mod scorer;
 
 pub use forest::{Attribution, Forest, ParseError, top_attributions};
+pub use scorer::{CmdlineScorer, Score, ScorerError};

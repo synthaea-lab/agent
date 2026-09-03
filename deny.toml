@@ -38,6 +38,13 @@ allow = [
     "Unicode-3.0",
 ]
 
+# Per-crate license exceptions (narrower than widening `allow` for everyone).
+[[licenses.exceptions]]
+# Pulled only at build time by ort's onnxruntime binary downloader (ureq -> rustls);
+# CDLA-Permissive-2.0 is a permissive data license, not in the global set above.
+name = "webpki-root-certs"
+allow = ["CDLA-Permissive-2.0"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
