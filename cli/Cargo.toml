@@ -1,0 +1,8 @@
+[package]
+name = "cli"
+version = "0.1.0"
+description = "Admin command-line tool — a local IPC client of the agent"
+license.workspace = true
+edition.workspace = true
+
+[dependencies]

@@ -10,25 +10,29 @@ its code comes from. Dependency direction between them is enforced by
 | `schema` | Event types + `Sensor`/`EventSink` contract — the platform boundary everything depends on | skeleton | migrate from `old/` |
 | `sensors/linux/userspace` | Linux sensor, userspace side (loads/drains eBPF probes) | skeleton | migrate from `old/` |
 | `sensors/linux/ebpf` | Linux kernel probes (eBPF, GPLv2, excluded from workspace) | skeleton | migrate from `old/` |
-| `sensors/windows/etw` | Windows sensor (ETW) | skeleton | migrate from `old/` |
+| `sensors/linux/audit` | Linux fallback sensor (auditd + fanotify) | skeleton | new development |
+| `sensors/windows/etw` | Windows sensor (ETW; cmdline, registry, DNS, AMSI, ... per audit) | skeleton | migrate from `old/` |
+| `sensors/windows/driver` | Windows kernel driver (minifilter, ELAM/PPL) — not a member | planned | new development |
 | `sensors/macos/endpoint-security` | macOS sensor (EndpointSecurity) | skeleton | new development |
+| `sensors/macos/network-extension` | macOS network/DNS sensor (NetworkExtension) | skeleton | new development |
 | `rules` | Rule engine — stateless + stateful detections | skeleton | migrate from `old/` |
 | `sigma` | Sigma rule parsing and compilation | skeleton | migrate from `old/` |
 | `correlator` | Correlation + scoring — builds cases from detections | skeleton | migrate from `old/` |
 | `ml` | On-device ONNX inference + feature extraction | skeleton | migrate from `old/` |
+| `yara` | YARA-X file and memory scanning, feeding detections to the correlator | skeleton | new development |
+| `enrich` | Cross-platform enrichment: hashing, code signing, file metadata | skeleton | new development |
+| `policy` | Policy model shared by agent and control plane (versioned, signed) | skeleton | new development |
+| `config` | Local agent configuration loading and validation | skeleton | new development |
+| `store` | Bounded local state: entity store (process graph) + event spool | skeleton | new development |
 | `response` | Response actions — kill, quarantine, isolate | skeleton | new development |
 | `transport` | Agent ↔ control-plane comms — mTLS, store-and-forward | skeleton | new development |
+| `ipc` | Local IPC: agent ↔ endpoint UI/CLI (named pipe / Unix socket) | skeleton | new development |
+| `sinks` | Local outputs: JSONL, syslog/CEF export | skeleton | migrate from `old/agent` |
+| `updater` | Agent self-update + content/model distribution client (canary rings) | skeleton | new development |
+| `conformance` | Sensor conformance suite — generates the capability matrix | skeleton | new development |
 
-Planned, not yet created (add here first, create the crate when work starts, and extend
-`tools/check-deps.py` in the same change):
-
-| Crate | Purpose |
-| --- | --- |
-| `yara` | YARA-X file/memory scanning, feeding detections to the correlator |
-| `config` | Agent configuration loading and validation, shared by binaries |
-| `store` | Bounded local state — entity store (process graph), event spool |
-
-The binaries live outside this folder: `agent/` (the pipeline host) and `watchdog/`.
+The binaries live outside this folder: `agent/` (the pipeline host), `watchdog/`, and
+`cli/` (admin tool, an `ipc` client).
 
 ## Adding a crate
 

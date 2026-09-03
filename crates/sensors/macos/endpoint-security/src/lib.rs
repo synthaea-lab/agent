@@ -1,8 +1,10 @@
 //! # sensor-macos
 //!
-//! macOS platform sensor (new in this iteration — not present in the old codebase).
-//! Uses the EndpointSecurity framework (`es_new_client`) for process, file, and network
-//! telemetry, with inline AUTH events enabling prevention. Requires the
-//! `com.apple.developer.endpoint-security.client` entitlement.
+//! macOS EndpointSecurity sensor (new development). `es_new_client` subscriptions for
+//! process (exec/fork/exit with argv and code-signing info), file, persistence
+//! (launchd/BTM), credential-access paths, and injection/tamper signals
+//! (task_for_pid, ptrace, code-signature invalidation). AUTH events enable inline
+//! prevention. Network/DNS telemetry lives in `sensor-macos-network-extension`.
 //!
-//! Compiles to a stub on non-macOS targets so `cargo check --workspace` works anywhere.
+//! Requires the `com.apple.developer.endpoint-security.client` entitlement.
+//! Compiles to a stub on non-macOS targets.

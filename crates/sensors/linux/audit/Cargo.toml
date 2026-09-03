@@ -1,0 +1,8 @@
+[package]
+name = "sensor-linux-audit"
+version = "0.1.0"
+description = "Linux fallback sensor: auditd/fanotify telemetry where eBPF is unavailable"
+license.workspace = true
+edition.workspace = true
+
+[dependencies]

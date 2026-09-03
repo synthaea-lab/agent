@@ -13,16 +13,28 @@ resolver = "2"
 members = [
     "agent",
     "watchdog",
+    "cli",
     "crates/schema",
+    "crates/policy",
+    "crates/config",
+    "crates/store",
     "crates/sensors/linux/userspace",
+    "crates/sensors/linux/audit",
     "crates/sensors/windows/etw",
     "crates/sensors/macos/endpoint-security",
+    "crates/sensors/macos/network-extension",
     "crates/rules",
     "crates/sigma",
     "crates/correlator",
     "crates/ml",
+    "crates/yara",
+    "crates/enrich",
     "crates/response",
+    "crates/ipc",
     "crates/transport",
+    "crates/sinks",
+    "crates/updater",
+    "crates/conformance",
 ]
 exclude = [
     # Built explicitly with the eBPF toolchain (see its README).

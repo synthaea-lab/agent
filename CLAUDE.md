@@ -13,11 +13,14 @@ copied (`docs/README.md` has the index).
 - `schema` is the platform boundary: event types + `Sensor`/`EventSink` contract.
   It depends on no workspace crate and stays dependency-light. Treat its public API as
   semi-frozen — changes there ripple everywhere and need explicit justification.
+- `policy` sits next to `schema` as the base tier (shared agent/server types); it
+  depends only on `schema`, everything else may depend on both.
 - Sensor crates (`crates/sensors/*`) depend **only** on `schema`.
-- Detection crates (`rules`, `sigma`, `correlator`,
-  `ml`) depend on `schema` and each other — **never on a sensor**.
-- `response`, `transport` depend only on `schema`.
-- Only the binaries (`agent/`, `watchdog/`) may depend on everything.
+- Detection crates (`rules`, `sigma`, `correlator`, `ml`, `yara`, `enrich`) depend on
+  the base tier, each other, and `store` — **never on a sensor**.
+- Leaf crates (`response`, `transport`, `ipc`, `sinks`, `updater`, `config`, `store`,
+  `conformance`) depend only on the base tier.
+- Only the binaries (`agent/`, `watchdog/`, `cli/`) may depend on everything.
 
 New crate? Add it to the rules in `tools/check-deps.py` in the same change.
 

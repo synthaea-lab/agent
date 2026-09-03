@@ -1,0 +1,8 @@
+[package]
+name = "yara"
+version = "0.1.0"
+description = "YARA-X file and memory scanning"
+license.workspace = true
+edition.workspace = true
+
+[dependencies]

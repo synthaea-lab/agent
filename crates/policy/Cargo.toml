@@ -1,0 +1,8 @@
+[package]
+name = "policy"
+version = "0.1.0"
+description = "Policy model shared by agent and control plane"
+license.workspace = true
+edition.workspace = true
+
+[dependencies]

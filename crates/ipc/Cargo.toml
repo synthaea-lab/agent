@@ -1,0 +1,8 @@
+[package]
+name = "ipc"
+version = "0.1.0"
+description = "Local IPC between the agent and on-host clients (UI, CLI)"
+license.workspace = true
+edition.workspace = true
+
+[dependencies]

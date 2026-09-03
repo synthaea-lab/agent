@@ -2,12 +2,14 @@
 """Enforce the workspace dependency direction.
 
 Rules (see CLAUDE.md):
-  - `schema` depends on no workspace crate.
+  - `schema` depends on no workspace crate; `policy` depends only on `schema`.
+    Together they are the BASE tier every other crate may use.
   - Sensor crates (`sensor-*`) depend only on `schema`.
-  - Detection crates (rules, sigma, correlator, ml) depend only on `schema`
-    and each other — never on a sensor crate.
-  - `response` and `transport` depend only on `schema`.
-  - Only the binaries (`agent`, `watchdog`) may depend on anything.
+  - Detection crates (rules, sigma, correlator, ml, yara, enrich) depend on the base
+    tier, each other, and `store` — never on a sensor crate.
+  - Leaf crates (response, transport, ipc, sinks, updater, config, store, conformance)
+    depend only on the base tier.
+  - Only the binaries (`agent`, `watchdog`, `cli`) may depend on anything.
   - No crate depends on a binary.
 
 Run from the workspace root: `python3 tools/check-deps.py`
@@ -19,9 +21,11 @@ import subprocess
 import sys
 
 SCHEMA = "schema"
-DETECTION = {"rules", "sigma", "correlator", "ml"}
-LEAF = {"response", "transport"}
-BINARIES = {"agent", "watchdog"}
+BASE = {"schema", "policy"}
+DETECTION = {"rules", "sigma", "correlator", "ml", "yara", "enrich"}
+LEAF = {"response", "transport", "ipc", "sinks", "updater", "config", "store",
+        "conformance"}
+BINARIES = {"agent", "watchdog", "cli"}
 
 
 def allowed(crate: str) -> set[str] | None:
@@ -30,12 +34,14 @@ def allowed(crate: str) -> set[str] | None:
         return None
     if crate == SCHEMA:
         return set()
+    if crate == "policy":
+        return {SCHEMA}
     if crate.startswith("sensor-"):
         return {SCHEMA}
     if crate in DETECTION:
-        return {SCHEMA} | DETECTION
+        return BASE | DETECTION | {"store"}
     if crate in LEAF:
-        return {SCHEMA}
+        return set(BASE)
     print(f"error: crate `{crate}` is not covered by the dependency rules — "
           f"add it to tools/check-deps.py")
     sys.exit(2)

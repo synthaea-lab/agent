@@ -1,0 +1,8 @@
+[package]
+name = "sensor-macos-network-extension"
+version = "0.1.0"
+description = "macOS network sensor: DNS and flow telemetry via NetworkExtension"
+license.workspace = true
+edition.workspace = true
+
+[dependencies]

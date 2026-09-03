@@ -7,11 +7,35 @@ name = "agent"
 version = "0.1.0"
 
 [[package]]
+name = "cli"
+version = "0.1.0"
+
+[[package]]
+name = "config"
+version = "0.1.0"
+
+[[package]]
+name = "conformance"
+version = "0.1.0"
+
+[[package]]
 name = "correlator"
 version = "0.1.0"
 
 [[package]]
+name = "enrich"
+version = "0.1.0"
+
+[[package]]
+name = "ipc"
+version = "0.1.0"
+
+[[package]]
 name = "ml"
+version = "0.1.0"
+
+[[package]]
+name = "policy"
 version = "0.1.0"
 
 [[package]]
@@ -31,7 +55,15 @@ name = "sensor-linux"
 version = "0.1.0"
 
 [[package]]
+name = "sensor-linux-audit"
+version = "0.1.0"
+
+[[package]]
 name = "sensor-macos"
+version = "0.1.0"
+
+[[package]]
+name = "sensor-macos-network-extension"
 version = "0.1.0"
 
 [[package]]
@@ -43,9 +75,25 @@ name = "sigma"
 version = "0.1.0"
 
 [[package]]
+name = "sinks"
+version = "0.1.0"
+
+[[package]]
+name = "store"
+version = "0.1.0"
+
+[[package]]
 name = "transport"
 version = "0.1.0"
 
 [[package]]
+name = "updater"
+version = "0.1.0"
+
+[[package]]
 name = "watchdog"
+version = "0.1.0"
+
+[[package]]
+name = "yara"
 version = "0.1.0"
