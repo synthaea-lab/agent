@@ -40,9 +40,9 @@ const BEACON_WINDOW_NS: u64 = 60_000_000_000; // 60s
 /// process keeps crashing (e.g. malware with no reachable C2). The spawn comes from WER
 /// itself, not from direct malicious behavior — false positive observed during the
 /// 2026-08-25 VM tests.
-/// SecurityHealthH = SecurityHealthHost.exe (ETW-truncated to 15 chars) — Windows
+/// `SecurityHealthH` = SecurityHealthHost.exe (ETW-truncated to 15 chars) — Windows
 /// Defender Health service, repeatedly respawned by svchost (ppid=956) under normal
-/// conditions — NjRAT FP 2026-08-28.
+/// conditions — `NjRAT` FP 2026-08-28.
 const SELF_SPAWN_EXCLUSIONS: &[&str] = &[
     "MpCmdRun.exe",
     "mpcmdrun.exe",
@@ -57,11 +57,11 @@ const SELF_SPAWN_EXCLUSIONS: &[&str] = &[
 
 /// Parents excluded from SELF-SPAWN — some system processes legitimately spawn the
 /// same child in a loop, with no link to malicious activity.
-/// RuntimeBroker.exe: UWP permissions broker, spawns PowerShell for system tasks
+/// RuntimeBroker.exe: UWP permissions broker, spawns `PowerShell` for system tasks
 /// (notifications, policies) — false positive observed in lab 2026-08-25.
 const SELF_SPAWN_PARENT_EXCLUSIONS: &[&str] = &["RuntimeBroker.exe"];
 
-/// LOLBins abused for shellcode injection or executing unsigned code (T1218/T1127).
+/// `LOLBins` abused for shellcode injection or executing unsigned code (T1218/T1127).
 const LOLBINS: &[&str] = &[
     "aspnet_compiler.exe",
     "aspnet_compiler", // truncated by Windows ETW (20 → 15 chars)
@@ -77,7 +77,7 @@ const LOLBINS: &[&str] = &[
     "odbcconf.exe",
 ];
 
-/// Legitimate parents allowed to spawn LOLBins (dev environments).
+/// Legitimate parents allowed to spawn `LOLBins` (dev environments).
 const LOLBIN_LEGIT_PARENTS: &[&str] = &["devenv.exe", "msbuild.exe", "dotnet.exe", "nuget.exe"];
 
 /// Office/PDF applications often exploited to spawn interpreters (T1204/T1059).
@@ -112,8 +112,8 @@ const SUSPECT_CHILDREN_WIN: &[&str] = &[
 /// 137 = NetBIOS-NS, 138 = NetBIOS-DGM, 5353 = mDNS, 5355 = LLMNR — native Windows
 /// network protocols emitted in a loop by the System process and legitimate services,
 /// not C2.
-/// 3478 = STUN/TURN — used by CrossDeviceService, Teams, WebRTC for NAT traversal,
-/// legitimate beaconing observed in lab (false positive, NjRAT capture 2026-08-28).
+/// 3478 = STUN/TURN — used by `CrossDeviceService`, Teams, WebRTC for NAT traversal,
+/// legitimate beaconing observed in lab (false positive, `NjRAT` capture 2026-08-28).
 const STANDARD_PORTS: &[u16] = &[
     80, 443, 53, 8080, 8443, 8000, 25, 587, 465, 993, 995, 143, 137, 138, 5353, 5355, 3478,
 ];
@@ -194,7 +194,7 @@ pub struct RuleState {
     /// pid → comm of the last exec seen for this pid, to recover the parent's comm
     /// (T1059) with a simple `ppid` lookup without having to walk the process tree in
     /// userspace. LRU-bounded (`store::BoundedMap`) — a long-lived agent must not
-    /// grow this without limit. `pub(crate)` for the seed_from_proc test.
+    /// grow this without limit. `pub(crate)` for the `seed_from_proc` test.
     pub(crate) pid_comm: BoundedMap<u32, String>,
     /// path → info about the last write by a known downloader (T1105). LRU-bounded:
     /// downloader writes are rare, but a hostile loop must not grow agent memory.
@@ -218,6 +218,7 @@ impl Default for RuleState {
 }
 
 impl RuleState {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             pid_comm: BoundedMap::new(PID_COMM_CAP),
@@ -266,7 +267,7 @@ impl RuleState {
     ///
     /// The fallback is necessary: `pid_comm` only knows a process if it exec'd during
     /// the capture, or was already running at startup (`seed_from_proc`) — not
-    /// processes fork()'d *after* startup that never exec afterwards (e.g. an nginx
+    /// processes `fork()`'d *after* startup that never exec afterwards (e.g. an nginx
     /// worker respawned by the master). Found in real conditions on 2026-08-14 with an
     /// unstable nginx perl module that kept churning workers: `seed_from_proc` alone
     /// let through any worker created after the collector attached. The fallback reads
@@ -347,8 +348,8 @@ impl RuleState {
 
     /// T1059 — same process spawned N times in X seconds by the same parent.
     /// False positives documented in lab (2026-08-24/25): MpCmdRun.exe, WerFault.exe,
-    /// RuntimeBroker.exe — excluded via SELF_SPAWN_EXCLUSIONS /
-    /// SELF_SPAWN_PARENT_EXCLUSIONS.
+    /// RuntimeBroker.exe — excluded via `SELF_SPAWN_EXCLUSIONS` /
+    /// `SELF_SPAWN_PARENT_EXCLUSIONS`.
     fn check_self_spawn(&mut self, event: &ExecEvent) -> Option<Alert> {
         let comm = event.meta.comm.clone();
         // Name alone is a bypass: a payload renamed `svchost.exe` in %TEMP% must
@@ -396,8 +397,8 @@ impl RuleState {
     }
 
     /// T1204/T1059 — Office/PDF application spawning an interpreter (macro/exploit).
-    /// `resolve_comm` reads pid_comm then `/proc` as a fallback (Linux) — returns None
-    /// on Windows if the parent has not yet sent an ExecEvent, which silently disables
+    /// `resolve_comm` reads `pid_comm` then `/proc` as a fallback (Linux) — returns None
+    /// on Windows if the parent has not yet sent an `ExecEvent`, which silently disables
     /// this rule for that case (mitigated by `seed_pid_comm` at startup).
     fn check_parent_suspect(&self, event: &ExecEvent) -> Option<Alert> {
         let comm = event.meta.comm.as_str();
@@ -423,7 +424,7 @@ impl RuleState {
         })
     }
 
-    /// T1218/T1127 — LOLBin spawned by a non-dev parent (shellcode execution proxy).
+    /// T1218/T1127 — `LOLBin` spawned by a non-dev parent (shellcode execution proxy).
     fn check_lolbin(&self, event: &ExecEvent) -> Option<Alert> {
         let comm = event.meta.comm.as_str();
         if !LOLBINS.iter().any(|&l| comm.eq_ignore_ascii_case(l)) {

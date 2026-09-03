@@ -99,8 +99,8 @@ fn agent_binary_name() -> &'static str {
     if cfg!(windows) { "agent.exe" } else { "agent" }
 }
 
-/// Strips the `\\?\` prefix added by canonicalize() on Windows.
-/// CreateProcess does not support this prefix and fails silently when given one.
+/// Strips the `\\?\` prefix added by `canonicalize()` on Windows.
+/// `CreateProcess` does not support this prefix and fails silently when given one.
 fn strip_unc_prefix(path: PathBuf) -> PathBuf {
     let s = path.to_string_lossy();
     if let Some(stripped) = s.strip_prefix(r"\\?\") {

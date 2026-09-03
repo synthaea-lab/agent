@@ -58,6 +58,12 @@ impl CmdlineScorer {
     /// Parses the tree structure up front so attribution needs no per-score reparse,
     /// and checks the model's feature arity against the cmdline extractor so a
     /// mismatched model fails loudly at load, not silently at score time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScorerError`] when the ONNX session cannot be built, the tree
+    /// structure cannot be parsed, or the model's feature arity does not match
+    /// the cmdline extractor.
     pub fn from_onnx_bytes(model: &[u8]) -> Result<Self, ScorerError> {
         let session = Session::builder()?.commit_from_memory(model)?;
         let forest = Forest::from_onnx_bytes(model)?;
@@ -79,12 +85,21 @@ impl CmdlineScorer {
 
     /// The anomaly score of a command line (no attribution — the hot path for events
     /// that will not become detections).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScorerError`] when ONNX inference fails or produces no score.
     pub fn score(&mut self, cmdline: &str) -> Result<f32, ScorerError> {
         self.run(&cmdline::extract_features(cmdline))
     }
 
     /// The anomaly score plus its top-`k` feature attributions — for an event that
     /// crossed a threshold and is becoming a detection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScorerError`] when inference fails, produces no score, or the
+    /// attribution walk finds the model inconsistent with its parsed structure.
     pub fn score_explained(&mut self, cmdline: &str, k: usize) -> Result<Score, ScorerError> {
         let features = cmdline::extract_features(cmdline);
         let value = self.run(&features)?;

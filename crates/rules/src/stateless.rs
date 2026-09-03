@@ -8,6 +8,7 @@ use crate::{Alert, has_write_intent};
 /// command. Deliberately simple heuristic (`base64` substrings + a decode flag): no
 /// entropy analysis here — that is the role of the ML model as a complement, not of
 /// this deterministic rule.
+#[must_use]
 pub fn check_base64_decode(event: &ExecEvent) -> Option<Alert> {
     let cmdline = &event.cmdline;
     let has_base64 = cmdline.contains("base64");
@@ -40,6 +41,7 @@ const PERSISTENCE_PATH_PATTERNS: &[&str] = &[
 /// A path captured by the `open` collector can be relative to an unresolved `dfd`
 /// (known limitation of the eBPF collector) — the substring filter tolerates this case
 /// as long as the meaningful path fragment (e.g. `.bashrc`) is present verbatim.
+#[must_use]
 pub fn check_persistence_write(event: &FileOpenEvent) -> Option<Alert> {
     let path = &event.path;
     let matched_pattern = PERSISTENCE_PATH_PATTERNS
@@ -60,11 +62,13 @@ pub fn check_persistence_write(event: &FileOpenEvent) -> Option<Alert> {
 }
 
 /// Evaluates all stateless rules applicable to an `ExecEvent`.
+#[must_use]
 pub fn evaluate_exec(event: &ExecEvent) -> Vec<Alert> {
     check_base64_decode(event).into_iter().collect()
 }
 
 /// Evaluates all stateless rules applicable to a `FileOpenEvent`.
+#[must_use]
 pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
     check_persistence_write(event).into_iter().collect()
 }

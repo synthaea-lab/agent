@@ -74,6 +74,7 @@ impl Default for Enricher {
 }
 
 impl Enricher {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             cache: BoundedMap::new(CACHE_CAP),

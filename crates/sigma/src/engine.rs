@@ -41,6 +41,11 @@ impl SigmaEngine {
     /// convention is `rules/sigma/<platform>/...`). Rules that fail to parse or use
     /// unsupported constructs are skipped with a warning naming the reason; the
     /// engine loads the rest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SigmaError::Io`] when the directory tree itself cannot be read —
+    /// individual bad rules are skipped, not errors.
     pub fn load_dir(dir: &Path) -> Result<Self, SigmaError> {
         let mut rules = Vec::new();
         let mut stack = vec![dir.to_path_buf()];
@@ -65,6 +70,12 @@ impl SigmaEngine {
     }
 
     /// Loads and validates one rule from a YAML file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SigmaError::Io`] when the file cannot be read, [`SigmaError::Yaml`]
+    /// on invalid YAML, and [`SigmaError::Unsupported`] when the rule uses
+    /// constructs this engine rejects at validation.
     pub fn load_rule(path: &Path) -> Result<SigmaRule, SigmaError> {
         let display = path.display().to_string();
         let content = std::fs::read_to_string(path).map_err(|source| SigmaError::Io {
@@ -81,6 +92,7 @@ impl SigmaEngine {
     }
 
     /// Evaluates all loaded rules against an `ExecEvent`.
+    #[must_use]
     pub fn eval_exec(&self, event: &ExecEvent) -> Vec<SigmaAlert> {
         self.rules
             .iter()
@@ -88,6 +100,7 @@ impl SigmaEngine {
             .collect()
     }
 
+    #[must_use]
     pub fn rule_count(&self) -> usize {
         self.rules.len()
     }
@@ -113,7 +126,9 @@ fn validate(rule: &SigmaRule, path: &str) -> Result<(), SigmaError> {
             // An empty map would vacuously match EVERY event (Iterator::all on
             // nothing) — a malformed rule must never become an alert flood.
             if fields.is_empty() {
-                return Err(unsupported("empty selection (would match everything)".into()));
+                return Err(unsupported(
+                    "empty selection (would match everything)".into(),
+                ));
             }
             for (spec, values) in fields {
                 let (field, modifier) = parse_field_spec(spec);
@@ -146,7 +161,9 @@ fn validate(rule: &SigmaRule, path: &str) -> Result<(), SigmaError> {
         }
         Selection::Keywords(keywords) => {
             if keywords.is_empty() {
-                return Err(unsupported("empty keyword list (would match nothing)".into()));
+                return Err(unsupported(
+                    "empty keyword list (would match nothing)".into(),
+                ));
             }
             for keyword in keywords {
                 let inner = keyword.trim_matches('*');
@@ -161,7 +178,7 @@ fn validate(rule: &SigmaRule, path: &str) -> Result<(), SigmaError> {
     Ok(())
 }
 
-/// Evaluates a validated rule against an ExecEvent.
+/// Evaluates a validated rule against an `ExecEvent`.
 fn eval_rule_exec(rule: &SigmaRule, event: &ExecEvent) -> Option<SigmaAlert> {
     let selection = rule.detection.selections.get("selection")?;
     if eval_selection_exec(selection, event) {
@@ -175,7 +192,7 @@ fn eval_rule_exec(rule: &SigmaRule, event: &ExecEvent) -> Option<SigmaAlert> {
     }
 }
 
-/// Evaluates a selection against an ExecEvent.
+/// Evaluates a selection against an `ExecEvent`.
 fn eval_selection_exec(selection: &Selection, event: &ExecEvent) -> bool {
     match selection {
         Selection::FieldMap(fields) => {
@@ -426,7 +443,10 @@ detection:
             "title: Case\ndetection:\n  selection:\n    Image|EndsWith: '\\cmd.exe'\n  condition: selection\n",
         );
         let ev = exec("C:\\Windows\\System32\\cmd.exe", "cmd.exe");
-        assert!(eval_rule_exec(&rule, &ev).is_some(), "EndsWith must behave as endswith");
+        assert!(
+            eval_rule_exec(&rule, &ev).is_some(),
+            "EndsWith must behave as endswith"
+        );
     }
 
     #[test]

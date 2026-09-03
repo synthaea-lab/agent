@@ -93,7 +93,7 @@ pub struct ExecEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_comm: Option<String>,
     /// Full image path of the parent, where the platform resolves it (ETW and
-    /// EndpointSecurity provide it; eBPF may only have the parent `comm`).
+    /// `EndpointSecurity` provide it; eBPF may only have the parent `comm`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_image_path: Option<String>,
     /// SHA-256 of the executed image, filled by the agent's enrichment stage (not by
@@ -155,6 +155,7 @@ pub enum Event {
 }
 
 impl Event {
+    #[must_use]
     pub fn meta(&self) -> &EventMeta {
         match self {
             Event::Exec(e) => &e.meta,

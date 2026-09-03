@@ -163,7 +163,10 @@ fn real_system_svchost_stays_ignored() {
         c.meta.comm = "svchost.exe".to_string();
     }
     let alerts = engine.on_event(connect);
-    assert!(alerts.is_empty(), "real svchost must stay excluded: {alerts:?}");
+    assert!(
+        alerts.is_empty(),
+        "real svchost must stay excluded: {alerts:?}"
+    );
 }
 
 fn exec_set_comm_and_path(event: &mut Event, comm: &str, image_path: &str) {

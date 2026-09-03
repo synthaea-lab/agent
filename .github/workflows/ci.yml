@@ -21,6 +21,10 @@ jobs:
         run: cargo fmt --all --check
       - name: dependency direction
         run: python3 tools/check-deps.py
+      - name: docs build clean
+        run: cargo doc --workspace --exclude sensor-linux-ebpf --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   # Licenses, RUSTSEC advisories, dependency hygiene (deny.toml).
   deny:

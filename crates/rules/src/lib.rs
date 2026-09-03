@@ -2,8 +2,8 @@
 //!
 //! Deterministic rule engine: hard-coded detections, one function per targeted ATT&CK
 //! technique. Two categories, one module each:
-//! - [`stateless`] — a single event evaluated at a time (`check_*`, `evaluate_*`);
-//! - [`state`] — the correlation rules ([`RuleState`]: download followed by execution,
+//! - `stateless` — a single event evaluated at a time (`check_*`, `evaluate_*`);
+//! - `state` — the correlation rules ([`RuleState`]: download followed by execution,
 //!   web server → shell lineage, SELF-SPAWN, PARENT-SUSPECT, LOLBIN, BEACON), which
 //!   need a sliding history of recent events.
 //!

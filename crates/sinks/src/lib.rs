@@ -11,7 +11,7 @@
 //! `schema`'s golden fixtures — and consumers (`ml/` capture parsing) use plain
 //! `json.loads` instead of a bespoke format. Escaping of hostile strings (a process
 //! renamed via `prctl(PR_SET_NAME, ...)` to contain quotes or control bytes) is
-//! serde_json's job, covered by tests here.
+//! `serde_json`'s job, covered by tests here.
 //!
 //! Scope rule: the agent speaks only neutral formats (JSONL here, syslog/CEF and
 //! OCSF/ECS mappings as additional sinks in this crate). Vendor-specific SIEM
@@ -44,6 +44,11 @@ impl JsonlWriter {
     /// trailing newline) is repaired by appending a newline first, so the first
     /// record of this run does not fuse with the torn tail into one unparseable
     /// line that silently loses BOTH records at read time (review finding).
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying I/O error when the file cannot be opened, created,
+    /// or the tail repair cannot be written.
     pub fn open(path: &Path) -> std::io::Result<Self> {
         let mut f = OpenOptions::new().create(true).append(true).open(path)?;
         if needs_tail_repair(path) {
@@ -106,6 +111,11 @@ pub struct JsonlEventSink {
 }
 
 impl JsonlEventSink {
+    /// Opens the event log for appending.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying I/O error when the file cannot be opened or created.
     pub fn open(path: &Path) -> std::io::Result<Self> {
         Ok(Self {
             writer: JsonlWriter::open(path)?,

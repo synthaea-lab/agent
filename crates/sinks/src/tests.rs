@@ -1,7 +1,7 @@
 //! Sink tests. The hostile-string cases carry over from the old `jsonl.rs` tests:
 //! a process can rename itself arbitrarily (`prctl(PR_SET_NAME, ...)` on Linux), so
 //! comm/cmdline containing quotes, backslashes, or control bytes must still produce
-//! valid JSON lines — serde_json's job now, asserted here rather than assumed.
+//! valid JSON lines — `serde_json`'s job now, asserted here rather than assumed.
 
 use schema::{Event, EventMeta, ExecEvent, FileOpenEvent, User, sensor::EventSink};
 
@@ -122,7 +122,11 @@ fn torn_tail_is_repaired_on_reopen() {
     drop(w);
     let content = std::fs::read_to_string(&path).unwrap();
     let lines: Vec<&str> = content.lines().collect();
-    assert_eq!(lines.len(), 2, "torn tail and new record must be separate lines");
+    assert_eq!(
+        lines.len(),
+        2,
+        "torn tail and new record must be separate lines"
+    );
     assert!(serde_json::from_str::<serde_json::Value>(lines[1]).is_ok());
     std::fs::remove_file(&path).ok();
 }

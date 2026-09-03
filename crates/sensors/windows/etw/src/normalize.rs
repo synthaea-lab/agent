@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 /// Windows FILETIME (100ns intervals since 1601-01-01) → Unix epoch nanoseconds.
+#[must_use]
 pub fn filetime_to_ns(ft: i64) -> u64 {
     const DELTA_100NS: i64 = 116_444_736_000_000_000;
     if ft <= DELTA_100NS {
@@ -13,9 +14,10 @@ pub fn filetime_to_ns(ft: i64) -> u64 {
     ((ft - DELTA_100NS) * 100) as u64
 }
 
-/// Maps the NT create disposition (high byte of CreateOptions) to the Unix-style
-/// flags the schema/file rules use. O_WRONLY=0o1, O_CREAT=0o100 — same constants as
+/// Maps the NT create disposition (high byte of `CreateOptions`) to the Unix-style
+/// flags the schema/file rules use. `O_WRONLY=0o1`, `O_CREAT=0o100` — same constants as
 /// the correlator's T1105 rule.
+#[must_use]
 pub fn disposition_to_flags(disposition: u32) -> u32 {
     const O_WRONLY: u32 = 0o1;
     const O_CREAT: u32 = 0o100;
@@ -34,6 +36,7 @@ pub fn disposition_to_flags(disposition: u32) -> u32 {
 /// guessed `C:` for every volume; a second disk or mounted VHDX — a common
 /// payload-staging spot — produced wrong paths). Longest-prefix match; unknown
 /// devices keep the raw path (honest, greppable) rather than a fabricated drive.
+#[must_use]
 pub fn normalize_nt_path(path: &str, volume_map: &HashMap<String, String>) -> String {
     let mut best: Option<(&str, &str)> = None;
     for (device, drive) in volume_map {
@@ -53,6 +56,7 @@ pub fn normalize_nt_path(path: &str, volume_map: &HashMap<String, String>) -> St
 /// Session names are randomized per start (F-2): a fixed name documented its own
 /// kill command. Entropy source is deliberately boring (time ^ pid) — this is
 /// anti-fingerprinting of the session *name*, not cryptography.
+#[must_use]
 pub fn random_session_name(seed_ns: u128, pid: u32) -> String {
     let mix = (seed_ns as u64) ^ ((pid as u64) << 17) ^ 0x9E37_79B9_7F4A_7C15;
     format!("wtrace-{:016x}", mix.wrapping_mul(0xBF58_476D_1CE4_E5B9))
@@ -61,11 +65,15 @@ pub fn random_session_name(seed_ns: u128, pid: u32) -> String {
 /// Short-window connect dedup (F-7): stacks that emit both Connect (42/58) and the
 /// first Send (12/26) for one connection must not double-count the beacon counter.
 pub struct ConnectDedup {
-    seen: HashMap<(u32, std::net::IpAddr, u16), u64>,
+    /// Keyed by the full flow (pid, sport, daddr, dport) — F-7: two distinct
+    /// sockets from the same process to the same destination are two flows, and
+    /// deduping them together undercounts beacon candidates.
+    seen: HashMap<(u32, u16, std::net::IpAddr, u16), u64>,
     window_ns: u64,
 }
 
 impl ConnectDedup {
+    #[must_use]
     pub fn new(window_ns: u64) -> Self {
         Self {
             seen: HashMap::new(),
@@ -79,13 +87,14 @@ impl ConnectDedup {
     pub fn is_duplicate(
         &mut self,
         pid: u32,
+        sport: u16,
         daddr: std::net::IpAddr,
         dport: u16,
         now_ns: u64,
     ) -> bool {
         let cutoff = now_ns.saturating_sub(self.window_ns);
         self.seen.retain(|_, &mut t| t >= cutoff);
-        match self.seen.insert((pid, daddr, dport), now_ns) {
+        match self.seen.insert((pid, sport, daddr, dport), now_ns) {
             Some(prev) => prev >= cutoff,
             None => false,
         }
@@ -144,12 +153,17 @@ mod tests {
     fn connect_send_pairs_dedup_within_window() {
         let mut d = ConnectDedup::new(2_000_000_000);
         let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
-        assert!(!d.is_duplicate(100, ip, 4444, 1_000_000_000), "connect");
         assert!(
-            d.is_duplicate(100, ip, 4444, 1_500_000_000),
+            !d.is_duplicate(100, 5555, ip, 4444, 1_000_000_000),
+            "connect"
+        );
+        assert!(
+            d.is_duplicate(100, 5555, ip, 4444, 1_500_000_000),
             "first send dup"
         );
         // Past the window: a genuinely new connection counts again.
-        assert!(!d.is_duplicate(100, ip, 4444, 9_000_000_000));
+        assert!(!d.is_duplicate(100, 5555, ip, 4444, 9_000_000_000));
+        // A different source port is a different flow, never a duplicate.
+        assert!(!d.is_duplicate(100, 6666, ip, 4444, 9_100_000_000));
     }
 }

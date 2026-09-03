@@ -56,18 +56,18 @@ pub struct CorrelationEngine {
     bus: EventBus,
     window_ns: u64,
     /// Bayesian beliefs per entity (ppid, comm), LRU-bounded (`store::BoundedMap`) —
-    /// the old iteration's unbounded HashMap was a documented known limitation.
+    /// the old iteration's unbounded `HashMap` was a documented known limitation.
     /// Keyed by (ppid, comm), not pid: survives respawns.
     beliefs: BoundedMap<(u32, String), BeliefState>,
-    /// pid → (ppid, comm) mapping populated by ExecEvents, LRU-bounded.
-    /// Lets ConnectEvents (ppid=0) find the right entity key.
+    /// pid → (ppid, comm) mapping populated by `ExecEvents`, LRU-bounded.
+    /// Lets `ConnectEvents` (ppid=0) find the right entity key.
     pid_entities: BoundedMap<u32, (u32, String)>,
     /// (technique, pid) → last alert timestamp. A satisfied co-occurrence pattern
     /// stays satisfied for every later event in the window — without this, one
     /// exec+connect pair re-alerted on every subsequent event of that pid (review
     /// finding: identical alert floods from a single pattern).
     fired: BoundedMap<(&'static str, u32), u64>,
-    /// Pids whose ExecEvent showed an IGNORED-list name running from an
+    /// Pids whose `ExecEvent` showed an IGNORED-list name running from an
     /// untrusted location — a rename masquerade (`/tmp/svchost.exe`). The
     /// exclusion is name-keyed and would otherwise be a trivial bypass (user
     /// finding); these pids keep full rule evaluation.
@@ -82,10 +82,12 @@ const BELIEF_CAP: usize = 16_384;
 
 impl CorrelationEngine {
     /// Default window: 60 seconds.
+    #[must_use]
     pub fn new() -> Self {
         Self::with_window(Duration::from_secs(60))
     }
 
+    #[must_use]
     pub fn with_window(window: Duration) -> Self {
         Self {
             bus: EventBus::new(window),
@@ -117,8 +119,7 @@ impl CorrelationEngine {
             if ppid != 0 {
                 self.pid_entities.insert(pid, (ppid, comm.clone()));
             }
-            if is_ignored(&comm)
-                && !policy::name_exclusion_applies(Some(exec.image_path.as_str()))
+            if is_ignored(&comm) && !policy::name_exclusion_applies(Some(exec.image_path.as_str()))
             {
                 self.masquerading.insert(pid, ());
             }
@@ -165,7 +166,7 @@ impl CorrelationEngine {
     }
 
     /// Bayesian alert — only once per threshold crossing.
-    /// Reset when log_odds drops back below BAYES_THRESHOLD (decay).
+    /// Reset when `log_odds` drops back below `BAYES_THRESHOLD` (decay).
     fn bayes_alert(
         &mut self,
         pid: u32,
@@ -194,9 +195,10 @@ impl CorrelationEngine {
     }
 
     /// Returns the Bayesian belief state for a given PID.
-    /// Uses the (ppid, comm) key if the PID has been seen in an ExecEvent,
+    /// Uses the (ppid, comm) key if the PID has been seen in an `ExecEvent`,
     /// otherwise rebuilds the fallback key (pid, comm) from the bus — consistent
-    /// with the fallback used in on_event.
+    /// with the fallback used in `on_event`.
+    #[must_use]
     pub fn belief_for_pid(&self, pid: u32) -> Option<&BeliefState> {
         if let Some(entity_key) = self.pid_entities.peek(&pid) {
             return self.beliefs.peek(entity_key);
@@ -251,6 +253,7 @@ impl CorrelationEngine {
     /// currently in the sliding window.
     ///
     /// Returns `None` if the PID has no events in the window.
+    #[must_use]
     pub fn behavior_vector_for_pid(&self, pid: u32) -> Option<BehaviorVector> {
         let events: Vec<&Event> = self.bus.events_for_pid(pid).collect();
         BehaviorVector::from_window(&events)

@@ -1,4 +1,4 @@
-//! Compiles the eBPF probes (`../ebpf`, excluded from the workspace) into OUT_DIR via
+//! Compiles the eBPF probes (`../ebpf`, excluded from the workspace) into `OUT_DIR` via
 //! aya-build, when that is possible on this host:
 //!
 //! - non-Linux target: skipped (the crate compiles to a stub there anyway);

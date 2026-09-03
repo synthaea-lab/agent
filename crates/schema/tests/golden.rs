@@ -1,6 +1,6 @@
 //! Golden-fixture tests: the serialized form of every event type is pinned by the
 //! files under `tests/fixtures/v1/`. A failure here means a serialization-visible
-//! schema change — that is a SCHEMA_VERSION bump and a new fixture directory, never
+//! schema change — that is a `SCHEMA_VERSION` bump and a new fixture directory, never
 //! an edit to these files (see crate docs).
 
 use std::net::IpAddr;

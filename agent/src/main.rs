@@ -38,7 +38,7 @@ enum Command {
     },
     /// Captures a baseline of healthy activity to train the ML models: records the
     /// command lines of exec events that trigger no deterministic rule, as
-    /// JSON-Lines consumable by synthaea_ml training. Run ~10 min on a clean host.
+    /// JSON-Lines consumable by `synthaea_ml` training. Run ~10 min on a clean host.
     CaptureBaseline {
         /// JSON-Lines output file.
         #[arg(long, default_value = "baseline_capture.jsonl")]

@@ -1,6 +1,6 @@
 //! The Windows sensor: ETW providers (Kernel-Process, Kernel-Network, Kernel-File)
 //! normalized into schema events. Migrated from the old iteration; the provider
-//! wiring and its lab-earned notes (TcpClient emits no eid=42 — 2026-08-25; PID
+//! wiring and its lab-earned notes (`TcpClient` emits no eid=42 — 2026-08-25; PID
 //! recycling; orphan named sessions) carry over, the audit findings are fixed here.
 
 use std::{
@@ -34,7 +34,7 @@ fn session_state_path() -> std::path::PathBuf {
 
 /// Stops an orphaned ETW session, if one exists. Named sessions are kernel objects
 /// that outlive the creating process: after a `taskkill /f` or crash the session
-/// stays Running and any restart fails with AlreadyExist — without this cleanup the
+/// stays Running and any restart fails with `AlreadyExist` — without this cleanup the
 /// agent could never restart after an unclean shutdown, defeating the watchdog.
 fn stop_orphaned_session(name: &str) {
     let out = std::process::Command::new("logman")
@@ -52,8 +52,8 @@ fn stop_orphaned_session(name: &str) {
 // ── Shared state between provider callbacks ──────────────────────────────────
 
 struct SharedState {
-    /// pid → full image path; populated by seed + ProcessStart, pruned on
-    /// ProcessEnd (PID recycling).
+    /// pid → full image path; populated by seed + `ProcessStart`, pruned on
+    /// `ProcessEnd` (PID recycling).
     pids: Mutex<HashMap<u32, String>>,
     /// F-5: live device→drive map, refreshed on normalization misses.
     volumes: Mutex<HashMap<String, String>>,
@@ -306,6 +306,7 @@ pub struct WindowsSensor {
 }
 
 impl WindowsSensor {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             stop: Arc::new(AtomicBool::new(false)),
@@ -313,6 +314,7 @@ impl WindowsSensor {
     }
 
     /// Shared stop flag for a ctrlc handler on another thread.
+    #[must_use]
     pub fn stop_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.stop)
     }

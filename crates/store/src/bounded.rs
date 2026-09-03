@@ -15,7 +15,11 @@ pub struct BoundedMap<K, V> {
 }
 
 impl<K: Eq + Hash + Clone, V> BoundedMap<K, V> {
-    /// `cap` must be at least 1.
+    /// # Panics
+    ///
+    /// Panics when `cap` is 0 — a zero-capacity LRU is a configuration bug, not
+    /// a runtime condition.
+    #[must_use]
     pub fn new(cap: usize) -> Self {
         assert!(cap >= 1, "BoundedMap cap must be >= 1");
         Self {
@@ -59,6 +63,10 @@ impl<K: Eq + Hash + Clone, V> BoundedMap<K, V> {
         self.entries.get(key).map(|(v, _)| v)
     }
 
+    /// # Panics
+    ///
+    /// The internal `expect` is unreachable: the entry was just inserted or
+    /// already present, and batch eviction always spares the freshest entry.
     pub fn get_or_insert_with(&mut self, key: K, default: impl FnOnce() -> V) -> &mut V {
         let tick = self.next_tick();
         if !self.entries.contains_key(&key) {
@@ -81,10 +89,12 @@ impl<K: Eq + Hash + Clone, V> BoundedMap<K, V> {
         }
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -97,6 +107,7 @@ impl<K: Eq + Hash + Clone, V> BoundedMap<K, V> {
 
     /// Entries evicted over the map's lifetime — bounded state loses information by
     /// design; the count keeps the loss observable.
+    #[must_use]
     pub fn evicted(&self) -> u64 {
         self.evicted
     }

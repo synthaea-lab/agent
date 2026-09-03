@@ -15,29 +15,30 @@ use crate::event::is_file_write;
 /// Per-PID behavioral vector — 9 features extracted from the sliding window.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BehaviorVector {
-    /// 1.0 if there is at least one ExecEvent in the window for this PID.
+    /// 1.0 if there is at least one `ExecEvent` in the window for this PID.
     pub has_exec: f32,
-    /// 1.0 if there is at least one ConnectEvent in the window for this PID.
+    /// 1.0 if there is at least one `ConnectEvent` in the window for this PID.
     pub has_connect: f32,
-    /// 1.0 if there is at least one FileOpenEvent with a write flag for this PID.
+    /// 1.0 if there is at least one `FileOpenEvent` with a write flag for this PID.
     pub has_filewrite: f32,
     /// Delay in ms between the first Exec and the first Connect (0.0 if either is absent).
     pub time_exec_to_connect_ms: f32,
-    /// Delay in ms between the first Exec and the first FileWrite (0.0 if either is absent).
+    /// Delay in ms between the first Exec and the first `FileWrite` (0.0 if either is absent).
     pub time_exec_to_filewrite_ms: f32,
-    /// 1.0 if the ExecEvent comes from a suspicious path (AppData/Temp/Downloads/Desktop).
+    /// 1.0 if the `ExecEvent` comes from a suspicious path (AppData/Temp/Downloads/Desktop).
     pub is_suspicious_path: f32,
-    /// Number of ConnectEvents in the window.
+    /// Number of `ConnectEvents` in the window.
     pub connect_count: f32,
-    /// Number of distinct destination ports among the ConnectEvents.
+    /// Number of distinct destination ports among the `ConnectEvents`.
     pub distinct_dports: f32,
-    /// 1.0 if there is at least one ConnectEvent to a non-RFC1918, non-loopback IP.
+    /// 1.0 if there is at least one `ConnectEvent` to a non-RFC1918, non-loopback IP.
     pub dest_is_external: f32,
 }
 
 impl BehaviorVector {
     /// Features as an ordered vector, compatible with the format expected
     /// by the ML pipeline's behavior features and the LLR calibration.
+    #[must_use]
     pub fn to_vec(&self) -> Vec<f32> {
         vec![
             self.has_exec,
@@ -161,8 +162,8 @@ fn is_suspicious_image_path(path: &str) -> bool {
 /// unidentified): without this exclusion, the unspecified address was classified as
 /// external by default, contributing to `dest_is_external` Bayesian LLR on traffic
 /// unrelated to any real C2.
-/// Loopback, unspecified, link-local (fe80::/10), unique-local (fc00::/7),
-/// multicast (ff00::/8) — the non-global classes legitimate local traffic uses.
+/// Loopback, unspecified, link-local (`fe80::/10`), unique-local (`fc00::/7`),
+/// multicast (`ff00::/8`) — the non-global classes legitimate local traffic uses.
 fn is_non_global_ipv6(addr: std::net::Ipv6Addr) -> bool {
     let seg = addr.segments();
     addr.is_loopback()

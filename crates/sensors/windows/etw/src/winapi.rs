@@ -49,10 +49,12 @@ unsafe extern "system" {
 
 /// Reads the target's real command line from its PEB
 /// (`PEB → ProcessParameters → CommandLine`). This is what fixes F-1: the encoded
-/// PowerShell payload, the LOLBin arguments — everything the ETW ProcessStart event
+/// `PowerShell` payload, the `LOLBin` arguments — everything the ETW `ProcessStart` event
 /// does not carry. `None` on any failure (protected process, already exited, WOW64
 /// mismatch) — the caller falls back to the image path, never fabricates.
 pub(crate) fn read_process_cmdline(pid: u32) -> Option<String> {
+    // SAFETY: OpenProcess returns either null (checked) or a handle we own and
+    // close on every path; read_cmdline_from_handle only receives the live handle.
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid);
         if handle.is_null() {
@@ -65,6 +67,10 @@ pub(crate) fn read_process_cmdline(pid: u32) -> Option<String> {
 }
 
 unsafe fn read_cmdline_from_handle(handle: HANDLE) -> Option<String> {
+    // SAFETY: every ReadProcessMemory call passes a valid destination pointer
+    // with a matching length, checks the return code, and the final read is
+    // bounded by the UNICODE_STRING's own u16 length; pointers read from the
+    // target's PEB are used only as remote addresses, never dereferenced locally.
     unsafe {
         let mut pbi: ProcessBasicInformation = core::mem::zeroed();
         let mut ret_len = 0u32;
@@ -145,6 +151,8 @@ unsafe fn read_cmdline_from_handle(handle: HANDLE) -> Option<String> {
 /// Resolves the user the process runs as. `User::Unknown` on failure — the
 /// capabilities flag stays honest either way.
 pub(crate) fn read_process_user(pid: u32) -> User {
+    // SAFETY: process and token handles are null-checked and closed on every
+    // path; token_sid_string/token_integrity_rid only see live handles.
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if process.is_null() {
@@ -176,6 +184,9 @@ pub(crate) fn read_process_user(pid: u32) -> User {
 }
 
 unsafe fn token_sid_string(token: HANDLE) -> Option<String> {
+    // SAFETY: the buffer is sized by the first GetTokenInformation call and the
+    // TOKEN_USER cast reads within it; the SID string is measured to its NUL and
+    // freed with LocalFree exactly once.
     unsafe {
         let mut needed = 0u32;
         GetTokenInformation(token, TokenUser, core::ptr::null_mut(), 0, &mut needed);
@@ -209,6 +220,8 @@ unsafe fn token_sid_string(token: HANDLE) -> Option<String> {
 }
 
 unsafe fn token_integrity_rid(token: HANDLE) -> Option<u32> {
+    // SAFETY: the buffer is sized by the first GetTokenInformation call; the SID
+    // sub-authority read is bounded by the SID's own count byte (checked > 0).
     unsafe {
         let mut needed = 0u32;
         GetTokenInformation(
@@ -254,6 +267,8 @@ pub(crate) fn build_volume_map() -> HashMap<String, String> {
     for letter in b'A'..=b'Z' {
         let drive: [u16; 3] = [letter as u16, b':' as u16, 0];
         let mut target = [0u16; 512];
+        // SAFETY: both buffers are valid for the lengths passed (drive is
+        // NUL-terminated, target is 512 wide chars as declared).
         let n = unsafe { QueryDosDeviceW(drive.as_ptr(), target.as_mut_ptr(), 512) };
         if n == 0 {
             continue;
@@ -277,6 +292,9 @@ pub(crate) fn build_volume_map() -> HashMap<String, String> {
 /// the rules' parent-side exclusions apply to pre-existing parents.
 pub(crate) fn snapshot_processes() -> Vec<(u32, String)> {
     let mut out = Vec::new();
+    // SAFETY: the snapshot handle is checked against INVALID_HANDLE_VALUE and
+    // closed; PROCESSENTRY32W is zeroed with dwSize set before the first call,
+    // and szExeFile reads are bounded by its NUL (or full length).
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snap == INVALID_HANDLE_VALUE {
@@ -307,9 +325,11 @@ pub(crate) fn snapshot_processes() -> Vec<(u32, String)> {
 }
 
 /// Live pid → image name via Win32 — the fallback for the ETW race where a
-/// ConnectEvent arrives before the ExecEvent populated the store.
+/// `ConnectEvent` arrives before the `ExecEvent` populated the store.
 /// `PROCESS_QUERY_LIMITED_INFORMATION` needs no admin privileges.
 pub(crate) fn resolve_pid_live(pid: u32) -> Option<String> {
+    // SAFETY: the handle is null-checked and closed on every path; the buffer
+    // length in/out contract of QueryFullProcessImageNameW is respected.
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {

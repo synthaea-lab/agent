@@ -12,7 +12,7 @@ use crate::behavior::BehaviorVector;
 pub(crate) const PRIOR_LOG_ODDS: f32 = -4.6;
 /// Decay toward the prior over ~5 min of inactivity.
 const DECAY_TAU_S: f32 = 300.0;
-/// Alert threshold: log_odds > 2.0 → P(compromised) ≈ 88%.
+/// Alert threshold: `log_odds` > 2.0 → P(compromised) ≈ 88%.
 pub(crate) const BAYES_THRESHOLD: f32 = 2.0;
 
 /// Bayesian belief state for an entity (ppid, comm).
@@ -21,12 +21,12 @@ pub(crate) const BAYES_THRESHOLD: f32 = 2.0;
 #[derive(Debug, Clone)]
 pub struct BeliefState {
     /// Log of the odds ratio P(malicious) / P(benign).
-    /// Initial value: PRIOR_LOG_ODDS (~1%).
+    /// Initial value: `PRIOR_LOG_ODDS` (~1%).
     pub log_odds: f32,
     /// Timestamp of the last update — used to compute the decay.
     pub last_update_ns: u64,
     /// true if an alert has already been emitted for this threshold crossing.
-    /// Reset to false when log_odds drops back below BAYES_THRESHOLD (decay).
+    /// Reset to false when `log_odds` drops back below `BAYES_THRESHOLD` (decay).
     pub(crate) alerted: bool,
 }
 
@@ -40,6 +40,7 @@ impl BeliefState {
     }
 
     /// Current compromise probability (0.0–1.0).
+    #[must_use]
     pub fn probability(&self) -> f32 {
         let odds = self.log_odds.exp();
         odds / (1.0 + odds)
@@ -47,7 +48,7 @@ impl BeliefState {
 }
 
 /// Log-likelihood ratio for the feature at index `idx`.
-/// Calibrated empirically on the NjRAT capture (n_benign=97, n_malicious=23) on
+/// Calibrated empirically on the `NjRAT` capture (`n_benign=97`, `n_malicious=23`) on
 /// 2026-08-28. Naive independence assumption: the LLRs are summed.
 fn log_likelihood_ratio(idx: usize, value: f32) -> f32 {
     match idx {
@@ -117,7 +118,7 @@ fn log_likelihood_ratio(idx: usize, value: f32) -> f32 {
     }
 }
 
-/// Updates an entity's belief with the current BehaviorVector.
+/// Updates an entity's belief with the current `BehaviorVector`.
 /// First applies the exponential decay toward the prior, then the Bayesian update.
 pub(crate) fn update_belief(state: &mut BeliefState, v: &BehaviorVector, now_ns: u64) {
     // Exponential decay toward the prior when inactive

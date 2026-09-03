@@ -1,7 +1,7 @@
 //! # sensor-linux
 //!
 //! Linux platform sensor (userspace side). Loads and attaches the eBPF probes from
-//! `sensor-linux-ebpf` (compiled into OUT_DIR by build.rs when the eBPF toolchain is
+//! `sensor-linux-ebpf` (compiled into `OUT_DIR` by build.rs when the eBPF toolchain is
 //! present), drains their ring buffers, normalizes the wire structs into `schema`
 //! events, and feeds them to the `EventSink`.
 //!

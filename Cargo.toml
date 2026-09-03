@@ -92,6 +92,22 @@ publish = false
 license = "Apache-2.0"
 edition = "2024"
 
+[workspace.lints.clippy]
+# Hard bans: debug/placeholder constructs never ship.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+# Every unsafe block carries a `// SAFETY:` comment explaining its invariants.
+undocumented_unsafe_blocks = "deny"
+# Curated pedantic subset (CI runs clippy with -D warnings, so these are enforced).
+# Not enabled: similar_names — its only hits are the pid/ppid pair, which is
+# kernel nomenclature; renaming either would hurt readability.
+doc_markdown = "warn"
+must_use_candidate = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+semicolon_if_nothing_returned = "warn"
+
 [workspace.dependencies]
 # Shared dependency versions are declared here as crates gain real code.
 serde = { version = "1", features = ["derive"] }

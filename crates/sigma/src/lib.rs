@@ -1,6 +1,6 @@
 //! # sigma
 //!
-//! Minimal Sigma evaluation engine (https://sigmahq.io), migrated from
+//! Minimal Sigma evaluation engine (<https://sigmahq.io>), migrated from
 //! `old/crates/synthaea-sigma`. Supported subset:
 //! - `Image`, `CommandLine`, and `ParentImage` fields mapped onto [`schema::ExecEvent`]
 //!   (`ParentImage` uses the lineage field sensors fill when they can — a rule using it

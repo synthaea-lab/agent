@@ -50,6 +50,72 @@ impl DetectionSink {
         })
     }
 
+    /// Enrichment first, so the logged event and every engine see hash+signature.
+    /// Budgeted: cache hit is a stat; miss is one bounded hash + one offline
+    /// signature check (see crates/enrich docs).
+    fn enrich(&self, event: &mut Event) {
+        if let Event::Exec(e) = event
+            && !e.image_path.is_empty()
+            && e.sha256.is_none()
+        {
+            let enrichment = self
+                .enricher
+                .lock()
+                .unwrap()
+                .enrich(std::path::Path::new(&e.image_path));
+            e.sha256 = enrichment.sha256;
+            e.signature = Some(enrichment.signature);
+        }
+    }
+
+    /// Cross-event correlation (co-occurrence rules + Bayesian belief).
+    fn correlate(&self, event: &Event) {
+        for alert in self.correlator.lock().unwrap().on_event(event.clone()) {
+            self.emit(alert.technique, &alert.message);
+        }
+    }
+
+    /// Exec events: stateless rules, stateful rules, then Sigma.
+    fn detect_exec(&self, event: &schema::ExecEvent) {
+        for alert in rules::evaluate_exec(event) {
+            self.emit(alert.technique, &alert.message);
+        }
+        for alert in self.rule_state.lock().unwrap().on_exec(event) {
+            self.emit(alert.technique, &alert.message);
+        }
+        if let Some(sigma) = &self.sigma {
+            for hit in sigma.eval_exec(event) {
+                let technique = if hit.tags.is_empty() {
+                    "Sigma".to_string()
+                } else {
+                    hit.tags.join("/")
+                };
+                self.emit(&technique, &hit.title);
+            }
+        }
+    }
+
+    /// `FileOpen` events: stateless rules, downloader-write history, and the
+    /// budgeted YARA queue on write intent (off the event path).
+    fn detect_file_open(&self, event: &schema::FileOpenEvent) {
+        for alert in rules::evaluate_file_open(event) {
+            self.emit(alert.technique, &alert.message);
+        }
+        self.rule_state.lock().unwrap().on_file_open(event);
+        if let Some(yara) = &self.yara
+            && event.flags & 0o103 != 0
+        {
+            yara.enqueue(std::path::PathBuf::from(&event.path));
+        }
+    }
+
+    /// Connect events: beacon detection.
+    fn detect_connect(&self, event: &schema::ConnectEvent) {
+        for alert in self.rule_state.lock().unwrap().on_connect(event) {
+            self.emit(alert.technique, &alert.message);
+        }
+    }
+
     fn emit(&self, technique: &str, message: &str) {
         // Alerts go to stderr (stdout carries nothing in run mode; the raw stream
         // lives in events.jsonl) and are highlighted — an alert must not get lost in
@@ -81,7 +147,7 @@ fn content_dir(name: &str) -> Option<std::path::PathBuf> {
 }
 
 /// Loads the Sigma content directory if present. Migrated from the old agent's
-/// load_sigma_rules.
+/// `load_sigma_rules`.
 fn load_sigma_rules() -> Option<sigma::SigmaEngine> {
     let rules_dir = content_dir("rules/sigma")?;
     match sigma::SigmaEngine::load_dir(&rules_dir) {
@@ -131,60 +197,16 @@ fn now_epoch_ns() -> u64 {
 
 impl EventSink for DetectionSink {
     fn on_event(&self, mut event: Event) {
-        // Enrichment first, so the logged event and every engine see hash+signature.
-        // Budgeted: cache hit is a stat; miss is one bounded hash + one offline
-        // signature check (see crates/enrich docs).
-        if let Event::Exec(e) = &mut event
-            && !e.image_path.is_empty()
-            && e.sha256.is_none()
-        {
-            let enrichment = self
-                .enricher
-                .lock()
-                .unwrap()
-                .enrich(std::path::Path::new(&e.image_path));
-            e.sha256 = enrichment.sha256;
-            e.signature = Some(enrichment.signature);
-        }
+        self.enrich(&mut event);
         self.events_log.write(&event);
-        let mut alerts = Vec::new();
-        for alert in self.correlator.lock().unwrap().on_event(event.clone()) {
-            self.emit(alert.technique, &alert.message);
-        }
+        self.correlate(&event);
         match &event {
-            Event::Exec(e) => {
-                alerts.extend(rules::evaluate_exec(e));
-                alerts.extend(self.rule_state.lock().unwrap().on_exec(e));
-                if let Some(sigma) = &self.sigma {
-                    for hit in sigma.eval_exec(e) {
-                        let technique = if hit.tags.is_empty() {
-                            "Sigma".to_string()
-                        } else {
-                            hit.tags.join("/")
-                        };
-                        self.emit(&technique, &hit.title);
-                    }
-                }
-            }
-            Event::FileOpen(e) => {
-                alerts.extend(rules::evaluate_file_open(e));
-                self.rule_state.lock().unwrap().on_file_open(e);
-                // Content scan on write intent, off the event path (budgeted queue).
-                if let Some(yara) = &self.yara
-                    && e.flags & 0o103 != 0
-                {
-                    yara.enqueue(std::path::PathBuf::from(&e.path));
-                }
-            }
-            Event::Connect(e) => {
-                alerts.extend(self.rule_state.lock().unwrap().on_connect(e));
-            }
+            Event::Exec(e) => self.detect_exec(e),
+            Event::FileOpen(e) => self.detect_file_open(e),
+            Event::Connect(e) => self.detect_connect(e),
             // New telemetry categories reach the engines as they land; until a rule
             // consumes them, logging above is the whole treatment.
             _ => {}
-        }
-        for alert in alerts {
-            self.emit(alert.technique, &alert.message);
         }
     }
 }
@@ -194,7 +216,7 @@ impl EventSink for DetectionSink {
 /// Minimal sink for ML baseline capture: records only the cmdlines of exec events
 /// that trigger NO deterministic rule — the "known benign under current rules"
 /// corpus consumed by `synthaea_ml` training. Migrated from the old agent's
-/// BaselineSink, now platform-neutral (any sensor speaking the contract feeds it).
+/// `BaselineSink`, now platform-neutral (any sensor speaking the contract feeds it).
 pub(crate) struct BaselineSink {
     rule_state: Mutex<rules::RuleState>,
     out: JsonlWriter,

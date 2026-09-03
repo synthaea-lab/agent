@@ -114,6 +114,11 @@ fn average_path_length(n: f64) -> f64 {
 impl Forest {
     /// Parses the tree structure (and per-leaf sample counts where present) out of a
     /// serialized ONNX model.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError`] when the bytes are not a parseable ONNX graph or the
+    /// graph does not contain the expected `TreeEnsembleRegressor` structure.
     pub fn from_onnx_bytes(model: &[u8]) -> Result<Self, ParseError> {
         let graph = find_graph(model)?;
         let parsed = parse_graph(graph)?;
@@ -140,10 +145,12 @@ impl Forest {
     }
 
     /// Number of input features the ensemble reads (highest referenced index + 1).
+    #[must_use]
     pub fn n_features(&self) -> usize {
         self.n_features
     }
 
+    #[must_use]
     pub fn n_trees(&self) -> usize {
         self.trees.len()
     }
@@ -152,6 +159,11 @@ impl Forest {
     ///
     /// `x` must have at least [`Forest::n_features`] values (extra values are
     /// ignored, matching how a model reads only the columns it was trained on).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError::Inconsistent`] when `x` is shorter than the model's
+    /// feature space.
     pub fn attribute(&self, x: &[f32]) -> Result<Attribution, ParseError> {
         if x.len() < self.n_features {
             return Err(ParseError::Inconsistent(
@@ -208,6 +220,7 @@ impl Forest {
 
 /// The top-k attributions by absolute contribution, paired with the feature values
 /// the model saw — ready to attach to a `schema::detection::Detection`.
+#[must_use]
 pub fn top_attributions(
     attribution: &Attribution,
     x: &[f32],
@@ -323,7 +336,7 @@ fn parse_graph(graph: &[u8]) -> Result<ParsedGraph<'_>, ParseError> {
     Ok(parsed)
 }
 
-/// `NodeProto`: input = 1, output = 2, op_type = 4, attribute = 5.
+/// `NodeProto`: input = 1, output = 2, `op_type` = 4, attribute = 5.
 fn parse_node(node: &[u8]) -> Result<GraphNode<'_>, ParseError> {
     let mut parsed = GraphNode {
         op_type: b"",
@@ -348,7 +361,7 @@ fn parse_node(node: &[u8]) -> Result<GraphNode<'_>, ParseError> {
 /// An INT64 initializer: (tensor name, values).
 type Int64Initializer<'a> = (&'a [u8], Vec<i64>);
 
-/// `TensorProto`: data_type = 2, int64_data = 7, name = 8, raw_data = 9.
+/// `TensorProto`: `data_type` = 2, `int64_data` = 7, name = 8, `raw_data` = 9.
 /// Returns `Some((name, values))` for INT64 tensors, `None` for every other type.
 fn parse_int64_initializer(tensor: &[u8]) -> Result<Option<Int64Initializer<'_>>, ParseError> {
     const INT64: u64 = 7;
@@ -430,7 +443,7 @@ struct LeafEncoder {
 }
 
 /// Finds the `LabelEncoder`s hanging off a tree node's output (via `Cast`):
-/// skl2onnx's IsolationForest converter emits one mapping leaf id → path length and
+/// skl2onnx's `IsolationForest` converter emits one mapping leaf id → path length and
 /// one mapping leaf id → training-sample count. Which is which is decided later
 /// against the actual tree structure ([`pick_sample_counts`]) — never by node name.
 fn leaf_encoders(
