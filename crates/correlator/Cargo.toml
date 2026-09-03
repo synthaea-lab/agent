@@ -8,3 +8,4 @@ publish.workspace = true
 
 [dependencies]
 schema = { path = "../schema" }
+store = { path = "../store" }

@@ -1,7 +1,9 @@
 //! The engine: receives events from the sensor, feeds the bus, evaluates the
 //! co-occurrence rules and the Bayesian belief, and emits alerts.
 
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
+
+use store::BoundedMap;
 
 use schema::Event;
 
@@ -52,13 +54,20 @@ fn is_ignored(comm: &str) -> bool {
 /// and evaluates the co-occurrence rules over the current window.
 pub struct CorrelationEngine {
     bus: EventBus,
-    /// Bayesian beliefs per entity (ppid, comm).
+    /// Bayesian beliefs per entity (ppid, comm), LRU-bounded (`store::BoundedMap`) —
+    /// the old iteration's unbounded HashMap was a documented known limitation.
     /// Keyed by (ppid, comm), not pid: survives respawns.
-    beliefs: HashMap<(u32, String), BeliefState>,
-    /// pid → (ppid, comm) mapping populated by ExecEvents.
+    beliefs: BoundedMap<(u32, String), BeliefState>,
+    /// pid → (ppid, comm) mapping populated by ExecEvents, LRU-bounded.
     /// Lets ConnectEvents (ppid=0) find the right entity key.
-    pid_entities: HashMap<u32, (u32, String)>,
+    pid_entities: BoundedMap<u32, (u32, String)>,
 }
+
+/// Bounds for a long-lived agent: entities cover the realistic live-pid space with
+/// headroom; beliefs are fewer (one per logical entity, not per pid). Evictions are
+/// observable via the maps' counters.
+const ENTITY_CAP: usize = 65_536;
+const BELIEF_CAP: usize = 16_384;
 
 impl CorrelationEngine {
     /// Default window: 60 seconds.
@@ -69,8 +78,8 @@ impl CorrelationEngine {
     pub fn with_window(window: Duration) -> Self {
         Self {
             bus: EventBus::new(window),
-            beliefs: HashMap::new(),
-            pid_entities: HashMap::new(),
+            beliefs: BoundedMap::new(BELIEF_CAP),
+            pid_entities: BoundedMap::new(ENTITY_CAP),
         }
     }
 
@@ -115,8 +124,7 @@ impl CorrelationEngine {
                 .unwrap_or(0);
             let state = self
                 .beliefs
-                .entry(entity_key.clone())
-                .or_insert_with(|| BeliefState::new(now_ns));
+                .get_or_insert_with(entity_key.clone(), || BeliefState::new(now_ns));
             update_belief(state, &bv, now_ns);
         }
 
@@ -163,13 +171,13 @@ impl CorrelationEngine {
     /// otherwise rebuilds the fallback key (pid, comm) from the bus — consistent
     /// with the fallback used in on_event.
     pub fn belief_for_pid(&self, pid: u32) -> Option<&BeliefState> {
-        if let Some(entity_key) = self.pid_entities.get(&pid) {
-            return self.beliefs.get(entity_key);
+        if let Some(entity_key) = self.pid_entities.peek(&pid) {
+            return self.beliefs.peek(entity_key);
         }
         // Fallback: recover the comm from the bus to rebuild the same key
         // as the one inserted in on_event — (pid, comm.clone()).
         let comm = self.bus.events_for_pid(pid).next()?.meta().comm.clone();
-        self.beliefs.get(&(pid, comm))
+        self.beliefs.peek(&(pid, comm))
     }
 
     /// Evaluates all the co-occurrence rules for a given pid.

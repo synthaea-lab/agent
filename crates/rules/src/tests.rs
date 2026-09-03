@@ -140,7 +140,7 @@ fn seed_from_proc_finds_own_pid_comm() {
         .unwrap()
         .trim_end()
         .to_string();
-    assert_eq!(state.pid_comm.get(&own_pid), Some(&expected_comm));
+    assert_eq!(state.pid_comm.peek(&own_pid), Some(&expected_comm));
 }
 
 #[test]

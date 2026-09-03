@@ -25,7 +25,7 @@ its code comes from. Dependency direction between them is enforced by
 | `enrich` | Cross-platform enrichment: hashing, code signing, file metadata | skeleton | new development |
 | `policy` | Policy model shared by agent and control plane (versioned, signed) | skeleton | new development |
 | `config` | Local agent configuration loading and validation | skeleton | new development |
-| `store` | Bounded local state: entity store (process graph) + event spool | skeleton | new development |
+| `store` | Bounded local state: LRU-bounded maps (BoundedMap) + durable event spool | **built** | issue #15 |
 | `response` | Response actions — kill, quarantine, isolate | skeleton | new development |
 | `live-response` | Live response: analyst-driven interactive sessions (fixed command set, audited) | skeleton | new development |
 | `transport` | Agent ↔ control-plane comms — mTLS, store-and-forward | skeleton | new development |

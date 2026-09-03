@@ -4,6 +4,8 @@
 
 use std::{collections::HashMap, net::IpAddr};
 
+use store::BoundedMap;
+
 use schema::{ConnectEvent, ExecEvent, FileOpenEvent};
 
 use crate::{Alert, has_write_intent};
@@ -148,12 +150,12 @@ type WindowedCounter = (u32, u64, bool);
 /// production agent): no eviction of old entries beyond the correlation window of
 /// `check_download_then_exec`. Known limitation — the bounded entity store
 /// (`crates/store`, issue #15) takes this over.
-#[derive(Default)]
 pub struct RuleState {
     /// pid → comm of the last exec seen for this pid, to recover the parent's comm
     /// (T1059) with a simple `ppid` lookup without having to walk the process tree in
-    /// userspace. `pub(crate)` for the `seed_from_proc_finds_own_pid_comm` test.
-    pub(crate) pid_comm: HashMap<u32, String>,
+    /// userspace. LRU-bounded (`store::BoundedMap`) — a long-lived agent must not
+    /// grow this without limit. `pub(crate)` for the seed_from_proc test.
+    pub(crate) pid_comm: BoundedMap<u32, String>,
     /// path → info about the last write by a known downloader (T1105).
     recent_writes: HashMap<String, RecentWrite>,
     /// (ppid, comm) → windowed counter for SELF-SPAWN (T1059 Windows).
@@ -162,9 +164,23 @@ pub struct RuleState {
     beacon: HashMap<(String, String, u16), WindowedCounter>,
 }
 
+/// Same bound as the correlator's entity table: the realistic live-pid space.
+const PID_COMM_CAP: usize = 65_536;
+
+impl Default for RuleState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RuleState {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            pid_comm: BoundedMap::new(PID_COMM_CAP),
+            recent_writes: HashMap::new(),
+            self_spawn: HashMap::new(),
+            beacon: HashMap::new(),
+        }
     }
 
     /// Pre-fills `pid_comm` from an external table (pid → comm) — the Windows
@@ -214,7 +230,7 @@ impl RuleState {
     /// time — true in the vast majority of cases, the child executing right after the
     /// fork.
     pub(crate) fn resolve_comm(&self, pid: u32) -> Option<String> {
-        if let Some(comm) = self.pid_comm.get(&pid) {
+        if let Some(comm) = self.pid_comm.peek(&pid) {
             return Some(comm.clone());
         }
         std::fs::read_to_string(format!("/proc/{pid}/comm"))
@@ -301,7 +317,7 @@ impl RuleState {
         // child in a loop (e.g. RuntimeBroker.exe → powershell.exe for UWP tasks).
         let parent_comm = self
             .pid_comm
-            .get(&event.meta.ppid)
+            .peek(&event.meta.ppid)
             .cloned()
             .unwrap_or_default();
         if SELF_SPAWN_PARENT_EXCLUSIONS

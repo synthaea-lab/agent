@@ -350,6 +350,7 @@ name = "correlator"
 version = "0.1.0"
 dependencies = [
  "schema",
+ "store",
 ]
 
 [[package]]
@@ -641,6 +642,7 @@ name = "rules"
 version = "0.1.0"
 dependencies = [
  "schema",
+ "store",
 ]
 
 [[package]]
@@ -846,6 +848,12 @@ dependencies = [
 [[package]]
 name = "store"
 version = "0.1.0"
+dependencies = [
+ "log",
+ "schema",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "strsim"
