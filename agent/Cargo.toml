@@ -12,6 +12,7 @@ rules = { path = "../crates/rules" }
 correlator = { path = "../crates/correlator" }
 sigma = { path = "../crates/sigma" }
 enrich = { path = "../crates/enrich" }
+yara = { path = "../crates/yara" }
 sinks = { path = "../crates/sinks" }
 
 anyhow = "1"

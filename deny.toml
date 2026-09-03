@@ -8,6 +8,20 @@ all-features = true
 # RUSTSEC advisories: any vulnerable or yanked dependency fails the build.
 version = 2
 yanked = "deny"
+# Scoped, justified exceptions — each names its blast radius and revisit condition.
+ignore = [
+    # bincode team ceased development; yara-x uses it only for (de)serializing OUR
+    # compiled rule sets, a format we produce and consume ourselves. Revisit when
+    # yara-x moves off bincode.
+    "RUSTSEC-2025-0141",
+    # Both wasmtime advisories require hostile/attacker-supplied WASM or WASI use.
+    # yara-x's wasmtime executes only the module its own compiler emits from our
+    # signed rule content and exposes no WASI to rules — attacker-controlled input
+    # reaches it as scanned DATA, not as code. Bump wasmtime the moment yara-x's
+    # requirement allows a fixed release.
+    "RUSTSEC-2026-0222",
+    "RUSTSEC-2026-0269",
+]
 
 [licenses]
 version = 2

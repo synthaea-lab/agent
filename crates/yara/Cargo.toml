@@ -1,9 +1,13 @@
 [package]
 name = "yara"
 version = "0.1.0"
-description = "YARA-X file and memory scanning"
+description = "YARA-X content scanning: budgeted scan queue feeding detections"
 license.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+schema = { path = "../schema" }
+yara-x = { version = "1", default-features = false }
+thiserror = { workspace = true }
+log = { version = "0.4", default-features = false }

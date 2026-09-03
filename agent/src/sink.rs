@@ -4,7 +4,7 @@
 //! scorer plug in here as their crates are migrated (M2), each addition a new field
 //! and a few lines in `on_event`.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use schema::{Event, sensor::EventSink};
 use sinks::{AlertRecord, JsonlWriter};
@@ -22,8 +22,10 @@ pub(crate) struct DetectionSink {
     sigma: Option<sigma::SigmaEngine>,
     /// Hash + code-signature enrichment, cached by (path, mtime, size).
     enricher: Mutex<enrich::Enricher>,
-    /// One alert per line in alerts.ndjson.
-    alert_log: JsonlWriter,
+    /// One alert per line in alerts.ndjson (shared with the YARA scan worker).
+    alert_log: Arc<JsonlWriter>,
+    /// Budgeted background content scanning; `None` when rules/yara is absent.
+    yara: Option<yara::ScanQueue>,
     /// Raw event log (one normalized event per line) for calibration/ML training.
     events_log: JsonlWriter,
 }
@@ -36,12 +38,14 @@ impl DetectionSink {
         alerts_path: &std::path::Path,
         events_path: &std::path::Path,
     ) -> std::io::Result<Self> {
+        let alert_log = Arc::new(JsonlWriter::open(alerts_path)?);
         Ok(Self {
             rule_state: Mutex::new(rule_state),
             correlator: Mutex::new(correlator::CorrelationEngine::new()),
             sigma: load_sigma_rules(),
             enricher: Mutex::new(enrich::Enricher::new()),
-            alert_log: JsonlWriter::open(alerts_path)?,
+            yara: start_yara(alert_log.clone()),
+            alert_log,
             events_log: JsonlWriter::open(events_path)?,
         })
     }
@@ -73,6 +77,35 @@ fn load_sigma_rules() -> Option<sigma::SigmaEngine> {
         }
         Err(e) => {
             log::error!("sigma: load error: {e}");
+            None
+        }
+    }
+}
+
+/// Loads rules/yara when present and starts the scan worker; matches are emitted as
+/// alerts by the worker thread through the shared alert log.
+fn start_yara(alert_log: Arc<JsonlWriter>) -> Option<yara::ScanQueue> {
+    let dir = std::path::Path::new("rules/yara");
+    if !dir.is_dir() {
+        return None;
+    }
+    match yara::RuleSet::load_dir(dir) {
+        Ok(rules) => {
+            log::info!("yara: {} rule files loaded", rules.rule_file_count());
+            Some(yara::ScanQueue::start(rules, move |outcome| {
+                for rule in &outcome.matches {
+                    let message = format!("yara rule {rule} matched {}", outcome.path.display());
+                    eprintln!("\x1b[1;31m[ALERT] YARA — {message}\x1b[0m");
+                    alert_log.write(&AlertRecord {
+                        timestamp_ns: now_epoch_ns(),
+                        technique: "YARA".to_string(),
+                        message,
+                    });
+                }
+            }))
+        }
+        Err(e) => {
+            log::error!("yara: load error: {e}");
             None
         }
     }
@@ -125,6 +158,12 @@ impl EventSink for DetectionSink {
             Event::FileOpen(e) => {
                 alerts.extend(rules::evaluate_file_open(e));
                 self.rule_state.lock().unwrap().on_file_open(e);
+                // Content scan on write intent, off the event path (budgeted queue).
+                if let Some(yara) = &self.yara
+                    && e.flags & 0o103 != 0
+                {
+                    yara.enqueue(std::path::PathBuf::from(&e.path));
+                }
             }
             Event::Connect(e) => {
                 alerts.extend(self.rule_state.lock().unwrap().on_connect(e));

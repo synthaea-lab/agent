@@ -20,7 +20,7 @@ its code comes from. Dependency direction between them is enforced by
 | `sigma` | Sigma rule parsing and compilation | **migrated** | `old/` (issue #11) |
 | `correlator` | Correlation + scoring — builds cases from detections | **migrated** | `old/` (issue #12) |
 | `ml` | On-device ONNX inference + feature extraction | skeleton | migrate from `old/` |
-| `yara` | YARA-X file and memory scanning, feeding detections to the correlator | skeleton | new development |
+| `yara` | YARA-X file scanning: budgeted queue, content suite in CI | **built** | issue #17 |
 | `intel` | IOC matching: hash/IP/domain indicator sets, canary-ring distributed | skeleton | new development |
 | `enrich` | Cross-platform enrichment: cached SHA-256 + code-signature verdicts | **built** | issue #16 |
 | `policy` | Policy model shared by agent and control plane (versioned, signed) | skeleton | new development |
