@@ -1,7 +1,7 @@
 [package]
-name = "rtr"
+name = "live-response"
 version = "0.1.0"
-description = "Real Time Response: analyst-driven live sessions on an endpoint"
+description = "Live response: analyst-driven interactive sessions on a running endpoint"
 license.workspace = true
 edition.workspace = true
 publish.workspace = true

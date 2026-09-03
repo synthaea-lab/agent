@@ -1,6 +1,7 @@
-//! # rtr
+//! # live-response
 //!
-//! Real Time Response — the analyst-driven counterpart of the automated `response`
+//! Live response (the DFIR term: acting on a *running* system, as opposed to
+//! dead-box analysis) — the analyst-driven counterpart of the automated `response`
 //! crate: an interactive, auditable session on a live endpoint, established through
 //! the control plane over `transport`. Command vocabulary is a fixed, policy-gated
 //! set (list processes, read/fetch file, kill process, pull memory region, run
