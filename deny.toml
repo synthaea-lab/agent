@@ -1,0 +1,33 @@
+# cargo-deny configuration — licenses, security advisories, and dependency hygiene.
+# Run locally with `cargo deny check`; CI runs it on every push.
+
+[graph]
+all-features = true
+
+[advisories]
+# RUSTSEC advisories: any vulnerable or yanked dependency fails the build.
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# The project is Apache-2.0; dependencies must stay in this permissive set.
+# The GPLv2 eBPF probe crate is excluded from the workspace and licensed separately.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

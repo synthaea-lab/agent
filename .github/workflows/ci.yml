@@ -22,6 +22,15 @@ jobs:
       - name: dependency direction
         run: python3 tools/check-deps.py
 
+  # Licenses, RUSTSEC advisories, dependency hygiene (deny.toml).
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
   # Core rule: every workspace crate compiles and passes tests on all three platforms.
   # Platform-specific code lives only in crates/sensors/* behind cfg, so this job is
   # what enforces it.

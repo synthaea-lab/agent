@@ -1,0 +1,6 @@
+# Pinned so every developer and CI runner builds with the same compiler.
+# Bump deliberately (and in its own commit) — a toolchain bump that sneaks into a
+# feature PR makes build breakage hard to bisect.
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]

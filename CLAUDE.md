@@ -1,7 +1,7 @@
 # Synthaea — project conventions
 
 Multi-platform EDR/XDR (Windows/Linux/macOS) with on-device ML. Rust agent workspace +
-Python training pipeline (`ml/`) + control plane (`server/`, tech not locked yet).
+Python training pipeline (`ml/`) + control plane (`server/`: Next.js + PostgreSQL, ADR-0001).
 Everything — code, comments, docs, commits — is in **English**.
 
 The previous iteration lives untracked in `old/`. Code is migrated from it crate by crate,
