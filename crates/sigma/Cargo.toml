@@ -1,9 +1,14 @@
 [package]
 name = "sigma"
 version = "0.1.0"
-description = "Sigma rule parsing and compilation"
+description = "Sigma rule parsing and compilation for on-device evaluation"
 license.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+schema = { path = "../schema" }
+serde = { workspace = true }
+serde_yaml = "0.9"
+thiserror = { workspace = true }
+log = { version = "0.4", default-features = false }

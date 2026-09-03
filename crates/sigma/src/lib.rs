@@ -1,6 +1,21 @@
 //! # sigma
 //!
-//! Parses Sigma YAML rules and compiles them into the internal rule representation used
-//! by `rules`, so community detection content runs on-device unchanged.
+//! Minimal Sigma evaluation engine (https://sigmahq.io), migrated from
+//! `old/crates/synthaea-sigma`. Supported subset:
+//! - `Image`, `CommandLine`, and `ParentImage` fields mapped onto [`schema::ExecEvent`]
+//!   (`ParentImage` uses the lineage field sensors fill when they can — a rule using it
+//!   simply never matches events without lineage)
+//! - Simple `selection` conditions (implicit AND between fields, OR between values),
+//!   keyword lists
+//! - `contains`/`startswith`/`endswith` modifiers and `*` wildcards at start/end
+//! - `condition: selection` only
 //!
-//! To be migrated from `old/crates/synthaea-sigma`.
+//! Anything outside the subset is rejected **loudly at load time** — a rule with an
+//! unsupported condition, field, or modifier fails to load with a precise error
+//! instead of silently never matching (the old engine's behavior, fixed per issue #11).
+
+pub mod engine;
+pub mod rule;
+
+pub use engine::{SigmaEngine, SigmaError};
+pub use rule::SigmaAlert;
