@@ -44,6 +44,11 @@ pub struct ScanQueue {
 impl ScanQueue {
     /// Starts the worker. `on_match` runs on the worker thread for every scan with
     /// at least one matching rule.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the OS refuses to spawn the worker thread — at agent startup,
+    /// on a host that cannot spawn one thread, there is nothing to degrade to.
     pub fn start(rules: RuleSet, on_match: impl Fn(ScanOutcome) + Send + 'static) -> Self {
         let (tx, rx) = mpsc::sync_channel::<(PathBuf, Instant)>(QUEUE_CAP);
         let scanned = Arc::new(AtomicU64::new(0));
@@ -91,6 +96,7 @@ impl ScanQueue {
         }
     }
 
+    #[must_use]
     pub fn stats(&self) -> ScanStats {
         ScanStats {
             scanned: self.scanned.load(Ordering::Relaxed),

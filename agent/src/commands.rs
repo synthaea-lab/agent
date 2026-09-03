@@ -64,6 +64,7 @@ fn run_windows_sensor(sink: Box<dyn schema::sensor::EventSink>) -> anyhow::Resul
 /// Linux: non-invasive eBPF preflight (loads the programs without attaching them).
 #[cfg(target_os = "linux")]
 pub(crate) fn cmd_status() -> anyhow::Result<()> {
+    // SAFETY: geteuid takes no arguments and cannot fail.
     let uid = unsafe { libc::geteuid() };
     if uid == 0 {
         println!("[OK]   privileges: uid=0");

@@ -49,10 +49,12 @@ unsafe extern "system" {
 
 /// Reads the target's real command line from its PEB
 /// (`PEB → ProcessParameters → CommandLine`). This is what fixes F-1: the encoded
-/// PowerShell payload, the LOLBin arguments — everything the ETW ProcessStart event
+/// `PowerShell` payload, the `LOLBin` arguments — everything the ETW `ProcessStart` event
 /// does not carry. `None` on any failure (protected process, already exited, WOW64
 /// mismatch) — the caller falls back to the image path, never fabricates.
 pub(crate) fn read_process_cmdline(pid: u32) -> Option<String> {
+    // SAFETY: OpenProcess returns either null (checked) or a handle we own and
+    // close on every path; read_cmdline_from_handle only receives the live handle.
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid);
         if handle.is_null() {
@@ -64,7 +66,43 @@ pub(crate) fn read_process_cmdline(pid: u32) -> Option<String> {
     }
 }
 
+/// PEB (x64): `ProcessParameters` pointer offset.
+const PEB_PROCESS_PARAMETERS: usize = 0x20;
+/// `RTL_USER_PROCESS_PARAMETERS` (x64): `CommandLine` `UNICODE_STRING` offset
+/// (`Length: u16`, `MaximumLength: u16`, pad, `Buffer: *mut u16` at +0x8).
+const PARAMS_CMDLINE_LENGTH: usize = 0x70;
+const PARAMS_CMDLINE_BUFFER: usize = 0x78;
+
+/// Reads one plain-old-data value out of the target's address space.
+///
+/// # Safety
+///
+/// `T` must be valid for any bit pattern (used here with `usize` and `u16`);
+/// `addr` is only ever passed to the kernel as a remote address, never
+/// dereferenced locally.
+unsafe fn read_remote<T: Copy>(handle: HANDLE, addr: usize) -> Option<T> {
+    // SAFETY: the destination is a local zeroed T and the length is exactly
+    // size_of::<T>(); the return code is checked.
+    unsafe {
+        let mut value: T = core::mem::zeroed();
+        if ReadProcessMemory(
+            handle,
+            addr as *const _,
+            (&mut value as *mut T).cast(),
+            size_of::<T>(),
+            core::ptr::null_mut(),
+        ) == 0
+        {
+            return None;
+        }
+        Some(value)
+    }
+}
+
+/// The PEB walk: `PEB → ProcessParameters → CommandLine{Length, Buffer}`.
 unsafe fn read_cmdline_from_handle(handle: HANDLE) -> Option<String> {
+    // SAFETY: NtQueryInformationProcess writes into a local zeroed struct of the
+    // exact size passed; remote pointers flow only through read_remote.
     unsafe {
         let mut pbi: ProcessBasicInformation = core::mem::zeroed();
         let mut ret_len = 0u32;
@@ -80,45 +118,18 @@ unsafe fn read_cmdline_from_handle(handle: HANDLE) -> Option<String> {
         {
             return None;
         }
+        let peb = pbi.peb_base_address as usize;
 
-        // PEB (x64): ProcessParameters pointer at offset 0x20.
-        let mut params_ptr: usize = 0;
-        if ReadProcessMemory(
-            handle,
-            (pbi.peb_base_address as usize + 0x20) as *const _,
-            (&mut params_ptr as *mut usize).cast(),
-            size_of::<usize>(),
-            core::ptr::null_mut(),
-        ) == 0
-            || params_ptr == 0
-        {
+        let params: usize = read_remote(handle, peb + PEB_PROCESS_PARAMETERS)?;
+        if params == 0 {
             return None;
         }
-
-        // RTL_USER_PROCESS_PARAMETERS (x64): CommandLine UNICODE_STRING at 0x70
-        // (Length: u16, MaximumLength: u16, pad, Buffer: *mut u16 at +0x8).
-        let mut len_bytes: u16 = 0;
-        if ReadProcessMemory(
-            handle,
-            (params_ptr + 0x70) as *const _,
-            (&mut len_bytes as *mut u16).cast(),
-            2,
-            core::ptr::null_mut(),
-        ) == 0
-            || len_bytes == 0
-        {
+        let len_bytes: u16 = read_remote(handle, params + PARAMS_CMDLINE_LENGTH)?;
+        if len_bytes == 0 {
             return None;
         }
-        let mut buf_ptr: usize = 0;
-        if ReadProcessMemory(
-            handle,
-            (params_ptr + 0x78) as *const _,
-            (&mut buf_ptr as *mut usize).cast(),
-            size_of::<usize>(),
-            core::ptr::null_mut(),
-        ) == 0
-            || buf_ptr == 0
-        {
+        let buf_ptr: usize = read_remote(handle, params + PARAMS_CMDLINE_BUFFER)?;
+        if buf_ptr == 0 {
             return None;
         }
 
@@ -126,6 +137,7 @@ unsafe fn read_cmdline_from_handle(handle: HANDLE) -> Option<String> {
         // the UNICODE_STRING's own u16 length (64KB), which is the OS's bound.
         let n_u16 = (len_bytes as usize) / 2;
         let mut wide = vec![0u16; n_u16];
+        // SAFETY: the destination buffer holds exactly len_bytes bytes.
         if ReadProcessMemory(
             handle,
             buf_ptr as *const _,
@@ -145,6 +157,8 @@ unsafe fn read_cmdline_from_handle(handle: HANDLE) -> Option<String> {
 /// Resolves the user the process runs as. `User::Unknown` on failure — the
 /// capabilities flag stays honest either way.
 pub(crate) fn read_process_user(pid: u32) -> User {
+    // SAFETY: process and token handles are null-checked and closed on every
+    // path; token_sid_string/token_integrity_rid only see live handles.
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if process.is_null() {
@@ -176,6 +190,9 @@ pub(crate) fn read_process_user(pid: u32) -> User {
 }
 
 unsafe fn token_sid_string(token: HANDLE) -> Option<String> {
+    // SAFETY: the buffer is sized by the first GetTokenInformation call and the
+    // TOKEN_USER cast reads within it; the SID string is measured to its NUL and
+    // freed with LocalFree exactly once.
     unsafe {
         let mut needed = 0u32;
         GetTokenInformation(token, TokenUser, core::ptr::null_mut(), 0, &mut needed);
@@ -209,6 +226,8 @@ unsafe fn token_sid_string(token: HANDLE) -> Option<String> {
 }
 
 unsafe fn token_integrity_rid(token: HANDLE) -> Option<u32> {
+    // SAFETY: the buffer is sized by the first GetTokenInformation call; the SID
+    // sub-authority read is bounded by the SID's own count byte (checked > 0).
     unsafe {
         let mut needed = 0u32;
         GetTokenInformation(
@@ -254,6 +273,8 @@ pub(crate) fn build_volume_map() -> HashMap<String, String> {
     for letter in b'A'..=b'Z' {
         let drive: [u16; 3] = [letter as u16, b':' as u16, 0];
         let mut target = [0u16; 512];
+        // SAFETY: both buffers are valid for the lengths passed (drive is
+        // NUL-terminated, target is 512 wide chars as declared).
         let n = unsafe { QueryDosDeviceW(drive.as_ptr(), target.as_mut_ptr(), 512) };
         if n == 0 {
             continue;
@@ -277,6 +298,9 @@ pub(crate) fn build_volume_map() -> HashMap<String, String> {
 /// the rules' parent-side exclusions apply to pre-existing parents.
 pub(crate) fn snapshot_processes() -> Vec<(u32, String)> {
     let mut out = Vec::new();
+    // SAFETY: the snapshot handle is checked against INVALID_HANDLE_VALUE and
+    // closed; PROCESSENTRY32W is zeroed with dwSize set before the first call,
+    // and szExeFile reads are bounded by its NUL (or full length).
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snap == INVALID_HANDLE_VALUE {
@@ -307,9 +331,11 @@ pub(crate) fn snapshot_processes() -> Vec<(u32, String)> {
 }
 
 /// Live pid → image name via Win32 — the fallback for the ETW race where a
-/// ConnectEvent arrives before the ExecEvent populated the store.
+/// `ConnectEvent` arrives before the `ExecEvent` populated the store.
 /// `PROCESS_QUERY_LIMITED_INFORMATION` needs no admin privileges.
 pub(crate) fn resolve_pid_live(pid: u32) -> Option<String> {
+    // SAFETY: the handle is null-checked and closed on every path; the buffer
+    // length in/out contract of QueryFullProcessImageNameW is respected.
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {

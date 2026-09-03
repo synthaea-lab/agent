@@ -2,183 +2,28 @@
 //! per-window counters) and consults it on every event. Each rule stays a dedicated
 //! method, with its calibration constants next to it.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    net::IpAddr,
-};
+use std::{collections::HashMap, net::IpAddr};
 
 use store::BoundedMap;
 
 use schema::{ConnectEvent, ExecEvent, FileOpenEvent};
 
-use crate::{Alert, has_write_intent};
-
-const DOWNLOADER_COMMS: &[&str] = &["curl", "wget"];
-const WEB_SERVER_COMMS: &[&str] = &["nginx", "apache2", "httpd"];
-const SHELL_COMMS: &[&str] = &["sh", "bash", "dash", "zsh", "ash"];
-
-/// Correlation window between the write of a downloaded file and its execution: past
-/// this delay, the two events are no longer linked (avoids keeping an unbounded
-/// history, and an execution hours later is no longer the same "download & run"
-/// scenario anyway).
-const DOWNLOAD_EXEC_WINDOW_NS: u64 = 60_000_000_000; // 60s
-
-// ── Windows constants (ETW rules — T1059/T1218/T1071) ───────────────────────
-
-/// SELF-SPAWN threshold and window (T1059): N spawns of the same name in X seconds.
-pub(crate) const SELF_SPAWN_THRESHOLD: u32 = 3;
-const SELF_SPAWN_WINDOW_NS: u64 = 30_000_000_000; // 30s
-
-/// BEACON threshold and window (T1071/T1041): N connections to the same dest in X seconds.
-pub(crate) const BEACON_THRESHOLD: u32 = 3;
-const BEACON_WINDOW_NS: u64 = 60_000_000_000; // 60s
-
-/// Processes excluded from SELF-SPAWN (child side) — frequent legitimate self-spawn
-/// confirmed in lab.
-/// MpCmdRun.exe (Defender): false positive observed during the 2026-08-24 tests.
-/// wermgr.exe / WerFault.exe: Windows Error Reporting — respawns in a loop when a
-/// process keeps crashing (e.g. malware with no reachable C2). The spawn comes from WER
-/// itself, not from direct malicious behavior — false positive observed during the
-/// 2026-08-25 VM tests.
-/// SecurityHealthH = SecurityHealthHost.exe (ETW-truncated to 15 chars) — Windows
-/// Defender Health service, repeatedly respawned by svchost (ppid=956) under normal
-/// conditions — NjRAT FP 2026-08-28.
-const SELF_SPAWN_EXCLUSIONS: &[&str] = &[
-    "MpCmdRun.exe",
-    "mpcmdrun.exe",
-    "TiWorker.exe",
-    "svchost.exe",
-    "wermgr.exe",
-    "WerFault.exe",
-    "WerFaultSecure.exe",
-    "SecurityHealthH",
-    "SecurityHealthHost.exe",
-];
-
-/// Parents excluded from SELF-SPAWN — some system processes legitimately spawn the
-/// same child in a loop, with no link to malicious activity.
-/// RuntimeBroker.exe: UWP permissions broker, spawns PowerShell for system tasks
-/// (notifications, policies) — false positive observed in lab 2026-08-25.
-const SELF_SPAWN_PARENT_EXCLUSIONS: &[&str] = &["RuntimeBroker.exe"];
-
-/// LOLBins abused for shellcode injection or executing unsigned code (T1218/T1127).
-const LOLBINS: &[&str] = &[
-    "aspnet_compiler.exe",
-    "aspnet_compiler", // truncated by Windows ETW (20 → 15 chars)
-    "msbuild.exe",
-    "installutil.exe",
-    "regasm.exe",
-    "regsvcs.exe",
-    "ieexec.exe",
-    "msdeploy.exe",
-    "dfsvc.exe",
-    "cmstp.exe",
-    "wab.exe",
-    "odbcconf.exe",
-];
-
-/// Legitimate parents allowed to spawn LOLBins (dev environments).
-const LOLBIN_LEGIT_PARENTS: &[&str] = &["devenv.exe", "msbuild.exe", "dotnet.exe", "nuget.exe"];
-
-/// Office/PDF applications often exploited to spawn interpreters (T1204/T1059).
-const SUSPECT_PARENTS_WIN: &[&str] = &[
-    "winword.exe",
-    "excel.exe",
-    "powerpnt.exe",
-    "outlook.exe",
-    "acrord32.exe",
-    "acrobat.exe",
-    "foxit.exe",
-    "iexplore.exe",
-];
-
-/// Interpreters and tools frequently launched by Windows macros/exploits.
-const SUSPECT_CHILDREN_WIN: &[&str] = &[
-    "cmd.exe",
-    "powershell.exe",
-    "pwsh.exe",
-    "wscript.exe",
-    "cscript.exe",
-    "mshta.exe",
-    "certutil.exe",
-    "regsvr32.exe",
-    "rundll32.exe",
-    "bitsadmin.exe",
-    "wmic.exe",
-    "msiexec.exe",
-];
-
-/// Standard ports — connections ignored for BEACON (expected legitimate traffic).
-/// 137 = NetBIOS-NS, 138 = NetBIOS-DGM, 5353 = mDNS, 5355 = LLMNR — native Windows
-/// network protocols emitted in a loop by the System process and legitimate services,
-/// not C2.
-/// 3478 = STUN/TURN — used by CrossDeviceService, Teams, WebRTC for NAT traversal,
-/// legitimate beaconing observed in lab (false positive, NjRAT capture 2026-08-28).
-const STANDARD_PORTS: &[u16] = &[
-    80, 443, 53, 8080, 8443, 8000, 25, 587, 465, 993, 995, 143, 137, 138, 5353, 5355, 3478,
-];
-
-/// Browsers — repeated outbound connections = normal behavior, not beaconing.
-const BROWSERS: &[&str] = &[
-    "chrome.exe",
-    "firefox.exe",
-    "msedge.exe",
-    "opera.exe",
-    "brave.exe",
-    "iexplore.exe",
-    "vivaldi.exe",
-];
+use crate::{
+    Alert,
+    exclusions::{
+        BEACON_THRESHOLD, BEACON_WINDOW_NS, BROWSERS, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS,
+        LOLBIN_LEGIT_PARENTS, LOLBINS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
+        SELF_SPAWN_THRESHOLD, SELF_SPAWN_WINDOW_NS, SHELL_COMMS, STANDARD_PORTS,
+        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, WEB_SERVER_COMMS,
+    },
+    has_write_intent,
+    sliding::SlidingCounter,
+};
 
 struct RecentWrite {
     pid: u32,
     comm: String,
     timestamp_ns: u64,
-}
-
-/// True sliding-window counter shared by SELF-SPAWN and BEACON ("N occurrences in
-/// X seconds, one alert per window"). The previous reset-bucket scheme discarded
-/// in-window events at the boundary — spawns at t=0s, 29s, 31s never reached a
-/// threshold of 3 in 30s, because the reset at 31s dropped the 29s spawn that was
-/// still inside the window (review finding).
-#[derive(Default)]
-struct SlidingCounter {
-    timestamps: VecDeque<u64>,
-    last_alert_ns: Option<u64>,
-}
-
-/// Hard cap on retained timestamps per key — a counter only needs to prove the
-/// threshold, not archive the full burst.
-const SLIDING_TIMESTAMPS_CAP: usize = 256;
-
-impl SlidingCounter {
-    /// Prunes expired timestamps, records the new one, returns the in-window count.
-    fn record(&mut self, ts: u64, window_ns: u64) -> u32 {
-        while self
-            .timestamps
-            .front()
-            .is_some_and(|&t| ts.saturating_sub(t) > window_ns)
-        {
-            self.timestamps.pop_front();
-        }
-        self.timestamps.push_back(ts);
-        if self.timestamps.len() > SLIDING_TIMESTAMPS_CAP {
-            self.timestamps.pop_front();
-        }
-        self.timestamps.len() as u32
-    }
-
-    /// One alert per window: true (and remembers) unless one already fired within
-    /// the window.
-    fn try_alert(&mut self, ts: u64, window_ns: u64) -> bool {
-        if self
-            .last_alert_ns
-            .is_some_and(|t| ts.saturating_sub(t) <= window_ns)
-        {
-            return false;
-        }
-        self.last_alert_ns = Some(ts);
-        true
-    }
 }
 
 /// Sliding history needed by the correlation rules:
@@ -194,7 +39,7 @@ pub struct RuleState {
     /// pid → comm of the last exec seen for this pid, to recover the parent's comm
     /// (T1059) with a simple `ppid` lookup without having to walk the process tree in
     /// userspace. LRU-bounded (`store::BoundedMap`) — a long-lived agent must not
-    /// grow this without limit. `pub(crate)` for the seed_from_proc test.
+    /// grow this without limit. `pub(crate)` for the `seed_from_proc` test.
     pub(crate) pid_comm: BoundedMap<u32, String>,
     /// path → info about the last write by a known downloader (T1105). LRU-bounded:
     /// downloader writes are rare, but a hostile loop must not grow agent memory.
@@ -218,6 +63,7 @@ impl Default for RuleState {
 }
 
 impl RuleState {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             pid_comm: BoundedMap::new(PID_COMM_CAP),
@@ -266,7 +112,7 @@ impl RuleState {
     ///
     /// The fallback is necessary: `pid_comm` only knows a process if it exec'd during
     /// the capture, or was already running at startup (`seed_from_proc`) — not
-    /// processes fork()'d *after* startup that never exec afterwards (e.g. an nginx
+    /// processes `fork()`'d *after* startup that never exec afterwards (e.g. an nginx
     /// worker respawned by the master). Found in real conditions on 2026-08-14 with an
     /// unstable nginx perl module that kept churning workers: `seed_from_proc` alone
     /// let through any worker created after the collector attached. The fallback reads
@@ -325,11 +171,14 @@ impl RuleState {
     /// property, reported by conformance).
     fn check_download_then_exec(&self, event: &ExecEvent) -> Option<Alert> {
         let comm = event.meta.comm.as_str();
-        let (path, write) = self.recent_writes.iter().find(|(path, write)| {
-            path.rsplit('/').next().unwrap_or(path.as_str()) == comm
-                && event.meta.timestamp_ns.saturating_sub(write.timestamp_ns)
-                    <= DOWNLOAD_EXEC_WINDOW_NS
-        })?;
+        let (path, write) =
+            self.recent_writes
+                .iter()
+                .find(|(path, write): &(&String, &RecentWrite)| {
+                    path.rsplit('/').next().unwrap_or(path.as_str()) == comm
+                        && event.meta.timestamp_ns.saturating_sub(write.timestamp_ns)
+                            <= DOWNLOAD_EXEC_WINDOW_NS
+                })?;
         Some(Alert {
             technique: "T1105",
             message: format!(
@@ -347,8 +196,8 @@ impl RuleState {
 
     /// T1059 — same process spawned N times in X seconds by the same parent.
     /// False positives documented in lab (2026-08-24/25): MpCmdRun.exe, WerFault.exe,
-    /// RuntimeBroker.exe — excluded via SELF_SPAWN_EXCLUSIONS /
-    /// SELF_SPAWN_PARENT_EXCLUSIONS.
+    /// RuntimeBroker.exe — excluded via `SELF_SPAWN_EXCLUSIONS` /
+    /// `SELF_SPAWN_PARENT_EXCLUSIONS`.
     fn check_self_spawn(&mut self, event: &ExecEvent) -> Option<Alert> {
         let comm = event.meta.comm.clone();
         // Name alone is a bypass: a payload renamed `svchost.exe` in %TEMP% must
@@ -396,8 +245,8 @@ impl RuleState {
     }
 
     /// T1204/T1059 — Office/PDF application spawning an interpreter (macro/exploit).
-    /// `resolve_comm` reads pid_comm then `/proc` as a fallback (Linux) — returns None
-    /// on Windows if the parent has not yet sent an ExecEvent, which silently disables
+    /// `resolve_comm` reads `pid_comm` then `/proc` as a fallback (Linux) — returns None
+    /// on Windows if the parent has not yet sent an `ExecEvent`, which silently disables
     /// this rule for that case (mitigated by `seed_pid_comm` at startup).
     fn check_parent_suspect(&self, event: &ExecEvent) -> Option<Alert> {
         let comm = event.meta.comm.as_str();
@@ -423,7 +272,7 @@ impl RuleState {
         })
     }
 
-    /// T1218/T1127 — LOLBin spawned by a non-dev parent (shellcode execution proxy).
+    /// T1218/T1127 — `LOLBin` spawned by a non-dev parent (shellcode execution proxy).
     fn check_lolbin(&self, event: &ExecEvent) -> Option<Alert> {
         let comm = event.meta.comm.as_str();
         if !LOLBINS.iter().any(|&l| comm.eq_ignore_ascii_case(l)) {

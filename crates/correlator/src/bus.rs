@@ -20,6 +20,7 @@ pub struct EventBus {
 }
 
 impl EventBus {
+    #[must_use]
     pub fn new(window: Duration) -> Self {
         Self {
             events: VecDeque::new(),
@@ -35,6 +36,7 @@ impl EventBus {
     }
 
     /// Returns all events currently in the window.
+    #[must_use]
     pub fn window_events(&self) -> &VecDeque<Event> {
         &self.events
     }

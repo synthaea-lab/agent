@@ -55,6 +55,12 @@ impl RuleSet {
     /// hard error naming the file: shipped content must compile (the content CI
     /// suite enforces it), and silently dropping rules is the failure mode the sigma
     /// migration already taught us about.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`YaraError::Io`] when the directory tree or a rule file cannot be
+    /// read, and [`YaraError::Compile`] (naming the file) when a rule does not
+    /// compile.
     pub fn load_dir(dir: &Path) -> Result<Self, YaraError> {
         let mut compiler = yara_x::Compiler::new();
         let mut stack = vec![dir.to_path_buf()];
@@ -90,6 +96,7 @@ impl RuleSet {
     }
 
     /// Number of compiled rules (not source files).
+    #[must_use]
     pub fn rule_count(&self) -> usize {
         self.count
     }
@@ -99,6 +106,12 @@ impl RuleSet {
     /// worker forever, /dev/zero would read without end — review finding). The
     /// read itself is bounded with `Read::take`, because a special file or a file
     /// growing under our feet can exceed what its metadata claimed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`YaraError::Io`] when the file cannot be read (a vanished dropper
+    /// payload is the normal case) and [`YaraError::Compile`] when the scan itself
+    /// fails inside the engine.
     pub fn scan_file(&self, path: &Path) -> Result<Vec<String>, YaraError> {
         let io = |source: std::io::Error| YaraError::Io {
             path: path.display().to_string(),
@@ -126,7 +139,10 @@ impl RuleSet {
                 .map_err(io)?;
         }
         if data.len() as u64 > MAX_SCAN_BYTES {
-            log::debug!("yara: {} grew past the scan budget, skipping", path.display());
+            log::debug!(
+                "yara: {} grew past the scan budget, skipping",
+                path.display()
+            );
             return Ok(Vec::new());
         }
         let mut scanner = yara_x::Scanner::new(&self.rules);

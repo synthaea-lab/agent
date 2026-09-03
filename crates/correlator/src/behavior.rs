@@ -15,29 +15,30 @@ use crate::event::is_file_write;
 /// Per-PID behavioral vector — 9 features extracted from the sliding window.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BehaviorVector {
-    /// 1.0 if there is at least one ExecEvent in the window for this PID.
+    /// 1.0 if there is at least one `ExecEvent` in the window for this PID.
     pub has_exec: f32,
-    /// 1.0 if there is at least one ConnectEvent in the window for this PID.
+    /// 1.0 if there is at least one `ConnectEvent` in the window for this PID.
     pub has_connect: f32,
-    /// 1.0 if there is at least one FileOpenEvent with a write flag for this PID.
+    /// 1.0 if there is at least one `FileOpenEvent` with a write flag for this PID.
     pub has_filewrite: f32,
     /// Delay in ms between the first Exec and the first Connect (0.0 if either is absent).
     pub time_exec_to_connect_ms: f32,
-    /// Delay in ms between the first Exec and the first FileWrite (0.0 if either is absent).
+    /// Delay in ms between the first Exec and the first `FileWrite` (0.0 if either is absent).
     pub time_exec_to_filewrite_ms: f32,
-    /// 1.0 if the ExecEvent comes from a suspicious path (AppData/Temp/Downloads/Desktop).
+    /// 1.0 if the `ExecEvent` comes from a suspicious path (AppData/Temp/Downloads/Desktop).
     pub is_suspicious_path: f32,
-    /// Number of ConnectEvents in the window.
+    /// Number of `ConnectEvents` in the window.
     pub connect_count: f32,
-    /// Number of distinct destination ports among the ConnectEvents.
+    /// Number of distinct destination ports among the `ConnectEvents`.
     pub distinct_dports: f32,
-    /// 1.0 if there is at least one ConnectEvent to a non-RFC1918, non-loopback IP.
+    /// 1.0 if there is at least one `ConnectEvent` to a non-RFC1918, non-loopback IP.
     pub dest_is_external: f32,
 }
 
 impl BehaviorVector {
     /// Features as an ordered vector, compatible with the format expected
     /// by the ML pipeline's behavior features and the LLR calibration.
+    #[must_use]
     pub fn to_vec(&self) -> Vec<f32> {
         vec![
             self.has_exec,
@@ -59,10 +60,6 @@ impl BehaviorVector {
         if events.is_empty() {
             return None;
         }
-
-        let has_exec = events.iter().any(|e| matches!(e, Event::Exec(_)));
-        let has_filewrite = events.iter().any(|e| is_file_write(e));
-
         let connect_events: Vec<&ConnectEvent> = events
             .iter()
             .filter_map(|e| {
@@ -74,75 +71,86 @@ impl BehaviorVector {
             })
             .collect();
 
-        let has_connect = !connect_events.is_empty();
-        let connect_count = connect_events.len() as f32;
+        let (distinct_dports, dest_is_external) = connect_features(&connect_events);
+        let (time_exec_to_connect_ms, time_exec_to_filewrite_ms) =
+            timing_features(events, &connect_events);
 
-        let mut dports: HashSet<u16> = HashSet::new();
-        let mut dest_is_external = false;
-        for c in &connect_events {
-            dports.insert(c.dport);
-            let external = match c.daddr {
-                IpAddr::V4(v4) => !is_private_ipv4(v4.octets()),
-                // Review finding: IPv6 was skipped entirely, so public IPv6 C2 was
-                // systematically underscored. Non-global v6 classes are excluded
-                // explicitly; everything else counts as external.
-                IpAddr::V6(v6) => !is_non_global_ipv6(v6),
-            };
-            if external {
-                dest_is_external = true;
-            }
+        Some(BehaviorVector {
+            has_exec: bool_feature(events.iter().any(|e| matches!(e, Event::Exec(_)))),
+            has_connect: bool_feature(!connect_events.is_empty()),
+            has_filewrite: bool_feature(events.iter().any(|e| is_file_write(e))),
+            time_exec_to_connect_ms,
+            time_exec_to_filewrite_ms,
+            is_suspicious_path: suspicious_path_feature(events),
+            connect_count: connect_events.len() as f32,
+            distinct_dports,
+            dest_is_external: bool_feature(dest_is_external),
+        })
+    }
+}
+
+fn bool_feature(b: bool) -> f32 {
+    if b { 1.0 } else { 0.0 }
+}
+
+/// (distinct destination ports, any-external-destination) over the window.
+fn connect_features(connect_events: &[&ConnectEvent]) -> (f32, bool) {
+    let mut dports: HashSet<u16> = HashSet::new();
+    let mut dest_is_external = false;
+    for c in connect_events {
+        dports.insert(c.dport);
+        let external = match c.daddr {
+            IpAddr::V4(v4) => !is_private_ipv4(v4.octets()),
+            // Review finding: IPv6 was skipped entirely, so public IPv6 C2 was
+            // systematically underscored. Non-global v6 classes are excluded
+            // explicitly; everything else counts as external.
+            IpAddr::V6(v6) => !is_non_global_ipv6(v6),
+        };
+        if external {
+            dest_is_external = true;
         }
+    }
+    (dports.len() as f32, dest_is_external)
+}
 
-        let first_exec_ns = events.iter().find_map(|e| {
+/// (exec→first connect, exec→first file write) deltas in milliseconds; 0 when
+/// either endpoint is absent from the window.
+fn timing_features(events: &[&Event], connect_events: &[&ConnectEvent]) -> (f32, f32) {
+    let first_exec_ns = events.iter().find_map(|e| {
+        if let Event::Exec(x) = e {
+            Some(x.meta.timestamp_ns)
+        } else {
+            None
+        }
+    });
+    let first_connect_ns = connect_events.first().map(|c| c.meta.timestamp_ns);
+    let first_filewrite_ns = events
+        .iter()
+        .find(|e| is_file_write(e))
+        .map(|e| e.meta().timestamp_ns);
+
+    let delta_ms = |from: Option<u64>, to: Option<u64>| match (from, to) {
+        (Some(f), Some(t)) => (t.saturating_sub(f) as f32) / 1_000_000.0,
+        _ => 0.0,
+    };
+    (
+        delta_ms(first_exec_ns, first_connect_ns),
+        delta_ms(first_exec_ns, first_filewrite_ns),
+    )
+}
+
+/// Suspicious path — judged on the first `ExecEvent` of the PID within the window.
+fn suspicious_path_feature(events: &[&Event]) -> f32 {
+    events
+        .iter()
+        .find_map(|e| {
             if let Event::Exec(x) = e {
-                Some(x.meta.timestamp_ns)
+                Some(bool_feature(is_suspicious_image_path(&x.image_path)))
             } else {
                 None
             }
-        });
-        let first_connect_ns = connect_events.first().map(|c| c.meta.timestamp_ns);
-        let first_filewrite_ns = events
-            .iter()
-            .find(|e| is_file_write(e))
-            .map(|e| e.meta().timestamp_ns);
-
-        let time_exec_to_connect_ms = match (first_exec_ns, first_connect_ns) {
-            (Some(e), Some(c)) => (c.saturating_sub(e) as f32) / 1_000_000.0,
-            _ => 0.0,
-        };
-        let time_exec_to_filewrite_ms = match (first_exec_ns, first_filewrite_ns) {
-            (Some(e), Some(f)) => (f.saturating_sub(e) as f32) / 1_000_000.0,
-            _ => 0.0,
-        };
-
-        // Suspicious path — first ExecEvent of the PID within the window
-        let is_suspicious_path = events
-            .iter()
-            .find_map(|e| {
-                if let Event::Exec(x) = e {
-                    Some(if is_suspicious_image_path(&x.image_path) {
-                        1.0f32
-                    } else {
-                        0.0f32
-                    })
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0.0);
-
-        Some(BehaviorVector {
-            has_exec: if has_exec { 1.0 } else { 0.0 },
-            has_connect: if has_connect { 1.0 } else { 0.0 },
-            has_filewrite: if has_filewrite { 1.0 } else { 0.0 },
-            time_exec_to_connect_ms,
-            time_exec_to_filewrite_ms,
-            is_suspicious_path,
-            connect_count,
-            distinct_dports: dports.len() as f32,
-            dest_is_external: if dest_is_external { 1.0 } else { 0.0 },
         })
-    }
+        .unwrap_or(0.0)
 }
 
 /// Returns true if the path contains a directory considered suspicious
@@ -161,8 +169,8 @@ fn is_suspicious_image_path(path: &str) -> bool {
 /// unidentified): without this exclusion, the unspecified address was classified as
 /// external by default, contributing to `dest_is_external` Bayesian LLR on traffic
 /// unrelated to any real C2.
-/// Loopback, unspecified, link-local (fe80::/10), unique-local (fc00::/7),
-/// multicast (ff00::/8) — the non-global classes legitimate local traffic uses.
+/// Loopback, unspecified, link-local (`fe80::/10`), unique-local (`fc00::/7`),
+/// multicast (`ff00::/8`) — the non-global classes legitimate local traffic uses.
 fn is_non_global_ipv6(addr: std::net::Ipv6Addr) -> bool {
     let seg = addr.segments();
     addr.is_loopback()

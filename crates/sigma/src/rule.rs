@@ -49,6 +49,7 @@ pub enum ValueList {
 }
 
 impl ValueList {
+    #[must_use]
     pub fn as_slice(&self) -> Vec<&str> {
         match self {
             ValueList::Single(s) => vec![s.as_str()],

@@ -37,6 +37,11 @@ pub struct EventSpool {
 impl EventSpool {
     /// Opens (or creates) a spool directory. Existing segments survive restarts and
     /// are drained before new ones.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying I/O error when the directory cannot be created or
+    /// its existing segments cannot be listed.
     pub fn open(dir: &Path, max_bytes: u64) -> std::io::Result<Self> {
         fs::create_dir_all(dir)?;
         let head_seq = segment_seqs(dir)?.last().copied().map_or(0, |s| s + 1);
@@ -55,6 +60,11 @@ impl EventSpool {
 
     /// Appends one record durably (fsync'd). Rotates the segment at
     /// `SEGMENT_RECORDS`; enforces the byte cap by deleting whole oldest segments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the record cannot be serialized, appended, or
+    /// fsync'd — the caller decides whether spool loss is fatal.
     pub fn push<T: Serialize>(&mut self, record: &T) -> std::io::Result<()> {
         let line = serde_json::to_string(record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -80,6 +90,10 @@ impl EventSpool {
     /// been fully read and parsed — a caller crash after `drain_oldest` therefore
     /// loses at most what it had not yet uploaded, and a crash before it
     /// re-delivers (at-least-once toward the server).
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the segment cannot be listed, read, or deleted.
     pub fn drain_oldest<T: DeserializeOwned>(&mut self) -> std::io::Result<Vec<T>> {
         let Some(seq) = segment_seqs(&self.dir)?.first().copied() else {
             return Ok(Vec::new());
@@ -104,6 +118,7 @@ impl EventSpool {
         Ok(out)
     }
 
+    #[must_use]
     pub fn stats(&self) -> SpoolStats {
         let bytes = segment_seqs(&self.dir)
             .into_iter()

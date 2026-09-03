@@ -128,6 +128,7 @@ fn contains_any_ci(cmdline_lower: &str, needles: &[&str]) -> f32 {
 ///
 /// `length` counts Unicode scalar values, not bytes: the Python side counts characters
 /// (`len(cmdline)`), so `str::len` (UTF-8 bytes) would diverge on any non-ASCII input.
+#[must_use]
 pub fn extract_features(cmdline: &str) -> [f32; 9] {
     let lower = cmdline.to_lowercase();
     [

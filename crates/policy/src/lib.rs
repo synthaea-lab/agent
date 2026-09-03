@@ -29,9 +29,17 @@ pub fn is_trusted_system_path(path: &str) -> bool {
             || rest.starts_with("\\program files (x86)\\");
     }
     // Unix/macOS grammar: root-owned system prefixes.
-    ["/usr/", "/bin/", "/sbin/", "/lib/", "/opt/", "/system/", "/applications/"]
-        .iter()
-        .any(|prefix| lower.starts_with(prefix))
+    [
+        "/usr/",
+        "/bin/",
+        "/sbin/",
+        "/lib/",
+        "/opt/",
+        "/system/",
+        "/applications/",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
 }
 
 /// Whether a name-keyed exclusion may apply, given the image path the sensor
@@ -52,13 +60,17 @@ mod exclusion_tests {
     #[test]
     fn system_locations_are_trusted() {
         assert!(is_trusted_system_path("C:\\Windows\\System32\\svchost.exe"));
-        assert!(is_trusted_system_path("C:\\Program Files\\Google\\Chrome\\chrome.exe"));
+        assert!(is_trusted_system_path(
+            "C:\\Program Files\\Google\\Chrome\\chrome.exe"
+        ));
         assert!(is_trusted_system_path("/usr/bin/curl"));
     }
 
     #[test]
     fn masquerade_locations_are_not() {
-        assert!(!is_trusted_system_path("C:\\Users\\bob\\Downloads\\svchost.exe"));
+        assert!(!is_trusted_system_path(
+            "C:\\Users\\bob\\Downloads\\svchost.exe"
+        ));
         assert!(!is_trusted_system_path("C:\\Windows\\Temp\\chrome.exe"));
         assert!(!is_trusted_system_path("/tmp/svchost.exe"));
         assert!(!is_trusted_system_path("/home/bob/chrome"));

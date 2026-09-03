@@ -26,4 +26,4 @@
 //! - A posture hint is advisory until corroborated: it carries the originating
 //!   case/policy signature; unsigned or replayed hints are dropped and reported.
 //! - Bounded chatter: fixed fan-out, rate limits, jittered intervals — the mesh
-//!   must never become a scanning signature or a DoS amplifier.
+//!   must never become a scanning signature or a `DoS` amplifier.

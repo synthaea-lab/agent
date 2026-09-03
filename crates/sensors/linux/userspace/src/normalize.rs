@@ -32,6 +32,7 @@ fn meta(meta: &wire::EventMeta, boot_epoch_offset_ns: u64) -> EventMeta {
 /// argv vector and a single display cmdline; `image_path` is best-effort `argv[0]`
 /// until the probes capture the resolved image path (a `\0`-terminated buffer can
 /// carry a trailing empty element — filtered).
+#[must_use]
 pub fn exec(event: &wire::ExecEvent, boot_epoch_offset_ns: u64) -> Event {
     let raw = &event.cmdline[..(event.cmdline_len as usize).min(wire::MAX_CMDLINE_LEN)];
     let argv: Vec<String> = raw
@@ -53,6 +54,7 @@ pub fn exec(event: &wire::ExecEvent, boot_epoch_offset_ns: u64) -> Event {
     })
 }
 
+#[must_use]
 pub fn file_open(event: &wire::FileOpenEvent, boot_epoch_offset_ns: u64) -> Event {
     let raw = &event.path[..(event.path_len as usize).min(wire::MAX_PATH_LEN)];
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
@@ -63,6 +65,7 @@ pub fn file_open(event: &wire::FileOpenEvent, boot_epoch_offset_ns: u64) -> Even
     })
 }
 
+#[must_use]
 pub fn connect(event: &wire::ConnectEvent, boot_epoch_offset_ns: u64) -> Event {
     let daddr = if event.is_ipv6 {
         std::net::IpAddr::V6(event.daddr_v6.into())

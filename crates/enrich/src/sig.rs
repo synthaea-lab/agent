@@ -6,7 +6,7 @@
 //!   crate). Revocation checks run offline-only: the event path must never wait on
 //!   the network. **Known limitation** (discovered on CI: notepad.exe reads
 //!   Unsigned): this checks EMBEDDED signatures only — most System32 binaries are
-//!   catalog-signed, which needs the CryptCATAdmin lookup chain; tracked with the
+//!   catalog-signed, which needs the `CryptCATAdmin` lookup chain; tracked with the
 //!   Windows telemetry expansion (#21, P7). Until then a Windows "Unsigned" verdict
 //!   means "no embedded signature", and rules must not treat it as tampering.
 //! - **macOS**: `codesign --verify` as a subprocess — Apple's supported CLI for
@@ -68,7 +68,7 @@ mod windows_impl {
         data4: [u8; 8],
     }
 
-    /// WINTRUST_ACTION_GENERIC_VERIFY_V2 {00AAC56B-CD44-11d0-8CC2-00C04FC295EE}.
+    /// `WINTRUST_ACTION_GENERIC_VERIFY_V2` {00AAC56B-CD44-11d0-8CC2-00C04FC295EE}.
     const ACTION_GENERIC_VERIFY_V2: Guid = Guid {
         data1: 0x00AA_C56B,
         data2: 0xCD44,
@@ -141,6 +141,8 @@ mod windows_impl {
             ui_context: 0,
             signature_settings: core::ptr::null_mut(),
         };
+        // SAFETY: `data` and `file_info` are fully initialized above and outlive
+        // the call; the struct layout matches the manual WINTRUST_DATA binding.
         let status = unsafe {
             WinVerifyTrust(
                 0,
@@ -150,6 +152,8 @@ mod windows_impl {
         };
         // Release verifier state regardless of the verdict.
         data.state_action = WTD_STATEACTION_CLOSE;
+        // SAFETY: same live `data` as the verify call, now asking the provider to
+        // release the state it allocated.
         unsafe {
             WinVerifyTrust(
                 0,

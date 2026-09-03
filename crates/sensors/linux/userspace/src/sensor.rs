@@ -28,6 +28,11 @@ fn err(msg: String) -> SensorError {
 /// Loads the compiled eBPF object (bytecode embedded at build time), without
 /// initializing the eBPF logger or loading/attaching any individual program. Shared
 /// between the agent's preflight and [`LinuxSensor::run`].
+///
+/// # Errors
+///
+/// Returns [`SensorError`] when the embedded eBPF object fails to load (kernel
+/// too old, verifier refusal at load, or missing BTF).
 #[cfg(ebpf_embedded)]
 pub fn load_ebpf() -> Result<aya::Ebpf, SensorError> {
     // Bump the memlock rlimit. This is needed for older kernels that don't use the
@@ -36,6 +41,7 @@ pub fn load_ebpf() -> Result<aya::Ebpf, SensorError> {
         rlim_cur: libc::RLIM_INFINITY,
         rlim_max: libc::RLIM_INFINITY,
     };
+    // SAFETY: plain FFI call with a valid pointer to a stack-owned rlimit.
     let ret = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) };
     if ret != 0 {
         log::debug!("remove limit on locked memory failed, ret is: {ret}");
@@ -51,6 +57,11 @@ pub fn load_ebpf() -> Result<aya::Ebpf, SensorError> {
 
 /// This build carries no embedded probes (bpf-linker was absent at build time — see
 /// build.rs). The sensor is present but cannot start; the error says how to fix it.
+///
+/// # Errors
+///
+/// Always errors in this build configuration — the message says how to provision
+/// the eBPF toolchain and rebuild.
 #[cfg(not(ebpf_embedded))]
 pub fn load_ebpf() -> Result<aya::Ebpf, SensorError> {
     Err(err(
@@ -62,6 +73,11 @@ pub fn load_ebpf() -> Result<aya::Ebpf, SensorError> {
 }
 
 /// Loads (kernel verifier included) the program `program_name` without attaching it.
+///
+/// # Errors
+///
+/// Returns [`SensorError`] when the program is missing from the eBPF object, is
+/// not a tracepoint, or is rejected by the kernel verifier.
 pub fn load_program(ebpf: &mut aya::Ebpf, program_name: &str) -> Result<(), SensorError> {
     let program: &mut aya::programs::TracePoint = ebpf
         .program_mut(program_name)
@@ -94,7 +110,7 @@ fn attach_tracepoint(
     Ok(())
 }
 
-/// Difference between the epoch clock and CLOCK_MONOTONIC (which the probes stamp
+/// Difference between the epoch clock and `CLOCK_MONOTONIC` (which the probes stamp
 /// events with), computed once at startup — see `normalize`.
 fn boot_epoch_offset_ns() -> u64 {
     let epoch_ns = std::time::SystemTime::now()
@@ -105,6 +121,7 @@ fn boot_epoch_offset_ns() -> u64 {
         tv_sec: 0,
         tv_nsec: 0,
     };
+    // SAFETY: plain FFI call writing into a valid stack-owned timespec.
     let mono_ns = if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0 {
         (ts.tv_sec as u64) * 1_000_000_000 + ts.tv_nsec as u64
     } else {
@@ -132,6 +149,9 @@ macro_rules! drain {
         let rb = guard.get_inner_mut();
         while let Some(item) = rb.next() {
             if item.len() >= core::mem::size_of::<$wire_ty>() {
+                // SAFETY: the length was checked against size_of::<$wire_ty>() above,
+                // the wire types are repr(C) plain-old-data, and read_unaligned
+                // handles the ring buffer's arbitrary alignment.
                 let event = unsafe { core::ptr::read_unaligned(item.as_ptr() as *const $wire_ty) };
                 $sink.on_event($normalize(&event, $offset));
             }
@@ -141,6 +161,7 @@ macro_rules! drain {
 }
 
 impl LinuxSensor {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             stop: Arc::new(Notify::new()),
@@ -195,13 +216,13 @@ impl LinuxSensor {
                 _ = &mut ctrl_c => break,
                 _ = self.stop.notified() => break,
                 guard = exec_ring_buf.readable_mut() => {
-                    drain!(guard, sensor_linux_wire::ExecEvent, normalize::exec, sink, offset)
+                    drain!(guard, sensor_linux_wire::ExecEvent, normalize::exec, sink, offset);
                 }
                 guard = file_open_ring_buf.readable_mut() => {
-                    drain!(guard, sensor_linux_wire::FileOpenEvent, normalize::file_open, sink, offset)
+                    drain!(guard, sensor_linux_wire::FileOpenEvent, normalize::file_open, sink, offset);
                 }
                 guard = connect_ring_buf.readable_mut() => {
-                    drain!(guard, sensor_linux_wire::ConnectEvent, normalize::connect, sink, offset)
+                    drain!(guard, sensor_linux_wire::ConnectEvent, normalize::connect, sink, offset);
                 }
             }
         }

@@ -16,7 +16,7 @@
 //!   survive intact.
 //! - **F-5**: NT device paths normalize through a real `QueryDosDeviceW` volume map,
 //!   not a hardcoded `C:`.
-//! - **F-6** (partial): CreateNewFile (EID 30) joins NameCreate (EID 12); full
+//! - **F-6** (partial): `CreateNewFile` (EID 30) joins `NameCreate` (EID 12); full
 //!   delete/rename semantics need schema variants and land with the ransomware pack
 //!   (#82) / driver (#39).
 //! - **F-7**: IPv6 connects (EID 58/26) are first-class, and a short dedup window
@@ -26,6 +26,8 @@
 //! #21; each provider arrives as its own module. Compiles to a stub off Windows.
 
 pub mod normalize;
+#[cfg(windows)]
+mod providers;
 
 #[cfg(windows)]
 mod sensor;

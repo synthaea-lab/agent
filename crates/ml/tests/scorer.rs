@@ -3,8 +3,8 @@
 //! through onnxruntime), pinned by `ml/tests/fixtures/scorer_golden.json` and its
 //! `gen_scorer_fixture.py` generator.
 //!
-//! This closes the loop the feature and attribution seams leave open: features_golden
-//! pins the vector, attribution_golden pins the explanation, and this pins the score
+//! This closes the loop the feature and attribution seams leave open: `features_golden`
+//! pins the vector, `attribution_golden` pins the explanation, and this pins the score
 //! the shipped runtime computes from that vector.
 
 use ml::CmdlineScorer;

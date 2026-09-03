@@ -12,13 +12,13 @@
 //! evaluated over the current window and the Bayesian belief is updated.
 //!
 //! One module per responsibility:
-//! - [`event`] — helpers over the shared [`schema::Event`] envelope (the old
+//! - `event` — helpers over the shared [`schema::Event`] envelope (the old
 //!   crate-local `TimedEvent` duplicate is gone);
-//! - [`bus`] — the sliding window ([`EventBus`]);
-//! - [`rules`] — the co-occurrence rules (one function per scenario);
-//! - [`behavior`] — the per-pid behavioral vector ([`BehaviorVector`]);
-//! - [`bayes`] — the naive Bayes filter ([`BeliefState`], calibrated LLRs);
-//! - [`engine`] — the entry point ([`CorrelationEngine`]) that orchestrates it all.
+//! - `bus` — the sliding window ([`EventBus`]);
+//! - `rules` — the co-occurrence rules (one function per scenario);
+//! - `behavior` — the per-pid behavioral vector ([`BehaviorVector`]);
+//! - `bayes` — the naive Bayes filter ([`BeliefState`], calibrated LLRs);
+//! - `engine` — the entry point ([`CorrelationEngine`]) that orchestrates it all.
 
 mod bayes;
 mod behavior;

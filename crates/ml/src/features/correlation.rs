@@ -46,6 +46,7 @@ pub const FEATURE_NAMES: [&str; 8] = [
 /// The 8-feature correlation vector for `pid` over the bus's current window, in
 /// [`FEATURE_NAMES`] order. Pid filtering happens here (mirror of the Python side
 /// taking the whole window), via [`EventBus::events_for_pid`].
+#[must_use]
 pub fn extract_features(bus: &EventBus, pid: u32) -> [f32; 8] {
     let events: Vec<&Event> = bus.events_for_pid(pid).collect();
 

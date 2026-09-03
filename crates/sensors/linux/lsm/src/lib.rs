@@ -10,6 +10,6 @@
 //!   blocking path for `response` (deny exec/open/connect by verdict), which
 //!   tracepoints structurally cannot provide.
 //!
-//! Requires CONFIG_BPF_LSM (lsm=bpf in the kernel cmdline on most distros) —
+//! Requires `CONFIG_BPF_LSM` (lsm=bpf in the kernel cmdline on most distros) —
 //! detected at startup and reported via capabilities/conformance, with tracepoint
 //! coverage as the universal floor.

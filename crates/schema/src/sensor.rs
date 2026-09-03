@@ -1,5 +1,5 @@
 //! The sensor contract shared across platforms (`Sensor`/`EventSink`) — an eBPF
-//! sensor (Linux), an ETW one (Windows), or an EndpointSecurity one (macOS) plug in
+//! sensor (Linux), an ETW one (Windows), or an `EndpointSecurity` one (macOS) plug in
 //! behind the same interface, without duplicating the detection logic that consumes
 //! the events.
 //!
@@ -51,6 +51,12 @@ pub trait Sensor: Send {
     /// What this sensor can actually produce on this platform.
     fn capabilities(&self) -> Capabilities;
 
+    /// Runs the capture loop until [`Sensor::stop`] is called.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SensorError`] when the platform capture facility cannot be
+    /// started or fails irrecoverably mid-run.
     fn run(&mut self, sink: Box<dyn EventSink>) -> Result<(), SensorError>;
 
     /// Clean shutdown (from another thread / signal handler) — `run` must return

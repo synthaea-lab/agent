@@ -54,7 +54,7 @@ pub struct FileOpenEvent {
     pub flags: u32,
 }
 
-/// Outbound network connection (`syscalls:sys_enter_connect`, AF_INET/AF_INET6 only).
+/// Outbound network connection (`syscalls:sys_enter_connect`, `AF_INET/AF_INET6` only).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ConnectEvent {

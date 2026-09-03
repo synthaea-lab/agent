@@ -47,6 +47,27 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
 - Config: format decided once via ADR before the first config file lands.
 - Cross-cutting decisions get an ADR (`docs/adr/template.md`) at the time they're made.
 
+## Code quality (full reference: `docs/development/code-style.md`)
+
+- Curated lint bar in root `[workspace.lints]`; clippy runs `-D warnings`, so every
+  listed lint is enforced: `dbg_macro`/`todo`/`unimplemented` and
+  `undocumented_unsafe_blocks` (write `// SAFETY:` on every unsafe block) are deny;
+  `doc_markdown`, `must_use_candidate`, `missing_errors_doc`, `missing_panics_doc`,
+  `semicolon_if_nothing_returned` are enforced warns. `similar_names` is deliberately
+  off (pid/ppid is kernel nomenclature).
+- Every `pub` item documented; `Result` fns get `# Errors`, panicking fns `# Panics`.
+- Functions stay at one level of abstraction — dispatchers dispatch, workers work.
+- Comments state what code can't (invariants, calibration dates, incident lessons),
+  never what the next line does.
+- Detection state is bounded + observable (`store::BoundedMap`, counted shedding);
+  time windows are sliding (timestamp deques), never reset buckets; name-keyed
+  exclusions must be gated on evidence (`policy::name_exclusion_applies`).
+- Bug fixes land with the regression test that would have caught them, named after
+  the behavior.
+- Platform-gated code must be linted for its platform before pushing:
+  `cargo clippy -p sensor-windows --target x86_64-pc-windows-msvc` (and the Linux
+  equivalent) — host-only clippy misses it entirely.
+
 ## Parity seams (golden fixtures required)
 
 - Event schema: versioned JSON fixtures; a serialization change that breaks a fixture is
