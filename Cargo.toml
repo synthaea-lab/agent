@@ -40,6 +40,7 @@ members = [
     "crates/updater",
     "crates/conformance",
     "crates/tamper",
+    "crates/mesh",
 ]
 # The eBPF probe crate is a member (aya-build resolves it by package id in the
 # workspace) but not a default member: it targets bpfel-unknown-none and only builds
@@ -73,6 +74,7 @@ default-members = [
     "crates/updater",
     "crates/conformance",
     "crates/tamper",
+    "crates/mesh",
 ]
 
 [workspace.package]
