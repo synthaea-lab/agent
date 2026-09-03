@@ -1,0 +1,49 @@
+Synthaea
+Copyright 2026 The Synthaea Authors
+
+This product includes software developed by The Synthaea Authors and
+contributors to the Synthaea project.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this file except in compliance with the License. You may obtain a copy of
+the License in the accompanying LICENSE file or at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+--------------------------------------------------------------------------------
+LICENSING EXCEPTION: LINUX eBPF PROBES
+--------------------------------------------------------------------------------
+
+Components under the Linux eBPF probe directories are licensed under the
+GNU General Public License, version 2 ("GPL-2.0"), and not under Apache-2.0.
+
+This is a technical constraint, not a policy preference. The Linux kernel BPF
+verifier restricts the majority of BPF helper functions -- including those this
+project fundamentally requires -- to programs that declare a GPL-compatible
+license in their `license` ELF section. A non-GPL eBPF probe would be rejected
+at load time.
+
+The exception is scoped as narrowly as possible: it covers only the eBPF
+programs that execute inside the kernel. The userspace loader, the event
+normalizer, and every other component of the agent remain Apache-2.0.
+
+Each affected source file carries its own SPDX identifier. The SPDX identifier
+in a file is authoritative for that file.
+
+--------------------------------------------------------------------------------
+THIRD-PARTY SOFTWARE
+--------------------------------------------------------------------------------
+
+This project is currently in the design phase and vendors no third-party
+source. When dependencies are introduced, their licenses and attributions will
+be enumerated here and in a generated dependency manifest.
+
+--------------------------------------------------------------------------------
+COPYRIGHT HOLDER
+--------------------------------------------------------------------------------
+
+"The Synthaea Authors" is used as the collective copyright designation. If the
+project is to be held by a single legal entity, replace this designation
+consistently across LICENSE, NOTICE, and all source headers BEFORE accepting
+external contributions -- changing it afterwards requires the agreement of
+every contributor, as there is no CLA. See docs/adr/0003-apache-license-no-cla.md.

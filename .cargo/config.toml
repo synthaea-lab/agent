@@ -1,0 +1,10 @@
+# Linux: eBPF loading/attachment needs root — run test binaries under sudo on lab
+# machines (harmless elsewhere: only applies when targeting Linux).
+[target."cfg(target_os = \"linux\")"]
+runner = "sudo -E"
+
+# aarch64 cross-builds: without this, `cargo build --target aarch64-unknown-linux-gnu`
+# uses the host's default linker and fails with "linking with `cc` failed"; the
+# cross-linker comes from `gcc-aarch64-linux-gnu`.
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
