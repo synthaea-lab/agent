@@ -1,14 +1,56 @@
-//! # agent
+//! `agent` — entry point of the Synthaea agent.
 //!
-//! The agent binary. Responsibilities:
+//! Walking-skeleton scope (issue #8): sensor -> schema -> rules -> sinks in one
+//! process. The correlator, ML scoring, and Sigma engines join the pipeline as their
+//! crates are migrated (M2) — `DetectionSink` is where they plug in.
 //!
-//! - Select and start the platform sensor (Linux/Windows/macOS) behind the shared contract.
-//! - Run the pipeline: sensor -> normalizer -> rules + ML -> correlator -> verdict -> response.
-//! - Manage local sinks (JSONL, alerts) and the transport to the control plane.
-//! - Host the CLI entry points (run, status, test-detection).
-//!
-//! To be migrated from `old/agent` (main, sinks, alerts, commands, jsonl).
+//! Layout: `commands` carries all the `cfg(target_os)` (sensor selection, rule
+//! seeding); `sink` the agent's `EventSink` wiring events into the detection engines
+//! and the output sinks.
 
-fn main() {
-    // Intentionally empty — skeleton only.
+mod commands;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod sink;
+
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "agent")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Checks that the environment can load the collectors, without attaching them
+    /// (no event capture and no persistent effect).
+    Status,
+    /// Loads the collectors and runs detection until Ctrl-C.
+    Run {
+        /// JSON-Lines file alerts are appended to.
+        #[arg(long, default_value = "alerts.ndjson")]
+        alerts: std::path::PathBuf,
+        /// JSON-Lines file every normalized event is appended to (raw capture,
+        /// consumed by ML calibration and lab assertions).
+        #[arg(long, default_value = "events.jsonl")]
+        events: std::path::PathBuf,
+    },
+    /// Raw capture of all events as JSON-Lines, without evaluating any rules —
+    /// feeds ML baseline/calibration work.
+    CaptureEvents {
+        /// JSON-Lines output file.
+        #[arg(long, default_value = "events.jsonl")]
+        output: std::path::PathBuf,
+    },
+}
+
+fn main() -> anyhow::Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Status => commands::cmd_status(),
+        Command::Run { alerts, events } => commands::cmd_run(&alerts, &events),
+        Command::CaptureEvents { output } => commands::cmd_capture_events(&output),
+    }
 }

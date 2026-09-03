@@ -1,4 +1,4 @@
-# Excluded from the workspace (see the root Cargo.toml): targets bpfel-unknown-none
+# Workspace member but NOT a default member: targets bpfel-unknown-none
 # and is compiled by the userspace crate's build.rs via aya-build (nightly rustc +
 # bpf-linker required — lab/provisioning/linux-toolchain.sh installs them).
 [package]

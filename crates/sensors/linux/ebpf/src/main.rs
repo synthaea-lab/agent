@@ -23,6 +23,7 @@ use sensor_linux_wire::{
     unsafe_op_in_unsafe_fn
 )]
 #[cfg(bpf_target_arch = "x86_64")]
+#[rustfmt::skip]
 mod vmlinux;
 
 /// Bindings generated via `bpftool btf dump` + `bindgen -target aarch64-unknown-linux-gnu` from
@@ -38,6 +39,7 @@ mod vmlinux;
     unsafe_op_in_unsafe_fn
 )]
 #[cfg(bpf_target_arch = "aarch64")]
+#[rustfmt::skip]
 mod vmlinux_aarch64;
 
 /// Ring buffer shared with userspace for `exec` events.
@@ -257,7 +259,10 @@ fn try_sched_process_exec(ctx: TracePointContext) -> Result<u32, u32> {
     };
 
     let Some(mut entry) = EXEC_EVENTS.reserve::<ExecEvent>(0) else {
-        warn!(&ctx, "sensor-linux-ebpf: ring buffer full, dropping exec event");
+        warn!(
+            &ctx,
+            "sensor-linux-ebpf: ring buffer full, dropping exec event"
+        );
         return Ok(0);
     };
 
@@ -347,7 +352,10 @@ fn try_sys_enter_openat(ctx: TracePointContext) -> Result<u32, u32> {
     }
 
     let Some(mut entry) = FILE_OPEN_EVENTS.reserve::<FileOpenEvent>(0) else {
-        warn!(&ctx, "sensor-linux-ebpf: ring buffer full, dropping open event");
+        warn!(
+            &ctx,
+            "sensor-linux-ebpf: ring buffer full, dropping open event"
+        );
         return Ok(0);
     };
 
@@ -456,7 +464,10 @@ fn try_sys_enter_connect(ctx: TracePointContext) -> Result<u32, u32> {
     }
 
     let Some(mut entry) = CONNECT_EVENTS.reserve::<ConnectEvent>(0) else {
-        warn!(&ctx, "sensor-linux-ebpf: ring buffer full, dropping connect event");
+        warn!(
+            &ctx,
+            "sensor-linux-ebpf: ring buffer full, dropping connect event"
+        );
         return Ok(0);
     };
 

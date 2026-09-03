@@ -54,8 +54,8 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
 
 ## Commands
 
-- `cargo check --workspace` / `cargo test --workspace` — works on any OS.
-- `cargo clippy --workspace --all-targets -- -D warnings` — must stay clean.
+- `cargo check` / `cargo test` (default members) — works on any OS; with `--workspace`, add `--exclude sensor-linux-ebpf` (bpfel target).
+- `cargo clippy --workspace --exclude sensor-linux-ebpf --all-targets -- -D warnings` — must stay clean.
 - `python3 tools/check-deps.py` — dependency direction check.
 
 ## Migration order (from `old/`)

@@ -20,6 +20,7 @@ members = [
     "crates/store",
     "crates/sensors/linux/wire",
     "crates/sensors/linux/userspace",
+    "crates/sensors/linux/ebpf",
     "crates/sensors/linux/audit",
     "crates/sensors/windows/etw",
     "crates/sensors/macos/endpoint-security",
@@ -37,9 +38,35 @@ members = [
     "crates/updater",
     "crates/conformance",
 ]
-exclude = [
-    # Built explicitly with the eBPF toolchain (see its README).
-    "crates/sensors/linux/ebpf",
+# The eBPF probe crate is a member (aya-build resolves it by package id in the
+# workspace) but not a default member: it targets bpfel-unknown-none and only builds
+# via sensor-linux's build.rs with the eBPF toolchain present. Plain cargo commands
+# skip it; CI passes --workspace --exclude sensor-linux-ebpf.
+default-members = [
+    "agent",
+    "watchdog",
+    "cli",
+    "crates/schema",
+    "crates/policy",
+    "crates/config",
+    "crates/store",
+    "crates/sensors/linux/wire",
+    "crates/sensors/linux/userspace",
+    "crates/sensors/windows/etw",
+    "crates/sensors/macos/endpoint-security",
+    "crates/sensors/macos/network-extension",
+    "crates/rules",
+    "crates/sigma",
+    "crates/correlator",
+    "crates/ml",
+    "crates/yara",
+    "crates/enrich",
+    "crates/response",
+    "crates/ipc",
+    "crates/transport",
+    "crates/sinks",
+    "crates/updater",
+    "crates/conformance",
 ]
 
 [workspace.package]

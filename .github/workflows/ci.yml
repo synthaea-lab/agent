@@ -47,9 +47,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude sensor-linux-ebpf --all-targets -- -D warnings
       - name: test
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude sensor-linux-ebpf
 
   # The eBPF probe crate is excluded from the workspace and gets its own job
   # once it contains code (bpf-linker toolchain, Linux only).
