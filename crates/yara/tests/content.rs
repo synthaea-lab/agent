@@ -11,7 +11,7 @@ fn content_dir() -> std::path::PathBuf {
 #[test]
 fn every_shipped_rule_compiles() {
     let rules = RuleSet::load_dir(&content_dir()).expect("shipped YARA content must compile");
-    assert!(rules.rule_file_count() >= 1, "no YARA rule files found");
+    assert!(rules.rule_count() >= 1, "no compiled YARA rules found");
 }
 
 #[test]
@@ -24,8 +24,8 @@ fn every_shipped_rule_fires_on_its_sample() {
     let rules = RuleSet::load_dir(&content_dir()).unwrap();
     assert_eq!(
         samples.len(),
-        rules.rule_file_count(),
-        "one matching sample per shipped rule file — add the sample for the new rule"
+        rules.rule_count(),
+        "one matching sample per shipped RULE — add the sample for the new rule"
     );
     for (ident, bytes) in samples {
         let p = std::env::temp_dir().join(format!("yara-content-{}-{ident}", std::process::id()));

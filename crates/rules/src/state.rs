@@ -2,7 +2,10 @@
 //! per-window counters) and consults it on every event. Each rule stays a dedicated
 //! method, with its calibration constants next to it.
 
-use std::{collections::HashMap, net::IpAddr};
+use std::{
+    collections::{HashMap, VecDeque},
+    net::IpAddr,
+};
 
 use store::BoundedMap;
 
@@ -132,10 +135,51 @@ struct RecentWrite {
     timestamp_ns: u64,
 }
 
-/// Sliding-window counter: (count, first_ts_ns, alerted). Shared by SELF-SPAWN and
-/// BEACON, which follow the same "N occurrences in X seconds, one alert per window"
-/// scheme.
-type WindowedCounter = (u32, u64, bool);
+/// True sliding-window counter shared by SELF-SPAWN and BEACON ("N occurrences in
+/// X seconds, one alert per window"). The previous reset-bucket scheme discarded
+/// in-window events at the boundary — spawns at t=0s, 29s, 31s never reached a
+/// threshold of 3 in 30s, because the reset at 31s dropped the 29s spawn that was
+/// still inside the window (review finding).
+#[derive(Default)]
+struct SlidingCounter {
+    timestamps: VecDeque<u64>,
+    last_alert_ns: Option<u64>,
+}
+
+/// Hard cap on retained timestamps per key — a counter only needs to prove the
+/// threshold, not archive the full burst.
+const SLIDING_TIMESTAMPS_CAP: usize = 256;
+
+impl SlidingCounter {
+    /// Prunes expired timestamps, records the new one, returns the in-window count.
+    fn record(&mut self, ts: u64, window_ns: u64) -> u32 {
+        while self
+            .timestamps
+            .front()
+            .is_some_and(|&t| ts.saturating_sub(t) > window_ns)
+        {
+            self.timestamps.pop_front();
+        }
+        self.timestamps.push_back(ts);
+        if self.timestamps.len() > SLIDING_TIMESTAMPS_CAP {
+            self.timestamps.pop_front();
+        }
+        self.timestamps.len() as u32
+    }
+
+    /// One alert per window: true (and remembers) unless one already fired within
+    /// the window.
+    fn try_alert(&mut self, ts: u64, window_ns: u64) -> bool {
+        if self
+            .last_alert_ns
+            .is_some_and(|t| ts.saturating_sub(t) <= window_ns)
+        {
+            return false;
+        }
+        self.last_alert_ns = Some(ts);
+        true
+    }
+}
 
 /// Sliding history needed by the correlation rules:
 /// - T1105 (Ingress Tool Transfer): a path recently written by `curl`/`wget` is
@@ -146,26 +190,26 @@ type WindowedCounter = (u32, u64, bool);
 /// - T1059 (suspicious process lineage): a shell interpreter executed directly by a
 ///   web server process — classic indicator of a web shell / RCE.
 ///
-/// Deliberately unbounded for now (lifetime of a lab session, not of a long-lived
-/// production agent): no eviction of old entries beyond the correlation window of
-/// `check_download_then_exec`. Known limitation — the bounded entity store
-/// (`crates/store`, issue #15) takes this over.
 pub struct RuleState {
     /// pid → comm of the last exec seen for this pid, to recover the parent's comm
     /// (T1059) with a simple `ppid` lookup without having to walk the process tree in
     /// userspace. LRU-bounded (`store::BoundedMap`) — a long-lived agent must not
     /// grow this without limit. `pub(crate)` for the seed_from_proc test.
     pub(crate) pid_comm: BoundedMap<u32, String>,
-    /// path → info about the last write by a known downloader (T1105).
-    recent_writes: HashMap<String, RecentWrite>,
-    /// (ppid, comm) → windowed counter for SELF-SPAWN (T1059 Windows).
-    self_spawn: HashMap<(u32, String), WindowedCounter>,
-    /// (comm, daddr, dport) → windowed counter for BEACON (T1071 Windows).
-    beacon: HashMap<(String, String, u16), WindowedCounter>,
+    /// path → info about the last write by a known downloader (T1105). LRU-bounded:
+    /// downloader writes are rare, but a hostile loop must not grow agent memory.
+    recent_writes: BoundedMap<String, RecentWrite>,
+    /// (ppid, comm) → sliding counter for SELF-SPAWN (T1059 Windows). LRU-bounded.
+    self_spawn: BoundedMap<(u32, String), SlidingCounter>,
+    /// (comm, daddr, dport) → sliding counter for BEACON (T1071 Windows). LRU-bounded.
+    beacon: BoundedMap<(String, String, u16), SlidingCounter>,
 }
 
 /// Same bound as the correlator's entity table: the realistic live-pid space.
 const PID_COMM_CAP: usize = 65_536;
+/// Counter/write-history bounds — one logical entity per key, far fewer than pids.
+const COUNTER_CAP: usize = 16_384;
+const RECENT_WRITES_CAP: usize = 4_096;
 
 impl Default for RuleState {
     fn default() -> Self {
@@ -177,9 +221,9 @@ impl RuleState {
     pub fn new() -> Self {
         Self {
             pid_comm: BoundedMap::new(PID_COMM_CAP),
-            recent_writes: HashMap::new(),
-            self_spawn: HashMap::new(),
-            beacon: HashMap::new(),
+            recent_writes: BoundedMap::new(RECENT_WRITES_CAP),
+            self_spawn: BoundedMap::new(COUNTER_CAP),
+            beacon: BoundedMap::new(COUNTER_CAP),
         }
     }
 
@@ -307,9 +351,13 @@ impl RuleState {
     /// SELF_SPAWN_PARENT_EXCLUSIONS.
     fn check_self_spawn(&mut self, event: &ExecEvent) -> Option<Alert> {
         let comm = event.meta.comm.clone();
+        // Name alone is a bypass: a payload renamed `svchost.exe` in %TEMP% must
+        // not inherit the exclusion — the image must live where the real binary
+        // does (user finding; signature-based identity is the follow-up issue).
         if SELF_SPAWN_EXCLUSIONS
             .iter()
             .any(|&e| comm.eq_ignore_ascii_case(e))
+            && policy::name_exclusion_applies(Some(event.image_path.as_str()))
         {
             return None;
         }
@@ -323,25 +371,22 @@ impl RuleState {
         if SELF_SPAWN_PARENT_EXCLUSIONS
             .iter()
             .any(|&e| parent_comm.eq_ignore_ascii_case(e))
+            && policy::name_exclusion_applies(event.parent_image_path.as_deref())
         {
             return None;
         }
         let ts = event.meta.timestamp_ns;
         let key = (event.meta.ppid, comm.clone());
-        let entry = self.self_spawn.entry(key).or_insert((0, ts, false));
-        // Reset if outside the window
-        if ts.saturating_sub(entry.1) > SELF_SPAWN_WINDOW_NS {
-            *entry = (0, ts, false);
-        }
-        entry.0 += 1;
-        if entry.0 >= SELF_SPAWN_THRESHOLD && !entry.2 {
-            entry.2 = true;
+        let entry = self
+            .self_spawn
+            .get_or_insert_with(key, SlidingCounter::default);
+        let count = entry.record(ts, SELF_SPAWN_WINDOW_NS);
+        if count >= SELF_SPAWN_THRESHOLD && entry.try_alert(ts, SELF_SPAWN_WINDOW_NS) {
             return Some(Alert {
                 technique: "T1059",
                 message: format!(
-                    "pid={} comm={comm} spawned {}x in {}s by ppid={} — suspected self-spawn",
+                    "pid={} comm={comm} spawned {count}x in {}s by ppid={} — suspected self-spawn",
                     event.meta.pid,
-                    entry.0,
                     SELF_SPAWN_WINDOW_NS / 1_000_000_000,
                     event.meta.ppid,
                 ),
@@ -410,6 +455,9 @@ impl RuleState {
             return None;
         }
         let comm = event.meta.comm.clone();
+        // Known limitation: ConnectEvent carries no image path, so the browser
+        // exclusion stays name-only here — the correlator's exec-time masquerade
+        // tracking covers the rename bypass at the correlation layer.
         if BROWSERS.iter().any(|&n| comm.eq_ignore_ascii_case(n)) {
             return None;
         }
@@ -428,20 +476,15 @@ impl RuleState {
         let daddr = event.daddr.to_string();
         let ts = event.meta.timestamp_ns;
         let key = (comm.clone(), daddr.clone(), event.dport);
-        let entry = self.beacon.entry(key).or_insert((0, ts, false));
-        if ts.saturating_sub(entry.1) > BEACON_WINDOW_NS {
-            *entry = (0, ts, false);
-        }
-        entry.0 += 1;
-        if entry.0 >= BEACON_THRESHOLD && !entry.2 {
-            entry.2 = true;
+        let entry = self.beacon.get_or_insert_with(key, SlidingCounter::default);
+        let count = entry.record(ts, BEACON_WINDOW_NS);
+        if count >= BEACON_THRESHOLD && entry.try_alert(ts, BEACON_WINDOW_NS) {
             return Some(Alert {
                 technique: "T1071/T1041",
                 message: format!(
-                    "pid={} comm={comm} → {daddr}:{} | {}x in {}s — suspected beaconing",
+                    "pid={} comm={comm} → {daddr}:{} | {count}x in {}s — suspected beaconing",
                     event.meta.pid,
                     event.dport,
-                    entry.0,
                     BEACON_WINDOW_NS / 1_000_000_000,
                 ),
             });

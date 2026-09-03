@@ -81,9 +81,14 @@ impl BehaviorVector {
         let mut dest_is_external = false;
         for c in &connect_events {
             dports.insert(c.dport);
-            if let IpAddr::V4(v4) = c.daddr
-                && !is_private_ipv4(v4.octets())
-            {
+            let external = match c.daddr {
+                IpAddr::V4(v4) => !is_private_ipv4(v4.octets()),
+                // Review finding: IPv6 was skipped entirely, so public IPv6 C2 was
+                // systematically underscored. Non-global v6 classes are excluded
+                // explicitly; everything else counts as external.
+                IpAddr::V6(v6) => !is_non_global_ipv6(v6),
+            };
+            if external {
                 dest_is_external = true;
             }
         }
@@ -156,6 +161,17 @@ fn is_suspicious_image_path(path: &str) -> bool {
 /// unidentified): without this exclusion, the unspecified address was classified as
 /// external by default, contributing to `dest_is_external` Bayesian LLR on traffic
 /// unrelated to any real C2.
+/// Loopback, unspecified, link-local (fe80::/10), unique-local (fc00::/7),
+/// multicast (ff00::/8) — the non-global classes legitimate local traffic uses.
+fn is_non_global_ipv6(addr: std::net::Ipv6Addr) -> bool {
+    let seg = addr.segments();
+    addr.is_loopback()
+        || addr.is_unspecified()
+        || (seg[0] & 0xffc0) == 0xfe80
+        || (seg[0] & 0xfe00) == 0xfc00
+        || (seg[0] & 0xff00) == 0xff00
+}
+
 fn is_private_ipv4(addr: [u8; 4]) -> bool {
     matches!(
         addr,

@@ -54,6 +54,7 @@ fn is_ignored(comm: &str) -> bool {
 /// and evaluates the co-occurrence rules over the current window.
 pub struct CorrelationEngine {
     bus: EventBus,
+    window_ns: u64,
     /// Bayesian beliefs per entity (ppid, comm), LRU-bounded (`store::BoundedMap`) —
     /// the old iteration's unbounded HashMap was a documented known limitation.
     /// Keyed by (ppid, comm), not pid: survives respawns.
@@ -61,6 +62,16 @@ pub struct CorrelationEngine {
     /// pid → (ppid, comm) mapping populated by ExecEvents, LRU-bounded.
     /// Lets ConnectEvents (ppid=0) find the right entity key.
     pid_entities: BoundedMap<u32, (u32, String)>,
+    /// (technique, pid) → last alert timestamp. A satisfied co-occurrence pattern
+    /// stays satisfied for every later event in the window — without this, one
+    /// exec+connect pair re-alerted on every subsequent event of that pid (review
+    /// finding: identical alert floods from a single pattern).
+    fired: BoundedMap<(&'static str, u32), u64>,
+    /// Pids whose ExecEvent showed an IGNORED-list name running from an
+    /// untrusted location — a rename masquerade (`/tmp/svchost.exe`). The
+    /// exclusion is name-keyed and would otherwise be a trivial bypass (user
+    /// finding); these pids keep full rule evaluation.
+    masquerading: BoundedMap<u32, ()>,
 }
 
 /// Bounds for a long-lived agent: entities cover the realistic live-pid space with
@@ -78,8 +89,11 @@ impl CorrelationEngine {
     pub fn with_window(window: Duration) -> Self {
         Self {
             bus: EventBus::new(window),
+            window_ns: window.as_nanos() as u64,
             beliefs: BoundedMap::new(BELIEF_CAP),
             pid_entities: BoundedMap::new(ENTITY_CAP),
+            fired: BoundedMap::new(BELIEF_CAP),
+            masquerading: BoundedMap::new(ENTITY_CAP),
         }
     }
 
@@ -99,8 +113,15 @@ impl CorrelationEngine {
         // On Windows (ETW), the sensor does not fill in ppid for ConnectEvent
         // (ppid=0 in EventMeta) — this table compensates. On Linux (eBPF), ppid
         // is filled in on all events, so the table is redundant but harmless.
-        if matches!(event, Event::Exec(_)) && ppid != 0 {
-            self.pid_entities.insert(pid, (ppid, comm.clone()));
+        if let Event::Exec(exec) = &event {
+            if ppid != 0 {
+                self.pid_entities.insert(pid, (ppid, comm.clone()));
+            }
+            if is_ignored(&comm)
+                && !policy::name_exclusion_applies(Some(exec.image_path.as_str()))
+            {
+                self.masquerading.insert(pid, ());
+            }
         }
 
         self.bus.push(event);
@@ -128,11 +149,17 @@ impl CorrelationEngine {
             update_belief(state, &bv, now_ns);
         }
 
-        if is_ignored(&comm) {
+        if is_ignored(&comm) && self.masquerading.peek(&pid).is_none() {
             return Vec::new();
         }
 
-        let mut alerts = self.evaluate(pid);
+        let now_ns = self
+            .bus
+            .events_for_pid(pid)
+            .map(|e| e.meta().timestamp_ns)
+            .max()
+            .unwrap_or(0);
+        let mut alerts = self.evaluate(pid, now_ns);
         alerts.extend(self.bayes_alert(pid, &comm, &entity_key));
         alerts
     }
@@ -180,24 +207,41 @@ impl CorrelationEngine {
         self.beliefs.peek(&(pid, comm))
     }
 
-    /// Evaluates all the co-occurrence rules for a given pid.
-    fn evaluate(&self, pid: u32) -> Vec<CorrelationAlert> {
+    /// Evaluates all the co-occurrence rules for a given pid, emitting each
+    /// satisfied pattern once per correlation window rather than on every event.
+    fn evaluate(&mut self, pid: u32, now_ns: u64) -> Vec<CorrelationAlert> {
         let mut alerts = Vec::new();
+        let window_ns = self.window_ns;
+
+        // Keyed by rule identity, not technique — spawn+connect and
+        // respawn+connect share "T1059/T1071" but are distinct findings.
+        let mut push_once = |fired: &mut BoundedMap<(&'static str, u32), u64>,
+                             rule_id: &'static str,
+                             alert: CorrelationAlert| {
+            let key = (rule_id, pid);
+            let recently = fired
+                .get(&key)
+                .is_some_and(|&t| now_ns.saturating_sub(t) <= window_ns);
+            if !recently {
+                fired.insert(key, now_ns);
+                alerts.push(alert);
+            }
+        };
 
         if let Some(alert) = rule_spawn_connect_filewrite(pid, &self.bus) {
-            alerts.push(alert);
+            push_once(&mut self.fired, "spawn_connect_filewrite", alert);
         } else if let Some(alert) = rule_spawn_connect(pid, &self.bus) {
             // Subset of the full chain — only alert if the full chain has not
             // already been reported, to avoid the duplicate.
-            alerts.push(alert);
+            push_once(&mut self.fired, "spawn_connect", alert);
         }
 
         if let Some(alert) = rule_connect_filewrite(pid, &self.bus) {
-            alerts.push(alert);
+            push_once(&mut self.fired, "connect_filewrite", alert);
         }
 
         if let Some(alert) = rule_respawn_connect(pid, &self.bus) {
-            alerts.push(alert);
+            push_once(&mut self.fired, "respawn_connect", alert);
         }
 
         alerts

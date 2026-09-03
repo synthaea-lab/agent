@@ -42,7 +42,23 @@ pub struct FileEnrichment {
 struct CacheEntry {
     mtime_ns: u128,
     size: u64,
+    /// Unix: (dev, inode) — an attacker can set mtime and size at will
+    /// (`touch -r`), but cannot keep them while swapping the underlying inode
+    /// without the pair changing (review finding: mtime+size alone made the
+    /// cached verdict spoofable). Windows: 0 (no cheap stable id via metadata).
+    file_id: (u64, u64),
     enrichment: FileEnrichment,
+}
+
+#[cfg(unix)]
+fn file_id(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
+}
+
+#[cfg(not(unix))]
+fn file_id(_meta: &std::fs::Metadata) -> (u64, u64) {
+    (0, 0)
 }
 
 /// The enrichment engine: owns the cache. One instance per agent, behind whatever
@@ -74,6 +90,15 @@ impl Enricher {
                 signature: Signature::Unsupported,
             };
         };
+        // FIFOs, device nodes, sockets: opening one can block forever (a named
+        // pipe with no writer) or read an endless stream — the event path must
+        // never touch them (review finding).
+        if !meta.is_file() {
+            return FileEnrichment {
+                sha256: None,
+                signature: Signature::Unsupported,
+            };
+        }
         let mtime_ns = meta
             .modified()
             .ok()
@@ -82,9 +107,11 @@ impl Enricher {
             .unwrap_or(0);
         let size = meta.len();
 
+        let id = file_id(&meta);
         if let Some(entry) = self.cache.get(&path.to_path_buf())
             && entry.mtime_ns == mtime_ns
             && entry.size == size
+            && entry.file_id == id
         {
             return entry.enrichment.clone();
         }
@@ -107,6 +134,7 @@ impl Enricher {
             CacheEntry {
                 mtime_ns,
                 size,
+                file_id: id,
                 enrichment: enrichment.clone(),
             },
         );

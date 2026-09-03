@@ -130,6 +130,69 @@ fn complete_dropper_chain_alerts() {
 }
 
 #[test]
+fn masqueraded_ignored_name_is_still_correlated() {
+    // A payload renamed `svchost.exe` in /tmp must not inherit the IGNORED-list
+    // exclusion (name-only exclusions are a trivial bypass).
+    let mut engine = CorrelationEngine::new();
+    let mut exec = exec_event(99, 1_000_000_000);
+    exec_set_comm_and_path(&mut exec, "svchost.exe", "/tmp/svchost.exe");
+    engine.on_event(exec);
+    let mut connect = connect_event(99, 2_000_000_000);
+    if let Event::Connect(c) = &mut connect {
+        c.meta.comm = "svchost.exe".to_string();
+    }
+    let alerts = engine.on_event(connect);
+    assert!(
+        alerts.iter().any(|a| a.technique == "T1059/T1071"),
+        "masqueraded svchost must still correlate: {alerts:?}"
+    );
+}
+
+#[test]
+fn real_system_svchost_stays_ignored() {
+    let mut engine = CorrelationEngine::new();
+    let mut exec = exec_event(99, 1_000_000_000);
+    exec_set_comm_and_path(
+        &mut exec,
+        "svchost.exe",
+        "C:\\Windows\\System32\\svchost.exe",
+    );
+    engine.on_event(exec);
+    let mut connect = connect_event(99, 2_000_000_000);
+    if let Event::Connect(c) = &mut connect {
+        c.meta.comm = "svchost.exe".to_string();
+    }
+    let alerts = engine.on_event(connect);
+    assert!(alerts.is_empty(), "real svchost must stay excluded: {alerts:?}");
+}
+
+fn exec_set_comm_and_path(event: &mut Event, comm: &str, image_path: &str) {
+    if let Event::Exec(e) = event {
+        e.meta.comm = comm.to_string();
+        e.image_path = image_path.to_string();
+    }
+}
+
+#[test]
+fn satisfied_pattern_alerts_once_per_window() {
+    // Review finding: once exec+connect co-occurred, EVERY later event of the
+    // pid re-emitted the identical alert — a flood from one pattern.
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(exec_event(99, 1_000_000_000));
+    let first = engine.on_event(connect_event(99, 2_000_000_000));
+    assert!(first.iter().any(|a| a.technique == "T1059/T1071"));
+    let repeat = engine.on_event(connect_event(99, 3_000_000_000));
+    assert!(
+        repeat.iter().all(|a| a.technique != "T1059/T1071"),
+        "same pattern re-alerted inside the window: {repeat:?}"
+    );
+    // A full window later, a fresh exec+connect pair is a new finding.
+    engine.on_event(exec_event(99, 99_000_000_000));
+    let later = engine.on_event(connect_event(99, 100_000_000_000));
+    assert!(later.iter().any(|a| a.technique == "T1059/T1071"));
+}
+
+#[test]
 fn complete_chain_masks_plain_spawn_connect() {
     // When the full chain is detected, spawn+connect alone must not
     // generate a duplicate.

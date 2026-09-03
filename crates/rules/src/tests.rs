@@ -331,6 +331,57 @@ fn self_spawn_third_spawn_triggers_alert() {
 }
 
 #[test]
+fn excluded_name_from_untrusted_path_still_alerts() {
+    // Name-based exclusion bypass: a payload renamed to an excluded name
+    // (wermgr.exe) running from /tmp must NOT inherit the exclusion.
+    let mut state = RuleState::new();
+    let sec = 1_000_000_000u64;
+    let mut alerts = Vec::new();
+    for i in 0..SELF_SPAWN_THRESHOLD {
+        let mut e = exec_event_full(300 + i, 1, "wermgr.exe", "wermgr.exe", u64::from(i) * sec);
+        e.image_path = "/tmp/wermgr.exe".to_string();
+        alerts.extend(state.on_exec(&e));
+    }
+    assert!(
+        alerts.iter().any(|a| a.technique == "T1059"),
+        "masqueraded excluded name must still trigger self-spawn"
+    );
+}
+
+#[test]
+fn excluded_name_from_system_path_stays_excluded() {
+    let mut state = RuleState::new();
+    let sec = 1_000_000_000u64;
+    let mut alerts = Vec::new();
+    for i in 0..SELF_SPAWN_THRESHOLD + 2 {
+        let mut e = exec_event_full(300 + i, 1, "wermgr.exe", "wermgr.exe", u64::from(i) * sec);
+        e.image_path = "C:\\Windows\\System32\\wermgr.exe".to_string();
+        alerts.extend(state.on_exec(&e));
+    }
+    assert!(
+        alerts.iter().all(|a| a.technique != "T1059"),
+        "the real wermgr.exe must keep its exclusion"
+    );
+}
+
+#[test]
+fn self_spawn_window_slides_instead_of_resetting() {
+    // Review finding: the reset-bucket scheme dropped in-window events at the
+    // boundary — spawns at t=0s, 29s, 31s, 33s never alerted with a 30s window,
+    // even though 29/31/33 are three spawns within 4 seconds.
+    let mut state = RuleState::new();
+    let sec = 1_000_000_000u64;
+    state.on_exec(&exec_event_full(200, 1, "cmd.exe", "cmd.exe", 0));
+    state.on_exec(&exec_event_full(201, 1, "cmd.exe", "cmd.exe", 29 * sec));
+    state.on_exec(&exec_event_full(202, 1, "cmd.exe", "cmd.exe", 31 * sec));
+    let alerts = state.on_exec(&exec_event_full(203, 1, "cmd.exe", "cmd.exe", 33 * sec));
+    assert!(
+        alerts.iter().any(|a| a.technique == "T1059"),
+        "three spawns within 4s straddling the bucket boundary must alert"
+    );
+}
+
+#[test]
 fn self_spawn_does_not_realert_past_threshold() {
     let mut state = RuleState::new();
     state.on_exec(&exec_event_full(200, 1, "cmd.exe", "cmd.exe", 0));
