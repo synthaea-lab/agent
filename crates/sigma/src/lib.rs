@@ -15,7 +15,12 @@
 //! instead of silently never matching (the old engine's behavior, fixed per issue #11).
 
 pub mod engine;
+mod eval;
 pub mod rule;
+mod validate;
+
+#[cfg(test)]
+mod tests;
 
 pub use engine::{SigmaEngine, SigmaError};
 pub use rule::SigmaAlert;

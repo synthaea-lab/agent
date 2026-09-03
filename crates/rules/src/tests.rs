@@ -4,7 +4,7 @@ use schema::{ConnectEvent, EventMeta, ExecEvent, FileOpenEvent, User};
 
 use crate::{
     O_CREAT, O_WRONLY, RuleState, check_base64_decode, check_persistence_write,
-    state::{BEACON_THRESHOLD, SELF_SPAWN_THRESHOLD},
+    exclusions::{BEACON_THRESHOLD, SELF_SPAWN_THRESHOLD},
 };
 
 const O_RDONLY: u32 = 0;

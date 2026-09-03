@@ -26,6 +26,8 @@
 //! #21; each provider arrives as its own module. Compiles to a stub off Windows.
 
 pub mod normalize;
+#[cfg(windows)]
+mod providers;
 
 #[cfg(windows)]
 mod sensor;

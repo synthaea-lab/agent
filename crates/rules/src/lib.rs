@@ -10,6 +10,8 @@
 //! Migrated from `old/crates/synthaea-rules`; the false-positive exclusion lists carry
 //! dated lab observations — treat them as data with provenance, not tunable noise.
 
+mod exclusions;
+mod sliding;
 mod state;
 mod stateless;
 
