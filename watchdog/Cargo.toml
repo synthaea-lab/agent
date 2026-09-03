@@ -1,9 +1,14 @@
 [package]
 name = "watchdog"
 version = "0.1.0"
-description = "Watchdog binary — keeps the agent alive and detects tampering"
+description = "Watchdog: installs and supervises the agent as a system service (systemd / Windows SCM)"
 license.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.6"
