@@ -12,10 +12,13 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# ML artifacts (large binaries are versioned elsewhere)
+# ML artifacts (large binaries are versioned elsewhere); the one exception is the
+# small committed parity fixture consumed by cargo test in CI.
 *.onnx
+!crates/ml/tests/fixtures/*.onnx
 
 # Editors / OS
 .DS_Store
 .idea/
 .vscode/
+*.egg-info/
