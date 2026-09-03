@@ -1,0 +1,9 @@
+[package]
+name = "rtr"
+version = "0.1.0"
+description = "Real Time Response: analyst-driven live sessions on an endpoint"
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]

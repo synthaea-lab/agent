@@ -22,9 +22,9 @@ import sys
 
 SCHEMA = "schema"
 BASE = {"schema", "policy"}
-DETECTION = {"rules", "sigma", "correlator", "ml", "yara", "enrich"}
+DETECTION = {"rules", "sigma", "correlator", "ml", "yara", "enrich", "intel"}
 LEAF = {"response", "transport", "ipc", "sinks", "updater", "config", "store",
-        "conformance"}
+        "conformance", "rtr"}
 BINARIES = {"agent", "watchdog", "cli"}
 WIRE_CRATES = {"sensor-linux-wire"}
 

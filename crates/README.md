@@ -21,11 +21,13 @@ its code comes from. Dependency direction between them is enforced by
 | `correlator` | Correlation + scoring — builds cases from detections | **migrated** | `old/` (issue #12) |
 | `ml` | On-device ONNX inference + feature extraction | skeleton | migrate from `old/` |
 | `yara` | YARA-X file and memory scanning, feeding detections to the correlator | skeleton | new development |
+| `intel` | IOC matching: hash/IP/domain indicator sets, canary-ring distributed | skeleton | new development |
 | `enrich` | Cross-platform enrichment: hashing, code signing, file metadata | skeleton | new development |
 | `policy` | Policy model shared by agent and control plane (versioned, signed) | skeleton | new development |
 | `config` | Local agent configuration loading and validation | skeleton | new development |
 | `store` | Bounded local state: entity store (process graph) + event spool | skeleton | new development |
 | `response` | Response actions — kill, quarantine, isolate | skeleton | new development |
+| `rtr` | Real Time Response: analyst-driven live sessions (fixed command set, audited) | skeleton | new development |
 | `transport` | Agent ↔ control-plane comms — mTLS, store-and-forward | skeleton | new development |
 | `ipc` | Local IPC: agent ↔ endpoint UI/CLI (named pipe / Unix socket) | skeleton | new development |
 | `sinks` | Local outputs: JSONL, syslog/CEF export | **migrated** | `old/agent` (issue #7) |
