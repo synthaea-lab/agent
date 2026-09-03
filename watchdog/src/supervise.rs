@@ -4,8 +4,12 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+#[cfg(unix)]
+use anyhow::Context as _;
 
 use crate::paths::{child_log_path, resolve_agent_bin};
 
@@ -68,6 +72,7 @@ fn watch_child(child: &mut Child, restart_delay: u64, stop_flag: &AtomicBool) ->
     loop {
         if stop_flag.load(Ordering::SeqCst) {
             let _ = child.kill();
+            let _ = child.wait();
             return false;
         }
         match child.try_wait() {
@@ -95,8 +100,8 @@ fn sleep_unless_stopped(stop_flag: &AtomicBool, secs: u64) -> bool {
     true
 }
 
-/// Subcommand `run`: direct supervision (fallback without service rights, and the
-/// body of Windows service mode).
+/// Subcommand `run`: direct supervision — the service entry point on Unix, and
+/// the fallback without service rights everywhere.
 pub(crate) fn cmd_run(
     agent_bin: Option<PathBuf>,
     alerts: PathBuf,
@@ -110,9 +115,20 @@ pub(crate) fn cmd_run(
         agent.display(),
         alerts.display()
     );
-    eprintln!("[watchdog] Ctrl+C to stop the watchdog (the agent will be stopped too)");
 
-    let stop = AtomicBool::new(false);
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Unix clean stop: systemd stop / launchctl bootout / Ctrl+C set the flag,
+    // the loop kills the agent and exits — the same semantics the Windows SCM
+    // control handler provides.
+    #[cfg(unix)]
+    for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        signal_hook::flag::register(sig, stop.clone())
+            .with_context(|| format!("registering handler for signal {sig}"))?;
+    }
+    eprintln!("[watchdog] Ctrl+C / SIGTERM stops the watchdog (the agent will be stopped too)");
+
     watchdog_loop(&agent, &alerts, restart_delay, &stop);
+    eprintln!("[watchdog] stopped.");
     Ok(())
 }

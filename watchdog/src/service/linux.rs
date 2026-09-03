@@ -54,7 +54,7 @@ pub(crate) fn cmd_install(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow
 
     println!("[watchdog] systemd service installed and started.");
     println!("  Alerts: {}", alerts_abs.display());
-    println!("  Check: systemctl status synthaea-agent");
+    println!("  Check: watchdog status");
     println!(
         "  Logs : journalctl -u synthaea-agent -f (watchdog); agent output in {}",
         child_log_path()

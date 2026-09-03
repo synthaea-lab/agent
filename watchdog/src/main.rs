@@ -1,9 +1,11 @@
 //! `watchdog` — kill resistance for the agent. Migrated from `old/watchdog`.
 //!
-//! Three CLI subcommands:
-//!   install   — installs the watchdog as a system service (systemd / SC Manager) with auto-restart
+//! Four CLI subcommands:
+//!   install   — installs the watchdog as a system service with auto-restart
 //!   uninstall — uninstalls the service
-//!   run       — pure-Rust supervision loop (fallback without service rights, or SCM service mode)
+//!   status    — shows the service state as the platform's service manager sees it
+//!   run       — pure-Rust supervision loop (service entry point, or fallback without
+//!               service rights)
 //!
 //! Kill resistance is the same two layers on every OS: the service manager runs the
 //! watchdog (never the agent directly), and the watchdog's supervision loop spawns and
@@ -12,6 +14,10 @@
 //!   Windows: the watchdog is the Windows service; `sc failure` restart policy. (sc stop)
 //!   Linux  : systemd unit with `Restart=always RestartSec=5s`.  (systemctl stop)
 //!   macOS  : launchd daemon with `KeepAlive`.                   (launchctl bootout)
+//!
+//! On Unix a stop request arrives as SIGTERM (systemd stop, launchctl bootout); the
+//! watchdog traps it, kills the agent, and exits — the same clean-stop semantics the
+//! Windows SCM control handler provides.
 //!
 //! Module map: `paths` (agent/binary/log resolution), `supervise` (the respawn
 //! loop), `service` (per-platform install/uninstall: SCM, systemd, launchd).
@@ -53,8 +59,11 @@ enum Command {
     /// Stops and uninstalls the service.
     Uninstall,
 
+    /// Shows the service state as the platform's service manager sees it.
+    Status,
+
     /// Direct supervision loop — respawns the agent if dead.
-    /// Also used as the entry point when the watchdog is launched by the Windows SCM.
+    /// Also the entry point when launched by the service manager.
     Run {
         /// Path to the agent binary (default: same folder as this binary).
         #[arg(long)]
@@ -75,6 +84,7 @@ fn run_cli() -> anyhow::Result<()> {
     match cli.command {
         Command::Install { agent_bin, alerts } => service::cmd_install(agent_bin, alerts),
         Command::Uninstall => service::cmd_uninstall(),
+        Command::Status => service::cmd_status(),
         Command::Run {
             agent_bin,
             alerts,

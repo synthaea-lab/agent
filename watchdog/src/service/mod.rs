@@ -9,7 +9,7 @@ pub(crate) const SERVICE_NAME: &str = "SynthaEDR";
 pub(crate) const SERVICE_DISPLAY: &str = "Synthaea EDR Agent";
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 pub(crate) const SERVICE_DESC: &str =
-    "Supervises the Synthaea EDR agent and restarts it if it is killed";
+    "Synthaea Endpoint Detection & Response — real-time behavioral monitoring";
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -36,4 +36,31 @@ pub(crate) fn cmd_install(
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub(crate) fn cmd_uninstall() -> anyhow::Result<()> {
     anyhow::bail!("uninstall is only supported on Windows, Linux, and macOS")
+}
+
+/// Subcommand `status`: the service manager's view. The query command's own exit
+/// code is informational (a stopped or absent service is a valid answer, not an
+/// error).
+pub(crate) fn cmd_status() -> anyhow::Result<()> {
+    let (program, args): (&str, &[&str]) = if cfg!(windows) {
+        ("sc", &["query", SERVICE_NAME])
+    } else if cfg!(target_os = "linux") {
+        (
+            "systemctl",
+            &["status", "synthaea-agent.service", "--no-pager"],
+        )
+    } else if cfg!(target_os = "macos") {
+        ("launchctl", &["print", "system/com.synthaea.agent"])
+    } else {
+        anyhow::bail!("status is only supported on Windows, Linux, and macOS")
+    };
+
+    let status = std::process::Command::new(program)
+        .args(args)
+        .status()
+        .map_err(|e| anyhow::anyhow!("cannot launch {program}: {e}"))?;
+    if !status.success() {
+        println!("[watchdog] service not running or not installed ({program} exited {status}).");
+    }
+    Ok(())
 }

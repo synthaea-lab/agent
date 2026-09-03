@@ -124,7 +124,7 @@ pub(crate) fn cmd_install(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow
 
     println!("[watchdog] service \"{SERVICE_NAME}\" installed and started.");
     println!("  Alerts: {}", out_abs.display());
-    println!("  Check: sc query {SERVICE_NAME}");
+    println!("  Check: watchdog status");
     println!("  Uninstall: watchdog uninstall");
     Ok(())
 }
