@@ -1,0 +1,9 @@
+[package]
+name = "sensor-linux-netlink"
+version = "0.1.0"
+description = "Linux netlink telemetry: socket tables, conntrack, proc connector"
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]

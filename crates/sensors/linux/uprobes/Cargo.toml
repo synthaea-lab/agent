@@ -1,0 +1,9 @@
+[package]
+name = "sensor-linux-uprobes"
+version = "0.1.0"
+description = "Linux uprobe telemetry: TLS plaintext taps, shell readline"
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]

@@ -1,0 +1,9 @@
+[package]
+name = "sensor-windows-eventlog"
+version = "0.1.0"
+description = "Windows Event Log channel telemetry (EvtSubscribe)"
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]

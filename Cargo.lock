@@ -801,6 +801,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sensor-linux-journal"
+version = "0.1.0"
+
+[[package]]
+name = "sensor-linux-lsm"
+version = "0.1.0"
+
+[[package]]
+name = "sensor-linux-netlink"
+version = "0.1.0"
+
+[[package]]
+name = "sensor-linux-uprobes"
+version = "0.1.0"
+
+[[package]]
 name = "sensor-linux-wire"
 version = "0.1.0"
 
@@ -813,7 +829,15 @@ name = "sensor-macos-network-extension"
 version = "0.1.0"
 
 [[package]]
+name = "sensor-macos-unifiedlog"
+version = "0.1.0"
+
+[[package]]
 name = "sensor-windows"
+version = "0.1.0"
+
+[[package]]
+name = "sensor-windows-eventlog"
 version = "0.1.0"
 
 [[package]]

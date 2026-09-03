@@ -1,0 +1,9 @@
+[package]
+name = "sensor-linux-journal"
+version = "0.1.0"
+description = "Linux journald/auth-log telemetry: logins and service lifecycle"
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
