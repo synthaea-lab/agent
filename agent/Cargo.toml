@@ -10,6 +10,7 @@ publish.workspace = true
 schema = { path = "../crates/schema" }
 rules = { path = "../crates/rules" }
 correlator = { path = "../crates/correlator" }
+sigma = { path = "../crates/sigma" }
 sinks = { path = "../crates/sinks" }
 
 anyhow = "1"

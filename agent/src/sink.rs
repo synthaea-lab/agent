@@ -16,6 +16,10 @@ use sinks::{AlertRecord, JsonlWriter};
 pub(crate) struct DetectionSink {
     rule_state: Mutex<rules::RuleState>,
     correlator: Mutex<correlator::CorrelationEngine>,
+    /// Sigma rules from `rules/sigma` (relative to the working directory) when the
+    /// folder exists — otherwise the agent runs without a Sigma engine, and that is
+    /// not an error (the load failure path IS an error: content present but broken).
+    sigma: Option<sigma::SigmaEngine>,
     /// One alert per line in alerts.ndjson.
     alert_log: JsonlWriter,
     /// Raw event log (one normalized event per line) for calibration/ML training.
@@ -33,6 +37,7 @@ impl DetectionSink {
         Ok(Self {
             rule_state: Mutex::new(rule_state),
             correlator: Mutex::new(correlator::CorrelationEngine::new()),
+            sigma: load_sigma_rules(),
             alert_log: JsonlWriter::open(alerts_path)?,
             events_log: JsonlWriter::open(events_path)?,
         })
@@ -48,6 +53,25 @@ impl DetectionSink {
             technique: technique.to_string(),
             message: message.to_string(),
         });
+    }
+}
+
+/// Loads the Sigma content directory if present. Migrated from the old agent's
+/// load_sigma_rules.
+fn load_sigma_rules() -> Option<sigma::SigmaEngine> {
+    let rules_dir = std::path::Path::new("rules/sigma");
+    if !rules_dir.is_dir() {
+        return None;
+    }
+    match sigma::SigmaEngine::load_dir(rules_dir) {
+        Ok(engine) => {
+            log::info!("sigma: {} rules loaded", engine.rule_count());
+            Some(engine)
+        }
+        Err(e) => {
+            log::error!("sigma: load error: {e}");
+            None
+        }
     }
 }
 
@@ -69,6 +93,16 @@ impl EventSink for DetectionSink {
             Event::Exec(e) => {
                 alerts.extend(rules::evaluate_exec(e));
                 alerts.extend(self.rule_state.lock().unwrap().on_exec(e));
+                if let Some(sigma) = &self.sigma {
+                    for hit in sigma.eval_exec(e) {
+                        let technique = if hit.tags.is_empty() {
+                            "Sigma".to_string()
+                        } else {
+                            hit.tags.join("/")
+                        };
+                        self.emit(&technique, &hit.title);
+                    }
+                }
             }
             Event::FileOpen(e) => {
                 alerts.extend(rules::evaluate_file_open(e));
