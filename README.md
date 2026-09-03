@@ -95,7 +95,7 @@ sensors; only the binaries see everything.
 | `server/` | Control plane — Next.js + PostgreSQL: ingest, API, console |
 | `ui/` | Endpoint interface — tray/menu-bar app, notifications, local status |
 | `packaging/` | Installers and service integration per platform (MSI, pkg, deb/rpm) |
-| `ml/` | Python training pipeline — features, training, ONNX export |
+| `ml/` | The ML space — datasets, features, training, calibration, evaluation, model registry, ONNX export |
 | `rules/` | Detection content (Sigma and YARA rules) |
 | `docs/` | Specification, architecture, ADRs |
 | `lab/` | Test lab — machine matrix, provisioning, attack scenarios |
