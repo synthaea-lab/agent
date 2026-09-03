@@ -3,10 +3,10 @@
 //! without a wired sensor (macOS today, Windows until the M3 migration), the commands
 //! compile and fail cleanly at runtime instead of breaking the workspace build.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 use schema::sensor::Sensor as _;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 use crate::sink::DetectionSink;
 
 /// `RuleState` pre-filled with the processes already running at startup — without
@@ -17,6 +17,46 @@ fn seeded_rule_state() -> rules::RuleState {
     let mut rule_state = rules::RuleState::new();
     rule_state.seed_from_proc();
     rule_state
+}
+
+/// Windows equivalent: pid → comm via `tasklist` (carried over from the old agent —
+/// no extra API surface; the sensor keeps its own richer store independently).
+#[cfg(windows)]
+fn seeded_rule_state() -> rules::RuleState {
+    let mut map = std::collections::HashMap::new();
+    if let Ok(output) = std::process::Command::new("tasklist")
+        .args(["/fo", "csv", "/nh"])
+        .output()
+    {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            // CSV: "Image Name","PID",...
+            let parts: Vec<&str> = line.splitn(3, ',').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let comm = parts[0].trim_matches('"').to_string();
+            if let Ok(pid) = parts[1].trim_matches('"').parse::<u32>() {
+                map.insert(pid, comm);
+            }
+        }
+    }
+    let mut rule_state = rules::RuleState::new();
+    rule_state.seed_pid_comm(map);
+    rule_state
+}
+
+/// Runs a Windows sensor to completion with Ctrl-C wired to its stop flag.
+#[cfg(windows)]
+fn run_windows_sensor(sink: Box<dyn schema::sensor::EventSink>) -> anyhow::Result<()> {
+    let mut sensor = sensor_windows::WindowsSensor::new();
+    let stop = sensor.stop_handle();
+    ctrlc::set_handler(move || {
+        eprintln!("\n[!] Shutdown requested...");
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    })?;
+    sensor
+        .run(sink)
+        .map_err(|e| anyhow::anyhow!("sensor failed: {e}"))
 }
 
 // ── status ────────────────────────────────────────────────────────────────────
@@ -110,29 +150,68 @@ pub(crate) fn cmd_capture_events(output: &std::path::Path) -> anyhow::Result<()>
         .map_err(|e| anyhow::anyhow!("sensor failed: {e}"))
 }
 
+// ── Windows commands ──────────────────────────────────────────────────────────
+
+/// Windows: administrator privileges are required by the ETW kernel providers.
+#[cfg(windows)]
+pub(crate) fn cmd_status() -> anyhow::Result<()> {
+    println!("Synthaea agent — platform: Windows");
+    println!("Sensor: ETW (Kernel-Process + Kernel-Network + Kernel-File)");
+    println!("Run as administrator for the kernel providers.");
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn cmd_run(alerts: &std::path::Path, events: &std::path::Path) -> anyhow::Result<()> {
+    let sink = DetectionSink::new(seeded_rule_state(), alerts, events)?;
+    eprintln!("Synthaea agent — detection active (Ctrl-C to stop)");
+    eprintln!(
+        "alerts: {} · events: {}",
+        alerts.display(),
+        events.display()
+    );
+    run_windows_sensor(Box::new(sink))
+}
+
+#[cfg(windows)]
+pub(crate) fn cmd_capture_events(output: &std::path::Path) -> anyhow::Result<()> {
+    let sink = sinks::JsonlEventSink::open(output)?;
+    eprintln!("Synthaea — raw event capture (Ctrl-C to stop)");
+    eprintln!("Output: {}", output.display());
+    run_windows_sensor(Box::new(sink))
+}
+
+#[cfg(windows)]
+pub(crate) fn cmd_capture_baseline(output: &std::path::Path) -> anyhow::Result<()> {
+    let sink = crate::sink::BaselineSink::new(seeded_rule_state(), output)?;
+    eprintln!("Synthaea — baseline capture (Ctrl-C to stop)");
+    eprintln!("Output: {}", output.display());
+    run_windows_sensor(Box::new(sink))
+}
+
 // ── unsupported platforms ─────────────────────────────────────────────────────
 
-#[cfg(not(target_os = "linux"))]
-const UNSUPPORTED_PLATFORM: &str = "no sensor is wired for this platform yet — Linux (eBPF) is the walking skeleton; \
-     Windows (ETW) returns with the M3 migration, macOS (EndpointSecurity) with M5. \
-     This build is for development only (cargo check/test).";
+#[cfg(not(any(target_os = "linux", windows)))]
+const UNSUPPORTED_PLATFORM: &str = "no sensor is wired for this platform yet — Linux (eBPF) and Windows (ETW) are \
+     live; macOS (EndpointSecurity) arrives with M5. This build is for development \
+     only (cargo check/test).";
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 pub(crate) fn cmd_status() -> anyhow::Result<()> {
     anyhow::bail!(UNSUPPORTED_PLATFORM)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 pub(crate) fn cmd_run(_alerts: &std::path::Path, _events: &std::path::Path) -> anyhow::Result<()> {
     anyhow::bail!(UNSUPPORTED_PLATFORM)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 pub(crate) fn cmd_capture_events(_output: &std::path::Path) -> anyhow::Result<()> {
     anyhow::bail!(UNSUPPORTED_PLATFORM)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 pub(crate) fn cmd_capture_baseline(_output: &std::path::Path) -> anyhow::Result<()> {
     anyhow::bail!(UNSUPPORTED_PLATFORM)
 }

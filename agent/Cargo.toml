@@ -21,6 +21,10 @@ clap = { version = "4", features = ["derive"] }
 env_logger = { version = "0.11", default-features = false, features = ["auto-color"] }
 log = "0.4"
 
+[target.'cfg(windows)'.dependencies]
+sensor-windows = { path = "../crates/sensors/windows/etw" }
+ctrlc = "3"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 sensor-linux = { path = "../crates/sensors/linux/userspace" }
 libc = "0.2"

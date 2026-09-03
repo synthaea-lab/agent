@@ -9,7 +9,7 @@
 //! and the output sinks.
 
 mod commands;
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 mod sink;
 
 use clap::{Parser, Subcommand};

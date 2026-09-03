@@ -1,17 +1,35 @@
 //! # sensor-windows
 //!
-//! Windows user-mode sensor built on ETW. Baseline providers: Kernel-Process,
-//! Kernel-File, Kernel-Network. Planned expansion (see ../README.md, audit P1–P8):
-//! real command line via PEB read (not the image-path placeholder), user/SID and
-//! integrity level, Kernel-Registry, DNS-Client, image load, hash + Authenticode,
-//! AMSI/script-block, WMI-Activity, IPv6 + inbound network.
+//! Windows user-mode sensor built on ETW (Kernel-Process, Kernel-Network,
+//! Kernel-File), migrated from the old iteration with the coverage-audit findings
+//! fixed at the source:
 //!
-//! Self-defense is part of the design: randomized session name, heartbeat alerting on
-//! event silence, automatic trace re-arm (a fixed session name plus `logman stop` must
-//! not blind the sensor silently).
+//! - **F-1**: the command line is the REAL command line, read from the target's PEB
+//!   (`NtQueryInformationProcess` + `ReadProcessMemory`), never the image path.
+//! - **F-2**: the session name is randomized per start (no `logman stop
+//!   synthaea-session` one-liner kill); the previous session name is persisted so
+//!   orphan cleanup after a crash still works, and a silence watchdog turns a
+//!   stopped trace into a loud sensor error instead of quiet blindness.
+//! - **F-3**: every event carries the process's user SID and integrity level
+//!   (`User::Windows`), resolved from the process token.
+//! - **F-4**: unbounded strings via the new schema — multi-KB encoded command lines
+//!   survive intact.
+//! - **F-5**: NT device paths normalize through a real `QueryDosDeviceW` volume map,
+//!   not a hardcoded `C:`.
+//! - **F-6** (partial): CreateNewFile (EID 30) joins NameCreate (EID 12); full
+//!   delete/rename semantics need schema variants and land with the ransomware pack
+//!   (#82) / driver (#39).
+//! - **F-7**: IPv6 connects (EID 58/26) are first-class, and a short dedup window
+//!   prevents Connect+Send double-counting.
 //!
-//! Windows long paths and multi-kilobyte command lines are first-class: no Linux-derived
-//! length limits, volume mapping via QueryDosDeviceW rather than assuming C:.
-//!
-//! Compiles to a stub on non-Windows targets. To be migrated from
-//! `old/crates/synthaea-sensor-windows`, fixing audit findings F-1..F-7 on the way.
+//! The provider expansion (registry, DNS, image load, AMSI, WMI — audit P2–P8) is
+//! #21; each provider arrives as its own module. Compiles to a stub off Windows.
+
+pub mod normalize;
+
+#[cfg(windows)]
+mod sensor;
+#[cfg(windows)]
+mod winapi;
+#[cfg(windows)]
+pub use sensor::WindowsSensor;

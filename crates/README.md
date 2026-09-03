@@ -12,7 +12,7 @@ its code comes from. Dependency direction between them is enforced by
 | `sensors/linux/userspace` | Linux sensor, userspace side (loads/drains eBPF probes, normalizes) | **migrated** | `old/` (issue #5) |
 | `sensors/linux/ebpf` | Linux kernel probes (eBPF, excluded from workspace) | **migrated** | `old/` (issue #4) |
 | `sensors/linux/audit` | Linux fallback sensor (auditd + fanotify) | skeleton | new development |
-| `sensors/windows/etw` | Windows sensor (ETW; cmdline, registry, DNS, AMSI, ... per audit) | skeleton | migrate from `old/` |
+| `sensors/windows/etw` | Windows sensor (ETW: process/network/file, F-1..F-7 fixed; expansion #21) | **migrated** | `old/` via edr@pre-migration-translations (issue #20) |
 | `sensors/windows/driver` | Windows kernel driver (minifilter, ELAM/PPL) — not a member | planned | new development |
 | `sensors/macos/endpoint-security` | macOS sensor (EndpointSecurity) | skeleton | new development |
 | `sensors/macos/network-extension` | macOS network/DNS sensor (NetworkExtension) | skeleton | new development |
