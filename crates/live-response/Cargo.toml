@@ -1,9 +1,0 @@
-[package]
-name = "live-response"
-version = "0.1.0"
-description = "Live response: analyst-driven interactive sessions on a running endpoint"
-license.workspace = true
-edition.workspace = true
-publish.workspace = true
-
-[dependencies]

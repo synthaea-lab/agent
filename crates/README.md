@@ -26,8 +26,7 @@ its code comes from. Dependency direction between them is enforced by
 | `policy` | Policy model shared by agent and control plane (versioned, signed) | skeleton | new development |
 | `config` | Local agent configuration loading and validation | skeleton | new development |
 | `store` | Bounded local state: LRU-bounded maps (BoundedMap) + durable event spool | **built** | issue #15 |
-| `response` | Response actions — kill, quarantine, isolate | skeleton | new development |
-| `live-response` | Live response: analyst-driven interactive sessions (fixed command set, audited) | skeleton | new development |
+| `response` | Endpoint actions: automated (kill/quarantine/isolate) + live-response sessions (`response::live`) | skeleton | new development |
 | `transport` | Agent ↔ control-plane comms — mTLS, store-and-forward | skeleton | new development |
 | `ipc` | Local IPC: agent ↔ endpoint UI/CLI (named pipe / Unix socket) | skeleton | new development |
 | `sinks` | Local outputs: JSONL, syslog/CEF export | **migrated** | `old/agent` (issue #7) |
