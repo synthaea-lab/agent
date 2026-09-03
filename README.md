@@ -2,111 +2,115 @@
 
 **An open-source, truly multi-platform EDR/XDR with on-device ML detection.**
 
-> **Status: clean-slate restructure.** This repository is the fresh start of the project.
-> Every file currently contains only a description of its intended purpose. Working code is
-> migrated piece by piece from the previous iteration (kept locally in `old/`, not tracked here)
-> after review against the new structure.
+> **Status: Linux walking skeleton proven, detection depth landing.** The Linux
+> pipeline runs end to end on real kernel telemetry — eBPF probes accepted by the
+> verifier, events normalized, four detection engines evaluating, alerts firing on
+> live attack scenarios in the lab, watchdog surviving SIGKILL. The remaining
+> platforms, the control plane, and the fleet features are structured, issue-tracked,
+> and dependency-ordered in **[docs/roadmap.md](docs/roadmap.md)**.
 
 ## Goals
 
 - **True multi-platform agent** — Windows (ETW / driver), Linux (eBPF), macOS
   (EndpointSecurity), behind one formal sensor contract. No reference platform.
-- **On-device ML detection** — models trained offline (Python), exported to ONNX, scored on the
-  endpoint alongside a Sigma-compatible rule engine.
-- **Correlation, not alert spam** — detections are evidence, correlated into cases.
-- **A control plane** — enrollment, policy, ingest, triage — designed in from day one instead of
-  bolted on.
+- **On-device ML detection** — models trained offline (Python), exported to ONNX,
+  scored on the endpoint alongside the deterministic engines; every score carries
+  per-feature attributions and traces to a registry model card.
+- **Correlation, not alert spam** — detections are evidence, correlated into cases,
+  on the host and across the fleet.
+- **A control plane designed in from day one** — enrollment, policy, ingest, triage,
+  and the fleet-derived signals (prevalence, cross-endpoint correlation) an attacker
+  cannot reproduce by reading our code.
+
+## The detection stack
+
+Ten layers of defense in depth, mapped one-to-one to components in
+**[docs/detection/layers.md](docs/detection/layers.md)**: signatures/hashes → static
+ML → behavioral rules → behavioral ML → prevalence → attack-chain correlation →
+cross-endpoint correlation → identity/network/cloud → threat intel → human/MDR.
+Layers 1–4 and 6 run on-device (milliseconds, works offline); the rest is where the
+control plane earns its keep — including **retrospective detection**: new intel
+replayed over the telemetry lake, turning yesterday's unknown into today's case.
 
 ## Architecture
 
-The system has two halves: an **agent** on every endpoint that observes, detects, and
-responds locally, and a **control plane** that manages the fleet and turns detections
-into cases.
-
 ```
 ┌───────────────────────────── ENDPOINT ──────────────────────────────┐
-│                                                                     │
-│   kernel/OS: ETW (Windows) · eBPF (Linux) · EndpointSecurity (macOS)│
-│        │                                                            │
+│  kernel/OS: ETW+EventLog (Win) · eBPF/LSM/uprobes/netlink/journald  │
+│             (Linux) · EndpointSecurity+NE+UnifiedLog (macOS)        │
+│        │  one sensor contract; sources inventoried, never assumed   │
 │  ┌─────▼───────────────────────────────────────────────────┐        │
-│  │ sensors  — platform-specific, one shared contract        │        │
-│  │     │  normalized events (schema)                        │        │
-│  │  enrich — hashes, code signing, file metadata            │        │
+│  │ sensors → schema events → enrich (hash · signature)      │        │
 │  │     │                                                    │        │
-│  │  store — entity store (process graph) + event spool      │        │
-│  │     │                                                    │        │
-│  │  ┌──┴────────┬─────────┬────────┐                        │        │
-│  │  rules     sigma      yara     ml (ONNX)   ← detection   │        │
-│  │  └──┬────────┴─────────┴────────┘                        │        │
+│  │  store — bounded state · durable spool                   │        │
+│  │  ┌──┴──────┬───────┬───────┬────────┬──────────┐         │        │
+│  │  rules   sigma   yara    ml(ONNX)  intel   deception     │        │
+│  │  └──┬──────┴───────┴───────┴────────┴──────────┘         │        │
 │  │  correlator — detections → scored cases (Bayesian LLR)   │        │
 │  │     │                                                    │        │
-│  │  verdict ──► response — kill · quarantine · isolate      │        │
-│  │     │              (gated by policy)                     │        │
-│  │  sinks (JSONL, syslog/CEF)   transport (mTLS, spooled)   │        │
+│  │  verdict ─► response — kill·quarantine·isolate + live    │        │
+│  │     │        sessions (policy-gated, audited)            │        │
+│  │  sinks · transport (mTLS, spooled) · tamper · mesh (P2P  │        │
+│  │  peer attestation + posture gossip)                      │        │
 │  └─────┬──────────────────────────────┬─────────────────────┘        │
-│        │ ipc                          │                              │
-│   ui (tray) · cli          watchdog · updater                        │
+│   ipc: ui (tray) · cli      watchdog · updater (canary rings)        │
 └───────────────────────────────────────┼──────────────────────────────┘
                                         ▼
 ┌────────────────────────── CONTROL PLANE ────────────────────────────┐
-│  Next.js + PostgreSQL (ADR-0001)                                    │
-│  ingest — events, detections, heartbeats (silence is a detection)   │
-│  api    — enrollment/PKI · policy · fleet inventory · audit log     │
-│  console— case-centric triage · fleet health · content/model rings  │
+│  Next.js + PostgreSQL (ADR-0001) · better-auth tenancy (ADR-0003)   │
+│  ingest → datalake (full-fidelity telemetry)                        │
+│  cloud-detection — streaming · scheduled · RETROSPECTIVE            │
+│  fleet — cross-machine cases + adaptive posture   graph — entities  │
+│  prevalence — first-seen/rarity     hunt — saved hunts → content    │
+│  forensics — DFIR workbench    disruption — isolate·suspend·block   │
+│  assistant — grounded LLM (narrates, never scores)                  │
+│  ops — fleet health   integrations — SOAR/ticketing   export — SIEM │
+│  api/console — enrollment·PKI · policy · triage · audit             │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-How to read it:
+What's real today: the full left column on Linux (sensors → enrich → store → four
+engines → correlator → alerts, plus watchdog), validated live in the lab. The rest
+is skeletoned with its design recorded in place and an issue per component.
 
-1. **Sensors** capture kernel-level telemetry with whatever mechanism each OS offers
-   (ETW, eBPF, EndpointSecurity), and normalize it into one shared event schema — the
-   `schema` crate is the platform boundary, and the only thing sensors and detection
-   share. A conformance suite generates the honest per-platform capability matrix.
-2. **Detection** runs on-device, on four engines fed by the same events: the stateful
-   rule engine, compiled Sigma content, YARA-X content scanning, and ONNX models
-   trained offline by the Python pipeline (`ml/`). Events are enriched (hashes, code
-   signatures) and contextualized against the entity store before evaluation.
-3. **Correlation** turns individual detections into scored cases per entity — the
-   agent escalates campaigns, not single events, and the console triages cases.
-4. **Response** executes verdicts inline (kill, quarantine, isolate), gated by the
-   signed `policy` distributed from the control plane, and audited.
-5. **Self-defense and operations**: a separate `watchdog` process restarts and
-   attests the agent; `updater` handles self-update and content/model canary rings;
-   `transport` spools events through outages — and agent silence is itself a
-   server-side detection. On-host visibility comes from the `ui` tray app and `cli`,
-   both unprivileged clients of the agent over local `ipc`.
-6. **The control plane** is one Next.js + PostgreSQL app: agent-facing ingest,
-   management API (enrollment, policy, audit), and the analyst console.
+## What makes it different
 
-Dependency direction between the agent's crates is mechanically enforced
-(`tools/check-deps.py`, in CI): sensors know only the schema; detection never touches
-sensors; only the binaries see everything.
+- **The fleet-derived half** — prevalence, cross-endpoint correlation, adaptive
+  posture (a detection on one machine raises the alertness of its neighbors, over
+  the server and over the P2P mesh), per-site model adaptation: signals an attacker
+  cannot derive from our public code and content.
+- **Deception** — per-host-unique canaries and decoy credentials: a near-zero-FP
+  tripwire layer, seed-derived so decoys never transfer between hosts.
+- **Detection as code** — all content versioned, PR-reviewed, and CI-enforced:
+  every shipped rule must compile *and* fire on a crafted sample (this pipeline has
+  already caught a rule that was silently dead in the previous iteration).
+- **Honest engineering as a feature** — capability matrices generated from
+  conformance runs, telemetry-source inventory with *rejected-with-reason* entries
+  (`docs/sensors/sources.md`), observable loss counters on every bounded buffer,
+  model cards required before any model ships, and ADRs for every locked decision.
 
 ## Repository layout
 
 | Path | Purpose |
 | --- | --- |
-| `crates/` | The agent's Rust modules — see [crates/README.md](crates/README.md) for the full table |
-| `crates/schema` | Shared event types + the `Sensor`/`EventSink` contract (the platform boundary) |
-| `crates/sensors/` | Platform sensors, grouped by platform — [coverage matrices per platform](crates/sensors/README.md) |
-| `agent/` | The agent binary — wires sensors, detection, response together |
-| `watchdog/` | Watchdog binary — keeps the agent alive, detects tampering |
-| `cli/` | Admin command-line tool — local IPC client of the agent |
-| `server/` | Control plane — Next.js + PostgreSQL: ingest, API, console |
-| `ui/` | Endpoint interface — tray/menu-bar app, notifications, local status |
-| `packaging/` | Installers and service integration per platform (MSI, pkg, deb/rpm) |
-| `ml/` | The ML space — datasets, features, training, calibration, evaluation, model registry, ONNX export |
-| `rules/` | Detection content (Sigma and YARA rules) |
-| `docs/` | Specification, architecture, ADRs |
-| `lab/` | Test lab — machine matrix, provisioning, attack scenarios |
-| `tools/` | Developer tooling and scripts |
+| `crates/` | The agent's Rust modules — full table in [crates/README.md](crates/README.md) |
+| `crates/sensors/` | Platform sensors by mechanism — [coverage matrices](crates/sensors/README.md), [source inventory](docs/sensors/sources.md) |
+| `agent/` · `watchdog/` · `cli/` | The agent binaries |
+| `server/` | Control plane — [module table](server/README.md) |
+| `ui/` | Endpoint tray/notifications (unprivileged ipc client) |
+| `packaging/` | MSI · notarized pkg · deb/rpm + service integration |
+| `ml/` | The ML space — datasets, training, calibration, evaluation, registry |
+| `rules/` | Detection content (Sigma, YARA) — CI-enforced |
+| `docs/` | Specification, [detection stack](docs/detection/layers.md), [roadmap](docs/roadmap.md), ADRs |
+| `lab/` | Machine matrix, provisioning, attack scenarios |
+| `tools/` | check-deps and developer tooling |
 
 ## Building
 
-`cargo check` on the workspace builds the stub crates on any platform (toolchain pinned
-in `rust-toolchain.toml`). Platform sensors and the eBPF probes are built explicitly on
-their target platform once implemented. CI runs fmt, dependency-direction and
-cargo-deny checks, plus clippy and tests on Linux, Windows, and macOS.
+`cargo check` / `cargo test` build the default members on any OS (toolchain pinned).
+CI enforces fmt, dependency direction, cargo-deny, clippy `-D warnings`, and tests on
+Linux/Windows/macOS, plus content and ML pipelines. The eBPF probes build on a lab
+machine via `lab/provisioning/`; `lab/vagrant/` boots the validation matrix.
 
 ## License
 
