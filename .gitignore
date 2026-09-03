@@ -16,6 +16,7 @@ __pycache__/
 # small committed parity fixture consumed by cargo test in CI.
 *.onnx
 !crates/ml/tests/fixtures/*.onnx
+!ml/registry/**/*.onnx
 
 # Editors / OS
 .DS_Store
