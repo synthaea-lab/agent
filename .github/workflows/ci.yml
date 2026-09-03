@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Formatting and dependency direction — cheap, one OS.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: dependency direction
+        run: python3 tools/check-deps.py
+
+  # Core rule: every workspace crate compiles and passes tests on all three platforms.
+  # Platform-specific code lives only in crates/sensors/* behind cfg, so this job is
+  # what enforces it.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace
+
+  # The eBPF probe crate is excluded from the workspace and gets its own job
+  # once it contains code (bpf-linker toolchain, Linux only).

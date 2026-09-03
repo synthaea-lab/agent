@@ -1,0 +1,8 @@
+[package]
+name = "watchdog"
+version = "0.1.0"
+description = "Watchdog binary — keeps the agent alive and detects tampering"
+license.workspace = true
+edition.workspace = true
+
+[dependencies]

@@ -1,0 +1,8 @@
+[package]
+name = "sigma"
+version = "0.1.0"
+description = "Sigma rule parsing and compilation"
+license.workspace = true
+edition.workspace = true
+
+[dependencies]

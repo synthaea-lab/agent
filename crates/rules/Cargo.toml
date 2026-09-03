@@ -1,0 +1,8 @@
+[package]
+name = "rules"
+version = "0.1.0"
+description = "Rule engine: stateless and stateful detections"
+license.workspace = true
+edition.workspace = true
+
+[dependencies]

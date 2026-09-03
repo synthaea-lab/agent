@@ -1,0 +1,8 @@
+[package]
+name = "schema"
+version = "0.1.0"
+description = "Shared event types and the Sensor/EventSink contract"
+license.workspace = true
+edition.workspace = true
+
+[dependencies]

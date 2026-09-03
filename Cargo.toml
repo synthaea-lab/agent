@@ -1,0 +1,37 @@
+# Workspace manifest for the Synthaea agent side (Rust).
+#
+# Crate directories and package names carry no project prefix — the workspace scopes
+# them. Platform sensors live under crates/sensors/<platform> (packages sensor-*).
+# Crates that need a special toolchain or target are excluded from the default build
+# and built explicitly:
+#   - crates/sensors/linux/ebpf   -> bpfel-unknown-none (aya), GPLv2
+#   - crates/sensors/windows/etw  -> Windows/ETW (stub on other targets)
+#   - crates/sensors/macos/endpoint-security -> macOS/EndpointSecurity (stub on other targets)
+
+[workspace]
+resolver = "2"
+members = [
+    "agent",
+    "watchdog",
+    "crates/schema",
+    "crates/sensors/linux/userspace",
+    "crates/sensors/windows/etw",
+    "crates/sensors/macos/endpoint-security",
+    "crates/rules",
+    "crates/sigma",
+    "crates/correlator",
+    "crates/ml",
+    "crates/response",
+    "crates/transport",
+]
+exclude = [
+    # Built explicitly with the eBPF toolchain (see its README).
+    "crates/sensors/linux/ebpf",
+]
+
+[workspace.package]
+license = "Apache-2.0"
+edition = "2024"
+
+[workspace.dependencies]
+# Shared dependency versions are declared here as crates gain real code.

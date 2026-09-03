@@ -1,0 +1,8 @@
+[package]
+name = "transport"
+version = "0.1.0"
+description = "Agent to control-plane communication"
+license.workspace = true
+edition.workspace = true
+
+[dependencies]

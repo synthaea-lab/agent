@@ -1,0 +1,8 @@
+[package]
+name = "correlator"
+version = "0.1.0"
+description = "Temporal correlation and scoring — builds cases from detections"
+license.workspace = true
+edition.workspace = true
+
+[dependencies]

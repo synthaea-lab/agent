@@ -1,0 +1,21 @@
+# Previous project iteration — reference only, never tracked here
+/old/
+
+# Rust
+/target/
+**/target/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# ML artifacts (large binaries are versioned elsewhere)
+*.onnx
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
