@@ -16,8 +16,8 @@ use sinks::{AlertRecord, JsonlWriter};
 pub(crate) struct DetectionSink {
     rule_state: Mutex<rules::RuleState>,
     correlator: Mutex<correlator::CorrelationEngine>,
-    /// Sigma rules from `rules/sigma` (relative to the working directory) when the
-    /// folder exists — otherwise the agent runs without a Sigma engine, and that is
+    /// Sigma rules from `rules/sigma` (next to the agent executable, falling back
+    /// to the working directory) when the folder exists — otherwise the agent runs without a Sigma engine, and that is
     /// not an error (the load failure path IS an error: content present but broken).
     sigma: Option<sigma::SigmaEngine>,
     /// Hash + code-signature enrichment, cached by (path, mtime, size).
@@ -63,14 +63,28 @@ impl DetectionSink {
     }
 }
 
+/// Resolves a content directory: next to the agent executable first, then the
+/// working directory. A cwd-relative path alone breaks under service managers
+/// (systemd runs with cwd=/, Windows services in System32), which silently
+/// disabled Sigma and YARA exactly in production deployments (review finding).
+fn content_dir(name: &str) -> Option<std::path::PathBuf> {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let candidate = dir.join(name);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    let cwd_relative = std::path::PathBuf::from(name);
+    cwd_relative.is_dir().then_some(cwd_relative)
+}
+
 /// Loads the Sigma content directory if present. Migrated from the old agent's
 /// load_sigma_rules.
 fn load_sigma_rules() -> Option<sigma::SigmaEngine> {
-    let rules_dir = std::path::Path::new("rules/sigma");
-    if !rules_dir.is_dir() {
-        return None;
-    }
-    match sigma::SigmaEngine::load_dir(rules_dir) {
+    let rules_dir = content_dir("rules/sigma")?;
+    match sigma::SigmaEngine::load_dir(&rules_dir) {
         Ok(engine) => {
             log::info!("sigma: {} rules loaded", engine.rule_count());
             Some(engine)
@@ -85,13 +99,10 @@ fn load_sigma_rules() -> Option<sigma::SigmaEngine> {
 /// Loads rules/yara when present and starts the scan worker; matches are emitted as
 /// alerts by the worker thread through the shared alert log.
 fn start_yara(alert_log: Arc<JsonlWriter>) -> Option<yara::ScanQueue> {
-    let dir = std::path::Path::new("rules/yara");
-    if !dir.is_dir() {
-        return None;
-    }
-    match yara::RuleSet::load_dir(dir) {
+    let dir = content_dir("rules/yara")?;
+    match yara::RuleSet::load_dir(&dir) {
         Ok(rules) => {
-            log::info!("yara: {} rule files loaded", rules.rule_file_count());
+            log::info!("yara: {} rules loaded", rules.rule_count());
             Some(yara::ScanQueue::start(rules, move |outcome| {
                 for rule in &outcome.matches {
                     let message = format!("yara rule {rule} matched {}", outcome.path.display());

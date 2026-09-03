@@ -89,6 +89,12 @@ impl<K: Eq + Hash + Clone, V> BoundedMap<K, V> {
         self.entries.is_empty()
     }
 
+    /// Non-refreshing iteration over all entries, for scan-style lookups whose
+    /// match key is not the map key (e.g. path matched by basename).
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.entries.iter().map(|(k, (v, _))| (k, v))
+    }
+
     /// Entries evicted over the map's lifetime — bounded state loses information by
     /// design; the count keeps the loss observable.
     pub fn evicted(&self) -> u64 {

@@ -35,13 +35,16 @@ pub enum YaraError {
 /// Compiled rule set, ready to scan. Compile once, scan many.
 pub struct RuleSet {
     rules: yara_x::Rules,
+    /// Number of compiled RULES, not source files — a file can hold many rules,
+    /// and the content suite pairs one sample per rule (review finding: the
+    /// file count let a multi-rule file ship with untested rules).
     count: usize,
 }
 
 impl std::fmt::Debug for RuleSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RuleSet")
-            .field("rule_files", &self.count)
+            .field("rules", &self.count)
             .finish_non_exhaustive()
     }
 }
@@ -54,7 +57,6 @@ impl RuleSet {
     /// migration already taught us about.
     pub fn load_dir(dir: &Path) -> Result<Self, YaraError> {
         let mut compiler = yara_x::Compiler::new();
-        let mut count = 0usize;
         let mut stack = vec![dir.to_path_buf()];
         while let Some(d) = stack.pop() {
             let entries = std::fs::read_dir(&d).map_err(|source| YaraError::Io {
@@ -76,28 +78,37 @@ impl RuleSet {
                             path: path.display().to_string(),
                             message: e.to_string(),
                         })?;
-                    count += 1;
                 }
             }
         }
+        let rules = compiler.build();
+        let rule_count = rules.iter().count();
         Ok(Self {
-            rules: compiler.build(),
-            count,
+            rules,
+            count: rule_count,
         })
     }
 
-    pub fn rule_file_count(&self) -> usize {
+    /// Number of compiled rules (not source files).
+    pub fn rule_count(&self) -> usize {
         self.count
     }
 
     /// Scans one file, returning the identifiers of matching rules. Refuses files
-    /// over [`MAX_SCAN_BYTES`].
+    /// over [`MAX_SCAN_BYTES`] and non-regular files (a FIFO would block the
+    /// worker forever, /dev/zero would read without end — review finding). The
+    /// read itself is bounded with `Read::take`, because a special file or a file
+    /// growing under our feet can exceed what its metadata claimed.
     pub fn scan_file(&self, path: &Path) -> Result<Vec<String>, YaraError> {
         let io = |source: std::io::Error| YaraError::Io {
             path: path.display().to_string(),
             source,
         };
         let meta = std::fs::metadata(path).map_err(io)?;
+        if !meta.is_file() {
+            log::debug!("yara: {} is not a regular file, skipping", path.display());
+            return Ok(Vec::new());
+        }
         if meta.len() > MAX_SCAN_BYTES {
             log::debug!(
                 "yara: {} over scan budget ({} bytes), skipping",
@@ -106,7 +117,18 @@ impl RuleSet {
             );
             return Ok(Vec::new());
         }
-        let data = std::fs::read(path).map_err(io)?;
+        let mut data = Vec::new();
+        {
+            use std::io::Read as _;
+            let file = std::fs::File::open(path).map_err(io)?;
+            file.take(MAX_SCAN_BYTES + 1)
+                .read_to_end(&mut data)
+                .map_err(io)?;
+        }
+        if data.len() as u64 > MAX_SCAN_BYTES {
+            log::debug!("yara: {} grew past the scan budget, skipping", path.display());
+            return Ok(Vec::new());
+        }
         let mut scanner = yara_x::Scanner::new(&self.rules);
         let results = scanner.scan(&data).map_err(|e| YaraError::Compile {
             path: path.display().to_string(),
@@ -163,7 +185,7 @@ rule test_marker {
         std::fs::create_dir_all(dir.join("cat")).unwrap();
         std::fs::write(dir.join("cat/a.yar"), TEST_RULE).unwrap();
         let rules = RuleSet::load_dir(&dir).unwrap();
-        assert_eq!(rules.rule_file_count(), 1);
+        assert_eq!(rules.rule_count(), 1);
     }
 
     #[test]

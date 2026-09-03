@@ -14,6 +14,10 @@ fn main() -> anyhow::Result<()> {
     println!("cargo::rustc-check-cfg=cfg(ebpf_embedded)");
     println!("cargo:rerun-if-changed=../ebpf/src");
     println!("cargo:rerun-if-changed=../wire/src");
+    // The bpf-linker probe below depends on PATH: installing the linker must
+    // invalidate a build that was cached WITHOUT the embedded bytecode (review
+    // finding: the stale no-ebpf build survived toolchain provisioning).
+    println!("cargo:rerun-if-env-changed=PATH");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         return Ok(());

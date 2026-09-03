@@ -8,7 +8,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::RuleSet;
@@ -36,7 +36,7 @@ pub struct ScanStats {
 
 /// Owns the worker thread. Dropping the queue stops the worker after the backlog.
 pub struct ScanQueue {
-    tx: mpsc::SyncSender<PathBuf>,
+    tx: mpsc::SyncSender<(PathBuf, Instant)>,
     scanned: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
 }
@@ -45,15 +45,22 @@ impl ScanQueue {
     /// Starts the worker. `on_match` runs on the worker thread for every scan with
     /// at least one matching rule.
     pub fn start(rules: RuleSet, on_match: impl Fn(ScanOutcome) + Send + 'static) -> Self {
-        let (tx, rx) = mpsc::sync_channel::<PathBuf>(QUEUE_CAP);
+        let (tx, rx) = mpsc::sync_channel::<(PathBuf, Instant)>(QUEUE_CAP);
         let scanned = Arc::new(AtomicU64::new(0));
         let dropped = Arc::new(AtomicU64::new(0));
         let scanned_w = scanned.clone();
         std::thread::Builder::new()
             .name("yara-scan".into())
             .spawn(move || {
-                while let Ok(path) = rx.recv() {
-                    std::thread::sleep(SETTLE);
+                while let Ok((path, ready_at)) = rx.recv() {
+                    // The settle deadline was stamped at ENQUEUE time — under a
+                    // backlog the wait overlaps with earlier scans instead of
+                    // adding 200ms of dead time per item (review finding: the
+                    // per-item sleep capped throughput at 5 scans/second).
+                    let now = Instant::now();
+                    if ready_at > now {
+                        std::thread::sleep(ready_at - now);
+                    }
                     match rules.scan_file(&path) {
                         Ok(matches) if !matches.is_empty() => {
                             scanned_w.fetch_add(1, Ordering::Relaxed);
@@ -78,7 +85,8 @@ impl ScanQueue {
 
     /// Enqueues a path for scanning; sheds (and counts) when the queue is full.
     pub fn enqueue(&self, path: PathBuf) {
-        if self.tx.try_send(path).is_err() {
+        let ready_at = Instant::now() + SETTLE;
+        if self.tx.try_send((path, ready_at)).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }

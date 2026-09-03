@@ -48,11 +48,17 @@ fn is_payload_file(path: &str) -> bool {
         || p.ends_with(".jar")
         || p.ends_with(".js")
         || p.ends_with(".jse");
-    // Locations systematically used by droppers
+    // Locations systematically used by droppers — both path grammars (review
+    // finding: the shipped Linux dropper scenario writes /tmp/… with no extension,
+    // and the Windows-only separators made the full-chain alert impossible).
     let suspicious_path = p.contains("\\temp\\")
         || p.contains("\\tmp\\")
         || p.contains("\\downloads\\")
-        || p.contains("\\startup\\");
+        || p.contains("\\startup\\")
+        || p.starts_with("/tmp/")
+        || p.starts_with("/var/tmp/")
+        || p.starts_with("/dev/shm/")
+        || p.contains("/downloads/");
     suspicious_ext || suspicious_path
 }
 

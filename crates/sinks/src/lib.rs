@@ -40,8 +40,15 @@ pub struct JsonlWriter {
 
 impl JsonlWriter {
     /// Opens a JSON-Lines file in append mode (created if it does not exist).
+    /// A torn last line from a previous crash (write interrupted mid-line, no
+    /// trailing newline) is repaired by appending a newline first, so the first
+    /// record of this run does not fuse with the torn tail into one unparseable
+    /// line that silently loses BOTH records at read time (review finding).
     pub fn open(path: &Path) -> std::io::Result<Self> {
-        let f = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+        if needs_tail_repair(path) {
+            f.write_all(b"\n")?;
+        }
         Ok(Self {
             inner: Mutex::new(BufWriter::new(f)),
         })
@@ -61,6 +68,23 @@ impl JsonlWriter {
             let _ = w.flush();
         }
     }
+}
+
+/// True when the file is non-empty and its last byte is not a newline — the
+/// signature of a line torn by a crash mid-write.
+fn needs_tail_repair(path: &Path) -> bool {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(len) = f.seek(SeekFrom::End(0)) else {
+        return false;
+    };
+    if len == 0 {
+        return false;
+    }
+    let mut last = [0u8; 1];
+    f.seek(SeekFrom::End(-1)).is_ok() && f.read_exact(&mut last).is_ok() && last[0] != b'\n'
 }
 
 /// One alert as written to `alerts.ndjson`. Defined here (not in `rules`) so the

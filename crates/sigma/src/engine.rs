@@ -108,20 +108,53 @@ fn validate(rule: &SigmaRule, path: &str) -> Result<(), SigmaError> {
     let Some(selection) = rule.detection.selections.get("selection") else {
         return Err(unsupported("missing `selection` block".to_string()));
     };
-    if let Selection::FieldMap(fields) = selection {
-        for spec in fields.keys() {
-            let (field, modifier) = parse_field_spec(spec);
-            if !SUPPORTED_FIELDS.contains(&field.to_lowercase().as_str()) {
-                return Err(unsupported(format!(
-                    "field `{field}` (supported: Image, CommandLine, ParentImage)"
-                )));
+    match selection {
+        Selection::FieldMap(fields) => {
+            // An empty map would vacuously match EVERY event (Iterator::all on
+            // nothing) — a malformed rule must never become an alert flood.
+            if fields.is_empty() {
+                return Err(unsupported("empty selection (would match everything)".into()));
             }
-            if let Some(m) = modifier
-                && !SUPPORTED_MODIFIERS.contains(&m.to_lowercase().as_str())
-            {
-                return Err(unsupported(format!(
-                    "modifier `{m}` (supported: contains, startswith, endswith)"
-                )));
+            for (spec, values) in fields {
+                let (field, modifier) = parse_field_spec(spec);
+                if !SUPPORTED_FIELDS.contains(&field.to_lowercase().as_str()) {
+                    return Err(unsupported(format!(
+                        "field `{field}` (supported: Image, CommandLine, ParentImage)"
+                    )));
+                }
+                if let Some(m) = modifier
+                    && !SUPPORTED_MODIFIERS.contains(&m.to_lowercase().as_str())
+                {
+                    return Err(unsupported(format!(
+                        "modifier `{m}` (supported: contains, startswith, endswith)"
+                    )));
+                }
+                // Interior wildcards are standard Sigma but outside the edge-only
+                // subset — an accepted-but-never-matching rule is the silent-death
+                // failure mode this validator exists to kill.
+                if modifier.is_none() {
+                    for value in values.as_slice() {
+                        let inner = value.trim_matches('*');
+                        if inner.contains('*') {
+                            return Err(unsupported(format!(
+                                "interior wildcard in `{value}` (only leading/trailing `*`)"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Selection::Keywords(keywords) => {
+            if keywords.is_empty() {
+                return Err(unsupported("empty keyword list (would match nothing)".into()));
+            }
+            for keyword in keywords {
+                let inner = keyword.trim_matches('*');
+                if inner.contains('*') {
+                    return Err(unsupported(format!(
+                        "interior wildcard in keyword `{keyword}`"
+                    )));
+                }
             }
         }
     }
@@ -152,9 +185,18 @@ fn eval_selection_exec(selection: &Selection, event: &ExecEvent) -> bool {
                 .all(|(field_spec, values)| eval_field(field_spec, values, event))
         }
         Selection::Keywords(keywords) => {
-            // OR over the full command line
+            // OR over the full command line; keywords share the field values'
+            // wildcard semantics (`*mimikatz*` must strip its stars, not be
+            // matched literally). A bare keyword means substring containment.
             let lower = event.cmdline.to_lowercase();
-            keywords.iter().any(|kw| lower.contains(&kw.to_lowercase()))
+            keywords.iter().any(|kw| {
+                let k = kw.to_lowercase();
+                if k.contains('*') {
+                    glob_match(&lower, &k)
+                } else {
+                    lower.contains(&k)
+                }
+            })
         }
     }
 }
@@ -194,7 +236,9 @@ fn parse_field_spec(spec: &str) -> (&str, Option<&str>) {
 fn match_value(haystack: &str, pattern: &str, modifier: Option<&str>) -> bool {
     let h = haystack.to_lowercase();
     let p = pattern.to_lowercase();
-    match modifier {
+    // Validation accepts modifiers case-insensitively; evaluation must agree
+    // (`Image|EndsWith` loaded fine but silently glob-matched before this).
+    match modifier.map(str::to_lowercase).as_deref() {
         None => glob_match(&h, &p),
         Some("contains") => h.contains(&p),
         Some("startswith") => h.starts_with(&p),
@@ -343,6 +387,46 @@ detection:
         );
         ev.parent_image_path = Some("C:\\Program Files\\Office\\winword.exe".into());
         assert!(eval_rule_exec(&rule, &ev).is_some());
+    }
+
+    #[test]
+    fn empty_selection_is_rejected_not_match_everything() {
+        // Review finding: `selection: {}` matched EVERY event (vacuous all()).
+        let rule: SigmaRule = serde_yaml::from_str(
+            "title: Empty\ndetection:\n  selection: {}\n  condition: selection\n",
+        )
+        .unwrap();
+        let err = validate(&rule, "<t>").unwrap_err();
+        assert!(err.to_string().contains("empty selection"), "{err}");
+    }
+
+    #[test]
+    fn interior_wildcards_are_rejected_at_load() {
+        // Review finding: `C:\*\cmd.exe` loaded fine and then never matched.
+        let rule: SigmaRule = serde_yaml::from_str(
+            "title: Interior\ndetection:\n  selection:\n    Image: 'C:\\*\\cmd.exe'\n  condition: selection\n",
+        )
+        .unwrap();
+        let err = validate(&rule, "<t>").unwrap_err();
+        assert!(err.to_string().contains("interior wildcard"), "{err}");
+    }
+
+    #[test]
+    fn keyword_wildcards_match_like_field_globs() {
+        let rule = parse(
+            "title: KW\ndetection:\n  selection:\n    - '*mimikatz*'\n  condition: selection\n",
+        );
+        let ev = exec("C:\\t\\x.exe", "run mimikatz please");
+        assert!(eval_rule_exec(&rule, &ev).is_some());
+    }
+
+    #[test]
+    fn modifier_case_is_insensitive_at_eval() {
+        let rule = parse(
+            "title: Case\ndetection:\n  selection:\n    Image|EndsWith: '\\cmd.exe'\n  condition: selection\n",
+        );
+        let ev = exec("C:\\Windows\\System32\\cmd.exe", "cmd.exe");
+        assert!(eval_rule_exec(&rule, &ev).is_some(), "EndsWith must behave as endswith");
     }
 
     #[test]

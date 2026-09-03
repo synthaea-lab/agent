@@ -110,3 +110,19 @@ fn writer_appends_across_reopens() {
     let last: AlertRecord = serde_json::from_str(&lines[1]).unwrap();
     assert_eq!(last.timestamp_ns, 2);
 }
+
+#[test]
+fn torn_tail_is_repaired_on_reopen() {
+    // A crash mid-write leaves a line without its newline; reopening must not fuse
+    // the next record onto it.
+    let path = std::env::temp_dir().join(format!("sinks-torn-{}.ndjson", std::process::id()));
+    std::fs::write(&path, b"{\"torn\":tru").unwrap();
+    let w = JsonlWriter::open(&path).unwrap();
+    w.write(&serde_json::json!({"ok": 1}));
+    drop(w);
+    let content = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines.len(), 2, "torn tail and new record must be separate lines");
+    assert!(serde_json::from_str::<serde_json::Value>(lines[1]).is_ok());
+    std::fs::remove_file(&path).ok();
+}

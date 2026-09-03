@@ -12,6 +12,11 @@ use schema::Event;
 pub struct EventBus {
     events: VecDeque<Event>,
     window: Duration,
+    /// Greatest timestamp ever seen — eviction cuts against this, not the last
+    /// insertion (review finding: the sensor drains three ring buffers
+    /// independently, so a delayed older event after a newer one must not move
+    /// the cutoff backwards and resurrect stale history).
+    max_seen_ns: u64,
 }
 
 impl EventBus {
@@ -19,6 +24,7 @@ impl EventBus {
         Self {
             events: VecDeque::new(),
             window,
+            max_seen_ns: 0,
         }
     }
 
@@ -51,13 +57,11 @@ impl EventBus {
     }
 
     fn evict(&mut self) {
-        // Use the timestamp of the last inserted event as the reference.
-        let Some(latest) = self.events.back() else {
-            return;
-        };
-        let latest_ns = latest.meta().timestamp_ns;
+        if let Some(latest) = self.events.back() {
+            self.max_seen_ns = self.max_seen_ns.max(latest.meta().timestamp_ns);
+        }
         let window_ns = self.window.as_nanos() as u64;
-        let cutoff = latest_ns.saturating_sub(window_ns);
+        let cutoff = self.max_seen_ns.saturating_sub(window_ns);
         self.events.retain(|e| e.meta().timestamp_ns >= cutoff);
     }
 }
