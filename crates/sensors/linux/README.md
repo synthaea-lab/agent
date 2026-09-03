@@ -15,3 +15,4 @@ Coverage targets:
 | Module load, bpf() usage, ptrace (injection/tamper signal) | tracepoints | `ebpf/` |
 | Privilege change (setuid, capset) | tracepoints | `ebpf/` |
 | Fallback: exec/connect/file | auditd + fanotify | `audit/` |
+| Container context (Docker/containerd): container id + image on every event | cgroup resolution in `userspace/` + runtime metadata lookup | `userspace/` — issue #80 |
