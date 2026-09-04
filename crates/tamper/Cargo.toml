@@ -10,3 +10,4 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+sha2 = "0.10"
