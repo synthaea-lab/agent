@@ -68,9 +68,9 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// True when the effective capability set allows eBPF loading: CAP_SYS_ADMIN,
-/// or CAP_BPF plus CAP_PERFMON (tracepoint attachment). Read from
-/// /proc/self/status CapEff — best-effort, false on any parse failure.
+/// True when the effective capability set allows eBPF loading: `CAP_SYS_ADMIN`,
+/// or `CAP_BPF` plus `CAP_PERFMON` (tracepoint attachment). Read from
+/// `/proc/self/status` `CapEff` — best-effort, false on any parse failure.
 fn has_bpf_capabilities() -> bool {
     const CAP_SYS_ADMIN: u32 = 21;
     const CAP_PERFMON: u32 = 38;
@@ -89,7 +89,7 @@ fn has_bpf_capabilities() -> bool {
     has(CAP_SYS_ADMIN) || (has(CAP_BPF) && has(CAP_PERFMON))
 }
 
-/// Linux: eBPF capture + detection via LinuxSensor (Ctrl-C handled by the sensor).
+/// Linux: eBPF capture + detection via `LinuxSensor` (Ctrl-C handled by the sensor).
 pub(crate) fn cmd_run(alerts: &std::path::Path, events: &std::path::Path) -> anyhow::Result<()> {
     let sink = DetectionSink::new(seeded_rule_state(), alerts, events)?;
     eprintln!("Synthaea agent — detection active (Ctrl-C to stop)");
@@ -104,7 +104,7 @@ pub(crate) fn cmd_run(alerts: &std::path::Path, events: &std::path::Path) -> any
         .map_err(|e| anyhow::anyhow!("sensor failed: {e}"))
 }
 
-/// Linux: rules-filtered benign capture via BaselineSink (Ctrl-C handled by the
+/// Linux: rules-filtered benign capture via `BaselineSink` (Ctrl-C handled by the
 /// sensor). Platform-neutral by construction — other platforms join as their
 /// sensors land.
 pub(crate) fn cmd_capture_baseline(output: &std::path::Path) -> anyhow::Result<()> {
