@@ -300,14 +300,10 @@ fn parse_tree_attrs(ensemble: &GraphNode<'_>) -> Result<TreeAttrs, ParseError> {
     Ok(attrs)
 }
 
-pub(super) fn build_trees(
-    ensemble: &GraphNode<'_>,
-    mapping: Option<&[i64]>,
-    encoders: &[LeafEncoder],
-    trees: &mut Vec<Tree>,
-    n_features: &mut usize,
-) -> Result<(), ParseError> {
-    let attrs = parse_tree_attrs(ensemble)?;
+/// Checks the flat attribute arrays agree before any indexing: same length
+/// everywhere, at least one node, no `missing_value_tracks_true`. Returns the
+/// node count.
+fn validate_tree_attrs(attrs: &TreeAttrs) -> Result<usize, ParseError> {
     let n = attrs.node_ids.len();
     if n == 0 {
         return Err(ParseError::Inconsistent("tree node with no tree nodes"));
@@ -330,6 +326,18 @@ pub(super) fn build_trees(
     if attrs.missing_tracks_true.iter().any(|&v| v != 0) {
         return Err(ParseError::Unsupported("missing_value_tracks_true is set"));
     }
+    Ok(n)
+}
+
+pub(super) fn build_trees(
+    ensemble: &GraphNode<'_>,
+    mapping: Option<&[i64]>,
+    encoders: &[LeafEncoder],
+    trees: &mut Vec<Tree>,
+    n_features: &mut usize,
+) -> Result<(), ParseError> {
+    let attrs = parse_tree_attrs(ensemble)?;
+    let n = validate_tree_attrs(&attrs)?;
 
     // One TreeEnsembleRegressor can hold several trees (contiguous runs of
     // nodes_treeids); skl2onnx's IsolationForest emits one tree per node, and only
@@ -378,37 +386,7 @@ fn build_one_tree(
         if node_id >= count {
             return Err(ParseError::Inconsistent("node id outside the tree"));
         }
-        let kind = match attrs.modes[i].as_slice() {
-            b"LEAF" => NodeKind::Leaf,
-            b"BRANCH_LEQ" => {
-                let raw_feature = attrs.feature_ids[i];
-                let column = match mapping {
-                    Some(map) => *usize::try_from(raw_feature)
-                        .ok()
-                        .and_then(|f| map.get(f))
-                        .ok_or(ParseError::Inconsistent(
-                            "feature id outside Gather mapping",
-                        ))?,
-                    None => raw_feature,
-                };
-                let feature = usize::try_from(column)
-                    .map_err(|_| ParseError::Inconsistent("negative feature column"))?;
-                *n_features = (*n_features).max(feature + 1);
-                let child = |id: i64| {
-                    u32::try_from(id)
-                        .ok()
-                        .filter(|&c| (c as usize) < count)
-                        .ok_or(ParseError::Inconsistent("child id outside the tree"))
-                };
-                NodeKind::Branch {
-                    feature,
-                    threshold: attrs.values[i],
-                    true_child: child(attrs.true_ids[i])?,
-                    false_child: child(attrs.false_ids[i])?,
-                }
-            }
-            _ => return Err(ParseError::Unsupported("branch mode other than BRANCH_LEQ")),
-        };
+        let kind = node_kind(attrs, i, mapping, count, n_features)?;
         if nodes[node_id].is_some() {
             return Err(ParseError::Inconsistent("duplicate node id"));
         }
@@ -426,6 +404,50 @@ fn build_one_tree(
     let counts = pick_sample_counts(&nodes, &depth, encoders)?;
     compute_expectations(&mut nodes, &depth, &post_order, counts.as_deref());
     Ok(Tree { nodes })
+}
+
+/// Builds one node's [`NodeKind`] from the flat attribute row `i`: leaves as-is,
+/// branches with the feature id resolved through the Gather `mapping` (the
+/// model's input contract) and both child ids bounds-checked against `count`.
+/// Widens `n_features` as columns are referenced.
+fn node_kind(
+    attrs: &TreeAttrs,
+    i: usize,
+    mapping: Option<&[i64]>,
+    count: usize,
+    n_features: &mut usize,
+) -> Result<NodeKind, ParseError> {
+    match attrs.modes[i].as_slice() {
+        b"LEAF" => Ok(NodeKind::Leaf),
+        b"BRANCH_LEQ" => {
+            let raw_feature = attrs.feature_ids[i];
+            let column = match mapping {
+                Some(map) => *usize::try_from(raw_feature)
+                    .ok()
+                    .and_then(|f| map.get(f))
+                    .ok_or(ParseError::Inconsistent(
+                        "feature id outside Gather mapping",
+                    ))?,
+                None => raw_feature,
+            };
+            let feature = usize::try_from(column)
+                .map_err(|_| ParseError::Inconsistent("negative feature column"))?;
+            *n_features = (*n_features).max(feature + 1);
+            let child = |id: i64| {
+                u32::try_from(id)
+                    .ok()
+                    .filter(|&c| (c as usize) < count)
+                    .ok_or(ParseError::Inconsistent("child id outside the tree"))
+            };
+            Ok(NodeKind::Branch {
+                feature,
+                threshold: attrs.values[i],
+                true_child: child(attrs.true_ids[i])?,
+                false_child: child(attrs.false_ids[i])?,
+            })
+        }
+        _ => Err(ParseError::Unsupported("branch mode other than BRANCH_LEQ")),
+    }
 }
 
 /// Depth of every node plus a parent-before-children visit order, validating that
