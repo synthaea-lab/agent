@@ -22,9 +22,14 @@
 //! ## Implemented so far
 //!
 //! - [`heartbeat`] — sensor-silence detection: the platform-agnostic core of the F-2
-//!   canary, turning "a sensor stopped producing telemetry" into an alert. The
-//!   integrity and protected-resource halves are tracked by #71.
+//!   canary, turning "a sensor stopped producing telemetry" into an alert.
+//! - [`integrity`] — self-integrity: hashing the agent's own binaries and config
+//!   against the signed manifest, so a swapped/neutered build is a detection.
+//!
+//! The protected-resource-monitoring half is still tracked by #71.
 
 pub mod heartbeat;
+pub mod integrity;
 
 pub use heartbeat::{SensorHeartbeat, SilenceMonitor, SilenceVerdict};
+pub use integrity::{IntegrityViolation, Manifest, ViolationKind};
