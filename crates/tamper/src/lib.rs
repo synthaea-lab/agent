@@ -18,3 +18,13 @@
 //! Honest scope (from the old README, kept true here): none of this stops a
 //! kernel-level adversary — that needs PPL/ELAM, SIP, LSM (per-platform milestones).
 //! What it does is make every tampering path loud, attributable, and fleet-visible.
+//!
+//! ## Implemented so far
+//!
+//! - [`heartbeat`] — sensor-silence detection: the platform-agnostic core of the F-2
+//!   canary, turning "a sensor stopped producing telemetry" into an alert. The
+//!   integrity and protected-resource halves are tracked by #71.
+
+pub mod heartbeat;
+
+pub use heartbeat::{SensorHeartbeat, SilenceMonitor, SilenceVerdict};
