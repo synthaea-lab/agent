@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 use schema::{Event, sensor::EventSink};
 use sinks::{AlertRecord, JsonlWriter};
 
+use crate::enrich_queue::EnrichQueue;
+
 /// Dispatches every event to the detection engines and the output sinks. `Mutex`
 /// around the mutable state (`RuleState`) rather than no synchronization: the
 /// `EventSink` trait requires `Send + Sync` and only exposes `&self`, to stay correct
@@ -20,14 +22,14 @@ pub(crate) struct DetectionSink {
     /// to the working directory) when the folder exists — otherwise the agent runs without a Sigma engine, and that is
     /// not an error (the load failure path IS an error: content present but broken).
     sigma: Option<sigma::SigmaEngine>,
-    /// Hash + code-signature enrichment, cached by (path, mtime, size).
-    enricher: Mutex<enrich::Enricher>,
     /// One alert per line in alerts.ndjson (shared with the YARA scan worker).
     alert_log: Arc<JsonlWriter>,
     /// Budgeted background content scanning; `None` when rules/yara is absent.
     yara: Option<yara::ScanQueue>,
-    /// Raw event log (one normalized event per line) for calibration/ML training.
-    events_log: JsonlWriter,
+    /// Enrichment (hash + signature) and the high-volume raw-event logging, off the
+    /// drain thread (issue #126). The capture thread runs detection in memory and
+    /// hands the event here with a non-blocking send.
+    enrich_queue: EnrichQueue,
 }
 
 impl DetectionSink {
@@ -39,33 +41,20 @@ impl DetectionSink {
         events_path: &std::path::Path,
     ) -> std::io::Result<Self> {
         let alert_log = Arc::new(JsonlWriter::open(alerts_path)?);
+        // The raw event log is written by the enrichment worker, not the drain
+        // thread — shared behind an Arc so the worker owns a handle.
+        let events_log = Arc::new(JsonlWriter::open(events_path)?);
+        let enrich_queue = EnrichQueue::start(enrich::Enricher::new(), move |event| {
+            events_log.write(&event);
+        });
         Ok(Self {
             rule_state: Mutex::new(rule_state),
             correlator: Mutex::new(correlator::CorrelationEngine::new()),
             sigma: load_sigma_rules(),
-            enricher: Mutex::new(enrich::Enricher::new()),
             yara: start_yara(alert_log.clone()),
             alert_log,
-            events_log: JsonlWriter::open(events_path)?,
+            enrich_queue,
         })
-    }
-
-    /// Enrichment first, so the logged event and every engine see hash+signature.
-    /// Budgeted: cache hit is a stat; miss is one bounded hash + one offline
-    /// signature check (see crates/enrich docs).
-    fn enrich(&self, event: &mut Event) {
-        if let Event::Exec(e) = event
-            && !e.image_path.is_empty()
-            && e.sha256.is_none()
-        {
-            let enrichment = self
-                .enricher
-                .lock()
-                .unwrap()
-                .enrich(std::path::Path::new(&e.image_path));
-            e.sha256 = enrichment.sha256;
-            e.signature = Some(enrichment.signature);
-        }
     }
 
     /// Cross-event correlation (co-occurrence rules + Bayesian belief).
@@ -196,18 +185,20 @@ fn now_epoch_ns() -> u64 {
 }
 
 impl EventSink for DetectionSink {
-    fn on_event(&self, mut event: Event) {
-        self.enrich(&mut event);
-        self.events_log.write(&event);
+    fn on_event(&self, event: Event) {
+        // Detection runs in memory on the capture thread — no engine needs the hash
+        // or signature synchronously (issue #126).
         self.correlate(&event);
         match &event {
             Event::Exec(e) => self.detect_exec(e),
             Event::FileOpen(e) => self.detect_file_open(e),
             Event::Connect(e) => self.detect_connect(e),
             // New telemetry categories reach the engines as they land; until a rule
-            // consumes them, logging above is the whole treatment.
+            // consumes them, logging below is the whole treatment.
             _ => {}
         }
+        // Enrichment + the high-volume raw-event write happen off this thread.
+        self.enrich_queue.enqueue(event);
     }
 }
 
