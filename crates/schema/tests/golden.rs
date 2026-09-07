@@ -7,7 +7,8 @@ use std::net::IpAddr;
 
 use schema::detection::{Detection, DetectionSource, ScoreAttribution, Severity};
 use schema::{
-    ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileOpenEvent, RegistrySetEvent, User,
+    ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileOpenEvent, ImageLoadEvent,
+    RegistrySetEvent, User,
 };
 
 fn fixture(name: &str) -> serde_json::Value {
@@ -208,6 +209,26 @@ fn dns_query_golden() {
 }
 
 #[test]
+fn image_load_golden() {
+    assert_golden(
+        &Event::ImageLoad(ImageLoadEvent {
+            meta: EventMeta {
+                pid: 4242,
+                ppid: 1337,
+                user: User::Windows {
+                    sid: "S-1-5-18".into(),
+                    integrity_level: Some(0x4000),
+                },
+                timestamp_ns: 1_756_900_030_000_000_000,
+                comm: "powershell.exe".into(),
+            },
+            image_path: r"C:\Windows\System32\amsi.dll".into(),
+        }),
+        "image_load",
+    );
+}
+
+#[test]
 fn registry_set_golden() {
     assert_golden(
         &Event::RegistrySet(RegistrySetEvent {
@@ -341,6 +362,10 @@ fn meta_accessor_covers_all_variants() {
             value_name: String::new(),
             data_type: 1,
             data: None,
+        }),
+        Event::ImageLoad(ImageLoadEvent {
+            meta: meta.clone(),
+            image_path: String::new(),
         }),
     ];
     for e in &events {

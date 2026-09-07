@@ -1,4 +1,5 @@
-//! The three ETW provider callbacks (Kernel-Process, Kernel-Network, Kernel-File),
+//! The ETW provider callbacks (Kernel-Process, Kernel-Network, Kernel-File, DNS-Client,
+//! Kernel-Registry), each normalizing its records into schema events. Lab-earned notes carry over
 //! each normalizing its records into schema events. Lab-earned notes carry over
 //! from the old iteration: `TcpClient` emits no eid=42 (2026-08-25), PID recycling
 //! prunes on `ProcessEnd`, canary events are filtered from emission.
@@ -7,7 +8,7 @@ use std::sync::{Arc, atomic::Ordering};
 
 use ferrisetw::{EventRecord, parser::Parser, provider::Provider, schema_locator::SchemaLocator};
 use schema::{
-    ConnectEvent, DnsQueryEvent, Event, ExecEvent, FileOpenEvent, RegistrySetEvent,
+    ConnectEvent, DnsQueryEvent, Event, ExecEvent, FileOpenEvent, ImageLoadEvent, RegistrySetEvent,
     sensor::EventSink,
 };
 
@@ -27,8 +28,8 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         let eid = record.event_id();
         // 1=ProcessStart (new spawn → ExecEvent), 2=ProcessEnd (prune the store —
         // PID recycling), 3=ProcessDCStart (rundown of already-running processes →
-        // store only, not a spawn).
-        if eid != 1 && eid != 2 && eid != 3 {
+        // store only, not a spawn), 5=ImageLoad (DLL/EXE mapped into a process).
+        if eid != 1 && eid != 2 && eid != 3 && eid != 5 {
             return;
         }
         state.events_seen.fetch_add(1, Ordering::Relaxed);
@@ -42,6 +43,39 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             if pid != 0 {
                 state.pids.lock().unwrap().remove(&pid);
             }
+            return;
+        }
+
+        if eid == 5 {
+            // EID 5 = ImageLoad: a DLL or EXE was mapped into the process.
+            // Only emit for tracked PIDs — the store is seeded at startup and
+            // populated by EID 1, so a missing PID is a kernel/driver load that
+            // we intentionally ignore at userland tier.
+            let Some(comm) = ({
+                let pids = state.pids.lock().unwrap();
+                pids.get(&pid).map(|p| basename(p))
+            }) else {
+                return;
+            };
+            let raw_image: String = parser
+                .try_parse("ImageFileName")
+                .unwrap_or_else(|_| String::from("<unknown>"));
+            if raw_image.is_empty() || raw_image == "<unknown>" {
+                return;
+            }
+            let image_path = state.normalize_path(&raw_image);
+            let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
+            let ppid = state
+                .pids
+                .lock()
+                .unwrap()
+                .get(&pid)
+                .map(|_| 0u32)
+                .unwrap_or(0);
+            sink.on_event(Event::ImageLoad(ImageLoadEvent {
+                meta: meta(pid, ppid, comm, timestamp_ns),
+                image_path,
+            }));
             return;
         }
 

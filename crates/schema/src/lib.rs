@@ -29,7 +29,7 @@ pub mod sensor;
 
 /// Version of the serialized event model. Bumped on any serialization-visible change,
 /// together with a new golden-fixture directory (see crate docs).
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Identity of the user a process runs as, per platform.
 ///
@@ -154,6 +154,20 @@ pub struct DnsQueryEvent {
     pub status: u32,
 }
 
+/// Image (DLL or EXE) loaded into a process address space.
+///
+/// Emitted on EID 5 of the Microsoft-Windows-Kernel-Process provider, which is
+/// already subscribed for process start/end events. Covers DLL hijacking, side-loading,
+/// `LOLBin` chains (e.g. `wscript.exe` → `scrobj.dll`), and AMSI bypass via patching
+/// (first seen as a load of `amsi.dll` into an unexpected process).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageLoadEvent {
+    pub meta: EventMeta,
+    /// Full path of the loaded image, normalized to drive-letter form (same
+    /// normalization as [`ExecEvent::image_path`], audit F-5).
+    pub image_path: String,
+}
+
 /// Registry value write — the primary signal for persistence and configuration
 /// manipulation detections.
 ///
@@ -201,6 +215,7 @@ pub enum Event {
     Connect(ConnectEvent),
     DnsQuery(DnsQueryEvent),
     RegistrySet(RegistrySetEvent),
+    ImageLoad(ImageLoadEvent),
 }
 
 impl Event {
@@ -212,6 +227,7 @@ impl Event {
             Event::Connect(e) => &e.meta,
             Event::DnsQuery(e) => &e.meta,
             Event::RegistrySet(e) => &e.meta,
+            Event::ImageLoad(e) => &e.meta,
             // Non-exhaustive: new telemetry categories reach existing sinks without
             // a breaking change — consumers match variants they understand and
             // ignore the rest.
