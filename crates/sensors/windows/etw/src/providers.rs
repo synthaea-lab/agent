@@ -9,7 +9,7 @@ use std::sync::{Arc, atomic::Ordering};
 use ferrisetw::{EventRecord, parser::Parser, provider::Provider, schema_locator::SchemaLocator};
 use schema::{
     ConnectEvent, DnsQueryEvent, Event, ExecEvent, FileOpenEvent, ImageLoadEvent, RegistrySetEvent,
-    sensor::EventSink,
+    ScriptBlockEvent, sensor::EventSink,
 };
 
 use crate::sensor::{SharedState, basename, meta};
@@ -22,6 +22,8 @@ const KERNEL_FILE_GUID: &str = "edd08927-9cc4-4e65-b970-c2560fb5c289";
 const DNS_CLIENT_GUID: &str = "1C95126E-7EEA-49A9-A3FE-A378B03DDB4D";
 /// Microsoft-Windows-Kernel-Registry
 const KERNEL_REGISTRY_GUID: &str = "70EB4F03-C1DE-4F73-A051-33D13D5413BD";
+/// Microsoft-Windows-PowerShell (script-block logging)
+const POWERSHELL_GUID: &str = "A0C1853B-5C40-4B15-8766-3CF1C58F985A";
 
 pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
@@ -374,6 +376,71 @@ pub(crate) fn registry_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState
     };
 
     Provider::by_guid(KERNEL_REGISTRY_GUID)
+        .add_callback(callback)
+        .build()
+}
+
+/// `PowerShell` script-block events (EID 4104 — `ScriptBlockLogging`).
+///
+/// The provider decodes `base64 -EncodedCommand` payloads before logging, so
+/// this event sees the plain-text script regardless of obfuscation. Primary
+/// signal for T1059.001 (`PowerShell`) and T1027 (obfuscated files/information).
+///
+/// # Fragmentation
+///
+/// Scripts that exceed the ETW record size are split: each fragment shares the
+/// same `ScriptBlockId` and carries `MessageNumber` / `MessageTotal`. Every
+/// fragment is emitted as a separate `ScriptBlockEvent`; the correlator can
+/// reassemble them by `script_block_id` + `message_number`.
+///
+/// # Field notes (Windows Server 2022, 2026-09-07)
+///
+/// - `ScriptBlockId` : GUID string identifying this script block.
+/// - `ScriptBlockText` : decoded script fragment (may be the full script).
+/// - `Path` : source file path when loaded from disk; empty for interactive use.
+/// - `MessageNumber` : 1-based fragment index.
+/// - `MessageTotal` : total fragment count for this `ScriptBlockId`.
+pub(crate) fn powershell_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
+    let callback = move |record: &EventRecord, locator: &SchemaLocator| {
+        // EID 4104 = ScriptBlockLogging — the only EID that carries script text.
+        if record.event_id() != 4104 {
+            return;
+        }
+        state.events_seen.fetch_add(1, Ordering::Relaxed);
+        let Ok(schema_def) = locator.event_schema(record) else {
+            return;
+        };
+        let parser = Parser::create(record, &schema_def);
+
+        let text: String = parser.try_parse("ScriptBlockText").unwrap_or_default();
+        if text.is_empty() {
+            return; // malformed or empty block — no detection value
+        }
+        let script_block_id: String = parser.try_parse("ScriptBlockId").unwrap_or_default();
+        let path_raw: String = parser.try_parse("Path").unwrap_or_default();
+        let path = if path_raw.is_empty() {
+            None
+        } else {
+            Some(path_raw)
+        };
+        let message_number: u32 = parser.try_parse("MessageNumber").unwrap_or(1);
+        let message_total: u32 = parser.try_parse("MessageTotal").unwrap_or(1);
+
+        let pid = record.process_id();
+        let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
+        let comm = state.comm_for(pid).unwrap_or_default();
+
+        sink.on_event(Event::ScriptBlock(ScriptBlockEvent {
+            meta: meta(pid, 0, comm, timestamp_ns),
+            script_block_id,
+            path,
+            text,
+            message_number,
+            message_total,
+        }));
+    };
+
+    Provider::by_guid(POWERSHELL_GUID)
         .add_callback(callback)
         .build()
 }

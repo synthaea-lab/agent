@@ -18,7 +18,8 @@ use schema::{
 };
 
 use crate::providers::{
-    dns_provider, file_provider, network_provider, process_provider, registry_provider,
+    dns_provider, file_provider, network_provider, powershell_provider, process_provider,
+    registry_provider,
 };
 use crate::{normalize, winapi};
 
@@ -247,7 +248,8 @@ impl Sensor for WindowsSensor {
             .enable(network_provider(sink.clone(), state.clone()))
             .enable(file_provider(sink.clone(), state.clone()))
             .enable(dns_provider(sink.clone(), state.clone()))
-            .enable(registry_provider(sink, state.clone()))
+            .enable(registry_provider(sink.clone(), state.clone()))
+            .enable(powershell_provider(sink, state.clone()))
             .start_and_process()
             .map_err(|e| -> SensorError { format!("ETW startup error: {e:?}").into() })?;
 

@@ -29,7 +29,7 @@ pub mod sensor;
 
 /// Version of the serialized event model. Bumped on any serialization-visible change,
 /// together with a new golden-fixture directory (see crate docs).
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Identity of the user a process runs as, per platform.
 ///
@@ -154,6 +154,34 @@ pub struct DnsQueryEvent {
     pub status: u32,
 }
 
+/// `PowerShell` script block logged by EID 4104 of the Microsoft-Windows-PowerShell
+/// provider.
+///
+/// The provider decodes `base64 -EncodedCommand` payloads before logging — this
+/// event sees the plain-text script regardless of obfuscation, making it the
+/// primary signal for encoded-PowerShell detections (T1059.001, T1027).
+///
+/// Large scripts are split across multiple ETW records. Each fragment shares the
+/// same `script_block_id`; reassemble by ordering on `(script_block_id,
+/// message_number)`. Single-record scripts have `message_number = message_total = 1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptBlockEvent {
+    pub meta: EventMeta,
+    /// Opaque identifier shared by all fragments of the same script block.
+    pub script_block_id: String,
+    /// Source file path when the script was loaded from disk; `None` for
+    /// interactive / inline invocations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Decoded script text for this fragment.
+    pub text: String,
+    /// 1-based fragment index. Equal to `message_total` when the script fits in
+    /// one ETW record.
+    pub message_number: u32,
+    /// Total number of fragments for this script block.
+    pub message_total: u32,
+}
+
 /// Image (DLL or EXE) loaded into a process address space.
 ///
 /// Emitted on EID 5 of the Microsoft-Windows-Kernel-Process provider, which is
@@ -216,6 +244,7 @@ pub enum Event {
     DnsQuery(DnsQueryEvent),
     RegistrySet(RegistrySetEvent),
     ImageLoad(ImageLoadEvent),
+    ScriptBlock(ScriptBlockEvent),
 }
 
 impl Event {
@@ -228,6 +257,7 @@ impl Event {
             Event::DnsQuery(e) => &e.meta,
             Event::RegistrySet(e) => &e.meta,
             Event::ImageLoad(e) => &e.meta,
+            Event::ScriptBlock(e) => &e.meta,
             // Non-exhaustive: new telemetry categories reach existing sinks without
             // a breaking change — consumers match variants they understand and
             // ignore the rest.
