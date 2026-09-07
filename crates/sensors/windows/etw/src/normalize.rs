@@ -53,6 +53,30 @@ pub fn normalize_nt_path(path: &str, volume_map: &HashMap<String, String>) -> St
     }
 }
 
+/// Normalizes an NT registry key path to the familiar Win32 hive prefix.
+///
+/// The ETW Kernel-Registry provider emits full NT paths
+/// (`\REGISTRY\MACHINE\SOFTWARE\...`); these are more useful in detections and
+/// UI as the standard Win32 forms (`HKLM\SOFTWARE\...`).
+///
+/// Unknown roots (e.g. `\REGISTRY\A\`) are returned unchanged — honest and
+/// greppable rather than fabricated.
+#[must_use]
+pub fn normalize_registry_key(raw: &str) -> String {
+    const MACHINE: &str = r"\REGISTRY\MACHINE\";
+    const USER: &str = r"\REGISTRY\USER\";
+
+    if raw.len() >= MACHINE.len() && raw[..MACHINE.len()].eq_ignore_ascii_case(MACHINE) {
+        return format!(r"HKLM\{}", &raw[MACHINE.len()..]);
+    }
+    if raw.len() >= USER.len() && raw[..USER.len()].eq_ignore_ascii_case(USER) {
+        // Includes SID-prefixed HKCU paths (e.g. HKU\S-1-5-21-...\...) and
+        // the machine-wide .DEFAULT hive — left with SID rather than guessing HKCU.
+        return format!(r"HKU\{}", &raw[USER.len()..]);
+    }
+    raw.to_string()
+}
+
 /// Session names are randomized per start (F-2): a fixed name documented its own
 /// kill command. Entropy source is deliberately boring (time ^ pid) — this is
 /// anti-fingerprinting of the session *name*, not cryptography.
@@ -138,6 +162,30 @@ mod tests {
         assert_eq!(
             normalize_nt_path(r"\Device\Mup\share\x", &map),
             r"\Device\Mup\share\x"
+        );
+    }
+
+    #[test]
+    fn registry_key_normalization() {
+        assert_eq!(
+            normalize_registry_key(
+                r"\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+            ),
+            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+        );
+        assert_eq!(
+            normalize_registry_key(r"\REGISTRY\USER\S-1-5-21-1234\SOFTWARE\Run"),
+            r"HKU\S-1-5-21-1234\SOFTWARE\Run"
+        );
+        // Case-insensitive prefix match.
+        assert_eq!(
+            normalize_registry_key(r"\registry\machine\SYSTEM\CurrentControlSet\Services"),
+            r"HKLM\SYSTEM\CurrentControlSet\Services"
+        );
+        // Unknown root: keep the truth.
+        assert_eq!(
+            normalize_registry_key(r"\REGISTRY\A\something"),
+            r"\REGISTRY\A\something"
         );
     }
 

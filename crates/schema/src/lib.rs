@@ -29,7 +29,7 @@ pub mod sensor;
 
 /// Version of the serialized event model. Bumped on any serialization-visible change,
 /// together with a new golden-fixture directory (see crate docs).
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Identity of the user a process runs as, per platform.
 ///
@@ -154,6 +154,30 @@ pub struct DnsQueryEvent {
     pub status: u32,
 }
 
+/// Registry value write — the primary signal for persistence and configuration
+/// manipulation detections.
+///
+/// Emitted on EID 4 (`RegSetValueKey`) of the Microsoft-Windows-Kernel-Registry
+/// provider. Only write operations are captured; reads (EID 2 `RegOpenKey`) are
+/// high-volume noise with almost no detection value at this tier.
+///
+/// Key path is normalized from NT registry format (`\REGISTRY\MACHINE\...`) to
+/// the familiar Win32 hive prefix (`HKLM\...`) by the sensor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistrySetEvent {
+    pub meta: EventMeta,
+    /// Normalized registry key path (e.g. `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`).
+    pub key: String,
+    /// Name of the value being written. Empty string means the default value `(Default)`.
+    pub value_name: String,
+    /// Registry data type (`1=REG_SZ`, `2=REG_EXPAND_SZ`, `3=REG_BINARY`, `4=REG_DWORD`, ...).
+    pub data_type: u32,
+    /// String representation of the value data for `REG_SZ` / `REG_EXPAND_SZ` types.
+    /// `None` for binary or DWORD types where string decoding is not meaningful.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+}
+
 /// Outbound network connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectEvent {
@@ -176,6 +200,7 @@ pub enum Event {
     FileOpen(FileOpenEvent),
     Connect(ConnectEvent),
     DnsQuery(DnsQueryEvent),
+    RegistrySet(RegistrySetEvent),
 }
 
 impl Event {
@@ -186,6 +211,7 @@ impl Event {
             Event::FileOpen(e) => &e.meta,
             Event::Connect(e) => &e.meta,
             Event::DnsQuery(e) => &e.meta,
+            Event::RegistrySet(e) => &e.meta,
             // Non-exhaustive: new telemetry categories reach existing sinks without
             // a breaking change — consumers match variants they understand and
             // ignore the rest.

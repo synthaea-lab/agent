@@ -6,7 +6,9 @@
 use std::net::IpAddr;
 
 use schema::detection::{Detection, DetectionSource, ScoreAttribution, Severity};
-use schema::{ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileOpenEvent, User};
+use schema::{
+    ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileOpenEvent, RegistrySetEvent, User,
+};
 
 fn fixture(name: &str) -> serde_json::Value {
     let path = format!(
@@ -206,6 +208,29 @@ fn dns_query_golden() {
 }
 
 #[test]
+fn registry_set_golden() {
+    assert_golden(
+        &Event::RegistrySet(RegistrySetEvent {
+            meta: EventMeta {
+                pid: 4242,
+                ppid: 1337,
+                user: User::Windows {
+                    sid: "S-1-5-18".into(),
+                    integrity_level: Some(0x4000),
+                },
+                timestamp_ns: 1_756_900_020_000_000_000,
+                comm: "chrome-update.exe".into(),
+            },
+            key: r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run".into(),
+            value_name: "ChromeUpdate".into(),
+            data_type: 1,
+            data: Some(r"C:\Users\Public\chrome-update.exe".into()),
+        }),
+        "registry_set",
+    );
+}
+
+#[test]
 fn connect_v6_golden() {
     assert_golden(
         &Event::Connect(ConnectEvent {
@@ -309,6 +334,13 @@ fn meta_accessor_covers_all_variants() {
             qtype: 1,
             result: None,
             status: 0,
+        }),
+        Event::RegistrySet(RegistrySetEvent {
+            meta: meta.clone(),
+            key: String::new(),
+            value_name: String::new(),
+            data_type: 1,
+            data: None,
         }),
     ];
     for e in &events {

@@ -6,7 +6,10 @@
 use std::sync::{Arc, atomic::Ordering};
 
 use ferrisetw::{EventRecord, parser::Parser, provider::Provider, schema_locator::SchemaLocator};
-use schema::{ConnectEvent, DnsQueryEvent, Event, ExecEvent, FileOpenEvent, sensor::EventSink};
+use schema::{
+    ConnectEvent, DnsQueryEvent, Event, ExecEvent, FileOpenEvent, RegistrySetEvent,
+    sensor::EventSink,
+};
 
 use crate::sensor::{SharedState, basename, meta};
 use crate::{normalize, winapi};
@@ -16,6 +19,8 @@ const KERNEL_NETWORK_GUID: &str = "7dd42a49-5329-4832-8dfd-43d979153a88";
 const KERNEL_FILE_GUID: &str = "edd08927-9cc4-4e65-b970-c2560fb5c289";
 /// Microsoft-Windows-DNS-Client
 const DNS_CLIENT_GUID: &str = "1C95126E-7EEA-49A9-A3FE-A378B03DDB4D";
+/// Microsoft-Windows-Kernel-Registry
+const KERNEL_REGISTRY_GUID: &str = "70EB4F03-C1DE-4F73-A051-33D13D5413BD";
 
 pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
@@ -244,12 +249,97 @@ pub(crate) fn dns_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
             meta: meta(pid, 0, comm, timestamp_ns),
             query,
             qtype: u32::from(qtype),
-            result: if result_raw.is_empty() { None } else { Some(result_raw) },
+            result: if result_raw.is_empty() {
+                None
+            } else {
+                Some(result_raw)
+            },
             status,
         }));
     };
 
     Provider::by_guid(DNS_CLIENT_GUID)
+        .add_callback(callback)
+        .build()
+}
+
+/// Decodes a `REG_SZ` / `REG_EXPAND_SZ` value: UTF-16 LE bytes → String.
+/// Returns `None` for empty input, odd-length buffers, or invalid UTF-16.
+fn decode_reg_string(bytes: Vec<u8>) -> Option<String> {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let s = String::from_utf16_lossy(&units);
+    let trimmed = s.trim_end_matches('\0');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Registry write events (EID 4 — `RegSetValueKey`).
+///
+/// Covers persistence writes to Run keys, IFEO, Services, and Winlogon (T1547,
+/// T1546, T1543). Only write operations are captured; reads (EID 2 `RegOpenKey`)
+/// are high-volume noise with negligible detection value at userland tier.
+///
+/// # Field notes (Windows Server 2022, 2026-09-07)
+///
+/// `KeyName` in EID 4 contains the full NT path of the key being written, e.g.
+/// `\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`. The sensor
+/// normalizes this to the Win32 hive prefix (`HKLM\...`, `HKU\...`).
+///
+/// `Data` is a raw binary blob. For `DataType` 1 (`REG_SZ`) and 2 (`REG_EXPAND_SZ`)
+/// the sensor decodes it as UTF-16 LE; other types (DWORD, BINARY, `MULTI_SZ`) are
+/// left as `None` — raw bytes have no safe string representation for rules.
+pub(crate) fn registry_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
+    let callback = move |record: &EventRecord, locator: &SchemaLocator| {
+        // EID 4 = RegSetValueKey — the only operation that writes persistence.
+        if record.event_id() != 4 {
+            return;
+        }
+        state.events_seen.fetch_add(1, Ordering::Relaxed);
+        let Ok(schema_def) = locator.event_schema(record) else {
+            return;
+        };
+        let parser = Parser::create(record, &schema_def);
+
+        let raw_key: String = parser.try_parse("KeyName").unwrap_or_default();
+        if raw_key.is_empty() {
+            // Opaque handle — kernel did not resolve the name (rare on Server 2022).
+            return;
+        }
+        let key = normalize::normalize_registry_key(&raw_key);
+        let value_name: String = parser.try_parse("ValueName").unwrap_or_default();
+        let data_type: u32 = parser.try_parse("DataType").unwrap_or(0);
+        let data_bytes: Vec<u8> = parser.try_parse("Data").unwrap_or_default();
+
+        // Decode string types; leave binary/DWORD as None.
+        let data = if data_type == 1 || data_type == 2 {
+            decode_reg_string(data_bytes)
+        } else {
+            None
+        };
+
+        let pid = record.process_id();
+        let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
+        let comm = state.comm_for(pid).unwrap_or_default();
+
+        sink.on_event(Event::RegistrySet(RegistrySetEvent {
+            meta: meta(pid, 0, comm, timestamp_ns),
+            key,
+            value_name,
+            data_type,
+            data,
+        }));
+    };
+
+    Provider::by_guid(KERNEL_REGISTRY_GUID)
         .add_callback(callback)
         .build()
 }
