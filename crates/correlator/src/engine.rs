@@ -13,8 +13,8 @@ use crate::{
     bus::EventBus,
     event::is_correlated,
     rules::{
-        CorrelationAlert, rule_connect_filewrite, rule_respawn_connect, rule_spawn_connect,
-        rule_spawn_connect_filewrite,
+        CorrelationAlert, rule_connect_filewrite, rule_dns_exfil, rule_respawn_connect,
+        rule_spawn_connect, rule_spawn_connect_filewrite,
     },
 };
 
@@ -244,6 +244,10 @@ impl CorrelationEngine {
 
         if let Some(alert) = rule_respawn_connect(pid, &self.bus) {
             push_once(&mut self.fired, "respawn_connect", alert);
+        }
+
+        if let Some(alert) = rule_dns_exfil(pid, &self.bus) {
+            push_once(&mut self.fired, "dns_exfil", alert);
         }
 
         alerts

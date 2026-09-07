@@ -23,6 +23,6 @@ pub(crate) fn is_file_write(event: &Event) -> bool {
 pub(crate) fn is_correlated(event: &Event) -> bool {
     matches!(
         event,
-        Event::Exec(_) | Event::Connect(_) | Event::FileOpen(_)
+        Event::Exec(_) | Event::Connect(_) | Event::FileOpen(_) | Event::DnsQuery(_)
     )
 }

@@ -1,6 +1,8 @@
 //! Co-occurrence rules — one function per scenario, evaluated by the engine over the
 //! bus's current window.
 
+use std::collections::{HashMap, HashSet};
+
 use schema::Event;
 
 use crate::{bus::EventBus, event::is_file_write};
@@ -148,6 +150,107 @@ pub(crate) fn rule_respawn_connect(pid: u32, bus: &EventBus) -> Option<Correlati
             technique: "T1059/T1071",
             message: format!(
                 "ppid={ppid} comm={comm}: {spawn_count} spawns + network connection — automatic respawn with suspected beaconing"
+            ),
+        })
+    } else {
+        None
+    }
+}
+
+/// T1048.003 / T1071.004 — data exfiltration or C2 tunnelled over DNS. A single
+/// process issues many DNS queries in the window that share one parent domain but
+/// each carry a distinct leftmost label that is both long and high-entropy — the
+/// shape of data chunked and base32/hex-encoded into subdomains (`iodine`, `dnscat2`,
+/// `DNSExfiltrator`). Co-occurrence by pid, order unconstrained.
+///
+/// Only DNS telemetry feeds this today (Windows ETW DNS-Client, EID 3008); the rule
+/// itself is source-agnostic and will pick up a Linux DNS sensor unchanged.
+///
+/// Parent-domain grouping is a plain "last two labels" split — it over-groups under
+/// multi-part public suffixes (`co.uk`, `s3.amazonaws.com`), which only makes the
+/// rule *less* likely to fire (queries scattered across sibling parents), never a
+/// false positive. A real public-suffix list is deferred (issue tracked with the
+/// rest of the DNS work).
+///
+/// Thresholds (Nikolas, 2026-09-07): entropy > 3.5 bits/char on the leftmost label,
+/// label length > 30, N >= 10 distinct such subdomains under one parent within the
+/// window. To be re-tuned against a lab capture.
+const DNS_TUNNEL_MIN_QUERIES: usize = 10;
+const DNS_TUNNEL_LABEL_MIN_LEN: usize = 30;
+const DNS_TUNNEL_LABEL_MIN_ENTROPY: f64 = 3.5;
+
+/// Shannon entropy of `s` in bits per character (0.0 for the empty string).
+/// Encoded payload labels land around 4–5 bits/char (base32 ≈ 5 max); dictionary
+/// hostnames and CDN hashes sit well below `DNS_TUNNEL_LABEL_MIN_ENTROPY`.
+fn shannon_entropy(s: &str) -> f64 {
+    if s.is_empty() {
+        return 0.0;
+    }
+    let mut counts: HashMap<char, usize> = HashMap::new();
+    for c in s.chars() {
+        *counts.entry(c).or_insert(0) += 1;
+    }
+    let len = s.chars().count() as f64;
+    counts
+        .values()
+        .map(|&n| {
+            let p = n as f64 / len;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+/// `("aGVsbG8", "example.com")` for `aGVsbG8.example.com`; `None` when the name has
+/// fewer than three labels (nothing to encode data into) or is malformed.
+fn split_leftmost_label(query: &str) -> Option<(&str, String)> {
+    let name = query.trim_end_matches('.');
+    let labels: Vec<&str> = name.split('.').filter(|l| !l.is_empty()).collect();
+    if labels.len() < 3 {
+        return None;
+    }
+    let leftmost = labels[0];
+    let parent = labels[labels.len() - 2..].join(".");
+    Some((leftmost, parent))
+}
+
+fn is_tunnel_like_label(label: &str) -> bool {
+    label.len() > DNS_TUNNEL_LABEL_MIN_LEN
+        && shannon_entropy(&label.to_ascii_lowercase()) > DNS_TUNNEL_LABEL_MIN_ENTROPY
+}
+
+pub(crate) fn rule_dns_exfil(pid: u32, bus: &EventBus) -> Option<CorrelationAlert> {
+    let comm = bus
+        .events_for_pid(pid)
+        .next()
+        .map(|e| e.meta().comm.clone())?;
+
+    // parent domain → set of distinct tunnel-like leftmost labels seen under it.
+    let mut per_parent: HashMap<String, HashSet<String>> = HashMap::new();
+    for event in bus.events_for_pid(pid) {
+        let Event::DnsQuery(dns) = event else {
+            continue;
+        };
+        let Some((label, parent)) = split_leftmost_label(&dns.query) else {
+            continue;
+        };
+        if is_tunnel_like_label(label) {
+            per_parent
+                .entry(parent)
+                .or_default()
+                .insert(label.to_ascii_lowercase());
+        }
+    }
+
+    let (parent, labels) = per_parent
+        .into_iter()
+        .max_by_key(|(_, labels)| labels.len())?;
+    let count = labels.len();
+    if count >= DNS_TUNNEL_MIN_QUERIES {
+        Some(CorrelationAlert {
+            technique: "T1048.003/T1071.004",
+            message: format!(
+                "pid={pid} comm={comm}: {count} distinct high-entropy subdomains of {parent} \
+                 within the window — suspected DNS tunnelling / exfiltration"
             ),
         })
     } else {

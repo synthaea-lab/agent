@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use schema::{ConnectEvent, Event, EventMeta, ExecEvent, FileOpenEvent, User};
+use schema::{ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileOpenEvent, User};
 
 use crate::{CorrelationEngine, bayes::PRIOR_LOG_ODDS};
 
@@ -69,6 +69,16 @@ fn file_read_event(pid: u32, ts_ns: u64) -> Event {
         meta: meta(pid, ts_ns),
         path: String::new(),
         flags: 0o0, // O_RDONLY
+    })
+}
+
+fn dns_query_event(pid: u32, ts_ns: u64, query: &str) -> Event {
+    Event::DnsQuery(DnsQueryEvent {
+        meta: meta(pid, ts_ns),
+        query: query.to_string(),
+        qtype: 1, // A
+        result: None,
+        status: 0,
     })
 }
 

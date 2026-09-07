@@ -2,6 +2,7 @@
 //! the once-per-window and masquerade regression tests.
 
 use super::*;
+use crate::CorrelationAlert;
 
 #[test]
 fn spawn_then_connect_same_pid_alerts() {
@@ -195,6 +196,165 @@ fn two_spawns_plus_connect_no_respawn_alert() {
         !alerts
             .iter()
             .any(|a| a.message.contains("automatic respawn"))
+    );
+}
+
+// ── R5: DNS tunnelling / exfiltration over DNS ────────────────────────────
+
+/// 34 chars from a 32-symbol alphabet, deterministic per seed — mimics a
+/// base32-encoded payload chunk (length > 30, entropy well above 3.5 bits/char).
+fn encoded_label(seed: u64) -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+    (0..34)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            ALPHABET[(x % 32) as usize] as char
+        })
+        .collect()
+}
+
+#[test]
+fn dns_tunnelling_many_encoded_subdomains_alerts() {
+    let mut engine = CorrelationEngine::new();
+    let mut all = Vec::new();
+    for i in 0..16u64 {
+        let q = format!("{}.tunnel.example.com", encoded_label(i));
+        all.extend(engine.on_event(dns_query_event(4242, 1_000_000_000 + i * 100_000_000, &q)));
+    }
+    let dns_alerts: Vec<_> = all
+        .iter()
+        .filter(|a| a.technique == "T1048.003/T1071.004")
+        .collect();
+    assert_eq!(
+        dns_alerts.len(),
+        1,
+        "expected exactly one DNS-tunnelling alert, got: {all:?}"
+    );
+    // Parent is the last two labels ("example.com"), per the documented
+    // over-grouping trade-off.
+    assert!(dns_alerts[0].message.contains("subdomains of example.com"));
+}
+
+/// Feeds every `queries[i]` as a DNS query from `pid`, 100 ms apart, and returns
+/// every alert raised across the whole sequence.
+fn run_dns_sequence(pid: u32, queries: &[String]) -> Vec<CorrelationAlert> {
+    let mut engine = CorrelationEngine::new();
+    let mut all = Vec::new();
+    for (i, q) in queries.iter().enumerate() {
+        all.extend(engine.on_event(dns_query_event(
+            pid,
+            1_000_000_000 + i as u64 * 100_000_000,
+            q,
+        )));
+    }
+    all
+}
+
+fn has_dns_exfil(alerts: &[CorrelationAlert]) -> bool {
+    alerts.iter().any(|a| a.technique == "T1048.003/T1071.004")
+}
+
+#[test]
+fn dns_normal_browsing_does_not_alert() {
+    let domains = [
+        "www.google.com",
+        "api.github.com",
+        "cdn.jsdelivr.net",
+        "mail.protonmail.com",
+        "static.cloudflareinsights.com",
+        "fonts.gstatic.com",
+        "analytics.tiktok.com",
+        "settings-win.data.microsoft.com",
+        "clientservices.googleapis.com",
+        "s3.eu-west-1.amazonaws.com",
+    ];
+    let queries: Vec<String> = domains
+        .iter()
+        .cycle()
+        .take(30)
+        .map(|d| d.to_string())
+        .collect();
+    assert!(
+        !has_dns_exfil(&run_dns_sequence(4242, &queries)),
+        "normal browsing raised a DNS-tunnelling alert"
+    );
+}
+
+#[test]
+fn dns_few_encoded_subdomains_below_threshold_no_alert() {
+    let queries: Vec<String> = (0..8u64)
+        .map(|i| format!("{}.tunnel.example.com", encoded_label(i)))
+        .collect();
+    assert!(
+        !has_dns_exfil(&run_dns_sequence(4242, &queries)),
+        "8 encoded subdomains (< threshold of 10) should not alert"
+    );
+}
+
+#[test]
+fn dns_encoded_subdomains_scattered_across_parents_no_alert() {
+    // Encoded labels, but each under its own parent domain — no single parent
+    // accumulates enough to look like a channel.
+    let queries: Vec<String> = (0..16u64)
+        .map(|i| format!("{}.p{i}.net", encoded_label(i)))
+        .collect();
+    assert!(
+        !has_dns_exfil(&run_dns_sequence(4242, &queries)),
+        "encoded labels scattered across parents should not alert"
+    );
+}
+
+#[test]
+fn dns_long_but_low_entropy_subdomains_no_alert() {
+    // Leftmost label > 30 chars, but near-zero entropy (one repeated char + a
+    // short serial) — a padded identifier, not encoded data.
+    let queries: Vec<String> = (0..20u64)
+        .map(|i| format!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa{i:04}.host.example.com"))
+        .collect();
+    assert!(
+        !has_dns_exfil(&run_dns_sequence(4242, &queries)),
+        "long low-entropy labels should not alert"
+    );
+}
+
+#[test]
+fn dns_repeated_identical_subdomain_no_alert() {
+    // Same high-entropy label queried 20× (a retry loop) — one distinct subdomain,
+    // not a channel.
+    let label = encoded_label(1);
+    let queries: Vec<String> = vec![format!("{label}.tunnel.example.com"); 20];
+    assert!(
+        !has_dns_exfil(&run_dns_sequence(4242, &queries)),
+        "a single repeated subdomain should not alert"
+    );
+}
+
+#[test]
+fn dns_tunnelling_alerts_once_per_window() {
+    let mut engine = CorrelationEngine::new();
+    let mut fired = 0;
+    for i in 0..16u64 {
+        let q = format!("{}.tunnel.example.com", encoded_label(i));
+        fired += engine
+            .on_event(dns_query_event(4242, 1_000_000_000 + i * 100_000_000, &q))
+            .iter()
+            .filter(|a| a.technique == "T1048.003/T1071.004")
+            .count();
+    }
+    // Every later query in the window keeps the pattern satisfied; it must not
+    // re-alert (same once-per-window guard as the other rules).
+    let repeat = engine.on_event(dns_query_event(
+        4242,
+        3_000_000_000,
+        &format!("{}.tunnel.example.com", encoded_label(999)),
+    ));
+    assert_eq!(fired, 1, "expected exactly one alert during the burst");
+    assert!(
+        !has_dns_exfil(&repeat),
+        "DNS-tunnelling pattern re-alerted inside the window: {repeat:?}"
     );
 }
 
