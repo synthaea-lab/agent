@@ -29,7 +29,7 @@ pub mod sensor;
 
 /// Version of the serialized event model. Bumped on any serialization-visible change,
 /// together with a new golden-fixture directory (see crate docs).
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Identity of the user a process runs as, per platform.
 ///
@@ -154,6 +154,26 @@ pub struct DnsQueryEvent {
     pub status: u32,
 }
 
+/// WMI activity — query execution (EID 23) or method invocation (EID 24) from the
+/// Microsoft-Windows-WMI-Activity provider.
+///
+/// Covers T1047 (`Win32_Process.Create` via WMI) and WMI-based reconnaissance
+/// (`SELECT * FROM Win32_Process`). Exactly one of `query` or `method` is `Some`
+/// depending on the event ID; the other is `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WmiActivityEvent {
+    pub meta: EventMeta,
+    /// WMI namespace (e.g. `ROOT\\CIMv2`).
+    pub namespace: String,
+    /// WQL query string for EID 23 (`ExecQuery`). `None` for EID 24.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    /// Method invocation for EID 24, formatted as `ClassName.MethodName`
+    /// (e.g. `Win32_Process.Create`). `None` for EID 23.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+}
+
 /// `PowerShell` script block logged by EID 4104 of the Microsoft-Windows-PowerShell
 /// provider.
 ///
@@ -245,6 +265,7 @@ pub enum Event {
     RegistrySet(RegistrySetEvent),
     ImageLoad(ImageLoadEvent),
     ScriptBlock(ScriptBlockEvent),
+    WmiActivity(WmiActivityEvent),
 }
 
 impl Event {
@@ -258,6 +279,7 @@ impl Event {
             Event::RegistrySet(e) => &e.meta,
             Event::ImageLoad(e) => &e.meta,
             Event::ScriptBlock(e) => &e.meta,
+            Event::WmiActivity(e) => &e.meta,
             // Non-exhaustive: new telemetry categories reach existing sinks without
             // a breaking change — consumers match variants they understand and
             // ignore the rest.

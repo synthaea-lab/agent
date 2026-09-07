@@ -8,7 +8,7 @@ use std::net::IpAddr;
 use schema::detection::{Detection, DetectionSource, ScoreAttribution, Severity};
 use schema::{
     ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileOpenEvent, ImageLoadEvent,
-    RegistrySetEvent, ScriptBlockEvent, User,
+    RegistrySetEvent, ScriptBlockEvent, User, WmiActivityEvent,
 };
 
 fn fixture(name: &str) -> serde_json::Value {
@@ -209,6 +209,29 @@ fn dns_query_golden() {
 }
 
 #[test]
+fn wmi_activity_golden() {
+    // EID 24 — method invocation (Win32_Process.Create → T1047 process spawn via WMI).
+    assert_golden(
+        &Event::WmiActivity(WmiActivityEvent {
+            meta: EventMeta {
+                pid: 4242,
+                ppid: 1337,
+                user: User::Windows {
+                    sid: "S-1-5-18".into(),
+                    integrity_level: Some(0x4000),
+                },
+                timestamp_ns: 1_756_900_050_000_000_000,
+                comm: "wmic.exe".into(),
+            },
+            namespace: r"ROOT\CIMv2".into(),
+            query: None,
+            method: Some("Win32_Process.Create".into()),
+        }),
+        "wmi_activity",
+    );
+}
+
+#[test]
 fn script_block_golden() {
     assert_golden(
         &Event::ScriptBlock(ScriptBlockEvent {
@@ -399,6 +422,12 @@ fn meta_accessor_covers_all_variants() {
             text: String::new(),
             message_number: 1,
             message_total: 1,
+        }),
+        Event::WmiActivity(WmiActivityEvent {
+            meta: meta.clone(),
+            namespace: String::new(),
+            query: None,
+            method: None,
         }),
     ];
     for e in &events {

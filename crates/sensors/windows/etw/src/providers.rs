@@ -9,7 +9,7 @@ use std::sync::{Arc, atomic::Ordering};
 use ferrisetw::{EventRecord, parser::Parser, provider::Provider, schema_locator::SchemaLocator};
 use schema::{
     ConnectEvent, DnsQueryEvent, Event, ExecEvent, FileOpenEvent, ImageLoadEvent, RegistrySetEvent,
-    ScriptBlockEvent, sensor::EventSink,
+    ScriptBlockEvent, WmiActivityEvent, sensor::EventSink,
 };
 
 use crate::sensor::{SharedState, basename, meta};
@@ -24,6 +24,8 @@ const DNS_CLIENT_GUID: &str = "1C95126E-7EEA-49A9-A3FE-A378B03DDB4D";
 const KERNEL_REGISTRY_GUID: &str = "70EB4F03-C1DE-4F73-A051-33D13D5413BD";
 /// Microsoft-Windows-PowerShell (script-block logging)
 const POWERSHELL_GUID: &str = "A0C1853B-5C40-4B15-8766-3CF1C58F985A";
+/// Microsoft-Windows-WMI-Activity
+const WMI_ACTIVITY_GUID: &str = "1418EF04-B0B4-4623-BF7E-D74AB47BBDAA";
 
 pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
@@ -441,6 +443,71 @@ pub(crate) fn powershell_provider(sink: Arc<dyn EventSink>, state: Arc<SharedSta
     };
 
     Provider::by_guid(POWERSHELL_GUID)
+        .add_callback(callback)
+        .build()
+}
+
+/// WMI activity events (EID 23 — `ExecQuery`, EID 24 — `ExecMethod`).
+///
+/// EID 23 captures WQL queries (reconnaissance, event subscriptions).
+/// EID 24 captures method invocations — `Win32_Process.Create` is the classic
+/// T1047 lateral-movement / execution primitive used by `wmic /node: process
+/// call create`.
+///
+/// # Field notes (Windows Server 2022, 2026-09-07)
+///
+/// EID 23: `NamespaceName` (String), `Query` (WQL String), `ResultCode` (u32).
+/// EID 24: `NamespaceName` (String), `ObjectPath` (String, class name),
+/// `MethodName` (String). Both: PID from the record header.
+pub(crate) fn wmi_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
+    let callback = move |record: &EventRecord, locator: &SchemaLocator| {
+        let eid = record.event_id();
+        // 23 = ExecQuery, 24 = ExecMethod — the two high-value WMI operations.
+        if eid != 23 && eid != 24 {
+            return;
+        }
+        state.events_seen.fetch_add(1, Ordering::Relaxed);
+        let Ok(schema_def) = locator.event_schema(record) else {
+            return;
+        };
+        let parser = Parser::create(record, &schema_def);
+
+        let namespace: String = parser.try_parse("NamespaceName").unwrap_or_default();
+        let pid = record.process_id();
+        let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
+        let comm = state.comm_for(pid).unwrap_or_default();
+
+        let (query, method) = if eid == 23 {
+            let q: String = parser.try_parse("Query").unwrap_or_default();
+            (if q.is_empty() { None } else { Some(q) }, None)
+        } else {
+            // EID 24: ObjectPath + MethodName → "ClassName.MethodName"
+            let class: String = parser.try_parse("ObjectPath").unwrap_or_default();
+            let meth: String = parser.try_parse("MethodName").unwrap_or_default();
+            let combined = format!("{class}.{meth}");
+            (
+                None,
+                if combined == "." {
+                    None
+                } else {
+                    Some(combined)
+                },
+            )
+        };
+
+        if query.is_none() && method.is_none() {
+            return; // nothing actionable
+        }
+
+        sink.on_event(Event::WmiActivity(WmiActivityEvent {
+            meta: meta(pid, 0, comm, timestamp_ns),
+            namespace,
+            query,
+            method,
+        }));
+    };
+
+    Provider::by_guid(WMI_ACTIVITY_GUID)
         .add_callback(callback)
         .build()
 }
