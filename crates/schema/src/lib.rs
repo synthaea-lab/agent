@@ -29,7 +29,7 @@ pub mod sensor;
 
 /// Version of the serialized event model. Bumped on any serialization-visible change,
 /// together with a new golden-fixture directory (see crate docs).
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Identity of the user a process runs as, per platform.
 ///
@@ -131,6 +131,29 @@ pub struct FileOpenEvent {
     pub flags: u32,
 }
 
+/// DNS resolution — the query name and answer, joined to the resolving process.
+///
+/// Emitted on EID 3008 (`QueryCompleted`) of the Microsoft-Windows-DNS-Client
+/// provider. Gives the exact domain a process tried to resolve and what it got
+/// back — the primary join key for domain IOC matching and beacon-frequency
+/// analysis. EID 3006 (`QueryStarted`) is not emitted: without the answer it is
+/// noise; a successful resolution always produces a 3008.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsQueryEvent {
+    pub meta: EventMeta,
+    /// The queried domain name, as the OS received it from the application.
+    pub query: String,
+    /// DNS record type (1 = A, 28 = AAAA, 5 = CNAME, ...).
+    pub qtype: u32,
+    /// Resolved addresses / CNAME chain, semicolon-separated as the provider
+    /// emits them (e.g. `"type:1 172.67.143.127;"`). `None` on NXDOMAIN or when
+    /// the provider returns an empty string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    /// Win32 status code (0 = success, 9003 = NXDOMAIN, ...).
+    pub status: u32,
+}
+
 /// Outbound network connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectEvent {
@@ -152,6 +175,7 @@ pub enum Event {
     Exec(ExecEvent),
     FileOpen(FileOpenEvent),
     Connect(ConnectEvent),
+    DnsQuery(DnsQueryEvent),
 }
 
 impl Event {
@@ -161,6 +185,12 @@ impl Event {
             Event::Exec(e) => &e.meta,
             Event::FileOpen(e) => &e.meta,
             Event::Connect(e) => &e.meta,
+            Event::DnsQuery(e) => &e.meta,
+            // Non-exhaustive: new telemetry categories reach existing sinks without
+            // a breaking change — consumers match variants they understand and
+            // ignore the rest.
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("all Event variants must be covered by meta()"),
         }
     }
 }

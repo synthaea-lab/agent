@@ -17,7 +17,7 @@ use schema::{
     sensor::{Capabilities, EventSink, Sensor, SensorError},
 };
 
-use crate::providers::{file_provider, network_provider, process_provider};
+use crate::providers::{dns_provider, file_provider, network_provider, process_provider};
 use crate::{normalize, winapi};
 
 /// Where the previous session's randomized name is persisted, so orphan cleanup
@@ -243,7 +243,8 @@ impl Sensor for WindowsSensor {
             .named(session.clone())
             .enable(process_provider(sink.clone(), state.clone()))
             .enable(network_provider(sink.clone(), state.clone()))
-            .enable(file_provider(sink, state.clone()))
+            .enable(file_provider(sink.clone(), state.clone()))
+            .enable(dns_provider(sink, state.clone()))
             .start_and_process()
             .map_err(|e| -> SensorError { format!("ETW startup error: {e:?}").into() })?;
 

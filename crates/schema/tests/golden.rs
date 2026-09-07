@@ -6,12 +6,13 @@
 use std::net::IpAddr;
 
 use schema::detection::{Detection, DetectionSource, ScoreAttribution, Severity};
-use schema::{ConnectEvent, Event, EventMeta, ExecEvent, FileOpenEvent, User};
+use schema::{ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileOpenEvent, User};
 
 fn fixture(name: &str) -> serde_json::Value {
     let path = format!(
-        "{}/tests/fixtures/v1/{name}.json",
-        env!("CARGO_MANIFEST_DIR")
+        "{}/tests/fixtures/v{}/{name}.json",
+        env!("CARGO_MANIFEST_DIR"),
+        schema::SCHEMA_VERSION,
     );
     serde_json::from_str(&std::fs::read_to_string(&path).expect(&path)).expect(&path)
 }
@@ -185,6 +186,26 @@ fn file_open_golden() {
 }
 
 #[test]
+fn dns_query_golden() {
+    assert_golden(
+        &Event::DnsQuery(DnsQueryEvent {
+            meta: EventMeta {
+                pid: 4242,
+                ppid: 1337,
+                user: User::Unknown,
+                timestamp_ns: 1_756_900_010_000_000_000,
+                comm: "chrome-update.exe".into(),
+            },
+            query: "beacon.example.test".into(),
+            qtype: 1,
+            result: Some("type:1 172.67.143.127;".into()),
+            status: 0,
+        }),
+        "dns_query",
+    );
+}
+
+#[test]
 fn connect_v6_golden() {
     assert_golden(
         &Event::Connect(ConnectEvent {
@@ -281,6 +302,13 @@ fn meta_accessor_covers_all_variants() {
             meta: meta.clone(),
             daddr: "10.0.0.1".parse::<IpAddr>().unwrap(),
             dport: 80,
+        }),
+        Event::DnsQuery(DnsQueryEvent {
+            meta: meta.clone(),
+            query: String::new(),
+            qtype: 1,
+            result: None,
+            status: 0,
         }),
     ];
     for e in &events {
