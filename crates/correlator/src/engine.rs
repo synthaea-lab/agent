@@ -13,8 +13,9 @@ use crate::{
     bus::EventBus,
     event::is_correlated,
     rules::{
-        CorrelationAlert, rule_connect_filewrite, rule_dns_exfil, rule_respawn_connect,
-        rule_spawn_connect, rule_spawn_connect_filewrite,
+        CorrelationAlert, rule_assembly_connect, rule_assembly_smb, rule_connect_filewrite,
+        rule_dns_exfil, rule_exec_smb, rule_respawn_connect, rule_spawn_connect,
+        rule_spawn_connect_filewrite,
     },
 };
 
@@ -248,6 +249,21 @@ impl CorrelationEngine {
 
         if let Some(alert) = rule_dns_exfil(pid, &self.bus) {
             push_once(&mut self.fired, "dns_exfil", alert);
+        }
+
+        // New-telemetry rules — AssemblyLoad + SmbConnect.
+        // `rule_assembly_smb` is the superset; check it first and skip the two
+        // subset rules (exec_smb, assembly_connect) if the full chain fires,
+        // matching the pattern of rule_spawn_connect_filewrite above.
+        if let Some(alert) = rule_assembly_smb(pid, &self.bus) {
+            push_once(&mut self.fired, "assembly_smb", alert);
+        } else {
+            if let Some(alert) = rule_assembly_connect(pid, &self.bus) {
+                push_once(&mut self.fired, "assembly_connect", alert);
+            }
+            if let Some(alert) = rule_exec_smb(pid, &self.bus) {
+                push_once(&mut self.fired, "exec_smb", alert);
+            }
         }
 
         alerts

@@ -20,9 +20,19 @@ pub(crate) fn is_file_write(event: &Event) -> bool {
 }
 
 /// True for the variants this crate correlates (and therefore stores in the bus).
+///
+/// New event types added here must also be handled in [`BehaviorVector::from_window`]
+/// (at minimum as a no-op) and covered by at least one rule or a `_ =>` arm in every
+/// exhaustive match inside `rules.rs`.
 pub(crate) fn is_correlated(event: &Event) -> bool {
     matches!(
         event,
-        Event::Exec(_) | Event::Connect(_) | Event::FileOpen(_) | Event::DnsQuery(_)
+        Event::Exec(_)
+            | Event::Connect(_)
+            | Event::FileOpen(_)
+            | Event::DnsQuery(_)
+            | Event::AssemblyLoad(_)
+            | Event::SmbConnect(_)
+            | Event::UdpSend(_)
     )
 }
