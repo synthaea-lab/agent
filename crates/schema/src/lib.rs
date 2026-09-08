@@ -29,7 +29,7 @@ pub mod sensor;
 
 /// Version of the serialized event model. Bumped on any serialization-visible change,
 /// together with a new golden-fixture directory (see crate docs).
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Identity of the user a process runs as, per platform.
 ///
@@ -273,6 +273,26 @@ pub struct SmbConnectEvent {
     pub server_name: String,
 }
 
+/// UDP datagram sent — the primary signal for DNS-tunneling and C2-over-UDP detection.
+///
+/// Emitted on EID 14 (`UDPSend` IPv4) of the Microsoft-Windows-Kernel-Network
+/// provider, which is already subscribed for TCP connect/send events. IPv6 UDP
+/// is not captured at this tier (field layout differs; add EID 18 separately if needed).
+///
+/// Note: UDP is stateless — unlike TCP connects there is no dedup filter, so
+/// high-volume UDP flows (QUIC, media) may produce many events. Rules matching
+/// on this type should aggregate on `(pid, daddr, dport)` before alerting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UdpSendEvent {
+    pub meta: EventMeta,
+    /// Destination address (IPv4 only at this tier).
+    pub daddr: core::net::IpAddr,
+    pub dport: u16,
+    /// UDP payload size in bytes. Useful for detecting large DNS queries (tunneling)
+    /// and volumetric anomalies — normal DNS queries are under 512 bytes.
+    pub size: u32,
+}
+
 /// Outbound network connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectEvent {
@@ -301,6 +321,7 @@ pub enum Event {
     WmiActivity(WmiActivityEvent),
     AssemblyLoad(AssemblyLoadEvent),
     SmbConnect(SmbConnectEvent),
+    UdpSend(UdpSendEvent),
 }
 
 impl Event {
@@ -317,6 +338,7 @@ impl Event {
             Event::WmiActivity(e) => &e.meta,
             Event::AssemblyLoad(e) => &e.meta,
             Event::SmbConnect(e) => &e.meta,
+            Event::UdpSend(e) => &e.meta,
             // Non-exhaustive: new telemetry categories reach existing sinks without
             // a breaking change — consumers match variants they understand and
             // ignore the rest.
