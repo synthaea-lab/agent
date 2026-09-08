@@ -7,8 +7,8 @@ use std::net::IpAddr;
 
 use schema::detection::{Detection, DetectionSource, ScoreAttribution, Severity};
 use schema::{
-    ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileOpenEvent, ImageLoadEvent,
-    RegistrySetEvent, ScriptBlockEvent, User, WmiActivityEvent,
+    AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileOpenEvent,
+    ImageLoadEvent, RegistrySetEvent, ScriptBlockEvent, User, WmiActivityEvent,
 };
 
 fn fixture(name: &str) -> serde_json::Value {
@@ -300,6 +300,31 @@ fn registry_set_golden() {
 }
 
 #[test]
+fn assembly_load_golden() {
+    // In-memory .NET assembly — execute-assembly / fileless injection signal.
+    // flags = 0x2 (dynamic): the only kind the sensor forwards; file-backed loads
+    // are dropped at the provider to avoid high-volume noise.
+    assert_golden(
+        &Event::AssemblyLoad(AssemblyLoadEvent {
+            meta: EventMeta {
+                pid: 4242,
+                ppid: 1337,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-512".into(),
+                    integrity_level: Some(0x2000),
+                },
+                timestamp_ns: 1_756_900_060_000_000_000,
+                comm: "powershell.exe".into(),
+            },
+            assembly_name: "MyPayload, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
+                .into(),
+            flags: 2,
+        }),
+        "assembly_load",
+    );
+}
+
+#[test]
 fn connect_v6_golden() {
     assert_golden(
         &Event::Connect(ConnectEvent {
@@ -428,6 +453,11 @@ fn meta_accessor_covers_all_variants() {
             namespace: String::new(),
             query: None,
             method: None,
+        }),
+        Event::AssemblyLoad(AssemblyLoadEvent {
+            meta: meta.clone(),
+            assembly_name: String::new(),
+            flags: 2,
         }),
     ];
     for e in &events {
