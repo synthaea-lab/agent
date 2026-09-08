@@ -207,6 +207,7 @@ impl RuleState {
             .iter()
             .any(|&e| comm.eq_ignore_ascii_case(e))
             && policy::name_exclusion_applies(Some(event.image_path.as_str()))
+            && policy::parent_exclusion_applies(&comm, event.parent_comm.as_deref())
         {
             return None;
         }
