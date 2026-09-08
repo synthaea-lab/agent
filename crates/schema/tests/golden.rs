@@ -8,7 +8,8 @@ use std::net::IpAddr;
 use schema::detection::{Detection, DetectionSource, ScoreAttribution, Severity};
 use schema::{
     AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileOpenEvent,
-    ImageLoadEvent, RegistrySetEvent, ScriptBlockEvent, SmbConnectEvent, User, WmiActivityEvent,
+    ImageLoadEvent, RegistrySetEvent, ScriptBlockEvent, SmbConnectEvent, UdpSendEvent, User,
+    WmiActivityEvent,
 };
 
 fn fixture(name: &str) -> serde_json::Value {
@@ -346,6 +347,30 @@ fn smb_connect_golden() {
 }
 
 #[test]
+fn udp_send_golden() {
+    // dnscat.exe tunneling DNS queries over UDP — large size (120 B) + port 53.
+    // Primary signal for DNS-over-UDP C2 and data exfiltration (T1071.004).
+    assert_golden(
+        &Event::UdpSend(UdpSendEvent {
+            meta: EventMeta {
+                pid: 4242,
+                ppid: 1337,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-512".into(),
+                    integrity_level: Some(0x2000),
+                },
+                timestamp_ns: 1_756_900_080_000_000_000,
+                comm: "dnscat.exe".into(),
+            },
+            daddr: "8.8.8.8".parse::<IpAddr>().unwrap(),
+            dport: 53,
+            size: 120,
+        }),
+        "udp_send",
+    );
+}
+
+#[test]
 fn connect_v6_golden() {
     assert_golden(
         &Event::Connect(ConnectEvent {
@@ -483,6 +508,12 @@ fn meta_accessor_covers_all_variants() {
         Event::SmbConnect(SmbConnectEvent {
             meta: meta.clone(),
             server_name: String::new(),
+        }),
+        Event::UdpSend(UdpSendEvent {
+            meta: meta.clone(),
+            daddr: "10.0.0.1".parse::<IpAddr>().unwrap(),
+            dport: 53,
+            size: 0,
         }),
     ];
     for e in &events {

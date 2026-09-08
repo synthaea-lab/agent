@@ -9,8 +9,8 @@ use std::sync::{Arc, atomic::Ordering};
 use ferrisetw::{EventRecord, parser::Parser, provider::Provider, schema_locator::SchemaLocator};
 use schema::{
     AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, ExecEvent, FileOpenEvent,
-    ImageLoadEvent, RegistrySetEvent, ScriptBlockEvent, SmbConnectEvent, WmiActivityEvent,
-    sensor::EventSink,
+    ImageLoadEvent, RegistrySetEvent, ScriptBlockEvent, SmbConnectEvent, UdpSendEvent,
+    WmiActivityEvent, sensor::EventSink,
 };
 
 use crate::sensor::{SharedState, basename, meta};
@@ -137,6 +137,37 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
 pub(crate) fn network_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
         let eid = record.event_id();
+
+        // EID 14 = UDPSend (IPv4): dest addr + port + payload size.
+        // Handled early and returned: UDP is stateless so no dedup filter applies,
+        // and the field set differs from TCP (no sport needed for emit).
+        if eid == 14 {
+            state.events_seen.fetch_add(1, Ordering::Relaxed);
+            let Ok(schema_def) = locator.event_schema(record) else {
+                return;
+            };
+            let parser = Parser::create(record, &schema_def);
+            let pid: u32 = parser.try_parse("PID").unwrap_or(0);
+            let raw: u32 = parser.try_parse("daddr").unwrap_or(0);
+            if raw == 0 {
+                return;
+            }
+            let daddr = std::net::IpAddr::V4(raw.to_ne_bytes().into());
+            let dport = parser.try_parse::<u16>("dport").unwrap_or(0).swap_bytes();
+            let size: u32 = parser.try_parse("size").unwrap_or(0);
+            let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
+            let Some(comm) = state.comm_for(pid) else {
+                return;
+            };
+            sink.on_event(Event::UdpSend(UdpSendEvent {
+                meta: meta(pid, 0, comm, timestamp_ns),
+                daddr,
+                dport,
+                size,
+            }));
+            return;
+        }
+
         // v4: 42=TcpIpConnect, 12=TcpIpSend (TcpClient emits no 42 — lab
         // 2026-08-25). v6 counterparts (F-7): 58=connect, 26=send. Recv excluded:
         // would double-count on the receiver side.
