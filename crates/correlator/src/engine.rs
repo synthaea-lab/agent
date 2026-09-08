@@ -120,7 +120,17 @@ impl CorrelationEngine {
             if ppid != 0 {
                 self.pid_entities.insert(pid, (ppid, comm.clone()));
             }
-            if is_ignored(&comm) && !policy::name_exclusion_applies(Some(exec.image_path.as_str()))
+            // Masquerade detection: an IGNORED-list name is suspicious when
+            // EITHER the image path is not in a trusted system location (rename
+            // in %TEMP%) OR the parent is not the expected one (e.g. svchost.exe
+            // spawned by cmd.exe instead of services.exe). Either failure alone
+            // is enough — both conditions must hold for the exclusion to apply.
+            if is_ignored(&comm)
+                && (!policy::name_exclusion_applies(Some(exec.image_path.as_str()))
+                    || !policy::parent_exclusion_applies(
+                        &comm,
+                        exec.parent_comm.as_deref(),
+                    ))
             {
                 self.masquerading.insert(pid, ());
             }
