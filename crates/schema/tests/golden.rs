@@ -8,7 +8,7 @@ use std::net::IpAddr;
 use schema::detection::{Detection, DetectionSource, ScoreAttribution, Severity};
 use schema::{
     AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileOpenEvent,
-    ImageLoadEvent, RegistrySetEvent, ScriptBlockEvent, User, WmiActivityEvent,
+    ImageLoadEvent, RegistrySetEvent, ScriptBlockEvent, SmbConnectEvent, User, WmiActivityEvent,
 };
 
 fn fixture(name: &str) -> serde_json::Value {
@@ -325,6 +325,27 @@ fn assembly_load_golden() {
 }
 
 #[test]
+fn smb_connect_golden() {
+    // PsExec-style lateral movement: the SMB client connects to a remote admin share.
+    assert_golden(
+        &Event::SmbConnect(SmbConnectEvent {
+            meta: EventMeta {
+                pid: 4242,
+                ppid: 1337,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-512".into(),
+                    integrity_level: Some(0x2000),
+                },
+                timestamp_ns: 1_756_900_070_000_000_000,
+                comm: "psexec.exe".into(),
+            },
+            server_name: r"\\WIN-TARGET".into(),
+        }),
+        "smb_connect",
+    );
+}
+
+#[test]
 fn connect_v6_golden() {
     assert_golden(
         &Event::Connect(ConnectEvent {
@@ -458,6 +479,10 @@ fn meta_accessor_covers_all_variants() {
             meta: meta.clone(),
             assembly_name: String::new(),
             flags: 2,
+        }),
+        Event::SmbConnect(SmbConnectEvent {
+            meta: meta.clone(),
+            server_name: String::new(),
         }),
     ];
     for e in &events {

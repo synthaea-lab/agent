@@ -29,7 +29,7 @@ pub mod sensor;
 
 /// Version of the serialized event model. Bumped on any serialization-visible change,
 /// together with a new golden-fixture directory (see crate docs).
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// Identity of the user a process runs as, per platform.
 ///
@@ -257,6 +257,22 @@ pub struct AssemblyLoadEvent {
     pub flags: u32,
 }
 
+/// SMB client connection to a remote server (EID 30704 of
+/// `Microsoft-Windows-SMBClient`).
+///
+/// Fires when the SMB redirector establishes a TCP connection to a remote
+/// server. Primary signal for lateral movement via SMB (T1021.002 —
+/// Remote Services: SMB/Windows Admin Shares).
+///
+/// EID 30702 (failed connection) is not emitted — only successful connections
+/// have detection value at this tier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmbConnectEvent {
+    pub meta: EventMeta,
+    /// Server name as the SMB client resolved it (e.g. `\\WIN-TARGET` or `\\192.168.1.10`).
+    pub server_name: String,
+}
+
 /// Outbound network connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectEvent {
@@ -284,6 +300,7 @@ pub enum Event {
     ScriptBlock(ScriptBlockEvent),
     WmiActivity(WmiActivityEvent),
     AssemblyLoad(AssemblyLoadEvent),
+    SmbConnect(SmbConnectEvent),
 }
 
 impl Event {
@@ -299,6 +316,7 @@ impl Event {
             Event::ScriptBlock(e) => &e.meta,
             Event::WmiActivity(e) => &e.meta,
             Event::AssemblyLoad(e) => &e.meta,
+            Event::SmbConnect(e) => &e.meta,
             // Non-exhaustive: new telemetry categories reach existing sinks without
             // a breaking change — consumers match variants they understand and
             // ignore the rest.

@@ -9,7 +9,8 @@ use std::sync::{Arc, atomic::Ordering};
 use ferrisetw::{EventRecord, parser::Parser, provider::Provider, schema_locator::SchemaLocator};
 use schema::{
     AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, ExecEvent, FileOpenEvent,
-    ImageLoadEvent, RegistrySetEvent, ScriptBlockEvent, WmiActivityEvent, sensor::EventSink,
+    ImageLoadEvent, RegistrySetEvent, ScriptBlockEvent, SmbConnectEvent, WmiActivityEvent,
+    sensor::EventSink,
 };
 
 use crate::sensor::{SharedState, basename, meta};
@@ -28,6 +29,8 @@ const POWERSHELL_GUID: &str = "A0C1853B-5C40-4B15-8766-3CF1C58F985A";
 const WMI_ACTIVITY_GUID: &str = "1418EF04-B0B4-4623-BF7E-D74AB47BBDAA";
 /// Microsoft-Windows-DotNETRuntime (Assembly keyword, EID 154 `AssemblyLoad`)
 const DOTNET_RUNTIME_GUID: &str = "e13c0d23-ccbc-4e12-931b-d9cc2eee27e4";
+/// Microsoft-Windows-SMBClient (EID 30704 — TCP connection established to SMB server)
+const SMB_CLIENT_GUID: &str = "988C59C5-0A1C-45B6-A555-0C62276E327D";
 
 /// `AssemblyFlags` bit indicating a dynamic (in-memory) assembly load.
 /// File-backed assemblies are high-volume noise; only dynamic loads are forwarded.
@@ -571,6 +574,53 @@ pub(crate) fn dotnet_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>)
     };
 
     Provider::by_guid(DOTNET_RUNTIME_GUID)
+        .add_callback(callback)
+        .build()
+}
+
+/// SMB client connections to remote servers (EID 30704) from
+/// `Microsoft-Windows-SMBClient`.
+///
+/// EID 30704 fires when the SMB redirector successfully establishes a TCP
+/// connection to a remote server. Primary signal for lateral movement via SMB
+/// (T1021.002 — Remote Services: SMB/Windows Admin Shares).
+///
+/// EID 30702 (failed connections) is not emitted — only successful connections
+/// have detection value at this tier.
+///
+/// # Field notes (Windows Server 2022, 2026-09-08)
+///
+/// EID 30704: `ServerName` (length-prefixed `UnicodeString`). Verified against
+/// `(Get-WinEvent -ListProvider Microsoft-Windows-SMBClient).Events`.
+pub(crate) fn smb_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
+    let callback = move |record: &EventRecord, locator: &SchemaLocator| {
+        // EID 30704 = TCP connection established to remote SMB server.
+        if record.event_id() != 30704 {
+            return;
+        }
+        let Ok(schema_def) = locator.event_schema(record) else {
+            return;
+        };
+        let parser = Parser::create(record, &schema_def);
+
+        let server_name: String = parser.try_parse("ServerName").unwrap_or_default();
+        if server_name.is_empty() {
+            return;
+        }
+
+        state.events_seen.fetch_add(1, Ordering::Relaxed);
+
+        let pid = record.process_id();
+        let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
+        let comm = state.comm_for(pid).unwrap_or_default();
+
+        sink.on_event(Event::SmbConnect(SmbConnectEvent {
+            meta: meta(pid, 0, comm, timestamp_ns),
+            server_name,
+        }));
+    };
+
+    Provider::by_guid(SMB_CLIENT_GUID)
         .add_callback(callback)
         .build()
 }
