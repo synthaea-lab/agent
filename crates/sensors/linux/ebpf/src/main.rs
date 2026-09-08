@@ -4,12 +4,13 @@
 use aya_ebpf::{
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_task,
-        bpf_probe_read_kernel, bpf_probe_read_user, bpf_probe_read_user_buf,
-        bpf_probe_read_user_str_bytes,
+        bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes, bpf_probe_read_user,
+        bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
     },
     macros::{map, tracepoint},
-    maps::{HashMap, RingBuf},
+    maps::{HashMap, PerCpuArray, RingBuf},
     programs::TracePointContext,
+    EbpfContext,
 };
 use aya_log_ebpf::{info, warn};
 use sensor_linux_wire::{
@@ -48,11 +49,17 @@ mod vmlinux;
 mod vmlinux_aarch64;
 
 /// Ring buffer shared with userspace for `exec` events. `ExecEvent` (`image` +
-/// `cmdline`) is larger than the 512-byte eBPF stack, so it is filled in place in a
-/// reserved ring-buffer slot — never in a scratch map (a `memset`/`memcpy` over map
-/// memory is rejected by the verifier).
+/// `cmdline`) is larger than the 512-byte eBPF stack, so it is assembled in the
+/// per-CPU `EXEC_SCRATCH` entry and emitted with a single `output` copy — the
+/// standard libbpf/Tetragon "heap map" pattern. Filling a reserved slot field by
+/// field instead needs per-byte loops over MAX_PATH_LEN / MAX_CMDLINE_LEN, which
+/// blow the verifier's 1M-instruction budget on pre-6.6 kernels (5.15, 6.1).
 #[map]
 static EXEC_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Per-CPU scratch for building one `ExecEvent` off the stack (see `EXEC_EVENTS`).
+#[map]
+static EXEC_SCRATCH: PerCpuArray<ExecEvent> = PerCpuArray::with_max_entries(1, 0);
 
 /// pid → parent identity (`real_parent->tgid` + its `comm`). Filled by
 /// `sched_process_fork` and by userspace `/proc` priming at startup; entries removed
@@ -240,26 +247,24 @@ fn try_sched_process_exec(ctx: TracePointContext) -> Result<u32, u32> {
     let pid: i32 = unsafe { ctx.read_at(PID_OFFSET).map_err(|_| 1u32)? };
     let tgid = pid as u32;
 
-    // `image` bytes go straight into the reserved ring-buffer slot; only `cmdline`
-    // needs a stack bounce (`bpf_probe_read_user` writes to stack, not ring-buffer
-    // memory), and it is the single large stack value in this function.
     let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
     let data_loc: u32 = unsafe { ctx.read_at(FILENAME_DATA_LOC_OFFSET).map_err(|_| 1u32)? };
     let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
     let timestamp_ns = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
 
+    // `cmdline` is bounced through the stack — `bpf_probe_read_user` reads best
+    // into a stack buffer — but it is the only stack value here now.
     let mut cmdline = [0u8; MAX_CMDLINE_LEN];
     let cmdline_len = read_argv(&mut cmdline).unwrap_or(0);
 
-    let Some(mut entry) = EXEC_EVENTS.reserve::<ExecEvent>(0) else {
-        warn!(
-            &ctx,
-            "sensor-linux-ebpf: ring buffer full, dropping exec event"
-        );
-        return Ok(0);
-    };
-    let e = entry.as_mut_ptr();
+    // Assemble the event in per-CPU scratch, not on the stack and not field by
+    // field in a reserved ring-buffer slot (that needs per-byte loops over
+    // MAX_PATH_LEN / MAX_CMDLINE_LEN, which blow the verifier's 1M-instruction
+    // budget on pre-6.6 kernels). One `output` copy emits it.
+    let e = EXEC_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
     unsafe {
+        core::ptr::write_bytes(e, 0, 1);
+
         (*e).meta.pid = tgid;
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
@@ -268,10 +273,9 @@ fn try_sched_process_exec(ctx: TracePointContext) -> Result<u32, u32> {
         let mut i = 0usize;
         while i < TASK_COMM_LEN {
             (*e).meta.comm[i] = comm[i];
-            (*e).pcomm[i] = 0;
             i += 1;
         }
-        // Parent identity from the fork-lineage map, written straight into the slot.
+        // Parent identity from the fork-lineage map.
         if let Some(l) = PROC_LINEAGE.get(&tgid) {
             (*e).meta.ppid = l.ppid;
             let mut i = 0usize;
@@ -280,44 +284,29 @@ fn try_sched_process_exec(ctx: TracePointContext) -> Result<u32, u32> {
                 i += 1;
             }
         }
-    }
 
-    // Authoritative image path: the tracepoint's own `filename` field (the kernel's
-    // resolved `bprm->filename`), byte by byte into the reserved slot — never argv[0].
-    let filename_offset = (data_loc & 0xffff) as usize;
-    let filename_len = ((data_loc >> 16) & 0xffff) as usize;
-    let copy_len = filename_len.min(MAX_PATH_LEN);
-    let mut il = 0usize;
-    while il < copy_len {
-        match unsafe { ctx.read_at::<u8>(filename_offset + il) } {
-            Ok(0) => break,
-            Ok(b) => unsafe { (*e).image[il & (MAX_PATH_LEN - 1)] = b },
-            Err(_) => {
-                entry.discard(0);
-                return Ok(0);
-            }
+        // Authoritative image path: the tracepoint's own `filename` field (the
+        // kernel's resolved `bprm->filename`), never argv[0]. One bounded
+        // `…_str_bytes` copy into the scratch entry.
+        let filename_offset = (data_loc & 0xffff) as usize;
+        let filename_src = (ctx.as_ptr() as *const u8).add(filename_offset);
+        if let Ok(s) = bpf_probe_read_kernel_str_bytes(filename_src, &mut (*e).image) {
+            (*e).image_len = s.len() as u16;
         }
-        il += 1;
-    }
-    unsafe { (*e).image_len = il as u16 };
-    // Zero the rest of the image buffer — the reserved slot is uninitialised.
-    let mut i = il;
-    while i < MAX_PATH_LEN {
-        unsafe { (*e).image[i & (MAX_PATH_LEN - 1)] = 0 };
-        i += 1;
-    }
 
-    // argv blob: copy the whole stack buffer into the slot (bytes past `cmdline_len`
-    // are zero — the buffer was zero-initialised and `read_argv` only wrote `[0..len]`).
-    unsafe {
+        // argv blob: one fixed-size copy of the stack buffer. `read_argv` wrote
+        // `[0..cmdline_len]`; the rest was zero-initialised (and so is the scratch
+        // entry, from the `write_bytes` above).
+        (*e).cmdline = cmdline;
         (*e).cmdline_len = cmdline_len;
-        let mut i = 0usize;
-        while i < MAX_CMDLINE_LEN {
-            (*e).cmdline[i] = cmdline[i & (MAX_CMDLINE_LEN - 1)];
-            i += 1;
+
+        if EXEC_EVENTS.output::<ExecEvent>(&*e, 0).is_err() {
+            warn!(
+                &ctx,
+                "sensor-linux-ebpf: ring buffer full, dropping exec event"
+            );
         }
     }
-    entry.submit(0);
 
     info!(&ctx, "sensor-linux-ebpf: exec pid={}", pid);
     Ok(0)
