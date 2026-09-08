@@ -29,7 +29,7 @@ pub mod sensor;
 
 /// Version of the serialized event model. Bumped on any serialization-visible change,
 /// together with a new golden-fixture directory (see crate docs).
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Identity of the user a process runs as, per platform.
 ///
@@ -240,6 +240,23 @@ pub struct RegistrySetEvent {
     pub data: Option<String>,
 }
 
+/// In-memory .NET assembly load — the primary signal for execute-assembly /
+/// fileless .NET injection (T1620, T1055).
+///
+/// Emitted on EID 154 (`AssemblyLoad`) of the `Microsoft-Windows-DotNETRuntime`
+/// provider, filtered to dynamic (in-memory) assemblies only (`flags & 0x2 != 0`).
+/// File-backed assemblies are high-volume noise with low detection value at this
+/// tier — they are dropped at the sensor, not forwarded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssemblyLoadEvent {
+    pub meta: EventMeta,
+    /// Fully qualified assembly name (e.g. `MyPayload, Version=0.0.0.0, ...`).
+    pub assembly_name: String,
+    /// Assembly load flags from the runtime (`0x2` = dynamic/in-memory,
+    /// `0x8` = collectible). In-memory loads always have bit `0x2` set.
+    pub flags: u32,
+}
+
 /// Outbound network connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectEvent {
@@ -266,6 +283,7 @@ pub enum Event {
     ImageLoad(ImageLoadEvent),
     ScriptBlock(ScriptBlockEvent),
     WmiActivity(WmiActivityEvent),
+    AssemblyLoad(AssemblyLoadEvent),
 }
 
 impl Event {
@@ -280,6 +298,7 @@ impl Event {
             Event::ImageLoad(e) => &e.meta,
             Event::ScriptBlock(e) => &e.meta,
             Event::WmiActivity(e) => &e.meta,
+            Event::AssemblyLoad(e) => &e.meta,
             // Non-exhaustive: new telemetry categories reach existing sinks without
             // a breaking change — consumers match variants they understand and
             // ignore the rest.

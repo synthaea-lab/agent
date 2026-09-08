@@ -8,8 +8,8 @@ use std::sync::{Arc, atomic::Ordering};
 
 use ferrisetw::{EventRecord, parser::Parser, provider::Provider, schema_locator::SchemaLocator};
 use schema::{
-    ConnectEvent, DnsQueryEvent, Event, ExecEvent, FileOpenEvent, ImageLoadEvent, RegistrySetEvent,
-    ScriptBlockEvent, WmiActivityEvent, sensor::EventSink,
+    AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, ExecEvent, FileOpenEvent,
+    ImageLoadEvent, RegistrySetEvent, ScriptBlockEvent, WmiActivityEvent, sensor::EventSink,
 };
 
 use crate::sensor::{SharedState, basename, meta};
@@ -26,6 +26,12 @@ const KERNEL_REGISTRY_GUID: &str = "70EB4F03-C1DE-4F73-A051-33D13D5413BD";
 const POWERSHELL_GUID: &str = "A0C1853B-5C40-4B15-8766-3CF1C58F985A";
 /// Microsoft-Windows-WMI-Activity
 const WMI_ACTIVITY_GUID: &str = "1418EF04-B0B4-4623-BF7E-D74AB47BBDAA";
+/// Microsoft-Windows-DotNETRuntime (Assembly keyword, EID 154 `AssemblyLoad`)
+const DOTNET_RUNTIME_GUID: &str = "e13c0d23-ccbc-4e12-931b-d9cc2eee27e4";
+
+/// `AssemblyFlags` bit indicating a dynamic (in-memory) assembly load.
+/// File-backed assemblies are high-volume noise; only dynamic loads are forwarded.
+const ASSEMBLY_FLAG_DYNAMIC: u32 = 0x2;
 
 pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
@@ -508,6 +514,63 @@ pub(crate) fn wmi_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
     };
 
     Provider::by_guid(WMI_ACTIVITY_GUID)
+        .add_callback(callback)
+        .build()
+}
+
+/// In-memory .NET assembly loads (EID 154 — `AssemblyLoad`) from
+/// `Microsoft-Windows-DotNETRuntime`.
+///
+/// Only dynamic (in-memory) assemblies are forwarded (`flags & 0x2 != 0`).
+/// File-backed loads are high-volume noise (every .NET app triggers dozens on
+/// startup) with almost no detection value at this tier. Dynamic loads are rare
+/// in legitimate software and are the hallmark of execute-assembly / fileless
+/// .NET injection (T1620, T1055).
+///
+/// # Field notes (Windows Server 2022, 2026-09-07)
+///
+/// EID 154: `AssemblyID` (u64, opaque), `AssemblyFlags` (u32, 0x2 = dynamic),
+/// `FullyQualifiedAssemblyName` (String, e.g.
+/// `MyPayload, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null`).
+/// PID comes from the record header.
+pub(crate) fn dotnet_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
+    let callback = move |record: &EventRecord, locator: &SchemaLocator| {
+        // EID 154 = AssemblyLoad — the only EID that carries assembly identity.
+        if record.event_id() != 154 {
+            return;
+        }
+        let Ok(schema_def) = locator.event_schema(record) else {
+            return;
+        };
+        let parser = Parser::create(record, &schema_def);
+
+        let flags: u32 = parser.try_parse("AssemblyFlags").unwrap_or(0);
+        // Drop file-backed assemblies — only in-memory loads have detection value.
+        if flags & ASSEMBLY_FLAG_DYNAMIC == 0 {
+            return;
+        }
+
+        state.events_seen.fetch_add(1, Ordering::Relaxed);
+
+        let assembly_name: String = parser
+            .try_parse("FullyQualifiedAssemblyName")
+            .unwrap_or_default();
+        if assembly_name.is_empty() {
+            return;
+        }
+
+        let pid = record.process_id();
+        let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
+        let comm = state.comm_for(pid).unwrap_or_default();
+
+        sink.on_event(Event::AssemblyLoad(AssemblyLoadEvent {
+            meta: meta(pid, 0, comm, timestamp_ns),
+            assembly_name,
+            flags,
+        }));
+    };
+
+    Provider::by_guid(DOTNET_RUNTIME_GUID)
         .add_callback(callback)
         .build()
 }
