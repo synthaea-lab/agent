@@ -14,8 +14,7 @@ use aya_ebpf::{
 };
 use aya_log_ebpf::{info, warn};
 use sensor_linux_wire::{
-    ConnectEvent, EventMeta, ExecEvent, FileOpenEvent, LineageEntry, MAX_CMDLINE_LEN, MAX_PATH_LEN,
-    TASK_COMM_LEN,
+    ConnectEvent, ExecEvent, FileOpenEvent, LineageEntry, MAX_CMDLINE_LEN, TASK_COMM_LEN,
 };
 
 // Parent lineage (ppid + parent comm) comes from tracepoint fields via `PROC_LINEAGE`
@@ -316,6 +315,10 @@ fn try_sched_process_exec(ctx: TracePointContext) -> Result<u32, u32> {
 #[map]
 static FILE_OPEN_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
+/// Per-CPU scratch for building one `FileOpenEvent` (see `EXEC_SCRATCH`).
+#[map]
+static OPEN_SCRATCH: PerCpuArray<FileOpenEvent> = PerCpuArray::with_max_entries(1, 0);
+
 /// Offsets of the `syscalls:sys_enter_openat` tracepoint (x86_64). Standard, stable format of
 /// the `syscalls:*` subsystem (documented, unlike `sched:*` tracepoints whose layout can vary
 /// more): an 8-byte common header, `__syscall_nr` (4 bytes + padding), then the syscall
@@ -364,42 +367,43 @@ fn try_sys_enter_openat(ctx: TracePointContext) -> Result<u32, u32> {
     #[cfg(bpf_target_arch = "x86")]
     let flags: i64 = unsafe { ctx.read_at::<i32>(OPENAT_FLAGS_OFFSET).map_err(|_| 1u32)? as i64 };
 
-    let mut event = FileOpenEvent {
-        meta: EventMeta {
-            pid: (bpf_get_current_pid_tgid() >> 32) as u32,
-            ppid: lineage_ppid(),
-            uid: aya_ebpf::helpers::bpf_get_current_uid_gid() as u32,
-            gid: (aya_ebpf::helpers::bpf_get_current_uid_gid() >> 32) as u32,
-            timestamp_ns: unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() },
-            comm: [0u8; TASK_COMM_LEN],
-        },
-        path: [0u8; MAX_PATH_LEN],
-        path_len: 0,
-        flags: flags as u32,
-    };
-
     let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
-    let comm_len = comm.len().min(TASK_COMM_LEN);
-    event.meta.comm[..comm_len].copy_from_slice(&comm[..comm_len]);
+    let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
 
-    if filename_ptr != 0 {
-        if let Ok(path) =
-            unsafe { bpf_probe_read_user_str_bytes(filename_ptr as *const u8, &mut event.path) }
-        {
-            event.path_len = path.len() as u16;
+    // Assemble in per-CPU scratch, then one `output` copy — a struct literal on
+    // the stack leaves interior padding uninitialised, and `entry.write` copying
+    // that into the ring buffer is rejected by the verifier on pre-6.6 kernels.
+    let e = OPEN_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
+    unsafe {
+        core::ptr::write_bytes(e, 0, 1);
+
+        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*e).meta.ppid = lineage_ppid();
+        (*e).meta.uid = uid_gid as u32;
+        (*e).meta.gid = (uid_gid >> 32) as u32;
+        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+        let mut i = 0usize;
+        while i < TASK_COMM_LEN {
+            (*e).meta.comm[i] = comm[i];
+            i += 1;
+        }
+        (*e).flags = flags as u32;
+
+        if filename_ptr != 0 {
+            if let Ok(path) =
+                bpf_probe_read_user_str_bytes(filename_ptr as *const u8, &mut (*e).path)
+            {
+                (*e).path_len = path.len() as u16;
+            }
+        }
+
+        if FILE_OPEN_EVENTS.output::<FileOpenEvent>(&*e, 0).is_err() {
+            warn!(
+                &ctx,
+                "sensor-linux-ebpf: ring buffer full, dropping open event"
+            );
         }
     }
-
-    let Some(mut entry) = FILE_OPEN_EVENTS.reserve::<FileOpenEvent>(0) else {
-        warn!(
-            &ctx,
-            "sensor-linux-ebpf: ring buffer full, dropping open event"
-        );
-        return Ok(0);
-    };
-
-    entry.write(event);
-    entry.submit(0);
 
     Ok(0)
 }
@@ -407,6 +411,10 @@ fn try_sys_enter_openat(ctx: TracePointContext) -> Result<u32, u32> {
 /// Ring buffer shared with userspace for `connect` events.
 #[map]
 static CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Per-CPU scratch for building one `ConnectEvent` (see `EXEC_SCRATCH`).
+#[map]
+static CONNECT_SCRATCH: PerCpuArray<ConnectEvent> = PerCpuArray::with_max_entries(1, 0);
 
 /// Offsets of the `syscalls:sys_enter_connect` tracepoint (x86_64). Same stable layout as
 /// `sys_enter_openat` (see above): 8-byte common header, `__syscall_nr`, then the arguments
@@ -462,58 +470,58 @@ fn try_sys_enter_connect(ctx: TracePointContext) -> Result<u32, u32> {
         return Ok(0);
     }
 
-    let mut event = ConnectEvent {
-        meta: EventMeta {
-            pid: (bpf_get_current_pid_tgid() >> 32) as u32,
-            ppid: lineage_ppid(),
-            uid: aya_ebpf::helpers::bpf_get_current_uid_gid() as u32,
-            gid: (aya_ebpf::helpers::bpf_get_current_uid_gid() >> 32) as u32,
-            timestamp_ns: unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() },
-            comm: [0u8; TASK_COMM_LEN],
-        },
-        daddr_v4: [0u8; 4],
-        daddr_v6: [0u8; 16],
-        dport: 0,
-        is_ipv6: family == AF_INET6,
-    };
-
     let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
-    let comm_len = comm.len().min(TASK_COMM_LEN);
-    event.meta.comm[..comm_len].copy_from_slice(&comm[..comm_len]);
+    let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
 
-    // `sin_port`/`sin6_port`: same offset (2) in both structs, in network byte order
-    // (big-endian) — hence the `from_be`.
+    // `sin_port`/`sin6_port`: same offset (2) in both structs, network byte order.
     let port_be: u16 =
         unsafe { bpf_probe_read_user((uservaddr_ptr + 2) as *const u16).map_err(|_| 1u32)? };
-    event.dport = u16::from_be(port_be);
-
-    if family == AF_INET {
-        // sockaddr_in::sin_addr at offset 4. Read as raw bytes ([u8; 4]), not as u32: a
-        // `bpf_probe_read_user::<u32>` interprets the bytes in native endianness (LE on
-        // x86_64), which reverses the address's byte order when displayed (bug observed under
-        // real conditions on 2026-08-13: 127.0.0.11 displayed as "11.0.0.127").
-        event.daddr_v4 = unsafe {
-            bpf_probe_read_user((uservaddr_ptr + 4) as *const [u8; 4]).map_err(|_| 1u32)?
-        };
+    // Address bytes read raw ([u8; N]), not as an integer: `bpf_probe_read_user::<u32>`
+    // would apply native (LE) endianness and reverse the displayed address (observed
+    // 2026-08-13: 127.0.0.11 shown as "11.0.0.127"). sockaddr_in::sin_addr at +4,
+    // sockaddr_in6::sin6_addr at +8.
+    let (v4, v6): ([u8; 4], [u8; 16]) = if family == AF_INET {
+        (
+            unsafe { bpf_probe_read_user((uservaddr_ptr + 4) as *const [u8; 4]).map_err(|_| 1u32)? },
+            [0u8; 16],
+        )
     } else {
-        // sockaddr_in6::sin6_addr at offset 8 (after sin6_family, sin6_port, sin6_flowinfo).
-        event.daddr_v6 = unsafe {
-            bpf_probe_read_user((uservaddr_ptr + 8) as *const [u8; 16]).map_err(|_| 1u32)?
-        };
-    }
-
-    let Some(mut entry) = CONNECT_EVENTS.reserve::<ConnectEvent>(0) else {
-        warn!(
-            &ctx,
-            "sensor-linux-ebpf: ring buffer full, dropping connect event"
-        );
-        return Ok(0);
+        (
+            [0u8; 4],
+            unsafe { bpf_probe_read_user((uservaddr_ptr + 8) as *const [u8; 16]).map_err(|_| 1u32)? },
+        )
     };
 
-    entry.write(event);
-    entry.submit(0);
+    // Assemble in per-CPU scratch, then one `output` copy (see `try_sys_enter_openat`).
+    let e = CONNECT_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
+    let pid = unsafe {
+        core::ptr::write_bytes(e, 0, 1);
 
-    info!(&ctx, "sensor-linux-ebpf: connect pid={}", event.meta.pid);
+        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*e).meta.ppid = lineage_ppid();
+        (*e).meta.uid = uid_gid as u32;
+        (*e).meta.gid = (uid_gid >> 32) as u32;
+        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+        let mut i = 0usize;
+        while i < TASK_COMM_LEN {
+            (*e).meta.comm[i] = comm[i];
+            i += 1;
+        }
+        (*e).is_ipv6 = family == AF_INET6;
+        (*e).dport = u16::from_be(port_be);
+        (*e).daddr_v4 = v4;
+        (*e).daddr_v6 = v6;
+
+        if CONNECT_EVENTS.output::<ConnectEvent>(&*e, 0).is_err() {
+            warn!(
+                &ctx,
+                "sensor-linux-ebpf: ring buffer full, dropping connect event"
+            );
+        }
+        (*e).meta.pid
+    };
+
+    info!(&ctx, "sensor-linux-ebpf: connect pid={}", pid);
     Ok(0)
 }
 
