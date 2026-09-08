@@ -53,6 +53,82 @@ pub fn name_exclusion_applies(image_path: Option<&str>) -> bool {
     }
 }
 
+/// Expected parent processes for commonly-impersonated Windows system processes.
+///
+/// Returns the allowed parent `comm` values (basename, case-insensitive) for a
+/// given process name. An empty slice means "no expectation — any parent is
+/// acceptable" (e.g. user-space apps, or processes with legitimately variable
+/// parents). Source: Windows process-tree documented in Microsoft documentation +
+/// lab observations.
+///
+/// Note: the `System` pseudo-process (pid=4) is the implicit parent of `smss.exe`
+/// at boot — represented here as `"system"`.
+#[must_use]
+pub fn expected_parents(comm: &str) -> &'static [&'static str] {
+    let name = comm.rsplit('\\').next().unwrap_or(comm);
+    match name.to_ascii_lowercase().as_str() {
+        // Session Manager → spawned by System at boot only.
+        "smss.exe" => &["system"],
+        // Client/Server Runtime → spawned by smss.exe.
+        "csrss.exe" => &["smss.exe"],
+        // Windows Initialization → spawned by smss.exe.
+        "wininit.exe" => &["smss.exe"],
+        // Windows Logon → spawned by smss.exe (one per session).
+        "winlogon.exe" => &["smss.exe"],
+        // Service Control Manager and its children.
+        "services.exe" => &["wininit.exe"],
+        // svchost is exclusively spawned by services.exe (or services.exe via
+        // svchost groups — but the direct parent is always services.exe).
+        "svchost.exe" => &["services.exe"],
+        // Task Host and Task Host Worker.
+        "taskhostw.exe" | "taskhost.exe" => &["services.exe", "svchost.exe"],
+        // Print Spooler.
+        "spoolsv.exe" => &["services.exe"],
+        // Local Security Authority Subsystem — spawned by wininit.exe.
+        // Key detection value: lsass.exe spawned from anywhere else = credential-theft
+        // (T1003, mimikatz injection) — never benign.
+        "lsass.exe" => &["wininit.exe"],
+        // User Initialization — spawned by winlogon.exe on interactive logon.
+        "userinit.exe" => &["winlogon.exe"],
+        // Explorer — spawned by userinit.exe (which then exits, leaving explorer
+        // as a child of the session's logon process).
+        "explorer.exe" => &["userinit.exe"],
+        // All other processes: no parent expectation (user apps, services with
+        // variable parents, Linux comms).
+        _ => &[],
+    }
+}
+
+/// Whether a parent-keyed exclusion applies, given the process `comm` and its
+/// parent `comm` as reported by the sensor.
+///
+/// Rules:
+/// - If `comm` has no parent expectation (`expected_parents` is empty): apply
+///   the exclusion regardless of parent.
+/// - If the parent is unknown/empty (sensor limitation, ETW race): keep the
+///   exclusion — a missing parent is not evidence of masquerade.
+/// - Otherwise: the parent's basename must appear in `expected_parents(comm)`.
+///
+/// Used alongside [`name_exclusion_applies`]: both must return `true` for an
+/// exclusion to hold. Either failing alone is enough to trigger the masquerade
+/// flag.
+#[must_use]
+pub fn parent_exclusion_applies(comm: &str, parent_comm: Option<&str>) -> bool {
+    let expected = expected_parents(comm);
+    if expected.is_empty() {
+        return true;
+    }
+    match parent_comm {
+        None | Some("") => true, // sensor limitation — not evidence of masquerade
+        Some(parent) => {
+            let parent_name = parent.rsplit('\\').next().unwrap_or(parent);
+            expected
+                .iter()
+                .any(|&e| e.eq_ignore_ascii_case(parent_name))
+        }
+    }
+}
+
 #[cfg(test)]
 mod exclusion_tests {
     use super::*;
@@ -81,5 +157,65 @@ mod exclusion_tests {
         assert!(name_exclusion_applies(None));
         assert!(name_exclusion_applies(Some("")));
         assert!(!name_exclusion_applies(Some("/tmp/svchost.exe")));
+    }
+
+    // ── parent_exclusion_applies ──────────────────────────────────────────
+
+    #[test]
+    fn svchost_from_services_is_legitimate() {
+        assert!(parent_exclusion_applies("svchost.exe", Some("services.exe")));
+    }
+
+    #[test]
+    fn svchost_from_cmd_is_masquerade() {
+        assert!(!parent_exclusion_applies("svchost.exe", Some("cmd.exe")));
+    }
+
+    #[test]
+    fn svchost_from_powershell_is_masquerade() {
+        assert!(!parent_exclusion_applies(
+            "svchost.exe",
+            Some("powershell.exe")
+        ));
+    }
+
+    #[test]
+    fn lsass_from_wininit_is_legitimate() {
+        assert!(parent_exclusion_applies("lsass.exe", Some("wininit.exe")));
+    }
+
+    #[test]
+    fn lsass_from_cmd_is_masquerade() {
+        // Classic mimikatz / credential-theft injection scenario.
+        assert!(!parent_exclusion_applies("lsass.exe", Some("cmd.exe")));
+    }
+
+    #[test]
+    fn unknown_parent_keeps_exclusion() {
+        // Sensor limitation (ETW race) — not evidence of masquerade.
+        assert!(parent_exclusion_applies("svchost.exe", None));
+        assert!(parent_exclusion_applies("svchost.exe", Some("")));
+    }
+
+    #[test]
+    fn process_with_no_expectation_allows_any_parent() {
+        // chrome.exe can be spawned by explorer, another chrome, etc.
+        assert!(parent_exclusion_applies("chrome.exe", Some("cmd.exe")));
+        assert!(parent_exclusion_applies("chrome.exe", None));
+    }
+
+    #[test]
+    fn parent_check_is_case_insensitive() {
+        assert!(parent_exclusion_applies("SVCHOST.EXE", Some("SERVICES.EXE")));
+        assert!(!parent_exclusion_applies("svchost.exe", Some("CMD.EXE")));
+    }
+
+    #[test]
+    fn full_path_in_parent_comm_is_handled() {
+        // ETW sometimes reports the full path rather than the basename.
+        assert!(parent_exclusion_applies(
+            "svchost.exe",
+            Some("C:\\Windows\\System32\\services.exe")
+        ));
     }
 }
