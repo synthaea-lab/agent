@@ -8,11 +8,21 @@
 use schema::{ConnectEvent, Event, EventMeta, ExecEvent, FileOpenEvent, User};
 use sensor_linux_wire as wire;
 
+/// Tripwire: bumping the wire ABI must come here to revisit the mappings below.
+const _: () = assert!(wire::WIRE_VERSION == 2);
+
 /// Decodes a fixed comm buffer: NUL-terminated, kernel-truncated to 15 bytes — a
 /// sensor property (reported by conformance), not a schema limit.
 fn comm_str(comm: &[u8; wire::TASK_COMM_LEN]) -> String {
     let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
     String::from_utf8_lossy(&comm[..end]).into_owned()
+}
+
+/// Same, but an empty buffer means "not captured" rather than the empty string —
+/// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
+fn comm_opt(comm: &[u8; wire::TASK_COMM_LEN]) -> Option<String> {
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+    (end != 0).then(|| String::from_utf8_lossy(&comm[..end]).into_owned())
 }
 
 fn meta(meta: &wire::EventMeta, boot_epoch_offset_ns: u64) -> EventMeta {
@@ -28,12 +38,20 @@ fn meta(meta: &wire::EventMeta, boot_epoch_offset_ns: u64) -> EventMeta {
     }
 }
 
-/// The wire cmdline is the raw argv buffer (`\0`-separated). Schema wants both the
-/// argv vector and a single display cmdline; `image_path` is best-effort `argv[0]`
-/// until the probes capture the resolved image path (a `\0`-terminated buffer can
-/// carry a trailing empty element — filtered).
+/// `image_path` is the authoritative image the kernel loaded (`ExecEvent::image`, from
+/// the `sched_process_exec` tracepoint), never `argv[0]`. `cmdline`/`argv` come from
+/// the `mm->arg_*` blob (`\0`-separated; a trailing empty element from the terminating
+/// NUL is filtered). `parent_comm` is the fork-lineage entry, or `None` when the
+/// parent predated the probe and priming missed it.
 #[must_use]
 pub fn exec(event: &wire::ExecEvent, boot_epoch_offset_ns: u64) -> Event {
+    let image_raw = &event.image[..(event.image_len as usize).min(wire::MAX_PATH_LEN)];
+    let image_end = image_raw
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(image_raw.len());
+    let image_path = String::from_utf8_lossy(&image_raw[..image_end]).into_owned();
+
     let raw = &event.cmdline[..(event.cmdline_len as usize).min(wire::MAX_CMDLINE_LEN)];
     let argv: Vec<String> = raw
         .split(|&b| b == 0)
@@ -42,12 +60,11 @@ pub fn exec(event: &wire::ExecEvent, boot_epoch_offset_ns: u64) -> Event {
         .collect();
     Event::Exec(ExecEvent {
         meta: meta(&event.meta, boot_epoch_offset_ns),
-        image_path: argv.first().cloned().unwrap_or_default(),
+        image_path,
         cmdline: argv.join(" "),
         argv,
-        // The probes read real_parent->tgid but not the parent comm yet — lineage
-        // stays None until the probe captures it (capabilities say so honestly).
-        parent_comm: None,
+        parent_comm: comm_opt(&event.pcomm),
+        // eBPF has the parent comm but not its full path — see #107.
         parent_image_path: None,
         sha256: None,
         signature: None,
@@ -96,22 +113,33 @@ mod tests {
         }
     }
 
+    fn wire_exec(image: &[u8], argv: &[u8], pcomm: &[u8]) -> wire::ExecEvent {
+        let mut image_buf = [0u8; wire::MAX_PATH_LEN];
+        image_buf[..image.len()].copy_from_slice(image);
+        let mut cmdline = [0u8; wire::MAX_CMDLINE_LEN];
+        cmdline[..argv.len()].copy_from_slice(argv);
+        let mut pcomm_buf = [0u8; wire::TASK_COMM_LEN];
+        pcomm_buf[..pcomm.len()].copy_from_slice(pcomm);
+        wire::ExecEvent {
+            meta: wire_meta(b"curl"),
+            image: image_buf,
+            image_len: image.len() as u16,
+            cmdline,
+            cmdline_len: argv.len() as u16,
+            pcomm: pcomm_buf,
+        }
+    }
+
     #[test]
     fn exec_splits_argv_and_joins_cmdline() {
-        let mut cmdline = [0u8; wire::MAX_CMDLINE_LEN];
-        let raw = b"curl\0-o\0/tmp/x\0";
-        cmdline[..raw.len()].copy_from_slice(raw);
-        let event = wire::ExecEvent {
-            meta: wire_meta(b"curl"),
-            cmdline,
-            cmdline_len: raw.len() as u16,
-        };
+        let event = wire_exec(b"/usr/bin/curl", b"curl\0-o\0/tmp/x\0", b"bash");
         let Event::Exec(e) = exec(&event, 500) else {
             panic!("wrong variant")
         };
         assert_eq!(e.argv, ["curl", "-o", "/tmp/x"]);
         assert_eq!(e.cmdline, "curl -o /tmp/x");
-        assert_eq!(e.image_path, "curl");
+        assert_eq!(e.image_path, "/usr/bin/curl");
+        assert_eq!(e.parent_comm.as_deref(), Some("bash"));
         assert_eq!(e.meta.timestamp_ns, 1_500, "boot offset applied");
         assert_eq!(
             e.meta.user,
@@ -120,6 +148,32 @@ mod tests {
                 gid: 1000
             }
         );
+    }
+
+    #[test]
+    fn exec_image_path_ignores_spoofed_argv0() {
+        // execve("/tmp/evil", {"/usr/sbin/sshd", ...}, ...)
+        let event = wire_exec(b"/tmp/evil", b"/usr/sbin/sshd\0-D\0", b"bash");
+        let Event::Exec(e) = exec(&event, 0) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(
+            e.image_path, "/tmp/evil",
+            "image is the kernel's, not argv[0]"
+        );
+        assert_eq!(
+            e.argv[0], "/usr/sbin/sshd",
+            "argv kept verbatim for analysis"
+        );
+    }
+
+    #[test]
+    fn exec_parent_comm_absent_when_lineage_missed() {
+        let event = wire_exec(b"/bin/sh", b"sh\0", b"");
+        let Event::Exec(e) = exec(&event, 0) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.parent_comm, None);
     }
 
     #[test]

@@ -14,12 +14,27 @@ use tokio::sync::Notify;
 
 use crate::normalize;
 
-/// The three tracepoints implemented to date: (program, category, name).
+/// The tracepoints implemented to date: (program, category, name). `sched_process_fork`
+/// and `sched_process_exit` maintain the `PROC_LINEAGE` map (parent pid/comm) that the
+/// other probes read — attach them first so it is populating before events flow.
 pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
+    ("sched_process_fork", "sched", "sched_process_fork"),
+    ("sched_process_exit", "sched", "sched_process_exit"),
     ("sched_process_exec", "sched", "sched_process_exec"),
     ("sys_enter_openat", "syscalls", "sys_enter_openat"),
     ("sys_enter_connect", "syscalls", "sys_enter_connect"),
 ];
+
+/// `sensor_linux_wire::LineageEntry` is `repr(C)` over a `u32` and a `[u8; 16]` — every
+/// bit pattern is valid, so it is plain-old-data. A transparent newtype carries the
+/// `aya::Pod` impl (the orphan rule forbids implementing it on the wire type directly).
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct PodLineage(sensor_linux_wire::LineageEntry);
+
+// SAFETY: see the doc comment above — POD, no padding invariants, no invalid bit
+// patterns.
+unsafe impl aya::Pod for PodLineage {}
 
 fn err(msg: String) -> SensorError {
     msg.into()
@@ -110,6 +125,69 @@ fn attach_tracepoint(
     Ok(())
 }
 
+/// Splits a `/proc/<pid>/stat` line into `(ppid, comm)`. `comm` is parenthesised and
+/// may itself contain spaces and `)` (e.g. `(a )b)`), so the fields after it are read
+/// from the last `)`, not by whitespace-splitting the whole line.
+fn parse_stat_ppid_comm(stat: &str) -> Option<(u32, &str)> {
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    let comm = stat.get(open + 1..close)?;
+    // After ") " comes: state (1 field), then ppid.
+    let rest = stat.get(close + 1..)?;
+    let mut fields = rest.split_whitespace();
+    let _state = fields.next()?;
+    let ppid: u32 = fields.next()?.parse().ok()?;
+    Some((ppid, comm))
+}
+
+/// Pre-fills the `PROC_LINEAGE` eBPF map with the processes already running, read from
+/// `/proc`. Without this, `ppid`/`parent_comm` are only known for processes that
+/// `fork()` *after* the probe attaches — every already-running service (nginx, sshd,
+/// systemd units started at boot) would report `ppid = 0`. Best-effort: a `/proc/<pid>`
+/// that vanishes mid-scan is skipped; a full map stops the scan. There is a small race
+/// window (a process forking between this scan and the `sched_process_fork` attach) —
+/// accepted, it self-heals on that process's next child.
+fn prime_proc_lineage(ebpf: &mut aya::Ebpf) -> Result<u32, SensorError> {
+    let map = ebpf
+        .map_mut("PROC_LINEAGE")
+        .ok_or_else(|| err("map PROC_LINEAGE not found in eBPF object".to_string()))?;
+    let mut lineage: aya::maps::HashMap<_, u32, PodLineage> = aya::maps::HashMap::try_from(map)
+        .map_err(|e| err(format!("PROC_LINEAGE is not a hash map: {e}")))?;
+
+    let entries = std::fs::read_dir("/proc").map_err(|e| err(format!("read /proc: {e}")))?;
+    let mut primed = 0u32;
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read(entry.path().join("stat")) else {
+            continue;
+        };
+        let Ok(stat) = std::str::from_utf8(&stat) else {
+            continue;
+        };
+        let Some((ppid, comm)) = parse_stat_ppid_comm(stat) else {
+            continue;
+        };
+        let mut val = sensor_linux_wire::LineageEntry {
+            ppid,
+            comm: [0u8; sensor_linux_wire::TASK_COMM_LEN],
+        };
+        let bytes = comm.as_bytes();
+        let n = bytes.len().min(sensor_linux_wire::TASK_COMM_LEN);
+        val.comm[..n].copy_from_slice(&bytes[..n]);
+
+        if lineage.insert(pid, PodLineage(val), 0).is_ok() {
+            primed += 1;
+        }
+    }
+    Ok(primed)
+}
+
 /// Difference between the epoch clock and `CLOCK_MONOTONIC` (which the probes stamp
 /// events with), computed once at startup — see `normalize`.
 fn boot_epoch_offset_ns() -> u64 {
@@ -190,6 +268,15 @@ impl LinuxSensor {
             }
         }
 
+        // Seed parent lineage from /proc *before* attaching, so already-running
+        // processes are known from the first event (see `prime_proc_lineage`).
+        match prime_proc_lineage(&mut ebpf) {
+            Ok(n) => log::info!("sensor-linux: primed {n} processes into PROC_LINEAGE"),
+            Err(e) => warn!(
+                "sensor-linux: PROC_LINEAGE priming failed ({e}) — ppid known only for post-attach forks"
+            ),
+        }
+
         for (program, category, name) in TRACEPOINTS {
             attach_tracepoint(&mut ebpf, program, category, name)?;
         }
@@ -237,15 +324,16 @@ impl Sensor for LinuxSensor {
         "linux-ebpf"
     }
 
-    /// All three tracepoints are attached in `run_async`, and every event carries
-    /// uid/gid from `bpf_get_current_uid_gid` — capabilities reflect that.
+    /// Every event carries uid/gid from `bpf_get_current_uid_gid` and a `ppid` from the
+    /// `PROC_LINEAGE` fork-tracking map (`/proc`-primed at startup); exec events also
+    /// carry the parent `comm`. `parent_lineage` reflects that.
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             exec_events: true,
             file_events: true,
             connect_events: true,
             user_attribution: true,
-            parent_lineage: false,
+            parent_lineage: true,
         }
     }
 
@@ -262,5 +350,36 @@ impl Sensor for LinuxSensor {
     /// orchestrating shutdown); the CLI path still relies on Ctrl-C.
     fn stop(&mut self) {
         self.stop.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_stat_ppid_comm;
+
+    #[test]
+    fn stat_simple() {
+        let stat = "1234 (bash) S 1000 1234 1234 34816 1789 4194304 ...";
+        assert_eq!(parse_stat_ppid_comm(stat), Some((1000, "bash")));
+    }
+
+    #[test]
+    fn stat_comm_with_spaces_and_parens() {
+        // The kernel does not sanitise comm; `)` and spaces inside it are why the
+        // fields are read from the last `)`, not by splitting the whole line.
+        let stat = "42 (a ) b) S 7 42 42 0 -1 4194560 100 0 0 0";
+        assert_eq!(parse_stat_ppid_comm(stat), Some((7, "a ) b")));
+    }
+
+    #[test]
+    fn stat_kernel_thread_ppid_zero() {
+        let stat = "2 (kthreadd) S 0 0 0 0 -1 2129984 0 0";
+        assert_eq!(parse_stat_ppid_comm(stat), Some((0, "kthreadd")));
+    }
+
+    #[test]
+    fn stat_garbage_is_none() {
+        assert_eq!(parse_stat_ppid_comm("not a stat line"), None);
+        assert_eq!(parse_stat_ppid_comm("123 (x) S notanumber"), None);
     }
 }

@@ -37,7 +37,7 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
     if std::path::Path::new(btf_path).exists() {
         println!("[OK]   kernel BTF present ({btf_path})");
     } else {
-        println!("[FAIL] kernel BTF missing ({btf_path}) — task_struct reads (ppid) will fail");
+        println!("[FAIL] kernel BTF missing ({btf_path}) — the eBPF probes cannot load");
     }
 
     if let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease") {
