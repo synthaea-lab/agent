@@ -358,6 +358,92 @@ fn dns_tunnelling_alerts_once_per_window() {
     );
 }
 
+// ── R6: assembly + connect (T1055/T1620) ─────────────────────────────────
+
+#[test]
+fn assembly_load_then_connect_alerts() {
+    // Execute-assembly pattern: in-memory .NET loaded, then C2 call-back.
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(assembly_load_event(500, 1_000_000_000));
+    let alerts = engine.on_event(connect_event(500, 2_000_000_000));
+    assert!(
+        alerts.iter().any(|a| a.technique == "T1055/T1620"),
+        "assembly + connect should alert: {alerts:?}"
+    );
+}
+
+#[test]
+fn assembly_load_without_connect_no_alert() {
+    let mut engine = CorrelationEngine::new();
+    let alerts = engine.on_event(assembly_load_event(500, 1_000_000_000));
+    assert!(
+        !alerts.iter().any(|a| a.technique == "T1055/T1620"),
+        "assembly alone should not alert: {alerts:?}"
+    );
+}
+
+// ── R7: exec + smb (T1021.002) ───────────────────────────────────────────
+
+#[test]
+fn exec_then_smb_alerts() {
+    // psexec-style: process spawns and immediately connects over SMB.
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(exec_event(600, 1_000_000_000));
+    let alerts = engine.on_event(smb_connect_event(600, 2_000_000_000));
+    assert!(
+        alerts.iter().any(|a| a.technique == "T1021.002"),
+        "exec + smb should alert: {alerts:?}"
+    );
+}
+
+#[test]
+fn smb_without_exec_no_lateral_movement_alert() {
+    // SMB connection from a process we never saw exec — no alert from R7.
+    let mut engine = CorrelationEngine::new();
+    let alerts = engine.on_event(smb_connect_event(600, 1_000_000_000));
+    assert!(
+        !alerts.iter().any(|a| a.technique == "T1021.002"),
+        "smb alone should not trigger exec+smb rule: {alerts:?}"
+    );
+}
+
+// ── R8: assembly + smb (T1021.002/T1055) ─────────────────────────────────
+
+#[test]
+fn assembly_then_smb_alerts_fileless_lateral() {
+    // Fileless lateral movement: in-memory implant connects over SMB — no
+    // ExecEvent in sight. Hardest pattern to detect without both sensors.
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(assembly_load_event(700, 1_000_000_000));
+    let alerts = engine.on_event(smb_connect_event(700, 2_000_000_000));
+    assert!(
+        alerts.iter().any(|a| a.technique == "T1021.002/T1055"),
+        "assembly + smb should alert: {alerts:?}"
+    );
+}
+
+#[test]
+fn assembly_smb_masks_exec_smb_subset() {
+    // When the full fileless chain fires, exec+smb must not also fire
+    // (superset-first ordering in evaluate(), mirroring complete_chain_masks_plain).
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(exec_event(700, 1_000_000_000));
+    engine.on_event(assembly_load_event(700, 2_000_000_000));
+    let alerts = engine.on_event(smb_connect_event(700, 3_000_000_000));
+    let exec_smb_count = alerts
+        .iter()
+        .filter(|a| a.technique == "T1021.002" && !a.technique.contains("/T1055"))
+        .count();
+    assert_eq!(
+        exec_smb_count, 0,
+        "exec+smb must not fire when assembly+smb already fired: {alerts:?}"
+    );
+    assert!(
+        alerts.iter().any(|a| a.technique == "T1021.002/T1055"),
+        "assembly+smb alert missing: {alerts:?}"
+    );
+}
+
 #[test]
 fn eviction_outside_window() {
     let window = Duration::from_secs(10);

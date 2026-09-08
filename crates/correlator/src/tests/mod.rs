@@ -5,7 +5,10 @@
 
 use std::time::Duration;
 
-use schema::{ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileOpenEvent, User};
+use schema::{
+    AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileOpenEvent,
+    SmbConnectEvent, User,
+};
 
 use crate::{CorrelationEngine, bayes::PRIOR_LOG_ODDS};
 
@@ -69,6 +72,22 @@ fn file_read_event(pid: u32, ts_ns: u64) -> Event {
         meta: meta(pid, ts_ns),
         path: String::new(),
         flags: 0o0, // O_RDONLY
+    })
+}
+
+fn assembly_load_event(pid: u32, ts_ns: u64) -> Event {
+    Event::AssemblyLoad(AssemblyLoadEvent {
+        meta: meta(pid, ts_ns),
+        assembly_name: "MyPayload, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
+            .to_string(),
+        flags: 0x2, // dynamic / in-memory
+    })
+}
+
+fn smb_connect_event(pid: u32, ts_ns: u64) -> Event {
+    Event::SmbConnect(SmbConnectEvent {
+        meta: meta(pid, ts_ns),
+        server_name: r"\\WIN-TARGET".to_string(),
     })
 }
 

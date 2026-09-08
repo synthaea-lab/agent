@@ -179,6 +179,127 @@ const DNS_TUNNEL_MIN_QUERIES: usize = 10;
 const DNS_TUNNEL_LABEL_MIN_LEN: usize = 30;
 const DNS_TUNNEL_LABEL_MIN_ENTROPY: f64 = 3.5;
 
+// ── New-telemetry rules (AssemblyLoad, SmbConnect) ───────────────────────────
+
+/// T1055/T1620 — In-memory .NET assembly loaded by a process that also opens a
+/// network connection within the same window. Classic execute-assembly → C2
+/// pattern (Cobalt Strike's `execute-assembly`, `SharpC2`, etc.): the implant
+/// loads an unsigned assembly from memory, runs it, and calls back over TCP.
+///
+/// The rule fires on (`AssemblyLoad` + `Connect`) co-occurrence by pid; order is
+/// unconstrained because beaconing may start before the assembly is invoked
+/// (pre-staged implant) or immediately after (on-demand loader).
+///
+/// Noise guard: `DotNETRuntime` EID 154 is already filtered to dynamic
+/// (in-memory) assemblies by the sensor — file-backed .NET loads never reach
+/// the bus, so no additional filter is needed here.
+pub(crate) fn rule_assembly_connect(pid: u32, bus: &EventBus) -> Option<CorrelationAlert> {
+    let events: Vec<&Event> = bus.events_for_pid(pid).collect();
+
+    let has_assembly = events.iter().any(|e| matches!(e, Event::AssemblyLoad(_)));
+    let has_connect = events.iter().any(|e| matches!(e, Event::Connect(_)));
+
+    if has_assembly && has_connect {
+        let assembly_name = events.iter().find_map(|e| {
+            if let Event::AssemblyLoad(a) = e {
+                Some(a.assembly_name.as_str())
+            } else {
+                None
+            }
+        });
+        Some(CorrelationAlert {
+            technique: "T1055/T1620",
+            message: format!(
+                "pid={pid}: in-memory .NET assembly + network connection — suspected execute-assembly C2{}",
+                assembly_name
+                    .map(|n| format!(" (assembly: {n})"))
+                    .unwrap_or_default()
+            ),
+        })
+    } else {
+        None
+    }
+}
+
+/// T1021.002 — A process spawns (`ExecEvent`) AND connects to a remote SMB server
+/// within the same window. Covers psexec-style lateral movement: the attacker
+/// starts a process (psexec, cmd, net, wmic) and it immediately connects over SMB.
+///
+/// Correlation is by pid: the exec and the SMB connection must come from the same
+/// process, not a parent/child pair — psexec initiates both from the same pid.
+pub(crate) fn rule_exec_smb(pid: u32, bus: &EventBus) -> Option<CorrelationAlert> {
+    let events: Vec<&Event> = bus.events_for_pid(pid).collect();
+
+    let has_exec = events.iter().any(|e| matches!(e, Event::Exec(_)));
+    let has_smb = events.iter().any(|e| matches!(e, Event::SmbConnect(_)));
+
+    if has_exec && has_smb {
+        let server = events.iter().find_map(|e| {
+            if let Event::SmbConnect(s) = e {
+                Some(s.server_name.as_str())
+            } else {
+                None
+            }
+        });
+        Some(CorrelationAlert {
+            technique: "T1021.002",
+            message: format!(
+                "pid={pid}: process spawn + SMB connection — suspected lateral movement{}",
+                server
+                    .map(|s| format!(" (server: {s})"))
+                    .unwrap_or_default()
+            ),
+        })
+    } else {
+        None
+    }
+}
+
+/// T1021.002/T1055 — An in-memory .NET assembly AND an SMB connection from the same
+/// pid within the window. This is the hardest-to-detect lateral movement pattern:
+/// a fileless implant (no exe on disk) that moves laterally over SMB. Examples:
+/// Cobalt Strike `jump psexec` via `SharpWMI`, Metasploit psexec via in-memory PE.
+///
+/// Unlike `rule_exec_smb`, there is no `ExecEvent` requirement — the implant may
+/// already be injected and only emits an `AssemblyLoad`. The combination
+/// (`AssemblyLoad`, `SmbConnect`) by the same pid is a high-confidence signal with
+/// virtually no legitimate equivalent.
+pub(crate) fn rule_assembly_smb(pid: u32, bus: &EventBus) -> Option<CorrelationAlert> {
+    let events: Vec<&Event> = bus.events_for_pid(pid).collect();
+
+    let has_assembly = events.iter().any(|e| matches!(e, Event::AssemblyLoad(_)));
+    let has_smb = events.iter().any(|e| matches!(e, Event::SmbConnect(_)));
+
+    if has_assembly && has_smb {
+        let assembly_name = events.iter().find_map(|e| {
+            if let Event::AssemblyLoad(a) = e {
+                Some(a.assembly_name.as_str())
+            } else {
+                None
+            }
+        });
+        let server = events.iter().find_map(|e| {
+            if let Event::SmbConnect(s) = e {
+                Some(s.server_name.as_str())
+            } else {
+                None
+            }
+        });
+        Some(CorrelationAlert {
+            technique: "T1021.002/T1055",
+            message: format!(
+                "pid={pid}: in-memory .NET assembly + SMB connection — suspected fileless lateral movement{}{}",
+                assembly_name
+                    .map(|n| format!(" (assembly: {n})"))
+                    .unwrap_or_default(),
+                server.map(|s| format!(" → {s}")).unwrap_or_default()
+            ),
+        })
+    } else {
+        None
+    }
+}
+
 /// Shannon entropy of `s` in bits per character (0.0 for the empty string).
 /// Encoded payload labels land around 4–5 bits/char (base32 ≈ 5 max); dictionary
 /// hostnames and CDN hashes sit well below `DNS_TUNNEL_LABEL_MIN_ENTROPY`.
