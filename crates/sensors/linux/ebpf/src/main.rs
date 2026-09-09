@@ -4,55 +4,29 @@
 use aya_ebpf::{
     EbpfContext,
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_task,
-        bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes, bpf_probe_read_user,
-        bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_kernel_str_bytes,
+        bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
     macros::{map, tracepoint},
     maps::{HashMap, PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
 use aya_log_ebpf::{info, warn};
-use sensor_linux_wire::{
-    ConnectEvent, ExecEvent, FileOpenEvent, LineageEntry, MAX_CMDLINE_LEN, TASK_COMM_LEN,
-};
+use sensor_linux_wire::{ConnectEvent, ExecEvent, FileOpenEvent, LineageEntry, TASK_COMM_LEN};
 
-// Parent lineage (ppid + parent comm) comes from tracepoint fields via `PROC_LINEAGE`
-// (issue #53) — no `real_parent` walk, so `read_ppid` and its per-kernel frozen
-// offsets are gone. The executed image comes from the `sched_process_exec` tracepoint
-// (issue #111). `cmdline` is still read from `mm->arg_start..arg_end` by frozen offset
-// (`vmlinux*` bindings on 64-bit, `i686_offsets` on i686), unchanged from before —
-// making that read portable too is tracked separately.
-#[allow(
-    dead_code,
-    non_camel_case_types,
-    non_snake_case,
-    non_upper_case_globals,
-    unsafe_op_in_unsafe_fn
-)]
-#[cfg(bpf_target_arch = "x86_64")]
-#[rustfmt::skip]
-mod vmlinux;
+// This probe reads NO `task_struct`/`mm_struct` frozen offset: parent lineage (ppid +
+// parent comm) comes from `sched_process_fork` tracepoint fields via `PROC_LINEAGE`
+// (issue #53), the executed image from the `sched_process_exec` tracepoint's
+// `__data_loc filename` (issue #111), and argv from `/proc/<pid>/cmdline` read by the
+// userspace loader (issue #152). No `vmlinux` BTF bindings, no per-kernel offset
+// table — every remaining read is a stable tracepoint field or a syscall argument.
 
-/// aarch64 bindings from the live BTF of an Ampere/Ubuntu-24.04 instance (kernel
-/// `6.17.0-1018-oracle`); 64-bit like x86_64, so standard struct reflection applies.
-#[allow(
-    dead_code,
-    non_camel_case_types,
-    non_snake_case,
-    non_upper_case_globals,
-    unsafe_op_in_unsafe_fn
-)]
-#[cfg(bpf_target_arch = "aarch64")]
-#[rustfmt::skip]
-mod vmlinux_aarch64;
-
-/// Ring buffer shared with userspace for `exec` events. `ExecEvent` (`image` +
-/// `cmdline`) is larger than the 512-byte eBPF stack, so it is assembled in the
-/// per-CPU `EXEC_SCRATCH` entry and emitted with a single `output` copy — the
-/// standard libbpf/Tetragon "heap map" pattern. Filling a reserved slot field by
-/// field instead needs per-byte loops over MAX_PATH_LEN / MAX_CMDLINE_LEN, which
-/// blow the verifier's 1M-instruction budget on pre-6.6 kernels (5.15, 6.1).
+/// Ring buffer shared with userspace for `exec` events. `ExecEvent` is assembled in
+/// the per-CPU `EXEC_SCRATCH` entry (not on the stack — `image` is `MAX_PATH_LEN`
+/// bytes) and emitted with a single `output` copy — the standard libbpf/Tetragon
+/// "heap map" pattern. Filling a reserved ring-buffer slot field by field instead
+/// needs per-byte loops over MAX_PATH_LEN, which blow the verifier's 1M-instruction
+/// budget on pre-6.6 kernels (5.15, 6.1).
 #[map]
 static EXEC_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
@@ -76,107 +50,6 @@ fn lineage_ppid() -> u32 {
         Some(entry) => entry.ppid,
         None => 0,
     }
-}
-
-/// Reads the argv blob (`\0`-separated argument strings) of the process being exec'd
-/// straight from its user memory: `mm->arg_start..arg_end`, the buffer the kernel
-/// places on the new stack at exec time — more robust than a deferred
-/// `/proc/{pid}/cmdline` read that would miss short-lived processes. Frozen
-/// `task_struct`/`mm_struct` offsets (BTF reflection on 64-bit, raw offsets on i686):
-/// correct on the kernel the bindings came from, a short/empty read elsewhere, never a
-/// crash. Making this portable is tracked separately — the lineage read (#53) no
-/// longer touches these offsets.
-///
-/// Writes `[0..len]` of `buf`; `buf` must be a **stack** buffer (`bpf_probe_read_user`
-/// only writes to stack, not to ring-buffer memory) and zero-initialised (the tail is
-/// left untouched). `None` for kernel threads (null `mm`) or read failure.
-#[cfg(bpf_target_arch = "x86_64")]
-#[inline(always)]
-fn read_argv(buf: &mut [u8; MAX_CMDLINE_LEN]) -> Option<u16> {
-    let task = unsafe { bpf_get_current_task() } as *const vmlinux::task_struct;
-    let mm: *const vmlinux::mm_struct =
-        unsafe { bpf_probe_read_kernel(core::ptr::addr_of!((*task).mm) as *const _).ok()? };
-    if mm.is_null() {
-        return None;
-    }
-    let arg_start: u64 = unsafe {
-        bpf_probe_read_kernel(core::ptr::addr_of!((*mm).__bindgen_anon_1.arg_start) as *const _)
-            .ok()?
-    };
-    let arg_end: u64 = unsafe {
-        bpf_probe_read_kernel(core::ptr::addr_of!((*mm).__bindgen_anon_1.arg_end) as *const _)
-            .ok()?
-    };
-    let len = arg_end
-        .saturating_sub(arg_start)
-        .min(MAX_CMDLINE_LEN as u64) as usize;
-    if len == 0 {
-        return None;
-    }
-    unsafe { bpf_probe_read_user_buf(arg_start as *const u8, &mut buf[..len]).ok()? };
-    Some(len as u16)
-}
-
-/// `task_struct`/`mm_struct` offsets for the i686 target (Debian 12 Bookworm, kernel
-/// `6.1.0-52-686-pae`), via `pahole` on the `-dbg` vmlinux. Specific to that kernel —
-/// regenerate if it changes. Raw offsets rather than `bindgen` reflection: on
-/// `bpfel-unknown-none` a `c_ulong`/pointer is always 8 bytes regardless of the target
-/// host arch, so 32-bit BTF-generated bindings would misplace every field.
-#[cfg(bpf_target_arch = "x86")]
-mod i686_offsets {
-    pub const TASK_MM_OFFSET: usize = 1008;
-    pub const MM_ARG_START_OFFSET: usize = 164;
-    pub const MM_ARG_END_OFFSET: usize = 168;
-}
-
-#[cfg(bpf_target_arch = "x86")]
-#[inline(always)]
-fn read_argv(buf: &mut [u8; MAX_CMDLINE_LEN]) -> Option<u16> {
-    use i686_offsets::{MM_ARG_END_OFFSET, MM_ARG_START_OFFSET, TASK_MM_OFFSET};
-    let task = unsafe { bpf_get_current_task() } as usize;
-    let mm: u32 = unsafe { bpf_probe_read_kernel((task + TASK_MM_OFFSET) as *const u32).ok()? };
-    if mm == 0 {
-        return None;
-    }
-    let arg_start: u32 =
-        unsafe { bpf_probe_read_kernel((mm as usize + MM_ARG_START_OFFSET) as *const u32).ok()? };
-    let arg_end: u32 =
-        unsafe { bpf_probe_read_kernel((mm as usize + MM_ARG_END_OFFSET) as *const u32).ok()? };
-    let len = arg_end
-        .saturating_sub(arg_start)
-        .min(MAX_CMDLINE_LEN as u32) as usize;
-    if len == 0 {
-        return None;
-    }
-    unsafe { bpf_probe_read_user_buf(arg_start as *const u8, &mut buf[..len]).ok()? };
-    Some(len as u16)
-}
-
-#[cfg(bpf_target_arch = "aarch64")]
-#[inline(always)]
-fn read_argv(buf: &mut [u8; MAX_CMDLINE_LEN]) -> Option<u16> {
-    let task = unsafe { bpf_get_current_task() } as *const vmlinux_aarch64::task_struct;
-    let mm: *const vmlinux_aarch64::mm_struct =
-        unsafe { bpf_probe_read_kernel(core::ptr::addr_of!((*task).mm) as *const _).ok()? };
-    if mm.is_null() {
-        return None;
-    }
-    let arg_start: u64 = unsafe {
-        bpf_probe_read_kernel(core::ptr::addr_of!((*mm).__bindgen_anon_1.arg_start) as *const _)
-            .ok()?
-    };
-    let arg_end: u64 = unsafe {
-        bpf_probe_read_kernel(core::ptr::addr_of!((*mm).__bindgen_anon_1.arg_end) as *const _)
-            .ok()?
-    };
-    let len = arg_end
-        .saturating_sub(arg_start)
-        .min(MAX_CMDLINE_LEN as u64) as usize;
-    if len == 0 {
-        return None;
-    }
-    unsafe { bpf_probe_read_user_buf(arg_start as *const u8, &mut buf[..len]).ok()? };
-    Some(len as u16)
 }
 
 // --- sched:sched_process_fork -------------------------------------------------------
@@ -251,15 +124,11 @@ fn try_sched_process_exec(ctx: TracePointContext) -> Result<u32, u32> {
     let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
     let timestamp_ns = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
 
-    // `cmdline` is bounced through the stack — `bpf_probe_read_user` reads best
-    // into a stack buffer — but it is the only stack value here now.
-    let mut cmdline = [0u8; MAX_CMDLINE_LEN];
-    let cmdline_len = read_argv(&mut cmdline).unwrap_or(0);
-
     // Assemble the event in per-CPU scratch, not on the stack and not field by
     // field in a reserved ring-buffer slot (that needs per-byte loops over
-    // MAX_PATH_LEN / MAX_CMDLINE_LEN, which blow the verifier's 1M-instruction
-    // budget on pre-6.6 kernels). One `output` copy emits it.
+    // MAX_PATH_LEN, which blow the verifier's 1M-instruction budget on pre-6.6
+    // kernels). One `output` copy emits it. argv is not read here — the userspace
+    // loader reads `/proc/<pid>/cmdline` on receipt (issue #152).
     let e = EXEC_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
@@ -292,12 +161,6 @@ fn try_sched_process_exec(ctx: TracePointContext) -> Result<u32, u32> {
         if let Ok(s) = bpf_probe_read_kernel_str_bytes(filename_src, &mut (*e).image) {
             (*e).image_len = s.len() as u16;
         }
-
-        // argv blob: one fixed-size copy of the stack buffer. `read_argv` wrote
-        // `[0..cmdline_len]`; the rest was zero-initialised (and so is the scratch
-        // entry, from the `write_bytes` above).
-        (*e).cmdline = cmdline;
-        (*e).cmdline_len = cmdline_len;
 
         if EXEC_EVENTS.output::<ExecEvent>(&*e, 0).is_err() {
             warn!(
