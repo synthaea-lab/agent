@@ -11,7 +11,18 @@
 //! eBPF stack is 512 bytes and events are built in place on it), not product limits —
 //! truncation at these bounds is a sensor property reported by conformance. Raising
 //! `MAX_CMDLINE_LEN` beyond the stack budget needs per-CPU scratch maps on the probe
-//! side (tracked with the sensor work, not by editing the constant).
+//! side (`ExecEvent` is already built in a `PerCpuArray` for this reason).
+
+/// Bumped on every layout-affecting change to the structs below. Not a wire header
+/// (ring-buffer items carry none) — a build-time tripwire: the userspace loader
+/// `const _`-asserts the value it was compiled against, so an ebpf/userspace version
+/// skew fails the build instead of misreading bytes at runtime.
+///
+/// - v1: initial exec/open/connect structs.
+/// - v2: `ExecEvent` gains `image`/`image_len` (authoritative image path from the
+///   tracepoint, issue #111) and `pcomm` (parent name from the fork-lineage map,
+///   issue #53). `cmdline` is unchanged (`mm->arg_*` blob).
+pub const WIRE_VERSION: u32 = 2;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
@@ -23,7 +34,10 @@ pub const MAX_CMDLINE_LEN: usize = 256;
 #[derive(Clone, Copy, Debug)]
 pub struct EventMeta {
     pub pid: u32,
-    /// Parent PID — read from `current_task->real_parent->tgid`.
+    /// Parent PID (`real_parent->tgid`). Since issue #53 this comes from the
+    /// `PROC_LINEAGE` fork-tracking map (`sched_process_fork` + `/proc` priming), not
+    /// a frozen-offset `task_struct` walk — `0` when the parent forked before the
+    /// probe attached and priming missed it.
     pub ppid: u32,
     pub uid: u32,
     pub gid: u32,
@@ -33,14 +47,38 @@ pub struct EventMeta {
     pub comm: [u8; TASK_COMM_LEN],
 }
 
-/// Process execution (`sched:sched_process_exec`). `cmdline` holds the argv buffer
-/// copied from `mm->arg_start..arg_end`: `\0`-separated argument strings.
+/// Process execution (`sched:sched_process_exec`, success only).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ExecEvent {
     pub meta: EventMeta,
+    /// Authoritative executed-image path: the kernel's `bprm->filename`, read from the
+    /// `sched_process_exec` tracepoint's `__data_loc filename` field. NOT `argv[0]`,
+    /// which the caller sets freely (`execve("/tmp/x", {"/usr/bin/sshd"}, …)`).
+    /// `\0`-terminated, truncated at `MAX_PATH_LEN` (a sensor property).
+    pub image: [u8; MAX_PATH_LEN],
+    pub image_len: u16,
+    /// argv, `\0`-separated, copied from `mm->arg_start..arg_end`. Caller-controlled —
+    /// display/analysis only, never an identity input. Empty for kernel threads or on
+    /// read failure (including a `task_struct`/`mm_struct` layout mismatch off the
+    /// binding kernel — see `read_argv` in the probe).
     pub cmdline: [u8; MAX_CMDLINE_LEN],
     pub cmdline_len: u16,
+    /// Parent short name at exec time, from the `PROC_LINEAGE` map. Empty when the
+    /// parent forked before the probe attached and `/proc` priming missed it.
+    pub pcomm: [u8; TASK_COMM_LEN],
+}
+
+/// Value of the `PROC_LINEAGE` fork-tracking map: a pid's parent identity, captured
+/// from `sched:sched_process_fork` (`parent_pid`/`parent_comm` tracepoint fields — no
+/// `task_struct` offsets) or primed from `/proc/<pid>/stat` at startup. Replaces the
+/// per-kernel frozen-offset `real_parent->tgid` walk that returned garbage off the
+/// binding kernel (issue #53). Also written from userspace, so the layout is shared.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LineageEntry {
+    pub ppid: u32,
+    pub comm: [u8; TASK_COMM_LEN],
 }
 
 /// File open (`syscalls:sys_enter_openat`). `path` is the raw path passed by the
