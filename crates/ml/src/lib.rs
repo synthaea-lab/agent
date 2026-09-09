@@ -10,8 +10,8 @@
 //!   shared golden fixture;
 //! - [`forest`] — tree structure parsed back out of the ONNX model, for per-feature
 //!   attribution (the explanation side of "never a bare score", `docs/detection/ml.md`);
-//! - [`scorer`] — [`CmdlineScorer`], which runs the model through `ort` and pairs each
-//!   score with its attribution.
+//! - [`scorer`] — [`CmdlineScorer`] (T0) and [`CorrelationScorer`] (T2), which run a
+//!   model through `ort` and pair each score with its attribution.
 
 mod proto;
 
@@ -20,4 +20,5 @@ pub mod forest;
 pub mod scorer;
 
 pub use forest::{Attribution, Forest, ParseError, top_attributions};
+pub use scorer::correlation::{CorrelationScorer, MIN_EVENT_COUNT, score_to_llr};
 pub use scorer::{CmdlineScorer, Score, ScorerError};
