@@ -1,11 +1,12 @@
-//! Correlation features for the T1 behavior scorer — the "multi-events per pid"
+//! Correlation features for the T2 behaviour scorer — the "multi-events per pid"
 //! vector, Rust mirror of `ml/synthaea_ml/features/correlation.py`.
 //!
 //! A second, complementary signal to [`super::cmdline`], never merged into one model
 //! (2026-08-27 decision): the two vectors differ in temporal availability (a cmdline
 //! is ready the instant an `Exec` arrives; this one only once the correlator window
-//! is populated) and in statistical nature. Same parity discipline as the cmdline
-//! seam — locked by `ml/tests/fixtures/correlation_golden.jsonl`.
+//! is populated) and in statistical nature. Parity with the Python definition is
+//! pinned end-to-end by `crates/ml/tests/capture_parity.rs` (a real `events.jsonl`
+//! capture → these vectors, checked against the Python aggregator's output).
 //!
 //! No trained model ships against this yet: it needs a dedicated benign multi-event
 //! capture campaign (#44), not the isolated-cmdline baselines we have. The extractor
@@ -43,12 +44,24 @@ pub const FEATURE_NAMES: [&str; 8] = [
     "event_count",
 ];
 
+/// Event variants this vector is built from — process spawn, outbound connect, file
+/// open. `span_s` and `event_count` are computed over these only: the Python
+/// aggregator (`aggregate_correlation._flatten`, `RAW_EVENT_TYPES`) drops every other
+/// category before windowing, so counting e.g. a `DnsQuery` here would silently
+/// inflate both features relative to the training vectors.
+fn is_modeled(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Exec(_) | Event::Connect(_) | Event::FileOpen(_)
+    )
+}
+
 /// The 8-feature correlation vector for `pid` over the bus's current window, in
 /// [`FEATURE_NAMES`] order. Pid filtering happens here (mirror of the Python side
 /// taking the whole window), via [`EventBus::events_for_pid`].
 #[must_use]
 pub fn extract_features(bus: &EventBus, pid: u32) -> [f32; 8] {
-    let events: Vec<&Event> = bus.events_for_pid(pid).collect();
+    let events: Vec<&Event> = bus.events_for_pid(pid).filter(|e| is_modeled(e)).collect();
 
     let spawn_count = events
         .iter()
@@ -99,7 +112,7 @@ pub fn extract_features(bus: &EventBus, pid: u32) -> [f32; 8] {
 mod tests {
     use std::time::Duration;
 
-    use schema::{ConnectEvent, EventMeta, ExecEvent, FileOpenEvent, User};
+    use schema::{ConnectEvent, DnsQueryEvent, EventMeta, ExecEvent, FileOpenEvent, User};
 
     use super::*;
 
@@ -175,6 +188,27 @@ mod tests {
         assert_eq!(f[1], 3.0, "connect_count");
         assert_eq!(f[3], 1.0, "unique_daddr_count");
         assert_eq!(f[4], 2.0, "unique_dport_count");
+    }
+
+    #[test]
+    fn non_modeled_events_do_not_perturb_span_or_count() {
+        // The Python aggregator drops DnsQuery et al. before windowing; span_s and
+        // event_count here must match — a later, unrelated DNS lookup must not
+        // stretch the span or bump the count.
+        let mut bus = EventBus::new(Duration::from_secs(60));
+        bus.push(exec(5, 0));
+        bus.push(connect(5, 1_000_000_000, 443));
+        bus.push(Event::DnsQuery(DnsQueryEvent {
+            meta: meta(5, 9_000_000_000),
+            query: "c2.test".into(),
+            qtype: 1,
+            result: None,
+            status: 0,
+        }));
+
+        let f = extract_features(&bus, 5);
+        assert_eq!(f[7], 2.0, "event_count counts only modeled events");
+        assert_eq!(f[6], 1.0, "span_s ignores the later DNS lookup");
     }
 
     #[test]

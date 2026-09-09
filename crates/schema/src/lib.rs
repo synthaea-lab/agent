@@ -105,6 +105,34 @@ pub struct ExecEvent {
     pub signature: Option<Signature>,
 }
 
+impl ExecEvent {
+    /// The command line in the one canonical form the ML cmdline scorer and its
+    /// training pipeline agree on: `argv` tokens joined (and terminated) by NUL.
+    ///
+    /// This is deliberately **not** [`ExecEvent::cmdline`]: sensors are free to put a
+    /// display/Sigma-friendly string there (the Linux userspace sensor space-joins
+    /// argv), and the cmdline feature extractor splits tokens on NUL — feeding it a
+    /// space-joined string silently collapses `token_count` to 1 and inflates
+    /// `max_token_length`. Every ML consumer (`ml::features::cmdline`, the agent's
+    /// scorer wiring, `synthaea_ml`) must build its input from here.
+    ///
+    /// Fallback when `argv` is empty (Windows/ETW has only a flat command line):
+    /// [`ExecEvent::cmdline`] verbatim, as one token. Mirror of
+    /// `synthaea_ml.data.canonical.ml_cmdline_from_record`.
+    #[must_use]
+    pub fn ml_cmdline(&self) -> String {
+        if self.argv.is_empty() {
+            return self.cmdline.clone();
+        }
+        let mut s = String::with_capacity(self.cmdline.len() + self.argv.len());
+        for tok in &self.argv {
+            s.push_str(tok);
+            s.push('\0');
+        }
+        s
+    }
+}
+
 /// Code-signature verdict (Authenticode on Windows, codesign on macOS; Linux has no
 /// standard equivalent and reports `Unsupported`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

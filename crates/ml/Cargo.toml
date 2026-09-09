@@ -17,3 +17,7 @@ ort = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+# capture_parity: deserialize a real events.jsonl as schema::Event and run it
+# through the correlator's window — the crate already depends on both.
+schema = { path = "../schema" }
+correlator = { path = "../correlator" }

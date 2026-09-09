@@ -204,19 +204,25 @@ impl EventSink for DetectionSink {
 
 // ── BaselineSink ──────────────────────────────────────────────────────────────
 
-/// Minimal sink for ML baseline capture: records only the cmdlines of exec events
-/// that trigger NO deterministic rule — the "known benign under current rules"
-/// corpus consumed by `synthaea_ml` training. Migrated from the old agent's
-/// `BaselineSink`, now platform-neutral (any sensor speaking the contract feeds it).
+/// Minimal sink for ML baseline capture: records the exec events that trigger NO
+/// deterministic rule — the "known benign under current rules" corpus consumed by
+/// `synthaea_ml` training. Migrated from the old agent's `BaselineSink`, now
+/// platform-neutral (any sensor speaking the contract feeds it).
 pub(crate) struct BaselineSink {
     rule_state: Mutex<rules::RuleState>,
     out: JsonlWriter,
     count: std::sync::atomic::AtomicU64,
 }
 
-/// One baseline record — the format `synthaea_ml/training` consumes.
+/// One baseline record — the format `synthaea_ml` training consumes.
+///
+/// `argv` is the canonical form: the training side joins it with NUL exactly as
+/// [`schema::ExecEvent::ml_cmdline`] does, so the model trains on the vectors the
+/// agent will score. `cmdline` is kept alongside it for human inspection of the
+/// capture and as the documented fallback when `argv` is empty (Windows/ETW).
 #[derive(serde::Serialize)]
 struct BaselineRecord<'a> {
+    argv: &'a [String],
     cmdline: &'a str,
 }
 
@@ -246,6 +252,7 @@ impl EventSink for BaselineSink {
                     return;
                 }
                 self.out.write(&BaselineRecord {
+                    argv: &e.argv,
                     cmdline: &e.cmdline,
                 });
                 let n = self
