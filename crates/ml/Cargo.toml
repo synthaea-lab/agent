@@ -17,12 +17,6 @@ ort = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
-<<<<<<< HEAD
-# capture_parity: deserialize a real events.jsonl as schema::Event and run it
-# through the correlator's window — the crate already depends on both.
-=======
-# Integration tests build event windows to score end-to-end (events -> EventBus ->
-# vector -> model); the unit path already depends on both.
->>>>>>> 8b756586
-schema = { path = "../schema" }
-correlator = { path = "../correlator" }
+# Integration tests (capture_parity, correlation_scorer) build event windows and
+# score end-to-end: events -> schema::Event -> EventBus -> vector -> model. Both
+# crates are already in [dependencies], so tests pick them up as-is.
