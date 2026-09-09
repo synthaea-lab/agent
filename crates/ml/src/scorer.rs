@@ -1,13 +1,20 @@
-//! On-device cmdline scoring: runs an Isolation Forest (ONNX) through onnxruntime
+//! On-device ML scoring: runs an Isolation Forest (ONNX) through onnxruntime
 //! (`ort`, statically linked — ADR-0002) and pairs every score with the per-feature
 //! attribution from [`crate::forest`], so a detection is never a bare number
 //! (`docs/detection/ml.md`).
 //!
-//! The model is loaded as data from the update channel, never embedded
+//! A model is loaded as data from the update channel, never embedded
 //! ([`CmdlineScorer::from_onnx_bytes`]). One model file feeds both paths: `ort`
 //! executes the graph for the score, and the same bytes are parsed into a [`Forest`]
 //! for attribution — so the explanation always describes the model that produced the
 //! score.
+//!
+//! - [`CmdlineScorer`] (T0) scores one command line the instant an `Exec` arrives;
+//! - [`correlation::CorrelationScorer`] (T2) scores a pid's behaviour over the
+//!   correlator window once it is populated, and feeds the correlator's belief state
+//!   rather than alerting on its own.
+
+pub mod correlation;
 
 use ort::session::Session;
 use ort::value::Tensor;
@@ -25,9 +32,9 @@ pub enum ScorerError {
     /// The model file could not be parsed for attribution.
     #[error(transparent)]
     Parse(#[from] ParseError),
-    /// The model's input width disagrees with the cmdline feature space — a sign the
+    /// The model's input width disagrees with the scorer's feature space — a sign the
     /// wrong model shipped to this scorer.
-    #[error("model expects {model} features, cmdline extractor produces {extractor}")]
+    #[error("model expects {model} features, the extractor produces {extractor}")]
     FeatureArity { model: usize, extractor: usize },
     /// The `scores` output was missing or empty.
     #[error("model produced no score")]
