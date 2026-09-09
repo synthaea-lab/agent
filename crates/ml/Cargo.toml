@@ -17,3 +17,7 @@ ort = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+# Integration tests build event windows to score end-to-end (events -> EventBus ->
+# vector -> model); the unit path already depends on both.
+schema = { path = "../schema" }
+correlator = { path = "../correlator" }
