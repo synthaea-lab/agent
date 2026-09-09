@@ -439,6 +439,55 @@ fn unbounded_cmdline_survives() {
 }
 
 #[test]
+fn ml_cmdline_is_the_canonical_nul_joined_form() {
+    // Parity contract with `synthaea_ml.data.canonical.cmdline_str`: the ML cmdline
+    // scorer's input is argv joined+terminated by NUL, NOT the sensor's display
+    // `cmdline` string (which the Linux userspace sensor space-joins — feeding that
+    // to the extractor collapses token_count to 1).
+    let mk = |cmdline: &str, argv: &[&str]| ExecEvent {
+        meta: EventMeta {
+            pid: 1,
+            ppid: 0,
+            user: User::Unknown,
+            timestamp_ns: 0,
+            comm: "x".into(),
+        },
+        image_path: String::new(),
+        cmdline: cmdline.into(),
+        argv: argv.iter().map(|s| (*s).to_string()).collect(),
+        parent_comm: None,
+        parent_image_path: None,
+        sha256: None,
+        signature: None,
+    };
+
+    // Linux execve: argv present → NUL-joined, ignoring the space-joined `cmdline`.
+    assert_eq!(
+        mk(
+            "curl -fsSL https://x.test",
+            &["curl", "-fsSL", "https://x.test"]
+        )
+        .ml_cmdline(),
+        "curl\0-fsSL\0https://x.test\0",
+    );
+    // Single token still gets its terminator.
+    assert_eq!(
+        mk("/tmp/payload", &["/tmp/payload"]).ml_cmdline(),
+        "/tmp/payload\0"
+    );
+    // Windows/ETW: no argv → the flat cmdline verbatim, as one token.
+    assert_eq!(
+        mk("powershell.exe -EncodedCommand ZWNobw==", &[]).ml_cmdline(),
+        "powershell.exe -EncodedCommand ZWNobw==",
+    );
+    // A token containing spaces (e.g. `sh -c "a b"`) is preserved whole.
+    assert_eq!(
+        mk("", &["sh", "-c", "chmod +x x"]).ml_cmdline(),
+        "sh\0-c\0chmod +x x\0",
+    );
+}
+
+#[test]
 fn meta_accessor_covers_all_variants() {
     let meta = EventMeta {
         pid: 7,
