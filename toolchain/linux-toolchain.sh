@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Provisioning for the lab's Linux VMs (Debian/RPM matrix, arm64): Rust + eBPF
-# toolchain for building the agent and probes. Provider-neutral — run by any
-# harness (Vagrant shell provisioner, ssh, cloud-init). Idempotent: rerunnable
-# via `vagrant provision <machine>` or a plain re-run.
+# Provisioning for the lab's Linux VMs (Debian/RPM matrix, x86_64 or arm64):
+# Rust + eBPF toolchain for building the agent and probes, plus the packages the
+# lab/scenarios/ scripts need. Provider-neutral — run by any harness (Vagrant
+# shell provisioner, ssh, cloud-init). Idempotent: rerunnable via
+# `vagrant provision <machine>` or a plain re-run.
 #
-# The full eBPF toolchain (bpf-linker) requires LLVM >= 21: guaranteed on the
-# Debian family via apt.llvm.org; on Fedora/Rocky, if the distro LLVM is too
-# old the script CONTINUES with a warning — the VM is then used for replaying
-# scenarios with a binary built elsewhere, not for eBPF builds (replay-only
-# rows in lab/MATRIX.md).
+# bpf-linker comes from the upstream musl-static release (bundled LLVM matching
+# recent rustc nightly). If that download fails the script CONTINUES with a
+# warning — the VM is then replay-only (run scenarios against a binary built
+# elsewhere), matching the replay-only rows in lab/MATRIX.md.
 set -euo pipefail
 
 # sudo does not propagate the environment: pass DEBIAN_FRONTEND explicitly,
@@ -21,20 +21,29 @@ if command -v apt-get >/dev/null 2>&1; then FAMILY=debian
 elif command -v dnf >/dev/null 2>&1; then FAMILY=rpm
 else echo "[err] neither apt-get nor dnf — unsupported distro" >&2; exit 1
 fi
-echo "== System packages (family: $FAMILY) =="
+. /etc/os-release
+echo "== System packages (family: $FAMILY, distro: ${ID:-?}) =="
 
 if [ "$FAMILY" = debian ]; then
   $APT update -qq
   $APT install -y -qq \
-    build-essential curl git pkg-config rsync \
-    clang llvm llvm-dev libclang-dev libelf-dev libssl-dev libzstd-dev \
-    linux-tools-common "linux-tools-$(uname -r)" linux-tools-generic
+    build-essential curl git pkg-config rsync zstd netcat-openbsd dnsutils \
+    clang llvm llvm-dev libclang-dev libelf-dev libssl-dev libzstd-dev
+  # perf: `linux-tools-*` is Ubuntu-only; Debian ships it as `linux-perf`. Not
+  # required by the eBPF sensor — best-effort, never fatal.
+  if [ "${ID:-}" = ubuntu ]; then
+    $APT install -y -qq linux-tools-common "linux-tools-$(uname -r)" linux-tools-generic \
+      || echo "[warn] linux-tools unavailable — perf not installed (not needed for the sensor)"
+  else
+    $APT install -y -qq linux-perf \
+      || echo "[warn] linux-perf unavailable — perf not installed (not needed for the sensor)"
+  fi
 else
   # Rocky/Alma: the -devel packages (libclang…) live in the CRB repository.
   if grep -qiE 'rocky|alma|centos|rhel' /etc/os-release; then
     sudo dnf config-manager --set-enabled crb 2>/dev/null || true
   fi
-  $DNF install gcc gcc-c++ make curl git pkgconf-pkg-config rsync \
+  $DNF install gcc gcc-c++ make curl git pkgconf-pkg-config rsync zstd nmap-ncat bind-utils \
     clang llvm llvm-devel clang-devel clang-libs \
     elfutils-libelf-devel openssl-devel libzstd-devel zlib-devel bpftool
 fi
@@ -55,54 +64,41 @@ source "$HOME/.cargo/env"
 rustup toolchain install nightly --component rust-src
 
 echo "== bpf-linker =="
-# The current bpf-linker (0.11.x) requires LLVM 21/22/23 via an explicit
-# feature flag — Ubuntu 24.04's LLVM 18 is not enough. And that version must
-# be able to READ the bitcode emitted by the nightly rustc (error observed
-# otherwise: "Unknown attribute kind … Producer: LLVM23… Reader: LLVM 21") —
-# so we align bpf-linker's LLVM major with the nightly's, not with "the
-# newest available".
+# bpf-linker links against an LLVM whose major must match the one the pinned
+# nightly rustc emits bitcode with (otherwise: "Unknown attribute kind …
+# Producer: LLVM23 … Reader: LLVM 21"). Building it from source against
+# apt.llvm.org is fragile: no `llvm-23` repo exists for jammy (20/21/22, then a
+# rolling 24), and bpf-linker 0.11 dropped the `--features llvm-NN` flag the
+# old code passed. The upstream release binaries are musl-static with a bundled
+# LLVM cut in lockstep with recent rustc nightly, so they Just Work and the
+# "revalidate on nightly bump" problem goes away (#113). Pin explicitly.
+BPF_LINKER_VERSION="v0.11.1"
 install_bpf_linker() {
-  # Build dynamically linked against the system LLVM. Two subtleties validated
-  # on ubuntu2404: (1) the llvm-config of the right version must come first in
-  # the PATH, (2) llvm-sys doesn't emit the right -L for the final link
-  # (`ld: cannot find -lLLVM`), hence the explicit RUSTFLAGS.
-  bpf_linker_build() {
-    local prefix=$1 v=$2
-    PATH="$prefix/bin:$PATH" RUSTFLAGS="-L$prefix/lib" \
-      env "LLVM_SYS_${v}1_PREFIX=$prefix" \
-      cargo install bpf-linker --no-default-features --features "llvm-$v"
-  }
-  local need v
-  need=$(rustup run nightly rustc -Vv | awk '/^LLVM version/{print $3}' | cut -d. -f1)
-  if [ "$need" -lt 21 ] || [ "$need" -gt 23 ]; then
-    echo "[warn] the nightly uses LLVM $need, outside bpf-linker 0.11's features (21–23)" >&2
-    return 1
-  fi
-  v=$(llvm-config --version 2>/dev/null | cut -d. -f1 || echo 0)
-  if [ "$v" = "$need" ]; then
-    bpf_linker_build "$(llvm-config --prefix)" "$v" && return 0
-  fi
-  if [ "$FAMILY" = debian ]; then
-    echo "[info] distro LLVM ($v) != nightly's LLVM ($need) — LLVM $need via apt.llvm.org"
-    . /etc/os-release
-    curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
-      | sudo tee /etc/apt/trusted.gpg.d/apt-llvm-org.asc >/dev/null
-    echo "deb http://apt.llvm.org/$VERSION_CODENAME/ llvm-toolchain-$VERSION_CODENAME-$need main" \
-      | sudo tee "/etc/apt/sources.list.d/llvm$need.list" >/dev/null
-    $APT update -qq
-    $APT install -y -qq "llvm-$need-dev" "libpolly-$need-dev"
-    bpf_linker_build "/usr/lib/llvm-$need" "$need"
-  else
-    return 1
-  fi
+  local url="https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-$(uname -m)-unknown-linux-musl.tar.zst"
+  local tmp bin rc
+  tmp=$(mktemp -d)
+  echo "[info] bpf-linker ${BPF_LINKER_VERSION} (prebuilt): $url"
+  curl -fsSL "$url" -o "$tmp/bl.tar.zst" && tar --zstd -xf "$tmp/bl.tar.zst" -C "$tmp" \
+    && bin=$(find "$tmp" -type f -name bpf-linker -print -quit) && [ -n "$bin" ] \
+    && install -m755 "$bin" "$HOME/.cargo/bin/bpf-linker"
+  rc=$?
+  rm -rf "$tmp"
+  return $rc
 }
 if ! command -v bpf-linker >/dev/null 2>&1; then
-  if ! install_bpf_linker; then
-    echo "[warn] bpf-linker not installed (LLVM >= 21 unavailable on this distro) —" >&2
-    echo "[warn] eBPF builds impossible in this VM; build on ubuntu2404 (see lab/vagrant/README.md)" >&2
-  fi
+  install_bpf_linker || {
+    echo "[warn] bpf-linker install failed — eBPF builds impossible in this VM" >&2
+    echo "[warn] (replay-only: build the agent elsewhere, run scenarios here)" >&2
+  }
 fi
 command -v bpf-linker >/dev/null 2>&1 && bpf-linker --version
+
+# Sanity: the prebuilt tracks a recent nightly; warn (don't fail) if the pinned
+# nightly's LLVM major looks far ahead of what v0.11.x was cut against.
+_nightly_llvm=$(rustup run nightly rustc -Vv 2>/dev/null | awk '/^LLVM version/{print $3}' | cut -d. -f1)
+if [ -n "${_nightly_llvm:-}" ] && [ "$_nightly_llvm" -gt 24 ]; then
+  echo "[warn] nightly rustc uses LLVM $_nightly_llvm — bump BPF_LINKER_VERSION if probe builds hit bitcode-version errors" >&2
+fi
 
 echo "== bindgen-cli + aya-tool =="
 command -v bindgen >/dev/null 2>&1 || cargo install bindgen-cli
