@@ -15,6 +15,9 @@ __pycache__/
 !crates/ml/tests/fixtures/*.onnx
 !ml/registry/**/*.onnx
 
+# Vagrant (per-machine state, box images, generated SSH keys)
+.vagrant/
+
 # Editors / OS
 .DS_Store
 .idea/
