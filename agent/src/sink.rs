@@ -111,7 +111,7 @@ impl DetectionSink {
         // terminal noise.
         eprintln!("\x1b[1;31m[ALERT] {technique} — {message}\x1b[0m");
         self.alert_log.write(&AlertRecord {
-            timestamp_ns: now_epoch_ns(),
+            timestamp_ns: crate::time::now_ns(),
             technique: technique.to_string(),
             message: message.to_string(),
         });
@@ -163,7 +163,7 @@ fn start_yara(alert_log: Arc<JsonlWriter>) -> Option<yara::ScanQueue> {
                     let message = format!("yara rule {rule} matched {}", outcome.path.display());
                     eprintln!("\x1b[1;31m[ALERT] YARA — {message}\x1b[0m");
                     alert_log.write(&AlertRecord {
-                        timestamp_ns: now_epoch_ns(),
+                        timestamp_ns: crate::time::now_ns(),
                         technique: "YARA".to_string(),
                         message,
                     });
@@ -175,13 +175,6 @@ fn start_yara(alert_log: Arc<JsonlWriter>) -> Option<yara::ScanQueue> {
             None
         }
     }
-}
-
-fn now_epoch_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 impl EventSink for DetectionSink {

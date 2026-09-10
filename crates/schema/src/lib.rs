@@ -330,11 +330,50 @@ pub struct ConnectEvent {
     pub dport: u16,
 }
 
+/// Health status of a single sensor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SensorHealth {
+    /// Sensor name (e.g. "linux-ebpf", "windows-etw").
+    pub name: String,
+    /// Cumulative pulse count since agent start (heartbeat counter).
+    pub pulse_count: u64,
+    /// Whether the sensor is currently considered silent (no pulses in deadline).
+    pub silent: bool,
+}
+
+/// Periodic agent health beacon — self-diagnostics emitted to the control plane.
+///
+/// Emitted at a fixed cadence (default 30s) so the server can detect silent agents
+/// (an agent that stops beaconing is as suspicious as one that stops sending events).
+/// Does not carry event payloads — only aggregate counters and status flags.
+///
+/// Note: Unlike telemetry events, `HealthBeacon` has no `EventMeta` (no originating
+/// process). Consumers must handle this variant specially in pattern matches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthBeacon {
+    /// Nanoseconds since the UNIX epoch.
+    pub timestamp_ns: u64,
+    /// Agent version string (e.g. "0.1.0").
+    pub agent_version: String,
+    /// Health status of each loaded sensor.
+    pub sensors: Vec<SensorHealth>,
+    /// Total bytes currently in the event spool (upload backlog).
+    pub spool_bytes: u64,
+    /// Cumulative records dropped from spool due to byte cap.
+    pub spool_dropped: u64,
+    /// Cumulative events dropped from enrichment queue (backpressure).
+    pub enrich_dropped: u64,
+}
+
 /// The normalized event envelope.
 ///
 /// `#[non_exhaustive]`: new telemetry categories (registry, DNS, image load, ...) are
 /// added as variants without breaking sinks — consumers must have a fall-through arm
 /// and treat unknown categories as "not for me".
+///
+/// Note: Control-plane messages like [`HealthBeacon`] are NOT part of this enum.
+/// They flow through a separate channel at the transport layer to avoid polluting
+/// the telemetry pipeline with non-process events.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -353,6 +392,7 @@ pub enum Event {
 }
 
 impl Event {
+    /// Returns the process metadata common to all telemetry events.
     #[must_use]
     pub fn meta(&self) -> &EventMeta {
         match self {
@@ -367,11 +407,10 @@ impl Event {
             Event::AssemblyLoad(e) => &e.meta,
             Event::SmbConnect(e) => &e.meta,
             Event::UdpSend(e) => &e.meta,
-            // Non-exhaustive: new telemetry categories reach existing sinks without
-            // a breaking change — consumers match variants they understand and
-            // ignore the rest.
+            // Non-exhaustive: new telemetry variants must be added here.
+            // This arm ensures a compile-time reminder when adding variants.
             #[allow(unreachable_patterns)]
-            _ => unreachable!("all Event variants must be covered by meta()"),
+            _ => unreachable!("all Event variants must have meta — add the new variant here"),
         }
     }
 }

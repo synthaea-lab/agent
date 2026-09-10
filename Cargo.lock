@@ -2654,6 +2654,7 @@ dependencies = [
 name = "tamper"
 version = "0.1.0"
 dependencies = [
+ "schema",
  "sha2",
 ]
 
