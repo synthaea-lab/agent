@@ -63,6 +63,16 @@ fi
 source "$HOME/.cargo/env"
 rustup toolchain install nightly --component rust-src
 
+# Pre-install the exact channel rust-toolchain.toml pins, with its components, so
+# the first `cargo` inside the tree doesn't download a toolchain mid-build — a
+# transient DNS failure there fails a whole validation run (same class of gap as
+# the bpf-linker fetch above).
+_pinned=$(grep -oE 'channel *= *"[^"]+"' "${SYNTHAEA_SRC:-/synthaea}/rust-toolchain.toml" 2>/dev/null | cut -d'"' -f2)
+if [ -n "${_pinned:-}" ]; then
+  echo "[info] rust-toolchain.toml pins $_pinned — installing it now"
+  rustup toolchain install "$_pinned" --component rustfmt --component clippy
+fi
+
 echo "== bpf-linker =="
 # bpf-linker links against an LLVM whose major must match the one the pinned
 # nightly rustc emits bitcode with (otherwise: "Unknown attribute kind …
