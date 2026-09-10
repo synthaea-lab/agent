@@ -68,6 +68,13 @@ impl SensorHeartbeat {
         self.name
     }
 
+    /// Returns the current pulse count. Used by the health beacon (#134) to report
+    /// per-sensor liveness to the control plane.
+    #[must_use]
+    pub fn pulse_count(&self) -> u64 {
+        self.counter.load(Ordering::Relaxed)
+    }
+
     fn count(&self) -> u64 {
         self.counter.load(Ordering::Relaxed)
     }
@@ -178,6 +185,31 @@ impl SilenceMonitor {
     pub fn any_silent(&self) -> bool {
         self.watched.iter().any(|w| w.alerted)
     }
+
+    /// Returns the health status of each registered sensor. Used by the health
+    /// beacon (#134) to report per-sensor state to the control plane.
+    #[must_use]
+    pub fn sensor_health(&self) -> Vec<SensorHealthSnapshot> {
+        self.watched
+            .iter()
+            .map(|w| SensorHealthSnapshot {
+                name: w.heartbeat.name(),
+                pulse_count: w.heartbeat.pulse_count(),
+                silent: w.alerted,
+            })
+            .collect()
+    }
+}
+
+/// Snapshot of a sensor's health state for the health beacon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SensorHealthSnapshot {
+    /// The sensor's stable name.
+    pub name: &'static str,
+    /// Cumulative pulse count since agent start.
+    pub pulse_count: u64,
+    /// Whether the sensor is currently considered silent.
+    pub silent: bool,
 }
 
 impl Default for SilenceMonitor {

@@ -29,7 +29,7 @@ pub mod sensor;
 
 /// Version of the serialized event model. Bumped on any serialization-visible change,
 /// together with a new golden-fixture directory (see crate docs).
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// Identity of the user a process runs as, per platform.
 ///
@@ -330,6 +330,41 @@ pub struct ConnectEvent {
     pub dport: u16,
 }
 
+/// Health status of a single sensor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SensorHealth {
+    /// Sensor name (e.g. "linux-ebpf", "windows-etw").
+    pub name: String,
+    /// Cumulative pulse count since agent start (heartbeat counter).
+    pub pulse_count: u64,
+    /// Whether the sensor is currently considered silent (no pulses in deadline).
+    pub silent: bool,
+}
+
+/// Periodic agent health beacon — self-diagnostics emitted to the control plane.
+///
+/// Emitted at a fixed cadence (default 30s) so the server can detect silent agents
+/// (an agent that stops beaconing is as suspicious as one that stops sending events).
+/// Does not carry event payloads — only aggregate counters and status flags.
+///
+/// Note: Unlike telemetry events, `HealthBeacon` has no `EventMeta` (no originating
+/// process). Consumers must handle this variant specially in pattern matches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthBeacon {
+    /// Nanoseconds since the UNIX epoch.
+    pub timestamp_ns: u64,
+    /// Agent version string (e.g. "0.1.0").
+    pub agent_version: String,
+    /// Health status of each loaded sensor.
+    pub sensors: Vec<SensorHealth>,
+    /// Total bytes currently in the event spool (upload backlog).
+    pub spool_bytes: u64,
+    /// Cumulative records dropped from spool due to byte cap.
+    pub spool_dropped: u64,
+    /// Cumulative events dropped from enrichment queue (backpressure).
+    pub enrich_dropped: u64,
+}
+
 /// The normalized event envelope.
 ///
 /// `#[non_exhaustive]`: new telemetry categories (registry, DNS, image load, ...) are
@@ -350,28 +385,52 @@ pub enum Event {
     AssemblyLoad(AssemblyLoadEvent),
     SmbConnect(SmbConnectEvent),
     UdpSend(UdpSendEvent),
+    /// Agent health beacon (no originating process — control-plane diagnostic).
+    HealthBeacon(HealthBeacon),
 }
 
 impl Event {
+    /// Returns the process metadata for telemetry events.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on `Event::HealthBeacon`, which has no originating process.
+    /// Use [`Event::meta_opt`] if you need to handle all variants safely.
     #[must_use]
     pub fn meta(&self) -> &EventMeta {
+        self.meta_opt()
+            .expect("meta() called on Event::HealthBeacon — use meta_opt() instead")
+    }
+
+    /// Returns the process metadata if this is a telemetry event, or `None` for
+    /// control-plane messages like `HealthBeacon`.
+    #[must_use]
+    pub fn meta_opt(&self) -> Option<&EventMeta> {
         match self {
-            Event::Exec(e) => &e.meta,
-            Event::FileOpen(e) => &e.meta,
-            Event::Connect(e) => &e.meta,
-            Event::DnsQuery(e) => &e.meta,
-            Event::RegistrySet(e) => &e.meta,
-            Event::ImageLoad(e) => &e.meta,
-            Event::ScriptBlock(e) => &e.meta,
-            Event::WmiActivity(e) => &e.meta,
-            Event::AssemblyLoad(e) => &e.meta,
-            Event::SmbConnect(e) => &e.meta,
-            Event::UdpSend(e) => &e.meta,
+            Event::Exec(e) => Some(&e.meta),
+            Event::FileOpen(e) => Some(&e.meta),
+            Event::Connect(e) => Some(&e.meta),
+            Event::DnsQuery(e) => Some(&e.meta),
+            Event::RegistrySet(e) => Some(&e.meta),
+            Event::ImageLoad(e) => Some(&e.meta),
+            Event::ScriptBlock(e) => Some(&e.meta),
+            Event::WmiActivity(e) => Some(&e.meta),
+            Event::AssemblyLoad(e) => Some(&e.meta),
+            Event::SmbConnect(e) => Some(&e.meta),
+            Event::UdpSend(e) => Some(&e.meta),
+            Event::HealthBeacon(_) => None,
             // Non-exhaustive: new telemetry categories reach existing sinks without
             // a breaking change — consumers match variants they understand and
             // ignore the rest.
             #[allow(unreachable_patterns)]
-            _ => unreachable!("all Event variants must be covered by meta()"),
+            _ => None,
         }
+    }
+
+    /// Returns `true` if this is a control-plane message (e.g. `HealthBeacon`)
+    /// rather than a telemetry event from a process.
+    #[must_use]
+    pub fn is_control_message(&self) -> bool {
+        matches!(self, Event::HealthBeacon(_))
     }
 }
