@@ -1,6 +1,6 @@
 //! Durable store-and-forward spool: append-only JSONL segments in a directory,
-//! rotated at a fixed record count, with a total byte cap enforced by deleting the
-//! oldest segment (the loss is counted, never silent).
+//! rotated at a fixed record count OR byte threshold, with a total byte cap
+//! enforced by deleting the oldest segment (the loss is counted, never silent).
 //!
 //! Two-phase drain/ack protocol ensures at-least-once delivery:
 //! 1. `drain_oldest()` returns records and renames the segment to `.inflight`
@@ -8,8 +8,9 @@
 //! 3. Caller calls `ack()` to delete the `.inflight` file
 //! 4. On crash before ack, `open()` recovers `.inflight` → `.jsonl` for re-drain
 //!
-//! The byte cap is enforced including the active segment: if only the active segment
-//! remains and exceeds the cap, it is sealed (rotated) and then shed.
+//! Forward progress guarantee: after `MAX_DRAIN_ATTEMPTS` failed uploads of the
+//! same segment, callers should call `skip()` to discard it and move on. This
+//! prevents a poison segment from blocking all telemetry indefinitely.
 
 use std::{
     fs,
@@ -22,9 +23,17 @@ use serde::{Serialize, de::DeserializeOwned};
 /// Records per segment before rotation.
 const SEGMENT_RECORDS: usize = 1024;
 
+/// Maximum bytes per segment before rotation. Ensures no single segment exceeds
+/// the byte cap, preventing the seal-and-shed oscillation on small caps.
+const SEGMENT_MAX_BYTES: u64 = 1024 * 1024; // 1 MiB
+
+/// Suggested max drain attempts before calling `skip()`. Not enforced by the spool
+/// itself — the caller (transport) decides when to give up.
+pub const MAX_DRAIN_ATTEMPTS: u32 = 5;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SpoolStats {
-    /// Total bytes currently on disk across segments.
+    /// Total bytes currently on disk across segments (including in-flight).
     pub bytes: u64,
     /// Records dropped over the spool's lifetime because the byte cap was hit.
     pub dropped_records: u64,
@@ -37,10 +46,12 @@ pub struct EventSpool {
     /// Sequence number of the segment currently being appended.
     head_seq: u64,
     head_records: usize,
+    /// Current byte size of the active segment (for byte-threshold rotation).
+    head_bytes: u64,
     dropped_records: u64,
     /// Segment currently handed out via `drain_oldest` but not yet ack'd.
-    /// At most one segment can be in-flight at a time; a second drain blocks
-    /// until the first is ack'd (or re-delivers the same segment).
+    /// At most one segment can be in-flight at a time; a second drain
+    /// re-delivers the same segment (idempotent retry).
     in_flight: Option<u64>,
 }
 
@@ -73,6 +84,7 @@ impl EventSpool {
             max_bytes,
             head_seq,
             head_records: 0,
+            head_bytes: 0,
             dropped_records: 0,
             in_flight: None,
         })
@@ -87,7 +99,8 @@ impl EventSpool {
     }
 
     /// Appends one record durably (fsync'd). Rotates the segment at
-    /// `SEGMENT_RECORDS`; enforces the byte cap by deleting whole oldest segments.
+    /// `SEGMENT_RECORDS` or `SEGMENT_MAX_BYTES` (whichever comes first).
+    /// Enforces the byte cap by deleting whole oldest segments.
     ///
     /// # Errors
     ///
@@ -96,6 +109,16 @@ impl EventSpool {
     pub fn push<T: Serialize>(&mut self, record: &T) -> std::io::Result<()> {
         let line = serde_json::to_string(record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let line_bytes = line.len() as u64 + 1; // +1 for newline
+
+        // Rotate if adding this record would exceed byte threshold.
+        // This ensures no single segment exceeds SEGMENT_MAX_BYTES.
+        if self.head_records > 0 && self.head_bytes + line_bytes > SEGMENT_MAX_BYTES {
+            self.head_seq += 1;
+            self.head_records = 0;
+            self.head_bytes = 0;
+        }
+
         let path = self.segment_path(self.head_seq);
         let mut f = fs::OpenOptions::new()
             .create(true)
@@ -104,11 +127,17 @@ impl EventSpool {
         f.write_all(line.as_bytes())?;
         f.write_all(b"\n")?;
         f.sync_data()?;
+
         self.head_records += 1;
+        self.head_bytes += line_bytes;
+
+        // Rotate on record count threshold.
         if self.head_records >= SEGMENT_RECORDS {
             self.head_seq += 1;
             self.head_records = 0;
+            self.head_bytes = 0;
         }
+
         self.enforce_cap()?;
         Ok(())
     }
@@ -125,6 +154,12 @@ impl EventSpool {
     /// 2. Caller uploads data to server
     /// 3. Caller calls `ack()` to delete the `.inflight` file
     /// 4. On crash before ack, `open()` recovers `.inflight` → `.jsonl` for re-drain
+    ///
+    /// # Forward Progress
+    ///
+    /// If the server permanently rejects a batch (4xx, malformed, etc.), the caller
+    /// should track attempts and call `skip()` after [`MAX_DRAIN_ATTEMPTS`] to
+    /// discard the poison segment and continue with newer data.
     ///
     /// # Errors
     ///
@@ -161,6 +196,7 @@ impl EventSpool {
                 // Drained the segment being appended: rotate to a new segment.
                 self.head_seq += 1;
                 self.head_records = 0;
+                self.head_bytes = 0;
             }
         }
 
@@ -176,63 +212,116 @@ impl EventSpool {
     ///
     /// Returns an I/O error when the in-flight file cannot be deleted.
     pub fn ack(&mut self) -> std::io::Result<bool> {
-        let Some(seq) = self.in_flight.take() else {
+        let Some(seq) = self.in_flight else {
             return Ok(false);
         };
         let path = self.inflight_path(seq);
+        // Delete first, then clear in_flight. If delete fails, we'll retry on next ack().
         fs::remove_file(&path)?;
+        self.in_flight = None;
         log::debug!("spool: ack'd segment {seq}");
         Ok(true)
     }
 
+    /// Skips (discards) the in-flight segment without uploading it.
+    /// Use this after repeated upload failures to prevent a poison segment from
+    /// blocking all telemetry indefinitely.
+    ///
+    /// Returns `true` if a segment was skipped, `false` if nothing was in-flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the in-flight file cannot be deleted.
+    pub fn skip(&mut self) -> std::io::Result<bool> {
+        let Some(seq) = self.in_flight else {
+            return Ok(false);
+        };
+        let path = self.inflight_path(seq);
+        let dropped = fs::read_to_string(&path)
+            .map(|c| c.lines().count() as u64)
+            .unwrap_or(0);
+        // Delete first, then clear in_flight.
+        fs::remove_file(&path)?;
+        self.in_flight = None;
+        self.dropped_records += dropped;
+        log::warn!("spool: skipped poison segment {seq} ({dropped} records dropped)");
+        Ok(true)
+    }
+
+    /// Returns true if a segment is currently in-flight (drained but not ack'd).
+    #[must_use]
+    pub fn has_in_flight(&self) -> bool {
+        self.in_flight.is_some()
+    }
+
     #[must_use]
     pub fn stats(&self) -> SpoolStats {
-        let bytes = segment_seqs(&self.dir)
+        // Sum .jsonl segments
+        let jsonl_bytes: u64 = segment_seqs(&self.dir)
             .into_iter()
             .flatten()
             .filter_map(|s| fs::metadata(self.segment_path(s)).ok())
             .map(|m| m.len())
             .sum();
+
+        // Add in-flight segment bytes if any
+        let inflight_bytes: u64 = self
+            .in_flight
+            .and_then(|seq| fs::metadata(self.inflight_path(seq)).ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
+
         SpoolStats {
-            bytes,
+            bytes: jsonl_bytes + inflight_bytes,
             dropped_records: self.dropped_records,
         }
     }
 
-    /// Deletes oldest segments until under the cap. If the active segment is the
-    /// only one remaining and exceeds the cap, it is sealed (rotated to a new
-    /// segment) and then shed — ensuring the cap is always enforced, including
-    /// on the active segment.
+    /// Deletes oldest segments until under the cap. Never deletes in-flight segments
+    /// (they are protected during upload). Never deletes the active segment (`head_seq`).
     fn enforce_cap(&mut self) -> std::io::Result<()> {
         loop {
             let seqs = segment_seqs(&self.dir)?;
-            let total: u64 = seqs
+
+            // Calculate total including in-flight segment
+            let jsonl_bytes: u64 = seqs
                 .iter()
                 .filter_map(|s| fs::metadata(self.segment_path(*s)).ok())
                 .map(|m| m.len())
                 .sum();
+            let inflight_bytes: u64 = self
+                .in_flight
+                .and_then(|seq| fs::metadata(self.inflight_path(seq)).ok())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let total = jsonl_bytes + inflight_bytes;
+
             if total <= self.max_bytes {
                 return Ok(());
             }
+
             let Some(oldest) = seqs.first().copied() else {
                 return Ok(());
             };
-            // If the oldest segment is the active one and we're over cap, seal it
-            // first (rotate to a new segment) so it can be shed.
-            if oldest == self.head_seq {
-                if seqs.len() == 1 {
-                    // Only the active segment exists and it exceeds the cap.
-                    // Seal it by rotating to a new segment number.
-                    self.head_seq += 1;
-                    self.head_records = 0;
-                    log::warn!("spool: active segment {oldest} exceeds cap, sealing for shed");
-                    // Continue the loop — now `oldest` is no longer head_seq and can be shed.
-                    continue;
-                }
-                // Multiple segments exist but oldest is head — shouldn't happen in normal
-                // operation since head is always the highest seq. Skip to avoid corruption.
+
+            // Never delete the in-flight segment — it's protected during upload.
+            if Some(oldest) == self.in_flight {
+                // In-flight is the only segment, and we're over cap.
+                // We must wait for ack/skip before we can shed anything.
                 return Ok(());
             }
+
+            // Never delete the active segment being appended.
+            if oldest == self.head_seq {
+                // This shouldn't happen: head_seq is always the highest seq number,
+                // and we iterate from lowest. If we hit this, something is wrong.
+                debug_assert!(
+                    seqs.len() <= 1,
+                    "oldest == head_seq with multiple segments: {seqs:?}"
+                );
+                return Ok(());
+            }
+
             let path = self.segment_path(oldest);
             let dropped = fs::read_to_string(&path)
                 .map(|c| c.lines().count() as u64)
@@ -411,17 +500,103 @@ mod tests {
     }
 
     #[test]
-    fn active_segment_cap_enforcement() {
-        let dir = tmp("active-cap");
-        // Very small cap to force shedding of active segment.
-        // Each record is ~2-4 bytes, cap at 50 bytes.
-        let mut spool = EventSpool::open(&dir, 50).unwrap();
-        for i in 0..100u32 {
+    fn skip_poison_segment() {
+        let dir = tmp("skip");
+        let mut spool = EventSpool::open(&dir, u64::MAX).unwrap();
+
+        // Write first segment
+        for i in 0..3u32 {
             spool.push(&i).unwrap();
         }
-        let stats = spool.stats();
-        // Should have shed data to stay under cap.
-        assert!(stats.bytes <= 100, "cap enforced: {} bytes", stats.bytes);
-        assert!(stats.dropped_records > 0, "some records dropped");
+
+        // Drain first segment
+        let first: Vec<u32> = spool.drain_oldest().unwrap();
+        assert_eq!(first, vec![0, 1, 2]);
+
+        // Write more data while first segment is in-flight (creates new segment)
+        spool.push(&100u32).unwrap();
+
+        // Skip instead of ack (simulates poison segment)
+        assert!(spool.skip().unwrap());
+        assert_eq!(spool.stats().dropped_records, 3);
+
+        // Should now get the second segment
+        let second: Vec<u32> = spool.drain_oldest().unwrap();
+        assert_eq!(second, vec![100]);
+        spool.ack().unwrap();
+    }
+
+    #[test]
+    fn inflight_protected_from_cap_enforcement() {
+        let dir = tmp("inflight-protected");
+        // Create spool with small cap
+        let mut spool = EventSpool::open(&dir, 100).unwrap();
+
+        // Write some data
+        for i in 0..10u32 {
+            spool.push(&i).unwrap();
+        }
+
+        // Drain but don't ack
+        let drained: Vec<u32> = spool.drain_oldest().unwrap();
+        assert!(!drained.is_empty());
+        assert!(spool.has_in_flight());
+
+        // Write more data that would trigger cap enforcement
+        for i in 100..200u32 {
+            spool.push(&i).unwrap();
+        }
+
+        // In-flight segment should still be there
+        assert!(spool.has_in_flight());
+
+        // Re-drain should return same data
+        let redrained: Vec<u32> = spool.drain_oldest().unwrap();
+        assert_eq!(drained, redrained, "in-flight segment preserved");
+
+        spool.ack().unwrap();
+    }
+
+    #[test]
+    fn stats_includes_inflight_bytes() {
+        let dir = tmp("stats-inflight");
+        let mut spool = EventSpool::open(&dir, u64::MAX).unwrap();
+
+        for i in 0..5u32 {
+            spool.push(&i).unwrap();
+        }
+
+        let before_drain = spool.stats().bytes;
+        assert!(before_drain > 0);
+
+        // Drain moves segment to .inflight
+        let _: Vec<u32> = spool.drain_oldest().unwrap();
+
+        // Stats should still count the in-flight bytes
+        let after_drain = spool.stats().bytes;
+        assert_eq!(
+            before_drain, after_drain,
+            "in-flight bytes counted in stats"
+        );
+
+        spool.ack().unwrap();
+        assert_eq!(spool.stats().bytes, 0, "bytes zero after ack");
+    }
+
+    #[test]
+    fn ack_failure_allows_retry() {
+        let dir = tmp("ack-retry");
+        let mut spool = EventSpool::open(&dir, u64::MAX).unwrap();
+        spool.push(&1u32).unwrap();
+
+        let _: Vec<u32> = spool.drain_oldest().unwrap();
+        assert!(spool.has_in_flight());
+
+        // Ack succeeds
+        assert!(spool.ack().unwrap());
+        assert!(!spool.has_in_flight());
+
+        // Second ack returns false (nothing in flight)
+        assert!(!spool.ack().unwrap());
     }
 }
