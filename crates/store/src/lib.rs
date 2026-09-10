@@ -16,4 +16,4 @@ mod bounded;
 mod spool;
 
 pub use bounded::BoundedMap;
-pub use spool::{EventSpool, SpoolStats};
+pub use spool::{EventSpool, MAX_DRAIN_ATTEMPTS, SpoolStats};
