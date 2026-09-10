@@ -143,15 +143,32 @@ fn parse_proc_cmdline(blob: &[u8]) -> Vec<String> {
 /// argv of `pid`, read from `/proc/<pid>/cmdline` when the `exec` event is drained.
 ///
 /// Deliberately not read in the probe: that needed a `mm_struct` frozen offset, the
-/// last non-portable read (issue #152). The cost is a race — a process that exits in
-/// the few milliseconds before userspace drains the ring buffer leaves no `/proc`
-/// entry (empty argv), and in the rare case its pid is already reused the argv would
-/// be the successor's. Accepted: `cmdline`/`argv` are display/analysis inputs, never
-/// an identity (that is `image_path`, still read authoritatively in the probe).
+/// last non-portable read (issue #152). Two consequences, both accepted because
+/// `cmdline`/`argv` are display/analysis inputs and never an identity — that is
+/// `image_path`, still read authoritatively in the probe at `sched_process_exec`:
+///
+/// - **Race.** A process that exits in the few milliseconds before userspace drains
+///   the ring buffer leaves no `/proc` entry (empty argv); if its pid is already
+///   reused in that window the argv is the successor's.
+/// - **Not exec-time.** `/proc/<pid>/cmdline` reflects `mm->arg_*` *now*, not at
+///   `execve`. A process can rewrite its own argv region (write through
+///   `arg_start..arg_end`, or move the pointers with `prctl(PR_SET_MM_ARG_*)`) between
+///   exec and the drain, so a cmdline-substring rule (base64 decode, `curl | sh`) can
+///   be evaded or spoofed by a process willing to scribble its own stack. The old
+///   probe-side read captured argv atomically at exec and did not have this gap.
+///   Tightening it — a `/proc` read triggered from the probe via task-work, or an
+///   `arg_start` snapshot once aya has CO-RE — is a separate follow-up, not this
+///   change.
 fn read_proc_cmdline(pid: u32) -> Vec<String> {
     match std::fs::read(format!("/proc/{pid}/cmdline")) {
         Ok(blob) => parse_proc_cmdline(&blob),
-        Err(_) => Vec::new(),
+        // ENOENT/ESRCH is the expected race (process already gone); anything else
+        // (EACCES, EIO) is worth a line when tracing a capture gap on some kernel.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            log::debug!("read /proc/{pid}/cmdline: {e}");
+            Vec::new()
+        }
     }
 }
 
@@ -334,6 +351,11 @@ impl LinuxSensor {
                 _ = &mut ctrl_c => break,
                 _ = self.stop.notified() => break,
                 guard = exec_ring_buf.readable_mut() => {
+                    // One synchronous procfs read per exec event, on this task. A
+                    // `/proc/<pid>/cmdline` read is served from pseudo-fs with no I/O
+                    // wait, so it does not warrant `spawn_blocking`; if an exec storm
+                    // ever makes it show up, batch the drained pids and read them off
+                    // the reactor instead.
                     drain!(guard, sensor_linux_wire::ExecEvent, sink, |e: &sensor_linux_wire::ExecEvent| {
                         normalize::exec(e, offset, read_proc_cmdline(e.meta.pid))
                     });
