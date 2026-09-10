@@ -78,18 +78,36 @@ install_bpf_linker() {
   local tmp bin rc
   tmp=$(mktemp -d)
   echo "[info] bpf-linker ${BPF_LINKER_VERSION} (prebuilt): $url"
-  curl -fsSL "$url" -o "$tmp/bl.tar.zst" && tar --zstd -xf "$tmp/bl.tar.zst" -C "$tmp" \
+  # A single lost packet here silently makes the VM replay-only (the caller only
+  # warns). Retry the fetch — 3 attempts, transient HTTP errors included.
+  curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors "$url" -o "$tmp/bl.tar.zst" \
+    && tar --zstd -xf "$tmp/bl.tar.zst" -C "$tmp" \
     && bin=$(find "$tmp" -type f -name bpf-linker -print -quit) && [ -n "$bin" ] \
     && install -m755 "$bin" "$HOME/.cargo/bin/bpf-linker"
   rc=$?
   rm -rf "$tmp"
   return $rc
 }
+
+# Bust a probe-less build cached before bpf-linker existed. userspace/build.rs
+# has `rerun-if-env-changed=PATH`, but that does not fire when ~/.cargo/bin was
+# already on PATH (cargo itself lives there) and only the linker binary appeared
+# — so cargo replays the stale "no embedded eBPF" build script output forever.
+bust_stale_sensor_linux_build() {
+  local src="${SYNTHAEA_SRC:-/synthaea}" d
+  for d in "$src"/target/*/build "$src"/target/*/.fingerprint; do
+    [ -d "$d" ] || continue
+    find "$d" -maxdepth 1 -name 'sensor-linux-*' -exec rm -rf {} + 2>/dev/null || true
+  done
+}
+
 if ! command -v bpf-linker >/dev/null 2>&1; then
-  install_bpf_linker || {
+  if install_bpf_linker; then
+    bust_stale_sensor_linux_build
+  else
     echo "[warn] bpf-linker install failed — eBPF builds impossible in this VM" >&2
     echo "[warn] (replay-only: build the agent elsewhere, run scenarios here)" >&2
-  }
+  fi
 fi
 command -v bpf-linker >/dev/null 2>&1 && bpf-linker --version
 
