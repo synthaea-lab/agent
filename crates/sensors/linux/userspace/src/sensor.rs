@@ -167,14 +167,22 @@ fn parse_proc_cmdline(blob: &[u8]) -> Vec<String> {
 fn read_proc_cmdline(pid: u32) -> Vec<String> {
     match std::fs::read(format!("/proc/{pid}/cmdline")) {
         Ok(blob) => parse_proc_cmdline(&blob),
-        // ENOENT/ESRCH is the expected race (process already gone); anything else
+        // The expected exit race (process already gone) is silent; anything else
         // (EACCES, EIO) is worth a line when tracing a capture gap on some kernel.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) if is_proc_exit_race(&e) => Vec::new(),
         Err(e) => {
             log::debug!("read /proc/{pid}/cmdline: {e}");
             Vec::new()
         }
     }
+}
+
+/// Whether an error from reading `/proc/<pid>/*` is the process having already exited
+/// (the accepted race) rather than a real capture gap. `open()` on a dead pid gives
+/// `ENOENT`; a `read()` that loses the task mid-flight can surface `ESRCH`, which
+/// `std::io` maps to `Uncategorized`, not `NotFound` — so the raw errno is checked too.
+fn is_proc_exit_race(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH)
 }
 
 /// Splits a `/proc/<pid>/stat` line into `(ppid, comm)`. `comm` is parenthesised and
@@ -357,10 +365,11 @@ impl LinuxSensor {
                 _ = self.stop.notified() => break,
                 guard = exec_ring_buf.readable_mut() => {
                     // One synchronous procfs read per exec event, on this task. A
-                    // `/proc/<pid>/cmdline` read is served from pseudo-fs with no I/O
-                    // wait, so it does not warrant `spawn_blocking`; if an exec storm
-                    // ever makes it show up, batch the drained pids and read them off
-                    // the reactor instead.
+                    // `/proc/<pid>/cmdline` read is normally served from pseudo-fs
+                    // without blocking (it can still stall on `mmap_lock` contention or
+                    // a page fault in the target's mm), so it does not warrant
+                    // `spawn_blocking` today; if an exec storm ever makes it show up,
+                    // batch the drained pids and read them off the reactor instead.
                     drain!(guard, sensor_linux_wire::ExecEvent, sink, |e: &sensor_linux_wire::ExecEvent| {
                         normalize::exec(e, offset, read_proc_cmdline(e.meta.pid))
                     });
@@ -417,7 +426,7 @@ impl Sensor for LinuxSensor {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_proc_cmdline, parse_stat_ppid_comm};
+    use super::{is_proc_exit_race, parse_proc_cmdline, parse_stat_ppid_comm};
 
     #[test]
     fn cmdline_splits_on_nul_and_drops_trailing_empty() {
@@ -450,6 +459,18 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(out[0].contains('\u{fffd}'));
         assert_eq!(out[1], "-x");
+    }
+
+    #[test]
+    fn proc_exit_race_is_silent_for_enoent_and_esrch_only() {
+        use std::io::{Error, ErrorKind};
+        // open() on a dead pid — mapped to NotFound
+        assert!(is_proc_exit_race(&Error::from(ErrorKind::NotFound)));
+        // read() losing the task mid-flight — ESRCH, which std::io leaves Uncategorized
+        assert!(is_proc_exit_race(&Error::from_raw_os_error(libc::ESRCH)));
+        // a real capture gap on some kernel must still get logged
+        assert!(!is_proc_exit_race(&Error::from_raw_os_error(libc::EACCES)));
+        assert!(!is_proc_exit_race(&Error::from_raw_os_error(libc::EIO)));
     }
 
     #[test]
