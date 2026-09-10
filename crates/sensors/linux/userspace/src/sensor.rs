@@ -159,6 +159,11 @@ fn parse_proc_cmdline(blob: &[u8]) -> Vec<String> {
 ///   Tightening it — a `/proc` read triggered from the probe via task-work, or an
 ///   `arg_start` snapshot once aya has CO-RE — is a separate follow-up, not this
 ///   change.
+///
+/// Not usable on `WSL2`: kernel 6.6 returns `ENOENT` here for every pid, including
+/// a live `sleep 60` with a confirmed parent — the `WSL` interop layer between the
+/// eBPF context and the agent's `/proc` view, not the drain race. `WSL2` is out of
+/// `lab/MATRIX.md`; recorded so it is not re-investigated (Nikolas, 2026-09-10, #155).
 fn read_proc_cmdline(pid: u32) -> Vec<String> {
     match std::fs::read(format!("/proc/{pid}/cmdline")) {
         Ok(blob) => parse_proc_cmdline(&blob),
