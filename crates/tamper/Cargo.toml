@@ -10,4 +10,5 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+schema.path = "../schema"
 sha2 = "0.10"

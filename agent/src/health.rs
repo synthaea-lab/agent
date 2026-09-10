@@ -1,25 +1,22 @@
-//! Agent health beacon — periodic self-diagnostics emitted to the control plane.
-//!
-//! Not yet wired into the agent main loop — integration pending transport (#24)
-//! and spool availability. The module compiles and tests pass; `#[allow(dead_code)]`
-//! until the main loop calls `HealthCollector::spawn`.
-
 #![allow(dead_code)]
+//! Agent health beacon — periodic self-diagnostics emitted to the control plane.
 //!
 //! A background thread collects counters from sensors, spool, and enrichment queue,
 //! then emits a [`schema::HealthBeacon`] at a fixed cadence. The beacon flows through
-//! the normal event pipeline (spool → transport) so it benefits from at-least-once
-//! delivery and the server can detect silent agents.
+//! a separate channel (not the Event pipeline) so it doesn't pollute telemetry
+//! consumers that expect process metadata.
 //!
 //! "Silence is a detection": an agent that stops beaconing is as suspicious as one
 //! that stops sending events.
+//!
+//! Not yet wired into the agent main loop — integration pending transport (#24).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use schema::{Event, HealthBeacon, SensorHealth};
+use schema::{HealthBeacon, SensorHealth};
 
 /// Default beacon interval (30 seconds).
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
@@ -30,38 +27,10 @@ pub trait DroppedCounter: Send + Sync {
     fn dropped(&self) -> u64;
 }
 
-/// A simple atomic counter implementing `DroppedCounter`.
-#[derive(Default)]
-pub struct AtomicDroppedCounter(AtomicU64);
-
-impl AtomicDroppedCounter {
-    pub fn new() -> Self {
-        Self(AtomicU64::new(0))
-    }
-
-    pub fn add(&self, n: u64) {
-        self.0.fetch_add(n, Ordering::Relaxed);
-    }
-}
-
-impl DroppedCounter for AtomicDroppedCounter {
-    fn dropped(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
-    }
-}
-
-/// Snapshot of sensor health for the beacon.
-#[derive(Clone)]
-pub struct SensorSnapshot {
-    pub name: String,
-    pub pulse_count: u64,
-    pub silent: bool,
-}
-
 /// Reads sensor health snapshots. Implementations may wrap a `SilenceMonitor` or
 /// provide mock data for testing.
 pub trait SensorHealthSource: Send + Sync {
-    fn sensor_health(&self) -> Vec<SensorSnapshot>;
+    fn sensor_health(&self) -> Vec<SensorHealth>;
 }
 
 /// Reads spool statistics. Implementations may wrap an `EventSpool` or provide
@@ -87,7 +56,7 @@ impl SpoolStatsSource for NoopSpoolStats {
 pub struct NoopSensorHealth;
 
 impl SensorHealthSource for NoopSensorHealth {
-    fn sensor_health(&self) -> Vec<SensorSnapshot> {
+    fn sensor_health(&self) -> Vec<SensorHealth> {
         Vec::new()
     }
 }
@@ -113,14 +82,49 @@ impl Default for HealthCollectorConfig {
 ///
 /// The collector runs in a dedicated thread to avoid blocking the sensor drain
 /// thread. It reads from various sources (sensors, spool, enrich queue) and
-/// emits `Event::HealthBeacon` via the provided callback.
+/// emits `HealthBeacon` via the provided callback.
+///
+/// Note: Beacons are emitted separately from telemetry events — they flow through
+/// a different channel at the transport layer.
 pub struct HealthCollector {
     config: HealthCollectorConfig,
     sensors: Arc<dyn SensorHealthSource>,
     spool: Arc<dyn SpoolStatsSource>,
     enrich_dropped: Arc<dyn DroppedCounter>,
-    emit: Box<dyn Fn(Event) + Send>,
-    stop: Arc<AtomicBool>,
+    emit: Box<dyn Fn(HealthBeacon) + Send>,
+    stop: Arc<StopFlag>,
+}
+
+/// Shared stop flag with condvar for interruptible sleep.
+struct StopFlag {
+    flag: AtomicBool,
+    condvar: std::sync::Condvar,
+    mutex: std::sync::Mutex<()>,
+}
+
+impl StopFlag {
+    fn new() -> Self {
+        Self {
+            flag: AtomicBool::new(false),
+            condvar: std::sync::Condvar::new(),
+            mutex: std::sync::Mutex::new(()),
+        }
+    }
+
+    fn stop(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+        self.condvar.notify_all();
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    /// Sleeps for the given duration, but wakes early if stop() is called.
+    fn sleep_interruptible(&self, duration: Duration) {
+        let guard = self.mutex.lock().unwrap();
+        let _ = self.condvar.wait_timeout(guard, duration);
+    }
 }
 
 impl HealthCollector {
@@ -130,7 +134,7 @@ impl HealthCollector {
         sensors: Arc<dyn SensorHealthSource>,
         spool: Arc<dyn SpoolStatsSource>,
         enrich_dropped: Arc<dyn DroppedCounter>,
-        emit: impl Fn(Event) + Send + 'static,
+        emit: impl Fn(HealthBeacon) + Send + 'static,
     ) -> Self {
         Self {
             config,
@@ -138,7 +142,7 @@ impl HealthCollector {
             spool,
             enrich_dropped,
             emit: Box::new(emit),
-            stop: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(StopFlag::new()),
         }
     }
 
@@ -158,34 +162,23 @@ impl HealthCollector {
             "health beacon started (interval: {:?})",
             self.config.interval
         );
-        while !self.stop.load(Ordering::Relaxed) {
-            thread::sleep(self.config.interval);
-            if self.stop.load(Ordering::Relaxed) {
+        while !self.stop.is_stopped() {
+            self.stop.sleep_interruptible(self.config.interval);
+            if self.stop.is_stopped() {
                 break;
             }
             let beacon = self.collect();
-            (self.emit)(Event::HealthBeacon(beacon));
+            (self.emit)(beacon);
             log::debug!("health beacon emitted");
         }
         log::info!("health beacon stopped");
     }
 
     fn collect(&self) -> HealthBeacon {
-        let sensors: Vec<SensorHealth> = self
-            .sensors
-            .sensor_health()
-            .into_iter()
-            .map(|s| SensorHealth {
-                name: s.name,
-                pulse_count: s.pulse_count,
-                silent: s.silent,
-            })
-            .collect();
-
         HealthBeacon {
-            timestamp_ns: now_ns(),
+            timestamp_ns: crate::time::now_ns(),
             agent_version: self.config.agent_version.clone(),
-            sensors,
+            sensors: self.sensors.sensor_health(),
             spool_bytes: self.spool.spool_bytes(),
             spool_dropped: self.spool.spool_dropped(),
             enrich_dropped: self.enrich_dropped.dropped(),
@@ -194,22 +187,13 @@ impl HealthCollector {
 }
 
 /// Handle to stop the health collector.
-pub struct StopHandle(Arc<AtomicBool>);
+pub struct StopHandle(Arc<StopFlag>);
 
 impl StopHandle {
-    /// Signals the collector to stop after its current sleep.
+    /// Signals the collector to stop and wakes it from sleep immediately.
     pub fn stop(&self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.0.stop();
     }
-}
-
-/// Returns the current time in nanoseconds since the UNIX epoch.
-fn now_ns() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -218,10 +202,10 @@ mod tests {
 
     use super::*;
 
-    struct MockSensors(Vec<SensorSnapshot>);
+    struct MockSensors(Vec<SensorHealth>);
 
     impl SensorHealthSource for MockSensors {
-        fn sensor_health(&self) -> Vec<SensorSnapshot> {
+        fn sensor_health(&self) -> Vec<SensorHealth> {
             self.0.clone()
         }
     }
@@ -240,9 +224,17 @@ mod tests {
         }
     }
 
+    struct MockDropped(u64);
+
+    impl DroppedCounter for MockDropped {
+        fn dropped(&self) -> u64 {
+            self.0
+        }
+    }
+
     #[test]
     fn collects_health_beacon() {
-        let sensors = Arc::new(MockSensors(vec![SensorSnapshot {
+        let sensors = Arc::new(MockSensors(vec![SensorHealth {
             name: "linux-ebpf".into(),
             pulse_count: 1234,
             silent: false,
@@ -251,10 +243,9 @@ mod tests {
             bytes: 5000,
             dropped: 10,
         });
-        let enrich = Arc::new(AtomicDroppedCounter::new());
-        enrich.add(5);
+        let enrich = Arc::new(MockDropped(5));
 
-        let collected: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+        let collected: Arc<Mutex<Vec<HealthBeacon>>> = Arc::new(Mutex::new(Vec::new()));
         let collected_clone = collected.clone();
 
         let collector = HealthCollector::new(
@@ -265,7 +256,7 @@ mod tests {
             sensors,
             spool,
             enrich,
-            move |e| collected_clone.lock().unwrap().push(e),
+            move |b| collected_clone.lock().unwrap().push(b),
         );
 
         let (handle, stop) = collector.spawn();
@@ -275,15 +266,13 @@ mod tests {
         stop.stop();
         handle.join().unwrap();
 
-        let events = collected.lock().unwrap();
+        let beacons = collected.lock().unwrap();
         assert!(
-            !events.is_empty(),
+            !beacons.is_empty(),
             "should have collected at least one beacon"
         );
 
-        let Event::HealthBeacon(beacon) = &events[0] else {
-            panic!("expected HealthBeacon");
-        };
+        let beacon = &beacons[0];
         assert_eq!(beacon.agent_version, "0.1.0-test");
         assert_eq!(beacon.sensors.len(), 1);
         assert_eq!(beacon.sensors[0].name, "linux-ebpf");
@@ -292,5 +281,37 @@ mod tests {
         assert_eq!(beacon.spool_bytes, 5000);
         assert_eq!(beacon.spool_dropped, 10);
         assert_eq!(beacon.enrich_dropped, 5);
+    }
+
+    #[test]
+    fn stop_interrupts_sleep() {
+        let sensors = Arc::new(NoopSensorHealth);
+        let spool = Arc::new(NoopSpoolStats);
+        let enrich = Arc::new(MockDropped(0));
+
+        let collector = HealthCollector::new(
+            HealthCollectorConfig {
+                interval: Duration::from_secs(60), // Long interval
+                agent_version: "test".into(),
+            },
+            sensors,
+            spool,
+            enrich,
+            |_| {},
+        );
+
+        let (handle, stop) = collector.spawn();
+
+        // Stop immediately - should not wait 60 seconds
+        thread::sleep(Duration::from_millis(10));
+        stop.stop();
+
+        // Join should complete quickly
+        let start = std::time::Instant::now();
+        handle.join().unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "stop should interrupt sleep"
+        );
     }
 }

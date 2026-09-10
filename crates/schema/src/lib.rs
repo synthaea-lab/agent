@@ -29,7 +29,7 @@ pub mod sensor;
 
 /// Version of the serialized event model. Bumped on any serialization-visible change,
 /// together with a new golden-fixture directory (see crate docs).
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Identity of the user a process runs as, per platform.
 ///
@@ -370,6 +370,10 @@ pub struct HealthBeacon {
 /// `#[non_exhaustive]`: new telemetry categories (registry, DNS, image load, ...) are
 /// added as variants without breaking sinks — consumers must have a fall-through arm
 /// and treat unknown categories as "not for me".
+///
+/// Note: Control-plane messages like [`HealthBeacon`] are NOT part of this enum.
+/// They flow through a separate channel at the transport layer to avoid polluting
+/// the telemetry pipeline with non-process events.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -385,52 +389,28 @@ pub enum Event {
     AssemblyLoad(AssemblyLoadEvent),
     SmbConnect(SmbConnectEvent),
     UdpSend(UdpSendEvent),
-    /// Agent health beacon (no originating process — control-plane diagnostic).
-    HealthBeacon(HealthBeacon),
 }
 
 impl Event {
-    /// Returns the process metadata for telemetry events.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called on `Event::HealthBeacon`, which has no originating process.
-    /// Use [`Event::meta_opt`] if you need to handle all variants safely.
+    /// Returns the process metadata common to all telemetry events.
     #[must_use]
     pub fn meta(&self) -> &EventMeta {
-        self.meta_opt()
-            .expect("meta() called on Event::HealthBeacon — use meta_opt() instead")
-    }
-
-    /// Returns the process metadata if this is a telemetry event, or `None` for
-    /// control-plane messages like `HealthBeacon`.
-    #[must_use]
-    pub fn meta_opt(&self) -> Option<&EventMeta> {
         match self {
-            Event::Exec(e) => Some(&e.meta),
-            Event::FileOpen(e) => Some(&e.meta),
-            Event::Connect(e) => Some(&e.meta),
-            Event::DnsQuery(e) => Some(&e.meta),
-            Event::RegistrySet(e) => Some(&e.meta),
-            Event::ImageLoad(e) => Some(&e.meta),
-            Event::ScriptBlock(e) => Some(&e.meta),
-            Event::WmiActivity(e) => Some(&e.meta),
-            Event::AssemblyLoad(e) => Some(&e.meta),
-            Event::SmbConnect(e) => Some(&e.meta),
-            Event::UdpSend(e) => Some(&e.meta),
-            Event::HealthBeacon(_) => None,
-            // Non-exhaustive: new telemetry categories reach existing sinks without
-            // a breaking change — consumers match variants they understand and
-            // ignore the rest.
+            Event::Exec(e) => &e.meta,
+            Event::FileOpen(e) => &e.meta,
+            Event::Connect(e) => &e.meta,
+            Event::DnsQuery(e) => &e.meta,
+            Event::RegistrySet(e) => &e.meta,
+            Event::ImageLoad(e) => &e.meta,
+            Event::ScriptBlock(e) => &e.meta,
+            Event::WmiActivity(e) => &e.meta,
+            Event::AssemblyLoad(e) => &e.meta,
+            Event::SmbConnect(e) => &e.meta,
+            Event::UdpSend(e) => &e.meta,
+            // Non-exhaustive: new telemetry variants must be added here.
+            // This arm ensures a compile-time reminder when adding variants.
             #[allow(unreachable_patterns)]
-            _ => None,
+            _ => unreachable!("all Event variants must have meta — add the new variant here"),
         }
-    }
-
-    /// Returns `true` if this is a control-plane message (e.g. `HealthBeacon`)
-    /// rather than a telemetry event from a process.
-    #[must_use]
-    pub fn is_control_message(&self) -> bool {
-        matches!(self, Event::HealthBeacon(_))
     }
 }

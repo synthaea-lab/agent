@@ -13,6 +13,7 @@ mod enrich_queue;
 mod health;
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 mod sink;
+mod time;
 
 use clap::{Parser, Subcommand};
 

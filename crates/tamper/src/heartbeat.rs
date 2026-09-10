@@ -189,27 +189,16 @@ impl SilenceMonitor {
     /// Returns the health status of each registered sensor. Used by the health
     /// beacon (#134) to report per-sensor state to the control plane.
     #[must_use]
-    pub fn sensor_health(&self) -> Vec<SensorHealthSnapshot> {
+    pub fn sensor_health(&self) -> Vec<schema::SensorHealth> {
         self.watched
             .iter()
-            .map(|w| SensorHealthSnapshot {
-                name: w.heartbeat.name(),
+            .map(|w| schema::SensorHealth {
+                name: w.heartbeat.name().to_string(),
                 pulse_count: w.heartbeat.pulse_count(),
                 silent: w.alerted,
             })
             .collect()
     }
-}
-
-/// Snapshot of a sensor's health state for the health beacon.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SensorHealthSnapshot {
-    /// The sensor's stable name.
-    pub name: &'static str,
-    /// Cumulative pulse count since agent start.
-    pub pulse_count: u64,
-    /// Whether the sensor is currently considered silent.
-    pub silent: bool,
 }
 
 impl Default for SilenceMonitor {
