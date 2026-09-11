@@ -1,7 +1,6 @@
 //! Transport configuration.
 
-use std::path::PathBuf;
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use crate::{
     DEFAULT_BATCH_SIZE, DEFAULT_HEARTBEAT_ENDPOINT, DEFAULT_INGEST_ENDPOINT, DEFAULT_RETRY_BASE_MS,

@@ -3,8 +3,10 @@
 use schema::Event;
 use serde::Serialize;
 
-use crate::config::TransportConfig;
-use crate::error::{Result, TransportError};
+use crate::{
+    config::TransportConfig,
+    error::{Result, TransportError},
+};
 
 /// HTTP client for communication with the control plane.
 ///

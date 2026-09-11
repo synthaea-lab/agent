@@ -11,10 +11,14 @@
 //!
 //! Not yet wired into the agent main loop — integration pending transport (#24).
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 
 use schema::{HealthBeacon, SensorHealth};
 
@@ -120,7 +124,7 @@ impl StopFlag {
         self.flag.load(Ordering::SeqCst)
     }
 
-    /// Sleeps for the given duration, but wakes early if stop() is called.
+    /// Sleeps for the given duration, but wakes early if `stop()` is called.
     fn sleep_interruptible(&self, duration: Duration) {
         let guard = self.mutex.lock().unwrap();
         let _ = self.condvar.wait_timeout(guard, duration);

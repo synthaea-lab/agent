@@ -1,13 +1,10 @@
 //! Event upload with retry and backpressure handling.
 
-use std::thread;
-use std::time::Duration;
+use std::{thread, time::Duration};
 
 use schema::Event;
 
-use crate::client::TransportClient;
-use crate::config::TransportConfig;
-use crate::error::Result;
+use crate::{client::TransportClient, config::TransportConfig, error::Result};
 
 /// Trait for draining events from a spool.
 ///
