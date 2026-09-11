@@ -2421,6 +2421,9 @@ dependencies = [
 [[package]]
 name = "sensor-linux-netlink"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "sensor-linux-uprobes"

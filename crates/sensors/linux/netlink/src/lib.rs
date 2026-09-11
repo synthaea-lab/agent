@@ -10,3 +10,145 @@
 //!
 //! No special kernel config; runs where eBPF cannot; complements, never replaces,
 //! the probe-based sensors.
+//!
+//! **Status (issue #92, foundation):** `sock_diag` is done — [`snapshot`] queries
+//! TCP listening/established sockets (IPv4 + IPv6) via a hand-rolled
+//! `NETLINK_SOCK_DIAG` client ([`wire`]/[`socket`]) and joins each one to its
+//! owning PID(s) by scanning `/proc` ([`proc_join`]), the same technique `ss`/
+//! `lsof` use. Verified against this dev machine's real kernel — no root needed
+//! (confirmed empirically: `sock_diag` for TCP works unprivileged, unlike
+//! conntrack and proc connector below).
+//!
+//! Deliberately **not** here yet:
+//! - **conntrack** and **proc connector** — both were confirmed reachable in this
+//!   sandbox (this session has passwordless `sudo`), but each is a full netlink
+//!   sub-protocol of its own (conntrack's TLV-nested attributes — tuples,
+//!   counters — are a meaningfully bigger parser than `sock_diag`'s fixed-size
+//!   struct). Scoped out to keep this slice reviewable; tracked as follow-ups on
+//!   #92, not silently dropped.
+//! - No `schema::Event` variant or [`schema::sensor::Sensor`] implementation:
+//!   volume/periodicity beacon features and the eBPF cross-check both need
+//!   `crates/correlator`/`crates/tamper` wiring that doesn't exist for this data
+//!   yet — nothing to push into today.
+//! - UDP sockets — `sock_diag` supports them, but "listen/established" (this
+//!   issue's own wording) is TCP-state terminology; UDP would need its own
+//!   category, not a states-mask filter.
+//! - Periodic re-snapshotting / drift detection between snapshots — [`snapshot`]
+//!   is a one-shot query; a caller decides the cadence. No lab VM here to
+//!   validate the issue's "listening-port drift" done-when item against.
+
+mod proc_join;
+mod wire;
+
+#[cfg(target_os = "linux")]
+mod socket;
+
+use std::net::SocketAddr;
+
+#[cfg(target_os = "linux")]
+pub use socket::NetlinkError;
+pub use wire::{DiagMsg, TCP_ESTABLISHED, TCP_LISTEN};
+
+/// A TCP socket's state, as reported by `sock_diag`. This crate only ever
+/// requests [`TCP_ESTABLISHED`]/[`TCP_LISTEN`] (see the crate doc), so `Other` is
+/// purely defensive — a kernel returning something outside the requested mask
+/// would be a bug worth seeing, not a panic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketState {
+    Established,
+    Listen,
+    Other(u8),
+}
+
+impl From<u8> for SocketState {
+    fn from(raw: u8) -> Self {
+        match raw {
+            TCP_ESTABLISHED => Self::Established,
+            TCP_LISTEN => Self::Listen,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// One socket from a [`snapshot`], joined to the PID(s) holding it open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocketSnapshotEntry {
+    pub local: SocketAddr,
+    pub remote: SocketAddr,
+    pub state: SocketState,
+    /// UID of the socket's owning process, from the kernel — independent of the
+    /// `/proc` join below, and still populated even when that join finds nothing.
+    pub uid: u32,
+    pub inode: u32,
+    /// PIDs whose open file descriptors point at this socket's inode. Usually
+    /// one; more than one when a listener is shared across forked workers before
+    /// `exec`; empty when the owning process is in another user's `/proc/<pid>/fd`
+    /// (unreadable without root) or already exited between the two queries.
+    pub pids: Vec<u32>,
+}
+
+impl From<DiagMsg> for SocketSnapshotEntry {
+    fn from(msg: DiagMsg) -> Self {
+        Self {
+            local: SocketAddr::new(msg.local, msg.local_port),
+            remote: SocketAddr::new(msg.remote, msg.remote_port),
+            state: SocketState::from(msg.state),
+            uid: msg.uid,
+            inode: msg.inode,
+            pids: Vec::new(),
+        }
+    }
+}
+
+/// Takes one snapshot of TCP listening/established sockets, joined to their
+/// owning PID(s) where `/proc` permissions allow it.
+///
+/// # Errors
+///
+/// See [`NetlinkError`] — the query fails as a whole (rather than returning a
+/// partial list) if the kernel can't be reached at all.
+#[cfg(target_os = "linux")]
+pub fn snapshot() -> Result<Vec<SocketSnapshotEntry>, NetlinkError> {
+    let states = (1u32 << TCP_ESTABLISHED) | (1u32 << TCP_LISTEN);
+    let msgs = socket::query_tcp_sockets(states)?;
+    let inode_pids = proc_join::inode_to_pids();
+
+    Ok(msgs
+        .into_iter()
+        .map(|msg| {
+            let mut entry = SocketSnapshotEntry::from(msg);
+            entry.pids = inode_pids
+                .get(&u64::from(entry.inode))
+                .cloned()
+                .unwrap_or_default();
+            entry
+        })
+        .collect())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_runs_end_to_end_against_the_real_kernel_and_proc() {
+        let entries = snapshot().expect("unprivileged snapshot must succeed");
+        // Nondeterministic which sockets exist right now — the properties that
+        // must hold regardless: every entry has a real state (not garbage from a
+        // parsing bug) and, when a PID was found, it's still a plausible PID
+        // (nonzero — PID 0 is not a real process).
+        for entry in &entries {
+            assert!(!matches!(entry.state, SocketState::Other(_)));
+            for &pid in &entry.pids {
+                assert_ne!(pid, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn socket_state_from_u8_covers_the_requested_states_and_falls_back() {
+        assert_eq!(SocketState::from(TCP_ESTABLISHED), SocketState::Established);
+        assert_eq!(SocketState::from(TCP_LISTEN), SocketState::Listen);
+        assert_eq!(SocketState::from(7), SocketState::Other(7));
+    }
+}
