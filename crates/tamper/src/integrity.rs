@@ -173,7 +173,17 @@ fn hash_file(path: &Path) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
     let mut reader = file.take(MAX_VERIFY_BYTES);
     let mut hasher = Sha256::new();
-    std::io::copy(&mut reader, &mut hasher).ok()?;
+    // `sha2` 0.11 dropped `impl Write for Sha256` (it never guaranteed the
+    // infallible-write contract `io::Write` implies), so `io::copy` no longer
+    // applies here — read into a buffer and feed `Digest::update` by hand.
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
     let digest = hasher.finalize();
     let mut out = String::with_capacity(64);
     for byte in digest {

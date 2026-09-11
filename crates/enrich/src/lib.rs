@@ -18,7 +18,7 @@
 
 mod sig;
 
-use std::path::Path;
+use std::{io::Read as _, path::Path};
 
 use schema::Signature;
 use sha2::{Digest, Sha256};
@@ -146,7 +146,17 @@ impl Enricher {
 fn hash_file(path: &Path) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).ok()?;
+    // `sha2` 0.11 dropped `impl Write for Sha256` (it never guaranteed the
+    // infallible-write contract `io::Write` implies), so `io::copy` no longer
+    // applies here — read into a buffer and feed `Digest::update` by hand.
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
     let digest = hasher.finalize();
     let mut out = String::with_capacity(64);
     for byte in digest {
