@@ -4,7 +4,7 @@
 
 use std::{collections::HashMap, net::IpAddr};
 
-use schema::{ConnectEvent, ExecEvent, FileOpenEvent};
+use schema::{ConnectEvent, ExecEvent, FileOpenEvent, User};
 use store::BoundedMap;
 
 use crate::{
@@ -194,10 +194,22 @@ impl RuleState {
     // ── Windows rules ────────────────────────────────────────────────────────
 
     /// T1059 — same process spawned N times in X seconds by the same parent.
+    ///
+    /// Windows only. The exclusion lists below are Windows `.exe` names dated to
+    /// Windows lab captures, and the rule has no comm allowlist — so on Linux it
+    /// fires on any script that re-spawns the same helper a few times in a loop
+    /// (#159: `for i in 1..3; do sh -c …; done` trips 3 spawns of `sh` in <30s).
+    /// A Linux respawn that matters surfaces through the web-shell lineage (T1059),
+    /// download→exec (T1105), or the correlator's respawn+connect rule; a
+    /// Linux-calibrated SELF-SPAWN would be its own pass.
+    ///
     /// False positives documented in lab (2026-08-24/25): MpCmdRun.exe, WerFault.exe,
     /// RuntimeBroker.exe — excluded via `SELF_SPAWN_EXCLUSIONS` /
     /// `SELF_SPAWN_PARENT_EXCLUSIONS`.
     fn check_self_spawn(&mut self, event: &ExecEvent) -> Option<Alert> {
+        if !matches!(event.meta.user, User::Windows { .. }) {
+            return None;
+        }
         let comm = event.meta.comm.clone();
         // Name alone is a bypass: a payload renamed `svchost.exe` in %TEMP% must
         // not inherit the exclusion — the image must live where the real binary

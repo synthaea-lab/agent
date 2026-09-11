@@ -46,6 +46,18 @@ fn exec_event_full(pid: u32, ppid: u32, comm: &str, cmdline: &str, timestamp_ns:
     event
 }
 
+/// A Windows-flavoured exec event (`User::Windows`). SELF-SPAWN is gated on the
+/// platform (Windows-calibrated, no comm allowlist — see the rule doc), so its
+/// tests build events this way; `exec_event_full` stays `User::Unix`.
+fn exec_event_win(pid: u32, ppid: u32, comm: &str, cmdline: &str, timestamp_ns: u64) -> ExecEvent {
+    let mut event = exec_event_full(pid, ppid, comm, cmdline, timestamp_ns);
+    event.meta.user = User::Windows {
+        sid: "S-1-5-21-0-0-0-1000".to_string(),
+        integrity_level: Some(0x2000),
+    };
+    event
+}
+
 fn file_open_event(path: &str, flags: u32) -> FileOpenEvent {
     FileOpenEvent {
         meta: meta(),

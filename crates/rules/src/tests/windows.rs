@@ -4,12 +4,37 @@
 use super::*;
 
 // ── SELF-SPAWN (T1059) ────────────────────────────────────────────────────
+// Windows-only (the rule is gated on `User::Windows` — #159), so these build
+// events with `exec_event_win`.
+
+#[test]
+fn self_spawn_stays_quiet_on_a_unix_shell_loop() {
+    // #159: `for i in 1..N; do sh -c …; done` spawns `sh` from the same ppid
+    // repeatedly. The rule is Windows-calibrated and must not fire on Linux —
+    // `exec_event_full` builds a `User::Unix` event.
+    let mut state = RuleState::new();
+    let sec = 1_000_000_000u64;
+    let mut alerts = Vec::new();
+    for i in 0..SELF_SPAWN_THRESHOLD + 2 {
+        alerts.extend(state.on_exec(&exec_event_full(
+            200 + i,
+            1,
+            "sh",
+            "sh -c true",
+            u64::from(i) * sec,
+        )));
+    }
+    assert!(
+        alerts.iter().all(|a| a.technique != "T1059"),
+        "SELF-SPAWN must not fire for a Unix shell loop (#159)"
+    );
+}
 
 #[test]
 fn self_spawn_below_threshold_does_not_alert() {
     let mut state = RuleState::new();
     for i in 0..SELF_SPAWN_THRESHOLD - 1 {
-        let alerts = state.on_exec(&exec_event_full(200 + i, 1, "cmd.exe", "cmd.exe", i as u64));
+        let alerts = state.on_exec(&exec_event_win(200 + i, 1, "cmd.exe", "cmd.exe", i as u64));
         assert!(alerts.is_empty());
     }
 }
@@ -17,21 +42,9 @@ fn self_spawn_below_threshold_does_not_alert() {
 #[test]
 fn self_spawn_third_spawn_triggers_alert() {
     let mut state = RuleState::new();
-    state.on_exec(&exec_event_full(200, 1, "cmd.exe", "cmd.exe", 0));
-    state.on_exec(&exec_event_full(
-        201,
-        1,
-        "cmd.exe",
-        "cmd.exe",
-        1_000_000_000,
-    ));
-    let alerts = state.on_exec(&exec_event_full(
-        202,
-        1,
-        "cmd.exe",
-        "cmd.exe",
-        2_000_000_000,
-    ));
+    state.on_exec(&exec_event_win(200, 1, "cmd.exe", "cmd.exe", 0));
+    state.on_exec(&exec_event_win(201, 1, "cmd.exe", "cmd.exe", 1_000_000_000));
+    let alerts = state.on_exec(&exec_event_win(202, 1, "cmd.exe", "cmd.exe", 2_000_000_000));
     assert_eq!(alerts.len(), 1);
     assert_eq!(alerts[0].technique, "T1059");
 }
@@ -44,7 +57,7 @@ fn excluded_name_from_untrusted_path_still_alerts() {
     let sec = 1_000_000_000u64;
     let mut alerts = Vec::new();
     for i in 0..SELF_SPAWN_THRESHOLD {
-        let mut e = exec_event_full(300 + i, 1, "wermgr.exe", "wermgr.exe", u64::from(i) * sec);
+        let mut e = exec_event_win(300 + i, 1, "wermgr.exe", "wermgr.exe", u64::from(i) * sec);
         e.image_path = "/tmp/wermgr.exe".to_string();
         alerts.extend(state.on_exec(&e));
     }
@@ -60,7 +73,7 @@ fn excluded_name_from_system_path_stays_excluded() {
     let sec = 1_000_000_000u64;
     let mut alerts = Vec::new();
     for i in 0..SELF_SPAWN_THRESHOLD + 2 {
-        let mut e = exec_event_full(300 + i, 1, "wermgr.exe", "wermgr.exe", u64::from(i) * sec);
+        let mut e = exec_event_win(300 + i, 1, "wermgr.exe", "wermgr.exe", u64::from(i) * sec);
         e.image_path = "C:\\Windows\\System32\\wermgr.exe".to_string();
         alerts.extend(state.on_exec(&e));
     }
@@ -77,10 +90,10 @@ fn self_spawn_window_slides_instead_of_resetting() {
     // even though 29/31/33 are three spawns within 4 seconds.
     let mut state = RuleState::new();
     let sec = 1_000_000_000u64;
-    state.on_exec(&exec_event_full(200, 1, "cmd.exe", "cmd.exe", 0));
-    state.on_exec(&exec_event_full(201, 1, "cmd.exe", "cmd.exe", 29 * sec));
-    state.on_exec(&exec_event_full(202, 1, "cmd.exe", "cmd.exe", 31 * sec));
-    let alerts = state.on_exec(&exec_event_full(203, 1, "cmd.exe", "cmd.exe", 33 * sec));
+    state.on_exec(&exec_event_win(200, 1, "cmd.exe", "cmd.exe", 0));
+    state.on_exec(&exec_event_win(201, 1, "cmd.exe", "cmd.exe", 29 * sec));
+    state.on_exec(&exec_event_win(202, 1, "cmd.exe", "cmd.exe", 31 * sec));
+    let alerts = state.on_exec(&exec_event_win(203, 1, "cmd.exe", "cmd.exe", 33 * sec));
     assert!(
         alerts.iter().any(|a| a.technique == "T1059"),
         "three spawns within 4s straddling the bucket boundary must alert"
@@ -90,29 +103,11 @@ fn self_spawn_window_slides_instead_of_resetting() {
 #[test]
 fn self_spawn_does_not_realert_past_threshold() {
     let mut state = RuleState::new();
-    state.on_exec(&exec_event_full(200, 1, "cmd.exe", "cmd.exe", 0));
-    state.on_exec(&exec_event_full(
-        201,
-        1,
-        "cmd.exe",
-        "cmd.exe",
-        1_000_000_000,
-    ));
-    state.on_exec(&exec_event_full(
-        202,
-        1,
-        "cmd.exe",
-        "cmd.exe",
-        2_000_000_000,
-    )); // alerts here
+    state.on_exec(&exec_event_win(200, 1, "cmd.exe", "cmd.exe", 0));
+    state.on_exec(&exec_event_win(201, 1, "cmd.exe", "cmd.exe", 1_000_000_000));
+    state.on_exec(&exec_event_win(202, 1, "cmd.exe", "cmd.exe", 2_000_000_000)); // alerts here
     // 4th spawn, still within the window: already alerted (flag), no duplicate.
-    let alerts = state.on_exec(&exec_event_full(
-        203,
-        1,
-        "cmd.exe",
-        "cmd.exe",
-        3_000_000_000,
-    ));
+    let alerts = state.on_exec(&exec_event_win(203, 1, "cmd.exe", "cmd.exe", 3_000_000_000));
     assert!(alerts.is_empty());
 }
 
@@ -120,15 +115,15 @@ fn self_spawn_does_not_realert_past_threshold() {
 fn self_spawn_excluded_process_does_not_alert() {
     // MpCmdRun.exe: false positive documented in lab (2026-08-24), explicitly excluded.
     let mut state = RuleState::new();
-    state.on_exec(&exec_event_full(200, 1, "MpCmdRun.exe", "MpCmdRun.exe", 0));
-    state.on_exec(&exec_event_full(
+    state.on_exec(&exec_event_win(200, 1, "MpCmdRun.exe", "MpCmdRun.exe", 0));
+    state.on_exec(&exec_event_win(
         201,
         1,
         "MpCmdRun.exe",
         "MpCmdRun.exe",
         1_000_000_000,
     ));
-    let alerts = state.on_exec(&exec_event_full(
+    let alerts = state.on_exec(&exec_event_win(
         202,
         1,
         "MpCmdRun.exe",
@@ -141,17 +136,11 @@ fn self_spawn_excluded_process_does_not_alert() {
 #[test]
 fn self_spawn_outside_window_resets_counter() {
     let mut state = RuleState::new();
-    state.on_exec(&exec_event_full(200, 1, "cmd.exe", "cmd.exe", 0));
-    state.on_exec(&exec_event_full(
-        201,
-        1,
-        "cmd.exe",
-        "cmd.exe",
-        1_000_000_000,
-    ));
+    state.on_exec(&exec_event_win(200, 1, "cmd.exe", "cmd.exe", 0));
+    state.on_exec(&exec_event_win(201, 1, "cmd.exe", "cmd.exe", 1_000_000_000));
     // 40s later, outside the 30s window: the counter restarts at 1, no 3rd spawn
     // reached.
-    let alerts = state.on_exec(&exec_event_full(
+    let alerts = state.on_exec(&exec_event_win(
         202,
         1,
         "cmd.exe",
