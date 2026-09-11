@@ -14,7 +14,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-service = "0.6"
+windows-service = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"
