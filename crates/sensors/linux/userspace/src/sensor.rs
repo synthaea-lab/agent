@@ -185,6 +185,67 @@ fn is_proc_exit_race(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH)
 }
 
+/// Extracts a container id from one `/proc/<pid>/cgroup` line's path (the part after
+/// the last `:` — format is `hierarchy-id:controller-list:path`, and cgroup v2's
+/// single-hierarchy line has an empty controller list, `0::/path`). Recognizes the
+/// two layouts actually seen on this binding's targets:
+///
+/// - cgroup v1 / cgroupfs naming: a path segment that is exactly the 64 hex-char id
+///   (`/docker/<id>`, `/docker/<id>/init`).
+/// - cgroup v2 / systemd unit naming: `docker-<id>.scope` or `cri-containerd-<id>.scope`
+///   (containerd without Docker in front — still relevant since #80 mentions the
+///   containerd socket alongside Docker's).
+///
+/// Kubernetes' `kubepods` slice nesting is deliberately not special-cased (pod/
+/// namespace context is out of scope for issue #80) — the container-id segment inside
+/// it matches the same two patterns regardless of what wraps it.
+fn extract_container_id(cgroup_path: &str) -> Option<String> {
+    fn is_hex_id(s: &str) -> bool {
+        s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
+    cgroup_path.split('/').find_map(|segment| {
+        let candidate = segment
+            .strip_suffix(".scope")
+            .and_then(|s| {
+                s.strip_prefix("docker-")
+                    .or_else(|| s.strip_prefix("cri-containerd-"))
+            })
+            .unwrap_or(segment);
+        is_hex_id(candidate).then(|| candidate.to_string())
+    })
+}
+
+/// Parses `/proc/<pid>/cgroup` (one `hierarchy-id:controllers:path` line per
+/// hierarchy — a single `0::/path` line under the cgroup v2 unified hierarchy this
+/// binding targets) and returns the first line whose path attributes to a container.
+fn parse_cgroup_container_id(contents: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        line.rsplit_once(':')
+            .and_then(|(_, path)| extract_container_id(path))
+    })
+}
+
+/// Container id of `pid`'s cgroup, read from `/proc/<pid>/cgroup` when the event is
+/// drained — same drain-time-not-exec-time tradeoff as [`read_proc_cmdline`] (a process
+/// cannot change its own cgroup membership the way it can rewrite argv, so there is no
+/// spoofing concern here, just the same exit race). `None` on a bare-metal/VM process,
+/// not just on a read failure — most events have no container to attribute.
+///
+/// Attribution only: `id` is the full 64-hex-char id from the cgroup path. Resolving
+/// it to an image/name needs a cached Docker/containerd socket lookup, left to a
+/// follow-up (issue #80's item 1 is split across two PRs for that reason).
+fn read_container_id(pid: u32) -> Option<String> {
+    match std::fs::read_to_string(format!("/proc/{pid}/cgroup")) {
+        Ok(contents) => parse_cgroup_container_id(&contents),
+        Err(e) if is_proc_exit_race(&e) => None,
+        Err(e) => {
+            log::debug!("read /proc/{pid}/cgroup: {e}");
+            None
+        }
+    }
+}
+
 /// Splits a `/proc/<pid>/stat` line into `(ppid, comm)`. `comm` is parenthesised and
 /// may itself contain spaces and `)` (e.g. `(a )b)`), so the fields after it are read
 /// from the last `)`, not by whitespace-splitting the whole line.
@@ -281,7 +342,16 @@ impl Default for LinuxSensor {
 
 /// Drains every ready item from one ring buffer, decoding `$wire_ty` and forwarding
 /// the event `$to_event` builds from it. `$to_event` is `Fn(&$wire_ty) -> Event` so
-/// the exec path can enrich with a `/proc/<pid>/cmdline` read the others do not need.
+/// each leg can enrich with its own procfs reads (exec: `/proc/<pid>/cmdline`; all
+/// three: `/proc/<pid>/cgroup` for container attribution, issue #80).
+///
+/// The container-id read runs on every file-open/connect event, not just exec — a
+/// higher rate than the cmdline read that motivated the `spawn_blocking` discussion
+/// on `read_proc_cmdline`. Accepted for this attribution foundation (still a
+/// pseudo-fs read, no syscall that blocks on the target's locks); revisit with a
+/// per-cgroup cache if a file-event-heavy workload makes it show up in profiling —
+/// deferred rather than guessed at, same as the Docker/containerd socket lookup this
+/// id is meant to feed.
 macro_rules! drain {
     ($guard:expr, $wire_ty:ty, $sink:expr, $to_event:expr) => {{
         let mut guard = $guard.map_err(|e| err(format!("ring buffer poll failed: {e}")))?;
@@ -364,23 +434,25 @@ impl LinuxSensor {
                 _ = &mut ctrl_c => break,
                 _ = self.stop.notified() => break,
                 guard = exec_ring_buf.readable_mut() => {
-                    // One synchronous procfs read per exec event, on this task. A
-                    // `/proc/<pid>/cmdline` read is normally served from pseudo-fs
-                    // without blocking (it can still stall on `mmap_lock` contention or
-                    // a page fault in the target's mm), so it does not warrant
-                    // `spawn_blocking` today; if an exec storm ever makes it show up,
-                    // batch the drained pids and read them off the reactor instead.
+                    // Two synchronous procfs reads per exec event, on this task (see
+                    // `read_proc_cmdline`'s doc comment on why this hasn't warranted
+                    // `spawn_blocking` yet — `/proc/<pid>/cgroup` has the same
+                    // pseudo-fs-cheap, mmap_lock-independent profile).
                     drain!(guard, sensor_linux_wire::ExecEvent, sink, |e: &sensor_linux_wire::ExecEvent| {
-                        normalize::exec(e, offset, read_proc_cmdline(e.meta.pid))
+                        normalize::exec(e, offset, read_proc_cmdline(e.meta.pid), read_container_id(e.meta.pid))
                     });
                 }
                 guard = file_open_ring_buf.readable_mut() => {
                     drain!(guard, sensor_linux_wire::FileOpenEvent, sink,
-                        |e: &sensor_linux_wire::FileOpenEvent| normalize::file_open(e, offset));
+                        |e: &sensor_linux_wire::FileOpenEvent| {
+                            normalize::file_open(e, offset, read_container_id(e.meta.pid))
+                        });
                 }
                 guard = connect_ring_buf.readable_mut() => {
                     drain!(guard, sensor_linux_wire::ConnectEvent, sink,
-                        |e: &sensor_linux_wire::ConnectEvent| normalize::connect(e, offset));
+                        |e: &sensor_linux_wire::ConnectEvent| {
+                            normalize::connect(e, offset, read_container_id(e.meta.pid))
+                        });
                 }
             }
         }
@@ -426,7 +498,10 @@ impl Sensor for LinuxSensor {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_proc_exit_race, parse_proc_cmdline, parse_stat_ppid_comm};
+    use super::{
+        extract_container_id, is_proc_exit_race, parse_cgroup_container_id, parse_proc_cmdline,
+        parse_stat_ppid_comm,
+    };
 
     #[test]
     fn cmdline_splits_on_nul_and_drops_trailing_empty() {
@@ -471,6 +546,91 @@ mod tests {
         // a real capture gap on some kernel must still get logged
         assert!(!is_proc_exit_race(&Error::from_raw_os_error(libc::EACCES)));
         assert!(!is_proc_exit_race(&Error::from_raw_os_error(libc::EIO)));
+    }
+
+    const DOCKER_ID: &str = "a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456";
+
+    #[test]
+    fn cgroup_v1_docker_path() {
+        assert_eq!(
+            extract_container_id(&format!("/docker/{DOCKER_ID}")),
+            Some(DOCKER_ID.to_string())
+        );
+        // A sub-cgroup under the container (e.g. `/docker/<id>/init`) still matches.
+        assert_eq!(
+            extract_container_id(&format!("/docker/{DOCKER_ID}/init")),
+            Some(DOCKER_ID.to_string())
+        );
+    }
+
+    #[test]
+    fn cgroup_v2_systemd_docker_scope() {
+        assert_eq!(
+            extract_container_id(&format!("/system.slice/docker-{DOCKER_ID}.scope")),
+            Some(DOCKER_ID.to_string())
+        );
+    }
+
+    #[test]
+    fn cgroup_v2_containerd_without_docker() {
+        assert_eq!(
+            extract_container_id(&format!("/system.slice/cri-containerd-{DOCKER_ID}.scope")),
+            Some(DOCKER_ID.to_string())
+        );
+    }
+
+    #[test]
+    fn cgroup_kubepods_nesting_still_matches() {
+        // Pod/namespace context is out of scope (#80); the id inside the nesting is not.
+        assert_eq!(
+            extract_container_id(&format!(
+                "/kubepods.slice/kubepods-burstable.slice/cri-containerd-{DOCKER_ID}.scope"
+            )),
+            Some(DOCKER_ID.to_string())
+        );
+    }
+
+    #[test]
+    fn cgroup_bare_metal_process_has_no_container() {
+        assert_eq!(extract_container_id("/user.slice/user-1000.slice"), None);
+        assert_eq!(extract_container_id("/init.scope"), None);
+        assert_eq!(extract_container_id("/system.slice/sshd.service"), None);
+    }
+
+    #[test]
+    fn cgroup_id_wrong_length_does_not_match() {
+        // 63 hex chars — one short of a real id, must not false-positive.
+        assert_eq!(extract_container_id("/docker/abc123"), None);
+    }
+
+    #[test]
+    fn parse_cgroup_v2_single_hierarchy_line() {
+        // Real cgroup v2 layout: one `0::/path` line, no controller list.
+        let contents = format!("0::/system.slice/docker-{DOCKER_ID}.scope\n");
+        assert_eq!(
+            parse_cgroup_container_id(&contents),
+            Some(DOCKER_ID.to_string())
+        );
+    }
+
+    #[test]
+    fn parse_cgroup_v1_multi_hierarchy_lines() {
+        // Real cgroup v1 layout: several `id:controllers:path` lines, only some of
+        // which mention the container (v1 mounts one hierarchy per controller).
+        let contents = format!(
+            "12:pids:/docker/{DOCKER_ID}\n11:cpuset:/docker/{DOCKER_ID}\n\
+             4:memory:/user.slice\n"
+        );
+        assert_eq!(
+            parse_cgroup_container_id(&contents),
+            Some(DOCKER_ID.to_string())
+        );
+    }
+
+    #[test]
+    fn parse_cgroup_no_container_line_is_none() {
+        let contents = "0::/user.slice/user-1000.slice/session-2.scope\n";
+        assert_eq!(parse_cgroup_container_id(contents), None);
     }
 
     #[test]

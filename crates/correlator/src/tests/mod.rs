@@ -23,6 +23,7 @@ fn meta_full(pid: u32, ppid: u32, comm: &str, ts_ns: u64) -> EventMeta {
         user: User::Unknown,
         timestamp_ns: ts_ns,
         comm: comm.to_string(),
+        container: None,
     }
 }
 

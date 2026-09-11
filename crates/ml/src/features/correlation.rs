@@ -123,6 +123,7 @@ mod tests {
             user: User::Unix { uid: 0, gid: 0 },
             timestamp_ns: ts_ns,
             comm: "proc".into(),
+            container: None,
         }
     }
 

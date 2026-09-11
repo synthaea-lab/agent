@@ -107,6 +107,7 @@ mod tests {
                 user: User::Unknown,
                 timestamp_ns: 0,
                 comm: "t".into(),
+                container: None,
             },
             image_path: image_path.to_string(),
             cmdline: String::new(),

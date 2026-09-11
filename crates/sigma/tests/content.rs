@@ -19,6 +19,7 @@ fn exec(image: &str, cmdline: &str) -> ExecEvent {
             user: User::Unknown,
             timestamp_ns: 0,
             comm: "test".into(),
+            container: None,
         },
         image_path: image.to_string(),
         cmdline: cmdline.to_string(),

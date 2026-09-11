@@ -5,7 +5,7 @@
 //! clock the probes stamp events with (`bpf_ktime_get_ns`); the sensor computes it
 //! once at startup and passes it here so schema timestamps are epoch nanoseconds.
 
-use schema::{ConnectEvent, Event, EventMeta, ExecEvent, FileOpenEvent, User};
+use schema::{ConnectEvent, ContainerContext, Event, EventMeta, ExecEvent, FileOpenEvent, User};
 use sensor_linux_wire as wire;
 
 /// Tripwire: bumping the wire ABI must come here to revisit the mappings below.
@@ -25,7 +25,14 @@ fn comm_opt(comm: &[u8; wire::TASK_COMM_LEN]) -> Option<String> {
     (end != 0).then(|| String::from_utf8_lossy(&comm[..end]).into_owned())
 }
 
-fn meta(meta: &wire::EventMeta, boot_epoch_offset_ns: u64) -> EventMeta {
+/// `container_id` is resolved by the caller from `/proc/<pid>/cgroup` at drain time
+/// (issue #80) — attribution only for now, `image`/`name` await a follow-up
+/// Docker/containerd socket lookup.
+fn meta(
+    meta: &wire::EventMeta,
+    boot_epoch_offset_ns: u64,
+    container_id: Option<String>,
+) -> EventMeta {
     EventMeta {
         pid: meta.pid,
         ppid: meta.ppid,
@@ -35,6 +42,11 @@ fn meta(meta: &wire::EventMeta, boot_epoch_offset_ns: u64) -> EventMeta {
         },
         timestamp_ns: meta.timestamp_ns.saturating_add(boot_epoch_offset_ns),
         comm: comm_str(&meta.comm),
+        container: container_id.map(|id| ContainerContext {
+            id,
+            image: None,
+            name: None,
+        }),
     }
 }
 
@@ -47,7 +59,12 @@ fn meta(meta: &wire::EventMeta, boot_epoch_offset_ns: u64) -> EventMeta {
 /// fork-lineage entry, or `None` when the parent predated the probe and priming
 /// missed it.
 #[must_use]
-pub fn exec(event: &wire::ExecEvent, boot_epoch_offset_ns: u64, argv: Vec<String>) -> Event {
+pub fn exec(
+    event: &wire::ExecEvent,
+    boot_epoch_offset_ns: u64,
+    argv: Vec<String>,
+    container_id: Option<String>,
+) -> Event {
     let image_raw = &event.image[..(event.image_len as usize).min(wire::MAX_PATH_LEN)];
     let image_end = image_raw
         .iter()
@@ -56,7 +73,7 @@ pub fn exec(event: &wire::ExecEvent, boot_epoch_offset_ns: u64, argv: Vec<String
     let image_path = String::from_utf8_lossy(&image_raw[..image_end]).into_owned();
 
     Event::Exec(ExecEvent {
-        meta: meta(&event.meta, boot_epoch_offset_ns),
+        meta: meta(&event.meta, boot_epoch_offset_ns, container_id),
         image_path,
         cmdline: argv.join(" "),
         argv,
@@ -69,25 +86,33 @@ pub fn exec(event: &wire::ExecEvent, boot_epoch_offset_ns: u64, argv: Vec<String
 }
 
 #[must_use]
-pub fn file_open(event: &wire::FileOpenEvent, boot_epoch_offset_ns: u64) -> Event {
+pub fn file_open(
+    event: &wire::FileOpenEvent,
+    boot_epoch_offset_ns: u64,
+    container_id: Option<String>,
+) -> Event {
     let raw = &event.path[..(event.path_len as usize).min(wire::MAX_PATH_LEN)];
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
     Event::FileOpen(FileOpenEvent {
-        meta: meta(&event.meta, boot_epoch_offset_ns),
+        meta: meta(&event.meta, boot_epoch_offset_ns, container_id),
         path: String::from_utf8_lossy(&raw[..end]).into_owned(),
         flags: event.flags,
     })
 }
 
 #[must_use]
-pub fn connect(event: &wire::ConnectEvent, boot_epoch_offset_ns: u64) -> Event {
+pub fn connect(
+    event: &wire::ConnectEvent,
+    boot_epoch_offset_ns: u64,
+    container_id: Option<String>,
+) -> Event {
     let daddr = if event.is_ipv6 {
         std::net::IpAddr::V6(event.daddr_v6.into())
     } else {
         std::net::IpAddr::V4(event.daddr_v4.into())
     };
     Event::Connect(ConnectEvent {
-        meta: meta(&event.meta, boot_epoch_offset_ns),
+        meta: meta(&event.meta, boot_epoch_offset_ns, container_id),
         daddr,
         dport: event.dport,
     })
@@ -130,7 +155,7 @@ mod tests {
     #[test]
     fn exec_keeps_argv_and_joins_cmdline() {
         let event = wire_exec(b"/usr/bin/curl", b"bash");
-        let Event::Exec(e) = exec(&event, 500, argv(&["curl", "-o", "/tmp/x"])) else {
+        let Event::Exec(e) = exec(&event, 500, argv(&["curl", "-o", "/tmp/x"]), None) else {
             panic!("wrong variant")
         };
         assert_eq!(e.argv, ["curl", "-o", "/tmp/x"]);
@@ -151,7 +176,7 @@ mod tests {
     fn exec_image_path_ignores_spoofed_argv0() {
         // execve("/tmp/evil", {"/usr/sbin/sshd", ...}, ...)
         let event = wire_exec(b"/tmp/evil", b"bash");
-        let Event::Exec(e) = exec(&event, 0, argv(&["/usr/sbin/sshd", "-D"])) else {
+        let Event::Exec(e) = exec(&event, 0, argv(&["/usr/sbin/sshd", "-D"]), None) else {
             panic!("wrong variant")
         };
         assert_eq!(
@@ -168,7 +193,7 @@ mod tests {
     fn exec_empty_argv_when_process_already_exited() {
         // /proc/<pid>/cmdline gone by drain time — image_path still authoritative.
         let event = wire_exec(b"/bin/sh", b"bash");
-        let Event::Exec(e) = exec(&event, 0, Vec::new()) else {
+        let Event::Exec(e) = exec(&event, 0, Vec::new(), None) else {
             panic!("wrong variant")
         };
         assert!(e.argv.is_empty());
@@ -179,10 +204,32 @@ mod tests {
     #[test]
     fn exec_parent_comm_absent_when_lineage_missed() {
         let event = wire_exec(b"/bin/sh", b"");
-        let Event::Exec(e) = exec(&event, 0, argv(&["sh"])) else {
+        let Event::Exec(e) = exec(&event, 0, argv(&["sh"]), None) else {
             panic!("wrong variant")
         };
         assert_eq!(e.parent_comm, None);
+    }
+
+    #[test]
+    fn exec_carries_container_id() {
+        let event = wire_exec(b"/usr/sbin/nginx", b"");
+        let id = "a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456".to_string();
+        let Event::Exec(e) = exec(&event, 0, argv(&["nginx"]), Some(id.clone())) else {
+            panic!("wrong variant")
+        };
+        let container = e.meta.container.expect("container attributed");
+        assert_eq!(container.id, id);
+        assert_eq!(container.image, None, "awaits the socket-lookup follow-up");
+        assert_eq!(container.name, None, "awaits the socket-lookup follow-up");
+    }
+
+    #[test]
+    fn bare_metal_process_has_no_container() {
+        let event = wire_exec(b"/usr/bin/curl", b"bash");
+        let Event::Exec(e) = exec(&event, 0, argv(&["curl"]), None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.meta.container, None);
     }
 
     #[test]
@@ -196,7 +243,7 @@ mod tests {
             path_len: raw.len() as u16,
             flags: 0o101,
         };
-        let Event::FileOpen(e) = file_open(&event, 0) else {
+        let Event::FileOpen(e) = file_open(&event, 0, None) else {
             panic!("wrong variant")
         };
         assert_eq!(e.path, "/etc/cron.d/job");
@@ -213,7 +260,7 @@ mod tests {
             dport: 4444,
             is_ipv6: false,
         };
-        let Event::Connect(e) = connect(&v4, 0) else {
+        let Event::Connect(e) = connect(&v4, 0, None) else {
             panic!("wrong variant")
         };
         // Byte order preserved (the 2026-08-13 reversal bug stays fixed).
@@ -231,7 +278,7 @@ mod tests {
             dport: 8443,
             is_ipv6: true,
         };
-        let Event::Connect(e) = connect(&v6, 0) else {
+        let Event::Connect(e) = connect(&v6, 0, None) else {
             panic!("wrong variant")
         };
         assert_eq!(e.daddr.to_string(), "2001::1");
@@ -245,7 +292,7 @@ mod tests {
             path_len: 0,
             flags: 0,
         };
-        let Event::FileOpen(e) = file_open(&event, 0) else {
+        let Event::FileOpen(e) = file_open(&event, 0, None) else {
             panic!("wrong variant")
         };
         assert!(e.meta.comm.contains('\u{fffd}'), "{:?}", e.meta.comm);

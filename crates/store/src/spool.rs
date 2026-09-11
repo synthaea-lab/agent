@@ -439,6 +439,7 @@ mod tests {
                 user: User::Unknown,
                 timestamp_ns: 42,
                 comm: "x".into(),
+                container: None,
             },
             image_path: "/bin/x".into(),
             cmdline: "x".into(),

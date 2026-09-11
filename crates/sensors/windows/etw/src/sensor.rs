@@ -112,6 +112,7 @@ pub(crate) fn meta(pid: u32, ppid: u32, comm: String, timestamp_ns: u64) -> Even
         user: winapi::read_process_user(pid),
         timestamp_ns,
         comm,
+        container: None,
     }
 }
 

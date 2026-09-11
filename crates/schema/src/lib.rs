@@ -29,7 +29,7 @@ pub mod sensor;
 
 /// Version of the serialized event model. Bumped on any serialization-visible change,
 /// together with a new golden-fixture directory (see crate docs).
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// Identity of the user a process runs as, per platform.
 ///
@@ -68,6 +68,33 @@ pub struct EventMeta {
     /// platform truncation (e.g. the kernel's 15 bytes for `comm`) is a sensor
     /// property reported by conformance, not a schema limit.
     pub comm: String,
+    /// Container the emitting process runs in, when the sensor can attribute one.
+    /// `None` on every platform without container support (Windows, macOS) and on
+    /// bare-metal/VM Linux processes — this is not a Kubernetes pod/namespace context
+    /// (out of scope, issue #80), just the container runtime's own identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<ContainerContext>,
+}
+
+/// Identity of the container a process runs in, resolved from its cgroup (issue #80).
+///
+/// `id` is the only field a Linux sensor can fill today (cgroup path parsing alone,
+/// no daemon call). `image`/`name` need a cached lookup against the Docker/containerd
+/// socket — deliberately left as a follow-up so this attribution foundation doesn't
+/// block on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerContext {
+    /// Full container id, as it appears in the cgroup path (64 hex chars for
+    /// Docker/containerd) — not truncated to the 12-char short id, so it stays a
+    /// stable join key for a later Docker/containerd socket lookup.
+    pub id: String,
+    /// Image reference (e.g. `nginx:1.27`). `None` until the socket lookup lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// Container name, as assigned by the runtime. `None` until the socket lookup
+    /// lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Process execution.

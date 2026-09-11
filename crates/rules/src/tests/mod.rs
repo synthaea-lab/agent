@@ -21,6 +21,7 @@ fn meta() -> EventMeta {
         },
         timestamp_ns: 0,
         comm: String::new(),
+        container: None,
     }
 }
 
