@@ -125,6 +125,66 @@ fn attach_tracepoint(
     Ok(())
 }
 
+/// Splits a NUL-separated `/proc/<pid>/cmdline` blob into argv tokens. The kernel
+/// gives exactly the `execve` argument vector, each element NUL-terminated; a trailing
+/// empty element from the final NUL is dropped, and any interior empty argument is
+/// kept (a process is free to pass `""`). Non-UTF-8 bytes are replaced, never fatal.
+fn parse_proc_cmdline(blob: &[u8]) -> Vec<String> {
+    let trimmed = blob.strip_suffix(b"\0").unwrap_or(blob);
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    trimmed
+        .split(|&b| b == 0)
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect()
+}
+
+/// argv of `pid`, read from `/proc/<pid>/cmdline` when the `exec` event is drained.
+///
+/// Deliberately not read in the probe: that needed a `mm_struct` frozen offset, the
+/// last non-portable read (issue #152). Two consequences, both accepted because
+/// `cmdline`/`argv` are display/analysis inputs and never an identity — that is
+/// `image_path`, still read authoritatively in the probe at `sched_process_exec`:
+///
+/// - **Race.** A process that exits in the few milliseconds before userspace drains
+///   the ring buffer leaves no `/proc` entry (empty argv); if its pid is already
+///   reused in that window the argv is the successor's.
+/// - **Not exec-time.** `/proc/<pid>/cmdline` reflects `mm->arg_*` *now*, not at
+///   `execve`. A process can rewrite its own argv region (write through
+///   `arg_start..arg_end`, or move the pointers with `prctl(PR_SET_MM_ARG_*)`) between
+///   exec and the drain, so a cmdline-substring rule (base64 decode, `curl | sh`) can
+///   be evaded or spoofed by a process willing to scribble its own stack. The old
+///   probe-side read captured argv atomically at exec and did not have this gap.
+///   Tightening it — a `/proc` read triggered from the probe via task-work, or an
+///   `arg_start` snapshot once aya has CO-RE — is a separate follow-up, not this
+///   change.
+///
+/// Not usable on `WSL2`: kernel 6.6 returns `ENOENT` here for every pid, including
+/// a live `sleep 60` with a confirmed parent — the `WSL` interop layer between the
+/// eBPF context and the agent's `/proc` view, not the drain race. `WSL2` is out of
+/// `lab/MATRIX.md`; recorded so it is not re-investigated (Nikolas, 2026-09-10, #155).
+fn read_proc_cmdline(pid: u32) -> Vec<String> {
+    match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(blob) => parse_proc_cmdline(&blob),
+        // The expected exit race (process already gone) is silent; anything else
+        // (EACCES, EIO) is worth a line when tracing a capture gap on some kernel.
+        Err(e) if is_proc_exit_race(&e) => Vec::new(),
+        Err(e) => {
+            log::debug!("read /proc/{pid}/cmdline: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Whether an error from reading `/proc/<pid>/*` is the process having already exited
+/// (the accepted race) rather than a real capture gap. `open()` on a dead pid gives
+/// `ENOENT`; a `read()` that loses the task mid-flight can surface `ESRCH`, which
+/// `std::io` maps to `Uncategorized`, not `NotFound` — so the raw errno is checked too.
+fn is_proc_exit_race(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH)
+}
+
 /// Splits a `/proc/<pid>/stat` line into `(ppid, comm)`. `comm` is parenthesised and
 /// may itself contain spaces and `)` (e.g. `(a )b)`), so the fields after it are read
 /// from the last `)`, not by whitespace-splitting the whole line.
@@ -219,10 +279,11 @@ impl Default for LinuxSensor {
     }
 }
 
-/// Drains every ready item from one ring buffer, decoding `W` and forwarding the
-/// normalized event.
+/// Drains every ready item from one ring buffer, decoding `$wire_ty` and forwarding
+/// the event `$to_event` builds from it. `$to_event` is `Fn(&$wire_ty) -> Event` so
+/// the exec path can enrich with a `/proc/<pid>/cmdline` read the others do not need.
 macro_rules! drain {
-    ($guard:expr, $wire_ty:ty, $normalize:path, $sink:expr, $offset:expr) => {{
+    ($guard:expr, $wire_ty:ty, $sink:expr, $to_event:expr) => {{
         let mut guard = $guard.map_err(|e| err(format!("ring buffer poll failed: {e}")))?;
         let rb = guard.get_inner_mut();
         while let Some(item) = rb.next() {
@@ -231,7 +292,7 @@ macro_rules! drain {
                 // the wire types are repr(C) plain-old-data, and read_unaligned
                 // handles the ring buffer's arbitrary alignment.
                 let event = unsafe { core::ptr::read_unaligned(item.as_ptr() as *const $wire_ty) };
-                $sink.on_event($normalize(&event, $offset));
+                $sink.on_event($to_event(&event));
             }
         }
         guard.clear_ready();
@@ -303,13 +364,23 @@ impl LinuxSensor {
                 _ = &mut ctrl_c => break,
                 _ = self.stop.notified() => break,
                 guard = exec_ring_buf.readable_mut() => {
-                    drain!(guard, sensor_linux_wire::ExecEvent, normalize::exec, sink, offset);
+                    // One synchronous procfs read per exec event, on this task. A
+                    // `/proc/<pid>/cmdline` read is normally served from pseudo-fs
+                    // without blocking (it can still stall on `mmap_lock` contention or
+                    // a page fault in the target's mm), so it does not warrant
+                    // `spawn_blocking` today; if an exec storm ever makes it show up,
+                    // batch the drained pids and read them off the reactor instead.
+                    drain!(guard, sensor_linux_wire::ExecEvent, sink, |e: &sensor_linux_wire::ExecEvent| {
+                        normalize::exec(e, offset, read_proc_cmdline(e.meta.pid))
+                    });
                 }
                 guard = file_open_ring_buf.readable_mut() => {
-                    drain!(guard, sensor_linux_wire::FileOpenEvent, normalize::file_open, sink, offset);
+                    drain!(guard, sensor_linux_wire::FileOpenEvent, sink,
+                        |e: &sensor_linux_wire::FileOpenEvent| normalize::file_open(e, offset));
                 }
                 guard = connect_ring_buf.readable_mut() => {
-                    drain!(guard, sensor_linux_wire::ConnectEvent, normalize::connect, sink, offset);
+                    drain!(guard, sensor_linux_wire::ConnectEvent, sink,
+                        |e: &sensor_linux_wire::ConnectEvent| normalize::connect(e, offset));
                 }
             }
         }
@@ -355,7 +426,52 @@ impl Sensor for LinuxSensor {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_stat_ppid_comm;
+    use super::{is_proc_exit_race, parse_proc_cmdline, parse_stat_ppid_comm};
+
+    #[test]
+    fn cmdline_splits_on_nul_and_drops_trailing_empty() {
+        assert_eq!(
+            parse_proc_cmdline(b"curl\0-o\0/tmp/x\0"),
+            ["curl", "-o", "/tmp/x"]
+        );
+    }
+
+    #[test]
+    fn cmdline_without_trailing_nul() {
+        // The kernel normally NUL-terminates the last arg, but be liberal.
+        assert_eq!(parse_proc_cmdline(b"ls\0-la"), ["ls", "-la"]);
+    }
+
+    #[test]
+    fn cmdline_empty_for_kernel_thread_or_dead_process() {
+        assert!(parse_proc_cmdline(b"").is_empty());
+        assert!(parse_proc_cmdline(b"\0").is_empty());
+    }
+
+    #[test]
+    fn cmdline_keeps_interior_empty_argument() {
+        assert_eq!(parse_proc_cmdline(b"sh\0\0-c\0"), ["sh", "", "-c"]);
+    }
+
+    #[test]
+    fn cmdline_non_utf8_is_lossy_not_fatal() {
+        let out = parse_proc_cmdline(b"\xff\xfe\0-x\0");
+        assert_eq!(out.len(), 2);
+        assert!(out[0].contains('\u{fffd}'));
+        assert_eq!(out[1], "-x");
+    }
+
+    #[test]
+    fn proc_exit_race_is_silent_for_enoent_and_esrch_only() {
+        use std::io::{Error, ErrorKind};
+        // open() on a dead pid — mapped to NotFound
+        assert!(is_proc_exit_race(&Error::from(ErrorKind::NotFound)));
+        // read() losing the task mid-flight — ESRCH, which std::io leaves Uncategorized
+        assert!(is_proc_exit_race(&Error::from_raw_os_error(libc::ESRCH)));
+        // a real capture gap on some kernel must still get logged
+        assert!(!is_proc_exit_race(&Error::from_raw_os_error(libc::EACCES)));
+        assert!(!is_proc_exit_race(&Error::from_raw_os_error(libc::EIO)));
+    }
 
     #[test]
     fn stat_simple() {

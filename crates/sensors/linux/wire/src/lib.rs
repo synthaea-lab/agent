@@ -9,9 +9,9 @@
 //! These types are deliberately NOT the agent's event model: the loader normalizes
 //! them into `schema` types. The fixed limits below are wire/kernel constraints (the
 //! eBPF stack is 512 bytes and events are built in place on it), not product limits —
-//! truncation at these bounds is a sensor property reported by conformance. Raising
-//! `MAX_CMDLINE_LEN` beyond the stack budget needs per-CPU scratch maps on the probe
-//! side (`ExecEvent` is already built in a `PerCpuArray` for this reason).
+//! truncation at these bounds is a sensor property reported by conformance.
+//! `ExecEvent` is built in a `PerCpuArray` because `image` alone already exceeds the
+//! stack budget.
 
 /// Bumped on every layout-affecting change to the structs below. Not a wire header
 /// (ring-buffer items carry none) — a build-time tripwire: the userspace loader
@@ -22,11 +22,13 @@
 /// - v2: `ExecEvent` gains `image`/`image_len` (authoritative image path from the
 ///   tracepoint, issue #111) and `pcomm` (parent name from the fork-lineage map,
 ///   issue #53). `cmdline` is unchanged (`mm->arg_*` blob).
-pub const WIRE_VERSION: u32 = 2;
+/// - v3: `ExecEvent` drops `cmdline`/`cmdline_len` — argv is read from
+///   `/proc/<pid>/cmdline` by the userspace loader (issue #152), so the probe no
+///   longer touches a `task_struct`/`mm_struct` frozen offset at all.
+pub const WIRE_VERSION: u32 = 3;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
-pub const MAX_CMDLINE_LEN: usize = 256;
 
 /// Metadata common to every wire event: identity of the emitting process.
 /// `uid`/`gid` come from `bpf_get_current_uid_gid()` (low/high 32 bits).
@@ -58,12 +60,6 @@ pub struct ExecEvent {
     /// `\0`-terminated, truncated at `MAX_PATH_LEN` (a sensor property).
     pub image: [u8; MAX_PATH_LEN],
     pub image_len: u16,
-    /// argv, `\0`-separated, copied from `mm->arg_start..arg_end`. Caller-controlled —
-    /// display/analysis only, never an identity input. Empty for kernel threads or on
-    /// read failure (including a `task_struct`/`mm_struct` layout mismatch off the
-    /// binding kernel — see `read_argv` in the probe).
-    pub cmdline: [u8; MAX_CMDLINE_LEN],
-    pub cmdline_len: u16,
     /// Parent short name at exec time, from the `PROC_LINEAGE` map. Empty when the
     /// parent forked before the probe attached and `/proc` priming missed it.
     pub pcomm: [u8; TASK_COMM_LEN],
