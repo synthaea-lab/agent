@@ -1,3 +1,6 @@
+# group_imports and imports_granularity are still nightly-only rustfmt options, so
+# formatting must run on nightly: `cargo +nightly fmt` (CI does this; so does
+# lab/lint.sh). Stable rustfmt silently ignores them and reports spurious diffs.
 group_imports = "StdExternalCrate"
 imports_granularity = "Crate"
 reorder_imports = true

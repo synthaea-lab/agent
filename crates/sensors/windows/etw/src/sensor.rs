@@ -17,11 +17,14 @@ use schema::{
     sensor::{Capabilities, EventSink, Sensor, SensorError},
 };
 
-use crate::providers::{
-    dns_provider, dotnet_provider, file_provider, network_provider, powershell_provider,
-    process_provider, registry_provider, smb_provider, wmi_provider,
+use crate::{
+    normalize,
+    providers::{
+        dns_provider, dotnet_provider, file_provider, network_provider, powershell_provider,
+        process_provider, registry_provider, smb_provider, wmi_provider,
+    },
+    winapi,
 };
-use crate::{normalize, winapi};
 
 /// Where the previous session's randomized name is persisted, so orphan cleanup
 /// after a crash still works despite F-2's name randomization.

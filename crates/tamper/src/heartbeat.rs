@@ -27,8 +27,10 @@
 //! cannot self-generate traffic, the monitor still catches a *total* stall; the
 //! canary is what tightens "no events" into "no events despite guaranteed activity".
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 /// A sensor's liveness counter. Cloneable: the sensor keeps one and pulses it, the
 /// [`SilenceMonitor`] keeps another and reads it. Reads and writes are `Relaxed` —

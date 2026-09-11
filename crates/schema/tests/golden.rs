@@ -5,11 +5,11 @@
 
 use std::net::IpAddr;
 
-use schema::detection::{Detection, DetectionSource, ScoreAttribution, Severity};
 use schema::{
     AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileOpenEvent,
     ImageLoadEvent, RegistrySetEvent, ScriptBlockEvent, SmbConnectEvent, UdpSendEvent, User,
     WmiActivityEvent,
+    detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
 fn fixture(name: &str) -> serde_json::Value {

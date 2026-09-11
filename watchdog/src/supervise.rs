@@ -2,11 +2,15 @@
 //! the agent, watch it, respawn on exit. (Layer 2 is the service manager restarting
 //! the watchdog itself — see [`crate::service`].)
 
-use std::path::{Path, PathBuf};
-use std::process::Child;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::{
+    path::{Path, PathBuf},
+    process::Child,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 #[cfg(unix)]
 use anyhow::Context as _;

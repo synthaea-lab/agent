@@ -5,20 +5,26 @@
 use std::collections::HashMap;
 
 use schema::User;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-use windows_sys::Win32::Security::{
-    GetTokenInformation, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel,
-    TokenUser,
-};
-use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
-use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
-};
-use windows_sys::Win32::System::Threading::{
-    OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_VM_READ, QueryFullProcessImageNameW,
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
+    Security::{
+        Authorization::ConvertSidToStringSidW, GetTokenInformation, TOKEN_MANDATORY_LABEL,
+        TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenUser,
+    },
+    Storage::FileSystem::QueryDosDeviceW,
+    System::{
+        Diagnostics::{
+            Debug::ReadProcessMemory,
+            ToolHelp::{
+                CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+                TH32CS_SNAPPROCESS,
+            },
+        },
+        Threading::{
+            OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_VM_READ, QueryFullProcessImageNameW,
+        },
+    },
 };
 
 // ── F-1: real command line from the target's PEB ─────────────────────────────

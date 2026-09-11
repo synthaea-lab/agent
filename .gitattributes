@@ -1,0 +1,6 @@
+# crates/correlator/src/engine.rs and crates/policy/src/lib.rs were committed with
+# CRLF while the rest of the tree is LF. rustfmt run on Linux (CI, or the lab VMs)
+# then rewrites those files whole just to flip line endings, burying the real diff.
+# Pin *.rs to LF so formatting stays a content-only change regardless of the
+# developer's core.autocrlf.
+*.rs text eol=lf

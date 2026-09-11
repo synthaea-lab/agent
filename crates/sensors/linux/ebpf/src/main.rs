@@ -2,6 +2,7 @@
 #![no_main]
 
 use aya_ebpf::{
+    EbpfContext,
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_task,
         bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes, bpf_probe_read_user,
@@ -10,7 +11,6 @@ use aya_ebpf::{
     macros::{map, tracepoint},
     maps::{HashMap, PerCpuArray, RingBuf},
     programs::TracePointContext,
-    EbpfContext,
 };
 use aya_log_ebpf::{info, warn};
 use sensor_linux_wire::{
@@ -482,14 +482,15 @@ fn try_sys_enter_connect(ctx: TracePointContext) -> Result<u32, u32> {
     // sockaddr_in6::sin6_addr at +8.
     let (v4, v6): ([u8; 4], [u8; 16]) = if family == AF_INET {
         (
-            unsafe { bpf_probe_read_user((uservaddr_ptr + 4) as *const [u8; 4]).map_err(|_| 1u32)? },
+            unsafe {
+                bpf_probe_read_user((uservaddr_ptr + 4) as *const [u8; 4]).map_err(|_| 1u32)?
+            },
             [0u8; 16],
         )
     } else {
-        (
-            [0u8; 4],
-            unsafe { bpf_probe_read_user((uservaddr_ptr + 8) as *const [u8; 16]).map_err(|_| 1u32)? },
-        )
+        ([0u8; 4], unsafe {
+            bpf_probe_read_user((uservaddr_ptr + 8) as *const [u8; 16]).map_err(|_| 1u32)?
+        })
     };
 
     // Assemble in per-CPU scratch, then one `output` copy (see `try_sys_enter_openat`).

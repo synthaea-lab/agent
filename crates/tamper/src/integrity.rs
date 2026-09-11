@@ -25,9 +25,11 @@
 //! 12 KB launcher that is now 300 MB is exactly the tampering we are looking for),
 //! not something we read to the end.
 
-use std::collections::BTreeMap;
-use std::io::Read as _;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    io::Read as _,
+    path::{Path, PathBuf},
+};
 
 use sha2::{Digest, Sha256};
 

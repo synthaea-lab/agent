@@ -4,9 +4,8 @@
 
 use std::{collections::HashMap, net::IpAddr};
 
-use store::BoundedMap;
-
 use schema::{ConnectEvent, ExecEvent, FileOpenEvent};
+use store::BoundedMap;
 
 use crate::{
     Alert,

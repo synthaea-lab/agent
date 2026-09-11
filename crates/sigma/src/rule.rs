@@ -1,7 +1,8 @@
 //! Data structures for a parsed Sigma rule.
 
-use serde::Deserialize;
 use std::collections::HashMap;
+
+use serde::Deserialize;
 
 /// Sigma rule as loaded from the YAML.
 #[derive(Debug, Deserialize)]

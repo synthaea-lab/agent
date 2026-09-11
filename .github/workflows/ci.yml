@@ -13,10 +13,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
       - name: rustfmt
-        run: cargo fmt --all --check
+        # rustfmt.toml sets unstable options (group_imports, imports_granularity);
+        # stable rustfmt silently ignores them, so the check must run on nightly.
+        run: |
+          rustup toolchain install nightly --profile minimal --component rustfmt
+          cargo +nightly fmt --all --check
       - name: dependency direction
         run: python3 tools/check-deps.py
       - name: docs build clean

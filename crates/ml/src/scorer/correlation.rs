@@ -21,12 +21,13 @@
 //! this crate yet — see `docs/detection/correlation.md`.
 
 use correlator::EventBus;
-use ort::session::Session;
-use ort::value::Tensor;
+use ort::{session::Session, value::Tensor};
 
 use super::{Score, ScorerError};
-use crate::features::correlation::{self, FEATURE_NAMES};
-use crate::forest::Forest;
+use crate::{
+    features::correlation::{self, FEATURE_NAMES},
+    forest::Forest,
+};
 
 /// Index of `event_count` in [`FEATURE_NAMES`] — the gate feature.
 const EVENT_COUNT_IDX: usize = 7;

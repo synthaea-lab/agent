@@ -5,11 +5,12 @@ use std::path::Path;
 
 use schema::ExecEvent;
 
-use crate::eval::eval_rule_exec;
-use crate::rule::{SigmaAlert, SigmaRule};
-use crate::validate::validate;
-
 pub use crate::validate::SigmaError;
+use crate::{
+    eval::eval_rule_exec,
+    rule::{SigmaAlert, SigmaRule},
+    validate::validate,
+};
 
 /// Sigma engine: set of loaded, validated rules, ready to evaluate.
 pub struct SigmaEngine {

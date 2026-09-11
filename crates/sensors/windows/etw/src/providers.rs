@@ -13,8 +13,11 @@ use schema::{
     WmiActivityEvent, sensor::EventSink,
 };
 
-use crate::sensor::{SharedState, basename, meta};
-use crate::{normalize, winapi};
+use crate::{
+    normalize,
+    sensor::{SharedState, basename, meta},
+    winapi,
+};
 
 const KERNEL_PROCESS_GUID: &str = "22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716";
 const KERNEL_NETWORK_GUID: &str = "7dd42a49-5329-4832-8dfd-43d979153a88";

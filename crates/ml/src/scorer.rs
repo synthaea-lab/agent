@@ -16,11 +16,12 @@
 
 pub mod correlation;
 
-use ort::session::Session;
-use ort::value::Tensor;
+use ort::{session::Session, value::Tensor};
 
-use crate::features::cmdline::{self, FEATURE_NAMES};
-use crate::forest::{Forest, ParseError};
+use crate::{
+    features::cmdline::{self, FEATURE_NAMES},
+    forest::{Forest, ParseError},
+};
 
 /// Model artifacts arrive from the update channel; loading and inference must surface
 /// errors, never panic.

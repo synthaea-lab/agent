@@ -3,9 +3,11 @@
 
 use schema::{EventMeta, ExecEvent, User};
 
-use crate::eval::{eval_rule_exec, glob_match};
-use crate::rule::SigmaRule;
-use crate::validate::validate;
+use crate::{
+    eval::{eval_rule_exec, glob_match},
+    rule::SigmaRule,
+    validate::validate,
+};
 
 fn exec(image: &str, cmdline: &str) -> ExecEvent {
     ExecEvent {

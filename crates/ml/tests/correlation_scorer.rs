@@ -9,8 +9,7 @@
 //! of events — including the `MIN_EVENT_COUNT` gate, where the scorer returns
 //! `None` and the model is never asked.
 
-use std::net::Ipv4Addr;
-use std::time::Duration;
+use std::{net::Ipv4Addr, time::Duration};
 
 use correlator::EventBus;
 use ml::CorrelationScorer;

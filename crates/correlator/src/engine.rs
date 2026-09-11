@@ -3,9 +3,8 @@
 
 use std::time::Duration;
 
-use store::BoundedMap;
-
 use schema::Event;
+use store::BoundedMap;
 
 use crate::{
     bayes::{BAYES_THRESHOLD, BeliefState, update_belief},
@@ -127,10 +126,7 @@ impl CorrelationEngine {
             // is enough — both conditions must hold for the exclusion to apply.
             if is_ignored(&comm)
                 && (!policy::name_exclusion_applies(Some(exec.image_path.as_str()))
-                    || !policy::parent_exclusion_applies(
-                        &comm,
-                        exec.parent_comm.as_deref(),
-                    ))
+                    || !policy::parent_exclusion_applies(&comm, exec.parent_comm.as_deref()))
             {
                 self.masquerading.insert(pid, ());
             }

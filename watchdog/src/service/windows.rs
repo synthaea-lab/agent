@@ -1,10 +1,14 @@
 //! Windows: the watchdog runs as an SCM service with an `sc failure` restart
 //! policy, and detects service-mode launch itself (see `main`'s dispatch).
 
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context as _, bail};
 use windows_service::{
@@ -18,8 +22,10 @@ use windows_service::{
 };
 
 use super::{SERVICE_DESC, SERVICE_DISPLAY, SERVICE_NAME};
-use crate::paths::{DEFAULT_ALERTS, resolve_agent_bin};
-use crate::supervise::watchdog_loop;
+use crate::{
+    paths::{DEFAULT_ALERTS, resolve_agent_bin},
+    supervise::watchdog_loop,
+};
 
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 

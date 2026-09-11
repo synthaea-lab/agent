@@ -3,9 +3,8 @@
 //! model. Consumed only by [`super::Forest::from_onnx_bytes`]; the walk and the
 //! attribution semantics live in the parent module.
 
-use crate::proto::{Reader, Wire, read_f32s, read_i64s};
-
 use super::{NodeKind, ParseError, Tree, TreeNode, average_path_length};
+use crate::proto::{Reader, Wire, read_f32s, read_i64s};
 
 /// A `NodeProto` reduced to what we read.
 pub(super) struct GraphNode<'a> {

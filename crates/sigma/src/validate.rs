@@ -2,8 +2,10 @@
 //! with an error naming exactly what is unsupported. Nothing is ever silently
 //! never-matching at evaluation time — that failure mode is what this module kills.
 
-use crate::eval::parse_field_spec;
-use crate::rule::{Selection, SigmaRule, ValueList};
+use crate::{
+    eval::parse_field_spec,
+    rule::{Selection, SigmaRule, ValueList},
+};
 
 const SUPPORTED_FIELDS: &[&str] = &["image", "commandline", "parentimage"];
 const SUPPORTED_MODIFIERS: &[&str] = &["contains", "startswith", "endswith"];

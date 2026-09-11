@@ -20,5 +20,7 @@ pub mod forest;
 pub mod scorer;
 
 pub use forest::{Attribution, Forest, ParseError, top_attributions};
-pub use scorer::correlation::{CorrelationScorer, MIN_EVENT_COUNT, score_to_llr};
-pub use scorer::{CmdlineScorer, Score, ScorerError};
+pub use scorer::{
+    CmdlineScorer, Score, ScorerError,
+    correlation::{CorrelationScorer, MIN_EVENT_COUNT, score_to_llr},
+};

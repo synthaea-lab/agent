@@ -29,7 +29,6 @@ mod supervise;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-
 use paths::DEFAULT_ALERTS;
 
 #[derive(Parser)]

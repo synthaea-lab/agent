@@ -163,7 +163,10 @@ mod exclusion_tests {
 
     #[test]
     fn svchost_from_services_is_legitimate() {
-        assert!(parent_exclusion_applies("svchost.exe", Some("services.exe")));
+        assert!(parent_exclusion_applies(
+            "svchost.exe",
+            Some("services.exe")
+        ));
     }
 
     #[test]
@@ -206,7 +209,10 @@ mod exclusion_tests {
 
     #[test]
     fn parent_check_is_case_insensitive() {
-        assert!(parent_exclusion_applies("SVCHOST.EXE", Some("SERVICES.EXE")));
+        assert!(parent_exclusion_applies(
+            "SVCHOST.EXE",
+            Some("SERVICES.EXE")
+        ));
         assert!(!parent_exclusion_applies("svchost.exe", Some("CMD.EXE")));
     }
 
