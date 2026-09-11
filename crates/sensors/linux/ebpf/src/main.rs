@@ -7,9 +7,9 @@ use aya_ebpf::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_kernel_str_bytes,
         bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
-    macros::{map, tracepoint},
+    macros::{lsm, map, tracepoint},
     maps::{HashMap, PerCpuArray, RingBuf},
-    programs::TracePointContext,
+    programs::{LsmContext, TracePointContext},
 };
 use aya_log_ebpf::{info, warn};
 use sensor_linux_wire::{ConnectEvent, ExecEvent, FileOpenEvent, LineageEntry, TASK_COMM_LEN};
@@ -386,6 +386,52 @@ fn try_sys_enter_connect(ctx: TracePointContext) -> Result<u32, u32> {
     };
 
     info!(&ctx, "sensor-linux-ebpf: connect pid={}", pid);
+    Ok(0)
+}
+
+/// Per-CPU hit counter for the `file_open` LSM hook below — issue #91's foundation
+/// slice, observation only. Exists so userspace (`sensor-linux-lsm`) has something
+/// concrete to point at proving the hook actually fires, without yet deciding how an
+/// LSM-sourced open relates to the tracepoint-sourced `FileOpenEvent` above (double-
+/// counting the same open two ways needs a real answer, left to the follow-up that
+/// also wires `-EPERM` to a `response` verdict — that plumbing does not exist yet).
+#[map]
+static LSM_FILE_OPEN_HITS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+/// Observation-only LSM hook (issue #91 foundation). Fires at the security layer
+/// regardless of entry path — including `io_uring`-submitted opens, which never reach
+/// `syscalls:sys_enter_openat` above (the blinding technique against tracepoint-only
+/// EDRs this hook exists to close). Reads no `struct file` field: this slice proves
+/// the hook attaches and fires, nothing more, so it needs no `vmlinux` BTF bindings
+/// and no per-kernel offset table — same discipline as the rest of this probe.
+#[lsm(hook = "file_open")]
+pub fn file_open(ctx: LsmContext) -> i32 {
+    match try_file_open(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_file_open(ctx: LsmContext) -> Result<i32, i32> {
+    // `file_open`'s LSM_HOOK signature is `(struct file *file, int retval)` — `arg(1)`
+    // is the verdict of whatever LSM program ran before us in the chain. Defer to an
+    // earlier `-EPERM` rather than silently overriding it with our own `0`; this hook
+    // never denies on its own (no verdict source to enforce yet).
+    let retval: i32 = ctx.arg(1);
+    if retval != 0 {
+        return Ok(retval);
+    }
+
+    if let Some(count) = LSM_FILE_OPEN_HITS.get_ptr_mut(0) {
+        // SAFETY: `count` is a valid per-CPU slot pointer from `get_ptr_mut`; no
+        // concurrent access from another CPU (each CPU owns its own slot).
+        unsafe {
+            *count = (*count).wrapping_add(1);
+        }
+    }
+
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    info!(&ctx, "sensor-linux-ebpf: lsm file_open pid={}", pid);
     Ok(0)
 }
 
