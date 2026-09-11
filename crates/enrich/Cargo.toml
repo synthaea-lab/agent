@@ -12,5 +12,5 @@ workspace = true
 [dependencies]
 schema = { path = "../schema" }
 store = { path = "../store" }
-sha2 = "0.10"
+sha2 = "0.11"
 log = { version = "0.4", default-features = false }
