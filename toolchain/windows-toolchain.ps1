@@ -8,13 +8,13 @@
     Provider-neutral, like ../MATRIX.md and lab/provisioning/linux-toolchain.sh:
     a harness (Vagrant winrm provisioner, a plain `Invoke-Command` over
     WinRM/PSRemoting, a cloud-init-equivalent user-data script) is only
-    responsible for running this inside the VM. Idempotent — safe to re-run
+    responsible for running this inside the VM. Idempotent - safe to re-run
     (e.g. `vagrant provision win11`) without redoing already-completed steps.
 
     Unlike the Linux eBPF toolchain, nothing here needs a specific LLVM/kernel
     version: `windows-sys`/`ferrisetw` (ETW) and `windows-service` (SCM) are
     pure-Rust FFI bindings against DLLs Windows already ships (advapi32,
-    kernel32, ...) — the only extra piece beyond Rust itself is the MSVC
+    kernel32, ...) - the only extra piece beyond Rust itself is the MSVC
     linker + Windows SDK (`link.exe`, import libs), which on Windows comes
     from Visual Studio's Build Tools, not from Rust or cargo.
 #>
@@ -34,12 +34,12 @@ function Write-Section([string]$Title) {
     Write-Host "== $Title ==" -ForegroundColor Cyan
 }
 
-# ── Git ─────────────────────────────────────────────────────────────────────
+# -- Git ---------------------------------------------------------------------
 # Mirrors linux-toolchain.sh's package list (which includes git): a fresh lab
 # VM has no git, and getting the repo onto it is the very first thing every
 # workflow after this script needs (clone, `vagrant rsync`-less winrm setups,
 # CI checkouts). winget ships on Windows 10 2004+/11 but NOT on most Windows
-# Server images (confirmed missing on winserver in #22 testing) — falls back
+# Server images (confirmed missing on winserver in #22 testing) - falls back
 # to a pinned Git for Windows installer in that case rather than resolving
 # "latest" (matches rustup-init/vs_buildtools below: a fixed, known-good URL).
 Write-Section "Git"
@@ -54,12 +54,12 @@ if (Get-Command git -ErrorAction SilentlyContinue) {
         throw "winget install Git.Git failed with exit code $LASTEXITCODE"
     }
 } else {
-    Write-Host "[info] winget not present (common on Server images) — installing Git for Windows directly"
+    Write-Host "[info] winget not present (common on Server images) - installing Git for Windows directly"
     $gitInstaller = Join-Path $env:TEMP "git-for-windows.exe"
     Invoke-WebRequest -Uri "https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.1/Git-2.47.1-64-bit.exe" `
         -OutFile $gitInstaller
     # /VERYSILENT: Inno Setup's unattended flag (Git for Windows is built with
-    # Inno Setup, not MSI — different silent-install convention than
+    # Inno Setup, not MSI - different silent-install convention than
     # vs_buildtools.exe below). /NORESTART: same reasoning as Build Tools.
     $proc = Start-Process -FilePath $gitInstaller -ArgumentList @(
         "/VERYSILENT", "/NORESTART", "/NOCANCEL", "/SP-", "/CLOSEAPPLICATIONS"
@@ -79,10 +79,10 @@ if ((-not (Get-Command git -ErrorAction SilentlyContinue)) -and (Test-Path $gitB
 if (Get-Command git -ErrorAction SilentlyContinue) {
     git --version
 } else {
-    Write-Host "[warn] git installed but not resolvable on PATH in this session — a new shell should see it" -ForegroundColor Yellow
+    Write-Host "[warn] git installed but not resolvable on PATH in this session - a new shell should see it" -ForegroundColor Yellow
 }
 
-# ── Rust (rustup) ──────────────────────────────────────────────────────────
+# -- Rust (rustup) ----------------------------------------------------------
 Write-Section "Rust (rustup, stable-msvc)"
 
 $cargoHome = Join-Path $env:USERPROFILE ".cargo"
@@ -120,11 +120,11 @@ if ($env:Path -notlike "*$cargoBin*") {
 & "$cargoBin\rustc.exe" --version
 & "$cargoBin\cargo.exe" --version
 
-# ── MSVC Build Tools + Windows SDK ─────────────────────────────────────────
+# -- MSVC Build Tools + Windows SDK -----------------------------------------
 # The Rust MSVC toolchain (the rustup default above) links with `link.exe`
 # from Visual Studio's C++ toolset, plus the Windows SDK import libraries
 # (kernel32.lib, advapi32.lib, ...) that windows-sys/windows-service bind
-# against — neither ships with Rust itself. `vswhere` (installed by any VS
+# against - neither ships with Rust itself. `vswhere` (installed by any VS
 # product since 2017, including Build Tools) is the supported way to check
 # what's already there before downloading anything.
 if ($SkipBuildTools) {
@@ -159,24 +159,24 @@ if ($SkipBuildTools) {
             "--includeRecommended"
         ) -PassThru -Wait
 
-        # 3010 = ERROR_SUCCESS_REBOOT_REQUIRED — installed fine, but a reboot
+        # 3010 = ERROR_SUCCESS_REBOOT_REQUIRED - installed fine, but a reboot
         # is pending; still a success for provisioning purposes.
         if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
             throw "vs_buildtools.exe failed with exit code $($proc.ExitCode)"
         }
         if ($proc.ExitCode -eq 3010) {
-            Write-Host "[warn] Build Tools installed but a reboot is pending — reboot before building" -ForegroundColor Yellow
+            Write-Host "[warn] Build Tools installed but a reboot is pending - reboot before building" -ForegroundColor Yellow
         } else {
             Write-Host "[ok] Build Tools installed"
         }
     }
 }
 
-# ── Verification ────────────────────────────────────────────────────────────
+# -- Verification ------------------------------------------------------------
 Write-Section "Verification"
 
 # link.exe itself only resolves inside a "Developer" shell (vcvarsall.bat sets
-# up its own PATH/INCLUDE/LIB) — a plain build works because cargo's MSVC
+# up its own PATH/INCLUDE/LIB) - a plain build works because cargo's MSVC
 # linker-search (via the `cc`/`link-args` machinery in rustc, which shells out
 # to `vswhere`-discovered paths itself) doesn't need this script's shell to
 # already have it on PATH. This check just confirms *something* would find
@@ -188,10 +188,10 @@ if (Test-Path $vswhere) {
     if ($installPath) {
         Write-Host "[ok] Visual Studio / Build Tools at $installPath"
     } else {
-        Write-Host "[warn] vswhere found no VC++ installation — a `cargo build` will fail to link" -ForegroundColor Yellow
+        Write-Host "[warn] vswhere found no VC++ installation - a `cargo build` will fail to link" -ForegroundColor Yellow
     }
 } else {
-    Write-Host "[warn] vswhere.exe not found — cannot confirm the MSVC toolset is installed" -ForegroundColor Yellow
+    Write-Host "[warn] vswhere.exe not found - cannot confirm the MSVC toolset is installed" -ForegroundColor Yellow
 }
 
 Write-Host ""
