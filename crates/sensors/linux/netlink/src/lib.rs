@@ -19,32 +19,48 @@
 //! (confirmed empirically: `sock_diag` for TCP works unprivileged, unlike
 //! conntrack and proc connector below).
 //!
+//! **proc connector is also done** — [`ProcEventSubscription`] subscribes to the
+//! kernel's `CN_IDX_PROC` multicast group over `NETLINK_CONNECTOR`
+//! ([`proc_events`]/[`proc_socket`]) and decodes fork/exec/exit broadcasts. Root/
+//! `CAP_NET_ADMIN`-only (unlike `sock_diag`): confirmed against this dev
+//! machine that the kernel rejects the subscribe with `EPERM` for an
+//! unprivileged caller, reported back as a proper `NetlinkError`, not a panic.
+//!
 //! Deliberately **not** here yet:
-//! - **conntrack** and **proc connector** — both were confirmed reachable in this
-//!   sandbox (this session has passwordless `sudo`), but each is a full netlink
-//!   sub-protocol of its own (conntrack's TLV-nested attributes — tuples,
-//!   counters — are a meaningfully bigger parser than `sock_diag`'s fixed-size
-//!   struct). Scoped out to keep this slice reviewable; tracked as follow-ups on
-//!   #92, not silently dropped.
-//! - No `schema::Event` variant or [`schema::sensor::Sensor`] implementation:
-//!   volume/periodicity beacon features and the eBPF cross-check both need
-//!   `crates/correlator`/`crates/tamper` wiring that doesn't exist for this data
-//!   yet — nothing to push into today.
+//! - **conntrack** — a full netlink sub-protocol of its own (TLV-nested
+//!   attributes — tuples, counters — a meaningfully bigger parser than either
+//!   `sock_diag`'s fixed-size struct or proc connector's flat `proc_event`
+//!   union). Scoped out to keep each slice reviewable; tracked as a follow-up
+//!   on #92, not silently dropped.
+//! - No `schema::Event` variant or [`schema::sensor::Sensor`] implementation
+//!   for either `sock_diag` or proc connector: volume/periodicity beacon
+//!   features and the eBPF cross-check both need `crates/correlator`/
+//!   `crates/tamper` wiring that doesn't exist for this data yet — nothing to
+//!   push into today.
 //! - UDP sockets — `sock_diag` supports them, but "listen/established" (this
 //!   issue's own wording) is TCP-state terminology; UDP would need its own
 //!   category, not a states-mask filter.
 //! - Periodic re-snapshotting / drift detection between snapshots — [`snapshot`]
 //!   is a one-shot query; a caller decides the cadence. No lab VM here to
 //!   validate the issue's "listening-port drift" done-when item against.
+//! - `PROC_EVENT_UID`/`_GID`/`_SID`/`_PTRACE`/`_COMM`/`_COREDUMP` — decoded as
+//!   [`ProcEvent::Other`] rather than their own variants; nothing in the eBPF
+//!   stream to cross-check them against yet (see [`proc_events`]).
 
+mod proc_events;
 mod proc_join;
 mod wire;
 
+#[cfg(target_os = "linux")]
+mod proc_socket;
 #[cfg(target_os = "linux")]
 mod socket;
 
 use std::net::SocketAddr;
 
+pub use proc_events::ProcEvent;
+#[cfg(target_os = "linux")]
+pub use proc_socket::ProcEventSubscription;
 #[cfg(target_os = "linux")]
 pub use socket::NetlinkError;
 pub use wire::{DiagMsg, TCP_ESTABLISHED, TCP_LISTEN};
