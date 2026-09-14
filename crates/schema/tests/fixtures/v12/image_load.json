@@ -1,0 +1,11 @@
+{
+  "type": "image_load",
+  "meta": {
+    "pid": 4242,
+    "ppid": 1337,
+    "user": { "os": "windows", "sid": "S-1-5-18", "integrity_level": 16384 },
+    "timestamp_ns": 1756900030000000000,
+    "comm": "powershell.exe"
+  },
+  "image_path": "C:\\Windows\\System32\\amsi.dll"
+}

@@ -69,19 +69,35 @@
 //! diffs consecutive results. No lab VM here to validate that live, same gap as
 //! before this wiring existed.
 //!
+//! **`schema::Event` wiring, for conntrack flows:** [`conntrack_flow_events`] maps
+//! a [`dump_conntrack`] dump to [`schema::Event::NetworkFlow`] (`schema`
+//! `SCHEMA_VERSION` 11 -> 12) — the mapping issue #92's "conntrack features reach
+//! the correlator" done-when item needs. A conntrack entry carries no PID at all
+//! from the kernel, unlike `sock_diag`'s inode->pid join — attribution instead
+//! joins the flow's tuple against a concurrent [`snapshot`]'s
+//! `local`/`remote`/state, see [`normalize::conntrack_flow_events_for`]'s doc for
+//! the two-orientation match this needs (outbound vs. locally-accepted) and why
+//! `orig`/`reply`'s byte counters must be swapped for one of them relative to
+//! "sent"/"received". TCP only — [`snapshot`] never queries UDP sockets, so a UDP
+//! flow can never find a match (checked explicitly, not left to chance). A flow
+//! nothing could attribute (already closed, permission-denied `/proc/<pid>/fd`,
+//! or genuinely no matching local socket) produces no event, same discipline as
+//! [`listen_port_events`]. Two kernel queries taken back to back, not atomically
+//! — see [`conntrack_flow_events`]'s doc. Still not here: `crates/correlator`
+//! wiring (below) and periodic polling/the beacon-scenario validation itself — no
+//! lab VM here to generate one live.
+//!
 //! Deliberately **not** here yet:
-//! - `schema::Event` wiring for `conntrack` (beacon volume/periodicity features) and
-//!   `proc connector` (the eBPF cross-check): both need design decisions beyond this
-//!   slice's scope — conntrack flows carry no PID at all from the kernel (would
-//!   need a further join, e.g. against a `sock_diag` snapshot's own tuples, to
-//!   attribute one), and the proc connector's role per the issue is a *tamper*
-//!   signal (divergence from the eBPF stream), which may not want to be a
-//!   `schema::Event` at all rather than an internal `crates/tamper` comparison —
-//!   not a call this Linux-only slice should make alone.
-//! - `crates/correlator` wiring: [`listen_port_events`] produces `schema::Event`s,
-//!   but nothing in this crate hands them to `correlator::EventBus` — that's the
-//!   caller's job (the same one that would own the polling cadence above), and no
-//!   such caller exists yet for this crate's data.
+//! - `schema::Event` wiring for the proc connector (the eBPF cross-check): the
+//!   issue's role for it is a *tamper* signal (divergence from the eBPF stream),
+//!   which may not want to be a `schema::Event` at all rather than an internal
+//!   `crates/tamper` comparison — not a call this Linux-only slice should make
+//!   alone.
+//! - `crates/correlator` wiring: [`listen_port_events`]/[`conntrack_flow_events`]
+//!   produce `schema::Event`s, but nothing in this crate hands them to
+//!   `correlator::EventBus` — that's the caller's job (the same one that would own
+//!   the polling cadence above), and no such caller exists yet for this crate's
+//!   data.
 //! - UDP sockets — `sock_diag` supports them, but "listen/established" (this
 //!   issue's own wording) is TCP-state terminology; UDP would need its own
 //!   category, not a states-mask filter.
@@ -223,6 +239,36 @@ pub fn listen_port_events(timestamp_ns: u64) -> Result<Vec<schema::Event>, Netli
         .collect())
 }
 
+/// Dumps the kernel's conntrack table and a `sock_diag` snapshot, and maps every
+/// TCP flow the two can jointly attribute to a [`schema::Event::NetworkFlow`] —
+/// the mapping issue #92's "conntrack features reach the correlator" done-when
+/// item needs (`schema` `SCHEMA_VERSION` 11 -> 12). See
+/// [`normalize::conntrack_flow_events_for`] for the attribution join (why a flow
+/// needs a concurrent `sock_diag` snapshot at all) and what it does and doesn't
+/// cover (TCP only, UDP flows never match). `timestamp_ns` is stamped on every
+/// event as the poll time, same caveat as [`listen_port_events`].
+///
+/// Two independent kernel queries ([`dump_conntrack`] and [`snapshot`]) are taken
+/// back to back, not atomically — a flow that closes or a socket that's replaced
+/// between the two is simply unattributed this poll rather than mismatched, since
+/// [`normalize::conntrack_flow_events_for`]'s join requires an exact tuple match.
+///
+/// # Errors
+///
+/// See [`NetlinkError`] — either query failing as a whole fails this call; a flow
+/// this crate merely couldn't *attribute* is not an error (see above).
+#[cfg(target_os = "linux")]
+pub fn conntrack_flow_events(timestamp_ns: u64) -> Result<Vec<schema::Event>, NetlinkError> {
+    let flows = dump_conntrack()?;
+    let sockets = snapshot()?;
+    Ok(flows
+        .iter()
+        .flat_map(|flow| {
+            normalize::conntrack_flow_events_for(flow, &sockets, proc_meta::resolve, timestamp_ns)
+        })
+        .collect())
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
@@ -263,6 +309,35 @@ mod tests {
             };
             assert_eq!(listen.meta.timestamp_ns, 42);
             assert_ne!(listen.meta.pid, 0);
+        }
+    }
+
+    #[test]
+    fn conntrack_flow_events_runs_end_to_end_against_the_real_kernel_and_proc() {
+        // Unlike sock_diag, conntrack's unprivileged reachability isn't
+        // characterized (crate doc) — every capture this crate was built against
+        // ran as root. Same EPERM-tolerant pattern as proc_socket's live test:
+        // skip rather than fail when this dev environment isn't privileged.
+        let events = match conntrack_flow_events(42) {
+            Ok(events) => events,
+            Err(NetlinkError::Kernel(errno)) if errno == libc::EPERM => {
+                eprintln!("skipping: kernel rejected the conntrack dump with EPERM — needs root");
+                return;
+            }
+            Err(e) => panic!("unexpected netlink error: {e}"),
+        };
+        // Nondeterministic whether any TCP flow this host both has in conntrack
+        // and can attribute to a live socket exists right now — the property
+        // that must hold regardless: every event produced really is a
+        // NetworkFlow variant with the stamped timestamp, a nonzero PID, and
+        // TCP's protocol number.
+        for event in &events {
+            let schema::Event::NetworkFlow(flow) = &event else {
+                panic!("conntrack_flow_events must only ever produce NetworkFlow events");
+            };
+            assert_eq!(flow.meta.timestamp_ns, 42);
+            assert_ne!(flow.meta.pid, 0);
+            assert_eq!(flow.protocol, wire::IPPROTO_TCP);
         }
     }
 }

@@ -29,7 +29,7 @@ pub mod sensor;
 
 /// Version of the serialized event model. Bumped on any serialization-visible change,
 /// together with a new golden-fixture directory (see crate docs).
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// Identity of the user a process runs as, per platform.
 ///
@@ -375,6 +375,38 @@ pub struct ConnectEvent {
     pub dport: u16,
 }
 
+/// Conntrack flow accounting — bytes/packets transferred over a tracked connection,
+/// the beacon-detection volume feature a point-in-time [`ConnectEvent`] can't carry
+/// (Linux: `NETLINK_NETFILTER`/`ctnetlink`, issue #92).
+///
+/// A conntrack dump entry carries no PID of its own — this event only exists because
+/// the sensor joined the flow's tuple against a concurrent `sock_diag` snapshot to
+/// attribute it (see `sensor-linux-netlink`'s `normalize::conntrack_flow_events_for`);
+/// a flow the join couldn't attribute (already closed, owned by another user's
+/// unreadable `/proc/<pid>/fd`) produces no event at all rather than one with
+/// fabricated metadata, same discipline as [`ListenPortEvent`].
+///
+/// `bytes_*`/`packets_*` are `None` when the kernel's
+/// `net.netfilter.nf_conntrack_acct` accounting is disabled (the default) — a flow
+/// with `None` counters is still worth an event (its address/port/protocol alone),
+/// just without volume data. `meta.timestamp_ns` is the poll time, not flow start —
+/// same "snapshot, not a discrete trace" caveat as [`ListenPortEvent`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkFlowEvent {
+    pub meta: EventMeta,
+    /// The peer address, from this host's perspective — whichever side of the
+    /// flow's tuple isn't the locally-attributed socket (see the join doc above).
+    pub daddr: core::net::IpAddr,
+    pub dport: u16,
+    /// IP protocol number (`IPPROTO_TCP` = 6; the only value this source currently
+    /// attributes — see the sensor crate doc for why UDP isn't joined yet).
+    pub protocol: u8,
+    pub bytes_sent: Option<u64>,
+    pub bytes_received: Option<u64>,
+    pub packets_sent: Option<u64>,
+    pub packets_received: Option<u64>,
+}
+
 /// Health status of a single sensor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SensorHealth {
@@ -435,6 +467,7 @@ pub enum Event {
     SmbConnect(SmbConnectEvent),
     UdpSend(UdpSendEvent),
     ListenPort(ListenPortEvent),
+    NetworkFlow(NetworkFlowEvent),
 }
 
 impl Event {
@@ -454,6 +487,7 @@ impl Event {
             Event::SmbConnect(e) => &e.meta,
             Event::UdpSend(e) => &e.meta,
             Event::ListenPort(e) => &e.meta,
+            Event::NetworkFlow(e) => &e.meta,
             // Non-exhaustive: new telemetry variants must be added here.
             // This arm ensures a compile-time reminder when adding variants.
             #[allow(unreachable_patterns)]
