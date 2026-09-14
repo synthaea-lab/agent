@@ -52,12 +52,36 @@
 //! machine that the kernel rejects the subscribe with `EPERM` for an
 //! unprivileged caller, reported back as a proper `NetlinkError`, not a panic.
 //!
+//! **`schema::Event` wiring, for listening sockets:** [`listen_port_events`] maps
+//! a [`snapshot`] to [`schema::Event::ListenPort`] (`schema` `SCHEMA_VERSION` 10 ->
+//! 11) — the mapping issue #92's "listening-port drift" done-when item needs.
+//! [`proc_meta`] resolves the `comm`/`ppid`/`gid` a [`schema::EventMeta`] needs
+//! from `/proc/<pid>/status` (uid comes straight from the kernel via `sock_diag` —
+//! see [`SocketSnapshotEntry::uid`]'s doc); [`normalize`] does the pure
+//! entry-plus-proc-info -> `Event` mapping, same split as `sensor-linux`'s own
+//! `normalize` module. A joined PID that can't be resolved (exited between the two
+//! `/proc` reads, or another user's process without permission) is silently
+//! skipped rather than emitted with fabricated metadata — a per-poll, best-effort
+//! sample, not a guaranteed-complete one. Established sockets aren't mapped (no
+//! drift semantics for them, see [`normalize::listen_port_event`]'s doc); this
+//! crate still doesn't decide the polling cadence or run the drift comparison
+//! itself — a caller (not yet written) calls [`listen_port_events`] repeatedly and
+//! diffs consecutive results. No lab VM here to validate that live, same gap as
+//! before this wiring existed.
+//!
 //! Deliberately **not** here yet:
-//! - No `schema::Event` variant or [`schema::sensor::Sensor`] implementation
-//!   for sock_diag, conntrack, or proc connector: volume/periodicity beacon
-//!   features and the eBPF cross-check both need `crates/correlator`/
-//!   `crates/tamper` wiring that doesn't exist for this data yet — nothing to
-//!   push into today.
+//! - `schema::Event` wiring for `conntrack` (beacon volume/periodicity features) and
+//!   `proc connector` (the eBPF cross-check): both need design decisions beyond this
+//!   slice's scope — conntrack flows carry no PID at all from the kernel (would
+//!   need a further join, e.g. against a `sock_diag` snapshot's own tuples, to
+//!   attribute one), and the proc connector's role per the issue is a *tamper*
+//!   signal (divergence from the eBPF stream), which may not want to be a
+//!   `schema::Event` at all rather than an internal `crates/tamper` comparison —
+//!   not a call this Linux-only slice should make alone.
+//! - `crates/correlator` wiring: [`listen_port_events`] produces `schema::Event`s,
+//!   but nothing in this crate hands them to `correlator::EventBus` — that's the
+//!   caller's job (the same one that would own the polling cadence above), and no
+//!   such caller exists yet for this crate's data.
 //! - UDP sockets — `sock_diag` supports them, but "listen/established" (this
 //!   issue's own wording) is TCP-state terminology; UDP would need its own
 //!   category, not a states-mask filter.
@@ -69,8 +93,10 @@
 //!   stream to cross-check them against yet (see [`proc_events`]).
 
 mod conntrack_attrs;
+mod normalize;
 mod proc_events;
 mod proc_join;
+mod proc_meta;
 mod wire;
 
 #[cfg(target_os = "linux")]
@@ -169,6 +195,34 @@ pub fn snapshot() -> Result<Vec<SocketSnapshotEntry>, NetlinkError> {
         .collect())
 }
 
+/// Takes one [`snapshot`] and maps every listening socket to a
+/// [`schema::Event::ListenPort`], attributed to each PID that holds it open (see
+/// [`SocketSnapshotEntry::pids`]'s doc — usually one, occasionally several for a
+/// pre-`exec` shared listener, none when unattributable). `timestamp_ns` is
+/// stamped on every event as the snapshot time (see
+/// [`schema::ListenPortEvent`]'s doc on what that does and doesn't mean).
+///
+/// Established sockets and unattributed listeners produce no event — see the
+/// crate doc's "`schema::Event` wiring" section for why that's a deliberate,
+/// documented gap rather than a bug.
+///
+/// # Errors
+///
+/// See [`NetlinkError`] — same failure mode as [`snapshot`], which this wraps.
+#[cfg(target_os = "linux")]
+pub fn listen_port_events(timestamp_ns: u64) -> Result<Vec<schema::Event>, NetlinkError> {
+    let entries = snapshot()?;
+    Ok(entries
+        .iter()
+        .flat_map(|entry| {
+            entry.pids.iter().filter_map(move |&pid| {
+                let proc = proc_meta::resolve(pid)?;
+                normalize::listen_port_event(entry, pid, &proc, timestamp_ns)
+            })
+        })
+        .collect())
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
@@ -193,5 +247,22 @@ mod tests {
         assert_eq!(SocketState::from(TCP_ESTABLISHED), SocketState::Established);
         assert_eq!(SocketState::from(TCP_LISTEN), SocketState::Listen);
         assert_eq!(SocketState::from(7), SocketState::Other(7));
+    }
+
+    #[test]
+    fn listen_port_events_runs_end_to_end_against_the_real_kernel_and_proc() {
+        let events = listen_port_events(42).expect("must succeed, same as snapshot()");
+        // Nondeterministic whether any listening socket with an attributable PID
+        // exists right now — the property that must hold regardless: every event
+        // this produced really is a ListenPort variant with the stamped
+        // timestamp and a nonzero PID (proc_meta::resolve only ever returns
+        // Some for a PID it actually read from /proc).
+        for event in &events {
+            let schema::Event::ListenPort(listen) = &event else {
+                panic!("listen_port_events must only ever produce ListenPort events");
+            };
+            assert_eq!(listen.meta.timestamp_ns, 42);
+            assert_ne!(listen.meta.pid, 0);
+        }
     }
 }

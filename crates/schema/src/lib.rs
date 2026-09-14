@@ -29,7 +29,7 @@ pub mod sensor;
 
 /// Version of the serialized event model. Bumped on any serialization-visible change,
 /// together with a new golden-fixture directory (see crate docs).
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// Identity of the user a process runs as, per platform.
 ///
@@ -348,6 +348,24 @@ pub struct UdpSendEvent {
     pub size: u32,
 }
 
+/// A TCP socket found listening, from a periodic socket-table snapshot rather than a
+/// discrete `bind`/`listen()` syscall trace (Linux: `NETLINK_SOCK_DIAG`, issue #92 —
+/// a probe-free source that runs where eBPF/ETW cannot, or as a redundant cross-check
+/// alongside them).
+///
+/// `meta.timestamp_ns` is when the snapshot was taken, not when the socket actually
+/// started listening — a snapshot can only observe "listening as of now", so a
+/// short-lived listener between two polls is invisible to this source (the polling
+/// cadence is a caller decision, not a schema concern). Detection value is in the
+/// series across snapshots (listen-port drift: a new port appearing that wasn't there
+/// last poll), not any single event in isolation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListenPortEvent {
+    pub meta: EventMeta,
+    pub local_addr: core::net::IpAddr,
+    pub local_port: u16,
+}
+
 /// Outbound network connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectEvent {
@@ -416,6 +434,7 @@ pub enum Event {
     AssemblyLoad(AssemblyLoadEvent),
     SmbConnect(SmbConnectEvent),
     UdpSend(UdpSendEvent),
+    ListenPort(ListenPortEvent),
 }
 
 impl Event {
@@ -434,6 +453,7 @@ impl Event {
             Event::AssemblyLoad(e) => &e.meta,
             Event::SmbConnect(e) => &e.meta,
             Event::UdpSend(e) => &e.meta,
+            Event::ListenPort(e) => &e.meta,
             // Non-exhaustive: new telemetry variants must be added here.
             // This arm ensures a compile-time reminder when adding variants.
             #[allow(unreachable_patterns)]

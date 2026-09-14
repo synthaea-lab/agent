@@ -2423,6 +2423,7 @@ name = "sensor-linux-netlink"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "schema",
 ]
 
 [[package]]

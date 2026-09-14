@@ -7,8 +7,8 @@ use std::net::IpAddr;
 
 use schema::{
     AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileOpenEvent,
-    ImageLoadEvent, RegistrySetEvent, ScriptBlockEvent, SmbConnectEvent, UdpSendEvent, User,
-    WmiActivityEvent,
+    ImageLoadEvent, ListenPortEvent, RegistrySetEvent, ScriptBlockEvent, SmbConnectEvent,
+    UdpSendEvent, User, WmiActivityEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -403,6 +403,28 @@ fn connect_v6_golden() {
 }
 
 #[test]
+fn listen_port_golden() {
+    // A sock_diag snapshot catching a listener that wasn't there on a prior poll —
+    // the "listen-port drift" scenario issue #92 targets. root/uid 0 process,
+    // wildcard bind, high port: the shape a planted backdoor listener takes.
+    assert_golden(
+        &Event::ListenPort(ListenPortEvent {
+            meta: EventMeta {
+                pid: 4242,
+                ppid: 1,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_090_000_000_000,
+                comm: "sshd-backdoor".into(),
+                container: None,
+            },
+            local_addr: "0.0.0.0".parse::<IpAddr>().unwrap(),
+            local_port: 31337,
+        }),
+        "listen_port",
+    );
+}
+
+#[test]
 fn exec_enriched_golden() {
     assert_golden(
         &Event::Exec(ExecEvent {
@@ -611,6 +633,11 @@ fn meta_accessor_covers_all_variants() {
             daddr: "10.0.0.1".parse::<IpAddr>().unwrap(),
             dport: 53,
             size: 0,
+        }),
+        Event::ListenPort(ListenPortEvent {
+            meta: meta.clone(),
+            local_addr: "0.0.0.0".parse::<IpAddr>().unwrap(),
+            local_port: 0,
         }),
     ];
     for e in &events {
