@@ -16,3 +16,25 @@
 *.ps1 text eol=crlf
 *.bat text eol=crlf
 *.cmd text eol=crlf
+
+# ml/datasets baselines are hash-pinned (manifest.json's sample_sha256) against their
+# on-disk bytes. Without this, Windows contributors on the Git-for-Windows default
+# core.autocrlf=true get LF silently rewritten to CRLF on checkout, and every
+# verify_manifest run fails with a hash mismatch that has nothing to do with content
+# (issue #196, found reviewing #192).
+ml/datasets/**/*.jsonl text eol=lf
+ml/datasets/**/manifest.json text eol=lf
+
+# Rust/Python parity fixtures (CLAUDE.md "Parity seams"). Checked: both sides read
+# these via json.loads/serde_json::from_str, which treat \r as insignificant
+# whitespace outside strings, so CRLF here doesn't actually break a test the way
+# it does for ml/datasets' sample_sha256 check above — but it's still the same
+# diff-hygiene reason *.rs is pinned: a CRLF round-trip would rewrite every line
+# of a fixture for no content reason. Pin for that, not for correctness.
+ml/tests/fixtures/**/*.jsonl text eol=lf
+crates/**/tests/fixtures/**/*.json text eol=lf
+crates/**/tests/fixtures/**/*.jsonl text eol=lf
+
+# ONNX model files are binary (protobuf). Not currently relying on an incorrect
+# guess from Git's content-sniffing heuristic, just making it explicit.
+*.onnx binary
