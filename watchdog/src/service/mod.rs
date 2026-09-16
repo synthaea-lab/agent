@@ -40,27 +40,33 @@ pub(crate) fn cmd_uninstall() -> anyhow::Result<()> {
 
 /// Subcommand `status`: the service manager's view. The query command's own exit
 /// code is informational (a stopped or absent service is a valid answer, not an
-/// error).
+/// error). Linux delegates to `linux::cmd_status` since the query itself is
+/// service-manager-dependent (systemd vs. `OpenRC`, detected there).
 pub(crate) fn cmd_status() -> anyhow::Result<()> {
-    let (program, args): (&str, &[&str]) = if cfg!(windows) {
-        ("sc", &["query", SERVICE_NAME])
-    } else if cfg!(target_os = "linux") {
-        (
-            "systemctl",
-            &["status", "synthaea-agent.service", "--no-pager"],
-        )
-    } else if cfg!(target_os = "macos") {
-        ("launchctl", &["print", "system/com.synthaea.agent"])
-    } else {
-        anyhow::bail!("status is only supported on Windows, Linux, and macOS")
-    };
-
-    let status = std::process::Command::new(program)
-        .args(args)
-        .status()
-        .map_err(|e| anyhow::anyhow!("cannot launch {program}: {e}"))?;
-    if !status.success() {
-        println!("[watchdog] service not running or not installed ({program} exited {status}).");
+    #[cfg(target_os = "linux")]
+    {
+        linux::cmd_status()
     }
-    Ok(())
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("sc", &["query", SERVICE_NAME])
+        } else if cfg!(target_os = "macos") {
+            ("launchctl", &["print", "system/com.synthaea.agent"])
+        } else {
+            anyhow::bail!("status is only supported on Windows, Linux, and macOS")
+        };
+
+        let status = std::process::Command::new(program)
+            .args(args)
+            .status()
+            .map_err(|e| anyhow::anyhow!("cannot launch {program}: {e}"))?;
+        if !status.success() {
+            println!(
+                "[watchdog] service not running or not installed ({program} exited {status})."
+            );
+        }
+        Ok(())
+    }
 }
