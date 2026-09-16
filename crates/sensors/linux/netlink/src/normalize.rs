@@ -149,6 +149,7 @@ pub fn conntrack_flow_events_for(
                     comm: proc.comm.clone(),
                     container: None, // see listen_port_event's identical note.
                 },
+                local_port: sock.local.port(),
                 daddr: peer.ip(),
                 dport: peer.port(),
                 protocol: flow.orig.protocol,
@@ -279,6 +280,7 @@ mod tests {
             panic!("expected exactly one NetworkFlow event, got {events:?}");
         };
         assert_eq!(flow.meta.pid, 4242);
+        assert_eq!(flow.local_port, 51000);
         assert_eq!(flow.daddr, v4([203, 0, 113, 9]));
         assert_eq!(flow.dport, 443);
         assert_eq!(flow.bytes_sent, Some(1240));
@@ -307,6 +309,7 @@ mod tests {
         let [Event::NetworkFlow(flow)] = events.as_slice() else {
             panic!("expected exactly one NetworkFlow event, got {events:?}");
         };
+        assert_eq!(flow.local_port, 443); // this host's local socket is 203.0.113.9:443 here
         assert_eq!(flow.daddr, v4([10, 0, 0, 5]));
         assert_eq!(flow.dport, 51000);
         assert_eq!(flow.bytes_sent, Some(8890)); // reply direction, now local->peer

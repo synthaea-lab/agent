@@ -256,3 +256,168 @@ fn unrelated_exec_does_not_match_download() {
     let alerts = state.on_exec(&exec_event_full(51, 1, "ls", "ls -la", 1_000_000_000));
     assert!(alerts.is_empty());
 }
+
+// ── BEACON via conntrack polling (issue #92, NetworkFlowEvent) ──────────────────
+
+#[test]
+fn beacon_flow_three_distinct_ports_triggers_alert() {
+    // 3 distinct short-lived connections (3 distinct local ports) to the same
+    // (comm, daddr, dport) — the real beaconing shape `lab/scenarios/beacon.sh`
+    // exercises, observed here via conntrack polling instead of a discrete
+    // ConnectEvent trace.
+    let mut state = RuleState::new();
+    state.on_network_flow(&network_flow_event_full(
+        300,
+        "nc",
+        50000,
+        [127, 0, 0, 1],
+        4444,
+        0,
+    ));
+    state.on_network_flow(&network_flow_event_full(
+        300,
+        "nc",
+        50001,
+        [127, 0, 0, 1],
+        4444,
+        1_000_000_000,
+    ));
+    let alerts = state.on_network_flow(&network_flow_event_full(
+        300,
+        "nc",
+        50002,
+        [127, 0, 0, 1],
+        4444,
+        2_000_000_000,
+    ));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1071/T1041");
+}
+
+#[test]
+fn beacon_flow_same_local_port_repolled_does_not_alert() {
+    // One single long-lived flow (same local_port every time) polled 5x within
+    // the window must NOT count as 5 connections — the false-positive risk this
+    // wiring exists to avoid (an ordinary long-lived SSH session still open on
+    // its 3rd poll is not beaconing).
+    let mut state = RuleState::new();
+    for i in 0..5u64 {
+        let alerts = state.on_network_flow(&network_flow_event_full(
+            300,
+            "sshd",
+            50000,
+            [127, 0, 0, 1],
+            22222, // non-standard port, so STANDARD_PORTS doesn't mask this case
+            i * 1_000_000_000,
+        ));
+        assert!(alerts.is_empty());
+    }
+}
+
+#[test]
+fn beacon_flow_standard_port_does_not_alert() {
+    let mut state = RuleState::new();
+    for (i, port) in (50000..50003u16).enumerate() {
+        let alerts = state.on_network_flow(&network_flow_event_full(
+            300,
+            "app",
+            port,
+            [10, 0, 0, 1],
+            443,
+            i as u64 * 1_000_000_000,
+        ));
+        assert!(alerts.is_empty());
+    }
+}
+
+#[test]
+fn beacon_flow_and_connect_share_the_same_window_state() {
+    // check_beacon and check_beacon_flow share the same underlying counter keyed
+    // by (comm, daddr, dport) — a mixed source (2 discrete connects + 1 polled
+    // flow, e.g. eBPF and netlink both active) must still cross the threshold,
+    // not reset it.
+    let mut state = RuleState::new();
+    state.on_connect(&connect_event_full(300, "nc", [127, 0, 0, 1], 4444, 0));
+    state.on_connect(&connect_event_full(
+        300,
+        "nc",
+        [127, 0, 0, 1],
+        4444,
+        1_000_000_000,
+    ));
+    let alerts = state.on_network_flow(&network_flow_event_full(
+        300,
+        "nc",
+        50002,
+        [127, 0, 0, 1],
+        4444,
+        2_000_000_000,
+    ));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1071/T1041");
+}
+
+// ── LISTENER-DRIFT via sock_diag polling (issue #92, ListenPortEvent) ───────────
+
+#[test]
+fn listen_port_not_in_baseline_alerts_once() {
+    let mut state = RuleState::new();
+    let alerts = state.on_listen_port(&listen_port_event_full(
+        4242,
+        "sshd-backdoor",
+        [0, 0, 0, 0],
+        31337,
+        0,
+    ));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1571");
+}
+
+#[test]
+fn listen_port_seeded_at_startup_does_not_alert() {
+    // The exact scenario seed_listen_ports exists for: a listener already up
+    // before the agent attaches (sshd started by systemd at boot) must not look
+    // like a freshly planted backdoor on the first poll.
+    let mut state = RuleState::new();
+    state.seed_listen_ports([(std::net::IpAddr::V4([0, 0, 0, 0].into()), 22)]);
+    let alerts = state.on_listen_port(&listen_port_event_full(1, "sshd", [0, 0, 0, 0], 22, 0));
+    assert!(alerts.is_empty());
+}
+
+#[test]
+fn listen_port_repolled_does_not_realert() {
+    // A poll-based source re-reports the same open listener every cycle — the
+    // 2nd+ poll of the same (local_addr, local_port) is not a new finding.
+    let mut state = RuleState::new();
+    let first = state.on_listen_port(&listen_port_event_full(
+        4242,
+        "sshd-backdoor",
+        [0, 0, 0, 0],
+        31337,
+        0,
+    ));
+    assert_eq!(first.len(), 1);
+    let second = state.on_listen_port(&listen_port_event_full(
+        4242,
+        "sshd-backdoor",
+        [0, 0, 0, 0],
+        31337,
+        10_000_000_000,
+    ));
+    assert!(second.is_empty());
+}
+
+#[test]
+fn listen_port_two_distinct_new_ports_each_alert() {
+    let mut state = RuleState::new();
+    let first = state.on_listen_port(&listen_port_event_full(300, "nc", [0, 0, 0, 0], 4444, 0));
+    let second = state.on_listen_port(&listen_port_event_full(
+        301,
+        "nc",
+        [0, 0, 0, 0],
+        4445,
+        1_000_000_000,
+    ));
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+}

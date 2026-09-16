@@ -7,6 +7,7 @@
     "timestamp_ns": 1756900090000000000,
     "comm": "sshd-backdoor"
   },
+  "local_port": 51000,
   "daddr": "203.0.113.9",
   "dport": 443,
   "protocol": 6,

@@ -431,6 +431,15 @@ pub struct ConnectEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkFlowEvent {
     pub meta: EventMeta,
+    /// This host's side of the attributed socket (see the join doc above) — the
+    /// stable per-flow identity a poll-based source needs: unlike a discrete
+    /// `connect()` trace, the same live flow reappears on every conntrack poll
+    /// while it's open, so a consumer counting "connections" must key on
+    /// `local_port` (plus `daddr`/`dport`) to tell a repeated poll of one
+    /// long-lived flow apart from N distinct connections (issue #92 beacon
+    /// wiring — a naive per-poll counter would otherwise alert on any ordinary
+    /// long-lived connection, e.g. SSH, simply for staying open past 3 polls).
+    pub local_port: u16,
     /// The peer address, from this host's perspective — whichever side of the
     /// flow's tuple isn't the locally-attributed socket (see the join doc above).
     pub daddr: core::net::IpAddr,

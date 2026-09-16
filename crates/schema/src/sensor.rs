@@ -44,6 +44,16 @@ pub trait EventSink: Send + Sync {
     fn on_event(&self, event: Event);
 }
 
+/// Lets several producers share one sink behind an `Arc` — e.g. issue #92's
+/// netlink poller running on its own thread alongside a platform `Sensor` that
+/// still needs to own a `Box<dyn EventSink>` for [`Sensor::run`]. `Arc<T>` is
+/// already `Send + Sync` whenever `T` is, so this only has to forward the call.
+impl<T: EventSink + ?Sized> EventSink for std::sync::Arc<T> {
+    fn on_event(&self, event: Event) {
+        (**self).on_event(event);
+    }
+}
+
 /// Sensor for a given platform. `run` blocks and pushes observed events to `sink` as
 /// they come, until [`Sensor::stop`] or an error.
 pub trait Sensor: Send {

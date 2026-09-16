@@ -105,6 +105,22 @@ impl DetectionSink {
         }
     }
 
+    /// `NetworkFlow` events (conntrack polling, issue #92): same beacon detection as
+    /// `detect_connect`, deduped per-flow so a poll-based source doesn't
+    /// false-positive on one ordinary long-lived connection.
+    fn detect_network_flow(&self, event: &schema::NetworkFlowEvent) {
+        for alert in self.rule_state.lock().unwrap().on_network_flow(event) {
+            self.emit(alert.technique, &alert.message);
+        }
+    }
+
+    /// `ListenPort` events (`sock_diag` polling, issue #92): LISTENER-DRIFT.
+    fn detect_listen_port(&self, event: &schema::ListenPortEvent) {
+        for alert in self.rule_state.lock().unwrap().on_listen_port(event) {
+            self.emit(alert.technique, &alert.message);
+        }
+    }
+
     fn emit(&self, technique: &str, message: &str) {
         // Alerts go to stderr (stdout carries nothing in run mode; the raw stream
         // lives in events.jsonl) and are highlighted — an alert must not get lost in
@@ -186,6 +202,8 @@ impl EventSink for DetectionSink {
             Event::Exec(e) => self.detect_exec(e),
             Event::FileOpen(e) => self.detect_file_open(e),
             Event::Connect(e) => self.detect_connect(e),
+            Event::NetworkFlow(e) => self.detect_network_flow(e),
+            Event::ListenPort(e) => self.detect_listen_port(e),
             // New telemetry categories reach the engines as they land; until a rule
             // consumes them, logging below is the whole treatment.
             _ => {}

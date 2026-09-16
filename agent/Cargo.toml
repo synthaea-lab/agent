@@ -32,4 +32,5 @@ ctrlc = "3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sensor-linux = { path = "../crates/sensors/linux/userspace" }
+sensor-linux-netlink = { path = "../crates/sensors/linux/netlink" }
 libc = "0.2"

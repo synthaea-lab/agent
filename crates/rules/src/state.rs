@@ -4,7 +4,7 @@
 
 use std::{collections::HashMap, net::IpAddr};
 
-use schema::{ConnectEvent, ExecEvent, FileOpenEvent, User};
+use schema::{ConnectEvent, ExecEvent, FileOpenEvent, ListenPortEvent, NetworkFlowEvent, User};
 use store::BoundedMap;
 
 use crate::{
@@ -16,7 +16,7 @@ use crate::{
         SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, WEB_SERVER_COMMS,
     },
     has_write_intent,
-    sliding::SlidingCounter,
+    sliding::{FlowPortDedup, SlidingCounter},
 };
 
 struct RecentWrite {
@@ -47,6 +47,19 @@ pub struct RuleState {
     self_spawn: BoundedMap<(u32, String), SlidingCounter>,
     /// (comm, daddr, dport) → sliding counter for BEACON (T1071 Windows). LRU-bounded.
     beacon: BoundedMap<(String, String, u16), SlidingCounter>,
+    /// Same key as `beacon` → which local ports have already counted toward it —
+    /// only consulted by [`Self::on_network_flow`] (a poll-based source, see
+    /// [`FlowPortDedup`]'s doc); `on_connect`'s discrete syscall trace needs no
+    /// dedup, each `ConnectEvent` already is one real connection attempt.
+    beacon_flow_dedup: BoundedMap<(String, String, u16), FlowPortDedup>,
+    /// (`local_addr`, `local_port`) → seen, for LISTENER-DRIFT (issue #92, T1571).
+    /// [`Self::seed_listen_ports`] pre-fills this from one startup snapshot so
+    /// every service already listening when the agent attaches is the baseline,
+    /// not noise — the same "seed from the world as it already is" principle as
+    /// [`Self::seed_from_proc`]/`seed_pid_comm`. LRU-bounded: the realistic
+    /// listener space is a few dozen, not unbounded, but a hostile loop binding
+    /// many ports must not grow this without limit either.
+    known_listeners: BoundedMap<(IpAddr, u16), ()>,
 }
 
 /// Same bound as the correlator's entity table: the realistic live-pid space.
@@ -69,6 +82,19 @@ impl RuleState {
             recent_writes: BoundedMap::new(RECENT_WRITES_CAP),
             self_spawn: BoundedMap::new(COUNTER_CAP),
             beacon: BoundedMap::new(COUNTER_CAP),
+            beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
+            known_listeners: BoundedMap::new(COUNTER_CAP),
+        }
+    }
+
+    /// Pre-fills the LISTENER-DRIFT baseline from the agent's own startup
+    /// snapshot — without this, every service already listening when the agent
+    /// attaches (sshd, nginx started by systemd at boot) would look exactly like
+    /// a freshly planted backdoor listener on the very first poll after startup.
+    /// Same principle, same caller responsibility, as [`Self::seed_from_proc`].
+    pub fn seed_listen_ports(&mut self, ports: impl IntoIterator<Item = (IpAddr, u16)>) {
+        for key in ports {
+            self.known_listeners.insert(key, ());
         }
     }
 
@@ -306,6 +332,63 @@ impl RuleState {
         })
     }
 
+    /// Shared BEACON exclusions (T1071/T1041) — same filter regardless of which
+    /// telemetry source observed the connection.
+    ///
+    /// pid=4 (Windows System) is excluded by the caller, not here: `NetworkFlowEvent`
+    /// (Linux-only, no Windows equivalent) never needs that check, so it stays
+    /// specific to [`Self::check_beacon`].
+    fn beacon_excluded(comm: &str, daddr: IpAddr, dport: u16) -> bool {
+        // Known limitation: neither ConnectEvent nor NetworkFlowEvent carries an
+        // image path, so the browser exclusion stays name-only here — the
+        // correlator's exec-time masquerade tracking covers the rename bypass at
+        // the correlation layer.
+        if BROWSERS.iter().any(|&n| comm.eq_ignore_ascii_case(n)) {
+            return true;
+        }
+        if STANDARD_PORTS.contains(&dport) {
+            return true;
+        }
+        // IPv4 multicast (224.0.0.0/4) and broadcast (last octet = 255): legitimate
+        // network traffic emitted in a loop by system services (mDNS, SSDP, Spotify…),
+        // never C2.
+        if let IpAddr::V4(v4) = daddr {
+            let o = v4.octets();
+            if o[0] >= 224 || o[3] == 255 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Records one occurrence toward the (comm, daddr, dport) BEACON counter and
+    /// returns an alert once the threshold is crossed — the counting/alerting core
+    /// shared by [`Self::check_beacon`] and [`Self::check_beacon_flow`], which
+    /// differ only in what counts as "one occurrence" (see the latter's doc).
+    fn record_beacon(
+        &mut self,
+        pid: u32,
+        comm: &str,
+        daddr: IpAddr,
+        dport: u16,
+        ts: u64,
+    ) -> Option<Alert> {
+        let daddr = daddr.to_string();
+        let key = (comm.to_string(), daddr.clone(), dport);
+        let entry = self.beacon.get_or_insert_with(key, SlidingCounter::default);
+        let count = entry.record(ts, BEACON_WINDOW_NS);
+        if count >= BEACON_THRESHOLD && entry.try_alert(ts, BEACON_WINDOW_NS) {
+            return Some(Alert {
+                technique: "T1071/T1041",
+                message: format!(
+                    "pid={pid} comm={comm} → {daddr}:{dport} | {count}x in {}s — suspected beaconing",
+                    BEACON_WINDOW_NS / 1_000_000_000,
+                ),
+            });
+        }
+        None
+    }
+
     /// T1071/T1041 — repeated connections to the same destination on a non-standard
     /// port (C2 beaconing). Browsers excluded (repeated outbound traffic = normal
     /// behavior).
@@ -315,42 +398,55 @@ impl RuleState {
         if event.meta.pid == 4 {
             return None;
         }
-        let comm = event.meta.comm.clone();
-        // Known limitation: ConnectEvent carries no image path, so the browser
-        // exclusion stays name-only here — the correlator's exec-time masquerade
-        // tracking covers the rename bypass at the correlation layer.
-        if BROWSERS.iter().any(|&n| comm.eq_ignore_ascii_case(n)) {
+        if Self::beacon_excluded(&event.meta.comm, event.daddr, event.dport) {
             return None;
         }
-        if STANDARD_PORTS.contains(&event.dport) {
+        self.record_beacon(
+            event.meta.pid,
+            &event.meta.comm,
+            event.daddr,
+            event.dport,
+            event.meta.timestamp_ns,
+        )
+    }
+
+    /// T1071/T1041 via conntrack polling (issue #92) — same rule as
+    /// [`Self::check_beacon`], fed by a periodic flow snapshot instead of a discrete
+    /// `connect()` trace. This is the "probe-free" source `sensor-linux-netlink`
+    /// exists for: it produces the same alert where eBPF/ETW cannot run, or as a
+    /// redundant cross-check alongside them.
+    ///
+    /// A poll-based source re-reports the *same* open flow on every poll — unlike
+    /// `ConnectEvent`, one `NetworkFlowEvent` is not one connection attempt. Without
+    /// deduping, an ordinary long-lived connection (SSH, a websocket) still open on
+    /// its 3rd poll inside the window would false-positive BEACON on its own.
+    /// [`FlowPortDedup`] keyed by `local_port` — this host's stable identity for one
+    /// flow's lifetime — only lets a given flow count once per window; a real beacon
+    /// (N distinct short-lived connections, N distinct local ports) still crosses
+    /// the threshold exactly as `check_beacon` would.
+    fn check_beacon_flow(&mut self, event: &NetworkFlowEvent) -> Option<Alert> {
+        if Self::beacon_excluded(&event.meta.comm, event.daddr, event.dport) {
             return None;
         }
-        // IPv4 multicast (224.0.0.0/4) and broadcast (last octet = 255): legitimate
-        // network traffic emitted in a loop by system services (mDNS, SSDP, Spotify…),
-        // never C2.
-        if let IpAddr::V4(v4) = event.daddr {
-            let o = v4.octets();
-            if o[0] >= 224 || o[3] == 255 {
-                return None;
-            }
-        }
-        let daddr = event.daddr.to_string();
+        let key = (
+            event.meta.comm.clone(),
+            event.daddr.to_string(),
+            event.dport,
+        );
         let ts = event.meta.timestamp_ns;
-        let key = (comm.clone(), daddr.clone(), event.dport);
-        let entry = self.beacon.get_or_insert_with(key, SlidingCounter::default);
-        let count = entry.record(ts, BEACON_WINDOW_NS);
-        if count >= BEACON_THRESHOLD && entry.try_alert(ts, BEACON_WINDOW_NS) {
-            return Some(Alert {
-                technique: "T1071/T1041",
-                message: format!(
-                    "pid={} comm={comm} → {daddr}:{} | {count}x in {}s — suspected beaconing",
-                    event.meta.pid,
-                    event.dport,
-                    BEACON_WINDOW_NS / 1_000_000_000,
-                ),
-            });
+        let dedup = self
+            .beacon_flow_dedup
+            .get_or_insert_with(key, FlowPortDedup::default);
+        if !dedup.is_new(event.local_port, ts, BEACON_WINDOW_NS) {
+            return None;
         }
-        None
+        self.record_beacon(
+            event.meta.pid,
+            &event.meta.comm,
+            event.daddr,
+            event.dport,
+            ts,
+        )
     }
 
     /// To be called for every `ExecEvent` in the stream, in chronological order.
@@ -372,6 +468,46 @@ impl RuleState {
     /// To be called for every `ConnectEvent` in the stream (mainly Windows ETW).
     pub fn on_connect(&mut self, event: &ConnectEvent) -> Vec<Alert> {
         self.check_beacon(event).into_iter().collect()
+    }
+
+    /// To be called for every `NetworkFlowEvent` in the stream (Linux conntrack
+    /// polling, issue #92) — see [`Self::check_beacon_flow`].
+    pub fn on_network_flow(&mut self, event: &NetworkFlowEvent) -> Vec<Alert> {
+        self.check_beacon_flow(event).into_iter().collect()
+    }
+
+    /// LISTENER-DRIFT (issue #92, T1571 — non-standard port is the closest
+    /// existing tag in this crate; no better precedent for "a new listener
+    /// appeared" exists here yet, calibratable later) — a listening socket that
+    /// wasn't in the startup baseline ([`Self::seed_listen_ports`]) nor already
+    /// alerted on this run. One alert per (`local_addr`, `local_port`): the second
+    /// poll to see the same listener is expected (a poll-based source re-reports
+    /// it every cycle while it stays open, same reasoning as
+    /// [`Self::check_beacon_flow`]'s dedup), not a second finding.
+    ///
+    /// No name/path exclusion list yet — unlike BEACON's `BROWSERS`/
+    /// `STANDARD_PORTS`, there is no lab capture here to calibrate one honestly
+    /// against (a dev server or `docker-proxy` binding a fresh port after
+    /// startup will alert; a documented, known noise source, not a bug).
+    fn check_listen_port_drift(&mut self, event: &ListenPortEvent) -> Option<Alert> {
+        let key = (event.local_addr, event.local_port);
+        if self.known_listeners.get(&key).is_some() {
+            return None;
+        }
+        self.known_listeners.insert(key, ());
+        Some(Alert {
+            technique: "T1571",
+            message: format!(
+                "pid={} comm={} new listener on {}:{} — not seen at agent startup",
+                event.meta.pid, event.meta.comm, event.local_addr, event.local_port,
+            ),
+        })
+    }
+
+    /// To be called for every `ListenPortEvent` in the stream (Linux `sock_diag`
+    /// polling, issue #92) — see [`Self::check_listen_port_drift`].
+    pub fn on_listen_port(&mut self, event: &ListenPortEvent) -> Vec<Alert> {
+        self.check_listen_port_drift(event).into_iter().collect()
     }
 
     /// To be called for every `FileOpenEvent` in the stream. Does not produce alerts

@@ -442,6 +442,7 @@ fn network_flow_golden() {
                 comm: "sshd-backdoor".into(),
                 container: None,
             },
+            local_port: 51000,
             daddr: "203.0.113.9".parse::<IpAddr>().unwrap(),
             dport: 443,
             protocol: 6,
@@ -742,6 +743,7 @@ fn meta_accessor_covers_all_variants() {
         }),
         Event::NetworkFlow(NetworkFlowEvent {
             meta: meta.clone(),
+            local_port: 0,
             daddr: "10.0.0.1".parse::<IpAddr>().unwrap(),
             dport: 0,
             protocol: 6,
