@@ -54,15 +54,27 @@ fn lineage_ppid() -> u32 {
 
 // --- sched:sched_process_fork -------------------------------------------------------
 //
-// Records `child_pid -> {parent_pid, parent_comm}`. All three come from the
-// tracepoint's own record — a `char[16]` and two `pid_t`s — so the offsets are the
-// standard tracepoint layout (8-byte common header, then the fields) and do not vary
-// with pointer width across the x86_64 / i686 / aarch64 targets. Verify against
-// `/sys/kernel/tracing/events/sched/sched_process_fork/format` when adding a kernel
-// row to `lab/MATRIX.md`.
-const FORK_PARENT_COMM_OFFSET: usize = 8;
-const FORK_PARENT_PID_OFFSET: usize = 24;
-const FORK_CHILD_PID_OFFSET: usize = 44;
+// Records `child_pid -> {parent_pid, parent_comm}`. Verified on 2026-09-15 on Alpine
+// (kernel 6.18.50-0-virt, x86_64) via
+// `/sys/kernel/tracing/events/sched/sched_process_fork/format` — and found NOT to
+// match the layout previously assumed here. This kernel emits `parent_comm`/
+// `child_comm` as `__data_loc` (dynamic-offset) fields, not inline `char[16]`s, which
+// also shifts every field after them:
+//
+//   field:__data_loc char[] parent_comm;  offset:8;  size:4;
+//   field:pid_t parent_pid;               offset:12; size:4;
+//   field:__data_loc char[] child_comm;   offset:16; size:4;
+//   field:pid_t child_pid;                offset:20; size:4;
+//
+// `parent_comm` is read the same way `sched_process_exec` already reads `filename`
+// (issue #111): a `u32` data-locator (low 16 bits = byte offset from the record
+// start, high 16 bits = length), then a bounded string copy from that offset. All
+// fields are ints/u32s, no pointers — arch-independent, unlike `sys_enter_openat`
+// below. Re-verify against `/format` on any kernel row added to `lab/MATRIX.md`;
+// this layout has apparently changed across kernel versions before and can again.
+const FORK_PARENT_COMM_DATA_LOC_OFFSET: usize = 8;
+const FORK_PARENT_PID_OFFSET: usize = 12;
+const FORK_CHILD_PID_OFFSET: usize = 20;
 
 #[tracepoint]
 pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
@@ -71,17 +83,49 @@ pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
 }
 
 fn try_sched_process_fork(ctx: &TracePointContext) -> Result<(), i64> {
-    let child_pid: i32 = unsafe { ctx.read_at(FORK_CHILD_PID_OFFSET).map_err(|_| 1i64)? };
-    let parent_pid: i32 = unsafe { ctx.read_at(FORK_PARENT_PID_OFFSET).map_err(|_| 1i64)? };
-    let comm: [u8; TASK_COMM_LEN] =
-        unsafe { ctx.read_at(FORK_PARENT_COMM_OFFSET).map_err(|_| 1i64)? };
+    let parent_pid: i32 = unsafe {
+        ctx.read_at(FORK_PARENT_PID_OFFSET).map_err(|_| {
+            warn!(ctx, "sensor-linux-ebpf: fork read parent_pid failed");
+            1i64
+        })?
+    };
+    let child_pid: i32 = unsafe {
+        ctx.read_at(FORK_CHILD_PID_OFFSET).map_err(|_| {
+            warn!(ctx, "sensor-linux-ebpf: fork read child_pid failed");
+            1i64
+        })?
+    };
+    let data_loc: u32 = unsafe {
+        ctx.read_at(FORK_PARENT_COMM_DATA_LOC_OFFSET).map_err(|_| {
+            warn!(
+                ctx,
+                "sensor-linux-ebpf: fork read parent_comm data_loc failed"
+            );
+            1i64
+        })?
+    };
+
+    let mut comm = [0u8; TASK_COMM_LEN];
+    let comm_offset = (data_loc & 0xffff) as usize;
+    let comm_src = unsafe { (ctx.as_ptr() as *const u8).add(comm_offset) };
+    let _ = unsafe { bpf_probe_read_kernel_str_bytes(comm_src, &mut comm) };
 
     let entry = LineageEntry {
         ppid: parent_pid as u32,
         comm,
     };
     // BPF_ANY: overwrite a stale entry left by pid reuse.
-    let _ = PROC_LINEAGE.insert(&(child_pid as u32), &entry, 0);
+    let inserted = PROC_LINEAGE.insert(&(child_pid as u32), &entry, 0);
+    match inserted {
+        Ok(_) => info!(
+            ctx,
+            "sensor-linux-ebpf: fork child={} parent={} inserted=1", child_pid, parent_pid
+        ),
+        Err(_) => info!(
+            ctx,
+            "sensor-linux-ebpf: fork child={} parent={} inserted=0", child_pid, parent_pid
+        ),
+    }
     Ok(())
 }
 
