@@ -186,9 +186,13 @@ fn open_socket() -> Result<OwnedFd, NetlinkError> {
 }
 
 fn set_recv_timeout(fd: &OwnedFd, timeout: Duration) -> Result<(), NetlinkError> {
+    // `as _` rather than naming `libc::time_t`/`libc::suseconds_t` directly: both
+    // aliases are deprecated on musl (Alpine) -- 32-bit today, becoming 64-bit in a
+    // future musl/libc-crate release -- so inferring the field type from the struct
+    // literal instead keeps this correct on both without an `#[allow(deprecated)]`.
     let tv = libc::timeval {
-        tv_sec: timeout.as_secs() as libc::time_t,
-        tv_usec: libc::suseconds_t::from(timeout.subsec_micros()),
+        tv_sec: timeout.as_secs() as _,
+        tv_usec: timeout.subsec_micros() as _,
     };
     // SAFETY: `setsockopt(2)` on the fd this function borrows, with a
     // `libc::timeval` whose size exactly matches the `optlen` argument passed
