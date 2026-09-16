@@ -18,7 +18,7 @@ mod stateless;
 pub use state::RuleState;
 pub use stateless::{
     check_base64_decode, check_encoded_powershell, check_persistence_write, check_proc_root_escape,
-    evaluate_exec, evaluate_file_open,
+    check_scheduled_task_persistence, evaluate_exec, evaluate_file_open,
 };
 
 #[derive(Debug, Clone)]

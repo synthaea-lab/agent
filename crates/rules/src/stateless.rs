@@ -1,6 +1,6 @@
 //! Stateless rules: a single event is enough to decide — no history, no state.
 
-use schema::{ExecEvent, FileOpenEvent};
+use schema::{ExecEvent, FLAG_PERSISTENCE_TASK_ARTIFACT, FileOpenEvent};
 
 use crate::{Alert, has_write_intent};
 
@@ -157,11 +157,44 @@ pub fn check_proc_root_escape(event: &FileOpenEvent) -> Option<Alert> {
     })
 }
 
+/// T1053.005 — Scheduled Task/Job: Scheduled Task. A Windows scheduled task was
+/// just created (Security log event 4698, "A scheduled task was created") — see
+/// `docs/adr/0004-windows-persistence-detection-via-eventlog-polling.md` for why
+/// this flows through `FileOpenEvent` (`FLAG_PERSISTENCE_TASK_ARTIFACT`) rather
+/// than a dedicated `Event::Persistence` variant.
+///
+/// The signal is deterministic: `sensor-windows-eventlog` pushes this exact
+/// `FileOpenEvent` iff Windows wrote a 4698, and 4698 is only emitted when a
+/// scheduled task is actually created via any Windows-supported path
+/// (`schtasks.exe`, `New-ScheduledTask*`, Task Scheduler COM, the Task Scheduler
+/// UI). The flag **is** the signal — no substring or path heuristic needed, no
+/// audit-subcategory guessing (the sensor also enables the required subcategory
+/// itself, "Other Object Access Events").
+///
+/// Alert content carries the task's action path (`event.path`) and the task's
+/// leaf name (`event.meta.comm`) so an analyst can jump straight from the alert
+/// to the persistence artifact for triage/removal via
+/// `schtasks /Delete /TN <name> /F`.
+#[must_use]
+pub fn check_scheduled_task_persistence(event: &FileOpenEvent) -> Option<Alert> {
+    if event.flags & FLAG_PERSISTENCE_TASK_ARTIFACT == 0 {
+        return None;
+    }
+    Some(Alert {
+        technique: "T1053.005",
+        message: format!(
+            "task={} pid={}: scheduled task persistence created — action path: {}",
+            event.meta.comm, event.meta.pid, event.path,
+        ),
+    })
+}
+
 /// Evaluates all stateless rules applicable to a `FileOpenEvent`.
 #[must_use]
 pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
     check_persistence_write(event)
         .into_iter()
         .chain(check_proc_root_escape(event))
+        .chain(check_scheduled_task_persistence(event))
         .collect()
 }

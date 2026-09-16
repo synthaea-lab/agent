@@ -9,7 +9,7 @@ use schema::{
 
 use crate::{
     O_CREAT, O_WRONLY, RuleState, check_base64_decode, check_encoded_powershell,
-    check_persistence_write, check_proc_root_escape,
+    check_persistence_write, check_proc_root_escape, check_scheduled_task_persistence,
     exclusions::{BEACON_THRESHOLD, SELF_SPAWN_THRESHOLD},
 };
 
@@ -95,6 +95,16 @@ fn file_open_event_containerized(path: &str, container_id: &str) -> FileOpenEven
     event
 }
 
+/// A `FileOpenEvent` shaped like what `sensor-windows-eventlog` pushes on a
+/// Security event 4698 (scheduled task creation): the `flags` field carries the
+/// `FLAG_PERSISTENCE_TASK_ARTIFACT` bit, `path` is the task's action path, and
+/// `comm` is the task's leaf name.
+fn file_open_event_scheduled_task(task_name: &str, action_path: &str) -> FileOpenEvent {
+    let mut event = file_open_event(action_path, schema::FLAG_PERSISTENCE_TASK_ARTIFACT);
+    event.meta.comm = task_name.to_string();
+    event
+}
+
 fn connect_event_full(
     pid: u32,
     comm: &str,
@@ -157,4 +167,5 @@ fn listen_port_event_full(
 }
 
 mod linux;
+mod persistence;
 mod windows;
