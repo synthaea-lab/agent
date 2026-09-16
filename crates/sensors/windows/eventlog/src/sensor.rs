@@ -13,10 +13,10 @@ use std::time::Duration;
 use schema::sensor::{Capabilities, EventSink, Sensor, SensorError};
 use schema::{
     AuthEvent, AuthKind, AuthOutcome, Event, EventMeta, FileOpenEvent, User,
-    FLAG_PERSISTENCE_ARTIFACT, FLAG_PERSISTENCE_TASK_ARTIFACT,
+    FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT, FLAG_PERSISTENCE_TASK_ARTIFACT,
 };
 
-use crate::xml::{self, LogonEvent, ScheduledTaskEvent, ServiceInstallEvent};
+use crate::xml::{self, AccountCreatedEvent, LogonEvent, ScheduledTaskEvent, ServiceInstallEvent};
 
 /// All channels are polled on the same cadence — persistence detection and
 /// logon-event normalization both have no sub-second stakes (the underlying
@@ -44,6 +44,15 @@ const LOGON_AUDIT_SUBCATEGORY_GUID: &str = "{0CCE9215-69AE-11D9-BED3-50505450303
 /// "Special Logon" audit subcategory (covers 4672) — same caveats as
 /// [`LOGON_AUDIT_SUBCATEGORY_GUID`].
 const SPECIAL_LOGON_AUDIT_SUBCATEGORY_GUID: &str = "{0CCE921B-69AE-11D9-BED3-505054503030}";
+
+/// "User Account Management" audit subcategory (covers 4720/4722/4724/4738/...) —
+/// GUID form for the same locale-independence reason as the other GUIDs above.
+/// Published by Microsoft's subcategory GUID list; **not yet re-confirmed against
+/// this project's own lab VM** the way the 4698 GUID was. Unlike "Other Object
+/// Access Events" (needed for 4698), User Account Management is part of Windows'
+/// out-of-the-box default audit policy on both Client and Server SKUs — a failure
+/// to enable here is expected to be rare and non-blocking.
+const USER_ACCOUNT_MGMT_AUDIT_SUBCATEGORY_GUID: &str = "{0CCE9235-69AE-11D9-BED3-505054503030}";
 
 /// The "Microsoft-Windows-Security-Auditing" provider that writes 4624/4625/
 /// 4648/4672 runs inside the LSA subsystem process, not the account's own
@@ -403,6 +412,126 @@ fn poll_logon_events(
     })
 }
 
+// ── Event 4720 — account creation (T1136.001) ────────────────────────────────
+
+/// Same rationale as [`enable_scheduled_task_audit`], less critical: User Account
+/// Management is part of Windows' out-of-the-box default audit policy on both
+/// Client and Server SKUs, so a failure here should not be read as urgently as an
+/// `enable_scheduled_task_audit` failure would be. Belt-and-suspenders regardless
+/// — enable it explicitly so we do not silently miss 4720s on a hardened VM that
+/// disabled the default policy.
+fn enable_account_creation_audit() -> bool {
+    let subcategory_arg = format!("/subcategory:{USER_ACCOUNT_MGMT_AUDIT_SUBCATEGORY_GUID}");
+    let output = Command::new("auditpol")
+        .args([
+            "/set",
+            subcategory_arg.as_str(),
+            "/success:enable",
+            "/failure:enable",
+        ])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            log::info!("\"User Account Management\" audit enabled (event 4720)");
+            true
+        }
+        Ok(o) => {
+            log::warn!(
+                "auditpol failed (code {:?}) — account-creation persistence detection \
+                 (T1136.001) may not receive any 4720 events until this audit \
+                 subcategory is enabled manually: auditpol /set \
+                 /subcategory:{USER_ACCOUNT_MGMT_AUDIT_SUBCATEGORY_GUID} \
+                 /success:enable /failure:enable. stderr: {}",
+                o.status.code(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            log::warn!(
+                "could not run auditpol ({e}) — account-creation persistence detection \
+                 (T1136.001) may stay silent until the audit is enabled manually \
+                 (see command above)"
+            );
+            false
+        }
+    }
+}
+
+fn last_known_record_id_4720() -> u64 {
+    let xml_out = wevtutil(&[
+        "qe",
+        "Security",
+        "/c:1",
+        "/rd:true",
+        "/f:xml",
+        "/q:*[System[(EventID=4720)]]",
+    ]);
+    xml::split_event_blocks(&xml_out)
+        .first()
+        .and_then(|block| xml::parse_account_created_block(block))
+        .map(|e| e.record_id)
+        .unwrap_or(0)
+}
+
+fn new_account_created_events(since_record_id: u64) -> Vec<AccountCreatedEvent> {
+    let query = format!("*[System[(EventID=4720) and (EventRecordID>{since_record_id})]]");
+    let query_arg = format!("/q:{query}");
+    let xml_out = wevtutil(&["qe", "Security", "/rd:false", "/f:xml", query_arg.as_str()]);
+    xml::split_event_blocks(&xml_out)
+        .into_iter()
+        .filter_map(xml::parse_account_created_block)
+        .collect()
+}
+
+fn poll_account_creations(
+    sink: Arc<dyn EventSink>,
+    stop: Arc<AtomicBool>,
+    counters: Arc<EventLogCounters>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut last_id = last_known_record_id_4720();
+        log::info!("account-creation poll started (last known EventRecordID: {last_id})");
+        while !stop.load(Ordering::SeqCst) {
+            std::thread::sleep(POLL_INTERVAL);
+            for account in new_account_created_events(last_id) {
+                last_id = last_id.max(account.record_id);
+                // A 4720 without a target user name is not usable — the alert
+                // message quotes this as `comm`. Skip (same tolerance rule as
+                // the scheduled-task/service-install pollers).
+                let Some(target_name) = account.target_user_name else {
+                    continue;
+                };
+                // TargetSid is preferred as `path` (the persistence artifact's
+                // canonical identifier — survives an account rename). Falling
+                // back to the leaf name reproduced as a placeholder path keeps
+                // the alert well-formed if the SID is missing on some future
+                // Windows shape rather than dropping the event outright.
+                let sid = account
+                    .target_user_sid
+                    .unwrap_or_else(|| format!("(unknown-sid:{target_name})"));
+                let event = FileOpenEvent {
+                    meta: EventMeta {
+                        pid: account.pid,
+                        ppid: 0,
+                        user: User::Unknown,
+                        timestamp_ns: now_ns(),
+                        comm: target_name,
+                        container: None, // Windows: no container support
+                    },
+                    path: sid,
+                    flags: FLAG_PERSISTENCE_ACCOUNT_ARTIFACT,
+                };
+                counters
+                    .account_creations
+                    .fetch_add(1, Ordering::Relaxed);
+                sink.on_event(Event::FileOpen(event));
+            }
+        }
+        log::info!("account-creation poll stopped");
+    })
+}
+
 // ── Policy-configurable allowlist and volume counters (#94) ─────────────────
 //
 // `sensor-*` crates may depend only on `schema` (`tools/check-deps.py`), so
@@ -421,6 +550,8 @@ pub struct EventLogConfig {
     pub service_installs_enabled: bool,
     /// Event 4698 (T1053.005 — scheduled task persistence).
     pub scheduled_tasks_enabled: bool,
+    /// Event 4720 (T1136.001 — local account creation persistence).
+    pub account_creations_enabled: bool,
     /// Events 4624/4625/4648/4672 (logon/session, #94).
     pub logon_events_enabled: bool,
 }
@@ -432,6 +563,7 @@ impl Default for EventLogConfig {
         Self {
             service_installs_enabled: true,
             scheduled_tasks_enabled: true,
+            account_creations_enabled: true,
             logon_events_enabled: true,
         }
     }
@@ -449,6 +581,7 @@ impl Default for EventLogConfig {
 pub struct EventLogCounters {
     pub service_installs: AtomicU64,
     pub scheduled_tasks: AtomicU64,
+    pub account_creations: AtomicU64,
     pub logon_events: AtomicU64,
 }
 
@@ -506,7 +639,8 @@ impl Sensor for EventLogSensor {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             file_events: self.config.service_installs_enabled
-                || self.config.scheduled_tasks_enabled,
+                || self.config.scheduled_tasks_enabled
+                || self.config.account_creations_enabled,
             auth_events: self.config.logon_events_enabled,
             ..Capabilities::default()
         }
@@ -528,6 +662,14 @@ impl Sensor for EventLogSensor {
         if self.config.scheduled_tasks_enabled {
             enable_scheduled_task_audit();
             handles.push(poll_scheduled_tasks(
+                Arc::clone(&sink),
+                Arc::clone(&self.stop),
+                Arc::clone(&self.counters),
+            ));
+        }
+        if self.config.account_creations_enabled {
+            enable_account_creation_audit();
+            handles.push(poll_account_creations(
                 Arc::clone(&sink),
                 Arc::clone(&self.stop),
                 Arc::clone(&self.counters),
@@ -566,6 +708,7 @@ mod config_tests {
         let config = EventLogConfig::default();
         assert!(config.service_installs_enabled);
         assert!(config.scheduled_tasks_enabled);
+        assert!(config.account_creations_enabled);
         assert!(config.logon_events_enabled);
     }
 
@@ -574,6 +717,7 @@ mod config_tests {
         let sensor = EventLogSensor::with_config(EventLogConfig {
             service_installs_enabled: false,
             scheduled_tasks_enabled: false,
+            account_creations_enabled: false,
             logon_events_enabled: false,
         });
         let caps = sensor.capabilities();
@@ -586,6 +730,7 @@ mod config_tests {
         let sensor = EventLogSensor::with_config(EventLogConfig {
             service_installs_enabled: true,
             scheduled_tasks_enabled: false,
+            account_creations_enabled: false,
             logon_events_enabled: false,
         });
         assert!(sensor.capabilities().file_events);
@@ -597,6 +742,7 @@ mod config_tests {
         let counters = sensor.counters();
         assert_eq!(counters.service_installs.load(Ordering::Relaxed), 0);
         assert_eq!(counters.scheduled_tasks.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.account_creations.load(Ordering::Relaxed), 0);
         assert_eq!(counters.logon_events.load(Ordering::Relaxed), 0);
     }
 }

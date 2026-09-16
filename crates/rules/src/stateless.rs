@@ -1,6 +1,9 @@
 //! Stateless rules: a single event is enough to decide — no history, no state.
 
-use schema::{ExecEvent, FLAG_PERSISTENCE_ARTIFACT, FLAG_PERSISTENCE_TASK_ARTIFACT, FileOpenEvent};
+use schema::{
+    ExecEvent, FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT,
+    FLAG_PERSISTENCE_TASK_ARTIFACT, FileOpenEvent,
+};
 
 use crate::{Alert, has_write_intent};
 
@@ -222,6 +225,39 @@ pub fn check_service_install_persistence(event: &FileOpenEvent) -> Option<Alert>
     })
 }
 
+/// T1136.001 — Create Account: Local Account. A Windows local user account was
+/// just created (Security log event 4720, "A user account was created") — same
+/// eventlog-polling pipeline as T1053.005 and T1543.003, see
+/// `docs/adr/0004-windows-persistence-detection-via-eventlog-polling.md`. Flows
+/// through `FileOpenEvent` with `FLAG_PERSISTENCE_ACCOUNT_ARTIFACT` (distinct
+/// bit from the two other persistence flags, so the three techniques never
+/// cross-fire off a single event).
+///
+/// The signal is deterministic: `sensor-windows-eventlog` pushes this exact
+/// `FileOpenEvent` iff Windows wrote a 4720 on THIS machine, and 4720 is
+/// emitted on any local account creation path (`net user /add`, `New-LocalUser`,
+/// the Local Users MMC applet, the `NetUserAdd` Win32 API). Domain account
+/// creation writes 4720 on the domain controller, not the reporting machine —
+/// out of scope regardless (T1136.002).
+///
+/// Alert content carries the new account's SAM name (`event.meta.comm`) and its
+/// SID (`event.path`) so an analyst can jump straight from the alert to
+/// `net user <name> /delete` for triage. The SID (rather than a path) survives
+/// an attacker renaming the account before triage runs.
+#[must_use]
+pub fn check_account_creation_persistence(event: &FileOpenEvent) -> Option<Alert> {
+    if event.flags & FLAG_PERSISTENCE_ACCOUNT_ARTIFACT == 0 {
+        return None;
+    }
+    Some(Alert {
+        technique: "T1136.001",
+        message: format!(
+            "account={} pid={}: local account persistence created — sid: {}",
+            event.meta.comm, event.meta.pid, event.path,
+        ),
+    })
+}
+
 /// Evaluates all stateless rules applicable to a `FileOpenEvent`.
 #[must_use]
 pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
@@ -230,5 +266,6 @@ pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
         .chain(check_proc_root_escape(event))
         .chain(check_scheduled_task_persistence(event))
         .chain(check_service_install_persistence(event))
+        .chain(check_account_creation_persistence(event))
         .collect()
 }

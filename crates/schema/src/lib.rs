@@ -68,6 +68,23 @@ pub const FLAG_PERSISTENCE_ARTIFACT: u32 = 0x1000_0000;
 /// `docs/adr/0004-windows-persistence-detection-via-eventlog-polling.md`.
 pub const FLAG_PERSISTENCE_TASK_ARTIFACT: u32 = 0x2000_0000;
 
+/// Same principle as [`FLAG_PERSISTENCE_ARTIFACT`], for a Windows **local account
+/// creation** (event 4720, "A user account was created" — ATT&CK T1136.001) rather
+/// than a service (T1543.003) or scheduled task (T1053.005). See
+/// `check_account_creation_persistence` (`rules`) and
+/// `docs/adr/0004-windows-persistence-detection-via-eventlog-polling.md`.
+///
+/// Scoped to local SAM accounts on this host: domain account creation (4720 on the
+/// domain controller) is out of scope for a userland EDR on member/standalone
+/// machines — the sensor never observes it. A `computer` account creation (4741) is
+/// a distinct technique (T1136.002) and would take its own bit if we add it later.
+///
+/// On this flag, `FileOpenEvent::path` carries the new account's SID (`S-1-5-21-...`)
+/// and `FileOpenEvent::meta::comm` carries the account leaf name (SAM name). Same
+/// distinct-bit rule as the other two: the three T1136/T1053/T1543 rules never
+/// cross-fire off a single event.
+pub const FLAG_PERSISTENCE_ACCOUNT_ARTIFACT: u32 = 0x0800_0000;
+
 /// Identity of the user a process runs as, per platform.
 ///
 /// A bare `uid: u32` cannot represent Windows (audit finding F-3: SYSTEM spawning

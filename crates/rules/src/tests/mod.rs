@@ -8,9 +8,9 @@ use schema::{
 };
 
 use crate::{
-    O_CREAT, O_WRONLY, RuleState, check_base64_decode, check_encoded_powershell,
-    check_persistence_write, check_proc_root_escape, check_scheduled_task_persistence,
-    check_service_install_persistence,
+    O_CREAT, O_WRONLY, RuleState, check_account_creation_persistence, check_base64_decode,
+    check_encoded_powershell, check_persistence_write, check_proc_root_escape,
+    check_scheduled_task_persistence, check_service_install_persistence,
     exclusions::{BEACON_THRESHOLD, SELF_SPAWN_THRESHOLD},
 };
 
@@ -113,6 +113,16 @@ fn file_open_event_scheduled_task(task_name: &str, action_path: &str) -> FileOpe
 fn file_open_event_service_install(service_name: &str, image_path: &str) -> FileOpenEvent {
     let mut event = file_open_event(image_path, schema::FLAG_PERSISTENCE_ARTIFACT);
     event.meta.comm = service_name.to_string();
+    event
+}
+
+/// A `FileOpenEvent` shaped like what `sensor-windows-eventlog` pushes on a
+/// Security event 4720 (local account creation): the `flags` field carries the
+/// `FLAG_PERSISTENCE_ACCOUNT_ARTIFACT` bit, `path` is the new account's SID,
+/// and `comm` is the SAM name.
+fn file_open_event_account_created(account_name: &str, sid: &str) -> FileOpenEvent {
+    let mut event = file_open_event(sid, schema::FLAG_PERSISTENCE_ACCOUNT_ARTIFACT);
+    event.meta.comm = account_name.to_string();
     event
 }
 

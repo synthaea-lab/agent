@@ -150,6 +150,8 @@ pub struct EventLogPolicy {
     pub service_installs_enabled: bool,
     /// Event 4698 (T1053.005 — scheduled task persistence).
     pub scheduled_tasks_enabled: bool,
+    /// Event 4720 (T1136.001 — local account creation persistence).
+    pub account_creations_enabled: bool,
     /// Events 4624/4625/4648/4672 (logon/session, #94).
     pub logon_events_enabled: bool,
 }
@@ -161,6 +163,7 @@ impl Default for EventLogPolicy {
         Self {
             service_installs_enabled: true,
             scheduled_tasks_enabled: true,
+            account_creations_enabled: true,
             logon_events_enabled: true,
         }
     }
@@ -175,6 +178,7 @@ mod eventlog_policy_tests {
         let policy = EventLogPolicy::default();
         assert!(policy.service_installs_enabled);
         assert!(policy.scheduled_tasks_enabled);
+        assert!(policy.account_creations_enabled);
         assert!(policy.logon_events_enabled);
     }
 }

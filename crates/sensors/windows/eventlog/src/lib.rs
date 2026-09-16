@@ -4,9 +4,10 @@
 //! (`EvtSubscribe` push subscriptions on an allowlist):
 //! - Security: 4624/4625/4648 (logons — lateral movement), 4688 fallback, 4672
 //! - System: 7045 (service install — persistence)
+//! - Security: 4720 (local account creation — persistence)
 //! - Microsoft-Windows-AppLocker + WDAC, Defender operational, Task-Scheduler
 //!
-//! Implements two persistence detections, ported from a spike validated
+//! Implements three persistence detections, ported from a spike validated
 //! end-to-end on a real Windows VM (see
 //! `docs/adr/0004-windows-persistence-detection-via-eventlog-polling.md` for the
 //! full investigation and rationale — summary below), plus logon/session-event
@@ -16,6 +17,10 @@
 //!   event **7045** ("A service was installed in the system").
 //! - **T1053.005** — Scheduled Task/Job: Scheduled Task. Security log, event
 //!   **4698** ("A scheduled task was created").
+//! - **T1136.001** — Create Account: Local Account. Security log, event **4720**
+//!   ("A user account was created"). Scoped to local SAM accounts on this host;
+//!   domain account creation writes 4720 on the DC, not the reporting machine,
+//!   so it is T1136.002 territory and out of scope for a userland EDR here.
 //! - **Logon/session events** (#94): Security log events **4624** (successful
 //!   logon), **4625** (failed logon), **4648** (explicit-credential logon — a
 //!   classic RunAs/lateral-movement signal), and **4672** (special privileges
@@ -91,7 +96,7 @@
 //!
 //! ## Configurable allowlist and volume counters (#94)
 //!
-//! [`EventLogConfig`] toggles each of the three poll targets above
+//! [`EventLogConfig`] toggles each of the four poll targets above
 //! independently (a disabled one is never even queried), and
 //! [`EventLogCounters`] (via [`EventLogSensor::counters`]) exposes a live count
 //! of events actually normalized per target. This crate cannot depend on

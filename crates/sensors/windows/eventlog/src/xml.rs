@@ -259,6 +259,71 @@ pub fn parse_logon_block(block: &str) -> Option<LogonEvent> {
     })
 }
 
+/// Fields extracted from a 4720 ("A user account was created") `<Event>` block —
+/// Security log, requires the "User Account Management" audit subcategory (usually
+/// enabled by default on both Client and Server SKUs, but the sensor enables it
+/// itself belt-and-suspenders, like it does for 4698's subcategory).
+///
+/// Scope of the 4720 signal for a userland EDR on a member/standalone machine:
+/// **local SAM only** (T1136.001 — Local Account). Domain account creation writes
+/// 4720 on the domain controller, not on the machine where the attacker actually ran
+/// `net user /add`, so we never observe it — that is T1136.002 (Domain Account) and
+/// out of scope regardless. The sensor does not try to distinguish local vs. domain
+/// on the reporting host (both look identical here); the SAM/domain distinction is
+/// upstream, in whether Windows wrote the 4720 on THIS machine at all.
+///
+/// `TargetUserSid`/`TargetUserName` — the newly created account.
+/// `SubjectUserSid`/`SubjectUserName` — the caller that created it (usually a local
+/// administrator, or SYSTEM for programmatic paths like the Local Users MMC applet).
+/// `SamAccountName` exists on this event too but is redundant with `TargetUserName`
+/// on local SAM (differs from `TargetUserName` only for downlevel domain accounts,
+/// which are out of scope) — kept out of the struct to avoid duplication.
+///
+/// Not yet reconciled against a real `wevtutil qe Security /f:xml` capture — same
+/// caveat as [`LogonEvent`] above; whoever validates this on the lab VM should diff
+/// against the fixture in this module's tests.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AccountCreatedEvent {
+    pub record_id: u64,
+    /// PID of the reporting process (`<Execution ProcessID='...'>`) — LSASS, same
+    /// as [`LogonEvent`]. Not the caller's PID; that is not carried on this event.
+    pub pid: u32,
+    /// SID of the newly created account (`S-1-5-21-...`). None if the field was
+    /// missing (should not happen on a well-formed 4720).
+    pub target_user_sid: Option<String>,
+    /// SAM name of the newly created account.
+    pub target_user_name: Option<String>,
+    /// SID of the caller that created the account.
+    pub subject_user_sid: Option<String>,
+    /// SAM name of the caller.
+    pub subject_user_name: Option<String>,
+}
+
+/// Parses one 4720 `<Event>` block. `None` if the block is missing `EventRecordID`
+/// (a genuinely different event matched the `XPath` filter — skip rather than
+/// guess, same convention as the other parsers in this module).
+#[must_use]
+pub fn parse_account_created_block(block: &str) -> Option<AccountCreatedEvent> {
+    let record_id = extract_between(block, "<EventRecordID>", "</EventRecordID>")?
+        .parse()
+        .ok()?;
+    let pid = extract_between(block, "ProcessID='", "'")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    Some(AccountCreatedEvent {
+        record_id,
+        pid,
+        // 4720 uses `TargetSid`, NOT `TargetUserSid` (that spelling is only on
+        // 4624/4625/4648 in `LogonEvent`). Documented in the Microsoft
+        // Security-auditing schema for 4720; caught while writing this module's
+        // 4720 fixture.
+        target_user_sid: opt_data(block, "TargetSid"),
+        target_user_name: opt_data(block, "TargetUserName"),
+        subject_user_sid: opt_data(block, "SubjectUserSid"),
+        subject_user_name: opt_data(block, "SubjectUserName"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,5 +524,44 @@ mod tests {
     fn logon_block_missing_event_id_does_not_parse() {
         let block = "<Event><EventRecordID>1</EventRecordID></Event>";
         assert!(parse_logon_block(block).is_none());
+    }
+
+    // ── Account creation (4720) ──────────────────────────────────────────────
+    //
+    // Shape built from the documented Microsoft Security-auditing schema for
+    // 4720 (`User Account Management`). Not yet reconciled against a real
+    // `wevtutil qe Security /f:xml` capture — same caveat as `LogonEvent`;
+    // whoever validates this on the lab VM should diff a real capture against
+    // this fixture and fix any mismatch.
+
+    /// A local SAM account creation via `net user attacker P@ssw0rd /add`.
+    /// Subject is the caller (a local administrator), Target is the newly
+    /// created account (`S-1-5-21-...-1005`, next RID after `victim`'s 1001).
+    const ACCOUNT_CREATED_XML: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Security-Auditing' Guid='{54849625-5478-4994-a5ba-3e3b0328c30d}'/><EventID>4720</EventID><Version>0</Version><Level>0</Level><Task>13824</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime='2026-09-07T09:10:00.000000000Z'/><EventRecordID>9010</EventRecordID><Correlation/><Execution ProcessID='604' ThreadID='710'/><Channel>Security</Channel><Computer>LAB-VM</Computer><Security/></System><EventData><Data Name='TargetUserName'>attacker</Data><Data Name='TargetDomainName'>LAB-VM</Data><Data Name='TargetSid'>S-1-5-21-1004336348-1177238915-682003330-1005</Data><Data Name='SubjectUserSid'>S-1-5-21-1004336348-1177238915-682003330-500</Data><Data Name='SubjectUserName'>Administrator</Data><Data Name='SubjectDomainName'>LAB-VM</Data><Data Name='SubjectLogonId'>0x1a4c9</Data><Data Name='PrivilegeList'>-</Data><Data Name='SamAccountName'>attacker</Data><Data Name='DisplayName'>%%1793</Data><Data Name='UserPrincipalName'>-</Data><Data Name='HomeDirectory'>%%1793</Data><Data Name='HomePath'>%%1793</Data><Data Name='ScriptPath'>%%1793</Data><Data Name='ProfilePath'>%%1793</Data><Data Name='UserWorkstations'>%%1793</Data><Data Name='PasswordLastSet'>%%1794</Data><Data Name='AccountExpires'>%%1794</Data><Data Name='PrimaryGroupId'>513</Data><Data Name='AllowedToDelegateTo'>-</Data><Data Name='OldUacValue'>0x0</Data><Data Name='NewUacValue'>0x15</Data><Data Name='UserAccountControl'>%%2080 %%2082 %%2084</Data><Data Name='UserParameters'>%%1793</Data><Data Name='SidHistory'>-</Data><Data Name='LogonHours'>%%1797</Data></EventData></Event>"#;
+
+    #[test]
+    fn parses_a_real_shaped_account_created_block() {
+        let block = split_event_blocks(ACCOUNT_CREATED_XML)[0];
+        let parsed = parse_account_created_block(block).expect("should parse");
+        assert_eq!(parsed.record_id, 9010);
+        assert_eq!(parsed.pid, 604);
+        assert_eq!(parsed.target_user_name.as_deref(), Some("attacker"));
+        // 4720 uses `TargetSid`, not `TargetUserSid` — the parser knows this
+        // (see comment on `parse_account_created_block`).
+        assert_eq!(
+            parsed.target_user_sid.as_deref(),
+            Some("S-1-5-21-1004336348-1177238915-682003330-1005")
+        );
+        assert_eq!(
+            parsed.subject_user_sid.as_deref(),
+            Some("S-1-5-21-1004336348-1177238915-682003330-500")
+        );
+        assert_eq!(parsed.subject_user_name.as_deref(), Some("Administrator"));
+    }
+
+    #[test]
+    fn account_created_block_missing_record_id_does_not_parse() {
+        let block = "<Event><EventData><Data Name='TargetUserName'>x</Data></EventData></Event>";
+        assert!(parse_account_created_block(block).is_none());
     }
 }

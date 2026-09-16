@@ -57,6 +57,7 @@ fn eventlog_config(policy: &policy::EventLogPolicy) -> sensor_windows_eventlog::
     sensor_windows_eventlog::EventLogConfig {
         service_installs_enabled: policy.service_installs_enabled,
         scheduled_tasks_enabled: policy.scheduled_tasks_enabled,
+        account_creations_enabled: policy.account_creations_enabled,
         logon_events_enabled: policy.logon_events_enabled,
     }
 }
