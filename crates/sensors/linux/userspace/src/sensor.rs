@@ -20,11 +20,18 @@ use crate::normalize;
 /// The tracepoints implemented to date: (program, category, name). `sched_process_fork`
 /// and `sched_process_exit` maintain the `PROC_LINEAGE` map (parent pid/comm) that the
 /// other probes read — attach them first so it is populating before events flow.
+///
+/// Both `sys_enter_openat` and `sys_enter_open` are attached: musl (and every busybox
+/// applet linked against it) still issues the plain `open(2)` syscall directly, while
+/// glibc rewrites `open()` into `openat(AT_FDCWD, ...)` since 2.26 — attaching only one
+/// of the two misses file opens on whichever libc doesn't use it. Both feed the same
+/// `FileOpenEvent`/`file_open` event type.
 pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
     ("sched_process_fork", "sched", "sched_process_fork"),
     ("sched_process_exit", "sched", "sched_process_exit"),
     ("sched_process_exec", "sched", "sched_process_exec"),
     ("sys_enter_openat", "syscalls", "sys_enter_openat"),
+    ("sys_enter_open", "syscalls", "sys_enter_open"),
     ("sys_enter_connect", "syscalls", "sys_enter_connect"),
 ];
 
