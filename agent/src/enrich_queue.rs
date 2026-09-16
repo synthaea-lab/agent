@@ -32,6 +32,7 @@ const QUEUE_CAP: usize = 4_096;
 
 /// Owns the worker thread. Dropping the queue stops the worker after the backlog
 /// drains.
+#[derive(Clone)]
 pub(crate) struct EnrichQueue {
     tx: mpsc::SyncSender<Event>,
     dropped: Arc<AtomicU64>,
@@ -71,9 +72,14 @@ impl EnrichQueue {
     /// Events shed because the queue was full — observable loss, for the agent's
     /// own health telemetry (bounded state loses information by design; the count
     /// keeps it visible). Read by the health beacon (#134); exercised by tests today.
-    #[allow(dead_code)]
     pub(crate) fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+impl crate::health::DroppedCounter for EnrichQueue {
+    fn dropped(&self) -> u64 {
+        EnrichQueue::dropped(self)
     }
 }
 

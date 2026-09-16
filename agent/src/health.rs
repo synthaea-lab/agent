@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Agent health beacon — periodic self-diagnostics emitted to the control plane.
 //!
 //! A background thread collects counters from sensors, spool, and enrichment queue,
@@ -8,8 +7,10 @@
 //!
 //! "Silence is a detection": an agent that stops beaconing is as suspicious as one
 //! that stops sending events.
-//!
-//! Not yet wired into the agent main loop — integration pending transport (#24).
+
+// Only wired on Linux (commands/linux.rs) — Windows build will see this as dead code
+// until health is integrated there too (see #209 review).
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::{
     sync::{
@@ -191,10 +192,11 @@ impl HealthCollector {
 }
 
 /// Handle to stop the health collector.
-pub struct StopHandle(Arc<StopFlag>);
+pub struct StopHandle(#[allow(dead_code)] Arc<StopFlag>);
 
 impl StopHandle {
     /// Signals the collector to stop and wakes it from sleep immediately.
+    #[allow(dead_code)] // Will be used for graceful shutdown
     pub fn stop(&self) {
         self.0.stop();
     }
