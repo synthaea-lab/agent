@@ -29,7 +29,44 @@ pub mod sensor;
 
 /// Version of the serialized event model. Bumped on any serialization-visible change,
 /// together with a new golden-fixture directory (see crate docs).
-pub const SCHEMA_VERSION: u32 = 12;
+///
+/// Bumped 12 → 13 for [`Event::Auth`] (#94): a new enum variant is a new possible
+/// `"type"` tag value, which counts as serialization-visible per the rule above —
+/// even though it breaks nothing for readers of *old* data (see `tests/v1_compat.rs`,
+/// which pins that `tests/fixtures/v1/*.json`, frozen and never edited, still
+/// deserialize under the current `Event` type). `tests/fixtures/v13/` is a full
+/// snapshot (every golden fixture, not only the new `Auth` ones), matching the
+/// precedent already established by versions 2 through 12. Originally claimed as
+/// 10 → 11 while this branch was open; rebased to 13 once #189 (`NetworkFlow`,
+/// 11 → 12) merged into `main` first — same coordination note as ADR-0005.
+pub const SCHEMA_VERSION: u32 = 13;
+
+/// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
+/// reports a Windows **service install** as a persistence artifact (event 7045, "A
+/// service was installed in the system" — ATT&CK T1543.003) rather than a real file
+/// operation. `rules::check_service_persistence` requires this exact value before
+/// applying a suspicious-path filter — see that function's doc for why: applying the
+/// filter to the whole Windows file stream unfiltered would alert on every legitimate
+/// AppData/Temp write (browser updates, Electron apps, installers...).
+///
+/// A distinct bit from [`FLAG_PERSISTENCE_TASK_ARTIFACT`] (not shared): the two
+/// techniques (T1543.003 vs T1053.005) must not both fire off a single event.
+/// `disposition_to_flags` (`sensor-windows`) only ever produces `O_WRONLY` (0o1) /
+/// `O_CREAT` (0o100), so this high bit never collides with a real disposition value.
+///
+/// Not a serialization-visible schema change (no new field, no new [`Event`]
+/// variant — `flags` already exists and is already an opaque, per-platform `u32`),
+/// so this does not bump [`SCHEMA_VERSION`]. Pragmatic solution, not the final one:
+/// see `docs/adr/0004-windows-persistence-detection-via-eventlog-polling.md` for the
+/// full rationale and the option of a dedicated `Persistence`/`Registry` event
+/// family once the schema needs one for other reasons too.
+pub const FLAG_PERSISTENCE_ARTIFACT: u32 = 0x1000_0000;
+
+/// Same principle as [`FLAG_PERSISTENCE_ARTIFACT`], for a Windows **scheduled task**
+/// creation (event 4698, "A scheduled task was created" — ATT&CK T1053.005) rather
+/// than a service (T1543.003). See `check_scheduled_task_persistence` (`rules`) and
+/// `docs/adr/0004-windows-persistence-detection-via-eventlog-polling.md`.
+pub const FLAG_PERSISTENCE_TASK_ARTIFACT: u32 = 0x2000_0000;
 
 /// Identity of the user a process runs as, per platform.
 ///
@@ -442,6 +479,83 @@ pub struct HealthBeacon {
     pub enrich_dropped: u64,
 }
 
+/// A logon/authentication outcome, or a privileged-session assignment — shared
+/// across platforms per #94: Windows Security-log logons (events 4624/4625/4648/
+/// 4672, `sensor-windows-eventlog`) and Linux authentication (sshd accept/failure,
+/// `su`/`sudo`, PAM sessions — `sensor-linux-journal`, not yet implemented) both
+/// normalize into this one shape rather than each inventing its own type. See
+/// `docs/adr/0005-windows-logon-events-shared-auth-event-type.md`.
+///
+/// Deliberately narrower than either platform's native audit record: only the
+/// fields a cross-platform lateral-movement/privilege-escalation rule can
+/// actually use today. Platform-only detail that doesn't generalize (a Windows
+/// `LogonType` code, a Linux PAM service name) is left out rather than added
+/// speculatively — extend when a rule needs it, per this crate's additive-only
+/// discipline (see the top-level docs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthEvent {
+    /// Identity of the process that reported the logon (e.g. Windows
+    /// `winlogon.exe`/`lsass.exe`, the logon subsystem — not necessarily the
+    /// account's own process). This is a session/auth-subsystem event, not a
+    /// process-lifecycle one; `meta.user` is who is *performing* the action
+    /// (the already-logged-on caller for `ExplicitCredentials`/
+    /// `PrivilegedSession`), which is not the same as `target_user` below.
+    pub meta: EventMeta,
+    pub outcome: AuthOutcome,
+    pub kind: AuthKind,
+    /// The account being authenticated as/into — Windows `TargetUserName`
+    /// (`DOMAIN\user` or a local account name), Linux the PAM/sshd target user.
+    /// Deliberately distinct from `meta.user`: for `ExplicitCredentials` and
+    /// `PrivilegedSession` the two differ by design — that difference is the
+    /// whole signal.
+    pub target_user: String,
+    /// Windows `TargetUserSid`, when the platform resolves one. `None` on Linux
+    /// (no SID concept) and when Windows itself could not resolve the account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_user_sid: Option<String>,
+    /// Origin address, when the platform reports one for this kind of logon
+    /// (network/RDP logons, SSH) — absent for local console/service/batch
+    /// logons, which is itself meaningful (do not fabricate a loopback address).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_address: Option<core::net::IpAddr>,
+    /// Opaque platform status/result code, kept for forensic completeness
+    /// (Windows hex `Status`/`SubStatus` — e.g. the substatus that tells a wrong
+    /// password apart from an already-locked-out account) — not interpreted by
+    /// rules, which match on `outcome`/`kind` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<String>,
+}
+
+/// Whether an [`AuthEvent`] represents a successful or failed action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthOutcome {
+    Success,
+    Failure,
+}
+
+/// What kind of authentication/session action an [`AuthEvent`] represents.
+/// Coarse by design — see each variant for how Windows event IDs and (once
+/// implemented) the Linux journal facilities map onto it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthKind {
+    /// A new logon session was created (Windows event 4624; Linux sshd
+    /// `Accepted ...`/a PAM session open).
+    Logon,
+    /// A logon attempt failed (Windows event 4625; Linux sshd `Failed
+    /// password ...`/a PAM authentication failure).
+    LogonFailure,
+    /// Credentials for an account other than the current session's were
+    /// explicitly supplied (Windows event 4648 — a classic RunAs/lateral-movement
+    /// signal; Linux `su`/`sudo -u other-user`).
+    ExplicitCredentials,
+    /// Special/elevated privileges were assigned to a logon session (Windows
+    /// event 4672, typically alongside a 4624 for administrative accounts; Linux
+    /// a successful `sudo`).
+    PrivilegedSession,
+}
+
 /// The normalized event envelope.
 ///
 /// `#[non_exhaustive]`: new telemetry categories (registry, DNS, image load, ...) are
@@ -466,12 +580,17 @@ pub enum Event {
     AssemblyLoad(AssemblyLoadEvent),
     SmbConnect(SmbConnectEvent),
     UdpSend(UdpSendEvent),
+    Auth(AuthEvent),
     ListenPort(ListenPortEvent),
     NetworkFlow(NetworkFlowEvent),
 }
 
 impl Event {
     /// Returns the process metadata common to all telemetry events.
+    ///
+    /// Deliberately exhaustive (no wildcard arm): every new [`Event`] variant must
+    /// add its own arm here, so a missing one is a compile error rather than a
+    /// silently-wrong fallback.
     #[must_use]
     pub fn meta(&self) -> &EventMeta {
         match self {
@@ -486,6 +605,7 @@ impl Event {
             Event::AssemblyLoad(e) => &e.meta,
             Event::SmbConnect(e) => &e.meta,
             Event::UdpSend(e) => &e.meta,
+            Event::Auth(e) => &e.meta,
             Event::ListenPort(e) => &e.meta,
             Event::NetworkFlow(e) => &e.meta,
             // Non-exhaustive: new telemetry variants must be added here.

@@ -24,6 +24,8 @@ pub struct Capabilities {
     pub exec_events: bool,
     pub file_events: bool,
     pub connect_events: bool,
+    /// True when this sensor can emit [`crate::Event::Auth`].
+    pub auth_events: bool,
     /// True when emitted events carry real user attribution ([`crate::User`] not
     /// `Unknown`).
     pub user_attribution: bool,

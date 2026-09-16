@@ -129,6 +129,56 @@ pub fn parent_exclusion_applies(comm: &str, parent_comm: Option<&str>) -> bool {
     }
 }
 
+/// Per-channel-group enablement for `sensor-windows-eventlog` — #94's
+/// "policy-configurable channel allowlist". `sensor-*` crates may depend only
+/// on `schema` (`tools/check-deps.py`), so this type cannot be read by the
+/// sensor directly: the `agent` binary (unrestricted deps) reads it here and
+/// converts it into the sensor's own `EventLogConfig` at construction time
+/// (`agent/src/commands/windows.rs`). See
+/// `docs/adr/0006-eventlog-channel-allowlist-and-volume-counters.md`.
+///
+/// The first struct this crate has ever held (previously pure functions
+/// only) — deliberately without a `serde` derive: there is no policy-loading
+/// or distribution mechanism anywhere in this workspace yet (`config` covers
+/// only local, per-install settings — see its crate doc), so today this is a
+/// plain in-code default, not yet the "versioned and signed" document this
+/// crate's top-level doc describes. Add serialization when that mechanism
+/// exists, rather than speculatively now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventLogPolicy {
+    /// Event 7045 (T1543.003 — service install persistence).
+    pub service_installs_enabled: bool,
+    /// Event 4698 (T1053.005 — scheduled task persistence).
+    pub scheduled_tasks_enabled: bool,
+    /// Events 4624/4625/4648/4672 (logon/session, #94).
+    pub logon_events_enabled: bool,
+}
+
+impl Default for EventLogPolicy {
+    /// Every channel group enabled — matches `sensor-windows-eventlog`'s
+    /// behavior before this policy existed.
+    fn default() -> Self {
+        Self {
+            service_installs_enabled: true,
+            scheduled_tasks_enabled: true,
+            logon_events_enabled: true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod eventlog_policy_tests {
+    use super::EventLogPolicy;
+
+    #[test]
+    fn default_enables_every_channel_group() {
+        let policy = EventLogPolicy::default();
+        assert!(policy.service_installs_enabled);
+        assert!(policy.scheduled_tasks_enabled);
+        assert!(policy.logon_events_enabled);
+    }
+}
+
 #[cfg(test)]
 mod exclusion_tests {
     use super::*;

@@ -1,8 +1,12 @@
-//! Windows: ETW sensor commands. The kernel providers require administrator
-//! privileges; Ctrl-C is wired to the sensor's stop flag here (on Linux the
-//! sensor handles it itself).
+//! Windows: ETW + Event Log sensor commands. The kernel providers require
+//! administrator privileges; Ctrl-C is wired to both sensors' stop flags here (on
+//! Linux the sensor handles it itself).
 
-use schema::sensor::Sensor as _;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+use schema::Event;
+use schema::sensor::{EventSink, Sensor as _};
 
 use crate::sink::DetectionSink;
 
@@ -31,23 +35,95 @@ fn seeded_rule_state() -> rules::RuleState {
     rule_state
 }
 
-/// Runs a Windows sensor to completion with Ctrl-C wired to its stop flag.
-fn run_windows_sensor(sink: Box<dyn schema::sensor::EventSink>) -> anyhow::Result<()> {
-    let mut sensor = sensor_windows::WindowsSensor::new();
-    let stop = sensor.stop_handle();
+/// Forwards to a shared `Arc<dyn EventSink>` — lets two sensors run concurrently
+/// against the same sink (`EventSink::on_event` takes `&self`, so this is just
+/// ownership plumbing to satisfy `Sensor::run`'s `Box<dyn EventSink>` signature).
+struct SharedSink(Arc<dyn EventSink>);
+
+impl EventSink for SharedSink {
+    fn on_event(&self, event: Event) {
+        self.0.on_event(event);
+    }
+}
+
+/// Converts the control-plane-facing `policy::EventLogPolicy` into
+/// `sensor-windows-eventlog`'s own `EventLogConfig`. A manual field-by-field
+/// mapping, not a `From` impl, because `tools/check-deps.py` forbids either
+/// crate from depending on the other (`sensor-*` crates depend only on
+/// `schema`; `policy` depends only on `schema` too) — the binary is the one
+/// place both types are in scope, so it is the one place allowed to bridge
+/// them. See `docs/adr/0006-eventlog-channel-allowlist-and-volume-counters.md`.
+fn eventlog_config(policy: &policy::EventLogPolicy) -> sensor_windows_eventlog::EventLogConfig {
+    sensor_windows_eventlog::EventLogConfig {
+        service_installs_enabled: policy.service_installs_enabled,
+        scheduled_tasks_enabled: policy.scheduled_tasks_enabled,
+        logon_events_enabled: policy.logon_events_enabled,
+    }
+}
+
+/// Runs the ETW sensor (blocking, on the calling thread — same as before) and the
+/// Event Log persistence sensor (`sensor-windows-eventlog`, T1543.003/T1053.005/
+/// logon events) on a background thread, both against the same sink, with Ctrl-C
+/// wired to stop both.
+///
+/// The Event Log sensor is supplementary (see its crate doc): its failure is
+/// logged, not fatal — the ETW sensor is the one that must work for the agent to be
+/// useful at all, and a `wevtutil`/`auditpol` hiccup on one host must not take down
+/// process/network/file detection with it.
+fn run_windows_sensors(sink: Box<dyn EventSink>) -> anyhow::Result<()> {
+    let sink: Arc<dyn EventSink> = Arc::from(sink);
+
+    let mut etw_sensor = sensor_windows::WindowsSensor::new();
+    let etw_stop = etw_sensor.stop_handle();
+
+    // No policy-loading/distribution mechanism exists in this workspace yet
+    // (see `eventlog_config`'s doc), so this is the default (every channel
+    // group enabled) rather than something actually loaded from the control
+    // plane — the type and the toggle are real, the wire-up to a live policy
+    // document is a separate, tracked follow-up.
+    let eventlog_policy = policy::EventLogPolicy::default();
+    let mut eventlog_sensor =
+        sensor_windows_eventlog::EventLogSensor::with_config(eventlog_config(&eventlog_policy));
+    let eventlog_stop = eventlog_sensor.stop_handle();
+
     ctrlc::set_handler(move || {
         eprintln!("\n[!] Shutdown requested...");
-        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        etw_stop.store(true, Ordering::SeqCst);
+        eventlog_stop.store(true, Ordering::SeqCst);
     })?;
-    sensor
-        .run(sink)
-        .map_err(|e| anyhow::anyhow!("sensor failed: {e}"))
+
+    let eventlog_thread = {
+        let sink = Arc::clone(&sink);
+        std::thread::spawn(move || eventlog_sensor.run(Box::new(SharedSink(sink))))
+    };
+
+    let etw_result = etw_sensor
+        .run(Box::new(SharedSink(sink)))
+        .map_err(|e| anyhow::anyhow!("ETW sensor failed: {e}"));
+
+    match eventlog_thread.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!(
+            "[!] Event Log sensor stopped with an error (persistence detection degraded, \
+             ETW detections unaffected): {e}"
+        ),
+        Err(_) => eprintln!(
+            "[!] Event Log sensor thread panicked (persistence detection degraded, \
+             ETW detections unaffected)"
+        ),
+    }
+
+    etw_result
 }
 
 /// Windows: administrator privileges are required by the ETW kernel providers.
 pub(crate) fn cmd_status() -> anyhow::Result<()> {
     println!("Synthaea agent — platform: Windows");
-    println!("Sensor: ETW (Kernel-Process + Kernel-Network + Kernel-File)");
+    println!("Sensors: ETW (Kernel-Process + Kernel-Network + Kernel-File)");
+    println!(
+        "          Event Log polling (System/7045 + Security/4698/4624/4625/4648/4672 — \
+         service and scheduled-task persistence, logon/session events)"
+    );
     println!("Run as administrator for the kernel providers.");
     Ok(())
 }
@@ -60,19 +136,19 @@ pub(crate) fn cmd_run(alerts: &std::path::Path, events: &std::path::Path) -> any
         alerts.display(),
         events.display()
     );
-    run_windows_sensor(Box::new(sink))
+    run_windows_sensors(Box::new(sink))
 }
 
 pub(crate) fn cmd_capture_events(output: &std::path::Path) -> anyhow::Result<()> {
     let sink = sinks::JsonlEventSink::open(output)?;
     eprintln!("Synthaea — raw event capture (Ctrl-C to stop)");
     eprintln!("Output: {}", output.display());
-    run_windows_sensor(Box::new(sink))
+    run_windows_sensors(Box::new(sink))
 }
 
 pub(crate) fn cmd_capture_baseline(output: &std::path::Path) -> anyhow::Result<()> {
     let sink = crate::sink::BaselineSink::new(seeded_rule_state(), output)?;
     eprintln!("Synthaea — baseline capture (Ctrl-C to stop)");
     eprintln!("Output: {}", output.display());
-    run_windows_sensor(Box::new(sink))
+    run_windows_sensors(Box::new(sink))
 }

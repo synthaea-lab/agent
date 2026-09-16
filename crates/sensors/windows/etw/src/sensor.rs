@@ -221,6 +221,10 @@ impl Sensor for WindowsSensor {
             connect_events: true,
             user_attribution: true, // F-3: token SID + integrity level
             parent_lineage: true,   // parent path/comm resolved at exec time
+            // ETW (this sensor) only covers Kernel-Process/File/Network — it
+            // doesn't emit logon/auth events. That's `sensor-windows-eventlog`'s
+            // job (#94, Security 4624/4625/4648/4672 via wevtutil polling).
+            auth_events: false,
         }
     }
 

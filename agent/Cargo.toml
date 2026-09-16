@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 schema = { path = "../crates/schema" }
+policy = { path = "../crates/policy" }
 rules = { path = "../crates/rules" }
 correlator = { path = "../crates/correlator" }
 sigma = { path = "../crates/sigma" }
@@ -26,6 +27,7 @@ log = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 sensor-windows = { path = "../crates/sensors/windows/etw" }
+sensor-windows-eventlog = { path = "../crates/sensors/windows/eventlog" }
 ctrlc = "3"
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -662,6 +662,7 @@ impl Sensor for LinuxSensor {
             connect_events: true,
             user_attribution: true,
             parent_lineage: true,
+            auth_events: false,
         }
     }
 

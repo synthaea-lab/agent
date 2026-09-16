@@ -15,6 +15,9 @@
 //!   pipeline.
 //! - Signature verification runs only on cache misses and its verdict is cached with
 //!   the hash. Windows verification is forced offline (no revocation-network calls).
+//!   On Windows, an embedded-signature miss additionally tries a catalog-membership
+//!   lookup (see `sig.rs`) before settling on `Unsigned` — a handful of extra Win32
+//!   calls, but only on that one path, and only once per cache miss.
 
 mod sig;
 
@@ -212,8 +215,10 @@ mod tests {
     #[test]
     fn platform_signature_of_system_binary() {
         let mut e = Enricher::new();
-        // pwsh.exe carries an EMBEDDED Authenticode signature (System32 binaries are
-        // catalog-signed, which this stage does not resolve yet — see sig.rs).
+        // pwsh.exe carries an EMBEDDED Authenticode signature — this exercises the
+        // embedded-signature path (sig.rs's `verify_wide`) in isolation; the
+        // catalog-lookup fallback is exercised separately by
+        // `catalog_signed_system_binary_verifies` below.
         #[cfg(windows)]
         let (path, expected) = (
             Path::new("C:\\Program Files\\PowerShell\\7\\pwsh.exe"),
@@ -258,5 +263,27 @@ mod tests {
         let p = tmp_file("blob", b"just data");
         let mut e = Enricher::new();
         assert_eq!(e.enrich(&p).signature, Signature::Unsupported);
+    }
+
+    /// The exact regression #21's closing comment flagged: notepad.exe (like most
+    /// System32 binaries) has no EMBEDDED Authenticode signature, only catalog
+    /// membership — `verify_wide` alone reports Unsigned; the catalog-lookup
+    /// fallback (`sig.rs::windows_impl::catalog_verify`) must resolve it to Valid.
+    /// See `docs/adr/0007-windows-catalog-signed-binary-verification.md`.
+    #[cfg(windows)]
+    #[test]
+    fn catalog_signed_system_binary_verifies() {
+        let path = Path::new(r"C:\Windows\System32\notepad.exe");
+        if !path.exists() {
+            eprintln!("skipping: {} not present on this host", path.display());
+            return;
+        }
+        let mut e = Enricher::new();
+        assert_eq!(
+            e.enrich(path).signature,
+            Signature::Valid,
+            "{}",
+            path.display()
+        );
     }
 }

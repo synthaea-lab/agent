@@ -1,14 +1,17 @@
 //! Golden-fixture tests: the serialized form of every event type is pinned by the
-//! files under `tests/fixtures/v1/`. A failure here means a serialization-visible
-//! schema change — that is a `SCHEMA_VERSION` bump and a new fixture directory, never
-//! an edit to these files (see crate docs).
+//! files under `tests/fixtures/v<N>/`, where `<N>` is the current
+//! [`schema::SCHEMA_VERSION`]. A failure here means a serialization-visible schema change — that is a
+//! `SCHEMA_VERSION` bump and a new fixture directory, never an edit to these
+//! files (see crate docs). Old versions are never deleted either: see
+//! `tests/v1_compat.rs` for the matching backward-compatibility check against
+//! `tests/fixtures/v1/`.
 
 use std::net::IpAddr;
 
 use schema::{
-    AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileOpenEvent,
-    ImageLoadEvent, ListenPortEvent, NetworkFlowEvent, RegistrySetEvent, ScriptBlockEvent,
-    SmbConnectEvent, UdpSendEvent, User, WmiActivityEvent,
+    AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, ConnectEvent, DnsQueryEvent, Event,
+    EventMeta, ExecEvent, FileOpenEvent, ImageLoadEvent, ListenPortEvent, NetworkFlowEvent,
+    RegistrySetEvent, ScriptBlockEvent, SmbConnectEvent, UdpSendEvent, User, WmiActivityEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -77,7 +80,7 @@ fn exec_windows_golden() {
                 },
                 timestamp_ns: 1_756_900_001_000_000_000,
                 comm: "powershell.exe".into(),
-            container: None,
+                container: None,
             },
             image_path: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".into(),
             cmdline: "powershell.exe -NoProfile -EncodedCommand JABzAD0ATgBlAHcALQBPAGIAagBlAGMAdAAgAE4AZQB0AC4AVwBlAGIAQwBsAGkAZQBuAHQA".into(),
@@ -506,6 +509,68 @@ fn exec_container_golden() {
 }
 
 #[test]
+fn auth_logon_golden() {
+    // Successful interactive logon — no source address (local console/service
+    // logons don't have one; `None` must round-trip as an absent field, not a
+    // null, per `skip_serializing_if`). `comm` is `lsass.exe`: 4624/4625/4648/
+    // 4672 are all written by the "Microsoft-Windows-Security-Auditing"
+    // provider, which runs inside the LSA subsystem process — not
+    // `winlogon.exe`, which does not itself write these audit records (see
+    // `sensor.rs`'s `LSASS_COMM` doc).
+    assert_golden(
+        &Event::Auth(AuthEvent {
+            meta: EventMeta {
+                pid: 604,
+                ppid: 0,
+                user: User::Windows {
+                    sid: "S-1-5-18".into(),
+                    integrity_level: Some(0x4000),
+                },
+                timestamp_ns: 1_756_900_006_000_000_000,
+                comm: "lsass.exe".into(),
+                container: None,
+            },
+            outcome: AuthOutcome::Success,
+            kind: AuthKind::Logon,
+            target_user: "victim".into(),
+            target_user_sid: Some("S-1-5-21-1004336348-1177238915-682003330-1001".into()),
+            source_address: None,
+            status_code: None,
+        }),
+        "auth_logon",
+    );
+}
+
+#[test]
+fn auth_logon_failure_golden() {
+    // Failed network logon: source address present, target_user_sid is the Null
+    // SID (S-1-0-0) — what Windows reports in 4625 when the account name itself
+    // never resolved to a real SID (a nonexistent or badly-typed username).
+    assert_golden(
+        &Event::Auth(AuthEvent {
+            meta: EventMeta {
+                pid: 604,
+                ppid: 0,
+                user: User::Windows {
+                    sid: "S-1-5-18".into(),
+                    integrity_level: Some(0x4000),
+                },
+                timestamp_ns: 1_756_900_007_000_000_000,
+                comm: "lsass.exe".into(),
+                container: None,
+            },
+            outcome: AuthOutcome::Failure,
+            kind: AuthKind::LogonFailure,
+            target_user: "admin".into(),
+            target_user_sid: Some("S-1-0-0".into()),
+            source_address: Some("198.51.100.23".parse::<IpAddr>().unwrap()),
+            status_code: Some("0xC000006D/0xC000006A".into()),
+        }),
+        "auth_logon_failure",
+    );
+}
+
+#[test]
 fn unbounded_cmdline_survives() {
     // Audit F-4: multi-kilobyte encoded command lines must round-trip untouched.
     let long = format!("powershell.exe -EncodedCommand {}", "A".repeat(8 * 1024));
@@ -660,6 +725,15 @@ fn meta_accessor_covers_all_variants() {
             daddr: "10.0.0.1".parse::<IpAddr>().unwrap(),
             dport: 53,
             size: 0,
+        }),
+        Event::Auth(AuthEvent {
+            meta: meta.clone(),
+            outcome: AuthOutcome::Success,
+            kind: AuthKind::Logon,
+            target_user: String::new(),
+            target_user_sid: None,
+            source_address: None,
+            status_code: None,
         }),
         Event::ListenPort(ListenPortEvent {
             meta: meta.clone(),
