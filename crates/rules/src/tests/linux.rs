@@ -49,6 +49,49 @@ fn write_to_systemd_unit_matches_persistence() {
 }
 
 #[test]
+fn containerized_process_opening_proc_pid_root_matches_escape() {
+    let event = file_open_event_containerized("/proc/1/root/etc/shadow", "abc123");
+    assert!(check_proc_root_escape(&event).is_some());
+}
+
+#[test]
+fn containerized_process_opening_proc_pid_root_bare_matches_escape() {
+    // No subpath past `root` itself — still the same escape shape.
+    let event = file_open_event_containerized("/proc/42/root", "abc123");
+    assert!(check_proc_root_escape(&event).is_some());
+}
+
+#[test]
+fn bare_metal_process_opening_proc_pid_root_does_not_alert() {
+    // Same path, no container attribution: host tooling (nsenter, procfs walkers,
+    // debuggers) does this constantly and legitimately.
+    let event = file_open_event("/proc/1/root/etc/shadow", O_RDONLY);
+    assert!(check_proc_root_escape(&event).is_none());
+}
+
+#[test]
+fn containerized_process_opening_unrelated_proc_path_does_not_alert() {
+    let event = file_open_event_containerized("/proc/1/cgroup", "abc123");
+    assert!(check_proc_root_escape(&event).is_none());
+}
+
+#[test]
+fn containerized_process_opening_proc_root_without_pid_does_not_alert() {
+    // `/proc/root` isn't a thing — must not false-positive on a coincidental
+    // substring match.
+    let event = file_open_event_containerized("/proc/root", "abc123");
+    assert!(check_proc_root_escape(&event).is_none());
+}
+
+#[test]
+fn containerized_process_opening_proc_self_root_does_not_alert() {
+    // `/proc/self/root` is a process reading its OWN root (harmless, extremely
+    // common) — `self` isn't numeric, so this must not match.
+    let event = file_open_event_containerized("/proc/self/root", "abc123");
+    assert!(check_proc_root_escape(&event).is_none());
+}
+
+#[test]
 fn nginx_spawning_shell_matches_lineage() {
     let mut state = RuleState::new();
     state.on_exec(&exec_event_full(100, 1, "nginx", "nginx -g daemon off;", 0));

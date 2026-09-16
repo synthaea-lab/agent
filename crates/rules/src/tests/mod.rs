@@ -2,10 +2,11 @@
 //! (`linux` — stateless + download/exec/web-server lineage; `windows` —
 //! SELF-SPAWN, PARENT-SUSPECT, LOLBIN, BEACON).
 
-use schema::{ConnectEvent, EventMeta, ExecEvent, FileOpenEvent, User};
+use schema::{ConnectEvent, ContainerContext, EventMeta, ExecEvent, FileOpenEvent, User};
 
 use crate::{
     O_CREAT, O_WRONLY, RuleState, check_base64_decode, check_persistence_write,
+    check_proc_root_escape,
     exclusions::{BEACON_THRESHOLD, SELF_SPAWN_THRESHOLD},
 };
 
@@ -78,6 +79,16 @@ fn file_open_event_full(
     event.meta.pid = pid;
     event.meta.timestamp_ns = timestamp_ns;
     event.meta.comm = comm.to_string();
+    event
+}
+
+fn file_open_event_containerized(path: &str, container_id: &str) -> FileOpenEvent {
+    let mut event = file_open_event(path, O_RDONLY);
+    event.meta.container = Some(ContainerContext {
+        id: container_id.to_string(),
+        image: None,
+        name: None,
+    });
     event
 }
 

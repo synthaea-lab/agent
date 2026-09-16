@@ -67,8 +67,51 @@ pub fn evaluate_exec(event: &ExecEvent) -> Vec<Alert> {
     check_base64_decode(event).into_iter().collect()
 }
 
+/// T1611 — Escape to Host: a containerized process opening `/proc/<pid>/root` reaches
+/// through procfs into another process's root filesystem — normal containerized
+/// workloads have no legitimate reason to do this. The textbook path is a container
+/// run with a shared/host PID namespace (`--pid=host`) reaching `/proc/1/root` to
+/// read/write the host's own filesystem (issue #80's suggested example). This needs
+/// the container attribution #80 built, since the signal is "a containerized process
+/// did X", not X alone — host-side tooling reaches into other processes'
+/// `/proc/<pid>/root` constantly and legitimately (procfs walkers, `nsenter`,
+/// debuggers); a bare-metal process doing this is unremarkable, a containerized one
+/// almost never has a legitimate reason to.
+///
+/// Coverage gap, confirmed against a real Docker daemon: this needs `event.meta
+/// .container` to be populated, and the sensor's attribution loses a race for a
+/// process whose entire lifetime is one `open()` then exit (a bare `cat <path>`) — see
+/// `read_container_id`'s doc comment in `sensor-linux`. A slower/more deliberate escape
+/// (a shell that stays alive past the read) is attributed correctly and this rule fires;
+/// a one-shot command is not detected. Not a bug in this rule — a sensor-side tradeoff.
+#[must_use]
+pub fn check_proc_root_escape(event: &FileOpenEvent) -> Option<Alert> {
+    let container = event.meta.container.as_ref()?;
+
+    let mut segments = event.path.split('/').filter(|s| !s.is_empty());
+    let is_proc_pid_root = matches!(segments.next(), Some("proc"))
+        && segments.next().is_some_and(|s| s.parse::<u64>().is_ok())
+        && matches!(segments.next(), Some("root"));
+    if !is_proc_pid_root {
+        return None;
+    }
+
+    Some(Alert {
+        technique: "T1611",
+        message: format!(
+            "pid={} comm={} container={}: opened {} — containerized process reaching \
+             into another process's root filesystem via procfs, a common \
+             container-escape path",
+            event.meta.pid, event.meta.comm, container.id, event.path,
+        ),
+    })
+}
+
 /// Evaluates all stateless rules applicable to a `FileOpenEvent`.
 #[must_use]
 pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
-    check_persistence_write(event).into_iter().collect()
+    check_persistence_write(event)
+        .into_iter()
+        .chain(check_proc_root_escape(event))
+        .collect()
 }

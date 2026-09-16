@@ -25,13 +25,14 @@ fn comm_opt(comm: &[u8; wire::TASK_COMM_LEN]) -> Option<String> {
     (end != 0).then(|| String::from_utf8_lossy(&comm[..end]).into_owned())
 }
 
-/// `container_id` is resolved by the caller from `/proc/<pid>/cgroup` at drain time
-/// (issue #80) — attribution only for now, `image`/`name` await a follow-up
-/// Docker/containerd socket lookup.
+/// `container` is resolved by the caller: the id from `/proc/<pid>/cgroup` at drain
+/// time, `image`/`name` from a cached Docker/containerd socket lookup keyed on that
+/// id (issue #80 — both halves of the attribution this crate's doc comment on
+/// `ContainerContext` originally deferred).
 fn meta(
     meta: &wire::EventMeta,
     boot_epoch_offset_ns: u64,
-    container_id: Option<String>,
+    container: Option<ContainerContext>,
 ) -> EventMeta {
     EventMeta {
         pid: meta.pid,
@@ -42,11 +43,7 @@ fn meta(
         },
         timestamp_ns: meta.timestamp_ns.saturating_add(boot_epoch_offset_ns),
         comm: comm_str(&meta.comm),
-        container: container_id.map(|id| ContainerContext {
-            id,
-            image: None,
-            name: None,
-        }),
+        container,
     }
 }
 
@@ -63,7 +60,7 @@ pub fn exec(
     event: &wire::ExecEvent,
     boot_epoch_offset_ns: u64,
     argv: Vec<String>,
-    container_id: Option<String>,
+    container: Option<ContainerContext>,
 ) -> Event {
     let image_raw = &event.image[..(event.image_len as usize).min(wire::MAX_PATH_LEN)];
     let image_end = image_raw
@@ -73,7 +70,7 @@ pub fn exec(
     let image_path = String::from_utf8_lossy(&image_raw[..image_end]).into_owned();
 
     Event::Exec(ExecEvent {
-        meta: meta(&event.meta, boot_epoch_offset_ns, container_id),
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
         image_path,
         cmdline: argv.join(" "),
         argv,
@@ -89,12 +86,12 @@ pub fn exec(
 pub fn file_open(
     event: &wire::FileOpenEvent,
     boot_epoch_offset_ns: u64,
-    container_id: Option<String>,
+    container: Option<ContainerContext>,
 ) -> Event {
     let raw = &event.path[..(event.path_len as usize).min(wire::MAX_PATH_LEN)];
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
     Event::FileOpen(FileOpenEvent {
-        meta: meta(&event.meta, boot_epoch_offset_ns, container_id),
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
         path: String::from_utf8_lossy(&raw[..end]).into_owned(),
         flags: event.flags,
     })
@@ -104,7 +101,7 @@ pub fn file_open(
 pub fn connect(
     event: &wire::ConnectEvent,
     boot_epoch_offset_ns: u64,
-    container_id: Option<String>,
+    container: Option<ContainerContext>,
 ) -> Event {
     let daddr = if event.is_ipv6 {
         std::net::IpAddr::V6(event.daddr_v6.into())
@@ -112,7 +109,7 @@ pub fn connect(
         std::net::IpAddr::V4(event.daddr_v4.into())
     };
     Event::Connect(ConnectEvent {
-        meta: meta(&event.meta, boot_epoch_offset_ns, container_id),
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
         daddr,
         dport: event.dport,
     })
@@ -211,16 +208,37 @@ mod tests {
     }
 
     #[test]
-    fn exec_carries_container_id() {
+    fn exec_carries_container_id_only_when_image_name_unresolved() {
         let event = wire_exec(b"/usr/sbin/nginx", b"");
         let id = "a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456".to_string();
-        let Event::Exec(e) = exec(&event, 0, argv(&["nginx"]), Some(id.clone())) else {
+        let ctx = ContainerContext {
+            id: id.clone(),
+            image: None,
+            name: None,
+        };
+        let Event::Exec(e) = exec(&event, 0, argv(&["nginx"]), Some(ctx)) else {
             panic!("wrong variant")
         };
         let container = e.meta.container.expect("container attributed");
         assert_eq!(container.id, id);
-        assert_eq!(container.image, None, "awaits the socket-lookup follow-up");
-        assert_eq!(container.name, None, "awaits the socket-lookup follow-up");
+        assert_eq!(container.image, None, "socket lookup pending/failed");
+        assert_eq!(container.name, None, "socket lookup pending/failed");
+    }
+
+    #[test]
+    fn exec_carries_container_image_and_name_when_resolved() {
+        let event = wire_exec(b"/usr/sbin/nginx", b"");
+        let ctx = ContainerContext {
+            id: "abc123".to_string(),
+            image: Some("nginx:1.27".to_string()),
+            name: Some("web1".to_string()),
+        };
+        let Event::Exec(e) = exec(&event, 0, argv(&["nginx"]), Some(ctx)) else {
+            panic!("wrong variant")
+        };
+        let container = e.meta.container.expect("container attributed");
+        assert_eq!(container.image.as_deref(), Some("nginx:1.27"));
+        assert_eq!(container.name.as_deref(), Some("web1"));
     }
 
     #[test]

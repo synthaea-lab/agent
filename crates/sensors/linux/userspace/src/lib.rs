@@ -13,6 +13,8 @@
 pub mod normalize;
 
 #[cfg(target_os = "linux")]
+mod docker;
+#[cfg(target_os = "linux")]
 mod sensor;
 #[cfg(target_os = "linux")]
 pub use sensor::{LinuxSensor, TRACEPOINTS, load_ebpf, load_program};

@@ -6,12 +6,15 @@
 //! reuses them for the preflight (loads each program without attaching it), which is
 //! not part of the `Sensor` contract.
 
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use log::warn;
 use schema::sensor::{Capabilities, EventSink, Sensor, SensorError};
+use schema::ContainerContext;
 use tokio::sync::Notify;
 
+use crate::docker::DockerContainerInfo;
 use crate::normalize;
 
 /// The tracepoints implemented to date: (program, category, name). `sched_process_fork`
@@ -232,9 +235,22 @@ fn parse_cgroup_container_id(contents: &str) -> Option<String> {
 /// spoofing concern here, just the same exit race). `None` on a bare-metal/VM process,
 /// not just on a read failure — most events have no container to attribute.
 ///
-/// Attribution only: `id` is the full 64-hex-char id from the cgroup path. Resolving
-/// it to an image/name needs a cached Docker/containerd socket lookup, left to a
-/// follow-up (issue #80's item 1 is split across two PRs for that reason).
+/// `id` is the full 64-hex-char id from the cgroup path — resolving it to an
+/// image/name is [`DockerInfoCache`]'s job, a separate cached lookup against the
+/// daemon socket (issue #80's item 1, the other half of the split #169 left here).
+///
+/// Known coverage gap, confirmed against a real Docker daemon: a process whose entire
+/// lifetime is one `open()` then exit (e.g. a bare `cat <path>`, as opposed to a shell
+/// that keeps the fd/process around) reliably loses this race — `/proc/<pid>/cgroup` is
+/// already gone by the *first* attempt, every time, because the drain loop cannot catch
+/// up within such a short lifetime. [`ContainerIdCache`]'s retry budget does not help
+/// here (it targets a *different* race — `runc`'s init window, where the read succeeds
+/// but the cgroup hasn't settled yet — not a process that is already gone). A
+/// container-conditioned rule ([`crate::normalize`]'s callers; see `check_proc_root_escape`
+/// in `rules`) will not fire for a one-shot command, only for a process that stays alive
+/// past its triggering syscall. Not addressed here: fixing it needs the container id
+/// captured kernel-side (e.g. `bpf_get_current_cgroup_id()` at event capture time) rather
+/// than resolved lazily against `/proc` at drain time.
 fn read_container_id(pid: u32) -> Option<String> {
     match std::fs::read_to_string(format!("/proc/{pid}/cgroup")) {
         Ok(contents) => parse_cgroup_container_id(&contents),
@@ -244,6 +260,173 @@ fn read_container_id(pid: u32) -> Option<String> {
             None
         }
     }
+}
+
+/// Bounded cache over [`read_container_id`], keyed by pid.
+///
+/// Without this, every `file_open`/`exec`/`connect` event triggers a fresh
+/// `/proc/<pid>/cgroup` read — and for `file_open` specifically, that read is
+/// *itself* an `open()` syscall, which the `file_open` probe captures as a new
+/// `file_open` event for the same pid, which asks this same question again,
+/// forever: an unbounded, self-sustaining loop that pins a CPU core from the
+/// moment the agent starts (issue #199). The `drain!` call sites' own prior
+/// doc comment already flagged this exact shape of fix as a deferred
+/// followup ("revisit with a per-cgroup cache if a file-event-heavy workload
+/// makes it show up in profiling") — it has.
+///
+/// A pid's cgroup membership does not change once it's *settled* — but it is
+/// not settled from the pid's very first instant. Caught against a real
+/// `docker exec` while validating #80's image/name lookup: `runc`'s init
+/// process does several `file_open`s (setting up the target namespaces)
+/// *before* it moves itself into the container's cgroup and `execve`s into
+/// the target command — same pid throughout. Caching whatever the first
+/// observation says, permanently, latches every containerized process to
+/// `None` forever, the instant its very first file open is captured. Fixed by
+/// giving a `None` result a small number of retries — [`NONE_RETRY_LIMIT`] —
+/// before it's trusted as final; a genuinely bare-metal process pays that
+/// same bounded number of extra `/proc/<pid>/cgroup` reads once, which is
+/// exactly the "small constant multiplier, not unbounded" tradeoff the whole
+/// cache exists to keep. A resolved `Some(id)` is still cached immediately
+/// and permanently — nothing about a container id becomes wrong once seen.
+struct ContainerIdCache {
+    entries: HashMap<u32, CacheEntry>,
+    order: VecDeque<u32>,
+}
+
+#[derive(Clone)]
+struct CacheEntry {
+    id: Option<String>,
+    /// Only meaningful while `id` is `None` — how many `None` results in a row
+    /// this pid has produced. Irrelevant, and left alone, once `id` is `Some`.
+    none_attempts: u8,
+}
+
+/// Arbitrary but generous: a box with this many *concurrently live* distinct
+/// pids producing file/exec/connect events between evictions would need to be
+/// under genuinely unusual load — bound it rather than let it grow forever.
+const CONTAINER_ID_CACHE_CAP: usize = 4096;
+
+/// How many consecutive `None` reads a pid gets before its `None` is trusted
+/// as final. Small: the `runc`-init-to-execve window observed in practice is
+/// a handful of `file_open`s, not dozens.
+const NONE_RETRY_LIMIT: u8 = 5;
+
+impl ContainerIdCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn resolve(&mut self, pid: u32) -> Option<String> {
+        self.resolve_with(pid, read_container_id)
+    }
+
+    /// `resolve`'s actual logic, parameterized over the fetch so tests can inject a
+    /// call-counting stub instead of touching real `/proc` entries.
+    fn resolve_with(&mut self, pid: u32, fetch: impl Fn(u32) -> Option<String>) -> Option<String> {
+        if let Some(cached) = self.entries.get(&pid)
+            && (cached.id.is_some() || cached.none_attempts >= NONE_RETRY_LIMIT)
+        {
+            return cached.id.clone();
+        }
+
+        let id = fetch(pid);
+        let is_new_pid = !self.entries.contains_key(&pid);
+        let none_attempts = match &id {
+            Some(_) => 0,
+            None => {
+                self.entries
+                    .get(&pid)
+                    .map_or(0, |e| e.none_attempts)
+                    .saturating_add(1)
+            }
+        };
+        self.entries.insert(
+            pid,
+            CacheEntry {
+                id: id.clone(),
+                none_attempts,
+            },
+        );
+
+        if is_new_pid {
+            self.order.push_back(pid);
+            if self.order.len() > CONTAINER_ID_CACHE_CAP
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        id
+    }
+}
+
+/// One entry in [`DockerInfoCache`]: either a lookup is already running for this
+/// container id (don't start a second one), or it finished with whatever it found
+/// (`DockerContainerInfo`'s fields are already `Option` for "asked, got nothing").
+enum DockerLookupState {
+    Pending,
+    Done(DockerContainerInfo),
+}
+
+/// Cache of Docker daemon socket lookups, keyed by container id, shared between the
+/// event-processing loop and the background tasks it spawns to do the actual
+/// lookups.
+///
+/// Unlike [`ContainerIdCache`] (per pid, cheap, synchronous), resolving a container
+/// id to its image/name needs a round trip to another daemon over `/var/run/docker
+/// .sock` ([`crate::docker::lookup`]) — too slow to do inline on the same task that
+/// drains ring buffers, so a first sighting of a container id spawns a background
+/// task and the event that triggered it goes out with just the id (image/name
+/// filled in once the lookup completes, for every event after that).
+///
+/// Not bounded like `ContainerIdCache`: the number of *containers* a host runs
+/// over its uptime is normally far smaller than the number of *pids*, so unbounded
+/// growth here is a much smaller concern — revisit if a host doing heavy container
+/// churn (a CI runner, say) ever makes this show up in profiling, same as
+/// `ContainerIdCache` was itself once a deferred concern (issue #199).
+type DockerInfoCache = Arc<Mutex<HashMap<String, DockerLookupState>>>;
+
+/// Resolves `pid`'s full [`ContainerContext`] (id, plus image/name if the Docker
+/// socket lookup for that id has completed): the id comes from `container_ids`
+/// (cheap, synchronous, cached per pid); on the id's first sighting this spawns a
+/// background lookup into `docker_cache` and returns the id alone for now — image/
+/// name catch up on the *next* event for the same container, not this one.
+fn container_context(
+    pid: u32,
+    container_ids: &mut ContainerIdCache,
+    docker_cache: &DockerInfoCache,
+) -> Option<ContainerContext> {
+    let id = container_ids.resolve(pid)?;
+
+    let info = {
+        let mut cache = docker_cache.lock().unwrap();
+        match cache.get(&id) {
+            Some(DockerLookupState::Done(info)) => Some(info.clone()),
+            Some(DockerLookupState::Pending) => None,
+            None => {
+                cache.insert(id.clone(), DockerLookupState::Pending);
+                let cache = Arc::clone(docker_cache);
+                let lookup_id = id.clone();
+                tokio::task::spawn(async move {
+                    let info = crate::docker::lookup(&lookup_id).await.unwrap_or_default();
+                    cache
+                        .lock()
+                        .unwrap()
+                        .insert(lookup_id, DockerLookupState::Done(info));
+                });
+                None
+            }
+        }
+    };
+
+    Some(ContainerContext {
+        id,
+        image: info.as_ref().and_then(|i| i.image.clone()),
+        name: info.as_ref().and_then(|i| i.name.clone()),
+    })
 }
 
 /// Splits a `/proc/<pid>/stat` line into `(ppid, comm)`. `comm` is parenthesised and
@@ -427,6 +610,8 @@ impl LinuxSensor {
 
         log::info!("sensor-linux: listening for exec/open/connect events");
 
+        let mut container_ids = ContainerIdCache::new();
+        let docker_cache: DockerInfoCache = Arc::new(Mutex::new(HashMap::new()));
         let ctrl_c = tokio::signal::ctrl_c();
         tokio::pin!(ctrl_c);
         loop {
@@ -439,19 +624,19 @@ impl LinuxSensor {
                     // `spawn_blocking` yet — `/proc/<pid>/cgroup` has the same
                     // pseudo-fs-cheap, mmap_lock-independent profile).
                     drain!(guard, sensor_linux_wire::ExecEvent, sink, |e: &sensor_linux_wire::ExecEvent| {
-                        normalize::exec(e, offset, read_proc_cmdline(e.meta.pid), read_container_id(e.meta.pid))
+                        normalize::exec(e, offset, read_proc_cmdline(e.meta.pid), container_context(e.meta.pid, &mut container_ids, &docker_cache))
                     });
                 }
                 guard = file_open_ring_buf.readable_mut() => {
                     drain!(guard, sensor_linux_wire::FileOpenEvent, sink,
                         |e: &sensor_linux_wire::FileOpenEvent| {
-                            normalize::file_open(e, offset, read_container_id(e.meta.pid))
+                            normalize::file_open(e, offset, container_context(e.meta.pid, &mut container_ids, &docker_cache))
                         });
                 }
                 guard = connect_ring_buf.readable_mut() => {
                     drain!(guard, sensor_linux_wire::ConnectEvent, sink,
                         |e: &sensor_linux_wire::ConnectEvent| {
-                            normalize::connect(e, offset, read_container_id(e.meta.pid))
+                            normalize::connect(e, offset, container_context(e.meta.pid, &mut container_ids, &docker_cache))
                         });
                 }
             }
@@ -499,9 +684,14 @@ impl Sensor for LinuxSensor {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_container_id, is_proc_exit_race, parse_cgroup_container_id, parse_proc_cmdline,
-        parse_stat_ppid_comm,
+        container_context, extract_container_id, is_proc_exit_race, parse_cgroup_container_id,
+        parse_proc_cmdline, parse_stat_ppid_comm, CacheEntry, ContainerIdCache, DockerInfoCache,
+        DockerLookupState, CONTAINER_ID_CACHE_CAP, NONE_RETRY_LIMIT,
     };
+    use crate::docker::DockerContainerInfo;
+    use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn cmdline_splits_on_nul_and_drops_trailing_empty() {
@@ -657,5 +847,197 @@ mod tests {
     fn stat_garbage_is_none() {
         assert_eq!(parse_stat_ppid_comm("not a stat line"), None);
         assert_eq!(parse_stat_ppid_comm("123 (x) S notanumber"), None);
+    }
+
+    #[test]
+    fn container_id_cache_fetches_once_per_pid() {
+        // The bug this cache exists to fix (#199): resolving the same pid's container
+        // id twice should not re-run the fetch a second time. `read_container_id`
+        // itself does an `open()` that the real `file_open` probe would capture as a
+        // brand new event for the same pid — this is what turns a single re-fetch
+        // into an unbounded loop, so "no re-fetch" is the entire point of the cache.
+        let mut cache = ContainerIdCache::new();
+        let calls = Cell::new(0u32);
+        let fetch = |_pid: u32| {
+            calls.set(calls.get() + 1);
+            Some("abc".to_string())
+        };
+
+        assert_eq!(cache.resolve_with(42, fetch), Some("abc".to_string()));
+        assert_eq!(cache.resolve_with(42, fetch), Some("abc".to_string()));
+        assert_eq!(cache.resolve_with(42, fetch), Some("abc".to_string()));
+        assert_eq!(calls.get(), 1, "second/third resolve of the same pid must hit the cache, not fetch again");
+    }
+
+    #[test]
+    fn container_id_cache_none_result_is_retried_then_cached() {
+        // A bare-metal process (no container) resolves to `None` — eventually that
+        // negative result must be cached too, or every one of its events
+        // re-triggers the same self-feeding `open()` loop the cache exists to stop.
+        // But not on the very first `None`: see `NONE_RETRY_LIMIT`'s doc comment
+        // (the `runc`-init-before-execve window) for why an immediate-permanent
+        // `None` latch is itself a bug, not just over-caution.
+        let mut cache = ContainerIdCache::new();
+        let calls = Cell::new(0u32);
+        let fetch = |_pid: u32| {
+            calls.set(calls.get() + 1);
+            None
+        };
+
+        for _ in 0..NONE_RETRY_LIMIT {
+            assert_eq!(cache.resolve_with(7, fetch), None);
+        }
+        assert_eq!(
+            calls.get(),
+            u32::from(NONE_RETRY_LIMIT),
+            "each call up to the retry limit must actually re-fetch"
+        );
+
+        // Past the limit: cached, no more fetching.
+        assert_eq!(cache.resolve_with(7, fetch), None);
+        assert_eq!(cache.resolve_with(7, fetch), None);
+        assert_eq!(calls.get(), u32::from(NONE_RETRY_LIMIT), "no fetch past the retry limit");
+    }
+
+    #[test]
+    fn container_id_cache_some_result_stops_retrying_immediately() {
+        // A container id that only shows up after a couple of `None`s (the
+        // `runc`-init window) must be cached the moment it resolves, not after
+        // `NONE_RETRY_LIMIT` more calls.
+        let mut cache = ContainerIdCache::new();
+        let calls = Cell::new(0u32);
+        let responses = [None, None, Some("abc123".to_string())];
+        let fetch = |_pid: u32| {
+            let i = calls.get() as usize;
+            calls.set(calls.get() + 1);
+            responses.get(i).cloned().flatten()
+        };
+
+        assert_eq!(cache.resolve_with(7, fetch), None);
+        assert_eq!(cache.resolve_with(7, fetch), None);
+        assert_eq!(cache.resolve_with(7, fetch), Some("abc123".to_string()));
+        assert_eq!(calls.get(), 3);
+
+        // Cached from here on — no more fetching, even well past what would have
+        // been the `None` retry limit.
+        for _ in 0..(NONE_RETRY_LIMIT as u32 + 5) {
+            assert_eq!(cache.resolve_with(7, fetch), Some("abc123".to_string()));
+        }
+        assert_eq!(calls.get(), 3, "resolved id must not be re-fetched, ever");
+    }
+
+    #[test]
+    fn container_id_cache_distinct_pids_each_fetch_once() {
+        let mut cache = ContainerIdCache::new();
+        let calls = Cell::new(0u32);
+        let fetch = |pid: u32| {
+            calls.set(calls.get() + 1);
+            Some(format!("container-{pid}"))
+        };
+
+        assert_eq!(cache.resolve_with(1, fetch), Some("container-1".to_string()));
+        assert_eq!(cache.resolve_with(2, fetch), Some("container-2".to_string()));
+        assert_eq!(cache.resolve_with(1, fetch), Some("container-1".to_string()));
+        assert_eq!(calls.get(), 2, "one fetch per distinct pid, regardless of resolve order");
+    }
+
+    #[test]
+    fn container_id_cache_evicts_oldest_once_over_capacity() {
+        let mut cache = ContainerIdCache::new();
+        let fetch = |pid: u32| Some(format!("c{pid}"));
+
+        for pid in 0..CONTAINER_ID_CACHE_CAP as u32 {
+            cache.resolve_with(pid, fetch);
+        }
+        assert_eq!(cache.entries.len(), CONTAINER_ID_CACHE_CAP);
+
+        // One more pid pushes the cache over capacity: the oldest (pid 0) must be
+        // evicted so the cache stays bounded rather than growing forever.
+        cache.resolve_with(CONTAINER_ID_CACHE_CAP as u32, fetch);
+        assert_eq!(cache.entries.len(), CONTAINER_ID_CACHE_CAP);
+        assert!(!cache.entries.contains_key(&0), "oldest entry should have been evicted");
+
+        // Evicting pid 0 means it is no longer cached — re-resolving it must fetch
+        // again (proves eviction removed it from `entries`, not just `order`).
+        let refetch_calls = Cell::new(0u32);
+        let counting_fetch = |_pid: u32| {
+            refetch_calls.set(refetch_calls.get() + 1);
+            Some("c0-again".to_string())
+        };
+        cache.resolve_with(0, counting_fetch);
+        assert_eq!(refetch_calls.get(), 1);
+    }
+
+    fn empty_docker_cache() -> DockerInfoCache {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    #[test]
+    fn container_context_none_when_pid_has_no_container() {
+        let mut ids = ContainerIdCache::new();
+        ids.entries.insert(7, CacheEntry { id: None, none_attempts: NONE_RETRY_LIMIT }); // pre-seeded: settled, no container
+        let docker_cache = empty_docker_cache();
+
+        assert_eq!(container_context(7, &mut ids, &docker_cache), None);
+    }
+
+    #[tokio::test]
+    async fn container_context_returns_id_only_while_docker_lookup_pending() {
+        let mut ids = ContainerIdCache::new();
+        ids.entries.insert(7, CacheEntry { id: Some("abc123".to_string()), none_attempts: 0 });
+        let docker_cache = empty_docker_cache();
+
+        let ctx = container_context(7, &mut ids, &docker_cache).expect("has a container id");
+        assert_eq!(ctx.id, "abc123");
+        assert_eq!(ctx.image, None, "lookup was just spawned, not resolved yet");
+        assert_eq!(ctx.name, None);
+
+        // A second call for the same id, before the background lookup has had any
+        // chance to run (no `.await` in between), must not spawn a second one —
+        // observable as the cache entry staying a single `Pending`, not two
+        // overlapping tasks racing to write their result.
+        let ctx2 = container_context(7, &mut ids, &docker_cache).expect("still has a container id");
+        assert_eq!(ctx2.image, None);
+        assert!(matches!(
+            docker_cache.lock().unwrap().get("abc123"),
+            Some(DockerLookupState::Pending)
+        ));
+    }
+
+    #[tokio::test]
+    async fn container_context_uses_resolved_docker_info() {
+        let mut ids = ContainerIdCache::new();
+        ids.entries.insert(7, CacheEntry { id: Some("abc123".to_string()), none_attempts: 0 });
+        let docker_cache = empty_docker_cache();
+        docker_cache.lock().unwrap().insert(
+            "abc123".to_string(),
+            DockerLookupState::Done(DockerContainerInfo {
+                image: Some("nginx:1.27".to_string()),
+                name: Some("web1".to_string()),
+            }),
+        );
+
+        let ctx = container_context(7, &mut ids, &docker_cache).expect("has a container id");
+        assert_eq!(ctx.image.as_deref(), Some("nginx:1.27"));
+        assert_eq!(ctx.name.as_deref(), Some("web1"));
+    }
+
+    #[tokio::test]
+    async fn container_context_survives_a_failed_lookup() {
+        // `Done(default)` — the shape a failed/negative lookup leaves behind — must
+        // still produce a valid `ContainerContext` with just the id, not panic or
+        // re-spawn a lookup forever.
+        let mut ids = ContainerIdCache::new();
+        ids.entries.insert(7, CacheEntry { id: Some("abc123".to_string()), none_attempts: 0 });
+        let docker_cache = empty_docker_cache();
+        docker_cache
+            .lock()
+            .unwrap()
+            .insert("abc123".to_string(), DockerLookupState::Done(DockerContainerInfo::default()));
+
+        let ctx = container_context(7, &mut ids, &docker_cache).expect("has a container id");
+        assert_eq!(ctx.id, "abc123");
+        assert_eq!(ctx.image, None);
+        assert_eq!(ctx.name, None);
     }
 }
