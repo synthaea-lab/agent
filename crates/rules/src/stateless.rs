@@ -27,6 +27,53 @@ pub fn check_base64_decode(event: &ExecEvent) -> Option<Alert> {
     }
 }
 
+/// T1059.001 — Command and Scripting Interpreter: `PowerShell`, sub-case
+/// base64-encoded command (`-EncodedCommand` / `-enc`). Same philosophy as
+/// `check_base64_decode`: deterministic substring heuristic on the cmdline, no
+/// entropy analysis (that is the ML model's role as a complement, per
+/// `threat-model.md`).
+///
+/// Matches the `PowerShell` parameter alias `-EncodedCommand` in its canonical
+/// form and the short truncation `-enc` — the two shapes observed in T1059.001
+/// tradecraft in the wild. Rarer intermediate truncations (`-e`, `-en`,
+/// `-enco`, ...) are accepted by `PowerShell` itself but are a follow-up
+/// widening once we have telemetry to guide the trade-off against false
+/// positives (any shell script with a token starting with `-e` is very common
+/// on Linux).
+///
+/// Requires the cmdline to also mention a `PowerShell` interpreter
+/// (`powershell` on Windows via `powershell.exe`, `pwsh` on Linux/macOS and
+/// `PowerShell` Core on Windows) to filter out unrelated
+/// `-enc`/`-encodedcommand` tokens (an `openssl enc` pipeline, a fictitious
+/// tool with its own `-encodedcommand` flag, ...). Both anchor strings are
+/// specific enough that false positives are negligible in practice.
+/// Case-insensitive on the full string — `PowerShell` parameter names and
+/// image paths are.
+#[must_use]
+pub fn check_encoded_powershell(event: &ExecEvent) -> Option<Alert> {
+    let cmdline = &event.cmdline;
+    let cmdline_lower = cmdline.to_ascii_lowercase();
+    let mentions_powershell =
+        cmdline_lower.contains("powershell") || cmdline_lower.contains("pwsh");
+    if !mentions_powershell {
+        return None;
+    }
+    let has_encoded_flag = cmdline_lower
+        .split(|c: char| c.is_whitespace() || c == '\0')
+        .any(|token| token == "-encodedcommand" || token == "-enc");
+    if has_encoded_flag {
+        Some(Alert {
+            technique: "T1059.001",
+            message: format!(
+                "pid={} comm={}: PowerShell EncodedCommand invocation: {cmdline}",
+                event.meta.pid, event.meta.comm,
+            ),
+        })
+    } else {
+        None
+    }
+}
+
 /// T1037.004 (Boot or Logon Initialization Scripts) / T1053.003 (Cron) — write to a
 /// known persistence path. List deliberately restricted to the threat-model examples,
 /// not exhaustive coverage of Linux persistence mechanisms. Per-platform path sets are
@@ -64,7 +111,10 @@ pub fn check_persistence_write(event: &FileOpenEvent) -> Option<Alert> {
 /// Evaluates all stateless rules applicable to an `ExecEvent`.
 #[must_use]
 pub fn evaluate_exec(event: &ExecEvent) -> Vec<Alert> {
-    check_base64_decode(event).into_iter().collect()
+    check_base64_decode(event)
+        .into_iter()
+        .chain(check_encoded_powershell(event))
+        .collect()
 }
 
 /// T1611 — Escape to Host: a containerized process opening `/proc/<pid>/root` reaches

@@ -21,6 +21,77 @@ fn benign_curl_does_not_match_base64() {
     assert!(check_base64_decode(&event).is_none());
 }
 
+// ── T1059.001 PowerShell EncodedCommand (stateless, platform-neutral) ──────
+
+#[test]
+fn powershell_encoded_command_canonical_matches() {
+    // Canonical shape: `powershell.exe -EncodedCommand <base64>` — the form
+    // documented in every offensive-tradecraft resource.
+    let event = exec_event("powershell.exe -EncodedCommand ZWNobyBoZWxsbw==");
+    assert!(check_encoded_powershell(&event).is_some());
+}
+
+#[test]
+fn powershell_enc_short_form_matches() {
+    // Short truncation `-enc`, the other T1059.001 shape seen in the wild
+    // (e.g. Empire, Cobalt Strike PowerShell payloads).
+    let event = exec_event("powershell -enc ZWNobyBoZWxsbw==");
+    assert!(check_encoded_powershell(&event).is_some());
+}
+
+#[test]
+fn powershell_encoded_command_case_insensitive_matches() {
+    // PowerShell parameter aliases are case-insensitive — attacker payload
+    // may use mixed case to defeat naive lowercase-only matchers.
+    let event = exec_event("PowerShell.exe -EnCoDeDcOmMaNd ZWNobyBoZWxsbw==");
+    assert!(check_encoded_powershell(&event).is_some());
+}
+
+#[test]
+fn pwsh_linux_variant_matches() {
+    // T1059.001 is not Windows-only — `pwsh` is the PowerShell interpreter on
+    // Linux/macOS (and PowerShell Core on Windows). The rule's anchor covers
+    // both `powershell` and `pwsh` for exactly this case.
+    let event = exec_event("pwsh -EncodedCommand ZWNobyBoZWxsbw==");
+    assert!(check_encoded_powershell(&event).is_some());
+}
+
+#[test]
+fn powershell_without_encoded_flag_does_not_match() {
+    let event = exec_event("powershell.exe -Command Get-Process");
+    assert!(check_encoded_powershell(&event).is_none());
+}
+
+#[test]
+fn openssl_enc_without_powershell_does_not_match() {
+    // `openssl enc` for legitimate encryption uses a `-enc` token but does not
+    // mention powershell — the anchor filters it out.
+    let event = exec_event("openssl enc -aes-256-cbc -in file.txt -out file.enc");
+    assert!(check_encoded_powershell(&event).is_none());
+}
+
+#[test]
+fn powershell_word_in_argument_but_no_encoded_flag_does_not_match() {
+    // A shell that mentions "powershell" in a string argument but doesn't invoke
+    // it with an encoded flag must not match (the word `enc` here is not a
+    // standalone token starting with `-`).
+    let event = exec_event("echo 'use powershell to enc your commands'");
+    assert!(check_encoded_powershell(&event).is_none());
+}
+
+#[test]
+fn powershell_intermediate_truncation_does_not_match_yet() {
+    // Documented v1 limitation: PowerShell accepts `-Encoded`, `-Encod`, `-E`,
+    // etc. as valid truncations of `-EncodedCommand`. v1 covers only the
+    // canonical form and `-enc`; intermediate truncations are a follow-up
+    // widening once telemetry justifies the trade-off against false positives
+    // (any `-e` prefix token is very common on Unix cmdlines).
+    let event = exec_event("powershell.exe -Encoded ZWNobyBoZWxsbw==");
+    assert!(check_encoded_powershell(&event).is_none());
+}
+
+// ── T1037.004 / T1053.003 persistence writes ────────────────────────────────
+
 #[test]
 fn write_to_bashrc_matches_persistence() {
     // O_WRONLY|O_CREAT|O_TRUNC, values observed in real conditions (touch(1)).

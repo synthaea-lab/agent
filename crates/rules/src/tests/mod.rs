@@ -8,8 +8,8 @@ use schema::{
 };
 
 use crate::{
-    O_CREAT, O_WRONLY, RuleState, check_base64_decode, check_persistence_write,
-    check_proc_root_escape,
+    O_CREAT, O_WRONLY, RuleState, check_base64_decode, check_encoded_powershell,
+    check_persistence_write, check_proc_root_escape,
     exclusions::{BEACON_THRESHOLD, SELF_SPAWN_THRESHOLD},
 };
 
