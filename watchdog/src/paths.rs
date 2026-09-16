@@ -10,9 +10,18 @@ pub(crate) const DEFAULT_ALERTS: &str = "alerts.ndjson";
 
 /// Resolves the agent binary: the explicit `--agent-bin` path when given,
 /// otherwise next to the watchdog executable.
+///
+/// A relative `--agent-bin` is made absolute against the current directory here,
+/// not left for `spawn_agent` to sort out: `Command::current_dir` changes the
+/// child's working directory before it execs, so a still-relative program path
+/// resolves against the *new* directory instead of the one the caller meant —
+/// `target/release/agent` with a working dir of `target/release` looks for
+/// `target/release/target/release/agent` and fails with ENOENT.
 pub(crate) fn resolve_agent_bin(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     if let Some(p) = explicit {
-        return Ok(strip_unc_prefix(p));
+        let absolute = std::path::absolute(&p)
+            .with_context(|| format!("cannot resolve --agent-bin path: {}", p.display()))?;
+        return Ok(strip_unc_prefix(absolute));
     }
     let mut path = std::env::current_exe().context("cannot resolve current_exe")?;
     path.pop();
@@ -76,5 +85,21 @@ mod tests {
     fn explicit_agent_path_wins() {
         let p = resolve_agent_bin(Some(PathBuf::from("/x/agent"))).unwrap();
         assert_eq!(p, PathBuf::from("/x/agent"));
+    }
+
+    #[test]
+    fn explicit_relative_agent_path_is_made_absolute() {
+        // Regression test for the bug this session found on the Alpine VM: a
+        // relative --agent-bin survived unresolved all the way to spawn_agent's
+        // Command::new(agent).current_dir(work_dir), which changes the child's
+        // cwd before exec — so the still-relative program path resolved against
+        // the *new* directory and spawning failed with ENOENT.
+        let relative = PathBuf::from("target/release/agent");
+        let p = resolve_agent_bin(Some(relative.clone())).unwrap();
+        assert!(p.is_absolute(), "expected an absolute path, got {p:?}");
+        assert!(
+            p.ends_with(&relative),
+            "absolutized path {p:?} should still end with {relative:?}"
+        );
     }
 }
