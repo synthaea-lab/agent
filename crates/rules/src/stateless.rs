@@ -1,6 +1,6 @@
 //! Stateless rules: a single event is enough to decide — no history, no state.
 
-use schema::{ExecEvent, FLAG_PERSISTENCE_TASK_ARTIFACT, FileOpenEvent};
+use schema::{ExecEvent, FLAG_PERSISTENCE_ARTIFACT, FLAG_PERSISTENCE_TASK_ARTIFACT, FileOpenEvent};
 
 use crate::{Alert, has_write_intent};
 
@@ -189,6 +189,39 @@ pub fn check_scheduled_task_persistence(event: &FileOpenEvent) -> Option<Alert> 
     })
 }
 
+/// T1543.003 — Create or Modify System Process: Windows Service. A Windows service
+/// was just installed (Security log event 7045, "A service was installed in the
+/// system") — same eventlog-polling pipeline as T1053.005, see
+/// `docs/adr/0004-windows-persistence-detection-via-eventlog-polling.md`. Flows
+/// through `FileOpenEvent` with `FLAG_PERSISTENCE_ARTIFACT` (distinct bit from
+/// `FLAG_PERSISTENCE_TASK_ARTIFACT`, so the two techniques never cross-fire).
+///
+/// The signal is deterministic: `sensor-windows-eventlog` pushes this exact
+/// `FileOpenEvent` iff Windows wrote a 7045, and 7045 is emitted on any
+/// service install path (`sc.exe create`, `New-Service`, the Service Control
+/// Manager API, an MSI installer's service registration). The flag **is** the
+/// signal — no heuristic on service name, image path or start type here; the
+/// System log (not Security) provides 7045 unconditionally, no audit
+/// subcategory to enable.
+///
+/// Alert content carries the service's image path (`event.path`) and the
+/// service name (`event.meta.comm`) so an analyst can jump straight from the
+/// alert to the persistence artifact for triage/removal via
+/// `sc.exe delete <name>`.
+#[must_use]
+pub fn check_service_install_persistence(event: &FileOpenEvent) -> Option<Alert> {
+    if event.flags & FLAG_PERSISTENCE_ARTIFACT == 0 {
+        return None;
+    }
+    Some(Alert {
+        technique: "T1543.003",
+        message: format!(
+            "service={} pid={}: service persistence installed — image path: {}",
+            event.meta.comm, event.meta.pid, event.path,
+        ),
+    })
+}
+
 /// Evaluates all stateless rules applicable to a `FileOpenEvent`.
 #[must_use]
 pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
@@ -196,5 +229,6 @@ pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
         .into_iter()
         .chain(check_proc_root_escape(event))
         .chain(check_scheduled_task_persistence(event))
+        .chain(check_service_install_persistence(event))
         .collect()
 }

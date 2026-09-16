@@ -10,6 +10,7 @@ use schema::{
 use crate::{
     O_CREAT, O_WRONLY, RuleState, check_base64_decode, check_encoded_powershell,
     check_persistence_write, check_proc_root_escape, check_scheduled_task_persistence,
+    check_service_install_persistence,
     exclusions::{BEACON_THRESHOLD, SELF_SPAWN_THRESHOLD},
 };
 
@@ -102,6 +103,16 @@ fn file_open_event_containerized(path: &str, container_id: &str) -> FileOpenEven
 fn file_open_event_scheduled_task(task_name: &str, action_path: &str) -> FileOpenEvent {
     let mut event = file_open_event(action_path, schema::FLAG_PERSISTENCE_TASK_ARTIFACT);
     event.meta.comm = task_name.to_string();
+    event
+}
+
+/// A `FileOpenEvent` shaped like what `sensor-windows-eventlog` pushes on a
+/// System event 7045 (service install): the `flags` field carries the
+/// `FLAG_PERSISTENCE_ARTIFACT` bit, `path` is the service's image path, and
+/// `comm` is the service name.
+fn file_open_event_service_install(service_name: &str, image_path: &str) -> FileOpenEvent {
+    let mut event = file_open_event(image_path, schema::FLAG_PERSISTENCE_ARTIFACT);
+    event.meta.comm = service_name.to_string();
     event
 }
 
