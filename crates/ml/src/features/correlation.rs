@@ -45,14 +45,20 @@ pub const FEATURE_NAMES: [&str; 8] = [
 ];
 
 /// Event variants this vector is built from — process spawn, outbound connect, file
-/// open. `span_s` and `event_count` are computed over these only: the Python
-/// aggregator (`aggregate_correlation._flatten`, `RAW_EVENT_TYPES`) drops every other
-/// category before windowing, so counting e.g. a `DnsQuery` here would silently
-/// inflate both features relative to the training vectors.
+/// open, netlink-observed flow (ADR-0008). `span_s` and `event_count` are computed
+/// over these only: the Python aggregator (`aggregate_correlation._flatten`,
+/// `RAW_EVENT_TYPES`) drops every other category before windowing, so counting e.g. a
+/// `DnsQuery` here would silently inflate both features relative to the training
+/// vectors.
+///
+/// ADR-0008 side effect: gating the whole vector on this filter means `event_count`
+/// and `span_s` grow for any process with netlink traffic, not just the two fields
+/// `NetworkFlow` feeds below. `connect_count` (T1's `BehaviorVector`) is unaffected —
+/// it filters on `Event::Connect` explicitly, independent of this gate.
 fn is_modeled(event: &Event) -> bool {
     matches!(
         event,
-        Event::Exec(_) | Event::Connect(_) | Event::FileOpen(_)
+        Event::Exec(_) | Event::Connect(_) | Event::FileOpen(_) | Event::NetworkFlow(_)
     )
 }
 
@@ -73,12 +79,23 @@ pub fn extract_features(bus: &EventBus, pid: u32) -> [f32; 8] {
         .count();
     let filewrite_count = events.iter().filter(|e| is_file_write(e)).count();
 
+    // ADR-0008: NetworkFlow (netlink) and Connect are absorbed into the same
+    // daddr/dport sets — one count of "distinct destinations touched", regardless of
+    // which sensor captured them (mirrors BEACON's check_beacon/check_beacon_flow
+    // convergence on shared state).
     let mut daddrs = HashSet::new();
     let mut dports = HashSet::new();
     for e in &events {
-        if let Event::Connect(c) = e {
-            daddrs.insert(c.daddr);
-            dports.insert(c.dport);
+        match e {
+            Event::Connect(c) => {
+                daddrs.insert(c.daddr);
+                dports.insert(c.dport);
+            }
+            Event::NetworkFlow(f) => {
+                daddrs.insert(f.daddr);
+                dports.insert(f.dport);
+            }
+            _ => {}
         }
     }
 
@@ -112,7 +129,9 @@ pub fn extract_features(bus: &EventBus, pid: u32) -> [f32; 8] {
 mod tests {
     use std::time::Duration;
 
-    use schema::{ConnectEvent, DnsQueryEvent, EventMeta, ExecEvent, FileOpenEvent, User};
+    use schema::{
+        ConnectEvent, DnsQueryEvent, EventMeta, ExecEvent, FileOpenEvent, NetworkFlowEvent, User,
+    };
 
     use super::*;
 
@@ -145,6 +164,20 @@ mod tests {
             meta: meta(pid, ts_ns),
             daddr: "127.0.0.1".parse().unwrap(),
             dport,
+        })
+    }
+
+    fn network_flow(pid: u32, ts_ns: u64, daddr: &str, dport: u16) -> Event {
+        Event::NetworkFlow(NetworkFlowEvent {
+            meta: meta(pid, ts_ns),
+            local_port: 54321,
+            daddr: daddr.parse().unwrap(),
+            dport,
+            protocol: 6,
+            bytes_sent: None,
+            bytes_received: None,
+            packets_sent: None,
+            packets_received: None,
         })
     }
 
@@ -189,6 +222,24 @@ mod tests {
         assert_eq!(f[1], 3.0, "connect_count");
         assert_eq!(f[3], 1.0, "unique_daddr_count");
         assert_eq!(f[4], 2.0, "unique_dport_count");
+    }
+
+    #[test]
+    fn network_flow_absorbed_into_same_daddr_dport_sets_as_connect() {
+        // ADR-0008: Connect and NetworkFlow share one "distinct destinations" count —
+        // an attacker whose traffic is seen only by netlink still shows up here.
+        let mut bus = EventBus::new(Duration::from_secs(60));
+        bus.push(connect(7, 0, 4444));
+        bus.push(network_flow(7, 1_000_000_000, "10.0.0.1", 4444)); // same dest as connect
+        bus.push(network_flow(7, 2_000_000_000, "10.0.0.2", 9999)); // netlink-only dest
+
+        let f = extract_features(&bus, 7);
+        assert_eq!(f[3], 3.0, "unique_daddr_count spans Connect + NetworkFlow");
+        assert_eq!(f[4], 2.0, "unique_dport_count spans Connect + NetworkFlow");
+        assert_eq!(
+            f[7], 3.0,
+            "event_count includes NetworkFlow (is_modeled gate)"
+        );
     }
 
     #[test]
