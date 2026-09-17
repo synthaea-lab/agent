@@ -56,6 +56,16 @@ pub(crate) fn child_log_path() -> &'static str {
     }
 }
 
+/// Derives the heartbeat file path from the alerts output path (#102) — the
+/// two always travel together, so no separate CLI flag or install-time wiring
+/// is needed for it. **Must stay in sync with `agent::heartbeat::heartbeat_path_for`**,
+/// which computes the same transform independently (the two crates share no
+/// dependency to hang a single implementation off of — `watchdog` cannot
+/// depend on the binary-only `agent` crate).
+pub(crate) fn heartbeat_path_for(alerts: &std::path::Path) -> PathBuf {
+    alerts.with_extension("heartbeat")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,8 +93,20 @@ mod tests {
 
     #[test]
     fn explicit_agent_path_wins() {
-        let p = resolve_agent_bin(Some(PathBuf::from("/x/agent"))).unwrap();
-        assert_eq!(p, PathBuf::from("/x/agent"));
+        // "/x/agent" is fully absolute on Unix but only *rooted* on Windows (no
+        // drive letter) — resolve_agent_bin's std::path::absolute() call
+        // legitimately prepends the current drive there, so exact equality
+        // isn't portable. Assert what this test actually cares about: the
+        // explicit path wins over the next-to-the-watchdog default, i.e. the
+        // result stays absolute and still ends with the path we gave it —
+        // same pattern as explicit_relative_agent_path_is_made_absolute below.
+        let explicit = PathBuf::from("/x/agent");
+        let p = resolve_agent_bin(Some(explicit.clone())).unwrap();
+        assert!(p.is_absolute(), "expected an absolute path, got {p:?}");
+        assert!(
+            p.ends_with("x/agent"),
+            "resolved path {p:?} should still end with the explicit {explicit:?}"
+        );
     }
 
     #[test]
@@ -100,6 +122,16 @@ mod tests {
         assert!(
             p.ends_with(&relative),
             "absolutized path {p:?} should still end with {relative:?}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_path_is_derived_from_alerts() {
+        // Must match agent::heartbeat::heartbeat_path_for byte for byte —
+        // this is the independent side of that transform (see its doc).
+        assert_eq!(
+            heartbeat_path_for(std::path::Path::new("/var/lib/synthaea/alerts.ndjson")),
+            PathBuf::from("/var/lib/synthaea/alerts.heartbeat")
         );
     }
 }

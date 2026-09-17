@@ -137,6 +137,14 @@ pub(crate) fn cmd_run(alerts: &std::path::Path, events: &std::path::Path) -> any
         alerts.display(),
         events.display()
     );
+    // Progress-backed liveness (#102): started before the sink moves into the
+    // sensor below, since the heartbeat writer only needs a clone of the
+    // shared counter, not the sink itself.
+    crate::heartbeat::start(
+        crate::heartbeat::heartbeat_path_for(alerts),
+        sink.progress_handle(),
+        crate::heartbeat::WRITE_INTERVAL,
+    );
     run_windows_sensors(Box::new(sink))
 }
 

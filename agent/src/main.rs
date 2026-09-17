@@ -6,11 +6,14 @@
 //!
 //! Layout: `commands` carries all the `cfg(target_os)` (sensor selection, rule
 //! seeding); `sink` the agent's `EventSink` wiring events into the detection engines
-//! and the output sinks.
+//! and the output sinks; `heartbeat` the progress-backed liveness signal the
+//! watchdog polls (#102).
 
 mod commands;
 mod enrich_queue;
 mod health;
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+mod heartbeat;
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 mod sink;
 mod time;

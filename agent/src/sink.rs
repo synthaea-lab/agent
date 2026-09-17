@@ -4,6 +4,7 @@
 //! scorer plug in here as their crates are migrated (M2), each addition a new field
 //! and a few lines in `on_event`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use schema::{Event, sensor::EventSink};
@@ -30,6 +31,12 @@ pub(crate) struct DetectionSink {
     /// drain thread (issue #126). The capture thread runs detection in memory and
     /// hands the event here with a non-blocking send.
     enrich_queue: EnrichQueue,
+    /// Liveness counter for the watchdog's heartbeat monitor (#102): incremented
+    /// once `on_event` has fully processed an event, so `agent::heartbeat`'s
+    /// writer thread can sample it and expose real forward progress — not just
+    /// "the process is scheduled" — to `watchdog::supervise::HeartbeatMonitor`.
+    /// See `progress_handle`.
+    progress: Arc<AtomicU64>,
 }
 
 impl DetectionSink {
@@ -54,6 +61,7 @@ impl DetectionSink {
             yara: start_yara(alert_log.clone()),
             alert_log,
             enrich_queue,
+            progress: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -61,6 +69,14 @@ impl DetectionSink {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn enrich_queue(&self) -> &EnrichQueue {
         &self.enrich_queue
+    }
+
+    /// Hands out the shared progress counter for `agent::heartbeat::start` to
+    /// sample (#102) — a clone of the `Arc`, not the sink itself, so the
+    /// heartbeat writer thread needs no reference to the sink or its other
+    /// state.
+    pub(crate) fn progress_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.progress)
     }
 
     /// Cross-event correlation (co-occurrence rules + Bayesian belief).
@@ -216,6 +232,10 @@ impl EventSink for DetectionSink {
         }
         // Enrichment + the high-volume raw-event write happen off this thread.
         self.enrich_queue.enqueue(event);
+        // Last: only counts as "progress" once everything above has actually
+        // completed for this event (#102) — a hang anywhere above (a poisoned
+        // lock, a wedged Sigma/YARA call) stops the heartbeat from advancing.
+        self.progress.fetch_add(1, Ordering::Relaxed);
     }
 }
 

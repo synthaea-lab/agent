@@ -75,6 +75,16 @@ enum Command {
         /// Restart delay in seconds after a crash.
         #[arg(long, default_value = "5")]
         restart_delay: u64,
+
+        /// Heartbeat check interval in seconds (#102): how often the progress
+        /// counter the agent writes is polled for advancement.
+        #[arg(long, default_value = "5")]
+        heartbeat_interval_secs: u64,
+
+        /// Consecutive stalled heartbeat checks before the agent is considered
+        /// hung and killed/restarted (#102).
+        #[arg(long, default_value = "6")]
+        heartbeat_miss_limit: u32,
     },
 }
 
@@ -88,7 +98,15 @@ fn run_cli() -> anyhow::Result<()> {
             agent_bin,
             alerts,
             restart_delay,
-        } => supervise::cmd_run(agent_bin, alerts, restart_delay),
+            heartbeat_interval_secs,
+            heartbeat_miss_limit,
+        } => supervise::cmd_run(
+            agent_bin,
+            alerts,
+            restart_delay,
+            heartbeat_interval_secs,
+            heartbeat_miss_limit,
+        ),
     }
 }
 
