@@ -25,6 +25,13 @@
 ml/datasets/**/*.jsonl text eol=lf
 ml/datasets/**/manifest.json text eol=lf
 
+# lab/scenarios/*.yaml sidecars are content-hashed too: ADR-0009's
+# ScenarioReplayResult.scenario_yaml_sha256 binds a model record to the exact
+# on-disk bytes of the scenario it was replayed against, invalidating the binding
+# on any mutation. Same hash-drift risk as ml/datasets above if a Windows
+# contributor's core.autocrlf rewrites LF to CRLF on checkout.
+lab/scenarios/*.yaml text eol=lf
+
 # Rust/Python parity fixtures (CLAUDE.md "Parity seams"). Checked: both sides read
 # these via json.loads/serde_json::from_str, which treat \r as insignificant
 # whitespace outside strings, so CRLF here doesn't actually break a test the way
