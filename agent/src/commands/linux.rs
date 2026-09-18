@@ -155,6 +155,7 @@ pub(crate) fn cmd_run(alerts: &std::path::Path, events: &std::path::Path) -> any
     );
 
     spawn_netlink_poller(sink.clone());
+    spawn_journal_tail(sink.clone());
     let mut sensor = sensor_linux::LinuxSensor::new();
     sensor
         .run(Box::new(sink))
@@ -231,6 +232,56 @@ fn forward_netlink_events(
             }
         }
     }
+}
+
+/// Spawns the background thread that tails journald for auth/session events
+/// (issue #93: sshd accept/fail, `sudo`/`su`, PAM sessions), mapping each into
+/// `schema::AuthEvent` (`sensor_linux_journal::to_auth_event`, issue #94's shared
+/// logon shape) and handing it to `sink` — same "poll/tail source with no
+/// `Sensor` impl, caller owns the handoff" shape as [`spawn_netlink_poller`], see
+/// `sensor_linux_journal`'s crate doc.
+///
+/// Best-effort at startup: a non-systemd init (Alpine/OpenRC, see
+/// `watchdog::service::linux`'s own doc on this) has no `journalctl` at all —
+/// logged once and skipped, not a reason to fail `agent run` entirely, same
+/// posture as [`seeded_rule_state`]'s netlink snapshot.
+fn spawn_journal_tail(sink: Arc<DetectionSink>) {
+    std::thread::Builder::new()
+        .name("journal-tail".into())
+        .spawn(move || {
+            let cursor = sensor_linux_journal::current_cursor().ok();
+            let mut child = match sensor_linux_journal::spawn_follow(cursor.as_deref()) {
+                Ok(child) => child,
+                Err(e) => {
+                    log::warn!("journal tail: journalctl unavailable, skipping ({e})");
+                    return;
+                }
+            };
+            let Some(stdout) = child.stdout.take() else {
+                log::warn!("journal tail: journalctl spawned without a piped stdout");
+                return;
+            };
+            let journal = sensor_linux_journal::ClassifiedJournal::new(std::io::BufReader::new(
+                stdout,
+            ));
+            for item in journal {
+                match item {
+                    Ok((record, event)) => {
+                        if let Some(auth) = sensor_linux_journal::to_auth_event(&record, &event) {
+                            sink.on_event(schema::Event::Auth(auth));
+                        }
+                    }
+                    Err(e) => {
+                        // A hard I/O error ends `ClassifiedJournal`'s stream (see its
+                        // doc) — nothing left to iterate, so this thread exits. No
+                        // reconnect logic yet (matches the crate doc's Status section).
+                        log::warn!("journal tail: stream ended: {e}");
+                        break;
+                    }
+                }
+            }
+        })
+        .expect("spawning the journal tail thread");
 }
 
 /// Linux: rules-filtered benign capture via `BaselineSink` (Ctrl-C handled by the

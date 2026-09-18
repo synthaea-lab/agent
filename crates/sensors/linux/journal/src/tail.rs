@@ -7,9 +7,10 @@
 //! every dev/CI machine and target distro — in the same spirit as PR #152 dropping
 //! the `vmlinux` bindings crate in favor of reading `/proc` directly. The cost is a
 //! child process to supervise; [`process::spawn_follow`] hands back the `Child` and
-//! leaves lifecycle management (kill on [`schema::sensor::Sensor::stop`], restart on
-//! unexpected exit) to the caller — there is no caller yet (see the crate doc), so
-//! there's nothing to build that supervision against today.
+//! leaves lifecycle management to the caller —
+//! `agent::commands::linux::cmd_run` (issue #93), which kills it on Ctrl-C
+//! alongside the rest of the agent's threads. Restart-on-unexpected-exit is not
+//! built yet (see the crate doc's Status section on cursor persistence).
 
 use std::io::BufRead;
 
@@ -110,8 +111,8 @@ pub mod process {
     /// `BufReader::new(child.stdout.take().unwrap())`.
     ///
     /// The caller owns the child and must kill it on shutdown; this crate has no
-    /// [`schema::sensor::Sensor`] implementation yet to do that from (see the crate
-    /// doc), so there is no such caller today.
+    /// [`schema::sensor::Sensor`] implementation (see the crate doc — its caller,
+    /// `agent::commands::linux::cmd_run`, wires it directly instead).
     ///
     /// # Errors
     ///

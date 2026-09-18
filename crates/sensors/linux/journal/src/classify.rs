@@ -27,9 +27,15 @@ use crate::JournalRecord;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JournalEvent {
     /// Successful SSH login (`sshd`, "Accepted ..." — password or pubkey).
-    SshAccepted { user: Option<String> },
+    SshAccepted {
+        user: Option<String>,
+        source_addr: Option<String>,
+    },
     /// Failed SSH login attempt (bad password, or a nonexistent account probed).
-    SshFailed { user: Option<String> },
+    SshFailed {
+        user: Option<String>,
+        source_addr: Option<String>,
+    },
     /// A PAM-backed session opened, keyed by the PAM service name (`"sudo"`,
     /// `"sshd"`, `"su"`, `"login"`, ...) — parsed from the standard
     /// `pam_unix(<service>:session):` prefix, so any PAM service using
@@ -65,7 +71,14 @@ pub fn classify(record: &JournalRecord) -> Option<JournalEvent> {
 
     let identifier = record.syslog_identifier.as_deref().unwrap_or_default();
 
-    if identifier == "sshd"
+    // OpenSSH 9.8+ re-execs the per-connection worker into a separate
+    // `sshd-session` binary (privsep refactor) that reports under that name
+    // instead of the classic single-binary `sshd` — confirmed on real hardware
+    // (Arch, 2026-09-18 lab validation): a stock Arch box's `Accepted`/PAM-session
+    // lines never carried `SYSLOG_IDENTIFIER=sshd` at all, only `sshd-session`.
+    // Both are checked so this doesn't silently go dark on either OpenSSH
+    // generation.
+    if (identifier == "sshd" || identifier == "sshd-session")
         && let Some(event) = classify_sshd(&record.message)
     {
         return Some(event);
@@ -96,21 +109,25 @@ fn classify_sshd(message: &str) -> Option<JournalEvent> {
     if let Some(rest) = message.strip_prefix("Accepted ") {
         // "password for alice from 10.0.0.5 port 51000 ssh2" (or "publickey for ...").
         let user = extract_between(rest, " for ", " from");
-        return Some(JournalEvent::SshAccepted { user });
+        let source_addr = extract_between(rest, " from ", " port");
+        return Some(JournalEvent::SshAccepted { user, source_addr });
     }
     if let Some(rest) = message.strip_prefix("Failed password for invalid user ") {
         return Some(JournalEvent::SshFailed {
             user: extract_before(rest, " from"),
+            source_addr: extract_between(rest, " from ", " port"),
         });
     }
     if let Some(rest) = message.strip_prefix("Failed password for ") {
         return Some(JournalEvent::SshFailed {
             user: extract_before(rest, " from"),
+            source_addr: extract_between(rest, " from ", " port"),
         });
     }
     if let Some(rest) = message.strip_prefix("Invalid user ") {
         return Some(JournalEvent::SshFailed {
             user: extract_before(rest, " from"),
+            source_addr: extract_between(rest, " from ", " port"),
         });
     }
     None
@@ -261,7 +278,8 @@ mod tests {
         assert_eq!(
             classify(&r),
             Some(JournalEvent::SshAccepted {
-                user: Some("alice".into())
+                user: Some("alice".into()),
+                source_addr: Some("10.0.0.5".into()),
             })
         );
     }
@@ -278,7 +296,8 @@ mod tests {
         assert_eq!(
             classify(&r),
             Some(JournalEvent::SshAccepted {
-                user: Some("bob".into())
+                user: Some("bob".into()),
+                source_addr: Some("10.0.0.5".into()),
             })
         );
     }
@@ -295,7 +314,8 @@ mod tests {
         assert_eq!(
             classify(&r),
             Some(JournalEvent::SshFailed {
-                user: Some("alice".into())
+                user: Some("alice".into()),
+                source_addr: Some("10.0.0.5".into()),
             })
         );
     }
@@ -312,7 +332,8 @@ mod tests {
         assert_eq!(
             classify(&r),
             Some(JournalEvent::SshFailed {
-                user: Some("root".into())
+                user: Some("root".into()),
+                source_addr: Some("10.0.0.5".into()),
             })
         );
     }
@@ -326,7 +347,28 @@ mod tests {
         assert_eq!(
             classify(&r),
             Some(JournalEvent::SshFailed {
-                user: Some("admin".into())
+                user: Some("admin".into()),
+                source_addr: Some("10.0.0.5".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn sshd_session_identifier_is_also_classified() {
+        // Real capture (Arch, OpenSSH 9.8+ privsep refactor): the per-connection
+        // worker reports as `sshd-session`, not the classic `sshd`.
+        let r = record_with(&[
+            ("SYSLOG_IDENTIFIER", "sshd-session"),
+            (
+                "MESSAGE",
+                "Accepted publickey for vagrant from 172.18.96.1 port 23331 ssh2: ED25519 SHA256:abc",
+            ),
+        ]);
+        assert_eq!(
+            classify(&r),
+            Some(JournalEvent::SshAccepted {
+                user: Some("vagrant".into()),
+                source_addr: Some("172.18.96.1".into()),
             })
         );
     }

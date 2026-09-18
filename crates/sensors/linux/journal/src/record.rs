@@ -34,6 +34,15 @@ pub struct JournalRecord {
     /// necessarily the account being authenticated — that's parsed from `message`
     /// by [`classify`](crate::classify) instead).
     pub uid: Option<String>,
+    /// `_PID` — PID of the process that emitted the record (`sshd`, `sudo`, ...).
+    /// Needed to fill [`schema::EventMeta::pid`] for the auth-event mapping
+    /// (issue #94) — a record without one (never seen in practice for the
+    /// syslog-identified sources this crate allowlists) can't be attributed to a
+    /// schema event and is skipped there rather than fabricating a pid.
+    pub pid: Option<String>,
+    /// `_GID` — numeric GID of the process that emitted the record, paired with
+    /// `uid` to fill `schema::User::Unix` for the auth-event mapping.
+    pub gid: Option<String>,
     /// `MESSAGE` — required: a record with no usable message string can't be
     /// classified, so [`parse_record`] treats its absence as unparseable.
     pub message: String,
@@ -78,6 +87,8 @@ pub fn parse_record(line: &str) -> Result<JournalRecord, JournalError> {
         boot_id: get_str("_BOOT_ID"),
         syslog_identifier: get_str("SYSLOG_IDENTIFIER"),
         uid: get_str("_UID"),
+        pid: get_str("_PID"),
+        gid: get_str("_GID"),
         message,
         job_type: get_str("JOB_TYPE"),
         job_result: get_str("JOB_RESULT"),

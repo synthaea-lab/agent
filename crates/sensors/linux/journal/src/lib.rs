@@ -10,31 +10,39 @@
 //! Records normalize into schema events with their journal provenance kept;
 //! filtering is allowlist-based (never ship the whole journal).
 //!
-//! **Status (issue #93, foundation):** [`classify`] and [`JournalRecord`] parsing are
-//! done and tested against a mix of real captures (sudo command + PAM session
-//! open/close, taken from this dev machine's own journal — see the test fixtures'
-//! comments for which) and documented-but-unverified formats (sshd accept/fail: no
-//! `sshd` on this box; su: blocked here by an interactive-auth prompt this
-//! non-interactive session can't answer). [`tail::spawn_follow`] and
-//! [`tail::current_cursor`] shell out to `journalctl` and are exercised by an
-//! integration test that skips itself if `journalctl` is not on `PATH` rather than
-//! asserting a specific journal history exists.
+//! **Status (issue #93):** [`classify`]/[`JournalRecord`] parsing, and the
+//! [`auth`] mapping into the shared `schema::AuthEvent` (issue #94 having landed
+//! `Event::Auth` since this crate's foundation was written — see [`auth`]'s module
+//! doc), are done and tested. Real-hardware validation (Hyper-V lab, Arch Linux):
+//! `sshd` accept and `sudo` both confirmed to land as normalized `AuthEvent`s.
+//! Found along the way: this box's OpenSSH (9.8+ privsep refactor) re-execs the
+//! per-connection worker as `sshd-session`, never `sshd` — the original
+//! `identifier == "sshd"` check (written against documentation, no `sshd` on the
+//! original dev box to verify against) would have silently never matched on real
+//! hardware; both identifiers are now checked. Also confirmed: unprivileged
+//! `journalctl` cannot read these auth records at all on this box (journald's
+//! per-unit read ACL) — a non-issue for this sensor in practice since the agent
+//! already needs root for eBPF, but worth remembering if testing this crate
+//! standalone. `su`/`sshd` login-failure mapping is implemented and unit-tested
+//! but still unverified against a real prompt/failed attempt.
 //!
-//! Deliberately **not** here yet, matching the same discipline as issue #91's
-//! foundation:
-//! - No `schema::Event` variant. The issue's own text says this event type is
-//!   "shared with Windows 4624 and macOS login work" — `schema` has no
-//!   auth/session event at all today (checked), so designing one is a cross-platform
-//!   decision, not something to bake into a Linux-only PR unreviewed.
-//! - No [`schema::sensor::Sensor`] implementation — same reason: `run` would need to
-//!   push a [`schema::Event`] that doesn't exist yet.
-//! - No cursor persistence across restarts (the `crates/store` integration) or lab
-//!   validation of the sshd/su paths — needs the Hyper-V lab kernels.
+//! Deliberately **not** here yet:
+//! - No [`schema::sensor::Sensor`] implementation — like `sensor-linux-netlink`
+//!   (issue #92), this is a supplementary poll/tail source wired directly into
+//!   `agent::commands::linux::cmd_run` alongside the main sensor, not a
+//!   standalone `Sensor`.
+//! - No cursor persistence across agent restarts (the `crates/store` integration)
+//!   — not required by issue #93's `Done when`; a restart re-tailing from "now"
+//!   rather than resuming is an accepted gap for a follow-up, not this issue.
+//! - No unit-lifecycle mapping (`JournalEvent::UnitStarted`/`Stopped`/`Failed`) —
+//!   see [`auth`]'s module doc for why.
 
+mod auth;
 mod classify;
 mod record;
 mod tail;
 
+pub use auth::to_auth_event;
 pub use classify::{JournalEvent, classify};
 pub use record::{JournalRecord, parse_record};
 pub use tail::ClassifiedJournal;
