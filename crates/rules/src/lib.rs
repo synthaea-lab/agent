@@ -40,8 +40,13 @@ const O_RDWR: u32 = 0o2;
 pub(crate) const O_CREAT: u32 = 0o100;
 
 /// Write intent on `open(2)` flags: write access mode, or creation.
-/// Shared by the stateless rules (persistence) and the stateful ones (download history).
-pub(crate) fn has_write_intent(flags: u32) -> bool {
+/// Shared by the stateless rules (persistence) and the stateful ones (download history);
+/// also used by `agent`'s protected-resource monitoring (#71) to separate a foreign
+/// process merely reading an agent file from one attempting to modify it. Interprets
+/// Linux `open(2)` flag values specifically (see the `O_*` consts above) — only
+/// meaningful for `FileOpenEvent`s produced by a Linux sensor.
+#[must_use]
+pub fn has_write_intent(flags: u32) -> bool {
     let access_mode = flags & O_ACCMODE;
     access_mode == O_WRONLY || access_mode == O_RDWR || (flags & O_CREAT) != 0
 }

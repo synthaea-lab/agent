@@ -2,11 +2,25 @@
 //! programs through the kernel verifier without attaching them); run/capture
 //! drive `LinuxSensor` with the appropriate sink.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use schema::sensor::{EventSink as _, Sensor as _};
+use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
 
+use crate::protected::ProtectedResourceGuard;
+use crate::silence::{PulsingSink, SilenceHealthSource};
 use crate::sink::DetectionSink;
+
+/// Silence deadlines (#71) fed to `SilenceMonitor::register`. The eBPF sensor and
+/// the journal tail have no self-generated canary (see `silence::PulsingSink`'s
+/// doc), so their deadline is generous — long enough that an ordinary host's
+/// incidental activity (cron, the agent's own files, network chatter, journald's
+/// own baseline logging) almost always beats it, keeping the false-positive rate
+/// on an idle-but-healthy sensor low. The netlink poller ticks every
+/// [`NETLINK_POLL_INTERVAL`] regardless of host activity — a real canary — so its
+/// deadline can be tight: three missed polls is a genuine stall, not bad luck.
+const NO_CANARY_SILENCE_DEADLINE_NS: u64 = 120_000_000_000; // 120s
+const NETLINK_SILENCE_DEADLINE_NS: u64 = 3 * NETLINK_POLL_INTERVAL.as_secs() * 1_000_000_000;
 
 /// `RuleState` pre-filled with the processes already running at startup — without
 /// it, the parent-side exclusions and lineage rules don't apply to processes
@@ -123,13 +137,40 @@ pub(crate) fn cmd_run(alerts: &std::path::Path, events: &std::path::Path) -> any
         events.display()
     );
 
+    // Sensor-silence detection (#71): one heartbeat per sensor, pulsed as each
+    // processes events/polls, watched by a dedicated thread — see `silence`'s doc.
+    let ebpf_heartbeat = SensorHeartbeat::new("linux-ebpf");
+    let netlink_heartbeat = SensorHeartbeat::new("linux-netlink");
+    let journal_heartbeat = SensorHeartbeat::new("linux-journal");
+    let silence_monitor = Arc::new(Mutex::new(SilenceMonitor::new()));
+    {
+        let now_ns = crate::time::now_ns();
+        let mut mon = silence_monitor.lock().unwrap();
+        mon.register(
+            ebpf_heartbeat.clone(),
+            NO_CANARY_SILENCE_DEADLINE_NS,
+            now_ns,
+        );
+        mon.register(
+            netlink_heartbeat.clone(),
+            NETLINK_SILENCE_DEADLINE_NS,
+            now_ns,
+        );
+        mon.register(
+            journal_heartbeat.clone(),
+            NO_CANARY_SILENCE_DEADLINE_NS,
+            now_ns,
+        );
+    }
+    crate::silence::spawn_monitor(silence_monitor.clone(), sink.clone());
+
     // Spawn health beacon thread — emits periodic self-diagnostics to the control
-    // plane (issue #134). Uses no-op sources for now (sensors, spool) until those
-    // components expose the necessary APIs.
+    // plane (issue #134). Sensor health is now the real silence-monitor snapshot
+    // (#71) rather than a no-op; spool stays a no-op until that component exists.
     let health_config = crate::health::HealthCollectorConfig::default();
     let health = crate::health::HealthCollector::new(
         health_config,
-        Arc::new(crate::health::NoopSensorHealth),
+        Arc::new(SilenceHealthSource::new(silence_monitor)),
         Arc::new(crate::health::NoopSpoolStats),
         Arc::new(sink.enrich_queue().clone()) as Arc<dyn crate::health::DroppedCounter>,
         |beacon| {
@@ -154,11 +195,17 @@ pub(crate) fn cmd_run(alerts: &std::path::Path, events: &std::path::Path) -> any
         crate::heartbeat::WRITE_INTERVAL,
     );
 
-    spawn_netlink_poller(sink.clone());
-    spawn_journal_tail(sink.clone());
+    spawn_netlink_poller(sink.clone(), netlink_heartbeat);
+    spawn_journal_tail(sink.clone(), journal_heartbeat);
+
+    // Protected-resource monitoring (#71): only the eBPF sensor produces `FileOpen`
+    // events, so only its chain needs the guard — the netlink/journal sinks above
+    // never see one.
+    let protected = crate::protected::protected_paths(alerts, events);
+    let guarded = ProtectedResourceGuard::new(sink.clone(), protected, sink);
     let mut sensor = sensor_linux::LinuxSensor::new();
     sensor
-        .run(Box::new(sink))
+        .run(Box::new(PulsingSink::new(guarded, ebpf_heartbeat)))
         .map_err(|e| anyhow::anyhow!("sensor failed: {e}"))
     // Health beacon thread stops when the process exits (sensor.run() blocks until
     // Ctrl-C). For graceful shutdown, call health_stop.stop() before exiting.
@@ -179,7 +226,7 @@ const NETLINK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// Runs until the process exits (no `Sensor::stop`-style shutdown): `agent run`'s
 /// only exit path today is Ctrl-C ending the whole process, same as every other
 /// background worker here (`EnrichQueue`, `yara::ScanQueue`).
-fn spawn_netlink_poller(sink: Arc<DetectionSink>) {
+fn spawn_netlink_poller(sink: Arc<DetectionSink>, heartbeat: SensorHeartbeat) {
     std::thread::Builder::new()
         .name("netlink-poll".into())
         .spawn(move || {
@@ -190,12 +237,14 @@ fn spawn_netlink_poller(sink: Arc<DetectionSink>) {
                 forward_netlink_events(
                     sensor_linux_netlink::listen_port_events(ts),
                     &sink,
+                    &heartbeat,
                     &mut listen_warned,
                     "listen-port",
                 );
                 forward_netlink_events(
                     sensor_linux_netlink::conntrack_flow_events(ts),
                     &sink,
+                    &heartbeat,
                     &mut conntrack_warned,
                     "conntrack",
                 );
@@ -209,16 +258,21 @@ fn spawn_netlink_poller(sink: Arc<DetectionSink>) {
 /// distinct failure streak (`warned`) rather than every `NETLINK_POLL_INTERVAL`,
 /// since an unprivileged agent (conntrack's reachability isn't characterized
 /// unprivileged, see `sensor_linux_netlink`'s crate doc) would otherwise log the
-/// same `EPERM` forever.
+/// same `EPERM` forever. Pulses `heartbeat` on a successful poll regardless of
+/// event count (#71): the poll attempt succeeding is itself the netlink
+/// sensor's canary — silence here means the poll is failing or the thread is
+/// stuck, not merely that the host has nothing to report.
 fn forward_netlink_events(
     result: Result<Vec<schema::Event>, sensor_linux_netlink::NetlinkError>,
     sink: &DetectionSink,
+    heartbeat: &SensorHeartbeat,
     warned: &mut bool,
     source: &str,
 ) {
     match result {
         Ok(events) => {
             *warned = false;
+            heartbeat.pulse();
             for event in events {
                 sink.on_event(event);
             }
@@ -245,7 +299,7 @@ fn forward_netlink_events(
 /// `watchdog::service::linux`'s own doc on this) has no `journalctl` at all —
 /// logged once and skipped, not a reason to fail `agent run` entirely, same
 /// posture as [`seeded_rule_state`]'s netlink snapshot.
-fn spawn_journal_tail(sink: Arc<DetectionSink>) {
+fn spawn_journal_tail(sink: Arc<DetectionSink>, heartbeat: SensorHeartbeat) {
     std::thread::Builder::new()
         .name("journal-tail".into())
         .spawn(move || {
@@ -265,6 +319,11 @@ fn spawn_journal_tail(sink: Arc<DetectionSink>) {
                 stdout,
             ));
             for item in journal {
+                // Pulsed on every line the stream yields, matched or not (#71):
+                // proof journalctl is still delivering, same idle-host caveat as
+                // the eBPF sensor (see `silence::PulsingSink`'s doc) since journald
+                // itself has no forced canary tick.
+                heartbeat.pulse();
                 match item {
                     Ok((record, event)) => {
                         if let Some(auth) = sensor_linux_journal::to_auth_event(&record, &event) {

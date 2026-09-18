@@ -18,6 +18,7 @@ sigma = { path = "../crates/sigma" }
 enrich = { path = "../crates/enrich" }
 yara = { path = "../crates/yara" }
 sinks = { path = "../crates/sinks" }
+tamper = { path = "../crates/tamper" }
 
 anyhow = "1"
 serde = { workspace = true }

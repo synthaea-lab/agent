@@ -57,15 +57,6 @@ impl SpoolStatsSource for NoopSpoolStats {
     }
 }
 
-/// A no-op sensor health source for when sensors are not yet registered.
-pub struct NoopSensorHealth;
-
-impl SensorHealthSource for NoopSensorHealth {
-    fn sensor_health(&self) -> Vec<SensorHealth> {
-        Vec::new()
-    }
-}
-
 /// Configuration for the health collector.
 pub struct HealthCollectorConfig {
     /// Interval between beacon emissions.
@@ -291,7 +282,7 @@ mod tests {
 
     #[test]
     fn stop_interrupts_sleep() {
-        let sensors = Arc::new(NoopSensorHealth);
+        let sensors = Arc::new(MockSensors(Vec::new()));
         let spool = Arc::new(NoopSpoolStats);
         let enrich = Arc::new(MockDropped(0));
 

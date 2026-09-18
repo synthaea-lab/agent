@@ -143,7 +143,11 @@ impl DetectionSink {
         }
     }
 
-    fn emit(&self, technique: &str, message: &str) {
+    /// Writes one alert to the shared log and highlighted stderr. `pub(crate)`
+    /// rather than private: `silence::spawn_monitor` (#71) emits a sensor-silence
+    /// verdict through the exact same path as a rule/correlator/Sigma finding —
+    /// one alert shape, whatever detected it.
+    pub(crate) fn emit(&self, technique: &str, message: &str) {
         // Alerts go to stderr (stdout carries nothing in run mode; the raw stream
         // lives in events.jsonl) and are highlighted — an alert must not get lost in
         // terminal noise.
