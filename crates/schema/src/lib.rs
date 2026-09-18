@@ -9,8 +9,36 @@
 //! Every crate in the workspace depends on this one. Changes to public types ripple
 //! everywhere and need explicit justification in review — prefer additive changes
 //! (new fields with serde defaults, new [`Event`] variants) over reshaping what exists.
-//! Any change visible in serialization bumps [`SCHEMA_VERSION`] and adds a new
-//! `tests/fixtures/v<N>/` directory; existing fixture files are never edited.
+//!
+//! **Every serialization-visible change bumps [`SCHEMA_VERSION`]** and adds a full
+//! `tests/fixtures/v<N>/` snapshot (existing fixture files are never edited) — no
+//! exception for additive changes, even though they don't break a Rust reader on
+//! this crate's current types. This resolves issue #114 (closed): a change is
+//! "visible" in three ways, and all three bump the version the same way —
+//!
+//! 1. **New optional field** on an existing type (e.g. [`EventMeta::container`],
+//!    #169, v9 → v10) — non-breaking for a Rust reader (`#[serde(default)]`), but
+//!    a non-Rust consumer (the server, a SIEM export) that snapshots the field set
+//!    it deserializes still sees a change.
+//! 2. **New [`Event`] variant** (e.g. `Event::Auth`, #94, v12 → v13) — non-breaking
+//!    for a Rust reader too ([`Event`] is `#[non_exhaustive]`, forcing a wildcard
+//!    match arm), but it changes the closed set of `"type"` tag values a consumer
+//!    keying on that tag can see, the same concern as case 1.
+//! 3. **Removal, rename, or type change** — breaking outright, bumps for the
+//!    obvious reason.
+//!
+//! Bumping on 1 and 2 costs nothing (the version is metadata, not a compatibility
+//! gate — old fixtures keep deserializing under new types, see
+//! `tests/v1_compat.rs`) and buys every consumer an honest signal of "this shape
+//! didn't exist before v*N*", which not bumping would silently hide. See
+//! `docs/architecture/event-schema.md` for the full contract and worked examples.
+//!
+//! Not every change to this crate is a schema change: reusing bits within an
+//! *existing* field (e.g. [`FLAG_PERSISTENCE_ARTIFACT`]) adds no new shape, so it
+//! does not bump [`SCHEMA_VERSION`] — see that constant's doc comment. Nor is this
+//! the same contract as a sensor's own wire ABI (e.g. `sensor-linux-wire`'s
+//! `WIRE_VERSION`, bumped independently for #204): that governs the eBPF-to-
+//! userspace struct layout on one platform, never this crate's public JSON model.
 //!
 //! ## What this crate is not
 //!
