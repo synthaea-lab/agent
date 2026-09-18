@@ -50,6 +50,30 @@ fn is_ignored(comm: &str) -> bool {
         .any(|&ignore| name.eq_ignore_ascii_case(ignore))
 }
 
+/// Comms excluded from the BAYES alert specifically (issue #212, Alpine lab,
+/// 2026-09-18) — narrower than `IGNORED`: these still run through the
+/// co-occurrence rules normally (e.g. a wget-driven download+exec chain is
+/// still a legitimate `rules` detection target), only the Bayesian alert is
+/// suppressed. Guarded by the same masquerade check as `IGNORED` — a payload
+/// renamed to one of these names from an untrusted path keeps full scoring.
+///
+/// wget: a bare `wget -T 3 -O /dev/null http://1.1.1.1/` alone produced
+/// `log_odds`=5.33 (P=100%) — `time_exec_to_connect_ms` (quick connect after
+/// spawn) and `dest_is_external` fire on any CLI network tool, not just
+/// beaconing malware.
+/// chronyd: Alpine's stock NTP daemon — periodic external resync connects hit
+/// the same features on default, zero-user-action system activity
+/// (`log_odds` up to 2.90, P=95%; the process was never invoked by the
+/// tester).
+const BAYES_NAME_EXCLUSIONS: &[&str] = &["wget", "chronyd"];
+
+fn is_bayes_excluded(comm: &str) -> bool {
+    let name = comm.rsplit('\\').next().unwrap_or(comm);
+    BAYES_NAME_EXCLUSIONS
+        .iter()
+        .any(|&excluded| name.eq_ignore_ascii_case(excluded))
+}
+
 /// Main entry point. Receives events from the sensor, stores them in the bus,
 /// and evaluates the co-occurrence rules over the current window.
 pub struct CorrelationEngine {
@@ -119,12 +143,14 @@ impl CorrelationEngine {
             if ppid != 0 {
                 self.pid_entities.insert(pid, (ppid, comm.clone()));
             }
-            // Masquerade detection: an IGNORED-list name is suspicious when
-            // EITHER the image path is not in a trusted system location (rename
-            // in %TEMP%) OR the parent is not the expected one (e.g. svchost.exe
-            // spawned by cmd.exe instead of services.exe). Either failure alone
-            // is enough — both conditions must hold for the exclusion to apply.
-            if is_ignored(&comm)
+            // Masquerade detection: an IGNORED-list or BAYES_NAME_EXCLUSIONS name is
+            // suspicious when EITHER the image path is not in a trusted system
+            // location (rename in %TEMP%/tmp) OR the parent is not the expected one
+            // (e.g. svchost.exe spawned by cmd.exe instead of services.exe). Either
+            // failure alone is enough — both conditions must hold for the exclusion
+            // to apply. Shared between both lists: a name only in one of them is
+            // simply never looked up by the other's gate below.
+            if (is_ignored(&comm) || is_bayes_excluded(&comm))
                 && (!policy::name_exclusion_applies(Some(exec.image_path.as_str()))
                     || !policy::parent_exclusion_applies(&comm, exec.parent_comm.as_deref()))
             {
@@ -168,7 +194,9 @@ impl CorrelationEngine {
             .max()
             .unwrap_or(0);
         let mut alerts = self.evaluate(pid, now_ns);
-        alerts.extend(self.bayes_alert(pid, &comm, &entity_key));
+        if !is_bayes_excluded(&comm) || self.masquerading.peek(&pid).is_some() {
+            alerts.extend(self.bayes_alert(pid, &comm, &entity_key));
+        }
         alerts
     }
 

@@ -206,3 +206,65 @@ fn bayes_survives_respawn() {
         log_odds_after_pid401
     );
 }
+
+// ── BAYES_NAME_EXCLUSIONS (issue #212) ──────────────────────────────────────
+
+#[test]
+fn wget_from_a_trusted_path_never_alerts_bayes() {
+    // Issue #212: a bare `wget -T 3 -O /dev/null http://1.1.1.1/` crossed
+    // BAYES_THRESHOLD purely from "quick connect after spawn" + "external
+    // destination" — features that don't distinguish beaconing malware from
+    // any CLI network tool.
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(exec_with_meta(
+        meta_full(500, 50, "wget", 0),
+        "/usr/bin/wget",
+    ));
+    for i in 0..20u64 {
+        let connect = connect_to(meta_full(500, 50, "wget", (i + 1) * 100_000_000), [1, 1, 1, 1], 80);
+        let alerts = engine.on_event(connect);
+        assert!(
+            !alerts.iter().any(|a| a.technique == "BAYES"),
+            "a trusted wget must never trigger the BAYES false positive"
+        );
+    }
+}
+
+#[test]
+fn chronyd_without_an_observed_exec_never_alerts_bayes() {
+    // Issue #212: chronyd is already running when the agent starts (no
+    // ExecEvent is ever seen for it — see `prime_proc_lineage` in
+    // sensor-linux) — its periodic NTP resync connects alone crossed
+    // BAYES_THRESHOLD with zero user action.
+    let mut engine = CorrelationEngine::new();
+    for i in 0..20u64 {
+        let connect = connect_to(
+            meta_full(600, 0, "chronyd", i * 1_000_000_000),
+            [162, 159, 200, 1],
+            123,
+        );
+        let alerts = engine.on_event(connect);
+        assert!(
+            !alerts.iter().any(|a| a.technique == "BAYES"),
+            "chronyd's periodic resync must never alert BAYES"
+        );
+    }
+}
+
+#[test]
+fn masqueraded_wget_from_an_untrusted_path_still_alerts_bayes() {
+    // A payload renamed "wget" in /tmp must not inherit the exclusion
+    // (name-only exclusions are a trivial bypass) — same masquerade
+    // regression as `masqueraded_ignored_name_is_still_correlated` in
+    // tests/rules.rs.
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(exec_with_meta(meta_full(700, 50, "wget", 0), "/tmp/wget"));
+    for i in 0..20u64 {
+        let connect = connect_to(meta_full(700, 50, "wget", (i + 1) * 100_000_000), [1, 1, 1, 1], 80);
+        let alerts = engine.on_event(connect);
+        if alerts.iter().any(|a| a.technique == "BAYES") {
+            return; // test OK
+        }
+    }
+    panic!("a payload masquerading as wget from /tmp must still be able to alert BAYES");
+}
