@@ -182,6 +182,7 @@ fn try_sched_process_exec(ctx: TracePointContext) -> Result<u32, u32> {
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = timestamp_ns;
         (*e).meta.ppid = 0;
+        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
         let mut i = 0usize;
         while i < TASK_COMM_LEN {
             (*e).meta.comm[i] = comm[i];
@@ -345,6 +346,7 @@ fn emit_file_open_event(
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
         let mut i = 0usize;
         while i < TASK_COMM_LEN {
             (*e).meta.comm[i] = comm[i];
@@ -466,6 +468,7 @@ fn try_sys_enter_connect(ctx: TracePointContext) -> Result<u32, u32> {
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
         let mut i = 0usize;
         while i < TASK_COMM_LEN {
             (*e).meta.comm[i] = comm[i];

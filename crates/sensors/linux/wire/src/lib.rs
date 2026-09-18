@@ -25,7 +25,11 @@
 /// - v3: `ExecEvent` drops `cmdline`/`cmdline_len` — argv is read from
 ///   `/proc/<pid>/cmdline` by the userspace loader (issue #152), so the probe no
 ///   longer touches a `task_struct`/`mm_struct` frozen offset at all.
-pub const WIRE_VERSION: u32 = 3;
+/// - v4: `EventMeta` gains `cgroup_id` (`bpf_get_current_cgroup_id()`, captured at
+///   probe time, issue #204) — closes the drain-time `/proc` exit race for
+///   container attribution: the userspace loader resolves it against cgroupfs
+///   instead of `/proc/<pid>/cgroup`, which no longer needs the pid to still exist.
+pub const WIRE_VERSION: u32 = 4;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
@@ -47,6 +51,10 @@ pub struct EventMeta {
     /// loader adds the boot-to-epoch offset during normalization.
     pub timestamp_ns: u64,
     pub comm: [u8; TASK_COMM_LEN],
+    /// `bpf_get_current_cgroup_id()`, captured at probe time, not resolved lazily
+    /// against `/proc` at drain time (issue #204) — the userspace loader maps this
+    /// to a container id by inode against cgroupfs. `0` if the helper failed.
+    pub cgroup_id: u64,
 }
 
 /// Process execution (`sched:sched_process_exec`, success only).

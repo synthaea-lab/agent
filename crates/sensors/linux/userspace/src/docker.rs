@@ -1,7 +1,7 @@
 //! Minimal Docker Engine API client over the daemon's Unix socket, just enough to
 //! resolve a container id to its image/name (issue #80: the "needs a cached lookup
-//! against the Docker/containerd socket" half `read_container_id`'s doc comment
-//! deferred). No HTTP client dependency: the request/response shape needed here
+//! against the Docker/containerd socket" half `container_id_from_cgroupfs`'s doc
+//! comment deferred). No HTTP client dependency: the request/response shape needed here
 //! (one GET, one small JSON body, `Connection: close`) is simple enough that
 //! hand-rolling it is less risk than a new crate for a single call site.
 

@@ -131,12 +131,14 @@ pub fn evaluate_exec(event: &ExecEvent) -> Vec<Alert> {
 /// debuggers); a bare-metal process doing this is unremarkable, a containerized one
 /// almost never has a legitimate reason to.
 ///
-/// Coverage gap, confirmed against a real Docker daemon: this needs `event.meta
-/// .container` to be populated, and the sensor's attribution loses a race for a
-/// process whose entire lifetime is one `open()` then exit (a bare `cat <path>`) — see
-/// `read_container_id`'s doc comment in `sensor-linux`. A slower/more deliberate escape
-/// (a shell that stays alive past the read) is attributed correctly and this rule fires;
-/// a one-shot command is not detected. Not a bug in this rule — a sensor-side tradeoff.
+/// Needs `event.meta.container` to be populated. Originally had a coverage gap here,
+/// confirmed against a real Docker daemon: the sensor's attribution lost a race for a
+/// process whose entire lifetime was one `open()` then exit (a bare `cat <path>`),
+/// because attribution was read from `/proc/<pid>/cgroup` at drain time, after the pid
+/// could already be gone. Closed by issue #204 — attribution is now keyed off a cgroup
+/// id captured kernel-side at syscall time (see `container_id_from_cgroupfs`'s doc
+/// comment in `sensor-linux`), which does not depend on the pid still existing by
+/// drain time.
 #[must_use]
 pub fn check_proc_root_escape(event: &FileOpenEvent) -> Option<Alert> {
     let container = event.meta.container.as_ref()?;

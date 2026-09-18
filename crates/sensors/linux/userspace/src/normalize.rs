@@ -9,7 +9,7 @@ use schema::{ConnectEvent, ContainerContext, Event, EventMeta, ExecEvent, FileOp
 use sensor_linux_wire as wire;
 
 /// Tripwire: bumping the wire ABI must come here to revisit the mappings below.
-const _: () = assert!(wire::WIRE_VERSION == 3);
+const _: () = assert!(wire::WIRE_VERSION == 4);
 
 /// Decodes a fixed comm buffer: NUL-terminated, kernel-truncated to 15 bytes — a
 /// sensor property (reported by conformance), not a schema limit.
@@ -25,9 +25,10 @@ fn comm_opt(comm: &[u8; wire::TASK_COMM_LEN]) -> Option<String> {
     (end != 0).then(|| String::from_utf8_lossy(&comm[..end]).into_owned())
 }
 
-/// `container` is resolved by the caller: the id from `/proc/<pid>/cgroup` at drain
-/// time, `image`/`name` from a cached Docker/containerd socket lookup keyed on that
-/// id (issue #80 — both halves of the attribution this crate's doc comment on
+/// `container` is resolved by the caller: the id from `meta.cgroup_id` (captured
+/// kernel-side, resolved against cgroupfs — issue #204) at drain time, `image`/
+/// `name` from a cached Docker/containerd socket lookup keyed on that id (issue
+/// #80 — both halves of the attribution this crate's doc comment on
 /// `ContainerContext` originally deferred).
 fn meta(
     meta: &wire::EventMeta,
@@ -129,6 +130,7 @@ mod tests {
             gid: 1000,
             timestamp_ns: 1_000,
             comm: c,
+            cgroup_id: 0,
         }
     }
 
