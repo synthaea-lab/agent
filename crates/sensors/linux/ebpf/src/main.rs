@@ -522,7 +522,29 @@ fn try_file_open(ctx: LsmContext) -> Result<i32, i32> {
     // never denies on its own (no verdict source to enforce yet).
     let retval: i32 = ctx.arg(1);
     if retval != 0 {
-        return Ok(retval);
+        // Forward the veto, not the exact code. `retval` reaches the verifier as an
+        // unconstrained scalar (aya's `arg()` extraction loses the sign tracking a
+        // raw i32 read would have), so returning it — or any value arithmetically
+        // derived from it (`i32::clamp`, an if/else chain assigning to a binding —
+        // both tried, both compile to a branchless sign-extend-and-mask select the
+        // verifier's range tracking cannot see through) — fails the verifier's LSM
+        // exit-state check, which requires every path provably within [-4095, 0]
+        // (confirmed on real hardware, kernel 7.2.4: "R0 has smin=1 smax=4294967295
+        // should have been in [-4095, 0]", still unconstrained even after an
+        // explicit bounds comparison). The actual requirement here is only "never
+        // override an earlier LSM's deny with our own allow" — the exact errno
+        // doesn't matter to us, so return a fixed, compile-time-constant deny
+        // instead of the arbitrary value.
+        //
+        // Review note (Nikolas, PR #239): this is a lossy, generic deny signal,
+        // not a transparent forward — an operator debugging "why was this denied"
+        // sees `EPERM` here regardless of whether the earlier LSM actually
+        // returned `EACCES`, `EPIPE`, or anything else. Acceptable for this
+        // observation-only hook (no policy enforcement reads this value today),
+        // but anyone wiring real inline blocking on top of this hook later
+        // (#131/#133) should not assume `attach_file_open`'s return value is the
+        // original LSM's own errno.
+        return Ok(-1);
     }
 
     if let Some(count) = LSM_FILE_OPEN_HITS.get_ptr_mut(0) {

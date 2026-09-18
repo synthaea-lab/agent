@@ -35,3 +35,9 @@ sensor-linux = { path = "../crates/sensors/linux/userspace" }
 sensor-linux-netlink = { path = "../crates/sensors/linux/netlink" }
 sensor-linux-journal = { path = "../crates/sensors/linux/journal" }
 libc = "0.2"
+
+# sensor-linux-lsm is not wired into `cmd_run` yet (issue #91 — inline blocking
+# needs the verdict model from #131/#133 first); only the real-kernel regression
+# test below exercises it.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+sensor-linux-lsm = { path = "../crates/sensors/linux/lsm" }
