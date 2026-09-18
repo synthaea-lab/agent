@@ -4,7 +4,7 @@
 //! watchdog restarts the agent. Alpine and other non-glibc/non-systemd distros run
 //! `OpenRC`, not systemd (issue #213) — detected at install time, not assumed.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
 
@@ -91,6 +91,21 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
 }
 
 fn install_systemd(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Result<()> {
+    // Check if running from package installation (issue #36)
+    // Package-managed units are in /usr/lib/systemd/system/, manual installs in /etc/systemd/system/
+    let packaged_unit = Path::new("/usr/lib/systemd/system/synthaea-agent.service");
+
+    if packaged_unit.exists() {
+        // Package already installed the unit - just enable it
+        run("systemctl", &["daemon-reload"])?;
+        run("systemctl", &["enable", "--now", "synthaea-agent.service"])?;
+        println!("[watchdog] Using package-installed systemd unit.");
+        println!("  Status: systemctl status synthaea-agent");
+        println!("  Logs:   journalctl -u synthaea-agent -f");
+        return Ok(());
+    }
+
+    // Fallback: runtime generation for development/manual installs
     let paths = resolve_paths(agent_bin, alerts)?;
 
     let unit = format!(
@@ -112,7 +127,7 @@ fn install_systemd(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Resul
     run("systemctl", &["daemon-reload"])?;
     run("systemctl", &["enable", "--now", "synthaea-agent.service"])?;
 
-    println!("[watchdog] systemd service installed and started.");
+    println!("[watchdog] systemd service installed and started (development mode).");
     println!("  Alerts: {}", paths.alerts_abs.display());
     println!("  Check: watchdog status");
     println!(

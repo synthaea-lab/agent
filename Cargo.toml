@@ -117,3 +117,17 @@ tracing = "0.1"
 # ONNX Runtime for on-device inference (ADR-0002). Pinned RC — ort 2.0 is the first
 # line to support the ai.onnx.ml tree ops our models use; used only by `crates/ml`.
 ort = "=2.0.0-rc.13"
+
+[workspace.metadata.deb]
+# Shared .deb packaging configuration (issue #36)
+maintainer = "Synthaea Security <security@synthaea.io>"
+copyright = "2026, Synthaea Security. Licensed under Apache-2.0"
+license-file = ["LICENSE", "4"]
+extended-description = """\
+Synthaea is a multi-platform Endpoint Detection & Response (EDR) system \
+providing real-time behavioral monitoring, threat detection, and automated \
+response capabilities."""
+section = "admin"
+priority = "optional"
+# Note: We target Debian Trixie (13) and Ubuntu 26.04+
+depends = "$auto, systemd, adduser"

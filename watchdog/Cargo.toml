@@ -21,3 +21,28 @@ signal-hook = "0.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { version = "0.2", default-features = false }
+
+[package.metadata.deb]
+name = "synthaea-agent"
+maintainer-scripts = "../packaging/linux/debian/maintainer-scripts"
+
+# Assets: binaries, configs, systemd units (paths relative to watchdog/ directory)
+assets = [
+    # Bootstrap binaries
+    ["../target/release/watchdog", "var/lib/synthaea/bootstrap/", "755"],
+    ["../target/release/agent", "var/lib/synthaea/bootstrap/", "755"],
+    ["../target/release/cli", "var/lib/synthaea/bootstrap/", "755"],
+
+    # systemd integration
+    ["../packaging/linux/systemd/synthaea-agent.service", "usr/lib/systemd/system/", "644"],
+    ["../packaging/linux/systemd/synthaea.sysusers", "usr/lib/sysusers.d/synthaea.conf", "644"],
+    ["../packaging/linux/systemd/synthaea.tmpfiles", "usr/lib/tmpfiles.d/synthaea.conf", "644"],
+
+    # Config template
+    ["../packaging/linux/debian/agent.conf.template", "etc/synthaea/agent.conf", "644"],
+]
+
+[package.metadata.deb.systemd-units]
+unit-name = "synthaea-agent"
+enable = true
+start = true

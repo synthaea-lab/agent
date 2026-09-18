@@ -1,0 +1,2 @@
+#Type Name     ID      GECOS                    Home directory         Shell
+u     synthaea -       "Synthaea EDR Agent"     /var/lib/synthaea      /usr/sbin/nologin

@@ -1,0 +1,4 @@
+# Type Path                Mode User     Group    Age Argument
+d      /run/synthaea       0755 synthaea synthaea -   -
+d      /var/log/synthaea   0750 synthaea synthaea -   -
+d      /var/lib/synthaea   0750 synthaea synthaea -   -
