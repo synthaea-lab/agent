@@ -9,13 +9,16 @@
 //! and the output sinks; `heartbeat` the progress-backed liveness signal the
 //! watchdog polls (#102); `silence` per-sensor silence detection via
 //! `tamper::heartbeat`, wired into the health beacon and a real local alert (#71);
-//! `protected` watches the agent's own on-disk footprint for a foreign writer (#71).
+//! `protected` watches the agent's own on-disk footprint for a foreign writer (#71);
+//! `kill_loudness` attributes who sent a catchable termination signal before the
+//! agent actually dies (#71).
 
 mod commands;
 mod enrich_queue;
 mod health;
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 mod heartbeat;
+mod kill_loudness;
 mod protected;
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 mod sink;

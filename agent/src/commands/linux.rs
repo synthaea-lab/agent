@@ -129,6 +129,12 @@ fn has_bpf_capabilities() -> bool {
 /// blanket `EventSink for Arc<T>`) since `LinuxSensor::run` needs to own its sink
 /// for `Sensor`'s lifetime but the poller thread outlives no particular caller.
 pub(crate) fn cmd_run(alerts: &std::path::Path, events: &std::path::Path) -> anyhow::Result<()> {
+    // Kill-loudness (#71): must run before any other thread exists — the signal mask
+    // set here is inherited by every thread spawned below, including `DetectionSink`'s
+    // own worker threads.
+    crate::kill_loudness::block_termination_signals();
+    crate::kill_loudness::spawn_watcher(alerts.to_path_buf());
+
     let sink = Arc::new(DetectionSink::new(seeded_rule_state(), alerts, events)?);
     eprintln!("Synthaea agent — detection active (Ctrl-C to stop)");
     eprintln!(
