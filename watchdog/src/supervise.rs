@@ -237,7 +237,46 @@ fn spawn_agent(agent: &Path, alerts: &Path) -> std::io::Result<Child> {
             cmd.stdout(std::process::Stdio::from(f2));
         }
     }
+    #[cfg(target_os = "linux")]
+    die_with_parent(&mut cmd);
     cmd.spawn()
+}
+
+/// Makes the agent die on its own the instant the watchdog does, even a SIGKILL
+/// the watchdog's own handlers never get to react to (issue #216).
+///
+/// Without this, a killed watchdog leaves the agent reparented to PID 1 —
+/// unsupervised but still running — because the OS does not kill children when a
+/// parent dies. systemd's `KillMode=control-group` papers over this by sweeping
+/// the unit's whole cgroup on every restart; `OpenRC` does not do this by default
+/// (`rc_cgroup_cleanup="NO"`), so nothing else catches it there.
+#[cfg(target_os = "linux")]
+fn die_with_parent(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    let watchdog_pid = std::process::id() as libc::pid_t;
+
+    // SAFETY: `pre_exec` runs in the forked child, after `fork` and before
+    // `exec`, with only this closure's stack in scope — no other threads, no
+    // heap state shared with the parent to race on. `prctl`/`getppid` are plain
+    // syscalls; passing a fixed signal constant and reading our own new pid
+    // has no preconditions beyond a valid libc, guaranteed by this cfg.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Close the fork/prctl race: if the watchdog died between fork and
+            // this call, we've already been reparented (to the nearest
+            // subreaper, usually PID 1) and PDEATHSIG registered above will
+            // never fire for the watchdog we actually meant. Bail out instead
+            // of exec-ing into an unsupervised agent.
+            if libc::getppid() != watchdog_pid {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
 }
 
 /// Watches one child until it exits or is killed for a stalled heartbeat (→
@@ -476,5 +515,98 @@ mod tests {
         // baseline read on first check -> not yet a miss (first real reading).
         assert!(!m.tick());
         std::fs::remove_file(&path).ok();
+    }
+}
+
+/// Regression test for issue #216: a SIGKILL'd watchdog must not leave its agent
+/// running unsupervised.
+///
+/// Re-execs this test binary as a stand-in "watchdog" (`FAKE_WATCHDOG_ENV` set)
+/// that spawns a grandchild through the same [`die_with_parent`] path
+/// [`spawn_agent`] uses, prints that grandchild's pid, then idles. The real test
+/// process SIGKILLs the stand-in — the exact failure mode from the issue, which
+/// bypasses any signal handler the stand-in might otherwise have run — and
+/// asserts the grandchild disappears on its own shortly after.
+#[cfg(all(test, target_os = "linux"))]
+mod pdeathsig_tests {
+    use std::io::BufRead as _;
+    use std::time::{Duration, Instant};
+
+    const FAKE_WATCHDOG_ENV: &str = "SYNTHAEA_TEST_FAKE_WATCHDOG";
+
+    #[test]
+    fn agent_dies_when_watchdog_is_sigkilled() {
+        if std::env::var_os(FAKE_WATCHDOG_ENV).is_some() {
+            run_as_fake_watchdog();
+        }
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut fake_watchdog = std::process::Command::new(exe)
+            .arg("supervise::pdeathsig_tests::agent_dies_when_watchdog_is_sigkilled")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(FAKE_WATCHDOG_ENV, "1")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn fake watchdog");
+
+        // The test harness itself writes preamble lines ("running 1 test", a
+        // blank line, ...) to stdout before our test body runs — skip past
+        // those to find the one line we actually care about.
+        let stdout = fake_watchdog.stdout.take().expect("piped stdout");
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut grandchild_pid = None;
+        for _ in 0..20 {
+            let mut line = String::new();
+            if reader.read_line(&mut line).expect("read line") == 0 {
+                break; // EOF
+            }
+            if let Some(pid_str) = line.trim().strip_prefix("GRANDCHILD_PID=") {
+                grandchild_pid = pid_str.parse::<libc::pid_t>().ok();
+                break;
+            }
+        }
+        let grandchild_pid =
+            grandchild_pid.expect("fake watchdog never printed a GRANDCHILD_PID= line");
+
+        // Give the grandchild a moment to actually spawn and register PDEATHSIG
+        // before we pull the rug out from under its parent.
+        std::thread::sleep(Duration::from_millis(300));
+
+        // SAFETY: `kill` with a validated pid and a fixed signal constant has no
+        // preconditions beyond a valid libc.
+        unsafe {
+            libc::kill(fake_watchdog.id() as libc::pid_t, libc::SIGKILL);
+        }
+        let _ = fake_watchdog.wait();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // SAFETY: signal 0 only probes liveness, no signal is actually sent.
+            let alive = unsafe { libc::kill(grandchild_pid, 0) } == 0;
+            if !alive {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "grandchild pid {grandchild_pid} survived its watchdog's SIGKILL \
+                 — the issue #216 orphan bug has regressed"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// The stand-in "watchdog" role: spawn a grandchild the same way
+    /// [`super::spawn_agent`] does, report its pid, then idle until killed.
+    fn run_as_fake_watchdog() -> ! {
+        let mut grandchild_cmd = std::process::Command::new("sleep");
+        grandchild_cmd.arg("30");
+        super::die_with_parent(&mut grandchild_cmd);
+        let mut grandchild = grandchild_cmd.spawn().expect("spawn grandchild");
+        println!("GRANDCHILD_PID={}", grandchild.id());
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+            let _ = grandchild.try_wait();
+        }
     }
 }

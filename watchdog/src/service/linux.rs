@@ -151,7 +151,7 @@ fn status_systemd() -> anyhow::Result<()> {
 /// applied to every `supervisor=supervise-daemon` service that doesn't override
 /// them. `/etc/rc.conf` documents `respawn_max=0` as "unlimited" — that's the
 /// `Restart=always` equivalent we want, so it's set explicitly rather than relying
-/// on OpenRC's own default.
+/// on `OpenRC`'s own default.
 fn install_openrc(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Result<()> {
     let paths = resolve_paths(agent_bin, alerts)?;
 
