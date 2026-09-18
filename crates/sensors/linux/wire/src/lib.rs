@@ -29,10 +29,19 @@
 ///   probe time, issue #204) — closes the drain-time `/proc` exit race for
 ///   container attribution: the userspace loader resolves it against cgroupfs
 ///   instead of `/proc/<pid>/cgroup`, which no longer needs the pid to still exist.
-pub const WIRE_VERSION: u32 = 4;
+/// - v5: `TlsCaptureEvent` and `ReadlineInputEvent` added for uprobes (issue #90).
+///   TLS capture budgeted at 256 bytes (first N bytes of plaintext), readline at
+///   512 bytes (full interactive command line).
+pub const WIRE_VERSION: u32 = 5;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
+/// Budget for TLS plaintext capture (first N bytes). Chosen to fit comfortably
+/// in a ring-buffer event with metadata while staying under 512 bytes total.
+pub const MAX_TLS_CAPTURE: usize = 256;
+/// Budget for readline input capture (full command line). Interactive shell
+/// commands rarely exceed this length; longer inputs are truncated at capture time.
+pub const MAX_READLINE_INPUT: usize = 512;
 
 /// Metadata common to every wire event: identity of the emitting process.
 /// `uid`/`gid` come from `bpf_get_current_uid_gid()` (low/high 32 bits).
@@ -108,4 +117,37 @@ pub struct ConnectEvent {
     pub daddr_v6: [u8; 16],
     pub dport: u16,
     pub is_ipv6: bool,
+}
+
+/// TLS plaintext capture (uprobes on `SSL_read`/`SSL_write`, issue #90).
+/// Captures the first `MAX_TLS_CAPTURE` bytes of plaintext before encryption
+/// (`SSL_write`) or after decryption (`SSL_read`) for C2 beacon detection.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TlsCaptureEvent {
+    pub meta: EventMeta,
+    /// 0 = read (post-decryption), 1 = write (pre-encryption).
+    pub direction: u8,
+    /// 0 = OpenSSL, 1 = `BoringSSL`, 2 = `GnuTLS`. Identifies which library was probed.
+    pub lib_type: u8,
+    /// Actual bytes captured (may be less than `MAX_TLS_CAPTURE` if the buffer
+    /// passed to `SSL_read`/`SSL_write` was shorter).
+    pub bytes_len: u32,
+    /// First N bytes of the plaintext buffer. Budget: 256 bytes.
+    pub data: [u8; MAX_TLS_CAPTURE],
+}
+
+/// Readline input capture (uprobes on bash/zsh readline, issue #90).
+/// Captures interactive shell commands at typing time, including shell builtins
+/// that never trigger execve (cd, export, alias, etc.).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ReadlineInputEvent {
+    pub meta: EventMeta,
+    /// 0 = bash, 1 = zsh. Identifies which shell was probed.
+    pub shell_type: u8,
+    /// Actual input length (may be less than `MAX_READLINE_INPUT` if truncated).
+    pub input_len: u32,
+    /// Full command line input. Budget: 512 bytes.
+    pub input: [u8; MAX_READLINE_INPUT],
 }

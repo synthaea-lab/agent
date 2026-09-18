@@ -10,3 +10,24 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+schema = { path = "../../../schema" }
+log = { version = "0.4", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sensor-linux-wire = { path = "../wire" }
+aya = { version = "0.14", default-features = false }
+aya-log = { version = "0.3", default-features = false }
+goblin = { version = "0.9", default-features = false, features = ["elf64", "elf32", "endian_fd", "std"] }
+thiserror = "2.0"
+tokio = { version = "1", default-features = false, features = ["sync", "signal", "macros", "rt", "net"] }
+libc = "0.2"
+regex = { version = "1.11", default-features = false, features = ["std"] }
+
+[build-dependencies]
+anyhow = "1.0"
+aya-build = "0.2"
+which = { version = "8.0.6", default-features = false }
+
+[[example]]
+name = "symbol_resolution_spike"
+path = "examples/symbol_resolution_spike.rs"
