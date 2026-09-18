@@ -20,11 +20,13 @@
 //! Windows SCM control handler provides.
 //!
 //! Module map: `paths` (agent/binary/log resolution), `supervise` (the respawn
-//! loop), `service` (per-platform install/uninstall: SCM, systemd, launchd).
+//! loop), `service` (per-platform install/uninstall: SCM, systemd, launchd),
+//! `tamper` (install-surface hardening and integrity checks, issue #103).
 
 mod paths;
 mod service;
 mod supervise;
+mod tamper;
 
 use std::path::PathBuf;
 

@@ -22,6 +22,14 @@
 //! processes an event end to end) and, after `miss_limit` consecutive checks
 //! see no advance, kills the child — feeding the same [`Backoff`] a crash
 //! would, per #102's "same path as a crash, feeding the backoff (#101)".
+//!
+//! Tamper resistance (#103): both kill-resistance layers assume an attacker who
+//! kills a process. `watchdog_loop` also pins the agent binary's hash at startup
+//! and re-checks it before every (re)spawn — a binary swapped on disk after
+//! supervision began is refused, not launched. On Linux, it does the same for the
+//! installed service definition (`crate::service::linux`), reporting content
+//! drift or the service having been disabled. See `crate::tamper` for the
+//! primitives and the platforms not covered yet.
 
 use std::{
     path::{Path, PathBuf},
@@ -178,7 +186,56 @@ pub(crate) fn watchdog_loop(
 ) {
     let mut backoff = Backoff::new(restart_delay);
     let heartbeat_path = heartbeat_path_for(alerts);
+
+    // #103: pin the agent binary's hash once, at watchdog startup — every later
+    // spawn is checked against this baseline instead of trusting the path blindly.
+    // `None` (pin failed, e.g. the binary momentarily missing) disables the check
+    // for this run rather than refusing to supervise at all.
+    let binary_pin = match crate::tamper::BinaryPin::pin(agent) {
+        Ok(pin) => Some(pin),
+        Err(e) => {
+            eprintln!(
+                "[watchdog] could not pin agent binary integrity ({e}) — \
+                 integrity checking disabled for this run"
+            );
+            None
+        }
+    };
+
+    // #103: same idea for the installed service definition (systemd unit /
+    // OpenRC script) — `None` when there is nothing installed to watch (e.g.
+    // `run` invoked directly during development, without a prior `install`).
+    #[cfg(target_os = "linux")]
+    let definition_baseline = crate::service::snapshot_definition().ok();
+
     while !stop_flag.load(Ordering::SeqCst) {
+        #[cfg(target_os = "linux")]
+        if let Some(baseline) = &definition_baseline
+            && let Ok(current) = crate::service::snapshot_definition()
+        {
+            for line in crate::service::drift_report(baseline, &current) {
+                report_self_protection_event(alerts, &line);
+            }
+        }
+
+        if let Some(pin) = &binary_pin
+            && !pin.verify()
+        {
+            report_self_protection_event(
+                alerts,
+                &format!(
+                    "agent binary at {} no longer matches its pinned hash — \
+                     refusing to launch it",
+                    agent.display()
+                ),
+            );
+            let (delay, _) = backoff.record_exit(Duration::ZERO);
+            if !sleep_unless_stopped(stop_flag, delay) {
+                return;
+            }
+            continue;
+        }
+
         eprintln!("[watchdog] starting the agent...");
         let spawn_time = Instant::now();
         let mut heartbeat = HeartbeatMonitor::new(
@@ -329,6 +386,29 @@ fn watch_child(
                 return true;
             }
         }
+    }
+}
+
+/// Appends a self-protection finding to the alerts file as a single JSON-Lines
+/// entry, same shape (`timestamp_ns`/`technique`/`message`) as a rule/correlator
+/// alert (issue #103: "alerts on mismatch... instead of silently launching a
+/// swapped binary" / service-definition drift "reports it rather than accepting
+/// it silently"). No `schema`/`sinks` dependency on purpose — the watchdog has
+/// nothing else in common with the agent's detection pipeline, and this is one
+/// fixed-shape line, not a general-purpose sink.
+fn report_self_protection_event(alerts: &Path, message: &str) {
+    eprintln!("[watchdog] SELF-PROTECTION: {message}");
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let escaped = message.replace('\\', "\\\\").replace('"', "\\\"");
+    let line = format!(
+        "{{\"timestamp_ns\":{now_ns},\"technique\":\"SELF-PROTECTION\",\"message\":\"{escaped}\"}}\n"
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(alerts) {
+        use std::io::Write as _;
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
@@ -514,6 +594,23 @@ mod tests {
         // The 10th tick performs the check: same value as the (nonexistent)
         // baseline read on first check -> not yet a miss (first real reading).
         assert!(!m.tick());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn self_protection_event_is_a_well_shaped_json_line() {
+        let path = std::env::temp_dir().join(format!(
+            "self-protection-event-test-{}.ndjson",
+            std::process::id()
+        ));
+        std::fs::remove_file(&path).ok();
+        report_self_protection_event(&path, r#"binary at "C:\agent.exe" was swapped"#);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.ends_with('\n'), "expected a trailing newline: {contents:?}");
+        assert!(contents.contains(r#""technique":"SELF-PROTECTION""#));
+        // The message's own quotes and backslash must come back escaped, not
+        // break the JSON shape.
+        assert!(contents.contains(r#"binary at \"C:\\agent.exe\" was swapped"#));
         std::fs::remove_file(&path).ok();
     }
 }

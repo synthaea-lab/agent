@@ -14,6 +14,14 @@ use crate::paths::{child_log_path, resolve_agent_bin};
 const SYSTEMD_UNIT: &str = "/etc/systemd/system/synthaea-agent.service";
 const OPENRC_SCRIPT: &str = "/etc/init.d/synthaea-agent";
 
+/// Symlink `systemctl enable` creates for our unit's `WantedBy=multi-user.target`
+/// (see `install_systemd`) — its disappearance means the service was disabled.
+const SYSTEMD_ENABLE_LINK: &str =
+    "/etc/systemd/system/multi-user.target.wants/synthaea-agent.service";
+/// Symlink `rc-update add synthaea-agent default` creates — its disappearance
+/// means `rc-update del`/equivalent ran.
+const OPENRC_ENABLE_LINK: &str = "/etc/runlevels/default/synthaea-agent";
+
 enum InitSystem {
     Systemd,
     OpenRc,
@@ -55,6 +63,19 @@ fn resolve_paths(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Result<
         .canonicalize()
         .context("canonicalize watchdog")?;
 
+    // #103: refuse to install pointing at a binary an unprivileged user could
+    // overwrite in place — the integrity check `supervise::watchdog_loop` does
+    // at every respawn is worthless if the file it re-hashes lives in a
+    // directory anyone can drop a replacement into.
+    for bin in [&agent_abs, &watchdog_abs] {
+        if let Some(dir) = bin.parent() {
+            crate::tamper::refuse_world_writable_dir(dir)
+                .with_context(|| format!("checking install directory for {}", bin.display()))?;
+        }
+        crate::tamper::harden_permissions(bin, 0o755)
+            .with_context(|| format!("hardening permissions on {}", bin.display()))?;
+    }
+
     let alerts_abs =
         std::path::absolute(&alerts).with_context(|| format!("absolutize {}", alerts.display()))?;
     if let Some(parent) = alerts_abs.parent() {
@@ -66,6 +87,68 @@ fn resolve_paths(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Result<
         agent_abs,
         alerts_abs,
     })
+}
+
+/// A snapshot of the installed service definition's on-disk state, taken once
+/// (typically at watchdog startup) so a later snapshot can be compared against it
+/// — see [`drift_report`] (issue #103: "definition drift detection").
+pub(crate) struct DefinitionSnapshot {
+    definition_path: PathBuf,
+    enable_link: PathBuf,
+    /// `None` if the definition file was already missing when snapshotted (a
+    /// broken or removed install, or `run` used directly without `install`).
+    digest: Option<[u8; 32]>,
+    enabled: bool,
+}
+
+/// Reads the current on-disk state of whichever definition/enable-link pair
+/// matches the detected init system. Best-effort by design: a missing
+/// definition file is a `None` digest, not an error — `run` without a prior
+/// `install` is a supported, if unsupervised-by-a-service-manager, mode.
+pub(crate) fn snapshot_definition() -> anyhow::Result<DefinitionSnapshot> {
+    let (definition_path, enable_link) = match detect_init_system()? {
+        InitSystem::Systemd => (
+            PathBuf::from(SYSTEMD_UNIT),
+            PathBuf::from(SYSTEMD_ENABLE_LINK),
+        ),
+        InitSystem::OpenRc => (
+            PathBuf::from(OPENRC_SCRIPT),
+            PathBuf::from(OPENRC_ENABLE_LINK),
+        ),
+    };
+    let digest = crate::tamper::sha256_file(&definition_path).ok();
+    let enabled = enable_link.exists();
+    Ok(DefinitionSnapshot {
+        definition_path,
+        enable_link,
+        digest,
+        enabled,
+    })
+}
+
+/// Compares two snapshots of the same installation, describing anything that
+/// changed between them in a human-readable line each — empty means no drift.
+#[must_use]
+pub(crate) fn drift_report(baseline: &DefinitionSnapshot, current: &DefinitionSnapshot) -> Vec<String> {
+    let mut report = Vec::new();
+    match (&baseline.digest, &current.digest) {
+        (Some(b), Some(c)) if b != c => report.push(format!(
+            "service definition {} was modified after the watchdog started",
+            current.definition_path.display()
+        )),
+        (Some(_), None) => report.push(format!(
+            "service definition {} was deleted after the watchdog started",
+            current.definition_path.display()
+        )),
+        _ => {}
+    }
+    if baseline.enabled && !current.enabled {
+        report.push(format!(
+            "service was disabled ({} no longer exists)",
+            current.enable_link.display()
+        ));
+    }
+    report
 }
 
 pub(crate) fn cmd_install(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Result<()> {
@@ -124,6 +207,9 @@ fn install_systemd(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Resul
 
     std::fs::write(SYSTEMD_UNIT, &unit)
         .with_context(|| format!("writing {SYSTEMD_UNIT} (root required)"))?;
+    // #103: don't rely on umask for a root-owned service definition's permissions.
+    crate::tamper::harden_permissions(std::path::Path::new(SYSTEMD_UNIT), 0o644)
+        .with_context(|| format!("hardening permissions on {SYSTEMD_UNIT}"))?;
     run("systemctl", &["daemon-reload"])?;
     run("systemctl", &["enable", "--now", "synthaea-agent.service"])?;
 
