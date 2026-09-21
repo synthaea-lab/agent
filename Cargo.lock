@@ -30,6 +30,7 @@ dependencies = [
  "libc",
  "log",
  "policy",
+ "response",
  "rules",
  "schema",
  "sensor-linux",
@@ -41,6 +42,7 @@ dependencies = [
  "serde",
  "sigma",
  "sinks",
+ "tamper",
  "yara",
 ]
 
@@ -2203,6 +2205,10 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "response"
 version = "0.1.0"
+dependencies = [
+ "policy",
+ "sha2 0.11.0",
+]
 
 [[package]]
 name = "ring"

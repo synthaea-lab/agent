@@ -137,6 +137,7 @@ mod tests {
             ppid: 7,
             uid: 1000,
             gid: 1000,
+            cgroup_id: 0,
             timestamp_ns: 1_000,
             comm: c,
         }
