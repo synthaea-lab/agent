@@ -34,6 +34,7 @@ dependencies = [
  "rules",
  "schema",
  "sensor-linux",
+ "sensor-linux-audit",
  "sensor-linux-journal",
  "sensor-linux-lsm",
  "sensor-linux-netlink",
@@ -2439,6 +2440,13 @@ dependencies = [
 [[package]]
 name = "sensor-linux-audit"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "schema",
+ "thiserror 2.0.20",
+ "tokio",
+]
 
 [[package]]
 name = "sensor-linux-ebpf"
