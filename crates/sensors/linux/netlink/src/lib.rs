@@ -108,11 +108,20 @@
 //!   [`ProcEvent::Other`] rather than their own variants; nothing in the eBPF
 //!   stream to cross-check them against yet (see [`proc_events`]).
 
+// The pure codec/normalize modules compile on every OS so their unit tests run
+// anywhere, but their only callers are the linux-gated socket modules below —
+// off-Linux, the lib target legitimately has unused items (same idiom as
+// `agent/src/health.rs`). The lint stays live on Linux, where dead code is real.
 mod conntrack_attrs;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod normalize;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod proc_events;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod proc_join;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod proc_meta;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod wire;
 
 #[cfg(target_os = "linux")]

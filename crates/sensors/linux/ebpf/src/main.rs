@@ -13,8 +13,8 @@ use aya_ebpf::{
 };
 use aya_log_ebpf::{info, warn};
 use sensor_linux_wire::{
-    ConnectEvent, ExecEvent, FileOpenEvent, LineageEntry, ReadlineInputEvent, TlsCaptureEvent,
-    TASK_COMM_LEN, MAX_TLS_CAPTURE,
+    ConnectEvent, ExecEvent, FileOpenEvent, LineageEntry, MAX_TLS_CAPTURE, ReadlineInputEvent,
+    TASK_COMM_LEN, TlsCaptureEvent,
 };
 
 // This probe reads NO `task_struct`/`mm_struct` frozen offset: parent lineage (ppid +
@@ -656,16 +656,18 @@ fn try_ssl_write(ctx: ProbeContext, lib_type: u8) -> Result<u32, u32> {
         // Batch read: single bpf_probe_read_user_buf() call instead of 256
         // individual bpf_probe_read_user() calls (verifier-friendly).
         let data_slice = &mut (*e).data;
-        (*e).bytes_len = if let Ok(()) = bpf_probe_read_user_buf(
-            buf_ptr as *const u8,
-            &mut data_slice[..to_read],
-        ) {
+        (*e).bytes_len = if let Ok(()) =
+            bpf_probe_read_user_buf(buf_ptr as *const u8, &mut data_slice[..to_read])
+        {
             to_read as u32
         } else {
             0
         };
 
-        if TLS_CAPTURE_EVENTS.output::<TlsCaptureEvent>(&*e, 0).is_err() {
+        if TLS_CAPTURE_EVENTS
+            .output::<TlsCaptureEvent>(&*e, 0)
+            .is_err()
+        {
             warn!(
                 &ctx,
                 "sensor-linux-ebpf: ring buffer full, dropping TLS write event"
@@ -781,16 +783,18 @@ fn try_ssl_read_exit(ctx: RetProbeContext) -> Result<u32, u32> {
         // Batch read: single bpf_probe_read_user_buf() call instead of 256
         // individual bpf_probe_read_user() calls (verifier-friendly).
         let data_slice = &mut (*e).data;
-        (*e).bytes_len = if let Ok(()) = bpf_probe_read_user_buf(
-            buf_ptr as *const u8,
-            &mut data_slice[..to_read],
-        ) {
+        (*e).bytes_len = if let Ok(()) =
+            bpf_probe_read_user_buf(buf_ptr as *const u8, &mut data_slice[..to_read])
+        {
             to_read as u32
         } else {
             0
         };
 
-        if TLS_CAPTURE_EVENTS.output::<TlsCaptureEvent>(&*e, 0).is_err() {
+        if TLS_CAPTURE_EVENTS
+            .output::<TlsCaptureEvent>(&*e, 0)
+            .is_err()
+        {
             warn!(
                 &ctx,
                 "sensor-linux-ebpf: ring buffer full, dropping TLS read event"
@@ -860,7 +864,10 @@ fn try_readline_exit(ctx: RetProbeContext) -> Result<u32, u32> {
             (*e).input_len = input.len() as u32;
         }
 
-        if READLINE_EVENTS.output::<ReadlineInputEvent>(&*e, 0).is_err() {
+        if READLINE_EVENTS
+            .output::<ReadlineInputEvent>(&*e, 0)
+            .is_err()
+        {
             warn!(
                 &ctx,
                 "sensor-linux-ebpf: ring buffer full, dropping readline event"

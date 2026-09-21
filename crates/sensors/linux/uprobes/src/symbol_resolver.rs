@@ -2,13 +2,17 @@
 //!
 //! Scans system library paths for SSL libraries (OpenSSL, `GnuTLS`) and readline libraries
 //! (libreadline, libedit), parses their ELF symbol tables with goblin, and returns offsets for
-//! uprobe attachment. Built from the Phase 1 spike (`examples/symbol_resolution_spike.rs`),
-//! now production-ready: deduplication, error handling, library type detection.
+//! uprobe attachment. Built from the Phase 1 spike (`examples/symbol_resolution_spike.rs`,
+//! since deleted — it only compiled on Linux and this module supersedes it; see git
+//! history), now production-ready: deduplication, error handling, library type detection.
+
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use goblin::elf::Elf;
-use std::collections::HashSet;
-use std::fs;
-use std::path::{Path, PathBuf};
 
 /// ELF symbol with its offset and source library.
 #[derive(Debug, Clone)]
@@ -30,10 +34,7 @@ pub enum LibraryType {
 
 impl LibraryType {
     fn from_path(path: &Path) -> Self {
-        let filename = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
 
         if filename.contains("libssl") {
             Self::OpenSSL
@@ -241,10 +242,11 @@ pub fn resolve_symbols(
                         library_path: library_path.to_path_buf(),
                         library_type,
                     });
-                    log::debug!(
-                        "symbol_resolver: found {name} @ 0x{:x} in {}",
-                        sym.st_value,
-                        library_path.display()
+                    tracing::debug!(
+                        symbol = name,
+                        offset = format_args!("0x{:x}", sym.st_value),
+                        library = %library_path.display(),
+                        "symbol_resolver: found symbol"
                     );
                 }
             }
@@ -263,10 +265,11 @@ pub fn resolve_symbols(
                             library_path: library_path.to_path_buf(),
                             library_type,
                         });
-                        log::debug!(
-                            "symbol_resolver: found {name} (static) @ 0x{:x} in {}",
-                            sym.st_value,
-                            library_path.display()
+                        tracing::debug!(
+                            symbol = name,
+                            offset = format_args!("0x{:x}", sym.st_value),
+                            library = %library_path.display(),
+                            "symbol_resolver: found symbol (static table)"
                         );
                     }
                 }
@@ -300,18 +303,15 @@ pub fn resolve_tls_symbols() -> Result<Vec<SymbolInfo>, ResolverError> {
         match resolve_symbols(lib, &target_symbols) {
             Ok(mut symbols) => all_symbols.append(&mut symbols),
             Err(e) => {
-                log::warn!(
-                    "symbol_resolver: failed to parse {}: {e}",
-                    lib.display()
-                );
+                tracing::warn!(library = %lib.display(), error = %e, "symbol_resolver: parse failed");
             }
         }
     }
 
-    log::info!(
-        "symbol_resolver: resolved {} TLS symbols across {} libraries",
-        all_symbols.len(),
-        libraries.len()
+    tracing::info!(
+        symbols = all_symbols.len(),
+        libraries = libraries.len(),
+        "symbol_resolver: resolved TLS symbols"
     );
     Ok(all_symbols)
 }
@@ -334,18 +334,15 @@ pub fn resolve_readline_symbols() -> Result<Vec<SymbolInfo>, ResolverError> {
         match resolve_symbols(lib, &target_symbols) {
             Ok(mut symbols) => all_symbols.append(&mut symbols),
             Err(e) => {
-                log::warn!(
-                    "symbol_resolver: failed to parse {}: {e}",
-                    lib.display()
-                );
+                tracing::warn!(library = %lib.display(), error = %e, "symbol_resolver: parse failed");
             }
         }
     }
 
-    log::info!(
-        "symbol_resolver: resolved {} readline symbols across {} libraries",
-        all_symbols.len(),
-        libraries.len()
+    tracing::info!(
+        symbols = all_symbols.len(),
+        libraries = libraries.len(),
+        "symbol_resolver: resolved readline symbols"
     );
     Ok(all_symbols)
 }

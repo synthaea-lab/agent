@@ -1,16 +1,25 @@
 //! Normalizes `AuditEvent` into `schema::Event`.
 //! Platform-independent, unit-testable on any OS.
 
+use schema::{ConnectEvent, Event, EventMeta, ExecEvent, User};
+
 use crate::classify::AuditEvent;
-use schema::{Event, ExecEvent, ConnectEvent, EventMeta, User};
 
 /// Converts `AuditEvent::Exec` to `schema::Event::Exec`.
 ///
 /// # Panics
 ///
 /// Panics if called on a non-Exec event (internal misuse).
+#[must_use]
 pub fn exec_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
-    let AuditEvent::Exec { pid, uid, gid, image_path, argv } = evt else {
+    let AuditEvent::Exec {
+        pid,
+        uid,
+        gid,
+        image_path,
+        argv,
+    } = evt
+    else {
         panic!("normalize::exec_event called on non-Exec event");
     };
 
@@ -18,17 +27,20 @@ pub fn exec_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
         meta: EventMeta {
             timestamp_ns,
             pid: *pid,
-            ppid: 0,  // HONEST: audit doesn't provide this
-            user: User::Unix { uid: *uid, gid: *gid },
+            ppid: 0, // HONEST: audit doesn't provide this
+            user: User::Unix {
+                uid: *uid,
+                gid: *gid,
+            },
             comm: comm_from_path(image_path),
-            container: None,  // Phase 1: no container attribution
+            container: None, // Phase 1: no container attribution
         },
         image_path: image_path.clone(),
         cmdline: argv.join(" "),
         argv: argv.clone(),
-        parent_comm: None,       // HONEST: audit doesn't track parent
+        parent_comm: None, // HONEST: audit doesn't track parent
         parent_image_path: None,
-        sha256: None,            // Filled by enrichment
+        sha256: None, // Filled by enrichment
         signature: None,
     })
 }
@@ -38,8 +50,16 @@ pub fn exec_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
 /// # Panics
 ///
 /// Panics if called on a non-Connect event (internal misuse).
+#[must_use]
 pub fn connect_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
-    let AuditEvent::Connect { pid, uid, gid, remote_addr, protocol: _ } = evt else {
+    let AuditEvent::Connect {
+        pid,
+        uid,
+        gid,
+        remote_addr,
+        protocol: _,
+    } = evt
+    else {
         panic!("normalize::connect_event called on non-Connect event");
     };
 
@@ -48,8 +68,11 @@ pub fn connect_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
             timestamp_ns,
             pid: *pid,
             ppid: 0,
-            user: User::Unix { uid: *uid, gid: *gid },
-            comm: String::from("unknown"),  // audit doesn't provide comm
+            user: User::Unix {
+                uid: *uid,
+                gid: *gid,
+            },
+            comm: String::from("unknown"), // audit doesn't provide comm
             container: None,
         },
         daddr: remote_addr.ip(),
@@ -64,8 +87,9 @@ fn comm_from_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use super::*;
 
     #[test]
     fn normalize_exec() {
@@ -77,7 +101,7 @@ mod tests {
             argv: vec!["/bin/ls".to_string(), "-la".to_string()],
         };
 
-        let schema_evt = exec_event(&audit_evt, 1234567890_000_000_000);
+        let schema_evt = exec_event(&audit_evt, 1_234_567_890_000_000_000);
         match schema_evt {
             Event::Exec(e) => {
                 assert_eq!(e.meta.pid, 1234);
@@ -103,7 +127,7 @@ mod tests {
             protocol: 6,
         };
 
-        let schema_evt = connect_event(&audit_evt, 9876543210_000_000_000);
+        let schema_evt = connect_event(&audit_evt, 9_876_543_210_000_000_000);
         match schema_evt {
             Event::Connect(e) => {
                 assert_eq!(e.meta.pid, 5678);

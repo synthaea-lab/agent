@@ -13,3 +13,6 @@ workspace = true
 policy = { path = "../policy" }
 schema = { path = "../schema" }
 store = { path = "../store" }
+
+[dev-dependencies]
+schema = { path = "../schema", features = ["test-fixtures"] }

@@ -24,22 +24,15 @@ fn meta() -> EventMeta {
             uid: 1000,
             gid: 1000,
         },
-        timestamp_ns: 0,
-        comm: String::new(),
-        container: None,
+        ..schema::fixtures::meta()
     }
 }
 
 fn exec_event(cmdline: &str) -> ExecEvent {
     ExecEvent {
         meta: meta(),
-        image_path: String::new(),
         cmdline: cmdline.to_string(),
-        argv: vec![],
-        parent_comm: None,
-        parent_image_path: None,
-        sha256: None,
-        signature: None,
+        ..schema::fixtures::exec()
     }
 }
 
@@ -162,10 +155,7 @@ fn network_flow_event_full(
         daddr: std::net::IpAddr::V4(daddr_v4.into()),
         dport,
         protocol: 6, // IPPROTO_TCP
-        bytes_sent: None,
-        bytes_received: None,
-        packets_sent: None,
-        packets_received: None,
+        ..schema::fixtures::network_flow()
     }
 }
 

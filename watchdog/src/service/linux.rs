@@ -131,7 +131,10 @@ pub(crate) fn snapshot_definition() -> anyhow::Result<DefinitionSnapshot> {
 /// Compares two snapshots of the same installation, describing anything that
 /// changed between them in a human-readable line each — empty means no drift.
 #[must_use]
-pub(crate) fn drift_report(baseline: &DefinitionSnapshot, current: &DefinitionSnapshot) -> Vec<String> {
+pub(crate) fn drift_report(
+    baseline: &DefinitionSnapshot,
+    current: &DefinitionSnapshot,
+) -> Vec<String> {
     let mut report = Vec::new();
     match (&baseline.digest, &current.digest) {
         (Some(b), Some(c)) if b != c => report.push(format!(
@@ -304,8 +307,7 @@ fn uninstall_openrc() -> anyhow::Result<()> {
     let _ = run("rc-service", &["synthaea-agent", "stop"]);
     let _ = run("rc-update", &["del", "synthaea-agent", "default"]);
     if std::path::Path::new(OPENRC_SCRIPT).exists() {
-        std::fs::remove_file(OPENRC_SCRIPT)
-            .with_context(|| format!("removing {OPENRC_SCRIPT}"))?;
+        std::fs::remove_file(OPENRC_SCRIPT).with_context(|| format!("removing {OPENRC_SCRIPT}"))?;
     }
     println!("[watchdog] synthaea-agent OpenRC service uninstalled.");
     Ok(())

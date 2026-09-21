@@ -2,7 +2,8 @@
 //! the sensor pipeline's live event counter to a small file next to the
 //! alerts output, which the watchdog polls to detect a hung agent. Unlike a
 //! bare "I'm still scheduled" timer, this only advances when
-//! [`crate::sink::DetectionSink::on_event`] completes end-to-end for a real
+//! [`crate::sink::DetectionSink`]'s `on_event` (its `EventSink` trait impl —
+//! rustdoc cannot link trait-impl methods) completes end-to-end for a real
 //! event — a wedged sensor thread, a poisoned lock, or a stalled drain loop
 //! all stop it, exactly the failure mode a plain process-alive (`try_wait`)
 //! check misses (the endpoint looks protected while collecting nothing).
@@ -15,10 +16,14 @@
 //! version) remains the right tool for the UI/CLI control channel it's
 //! designed for; this is a narrower, purpose-built mechanism for one signal.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 /// How often the writer thread samples the counter and rewrites the file.
 /// Independent of the watchdog's own `--heartbeat-interval-secs` (its poll

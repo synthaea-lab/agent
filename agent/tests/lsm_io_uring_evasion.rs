@@ -74,7 +74,9 @@ fn file_open_lsm_hook_fires_for_an_io_uring_write() {
     match status {
         Ok(status) if status.success() => {}
         Ok(status) => {
-            eprintln!("skipping: fio exited with {status} (likely no io_uring support in this kernel/fio build)");
+            eprintln!(
+                "skipping: fio exited with {status} (likely no io_uring support in this kernel/fio build)"
+            );
             return;
         }
         Err(e) => {

@@ -24,8 +24,10 @@ response = { path = "../crates/response" }
 anyhow = "1"
 serde = { workspace = true }
 clap = { version = "4", features = ["derive"] }
-env_logger = { version = "0.11", default-features = false, features = ["auto-color"] }
-log = "0.4"
+tracing = { workspace = true }
+# fmt + env-filter: RUST_LOG-style filtering; the default "tracing-log" feature
+# bridges `log` records (aya-log, dependencies) into the subscriber.
+tracing-subscriber = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 sensor-windows = { path = "../crates/sensors/windows/etw" }
@@ -44,3 +46,6 @@ libc = "0.2"
 # test below exercises it.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 sensor-linux-lsm = { path = "../crates/sensors/linux/lsm" }
+
+[dev-dependencies]
+schema = { path = "../crates/schema", features = ["test-fixtures"] }

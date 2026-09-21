@@ -154,10 +154,12 @@ fn read_dump(fd: &OwnedFd) -> Result<Vec<DiagMsg>, NetlinkError> {
             match header.msg_type {
                 NLMSG_DONE => break 'recv,
                 NLMSG_ERROR => {
-                    let errno = payload
-                        .get(0..4)
-                        .map(|b| i32::from_ne_bytes(b.try_into().unwrap()))
-                        .unwrap_or(-1);
+                    // Slice pattern, not `try_into().unwrap()` — same rule as the
+                    // parsers: no explicit panic point to document.
+                    let errno = match payload {
+                        [b0, b1, b2, b3, ..] => i32::from_ne_bytes([*b0, *b1, *b2, *b3]),
+                        _ => -1,
+                    };
                     if errno != 0 {
                         return Err(NetlinkError::Kernel(errno));
                     }

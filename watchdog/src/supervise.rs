@@ -406,7 +406,11 @@ fn report_self_protection_event(alerts: &Path, message: &str) {
     let line = format!(
         "{{\"timestamp_ns\":{now_ns},\"technique\":\"SELF-PROTECTION\",\"message\":\"{escaped}\"}}\n"
     );
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(alerts) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(alerts)
+    {
         use std::io::Write as _;
         let _ = f.write_all(line.as_bytes());
     }
@@ -584,8 +588,10 @@ mod tests {
     fn tick_only_checks_the_file_once_per_interval() {
         // interval = 5s, POLL_TICK = 500ms -> 10 ticks per check.
         let mut m = monitor(1);
-        let path = std::env::temp_dir()
-            .join(format!("heartbeat-monitor-tick-test-{}.txt", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "heartbeat-monitor-tick-test-{}.txt",
+            std::process::id()
+        ));
         std::fs::write(&path, "1").unwrap();
         m.path = path.clone();
         for i in 1..10 {
@@ -606,7 +612,10 @@ mod tests {
         std::fs::remove_file(&path).ok();
         report_self_protection_event(&path, r#"binary at "C:\agent.exe" was swapped"#);
         let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(contents.ends_with('\n'), "expected a trailing newline: {contents:?}");
+        assert!(
+            contents.ends_with('\n'),
+            "expected a trailing newline: {contents:?}"
+        );
         assert!(contents.contains(r#""technique":"SELF-PROTECTION""#));
         // The message's own quotes and backslash must come back escaped, not
         // break the JSON shape.
@@ -626,8 +635,10 @@ mod tests {
 /// asserts the grandchild disappears on its own shortly after.
 #[cfg(all(test, target_os = "linux"))]
 mod pdeathsig_tests {
-    use std::io::BufRead as _;
-    use std::time::{Duration, Instant};
+    use std::{
+        io::BufRead as _,
+        time::{Duration, Instant},
+    };
 
     const FAKE_WATCHDOG_ENV: &str = "SYNTHAEA_TEST_FAKE_WATCHDOG";
 

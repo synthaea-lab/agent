@@ -11,7 +11,8 @@ use std::net::IpAddr;
 use schema::{
     AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, ConnectEvent, DnsQueryEvent, Event,
     EventMeta, ExecEvent, FileOpenEvent, ImageLoadEvent, ListenPortEvent, NetworkFlowEvent,
-    RegistrySetEvent, ScriptBlockEvent, SmbConnectEvent, UdpSendEvent, User, WmiActivityEvent,
+    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType, SmbConnectEvent,
+    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -572,6 +573,56 @@ fn auth_logon_failure_golden() {
 }
 
 #[test]
+fn tls_capture_golden() {
+    // v14 (#90): uprobes TLS plaintext tap. `data` is raw bytes, not a string —
+    // it serializes as a JSON number array, and the fixture pins that (captured
+    // plaintext may be non-UTF-8, so a string encoding would be lossy).
+    assert_golden(
+        &Event::TlsCapture(TlsCaptureEvent {
+            meta: EventMeta {
+                pid: 5150,
+                ppid: 5100,
+                user: User::Unix {
+                    uid: 1000,
+                    gid: 1000,
+                },
+                timestamp_ns: 1_756_900_008_000_000_000,
+                comm: "curl".into(),
+                container: None,
+            },
+            direction: TlsDirection::Write,
+            lib_type: TlsLibraryType::OpenSsl,
+            data: b"GET /beacon HTTP/1.1\r\nHost: c2.example.test\r\n\r\n".to_vec(),
+        }),
+        "tls_capture",
+    );
+}
+
+#[test]
+fn readline_input_golden() {
+    // v14 (#90): shell readline capture — a builtin (`export`) that never execs,
+    // exactly the visibility gap the variant exists for.
+    assert_golden(
+        &Event::ReadlineInput(ReadlineInputEvent {
+            meta: EventMeta {
+                pid: 6001,
+                ppid: 6000,
+                user: User::Unix {
+                    uid: 1000,
+                    gid: 1000,
+                },
+                timestamp_ns: 1_756_900_009_000_000_000,
+                comm: "bash".into(),
+                container: None,
+            },
+            shell_type: ShellType::Bash,
+            input: "export PATH=/tmp/.hidden:$PATH".into(),
+        }),
+        "readline_input",
+    );
+}
+
+#[test]
 fn unbounded_cmdline_survives() {
     // Audit F-4: multi-kilobyte encoded command lines must round-trip untouched.
     let long = format!("powershell.exe -EncodedCommand {}", "A".repeat(8 * 1024));
@@ -751,6 +802,17 @@ fn meta_accessor_covers_all_variants() {
             bytes_received: None,
             packets_sent: None,
             packets_received: None,
+        }),
+        Event::TlsCapture(TlsCaptureEvent {
+            meta: meta.clone(),
+            direction: TlsDirection::Read,
+            lib_type: TlsLibraryType::GnuTls,
+            data: vec![],
+        }),
+        Event::ReadlineInput(ReadlineInputEvent {
+            meta: meta.clone(),
+            shell_type: ShellType::Zsh,
+            input: String::new(),
         }),
     ];
     for e in &events {

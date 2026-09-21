@@ -13,14 +13,15 @@
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use schema::{Event, sensor::EventSink};
 use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
 
-use crate::health::SensorHealthSource;
-use crate::sink::DetectionSink;
+use crate::{health::SensorHealthSource, sink::DetectionSink};
 
 /// How often the dedicated monitor thread checks every registered heartbeat against
 /// its deadline. Independent of the health beacon's own (much longer) cadence —
@@ -83,7 +84,7 @@ pub(crate) fn spawn_monitor(monitor: Arc<Mutex<SilenceMonitor>>, sink: Arc<Detec
         .spawn(move || {
             loop {
                 std::thread::sleep(POLL_INTERVAL);
-                let verdicts = monitor.lock().unwrap().poll(crate::time::now_ns());
+                let verdicts = monitor.lock().unwrap().poll(schema::time::now_ns());
                 for verdict in verdicts {
                     sink.emit("T1562", &verdict.message());
                 }
@@ -94,8 +95,9 @@ pub(crate) fn spawn_monitor(monitor: Arc<Mutex<SilenceMonitor>>, sink: Arc<Detec
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
 
     struct CountingSink(Arc<AtomicUsize>);
 
@@ -109,19 +111,9 @@ mod tests {
         Event::Exec(schema::ExecEvent {
             meta: schema::EventMeta {
                 pid: 1,
-                ppid: 0,
-                user: schema::User::Unknown,
-                timestamp_ns: 0,
-                comm: String::new(),
-                container: None,
+                ..schema::fixtures::meta()
             },
-            image_path: String::new(),
-            cmdline: String::new(),
-            argv: vec![],
-            parent_comm: None,
-            parent_image_path: None,
-            sha256: None,
-            signature: None,
+            ..schema::fixtures::exec()
         })
     }
 
@@ -134,8 +126,16 @@ mod tests {
         pulsing.on_event(exec_event());
         pulsing.on_event(exec_event());
 
-        assert_eq!(count.load(Ordering::Relaxed), 2, "events must still reach the inner sink");
-        assert_eq!(heartbeat.pulse_count(), 2, "each event must pulse the heartbeat");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            2,
+            "events must still reach the inner sink"
+        );
+        assert_eq!(
+            heartbeat.pulse_count(),
+            2,
+            "each event must pulse the heartbeat"
+        );
     }
 
     #[test]

@@ -88,7 +88,10 @@ mod tests {
             quarantine_enabled: false,
         };
         let outcome = kill_process(1234, &policy, |_| {
-            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no such process"))
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no such process",
+            ))
         });
         assert_eq!(
             outcome,

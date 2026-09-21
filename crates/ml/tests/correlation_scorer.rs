@@ -28,11 +28,10 @@ fn scorer() -> CorrelationScorer {
 fn meta(pid: u32, ts_ns: u64) -> EventMeta {
     EventMeta {
         pid,
-        ppid: 0,
         user: User::Unix { uid: 0, gid: 0 },
         timestamp_ns: ts_ns,
         comm: "proc".into(),
-        container: None,
+        ..schema::fixtures::meta()
     }
 }
 
@@ -45,13 +44,7 @@ fn event_from_json(e: &Value) -> Event {
     match e["type"].as_str().unwrap() {
         "exec" => Event::Exec(ExecEvent {
             meta: meta(pid, ts),
-            image_path: String::new(),
-            cmdline: String::new(),
-            argv: vec![],
-            parent_comm: None,
-            parent_image_path: None,
-            sha256: None,
-            signature: None,
+            ..schema::fixtures::exec()
         }),
         "connect" => {
             let o = e["daddr_v4"].as_array().unwrap();

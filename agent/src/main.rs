@@ -26,10 +26,9 @@ mod heartbeat;
 #[cfg(target_os = "linux")]
 mod kill_loudness;
 mod protected;
+mod silence;
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 mod sink;
-mod silence;
-mod time;
 
 use clap::{Parser, Subcommand};
 
@@ -82,7 +81,15 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Same operator contract env_logger had: RUST_LOG filters, "info" default.
+    // `init()` also installs the `log` bridge, so records from aya-log and other
+    // `log`-facade dependencies land in the same subscriber.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
     let cli = Cli::parse();
     match cli.command {
         Command::Status => commands::cmd_status(),

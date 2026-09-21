@@ -75,7 +75,7 @@ impl EventSpool {
             if let Some(base) = name_str.strip_suffix(".inflight") {
                 let recovered = dir.join(format!("{base}.jsonl"));
                 fs::rename(entry.path(), &recovered)?;
-                log::info!("spool: recovered in-flight segment {base}");
+                tracing::info!(segment = base, "spool: recovered in-flight segment");
             }
         }
         let head_seq = segment_seqs(dir)?.last().copied().map_or(0, |s| s + 1);
@@ -183,7 +183,7 @@ impl EventSpool {
                 // A torn tail line (crash mid-append) is expected once per crash;
                 // anything else in the middle would also land here — count-free but
                 // logged, never fatal to the drain.
-                Err(e) => log::warn!("spool: skipping unparseable record: {e}"),
+                Err(e) => tracing::warn!(error = %e, "spool: skipping unparseable record"),
             }
         }
 
@@ -219,7 +219,7 @@ impl EventSpool {
         // Delete first, then clear in_flight. If delete fails, we'll retry on next ack().
         fs::remove_file(&path)?;
         self.in_flight = None;
-        log::debug!("spool: ack'd segment {seq}");
+        tracing::debug!(seq, "spool: ack'd segment");
         Ok(true)
     }
 
@@ -244,7 +244,7 @@ impl EventSpool {
         fs::remove_file(&path)?;
         self.in_flight = None;
         self.dropped_records += dropped;
-        log::warn!("spool: skipped poison segment {seq} ({dropped} records dropped)");
+        tracing::warn!(seq, dropped, "spool: skipped poison segment");
         Ok(true)
     }
 
@@ -328,7 +328,11 @@ impl EventSpool {
                 .unwrap_or(0);
             fs::remove_file(&path)?;
             self.dropped_records += dropped;
-            log::warn!("spool: byte cap exceeded, dropped segment {oldest} ({dropped} records)");
+            tracing::warn!(
+                segment = oldest,
+                dropped,
+                "spool: byte cap exceeded, dropped oldest segment"
+            );
         }
     }
 }
@@ -429,25 +433,19 @@ mod tests {
 
     #[test]
     fn spools_schema_events() {
-        use schema::{Event, EventMeta, ExecEvent, User};
+        use schema::{Event, EventMeta, ExecEvent};
         let dir = tmp("schema");
         let mut spool = EventSpool::open(&dir, u64::MAX).unwrap();
         let event = Event::Exec(ExecEvent {
             meta: EventMeta {
                 pid: 1,
-                ppid: 0,
-                user: User::Unknown,
                 timestamp_ns: 42,
                 comm: "x".into(),
-                container: None,
+                ..schema::fixtures::meta()
             },
             image_path: "/bin/x".into(),
             cmdline: "x".into(),
-            argv: vec![],
-            parent_comm: None,
-            parent_image_path: None,
-            sha256: None,
-            signature: None,
+            ..schema::fixtures::exec()
         });
         spool.push(&event).unwrap();
         let got: Vec<Event> = spool.drain_oldest().unwrap();

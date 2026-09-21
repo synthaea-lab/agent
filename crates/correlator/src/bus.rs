@@ -35,12 +35,6 @@ impl EventBus {
         self.evict();
     }
 
-    /// Returns all events currently in the window.
-    #[must_use]
-    pub fn window_events(&self) -> &VecDeque<Event> {
-        &self.events
-    }
-
     /// Filters events by pid.
     pub fn events_for_pid(&self, pid: u32) -> impl Iterator<Item = &Event> {
         self.events.iter().filter(move |e| e.meta().pid == pid)
@@ -48,7 +42,7 @@ impl EventBus {
 
     /// Filters events by (ppid, comm) — the logical identity of a respawned process
     /// (repeated fork+exec by the same parent), whose pid changes on every iteration.
-    pub fn events_for_ppid_comm<'a>(
+    pub(crate) fn events_for_ppid_comm<'a>(
         &'a self,
         ppid: u32,
         comm: &'a str,

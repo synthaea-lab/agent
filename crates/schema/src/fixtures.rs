@@ -1,0 +1,234 @@
+//! Shared test-fixture baselines (feature `test-fixtures`, dev-dependencies
+//! only — never compiled into a shipping build).
+//!
+//! Before this module, every detection crate hand-wrote the same full event
+//! literals in its test helpers (~12 copies), and each new field on an event
+//! struct forced a mechanical edit in all of them. Tests now spell only the
+//! fields they are about and take the rest from here via struct-update syntax:
+//!
+//! ```
+//! use schema::{Event, ExecEvent, fixtures};
+//!
+//! let event = Event::Exec(ExecEvent {
+//!     cmdline: "curl -fsSL https://x.test".into(),
+//!     ..fixtures::exec()
+//! });
+//! ```
+//!
+//! Every value here is deliberately **neutral** (zero, empty, `Unknown`,
+//! `None`): a test that asserts on a field it did not set is asserting on
+//! nothing, and a neutral baseline makes that visible instead of smuggling in
+//! plausible-looking data. The exception is addresses, which need *some*
+//! value — they use TEST-NET-1 (`192.0.2.0/24`, RFC 5737) so a fixture address
+//! can never be mistaken for a real one.
+//!
+//! `tests/golden.rs` deliberately does NOT use these: the golden suite pins
+//! serialization, so it spells every field explicitly on purpose.
+
+use core::net::{IpAddr, Ipv4Addr};
+
+use crate::{
+    AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, ConnectEvent, DnsQueryEvent, EventMeta,
+    ExecEvent, FileOpenEvent, ImageLoadEvent, ListenPortEvent, NetworkFlowEvent,
+    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType, SmbConnectEvent,
+    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
+};
+
+/// The TEST-NET-1 address every address-carrying fixture defaults to.
+pub const TEST_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+
+/// Neutral [`EventMeta`]: pid/ppid 0, [`User::Unknown`], timestamp 0, empty comm.
+#[must_use]
+pub fn meta() -> EventMeta {
+    EventMeta {
+        pid: 0,
+        ppid: 0,
+        user: User::Unknown,
+        timestamp_ns: 0,
+        comm: String::new(),
+        container: None,
+    }
+}
+
+/// Neutral [`ExecEvent`].
+#[must_use]
+pub fn exec() -> ExecEvent {
+    ExecEvent {
+        meta: meta(),
+        image_path: String::new(),
+        cmdline: String::new(),
+        argv: Vec::new(),
+        parent_comm: None,
+        parent_image_path: None,
+        sha256: None,
+        signature: None,
+    }
+}
+
+/// Neutral [`FileOpenEvent`] (`flags: 0` = `O_RDONLY`).
+#[must_use]
+pub fn file_open() -> FileOpenEvent {
+    FileOpenEvent {
+        meta: meta(),
+        path: String::new(),
+        flags: 0,
+    }
+}
+
+/// Neutral [`ConnectEvent`] to [`TEST_ADDR`].
+#[must_use]
+pub fn connect() -> ConnectEvent {
+    ConnectEvent {
+        meta: meta(),
+        daddr: TEST_ADDR,
+        dport: 0,
+    }
+}
+
+/// Neutral [`DnsQueryEvent`].
+#[must_use]
+pub fn dns_query() -> DnsQueryEvent {
+    DnsQueryEvent {
+        meta: meta(),
+        query: String::new(),
+        qtype: 0,
+        result: None,
+        status: 0,
+    }
+}
+
+/// Neutral [`RegistrySetEvent`].
+#[must_use]
+pub fn registry_set() -> RegistrySetEvent {
+    RegistrySetEvent {
+        meta: meta(),
+        key: String::new(),
+        value_name: String::new(),
+        data_type: 0,
+        data: None,
+    }
+}
+
+/// Neutral [`ImageLoadEvent`].
+#[must_use]
+pub fn image_load() -> ImageLoadEvent {
+    ImageLoadEvent {
+        meta: meta(),
+        image_path: String::new(),
+    }
+}
+
+/// Neutral [`ScriptBlockEvent`].
+#[must_use]
+pub fn script_block() -> ScriptBlockEvent {
+    ScriptBlockEvent {
+        meta: meta(),
+        script_block_id: String::new(),
+        path: None,
+        text: String::new(),
+        message_number: 0,
+        message_total: 0,
+    }
+}
+
+/// Neutral [`WmiActivityEvent`].
+#[must_use]
+pub fn wmi_activity() -> WmiActivityEvent {
+    WmiActivityEvent {
+        meta: meta(),
+        namespace: String::new(),
+        query: None,
+        method: None,
+    }
+}
+
+/// Neutral [`AssemblyLoadEvent`].
+#[must_use]
+pub fn assembly_load() -> AssemblyLoadEvent {
+    AssemblyLoadEvent {
+        meta: meta(),
+        assembly_name: String::new(),
+        flags: 0,
+    }
+}
+
+/// Neutral [`SmbConnectEvent`].
+#[must_use]
+pub fn smb_connect() -> SmbConnectEvent {
+    SmbConnectEvent {
+        meta: meta(),
+        server_name: String::new(),
+    }
+}
+
+/// Neutral [`UdpSendEvent`] to [`TEST_ADDR`].
+#[must_use]
+pub fn udp_send() -> UdpSendEvent {
+    UdpSendEvent {
+        meta: meta(),
+        daddr: TEST_ADDR,
+        dport: 0,
+        size: 0,
+    }
+}
+
+/// Neutral successful-logon [`AuthEvent`].
+#[must_use]
+pub fn auth() -> AuthEvent {
+    AuthEvent {
+        meta: meta(),
+        outcome: AuthOutcome::Success,
+        kind: AuthKind::Logon,
+        target_user: String::new(),
+        target_user_sid: None,
+        source_address: None,
+        status_code: None,
+    }
+}
+
+/// Neutral [`ListenPortEvent`] on [`TEST_ADDR`].
+#[must_use]
+pub fn listen_port() -> ListenPortEvent {
+    ListenPortEvent {
+        meta: meta(),
+        local_addr: TEST_ADDR,
+        local_port: 0,
+    }
+}
+
+/// Neutral [`NetworkFlowEvent`] to [`TEST_ADDR`], no counters.
+#[must_use]
+pub fn network_flow() -> NetworkFlowEvent {
+    NetworkFlowEvent {
+        meta: meta(),
+        local_port: 0,
+        daddr: TEST_ADDR,
+        dport: 0,
+        protocol: 0,
+        bytes_sent: None,
+        bytes_received: None,
+        packets_sent: None,
+        packets_received: None,
+    }
+}
+
+/// Neutral [`TlsCaptureEvent`] (read direction, OpenSSL, empty payload).
+#[must_use]
+pub fn tls_capture() -> TlsCaptureEvent {
+    TlsCaptureEvent {
+        meta: meta(),
+        direction: TlsDirection::Read,
+        lib_type: TlsLibraryType::OpenSsl,
+        data: Vec::new(),
+    }
+}
+
+/// Neutral [`ReadlineInputEvent`] (bash, empty input).
+#[must_use]
+pub fn readline_input() -> ReadlineInputEvent {
+    ReadlineInputEvent {
+        meta: meta(),
+        shell_type: ShellType::Bash,
+        input: String::new(),
+    }
+}

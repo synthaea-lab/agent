@@ -8,8 +8,10 @@
 use std::time::Duration;
 
 use serde::Deserialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::UnixStream,
+};
 
 /// Where the Docker daemon listens by default. A containerd-only host (no Docker)
 /// or a remapped socket path isn't handled specially — `lookup` returns `None`
@@ -54,7 +56,7 @@ pub(crate) async fn lookup(container_id: &str) -> Option<DockerContainerInfo> {
     match tokio::time::timeout(REQUEST_TIMEOUT, lookup_inner(container_id)).await {
         Ok(info) => info,
         Err(_) => {
-            log::debug!("docker socket lookup for {container_id}: timed out");
+            tracing::debug!(container_id, "docker socket lookup timed out");
             None
         }
     }
@@ -64,7 +66,7 @@ async fn lookup_inner(container_id: &str) -> Option<DockerContainerInfo> {
     let mut stream = match UnixStream::connect(DOCKER_SOCKET).await {
         Ok(s) => s,
         Err(e) => {
-            log::debug!("docker socket ({DOCKER_SOCKET}) unavailable: {e}");
+            tracing::debug!(socket = DOCKER_SOCKET, error = %e, "docker socket unavailable");
             return None;
         }
     };
@@ -73,13 +75,13 @@ async fn lookup_inner(container_id: &str) -> Option<DockerContainerInfo> {
         "GET /containers/{container_id}/json HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n"
     );
     if let Err(e) = stream.write_all(request.as_bytes()).await {
-        log::debug!("docker socket write failed: {e}");
+        tracing::debug!(error = %e, "docker socket write failed");
         return None;
     }
 
     let mut raw = Vec::new();
     if let Err(e) = stream.read_to_end(&mut raw).await {
-        log::debug!("docker socket read failed: {e}");
+        tracing::debug!(error = %e, "docker socket read failed");
         return None;
     }
 
@@ -90,10 +92,7 @@ async fn lookup_inner(container_id: &str) -> Option<DockerContainerInfo> {
     let body = match http_response_body(&raw) {
         Some(b) => b,
         None => {
-            log::debug!(
-                "docker socket: malformed HTTP response ({} bytes)",
-                raw.len()
-            );
+            tracing::debug!(bytes = raw.len(), "docker socket: malformed HTTP response");
             return None;
         }
     };
@@ -101,7 +100,7 @@ async fn lookup_inner(container_id: &str) -> Option<DockerContainerInfo> {
     let parsed: InspectResponse = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(e) => {
-            log::debug!("docker socket: response is not the expected JSON shape: {e}");
+            tracing::debug!(error = %e, "docker socket: response is not the expected JSON shape");
             return None;
         }
     };
@@ -136,7 +135,10 @@ fn http_response_body(raw: &[u8]) -> Option<Vec<u8>> {
     let split_at = raw.windows(sep.len()).position(|w| w == sep)? + sep.len();
     let (headers, body) = (&raw[..split_at], &raw[split_at..]);
     let headers = std::str::from_utf8(headers).ok()?;
-    if headers.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+    if headers
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
         dechunk(body)
     } else {
         Some(body.to_vec())
@@ -166,7 +168,7 @@ fn dechunk(mut body: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dechunk, http_response_body, status_line_is_2xx, InspectResponse};
+    use super::{InspectResponse, dechunk, http_response_body, status_line_is_2xx};
 
     #[test]
     fn status_line_2xx_accepts_200() {
@@ -196,7 +198,10 @@ mod tests {
 
     #[test]
     fn http_response_body_none_without_blank_line() {
-        assert_eq!(http_response_body(b"garbage, no header/body separator"), None);
+        assert_eq!(
+            http_response_body(b"garbage, no header/body separator"),
+            None
+        );
     }
 
     #[test]

@@ -153,7 +153,8 @@ const HARDENED_SERVICE_SDDL: &str = "D:(A;;GA;;;SY)(A;;CCLCSWRPLOCRRCWDWO;;;BA)(
 /// [`cmd_uninstall`] before it does exactly that, and by [`cmd_install`]
 /// before re-running `sc description`/`sc failure` (both `SERVICE_CHANGE_CONFIG`)
 /// on a service a previous install already hardened.
-const PERMISSIVE_SERVICE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;CCLCSWLOCRRC;;;WD)";
+const PERMISSIVE_SERVICE_SDDL: &str =
+    "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;CCLCSWLOCRRC;;;WD)";
 
 /// Applies [`HARDENED_SERVICE_SDDL`]. Best-effort: a failure here (e.g. `sc
 /// sdset` itself blocked by some other policy) leaves the service installed

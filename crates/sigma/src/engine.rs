@@ -42,7 +42,7 @@ impl SigmaEngine {
                 } else if path.extension().is_some_and(|e| e == "yml" || e == "yaml") {
                     match Self::load_rule(&path) {
                         Ok(rule) => rules.push(rule),
-                        Err(e) => log::warn!("sigma rule skipped: {e}"),
+                        Err(e) => tracing::warn!(error = %e, "sigma rule skipped"),
                     }
                 }
             }

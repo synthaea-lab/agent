@@ -76,7 +76,7 @@ impl ScanQueue {
                         }
                         // Vanished files are the normal case for droppers that
                         // delete their payload; anything else is logged, not fatal.
-                        Err(e) => log::debug!("yara: scan skipped: {e}"),
+                        Err(e) => tracing::debug!(error = %e, "yara: scan skipped"),
                     }
                 }
             })

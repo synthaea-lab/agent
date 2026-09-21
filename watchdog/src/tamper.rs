@@ -10,9 +10,7 @@
 //! Linux only for now. Windows service-ACL hardening and macOS's Endpoint Security
 //! system-extension path are tracked in the issue but not implemented here.
 
-use std::fs::File;
-use std::io::Read as _;
-use std::path::Path;
+use std::{fs::File, io::Read as _, path::Path};
 
 /// Hashes a file's contents with SHA-256. Same buffered-read shape as
 /// `enrich::hash_file` (`sha2` 0.11 dropped `impl Write for Sha256`, so
@@ -119,8 +117,9 @@ impl BinaryPin {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write as _;
+
+    use super::*;
 
     /// A path under the OS temp dir unique to this test process+call, so
     /// concurrent test runs never collide on the same file.

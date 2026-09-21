@@ -42,10 +42,13 @@ fn stop_orphaned_session(name: &str) {
         .output();
     match out {
         Ok(o) if o.status.success() => {
-            log::info!("orphaned ETW session {name} stopped before startup");
+            tracing::info!(
+                session = name,
+                "orphaned ETW session stopped before startup"
+            );
         }
         Ok(_) => {} // no such session — nominal on a clean start
-        Err(e) => log::warn!("logman unavailable ({e}) — ETW orphan cleanup skipped"),
+        Err(e) => tracing::warn!(error = %e, "logman unavailable — ETW orphan cleanup skipped"),
     }
 }
 
@@ -123,7 +126,7 @@ fn seed_pid_store(state: &SharedState) {
     for (pid, name) in winapi::snapshot_processes() {
         pids.insert(pid, name);
     }
-    log::info!("pid store seeded: {} existing processes", pids.len());
+    tracing::info!(processes = pids.len(), "pid store seeded");
 }
 
 /// F-2: randomized session name; the previous name is persisted so orphan cleanup
@@ -184,6 +187,8 @@ fn liveness_watch(
 
 // ── The sensor ───────────────────────────────────────────────────────────────
 
+/// The Windows ETW sensor: owns the trace session and consumer thread, and
+/// implements `schema::sensor::Sensor` (see the crate doc for provider coverage).
 pub struct WindowsSensor {
     stop: Arc<AtomicBool>,
 }

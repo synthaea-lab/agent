@@ -630,7 +630,7 @@ use sensor_linux_uprobes::{UprobesSensor, UprobesConfig};
 use sinks::JsonlEventSink;
 
 fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    tracing_subscriber::fmt::init();
 
     let config = UprobesConfig::new()
         .with_tls_enabled()

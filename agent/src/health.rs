@@ -154,10 +154,7 @@ impl HealthCollector {
     }
 
     fn run(self) {
-        log::info!(
-            "health beacon started (interval: {:?})",
-            self.config.interval
-        );
+        tracing::info!(interval = ?self.config.interval, "health beacon started");
         while !self.stop.is_stopped() {
             self.stop.sleep_interruptible(self.config.interval);
             if self.stop.is_stopped() {
@@ -165,14 +162,14 @@ impl HealthCollector {
             }
             let beacon = self.collect();
             (self.emit)(beacon);
-            log::debug!("health beacon emitted");
+            tracing::debug!("health beacon emitted");
         }
-        log::info!("health beacon stopped");
+        tracing::info!("health beacon stopped");
     }
 
     fn collect(&self) -> HealthBeacon {
         HealthBeacon {
-            timestamp_ns: crate::time::now_ns(),
+            timestamp_ns: schema::time::now_ns(),
             agent_version: self.config.agent_version.clone(),
             sensors: self.sensors.sensor_health(),
             spool_bytes: self.spool.spool_bytes(),

@@ -12,7 +12,7 @@ use crate::{Alert, has_write_intent};
 /// entropy analysis here — that is the role of the ML model as a complement, not of
 /// this deterministic rule.
 #[must_use]
-pub fn check_base64_decode(event: &ExecEvent) -> Option<Alert> {
+pub(crate) fn check_base64_decode(event: &ExecEvent) -> Option<Alert> {
     let cmdline = &event.cmdline;
     let has_base64 = cmdline.contains("base64");
     let has_decode_flag =
@@ -53,7 +53,7 @@ pub fn check_base64_decode(event: &ExecEvent) -> Option<Alert> {
 /// Case-insensitive on the full string — `PowerShell` parameter names and
 /// image paths are.
 #[must_use]
-pub fn check_encoded_powershell(event: &ExecEvent) -> Option<Alert> {
+pub(crate) fn check_encoded_powershell(event: &ExecEvent) -> Option<Alert> {
     let cmdline = &event.cmdline;
     let cmdline_lower = cmdline.to_ascii_lowercase();
     let mentions_powershell =
@@ -92,7 +92,7 @@ const PERSISTENCE_PATH_PATTERNS: &[&str] = &[
 /// (known limitation of the eBPF collector) — the substring filter tolerates this case
 /// as long as the meaningful path fragment (e.g. `.bashrc`) is present verbatim.
 #[must_use]
-pub fn check_persistence_write(event: &FileOpenEvent) -> Option<Alert> {
+pub(crate) fn check_persistence_write(event: &FileOpenEvent) -> Option<Alert> {
     let path = &event.path;
     let matched_pattern = PERSISTENCE_PATH_PATTERNS
         .iter()
@@ -140,7 +140,7 @@ pub fn evaluate_exec(event: &ExecEvent) -> Vec<Alert> {
 /// comment in `sensor-linux`), which does not depend on the pid still existing by
 /// drain time.
 #[must_use]
-pub fn check_proc_root_escape(event: &FileOpenEvent) -> Option<Alert> {
+pub(crate) fn check_proc_root_escape(event: &FileOpenEvent) -> Option<Alert> {
     let container = event.meta.container.as_ref()?;
 
     let mut segments = event.path.split('/').filter(|s| !s.is_empty());
@@ -181,7 +181,7 @@ pub fn check_proc_root_escape(event: &FileOpenEvent) -> Option<Alert> {
 /// to the persistence artifact for triage/removal via
 /// `schtasks /Delete /TN <name> /F`.
 #[must_use]
-pub fn check_scheduled_task_persistence(event: &FileOpenEvent) -> Option<Alert> {
+pub(crate) fn check_scheduled_task_persistence(event: &FileOpenEvent) -> Option<Alert> {
     if event.flags & FLAG_PERSISTENCE_TASK_ARTIFACT == 0 {
         return None;
     }
@@ -214,7 +214,7 @@ pub fn check_scheduled_task_persistence(event: &FileOpenEvent) -> Option<Alert> 
 /// alert to the persistence artifact for triage/removal via
 /// `sc.exe delete <name>`.
 #[must_use]
-pub fn check_service_install_persistence(event: &FileOpenEvent) -> Option<Alert> {
+pub(crate) fn check_service_install_persistence(event: &FileOpenEvent) -> Option<Alert> {
     if event.flags & FLAG_PERSISTENCE_ARTIFACT == 0 {
         return None;
     }
@@ -247,7 +247,7 @@ pub fn check_service_install_persistence(event: &FileOpenEvent) -> Option<Alert>
 /// `net user <name> /delete` for triage. The SID (rather than a path) survives
 /// an attacker renaming the account before triage runs.
 #[must_use]
-pub fn check_account_creation_persistence(event: &FileOpenEvent) -> Option<Alert> {
+pub(crate) fn check_account_creation_persistence(event: &FileOpenEvent) -> Option<Alert> {
     if event.flags & FLAG_PERSISTENCE_ACCOUNT_ARTIFACT == 0 {
         return None;
     }

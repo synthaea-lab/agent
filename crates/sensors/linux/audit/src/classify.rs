@@ -1,7 +1,8 @@
 //! Classifies `AuditRecord` into semantic event types.
 
-use crate::parse::AuditRecord;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+use crate::parse::AuditRecord;
 
 #[derive(Debug)]
 pub enum AuditEvent {
@@ -52,13 +53,19 @@ fn classify_exec(record: &AuditRecord) -> Option<AuditEvent> {
     let image_path = argv.first()?.clone();
 
     // Extract process metadata (may not always be present)
-    let pid: u32 = record.fields.get("pid")
+    let pid: u32 = record
+        .fields
+        .get("pid")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let uid: u32 = record.fields.get("uid")
+    let uid: u32 = record
+        .fields
+        .get("uid")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let gid: u32 = record.fields.get("gid")
+    let gid: u32 = record
+        .fields
+        .get("gid")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
@@ -79,13 +86,19 @@ fn classify_connect(record: &AuditRecord) -> Option<AuditEvent> {
     let remote_addr = parse_sockaddr(saddr_hex)?;
 
     // Extract process metadata
-    let pid: u32 = record.fields.get("pid")
+    let pid: u32 = record
+        .fields
+        .get("pid")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let uid: u32 = record.fields.get("uid")
+    let uid: u32 = record
+        .fields
+        .get("uid")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let gid: u32 = record.fields.get("gid")
+    let gid: u32 = record
+        .fields
+        .get("gid")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
@@ -104,7 +117,9 @@ fn classify_connect(record: &AuditRecord) -> Option<AuditEvent> {
 /// Decodes audit field values (handles hex-encoded strings).
 fn decode_audit_value(value: &str) -> String {
     // If value looks like hex (even length, all hex chars), try to decode
-    if value.len().is_multiple_of(2) && value.chars().all(|c| c.is_ascii_hexdigit()) && value.len() > 2
+    if value.len().is_multiple_of(2)
+        && value.chars().all(|c| c.is_ascii_hexdigit())
+        && value.len() > 2
         && let Ok(bytes) = hex_decode(value)
         && let Ok(s) = String::from_utf8(bytes)
     {
@@ -188,7 +203,13 @@ mod tests {
 
         let event = classify(&record).unwrap();
         match event {
-            AuditEvent::Exec { pid, uid, gid, image_path, argv } => {
+            AuditEvent::Exec {
+                pid,
+                uid,
+                gid,
+                image_path,
+                argv,
+            } => {
                 assert_eq!(pid, 1234);
                 assert_eq!(uid, 1000);
                 assert_eq!(gid, 1000);

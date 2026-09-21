@@ -15,7 +15,7 @@
 /// and expected-parent verification (tracked as a dedicated issue). Writable
 /// subtrees of C:\Windows (Temp, Tasks, tracing) are explicitly untrusted.
 #[must_use]
-pub fn is_trusted_system_path(path: &str) -> bool {
+pub(crate) fn is_trusted_system_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     // Windows drive-letter grammar.
     if lower.as_bytes().get(1) == Some(&b':') {
@@ -64,7 +64,7 @@ pub fn name_exclusion_applies(image_path: Option<&str>) -> bool {
 /// Note: the `System` pseudo-process (pid=4) is the implicit parent of `smss.exe`
 /// at boot — represented here as `"system"`.
 #[must_use]
-pub fn expected_parents(comm: &str) -> &'static [&'static str] {
+pub(crate) fn expected_parents(comm: &str) -> &'static [&'static str] {
     let name = comm.rsplit('\\').next().unwrap_or(comm);
     match name.to_ascii_lowercase().as_str() {
         // Session Manager → spawned by System at boot only.

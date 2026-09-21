@@ -4,22 +4,27 @@
 //! **Status (Phase 6):** Full implementation with configuration - symbol resolution,
 //! uprobe attachment, ring buffer draining, normalization, and budget enforcement.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use aya::maps::RingBuf;
-use aya::programs::uprobe::UProbeScope;
-use aya::programs::UProbe;
-use aya::Ebpf;
-use log::{debug, info, warn};
+use aya::{
+    Ebpf,
+    maps::RingBuf,
+    programs::{UProbe, uprobe::UProbeScope},
+};
 use schema::sensor::{Capabilities, EventSink, Sensor, SensorError};
-use sensor_linux_wire::{ReadlineInputEvent, TlsCaptureEvent, TASK_COMM_LEN};
+use sensor_linux_wire::{ReadlineInputEvent, TASK_COMM_LEN, TlsCaptureEvent};
 use tokio::sync::Notify;
+use tracing::{debug, info, warn};
 
-use crate::config::UprobesConfig;
-use crate::normalize;
-use crate::symbol_resolver::{self, SymbolInfo};
+use crate::{
+    config::UprobesConfig,
+    normalize,
+    symbol_resolver::{self, SymbolInfo},
+};
 
 fn err(msg: String) -> SensorError {
     msg.into()
@@ -39,7 +44,7 @@ fn boot_epoch_offset_ns() -> u64 {
     // SAFETY: plain FFI call with a valid pointer to a stack-owned timespec
     let ret = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     if ret != 0 {
-        log::warn!("sensor-linux-uprobes: clock_gettime(CLOCK_MONOTONIC) failed");
+        warn!("sensor-linux-uprobes: clock_gettime(CLOCK_MONOTONIC) failed");
         return 0;
     }
     let monotonic_ns = (ts.tv_sec as u64)
@@ -160,7 +165,10 @@ fn load_ebpf() -> Result<Ebpf, SensorError> {
     // SAFETY: plain FFI call with a valid pointer to a stack-owned rlimit struct
     let ret = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) };
     if ret != 0 {
-        log::debug!("sensor-linux-uprobes: setrlimit(RLIMIT_MEMLOCK) failed: {ret}");
+        debug!(
+            ret,
+            "sensor-linux-uprobes: setrlimit(RLIMIT_MEMLOCK) failed"
+        );
     }
 
     // Load the eBPF object (built by sensor-linux-ebpf, shared with tracepoints)
@@ -218,13 +226,20 @@ fn attach_uprobe(
             .load()
             .map_err(|e| err(format!("kernel verifier rejected `{program_name}`: {e}")))?;
         loaded_programs.insert(program_name.to_string());
-        log::debug!("sensor-linux-uprobes: loaded program {program_name}");
+        debug!(
+            program = program_name,
+            "sensor-linux-uprobes: loaded program"
+        );
     }
 
     // Attach uprobe: point = offset, target = library path, scope = all processes
     // (can attach same program to multiple offsets)
     program
-        .attach(symbol.offset, &symbol.library_path, UProbeScope::AllProcesses)
+        .attach(
+            symbol.offset,
+            &symbol.library_path,
+            UProbeScope::AllProcesses,
+        )
         .map_err(|e| {
             err(format!(
                 "failed to attach uprobe `{program_name}` to {}:{} @ 0x{:x}: {e}",
@@ -234,13 +249,28 @@ fn attach_uprobe(
             ))
         })?;
 
-    log::info!(
-        "sensor-linux-uprobes: attached {program_name} to {}:{} @ 0x{:x}",
-        symbol.library_path.display(),
-        symbol.name,
-        symbol.offset
+    info!(
+        program = program_name,
+        library = %symbol.library_path.display(),
+        symbol = %symbol.name,
+        offset = format_args!("0x{:x}", symbol.offset),
+        "sensor-linux-uprobes: attached uprobe"
     );
     Ok(())
+}
+
+/// Reads one `repr(C)` wire struct out of a ring-buffer item, or `None` when the
+/// item is too short. Kept as a named function rather than inline in the drain
+/// macros: `undocumented_unsafe_blocks` cannot associate a `// SAFETY:` comment
+/// with an unsafe block through a macro expansion, and this is the only raw read
+/// the drains need.
+fn read_wire_event<T: Copy>(item: &[u8]) -> Option<T> {
+    if item.len() < core::mem::size_of::<T>() {
+        return None;
+    }
+    // SAFETY: length checked above; T is a repr(C) POD wire struct (Copy, no
+    // padding invariants) and read_unaligned handles arbitrary alignment.
+    Some(unsafe { core::ptr::read_unaligned(item.as_ptr().cast::<T>()) })
 }
 
 /// Drains TLS capture events from the ring buffer and emits normalized schema events.
@@ -250,20 +280,14 @@ macro_rules! drain_tls {
         let mut guard = $guard.map_err(|e| err(format!("TLS ring buffer poll failed: {e}")))?;
         let rb = guard.get_inner_mut();
         while let Some(item) = rb.next() {
-            if item.len() >= core::mem::size_of::<TlsCaptureEvent>() {
-                // SAFETY: item.len() >= size_of::<TlsCaptureEvent>() checked above;
-                // TlsCaptureEvent is repr(C) POD; read_unaligned handles arbitrary alignment
-                let event = unsafe {
-                    core::ptr::read_unaligned(item.as_ptr() as *const TlsCaptureEvent)
-                };
-
+            if let Some(event) = read_wire_event::<TlsCaptureEvent>(&item) {
                 // Allowlist check: if allowlist is non-empty, only allow listed processes
                 if !$config.tls.process_allowlist.is_empty() {
                     let comm = comm_str(&event.meta.comm);
                     if !$config.tls.process_allowlist.contains(&comm) {
                         debug!(
-                            "sensor-linux-uprobes: TLS capture dropped (allowlist): pid={} comm={}",
-                            event.meta.pid, comm
+                            pid = event.meta.pid,
+                            comm, "sensor-linux-uprobes: TLS capture dropped (allowlist)"
                         );
                         $dropped += 1;
                         continue;
@@ -273,8 +297,9 @@ macro_rules! drain_tls {
                 // Budget enforcement: check if pid hasn't exceeded bytes/sec budget
                 if !$budget.check_and_record(event.meta.pid, event.bytes_len) {
                     debug!(
-                        "sensor-linux-uprobes: TLS capture dropped (budget): pid={} bytes={}",
-                        event.meta.pid, event.bytes_len
+                        pid = event.meta.pid,
+                        bytes = event.bytes_len,
+                        "sensor-linux-uprobes: TLS capture dropped (budget)"
                     );
                     $dropped += 1;
                     continue;
@@ -300,24 +325,18 @@ fn comm_str(comm: &[u8; TASK_COMM_LEN]) -> String {
 /// Applies budget enforcement and allowlist filtering.
 macro_rules! drain_readline {
     ($guard:expr, $sink:expr, $offset:expr, $config:expr, $budget:expr, $dropped:expr) => {{
-        let mut guard = $guard
-            .map_err(|e| err(format!("readline ring buffer poll failed: {e}")))?;
+        let mut guard =
+            $guard.map_err(|e| err(format!("readline ring buffer poll failed: {e}")))?;
         let rb = guard.get_inner_mut();
         while let Some(item) = rb.next() {
-            if item.len() >= core::mem::size_of::<ReadlineInputEvent>() {
-                // SAFETY: item.len() >= size_of::<ReadlineInputEvent>() checked above;
-                // ReadlineInputEvent is repr(C) POD; read_unaligned handles arbitrary alignment
-                let event = unsafe {
-                    core::ptr::read_unaligned(item.as_ptr() as *const ReadlineInputEvent)
-                };
-
+            if let Some(event) = read_wire_event::<ReadlineInputEvent>(&item) {
                 // Allowlist check: if allowlist is non-empty, only allow listed shells
                 if !$config.readline.process_allowlist.is_empty() {
                     let comm = comm_str(&event.meta.comm);
                     if !$config.readline.process_allowlist.contains(&comm) {
                         debug!(
-                            "sensor-linux-uprobes: readline dropped (allowlist): pid={} comm={}",
-                            event.meta.pid, comm
+                            pid = event.meta.pid,
+                            comm, "sensor-linux-uprobes: readline dropped (allowlist)"
                         );
                         $dropped += 1;
                         continue;
@@ -327,8 +346,8 @@ macro_rules! drain_readline {
                 // Budget enforcement: check if pid hasn't exceeded commands/sec budget
                 if !$budget.check_and_record(event.meta.pid) {
                     debug!(
-                        "sensor-linux-uprobes: readline dropped (budget): pid={}",
-                        event.meta.pid
+                        pid = event.meta.pid,
+                        "sensor-linux-uprobes: readline dropped (budget)"
                     );
                     $dropped += 1;
                     continue;
@@ -395,7 +414,7 @@ impl UprobesSensor {
         // Initialize eBPF logger
         match aya_log::EbpfLogger::init(&mut ebpf) {
             Err(e) => {
-                warn!("sensor-linux-uprobes: failed to initialize eBPF logger: {e}");
+                warn!(error = %e, "sensor-linux-uprobes: failed to initialize eBPF logger");
             }
             Ok(logger) => {
                 let mut logger =
@@ -403,7 +422,16 @@ impl UprobesSensor {
                         .map_err(|e| err(format!("eBPF logger fd: {e}")))?;
                 tokio::task::spawn(async move {
                     loop {
-                        let mut guard = logger.readable_mut().await.unwrap();
+                        // No unwrap: nothing holds this task's JoinHandle, so a
+                        // panic here would be swallowed silently. An fd error
+                        // means the logger fd is gone — stop draining, loudly.
+                        let mut guard = match logger.readable_mut().await {
+                            Ok(guard) => guard,
+                            Err(e) => {
+                                warn!(error = %e, "eBPF log drain stopped");
+                                break;
+                            }
+                        };
                         guard.get_inner_mut().flush();
                         guard.clear_ready();
                     }
@@ -422,10 +450,15 @@ impl UprobesSensor {
 
             for symbol in &tls_symbols {
                 // Skip libraries in denylist
-                if self.config.tls.library_denylist.contains(&symbol.library_path) {
+                if self
+                    .config
+                    .tls
+                    .library_denylist
+                    .contains(&symbol.library_path)
+                {
                     info!(
-                        "sensor-linux-uprobes: skipping denylisted library: {}",
-                        symbol.library_path.display()
+                        library = %symbol.library_path.display(),
+                        "sensor-linux-uprobes: skipping denylisted library"
                     );
                     continue;
                 }
@@ -438,15 +471,18 @@ impl UprobesSensor {
                         symbol_resolver::LibraryType::GnuTLS => "ssl_write_gnutls",
                         symbol_resolver::LibraryType::Unknown => "ssl_write_openssl", // Default to OpenSSL
                     };
-                    if let Err(e) = attach_uprobe(&mut ebpf, probe_name, symbol, &mut loaded_programs) {
-                        warn!("sensor-linux-uprobes: failed to attach {probe_name}: {e}");
+                    if let Err(e) =
+                        attach_uprobe(&mut ebpf, probe_name, symbol, &mut loaded_programs)
+                    {
+                        warn!(probe = probe_name, error = %e, "sensor-linux-uprobes: failed to attach uprobe");
                     }
                 }
                 // GnuTLS uses gnutls_record_send instead of SSL_write
                 if symbol.name == "gnutls_record_send"
-                    && let Err(e) = attach_uprobe(&mut ebpf, "ssl_write_gnutls", symbol, &mut loaded_programs)
+                    && let Err(e) =
+                        attach_uprobe(&mut ebpf, "ssl_write_gnutls", symbol, &mut loaded_programs)
                 {
-                    warn!("sensor-linux-uprobes: failed to attach ssl_write_gnutls: {e}");
+                    warn!(probe = "ssl_write_gnutls", error = %e, "sensor-linux-uprobes: failed to attach uprobe");
                 }
                 // Attach ssl_read_entry to SSL_read/SSL_read_ex (per-library probe function)
                 if symbol.name == "SSL_read" || symbol.name == "SSL_read_ex" {
@@ -456,15 +492,22 @@ impl UprobesSensor {
                         symbol_resolver::LibraryType::GnuTLS => "ssl_read_entry_gnutls",
                         symbol_resolver::LibraryType::Unknown => "ssl_read_entry_openssl", // Default
                     };
-                    if let Err(e) = attach_uprobe(&mut ebpf, probe_name, symbol, &mut loaded_programs) {
-                        warn!("sensor-linux-uprobes: failed to attach {probe_name}: {e}");
+                    if let Err(e) =
+                        attach_uprobe(&mut ebpf, probe_name, symbol, &mut loaded_programs)
+                    {
+                        warn!(probe = probe_name, error = %e, "sensor-linux-uprobes: failed to attach uprobe");
                     }
                 }
                 // GnuTLS uses gnutls_record_recv instead of SSL_read
                 if symbol.name == "gnutls_record_recv"
-                    && let Err(e) = attach_uprobe(&mut ebpf, "ssl_read_entry_gnutls", symbol, &mut loaded_programs)
+                    && let Err(e) = attach_uprobe(
+                        &mut ebpf,
+                        "ssl_read_entry_gnutls",
+                        symbol,
+                        &mut loaded_programs,
+                    )
                 {
-                    warn!("sensor-linux-uprobes: failed to attach ssl_read_entry_gnutls: {e}");
+                    warn!(probe = "ssl_read_entry_gnutls", error = %e, "sensor-linux-uprobes: failed to attach uprobe");
                 }
                 // Also attach the uretprobe (ssl_read_exit_*) - per-library function
                 if symbol.name == "SSL_read" || symbol.name == "SSL_read_ex" {
@@ -474,15 +517,22 @@ impl UprobesSensor {
                         symbol_resolver::LibraryType::GnuTLS => "ssl_read_exit_gnutls",
                         symbol_resolver::LibraryType::Unknown => "ssl_read_exit_openssl", // Default
                     };
-                    if let Err(e) = attach_uprobe(&mut ebpf, probe_name, symbol, &mut loaded_programs) {
-                        warn!("sensor-linux-uprobes: failed to attach {probe_name}: {e}");
+                    if let Err(e) =
+                        attach_uprobe(&mut ebpf, probe_name, symbol, &mut loaded_programs)
+                    {
+                        warn!(probe = probe_name, error = %e, "sensor-linux-uprobes: failed to attach uprobe");
                     }
                 }
                 // GnuTLS uretprobe for gnutls_record_recv
                 if symbol.name == "gnutls_record_recv"
-                    && let Err(e) = attach_uprobe(&mut ebpf, "ssl_read_exit_gnutls", symbol, &mut loaded_programs)
+                    && let Err(e) = attach_uprobe(
+                        &mut ebpf,
+                        "ssl_read_exit_gnutls",
+                        symbol,
+                        &mut loaded_programs,
+                    )
                 {
-                    warn!("sensor-linux-uprobes: failed to attach ssl_read_exit_gnutls: {e}");
+                    warn!(probe = "ssl_read_exit_gnutls", error = %e, "sensor-linux-uprobes: failed to attach uprobe");
                 }
             }
         } else {
@@ -497,9 +547,10 @@ impl UprobesSensor {
 
             for symbol in &readline_symbols {
                 if symbol.name == "readline"
-                    && let Err(e) = attach_uprobe(&mut ebpf, "readline_exit", symbol, &mut loaded_programs)
+                    && let Err(e) =
+                        attach_uprobe(&mut ebpf, "readline_exit", symbol, &mut loaded_programs)
                 {
-                    warn!("sensor-linux-uprobes: failed to attach readline_exit: {e}");
+                    warn!(probe = "readline_exit", error = %e, "sensor-linux-uprobes: failed to attach uprobe");
                 }
             }
         } else {
@@ -561,14 +612,14 @@ impl UprobesSensor {
         // Log budget enforcement statistics
         if tls_dropped > 0 {
             info!(
-                "sensor-linux-uprobes: TLS captures dropped (budget/allowlist): {}",
-                tls_dropped
+                dropped = tls_dropped,
+                "sensor-linux-uprobes: TLS captures dropped (budget/allowlist)"
             );
         }
         if readline_dropped > 0 {
             info!(
-                "sensor-linux-uprobes: readline captures dropped (budget/allowlist): {}",
-                readline_dropped
+                dropped = readline_dropped,
+                "sensor-linux-uprobes: readline captures dropped (budget/allowlist)"
             );
         }
 
@@ -588,9 +639,9 @@ impl Sensor for UprobesSensor {
             exec_events: false,
             file_events: false,
             connect_events: false,
-            auth_events: false,      // No authentication events
-            user_attribution: true,  // EventMeta includes uid/gid
-            parent_lineage: true,    // EventMeta includes ppid/parent_comm
+            auth_events: false,     // No authentication events
+            user_attribution: true, // EventMeta includes uid/gid
+            parent_lineage: true,   // EventMeta includes ppid/parent_comm
         }
     }
 

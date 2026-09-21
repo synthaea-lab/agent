@@ -108,12 +108,23 @@ missing_errors_doc = "warn"
 missing_panics_doc = "warn"
 semicolon_if_nothing_returned = "warn"
 
+[workspace.lints.rustdoc]
+# The doc style here deliberately cross-references private modules and items
+# (`see [`wire`]`, error-enum links from public fns) — every crate is
+# unpublished (publish = false) and the rustdoc audience is workspace
+# developers, who can build with --document-private-items. The public-view
+# docs job (RUSTDOCFLAGS=-D warnings) would otherwise reject every such link.
+# broken_intra_doc_links stays enforced: a link to something that exists
+# nowhere is a typo, not a style choice.
+private_intra_doc_links = "allow"
+
 [workspace.dependencies]
 # Shared dependency versions are declared here as crates gain real code.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # ONNX Runtime for on-device inference (ADR-0002). Pinned RC — ort 2.0 is the first
 # line to support the ai.onnx.ml tree ops our models use; used only by `crates/ml`.
 ort = "=2.0.0-rc.13"

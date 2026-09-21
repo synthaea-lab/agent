@@ -9,6 +9,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Neutral event-literal baselines for other crates' tests (src/fixtures.rs).
+# Enabled only from dev-dependencies — never in a shipping build.
+test-fixtures = []
+
 [dependencies]
 serde = { workspace = true }
 

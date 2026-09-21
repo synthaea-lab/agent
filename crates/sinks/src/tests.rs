@@ -15,15 +15,10 @@ fn exec_event(comm: &str, cmdline: &str) -> Event {
             user: User::Unix { uid: 0, gid: 0 },
             timestamp_ns: 42,
             comm: comm.to_string(),
-            container: None,
+            ..schema::fixtures::meta()
         },
-        image_path: String::new(),
         cmdline: cmdline.to_string(),
-        argv: vec![],
-        parent_comm: None,
-        parent_image_path: None,
-        sha256: None,
-        signature: None,
+        ..schema::fixtures::exec()
     })
 }
 

@@ -96,9 +96,11 @@
 //!
 //! ## Configurable allowlist and volume counters (#94)
 //!
-//! [`EventLogConfig`] toggles each of the four poll targets above
+// Plain code spans, not intra-doc links, for the three items below: they are
+// Windows-gated, so links to them would break the Linux docs build CI runs.
+//! `EventLogConfig` toggles each of the four poll targets above
 //! independently (a disabled one is never even queried), and
-//! [`EventLogCounters`] (via [`EventLogSensor::counters`]) exposes a live count
+//! `EventLogCounters` (via `EventLogSensor::counters`) exposes a live count
 //! of events actually normalized per target. This crate cannot depend on
 //! `policy` (`sensor-*` crates depend only on `schema` —
 //! `tools/check-deps.py`), so `EventLogConfig` is this crate's own type; the

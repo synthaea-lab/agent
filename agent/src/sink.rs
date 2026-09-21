@@ -4,9 +4,13 @@
 //! scorer plug in here as their crates are migrated (M2), each addition a new field
 //! and a few lines in `on_event`.
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use policy::ResponsePolicy;
 use schema::{Event, sensor::EventSink};
@@ -155,7 +159,9 @@ impl DetectionSink {
                 format!("killed pid {pid} on a high-confidence correlated verdict")
             }
             response::KillOutcome::ObserveOnly { pid } => {
-                format!("pid {pid} would have been killed on a high-confidence correlated verdict (observe-only)")
+                format!(
+                    "pid {pid} would have been killed on a high-confidence correlated verdict (observe-only)"
+                )
             }
             response::KillOutcome::Failed { pid, error } => {
                 format!("failed to kill pid {pid} on a high-confidence correlated verdict: {error}")
@@ -231,7 +237,7 @@ impl DetectionSink {
         // terminal noise.
         eprintln!("\x1b[1;31m[ALERT] {technique} — {message}\x1b[0m");
         self.alert_log.write(&AlertRecord {
-            timestamp_ns: crate::time::now_ns(),
+            timestamp_ns: schema::time::now_ns(),
             technique: technique.to_string(),
             message: message.to_string(),
         });
@@ -261,11 +267,11 @@ fn load_sigma_rules() -> Option<sigma::SigmaEngine> {
     let rules_dir = content_dir("rules/sigma")?;
     match sigma::SigmaEngine::load_dir(&rules_dir) {
         Ok(engine) => {
-            log::info!("sigma: {} rules loaded", engine.rule_count());
+            tracing::info!(rules = engine.rule_count(), "sigma: rules loaded");
             Some(engine)
         }
         Err(e) => {
-            log::error!("sigma: load error: {e}");
+            tracing::error!(error = %e, "sigma: load error");
             None
         }
     }
@@ -282,14 +288,14 @@ fn start_yara(
     let dir = content_dir("rules/yara")?;
     match yara::RuleSet::load_dir(&dir) {
         Ok(rules) => {
-            log::info!("yara: {} rules loaded", rules.rule_count());
+            tracing::info!(rules = rules.rule_count(), "yara: rules loaded");
             Some(yara::ScanQueue::start(rules, move |outcome| {
                 let matched = !outcome.matches.is_empty();
                 for rule in &outcome.matches {
                     let message = format!("yara rule {rule} matched {}", outcome.path.display());
                     eprintln!("\x1b[1;31m[ALERT] YARA — {message}\x1b[0m");
                     alert_log.write(&AlertRecord {
-                        timestamp_ns: crate::time::now_ns(),
+                        timestamp_ns: schema::time::now_ns(),
                         technique: "YARA".to_string(),
                         message,
                     });
@@ -300,7 +306,7 @@ fn start_yara(
             }))
         }
         Err(e) => {
-            log::error!("yara: load error: {e}");
+            tracing::error!(error = %e, "yara: load error");
             None
         }
     }
@@ -342,12 +348,15 @@ fn quarantine_matched_payload(
             path.display()
         ),
         response::QuarantineOutcome::Failed { path, error } => {
-            format!("failed to quarantine {} on a confirmed YARA match: {error}", path.display())
+            format!(
+                "failed to quarantine {} on a confirmed YARA match: {error}",
+                path.display()
+            )
         }
     };
     eprintln!("\x1b[1;31m[ALERT] RESPONSE-QUARANTINE — {message}\x1b[0m");
     alert_log.write(&AlertRecord {
-        timestamp_ns: crate::time::now_ns(),
+        timestamp_ns: schema::time::now_ns(),
         technique: "RESPONSE-QUARANTINE".to_string(),
         message,
     });

@@ -11,9 +11,11 @@
 //! plain `std::fs` — no `#[cfg(target_os = ...)]` needed (contrast [`crate::kill`],
 //! which does need one, injected by the caller instead of living in this crate).
 
-use std::fmt::Write as _;
-use std::io::Read as _;
-use std::path::{Path, PathBuf};
+use std::{
+    fmt::Write as _,
+    io::Read as _,
+    path::{Path, PathBuf},
+};
 
 use policy::ResponsePolicy;
 
@@ -43,7 +45,11 @@ pub enum QuarantineOutcome {
 /// [`QuarantineOutcome::Failed`] for the same reason [`crate::kill::kill_process`]
 /// reports rather than propagates.
 #[must_use]
-pub fn quarantine_file(path: &Path, quarantine_dir: &Path, policy: &ResponsePolicy) -> QuarantineOutcome {
+pub fn quarantine_file(
+    path: &Path,
+    quarantine_dir: &Path,
+    policy: &ResponsePolicy,
+) -> QuarantineOutcome {
     if !policy.quarantine_enabled {
         return QuarantineOutcome::ObserveOnly {
             path: path.to_path_buf(),
@@ -172,7 +178,12 @@ mod tests {
 
         let outcome = quarantine_file(&payload, &dir.join("quarantine"), &policy);
 
-        assert_eq!(outcome, QuarantineOutcome::ObserveOnly { path: payload.clone() });
+        assert_eq!(
+            outcome,
+            QuarantineOutcome::ObserveOnly {
+                path: payload.clone()
+            }
+        );
         assert!(payload.exists(), "observe-only must not touch the file");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -202,16 +213,25 @@ mod tests {
             other => panic!("expected Quarantined, got {other:?}"),
         };
 
-        assert!(!payload.exists(), "the original path must be empty after quarantine");
+        assert!(
+            !payload.exists(),
+            "the original path must be empty after quarantine"
+        );
         assert!(quarantined_at.exists());
         assert!(
-            std::fs::metadata(&quarantined_at).unwrap().permissions().readonly(),
+            std::fs::metadata(&quarantined_at)
+                .unwrap()
+                .permissions()
+                .readonly(),
             "a quarantined file must be read-only"
         );
 
         let restored = unquarantine(&quarantine_dir, &sha256_hex).unwrap();
         assert_eq!(restored, payload);
-        assert!(payload.exists(), "unquarantine must restore the original file");
+        assert!(
+            payload.exists(),
+            "unquarantine must restore the original file"
+        );
         assert_eq!(std::fs::read(&payload).unwrap(), b"not actually malware");
         assert!(
             !quarantine_dir.join(format!("{sha256_hex}.origin")).exists(),
@@ -229,7 +249,11 @@ mod tests {
             quarantine_enabled: true,
         };
 
-        let outcome = quarantine_file(&dir.join("does-not-exist"), &dir.join("quarantine"), &policy);
+        let outcome = quarantine_file(
+            &dir.join("does-not-exist"),
+            &dir.join("quarantine"),
+            &policy,
+        );
 
         assert!(matches!(outcome, QuarantineOutcome::Failed { .. }));
 

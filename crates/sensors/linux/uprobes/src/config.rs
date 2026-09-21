@@ -4,8 +4,7 @@
 //! and libraries are allowed to be monitored, what rate limits apply, and what
 //! compliance requirements are enforced (GDPR, HIPAA, PCI-DSS).
 
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 use thiserror::Error;
 
