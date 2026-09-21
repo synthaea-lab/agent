@@ -237,7 +237,7 @@ impl DetectionSink {
         // terminal noise.
         eprintln!("\x1b[1;31m[ALERT] {technique} — {message}\x1b[0m");
         self.alert_log.write(&AlertRecord {
-            timestamp_ns: crate::time::now_ns(),
+            timestamp_ns: schema::time::now_ns(),
             technique: technique.to_string(),
             message: message.to_string(),
         });
@@ -295,7 +295,7 @@ fn start_yara(
                     let message = format!("yara rule {rule} matched {}", outcome.path.display());
                     eprintln!("\x1b[1;31m[ALERT] YARA — {message}\x1b[0m");
                     alert_log.write(&AlertRecord {
-                        timestamp_ns: crate::time::now_ns(),
+                        timestamp_ns: schema::time::now_ns(),
                         technique: "YARA".to_string(),
                         message,
                     });
@@ -356,7 +356,7 @@ fn quarantine_matched_payload(
     };
     eprintln!("\x1b[1;31m[ALERT] RESPONSE-QUARANTINE — {message}\x1b[0m");
     alert_log.write(&AlertRecord {
-        timestamp_ns: crate::time::now_ns(),
+        timestamp_ns: schema::time::now_ns(),
         technique: "RESPONSE-QUARANTINE".to_string(),
         message,
     });

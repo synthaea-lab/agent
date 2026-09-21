@@ -119,7 +119,7 @@ fn report_kill_attempt(alerts_path: &Path, signo: i32, sender_pid: i32) {
         ),
     };
     eprintln!("\x1b[1;31m[ALERT] T1562 — {message}\x1b[0m");
-    let now_ns = crate::time::now_ns();
+    let now_ns = schema::time::now_ns();
     let line = format!(
         "{{\"timestamp_ns\":{now_ns},\"technique\":\"T1562\",\"message\":\"{}\"}}\n",
         escape_json_string(&message)

@@ -84,7 +84,7 @@ pub(crate) fn spawn_monitor(monitor: Arc<Mutex<SilenceMonitor>>, sink: Arc<Detec
         .spawn(move || {
             loop {
                 std::thread::sleep(POLL_INTERVAL);
-                let verdicts = monitor.lock().unwrap().poll(crate::time::now_ns());
+                let verdicts = monitor.lock().unwrap().poll(schema::time::now_ns());
                 for verdict in verdicts {
                     sink.emit("T1562", &verdict.message());
                 }

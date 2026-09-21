@@ -248,7 +248,7 @@ pub(crate) fn cmd_run(
     let journal_heartbeat = SensorHeartbeat::new("linux-journal");
     let silence_monitor = Arc::new(Mutex::new(SilenceMonitor::new()));
     {
-        let now_ns = crate::time::now_ns();
+        let now_ns = schema::time::now_ns();
         let mut mon = silence_monitor.lock().unwrap();
         mon.register(
             primary_heartbeat.clone(),
@@ -336,7 +336,7 @@ fn spawn_netlink_poller(sink: Arc<DetectionSink>, heartbeat: SensorHeartbeat) {
             let mut listen_warned = false;
             let mut conntrack_warned = false;
             loop {
-                let ts = crate::time::now_ns();
+                let ts = schema::time::now_ns();
                 forward_netlink_events(
                     sensor_linux_netlink::listen_port_events(ts),
                     &sink,

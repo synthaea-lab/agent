@@ -54,6 +54,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod detection;
 pub mod sensor;
+pub mod time;
 
 /// Version of the serialized event model. Bumped on any serialization-visible change,
 /// together with a new golden-fixture directory (see crate docs).

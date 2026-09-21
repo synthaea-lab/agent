@@ -18,6 +18,7 @@ use schema::{
     AuthEvent, AuthKind, AuthOutcome, Event, EventMeta, FLAG_PERSISTENCE_ACCOUNT_ARTIFACT,
     FLAG_PERSISTENCE_ARTIFACT, FLAG_PERSISTENCE_TASK_ARTIFACT, FileOpenEvent, User,
     sensor::{Capabilities, EventSink, Sensor, SensorError},
+    time::now_ns,
 };
 
 use crate::xml::{self, AccountCreatedEvent, LogonEvent, ScheduledTaskEvent, ServiceInstallEvent};
@@ -72,13 +73,6 @@ fn wevtutil(args: &[&str]) -> String {
             String::new()
         }
     }
-}
-
-fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 // ── Event 7045 — service install (T1543.003) ─────────────────────────────────
@@ -281,7 +275,7 @@ fn enable_logon_audit() {
             .output();
         match output {
             Ok(o) if o.status.success() => {
-                tracing::info!(audit = label, "audit subcategory enabled")
+                tracing::info!(audit = label, "audit subcategory enabled");
             }
             Ok(o) => tracing::warn!(
                 audit = label,

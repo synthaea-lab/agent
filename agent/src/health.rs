@@ -169,7 +169,7 @@ impl HealthCollector {
 
     fn collect(&self) -> HealthBeacon {
         HealthBeacon {
-            timestamp_ns: crate::time::now_ns(),
+            timestamp_ns: schema::time::now_ns(),
             agent_version: self.config.agent_version.clone(),
             sensors: self.sensors.sensor_health(),
             spool_bytes: self.spool.spool_bytes(),
