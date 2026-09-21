@@ -4,23 +4,25 @@ On-device ML inference using ONNX Runtime with feature extraction from event str
 
 ## ONNX Runtime Linking
 
-Per **ADR-0002 decision #2**, onnxruntime is statically linked into the agent binary for:
+Per **ADR-0002 decision #2**, onnxruntime is statically linked into the agent binary for production:
 - Single-binary deployment (no runtime .so/.dll dependencies)
 - Updater integrity guarantees
 - Root/SYSTEM execution security posture
 
-### Default Build (Dynamic Linking - Development)
+### Development Builds (Dynamic Linking - Default)
 
-For development builds, the `ort` crate can use dynamic libraries if explicitly enabled:
+By default, the ml crate uses the `dynamic-onnx` feature which downloads prebuilt ONNX Runtime libraries:
 
 ```bash
-# Not recommended - violates ADR-0002
-cargo build -p ml --features ort/download-binaries
+# Standard dev workflow - downloads onnxruntime automatically
+cargo build -p ml
+cargo test -p ml
+cargo test --workspace --exclude sensor-linux-ebpf
 ```
 
-**Note:** The workspace `ort` dependency has `default-features = false`, so dynamic linking must be explicitly opted into. Do not commit changes that re-enable `download-binaries` or `copy-dylibs`.
+This allows fast iteration without manual onnxruntime builds. The `dynamic-onnx` feature is **enabled by default** for dev convenience.
 
-### Static Linking (Production - Required)
+### Production Builds (Static Linking - Required)
 
 **Issue:** #110 tracks full integration. Current status: **Manual setup required**
 
@@ -36,12 +38,15 @@ export ORT_LIB_LOCATION="$PWD/onnxruntime/build/Linux/Release"
 # 3. Generate static link flags
 eval "$(./lab/provisioning/ort-static-link-flags.sh)"
 
-# 4. Build and test
-cargo test -p ml --release
+# 4. Build with static linking (disables dynamic-onnx default feature)
+cargo build -p ml --release --no-default-features
+cargo test -p ml --release --no-default-features
 
 # 5. Verify no runtime dependencies
 ldd target/release/deps/ml-* | grep -i onnx  # Should return nothing
 ```
+
+**Note:** The `--no-default-features` flag disables the `dynamic-onnx` feature, forcing static linking.
 
 #### Detailed Documentation
 
