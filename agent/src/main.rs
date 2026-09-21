@@ -18,6 +18,12 @@ mod enrich_queue;
 mod health;
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 mod heartbeat;
+// Linux-only: the module itself calls raw POSIX signal APIs
+// (sigemptyset/pthread_sigmask/sigwaitinfo) that don't exist in the `libc` crate on
+// Windows, and `agent/Cargo.toml` only pulls `libc` in under
+// `cfg(target_os = "linux")` — unlike `heartbeat`/`sink` above, there's no
+// cross-platform body here to keep alive with an `allow(dead_code)`.
+#[cfg(target_os = "linux")]
 mod kill_loudness;
 mod protected;
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
