@@ -23,8 +23,11 @@ use crate::error::ConfigError;
 ///
 /// Deserialized from a string literal in the TOML file: `envvar:SYNTHAEA_TOKEN`
 /// or `file:/etc/synthaea/certs/mtls.key.pass`. A literal that starts with
-/// neither prefix is rejected at deserialization time via
-/// [`ConfigError::SecretInvalid`].
+/// neither prefix (a bare cleartext value such as `hunter2`) deserializes into
+/// the transient [`SecretRef::Invalid`] variant and is rejected during the
+/// post-parse validation pass with [`ConfigError::SecretInvalid`] — which is
+/// where the offending value gets its field-path context, something a serde
+/// `Deserialize` impl cannot carry on its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecretRef {
     /// Resolved from the process's environment (`std::env::var(name)`).
@@ -36,6 +39,15 @@ pub enum SecretRef {
     /// Windows. The file's contents (trimmed of trailing whitespace) are the
     /// secret value.
     File(PathBuf),
+    /// Transient variant: the raw string in the config file did not match any
+    /// supported provider prefix. Never observed by end callers of
+    /// [`crate::load`] — [`crate::load::validate_semantics`] converts every
+    /// occurrence into [`ConfigError::SecretInvalid`] before returning. Kept
+    /// public within the crate (not `#[doc(hidden)]`) so downstream code that
+    /// pattern-matches on `SecretRef` is forced to handle it exhaustively, but
+    /// callers should treat it as unreachable in released builds — a valid
+    /// [`crate::AgentConfig`] never contains this variant.
+    Invalid(String),
 }
 
 impl SecretRef {
@@ -72,8 +84,21 @@ impl SecretRef {
     ///
     /// Returns [`ConfigError::SecretResolve`] when the referenced source is
     /// missing, empty, or unreadable.
+    ///
+    /// # Panics
+    ///
+    /// Panics on [`SecretRef::Invalid`]. The invariant is that
+    /// [`crate::load::validate_semantics`] rejects any config carrying that
+    /// variant before returning to the caller — reaching this arm means the
+    /// crate's own validation was bypassed, and no cleartext value can be
+    /// produced from the raw literal in any case. Callers that construct a
+    /// `SecretRef` by hand (tests, mocks) must not use `Invalid`.
     pub fn resolve(&self, field: &str) -> Result<String, ConfigError> {
         match self {
+            SecretRef::Invalid(raw) => panic!(
+                "SecretRef::resolve called on Invalid variant (field={field}, raw={raw:?}) — \
+                 validate_semantics should have rejected this before resolve"
+            ),
             SecretRef::EnvVar(name) => {
                 let value = std::env::var(name).map_err(|_| ConfigError::SecretResolve {
                     field: field.to_string(),
@@ -109,21 +134,22 @@ impl SecretRef {
     }
 }
 
-// serde support: deserialize a SecretRef from a TOML string, rejecting any
-// literal that isn't one of the supported provider prefixes. The rejection
-// path here surfaces as a `toml::de::Error` at parse time, which the caller
-// converts into `ConfigError::SecretInvalid` with the right field/source
-// context in `load::validate`. Kept in this module (rather than a bespoke
-// visitor in load.rs) so the format and its parser stay side by side.
+// serde support: deserialize a SecretRef from a TOML string. Deliberately
+// infallible at this layer — an unrecognized prefix produces the transient
+// `Invalid` variant instead of a serde error. The reason is that
+// `serde::de::Error` cannot carry the field-path context needed for a useful
+// operator message: it only knows "this string was not a valid SecretRef",
+// not "the field at `server.mtls_passphrase` was not a valid SecretRef".
+// `load::validate_semantics` walks the deserialized `AgentConfig`, sees the
+// `Invalid` variant, and constructs `ConfigError::SecretInvalid` with the
+// full field-path, matching the "precise errors" contract of ADR-0013 §8.
+// This fixes the `SecretInvalid`-was-dead-code defect from PR #278 (issue
+// #281): before this change, a malformed secret would surface as the generic
+// `ConfigError::Parse`, hiding the specific message that documents the fix.
 impl<'de> Deserialize<'de> for SecretRef {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(deserializer)?;
-        SecretRef::parse(&raw).map_err(|bad| {
-            serde::de::Error::custom(format!(
-                "invalid secret reference `{bad}` (expected `envvar:NAME` or \
-                 `file:/absolute/path`)"
-            ))
-        })
+        Ok(SecretRef::parse(&raw).unwrap_or(SecretRef::Invalid(raw)))
     }
 }
 
@@ -179,14 +205,29 @@ mod tests {
     }
 
     #[test]
-    fn serde_rejects_bare_literal() {
+    fn serde_maps_bare_literal_to_invalid_variant() {
+        // The Deserialize impl is deliberately infallible: a malformed literal
+        // deserializes into the transient `Invalid` variant, which
+        // `load::validate_semantics` then converts to
+        // `ConfigError::SecretInvalid` with the full field-path — see the
+        // comment above the `Deserialize` impl and issue #281.
         #[derive(Deserialize)]
         struct Holder {
-            #[allow(dead_code)]
             token: SecretRef,
         }
         let doc = r#"token = "hunter2""#;
-        assert!(toml::from_str::<Holder>(doc).is_err());
+        let h: Holder = toml::from_str(doc).expect("deserialize is now infallible");
+        assert_eq!(h.token, SecretRef::Invalid("hunter2".to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "SecretRef::resolve called on Invalid variant")]
+    fn resolve_on_invalid_panics_by_contract() {
+        // Documents the invariant: reaching `resolve` on `Invalid` means
+        // validation was bypassed. A test-only construction and direct
+        // resolve call is the only way to reach the panic in practice.
+        let r = SecretRef::Invalid("hunter2".to_string());
+        let _ = r.resolve("server.token");
     }
 
     #[test]

@@ -119,6 +119,19 @@ struct SchemaProbe {
 fn validate_semantics(cfg: &AgentConfig, source_path: &Path) -> Result<(), ConfigError> {
     let src = source_path.display().to_string();
 
+    // Secret fields — reject `SecretRef::Invalid` (a bare literal in the TOML
+    // that didn't match any provider prefix). Deserialize is deliberately
+    // infallible on secrets so the field-path context can be produced here;
+    // see `SecretRef`'s docs and the module-level comment above its
+    // `Deserialize` impl. Fixes the dead-code defect from issue #281.
+    if let crate::secret::SecretRef::Invalid(raw) = &cfg.server.mtls_passphrase {
+        return Err(ConfigError::SecretInvalid {
+            field: "server.mtls_passphrase".into(),
+            value: raw.clone(),
+            origin: src.clone(),
+        });
+    }
+
     // server.control_plane_url — non-empty https://…
     if !cfg.server.control_plane_url.starts_with("https://") {
         return Err(ConfigError::Invalid {
@@ -512,18 +525,25 @@ control_plane_url = "https://cp.example"
     }
 
     #[test]
-    fn cleartext_secret_is_rejected_at_parse() {
+    fn cleartext_secret_is_rejected_as_secret_invalid() {
+        // A bare cleartext value in a secret field must produce
+        // `ConfigError::SecretInvalid`, NOT the generic `Parse` — this is the
+        // whole point of the `SecretInvalid` variant, and the fix for
+        // issue #281 (before the fix, this test asserted `Parse` and the
+        // dedicated variant was dead code).
         let bad = valid_toml().replace(
             r#"mtls_passphrase = "envvar:SYNTHAEA_MTLS_PASSPHRASE""#,
             r#"mtls_passphrase = "hunter2""#,
         );
         let f = write_tmp(&bad);
         let err = load_from(f.path()).unwrap_err();
-        assert!(matches!(err, ConfigError::Parse { .. }));
-        // The parse error message flows through from the SecretRef
-        // deserialize impl; operators see the field name and the offending
-        // literal.
-        assert!(format!("{err}").contains("hunter2"));
+        match err {
+            ConfigError::SecretInvalid { field, value, .. } => {
+                assert_eq!(field, "server.mtls_passphrase");
+                assert_eq!(value, "hunter2");
+            }
+            other => panic!("expected SecretInvalid, got {other:?}"),
+        }
     }
 
     #[test]
