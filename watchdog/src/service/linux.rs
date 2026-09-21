@@ -74,6 +74,8 @@ fn resolve_paths(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Result<
         }
         crate::tamper::harden_permissions(bin, 0o755)
             .with_context(|| format!("hardening permissions on {}", bin.display()))?;
+        crate::tamper::harden_ownership(bin)
+            .with_context(|| format!("hardening ownership on {}", bin.display()))?;
     }
 
     let alerts_abs =
@@ -210,6 +212,8 @@ fn install_systemd(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Resul
     // #103: don't rely on umask for a root-owned service definition's permissions.
     crate::tamper::harden_permissions(std::path::Path::new(SYSTEMD_UNIT), 0o644)
         .with_context(|| format!("hardening permissions on {SYSTEMD_UNIT}"))?;
+    crate::tamper::harden_ownership(std::path::Path::new(SYSTEMD_UNIT))
+        .with_context(|| format!("hardening ownership on {SYSTEMD_UNIT}"))?;
     run("systemctl", &["daemon-reload"])?;
     run("systemctl", &["enable", "--now", "synthaea-agent.service"])?;
 
@@ -279,6 +283,9 @@ fn install_openrc(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Result
     std::fs::write(OPENRC_SCRIPT, &script)
         .with_context(|| format!("writing {OPENRC_SCRIPT} (root required)"))?;
     set_executable(OPENRC_SCRIPT)?;
+    // #103: same ownership hardening the systemd unit gets above.
+    crate::tamper::harden_ownership(std::path::Path::new(OPENRC_SCRIPT))
+        .with_context(|| format!("hardening ownership on {OPENRC_SCRIPT}"))?;
 
     run("rc-update", &["add", "synthaea-agent", "default"])?;
     run("rc-service", &["synthaea-agent", "start"])?;

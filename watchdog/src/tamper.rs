@@ -71,6 +71,20 @@ pub(crate) fn harden_permissions(path: &Path, mode: u32) -> std::io::Result<()> 
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
+/// Sets `path`'s owner and group to root (uid/gid 0) — mode bits alone
+/// (`harden_permissions`) still leave a non-root-owned install artifact one
+/// `chmod` away from being writable by its own (non-root) owner again.
+/// `install`/`uninstall` already require root to write these paths at all
+/// (`/etc/systemd/system`, the resolved binary paths), so this is normalizing
+/// ownership on a path this process could already write, not an escalation.
+///
+/// # Errors
+/// Propagates any I/O error setting `path`'s owner.
+#[cfg(target_os = "linux")]
+pub(crate) fn harden_ownership(path: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::chown(path, Some(0), Some(0))
+}
+
 /// A binary's SHA-256, pinned at one point in time (watchdog startup) so every
 /// later spawn can be checked against that baseline — see [`BinaryPin::verify`].
 /// Pure file I/O, no `cfg` gate: hashing and comparing bytes is exactly as
@@ -186,6 +200,24 @@ mod tests {
         harden_permissions(&path, 0o644).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o644);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn harden_ownership_sets_root_when_running_as_root() {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: chown(2) to root requires root — not running as root here");
+            return;
+        }
+        use std::os::unix::fs::MetadataExt as _;
+        let path = temp_path("ownership");
+        std::fs::write(&path, b"x").unwrap();
+        harden_ownership(&path).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.uid(), 0);
+        assert_eq!(meta.gid(), 0);
         std::fs::remove_file(&path).ok();
     }
 }
