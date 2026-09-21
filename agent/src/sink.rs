@@ -267,11 +267,11 @@ fn load_sigma_rules() -> Option<sigma::SigmaEngine> {
     let rules_dir = content_dir("rules/sigma")?;
     match sigma::SigmaEngine::load_dir(&rules_dir) {
         Ok(engine) => {
-            log::info!("sigma: {} rules loaded", engine.rule_count());
+            tracing::info!(rules = engine.rule_count(), "sigma: rules loaded");
             Some(engine)
         }
         Err(e) => {
-            log::error!("sigma: load error: {e}");
+            tracing::error!(error = %e, "sigma: load error");
             None
         }
     }
@@ -288,7 +288,7 @@ fn start_yara(
     let dir = content_dir("rules/yara")?;
     match yara::RuleSet::load_dir(&dir) {
         Ok(rules) => {
-            log::info!("yara: {} rules loaded", rules.rule_count());
+            tracing::info!(rules = rules.rule_count(), "yara: rules loaded");
             Some(yara::ScanQueue::start(rules, move |outcome| {
                 let matched = !outcome.matches.is_empty();
                 for rule in &outcome.matches {
@@ -306,7 +306,7 @@ fn start_yara(
             }))
         }
         Err(e) => {
-            log::error!("yara: load error: {e}");
+            tracing::error!(error = %e, "yara: load error");
             None
         }
     }

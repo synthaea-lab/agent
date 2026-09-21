@@ -242,10 +242,11 @@ pub fn resolve_symbols(
                         library_path: library_path.to_path_buf(),
                         library_type,
                     });
-                    log::debug!(
-                        "symbol_resolver: found {name} @ 0x{:x} in {}",
-                        sym.st_value,
-                        library_path.display()
+                    tracing::debug!(
+                        symbol = name,
+                        offset = format_args!("0x{:x}", sym.st_value),
+                        library = %library_path.display(),
+                        "symbol_resolver: found symbol"
                     );
                 }
             }
@@ -264,10 +265,11 @@ pub fn resolve_symbols(
                             library_path: library_path.to_path_buf(),
                             library_type,
                         });
-                        log::debug!(
-                            "symbol_resolver: found {name} (static) @ 0x{:x} in {}",
-                            sym.st_value,
-                            library_path.display()
+                        tracing::debug!(
+                            symbol = name,
+                            offset = format_args!("0x{:x}", sym.st_value),
+                            library = %library_path.display(),
+                            "symbol_resolver: found symbol (static table)"
                         );
                     }
                 }
@@ -301,15 +303,15 @@ pub fn resolve_tls_symbols() -> Result<Vec<SymbolInfo>, ResolverError> {
         match resolve_symbols(lib, &target_symbols) {
             Ok(mut symbols) => all_symbols.append(&mut symbols),
             Err(e) => {
-                log::warn!("symbol_resolver: failed to parse {}: {e}", lib.display());
+                tracing::warn!(library = %lib.display(), error = %e, "symbol_resolver: parse failed");
             }
         }
     }
 
-    log::info!(
-        "symbol_resolver: resolved {} TLS symbols across {} libraries",
-        all_symbols.len(),
-        libraries.len()
+    tracing::info!(
+        symbols = all_symbols.len(),
+        libraries = libraries.len(),
+        "symbol_resolver: resolved TLS symbols"
     );
     Ok(all_symbols)
 }
@@ -332,15 +334,15 @@ pub fn resolve_readline_symbols() -> Result<Vec<SymbolInfo>, ResolverError> {
         match resolve_symbols(lib, &target_symbols) {
             Ok(mut symbols) => all_symbols.append(&mut symbols),
             Err(e) => {
-                log::warn!("symbol_resolver: failed to parse {}: {e}", lib.display());
+                tracing::warn!(library = %lib.display(), error = %e, "symbol_resolver: parse failed");
             }
         }
     }
 
-    log::info!(
-        "symbol_resolver: resolved {} readline symbols across {} libraries",
-        all_symbols.len(),
-        libraries.len()
+    tracing::info!(
+        symbols = all_symbols.len(),
+        libraries = libraries.len(),
+        "symbol_resolver: resolved readline symbols"
     );
     Ok(all_symbols)
 }

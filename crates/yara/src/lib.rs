@@ -119,15 +119,11 @@ impl RuleSet {
         };
         let meta = std::fs::metadata(path).map_err(io)?;
         if !meta.is_file() {
-            log::debug!("yara: {} is not a regular file, skipping", path.display());
+            tracing::debug!(path = %path.display(), "yara: not a regular file, skipping");
             return Ok(Vec::new());
         }
         if meta.len() > MAX_SCAN_BYTES {
-            log::debug!(
-                "yara: {} over scan budget ({} bytes), skipping",
-                path.display(),
-                meta.len()
-            );
+            tracing::debug!(path = %path.display(), size = meta.len(), "yara: over scan budget, skipping");
             return Ok(Vec::new());
         }
         let mut data = Vec::new();
@@ -139,10 +135,7 @@ impl RuleSet {
                 .map_err(io)?;
         }
         if data.len() as u64 > MAX_SCAN_BYTES {
-            log::debug!(
-                "yara: {} grew past the scan budget, skipping",
-                path.display()
-            );
+            tracing::debug!(path = %path.display(), "yara: grew past the scan budget, skipping");
             return Ok(Vec::new());
         }
         let mut scanner = yara_x::Scanner::new(&self.rules);

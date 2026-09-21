@@ -12,7 +12,7 @@ workspace = true
 [dependencies]
 schema = { path = "../../../schema" }
 sensor-linux-wire = { path = "../wire" }
-log = { version = "0.4", default-features = false }
+tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

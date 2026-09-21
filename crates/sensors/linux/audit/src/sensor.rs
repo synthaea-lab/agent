@@ -26,7 +26,7 @@ impl AuditSensor {
             tokio::io::unix::AsyncFd::with_interest(socket, tokio::io::Interest::READABLE)
                 .map_err(|e| format!("AsyncFd: {e}"))?;
 
-        log::info!("sensor-linux-audit: listening for exec/connect");
+        tracing::info!("sensor-linux-audit: listening for exec/connect");
 
         let ctrl_c = tokio::signal::ctrl_c();
         tokio::pin!(ctrl_c);
@@ -74,7 +74,7 @@ impl AuditSensor {
             }
         }
 
-        log::info!("sensor-linux-audit: exiting");
+        tracing::info!("sensor-linux-audit: exiting");
         Ok(())
     }
 }

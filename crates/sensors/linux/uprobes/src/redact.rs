@@ -140,7 +140,7 @@ fn redact_pattern(text: &str, pattern: &str, replacement: &str) -> String {
     match regex::Regex::new(pattern) {
         Ok(re) => re.replace_all(text, replacement).into_owned(),
         Err(err) => {
-            log::error!("redact_pattern: pattern {pattern:?} failed to compile: {err}");
+            tracing::error!(?pattern, error = %err, "redact_pattern: pattern failed to compile");
             text.to_string()
         }
     }

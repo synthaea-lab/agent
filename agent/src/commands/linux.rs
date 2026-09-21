@@ -62,7 +62,7 @@ fn seeded_rule_state() -> rules::RuleState {
                     .map(|entry| (entry.local.ip(), entry.local.port())),
             );
         }
-        Err(e) => log::warn!("listen-port baseline: sock_diag snapshot failed: {e}"),
+        Err(e) => tracing::warn!(error = %e, "listen-port baseline: sock_diag snapshot failed"),
     }
     rule_state
 }
@@ -145,11 +145,11 @@ fn has_bpf_capabilities() -> bool {
 /// Returns (sensor, `sensor_name`) for correct telemetry.
 fn select_sensor() -> (Box<dyn schema::sensor::Sensor>, &'static str) {
     if can_use_ebpf() {
-        log::info!("Using eBPF sensor (primary)");
+        tracing::info!("Using eBPF sensor (primary)");
         return (Box::new(sensor_linux::LinuxSensor::new()), "linux-ebpf");
     }
 
-    log::warn!("eBPF unavailable — using audit fallback (reduced fidelity)");
+    tracing::warn!("eBPF unavailable — using audit fallback (reduced fidelity)");
     (
         Box::new(sensor_linux_audit::AuditSensor::new()),
         "linux-audit",
@@ -163,13 +163,13 @@ fn can_use_ebpf() -> bool {
     // SAFETY: geteuid takes no arguments and cannot fail.
     let uid = unsafe { libc::geteuid() };
     if uid != 0 && !has_bpf_capabilities() {
-        log::debug!("eBPF preflight: no privileges");
+        tracing::debug!("eBPF preflight: no privileges");
         return false;
     }
 
     // Check 2: BTF present
     if !std::path::Path::new("/sys/kernel/btf/vmlinux").exists() {
-        log::debug!("eBPF preflight: no BTF");
+        tracing::debug!("eBPF preflight: no BTF");
         return false;
     }
 
@@ -177,7 +177,7 @@ fn can_use_ebpf() -> bool {
     let mut ebpf = match sensor_linux::load_ebpf() {
         Ok(ebpf) => ebpf,
         Err(e) => {
-            log::debug!("eBPF preflight: failed to load object: {e}");
+            tracing::debug!(error = %e, "eBPF preflight: failed to load object");
             return false;
         }
     };
@@ -187,7 +187,7 @@ fn can_use_ebpf() -> bool {
     if let Some((program_name, _category, _name)) = sensor_linux::TRACEPOINTS.first()
         && let Err(e) = sensor_linux::load_program(&mut ebpf, program_name)
     {
-        log::debug!("eBPF preflight: program {program_name} rejected: {e}");
+        tracing::debug!(program = program_name, error = %e, "eBPF preflight: program rejected");
         return false;
     }
 
@@ -280,11 +280,11 @@ pub(crate) fn cmd_run(
         |beacon| {
             // For now, just log the beacon. Once transport (#24) integration is
             // complete, this will emit via the dedicated health channel.
-            log::info!(
-                "health beacon: {} sensors, {} spool bytes, {} enrich dropped",
-                beacon.sensors.len(),
-                beacon.spool_bytes,
-                beacon.enrich_dropped
+            tracing::info!(
+                sensors = beacon.sensors.len(),
+                spool_bytes = beacon.spool_bytes,
+                enrich_dropped = beacon.enrich_dropped,
+                "health beacon"
             );
         },
     );
@@ -383,8 +383,10 @@ fn forward_netlink_events(
         Err(e) => {
             if !*warned {
                 *warned = true;
-                log::warn!(
-                    "netlink poll ({source}): {e} — further identical errors this run are suppressed"
+                tracing::warn!(
+                    source,
+                    error = %e,
+                    "netlink poll failed — further identical errors this run are suppressed"
                 );
             }
         }
@@ -410,12 +412,12 @@ fn spawn_journal_tail(sink: Arc<DetectionSink>, heartbeat: SensorHeartbeat) {
             let mut child = match sensor_linux_journal::spawn_follow(cursor.as_deref()) {
                 Ok(child) => child,
                 Err(e) => {
-                    log::warn!("journal tail: journalctl unavailable, skipping ({e})");
+                    tracing::warn!(error = %e, "journal tail: journalctl unavailable, skipping");
                     return;
                 }
             };
             let Some(stdout) = child.stdout.take() else {
-                log::warn!("journal tail: journalctl spawned without a piped stdout");
+                tracing::warn!("journal tail: journalctl spawned without a piped stdout");
                 return;
             };
             let journal =
@@ -436,7 +438,7 @@ fn spawn_journal_tail(sink: Arc<DetectionSink>, heartbeat: SensorHeartbeat) {
                         // A hard I/O error ends `ClassifiedJournal`'s stream (see its
                         // doc) — nothing left to iterate, so this thread exits. No
                         // reconnect logic yet (matches the crate doc's Status section).
-                        log::warn!("journal tail: stream ended: {e}");
+                        tracing::warn!(error = %e, "journal tail: stream ended");
                         break;
                     }
                 }

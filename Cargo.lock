@@ -26,9 +26,7 @@ dependencies = [
  "correlator",
  "ctrlc",
  "enrich",
- "env_logger",
  "libc",
- "log",
  "policy",
  "response",
  "rules",
@@ -44,6 +42,8 @@ dependencies = [
  "sigma",
  "sinks",
  "tamper",
+ "tracing",
+ "tracing-subscriber",
  "yara",
 ]
 
@@ -983,32 +983,10 @@ checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 name = "enrich"
 version = "0.1.0"
 dependencies = [
- "log",
  "schema",
  "sha2 0.11.0",
  "store",
-]
-
-[[package]]
-name = "env_filter"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "900d271a03799a1ee8d1ca9b19893b48ca674a9284fefcfb85f05e74ed314217"
-dependencies = [
- "log",
- "regex",
-]
-
-[[package]]
-name = "env_logger"
-version = "0.11.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de671bd27a75a797dc9ae289ba1e77276e75e2026408aab65185384e2d5cd3f6"
-dependencies = [
- "anstream",
- "anstyle",
- "env_filter",
- "log",
+ "tracing",
 ]
 
 [[package]]
@@ -1518,6 +1496,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazy_static"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+
+[[package]]
 name = "leb128"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1610,6 +1594,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d640282b302c0bb0a2a8e0233ead9035e3bed871f0b7e81fe4a1ec829765db44"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "matchers"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
+dependencies = [
+ "regex-automata",
 ]
 
 [[package]]
@@ -1733,6 +1726,15 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+]
+
+[[package]]
+name = "nu-ansi-term"
+version = "0.50.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2428,12 +2430,12 @@ dependencies = [
  "aya-build",
  "aya-log",
  "libc",
- "log",
  "schema",
  "sensor-linux-wire",
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
  "which",
 ]
 
@@ -2442,10 +2444,10 @@ name = "sensor-linux-audit"
 version = "0.1.0"
 dependencies = [
  "libc",
- "log",
  "schema",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2495,12 +2497,12 @@ dependencies = [
  "aya-log",
  "goblin",
  "libc",
- "log",
  "regex",
  "schema",
  "sensor-linux-wire",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
  "which",
 ]
 
@@ -2525,8 +2527,8 @@ name = "sensor-windows"
 version = "0.1.0"
 dependencies = [
  "ferrisetw",
- "log",
  "schema",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 
@@ -2534,8 +2536,8 @@ dependencies = [
 name = "sensor-windows-eventlog"
 version = "0.1.0"
 dependencies = [
- "log",
  "schema",
+ "tracing",
 ]
 
 [[package]]
@@ -2618,6 +2620,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sharded-slab"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
+dependencies = [
+ "lazy_static",
+]
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2627,11 +2638,11 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 name = "sigma"
 version = "0.1.0"
 dependencies = [
- "log",
  "schema",
  "serde",
  "serde_yaml",
  "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]
@@ -2715,10 +2726,10 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 name = "store"
 version = "0.1.0"
 dependencies = [
- "log",
  "schema",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -2867,6 +2878,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "thread_local"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "time"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2962,6 +2982,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
+ "valuable",
+]
+
+[[package]]
+name = "tracing-log"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
+dependencies = [
+ "log",
+ "once_cell",
+ "tracing-core",
+]
+
+[[package]]
+name = "tracing-subscriber"
+version = "0.3.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
+dependencies = [
+ "matchers",
+ "nu-ansi-term",
+ "once_cell",
+ "regex-automata",
+ "sharded-slab",
+ "smallvec",
+ "thread_local",
+ "tracing",
+ "tracing-core",
+ "tracing-log",
 ]
 
 [[package]]
@@ -3082,6 +3132,12 @@ name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
+
+[[package]]
+name = "valuable"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vcpkg"
@@ -3659,9 +3715,9 @@ dependencies = [
 name = "yara"
 version = "0.1.0"
 dependencies = [
- "log",
  "schema",
  "thiserror 2.0.20",
+ "tracing",
  "yara-x",
 ]
 

@@ -68,7 +68,7 @@ fn wevtutil(args: &[&str]) -> String {
     match Command::new("wevtutil").args(args).output() {
         Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
         Err(e) => {
-            log::warn!("wevtutil invocation failed ({e}); args={args:?}");
+            tracing::warn!(error = %e, ?args, "wevtutil invocation failed");
             String::new()
         }
     }
@@ -120,7 +120,7 @@ fn poll_service_installs(
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut last_id = last_known_record_id_7045();
-        log::info!("service-install poll started (last known EventRecordID: {last_id})");
+        tracing::info!(last_record_id = last_id, "service-install poll started");
         while !stop.load(Ordering::SeqCst) {
             std::thread::sleep(POLL_INTERVAL);
             for install in new_service_install_events(last_id) {
@@ -144,7 +144,7 @@ fn poll_service_installs(
                 sink.on_event(Event::FileOpen(event));
             }
         }
-        log::info!("service-install poll stopped");
+        tracing::info!("service-install poll stopped");
     })
 }
 
@@ -169,23 +169,24 @@ fn enable_scheduled_task_audit() -> bool {
         .output();
     match output {
         Ok(o) if o.status.success() => {
-            log::info!("\"Other Object Access Events\" audit enabled (event 4698)");
+            tracing::info!("\"Other Object Access Events\" audit enabled (event 4698)");
             true
         }
         Ok(o) => {
-            log::warn!(
-                "auditpol failed (code {:?}) — scheduled task persistence detection (T1053.005) \
-                 may not receive any 4698 events until this audit subcategory is enabled \
-                 manually: auditpol /set /subcategory:{SCHEDULED_TASK_AUDIT_SUBCATEGORY_GUID} \
-                 /success:enable /failure:enable. stderr: {}",
-                o.status.code(),
-                String::from_utf8_lossy(&o.stderr).trim()
+            tracing::warn!(
+                code = ?o.status.code(),
+                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                "auditpol failed — scheduled task persistence detection (T1053.005) may not \
+                 receive any 4698 events until this audit subcategory is enabled manually: \
+                 auditpol /set /subcategory:{SCHEDULED_TASK_AUDIT_SUBCATEGORY_GUID} \
+                 /success:enable /failure:enable"
             );
             false
         }
         Err(e) => {
-            log::warn!(
-                "could not run auditpol ({e}) — scheduled task persistence detection (T1053.005) \
+            tracing::warn!(
+                error = %e,
+                "could not run auditpol — scheduled task persistence detection (T1053.005) \
                  may stay silent until the audit is enabled manually (see command above)"
             );
             false
@@ -226,7 +227,7 @@ fn poll_scheduled_tasks(
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut last_id = last_known_record_id_4698();
-        log::info!("scheduled-task poll started (last known EventRecordID: {last_id})");
+        tracing::info!(last_record_id = last_id, "scheduled-task poll started");
         while !stop.load(Ordering::SeqCst) {
             std::thread::sleep(POLL_INTERVAL);
             for task in new_scheduled_task_events(last_id) {
@@ -253,7 +254,7 @@ fn poll_scheduled_tasks(
                 sink.on_event(Event::FileOpen(event));
             }
         }
-        log::info!("scheduled-task poll stopped");
+        tracing::info!("scheduled-task poll stopped");
     })
 }
 
@@ -279,17 +280,22 @@ fn enable_logon_audit() {
             ])
             .output();
         match output {
-            Ok(o) if o.status.success() => log::info!("\"{label}\" audit enabled"),
-            Ok(o) => log::warn!(
-                "auditpol failed enabling \"{label}\" audit (code {:?}) — logon-event coverage \
-                 may be incomplete until this audit subcategory is confirmed enabled: auditpol \
-                 /set /subcategory:{guid} /success:enable /failure:enable. stderr: {}",
-                o.status.code(),
-                String::from_utf8_lossy(&o.stderr).trim()
+            Ok(o) if o.status.success() => {
+                tracing::info!(audit = label, "audit subcategory enabled")
+            }
+            Ok(o) => tracing::warn!(
+                audit = label,
+                code = ?o.status.code(),
+                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                "auditpol failed — logon-event coverage may be incomplete until this audit \
+                 subcategory is confirmed enabled: auditpol /set /subcategory:{guid} \
+                 /success:enable /failure:enable"
             ),
-            Err(e) => log::warn!(
-                "could not run auditpol ({e}) — logon-event coverage may be incomplete until \
-                 the \"{label}\" audit is confirmed enabled (see command above)"
+            Err(e) => tracing::warn!(
+                audit = label,
+                error = %e,
+                "could not run auditpol — logon-event coverage may be incomplete until the \
+                 audit is confirmed enabled (see command above)"
             ),
         }
     }
@@ -401,7 +407,7 @@ fn poll_logon_events(
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut last_id = last_known_record_id_logon();
-        log::info!("logon poll started (last known EventRecordID: {last_id})");
+        tracing::info!(last_record_id = last_id, "logon poll started");
         while !stop.load(Ordering::SeqCst) {
             std::thread::sleep(POLL_INTERVAL);
             for logon in new_logon_events(last_id) {
@@ -412,7 +418,7 @@ fn poll_logon_events(
                 }
             }
         }
-        log::info!("logon poll stopped");
+        tracing::info!("logon poll stopped");
     })
 }
 
@@ -436,26 +442,25 @@ fn enable_account_creation_audit() -> bool {
         .output();
     match output {
         Ok(o) if o.status.success() => {
-            log::info!("\"User Account Management\" audit enabled (event 4720)");
+            tracing::info!("\"User Account Management\" audit enabled (event 4720)");
             true
         }
         Ok(o) => {
-            log::warn!(
-                "auditpol failed (code {:?}) — account-creation persistence detection \
-                 (T1136.001) may not receive any 4720 events until this audit \
-                 subcategory is enabled manually: auditpol /set \
-                 /subcategory:{USER_ACCOUNT_MGMT_AUDIT_SUBCATEGORY_GUID} \
-                 /success:enable /failure:enable. stderr: {}",
-                o.status.code(),
-                String::from_utf8_lossy(&o.stderr).trim()
+            tracing::warn!(
+                code = ?o.status.code(),
+                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                "auditpol failed — account-creation persistence detection (T1136.001) may not \
+                 receive any 4720 events until this audit subcategory is enabled manually: \
+                 auditpol /set /subcategory:{USER_ACCOUNT_MGMT_AUDIT_SUBCATEGORY_GUID} \
+                 /success:enable /failure:enable"
             );
             false
         }
         Err(e) => {
-            log::warn!(
-                "could not run auditpol ({e}) — account-creation persistence detection \
-                 (T1136.001) may stay silent until the audit is enabled manually \
-                 (see command above)"
+            tracing::warn!(
+                error = %e,
+                "could not run auditpol — account-creation persistence detection (T1136.001) \
+                 may stay silent until the audit is enabled manually (see command above)"
             );
             false
         }
@@ -495,7 +500,7 @@ fn poll_account_creations(
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut last_id = last_known_record_id_4720();
-        log::info!("account-creation poll started (last known EventRecordID: {last_id})");
+        tracing::info!(last_record_id = last_id, "account-creation poll started");
         while !stop.load(Ordering::SeqCst) {
             std::thread::sleep(POLL_INTERVAL);
             for account in new_account_created_events(last_id) {
@@ -530,7 +535,7 @@ fn poll_account_creations(
                 sink.on_event(Event::FileOpen(event));
             }
         }
-        log::info!("account-creation poll stopped");
+        tracing::info!("account-creation poll stopped");
     })
 }
 

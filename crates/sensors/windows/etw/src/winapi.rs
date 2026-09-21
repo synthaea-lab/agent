@@ -310,7 +310,7 @@ pub(crate) fn snapshot_processes() -> Vec<(u32, String)> {
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snap == INVALID_HANDLE_VALUE {
-            log::warn!("toolhelp snapshot failed — seeding skipped");
+            tracing::warn!("toolhelp snapshot failed — seeding skipped");
             return out;
         }
         let mut entry: PROCESSENTRY32W = core::mem::zeroed();

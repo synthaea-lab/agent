@@ -13,12 +13,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use log::warn;
 use schema::{
     ContainerContext,
     sensor::{Capabilities, EventSink, Sensor, SensorError},
 };
 use tokio::sync::Notify;
+use tracing::warn;
 
 use crate::{docker::DockerContainerInfo, normalize};
 
@@ -74,7 +74,7 @@ pub fn load_ebpf() -> Result<aya::Ebpf, SensorError> {
     // SAFETY: plain FFI call with a valid pointer to a stack-owned rlimit.
     let ret = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) };
     if ret != 0 {
-        log::debug!("remove limit on locked memory failed, ret is: {ret}");
+        tracing::debug!(ret, "remove limit on locked memory failed");
     }
 
     let ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
@@ -186,7 +186,7 @@ fn read_proc_cmdline(pid: u32) -> Vec<String> {
         // (EACCES, EIO) is worth a line when tracing a capture gap on some kernel.
         Err(e) if is_proc_exit_race(&e) => Vec::new(),
         Err(e) => {
-            log::debug!("read /proc/{pid}/cmdline: {e}");
+            tracing::debug!(pid, error = %e, "read /proc/<pid>/cmdline failed");
             Vec::new()
         }
     }
@@ -557,7 +557,7 @@ impl LinuxSensor {
 
         match aya_log::EbpfLogger::init(&mut ebpf) {
             Err(e) => {
-                warn!("failed to initialize eBPF logger: {e}");
+                warn!(error = %e, "failed to initialize eBPF logger");
             }
             Ok(logger) => {
                 let mut logger =
@@ -571,7 +571,7 @@ impl LinuxSensor {
                         let mut guard = match logger.readable_mut().await {
                             Ok(guard) => guard,
                             Err(e) => {
-                                warn!("eBPF log drain stopped: {e}");
+                                warn!(error = %e, "eBPF log drain stopped");
                                 break;
                             }
                         };
@@ -585,9 +585,13 @@ impl LinuxSensor {
         // Seed parent lineage from /proc *before* attaching, so already-running
         // processes are known from the first event (see `prime_proc_lineage`).
         match prime_proc_lineage(&mut ebpf) {
-            Ok(n) => log::info!("sensor-linux: primed {n} processes into PROC_LINEAGE"),
+            Ok(n) => tracing::info!(
+                primed = n,
+                "sensor-linux: primed processes into PROC_LINEAGE"
+            ),
             Err(e) => warn!(
-                "sensor-linux: PROC_LINEAGE priming failed ({e}) — ppid known only for post-attach forks"
+                error = %e,
+                "sensor-linux: PROC_LINEAGE priming failed — ppid known only for post-attach forks"
             ),
         }
 
@@ -608,7 +612,7 @@ impl LinuxSensor {
         let mut file_open_ring_buf = ring("FILE_OPEN_EVENTS")?;
         let mut connect_ring_buf = ring("CONNECT_EVENTS")?;
 
-        log::info!("sensor-linux: listening for exec/open/connect events");
+        tracing::info!("sensor-linux: listening for exec/open/connect events");
 
         let mut container_ids = CgroupIdCache::new();
         let docker_cache: DockerInfoCache = Arc::new(Mutex::new(HashMap::new()));
@@ -641,7 +645,7 @@ impl LinuxSensor {
                 }
             }
         }
-        log::info!("sensor-linux: exiting");
+        tracing::info!("sensor-linux: exiting");
 
         Ok(())
     }

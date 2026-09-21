@@ -123,10 +123,7 @@ impl Enricher {
         let sha256 = if size <= MAX_HASH_BYTES {
             hash_file(path)
         } else {
-            log::debug!(
-                "enrich: {} over hash budget ({size} bytes), skipping",
-                path.display()
-            );
+            tracing::debug!(path = %path.display(), size, "enrich: over hash budget, skipping");
             None
         };
         let enrichment = FileEnrichment {
