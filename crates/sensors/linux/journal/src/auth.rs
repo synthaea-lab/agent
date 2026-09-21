@@ -13,11 +13,13 @@
 //!   `"su"` (no dedicated classifier — [`ExplicitCredentials`](schema::AuthKind)
 //!   is the closest existing signal for "became another user") and `"login"`
 //!   (local console, not covered elsewhere) get a PAM-session-based mapping.
-//! - Unit lifecycle ([`JournalEvent::UnitStarted`]/`Stopped`/`Failed`) has no
-//!   `schema::Event` variant yet — a Linux-only "service lifecycle" shape would
-//!   preempt the same cross-platform decision `AuthEvent` itself needed (ADR-0005),
-//!   and Windows' service-install/lifecycle event reconciliation is active work
-//!   in progress (issue #224) — left unmapped rather than invented unilaterally.
+//! - Unit lifecycle ([`JournalEvent::UnitStarted`]/`Stopped`/`Failed`) never maps
+//!   into an `AuthEvent` — a login/session shape is the wrong fit for "a service
+//!   started". [`crate::persistence::UnitPersistenceTracker`] maps a unit's first
+//!   observed start into `schema::FileOpenEvent` instead, once issue #224
+//!   (Windows' own service-lifecycle event reconciliation) confirmed the
+//!   precedent to follow (reuse `FileOpenEvent` + a flag, no new `Event`
+//!   variant) — see that module's doc.
 
 use schema::{AuthEvent, AuthKind, AuthOutcome, EventMeta, User};
 

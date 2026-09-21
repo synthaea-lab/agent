@@ -11,6 +11,7 @@ use crate::{
     O_CREAT, O_WRONLY, RuleState, check_account_creation_persistence, check_base64_decode,
     check_encoded_powershell, check_persistence_write, check_proc_root_escape,
     check_scheduled_task_persistence, check_service_install_persistence,
+    check_systemd_service_persistence,
     exclusions::{BEACON_THRESHOLD, SELF_SPAWN_THRESHOLD},
 };
 
@@ -116,6 +117,17 @@ fn file_open_event_service_install(service_name: &str, image_path: &str) -> File
 fn file_open_event_account_created(account_name: &str, sid: &str) -> FileOpenEvent {
     let mut event = file_open_event(sid, schema::FLAG_PERSISTENCE_ACCOUNT_ARTIFACT);
     event.meta.comm = account_name.to_string();
+    event
+}
+
+/// A `FileOpenEvent` shaped like what `sensor-linux-journal`'s
+/// `persistence::UnitPersistenceTracker` pushes on a unit's first observed
+/// start: the `flags` field carries the `FLAG_PERSISTENCE_SYSTEMD_ARTIFACT`
+/// bit, and both `path` and `comm` are the unit name (no separate image-path
+/// field exists on this side, unlike the Windows 7045 shape).
+fn file_open_event_systemd_unit(unit_name: &str) -> FileOpenEvent {
+    let mut event = file_open_event(unit_name, schema::FLAG_PERSISTENCE_SYSTEMD_ARTIFACT);
+    event.meta.comm = unit_name.to_string();
     event
 }
 

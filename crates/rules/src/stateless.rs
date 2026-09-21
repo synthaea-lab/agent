@@ -2,7 +2,7 @@
 
 use schema::{
     ExecEvent, FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT,
-    FLAG_PERSISTENCE_TASK_ARTIFACT, FileOpenEvent,
+    FLAG_PERSISTENCE_SYSTEMD_ARTIFACT, FLAG_PERSISTENCE_TASK_ARTIFACT, FileOpenEvent,
 };
 
 use crate::{Alert, has_write_intent};
@@ -260,6 +260,39 @@ pub(crate) fn check_account_creation_persistence(event: &FileOpenEvent) -> Optio
     })
 }
 
+/// T1543.002 — Create or Modify System Process: Systemd Service. A systemd unit
+/// was just observed starting for the first time since this agent started —
+/// `sensor-linux-journal`'s `persistence::UnitPersistenceTracker` (issue #93),
+/// the Linux sibling of `check_service_install_persistence`'s Windows T1543.003.
+/// Flows through `FileOpenEvent` with `FLAG_PERSISTENCE_SYSTEMD_ARTIFACT`
+/// (distinct bit, so this never cross-fires with the three Windows persistence
+/// techniques off a single event).
+///
+/// Unlike the Windows signal, this is an approximation, not a deterministic
+/// "just installed" fact: journald's `JOB_TYPE=start`/`JOB_RESULT=done` fires on
+/// every start of a unit, install or routine restart alike — the tracker only
+/// suppresses repeats *within one agent lifetime*, so a unit already running
+/// before the agent started still alerts once, and an agent restart forgets
+/// what it had already seen. See [`FLAG_PERSISTENCE_SYSTEMD_ARTIFACT`]'s own
+/// doc for the full caveat.
+///
+/// Alert content carries the unit name from both `event.meta.comm` and
+/// `event.path` (journald's job-completion record has no image-path equivalent
+/// to Windows' 7045, so there is no second field to distinguish them).
+#[must_use]
+pub(crate) fn check_systemd_service_persistence(event: &FileOpenEvent) -> Option<Alert> {
+    if event.flags & FLAG_PERSISTENCE_SYSTEMD_ARTIFACT == 0 {
+        return None;
+    }
+    Some(Alert {
+        technique: "T1543.002",
+        message: format!(
+            "unit={} pid={}: systemd service first seen starting — unit: {}",
+            event.meta.comm, event.meta.pid, event.path,
+        ),
+    })
+}
+
 /// Evaluates all stateless rules applicable to a `FileOpenEvent`.
 #[must_use]
 pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
@@ -269,5 +302,6 @@ pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
         .chain(check_scheduled_task_persistence(event))
         .chain(check_service_install_persistence(event))
         .chain(check_account_creation_persistence(event))
+        .chain(check_systemd_service_persistence(event))
         .collect()
 }

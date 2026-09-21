@@ -120,12 +120,32 @@ pub const FLAG_PERSISTENCE_TASK_ARTIFACT: u32 = 0x2000_0000;
 /// domain controller) is out of scope for a userland EDR on member/standalone
 /// machines — the sensor never observes it. A `computer` account creation (4741) is
 /// a distinct technique (T1136.002) and would take its own bit if we add it later.
-///
-/// On this flag, `FileOpenEvent::path` carries the new account's SID (`S-1-5-21-...`)
-/// and `FileOpenEvent::meta::comm` carries the account leaf name (SAM name). Same
-/// distinct-bit rule as the other two: the three T1136/T1053/T1543 rules never
-/// cross-fire off a single event.
 pub const FLAG_PERSISTENCE_ACCOUNT_ARTIFACT: u32 = 0x0800_0000;
+
+/// Same principle as [`FLAG_PERSISTENCE_ARTIFACT`], for a Linux **systemd unit**
+/// observed starting for the first time since the agent started (ATT&CK T1543.002
+/// — Create or Modify System Process: Systemd Service, the Linux sibling of
+/// T1543.003) rather than a Windows service. Set by `sensor-linux-journal`'s
+/// `persistence::UnitPersistenceTracker` (issue #93), the Linux side of the same
+/// "reuse `FileOpenEvent` + a flag" shape rather than a new `Event` variant —
+/// see `sensor-linux-journal::auth`'s module doc for why a Linux-only lifecycle
+/// shape was deliberately not invented while this decision was open.
+///
+/// Not the same signal as Windows' 7045: journald's `JOB_TYPE=start`/
+/// `JOB_RESULT=done` fires on every start of a unit, install or routine restart
+/// alike, unlike the Service Control Manager which only writes 7045 once, at
+/// actual registration. This flag is therefore only a "first start observed by
+/// this agent process" approximation, not a true install signal — see the
+/// tracker's own doc for the full caveat (an agent restart forgets what it had
+/// already seen).
+///
+/// `FileOpenEvent::path` and `FileOpenEvent::meta::comm` both carry the unit name
+/// (`sshd.service`) — journald's job-completion record has no image-path
+/// equivalent to Windows' 7045, so there is no separate field to put there.
+///
+/// A distinct bit from every other `FLAG_PERSISTENCE_*` constant, so no two
+/// techniques cross-fire off a single event.
+pub const FLAG_PERSISTENCE_SYSTEMD_ARTIFACT: u32 = 0x4000_0000;
 
 /// Identity of the user a process runs as, per platform.
 ///

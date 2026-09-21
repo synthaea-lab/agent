@@ -419,7 +419,11 @@ fn forward_netlink_events(
 /// `schema::AuthEvent` (`sensor_linux_journal::to_auth_event`, issue #94's shared
 /// logon shape) and handing it to `sink` — same "poll/tail source with no
 /// `Sensor` impl, caller owns the handoff" shape as [`spawn_netlink_poller`], see
-/// `sensor_linux_journal`'s crate doc.
+/// `sensor_linux_journal`'s crate doc. Also runs a
+/// `sensor_linux_journal::UnitPersistenceTracker` (issue #93's other half) over
+/// the same stream, so a unit's first observed start lands as a
+/// `FLAG_PERSISTENCE_SYSTEMD_ARTIFACT` `FileOpenEvent` too — one tail thread,
+/// two independent mappings off the same classified record/event pair.
 ///
 /// Best-effort at startup: a non-systemd init (Alpine/OpenRC, see
 /// `watchdog::service::linux`'s own doc on this) has no `journalctl` at all —
@@ -443,6 +447,7 @@ fn spawn_journal_tail(sink: Arc<DetectionSink>, heartbeat: SensorHeartbeat) {
             };
             let journal =
                 sensor_linux_journal::ClassifiedJournal::new(std::io::BufReader::new(stdout));
+            let mut unit_persistence = sensor_linux_journal::UnitPersistenceTracker::new();
             for item in journal {
                 // Pulsed on every line the stream yields, matched or not (#71):
                 // proof journalctl is still delivering, same idle-host caveat as
@@ -453,6 +458,10 @@ fn spawn_journal_tail(sink: Arc<DetectionSink>, heartbeat: SensorHeartbeat) {
                     Ok((record, event)) => {
                         if let Some(auth) = sensor_linux_journal::to_auth_event(&record, &event) {
                             sink.on_event(schema::Event::Auth(auth));
+                        }
+                        if let Some(persistence_event) = unit_persistence.observe(&record, &event)
+                        {
+                            sink.on_event(persistence_event);
                         }
                     }
                     Err(e) => {
