@@ -1,0 +1,77 @@
+# Synthaea agent — default configuration template.
+#
+# This file is loaded by `agent`, `watchdog`, and `cli` from
+# `/etc/synthaea/agent.toml` (Linux, this template's OS), or
+# `C:\ProgramData\Synthaea\agent.toml` (Windows) — see ADR-0013 §2.
+#
+# To customize:
+#   1. Copy this file to the default OS path (or pass `--config <path>`).
+#   2. Fill in every value marked `# CHANGE ME`.
+#   3. Secrets: never write cleartext. Use `envvar:NAME` or
+#      `file:/absolute/path` (ADR-0013 §7).
+#
+# Adapting for Windows: change `ipc.endpoint`, `log.dir`, `storage.state_dir`,
+# and the `server.mtls_*` paths to Windows-style absolute paths, e.g.:
+#   ipc.endpoint       = "\\\\.\\pipe\\synthaea-agent"
+#   log.dir            = "C:\\ProgramData\\Synthaea\\logs"
+#   storage.state_dir  = "C:\\ProgramData\\Synthaea\\state"
+
+# Every file MUST carry the schema version this build understands. Absent or
+# mismatching values fail the load explicitly (see ADR-0013 §Deferred on
+# versioning).
+schema_version = 1
+
+[server]
+# Absolute HTTPS URL of the control plane's ingest endpoint.
+control_plane_url = "https://cp.synthaea.example"    # CHANGE ME
+
+# Client mTLS material presented to the control plane.
+mtls_cert       = "/etc/synthaea/certs/client.crt"   # CHANGE ME
+mtls_key        = "/etc/synthaea/certs/client.key"   # CHANGE ME
+
+# Reference to the private-key passphrase. Two providers are supported:
+#   envvar:NAME               (read from the process's environment)
+#   file:/absolute/path       (read from a 0600 file)
+mtls_passphrase = "envvar:SYNTHAEA_MTLS_PASSPHRASE"
+
+# If true, the agent keeps running against its cached policy when the
+# control plane is unreachable. If false, an unreachable control plane is a
+# hard failure at boot. Default: true.
+offline_fallback = true
+
+[log]
+# Directory the agent writes rotated log files into. Created at boot if
+# missing (owned by the service account).
+dir     = "/var/log/synthaea"
+
+# Verbosity. One of: trace, debug, info, warn, error.
+level   = "info"
+
+# Maximum on-disk size for the log directory, in mebibytes. 0 is refused
+# (state the cap explicitly; unbounded logging must be an intentional choice
+# with a large value).
+max_mb  = 1024
+
+[storage]
+# Root directory for agent state (spool, cache, model registry). Must be
+# on a partition the agent can reserve `spool_max_mb` on.
+state_dir     = "/var/lib/synthaea"
+
+# Maximum on-disk size for the event spool, in mebibytes. Enforced at
+# boot — the spooler refuses to start if it can't reserve this much under
+# `state_dir`.
+spool_max_mb  = 4096
+
+[ipc]
+# Where the agent listens for `cli` (issue #26). Unix domain socket path
+# on Linux/macOS, Windows named pipe on Windows.
+endpoint = "/var/run/synthaea/agent.sock"
+
+[resources]
+# Size of the tokio worker pool. 0 delegates to tokio's default heuristic
+# (num_cpus). Set explicitly on hosts where the agent is boxed by cgroups.
+worker_threads = 0
+
+# Maximum backoff (milliseconds) between consecutive control-plane
+# reconnection attempts. Default: 60_000 ms = 60 s.
+max_reconnect_backoff_ms = 60000
