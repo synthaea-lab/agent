@@ -70,8 +70,9 @@ pub fn detect_hook_support(hook: &str) -> bool {
 }
 
 /// Loads and attaches the `file_open` LSM hook from `ebpf` (already loaded via
-/// [`sensor_linux::load_ebpf`] — the LSM program lives in the same compiled object as
-/// the tracepoint probes, not a separate one).
+/// `sensor_linux::load_ebpf` — a different crate, so no intra-doc link; the LSM
+/// program lives in the same compiled object as the tracepoint probes, not a
+/// separate one).
 ///
 /// A `Result::Err` here is the capability probe, not necessarily an operational
 /// problem: a kernel without `CONFIG_BPF_LSM`, or one that has it compiled in but not

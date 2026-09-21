@@ -6,7 +6,7 @@
 //! ## Architecture
 //!
 //! Transport is the bridge between the on-device collection/detection stack and the
-//! control plane. It drains the [`store::EventSpool`], uploads events to the server,
+//! control plane. It drains the `store::EventSpool`, uploads events to the server,
 //! sends periodic heartbeats, and downloads policy updates.
 //!
 //! ```text
@@ -37,7 +37,7 @@
 //!
 //! ## At-least-once Delivery
 //!
-//! Uses the two-phase drain/ack protocol from [`store::EventSpool`]:
+//! Uses the two-phase drain/ack protocol from `store::EventSpool`:
 //! 1. `drain_oldest()` returns events and marks segment as in-flight
 //! 2. Upload to server
 //! 3. `ack()` deletes segment only after successful upload

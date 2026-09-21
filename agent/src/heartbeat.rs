@@ -2,7 +2,8 @@
 //! the sensor pipeline's live event counter to a small file next to the
 //! alerts output, which the watchdog polls to detect a hung agent. Unlike a
 //! bare "I'm still scheduled" timer, this only advances when
-//! [`crate::sink::DetectionSink::on_event`] completes end-to-end for a real
+//! [`crate::sink::DetectionSink`]'s `on_event` (its `EventSink` trait impl —
+//! rustdoc cannot link trait-impl methods) completes end-to-end for a real
 //! event — a wedged sensor thread, a poisoned lock, or a stalled drain loop
 //! all stop it, exactly the failure mode a plain process-alive (`try_wait`)
 //! check misses (the endpoint looks protected while collecting nothing).

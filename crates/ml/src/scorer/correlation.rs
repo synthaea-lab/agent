@@ -1,5 +1,5 @@
 //! On-device behaviour scoring (T2): runs the correlation Isolation Forest (ONNX)
-//! over a pid's [`features::correlation`] vector and turns the anomaly score into a
+//! over a pid's [`crate::features::correlation`] vector and turns the anomaly score into a
 //! log-odds term for the correlator's Bayesian belief state.
 //!
 //! Distinct from [`super::CmdlineScorer`] (T0) in every axis that matters
