@@ -21,7 +21,7 @@ goblin = { version = "0.9", default-features = false, features = ["elf64", "elf3
 thiserror = "2.0"
 tokio = { version = "1", default-features = false, features = ["sync", "signal", "macros", "rt", "net"] }
 libc = "0.2"
-regex = { version = "1.11", default-features = false, features = ["std"] }
+regex = { version = "1.11", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
 
 [build-dependencies]
 anyhow = "1.0"

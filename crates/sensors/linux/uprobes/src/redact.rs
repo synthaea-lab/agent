@@ -14,6 +14,28 @@
 //! **Security Note:** Redaction is best-effort pattern matching. Attackers may encode
 //! credentials in non-standard ways. This is defense-in-depth, not a security boundary.
 
+/// `(pattern, replacement)` pairs applied to TLS plaintext captures, in order.
+///
+/// Kept as data (rather than inlined `redact_pattern` calls) so `all_patterns_compile`
+/// below walks the exact same list `redact_tls_data` runs — the #251 incident was two
+/// patterns here failing `Regex::new` silently, with no test ever having exercised them.
+const TLS_PATTERNS: &[(&str, &str)] = &[
+    // "Authorization: Bearer ..." or "Authorization: Basic ..."
+    (r"(?i)authorization:\s*[^\r\n]+", "Authorization: [REDACTED]"),
+    // "Cookie: session_id=abc123..."
+    (r"(?i)cookie:\s*[^\r\n]+", "Cookie: [REDACTED]"),
+    // "https://user:password@example.com"
+    (
+        r"(https?://)([^:@\s]+):([^@\s]+)@",
+        "$1[REDACTED]:[REDACTED]@",
+    ),
+    // "?api_key=abc123", "?token=xyz789", "&key=foo"
+    (
+        r"[?&](api_key|token|key|apikey|access_token)=[^&\s]+",
+        "?$1=[REDACTED]",
+    ),
+];
+
 /// Redacts sensitive data from TLS plaintext captures (HTTP headers, credentials).
 ///
 /// Replaces matched patterns with `[REDACTED]` markers. Binary data is preserved if
@@ -30,41 +52,58 @@ pub fn redact_tls_data(mut data: Vec<u8>) -> Vec<u8> {
     // Try to parse as UTF-8 (most HTTP traffic is text-based)
     if let Ok(text) = std::str::from_utf8(&data) {
         let mut redacted = text.to_string();
-
-        // Redact Authorization headers (case-insensitive)
-        // Matches: "Authorization: Bearer ..." or "Authorization: Basic ..."
-        redacted = redact_pattern(
-            &redacted,
-            r"(?i)authorization:\s*[^\r\n]+",
-            "Authorization: [REDACTED]",
-        );
-
-        // Redact Cookie headers
-        // Matches: "Cookie: session_id=abc123..."
-        redacted = redact_pattern(&redacted, r"(?i)cookie:\s*[^\r\n]+", "Cookie: [REDACTED]");
-
-        // Redact credentials in URLs
-        // Matches: "https://user:password@example.com"
-        redacted = redact_pattern(
-            &redacted,
-            r"(https?://)([^:@\s]+):([^@\s]+)@",
-            "$1[REDACTED]:[REDACTED]@",
-        );
-
-        // Redact API keys in query strings
-        // Matches: "?api_key=abc123", "?token=xyz789", "&key=foo"
-        redacted = redact_pattern(
-            &redacted,
-            r"[?&](api_key|token|key|apikey|access_token)=[^&\s]+",
-            "?$1=[REDACTED]",
-        );
-
+        for (pattern, replacement) in TLS_PATTERNS {
+            redacted = redact_pattern(&redacted, pattern, replacement);
+        }
         data = redacted.into_bytes();
     }
     // If not valid UTF-8, return data unchanged (binary protocols like TLS handshake)
 
     data
 }
+
+/// `(pattern, replacement)` pairs applied to shell readline inputs, in order.
+///
+/// The quote-delimited value patterns (export/`--password`/`-p`/`-u`) use two
+/// *independent* optional-quote groups around the value rather than a backreference
+/// to the opening quote (`\1`) — this crate's `regex` engine is guaranteed-linear-time
+/// and does not support backreferences at all, which is what made these four patterns
+/// fail to compile under #251. The replacement text never echoes the value or its
+/// quoting back, so an unpaired quote match (e.g. matching a stray trailing `'` that
+/// wasn't actually the opening one) has no observable effect beyond this being
+/// best-effort redaction, not a parser.
+///
+/// The `-p` pattern additionally anchors on "not preceded by another `-`"
+/// (`(^|[^-])` consumed into the match and echoed back via `$1`, since this engine
+/// has no lookbehind): `--password` contains the literal substring `-p`
+/// (second dash + "p"), so an unanchored `-p` pattern matches *inside* the
+/// `--password=[REDACTED]` this list's own earlier entry just produced — greedily
+/// consuming through the `=` and brackets — and clobbers it into `--p[REDACTED]`.
+/// Order matters here: this only bites because `--password` runs first.
+const READLINE_PATTERNS: &[(&str, &str)] = &[
+    // "export FOO=bar", "export FOO='bar'", "export FOO=\"bar\""
+    (
+        r#"(?i)\b(export\s+\w+)=(['"]?)([^'"\s]+)(['"]?)"#,
+        "$1=[REDACTED]",
+    ),
+    // "--password=foo", "--password='foo'", "--password \"foo\""
+    (
+        r#"(?i)--password[=\s]+(['"]?)([^'"\s]+)(['"]?)"#,
+        "--password=[REDACTED]",
+    ),
+    // "mysql -pfoo", "mysql -p foo", "mysql -p'foo'" — but not "--password"
+    (
+        r#"(?i)(^|[^-])-p\s*(['"]?)([^'"\s]+)(['"]?)"#,
+        "$1-p[REDACTED]",
+    ),
+    // "aws_secret_access_key=...", "AWS_SECRET_ACCESS_KEY=..."
+    (
+        r"(?i)(aws_secret_access_key|aws_session_token)=([^\s]+)",
+        "$1=[REDACTED]",
+    ),
+    // "curl -u user:pass", "curl -u 'user:pass'"
+    (r#"-u\s+(['"]?)([^'"\s]+)(['"]?)"#, "-u [REDACTED]"),
+];
 
 /// Redacts sensitive data from shell readline inputs (passwords, secrets).
 ///
@@ -79,46 +118,28 @@ pub fn redact_tls_data(mut data: Vec<u8>) -> Vec<u8> {
 /// assert_eq!(redacted, "export DATABASE_PASSWORD=[REDACTED]");
 /// ```
 pub fn redact_readline_input(mut input: String) -> String {
-    // Redact export statements with secrets
-    // Matches: "export FOO=bar", "export FOO='bar'", "export FOO=\"bar\""
-    input = redact_pattern(
-        &input,
-        r#"(?i)\b(export\s+\w+)=(['"]?)([^'"\s]+)\2"#,
-        "$1=[REDACTED]",
-    );
-
-    // Redact --password= flags
-    // Matches: "--password=foo", "--password='foo'", "--password \"foo\""
-    input = redact_pattern(
-        &input,
-        r#"(?i)--password[=\s]+(['"]?)([^'"\s]+)\1"#,
-        "--password=[REDACTED]",
-    );
-
-    // Redact -p flag for mysql/psql
-    // Matches: "mysql -pfoo", "mysql -p foo", "mysql -p'foo'"
-    input = redact_pattern(&input, r#"(?i)-p\s*(['"]?)([^'"\s]+)\1"#, "-p[REDACTED]");
-
-    // Redact AWS-style credentials
-    // Matches: "aws_secret_access_key=...", "AWS_SECRET_ACCESS_KEY=..."
-    input = redact_pattern(
-        &input,
-        r"(?i)(aws_secret_access_key|aws_session_token)=([^\s]+)",
-        "$1=[REDACTED]",
-    );
-
-    // Redact curl -u (basic auth)
-    // Matches: "curl -u user:pass", "curl -u 'user:pass'"
-    input = redact_pattern(&input, r#"-u\s+(['"]?)([^'"\s]+)\1"#, "-u [REDACTED]");
-
+    for (pattern, replacement) in READLINE_PATTERNS {
+        input = redact_pattern(&input, pattern, replacement);
+    }
     input
 }
 
-/// Helper: applies a regex pattern replacement. Returns original string if regex fails.
+/// Helper: applies a regex pattern replacement.
+///
+/// Every pattern used by this module is static and covered by `all_patterns_compile`,
+/// so a `Regex::new` failure here means a pattern regressed, not bad input. #251 was
+/// exactly this: patterns failing to compile and this fallback silently returning the
+/// unredacted original with no signal anywhere that redaction had stopped working.
+/// Log loudly and fail open (return the original text) rather than panic — dropping a
+/// capture event or crashing the sensor over a redaction bug is a worse outcome than a
+/// best-effort, non-security-boundary redaction pass being skipped for one pattern.
 fn redact_pattern(text: &str, pattern: &str, replacement: &str) -> String {
     match regex::Regex::new(pattern) {
         Ok(re) => re.replace_all(text, replacement).into_owned(),
-        Err(_) => text.to_string(), // Defensive: invalid regex shouldn't break capture
+        Err(err) => {
+            log::error!("redact_pattern: pattern {pattern:?} failed to compile: {err}");
+            text.to_string()
+        }
     }
 }
 
@@ -223,6 +244,16 @@ mod tests {
         let input = "ls -la /home/user".to_string();
         let redacted = redact_readline_input(input.clone());
         assert_eq!(redacted, input); // Unchanged
+    }
+
+    #[test]
+    fn all_patterns_compile() {
+        for (pattern, _) in TLS_PATTERNS.iter().chain(READLINE_PATTERNS.iter()) {
+            assert!(
+                regex::Regex::new(pattern).is_ok(),
+                "pattern failed to compile: {pattern}"
+            );
+        }
     }
 
     #[test]
