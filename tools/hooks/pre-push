@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Opt-in pre-push gate: runs the fast slice of the gauntlet before every push.
+# Enable with:  git config core.hooksPath tools/hooks
+# The cross-target and docs passes stay manual (tools/gauntlet.sh, no --fast) —
+# a full matrix on every push is too slow to survive as a habit.
+exec "$(dirname "$0")/../gauntlet.sh" --fast

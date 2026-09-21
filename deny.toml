@@ -45,6 +45,13 @@ allow = [
 name = "webpki-root-certs"
 allow = ["CDLA-Permissive-2.0"]
 
+[[licenses.exceptions]]
+# Same CDLA-Permissive-2.0 story as webpki-root-certs above, sibling crate: the
+# Mozilla CA bundle ureq's rustls verifier ships (transport's TLS to the control
+# plane, and ort-sys's build-time downloader). Certificate DATA, not code.
+name = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
