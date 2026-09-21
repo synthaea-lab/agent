@@ -111,11 +111,15 @@ $cargoBin = Join-Path $cargoHome "bin"
 if ($env:Path -notlike "*$cargoBin*") {
     $env:Path = "$cargoBin;$env:Path"
 }
-[Environment]::SetEnvironmentVariable(
-    "Path",
-    "$cargoBin;" + [Environment]::GetEnvironmentVariable("Path", "User"),
-    "User"
-)
+# Guarded the same way as the in-session $env:Path update just above: without
+# this check, every re-provision (`vagrant provision win11` is documented as
+# idempotent) prepended another copy of $cargoBin onto the persistent
+# User-scope PATH, growing it unbounded across re-runs instead of actually
+# being a no-op - found during #223's real-machine validation.
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($userPath -notlike "*$cargoBin*") {
+    [Environment]::SetEnvironmentVariable("Path", "$cargoBin;$userPath", "User")
+}
 
 & "$cargoBin\rustc.exe" --version
 & "$cargoBin\cargo.exe" --version
