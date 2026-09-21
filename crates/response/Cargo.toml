@@ -10,3 +10,5 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+policy = { path = "../policy" }
+sha2 = "0.11"

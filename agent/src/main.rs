@@ -48,6 +48,15 @@ enum Command {
         /// consumed by ML calibration and lab assertions).
         #[arg(long, default_value = "events.jsonl")]
         events: std::path::PathBuf,
+        /// Enables automated process termination on a high-confidence correlated
+        /// verdict (issue #25). Off by default: observe-only — logs what would have
+        /// been killed without acting. See `policy::ResponsePolicy`.
+        #[arg(long)]
+        enable_kill: bool,
+        /// Enables automated quarantine of a payload a scan confirms malicious
+        /// (issue #25). Off by default: observe-only. See `policy::ResponsePolicy`.
+        #[arg(long)]
+        enable_quarantine: bool,
     },
     /// Captures a baseline of healthy activity to train the ML models: records the
     /// command lines of exec events that trigger no deterministic rule, as
@@ -71,7 +80,12 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Status => commands::cmd_status(),
-        Command::Run { alerts, events } => commands::cmd_run(&alerts, &events),
+        Command::Run {
+            alerts,
+            events,
+            enable_kill,
+            enable_quarantine,
+        } => commands::cmd_run(&alerts, &events, enable_kill, enable_quarantine),
         Command::CaptureBaseline { output } => commands::cmd_capture_baseline(&output),
         Command::CaptureEvents { output } => commands::cmd_capture_events(&output),
     }

@@ -22,6 +22,23 @@ use crate::sink::DetectionSink;
 const NO_CANARY_SILENCE_DEADLINE_NS: u64 = 120_000_000_000; // 120s
 const NETLINK_SILENCE_DEADLINE_NS: u64 = 3 * NETLINK_POLL_INTERVAL.as_secs() * 1_000_000_000;
 
+/// The actual OS-level kill call for issue #25's automated response —
+/// `response::kill_process` takes this as an injected closure rather than calling
+/// `libc` itself, since `response` is base-tier-only and platform dispatch belongs
+/// here (CLAUDE.md: platform-specific code stays out of library crates outside
+/// `crates/sensors/*`). `SIGKILL`, not `SIGTERM`: a process correlated as
+/// compromised gets no chance to catch a signal and clean up/hide/persist further.
+fn terminate_process(pid: u32) -> std::io::Result<()> {
+    // SAFETY: `kill` with an arbitrary pid is memory-safe — a nonexistent or
+    // already-exited pid just returns `ESRCH`, surfaced via the checked return code.
+    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// `RuleState` pre-filled with the processes already running at startup — without
 /// it, the parent-side exclusions and lineage rules don't apply to processes
 /// launched before the agent, the most common case in practice (see `RuleState`).
@@ -128,7 +145,12 @@ fn has_bpf_capabilities() -> bool {
 /// it). Both feed the same `DetectionSink`, shared via `Arc` (`schema::sensor`'s
 /// blanket `EventSink for Arc<T>`) since `LinuxSensor::run` needs to own its sink
 /// for `Sensor`'s lifetime but the poller thread outlives no particular caller.
-pub(crate) fn cmd_run(alerts: &std::path::Path, events: &std::path::Path) -> anyhow::Result<()> {
+pub(crate) fn cmd_run(
+    alerts: &std::path::Path,
+    events: &std::path::Path,
+    enable_kill: bool,
+    enable_quarantine: bool,
+) -> anyhow::Result<()> {
     // Kill-loudness (#71): must run before any other thread exists — the signal mask
     // set here is inherited by every thread spawned below, including `DetectionSink`'s
     // own worker threads.
@@ -142,6 +164,23 @@ pub(crate) fn cmd_run(alerts: &std::path::Path, events: &std::path::Path) -> any
         alerts.display(),
         events.display()
     );
+
+    // Automated response (#25): policy off by default (observe-only), opted into
+    // per flag. Quarantine lands next to alerts.ndjson, the same "derived, no
+    // separate flag" convention `heartbeat::heartbeat_path_for` uses for #102.
+    sink.enable_response(
+        policy::ResponsePolicy {
+            kill_enabled: enable_kill,
+            quarantine_enabled: enable_quarantine,
+        },
+        terminate_process,
+        alerts.with_file_name("quarantine"),
+    );
+    if enable_kill || enable_quarantine {
+        eprintln!(
+            "response: kill={enable_kill} quarantine={enable_quarantine} (see alerts.ndjson for RESPONSE-* entries)"
+        );
+    }
 
     // Sensor-silence detection (#71): one heartbeat per sensor, pulsed as each
     // processes events/polls, watched by a dedicated thread — see `silence`'s doc.

@@ -169,6 +169,37 @@ impl Default for EventLogPolicy {
     }
 }
 
+/// Enablement for `response`'s automated, verdict-driven actions (issue #25).
+/// `response` is base-tier-only (`tools/check-deps.py`: leaf crates depend on
+/// `schema`+`policy` alone), so it cannot read a live config/loader either — same
+/// posture as [`EventLogPolicy`]: the `agent` binary owns/constructs this at
+/// startup and passes it into `response::kill_process`/`quarantine_file` on every
+/// call, rather than the response crate reaching for global state.
+///
+/// Defaults to **both disabled** — "policy off = observe-only" is issue #25's own
+/// acceptance criterion, and an EDR that starts acting on the endpoint the moment
+/// it's compiled in, before an operator opts in, is the wrong default for a kill
+/// switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResponsePolicy {
+    /// Automated process termination on a high-confidence correlated verdict.
+    pub kill_enabled: bool,
+    /// Automated quarantine of a payload a scan confirms malicious.
+    pub quarantine_enabled: bool,
+}
+
+#[cfg(test)]
+mod response_policy_tests {
+    use super::ResponsePolicy;
+
+    #[test]
+    fn default_is_observe_only() {
+        let policy = ResponsePolicy::default();
+        assert!(!policy.kill_enabled);
+        assert!(!policy.quarantine_enabled);
+    }
+}
+
 #[cfg(test)]
 mod eventlog_policy_tests {
     use super::EventLogPolicy;

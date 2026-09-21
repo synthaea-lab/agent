@@ -129,7 +129,16 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_run(alerts: &std::path::Path, events: &std::path::Path) -> anyhow::Result<()> {
+/// `enable_kill`/`enable_quarantine` are accepted for CLI-signature parity with the
+/// Linux path but not wired here yet (issue #25 is Linux-first, matching #71/#103's
+/// precedent) — `DetectionSink::enable_response` is never called, so response stays
+/// fully inactive on Windows regardless of these flags.
+pub(crate) fn cmd_run(
+    alerts: &std::path::Path,
+    events: &std::path::Path,
+    _enable_kill: bool,
+    _enable_quarantine: bool,
+) -> anyhow::Result<()> {
     let sink = DetectionSink::new(seeded_rule_state(), alerts, events)?;
     eprintln!("Synthaea agent — detection active (Ctrl-C to stop)");
     eprintln!(

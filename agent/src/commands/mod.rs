@@ -26,7 +26,12 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
-pub(crate) fn cmd_run(_alerts: &std::path::Path, _events: &std::path::Path) -> anyhow::Result<()> {
+pub(crate) fn cmd_run(
+    _alerts: &std::path::Path,
+    _events: &std::path::Path,
+    _enable_kill: bool,
+    _enable_quarantine: bool,
+) -> anyhow::Result<()> {
     anyhow::bail!(UNSUPPORTED_PLATFORM)
 }
 

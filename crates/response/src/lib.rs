@@ -11,5 +11,14 @@
 //!
 //! One crate on purpose: both halves execute privileged actions under the same
 //! policy and audit rules; splitting them invited two enforcement paths.
+//!
+//! Issue #25 ships the first two automated actions: [`kill`] and [`quarantine`].
+//! Host isolation and [`live`] (blocked on `transport`/server-side analyst auth)
+//! are follow-up scope.
 
+pub mod kill;
 pub mod live;
+pub mod quarantine;
+
+pub use kill::{KillOutcome, kill_process};
+pub use quarantine::{QuarantineOutcome, quarantine_file, unquarantine};

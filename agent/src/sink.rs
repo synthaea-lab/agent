@@ -4,13 +4,30 @@
 //! scorer plug in here as their crates are migrated (M2), each addition a new field
 //! and a few lines in `on_event`.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use policy::ResponsePolicy;
 use schema::{Event, sensor::EventSink};
 use sinks::{AlertRecord, JsonlWriter};
 
 use crate::enrich_queue::EnrichQueue;
+
+/// Wires issue #25's automated response into the sink once `enable_response` sets it
+/// (Linux only for this pass — see `commands::linux::cmd_run`). Held behind
+/// `Arc<Mutex<Option<_>>>` rather than a constructor parameter because the YARA scan
+/// queue's callback closure is created inside `DetectionSink::new` itself, before a
+/// caller has a `&DetectionSink` to configure — the shared cell lets both `correlate`
+/// and that closure read whatever was set (or nothing, on a platform that never
+/// calls `enable_response`) without restructuring construction order.
+struct ResponseHooks {
+    policy: ResponsePolicy,
+    /// The actual OS-level kill call, injected by the caller: `response` is
+    /// base-tier-only and platform dispatch belongs to the binary (CLAUDE.md).
+    terminate: Box<dyn Fn(u32) -> std::io::Result<()> + Send + Sync>,
+    quarantine_dir: PathBuf,
+}
 
 /// Dispatches every event to the detection engines and the output sinks. `Mutex`
 /// around the mutable state (`RuleState`) rather than no synchronization: the
@@ -37,6 +54,9 @@ pub(crate) struct DetectionSink {
     /// "the process is scheduled" — to `watchdog::supervise::HeartbeatMonitor`.
     /// See `progress_handle`.
     progress: Arc<AtomicU64>,
+    /// Issue #25's automated response, `None` until (if ever) `enable_response` sets
+    /// it — see [`ResponseHooks`].
+    response: Arc<Mutex<Option<ResponseHooks>>>,
 }
 
 impl DetectionSink {
@@ -54,15 +74,38 @@ impl DetectionSink {
         let enrich_queue = EnrichQueue::start(enrich::Enricher::new(), move |event| {
             events_log.write(&event);
         });
+        let response: Arc<Mutex<Option<ResponseHooks>>> = Arc::new(Mutex::new(None));
         Ok(Self {
             rule_state: Mutex::new(rule_state),
             correlator: Mutex::new(correlator::CorrelationEngine::new()),
             sigma: load_sigma_rules(),
-            yara: start_yara(alert_log.clone()),
+            yara: start_yara(alert_log.clone(), response.clone()),
             alert_log,
             enrich_queue,
             progress: Arc::new(AtomicU64::new(0)),
+            response,
         })
+    }
+
+    /// Activates issue #25's automated response — process kill on a high-confidence
+    /// correlated (`BAYES`) verdict, quarantine on a confirmed YARA match. Not called
+    /// at all on a platform that doesn't wire it (Windows, for this pass), so
+    /// `response` stays `None` and every action reports
+    /// [`response::KillOutcome::ObserveOnly`]/[`response::QuarantineOutcome::ObserveOnly`]
+    /// regardless of `policy` — the same as if this were never called, which is
+    /// deliberate: not opting in and opting in with policy fully disabled must look
+    /// identical to an audit consumer.
+    pub(crate) fn enable_response(
+        &self,
+        policy: ResponsePolicy,
+        terminate: impl Fn(u32) -> std::io::Result<()> + Send + Sync + 'static,
+        quarantine_dir: PathBuf,
+    ) {
+        *self.response.lock().unwrap() = Some(ResponseHooks {
+            policy,
+            terminate: Box::new(terminate),
+            quarantine_dir,
+        });
     }
 
     /// Returns a reference to the enrichment queue for health telemetry.
@@ -80,10 +123,44 @@ impl DetectionSink {
     }
 
     /// Cross-event correlation (co-occurrence rules + Bayesian belief).
+    ///
+    /// `BAYES` is today's only correlator output with a real number behind it (the
+    /// belief engine's `log_odds`, gated by its own threshold before it ever fires —
+    /// see `correlator::bayes`); the co-occurrence rules carry no confidence field.
+    /// Issue #131 (verdict fusion) will give this a principled score to key off
+    /// instead of a technique-name check.
     fn correlate(&self, event: &Event) {
-        for alert in self.correlator.lock().unwrap().on_event(event.clone()) {
+        let alerts = self.correlator.lock().unwrap().on_event(event.clone());
+        let is_high_confidence = alerts.iter().any(|alert| alert.technique == "BAYES");
+        for alert in &alerts {
             self.emit(alert.technique, &alert.message);
         }
+        if is_high_confidence {
+            self.maybe_kill(event.meta().pid);
+        }
+    }
+
+    /// Issue #25: policy-gates killing the process behind a high-confidence
+    /// correlated verdict. A no-op whenever `enable_response` was never called.
+    fn maybe_kill(&self, pid: u32) {
+        let guard = self.response.lock().unwrap();
+        let Some(hooks) = guard.as_ref() else {
+            return;
+        };
+        let outcome = response::kill_process(pid, &hooks.policy, |p| (hooks.terminate)(p));
+        drop(guard);
+        let message = match outcome {
+            response::KillOutcome::Killed { pid } => {
+                format!("killed pid {pid} on a high-confidence correlated verdict")
+            }
+            response::KillOutcome::ObserveOnly { pid } => {
+                format!("pid {pid} would have been killed on a high-confidence correlated verdict (observe-only)")
+            }
+            response::KillOutcome::Failed { pid, error } => {
+                format!("failed to kill pid {pid} on a high-confidence correlated verdict: {error}")
+            }
+        };
+        self.emit("RESPONSE-KILL", &message);
     }
 
     /// Exec events: stateless rules, stateful rules, then Sigma.
@@ -194,13 +271,19 @@ fn load_sigma_rules() -> Option<sigma::SigmaEngine> {
 }
 
 /// Loads rules/yara when present and starts the scan worker; matches are emitted as
-/// alerts by the worker thread through the shared alert log.
-fn start_yara(alert_log: Arc<JsonlWriter>) -> Option<yara::ScanQueue> {
+/// alerts by the worker thread through the shared alert log, and — issue #25 —
+/// trigger quarantine of the matched file through `response`, whenever
+/// `enable_response` set it.
+fn start_yara(
+    alert_log: Arc<JsonlWriter>,
+    response: Arc<Mutex<Option<ResponseHooks>>>,
+) -> Option<yara::ScanQueue> {
     let dir = content_dir("rules/yara")?;
     match yara::RuleSet::load_dir(&dir) {
         Ok(rules) => {
             log::info!("yara: {} rules loaded", rules.rule_count());
             Some(yara::ScanQueue::start(rules, move |outcome| {
+                let matched = !outcome.matches.is_empty();
                 for rule in &outcome.matches {
                     let message = format!("yara rule {rule} matched {}", outcome.path.display());
                     eprintln!("\x1b[1;31m[ALERT] YARA — {message}\x1b[0m");
@@ -210,6 +293,9 @@ fn start_yara(alert_log: Arc<JsonlWriter>) -> Option<yara::ScanQueue> {
                         message,
                     });
                 }
+                if matched {
+                    quarantine_matched_payload(&response, &outcome.path, &alert_log);
+                }
             }))
         }
         Err(e) => {
@@ -217,6 +303,53 @@ fn start_yara(alert_log: Arc<JsonlWriter>) -> Option<yara::ScanQueue> {
             None
         }
     }
+}
+
+/// Issue #25: policy-gates quarantining a YARA-confirmed payload. A no-op whenever
+/// `enable_response` was never called — same posture as `DetectionSink::maybe_kill`.
+fn quarantine_matched_payload(
+    response: &Mutex<Option<ResponseHooks>>,
+    path: &std::path::Path,
+    alert_log: &JsonlWriter,
+) {
+    let guard = response.lock().unwrap();
+    let Some(hooks) = guard.as_ref() else {
+        return;
+    };
+    // A quarantined file is written under `quarantine_dir` — that write is itself a
+    // FileOpen the sensor sees, which would otherwise re-match and re-"quarantine"
+    // the file into itself, overwriting its own `.origin` sidecar with the wrong
+    // "original" path (real behavior observed on the lab VM). Once a payload is
+    // already there, leave it alone.
+    if path.starts_with(&hooks.quarantine_dir) {
+        return;
+    }
+    let outcome = response::quarantine_file(path, &hooks.quarantine_dir, &hooks.policy);
+    drop(guard);
+    let message = match outcome {
+        response::QuarantineOutcome::Quarantined {
+            original,
+            quarantined_at,
+            sha256_hex,
+        } => format!(
+            "quarantined {} ({sha256_hex}) to {} on a confirmed YARA match",
+            original.display(),
+            quarantined_at.display()
+        ),
+        response::QuarantineOutcome::ObserveOnly { path } => format!(
+            "{} would have been quarantined on a confirmed YARA match (observe-only)",
+            path.display()
+        ),
+        response::QuarantineOutcome::Failed { path, error } => {
+            format!("failed to quarantine {} on a confirmed YARA match: {error}", path.display())
+        }
+    };
+    eprintln!("\x1b[1;31m[ALERT] RESPONSE-QUARANTINE — {message}\x1b[0m");
+    alert_log.write(&AlertRecord {
+        timestamp_ns: crate::time::now_ns(),
+        technique: "RESPONSE-QUARANTINE".to_string(),
+        message,
+    });
 }
 
 impl EventSink for DetectionSink {
