@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
 
-use crate::paths::{child_log_path, resolve_agent_bin};
+use super::resolve_paths;
+use crate::paths::child_log_path;
 
 const LAUNCHD_LABEL: &str = "com.synthaea.agent";
 const LAUNCHD_PLIST: &str = "/Library/LaunchDaemons/com.synthaea.agent.plist";
@@ -61,34 +62,26 @@ fn launchd_plist(watchdog: &Path, agent: &Path, alerts: &Path) -> String {
 }
 
 pub(crate) fn cmd_install(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Result<()> {
-    let agent = resolve_agent_bin(agent_bin)?;
-    anyhow::ensure!(agent.exists(), "agent not found: {}", agent.display());
-
-    let agent_abs = agent
-        .canonicalize()
-        .with_context(|| format!("canonicalize {}", agent.display()))?;
-    let watchdog_abs = std::env::current_exe()
-        .context("current_exe")?
-        .canonicalize()
-        .context("canonicalize watchdog")?;
-
-    // launchd daemons start with `/` as working directory — pin the alerts path
-    // down before it lands in the plist.
-    let alerts_abs =
-        std::path::absolute(&alerts).with_context(|| format!("absolutize {}", alerts.display()))?;
-    if let Some(parent) = alerts_abs.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-    }
+    // Shared with the Linux arms — including the #103 world-writable/ownership
+    // hardening this arm used to silently drop (the check existed only on
+    // Linux, so a macOS install from ~/Downloads passed unexamined).
+    let paths = resolve_paths(agent_bin, alerts)?;
 
     std::fs::write(
         LAUNCHD_PLIST,
-        launchd_plist(&watchdog_abs, &agent_abs, &alerts_abs),
+        launchd_plist(&paths.watchdog_abs, &paths.agent_abs, &paths.alerts_abs),
     )
     .with_context(|| format!("writing {LAUNCHD_PLIST} (root required)"))?;
+    // #103: same treatment the systemd unit gets — don't rely on umask for a
+    // root-owned service definition's permissions.
+    crate::tamper::harden_permissions(Path::new(LAUNCHD_PLIST), 0o644)
+        .with_context(|| format!("hardening permissions on {LAUNCHD_PLIST}"))?;
+    crate::tamper::harden_ownership(Path::new(LAUNCHD_PLIST))
+        .with_context(|| format!("hardening ownership on {LAUNCHD_PLIST}"))?;
     run_launchctl(&["bootstrap", "system", LAUNCHD_PLIST])?;
 
     println!("[watchdog] launchd daemon installed and started.");
-    println!("  Alerts: {}", alerts_abs.display());
+    println!("  Alerts: {}", paths.alerts_abs.display());
     println!("  Check: watchdog status");
     println!(
         "  Logs : /var/log/synthaea-watchdog.log (watchdog); agent output in {}",

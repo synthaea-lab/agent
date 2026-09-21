@@ -189,6 +189,16 @@ pub(crate) fn cmd_install(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow
     reset_service_acl_best_effort();
 
     // The service points at the watchdog itself (not the agent).
+    //
+    // KNOWN GAP (#103): the Unix arms run `service::resolve_paths` here, which
+    // refuses a world-writable install directory and normalizes owner/mode on
+    // both binaries. There is no Windows analogue yet — mode bits don't exist,
+    // the equivalent is a DACL audit (does any non-admin SID hold FILE_WRITE_*
+    // on the directory?), which is real security-descriptor FFI that must be
+    // written and validated against a lab VM, not approximated blind. Until
+    // then the MSI's Program Files default (admin-writable only) is the
+    // mitigation; a portable install to a user-writable directory is NOT
+    // checked here the way it is on Unix.
     let watchdog_abs = std::env::current_exe()
         .context("current_exe")?
         .canonicalize()

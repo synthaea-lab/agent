@@ -70,3 +70,91 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
         Ok(())
     }
 }
+
+// ── Shared install-path resolution + #103 hardening (Unix service arms) ──────
+
+/// Paths baked into the generated unit/script: absolute, so they survive the
+/// service manager starting the process with `/` as its working directory.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct ResolvedPaths {
+    pub(crate) watchdog_abs: std::path::PathBuf,
+    pub(crate) agent_abs: std::path::PathBuf,
+    pub(crate) alerts_abs: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+pub(crate) fn resolve_paths(
+    agent_bin: Option<std::path::PathBuf>,
+    alerts: std::path::PathBuf,
+) -> anyhow::Result<ResolvedPaths> {
+    use anyhow::Context as _;
+
+    let agent = crate::paths::resolve_agent_bin(agent_bin)?;
+    anyhow::ensure!(agent.exists(), "agent not found: {}", agent.display());
+    let agent_abs = agent
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", agent.display()))?;
+
+    // The unit/script runs the watchdog (layer 2), which supervises the agent
+    // (layer 1) — same shape as the Windows SCM service and the launchd daemon.
+    let watchdog_abs = std::env::current_exe()
+        .context("current_exe")?
+        .canonicalize()
+        .context("canonicalize watchdog")?;
+
+    // #103: refuse to install pointing at a binary an unprivileged user could
+    // overwrite in place — the integrity check `supervise::watchdog_loop` does
+    // at every respawn is worthless if the file it re-hashes lives in a
+    // directory anyone can drop a replacement into.
+    for bin in [&agent_abs, &watchdog_abs] {
+        if let Some(dir) = bin.parent() {
+            crate::tamper::refuse_world_writable_dir(dir)
+                .with_context(|| format!("checking install directory for {}", bin.display()))?;
+        }
+        crate::tamper::harden_permissions(bin, 0o755)
+            .with_context(|| format!("hardening permissions on {}", bin.display()))?;
+        crate::tamper::harden_ownership(bin)
+            .with_context(|| format!("hardening ownership on {}", bin.display()))?;
+    }
+
+    let alerts_abs =
+        std::path::absolute(&alerts).with_context(|| format!("absolutize {}", alerts.display()))?;
+    if let Some(parent) = alerts_abs.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+
+    Ok(ResolvedPaths {
+        watchdog_abs,
+        agent_abs,
+        alerts_abs,
+    })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::resolve_paths;
+
+    /// #103 parity regression: `resolve_paths` is the shared install gate, so a
+    /// world-writable agent directory must be refused on every Unix arm — the
+    /// macOS installer used to inline its own resolution and silently skip
+    /// this check (it existed only in `service/linux.rs`).
+    #[test]
+    fn install_refuses_agent_in_world_writable_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("wd-ww-install-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let agent = dir.join("agent");
+        std::fs::write(&agent, b"#!/bin/sh\n").unwrap();
+
+        let err = resolve_paths(Some(agent), dir.join("alerts.ndjson"))
+            .expect_err("a world-writable agent directory must be refused");
+        assert!(
+            format!("{err:#}").contains("world-writable"),
+            "unexpected error: {err:#}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
