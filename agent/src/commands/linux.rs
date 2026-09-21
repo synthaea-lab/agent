@@ -469,7 +469,7 @@ fn spawn_journal_tail(sink: Arc<DetectionSink>, heartbeat: SensorHeartbeat) {
 }
 
 /// Spawns the background thread running the uprobes sensor (issue #90: TLS
-/// plaintext taps via SSL_read/SSL_write uprobes, shell readline capture) when at
+/// plaintext taps via `SSL_read`/`SSL_write` uprobes, shell readline capture) when at
 /// least one capture is enabled by CLI flag. Only called when the caller has
 /// already checked `enable_tls_capture || enable_readline_capture` — `cmd_run`
 /// doesn't spawn this thread at all otherwise, so a deliberately-disabled capture

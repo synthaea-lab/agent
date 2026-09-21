@@ -62,7 +62,7 @@ enum Command {
         /// (issue #25). Off by default: observe-only. See `policy::ResponsePolicy`.
         #[arg(long)]
         enable_quarantine: bool,
-        /// Enables TLS plaintext capture via SSL_read/SSL_write uprobes (issue #90):
+        /// Enables TLS plaintext capture via `SSL_read`/`SSL_write` uprobes (issue #90):
         /// pre-encryption content visibility, budgeted and redacted. Off by default —
         /// captures process traffic before it's encrypted, opt-in only. Linux only.
         #[arg(long)]
