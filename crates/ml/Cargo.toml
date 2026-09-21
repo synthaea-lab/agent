@@ -9,10 +9,22 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Default feature enables dynamic ONNX Runtime for easy dev builds.
+# Production builds disable this and use manually-built static libraries.
+#
+# Dev builds (default):     cargo build/test (downloads onnxruntime)
+# Production builds:         cargo build --release --no-default-features
+#                            Requires ORT_LIB_LOCATION + manual build (see README)
+default = ["dynamic-onnx"]
+dynamic-onnx = ["ort/download-binaries", "ort/tls-rustls"]
+
 [dependencies]
 schema = { path = "../schema" }
 correlator = { path = "../correlator" }
 thiserror = { workspace = true }
+# Workspace ort is configured with default-features = false.
+# The dynamic-onnx feature (enabled by default) re-enables download-binaries for dev builds.
 ort = { workspace = true }
 
 [dev-dependencies]
