@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use schema::{
     AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileOpenEvent,
-    SmbConnectEvent, User,
+    SmbConnectEvent,
 };
 
 use crate::{CorrelationEngine, bayes::PRIOR_LOG_ODDS};
@@ -20,10 +20,9 @@ fn meta_full(pid: u32, ppid: u32, comm: &str, ts_ns: u64) -> EventMeta {
     EventMeta {
         pid,
         ppid,
-        user: User::Unknown,
         timestamp_ns: ts_ns,
         comm: comm.to_string(),
-        container: None,
+        ..schema::fixtures::meta()
     }
 }
 
@@ -35,12 +34,7 @@ fn exec_with_meta(meta: EventMeta, image_path: &str) -> Event {
     Event::Exec(ExecEvent {
         meta,
         image_path: image_path.to_string(),
-        cmdline: String::new(),
-        argv: vec![],
-        parent_comm: None,
-        parent_image_path: None,
-        sha256: None,
-        signature: None,
+        ..schema::fixtures::exec()
     })
 }
 
@@ -97,8 +91,7 @@ fn dns_query_event(pid: u32, ts_ns: u64, query: &str) -> Event {
         meta: meta(pid, ts_ns),
         query: query.to_string(),
         qtype: 1, // A
-        result: None,
-        status: 0,
+        ..schema::fixtures::dns_query()
     })
 }
 

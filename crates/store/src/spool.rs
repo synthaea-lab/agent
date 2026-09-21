@@ -433,25 +433,19 @@ mod tests {
 
     #[test]
     fn spools_schema_events() {
-        use schema::{Event, EventMeta, ExecEvent, User};
+        use schema::{Event, EventMeta, ExecEvent};
         let dir = tmp("schema");
         let mut spool = EventSpool::open(&dir, u64::MAX).unwrap();
         let event = Event::Exec(ExecEvent {
             meta: EventMeta {
                 pid: 1,
-                ppid: 0,
-                user: User::Unknown,
                 timestamp_ns: 42,
                 comm: "x".into(),
-                container: None,
+                ..schema::fixtures::meta()
             },
             image_path: "/bin/x".into(),
             cmdline: "x".into(),
-            argv: vec![],
-            parent_comm: None,
-            parent_image_path: None,
-            sha256: None,
-            signature: None,
+            ..schema::fixtures::exec()
         });
         spool.push(&event).unwrap();
         let got: Vec<Event> = spool.drain_oldest().unwrap();

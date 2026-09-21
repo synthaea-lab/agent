@@ -101,7 +101,7 @@ fn enrich_event(enricher: &mut Enricher, event: &mut Event) {
 mod tests {
     use std::sync::Mutex;
 
-    use schema::{Event, EventMeta, ExecEvent, User};
+    use schema::{Event, EventMeta, ExecEvent};
 
     use super::*;
 
@@ -109,19 +109,11 @@ mod tests {
         Event::Exec(ExecEvent {
             meta: EventMeta {
                 pid: 1,
-                ppid: 0,
-                user: User::Unknown,
-                timestamp_ns: 0,
                 comm: "t".into(),
-                container: None,
+                ..schema::fixtures::meta()
             },
             image_path: image_path.to_string(),
-            cmdline: String::new(),
-            argv: vec![],
-            parent_comm: None,
-            parent_image_path: None,
-            sha256: None,
-            signature: None,
+            ..schema::fixtures::exec()
         })
     }
 

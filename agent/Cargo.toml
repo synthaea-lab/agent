@@ -46,3 +46,6 @@ libc = "0.2"
 # test below exercises it.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 sensor-linux-lsm = { path = "../crates/sensors/linux/lsm" }
+
+[dev-dependencies]
+schema = { path = "../crates/schema", features = ["test-fixtures"] }

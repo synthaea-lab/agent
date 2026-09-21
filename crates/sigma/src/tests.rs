@@ -1,7 +1,7 @@
 //! Sigma engine tests — load-time validation and evaluation behavior, including
 //! the regression tests for the review findings on the migration PRs.
 
-use schema::{EventMeta, ExecEvent, User};
+use schema::{EventMeta, ExecEvent};
 
 use crate::{
     eval::{eval_rule_exec, glob_match},
@@ -13,19 +13,12 @@ fn exec(image: &str, cmdline: &str) -> ExecEvent {
     ExecEvent {
         meta: EventMeta {
             pid: 1,
-            ppid: 0,
-            user: User::Unknown,
-            timestamp_ns: 0,
             comm: "test".into(),
-            container: None,
+            ..schema::fixtures::meta()
         },
         image_path: image.to_string(),
         cmdline: cmdline.to_string(),
-        argv: vec![],
-        parent_comm: None,
-        parent_image_path: None,
-        sha256: None,
-        signature: None,
+        ..schema::fixtures::exec()
     }
 }
 

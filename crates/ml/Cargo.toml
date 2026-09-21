@@ -17,6 +17,7 @@ ort = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+schema = { path = "../schema", features = ["test-fixtures"] }
 # Integration tests (capture_parity, correlation_scorer) build event windows and
 # score end-to-end: events -> schema::Event -> EventBus -> vector -> model. Both
 # crates are already in [dependencies], so tests pick them up as-is.

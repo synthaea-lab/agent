@@ -111,19 +111,9 @@ mod tests {
         Event::Exec(schema::ExecEvent {
             meta: schema::EventMeta {
                 pid: 1,
-                ppid: 0,
-                user: schema::User::Unknown,
-                timestamp_ns: 0,
-                comm: String::new(),
-                container: None,
+                ..schema::fixtures::meta()
             },
-            image_path: String::new(),
-            cmdline: String::new(),
-            argv: vec![],
-            parent_comm: None,
-            parent_image_path: None,
-            sha256: None,
-            signature: None,
+            ..schema::fixtures::exec()
         })
     }
 

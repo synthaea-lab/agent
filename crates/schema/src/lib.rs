@@ -53,6 +53,8 @@
 use serde::{Deserialize, Serialize};
 
 pub mod detection;
+#[cfg(feature = "test-fixtures")]
+pub mod fixtures;
 pub mod sensor;
 pub mod time;
 

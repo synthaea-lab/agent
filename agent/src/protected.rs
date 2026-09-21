@@ -115,10 +115,8 @@ mod tests {
             meta: schema::EventMeta {
                 pid,
                 ppid: 1,
-                user: schema::User::Unknown,
-                timestamp_ns: 0,
                 comm: comm.to_string(),
-                container: None,
+                ..schema::fixtures::meta()
             },
             path: path.to_string(),
             flags,

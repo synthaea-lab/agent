@@ -138,24 +138,17 @@ mod tests {
     fn meta(pid: u32, ts_ns: u64) -> EventMeta {
         EventMeta {
             pid,
-            ppid: 0,
             user: User::Unix { uid: 0, gid: 0 },
             timestamp_ns: ts_ns,
             comm: "proc".into(),
-            container: None,
+            ..schema::fixtures::meta()
         }
     }
 
     fn exec(pid: u32, ts_ns: u64) -> Event {
         Event::Exec(ExecEvent {
             meta: meta(pid, ts_ns),
-            image_path: String::new(),
-            cmdline: String::new(),
-            argv: vec![],
-            parent_comm: None,
-            parent_image_path: None,
-            sha256: None,
-            signature: None,
+            ..schema::fixtures::exec()
         })
     }
 
@@ -174,10 +167,7 @@ mod tests {
             daddr: daddr.parse().unwrap(),
             dport,
             protocol: 6,
-            bytes_sent: None,
-            bytes_received: None,
-            packets_sent: None,
-            packets_received: None,
+            ..schema::fixtures::network_flow()
         })
     }
 
