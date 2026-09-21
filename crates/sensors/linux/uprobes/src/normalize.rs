@@ -17,7 +17,13 @@ use sensor_linux_wire as wire;
 use crate::redact;
 
 /// Tripwire: bumping the wire ABI must come here to revisit the mappings below.
-const _: () = assert!(wire::WIRE_VERSION == 5);
+///
+/// v6 (#262) added `FileWriteEvent`/`FileDeleteEvent`/`FileRenameEvent` — neither
+/// imported here, and neither `TlsCaptureEvent` nor `ReadlineInputEvent` (the only
+/// wire structs this module maps) changed shape, so the mappings below still hold.
+///
+/// v7 (#263) added `SocketBindEvent` — not imported here either, same reasoning.
+const _: () = assert!(wire::WIRE_VERSION == 7);
 
 /// Decodes a fixed comm buffer: NUL-terminated, kernel-truncated to 15 bytes — a
 /// sensor property (reported by conformance), not a schema limit.

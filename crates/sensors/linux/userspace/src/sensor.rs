@@ -31,6 +31,12 @@ use crate::{docker::DockerContainerInfo, normalize};
 /// glibc rewrites `open()` into `openat(AT_FDCWD, ...)` since 2.26 — attaching only one
 /// of the two misses file opens on whichever libc doesn't use it. Both feed the same
 /// `FileOpenEvent`/`file_open` event type.
+///
+/// `sys_enter_write` (write/delete/rename telemetry, issue #262) covers `write(2)`
+/// only — `writev`/`pwrite64`/`pwritev` are not yet attached. `sys_enter_unlink`/
+/// `sys_enter_unlinkat` and `sys_enter_rename`/`sys_enter_renameat`/
+/// `sys_enter_renameat2` are each attached in pairs/triples for the same libc-variant
+/// reason as open above.
 pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
     ("sched_process_fork", "sched", "sched_process_fork"),
     ("sched_process_exit", "sched", "sched_process_exit"),
@@ -38,6 +44,13 @@ pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
     ("sys_enter_openat", "syscalls", "sys_enter_openat"),
     ("sys_enter_open", "syscalls", "sys_enter_open"),
     ("sys_enter_connect", "syscalls", "sys_enter_connect"),
+    ("sys_enter_write", "syscalls", "sys_enter_write"),
+    ("sys_enter_unlink", "syscalls", "sys_enter_unlink"),
+    ("sys_enter_unlinkat", "syscalls", "sys_enter_unlinkat"),
+    ("sys_enter_rename", "syscalls", "sys_enter_rename"),
+    ("sys_enter_renameat", "syscalls", "sys_enter_renameat"),
+    ("sys_enter_renameat2", "syscalls", "sys_enter_renameat2"),
+    ("sys_enter_bind", "syscalls", "sys_enter_bind"),
 ];
 
 /// `sensor_linux_wire::LineageEntry` is `repr(C)` over a `u32` and a `[u8; 16]` — every
@@ -611,8 +624,14 @@ impl LinuxSensor {
         let mut exec_ring_buf = ring("EXEC_EVENTS")?;
         let mut file_open_ring_buf = ring("FILE_OPEN_EVENTS")?;
         let mut connect_ring_buf = ring("CONNECT_EVENTS")?;
+        let mut file_write_ring_buf = ring("FILE_WRITE_EVENTS")?;
+        let mut file_delete_ring_buf = ring("FILE_DELETE_EVENTS")?;
+        let mut file_rename_ring_buf = ring("FILE_RENAME_EVENTS")?;
+        let mut socket_bind_ring_buf = ring("SOCKET_BIND_EVENTS")?;
 
-        tracing::info!("sensor-linux: listening for exec/open/connect events");
+        tracing::info!(
+            "sensor-linux: listening for exec/open/connect/write/delete/rename/bind events"
+        );
 
         let mut container_ids = CgroupIdCache::new();
         let docker_cache: DockerInfoCache = Arc::new(Mutex::new(HashMap::new()));
@@ -641,6 +660,30 @@ impl LinuxSensor {
                     drain!(guard, sensor_linux_wire::ConnectEvent, sink,
                         |e: &sensor_linux_wire::ConnectEvent| {
                             normalize::connect(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = file_write_ring_buf.readable_mut() => {
+                    drain!(guard, sensor_linux_wire::FileWriteEvent, sink,
+                        |e: &sensor_linux_wire::FileWriteEvent| {
+                            normalize::file_write(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = file_delete_ring_buf.readable_mut() => {
+                    drain!(guard, sensor_linux_wire::FileDeleteEvent, sink,
+                        |e: &sensor_linux_wire::FileDeleteEvent| {
+                            normalize::file_delete(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = file_rename_ring_buf.readable_mut() => {
+                    drain!(guard, sensor_linux_wire::FileRenameEvent, sink,
+                        |e: &sensor_linux_wire::FileRenameEvent| {
+                            normalize::file_rename(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = socket_bind_ring_buf.readable_mut() => {
+                    drain!(guard, sensor_linux_wire::SocketBindEvent, sink,
+                        |e: &sensor_linux_wire::SocketBindEvent| {
+                            normalize::socket_bind(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
             }
