@@ -133,9 +133,59 @@ fn parse_persisted_args(args: impl Iterator<Item = String>) -> (Option<PathBuf>,
     (agent_bin, alerts)
 }
 
+/// Hardened service ACL (issue #103): only `SY` (`LocalSystem`) keeps
+/// `SERVICE_STOP`/`SERVICE_PAUSE_CONTINUE`/`DELETE` — built-in Administrators
+/// (`BA`) keep query/start/interrogate/`READ_CONTROL`/`WRITE_DAC`/`WRITE_OWNER`
+/// but lose the rights an attacker with local admin (not SYSTEM) would use
+/// for a smash-and-grab `sc stop`/`sc delete`. `BA` keeping `WRITE_DAC` is
+/// deliberate: it's what lets [`cmd_uninstall`] reset the ACL back before its
+/// own `sc stop`/`sc delete`, so the *tool* still works for an admin while a
+/// bare `sc stop`/`sc delete` typed by hand does not. `IU`/`SU`/`WD`
+/// (interactive/service-logon/everyone) get read-only rights.
+///
+/// This is friction, not a real boundary — an admin can always run
+/// `watchdog uninstall`, or hand-run the same `sc sdset` this module does, to
+/// undo it. Matches the issue's own framing: detection + friction + audit
+/// trail against local admin, not a claim to stop it outright.
+const HARDENED_SERVICE_SDDL: &str = "D:(A;;GA;;;SY)(A;;CCLCSWRPLOCRRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;CCLCSWLOCRRC;;;WD)";
+
+/// The stock rights `BA` needs to `sc stop`/`sc delete` itself — restored by
+/// [`cmd_uninstall`] before it does exactly that, and by [`cmd_install`]
+/// before re-running `sc description`/`sc failure` (both `SERVICE_CHANGE_CONFIG`)
+/// on a service a previous install already hardened.
+const PERMISSIVE_SERVICE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;CCLCSWLOCRRC;;;WD)";
+
+/// Applies [`HARDENED_SERVICE_SDDL`]. Best-effort: a failure here (e.g. `sc
+/// sdset` itself blocked by some other policy) leaves the service installed
+/// and functional, just without the extra ACL friction — worth a loud
+/// warning, not worth failing an otherwise-successful install over.
+fn harden_service_acl() {
+    if let Err(e) = run_sc(&["sdset", SERVICE_NAME, HARDENED_SERVICE_SDDL]) {
+        eprintln!(
+            "[watchdog] warning: could not harden service ACL ({e}) — \
+             service is installed and running, but not protected against \
+             a non-SYSTEM sc stop/delete"
+        );
+    }
+}
+
+/// Applies [`PERMISSIVE_SERVICE_SDDL`]. Best-effort and silent on failure:
+/// called before an operation that needs the stock rights back, on a service
+/// that may not be hardened yet (fresh install) or may not exist at all
+/// (uninstall of a service that was never installed) — either is a normal,
+/// expected outcome here, not an error worth surfacing.
+fn reset_service_acl_best_effort() {
+    let _ = run_sc(&["sdset", SERVICE_NAME, PERMISSIVE_SERVICE_SDDL]);
+}
+
 pub(crate) fn cmd_install(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Result<()> {
     let agent = resolve_agent_bin(agent_bin)?;
     anyhow::ensure!(agent.exists(), "agent not found: {}", agent.display());
+
+    // Undo any hardening from a previous install before `sc description`/`sc
+    // failure` below, which need SERVICE_CHANGE_CONFIG — a no-op (harmlessly
+    // failing, ignored) on a fresh install where the service doesn't exist yet.
+    reset_service_acl_best_effort();
 
     // The service points at the watchdog itself (not the agent).
     let watchdog_abs = std::env::current_exe()
@@ -181,6 +231,7 @@ pub(crate) fn cmd_install(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow
         "restart/5000/restart/5000/restart/5000",
     ])?;
     run_sc(&["start", SERVICE_NAME])?;
+    harden_service_acl();
 
     println!("[watchdog] service \"{SERVICE_NAME}\" installed and started.");
     println!("  Alerts: {}", alerts_abs.display());
@@ -206,6 +257,11 @@ fn build_bin_path(watchdog: &Path, agent: &Path, alerts: &Path) -> String {
 }
 
 pub(crate) fn cmd_uninstall() -> anyhow::Result<()> {
+    // Undo the #103 ACL hardening first: an admin running this tool should be
+    // able to uninstall even though the hardened ACL denies a bare `sc
+    // stop`/`sc delete` to anyone but SYSTEM. Best-effort — a service that
+    // was never hardened, or never installed, just no-ops here.
+    reset_service_acl_best_effort();
     let _ = run_sc(&["stop", SERVICE_NAME]);
     run_sc(&["delete", SERVICE_NAME])?;
     println!("[watchdog] service \"{SERVICE_NAME}\" removed.");
@@ -226,6 +282,46 @@ fn run_sc(args: &[&str]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hardened_sddl_denies_stop_pause_delete_to_administrators() {
+        // The `BA` (built-in Administrators) clause must not grant WP
+        // (SERVICE_STOP), DT (SERVICE_PAUSE_CONTINUE), or SD (DELETE) — that's
+        // the entire point of #103's hardening. Isolate BA's own clause
+        // rather than scanning the whole string, since SY's clause
+        // legitimately grants all of these via GA.
+        let ba_clause = HARDENED_SERVICE_SDDL
+            .split(')')
+            .find(|clause| clause.ends_with(";;;BA"))
+            .expect("SDDL has a BA clause");
+        for right in ["WP", "DT", "SD"] {
+            assert!(
+                !ba_clause.contains(right),
+                "BA clause {ba_clause:?} must not grant {right}"
+            );
+        }
+    }
+
+    #[test]
+    fn hardened_sddl_still_lets_administrators_write_dac() {
+        // BA must keep WRITE_DAC (WD) — cmd_uninstall relies on it to reset
+        // the ACL back to PERMISSIVE_SERVICE_SDDL before its own stop/delete.
+        let ba_clause = HARDENED_SERVICE_SDDL
+            .split(')')
+            .find(|clause| clause.ends_with(";;;BA"))
+            .expect("SDDL has a BA clause");
+        assert!(ba_clause.contains("WD"), "BA clause {ba_clause:?} needs WD");
+    }
+
+    #[test]
+    fn hardened_sddl_grants_system_full_control() {
+        assert!(HARDENED_SERVICE_SDDL.contains("(A;;GA;;;SY)"));
+    }
+
+    #[test]
+    fn permissive_sddl_restores_administrators_to_full_control() {
+        assert!(PERMISSIVE_SERVICE_SDDL.contains("(A;;GA;;;BA)"));
+    }
 
     #[test]
     fn build_bin_path_quotes_each_argument() {
