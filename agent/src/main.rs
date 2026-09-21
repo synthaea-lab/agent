@@ -35,6 +35,13 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "agent")]
 struct Cli {
+    /// Path to the agent configuration file (TOML). See ADR-0013 for the
+    /// discovery order (this flag, `SYNTHAEA_CONFIG` env, OS default).
+    /// The agent refuses to start without a valid config — this is
+    /// intentional; there is no in-memory default (ADR-0013 §5).
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -91,16 +98,35 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
-    // Same operator contract env_logger had: RUST_LOG filters, "info" default.
-    // `init()` also installs the `log` bridge, so records from aya-log and other
-    // `log`-facade dependencies land in the same subscriber.
+    let cli = Cli::parse();
+
+    // Load the local install configuration BEFORE anything else — logging
+    // level, spool paths, and (soon) transport URLs all come from here, and
+    // per ADR-0013 §5 the agent fails fast if the file is missing or
+    // invalid rather than fall back on invented defaults. `config::load`
+    // returns a `ConfigError` whose Display already lists the paths it
+    // tried, so `anyhow` propagates a copy-pasteable error message.
+    let cfg = config::load(cli.config.as_deref())?;
+
+    // Init the logger with the level from the config file. `cfg.log.level` is
+    // validated at load-time to be one of trace/debug/info/warn/error.
+    // The `RUST_LOG` env variable still overrides this — matches the operator-
+    // familiar pattern for ad-hoc debug (`RUST_LOG=debug agent run` doesn't
+    // need a file edit). `init()` also installs the `log` bridge, so records
+    // from aya-log and other `log`-facade dependencies land in the same subscriber.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(cfg.log.level.as_str())),
         )
         .init();
-    let cli = Cli::parse();
+    tracing::debug!(
+        "loaded configuration (schema_version={}, log.level={}, server={})",
+        cfg.schema_version,
+        cfg.log.level,
+        cfg.server.control_plane_url
+    );
+
     match cli.command {
         Command::Status => commands::cmd_status(),
         Command::Run {

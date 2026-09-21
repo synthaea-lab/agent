@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 schema = { path = "../crates/schema" }
+config = { path = "../crates/config" }
 policy = { path = "../crates/policy" }
 rules = { path = "../crates/rules" }
 correlator = { path = "../crates/correlator" }
