@@ -497,7 +497,11 @@ fn boot_epoch_offset_ns() -> u64 {
     };
     // SAFETY: plain FFI call writing into a valid stack-owned timespec.
     let mono_ns = if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0 {
-        (ts.tv_sec as u64) * 1_000_000_000 + ts.tv_nsec as u64
+        // Saturating, matching sensor-linux-uprobes' copy of this function —
+        // the two must not drift (a candidate for sensor-linux-wire).
+        (ts.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec as u64)
     } else {
         0
     };
