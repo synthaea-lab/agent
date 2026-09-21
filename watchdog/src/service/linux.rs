@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
 
-use super::SERVICE_DESC;
-use crate::paths::{child_log_path, resolve_agent_bin};
+use super::{SERVICE_DESC, resolve_paths};
+use crate::paths::child_log_path;
 
 const SYSTEMD_UNIT: &str = "/etc/systemd/system/synthaea-agent.service";
 const OPENRC_SCRIPT: &str = "/etc/init.d/synthaea-agent";
@@ -39,56 +39,6 @@ fn detect_init_system() -> anyhow::Result<InitSystem> {
     } else {
         bail!("no supported init system detected (neither systemd nor OpenRC)")
     }
-}
-
-/// Paths baked into the generated unit/script: absolute, so they survive the
-/// service manager starting the process with `/` as its working directory.
-struct ResolvedPaths {
-    watchdog_abs: PathBuf,
-    agent_abs: PathBuf,
-    alerts_abs: PathBuf,
-}
-
-fn resolve_paths(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Result<ResolvedPaths> {
-    let agent = resolve_agent_bin(agent_bin)?;
-    anyhow::ensure!(agent.exists(), "agent not found: {}", agent.display());
-    let agent_abs = agent
-        .canonicalize()
-        .with_context(|| format!("canonicalize {}", agent.display()))?;
-
-    // The unit/script runs the watchdog (layer 2), which supervises the agent
-    // (layer 1) — same shape as the Windows SCM service and the launchd daemon.
-    let watchdog_abs = std::env::current_exe()
-        .context("current_exe")?
-        .canonicalize()
-        .context("canonicalize watchdog")?;
-
-    // #103: refuse to install pointing at a binary an unprivileged user could
-    // overwrite in place — the integrity check `supervise::watchdog_loop` does
-    // at every respawn is worthless if the file it re-hashes lives in a
-    // directory anyone can drop a replacement into.
-    for bin in [&agent_abs, &watchdog_abs] {
-        if let Some(dir) = bin.parent() {
-            crate::tamper::refuse_world_writable_dir(dir)
-                .with_context(|| format!("checking install directory for {}", bin.display()))?;
-        }
-        crate::tamper::harden_permissions(bin, 0o755)
-            .with_context(|| format!("hardening permissions on {}", bin.display()))?;
-        crate::tamper::harden_ownership(bin)
-            .with_context(|| format!("hardening ownership on {}", bin.display()))?;
-    }
-
-    let alerts_abs =
-        std::path::absolute(&alerts).with_context(|| format!("absolutize {}", alerts.display()))?;
-    if let Some(parent) = alerts_abs.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-    }
-
-    Ok(ResolvedPaths {
-        watchdog_abs,
-        agent_abs,
-        alerts_abs,
-    })
 }
 
 /// A snapshot of the installed service definition's on-disk state, taken once
