@@ -127,7 +127,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # ONNX Runtime for on-device inference (ADR-0002). Pinned RC — ort 2.0 is the first
 # line to support the ai.onnx.ml tree ops our models use; used only by `crates/ml`.
-ort = "=2.0.0-rc.13"
+# Static linking enforced (default-features = false disables download-binaries/copy-dylibs).
+ort = { version = "=2.0.0-rc.13", default-features = false }
 
 [workspace.metadata.deb]
 # Shared .deb packaging configuration (issue #36)
