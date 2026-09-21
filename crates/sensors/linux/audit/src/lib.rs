@@ -1,9 +1,17 @@
 //! # sensor-linux-audit
 //!
 //! Linux fallback sensor for hosts where eBPF is unavailable or restricted (old kernels,
-//! lockdown mode, some container hosts). Sources: audit netlink (execve, connect),
-//! fanotify (file events). Reduced fidelity versus the eBPF sensor; the conformance
-//! suite records exactly what is lost.
+//! lockdown mode, some container hosts). Source: audit netlink (execve, connect).
+//! Reduced fidelity versus the eBPF sensor; the conformance suite records exactly
+//! what is lost. fanotify was evaluated (see `docs/sensors/linux-telemetry-matrix.md`)
+//! and not built — this crate doesn't use it despite an earlier version of this doc
+//! comment implying otherwise.
+//!
+//! Also classifies `SELinux` AVC denials (`type=AVC`) — free telemetry, since this
+//! sensor already subscribes to the whole `NETLINK_AUDIT` multicast stream for
+//! execve/connect. Not yet wired to `schema::Event` (see
+//! [`classify::AuditEvent::PolicyDenial`]'s doc for why); traced via `tracing::info!`
+//! in the meantime.
 
 mod classify;
 mod normalize;
