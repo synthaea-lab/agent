@@ -95,6 +95,7 @@ impl DetectionSink {
     /// regardless of `policy` — the same as if this were never called, which is
     /// deliberate: not opting in and opting in with policy fully disabled must look
     /// identical to an audit consumer.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn enable_response(
         &self,
         policy: ResponsePolicy,
