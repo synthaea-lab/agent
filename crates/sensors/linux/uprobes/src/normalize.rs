@@ -252,10 +252,10 @@ mod tests {
         let mut event = wire::ReadlineInputEvent {
             meta: wire_meta(b"bash"),
             shell_type: 0,
-            input_len: 13,
+            input_len: 12,
             input: [0; wire::MAX_READLINE_INPUT],
         };
-        event.input[..13].copy_from_slice(b"ls -la /tmp\n");
+        event.input[..12].copy_from_slice(b"ls -la /tmp\n");
 
         let Event::ReadlineInput(e) = readline_input(&event, 500, None) else {
             panic!("wrong variant")
