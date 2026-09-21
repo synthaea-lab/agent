@@ -9,8 +9,6 @@ use schema::{
     sensor::{EventSink, Sensor as _},
 };
 
-use crate::sink::DetectionSink;
-
 /// Windows equivalent: pid → comm via `tasklist` (carried over from the old agent —
 /// no extra API surface; the sensor keeps its own richer store independently).
 fn seeded_rule_state() -> rules::RuleState {
@@ -139,23 +137,10 @@ pub(crate) fn cmd_run(
     events: &std::path::Path,
     _enable_kill: bool,
     _enable_quarantine: bool,
+    server: Option<&str>,
 ) -> anyhow::Result<()> {
-    let sink = DetectionSink::new(seeded_rule_state(), alerts, events)?;
-    eprintln!("Synthaea agent — detection active (Ctrl-C to stop)");
-    eprintln!(
-        "alerts: {} · events: {}",
-        alerts.display(),
-        events.display()
-    );
-    // Progress-backed liveness (#102): started before the sink moves into the
-    // sensor below, since the heartbeat writer only needs a clone of the
-    // shared counter, not the sink itself.
-    crate::heartbeat::start(
-        crate::heartbeat::heartbeat_path_for(alerts),
-        sink.progress_handle(),
-        crate::heartbeat::WRITE_INTERVAL,
-    );
-    run_windows_sensors(Box::new(sink))
+    let pipeline = super::common::wire_run_pipeline(seeded_rule_state(), alerts, events, server)?;
+    run_windows_sensors(Box::new(SharedSink(pipeline.sink)))
 }
 
 pub(crate) fn cmd_capture_events(output: &std::path::Path) -> anyhow::Result<()> {

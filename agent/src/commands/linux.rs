@@ -205,6 +205,7 @@ pub(crate) fn cmd_run(
     events: &std::path::Path,
     enable_kill: bool,
     enable_quarantine: bool,
+    server: Option<&str>,
 ) -> anyhow::Result<()> {
     // Kill-loudness (#71): must run before any other thread exists — the signal mask
     // set here is inherited by every thread spawned below, including `DetectionSink`'s
@@ -212,13 +213,8 @@ pub(crate) fn cmd_run(
     crate::kill_loudness::block_termination_signals();
     crate::kill_loudness::spawn_watcher(alerts.to_path_buf());
 
-    let sink = Arc::new(DetectionSink::new(seeded_rule_state(), alerts, events)?);
-    eprintln!("Synthaea agent — detection active (Ctrl-C to stop)");
-    eprintln!(
-        "alerts: {} · events: {}",
-        alerts.display(),
-        events.display()
-    );
+    let pipeline = super::common::wire_run_pipeline(seeded_rule_state(), alerts, events, server)?;
+    let sink = pipeline.sink;
 
     // Select the primary sensor (eBPF or audit fallback) before creating heartbeats
     // so telemetry reports the correct sensor type.
@@ -272,32 +268,34 @@ pub(crate) fn cmd_run(
     // plane (issue #134). Sensor health is now the real silence-monitor snapshot
     // (#71) rather than a no-op; spool stays a no-op until that component exists.
     let health_config = crate::health::HealthCollectorConfig::default();
+    let spool_stats: Arc<dyn crate::health::SpoolStatsSource> = match &pipeline.transport {
+        Some(t) => Arc::new(crate::upload::SpoolHealth(Arc::clone(&t.spool))),
+        None => Arc::new(crate::health::NoopSpoolStats),
+    };
+    let heartbeat_client = pipeline.transport.as_ref().map(|t| Arc::clone(&t.client));
     let health = crate::health::HealthCollector::new(
         health_config,
         Arc::new(SilenceHealthSource::new(silence_monitor)),
-        Arc::new(crate::health::NoopSpoolStats),
+        spool_stats,
         Arc::new(sink.enrich_queue().clone()) as Arc<dyn crate::health::DroppedCounter>,
-        |beacon| {
-            // For now, just log the beacon. Once transport (#24) integration is
-            // complete, this will emit via the dedicated health channel.
+        move |beacon| {
             tracing::info!(
                 sensors = beacon.sensors.len(),
                 spool_bytes = beacon.spool_bytes,
                 enrich_dropped = beacon.enrich_dropped,
                 "health beacon"
             );
+            // #24/#134: the dedicated health channel — best-effort, an
+            // unreachable server is nominal (events spool; the beacon's next
+            // tick retries by construction).
+            if let Some(client) = &heartbeat_client
+                && let Err(e) = client.send_heartbeat(&beacon)
+            {
+                tracing::debug!(error = %e, "health beacon heartbeat POST failed");
+            }
         },
     );
     let (_health_handle, _health_stop) = health.spawn();
-
-    // Progress-backed liveness (#102): started before the sink moves into the
-    // sensor below, since the heartbeat writer only needs a clone of the
-    // shared counter, not the sink itself.
-    crate::heartbeat::start(
-        crate::heartbeat::heartbeat_path_for(alerts),
-        sink.progress_handle(),
-        crate::heartbeat::WRITE_INTERVAL,
-    );
 
     spawn_netlink_poller(sink.clone(), netlink_heartbeat);
     spawn_journal_tail(sink.clone(), journal_heartbeat);

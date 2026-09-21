@@ -29,6 +29,8 @@ mod protected;
 mod silence;
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 mod sink;
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+mod upload;
 
 use clap::{Parser, Subcommand};
 
@@ -62,6 +64,13 @@ enum Command {
         /// (issue #25). Off by default: observe-only. See `policy::ResponsePolicy`.
         #[arg(long)]
         enable_quarantine: bool,
+        /// Control-plane base URL (e.g. `https://api.synthaea.example.com`).
+        /// When set, every normalized event is spooled next to the alerts file
+        /// and uploaded store-and-forward (at-least-once; the spool sheds
+        /// oldest past its byte cap). Without it the agent runs standalone,
+        /// exactly as before.
+        #[arg(long)]
+        server: Option<String>,
     },
     /// Captures a baseline of healthy activity to train the ML models: records the
     /// command lines of exec events that trigger no deterministic rule, as
@@ -98,7 +107,14 @@ fn main() -> anyhow::Result<()> {
             events,
             enable_kill,
             enable_quarantine,
-        } => commands::cmd_run(&alerts, &events, enable_kill, enable_quarantine),
+            server,
+        } => commands::cmd_run(
+            &alerts,
+            &events,
+            enable_kill,
+            enable_quarantine,
+            server.as_deref(),
+        ),
         Command::CaptureBaseline { output } => commands::cmd_capture_baseline(&output),
         Command::CaptureEvents { output } => commands::cmd_capture_events(&output),
     }

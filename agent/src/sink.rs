@@ -65,18 +65,29 @@ pub(crate) struct DetectionSink {
 
 impl DetectionSink {
     /// `rule_state` arrives already seeded by the caller (from /proc or the
-    /// platform's process list — see `commands`).
+    /// platform's process list — see `commands`). `spool` is the transport
+    /// spool (`run --server`), `None` when the agent runs standalone.
     pub(crate) fn new(
         rule_state: rules::RuleState,
         alerts_path: &std::path::Path,
         events_path: &std::path::Path,
+        spool: Option<Arc<Mutex<store::EventSpool>>>,
     ) -> std::io::Result<Self> {
         let alert_log = Arc::new(JsonlWriter::open(alerts_path)?);
         // The raw event log is written by the enrichment worker, not the drain
-        // thread — shared behind an Arc so the worker owns a handle.
+        // thread — shared behind an Arc so the worker owns a handle. The spool
+        // append rides the same worker for the same #126 reason: it is file
+        // I/O that must never stall the capture thread.
         let events_log = Arc::new(JsonlWriter::open(events_path)?);
         let enrich_queue = EnrichQueue::start(enrich::Enricher::new(), move |event| {
             events_log.write(&event);
+            if let Some(spool) = &spool
+                && let Err(e) = spool.lock().unwrap().push(&event)
+            {
+                // Spool full is handled inside push (shed-oldest, counted);
+                // reaching here is a real I/O failure — degrade to local-only.
+                tracing::warn!(error = %e, "spool append failed — event stays local-only");
+            }
         });
         let response: Arc<Mutex<Option<ResponseHooks>>> = Arc::new(Mutex::new(None));
         Ok(Self {

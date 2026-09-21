@@ -1,6 +1,13 @@
 //! Event upload with retry and backpressure handling.
 
-use std::{thread, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
+};
 
 use schema::Event;
 
@@ -11,7 +18,10 @@ use crate::{client::TransportClient, config::TransportConfig, error::Result};
 /// This abstraction allows transport to remain decoupled from the concrete
 /// spool implementation. The agent binary wires up the actual `EventSpool`.
 pub trait EventDrain: Send {
-    /// Drains events from the oldest segment.
+    /// Drains events from the oldest segment. A drain that was never
+    /// [`EventDrain::ack`]'d re-delivers the same events on the next call —
+    /// that redelivery is the at-least-once guarantee, so implementations must
+    /// NOT discard on drain.
     ///
     /// Returns an empty vec if no events are available.
     ///
@@ -19,6 +29,26 @@ pub trait EventDrain: Send {
     ///
     /// Returns an error if the drain operation fails.
     fn drain(&mut self) -> std::io::Result<Vec<Event>>;
+
+    /// Marks the last drained batch as durably uploaded — only now may the
+    /// implementation discard it. Called by [`EventUploader::upload_once`]
+    /// after every batch of the drain uploaded successfully; never called on
+    /// failure, so a crash or network outage re-delivers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the acknowledgement cannot be persisted.
+    fn ack(&mut self) -> std::io::Result<()>;
+
+    /// Discards the last drained batch without uploading it — the poison
+    /// escape hatch, called when the server rejects the batch permanently
+    /// (a non-retryable [`crate::TransportError`]): without it one malformed
+    /// segment would block all newer telemetry forever.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the discard cannot be persisted.
+    fn skip(&mut self) -> std::io::Result<()>;
 }
 
 /// Manages event upload from a drain source to the server.
@@ -44,10 +74,15 @@ impl<D: EventDrain> EventUploader<D> {
         }
     }
 
-    /// Attempts to drain and upload events.
+    /// Attempts to drain and upload events, acknowledging the drain only after
+    /// every batch uploaded — at-least-once: a retryable failure leaves the
+    /// batch un-ack'd for redelivery (a partially-uploaded drain re-delivers
+    /// whole, so the server may see duplicates; it never silently loses). A
+    /// permanent rejection ([`crate::TransportError::is_retryable`] false) skips the
+    /// poison batch instead, so one malformed segment can't block newer
+    /// telemetry forever.
     ///
     /// Returns the number of events uploaded, or 0 if the drain is empty.
-    /// On failure, events may be lost (depends on drain implementation).
     ///
     /// # Errors
     ///
@@ -74,6 +109,16 @@ impl<D: EventDrain> EventUploader<D> {
                     );
                     self.consecutive_failures = 0;
                 }
+                Err(e) if !e.is_retryable() => {
+                    self.consecutive_failures += 1;
+                    tracing::warn!(
+                        error = %e,
+                        dropped = count,
+                        "server rejected batch permanently — skipping poison segment"
+                    );
+                    self.drain.skip()?;
+                    return Err(e);
+                }
                 Err(e) => {
                     self.consecutive_failures += 1;
                     tracing::warn!(
@@ -86,6 +131,7 @@ impl<D: EventDrain> EventUploader<D> {
             }
         }
 
+        self.drain.ack()?;
         tracing::info!(count, "uploaded events successfully");
         Ok(count)
     }
@@ -126,14 +172,14 @@ impl<D: EventDrain> EventUploader<D> {
     }
 }
 
-/// Background upload loop that continuously drains events.
-///
-/// This is a simple blocking implementation. For production, consider
-/// running this in a dedicated thread or using async.
+/// Background upload loop that continuously drains events. Blocking — run it
+/// on a dedicated thread; another thread stops it through [`UploadLoop::stop_handle`]
+/// (the same shared-`AtomicBool` shape the sensors use — a `&mut self` stop
+/// would be uncallable while `run(&mut self)` blocks).
 pub struct UploadLoop<D: EventDrain> {
     uploader: EventUploader<D>,
     poll_interval: Duration,
-    running: bool,
+    stop: Arc<AtomicBool>,
 }
 
 impl<D: EventDrain> UploadLoop<D> {
@@ -143,18 +189,24 @@ impl<D: EventDrain> UploadLoop<D> {
         Self {
             uploader,
             poll_interval,
-            running: false,
+            stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Runs the upload loop until stopped.
+    /// Shared stop flag: set it to `true` to end [`UploadLoop::run`] after the
+    /// current iteration (including its sleep).
+    #[must_use]
+    pub fn stop_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop)
+    }
+
+    /// Runs the upload loop until the stop flag is set.
     ///
     /// This method blocks. Call from a dedicated thread.
     pub fn run(&mut self) {
-        self.running = true;
         tracing::info!(poll_interval = ?self.poll_interval, "upload loop started");
 
-        while self.running {
+        while !self.stop.load(Ordering::SeqCst) {
             match self.uploader.upload_once() {
                 Ok(0) => {
                     // Drain empty, wait before checking again
@@ -175,17 +227,6 @@ impl<D: EventDrain> UploadLoop<D> {
 
         tracing::info!("upload loop stopped");
     }
-
-    /// Signals the loop to stop after the current iteration.
-    pub fn stop(&mut self) {
-        self.running = false;
-    }
-
-    /// Returns true if the loop is running.
-    #[must_use]
-    pub fn is_running(&self) -> bool {
-        self.running
-    }
 }
 
 #[cfg(test)]
@@ -196,6 +237,8 @@ mod tests {
     struct MockDrain {
         events: Vec<Event>,
         drained: bool,
+        acked: u32,
+        skipped: u32,
     }
 
     impl MockDrain {
@@ -203,6 +246,8 @@ mod tests {
             Self {
                 events: Vec::new(),
                 drained: false,
+                acked: 0,
+                skipped: 0,
             }
         }
     }
@@ -214,6 +259,16 @@ mod tests {
             }
             self.drained = true;
             Ok(std::mem::take(&mut self.events))
+        }
+
+        fn ack(&mut self) -> std::io::Result<()> {
+            self.acked += 1;
+            Ok(())
+        }
+
+        fn skip(&mut self) -> std::io::Result<()> {
+            self.skipped += 1;
+            Ok(())
         }
     }
 
@@ -242,5 +297,18 @@ mod tests {
         // Capped at max (60s)
         uploader.consecutive_failures = 20;
         assert_eq!(uploader.backoff_duration(), Duration::from_millis(60000));
+    }
+
+    #[test]
+    fn empty_drain_is_never_acked() {
+        // ack() marks a drained batch as uploaded; an empty drain has no batch,
+        // so acking it would delete whatever the NEXT drain would have returned
+        // in a real spool. upload_once must return without touching the drain.
+        let config = TransportConfig::new("https://example.com");
+        let client = TransportClient::new(config).unwrap();
+        let mut uploader = EventUploader::new(client, MockDrain::empty());
+        assert_eq!(uploader.upload_once().unwrap(), 0);
+        assert_eq!(uploader.drain.acked, 0);
+        assert_eq!(uploader.drain.skipped, 0);
     }
 }

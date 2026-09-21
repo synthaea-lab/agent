@@ -144,7 +144,8 @@ mod tests {
         std::fs::create_dir_all(&alerts_dir).unwrap();
         let alerts = alerts_dir.join("alerts.ndjson");
         let events = alerts_dir.join("events.jsonl");
-        let sink = Arc::new(DetectionSink::new(rules::RuleState::new(), &alerts, &events).unwrap());
+        let sink =
+            Arc::new(DetectionSink::new(rules::RuleState::new(), &alerts, &events, None).unwrap());
 
         let guard = ProtectedResourceGuard::new(
             CountingSink(forwarded.clone()),
@@ -177,7 +178,8 @@ mod tests {
         std::fs::create_dir_all(&alerts_dir).unwrap();
         let alerts = alerts_dir.join("alerts.ndjson");
         let events = alerts_dir.join("events.jsonl");
-        let sink = Arc::new(DetectionSink::new(rules::RuleState::new(), &alerts, &events).unwrap());
+        let sink =
+            Arc::new(DetectionSink::new(rules::RuleState::new(), &alerts, &events, None).unwrap());
 
         let guard = ProtectedResourceGuard::new(
             CountingSink(forwarded.clone()),
@@ -209,7 +211,8 @@ mod tests {
         std::fs::create_dir_all(&alerts_dir).unwrap();
         let alerts = alerts_dir.join("alerts.ndjson");
         let events = alerts_dir.join("events.jsonl");
-        let sink = Arc::new(DetectionSink::new(rules::RuleState::new(), &alerts, &events).unwrap());
+        let sink =
+            Arc::new(DetectionSink::new(rules::RuleState::new(), &alerts, &events, None).unwrap());
 
         let guard = ProtectedResourceGuard::new(
             CountingSink(forwarded.clone()),
