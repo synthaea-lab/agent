@@ -16,11 +16,16 @@ mod state;
 mod stateless;
 
 pub use state::RuleState;
-pub use stateless::{
+#[cfg(test)]
+pub(crate) use stateless::{
     check_account_creation_persistence, check_base64_decode, check_encoded_powershell,
     check_persistence_write, check_proc_root_escape, check_scheduled_task_persistence,
-    check_service_install_persistence, evaluate_exec, evaluate_file_open,
+    check_service_install_persistence,
 };
+// The contract is the two dispatchers — callers (agent) route every event
+// through them. The individual checks are implementation detail, re-exported
+// crate-internally for the tests under `src/tests/`.
+pub use stateless::{evaluate_exec, evaluate_file_open};
 
 #[derive(Debug, Clone)]
 pub struct Alert {

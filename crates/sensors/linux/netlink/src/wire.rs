@@ -72,12 +72,14 @@ impl NlMsgHeader {
         if buf.len() < NLMSG_HDR_LEN {
             return None;
         }
+        // Byte-by-byte, not `try_into().unwrap()` — same rule as every other
+        // parser in this crate: no explicit panic point to document.
         Some(Self {
-            len: u32::from_ne_bytes(buf[0..4].try_into().unwrap()),
-            msg_type: u16::from_ne_bytes(buf[4..6].try_into().unwrap()),
-            flags: u16::from_ne_bytes(buf[6..8].try_into().unwrap()),
-            seq: u32::from_ne_bytes(buf[8..12].try_into().unwrap()),
-            pid: u32::from_ne_bytes(buf[12..16].try_into().unwrap()),
+            len: u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            msg_type: u16::from_ne_bytes([buf[4], buf[5]]),
+            flags: u16::from_ne_bytes([buf[6], buf[7]]),
+            seq: u32::from_ne_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            pid: u32::from_ne_bytes([buf[12], buf[13], buf[14], buf[15]]),
         })
     }
 }

@@ -561,7 +561,16 @@ impl LinuxSensor {
                         .map_err(|e| err(format!("eBPF logger fd: {e}")))?;
                 tokio::task::spawn(async move {
                     loop {
-                        let mut guard = logger.readable_mut().await.unwrap();
+                        // No unwrap: nothing holds this task's JoinHandle, so a
+                        // panic here would be swallowed silently. An fd error
+                        // means the logger fd is gone — stop draining, loudly.
+                        let mut guard = match logger.readable_mut().await {
+                            Ok(guard) => guard,
+                            Err(e) => {
+                                warn!("eBPF log drain stopped: {e}");
+                                break;
+                            }
+                        };
                         guard.get_inner_mut().flush();
                         guard.clear_ready();
                     }

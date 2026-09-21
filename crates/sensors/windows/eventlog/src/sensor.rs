@@ -589,6 +589,8 @@ pub struct EventLogCounters {
 
 // ── The sensor ────────────────────────────────────────────────────────────────
 
+/// The Windows Event Log poller: spawns one `wevtutil`-based poll loop per
+/// enabled target (see the crate doc) and implements `schema::sensor::Sensor`.
 pub struct EventLogSensor {
     stop: Arc<AtomicBool>,
     config: EventLogConfig,

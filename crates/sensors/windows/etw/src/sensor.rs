@@ -184,6 +184,8 @@ fn liveness_watch(
 
 // ── The sensor ───────────────────────────────────────────────────────────────
 
+/// The Windows ETW sensor: owns the trace session and consumer thread, and
+/// implements `schema::sensor::Sensor` (see the crate doc for provider coverage).
 pub struct WindowsSensor {
     stop: Arc<AtomicBool>,
 }

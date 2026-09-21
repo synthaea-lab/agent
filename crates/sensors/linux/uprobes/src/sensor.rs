@@ -252,6 +252,20 @@ fn attach_uprobe(
     Ok(())
 }
 
+/// Reads one `repr(C)` wire struct out of a ring-buffer item, or `None` when the
+/// item is too short. Kept as a named function rather than inline in the drain
+/// macros: `undocumented_unsafe_blocks` cannot associate a `// SAFETY:` comment
+/// with an unsafe block through a macro expansion, and this is the only raw read
+/// the drains need.
+fn read_wire_event<T: Copy>(item: &[u8]) -> Option<T> {
+    if item.len() < core::mem::size_of::<T>() {
+        return None;
+    }
+    // SAFETY: length checked above; T is a repr(C) POD wire struct (Copy, no
+    // padding invariants) and read_unaligned handles arbitrary alignment.
+    Some(unsafe { core::ptr::read_unaligned(item.as_ptr().cast::<T>()) })
+}
+
 /// Drains TLS capture events from the ring buffer and emits normalized schema events.
 /// Applies budget enforcement and allowlist filtering.
 macro_rules! drain_tls {
@@ -259,12 +273,7 @@ macro_rules! drain_tls {
         let mut guard = $guard.map_err(|e| err(format!("TLS ring buffer poll failed: {e}")))?;
         let rb = guard.get_inner_mut();
         while let Some(item) = rb.next() {
-            if item.len() >= core::mem::size_of::<TlsCaptureEvent>() {
-                // SAFETY: item.len() >= size_of::<TlsCaptureEvent>() checked above;
-                // TlsCaptureEvent is repr(C) POD; read_unaligned handles arbitrary alignment
-                let event =
-                    unsafe { core::ptr::read_unaligned(item.as_ptr() as *const TlsCaptureEvent) };
-
+            if let Some(event) = read_wire_event::<TlsCaptureEvent>(&item) {
                 // Allowlist check: if allowlist is non-empty, only allow listed processes
                 if !$config.tls.process_allowlist.is_empty() {
                     let comm = comm_str(&event.meta.comm);
@@ -312,13 +321,7 @@ macro_rules! drain_readline {
             $guard.map_err(|e| err(format!("readline ring buffer poll failed: {e}")))?;
         let rb = guard.get_inner_mut();
         while let Some(item) = rb.next() {
-            if item.len() >= core::mem::size_of::<ReadlineInputEvent>() {
-                // SAFETY: item.len() >= size_of::<ReadlineInputEvent>() checked above;
-                // ReadlineInputEvent is repr(C) POD; read_unaligned handles arbitrary alignment
-                let event = unsafe {
-                    core::ptr::read_unaligned(item.as_ptr() as *const ReadlineInputEvent)
-                };
-
+            if let Some(event) = read_wire_event::<ReadlineInputEvent>(&item) {
                 // Allowlist check: if allowlist is non-empty, only allow listed shells
                 if !$config.readline.process_allowlist.is_empty() {
                     let comm = comm_str(&event.meta.comm);
@@ -411,7 +414,16 @@ impl UprobesSensor {
                         .map_err(|e| err(format!("eBPF logger fd: {e}")))?;
                 tokio::task::spawn(async move {
                     loop {
-                        let mut guard = logger.readable_mut().await.unwrap();
+                        // No unwrap: nothing holds this task's JoinHandle, so a
+                        // panic here would be swallowed silently. An fd error
+                        // means the logger fd is gone — stop draining, loudly.
+                        let mut guard = match logger.readable_mut().await {
+                            Ok(guard) => guard,
+                            Err(e) => {
+                                warn!("eBPF log drain stopped: {e}");
+                                break;
+                            }
+                        };
                         guard.get_inner_mut().flush();
                         guard.clear_ready();
                     }

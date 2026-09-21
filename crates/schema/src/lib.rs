@@ -743,10 +743,9 @@ impl Event {
             Event::NetworkFlow(e) => &e.meta,
             Event::TlsCapture(e) => &e.meta,
             Event::ReadlineInput(e) => &e.meta,
-            // Non-exhaustive: new telemetry variants must be added here.
-            // This arm ensures a compile-time reminder when adding variants.
-            #[allow(unreachable_patterns)]
-            _ => unreachable!("all Event variants must have meta — add the new variant here"),
+            // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
+            // the defining crate, so a new variant without its arm here is a
+            // compile error — the reminder the doc comment above promises.
         }
     }
 }

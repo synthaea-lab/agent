@@ -112,7 +112,7 @@ impl CorrelationEngine {
     }
 
     #[must_use]
-    pub fn with_window(window: Duration) -> Self {
+    pub(crate) fn with_window(window: Duration) -> Self {
         Self {
             bus: EventBus::new(window),
             window_ns: window.as_nanos() as u64,
@@ -233,8 +233,10 @@ impl CorrelationEngine {
     /// Uses the (ppid, comm) key if the PID has been seen in an `ExecEvent`,
     /// otherwise rebuilds the fallback key (pid, comm) from the bus — consistent
     /// with the fallback used in `on_event`.
-    #[must_use]
-    pub fn belief_for_pid(&self, pid: u32) -> Option<&BeliefState> {
+    /// Test scaffolding only today (`src/tests/behavior.rs`) — promote back to
+    /// `pub` when a real consumer appears.
+    #[cfg(test)]
+    pub(crate) fn belief_for_pid(&self, pid: u32) -> Option<&BeliefState> {
         if let Some(entity_key) = self.pid_entities.peek(&pid) {
             return self.beliefs.peek(entity_key);
         }
@@ -308,7 +310,7 @@ impl CorrelationEngine {
     ///
     /// Returns `None` if the PID has no events in the window.
     #[must_use]
-    pub fn behavior_vector_for_pid(&self, pid: u32) -> Option<BehaviorVector> {
+    pub(crate) fn behavior_vector_for_pid(&self, pid: u32) -> Option<BehaviorVector> {
         let events: Vec<&Event> = self.bus.events_for_pid(pid).collect();
         BehaviorVector::from_window(&events)
     }
