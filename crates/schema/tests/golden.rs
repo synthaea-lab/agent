@@ -10,9 +10,10 @@ use std::net::IpAddr;
 
 use schema::{
     AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, ConnectEvent, DnsQueryEvent, Event,
-    EventMeta, ExecEvent, FileOpenEvent, ImageLoadEvent, ListenPortEvent, NetworkFlowEvent,
-    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType, SmbConnectEvent,
-    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
+    EventMeta, ExecEvent, FileDeleteEvent, FileOpenEvent, FileRenameEvent, FileWriteEvent,
+    ImageLoadEvent, ListenPortEvent, NetworkFlowEvent, ReadlineInputEvent, RegistrySetEvent,
+    ScriptBlockEvent, ShellType, SmbConnectEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
+    UdpSendEvent, User, WmiActivityEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -623,6 +624,71 @@ fn readline_input_golden() {
 }
 
 #[test]
+fn file_write_golden() {
+    // v15 (#262): burst-write signal, no path — see FileWriteEvent's doc.
+    assert_golden(
+        &Event::FileWrite(FileWriteEvent {
+            meta: EventMeta {
+                pid: 7001,
+                ppid: 7000,
+                user: User::Unix {
+                    uid: 1000,
+                    gid: 1000,
+                },
+                timestamp_ns: 1_756_900_010_000_000_000,
+                comm: "encryptor".into(),
+                container: None,
+            },
+            fd: 4,
+            bytes_requested: 4096,
+        }),
+        "file_write",
+    );
+}
+
+#[test]
+fn file_delete_golden() {
+    // v15 (#262): log-tampering shape — deleting an audit trail.
+    assert_golden(
+        &Event::FileDelete(FileDeleteEvent {
+            meta: EventMeta {
+                pid: 7002,
+                ppid: 7000,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_011_000_000_000,
+                comm: "rm".into(),
+                container: None,
+            },
+            path: "/var/log/auth.log".into(),
+        }),
+        "file_delete",
+    );
+}
+
+#[test]
+fn file_rename_golden() {
+    // v15 (#262): the ransomware signal — new_path's suffix relative to old_path's.
+    assert_golden(
+        &Event::FileRename(FileRenameEvent {
+            meta: EventMeta {
+                pid: 7003,
+                ppid: 7000,
+                user: User::Unix {
+                    uid: 1000,
+                    gid: 1000,
+                },
+                timestamp_ns: 1_756_900_012_000_000_000,
+                comm: "encryptor".into(),
+                container: None,
+            },
+            old_path: "/home/user/invoice.pdf".into(),
+            new_path: "/home/user/invoice.pdf.locked".into(),
+        }),
+        "file_rename",
+    );
+}
+
+#[test]
 fn unbounded_cmdline_survives() {
     // Audit F-4: multi-kilobyte encoded command lines must round-trip untouched.
     let long = format!("powershell.exe -EncodedCommand {}", "A".repeat(8 * 1024));
@@ -813,6 +879,20 @@ fn meta_accessor_covers_all_variants() {
             meta: meta.clone(),
             shell_type: ShellType::Zsh,
             input: String::new(),
+        }),
+        Event::FileWrite(FileWriteEvent {
+            meta: meta.clone(),
+            fd: 3,
+            bytes_requested: 0,
+        }),
+        Event::FileDelete(FileDeleteEvent {
+            meta: meta.clone(),
+            path: String::new(),
+        }),
+        Event::FileRename(FileRenameEvent {
+            meta: meta.clone(),
+            old_path: String::new(),
+            new_path: String::new(),
         }),
     ];
     for e in &events {

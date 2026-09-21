@@ -36,6 +36,7 @@ dependencies = [
  "sensor-linux-journal",
  "sensor-linux-lsm",
  "sensor-linux-netlink",
+ "sensor-linux-uprobes",
  "sensor-windows",
  "sensor-windows-eventlog",
  "serde",

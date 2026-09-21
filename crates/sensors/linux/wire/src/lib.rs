@@ -32,7 +32,14 @@
 /// - v5: `TlsCaptureEvent` and `ReadlineInputEvent` added for uprobes (issue #90).
 ///   TLS capture budgeted at 256 bytes (first N bytes of plaintext), readline at
 ///   512 bytes (full interactive command line).
-pub const WIRE_VERSION: u32 = 5;
+/// - v6: `FileWriteEvent`, `FileDeleteEvent`, `FileRenameEvent` added (issue #262).
+///   `FileWriteEvent` carries no path — `write(2)`/`pwrite64(2)` take a file
+///   descriptor, not a path, and this codebase resolves no `fd`→path mapping
+///   (kernel-side `d_path`/`bpf_d_path` nor a userspace `/proc/<pid>/fd/<n>`
+///   lookup); it is a volume/frequency signal (burst-write detection), not a
+///   per-write path trail. `FileDeleteEvent`/`FileRenameEvent` read real path
+///   arguments straight off the syscall, same as `FileOpenEvent`.
+pub const WIRE_VERSION: u32 = 6;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
@@ -103,6 +110,47 @@ pub struct FileOpenEvent {
     pub path: [u8; MAX_PATH_LEN],
     pub path_len: u16,
     pub flags: u32,
+}
+
+/// File write (`syscalls:sys_enter_write`/`sys_enter_pwrite64`). No path: `write(2)`
+/// takes a file descriptor, and this sensor resolves no fd→path mapping (see the
+/// `WIRE_VERSION` v6 changelog above) — a volume/frequency signal for burst-write
+/// detection (ransomware, mass tampering), not a per-write path trail.
+/// `bytes_requested` is the caller's `count` argument, read at syscall entry — the
+/// actual bytes written (the syscall's return value) is not observed here.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FileWriteEvent {
+    pub meta: EventMeta,
+    pub fd: u32,
+    pub bytes_requested: u64,
+}
+
+/// File delete (`syscalls:sys_enter_unlink`/`sys_enter_unlinkat`). `path` is the raw
+/// path passed by the caller, not resolved against `dfd` — same known limitation as
+/// `FileOpenEvent::path`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FileDeleteEvent {
+    pub meta: EventMeta,
+    pub path: [u8; MAX_PATH_LEN],
+    pub path_len: u16,
+}
+
+/// File rename (`syscalls:sys_enter_rename`/`sys_enter_renameat`/
+/// `sys_enter_renameat2`). Both `old_path`/`new_path` are raw caller-supplied paths,
+/// not resolved against `olddfd`/`newdfd` — same known limitation as
+/// `FileOpenEvent::path`. The classic ransomware signal (`document.docx` →
+/// `document.docx.encrypted`) lives entirely in `new_path`'s suffix, no fd
+/// resolution needed to see it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FileRenameEvent {
+    pub meta: EventMeta,
+    pub old_path: [u8; MAX_PATH_LEN],
+    pub old_path_len: u16,
+    pub new_path: [u8; MAX_PATH_LEN],
+    pub new_path_len: u16,
 }
 
 /// Outbound network connection (`syscalls:sys_enter_connect`, `AF_INET/AF_INET6` only).

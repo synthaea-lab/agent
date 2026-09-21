@@ -74,7 +74,11 @@ pub mod time;
 /// Bumped 13 → 14 for [`Event::TlsCapture`] and [`Event::ReadlineInput`] (#90):
 /// two new enum variants for uprobes-based TLS plaintext capture and shell readline
 /// input capture. Same serialization-visible reasoning as v13 above.
-pub const SCHEMA_VERSION: u32 = 14;
+///
+/// Bumped 14 → 15 for [`Event::FileWrite`], [`Event::FileDelete`], and
+/// [`Event::FileRename`] (#262): three new enum variants for Linux
+/// write/delete/rename telemetry. Same serialization-visible reasoning as v13/v14.
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -273,6 +277,42 @@ pub struct FileOpenEvent {
     /// dispositions). Rules match primarily on `path`; flag interpretation is
     /// per-platform and documented by each sensor.
     pub flags: u32,
+}
+
+/// File write (issue #262). Carries no path: `write(2)`/`pwrite64(2)` take a file
+/// descriptor, and the Linux sensor resolves no fd→path mapping (see
+/// `sensor-linux-wire::FileWriteEvent`'s doc) — this is a volume/frequency signal
+/// (burst-write detection: ransomware, mass tampering, log destruction), not a
+/// per-write path trail. Join to a recent [`FileOpenEvent`] on `(meta.pid, fd)` if a
+/// path is needed downstream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileWriteEvent {
+    pub meta: EventMeta,
+    /// The file descriptor written to, in the writing process's own fd table —
+    /// meaningful only paired with `meta.pid`, and reused across the process's
+    /// lifetime like any fd.
+    pub fd: u32,
+    /// The caller's requested byte count (`write(2)`'s `count` argument), read at
+    /// syscall entry — not the syscall's return value, so a short write or a
+    /// failed call still reports the requested size.
+    pub bytes_requested: u64,
+}
+
+/// File delete (issue #262): `unlink(2)`/`unlinkat(2)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileDeleteEvent {
+    pub meta: EventMeta,
+    pub path: String,
+}
+
+/// File rename (issue #262): `rename(2)`/`renameat(2)`/`renameat2(2)`. The classic
+/// ransomware signal (`invoice.pdf` → `invoice.pdf.locked`) lives entirely in
+/// `new_path`'s suffix relative to `old_path`'s.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRenameEvent {
+    pub meta: EventMeta,
+    pub old_path: String,
+    pub new_path: String,
 }
 
 /// DNS resolution — the query name and answer, joined to the resolving process.
@@ -719,6 +759,9 @@ pub enum Event {
     NetworkFlow(NetworkFlowEvent),
     TlsCapture(TlsCaptureEvent),
     ReadlineInput(ReadlineInputEvent),
+    FileWrite(FileWriteEvent),
+    FileDelete(FileDeleteEvent),
+    FileRename(FileRenameEvent),
 }
 
 impl Event {
@@ -746,6 +789,9 @@ impl Event {
             Event::NetworkFlow(e) => &e.meta,
             Event::TlsCapture(e) => &e.meta,
             Event::ReadlineInput(e) => &e.meta,
+            Event::FileWrite(e) => &e.meta,
+            Event::FileDelete(e) => &e.meta,
+            Event::FileRename(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.
