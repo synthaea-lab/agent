@@ -16,6 +16,7 @@ mod sensor;
 
 pub use parse::{AuditRecord, parse_audit_message};
 pub use classify::{AuditEvent, classify};
+pub use normalize::{connect_event, exec_event};
 
 #[cfg(target_os = "linux")]
 pub use socket::{AuditSocket, AuditError};

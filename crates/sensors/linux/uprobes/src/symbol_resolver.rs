@@ -2,8 +2,9 @@
 //!
 //! Scans system library paths for SSL libraries (OpenSSL, `GnuTLS`) and readline libraries
 //! (libreadline, libedit), parses their ELF symbol tables with goblin, and returns offsets for
-//! uprobe attachment. Built from the Phase 1 spike (`examples/symbol_resolution_spike.rs`),
-//! now production-ready: deduplication, error handling, library type detection.
+//! uprobe attachment. Built from the Phase 1 spike (`examples/symbol_resolution_spike.rs`,
+//! since deleted — it only compiled on Linux and this module supersedes it; see git
+//! history), now production-ready: deduplication, error handling, library type detection.
 
 use goblin::elf::Elf;
 use std::collections::HashSet;

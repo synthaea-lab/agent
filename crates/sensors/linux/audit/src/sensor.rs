@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn timestamp_conversion() {
         let ns = audit_ts_to_epoch_ns(1234567890, 123);
-        assert_eq!(ns, 1234567890_123_000_000);
+        assert_eq!(ns, 1_234_567_890_123_000_000);
     }
 
     #[test]

@@ -9,6 +9,7 @@ use schema::{Event, ExecEvent, ConnectEvent, EventMeta, User};
 /// # Panics
 ///
 /// Panics if called on a non-Exec event (internal misuse).
+#[must_use]
 pub fn exec_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
     let AuditEvent::Exec { pid, uid, gid, image_path, argv } = evt else {
         panic!("normalize::exec_event called on non-Exec event");
@@ -38,6 +39,7 @@ pub fn exec_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
 /// # Panics
 ///
 /// Panics if called on a non-Connect event (internal misuse).
+#[must_use]
 pub fn connect_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
     let AuditEvent::Connect { pid, uid, gid, remote_addr, protocol: _ } = evt else {
         panic!("normalize::connect_event called on non-Connect event");
@@ -77,7 +79,7 @@ mod tests {
             argv: vec!["/bin/ls".to_string(), "-la".to_string()],
         };
 
-        let schema_evt = exec_event(&audit_evt, 1234567890_000_000_000);
+        let schema_evt = exec_event(&audit_evt, 1_234_567_890_000_000_000);
         match schema_evt {
             Event::Exec(e) => {
                 assert_eq!(e.meta.pid, 1234);
@@ -103,7 +105,7 @@ mod tests {
             protocol: 6,
         };
 
-        let schema_evt = connect_event(&audit_evt, 9876543210_000_000_000);
+        let schema_evt = connect_event(&audit_evt, 9_876_543_210_000_000_000);
         match schema_evt {
             Event::Connect(e) => {
                 assert_eq!(e.meta.pid, 5678);

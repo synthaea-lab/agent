@@ -27,7 +27,3 @@ regex = { version = "1.11", default-features = false, features = ["std", "unicod
 anyhow = "1.0"
 aya-build = "0.2"
 which = { version = "8.0.6", default-features = false }
-
-[[example]]
-name = "symbol_resolution_spike"
-path = "examples/symbol_resolution_spike.rs"
