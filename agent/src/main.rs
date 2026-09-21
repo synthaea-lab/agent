@@ -62,6 +62,16 @@ enum Command {
         /// (issue #25). Off by default: observe-only. See `policy::ResponsePolicy`.
         #[arg(long)]
         enable_quarantine: bool,
+        /// Enables TLS plaintext capture via SSL_read/SSL_write uprobes (issue #90):
+        /// pre-encryption content visibility, budgeted and redacted. Off by default —
+        /// captures process traffic before it's encrypted, opt-in only. Linux only.
+        #[arg(long)]
+        enable_tls_capture: bool,
+        /// Enables shell readline capture (bash/zsh interactive commands, issue #90):
+        /// catches shell builtins and history-evading input `execve` never sees. Off
+        /// by default, redacted. Linux only.
+        #[arg(long)]
+        enable_readline_capture: bool,
     },
     /// Captures a baseline of healthy activity to train the ML models: records the
     /// command lines of exec events that trigger no deterministic rule, as
@@ -98,7 +108,16 @@ fn main() -> anyhow::Result<()> {
             events,
             enable_kill,
             enable_quarantine,
-        } => commands::cmd_run(&alerts, &events, enable_kill, enable_quarantine),
+            enable_tls_capture,
+            enable_readline_capture,
+        } => commands::cmd_run(
+            &alerts,
+            &events,
+            enable_kill,
+            enable_quarantine,
+            enable_tls_capture,
+            enable_readline_capture,
+        ),
         Command::CaptureBaseline { output } => commands::cmd_capture_baseline(&output),
         Command::CaptureEvents { output } => commands::cmd_capture_events(&output),
     }

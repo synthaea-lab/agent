@@ -133,12 +133,17 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
 /// `enable_kill`/`enable_quarantine` are accepted for CLI-signature parity with the
 /// Linux path but not wired here yet (issue #25 is Linux-first, matching #71/#103's
 /// precedent) — `DetectionSink::enable_response` is never called, so response stays
-/// fully inactive on Windows regardless of these flags.
+/// fully inactive on Windows regardless of these flags. `enable_tls_capture`/
+/// `enable_readline_capture` (issue #90) are Linux-uprobe-specific — ETW would need
+/// its own, unrelated mechanism — so they're accepted for parity only, same as the
+/// response flags.
 pub(crate) fn cmd_run(
     alerts: &std::path::Path,
     events: &std::path::Path,
     _enable_kill: bool,
     _enable_quarantine: bool,
+    _enable_tls_capture: bool,
+    _enable_readline_capture: bool,
 ) -> anyhow::Result<()> {
     let sink = DetectionSink::new(seeded_rule_state(), alerts, events)?;
     eprintln!("Synthaea agent — detection active (Ctrl-C to stop)");
