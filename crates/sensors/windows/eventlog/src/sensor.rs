@@ -1,9 +1,9 @@
 //! `wevtutil`-polling implementation of the persistence detections plus the
 //! logon/session events (see the crate doc for why polling rather than
-//! `EvtSubscribe`/ETW). Three independent threads, one per channel/event group,
-//! each following the same pattern as the other sensors in this workspace:
-//! remember the last `EventRecordID` seen, poll for anything newer, normalize
-//! into a `schema::Event`, hand it to the sink.
+//! `EvtSubscribe`/ETW). One independent poll thread per enabled
+//! [`PollTarget`] — the shared pipeline (cursor, query, normalize, count,
+//! sink) exists once; each target contributes only its query, parser, and
+//! normalization.
 
 use std::{
     process::Command,
@@ -21,7 +21,7 @@ use schema::{
     time::now_ns,
 };
 
-use crate::xml::{self, AccountCreatedEvent, LogonEvent, ScheduledTaskEvent, ServiceInstallEvent};
+use crate::xml::{self, LogonEvent};
 
 /// All channels are polled on the same cadence — persistence detection and
 /// logon-event normalization both have no sub-second stakes (the underlying
@@ -75,84 +75,126 @@ fn wevtutil(args: &[&str]) -> String {
     }
 }
 
-// ── Event 7045 — service install (T1543.003) ─────────────────────────────────
+// ── The shared poll pipeline ─────────────────────────────────────────────────
+//
+// Every target below is the same machine: remember the newest `EventRecordID`
+// already in the channel at startup — only events written *after* the sensor
+// starts are reported, matching the other sensors in this workspace (none of
+// them replay history) — then poll for anything newer, normalize each parsed
+// block into a `schema::Event`, count it, hand it to the sink. Only the
+// query, the parser, and the normalization differ per target, so those live
+// in a [`PollTarget`] and the machine exists once.
 
-/// `EventRecordID` of the newest 7045 event already in the System log at startup —
-/// only services installed *after* the sensor starts are reported, matching the
-/// other sensors in this workspace (none of them replay history).
-fn last_known_record_id_7045() -> u64 {
+/// What [`PollTarget::parse_block`] yields for one `<Event>` XML block.
+/// `None`: not even parseable. `Some((record_id, None))`: parsed but skipped
+/// as unusable. `Some((record_id, Some(event)))`: a normalized event.
+type ParsedBlock = Option<(u64, Option<Event>)>;
+
+/// One poll target: a channel + `EventID` filter, and how its raw XML blocks
+/// become normalized events.
+struct PollTarget {
+    /// Names the poll thread in logs.
+    label: &'static str,
+    /// `wevtutil` channel (`System` / `Security`).
+    channel: &'static str,
+    /// The `EventID=...` predicate, without the surrounding `*[System[...]]`.
+    id_filter: &'static str,
+    /// Which volume counter this target increments.
+    counter: fn(&EventLogCounters) -> &AtomicU64,
+    /// Parses one `<Event>` XML block — see [`ParsedBlock`] for the three
+    /// outcomes. An unparseable block does not advance the record cursor; a
+    /// parsed-but-unusable one advances it without counting (a block missing
+    /// required fields is noise the sensor filtered out, not volume).
+    parse_block: fn(&str) -> ParsedBlock,
+    /// `auditpol` enablement to run once before polling starts, for targets
+    /// whose audit subcategory may be off (see each target's enable fn doc).
+    enable_audit: Option<fn()>,
+}
+
+/// `EventRecordID` of the newest matching event already in the channel.
+fn last_known_record_id(target: &PollTarget) -> u64 {
+    let query = format!("/q:*[System[({})]]", target.id_filter);
     let xml_out = wevtutil(&[
         "qe",
-        "System",
+        target.channel,
         "/c:1",
         "/rd:true",
         "/f:xml",
-        "/q:*[System[(EventID=7045)]]",
+        query.as_str(),
     ]);
     xml::split_event_blocks(&xml_out)
         .first()
-        .and_then(|block| xml::parse_service_install_block(block))
-        .map(|e| e.record_id)
+        .and_then(|block| (target.parse_block)(block))
+        .map(|(record_id, _)| record_id)
         .unwrap_or(0)
 }
 
-/// New 7045 events since `since_record_id` (exclusive), oldest to newest.
-fn new_service_install_events(since_record_id: u64) -> Vec<ServiceInstallEvent> {
-    let query = format!("*[System[(EventID=7045) and (EventRecordID>{since_record_id})]]");
-    let query_arg = format!("/q:{query}");
-    let xml_out = wevtutil(&["qe", "System", "/rd:false", "/f:xml", query_arg.as_str()]);
+/// Parsed blocks newer than `since_record_id` (exclusive), oldest to newest.
+fn new_blocks(target: &PollTarget, since_record_id: u64) -> Vec<(u64, Option<Event>)> {
+    let query = format!(
+        "/q:*[System[({}) and (EventRecordID>{since_record_id})]]",
+        target.id_filter
+    );
+    let xml_out = wevtutil(&["qe", target.channel, "/rd:false", "/f:xml", query.as_str()]);
     xml::split_event_blocks(&xml_out)
         .into_iter()
-        .filter_map(xml::parse_service_install_block)
+        .filter_map(|block| (target.parse_block)(block))
         .collect()
 }
 
-fn poll_service_installs(
+fn poll(
+    target: &'static PollTarget,
     sink: Arc<dyn EventSink>,
     stop: Arc<AtomicBool>,
     counters: Arc<EventLogCounters>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let mut last_id = last_known_record_id_7045();
-        tracing::info!(last_record_id = last_id, "service-install poll started");
+        let mut last_id = last_known_record_id(target);
+        tracing::info!(
+            target = target.label,
+            last_record_id = last_id,
+            "poll started"
+        );
         while !stop.load(Ordering::SeqCst) {
             std::thread::sleep(POLL_INTERVAL);
-            for install in new_service_install_events(last_id) {
-                last_id = last_id.max(install.record_id);
-                if install.service_name.is_empty() || install.image_path.is_empty() {
-                    continue;
+            for (record_id, event) in new_blocks(target, last_id) {
+                last_id = last_id.max(record_id);
+                if let Some(event) = event {
+                    (target.counter)(&counters).fetch_add(1, Ordering::Relaxed);
+                    sink.on_event(event);
                 }
-                let event = FileOpenEvent {
-                    meta: EventMeta {
-                        pid: install.pid,
-                        ppid: 0,
-                        user: User::Unknown,
-                        timestamp_ns: now_ns(),
-                        comm: install.service_name,
-                        container: None, // Windows: no container support
-                    },
-                    path: install.image_path,
-                    flags: FLAG_PERSISTENCE_ARTIFACT,
-                };
-                counters.service_installs.fetch_add(1, Ordering::Relaxed);
-                sink.on_event(Event::FileOpen(event));
             }
         }
-        tracing::info!("service-install poll stopped");
+        tracing::info!(target = target.label, "poll stopped");
     })
 }
 
-// ── Event 4698 — scheduled task creation (T1053.005) ─────────────────────────
+/// The meta shape shared by the three persistence-artifact targets, which all
+/// reuse [`FileOpenEvent`] (see ADR-0004) rather than defining event types of
+/// their own.
+fn persistence_file_open(pid: u32, comm: String, path: String, flags: u32) -> Event {
+    Event::FileOpen(FileOpenEvent {
+        meta: EventMeta {
+            pid,
+            ppid: 0,
+            user: User::Unknown,
+            timestamp_ns: now_ns(),
+            comm,
+            container: None, // Windows: no container support
+        },
+        path,
+        flags,
+    })
+}
 
-/// Best-effort, non-blocking: if `auditpol` fails (insufficient rights despite
-/// being admin, a GPO overriding it, the command missing...), this is logged and
-/// the sensor keeps going — a problem in this one sub-feature must never take down
-/// the rest of the sensor. Still required even though reading is done via
-/// `wevtutil` rather than a live ETW subscription: without this subcategory
-/// active, Windows simply never writes the 4698 event, regardless of how it is
-/// read afterward.
-fn enable_scheduled_task_audit() -> bool {
-    let subcategory_arg = format!("/subcategory:{SCHEDULED_TASK_AUDIT_SUBCATEGORY_GUID}");
+/// Runs `auditpol /set /subcategory:<guid>` — best-effort and non-blocking: if
+/// it fails (insufficient rights despite being admin, a GPO overriding it, the
+/// command missing...), the failure is logged with `consequence` (what
+/// coverage the operator loses until they enable the subcategory manually) and
+/// the sensor keeps going — a problem in one sub-feature must never take down
+/// the rest of the sensor.
+fn enable_audit_subcategory(label: &str, guid: &str, consequence: &str) {
+    let subcategory_arg = format!("/subcategory:{guid}");
     let output = Command::new("auditpol")
         .args([
             "/set",
@@ -163,170 +205,129 @@ fn enable_scheduled_task_audit() -> bool {
         .output();
     match output {
         Ok(o) if o.status.success() => {
-            tracing::info!("\"Other Object Access Events\" audit enabled (event 4698)");
-            true
+            tracing::info!(audit = label, "audit subcategory enabled");
         }
-        Ok(o) => {
-            tracing::warn!(
-                code = ?o.status.code(),
-                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
-                "auditpol failed — scheduled task persistence detection (T1053.005) may not \
-                 receive any 4698 events until this audit subcategory is enabled manually: \
-                 auditpol /set /subcategory:{SCHEDULED_TASK_AUDIT_SUBCATEGORY_GUID} \
-                 /success:enable /failure:enable"
-            );
-            false
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "could not run auditpol — scheduled task persistence detection (T1053.005) \
-                 may stay silent until the audit is enabled manually (see command above)"
-            );
-            false
-        }
+        Ok(o) => tracing::warn!(
+            audit = label,
+            code = ?o.status.code(),
+            stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+            "auditpol failed — {consequence}: enable manually with auditpol /set \
+             /subcategory:{guid} /success:enable /failure:enable"
+        ),
+        Err(e) => tracing::warn!(
+            audit = label,
+            error = %e,
+            "could not run auditpol — {consequence}: enable manually with auditpol /set \
+             /subcategory:{guid} /success:enable /failure:enable"
+        ),
     }
 }
 
-fn last_known_record_id_4698() -> u64 {
-    let xml_out = wevtutil(&[
-        "qe",
-        "Security",
-        "/c:1",
-        "/rd:true",
-        "/f:xml",
-        "/q:*[System[(EventID=4698)]]",
-    ]);
-    xml::split_event_blocks(&xml_out)
-        .first()
-        .and_then(|block| xml::parse_scheduled_task_block(block))
-        .map(|e| e.record_id)
-        .unwrap_or(0)
+// ── Event 7045 — service install (T1543.003) ─────────────────────────────────
+
+/// A 7045 without a service name or image path is unusable — the alert quotes
+/// them as `comm`/`path`. Skip, advancing the cursor.
+fn normalize_service_install(block: &str) -> ParsedBlock {
+    let install = xml::parse_service_install_block(block)?;
+    let record_id = install.record_id;
+    if install.service_name.is_empty() || install.image_path.is_empty() {
+        return Some((record_id, None));
+    }
+    let event = persistence_file_open(
+        install.pid,
+        install.service_name,
+        install.image_path,
+        FLAG_PERSISTENCE_ARTIFACT,
+    );
+    Some((record_id, Some(event)))
 }
 
-fn new_scheduled_task_events(since_record_id: u64) -> Vec<ScheduledTaskEvent> {
-    let query = format!("*[System[(EventID=4698) and (EventRecordID>{since_record_id})]]");
-    let query_arg = format!("/q:{query}");
-    let xml_out = wevtutil(&["qe", "Security", "/rd:false", "/f:xml", query_arg.as_str()]);
-    xml::split_event_blocks(&xml_out)
-        .into_iter()
-        .filter_map(xml::parse_scheduled_task_block)
-        .collect()
+static SERVICE_INSTALLS: PollTarget = PollTarget {
+    label: "service-install",
+    channel: "System",
+    id_filter: "EventID=7045",
+    counter: |c| &c.service_installs,
+    parse_block: normalize_service_install,
+    // 7045 lands in the System log unconditionally — nothing to enable.
+    enable_audit: None,
+};
+
+// ── Event 4698 — scheduled task creation (T1053.005) ─────────────────────────
+
+/// Audit enablement is still required even though reading is done via
+/// `wevtutil` rather than a live ETW subscription: without the subcategory
+/// active, Windows simply never writes the 4698 event, regardless of how it is
+/// read afterward. Unlike the logon/account subcategories, "Other Object
+/// Access Events" is NOT in Windows' default audit policy — this call is the
+/// primary enablement path, and its failure warning deserves urgency.
+fn enable_scheduled_task_audit() {
+    enable_audit_subcategory(
+        "Other Object Access Events (event 4698)",
+        SCHEDULED_TASK_AUDIT_SUBCATEGORY_GUID,
+        "scheduled task persistence detection (T1053.005) will not receive any 4698 events",
+    );
 }
 
-fn poll_scheduled_tasks(
-    sink: Arc<dyn EventSink>,
-    stop: Arc<AtomicBool>,
-    counters: Arc<EventLogCounters>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let mut last_id = last_known_record_id_4698();
-        tracing::info!(last_record_id = last_id, "scheduled-task poll started");
-        while !stop.load(Ordering::SeqCst) {
-            std::thread::sleep(POLL_INTERVAL);
-            for task in new_scheduled_task_events(last_id) {
-                last_id = last_id.max(task.record_id);
-                if task.task_name.is_empty() {
-                    continue;
-                }
-                let Some(action_path) = xml::task_action_path(&task.task_content) else {
-                    continue;
-                };
-                let event = FileOpenEvent {
-                    meta: EventMeta {
-                        pid: task.pid,
-                        ppid: 0,
-                        user: User::Unknown,
-                        timestamp_ns: now_ns(),
-                        comm: xml::task_leaf_name(&task.task_name),
-                        container: None, // Windows: no container support
-                    },
-                    path: action_path,
-                    flags: FLAG_PERSISTENCE_TASK_ARTIFACT,
-                };
-                counters.scheduled_tasks.fetch_add(1, Ordering::Relaxed);
-                sink.on_event(Event::FileOpen(event));
-            }
-        }
-        tracing::info!("scheduled-task poll stopped");
-    })
+/// Same tolerance rule as [`normalize_service_install`]; additionally skips a
+/// task whose XML content yields no action path to report.
+fn normalize_scheduled_task(block: &str) -> ParsedBlock {
+    let task = xml::parse_scheduled_task_block(block)?;
+    let record_id = task.record_id;
+    if task.task_name.is_empty() {
+        return Some((record_id, None));
+    }
+    let Some(action_path) = xml::task_action_path(&task.task_content) else {
+        return Some((record_id, None));
+    };
+    let event = persistence_file_open(
+        task.pid,
+        xml::task_leaf_name(&task.task_name),
+        action_path,
+        FLAG_PERSISTENCE_TASK_ARTIFACT,
+    );
+    Some((record_id, Some(event)))
 }
+
+static SCHEDULED_TASKS: PollTarget = PollTarget {
+    label: "scheduled-task",
+    channel: "Security",
+    id_filter: "EventID=4698",
+    counter: |c| &c.scheduled_tasks,
+    parse_block: normalize_scheduled_task,
+    enable_audit: Some(enable_scheduled_task_audit),
+};
 
 // ── Events 4624/4625/4648/4672 — logon/session (#94) ─────────────────────────
 
-/// Best-effort, non-blocking — same rationale as [`enable_scheduled_task_audit`],
-/// except a failure here is expected to be rarer: "Logon" and "Special Logon"
-/// are both enabled by Windows' default audit policy out of the box, so this
-/// call is reinforcement against a hardened/custom policy that turned them off,
-/// not the primary enablement path.
+/// Reinforcement, not primary enablement: "Logon" and "Special Logon" are both
+/// in Windows' default audit policy out of the box, so this guards against a
+/// hardened/custom policy that turned them off — a failure here is less urgent
+/// than [`enable_scheduled_task_audit`]'s.
 fn enable_logon_audit() {
     for (label, guid) in [
         ("Logon", LOGON_AUDIT_SUBCATEGORY_GUID),
         ("Special Logon", SPECIAL_LOGON_AUDIT_SUBCATEGORY_GUID),
     ] {
-        let subcategory_arg = format!("/subcategory:{guid}");
-        let output = Command::new("auditpol")
-            .args([
-                "/set",
-                subcategory_arg.as_str(),
-                "/success:enable",
-                "/failure:enable",
-            ])
-            .output();
-        match output {
-            Ok(o) if o.status.success() => {
-                tracing::info!(audit = label, "audit subcategory enabled");
-            }
-            Ok(o) => tracing::warn!(
-                audit = label,
-                code = ?o.status.code(),
-                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
-                "auditpol failed — logon-event coverage may be incomplete until this audit \
-                 subcategory is confirmed enabled: auditpol /set /subcategory:{guid} \
-                 /success:enable /failure:enable"
-            ),
-            Err(e) => tracing::warn!(
-                audit = label,
-                error = %e,
-                "could not run auditpol — logon-event coverage may be incomplete until the \
-                 audit is confirmed enabled (see command above)"
-            ),
-        }
+        enable_audit_subcategory(label, guid, "logon-event coverage may be incomplete");
     }
 }
 
-fn last_known_record_id_logon() -> u64 {
-    let xml_out = wevtutil(&[
-        "qe",
-        "Security",
-        "/c:1",
-        "/rd:true",
-        "/f:xml",
-        "/q:*[System[(EventID=4624 or EventID=4625 or EventID=4648 or EventID=4672)]]",
-    ]);
-    xml::split_event_blocks(&xml_out)
-        .first()
-        .and_then(|block| xml::parse_logon_block(block))
-        .map(|e| e.record_id)
-        .unwrap_or(0)
+fn normalize_logon(block: &str) -> ParsedBlock {
+    let logon = xml::parse_logon_block(block)?;
+    Some((logon.record_id, to_auth_event(&logon)))
 }
 
-/// New 4624/4625/4648/4672 events since `since_record_id` (exclusive), oldest to
-/// newest — one query across all four IDs (they share the Security channel's
-/// single `EventRecordID` sequence), rather than four separate polls hammering
-/// the same channel.
-fn new_logon_events(since_record_id: u64) -> Vec<LogonEvent> {
-    let query = format!(
-        "*[System[(EventID=4624 or EventID=4625 or EventID=4648 or EventID=4672) and \
-         (EventRecordID>{since_record_id})]]"
-    );
-    let query_arg = format!("/q:{query}");
-    let xml_out = wevtutil(&["qe", "Security", "/rd:false", "/f:xml", query_arg.as_str()]);
-    xml::split_event_blocks(&xml_out)
-        .into_iter()
-        .filter_map(xml::parse_logon_block)
-        .collect()
-}
+static LOGON_EVENTS: PollTarget = PollTarget {
+    label: "logon",
+    channel: "Security",
+    // One query across all four IDs (they share the Security channel's single
+    // `EventRecordID` sequence), rather than four separate polls hammering the
+    // same channel.
+    id_filter: "EventID=4624 or EventID=4625 or EventID=4648 or EventID=4672",
+    counter: |c| &c.logon_events,
+    parse_block: normalize_logon,
+    enable_audit: Some(enable_logon_audit),
+};
 
 /// Maps a parsed [`LogonEvent`] to the normalized [`Event::Auth`], or `None`
 /// when the event carries no usable account identity (a shape this module does
@@ -394,144 +395,53 @@ fn to_auth_event(logon: &LogonEvent) -> Option<Event> {
     }))
 }
 
-fn poll_logon_events(
-    sink: Arc<dyn EventSink>,
-    stop: Arc<AtomicBool>,
-    counters: Arc<EventLogCounters>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let mut last_id = last_known_record_id_logon();
-        tracing::info!(last_record_id = last_id, "logon poll started");
-        while !stop.load(Ordering::SeqCst) {
-            std::thread::sleep(POLL_INTERVAL);
-            for logon in new_logon_events(last_id) {
-                last_id = last_id.max(logon.record_id);
-                if let Some(event) = to_auth_event(&logon) {
-                    counters.logon_events.fetch_add(1, Ordering::Relaxed);
-                    sink.on_event(event);
-                }
-            }
-        }
-        tracing::info!("logon poll stopped");
-    })
-}
-
 // ── Event 4720 — account creation (T1136.001) ────────────────────────────────
 
-/// Same rationale as [`enable_scheduled_task_audit`], less critical: User Account
-/// Management is part of Windows' out-of-the-box default audit policy on both
-/// Client and Server SKUs, so a failure here should not be read as urgently as an
-/// `enable_scheduled_task_audit` failure would be. Belt-and-suspenders regardless
-/// — enable it explicitly so we do not silently miss 4720s on a hardened VM that
-/// disabled the default policy.
-fn enable_account_creation_audit() -> bool {
-    let subcategory_arg = format!("/subcategory:{USER_ACCOUNT_MGMT_AUDIT_SUBCATEGORY_GUID}");
-    let output = Command::new("auditpol")
-        .args([
-            "/set",
-            subcategory_arg.as_str(),
-            "/success:enable",
-            "/failure:enable",
-        ])
-        .output();
-    match output {
-        Ok(o) if o.status.success() => {
-            tracing::info!("\"User Account Management\" audit enabled (event 4720)");
-            true
-        }
-        Ok(o) => {
-            tracing::warn!(
-                code = ?o.status.code(),
-                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
-                "auditpol failed — account-creation persistence detection (T1136.001) may not \
-                 receive any 4720 events until this audit subcategory is enabled manually: \
-                 auditpol /set /subcategory:{USER_ACCOUNT_MGMT_AUDIT_SUBCATEGORY_GUID} \
-                 /success:enable /failure:enable"
-            );
-            false
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "could not run auditpol — account-creation persistence detection (T1136.001) \
-                 may stay silent until the audit is enabled manually (see command above)"
-            );
-            false
-        }
-    }
+/// Belt-and-suspenders like [`enable_logon_audit`]: "User Account Management"
+/// is part of Windows' out-of-the-box default audit policy on both Client and
+/// Server SKUs, so this only matters on a hardened VM that disabled the
+/// default policy.
+fn enable_account_creation_audit() {
+    enable_audit_subcategory(
+        "User Account Management (event 4720)",
+        USER_ACCOUNT_MGMT_AUDIT_SUBCATEGORY_GUID,
+        "account-creation persistence detection (T1136.001) will not receive any 4720 events",
+    );
 }
 
-fn last_known_record_id_4720() -> u64 {
-    let xml_out = wevtutil(&[
-        "qe",
-        "Security",
-        "/c:1",
-        "/rd:true",
-        "/f:xml",
-        "/q:*[System[(EventID=4720)]]",
-    ]);
-    xml::split_event_blocks(&xml_out)
-        .first()
-        .and_then(|block| xml::parse_account_created_block(block))
-        .map(|e| e.record_id)
-        .unwrap_or(0)
+/// A 4720 without a target user name is not usable — the alert message quotes
+/// it as `comm`. Skip, advancing the cursor.
+fn normalize_account_created(block: &str) -> ParsedBlock {
+    let account = xml::parse_account_created_block(block)?;
+    let record_id = account.record_id;
+    let Some(target_name) = account.target_user_name else {
+        return Some((record_id, None));
+    };
+    // TargetSid is preferred as `path` (the persistence artifact's canonical
+    // identifier — survives an account rename). Falling back to the leaf name
+    // reproduced as a placeholder path keeps the alert well-formed if the SID
+    // is missing on some future Windows shape rather than dropping the event
+    // outright.
+    let sid = account
+        .target_user_sid
+        .unwrap_or_else(|| format!("(unknown-sid:{target_name})"));
+    let event = persistence_file_open(
+        account.pid,
+        target_name,
+        sid,
+        FLAG_PERSISTENCE_ACCOUNT_ARTIFACT,
+    );
+    Some((record_id, Some(event)))
 }
 
-fn new_account_created_events(since_record_id: u64) -> Vec<AccountCreatedEvent> {
-    let query = format!("*[System[(EventID=4720) and (EventRecordID>{since_record_id})]]");
-    let query_arg = format!("/q:{query}");
-    let xml_out = wevtutil(&["qe", "Security", "/rd:false", "/f:xml", query_arg.as_str()]);
-    xml::split_event_blocks(&xml_out)
-        .into_iter()
-        .filter_map(xml::parse_account_created_block)
-        .collect()
-}
-
-fn poll_account_creations(
-    sink: Arc<dyn EventSink>,
-    stop: Arc<AtomicBool>,
-    counters: Arc<EventLogCounters>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let mut last_id = last_known_record_id_4720();
-        tracing::info!(last_record_id = last_id, "account-creation poll started");
-        while !stop.load(Ordering::SeqCst) {
-            std::thread::sleep(POLL_INTERVAL);
-            for account in new_account_created_events(last_id) {
-                last_id = last_id.max(account.record_id);
-                // A 4720 without a target user name is not usable — the alert
-                // message quotes this as `comm`. Skip (same tolerance rule as
-                // the scheduled-task/service-install pollers).
-                let Some(target_name) = account.target_user_name else {
-                    continue;
-                };
-                // TargetSid is preferred as `path` (the persistence artifact's
-                // canonical identifier — survives an account rename). Falling
-                // back to the leaf name reproduced as a placeholder path keeps
-                // the alert well-formed if the SID is missing on some future
-                // Windows shape rather than dropping the event outright.
-                let sid = account
-                    .target_user_sid
-                    .unwrap_or_else(|| format!("(unknown-sid:{target_name})"));
-                let event = FileOpenEvent {
-                    meta: EventMeta {
-                        pid: account.pid,
-                        ppid: 0,
-                        user: User::Unknown,
-                        timestamp_ns: now_ns(),
-                        comm: target_name,
-                        container: None, // Windows: no container support
-                    },
-                    path: sid,
-                    flags: FLAG_PERSISTENCE_ACCOUNT_ARTIFACT,
-                };
-                counters.account_creations.fetch_add(1, Ordering::Relaxed);
-                sink.on_event(Event::FileOpen(event));
-            }
-        }
-        tracing::info!("account-creation poll stopped");
-    })
-}
+static ACCOUNT_CREATIONS: PollTarget = PollTarget {
+    label: "account-creation",
+    channel: "Security",
+    id_filter: "EventID=4720",
+    counter: |c| &c.account_creations,
+    parse_block: normalize_account_created,
+    enable_audit: Some(enable_account_creation_audit),
+};
 
 // ── Policy-configurable allowlist and volume counters (#94) ─────────────────
 //
@@ -655,32 +565,21 @@ impl Sensor for EventLogSensor {
 
         let mut handles = Vec::new();
 
-        if self.config.service_installs_enabled {
-            handles.push(poll_service_installs(
-                Arc::clone(&sink),
-                Arc::clone(&self.stop),
-                Arc::clone(&self.counters),
-            ));
-        }
-        if self.config.scheduled_tasks_enabled {
-            enable_scheduled_task_audit();
-            handles.push(poll_scheduled_tasks(
-                Arc::clone(&sink),
-                Arc::clone(&self.stop),
-                Arc::clone(&self.counters),
-            ));
-        }
-        if self.config.account_creations_enabled {
-            enable_account_creation_audit();
-            handles.push(poll_account_creations(
-                Arc::clone(&sink),
-                Arc::clone(&self.stop),
-                Arc::clone(&self.counters),
-            ));
-        }
-        if self.config.logon_events_enabled {
-            enable_logon_audit();
-            handles.push(poll_logon_events(
+        let targets = [
+            (self.config.service_installs_enabled, &SERVICE_INSTALLS),
+            (self.config.scheduled_tasks_enabled, &SCHEDULED_TASKS),
+            (self.config.account_creations_enabled, &ACCOUNT_CREATIONS),
+            (self.config.logon_events_enabled, &LOGON_EVENTS),
+        ];
+        for (enabled, target) in targets {
+            if !enabled {
+                continue;
+            }
+            if let Some(enable_audit) = target.enable_audit {
+                enable_audit();
+            }
+            handles.push(poll(
+                target,
                 Arc::clone(&sink),
                 Arc::clone(&self.stop),
                 Arc::clone(&self.counters),
