@@ -1,0 +1,203 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Synthaea agent MSI (#37): installs agent.exe + watchdog.exe into Program Files
+  and registers the watchdog as the "SynthaEDR" Windows service via its own
+  `install`/`uninstall` subcommands (see watchdog/src/service/windows.rs) rather
+  than WiX's native ServiceInstall/ServiceControl elements - the watchdog already
+  self-registers (sc create + failure-action + start), persisting the
+  agent-bin/alerts flags into the service's own binPath (#112), so
+  re-implementing that in WiX would just be a second, divergent way to do the
+  same thing.
+
+  WiX v3 (candle.exe/light.exe) chosen over v4/v5: a standalone toolset, no
+  dotnet/NuGet needed to install it (this repo's dev machines already juggle
+  enough toolchains - see lab/provisioning/windows-toolchain.ps1) or to build
+  with it.
+
+  Build-tested (2026-09-18) end to end on a real Windows 11 machine: install,
+  service running, uninstall, service gone. INSTALLFOLDER wipe took three
+  iterations to get right - see README.md "Status" and the
+  CleanupInstallFolder comment below for what each attempt found.
+
+  A first attempt at the uninstall cleanup used WixUtilExtension's
+  util:RemoveFolderEx (the textbook WiX answer for "delete everything under
+  this folder on uninstall, not just what MSI itself installed"). In practice
+  on this build it never even appeared in the verbose install log - not a
+  runtime failure, just never scheduled - and debugging a third-party
+  extension's internals blind, without MSI table-inspection tooling (orca/
+  lessmsi) on the test machine, wasn't worth it against a mechanism already
+  proven to work in this exact file: the CleanupInstallFolder CustomAction
+  below reuses the same deferred + Impersonate="no" + FileKey/Directory
+  pattern already confirmed (via the verbose log) to resolve [INSTALLFOLDER]
+  correctly for InstallService/UninstallService.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="Synthaea Agent"
+           Language="1033"
+           Version="0.1.0.0"
+           Manufacturer="Synthaea"
+           UpgradeCode="D79BAF8F-91AC-4018-8274-297161F7F57F">
+    <!--
+      UpgradeCode must never change across versions (it is what ties future
+      releases together for MajorUpgrade below) - Product/Id="*" (a fresh GUID
+      each build) is what SHOULD change every build; Version is what actually
+      drives upgrade/downgrade comparisons.
+    -->
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64" />
+
+    <!--
+      perMachine (via Package above) already implies elevation is required;
+      the watchdog's own `install` custom action below needs that (sc create).
+    -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="Synthaea">
+          <Component Id="AgentExe" Guid="855B0481-4C70-4A29-A15D-23625BD085AE" Win64="yes">
+            <File Id="AgentExeFile" Source="$(var.RepoRoot)\target\release\agent.exe" KeyPath="yes" />
+          </Component>
+          <Component Id="WatchdogExe" Guid="4BE7B00A-A454-4E8D-B786-A15E32D22AFF" Win64="yes">
+            <File Id="WatchdogExeFile" Source="$(var.RepoRoot)\target\release\watchdog.exe" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="MainFeature" Title="Synthaea Agent" Level="1">
+      <ComponentRef Id="AgentExe" />
+      <ComponentRef Id="WatchdogExe" />
+    </Feature>
+
+    <!--
+      FileKey (not a literal path): resolves to wherever AgentExeFile/
+      WatchdogExeFile actually got installed, so this does not hardcode
+      INSTALLFOLDER twice. Deferred + Impersonate="no": runs elevated, in the
+      installer's script context, after the files are actually on disk -
+      sc create would fail if scheduled any earlier or run as the (possibly
+      non-admin) interactive user.
+
+      The alerts flag is explicit ("[INSTALLFOLDER]alerts.ndjson"): without
+      it, watchdog.exe install's own CLI default ("alerts.ndjson", relative)
+      would resolve against msiexec's own working directory, not
+      INSTALLFOLDER - see cmd_install's std::path::absolute() call in
+      service/windows.rs. No agent-bin flag needed: resolve_agent_bin's
+      default (next to the watchdog executable) already finds AgentExeFile,
+      since both land in the same INSTALLFOLDER.
+    -->
+    <CustomAction Id="InstallService"
+                  FileKey="WatchdogExeFile"
+                  ExeCommand="install --alerts &quot;[INSTALLFOLDER]alerts.ndjson&quot;"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <!--
+      Return="ignore": an uninstall must not fail (leaving the product stuck
+      "half removed") just because the service was already gone or `sc
+      delete` hit a transient error - matches watchdog.exe uninstall's own
+      command-side tolerance (run_sc for "stop" is already best-effort there).
+    -->
+    <CustomAction Id="UninstallService"
+                  FileKey="WatchdogExeFile"
+                  ExeCommand="uninstall"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <!--
+      Forces INSTALLFOLDER empty on uninstall, including files the running
+      agent/watchdog wrote at runtime (alerts.ndjson, alerts.heartbeat,
+      events.jsonl) that no MSI Component here declares - MSI's own RemoveFiles
+      standard action only ever removes files a Component actually installed,
+      so without this, those (and the now-non-empty INSTALLFOLDER itself) were
+      left behind after a real uninstall - confirmed on a real machine
+      2026-09-18, which is what led to adding this.
+
+      Directory="TARGETDIR" + ExeCommand (WiX "Type 18": launch ExeCommand
+      with that Directory as the working directory, target resolved via the
+      system PATH - cmd.exe always is) - deliberately not FileKey-based like
+      the two CustomActions above, since this must still run even if
+      watchdog.exe/agent.exe are already gone by the time it executes.
+
+      Directory is deliberately TARGETDIR (the drive root), not INSTALLFOLDER
+      itself: an earlier version used Directory="INSTALLFOLDER" and every
+      real-machine test hit error 32 (ERROR_SHARING_VIOLATION) on the very
+      first delete, unaffected by the ping-based wait below - because
+      Directory sets the *launched cmd.exe's own current working directory*,
+      and Windows will not let you delete a directory that is some process's
+      CWD. cmd.exe was locking the exact folder it was told to delete. Using
+      an unrelated, never-deleted directory as the working directory (the
+      actual delete target is still passed via [INSTALLFOLDER] in
+      ExeCommand, independent of Directory) removed that self-lock.
+
+      The trailing "." in "[INSTALLFOLDER]." is not a typo: INSTALLFOLDER
+      expands with a trailing backslash (e.g. "C:\Program Files\Synthaea\"),
+      and a backslash immediately before the closing quote is parsed by
+      Windows' argument parser as an escaped quote, not a path separator -
+      corrupting the quoting. Appending "." after the property reference (a
+      no-op for the actual path) keeps the character before the closing quote
+      a literal ".", sidestepping that.
+
+      This is a deliberate product choice, not just a packaging nicety: an
+      uninstall wipes local telemetry (events.jsonl) along with the binaries.
+      Weighed against forensic value (keeping local logs around after someone
+      removes the agent), packaging/README.md's own rule - "Uninstall must be
+      clean and complete - an EDR that leaves residue destroys trust" - is
+      what this defers to. Revisit if the team decides log
+      retention-after-uninstall matters more than that rule for incident
+      response.
+
+      "ping -n 4 127.0.0.1 >nul" before the actual rd /s /q: kept as a cheap
+      safety margin for the separate, still-real possibility that stopping
+      the service via the SCM (what watchdog.exe uninstall does, immediately
+      before this runs) is asynchronous, so agent.exe/watchdog.exe could
+      still be mid-exit and briefly hold their own file handles open right
+      after the SCM reports the stop as done. `timeout` doesn't work here (it
+      needs a console to redirect from, which a deferred CA running as SYSTEM
+      doesn't have) - pinging localhost a few times is the standard, reliable
+      way to get a plain ~3s wait out of cmd.exe alone, with no extra
+      tooling. Note this alone did NOT fix the error 32 seen on real-machine
+      testing (see above) - the Directory="INSTALLFOLDER" self-lock did,
+      independently of this wait.
+
+      Return="ignore": matches UninstallService's own reasoning - if a file
+      is still locked for some other reason even after the wait (e.g. an
+      antivirus scanner mid-scan) and rd /s /q exits non-zero, that must not
+      leave the product stuck "half removed".
+    -->
+    <CustomAction Id="CleanupInstallFolder"
+                  Directory="TARGETDIR"
+                  ExeCommand="cmd.exe /c ping -n 4 127.0.0.1 >nul &amp; rd /s /q &quot;[INSTALLFOLDER].&quot;"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <!--
+        NOT Installed: only on a fresh install / major upgrade's install half,
+        never on a repair of an already-installed product (repairing would
+        otherwise call `watchdog.exe install` against an already-registered
+        service on every `msiexec /fa`).
+      -->
+      <Custom Action="InstallService" After="InstallFiles">NOT Installed</Custom>
+      <!--
+        Before RemoveFiles, not after: the service must be stopped and
+        deregistered while watchdog.exe still exists on disk to run.
+        Installed AND REMOVE="ALL" is the standard WiX idiom for "this is a
+        real uninstall", not a repair or a feature-level modify.
+      -->
+      <Custom Action="UninstallService" Before="RemoveFiles">Installed AND (REMOVE="ALL")</Custom>
+      <!--
+        After UninstallService (which still needs watchdog.exe on disk to run
+        its own `uninstall` subcommand) but still before RemoveFiles - by the
+        time RemoveFiles itself runs, INSTALLFOLDER is already gone, so
+        RemoveFiles finds nothing left to do for AgentExe/WatchdogExe, which
+        MSI tolerates without erroring.
+      -->
+      <Custom Action="CleanupInstallFolder" After="UninstallService">Installed AND (REMOVE="ALL")</Custom>
+    </InstallExecuteSequence>
+  </Product>
+</Wix>
