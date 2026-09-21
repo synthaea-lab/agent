@@ -6,10 +6,13 @@
 //! since deleted — it only compiled on Linux and this module supersedes it; see git
 //! history), now production-ready: deduplication, error handling, library type detection.
 
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+};
+
 use goblin::elf::Elf;
-use std::collections::HashSet;
-use std::fs;
-use std::path::{Path, PathBuf};
 
 /// ELF symbol with its offset and source library.
 #[derive(Debug, Clone)]
@@ -31,10 +34,7 @@ pub enum LibraryType {
 
 impl LibraryType {
     fn from_path(path: &Path) -> Self {
-        let filename = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
 
         if filename.contains("libssl") {
             Self::OpenSSL
@@ -301,10 +301,7 @@ pub fn resolve_tls_symbols() -> Result<Vec<SymbolInfo>, ResolverError> {
         match resolve_symbols(lib, &target_symbols) {
             Ok(mut symbols) => all_symbols.append(&mut symbols),
             Err(e) => {
-                log::warn!(
-                    "symbol_resolver: failed to parse {}: {e}",
-                    lib.display()
-                );
+                log::warn!("symbol_resolver: failed to parse {}: {e}", lib.display());
             }
         }
     }
@@ -335,10 +332,7 @@ pub fn resolve_readline_symbols() -> Result<Vec<SymbolInfo>, ResolverError> {
         match resolve_symbols(lib, &target_symbols) {
             Ok(mut symbols) => all_symbols.append(&mut symbols),
             Err(e) => {
-                log::warn!(
-                    "symbol_resolver: failed to parse {}: {e}",
-                    lib.display()
-                );
+                log::warn!("symbol_resolver: failed to parse {}: {e}", lib.display());
             }
         }
     }

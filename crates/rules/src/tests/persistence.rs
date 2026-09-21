@@ -94,7 +94,9 @@ fn service_install_alert_carries_image_path_and_service_name() {
         alert.message
     );
     assert!(
-        alert.message.contains("C:\\Users\\Public\\malware-service.exe"),
+        alert
+            .message
+            .contains("C:\\Users\\Public\\malware-service.exe"),
         "alert missing image path: {}",
         alert.message
     );
@@ -164,7 +166,9 @@ fn account_creation_alert_carries_sid_and_account_name() {
         alert.message
     );
     assert!(
-        alert.message.contains("S-1-5-21-1004336348-1177238915-682003330-1006"),
+        alert
+            .message
+            .contains("S-1-5-21-1004336348-1177238915-682003330-1006"),
         "alert missing SID: {}",
         alert.message
     );

@@ -10,8 +10,7 @@
 //! `tests/fixtures/v2/` holds the current snapshot instead, exercised by
 //! `tests/golden.rs`.
 
-use schema::detection::Detection;
-use schema::Event;
+use schema::{Event, detection::Detection};
 
 fn v1_fixture(name: &str) -> String {
     let path = format!(

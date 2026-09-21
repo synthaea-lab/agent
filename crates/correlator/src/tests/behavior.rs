@@ -221,7 +221,11 @@ fn wget_from_a_trusted_path_never_alerts_bayes() {
         "/usr/bin/wget",
     ));
     for i in 0..20u64 {
-        let connect = connect_to(meta_full(500, 50, "wget", (i + 1) * 100_000_000), [1, 1, 1, 1], 80);
+        let connect = connect_to(
+            meta_full(500, 50, "wget", (i + 1) * 100_000_000),
+            [1, 1, 1, 1],
+            80,
+        );
         let alerts = engine.on_event(connect);
         assert!(
             !alerts.iter().any(|a| a.technique == "BAYES"),
@@ -260,7 +264,11 @@ fn masqueraded_wget_from_an_untrusted_path_still_alerts_bayes() {
     let mut engine = CorrelationEngine::new();
     engine.on_event(exec_with_meta(meta_full(700, 50, "wget", 0), "/tmp/wget"));
     for i in 0..20u64 {
-        let connect = connect_to(meta_full(700, 50, "wget", (i + 1) * 100_000_000), [1, 1, 1, 1], 80);
+        let connect = connect_to(
+            meta_full(700, 50, "wget", (i + 1) * 100_000_000),
+            [1, 1, 1, 1],
+            80,
+        );
         let alerts = engine.on_event(connect);
         if alerts.iter().any(|a| a.technique == "BAYES") {
             return; // test OK

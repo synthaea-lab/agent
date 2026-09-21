@@ -1,8 +1,10 @@
 //! `AuditSensor`: `schema::sensor::Sensor` implementation.
 
 use std::sync::Arc;
-use schema::sensor::{Sensor, SensorError, Capabilities, EventSink};
+
+use schema::sensor::{Capabilities, EventSink, Sensor, SensorError};
 use tokio::sync::Notify;
+
 use crate::{AuditSocket, classify, normalize, parse};
 
 pub struct AuditSensor {
@@ -12,17 +14,17 @@ pub struct AuditSensor {
 impl AuditSensor {
     #[must_use]
     pub fn new() -> Self {
-        Self { stop: Arc::new(Notify::new()) }
+        Self {
+            stop: Arc::new(Notify::new()),
+        }
     }
 
     async fn run_async(&mut self, sink: Box<dyn EventSink>) -> Result<(), SensorError> {
-        let socket = AuditSocket::open()
-            .map_err(|e| format!("audit socket open: {e}"))?;
+        let socket = AuditSocket::open().map_err(|e| format!("audit socket open: {e}"))?;
 
-        let mut async_socket = tokio::io::unix::AsyncFd::with_interest(
-            socket,
-            tokio::io::Interest::READABLE,
-        ).map_err(|e| format!("AsyncFd: {e}"))?;
+        let mut async_socket =
+            tokio::io::unix::AsyncFd::with_interest(socket, tokio::io::Interest::READABLE)
+                .map_err(|e| format!("AsyncFd: {e}"))?;
 
         log::info!("sensor-linux-audit: listening for exec/connect");
 
@@ -91,11 +93,11 @@ impl Sensor for AuditSensor {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             exec_events: true,
-            file_events: false,      // Phase 2: fanotify
+            file_events: false, // Phase 2: fanotify
             connect_events: true,
-            auth_events: false,      // journal sensor's domain
+            auth_events: false, // journal sensor's domain
             user_attribution: true,
-            parent_lineage: false,   // HONEST: auditd doesn't track ppid
+            parent_lineage: false, // HONEST: auditd doesn't track ppid
         }
     }
 
@@ -133,8 +135,8 @@ mod tests {
         assert!(caps.exec_events);
         assert!(caps.connect_events);
         assert!(caps.user_attribution);
-        assert!(!caps.parent_lineage);  // Honest: audit doesn't provide ppid
-        assert!(!caps.file_events);     // Phase 2
-        assert!(!caps.auth_events);     // journal owns this
+        assert!(!caps.parent_lineage); // Honest: audit doesn't provide ppid
+        assert!(!caps.file_events); // Phase 2
+        assert!(!caps.auth_events); // journal owns this
     }
 }

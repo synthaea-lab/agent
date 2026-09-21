@@ -2,11 +2,12 @@
 //! administrator privileges; Ctrl-C is wired to both sensors' stop flags here (on
 //! Linux the sensor handles it itself).
 
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, atomic::Ordering};
 
-use schema::Event;
-use schema::sensor::{EventSink, Sensor as _};
+use schema::{
+    Event,
+    sensor::{EventSink, Sensor as _},
+};
 
 use crate::sink::DetectionSink;
 

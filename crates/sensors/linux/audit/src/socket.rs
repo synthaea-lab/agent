@@ -6,12 +6,12 @@ use std::os::unix::io::{AsRawFd, RawFd};
 
 const AF_NETLINK: i32 = 16;
 const NETLINK_AUDIT: i32 = 9;
-const AUDIT_NLGRP_READLOG: u32 = 1;  // Multicast group for receiving audit logs
+const AUDIT_NLGRP_READLOG: u32 = 1; // Multicast group for receiving audit logs
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuditError {
     #[error("netlink socket error: {0}")]
-    Netlink(i32),  // errno
+    Netlink(i32), // errno
     #[error("failed to parse audit message: {0}")]
     Parse(String),
 }
@@ -48,8 +48,8 @@ impl AuditSocket {
         // with no invalid all-zero bit pattern.
         let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
         addr.nl_family = AF_NETLINK as u16;
-        addr.nl_pid = 0;  // Let kernel assign
-        addr.nl_groups = 1 << (AUDIT_NLGRP_READLOG - 1);  // Subscribe to audit log multicast group
+        addr.nl_pid = 0; // Let kernel assign
+        addr.nl_groups = 1 << (AUDIT_NLGRP_READLOG - 1); // Subscribe to audit log multicast group
 
         // SAFETY: bind(2) on owned fd, passing pointer to local sockaddr_nl
         // whose size matches addrlen argument.
@@ -65,7 +65,9 @@ impl AuditSocket {
             // SAFETY: __errno_location returns a valid pointer to thread-local errno
             let errno = unsafe { *libc::__errno_location() };
             // SAFETY: fd is owned by this function and close is called exactly once
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             return Err(AuditError::Netlink(errno));
         }
 
@@ -111,7 +113,9 @@ impl AsRawFd for AuditSocket {
 impl Drop for AuditSocket {
     fn drop(&mut self) {
         // SAFETY: fd owned by this struct, closed exactly once on drop.
-        unsafe { libc::close(self.fd); }
+        unsafe {
+            libc::close(self.fd);
+        }
     }
 }
 

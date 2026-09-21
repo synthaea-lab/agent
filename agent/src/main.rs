@@ -26,9 +26,9 @@ mod heartbeat;
 #[cfg(target_os = "linux")]
 mod kill_loudness;
 mod protected;
+mod silence;
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 mod sink;
-mod silence;
 mod time;
 
 use clap::{Parser, Subcommand};

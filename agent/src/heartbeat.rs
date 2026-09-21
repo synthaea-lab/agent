@@ -15,10 +15,14 @@
 //! version) remains the right tool for the UI/CLI control channel it's
 //! designed for; this is a narrower, purpose-built mechanism for one signal.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 /// How often the writer thread samples the counter and rewrites the file.
 /// Independent of the watchdog's own `--heartbeat-interval-secs` (its poll

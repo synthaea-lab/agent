@@ -8,8 +8,10 @@
 use std::time::Duration;
 
 use serde::Deserialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::UnixStream,
+};
 
 /// Where the Docker daemon listens by default. A containerd-only host (no Docker)
 /// or a remapped socket path isn't handled specially — `lookup` returns `None`
@@ -136,7 +138,10 @@ fn http_response_body(raw: &[u8]) -> Option<Vec<u8>> {
     let split_at = raw.windows(sep.len()).position(|w| w == sep)? + sep.len();
     let (headers, body) = (&raw[..split_at], &raw[split_at..]);
     let headers = std::str::from_utf8(headers).ok()?;
-    if headers.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+    if headers
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
         dechunk(body)
     } else {
         Some(body.to_vec())
@@ -166,7 +171,7 @@ fn dechunk(mut body: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dechunk, http_response_body, status_line_is_2xx, InspectResponse};
+    use super::{InspectResponse, dechunk, http_response_body, status_line_is_2xx};
 
     #[test]
     fn status_line_2xx_accepts_200() {
@@ -196,7 +201,10 @@ mod tests {
 
     #[test]
     fn http_response_body_none_without_blank_line() {
-        assert_eq!(http_response_body(b"garbage, no header/body separator"), None);
+        assert_eq!(
+            http_response_body(b"garbage, no header/body separator"),
+            None
+        );
     }
 
     #[test]

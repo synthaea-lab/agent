@@ -18,8 +18,10 @@
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use schema::{Event, sensor::EventSink};
 
@@ -96,8 +98,9 @@ fn matches_protected(protected: &Path, observed: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
 
     struct CountingSink(Arc<AtomicUsize>);
 
@@ -127,10 +130,7 @@ mod tests {
 
     #[test]
     fn matches_protected_tolerates_a_dfd_relative_suffix() {
-        assert!(matches_protected(
-            Path::new("/opt/synthaea/agent"),
-            "agent"
-        ));
+        assert!(matches_protected(Path::new("/opt/synthaea/agent"), "agent"));
         assert!(!matches_protected(
             Path::new("/opt/synthaea/agent"),
             "myagent"
@@ -141,7 +141,8 @@ mod tests {
     #[test]
     fn a_foreign_write_to_a_protected_path_fires_an_alert() {
         let forwarded = Arc::new(AtomicUsize::new(0));
-        let alerts_dir = std::env::temp_dir().join(format!("protected-test-{}", std::process::id()));
+        let alerts_dir =
+            std::env::temp_dir().join(format!("protected-test-{}", std::process::id()));
         std::fs::create_dir_all(&alerts_dir).unwrap();
         let alerts = alerts_dir.join("alerts.ndjson");
         let events = alerts_dir.join("events.jsonl");
@@ -155,9 +156,16 @@ mod tests {
 
         guard.on_event(open_event(9999, "evil", "alerts.ndjson", O_WRONLY));
 
-        assert_eq!(forwarded.load(Ordering::Relaxed), 1, "must still forward the event");
+        assert_eq!(
+            forwarded.load(Ordering::Relaxed),
+            1,
+            "must still forward the event"
+        );
         let written = std::fs::read_to_string(&alerts).unwrap();
-        assert!(written.contains("T1562"), "expected a T1562 alert, got: {written}");
+        assert!(
+            written.contains("T1562"),
+            "expected a T1562 alert, got: {written}"
+        );
         assert!(written.contains("evil"));
 
         let _ = std::fs::remove_dir_all(&alerts_dir);
@@ -166,7 +174,8 @@ mod tests {
     #[test]
     fn own_writes_never_alert() {
         let forwarded = Arc::new(AtomicUsize::new(0));
-        let alerts_dir = std::env::temp_dir().join(format!("protected-test-self-{}", std::process::id()));
+        let alerts_dir =
+            std::env::temp_dir().join(format!("protected-test-self-{}", std::process::id()));
         std::fs::create_dir_all(&alerts_dir).unwrap();
         let alerts = alerts_dir.join("alerts.ndjson");
         let events = alerts_dir.join("events.jsonl");
@@ -178,10 +187,18 @@ mod tests {
             sink,
         );
 
-        guard.on_event(open_event(std::process::id(), "agent", "alerts.ndjson", O_WRONLY));
+        guard.on_event(open_event(
+            std::process::id(),
+            "agent",
+            "alerts.ndjson",
+            O_WRONLY,
+        ));
 
         let written = std::fs::read_to_string(&alerts).unwrap();
-        assert!(!written.contains("T1562"), "must not alert on its own writes, got: {written}");
+        assert!(
+            !written.contains("T1562"),
+            "must not alert on its own writes, got: {written}"
+        );
 
         let _ = std::fs::remove_dir_all(&alerts_dir);
     }
@@ -189,7 +206,8 @@ mod tests {
     #[test]
     fn a_read_only_open_never_alerts() {
         let forwarded = Arc::new(AtomicUsize::new(0));
-        let alerts_dir = std::env::temp_dir().join(format!("protected-test-read-{}", std::process::id()));
+        let alerts_dir =
+            std::env::temp_dir().join(format!("protected-test-read-{}", std::process::id()));
         std::fs::create_dir_all(&alerts_dir).unwrap();
         let alerts = alerts_dir.join("alerts.ndjson");
         let events = alerts_dir.join("events.jsonl");
@@ -204,7 +222,10 @@ mod tests {
         guard.on_event(open_event(9999, "cat", "alerts.ndjson", O_RDONLY));
 
         let written = std::fs::read_to_string(&alerts).unwrap();
-        assert!(!written.contains("T1562"), "a mere read must not alert, got: {written}");
+        assert!(
+            !written.contains("T1562"),
+            "a mere read must not alert, got: {written}"
+        );
 
         let _ = std::fs::remove_dir_all(&alerts_dir);
     }

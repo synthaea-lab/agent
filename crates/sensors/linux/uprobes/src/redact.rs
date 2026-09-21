@@ -21,7 +21,10 @@
 /// patterns here failing `Regex::new` silently, with no test ever having exercised them.
 const TLS_PATTERNS: &[(&str, &str)] = &[
     // "Authorization: Bearer ..." or "Authorization: Basic ..."
-    (r"(?i)authorization:\s*[^\r\n]+", "Authorization: [REDACTED]"),
+    (
+        r"(?i)authorization:\s*[^\r\n]+",
+        "Authorization: [REDACTED]",
+    ),
     // "Cookie: session_id=abc123..."
     (r"(?i)cookie:\s*[^\r\n]+", "Cookie: [REDACTED]"),
     // "https://user:password@example.com"
@@ -149,7 +152,9 @@ mod tests {
 
     #[test]
     fn redacts_authorization_header() {
-        let data = b"GET /api HTTP/1.1\r\nAuthorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\r\n".to_vec();
+        let data =
+            b"GET /api HTTP/1.1\r\nAuthorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\r\n"
+                .to_vec();
         let redacted = redact_tls_data(data);
         let text = String::from_utf8(redacted).unwrap();
         assert!(text.contains("Authorization: [REDACTED]"));
@@ -158,7 +163,8 @@ mod tests {
 
     #[test]
     fn redacts_cookie_header() {
-        let data = b"GET /api HTTP/1.1\r\nCookie: session_id=abc123; auth_token=xyz789\r\n".to_vec();
+        let data =
+            b"GET /api HTTP/1.1\r\nCookie: session_id=abc123; auth_token=xyz789\r\n".to_vec();
         let redacted = redact_tls_data(data);
         let text = String::from_utf8(redacted).unwrap();
         assert!(text.contains("Cookie: [REDACTED]"));
@@ -225,7 +231,8 @@ mod tests {
 
     #[test]
     fn redacts_aws_credentials() {
-        let input = "export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string();
+        let input =
+            "export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string();
         let redacted = redact_readline_input(input);
         assert!(redacted.contains("AWS_SECRET_ACCESS_KEY=[REDACTED]"));
         assert!(!redacted.contains("wJalrXUtn"));

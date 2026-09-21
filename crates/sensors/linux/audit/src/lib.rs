@@ -5,20 +5,19 @@
 //! fanotify (file events). Reduced fidelity versus the eBPF sensor; the conformance
 //! suite records exactly what is lost.
 
-mod parse;
 mod classify;
 mod normalize;
+mod parse;
 
-#[cfg(target_os = "linux")]
-mod socket;
 #[cfg(target_os = "linux")]
 mod sensor;
+#[cfg(target_os = "linux")]
+mod socket;
 
-pub use parse::{AuditRecord, parse_audit_message};
 pub use classify::{AuditEvent, classify};
 pub use normalize::{connect_event, exec_event};
-
-#[cfg(target_os = "linux")]
-pub use socket::{AuditSocket, AuditError};
+pub use parse::{AuditRecord, parse_audit_message};
 #[cfg(target_os = "linux")]
 pub use sensor::AuditSensor;
+#[cfg(target_os = "linux")]
+pub use socket::{AuditError, AuditSocket};

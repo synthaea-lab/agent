@@ -5,15 +5,19 @@
 //! remember the last `EventRecordID` seen, poll for anything newer, normalize
 //! into a `schema::Event`, hand it to the sink.
 
-use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
-use schema::sensor::{Capabilities, EventSink, Sensor, SensorError};
 use schema::{
-    AuthEvent, AuthKind, AuthOutcome, Event, EventMeta, FileOpenEvent, User,
-    FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT, FLAG_PERSISTENCE_TASK_ARTIFACT,
+    AuthEvent, AuthKind, AuthOutcome, Event, EventMeta, FLAG_PERSISTENCE_ACCOUNT_ARTIFACT,
+    FLAG_PERSISTENCE_ARTIFACT, FLAG_PERSISTENCE_TASK_ARTIFACT, FileOpenEvent, User,
+    sensor::{Capabilities, EventSink, Sensor, SensorError},
 };
 
 use crate::xml::{self, AccountCreatedEvent, LogonEvent, ScheduledTaskEvent, ServiceInstallEvent};
@@ -522,9 +526,7 @@ fn poll_account_creations(
                     path: sid,
                     flags: FLAG_PERSISTENCE_ACCOUNT_ARTIFACT,
                 };
-                counters
-                    .account_creations
-                    .fetch_add(1, Ordering::Relaxed);
+                counters.account_creations.fetch_add(1, Ordering::Relaxed);
                 sink.on_event(Event::FileOpen(event));
             }
         }

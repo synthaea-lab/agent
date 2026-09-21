@@ -6,18 +6,21 @@
 //! reuses them for the preflight (loads each program without attaching it), which is
 //! not part of the `Sensor` contract.
 
-use std::collections::{HashMap, VecDeque};
-use std::os::unix::fs::MetadataExt;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::{HashMap, VecDeque},
+    os::unix::fs::MetadataExt,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use log::warn;
-use schema::sensor::{Capabilities, EventSink, Sensor, SensorError};
-use schema::ContainerContext;
+use schema::{
+    ContainerContext,
+    sensor::{Capabilities, EventSink, Sensor, SensorError},
+};
 use tokio::sync::Notify;
 
-use crate::docker::DockerContainerInfo;
-use crate::normalize;
+use crate::{docker::DockerContainerInfo, normalize};
 
 /// The tracepoints implemented to date: (program, category, name). `sched_process_fork`
 /// and `sched_process_exit` maintain the `PROC_LINEAGE` map (parent pid/comm) that the
@@ -668,17 +671,20 @@ impl Sensor for LinuxSensor {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        cell::Cell,
+        collections::HashMap,
+        os::unix::fs::MetadataExt,
+        path::Path,
+        sync::{Arc, Mutex},
+    };
+
     use super::{
-        container_context, container_id_from_cgroupfs, extract_container_id, is_proc_exit_race,
-        parse_proc_cmdline, parse_stat_ppid_comm, CgroupIdCache, DockerInfoCache,
-        DockerLookupState, CGROUP_ID_CACHE_CAP,
+        CGROUP_ID_CACHE_CAP, CgroupIdCache, DockerInfoCache, DockerLookupState, container_context,
+        container_id_from_cgroupfs, extract_container_id, is_proc_exit_race, parse_proc_cmdline,
+        parse_stat_ppid_comm,
     };
     use crate::docker::DockerContainerInfo;
-    use std::cell::Cell;
-    use std::collections::HashMap;
-    use std::os::unix::fs::MetadataExt;
-    use std::path::Path;
-    use std::sync::{Arc, Mutex};
 
     #[test]
     fn cmdline_splits_on_nul_and_drops_trailing_empty() {
@@ -802,10 +808,7 @@ mod tests {
     #[test]
     fn cgroupfs_walk_finds_a_matching_docker_scope_by_inode() {
         let root = temp_cgroupfs_root("finds-match");
-        let target_ino = make_cgroup_dir(
-            &root,
-            &format!("system.slice/docker-{DOCKER_ID}.scope"),
-        );
+        let target_ino = make_cgroup_dir(&root, &format!("system.slice/docker-{DOCKER_ID}.scope"));
         // A sibling directory the walk must not mistake for the target.
         make_cgroup_dir(&root, "system.slice/sshd.service");
 
@@ -868,7 +871,11 @@ mod tests {
         assert_eq!(cache.resolve_with(42, fetch), Some("abc".to_string()));
         assert_eq!(cache.resolve_with(42, fetch), Some("abc".to_string()));
         assert_eq!(cache.resolve_with(42, fetch), Some("abc".to_string()));
-        assert_eq!(calls.get(), 1, "second/third resolve of the same cgroup id must hit the cache, not fetch again");
+        assert_eq!(
+            calls.get(),
+            1,
+            "second/third resolve of the same cgroup id must hit the cache, not fetch again"
+        );
     }
 
     #[test]
@@ -888,7 +895,11 @@ mod tests {
         assert_eq!(cache.resolve_with(7, fetch), None);
         assert_eq!(cache.resolve_with(7, fetch), None);
         assert_eq!(cache.resolve_with(7, fetch), None);
-        assert_eq!(calls.get(), 1, "a None result must be cached on the very first fetch");
+        assert_eq!(
+            calls.get(),
+            1,
+            "a None result must be cached on the very first fetch"
+        );
     }
 
     #[test]
@@ -900,10 +911,23 @@ mod tests {
             Some(format!("container-{id}"))
         };
 
-        assert_eq!(cache.resolve_with(1, fetch), Some("container-1".to_string()));
-        assert_eq!(cache.resolve_with(2, fetch), Some("container-2".to_string()));
-        assert_eq!(cache.resolve_with(1, fetch), Some("container-1".to_string()));
-        assert_eq!(calls.get(), 2, "one fetch per distinct cgroup id, regardless of resolve order");
+        assert_eq!(
+            cache.resolve_with(1, fetch),
+            Some("container-1".to_string())
+        );
+        assert_eq!(
+            cache.resolve_with(2, fetch),
+            Some("container-2".to_string())
+        );
+        assert_eq!(
+            cache.resolve_with(1, fetch),
+            Some("container-1".to_string())
+        );
+        assert_eq!(
+            calls.get(),
+            2,
+            "one fetch per distinct cgroup id, regardless of resolve order"
+        );
     }
 
     #[test]
@@ -920,7 +944,10 @@ mod tests {
         // evicted so the cache stays bounded rather than growing forever.
         cache.resolve_with(CGROUP_ID_CACHE_CAP as u64, fetch);
         assert_eq!(cache.entries.len(), CGROUP_ID_CACHE_CAP);
-        assert!(!cache.entries.contains_key(&0), "oldest entry should have been evicted");
+        assert!(
+            !cache.entries.contains_key(&0),
+            "oldest entry should have been evicted"
+        );
 
         // Evicting id 0 means it is no longer cached — re-resolving it must fetch
         // again (proves eviction removed it from `entries`, not just `order`).
@@ -940,7 +967,10 @@ mod tests {
         // `resolve_with`'s fetch.
         let mut cache = CgroupIdCache::new();
         assert_eq!(cache.resolve(0), None);
-        assert!(!cache.entries.contains_key(&0), "id 0 must not even be cached");
+        assert!(
+            !cache.entries.contains_key(&0),
+            "id 0 must not even be cached"
+        );
     }
 
     fn empty_docker_cache() -> DockerInfoCache {
@@ -1005,10 +1035,10 @@ mod tests {
         let mut ids = CgroupIdCache::new();
         ids.entries.insert(7, Some("abc123".to_string()));
         let docker_cache = empty_docker_cache();
-        docker_cache
-            .lock()
-            .unwrap()
-            .insert("abc123".to_string(), DockerLookupState::Done(DockerContainerInfo::default()));
+        docker_cache.lock().unwrap().insert(
+            "abc123".to_string(),
+            DockerLookupState::Done(DockerContainerInfo::default()),
+        );
 
         let ctx = container_context(7, &mut ids, &docker_cache).expect("has a container id");
         assert_eq!(ctx.id, "abc123");

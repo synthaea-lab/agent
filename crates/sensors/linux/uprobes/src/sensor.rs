@@ -4,22 +4,27 @@
 //! **Status (Phase 6):** Full implementation with configuration - symbol resolution,
 //! uprobe attachment, ring buffer draining, normalization, and budget enforcement.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use aya::maps::RingBuf;
-use aya::programs::uprobe::UProbeScope;
-use aya::programs::UProbe;
-use aya::Ebpf;
+use aya::{
+    Ebpf,
+    maps::RingBuf,
+    programs::{UProbe, uprobe::UProbeScope},
+};
 use log::{debug, info, warn};
 use schema::sensor::{Capabilities, EventSink, Sensor, SensorError};
-use sensor_linux_wire::{ReadlineInputEvent, TlsCaptureEvent, TASK_COMM_LEN};
+use sensor_linux_wire::{ReadlineInputEvent, TASK_COMM_LEN, TlsCaptureEvent};
 use tokio::sync::Notify;
 
-use crate::config::UprobesConfig;
-use crate::normalize;
-use crate::symbol_resolver::{self, SymbolInfo};
+use crate::{
+    config::UprobesConfig,
+    normalize,
+    symbol_resolver::{self, SymbolInfo},
+};
 
 fn err(msg: String) -> SensorError {
     msg.into()
@@ -224,7 +229,11 @@ fn attach_uprobe(
     // Attach uprobe: point = offset, target = library path, scope = all processes
     // (can attach same program to multiple offsets)
     program
-        .attach(symbol.offset, &symbol.library_path, UProbeScope::AllProcesses)
+        .attach(
+            symbol.offset,
+            &symbol.library_path,
+            UProbeScope::AllProcesses,
+        )
         .map_err(|e| {
             err(format!(
                 "failed to attach uprobe `{program_name}` to {}:{} @ 0x{:x}: {e}",
@@ -253,9 +262,8 @@ macro_rules! drain_tls {
             if item.len() >= core::mem::size_of::<TlsCaptureEvent>() {
                 // SAFETY: item.len() >= size_of::<TlsCaptureEvent>() checked above;
                 // TlsCaptureEvent is repr(C) POD; read_unaligned handles arbitrary alignment
-                let event = unsafe {
-                    core::ptr::read_unaligned(item.as_ptr() as *const TlsCaptureEvent)
-                };
+                let event =
+                    unsafe { core::ptr::read_unaligned(item.as_ptr() as *const TlsCaptureEvent) };
 
                 // Allowlist check: if allowlist is non-empty, only allow listed processes
                 if !$config.tls.process_allowlist.is_empty() {
@@ -300,8 +308,8 @@ fn comm_str(comm: &[u8; TASK_COMM_LEN]) -> String {
 /// Applies budget enforcement and allowlist filtering.
 macro_rules! drain_readline {
     ($guard:expr, $sink:expr, $offset:expr, $config:expr, $budget:expr, $dropped:expr) => {{
-        let mut guard = $guard
-            .map_err(|e| err(format!("readline ring buffer poll failed: {e}")))?;
+        let mut guard =
+            $guard.map_err(|e| err(format!("readline ring buffer poll failed: {e}")))?;
         let rb = guard.get_inner_mut();
         while let Some(item) = rb.next() {
             if item.len() >= core::mem::size_of::<ReadlineInputEvent>() {
@@ -422,7 +430,12 @@ impl UprobesSensor {
 
             for symbol in &tls_symbols {
                 // Skip libraries in denylist
-                if self.config.tls.library_denylist.contains(&symbol.library_path) {
+                if self
+                    .config
+                    .tls
+                    .library_denylist
+                    .contains(&symbol.library_path)
+                {
                     info!(
                         "sensor-linux-uprobes: skipping denylisted library: {}",
                         symbol.library_path.display()
@@ -438,13 +451,16 @@ impl UprobesSensor {
                         symbol_resolver::LibraryType::GnuTLS => "ssl_write_gnutls",
                         symbol_resolver::LibraryType::Unknown => "ssl_write_openssl", // Default to OpenSSL
                     };
-                    if let Err(e) = attach_uprobe(&mut ebpf, probe_name, symbol, &mut loaded_programs) {
+                    if let Err(e) =
+                        attach_uprobe(&mut ebpf, probe_name, symbol, &mut loaded_programs)
+                    {
                         warn!("sensor-linux-uprobes: failed to attach {probe_name}: {e}");
                     }
                 }
                 // GnuTLS uses gnutls_record_send instead of SSL_write
                 if symbol.name == "gnutls_record_send"
-                    && let Err(e) = attach_uprobe(&mut ebpf, "ssl_write_gnutls", symbol, &mut loaded_programs)
+                    && let Err(e) =
+                        attach_uprobe(&mut ebpf, "ssl_write_gnutls", symbol, &mut loaded_programs)
                 {
                     warn!("sensor-linux-uprobes: failed to attach ssl_write_gnutls: {e}");
                 }
@@ -456,13 +472,20 @@ impl UprobesSensor {
                         symbol_resolver::LibraryType::GnuTLS => "ssl_read_entry_gnutls",
                         symbol_resolver::LibraryType::Unknown => "ssl_read_entry_openssl", // Default
                     };
-                    if let Err(e) = attach_uprobe(&mut ebpf, probe_name, symbol, &mut loaded_programs) {
+                    if let Err(e) =
+                        attach_uprobe(&mut ebpf, probe_name, symbol, &mut loaded_programs)
+                    {
                         warn!("sensor-linux-uprobes: failed to attach {probe_name}: {e}");
                     }
                 }
                 // GnuTLS uses gnutls_record_recv instead of SSL_read
                 if symbol.name == "gnutls_record_recv"
-                    && let Err(e) = attach_uprobe(&mut ebpf, "ssl_read_entry_gnutls", symbol, &mut loaded_programs)
+                    && let Err(e) = attach_uprobe(
+                        &mut ebpf,
+                        "ssl_read_entry_gnutls",
+                        symbol,
+                        &mut loaded_programs,
+                    )
                 {
                     warn!("sensor-linux-uprobes: failed to attach ssl_read_entry_gnutls: {e}");
                 }
@@ -474,13 +497,20 @@ impl UprobesSensor {
                         symbol_resolver::LibraryType::GnuTLS => "ssl_read_exit_gnutls",
                         symbol_resolver::LibraryType::Unknown => "ssl_read_exit_openssl", // Default
                     };
-                    if let Err(e) = attach_uprobe(&mut ebpf, probe_name, symbol, &mut loaded_programs) {
+                    if let Err(e) =
+                        attach_uprobe(&mut ebpf, probe_name, symbol, &mut loaded_programs)
+                    {
                         warn!("sensor-linux-uprobes: failed to attach {probe_name}: {e}");
                     }
                 }
                 // GnuTLS uretprobe for gnutls_record_recv
                 if symbol.name == "gnutls_record_recv"
-                    && let Err(e) = attach_uprobe(&mut ebpf, "ssl_read_exit_gnutls", symbol, &mut loaded_programs)
+                    && let Err(e) = attach_uprobe(
+                        &mut ebpf,
+                        "ssl_read_exit_gnutls",
+                        symbol,
+                        &mut loaded_programs,
+                    )
                 {
                     warn!("sensor-linux-uprobes: failed to attach ssl_read_exit_gnutls: {e}");
                 }
@@ -497,7 +527,8 @@ impl UprobesSensor {
 
             for symbol in &readline_symbols {
                 if symbol.name == "readline"
-                    && let Err(e) = attach_uprobe(&mut ebpf, "readline_exit", symbol, &mut loaded_programs)
+                    && let Err(e) =
+                        attach_uprobe(&mut ebpf, "readline_exit", symbol, &mut loaded_programs)
                 {
                     warn!("sensor-linux-uprobes: failed to attach readline_exit: {e}");
                 }
@@ -588,9 +619,9 @@ impl Sensor for UprobesSensor {
             exec_events: false,
             file_events: false,
             connect_events: false,
-            auth_events: false,      // No authentication events
-            user_attribution: true,  // EventMeta includes uid/gid
-            parent_lineage: true,    // EventMeta includes ppid/parent_comm
+            auth_events: false,     // No authentication events
+            user_attribution: true, // EventMeta includes uid/gid
+            parent_lineage: true,   // EventMeta includes ppid/parent_comm
         }
     }
 

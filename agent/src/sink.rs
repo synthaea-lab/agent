@@ -4,9 +4,13 @@
 //! scorer plug in here as their crates are migrated (M2), each addition a new field
 //! and a few lines in `on_event`.
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use policy::ResponsePolicy;
 use schema::{Event, sensor::EventSink};
@@ -155,7 +159,9 @@ impl DetectionSink {
                 format!("killed pid {pid} on a high-confidence correlated verdict")
             }
             response::KillOutcome::ObserveOnly { pid } => {
-                format!("pid {pid} would have been killed on a high-confidence correlated verdict (observe-only)")
+                format!(
+                    "pid {pid} would have been killed on a high-confidence correlated verdict (observe-only)"
+                )
             }
             response::KillOutcome::Failed { pid, error } => {
                 format!("failed to kill pid {pid} on a high-confidence correlated verdict: {error}")
@@ -342,7 +348,10 @@ fn quarantine_matched_payload(
             path.display()
         ),
         response::QuarantineOutcome::Failed { path, error } => {
-            format!("failed to quarantine {} on a confirmed YARA match: {error}", path.display())
+            format!(
+                "failed to quarantine {} on a confirmed YARA match: {error}",
+                path.display()
+            )
         }
     };
     eprintln!("\x1b[1;31m[ALERT] RESPONSE-QUARANTINE — {message}\x1b[0m");

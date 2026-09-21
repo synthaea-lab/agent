@@ -7,9 +7,11 @@ use std::sync::{Arc, Mutex};
 use schema::sensor::{EventSink as _, Sensor as _};
 use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
 
-use crate::protected::ProtectedResourceGuard;
-use crate::silence::{PulsingSink, SilenceHealthSource};
-use crate::sink::DetectionSink;
+use crate::{
+    protected::ProtectedResourceGuard,
+    silence::{PulsingSink, SilenceHealthSource},
+    sink::DetectionSink,
+};
 
 /// Silence deadlines (#71) fed to `SilenceMonitor::register`. The eBPF sensor and
 /// the journal tail have no self-generated canary (see `silence::PulsingSink`'s
@@ -148,7 +150,10 @@ fn select_sensor() -> (Box<dyn schema::sensor::Sensor>, &'static str) {
     }
 
     log::warn!("eBPF unavailable — using audit fallback (reduced fidelity)");
-    (Box::new(sensor_linux_audit::AuditSensor::new()), "linux-audit")
+    (
+        Box::new(sensor_linux_audit::AuditSensor::new()),
+        "linux-audit",
+    )
 }
 
 /// Checks if eBPF sensor can be loaded (privileges, BTF, verifier).
@@ -413,9 +418,8 @@ fn spawn_journal_tail(sink: Arc<DetectionSink>, heartbeat: SensorHeartbeat) {
                 log::warn!("journal tail: journalctl spawned without a piped stdout");
                 return;
             };
-            let journal = sensor_linux_journal::ClassifiedJournal::new(std::io::BufReader::new(
-                stdout,
-            ));
+            let journal =
+                sensor_linux_journal::ClassifiedJournal::new(std::io::BufReader::new(stdout));
             for item in journal {
                 // Pulsed on every line the stream yields, matched or not (#71):
                 // proof journalctl is still delivering, same idle-host caveat as
