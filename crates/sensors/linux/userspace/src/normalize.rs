@@ -9,7 +9,12 @@ use schema::{ConnectEvent, ContainerContext, Event, EventMeta, ExecEvent, FileOp
 use sensor_linux_wire as wire;
 
 /// Tripwire: bumping the wire ABI must come here to revisit the mappings below.
-const _: () = assert!(wire::WIRE_VERSION == 4);
+///
+/// v5 (#90) only added `TlsCaptureEvent`/`ReadlineInputEvent` — neither is imported
+/// here, and none of the structs this module maps (`EventMeta`, `ExecEvent`,
+/// `ConnectEvent`, `FileOpenEvent`, `ContainerContext`) changed shape, so the
+/// mappings below still hold; bumped straight to 5 after that audit.
+const _: () = assert!(wire::WIRE_VERSION == 5);
 
 /// Decodes a fixed comm buffer: NUL-terminated, kernel-truncated to 15 bytes — a
 /// sensor property (reported by conformance), not a schema limit.
