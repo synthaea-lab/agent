@@ -205,6 +205,8 @@ pub(crate) fn cmd_run(
     events: &std::path::Path,
     enable_kill: bool,
     enable_quarantine: bool,
+    enable_tls_capture: bool,
+    enable_readline_capture: bool,
 ) -> anyhow::Result<()> {
     // Kill-loudness (#71): must run before any other thread exists — the signal mask
     // set here is inherited by every thread spawned below, including `DetectionSink`'s
@@ -246,6 +248,10 @@ pub(crate) fn cmd_run(
     let primary_heartbeat = SensorHeartbeat::new(sensor_name);
     let netlink_heartbeat = SensorHeartbeat::new("linux-netlink");
     let journal_heartbeat = SensorHeartbeat::new("linux-journal");
+    // Only registered/pulsed if actually enabled below — an uprobes sensor that
+    // never runs (the off-by-default case) must never accrue silence, or a
+    // deliberately-disabled capture would eventually alert as a stalled sensor.
+    let uprobes_heartbeat = SensorHeartbeat::new("linux-uprobes");
     let silence_monitor = Arc::new(Mutex::new(SilenceMonitor::new()));
     {
         let now_ns = schema::time::now_ns();
@@ -265,6 +271,13 @@ pub(crate) fn cmd_run(
             NO_CANARY_SILENCE_DEADLINE_NS,
             now_ns,
         );
+        if enable_tls_capture || enable_readline_capture {
+            mon.register(
+                uprobes_heartbeat.clone(),
+                NO_CANARY_SILENCE_DEADLINE_NS,
+                now_ns,
+            );
+        }
     }
     crate::silence::spawn_monitor(silence_monitor.clone(), sink.clone());
 
@@ -301,6 +314,14 @@ pub(crate) fn cmd_run(
 
     spawn_netlink_poller(sink.clone(), netlink_heartbeat);
     spawn_journal_tail(sink.clone(), journal_heartbeat);
+    if enable_tls_capture || enable_readline_capture {
+        spawn_uprobes_sensor(
+            sink.clone(),
+            uprobes_heartbeat,
+            enable_tls_capture,
+            enable_readline_capture,
+        );
+    }
 
     // Protected-resource monitoring (#71): only the eBPF sensor produces `FileOpen`
     // events, so only its chain needs the guard — the netlink/journal sinks above
@@ -445,6 +466,43 @@ fn spawn_journal_tail(sink: Arc<DetectionSink>, heartbeat: SensorHeartbeat) {
             }
         })
         .expect("spawning the journal tail thread");
+}
+
+/// Spawns the background thread running the uprobes sensor (issue #90: TLS
+/// plaintext taps via `SSL_read`/`SSL_write` uprobes, shell readline capture) when at
+/// least one capture is enabled by CLI flag. Only called when the caller has
+/// already checked `enable_tls_capture || enable_readline_capture` — `cmd_run`
+/// doesn't spawn this thread at all otherwise, so a deliberately-disabled capture
+/// costs nothing at runtime, not even a parked thread.
+///
+/// Unlike [`spawn_netlink_poller`]/[`spawn_journal_tail`] above, `UprobesSensor`
+/// implements `Sensor` — the same trait the primary eBPF/audit sensor does — so
+/// its own blocking `run` owns this thread and `PulsingSink` (the primary sensor's
+/// own wrapper) pulses `heartbeat` on every event, rather than a manual per-item
+/// pulse. No `ProtectedResourceGuard` here: unlike the primary eBPF sensor, this
+/// one never produces `FileOpen` events.
+fn spawn_uprobes_sensor(
+    sink: Arc<DetectionSink>,
+    heartbeat: SensorHeartbeat,
+    enable_tls_capture: bool,
+    enable_readline_capture: bool,
+) {
+    std::thread::Builder::new()
+        .name("uprobes".into())
+        .spawn(move || {
+            let mut config = sensor_linux_uprobes::UprobesConfig::new();
+            if enable_tls_capture {
+                config = config.with_tls_enabled();
+            }
+            if enable_readline_capture {
+                config = config.with_readline_enabled();
+            }
+            let mut sensor = sensor_linux_uprobes::UprobesSensor::with_config(config);
+            if let Err(e) = sensor.run(Box::new(PulsingSink::new(sink, heartbeat))) {
+                tracing::warn!(error = %e, "uprobes sensor failed");
+            }
+        })
+        .expect("spawning the uprobes sensor thread");
 }
 
 /// Linux: rules-filtered benign capture via `BaselineSink` (Ctrl-C handled by the
