@@ -21,7 +21,9 @@ use crate::redact;
 /// v6 (#262) added `FileWriteEvent`/`FileDeleteEvent`/`FileRenameEvent` — neither
 /// imported here, and neither `TlsCaptureEvent` nor `ReadlineInputEvent` (the only
 /// wire structs this module maps) changed shape, so the mappings below still hold.
-const _: () = assert!(wire::WIRE_VERSION == 6);
+///
+/// v7 (#263) added `SocketBindEvent` — not imported here either, same reasoning.
+const _: () = assert!(wire::WIRE_VERSION == 7);
 
 /// Decodes a fixed comm buffer: NUL-terminated, kernel-truncated to 15 bytes — a
 /// sensor property (reported by conformance), not a schema limit.

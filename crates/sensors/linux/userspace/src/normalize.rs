@@ -7,7 +7,7 @@
 
 use schema::{
     ConnectEvent, ContainerContext, Event, EventMeta, ExecEvent, FileDeleteEvent, FileOpenEvent,
-    FileRenameEvent, FileWriteEvent, User,
+    FileRenameEvent, FileWriteEvent, SocketBindEvent, User,
 };
 use sensor_linux_wire as wire;
 
@@ -21,7 +21,10 @@ use sensor_linux_wire as wire;
 /// v6 (#262) added `FileWriteEvent`, `FileDeleteEvent`, `FileRenameEvent` — new
 /// mapping functions `file_write`/`file_delete`/`file_rename` added below, same
 /// `meta()` helper reused; no existing mapping changed shape.
-const _: () = assert!(wire::WIRE_VERSION == 6);
+///
+/// v7 (#263) added `SocketBindEvent` — new `socket_bind` mapping function below,
+/// same address-family logic as `connect`; no existing mapping changed shape.
+const _: () = assert!(wire::WIRE_VERSION == 7);
 
 /// Decodes a fixed comm buffer: NUL-terminated, kernel-truncated to 15 bytes — a
 /// sensor property (reported by conformance), not a schema limit.
@@ -169,6 +172,24 @@ pub fn connect(
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
         daddr,
         dport: event.dport,
+    })
+}
+
+#[must_use]
+pub fn socket_bind(
+    event: &wire::SocketBindEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    let laddr = if event.is_ipv6 {
+        std::net::IpAddr::V6(event.laddr_v6.into())
+    } else {
+        std::net::IpAddr::V4(event.laddr_v4.into())
+    };
+    Event::SocketBind(SocketBindEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        local_addr: laddr,
+        local_port: event.lport,
     })
 }
 
@@ -425,5 +446,35 @@ mod tests {
         };
         assert_eq!(e.old_path, "/home/user/invoice.pdf");
         assert_eq!(e.new_path, "/home/user/invoice.pdf.locked");
+    }
+
+    #[test]
+    fn socket_bind_maps_both_families() {
+        let v4 = wire::SocketBindEvent {
+            meta: wire_meta(b"nc"),
+            laddr_v4: [0, 0, 0, 0],
+            laddr_v6: [0; 16],
+            lport: 4444,
+            is_ipv6: false,
+        };
+        let Event::SocketBind(e) = socket_bind(&v4, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.local_addr.to_string(), "0.0.0.0");
+        assert_eq!(e.local_port, 4444);
+
+        let mut l6 = [0u8; 16];
+        l6[15] = 0x01;
+        let v6 = wire::SocketBindEvent {
+            meta: wire_meta(b"nc"),
+            laddr_v4: [0; 4],
+            laddr_v6: l6,
+            lport: 8443,
+            is_ipv6: true,
+        };
+        let Event::SocketBind(e) = socket_bind(&v6, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.local_addr.to_string(), "::1");
     }
 }

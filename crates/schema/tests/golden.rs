@@ -12,8 +12,8 @@ use schema::{
     AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, ConnectEvent, DnsQueryEvent, Event,
     EventMeta, ExecEvent, FileDeleteEvent, FileOpenEvent, FileRenameEvent, FileWriteEvent,
     ImageLoadEvent, ListenPortEvent, NetworkFlowEvent, ReadlineInputEvent, RegistrySetEvent,
-    ScriptBlockEvent, ShellType, SmbConnectEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
-    UdpSendEvent, User, WmiActivityEvent,
+    ScriptBlockEvent, ShellType, SmbConnectEvent, SocketBindEvent, TlsCaptureEvent, TlsDirection,
+    TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -689,6 +689,27 @@ fn file_rename_golden() {
 }
 
 #[test]
+fn socket_bind_golden() {
+    // v16 (#263): discrete real-time bind(2) trace — distinct from ListenPort's
+    // periodic-poll semantics, see SocketBindEvent's doc.
+    assert_golden(
+        &Event::SocketBind(SocketBindEvent {
+            meta: EventMeta {
+                pid: 8001,
+                ppid: 8000,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_013_000_000_000,
+                comm: "nc".into(),
+                container: None,
+            },
+            local_addr: "0.0.0.0".parse().unwrap(),
+            local_port: 4444,
+        }),
+        "socket_bind",
+    );
+}
+
+#[test]
 fn unbounded_cmdline_survives() {
     // Audit F-4: multi-kilobyte encoded command lines must round-trip untouched.
     let long = format!("powershell.exe -EncodedCommand {}", "A".repeat(8 * 1024));
@@ -893,6 +914,11 @@ fn meta_accessor_covers_all_variants() {
             meta: meta.clone(),
             old_path: String::new(),
             new_path: String::new(),
+        }),
+        Event::SocketBind(SocketBindEvent {
+            meta: meta.clone(),
+            local_addr: "0.0.0.0".parse::<IpAddr>().unwrap(),
+            local_port: 0,
         }),
     ];
     for e in &events {

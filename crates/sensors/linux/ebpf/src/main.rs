@@ -14,7 +14,8 @@ use aya_ebpf::{
 use aya_log_ebpf::{info, warn};
 use sensor_linux_wire::{
     ConnectEvent, ExecEvent, FileDeleteEvent, FileOpenEvent, FileRenameEvent, FileWriteEvent,
-    LineageEntry, MAX_TLS_CAPTURE, ReadlineInputEvent, TASK_COMM_LEN, TlsCaptureEvent,
+    LineageEntry, MAX_TLS_CAPTURE, ReadlineInputEvent, SocketBindEvent, TASK_COMM_LEN,
+    TlsCaptureEvent,
 };
 
 // This probe reads NO `task_struct`/`mm_struct` frozen offset: parent lineage (ppid +
@@ -875,6 +876,105 @@ fn try_sys_enter_connect(ctx: TracePointContext) -> Result<u32, u32> {
     };
 
     info!(&ctx, "sensor-linux-ebpf: connect pid={}", pid);
+    Ok(0)
+}
+
+/// Ring buffer shared with userspace for `bind` events.
+#[map]
+static SOCKET_BIND_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Per-CPU scratch for building one `SocketBindEvent` (see `EXEC_SCRATCH`).
+#[map]
+static BIND_SCRATCH: PerCpuArray<SocketBindEvent> = PerCpuArray::with_max_entries(1, 0);
+
+/// Offsets of the `syscalls:sys_enter_bind` tracepoint (x86_64/aarch64): `fd`(16),
+/// `umyaddr`(24), `addrlen`(32) — identical shape to `sys_enter_connect` above.
+/// Verified on 2026-09-21 on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// `/sys/kernel/tracing/events/syscalls/sys_enter_bind/format`.
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const BIND_UMYADDR_PTR_OFFSET: usize = 24;
+/// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
+#[cfg(bpf_target_arch = "x86")]
+const BIND_UMYADDR_PTR_OFFSET: usize = 16;
+
+#[tracepoint]
+pub fn sys_enter_bind(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_bind(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+/// Mirrors `try_sys_enter_connect` above field for field — same family filter, same
+/// raw-byte address read (avoids the endianness bug documented on `ConnectEvent`),
+/// same per-CPU-scratch assembly. Only the wire type, ring buffer, and field names
+/// (`laddr`/`lport` vs `daddr`/`dport`) differ.
+fn try_sys_enter_bind(ctx: TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let umyaddr_ptr: u64 = unsafe { ctx.read_at(BIND_UMYADDR_PTR_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let umyaddr_ptr: u64 = unsafe {
+        ctx.read_at::<u32>(BIND_UMYADDR_PTR_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
+    if umyaddr_ptr == 0 {
+        return Ok(0);
+    }
+
+    let family: u16 = match unsafe { bpf_probe_read_user(umyaddr_ptr as *const u16) } {
+        Ok(f) => f,
+        Err(_) => return Ok(0),
+    };
+    if family != AF_INET && family != AF_INET6 {
+        return Ok(0);
+    }
+
+    let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
+    let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
+
+    let port_be: u16 =
+        unsafe { bpf_probe_read_user((umyaddr_ptr + 2) as *const u16).map_err(|_| 1u32)? };
+    let (v4, v6): ([u8; 4], [u8; 16]) = if family == AF_INET {
+        (
+            unsafe {
+                bpf_probe_read_user((umyaddr_ptr + 4) as *const [u8; 4]).map_err(|_| 1u32)?
+            },
+            [0u8; 16],
+        )
+    } else {
+        ([0u8; 4], unsafe {
+            bpf_probe_read_user((umyaddr_ptr + 8) as *const [u8; 16]).map_err(|_| 1u32)?
+        })
+    };
+
+    let e = BIND_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
+    unsafe {
+        core::ptr::write_bytes(e, 0, 1);
+
+        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*e).meta.ppid = lineage_ppid();
+        (*e).meta.uid = uid_gid as u32;
+        (*e).meta.gid = (uid_gid >> 32) as u32;
+        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
+        let mut i = 0usize;
+        while i < TASK_COMM_LEN {
+            (*e).meta.comm[i] = comm[i];
+            i += 1;
+        }
+        (*e).is_ipv6 = family == AF_INET6;
+        (*e).lport = u16::from_be(port_be);
+        (*e).laddr_v4 = v4;
+        (*e).laddr_v6 = v6;
+
+        if SOCKET_BIND_EVENTS.output::<SocketBindEvent>(&*e, 0).is_err() {
+            warn!(
+                &ctx,
+                "sensor-linux-ebpf: ring buffer full, dropping bind event"
+            );
+        }
+    }
+
     Ok(0)
 }
 

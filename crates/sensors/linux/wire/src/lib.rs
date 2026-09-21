@@ -39,7 +39,12 @@
 ///   lookup); it is a volume/frequency signal (burst-write detection), not a
 ///   per-write path trail. `FileDeleteEvent`/`FileRenameEvent` read real path
 ///   arguments straight off the syscall, same as `FileOpenEvent`.
-pub const WIRE_VERSION: u32 = 6;
+/// - v7: `SocketBindEvent` added (issue #263) — `bind(2)` only. Same
+///   family-filtered (`AF_INET`/`AF_INET6`) sockaddr read as `ConnectEvent`;
+///   `listen(2)` (no address, just `fd`+`backlog`) and `accept(2)`/`accept4(2)`
+///   (needs a `sys_exit` probe to read the kernel-filled peer address — a new
+///   probe shape this crate doesn't have yet) are deliberately deferred.
+pub const WIRE_VERSION: u32 = 7;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
@@ -164,6 +169,23 @@ pub struct ConnectEvent {
     pub daddr_v4: [u8; 4],
     pub daddr_v6: [u8; 16],
     pub dport: u16,
+    pub is_ipv6: bool,
+}
+
+/// Socket bind (`syscalls:sys_enter_bind`, `AF_INET/AF_INET6` only, issue #263) — a
+/// discrete, real-time trace of a process claiming a local address, same
+/// family-filtered sockaddr shape as [`ConnectEvent`]. Distinct from
+/// `schema::ListenPortEvent`, which is a periodic poll snapshot (`sensor-linux-netlink`)
+/// — this fires once, at the moment of the `bind(2)` call itself, and does not imply
+/// `listen(2)` followed (a UDP socket, or a TCP socket bound but never listened,
+/// binds too).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SocketBindEvent {
+    pub meta: EventMeta,
+    pub laddr_v4: [u8; 4],
+    pub laddr_v6: [u8; 16],
+    pub lport: u16,
     pub is_ipv6: bool,
 }
 

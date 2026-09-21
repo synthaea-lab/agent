@@ -78,7 +78,10 @@ pub mod time;
 /// Bumped 14 → 15 for [`Event::FileWrite`], [`Event::FileDelete`], and
 /// [`Event::FileRename`] (#262): three new enum variants for Linux
 /// write/delete/rename telemetry. Same serialization-visible reasoning as v13/v14.
-pub const SCHEMA_VERSION: u32 = 15;
+///
+/// Bumped 15 → 16 for [`Event::SocketBind`] (#263): one new enum variant for
+/// discrete, real-time `bind(2)` telemetry on Linux. Same reasoning as v13-v15.
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -313,6 +316,22 @@ pub struct FileRenameEvent {
     pub meta: EventMeta,
     pub old_path: String,
     pub new_path: String,
+}
+
+/// Socket bind (issue #263): `bind(2)`, `AF_INET`/`AF_INET6` only — a discrete,
+/// real-time trace of a process claiming a local address (backdoor/reverse-shell
+/// listener detection: `/bin/bash` binding a port is a strong signal on its own).
+///
+/// Distinct from [`ListenPortEvent`], which is a periodic poll snapshot from
+/// `sensor-linux-netlink`: this fires once, at the `bind(2)` call itself, and does
+/// NOT imply `listen(2)` followed — a UDP socket, or a TCP socket bound but never
+/// listened, binds too. `listen(2)`/`accept(2)` are deliberately not captured yet
+/// (see `sensor-linux-wire::SocketBindEvent`'s doc for why).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocketBindEvent {
+    pub meta: EventMeta,
+    pub local_addr: core::net::IpAddr,
+    pub local_port: u16,
 }
 
 /// DNS resolution — the query name and answer, joined to the resolving process.
@@ -762,6 +781,7 @@ pub enum Event {
     FileWrite(FileWriteEvent),
     FileDelete(FileDeleteEvent),
     FileRename(FileRenameEvent),
+    SocketBind(SocketBindEvent),
 }
 
 impl Event {
@@ -792,6 +812,7 @@ impl Event {
             Event::FileWrite(e) => &e.meta,
             Event::FileDelete(e) => &e.meta,
             Event::FileRename(e) => &e.meta,
+            Event::SocketBind(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.

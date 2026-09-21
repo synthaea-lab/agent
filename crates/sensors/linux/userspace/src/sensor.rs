@@ -50,6 +50,7 @@ pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
     ("sys_enter_rename", "syscalls", "sys_enter_rename"),
     ("sys_enter_renameat", "syscalls", "sys_enter_renameat"),
     ("sys_enter_renameat2", "syscalls", "sys_enter_renameat2"),
+    ("sys_enter_bind", "syscalls", "sys_enter_bind"),
 ];
 
 /// `sensor_linux_wire::LineageEntry` is `repr(C)` over a `u32` and a `[u8; 16]` — every
@@ -626,8 +627,11 @@ impl LinuxSensor {
         let mut file_write_ring_buf = ring("FILE_WRITE_EVENTS")?;
         let mut file_delete_ring_buf = ring("FILE_DELETE_EVENTS")?;
         let mut file_rename_ring_buf = ring("FILE_RENAME_EVENTS")?;
+        let mut socket_bind_ring_buf = ring("SOCKET_BIND_EVENTS")?;
 
-        tracing::info!("sensor-linux: listening for exec/open/connect/write/delete/rename events");
+        tracing::info!(
+            "sensor-linux: listening for exec/open/connect/write/delete/rename/bind events"
+        );
 
         let mut container_ids = CgroupIdCache::new();
         let docker_cache: DockerInfoCache = Arc::new(Mutex::new(HashMap::new()));
@@ -674,6 +678,12 @@ impl LinuxSensor {
                     drain!(guard, sensor_linux_wire::FileRenameEvent, sink,
                         |e: &sensor_linux_wire::FileRenameEvent| {
                             normalize::file_rename(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = socket_bind_ring_buf.readable_mut() => {
+                    drain!(guard, sensor_linux_wire::SocketBindEvent, sink,
+                        |e: &sensor_linux_wire::SocketBindEvent| {
+                            normalize::socket_bind(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
             }

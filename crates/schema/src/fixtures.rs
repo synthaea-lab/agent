@@ -31,8 +31,8 @@ use crate::{
     AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, ConnectEvent, DnsQueryEvent, EventMeta,
     ExecEvent, FileDeleteEvent, FileOpenEvent, FileRenameEvent, FileWriteEvent, ImageLoadEvent,
     ListenPortEvent, NetworkFlowEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
-    ShellType, SmbConnectEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User,
-    WmiActivityEvent,
+    ShellType, SmbConnectEvent, SocketBindEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
+    UdpSendEvent, User, WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -260,5 +260,15 @@ pub fn file_rename() -> FileRenameEvent {
         meta: meta(),
         old_path: String::new(),
         new_path: String::new(),
+    }
+}
+
+/// Neutral [`SocketBindEvent`] on [`TEST_ADDR`].
+#[must_use]
+pub fn socket_bind() -> SocketBindEvent {
+    SocketBindEvent {
+        meta: meta(),
+        local_addr: TEST_ADDR,
+        local_port: 0,
     }
 }
