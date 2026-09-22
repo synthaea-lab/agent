@@ -1,6 +1,6 @@
 //! Persists the journal tail's last-seen cursor across agent restarts (issue #321).
 //!
-//! Without this, [`crate::commands::linux::spawn_journal_tail`] always started its
+//! Without this, `commands::linux::spawn_journal_tail` (Linux-gated) always started its
 //! `journalctl -f` from "now" (`sensor_linux_journal::process::current_cursor`) —
 //! the crate's own doc named this an accepted gap, not a decision: a
 //! watchdog-triggered restart drops whatever auth/persistence events landed in the

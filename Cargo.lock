@@ -41,6 +41,7 @@ dependencies = [
  "sensor-linux-uprobes",
  "sensor-macos",
  "sensor-macos-network-extension",
+ "sensor-macos-sockets",
  "sensor-macos-unifiedlog",
  "sensor-windows",
  "sensor-windows-eventlog",
@@ -2390,6 +2391,16 @@ dependencies = [
  "schema",
  "serde",
  "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "sensor-macos-sockets"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "schema",
  "thiserror 2.0.20",
  "tracing",
 ]

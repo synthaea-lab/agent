@@ -44,7 +44,58 @@ fn seeded_rule_state() -> rules::RuleState {
     }
     let mut rule_state = rules::RuleState::new();
     rule_state.seed_pid_comm(map);
+    // LISTENER-DRIFT baseline (#358), same reasoning as the Linux netlink
+    // seeding: every listener already up when the agent attaches (launchd
+    // services, AirPlay, sshd) is the baseline, not a finding. Best-effort —
+    // a snapshot failure leaves the baseline empty rather than failing
+    // startup.
+    match sensor_macos_sockets::snapshot() {
+        Ok(entries) => rule_state.seed_listen_ports(
+            entries
+                .iter()
+                .filter(|e| e.state == sensor_macos_sockets::SocketState::Listen)
+                .map(|e| (e.local.ip(), e.local.port())),
+        ),
+        Err(e) => tracing::warn!(error = %e, "socket snapshot for listener baseline failed"),
+    }
     rule_state
+}
+
+/// Poll cadence for the socket-table snapshots — same 10s as the Linux
+/// netlink poller; the tightness of the LISTENER-DRIFT window, not a
+/// correctness knob.
+const SOCKET_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Spawns the background thread that snapshots the socket table every
+/// [`SOCKET_POLL_INTERVAL`] and pushes listening sockets into the sink
+/// (`sensor-macos-sockets`, issue #358 — the entitlement-free source).
+/// Supplementary and non-fatal, same posture as the unified-log tail.
+fn spawn_socket_poller(sink: Arc<dyn EventSink>, stop: Arc<std::sync::atomic::AtomicBool>) {
+    std::thread::Builder::new()
+        .name("socket-poller".into())
+        .spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let now_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+                match sensor_macos_sockets::listen_port_events(now_ns) {
+                    Ok(events) => {
+                        for event in events {
+                            sink.on_event(event);
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "socket-table poll failed"),
+                }
+                // Sleep in short slices so Ctrl-C never waits a full interval.
+                let deadline = std::time::Instant::now() + SOCKET_POLL_INTERVAL;
+                while std::time::Instant::now() < deadline
+                    && !stop.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
+        })
+        .expect("spawning the socket poller thread");
 }
 
 /// Spawns the background thread that tails the unified log (sudo → `Auth`,
@@ -149,12 +200,15 @@ fn run_macos_sensors(sink: Box<dyn EventSink>) -> anyhow::Result<()> {
     let stop = sensor.stop_handle();
 
     spawn_network_extension_receiver(Arc::clone(&sink));
+    let poll_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    spawn_socket_poller(Arc::clone(&sink), Arc::clone(&poll_stop));
     let log_child = spawn_unifiedlog_tail(Arc::clone(&sink));
     let log_child = std::sync::Mutex::new(log_child);
 
     ctrlc::set_handler(move || {
         eprintln!("\n[!] Shutdown requested...");
         stop.stop();
+        poll_stop.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut guard) = log_child.lock()
             && let Some(child) = guard.as_mut()
         {
@@ -174,6 +228,7 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
     println!("Sensors: EndpointSecurity (exec + file + BTM launch-item persistence)");
     println!("         unified-log tail (sudo auth, TCC decisions, Gatekeeper verdicts)");
     println!("         NetworkExtension receiver (flows + DNS, when the extension is installed)");
+    println!("         socket-table snapshots (listening ports, 10s poll — no entitlement needed)");
     println!(
         "Requires: root, the com.apple.developer.endpoint-security.client entitlement, \
          and Full Disk Access (see docs/sensors/macos.md)."
