@@ -115,11 +115,12 @@ impl SecretRef {
                 Ok(value)
             }
             SecretRef::File(path) => {
-                let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::SecretResolve {
-                    field: field.to_string(),
-                    reference: format!("file:{}", path.display()),
-                    reason: format!("could not read secret file: {e}"),
-                })?;
+                let raw =
+                    std::fs::read_to_string(path).map_err(|e| ConfigError::SecretResolve {
+                        field: field.to_string(),
+                        reference: format!("file:{}", path.display()),
+                        reason: format!("could not read secret file: {e}"),
+                    })?;
                 let trimmed = raw.trim_end().to_string();
                 if trimmed.is_empty() {
                     return Err(ConfigError::SecretResolve {

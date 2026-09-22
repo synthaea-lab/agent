@@ -335,7 +335,10 @@ mod tests {
             } => {
                 assert_eq!(comm.as_deref(), Some("httpd"));
                 assert_eq!(scontext.as_deref(), Some("system_u:system_r:httpd_t:s0"));
-                assert_eq!(tcontext.as_deref(), Some("system_u:object_r:user_home_t:s0"));
+                assert_eq!(
+                    tcontext.as_deref(),
+                    Some("system_u:object_r:user_home_t:s0")
+                );
                 assert_eq!(tclass.as_deref(), Some("file"));
                 assert!(!permissive);
             }
@@ -346,7 +349,10 @@ mod tests {
     #[test]
     fn classify_avc_permissive_mode() {
         let mut fields = std::collections::HashMap::new();
-        fields.insert("scontext".to_string(), "unconfined_u:unconfined_r:unconfined_t:s0".to_string());
+        fields.insert(
+            "scontext".to_string(),
+            "unconfined_u:unconfined_r:unconfined_t:s0".to_string(),
+        );
         fields.insert("tclass".to_string(), "process".to_string());
         fields.insert("permissive".to_string(), "1".to_string());
 

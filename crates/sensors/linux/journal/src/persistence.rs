@@ -61,7 +61,11 @@ impl UnitPersistenceTracker {
                 // section on `UNIT` vs `USER_UNIT`). Not fabricated: this is
                 // what the reporting process always is for this record shape,
                 // not a guess at unknown data.
-                pid: record.pid.as_deref().and_then(|p| p.parse().ok()).unwrap_or(1),
+                pid: record
+                    .pid
+                    .as_deref()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(1),
                 ppid: 0,
                 user: User::Unknown,
                 timestamp_ns: record.realtime_us.saturating_mul(1_000),
