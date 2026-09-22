@@ -23,10 +23,14 @@ This separation ensures that package managers (apt/dnf) and the updater never co
 │   ├── agent
 │   ├── watchdog
 │   └── cli
-├── current -> bootstrap   # Symlink (updater-managed, initially points to bootstrap)
-└── versions/           # Updater-managed version directory
-    ├── v0.1.0/
-    └── v0.2.0/
+├── current -> bootstrap    # Symlink (updater-managed, initially points to bootstrap)
+├── versions/           # Updater-managed version directories, named by the signed
+│   ├── v1/             # manifest's monotone release_version (ADR-0015), not semver
+│   └── v2/
+└── banned_versions.json  # Release versions that failed a health check on this
+                           # install and are refused even if offered again (ADR-0015
+                           # Decision 6). Bare JSON array, unsigned — created on the
+                           # first rollback, absent otherwise.
 
 /var/log/synthaea/      # Log directory (owned by synthaea user)
 ├── agent.log           # Agent stdout/stderr

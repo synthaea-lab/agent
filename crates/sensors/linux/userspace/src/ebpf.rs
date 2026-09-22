@@ -30,6 +30,11 @@ pub(crate) fn err(msg: String) -> SensorError {
 /// reason as open above. `sys_enter_chmod`/`sys_enter_fchmodat` and
 /// `sys_enter_chown`/`sys_enter_lchown`/`sys_enter_fchownat` (issue #262 Phase 2)
 /// follow the same pattern — the fd-only variants (`fchmod`/`fchown`) are deferred.
+///
+/// `sys_enter_accept{,4}`/`sys_exit_accept{,4}` (issue #263 Phase 2) are this
+/// sensor's first `sys_exit_*` attachments — `accept`/`accept4`'s peer address is
+/// only populated once the kernel-side call returns, so the enter and exit halves
+/// are attached as a pair (`ebpf/src/main.rs`'s `ACCEPT_ARGS` map correlates them).
 pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
     ("sched_process_fork", "sched", "sched_process_fork"),
     ("sched_process_exit", "sched", "sched_process_exit"),
@@ -51,6 +56,10 @@ pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
     ("sys_enter_fchownat", "syscalls", "sys_enter_fchownat"),
     ("sys_enter_sendto", "syscalls", "sys_enter_sendto"),
     ("sys_enter_listen", "syscalls", "sys_enter_listen"),
+    ("sys_enter_accept", "syscalls", "sys_enter_accept"),
+    ("sys_enter_accept4", "syscalls", "sys_enter_accept4"),
+    ("sys_exit_accept", "syscalls", "sys_exit_accept"),
+    ("sys_exit_accept4", "syscalls", "sys_exit_accept4"),
 ];
 
 /// `sensor_linux_wire::LineageEntry` is `repr(C)` over a `u32` and a `[u8; 16]` — every

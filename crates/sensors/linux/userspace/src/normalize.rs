@@ -7,8 +7,8 @@
 
 use schema::{
     ConnectEvent, ContainerContext, Event, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent,
-    FileDeleteEvent, FileOpenEvent, FileRenameEvent, FileWriteEvent, SocketBindEvent,
-    SocketListenEvent, UdpSendEvent, User,
+    FileDeleteEvent, FileOpenEvent, FileRenameEvent, FileWriteEvent, SocketAcceptEvent,
+    SocketBindEvent, SocketListenEvent, UdpSendEvent, User,
 };
 use sensor_linux_wire as wire;
 
@@ -39,7 +39,11 @@ use sensor_linux_wire as wire;
 /// function below, converting the wire struct's `addr_resolved` bool + zeroed
 /// fields into `Option<IpAddr>`/`Option<u16>` on the schema side; no existing
 /// mapping changed shape.
-const _: () = assert!(wire::WIRE_VERSION == 10);
+///
+/// v11 (#263 Phase 2) added `SocketAcceptEvent` — new `socket_accept` mapping
+/// function below, same address-family logic as `connect`/`socket_bind`; no
+/// existing mapping changed shape.
+const _: () = assert!(wire::WIRE_VERSION == 11);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
@@ -278,6 +282,26 @@ pub fn socket_listen(
         local_addr,
         local_port,
         backlog: event.backlog,
+    })
+}
+
+#[must_use]
+pub fn socket_accept(
+    event: &wire::SocketAcceptEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    let peer_addr = if event.is_ipv6 {
+        std::net::IpAddr::V6(event.peer_addr_v6.into())
+    } else {
+        std::net::IpAddr::V4(event.peer_addr_v4.into())
+    };
+    Event::SocketAccept(SocketAcceptEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        listen_fd: event.listen_fd,
+        accepted_fd: event.accepted_fd,
+        peer_addr,
+        peer_port: event.peer_port,
     })
 }
 
@@ -676,5 +700,25 @@ mod tests {
         assert_eq!(e.local_addr, None);
         assert_eq!(e.local_port, None);
         assert_eq!(e.backlog, 128);
+    }
+
+    #[test]
+    fn socket_accept_carries_peer_not_local_address() {
+        let event = wire::SocketAcceptEvent {
+            meta: wire_meta(b"sshd"),
+            listen_fd: 3,
+            accepted_fd: 7,
+            peer_addr_v4: [203, 0, 113, 42],
+            peer_addr_v6: [0; 16],
+            peer_port: 54321,
+            is_ipv6: false,
+        };
+        let Event::SocketAccept(e) = socket_accept(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.listen_fd, 3);
+        assert_eq!(e.accepted_fd, 7);
+        assert_eq!(e.peer_addr.to_string(), "203.0.113.42");
+        assert_eq!(e.peer_port, 54321);
     }
 }
