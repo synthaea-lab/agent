@@ -311,7 +311,7 @@ pub(crate) fn cmd_run(
     let (_health_handle, _health_stop) = health.spawn();
 
     spawn_netlink_poller(sink.clone(), netlink_heartbeat);
-    spawn_journal_tail(sink.clone(), journal_heartbeat);
+    spawn_journal_tail(sink.clone(), journal_heartbeat, alerts);
     if enable_tls_capture || enable_readline_capture {
         spawn_uprobes_sensor(
             sink.clone(),
@@ -427,11 +427,21 @@ fn forward_netlink_events(
 /// `watchdog::service::linux`'s own doc on this) has no `journalctl` at all —
 /// logged once and skipped, not a reason to fail `agent run` entirely, same
 /// posture as [`seeded_rule_state`]'s netlink snapshot.
-fn spawn_journal_tail(sink: Arc<DetectionSink>, heartbeat: SensorHeartbeat) {
+///
+/// Cursor persistence (issue #321): the tail resumes from the last cursor this
+/// process saw (`crate::journal_cursor`, a file derived from `alerts` — same
+/// convention as `heartbeat_path_for`) when one exists, falling back to
+/// `journalctl`'s own "now" snapshot on a fresh install or a missing/corrupt
+/// cursor file — either way the honest "no prior state" case, not an error.
+/// Bounded catch-up: a restart replays whatever landed since the last persisted
+/// cursor, not the whole journal from epoch.
+fn spawn_journal_tail(sink: Arc<DetectionSink>, heartbeat: SensorHeartbeat, alerts: &std::path::Path) {
+    let cursor_path = crate::journal_cursor::cursor_path_for(alerts);
     std::thread::Builder::new()
         .name("journal-tail".into())
         .spawn(move || {
-            let cursor = sensor_linux_journal::current_cursor().ok();
+            let cursor = crate::journal_cursor::read(&cursor_path)
+                .or_else(|| sensor_linux_journal::current_cursor().ok());
             let mut child = match sensor_linux_journal::spawn_follow(cursor.as_deref()) {
                 Ok(child) => child,
                 Err(e) => {
@@ -454,6 +464,7 @@ fn spawn_journal_tail(sink: Arc<DetectionSink>, heartbeat: SensorHeartbeat) {
                 heartbeat.pulse();
                 match item {
                     Ok((record, event)) => {
+                        crate::journal_cursor::write(&cursor_path, &record.cursor);
                         if let Some(auth) = sensor_linux_journal::to_auth_event(&record, &event) {
                             sink.on_event(schema::Event::Auth(auth));
                         }

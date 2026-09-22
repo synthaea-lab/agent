@@ -27,6 +27,8 @@ mod heartbeat;
 // `cfg(target_os = "linux")` — unlike `heartbeat`/`sink` above, there's no
 // cross-platform body here to keep alive with an `allow(dead_code)`.
 #[cfg(target_os = "linux")]
+mod journal_cursor;
+#[cfg(target_os = "linux")]
 mod kill_loudness;
 mod protected;
 mod silence;
