@@ -21,7 +21,7 @@ use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use crate::{
-    config::UprobesConfig,
+    config::{TlsConfig, UprobesConfig},
     normalize,
     symbol_resolver::{self, SymbolInfo},
 };
@@ -339,6 +339,111 @@ macro_rules! drain_readline {
     }};
 }
 
+/// Spawns the detached eBPF-log drain task, or warns and continues without it —
+/// probe logging is diagnostics, never worth failing the sensor over. Only a
+/// broken `AsyncFd` registration (the tokio reactor itself) is a hard error.
+fn spawn_ebpf_log_drain(ebpf: &mut aya::Ebpf) -> Result<(), SensorError> {
+    match aya_log::EbpfLogger::init(ebpf) {
+        Err(e) => {
+            warn!(error = %e, "sensor-linux-uprobes: failed to initialize eBPF logger");
+        }
+        Ok(logger) => {
+            let mut logger =
+                tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)
+                    .map_err(|e| err(format!("eBPF logger fd: {e}")))?;
+            tokio::task::spawn(async move {
+                loop {
+                    // No unwrap: nothing holds this task's JoinHandle, so a
+                    // panic here would be swallowed silently. An fd error
+                    // means the logger fd is gone — stop draining, loudly.
+                    let mut guard = match logger.readable_mut().await {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            warn!(error = %e, "eBPF log drain stopped");
+                            break;
+                        }
+                    };
+                    guard.get_inner_mut().flush();
+                    guard.clear_ready();
+                }
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The eBPF programs to attach for one resolved TLS symbol: per-library probe
+/// variants, entry+exit for the read path (the exit uretprobe carries the
+/// plaintext once `SSL_read` has filled the buffer). One table instead of the
+/// six hand-copied match blocks this used to be — `Unknown` defaults to the
+/// OpenSSL-shaped probes, the dominant ABI.
+fn tls_probes_for(symbol_name: &str, lib: symbol_resolver::LibraryType) -> &'static [&'static str] {
+    use symbol_resolver::LibraryType::{BoringSSL, GnuTLS, OpenSSL, Unknown};
+    match symbol_name {
+        "SSL_write" | "SSL_write_ex" => match lib {
+            OpenSSL | Unknown => &["ssl_write_openssl"],
+            BoringSSL => &["ssl_write_boringssl"],
+            GnuTLS => &["ssl_write_gnutls"],
+        },
+        "gnutls_record_send" => &["ssl_write_gnutls"],
+        "SSL_read" | "SSL_read_ex" => match lib {
+            OpenSSL | Unknown => &["ssl_read_entry_openssl", "ssl_read_exit_openssl"],
+            BoringSSL => &["ssl_read_entry_boringssl", "ssl_read_exit_boringssl"],
+            GnuTLS => &["ssl_read_entry_gnutls", "ssl_read_exit_gnutls"],
+        },
+        "gnutls_record_recv" => &["ssl_read_entry_gnutls", "ssl_read_exit_gnutls"],
+        _ => &[],
+    }
+}
+
+/// Resolves TLS symbols and attaches every applicable probe. A single failed
+/// attach warns and moves on (one hardened library must not disable TLS
+/// capture for the rest); failed symbol *resolution* is a hard error — with no
+/// symbols at all, enabling TLS capture was a configuration mistake worth
+/// surfacing.
+fn attach_tls_uprobes(
+    config: &TlsConfig,
+    ebpf: &mut aya::Ebpf,
+    loaded_programs: &mut HashSet<String>,
+) -> Result<(), SensorError> {
+    let tls_symbols = symbol_resolver::resolve_tls_symbols()
+        .map_err(|e| err(format!("TLS symbol resolution failed: {e}")))?;
+
+    for symbol in &tls_symbols {
+        if config.library_denylist.contains(&symbol.library_path) {
+            info!(
+                library = %symbol.library_path.display(),
+                "sensor-linux-uprobes: skipping denylisted library"
+            );
+            continue;
+        }
+        for probe_name in tls_probes_for(&symbol.name, symbol.library_type) {
+            if let Err(e) = attach_uprobe(ebpf, probe_name, symbol, loaded_programs) {
+                warn!(probe = probe_name, error = %e, "sensor-linux-uprobes: failed to attach uprobe");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Same contract as [`attach_tls_uprobes`], for the shell readline probe.
+fn attach_readline_uprobes(
+    ebpf: &mut aya::Ebpf,
+    loaded_programs: &mut HashSet<String>,
+) -> Result<(), SensorError> {
+    let readline_symbols = symbol_resolver::resolve_readline_symbols()
+        .map_err(|e| err(format!("readline symbol resolution failed: {e}")))?;
+
+    for symbol in &readline_symbols {
+        if symbol.name == "readline"
+            && let Err(e) = attach_uprobe(ebpf, "readline_exit", symbol, loaded_programs)
+        {
+            warn!(probe = "readline_exit", error = %e, "sensor-linux-uprobes: failed to attach uprobe");
+        }
+    }
+    Ok(())
+}
+
 /// Uprobe sensor. `run` blocks until Ctrl-C or [`Sensor::stop`].
 pub struct UprobesSensor {
     stop: Arc<Notify>,
@@ -387,148 +492,21 @@ impl UprobesSensor {
         let mut tls_dropped = 0u64;
         let mut readline_dropped = 0u64;
 
-        // Initialize eBPF logger
-        match aya_log::EbpfLogger::init(&mut ebpf) {
-            Err(e) => {
-                warn!(error = %e, "sensor-linux-uprobes: failed to initialize eBPF logger");
-            }
-            Ok(logger) => {
-                let mut logger =
-                    tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)
-                        .map_err(|e| err(format!("eBPF logger fd: {e}")))?;
-                tokio::task::spawn(async move {
-                    loop {
-                        // No unwrap: nothing holds this task's JoinHandle, so a
-                        // panic here would be swallowed silently. An fd error
-                        // means the logger fd is gone — stop draining, loudly.
-                        let mut guard = match logger.readable_mut().await {
-                            Ok(guard) => guard,
-                            Err(e) => {
-                                warn!(error = %e, "eBPF log drain stopped");
-                                break;
-                            }
-                        };
-                        guard.get_inner_mut().flush();
-                        guard.clear_ready();
-                    }
-                });
-            }
-        }
+        spawn_ebpf_log_drain(&mut ebpf)?;
 
         // Track which eBPF programs have been loaded (to avoid duplicate load() calls)
         let mut loaded_programs = HashSet::new();
 
-        // Resolve and attach TLS uprobes (only if enabled)
         if self.config.tls.enabled {
             info!("sensor-linux-uprobes: TLS capture enabled, resolving symbols...");
-            let tls_symbols = symbol_resolver::resolve_tls_symbols()
-                .map_err(|e| err(format!("TLS symbol resolution failed: {e}")))?;
-
-            for symbol in &tls_symbols {
-                // Skip libraries in denylist
-                if self
-                    .config
-                    .tls
-                    .library_denylist
-                    .contains(&symbol.library_path)
-                {
-                    info!(
-                        library = %symbol.library_path.display(),
-                        "sensor-linux-uprobes: skipping denylisted library"
-                    );
-                    continue;
-                }
-
-                // Attach ssl_write to SSL_write/SSL_write_ex (per-library probe function)
-                if symbol.name == "SSL_write" || symbol.name == "SSL_write_ex" {
-                    let probe_name = match symbol.library_type {
-                        symbol_resolver::LibraryType::OpenSSL => "ssl_write_openssl",
-                        symbol_resolver::LibraryType::BoringSSL => "ssl_write_boringssl",
-                        symbol_resolver::LibraryType::GnuTLS => "ssl_write_gnutls",
-                        symbol_resolver::LibraryType::Unknown => "ssl_write_openssl", // Default to OpenSSL
-                    };
-                    if let Err(e) =
-                        attach_uprobe(&mut ebpf, probe_name, symbol, &mut loaded_programs)
-                    {
-                        warn!(probe = probe_name, error = %e, "sensor-linux-uprobes: failed to attach uprobe");
-                    }
-                }
-                // GnuTLS uses gnutls_record_send instead of SSL_write
-                if symbol.name == "gnutls_record_send"
-                    && let Err(e) =
-                        attach_uprobe(&mut ebpf, "ssl_write_gnutls", symbol, &mut loaded_programs)
-                {
-                    warn!(probe = "ssl_write_gnutls", error = %e, "sensor-linux-uprobes: failed to attach uprobe");
-                }
-                // Attach ssl_read_entry to SSL_read/SSL_read_ex (per-library probe function)
-                if symbol.name == "SSL_read" || symbol.name == "SSL_read_ex" {
-                    let probe_name = match symbol.library_type {
-                        symbol_resolver::LibraryType::OpenSSL => "ssl_read_entry_openssl",
-                        symbol_resolver::LibraryType::BoringSSL => "ssl_read_entry_boringssl",
-                        symbol_resolver::LibraryType::GnuTLS => "ssl_read_entry_gnutls",
-                        symbol_resolver::LibraryType::Unknown => "ssl_read_entry_openssl", // Default
-                    };
-                    if let Err(e) =
-                        attach_uprobe(&mut ebpf, probe_name, symbol, &mut loaded_programs)
-                    {
-                        warn!(probe = probe_name, error = %e, "sensor-linux-uprobes: failed to attach uprobe");
-                    }
-                }
-                // GnuTLS uses gnutls_record_recv instead of SSL_read
-                if symbol.name == "gnutls_record_recv"
-                    && let Err(e) = attach_uprobe(
-                        &mut ebpf,
-                        "ssl_read_entry_gnutls",
-                        symbol,
-                        &mut loaded_programs,
-                    )
-                {
-                    warn!(probe = "ssl_read_entry_gnutls", error = %e, "sensor-linux-uprobes: failed to attach uprobe");
-                }
-                // Also attach the uretprobe (ssl_read_exit_*) - per-library function
-                if symbol.name == "SSL_read" || symbol.name == "SSL_read_ex" {
-                    let probe_name = match symbol.library_type {
-                        symbol_resolver::LibraryType::OpenSSL => "ssl_read_exit_openssl",
-                        symbol_resolver::LibraryType::BoringSSL => "ssl_read_exit_boringssl",
-                        symbol_resolver::LibraryType::GnuTLS => "ssl_read_exit_gnutls",
-                        symbol_resolver::LibraryType::Unknown => "ssl_read_exit_openssl", // Default
-                    };
-                    if let Err(e) =
-                        attach_uprobe(&mut ebpf, probe_name, symbol, &mut loaded_programs)
-                    {
-                        warn!(probe = probe_name, error = %e, "sensor-linux-uprobes: failed to attach uprobe");
-                    }
-                }
-                // GnuTLS uretprobe for gnutls_record_recv
-                if symbol.name == "gnutls_record_recv"
-                    && let Err(e) = attach_uprobe(
-                        &mut ebpf,
-                        "ssl_read_exit_gnutls",
-                        symbol,
-                        &mut loaded_programs,
-                    )
-                {
-                    warn!(probe = "ssl_read_exit_gnutls", error = %e, "sensor-linux-uprobes: failed to attach uprobe");
-                }
-            }
+            attach_tls_uprobes(&self.config.tls, &mut ebpf, &mut loaded_programs)?;
         } else {
             info!("sensor-linux-uprobes: TLS capture disabled");
         }
 
-        // Resolve and attach readline uprobes (only if enabled)
         if self.config.readline.enabled {
             info!("sensor-linux-uprobes: readline capture enabled, resolving symbols...");
-            let readline_symbols = symbol_resolver::resolve_readline_symbols()
-                .map_err(|e| err(format!("readline symbol resolution failed: {e}")))?;
-
-            for symbol in &readline_symbols {
-                if symbol.name == "readline"
-                    && let Err(e) =
-                        attach_uprobe(&mut ebpf, "readline_exit", symbol, &mut loaded_programs)
-                {
-                    warn!(probe = "readline_exit", error = %e, "sensor-linux-uprobes: failed to attach uprobe");
-                }
-            }
+            attach_readline_uprobes(&mut ebpf, &mut loaded_programs)?;
         } else {
             info!("sensor-linux-uprobes: readline capture disabled");
         }
