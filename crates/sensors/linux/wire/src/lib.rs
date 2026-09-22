@@ -13,6 +13,11 @@
 //! `ExecEvent` is built in a `PerCpuArray` because `image` alone already exceeds the
 //! stack budget.
 
+// The "user" feature (userspace loader + uprobes sensor) brings std in for the
+// shared decode helpers at the bottom; the eBPF build stays pure no_std.
+#[cfg(feature = "user")]
+extern crate std;
+
 /// Bumped on every layout-affecting change to the structs below. Not a wire header
 /// (ring-buffer items carry none) — a build-time tripwire: the userspace loader
 /// `const _`-asserts the value it was compiled against, so an ebpf/userspace version
@@ -220,4 +225,72 @@ pub struct ReadlineInputEvent {
     pub input_len: u32,
     /// Full command line input. Budget: 512 bytes.
     pub input: [u8; MAX_READLINE_INPUT],
+}
+
+/// Decodes a fixed comm buffer: NUL-terminated, kernel-truncated to 15 bytes — a
+/// sensor property (reported by conformance), not a schema limit. Shared by the
+/// eBPF loader and the uprobes sensor, which carried identical copies before.
+#[cfg(feature = "user")]
+#[must_use]
+pub fn comm_str(comm: &[u8; TASK_COMM_LEN]) -> std::string::String {
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+    std::string::String::from_utf8_lossy(&comm[..end]).into_owned()
+}
+
+/// Difference between the epoch clock and `CLOCK_MONOTONIC` (which the probes
+/// stamp events with, `bpf_ktime_get_ns`), computed once at sensor startup so
+/// normalization can turn probe timestamps into epoch nanoseconds. `0` (plus a
+/// warning) if the monotonic clock cannot be read — timestamps then stay
+/// monotonic-based rather than the sensor failing.
+///
+/// Lives here because the two sensor crates each carried a copy and the copies
+/// drifted once already (unchecked vs. saturating arithmetic).
+#[cfg(all(feature = "user", target_os = "linux"))]
+#[must_use]
+pub fn boot_epoch_offset_ns() -> u64 {
+    let epoch_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: plain FFI call writing into a valid stack-owned timespec.
+    let ret = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    if ret != 0 {
+        tracing::warn!("clock_gettime(CLOCK_MONOTONIC) failed — timestamps stay monotonic");
+        return 0;
+    }
+    let monotonic_ns = (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64);
+    epoch_ns.saturating_sub(monotonic_ns)
+}
+
+#[cfg(all(test, feature = "user"))]
+mod helper_tests {
+    use super::*;
+
+    #[test]
+    fn comm_str_stops_at_the_nul_terminator() {
+        let mut buf = [0u8; TASK_COMM_LEN];
+        buf[..4].copy_from_slice(b"bash");
+        assert_eq!(comm_str(&buf), "bash");
+    }
+
+    #[test]
+    fn comm_str_handles_a_full_unterminated_buffer() {
+        let buf = [b'x'; TASK_COMM_LEN];
+        assert_eq!(comm_str(&buf), "x".repeat(TASK_COMM_LEN));
+    }
+
+    #[test]
+    fn comm_str_replaces_non_utf8_instead_of_failing() {
+        // A process can prctl(PR_SET_NAME) itself to arbitrary bytes.
+        let mut buf = [0u8; TASK_COMM_LEN];
+        buf[0] = 0xFF;
+        buf[1] = b'a';
+        assert_eq!(comm_str(&buf), "\u{FFFD}a");
+    }
 }
