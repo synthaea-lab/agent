@@ -19,15 +19,18 @@
 //! [`Stream`] without touching the server logic.
 
 use std::sync::Arc;
+
 use tokio::io::BufReader;
 
-use crate::error::ServerError;
-use crate::frame::{read_message, write_message, FrameError};
-use crate::protocol::{
-    ClientHello, PolicyVersionResponse, RecentDetectionsResponse, Request, Response,
-    SensorHealthResponse, ServerHello, StatusResponse, WireError, PROTOCOL_VERSION,
+use crate::{
+    error::ServerError,
+    frame::{FrameError, read_message, write_message},
+    protocol::{
+        ClientHello, PROTOCOL_VERSION, PolicyVersionResponse, RecentDetectionsResponse, Request,
+        Response, SensorHealthResponse, ServerHello, StatusResponse, WireError,
+    },
+    stream::{Listener, Stream},
 };
-use crate::stream::{Listener, Stream};
 
 /// Hard upper bound on [`Request::RecentDetections::limit`] — a client
 /// that requests more is served this many entries with no error, so a
@@ -199,8 +202,9 @@ async fn serve_one<H: Handler>(
     tracing::debug!(pid = creds.pid, "IPC peer authorized");
 
     // Handshake: read ClientHello, respond with ServerHello (or WireError).
-    let hello: Option<ClientHello> =
-        read_message(&mut reader).await.map_err(map_frame_err_read)?;
+    let hello: Option<ClientHello> = read_message(&mut reader)
+        .await
+        .map_err(map_frame_err_read)?;
     let hello = match hello {
         Some(h) => h,
         None => return Ok(()), // peer closed before saying anything

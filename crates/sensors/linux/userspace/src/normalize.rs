@@ -242,6 +242,7 @@ pub fn socket_bind(
     })
 }
 
+#[must_use]
 pub fn udp_send(
     event: &wire::UdpSendEvent,
     boot_epoch_offset_ns: u64,

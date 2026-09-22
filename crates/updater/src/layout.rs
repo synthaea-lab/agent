@@ -3,14 +3,13 @@
 //! `CLAUDE.md`'s platform-code exception for `updater` and ADR-0015's Deferred
 //! section (Windows/macOS self-update need their own design).
 
-use std::fs;
-use std::io;
-use std::os::unix::fs::symlink;
-use std::path::{Path, PathBuf};
+use std::{
+    fs, io,
+    os::unix::fs::symlink,
+    path::{Path, PathBuf},
+};
 
-use crate::error::UpdaterError;
-use crate::hash::hash_file;
-use crate::manifest::ReleaseManifest;
+use crate::{error::UpdaterError, hash::hash_file, manifest::ReleaseManifest};
 
 /// Name of the `current` symlink, directly under [`Layout::base_dir`].
 const CURRENT_LINK: &str = "current";
@@ -190,8 +189,9 @@ impl Layout {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::BTreeMap;
+
+    use super::*;
 
     fn layout() -> (tempfile::TempDir, Layout) {
         let dir = tempfile::tempdir().unwrap();

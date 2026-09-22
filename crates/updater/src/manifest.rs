@@ -3,15 +3,16 @@
 //! sha256)` shape `tamper::integrity::Manifest` consumes at runtime, plus the
 //! version counter and signature that make it trustworthy in the first place.
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use ring::signature::{self, Ed25519KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
-use crate::error::UpdaterError;
-use crate::hash::{hex_decode, hex_encode};
-use crate::key::UPDATER_PUBLIC_KEY;
+use crate::{
+    error::UpdaterError,
+    hash::{hex_decode, hex_encode},
+    key::UPDATER_PUBLIC_KEY,
+};
 
 /// The only `schema_version` this build accepts (ADR-0015 Decision 2: readers
 /// reject an unknown value outright rather than parsing leniently).

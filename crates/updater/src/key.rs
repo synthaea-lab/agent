@@ -38,7 +38,7 @@ pub fn test_key_pair() -> Ed25519KeyPair {
 /// The public key manifests are verified against. Derived from [`TEST_KEY_SEED`]
 /// at startup rather than hand-copied, so the seed stays the single source of
 /// truth and the embedded key cannot silently drift from it — see
-/// [`tests::updater_public_key_matches_test_key_pair`] for the regression test
+/// `tests::updater_public_key_matches_test_key_pair` for the regression test
 /// that would catch a mismatch if this derivation were ever hand-inlined instead.
 pub static UPDATER_PUBLIC_KEY: LazyLock<[u8; 32]> = LazyLock::new(|| {
     test_key_pair()

@@ -13,13 +13,15 @@
 
 use tokio::io::BufReader;
 
-use crate::error::ClientError;
-use crate::frame::{read_message, write_message, FrameError};
-use crate::protocol::{
-    ClientHello, PolicyVersionResponse, RecentDetectionsResponse, Request, Response,
-    SensorHealthResponse, ServerHello, StatusResponse, WireError, PROTOCOL_VERSION,
+use crate::{
+    error::ClientError,
+    frame::{FrameError, read_message, write_message},
+    protocol::{
+        ClientHello, PROTOCOL_VERSION, PolicyVersionResponse, RecentDetectionsResponse, Request,
+        Response, SensorHealthResponse, ServerHello, StatusResponse, WireError,
+    },
+    stream::{Stream, connect},
 };
-use crate::stream::{connect, Stream};
 
 /// An established, handshook client connection.
 pub struct Client {
@@ -44,10 +46,12 @@ impl Client {
     /// - [`ClientError::Io`] on transport errors during handshake.
     /// - [`ClientError::Protocol`] on malformed server replies.
     pub async fn connect(endpoint: &str, client_name: &str) -> Result<Self, ClientError> {
-        let stream = connect(endpoint).await.map_err(|source| ClientError::Connect {
-            endpoint: endpoint.to_string(),
-            source,
-        })?;
+        let stream = connect(endpoint)
+            .await
+            .map_err(|source| ClientError::Connect {
+                endpoint: endpoint.to_string(),
+                source,
+            })?;
         let (read_half, mut write_half) = tokio::io::split(stream);
         let mut reader = BufReader::new(read_half);
 

@@ -77,7 +77,9 @@ async fn round_trip_every_endpoint() {
     let mut client = match Client::connect(&endpoint, "e2e-test").await {
         Ok(c) => c,
         Err(ClientError::Refused(msg)) if msg.contains("Unauthorized") => {
-            skip_test!("peer-auth rejected the test process (need root on Unix / elevated on Windows)");
+            skip_test!(
+                "peer-auth rejected the test process (need root on Unix / elevated on Windows)"
+            );
         }
         Err(e) => panic!("unexpected connect failure: {e:?}"),
     };

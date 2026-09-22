@@ -19,7 +19,7 @@
 //! Anything above that is a bug or an attack — the server closes the
 //! connection when its line reader hits the cap.
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 /// Hard cap on one line's length in bytes, INCLUDING the trailing
@@ -83,7 +83,10 @@ where
     let mut total = 0usize;
     loop {
         let (done, consumed) = {
-            let available = reader.fill_buf().await.map_err(|source| FrameError::Io { source })?;
+            let available = reader
+                .fill_buf()
+                .await
+                .map_err(|source| FrameError::Io { source })?;
             if available.is_empty() {
                 return Ok(total); // EOF; `total > 0` means partial line
             }
@@ -157,9 +160,7 @@ pub enum FrameError {
         source: std::io::Error,
     },
     /// A single line exceeded [`MAX_MESSAGE_BYTES`].
-    #[error(
-        "framed message exceeds the {MAX_MESSAGE_BYTES}-byte per-line cap"
-    )]
+    #[error("framed message exceeds the {MAX_MESSAGE_BYTES}-byte per-line cap")]
     TooLarge,
     /// A line contained non-UTF-8 bytes; the wire is strictly UTF-8 JSON.
     #[error("framed message is not valid UTF-8")]
@@ -177,8 +178,9 @@ pub enum FrameError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio::io::BufReader;
+
+    use super::*;
 
     // These tests hand `read_message` a `&[u8]` reader — tokio implements
     // `AsyncRead` for byte slices, which is a simpler and non-blocking
