@@ -321,6 +321,12 @@ pub(crate) fn cmd_run(
         );
     }
 
+    // Observation-only BPF-LSM coverage (issue #91/#313): best-effort, never
+    // fails `cmd_run`. `_lsm_ebpf` must stay bound for the rest of this function
+    // — dropping it detaches the hook — so it lives alongside `sensor` below,
+    // both held until `sensor.run()`'s Ctrl-C return ends the process.
+    let _lsm_ebpf = attach_lsm_hooks();
+
     // Protected-resource monitoring (#71): only the eBPF sensor produces `FileOpen`
     // events, so only its chain needs the guard — the netlink/journal sinks above
     // never see one.
@@ -509,6 +515,51 @@ fn spawn_uprobes_sensor(
             }
         })
         .expect("spawning the uprobes sensor thread");
+}
+
+/// Attaches the observation-only `file_open` BPF-LSM hook (issue #91/#313) and
+/// returns the `Ebpf` object that keeps it live — dropping it detaches the
+/// program, so the caller must hold the return value for the process's lifetime,
+/// same as the primary sensor's own internal `Ebpf` object.
+///
+/// Best-effort, never fails `cmd_run`: every outcome (no BPF-LSM support on this
+/// kernel, compiled in but not in the active `lsm=` boot list, or a genuine
+/// attach failure) is the honest capability-absent case, logged and moved past —
+/// see `sensor_linux_lsm`'s crate doc on why a structured capability report
+/// doesn't exist yet. Gated behind `can_use_ebpf`: a host that can't load the
+/// primary eBPF object can't load this hook's object either (same compiled
+/// object, same privilege/BTF preflight), so skip the attempt entirely rather
+/// than log a second, redundant failure.
+fn attach_lsm_hooks() -> Option<aya::Ebpf> {
+    if !can_use_ebpf() {
+        return None;
+    }
+    if !sensor_linux_lsm::detect_hook_support("file_open") {
+        tracing::info!("lsm: kernel has no BPF-LSM support for `file_open`, skipping");
+        return None;
+    }
+    let mut ebpf = match sensor_linux::load_ebpf() {
+        Ok(ebpf) => ebpf,
+        Err(e) => {
+            tracing::warn!(error = %e, "lsm: failed to load the eBPF object for the file_open hook");
+            return None;
+        }
+    };
+    match sensor_linux_lsm::attach_file_open(&mut ebpf) {
+        Ok(()) => {
+            tracing::info!("lsm: file_open BPF-LSM hook attached");
+            Some(ebpf)
+        }
+        Err(e) => {
+            // BTF said the type exists but attach still failed — most commonly
+            // "bpf" is not in the active `lsm=` boot list (compiled in, not
+            // live). Still the honest capability-absent case, just a notch more
+            // notable than "no BTF at all" since it means the operator could
+            // fix this with a boot-cmdline change.
+            tracing::warn!(error = %e, "lsm: file_open BPF-LSM hook did not attach");
+            None
+        }
+    }
 }
 
 /// Linux: rules-filtered benign capture via `BaselineSink` (Ctrl-C handled by the
