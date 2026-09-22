@@ -811,10 +811,7 @@ pub fn sys_enter_chmod(ctx: TracePointContext) -> u32 {
 
 fn try_sys_enter_chmod(ctx: TracePointContext) -> Result<u32, u32> {
     #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let filename_ptr: u64 = unsafe {
-        ctx.read_at(CHMOD_FILENAME_PTR_OFFSET)
-            .map_err(|_| 1u32)?
-    };
+    let filename_ptr: u64 = unsafe { ctx.read_at(CHMOD_FILENAME_PTR_OFFSET).map_err(|_| 1u32)? };
     #[cfg(bpf_target_arch = "x86")]
     let filename_ptr: u64 = unsafe {
         ctx.read_at::<u32>(CHMOD_FILENAME_PTR_OFFSET)
@@ -962,10 +959,7 @@ pub fn sys_enter_chown(ctx: TracePointContext) -> u32 {
 
 fn try_sys_enter_chown(ctx: TracePointContext) -> Result<u32, u32> {
     #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let filename_ptr: u64 = unsafe {
-        ctx.read_at(CHOWN_FILENAME_PTR_OFFSET)
-            .map_err(|_| 1u32)?
-    };
+    let filename_ptr: u64 = unsafe { ctx.read_at(CHOWN_FILENAME_PTR_OFFSET).map_err(|_| 1u32)? };
     #[cfg(bpf_target_arch = "x86")]
     let filename_ptr: u64 = unsafe {
         ctx.read_at::<u32>(CHOWN_FILENAME_PTR_OFFSET)
@@ -993,10 +987,7 @@ pub fn sys_enter_lchown(ctx: TracePointContext) -> u32 {
 
 fn try_sys_enter_lchown(ctx: TracePointContext) -> Result<u32, u32> {
     #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let filename_ptr: u64 = unsafe {
-        ctx.read_at(LCHOWN_FILENAME_PTR_OFFSET)
-            .map_err(|_| 1u32)?
-    };
+    let filename_ptr: u64 = unsafe { ctx.read_at(LCHOWN_FILENAME_PTR_OFFSET).map_err(|_| 1u32)? };
     #[cfg(bpf_target_arch = "x86")]
     let filename_ptr: u64 = unsafe {
         ctx.read_at::<u32>(LCHOWN_FILENAME_PTR_OFFSET)
@@ -1040,8 +1031,10 @@ fn try_sys_enter_fchownat(ctx: TracePointContext) -> Result<u32, u32> {
     #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     let group: u64 = unsafe { ctx.read_at(FCHOWNAT_GROUP_OFFSET).map_err(|_| 1u32)? };
     #[cfg(bpf_target_arch = "x86")]
-    let group: u64 =
-        unsafe { ctx.read_at::<u32>(FCHOWNAT_GROUP_OFFSET).map_err(|_| 1u32)? as u64 };
+    let group: u64 = unsafe {
+        ctx.read_at::<u32>(FCHOWNAT_GROUP_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
 
     emit_file_chown_event(&ctx, filename_ptr, user, group)
 }
