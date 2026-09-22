@@ -738,7 +738,10 @@ fn file_chown_golden() {
             meta: EventMeta {
                 pid: 9002,
                 ppid: 9000,
-                user: User::Unix { uid: 1000, gid: 1000 },
+                user: User::Unix {
+                    uid: 1000,
+                    gid: 1000,
+                },
                 timestamp_ns: 1_756_900_015_000_000_000,
                 comm: "chown".into(),
                 container: None,
