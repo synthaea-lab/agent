@@ -10,3 +10,26 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# Named-pipe peer authentication uses Win32 token APIs (OpenProcessToken +
+# CheckTokenMembership against BUILTIN\Administrators). Alternative — an
+# SDDL on the pipe itself — would delegate authorization to the OS but
+# would prevent a non-admin CLI from connecting AT ALL, including for the
+# unauthorized-peer-rejected test. Explicit check gives us both accept and
+# reject paths under the same code path.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time", "test-util"] }

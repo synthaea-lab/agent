@@ -134,6 +134,12 @@ toml = "0.8"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Async runtime for the local IPC server (crates/ipc, issue #26). Features
+# picked minimal: multi-thread runtime for the server (many concurrent
+# clients), `net` for named-pipe/UDS listeners, `io-util` for line-based
+# framing, `sync` for shutdown signaling, `macros` for `#[tokio::main]` /
+# `#[tokio::test]`.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros"] }
 # ONNX Runtime for on-device inference (ADR-0002). Pinned RC — ort 2.0 is the first
 # line to support the ai.onnx.ml tree ops our models use; used only by `crates/ml`.
 # Workspace config: default-features = false (no auto-download).
