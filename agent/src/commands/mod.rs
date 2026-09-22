@@ -5,6 +5,8 @@
 //! the commands compile and fail cleanly at runtime instead of breaking the
 //! workspace build.
 
+#[cfg(any(target_os = "linux", windows))]
+mod common;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(windows)]
@@ -33,6 +35,7 @@ pub(crate) fn cmd_run(
     _enable_quarantine: bool,
     _enable_tls_capture: bool,
     _enable_readline_capture: bool,
+    _server: Option<&str>,
 ) -> anyhow::Result<()> {
     anyhow::bail!(UNSUPPORTED_PLATFORM)
 }

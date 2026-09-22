@@ -21,6 +21,8 @@ yara = { path = "../crates/yara" }
 sinks = { path = "../crates/sinks" }
 tamper = { path = "../crates/tamper" }
 response = { path = "../crates/response" }
+store = { path = "../crates/store" }
+transport = { path = "../crates/transport" }
 
 anyhow = "1"
 serde = { workspace = true }
