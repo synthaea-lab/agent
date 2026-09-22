@@ -11,7 +11,7 @@
 //! ## Trust and scope
 //!
 //! The manifest is the root of trust: its authenticity is the `updater`'s job
-//! (signed distribution, ADR-0001), not this module's — here it is already-trusted
+//! (signed distribution, ADR-0015), not this module's — here it is already-trusted
 //! input. Verification runs in user mode, so a kernel-level adversary can forge the
 //! result; that ceiling is named in the threat model. What this closes is the
 //! same-privilege on-disk swap: the swap changes the hash, and the changed hash is

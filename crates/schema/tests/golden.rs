@@ -13,8 +13,8 @@ use schema::{
     EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent,
     FileRenameEvent, FileWriteEvent, GatekeeperVerdictEvent, ImageLoadEvent, ListenPortEvent,
     NetworkFlowEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType,
-    SmbConnectEvent, SocketBindEvent, SocketListenEvent, TccDecisionEvent, TlsCaptureEvent,
-    TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
+    SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TccDecisionEvent,
+    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -800,7 +800,7 @@ fn socket_listen_unresolved_golden() {
 
 #[test]
 fn tcc_decision_golden() {
-    // v19 (#95): a TCC grant as joined from tccd's AUTHREQ_CTX + AUTHREQ_RESULT
+    // v20 (#95): a TCC grant as joined from tccd's AUTHREQ_CTX + AUTHREQ_RESULT
     // unified-log pair — screen capture granted to an unsigned payload.
     assert_golden(
         &Event::TccDecision(TccDecisionEvent {
@@ -824,7 +824,7 @@ fn tcc_decision_golden() {
 
 #[test]
 fn gatekeeper_verdict_golden() {
-    // v19 (#95): a syspolicyd `GK evaluateScanResult` record. `result_code` is
+    // v20 (#95): a syspolicyd `GK evaluateScanResult` record. `result_code` is
     // deliberately raw/uninterpreted — see the type's doc.
     assert_golden(
         &Event::GatekeeperVerdict(GatekeeperVerdictEvent {
@@ -842,6 +842,29 @@ fn gatekeeper_verdict_golden() {
             result_code: 2,
         }),
         "gatekeeper_verdict",
+    );
+}
+
+#[test]
+fn socket_accept_golden() {
+    // v19 (#263 Phase 2): peer address of a newly accepted connection — an
+    // attacker's IP connecting to a listening backdoor.
+    assert_golden(
+        &Event::SocketAccept(SocketAcceptEvent {
+            meta: EventMeta {
+                pid: 8004,
+                ppid: 8000,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_018_000_000_000,
+                comm: "nc".into(),
+                container: None,
+            },
+            listen_fd: 3,
+            accepted_fd: 4,
+            peer_addr: "203.0.113.42".parse().unwrap(),
+            peer_port: 54321,
+        }),
+        "socket_accept",
     );
 }
 
@@ -1087,6 +1110,13 @@ fn meta_accessor_covers_all_variants() {
             team_id: None,
             signing_id: None,
             result_code: 0,
+        }),
+        Event::SocketAccept(SocketAcceptEvent {
+            meta: meta.clone(),
+            listen_fd: 0,
+            accepted_fd: 0,
+            peer_addr: "0.0.0.0".parse::<IpAddr>().unwrap(),
+            peer_port: 0,
         }),
     ];
     for e in &events {
