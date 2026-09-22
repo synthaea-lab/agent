@@ -213,10 +213,15 @@ pub(crate) fn cmd_run(
     // set here is inherited by every thread spawned below, including `DetectionSink`'s
     // own worker threads.
     crate::kill_loudness::block_termination_signals();
-    crate::kill_loudness::spawn_watcher(alerts.to_path_buf());
 
     let pipeline = super::common::wire_run_pipeline(seeded_rule_state(), alerts, events, server)?;
     let sink = pipeline.sink;
+
+    // The watcher thread itself can start any time after the mask above — only the
+    // masking has to precede every other thread. Started here (not right after the
+    // masking call) so it can hold a clone of the sink's enrich queue for #341's
+    // bounded shutdown drain.
+    crate::kill_loudness::spawn_watcher(alerts.to_path_buf(), sink.enrich_queue().clone());
 
     // Select the primary sensor (eBPF or audit fallback) before creating heartbeats
     // so telemetry reports the correct sensor type.

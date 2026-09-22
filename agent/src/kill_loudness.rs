@@ -18,7 +18,11 @@
 //! signal handler would have, so a plain file write is safe here. Blocking suppressed
 //! the signal's own default disposition, so after logging, this thread is now the one
 //! responsible for actually terminating the process (the conventional 128+signal exit
-//! code).
+//! code) — after giving `enrich_queue` a bounded chance to drain first (issue #341),
+//! so an event captured in the same instant the signal landed isn't lost downstream
+//! of an already-successful capture. Bounded, deliberately: this must never become a
+//! real clean-shutdown path a compromised or wedged process could use to outlast the
+//! signal — see `SHUTDOWN_FLUSH_BUDGET` and `EnrichQueue::flush`'s own doc.
 //!
 //! Not unit-tested past the pure helpers below: the full mask-then-`sigwaitinfo`-then-
 //! `exit` flow deliberately terminates the process, which would kill the `cargo test`
@@ -27,9 +31,21 @@
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use crate::enrich_queue::EnrichQueue;
 
 const WATCHED_SIGNALS: [i32; 3] = [libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
+
+/// Bound on [`EnrichQueue::flush`] before the hard exit below proceeds regardless
+/// (issue #341) — short enough that a legitimate shutdown (watchdog restart,
+/// operator stop) is never noticeably delayed, long enough to drain the
+/// sub-millisecond-normally backlog that exists only because a signal can land in
+/// the same instant an event was captured.
+const SHUTDOWN_FLUSH_BUDGET: Duration = Duration::from_millis(200);
 
 fn watched_signal_set() -> libc::sigset_t {
     // SAFETY: `set` is zero-initialized then only ever populated through
@@ -58,10 +74,11 @@ pub(crate) fn block_termination_signals() {
     }
 }
 
-/// Spawns the dedicated thread that waits for one of the blocked signals and records
-/// who sent it before actually terminating the process (blocking suppressed the
-/// signal's own default disposition, so nothing else will end it).
-pub(crate) fn spawn_watcher(alerts_path: PathBuf) {
+/// Spawns the dedicated thread that waits for one of the blocked signals, records
+/// who sent it, gives `enrich_queue` a bounded chance to drain (issue #341) before
+/// actually terminating the process (blocking suppressed the signal's own default
+/// disposition, so nothing else will end it).
+pub(crate) fn spawn_watcher(alerts_path: PathBuf, enrich_queue: EnrichQueue) {
     std::thread::Builder::new()
         .name("kill-loudness".into())
         .spawn(move || {
@@ -80,6 +97,16 @@ pub(crate) fn spawn_watcher(alerts_path: PathBuf) {
                 return;
             }
             report_kill_attempt(&alerts_path, signo, sender_pid);
+            // Bounded, not unconditional (see `enrich_queue`'s module doc): the
+            // worst case here is the exact same immediate exit as before this
+            // issue was fixed, just after up to `SHUTDOWN_FLUSH_BUDGET` instead of
+            // none — #71's hard-exit guarantee against a wedged/compromised
+            // process outlasting a termination signal is unchanged.
+            if !enrich_queue.flush(SHUTDOWN_FLUSH_BUDGET) {
+                tracing::warn!(
+                    "kill-loudness: enrich queue did not fully drain within the shutdown budget"
+                );
+            }
             std::process::exit(128 + signo);
         })
         .expect("spawning the kill-loudness watcher thread");
