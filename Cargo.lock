@@ -2320,6 +2320,10 @@ dependencies = [
 [[package]]
 name = "sensor-linux-wire"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "tracing",
+]
 
 [[package]]
 name = "sensor-macos"

@@ -26,13 +26,6 @@ use sensor_linux_wire as wire;
 /// same address-family logic as `connect`; no existing mapping changed shape.
 const _: () = assert!(wire::WIRE_VERSION == 7);
 
-/// Decodes a fixed comm buffer: NUL-terminated, kernel-truncated to 15 bytes — a
-/// sensor property (reported by conformance), not a schema limit.
-fn comm_str(comm: &[u8; wire::TASK_COMM_LEN]) -> String {
-    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
-    String::from_utf8_lossy(&comm[..end]).into_owned()
-}
-
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
 fn comm_opt(comm: &[u8; wire::TASK_COMM_LEN]) -> Option<String> {
@@ -58,7 +51,7 @@ fn meta(
             gid: meta.gid,
         },
         timestamp_ns: meta.timestamp_ns.saturating_add(boot_epoch_offset_ns),
-        comm: comm_str(&meta.comm),
+        comm: wire::comm_str(&meta.comm),
         container,
     }
 }

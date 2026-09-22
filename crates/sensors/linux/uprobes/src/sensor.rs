@@ -16,7 +16,7 @@ use aya::{
     programs::{UProbe, uprobe::UProbeScope},
 };
 use schema::sensor::{Capabilities, EventSink, Sensor, SensorError};
-use sensor_linux_wire::{ReadlineInputEvent, TASK_COMM_LEN, TlsCaptureEvent};
+use sensor_linux_wire::{ReadlineInputEvent, TlsCaptureEvent, comm_str};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
@@ -30,27 +30,9 @@ fn err(msg: String) -> SensorError {
     msg.into()
 }
 
-/// Difference between the epoch clock and `CLOCK_MONOTONIC` (which the probes stamp
-/// events with), computed once at startup — see `normalize`.
+/// See `sensor_linux_wire::boot_epoch_offset_ns` — computed once at startup.
 fn boot_epoch_offset_ns() -> u64 {
-    let epoch_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: plain FFI call with a valid pointer to a stack-owned timespec
-    let ret = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    if ret != 0 {
-        warn!("sensor-linux-uprobes: clock_gettime(CLOCK_MONOTONIC) failed");
-        return 0;
-    }
-    let monotonic_ns = (ts.tv_sec as u64)
-        .saturating_mul(1_000_000_000)
-        .saturating_add(ts.tv_nsec as u64);
-    epoch_ns.saturating_sub(monotonic_ns)
+    sensor_linux_wire::boot_epoch_offset_ns()
 }
 
 /// Per-process budget tracking for TLS capture (sliding window).
@@ -313,12 +295,6 @@ macro_rules! drain_tls {
         }
         guard.clear_ready();
     }};
-}
-
-/// Helper to decode comm from wire format (shared with drain macros).
-fn comm_str(comm: &[u8; TASK_COMM_LEN]) -> String {
-    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
-    String::from_utf8_lossy(&comm[..end]).into_owned()
 }
 
 /// Drains readline events from the ring buffer and emits normalized schema events.
