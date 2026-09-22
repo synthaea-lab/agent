@@ -40,6 +40,7 @@ pub struct Alert {
 /// unchanged: `agent`'s protected-resource monitoring (#71) calls it as
 /// `rules::has_write_intent`.
 pub use schema::has_write_intent;
+#[cfg(test)]
 pub(crate) use schema::{O_CREAT, O_WRONLY};
 
 #[cfg(test)]
