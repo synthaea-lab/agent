@@ -57,6 +57,31 @@ fn lineage_ppid() -> u32 {
     }
 }
 
+/// Path prefixes this sensor never emits path-bearing file events for (issue #262's
+/// "Performance Considerations": named as the mitigation for the volume these
+/// syscalls generate). `/dev`, `/proc`, and `/sys` are virtual filesystems that
+/// legitimate processes touch continuously as a side effect of just running — not
+/// because a ransomware/tamper/exfil scenario would ever target real data there —
+/// and `/tmp` is high-churn scratch space (package manager staging, compiler temp
+/// files, systemd's `PrivateTmp`) with the same property. Checked against every
+/// event that carries a real filesystem path (open/delete/rename/chmod/chown);
+/// `write(2)` has no path argument at all (it operates on an already-open `fd`) and
+/// so cannot be filtered this way — a known, accepted gap, not solved here.
+const FILTERED_PATH_PREFIXES: [&[u8]; 4] = [b"/dev/", b"/proc/", b"/sys/", b"/tmp/"];
+
+/// Whether `path` falls under one of `FILTERED_PATH_PREFIXES` and the file event
+/// it belongs to should be dropped before it ever reaches the ring buffer.
+fn is_filtered_path(path: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < FILTERED_PATH_PREFIXES.len() {
+        if path.starts_with(FILTERED_PATH_PREFIXES[i]) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 // --- sched:sched_process_fork -------------------------------------------------------
 //
 // Records `child_pid -> {parent_pid, parent_comm}`. Verified on 2026-09-15 on Alpine
@@ -363,6 +388,9 @@ fn emit_file_open_event(
             if let Ok(path) =
                 bpf_probe_read_user_str_bytes(filename_ptr as *const u8, &mut (*e).path)
             {
+                if is_filtered_path(path) {
+                    return Ok(0);
+                }
                 (*e).path_len = path.len() as u16;
             }
         }
@@ -556,6 +584,9 @@ fn emit_file_delete_event(ctx: &TracePointContext, pathname_ptr: u64) -> Result<
             if let Ok(path) =
                 bpf_probe_read_user_str_bytes(pathname_ptr as *const u8, &mut (*e).path)
             {
+                if is_filtered_path(path) {
+                    return Ok(0);
+                }
                 (*e).path_len = path.len() as u16;
             }
         }
@@ -733,6 +764,9 @@ fn emit_file_rename_event(
             if let Ok(path) =
                 bpf_probe_read_user_str_bytes(oldname_ptr as *const u8, &mut (*e).old_path)
             {
+                if is_filtered_path(path) {
+                    return Ok(0);
+                }
                 (*e).old_path_len = path.len() as u16;
             }
         }
@@ -740,6 +774,9 @@ fn emit_file_rename_event(
             if let Ok(path) =
                 bpf_probe_read_user_str_bytes(newname_ptr as *const u8, &mut (*e).new_path)
             {
+                if is_filtered_path(path) {
+                    return Ok(0);
+                }
                 (*e).new_path_len = path.len() as u16;
             }
         }
@@ -881,6 +918,9 @@ fn emit_file_chmod_event(
             if let Ok(path) =
                 bpf_probe_read_user_str_bytes(filename_ptr as *const u8, &mut (*e).path)
             {
+                if is_filtered_path(path) {
+                    return Ok(0);
+                }
                 (*e).path_len = path.len() as u16;
             }
         }
@@ -1069,6 +1109,9 @@ fn emit_file_chown_event(
             if let Ok(path) =
                 bpf_probe_read_user_str_bytes(filename_ptr as *const u8, &mut (*e).path)
             {
+                if is_filtered_path(path) {
+                    return Ok(0);
+                }
                 (*e).path_len = path.len() as u16;
             }
         }
