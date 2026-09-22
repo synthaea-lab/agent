@@ -39,6 +39,7 @@ dependencies = [
  "sensor-linux-netlink",
  "sensor-linux-uprobes",
  "sensor-macos",
+ "sensor-macos-unifiedlog",
  "sensor-windows",
  "sensor-windows-eventlog",
  "serde",
@@ -2345,6 +2346,13 @@ version = "0.1.0"
 [[package]]
 name = "sensor-macos-unifiedlog"
 version = "0.1.0"
+dependencies = [
+ "schema",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+]
 
 [[package]]
 name = "sensor-windows"
