@@ -207,3 +207,41 @@ detection:
     let err = validate(&bad_modifier, "<t>").unwrap_err();
     assert!(err.to_string().contains("modifier `re`"), "{err}");
 }
+
+/// Robustness: patterns and haystacks are content-supplied (rules) and
+/// event-supplied (an attacker names its own processes and command lines) —
+/// the matcher must never panic, including on multibyte boundaries where a
+/// byte-indexed slice would.
+#[test]
+fn glob_match_never_panics_on_hostile_inputs() {
+    let hostile = [
+        "",
+        "*",
+        "**",
+        "*****************",
+        "*café*",
+        "état*",
+        "\u{FFFD}\u{202E}evil",
+        "a*b", // interior star: literal per the doc ("start/end only")
+        "\0null\0",
+        "𝕊𝕪𝕟𝕥𝕙𝕒𝕖𝕒",
+    ];
+    for pattern in hostile {
+        for haystack in hostile {
+            let _ = glob_match(haystack, pattern);
+        }
+    }
+    // Long inputs: the minimal matcher is contains/prefix/suffix — linear, but
+    // pin that a big haystack with a big pattern completes and doesn't panic.
+    let long_h = "x".repeat(64 * 1024);
+    let long_p = format!("*{}*", "y".repeat(1024));
+    assert!(!glob_match(&long_h, &long_p));
+}
+
+/// Interior `*` is documented as literal (start/end only) — pinned so a future
+/// "full glob" upgrade is a deliberate semantic change, not an accident.
+#[test]
+fn glob_match_interior_star_is_literal() {
+    assert!(glob_match("a*b", "a*b"));
+    assert!(!glob_match("axb", "a*b"));
+}
