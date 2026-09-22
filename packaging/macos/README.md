@@ -82,6 +82,14 @@ not an install-time postcondition.
 
 Scaffold + this document (issues #32/#33). Real `.pkg` build scripts,
 signing/notarization pipeline, and the beacon-scenario lab validation are
-the follow-up — they need the Developer ID + restricted entitlements
-(requested via <https://developer.apple.com/system-extensions/>), which is
-an organizational step, not a code one.
+the follow-up — they need the Developer ID + restricted entitlements, an
+organizational step, not a code one. **The Endpoint Security entitlement
+request was submitted to Apple on 2026-09-22** (via
+<https://developer.apple.com/system-extensions/>, describing the
+open-source EDR use case); the Network Extension content-filter/dns-proxy
+request is a separate form on the same page and is still to file. Until a
+grant lands, no provisioning profile on any machine can authorize the
+restricted entitlements — verified live: amfid SIGKILLs an ad-hoc-entitled
+binary at exec (error -424), before TCC, on a SIP-enabled host (see the
+dev-signing section of `docs/sensors/macos.md` for the lab-relaxation
+alternative).
