@@ -10,3 +10,10 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Ed25519 signature verification per ADR-0010 Decision 3 (algorithm from
+# ADR-0010, crate substitution to `ring` per ADR-0015 Decision 3 — already
+# a transitive dep via `rustls`).
+ring = { workspace = true }

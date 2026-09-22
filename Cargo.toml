@@ -140,6 +140,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # framing, `sync` for shutdown signaling, `macros` for `#[tokio::main]` /
 # `#[tokio::test]`.
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros"] }
+# Ed25519 signature verification for signed policy documents (ADR-0010) and
+# updater manifests (ADR-0015). `ring` chosen over `ed25519-dalek` because it
+# is already a transitive dep via `rustls`, avoiding a second signature
+# implementation in the workspace.
+ring = "0.17"
 # ONNX Runtime for on-device inference (ADR-0002). Pinned RC — ort 2.0 is the first
 # line to support the ai.onnx.ml tree ops our models use; used only by `crates/ml`.
 # Workspace config: default-features = false (no auto-download).

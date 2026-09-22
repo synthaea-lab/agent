@@ -4,6 +4,44 @@
 //! permitted, thresholds, per-host overrides. Policies are versioned and signed;
 //! distributed by the control plane, enforced by the agent — this crate holds the
 //! shared types and evaluation logic so both sides agree by construction.
+//!
+//! ## Two coexisting shapes (v1)
+//!
+//! - **Pre-ADR-0010 pure functions and flat structs** — the masquerade
+//!   helpers ([`is_trusted_system_path`], [`name_exclusion_applies`],
+//!   [`expected_parents`], [`parent_exclusion_applies`]) and the two flat
+//!   policy structs ([`EventLogPolicy`], [`ResponsePolicy`]) shipped before
+//!   there was a shared policy document. They stay: masquerade helpers are
+//!   compile-time truth (not distributed configuration), and the two flat
+//!   structs are the concrete state the agent's binaries consume today, kept
+//!   as-is per ADR-0010 §Consequences as a stepping stone.
+//! - **Post-ADR-0010 signed policy document** — [`Policy`],
+//!   [`PolicyMetadata`], [`PolicyPayload`] and the sections in [`document`],
+//!   with canonical JSON via [`to_canonical_bytes`], signature verification
+//!   via [`verify`], and layered override merge via [`apply_overrides`].
+//!   This is the on-the-wire format the (future) control plane and the
+//!   agent will exchange.
+//!
+//! Wiring `PolicyPayload.sensors.windows_eventlog` into the sensor's own
+//! `EventLogConfig` (replacing the `EventLogPolicy` glue in
+//! `agent/src/commands/windows.rs`) is a follow-up per ADR-0010
+//! §Consequences.
+
+pub mod canonical;
+pub mod document;
+pub mod error;
+pub mod merge;
+pub mod signature;
+
+pub use canonical::to_canonical_bytes;
+pub use document::{
+    ComplianceMode, ModelsSection, Policy, PolicyMetadata, PolicyPayload, RedactionPolicy,
+    ResponseSection, RulesSection, SensorSection, ThresholdsSection,
+    WindowsEventlogSensorPolicy, SCHEMA_VERSION,
+};
+pub use error::PolicyError;
+pub use merge::{apply_overrides, SAFETY_CRITICAL_PATHS};
+pub use signature::{sign, verify, PUBLIC_KEY_LEN_BYTES, SIGNATURE_LEN_BYTES};
 
 /// Directories only privileged installers write to — the gate for name-keyed
 /// detection exclusions. An exclusion list of process NAMES (`svchost.exe`,
