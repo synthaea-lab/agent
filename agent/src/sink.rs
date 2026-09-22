@@ -465,3 +465,231 @@ impl EventSink for BaselineSink {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex, atomic::Ordering};
+
+    use schema::{ConnectEvent, Event, EventMeta, ExecEvent, User, sensor::EventSink as _};
+
+    use super::DetectionSink;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sink-test-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sink_in(dir: &std::path::Path) -> Arc<DetectionSink> {
+        Arc::new(
+            DetectionSink::new(
+                rules::RuleState::new(),
+                &dir.join("alerts.ndjson"),
+                &dir.join("events.jsonl"),
+                None,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn alerts_in(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(dir.join("alerts.ndjson")).unwrap_or_default()
+    }
+
+    fn exec(pid: u32, cmdline: &str, image_path: &str) -> Event {
+        Event::Exec(ExecEvent {
+            meta: EventMeta {
+                pid,
+                ppid: 1,
+                user: User::Unix {
+                    uid: 1000,
+                    gid: 1000,
+                },
+                comm: "bash".into(),
+                ..schema::fixtures::meta()
+            },
+            image_path: image_path.into(),
+            cmdline: cmdline.into(),
+            ..schema::fixtures::exec()
+        })
+    }
+
+    /// The BAYES recipe from `correlator`'s own tests: a suspicious-path exec
+    /// plus repeated connects to a public address crosses the belief threshold.
+    fn drive_bayes_crossing(sink: &DetectionSink, pid: u32) {
+        sink.on_event(exec(
+            pid,
+            "malware.exe",
+            "C:\\Users\\solka\\AppData\\Roaming\\malware.exe",
+        ));
+        for i in 0..25u64 {
+            sink.on_event(Event::Connect(ConnectEvent {
+                meta: EventMeta {
+                    pid,
+                    timestamp_ns: (i + 1) * 100_000_000,
+                    ..schema::fixtures::meta()
+                },
+                daddr: std::net::IpAddr::V4(std::net::Ipv4Addr::new(185, 220, 101, 1)),
+                dport: 4444,
+            }));
+        }
+    }
+
+    #[test]
+    fn exec_rule_alert_reaches_the_alert_log() {
+        let dir = tmp("rule-alert");
+        let sink = sink_in(&dir);
+        sink.on_event(exec(
+            42,
+            "bash -c echo cGF5bG9hZAo= | base64 -d | sh",
+            "/bin/bash",
+        ));
+        let alerts = alerts_in(&dir);
+        assert!(
+            alerts.contains("T1059.004"),
+            "base64-decode rule must land in alerts.ndjson, got: {alerts}"
+        );
+    }
+
+    #[test]
+    fn progress_advances_once_per_fully_processed_event() {
+        let dir = tmp("progress");
+        let sink = sink_in(&dir);
+        let progress = sink.progress_handle();
+        assert_eq!(progress.load(Ordering::Relaxed), 0);
+        for i in 0..5 {
+            sink.on_event(exec(100 + i, "ls", "/bin/ls"));
+        }
+        assert_eq!(
+            progress.load(Ordering::Relaxed),
+            5,
+            "#102: real progress, one per event"
+        );
+    }
+
+    #[test]
+    fn bayes_crossing_without_response_hooks_alerts_but_never_kills() {
+        let dir = tmp("bayes-observe");
+        let sink = sink_in(&dir);
+        drive_bayes_crossing(&sink, 4242);
+        let alerts = alerts_in(&dir);
+        assert!(
+            alerts.contains("BAYES"),
+            "belief crossing must alert: {alerts}"
+        );
+        assert!(
+            !alerts.contains("RESPONSE-KILL"),
+            "no enable_response call means response stays entirely silent"
+        );
+    }
+
+    #[test]
+    fn bayes_crossing_with_kill_disabled_reports_observe_only() {
+        let dir = tmp("bayes-disabled");
+        let sink = sink_in(&dir);
+        let killed = Arc::new(Mutex::new(Vec::new()));
+        let killed_rec = Arc::clone(&killed);
+        sink.enable_response(
+            policy::ResponsePolicy {
+                kill_enabled: false,
+                quarantine_enabled: false,
+            },
+            move |pid| {
+                killed_rec.lock().unwrap().push(pid);
+                Ok(())
+            },
+            dir.join("quarantine"),
+        );
+        drive_bayes_crossing(&sink, 4243);
+        let alerts = alerts_in(&dir);
+        assert!(
+            alerts.contains("RESPONSE-KILL"),
+            "response path must report: {alerts}"
+        );
+        assert!(
+            alerts.contains("observe-only"),
+            "policy-off means observe-only: {alerts}"
+        );
+        assert!(
+            killed.lock().unwrap().is_empty(),
+            "terminate must never run with kill disabled"
+        );
+    }
+
+    #[test]
+    fn bayes_crossing_with_kill_enabled_calls_terminate_on_the_verdict_pid() {
+        let dir = tmp("bayes-kill");
+        let sink = sink_in(&dir);
+        let killed = Arc::new(Mutex::new(Vec::new()));
+        let killed_rec = Arc::clone(&killed);
+        sink.enable_response(
+            policy::ResponsePolicy {
+                kill_enabled: true,
+                quarantine_enabled: false,
+            },
+            move |pid| {
+                killed_rec.lock().unwrap().push(pid);
+                Ok(())
+            },
+            dir.join("quarantine"),
+        );
+        drive_bayes_crossing(&sink, 4244);
+        let alerts = alerts_in(&dir);
+        assert!(
+            alerts.contains("killed pid 4244"),
+            "kill outcome must be recorded in alerts: {alerts}"
+        );
+        assert_eq!(
+            *killed.lock().unwrap(),
+            vec![4244],
+            "the injected terminate runs, exactly once"
+        );
+    }
+
+    #[test]
+    fn events_and_spool_receive_the_raw_event_via_the_enrich_worker() {
+        let dir = tmp("spool");
+        let spool_dir = dir.join("spool");
+        let spool = Arc::new(Mutex::new(
+            store::EventSpool::open(&spool_dir, u64::MAX).unwrap(),
+        ));
+        let sink = Arc::new(
+            DetectionSink::new(
+                rules::RuleState::new(),
+                &dir.join("alerts.ndjson"),
+                &dir.join("events.jsonl"),
+                Some(Arc::clone(&spool)),
+            )
+            .unwrap(),
+        );
+        sink.on_event(exec(7, "ls", "/bin/ls"));
+
+        // The raw write and the spool append run on the enrich worker — wait.
+        let mut spooled: Vec<Event> = Vec::new();
+        for _ in 0..200 {
+            spooled = spool.lock().unwrap().drain_oldest().unwrap();
+            if !spooled.is_empty() {
+                break;
+            }
+            // Segment may be in-flight from the empty drain — put it back.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(spooled.len(), 1, "the event must reach the transport spool");
+        let events_log = std::fs::read_to_string(dir.join("events.jsonl")).unwrap_or_default();
+        assert!(
+            events_log.contains("/bin/ls"),
+            "raw event log written off-thread"
+        );
+    }
+
+    /// A counting sink for wiring tests elsewhere would go through `EventSink`;
+    /// this pins that `DetectionSink` is object-safe behind the same trait the
+    /// sensors use (compile-time check, the assertion is incidental).
+    #[test]
+    fn detection_sink_is_usable_as_a_trait_object() {
+        let dir = tmp("dyn");
+        let sink: Arc<dyn schema::sensor::EventSink> = sink_in(&dir);
+        sink.on_event(exec(9, "true", "/bin/true"));
+    }
+}
