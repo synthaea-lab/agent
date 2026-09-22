@@ -291,6 +291,46 @@ pub enum Signature {
     Unsupported,
 }
 
+// Standard POSIX open(2) flag values, stable across the Linux architectures this
+// project supports (x86_64, aarch64). Defined here rather than via `libc`:
+// `FileOpenEvent::flags` is platform-native and these are the Linux values; a
+// `libc` dependency would drag platform quirks (no `O_ACCMODE` on Windows) into
+// the boundary crate that must compile everywhere.
+/// `open(2)` access-mode mask (`flags & O_ACCMODE` is one of `O_RDONLY`=0,
+/// [`O_WRONLY`], [`O_RDWR`] — a 2-bit field, not independent bits).
+pub const O_ACCMODE: u32 = 0o3;
+/// `open(2)` write-only access mode.
+pub const O_WRONLY: u32 = 0o1;
+/// `open(2)` read-write access mode.
+pub const O_RDWR: u32 = 0o2;
+/// `open(2)` create-if-absent flag.
+pub const O_CREAT: u32 = 0o100;
+
+/// Write intent on [`FileOpenEvent::flags`]: a write access mode, or creation
+/// (`O_CREAT` — creating a file is write intent even with `O_RDONLY`).
+///
+/// The ONE definition of this predicate. It used to exist five times (rules,
+/// correlator, `crates/ml`, and two Python mirrors) with two different
+/// semantics — an access-mode comparison vs. a bitmask-any — which classified
+/// `flags = 0o3` differently, so the rule engine and the correlator could
+/// disagree about the same event. The access-mode comparison is canonical
+/// because it is what the kernel does: the access mode is a 2-bit *field*
+/// (`O_ACCMODE`), not independent bits, and the `0o3` combination is invalid —
+/// `open(2)` refuses it with `EINVAL`, so no write can result and counting it
+/// would let crafted always-failing opens inflate behavioral write counts.
+/// The Python mirrors (`synthaea_ml.features.correlation._is_file_write`,
+/// `behavior._is_write`) must match this exactly — parity-tested against
+/// shared fixtures.
+///
+/// Lives in `schema` deliberately: a pure helper on a field this crate
+/// defines, additive to the semi-frozen surface (no serialization impact),
+/// and the only crate every consumer of `flags` may depend on.
+#[must_use]
+pub fn has_write_intent(flags: u32) -> bool {
+    let access_mode = flags & O_ACCMODE;
+    access_mode == O_WRONLY || access_mode == O_RDWR || (flags & O_CREAT) != 0
+}
+
 /// File open/create.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileOpenEvent {
@@ -892,5 +932,46 @@ impl Event {
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.
         }
+    }
+}
+
+#[cfg(test)]
+mod write_intent_tests {
+    use super::has_write_intent;
+
+    #[test]
+    fn write_access_modes_are_write_intent() {
+        assert!(has_write_intent(super::O_WRONLY));
+        assert!(has_write_intent(super::O_RDWR));
+        assert!(has_write_intent(
+            super::O_WRONLY | 0o2000 /* O_APPEND */
+        ));
+    }
+
+    #[test]
+    fn creat_is_write_intent_even_with_rdonly() {
+        // Creating a file mutates the filesystem regardless of the access mode.
+        assert!(has_write_intent(super::O_CREAT));
+    }
+
+    #[test]
+    fn rdonly_is_not_write_intent() {
+        assert!(!has_write_intent(0));
+        assert!(!has_write_intent(
+            0o2000 /* O_APPEND alone — no write mode */
+        ));
+    }
+
+    #[test]
+    fn invalid_accmode_combo_is_not_write_intent() {
+        // The divergence that motivated unifying the five copies: 0o3 sets both
+        // access-mode bits, which open(2) refuses with EINVAL — no write can
+        // result, so the bitmask-any copies that counted it were wrong. Pinned
+        // so the semantics never fork again.
+        assert!(!has_write_intent(0o3));
+        assert!(
+            has_write_intent(0o3 | super::O_CREAT),
+            "creation still counts"
+        );
     }
 }

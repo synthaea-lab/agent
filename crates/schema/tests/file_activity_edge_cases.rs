@@ -130,12 +130,12 @@ fn file_rename_unicode() {
 fn file_write_large_byte_counts() {
     // Boundary conditions for bytes_requested (u64).
     let test_cases = vec![
-        0,                           // Zero-byte write (valid syscall, e.g., touch)
-        1,                           // Single byte
-        4096,                        // Typical page size
-        1024 * 1024,                 // 1 MB
-        1024 * 1024 * 1024,          // 1 GB (large but realistic for video/DB)
-        u64::MAX,                    // Maximum (unrealistic but must not overflow)
+        0,                  // Zero-byte write (valid syscall, e.g., touch)
+        1,                  // Single byte
+        4096,               // Typical page size
+        1024 * 1024,        // 1 MB
+        1024 * 1024 * 1024, // 1 GB (large but realistic for video/DB)
+        u64::MAX,           // Maximum (unrealistic but must not overflow)
     ];
 
     for bytes in test_cases {
@@ -160,13 +160,13 @@ fn file_write_large_byte_counts() {
 fn file_write_fd_boundary() {
     // File descriptors: typical range 0-1023, but kernel allows up to ~1M.
     let test_cases = vec![
-        0,             // stdin (valid write target on Linux)
-        1,             // stdout
-        2,             // stderr
-        3,             // First user fd
-        1023,          // Typical ulimit default
-        65535,         // Large but realistic (servers with high fd limits)
-        u32::MAX,      // Maximum (unrealistic but must not break)
+        0,        // stdin (valid write target on Linux)
+        1,        // stdout
+        2,        // stderr
+        3,        // First user fd
+        1023,     // Typical ulimit default
+        65535,    // Large but realistic (servers with high fd limits)
+        u32::MAX, // Maximum (unrealistic but must not break)
     ];
 
     for fd in test_cases {

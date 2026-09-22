@@ -5,16 +5,12 @@
 
 use schema::Event;
 
-/// Write intent on a `FileOpen` (`O_WRONLY`, `O_RDWR` or `O_CREAT`) — `false` for the
-/// other variants. Only place in the crate where this bit test exists (the T1105
-/// rules and the behavioral vector go through here); `crates/ml`'s correlation
-/// features and `ml/`'s behavior features carry its mirror.
+/// Write intent on a `FileOpen` — `false` for the other variants. The flag
+/// semantics live in [`schema::has_write_intent`] (this crate used to carry a
+/// drifted bitmask copy that disagreed with `rules` on invalid access modes).
 pub(crate) fn is_file_write(event: &Event) -> bool {
-    const O_WRONLY: u32 = 0o1;
-    const O_RDWR: u32 = 0o2;
-    const O_CREAT: u32 = 0o100;
     match event {
-        Event::FileOpen(f) => f.flags & (O_WRONLY | O_RDWR | O_CREAT) != 0,
+        Event::FileOpen(f) => schema::has_write_intent(f.flags),
         _ => false,
     }
 }

@@ -16,8 +16,7 @@
 //! do have a documented default value use `#[serde(default = "...")]` so
 //! the template stays short without making the type ambiguous.
 
-use std::path::PathBuf;
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use serde::Deserialize;
 
@@ -131,7 +130,10 @@ pub struct ResourcesConfig {
     /// reconnection attempts to the control plane. Deserialized as an
     /// integer to keep the file format machine-parseable across languages;
     /// exposed as a [`Duration`] via [`Self::max_reconnect_backoff`].
-    #[serde(default = "default_reconnect_backoff_ms", rename = "max_reconnect_backoff_ms")]
+    #[serde(
+        default = "default_reconnect_backoff_ms",
+        rename = "max_reconnect_backoff_ms"
+    )]
     pub max_reconnect_backoff_ms: u64,
 }
 
