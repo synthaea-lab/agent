@@ -31,7 +31,12 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
 - Core crates compile on all three OSes; CI tests ubuntu/windows/macos and clippy runs
   with `-D warnings`.
 - Platform-specific code (`#[cfg(target_os = ...)]`, platform-only deps) is allowed
-  **only inside `crates/sensors/*`** — sensor crates compile to empty stubs elsewhere.
+  **only inside `crates/sensors/*` and `crates/updater`** — both compile to empty
+  stubs elsewhere. `updater`'s exception is scoped narrowly: ADR-0015 is a
+  Linux-first slice (the `bootstrap`/`current`/`versions` layout and its atomic
+  symlink swap are POSIX-shaped by nature), and Windows/macOS self-update need
+  their own design before they get a stub worth writing (ADR-0015 Deferred) — this
+  is not a general invitation for leaf crates to grow platform branches.
   Platform deps must be target-gated: `[target.'cfg(windows)'.dependencies]`, never
   unconditional.
 - `crates/sensors/linux-ebpf` is excluded from the workspace (special toolchain, GPLv2);
