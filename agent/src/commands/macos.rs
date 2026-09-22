@@ -86,15 +86,69 @@ fn spawn_unifiedlog_tail(sink: Arc<dyn EventSink>) -> Option<std::process::Child
     Some(child)
 }
 
-/// Runs the ES sensor (blocking, on the calling thread) and the unified-log
-/// tail (background thread) against the same sink, with Ctrl-C wired to stop
-/// both.
+/// Where the `NetworkExtension` providers' event pipe lives (issue #33). The
+/// Swift extension reconnects here whenever the OS (re)starts it — see
+/// `sensor-macos-network-extension`'s crate doc and `packaging/macos` for the
+/// app-group placement this default stands in for until the packaged bundle
+/// exists.
+const NE_SOCKET_PATH: &str = "/var/run/synthaea-ne.sock";
+
+/// Spawns the background thread that accepts `NetworkExtension` connections
+/// and pumps normalized flow/DNS events into the shared sink. Supplementary
+/// source, same non-fatal posture as the unified-log tail: without the
+/// packaged system extension nothing ever connects, and binding may fail
+/// unprivileged — both are logged, never fatal. The accept loop lives for
+/// the process (torn down at exit with everything else).
+fn spawn_network_extension_receiver(sink: Arc<dyn EventSink>) {
+    let listener =
+        match sensor_macos_network_extension::listen(std::path::Path::new(NE_SOCKET_PATH)) {
+            Ok(listener) => listener,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = NE_SOCKET_PATH,
+                    "network-extension receiver: cannot bind, skipping (flow/DNS \
+                     telemetry off)"
+                );
+                return;
+            }
+        };
+    std::thread::Builder::new()
+        .name("ne-receiver".into())
+        .spawn(move || {
+            let result = sensor_macos_network_extension::accept_loop(&listener, |conn| {
+                let stream = sensor_macos_network_extension::NormalizedNeStream::new(
+                    std::io::BufReader::new(conn),
+                );
+                for item in stream {
+                    match item {
+                        Ok(event) => sink.on_event(event),
+                        Err(e) => {
+                            // One connection ended (extension restarted by
+                            // the OS) — back to accept for the reconnect.
+                            tracing::debug!(error = %e, "network-extension connection ended");
+                            break;
+                        }
+                    }
+                }
+            });
+            if let Err(e) = result {
+                tracing::warn!(error = %e, "network-extension receiver stopped");
+            }
+        })
+        .expect("spawning the network-extension receiver thread");
+}
+
+/// Runs the ES sensor (blocking, on the calling thread), the unified-log
+/// tail, and the `NetworkExtension` receiver (background threads) against the
+/// same sink, with Ctrl-C wired to stop the lot.
 fn run_macos_sensors(sink: Box<dyn EventSink>) -> anyhow::Result<()> {
     let sink: Arc<dyn EventSink> = Arc::from(sink);
 
     let mut sensor = sensor_macos::MacosSensor::new();
     let stop = sensor.stop_handle();
 
+    spawn_network_extension_receiver(Arc::clone(&sink));
     let log_child = spawn_unifiedlog_tail(Arc::clone(&sink));
     let log_child = std::sync::Mutex::new(log_child);
 
@@ -119,6 +173,7 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
     println!("Synthaea agent — platform: macOS");
     println!("Sensors: EndpointSecurity (exec + file + BTM launch-item persistence)");
     println!("         unified-log tail (sudo auth, TCC decisions, Gatekeeper verdicts)");
+    println!("         NetworkExtension receiver (flows + DNS, when the extension is installed)");
     println!(
         "Requires: root, the com.apple.developer.endpoint-security.client entitlement, \
          and Full Disk Access (see docs/sensors/macos.md)."
