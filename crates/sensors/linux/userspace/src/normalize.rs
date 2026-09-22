@@ -7,8 +7,8 @@
 
 use schema::{
     ConnectEvent, ContainerContext, Event, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent,
-    FileDeleteEvent, FileOpenEvent, FileRenameEvent, FileWriteEvent, SocketBindEvent,
-    UdpSendEvent, User,
+    FileDeleteEvent, FileOpenEvent, FileRenameEvent, FileWriteEvent, SocketBindEvent, UdpSendEvent,
+    User,
 };
 use sensor_linux_wire as wire;
 
