@@ -29,10 +29,10 @@ use core::net::{IpAddr, Ipv4Addr};
 
 use crate::{
     AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, ConnectEvent, DnsQueryEvent, EventMeta,
-    ExecEvent, FileDeleteEvent, FileOpenEvent, FileRenameEvent, FileWriteEvent, ImageLoadEvent,
-    ListenPortEvent, NetworkFlowEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
-    ShellType, SmbConnectEvent, SocketBindEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
-    UdpSendEvent, User, WmiActivityEvent,
+    ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent, FileRenameEvent,
+    FileWriteEvent, ImageLoadEvent, ListenPortEvent, NetworkFlowEvent, ReadlineInputEvent,
+    RegistrySetEvent, ScriptBlockEvent, ShellType, SmbConnectEvent, SocketBindEvent,
+    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -270,5 +270,26 @@ pub fn socket_bind() -> SocketBindEvent {
         meta: meta(),
         local_addr: TEST_ADDR,
         local_port: 0,
+    }
+}
+
+/// Neutral [`FileChmodEvent`].
+#[must_use]
+pub fn file_chmod() -> FileChmodEvent {
+    FileChmodEvent {
+        meta: meta(),
+        path: String::new(),
+        mode: 0,
+    }
+}
+
+/// Neutral [`FileChownEvent`].
+#[must_use]
+pub fn file_chown() -> FileChownEvent {
+    FileChownEvent {
+        meta: meta(),
+        path: String::new(),
+        uid: 0,
+        gid: 0,
     }
 }

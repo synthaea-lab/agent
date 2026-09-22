@@ -6,8 +6,8 @@
 //! once at startup and passes it here so schema timestamps are epoch nanoseconds.
 
 use schema::{
-    ConnectEvent, ContainerContext, Event, EventMeta, ExecEvent, FileDeleteEvent, FileOpenEvent,
-    FileRenameEvent, FileWriteEvent, SocketBindEvent, User,
+    ConnectEvent, ContainerContext, Event, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent,
+    FileDeleteEvent, FileOpenEvent, FileRenameEvent, FileWriteEvent, SocketBindEvent, User,
 };
 use sensor_linux_wire as wire;
 
@@ -24,7 +24,11 @@ use sensor_linux_wire as wire;
 ///
 /// v7 (#263) added `SocketBindEvent` — new `socket_bind` mapping function below,
 /// same address-family logic as `connect`; no existing mapping changed shape.
-const _: () = assert!(wire::WIRE_VERSION == 7);
+///
+/// v8 (#262 Phase 2) added `FileChmodEvent`/`FileChownEvent` — new mapping functions
+/// `file_chmod`/`file_chown` added below, same path-decoding shape as `file_delete`;
+/// no existing mapping changed shape.
+const _: () = assert!(wire::WIRE_VERSION == 8);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
@@ -153,6 +157,37 @@ pub fn file_rename(
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
         old_path: String::from_utf8_lossy(&old_raw[..old_end]).into_owned(),
         new_path: String::from_utf8_lossy(&new_raw[..new_end]).into_owned(),
+    })
+}
+
+#[must_use]
+pub fn file_chmod(
+    event: &wire::FileChmodEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    let raw = &event.path[..(event.path_len as usize).min(wire::MAX_PATH_LEN)];
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    Event::FileChmod(FileChmodEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        path: String::from_utf8_lossy(&raw[..end]).into_owned(),
+        mode: event.mode,
+    })
+}
+
+#[must_use]
+pub fn file_chown(
+    event: &wire::FileChownEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    let raw = &event.path[..(event.path_len as usize).min(wire::MAX_PATH_LEN)];
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    Event::FileChown(FileChownEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        path: String::from_utf8_lossy(&raw[..end]).into_owned(),
+        uid: event.uid,
+        gid: event.gid,
     })
 }
 
@@ -445,6 +480,44 @@ mod tests {
         };
         assert_eq!(e.old_path, "/home/user/invoice.pdf");
         assert_eq!(e.new_path, "/home/user/invoice.pdf.locked");
+    }
+
+    #[test]
+    fn file_chmod_carries_mode_and_trims_nul_padding() {
+        let mut path = [0u8; wire::MAX_PATH_LEN];
+        let raw = b"/tmp/backdoor\0";
+        path[..raw.len()].copy_from_slice(raw);
+        let event = wire::FileChmodEvent {
+            meta: wire_meta(b"chmod"),
+            path,
+            path_len: raw.len() as u16,
+            mode: 0o4755,
+        };
+        let Event::FileChmod(e) = file_chmod(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.path, "/tmp/backdoor");
+        assert_eq!(e.mode, 0o4755);
+    }
+
+    #[test]
+    fn file_chown_carries_uid_and_gid_distinctly() {
+        let mut path = [0u8; wire::MAX_PATH_LEN];
+        let raw = b"/tmp/backdoor\0";
+        path[..raw.len()].copy_from_slice(raw);
+        let event = wire::FileChownEvent {
+            meta: wire_meta(b"chown"),
+            path,
+            path_len: raw.len() as u16,
+            uid: 0,
+            gid: 1000,
+        };
+        let Event::FileChown(e) = file_chown(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.path, "/tmp/backdoor");
+        assert_eq!(e.uid, 0);
+        assert_eq!(e.gid, 1000);
     }
 
     #[test]

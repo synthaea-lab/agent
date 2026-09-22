@@ -49,7 +49,12 @@ extern crate std;
 ///   `listen(2)` (no address, just `fd`+`backlog`) and `accept(2)`/`accept4(2)`
 ///   (needs a `sys_exit` probe to read the kernel-filled peer address — a new
 ///   probe shape this crate doesn't have yet) are deliberately deferred.
-pub const WIRE_VERSION: u32 = 7;
+/// - v8: `FileChmodEvent`/`FileChownEvent` added (issue #262 Phase 2) —
+///   `chmod(2)`/`fchmodat(2)` and `chown(2)`/`lchown(2)`/`fchownat(2)`. All five
+///   read a real path argument, unlike `FileWriteEvent`. `fchmod(2)`/`fchown(2)`
+///   (fd-only, no path) are deferred the same way `write(2)`'s fd-only shape was
+///   handled: a future addition, not a silent gap.
+pub const WIRE_VERSION: u32 = 8;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
@@ -161,6 +166,37 @@ pub struct FileRenameEvent {
     pub old_path_len: u16,
     pub new_path: [u8; MAX_PATH_LEN],
     pub new_path_len: u16,
+}
+
+/// File permission change (`syscalls:sys_enter_chmod`/`sys_enter_fchmodat`, issue #262
+/// Phase 2). `path` is the raw path passed by the caller, not resolved against `dfd` —
+/// same known limitation as `FileOpenEvent::path`. `fchmod(2)` (fd-only) is deferred.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FileChmodEvent {
+    pub meta: EventMeta,
+    pub path: [u8; MAX_PATH_LEN],
+    pub path_len: u16,
+    /// The requested mode bits (`umode_t`), truncated to 32 bits — the tracepoint
+    /// promotes it to 8 bytes on the wire but only the low 16 bits are ever
+    /// meaningful (permission bits plus setuid/setgid/sticky).
+    pub mode: u32,
+}
+
+/// File ownership change (`syscalls:sys_enter_chown`/`sys_enter_lchown`/
+/// `sys_enter_fchownat`, issue #262 Phase 2). `path` is the raw path passed by the
+/// caller, not resolved against `dfd` — same known limitation as
+/// `FileOpenEvent::path`. `fchown(2)` (fd-only) is deferred. `uid`/`gid` of
+/// `(uid_t)-1`/`(gid_t)-1` (i.e. `u32::MAX`) mean "leave unchanged" per `chown(2)`'s
+/// own semantics — passed through as-is, not specially interpreted here.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FileChownEvent {
+    pub meta: EventMeta,
+    pub path: [u8; MAX_PATH_LEN],
+    pub path_len: u16,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 /// Outbound network connection (`syscalls:sys_enter_connect`, `AF_INET/AF_INET6` only).
