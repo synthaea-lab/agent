@@ -15,7 +15,8 @@ use aya_log_ebpf::{info, warn};
 use sensor_linux_wire::{
     ConnectEvent, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent,
     FileRenameEvent, FileWriteEvent, LineageEntry, MAX_TLS_CAPTURE, ReadlineInputEvent,
-    SocketBindEvent, SocketListenEvent, TASK_COMM_LEN, TlsCaptureEvent, UdpSendEvent,
+    SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TASK_COMM_LEN, TlsCaptureEvent,
+    UdpSendEvent,
 };
 
 // This probe reads NO `task_struct`/`mm_struct` frozen offset: parent lineage (ppid +
@@ -1558,6 +1559,215 @@ fn try_sys_enter_sendto(ctx: TracePointContext) -> Result<u32, u32> {
             warn!(
                 &ctx,
                 "sensor-linux-ebpf: ring buffer full, dropping udp send event"
+            );
+        }
+    }
+
+    Ok(0)
+}
+
+// --- Socket accept (issue #263 Phase 2) -----------------------------------------
+//
+// First paired sys_enter/sys_exit probe in this crate. Every other probe here is
+// sys_enter_*: it reads syscall arguments before the call runs, which is enough
+// because the kernel hasn't touched anything yet. accept(2)/accept4(2) are
+// different — the caller passes a sockaddr buffer that the kernel fills in DURING
+// the call, so the peer address does not exist yet at sys_enter time. The standard
+// sys_exit_* tracepoint format carries only __syscall_nr and the return value, not
+// the original arguments, so sys_enter_accept{,4} stashes the caller's
+// (fd, addr_ptr) in ACCEPT_ARGS (keyed by pid_tgid, the same entry/exit
+// correlation pattern already used by the uprobes crate's SSL_READ_ARGS for
+// SSL_read's output buffer), and sys_exit_accept{,4} reads it back once the kernel
+// has actually written the peer address.
+
+/// Ring buffer shared with userspace for `accept`/`accept4` events.
+#[map]
+static SOCKET_ACCEPT_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Per-CPU scratch for building one `SocketAcceptEvent` (see `EXEC_SCRATCH`).
+#[map]
+static ACCEPT_SCRATCH: PerCpuArray<SocketAcceptEvent> = PerCpuArray::with_max_entries(1, 0);
+
+/// Stashed at `sys_enter_accept{,4}`, consumed at `sys_exit_accept{,4}`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AcceptArgs {
+    fd: u32,
+    addr_ptr: u64,
+}
+
+/// Correlates `sys_enter_accept{,4}` with its matching `sys_exit_accept{,4}` on the
+/// same thread. Not part of `sensor-linux-wire`'s ABI (never read by userspace).
+/// A thread that enters `accept()` and never returns (blocked forever, or the
+/// process is killed mid-call) leaks its entry — same accepted risk as
+/// `SSL_READ_ARGS`, bounded by `max_entries`, not explicitly swept.
+#[map]
+static ACCEPT_ARGS: HashMap<u64, AcceptArgs> = HashMap::with_max_entries(1024, 0);
+
+/// Offsets of the `syscalls:sys_enter_accept`/`sys_enter_accept4` tracepoints
+/// (x86_64/aarch64): `fd`(16), `upeer_sockaddr`(24) — identical shape for both
+/// (accept4's extra `flags` argument trails at 40, not needed here). Verified on
+/// 2026-09-22 on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// `/sys/kernel/tracing/events/syscalls/sys_enter_accept{,4}/format`.
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const ACCEPT_FD_OFFSET: usize = 16;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const ACCEPT_ADDR_PTR_OFFSET: usize = 24;
+/// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
+#[cfg(bpf_target_arch = "x86")]
+const ACCEPT_FD_OFFSET: usize = 12;
+#[cfg(bpf_target_arch = "x86")]
+const ACCEPT_ADDR_PTR_OFFSET: usize = 16;
+
+/// Offset of `ret` in every `sys_exit_*` tracepoint (x86_64/aarch64): 8-byte common
+/// header + `__syscall_nr`(4, +4 padding) + `ret`(8, signed). Verified on
+/// 2026-09-22 on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// `/sys/kernel/tracing/events/syscalls/sys_exit_accept{,4}/format` — identical for
+/// both.
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const SYS_EXIT_RET_OFFSET: usize = 16;
+/// i686: `ret` is a packed 4-byte `long`, not independently verified (see
+/// `sys_enter_open`'s i686 note for the same packed-layout reasoning).
+#[cfg(bpf_target_arch = "x86")]
+const SYS_EXIT_RET_OFFSET: usize = 12;
+
+#[tracepoint]
+pub fn sys_enter_accept(ctx: TracePointContext) -> u32 {
+    match stash_accept_args(&ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+#[tracepoint]
+pub fn sys_enter_accept4(ctx: TracePointContext) -> u32 {
+    match stash_accept_args(&ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+/// Shared by `sys_enter_accept` and `sys_enter_accept4` — both have the same
+/// `fd`/`upeer_sockaddr` layout.
+fn stash_accept_args(ctx: &TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let fd: u64 = unsafe { ctx.read_at(ACCEPT_FD_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let fd: u64 = unsafe { ctx.read_at::<u32>(ACCEPT_FD_OFFSET).map_err(|_| 1u32)? as u64 };
+
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let addr_ptr: u64 = unsafe { ctx.read_at(ACCEPT_ADDR_PTR_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let addr_ptr: u64 = unsafe {
+        ctx.read_at::<u32>(ACCEPT_ADDR_PTR_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
+
+    if addr_ptr != 0 {
+        let pid_tgid = bpf_get_current_pid_tgid();
+        let args = AcceptArgs {
+            fd: fd as u32,
+            addr_ptr,
+        };
+        let _ = ACCEPT_ARGS.insert(&pid_tgid, &args, 0);
+    }
+
+    Ok(0)
+}
+
+#[tracepoint]
+pub fn sys_exit_accept(ctx: TracePointContext) -> u32 {
+    match try_sys_exit_accept(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+#[tracepoint]
+pub fn sys_exit_accept4(ctx: TracePointContext) -> u32 {
+    match try_sys_exit_accept(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+/// Shared by `sys_exit_accept` and `sys_exit_accept4`. No-ops (returns `Ok(0)`
+/// without emitting) when: the matching `sys_enter` wasn't tracked (NULL addr, or
+/// `ACCEPT_ARGS` was full), the call failed (`ret < 0`), or the peer's address
+/// family isn't one this sensor tracks.
+fn try_sys_exit_accept(ctx: TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let ret: i64 = unsafe { ctx.read_at(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let ret: i64 = unsafe { ctx.read_at::<i32>(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? as i64 };
+
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let args = match unsafe { ACCEPT_ARGS.get(&pid_tgid) } {
+        Some(a) => *a,
+        None => return Ok(0),
+    };
+    let _ = ACCEPT_ARGS.remove(&pid_tgid);
+
+    if ret < 0 {
+        return Ok(0);
+    }
+    let accepted_fd = ret as u32;
+
+    let family: u16 = match unsafe { bpf_probe_read_user(args.addr_ptr as *const u16) } {
+        Ok(f) => f,
+        Err(_) => return Ok(0),
+    };
+    if family != AF_INET && family != AF_INET6 {
+        return Ok(0);
+    }
+
+    let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
+    let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
+
+    let port_be: u16 =
+        unsafe { bpf_probe_read_user((args.addr_ptr + 2) as *const u16).map_err(|_| 1u32)? };
+    let (v4, v6): ([u8; 4], [u8; 16]) = if family == AF_INET {
+        (
+            unsafe {
+                bpf_probe_read_user((args.addr_ptr + 4) as *const [u8; 4]).map_err(|_| 1u32)?
+            },
+            [0u8; 16],
+        )
+    } else {
+        ([0u8; 4], unsafe {
+            bpf_probe_read_user((args.addr_ptr + 8) as *const [u8; 16]).map_err(|_| 1u32)?
+        })
+    };
+
+    let e = ACCEPT_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
+    unsafe {
+        core::ptr::write_bytes(e, 0, 1);
+
+        (*e).meta.pid = (pid_tgid >> 32) as u32;
+        (*e).meta.ppid = lineage_ppid();
+        (*e).meta.uid = uid_gid as u32;
+        (*e).meta.gid = (uid_gid >> 32) as u32;
+        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
+        let mut i = 0usize;
+        while i < TASK_COMM_LEN {
+            (*e).meta.comm[i] = comm[i];
+            i += 1;
+        }
+        (*e).listen_fd = args.fd;
+        (*e).accepted_fd = accepted_fd;
+        (*e).peer_addr_v4 = v4;
+        (*e).peer_addr_v6 = v6;
+        (*e).peer_port = u16::from_be(port_be);
+        (*e).is_ipv6 = family == AF_INET6;
+
+        if SOCKET_ACCEPT_EVENTS
+            .output::<SocketAcceptEvent>(&*e, 0)
+            .is_err()
+        {
+            warn!(
+                &ctx,
+                "sensor-linux-ebpf: ring buffer full, dropping accept event"
             );
         }
     }

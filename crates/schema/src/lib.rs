@@ -89,7 +89,11 @@ pub mod time;
 /// Bumped 17 → 18 for [`Event::SocketListen`] (#263 Phase 2): one new enum variant
 /// for discrete, real-time `listen(2)` telemetry on Linux. Same reasoning as
 /// v13-v17.
-pub const SCHEMA_VERSION: u32 = 18;
+///
+/// Bumped 18 → 19 for [`Event::SocketAccept`] (#263 Phase 2): one new enum variant
+/// for `accept(2)`/`accept4(2)` telemetry (the peer address of a newly accepted
+/// connection) on Linux. Same reasoning as v13-v18.
+pub const SCHEMA_VERSION: u32 = 19;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -474,8 +478,8 @@ pub struct FileChownEvent {
 /// Distinct from [`ListenPortEvent`], which is a periodic poll snapshot from
 /// `sensor-linux-netlink`: this fires once, at the `bind(2)` call itself, and does
 /// NOT imply `listen(2)` followed — a UDP socket, or a TCP socket bound but never
-/// listened, binds too. See [`SocketListenEvent`] for the `listen(2)` counterpart;
-/// `accept(2)`/`accept4(2)` are still deliberately not captured (see
+/// listened, binds too. See [`SocketListenEvent`] for the `listen(2)` counterpart
+/// and [`SocketAcceptEvent`] for the `accept(2)`/`accept4(2)` counterpart (see
 /// `sensor-linux-wire::SocketBindEvent`'s doc for why).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SocketBindEvent {
@@ -503,6 +507,24 @@ pub struct SocketListenEvent {
     /// The caller's requested backlog — a small value (e.g. 1) on an otherwise
     /// unremarkable listener can itself be a signal.
     pub backlog: u32,
+}
+
+/// Socket accept (issue #263 Phase 2): `accept(2)`/`accept4(2)` completing — a
+/// discrete, real-time trace of a listening socket accepting a new connection,
+/// carrying the PEER's address (the connecting client), not the local one. Only
+/// emitted on success — a failed `accept()` has no peer to report. See
+/// `sensor-linux-wire::SocketAcceptEvent`'s doc for the `sys_enter`/`sys_exit`
+/// correlation this event depends on (the peer address doesn't exist until the
+/// kernel-side call returns).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocketAcceptEvent {
+    pub meta: EventMeta,
+    /// The listening socket's fd (`accept`/`accept4`'s first argument).
+    pub listen_fd: u32,
+    /// The newly accepted connection's fd (`accept`/`accept4`'s return value).
+    pub accepted_fd: u32,
+    pub peer_addr: core::net::IpAddr,
+    pub peer_port: u16,
 }
 
 /// DNS resolution — the query name and answer, joined to the resolving process.
@@ -956,6 +978,7 @@ pub enum Event {
     FileChmod(FileChmodEvent),
     FileChown(FileChownEvent),
     SocketListen(SocketListenEvent),
+    SocketAccept(SocketAcceptEvent),
 }
 
 impl Event {
@@ -990,6 +1013,7 @@ impl Event {
             Event::FileChmod(e) => &e.meta,
             Event::FileChown(e) => &e.meta,
             Event::SocketListen(e) => &e.meta,
+            Event::SocketAccept(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.

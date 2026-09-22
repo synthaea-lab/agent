@@ -13,8 +13,8 @@ use schema::{
     EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent,
     FileRenameEvent, FileWriteEvent, ImageLoadEvent, ListenPortEvent, NetworkFlowEvent,
     ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType, SmbConnectEvent,
-    SocketBindEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
-    UdpSendEvent, User, WmiActivityEvent,
+    SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection,
+    TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -799,6 +799,29 @@ fn socket_listen_unresolved_golden() {
 }
 
 #[test]
+fn socket_accept_golden() {
+    // v19 (#263 Phase 2): peer address of a newly accepted connection — an
+    // attacker's IP connecting to a listening backdoor.
+    assert_golden(
+        &Event::SocketAccept(SocketAcceptEvent {
+            meta: EventMeta {
+                pid: 8004,
+                ppid: 8000,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_018_000_000_000,
+                comm: "nc".into(),
+                container: None,
+            },
+            listen_fd: 3,
+            accepted_fd: 4,
+            peer_addr: "203.0.113.42".parse().unwrap(),
+            peer_port: 54321,
+        }),
+        "socket_accept",
+    );
+}
+
+#[test]
 fn unbounded_cmdline_survives() {
     // Audit F-4: multi-kilobyte encoded command lines must round-trip untouched.
     let long = format!("powershell.exe -EncodedCommand {}", "A".repeat(8 * 1024));
@@ -1025,6 +1048,13 @@ fn meta_accessor_covers_all_variants() {
             local_addr: None,
             local_port: None,
             backlog: 0,
+        }),
+        Event::SocketAccept(SocketAcceptEvent {
+            meta: meta.clone(),
+            listen_fd: 0,
+            accepted_fd: 0,
+            peer_addr: "0.0.0.0".parse::<IpAddr>().unwrap(),
+            peer_port: 0,
         }),
     ];
     for e in &events {
