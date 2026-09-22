@@ -12,7 +12,7 @@ use crate::{
     check_btm_launch_item_persistence, check_encoded_powershell, check_persistence_write,
     check_proc_root_escape, check_scheduled_task_persistence, check_service_install_persistence,
     check_systemd_service_persistence,
-    exclusions::{BEACON_THRESHOLD, SELF_SPAWN_THRESHOLD},
+    exclusions::{AUTH_FAILURE_THRESHOLD, BEACON_THRESHOLD, SELF_SPAWN_THRESHOLD},
 };
 
 const O_RDONLY: u32 = 0;
@@ -189,6 +189,7 @@ fn listen_port_event_full(
     }
 }
 
+mod coverage;
 mod linux;
 mod persistence;
 mod windows;

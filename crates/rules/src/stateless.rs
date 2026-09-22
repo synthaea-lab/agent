@@ -127,6 +127,9 @@ pub fn evaluate_exec(event: &ExecEvent) -> Vec<Alert> {
     check_base64_decode(event)
         .into_iter()
         .chain(check_encoded_powershell(event))
+        .chain(check_masquerading(event))
+        .chain(check_recovery_inhibit(event))
+        .chain(check_log_clear_exec(event))
         .collect()
 }
 
@@ -351,4 +354,194 @@ pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
         .chain(check_systemd_service_persistence(event))
         .chain(check_btm_launch_item_persistence(event))
         .collect()
+}
+
+/// System-binary names an attacker impersonates, with the directory prefixes
+/// the real binary lives under. Unix side (Linux + macOS — both checked, a
+/// path matching either platform's legitimate home is fine; the *mismatch*
+/// is the signal, not the platform).
+const MASQUERADE_UNIX: &[(&str, &[&str])] = &[
+    ("bash", &["/bin/", "/usr/bin/", "/usr/local/bin/"]),
+    ("sh", &["/bin/", "/usr/bin/"]),
+    ("zsh", &["/bin/", "/usr/bin/"]),
+    (
+        "sshd",
+        &[
+            "/usr/sbin/",
+            "/usr/libexec/",
+            "/usr/lib/ssh/",
+            "/usr/lib/openssh/",
+        ],
+    ),
+    ("sudo", &["/usr/bin/", "/bin/"]),
+    ("systemd", &["/usr/lib/systemd/", "/lib/systemd/"]),
+    ("launchd", &["/sbin/"]),
+    ("cron", &["/usr/sbin/", "/usr/bin/"]),
+    ("login", &["/usr/bin/", "/bin/"]),
+];
+
+/// Windows side — compared case-insensitively (NTFS is), against lowercase
+/// prefixes.
+const MASQUERADE_WINDOWS: &[(&str, &[&str])] = &[
+    (
+        "svchost.exe",
+        &["c:\\windows\\system32\\", "c:\\windows\\syswow64\\"],
+    ),
+    ("lsass.exe", &["c:\\windows\\system32\\"]),
+    ("services.exe", &["c:\\windows\\system32\\"]),
+    ("csrss.exe", &["c:\\windows\\system32\\"]),
+    ("winlogon.exe", &["c:\\windows\\system32\\"]),
+    ("smss.exe", &["c:\\windows\\system32\\"]),
+    (
+        "explorer.exe",
+        &["c:\\windows\\", "c:\\windows\\syswow64\\"],
+    ),
+    (
+        "powershell.exe",
+        &[
+            "c:\\windows\\system32\\windowspowershell\\",
+            "c:\\windows\\syswow64\\windowspowershell\\",
+        ],
+    ),
+    (
+        "rundll32.exe",
+        &["c:\\windows\\system32\\", "c:\\windows\\syswow64\\"],
+    ),
+];
+
+/// T1036.005 — Masquerading: Match Legitimate Name or Location. A binary
+/// *named* like a core system process executing from outside that binary's
+/// legitimate directories (`svchost.exe` in a temp dir, `bash` in
+/// `/tmp`). The name lists are deliberately short and high-value: every
+/// entry is a binary attackers actually impersonate, and the allowed-prefix
+/// sets are the platform's real install locations — no heuristics, so the
+/// only false-positive surface is a user legitimately naming their own
+/// binary `lsass.exe`, which is itself worth an alert.
+///
+/// Relative or truncated paths (the Linux `dfd` limitation
+/// [`check_persistence_write`] documents) are skipped, not guessed: a
+/// masquerade verdict needs the real absolute location.
+#[must_use]
+pub(crate) fn check_masquerading(event: &ExecEvent) -> Option<Alert> {
+    let path = &event.image_path;
+    let name = path.rsplit(['/', '\\']).next().unwrap_or("");
+    if name.is_empty() {
+        return None;
+    }
+
+    let (matched, allowed): (&str, &[&str]) = if path.starts_with('/') {
+        let entry = MASQUERADE_UNIX.iter().find(|(n, _)| *n == name)?;
+        (entry.0, entry.1)
+    } else {
+        // Windows paths only — anything else (relative, dfd-truncated) is
+        // skipped per the doc above.
+        let lower_name = name.to_ascii_lowercase();
+        let drive_absolute = path.as_bytes().get(1) == Some(&b':');
+        if !drive_absolute {
+            return None;
+        }
+        let entry = MASQUERADE_WINDOWS.iter().find(|(n, _)| *n == lower_name)?;
+        (entry.0, entry.1)
+    };
+
+    let lower_path = path.to_ascii_lowercase();
+    let legitimate = allowed.iter().any(|prefix| lower_path.starts_with(prefix));
+    if legitimate {
+        return None;
+    }
+    Some(Alert {
+        technique: "T1036.005",
+        message: format!(
+            "pid={} comm={}: system-binary name `{matched}` executing from outside its \
+             legitimate location: {path}",
+            event.meta.pid, event.meta.comm,
+        ),
+    })
+}
+
+/// T1490 — Inhibit System Recovery. The commands that destroy a host's
+/// ability to roll back before encryption: shadow-copy deletion, backup
+/// catalog wipes, recovery-boot disabling, and Time Machine local-snapshot
+/// destruction. Deterministic multi-token matches on the command line — each
+/// pattern requires every listed token, so `vssadmin list shadows` never
+/// fires.
+#[must_use]
+pub(crate) fn check_recovery_inhibit(event: &ExecEvent) -> Option<Alert> {
+    const PATTERNS: &[(&str, &[&str])] = &[
+        ("shadow-copy deletion", &["vssadmin", "delete", "shadows"]),
+        ("shadow-copy deletion", &["wmic", "shadowcopy", "delete"]),
+        ("backup catalog wipe", &["wbadmin", "delete", "catalog"]),
+        (
+            "recovery boot disabled",
+            &["bcdedit", "recoveryenabled", "no"],
+        ),
+        (
+            "local snapshot destruction",
+            &["tmutil", "deletelocalsnapshots"],
+        ),
+    ];
+    let cmdline = event.cmdline.to_ascii_lowercase();
+    let (label, _) = PATTERNS
+        .iter()
+        .find(|(_, tokens)| tokens.iter().all(|t| cmdline.contains(t)))?;
+    Some(Alert {
+        technique: "T1490",
+        message: format!(
+            "pid={} comm={}: {label} — the pre-encryption tell: {}",
+            event.meta.pid, event.meta.comm, event.cmdline,
+        ),
+    })
+}
+
+/// T1070.002 — Indicator Removal: Clear Logs (the exec-side half; the
+/// file-deletion half is [`check_log_file_delete`]). Platform log-wipe
+/// commands: Windows event-log clearing, the macOS unified-log erase, and
+/// journald vacuuming to nothing.
+#[must_use]
+pub(crate) fn check_log_clear_exec(event: &ExecEvent) -> Option<Alert> {
+    const PATTERNS: &[&[&str]] = &[
+        &["wevtutil", "cl"],
+        &["wevtutil", "clear-log"],
+        &["clear-eventlog"],
+        &["log", "erase"],
+        &["journalctl", "--vacuum"],
+    ];
+    let cmdline = event.cmdline.to_ascii_lowercase();
+    PATTERNS
+        .iter()
+        .find(|tokens| tokens.iter().all(|t| cmdline.contains(t)))?;
+    Some(Alert {
+        technique: "T1070.002",
+        message: format!(
+            "pid={} comm={}: log-clearing command: {}",
+            event.meta.pid, event.meta.comm, event.cmdline,
+        ),
+    })
+}
+
+/// Log locations whose deletion is the anti-forensics signal
+/// ([`check_log_file_delete`]). Substring/prefix matches, same tolerance as
+/// [`check_persistence_write`]'s patterns.
+const LOG_PATH_PATTERNS: &[&str] = &["/var/log/", "/private/var/log/", "/log/journal/", ".evtx"];
+
+/// T1070.002 — the file-deletion half: a log file removed outright. Consumes
+/// [`schema::FileDeleteEvent`]s (Linux unlink tracing, macOS ES `UNLINK`;
+/// Windows deletions arrive with the minifilter, #136).
+#[must_use]
+pub(crate) fn check_log_file_delete(event: &schema::FileDeleteEvent) -> Option<Alert> {
+    let path = &event.path;
+    let matched = LOG_PATH_PATTERNS.iter().find(|p| path.contains(*p))?;
+    Some(Alert {
+        technique: "T1070.002",
+        message: format!(
+            "pid={} comm={}: log file deleted ({matched}): {path}",
+            event.meta.pid, event.meta.comm,
+        ),
+    })
+}
+
+/// Evaluates all stateless rules applicable to a `FileDeleteEvent`.
+#[must_use]
+pub fn evaluate_file_delete(event: &schema::FileDeleteEvent) -> Vec<Alert> {
+    check_log_file_delete(event).into_iter().collect()
 }
