@@ -36,13 +36,14 @@ use crate::redact;
 /// reasoning.
 const _: () = assert!(wire::WIRE_VERSION == 11);
 
-/// `container_id` is resolved by the caller from `/proc/<pid>/cgroup` at drain time
-/// (issue #80) — attribution only for now, `image`/`name` await a follow-up
-/// Docker/containerd socket lookup.
+/// `container` is resolved by the caller (`crate::container::container_context`,
+/// issue #312) from `EventMeta::cgroup_id` against cgroupfs, with image/name filled
+/// in once the background Docker socket lookup for that container id completes —
+/// same fidelity as the main sensor's events.
 fn meta(
     meta: &wire::EventMeta,
     boot_epoch_offset_ns: u64,
-    container_id: Option<String>,
+    container: Option<ContainerContext>,
 ) -> EventMeta {
     EventMeta {
         pid: meta.pid,
@@ -53,11 +54,7 @@ fn meta(
         },
         timestamp_ns: meta.timestamp_ns.saturating_add(boot_epoch_offset_ns),
         comm: wire::comm_str(&meta.comm),
-        container: container_id.map(|id| ContainerContext {
-            id,
-            image: None,
-            name: None,
-        }),
+        container,
     }
 }
 
@@ -73,7 +70,7 @@ fn meta(
 pub fn tls_capture(
     event: &wire::TlsCaptureEvent,
     boot_epoch_offset_ns: u64,
-    container_id: Option<String>,
+    container: Option<ContainerContext>,
 ) -> Event {
     let direction = match event.direction {
         0 => TlsDirection::Read,
@@ -95,7 +92,7 @@ pub fn tls_capture(
     let data = redact::redact_tls_data(data);
 
     Event::TlsCapture(TlsCaptureEvent {
-        meta: meta(&event.meta, boot_epoch_offset_ns, container_id),
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
         direction,
         lib_type,
         data,
@@ -114,7 +111,7 @@ pub fn tls_capture(
 pub fn readline_input(
     event: &wire::ReadlineInputEvent,
     boot_epoch_offset_ns: u64,
-    container_id: Option<String>,
+    container: Option<ContainerContext>,
 ) -> Event {
     let shell_type = match event.shell_type {
         0 => ShellType::Bash,
@@ -129,7 +126,7 @@ pub fn readline_input(
     let input = redact::redact_readline_input(input);
 
     Event::ReadlineInput(ReadlineInputEvent {
-        meta: meta(&event.meta, boot_epoch_offset_ns, container_id),
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
         shell_type,
         input,
     })
@@ -324,6 +321,18 @@ mod tests {
         assert_eq!(e.input.len(), wire::MAX_READLINE_INPUT);
     }
 
+    /// A full [`ContainerContext`] — id, image, and name — the shape
+    /// `crate::container::container_context` produces once its background Docker
+    /// lookup has completed (issue #312: same fidelity as the main sensor's events,
+    /// not just the id).
+    fn full_container_context() -> ContainerContext {
+        ContainerContext {
+            id: "a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456".to_string(),
+            image: Some("nginx:1.27".to_string()),
+            name: Some("web1".to_string()),
+        }
+    }
+
     #[test]
     fn tls_capture_carries_container_id() {
         let event = wire::TlsCaptureEvent {
@@ -333,14 +342,12 @@ mod tests {
             bytes_len: 0,
             data: [0; wire::MAX_TLS_CAPTURE],
         };
-        let id = "a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456".to_string();
+        let ctx = full_container_context();
 
-        let Event::TlsCapture(e) = tls_capture(&event, 0, Some(id.clone())) else {
+        let Event::TlsCapture(e) = tls_capture(&event, 0, Some(ctx.clone())) else {
             panic!("wrong variant")
         };
-        let container = e.meta.container.expect("container attributed");
-        assert_eq!(container.id, id);
-        assert_eq!(container.image, None, "awaits the socket-lookup follow-up");
+        assert_eq!(e.meta.container, Some(ctx));
     }
 
     #[test]
@@ -351,12 +358,11 @@ mod tests {
             input_len: 0,
             input: [0; wire::MAX_READLINE_INPUT],
         };
-        let id = "a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456".to_string();
+        let ctx = full_container_context();
 
-        let Event::ReadlineInput(e) = readline_input(&event, 0, Some(id.clone())) else {
+        let Event::ReadlineInput(e) = readline_input(&event, 0, Some(ctx.clone())) else {
             panic!("wrong variant")
         };
-        let container = e.meta.container.expect("container attributed");
-        assert_eq!(container.id, id);
+        assert_eq!(e.meta.container, Some(ctx));
     }
 }
