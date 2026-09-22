@@ -302,12 +302,67 @@ pub struct FileOpenEvent {
     pub flags: u32,
 }
 
-/// File write (issue #262). Carries no path: `write(2)`/`pwrite64(2)` take a file
-/// descriptor, and the Linux sensor resolves no fd→path mapping (see
-/// `sensor-linux-wire::FileWriteEvent`'s doc) — this is a volume/frequency signal
-/// (burst-write detection: ransomware, mass tampering, log destruction), not a
-/// per-write path trail. Join to a recent [`FileOpenEvent`] on `(meta.pid, fd)` if a
-/// path is needed downstream.
+/// File write (issue #262).
+///
+/// ## ⚠️ Critical Limitation: No Path Included
+///
+/// This event carries **no path** — only `(pid, fd, bytes_requested)`. `write(2)` and
+/// `pwrite64(2)` operate on file descriptors, not paths, and the Linux sensor resolves
+/// no fd→path mapping (neither kernel-side `bpf_d_path`/LSM hooks nor userspace
+/// `/proc/<pid>/fd/<n>` lookup — see `sensor-linux-wire::FileWriteEvent`'s version
+/// history for rationale).
+///
+/// **This is a volume/frequency signal** for burst-write detection (ransomware, mass
+/// tampering, log destruction), not a per-write path trail. To correlate a write with
+/// a file path, detection rules must join to a recent [`FileOpenEvent`] on
+/// `(meta.pid, fd)`.
+///
+/// ## Detection Correlation Pattern
+///
+/// ```rust,ignore
+/// // Pseudo-code example: correlate FileOpen → FileWrite
+/// match event {
+///     Event::FileOpen(open) => {
+///         // Store (pid, fd) → path mapping
+///         state.track_fd(open.meta.pid, open.fd, open.path.clone());
+///     }
+///     Event::FileWrite(write) => {
+///         // Look up path from prior FileOpen
+///         if let Some(path) = state.get_path(write.meta.pid, write.fd) {
+///             // Now you can detect: "wrote 1MB to /etc/passwd"
+///             check_suspicious_write(path, write.bytes_requested);
+///         }
+///     }
+///     Event::FileClose(_) => {
+///         // Clean up fd tracking to bound memory
+///     }
+/// }
+/// ```
+///
+/// See `docs/detection/file-activity-patterns.md` for full worked examples including
+/// ransomware burst-write + mass-rename correlation.
+///
+/// ## Performance Notes
+///
+/// `write(2)` is one of the hottest syscalls in the system. Current implementation:
+/// - Captures **every** write syscall (no size filtering)
+/// - Expected rate: 10-1000+ events/sec under normal load, 10K+/sec under heavy I/O
+/// - No built-in sampling or backpressure (Phase 1 implementation)
+///
+/// Future work (issue #262 Phase 2):
+/// - Add min-size filter (e.g., skip writes < 4KB)
+/// - Consider sampling under sustained high-volume
+/// - Add `writev(2)`, `pwrite64(2)`, `pwritev(2)` coverage (currently only `write(2)`)
+///
+/// ## Syscall Coverage
+///
+/// Phase 1 (current): `write(2)` only
+/// Phase 2 (deferred): `writev`, `pwrite64`, `pwritev`, `pwritev2`
+///
+/// Rationale for deferral: `write(2)` covers the common case; vectored/positioned
+/// writes are used by databases and async I/O but add complexity (multiple fd/offset
+/// pairs per syscall). Added once the Phase 1 signal proves useful and performance
+/// characteristics are understood.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileWriteEvent {
     pub meta: EventMeta,
