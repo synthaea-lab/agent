@@ -11,10 +11,11 @@ use std::net::IpAddr;
 use schema::{
     AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, ConnectEvent, DnsQueryEvent, Event,
     EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent,
-    FileRenameEvent, FileWriteEvent, GatekeeperVerdictEvent, ImageLoadEvent, ListenPortEvent,
-    NetworkFlowEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType,
-    SmbConnectEvent, SocketBindEvent, SocketListenEvent, TccDecisionEvent, TlsCaptureEvent,
-    TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
+    FileQuarantineEvent, FileRenameEvent, FileWriteEvent, GatekeeperVerdictEvent, ImageLoadEvent,
+    ListenPortEvent, MountEvent, NetworkFlowEvent, ReadlineInputEvent, RegistrySetEvent,
+    ScriptBlockEvent, ShellType, SignalEvent, SmbConnectEvent, SocketBindEvent, SocketListenEvent,
+    TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User,
+    WmiActivityEvent, XpcConnectEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -846,6 +847,94 @@ fn gatekeeper_verdict_golden() {
 }
 
 #[test]
+fn file_quarantine_golden() {
+    // v20 (#96): the quarantine xattr landed on a download, with the origin
+    // URLs read back from kMDItemWhereFroms — the network→file link.
+    assert_golden(
+        &Event::FileQuarantine(FileQuarantineEvent {
+            meta: EventMeta {
+                pid: 812,
+                ppid: 1,
+                user: User::Unix { uid: 501, gid: 20 },
+                timestamp_ns: 1_756_900_000_123_456_789,
+                comm: "Safari".into(),
+                container: None,
+            },
+            path: "/Users/mal/Downloads/invoice.app.zip".into(),
+            agent: Some("Safari".into()),
+            origin_url: Some("https://example.test/invoice.app.zip".into()),
+            referrer_url: Some("https://example.test/downloads".into()),
+        }),
+        "file_quarantine",
+    );
+}
+
+#[test]
+fn mount_golden() {
+    // v20 (#96): a read-only disk-image mount — the classic DMG delivery step.
+    assert_golden(
+        &Event::Mount(MountEvent {
+            meta: EventMeta {
+                pid: 941,
+                ppid: 1,
+                user: User::Unix { uid: 501, gid: 20 },
+                timestamp_ns: 1_756_900_000_123_456_789,
+                comm: "diskimagesiod".into(),
+                container: None,
+            },
+            mount_point: "/Volumes/Installer".into(),
+            source: Some("/dev/disk4s1".into()),
+            fs_type: Some("hfs".into()),
+            readonly: true,
+            mounted: true,
+        }),
+        "mount",
+    );
+}
+
+#[test]
+fn signal_golden() {
+    // v20 (#96): SIGKILL aimed at an ES-client process — the tamper subset the
+    // sensor forwards; meta is the sender.
+    assert_golden(
+        &Event::Signal(SignalEvent {
+            meta: EventMeta {
+                pid: 6001,
+                ppid: 6000,
+                user: User::Unix { uid: 501, gid: 20 },
+                timestamp_ns: 1_756_900_000_123_456_789,
+                comm: "bash".into(),
+                container: None,
+            },
+            signal: 9,
+            target_pid: 400,
+            target_image_path: Some("/usr/local/bin/synthaea-agent".into()),
+        }),
+        "signal",
+    );
+}
+
+#[test]
+fn xpc_connect_golden() {
+    // v20 (#96): a process connecting to tccd's XPC service by name.
+    assert_golden(
+        &Event::XpcConnect(XpcConnectEvent {
+            meta: EventMeta {
+                pid: 7001,
+                ppid: 1,
+                user: User::Unix { uid: 501, gid: 20 },
+                timestamp_ns: 1_756_900_000_123_456_789,
+                comm: "payload".into(),
+                container: None,
+            },
+            service_name: "com.apple.tccd".into(),
+            domain_type: 1,
+        }),
+        "xpc_connect",
+    );
+}
+
+#[test]
 fn unbounded_cmdline_survives() {
     // Audit F-4: multi-kilobyte encoded command lines must round-trip untouched.
     let long = format!("powershell.exe -EncodedCommand {}", "A".repeat(8 * 1024));
@@ -1087,6 +1176,32 @@ fn meta_accessor_covers_all_variants() {
             team_id: None,
             signing_id: None,
             result_code: 0,
+        }),
+        Event::FileQuarantine(FileQuarantineEvent {
+            meta: meta.clone(),
+            path: String::new(),
+            agent: None,
+            origin_url: None,
+            referrer_url: None,
+        }),
+        Event::Mount(MountEvent {
+            meta: meta.clone(),
+            mount_point: String::new(),
+            source: None,
+            fs_type: None,
+            readonly: false,
+            mounted: true,
+        }),
+        Event::Signal(SignalEvent {
+            meta: meta.clone(),
+            signal: 0,
+            target_pid: 0,
+            target_image_path: None,
+        }),
+        Event::XpcConnect(XpcConnectEvent {
+            meta: meta.clone(),
+            service_name: String::new(),
+            domain_type: 0,
         }),
     ];
     for e in &events {

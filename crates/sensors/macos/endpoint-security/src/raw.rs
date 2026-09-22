@@ -94,6 +94,62 @@ pub enum RawEsEvent {
     /// `ES_EVENT_TYPE_NOTIFY_MMAP`, already filtered by the shim to writable
     /// `MAP_SHARED` mappings (the only mmap case that mutates the file).
     MmapWriteShared { meta: RawMeta, path: String },
+    /// `ES_EVENT_TYPE_NOTIFY_OPENSSH_LOGIN` (macOS 13+, #96).
+    SshLogin {
+        meta: RawMeta,
+        success: bool,
+        username: String,
+        /// Source address as sshd reports it (IPv4/IPv6 literal or hostname).
+        source_address: Option<String>,
+    },
+    /// `ES_EVENT_TYPE_NOTIFY_LOGIN_LOGIN` — `login(1)`, local console
+    /// (macOS 13+, #96).
+    LoginLogin {
+        meta: RawMeta,
+        success: bool,
+        username: String,
+    },
+    /// `ES_EVENT_TYPE_NOTIFY_LW_SESSION_LOGIN` — a loginwindow graphical
+    /// session login; only completed logins are reported (macOS 13+, #96).
+    LwSessionLogin { meta: RawMeta, username: String },
+    /// `ES_EVENT_TYPE_NOTIFY_SETEXTATTR` filtered by the shim to
+    /// `com.apple.quarantine` (#96): download provenance. Both values are
+    /// read back from the file at event time and `None` when that read raced
+    /// the writer.
+    QuarantineSet {
+        meta: RawMeta,
+        path: String,
+        /// The raw quarantine string (`flags;timestamp;agent;uuid`).
+        quarantine: Option<String>,
+        /// `kMDItemWhereFroms` raw bytes (a binary plist of URL strings).
+        wherefroms_plist: Option<Vec<u8>>,
+    },
+    /// `ES_EVENT_TYPE_NOTIFY_MOUNT` / `NOTIFY_UNMOUNT` (#96).
+    Mount {
+        meta: RawMeta,
+        mount_point: String,
+        source: Option<String>,
+        fs_type: Option<String>,
+        readonly: bool,
+        /// True for a mount, false for an unmount.
+        mounted: bool,
+    },
+    /// `ES_EVENT_TYPE_NOTIFY_SIGNAL`, filtered by the shim to targets that
+    /// are `EndpointSecurity` clients — the tamper-relevant subset (#96).
+    /// `meta` is the sender.
+    SignalToEsClient {
+        meta: RawMeta,
+        signal: u32,
+        target_pid: u32,
+        target_path: Option<String>,
+    },
+    /// `ES_EVENT_TYPE_NOTIFY_XPC_CONNECT` (macOS 14+, #96).
+    XpcConnect {
+        meta: RawMeta,
+        service_name: String,
+        /// Raw `es_xpc_domain_type_t`.
+        domain_type: u32,
+    },
     /// `ES_EVENT_TYPE_NOTIFY_BTM_LAUNCH_ITEM_ADD` (macOS 13+) — Background
     /// Task Management registered a launch item. `meta` is the instigating
     /// process when BTM identified one, otherwise the BTM subsystem itself.

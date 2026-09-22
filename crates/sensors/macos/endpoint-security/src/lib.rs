@@ -16,8 +16,19 @@
 //!   additionally surface through the ordinary file stream and the
 //!   `rules::check_persistence_write` path patterns.
 //!
-//! The ES event catalog beyond this core set (login/session, quarantine
-//! xattrs, mount, signal, XPC) is the widening issue #96.
+//! The #96 widening adds the rest of the catalog worth having:
+//!
+//! - **sessions** — SSH, `login(1)`, and loginwindow logins (macOS 13+) into
+//!   the shared `Event::Auth` shape (ADR-0005);
+//! - **provenance** — `SETEXTATTR` filtered to `com.apple.quarantine`, with
+//!   the quarantine string and `kMDItemWhereFroms` origin URLs read back at
+//!   event time → `Event::FileQuarantine`, the network→file link;
+//! - **mount/unmount** → `Event::Mount` (DMG delivery, USB staging);
+//! - **tamper** — signals aimed at `EndpointSecurity`-client processes (the
+//!   agent, other security tools; everything else is dropped in the shim) →
+//!   `Event::Signal` with the *sender* as `meta`;
+//! - **XPC connects** (macOS 14+) → `Event::XpcConnect`, high-volume by
+//!   nature — rules match sensitive service names, never per-event.
 //!
 //! ## Layout
 //!

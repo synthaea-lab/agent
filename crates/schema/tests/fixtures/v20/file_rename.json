@@ -1,0 +1,12 @@
+{
+  "type": "file_rename",
+  "meta": {
+    "pid": 7003,
+    "ppid": 7000,
+    "user": { "os": "unix", "uid": 1000, "gid": 1000 },
+    "timestamp_ns": 1756900012000000000,
+    "comm": "encryptor"
+  },
+  "old_path": "/home/user/invoice.pdf",
+  "new_path": "/home/user/invoice.pdf.locked"
+}

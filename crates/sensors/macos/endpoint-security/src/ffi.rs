@@ -18,11 +18,24 @@ pub(crate) const SYN_ES_KIND_RENAME: i32 = 4;
 pub(crate) const SYN_ES_KIND_UNLINK: i32 = 5;
 pub(crate) const SYN_ES_KIND_MMAP_WRITE_SHARED: i32 = 6;
 pub(crate) const SYN_ES_KIND_BTM_LAUNCH_ITEM_ADD: i32 = 7;
+pub(crate) const SYN_ES_KIND_SSH_LOGIN: i32 = 8;
+pub(crate) const SYN_ES_KIND_LOGIN: i32 = 9;
+pub(crate) const SYN_ES_KIND_LW_LOGIN: i32 = 10;
+pub(crate) const SYN_ES_KIND_QUARANTINE: i32 = 11;
+pub(crate) const SYN_ES_KIND_MOUNT: i32 = 12;
+pub(crate) const SYN_ES_KIND_UNMOUNT: i32 = 13;
+pub(crate) const SYN_ES_KIND_SIGNAL_ES_CLIENT: i32 = 14;
+pub(crate) const SYN_ES_KIND_XPC_CONNECT: i32 = 15;
 
 // Mirrors the `SYN_ES_GROUP_*` bitflags.
 pub(crate) const SYN_ES_GROUP_EXEC: u32 = 0x1;
 pub(crate) const SYN_ES_GROUP_FILE: u32 = 0x2;
 pub(crate) const SYN_ES_GROUP_PERSISTENCE: u32 = 0x4;
+pub(crate) const SYN_ES_GROUP_SESSIONS: u32 = 0x8;
+pub(crate) const SYN_ES_GROUP_PROVENANCE: u32 = 0x10;
+pub(crate) const SYN_ES_GROUP_MOUNT: u32 = 0x20;
+pub(crate) const SYN_ES_GROUP_TAMPER: u32 = 0x40;
+pub(crate) const SYN_ES_GROUP_XPC: u32 = 0x80;
 
 /// Mirrors `syn_es_str`: borrowed, length-delimited, `data` null when absent.
 #[repr(C)]
@@ -59,6 +72,20 @@ impl SynEsStr {
     unsafe fn to_string_lossy(self) -> String {
         // SAFETY: forwarded contract.
         unsafe { self.to_option_string() }.unwrap_or_default()
+    }
+
+    /// Raw-bytes copy for fields that are not text (the `kMDItemWhereFroms`
+    /// binary plist). `None` when absent.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`SynEsStr::to_option_string`].
+    unsafe fn to_option_bytes(self) -> Option<Vec<u8>> {
+        if self.data.is_null() {
+            return None;
+        }
+        // SAFETY: non-null `data` with `len` readable bytes per the contract.
+        Some(unsafe { std::slice::from_raw_parts(self.data.cast::<u8>(), self.len) }.to_vec())
     }
 }
 
@@ -99,6 +126,23 @@ pub(crate) struct SynEsEvent {
     pub btm_item_uid: u32,
     pub btm_app_url: SynEsStr,
     pub btm_executable_path: SynEsStr,
+
+    pub auth_success: u8,
+    pub auth_username: SynEsStr,
+    pub auth_source_address: SynEsStr,
+
+    pub quarantine_raw: SynEsStr,
+    pub wherefroms_raw: SynEsStr,
+
+    pub mount_source: SynEsStr,
+    pub mount_fs_type: SynEsStr,
+    pub mount_readonly: u8,
+
+    pub signal_number: i32,
+    pub signal_target_pid: i32,
+
+    pub xpc_service_name: SynEsStr,
+    pub xpc_domain_type: u32,
 }
 
 impl SynEsEvent {
@@ -171,6 +215,58 @@ impl SynEsEvent {
                 SYN_ES_KIND_MMAP_WRITE_SHARED => Some(RawEsEvent::MmapWriteShared {
                     meta,
                     path: self.file_path.to_string_lossy(),
+                }),
+                SYN_ES_KIND_SSH_LOGIN => Some(RawEsEvent::SshLogin {
+                    meta,
+                    success: self.auth_success != 0,
+                    username: self.auth_username.to_string_lossy(),
+                    source_address: self
+                        .auth_source_address
+                        .to_option_string()
+                        .filter(|s| !s.is_empty()),
+                }),
+                SYN_ES_KIND_LOGIN => Some(RawEsEvent::LoginLogin {
+                    meta,
+                    success: self.auth_success != 0,
+                    username: self.auth_username.to_string_lossy(),
+                }),
+                SYN_ES_KIND_LW_LOGIN => Some(RawEsEvent::LwSessionLogin {
+                    meta,
+                    username: self.auth_username.to_string_lossy(),
+                }),
+                SYN_ES_KIND_QUARANTINE => Some(RawEsEvent::QuarantineSet {
+                    meta,
+                    path: self.file_path.to_string_lossy(),
+                    quarantine: self
+                        .quarantine_raw
+                        .to_option_string()
+                        .filter(|s| !s.is_empty()),
+                    wherefroms_plist: self.wherefroms_raw.to_option_bytes(),
+                }),
+                SYN_ES_KIND_MOUNT | SYN_ES_KIND_UNMOUNT => Some(RawEsEvent::Mount {
+                    meta,
+                    mount_point: self.file_path.to_string_lossy(),
+                    source: self
+                        .mount_source
+                        .to_option_string()
+                        .filter(|s| !s.is_empty()),
+                    fs_type: self
+                        .mount_fs_type
+                        .to_option_string()
+                        .filter(|s| !s.is_empty()),
+                    readonly: self.mount_readonly != 0,
+                    mounted: self.kind == SYN_ES_KIND_MOUNT,
+                }),
+                SYN_ES_KIND_SIGNAL_ES_CLIENT => Some(RawEsEvent::SignalToEsClient {
+                    meta,
+                    signal: self.signal_number.max(0).cast_unsigned(),
+                    target_pid: self.signal_target_pid.max(0).cast_unsigned(),
+                    target_path: self.file_path.to_option_string().filter(|s| !s.is_empty()),
+                }),
+                SYN_ES_KIND_XPC_CONNECT => Some(RawEsEvent::XpcConnect {
+                    meta,
+                    service_name: self.xpc_service_name.to_string_lossy(),
+                    domain_type: self.xpc_domain_type,
                 }),
                 SYN_ES_KIND_BTM_LAUNCH_ITEM_ADD => Some(RawEsEvent::BtmLaunchItemAdd {
                     meta,
