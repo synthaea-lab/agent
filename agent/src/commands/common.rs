@@ -13,6 +13,9 @@ pub(crate) struct RunPipeline {
     pub(crate) sink: Arc<DetectionSink>,
     /// `Some` when `--server` was given: the upload thread is already running
     /// and the sink is spooling — see [`crate::upload`].
+    // Read back only on Linux (spool health stats + heartbeat client, see
+    // `commands::linux::cmd_run`) — `windows.rs` uses `pipeline.sink` alone.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) transport: Option<crate::upload::TransportHandle>,
 }
 

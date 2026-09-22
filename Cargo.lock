@@ -41,9 +41,11 @@ dependencies = [
  "serde",
  "sigma",
  "sinks",
+ "store",
  "tamper",
  "tracing",
  "tracing-subscriber",
+ "transport",
  "yara",
 ]
 
