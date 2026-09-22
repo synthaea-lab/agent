@@ -1,0 +1,21 @@
+[package]
+name = "sensor-macos-sockets"
+version = "0.1.0"
+description = "macOS socket-table snapshots (libproc): listening ports + baseline, no entitlement"
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+schema = { path = "../../../schema" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Unconditional for the same reason as sensor-macos: build scripts compile for
+# the HOST, so a target-gated build-dependency would break Linux-target checks
+# from a macOS host. The script itself returns early off macOS.
+[build-dependencies]
+cc = "1"

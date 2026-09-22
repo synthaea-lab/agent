@@ -77,14 +77,14 @@ pub struct PolicyMetadata {
     /// duplicate-apply (ADR-0010 §2).
     pub policy_version: u64,
     /// When the issuer produced this document. Nanoseconds since the Unix
-    /// epoch (UTC), matching [`schema::EventMeta`]'s timestamp unit across
+    /// epoch (UTC), matching `schema::EventMeta`'s timestamp unit across
     /// the workspace. Not used for freshness enforcement in v1 (that
     /// belongs to the distribution mechanism ADR-0010 defers) but recorded
     /// so audit trails and post-mortems have a definitive "issued at"
     /// value.
     pub issued_at_ns: u64,
     /// Ed25519 signature over this document's canonical JSON form (see
-    /// [`crate::to_canonical_json`]), encoded as 128 lowercase-hex
+    /// [`crate::to_canonical_bytes`]), encoded as 128 lowercase-hex
     /// characters. During canonicalization for signing, this field is set
     /// to `""` (the empty string, not omitted or null) so the schema shape
     /// stays fixed regardless of whether the document is signed or being

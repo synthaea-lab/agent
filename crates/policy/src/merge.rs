@@ -39,7 +39,7 @@
 //! it documents the intent, prevents a future contributor from adding
 //! `#[serde(default)]` to one of these fields without noticing, and
 //! matches the reference form ADR-0011 §Decision 3 called for. The
-//! module's regression test [`safety_critical_paths_field_are_serde_required`]
+//! module's regression test `safety_critical_paths_field_are_serde_required`
 //! guards the "no `#[serde(default)]`" invariant so a schema evolution
 //! that would silently relax safety-critical to admissible-partial fails
 //! the crate's own tests.
