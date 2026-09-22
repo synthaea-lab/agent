@@ -22,28 +22,12 @@ use crate::{
     proc::read_proc_cmdline,
 };
 
-/// Difference between the epoch clock and `CLOCK_MONOTONIC` (which the probes stamp
-/// events with), computed once at startup — see `normalize`.
+/// See `sensor_linux_wire::boot_epoch_offset_ns` — computed once at startup.
+/// (Consolidated there by #295; a parallel branch merge resurrected the old
+/// local copy once already — if you are reading a full implementation here
+/// again, the same thing happened again.)
 fn boot_epoch_offset_ns() -> u64 {
-    let epoch_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: plain FFI call writing into a valid stack-owned timespec.
-    let mono_ns = if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0 {
-        // Saturating, matching sensor-linux-uprobes' copy of this function —
-        // the two must not drift (a candidate for sensor-linux-wire).
-        (ts.tv_sec as u64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add(ts.tv_nsec as u64)
-    } else {
-        0
-    };
-    epoch_ns.saturating_sub(mono_ns)
+    sensor_linux_wire::boot_epoch_offset_ns()
 }
 
 /// Linux sensor (eBPF). `run` blocks until Ctrl-C or [`Sensor::stop`].
