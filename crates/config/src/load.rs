@@ -11,9 +11,11 @@
 
 use std::path::Path;
 
-use crate::discovery::{discover, DiscoverySource};
-use crate::error::ConfigError;
-use crate::schema::{AgentConfig, SCHEMA_VERSION};
+use crate::{
+    discovery::{DiscoverySource, discover},
+    error::ConfigError,
+    schema::{AgentConfig, SCHEMA_VERSION},
+};
 
 /// Perform the full discovery-and-load flow, then apply env overrides.
 ///
@@ -352,9 +354,10 @@ fn parse_env_bool(env_var: &str, field: &str, raw: &str) -> Result<bool, ConfigE
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
     use crate::test_util::env_lock;
-    use std::io::Write;
 
     // Absolute-path fixtures split per OS: `Path::is_absolute` on Windows
     // rejects Unix-style `/etc/…`, and the load-time validation checks
@@ -581,9 +584,7 @@ control_plane_url = "https://cp.example"
             std::env::remove_var("SYNTHAEA_SPOOL_MAX_MB");
         }
         match err {
-            ConfigError::EnvOverrideParse {
-                env_var, field, ..
-            } => {
+            ConfigError::EnvOverrideParse { env_var, field, .. } => {
                 assert_eq!(env_var, "SYNTHAEA_SPOOL_MAX_MB");
                 assert_eq!(field, "storage.spool_max_mb");
             }

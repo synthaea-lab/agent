@@ -459,8 +459,7 @@ fn spawn_journal_tail(sink: Arc<DetectionSink>, heartbeat: SensorHeartbeat) {
                         if let Some(auth) = sensor_linux_journal::to_auth_event(&record, &event) {
                             sink.on_event(schema::Event::Auth(auth));
                         }
-                        if let Some(persistence_event) = unit_persistence.observe(&record, &event)
-                        {
+                        if let Some(persistence_event) = unit_persistence.observe(&record, &event) {
                             sink.on_event(persistence_event);
                         }
                     }

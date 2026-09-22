@@ -147,9 +147,15 @@ pub fn file_rename(
     container: Option<ContainerContext>,
 ) -> Event {
     let old_raw = &event.old_path[..(event.old_path_len as usize).min(wire::MAX_PATH_LEN)];
-    let old_end = old_raw.iter().position(|&b| b == 0).unwrap_or(old_raw.len());
+    let old_end = old_raw
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(old_raw.len());
     let new_raw = &event.new_path[..(event.new_path_len as usize).min(wire::MAX_PATH_LEN)];
-    let new_end = new_raw.iter().position(|&b| b == 0).unwrap_or(new_raw.len());
+    let new_end = new_raw
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(new_raw.len());
     Event::FileRename(FileRenameEvent {
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
         old_path: String::from_utf8_lossy(&old_raw[..old_end]).into_owned(),

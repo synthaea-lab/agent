@@ -498,10 +498,7 @@ pub fn sys_enter_unlink(ctx: TracePointContext) -> u32 {
 
 fn try_sys_enter_unlink(ctx: TracePointContext) -> Result<u32, u32> {
     #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let pathname_ptr: u64 = unsafe {
-        ctx.read_at(UNLINK_PATHNAME_PTR_OFFSET)
-            .map_err(|_| 1u32)?
-    };
+    let pathname_ptr: u64 = unsafe { ctx.read_at(UNLINK_PATHNAME_PTR_OFFSET).map_err(|_| 1u32)? };
     #[cfg(bpf_target_arch = "x86")]
     let pathname_ptr: u64 = unsafe {
         ctx.read_at::<u32>(UNLINK_PATHNAME_PTR_OFFSET)
@@ -562,7 +559,10 @@ fn emit_file_delete_event(ctx: &TracePointContext, pathname_ptr: u64) -> Result<
             }
         }
 
-        if FILE_DELETE_EVENTS.output::<FileDeleteEvent>(&*e, 0).is_err() {
+        if FILE_DELETE_EVENTS
+            .output::<FileDeleteEvent>(&*e, 0)
+            .is_err()
+        {
             warn!(
                 ctx,
                 "sensor-linux-ebpf: ring buffer full, dropping delete event"
@@ -654,20 +654,14 @@ pub fn sys_enter_renameat(ctx: TracePointContext) -> u32 {
 
 fn try_sys_enter_renameat(ctx: TracePointContext) -> Result<u32, u32> {
     #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let oldname_ptr: u64 = unsafe {
-        ctx.read_at(RENAMEAT_OLDNAME_PTR_OFFSET)
-            .map_err(|_| 1u32)?
-    };
+    let oldname_ptr: u64 = unsafe { ctx.read_at(RENAMEAT_OLDNAME_PTR_OFFSET).map_err(|_| 1u32)? };
     #[cfg(bpf_target_arch = "x86")]
     let oldname_ptr: u64 = unsafe {
         ctx.read_at::<u32>(RENAMEAT_OLDNAME_PTR_OFFSET)
             .map_err(|_| 1u32)? as u64
     };
     #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let newname_ptr: u64 = unsafe {
-        ctx.read_at(RENAMEAT_NEWNAME_PTR_OFFSET)
-            .map_err(|_| 1u32)?
-    };
+    let newname_ptr: u64 = unsafe { ctx.read_at(RENAMEAT_NEWNAME_PTR_OFFSET).map_err(|_| 1u32)? };
     #[cfg(bpf_target_arch = "x86")]
     let newname_ptr: u64 = unsafe {
         ctx.read_at::<u32>(RENAMEAT_NEWNAME_PTR_OFFSET)
@@ -749,7 +743,10 @@ fn emit_file_rename_event(
             }
         }
 
-        if FILE_RENAME_EVENTS.output::<FileRenameEvent>(&*e, 0).is_err() {
+        if FILE_RENAME_EVENTS
+            .output::<FileRenameEvent>(&*e, 0)
+            .is_err()
+        {
             warn!(
                 ctx,
                 "sensor-linux-ebpf: ring buffer full, dropping rename event"
@@ -936,9 +933,7 @@ fn try_sys_enter_bind(ctx: TracePointContext) -> Result<u32, u32> {
         unsafe { bpf_probe_read_user((umyaddr_ptr + 2) as *const u16).map_err(|_| 1u32)? };
     let (v4, v6): ([u8; 4], [u8; 16]) = if family == AF_INET {
         (
-            unsafe {
-                bpf_probe_read_user((umyaddr_ptr + 4) as *const [u8; 4]).map_err(|_| 1u32)?
-            },
+            unsafe { bpf_probe_read_user((umyaddr_ptr + 4) as *const [u8; 4]).map_err(|_| 1u32)? },
             [0u8; 16],
         )
     } else {
@@ -967,7 +962,10 @@ fn try_sys_enter_bind(ctx: TracePointContext) -> Result<u32, u32> {
         (*e).laddr_v4 = v4;
         (*e).laddr_v6 = v6;
 
-        if SOCKET_BIND_EVENTS.output::<SocketBindEvent>(&*e, 0).is_err() {
+        if SOCKET_BIND_EVENTS
+            .output::<SocketBindEvent>(&*e, 0)
+            .is_err()
+        {
             warn!(
                 &ctx,
                 "sensor-linux-ebpf: ring buffer full, dropping bind event"

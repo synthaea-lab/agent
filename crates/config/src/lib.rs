@@ -50,11 +50,10 @@ mod secret;
 #[cfg(test)]
 pub(crate) mod test_util;
 
-pub use discovery::{discover, DEFAULT_CONFIG_PATH, ENV_CONFIG_PATH};
+pub use discovery::{DEFAULT_CONFIG_PATH, ENV_CONFIG_PATH, discover};
 pub use error::ConfigError;
 pub use load::{apply_env_overrides, load, load_from};
 pub use schema::{
-    AgentConfig, IpcConfig, LogConfig, ResourcesConfig, ServerConfig, StorageConfig,
-    SCHEMA_VERSION,
+    AgentConfig, IpcConfig, LogConfig, ResourcesConfig, SCHEMA_VERSION, ServerConfig, StorageConfig,
 };
 pub use secret::SecretRef;

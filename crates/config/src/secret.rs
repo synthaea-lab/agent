@@ -41,7 +41,7 @@ pub enum SecretRef {
     File(PathBuf),
     /// Transient variant: the raw string in the config file did not match any
     /// supported provider prefix. Never observed by end callers of
-    /// [`crate::load`] — [`crate::load::validate_semantics`] converts every
+    /// [`crate::load`] — `load::validate_semantics` converts every
     /// occurrence into [`ConfigError::SecretInvalid`] before returning. Kept
     /// public within the crate (not `#[doc(hidden)]`) so downstream code that
     /// pattern-matches on `SecretRef` is forced to handle it exhaustively, but
@@ -88,7 +88,7 @@ impl SecretRef {
     /// # Panics
     ///
     /// Panics on [`SecretRef::Invalid`]. The invariant is that
-    /// [`crate::load::validate_semantics`] rejects any config carrying that
+    /// `load::validate_semantics` rejects any config carrying that
     /// variant before returning to the caller — reaching this arm means the
     /// crate's own validation was bypassed, and no cleartext value can be
     /// produced from the raw literal in any case. Callers that construct a
@@ -115,11 +115,12 @@ impl SecretRef {
                 Ok(value)
             }
             SecretRef::File(path) => {
-                let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::SecretResolve {
-                    field: field.to_string(),
-                    reference: format!("file:{}", path.display()),
-                    reason: format!("could not read secret file: {e}"),
-                })?;
+                let raw =
+                    std::fs::read_to_string(path).map_err(|e| ConfigError::SecretResolve {
+                        field: field.to_string(),
+                        reference: format!("file:{}", path.display()),
+                        reason: format!("could not read secret file: {e}"),
+                    })?;
                 let trimmed = raw.trim_end().to_string();
                 if trimmed.is_empty() {
                     return Err(ConfigError::SecretResolve {

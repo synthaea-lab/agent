@@ -74,7 +74,10 @@ fn cmd_config_check(cli_arg: Option<&std::path::Path>) -> anyhow::Result<()> {
     let cfg = config::load(cli_arg)?;
     println!("OK: configuration loaded and validated.");
     println!("  schema_version           = {}", cfg.schema_version);
-    println!("  server.control_plane_url = {}", cfg.server.control_plane_url);
+    println!(
+        "  server.control_plane_url = {}",
+        cfg.server.control_plane_url
+    );
     println!(
         "  server.offline_fallback  = {}",
         cfg.server.offline_fallback
@@ -86,10 +89,7 @@ fn cmd_config_check(cli_arg: Option<&std::path::Path>) -> anyhow::Result<()> {
         "  storage.state_dir        = {}",
         cfg.storage.state_dir.display()
     );
-    println!(
-        "  storage.spool_max_mb     = {}",
-        cfg.storage.spool_max_mb
-    );
+    println!("  storage.spool_max_mb     = {}", cfg.storage.spool_max_mb);
     println!("  ipc.endpoint             = {}", cfg.ipc.endpoint);
     println!(
         "  resources.worker_threads = {}",
