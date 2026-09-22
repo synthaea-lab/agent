@@ -6,7 +6,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -22,6 +22,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     config::{TlsConfig, UprobesConfig},
+    container::{CgroupIdCache, DockerInfoCache, container_context},
     normalize,
     symbol_resolver::{self, SymbolInfo},
 };
@@ -264,7 +265,7 @@ const MAX_ITEMS_PER_DRAIN: usize = 256;
 /// Drains up to [`MAX_ITEMS_PER_DRAIN`] TLS capture events from the ring buffer and
 /// emits normalized schema events. Applies budget enforcement and allowlist filtering.
 macro_rules! drain_tls {
-    ($guard:expr, $sink:expr, $offset:expr, $config:expr, $budget:expr, $dropped:expr) => {{
+    ($guard:expr, $sink:expr, $offset:expr, $config:expr, $budget:expr, $dropped:expr, $container_ids:expr, $docker_cache:expr) => {{
         let mut guard = $guard.map_err(|e| err(format!("TLS ring buffer poll failed: {e}")))?;
         let rb = guard.get_inner_mut();
         let mut drained = 0usize;
@@ -297,8 +298,9 @@ macro_rules! drain_tls {
                 }
 
                 // Normalize and emit to sink
-                // TODO: container_id from /proc/<pid>/cgroup (issue #80)
-                let schema_event = normalize::tls_capture(&event, $offset, None);
+                let container =
+                    container_context(event.meta.cgroup_id, $container_ids, $docker_cache);
+                let schema_event = normalize::tls_capture(&event, $offset, container);
                 $sink.on_event(schema_event);
             }
         }
@@ -314,7 +316,7 @@ macro_rules! drain_tls {
 /// Drains up to [`MAX_ITEMS_PER_DRAIN`] readline events from the ring buffer and
 /// emits normalized schema events. Applies budget enforcement and allowlist filtering.
 macro_rules! drain_readline {
-    ($guard:expr, $sink:expr, $offset:expr, $config:expr, $budget:expr, $dropped:expr) => {{
+    ($guard:expr, $sink:expr, $offset:expr, $config:expr, $budget:expr, $dropped:expr, $container_ids:expr, $docker_cache:expr) => {{
         let mut guard =
             $guard.map_err(|e| err(format!("readline ring buffer poll failed: {e}")))?;
         let rb = guard.get_inner_mut();
@@ -347,8 +349,9 @@ macro_rules! drain_readline {
                 }
 
                 // Normalize and emit to sink
-                // TODO: container_id from /proc/<pid>/cgroup (issue #80)
-                let schema_event = normalize::readline_input(&event, $offset, None);
+                let container =
+                    container_context(event.meta.cgroup_id, $container_ids, $docker_cache);
+                let schema_event = normalize::readline_input(&event, $offset, container);
                 $sink.on_event(schema_event);
             }
         }
@@ -510,6 +513,8 @@ impl UprobesSensor {
             ReadlineBudgetTracker::new(self.config.readline.commands_per_process_per_sec);
         let mut tls_dropped = 0u64;
         let mut readline_dropped = 0u64;
+        let mut container_ids = CgroupIdCache::new();
+        let docker_cache: DockerInfoCache = Arc::new(Mutex::new(HashMap::new()));
 
         spawn_ebpf_log_drain(&mut ebpf)?;
 
@@ -568,7 +573,7 @@ impl UprobesSensor {
                         std::future::pending().await
                     }
                 } => {
-                    drain_tls!(guard, sink, offset, self.config, tls_budget, tls_dropped);
+                    drain_tls!(guard, sink, offset, self.config, tls_budget, tls_dropped, &mut container_ids, &docker_cache);
                 }
                 guard = async {
                     if let Some(ref mut rb) = readline_ring_buf {
@@ -577,7 +582,7 @@ impl UprobesSensor {
                         std::future::pending().await
                     }
                 } => {
-                    drain_readline!(guard, sink, offset, self.config, readline_budget, readline_dropped);
+                    drain_readline!(guard, sink, offset, self.config, readline_budget, readline_dropped, &mut container_ids, &docker_cache);
                 }
             }
         }
