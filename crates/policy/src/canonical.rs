@@ -137,12 +137,13 @@ fn indent(out: &mut Vec<u8>, depth: usize) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::document::{
-        ComplianceMode, PolicyMetadata, PolicyPayload, ResponseSection, SensorSection,
-        WindowsEventlogSensorPolicy, SCHEMA_VERSION,
+        ComplianceMode, PolicyMetadata, PolicyPayload, ResponseSection, SCHEMA_VERSION,
+        SensorSection, WindowsEventlogSensorPolicy,
     };
-    use std::collections::BTreeMap;
 
     fn minimal_policy(signature: &str) -> Policy {
         Policy {

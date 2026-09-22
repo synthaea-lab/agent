@@ -101,11 +101,7 @@ impl EnrichQueue {
     /// Hands an event to the worker; sheds (and counts) when the queue is full so
     /// the caller — the capture thread — never blocks.
     pub(crate) fn enqueue(&self, event: Event) {
-        if self
-            .tx
-            .try_send(QueueItem::Event(Box::new(event)))
-            .is_err()
-        {
+        if self.tx.try_send(QueueItem::Event(Box::new(event))).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }

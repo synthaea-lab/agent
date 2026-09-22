@@ -163,8 +163,8 @@ fn merge_experimental(
 mod tests {
     use super::*;
     use crate::document::{
-        ComplianceMode, PolicyMetadata, RedactionPolicy, ResponseSection, SensorSection,
-        WindowsEventlogSensorPolicy, SCHEMA_VERSION,
+        ComplianceMode, PolicyMetadata, RedactionPolicy, ResponseSection, SCHEMA_VERSION,
+        SensorSection, WindowsEventlogSensorPolicy,
     };
 
     fn baseline() -> Policy {
@@ -289,7 +289,10 @@ mod tests {
 
         let merged = apply_overrides(&base, &ov);
         let exp = merged.payload.experimental;
-        assert_eq!(exp.get("only_in_baseline"), Some(&serde_json::json!("kept")));
+        assert_eq!(
+            exp.get("only_in_baseline"),
+            Some(&serde_json::json!("kept"))
+        );
         assert_eq!(
             exp.get("in_both"),
             Some(&serde_json::json!("override_value"))
@@ -327,7 +330,10 @@ mod tests {
 
         let merged = apply_overrides(&base_with_scrub_on, &ov);
         let we = merged.payload.sensors.windows_eventlog.unwrap();
-        assert!(!we.service_installs_enabled, "the override's own change applies");
+        assert!(
+            !we.service_installs_enabled,
+            "the override's own change applies"
+        );
         assert!(
             we.redaction.unwrap().pii_scrub_enabled,
             "redaction must be inherited from baseline, not silently reset to None"
