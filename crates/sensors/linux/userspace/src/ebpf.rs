@@ -27,7 +27,9 @@ pub(crate) fn err(msg: String) -> SensorError {
 /// only — `writev`/`pwrite64`/`pwritev` are not yet attached. `sys_enter_unlink`/
 /// `sys_enter_unlinkat` and `sys_enter_rename`/`sys_enter_renameat`/
 /// `sys_enter_renameat2` are each attached in pairs/triples for the same libc-variant
-/// reason as open above.
+/// reason as open above. `sys_enter_chmod`/`sys_enter_fchmodat` and
+/// `sys_enter_chown`/`sys_enter_lchown`/`sys_enter_fchownat` (issue #262 Phase 2)
+/// follow the same pattern — the fd-only variants (`fchmod`/`fchown`) are deferred.
 pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
     ("sched_process_fork", "sched", "sched_process_fork"),
     ("sched_process_exit", "sched", "sched_process_exit"),
@@ -42,6 +44,11 @@ pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
     ("sys_enter_renameat", "syscalls", "sys_enter_renameat"),
     ("sys_enter_renameat2", "syscalls", "sys_enter_renameat2"),
     ("sys_enter_bind", "syscalls", "sys_enter_bind"),
+    ("sys_enter_chmod", "syscalls", "sys_enter_chmod"),
+    ("sys_enter_fchmodat", "syscalls", "sys_enter_fchmodat"),
+    ("sys_enter_chown", "syscalls", "sys_enter_chown"),
+    ("sys_enter_lchown", "syscalls", "sys_enter_lchown"),
+    ("sys_enter_fchownat", "syscalls", "sys_enter_fchownat"),
 ];
 
 /// `sensor_linux_wire::LineageEntry` is `repr(C)` over a `u32` and a `[u8; 16]` — every
