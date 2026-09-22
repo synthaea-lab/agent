@@ -255,13 +255,22 @@ fn read_wire_event<T: Copy>(item: &[u8]) -> Option<T> {
     Some(unsafe { core::ptr::read_unaligned(item.as_ptr().cast::<T>()) })
 }
 
-/// Drains TLS capture events from the ring buffer and emits normalized schema events.
-/// Applies budget enforcement and allowlist filtering.
+/// Upper bound on items one drain call takes from a ring buffer before returning
+/// control to `select!` — see `sensor_linux::MAX_ITEMS_PER_DRAIN` (issue #326) for
+/// why an unbounded `while let Some(item) = rb.next()` loop can starve this sensor's
+/// other branch (and the reactor) indefinitely under sustained producer load.
+const MAX_ITEMS_PER_DRAIN: usize = 256;
+
+/// Drains up to [`MAX_ITEMS_PER_DRAIN`] TLS capture events from the ring buffer and
+/// emits normalized schema events. Applies budget enforcement and allowlist filtering.
 macro_rules! drain_tls {
     ($guard:expr, $sink:expr, $offset:expr, $config:expr, $budget:expr, $dropped:expr) => {{
         let mut guard = $guard.map_err(|e| err(format!("TLS ring buffer poll failed: {e}")))?;
         let rb = guard.get_inner_mut();
-        while let Some(item) = rb.next() {
+        let mut drained = 0usize;
+        while drained < MAX_ITEMS_PER_DRAIN {
+            let Some(item) = rb.next() else { break };
+            drained += 1;
             if let Some(event) = read_wire_event::<TlsCaptureEvent>(&item) {
                 // Allowlist check: if allowlist is non-empty, only allow listed processes
                 if !$config.tls.process_allowlist.is_empty() {
@@ -293,18 +302,26 @@ macro_rules! drain_tls {
                 $sink.on_event(schema_event);
             }
         }
-        guard.clear_ready();
+        // See `drain!` in `sensor_linux::sensor` (issue #326): only clear readiness
+        // once the buffer actually ran dry, so a buffer still at the cap keeps
+        // getting re-polled on the next `select!` iteration instead of starving.
+        if drained < MAX_ITEMS_PER_DRAIN {
+            guard.clear_ready();
+        }
     }};
 }
 
-/// Drains readline events from the ring buffer and emits normalized schema events.
-/// Applies budget enforcement and allowlist filtering.
+/// Drains up to [`MAX_ITEMS_PER_DRAIN`] readline events from the ring buffer and
+/// emits normalized schema events. Applies budget enforcement and allowlist filtering.
 macro_rules! drain_readline {
     ($guard:expr, $sink:expr, $offset:expr, $config:expr, $budget:expr, $dropped:expr) => {{
         let mut guard =
             $guard.map_err(|e| err(format!("readline ring buffer poll failed: {e}")))?;
         let rb = guard.get_inner_mut();
-        while let Some(item) = rb.next() {
+        let mut drained = 0usize;
+        while drained < MAX_ITEMS_PER_DRAIN {
+            let Some(item) = rb.next() else { break };
+            drained += 1;
             if let Some(event) = read_wire_event::<ReadlineInputEvent>(&item) {
                 // Allowlist check: if allowlist is non-empty, only allow listed shells
                 if !$config.readline.process_allowlist.is_empty() {
@@ -335,7 +352,9 @@ macro_rules! drain_readline {
                 $sink.on_event(schema_event);
             }
         }
-        guard.clear_ready();
+        if drained < MAX_ITEMS_PER_DRAIN {
+            guard.clear_ready();
+        }
     }};
 }
 

@@ -41,18 +41,33 @@ impl Default for LinuxSensor {
     }
 }
 
-/// Drains every ready item from one ring buffer, decoding `$wire_ty` and forwarding
-/// the event `$to_event` builds from it. `$to_event` is `Fn(&$wire_ty) -> Event` so
-/// each leg can enrich with its own reads: exec's `/proc/<pid>/cmdline`, and all
-/// three's container attribution (issue #80/#204) — the latter no longer touches
-/// `/proc` at all, resolving `$wire_ty::meta.cgroup_id` against cgroupfs instead
-/// (see [`CgroupIdCache`]), specifically to avoid re-triggering `read_proc_cmdline`'s
-/// exact `spawn_blocking` tradeoff on every file-open/connect event, not just exec.
+/// Upper bound on items one `drain!` call takes from a ring buffer before returning
+/// control to `select!` (issue #326). `RingBuf::next()` is a synchronous read of live
+/// shared memory with no `.await` in this loop — under a sustained producer (e.g. a
+/// tight `write(2)` loop) it can keep returning `Some` indefinitely, and a loop with
+/// no yield point never gives `select!` a chance to re-poll the other nine branches,
+/// starving them completely rather than just statistically disadvantaging them. This
+/// cap forces a return to the top of the `select!` loop regularly, which re-polls
+/// every branch and lets tokio's cooperative-scheduling budget actually enforce
+/// fairness between them.
+const MAX_ITEMS_PER_DRAIN: usize = 256;
+
+/// Drains up to [`MAX_ITEMS_PER_DRAIN`] ready items from one ring buffer, decoding
+/// `$wire_ty` and forwarding the event `$to_event` builds from it. `$to_event` is
+/// `Fn(&$wire_ty) -> Event` so each leg can enrich with its own reads: exec's
+/// `/proc/<pid>/cmdline`, and all three's container attribution (issue #80/#204) —
+/// the latter no longer touches `/proc` at all, resolving `$wire_ty::meta.cgroup_id`
+/// against cgroupfs instead (see [`CgroupIdCache`]), specifically to avoid
+/// re-triggering `read_proc_cmdline`'s exact `spawn_blocking` tradeoff on every
+/// file-open/connect event, not just exec.
 macro_rules! drain {
     ($guard:expr, $wire_ty:ty, $sink:expr, $to_event:expr) => {{
         let mut guard = $guard.map_err(|e| err(format!("ring buffer poll failed: {e}")))?;
         let rb = guard.get_inner_mut();
-        while let Some(item) = rb.next() {
+        let mut drained = 0usize;
+        while drained < MAX_ITEMS_PER_DRAIN {
+            let Some(item) = rb.next() else { break };
+            drained += 1;
             if item.len() >= core::mem::size_of::<$wire_ty>() {
                 // SAFETY: the length was checked against size_of::<$wire_ty>() above,
                 // the wire types are repr(C) plain-old-data, and read_unaligned
@@ -61,7 +76,14 @@ macro_rules! drain {
                 $sink.on_event($to_event(&event));
             }
         }
-        guard.clear_ready();
+        // Only clear readiness once the buffer actually ran dry. If we stopped
+        // because we hit the cap, more data is still waiting — leaving the
+        // ready-flag set makes the next `select!` iteration re-poll this branch
+        // immediately instead of blocking for the next epoll edge, which is what
+        // continues draining it without starving the other branches in the meantime.
+        if drained < MAX_ITEMS_PER_DRAIN {
+            guard.clear_ready();
+        }
     }};
 }
 
