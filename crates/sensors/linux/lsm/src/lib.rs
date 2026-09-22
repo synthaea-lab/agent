@@ -55,20 +55,22 @@
 //!   feed — an LSM-sourced open and the existing tracepoint-sourced one need a
 //!   decided relationship, e.g. dedup by pid+path+timestamp window, before this counts
 //!   as telemetry rather than a liveness signal).
-//! - **Capability reporting on a kernel without `lsm=bpf`** (issue #91's third
-//!   `Done when` item). Two separate gaps, not just "untested": (1) there is no
-//!   schema surface for it yet — `schema::sensor::Capabilities` describes the
-//!   *main* `Sensor`'s event quality (exec/file/connect/auth, attribution,
-//!   lineage), not a supplementary poll source like this one (same "no `Sensor`
-//!   impl, caller owns the handoff" shape as `sensor-linux-netlink`/
-//!   `sensor-linux-journal`) — adding an LSM-coverage field to a struct shared
-//!   with Windows/macOS sensors is a cross-cutting decision, not this crate's to
-//!   make alone; (2) this crate isn't wired into `agent` at all yet (see the
-//!   dev-only dependency in `agent/tests/lsm_io_uring_evasion.rs` — no
-//!   production caller), so there is no live capability report to validate the
-//!   correctness of in the first place. [`detect_hook_support`]'s own doc already
-//!   covers the narrower "BTF presence isn't proof of a live hook" distinction at
-//!   the function level.
+//! - **Structured capability reporting on a kernel without `lsm=bpf`** (issue #91's
+//!   third `Done when` item, issue #313). `agent::cmd_run` now loads/attaches this
+//!   hook at startup (behind the same `can_use_ebpf()` preflight the primary
+//!   sensor uses — no point attempting a second `Ebpf::load` on a host that can't
+//!   do eBPF at all) and logs the outcome honestly: attached, not supported on
+//!   this kernel, or compiled-in-but-not-live. What's still missing is a
+//!   *structured* surface for that outcome — `schema::sensor::Capabilities`
+//!   describes the *main* `Sensor`'s event quality (exec/file/connect/auth,
+//!   attribution, lineage), not a supplementary poll source like this one (same
+//!   "no `Sensor` impl, caller owns the handoff" shape as `sensor-linux-netlink`/
+//!   `sensor-linux-journal`), and adding an LSM-coverage field to a struct shared
+//!   with Windows/macOS sensors is a cross-cutting schema decision, not this
+//!   crate's to make alone — a log line is the honest, scoped answer until that
+//!   decision is made. [`detect_hook_support`]'s own doc already covers the
+//!   narrower "BTF presence isn't proof of a live hook" distinction at the
+//!   function level.
 
 #[cfg(target_os = "linux")]
 mod attach;

@@ -49,13 +49,15 @@ sensor-linux-audit = { path = "../crates/sensors/linux/audit" }
 sensor-linux-netlink = { path = "../crates/sensors/linux/netlink" }
 sensor-linux-journal = { path = "../crates/sensors/linux/journal" }
 sensor-linux-uprobes = { path = "../crates/sensors/linux/uprobes" }
-libc = "0.2"
-
-# sensor-linux-lsm is not wired into `cmd_run` yet (issue #91 — inline blocking
-# needs the verdict model from #131/#133 first); only the real-kernel regression
-# test below exercises it.
-[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Observation-only file_open hook (issue #91/#313): cmd_run attaches it
+# best-effort alongside the primary sensor. Inline blocking (-EPERM on a
+# verdict) still needs the verdict model from #131/#133 first.
 sensor-linux-lsm = { path = "../crates/sensors/linux/lsm" }
+# Named directly in `commands::linux::attach_lsm_hooks`'s return type (the
+# `Ebpf` object that must outlive the hook) — same version sensor-linux-lsm
+# itself uses.
+aya = { version = "0.14", default-features = false }
+libc = "0.2"
 
 [dev-dependencies]
 schema = { path = "../crates/schema", features = ["test-fixtures"] }
