@@ -50,6 +50,11 @@ members = [
     "crates/device-control",
     "crates/inventory",
 ]
+# The fuzz crate is fully excluded (not even a non-default member): it needs
+# nightly + libFuzzer instrumentation and is run explicitly —
+#   cargo +nightly fuzz run audit_parse
+# from the repo root (see fuzz/Cargo.toml).
+exclude = ["fuzz"]
 # The eBPF probe crate is a member (aya-build resolves it by package id in the
 # workspace) but not a default member: it targets bpfel-unknown-none and only builds
 # via sensor-linux's build.rs with the eBPF toolchain present. Plain cargo commands
