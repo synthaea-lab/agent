@@ -38,6 +38,7 @@ dependencies = [
  "sensor-linux-lsm",
  "sensor-linux-netlink",
  "sensor-linux-uprobes",
+ "sensor-macos",
  "sensor-windows",
  "sensor-windows-eventlog",
  "serde",
@@ -2341,6 +2342,12 @@ dependencies = [
 [[package]]
 name = "sensor-macos"
 version = "0.1.0"
+dependencies = [
+ "cc",
+ "schema",
+ "thiserror 2.0.20",
+ "tracing",
+]
 
 [[package]]
 name = "sensor-macos-network-extension"

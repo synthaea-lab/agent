@@ -16,7 +16,10 @@
 mod commands;
 mod enrich_queue;
 mod health;
-#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", windows)),
+    allow(dead_code)
+)]
 mod heartbeat;
 // Linux-only: the module itself calls raw POSIX signal APIs
 // (sigemptyset/pthread_sigmask/sigwaitinfo) that don't exist in the `libc` crate on
@@ -27,9 +30,15 @@ mod heartbeat;
 mod kill_loudness;
 mod protected;
 mod silence;
-#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", windows)),
+    allow(dead_code)
+)]
 mod sink;
-#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", windows)),
+    allow(dead_code)
+)]
 mod upload;
 
 use clap::{Parser, Subcommand};

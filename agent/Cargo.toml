@@ -37,6 +37,10 @@ sensor-windows = { path = "../crates/sensors/windows/etw" }
 sensor-windows-eventlog = { path = "../crates/sensors/windows/eventlog" }
 ctrlc = "3"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+sensor-macos = { path = "../crates/sensors/macos/endpoint-security" }
+ctrlc = "3"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 sensor-linux = { path = "../crates/sensors/linux/userspace" }
 sensor-linux-audit = { path = "../crates/sensors/linux/audit" }

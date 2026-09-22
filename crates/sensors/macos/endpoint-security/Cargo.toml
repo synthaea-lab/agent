@@ -10,3 +10,14 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+schema = { path = "../../../schema" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Unconditional, not target-gated: build scripts compile for the HOST, so a
+# `[target.'cfg(target_os = "macos")'.build-dependencies]` gate (which follows
+# the TARGET) would leave a macOS host without `cc` when cross-checking the
+# Linux target (`cargo clippy --target x86_64-unknown-linux-gnu`). The build
+# script itself returns early on every non-macOS target.
+[build-dependencies]
+cc = "1"

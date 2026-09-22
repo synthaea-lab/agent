@@ -159,6 +159,28 @@ pub const FLAG_PERSISTENCE_ACCOUNT_ARTIFACT: u32 = 0x0800_0000;
 /// techniques cross-fire off a single event.
 pub const FLAG_PERSISTENCE_SYSTEMD_ARTIFACT: u32 = 0x4000_0000;
 
+/// Same principle as [`FLAG_PERSISTENCE_ARTIFACT`], for a macOS **launch item
+/// registration** observed by Background Task Management (`EndpointSecurity`'s
+/// `BTM_LAUNCH_ITEM_ADD`, macOS 13+) — launch agents/daemons (ATT&CK
+/// T1543.001/.004) and login items (T1547.015), set by `sensor-macos` (issue
+/// #32). Like Windows' 7045 and unlike the Linux systemd approximation, this
+/// is a registration-time fact from the OS itself: BTM emits it when the item
+/// is added, whatever the path taken (a plist dropped in `LaunchAgents`, an
+/// `SMAppService` registration, MDM).
+///
+/// `FileOpenEvent::path` carries the persistence *payload* (the executable
+/// resolved from the launchd plist) when BTM provides it, else the item URL;
+/// `meta` identifies the instigating process when BTM attributes one. A raw
+/// plist write additionally surfaces as an ordinary file event and is caught
+/// by `rules::check_persistence_write`'s path patterns — two distinct signals,
+/// not a duplicate (BTM also fires for registrations that never touch a
+/// watched directory).
+///
+/// A distinct bit from every other `FLAG_PERSISTENCE_*` constant, so no two
+/// techniques cross-fire off a single event. Not a serialization-visible
+/// schema change (same reasoning as [`FLAG_PERSISTENCE_ARTIFACT`]).
+pub const FLAG_PERSISTENCE_BTM_ARTIFACT: u32 = 0x0400_0000;
+
 /// Identity of the user a process runs as, per platform.
 ///
 /// A bare `uid: u32` cannot represent Windows (audit finding F-3: SYSTEM spawning
