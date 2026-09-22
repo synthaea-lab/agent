@@ -1403,17 +1403,16 @@ fn try_sys_enter_listen(ctx: TracePointContext) -> Result<u32, u32> {
     #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     let backlog: u64 = unsafe { ctx.read_at(LISTEN_BACKLOG_OFFSET).map_err(|_| 1u32)? };
     #[cfg(bpf_target_arch = "x86")]
-    let backlog: u64 =
-        unsafe { ctx.read_at::<u32>(LISTEN_BACKLOG_OFFSET).map_err(|_| 1u32)? as u64 };
+    let backlog: u64 = unsafe {
+        ctx.read_at::<u32>(LISTEN_BACKLOG_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
 
     let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
     let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
 
-    let key = BindAddrKey {
-        pid,
-        fd: fd as u32,
-    };
+    let key = BindAddrKey { pid, fd: fd as u32 };
     let bound = unsafe { BIND_ADDR_MAP.get(&key) }.copied();
 
     let e = LISTEN_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;

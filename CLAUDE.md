@@ -44,7 +44,9 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
 - Logging: `tracing`, structured fields; never log event payload contents at info level.
 - Visibility: `pub(crate)` by default; a crate's `pub` surface is its contract — keep it
   minimal and deliberate.
-- Config: format decided once via ADR before the first config file lands.
+- Config: TOML `agent.toml` per ADR-0013 — the agent **fails fast** on a missing or
+  invalid file (`config::load`, discovery order in `crates/config`); `RUST_LOG` still
+  overrides the configured log level for ad-hoc debugging.
 - Cross-cutting decisions get an ADR (`docs/adr/template.md`) at the time they're made.
 
 ## Code quality (full reference: `docs/development/code-style.md`)
@@ -64,6 +66,13 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
   exclusions must be gated on evidence (`policy::name_exclusion_applies`).
 - Bug fixes land with the regression test that would have caught them, named after
   the behavior.
+- Test event literals come from `schema::fixtures` (feature `test-fixtures`,
+  dev-dependencies only) via struct-update syntax — never hand-write a full
+  `EventMeta`/event literal in a test; the golden suite (`schema/tests/golden.rs`)
+  is the one deliberate exception.
+- Byte parsers (anything consuming kernel-socket or attacker-influenced bytes) get
+  a never-panic robustness suite in their crate's `tests/` and, where high-value, a
+  fuzz target in `fuzz/`.
 - Platform-gated code must be linted for its platform before pushing:
   `cargo clippy -p sensor-windows --target x86_64-pc-windows-msvc` (and the Linux
   equivalent) — host-only clippy misses it entirely.
@@ -77,9 +86,17 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
 
 ## Commands
 
+- `tools/gauntlet.sh` — the full local check matrix (fmt, deps, clippy on host +
+  linux target + the Windows sensor crates, tests, cargo-deny, docs). `--fast`
+  skips the cross-target/docs passes; opt-in pre-push gate:
+  `git config core.hooksPath tools/hooks`. **While CI is billing-blocked
+  (workflow_dispatch only, issue #318), this is the enforcement — run it before
+  every push.**
 - `cargo check` / `cargo test` (default members) — works on any OS; with `--workspace`, add `--exclude sensor-linux-ebpf` (bpfel target).
 - `cargo clippy --workspace --exclude sensor-linux-ebpf --all-targets -- -D warnings` — must stay clean.
 - `python3 tools/check-deps.py` — dependency direction check.
+- `cargo +nightly fuzz run audit_parse` / `netlink_parse` — coverage-guided parser
+  fuzzing (`fuzz/README.md`; workspace-excluded, needs `cargo-fuzz`).
 
 ## Migration order (from `old/`)
 
