@@ -58,6 +58,22 @@ enum syn_es_kind {
     /* Background Task Management registered a launch item (launchd plist or
      * login item) — macOS 13+; never delivered on older hosts. */
     SYN_ES_KIND_BTM_LAUNCH_ITEM_ADD = 7,
+    /* Session events (#96, macOS 13+). */
+    SYN_ES_KIND_SSH_LOGIN = 8,
+    SYN_ES_KIND_LOGIN = 9,      /* login(1) */
+    SYN_ES_KIND_LW_LOGIN = 10,  /* loginwindow session login */
+    /* com.apple.quarantine landed on a file (#96): SETEXTATTR filtered to
+     * that one attribute, with the quarantine string and kMDItemWhereFroms
+     * read back from the file at event time. */
+    SYN_ES_KIND_QUARANTINE = 11,
+    SYN_ES_KIND_MOUNT = 12,
+    SYN_ES_KIND_UNMOUNT = 13,
+    /* A signal aimed at an EndpointSecurity client process — the
+     * tamper-relevant subset; the platform's full signal stream is dropped
+     * in the shim (#96). */
+    SYN_ES_KIND_SIGNAL_ES_CLIENT = 14,
+    /* XPC connect by service name (#96, macOS 14+). */
+    SYN_ES_KIND_XPC_CONNECT = 15,
 };
 
 /* Argv entries beyond this cap are dropped (argc_total still carries the real
@@ -101,6 +117,31 @@ typedef struct {
     /* Executable path from the launchd plist, when BTM resolves one — the
      * actual persistence payload. */
     syn_es_str btm_executable_path;
+
+    /* Session events (SSH_LOGIN / LOGIN / LW_LOGIN). */
+    uint8_t auth_success;
+    syn_es_str auth_username;
+    syn_es_str auth_source_address; /* SSH only */
+
+    /* SYN_ES_KIND_QUARANTINE — file_path is the quarantined file. Both
+     * values are read back via getxattr at event time; absent (NULL) when
+     * the read raced the writer or the attribute is missing. */
+    syn_es_str quarantine_raw; /* the com.apple.quarantine string */
+    syn_es_str wherefroms_raw; /* kMDItemWhereFroms, raw binary plist bytes */
+
+    /* MOUNT / UNMOUNT — file_path is the mount point. */
+    syn_es_str mount_source;
+    syn_es_str mount_fs_type;
+    uint8_t mount_readonly;
+
+    /* SYN_ES_KIND_SIGNAL_ES_CLIENT — file_path is the target's image path;
+     * meta is the SENDER. */
+    int32_t signal_number;
+    int32_t signal_target_pid;
+
+    /* SYN_ES_KIND_XPC_CONNECT */
+    syn_es_str xpc_service_name;
+    uint32_t xpc_domain_type; /* es_xpc_domain_type_t raw value */
 } syn_es_event;
 
 /* Subscription groups (bitflags) — the shim owns the mapping to concrete
@@ -108,6 +149,13 @@ typedef struct {
 #define SYN_ES_GROUP_EXEC 0x1u
 #define SYN_ES_GROUP_FILE 0x2u
 #define SYN_ES_GROUP_PERSISTENCE 0x4u
+/* #96 widening. Families needing a newer OS than the host are skipped
+ * silently at subscribe time (capabilities honesty is the Rust side's job). */
+#define SYN_ES_GROUP_SESSIONS 0x8u    /* macOS 13+ */
+#define SYN_ES_GROUP_PROVENANCE 0x10u /* setextattr → quarantine */
+#define SYN_ES_GROUP_MOUNT 0x20u
+#define SYN_ES_GROUP_TAMPER 0x40u /* signal → ES-client targets */
+#define SYN_ES_GROUP_XPC 0x80u    /* macOS 14+ */
 
 /* Invoked synchronously on an EndpointSecurity dispatch thread for every
  * subscribed message. `event` and all strings it references are valid only

@@ -144,8 +144,11 @@ impl Sensor for MacosSensor {
             // Network visibility is sensor-macos-network-extension (#33); ES
             // itself carries none (unix-socket events aside).
             connect_events: false,
-            // Login/session events arrive with the ES widening (#96).
-            auth_events: false,
+            // #96: SSH/console/loginwindow logins → Event::Auth. Honest
+            // caveat: those ES families are macOS 13+, so on 12.x this stays
+            // subscribed-but-silent; 12.x predates this project's supported
+            // floor, so the static value is accurate where the agent ships.
+            auth_events: true,
             user_attribution: true,
             parent_lineage: true,
         }
@@ -183,8 +186,14 @@ impl Sensor for MacosSensor {
             tracing::warn!("es_mute_process(self) failed; expect self-generated file events");
         }
 
-        let groups =
-            ffi::SYN_ES_GROUP_EXEC | ffi::SYN_ES_GROUP_FILE | ffi::SYN_ES_GROUP_PERSISTENCE;
+        let groups = ffi::SYN_ES_GROUP_EXEC
+            | ffi::SYN_ES_GROUP_FILE
+            | ffi::SYN_ES_GROUP_PERSISTENCE
+            | ffi::SYN_ES_GROUP_SESSIONS
+            | ffi::SYN_ES_GROUP_PROVENANCE
+            | ffi::SYN_ES_GROUP_MOUNT
+            | ffi::SYN_ES_GROUP_TAMPER
+            | ffi::SYN_ES_GROUP_XPC;
         // SAFETY: `client` is the live client created above.
         let sub = unsafe { ffi::syn_es_subscribe(client, groups) };
         if sub != 0 {
@@ -198,7 +207,8 @@ impl Sensor for MacosSensor {
 
         tracing::info!(
             sensor = self.name(),
-            "EndpointSecurity client subscribed (exec + file + persistence)"
+            "EndpointSecurity client subscribed (exec + file + persistence + \
+             sessions + provenance + mount + tamper + xpc)"
         );
 
         // Park until stop. wait_timeout (not plain wait) so a missed notify

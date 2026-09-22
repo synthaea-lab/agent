@@ -102,7 +102,17 @@ pub mod time;
 /// claimed as 18 → 19 while #95's branch was open; renumbered once #263's
 /// `SocketAccept` (18 → 19) merged into `main` first — the same coordination
 /// note as v13 and ADR-0005.
-pub const SCHEMA_VERSION: u32 = 20;
+///
+/// Bumped 20 → 21 for [`Event::FileQuarantine`], [`Event::Mount`],
+/// [`Event::Signal`], and [`Event::XpcConnect`] (#96, the macOS
+/// `EndpointSecurity` catalog widening): download provenance, mount/unmount,
+/// tamper-relevant signals, and XPC connections. `Mount` and `Signal` are
+/// platform-neutral shapes (Linux mount/kill telemetry can reuse them);
+/// `FileQuarantine`/`XpcConnect` are macOS-only families per the v20
+/// precedent. Same serialization-visible reasoning as v13-v20. Originally
+/// claimed as 19 → 20 while #96's branch was open; renumbered with the rest
+/// of the macOS stack when `SocketAccept` took v19 on `main` first.
+pub const SCHEMA_VERSION: u32 = 21;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -1042,6 +1052,93 @@ pub struct GatekeeperVerdictEvent {
     pub result_code: u32,
 }
 
+/// macOS download provenance — the `com.apple.quarantine` extended attribute
+/// was set on a file, marking it as downloaded from the network. Emitted by
+/// `sensor-macos` (#96) on `SETEXTATTR`, with the quarantine string and the
+/// `kMDItemWhereFroms` origin URLs read back from the file at event time.
+///
+/// This is the network→file link: a later exec of `path` joins this event to
+/// answer "where did that binary come from" — the macOS mark-of-the-web
+/// (cross-platform note in `docs/sensors/sources.md`).
+///
+/// `agent`/`origin_url`/`referrer_url` are `None` when the writing application
+/// did not (or had not yet) recorded them — the quarantine mark alone is still
+/// the signal that the file arrived from outside.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileQuarantineEvent {
+    pub meta: EventMeta,
+    /// The quarantined file.
+    pub path: String,
+    /// Application that downloaded it, from the quarantine string's agent
+    /// field (e.g. `Safari`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Download URL from `kMDItemWhereFroms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_url: Option<String>,
+    /// Referrer URL from `kMDItemWhereFroms`, when recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub referrer_url: Option<String>,
+}
+
+/// A filesystem was mounted or unmounted. Emitted by `sensor-macos` (#96);
+/// deliberately platform-neutral — Linux mount telemetry can reuse it.
+///
+/// Detection value: staging via disk images (`hdiutil attach` of a downloaded
+/// DMG is the classic macOS malware delivery step), USB mass storage, and
+/// unmounts destroying evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountEvent {
+    pub meta: EventMeta,
+    /// Where the filesystem is (or was) mounted.
+    pub mount_point: String,
+    /// What was mounted (device node, image path, network source), when the
+    /// platform reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Filesystem type (`hfs`, `apfs`, `smbfs`, ...), when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fs_type: Option<String>,
+    /// True for a read-only mount.
+    pub readonly: bool,
+    /// True for a mount, false for an unmount.
+    pub mounted: bool,
+}
+
+/// A signal was sent to a monitored security process. Emitted by
+/// `sensor-macos` (#96), filtered at the source to targets that are
+/// `EndpointSecurity` clients — i.e. this agent and other security tools:
+/// the tamper-attempt subset of the platform's full (and enormous) signal
+/// stream, per the sensor's volume discipline. Platform-neutral shape;
+/// a Linux kill-tracing source can reuse it with its own target filter.
+///
+/// `meta` is the *sender* — the interesting party in a tamper attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignalEvent {
+    pub meta: EventMeta,
+    /// Signal number, platform-native (SIGKILL=9, SIGTERM=15, ...).
+    pub signal: u32,
+    pub target_pid: u32,
+    /// Image path of the targeted process, when the platform resolves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_image_path: Option<String>,
+}
+
+/// macOS XPC connection — a process connected to an XPC service by name.
+/// Emitted by `sensor-macos` (#96, macOS 14+). High-volume by nature; rules
+/// should match on sensitive `service_name`s (e.g. TCC, launchd control,
+/// screen capture services) rather than alerting per event. macOS-only
+/// family, per the v19 precedent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct XpcConnectEvent {
+    pub meta: EventMeta,
+    /// The requested service name (e.g. `com.apple.tccd`).
+    pub service_name: String,
+    /// Raw `es_xpc_domain_type_t` (1 = system, 2 = user, ... 7 = pid) — kept
+    /// as the platform reports it, uninterpreted.
+    pub domain_type: u32,
+}
+
 /// The normalized event envelope.
 ///
 /// `#[non_exhaustive]`: new telemetry categories (registry, DNS, image load, ...) are
@@ -1081,6 +1178,10 @@ pub enum Event {
     SocketAccept(SocketAcceptEvent),
     TccDecision(TccDecisionEvent),
     GatekeeperVerdict(GatekeeperVerdictEvent),
+    FileQuarantine(FileQuarantineEvent),
+    Mount(MountEvent),
+    Signal(SignalEvent),
+    XpcConnect(XpcConnectEvent),
 }
 
 impl Event {
@@ -1118,6 +1219,10 @@ impl Event {
             Event::SocketAccept(e) => &e.meta,
             Event::TccDecision(e) => &e.meta,
             Event::GatekeeperVerdict(e) => &e.meta,
+            Event::FileQuarantine(e) => &e.meta,
+            Event::Mount(e) => &e.meta,
+            Event::Signal(e) => &e.meta,
+            Event::XpcConnect(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.

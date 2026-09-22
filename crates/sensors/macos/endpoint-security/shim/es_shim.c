@@ -12,6 +12,8 @@
 #include <string.h>
 #include <sys/fcntl.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
+#include <sys/xattr.h>
 
 struct syn_es_client {
     es_client_t *es;
@@ -48,10 +50,38 @@ static syn_es_str compose_path(char *buf, size_t buf_len, es_string_token_t dir,
     return s;
 }
 
+/* Reads one xattr of `path` into buf; returns a str pointing at buf (valid
+ * while buf is), or an absent str when the attribute is missing/unreadable —
+ * e.g. the read raced the file's writer, which the Rust side treats as
+ * "value unavailable", never as an error. */
+static syn_es_str read_xattr(const char *path, const char *name, char *buf,
+                             size_t buf_len) {
+    syn_es_str absent = {NULL, 0};
+    ssize_t n = getxattr(path, name, buf, buf_len, 0, 0);
+    if (n < 0) {
+        return absent;
+    }
+    syn_es_str s = {buf, (size_t)n};
+    return s;
+}
+
+static void fill_mount(syn_es_event *ev, const struct statfs *fs, int mounted) {
+    ev->kind = mounted ? SYN_ES_KIND_MOUNT : SYN_ES_KIND_UNMOUNT;
+    syn_es_str on = {fs->f_mntonname, strnlen(fs->f_mntonname, MNAMELEN)};
+    syn_es_str from = {fs->f_mntfromname, strnlen(fs->f_mntfromname, MNAMELEN)};
+    syn_es_str type = {fs->f_fstypename, strnlen(fs->f_fstypename, MFSTYPENAMELEN)};
+    ev->file_path = on;
+    ev->mount_source = from;
+    ev->mount_fs_type = type;
+    ev->mount_readonly = (fs->f_flags & MNT_RDONLY) ? 1 : 0;
+}
+
 static void handle_message(syn_es_client *client, const es_message_t *msg) {
-    /* Scratch for composed destination paths — must outlive the callback call
-     * below, hence declared at this scope. */
+    /* Scratch for composed destination paths and xattr values — must outlive
+     * the callback call below, hence declared at this scope. */
     char path_buf[2048];
+    char quarantine_buf[1024];
+    char wherefroms_buf[4096];
 
     syn_es_event ev;
     memset(&ev, 0, sizeof(ev));
@@ -160,6 +190,97 @@ static void handle_message(syn_es_client *client, const es_message_t *msg) {
         }
         break;
     }
+    case ES_EVENT_TYPE_NOTIFY_SETEXTATTR: {
+        const es_event_setextattr_t *set = &msg->event.setextattr;
+        /* Only the quarantine mark is provenance; every other xattr write on
+         * the system is dropped here, before crossing into Rust. */
+        if (set->extattr.length != strlen("com.apple.quarantine") ||
+            memcmp(set->extattr.data, "com.apple.quarantine",
+                   set->extattr.length) != 0) {
+            return;
+        }
+        ev.kind = SYN_ES_KIND_QUARANTINE;
+        ev.file_path = str_from_token(set->target->path);
+        /* getxattr needs a NUL-terminated path; ES tokens are
+         * length-delimited, so copy. A path over the scratch size cannot be
+         * read back — forward the event without the values. */
+        int n = snprintf(path_buf, sizeof(path_buf), "%.*s",
+                         (int)set->target->path.length, set->target->path.data);
+        if (n >= 0 && (size_t)n < sizeof(path_buf)) {
+            ev.quarantine_raw =
+                read_xattr(path_buf, "com.apple.quarantine", quarantine_buf,
+                           sizeof(quarantine_buf));
+            ev.wherefroms_raw =
+                read_xattr(path_buf, "com.apple.metadata:kMDItemWhereFroms",
+                           wherefroms_buf, sizeof(wherefroms_buf));
+        }
+        break;
+    }
+    case ES_EVENT_TYPE_NOTIFY_MOUNT:
+        fill_mount(&ev, msg->event.mount.statfs, 1);
+        break;
+    case ES_EVENT_TYPE_NOTIFY_UNMOUNT:
+        fill_mount(&ev, msg->event.unmount.statfs, 0);
+        break;
+    case ES_EVENT_TYPE_NOTIFY_SIGNAL: {
+        const es_event_signal_t *sig = &msg->event.signal;
+        /* Tamper filter: only signals aimed at an EndpointSecurity client
+         * (this agent, other security tools). The full system-wide signal
+         * stream is volume without signal. */
+        if (!sig->target->is_es_client) {
+            return;
+        }
+        ev.kind = SYN_ES_KIND_SIGNAL_ES_CLIENT;
+        ev.signal_number = sig->sig;
+        ev.signal_target_pid = audit_token_to_pid(sig->target->audit_token);
+        ev.file_path = str_from_token(sig->target->executable->path);
+        break;
+    }
+    case ES_EVENT_TYPE_NOTIFY_OPENSSH_LOGIN: {
+        if (__builtin_available(macOS 13.0, *)) {
+            const es_event_openssh_login_t *ssh = msg->event.openssh_login;
+            ev.kind = SYN_ES_KIND_SSH_LOGIN;
+            ev.auth_success = ssh->success ? 1 : 0;
+            ev.auth_username = str_from_token(ssh->username);
+            ev.auth_source_address = str_from_token(ssh->source_address);
+        } else {
+            return;
+        }
+        break;
+    }
+    case ES_EVENT_TYPE_NOTIFY_LOGIN_LOGIN: {
+        if (__builtin_available(macOS 13.0, *)) {
+            const es_event_login_login_t *login = msg->event.login_login;
+            ev.kind = SYN_ES_KIND_LOGIN;
+            ev.auth_success = login->success ? 1 : 0;
+            ev.auth_username = str_from_token(login->username);
+        } else {
+            return;
+        }
+        break;
+    }
+    case ES_EVENT_TYPE_NOTIFY_LW_SESSION_LOGIN: {
+        if (__builtin_available(macOS 13.0, *)) {
+            const es_event_lw_session_login_t *lw = msg->event.lw_session_login;
+            ev.kind = SYN_ES_KIND_LW_LOGIN;
+            ev.auth_success = 1; /* loginwindow only reports completed logins */
+            ev.auth_username = str_from_token(lw->username);
+        } else {
+            return;
+        }
+        break;
+    }
+    case ES_EVENT_TYPE_NOTIFY_XPC_CONNECT: {
+        if (__builtin_available(macOS 14.0, *)) {
+            const es_event_xpc_connect_t *xpc = msg->event.xpc_connect;
+            ev.kind = SYN_ES_KIND_XPC_CONNECT;
+            ev.xpc_service_name = str_from_token(xpc->service_name);
+            ev.xpc_domain_type = (uint32_t)xpc->service_domain_type;
+        } else {
+            return;
+        }
+        break;
+    }
     default:
         /* Not subscribed / not handled — nothing to forward. */
         return;
@@ -193,7 +314,7 @@ int32_t syn_es_client_new(syn_es_event_cb cb, void *ctx,
 }
 
 int32_t syn_es_subscribe(syn_es_client *client, uint32_t groups) {
-    es_event_type_t events[16];
+    es_event_type_t events[24];
     uint32_t count = 0;
     if (groups & SYN_ES_GROUP_EXEC) {
         events[count++] = ES_EVENT_TYPE_NOTIFY_EXEC;
@@ -210,6 +331,28 @@ int32_t syn_es_subscribe(syn_es_client *client, uint32_t groups) {
          * whole es_subscribe call on older hosts, so gate it here. */
         if (__builtin_available(macOS 13.0, *)) {
             events[count++] = ES_EVENT_TYPE_NOTIFY_BTM_LAUNCH_ITEM_ADD;
+        }
+    }
+    if (groups & SYN_ES_GROUP_SESSIONS) {
+        if (__builtin_available(macOS 13.0, *)) {
+            events[count++] = ES_EVENT_TYPE_NOTIFY_OPENSSH_LOGIN;
+            events[count++] = ES_EVENT_TYPE_NOTIFY_LOGIN_LOGIN;
+            events[count++] = ES_EVENT_TYPE_NOTIFY_LW_SESSION_LOGIN;
+        }
+    }
+    if (groups & SYN_ES_GROUP_PROVENANCE) {
+        events[count++] = ES_EVENT_TYPE_NOTIFY_SETEXTATTR;
+    }
+    if (groups & SYN_ES_GROUP_MOUNT) {
+        events[count++] = ES_EVENT_TYPE_NOTIFY_MOUNT;
+        events[count++] = ES_EVENT_TYPE_NOTIFY_UNMOUNT;
+    }
+    if (groups & SYN_ES_GROUP_TAMPER) {
+        events[count++] = ES_EVENT_TYPE_NOTIFY_SIGNAL;
+    }
+    if (groups & SYN_ES_GROUP_XPC) {
+        if (__builtin_available(macOS 14.0, *)) {
+            events[count++] = ES_EVENT_TYPE_NOTIFY_XPC_CONNECT;
         }
     }
     if (count == 0) {

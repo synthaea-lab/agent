@@ -13,6 +13,11 @@ workspace = true
 schema = { path = "../../../schema" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# kMDItemWhereFroms is a binary plist; parsing it by hand is exactly the kind
+# of fragile byte-poking a maintained parser exists for. Unconditional (not
+# macOS-gated) because `normalize` — where the parsing lives — is the
+# cross-platform, unit-tested half of this crate.
+plist = "1"
 
 # Unconditional, not target-gated: build scripts compile for the HOST, so a
 # `[target.'cfg(target_os = "macos")'.build-dependencies]` gate (which follows
