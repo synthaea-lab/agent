@@ -18,9 +18,10 @@ mod stateless;
 pub use state::RuleState;
 #[cfg(test)]
 pub(crate) use stateless::{
-    check_account_creation_persistence, check_base64_decode, check_encoded_powershell,
-    check_persistence_write, check_proc_root_escape, check_scheduled_task_persistence,
-    check_service_install_persistence, check_systemd_service_persistence,
+    check_account_creation_persistence, check_base64_decode, check_btm_launch_item_persistence,
+    check_encoded_powershell, check_persistence_write, check_proc_root_escape,
+    check_scheduled_task_persistence, check_service_install_persistence,
+    check_systemd_service_persistence,
 };
 // The contract is the two dispatchers — callers (agent) route every event
 // through them. The individual checks are implementation detail, re-exported

@@ -2,7 +2,8 @@
 
 use schema::{
     ExecEvent, FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT,
-    FLAG_PERSISTENCE_SYSTEMD_ARTIFACT, FLAG_PERSISTENCE_TASK_ARTIFACT, FileOpenEvent,
+    FLAG_PERSISTENCE_BTM_ARTIFACT, FLAG_PERSISTENCE_SYSTEMD_ARTIFACT,
+    FLAG_PERSISTENCE_TASK_ARTIFACT, FileOpenEvent,
 };
 
 use crate::{Alert, has_write_intent};
@@ -86,6 +87,15 @@ const PERSISTENCE_PATH_PATTERNS: &[&str] = &[
     "/etc/profile.d/",
     "/etc/cron.d/",
     "/etc/systemd/system/",
+    // macOS (issue #32): substring match deliberately catches the per-user
+    // (`~/Library/...`) and system (`/Library/...`) launchd directories alike.
+    "/Library/LaunchAgents/",
+    "/Library/LaunchDaemons/",
+    ".zshrc",
+    "/etc/periodic/",
+    // at(1) jobs — rare on modern macOS, which is exactly why a write there
+    // is signal.
+    "/var/at/tabs/",
 ];
 
 /// A path captured by the `open` collector can be relative to an unresolved `dfd`
@@ -293,6 +303,42 @@ pub(crate) fn check_systemd_service_persistence(event: &FileOpenEvent) -> Option
     })
 }
 
+/// T1543.001/.004, T1547.015 — Create or Modify System Process: Launch
+/// Agent/Daemon, and Boot or Logon Autostart: Login Items. macOS Background
+/// Task Management just registered a launch item (`EndpointSecurity`'s
+/// `BTM_LAUNCH_ITEM_ADD`, `sensor-macos`, issue #32) — the macOS sibling of
+/// `check_service_install_persistence`'s Windows 7045. Flows through
+/// `FileOpenEvent` with `FLAG_PERSISTENCE_BTM_ARTIFACT` (distinct bit, so this
+/// never cross-fires with the other persistence techniques off a single
+/// event).
+///
+/// Like the Windows signal (and unlike the Linux systemd approximation), this
+/// is a registration-time fact from the OS: BTM emits it when the item is
+/// added, whatever the path taken (plist drop, `SMAppService`, MDM). The flag
+/// **is** the signal — no path heuristic here; a raw plist write into a
+/// launchd directory is the separate, complementary
+/// [`check_persistence_write`] signal (see the flag's doc in `schema` for why
+/// the two are not duplicates).
+///
+/// Alert content carries the persistence payload (`event.path` — the
+/// executable resolved from the launchd plist when BTM provides it, else the
+/// item URL) and the instigating process (`event.meta.comm`), so an analyst
+/// can jump straight to triage via `sfltool dumpbtm` / removal in System
+/// Settings → Login Items.
+#[must_use]
+pub(crate) fn check_btm_launch_item_persistence(event: &FileOpenEvent) -> Option<Alert> {
+    if event.flags & FLAG_PERSISTENCE_BTM_ARTIFACT == 0 {
+        return None;
+    }
+    Some(Alert {
+        technique: "T1543.001/T1547.015",
+        message: format!(
+            "instigator={} pid={}: macOS launch item registered — payload: {}",
+            event.meta.comm, event.meta.pid, event.path,
+        ),
+    })
+}
+
 /// Evaluates all stateless rules applicable to a `FileOpenEvent`.
 #[must_use]
 pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
@@ -303,5 +349,6 @@ pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
         .chain(check_service_install_persistence(event))
         .chain(check_account_creation_persistence(event))
         .chain(check_systemd_service_persistence(event))
+        .chain(check_btm_launch_item_persistence(event))
         .collect()
 }

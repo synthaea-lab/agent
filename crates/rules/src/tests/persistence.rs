@@ -3,7 +3,9 @@
 //! ADR-0004): the Windows trio `check_scheduled_task_persistence` (T1053.005,
 //! event 4698), `check_service_install_persistence` (T1543.003, event 7045),
 //! `check_account_creation_persistence` (T1136.001, event 4720) — plus the
-//! Linux sibling `check_systemd_service_persistence` (T1543.002, issue #93).
+//! Linux sibling `check_systemd_service_persistence` (T1543.002, issue #93)
+//! and the macOS sibling `check_btm_launch_item_persistence`
+//! (T1543.001/T1547.015, issue #32).
 
 use super::*;
 
@@ -271,4 +273,60 @@ fn file_open_with_systemd_and_a_windows_flag_still_alerts_as_systemd() {
     event.meta.comm = "ambiguous.service".to_string();
     let alert = check_systemd_service_persistence(&event).expect("must alert on the systemd bit");
     assert_eq!(alert.technique, "T1543.002");
+}
+
+#[test]
+fn btm_launch_item_flag_matches() {
+    // Canonical shape (issue #32): `sensor-macos` sets
+    // `flags = FLAG_PERSISTENCE_BTM_ARTIFACT` on a BTM_LAUNCH_ITEM_ADD,
+    // `path` is the persistence payload, `comm` the instigating process.
+    let mut event = file_open_event(
+        "/Users/mal/.hidden/payload",
+        schema::FLAG_PERSISTENCE_BTM_ARTIFACT,
+    );
+    event.meta.comm = "sfltool".to_string();
+    let alert = check_btm_launch_item_persistence(&event).expect("must alert on flagged event");
+    assert_eq!(alert.technique, "T1543.001/T1547.015");
+    assert!(
+        alert.message.contains("/Users/mal/.hidden/payload"),
+        "alert missing payload path: {}",
+        alert.message
+    );
+}
+
+#[test]
+fn file_open_without_btm_flag_does_not_alert() {
+    // Ordinary write into a launchd directory must not fire the BTM rule —
+    // that path-shaped signal belongs to `check_persistence_write` (the flag
+    // *is* the BTM signal, not the path).
+    let event = file_open_event(
+        "/Users/mal/Library/LaunchAgents/com.evil.plist",
+        O_CREAT | O_WRONLY,
+    );
+    assert!(check_btm_launch_item_persistence(&event).is_none());
+}
+
+#[test]
+fn file_open_with_other_persistence_flags_does_not_alert_as_btm() {
+    // Every other platform's persistence bit is distinct from the BTM one —
+    // none of them may cross-fire T1543.001/T1547.015.
+    let flags = schema::FLAG_PERSISTENCE_TASK_ARTIFACT
+        | schema::FLAG_PERSISTENCE_ARTIFACT
+        | schema::FLAG_PERSISTENCE_ACCOUNT_ARTIFACT
+        | schema::FLAG_PERSISTENCE_SYSTEMD_ARTIFACT;
+    let event = file_open_event("whatever", flags);
+    assert!(check_btm_launch_item_persistence(&event).is_none());
+}
+
+#[test]
+fn launchd_directory_write_alerts_via_persistence_path_patterns() {
+    // The complementary signal: a plist dropped into a launchd directory is an
+    // ordinary write-intent `FileOpenEvent` from the ES file stream and must
+    // fire `check_persistence_write` without any flag bit.
+    let event = file_open_event(
+        "/Users/mal/Library/LaunchAgents/com.evil.plist",
+        O_CREAT | O_WRONLY,
+    );
+    let alert = check_persistence_write(&event).expect("launchd plist write must alert");
+    assert_eq!(alert.technique, "T1037.004/T1053.003");
 }
