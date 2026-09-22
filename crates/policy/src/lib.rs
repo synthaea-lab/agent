@@ -36,12 +36,12 @@ pub mod signature;
 pub use canonical::to_canonical_bytes;
 pub use document::{
     ComplianceMode, ModelsSection, Policy, PolicyMetadata, PolicyPayload, RedactionPolicy,
-    ResponseSection, RulesSection, SensorSection, ThresholdsSection,
-    WindowsEventlogSensorPolicy, SCHEMA_VERSION,
+    ResponseSection, RulesSection, SCHEMA_VERSION, SensorSection, ThresholdsSection,
+    WindowsEventlogSensorPolicy,
 };
 pub use error::PolicyError;
-pub use merge::{apply_overrides, SAFETY_CRITICAL_PATHS};
-pub use signature::{sign, verify, PUBLIC_KEY_LEN_BYTES, SIGNATURE_LEN_BYTES};
+pub use merge::{SAFETY_CRITICAL_PATHS, apply_overrides};
+pub use signature::{PUBLIC_KEY_LEN_BYTES, SIGNATURE_LEN_BYTES, sign, verify};
 
 /// Directories only privileged installers write to — the gate for name-keyed
 /// detection exclusions. An exclusion list of process NAMES (`svchost.exe`,

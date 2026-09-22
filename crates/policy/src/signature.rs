@@ -27,15 +27,13 @@
 //! - Key generation. `ring` can generate keypairs; that lives in whatever
 //!   test binary needs a keypair (see the `#[cfg(test)]` helper below).
 
-use ring::signature::{Ed25519KeyPair, UnparsedPublicKey, ED25519};
 // `KeyPair` is only referenced by the test-only helper below; scoped
 // accordingly to keep it out of the production build's imports.
 #[cfg(test)]
 use ring::signature::KeyPair;
+use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
 
-use crate::canonical::to_canonical_bytes;
-use crate::document::Policy;
-use crate::error::PolicyError;
+use crate::{canonical::to_canonical_bytes, document::Policy, error::PolicyError};
 
 /// Length of an Ed25519 signature in bytes.
 pub const SIGNATURE_LEN_BYTES: usize = 64;
@@ -238,7 +236,10 @@ mod tests {
         let mut doc = empty_doc();
         // 128 chars, but uppercase — format contract is lowercase.
         doc.metadata.signature = "F".repeat(128);
-        assert!(matches!(verify(&doc, &pk), Err(PolicyError::SignatureNotHex)));
+        assert!(matches!(
+            verify(&doc, &pk),
+            Err(PolicyError::SignatureNotHex)
+        ));
     }
 
     #[test]

@@ -51,6 +51,9 @@ enum QueueItem {
     // Boxed: `Event`'s largest variant otherwise sets every channel slot's size,
     // multiplied by `QUEUE_CAP` — `Flush` doesn't need anywhere near that much room.
     Event(Box<Event>),
+    // Only `kill_loudness` (Linux-gated) flushes today — the shutdown path on
+    // the other platforms doesn't exist yet, not a reason to lose the variant.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Flush(mpsc::Sender<()>),
 }
 
@@ -101,11 +104,7 @@ impl EnrichQueue {
     /// Hands an event to the worker; sheds (and counts) when the queue is full so
     /// the caller — the capture thread — never blocks.
     pub(crate) fn enqueue(&self, event: Event) {
-        if self
-            .tx
-            .try_send(QueueItem::Event(Box::new(event)))
-            .is_err()
-        {
+        if self.tx.try_send(QueueItem::Event(Box::new(event))).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -134,6 +133,7 @@ impl EnrichQueue {
     /// or the worker didn't reach it in time) or if the worker thread is gone —
     /// the caller's own bounded budget is what actually protects it against this
     /// never resolving, not this function's internals.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn flush(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let (done_tx, done_rx) = mpsc::channel();

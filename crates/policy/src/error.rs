@@ -14,9 +14,7 @@ pub enum PolicyError {
     /// The document's `schema_version` is unknown to this build. Readers
     /// reject rather than parse-strict-with-drop (ADR-0010 §Deferred:
     /// today's decision on cross-version co-existence is "reject").
-    #[error(
-        "unsupported schema_version {found}: this build only accepts {expected}"
-    )]
+    #[error("unsupported schema_version {found}: this build only accepts {expected}")]
     SchemaVersionMismatch {
         /// Version literally present in the document.
         found: u32,
@@ -54,9 +52,7 @@ pub enum PolicyError {
     /// The caller-supplied public key is not the 32 bytes an Ed25519
     /// public key requires. Distinguished from a runtime `SignatureInvalid`
     /// so callers whose key material is misconfigured see it named.
-    #[error(
-        "public key must be exactly 32 bytes, got {found_len}"
-    )]
+    #[error("public key must be exactly 32 bytes, got {found_len}")]
     PublicKeyMalformed {
         /// Byte length of the supplied key.
         found_len: usize,

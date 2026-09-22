@@ -446,7 +446,11 @@ fn forward_netlink_events(
 /// cursor file — either way the honest "no prior state" case, not an error.
 /// Bounded catch-up: a restart replays whatever landed since the last persisted
 /// cursor, not the whole journal from epoch.
-fn spawn_journal_tail(sink: Arc<DetectionSink>, heartbeat: SensorHeartbeat, alerts: &std::path::Path) {
+fn spawn_journal_tail(
+    sink: Arc<DetectionSink>,
+    heartbeat: SensorHeartbeat,
+    alerts: &std::path::Path,
+) {
     let cursor_path = crate::journal_cursor::cursor_path_for(alerts);
     std::thread::Builder::new()
         .name("journal-tail".into())
