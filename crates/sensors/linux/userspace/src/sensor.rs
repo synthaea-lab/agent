@@ -61,7 +61,7 @@ const MAX_ITEMS_PER_DRAIN: usize = 256;
 /// re-triggering `read_proc_cmdline`'s exact `spawn_blocking` tradeoff on every
 /// file-open/connect event, not just exec.
 macro_rules! drain {
-    ($guard:expr, $wire_ty:ty, $sink:expr, $to_event:expr) => {{
+    ($guard:expr, $wire_ty:ty, $sink:expr, $own_pid:expr, $to_event:expr) => {{
         let mut guard = $guard.map_err(|e| err(format!("ring buffer poll failed: {e}")))?;
         let rb = guard.get_inner_mut();
         let mut drained = 0usize;
@@ -73,7 +73,17 @@ macro_rules! drain {
                 // the wire types are repr(C) plain-old-data, and read_unaligned
                 // handles the ring buffer's arbitrary alignment.
                 let event = unsafe { core::ptr::read_unaligned(item.as_ptr() as *const $wire_ty) };
-                $sink.on_event($to_event(&event));
+                let schema_event = $to_event(&event);
+                // Self-exclusion (issue #340): the agent's own activity — most
+                // visibly its own `write(2)` calls appending to `events.jsonl` —
+                // is itself observed by this same sensor, re-triggering the very
+                // write that produced it and amplifying without bound (capped
+                // from a full hang only by MAX_ITEMS_PER_DRAIN above, #326).
+                // Standard EDR practice: never feed the agent's own pid back
+                // into its own telemetry.
+                if schema_event.meta().pid != $own_pid {
+                    $sink.on_event(schema_event);
+                }
             }
         }
         // Only clear readiness once the buffer actually ran dry. If we stopped
@@ -171,6 +181,9 @@ impl LinuxSensor {
 
         let mut container_ids = CgroupIdCache::new();
         let docker_cache: DockerInfoCache = Arc::new(Mutex::new(HashMap::new()));
+        // Issue #340: excluded from every drain below so the sensor never re-observes
+        // its own syscalls (most visibly its `write(2)`s to `events.jsonl`).
+        let own_pid = std::process::id();
         let ctrl_c = tokio::signal::ctrl_c();
         tokio::pin!(ctrl_c);
         loop {
@@ -182,72 +195,72 @@ impl LinuxSensor {
                     // `read_proc_cmdline`'s doc comment on why this hasn't warranted
                     // `spawn_blocking` yet). Container attribution no longer touches
                     // `/proc` at all — see `CgroupIdCache`.
-                    drain!(guard, sensor_linux_wire::ExecEvent, sink, |e: &sensor_linux_wire::ExecEvent| {
+                    drain!(guard, sensor_linux_wire::ExecEvent, sink, own_pid, |e: &sensor_linux_wire::ExecEvent| {
                         normalize::exec(e, offset, read_proc_cmdline(e.meta.pid), container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                     });
                 }
                 guard = file_open_ring_buf.readable_mut() => {
-                    drain!(guard, sensor_linux_wire::FileOpenEvent, sink,
+                    drain!(guard, sensor_linux_wire::FileOpenEvent, sink, own_pid,
                         |e: &sensor_linux_wire::FileOpenEvent| {
                             normalize::file_open(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
                 guard = connect_ring_buf.readable_mut() => {
-                    drain!(guard, sensor_linux_wire::ConnectEvent, sink,
+                    drain!(guard, sensor_linux_wire::ConnectEvent, sink, own_pid,
                         |e: &sensor_linux_wire::ConnectEvent| {
                             normalize::connect(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
                 guard = file_write_ring_buf.readable_mut() => {
-                    drain!(guard, sensor_linux_wire::FileWriteEvent, sink,
+                    drain!(guard, sensor_linux_wire::FileWriteEvent, sink, own_pid,
                         |e: &sensor_linux_wire::FileWriteEvent| {
                             normalize::file_write(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
                 guard = file_delete_ring_buf.readable_mut() => {
-                    drain!(guard, sensor_linux_wire::FileDeleteEvent, sink,
+                    drain!(guard, sensor_linux_wire::FileDeleteEvent, sink, own_pid,
                         |e: &sensor_linux_wire::FileDeleteEvent| {
                             normalize::file_delete(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
                 guard = file_rename_ring_buf.readable_mut() => {
-                    drain!(guard, sensor_linux_wire::FileRenameEvent, sink,
+                    drain!(guard, sensor_linux_wire::FileRenameEvent, sink, own_pid,
                         |e: &sensor_linux_wire::FileRenameEvent| {
                             normalize::file_rename(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
                 guard = socket_bind_ring_buf.readable_mut() => {
-                    drain!(guard, sensor_linux_wire::SocketBindEvent, sink,
+                    drain!(guard, sensor_linux_wire::SocketBindEvent, sink, own_pid,
                         |e: &sensor_linux_wire::SocketBindEvent| {
                             normalize::socket_bind(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
                 guard = file_chmod_ring_buf.readable_mut() => {
-                    drain!(guard, sensor_linux_wire::FileChmodEvent, sink,
+                    drain!(guard, sensor_linux_wire::FileChmodEvent, sink, own_pid,
                         |e: &sensor_linux_wire::FileChmodEvent| {
                             normalize::file_chmod(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
                 guard = file_chown_ring_buf.readable_mut() => {
-                    drain!(guard, sensor_linux_wire::FileChownEvent, sink,
+                    drain!(guard, sensor_linux_wire::FileChownEvent, sink, own_pid,
                         |e: &sensor_linux_wire::FileChownEvent| {
                             normalize::file_chown(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
                 guard = udp_send_ring_buf.readable_mut() => {
-                    drain!(guard, sensor_linux_wire::UdpSendEvent, sink,
+                    drain!(guard, sensor_linux_wire::UdpSendEvent, sink, own_pid,
                         |e: &sensor_linux_wire::UdpSendEvent| {
                             normalize::udp_send(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
                 guard = socket_listen_ring_buf.readable_mut() => {
-                    drain!(guard, sensor_linux_wire::SocketListenEvent, sink,
+                    drain!(guard, sensor_linux_wire::SocketListenEvent, sink, own_pid,
                         |e: &sensor_linux_wire::SocketListenEvent| {
                             normalize::socket_listen(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
                 guard = socket_accept_ring_buf.readable_mut() => {
-                    drain!(guard, sensor_linux_wire::SocketAcceptEvent, sink,
+                    drain!(guard, sensor_linux_wire::SocketAcceptEvent, sink, own_pid,
                         |e: &sensor_linux_wire::SocketAcceptEvent| {
                             normalize::socket_accept(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
