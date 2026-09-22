@@ -525,6 +525,9 @@ dependencies = [
  "anyhow",
  "clap",
  "config",
+ "ipc",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1423,6 +1426,14 @@ dependencies = [
 [[package]]
 name = "ipc"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "is_terminal_polyfill"
@@ -2971,6 +2982,14 @@ checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
 [[package]]
 name = "updater"
 version = "0.1.0"
+dependencies = [
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "ureq"
