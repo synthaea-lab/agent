@@ -523,6 +523,9 @@ dependencies = [
  "anyhow",
  "clap",
  "config",
+ "ipc",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
