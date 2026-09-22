@@ -26,7 +26,9 @@ use crate::redact;
 ///
 /// v8 (#262 Phase 2) added `FileChmodEvent`/`FileChownEvent` — not imported here
 /// either, same reasoning.
-const _: () = assert!(wire::WIRE_VERSION == 8);
+///
+/// v9 (#263 Phase 2) added `UdpSendEvent` — not imported here either, same reasoning.
+const _: () = assert!(wire::WIRE_VERSION == 9);
 
 /// `container_id` is resolved by the caller from `/proc/<pid>/cgroup` at drain time
 /// (issue #80) — attribution only for now, `image`/`name` await a follow-up

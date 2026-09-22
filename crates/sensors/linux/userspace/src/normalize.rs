@@ -7,7 +7,8 @@
 
 use schema::{
     ConnectEvent, ContainerContext, Event, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent,
-    FileDeleteEvent, FileOpenEvent, FileRenameEvent, FileWriteEvent, SocketBindEvent, User,
+    FileDeleteEvent, FileOpenEvent, FileRenameEvent, FileWriteEvent, SocketBindEvent,
+    UdpSendEvent, User,
 };
 use sensor_linux_wire as wire;
 
@@ -28,7 +29,12 @@ use sensor_linux_wire as wire;
 /// v8 (#262 Phase 2) added `FileChmodEvent`/`FileChownEvent` — new mapping functions
 /// `file_chmod`/`file_chown` added below, same path-decoding shape as `file_delete`;
 /// no existing mapping changed shape.
-const _: () = assert!(wire::WIRE_VERSION == 8);
+///
+/// v9 (#263 Phase 2) added `UdpSendEvent` — new `udp_send` mapping function below,
+/// same address-family logic as `connect`/`socket_bind`, reusing the schema type
+/// already shared with the Windows ETW UDP producer; no existing mapping changed
+/// shape.
+const _: () = assert!(wire::WIRE_VERSION == 9);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
@@ -224,6 +230,25 @@ pub fn socket_bind(
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
         local_addr: laddr,
         local_port: event.lport,
+    })
+}
+
+#[must_use]
+pub fn udp_send(
+    event: &wire::UdpSendEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    let daddr = if event.is_ipv6 {
+        std::net::IpAddr::V6(event.daddr_v6.into())
+    } else {
+        std::net::IpAddr::V4(event.daddr_v4.into())
+    };
+    Event::UdpSend(UdpSendEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        daddr,
+        dport: event.dport,
+        size: event.size,
     })
 }
 
@@ -548,5 +573,39 @@ mod tests {
             panic!("wrong variant")
         };
         assert_eq!(e.local_addr.to_string(), "::1");
+    }
+
+    #[test]
+    fn udp_send_carries_size_and_maps_both_families() {
+        let v4 = wire::UdpSendEvent {
+            meta: wire_meta(b"dig"),
+            daddr_v4: [8, 8, 8, 8],
+            daddr_v6: [0; 16],
+            dport: 53,
+            is_ipv6: false,
+            size: 42,
+        };
+        let Event::UdpSend(e) = udp_send(&v4, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.daddr.to_string(), "8.8.8.8");
+        assert_eq!(e.dport, 53);
+        assert_eq!(e.size, 42);
+
+        let mut d6 = [0u8; 16];
+        d6[15] = 0x01;
+        let v6 = wire::UdpSendEvent {
+            meta: wire_meta(b"dig"),
+            daddr_v4: [0; 4],
+            daddr_v6: d6,
+            dport: 53,
+            is_ipv6: true,
+            size: 512,
+        };
+        let Event::UdpSend(e) = udp_send(&v6, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.daddr.to_string(), "::1");
+        assert_eq!(e.size, 512);
     }
 }
