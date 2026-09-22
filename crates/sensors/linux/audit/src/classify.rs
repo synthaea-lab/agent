@@ -20,10 +20,37 @@ pub enum AuditEvent {
         remote_addr: SocketAddr,
         protocol: u8,
     },
+    /// A `SELinux` AVC record (`type=AVC`) — arrives at this sensor's socket for free
+    /// (it already subscribes to the whole `NETLINK_AUDIT` multicast stream, see
+    /// `socket.rs`) but was previously dropped by `classify`'s `_ => None` arm.
+    ///
+    /// No `pid` field: the kernel's AVC message body is `avc:  denied  { read } for
+    /// pid=1234 comm="httpd" ...` — text, not `key=value`, before the first real
+    /// field — so the shared `parse_fields`'s byte scan (which has no concept of
+    /// this preamble) folds that whole prefix into what should have been just
+    /// `pid`'s key, corrupting it. Every field *after* the first one parses with a
+    /// clean key (confirmed by tracing the byte scan by hand against a real AVC
+    /// line), so this variant only carries what survives intact. Not worth a
+    /// preamble-skipping special case in the shared parser for one record type
+    /// this sensor treats as supplementary in the first place.
+    ///
+    /// Always a denial: `SELinux` policies that `auditallow` (log a *grant*) are rare
+    /// in practice, and the "denied"/"granted" word itself lives inside the same
+    /// corrupted first field as `pid` — not worth recovering for a case this
+    /// unlikely. A misclassified grant-as-denial would be a very rare false
+    /// positive, not a false negative.
+    PolicyDenial {
+        comm: Option<String>,
+        scontext: Option<String>,
+        tcontext: Option<String>,
+        tclass: Option<String>,
+        permissive: bool,
+    },
 }
 
 const AUDIT_EXECVE: u32 = 1309;
 const AUDIT_SOCKADDR: u32 = 1306;
+const AUDIT_AVC: u32 = 1400;
 
 /// Maps `AuditRecord` to `AuditEvent`, or None if not interesting.
 #[must_use]
@@ -31,6 +58,7 @@ pub fn classify(record: &AuditRecord) -> Option<AuditEvent> {
     match record.record_type {
         AUDIT_EXECVE => classify_exec(record),
         AUDIT_SOCKADDR => classify_connect(record),
+        AUDIT_AVC => classify_avc(record),
         _ => None,
     }
 }
@@ -111,6 +139,25 @@ fn classify_connect(record: &AuditRecord) -> Option<AuditEvent> {
         gid,
         remote_addr,
         protocol,
+    })
+}
+
+fn classify_avc(record: &AuditRecord) -> Option<AuditEvent> {
+    // scontext/tclass are the two fields that actually matter for triage (who,
+    // acting-as-what, tried to do what) — require at least one of them present so
+    // an unrecognized/short AVC variant doesn't produce an all-`None` event.
+    let scontext = record.fields.get("scontext").cloned();
+    let tclass = record.fields.get("tclass").cloned();
+    if scontext.is_none() && tclass.is_none() {
+        return None;
+    }
+
+    Some(AuditEvent::PolicyDenial {
+        comm: record.fields.get("comm").cloned(),
+        scontext,
+        tcontext: record.fields.get("tcontext").cloned(),
+        tclass,
+        permissive: record.fields.get("permissive").is_some_and(|v| v == "1"),
     })
 }
 
@@ -245,5 +292,97 @@ mod tests {
         let plain = "/bin/ls";
         let decoded = decode_audit_value(plain);
         assert_eq!(decoded, "/bin/ls");
+    }
+
+    #[test]
+    fn classify_avc_record() {
+        // Real kernel AVC wire shape: `pid=` is the first key=value token, so its
+        // key comes out corrupted by the preceding non-key=value text (see
+        // AuditEvent::PolicyDenial's doc) — everything after it parses cleanly.
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "avc:  denied  { read } for  pid".to_string(),
+            "1234".to_string(),
+        );
+        fields.insert("comm".to_string(), "httpd".to_string());
+        fields.insert(
+            "scontext".to_string(),
+            "system_u:system_r:httpd_t:s0".to_string(),
+        );
+        fields.insert(
+            "tcontext".to_string(),
+            "system_u:object_r:user_home_t:s0".to_string(),
+        );
+        fields.insert("tclass".to_string(), "file".to_string());
+        fields.insert("permissive".to_string(), "0".to_string());
+
+        let record = AuditRecord {
+            record_type: AUDIT_AVC,
+            timestamp_sec: 0,
+            timestamp_ms: 0,
+            seq: 0,
+            fields,
+        };
+
+        let event = classify(&record).unwrap();
+        match event {
+            AuditEvent::PolicyDenial {
+                comm,
+                scontext,
+                tcontext,
+                tclass,
+                permissive,
+            } => {
+                assert_eq!(comm.as_deref(), Some("httpd"));
+                assert_eq!(scontext.as_deref(), Some("system_u:system_r:httpd_t:s0"));
+                assert_eq!(
+                    tcontext.as_deref(),
+                    Some("system_u:object_r:user_home_t:s0")
+                );
+                assert_eq!(tclass.as_deref(), Some("file"));
+                assert!(!permissive);
+            }
+            _ => panic!("expected PolicyDenial event"),
+        }
+    }
+
+    #[test]
+    fn classify_avc_permissive_mode() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "scontext".to_string(),
+            "unconfined_u:unconfined_r:unconfined_t:s0".to_string(),
+        );
+        fields.insert("tclass".to_string(), "process".to_string());
+        fields.insert("permissive".to_string(), "1".to_string());
+
+        let record = AuditRecord {
+            record_type: AUDIT_AVC,
+            timestamp_sec: 0,
+            timestamp_ms: 0,
+            seq: 0,
+            fields,
+        };
+
+        let AuditEvent::PolicyDenial { permissive, .. } = classify(&record).unwrap() else {
+            panic!("expected PolicyDenial event");
+        };
+        assert!(permissive);
+    }
+
+    #[test]
+    fn classify_avc_without_scontext_or_tclass_is_dropped() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("comm".to_string(), "httpd".to_string());
+
+        let record = AuditRecord {
+            record_type: AUDIT_AVC,
+            timestamp_sec: 0,
+            timestamp_ms: 0,
+            seq: 0,
+            fields,
+        };
+
+        assert!(classify(&record).is_none());
     }
 }

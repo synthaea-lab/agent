@@ -29,9 +29,10 @@ use core::net::{IpAddr, Ipv4Addr};
 
 use crate::{
     AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, ConnectEvent, DnsQueryEvent, EventMeta,
-    ExecEvent, FileOpenEvent, ImageLoadEvent, ListenPortEvent, NetworkFlowEvent,
-    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType, SmbConnectEvent,
-    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
+    ExecEvent, FileDeleteEvent, FileOpenEvent, FileRenameEvent, FileWriteEvent, ImageLoadEvent,
+    ListenPortEvent, NetworkFlowEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
+    ShellType, SmbConnectEvent, SocketBindEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
+    UdpSendEvent, User, WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -230,5 +231,44 @@ pub fn readline_input() -> ReadlineInputEvent {
         meta: meta(),
         shell_type: ShellType::Bash,
         input: String::new(),
+    }
+}
+
+/// Neutral [`FileWriteEvent`].
+#[must_use]
+pub fn file_write() -> FileWriteEvent {
+    FileWriteEvent {
+        meta: meta(),
+        fd: 0,
+        bytes_requested: 0,
+    }
+}
+
+/// Neutral [`FileDeleteEvent`].
+#[must_use]
+pub fn file_delete() -> FileDeleteEvent {
+    FileDeleteEvent {
+        meta: meta(),
+        path: String::new(),
+    }
+}
+
+/// Neutral [`FileRenameEvent`].
+#[must_use]
+pub fn file_rename() -> FileRenameEvent {
+    FileRenameEvent {
+        meta: meta(),
+        old_path: String::new(),
+        new_path: String::new(),
+    }
+}
+
+/// Neutral [`SocketBindEvent`] on [`TEST_ADDR`].
+#[must_use]
+pub fn socket_bind() -> SocketBindEvent {
+    SocketBindEvent {
+        meta: meta(),
+        local_addr: TEST_ADDR,
+        local_port: 0,
     }
 }

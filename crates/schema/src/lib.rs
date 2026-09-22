@@ -74,7 +74,14 @@ pub mod time;
 /// Bumped 13 → 14 for [`Event::TlsCapture`] and [`Event::ReadlineInput`] (#90):
 /// two new enum variants for uprobes-based TLS plaintext capture and shell readline
 /// input capture. Same serialization-visible reasoning as v13 above.
-pub const SCHEMA_VERSION: u32 = 14;
+///
+/// Bumped 14 → 15 for [`Event::FileWrite`], [`Event::FileDelete`], and
+/// [`Event::FileRename`] (#262): three new enum variants for Linux
+/// write/delete/rename telemetry. Same serialization-visible reasoning as v13/v14.
+///
+/// Bumped 15 → 16 for [`Event::SocketBind`] (#263): one new enum variant for
+/// discrete, real-time `bind(2)` telemetry on Linux. Same reasoning as v13-v15.
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -113,12 +120,32 @@ pub const FLAG_PERSISTENCE_TASK_ARTIFACT: u32 = 0x2000_0000;
 /// domain controller) is out of scope for a userland EDR on member/standalone
 /// machines — the sensor never observes it. A `computer` account creation (4741) is
 /// a distinct technique (T1136.002) and would take its own bit if we add it later.
-///
-/// On this flag, `FileOpenEvent::path` carries the new account's SID (`S-1-5-21-...`)
-/// and `FileOpenEvent::meta::comm` carries the account leaf name (SAM name). Same
-/// distinct-bit rule as the other two: the three T1136/T1053/T1543 rules never
-/// cross-fire off a single event.
 pub const FLAG_PERSISTENCE_ACCOUNT_ARTIFACT: u32 = 0x0800_0000;
+
+/// Same principle as [`FLAG_PERSISTENCE_ARTIFACT`], for a Linux **systemd unit**
+/// observed starting for the first time since the agent started (ATT&CK T1543.002
+/// — Create or Modify System Process: Systemd Service, the Linux sibling of
+/// T1543.003) rather than a Windows service. Set by `sensor-linux-journal`'s
+/// `persistence::UnitPersistenceTracker` (issue #93), the Linux side of the same
+/// "reuse `FileOpenEvent` + a flag" shape rather than a new `Event` variant —
+/// see `sensor-linux-journal::auth`'s module doc for why a Linux-only lifecycle
+/// shape was deliberately not invented while this decision was open.
+///
+/// Not the same signal as Windows' 7045: journald's `JOB_TYPE=start`/
+/// `JOB_RESULT=done` fires on every start of a unit, install or routine restart
+/// alike, unlike the Service Control Manager which only writes 7045 once, at
+/// actual registration. This flag is therefore only a "first start observed by
+/// this agent process" approximation, not a true install signal — see the
+/// tracker's own doc for the full caveat (an agent restart forgets what it had
+/// already seen).
+///
+/// `FileOpenEvent::path` and `FileOpenEvent::meta::comm` both carry the unit name
+/// (`sshd.service`) — journald's job-completion record has no image-path
+/// equivalent to Windows' 7045, so there is no separate field to put there.
+///
+/// A distinct bit from every other `FLAG_PERSISTENCE_*` constant, so no two
+/// techniques cross-fire off a single event.
+pub const FLAG_PERSISTENCE_SYSTEMD_ARTIFACT: u32 = 0x4000_0000;
 
 /// Identity of the user a process runs as, per platform.
 ///
@@ -264,6 +291,46 @@ pub enum Signature {
     Unsupported,
 }
 
+// Standard POSIX open(2) flag values, stable across the Linux architectures this
+// project supports (x86_64, aarch64). Defined here rather than via `libc`:
+// `FileOpenEvent::flags` is platform-native and these are the Linux values; a
+// `libc` dependency would drag platform quirks (no `O_ACCMODE` on Windows) into
+// the boundary crate that must compile everywhere.
+/// `open(2)` access-mode mask (`flags & O_ACCMODE` is one of `O_RDONLY`=0,
+/// [`O_WRONLY`], [`O_RDWR`] — a 2-bit field, not independent bits).
+pub const O_ACCMODE: u32 = 0o3;
+/// `open(2)` write-only access mode.
+pub const O_WRONLY: u32 = 0o1;
+/// `open(2)` read-write access mode.
+pub const O_RDWR: u32 = 0o2;
+/// `open(2)` create-if-absent flag.
+pub const O_CREAT: u32 = 0o100;
+
+/// Write intent on [`FileOpenEvent::flags`]: a write access mode, or creation
+/// (`O_CREAT` — creating a file is write intent even with `O_RDONLY`).
+///
+/// The ONE definition of this predicate. It used to exist five times (rules,
+/// correlator, `crates/ml`, and two Python mirrors) with two different
+/// semantics — an access-mode comparison vs. a bitmask-any — which classified
+/// `flags = 0o3` differently, so the rule engine and the correlator could
+/// disagree about the same event. The access-mode comparison is canonical
+/// because it is what the kernel does: the access mode is a 2-bit *field*
+/// (`O_ACCMODE`), not independent bits, and the `0o3` combination is invalid —
+/// `open(2)` refuses it with `EINVAL`, so no write can result and counting it
+/// would let crafted always-failing opens inflate behavioral write counts.
+/// The Python mirrors (`synthaea_ml.features.correlation._is_file_write`,
+/// `behavior._is_write`) must match this exactly — parity-tested against
+/// shared fixtures.
+///
+/// Lives in `schema` deliberately: a pure helper on a field this crate
+/// defines, additive to the semi-frozen surface (no serialization impact),
+/// and the only crate every consumer of `flags` may depend on.
+#[must_use]
+pub fn has_write_intent(flags: u32) -> bool {
+    let access_mode = flags & O_ACCMODE;
+    access_mode == O_WRONLY || access_mode == O_RDWR || (flags & O_CREAT) != 0
+}
+
 /// File open/create.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileOpenEvent {
@@ -273,6 +340,113 @@ pub struct FileOpenEvent {
     /// dispositions). Rules match primarily on `path`; flag interpretation is
     /// per-platform and documented by each sensor.
     pub flags: u32,
+}
+
+/// File write (issue #262).
+///
+/// ## ⚠️ Critical Limitation: No Path Included
+///
+/// This event carries **no path** — only `(pid, fd, bytes_requested)`. `write(2)` and
+/// `pwrite64(2)` operate on file descriptors, not paths, and the Linux sensor resolves
+/// no fd→path mapping (neither kernel-side `bpf_d_path`/LSM hooks nor userspace
+/// `/proc/<pid>/fd/<n>` lookup — see `sensor-linux-wire::FileWriteEvent`'s version
+/// history for rationale).
+///
+/// **This is a volume/frequency signal** for burst-write detection (ransomware, mass
+/// tampering, log destruction), not a per-write path trail. To correlate a write with
+/// a file path, detection rules must join to a recent [`FileOpenEvent`] on
+/// `(meta.pid, fd)`.
+///
+/// ## Detection Correlation Pattern
+///
+/// ```rust,ignore
+/// // Pseudo-code example: correlate FileOpen → FileWrite
+/// match event {
+///     Event::FileOpen(open) => {
+///         // Store (pid, fd) → path mapping
+///         state.track_fd(open.meta.pid, open.fd, open.path.clone());
+///     }
+///     Event::FileWrite(write) => {
+///         // Look up path from prior FileOpen
+///         if let Some(path) = state.get_path(write.meta.pid, write.fd) {
+///             // Now you can detect: "wrote 1MB to /etc/passwd"
+///             check_suspicious_write(path, write.bytes_requested);
+///         }
+///     }
+///     Event::FileClose(_) => {
+///         // Clean up fd tracking to bound memory
+///     }
+/// }
+/// ```
+///
+/// See `docs/detection/file-activity-patterns.md` for full worked examples including
+/// ransomware burst-write + mass-rename correlation.
+///
+/// ## Performance Notes
+///
+/// `write(2)` is one of the hottest syscalls in the system. Current implementation:
+/// - Captures **every** write syscall (no size filtering)
+/// - Expected rate: 10-1000+ events/sec under normal load, 10K+/sec under heavy I/O
+/// - No built-in sampling or backpressure (Phase 1 implementation)
+///
+/// Future work (issue #262 Phase 2):
+/// - Add min-size filter (e.g., skip writes < 4KB)
+/// - Consider sampling under sustained high-volume
+/// - Add `writev(2)`, `pwrite64(2)`, `pwritev(2)` coverage (currently only `write(2)`)
+///
+/// ## Syscall Coverage
+///
+/// Phase 1 (current): `write(2)` only
+/// Phase 2 (deferred): `writev`, `pwrite64`, `pwritev`, `pwritev2`
+///
+/// Rationale for deferral: `write(2)` covers the common case; vectored/positioned
+/// writes are used by databases and async I/O but add complexity (multiple fd/offset
+/// pairs per syscall). Added once the Phase 1 signal proves useful and performance
+/// characteristics are understood.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileWriteEvent {
+    pub meta: EventMeta,
+    /// The file descriptor written to, in the writing process's own fd table —
+    /// meaningful only paired with `meta.pid`, and reused across the process's
+    /// lifetime like any fd.
+    pub fd: u32,
+    /// The caller's requested byte count (`write(2)`'s `count` argument), read at
+    /// syscall entry — not the syscall's return value, so a short write or a
+    /// failed call still reports the requested size.
+    pub bytes_requested: u64,
+}
+
+/// File delete (issue #262): `unlink(2)`/`unlinkat(2)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileDeleteEvent {
+    pub meta: EventMeta,
+    pub path: String,
+}
+
+/// File rename (issue #262): `rename(2)`/`renameat(2)`/`renameat2(2)`. The classic
+/// ransomware signal (`invoice.pdf` → `invoice.pdf.locked`) lives entirely in
+/// `new_path`'s suffix relative to `old_path`'s.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRenameEvent {
+    pub meta: EventMeta,
+    pub old_path: String,
+    pub new_path: String,
+}
+
+/// Socket bind (issue #263): `bind(2)`, `AF_INET`/`AF_INET6` only — a discrete,
+/// real-time trace of a process claiming a local address (backdoor/reverse-shell
+/// listener detection: `/bin/bash` binding a port is a strong signal on its own).
+///
+/// Distinct from [`ListenPortEvent`], which is a periodic poll snapshot from
+/// `sensor-linux-netlink`: this fires once, at the `bind(2)` call itself, and does
+/// NOT imply `listen(2)` followed — a UDP socket, or a TCP socket bound but never
+/// listened, binds too. `listen(2)`/`accept(2)` are deliberately not captured yet
+/// (see `sensor-linux-wire::SocketBindEvent`'s doc for why).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocketBindEvent {
+    pub meta: EventMeta,
+    pub local_addr: core::net::IpAddr,
+    pub local_port: u16,
 }
 
 /// DNS resolution — the query name and answer, joined to the resolving process.
@@ -719,6 +893,10 @@ pub enum Event {
     NetworkFlow(NetworkFlowEvent),
     TlsCapture(TlsCaptureEvent),
     ReadlineInput(ReadlineInputEvent),
+    FileWrite(FileWriteEvent),
+    FileDelete(FileDeleteEvent),
+    FileRename(FileRenameEvent),
+    SocketBind(SocketBindEvent),
 }
 
 impl Event {
@@ -746,9 +924,54 @@ impl Event {
             Event::NetworkFlow(e) => &e.meta,
             Event::TlsCapture(e) => &e.meta,
             Event::ReadlineInput(e) => &e.meta,
+            Event::FileWrite(e) => &e.meta,
+            Event::FileDelete(e) => &e.meta,
+            Event::FileRename(e) => &e.meta,
+            Event::SocketBind(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.
         }
+    }
+}
+
+#[cfg(test)]
+mod write_intent_tests {
+    use super::has_write_intent;
+
+    #[test]
+    fn write_access_modes_are_write_intent() {
+        assert!(has_write_intent(super::O_WRONLY));
+        assert!(has_write_intent(super::O_RDWR));
+        assert!(has_write_intent(
+            super::O_WRONLY | 0o2000 /* O_APPEND */
+        ));
+    }
+
+    #[test]
+    fn creat_is_write_intent_even_with_rdonly() {
+        // Creating a file mutates the filesystem regardless of the access mode.
+        assert!(has_write_intent(super::O_CREAT));
+    }
+
+    #[test]
+    fn rdonly_is_not_write_intent() {
+        assert!(!has_write_intent(0));
+        assert!(!has_write_intent(
+            0o2000 /* O_APPEND alone — no write mode */
+        ));
+    }
+
+    #[test]
+    fn invalid_accmode_combo_is_not_write_intent() {
+        // The divergence that motivated unifying the five copies: 0o3 sets both
+        // access-mode bits, which open(2) refuses with EINVAL — no write can
+        // result, so the bitmask-any copies that counted it were wrong. Pinned
+        // so the semantics never fork again.
+        assert!(!has_write_intent(0o3));
+        assert!(
+            has_write_intent(0o3 | super::O_CREAT),
+            "creation still counts"
+        );
     }
 }

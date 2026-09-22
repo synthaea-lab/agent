@@ -18,16 +18,12 @@ use std::collections::HashSet;
 use correlator::EventBus;
 use schema::Event;
 
-/// Write intent on a `FileOpen` — mirror of `correlator`'s crate-private
-/// `is_file_write` and of `correlation.py::_is_file_write`. Duplicated deliberately:
-/// the correlator does not export it, and a bit test is cheaper to mirror than to
-/// plumb a new public API through the platform boundary.
+/// Write intent on a `FileOpen` — same shape as `correlator`'s crate-private
+/// `is_file_write`; the flag semantics live once, in [`schema::has_write_intent`]
+/// (the former "duplicated deliberately" bitmask copy had drifted from `rules`).
 fn is_file_write(event: &Event) -> bool {
-    const O_WRONLY: u32 = 0o1;
-    const O_RDWR: u32 = 0o2;
-    const O_CREAT: u32 = 0o100;
     match event {
-        Event::FileOpen(f) => f.flags & (O_WRONLY | O_RDWR | O_CREAT) != 0,
+        Event::FileOpen(f) => schema::has_write_intent(f.flags),
         _ => false,
     }
 }

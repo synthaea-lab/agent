@@ -13,8 +13,9 @@ use aya_ebpf::{
 };
 use aya_log_ebpf::{info, warn};
 use sensor_linux_wire::{
-    ConnectEvent, ExecEvent, FileOpenEvent, LineageEntry, MAX_TLS_CAPTURE, ReadlineInputEvent,
-    TASK_COMM_LEN, TlsCaptureEvent,
+    ConnectEvent, ExecEvent, FileDeleteEvent, FileOpenEvent, FileRenameEvent, FileWriteEvent,
+    LineageEntry, MAX_TLS_CAPTURE, ReadlineInputEvent, SocketBindEvent, TASK_COMM_LEN,
+    TlsCaptureEvent,
 };
 
 // This probe reads NO `task_struct`/`mm_struct` frozen offset: parent lineage (ppid +
@@ -376,6 +377,386 @@ fn emit_file_open_event(
     Ok(0)
 }
 
+// --- File write/delete/rename (issue #262) ------------------------------------------
+
+/// Ring buffer shared with userspace for `write` events.
+#[map]
+static FILE_WRITE_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Per-CPU scratch for building one `FileWriteEvent` (see `EXEC_SCRATCH`).
+#[map]
+static WRITE_SCRATCH: PerCpuArray<FileWriteEvent> = PerCpuArray::with_max_entries(1, 0);
+
+/// Ring buffer shared with userspace for `unlink`/`unlinkat` events.
+#[map]
+static FILE_DELETE_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Per-CPU scratch for building one `FileDeleteEvent` (see `EXEC_SCRATCH`).
+#[map]
+static DELETE_SCRATCH: PerCpuArray<FileDeleteEvent> = PerCpuArray::with_max_entries(1, 0);
+
+/// Ring buffer shared with userspace for `rename`/`renameat`/`renameat2` events.
+#[map]
+static FILE_RENAME_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Per-CPU scratch for building one `FileRenameEvent` (see `EXEC_SCRATCH`).
+#[map]
+static RENAME_SCRATCH: PerCpuArray<FileRenameEvent> = PerCpuArray::with_max_entries(1, 0);
+
+/// Offsets of the `syscalls:sys_enter_write` tracepoint (x86_64/aarch64). Standard
+/// `syscalls:*` layout (see `sys_enter_openat` above): `fd`(16), `buf`(24),
+/// `count`(32). Verified on 2026-09-21 on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// `/sys/kernel/tracing/events/syscalls/sys_enter_write/format`.
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const WRITE_FD_OFFSET: usize = 16;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const WRITE_COUNT_OFFSET: usize = 32;
+/// i686: packed 4-byte args, no independent kernel verification — inferred by the
+/// same 4-byte-shift rule already used (and flagged the same way) for `sys_enter_open`
+/// above: `fd`(12), `buf`(16), `count`(20).
+#[cfg(bpf_target_arch = "x86")]
+const WRITE_FD_OFFSET: usize = 12;
+#[cfg(bpf_target_arch = "x86")]
+const WRITE_COUNT_OFFSET: usize = 20;
+
+#[tracepoint]
+pub fn sys_enter_write(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_write(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_sys_enter_write(ctx: TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let fd: u64 = unsafe { ctx.read_at(WRITE_FD_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let fd: u64 = unsafe { ctx.read_at::<u32>(WRITE_FD_OFFSET).map_err(|_| 1u32)? as u64 };
+
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let count: u64 = unsafe { ctx.read_at(WRITE_COUNT_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let count: u64 = unsafe { ctx.read_at::<u32>(WRITE_COUNT_OFFSET).map_err(|_| 1u32)? as u64 };
+
+    let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
+    let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
+
+    let e = WRITE_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
+    unsafe {
+        core::ptr::write_bytes(e, 0, 1);
+        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*e).meta.ppid = lineage_ppid();
+        (*e).meta.uid = uid_gid as u32;
+        (*e).meta.gid = (uid_gid >> 32) as u32;
+        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
+        let mut i = 0usize;
+        while i < TASK_COMM_LEN {
+            (*e).meta.comm[i] = comm[i];
+            i += 1;
+        }
+        (*e).fd = fd as u32;
+        (*e).bytes_requested = count;
+
+        if FILE_WRITE_EVENTS.output::<FileWriteEvent>(&*e, 0).is_err() {
+            warn!(
+                &ctx,
+                "sensor-linux-ebpf: ring buffer full, dropping write event"
+            );
+        }
+    }
+
+    Ok(0)
+}
+
+/// Offsets of the `syscalls:sys_enter_unlink` tracepoint (x86_64/aarch64):
+/// `pathname`(16). Verified on 2026-09-21 on Alpine (kernel 6.18.50-0-virt, x86_64)
+/// via `/sys/kernel/tracing/events/syscalls/sys_enter_unlink/format`.
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const UNLINK_PATHNAME_PTR_OFFSET: usize = 16;
+/// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
+#[cfg(bpf_target_arch = "x86")]
+const UNLINK_PATHNAME_PTR_OFFSET: usize = 12;
+
+/// Offsets of the `syscalls:sys_enter_unlinkat` tracepoint (x86_64/aarch64):
+/// `dfd`(16), `pathname`(24), `flag`(32). Verified on 2026-09-21 on Alpine
+/// (kernel 6.18.50-0-virt, x86_64) via
+/// `/sys/kernel/tracing/events/syscalls/sys_enter_unlinkat/format`.
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const UNLINKAT_PATHNAME_PTR_OFFSET: usize = 24;
+/// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
+#[cfg(bpf_target_arch = "x86")]
+const UNLINKAT_PATHNAME_PTR_OFFSET: usize = 16;
+
+#[tracepoint]
+pub fn sys_enter_unlink(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_unlink(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_sys_enter_unlink(ctx: TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let pathname_ptr: u64 = unsafe { ctx.read_at(UNLINK_PATHNAME_PTR_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let pathname_ptr: u64 = unsafe {
+        ctx.read_at::<u32>(UNLINK_PATHNAME_PTR_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
+
+    emit_file_delete_event(&ctx, pathname_ptr)
+}
+
+#[tracepoint]
+pub fn sys_enter_unlinkat(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_unlinkat(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_sys_enter_unlinkat(ctx: TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let pathname_ptr: u64 = unsafe {
+        ctx.read_at(UNLINKAT_PATHNAME_PTR_OFFSET)
+            .map_err(|_| 1u32)?
+    };
+    #[cfg(bpf_target_arch = "x86")]
+    let pathname_ptr: u64 = unsafe {
+        ctx.read_at::<u32>(UNLINKAT_PATHNAME_PTR_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
+
+    emit_file_delete_event(&ctx, pathname_ptr)
+}
+
+/// Shared by `sys_enter_unlink` and `sys_enter_unlinkat` above.
+fn emit_file_delete_event(ctx: &TracePointContext, pathname_ptr: u64) -> Result<u32, u32> {
+    let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
+    let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
+
+    let e = DELETE_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
+    unsafe {
+        core::ptr::write_bytes(e, 0, 1);
+        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*e).meta.ppid = lineage_ppid();
+        (*e).meta.uid = uid_gid as u32;
+        (*e).meta.gid = (uid_gid >> 32) as u32;
+        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
+        let mut i = 0usize;
+        while i < TASK_COMM_LEN {
+            (*e).meta.comm[i] = comm[i];
+            i += 1;
+        }
+
+        if pathname_ptr != 0 {
+            if let Ok(path) =
+                bpf_probe_read_user_str_bytes(pathname_ptr as *const u8, &mut (*e).path)
+            {
+                (*e).path_len = path.len() as u16;
+            }
+        }
+
+        if FILE_DELETE_EVENTS
+            .output::<FileDeleteEvent>(&*e, 0)
+            .is_err()
+        {
+            warn!(
+                ctx,
+                "sensor-linux-ebpf: ring buffer full, dropping delete event"
+            );
+        }
+    }
+
+    Ok(0)
+}
+
+/// Offsets of the `syscalls:sys_enter_rename` tracepoint (x86_64/aarch64):
+/// `oldname`(16), `newname`(24). Verified on 2026-09-21 on Alpine
+/// (kernel 6.18.50-0-virt, x86_64) via
+/// `/sys/kernel/tracing/events/syscalls/sys_enter_rename/format`.
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const RENAME_OLDNAME_PTR_OFFSET: usize = 16;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const RENAME_NEWNAME_PTR_OFFSET: usize = 24;
+/// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
+#[cfg(bpf_target_arch = "x86")]
+const RENAME_OLDNAME_PTR_OFFSET: usize = 12;
+#[cfg(bpf_target_arch = "x86")]
+const RENAME_NEWNAME_PTR_OFFSET: usize = 16;
+
+/// Offsets of the `syscalls:sys_enter_renameat` tracepoint (x86_64/aarch64):
+/// `olddfd`(16), `oldname`(24), `newdfd`(32), `newname`(40). Verified on 2026-09-21
+/// on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// `/sys/kernel/tracing/events/syscalls/sys_enter_renameat/format`.
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const RENAMEAT_OLDNAME_PTR_OFFSET: usize = 24;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const RENAMEAT_NEWNAME_PTR_OFFSET: usize = 40;
+/// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
+#[cfg(bpf_target_arch = "x86")]
+const RENAMEAT_OLDNAME_PTR_OFFSET: usize = 16;
+#[cfg(bpf_target_arch = "x86")]
+const RENAMEAT_NEWNAME_PTR_OFFSET: usize = 24;
+
+/// Offsets of the `syscalls:sys_enter_renameat2` tracepoint (x86_64/aarch64):
+/// `olddfd`(16), `oldname`(24), `newdfd`(32), `newname`(40), `flags`(48). Verified on
+/// 2026-09-21 on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// `/sys/kernel/tracing/events/syscalls/sys_enter_renameat2/format`. Same
+/// oldname/newname offsets as `renameat` above (the trailing `flags` field doesn't
+/// shift them).
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const RENAMEAT2_OLDNAME_PTR_OFFSET: usize = 24;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const RENAMEAT2_NEWNAME_PTR_OFFSET: usize = 40;
+/// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
+#[cfg(bpf_target_arch = "x86")]
+const RENAMEAT2_OLDNAME_PTR_OFFSET: usize = 16;
+#[cfg(bpf_target_arch = "x86")]
+const RENAMEAT2_NEWNAME_PTR_OFFSET: usize = 24;
+
+#[tracepoint]
+pub fn sys_enter_rename(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_rename(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_sys_enter_rename(ctx: TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let oldname_ptr: u64 = unsafe { ctx.read_at(RENAME_OLDNAME_PTR_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let oldname_ptr: u64 = unsafe {
+        ctx.read_at::<u32>(RENAME_OLDNAME_PTR_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let newname_ptr: u64 = unsafe { ctx.read_at(RENAME_NEWNAME_PTR_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let newname_ptr: u64 = unsafe {
+        ctx.read_at::<u32>(RENAME_NEWNAME_PTR_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
+
+    emit_file_rename_event(&ctx, oldname_ptr, newname_ptr)
+}
+
+#[tracepoint]
+pub fn sys_enter_renameat(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_renameat(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_sys_enter_renameat(ctx: TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let oldname_ptr: u64 = unsafe { ctx.read_at(RENAMEAT_OLDNAME_PTR_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let oldname_ptr: u64 = unsafe {
+        ctx.read_at::<u32>(RENAMEAT_OLDNAME_PTR_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let newname_ptr: u64 = unsafe { ctx.read_at(RENAMEAT_NEWNAME_PTR_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let newname_ptr: u64 = unsafe {
+        ctx.read_at::<u32>(RENAMEAT_NEWNAME_PTR_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
+
+    emit_file_rename_event(&ctx, oldname_ptr, newname_ptr)
+}
+
+#[tracepoint]
+pub fn sys_enter_renameat2(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_renameat2(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_sys_enter_renameat2(ctx: TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let oldname_ptr: u64 = unsafe {
+        ctx.read_at(RENAMEAT2_OLDNAME_PTR_OFFSET)
+            .map_err(|_| 1u32)?
+    };
+    #[cfg(bpf_target_arch = "x86")]
+    let oldname_ptr: u64 = unsafe {
+        ctx.read_at::<u32>(RENAMEAT2_OLDNAME_PTR_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let newname_ptr: u64 = unsafe {
+        ctx.read_at(RENAMEAT2_NEWNAME_PTR_OFFSET)
+            .map_err(|_| 1u32)?
+    };
+    #[cfg(bpf_target_arch = "x86")]
+    let newname_ptr: u64 = unsafe {
+        ctx.read_at::<u32>(RENAMEAT2_NEWNAME_PTR_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
+
+    emit_file_rename_event(&ctx, oldname_ptr, newname_ptr)
+}
+
+/// Shared by `sys_enter_rename`/`sys_enter_renameat`/`sys_enter_renameat2` above.
+fn emit_file_rename_event(
+    ctx: &TracePointContext,
+    oldname_ptr: u64,
+    newname_ptr: u64,
+) -> Result<u32, u32> {
+    let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
+    let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
+
+    let e = RENAME_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
+    unsafe {
+        core::ptr::write_bytes(e, 0, 1);
+        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*e).meta.ppid = lineage_ppid();
+        (*e).meta.uid = uid_gid as u32;
+        (*e).meta.gid = (uid_gid >> 32) as u32;
+        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
+        let mut i = 0usize;
+        while i < TASK_COMM_LEN {
+            (*e).meta.comm[i] = comm[i];
+            i += 1;
+        }
+
+        if oldname_ptr != 0 {
+            if let Ok(path) =
+                bpf_probe_read_user_str_bytes(oldname_ptr as *const u8, &mut (*e).old_path)
+            {
+                (*e).old_path_len = path.len() as u16;
+            }
+        }
+        if newname_ptr != 0 {
+            if let Ok(path) =
+                bpf_probe_read_user_str_bytes(newname_ptr as *const u8, &mut (*e).new_path)
+            {
+                (*e).new_path_len = path.len() as u16;
+            }
+        }
+
+        if FILE_RENAME_EVENTS
+            .output::<FileRenameEvent>(&*e, 0)
+            .is_err()
+        {
+            warn!(
+                ctx,
+                "sensor-linux-ebpf: ring buffer full, dropping rename event"
+            );
+        }
+    }
+
+    Ok(0)
+}
+
 /// Ring buffer shared with userspace for `connect` events.
 #[map]
 static CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -492,6 +873,106 @@ fn try_sys_enter_connect(ctx: TracePointContext) -> Result<u32, u32> {
     };
 
     info!(&ctx, "sensor-linux-ebpf: connect pid={}", pid);
+    Ok(0)
+}
+
+/// Ring buffer shared with userspace for `bind` events.
+#[map]
+static SOCKET_BIND_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Per-CPU scratch for building one `SocketBindEvent` (see `EXEC_SCRATCH`).
+#[map]
+static BIND_SCRATCH: PerCpuArray<SocketBindEvent> = PerCpuArray::with_max_entries(1, 0);
+
+/// Offsets of the `syscalls:sys_enter_bind` tracepoint (x86_64/aarch64): `fd`(16),
+/// `umyaddr`(24), `addrlen`(32) — identical shape to `sys_enter_connect` above.
+/// Verified on 2026-09-21 on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// `/sys/kernel/tracing/events/syscalls/sys_enter_bind/format`.
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const BIND_UMYADDR_PTR_OFFSET: usize = 24;
+/// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
+#[cfg(bpf_target_arch = "x86")]
+const BIND_UMYADDR_PTR_OFFSET: usize = 16;
+
+#[tracepoint]
+pub fn sys_enter_bind(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_bind(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+/// Mirrors `try_sys_enter_connect` above field for field — same family filter, same
+/// raw-byte address read (avoids the endianness bug documented on `ConnectEvent`),
+/// same per-CPU-scratch assembly. Only the wire type, ring buffer, and field names
+/// (`laddr`/`lport` vs `daddr`/`dport`) differ.
+fn try_sys_enter_bind(ctx: TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let umyaddr_ptr: u64 = unsafe { ctx.read_at(BIND_UMYADDR_PTR_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let umyaddr_ptr: u64 = unsafe {
+        ctx.read_at::<u32>(BIND_UMYADDR_PTR_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
+    if umyaddr_ptr == 0 {
+        return Ok(0);
+    }
+
+    let family: u16 = match unsafe { bpf_probe_read_user(umyaddr_ptr as *const u16) } {
+        Ok(f) => f,
+        Err(_) => return Ok(0),
+    };
+    if family != AF_INET && family != AF_INET6 {
+        return Ok(0);
+    }
+
+    let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
+    let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
+
+    let port_be: u16 =
+        unsafe { bpf_probe_read_user((umyaddr_ptr + 2) as *const u16).map_err(|_| 1u32)? };
+    let (v4, v6): ([u8; 4], [u8; 16]) = if family == AF_INET {
+        (
+            unsafe { bpf_probe_read_user((umyaddr_ptr + 4) as *const [u8; 4]).map_err(|_| 1u32)? },
+            [0u8; 16],
+        )
+    } else {
+        ([0u8; 4], unsafe {
+            bpf_probe_read_user((umyaddr_ptr + 8) as *const [u8; 16]).map_err(|_| 1u32)?
+        })
+    };
+
+    let e = BIND_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
+    unsafe {
+        core::ptr::write_bytes(e, 0, 1);
+
+        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*e).meta.ppid = lineage_ppid();
+        (*e).meta.uid = uid_gid as u32;
+        (*e).meta.gid = (uid_gid >> 32) as u32;
+        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
+        let mut i = 0usize;
+        while i < TASK_COMM_LEN {
+            (*e).meta.comm[i] = comm[i];
+            i += 1;
+        }
+        (*e).is_ipv6 = family == AF_INET6;
+        (*e).lport = u16::from_be(port_be);
+        (*e).laddr_v4 = v4;
+        (*e).laddr_v6 = v6;
+
+        if SOCKET_BIND_EVENTS
+            .output::<SocketBindEvent>(&*e, 0)
+            .is_err()
+        {
+            warn!(
+                &ctx,
+                "sensor-linux-ebpf: ring buffer full, dropping bind event"
+            );
+        }
+    }
+
     Ok(0)
 }
 

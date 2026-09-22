@@ -33,6 +33,8 @@ pub(crate) fn cmd_run(
     _events: &std::path::Path,
     _enable_kill: bool,
     _enable_quarantine: bool,
+    _enable_tls_capture: bool,
+    _enable_readline_capture: bool,
     _server: Option<&str>,
 ) -> anyhow::Result<()> {
     anyhow::bail!(UNSUPPORTED_PLATFORM)

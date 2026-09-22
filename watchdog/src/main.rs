@@ -39,6 +39,14 @@ use paths::DEFAULT_ALERTS;
     about = "Installs and supervises the Synthaea agent as a system service"
 )]
 struct Cli {
+    /// Path to the agent configuration file (TOML). See ADR-0013 for the
+    /// discovery order (this flag, `SYNTHAEA_CONFIG` env, OS default).
+    /// The Windows service-mode entry point (`run_as_service`) skips this
+    /// flag and always resolves the config via `SYNTHAEA_CONFIG`/OS
+    /// default, since the SCM launches the binary without CLI args.
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -92,6 +100,24 @@ enum Command {
 
 fn run_cli() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // Load the local install configuration eagerly. Per ADR-0013 §5 the
+    // watchdog fails fast with a copy-pasteable message if the config is
+    // missing or invalid — the alternative (silently falling back on
+    // hard-coded paths) would let a mis-installed watchdog respawn an
+    // agent that itself can't find its config, wasting boots.
+    //
+    // The service-mode entry point on Windows (see `main` below) does NOT
+    // go through this function — it enters `service::windows::run_as_service`
+    // directly, and resolves the config on its own via the same discovery
+    // order minus the `--config` flag (the SCM never passes CLI args).
+    let cfg = config::load(cli.config.as_deref())?;
+    eprintln!(
+        "[watchdog] loaded configuration (schema_version={}, log.dir={})",
+        cfg.schema_version,
+        cfg.log.dir.display()
+    );
+
     match cli.command {
         Command::Install { agent_bin, alerts } => service::cmd_install(agent_bin, alerts),
         Command::Uninstall => service::cmd_uninstall(),

@@ -9,4 +9,14 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Userspace decode helpers (comm_str, boot_epoch_offset_ns) — std required.
+# The eBPF crate (`../ebpf`, no_std bpfel target) must NOT enable this.
+user = []
+
 [dependencies]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# boot_epoch_offset_ns only: clock_gettime + the failure warning.
+libc = { version = "0.2", default-features = false }
+tracing = { workspace = true }

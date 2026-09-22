@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 schema = { path = "../crates/schema" }
+config = { path = "../crates/config" }
 policy = { path = "../crates/policy" }
 rules = { path = "../crates/rules" }
 correlator = { path = "../crates/correlator" }
@@ -41,6 +42,7 @@ sensor-linux = { path = "../crates/sensors/linux/userspace" }
 sensor-linux-audit = { path = "../crates/sensors/linux/audit" }
 sensor-linux-netlink = { path = "../crates/sensors/linux/netlink" }
 sensor-linux-journal = { path = "../crates/sensors/linux/journal" }
+sensor-linux-uprobes = { path = "../crates/sensors/linux/uprobes" }
 libc = "0.2"
 
 # sensor-linux-lsm is not wired into `cmd_run` yet (issue #91 — inline blocking

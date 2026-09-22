@@ -189,12 +189,10 @@ pub fn task_leaf_name(task_name: &str) -> String {
 /// `to_auth_event` reuses Subject as the reported target for that one kind.
 ///
 /// Field names are the standard, publicly documented Microsoft Security-auditing
-/// schema for these four event IDs. Unlike 7045/4698 (each empirically confirmed
-/// against a real lab-VM capture during the original #94 investigation — see
-/// `docs/adr/0004-...`), these have **not** yet been reconciled against a real
-/// `wevtutil qe Security /f:xml` capture. Whoever validates this on the lab VM
-/// should diff a real capture against the constants in this module's tests and
-/// fix any mismatch here before relying on this in production.
+/// schema for these four event IDs. Reconciled against a real
+/// `wevtutil qe Security /f:xml` capture on 2026-09-21 (Windows 11 lab VM
+/// `Sandbox`, issue #224 — see `lab/eventlog-captures/2026-09-21-sandbox/*.xml`); the fixtures in this
+/// module's tests are trimmed but otherwise faithful to that capture.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LogonEvent {
     pub record_id: u64,
@@ -279,9 +277,9 @@ pub fn parse_logon_block(block: &str) -> Option<LogonEvent> {
 /// on local SAM (differs from `TargetUserName` only for downlevel domain accounts,
 /// which are out of scope) — kept out of the struct to avoid duplication.
 ///
-/// Not yet reconciled against a real `wevtutil qe Security /f:xml` capture — same
-/// caveat as [`LogonEvent`] above; whoever validates this on the lab VM should diff
-/// against the fixture in this module's tests.
+/// Reconciled against a real `wevtutil qe Security /f:xml` capture on 2026-09-21
+/// (Windows 11 lab VM `Sandbox`, issue #224 — see `lab/eventlog-captures/2026-09-21-sandbox/4720.xml`);
+/// the fixture in this module's tests is faithful to that capture.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AccountCreatedEvent {
     pub record_id: u64,
@@ -443,21 +441,30 @@ mod tests {
 
     // ── Logon events (4624/4625/4648/4672) ───────────────────────────────────
     //
-    // Shape built from the documented Microsoft Security-auditing schema, NOT
-    // yet reconciled against a real lab-VM capture (see `LogonEvent`'s doc) —
-    // unlike SERVICE_INSTALL_XML/SCHEDULED_TASK_XML above, which were.
+    // Fixtures reconciled 2026-09-21 (issue #224) against a real
+    // `wevtutil qe Security /f:xml` capture on Windows 11 lab VM `Sandbox` —
+    // see `lab/eventlog-captures/2026-09-21-sandbox/*.xml`. UTF-16-LE from wevtutil normalised to UTF-8
+    // via iconv (a stray `Système`-mojibake artefact from that pipeline was
+    // corrected back to `Système` here; the parser reads neither the field nor
+    // the surrounding text, so the round-trip is safe).
 
-    /// A successful interactive logon (`LogonType` 10 = RemoteInteractive/RDP).
-    /// Subject is SYSTEM (LSASS acting on the machine's behalf); Target is the
-    /// account actually logging in.
-    const LOGON_SUCCESS_XML: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Security-Auditing' Guid='{54849625-5478-4994-a5ba-3e3b0328c30d}'/><EventID>4624</EventID><Version>2</Version><Level>0</Level><Task>12544</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime='2026-09-07T09:00:00.000000000Z'/><EventRecordID>9001</EventRecordID><Correlation/><Execution ProcessID='604' ThreadID='700'/><Channel>Security</Channel><Computer>LAB-VM</Computer><Security/></System><EventData><Data Name='SubjectUserSid'>S-1-5-18</Data><Data Name='SubjectUserName'>LAB-VM$</Data><Data Name='SubjectDomainName'>WORKGROUP</Data><Data Name='SubjectLogonId'>0x3e7</Data><Data Name='TargetUserSid'>S-1-5-21-1004336348-1177238915-682003330-1001</Data><Data Name='TargetUserName'>victim</Data><Data Name='TargetDomainName'>LAB-VM</Data><Data Name='TargetLogonId'>0x3a2f1</Data><Data Name='LogonType'>10</Data><Data Name='LogonProcessName'>User32 </Data><Data Name='AuthenticationPackageName'>Negotiate</Data><Data Name='WorkstationName'>LAB-VM</Data><Data Name='IpAddress'>-</Data><Data Name='IpPort'>0</Data></EventData></Event>"#;
+    /// Three concatenated 4624 events as one `wevtutil` query returns them:
+    /// two service-account logons (`LogonType` 5, Target SYSTEM `S-1-5-18`,
+    /// `IpAddress='-'`) followed by the interactive `runas`-triggered logon
+    /// (`LogonType` 2, Target `testuser224`, `IpAddress='::1'`). Exercises both
+    /// the multi-event splitter and the `"-"`-sentinel filter on `IpAddress`.
+    const LOGON_SUCCESS_XML: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Security-Auditing' Guid='{54849625-5478-4994-a5ba-3e3b0328c30d}'/><EventID>4624</EventID><Version>3</Version><Level>0</Level><Task>12544</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime='2026-09-21T13:31:23.4077711Z'/><EventRecordID>76351</EventRecordID><Correlation ActivityID='{9f6e2246-49c9-0001-c923-6e9fc949dd01}'/><Execution ProcessID='836' ThreadID='932'/><Channel>Security</Channel><Computer>Sandbox</Computer><Security/></System><EventData><Data Name='SubjectUserSid'>S-1-5-18</Data><Data Name='SubjectUserName'>SANDBOX$</Data><Data Name='SubjectDomainName'>WORKGROUP</Data><Data Name='SubjectLogonId'>0x3e7</Data><Data Name='TargetUserSid'>S-1-5-18</Data><Data Name='TargetUserName'>Système</Data><Data Name='TargetDomainName'>AUTORITE NT</Data><Data Name='TargetLogonId'>0x3e7</Data><Data Name='LogonType'>5</Data><Data Name='LogonProcessName'>Advapi  </Data><Data Name='AuthenticationPackageName'>Negotiate</Data><Data Name='WorkstationName'>-</Data><Data Name='LogonGuid'>{00000000-0000-0000-0000-000000000000}</Data><Data Name='TransmittedServices'>-</Data><Data Name='LmPackageName'>-</Data><Data Name='KeyLength'>0</Data><Data Name='ProcessId'>0x330</Data><Data Name='ProcessName'>C:\Windows\System32\services.exe</Data><Data Name='IpAddress'>-</Data><Data Name='IpPort'>-</Data><Data Name='ImpersonationLevel'>%%1833</Data><Data Name='RestrictedAdminMode'>-</Data><Data Name='RemoteCredentialGuard'>-</Data><Data Name='TargetOutboundUserName'>-</Data><Data Name='TargetOutboundDomainName'>-</Data><Data Name='VirtualAccount'>%%1843</Data><Data Name='TargetLinkedLogonId'>0x0</Data><Data Name='ElevatedToken'>%%1842</Data></EventData></Event><Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Security-Auditing' Guid='{54849625-5478-4994-a5ba-3e3b0328c30d}'/><EventID>4624</EventID><Version>3</Version><Level>0</Level><Task>12544</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime='2026-09-21T13:29:39.7628569Z'/><EventRecordID>76342</EventRecordID><Correlation ActivityID='{9f6e2246-49c9-0001-c923-6e9fc949dd01}'/><Execution ProcessID='836' ThreadID='876'/><Channel>Security</Channel><Computer>Sandbox</Computer><Security/></System><EventData><Data Name='SubjectUserSid'>S-1-5-18</Data><Data Name='SubjectUserName'>SANDBOX$</Data><Data Name='SubjectDomainName'>WORKGROUP</Data><Data Name='SubjectLogonId'>0x3e7</Data><Data Name='TargetUserSid'>S-1-5-18</Data><Data Name='TargetUserName'>Système</Data><Data Name='TargetDomainName'>AUTORITE NT</Data><Data Name='TargetLogonId'>0x3e7</Data><Data Name='LogonType'>5</Data><Data Name='LogonProcessName'>Advapi  </Data><Data Name='AuthenticationPackageName'>Negotiate</Data><Data Name='WorkstationName'>-</Data><Data Name='LogonGuid'>{00000000-0000-0000-0000-000000000000}</Data><Data Name='TransmittedServices'>-</Data><Data Name='LmPackageName'>-</Data><Data Name='KeyLength'>0</Data><Data Name='ProcessId'>0x330</Data><Data Name='ProcessName'>C:\Windows\System32\services.exe</Data><Data Name='IpAddress'>-</Data><Data Name='IpPort'>-</Data><Data Name='ImpersonationLevel'>%%1833</Data><Data Name='RestrictedAdminMode'>-</Data><Data Name='RemoteCredentialGuard'>-</Data><Data Name='TargetOutboundUserName'>-</Data><Data Name='TargetOutboundDomainName'>-</Data><Data Name='VirtualAccount'>%%1843</Data><Data Name='TargetLinkedLogonId'>0x0</Data><Data Name='ElevatedToken'>%%1842</Data></EventData></Event><Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Security-Auditing' Guid='{54849625-5478-4994-a5ba-3e3b0328c30d}'/><EventID>4624</EventID><Version>3</Version><Level>0</Level><Task>12544</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime='2026-09-21T13:29:36.7187492Z'/><EventRecordID>76340</EventRecordID><Correlation ActivityID='{9f6e2246-49c9-0001-c923-6e9fc949dd01}'/><Execution ProcessID='836' ThreadID='876'/><Channel>Security</Channel><Computer>Sandbox</Computer><Security/></System><EventData><Data Name='SubjectUserSid'>S-1-5-21-1663667890-2519037288-962558911-1001</Data><Data Name='SubjectUserName'>solka</Data><Data Name='SubjectDomainName'>SANDBOX</Data><Data Name='SubjectLogonId'>0x12abb7</Data><Data Name='TargetUserSid'>S-1-5-21-1663667890-2519037288-962558911-1002</Data><Data Name='TargetUserName'>testuser224</Data><Data Name='TargetDomainName'>Sandbox</Data><Data Name='TargetLogonId'>0xd15e6e</Data><Data Name='LogonType'>2</Data><Data Name='LogonProcessName'>seclogo</Data><Data Name='AuthenticationPackageName'>Negotiate</Data><Data Name='WorkstationName'>SANDBOX</Data><Data Name='LogonGuid'>{00000000-0000-0000-0000-000000000000}</Data><Data Name='TransmittedServices'>-</Data><Data Name='LmPackageName'>-</Data><Data Name='KeyLength'>0</Data><Data Name='ProcessId'>0xb90</Data><Data Name='ProcessName'>C:\Windows\System32\svchost.exe</Data><Data Name='IpAddress'>::1</Data><Data Name='IpPort'>0</Data><Data Name='ImpersonationLevel'>%%1833</Data><Data Name='RestrictedAdminMode'>-</Data><Data Name='RemoteCredentialGuard'>-</Data><Data Name='TargetOutboundUserName'>-</Data><Data Name='TargetOutboundDomainName'>-</Data><Data Name='VirtualAccount'>%%1843</Data><Data Name='TargetLinkedLogonId'>0x0</Data><Data Name='ElevatedToken'>%%1843</Data></EventData></Event>"#;
 
-    /// A failed network logon (`LogonType` 3), wrong-password substatus.
-    const LOGON_FAILURE_XML: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Security-Auditing' Guid='{54849625-5478-4994-a5ba-3e3b0328c30d}'/><EventID>4625</EventID><Version>0</Version><Level>0</Level><Task>12544</Task><Opcode>0</Opcode><Keywords>0x8010000000000000</Keywords><TimeCreated SystemTime='2026-09-07T09:01:00.000000000Z'/><EventRecordID>9002</EventRecordID><Correlation/><Execution ProcessID='604' ThreadID='701'/><Channel>Security</Channel><Computer>LAB-VM</Computer><Security/></System><EventData><Data Name='SubjectUserSid'>S-1-0-0</Data><Data Name='SubjectUserName'>-</Data><Data Name='SubjectDomainName'>-</Data><Data Name='SubjectLogonId'>0x0</Data><Data Name='TargetUserSid'>S-1-0-0</Data><Data Name='TargetUserName'>admin</Data><Data Name='TargetDomainName'>LAB-VM</Data><Data Name='Status'>0xc000006d</Data><Data Name='FailureReason'>%%2313</Data><Data Name='SubStatus'>0xc000006a</Data><Data Name='LogonType'>3</Data><Data Name='WorkstationName'>ATTACKER-BOX</Data><Data Name='ProcessId'>0x0</Data><Data Name='ProcessName'>-</Data><Data Name='IpAddress'>198.51.100.23</Data><Data Name='IpPort'>51514</Data></EventData></Event>"#;
+    /// A failed network logon (`LogonType` 3, `NtLmSsp`), wrong-password
+    /// substatus, from a `net use \\localhost\C$` attempt by an account that is
+    /// not a local administrator — `IpAddress='::1'` because Windows resolves
+    /// `localhost` to the IPv6 loopback first.
+    const LOGON_FAILURE_XML: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Security-Auditing' Guid='{54849625-5478-4994-a5ba-3e3b0328c30d}'/><EventID>4625</EventID><Version>0</Version><Level>0</Level><Task>12544</Task><Opcode>0</Opcode><Keywords>0x8010000000000000</Keywords><TimeCreated SystemTime='2026-09-21T13:29:23.2367298Z'/><EventRecordID>76333</EventRecordID><Correlation ActivityID='{9f6e2246-49c9-0001-c923-6e9fc949dd01}'/><Execution ProcessID='836' ThreadID='4836'/><Channel>Security</Channel><Computer>Sandbox</Computer><Security/></System><EventData><Data Name='SubjectUserSid'>S-1-0-0</Data><Data Name='SubjectUserName'>-</Data><Data Name='SubjectDomainName'>-</Data><Data Name='SubjectLogonId'>0x0</Data><Data Name='TargetUserSid'>S-1-0-0</Data><Data Name='TargetUserName'>testuser224</Data><Data Name='TargetDomainName'>-</Data><Data Name='Status'>0xc000006d</Data><Data Name='FailureReason'>%%2313</Data><Data Name='SubStatus'>0xc000006a</Data><Data Name='LogonType'>3</Data><Data Name='LogonProcessName'>NtLmSsp </Data><Data Name='AuthenticationPackageName'>NTLM</Data><Data Name='WorkstationName'>SANDBOX</Data><Data Name='TransmittedServices'>-</Data><Data Name='LmPackageName'>-</Data><Data Name='KeyLength'>0</Data><Data Name='ProcessId'>0x0</Data><Data Name='ProcessName'>-</Data><Data Name='IpAddress'>::1</Data><Data Name='IpPort'>54937</Data></EventData></Event>"#;
 
-    /// An explicit-credential logon (`runas /user:Administrator`) — no
-    /// `TargetUserSid` (never resolved for this event type).
-    const EXPLICIT_CREDENTIALS_XML: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Security-Auditing' Guid='{54849625-5478-4994-a5ba-3e3b0328c30d}'/><EventID>4648</EventID><Version>0</Version><Level>0</Level><Task>12544</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime='2026-09-07T09:02:00.000000000Z'/><EventRecordID>9003</EventRecordID><Correlation/><Execution ProcessID='604' ThreadID='702'/><Channel>Security</Channel><Computer>LAB-VM</Computer><Security/></System><EventData><Data Name='SubjectUserSid'>S-1-5-21-1004336348-1177238915-682003330-1001</Data><Data Name='SubjectUserName'>victim</Data><Data Name='SubjectDomainName'>LAB-VM</Data><Data Name='SubjectLogonId'>0x3a2f1</Data><Data Name='TargetUserName'>Administrator</Data><Data Name='TargetDomainName'>LAB-VM</Data><Data Name='TargetServerName'>localhost</Data><Data Name='TargetInfo'>localhost</Data><Data Name='ProcessId'>0x1a4</Data><Data Name='ProcessName'>C:\Windows\System32\cmd.exe</Data><Data Name='IpAddress'>127.0.0.1</Data><Data Name='IpPort'>0</Data></EventData></Event>"#;
+    /// An explicit-credential logon (`Start-Process -Credential` targeting a
+    /// local account on `localhost`) — no `TargetUserSid` (never resolved for
+    /// this event type), Subject is the already-authenticated caller (`solka`).
+    const EXPLICIT_CREDENTIALS_XML: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Security-Auditing' Guid='{54849625-5478-4994-a5ba-3e3b0328c30d}'/><EventID>4648</EventID><Version>0</Version><Level>0</Level><Task>12544</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime='2026-09-21T13:29:36.7187097Z'/><EventRecordID>76339</EventRecordID><Correlation ActivityID='{9f6e2246-49c9-0001-c923-6e9fc949dd01}'/><Execution ProcessID='836' ThreadID='876'/><Channel>Security</Channel><Computer>Sandbox</Computer><Security/></System><EventData><Data Name='SubjectUserSid'>S-1-5-21-1663667890-2519037288-962558911-1001</Data><Data Name='SubjectUserName'>solka</Data><Data Name='SubjectDomainName'>SANDBOX</Data><Data Name='SubjectLogonId'>0x12abb7</Data><Data Name='LogonGuid'>{00000000-0000-0000-0000-000000000000}</Data><Data Name='TargetUserName'>testuser224</Data><Data Name='TargetDomainName'>Sandbox</Data><Data Name='TargetLogonGuid'>{00000000-0000-0000-0000-000000000000}</Data><Data Name='TargetServerName'>localhost</Data><Data Name='TargetInfo'>localhost</Data><Data Name='ProcessId'>0xb90</Data><Data Name='ProcessName'>C:\Windows\System32\svchost.exe</Data><Data Name='IpAddress'>::1</Data><Data Name='IpPort'>0</Data></EventData></Event>"#;
 
     /// Special privileges assigned to a new logon — no `Target*` fields at all;
     /// Subject is the account that just received the privileges.
@@ -465,42 +472,70 @@ mod tests {
 
     #[test]
     fn parses_a_real_shaped_logon_success_block() {
-        let block = split_event_blocks(LOGON_SUCCESS_XML)[0];
-        let parsed = parse_logon_block(block).expect("should parse");
-        assert_eq!(parsed.record_id, 9001);
-        assert_eq!(parsed.event_id, 4624);
-        assert_eq!(parsed.pid, 604);
-        assert_eq!(parsed.subject_user_sid.as_deref(), Some("S-1-5-18"));
-        assert_eq!(parsed.target_user_name.as_deref(), Some("victim"));
+        // Real wevtutil output for `EventID=4624` returns concatenated events;
+        // exercise both the multi-event splitter and the two logon shapes the
+        // capture contains (service-account SYSTEM logon vs. real interactive
+        // logon) rather than picking only one.
+        let blocks = split_event_blocks(LOGON_SUCCESS_XML);
+        assert_eq!(blocks.len(), 3);
+
+        // First block: LogonType 5, Target SYSTEM, `IpAddress='-'` — proves the
+        // `"-"`-sentinel filter still trims the field on real captures.
+        let sys_logon = parse_logon_block(blocks[0]).expect("should parse");
+        assert_eq!(sys_logon.record_id, 76351);
+        assert_eq!(sys_logon.event_id, 4624);
+        assert_eq!(sys_logon.pid, 836);
+        assert_eq!(sys_logon.target_user_sid.as_deref(), Some("S-1-5-18"));
+        // "-" sentinel (no network address for a local/service logon) filtered out.
+        assert_eq!(sys_logon.ip_address, None);
+
+        // Third block: LogonType 2, interactive logon of `testuser224` from
+        // `solka` via `runas`, `IpAddress='::1'` (IPv6 loopback, kept as-is).
+        let user_logon = parse_logon_block(blocks[2]).expect("should parse");
+        assert_eq!(user_logon.record_id, 76340);
+        assert_eq!(user_logon.event_id, 4624);
+        assert_eq!(user_logon.pid, 836);
         assert_eq!(
-            parsed.target_user_sid.as_deref(),
-            Some("S-1-5-21-1004336348-1177238915-682003330-1001")
+            user_logon.subject_user_sid.as_deref(),
+            Some("S-1-5-21-1663667890-2519037288-962558911-1001")
         );
-        // "-" sentinel (no network address for a local/console logon) filtered out.
-        assert_eq!(parsed.ip_address, None);
+        assert_eq!(user_logon.subject_user_name.as_deref(), Some("solka"));
+        assert_eq!(
+            user_logon.target_user_sid.as_deref(),
+            Some("S-1-5-21-1663667890-2519037288-962558911-1002")
+        );
+        assert_eq!(user_logon.target_user_name.as_deref(), Some("testuser224"));
+        assert_eq!(user_logon.ip_address.as_deref(), Some("::1"));
     }
 
     #[test]
     fn parses_a_real_shaped_logon_failure_block() {
         let block = split_event_blocks(LOGON_FAILURE_XML)[0];
         let parsed = parse_logon_block(block).expect("should parse");
+        assert_eq!(parsed.record_id, 76333);
         assert_eq!(parsed.event_id, 4625);
         assert_eq!(parsed.status.as_deref(), Some("0xc000006d"));
         assert_eq!(parsed.sub_status.as_deref(), Some("0xc000006a"));
-        assert_eq!(parsed.ip_address.as_deref(), Some("198.51.100.23"));
+        // `::1` (IPv6 loopback) is a real value, not a sentinel — keep as-is.
+        assert_eq!(parsed.ip_address.as_deref(), Some("::1"));
         assert_eq!(parsed.target_user_sid.as_deref(), Some("S-1-0-0"));
+        assert_eq!(parsed.target_user_name.as_deref(), Some("testuser224"));
+        // 4625 for a not-yet-resolved caller: `SubjectUserName='-'` filtered
+        // out by the sentinel guard.
+        assert_eq!(parsed.subject_user_name, None);
     }
 
     #[test]
     fn parses_a_real_shaped_explicit_credentials_block() {
         let block = split_event_blocks(EXPLICIT_CREDENTIALS_XML)[0];
         let parsed = parse_logon_block(block).expect("should parse");
+        assert_eq!(parsed.record_id, 76339);
         assert_eq!(parsed.event_id, 4648);
-        assert_eq!(parsed.subject_user_name.as_deref(), Some("victim"));
-        assert_eq!(parsed.target_user_name.as_deref(), Some("Administrator"));
+        assert_eq!(parsed.subject_user_name.as_deref(), Some("solka"));
+        assert_eq!(parsed.target_user_name.as_deref(), Some("testuser224"));
         // 4648 never resolves a TargetUserSid.
         assert_eq!(parsed.target_user_sid, None);
-        assert_eq!(parsed.ip_address.as_deref(), Some("127.0.0.1"));
+        assert_eq!(parsed.ip_address.as_deref(), Some("::1"));
     }
 
     #[test]
@@ -528,35 +563,39 @@ mod tests {
 
     // ── Account creation (4720) ──────────────────────────────────────────────
     //
-    // Shape built from the documented Microsoft Security-auditing schema for
-    // 4720 (`User Account Management`). Not yet reconciled against a real
-    // `wevtutil qe Security /f:xml` capture — same caveat as `LogonEvent`;
-    // whoever validates this on the lab VM should diff a real capture against
-    // this fixture and fix any mismatch.
+    // Fixture reconciled 2026-09-21 (issue #224) against a real
+    // `wevtutil qe Security /f:xml` capture on Windows 11 lab VM `Sandbox` —
+    // see `lab/eventlog-captures/2026-09-21-sandbox/4720.xml`. Note that `UserAccountControl` is
+    // multi-line (indented `%%2080/%%2082/%%2084`, one per line); the parser
+    // ignores this field, so the whitespace shape does not affect correctness
+    // but is preserved here to stay faithful to what wevtutil rendered.
 
-    /// A local SAM account creation via `net user attacker P@ssw0rd /add`.
-    /// Subject is the caller (a local administrator), Target is the newly
-    /// created account (`S-1-5-21-...-1005`, next RID after `victim`'s 1001).
-    const ACCOUNT_CREATED_XML: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Security-Auditing' Guid='{54849625-5478-4994-a5ba-3e3b0328c30d}'/><EventID>4720</EventID><Version>0</Version><Level>0</Level><Task>13824</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime='2026-09-07T09:10:00.000000000Z'/><EventRecordID>9010</EventRecordID><Correlation/><Execution ProcessID='604' ThreadID='710'/><Channel>Security</Channel><Computer>LAB-VM</Computer><Security/></System><EventData><Data Name='TargetUserName'>attacker</Data><Data Name='TargetDomainName'>LAB-VM</Data><Data Name='TargetSid'>S-1-5-21-1004336348-1177238915-682003330-1005</Data><Data Name='SubjectUserSid'>S-1-5-21-1004336348-1177238915-682003330-500</Data><Data Name='SubjectUserName'>Administrator</Data><Data Name='SubjectDomainName'>LAB-VM</Data><Data Name='SubjectLogonId'>0x1a4c9</Data><Data Name='PrivilegeList'>-</Data><Data Name='SamAccountName'>attacker</Data><Data Name='DisplayName'>%%1793</Data><Data Name='UserPrincipalName'>-</Data><Data Name='HomeDirectory'>%%1793</Data><Data Name='HomePath'>%%1793</Data><Data Name='ScriptPath'>%%1793</Data><Data Name='ProfilePath'>%%1793</Data><Data Name='UserWorkstations'>%%1793</Data><Data Name='PasswordLastSet'>%%1794</Data><Data Name='AccountExpires'>%%1794</Data><Data Name='PrimaryGroupId'>513</Data><Data Name='AllowedToDelegateTo'>-</Data><Data Name='OldUacValue'>0x0</Data><Data Name='NewUacValue'>0x15</Data><Data Name='UserAccountControl'>%%2080 %%2082 %%2084</Data><Data Name='UserParameters'>%%1793</Data><Data Name='SidHistory'>-</Data><Data Name='LogonHours'>%%1797</Data></EventData></Event>"#;
+    /// A local SAM account creation via `net user testuser224 <pwd> /add`
+    /// executed by `solka` (a local administrator). Target is the newly
+    /// created `testuser224` account (RID 1002).
+    const ACCOUNT_CREATED_XML: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Security-Auditing' Guid='{54849625-5478-4994-a5ba-3e3b0328c30d}'/><EventID>4720</EventID><Version>0</Version><Level>0</Level><Task>13824</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime='2026-09-21T13:29:23.0286360Z'/><EventRecordID>76327</EventRecordID><Correlation ActivityID='{9f6e2246-49c9-0001-c923-6e9fc949dd01}'/><Execution ProcessID='836' ThreadID='4836'/><Channel>Security</Channel><Computer>Sandbox</Computer><Security/></System><EventData><Data Name='TargetUserName'>testuser224</Data><Data Name='TargetDomainName'>Sandbox</Data><Data Name='TargetSid'>S-1-5-21-1663667890-2519037288-962558911-1002</Data><Data Name='SubjectUserSid'>S-1-5-21-1663667890-2519037288-962558911-1001</Data><Data Name='SubjectUserName'>solka</Data><Data Name='SubjectDomainName'>SANDBOX</Data><Data Name='SubjectLogonId'>0x12abb7</Data><Data Name='PrivilegeList'>-</Data><Data Name='SamAccountName'>testuser224</Data><Data Name='DisplayName'>%%1793</Data><Data Name='UserPrincipalName'>-</Data><Data Name='HomeDirectory'>%%1793</Data><Data Name='HomePath'>%%1793</Data><Data Name='ScriptPath'>%%1793</Data><Data Name='ProfilePath'>%%1793</Data><Data Name='UserWorkstations'>%%1793</Data><Data Name='PasswordLastSet'>%%1794</Data><Data Name='AccountExpires'>%%1794</Data><Data Name='PrimaryGroupId'>513</Data><Data Name='AllowedToDelegateTo'>-</Data><Data Name='OldUacValue'>0x0</Data><Data Name='NewUacValue'>0x15</Data><Data Name='UserAccountControl'>
+		%%2080
+		%%2082
+		%%2084</Data><Data Name='UserParameters'>%%1793</Data><Data Name='SidHistory'>-</Data><Data Name='LogonHours'>%%1797</Data></EventData></Event>"#;
 
     #[test]
     fn parses_a_real_shaped_account_created_block() {
         let block = split_event_blocks(ACCOUNT_CREATED_XML)[0];
         let parsed = parse_account_created_block(block).expect("should parse");
-        assert_eq!(parsed.record_id, 9010);
-        assert_eq!(parsed.pid, 604);
-        assert_eq!(parsed.target_user_name.as_deref(), Some("attacker"));
+        assert_eq!(parsed.record_id, 76327);
+        assert_eq!(parsed.pid, 836);
+        assert_eq!(parsed.target_user_name.as_deref(), Some("testuser224"));
         // 4720 uses `TargetSid`, not `TargetUserSid` — the parser knows this
         // (see comment on `parse_account_created_block`).
         assert_eq!(
             parsed.target_user_sid.as_deref(),
-            Some("S-1-5-21-1004336348-1177238915-682003330-1005")
+            Some("S-1-5-21-1663667890-2519037288-962558911-1002")
         );
         assert_eq!(
             parsed.subject_user_sid.as_deref(),
-            Some("S-1-5-21-1004336348-1177238915-682003330-500")
+            Some("S-1-5-21-1663667890-2519037288-962558911-1001")
         );
-        assert_eq!(parsed.subject_user_name.as_deref(), Some("Administrator"));
+        assert_eq!(parsed.subject_user_name.as_deref(), Some("solka"));
     }
 
     #[test]

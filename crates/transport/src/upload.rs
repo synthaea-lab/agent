@@ -45,6 +45,14 @@ pub trait EventDrain: Send {
     /// (a non-retryable [`crate::TransportError`]): without it one malformed
     /// segment would block all newer telemetry forever.
     ///
+    /// The discard unit is everything the last `drain` returned — for the
+    /// spool that is a whole segment, so valid events sharing a segment with
+    /// a poison record are lost with it (review finding, PR #271). Deliberate:
+    /// sub-segment retry is not expressible in the spool's two-phase
+    /// drain/ack protocol, and one segment (1 MiB cap, roughly one upload
+    /// batch) is the accepted blast radius for the rare permanent-rejection
+    /// path. Revisit only if servers start rejecting individual events.
+    ///
     /// # Errors
     ///
     /// Returns an error if the discard cannot be persisted.

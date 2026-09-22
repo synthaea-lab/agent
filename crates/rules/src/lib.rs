@@ -20,7 +20,7 @@ pub use state::RuleState;
 pub(crate) use stateless::{
     check_account_creation_persistence, check_base64_decode, check_encoded_powershell,
     check_persistence_write, check_proc_root_escape, check_scheduled_task_persistence,
-    check_service_install_persistence,
+    check_service_install_persistence, check_systemd_service_persistence,
 };
 // The contract is the two dispatchers — callers (agent) route every event
 // through them. The individual checks are implementation detail, re-exported
@@ -34,27 +34,14 @@ pub struct Alert {
     pub message: String,
 }
 
-// Standard POSIX open(2) flag values, stable across the Linux architectures we support
-// (x86_64, aarch64). Defined locally rather than via `libc`: `FileOpenEvent::flags` is
-// documented as platform-native and these Linux-path rules interpret the Linux values;
-// a `libc` dependency would drag platform quirks (no `O_ACCMODE` on Windows) into a
-// crate that must compile everywhere.
-const O_ACCMODE: u32 = 0o3;
-const O_WRONLY: u32 = 0o1;
-const O_RDWR: u32 = 0o2;
-pub(crate) const O_CREAT: u32 = 0o100;
-
-/// Write intent on `open(2)` flags: write access mode, or creation.
-/// Shared by the stateless rules (persistence) and the stateful ones (download history);
-/// also used by `agent`'s protected-resource monitoring (#71) to separate a foreign
-/// process merely reading an agent file from one attempting to modify it. Interprets
-/// Linux `open(2)` flag values specifically (see the `O_*` consts above) — only
-/// meaningful for `FileOpenEvent`s produced by a Linux sensor.
-#[must_use]
-pub fn has_write_intent(flags: u32) -> bool {
-    let access_mode = flags & O_ACCMODE;
-    access_mode == O_WRONLY || access_mode == O_RDWR || (flags & O_CREAT) != 0
-}
+/// The write-intent predicate and its `O_*` constants now live in `schema`
+/// (the one definition — see `schema::has_write_intent`'s doc for the history
+/// of the five drifted copies). Re-exported so this crate's public surface is
+/// unchanged: `agent`'s protected-resource monitoring (#71) calls it as
+/// `rules::has_write_intent`.
+pub use schema::has_write_intent;
+#[cfg(test)]
+pub(crate) use schema::{O_CREAT, O_WRONLY};
 
 #[cfg(test)]
 mod tests;

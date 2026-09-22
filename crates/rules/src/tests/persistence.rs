@@ -1,8 +1,9 @@
-//! The Windows persistence rules that flow through `FileOpenEvent` with a
-//! high-bit `flags` marker rather than a dedicated `Event::Persistence`
-//! variant (see ADR-0004): `check_scheduled_task_persistence` (T1053.005,
+//! The persistence rules that flow through `FileOpenEvent` with a high-bit
+//! `flags` marker rather than a dedicated `Event::Persistence` variant (see
+//! ADR-0004): the Windows trio `check_scheduled_task_persistence` (T1053.005,
 //! event 4698), `check_service_install_persistence` (T1543.003, event 7045),
-//! and `check_account_creation_persistence` (T1136.001, event 4720).
+//! `check_account_creation_persistence` (T1136.001, event 4720) — plus the
+//! Linux sibling `check_systemd_service_persistence` (T1543.002, issue #93).
 
 use super::*;
 
@@ -216,4 +217,58 @@ fn file_open_with_all_three_persistence_flags_still_alerts_as_account_creation()
     event.meta.comm = "AmbiguousArtifact".to_string();
     let alert = check_account_creation_persistence(&event).expect("must alert on the account bit");
     assert_eq!(alert.technique, "T1136.001");
+}
+
+// ── T1543.002 — Linux systemd unit first-start (issue #93) ──────────────────
+
+#[test]
+fn systemd_unit_flag_matches() {
+    // Canonical shape: the sensor sets `flags = FLAG_PERSISTENCE_SYSTEMD_ARTIFACT`
+    // on a unit's first observed start; `path` and `comm` are both the unit name.
+    let event = file_open_event_systemd_unit("cryptominer.service");
+    let alert = check_systemd_service_persistence(&event).expect("must alert on flagged event");
+    assert_eq!(alert.technique, "T1543.002");
+}
+
+#[test]
+fn systemd_unit_alert_carries_unit_name() {
+    let event = file_open_event_systemd_unit("backdoor.service");
+    let alert = check_systemd_service_persistence(&event).expect("must alert on flagged event");
+    assert!(
+        alert.message.contains("backdoor.service"),
+        "alert missing unit name: {}",
+        alert.message
+    );
+}
+
+#[test]
+fn file_open_without_systemd_flag_does_not_alert() {
+    // Ordinary `FileOpenEvent` without the high-bit persistence marker — must
+    // not fire T1543.002 even if `path` looks unit-shaped (the flag *is* the
+    // signal, not the path).
+    let event = file_open_event("sshd.service", O_CREAT | O_WRONLY);
+    assert!(check_systemd_service_persistence(&event).is_none());
+}
+
+#[test]
+fn file_open_with_only_windows_flags_does_not_alert_as_systemd() {
+    // The Windows persistence bits are all distinct from the Linux one — none
+    // of them alone should cross-fire T1543.002.
+    let flags = schema::FLAG_PERSISTENCE_TASK_ARTIFACT
+        | schema::FLAG_PERSISTENCE_ARTIFACT
+        | schema::FLAG_PERSISTENCE_ACCOUNT_ARTIFACT;
+    let event = file_open_event("whatever", flags);
+    assert!(check_systemd_service_persistence(&event).is_none());
+}
+
+#[test]
+fn file_open_with_systemd_and_a_windows_flag_still_alerts_as_systemd() {
+    // Contrived defensive case (the two sensors never share a process, so this
+    // never happens in practice): if a future event ever carried both bits,
+    // T1543.002 must still fire on its own bit rather than silently defer.
+    let flags = schema::FLAG_PERSISTENCE_SYSTEMD_ARTIFACT | schema::FLAG_PERSISTENCE_ARTIFACT;
+    let mut event = file_open_event("ambiguous.service", flags);
+    event.meta.comm = "ambiguous.service".to_string();
+    let alert = check_systemd_service_persistence(&event).expect("must alert on the systemd bit");
+    assert_eq!(alert.technique, "T1543.002");
 }

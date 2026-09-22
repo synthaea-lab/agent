@@ -205,6 +205,8 @@ pub(crate) fn cmd_run(
     events: &std::path::Path,
     enable_kill: bool,
     enable_quarantine: bool,
+    enable_tls_capture: bool,
+    enable_readline_capture: bool,
     server: Option<&str>,
 ) -> anyhow::Result<()> {
     // Kill-loudness (#71): must run before any other thread exists — the signal mask
@@ -242,6 +244,10 @@ pub(crate) fn cmd_run(
     let primary_heartbeat = SensorHeartbeat::new(sensor_name);
     let netlink_heartbeat = SensorHeartbeat::new("linux-netlink");
     let journal_heartbeat = SensorHeartbeat::new("linux-journal");
+    // Only registered/pulsed if actually enabled below — an uprobes sensor that
+    // never runs (the off-by-default case) must never accrue silence, or a
+    // deliberately-disabled capture would eventually alert as a stalled sensor.
+    let uprobes_heartbeat = SensorHeartbeat::new("linux-uprobes");
     let silence_monitor = Arc::new(Mutex::new(SilenceMonitor::new()));
     {
         let now_ns = schema::time::now_ns();
@@ -261,6 +267,13 @@ pub(crate) fn cmd_run(
             NO_CANARY_SILENCE_DEADLINE_NS,
             now_ns,
         );
+        if enable_tls_capture || enable_readline_capture {
+            mon.register(
+                uprobes_heartbeat.clone(),
+                NO_CANARY_SILENCE_DEADLINE_NS,
+                now_ns,
+            );
+        }
     }
     crate::silence::spawn_monitor(silence_monitor.clone(), sink.clone());
 
@@ -299,6 +312,14 @@ pub(crate) fn cmd_run(
 
     spawn_netlink_poller(sink.clone(), netlink_heartbeat);
     spawn_journal_tail(sink.clone(), journal_heartbeat);
+    if enable_tls_capture || enable_readline_capture {
+        spawn_uprobes_sensor(
+            sink.clone(),
+            uprobes_heartbeat,
+            enable_tls_capture,
+            enable_readline_capture,
+        );
+    }
 
     // Protected-resource monitoring (#71): only the eBPF sensor produces `FileOpen`
     // events, so only its chain needs the guard — the netlink/journal sinks above
@@ -396,7 +417,11 @@ fn forward_netlink_events(
 /// `schema::AuthEvent` (`sensor_linux_journal::to_auth_event`, issue #94's shared
 /// logon shape) and handing it to `sink` — same "poll/tail source with no
 /// `Sensor` impl, caller owns the handoff" shape as [`spawn_netlink_poller`], see
-/// `sensor_linux_journal`'s crate doc.
+/// `sensor_linux_journal`'s crate doc. Also runs a
+/// `sensor_linux_journal::UnitPersistenceTracker` (issue #93's other half) over
+/// the same stream, so a unit's first observed start lands as a
+/// `FLAG_PERSISTENCE_SYSTEMD_ARTIFACT` `FileOpenEvent` too — one tail thread,
+/// two independent mappings off the same classified record/event pair.
 ///
 /// Best-effort at startup: a non-systemd init (Alpine/OpenRC, see
 /// `watchdog::service::linux`'s own doc on this) has no `journalctl` at all —
@@ -420,6 +445,7 @@ fn spawn_journal_tail(sink: Arc<DetectionSink>, heartbeat: SensorHeartbeat) {
             };
             let journal =
                 sensor_linux_journal::ClassifiedJournal::new(std::io::BufReader::new(stdout));
+            let mut unit_persistence = sensor_linux_journal::UnitPersistenceTracker::new();
             for item in journal {
                 // Pulsed on every line the stream yields, matched or not (#71):
                 // proof journalctl is still delivering, same idle-host caveat as
@@ -430,6 +456,9 @@ fn spawn_journal_tail(sink: Arc<DetectionSink>, heartbeat: SensorHeartbeat) {
                     Ok((record, event)) => {
                         if let Some(auth) = sensor_linux_journal::to_auth_event(&record, &event) {
                             sink.on_event(schema::Event::Auth(auth));
+                        }
+                        if let Some(persistence_event) = unit_persistence.observe(&record, &event) {
+                            sink.on_event(persistence_event);
                         }
                     }
                     Err(e) => {
@@ -443,6 +472,43 @@ fn spawn_journal_tail(sink: Arc<DetectionSink>, heartbeat: SensorHeartbeat) {
             }
         })
         .expect("spawning the journal tail thread");
+}
+
+/// Spawns the background thread running the uprobes sensor (issue #90: TLS
+/// plaintext taps via `SSL_read`/`SSL_write` uprobes, shell readline capture) when at
+/// least one capture is enabled by CLI flag. Only called when the caller has
+/// already checked `enable_tls_capture || enable_readline_capture` — `cmd_run`
+/// doesn't spawn this thread at all otherwise, so a deliberately-disabled capture
+/// costs nothing at runtime, not even a parked thread.
+///
+/// Unlike [`spawn_netlink_poller`]/[`spawn_journal_tail`] above, `UprobesSensor`
+/// implements `Sensor` — the same trait the primary eBPF/audit sensor does — so
+/// its own blocking `run` owns this thread and `PulsingSink` (the primary sensor's
+/// own wrapper) pulses `heartbeat` on every event, rather than a manual per-item
+/// pulse. No `ProtectedResourceGuard` here: unlike the primary eBPF sensor, this
+/// one never produces `FileOpen` events.
+fn spawn_uprobes_sensor(
+    sink: Arc<DetectionSink>,
+    heartbeat: SensorHeartbeat,
+    enable_tls_capture: bool,
+    enable_readline_capture: bool,
+) {
+    std::thread::Builder::new()
+        .name("uprobes".into())
+        .spawn(move || {
+            let mut config = sensor_linux_uprobes::UprobesConfig::new();
+            if enable_tls_capture {
+                config = config.with_tls_enabled();
+            }
+            if enable_readline_capture {
+                config = config.with_readline_enabled();
+            }
+            let mut sensor = sensor_linux_uprobes::UprobesSensor::with_config(config);
+            if let Err(e) = sensor.run(Box::new(PulsingSink::new(sink, heartbeat))) {
+                tracing::warn!(error = %e, "uprobes sensor failed");
+            }
+        })
+        .expect("spawning the uprobes sensor thread");
 }
 
 /// Linux: rules-filtered benign capture via `BaselineSink` (Ctrl-C handled by the
