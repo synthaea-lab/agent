@@ -44,13 +44,11 @@ const TLS_PATTERNS: &[(&str, &str)] = &[
 /// Replaces matched patterns with `[REDACTED]` markers. Binary data is preserved if
 /// no patterns match (non-UTF8 buffers are skipped).
 ///
-/// # Examples
-///
-/// ```
-/// let data = b"Authorization: Bearer eyJhbGc...".to_vec();
-/// let redacted = redact_tls_data(data);
-/// assert!(redacted.starts_with(b"Authorization: [REDACTED]"));
-/// ```
+/// Example: `b"Authorization: Bearer eyJhbGc..."` becomes
+/// `b"Authorization: [REDACTED]"` — pinned by `doc_examples_hold` in this
+/// module's tests rather than a doctest: the module is crate-private, so a
+/// doctest (which compiles as an external crate) has no path to reach it
+/// (issue #276).
 pub fn redact_tls_data(mut data: Vec<u8>) -> Vec<u8> {
     // Try to parse as UTF-8 (most HTTP traffic is text-based)
     if let Ok(text) = std::str::from_utf8(&data) {
@@ -113,13 +111,9 @@ const READLINE_PATTERNS: &[(&str, &str)] = &[
 /// Replaces matched patterns with `[REDACTED]` markers. Shell commands are always
 /// UTF-8 (readline returns strings).
 ///
-/// # Examples
-///
-/// ```
-/// let input = "export DATABASE_PASSWORD=secret123".to_string();
-/// let redacted = redact_readline_input(input);
-/// assert_eq!(redacted, "export DATABASE_PASSWORD=[REDACTED]");
-/// ```
+/// Example: `export DATABASE_PASSWORD=secret123` becomes
+/// `export DATABASE_PASSWORD=[REDACTED]` — pinned by `doc_examples_hold`
+/// below, not a doctest (see `redact_tls_data`'s doc for why, issue #276).
 pub fn redact_readline_input(mut input: String) -> String {
     for (pattern, replacement) in READLINE_PATTERNS {
         input = redact_pattern(&input, pattern, replacement);
@@ -269,5 +263,19 @@ mod tests {
         let input2 = "Export Password=secret".to_string();
         assert!(redact_readline_input(input1).contains("[REDACTED]"));
         assert!(redact_readline_input(input2).contains("[REDACTED]"));
+    }
+
+    /// The former doc examples of `redact_tls_data`/`redact_readline_input`,
+    /// as the unit test issue #276 asked for — the doctest form could never
+    /// compile (crate-private module, no external path).
+    #[test]
+    fn doc_examples_hold() {
+        let data = b"Authorization: Bearer eyJhbGc...".to_vec();
+        let redacted = redact_tls_data(data);
+        assert!(redacted.starts_with(b"Authorization: [REDACTED]"));
+
+        let input = "export DATABASE_PASSWORD=secret123".to_string();
+        let redacted = redact_readline_input(input);
+        assert_eq!(redacted, "export DATABASE_PASSWORD=[REDACTED]");
     }
 }
