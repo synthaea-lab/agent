@@ -15,7 +15,7 @@ use aya_log_ebpf::{info, warn};
 use sensor_linux_wire::{
     ConnectEvent, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent,
     FileRenameEvent, FileWriteEvent, LineageEntry, MAX_TLS_CAPTURE, ReadlineInputEvent,
-    SocketBindEvent, TASK_COMM_LEN, TlsCaptureEvent, UdpSendEvent,
+    SocketBindEvent, SocketListenEvent, TASK_COMM_LEN, TlsCaptureEvent, UdpSendEvent,
 };
 
 // This probe reads NO `task_struct`/`mm_struct` frozen offset: parent lineage (ppid +
@@ -1217,10 +1217,47 @@ static BIND_SCRATCH: PerCpuArray<SocketBindEvent> = PerCpuArray::with_max_entrie
 /// Verified on 2026-09-21 on Alpine (kernel 6.18.50-0-virt, x86_64) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_bind/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const BIND_FD_OFFSET: usize = 16;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const BIND_UMYADDR_PTR_OFFSET: usize = 24;
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
 #[cfg(bpf_target_arch = "x86")]
+const BIND_FD_OFFSET: usize = 12;
+#[cfg(bpf_target_arch = "x86")]
 const BIND_UMYADDR_PTR_OFFSET: usize = 16;
+
+/// Key into [`BIND_ADDR_MAP`]: a process's fd table entry is per-process, so the
+/// same fd number on two different pids is a different socket.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BindAddrKey {
+    pid: u32,
+    fd: u32,
+}
+
+/// Value in [`BIND_ADDR_MAP`]: the address a prior `bind(2)` on this `(pid, fd)`
+/// claimed, same shape as `SocketBindEvent`'s address fields.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BindAddrValue {
+    addr_v4: [u8; 4],
+    addr_v6: [u8; 16],
+    port: u16,
+    is_ipv6: bool,
+}
+
+/// Correlates a later `listen(2)` back to the address an earlier `bind(2)` on the
+/// same `(pid, fd)` claimed — `listen(2)`'s own arguments are just `fd`+`backlog`,
+/// no address. Internal to this crate: never read by userspace, so it is not part
+/// of `sensor-linux-wire`'s ABI and does not bump `WIRE_VERSION` on its own.
+///
+/// Entries are never explicitly removed (no `close(2)` probe tracks fd lifetime
+/// yet): a `bind()` on a reused fd simply overwrites the old entry, and the
+/// map is bounded (`insert` fails silently once full, same graceful-degradation
+/// posture as every other best-effort correlation in this file) rather than
+/// growing without limit.
+#[map]
+static BIND_ADDR_MAP: HashMap<BindAddrKey, BindAddrValue> = HashMap::with_max_entries(4096, 0);
 
 #[tracepoint]
 pub fn sys_enter_bind(ctx: TracePointContext) -> u32 {
@@ -1233,8 +1270,14 @@ pub fn sys_enter_bind(ctx: TracePointContext) -> u32 {
 /// Mirrors `try_sys_enter_connect` above field for field — same family filter, same
 /// raw-byte address read (avoids the endianness bug documented on `ConnectEvent`),
 /// same per-CPU-scratch assembly. Only the wire type, ring buffer, and field names
-/// (`laddr`/`lport` vs `daddr`/`dport`) differ.
+/// (`laddr`/`lport` vs `daddr`/`dport`) differ. Also records the address into
+/// [`BIND_ADDR_MAP`] for `sys_enter_listen` to correlate against later.
 fn try_sys_enter_bind(ctx: TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let fd: u64 = unsafe { ctx.read_at(BIND_FD_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let fd: u64 = unsafe { ctx.read_at::<u32>(BIND_FD_OFFSET).map_err(|_| 1u32)? as u64 };
+
     #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     let umyaddr_ptr: u64 = unsafe { ctx.read_at(BIND_UMYADDR_PTR_OFFSET).map_err(|_| 1u32)? };
     #[cfg(bpf_target_arch = "x86")]
@@ -1297,6 +1340,114 @@ fn try_sys_enter_bind(ctx: TracePointContext) -> Result<u32, u32> {
             warn!(
                 &ctx,
                 "sensor-linux-ebpf: ring buffer full, dropping bind event"
+            );
+        }
+    }
+
+    let key = BindAddrKey {
+        pid: (bpf_get_current_pid_tgid() >> 32) as u32,
+        fd: fd as u32,
+    };
+    let value = BindAddrValue {
+        addr_v4: v4,
+        addr_v6: v6,
+        port: u16::from_be(port_be),
+        is_ipv6: family == AF_INET6,
+    };
+    let _ = BIND_ADDR_MAP.insert(&key, &value, 0);
+
+    Ok(0)
+}
+
+// --- Socket listen (issue #263 Phase 2) -----------------------------------------
+
+/// Ring buffer shared with userspace for `listen` events.
+#[map]
+static SOCKET_LISTEN_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Per-CPU scratch for building one `SocketListenEvent` (see `EXEC_SCRATCH`).
+#[map]
+static LISTEN_SCRATCH: PerCpuArray<SocketListenEvent> = PerCpuArray::with_max_entries(1, 0);
+
+/// Offsets of the `syscalls:sys_enter_listen` tracepoint (x86_64/aarch64): `fd`(16),
+/// `backlog`(24). Verified on 2026-09-22 on Alpine (kernel 6.18.50-0-virt, x86_64)
+/// via `/sys/kernel/tracing/events/syscalls/sys_enter_listen/format`.
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const LISTEN_FD_OFFSET: usize = 16;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const LISTEN_BACKLOG_OFFSET: usize = 24;
+/// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
+#[cfg(bpf_target_arch = "x86")]
+const LISTEN_FD_OFFSET: usize = 12;
+#[cfg(bpf_target_arch = "x86")]
+const LISTEN_BACKLOG_OFFSET: usize = 16;
+
+#[tracepoint]
+pub fn sys_enter_listen(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_listen(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+/// `listen(2)` carries no address of its own — correlates against [`BIND_ADDR_MAP`]
+/// on `(pid, fd)` to recover the address a prior `bind(2)` claimed. No match still
+/// emits the event (a process just started listening is worth reporting on its
+/// own), with `addr_resolved: false` and the address fields left zeroed.
+fn try_sys_enter_listen(ctx: TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let fd: u64 = unsafe { ctx.read_at(LISTEN_FD_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let fd: u64 = unsafe { ctx.read_at::<u32>(LISTEN_FD_OFFSET).map_err(|_| 1u32)? as u64 };
+
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let backlog: u64 = unsafe { ctx.read_at(LISTEN_BACKLOG_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let backlog: u64 =
+        unsafe { ctx.read_at::<u32>(LISTEN_BACKLOG_OFFSET).map_err(|_| 1u32)? as u64 };
+
+    let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
+    let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+
+    let key = BindAddrKey {
+        pid,
+        fd: fd as u32,
+    };
+    let bound = unsafe { BIND_ADDR_MAP.get(&key) }.copied();
+
+    let e = LISTEN_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
+    unsafe {
+        core::ptr::write_bytes(e, 0, 1);
+
+        (*e).meta.pid = pid;
+        (*e).meta.ppid = lineage_ppid();
+        (*e).meta.uid = uid_gid as u32;
+        (*e).meta.gid = (uid_gid >> 32) as u32;
+        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
+        let mut i = 0usize;
+        while i < TASK_COMM_LEN {
+            (*e).meta.comm[i] = comm[i];
+            i += 1;
+        }
+        (*e).backlog = backlog as u32;
+
+        if let Some(addr) = bound {
+            (*e).laddr_v4 = addr.addr_v4;
+            (*e).laddr_v6 = addr.addr_v6;
+            (*e).lport = addr.port;
+            (*e).is_ipv6 = addr.is_ipv6;
+            (*e).addr_resolved = true;
+        }
+
+        if SOCKET_LISTEN_EVENTS
+            .output::<SocketListenEvent>(&*e, 0)
+            .is_err()
+        {
+            warn!(
+                &ctx,
+                "sensor-linux-ebpf: ring buffer full, dropping listen event"
             );
         }
     }

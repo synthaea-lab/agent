@@ -32,7 +32,8 @@ use crate::{
     ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent, FileRenameEvent,
     FileWriteEvent, ImageLoadEvent, ListenPortEvent, NetworkFlowEvent, ReadlineInputEvent,
     RegistrySetEvent, ScriptBlockEvent, ShellType, SmbConnectEvent, SocketBindEvent,
-    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
+    SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User,
+    WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -291,5 +292,17 @@ pub fn file_chown() -> FileChownEvent {
         path: String::new(),
         uid: 0,
         gid: 0,
+    }
+}
+
+/// Neutral [`SocketListenEvent`], address unresolved (the common neutral case —
+/// bind-correlation is the exception this type has to account for, not the norm).
+#[must_use]
+pub fn socket_listen() -> SocketListenEvent {
+    SocketListenEvent {
+        meta: meta(),
+        local_addr: None,
+        local_port: None,
+        backlog: 0,
     }
 }

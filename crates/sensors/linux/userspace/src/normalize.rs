@@ -7,8 +7,8 @@
 
 use schema::{
     ConnectEvent, ContainerContext, Event, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent,
-    FileDeleteEvent, FileOpenEvent, FileRenameEvent, FileWriteEvent, SocketBindEvent, UdpSendEvent,
-    User,
+    FileDeleteEvent, FileOpenEvent, FileRenameEvent, FileWriteEvent, SocketBindEvent,
+    SocketListenEvent, UdpSendEvent, User,
 };
 use sensor_linux_wire as wire;
 
@@ -34,7 +34,12 @@ use sensor_linux_wire as wire;
 /// same address-family logic as `connect`/`socket_bind`, reusing the schema type
 /// already shared with the Windows ETW UDP producer; no existing mapping changed
 /// shape.
-const _: () = assert!(wire::WIRE_VERSION == 9);
+///
+/// v10 (#263 Phase 2) added `SocketListenEvent` — new `socket_listen` mapping
+/// function below, converting the wire struct's `addr_resolved` bool + zeroed
+/// fields into `Option<IpAddr>`/`Option<u16>` on the schema side; no existing
+/// mapping changed shape.
+const _: () = assert!(wire::WIRE_VERSION == 10);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
@@ -249,6 +254,30 @@ pub fn udp_send(
         daddr,
         dport: event.dport,
         size: event.size,
+    })
+}
+
+#[must_use]
+pub fn socket_listen(
+    event: &wire::SocketListenEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    let (local_addr, local_port) = if event.addr_resolved {
+        let addr = if event.is_ipv6 {
+            std::net::IpAddr::V6(event.laddr_v6.into())
+        } else {
+            std::net::IpAddr::V4(event.laddr_v4.into())
+        };
+        (Some(addr), Some(event.lport))
+    } else {
+        (None, None)
+    };
+    Event::SocketListen(SocketListenEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        local_addr,
+        local_port,
+        backlog: event.backlog,
     })
 }
 
@@ -607,5 +636,45 @@ mod tests {
         };
         assert_eq!(e.daddr.to_string(), "::1");
         assert_eq!(e.size, 512);
+    }
+
+    #[test]
+    fn socket_listen_resolved_carries_correlated_address() {
+        let event = wire::SocketListenEvent {
+            meta: wire_meta(b"nc"),
+            laddr_v4: [0, 0, 0, 0],
+            laddr_v6: [0; 16],
+            lport: 4444,
+            is_ipv6: false,
+            addr_resolved: true,
+            backlog: 1,
+        };
+        let Event::SocketListen(e) = socket_listen(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.local_addr.unwrap().to_string(), "0.0.0.0");
+        assert_eq!(e.local_port, Some(4444));
+        assert_eq!(e.backlog, 1);
+    }
+
+    #[test]
+    fn socket_listen_unresolved_carries_no_address() {
+        // Probe attached after bind(), or the kernel implicit-bound at listen()
+        // time — this sensor never saw a matching bind() for this (pid, fd).
+        let event = wire::SocketListenEvent {
+            meta: wire_meta(b"nc"),
+            laddr_v4: [9, 9, 9, 9], // garbage: must be ignored when unresolved
+            laddr_v6: [0; 16],
+            lport: 9999,
+            is_ipv6: false,
+            addr_resolved: false,
+            backlog: 128,
+        };
+        let Event::SocketListen(e) = socket_listen(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.local_addr, None);
+        assert_eq!(e.local_port, None);
+        assert_eq!(e.backlog, 128);
     }
 }

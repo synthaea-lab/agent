@@ -50,6 +50,7 @@ pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
     ("sys_enter_lchown", "syscalls", "sys_enter_lchown"),
     ("sys_enter_fchownat", "syscalls", "sys_enter_fchownat"),
     ("sys_enter_sendto", "syscalls", "sys_enter_sendto"),
+    ("sys_enter_listen", "syscalls", "sys_enter_listen"),
 ];
 
 /// `sensor_linux_wire::LineageEntry` is `repr(C)` over a `u32` and a `[u8; 16]` — every

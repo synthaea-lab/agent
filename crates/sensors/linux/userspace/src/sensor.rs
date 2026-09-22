@@ -140,9 +140,10 @@ impl LinuxSensor {
         let mut file_chmod_ring_buf = ring("FILE_CHMOD_EVENTS")?;
         let mut file_chown_ring_buf = ring("FILE_CHOWN_EVENTS")?;
         let mut udp_send_ring_buf = ring("UDP_SEND_EVENTS")?;
+        let mut socket_listen_ring_buf = ring("SOCKET_LISTEN_EVENTS")?;
 
         tracing::info!(
-            "sensor-linux: listening for exec/open/connect/write/delete/rename/bind/chmod/chown/udp_send events"
+            "sensor-linux: listening for exec/open/connect/write/delete/rename/bind/chmod/chown/udp_send/listen events"
         );
 
         let mut container_ids = CgroupIdCache::new();
@@ -214,6 +215,12 @@ impl LinuxSensor {
                     drain!(guard, sensor_linux_wire::UdpSendEvent, sink,
                         |e: &sensor_linux_wire::UdpSendEvent| {
                             normalize::udp_send(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = socket_listen_ring_buf.readable_mut() => {
+                    drain!(guard, sensor_linux_wire::SocketListenEvent, sink,
+                        |e: &sensor_linux_wire::SocketListenEvent| {
+                            normalize::socket_listen(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
             }

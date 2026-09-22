@@ -62,7 +62,15 @@ extern crate std;
 ///   this crate doesn't have yet. `send(2)` (no destination arg) is also not
 ///   captured — glibc issues it as `sendto(fd, buf, len, flags, NULL, 0)`, which
 ///   this probe's null-address check already skips, same as `connect`/`bind`.
-pub const WIRE_VERSION: u32 = 9;
+/// - v10: `SocketListenEvent` added (issue #263 Phase 2) — `listen(2)`. `listen(2)`'s
+///   own args are just `fd`+`backlog`, no address, so the probe correlates against
+///   an in-kernel `(pid, fd) -> address` map populated by `sys_enter_bind` (internal
+///   to the ebpf crate, not part of this wire ABI). No matching `bind()` observed —
+///   probe attached after it happened, or the kernel's implicit ephemeral-port bind
+///   at `listen()` time — leaves `addr_resolved: false` and the address fields
+///   zeroed, rather than silently dropping the event. `accept(2)`/`accept4(2)`
+///   remain deferred (still need the `sys_exit` probe shape).
+pub const WIRE_VERSION: u32 = 10;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
@@ -243,7 +251,7 @@ pub struct SocketBindEvent {
 /// the caller's requested payload size (`len`, read at syscall entry — not the
 /// syscall's return value, so a short send still reports the requested size, same
 /// convention as `FileWriteEvent::bytes_requested`). `recvfrom(2)` is deliberately
-/// not captured — see this file's `WIRE_VERSION` v8 changelog.
+/// not captured — see this file's `WIRE_VERSION` v9 changelog.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct UdpSendEvent {
@@ -253,6 +261,30 @@ pub struct UdpSendEvent {
     pub dport: u16,
     pub is_ipv6: bool,
     pub size: u32,
+}
+
+/// Socket listen (`syscalls:sys_enter_listen`, issue #263 Phase 2) — a discrete,
+/// real-time trace of a process transitioning a bound socket into the listening
+/// state (backdoor/reverse-shell listener detection, same rationale as
+/// `SocketBindEvent`). See this file's `WIRE_VERSION` v10 changelog for the
+/// bind-correlation and `addr_resolved` semantics.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SocketListenEvent {
+    pub meta: EventMeta,
+    pub laddr_v4: [u8; 4],
+    pub laddr_v6: [u8; 16],
+    pub lport: u16,
+    pub is_ipv6: bool,
+    /// Whether `laddr_v4`/`laddr_v6`/`lport`/`is_ipv6` came from a real correlated
+    /// `bind(2)` observation. `false` means this sensor never saw a matching
+    /// `bind()` for this `(pid, fd)` — the address fields above are zeroed, not
+    /// meaningful.
+    pub addr_resolved: bool,
+    /// The caller's requested backlog (`listen(2)`'s second argument) — a small
+    /// value (e.g. 1) on an otherwise-unremarkable listener can itself be a signal
+    /// (a quick one-shot reverse-shell listener rarely needs a real accept queue).
+    pub backlog: u32,
 }
 
 /// TLS plaintext capture (uprobes on `SSL_read`/`SSL_write`, issue #90).

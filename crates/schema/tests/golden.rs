@@ -13,8 +13,8 @@ use schema::{
     EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent,
     FileRenameEvent, FileWriteEvent, ImageLoadEvent, ListenPortEvent, NetworkFlowEvent,
     ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType, SmbConnectEvent,
-    SocketBindEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User,
-    WmiActivityEvent,
+    SocketBindEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
+    UdpSendEvent, User, WmiActivityEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -755,6 +755,50 @@ fn file_chown_golden() {
 }
 
 #[test]
+fn socket_listen_golden() {
+    // v18 (#263 Phase 2): listen(2) with a correlated bind() address — the common
+    // case (backdoor bind-then-listen), addr_resolved: true on the wire side.
+    assert_golden(
+        &Event::SocketListen(SocketListenEvent {
+            meta: EventMeta {
+                pid: 8002,
+                ppid: 8000,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_016_000_000_000,
+                comm: "nc".into(),
+                container: None,
+            },
+            local_addr: Some("0.0.0.0".parse().unwrap()),
+            local_port: Some(4444),
+            backlog: 1,
+        }),
+        "socket_listen",
+    );
+}
+
+#[test]
+fn socket_listen_unresolved_golden() {
+    // v18 (#263 Phase 2): listen() with no correlated bind() — probe attached
+    // after bind(), or the kernel implicit-bound at listen() time.
+    assert_golden(
+        &Event::SocketListen(SocketListenEvent {
+            meta: EventMeta {
+                pid: 8003,
+                ppid: 8000,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_017_000_000_000,
+                comm: "nc".into(),
+                container: None,
+            },
+            local_addr: None,
+            local_port: None,
+            backlog: 128,
+        }),
+        "socket_listen_unresolved",
+    );
+}
+
+#[test]
 fn unbounded_cmdline_survives() {
     // Audit F-4: multi-kilobyte encoded command lines must round-trip untouched.
     let long = format!("powershell.exe -EncodedCommand {}", "A".repeat(8 * 1024));
@@ -975,6 +1019,12 @@ fn meta_accessor_covers_all_variants() {
             path: String::new(),
             uid: 0,
             gid: 0,
+        }),
+        Event::SocketListen(SocketListenEvent {
+            meta: meta.clone(),
+            local_addr: None,
+            local_port: None,
+            backlog: 0,
         }),
     ];
     for e in &events {
