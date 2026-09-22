@@ -46,6 +46,17 @@ else
   $DNF install gcc gcc-c++ make curl git pkgconf-pkg-config rsync zstd nmap-ncat bind-utils \
     clang llvm llvm-devel clang-devel clang-libs \
     elfutils-libelf-devel openssl-devel libzstd-devel zlib-devel bpftool
+  # Rocky's live repos serve whatever the current point release is, not what the
+  # box's baked-in minor version shipped with — the install above can pull a newer
+  # openssl-libs as a transitive dep while openssh-server stays at its original
+  # build. sshd then fails its runtime OpenSSL ABI check on every connection
+  # attempt, including the very first one, with no prior successful connection
+  # required to trigger it (issue #296, found chasing rocky9 SELinux/AVC access).
+  # Bringing openssh in step with whatever openssl-libs landed, then restarting
+  # sshd defensively, closes the gap regardless of which packages above triggered
+  # the drift.
+  $DNF update openssh openssh-server openssh-clients
+  sudo systemctl restart sshd
 fi
 
 echo "== BTF check =="
