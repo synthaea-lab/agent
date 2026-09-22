@@ -19,14 +19,15 @@ pub use state::RuleState;
 #[cfg(test)]
 pub(crate) use stateless::{
     check_account_creation_persistence, check_base64_decode, check_btm_launch_item_persistence,
-    check_encoded_powershell, check_persistence_write, check_proc_root_escape,
+    check_encoded_powershell, check_log_clear_exec, check_log_file_delete, check_masquerading,
+    check_persistence_write, check_proc_root_escape, check_recovery_inhibit,
     check_scheduled_task_persistence, check_service_install_persistence,
     check_systemd_service_persistence,
 };
 // The contract is the two dispatchers — callers (agent) route every event
 // through them. The individual checks are implementation detail, re-exported
 // crate-internally for the tests under `src/tests/`.
-pub use stateless::{evaluate_exec, evaluate_file_open};
+pub use stateless::{evaluate_exec, evaluate_file_delete, evaluate_file_open};
 
 #[derive(Debug, Clone)]
 pub struct Alert {

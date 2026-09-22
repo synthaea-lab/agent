@@ -21,6 +21,13 @@ pub(crate) const SELF_SPAWN_THRESHOLD: u32 = 3;
 pub(crate) const SELF_SPAWN_WINDOW_NS: u64 = 30_000_000_000; // 30s
 
 /// BEACON threshold and window (T1071/T1041): N connections to the same dest in X seconds.
+/// T1110 — failed authentications per (target user, source) inside
+/// [`AUTH_FAILURE_WINDOW_NS`] before the burst alerts. 5-in-60s clears any
+/// human fumbling a password (2-3 tries then a reset) while catching even a
+/// slow scripted spray.
+pub(crate) const AUTH_FAILURE_THRESHOLD: u32 = 5;
+/// Sliding window for [`AUTH_FAILURE_THRESHOLD`].
+pub(crate) const AUTH_FAILURE_WINDOW_NS: u64 = 60_000_000_000; // 60s
 pub(crate) const BEACON_THRESHOLD: u32 = 3;
 pub(crate) const BEACON_WINDOW_NS: u64 = 60_000_000_000; // 60s
 

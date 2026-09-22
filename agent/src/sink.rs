@@ -238,6 +238,20 @@ impl DetectionSink {
         }
     }
 
+    /// `Auth` events: brute-force/spray burst detection (T1110, pack #377).
+    fn detect_auth(&self, event: &schema::AuthEvent) {
+        for alert in self.rule_state.lock().unwrap().on_auth(event) {
+            self.emit(alert.technique, &alert.message);
+        }
+    }
+
+    /// `FileDelete` events: log-tamper detection (T1070.002, pack #379).
+    fn detect_file_delete(&self, event: &schema::FileDeleteEvent) {
+        for alert in rules::evaluate_file_delete(event) {
+            self.emit(alert.technique, &alert.message);
+        }
+    }
+
     /// Writes one alert to the shared log and highlighted stderr. `pub(crate)`
     /// rather than private: `silence::spawn_monitor` (#71) emits a sensor-silence
     /// verdict through the exact same path as a rule/correlator/Sigma finding —
@@ -384,6 +398,8 @@ impl EventSink for DetectionSink {
             Event::Connect(e) => self.detect_connect(e),
             Event::NetworkFlow(e) => self.detect_network_flow(e),
             Event::ListenPort(e) => self.detect_listen_port(e),
+            Event::Auth(e) => self.detect_auth(e),
+            Event::FileDelete(e) => self.detect_file_delete(e),
             // New telemetry categories reach the engines as they land; until a rule
             // consumes them, logging below is the whole treatment.
             _ => {}

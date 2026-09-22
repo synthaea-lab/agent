@@ -4,16 +4,20 @@
 
 use std::{collections::HashMap, net::IpAddr};
 
-use schema::{ConnectEvent, ExecEvent, FileOpenEvent, ListenPortEvent, NetworkFlowEvent, User};
+use schema::{
+    AuthEvent, AuthOutcome, ConnectEvent, ExecEvent, FileOpenEvent, ListenPortEvent,
+    NetworkFlowEvent, User,
+};
 use store::BoundedMap;
 
 use crate::{
     Alert,
     exclusions::{
-        BEACON_THRESHOLD, BEACON_WINDOW_NS, BROWSERS, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS,
-        LOLBIN_LEGIT_PARENTS, LOLBINS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
-        SELF_SPAWN_THRESHOLD, SELF_SPAWN_WINDOW_NS, SHELL_COMMS, STANDARD_PORTS,
-        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, WEB_SERVER_COMMS,
+        AUTH_FAILURE_THRESHOLD, AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD, BEACON_WINDOW_NS,
+        BROWSERS, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS,
+        SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_THRESHOLD,
+        SELF_SPAWN_WINDOW_NS, SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN,
+        SUSPECT_PARENTS_WIN, WEB_SERVER_COMMS,
     },
     has_write_intent,
     sliding::{FlowPortDedup, SlidingCounter},
@@ -60,6 +64,10 @@ pub struct RuleState {
     /// listener space is a few dozen, not unbounded, but a hostile loop binding
     /// many ports must not grow this without limit either.
     known_listeners: BoundedMap<(IpAddr, u16), ()>,
+    /// (target user, source) → sliding failure counter for T1110 (AUTH-BURST).
+    /// LRU-bounded like every other counter: a spray across many fabricated
+    /// usernames must not grow this without limit.
+    auth_failures: BoundedMap<(String, String), SlidingCounter>,
 }
 
 /// Same bound as the correlator's entity table: the realistic live-pid space.
@@ -84,6 +92,7 @@ impl RuleState {
             beacon: BoundedMap::new(COUNTER_CAP),
             beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
+            auth_failures: BoundedMap::new(COUNTER_CAP),
         }
     }
 
@@ -508,6 +517,42 @@ impl RuleState {
     /// polling, issue #92) — see [`Self::check_listen_port_drift`].
     pub fn on_listen_port(&mut self, event: &ListenPortEvent) -> Vec<Alert> {
         self.check_listen_port_drift(event).into_iter().collect()
+    }
+
+    /// To be called for every `AuthEvent` in the stream (issue #377, T1110):
+    /// counts failures per (target user, source) on a sliding window and
+    /// alerts once per window when the burst threshold is crossed. Successes
+    /// deliberately don't reset the counter — a success right after a burst
+    /// is the *stronger* signal, not an all-clear (success-after-burst gets
+    /// its own alert shape in a follow-up; today the burst itself already
+    /// fired).
+    pub fn on_auth(&mut self, event: &AuthEvent) -> Vec<Alert> {
+        if event.outcome != AuthOutcome::Failure {
+            return Vec::new();
+        }
+        // "local" for console/service logons that legitimately carry no
+        // source address (see `AuthEvent::source_address`'s doc) — a distinct
+        // key, never a fabricated loopback.
+        let source = event
+            .source_address
+            .map_or_else(|| "local".to_string(), |a| a.to_string());
+        let key = (event.target_user.clone(), source.clone());
+        let ts = event.meta.timestamp_ns;
+        let entry = self
+            .auth_failures
+            .get_or_insert_with(key, SlidingCounter::default);
+        let count = entry.record(ts, AUTH_FAILURE_WINDOW_NS);
+        if count >= AUTH_FAILURE_THRESHOLD && entry.try_alert(ts, AUTH_FAILURE_WINDOW_NS) {
+            return vec![Alert {
+                technique: "T1110",
+                message: format!(
+                    "target={} source={source}: {count} failed authentications in {}s —                      brute-force/spray burst",
+                    event.target_user,
+                    AUTH_FAILURE_WINDOW_NS / 1_000_000_000,
+                ),
+            }];
+        }
+        Vec::new()
     }
 
     /// To be called for every `FileOpenEvent` in the stream. Does not produce alerts
