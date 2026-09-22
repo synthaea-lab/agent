@@ -39,6 +39,7 @@ dependencies = [
  "sensor-linux-netlink",
  "sensor-linux-uprobes",
  "sensor-macos",
+ "sensor-macos-unifiedlog",
  "sensor-windows",
  "sensor-windows-eventlog",
  "serde",
@@ -2356,6 +2357,13 @@ version = "0.1.0"
 [[package]]
 name = "sensor-macos-unifiedlog"
 version = "0.1.0"
+dependencies = [
+ "schema",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+]
 
 [[package]]
 name = "sensor-windows"
@@ -2951,6 +2959,14 @@ checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
 [[package]]
 name = "updater"
 version = "0.1.0"
+dependencies = [
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "ureq"

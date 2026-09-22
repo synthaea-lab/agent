@@ -47,23 +47,78 @@ fn seeded_rule_state() -> rules::RuleState {
     rule_state
 }
 
-/// Runs the ES sensor (blocking, on the calling thread) with Ctrl-C wired to
-/// its stop handle.
-fn run_macos_sensor(sink: Box<dyn EventSink>) -> anyhow::Result<()> {
+/// Spawns the background thread that tails the unified log (sudo → `Auth`,
+/// TCC decisions, Gatekeeper verdicts — `sensor-macos-unifiedlog`, issue #95)
+/// into the shared sink. Supplementary source, same posture as the Windows
+/// Event Log sensor: its failure is logged, never fatal — `EndpointSecurity`
+/// is the sensor that must work. Returns the `log stream` child so shutdown
+/// can kill it (which ends the tail thread's stream and thus the thread).
+fn spawn_unifiedlog_tail(sink: Arc<dyn EventSink>) -> Option<std::process::Child> {
+    let mut child = match sensor_macos_unifiedlog::spawn_stream() {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::warn!(error = %e, "unified-log tail: `log stream` unavailable, skipping");
+            return None;
+        }
+    };
+    let Some(stdout) = child.stdout.take() else {
+        tracing::warn!("unified-log tail: `log stream` spawned without a piped stdout");
+        return None;
+    };
+    std::thread::Builder::new()
+        .name("unifiedlog-tail".into())
+        .spawn(move || {
+            let stream =
+                sensor_macos_unifiedlog::NormalizedLogStream::new(std::io::BufReader::new(stdout));
+            for item in stream {
+                match item {
+                    Ok((_, event)) => sink.on_event(event),
+                    Err(e) => {
+                        // A hard I/O error ends the stream — nothing left to
+                        // iterate (killing the child on shutdown lands here too).
+                        tracing::warn!(error = %e, "unified-log tail: stream ended");
+                        break;
+                    }
+                }
+            }
+        })
+        .expect("spawning the unified-log tail thread");
+    Some(child)
+}
+
+/// Runs the ES sensor (blocking, on the calling thread) and the unified-log
+/// tail (background thread) against the same sink, with Ctrl-C wired to stop
+/// both.
+fn run_macos_sensors(sink: Box<dyn EventSink>) -> anyhow::Result<()> {
+    let sink: Arc<dyn EventSink> = Arc::from(sink);
+
     let mut sensor = sensor_macos::MacosSensor::new();
     let stop = sensor.stop_handle();
+
+    let log_child = spawn_unifiedlog_tail(Arc::clone(&sink));
+    let log_child = std::sync::Mutex::new(log_child);
+
     ctrlc::set_handler(move || {
         eprintln!("\n[!] Shutdown requested...");
         stop.stop();
+        if let Ok(mut guard) = log_child.lock()
+            && let Some(child) = guard.as_mut()
+        {
+            // Ends the tail thread's stream; reaped below via wait().
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     })?;
+
     sensor
-        .run(sink)
+        .run(Box::new(SharedSink(sink)))
         .map_err(|e| anyhow::anyhow!("EndpointSecurity sensor failed: {e}"))
 }
 
 pub(crate) fn cmd_status() -> anyhow::Result<()> {
     println!("Synthaea agent — platform: macOS");
     println!("Sensors: EndpointSecurity (exec + file + BTM launch-item persistence)");
+    println!("         unified-log tail (sudo auth, TCC decisions, Gatekeeper verdicts)");
     println!(
         "Requires: root, the com.apple.developer.endpoint-security.client entitlement, \
          and Full Disk Access (see docs/sensors/macos.md)."
@@ -85,19 +140,19 @@ pub(crate) fn cmd_run(
     server: Option<&str>,
 ) -> anyhow::Result<()> {
     let pipeline = super::common::wire_run_pipeline(seeded_rule_state(), alerts, events, server)?;
-    run_macos_sensor(Box::new(SharedSink(pipeline.sink)))
+    run_macos_sensors(Box::new(SharedSink(pipeline.sink)))
 }
 
 pub(crate) fn cmd_capture_events(output: &std::path::Path) -> anyhow::Result<()> {
     let sink = sinks::JsonlEventSink::open(output)?;
     eprintln!("Synthaea — raw event capture (Ctrl-C to stop)");
     eprintln!("Output: {}", output.display());
-    run_macos_sensor(Box::new(sink))
+    run_macos_sensors(Box::new(sink))
 }
 
 pub(crate) fn cmd_capture_baseline(output: &std::path::Path) -> anyhow::Result<()> {
     let sink = crate::sink::BaselineSink::new(seeded_rule_state(), output)?;
     eprintln!("Synthaea — baseline capture (Ctrl-C to stop)");
     eprintln!("Output: {}", output.display());
-    run_macos_sensor(Box::new(sink))
+    run_macos_sensors(Box::new(sink))
 }

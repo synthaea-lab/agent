@@ -58,15 +58,12 @@ pub fn rollback(
 
 #[cfg(all(test, target_os = "linux"))]
 mod integration_tests {
-    use std::collections::BTreeMap;
-    use std::fs;
-    use std::path::PathBuf;
+    use std::{collections::BTreeMap, fs, path::PathBuf};
 
-    use crate::hash::hash_file;
-    use crate::key::test_key_pair;
-    use crate::layout::Layout;
-    use crate::manifest::ReleaseManifest;
-    use crate::{rollback, UpdaterError};
+    use crate::{
+        UpdaterError, hash::hash_file, key::test_key_pair, layout::Layout,
+        manifest::ReleaseManifest, rollback,
+    };
 
     /// End-to-end happy path: sign a manifest, stage a release, verify it,
     /// promote it, then roll it back and confirm the failed version is banned

@@ -4,10 +4,7 @@
 //! what this specific install will accept, the same trust boundary as the
 //! install itself.
 
-use std::collections::BTreeSet;
-use std::fs;
-use std::io;
-use std::path::Path;
+use std::{collections::BTreeSet, fs, io, path::Path};
 
 use crate::error::UpdaterError;
 

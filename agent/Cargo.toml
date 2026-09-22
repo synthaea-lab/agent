@@ -39,6 +39,7 @@ ctrlc = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 sensor-macos = { path = "../crates/sensors/macos/endpoint-security" }
+sensor-macos-unifiedlog = { path = "../crates/sensors/macos/unifiedlog" }
 ctrlc = "3"
 
 [target.'cfg(target_os = "linux")'.dependencies]

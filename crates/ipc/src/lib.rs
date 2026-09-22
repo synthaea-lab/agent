@@ -44,9 +44,9 @@ pub mod stream;
 pub use client::Client;
 pub use error::{ClientError, ServerError};
 pub use protocol::{
-    ClientHello, DetectionSummary, PolicyVersionResponse, RecentDetectionsResponse, Request,
-    Response, SensorHealth, SensorHealthResponse, SensorState, ServerHello, StatusResponse,
-    WireError, PROTOCOL_VERSION,
+    ClientHello, DetectionSummary, PROTOCOL_VERSION, PolicyVersionResponse,
+    RecentDetectionsResponse, Request, Response, SensorHealth, SensorHealthResponse, SensorState,
+    ServerHello, StatusResponse, WireError,
 };
-pub use server::{Handler, Server, StubHandler, RECENT_DETECTIONS_HARD_LIMIT};
+pub use server::{Handler, RECENT_DETECTIONS_HARD_LIMIT, Server, StubHandler};
 pub use stream::PeerCreds;

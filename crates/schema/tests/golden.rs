@@ -11,10 +11,10 @@ use std::net::IpAddr;
 use schema::{
     AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, ConnectEvent, DnsQueryEvent, Event,
     EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent,
-    FileRenameEvent, FileWriteEvent, ImageLoadEvent, ListenPortEvent, NetworkFlowEvent,
-    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType, SmbConnectEvent,
-    SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection,
-    TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
+    FileRenameEvent, FileWriteEvent, GatekeeperVerdictEvent, ImageLoadEvent, ListenPortEvent,
+    NetworkFlowEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType,
+    SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TccDecisionEvent,
+    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -799,6 +799,53 @@ fn socket_listen_unresolved_golden() {
 }
 
 #[test]
+fn tcc_decision_golden() {
+    // v20 (#95): a TCC grant as joined from tccd's AUTHREQ_CTX + AUTHREQ_RESULT
+    // unified-log pair — screen capture granted to an unsigned payload.
+    assert_golden(
+        &Event::TccDecision(TccDecisionEvent {
+            meta: EventMeta {
+                pid: 427,
+                ppid: 1,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_000_123_456_789,
+                comm: "tccd".into(),
+                container: None,
+            },
+            service: "kTCCServiceScreenCapture".into(),
+            allowed: true,
+            auth_value: 2,
+            auth_reason: Some(11),
+            client: Some("/Users/mal/.hidden/payload".into()),
+        }),
+        "tcc_decision",
+    );
+}
+
+#[test]
+fn gatekeeper_verdict_golden() {
+    // v20 (#95): a syspolicyd `GK evaluateScanResult` record. `result_code` is
+    // deliberately raw/uninterpreted — see the type's doc.
+    assert_golden(
+        &Event::GatekeeperVerdict(GatekeeperVerdictEvent {
+            meta: EventMeta {
+                pid: 672,
+                ppid: 1,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_000_123_456_789,
+                comm: "syspolicyd".into(),
+                container: None,
+            },
+            target: "com.evil.dropper".into(),
+            team_id: Some("ABCDE12345".into()),
+            signing_id: Some("com.evil.dropper".into()),
+            result_code: 2,
+        }),
+        "gatekeeper_verdict",
+    );
+}
+
+#[test]
 fn socket_accept_golden() {
     // v19 (#263 Phase 2): peer address of a newly accepted connection — an
     // attacker's IP connecting to a listening backdoor.
@@ -1048,6 +1095,21 @@ fn meta_accessor_covers_all_variants() {
             local_addr: None,
             local_port: None,
             backlog: 0,
+        }),
+        Event::TccDecision(TccDecisionEvent {
+            meta: meta.clone(),
+            service: String::new(),
+            allowed: false,
+            auth_value: 0,
+            auth_reason: None,
+            client: None,
+        }),
+        Event::GatekeeperVerdict(GatekeeperVerdictEvent {
+            meta: meta.clone(),
+            target: String::new(),
+            team_id: None,
+            signing_id: None,
+            result_code: 0,
         }),
         Event::SocketAccept(SocketAcceptEvent {
             meta: meta.clone(),

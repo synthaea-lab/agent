@@ -31,9 +31,12 @@
 //! Widening this to "any local user" is a policy change, not a code
 //! change — the current shape stays.
 
-use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll},
+};
+
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Peer identity read off an already-accepted connection. What the two
@@ -86,10 +89,11 @@ impl PeerCreds {
 
 #[cfg(windows)]
 mod platform {
-    use super::*;
     use tokio::net::windows::named_pipe::{
         ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
     };
+
+    use super::*;
 
     /// A named-pipe listener. Not a socket — Windows named pipes are
     /// their own IPC primitive, but tokio wraps them behind
@@ -214,13 +218,14 @@ mod platform {
 
     fn read_peer_creds(pipe: &NamedPipeServer) -> io::Result<PeerCreds> {
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-        use windows_sys::Win32::Security::{
-            GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
-        };
-        use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, HANDLE},
+            Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation},
+            System::{
+                Pipes::GetNamedPipeClientProcessId,
+                Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION},
+            },
         };
 
         let raw = pipe.as_raw_handle() as HANDLE;
@@ -291,8 +296,9 @@ mod platform {
 
 #[cfg(unix)]
 mod platform {
-    use super::*;
     use tokio::net::{UnixListener, UnixStream};
+
+    use super::*;
 
     /// A Unix-domain-socket listener bound at the caller's endpoint
     /// path. The path is deleted on `bind` if it already exists (the
@@ -387,7 +393,7 @@ mod platform {
     }
 }
 
-pub use platform::{connect, Listener, Stream};
+pub use platform::{Listener, Stream, connect};
 
 #[cfg(test)]
 mod tests {

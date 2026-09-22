@@ -222,10 +222,7 @@ async fn cmd_detections(
         println!("{:<24} {:<32} summary", "emitted at (ns)", "source");
         println!("{}", "-".repeat(90));
         for d in &r.detections {
-            println!(
-                "{:<24} {:<32} {}",
-                d.emitted_at_ns, d.source, d.summary
-            );
+            println!("{:<24} {:<32} {}", d.emitted_at_ns, d.source, d.summary);
         }
     }
     Ok(())

@@ -15,3 +15,4 @@ Coverage targets:
 | Injection/tamper (task_for_pid, ptrace, cs invalidation) | ES proc events | `endpoint-security/` |
 | Network flows with process attribution, inbound + outbound | NEFilterDataProvider | `network-extension/` |
 | DNS queries/responses | NEDNSProxyProvider | `network-extension/` |
+| sudo auth, TCC decisions, Gatekeeper verdicts | Unified log (`log stream`, strict predicates) | `unifiedlog/` |

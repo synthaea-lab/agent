@@ -93,7 +93,16 @@ pub mod time;
 /// Bumped 18 → 19 for [`Event::SocketAccept`] (#263 Phase 2): one new enum variant
 /// for `accept(2)`/`accept4(2)` telemetry (the peer address of a newly accepted
 /// connection) on Linux. Same reasoning as v13-v18.
-pub const SCHEMA_VERSION: u32 = 19;
+///
+/// Bumped 19 → 20 for [`Event::TccDecision`] and [`Event::GatekeeperVerdict`]
+/// (#95): two new enum variants for macOS unified-log telemetry (TCC
+/// privacy-permission decisions, Gatekeeper scan verdicts). macOS-only families,
+/// same precedent as the Windows-only `RegistrySet`/`WmiActivity`/`ScriptBlock`
+/// variants; same serialization-visible reasoning as v13-v19. Originally
+/// claimed as 18 → 19 while #95's branch was open; renumbered once #263's
+/// `SocketAccept` (18 → 19) merged into `main` first — the same coordination
+/// note as v13 and ADR-0005.
+pub const SCHEMA_VERSION: u32 = 20;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -964,6 +973,75 @@ pub enum AuthKind {
     PrivilegedSession,
 }
 
+/// macOS TCC privacy-permission decision — tccd answered a process's request
+/// for a protected capability (screen capture, microphone, Accessibility, full
+/// disk access, ...). Emitted by `sensor-macos-unifiedlog` (issue #95) from the
+/// `com.apple.TCC` unified-log subsystem, joining tccd's `AUTHREQ_CTX` (which
+/// carries the service) with the matching `AUTHREQ_RESULT` (which carries the
+/// verdict) on tccd's own message id.
+///
+/// Detection value: malware granting itself Accessibility/screen-capture (via
+/// synthetic clicks or a compromised MDM profile), and the reconnaissance
+/// pattern of a fresh binary probing many services. A *denial* is signal too —
+/// repeated denials for the same client is a process trying to escalate.
+///
+/// macOS-only family, same precedent as the Windows-only [`RegistrySetEvent`]/
+/// [`WmiActivityEvent`]/[`ScriptBlockEvent`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TccDecisionEvent {
+    /// The deciding daemon (`tccd`) — the unified log does not attribute the
+    /// requesting process on the result record; `client` below carries what
+    /// the log did say about the requester.
+    pub meta: EventMeta,
+    /// TCC service identifier as logged (e.g. `kTCCServiceScreenCapture`).
+    pub service: String,
+    /// True when access was granted (including "limited" grants).
+    pub allowed: bool,
+    /// Raw `authValue` from the log (0 denied, 1 unknown, 2 allowed, 3
+    /// limited) — kept for forensic completeness; rules match on `allowed`.
+    pub auth_value: u32,
+    /// Raw `authReason` code when logged (e.g. 11 = user consent, 12 =
+    /// service policy) — uninterpreted, forensic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_reason: Option<u32>,
+    /// Requesting client when the joined context carried one (bundle
+    /// identifier or binary path). `None` when tccd redacted it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+}
+
+/// macOS Gatekeeper scan verdict — syspolicyd evaluated a target (first
+/// launch, quarantine, background scan). Emitted by `sensor-macos-unifiedlog`
+/// (issue #95) from syspolicyd's `GK evaluateScanResult` unified-log messages.
+///
+/// The join keys for putting a verdict next to its exec event on a case are
+/// `team_id`/`signing_id` plus time proximity: syspolicyd hash-redacts file
+/// paths in the public log stream (they only appear with the private-data
+/// logging profile installed — see `docs/sensors/macos.md`), so `target` is
+/// honest about possibly being an opaque token rather than a path.
+///
+/// macOS-only family, same precedent as [`TccDecisionEvent`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatekeeperVerdictEvent {
+    /// The scanning daemon (`syspolicyd`).
+    pub meta: EventMeta,
+    /// Scan target as syspolicyd logged it: the bundle identifier when
+    /// present, else syspolicyd's path token (hash-redacted without the
+    /// logging profile).
+    pub target: String,
+    /// Signing team identifier, when the target is signed and logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
+    /// Code-signing identifier, when logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_id: Option<String>,
+    /// Raw `evaluateScanResult` code. Deliberately uninterpreted: the values
+    /// are undocumented by Apple, so the sensor forwards them for forensics
+    /// and fleet-side statistics instead of guessing an allow/deny meaning
+    /// that could silently invert on an OS update.
+    pub result_code: u32,
+}
+
 /// The normalized event envelope.
 ///
 /// `#[non_exhaustive]`: new telemetry categories (registry, DNS, image load, ...) are
@@ -1001,6 +1079,8 @@ pub enum Event {
     FileChown(FileChownEvent),
     SocketListen(SocketListenEvent),
     SocketAccept(SocketAcceptEvent),
+    TccDecision(TccDecisionEvent),
+    GatekeeperVerdict(GatekeeperVerdictEvent),
 }
 
 impl Event {
@@ -1036,6 +1116,8 @@ impl Event {
             Event::FileChown(e) => &e.meta,
             Event::SocketListen(e) => &e.meta,
             Event::SocketAccept(e) => &e.meta,
+            Event::TccDecision(e) => &e.meta,
+            Event::GatekeeperVerdict(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.
