@@ -58,6 +58,12 @@ fn eventlog_config(policy: &policy::EventLogPolicy) -> sensor_windows_eventlog::
         scheduled_tasks_enabled: policy.scheduled_tasks_enabled,
         account_creations_enabled: policy.account_creations_enabled,
         logon_events_enabled: policy.logon_events_enabled,
+        // Not yet policy-configurable (issue #283 v1): the AppLocker EXE/DLL and
+        // TaskScheduler-Operational channels are always on when this crate is
+        // enabled. A follow-up (see the same ADR-0006 note above) will surface
+        // per-channel toggles through `policy::EventLogPolicy`.
+        applocker_blocks_enabled: true,
+        task_scheduler_op_enabled: true,
     }
 }
 

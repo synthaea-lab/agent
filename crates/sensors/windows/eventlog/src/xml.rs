@@ -322,6 +322,90 @@ pub fn parse_account_created_block(block: &str) -> Option<AccountCreatedEvent> {
     })
 }
 
+/// One `Microsoft-Windows-AppLocker/EXE and DLL` event 8004 — an executable was
+/// refused execution by `AppLocker` (deny rule matched, or no allow rule in an
+/// allowlist policy). `AppLocker`'s channel emits this as `<UserData>` /
+/// `<RuleAndFileData>` rather than the `<EventData><Data Name=...>` shape the
+/// Security channel uses, so this parser reads the raw child elements
+/// directly (`<FilePath>`, `<TargetProcessId>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppLockerBlockEvent {
+    pub record_id: u64,
+    /// PID of the process that tried to launch the blocked image
+    /// (`RuleAndFileData/TargetProcessId`). 0 if missing.
+    pub target_process_id: u32,
+    /// Absolute path of the blocked image (`RuleAndFileData/FilePath`). Empty
+    /// if missing.
+    pub file_path: String,
+}
+
+/// Parses one 8004 `<Event>` block. `None` if the block is missing
+/// `EventRecordID` (a genuinely different event matched the `XPath` filter, or
+/// a `wevtutil` output shape change — skip rather than guess, same convention
+/// as the other parsers in this module).
+#[must_use]
+pub fn parse_applocker_block(block: &str) -> Option<AppLockerBlockEvent> {
+    let record_id = extract_between(block, "<EventRecordID>", "</EventRecordID>")?
+        .parse()
+        .ok()?;
+    // `AppLocker`'s payload lives in <UserData><RuleAndFileData>: children are
+    // *plain* elements (`<FilePath>...</FilePath>`), not `<Data Name='...'>`
+    // like on the Security channel.
+    let target_process_id = extract_between(block, "<TargetProcessId>", "</TargetProcessId>")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let file_path = extract_between(block, "<FilePath>", "</FilePath>")
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    Some(AppLockerBlockEvent {
+        record_id,
+        target_process_id,
+        file_path,
+    })
+}
+
+/// One `Microsoft-Windows-TaskScheduler/Operational` event 106 — a scheduled
+/// task was registered on this host. Distinct from the Security-channel event
+/// 4698 (`ScheduledTaskEvent`) because the Operational channel fires *always*
+/// (no audit-subcategory required) but carries less structure: only the task
+/// name and the user context that registered it — no serialized XML task
+/// content, so no action path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSchedulerOpRegisteredEvent {
+    pub record_id: u64,
+    /// PID of the reporting process (`<Execution ProcessID='...'>`) — the
+    /// Task Scheduler service host. 0 if missing.
+    pub pid: u32,
+    /// The registered task's full name (`\...\MyTask`). Empty if missing.
+    pub task_name: String,
+    /// SAM or UPN of the account that registered the task
+    /// (`<Data Name='UserContext'>`). Empty if missing.
+    pub user_context: String,
+}
+
+/// Parses one 106 `<Event>` block. `None` if the block is missing
+/// `EventRecordID` (same convention as the other parsers).
+#[must_use]
+pub fn parse_task_scheduler_op_registered_block(
+    block: &str,
+) -> Option<TaskSchedulerOpRegisteredEvent> {
+    let record_id = extract_between(block, "<EventRecordID>", "</EventRecordID>")?
+        .parse()
+        .ok()?;
+    let pid = extract_between(block, "ProcessID='", "'")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let task_name = opt_data(block, "TaskName").unwrap_or_default();
+    let user_context = opt_data(block, "UserContext").unwrap_or_default();
+    Some(TaskSchedulerOpRegisteredEvent {
+        record_id,
+        pid,
+        task_name,
+        user_context,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,5 +686,56 @@ mod tests {
     fn account_created_block_missing_record_id_does_not_parse() {
         let block = "<Event><EventData><Data Name='TargetUserName'>x</Data></EventData></Event>";
         assert!(parse_account_created_block(block).is_none());
+    }
+
+    // ── `AppLocker` EID 8004 ───────────────────────────────────────────────
+
+    /// A `powershell.exe` invocation from a low-privilege lab account that
+    /// `AppLocker` refused to run because its file path (`C:\Users\...\Downloads`)
+    /// matched a deny rule. Shape mirrors the `<UserData>`/`<RuleAndFileData>`
+    /// `AppLocker` actually emits, not the `<EventData>` shape of Security events.
+    const APPLOCKER_BLOCK_XML: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-AppLocker' Guid='{cbda4dbf-8d5d-4f69-9578-be14aa540d22}'/><EventID>8004</EventID><Version>0</Version><Level>2</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime='2026-09-22T08:19:44.1273512Z'/><EventRecordID>512</EventRecordID><Correlation/><Execution ProcessID='732' ThreadID='4104'/><Channel>Microsoft-Windows-AppLocker/EXE and DLL</Channel><Computer>Sandbox</Computer><Security UserID='S-1-5-21-1663667890-2519037288-962558911-1001'/></System><UserData><RuleAndFileData xmlns='http://schemas.microsoft.com/schemas/event/Microsoft.Windows/1.0.0.0'><PolicyName>EXE</PolicyName><RuleId>{00000000-0000-0000-0000-000000000000}</RuleId><RuleName>Deny Everyone from Downloads</RuleName><RuleSddl>D:(XA;;FX;;;WD;(Exists Path))</RuleSddl><TargetUser>S-1-5-21-1663667890-2519037288-962558911-1001</TargetUser><TargetProcessId>5312</TargetProcessId><FilePath>%OSDRIVE%\USERS\SOLKA\DOWNLOADS\POWERSHELL.EXE</FilePath><FileHash>0000000000000000000000000000000000000000000000000000000000000000</FileHash><FqbnLength>1</FqbnLength><Fqbn>O:\O:\O:0.0.0.0</Fqbn></RuleAndFileData></UserData></Event>"#;
+
+    #[test]
+    fn parses_a_real_shaped_applocker_block() {
+        let block = split_event_blocks(APPLOCKER_BLOCK_XML)[0];
+        let parsed = parse_applocker_block(block).expect("should parse");
+        assert_eq!(parsed.record_id, 512);
+        assert_eq!(parsed.target_process_id, 5312);
+        assert_eq!(
+            parsed.file_path,
+            "%OSDRIVE%\\USERS\\SOLKA\\DOWNLOADS\\POWERSHELL.EXE"
+        );
+    }
+
+    #[test]
+    fn applocker_block_missing_record_id_does_not_parse() {
+        let block = "<Event><UserData><RuleAndFileData><FilePath>x</FilePath></RuleAndFileData></UserData></Event>";
+        assert!(parse_applocker_block(block).is_none());
+    }
+
+    // ── TaskScheduler Operational EID 106 ───────────────────────────────
+
+    /// A user (`SANDBOX\solka`) registering a scheduled task named `\atomic-r`
+    /// via `schtasks.exe /Create ...`. Emitted by the Task Scheduler service on
+    /// the always-on `Microsoft-Windows-TaskScheduler/Operational` channel, no
+    /// audit subcategory required — the complement to Security 4698 whose audit
+    /// enablement may fail on a hardened host.
+    const TASK_SCHEDULER_OP_106_XML: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-TaskScheduler' Guid='{de7b24ea-73c8-4a09-985d-5bdadcfa9017}'/><EventID>106</EventID><Version>0</Version><Level>4</Level><Task>106</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime='2026-09-22T08:21:11.7752210Z'/><EventRecordID>18432</EventRecordID><Correlation/><Execution ProcessID='2124' ThreadID='2892'/><Channel>Microsoft-Windows-TaskScheduler/Operational</Channel><Computer>Sandbox</Computer><Security UserID='S-1-5-21-1663667890-2519037288-962558911-1001'/></System><EventData><Data Name='TaskName'>\atomic-r</Data><Data Name='UserContext'>SANDBOX\solka</Data></EventData></Event>"#;
+
+    #[test]
+    fn parses_a_real_shaped_task_scheduler_op_106_block() {
+        let block = split_event_blocks(TASK_SCHEDULER_OP_106_XML)[0];
+        let parsed = parse_task_scheduler_op_registered_block(block).expect("should parse");
+        assert_eq!(parsed.record_id, 18432);
+        assert_eq!(parsed.pid, 2124);
+        assert_eq!(parsed.task_name, "\\atomic-r");
+        assert_eq!(parsed.user_context, "SANDBOX\\solka");
+    }
+
+    #[test]
+    fn task_scheduler_op_106_missing_record_id_does_not_parse() {
+        let block = "<Event><EventData><Data Name='TaskName'>x</Data></EventData></Event>";
+        assert!(parse_task_scheduler_op_registered_block(block).is_none());
     }
 }

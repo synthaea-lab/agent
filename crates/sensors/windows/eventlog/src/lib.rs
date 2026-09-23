@@ -94,11 +94,32 @@
 //! Linux sensor rather than staying Windows-only stopgap plumbing. See
 //! `docs/adr/0005-windows-logon-events-shared-auth-event-type.md`.
 //!
+//! ## Additional detection channels (#283)
+//!
+//! Two extra operational channels supplement the Security-channel poll targets
+//! above, both **always-on** (no `auditpol` toggle) so they cover the same
+//! techniques even on a host where the audit subcategory for 4698 was left
+//! disabled:
+//!
+//! - **`AppLocker` EXE/DLL block** (`Microsoft-Windows-AppLocker/EXE and DLL`
+//!   channel, event **8004**): an executable was refused execution by
+//!   `AppLocker` policy. Reported as `FileOpenEvent` with
+//!   `schema::FLAG_APPLICATION_BLOCKED` — a defensive signal (a known-bad
+//!   payload stopped at the OS boundary), not a persistence artifact, so it
+//!   takes its own flag rather than reusing a `FLAG_PERSISTENCE_*` bit.
+//! - **Task Scheduler Operational — task registered**
+//!   (`Microsoft-Windows-TaskScheduler/Operational` channel, event **106**):
+//!   the always-on complement to Security 4698. Emitted whenever any scheduled
+//!   task is registered on this host; reuses
+//!   `schema::FLAG_PERSISTENCE_TASK_ARTIFACT`, so a task registration seen on
+//!   *both* channels is a rules-layer deduplication concern, not a sensor-layer
+//!   one.
+//!
 //! ## Configurable allowlist and volume counters (#94)
 //!
 // Plain code spans, not intra-doc links, for the three items below: they are
 // Windows-gated, so links to them would break the Linux docs build CI runs.
-//! `EventLogConfig` toggles each of the four poll targets above
+//! `EventLogConfig` toggles each of the six poll targets above
 //! independently (a disabled one is never even queried), and
 //! `EventLogCounters` (via `EventLogSensor::counters`) exposes a live count
 //! of events actually normalized per target. This crate cannot depend on

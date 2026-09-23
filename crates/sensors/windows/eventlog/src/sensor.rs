@@ -15,8 +15,9 @@ use std::{
 };
 
 use schema::{
-    AuthEvent, AuthKind, AuthOutcome, Event, EventMeta, FLAG_PERSISTENCE_ACCOUNT_ARTIFACT,
-    FLAG_PERSISTENCE_ARTIFACT, FLAG_PERSISTENCE_TASK_ARTIFACT, FileOpenEvent, User,
+    AuthEvent, AuthKind, AuthOutcome, Event, EventMeta, FLAG_APPLICATION_BLOCKED,
+    FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT, FLAG_PERSISTENCE_TASK_ARTIFACT,
+    FileOpenEvent, User,
     sensor::{Capabilities, EventSink, Sensor, SensorError},
     time::now_ns,
 };
@@ -443,6 +444,93 @@ static ACCOUNT_CREATIONS: PollTarget = PollTarget {
     enable_audit: Some(enable_account_creation_audit),
 };
 
+// ── Event 8004 — `AppLocker` EXE/DLL block (Microsoft-Windows-AppLocker/EXE and DLL) ───
+//
+// `AppLocker`'s operational channel is **enabled by default** on modern Windows
+// SKUs that ship `AppLocker`: unlike 4698, no `auditpol` toggle is involved
+// (`AppLocker` is a policy-configured feature, not an audit subcategory). If the
+// channel is disabled by group policy on a given host, `wevtutil qe` simply
+// returns nothing and this poll thread stays idle — the failure mode is a
+// coverage gap, not a crash.
+
+/// Filename-only leaf of an `AppLocker` `FilePath`, which is upper-cased and
+/// backslash-separated (e.g. `%OSDRIVE%\USERS\X\DOWNLOADS\POWERSHELL.EXE`).
+/// Returns the trailing segment lowercased for `comm`.
+fn applocker_leaf_name(path: &str) -> String {
+    path.rsplit(&['\\', '/'][..])
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase()
+}
+
+/// An 8004 without a `FilePath` cannot carry a persistence artifact — nothing
+/// to hand to the sink. Skip, advancing the cursor.
+fn normalize_applocker_block(block: &str) -> ParsedBlock {
+    let ev = xml::parse_applocker_block(block)?;
+    let record_id = ev.record_id;
+    if ev.file_path.is_empty() {
+        return Some((record_id, None));
+    }
+    let comm = applocker_leaf_name(&ev.file_path);
+    let event = persistence_file_open(
+        ev.target_process_id,
+        comm,
+        ev.file_path,
+        FLAG_APPLICATION_BLOCKED,
+    );
+    Some((record_id, Some(event)))
+}
+
+static APPLOCKER_BLOCKS: PollTarget = PollTarget {
+    label: "applocker-block",
+    channel: "Microsoft-Windows-AppLocker/EXE and DLL",
+    id_filter: "EventID=8004",
+    counter: |c| &c.applocker_blocks,
+    parse_block: normalize_applocker_block,
+    // No audit-subcategory toggle: `AppLocker`'s channel is on when `AppLocker` is
+    // configured on the host, off otherwise. Enabling it here would need
+    // `wevtutil sl <channel> /e:true`, which is best done by the operator's
+    // deployment (a disabled channel is a policy decision, not an oversight
+    // the sensor should override on its own).
+    enable_audit: None,
+};
+
+// ── Event 106 — TaskScheduler Operational "task registered" ─────────────────
+//
+// The `Microsoft-Windows-TaskScheduler/Operational` channel is **enabled by
+// default** on all supported Windows SKUs (Task Scheduler being a core service)
+// — no `auditpol` interaction, complementing the Security 4698 path whose
+// `enable_scheduled_task_audit` may fail on a hardened host. When both channels
+// are up, they double-fire on the same event: the deduplication happens at the
+// rules layer (schema flag differentiation), not here.
+
+/// A 106 without a `TaskName` is unusable — the alert quotes it as
+/// `comm`/`path`. Skip, advancing the cursor.
+fn normalize_task_scheduler_op_registered(block: &str) -> ParsedBlock {
+    let ev = xml::parse_task_scheduler_op_registered_block(block)?;
+    let record_id = ev.record_id;
+    if ev.task_name.is_empty() {
+        return Some((record_id, None));
+    }
+    // Operational 106 carries no serialized task XML (unlike 4698), so no
+    // action path is available — the task name is the only artifact. Feed it
+    // as both `comm` (leaf) and `path` (full path form Task Scheduler uses,
+    // `\Folder\TaskName`) to keep the FileOpenEvent shape well-formed.
+    let comm = xml::task_leaf_name(&ev.task_name);
+    let event = persistence_file_open(ev.pid, comm, ev.task_name, FLAG_PERSISTENCE_TASK_ARTIFACT);
+    Some((record_id, Some(event)))
+}
+
+static TASK_SCHEDULER_OP: PollTarget = PollTarget {
+    label: "task-scheduler-op",
+    channel: "Microsoft-Windows-TaskScheduler/Operational",
+    id_filter: "EventID=106",
+    counter: |c| &c.task_scheduler_op,
+    parse_block: normalize_task_scheduler_op_registered,
+    // Operational channel, always on — nothing to enable.
+    enable_audit: None,
+};
+
 // ── Policy-configurable allowlist and volume counters (#94) ─────────────────
 //
 // `sensor-*` crates may depend only on `schema` (`tools/check-deps.py`), so
@@ -459,12 +547,20 @@ static ACCOUNT_CREATIONS: PollTarget = PollTarget {
 pub struct EventLogConfig {
     /// Event 7045 (T1543.003 — service install persistence).
     pub service_installs_enabled: bool,
-    /// Event 4698 (T1053.005 — scheduled task persistence).
+    /// Event 4698 (T1053.005 — scheduled task persistence). Reads the Security
+    /// channel; requires `Other Object Access Events` audit enabled.
     pub scheduled_tasks_enabled: bool,
     /// Event 4720 (T1136.001 — local account creation persistence).
     pub account_creations_enabled: bool,
     /// Events 4624/4625/4648/4672 (logon/session, #94).
     pub logon_events_enabled: bool,
+    /// Event 8004 (T1562.001-adjacent — `AppLocker` EXE/DLL block).
+    /// `Microsoft-Windows-AppLocker/EXE and DLL` operational channel.
+    pub applocker_blocks_enabled: bool,
+    /// Event 106 (T1053.005 — scheduled task registered via the
+    /// `Microsoft-Windows-TaskScheduler/Operational` channel; always-on
+    /// complement to the 4698 path).
+    pub task_scheduler_op_enabled: bool,
 }
 
 impl Default for EventLogConfig {
@@ -476,6 +572,8 @@ impl Default for EventLogConfig {
             scheduled_tasks_enabled: true,
             account_creations_enabled: true,
             logon_events_enabled: true,
+            applocker_blocks_enabled: true,
+            task_scheduler_op_enabled: true,
         }
     }
 }
@@ -494,6 +592,8 @@ pub struct EventLogCounters {
     pub scheduled_tasks: AtomicU64,
     pub account_creations: AtomicU64,
     pub logon_events: AtomicU64,
+    pub applocker_blocks: AtomicU64,
+    pub task_scheduler_op: AtomicU64,
 }
 
 // ── The sensor ────────────────────────────────────────────────────────────────
@@ -553,7 +653,9 @@ impl Sensor for EventLogSensor {
         Capabilities {
             file_events: self.config.service_installs_enabled
                 || self.config.scheduled_tasks_enabled
-                || self.config.account_creations_enabled,
+                || self.config.account_creations_enabled
+                || self.config.applocker_blocks_enabled
+                || self.config.task_scheduler_op_enabled,
             auth_events: self.config.logon_events_enabled,
             ..Capabilities::default()
         }
@@ -570,6 +672,8 @@ impl Sensor for EventLogSensor {
             (self.config.scheduled_tasks_enabled, &SCHEDULED_TASKS),
             (self.config.account_creations_enabled, &ACCOUNT_CREATIONS),
             (self.config.logon_events_enabled, &LOGON_EVENTS),
+            (self.config.applocker_blocks_enabled, &APPLOCKER_BLOCKS),
+            (self.config.task_scheduler_op_enabled, &TASK_SCHEDULER_OP),
         ];
         for (enabled, target) in targets {
             if !enabled {
@@ -612,6 +716,8 @@ mod config_tests {
         assert!(config.scheduled_tasks_enabled);
         assert!(config.account_creations_enabled);
         assert!(config.logon_events_enabled);
+        assert!(config.applocker_blocks_enabled);
+        assert!(config.task_scheduler_op_enabled);
     }
 
     #[test]
@@ -621,6 +727,8 @@ mod config_tests {
             scheduled_tasks_enabled: false,
             account_creations_enabled: false,
             logon_events_enabled: false,
+            applocker_blocks_enabled: false,
+            task_scheduler_op_enabled: false,
         });
         let caps = sensor.capabilities();
         assert!(!caps.file_events);
@@ -634,6 +742,34 @@ mod config_tests {
             scheduled_tasks_enabled: false,
             account_creations_enabled: false,
             logon_events_enabled: false,
+            applocker_blocks_enabled: false,
+            task_scheduler_op_enabled: false,
+        });
+        assert!(sensor.capabilities().file_events);
+    }
+
+    #[test]
+    fn applocker_alone_still_sets_file_events() {
+        let sensor = EventLogSensor::with_config(EventLogConfig {
+            service_installs_enabled: false,
+            scheduled_tasks_enabled: false,
+            account_creations_enabled: false,
+            logon_events_enabled: false,
+            applocker_blocks_enabled: true,
+            task_scheduler_op_enabled: false,
+        });
+        assert!(sensor.capabilities().file_events);
+    }
+
+    #[test]
+    fn task_scheduler_op_alone_still_sets_file_events() {
+        let sensor = EventLogSensor::with_config(EventLogConfig {
+            service_installs_enabled: false,
+            scheduled_tasks_enabled: false,
+            account_creations_enabled: false,
+            logon_events_enabled: false,
+            applocker_blocks_enabled: false,
+            task_scheduler_op_enabled: true,
         });
         assert!(sensor.capabilities().file_events);
     }
@@ -646,5 +782,7 @@ mod config_tests {
         assert_eq!(counters.scheduled_tasks.load(Ordering::Relaxed), 0);
         assert_eq!(counters.account_creations.load(Ordering::Relaxed), 0);
         assert_eq!(counters.logon_events.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.applocker_blocks.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.task_scheduler_op.load(Ordering::Relaxed), 0);
     }
 }

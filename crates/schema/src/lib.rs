@@ -200,6 +200,26 @@ pub const FLAG_PERSISTENCE_SYSTEMD_ARTIFACT: u32 = 0x4000_0000;
 /// schema change (same reasoning as [`FLAG_PERSISTENCE_ARTIFACT`]).
 pub const FLAG_PERSISTENCE_BTM_ARTIFACT: u32 = 0x0400_0000;
 
+/// Same principle as [`FLAG_PERSISTENCE_ARTIFACT`], for a Windows **`AppLocker`
+/// block** — event 8004 in the `Microsoft-Windows-AppLocker/EXE and DLL`
+/// operational channel: an executable was refused execution because it
+/// matched a deny rule (or no allow rule, depending on policy mode). ATT&CK
+/// T1562.001 covers *disabling* `AppLocker`; a *raised* block is a defensive
+/// signal — a known-bad payload was stopped at the OS boundary — that the
+/// EDR still forwards so operators see the attempt.
+///
+/// Reuses [`FileOpenEvent`] like the other Windows persistence flags (see
+/// ADR-0004): `path` carries `FilePath` from the event's `RuleAndFileData`
+/// section, `meta::comm` carries its leaf name.
+///
+/// Not a persistence-family flag — the executable never ran, so nothing was
+/// installed — but it lives in the same reserved high-bit space because the
+/// underlying reuse trick is identical.
+///
+/// A distinct bit from every other `FLAG_*` constant, so no two techniques
+/// cross-fire off a single event.
+pub const FLAG_APPLICATION_BLOCKED: u32 = 0x0100_0000;
+
 /// Identity of the user a process runs as, per platform.
 ///
 /// A bare `uid: u32` cannot represent Windows (audit finding F-3: SYSTEM spawning
