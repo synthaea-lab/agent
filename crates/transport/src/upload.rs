@@ -41,17 +41,18 @@ pub trait EventDrain: Send {
     fn ack(&mut self) -> std::io::Result<()>;
 
     /// Discards the last drained batch without uploading it — the poison
-    /// escape hatch, called when the server rejects the batch permanently
-    /// (a non-retryable [`crate::TransportError`]): without it one malformed
-    /// segment would block all newer telemetry forever.
+    /// escape hatch, called either when the server rejects the batch
+    /// permanently (a non-retryable [`crate::TransportError`]) or when a
+    /// retryable failure has repeated [`TransportConfig::max_drain_attempts`]
+    /// times in a row on the same segment: without it one malformed or
+    /// permanently-500ing segment would block all newer telemetry forever.
     ///
     /// The discard unit is everything the last `drain` returned — for the
     /// spool that is a whole segment, so valid events sharing a segment with
-    /// a poison record are lost with it (review finding, PR #271). Deliberate:
-    /// sub-segment retry is not expressible in the spool's two-phase
-    /// drain/ack protocol, and one segment (1 MiB cap, roughly one upload
-    /// batch) is the accepted blast radius for the rare permanent-rejection
-    /// path. Revisit only if servers start rejecting individual events.
+    /// a poison record are lost with it. Deliberate: sub-segment retry is not
+    /// expressible in the spool's two-phase drain/ack protocol, and one
+    /// segment (1 MiB cap, roughly one upload batch) is the accepted blast
+    /// radius for the rare permanent-rejection or wedged-server path.
     ///
     /// # Errors
     ///
@@ -90,6 +91,15 @@ impl<D: EventDrain> EventUploader<D> {
     /// poison batch instead, so one malformed segment can't block newer
     /// telemetry forever.
     ///
+    /// A retryable failure (e.g. the server 500s) is NOT skipped on the first
+    /// attempt — it redelivers, same as any transient outage. But because the
+    /// same segment stays in-flight until ack'd or skipped, [`Self::drain`]
+    /// keeps re-delivering it on every call, so `consecutive_failures`
+    /// doubles as "attempts on this segment" for as long as it keeps failing.
+    /// Once that reaches [`TransportConfig::max_drain_attempts`], the segment
+    /// is skipped too — a permanently-broken server response, not just a slow
+    /// one, must not be allowed to wedge all newer telemetry forever either.
+    ///
     /// Returns the number of events uploaded, or 0 if the drain is empty.
     ///
     /// # Errors
@@ -106,7 +116,17 @@ impl<D: EventDrain> EventUploader<D> {
 
         let count = events.len();
 
-        // Upload in batches
+        // Upload in batches. `consecutive_failures` is NOT reset here on a
+        // per-batch success (issue #315 regression, found in PR #349 review):
+        // a segment larger than `batch_size` splits into several batches per
+        // call, and resetting mid-call erases the count from every PRIOR
+        // failed call on this same still-unacked segment the moment any
+        // later batch happens to land before the one that keeps failing —
+        // `consecutive_failures` never reaches `max_drain_attempts` unless
+        // the poison record happens to sit in the segment's very first
+        // batch. It resets exactly once, only when the whole call succeeds
+        // (see the `ack()` call below) — that is the only point at which
+        // this segment's attempt history should be forgotten.
         for batch in events.chunks(self.config.batch_size) {
             match self.client.upload_events(batch) {
                 Ok(response) => {
@@ -115,16 +135,15 @@ impl<D: EventDrain> EventUploader<D> {
                         batch_id = ?response.batch_id,
                         "uploaded events"
                     );
-                    self.consecutive_failures = 0;
                 }
                 Err(e) if !e.is_retryable() => {
-                    self.consecutive_failures += 1;
                     tracing::warn!(
                         error = %e,
                         dropped = count,
                         "server rejected batch permanently — skipping poison segment"
                     );
                     self.drain.skip()?;
+                    self.consecutive_failures = 0;
                     return Err(e);
                 }
                 Err(e) => {
@@ -134,12 +153,22 @@ impl<D: EventDrain> EventUploader<D> {
                         error = %e,
                         "upload failed"
                     );
+                    if self.consecutive_failures >= self.config.max_drain_attempts {
+                        tracing::warn!(
+                            attempts = self.consecutive_failures,
+                            dropped = count,
+                            "segment exceeded max drain attempts — skipping to restore forward progress"
+                        );
+                        self.drain.skip()?;
+                        self.consecutive_failures = 0;
+                    }
                     return Err(e);
                 }
             }
         }
 
         self.drain.ack()?;
+        self.consecutive_failures = 0;
         tracing::info!(count, "uploaded events successfully");
         Ok(count)
     }

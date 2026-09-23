@@ -3,8 +3,8 @@
 use std::{path::PathBuf, time::Duration};
 
 use crate::{
-    DEFAULT_BATCH_SIZE, DEFAULT_HEARTBEAT_ENDPOINT, DEFAULT_INGEST_ENDPOINT, DEFAULT_RETRY_BASE_MS,
-    DEFAULT_RETRY_MAX_MS,
+    DEFAULT_BATCH_SIZE, DEFAULT_HEARTBEAT_ENDPOINT, DEFAULT_INGEST_ENDPOINT,
+    DEFAULT_MAX_DRAIN_ATTEMPTS, DEFAULT_RETRY_BASE_MS, DEFAULT_RETRY_MAX_MS,
 };
 
 /// Configuration for the transport layer.
@@ -42,6 +42,10 @@ pub struct TransportConfig {
 
     /// Interval between heartbeats.
     pub heartbeat_interval: Duration,
+
+    /// Consecutive retryable upload failures on the same in-flight segment
+    /// before it is skipped so newer segments can flow again.
+    pub max_drain_attempts: u32,
 }
 
 impl Default for TransportConfig {
@@ -58,6 +62,7 @@ impl Default for TransportConfig {
             retry_max: Duration::from_millis(DEFAULT_RETRY_MAX_MS),
             request_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(30),
+            max_drain_attempts: DEFAULT_MAX_DRAIN_ATTEMPTS,
         }
     }
 }

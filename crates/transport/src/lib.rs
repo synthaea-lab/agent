@@ -67,3 +67,10 @@ pub const DEFAULT_RETRY_MAX_MS: u64 = 60_000;
 
 /// Default upload batch size (events per request).
 pub const DEFAULT_BATCH_SIZE: usize = 100;
+
+/// Default number of consecutive retryable failures on the same in-flight
+/// segment before it is skipped to restore forward progress. Mirrors
+/// `store::EventSpool`'s suggested `MAX_DRAIN_ATTEMPTS` — `store` and
+/// `transport` are both leaf crates and may not depend on each other, so the
+/// value is duplicated by convention rather than shared by import.
+pub const DEFAULT_MAX_DRAIN_ATTEMPTS: u32 = 5;
