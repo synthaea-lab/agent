@@ -19,12 +19,19 @@ use schema::{
 
 use crate::{
     normalize,
+    pid_cache::PidCache,
     providers::{
         dns_provider, dotnet_provider, file_provider, network_provider, powershell_provider,
         process_provider, registry_provider, smb_provider, wmi_provider,
     },
     winapi,
 };
+
+/// Cap for the pid cache. A live host rarely runs more than a few hundred
+/// processes; this leaves generous headroom (spawn storms, bursts of short-lived
+/// helpers) while bounding memory if `ProcessEnd` events are lost — a documented
+/// ETW behavior under buffer pressure, not a theoretical one.
+const PID_CACHE_CAP: usize = 16_384;
 
 /// Where the previous session's randomized name is persisted, so orphan cleanup
 /// after a crash still works despite F-2's name randomization.
@@ -56,8 +63,8 @@ fn stop_orphaned_session(name: &str) {
 
 pub(crate) struct SharedState {
     /// pid → full image path; populated by seed + `ProcessStart`, pruned on
-    /// `ProcessEnd` (PID recycling).
-    pub(crate) pids: Mutex<HashMap<u32, String>>,
+    /// `ProcessEnd` (PID recycling), bounded as a backstop (see [`PidCache`]).
+    pub(crate) pids: Mutex<PidCache>,
     /// F-5: live device→drive map, refreshed on normalization misses.
     pub(crate) volumes: Mutex<HashMap<String, String>>,
     /// F-7: Connect/Send dedup.
@@ -87,8 +94,8 @@ impl SharedState {
 
     pub(crate) fn comm_for(&self, pid: u32) -> Option<String> {
         let cached = {
-            let pids = self.pids.lock().unwrap();
-            pids.get(&pid).cloned()
+            let mut pids = self.pids.lock().unwrap();
+            pids.get(pid).map(str::to_owned)
         };
         let path = match cached {
             Some(p) => p,
@@ -240,7 +247,7 @@ impl Sensor for WindowsSensor {
         let canary_file =
             std::env::temp_dir().join(format!("synthaea-canary-{}", std::process::id()));
         let state = Arc::new(SharedState {
-            pids: Mutex::new(HashMap::new()),
+            pids: Mutex::new(PidCache::new(PID_CACHE_CAP)),
             volumes: Mutex::new(winapi::build_volume_map()),
             dedup: Mutex::new(normalize::ConnectDedup::new(60_000_000_000)),
             events_seen: AtomicU64::new(0),

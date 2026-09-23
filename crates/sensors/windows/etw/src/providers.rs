@@ -57,7 +57,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
 
         if eid == 2 {
             if pid != 0 {
-                state.pids.lock().unwrap().remove(&pid);
+                state.pids.lock().unwrap().remove(pid);
             }
             return;
         }
@@ -67,10 +67,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             // Only emit for tracked PIDs — the store is seeded at startup and
             // populated by EID 1, so a missing PID is a kernel/driver load that
             // we intentionally ignore at userland tier.
-            let Some(comm) = ({
-                let pids = state.pids.lock().unwrap();
-                pids.get(&pid).map(|p| basename(p))
-            }) else {
+            let Some(comm) = state.pids.lock().unwrap().get(pid).map(basename) else {
                 return;
             };
             let raw_image: String = parser
@@ -81,13 +78,9 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             }
             let image_path = state.normalize_path(&raw_image);
             let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
-            let ppid = state
-                .pids
-                .lock()
-                .unwrap()
-                .get(&pid)
-                .map(|_| 0u32)
-                .unwrap_or(0);
+            // EID 5 carries no parent pid; the old cache lookup here always
+            // yielded 0 anyway.
+            let ppid = 0;
             sink.on_event(Event::ImageLoad(ImageLoadEvent {
                 meta: meta(pid, ppid, comm, timestamp_ns),
                 image_path,
@@ -112,7 +105,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
 
         // Lineage at exec time (schema parent fields): the parent is usually alive
         // and already in the store.
-        let parent_image_path = state.pids.lock().unwrap().get(&ppid).cloned();
+        let parent_image_path = state.pids.lock().unwrap().get(ppid).map(str::to_owned);
         let parent_comm = parent_image_path.as_deref().map(basename);
 
         // F-1: the REAL command line from the target's PEB, unbounded (F-4);
@@ -247,10 +240,7 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
 
         // Tracked PIDs only: discards pure kernel ops and untracked churn (the
         // volume filter the old sensor validated in the lab).
-        let Some(comm) = ({
-            let pids = state.pids.lock().unwrap();
-            pids.get(&pid).map(|p| basename(p))
-        }) else {
+        let Some(comm) = state.pids.lock().unwrap().get(pid).map(basename) else {
             return;
         };
 
