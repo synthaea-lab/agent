@@ -13,10 +13,10 @@ use schema::{
     EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent,
     FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent,
     GatekeeperVerdictEvent, ImageLoadEvent, ListenPortEvent, MountEvent, NetworkFlowEvent,
-    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType, SignalEvent,
-    SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TccDecisionEvent,
-    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
-    XpcConnectEvent,
+    POLICY_MECHANISM_SELINUX, PolicyDenialEvent, ReadlineInputEvent, RegistrySetEvent,
+    ScriptBlockEvent, ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
+    SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
+    UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -1001,6 +1001,33 @@ fn socket_accept_golden() {
 }
 
 #[test]
+fn policy_denial_golden() {
+    // v22 (#297): a SELinux AVC denial — httpd blocked (enforcing mode) from
+    // reading a file labeled for a user's home directory, the classic
+    // web-shell-reading-secrets shape. `action` is absent: the AVC parser
+    // doesn't yet recover the requested permission set, see the type's doc.
+    assert_golden(
+        &Event::PolicyDenial(PolicyDenialEvent {
+            meta: EventMeta {
+                pid: 4242,
+                ppid: 1337,
+                user: User::Unix { uid: 48, gid: 48 },
+                timestamp_ns: 1_756_900_100_000_000_000,
+                comm: "httpd".into(),
+                container: None,
+            },
+            mechanism: POLICY_MECHANISM_SELINUX.into(),
+            subject_context: Some("system_u:system_r:httpd_t:s0".into()),
+            object_context: Some("system_u:object_r:user_home_t:s0".into()),
+            object_class: Some("file".into()),
+            action: None,
+            enforced: true,
+        }),
+        "policy_denial",
+    );
+}
+
+#[test]
 fn unbounded_cmdline_survives() {
     // Audit F-4: multi-kilobyte encoded command lines must round-trip untouched.
     let long = format!("powershell.exe -EncodedCommand {}", "A".repeat(8 * 1024));
@@ -1285,6 +1312,15 @@ fn meta_accessor_covers_all_variants() {
             meta: meta.clone(),
             path: String::new(),
             name: String::new(),
+        }),
+        Event::PolicyDenial(PolicyDenialEvent {
+            meta: meta.clone(),
+            mechanism: POLICY_MECHANISM_SELINUX.into(),
+            subject_context: None,
+            object_context: None,
+            object_class: None,
+            action: None,
+            enforced: false,
         }),
     ];
     for e in &events {

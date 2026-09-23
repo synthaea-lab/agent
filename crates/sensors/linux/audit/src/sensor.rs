@@ -52,29 +52,14 @@ impl AuditSensor {
                                 );
 
                                 let schema_event = match &event {
-                                    crate::AuditEvent::Exec { .. } => Some(normalize::exec_event(&event, timestamp_ns)),
-                                    crate::AuditEvent::Connect { .. } => Some(normalize::connect_event(&event, timestamp_ns)),
-                                    // No schema::Event variant yet — same posture as the
-                                    // journal sensor's unit-lifecycle events (issue #93):
-                                    // a Linux-only "policy denial" shape would preempt a
-                                    // cross-platform decision (Windows AppLocker/WDAC,
-                                    // macOS TCC/Gatekeeper denials are the same concept)
-                                    // that hasn't been made yet. Traced instead of
-                                    // dropped silently, unlike before this classifier
-                                    // arm existed at all.
-                                    crate::AuditEvent::PolicyDenial { comm, scontext, tcontext, tclass, permissive } => {
-                                        tracing::info!(
-                                            comm = ?comm, scontext = ?scontext, tcontext = ?tcontext,
-                                            tclass = ?tclass, permissive = *permissive,
-                                            "sensor-linux-audit: SELinux policy denial (not yet wired to schema::Event)"
-                                        );
-                                        None
+                                    crate::AuditEvent::Exec { .. } => normalize::exec_event(&event, timestamp_ns),
+                                    crate::AuditEvent::Connect { .. } => normalize::connect_event(&event, timestamp_ns),
+                                    crate::AuditEvent::PolicyDenial { .. } => {
+                                        normalize::policy_denial_event(&event, timestamp_ns)
                                     }
                                 };
 
-                                if let Some(schema_event) = schema_event {
-                                    sink.on_event(schema_event);
-                                }
+                                sink.on_event(schema_event);
                             }
                         }
                         Err(crate::AuditError::Netlink(errno))

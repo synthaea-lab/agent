@@ -1,7 +1,9 @@
 //! Normalizes `AuditEvent` into `schema::Event`.
 //! Platform-independent, unit-testable on any OS.
 
-use schema::{ConnectEvent, Event, EventMeta, ExecEvent, User};
+use schema::{
+    ConnectEvent, Event, EventMeta, ExecEvent, POLICY_MECHANISM_SELINUX, PolicyDenialEvent, User,
+};
 
 use crate::classify::AuditEvent;
 
@@ -85,6 +87,42 @@ fn comm_from_path(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
+/// Converts `AuditEvent::PolicyDenial` to `schema::Event::PolicyDenial` (#297).
+///
+/// # Panics
+///
+/// Panics if called on a non-`PolicyDenial` event (internal misuse).
+#[must_use]
+pub fn policy_denial_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
+    let AuditEvent::PolicyDenial {
+        comm,
+        scontext,
+        tcontext,
+        tclass,
+        permissive,
+    } = evt
+    else {
+        panic!("normalize::policy_denial_event called on non-PolicyDenial event");
+    };
+
+    Event::PolicyDenial(PolicyDenialEvent {
+        meta: EventMeta {
+            timestamp_ns,
+            pid: 0, // HONEST: the AVC preamble corrupts pid, see AuditEvent::PolicyDenial's doc
+            ppid: 0, // HONEST: audit doesn't provide this
+            user: User::Unknown, // HONEST: classify_avc doesn't extract uid/gid
+            comm: comm.clone().unwrap_or_else(|| "unknown".into()),
+            container: None,
+        },
+        mechanism: POLICY_MECHANISM_SELINUX.into(),
+        subject_context: scontext.clone(),
+        object_context: tcontext.clone(),
+        object_class: tclass.clone(),
+        action: None, // Not yet parsed — see PolicyDenialEvent's doc
+        enforced: !permissive,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -137,6 +175,55 @@ mod tests {
             }
             _ => panic!("expected Event::Connect"),
         }
+    }
+
+    #[test]
+    fn normalize_policy_denial() {
+        let audit_evt = AuditEvent::PolicyDenial {
+            comm: Some("httpd".to_string()),
+            scontext: Some("system_u:system_r:httpd_t:s0".to_string()),
+            tcontext: Some("system_u:object_r:user_home_t:s0".to_string()),
+            tclass: Some("file".to_string()),
+            permissive: false,
+        };
+
+        let schema_evt = policy_denial_event(&audit_evt, 1_756_900_100_000_000_000);
+        match schema_evt {
+            Event::PolicyDenial(e) => {
+                assert_eq!(e.meta.pid, 0); // Honest: AVC preamble corrupts pid
+                assert_eq!(e.meta.comm, "httpd");
+                assert_eq!(e.mechanism, schema::POLICY_MECHANISM_SELINUX);
+                assert_eq!(
+                    e.subject_context.as_deref(),
+                    Some("system_u:system_r:httpd_t:s0")
+                );
+                assert_eq!(
+                    e.object_context.as_deref(),
+                    Some("system_u:object_r:user_home_t:s0")
+                );
+                assert_eq!(e.object_class.as_deref(), Some("file"));
+                assert_eq!(e.action, None);
+                assert!(e.enforced);
+            }
+            _ => panic!("expected Event::PolicyDenial"),
+        }
+    }
+
+    #[test]
+    fn normalize_policy_denial_permissive_mode_is_not_enforced() {
+        let audit_evt = AuditEvent::PolicyDenial {
+            comm: None,
+            scontext: Some("unconfined_u:unconfined_r:unconfined_t:s0".to_string()),
+            tcontext: None,
+            tclass: Some("process".to_string()),
+            permissive: true,
+        };
+
+        let Event::PolicyDenial(e) = policy_denial_event(&audit_evt, 0) else {
+            panic!("expected Event::PolicyDenial");
+        };
+        assert!(!e.enforced);
+        assert_eq!(e.meta.comm, "unknown"); // Honest: no comm on this record
     }
 
     #[test]

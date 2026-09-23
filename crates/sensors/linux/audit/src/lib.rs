@@ -9,9 +9,9 @@
 //!
 //! Also classifies `SELinux` AVC denials (`type=AVC`) — free telemetry, since this
 //! sensor already subscribes to the whole `NETLINK_AUDIT` multicast stream for
-//! execve/connect. Not yet wired to `schema::Event` (see
-//! [`classify::AuditEvent::PolicyDenial`]'s doc for why); traced via `tracing::info!`
-//! in the meantime.
+//! execve/connect. Normalized to `schema::Event::PolicyDenial` (#297) — see
+//! [`classify::AuditEvent::PolicyDenial`]'s doc for what the AVC wire shape
+//! does and doesn't carry.
 
 mod classify;
 mod normalize;
@@ -23,7 +23,7 @@ mod sensor;
 mod socket;
 
 pub use classify::{AuditEvent, classify};
-pub use normalize::{connect_event, exec_event};
+pub use normalize::{connect_event, exec_event, policy_denial_event};
 pub use parse::{AuditRecord, parse_audit_message};
 #[cfg(target_os = "linux")]
 pub use sensor::AuditSensor;

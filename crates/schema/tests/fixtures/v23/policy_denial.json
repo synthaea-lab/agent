@@ -1,0 +1,15 @@
+{
+  "type": "policy_denial",
+  "meta": {
+    "pid": 4242,
+    "ppid": 1337,
+    "user": { "os": "unix", "uid": 48, "gid": 48 },
+    "timestamp_ns": 1756900100000000000,
+    "comm": "httpd"
+  },
+  "mechanism": "selinux",
+  "subject_context": "system_u:system_r:httpd_t:s0",
+  "object_context": "system_u:object_r:user_home_t:s0",
+  "object_class": "file",
+  "enforced": true
+}

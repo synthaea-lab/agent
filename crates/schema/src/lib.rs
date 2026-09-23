@@ -119,7 +119,19 @@ pub mod time;
 /// Originally claimed as 19 → 20 while this branch was open; renumbered once
 /// the macOS stack (#95/#96) took v19-v21 on `main` first — same coordination
 /// note as v13 and ADR-0005.
-pub const SCHEMA_VERSION: u32 = 22;
+///
+/// Bumped 22 → 23 for [`Event::PolicyDenial`] (#297): one new enum variant
+/// for OS-security-mechanism denials, first emitted by `sensor-linux-audit`
+/// from `SELinux` AVC records. Deliberately generic (`mechanism: String`,
+/// not a Linux-only shape) so Windows AppLocker/WDAC (#328) and macOS
+/// TCC/Gatekeeper — which already have their own dedicated `Event` variants,
+/// [`TccDecisionEvent`]/[`GatekeeperVerdictEvent`] from v20 — can reuse it
+/// instead of growing a fourth parallel "denial" family later. Schema-only:
+/// no detection rule ships with this bump, see the issue for why. Same
+/// serialization-visible reasoning as v13-v22. Originally claimed as 21 → 22
+/// while this branch was open; renumbered once #262 Phase 3's xattr telemetry
+/// took v22 on `main` first — same coordination note as v13 and ADR-0005.
+pub const SCHEMA_VERSION: u32 = 23;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -1190,6 +1202,59 @@ pub struct XpcConnectEvent {
     pub domain_type: u32,
 }
 
+/// [`PolicyDenialEvent::mechanism`] value for `SELinux` AVC denials
+/// (`sensor-linux-audit`, #297).
+pub const POLICY_MECHANISM_SELINUX: &str = "selinux";
+
+/// An OS security mechanism denied a subject an action on an object —
+/// `SELinux`/`AppArmor` on Linux, AppLocker/WDAC on Windows, TCC/Gatekeeper on
+/// macOS all report the same underlying shape (issue #297). A dedicated,
+/// generic variant rather than folding this into [`FileOpenEvent`]: unlike
+/// #224's persistence reuse of `FileOpenEvent` (where the denied artifact
+/// really was a file open), a policy denial's `object_class` ranges over
+/// file/process/socket/capability/... — forcing it into a file-shaped event
+/// would misrepresent every non-file denial. `mechanism` is a plain `String`,
+/// not a closed enum: new platforms' mechanisms (AppLocker/WDAC, TCC/
+/// Gatekeeper) are additive data here, not a schema change, matching how
+/// [`AuthKind`] stays coarse rather than growing a variant per OS event ID.
+///
+/// First emitted by `sensor-linux-audit` from `SELinux` AVC records
+/// (`type=AVC`). `action` is `None` for now: the kernel's AVC message body
+/// (`avc: denied { read } for pid=...`) is text, not `key=value`, before the
+/// first real field, so the shared audit parser's byte scan doesn't yet
+/// recover the requested permission set — see
+/// `sensor_linux_audit::classify::AuditEvent::PolicyDenial`'s doc. Tracked
+/// separately; this event ships without it rather than block the schema on
+/// that parser fix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyDenialEvent {
+    pub meta: EventMeta,
+    /// Which security mechanism denied the action — see
+    /// [`POLICY_MECHANISM_SELINUX`] for the one value emitted today.
+    pub mechanism: String,
+    /// The acting subject's security context (`SELinux` `scontext`, e.g.
+    /// `system_u:system_r:httpd_t:s0`). Opaque per-mechanism label syntax —
+    /// left as the platform reports it, not parsed into sub-fields, since
+    /// Windows/macOS mechanisms don't share `SELinux`'s context-string shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_context: Option<String>,
+    /// The target object's security context (`SELinux` `tcontext`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_context: Option<String>,
+    /// The kind of object the action targeted (`SELinux` `tclass`: `file`,
+    /// `process`, `tcp_socket`, `capability`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_class: Option<String>,
+    /// The permission that was requested (`SELinux` `{ read }` etc.). `None`
+    /// until the AVC parser recovers it — see this type's doc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// `true` when the mechanism actually blocked the action (`SELinux`
+    /// enforcing mode); `false` when it only logged what it would have
+    /// blocked (`SELinux` permissive mode) — `!permissive` at the source.
+    pub enforced: bool,
+}
+
 /// The normalized event envelope.
 ///
 /// `#[non_exhaustive]`: new telemetry categories (registry, DNS, image load, ...) are
@@ -1235,6 +1300,7 @@ pub enum Event {
     XpcConnect(XpcConnectEvent),
     FileSetxattr(FileSetxattrEvent),
     FileRemovexattr(FileRemovexattrEvent),
+    PolicyDenial(PolicyDenialEvent),
 }
 
 impl Event {
@@ -1278,6 +1344,7 @@ impl Event {
             Event::XpcConnect(e) => &e.meta,
             Event::FileSetxattr(e) => &e.meta,
             Event::FileRemovexattr(e) => &e.meta,
+            Event::PolicyDenial(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.
