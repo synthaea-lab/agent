@@ -98,8 +98,17 @@ mod integration_tests {
             .check_release_version(layout.current_release_version())
             .unwrap();
         layout.verify_staged(&manifest).unwrap();
+        layout.persist_manifest(&manifest).unwrap();
         layout.promote(2).unwrap();
         assert_eq!(layout.current_release_version(), Some(2));
+
+        // A later, unrelated process (the agent's periodic self-integrity check,
+        // issue #71) reads the manifest back from disk and re-verifies its
+        // signature before trusting it as a root of trust — the exact sequence
+        // `agent::integrity` runs on a cadence.
+        let reloaded = layout.read_manifest(2).unwrap();
+        assert_eq!(reloaded, manifest);
+        reloaded.verify_signature().unwrap();
 
         // Release 2's health check fails: roll back to release 1, ban release 2.
         let ban_list_path = base.path().join("banned_versions.json");

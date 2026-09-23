@@ -59,6 +59,10 @@ sensor-linux-lsm = { path = "../crates/sensors/linux/lsm" }
 # itself uses.
 aya = { version = "0.14", default-features = false }
 libc = "0.2"
+# `updater::layout` (the bootstrap/current/versions layout `crate::integrity`
+# reads the persisted release manifest through) is itself Linux-only, per
+# CLAUDE.md's platform-code exception for this crate.
+updater = { path = "../crates/updater" }
 
 [dev-dependencies]
 schema = { path = "../crates/schema", features = ["test-fixtures"] }

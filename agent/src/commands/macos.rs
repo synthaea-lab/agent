@@ -240,15 +240,17 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
 /// the Linux path but not wired here (same posture as Windows): kill/quarantine
 /// is issue #25's Linux-first scope, and TLS/readline capture is a Linux uprobe
 /// mechanism with no ES equivalent.
-pub(crate) fn cmd_run(
-    alerts: &std::path::Path,
-    events: &std::path::Path,
-    _enable_kill: bool,
-    _enable_quarantine: bool,
-    _enable_tls_capture: bool,
-    _enable_readline_capture: bool,
-    server: Option<&str>,
-) -> anyhow::Result<()> {
+pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
+    let super::RunOptions {
+        alerts,
+        events,
+        state_dir: _,
+        enable_kill: _,
+        enable_quarantine: _,
+        enable_tls_capture: _,
+        enable_readline_capture: _,
+        server,
+    } = opts;
     let pipeline = super::common::wire_run_pipeline(seeded_rule_state(), alerts, events, server)?;
     run_macos_sensors(Box::new(SharedSink(pipeline.sink)))
 }

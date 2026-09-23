@@ -14,6 +14,35 @@ mod macos;
 #[cfg(windows)]
 mod windows;
 
+/// Everything `cmd_run` needs, bundled so the function stays under clippy's
+/// argument-count lint — `state_dir` (#30/#71, the updater base directory
+/// `crate::integrity` reads the persisted release manifest from) was the eighth
+/// positional parameter, past the seventh clippy already flags. Every platform's
+/// `cmd_run` takes the same struct, even the ones that only use part of it — same
+/// "accepted for parity, inert here" posture the individual fields already had.
+pub(crate) struct RunOptions<'a> {
+    pub(crate) alerts: &'a std::path::Path,
+    pub(crate) events: &'a std::path::Path,
+    // Read only by `linux::cmd_run` (integrity monitoring, response, uprobes
+    // capture — all Linux-only mechanisms); `windows`/`macos::cmd_run` destructure
+    // and discard them for CLI-signature parity, same "accepted, inert here"
+    // posture the individual parameters had before this struct existed. Bundling
+    // them turns that per-platform inertness into a whole-field dead-code
+    // finding on any target that isn't Linux, unlike a bare unused fn parameter —
+    // hence the explicit allow rather than relying on the `_` destructuring alone.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) state_dir: &'a std::path::Path,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) enable_kill: bool,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) enable_quarantine: bool,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) enable_tls_capture: bool,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) enable_readline_capture: bool,
+    pub(crate) server: Option<&'a str>,
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{cmd_capture_baseline, cmd_capture_events, cmd_run, cmd_status};
 #[cfg(target_os = "macos")]
@@ -31,15 +60,7 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-pub(crate) fn cmd_run(
-    _alerts: &std::path::Path,
-    _events: &std::path::Path,
-    _enable_kill: bool,
-    _enable_quarantine: bool,
-    _enable_tls_capture: bool,
-    _enable_readline_capture: bool,
-    _server: Option<&str>,
-) -> anyhow::Result<()> {
+pub(crate) fn cmd_run(_opts: RunOptions) -> anyhow::Result<()> {
     anyhow::bail!(UNSUPPORTED_PLATFORM)
 }
 

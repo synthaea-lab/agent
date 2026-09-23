@@ -200,15 +200,17 @@ fn can_use_ebpf() -> bool {
 /// it). Both feed the same `DetectionSink`, shared via `Arc` (`schema::sensor`'s
 /// blanket `EventSink for Arc<T>`) since `LinuxSensor::run` needs to own its sink
 /// for `Sensor`'s lifetime but the poller thread outlives no particular caller.
-pub(crate) fn cmd_run(
-    alerts: &std::path::Path,
-    events: &std::path::Path,
-    enable_kill: bool,
-    enable_quarantine: bool,
-    enable_tls_capture: bool,
-    enable_readline_capture: bool,
-    server: Option<&str>,
-) -> anyhow::Result<()> {
+pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
+    let super::RunOptions {
+        alerts,
+        events,
+        state_dir,
+        enable_kill,
+        enable_quarantine,
+        enable_tls_capture,
+        enable_readline_capture,
+        server,
+    } = opts;
     // Kill-loudness (#71): must run before any other thread exists — the signal mask
     // set here is inherited by every thread spawned below, including `DetectionSink`'s
     // own worker threads.
@@ -281,6 +283,13 @@ pub(crate) fn cmd_run(
         }
     }
     crate::silence::spawn_monitor(silence_monitor.clone(), sink.clone());
+
+    // Self-integrity verification (#71/#30): periodic re-check of the installed
+    // binaries against the signed release manifest `updater` persisted at promote
+    // time — the real root of trust the heartbeat above cannot provide (silence
+    // proves a sensor stopped producing, not that the binary producing it is the
+    // one that was actually shipped).
+    crate::integrity::spawn_monitor(state_dir.to_path_buf(), sink.clone());
 
     // Spawn health beacon thread — emits periodic self-diagnostics to the control
     // plane (issue #134). Sensor health is now the real silence-monitor snapshot

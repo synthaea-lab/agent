@@ -125,6 +125,62 @@ impl Layout {
         Ok(())
     }
 
+    /// Name of the manifest file [`Self::persist_manifest`]/[`Self::read_manifest`]
+    /// read and write, directly under `version_dir(manifest.release_version)`.
+    const MANIFEST_FILE: &'static str = "manifest.json";
+
+    /// Writes `manifest` to `version_dir(manifest.release_version)/manifest.json` —
+    /// the durable copy issue #71's periodic self-integrity check reads back later,
+    /// after this process (and the download that staged the release) is long gone.
+    /// Call after [`Self::verify_staged`] succeeds, before or alongside
+    /// [`Self::promote`]; this crate does not bundle the write into either of those
+    /// so a caller that only wants to stage-and-verify (without ever promoting,
+    /// e.g. a dry run) is not forced to leave a manifest file behind.
+    ///
+    /// # Errors
+    ///
+    /// [`UpdaterError::Io`] if the version directory does not exist or the write
+    /// fails.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: [`ReleaseManifest`] contains no type `serde_json` cannot
+    /// serialize (same invariant `ReleaseManifest`'s own `canonical_bytes` relies
+    /// on).
+    pub fn persist_manifest(&self, manifest: &ReleaseManifest) -> Result<(), UpdaterError> {
+        let path = self
+            .version_dir(manifest.release_version)
+            .join(Self::MANIFEST_FILE);
+        let bytes = serde_json::to_vec_pretty(manifest)
+            .expect("ReleaseManifest has no non-serializable content");
+        fs::write(&path, bytes).map_err(|source| UpdaterError::Io { path, source })
+    }
+
+    /// Reads back the manifest [`Self::persist_manifest`] wrote for `release_version`.
+    /// Does not verify the signature or re-check staged files — same division of
+    /// labor as [`Self::verify_staged`]: this reads bytes back, the caller decides
+    /// whether to trust them (call [`ReleaseManifest::verify_signature`] on the
+    /// result before treating it as a root of trust — a manifest file readable from
+    /// disk is not the same as one this install actually verified and promoted).
+    ///
+    /// # Errors
+    ///
+    /// [`UpdaterError::Io`] if the file cannot be read (including "does not
+    /// exist" — callers checking the *currently active* release should consult
+    /// [`Self::current_release_version`] first and skip the read entirely on
+    /// `None`, the honest bootstrap/day-0 case where nothing was ever promoted).
+    /// [`UpdaterError::ManifestCorrupt`] if the file exists but is not a valid
+    /// [`ReleaseManifest`].
+    pub fn read_manifest(&self, release_version: u64) -> Result<ReleaseManifest, UpdaterError> {
+        let path = self.version_dir(release_version).join(Self::MANIFEST_FILE);
+        let bytes = fs::read(&path).map_err(|source| UpdaterError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        serde_json::from_slice(&bytes)
+            .map_err(|source| UpdaterError::ManifestCorrupt { path, source })
+    }
+
     /// Atomically repoints `current` at `version_dir(release_version)`
     /// (ADR-0015 Decision 5).
     ///
@@ -295,6 +351,35 @@ mod tests {
         assert!(matches!(
             layout.verify_staged(&manifest),
             Err(UpdaterError::StagedFileMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_persisted_manifest_round_trips_through_read() {
+        let (_dir, layout) = layout();
+        let manifest = manifest_for(&layout.version_dir(4), 4);
+        layout.persist_manifest(&manifest).unwrap();
+        assert_eq!(layout.read_manifest(4).unwrap(), manifest);
+    }
+
+    #[test]
+    fn read_manifest_fails_for_a_version_with_no_persisted_manifest() {
+        let (_dir, layout) = layout();
+        fs::create_dir_all(layout.version_dir(7)).unwrap();
+        assert!(matches!(
+            layout.read_manifest(7),
+            Err(UpdaterError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn read_manifest_reports_corrupt_json_distinctly_from_a_missing_file() {
+        let (_dir, layout) = layout();
+        fs::create_dir_all(layout.version_dir(9)).unwrap();
+        fs::write(layout.version_dir(9).join("manifest.json"), b"not json").unwrap();
+        assert!(matches!(
+            layout.read_manifest(9),
+            Err(UpdaterError::ManifestCorrupt { .. })
         ));
     }
 

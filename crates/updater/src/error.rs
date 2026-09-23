@@ -49,4 +49,14 @@ pub enum UpdaterError {
         #[source]
         source: std::io::Error,
     },
+
+    /// A persisted manifest file exists but is not valid JSON, or does not
+    /// deserialize as a [`crate::ReleaseManifest`] — a corrupt or truncated write,
+    /// never expected from this crate's own [`crate::layout::Layout::persist_manifest`].
+    #[error("manifest at {path} is corrupt: {source}")]
+    ManifestCorrupt {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
 }

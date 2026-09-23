@@ -141,17 +141,19 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
 /// `enable_readline_capture` (issue #90) are Linux-uprobe-specific — ETW would need
 /// its own, unrelated mechanism — so they're accepted for parity only, same as the
 /// response flags.
-pub(crate) fn cmd_run(
-    alerts: &std::path::Path,
-    events: &std::path::Path,
-    _enable_kill: bool,
-    _enable_quarantine: bool,
-    // uprobes are a Linux mechanism — the capture flags are accepted for CLI
-    // parity and inert here, same as the response flags above.
-    _enable_tls_capture: bool,
-    _enable_readline_capture: bool,
-    server: Option<&str>,
-) -> anyhow::Result<()> {
+pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
+    let super::RunOptions {
+        alerts,
+        events,
+        state_dir: _,
+        enable_kill: _,
+        enable_quarantine: _,
+        // uprobes are a Linux mechanism — the capture flags are accepted for CLI
+        // parity and inert here, same as the response flags above.
+        enable_tls_capture: _,
+        enable_readline_capture: _,
+        server,
+    } = opts;
     let pipeline = super::common::wire_run_pipeline(seeded_rule_state(), alerts, events, server)?;
     run_windows_sensors(Box::new(SharedSink(pipeline.sink)))
 }

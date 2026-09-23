@@ -9,6 +9,9 @@
 //! and the output sinks; `heartbeat` the progress-backed liveness signal the
 //! watchdog polls (#102); `silence` per-sensor silence detection via
 //! `tamper::heartbeat`, wired into the health beacon and a real local alert (#71);
+//! `integrity` periodic re-verification of the installed binaries against the
+//! signed release manifest `updater` persisted at promote time — the real root of
+//! trust `silence` alone cannot provide (#71/#30, Linux only);
 //! `protected` watches the agent's own on-disk footprint for a foreign writer (#71);
 //! `kill_loudness` attributes who sent a catchable termination signal before the
 //! agent actually dies (#71).
@@ -26,6 +29,8 @@ mod heartbeat;
 // Windows, and `agent/Cargo.toml` only pulls `libc` in under
 // `cfg(target_os = "linux")` — unlike `heartbeat`/`sink` above, there's no
 // cross-platform body here to keep alive with an `allow(dead_code)`.
+#[cfg(target_os = "linux")]
+mod integrity;
 #[cfg(target_os = "linux")]
 mod journal_cursor;
 #[cfg(target_os = "linux")]
@@ -157,15 +162,16 @@ fn main() -> anyhow::Result<()> {
             enable_tls_capture,
             enable_readline_capture,
             server,
-        } => commands::cmd_run(
-            &alerts,
-            &events,
+        } => commands::cmd_run(commands::RunOptions {
+            alerts: &alerts,
+            events: &events,
+            state_dir: &cfg.storage.state_dir,
             enable_kill,
             enable_quarantine,
             enable_tls_capture,
             enable_readline_capture,
-            server.as_deref(),
-        ),
+            server: server.as_deref(),
+        }),
         Command::CaptureBaseline { output } => commands::cmd_capture_baseline(&output),
         Command::CaptureEvents { output } => commands::cmd_capture_events(&output),
     }
