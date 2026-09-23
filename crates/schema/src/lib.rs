@@ -112,7 +112,14 @@ pub mod time;
 /// precedent. Same serialization-visible reasoning as v13-v20. Originally
 /// claimed as 19 → 20 while #96's branch was open; renumbered with the rest
 /// of the macOS stack when `SocketAccept` took v19 on `main` first.
-pub const SCHEMA_VERSION: u32 = 21;
+///
+/// Bumped 21 → 22 for [`Event::FileSetxattr`] and [`Event::FileRemovexattr`]
+/// (#262 Phase 3): two new enum variants for Linux extended-attribute
+/// telemetry (`setxattr(2)`/`removexattr(2)`). Same reasoning as v13-v21.
+/// Originally claimed as 19 → 20 while this branch was open; renumbered once
+/// the macOS stack (#95/#96) took v19-v21 on `main` first — same coordination
+/// note as v13 and ADR-0005.
+pub const SCHEMA_VERSION: u32 = 22;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -530,6 +537,30 @@ pub struct FileChownEvent {
     pub uid: u32,
     /// New owner gid, same "leave unchanged" sentinel as `uid`.
     pub gid: u32,
+}
+
+/// Extended attribute set (issue #262 Phase 3): `setxattr(2)`. `lsetxattr(2)`/
+/// `fsetxattr(2)` (symlink/fd-only variants) are deferred — same posture as
+/// `chmod`/`chown`'s fd-only siblings. `name` only, not the attribute's `value` —
+/// see `sensor-linux-wire::FileSetxattrEvent`'s doc. `name == "security.capability"`
+/// is the Linux file-capability grant `setcap` writes — functionally the
+/// extended-attribute equivalent of `chmod +s` (T1222.002).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSetxattrEvent {
+    pub meta: EventMeta,
+    pub path: String,
+    pub name: String,
+}
+
+/// Extended attribute removal (issue #262 Phase 3): `removexattr(2)`. Same
+/// deferred symlink/fd-variant posture as [`FileSetxattrEvent`]. Removing
+/// `security.selinux` or `security.capability` from a binary is an anti-forensics/
+/// evasion signal in its own right, independent of what `setxattr` ever wrote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRemovexattrEvent {
+    pub meta: EventMeta,
+    pub path: String,
+    pub name: String,
 }
 
 /// Socket bind (issue #263): `bind(2)`, `AF_INET`/`AF_INET6` only — a discrete,
@@ -1202,6 +1233,8 @@ pub enum Event {
     Mount(MountEvent),
     Signal(SignalEvent),
     XpcConnect(XpcConnectEvent),
+    FileSetxattr(FileSetxattrEvent),
+    FileRemovexattr(FileRemovexattrEvent),
 }
 
 impl Event {
@@ -1243,6 +1276,8 @@ impl Event {
             Event::Mount(e) => &e.meta,
             Event::Signal(e) => &e.meta,
             Event::XpcConnect(e) => &e.meta,
+            Event::FileSetxattr(e) => &e.meta,
+            Event::FileRemovexattr(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.

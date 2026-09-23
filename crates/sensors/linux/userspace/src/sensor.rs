@@ -174,9 +174,11 @@ impl LinuxSensor {
         let mut udp_send_ring_buf = ring("UDP_SEND_EVENTS")?;
         let mut socket_listen_ring_buf = ring("SOCKET_LISTEN_EVENTS")?;
         let mut socket_accept_ring_buf = ring("SOCKET_ACCEPT_EVENTS")?;
+        let mut file_setxattr_ring_buf = ring("FILE_SETXATTR_EVENTS")?;
+        let mut file_removexattr_ring_buf = ring("FILE_REMOVEXATTR_EVENTS")?;
 
         tracing::info!(
-            "sensor-linux: listening for exec/open/connect/write/delete/rename/bind/chmod/chown/udp_send/listen/accept events"
+            "sensor-linux: listening for exec/open/connect/write/delete/rename/bind/chmod/chown/udp_send/listen/accept/setxattr/removexattr events"
         );
 
         let mut container_ids = CgroupIdCache::new();
@@ -263,6 +265,18 @@ impl LinuxSensor {
                     drain!(guard, sensor_linux_wire::SocketAcceptEvent, sink, own_pid,
                         |e: &sensor_linux_wire::SocketAcceptEvent| {
                             normalize::socket_accept(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = file_setxattr_ring_buf.readable_mut() => {
+                    drain!(guard, sensor_linux_wire::FileSetxattrEvent, sink,
+                        |e: &sensor_linux_wire::FileSetxattrEvent| {
+                            normalize::file_setxattr(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = file_removexattr_ring_buf.readable_mut() => {
+                    drain!(guard, sensor_linux_wire::FileRemovexattrEvent, sink,
+                        |e: &sensor_linux_wire::FileRemovexattrEvent| {
+                            normalize::file_removexattr(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
             }

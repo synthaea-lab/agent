@@ -7,8 +7,8 @@
 
 use schema::{
     ConnectEvent, ContainerContext, Event, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent,
-    FileDeleteEvent, FileOpenEvent, FileRenameEvent, FileWriteEvent, SocketAcceptEvent,
-    SocketBindEvent, SocketListenEvent, UdpSendEvent, User,
+    FileDeleteEvent, FileOpenEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
+    FileWriteEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, UdpSendEvent, User,
 };
 use sensor_linux_wire as wire;
 
@@ -43,7 +43,12 @@ use sensor_linux_wire as wire;
 /// v11 (#263 Phase 2) added `SocketAcceptEvent` — new `socket_accept` mapping
 /// function below, same address-family logic as `connect`/`socket_bind`; no
 /// existing mapping changed shape.
-const _: () = assert!(wire::WIRE_VERSION == 11);
+///
+/// v12 (#262 Phase 3) added `FileSetxattrEvent`/`FileRemovexattrEvent` — new
+/// mapping functions `file_setxattr`/`file_removexattr` below, same path-decoding
+/// shape as `file_chmod`/`file_chown` plus a second nul-padded field (the xattr
+/// `name`); no existing mapping changed shape.
+const _: () = assert!(wire::WIRE_VERSION == 12);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
@@ -203,6 +208,52 @@ pub fn file_chown(
         path: String::from_utf8_lossy(&raw[..end]).into_owned(),
         uid: event.uid,
         gid: event.gid,
+    })
+}
+
+#[must_use]
+pub fn file_setxattr(
+    event: &wire::FileSetxattrEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    let path_raw = &event.path[..(event.path_len as usize).min(wire::MAX_PATH_LEN)];
+    let path_end = path_raw
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(path_raw.len());
+    let name_raw = &event.name[..(event.name_len as usize).min(wire::MAX_XATTR_NAME_LEN)];
+    let name_end = name_raw
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(name_raw.len());
+    Event::FileSetxattr(FileSetxattrEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        path: String::from_utf8_lossy(&path_raw[..path_end]).into_owned(),
+        name: String::from_utf8_lossy(&name_raw[..name_end]).into_owned(),
+    })
+}
+
+#[must_use]
+pub fn file_removexattr(
+    event: &wire::FileRemovexattrEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    let path_raw = &event.path[..(event.path_len as usize).min(wire::MAX_PATH_LEN)];
+    let path_end = path_raw
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(path_raw.len());
+    let name_raw = &event.name[..(event.name_len as usize).min(wire::MAX_XATTR_NAME_LEN)];
+    let name_end = name_raw
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(name_raw.len());
+    Event::FileRemovexattr(FileRemovexattrEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        path: String::from_utf8_lossy(&path_raw[..path_end]).into_owned(),
+        name: String::from_utf8_lossy(&name_raw[..name_end]).into_owned(),
     })
 }
 
@@ -596,6 +647,50 @@ mod tests {
         assert_eq!(e.path, "/tmp/backdoor");
         assert_eq!(e.uid, 0);
         assert_eq!(e.gid, 1000);
+    }
+
+    #[test]
+    fn file_setxattr_carries_path_and_name_distinctly() {
+        let mut path = [0u8; wire::MAX_PATH_LEN];
+        let raw_path = b"/tmp/backdoor\0";
+        path[..raw_path.len()].copy_from_slice(raw_path);
+        let mut name = [0u8; wire::MAX_XATTR_NAME_LEN];
+        let raw_name = b"security.capability\0";
+        name[..raw_name.len()].copy_from_slice(raw_name);
+        let event = wire::FileSetxattrEvent {
+            meta: wire_meta(b"setcap"),
+            path,
+            path_len: raw_path.len() as u16,
+            name,
+            name_len: raw_name.len() as u16,
+        };
+        let Event::FileSetxattr(e) = file_setxattr(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.path, "/tmp/backdoor");
+        assert_eq!(e.name, "security.capability");
+    }
+
+    #[test]
+    fn file_removexattr_carries_path_and_name_distinctly() {
+        let mut path = [0u8; wire::MAX_PATH_LEN];
+        let raw_path = b"/tmp/backdoor\0";
+        path[..raw_path.len()].copy_from_slice(raw_path);
+        let mut name = [0u8; wire::MAX_XATTR_NAME_LEN];
+        let raw_name = b"security.selinux\0";
+        name[..raw_name.len()].copy_from_slice(raw_name);
+        let event = wire::FileRemovexattrEvent {
+            meta: wire_meta(b"evade"),
+            path,
+            path_len: raw_path.len() as u16,
+            name,
+            name_len: raw_name.len() as u16,
+        };
+        let Event::FileRemovexattr(e) = file_removexattr(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.path, "/tmp/backdoor");
+        assert_eq!(e.name, "security.selinux");
     }
 
     #[test]

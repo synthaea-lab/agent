@@ -11,11 +11,12 @@ use std::net::IpAddr;
 use schema::{
     AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, ConnectEvent, DnsQueryEvent, Event,
     EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent,
-    FileQuarantineEvent, FileRenameEvent, FileWriteEvent, GatekeeperVerdictEvent, ImageLoadEvent,
-    ListenPortEvent, MountEvent, NetworkFlowEvent, ReadlineInputEvent, RegistrySetEvent,
-    ScriptBlockEvent, ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
-    SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
-    UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
+    FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent,
+    GatekeeperVerdictEvent, ImageLoadEvent, ListenPortEvent, MountEvent, NetworkFlowEvent,
+    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType, SignalEvent,
+    SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TccDecisionEvent,
+    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
+    XpcConnectEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -756,6 +757,48 @@ fn file_chown_golden() {
 }
 
 #[test]
+fn file_setxattr_golden() {
+    // v20 (#262 Phase 3): security.capability grant on a binary outside the usual
+    // package-managed paths — the extended-attribute equivalent of chmod +s.
+    assert_golden(
+        &Event::FileSetxattr(FileSetxattrEvent {
+            meta: EventMeta {
+                pid: 9003,
+                ppid: 9000,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_016_000_000_000,
+                comm: "setcap".into(),
+                container: None,
+            },
+            path: "/tmp/backdoor".into(),
+            name: "security.capability".into(),
+        }),
+        "file_setxattr",
+    );
+}
+
+#[test]
+fn file_removexattr_golden() {
+    // v20 (#262 Phase 3): stripping security.selinux off a binary — anti-forensics/
+    // evasion, independent of anything setxattr ever wrote.
+    assert_golden(
+        &Event::FileRemovexattr(FileRemovexattrEvent {
+            meta: EventMeta {
+                pid: 9004,
+                ppid: 9000,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_017_000_000_000,
+                comm: "evade".into(),
+                container: None,
+            },
+            path: "/tmp/backdoor".into(),
+            name: "security.selinux".into(),
+        }),
+        "file_removexattr",
+    );
+}
+
+#[test]
 fn socket_listen_golden() {
     // v18 (#263 Phase 2): listen(2) with a correlated bind() address — the common
     // case (backdoor bind-then-listen), addr_resolved: true on the wire side.
@@ -1232,6 +1275,16 @@ fn meta_accessor_covers_all_variants() {
             accepted_fd: 0,
             peer_addr: "0.0.0.0".parse::<IpAddr>().unwrap(),
             peer_port: 0,
+        }),
+        Event::FileSetxattr(FileSetxattrEvent {
+            meta: meta.clone(),
+            path: String::new(),
+            name: String::new(),
+        }),
+        Event::FileRemovexattr(FileRemovexattrEvent {
+            meta: meta.clone(),
+            path: String::new(),
+            name: String::new(),
         }),
     ];
     for e in &events {

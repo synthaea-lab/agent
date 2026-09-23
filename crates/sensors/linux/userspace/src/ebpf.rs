@@ -35,6 +35,10 @@ pub(crate) fn err(msg: String) -> SensorError {
 /// sensor's first `sys_exit_*` attachments — `accept`/`accept4`'s peer address is
 /// only populated once the kernel-side call returns, so the enter and exit halves
 /// are attached as a pair (`ebpf/src/main.rs`'s `ACCEPT_ARGS` map correlates them).
+///
+/// `sys_enter_setxattr`/`sys_enter_removexattr` (issue #262 Phase 3) cover the
+/// plain path-taking syscalls only — `lsetxattr`/`fsetxattr` (symlink/fd-only
+/// variants) are deferred, same posture as `chmod`/`chown`'s fd-only siblings.
 pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
     ("sched_process_fork", "sched", "sched_process_fork"),
     ("sched_process_exit", "sched", "sched_process_exit"),
@@ -60,6 +64,8 @@ pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
     ("sys_enter_accept4", "syscalls", "sys_enter_accept4"),
     ("sys_exit_accept", "syscalls", "sys_exit_accept"),
     ("sys_exit_accept4", "syscalls", "sys_exit_accept4"),
+    ("sys_enter_setxattr", "syscalls", "sys_enter_setxattr"),
+    ("sys_enter_removexattr", "syscalls", "sys_enter_removexattr"),
 ];
 
 /// `sensor_linux_wire::LineageEntry` is `repr(C)` over a `u32` and a `[u8; 16]` — every

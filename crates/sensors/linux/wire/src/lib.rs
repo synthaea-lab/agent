@@ -79,10 +79,25 @@ extern crate std;
 ///   `sys_exit_accept{,4}` reads the return value (the new fd, or a negative errno)
 ///   and, on success, the now-populated sockaddr from the stashed pointer. Only
 ///   emitted on success — a failed `accept()` has no peer to report.
-pub const WIRE_VERSION: u32 = 11;
+/// - v12: `FileSetxattrEvent`/`FileRemovexattrEvent` added (issue #262 Phase 3) —
+///   `setxattr(2)`/`removexattr(2)` only (the `l`/`f` fd/symlink-only variants are
+///   deferred, same posture as `chmod`/`chown`'s fd-only siblings). Captures the
+///   xattr `name` (e.g. `security.capability` — the Linux file-capability grant
+///   `setcap` writes, functionally the "+s" of extended attributes) but not
+///   `value`: the namespace+attribute name is what most detections need, and
+///   `value` is an arbitrary-length secondary read this slice does not add.
+pub const WIRE_VERSION: u32 = 12;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
+/// Maximum captured length of an xattr name (issue #262 Phase 3): the kernel's own
+/// `XATTR_NAME_MAX`. Real names (`security.capability`, `security.selinux`,
+/// `user.some_marker`, `trusted.overlay.origin`) are far shorter, but capturing the
+/// kernel's actual ceiling rather than a smaller "should be enough" guess means
+/// there is no truncation case to silently misreport — an attacker who picked an
+/// unusually long name (evasion, or just an unusual but legitimate tool) is exactly
+/// the case a smaller buffer would have hidden (review finding, PR #332).
+pub const MAX_XATTR_NAME_LEN: usize = 255;
 /// Budget for TLS plaintext capture (first N bytes). Chosen to fit comfortably
 /// in a ring-buffer event with metadata while staying under 512 bytes total.
 pub const MAX_TLS_CAPTURE: usize = 256;
@@ -222,6 +237,34 @@ pub struct FileChownEvent {
     pub path_len: u16,
     pub uid: u32,
     pub gid: u32,
+}
+
+/// Extended attribute set (`syscalls:sys_enter_setxattr`, issue #262 Phase 3). `path`
+/// is the raw path passed by the caller — same known limitation as
+/// `FileOpenEvent::path`. `lsetxattr(2)`/`fsetxattr(2)` (symlink/fd-only variants)
+/// are deferred, same posture as `chmod`/`chown`'s fd-only siblings. `name` only,
+/// not `value` — see this file's `WIRE_VERSION` v12 changelog.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FileSetxattrEvent {
+    pub meta: EventMeta,
+    pub path: [u8; MAX_PATH_LEN],
+    pub path_len: u16,
+    pub name: [u8; MAX_XATTR_NAME_LEN],
+    pub name_len: u16,
+}
+
+/// Extended attribute removal (`syscalls:sys_enter_removexattr`, issue #262 Phase 3).
+/// Same path/name capture and same deferred fd/symlink-variant posture as
+/// `FileSetxattrEvent`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FileRemovexattrEvent {
+    pub meta: EventMeta,
+    pub path: [u8; MAX_PATH_LEN],
+    pub path_len: u16,
+    pub name: [u8; MAX_XATTR_NAME_LEN],
+    pub name_len: u16,
 }
 
 /// Outbound network connection (`syscalls:sys_enter_connect`, `AF_INET/AF_INET6` only).

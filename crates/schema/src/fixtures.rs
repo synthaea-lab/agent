@@ -29,11 +29,11 @@ use core::net::{IpAddr, Ipv4Addr};
 
 use crate::{
     AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, ConnectEvent, DnsQueryEvent, EventMeta,
-    ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent, FileRenameEvent,
-    FileWriteEvent, ImageLoadEvent, ListenPortEvent, NetworkFlowEvent, ReadlineInputEvent,
-    RegistrySetEvent, ScriptBlockEvent, ShellType, SmbConnectEvent, SocketAcceptEvent,
-    SocketBindEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
-    UdpSendEvent, User, WmiActivityEvent,
+    ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent,
+    FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent, ImageLoadEvent,
+    ListenPortEvent, NetworkFlowEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
+    ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent,
+    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -292,6 +292,26 @@ pub fn file_chown() -> FileChownEvent {
         path: String::new(),
         uid: 0,
         gid: 0,
+    }
+}
+
+/// Neutral [`FileSetxattrEvent`].
+#[must_use]
+pub fn file_setxattr() -> FileSetxattrEvent {
+    FileSetxattrEvent {
+        meta: meta(),
+        path: String::new(),
+        name: String::new(),
+    }
+}
+
+/// Neutral [`FileRemovexattrEvent`].
+#[must_use]
+pub fn file_removexattr() -> FileRemovexattrEvent {
+    FileRemovexattrEvent {
+        meta: meta(),
+        path: String::new(),
+        name: String::new(),
     }
 }
 
