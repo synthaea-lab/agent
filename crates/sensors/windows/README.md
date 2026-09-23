@@ -16,6 +16,7 @@ Coverage targets (from the Windows coverage audit, priority order):
 | Script content | AMSI ETW + PowerShell script-block | `etw/` — P8 |
 | WMI activity | WMI-Activity ETW | `etw/` |
 | TCP in/outbound, IPv6 | Kernel-Network ETW | `etw/` |
+| Listening ports (LISTENER-DRIFT baseline) | `GetExtendedTcpTable` snapshots | `sockets/` — #366 |
 | Logon/session/token | Security auditing (`wevtutil` polling, not ETW — see ADR-0004) | `eventlog/` — #94 |
 | File reads/deletes/renames, named pipes | minifilter | `driver/` — LT |
 | Injection/memory ops | Threat-Intelligence ETW (needs PPL) | `driver/` — LT |

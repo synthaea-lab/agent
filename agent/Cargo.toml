@@ -35,6 +35,7 @@ tracing-subscriber = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 sensor-windows = { path = "../crates/sensors/windows/etw" }
 sensor-windows-eventlog = { path = "../crates/sensors/windows/eventlog" }
+sensor-windows-sockets = { path = "../crates/sensors/windows/sockets" }
 ctrlc = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]

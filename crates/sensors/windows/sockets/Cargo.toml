@@ -1,0 +1,23 @@
+[package]
+name = "sensor-windows-sockets"
+version = "0.1.0"
+description = "Windows socket-table snapshots (GetExtendedTcpTable): listening ports + baseline"
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+schema = { path = "../../../schema" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_System_Diagnostics_ToolHelp",
+] }

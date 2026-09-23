@@ -29,8 +29,14 @@ macro_rules! skip_test {
 }
 
 fn unique_endpoint() -> String {
-    // A per-run identifier so parallel `cargo test` runs and repeat
-    // invocations don't collide on the pipe / socket path.
+    // pid + nanos separates runs; the per-process counter separates the
+    // tests of one run, which cargo starts in parallel threads. Without
+    // it both tests could land in the same SystemTime tick (100 ns on
+    // Windows) and share a pipe name: the second bind then fails with
+    // ACCESS_DENIED (`first_pipe_instance`) and its client hits the
+    // other test's busy pipe — seen as a ~50% flake in the gauntlet.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -38,12 +44,19 @@ fn unique_endpoint() -> String {
         .unwrap_or(0);
     #[cfg(windows)]
     {
-        format!(r"\\.\pipe\synthaea-ipc-test-{pid}-{nanos}")
+        format!(r"\\.\pipe\synthaea-ipc-test-{pid}-{nanos}-{seq}")
     }
     #[cfg(unix)]
     {
-        format!("/tmp/synthaea-ipc-test-{pid}-{nanos}.sock")
+        format!("/tmp/synthaea-ipc-test-{pid}-{nanos}-{seq}.sock")
     }
+}
+
+#[test]
+fn unique_endpoints_never_collide_within_one_process() {
+    let endpoints: std::collections::HashSet<String> =
+        (0..1000).map(|_| unique_endpoint()).collect();
+    assert_eq!(endpoints.len(), 1000);
 }
 
 async fn spawn_server(endpoint: String) -> tokio::task::JoinHandle<()> {

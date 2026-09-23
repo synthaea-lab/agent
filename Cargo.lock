@@ -45,6 +45,7 @@ dependencies = [
  "sensor-macos-unifiedlog",
  "sensor-windows",
  "sensor-windows-eventlog",
+ "sensor-windows-sockets",
  "serde",
  "sigma",
  "sinks",
@@ -2432,6 +2433,16 @@ version = "0.1.0"
 dependencies = [
  "schema",
  "tracing",
+]
+
+[[package]]
+name = "sensor-windows-sockets"
+version = "0.1.0"
+dependencies = [
+ "schema",
+ "thiserror 2.0.20",
+ "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
