@@ -1218,8 +1218,7 @@ fn try_sys_enter_setxattr(ctx: TracePointContext) -> Result<u32, u32> {
             }
         }
         if name_ptr != 0 {
-            if let Ok(name) = bpf_probe_read_user_str_bytes(name_ptr as *const u8, &mut (*e).name)
-            {
+            if let Ok(name) = bpf_probe_read_user_str_bytes(name_ptr as *const u8, &mut (*e).name) {
                 (*e).name_len = name.len() as u16;
             }
         }
@@ -1273,10 +1272,7 @@ fn try_sys_enter_removexattr(ctx: TracePointContext) -> Result<u32, u32> {
     };
 
     #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let name_ptr: u64 = unsafe {
-        ctx.read_at(REMOVEXATTR_NAME_PTR_OFFSET)
-            .map_err(|_| 1u32)?
-    };
+    let name_ptr: u64 = unsafe { ctx.read_at(REMOVEXATTR_NAME_PTR_OFFSET).map_err(|_| 1u32)? };
     #[cfg(bpf_target_arch = "x86")]
     let name_ptr: u64 = unsafe {
         ctx.read_at::<u32>(REMOVEXATTR_NAME_PTR_OFFSET)
@@ -1312,8 +1308,7 @@ fn try_sys_enter_removexattr(ctx: TracePointContext) -> Result<u32, u32> {
             }
         }
         if name_ptr != 0 {
-            if let Ok(name) = bpf_probe_read_user_str_bytes(name_ptr as *const u8, &mut (*e).name)
-            {
+            if let Ok(name) = bpf_probe_read_user_str_bytes(name_ptr as *const u8, &mut (*e).name) {
                 (*e).name_len = name.len() as u16;
             }
         }

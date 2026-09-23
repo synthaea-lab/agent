@@ -268,13 +268,13 @@ impl LinuxSensor {
                         });
                 }
                 guard = file_setxattr_ring_buf.readable_mut() => {
-                    drain!(guard, sensor_linux_wire::FileSetxattrEvent, sink,
+                    drain!(guard, sensor_linux_wire::FileSetxattrEvent, sink, own_pid,
                         |e: &sensor_linux_wire::FileSetxattrEvent| {
                             normalize::file_setxattr(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
                 guard = file_removexattr_ring_buf.readable_mut() => {
-                    drain!(guard, sensor_linux_wire::FileRemovexattrEvent, sink,
+                    drain!(guard, sensor_linux_wire::FileRemovexattrEvent, sink, own_pid,
                         |e: &sensor_linux_wire::FileRemovexattrEvent| {
                             normalize::file_removexattr(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
