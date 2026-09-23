@@ -1595,12 +1595,24 @@ fn try_sys_enter_bind(ctx: TracePointContext) -> Result<u32, u32> {
         pid: (bpf_get_current_pid_tgid() >> 32) as u32,
         fd: fd as u32,
     };
-    let value = BindAddrValue {
-        addr_v4: v4,
-        addr_v6: v6,
-        port: u16::from_be(port_be),
-        is_ipv6: family == AF_INET6,
-    };
+    // `BindAddrValue`'s field order (4 + 16 + 2 + bool = 23 bytes of data, but a
+    // `u16` field forces the struct's alignment to 2, so its declared size is 24)
+    // leaves a 1-byte tail pad that a plain struct literal never writes. That's
+    // fine for a value that's only ever read back through this same typed struct
+    // — but `bpf_map_update_elem` below copies the map's full declared value_size
+    // (24) off the stack, and the verifier tracks stack initialization per byte:
+    // on kernel 5.15 it rejects the load with "invalid indirect read from stack
+    // ... size 24" because that pad byte was never provably written (issue #390 —
+    // reproduced on Ubuntu 22.04/5.15, not on the Alpine 6.18/Arch 6.6 kernels
+    // this sensor had been validated against before, so the stricter check isn't
+    // universal). Zeroing the whole struct first covers the pad the same way
+    // `core::ptr::write_bytes` already does for every ring-buffer scratch struct
+    // in this file, just without a `PerCpuArray` backing it.
+    let mut value: BindAddrValue = unsafe { core::mem::zeroed() };
+    value.addr_v4 = v4;
+    value.addr_v6 = v6;
+    value.port = u16::from_be(port_be);
+    value.is_ipv6 = family == AF_INET6;
     let _ = BIND_ADDR_MAP.insert(&key, &value, 0);
 
     Ok(0)
