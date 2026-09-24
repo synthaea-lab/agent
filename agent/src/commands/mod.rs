@@ -41,6 +41,9 @@ pub(crate) struct RunOptions<'a> {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) enable_readline_capture: bool,
     pub(crate) server: Option<&'a str>,
+    /// Where the local IPC control channel listens for `cli` (issue #388),
+    /// from `cfg.ipc.endpoint`: a Unix socket path, or a Windows named pipe.
+    pub(crate) ipc_endpoint: &'a str,
 }
 
 #[cfg(target_os = "linux")]

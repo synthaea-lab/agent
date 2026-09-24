@@ -53,6 +53,17 @@ impl SensorHeartbeat {
         }
     }
 
+    /// Wraps a liveness counter a sensor already owns, for a sensor crate that
+    /// may not depend on `tamper` (`sensor-*` crates depend only on `schema`,
+    /// see `tools/check-deps.py`): the sensor exposes a plain `Arc<AtomicU64>` it
+    /// increments, and the binary — the one place both crates are in scope —
+    /// turns it into a heartbeat here. Same semantics as [`Self::pulse`]: every
+    /// increment of `counter` is a pulse.
+    #[must_use]
+    pub fn from_counter(name: &'static str, counter: Arc<AtomicU64>) -> Self {
+        Self { name, counter }
+    }
+
     /// Records liveness — call it as events are produced (and from the canary tick,
     /// so an idle-but-healthy sensor still advances). One relaxed atomic add.
     pub fn pulse(&self) {
@@ -214,6 +225,18 @@ mod tests {
     use super::*;
 
     const SEC: u64 = 1_000_000_000;
+
+    #[test]
+    fn a_heartbeat_from_an_external_counter_sees_its_increments() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let hb = SensorHeartbeat::from_counter("windows-eventlog:logon", Arc::clone(&counter));
+        let mut mon = SilenceMonitor::new();
+        mon.register(hb.clone(), 30 * SEC, 0);
+        counter.fetch_add(1, Ordering::Relaxed);
+        assert!(mon.poll(40 * SEC).is_empty(), "the increment is a pulse");
+        assert_eq!(hb.pulse_count(), 1);
+        assert_eq!(mon.poll(80 * SEC).len(), 1, "no further increment: silent");
+    }
 
     #[test]
     fn a_pulsing_sensor_is_never_silent() {

@@ -210,13 +210,20 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         enable_tls_capture,
         enable_readline_capture,
         server,
+        ipc_endpoint,
     } = opts;
     // Kill-loudness (#71): must run before any other thread exists — the signal mask
     // set here is inherited by every thread spawned below, including `DetectionSink`'s
     // own worker threads.
     crate::kill_loudness::block_termination_signals();
 
-    let pipeline = super::common::wire_run_pipeline(seeded_rule_state(), alerts, events, server)?;
+    let pipeline = super::common::wire_run_pipeline(
+        seeded_rule_state(),
+        alerts,
+        events,
+        server,
+        ipc_endpoint,
+    )?;
     let sink = pipeline.sink;
 
     // The watcher thread itself can start any time after the mask above — only the
@@ -300,9 +307,14 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         None => Arc::new(crate::health::NoopSpoolStats),
     };
     let heartbeat_client = pipeline.transport.as_ref().map(|t| Arc::clone(&t.client));
+    // One live silence snapshot, shared by the health beacon and `cli health`
+    // (#388) so both always report the same state.
+    let silence_health: Arc<dyn crate::health::SensorHealthSource> =
+        Arc::new(SilenceHealthSource::new(silence_monitor));
+    let _ = pipeline.sensor_health.set(Arc::clone(&silence_health));
     let health = crate::health::HealthCollector::new(
         health_config,
-        Arc::new(SilenceHealthSource::new(silence_monitor)),
+        silence_health,
         spool_stats,
         Arc::new(sink.enrich_queue().clone()) as Arc<dyn crate::health::DroppedCounter>,
         move |beacon| {

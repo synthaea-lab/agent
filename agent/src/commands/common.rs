@@ -6,7 +6,10 @@
 
 use std::sync::Arc;
 
-use crate::sink::DetectionSink;
+use crate::{
+    ipc_handler::{AgentHandler, SensorHealthSlot},
+    sink::DetectionSink,
+};
 
 /// What `run` composes before handing control to the platform's sensors.
 pub(crate) struct RunPipeline {
@@ -17,16 +20,23 @@ pub(crate) struct RunPipeline {
     // `commands::linux::cmd_run`) — `windows.rs` uses `pipeline.sink` alone.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) transport: Option<crate::upload::TransportHandle>,
+    /// Where the platform deposits its sensor-health source for `cli health`
+    /// (issue #388). Left empty on a platform with no silence monitor wired:
+    /// the IPC handler then reports no sensors rather than invented ones.
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+    pub(crate) sensor_health: SensorHealthSlot,
 }
 
 /// Builds the shared pipeline: optional transport (spool + upload thread),
 /// the detection sink (spooling into it when transport is on), the operator
-/// banner, and the progress-backed liveness heartbeat (#102).
+/// banner, the progress-backed liveness heartbeat (#102), and the local IPC
+/// control channel served to `cli` (#388).
 pub(crate) fn wire_run_pipeline(
     rule_state: rules::RuleState,
     alerts: &std::path::Path,
     events: &std::path::Path,
     server: Option<&str>,
+    ipc_endpoint: &str,
 ) -> anyhow::Result<RunPipeline> {
     // Transport first: the sink needs the spool handle at construction.
     let transport = server
@@ -57,5 +67,16 @@ pub(crate) fn wire_run_pipeline(
         crate::heartbeat::WRITE_INTERVAL,
     );
 
-    Ok(RunPipeline { sink, transport })
+    // Local control channel (#388): non-fatal by design, see `ipc_handler`.
+    let sensor_health: SensorHealthSlot = Arc::new(std::sync::OnceLock::new());
+    crate::ipc_handler::spawn(
+        ipc_endpoint.to_string(),
+        AgentHandler::new(sink.alert_log(), Arc::clone(&sensor_health)),
+    );
+
+    Ok(RunPipeline {
+        sink,
+        transport,
+        sensor_health,
+    })
 }

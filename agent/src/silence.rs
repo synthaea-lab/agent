@@ -11,7 +11,7 @@
 //! what catches that instead. See `tamper::heartbeat`'s own doc for the F-2 lesson
 //! this generalizes and the honest limitation repeated on [`PulsingSink`] below.
 
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#![cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 
 use std::{
     sync::{Arc, Mutex},

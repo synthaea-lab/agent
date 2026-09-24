@@ -14,9 +14,12 @@ use std::{
 
 use policy::ResponsePolicy;
 use schema::{Event, sensor::EventSink};
-use sinks::{AlertRecord, JsonlWriter};
+use sinks::JsonlWriter;
 
-use crate::enrich_queue::EnrichQueue;
+use crate::{
+    alerts::{AlertLog, RECENT_ALERTS_CAPACITY},
+    enrich_queue::EnrichQueue,
+};
 
 /// Wires issue #25's automated response into the sink once `enable_response` sets it
 /// (Linux only for this pass — see `commands::linux::cmd_run`). Held behind
@@ -49,8 +52,10 @@ pub(crate) struct DetectionSink {
     /// to the working directory) when the folder exists — otherwise the agent runs without a Sigma engine, and that is
     /// not an error (the load failure path IS an error: content present but broken).
     sigma: Option<sigma::SigmaEngine>,
-    /// One alert per line in alerts.ndjson (shared with the YARA scan worker).
-    alert_log: Arc<JsonlWriter>,
+    /// The single alert funnel (issue #388): alerts.ndjson + stderr + the
+    /// in-memory recent-alerts buffer served to `cli detections`. Shared with
+    /// the YARA scan worker and quarantine.
+    alert_log: Arc<AlertLog>,
     /// Budgeted background content scanning; `None` when rules/yara is absent.
     yara: Option<yara::ScanQueue>,
     /// Enrichment (hash + signature) and the high-volume raw-event logging, off the
@@ -78,7 +83,7 @@ impl DetectionSink {
         events_path: &std::path::Path,
         spool: Option<Arc<Mutex<store::EventSpool>>>,
     ) -> std::io::Result<Self> {
-        let alert_log = Arc::new(JsonlWriter::open(alerts_path)?);
+        let alert_log = Arc::new(AlertLog::open(alerts_path, RECENT_ALERTS_CAPACITY)?);
         // The raw event log is written by the enrichment worker, not the drain
         // thread — shared behind an Arc so the worker owns a handle. The spool
         // append rides the same worker for the same #126 reason: it is file
@@ -371,15 +376,13 @@ impl DetectionSink {
     /// verdict through the exact same path as a rule/correlator/Sigma finding —
     /// one alert shape, whatever detected it.
     pub(crate) fn emit(&self, technique: &str, message: &str) {
-        // Alerts go to stderr (stdout carries nothing in run mode; the raw stream
-        // lives in events.jsonl) and are highlighted — an alert must not get lost in
-        // terminal noise.
-        eprintln!("\x1b[1;31m[ALERT] {technique} — {message}\x1b[0m");
-        self.alert_log.write(&AlertRecord {
-            timestamp_ns: schema::time::now_ns(),
-            technique: technique.to_string(),
-            message: message.to_string(),
-        });
+        self.alert_log.record(technique, message.to_string());
+    }
+
+    /// Handle to the alert funnel, for the IPC handler's `recent_detections`
+    /// endpoint (issue #388).
+    pub(crate) fn alert_log(&self) -> Arc<AlertLog> {
+        Arc::clone(&self.alert_log)
     }
 }
 
@@ -421,7 +424,7 @@ fn load_sigma_rules() -> Option<sigma::SigmaEngine> {
 /// trigger quarantine of the matched file through `response`, whenever
 /// `enable_response` set it.
 fn start_yara(
-    alert_log: Arc<JsonlWriter>,
+    alert_log: Arc<AlertLog>,
     response: Arc<Mutex<Option<ResponseHooks>>>,
 ) -> Option<yara::ScanQueue> {
     let dir = content_dir("rules/yara")?;
@@ -432,12 +435,7 @@ fn start_yara(
                 let matched = !outcome.matches.is_empty();
                 for rule in &outcome.matches {
                     let message = format!("yara rule {rule} matched {}", outcome.path.display());
-                    eprintln!("\x1b[1;31m[ALERT] YARA — {message}\x1b[0m");
-                    alert_log.write(&AlertRecord {
-                        timestamp_ns: schema::time::now_ns(),
-                        technique: "YARA".to_string(),
-                        message,
-                    });
+                    alert_log.record("YARA", message);
                 }
                 if matched {
                     quarantine_matched_payload(&response, &outcome.path, &alert_log);
@@ -456,7 +454,7 @@ fn start_yara(
 fn quarantine_matched_payload(
     response: &Mutex<Option<ResponseHooks>>,
     path: &std::path::Path,
-    alert_log: &JsonlWriter,
+    alert_log: &AlertLog,
 ) {
     let guard = response.lock().unwrap();
     let Some(hooks) = guard.as_ref() else {
@@ -493,12 +491,7 @@ fn quarantine_matched_payload(
             )
         }
     };
-    eprintln!("\x1b[1;31m[ALERT] RESPONSE-QUARANTINE — {message}\x1b[0m");
-    alert_log.write(&AlertRecord {
-        timestamp_ns: schema::time::now_ns(),
-        technique: "RESPONSE-QUARANTINE".to_string(),
-        message,
-    });
+    alert_log.record("RESPONSE-QUARANTINE", message);
 }
 
 impl EventSink for DetectionSink {

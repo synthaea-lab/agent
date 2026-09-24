@@ -16,6 +16,11 @@
 //! `kill_loudness` attributes who sent a catchable termination signal before the
 //! agent actually dies (#71).
 
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", windows)),
+    allow(dead_code)
+)]
+mod alerts;
 mod commands;
 mod enrich_queue;
 mod health;
@@ -31,6 +36,11 @@ mod heartbeat;
 // cross-platform body here to keep alive with an `allow(dead_code)`.
 #[cfg(target_os = "linux")]
 mod integrity;
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", windows)),
+    allow(dead_code)
+)]
+mod ipc_handler;
 #[cfg(target_os = "linux")]
 mod journal_cursor;
 #[cfg(target_os = "linux")]
@@ -171,6 +181,7 @@ fn main() -> anyhow::Result<()> {
             enable_tls_capture,
             enable_readline_capture,
             server: server.as_deref(),
+            ipc_endpoint: &cfg.ipc.endpoint,
         }),
         Command::CaptureBaseline { output } => commands::cmd_capture_baseline(&output),
         Command::CaptureEvents { output } => commands::cmd_capture_events(&output),

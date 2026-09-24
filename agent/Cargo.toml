@@ -24,6 +24,10 @@ tamper = { path = "../crates/tamper" }
 response = { path = "../crates/response" }
 store = { path = "../crates/store" }
 transport = { path = "../crates/transport" }
+# Local control channel served to `cli` (issue #388). The agent is otherwise
+# thread-based: tokio only runs the IPC server, on its own dedicated thread.
+ipc = { path = "../crates/ipc" }
+tokio = { workspace = true }
 
 anyhow = "1"
 serde = { workspace = true }

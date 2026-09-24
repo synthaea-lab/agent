@@ -250,8 +250,15 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         enable_tls_capture: _,
         enable_readline_capture: _,
         server,
+        ipc_endpoint,
     } = opts;
-    let pipeline = super::common::wire_run_pipeline(seeded_rule_state(), alerts, events, server)?;
+    let pipeline = super::common::wire_run_pipeline(
+        seeded_rule_state(),
+        alerts,
+        events,
+        server,
+        ipc_endpoint,
+    )?;
     run_macos_sensors(Box::new(SharedSink(pipeline.sink)))
 }
 
