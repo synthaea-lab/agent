@@ -17,7 +17,9 @@ use tracing::warn;
 
 use crate::{
     container::{CgroupIdCache, DockerInfoCache, container_context},
-    ebpf::{TRACEPOINTS, attach_tracepoint, err, load_ebpf, prime_proc_lineage},
+    ebpf::{
+        TRACEPOINTS, attach_tracepoint, err, load_ebpf, prime_proc_lineage, write_signal_watch_pid,
+    },
     normalize,
     proc::read_proc_cmdline,
 };
@@ -108,6 +110,20 @@ impl LinuxSensor {
     async fn run_async(&mut self, sink: Box<dyn EventSink>) -> Result<(), SensorError> {
         let mut ebpf = load_ebpf()?;
         let offset = boot_epoch_offset_ns();
+        // Computed early (not just for #340's drain-time self-exclusion below) so
+        // `write_signal_watch_pid` can seed `SIGNAL_WATCH_PID` before the
+        // `sys_enter_kill`/`sys_enter_tgkill` probes are attached (issue #362) —
+        // attaching them first would let a signal land before the map holds
+        // anything but its zero-initialized default, which the probe treats as
+        // "watch nothing" and silently drops.
+        let own_pid = std::process::id();
+        write_signal_watch_pid(&mut ebpf, own_pid)?;
+        // The signal filter only ever watches this process (v1 scope), so this is
+        // resolved once rather than per event — see `normalize::signal`'s doc
+        // comment.
+        let self_exe = std::env::current_exe()
+            .ok()
+            .map(|p| p.display().to_string());
 
         match aya_log::EbpfLogger::init(&mut ebpf) {
             Err(e) => {
@@ -176,16 +192,17 @@ impl LinuxSensor {
         let mut socket_accept_ring_buf = ring("SOCKET_ACCEPT_EVENTS")?;
         let mut file_setxattr_ring_buf = ring("FILE_SETXATTR_EVENTS")?;
         let mut file_removexattr_ring_buf = ring("FILE_REMOVEXATTR_EVENTS")?;
+        let mut mount_ring_buf = ring("MOUNT_EVENTS")?;
+        let mut signal_ring_buf = ring("SIGNAL_EVENTS")?;
 
         tracing::info!(
-            "sensor-linux: listening for exec/open/connect/write/delete/rename/bind/chmod/chown/udp_send/listen/accept/setxattr/removexattr events"
+            "sensor-linux: listening for exec/open/connect/write/delete/rename/bind/chmod/chown/udp_send/listen/accept/setxattr/removexattr/mount/signal events"
         );
 
         let mut container_ids = CgroupIdCache::new();
         let docker_cache: DockerInfoCache = Arc::new(Mutex::new(HashMap::new()));
         // Issue #340: excluded from every drain below so the sensor never re-observes
         // its own syscalls (most visibly its `write(2)`s to `events.jsonl`).
-        let own_pid = std::process::id();
         let ctrl_c = tokio::signal::ctrl_c();
         tokio::pin!(ctrl_c);
         loop {
@@ -277,6 +294,22 @@ impl LinuxSensor {
                     drain!(guard, sensor_linux_wire::FileRemovexattrEvent, sink, own_pid,
                         |e: &sensor_linux_wire::FileRemovexattrEvent| {
                             normalize::file_removexattr(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = mount_ring_buf.readable_mut() => {
+                    drain!(guard, sensor_linux_wire::MountEvent, sink, own_pid,
+                        |e: &sensor_linux_wire::MountEvent| {
+                            normalize::mount(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = signal_ring_buf.readable_mut() => {
+                    // container_context resolves the SENDER's container (meta is
+                    // the sender, same convention as every other event type) —
+                    // relevant for e.g. attributing a container-escape kill attempt
+                    // to the container it came from.
+                    drain!(guard, sensor_linux_wire::SignalEvent, sink, own_pid,
+                        |e: &sensor_linux_wire::SignalEvent| {
+                            normalize::signal(e, offset, self_exe.clone(), container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
             }

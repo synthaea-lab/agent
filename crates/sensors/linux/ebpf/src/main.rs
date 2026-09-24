@@ -8,15 +8,15 @@ use aya_ebpf::{
         bpf_probe_read_user, bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
     },
     macros::{lsm, map, tracepoint, uprobe, uretprobe},
-    maps::{HashMap, PerCpuArray, RingBuf},
+    maps::{Array, HashMap, PerCpuArray, RingBuf},
     programs::{LsmContext, ProbeContext, RetProbeContext, TracePointContext},
 };
 use aya_log_ebpf::{info, warn};
 use sensor_linux_wire::{
     ConnectEvent, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent,
     FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent, LineageEntry,
-    MAX_TLS_CAPTURE, ReadlineInputEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent,
-    TASK_COMM_LEN, TlsCaptureEvent, UdpSendEvent,
+    MAX_TLS_CAPTURE, MountEvent, ReadlineInputEvent, SignalEvent, SocketAcceptEvent,
+    SocketBindEvent, SocketListenEvent, TASK_COMM_LEN, TlsCaptureEvent, UdpSendEvent,
 };
 
 // This probe reads NO `task_struct`/`mm_struct` frozen offset: parent lineage (ppid +
@@ -2093,6 +2093,328 @@ fn try_file_open(ctx: LsmContext) -> Result<i32, i32> {
 
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     info!(&ctx, "sensor-linux-ebpf: lsm file_open pid={}", pid);
+    Ok(0)
+}
+
+// --- Mount/unmount and signal telemetry (issue #362) --------------------------------
+//
+// Feeds the two platform-neutral `schema` variants #96 introduced for macOS
+// (`Event::Mount`, `Event::Signal`) from Linux. See this crate's `WIRE_VERSION` v12
+// changelog (`sensor-linux-wire`) for the full rationale.
+
+/// Ring buffer shared with userspace for `mount`/`umount2` events.
+#[map]
+static MOUNT_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Per-CPU scratch for building one `MountEvent` (see `EXEC_SCRATCH`).
+#[map]
+static MOUNT_SCRATCH: PerCpuArray<MountEvent> = PerCpuArray::with_max_entries(1, 0);
+
+/// `MS_RDONLY` (`linux/mount.h`) — stable UAPI constant, not a kernel-version-
+/// dependent offset.
+const MS_RDONLY: u64 = 1;
+
+/// Offsets of the `syscalls:sys_enter_mount` tracepoint: `dev_name`(16, the
+/// `source` arg), `dir_name`(24, `target`), `type`(32, `filesystemtype`),
+/// `flags`(40, `mountflags`), `data`(48, unread). Verified on 2026-09-23 on Ubuntu
+/// 22.04 (kernel 5.15.0-91-generic, x86_64) via
+/// `/sys/kernel/tracing/events/syscalls/sys_enter_mount/format` — matched the
+/// standard `syscalls:*` layout inferred here on first write, no offset changes
+/// needed.
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const MOUNT_SOURCE_PTR_OFFSET: usize = 16;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const MOUNT_TARGET_PTR_OFFSET: usize = 24;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const MOUNT_FSTYPE_PTR_OFFSET: usize = 32;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const MOUNT_FLAGS_OFFSET: usize = 40;
+#[cfg(bpf_target_arch = "x86")]
+const MOUNT_SOURCE_PTR_OFFSET: usize = 12;
+#[cfg(bpf_target_arch = "x86")]
+const MOUNT_TARGET_PTR_OFFSET: usize = 16;
+#[cfg(bpf_target_arch = "x86")]
+const MOUNT_FSTYPE_PTR_OFFSET: usize = 20;
+#[cfg(bpf_target_arch = "x86")]
+const MOUNT_FLAGS_OFFSET: usize = 24;
+
+/// glibc's `umount2(2)` libc wrapper maps to a kernel syscall the kernel itself
+/// (`fs/namespace.c`) names plain `umount` — `SYSCALL_DEFINE2(umount, ...)`, not
+/// `umount2` — so the tracepoint is `syscalls:sys_enter_umount`, confirmed live
+/// (the assumed `sys_enter_umount2` name does not exist; this file's doc comments
+/// below keep saying "`umount2(2)`" for the libc call itself, which IS
+/// `umount2()`, while the identifiers here match the kernel's own name).
+/// Offsets: `name`(16, the target path), `flags`(24). Verified on 2026-09-23 on
+/// Ubuntu 22.04 (kernel 5.15.0-91-generic, x86_64) via
+/// `/sys/kernel/tracing/events/syscalls/sys_enter_umount/format`.
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const UMOUNT_TARGET_PTR_OFFSET: usize = 16;
+#[cfg(bpf_target_arch = "x86")]
+const UMOUNT_TARGET_PTR_OFFSET: usize = 12;
+
+#[tracepoint]
+pub fn sys_enter_mount(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_mount(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_sys_enter_mount(ctx: TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let source_ptr: u64 = unsafe { ctx.read_at(MOUNT_SOURCE_PTR_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let source_ptr: u64 = unsafe {
+        ctx.read_at::<u32>(MOUNT_SOURCE_PTR_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let target_ptr: u64 = unsafe { ctx.read_at(MOUNT_TARGET_PTR_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let target_ptr: u64 = unsafe {
+        ctx.read_at::<u32>(MOUNT_TARGET_PTR_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let fstype_ptr: u64 = unsafe { ctx.read_at(MOUNT_FSTYPE_PTR_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let fstype_ptr: u64 = unsafe {
+        ctx.read_at::<u32>(MOUNT_FSTYPE_PTR_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let flags: u64 = unsafe { ctx.read_at(MOUNT_FLAGS_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let flags: u64 =
+        unsafe { ctx.read_at::<u32>(MOUNT_FLAGS_OFFSET).map_err(|_| 1u32)? as u64 };
+
+    emit_mount_event(&ctx, target_ptr, source_ptr, fstype_ptr, flags, true)
+}
+
+#[tracepoint]
+pub fn sys_enter_umount(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_umount(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_sys_enter_umount(ctx: TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let target_ptr: u64 = unsafe { ctx.read_at(UMOUNT_TARGET_PTR_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let target_ptr: u64 = unsafe {
+        ctx.read_at::<u32>(UMOUNT_TARGET_PTR_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
+
+    emit_mount_event(&ctx, target_ptr, 0, 0, 0, false)
+}
+
+/// Shared by `sys_enter_mount` and `sys_enter_umount` above. `source_ptr`/
+/// `fstype_ptr` are `0` on an unmount (`umount2(2)` has neither argument) — left
+/// zero-length on the wire event, which `normalize::mount` maps to `None`.
+fn emit_mount_event(
+    ctx: &TracePointContext,
+    mount_point_ptr: u64,
+    source_ptr: u64,
+    fstype_ptr: u64,
+    flags: u64,
+    mounted: bool,
+) -> Result<u32, u32> {
+    let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
+    let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
+
+    let e = MOUNT_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
+    unsafe {
+        core::ptr::write_bytes(e, 0, 1);
+        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*e).meta.ppid = lineage_ppid();
+        (*e).meta.uid = uid_gid as u32;
+        (*e).meta.gid = (uid_gid >> 32) as u32;
+        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
+        let mut i = 0usize;
+        while i < TASK_COMM_LEN {
+            (*e).meta.comm[i] = comm[i];
+            i += 1;
+        }
+
+        if mount_point_ptr != 0 {
+            if let Ok(path) =
+                bpf_probe_read_user_str_bytes(mount_point_ptr as *const u8, &mut (*e).mount_point)
+            {
+                (*e).mount_point_len = path.len() as u16;
+            }
+        }
+        if source_ptr != 0 {
+            if let Ok(path) =
+                bpf_probe_read_user_str_bytes(source_ptr as *const u8, &mut (*e).source)
+            {
+                (*e).source_len = path.len() as u16;
+            }
+        }
+        if fstype_ptr != 0 {
+            if let Ok(s) =
+                bpf_probe_read_user_str_bytes(fstype_ptr as *const u8, &mut (*e).fs_type)
+            {
+                (*e).fs_type_len = s.len() as u8;
+            }
+        }
+        (*e).readonly = mounted && (flags & MS_RDONLY) != 0;
+        (*e).mounted = mounted;
+
+        if MOUNT_EVENTS.output::<MountEvent>(&*e, 0).is_err() {
+            warn!(
+                ctx,
+                "sensor-linux-ebpf: ring buffer full, dropping mount event"
+            );
+        }
+    }
+
+    Ok(0)
+}
+
+/// Single-slot map holding the agent's own pid, written by userspace before any
+/// signal probe below is attached (issue #362). Filters `kill`/`tgkill` at the
+/// probe to the "tamper subset, never the firehose" this ring buffer can afford —
+/// system-wide signal traffic (job control, `SIGCHLD` reaping, ordinary process
+/// supervision) is far too high-volume to forward unfiltered. v1 scope: only the
+/// agent's own pid is watched; the watchdog process and other registered security
+/// processes are a documented future extension (see `sensor-linux-wire`'s
+/// `WIRE_VERSION` v12 changelog), not implemented here.
+#[map]
+static SIGNAL_WATCH_PID: Array<u32> = Array::with_max_entries(1, 0);
+
+/// Whether `target_pid` is a signal target this sensor cares about — see
+/// `SIGNAL_WATCH_PID` above. `0` (unset) never matches: userspace hasn't written
+/// its pid yet, or wrote it as an explicit "watch nothing".
+fn is_watched_signal_target(target_pid: u32) -> bool {
+    matches!(SIGNAL_WATCH_PID.get(0), Some(&watched) if watched != 0 && watched == target_pid)
+}
+
+/// Ring buffer shared with userspace for `kill`/`tgkill` events that pass the
+/// `SIGNAL_WATCH_PID` filter.
+#[map]
+static SIGNAL_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+
+/// Per-CPU scratch for building one `SignalEvent` (see `EXEC_SCRATCH`).
+#[map]
+static SIGNAL_SCRATCH: PerCpuArray<SignalEvent> = PerCpuArray::with_max_entries(1, 0);
+
+/// Offsets of the `syscalls:sys_enter_kill` tracepoint: `pid`(16), `sig`(24) on
+/// x86_64/aarch64 — same inferred-not-verified status as the mount offsets above.
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const KILL_PID_OFFSET: usize = 16;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const KILL_SIG_OFFSET: usize = 24;
+#[cfg(bpf_target_arch = "x86")]
+const KILL_PID_OFFSET: usize = 12;
+#[cfg(bpf_target_arch = "x86")]
+const KILL_SIG_OFFSET: usize = 16;
+
+/// Offsets of the `syscalls:sys_enter_tgkill` tracepoint: `tgid`(16), `tid`(24),
+/// `sig`(32) on x86_64/aarch64 — same inferred-not-verified status as the mount
+/// offsets above. `tgid` is the field compared against `SIGNAL_WATCH_PID`, the
+/// same whole-process identity `kill(2)`'s `pid` argument carries — `tid` (the
+/// specific thread within that group) is read but not otherwise used.
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const TGKILL_TGID_OFFSET: usize = 16;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const TGKILL_SIG_OFFSET: usize = 32;
+#[cfg(bpf_target_arch = "x86")]
+const TGKILL_TGID_OFFSET: usize = 12;
+#[cfg(bpf_target_arch = "x86")]
+const TGKILL_SIG_OFFSET: usize = 20;
+
+// `tkill(2)` is deliberately NOT attached: it takes a thread id, not a
+// thread-group id, and this filter watches a whole-process pid
+// (`SIGNAL_WATCH_PID`) — there is no field in `tkill(2)`'s argument list
+// comparable to that identity. Superseded by `tgkill(2)` in practice (glibc's
+// `pthread_kill` uses `tgkill`, and a plain `kill(1)` uses `kill(2)`), so this
+// is a narrow, accepted gap rather than a missing common path.
+
+#[tracepoint]
+pub fn sys_enter_kill(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_kill(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_sys_enter_kill(ctx: TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let pid: u64 = unsafe { ctx.read_at(KILL_PID_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let pid: u64 = unsafe { ctx.read_at::<u32>(KILL_PID_OFFSET).map_err(|_| 1u32)? as u64 };
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let sig: u64 = unsafe { ctx.read_at(KILL_SIG_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let sig: u64 = unsafe { ctx.read_at::<u32>(KILL_SIG_OFFSET).map_err(|_| 1u32)? as u64 };
+
+    emit_signal_event(&ctx, pid as u32, sig as u32)
+}
+
+#[tracepoint]
+pub fn sys_enter_tgkill(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_tgkill(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_sys_enter_tgkill(ctx: TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let tgid: u64 = unsafe { ctx.read_at(TGKILL_TGID_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let tgid: u64 = unsafe { ctx.read_at::<u32>(TGKILL_TGID_OFFSET).map_err(|_| 1u32)? as u64 };
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let sig: u64 = unsafe { ctx.read_at(TGKILL_SIG_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let sig: u64 = unsafe { ctx.read_at::<u32>(TGKILL_SIG_OFFSET).map_err(|_| 1u32)? as u64 };
+
+    emit_signal_event(&ctx, tgid as u32, sig as u32)
+}
+
+/// Shared by `sys_enter_kill` and `sys_enter_tgkill` above. Drops silently
+/// (`Ok(0)`, no scratch touch) when `target_pid` fails the `SIGNAL_WATCH_PID`
+/// filter — this is the "regression-tested: ordinary signal traffic between
+/// unrelated processes produces zero events" boundary issue #362 requires.
+fn emit_signal_event(ctx: &TracePointContext, target_pid: u32, sig: u32) -> Result<u32, u32> {
+    if !is_watched_signal_target(target_pid) {
+        return Ok(0);
+    }
+
+    let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
+    let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
+
+    let e = SIGNAL_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
+    unsafe {
+        core::ptr::write_bytes(e, 0, 1);
+        // meta is the SENDER, not the target — same convention as macOS's
+        // `SignalToEsClient` (see `SignalEvent`'s doc comment in `sensor-linux-wire`).
+        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*e).meta.ppid = lineage_ppid();
+        (*e).meta.uid = uid_gid as u32;
+        (*e).meta.gid = (uid_gid >> 32) as u32;
+        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
+        let mut i = 0usize;
+        while i < TASK_COMM_LEN {
+            (*e).meta.comm[i] = comm[i];
+            i += 1;
+        }
+        (*e).signal = sig;
+        (*e).target_pid = target_pid;
+
+        if SIGNAL_EVENTS.output::<SignalEvent>(&*e, 0).is_err() {
+            warn!(
+                ctx,
+                "sensor-linux-ebpf: ring buffer full, dropping signal event"
+            );
+        }
+    }
+
     Ok(0)
 }
 

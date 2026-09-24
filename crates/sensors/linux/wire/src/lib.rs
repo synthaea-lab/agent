@@ -86,7 +86,29 @@ extern crate std;
 ///   `setcap` writes, functionally the "+s" of extended attributes) but not
 ///   `value`: the namespace+attribute name is what most detections need, and
 ///   `value` is an arbitrary-length secondary read this slice does not add.
-pub const WIRE_VERSION: u32 = 12;
+/// - v13: `MountEvent`/`SignalEvent` added (issue #362) — feeds the two
+///   platform-neutral `schema` variants #96 introduced for macOS. `MountEvent`
+///   covers `mount(2)`/`umount2(2)` (`move_mount(2)` deferred, same "known gap, not
+///   silently dropped" treatment as `fchmod`/`fchown`'s fd-only variants).
+///   `umount2(2)`'s actual kernel tracepoint is `syscalls:sys_enter_umount`, not
+///   `sys_enter_umount2`: glibc's `umount2(2)` libc wrapper maps to a kernel
+///   syscall the kernel itself (`fs/namespace.c`) names plain `umount`, confirmed
+///   live on the lab 2026-09-23 after the assumed `sys_enter_umount2` turned out
+///   not to exist. `fs_type`
+///   gets its own small `MAX_FS_TYPE_LEN` budget — filesystem type names
+///   (`ext4`, `overlay`, `tmpfs`, ...) never approach `MAX_PATH_LEN`.
+///   `SignalEvent` covers `kill(2)`/`tgkill(2)`, filtered at the probe via
+///   `SIGNAL_WATCH_PID` (internal to the ebpf crate, not part of this wire ABI) to
+///   targets that are the agent's own pid — the "tamper subset, never the
+///   firehose" filter `SignalToEsClient` uses on macOS (its ES-client gate), scoped
+///   down to just self-protection for v1 (watchdog/other registered security
+///   processes are a documented future extension, not implemented here). `tkill(2)`
+///   is deferred: it takes a thread id, not a thread-group id, and has no field
+///   comparable to the whole-process pid this filter watches for.
+///   Originally claimed as v12 while this branch was open; renumbered to v13
+///   once `#262` Phase 3's xattr telemetry took v12 on `main` first (same
+///   coordination note as `SCHEMA_VERSION`'s v13/v19/v20 history).
+pub const WIRE_VERSION: u32 = 13;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
@@ -98,6 +120,10 @@ pub const MAX_PATH_LEN: usize = 256;
 /// unusually long name (evasion, or just an unusual but legitimate tool) is exactly
 /// the case a smaller buffer would have hidden (review finding, PR #332).
 pub const MAX_XATTR_NAME_LEN: usize = 255;
+/// Budget for `MountEvent::fs_type` (issue #362) — filesystem type names
+/// (`ext4`, `overlay`, `tmpfs`, `fuse.sshfs`, ...) are always short, nowhere near
+/// `MAX_PATH_LEN`.
+pub const MAX_FS_TYPE_LEN: usize = 32;
 /// Budget for TLS plaintext capture (first N bytes). Chosen to fit comfortably
 /// in a ring-buffer event with metadata while staying under 512 bytes total.
 pub const MAX_TLS_CAPTURE: usize = 256;
@@ -356,6 +382,45 @@ pub struct SocketAcceptEvent {
     pub peer_addr_v6: [u8; 16],
     pub peer_port: u16,
     pub is_ipv6: bool,
+}
+
+/// Mount/unmount (`syscalls:sys_enter_mount`/`sys_enter_umount`, issue #362 — the
+/// latter is `sys_enter_umount`, not `sys_enter_umount2`, despite the libc call
+/// being `umount2(2)`; see this file's `WIRE_VERSION` v12 changelog).
+/// `source`/`fs_type` are zero-length on an unmount — `umount2(2)` only takes a
+/// target path. `move_mount(2)` is not captured here.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MountEvent {
+    pub meta: EventMeta,
+    pub mount_point: [u8; MAX_PATH_LEN],
+    pub mount_point_len: u16,
+    /// The `source` argument to `mount(2)` (device node, bind-mount source path,
+    /// image path). Zero-length on `umount2(2)`, which has none.
+    pub source: [u8; MAX_PATH_LEN],
+    pub source_len: u16,
+    /// Zero-length on `umount2(2)`, which has no filesystem type argument.
+    pub fs_type: [u8; MAX_FS_TYPE_LEN],
+    pub fs_type_len: u8,
+    /// `mount(2)`'s `mountflags & MS_RDONLY`, computed at probe time. Always
+    /// `false` on an unmount (`readonly` is not a meaningful `umount2(2)` concept).
+    pub readonly: bool,
+    /// `true` for `mount(2)`, `false` for `umount2(2)`.
+    pub mounted: bool,
+}
+
+/// A signal was sent to a watched target (`syscalls:sys_enter_kill`/
+/// `sys_enter_tgkill`, issue #362), filtered at the probe via `SIGNAL_WATCH_PID`
+/// (internal to the ebpf crate) to targets that are the agent's own pid — see this
+/// file's `WIRE_VERSION` v12 changelog. `meta` is the SENDER, not the target —
+/// same convention as macOS's `SignalToEsClient`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SignalEvent {
+    pub meta: EventMeta,
+    /// Signal number, platform-native (`SIGKILL` = 9, `SIGTERM` = 15, ...).
+    pub signal: u32,
+    pub target_pid: u32,
 }
 
 /// TLS plaintext capture (uprobes on `SSL_read`/`SSL_write`, issue #90).

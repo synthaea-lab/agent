@@ -37,7 +37,10 @@ use crate::redact;
 ///
 /// v12 (#262 Phase 3) added `FileSetxattrEvent`/`FileRemovexattrEvent` — not
 /// imported here either, same reasoning.
-const _: () = assert!(wire::WIRE_VERSION == 12);
+///
+/// v13 (#362, originally claimed as v12 — see that constant's doc) added
+/// `MountEvent`/`SignalEvent` — not imported here either, same reasoning.
+const _: () = assert!(wire::WIRE_VERSION == 13);
 
 /// `container` is resolved by the caller (`crate::container::container_context`,
 /// issue #312) from `EventMeta::cgroup_id` against cgroupfs, with image/name filled

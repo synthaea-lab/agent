@@ -8,7 +8,8 @@
 use schema::{
     ConnectEvent, ContainerContext, Event, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent,
     FileDeleteEvent, FileOpenEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
-    FileWriteEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, UdpSendEvent, User,
+    FileWriteEvent, MountEvent, SignalEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent,
+    UdpSendEvent, User,
 };
 use sensor_linux_wire as wire;
 
@@ -48,7 +49,16 @@ use sensor_linux_wire as wire;
 /// mapping functions `file_setxattr`/`file_removexattr` below, same path-decoding
 /// shape as `file_chmod`/`file_chown` plus a second nul-padded field (the xattr
 /// `name`); no existing mapping changed shape.
-const _: () = assert!(wire::WIRE_VERSION == 12);
+///
+/// v13 (#362, originally claimed as v12 — see that constant's doc) added
+/// `MountEvent`/`SignalEvent` — new `mount`/`signal` mapping functions below.
+/// `mount` turns zero-length `source`/`fs_type` (umount2(2) has neither) into
+/// `None`, matching how the macOS producer reports them absent. `signal` takes
+/// `target_image_path` from the caller rather than the wire event — the probe
+/// filters to the agent's own pid (v1 scope), which the sensor already knows
+/// its own exe path for without a `/proc/<pid>/exe` readlink per event. No
+/// existing mapping changed shape.
+const _: () = assert!(wire::WIRE_VERSION == 13);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
@@ -353,6 +363,51 @@ pub fn socket_accept(
         accepted_fd: event.accepted_fd,
         peer_addr,
         peer_port: event.peer_port,
+    })
+}
+
+#[must_use]
+pub fn mount(
+    event: &wire::MountEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    let mp_raw = &event.mount_point[..(event.mount_point_len as usize).min(wire::MAX_PATH_LEN)];
+    let mp_end = mp_raw.iter().position(|&b| b == 0).unwrap_or(mp_raw.len());
+    let source = (event.source_len > 0).then(|| {
+        let raw = &event.source[..(event.source_len as usize).min(wire::MAX_PATH_LEN)];
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        String::from_utf8_lossy(&raw[..end]).into_owned()
+    });
+    let fs_type = (event.fs_type_len > 0).then(|| {
+        let raw = &event.fs_type[..(event.fs_type_len as usize).min(wire::MAX_FS_TYPE_LEN)];
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        String::from_utf8_lossy(&raw[..end]).into_owned()
+    });
+    Event::Mount(MountEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        mount_point: String::from_utf8_lossy(&mp_raw[..mp_end]).into_owned(),
+        source,
+        fs_type,
+        readonly: event.readonly,
+        mounted: event.mounted,
+    })
+}
+
+/// `target_image_path` is the caller's, not the wire event's — see this module's
+/// `WIRE_VERSION` v12 changelog for why.
+#[must_use]
+pub fn signal(
+    event: &wire::SignalEvent,
+    boot_epoch_offset_ns: u64,
+    target_image_path: Option<String>,
+    container: Option<ContainerContext>,
+) -> Event {
+    Event::Signal(SignalEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        signal: event.signal,
+        target_pid: event.target_pid,
+        target_image_path,
     })
 }
 
@@ -815,5 +870,105 @@ mod tests {
         assert_eq!(e.accepted_fd, 7);
         assert_eq!(e.peer_addr.to_string(), "203.0.113.42");
         assert_eq!(e.peer_port, 54321);
+    }
+
+    fn packed_str<const N: usize>(s: &[u8]) -> ([u8; N], u16) {
+        let mut buf = [0u8; N];
+        buf[..s.len()].copy_from_slice(s);
+        (buf, s.len() as u16)
+    }
+
+    #[test]
+    fn mount_carries_source_and_fs_type() {
+        let (mount_point, mount_point_len) = packed_str::<{ wire::MAX_PATH_LEN }>(b"/mnt/x");
+        let (source, source_len) = packed_str::<{ wire::MAX_PATH_LEN }>(b"/");
+        let (fs_type, fs_type_len) = packed_str::<{ wire::MAX_FS_TYPE_LEN }>(b"ext4");
+        let event = wire::MountEvent {
+            meta: wire_meta(b"mount"),
+            mount_point,
+            mount_point_len,
+            source,
+            source_len,
+            fs_type,
+            fs_type_len: fs_type_len as u8,
+            readonly: false,
+            mounted: true,
+        };
+        let Event::Mount(e) = mount(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.mount_point, "/mnt/x");
+        assert_eq!(e.source.as_deref(), Some("/"));
+        assert_eq!(e.fs_type.as_deref(), Some("ext4"));
+        assert!(e.mounted);
+        assert!(!e.readonly);
+    }
+
+    #[test]
+    fn mount_readonly_bind_remount_is_flagged() {
+        let (mount_point, mount_point_len) = packed_str::<{ wire::MAX_PATH_LEN }>(b"/");
+        let event = wire::MountEvent {
+            meta: wire_meta(b"mount"),
+            mount_point,
+            mount_point_len,
+            source: [0; wire::MAX_PATH_LEN],
+            source_len: 0,
+            fs_type: [0; wire::MAX_FS_TYPE_LEN],
+            fs_type_len: 0,
+            readonly: true,
+            mounted: true,
+        };
+        let Event::Mount(e) = mount(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert!(e.readonly);
+        assert_eq!(e.source, None, "no source arg on this call shape");
+        assert_eq!(e.fs_type, None);
+    }
+
+    #[test]
+    fn unmount_has_no_source_or_fs_type() {
+        let (mount_point, mount_point_len) = packed_str::<{ wire::MAX_PATH_LEN }>(b"/mnt/x");
+        let event = wire::MountEvent {
+            meta: wire_meta(b"umount"),
+            mount_point,
+            mount_point_len,
+            source: [0; wire::MAX_PATH_LEN],
+            source_len: 0,
+            fs_type: [0; wire::MAX_FS_TYPE_LEN],
+            fs_type_len: 0,
+            readonly: false,
+            mounted: false,
+        };
+        let Event::Mount(e) = mount(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert!(!e.mounted);
+        assert_eq!(e.source, None);
+        assert_eq!(e.fs_type, None);
+    }
+
+    #[test]
+    fn signal_meta_is_the_sender_not_the_target() {
+        let event = wire::SignalEvent {
+            meta: wire_meta(b"bash"),
+            signal: 9,
+            target_pid: 400,
+        };
+        let Event::Signal(e) = signal(
+            &event,
+            0,
+            Some("/usr/local/bin/synthaea-agent".to_string()),
+            None,
+        ) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.signal, 9);
+        assert_eq!(e.target_pid, 400);
+        assert_eq!(e.meta.comm, "bash", "meta must stay the sender");
+        assert_eq!(
+            e.target_image_path.as_deref(),
+            Some("/usr/local/bin/synthaea-agent")
+        );
     }
 }

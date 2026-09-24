@@ -39,6 +39,18 @@ pub(crate) fn err(msg: String) -> SensorError {
 /// `sys_enter_setxattr`/`sys_enter_removexattr` (issue #262 Phase 3) cover the
 /// plain path-taking syscalls only — `lsetxattr`/`fsetxattr` (symlink/fd-only
 /// variants) are deferred, same posture as `chmod`/`chown`'s fd-only siblings.
+///
+/// `sys_enter_mount`/`sys_enter_umount` (issue #362) feed `Event::Mount` — note
+/// `sys_enter_umount`, not `sys_enter_umount2`: glibc's `umount2(2)` libc wrapper
+/// maps to a kernel syscall the kernel itself names plain `umount`
+/// (`fs/namespace.c`'s `SYSCALL_DEFINE2(umount, ...)`), confirmed live on the lab
+/// (`sys_enter_umount2` does not exist). `move_mount(2)` is deferred (see
+/// `sensor-linux-wire`'s `WIRE_VERSION` v13 changelog). `sys_enter_kill`/
+/// `sys_enter_tgkill` feed `Event::Signal`, filtered
+/// kernel-side to the agent's own pid by `SIGNAL_WATCH_PID` — [`write_signal_watch_pid`]
+/// **must** run before these two are attached, same ordering requirement
+/// `prime_proc_lineage` documents for the fork/exit pair above. `sys_enter_tkill` is
+/// not attached — see `sensor-linux-wire`'s `WIRE_VERSION` v13 changelog for why.
 pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
     ("sched_process_fork", "sched", "sched_process_fork"),
     ("sched_process_exit", "sched", "sched_process_exit"),
@@ -66,6 +78,10 @@ pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
     ("sys_exit_accept4", "syscalls", "sys_exit_accept4"),
     ("sys_enter_setxattr", "syscalls", "sys_enter_setxattr"),
     ("sys_enter_removexattr", "syscalls", "sys_enter_removexattr"),
+    ("sys_enter_mount", "syscalls", "sys_enter_mount"),
+    ("sys_enter_umount", "syscalls", "sys_enter_umount"),
+    ("sys_enter_kill", "syscalls", "sys_enter_kill"),
+    ("sys_enter_tgkill", "syscalls", "sys_enter_tgkill"),
 ];
 
 /// `sensor_linux_wire::LineageEntry` is `repr(C)` over a `u32` and a `[u8; 16]` — every
@@ -210,4 +226,28 @@ pub(crate) fn prime_proc_lineage(ebpf: &mut aya::Ebpf) -> Result<u32, SensorErro
         }
     }
     Ok(primed)
+}
+
+/// Writes the agent's own pid into `SIGNAL_WATCH_PID` (issue #362) — **must** run
+/// before `sys_enter_kill`/`sys_enter_tgkill` are attached, otherwise those probes
+/// read the map's zero-initialized default (`0`, which `is_watched_signal_target`
+/// treats as "watch nothing") and silently drop every signal sent to the agent
+/// until this call catches up. Same self-pid `own_pid` computation
+/// `LinuxSensor::run_async`'s drain loop excludes its own events with (issue #340) —
+/// deliberately not the identical value in general (a future watchdog/multi-pid
+/// extension would diverge here), just the same source for this v1's single slot.
+///
+/// # Errors
+///
+/// Returns [`SensorError`] when `SIGNAL_WATCH_PID` is missing from the eBPF object
+/// or the write itself fails.
+pub(crate) fn write_signal_watch_pid(ebpf: &mut aya::Ebpf, pid: u32) -> Result<(), SensorError> {
+    let map = ebpf
+        .map_mut("SIGNAL_WATCH_PID")
+        .ok_or_else(|| err("map SIGNAL_WATCH_PID not found in eBPF object".to_string()))?;
+    let mut watch: aya::maps::Array<_, u32> = aya::maps::Array::try_from(map)
+        .map_err(|e| err(format!("SIGNAL_WATCH_PID is not an array map: {e}")))?;
+    watch
+        .set(0, pid, 0)
+        .map_err(|e| err(format!("failed to write SIGNAL_WATCH_PID: {e}")))
 }
