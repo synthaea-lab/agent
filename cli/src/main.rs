@@ -8,9 +8,9 @@
 //!
 //! Two families of subcommands:
 //!
-//! - **`config`** — inspection of the local install configuration
-//!   (`config check` / `config path`), no network involved. Cheap,
-//!   always available.
+//! - **`config`** — the local install configuration: `config init`
+//!   writes the committed default template, `config check` / `config
+//!   path` inspect it. No network involved. Cheap, always available.
 //! - **`status` / `health` / `detections` / `policy`** — IPC calls to
 //!   the running agent, over the endpoint declared in the config
 //!   (`config.ipc.endpoint`). Every one of these exits with a non-zero
@@ -82,6 +82,18 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ConfigCmd {
+    /// Write the committed default template to the path the discovery
+    /// order resolves (`--config`, then `SYNTHAEA_CONFIG`, then the OS
+    /// default), creating missing parent directories. Refuses to replace
+    /// an existing file unless `--force` is given. The template's
+    /// `# CHANGE ME` values must be filled in before the agent can reach a
+    /// control plane; `config check` validates the result.
+    Init {
+        /// Replace an existing file at the target path.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Discover, load, validate, and print a compact summary of the
     /// effective configuration. Fails with a copy-pasteable error if the
     /// discovery step finds no file or the file fails validation.
@@ -100,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Config { cmd } => match cmd {
+            ConfigCmd::Init { force } => cmd_config_init(cli.config.as_deref(), force),
             ConfigCmd::Check => cmd_config_check(cli.config.as_deref()),
             ConfigCmd::Path => cmd_config_path(cli.config.as_deref()),
         },
@@ -113,6 +126,14 @@ async fn main() -> anyhow::Result<()> {
 }
 
 // ── `config` family — local, sync ────────────────────────────────────────
+
+fn cmd_config_init(cli_arg: Option<&std::path::Path>, force: bool) -> anyhow::Result<()> {
+    let d = config::discover(cli_arg)?;
+    config::write_default_template(&d.path, force)?;
+    println!("Wrote the default configuration to {}.", d.path.display());
+    println!("Next: fill in every value marked `# CHANGE ME`, then run `cli config check`.");
+    Ok(())
+}
 
 fn cmd_config_check(cli_arg: Option<&std::path::Path>) -> anyhow::Result<()> {
     let cfg = config::load(cli_arg)?;

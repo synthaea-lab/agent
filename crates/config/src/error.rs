@@ -29,6 +29,42 @@ pub enum ConfigError {
         searched: Vec<PathBuf>,
     },
 
+    /// `cli config init` found a file already at `path` and was not given
+    /// `--force`. An installed config is operator state; overwriting it with
+    /// placeholder values would be a silent misconfiguration.
+    #[error(
+        "`{path}` already exists — refusing to overwrite it. Inspect it with \
+         `cli config check`, or pass `--force` to replace it with the default \
+         template."
+    )]
+    AlreadyExists {
+        /// Path that already holds a file.
+        path: PathBuf,
+    },
+
+    /// `cli config init` could not create the parent directory of `path` or
+    /// write the template to it (permission denied, read-only filesystem...).
+    #[error("failed to write the default configuration to `{path}`: {source}")]
+    Write {
+        /// Path the template was being written to.
+        path: PathBuf,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+
+    /// `cli config init` on an OS the committed template does not target yet:
+    /// it carries Linux paths and a Unix-socket `ipc.endpoint`, so writing it
+    /// here would install a file the agent then rejects.
+    #[error(
+        "no default configuration template for this OS yet (the committed one \
+         targets Linux). Copy `crates/config/data/default-agent.toml` to \
+         `{path}` and adapt the paths as its header describes."
+    )]
+    UnsupportedPlatform {
+        /// Path the template would have been written to.
+        path: PathBuf,
+    },
+
     /// The file at `path` couldn't be read from disk (missing when the caller
     /// passed an explicit `--config` path, permission denied, I/O error).
     #[error("failed to read configuration file `{path}`: {source}")]
@@ -62,7 +98,7 @@ pub enum ConfigError {
     /// a bump the release notes describe) or the binary (for a downgrade).
     #[error(
         "schema_version mismatch in `{path}`: found {found}, this build \
-         expects {expected}. Check the release notes for the migration path."
+ expects {expected}. Check the release notes for the migration path."
     )]
     SchemaVersionMismatch {
         /// Path being loaded.
@@ -80,7 +116,7 @@ pub enum ConfigError {
     /// `value` is what the file (or the env override) actually carried.
     #[error(
         "invalid value for `{field}` (expected {expected}, got `{value}`) \
-         in `{origin}`."
+ in `{origin}`."
     )]
     Invalid {
         /// Dot-path of the failing field.
@@ -101,8 +137,8 @@ pub enum ConfigError {
     /// literal" heuristic.
     #[error(
         "field `{field}` in `{origin}` is a secret but is not a supported \
-         reference. Expected `envvar:NAME` or `file:/absolute/path`, got \
-         `{value}`."
+ reference. Expected `envvar:NAME` or `file:/absolute/path`, got \
+ `{value}`."
     )]
     SecretInvalid {
         /// Dot-path of the offending secret field.
@@ -136,7 +172,7 @@ pub enum ConfigError {
     /// partial override never runs.
     #[error(
         "environment variable `{env_var}` = `{value}` is not a valid \
-         override for field `{field}` (expected {expected})."
+ override for field `{field}` (expected {expected})."
     )]
     EnvOverrideParse {
         /// The env variable that carried the bad value.
@@ -152,12 +188,12 @@ pub enum ConfigError {
 
 fn format_paths(paths: &[PathBuf]) -> String {
     if paths.is_empty() {
-        return "  (none)".to_string();
+        return " (none)".to_string();
     }
     paths
         .iter()
         .enumerate()
-        .map(|(i, p)| format!("  {}. {}", i + 1, p.display()))
+        .map(|(i, p)| format!(" {}. {}", i + 1, p.display()))
         .collect::<Vec<_>>()
         .join("\n")
 }

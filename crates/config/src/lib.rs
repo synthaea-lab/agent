@@ -46,6 +46,7 @@ mod error;
 mod load;
 mod schema;
 mod secret;
+mod template;
 
 #[cfg(test)]
 pub(crate) mod test_util;
@@ -57,3 +58,4 @@ pub use schema::{
     AgentConfig, IpcConfig, LogConfig, ResourcesConfig, SCHEMA_VERSION, ServerConfig, StorageConfig,
 };
 pub use secret::SecretRef;
+pub use template::{DEFAULT_TEMPLATE, write_default_template};
