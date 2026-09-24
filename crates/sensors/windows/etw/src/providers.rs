@@ -124,7 +124,6 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             parent_image_path,
             sha256: None, // filled by the agent's enrichment stage
             signature: None,
-            env_security: vec![], // loader-hijack env capture is Linux-only (#363)
         }));
     };
     Provider::by_guid(KERNEL_PROCESS_GUID)
