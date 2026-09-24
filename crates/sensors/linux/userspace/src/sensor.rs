@@ -200,9 +200,12 @@ impl LinuxSensor {
         let mut process_vm_read_ring_buf = ring("PROCESS_VM_READ_EVENTS")?;
         let mut process_vm_write_ring_buf = ring("PROCESS_VM_WRITE_EVENTS")?;
         let mut memfd_create_ring_buf = ring("MEMFD_CREATE_EVENTS")?;
+        let mut identity_change_ring_buf = ring("IDENTITY_CHANGE_EVENTS")?;
+        let mut capset_ring_buf = ring("CAPSET_EVENTS")?;
+        let mut namespace_ring_buf = ring("NAMESPACE_EVENTS")?;
 
         tracing::info!(
-            "sensor-linux: listening for exec/open/connect/write/delete/rename/bind/chmod/chown/udp_send/listen/accept/setxattr/removexattr/mount/signal/kernel_module/bpf/ptrace/process_vm_readv/process_vm_writev/memfd_create events"
+            "sensor-linux: listening for exec/open/connect/write/delete/rename/bind/chmod/chown/udp_send/listen/accept/setxattr/removexattr/mount/signal/kernel_module/bpf/ptrace/process_vm_readv/process_vm_writev/memfd_create/identity_change/capset/namespace events"
         );
 
         let mut container_ids = CgroupIdCache::new();
@@ -352,6 +355,24 @@ impl LinuxSensor {
                     drain!(guard, sensor_linux_wire::MemfdCreateEvent, sink, own_pid,
                         |e: &sensor_linux_wire::MemfdCreateEvent| {
                             normalize::memfd_create(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = identity_change_ring_buf.readable_mut() => {
+                    drain!(guard, sensor_linux_wire::IdentityChangeEvent, sink, own_pid,
+                        |e: &sensor_linux_wire::IdentityChangeEvent| {
+                            normalize::identity_change(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = capset_ring_buf.readable_mut() => {
+                    drain!(guard, sensor_linux_wire::CapSetEvent, sink, own_pid,
+                        |e: &sensor_linux_wire::CapSetEvent| {
+                            normalize::cap_set(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = namespace_ring_buf.readable_mut() => {
+                    drain!(guard, sensor_linux_wire::NamespaceEvent, sink, own_pid,
+                        |e: &sensor_linux_wire::NamespaceEvent| {
+                            normalize::namespace(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
             }

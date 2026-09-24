@@ -13,12 +13,12 @@ use aya_ebpf::{
 };
 use aya_log_ebpf::{info, warn};
 use sensor_linux_wire::{
-    BpfEvent, ConnectEvent, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent,
-    FileOpenEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent,
-    KernelModuleEvent, LineageEntry, MAX_TLS_CAPTURE, MemfdCreateEvent, MountEvent,
-    ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, SignalEvent,
-    SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TASK_COMM_LEN, TlsCaptureEvent,
-    UdpSendEvent,
+    BpfEvent, CapSetEvent, ConnectEvent, ExecEvent, FileChmodEvent, FileChownEvent,
+    FileDeleteEvent, FileOpenEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
+    FileWriteEvent, IdentityChangeEvent, KernelModuleEvent, LineageEntry, MAX_TLS_CAPTURE,
+    MemfdCreateEvent, MountEvent, NamespaceEvent, ProcessVmReadEvent, ProcessVmWriteEvent,
+    PtraceEvent, ReadlineInputEvent, SignalEvent, SocketAcceptEvent, SocketBindEvent,
+    SocketListenEvent, TASK_COMM_LEN, TlsCaptureEvent, UdpSendEvent,
 };
 
 // This probe reads NO `task_struct`/`mm_struct` frozen offset: parent lineage (ppid +
@@ -3093,6 +3093,427 @@ fn try_sys_enter_bpf(ctx: TracePointContext) -> Result<u32, u32> {
     }
 
     Ok(0)
+}
+
+// --- Identity change (issue #266) -------------------------------------------------
+
+/// Ring buffer shared with userspace for `setuid`/`setgid`/`setresuid`/
+/// `setresgid`/`setfsuid`/`setfsgid` events.
+#[map]
+static IDENTITY_CHANGE_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Per-CPU scratch for building one `IdentityChangeEvent` (see `EXEC_SCRATCH`).
+#[map]
+static IDENTITY_CHANGE_SCRATCH: PerCpuArray<IdentityChangeEvent> =
+    PerCpuArray::with_max_entries(1, 0);
+
+const IDENTITY_KIND_SETUID: u8 = 0;
+const IDENTITY_KIND_SETGID: u8 = 1;
+const IDENTITY_KIND_SETRESUID: u8 = 2;
+const IDENTITY_KIND_SETRESGID: u8 = 3;
+const IDENTITY_KIND_SETFSUID: u8 = 4;
+const IDENTITY_KIND_SETFSGID: u8 = 5;
+
+/// Offset of `setuid(2)`/`setgid(2)`/`setfsuid(2)`/`setfsgid(2)`'s single
+/// `uid_t`/`gid_t` argument — identical shape across all four, assumed
+/// standard layout (16-byte header + 8 bytes/arg on x86_64/aarch64);
+/// re-verify against `/format` on any kernel row added to `lab/MATRIX.md`,
+/// same posture as every other offset const in this file.
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const SINGLE_ID_OFFSET: usize = 16;
+/// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
+#[cfg(bpf_target_arch = "x86")]
+const SINGLE_ID_OFFSET: usize = 12;
+
+/// Offsets of `setresuid(2)`/`setresgid(2)`'s three `uid_t`/`gid_t`
+/// arguments (real, effective, saved) — identical shape for both, assumed
+/// standard layout, same posture as `SINGLE_ID_OFFSET`.
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const RES_ID_REAL_OFFSET: usize = 16;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const RES_ID_EFFECTIVE_OFFSET: usize = 24;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const RES_ID_SAVED_OFFSET: usize = 32;
+/// i686: inferred, not independently verified.
+#[cfg(bpf_target_arch = "x86")]
+const RES_ID_REAL_OFFSET: usize = 12;
+#[cfg(bpf_target_arch = "x86")]
+const RES_ID_EFFECTIVE_OFFSET: usize = 16;
+#[cfg(bpf_target_arch = "x86")]
+const RES_ID_SAVED_OFFSET: usize = 20;
+
+/// Shared by all six probes below: fills `EventMeta` and the kind-specific id
+/// fields into `IDENTITY_CHANGE_SCRATCH`, then emits. Mirrors
+/// `emit_kernel_module_event`'s shape (#264) — one assembly helper for a
+/// family of syscalls that share almost all of their event fields.
+fn emit_identity_change_event(
+    ctx: &TracePointContext,
+    kind: u8,
+    real: u32,
+    effective: u32,
+    saved: u32,
+) -> Result<u32, u32> {
+    let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
+    let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
+
+    let e = IDENTITY_CHANGE_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
+    unsafe {
+        core::ptr::write_bytes(e, 0, 1);
+
+        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*e).meta.ppid = lineage_ppid();
+        (*e).meta.uid = uid_gid as u32;
+        (*e).meta.gid = (uid_gid >> 32) as u32;
+        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
+        let mut i = 0usize;
+        while i < TASK_COMM_LEN {
+            (*e).meta.comm[i] = comm[i];
+            i += 1;
+        }
+        (*e).kind = kind;
+        (*e).real = real;
+        (*e).effective = effective;
+        (*e).saved = saved;
+
+        if IDENTITY_CHANGE_EVENTS
+            .output::<IdentityChangeEvent>(&*e, 0)
+            .is_err()
+        {
+            warn!(
+                ctx,
+                "sensor-linux-ebpf: ring buffer full, dropping identity change event"
+            );
+        }
+    }
+
+    Ok(0)
+}
+
+/// Reads a single 32-bit `uid_t`/`gid_t` syscall argument at `SINGLE_ID_OFFSET`,
+/// shared by `setuid`/`setgid`/`setfsuid`/`setfsgid` — the four probes below
+/// differ only in which `IDENTITY_KIND_*` they pass through.
+fn read_single_id(ctx: &TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let id: u64 = unsafe { ctx.read_at(SINGLE_ID_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let id: u64 = unsafe { ctx.read_at::<u32>(SINGLE_ID_OFFSET).map_err(|_| 1u32)? as u64 };
+    Ok(id as u32)
+}
+
+#[tracepoint]
+pub fn sys_enter_setuid(ctx: TracePointContext) -> u32 {
+    match read_single_id(&ctx) {
+        Ok(uid) => match emit_identity_change_event(&ctx, IDENTITY_KIND_SETUID, uid, 0, 0) {
+            Ok(ret) | Err(ret) => ret,
+        },
+        Err(ret) => ret,
+    }
+}
+
+#[tracepoint]
+pub fn sys_enter_setgid(ctx: TracePointContext) -> u32 {
+    match read_single_id(&ctx) {
+        Ok(gid) => match emit_identity_change_event(&ctx, IDENTITY_KIND_SETGID, gid, 0, 0) {
+            Ok(ret) | Err(ret) => ret,
+        },
+        Err(ret) => ret,
+    }
+}
+
+#[tracepoint]
+pub fn sys_enter_setfsuid(ctx: TracePointContext) -> u32 {
+    match read_single_id(&ctx) {
+        Ok(fsuid) => match emit_identity_change_event(&ctx, IDENTITY_KIND_SETFSUID, fsuid, 0, 0) {
+            Ok(ret) | Err(ret) => ret,
+        },
+        Err(ret) => ret,
+    }
+}
+
+#[tracepoint]
+pub fn sys_enter_setfsgid(ctx: TracePointContext) -> u32 {
+    match read_single_id(&ctx) {
+        Ok(fsgid) => match emit_identity_change_event(&ctx, IDENTITY_KIND_SETFSGID, fsgid, 0, 0) {
+            Ok(ret) | Err(ret) => ret,
+        },
+        Err(ret) => ret,
+    }
+}
+
+#[tracepoint]
+pub fn sys_enter_setresuid(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_setres(&ctx) {
+        Ok((real, effective, saved)) => {
+            match emit_identity_change_event(&ctx, IDENTITY_KIND_SETRESUID, real, effective, saved)
+            {
+                Ok(ret) | Err(ret) => ret,
+            }
+        }
+        Err(ret) => ret,
+    }
+}
+
+#[tracepoint]
+pub fn sys_enter_setresgid(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_setres(&ctx) {
+        Ok((real, effective, saved)) => {
+            match emit_identity_change_event(&ctx, IDENTITY_KIND_SETRESGID, real, effective, saved)
+            {
+                Ok(ret) | Err(ret) => ret,
+            }
+        }
+        Err(ret) => ret,
+    }
+}
+
+fn try_sys_enter_setres(ctx: &TracePointContext) -> Result<(u32, u32, u32), u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let real: u64 = unsafe { ctx.read_at(RES_ID_REAL_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let real: u64 = unsafe { ctx.read_at::<u32>(RES_ID_REAL_OFFSET).map_err(|_| 1u32)? as u64 };
+
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let effective: u64 = unsafe { ctx.read_at(RES_ID_EFFECTIVE_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let effective: u64 = unsafe {
+        ctx.read_at::<u32>(RES_ID_EFFECTIVE_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
+
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let saved: u64 = unsafe { ctx.read_at(RES_ID_SAVED_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let saved: u64 = unsafe { ctx.read_at::<u32>(RES_ID_SAVED_OFFSET).map_err(|_| 1u32)? as u64 };
+
+    Ok((real as u32, effective as u32, saved as u32))
+}
+
+// --- Capability set change (issue #266) ---------------------------------------
+
+/// Ring buffer shared with userspace for `capset` events.
+#[map]
+static CAPSET_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Per-CPU scratch for building one `CapSetEvent` (see `EXEC_SCRATCH`).
+#[map]
+static CAPSET_SCRATCH: PerCpuArray<CapSetEvent> = PerCpuArray::with_max_entries(1, 0);
+
+/// Offsets of the `syscalls:sys_enter_capset` tracepoint (`hdrp`, `data`),
+/// assumed standard layout — see `SINGLE_ID_OFFSET`'s note above.
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const CAPSET_HDRP_PTR_OFFSET: usize = 16;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const CAPSET_DATA_PTR_OFFSET: usize = 24;
+/// i686: inferred, not independently verified.
+#[cfg(bpf_target_arch = "x86")]
+const CAPSET_HDRP_PTR_OFFSET: usize = 12;
+#[cfg(bpf_target_arch = "x86")]
+const CAPSET_DATA_PTR_OFFSET: usize = 16;
+
+#[tracepoint]
+pub fn sys_enter_capset(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_capset(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+/// `struct __user_cap_header_struct { __u32 version; int pid; }` — `pid` is
+/// the second field, 4 bytes in.
+const CAP_HEADER_PID_OFFSET: u64 = 4;
+/// `struct __user_cap_data_struct { __u32 effective; __u32 permitted;
+/// __u32 inheritable; }` — this probe reads only element `[0]` of `datap`'s
+/// array (the low 32 capability bits; see this crate's WIRE_VERSION v12
+/// changelog for why that's deliberately sufficient), so no stride constant
+/// for element `[1]` is needed.
+const CAP_DATA_PERMITTED_OFFSET: u64 = 4;
+const CAP_DATA_INHERITABLE_OFFSET: u64 = 8;
+
+fn try_sys_enter_capset(ctx: TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let hdrp_ptr: u64 = unsafe { ctx.read_at(CAPSET_HDRP_PTR_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let hdrp_ptr: u64 = unsafe {
+        ctx.read_at::<u32>(CAPSET_HDRP_PTR_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
+
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let data_ptr: u64 = unsafe { ctx.read_at(CAPSET_DATA_PTR_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let data_ptr: u64 = unsafe {
+        ctx.read_at::<u32>(CAPSET_DATA_PTR_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
+
+    let target_pid: u32 = if hdrp_ptr != 0 {
+        unsafe { bpf_probe_read_user((hdrp_ptr + CAP_HEADER_PID_OFFSET) as *const i32) }
+            .map(|p: i32| p as u32)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    let (effective, permitted, inheritable) = if data_ptr != 0 {
+        let effective = unsafe { bpf_probe_read_user(data_ptr as *const u32) }.unwrap_or(0);
+        let permitted =
+            unsafe { bpf_probe_read_user((data_ptr + CAP_DATA_PERMITTED_OFFSET) as *const u32) }
+                .unwrap_or(0);
+        let inheritable =
+            unsafe { bpf_probe_read_user((data_ptr + CAP_DATA_INHERITABLE_OFFSET) as *const u32) }
+                .unwrap_or(0);
+        (effective, permitted, inheritable)
+    } else {
+        (0, 0, 0)
+    };
+
+    let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
+    let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
+
+    let e = CAPSET_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
+    unsafe {
+        core::ptr::write_bytes(e, 0, 1);
+
+        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*e).meta.ppid = lineage_ppid();
+        (*e).meta.uid = uid_gid as u32;
+        (*e).meta.gid = (uid_gid >> 32) as u32;
+        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
+        let mut i = 0usize;
+        while i < TASK_COMM_LEN {
+            (*e).meta.comm[i] = comm[i];
+            i += 1;
+        }
+        (*e).target_pid = target_pid;
+        (*e).effective = effective;
+        (*e).permitted = permitted;
+        (*e).inheritable = inheritable;
+
+        if CAPSET_EVENTS.output::<CapSetEvent>(&*e, 0).is_err() {
+            warn!(
+                &ctx,
+                "sensor-linux-ebpf: ring buffer full, dropping capset event"
+            );
+        }
+    }
+
+    Ok(0)
+}
+
+// --- Namespace manipulation (issue #266) ----------------------------------------
+
+/// Ring buffer shared with userspace for `setns`/`unshare` events.
+#[map]
+static NAMESPACE_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Per-CPU scratch for building one `NamespaceEvent` (see `EXEC_SCRATCH`).
+#[map]
+static NAMESPACE_SCRATCH: PerCpuArray<NamespaceEvent> = PerCpuArray::with_max_entries(1, 0);
+
+const NAMESPACE_SYSCALL_SETNS: u8 = 0;
+const NAMESPACE_SYSCALL_UNSHARE: u8 = 1;
+
+/// Offsets of the `syscalls:sys_enter_setns` tracepoint (`fd`, `nstype`),
+/// assumed standard layout — see `SINGLE_ID_OFFSET`'s note above.
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const SETNS_FD_OFFSET: usize = 16;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const SETNS_NSTYPE_OFFSET: usize = 24;
+/// i686: inferred, not independently verified.
+#[cfg(bpf_target_arch = "x86")]
+const SETNS_FD_OFFSET: usize = 12;
+#[cfg(bpf_target_arch = "x86")]
+const SETNS_NSTYPE_OFFSET: usize = 16;
+
+/// Offset of the `syscalls:sys_enter_unshare` tracepoint's single `flags`
+/// argument — assumed standard layout, see `SINGLE_ID_OFFSET`'s note above.
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const UNSHARE_FLAGS_OFFSET: usize = 16;
+#[cfg(bpf_target_arch = "x86")]
+const UNSHARE_FLAGS_OFFSET: usize = 12;
+
+fn emit_namespace_event(ctx: &TracePointContext, syscall: u8, fd: i32, flags: u32) -> u32 {
+    let comm = match bpf_get_current_comm() {
+        Ok(c) => c,
+        Err(_) => return 1,
+    };
+    let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
+
+    let Some(e) = NAMESPACE_SCRATCH.get_ptr_mut(0) else {
+        return 1;
+    };
+    unsafe {
+        core::ptr::write_bytes(e, 0, 1);
+
+        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*e).meta.ppid = lineage_ppid();
+        (*e).meta.uid = uid_gid as u32;
+        (*e).meta.gid = (uid_gid >> 32) as u32;
+        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
+        let mut i = 0usize;
+        while i < TASK_COMM_LEN {
+            (*e).meta.comm[i] = comm[i];
+            i += 1;
+        }
+        (*e).syscall = syscall;
+        (*e).fd = fd;
+        (*e).flags = flags;
+
+        if NAMESPACE_EVENTS.output::<NamespaceEvent>(&*e, 0).is_err() {
+            warn!(
+                ctx,
+                "sensor-linux-ebpf: ring buffer full, dropping namespace event"
+            );
+        }
+    }
+
+    0
+}
+
+#[tracepoint]
+pub fn sys_enter_setns(ctx: TracePointContext) -> u32 {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let fd: u64 = match unsafe { ctx.read_at(SETNS_FD_OFFSET) } {
+        Ok(v) => v,
+        Err(_) => return 1,
+    };
+    #[cfg(bpf_target_arch = "x86")]
+    let fd: u64 = match unsafe { ctx.read_at::<u32>(SETNS_FD_OFFSET) } {
+        Ok(v) => v as u64,
+        Err(_) => return 1,
+    };
+
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let nstype: u64 = match unsafe { ctx.read_at(SETNS_NSTYPE_OFFSET) } {
+        Ok(v) => v,
+        Err(_) => return 1,
+    };
+    #[cfg(bpf_target_arch = "x86")]
+    let nstype: u64 = match unsafe { ctx.read_at::<u32>(SETNS_NSTYPE_OFFSET) } {
+        Ok(v) => v as u64,
+        Err(_) => return 1,
+    };
+
+    emit_namespace_event(&ctx, NAMESPACE_SYSCALL_SETNS, fd as i32, nstype as u32)
+}
+
+#[tracepoint]
+pub fn sys_enter_unshare(ctx: TracePointContext) -> u32 {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let flags: u64 = match unsafe { ctx.read_at(UNSHARE_FLAGS_OFFSET) } {
+        Ok(v) => v,
+        Err(_) => return 1,
+    };
+    #[cfg(bpf_target_arch = "x86")]
+    let flags: u64 = match unsafe { ctx.read_at::<u32>(UNSHARE_FLAGS_OFFSET) } {
+        Ok(v) => v as u64,
+        Err(_) => return 1,
+    };
+
+    emit_namespace_event(&ctx, NAMESPACE_SYSCALL_UNSHARE, -1, flags as u32)
 }
 
 // --- Uprobes: TLS plaintext capture (issue #90) ------------------------------------

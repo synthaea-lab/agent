@@ -129,10 +129,27 @@ extern crate std;
 ///   `iov_len` (a size signal, not a full scatter-gather resolution) — same
 ///   "requested size, not full path/content" tradeoff `FileWriteEvent` and
 ///   `UdpSendEvent::size` already make.
-///   Originally claimed as v12 while this branch was open; renumbered to v13
-///   once `#262` Phase 3's xattr telemetry took v12, then to v14 once #362 and
-///   #264 took v13 on `main` (same coordination note as `SCHEMA_VERSION`).
-pub const WIRE_VERSION: u32 = 14;
+/// - v15: `IdentityChangeEvent`, `CapSetEvent`, and `NamespaceEvent` added
+///   (issue #266) — privilege escalation, capability abuse, and container
+///   escape via namespace manipulation. `IdentityChangeEvent` covers
+///   `setuid(2)`/`setgid(2)`/`setresuid(2)`/`setresgid(2)`/`setfsuid(2)`/
+///   `setfsgid(2)` with a `kind` discriminant (same shape as `MountEvent`'s
+///   `mounted` bool and `#264`'s `KernelModuleEvent::action` — one event
+///   family, several closely related syscalls). `CapSetEvent` decodes only
+///   the low 32 capability bits (`__user_cap_data_struct[0]`) of
+///   `capset(2)`'s requested effective/permitted/inheritable sets — every
+///   capability an attacker plausibly cares about (`CAP_SYS_ADMIN`=21,
+///   `CAP_SETUID`=7, `CAP_NET_ADMIN`=12, ...) is below bit 32; the high word
+///   (`__user_cap_data_struct[1]`, capabilities 32+: `CAP_BPF`,
+///   `CAP_PERFMON`, `CAP_CHECKPOINT_RESTORE`) is not read. `NamespaceEvent`
+///   covers `setns(2)` (the actual container-escape primitive — joining a
+///   host namespace from inside a container) and `unshare(2)` with a
+///   `syscall` discriminant. `prctl(PR_SET_SECUREBITS)`/`prctl(PR_CAPBSET_DROP)`
+///   (also listed on #266) are deliberately deferred: both are one `option`
+///   value out of `prctl(2)`'s dozens, needing a filtered `sys_enter_prctl`
+///   probe shaped like the `sys_enter_bpf` cmd filter (#264) — a future
+///   addition, not silently dropped.
+pub const WIRE_VERSION: u32 = 15;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
@@ -450,6 +467,61 @@ pub struct SignalEvent {
     /// Signal number, platform-native (`SIGKILL` = 9, `SIGTERM` = 15, ...).
     pub signal: u32,
     pub target_pid: u32,
+}
+
+/// User/group identity change (issue #266): `setuid(2)`/`setgid(2)`/
+/// `setresuid(2)`/`setresgid(2)`/`setfsuid(2)`/`setfsgid(2)`. The
+/// SUID-binary-abuse and privilege-drop/escalation primitive.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IdentityChangeEvent {
+    pub meta: EventMeta,
+    /// 0=setuid, 1=setgid, 2=setresuid, 3=setresgid, 4=setfsuid, 5=setfsgid.
+    pub kind: u8,
+    /// The requested id: `setuid`/`setgid`/`setfsuid`/`setfsgid`'s single
+    /// argument, or `setresuid`/`setresgid`'s "real" argument.
+    pub real: u32,
+    /// `setresuid`/`setresgid`'s "effective" argument only — meaningless
+    /// (not read) for the other four `kind`s; the userspace loader decides
+    /// whether to surface it purely from `kind`, never from this value.
+    pub effective: u32,
+    /// `setresuid`/`setresgid`'s "saved" argument only — same caveat as
+    /// `effective`.
+    pub saved: u32,
+}
+
+/// eBPF program/map lifecycle capability probe's sibling (issue #266):
+/// `capset(2)`. Decodes only the low 32 capability bits — see this file's
+/// `WIRE_VERSION` v12 changelog for why that is deliberately sufficient.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CapSetEvent {
+    pub meta: EventMeta,
+    /// `cap_user_header_t.pid` — the target process. `0` means "the calling
+    /// process itself" (`capset(2)`'s own documented meaning for pid 0, not
+    /// a probe failure sentinel).
+    pub target_pid: u32,
+    pub effective: u32,
+    pub permitted: u32,
+    pub inheritable: u32,
+}
+
+/// Namespace manipulation (issue #266): `setns(2)` (the container-escape
+/// primitive — joining a host namespace from inside a container) and
+/// `unshare(2)` (creating a new namespace).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NamespaceEvent {
+    pub meta: EventMeta,
+    /// 0 = setns, 1 = unshare.
+    pub syscall: u8,
+    /// `setns(2)`'s fd argument (an open `/proc/[pid]/ns/*` file). `-1` for
+    /// `unshare`.
+    pub fd: i32,
+    /// `setns(2)`'s `nstype` (a single `CLONE_NEW*` constant, or `0` for
+    /// "any"), or `unshare(2)`'s `flags` (a bitmask of one or more
+    /// `CLONE_NEW*` bits).
+    pub flags: u32,
 }
 
 /// TLS plaintext capture (uprobes on `SSL_read`/`SSL_write`, issue #90).

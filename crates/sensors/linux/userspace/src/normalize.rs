@@ -6,10 +6,11 @@
 //! once at startup and passes it here so schema timestamps are epoch nanoseconds.
 
 use schema::{
-    BpfEvent, ConnectEvent, ContainerContext, Event, EventMeta, ExecEvent, FileChmodEvent,
-    FileChownEvent, FileDeleteEvent, FileOpenEvent, FileRemovexattrEvent, FileRenameEvent,
-    FileSetxattrEvent, FileWriteEvent, KernelModuleAction, KernelModuleEvent, MemfdCreateEvent,
-    MountEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, SignalEvent,
+    BpfEvent, CapSetEvent, ConnectEvent, ContainerContext, Event, EventMeta, ExecEvent,
+    FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent, FileRemovexattrEvent,
+    FileRenameEvent, FileSetxattrEvent, FileWriteEvent, IdentityChangeEvent, IdentityChangeKind,
+    KernelModuleAction, KernelModuleEvent, MemfdCreateEvent, MountEvent, NamespaceEvent,
+    NamespaceSyscall, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, SignalEvent,
     SocketAcceptEvent, SocketBindEvent, SocketListenEvent, UdpSendEvent, User,
 };
 use sensor_linux_wire as wire;
@@ -66,7 +67,17 @@ use sensor_linux_wire as wire;
 /// `PtraceEvent`, `ProcessVmReadEvent`, `ProcessVmWriteEvent`, `MemfdCreateEvent`
 /// — new `ptrace`/`process_vm_read`/`process_vm_write`/`memfd_create` mapping
 /// functions below; no existing mapping changed shape.
-const _: () = assert!(wire::WIRE_VERSION == 14);
+///
+/// v15 (#266, originally claimed as v12 — see that constant's doc) added
+/// `IdentityChangeEvent`/`CapSetEvent`/`NamespaceEvent` — new
+/// `identity_change`/`cap_set`/`namespace` mapping functions below.
+/// `identity_change` turns the wire struct's `kind: u8` discriminant into
+/// `schema::IdentityChangeKind` and only surfaces `effective`/`saved` as
+/// `Some` for the two `SetRes*` kinds (never from the wire value itself,
+/// which is always populated — see that struct's doc). `namespace` does the
+/// same `syscall: u8` → enum conversion and surfaces `fd` as `Some` only for
+/// `setns`. No existing mapping changed shape.
+const _: () = assert!(wire::WIRE_VERSION == 15);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
@@ -514,6 +525,63 @@ pub fn memfd_create(
     Event::MemfdCreate(MemfdCreateEvent {
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
         name: String::from_utf8_lossy(&raw[..end]).into_owned(),
+        flags: event.flags,
+    })
+}
+
+#[must_use]
+pub fn identity_change(
+    event: &wire::IdentityChangeEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    let (kind, is_res) = match event.kind {
+        1 => (IdentityChangeKind::SetGid, false),
+        2 => (IdentityChangeKind::SetResUid, true),
+        3 => (IdentityChangeKind::SetResGid, true),
+        4 => (IdentityChangeKind::SetFsUid, false),
+        5 => (IdentityChangeKind::SetFsGid, false),
+        _ => (IdentityChangeKind::SetUid, false),
+    };
+    Event::IdentityChange(IdentityChangeEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        kind,
+        real: event.real,
+        effective: is_res.then_some(event.effective),
+        saved: is_res.then_some(event.saved),
+    })
+}
+
+#[must_use]
+pub fn cap_set(
+    event: &wire::CapSetEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    Event::CapSet(CapSetEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        target_pid: event.target_pid,
+        effective: event.effective,
+        permitted: event.permitted,
+        inheritable: event.inheritable,
+    })
+}
+
+#[must_use]
+pub fn namespace(
+    event: &wire::NamespaceEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    let is_setns = event.syscall == 0;
+    Event::Namespace(NamespaceEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        syscall: if is_setns {
+            NamespaceSyscall::SetNs
+        } else {
+            NamespaceSyscall::Unshare
+        },
+        fd: is_setns.then_some(event.fd),
         flags: event.flags,
     })
 }
@@ -1143,5 +1211,107 @@ mod tests {
             panic!("wrong variant")
         };
         assert_eq!(e.cmd, 5);
+    }
+
+    #[test]
+    fn identity_change_setuid_has_only_real() {
+        let event = wire::IdentityChangeEvent {
+            meta: wire_meta(b"su"),
+            kind: 0,
+            real: 1000,
+            effective: 0,
+            saved: 0,
+        };
+        let Event::IdentityChange(e) = identity_change(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.kind, IdentityChangeKind::SetUid);
+        assert_eq!(e.real, 1000);
+        assert_eq!(e.effective, None);
+        assert_eq!(e.saved, None);
+    }
+
+    #[test]
+    fn identity_change_setresuid_carries_all_three() {
+        let event = wire::IdentityChangeEvent {
+            meta: wire_meta(b"su"),
+            kind: 2,
+            real: 1000,
+            effective: 1000,
+            saved: 0,
+        };
+        let Event::IdentityChange(e) = identity_change(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.kind, IdentityChangeKind::SetResUid);
+        assert_eq!(e.real, 1000);
+        assert_eq!(e.effective, Some(1000));
+        assert_eq!(e.saved, Some(0));
+    }
+
+    #[test]
+    fn identity_change_setfsgid_has_only_real() {
+        let event = wire::IdentityChangeEvent {
+            meta: wire_meta(b"su"),
+            kind: 5,
+            real: 1000,
+            effective: 0,
+            saved: 0,
+        };
+        let Event::IdentityChange(e) = identity_change(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.kind, IdentityChangeKind::SetFsGid);
+        assert_eq!(e.effective, None);
+        assert_eq!(e.saved, None);
+    }
+
+    #[test]
+    fn cap_set_carries_the_low_word_bits() {
+        let event = wire::CapSetEvent {
+            meta: wire_meta(b"evil"),
+            target_pid: 0,
+            effective: 1 << 21,
+            permitted: 1 << 21,
+            inheritable: 0,
+        };
+        let Event::CapSet(e) = cap_set(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.target_pid, 0);
+        assert_eq!(e.effective, 1 << 21);
+        assert_eq!(e.permitted, 1 << 21);
+    }
+
+    #[test]
+    fn namespace_setns_carries_the_fd() {
+        let event = wire::NamespaceEvent {
+            meta: wire_meta(b"nsenter"),
+            syscall: 0,
+            fd: 3,
+            flags: 0x4000_0000,
+        };
+        let Event::Namespace(e) = namespace(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.syscall, NamespaceSyscall::SetNs);
+        assert_eq!(e.fd, Some(3));
+        assert_eq!(e.flags, 0x4000_0000);
+    }
+
+    #[test]
+    fn namespace_unshare_has_no_fd() {
+        let event = wire::NamespaceEvent {
+            meta: wire_meta(b"unshare"),
+            syscall: 1,
+            fd: -1,
+            flags: 0x0002_0000,
+        };
+        let Event::Namespace(e) = namespace(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.syscall, NamespaceSyscall::Unshare);
+        assert_eq!(e.fd, None);
+        assert_eq!(e.flags, 0x0002_0000);
     }
 }

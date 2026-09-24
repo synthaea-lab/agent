@@ -114,6 +114,15 @@ pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
         "syscalls",
         "sys_enter_memfd_create",
     ),
+    ("sys_enter_setuid", "syscalls", "sys_enter_setuid"),
+    ("sys_enter_setgid", "syscalls", "sys_enter_setgid"),
+    ("sys_enter_setresuid", "syscalls", "sys_enter_setresuid"),
+    ("sys_enter_setresgid", "syscalls", "sys_enter_setresgid"),
+    ("sys_enter_setfsuid", "syscalls", "sys_enter_setfsuid"),
+    ("sys_enter_setfsgid", "syscalls", "sys_enter_setfsgid"),
+    ("sys_enter_capset", "syscalls", "sys_enter_capset"),
+    ("sys_enter_setns", "syscalls", "sys_enter_setns"),
+    ("sys_enter_unshare", "syscalls", "sys_enter_unshare"),
 ];
 
 /// `sensor_linux_wire::LineageEntry` is `repr(C)` over a `u32` and a `[u8; 16]` — every

@@ -152,7 +152,14 @@ pub mod time;
 /// as v13-v24. Originally claimed as 21 → 22 while this branch was open, then
 /// renumbered each time another PR took the number first: 22 → 23 (#262 Phase 3
 /// xattr), 23 → 24 (#297 `PolicyDenial`), 24 → 25 (#264 kernel module / eBPF).
-pub const SCHEMA_VERSION: u32 = 25;
+///
+/// Bumped 25 → 26 for [`Event::IdentityChange`], [`Event::CapSet`], and
+/// [`Event::Namespace`] (#266: privilege escalation, capability abuse, and
+/// container-escape telemetry via `setuid`-family syscalls, `capset(2)`, and
+/// `setns(2)`/`unshare(2)`). Linux-only, no cross-platform reuse, same
+/// posture as #264/#265's Linux-only additions. Same serialization-visible
+/// reasoning as v13-v25.
+pub const SCHEMA_VERSION: u32 = 26;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -1401,6 +1408,84 @@ pub struct BpfEvent {
     pub cmd: u32,
 }
 
+/// Which user/group identity syscall produced an [`IdentityChangeEvent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityChangeKind {
+    SetUid,
+    SetGid,
+    SetResUid,
+    SetResGid,
+    SetFsUid,
+    SetFsGid,
+}
+
+/// User/group identity change (issue #266): `setuid(2)`/`setgid(2)`/
+/// `setresuid(2)`/`setresgid(2)`/`setfsuid(2)`/`setfsgid(2)`. The
+/// SUID-binary-abuse and privilege-drop/escalation primitive — a process
+/// requesting uid/gid 0 after starting as an unprivileged user is the
+/// canonical exploit-success signal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityChangeEvent {
+    pub meta: EventMeta,
+    pub kind: IdentityChangeKind,
+    /// The requested id — the single argument for [`IdentityChangeKind::SetUid`]/
+    /// [`IdentityChangeKind::SetGid`]/[`IdentityChangeKind::SetFsUid`]/
+    /// [`IdentityChangeKind::SetFsGid`], or the "real" argument for the
+    /// `SetRes*` kinds.
+    pub real: u32,
+    /// [`IdentityChangeKind::SetResUid`]/[`IdentityChangeKind::SetResGid`]'s
+    /// "effective" argument only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective: Option<u32>,
+    /// [`IdentityChangeKind::SetResUid`]/[`IdentityChangeKind::SetResGid`]'s
+    /// "saved" argument only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved: Option<u32>,
+}
+
+/// Linux capability set change (issue #266): `capset(2)`. Only the low 32
+/// capability bits are decoded — see `sensor-linux-wire::CapSetEvent`'s doc
+/// for why that already covers every capability an attacker plausibly wants
+/// (`CAP_SYS_ADMIN`, `CAP_SETUID`, `CAP_NET_ADMIN`, `CAP_DAC_OVERRIDE`, ...).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapSetEvent {
+    pub meta: EventMeta,
+    /// The target process. `0` means "the calling process itself" — this is
+    /// `capset(2)`'s own documented meaning for pid 0, not an absent value,
+    /// so it stays a plain `u32` rather than `Option<u32>`.
+    pub target_pid: u32,
+    pub effective: u32,
+    pub permitted: u32,
+    pub inheritable: u32,
+}
+
+/// Which namespace syscall produced a [`NamespaceEvent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NamespaceSyscall {
+    SetNs,
+    Unshare,
+}
+
+/// Namespace manipulation (issue #266): `setns(2)` — the container-escape
+/// primitive, joining a host namespace from inside a container — and
+/// `unshare(2)`, creating a new namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceEvent {
+    pub meta: EventMeta,
+    pub syscall: NamespaceSyscall,
+    /// [`NamespaceSyscall::SetNs`]'s fd argument (an open `/proc/[pid]/ns/*`
+    /// file). Absent for [`NamespaceSyscall::Unshare`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fd: Option<i32>,
+    /// `setns(2)`'s `nstype` (a single `CLONE_NEW*` constant, or `0` for
+    /// "any"), or `unshare(2)`'s `flags` (a bitmask of one or more
+    /// `CLONE_NEW*` bits) — not decoded to constant names here, same
+    /// "sensor reports, detection interprets" split as `PtraceEvent::request`.
+    pub flags: u32,
+}
+
 /// The normalized event envelope.
 ///
 /// `#[non_exhaustive]`: new telemetry categories (registry, DNS, image load, ...) are
@@ -1453,6 +1538,9 @@ pub enum Event {
     ProcessVmRead(ProcessVmReadEvent),
     ProcessVmWrite(ProcessVmWriteEvent),
     MemfdCreate(MemfdCreateEvent),
+    IdentityChange(IdentityChangeEvent),
+    CapSet(CapSetEvent),
+    Namespace(NamespaceEvent),
 }
 
 impl Event {
@@ -1503,6 +1591,9 @@ impl Event {
             Event::ProcessVmRead(e) => &e.meta,
             Event::ProcessVmWrite(e) => &e.meta,
             Event::MemfdCreate(e) => &e.meta,
+            Event::IdentityChange(e) => &e.meta,
+            Event::CapSet(e) => &e.meta,
+            Event::Namespace(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.

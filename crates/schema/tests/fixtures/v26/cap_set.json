@@ -1,0 +1,14 @@
+{
+  "type": "cap_set",
+  "meta": {
+    "pid": 9008,
+    "ppid": 1,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900026000000000,
+    "comm": "evil"
+  },
+  "target_pid": 0,
+  "effective": 2097152,
+  "permitted": 2097152,
+  "inheritable": 0
+}

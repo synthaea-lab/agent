@@ -28,10 +28,11 @@
 use core::net::{IpAddr, Ipv4Addr};
 
 use crate::{
-    AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, ConnectEvent, DnsQueryEvent,
-    EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent,
-    FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent, ImageLoadEvent,
-    KernelModuleAction, KernelModuleEvent, ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent,
+    AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, CapSetEvent, ConnectEvent,
+    DnsQueryEvent, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent,
+    FileOpenEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent,
+    IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent, KernelModuleAction, KernelModuleEvent,
+    ListenPortEvent, MemfdCreateEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent,
     ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent,
     ScriptBlockEvent, ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
     SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User,
@@ -404,6 +405,41 @@ pub fn memfd_create() -> MemfdCreateEvent {
     MemfdCreateEvent {
         meta: meta(),
         name: String::new(),
+        flags: 0,
+    }
+}
+
+/// Neutral [`IdentityChangeEvent`].
+#[must_use]
+pub fn identity_change() -> IdentityChangeEvent {
+    IdentityChangeEvent {
+        meta: meta(),
+        kind: IdentityChangeKind::SetUid,
+        real: 0,
+        effective: None,
+        saved: None,
+    }
+}
+
+/// Neutral [`CapSetEvent`].
+#[must_use]
+pub fn cap_set() -> CapSetEvent {
+    CapSetEvent {
+        meta: meta(),
+        target_pid: 0,
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }
+}
+
+/// Neutral [`NamespaceEvent`].
+#[must_use]
+pub fn namespace() -> NamespaceEvent {
+    NamespaceEvent {
+        meta: meta(),
+        syscall: NamespaceSyscall::SetNs,
+        fd: None,
         flags: 0,
     }
 }
