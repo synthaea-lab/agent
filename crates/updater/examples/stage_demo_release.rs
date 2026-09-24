@@ -7,11 +7,29 @@
 //! `UPDATER_PUBLIC_KEY` accepts.
 //!
 //! Usage: `cargo run -p updater --example stage_demo_release -- <base_dir>`
+//!
+//! Linux only, like the rest of `updater::layout` (ADR-0015's Linux-first slice —
+//! see that module's doc): the `current` symlink swap this stages is POSIX-shaped,
+//! and there is no Windows/macOS layout to demo yet. Compiles to an inert stub
+//! elsewhere, same "empty stub outside its platform" posture `updater` itself
+//! already has (see CLAUDE.md's platform-code rules) — this file previously had no
+//! such gate and failed to compile at all on non-Linux (`layout::Layout` is
+//! cfg'd out there, and `std::os::unix::fs::symlink` doesn't exist), breaking any
+//! `--all-targets` build on Windows/macOS.
 
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("stage_demo_release: Linux only (ADR-0015's layout is a Linux-first slice)");
+    std::process::exit(1);
+}
+
+#[cfg(target_os = "linux")]
 use std::{collections::BTreeMap, env, fs, path::PathBuf};
 
+#[cfg(target_os = "linux")]
 use updater::{ReleaseManifest, hash::hash_file, key::test_key_pair, layout::Layout};
 
+#[cfg(target_os = "linux")]
 fn main() {
     let base_dir = env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| {
         eprintln!("usage: stage_demo_release <base_dir>");
