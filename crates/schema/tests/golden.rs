@@ -9,14 +9,14 @@
 use std::net::IpAddr;
 
 use schema::{
-    AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, ConnectEvent, DnsQueryEvent, Event,
-    EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent,
+    AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, ConnectEvent, DnsQueryEvent,
+    Event, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent,
     FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent,
-    GatekeeperVerdictEvent, ImageLoadEvent, ListenPortEvent, MountEvent, NetworkFlowEvent,
-    POLICY_MECHANISM_SELINUX, PolicyDenialEvent, ReadlineInputEvent, RegistrySetEvent,
-    ScriptBlockEvent, ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
-    SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
-    UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
+    GatekeeperVerdictEvent, ImageLoadEvent, KernelModuleAction, KernelModuleEvent, ListenPortEvent,
+    MountEvent, NetworkFlowEvent, POLICY_MECHANISM_SELINUX, PolicyDenialEvent, ReadlineInputEvent,
+    RegistrySetEvent, ScriptBlockEvent, ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent,
+    SocketBindEvent, SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection,
+    TlsLibraryType, UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -1002,7 +1002,7 @@ fn socket_accept_golden() {
 
 #[test]
 fn policy_denial_golden() {
-    // v22 (#297): a SELinux AVC denial — httpd blocked (enforcing mode) from
+    // v23 (#297): a SELinux AVC denial — httpd blocked (enforcing mode) from
     // reading a file labeled for a user's home directory, the classic
     // web-shell-reading-secrets shape. `action` is absent: the AVC parser
     // doesn't yet recover the requested permission set, see the type's doc.
@@ -1024,6 +1024,52 @@ fn policy_denial_golden() {
             enforced: true,
         }),
         "policy_denial",
+    );
+}
+
+#[test]
+fn kernel_module_golden() {
+    // v24 (#264): `delete_module(2)` unloading a module by name — the classic
+    // rootkit-installation/removal primitive. `fd`/`image_len` are omitted
+    // (skip_serializing_if), not null: only `finit_module`/`init_module`
+    // populate those.
+    assert_golden(
+        &Event::KernelModule(KernelModuleEvent {
+            meta: EventMeta {
+                pid: 9005,
+                ppid: 1,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_023_000_000_000,
+                comm: "rmmod".into(),
+                container: None,
+            },
+            action: KernelModuleAction::Unload,
+            name: Some("evil_rootkit".into()),
+            fd: None,
+            image_len: None,
+        }),
+        "kernel_module",
+    );
+}
+
+#[test]
+fn bpf_operation_golden() {
+    // v24 (#264): a filtered `bpf(2)` command — BPF_PROG_LOAD (5) here, the
+    // eBPF-based defense-evasion primitive. BPF_MAP_LOOKUP_ELEM/UPDATE_ELEM and
+    // every other command never reach this event stream (filtered in-kernel).
+    assert_golden(
+        &Event::BpfOperation(BpfEvent {
+            meta: EventMeta {
+                pid: 9006,
+                ppid: 1,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_024_000_000_000,
+                comm: "evil_loader".into(),
+                container: None,
+            },
+            cmd: 5, // BPF_PROG_LOAD
+        }),
+        "bpf_operation",
     );
 }
 
@@ -1321,6 +1367,17 @@ fn meta_accessor_covers_all_variants() {
             object_class: None,
             action: None,
             enforced: false,
+        }),
+        Event::KernelModule(KernelModuleEvent {
+            meta: meta.clone(),
+            action: KernelModuleAction::Load,
+            name: None,
+            fd: None,
+            image_len: None,
+        }),
+        Event::BpfOperation(BpfEvent {
+            meta: meta.clone(),
+            cmd: 0,
         }),
     ];
     for e in &events {

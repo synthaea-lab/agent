@@ -82,6 +82,18 @@ pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
     ("sys_enter_umount", "syscalls", "sys_enter_umount"),
     ("sys_enter_kill", "syscalls", "sys_enter_kill"),
     ("sys_enter_tgkill", "syscalls", "sys_enter_tgkill"),
+    ("sys_enter_init_module", "syscalls", "sys_enter_init_module"),
+    (
+        "sys_enter_finit_module",
+        "syscalls",
+        "sys_enter_finit_module",
+    ),
+    (
+        "sys_enter_delete_module",
+        "syscalls",
+        "sys_enter_delete_module",
+    ),
+    ("sys_enter_bpf", "syscalls", "sys_enter_bpf"),
 ];
 
 /// `sensor_linux_wire::LineageEntry` is `repr(C)` over a `u32` and a `[u8; 16]` — every

@@ -86,25 +86,36 @@ extern crate std;
 ///   `setcap` writes, functionally the "+s" of extended attributes) but not
 ///   `value`: the namespace+attribute name is what most detections need, and
 ///   `value` is an arbitrary-length secondary read this slice does not add.
-/// - v13: `MountEvent`/`SignalEvent` added (issue #362) — feeds the two
-///   platform-neutral `schema` variants #96 introduced for macOS. `MountEvent`
-///   covers `mount(2)`/`umount2(2)` (`move_mount(2)` deferred, same "known gap, not
-///   silently dropped" treatment as `fchmod`/`fchown`'s fd-only variants).
-///   `umount2(2)`'s actual kernel tracepoint is `syscalls:sys_enter_umount`, not
-///   `sys_enter_umount2`: glibc's `umount2(2)` libc wrapper maps to a kernel
-///   syscall the kernel itself (`fs/namespace.c`) names plain `umount`, confirmed
-///   live on the lab 2026-09-23 after the assumed `sys_enter_umount2` turned out
-///   not to exist. `fs_type`
-///   gets its own small `MAX_FS_TYPE_LEN` budget — filesystem type names
-///   (`ext4`, `overlay`, `tmpfs`, ...) never approach `MAX_PATH_LEN`.
-///   `SignalEvent` covers `kill(2)`/`tgkill(2)`, filtered at the probe via
-///   `SIGNAL_WATCH_PID` (internal to the ebpf crate, not part of this wire ABI) to
-///   targets that are the agent's own pid — the "tamper subset, never the
-///   firehose" filter `SignalToEsClient` uses on macOS (its ES-client gate), scoped
-///   down to just self-protection for v1 (watchdog/other registered security
-///   processes are a documented future extension, not implemented here). `tkill(2)`
-///   is deferred: it takes a thread id, not a thread-group id, and has no field
-///   comparable to the whole-process pid this filter watches for.
+/// - v13: `MountEvent`/`SignalEvent` added (issue #362), `KernelModuleEvent` and
+///   `BpfEvent` added (issue #264). `MountEvent` covers `mount(2)`/`umount2(2)`
+///   (`move_mount(2)` deferred, same "known gap, not silently dropped" treatment
+///   as `fchmod`/`fchown`'s fd-only variants). `umount2(2)`'s actual kernel
+///   tracepoint is `syscalls:sys_enter_umount`, not `sys_enter_umount2`: glibc's
+///   `umount2(2)` libc wrapper maps to a kernel syscall the kernel itself
+///   (`fs/namespace.c`) names plain `umount`, confirmed live on the lab 2026-09-23
+///   after the assumed `sys_enter_umount2` turned out not to exist. `fs_type` gets
+///   its own small `MAX_FS_TYPE_LEN` budget — filesystem type names (`ext4`,
+///   `overlay`, `tmpfs`, ...) never approach `MAX_PATH_LEN`. `SignalEvent` covers
+///   `kill(2)`/`tgkill(2)`, filtered at the probe via `SIGNAL_WATCH_PID` (internal
+///   to the ebpf crate, not part of this wire ABI) to targets that are the agent's
+///   own pid — the "tamper subset, never the firehose" filter `SignalToEsClient`
+///   uses on macOS (its ES-client gate), scoped down to just self-protection for
+///   v1 (watchdog/other registered security processes are a documented future
+///   extension, not implemented here). `tkill(2)` is deferred: it takes a thread
+///   id, not a thread-group id, and has no field comparable to the whole-process
+///   pid this filter watches for. `KernelModuleEvent` covers kernel module
+///   load/unload (`init_module(2)`/`finit_module(2)`/`delete_module(2)`) —
+///   `KernelModuleEvent::name` is only populated for `delete_module(2)`, the only
+///   one of the three that receives a module name as a real syscall argument;
+///   `init_module`/`finit_module` load a raw ELF image whose module name lives
+///   inside the blob itself, not decoded here (same "sensor reports the syscall
+///   boundary, not the payload" posture as `FileWriteEvent`'s no-path stance).
+///   `BpfEvent` covers the eBPF program/map lifecycle (`bpf(2)`), filtered
+///   in-kernel to `BPF_MAP_CREATE`, `BPF_PROG_LOAD`, and `BPF_PROG_ATTACH` only —
+///   every other `bpf(2)` command (map lookups/updates, the overwhelming majority
+///   of real traffic, including this agent's own sensor loading its probes) never
+///   reaches the ring buffer, the same "never the firehose" discipline as
+///   `SIGNAL_WATCH_PID` filtering.
 ///   Originally claimed as v12 while this branch was open; renumbered to v13
 ///   once `#262` Phase 3's xattr telemetry took v12 on `main` first (same
 ///   coordination note as `SCHEMA_VERSION`'s v13/v19/v20 history).
@@ -124,6 +135,11 @@ pub const MAX_XATTR_NAME_LEN: usize = 255;
 /// (`ext4`, `overlay`, `tmpfs`, `fuse.sshfs`, ...) are always short, nowhere near
 /// `MAX_PATH_LEN`.
 pub const MAX_FS_TYPE_LEN: usize = 32;
+/// Kernel's own `MODULE_NAME_LEN` (`include/linux/module.h`) is 56;
+/// `delete_module(2)` itself truncates any longer name at that bound before
+/// this probe even sees it. Rounded up here for alignment headroom, not
+/// because names can be longer.
+pub const MAX_MODULE_NAME_LEN: usize = 64;
 /// Budget for TLS plaintext capture (first N bytes). Chosen to fit comfortably
 /// in a ring-buffer event with metadata while staying under 512 bytes total.
 pub const MAX_TLS_CAPTURE: usize = 256;
@@ -454,6 +470,45 @@ pub struct ReadlineInputEvent {
     pub input_len: u32,
     /// Full command line input. Budget: 512 bytes.
     pub input: [u8; MAX_READLINE_INPUT],
+}
+
+/// Kernel module load/unload (issue #264): `init_module(2)` (raw ELF image from
+/// memory), `finit_module(2)` (image from an already-open fd), `delete_module(2)`
+/// (unload by name). The classic rootkit-installation primitive.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct KernelModuleEvent {
+    pub meta: EventMeta,
+    /// `delete_module(2)`'s `name` argument — the only one of the three
+    /// syscalls that names the module directly (see this file's v12
+    /// changelog). Zero-length for `init_module`/`finit_module`.
+    pub name: [u8; MAX_MODULE_NAME_LEN],
+    pub name_len: u16,
+    /// `finit_module(2)`'s fd argument. `-1` for `init_module`/`delete_module`.
+    pub fd: i32,
+    /// `init_module(2)`'s `len` argument — size in bytes of the raw module
+    /// image. `0` for `finit_module`/`delete_module`.
+    pub image_len: u64,
+    /// `finit_module(2)`/`delete_module(2)`'s `flags` argument. `0` for
+    /// `init_module` (no flags argument).
+    pub flags: u32,
+    /// 0 = `init_module` (load, raw image), 1 = `finit_module` (load, from
+    /// fd), 2 = `delete_module` (unload).
+    pub action: u8,
+}
+
+/// eBPF program/map lifecycle (issue #264): `bpf(2)`, filtered in-kernel to
+/// `BPF_MAP_CREATE`/`BPF_PROG_LOAD`/`BPF_PROG_ATTACH` (see this file's v12
+/// changelog) — eBPF-based defense evasion and kernel backdoor detection.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BpfEvent {
+    pub meta: EventMeta,
+    /// Raw `bpf_cmd` value (`<linux/bpf.h>`) — always one of the three
+    /// filtered commands above; not decoded to a name here, same
+    /// "sensor reports, detection interprets" split as every other raw
+    /// syscall-argument field in this crate.
+    pub cmd: u32,
 }
 
 /// Decodes a fixed comm buffer: NUL-terminated, kernel-truncated to 15 bytes — a

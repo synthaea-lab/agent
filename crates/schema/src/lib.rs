@@ -131,7 +131,18 @@ pub mod time;
 /// serialization-visible reasoning as v13-v22. Originally claimed as 21 → 22
 /// while this branch was open; renumbered once #262 Phase 3's xattr telemetry
 /// took v22 on `main` first — same coordination note as v13 and ADR-0005.
-pub const SCHEMA_VERSION: u32 = 23;
+///
+/// Bumped 23 → 24 for [`Event::KernelModule`] and [`Event::BpfOperation`]
+/// (#264: kernel module load/unload and eBPF program/map lifecycle
+/// telemetry — `init_module(2)`/`finit_module(2)`/`delete_module(2)` and a
+/// filtered `bpf(2)`). Linux-only, no cross-platform reuse (same posture as
+/// #265's `Ptrace`/`ProcessVmRead`/`ProcessVmWrite`/`MemfdCreate` — these
+/// syscalls have no Windows/macOS analogue this shape fits). Same
+/// serialization-visible reasoning as v13-v23. Originally claimed as 21 → 22
+/// while this branch was open; renumbered to 22 → 23 once `#262` Phase 3's
+/// xattr telemetry took v22 on `main` first, then to 23 → 24 once `#297`'s
+/// `PolicyDenial` took v23 on `main` in turn — same coordination note as above.
+pub const SCHEMA_VERSION: u32 = 24;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -1255,6 +1266,59 @@ pub struct PolicyDenialEvent {
     pub enforced: bool,
 }
 
+/// Which of the three kernel-module syscalls produced a [`KernelModuleEvent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KernelModuleAction {
+    /// `init_module(2)` — raw ELF module image supplied directly in memory.
+    Load,
+    /// `finit_module(2)` — module image loaded from an already-open file
+    /// descriptor.
+    LoadFd,
+    /// `delete_module(2)` — unload by name.
+    Unload,
+}
+
+/// Kernel module load/unload (issue #264): `init_module(2)`, `finit_module(2)`,
+/// `delete_module(2)`. The classic rootkit-installation primitive — unauthorized
+/// module loading is one of the highest-signal kernel-tampering events on Linux.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelModuleEvent {
+    pub meta: EventMeta,
+    pub action: KernelModuleAction,
+    /// The module name — only [`KernelModuleAction::Unload`] receives one
+    /// directly as a syscall argument; `init_module`/`finit_module` load a raw
+    /// ELF image whose module name lives inside the blob itself, not decoded
+    /// here (see `sensor-linux-wire::KernelModuleEvent`'s doc).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The already-open file descriptor [`KernelModuleAction::LoadFd`] loads
+    /// from. Resolving it to a path is deferred — same "sensor reports the
+    /// syscall boundary, not an enriched path" posture as `FileWriteEvent`'s
+    /// fd-only shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fd: Option<i32>,
+    /// Size in bytes of the raw module image [`KernelModuleAction::Load`]
+    /// receives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_len: Option<u64>,
+}
+
+/// eBPF program/map lifecycle (issue #264): the `bpf(2)` syscall, filtered at
+/// the source to `BPF_MAP_CREATE`/`BPF_PROG_LOAD`/`BPF_PROG_ATTACH` — every
+/// other `bpf(2)` command (map lookups/updates, the overwhelming majority of
+/// real traffic, including this agent's own sensor) never reaches this event
+/// stream at all (see `sensor-linux-wire::BpfEvent`'s doc). eBPF-based defense
+/// evasion and kernel backdoor detection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BpfEvent {
+    pub meta: EventMeta,
+    /// Raw `bpf_cmd` value (`<linux/bpf.h>`) — always one of the three
+    /// filtered commands above; not decoded to a name here, same
+    /// "sensor reports, detection interprets" split as `PtraceEvent::request`.
+    pub cmd: u32,
+}
+
 /// The normalized event envelope.
 ///
 /// `#[non_exhaustive]`: new telemetry categories (registry, DNS, image load, ...) are
@@ -1301,6 +1365,8 @@ pub enum Event {
     FileSetxattr(FileSetxattrEvent),
     FileRemovexattr(FileRemovexattrEvent),
     PolicyDenial(PolicyDenialEvent),
+    KernelModule(KernelModuleEvent),
+    BpfOperation(BpfEvent),
 }
 
 impl Event {
@@ -1345,6 +1411,8 @@ impl Event {
             Event::FileSetxattr(e) => &e.meta,
             Event::FileRemovexattr(e) => &e.meta,
             Event::PolicyDenial(e) => &e.meta,
+            Event::KernelModule(e) => &e.meta,
+            Event::BpfOperation(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.

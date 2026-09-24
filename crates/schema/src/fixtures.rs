@@ -28,12 +28,13 @@
 use core::net::{IpAddr, Ipv4Addr};
 
 use crate::{
-    AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, ConnectEvent, DnsQueryEvent, EventMeta,
-    ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent,
+    AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, ConnectEvent, DnsQueryEvent,
+    EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent,
     FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent, ImageLoadEvent,
-    ListenPortEvent, NetworkFlowEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
-    ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent,
-    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
+    KernelModuleAction, KernelModuleEvent, ListenPortEvent, NetworkFlowEvent, ReadlineInputEvent,
+    RegistrySetEvent, ScriptBlockEvent, ShellType, SmbConnectEvent, SocketAcceptEvent,
+    SocketBindEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
+    UdpSendEvent, User, WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -336,5 +337,26 @@ pub fn socket_accept() -> SocketAcceptEvent {
         accepted_fd: 0,
         peer_addr: TEST_ADDR,
         peer_port: 0,
+    }
+}
+
+/// Neutral [`KernelModuleEvent`].
+#[must_use]
+pub fn kernel_module() -> KernelModuleEvent {
+    KernelModuleEvent {
+        meta: meta(),
+        action: KernelModuleAction::Load,
+        name: None,
+        fd: None,
+        image_len: None,
+    }
+}
+
+/// Neutral [`BpfEvent`].
+#[must_use]
+pub fn bpf_operation() -> BpfEvent {
+    BpfEvent {
+        meta: meta(),
+        cmd: 0,
     }
 }

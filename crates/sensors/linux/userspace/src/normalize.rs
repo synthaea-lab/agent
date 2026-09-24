@@ -6,10 +6,10 @@
 //! once at startup and passes it here so schema timestamps are epoch nanoseconds.
 
 use schema::{
-    ConnectEvent, ContainerContext, Event, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent,
-    FileDeleteEvent, FileOpenEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
-    FileWriteEvent, MountEvent, SignalEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent,
-    UdpSendEvent, User,
+    BpfEvent, ConnectEvent, ContainerContext, Event, EventMeta, ExecEvent, FileChmodEvent,
+    FileChownEvent, FileDeleteEvent, FileOpenEvent, FileRemovexattrEvent, FileRenameEvent,
+    FileSetxattrEvent, FileWriteEvent, KernelModuleAction, KernelModuleEvent, MountEvent,
+    SignalEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, UdpSendEvent, User,
 };
 use sensor_linux_wire as wire;
 
@@ -50,14 +50,16 @@ use sensor_linux_wire as wire;
 /// shape as `file_chmod`/`file_chown` plus a second nul-padded field (the xattr
 /// `name`); no existing mapping changed shape.
 ///
-/// v13 (#362, originally claimed as v12 — see that constant's doc) added
-/// `MountEvent`/`SignalEvent` — new `mount`/`signal` mapping functions below.
-/// `mount` turns zero-length `source`/`fs_type` (umount2(2) has neither) into
-/// `None`, matching how the macOS producer reports them absent. `signal` takes
-/// `target_image_path` from the caller rather than the wire event — the probe
-/// filters to the agent's own pid (v1 scope), which the sensor already knows
-/// its own exe path for without a `/proc/<pid>/exe` readlink per event. No
-/// existing mapping changed shape.
+/// v13 (#362 and #264, originally claimed as v12 — see that constant's doc) added
+/// `MountEvent`/`SignalEvent` and `KernelModuleEvent`/`BpfEvent`. `mount` turns
+/// zero-length `source`/`fs_type` (umount2(2) has neither) into `None`, matching
+/// how the macOS producer reports them absent. `signal` takes `target_image_path`
+/// from the caller rather than the wire event — the probe filters to the agent's
+/// own pid (v1 scope), which the sensor already knows its own exe path for
+/// without a `/proc/<pid>/exe` readlink per event. `kernel_module` turns the wire
+/// struct's `action: u8` discriminant into `schema::KernelModuleAction` and its
+/// always-populated `fd`/`image_len` sentinels (`-1`/`0` when not applicable to
+/// the action) into `Option`s. No existing mapping changed shape.
 const _: () = assert!(wire::WIRE_VERSION == 13);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
@@ -408,6 +410,45 @@ pub fn signal(
         signal: event.signal,
         target_pid: event.target_pid,
         target_image_path,
+    })
+}
+
+#[must_use]
+pub fn kernel_module(
+    event: &wire::KernelModuleEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    let action = match event.action {
+        1 => KernelModuleAction::LoadFd,
+        2 => KernelModuleAction::Unload,
+        _ => KernelModuleAction::Load,
+    };
+    let name = if event.name_len > 0 {
+        let raw = &event.name[..(event.name_len as usize).min(wire::MAX_MODULE_NAME_LEN)];
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        Some(String::from_utf8_lossy(&raw[..end]).into_owned())
+    } else {
+        None
+    };
+    Event::KernelModule(KernelModuleEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        action,
+        name,
+        fd: (event.fd >= 0).then_some(event.fd),
+        image_len: (event.image_len > 0).then_some(event.image_len),
+    })
+}
+
+#[must_use]
+pub fn bpf_operation(
+    event: &wire::BpfEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    Event::BpfOperation(BpfEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        cmd: event.cmd,
     })
 }
 
@@ -970,5 +1011,71 @@ mod tests {
             e.target_image_path.as_deref(),
             Some("/usr/local/bin/synthaea-agent")
         );
+    }
+
+    fn wire_kernel_module(name: &[u8]) -> wire::KernelModuleEvent {
+        let mut name_buf = [0u8; wire::MAX_MODULE_NAME_LEN];
+        name_buf[..name.len()].copy_from_slice(name);
+        wire::KernelModuleEvent {
+            meta: wire_meta(b"rmmod"),
+            name: name_buf,
+            name_len: name.len() as u16,
+            fd: -1,
+            image_len: 0,
+            flags: 0,
+            action: 2,
+        }
+    }
+
+    #[test]
+    fn kernel_module_unload_carries_the_name() {
+        let event = wire_kernel_module(b"evil_rootkit");
+        let Event::KernelModule(e) = kernel_module(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.action, KernelModuleAction::Unload);
+        assert_eq!(e.name.as_deref(), Some("evil_rootkit"));
+        assert_eq!(e.fd, None);
+        assert_eq!(e.image_len, None);
+    }
+
+    #[test]
+    fn kernel_module_load_has_no_name_but_has_image_len() {
+        let mut event = wire_kernel_module(b"");
+        event.action = 0;
+        event.image_len = 4096;
+        let Event::KernelModule(e) = kernel_module(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.action, KernelModuleAction::Load);
+        assert_eq!(e.name, None);
+        assert_eq!(e.fd, None);
+        assert_eq!(e.image_len, Some(4096));
+    }
+
+    #[test]
+    fn kernel_module_load_fd_carries_the_fd_not_a_name() {
+        let mut event = wire_kernel_module(b"");
+        event.action = 1;
+        event.fd = 5;
+        let Event::KernelModule(e) = kernel_module(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.action, KernelModuleAction::LoadFd);
+        assert_eq!(e.name, None);
+        assert_eq!(e.fd, Some(5));
+        assert_eq!(e.image_len, None);
+    }
+
+    #[test]
+    fn bpf_operation_carries_the_raw_cmd() {
+        let event = wire::BpfEvent {
+            meta: wire_meta(b"evil_loader"),
+            cmd: 5, // BPF_PROG_LOAD
+        };
+        let Event::BpfOperation(e) = bpf_operation(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.cmd, 5);
     }
 }

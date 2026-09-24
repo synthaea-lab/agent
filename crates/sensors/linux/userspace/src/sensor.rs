@@ -194,9 +194,11 @@ impl LinuxSensor {
         let mut file_removexattr_ring_buf = ring("FILE_REMOVEXATTR_EVENTS")?;
         let mut mount_ring_buf = ring("MOUNT_EVENTS")?;
         let mut signal_ring_buf = ring("SIGNAL_EVENTS")?;
+        let mut kernel_module_ring_buf = ring("KERNEL_MODULE_EVENTS")?;
+        let mut bpf_ring_buf = ring("BPF_EVENTS")?;
 
         tracing::info!(
-            "sensor-linux: listening for exec/open/connect/write/delete/rename/bind/chmod/chown/udp_send/listen/accept/setxattr/removexattr/mount/signal events"
+            "sensor-linux: listening for exec/open/connect/write/delete/rename/bind/chmod/chown/udp_send/listen/accept/setxattr/removexattr/mount/signal/kernel_module/bpf events"
         );
 
         let mut container_ids = CgroupIdCache::new();
@@ -310,6 +312,18 @@ impl LinuxSensor {
                     drain!(guard, sensor_linux_wire::SignalEvent, sink, own_pid,
                         |e: &sensor_linux_wire::SignalEvent| {
                             normalize::signal(e, offset, self_exe.clone(), container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = kernel_module_ring_buf.readable_mut() => {
+                    drain!(guard, sensor_linux_wire::KernelModuleEvent, sink, own_pid,
+                        |e: &sensor_linux_wire::KernelModuleEvent| {
+                            normalize::kernel_module(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = bpf_ring_buf.readable_mut() => {
+                    drain!(guard, sensor_linux_wire::BpfEvent, sink, own_pid,
+                        |e: &sensor_linux_wire::BpfEvent| {
+                            normalize::bpf_operation(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
             }
