@@ -46,7 +46,11 @@ pub(crate) fn parse_fork_format(format: &str) -> Option<ForkLayout> {
             "parent_comm" => {
                 let data_loc = field.decl.starts_with("__data_loc");
                 // Inline: `char parent_comm[16]` (size 16). Data-loc: a u32 locator.
-                let size_ok = if data_loc { field.size == 4 } else { field.size == 16 };
+                let size_ok = if data_loc {
+                    field.size == 4
+                } else {
+                    field.size == 16
+                };
                 if size_ok && field.decl.contains("char") {
                     parent_comm = Some((field.offset, data_loc));
                 }
