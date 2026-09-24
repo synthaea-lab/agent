@@ -77,7 +77,12 @@ use sensor_linux_wire as wire;
 /// which is always populated — see that struct's doc). `namespace` does the
 /// same `syscall: u8` → enum conversion and surfaces `fd` as `Some` only for
 /// `setns`. No existing mapping changed shape.
-const _: () = assert!(wire::WIRE_VERSION == 15);
+///
+/// v16 (#267 Phase 1, originally claimed as v12 — see that constant's doc)
+/// added `GetAddrInfoEvent` — not imported here either (the DNS uprobe pair
+/// lives in `sensor-linux-uprobes`, not this crate's tracepoint-only
+/// surface); no existing mapping changed shape.
+const _: () = assert!(wire::WIRE_VERSION == 16);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.

@@ -9,8 +9,8 @@
 //! before event emission. See `crate::redact` for patterns and implementation.
 
 use schema::{
-    ContainerContext, Event, EventMeta, ReadlineInputEvent, ShellType, TlsCaptureEvent,
-    TlsDirection, TlsLibraryType, User,
+    ContainerContext, DnsQueryEvent, Event, EventMeta, ReadlineInputEvent, ShellType,
+    TlsCaptureEvent, TlsDirection, TlsLibraryType, User,
 };
 use sensor_linux_wire as wire;
 
@@ -49,7 +49,12 @@ use crate::redact;
 /// v15 (#266, originally claimed as v12 — see that constant's doc) added
 /// `IdentityChangeEvent`/`CapSetEvent`/`NamespaceEvent` — not imported here
 /// either, same reasoning.
-const _: () = assert!(wire::WIRE_VERSION == 15);
+///
+/// v16 (#267 Phase 1, originally claimed as v12 — see that constant's doc)
+/// added `GetAddrInfoEvent` — new `dns_query` mapping function below, reusing
+/// the platform-neutral `schema::DnsQueryEvent` already shared with the
+/// Windows DNS-Client ETW producer.
+const _: () = assert!(wire::WIRE_VERSION == 16);
 
 /// `container` is resolved by the caller (`crate::container::container_context`,
 /// issue #312) from `EventMeta::cgroup_id` against cgroupfs, with image/name filled
@@ -144,6 +149,56 @@ pub fn readline_input(
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
         shell_type,
         input,
+    })
+}
+
+/// Normalizes a `getaddrinfo(3)` wire event into the schema event type,
+/// reusing `schema::DnsQueryEvent` (issue #267 Phase 1, platform-neutral,
+/// already shared with the Windows DNS-Client ETW producer).
+///
+/// `qtype` reflects the *first resolved answer's* address family (1 = A,
+/// 28 = AAAA) — `getaddrinfo` can be called with `AF_UNSPEC`, so what the
+/// caller actually requested isn't visible at this probe's information
+/// level; on a failed lookup (no address resolved) it defaults to `1` as a
+/// neutral placeholder, not a claim about the real request. `status` is
+/// `0` on success or the absolute value of the negative `EAI_*` return code
+/// on failure (e.g. `EAI_NONAME` = -2 becomes `2`) — the raw two's-complement
+/// bit pattern of a small negative `i32` cast straight to `u32` would be a
+/// number in the billions, unreadable to a human or a detection rule.
+///
+/// **Security:** the query name is redacted for sensitive TLDs before
+/// emission — see `crate::redact::redact_dns_query`.
+#[must_use]
+pub fn dns_query(
+    event: &wire::GetAddrInfoEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    let raw = &event.query[..(event.query_len as usize).min(wire::MAX_DNS_QUERY_LEN)];
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    let query = redact::redact_dns_query(String::from_utf8_lossy(&raw[..end]).into_owned());
+
+    let (qtype, result) = if event.addr_resolved {
+        let addr = if event.is_ipv6 {
+            std::net::IpAddr::V6(event.addr_v6.into())
+        } else {
+            std::net::IpAddr::V4(event.addr_v4.into())
+        };
+        (if event.is_ipv6 { 28 } else { 1 }, Some(addr.to_string()))
+    } else {
+        (1, None)
+    };
+
+    Event::DnsQuery(DnsQueryEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        query,
+        qtype,
+        result,
+        status: if event.status == 0 {
+            0
+        } else {
+            event.status.unsigned_abs()
+        },
     })
 }
 
@@ -379,5 +434,70 @@ mod tests {
             panic!("wrong variant")
         };
         assert_eq!(e.meta.container, Some(ctx));
+    }
+
+    fn wire_dns(query: &[u8]) -> wire::GetAddrInfoEvent {
+        let mut query_buf = [0u8; wire::MAX_DNS_QUERY_LEN];
+        query_buf[..query.len()].copy_from_slice(query);
+        wire::GetAddrInfoEvent {
+            meta: wire_meta(b"curl"),
+            query: query_buf,
+            query_len: query.len() as u16,
+            status: 0,
+            addr_resolved: false,
+            is_ipv6: false,
+            addr_v4: [0; 4],
+            addr_v6: [0; 16],
+        }
+    }
+
+    #[test]
+    fn dns_query_resolved_ipv4_carries_the_address() {
+        let mut event = wire_dns(b"example.com");
+        event.addr_resolved = true;
+        event.addr_v4 = [93, 184, 216, 34];
+
+        let Event::DnsQuery(e) = dns_query(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.query, "example.com");
+        assert_eq!(e.qtype, 1);
+        assert_eq!(e.result.as_deref(), Some("93.184.216.34"));
+        assert_eq!(e.status, 0);
+    }
+
+    #[test]
+    fn dns_query_resolved_ipv6_sets_qtype_aaaa() {
+        let mut event = wire_dns(b"example.com");
+        event.addr_resolved = true;
+        event.is_ipv6 = true;
+        event.addr_v6 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+
+        let Event::DnsQuery(e) = dns_query(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.qtype, 28);
+        assert_eq!(e.result.as_deref(), Some("::1"));
+    }
+
+    #[test]
+    fn dns_query_failure_has_no_result_and_a_readable_status() {
+        let mut event = wire_dns(b"nonexistent.invalid");
+        event.status = -2; // EAI_NONAME
+
+        let Event::DnsQuery(e) = dns_query(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.result, None);
+        assert_eq!(e.status, 2, "readable, not the wrapped u32 of -2");
+    }
+
+    #[test]
+    fn dns_query_redacts_internal_tlds() {
+        let event = wire_dns(b"db01.internal");
+        let Event::DnsQuery(e) = dns_query(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.query, "[REDACTED].internal");
     }
 }

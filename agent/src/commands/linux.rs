@@ -209,6 +209,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         enable_quarantine,
         enable_tls_capture,
         enable_readline_capture,
+        enable_dns_capture,
         server,
         ipc_endpoint,
     } = opts;
@@ -281,7 +282,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
             NO_CANARY_SILENCE_DEADLINE_NS,
             now_ns,
         );
-        if enable_tls_capture || enable_readline_capture {
+        if enable_tls_capture || enable_readline_capture || enable_dns_capture {
             mon.register(
                 uprobes_heartbeat.clone(),
                 NO_CANARY_SILENCE_DEADLINE_NS,
@@ -338,12 +339,13 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
 
     spawn_netlink_poller(sink.clone(), netlink_heartbeat);
     spawn_journal_tail(sink.clone(), journal_heartbeat, alerts);
-    if enable_tls_capture || enable_readline_capture {
+    if enable_tls_capture || enable_readline_capture || enable_dns_capture {
         spawn_uprobes_sensor(
             sink.clone(),
             uprobes_heartbeat,
             enable_tls_capture,
             enable_readline_capture,
+            enable_dns_capture,
         );
     }
 
@@ -522,11 +524,13 @@ fn spawn_journal_tail(
 }
 
 /// Spawns the background thread running the uprobes sensor (issue #90: TLS
-/// plaintext taps via `SSL_read`/`SSL_write` uprobes, shell readline capture) when at
+/// plaintext taps via `SSL_read`/`SSL_write` uprobes, shell readline capture;
+/// issue #267 Phase 1: DNS query capture via a `getaddrinfo(3)` uprobe) when at
 /// least one capture is enabled by CLI flag. Only called when the caller has
-/// already checked `enable_tls_capture || enable_readline_capture` — `cmd_run`
-/// doesn't spawn this thread at all otherwise, so a deliberately-disabled capture
-/// costs nothing at runtime, not even a parked thread.
+/// already checked `enable_tls_capture || enable_readline_capture ||
+/// enable_dns_capture` — `cmd_run` doesn't spawn this thread at all otherwise,
+/// so a deliberately-disabled capture costs nothing at runtime, not even a
+/// parked thread.
 ///
 /// Unlike [`spawn_netlink_poller`]/[`spawn_journal_tail`] above, `UprobesSensor`
 /// implements `Sensor` — the same trait the primary eBPF/audit sensor does — so
@@ -539,6 +543,7 @@ fn spawn_uprobes_sensor(
     heartbeat: SensorHeartbeat,
     enable_tls_capture: bool,
     enable_readline_capture: bool,
+    enable_dns_capture: bool,
 ) {
     std::thread::Builder::new()
         .name("uprobes".into())
@@ -549,6 +554,9 @@ fn spawn_uprobes_sensor(
             }
             if enable_readline_capture {
                 config = config.with_readline_enabled();
+            }
+            if enable_dns_capture {
+                config = config.with_dns_enabled();
             }
             let mut sensor = sensor_linux_uprobes::UprobesSensor::with_config(config);
             if let Err(e) = sensor.run(Box::new(PulsingSink::new(sink, heartbeat))) {

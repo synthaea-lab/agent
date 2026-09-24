@@ -216,6 +216,103 @@ pub fn find_readline_libraries() -> Result<Vec<PathBuf>, ResolverError> {
     Ok(libraries)
 }
 
+/// Finds libc in common system paths, deduplicating symlinks. Every process on
+/// the box links against exactly one of these, so unlike the SSL/readline
+/// searches this always finds something on a working Linux system.
+///
+/// # Errors
+///
+/// Returns [`ResolverError`] if directory traversal fails.
+pub fn find_libc_libraries() -> Result<Vec<PathBuf>, ResolverError> {
+    let search_paths = [
+        "/lib",
+        "/usr/lib",
+        "/lib64",
+        "/usr/lib64",
+        "/lib/x86_64-linux-gnu",
+        "/usr/lib/x86_64-linux-gnu",
+        "/lib/aarch64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+    ];
+
+    let mut libraries = Vec::new();
+    let mut seen_inodes = HashSet::new();
+
+    for &search_path in &search_paths {
+        let path = Path::new(search_path);
+        if !path.exists() {
+            continue;
+        }
+
+        let entries = match fs::read_dir(path) {
+            Ok(e) => e,
+            Err(_) => continue, // Skip inaccessible dirs
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let filename = match path.file_name().and_then(|s| s.to_str()) {
+                Some(f) => f,
+                None => continue,
+            };
+
+            // Look for libc.so* (glibc) — musl's libc.so has a different name
+            // pattern (ld-musl-*.so.1) and getaddrinfo lives in a different
+            // symbol table shape there; musl support is issue #267 Phase 2.
+            if !filename.starts_with("libc.so") && !filename.starts_with("libc-") {
+                continue;
+            }
+
+            if let Ok(metadata) = fs::metadata(&path) {
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    let inode = metadata.ino();
+                    if metadata.is_file() && seen_inodes.insert(inode) {
+                        libraries.push(path);
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    if metadata.is_file() {
+                        libraries.push(path);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(libraries)
+}
+
+/// Resolves the `getaddrinfo(3)` symbol from system libc libraries (issue
+/// #267 Phase 1).
+///
+/// # Errors
+///
+/// Returns [`ResolverError`] if library discovery or symbol parsing fails.
+pub fn resolve_dns_symbols() -> Result<Vec<SymbolInfo>, ResolverError> {
+    let libraries = find_libc_libraries()?;
+    let target_symbols = ["getaddrinfo"];
+
+    let mut all_symbols = Vec::new();
+    for lib in &libraries {
+        match resolve_symbols(lib, &target_symbols) {
+            Ok(mut symbols) => all_symbols.append(&mut symbols),
+            Err(e) => {
+                tracing::warn!(library = %lib.display(), error = %e, "symbol_resolver: parse failed");
+            }
+        }
+    }
+
+    tracing::info!(
+        symbols = all_symbols.len(),
+        libraries = libraries.len(),
+        "symbol_resolver: resolved DNS symbols"
+    );
+    Ok(all_symbols)
+}
+
 /// Resolves ELF symbols from a library's dynamic symbol table.
 ///
 /// # Errors

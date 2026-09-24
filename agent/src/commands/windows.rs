@@ -321,7 +321,7 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
 /// fully inactive on Windows regardless of these flags. `enable_tls_capture`/
 /// `enable_readline_capture` (issue #90) are Linux-uprobe-specific — ETW would need
 /// its own, unrelated mechanism — so they're accepted for parity only, same as the
-/// response flags.
+/// response flags. `enable_dns_capture` (issue #267) is the same story.
 pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     let super::RunOptions {
         alerts,
@@ -333,6 +333,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         // parity and inert here, same as the response flags above.
         enable_tls_capture: _,
         enable_readline_capture: _,
+        enable_dns_capture: _,
         server,
         ipc_endpoint,
     } = opts;

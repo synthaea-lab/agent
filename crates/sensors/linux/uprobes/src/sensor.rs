@@ -16,7 +16,7 @@ use aya::{
     programs::{UProbe, uprobe::UProbeScope},
 };
 use schema::sensor::{Capabilities, EventSink, Sensor, SensorError};
-use sensor_linux_wire::{ReadlineInputEvent, TlsCaptureEvent, comm_str};
+use sensor_linux_wire::{GetAddrInfoEvent, ReadlineInputEvent, TlsCaptureEvent, comm_str};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
@@ -117,6 +117,46 @@ impl ReadlineBudgetTracker {
         entries.retain(|ts| now.duration_since(*ts) < window);
 
         if entries.len() >= self.commands_per_sec as usize {
+            return false;
+        }
+
+        entries.push(now);
+
+        self.cleanup_counter += 1;
+        if self.cleanup_counter >= 100 {
+            self.cleanup_counter = 0;
+            self.windows.retain(|_, entries| !entries.is_empty());
+        }
+
+        true
+    }
+}
+
+/// Per-process budget tracking for DNS capture (sliding window). Same shape as
+/// [`ReadlineBudgetTracker`] — one query "unit" per event, not bytes.
+struct DnsBudgetTracker {
+    queries_per_sec: u32,
+    windows: HashMap<u32, Vec<Instant>>,
+    cleanup_counter: u32,
+}
+
+impl DnsBudgetTracker {
+    fn new(queries_per_sec: u32) -> Self {
+        Self {
+            queries_per_sec,
+            windows: HashMap::new(),
+            cleanup_counter: 0,
+        }
+    }
+
+    fn check_and_record(&mut self, pid: u32) -> bool {
+        let now = Instant::now();
+        let window = Duration::from_secs(1);
+
+        let entries = self.windows.entry(pid).or_default();
+        entries.retain(|ts| now.duration_since(*ts) < window);
+
+        if entries.len() >= self.queries_per_sec as usize {
             return false;
         }
 
@@ -361,6 +401,50 @@ macro_rules! drain_readline {
     }};
 }
 
+/// Drains up to [`MAX_ITEMS_PER_DRAIN`] DNS query events from the ring buffer and
+/// emits normalized schema events. Applies budget enforcement and allowlist filtering.
+macro_rules! drain_dns {
+    ($guard:expr, $sink:expr, $offset:expr, $config:expr, $budget:expr, $dropped:expr, $container_ids:expr, $docker_cache:expr) => {{
+        let mut guard = $guard.map_err(|e| err(format!("DNS ring buffer poll failed: {e}")))?;
+        let rb = guard.get_inner_mut();
+        let mut drained = 0usize;
+        while drained < MAX_ITEMS_PER_DRAIN {
+            let Some(item) = rb.next() else { break };
+            drained += 1;
+            if let Some(event) = read_wire_event::<GetAddrInfoEvent>(&item) {
+                if !$config.dns.process_allowlist.is_empty() {
+                    let comm = comm_str(&event.meta.comm);
+                    if !$config.dns.process_allowlist.contains(&comm) {
+                        debug!(
+                            pid = event.meta.pid,
+                            comm, "sensor-linux-uprobes: DNS query dropped (allowlist)"
+                        );
+                        $dropped += 1;
+                        continue;
+                    }
+                }
+
+                if !$budget.check_and_record(event.meta.pid) {
+                    debug!(
+                        pid = event.meta.pid,
+                        "sensor-linux-uprobes: DNS query dropped (budget)"
+                    );
+                    $dropped += 1;
+                    continue;
+                }
+
+                let container =
+                    container_context(event.meta.cgroup_id, $container_ids, $docker_cache);
+                let schema_event = normalize::dns_query(&event, $offset, container);
+                $sink.on_event(schema_event);
+            }
+        }
+        if drained < MAX_ITEMS_PER_DRAIN {
+            guard.clear_ready();
+        }
+    }};
+}
+
 /// Spawns the detached eBPF-log drain task, or warns and continues without it —
 /// probe logging is diagnostics, never worth failing the sensor over. Only a
 /// broken `AsyncFd` registration (the tokio reactor itself) is a hard error.
@@ -466,6 +550,27 @@ fn attach_readline_uprobes(
     Ok(())
 }
 
+/// Same contract as [`attach_tls_uprobes`], for `getaddrinfo(3)` (issue #267
+/// Phase 1) — always both the entry and exit probe at the same resolved
+/// offset, no per-library variants (unlike TLS's OpenSSL/BoringSSL/GnuTLS
+/// split — every glibc build exports one `getaddrinfo`).
+fn attach_dns_uprobes(
+    ebpf: &mut aya::Ebpf,
+    loaded_programs: &mut HashSet<String>,
+) -> Result<(), SensorError> {
+    let dns_symbols = symbol_resolver::resolve_dns_symbols()
+        .map_err(|e| err(format!("DNS symbol resolution failed: {e}")))?;
+
+    for symbol in &dns_symbols {
+        for probe_name in ["getaddrinfo_entry", "getaddrinfo_exit"] {
+            if let Err(e) = attach_uprobe(ebpf, probe_name, symbol, loaded_programs) {
+                warn!(probe = probe_name, error = %e, "sensor-linux-uprobes: failed to attach uprobe");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Uprobe sensor. `run` blocks until Ctrl-C or [`Sensor::stop`].
 pub struct UprobesSensor {
     stop: Arc<Notify>,
@@ -499,7 +604,7 @@ impl UprobesSensor {
 
     async fn run_async(&mut self, sink: Box<dyn EventSink>) -> Result<(), SensorError> {
         // Check if any capture is enabled
-        if !self.config.tls.enabled && !self.config.readline.enabled {
+        if !self.config.tls.enabled && !self.config.readline.enabled && !self.config.dns.enabled {
             info!("sensor-linux-uprobes: all captures disabled, exiting");
             return Ok(());
         }
@@ -511,8 +616,10 @@ impl UprobesSensor {
         let mut tls_budget = TlsBudgetTracker::new(self.config.tls.bytes_per_process_per_sec);
         let mut readline_budget =
             ReadlineBudgetTracker::new(self.config.readline.commands_per_process_per_sec);
+        let mut dns_budget = DnsBudgetTracker::new(self.config.dns.queries_per_process_per_sec);
         let mut tls_dropped = 0u64;
         let mut readline_dropped = 0u64;
+        let mut dns_dropped = 0u64;
         let mut container_ids = CgroupIdCache::new();
         let docker_cache: DockerInfoCache = Arc::new(Mutex::new(HashMap::new()));
 
@@ -535,6 +642,13 @@ impl UprobesSensor {
             info!("sensor-linux-uprobes: readline capture disabled");
         }
 
+        if self.config.dns.enabled {
+            info!("sensor-linux-uprobes: DNS capture enabled, resolving symbols...");
+            attach_dns_uprobes(&mut ebpf, &mut loaded_programs)?;
+        } else {
+            info!("sensor-linux-uprobes: DNS capture disabled");
+        }
+
         // Open ring buffers (only for enabled captures)
         let mut ring = |map: &str| -> Result<_, SensorError> {
             let m = ebpf
@@ -554,6 +668,12 @@ impl UprobesSensor {
 
         let mut readline_ring_buf = if self.config.readline.enabled {
             Some(ring("READLINE_EVENTS")?)
+        } else {
+            None
+        };
+
+        let mut dns_ring_buf = if self.config.dns.enabled {
+            Some(ring("DNS_QUERY_EVENTS")?)
         } else {
             None
         };
@@ -584,6 +704,15 @@ impl UprobesSensor {
                 } => {
                     drain_readline!(guard, sink, offset, self.config, readline_budget, readline_dropped, &mut container_ids, &docker_cache);
                 }
+                guard = async {
+                    if let Some(ref mut rb) = dns_ring_buf {
+                        rb.readable_mut().await
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
+                    drain_dns!(guard, sink, offset, self.config, dns_budget, dns_dropped, &mut container_ids, &docker_cache);
+                }
             }
         }
 
@@ -598,6 +727,12 @@ impl UprobesSensor {
             info!(
                 dropped = readline_dropped,
                 "sensor-linux-uprobes: readline captures dropped (budget/allowlist)"
+            );
+        }
+        if dns_dropped > 0 {
+            info!(
+                dropped = dns_dropped,
+                "sensor-linux-uprobes: DNS captures dropped (budget/allowlist)"
             );
         }
 

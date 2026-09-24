@@ -149,7 +149,26 @@ extern crate std;
 ///   value out of `prctl(2)`'s dozens, needing a filtered `sys_enter_prctl`
 ///   probe shaped like the `sys_enter_bpf` cmd filter (#264) — a future
 ///   addition, not silently dropped.
-pub const WIRE_VERSION: u32 = 15;
+/// - v16: `GetAddrInfoEvent` added (issue #267 Phase 1) — a uprobe/uretprobe
+///   pair on glibc's `getaddrinfo(3)`, the DNS-based C2/tunneling/
+///   exfiltration visibility this crate had none of. Entry stashes the
+///   query-name pointer and the caller's `struct addrinfo **res` output-
+///   parameter pointer (`GETADDRINFO_ARGS`, internal to the ebpf crate, same
+///   pid_tgid-keyed correlation-map shape as `SSL_READ_ARGS`); exit reads the
+///   return code and, on success, dereferences `*res` and decodes only the
+///   *first* `addrinfo` entry's family + address — a real query commonly
+///   returns several (one per A/AAAA record, sometimes both), and walking
+///   the whole linked list is deferred, same "first element only" tradeoff
+///   as `#265`'s `ProcessVmReadEvent::remote_iov_len`. Emitted on failure
+///   too (`status != 0`, no address fields) — a resolution failure is itself
+///   a signal (DGA malware generates many). musl's internal resolver,
+///   systemd-resolved's D-Bus path, and raw UDP/TCP port-53 capture (DoH/DoT
+///   blind spots either way) are `#267`'s Phase 2, not implemented here.
+///   Originally claimed as v12 while this branch was open; renumbered to v13
+///   once `#262` Phase 3's xattr telemetry took v12, then to v14 once #362 and
+///   #264 took v13 on `main`, then to v16 once #265 and #266 took v14/v15
+///   (same coordination note as `SCHEMA_VERSION`).
+pub const WIRE_VERSION: u32 = 16;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
@@ -170,6 +189,10 @@ pub const MAX_FS_TYPE_LEN: usize = 32;
 /// this probe even sees it. Rounded up here for alignment headroom, not
 /// because names can be longer.
 pub const MAX_MODULE_NAME_LEN: usize = 64;
+/// Budget for a `getaddrinfo(3)` query name. RFC 1035's 253-byte domain-name
+/// limit fits comfortably; matches `MAX_PATH_LEN`'s existing budget rather
+/// than inventing a new number.
+pub const MAX_DNS_QUERY_LEN: usize = 256;
 /// Budget for TLS plaintext capture (first N bytes). Chosen to fit comfortably
 /// in a ring-buffer event with metadata while staying under 512 bytes total.
 pub const MAX_TLS_CAPTURE: usize = 256;
@@ -679,6 +702,30 @@ pub struct MemfdCreateEvent {
     pub name_len: u16,
     /// The `flags` argument (`MFD_CLOEXEC`, `MFD_ALLOW_SEALING`, ...).
     pub flags: u32,
+}
+
+/// DNS resolution via glibc's `getaddrinfo(3)` (issue #267 Phase 1): the
+/// DNS-based C2/tunneling/exfiltration visibility primitive. See this file's
+/// `WIRE_VERSION` v16 changelog for the uprobe/uretprobe correlation shape and
+/// the "first `addrinfo` entry only" tradeoff.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GetAddrInfoEvent {
+    pub meta: EventMeta,
+    pub query: [u8; MAX_DNS_QUERY_LEN],
+    pub query_len: u16,
+    /// `getaddrinfo(3)`'s return code: `0` on success, a negative `EAI_*`
+    /// constant on failure (`EAI_NONAME`, `EAI_AGAIN`, ...) — not decoded to
+    /// a name here, same "sensor reports, detection interprets" split as
+    /// every other raw syscall/libc return value in this crate.
+    pub status: i32,
+    /// `true` if `addr_v4`/`addr_v6`/`is_ipv6` were populated from the
+    /// first resolved `addrinfo` entry. `false` on failure (`status != 0`)
+    /// or an unrecognized `ai_family`.
+    pub addr_resolved: bool,
+    pub is_ipv6: bool,
+    pub addr_v4: [u8; 4],
+    pub addr_v6: [u8; 16],
 }
 
 /// Decodes a fixed comm buffer: NUL-terminated, kernel-truncated to 15 bytes — a

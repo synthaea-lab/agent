@@ -40,6 +40,8 @@ pub(crate) struct RunOptions<'a> {
     pub(crate) enable_tls_capture: bool,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) enable_readline_capture: bool,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) enable_dns_capture: bool,
     pub(crate) server: Option<&'a str>,
     /// Where the local IPC control channel listens for `cli` (issue #388),
     /// from `cfg.ipc.endpoint`: a Unix socket path, or a Windows named pipe.

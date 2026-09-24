@@ -121,6 +121,31 @@ pub fn redact_readline_input(mut input: String) -> String {
     input
 }
 
+/// `(pattern, replacement)` pairs applied to DNS query names, in order — issue
+/// #267's "redact sensitive TLDs" requirement. Matches the whole query against
+/// each private/internal TLD in turn and, on a hit, blanks everything before
+/// that TLD while keeping the TLD itself visible: an internal hostname is
+/// sensitive (topology disclosure), but "this process queried something under
+/// `.internal`" is exactly the signal DNS tunneling/exfil detection needs to
+/// keep. Public DNS (the overwhelming majority of queries) is never touched.
+const DNS_PATTERNS: &[(&str, &str)] = &[(
+    r"(?i)^.+\.(local|internal|lan|home|corp|intranet)\.?$",
+    "[REDACTED].$1",
+)];
+
+/// Redacts sensitive TLDs from a DNS query name before it's emitted as a
+/// schema event. Public domains pass through unchanged.
+///
+/// Example: `db01.prod.internal` becomes `[REDACTED].internal` — pinned by
+/// `dns_query_redaction_holds` below, not a doctest (see `redact_tls_data`'s
+/// doc for why, issue #276).
+pub fn redact_dns_query(mut query: String) -> String {
+    for (pattern, replacement) in DNS_PATTERNS {
+        query = redact_pattern(&query, pattern, replacement);
+    }
+    query
+}
+
 /// Helper: applies a regex pattern replacement.
 ///
 /// Every pattern used by this module is static and covered by `all_patterns_compile`,
@@ -249,12 +274,47 @@ mod tests {
 
     #[test]
     fn all_patterns_compile() {
-        for (pattern, _) in TLS_PATTERNS.iter().chain(READLINE_PATTERNS.iter()) {
+        for (pattern, _) in TLS_PATTERNS
+            .iter()
+            .chain(READLINE_PATTERNS.iter())
+            .chain(DNS_PATTERNS.iter())
+        {
             assert!(
                 regex::Regex::new(pattern).is_ok(),
                 "pattern failed to compile: {pattern}"
             );
         }
+    }
+
+    #[test]
+    fn dns_query_redaction_holds() {
+        assert_eq!(
+            redact_dns_query("db01.prod.internal".to_string()),
+            "[REDACTED].internal"
+        );
+    }
+
+    #[test]
+    fn dns_redacts_every_sensitive_tld() {
+        for tld in ["local", "internal", "lan", "home", "corp", "intranet"] {
+            let query = format!("host.{tld}");
+            let redacted = redact_dns_query(query.clone());
+            assert_eq!(redacted, format!("[REDACTED].{tld}"), "tld: {tld}");
+        }
+    }
+
+    #[test]
+    fn dns_preserves_public_domains() {
+        let query = "example.com".to_string();
+        assert_eq!(redact_dns_query(query.clone()), query);
+    }
+
+    #[test]
+    fn dns_redaction_is_case_insensitive() {
+        assert_eq!(
+            redact_dns_query("HOST.LOCAL".to_string()),
+            "[REDACTED].LOCAL"
+        );
     }
 
     #[test]

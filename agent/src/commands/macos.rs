@@ -249,6 +249,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         enable_quarantine: _,
         enable_tls_capture: _,
         enable_readline_capture: _,
+        enable_dns_capture: _,
         server,
         ipc_endpoint,
     } = opts;

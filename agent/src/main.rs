@@ -107,6 +107,12 @@ enum Command {
         /// by default, redacted. Linux only.
         #[arg(long)]
         enable_readline_capture: bool,
+        /// Enables DNS resolution capture via a `getaddrinfo(3)` uprobe (issue
+        /// #267 Phase 1): query name + first resolved address, for DNS-based
+        /// C2/tunneling/exfiltration visibility. Off by default, sensitive TLDs
+        /// redacted. Linux only.
+        #[arg(long)]
+        enable_dns_capture: bool,
         /// Control-plane base URL (e.g. `https://api.synthaea.example.com`).
         /// When set, every normalized event is spooled next to the alerts file
         /// and uploaded store-and-forward (at-least-once; the spool sheds
@@ -171,6 +177,7 @@ fn main() -> anyhow::Result<()> {
             enable_quarantine,
             enable_tls_capture,
             enable_readline_capture,
+            enable_dns_capture,
             server,
         } => commands::cmd_run(commands::RunOptions {
             alerts: &alerts,
@@ -180,6 +187,7 @@ fn main() -> anyhow::Result<()> {
             enable_quarantine,
             enable_tls_capture,
             enable_readline_capture,
+            enable_dns_capture,
             server: server.as_deref(),
             ipc_endpoint: &cfg.ipc.endpoint,
         }),

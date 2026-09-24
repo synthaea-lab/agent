@@ -144,6 +144,29 @@ impl Default for ReadlineConfig {
     }
 }
 
+/// Configuration for DNS resolution capture uprobes (issue #267 Phase 1).
+#[derive(Debug, Clone)]
+pub struct DnsConfig {
+    /// Enable DNS capture (default: false, same posture as TLS/readline).
+    pub enabled: bool,
+    /// Maximum queries captured per process per second.
+    /// Default: 50 queries/sec — generous for a legitimate resolver-heavy
+    /// process (a browser opening dozens of connections), still bounded.
+    pub queries_per_process_per_sec: u32,
+    /// Process names allowed for DNS capture (allowlist). Empty = all processes.
+    pub process_allowlist: HashSet<String>,
+}
+
+impl Default for DnsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            queries_per_process_per_sec: 50,
+            process_allowlist: HashSet::new(),
+        }
+    }
+}
+
 /// Complete uprobe sensor configuration.
 #[derive(Debug, Clone)]
 pub struct UprobesConfig {
@@ -151,6 +174,8 @@ pub struct UprobesConfig {
     pub tls: TlsConfig,
     /// Readline capture configuration.
     pub readline: ReadlineConfig,
+    /// DNS resolution capture configuration.
+    pub dns: DnsConfig,
     /// Compliance mode (applies preset constraints for regulatory frameworks).
     pub compliance_mode: ComplianceMode,
 }
@@ -160,6 +185,7 @@ impl Default for UprobesConfig {
         Self {
             tls: TlsConfig::default(),
             readline: ReadlineConfig::default(),
+            dns: DnsConfig::default(),
             compliance_mode: ComplianceMode::None,
         }
     }
@@ -183,6 +209,13 @@ impl UprobesConfig {
     #[must_use]
     pub fn with_readline_enabled(mut self) -> Self {
         self.readline.enabled = true;
+        self
+    }
+
+    /// Enable DNS resolution capture with default budget and no allowlist.
+    #[must_use]
+    pub fn with_dns_enabled(mut self) -> Self {
+        self.dns.enabled = true;
         self
     }
 
@@ -213,23 +246,26 @@ impl UprobesConfig {
         // Apply preset budget constraints
         match mode {
             ComplianceMode::None => {
-                // No constraints (keep defaults: TLS 4096, readline 10)
+                // No constraints (keep defaults: TLS 4096, readline 10, DNS 50)
             }
             ComplianceMode::Gdpr => {
                 // GDPR: Minimize PII capture
                 self.tls.bytes_per_process_per_sec = 2048;
                 self.readline.commands_per_process_per_sec = 5;
+                self.dns.queries_per_process_per_sec = 20;
             }
             ComplianceMode::Hipaa => {
                 // HIPAA: Minimize PHI capture (stricter than GDPR)
                 self.tls.bytes_per_process_per_sec = 1024;
                 self.readline.commands_per_process_per_sec = 5;
+                self.dns.queries_per_process_per_sec = 20;
             }
             ComplianceMode::PciDss => {
                 // PCI-DSS: Minimize cardholder data capture
                 // ⚠️ WARNING: Do not use in production until PAN redaction implemented
                 self.tls.bytes_per_process_per_sec = 1024;
                 self.readline.commands_per_process_per_sec = 5;
+                self.dns.queries_per_process_per_sec = 20;
             }
         }
 
@@ -266,6 +302,28 @@ impl UprobesConfig {
         Ok(self)
     }
 
+    /// Set DNS queries budget per process per second.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidBudget`] if the budget is 0.
+    pub fn dns_budget(mut self, queries_per_sec: u32) -> Result<Self, ConfigError> {
+        if queries_per_sec == 0 {
+            return Err(ConfigError::InvalidBudget(
+                "queries_per_process_per_sec must be > 0".to_string(),
+            ));
+        }
+        self.dns.queries_per_process_per_sec = queries_per_sec;
+        Ok(self)
+    }
+
+    /// Add processes to DNS capture allowlist.
+    #[must_use]
+    pub fn dns_allow_processes(mut self, processes: &[&str]) -> Self {
+        self.dns.process_allowlist = processes.iter().map(|s| (*s).to_string()).collect();
+        self
+    }
+
     /// Add processes to TLS capture allowlist.
     #[must_use]
     pub fn tls_allow_processes(mut self, processes: &[&str]) -> Self {
@@ -297,6 +355,38 @@ mod tests {
         let config = UprobesConfig::new();
         assert!(!config.tls.enabled);
         assert!(!config.readline.enabled);
+        assert!(!config.dns.enabled);
+    }
+
+    #[test]
+    fn can_enable_dns() {
+        let config = UprobesConfig::new().with_dns_enabled();
+        assert!(config.dns.enabled);
+        assert_eq!(config.dns.queries_per_process_per_sec, 50);
+    }
+
+    #[test]
+    fn can_set_dns_budget() {
+        let config = UprobesConfig::new().dns_budget(100).unwrap();
+        assert_eq!(config.dns.queries_per_process_per_sec, 100);
+    }
+
+    #[test]
+    fn rejects_zero_dns_budget() {
+        assert!(UprobesConfig::new().dns_budget(0).is_err());
+    }
+
+    #[test]
+    fn can_set_dns_allowlist() {
+        let config = UprobesConfig::new().dns_allow_processes(&["curl", "python3"]);
+        assert_eq!(config.dns.process_allowlist.len(), 2);
+        assert!(config.dns.process_allowlist.contains("curl"));
+    }
+
+    #[test]
+    fn gdpr_mode_reduces_dns_budget() {
+        let config = UprobesConfig::new().with_compliance_mode(ComplianceMode::Gdpr);
+        assert_eq!(config.dns.queries_per_process_per_sec, 20);
     }
 
     #[test]
