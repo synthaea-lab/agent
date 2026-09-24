@@ -330,3 +330,14 @@ fn launchd_directory_write_alerts_via_persistence_path_patterns() {
     let alert = check_persistence_write(&event).expect("launchd plist write must alert");
     assert_eq!(alert.technique, "T1037.004/T1053.003");
 }
+
+#[test]
+fn scheduled_task_with_unknown_action_still_alerts() {
+    // The sensor never drops a 4698: when no action is readable it sets
+    // FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN on top of the task bit (#422).
+    let mut event = file_open_event_scheduled_task("HiddenTask", "<action unknown>");
+    event.flags |= schema::FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN;
+    let alert = check_scheduled_task_persistence(&event).expect("must still alert");
+    assert_eq!(alert.technique, "T1053.005");
+    assert!(alert.message.contains("<action unknown>"));
+}

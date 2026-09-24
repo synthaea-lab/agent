@@ -197,6 +197,15 @@ pub const FLAG_PERSISTENCE_ARTIFACT: u32 = 0x1000_0000;
 /// `docs/adr/0004-windows-persistence-detection-via-eventlog-polling.md`.
 pub const FLAG_PERSISTENCE_TASK_ARTIFACT: u32 = 0x2000_0000;
 
+/// Set alongside [`FLAG_PERSISTENCE_TASK_ARTIFACT`] when the task definition had no
+/// action the sensor could read (no `Exec` with a `Command`, no `ComHandler` with a
+/// `ClassId`). The persistence event is still reported, since a task whose action
+/// is hidden from us is no less suspicious, but `path` then holds a placeholder
+/// instead of an action list. Not serialization-visible (a bit in the existing
+/// `flags`), so no [`SCHEMA_VERSION`] bump; same reasoning as
+/// [`FLAG_PERSISTENCE_ARTIFACT`].
+pub const FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN: u32 = 0x0200_0000;
+
 /// Same principle as [`FLAG_PERSISTENCE_ARTIFACT`], for a Windows **local account
 /// creation** (event 4720, "A user account was created" — ATT&CK T1136.001) rather
 /// than a service (T1543.003) or scheduled task (T1053.005). See
