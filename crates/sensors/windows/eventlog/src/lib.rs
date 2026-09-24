@@ -118,21 +118,21 @@
 //! ## Transport: polling (default) vs. `EvtSubscribe` (#322)
 //!
 //! The two transports coexist and are selected per host via
-//! [`EventLogTransport`] in [`EventLogConfig`]:
+//! `EventLogTransport` in `EventLogConfig`:
 //!
-//! - [`Polling`](EventLogTransport::Polling) — the default. One thread per
+//! - `EventLogTransport::Polling` — the default. One thread per
 //!   enabled target runs a `wevtutil` `qe` loop at the `POLL_INTERVAL`
 //!   cadence (2s), same shape as the pre-#322 implementation and same
 //!   trade-offs as documented in the section above.
-//! - [`Subscribe`](EventLogTransport::Subscribe) — one `EvtSubscribe`
+//! - `EventLogTransport::Subscribe` — one `EvtSubscribe`
 //!   subscription per enabled target, with a Windows callback delivering
 //!   events the moment they land in the channel. Removes the polling
 //!   latency and the subprocess churn. Available since #322; opt-in at the
 //!   config layer so hosts adopt it after validation rather than the whole
 //!   fleet flipping on a version bump.
 //!
-//! Both transports reuse the same [`PollTarget`](self::sensor) table, the
-//! same `xml::parse_*` parsers, and the same [`EventLogCounters`] — only the
+//! Both transports reuse the same `PollTarget` table (`sensor.rs`), the
+//! same `xml::parse_*` parsers, and the same `EventLogCounters` — only the
 //! delivery mechanism differs. See `subscribe.rs` for the OS-facing details
 //! of the callback-based path.
 //!
