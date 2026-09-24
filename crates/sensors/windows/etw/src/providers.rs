@@ -119,6 +119,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             image_path,
             cmdline,
             argv: vec![], // Windows has a flat command line; consumers fall back
+            env_security: Vec::new(), // no exec-environment capture on Windows yet (#363 is Linux-only)
             parent_comm,
             parent_image_path,
             sha256: None, // filled by the agent's enrichment stage
