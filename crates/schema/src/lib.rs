@@ -142,7 +142,17 @@ pub mod time;
 /// while this branch was open; renumbered to 22 → 23 once `#262` Phase 3's
 /// xattr telemetry took v22 on `main` first, then to 23 → 24 once `#297`'s
 /// `PolicyDenial` took v23 on `main` in turn — same coordination note as above.
-pub const SCHEMA_VERSION: u32 = 24;
+///
+/// Bumped 24 → 25 for [`Event::Ptrace`], [`Event::ProcessVmRead`],
+/// [`Event::ProcessVmWrite`], and [`Event::MemfdCreate`] (#265: process
+/// injection/debugging telemetry — `ptrace(2)`, `process_vm_readv(2)`/
+/// `process_vm_writev(2)`, `memfd_create(2)`). Linux-only, no cross-platform
+/// reuse (unlike `AuthEvent`'s logon/session precedent) — these syscalls have no
+/// Windows/macOS analogue this shape fits. Same serialization-visible reasoning
+/// as v13-v24. Originally claimed as 21 → 22 while this branch was open, then
+/// renumbered each time another PR took the number first: 22 → 23 (#262 Phase 3
+/// xattr), 23 → 24 (#297 `PolicyDenial`), 24 → 25 (#264 kernel module / eBPF).
+pub const SCHEMA_VERSION: u32 = 25;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -640,6 +650,78 @@ pub struct SocketAcceptEvent {
     pub accepted_fd: u32,
     pub peer_addr: core::net::IpAddr,
     pub peer_port: u16,
+}
+
+/// Process debugging/injection primitive (issue #265): `ptrace(2)`, every request
+/// unfiltered — the request code itself (`PTRACE_ATTACH`, `PTRACE_POKEDATA`, ...)
+/// is the injection/debugger-abuse signal, not something this sensor pre-filters.
+/// Linux-only (there is no Windows/macOS equivalent this reuses — `ptrace(2)` has
+/// no cross-platform analogue the way logon/session events did for
+/// [`AuthEvent`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PtraceEvent {
+    pub meta: EventMeta,
+    /// The raw `request` argument (see `<sys/ptrace.h>`) — not decoded to a name
+    /// here, same "sensor reports, detection interprets" split as elsewhere.
+    pub request: u64,
+    /// The target process being traced/attached/read.
+    pub target_pid: u32,
+    /// The `addr` argument — meaningful for PEEK/POKE*-family requests, passed
+    /// through as-is for every request regardless (see
+    /// `sensor-linux-wire::PtraceEvent`'s doc).
+    pub addr: u64,
+    /// The `data` argument — the value written for POKE* requests, a second
+    /// pointer for several others.
+    pub data: u64,
+}
+
+/// Cross-process memory read (issue #265): `process_vm_readv(2)` — reads another
+/// process's memory directly, without `ptrace`'s attach/stop choreography. The
+/// credential-dumping/memory-scraping primitive on Linux.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessVmReadEvent {
+    pub meta: EventMeta,
+    /// The process being read FROM.
+    pub target_pid: u32,
+    /// How many `struct iovec` entries the caller passed on each side — a real
+    /// scatter-gather call can span several; only the first remote entry's length
+    /// is resolved (`remote_iov_len`), not each one.
+    pub local_iov_count: u64,
+    pub remote_iov_count: u64,
+    /// `remote_iov[0].iov_len` — bytes of the target's memory the first requested
+    /// region covers. `0` if `remote_iov_count` is `0` or the read failed.
+    pub remote_iov_len: u64,
+}
+
+/// Cross-process memory write (issue #265): `process_vm_writev(2)` — the
+/// write-direction mirror of [`ProcessVmReadEvent`]: injecting data into another
+/// process's memory without `ptrace(PTRACE_POKEDATA, ...)`'s word-at-a-time
+/// interface. Classic shellcode-injection primitive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessVmWriteEvent {
+    pub meta: EventMeta,
+    /// The process being written TO.
+    pub target_pid: u32,
+    pub local_iov_count: u64,
+    pub remote_iov_count: u64,
+    /// `remote_iov[0].iov_len` — bytes being written into the target's memory by
+    /// the first requested region. Same caveats as
+    /// [`ProcessVmReadEvent::remote_iov_len`].
+    pub remote_iov_len: u64,
+}
+
+/// Anonymous in-memory file creation (issue #265): `memfd_create(2)` — the
+/// fileless-execution primitive (`memfd_create` + a written ELF image +
+/// `execveat(fd, "", ..., AT_EMPTY_PATH)` runs a binary that never touches a real
+/// path on disk).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemfdCreateEvent {
+    pub meta: EventMeta,
+    /// The caller-supplied display name — cosmetic only per `memfd_create(2)`
+    /// (shows up as the target of `/proc/<pid>/fd/<n>`), not a real path.
+    pub name: String,
+    /// `MFD_CLOEXEC`, `MFD_ALLOW_SEALING`, ...
+    pub flags: u32,
 }
 
 /// DNS resolution — the query name and answer, joined to the resolving process.
@@ -1367,6 +1449,10 @@ pub enum Event {
     PolicyDenial(PolicyDenialEvent),
     KernelModule(KernelModuleEvent),
     BpfOperation(BpfEvent),
+    Ptrace(PtraceEvent),
+    ProcessVmRead(ProcessVmReadEvent),
+    ProcessVmWrite(ProcessVmWriteEvent),
+    MemfdCreate(MemfdCreateEvent),
 }
 
 impl Event {
@@ -1413,6 +1499,10 @@ impl Event {
             Event::PolicyDenial(e) => &e.meta,
             Event::KernelModule(e) => &e.meta,
             Event::BpfOperation(e) => &e.meta,
+            Event::Ptrace(e) => &e.meta,
+            Event::ProcessVmRead(e) => &e.meta,
+            Event::ProcessVmWrite(e) => &e.meta,
+            Event::MemfdCreate(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.

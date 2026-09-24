@@ -31,10 +31,11 @@ use crate::{
     AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, ConnectEvent, DnsQueryEvent,
     EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent,
     FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent, ImageLoadEvent,
-    KernelModuleAction, KernelModuleEvent, ListenPortEvent, NetworkFlowEvent, ReadlineInputEvent,
-    RegistrySetEvent, ScriptBlockEvent, ShellType, SmbConnectEvent, SocketAcceptEvent,
-    SocketBindEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
-    UdpSendEvent, User, WmiActivityEvent,
+    KernelModuleAction, KernelModuleEvent, ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent,
+    ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent,
+    ScriptBlockEvent, ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
+    SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User,
+    WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -358,5 +359,51 @@ pub fn bpf_operation() -> BpfEvent {
     BpfEvent {
         meta: meta(),
         cmd: 0,
+    }
+}
+
+/// Neutral [`PtraceEvent`].
+#[must_use]
+pub fn ptrace() -> PtraceEvent {
+    PtraceEvent {
+        meta: meta(),
+        request: 0,
+        target_pid: 0,
+        addr: 0,
+        data: 0,
+    }
+}
+
+/// Neutral [`ProcessVmReadEvent`].
+#[must_use]
+pub fn process_vm_read() -> ProcessVmReadEvent {
+    ProcessVmReadEvent {
+        meta: meta(),
+        target_pid: 0,
+        local_iov_count: 0,
+        remote_iov_count: 0,
+        remote_iov_len: 0,
+    }
+}
+
+/// Neutral [`ProcessVmWriteEvent`].
+#[must_use]
+pub fn process_vm_write() -> ProcessVmWriteEvent {
+    ProcessVmWriteEvent {
+        meta: meta(),
+        target_pid: 0,
+        local_iov_count: 0,
+        remote_iov_count: 0,
+        remote_iov_len: 0,
+    }
+}
+
+/// Neutral [`MemfdCreateEvent`].
+#[must_use]
+pub fn memfd_create() -> MemfdCreateEvent {
+    MemfdCreateEvent {
+        meta: meta(),
+        name: String::new(),
+        flags: 0,
     }
 }

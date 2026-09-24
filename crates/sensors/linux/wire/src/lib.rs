@@ -119,7 +119,20 @@ extern crate std;
 ///   Originally claimed as v12 while this branch was open; renumbered to v13
 ///   once `#262` Phase 3's xattr telemetry took v12 on `main` first (same
 ///   coordination note as `SCHEMA_VERSION`'s v13/v19/v20 history).
-pub const WIRE_VERSION: u32 = 13;
+/// - v14: `PtraceEvent`, `ProcessVmReadEvent`, `ProcessVmWriteEvent`,
+///   `MemfdCreateEvent` added (issue #265) — process injection/debugging
+///   telemetry: `ptrace(2)` (every request, unfiltered — the request code itself
+///   is the signal), `process_vm_readv(2)`/`process_vm_writev(2)` (cross-process
+///   memory access without ptrace's attach/stop dance), `memfd_create(2)`
+///   (anonymous-fd fileless-execution primitive). The two `process_vm_*` events
+///   carry each iovec array's element count plus the first remote-iovec entry's
+///   `iov_len` (a size signal, not a full scatter-gather resolution) — same
+///   "requested size, not full path/content" tradeoff `FileWriteEvent` and
+///   `UdpSendEvent::size` already make.
+///   Originally claimed as v12 while this branch was open; renumbered to v13
+///   once `#262` Phase 3's xattr telemetry took v12, then to v14 once #362 and
+///   #264 took v13 on `main` (same coordination note as `SCHEMA_VERSION`).
+pub const WIRE_VERSION: u32 = 14;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
@@ -509,6 +522,91 @@ pub struct BpfEvent {
     /// "sensor reports, detection interprets" split as every other raw
     /// syscall-argument field in this crate.
     pub cmd: u32,
+}
+
+/// Process debugging/injection primitive (`syscalls:sys_enter_ptrace`, issue #265).
+/// Every request is captured unfiltered — `PTRACE_ATTACH`/`PTRACE_POKEDATA`/
+/// `PTRACE_SETREGS` against a foreign process is the injection/debugger-abuse
+/// pattern this issue targets, and filtering by request code here would just move
+/// the detection logic's own job into the sensor.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PtraceEvent {
+    pub meta: EventMeta,
+    /// The `request` argument (`PTRACE_ATTACH`, `PTRACE_PEEKDATA`, ... — see
+    /// `<sys/ptrace.h>`). Kept as the raw integer, not decoded to a name, here —
+    /// same "sensor reports, detection interprets" split as everywhere else.
+    pub request: u64,
+    /// The `pid` argument — the target process being traced/attached/read.
+    pub target_pid: u32,
+    /// The `addr` argument. Meaningful for the PEEK/POKE*-family requests (the
+    /// target address); the kernel ignores it for several other requests, but it
+    /// is passed through as-is regardless, same discipline as `FileChownEvent`'s
+    /// "leave unchanged" uid/gid sentinel.
+    pub addr: u64,
+    /// The `data` argument. For POKE* requests, the value written; for several
+    /// others, reused as a second pointer (e.g. `PTRACE_GETREGS`'s output buffer).
+    pub data: u64,
+}
+
+/// Cross-process memory read (`syscalls:sys_enter_process_vm_readv`, issue #265) —
+/// reads another process's memory directly, without ptrace's attach/stop
+/// choreography. The credential-dumping/memory-scraping primitive on Linux (there
+/// is no LSASS equivalent, but the technique — read a target process's heap/stack
+/// for secrets — is the same).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ProcessVmReadEvent {
+    pub meta: EventMeta,
+    /// The `pid` argument — the process being read FROM.
+    pub target_pid: u32,
+    /// `liovcnt`/`riovcnt`: how many `struct iovec` entries the caller passed on
+    /// each side. A real scatter-gather call can span several; only the first
+    /// remote entry's length is resolved below (see `remote_iov_len`), not each
+    /// one — same "volume signal, not full resolution" tradeoff `FileWriteEvent`
+    /// makes for `write(2)`.
+    pub local_iov_count: u64,
+    pub remote_iov_count: u64,
+    /// `remote_iov[0].iov_len` — how many bytes of the target's memory the first
+    /// (and, for the overwhelmingly common single-entry call, only) requested
+    /// region covers. `0` if `remote_iov_count` is `0` or the read failed.
+    pub remote_iov_len: u64,
+}
+
+/// Cross-process memory write (`syscalls:sys_enter_process_vm_writev`, issue
+/// #265) — the write-direction mirror of [`ProcessVmReadEvent`]: injecting data
+/// into another process's memory without `ptrace(PTRACE_POKEDATA, ...)`'s
+/// word-at-a-time interface. Classic shellcode-injection primitive.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ProcessVmWriteEvent {
+    pub meta: EventMeta,
+    /// The `pid` argument — the process being written TO.
+    pub target_pid: u32,
+    pub local_iov_count: u64,
+    pub remote_iov_count: u64,
+    /// `remote_iov[0].iov_len` — how many bytes are being written into the
+    /// target's memory by the first requested region. Same caveats as
+    /// [`ProcessVmReadEvent::remote_iov_len`].
+    pub remote_iov_len: u64,
+}
+
+/// Anonymous in-memory file creation (`syscalls:sys_enter_memfd_create`, issue
+/// #265) — the fileless-execution primitive: `memfd_create` + `fexecve`/a written
+/// ELF image + `execveat(fd, "", ..., AT_EMPTY_PATH)` runs a binary that never
+/// touches a real path on disk.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MemfdCreateEvent {
+    pub meta: EventMeta,
+    /// The caller-supplied display name (`name` argument) — cosmetic only per
+    /// `memfd_create(2)` (shows up as the target of `/proc/<pid>/fd/<n>`), not a
+    /// real path, but attacker tooling that names it `/tmp/x` or similar to look
+    /// like a real file on a process listing is itself a signal.
+    pub name: [u8; MAX_PATH_LEN],
+    pub name_len: u16,
+    /// The `flags` argument (`MFD_CLOEXEC`, `MFD_ALLOW_SEALING`, ...).
+    pub flags: u32,
 }
 
 /// Decodes a fixed comm buffer: NUL-terminated, kernel-truncated to 15 bytes — a

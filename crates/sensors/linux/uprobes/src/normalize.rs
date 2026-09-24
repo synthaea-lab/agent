@@ -41,7 +41,11 @@ use crate::redact;
 /// v13 (#362 and #264, originally claimed as v12 — see that constant's doc) added
 /// `MountEvent`/`SignalEvent` and `KernelModuleEvent`/`BpfEvent` — not imported
 /// here either, same reasoning.
-const _: () = assert!(wire::WIRE_VERSION == 13);
+///
+/// v14 (#265, originally claimed as v12 — see that constant's doc) added
+/// `PtraceEvent`/`ProcessVmReadEvent`/`ProcessVmWriteEvent`/`MemfdCreateEvent`
+/// — not imported here either, same reasoning.
+const _: () = assert!(wire::WIRE_VERSION == 14);
 
 /// `container` is resolved by the caller (`crate::container::container_context`,
 /// issue #312) from `EventMeta::cgroup_id` against cgroupfs, with image/name filled

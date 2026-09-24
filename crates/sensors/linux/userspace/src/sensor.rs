@@ -196,9 +196,13 @@ impl LinuxSensor {
         let mut signal_ring_buf = ring("SIGNAL_EVENTS")?;
         let mut kernel_module_ring_buf = ring("KERNEL_MODULE_EVENTS")?;
         let mut bpf_ring_buf = ring("BPF_EVENTS")?;
+        let mut ptrace_ring_buf = ring("PTRACE_EVENTS")?;
+        let mut process_vm_read_ring_buf = ring("PROCESS_VM_READ_EVENTS")?;
+        let mut process_vm_write_ring_buf = ring("PROCESS_VM_WRITE_EVENTS")?;
+        let mut memfd_create_ring_buf = ring("MEMFD_CREATE_EVENTS")?;
 
         tracing::info!(
-            "sensor-linux: listening for exec/open/connect/write/delete/rename/bind/chmod/chown/udp_send/listen/accept/setxattr/removexattr/mount/signal/kernel_module/bpf events"
+            "sensor-linux: listening for exec/open/connect/write/delete/rename/bind/chmod/chown/udp_send/listen/accept/setxattr/removexattr/mount/signal/kernel_module/bpf/ptrace/process_vm_readv/process_vm_writev/memfd_create events"
         );
 
         let mut container_ids = CgroupIdCache::new();
@@ -324,6 +328,30 @@ impl LinuxSensor {
                     drain!(guard, sensor_linux_wire::BpfEvent, sink, own_pid,
                         |e: &sensor_linux_wire::BpfEvent| {
                             normalize::bpf_operation(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = ptrace_ring_buf.readable_mut() => {
+                    drain!(guard, sensor_linux_wire::PtraceEvent, sink, own_pid,
+                        |e: &sensor_linux_wire::PtraceEvent| {
+                            normalize::ptrace(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = process_vm_read_ring_buf.readable_mut() => {
+                    drain!(guard, sensor_linux_wire::ProcessVmReadEvent, sink, own_pid,
+                        |e: &sensor_linux_wire::ProcessVmReadEvent| {
+                            normalize::process_vm_read(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = process_vm_write_ring_buf.readable_mut() => {
+                    drain!(guard, sensor_linux_wire::ProcessVmWriteEvent, sink, own_pid,
+                        |e: &sensor_linux_wire::ProcessVmWriteEvent| {
+                            normalize::process_vm_write(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = memfd_create_ring_buf.readable_mut() => {
+                    drain!(guard, sensor_linux_wire::MemfdCreateEvent, sink, own_pid,
+                        |e: &sensor_linux_wire::MemfdCreateEvent| {
+                            normalize::memfd_create(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
             }

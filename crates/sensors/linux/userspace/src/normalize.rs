@@ -8,8 +8,9 @@
 use schema::{
     BpfEvent, ConnectEvent, ContainerContext, Event, EventMeta, ExecEvent, FileChmodEvent,
     FileChownEvent, FileDeleteEvent, FileOpenEvent, FileRemovexattrEvent, FileRenameEvent,
-    FileSetxattrEvent, FileWriteEvent, KernelModuleAction, KernelModuleEvent, MountEvent,
-    SignalEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, UdpSendEvent, User,
+    FileSetxattrEvent, FileWriteEvent, KernelModuleAction, KernelModuleEvent, MemfdCreateEvent,
+    MountEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, SignalEvent,
+    SocketAcceptEvent, SocketBindEvent, SocketListenEvent, UdpSendEvent, User,
 };
 use sensor_linux_wire as wire;
 
@@ -60,7 +61,12 @@ use sensor_linux_wire as wire;
 /// struct's `action: u8` discriminant into `schema::KernelModuleAction` and its
 /// always-populated `fd`/`image_len` sentinels (`-1`/`0` when not applicable to
 /// the action) into `Option`s. No existing mapping changed shape.
-const _: () = assert!(wire::WIRE_VERSION == 13);
+///
+/// v14 (#265, originally claimed as v12 — see that constant's doc) added
+/// `PtraceEvent`, `ProcessVmReadEvent`, `ProcessVmWriteEvent`, `MemfdCreateEvent`
+/// — new `ptrace`/`process_vm_read`/`process_vm_write`/`memfd_create` mapping
+/// functions below; no existing mapping changed shape.
+const _: () = assert!(wire::WIRE_VERSION == 14);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
@@ -449,6 +455,66 @@ pub fn bpf_operation(
     Event::BpfOperation(BpfEvent {
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
         cmd: event.cmd,
+    })
+}
+
+#[must_use]
+pub fn ptrace(
+    event: &wire::PtraceEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    Event::Ptrace(PtraceEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        request: event.request,
+        target_pid: event.target_pid,
+        addr: event.addr,
+        data: event.data,
+    })
+}
+
+#[must_use]
+pub fn process_vm_read(
+    event: &wire::ProcessVmReadEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    Event::ProcessVmRead(ProcessVmReadEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        target_pid: event.target_pid,
+        local_iov_count: event.local_iov_count,
+        remote_iov_count: event.remote_iov_count,
+        remote_iov_len: event.remote_iov_len,
+    })
+}
+
+#[must_use]
+pub fn process_vm_write(
+    event: &wire::ProcessVmWriteEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    Event::ProcessVmWrite(ProcessVmWriteEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        target_pid: event.target_pid,
+        local_iov_count: event.local_iov_count,
+        remote_iov_count: event.remote_iov_count,
+        remote_iov_len: event.remote_iov_len,
+    })
+}
+
+#[must_use]
+pub fn memfd_create(
+    event: &wire::MemfdCreateEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    let raw = &event.name[..(event.name_len as usize).min(wire::MAX_PATH_LEN)];
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    Event::MemfdCreate(MemfdCreateEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        name: String::from_utf8_lossy(&raw[..end]).into_owned(),
+        flags: event.flags,
     })
 }
 

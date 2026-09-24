@@ -51,6 +51,10 @@ pub(crate) fn err(msg: String) -> SensorError {
 /// **must** run before these two are attached, same ordering requirement
 /// `prime_proc_lineage` documents for the fork/exit pair above. `sys_enter_tkill` is
 /// not attached — see `sensor-linux-wire`'s `WIRE_VERSION` v13 changelog for why.
+///
+/// `sys_enter_ptrace`/`sys_enter_process_vm_readv`/`sys_enter_process_vm_writev`/
+/// `sys_enter_memfd_create` (issue #265) round out process injection/debugging
+/// telemetry — no libc-variant pairing needed, each has exactly one syscall name.
 pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
     ("sched_process_fork", "sched", "sched_process_fork"),
     ("sched_process_exit", "sched", "sched_process_exit"),
@@ -94,6 +98,22 @@ pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
         "sys_enter_delete_module",
     ),
     ("sys_enter_bpf", "syscalls", "sys_enter_bpf"),
+    ("sys_enter_ptrace", "syscalls", "sys_enter_ptrace"),
+    (
+        "sys_enter_process_vm_readv",
+        "syscalls",
+        "sys_enter_process_vm_readv",
+    ),
+    (
+        "sys_enter_process_vm_writev",
+        "syscalls",
+        "sys_enter_process_vm_writev",
+    ),
+    (
+        "sys_enter_memfd_create",
+        "syscalls",
+        "sys_enter_memfd_create",
+    ),
 ];
 
 /// `sensor_linux_wire::LineageEntry` is `repr(C)` over a `u32` and a `[u8; 16]` — every
