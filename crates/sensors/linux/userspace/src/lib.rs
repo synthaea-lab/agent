@@ -23,6 +23,10 @@ mod proc;
 #[cfg(target_os = "linux")]
 mod sensor;
 #[cfg(target_os = "linux")]
+// Only `load_ebpf` reads the fork layout, and it exists only with embedded probes.
+// Without bpf-linker (the CI runner) the module is dead code, but its parser tests
+// still run.
+#[cfg_attr(not(ebpf_embedded), allow(dead_code))]
 mod tracefs;
 
 #[cfg(target_os = "linux")]
