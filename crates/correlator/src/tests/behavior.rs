@@ -207,6 +207,63 @@ fn bayes_survives_respawn() {
     );
 }
 
+// ── update_belief_with_ml (PR #345 review) ──────────────────────────────────
+
+#[test]
+fn update_belief_with_ml_adds_the_llr_exactly_once() {
+    // Before the fix, `update_belief_with_ml` re-ran the full decay+feature-LLR
+    // update `on_event` already did this cycle, so the hand-calibrated evidence
+    // was summed twice and the ML term landed on top of that inflated total.
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(exec_event_suspicious(600, 50, 0));
+    engine.on_event(connect_event_external(600, 100_000_000));
+    let before = engine
+        .belief_for_pid(600)
+        .expect("belief expected")
+        .log_odds;
+
+    engine
+        .update_belief_with_ml(600, Some(0.75))
+        .expect("belief state exists, must not error");
+    let after = engine
+        .belief_for_pid(600)
+        .expect("belief expected")
+        .log_odds;
+
+    assert!(
+        (after - (before + 0.75)).abs() < 1e-6,
+        "expected exactly +0.75 (the ML term only), got {before} → {after}"
+    );
+}
+
+#[test]
+fn update_belief_with_ml_none_leaves_the_belief_untouched() {
+    // A `None` LLR (gated / OOD / scorer error) must not re-apply decay or
+    // re-sum the feature LLRs either — there is no new evidence at all.
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(exec_event_suspicious(601, 50, 0));
+    engine.on_event(connect_event_external(601, 100_000_000));
+    let before = engine
+        .belief_for_pid(601)
+        .expect("belief expected")
+        .log_odds;
+
+    engine.update_belief_with_ml(601, None).unwrap();
+    let after = engine
+        .belief_for_pid(601)
+        .expect("belief expected")
+        .log_odds;
+
+    assert_eq!(before, after, "a None LLR must be a complete no-op");
+}
+
+#[test]
+fn update_belief_with_ml_before_any_belief_state_is_silent_err() {
+    // No prior `on_event` for this pid → no belief state to add an ML term to.
+    let mut engine = CorrelationEngine::new();
+    assert!(engine.update_belief_with_ml(9999, Some(1.0)).is_err());
+}
+
 // ── BAYES_NAME_EXCLUSIONS (issue #212) ──────────────────────────────────────
 
 #[test]

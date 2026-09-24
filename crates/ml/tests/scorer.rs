@@ -31,7 +31,10 @@ fn scores_match_onnxruntime_reference() {
     for case in golden()["cases"].as_array().unwrap() {
         let cmdline = case["cmdline"].as_str().unwrap();
         let expected = case["score"].as_f64().unwrap() as f32;
-        let got = scorer.score(cmdline).unwrap();
+        let got = scorer
+            .score(cmdline)
+            .unwrap()
+            .expect("legacy model without threshold always returns Some");
         assert!(
             (got - expected).abs() <= TOL,
             "score drifted for {cmdline:?}: ort={got} reference={expected}",
@@ -44,8 +47,14 @@ fn score_explained_agrees_with_score_and_attributes() {
     let mut scorer = scorer();
     for case in golden()["cases"].as_array().unwrap() {
         let cmdline = case["cmdline"].as_str().unwrap();
-        let bare = scorer.score(cmdline).unwrap();
-        let explained = scorer.score_explained(cmdline, 3).unwrap();
+        let bare = scorer
+            .score(cmdline)
+            .unwrap()
+            .expect("legacy model without threshold always returns Some");
+        let explained = scorer
+            .score_explained(cmdline, 3)
+            .unwrap()
+            .expect("legacy model without threshold always returns Some");
         assert_eq!(
             bare, explained.value,
             "explained score must equal bare score"

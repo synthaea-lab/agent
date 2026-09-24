@@ -118,9 +118,34 @@ fn log_likelihood_ratio(idx: usize, value: f32) -> f32 {
     }
 }
 
-/// Updates an entity's belief with the current `BehaviorVector`.
-/// First applies the exponential decay toward the prior, then the Bayesian update.
-pub(crate) fn update_belief(state: &mut BeliefState, v: &BehaviorVector, now_ns: u64) {
+/// Updates an entity's belief with the current `BehaviorVector` and optional ML LLR.
+///
+/// First applies the exponential decay toward the prior, then the Bayesian update from
+/// hand-calibrated per-feature LLRs, then the optional ML contribution.
+///
+/// # Parameters
+///
+/// - `state`: The belief state to update
+/// - `v`: The behavior vector extracted from the correlator's event bus
+/// - `ml_llr`: Optional ML contribution from `ml::correlation::score_to_llr` (issue #46 Phase 3)
+/// - `now_ns`: Current timestamp for decay calculation
+///
+/// # ML LLR Semantics
+///
+/// - `ml_llr = Some(llr)` → add `llr` to `log_odds` after hand-calibrated LLRs
+/// - `ml_llr = None` → skip ML contribution (no evidence, not "benign")
+///   - Returned when `event_count < MIN_EVENT_COUNT` (gating)
+///   - Returned when features are OOD (`ScorerError::FeatureOutOfBounds`)
+///   - Returned when ML scorer is unavailable or errors
+///
+/// The caller (agent sink via `CorrelationEngine::update_belief_with_ml`) handles
+/// the ML scorer invocation and error handling before passing the LLR here.
+pub(crate) fn update_belief(
+    state: &mut BeliefState,
+    v: &BehaviorVector,
+    ml_llr: Option<f32>,
+    now_ns: u64,
+) {
     // Exponential decay toward the prior when inactive
     let dt_s = (now_ns.saturating_sub(state.last_update_ns)) as f32 / 1e9;
     let decay = 1.0 - (-dt_s / DECAY_TAU_S).exp();
@@ -131,5 +156,26 @@ pub(crate) fn update_belief(state: &mut BeliefState, v: &BehaviorVector, now_ns:
         state.log_odds += log_likelihood_ratio(i, value);
     }
 
+    // ML contribution (issue #46 Phase 3): only if we have a score.
+    // None means "no evidence" (gated, OOD, or error), not "benign".
+    if let Some(llr) = ml_llr {
+        state.log_odds += llr;
+    }
+
     state.last_update_ns = now_ns;
+}
+
+/// Adds an ML log-likelihood ratio to an already-updated belief state.
+///
+/// Deliberately does NOT call [`update_belief`]: `CorrelationEngine::on_event`
+/// already runs the full decay-then-feature-LLR update for this cycle before
+/// the ML scorer even has a chance to run (ML scoring needs the event on the
+/// bus first). Calling `update_belief` a second time here re-summed the same
+/// hand-calibrated feature LLRs on top of themselves — found in PR #345
+/// review: `log_odds` grew roughly 2x calibration intent once a correlation
+/// model was loaded, causing premature `BAYES` alerts (and, via issue #25,
+/// premature auto-kill) on benign processes. This only ever adds the one new
+/// term the first update didn't have.
+pub(crate) fn apply_ml_llr(state: &mut BeliefState, llr: f32) {
+    state.log_odds += llr;
 }

@@ -7,7 +7,7 @@ use schema::Event;
 use store::BoundedMap;
 
 use crate::{
-    bayes::{BAYES_THRESHOLD, BeliefState, update_belief},
+    bayes::{BAYES_THRESHOLD, BeliefState, apply_ml_llr, update_belief},
     behavior::BehaviorVector,
     bus::EventBus,
     event::is_correlated,
@@ -180,7 +180,8 @@ impl CorrelationEngine {
             let state = self
                 .beliefs
                 .get_or_insert_with(entity_key.clone(), || BeliefState::new(now_ns));
-            update_belief(state, &bv, now_ns);
+            // No ML LLR in internal path — external callers use `update_belief_with_ml`.
+            update_belief(state, &bv, None, now_ns);
         }
 
         if is_ignored(&comm) && self.masquerading.peek(&pid).is_none() {
@@ -198,6 +199,77 @@ impl CorrelationEngine {
             alerts.extend(self.bayes_alert(pid, &comm, &entity_key));
         }
         alerts
+    }
+
+    /// Returns a reference to the internal event bus (for ML scoring).
+    ///
+    /// The ML correlation scorer (`ml::CorrelationScorer`) needs access to the bus to
+    /// extract features. This is safe to expose because the bus is already append-only
+    /// from the scorer's perspective.
+    #[must_use]
+    pub fn bus(&self) -> &EventBus {
+        &self.bus
+    }
+
+    /// Adds an optional ML LLR to an entity's belief (issue #46 Phase 3).
+    ///
+    /// For use by the agent sink after ML scoring, once per event, right after the
+    /// [`Self::on_event`] call for the same event. `on_event` already ran the full
+    /// decay-then-feature-LLR belief update for this cycle (with no ML term, since
+    /// scoring needs the event on the bus first) — this only adds the ML term on
+    /// top, via [`crate::bayes::apply_ml_llr`], instead of re-running the whole
+    /// update. Calling [`crate::bayes::update_belief`] again here used to double-count
+    /// the hand-calibrated feature evidence (PR #345 review: `log_odds` grew ~2x
+    /// calibration intent, causing premature `BAYES`/auto-kill on benign processes).
+    ///
+    /// # Parameters
+    ///
+    /// - `pid`: Process ID to update
+    /// - `ml_llr`: Optional ML log-likelihood ratio from `ml::correlation::score_to_llr`
+    ///   - `Some(llr)`: ML scorer produced a score, add it to belief
+    ///   - `None`: No score (gated, OOD, or error) — nothing to add, not "benign"
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(())` when `ml_llr` is `Some` but [`Self::on_event`] never created
+    /// a belief state for this pid this cycle (no `BehaviorVector` yet — not enough
+    /// events in the correlator window). This is a normal condition for newly seen
+    /// pids and should be handled silently by the caller. `ml_llr = None` always
+    /// returns `Ok(())`: there is nothing to add either way.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // In agent sink after ML scoring, right after `engine.on_event(event)`:
+    /// let ml_llr = match scorer.score(&engine.bus(), pid) {
+    ///     Ok(Some(score)) => Some(ml::correlation::score_to_llr(score)),
+    ///     Ok(None) => None,  // Gated
+    ///     Err(ScorerError::FeatureOutOfBounds { .. }) => None,  // OOD
+    ///     Err(e) => { error!("ML scorer: {e}"); None }  // Fail open
+    /// };
+    /// engine.update_belief_with_ml(pid, ml_llr)?;
+    /// ```
+    #[allow(clippy::result_unit_err)]
+    pub fn update_belief_with_ml(&mut self, pid: u32, ml_llr: Option<f32>) -> Result<(), ()> {
+        let Some(llr) = ml_llr else {
+            return Ok(());
+        };
+
+        let comm = self
+            .bus
+            .events_for_pid(pid)
+            .next()
+            .map(|e| e.meta().comm.clone())
+            .ok_or(())?;
+
+        let entity_key = self.pid_entities.get(&pid).cloned().unwrap_or((pid, comm));
+
+        // `on_event` creates this entity's belief state in the same cycle whenever a
+        // `BehaviorVector` is available; if it isn't there yet either, there is no
+        // base update to add the ML term to.
+        let state = self.beliefs.get_mut(&entity_key).ok_or(())?;
+        apply_ml_llr(state, llr);
+        Ok(())
     }
 
     /// Bayesian alert — only once per threshold crossing.

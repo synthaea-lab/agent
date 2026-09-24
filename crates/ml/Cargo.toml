@@ -26,6 +26,8 @@ thiserror = { workspace = true }
 # Workspace ort is configured with default-features = false.
 # The dynamic-onnx feature (enabled by default) re-enables download-binaries for dev builds.
 ort = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

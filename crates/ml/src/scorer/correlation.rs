@@ -23,8 +23,9 @@
 use correlator::EventBus;
 use ort::{session::Session, value::Tensor};
 
-use super::{Score, ScorerError};
+use super::{ModelMetadata, Score, ScorerError};
 use crate::{
+    bounds::FeatureBounds,
     features::correlation::{self, FEATURE_NAMES},
     forest::Forest,
 };
@@ -42,15 +43,63 @@ pub const MIN_EVENT_COUNT: f32 = 3.0;
 pub struct CorrelationScorer {
     session: Session,
     forest: Forest,
+    bounds: Option<FeatureBounds>,
+    /// Conformal threshold: anomaly if score < threshold (issue #46).
+    /// `None` for legacy models without calibration.
+    threshold: Option<f32>,
 }
 
 impl CorrelationScorer {
-    /// Loads a model from ONNX bytes (as delivered by the update channel).
+    /// Loads a model from ONNX bytes with optional metadata (issue #46).
     ///
-    /// Parses the tree structure up front so attribution needs no per-score reparse,
-    /// and checks the model's feature arity against the correlation extractor so a
-    /// mismatched model (e.g. a cmdline model) fails loudly at load, not silently at
-    /// score time.
+    /// See [`super::CmdlineScorer::from_onnx_bytes_with_metadata`] for metadata
+    /// format and semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScorerError`] when the ONNX session cannot be built, the tree
+    /// structure cannot be parsed, the model's feature arity does not match the
+    /// correlation extractor, or the metadata JSON is malformed.
+    pub fn from_onnx_bytes_with_metadata(
+        model: &[u8],
+        metadata: Option<&[u8]>,
+    ) -> Result<Self, ScorerError> {
+        let session = Session::builder()?.commit_from_memory(model)?;
+        let forest = Forest::from_onnx_bytes(model)?;
+
+        if forest.n_features() != FEATURE_NAMES.len() {
+            return Err(ScorerError::FeatureArity {
+                model: forest.n_features(),
+                extractor: FEATURE_NAMES.len(),
+            });
+        }
+
+        let (bounds, threshold) = if let Some(meta_bytes) = metadata {
+            let parsed: ModelMetadata = serde_json::from_slice(meta_bytes)
+                .map_err(|_| crate::forest::ParseError::Malformed("invalid metadata JSON"))?;
+
+            // Validate feature bounds internal consistency (issue #46: prevent panic on
+            // malformed metadata where array lengths don't match)
+            if let Some(ref b) = parsed.feature_bounds {
+                b.check_invariant()?;
+            }
+
+            (parsed.feature_bounds, parsed.threshold)
+        } else {
+            (None, None)
+        };
+
+        Ok(Self {
+            session,
+            forest,
+            bounds,
+            threshold,
+        })
+    }
+
+    /// Loads a model from ONNX bytes (legacy: no metadata).
+    ///
+    /// Equivalent to `from_onnx_bytes_with_metadata(model, None)`.
     ///
     /// # Errors
     ///
@@ -58,15 +107,7 @@ impl CorrelationScorer {
     /// structure cannot be parsed, or the model's feature arity does not match the
     /// correlation extractor.
     pub fn from_onnx_bytes(model: &[u8]) -> Result<Self, ScorerError> {
-        let session = Session::builder()?.commit_from_memory(model)?;
-        let forest = Forest::from_onnx_bytes(model)?;
-        if forest.n_features() != FEATURE_NAMES.len() {
-            return Err(ScorerError::FeatureArity {
-                model: forest.n_features(),
-                extractor: FEATURE_NAMES.len(),
-            });
-        }
-        Ok(Self { session, forest })
+        Self::from_onnx_bytes_with_metadata(model, None)
     }
 
     fn run(&mut self, features: &[f32; 8]) -> Result<f32, ScorerError> {
@@ -78,20 +119,42 @@ impl CorrelationScorer {
 
     /// The anomaly score of `pid`'s behaviour over the bus's current window, or
     /// `None` when the window holds fewer than [`MIN_EVENT_COUNT`] events for the pid
-    /// (nothing to score yet).
+    /// (nothing to score yet), or when the score is below the conformal threshold
+    /// (normal behaviour, FP budget enforcement).
     ///
     /// `IsolationForest.decision_function`: negative = anomalous, positive = normal.
-    /// No threshold is imposed here — T2 feeds the belief state, it does not alert.
+    /// When a conformal threshold is available (issue #46), only scores below it
+    /// (anomalous, meeting the FP budget) are returned; normal scores return `None`
+    /// to avoid contributing to the belief state.
     ///
     /// # Errors
     ///
-    /// Returns [`ScorerError`] when ONNX inference fails or produces no score.
+    /// Returns [`ScorerError::FeatureOutOfBounds`] if the feature vector falls
+    /// outside training bounds (OOD detection, issue #46). Returns other
+    /// [`ScorerError`] variants when ONNX inference fails or produces no score.
     pub fn score(&mut self, bus: &EventBus, pid: u32) -> Result<Option<f32>, ScorerError> {
         let features = correlation::extract_features(bus, pid);
         if features[EVENT_COUNT_IDX] < MIN_EVENT_COUNT {
             return Ok(None);
         }
-        self.run(&features).map(Some)
+
+        // OOD validation (if bounds available)
+        if let Some(ref bounds) = self.bounds {
+            bounds.validate(&features)?;
+        }
+
+        let score = self.run(&features)?;
+
+        // Conformal threshold: anomaly if score < threshold (issue #46).
+        // Normal scores (>= threshold) return None — they don't contribute to
+        // the belief state, enforcing the FP budget.
+        if let Some(threshold) = self.threshold
+            && score >= threshold
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(score))
     }
 
     /// The anomaly score plus its top-`k` feature attributions — for a pid whose
@@ -100,7 +163,9 @@ impl CorrelationScorer {
     ///
     /// # Errors
     ///
-    /// Returns [`ScorerError`] when inference fails, produces no score, or the
+    /// Returns [`ScorerError::FeatureOutOfBounds`] if the feature vector falls
+    /// outside training bounds (OOD detection, issue #46). Returns other
+    /// [`ScorerError`] variants when inference fails, produces no score, or the
     /// attribution walk finds the model inconsistent with its parsed structure.
     pub fn score_explained(
         &mut self,
@@ -112,7 +177,21 @@ impl CorrelationScorer {
         if features[EVENT_COUNT_IDX] < MIN_EVENT_COUNT {
             return Ok(None);
         }
+
+        // OOD validation
+        if let Some(ref bounds) = self.bounds {
+            bounds.validate(&features)?;
+        }
+
         let value = self.run(&features)?;
+
+        // Conformal threshold: anomaly if score < threshold (issue #46).
+        if let Some(threshold) = self.threshold
+            && value >= threshold
+        {
+            return Ok(None);
+        }
+
         let attribution = self.forest.attribute(&features)?;
         let names: Vec<&str> = FEATURE_NAMES.to_vec();
         Ok(Some(Score {

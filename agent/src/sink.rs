@@ -40,6 +40,11 @@ struct ResponseHooks {
 pub(crate) struct DetectionSink {
     rule_state: Mutex<rules::RuleState>,
     correlator: Mutex<correlator::CorrelationEngine>,
+    /// ML correlation scorer (issue #46 Phase 3, #47 Phase 2): scores behavior over
+    /// the correlator window and feeds the Bayesian belief state. `None` when the
+    /// model is unavailable (missing registry, load error) — the agent works without
+    /// ML (hand-calibrated features still function).
+    ml_scorer: Mutex<Option<ml::CorrelationScorer>>,
     /// Sigma rules from `rules/sigma` (next to the agent executable, falling back
     /// to the working directory) when the folder exists — otherwise the agent runs without a Sigma engine, and that is
     /// not an error (the load failure path IS an error: content present but broken).
@@ -93,6 +98,7 @@ impl DetectionSink {
         Ok(Self {
             rule_state: Mutex::new(rule_state),
             correlator: Mutex::new(correlator::CorrelationEngine::new()),
+            ml_scorer: Mutex::new(Self::load_correlation_scorer()),
             sigma: load_sigma_rules(),
             yara: start_yara(alert_log.clone(), response.clone()),
             alert_log,
@@ -100,6 +106,58 @@ impl DetectionSink {
             progress: Arc::new(AtomicU64::new(0)),
             response,
         })
+    }
+
+    /// Loads the ML correlation scorer from the registry (issue #46 Phase 3, #47 Phase 2).
+    ///
+    /// Returns `None` when the model is unavailable (missing directory, load error) —
+    /// the agent works without ML (hand-calibrated Bayesian features still function).
+    /// Logs a warning on load failure so the operator sees the degradation.
+    ///
+    /// Model location: `ml/registry/correlation-iforest-{linux,windows}/0.1.0/`
+    /// next to the agent binary (or in the current working directory as fallback).
+    fn load_correlation_scorer() -> Option<ml::CorrelationScorer> {
+        /// Platform-specific model family names.
+        #[cfg(target_os = "linux")]
+        const MODEL_FAMILY: &str = "correlation-iforest-linux";
+        #[cfg(target_os = "windows")]
+        const MODEL_FAMILY: &str = "correlation-iforest-windows";
+        #[cfg(target_os = "macos")]
+        const MODEL_FAMILY: &str = "correlation-iforest-macos";
+
+        let model_dir = std::path::Path::new("ml/registry")
+            .join(MODEL_FAMILY)
+            .join("0.1.0");
+
+        match Self::try_load_scorer(&model_dir) {
+            Ok(scorer) => {
+                tracing::info!(
+                    model_dir = %model_dir.display(),
+                    "ML correlation scorer loaded"
+                );
+                Some(scorer)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    model_dir = %model_dir.display(),
+                    error = %e,
+                    "ML correlation scorer unavailable — agent works without ML"
+                );
+                None
+            }
+        }
+    }
+
+    fn try_load_scorer(
+        model_dir: &std::path::Path,
+    ) -> Result<ml::CorrelationScorer, Box<dyn std::error::Error>> {
+        let model_bytes = std::fs::read(model_dir.join("model.onnx"))?;
+        let meta_bytes = std::fs::read(model_dir.join("model_metadata.json")).ok();
+
+        Ok(ml::CorrelationScorer::from_onnx_bytes_with_metadata(
+            &model_bytes,
+            meta_bytes.as_deref(),
+        )?)
     }
 
     /// Activates issue #25's automated response — process kill on a high-confidence
@@ -145,14 +203,70 @@ impl DetectionSink {
     /// see `correlator::bayes`); the co-occurrence rules carry no confidence field.
     /// Issue #131 (verdict fusion) will give this a principled score to key off
     /// instead of a technique-name check.
+    ///
+    /// ML correlation scorer (issue #46 Phase 3, #47 Phase 2): if available, scores
+    /// the pid's behavior over the correlator window and updates the belief state with
+    /// the resulting log-likelihood ratio. Scoring happens in the correlator lock —
+    /// ONNX inference is fast (~microseconds) and the capture thread is single-threaded.
     fn correlate(&self, event: &Event) {
-        let alerts = self.correlator.lock().unwrap().on_event(event.clone());
+        let mut engine = self.correlator.lock().unwrap();
+        let alerts = engine.on_event(event.clone());
+
+        // ML scoring: score the pid's behavior and update belief with the LLR.
+        // The scorer lock is held briefly (load Option, score if present). Scoring
+        // itself accesses the bus while still holding the correlator lock, which is
+        // acceptable — inference is fast and this is the capture thread.
+        let pid = event.meta().pid;
+        if let Some(ref mut scorer) = *self.ml_scorer.lock().unwrap() {
+            let ml_llr = match scorer.score(engine.bus(), pid) {
+                Ok(Some(score)) => {
+                    // Scored successfully: convert to log-likelihood ratio.
+                    Some(ml::score_to_llr(score))
+                }
+                Ok(None) => {
+                    // Gated: fewer than MIN_EVENT_COUNT events in the window for this pid.
+                    // No score available yet, not an error.
+                    None
+                }
+                Err(ml::ScorerError::FeatureOutOfBounds {
+                    feature,
+                    value,
+                    min,
+                    max,
+                }) => {
+                    // OOD rejection: feature value outside training bounds, score unreliable.
+                    tracing::warn!(
+                        pid = pid,
+                        feature = feature,
+                        value = value,
+                        min = min,
+                        max = max,
+                        "ML scorer OOD rejection"
+                    );
+                    None
+                }
+                Err(e) => {
+                    // Other error (ONNX runtime, model parse): fail open, log and continue.
+                    tracing::error!(pid = pid, error = %e, "ML scorer error");
+                    None
+                }
+            };
+
+            // Update belief with the ML LLR (None = no ML evidence, not "benign").
+            if let Err(()) = engine.update_belief_with_ml(pid, ml_llr) {
+                // No behavior vector available yet for this pid — not enough events.
+                // Silent: this is normal for the first few events of a new pid.
+            }
+        }
+
+        // Emit alerts from co-occurrence rules and Bayesian belief.
         let is_high_confidence = alerts.iter().any(|alert| alert.technique == "BAYES");
+        drop(engine); // Unlock correlator before alert emission (log I/O).
         for alert in &alerts {
             self.emit(alert.technique, &alert.message);
         }
         if is_high_confidence {
-            self.maybe_kill(event.meta().pid);
+            self.maybe_kill(pid);
         }
     }
 

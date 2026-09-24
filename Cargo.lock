@@ -29,6 +29,7 @@ dependencies = [
  "ctrlc",
  "enrich",
  "libc",
+ "ml",
  "policy",
  "response",
  "rules",
@@ -1656,6 +1657,7 @@ dependencies = [
  "correlator",
  "ort",
  "schema",
+ "serde",
  "serde_json",
  "thiserror 2.0.20",
 ]

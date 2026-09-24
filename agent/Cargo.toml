@@ -15,6 +15,7 @@ config = { path = "../crates/config" }
 policy = { path = "../crates/policy" }
 rules = { path = "../crates/rules" }
 correlator = { path = "../crates/correlator" }
+ml = { path = "../crates/ml" }
 sigma = { path = "../crates/sigma" }
 enrich = { path = "../crates/enrich" }
 yara = { path = "../crates/yara" }
