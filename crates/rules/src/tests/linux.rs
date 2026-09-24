@@ -90,6 +90,112 @@ fn powershell_intermediate_truncation_does_not_match_yet() {
     assert!(check_encoded_powershell(&event).is_none());
 }
 
+// ── T1574.006 dynamic linker hijacking (LD_PRELOAD family, issue #363) ─────
+
+fn exec_with_env(env: &[(&str, &str)]) -> ExecEvent {
+    let mut event = exec_event("irrelevant");
+    event.env_security = env
+        .iter()
+        .map(|(n, v)| ((*n).to_string(), (*v).to_string()))
+        .collect();
+    event
+}
+
+#[test]
+fn ld_preload_outside_trust_set_alerts() {
+    let event = exec_with_env(&[("LD_PRELOAD", "/tmp/evil.so")]);
+    let alert = check_ld_preload_hijack(&event, &[]).expect("must alert");
+    assert_eq!(alert.technique, "T1574.006");
+    assert!(alert.message.contains("/tmp/evil.so"));
+}
+
+#[test]
+fn ld_preload_inside_trust_set_does_not_alert() {
+    assert!(
+        check_ld_preload_hijack(
+            &exec_with_env(&[("LD_PRELOAD", "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2")]),
+            &[]
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn ld_preload_bare_filename_does_not_alert() {
+    // No `/` — resolved via the trusted search path itself, not a planted path.
+    assert!(
+        check_ld_preload_hijack(&exec_with_env(&[("LD_PRELOAD", "libjemalloc.so.2")]), &[])
+            .is_none()
+    );
+}
+
+#[test]
+fn ld_preload_mixed_trusted_and_untrusted_alerts() {
+    // A colon-separated list where only one entry escapes the trust set still
+    // counts as evidence of the attack (LD_PRELOAD loads every listed object).
+    let event = exec_with_env(&[("LD_PRELOAD", "/usr/lib/libgood.so:/tmp/evil.so")]);
+    assert!(check_ld_preload_hijack(&event, &[]).is_some());
+}
+
+#[test]
+fn ld_audit_outside_trust_set_alerts() {
+    let event = exec_with_env(&[("LD_AUDIT", "/tmp/audit-evil.so")]);
+    assert_eq!(
+        check_ld_preload_hijack(&event, &[])
+            .expect("must alert")
+            .technique,
+        "T1574.006"
+    );
+}
+
+#[test]
+fn plain_exec_with_no_captured_env_does_not_alert() {
+    assert!(check_ld_preload_hijack(&exec_event("ls -la"), &[]).is_none());
+}
+
+#[test]
+fn other_captured_env_names_do_not_alert() {
+    // GLIBC_TUNABLES/LD_DEBUG_OUTPUT are captured for hunting visibility but have
+    // no trust-set shape to judge — only LD_PRELOAD/LD_AUDIT are rule-gated.
+    let event = exec_with_env(&[("GLIBC_TUNABLES", "glibc.malloc.check=1")]);
+    assert!(check_ld_preload_hijack(&event, &[]).is_none());
+}
+
+#[test]
+fn ld_preload_fires_through_on_exec_not_evaluate_exec() {
+    // The rule moved to the stateful path (it needs the seeded ld.so.conf trust set):
+    // the agent's sink calls both dispatchers, so it must fire exactly once, from
+    // `on_exec`.
+    let event = exec_with_env(&[("LD_PRELOAD", "/tmp/evil.so")]);
+    assert!(
+        crate::evaluate_exec(&event)
+            .iter()
+            .all(|a| a.technique != "T1574.006")
+    );
+    let alerts = RuleState::new().on_exec(&event);
+    assert_eq!(
+        alerts.iter().filter(|a| a.technique == "T1574.006").count(),
+        1
+    );
+}
+
+#[test]
+fn ld_preload_from_a_seeded_ld_so_conf_dir_does_not_alert() {
+    // A vendor library directory registered with ldconfig (/etc/ld.so.conf.d/*.conf)
+    // is part of the host's trust set once seeded — without the seed it alerts.
+    let event = exec_with_env(&[("LD_PRELOAD", "/opt/vendor/lib/libhook.so")]);
+    let fired = |state: &mut RuleState| {
+        state
+            .on_exec(&event)
+            .iter()
+            .any(|a| a.technique == "T1574.006")
+    };
+    assert!(fired(&mut RuleState::new()));
+    let mut seeded = RuleState::new();
+    seeded.seed_ld_trust_dirs(vec!["/opt/vendor/lib/".to_string()]);
+    assert!(!fired(&mut seeded));
+}
+
 // ── T1037.004 / T1053.003 persistence writes ────────────────────────────────
 
 #[test]

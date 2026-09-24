@@ -53,6 +53,9 @@ fn terminate_process(pid: u32) -> std::io::Result<()> {
 fn seeded_rule_state() -> rules::RuleState {
     let mut rule_state = rules::RuleState::new();
     rule_state.seed_from_proc();
+    // T1574.006 (#363): trust the library directories this host's ld.so.conf
+    // declares, on top of the built-in baseline.
+    rule_state.seed_ld_trust_from_system();
     match sensor_linux_netlink::snapshot() {
         Ok(entries) => {
             rule_state.seed_listen_ports(

@@ -21,7 +21,7 @@ use crate::{
         TRACEPOINTS, attach_tracepoint, err, load_ebpf, prime_proc_lineage, write_signal_watch_pid,
     },
     normalize,
-    proc::read_proc_cmdline,
+    proc::{read_proc_cmdline, read_proc_environ_security},
 };
 
 /// See `sensor_linux_wire::boot_epoch_offset_ns` — computed once at startup.
@@ -219,12 +219,13 @@ impl LinuxSensor {
                 _ = &mut ctrl_c => break,
                 _ = self.stop.notified() => break,
                 guard = exec_ring_buf.readable_mut() => {
-                    // One synchronous procfs read per exec event, on this task (see
+                    // Two synchronous procfs reads per exec event, on this task (see
                     // `read_proc_cmdline`'s doc comment on why this hasn't warranted
-                    // `spawn_blocking` yet). Container attribution no longer touches
-                    // `/proc` at all — see `CgroupIdCache`.
+                    // `spawn_blocking` yet — `read_proc_environ_security` is the same
+                    // file family, same tradeoff). Container attribution no longer
+                    // touches `/proc` at all — see `CgroupIdCache`.
                     drain!(guard, sensor_linux_wire::ExecEvent, sink, own_pid, |e: &sensor_linux_wire::ExecEvent| {
-                        normalize::exec(e, offset, read_proc_cmdline(e.meta.pid), container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        normalize::exec(e, offset, read_proc_cmdline(e.meta.pid), read_proc_environ_security(e.meta.pid), container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                     });
                 }
                 guard = file_open_ring_buf.readable_mut() => {

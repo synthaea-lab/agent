@@ -74,6 +74,11 @@ pub struct RuleState {
     /// this cannot be discovered from inside a sensor and must be seeded by the
     /// agent binary, same caller responsibility as `seed_pid_comm`.
     own_pid: Option<u32>,
+    /// Library directories the host's `ld.so.conf` declares, as `/`-terminated trust
+    /// prefixes, on top of the built-in baseline (T1574.006, #363). Empty until
+    /// [`Self::seed_ld_trust_from_system`] runs — the rule then falls back to the
+    /// baseline alone, which only costs false positives on vendor directories.
+    ld_trust_extra: Vec<String>,
 }
 
 /// Same bound as the correlator's entity table: the realistic live-pid space.
@@ -100,6 +105,7 @@ impl RuleState {
             known_listeners: BoundedMap::new(COUNTER_CAP),
             auth_failures: BoundedMap::new(COUNTER_CAP),
             own_pid: None,
+            ld_trust_extra: Vec::new(),
         }
     }
 
@@ -111,6 +117,28 @@ impl RuleState {
     /// spoofable. Call once at startup, same as `seed_pid_comm`/`seed_listen_ports`.
     pub fn seed_own_pid(&mut self, pid: u32) {
         self.own_pid = Some(pid);
+    }
+
+    /// Loads the host's dynamic-linker trust set from `/etc/ld.so.conf` (`include`s
+    /// followed) for the `LD_PRELOAD`/`LD_AUDIT` hijack rule (T1574.006, #363), so a vendor
+    /// library directory registered with `ldconfig` (`/opt/<app>/lib`) is not mistaken
+    /// for a planted preload. Linux-only in practice: elsewhere the file does not
+    /// exist and this is a no-op. Best-effort, same caller responsibility as
+    /// [`Self::seed_from_proc`]: call once at startup; an unreadable file only means the
+    /// rule judges against the built-in baseline.
+    pub fn seed_ld_trust_from_system(&mut self) {
+        self.seed_ld_trust_dirs(crate::ld_trust::collect_ld_dirs(
+            std::path::Path::new(crate::ld_trust::LD_SO_CONF),
+            &crate::ld_trust::read_file,
+            &crate::ld_trust::list_dir,
+        ));
+    }
+
+    /// Replaces the extra trusted directories (already normalized, `/`-terminated).
+    /// The seam [`Self::seed_ld_trust_from_system`] goes through; exposed for callers
+    /// and tests that supply their own list.
+    pub fn seed_ld_trust_dirs(&mut self, dirs: Vec<String>) {
+        self.ld_trust_extra = dirs;
     }
 
     /// Pre-fills the LISTENER-DRIFT baseline from the agent's own startup
@@ -499,6 +527,10 @@ impl RuleState {
         alerts.extend(self.check_self_spawn(event));
         alerts.extend(self.check_parent_suspect(event));
         alerts.extend(self.check_lolbin(event));
+        alerts.extend(crate::stateless::check_ld_preload_hijack(
+            event,
+            &self.ld_trust_extra,
+        ));
 
         self.pid_comm
             .insert(event.meta.pid, event.meta.comm.clone());

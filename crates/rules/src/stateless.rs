@@ -459,6 +459,40 @@ pub(crate) fn check_masquerading(event: &ExecEvent) -> Option<Alert> {
     })
 }
 
+/// T1574.006 — Hijack Execution Flow: Dynamic Linker Hijacking. `LD_PRELOAD` (and its
+/// quieter `LD_AUDIT` sibling) force the dynamic linker to load an attacker-chosen
+/// shared object into every dynamically linked exec that inherits the variable; a path
+/// outside the linker's own trust set is exactly that shape. The trust set is the
+/// built-in baseline ([`crate::ld_trust::LD_TRUST_PREFIXES`]) plus `extra_trust`, the
+/// directories the host's `/etc/ld.so.conf` declares — seeded once at startup by
+/// [`crate::RuleState::seed_ld_trust_from_system`], which is why this runs from
+/// [`crate::RuleState::on_exec`] rather than [`evaluate_exec`]. A path already inside
+/// the trust set is standard operational use (some distros ship a legitimate preload
+/// this way) and does not fire — no heuristics beyond the trust set, same
+/// false-positive posture as `check_masquerading`.
+///
+/// Evidence-gated on [`ExecEvent::env_security`] actually carrying the variable
+/// (#363): capture is a fixed allowlist, so this never scans the full environment for
+/// names it doesn't already have — it only ever judges what the sensor chose to keep.
+#[must_use]
+pub(crate) fn check_ld_preload_hijack(event: &ExecEvent, extra_trust: &[String]) -> Option<Alert> {
+    let (name, value) = event
+        .env_security
+        .iter()
+        .find(|(name, _)| name.as_str() == "LD_PRELOAD" || name.as_str() == "LD_AUDIT")?;
+    if crate::ld_trust::all_paths_trusted(value, extra_trust) {
+        return None;
+    }
+    Some(Alert {
+        technique: "T1574.006",
+        message: format!(
+            "pid={} comm={}: {name}={value} loads a shared object outside the dynamic \
+             linker's trusted search path",
+            event.meta.pid, event.meta.comm,
+        ),
+    })
+}
+
 /// T1490 — Inhibit System Recovery. The commands that destroy a host's
 /// ability to roll back before encryption: shadow-copy deletion, backup
 /// catalog wipes, recovery-boot disabling, and Time Machine local-snapshot

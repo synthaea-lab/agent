@@ -159,7 +159,16 @@ pub mod time;
 /// `setns(2)`/`unshare(2)`). Linux-only, no cross-platform reuse, same
 /// posture as #264/#265's Linux-only additions. Same serialization-visible
 /// reasoning as v13-v25.
-pub const SCHEMA_VERSION: u32 = 26;
+///
+/// Bumped 26 → 27 for [`ExecEvent::env_security`] (#363): a present-only
+/// allowlist capture of the loader-hijack environment family (`LD_PRELOAD`,
+/// `LD_LIBRARY_PATH`, `LD_AUDIT`, `LD_DEBUG_OUTPUT`, `GLIBC_TUNABLES`) —
+/// additive optional field, no new `Event` variant, same serialization-visible
+/// reasoning as every field addition since v13. Originally claimed as 21 → 22
+/// while this branch was open, then renumbered each time another PR took the
+/// number first: 22 → 23 (#262 Phase 3 xattr), 23 → 24 (#297 `PolicyDenial`),
+/// 24 → 25 (#264), 25 → 26 → 27 (#265, #266).
+pub const SCHEMA_VERSION: u32 = 27;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -366,6 +375,18 @@ pub struct ExecEvent {
     /// Code-signature verdict for the executed image, filled by enrichment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Signature>,
+    /// Security-relevant environment variables present at exec time, `(name, value)`
+    /// pairs (#363) — the dynamic-linker-hijack family: `LD_PRELOAD`,
+    /// `LD_LIBRARY_PATH`, `LD_AUDIT` (the quieter sibling of `LD_PRELOAD`),
+    /// `LD_DEBUG_OUTPUT` (arbitrary-file-write via the linker's own debug tracing),
+    /// and `GLIBC_TUNABLES` (the CVE-2023-4911 "Looney Tunables" vector). A fixed
+    /// allowlist, never the whole environment — environments carry secrets and
+    /// multi-KB noise — and present-only: a name absent from the process's actual
+    /// environment is simply not in this list, never an empty-value entry. Empty on
+    /// every platform/sensor that has not opted into this capture (Linux/eBPF only,
+    /// so far).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_security: Vec<(String, String)>,
 }
 
 impl ExecEvent {

@@ -139,6 +139,7 @@ pub fn normalize(raw: &RawEsEvent) -> Option<Event> {
             parent_image_path: parent_path.clone(),
             sha256: None,
             signature: Some(signature_from_cs_flags(*cs_flags)),
+            env_security: Vec::new(),
         })),
         RawEsEvent::Open { meta, path, fflag } => Some(Event::FileOpen(FileOpenEvent {
             meta: event_meta(meta),

@@ -69,8 +69,37 @@ fn exec_unix_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            env_security: Vec::new(),
         }),
         "exec",
+    );
+}
+
+#[test]
+fn exec_ld_preload_golden() {
+    // #363: the loader-hijack allowlist capture, present on the wire only when the
+    // sensor actually found one of the five security-relevant names in the process's
+    // environment at exec time.
+    assert_golden(
+        &Event::Exec(ExecEvent {
+            meta: EventMeta {
+                pid: 9001,
+                ppid: 1,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_007_000_000_000,
+                comm: "ls".into(),
+                container: None,
+            },
+            image_path: "/usr/bin/ls".into(),
+            cmdline: "ls -la".into(),
+            argv: ["ls", "-la"].map(String::from).into(),
+            parent_comm: None,
+            parent_image_path: None,
+            sha256: None,
+            signature: None,
+            env_security: vec![("LD_PRELOAD".into(), "/tmp/evil.so".into())],
+        }),
+        "exec_ld_preload",
     );
 }
 
@@ -96,6 +125,7 @@ fn exec_windows_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            env_security: Vec::new(),
         }),
         "exec_windows",
     );
@@ -127,6 +157,7 @@ fn exec_lineage_golden() {
             ),
             sha256: None,
             signature: None,
+            env_security: Vec::new(),
         }),
         "exec_lineage",
     );
@@ -177,6 +208,7 @@ fn detection_ml_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            env_security: Vec::new(),
         })],
     };
     let serialized = serde_json::to_value(&detection).unwrap();
@@ -481,6 +513,7 @@ fn exec_enriched_golden() {
             parent_image_path: None,
             sha256: Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into()),
             signature: Some(schema::Signature::Unsigned),
+            env_security: Vec::new(),
         }),
         "exec_enriched",
     );
@@ -511,6 +544,7 @@ fn exec_container_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            env_security: Vec::new(),
         }),
         "exec_container",
     );
@@ -1253,6 +1287,7 @@ fn unbounded_cmdline_survives() {
         parent_image_path: None,
         sha256: None,
         signature: None,
+        env_security: Vec::new(),
     });
     let back: Event = serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
     match &back {
@@ -1283,6 +1318,7 @@ fn ml_cmdline_is_the_canonical_nul_joined_form() {
         parent_image_path: None,
         sha256: None,
         signature: None,
+        env_security: Vec::new(),
     };
 
     // Linux execve: argv present → NUL-joined, ignoring the space-joined `cmdline`.
@@ -1309,6 +1345,12 @@ fn ml_cmdline_is_the_canonical_nul_joined_form() {
         mk("", &["sh", "-c", "chmod +x x"]).ml_cmdline(),
         "sh\0-c\0chmod +x x\0",
     );
+    // `env_security` (#363) never reaches the ML input: the captured linker
+    // environment is rule evidence, not a model feature, and must not leak into
+    // what the scorer tokenizes (or into training data exported from it).
+    let mut preloaded = mk("ls", &["ls"]);
+    preloaded.env_security = vec![("LD_PRELOAD".into(), "/tmp/x.so".into())];
+    assert_eq!(preloaded.ml_cmdline(), "ls\0");
 }
 
 #[test]
@@ -1331,6 +1373,7 @@ fn meta_accessor_covers_all_variants() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            env_security: Vec::new(),
         }),
         Event::FileOpen(FileOpenEvent {
             meta: meta.clone(),

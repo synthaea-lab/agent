@@ -121,12 +121,16 @@ fn meta(
 /// space-joined rendering of `argv` for display and Sigma matching; consumers that
 /// need the exact tokens use `argv` (or `ExecEvent::ml_cmdline`). `parent_comm` is the
 /// fork-lineage entry, or `None` when the parent predated the probe and priming
-/// missed it.
+/// missed it. `env_security` is passed in by the caller the same way as `argv` — the
+/// Linux sensor reads it from `/proc/<pid>/environ` when it drains the event (issue
+/// #363; same drain-time-read tradeoffs as `argv`, see `read_proc_environ_security`),
+/// already filtered to the security-relevant allowlist.
 #[must_use]
 pub fn exec(
     event: &wire::ExecEvent,
     boot_epoch_offset_ns: u64,
     argv: Vec<String>,
+    env_security: Vec<(String, String)>,
     container: Option<ContainerContext>,
 ) -> Event {
     let image_raw = &event.image[..(event.image_len as usize).min(wire::MAX_PATH_LEN)];
@@ -146,6 +150,7 @@ pub fn exec(
         parent_image_path: None,
         sha256: None,
         signature: None,
+        env_security,
     })
 }
 
@@ -629,7 +634,13 @@ mod tests {
     #[test]
     fn exec_keeps_argv_and_joins_cmdline() {
         let event = wire_exec(b"/usr/bin/curl", b"bash");
-        let Event::Exec(e) = exec(&event, 500, argv(&["curl", "-o", "/tmp/x"]), None) else {
+        let Event::Exec(e) = exec(
+            &event,
+            500,
+            argv(&["curl", "-o", "/tmp/x"]),
+            Vec::new(),
+            None,
+        ) else {
             panic!("wrong variant")
         };
         assert_eq!(e.argv, ["curl", "-o", "/tmp/x"]);
@@ -650,7 +661,8 @@ mod tests {
     fn exec_image_path_ignores_spoofed_argv0() {
         // execve("/tmp/evil", {"/usr/sbin/sshd", ...}, ...)
         let event = wire_exec(b"/tmp/evil", b"bash");
-        let Event::Exec(e) = exec(&event, 0, argv(&["/usr/sbin/sshd", "-D"]), None) else {
+        let Event::Exec(e) = exec(&event, 0, argv(&["/usr/sbin/sshd", "-D"]), Vec::new(), None)
+        else {
             panic!("wrong variant")
         };
         assert_eq!(
@@ -667,7 +679,7 @@ mod tests {
     fn exec_empty_argv_when_process_already_exited() {
         // /proc/<pid>/cmdline gone by drain time — image_path still authoritative.
         let event = wire_exec(b"/bin/sh", b"bash");
-        let Event::Exec(e) = exec(&event, 0, Vec::new(), None) else {
+        let Event::Exec(e) = exec(&event, 0, Vec::new(), Vec::new(), None) else {
             panic!("wrong variant")
         };
         assert!(e.argv.is_empty());
@@ -676,9 +688,28 @@ mod tests {
     }
 
     #[test]
+    fn exec_carries_security_env_when_present() {
+        let event = wire_exec(b"/usr/bin/ls", b"bash");
+        let env = vec![("LD_PRELOAD".to_string(), "/tmp/evil.so".to_string())];
+        let Event::Exec(e) = exec(&event, 0, argv(&["ls"]), env.clone(), None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.env_security, env);
+    }
+
+    #[test]
+    fn exec_security_env_empty_for_plain_exec() {
+        let event = wire_exec(b"/usr/bin/ls", b"bash");
+        let Event::Exec(e) = exec(&event, 0, argv(&["ls"]), Vec::new(), None) else {
+            panic!("wrong variant")
+        };
+        assert!(e.env_security.is_empty());
+    }
+
+    #[test]
     fn exec_parent_comm_absent_when_lineage_missed() {
         let event = wire_exec(b"/bin/sh", b"");
-        let Event::Exec(e) = exec(&event, 0, argv(&["sh"]), None) else {
+        let Event::Exec(e) = exec(&event, 0, argv(&["sh"]), Vec::new(), None) else {
             panic!("wrong variant")
         };
         assert_eq!(e.parent_comm, None);
@@ -693,7 +724,7 @@ mod tests {
             image: None,
             name: None,
         };
-        let Event::Exec(e) = exec(&event, 0, argv(&["nginx"]), Some(ctx)) else {
+        let Event::Exec(e) = exec(&event, 0, argv(&["nginx"]), Vec::new(), Some(ctx)) else {
             panic!("wrong variant")
         };
         let container = e.meta.container.expect("container attributed");
@@ -710,7 +741,7 @@ mod tests {
             image: Some("nginx:1.27".to_string()),
             name: Some("web1".to_string()),
         };
-        let Event::Exec(e) = exec(&event, 0, argv(&["nginx"]), Some(ctx)) else {
+        let Event::Exec(e) = exec(&event, 0, argv(&["nginx"]), Vec::new(), Some(ctx)) else {
             panic!("wrong variant")
         };
         let container = e.meta.container.expect("container attributed");
@@ -721,7 +752,7 @@ mod tests {
     #[test]
     fn bare_metal_process_has_no_container() {
         let event = wire_exec(b"/usr/bin/curl", b"bash");
-        let Event::Exec(e) = exec(&event, 0, argv(&["curl"]), None) else {
+        let Event::Exec(e) = exec(&event, 0, argv(&["curl"]), Vec::new(), None) else {
             panic!("wrong variant")
         };
         assert_eq!(e.meta.container, None);

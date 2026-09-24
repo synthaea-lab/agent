@@ -44,6 +44,7 @@ pub fn exec_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
         parent_image_path: None,
         sha256: None, // Filled by enrichment
         signature: None,
+        env_security: Vec::new(), // Phase 1: no environment capture on this sensor
     })
 }
 
