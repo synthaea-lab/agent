@@ -158,11 +158,47 @@ pub fn load_ebpf() -> Result<aya::Ebpf, SensorError> {
         tracing::debug!(ret, "remove limit on locked memory failed");
     }
 
-    let ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
-        env!("OUT_DIR"),
-        "/sensor-linux-ebpf"
-    )))
-    .map_err(|e| err(format!("failed to load the eBPF object: {e}")))?;
+    // `sched_process_fork`'s record layout differs across kernels (issue #415): feed
+    // the probe the running kernel's offsets, or leave it disabled (it then inserts
+    // nothing, and lineage falls back to the `/proc` priming snapshot) rather than
+    // let it read garbage pids at a compiled-in guess.
+    let fork = crate::tracefs::read_fork_layout();
+    let (known, comm_offset, comm_data_loc, parent_pid_offset, child_pid_offset) = match fork {
+        Some(l) => {
+            tracing::info!(
+                parent_comm_offset = l.parent_comm_offset,
+                parent_comm_data_loc = l.parent_comm_data_loc,
+                parent_pid_offset = l.parent_pid_offset,
+                child_pid_offset = l.child_pid_offset,
+                "sched_process_fork layout read from tracefs"
+            );
+            (
+                1u32,
+                l.parent_comm_offset,
+                u32::from(l.parent_comm_data_loc),
+                l.parent_pid_offset,
+                l.child_pid_offset,
+            )
+        }
+        None => {
+            tracing::warn!(
+                "sched_process_fork format unreadable or unrecognised (tracefs not mounted                  at /sys/kernel/tracing or /sys/kernel/debug/tracing?) — fork lineage                  disabled; exec events keep the parent only for processes primed from                  /proc at startup"
+            );
+            (0, 8, 0, 24, 44)
+        }
+    };
+
+    let ebpf = aya::EbpfLoader::new()
+        .override_global("FORK_LAYOUT_KNOWN", &known, true)
+        .override_global("FORK_PARENT_COMM_OFFSET", &comm_offset, true)
+        .override_global("FORK_PARENT_COMM_DATA_LOC", &comm_data_loc, true)
+        .override_global("FORK_PARENT_PID_OFFSET", &parent_pid_offset, true)
+        .override_global("FORK_CHILD_PID_OFFSET", &child_pid_offset, true)
+        .load(aya::include_bytes_aligned!(concat!(
+            env!("OUT_DIR"),
+            "/sensor-linux-ebpf"
+        )))
+        .map_err(|e| err(format!("failed to load the eBPF object: {e}")))?;
     Ok(ebpf)
 }
 

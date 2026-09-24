@@ -2,7 +2,7 @@
 #![no_main]
 
 use aya_ebpf::{
-    EbpfContext,
+    EbpfContext, Global,
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_kernel_str_bytes,
         bpf_probe_read_user, bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
@@ -86,27 +86,45 @@ fn is_filtered_path(path: &[u8]) -> bool {
 
 // --- sched:sched_process_fork -------------------------------------------------------
 //
-// Records `child_pid -> {parent_pid, parent_comm}`. Verified on 2026-09-15 on Alpine
-// (kernel 6.18.50-0-virt, x86_64) via
-// `/sys/kernel/tracing/events/sched/sched_process_fork/format` — and found NOT to
-// match the layout previously assumed here. This kernel emits `parent_comm`/
-// `child_comm` as `__data_loc` (dynamic-offset) fields, not inline `char[16]`s, which
-// also shifts every field after them:
+// Records `child_pid -> {parent_pid, parent_comm}`. The record layout is NOT stable
+// across kernels (issue #415). Two families exist in the wild:
 //
-//   field:__data_loc char[] parent_comm;  offset:8;  size:4;
-//   field:pid_t parent_pid;               offset:12; size:4;
-//   field:__data_loc char[] child_comm;   offset:16; size:4;
-//   field:pid_t child_pid;                offset:20; size:4;
+//   inline (5.15, 6.1, 6.8 — verified on the Hyper-V lab):
+//     field:char parent_comm[16];            offset:8;  size:16;
+//     field:pid_t parent_pid;                offset:24; size:4;
+//     field:pid_t child_pid;                 offset:44; size:4;
 //
-// `parent_comm` is read the same way `sched_process_exec` already reads `filename`
-// (issue #111): a `u32` data-locator (low 16 bits = byte offset from the record
-// start, high 16 bits = length), then a bounded string copy from that offset. All
-// fields are ints/u32s, no pointers — arch-independent, unlike `sys_enter_openat`
-// below. Re-verify against `/format` on any kernel row added to `lab/MATRIX.md`;
-// this layout has apparently changed across kernel versions before and can again.
-const FORK_PARENT_COMM_DATA_LOC_OFFSET: usize = 8;
-const FORK_PARENT_PID_OFFSET: usize = 12;
-const FORK_CHILD_PID_OFFSET: usize = 20;
+//   __data_loc (Alpine 6.18.50-0-virt — verified by #205):
+//     field:__data_loc char[] parent_comm;   offset:8;  size:4;
+//     field:pid_t parent_pid;                offset:12; size:4;
+//     field:pid_t child_pid;                 offset:20; size:4;
+//
+// Hard-coding either one silently zeroes lineage on the other (#205 fixed 6.18 and
+// broke every inline-comm kernel). So the offsets are read-only globals that
+// userspace overrides at load time from the running kernel's
+// `/sys/kernel/tracing/events/sched/sched_process_fork/format`
+// (`sensor-linux::tracefs`). The compiled-in defaults describe the inline layout,
+// but `FORK_LAYOUT_KNOWN` stays 0 unless userspace actually parsed the format: an
+// unrecognised kernel makes this probe a no-op (lineage then degrades to the
+// `/proc` priming snapshot) instead of inserting garbage pids. All fields are
+// ints/u32s read through `bpf_probe_read`, so the variable offsets are
+// verifier-safe and arch-independent.
+
+/// 1 once userspace has parsed the running kernel's fork format; 0 = do nothing.
+#[unsafe(no_mangle)]
+static FORK_LAYOUT_KNOWN: Global<u32> = Global::new(0);
+/// Offset of `parent_comm`: the `char[16]` itself (inline) or its data-locator.
+#[unsafe(no_mangle)]
+static FORK_PARENT_COMM_OFFSET: Global<u32> = Global::new(8);
+/// 1 when `parent_comm` is a `__data_loc` field, 0 when it is an inline `char[16]`.
+#[unsafe(no_mangle)]
+static FORK_PARENT_COMM_DATA_LOC: Global<u32> = Global::new(0);
+/// Offset of `pid_t parent_pid`.
+#[unsafe(no_mangle)]
+static FORK_PARENT_PID_OFFSET: Global<u32> = Global::new(24);
+/// Offset of `pid_t child_pid`.
+#[unsafe(no_mangle)]
+static FORK_CHILD_PID_OFFSET: Global<u32> = Global::new(44);
 
 #[tracepoint]
 pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
@@ -115,30 +133,43 @@ pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
 }
 
 fn try_sched_process_fork(ctx: &TracePointContext) -> Result<(), i64> {
+    if FORK_LAYOUT_KNOWN.load() == 0 {
+        return Ok(());
+    }
     let parent_pid: i32 = unsafe {
-        ctx.read_at(FORK_PARENT_PID_OFFSET).map_err(|_| {
-            warn!(ctx, "sensor-linux-ebpf: fork read parent_pid failed");
-            1i64
-        })?
+        ctx.read_at(FORK_PARENT_PID_OFFSET.load() as usize)
+            .map_err(|_| {
+                warn!(ctx, "sensor-linux-ebpf: fork read parent_pid failed");
+                1i64
+            })?
     };
     let child_pid: i32 = unsafe {
-        ctx.read_at(FORK_CHILD_PID_OFFSET).map_err(|_| {
-            warn!(ctx, "sensor-linux-ebpf: fork read child_pid failed");
-            1i64
-        })?
+        ctx.read_at(FORK_CHILD_PID_OFFSET.load() as usize)
+            .map_err(|_| {
+                warn!(ctx, "sensor-linux-ebpf: fork read child_pid failed");
+                1i64
+            })?
     };
-    let data_loc: u32 = unsafe {
-        ctx.read_at(FORK_PARENT_COMM_DATA_LOC_OFFSET).map_err(|_| {
-            warn!(
-                ctx,
-                "sensor-linux-ebpf: fork read parent_comm data_loc failed"
-            );
-            1i64
-        })?
+
+    let comm_field = FORK_PARENT_COMM_OFFSET.load() as usize;
+    let comm_offset = if FORK_PARENT_COMM_DATA_LOC.load() != 0 {
+        // u32 data-locator: low 16 bits = byte offset from the record start, high 16
+        // bits = length — same decoding as `sched_process_exec`'s `filename` (#111).
+        let data_loc: u32 = unsafe {
+            ctx.read_at(comm_field).map_err(|_| {
+                warn!(
+                    ctx,
+                    "sensor-linux-ebpf: fork read parent_comm data_loc failed"
+                );
+                1i64
+            })?
+        };
+        (data_loc & 0xffff) as usize
+    } else {
+        comm_field
     };
 
     let mut comm = [0u8; TASK_COMM_LEN];
-    let comm_offset = (data_loc & 0xffff) as usize;
     let comm_src = unsafe { (ctx.as_ptr() as *const u8).add(comm_offset) };
     let _ = unsafe { bpf_probe_read_kernel_str_bytes(comm_src, &mut comm) };
 

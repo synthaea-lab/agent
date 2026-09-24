@@ -22,6 +22,8 @@ mod ebpf;
 mod proc;
 #[cfg(target_os = "linux")]
 mod sensor;
+#[cfg(target_os = "linux")]
+mod tracefs;
 
 #[cfg(target_os = "linux")]
 pub use ebpf::{TRACEPOINTS, load_ebpf, load_program};
