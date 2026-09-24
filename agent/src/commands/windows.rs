@@ -44,6 +44,9 @@ fn seeded_rule_state() -> rules::RuleState {
         }
         Err(e) => tracing::warn!(error = %e, "socket snapshot for listener baseline failed"),
     }
+    // Issue #403: without this, the Event Log sensor's own wevtutil.exe/auditpol.exe
+    // poll-loop children trip SELF-SPAWN on the agent itself.
+    rule_state.seed_own_pid(std::process::id());
     rule_state
 }
 

@@ -13,11 +13,11 @@ use store::BoundedMap;
 use crate::{
     Alert,
     exclusions::{
-        AUTH_FAILURE_THRESHOLD, AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD, BEACON_WINDOW_NS,
-        BROWSERS, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS,
-        SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_THRESHOLD,
-        SELF_SPAWN_WINDOW_NS, SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN,
-        SUSPECT_PARENTS_WIN, WEB_SERVER_COMMS,
+        AGENT_CHILD_EXCLUSIONS, AUTH_FAILURE_THRESHOLD, AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD,
+        BEACON_WINDOW_NS, BROWSERS, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS,
+        LOLBIN_LEGIT_PARENTS, LOLBINS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
+        SELF_SPAWN_THRESHOLD, SELF_SPAWN_WINDOW_NS, SHELL_COMMS, STANDARD_PORTS,
+        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, WEB_SERVER_COMMS,
     },
     has_write_intent,
     sliding::{FlowPortDedup, SlidingCounter},
@@ -68,6 +68,12 @@ pub struct RuleState {
     /// LRU-bounded like every other counter: a spray across many fabricated
     /// usernames must not grow this without limit.
     auth_failures: BoundedMap<(String, String), SlidingCounter>,
+    /// The agent's own pid, for [`Self::check_self_spawn`]'s narrow exclusion of
+    /// its own known children (issue #403). `None` until [`Self::seed_own_pid`] is
+    /// called — `sensor-*` crates stay `schema`-only (`tools/check-deps.py`), so
+    /// this cannot be discovered from inside a sensor and must be seeded by the
+    /// agent binary, same caller responsibility as `seed_pid_comm`.
+    own_pid: Option<u32>,
 }
 
 /// Same bound as the correlator's entity table: the realistic live-pid space.
@@ -93,7 +99,18 @@ impl RuleState {
             beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
             auth_failures: BoundedMap::new(COUNTER_CAP),
+            own_pid: None,
         }
+    }
+
+    /// Seeds the agent's own pid (issue #403), so [`Self::check_self_spawn`] can
+    /// narrowly exclude its own known children (`AGENT_CHILD_EXCLUSIONS`) instead
+    /// of alerting on the Event Log sensor's `wevtutil`/`auditpol` poll loop. Not a
+    /// blanket "ignore every child of this pid": the exclusion still requires the
+    /// child's image to live at a trusted system path, since `ppid` alone is
+    /// spoofable. Call once at startup, same as `seed_pid_comm`/`seed_listen_ports`.
+    pub fn seed_own_pid(&mut self, pid: u32) {
+        self.own_pid = Some(pid);
     }
 
     /// Pre-fills the LISTENER-DRIFT baseline from the agent's own startup
@@ -240,12 +257,26 @@ impl RuleState {
     ///
     /// False positives documented in lab (2026-08-24/25): MpCmdRun.exe, WerFault.exe,
     /// RuntimeBroker.exe — excluded via `SELF_SPAWN_EXCLUSIONS` /
-    /// `SELF_SPAWN_PARENT_EXCLUSIONS`.
+    /// `SELF_SPAWN_PARENT_EXCLUSIONS`. The agent's own children (issue #403,
+    /// 2026-09-23) — excluded via `AGENT_CHILD_EXCLUSIONS`, gated on
+    /// [`Self::seed_own_pid`].
     fn check_self_spawn(&mut self, event: &ExecEvent) -> Option<Alert> {
         if !matches!(event.meta.user, User::Windows { .. }) {
             return None;
         }
         let comm = event.meta.comm.clone();
+        // The agent's own known children (issue #403): wevtutil.exe/auditpol.exe
+        // spawned by the Event Log sensor's poll loop. Gated on the ppid matching
+        // the agent's own seeded pid, not just the name — ppid alone is spoofable
+        // (`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`), so this must stay narrow.
+        if self.own_pid == Some(event.meta.ppid)
+            && AGENT_CHILD_EXCLUSIONS
+                .iter()
+                .any(|&e| comm.eq_ignore_ascii_case(e))
+            && policy::name_exclusion_applies(Some(event.image_path.as_str()))
+        {
+            return None;
+        }
         // Name alone is a bypass: a payload renamed `svchost.exe` in %TEMP% must
         // not inherit the exclusion — the image must live where the real binary
         // does (user finding; signature-based identity is the follow-up issue).

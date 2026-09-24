@@ -59,6 +59,19 @@ pub(crate) const SELF_SPAWN_EXCLUSIONS: &[&str] = &[
 /// (notifications, policies) — false positive observed in lab 2026-08-25.
 pub(crate) const SELF_SPAWN_PARENT_EXCLUSIONS: &[&str] = &["RuntimeBroker.exe"];
 
+/// The agent's own known children — narrower than [`SELF_SPAWN_EXCLUSIONS`]: only
+/// applies when the spawning `ppid` is the agent's own seeded pid (issue #403).
+/// `wevtutil.exe`: the Event Log sensor's `wevtutil qe` poll loop, one spawn every
+/// 2s per enabled channel — ~60 spawns/30s across the default four channels, well
+/// past `SELF_SPAWN_THRESHOLD`. `auditpol.exe`: run once at startup per channel
+/// needing an audit subcategory enabled. Both false-positived on the agent itself
+/// in the 2026-09-23 live lab validation of #391. Never a blanket "ignore every
+/// child of the agent": `ppid` alone is spoofable
+/// (`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`), so `check_self_spawn` also requires
+/// the image to live at a trusted system path (`policy::name_exclusion_applies`),
+/// same pairing as `SELF_SPAWN_EXCLUSIONS`.
+pub(crate) const AGENT_CHILD_EXCLUSIONS: &[&str] = &["wevtutil.exe", "auditpol.exe"];
+
 /// `LOLBins` abused for shellcode injection or executing unsigned code (T1218/T1127).
 pub(crate) const LOLBINS: &[&str] = &[
     "aspnet_compiler.exe",

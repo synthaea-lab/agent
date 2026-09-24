@@ -133,6 +133,124 @@ fn self_spawn_excluded_process_does_not_alert() {
     assert!(alerts.is_empty());
 }
 
+// ── Agent's own children (issue #403) ─────────────────────────────────────
+
+#[test]
+fn agent_own_wevtutil_child_does_not_alert() {
+    let mut state = RuleState::new();
+    state.seed_own_pid(1084);
+    let sec = 1_000_000_000u64;
+    let mut alerts = Vec::new();
+    for i in 0..SELF_SPAWN_THRESHOLD + 2 {
+        let mut e = exec_event_win(
+            6000 + i,
+            1084,
+            "wevtutil.exe",
+            "wevtutil.exe",
+            u64::from(i) * sec,
+        );
+        e.image_path = "C:\\Windows\\System32\\wevtutil.exe".to_string();
+        alerts.extend(state.on_exec(&e));
+    }
+    assert!(
+        alerts.is_empty(),
+        "the agent's own wevtutil.exe poll children must not self-alert (#403)"
+    );
+}
+
+#[test]
+fn agent_own_auditpol_child_does_not_alert() {
+    let mut state = RuleState::new();
+    state.seed_own_pid(1084);
+    let sec = 1_000_000_000u64;
+    let mut alerts = Vec::new();
+    for i in 0..SELF_SPAWN_THRESHOLD + 2 {
+        let mut e = exec_event_win(
+            6100 + i,
+            1084,
+            "auditpol.exe",
+            "auditpol.exe",
+            u64::from(i) * sec,
+        );
+        e.image_path = "C:\\Windows\\System32\\auditpol.exe".to_string();
+        alerts.extend(state.on_exec(&e));
+    }
+    assert!(
+        alerts.is_empty(),
+        "the agent's own auditpol.exe startup child must not self-alert (#403)"
+    );
+}
+
+#[test]
+fn spoofed_own_pid_with_non_allowlisted_image_still_alerts() {
+    // Done-when criterion from #403: a process spawned with a spoofed parent (the
+    // agent's own pid) and a non-allowlisted image must still trigger SELF-SPAWN —
+    // ppid alone must never become a blanket exclusion.
+    let mut state = RuleState::new();
+    state.seed_own_pid(1084);
+    let sec = 1_000_000_000u64;
+    let mut alerts = Vec::new();
+    for i in 0..SELF_SPAWN_THRESHOLD {
+        let e = exec_event_win(6200 + i, 1084, "cmd.exe", "cmd.exe", u64::from(i) * sec);
+        alerts.extend(state.on_exec(&e));
+    }
+    assert!(
+        alerts.iter().any(|a| a.technique == "T1059"),
+        "spoofing the agent's pid as parent must not exempt an arbitrary child"
+    );
+}
+
+#[test]
+fn agent_child_name_from_untrusted_path_still_alerts() {
+    // Same masquerade guard as SELF_SPAWN_EXCLUSIONS: a payload named wevtutil.exe
+    // but not living at the real system path must not inherit the exclusion, even
+    // with a matching (possibly spoofed) ppid.
+    let mut state = RuleState::new();
+    state.seed_own_pid(1084);
+    let sec = 1_000_000_000u64;
+    let mut alerts = Vec::new();
+    for i in 0..SELF_SPAWN_THRESHOLD {
+        let mut e = exec_event_win(
+            6300 + i,
+            1084,
+            "wevtutil.exe",
+            "wevtutil.exe",
+            u64::from(i) * sec,
+        );
+        e.image_path = "C:\\Windows\\Temp\\wevtutil.exe".to_string();
+        alerts.extend(state.on_exec(&e));
+    }
+    assert!(
+        alerts.iter().any(|a| a.technique == "T1059"),
+        "a masqueraded wevtutil.exe outside System32 must still trigger self-spawn"
+    );
+}
+
+#[test]
+fn wevtutil_child_of_a_different_parent_still_alerts() {
+    // The exclusion is keyed on the *agent's own* pid, not on the name alone —
+    // wevtutil.exe spawned by anything else is not the agent's poll loop.
+    let mut state = RuleState::new();
+    state.seed_own_pid(1084);
+    let sec = 1_000_000_000u64;
+    let mut alerts = Vec::new();
+    for i in 0..SELF_SPAWN_THRESHOLD {
+        let mut e = exec_event_win(
+            6400 + i,
+            9999,
+            "wevtutil.exe",
+            "wevtutil.exe",
+            u64::from(i) * sec,
+        );
+        e.image_path = "C:\\Windows\\System32\\wevtutil.exe".to_string();
+        alerts.extend(state.on_exec(&e));
+    }
+    assert!(
+        alerts.iter().any(|a| a.technique == "T1059"),
+        "wevtutil.exe spawned by a pid other than the agent's own must still alert"
+    );
+}
+
 #[test]
 fn self_spawn_outside_window_resets_counter() {
     let mut state = RuleState::new();
