@@ -2,8 +2,11 @@
 //! catchable signal, record who sent it, when, and how — "where the platform allows"
 //! per the issue, since SIGKILL/SIGSTOP cannot be masked, caught, or attributed by the
 //! dying process at all (POSIX: `pthread_sigmask`/`sigaction` silently cannot touch
-//! them) — a real SIGKILL still kills the agent with zero attribution here, the same
-//! honest gap every other #71 primitive documents for its own uncoverable edge.
+//! them) — a real SIGKILL still kills the agent with zero attribution here. The eBPF
+//! sensor closes that gap from the kernel side (issue #362): its `kill`/`tgkill`
+//! probes record a SIGKILL aimed at the agent in a pinned map before delivery, and
+//! the restarted agent reports the sender through the T1562.001 rule. Under the
+//! audit fallback sensor the gap remains.
 //!
 //! Mechanism: the catchable termination signals (SIGTERM/SIGHUP/SIGQUIT — **not**
 //! SIGINT, deliberately: `sensor_linux::LinuxSensor::run` already owns Ctrl-C via

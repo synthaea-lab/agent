@@ -192,4 +192,5 @@ fn listen_port_event_full(
 mod coverage;
 mod linux;
 mod persistence;
+mod tamper;
 mod windows;

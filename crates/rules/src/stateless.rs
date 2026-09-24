@@ -579,3 +579,58 @@ pub(crate) fn check_log_file_delete(event: &schema::FileDeleteEvent) -> Option<A
 pub fn evaluate_file_delete(event: &schema::FileDeleteEvent) -> Vec<Alert> {
     check_log_file_delete(event).into_iter().collect()
 }
+
+/// `SIGSTOP`'s platform-native number: the one signal of
+/// [`tamper_signal_name`]'s set that differs between Linux and macOS. Signal
+/// events carry the sending host's numbering, and rules run on that same host.
+const SIGSTOP: u32 = if cfg!(target_os = "macos") { 17 } else { 19 };
+
+/// Name of `signal` when it ends or freezes its target, `None` otherwise. Signal
+/// `0` (an existence probe) and the user-defined or job-control signals are left
+/// out: they neither stop the agent nor blind it. Every number but `SIGSTOP` is
+/// the same on Linux and macOS.
+fn tamper_signal_name(signal: u32) -> Option<&'static str> {
+    match signal {
+        1 => Some("SIGHUP"),
+        2 => Some("SIGINT"),
+        3 => Some("SIGQUIT"),
+        6 => Some("SIGABRT"),
+        9 => Some("SIGKILL"),
+        15 => Some("SIGTERM"),
+        s if s == SIGSTOP => Some("SIGSTOP"),
+        _ => None,
+    }
+}
+
+/// T1562.001 — Impair Defenses: Disable or Modify Tools, the process-termination
+/// half (issue #362). Every [`schema::SignalEvent`] already targets a protected
+/// security process: the sensors filter at the source (Linux: the eBPF
+/// `SIGNAL_WATCH_PID` gate on the agent's own pid; macOS: the Endpoint Security
+/// client gate). This rule only keeps the signals that end or freeze the target.
+///
+/// On Linux it is the only record of a `SIGKILL`'s sender: the agent's own
+/// `kill_loudness` can only attribute the catchable signals. The kernel-side
+/// record of a `SIGKILL` survives the kill in a pinned map and is replayed by the
+/// restarted agent, so that alert arrives one restart late.
+#[must_use]
+pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Option<Alert> {
+    let name = tamper_signal_name(event.signal)?;
+    let target = event.target_image_path.as_deref().unwrap_or("?");
+    let sender_uid = match &event.meta.user {
+        schema::User::Unix { uid, .. } => format!(" uid={uid}"),
+        _ => String::new(),
+    };
+    Some(Alert {
+        technique: "T1562.001",
+        message: format!(
+            "pid={} comm={}{sender_uid}: sent {name} ({}) to security process pid={} ({target})",
+            event.meta.pid, event.meta.comm, event.signal, event.target_pid,
+        ),
+    })
+}
+
+/// Evaluates all stateless rules applicable to a `SignalEvent`.
+#[must_use]
+pub fn evaluate_signal(event: &schema::SignalEvent) -> Vec<Alert> {
+    check_security_process_signal(event).into_iter().collect()
+}

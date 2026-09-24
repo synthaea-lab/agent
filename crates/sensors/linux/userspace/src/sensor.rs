@@ -9,6 +9,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use schema::sensor::{Capabilities, EventSink, Sensor, SensorError};
@@ -18,7 +19,8 @@ use tracing::warn;
 use crate::{
     container::{CgroupIdCache, DockerInfoCache, container_context},
     ebpf::{
-        TRACEPOINTS, attach_tracepoint, err, load_ebpf, prime_proc_lineage, write_signal_watch_pid,
+        TRACEPOINTS, TamperSlot, attach_tracepoint, clear_tamper_slot, err, load_ebpf_for_run,
+        prime_proc_lineage, read_tamper_slot, take_tamper_slot, write_signal_watch_pid,
     },
     normalize,
     proc::{read_proc_cmdline, read_proc_environ_security},
@@ -30,6 +32,39 @@ use crate::{
 /// again, the same thing happened again.)
 fn boot_epoch_offset_ns() -> u64 {
     sensor_linux_wire::boot_epoch_offset_ns()
+}
+
+/// How often [`sweep_survived_sigkill`] runs.
+const TAMPER_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Age past which a `SIGKILL` recorded against this very process is known not to
+/// have landed. Delivery happens within the sender's `kill(2)` call, microseconds
+/// after the probe fires, so a live agent one second later survived it.
+const SIGKILL_SURVIVED_AFTER_NS: u64 = 1_000_000_000;
+
+/// Clears `SIGNAL_TAMPER_LAST` when it holds a `SIGKILL` aimed at this process
+/// that the process survived (issue #362). The probe fires at syscall entry,
+/// before the permission check, so an unprivileged `kill -9` that fails with
+/// `EPERM` still fills the slot. Left there, the next restart (a clean
+/// `systemctl restart` included) would blame that sender for a kill that never
+/// happened. The live `Event::Signal` from the ring buffer already reported the
+/// attempt itself. Waiting [`SIGKILL_SURVIVED_AFTER_NS`] rather than clearing on
+/// that ring-buffer event keeps a real kill from racing its own record away.
+fn sweep_survived_sigkill(slot: &mut TamperSlot, own_pid: u32, boot_epoch_offset_ns: u64) {
+    let Some(recorded) = read_tamper_slot(slot) else {
+        return;
+    };
+    let recorded_at = recorded
+        .meta
+        .timestamp_ns
+        .saturating_add(boot_epoch_offset_ns);
+    let age = schema::time::now_ns().saturating_sub(recorded_at);
+    if recorded.target_pid == own_pid
+        && age > SIGKILL_SURVIVED_AFTER_NS
+        && let Err(e) = clear_tamper_slot(slot)
+    {
+        warn!(error = %e, "sensor-linux: could not clear a survived SIGKILL record");
+    }
 }
 
 /// Linux sensor (eBPF). `run` blocks until Ctrl-C or [`Sensor::stop`].
@@ -108,7 +143,7 @@ impl LinuxSensor {
     }
 
     async fn run_async(&mut self, sink: Box<dyn EventSink>) -> Result<(), SensorError> {
-        let mut ebpf = load_ebpf()?;
+        let mut ebpf = load_ebpf_for_run()?;
         let offset = boot_epoch_offset_ns();
         // Computed early (not just for #340's drain-time self-exclusion below) so
         // `write_signal_watch_pid` can seed `SIGNAL_WATCH_PID` before the
@@ -212,12 +247,34 @@ impl LinuxSensor {
         let docker_cache: DockerInfoCache = Arc::new(Mutex::new(HashMap::new()));
         // Issue #340: excluded from every drain below so the sensor never re-observes
         // its own syscalls (most visibly its `write(2)`s to `events.jsonl`).
+        // Issue #362: a SIGKILL recorded by the previous agent instance, the one
+        // this process presumably restarted after. Replayed through the normal
+        // `Event::Signal` path, so the tamper rule attributes it like a live one.
+        let mut tamper_slot = take_tamper_slot(&mut ebpf)?;
+        if let Some(previous) = read_tamper_slot(&tamper_slot) {
+            tracing::warn!(
+                sender_pid = previous.meta.pid,
+                target_pid = previous.target_pid,
+                "sensor-linux: the previous agent instance was sent SIGKILL, reporting it"
+            );
+            sink.on_event(normalize::signal(
+                &previous,
+                offset,
+                self_exe.clone(),
+                container_context(previous.meta.cgroup_id, &mut container_ids, &docker_cache),
+            ));
+            clear_tamper_slot(&mut tamper_slot)?;
+        }
+        let mut tamper_sweep = tokio::time::interval(TAMPER_SWEEP_INTERVAL);
         let ctrl_c = tokio::signal::ctrl_c();
         tokio::pin!(ctrl_c);
         loop {
             tokio::select! {
                 _ = &mut ctrl_c => break,
                 _ = self.stop.notified() => break,
+                _ = tamper_sweep.tick() => {
+                    sweep_survived_sigkill(&mut tamper_slot, own_pid, offset);
+                }
                 guard = exec_ring_buf.readable_mut() => {
                     // Two synchronous procfs reads per exec event, on this task (see
                     // `read_proc_cmdline`'s doc comment on why this hasn't warranted

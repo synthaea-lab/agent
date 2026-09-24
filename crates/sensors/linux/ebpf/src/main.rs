@@ -2729,6 +2729,20 @@ fn is_watched_signal_target(target_pid: u32) -> bool {
 #[map]
 static SIGNAL_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
+/// Last `SIGKILL` sent to a watched target (issue #362). The ring-buffer event
+/// above cannot attribute a `SIGKILL`: the victim is the agent itself, which dies
+/// before it drains the buffer. This single slot is written synchronously at
+/// `sys_enter_kill`/`sys_enter_tgkill`, before the kernel even delivers the signal.
+/// Userspace pins it to bpffs, so the restarted agent can read who killed its
+/// predecessor. Unpinned (no bpffs), it still loads, but the record dies with the
+/// agent. Only `SIGKILL` lands here, because every catchable signal is already
+/// attributed by `agent::kill_loudness`, and a `SIGSTOP` does not end the process.
+#[map]
+static SIGNAL_TAMPER_LAST: Array<SignalEvent> = Array::with_max_entries(1, 0);
+
+/// `SIGKILL`'s number, the same on every Linux architecture.
+const SIGKILL: u32 = 9;
+
 /// Per-CPU scratch for building one `SignalEvent` (see `EXEC_SCRATCH`).
 #[map]
 static SIGNAL_SCRATCH: PerCpuArray<SignalEvent> = PerCpuArray::with_max_entries(1, 0);
@@ -2837,6 +2851,15 @@ fn emit_signal_event(ctx: &TracePointContext, target_pid: u32, sig: u32) -> Resu
         }
         (*e).signal = sig;
         (*e).target_pid = target_pid;
+
+        // Written before the ring-buffer output, so the slot is recorded even
+        // when the ring is full.
+        if sig == SIGKILL && SIGNAL_TAMPER_LAST.set(0, &*e, 0).is_err() {
+            warn!(
+                ctx,
+                "sensor-linux-ebpf: failed to record SIGKILL in SIGNAL_TAMPER_LAST"
+            );
+        }
 
         if SIGNAL_EVENTS.output::<SignalEvent>(&*e, 0).is_err() {
             warn!(
