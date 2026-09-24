@@ -54,6 +54,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "transport",
+ "updater",
  "yara",
 ]
 
