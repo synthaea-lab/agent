@@ -441,32 +441,55 @@ pub fn parse_account_created_block(block: &str) -> Option<AccountCreatedEvent> {
     })
 }
 
-/// One `Microsoft-Windows-AppLocker/EXE and DLL` event 8004 — an executable was
-/// refused execution by `AppLocker` (deny rule matched, or no allow rule in an
-/// allowlist policy). `AppLocker`'s channel emits this as `<UserData>` /
-/// `<RuleAndFileData>` rather than the `<EventData><Data Name=...>` shape the
-/// Security channel uses, so this parser reads the raw child elements
-/// directly (`<FilePath>`, `<TargetProcessId>`).
+/// One `Microsoft-Windows-AppLocker/EXE and DLL` event: **8004** (an image
+/// was refused — deny rule matched, or no allow rule in an allowlist policy)
+/// or **8003** (audit-only mode: it *would* have been refused, #427).
+/// `AppLocker`'s channel emits these as `<UserData>` / `<RuleAndFileData>`
+/// rather than the `<EventData><Data Name=...>` shape the Security channel
+/// uses, so this parser reads the raw child elements directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppLockerBlockEvent {
+pub struct AppLockerEvent {
     pub record_id: u64,
-    /// PID of the process that tried to launch the blocked image
+    /// `System/EventID`: 8004 (blocked) or 8003 (audit mode). 0 if missing.
+    pub event_id: u32,
+    /// Which rule collection matched (`RuleAndFileData/PolicyName`): `EXE`
+    /// for executables, `DLL` for libraries — the channel carries both.
+    /// Empty if missing.
+    pub policy_name: String,
+    /// SID of the user whose execution was refused
+    /// (`RuleAndFileData/TargetUser`). Deliberately not
+    /// `System/Security/@UserID`, which names the account the event was
+    /// *logged* under; the two matched in the only real capture so far (#427).
+    pub target_user: Option<String>,
+    /// PID of the process that tried to launch the image
     /// (`RuleAndFileData/TargetProcessId`). 0 if missing.
     pub target_process_id: u32,
-    /// Absolute path of the blocked image (`RuleAndFileData/FilePath`). Empty
-    /// if missing.
+    /// Path of the image as `AppLocker` reports it (`RuleAndFileData/FilePath`),
+    /// path variables and upper case included — see [`expand_applocker_path`].
+    /// Empty if missing.
     pub file_path: String,
 }
 
-/// Parses one 8004 `<Event>` block. `None` if the block is missing
+/// Parses one 8003/8004 `<Event>` block. `None` if the block is missing
 /// `EventRecordID` (a genuinely different event matched the `XPath` filter, or
 /// a `wevtutil` output shape change — skip rather than guess, same convention
 /// as the other parsers in this module).
 #[must_use]
-pub fn parse_applocker_block(block: &str) -> Option<AppLockerBlockEvent> {
+pub fn parse_applocker_event(block: &str) -> Option<AppLockerEvent> {
     let record_id = extract_between(block, "<EventRecordID>", "</EventRecordID>")?
         .parse()
         .ok()?;
+    let event_id = extract_between(block, "<EventID>", "</EventID>")
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let policy_name = extract_between(block, "<PolicyName>", "</PolicyName>")
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    let target_user = extract_between(block, "<TargetUser>", "</TargetUser>")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     // `AppLocker`'s payload lives in <UserData><RuleAndFileData>: children are
     // *plain* elements (`<FilePath>...</FilePath>`), not `<Data Name='...'>`
     // like on the Security channel.
@@ -477,11 +500,57 @@ pub fn parse_applocker_block(block: &str) -> Option<AppLockerBlockEvent> {
         .map(str::trim)
         .unwrap_or("")
         .to_string();
-    Some(AppLockerBlockEvent {
+    Some(AppLockerEvent {
         record_id,
+        event_id,
+        policy_name,
+        target_user,
         target_process_id,
         file_path,
     })
+}
+
+/// Expands the path variable `AppLocker` prefixes its `FilePath` with, so the
+/// path can be matched by rules written against real paths (#427).
+/// `AppLocker` path variables are *not* environment variables; each maps to
+/// one (Microsoft Learn, "Understanding the path rule condition in AppLocker"):
+///
+/// | Variable | Expanded from |
+/// |---|---|
+/// | `%OSDRIVE%` | `SystemDrive` |
+/// | `%WINDIR%` | `SystemRoot` |
+/// | `%SYSTEM32%` | `SystemRoot` + `\System32` |
+/// | `%PROGRAMFILES%` | `ProgramFiles` |
+///
+/// Two variables are lossy by design: `%SYSTEM32%` covers both `System32` and
+/// `SysWOW64`, and `%PROGRAMFILES%` both `Program Files` and
+/// `Program Files (x86)`; the event does not say which, so the 64-bit
+/// directory is assumed. `%REMOVABLE%` and `%HOT%` (removable media) have no
+/// fixed drive letter and are left as-is, as is any variable `env` cannot
+/// resolve. Case is preserved (`AppLocker` upper-cases paths; rules compare
+/// case-insensitively). `env` looks up an environment variable — injected so
+/// the mapping is testable off-Windows.
+#[must_use]
+pub fn expand_applocker_path(raw: &str, env: impl Fn(&str) -> Option<String>) -> String {
+    const VARIABLES: &[(&str, &str, &str)] = &[
+        ("%OSDRIVE%", "SystemDrive", ""),
+        ("%WINDIR%", "SystemRoot", ""),
+        ("%SYSTEM32%", "SystemRoot", "\\System32"),
+        ("%PROGRAMFILES%", "ProgramFiles", ""),
+    ];
+    for (variable, env_name, suffix) in VARIABLES {
+        let Some(prefix) = raw.get(..variable.len()) else {
+            continue;
+        };
+        if !prefix.eq_ignore_ascii_case(variable) {
+            continue;
+        }
+        return match env(env_name) {
+            Some(value) => format!("{value}{suffix}{}", &raw[variable.len()..]),
+            None => raw.to_string(),
+        };
+    }
+    raw.to_string()
 }
 
 /// One `Microsoft-Windows-TaskScheduler/Operational` event 106 — a scheduled
@@ -898,8 +967,14 @@ mod tests {
     #[test]
     fn parses_a_real_shaped_applocker_block() {
         let block = split_event_blocks(APPLOCKER_BLOCK_XML)[0];
-        let parsed = parse_applocker_block(block).expect("should parse");
+        let parsed = parse_applocker_event(block).expect("should parse");
         assert_eq!(parsed.record_id, 512);
+        assert_eq!(parsed.event_id, 8004);
+        assert_eq!(parsed.policy_name, "EXE");
+        assert_eq!(
+            parsed.target_user.as_deref(),
+            Some("S-1-5-21-1663667890-2519037288-962558911-1001")
+        );
         assert_eq!(parsed.target_process_id, 5312);
         assert_eq!(
             parsed.file_path,
@@ -908,9 +983,90 @@ mod tests {
     }
 
     #[test]
+    fn parses_an_audit_mode_8003_dll_event() {
+        // Same channel and payload shape as 8004; only the ID and, for a
+        // library, the rule collection differ.
+        let xml = APPLOCKER_BLOCK_XML
+            .replace("<EventID>8004</EventID>", "<EventID>8003</EventID>")
+            .replace(
+                "<PolicyName>EXE</PolicyName>",
+                "<PolicyName>DLL</PolicyName>",
+            );
+        let parsed = parse_applocker_event(split_event_blocks(&xml)[0]).expect("should parse");
+        assert_eq!(parsed.event_id, 8003);
+        assert_eq!(parsed.policy_name, "DLL");
+    }
+
+    #[test]
+    fn applocker_event_without_target_user_has_none() {
+        let xml = APPLOCKER_BLOCK_XML.replace(
+            "<TargetUser>S-1-5-21-1663667890-2519037288-962558911-1001</TargetUser>",
+            "",
+        );
+        let parsed = parse_applocker_event(split_event_blocks(&xml)[0]).expect("should parse");
+        assert_eq!(parsed.target_user, None);
+    }
+
+    #[test]
     fn applocker_block_missing_record_id_does_not_parse() {
         let block = "<Event><UserData><RuleAndFileData><FilePath>x</FilePath></RuleAndFileData></UserData></Event>";
-        assert!(parse_applocker_block(block).is_none());
+        assert!(parse_applocker_event(block).is_none());
+    }
+
+    // ── `AppLocker` path variables (#427) ───────────────────────────────
+
+    fn lab_env(name: &str) -> Option<String> {
+        match name {
+            "SystemDrive" => Some("C:".into()),
+            "SystemRoot" => Some("C:\\Windows".into()),
+            "ProgramFiles" => Some("C:\\Program Files".into()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn expands_every_fixed_applocker_path_variable() {
+        let cases = [
+            (
+                "%OSDRIVE%\\USERS\\SOLKA\\DOWNLOADS\\POWERSHELL.EXE",
+                "C:\\USERS\\SOLKA\\DOWNLOADS\\POWERSHELL.EXE",
+            ),
+            ("%WINDIR%\\TEMP\\X.EXE", "C:\\Windows\\TEMP\\X.EXE"),
+            ("%SYSTEM32%\\CMD.EXE", "C:\\Windows\\System32\\CMD.EXE"),
+            (
+                "%PROGRAMFILES%\\APP\\APP.EXE",
+                "C:\\Program Files\\APP\\APP.EXE",
+            ),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(expand_applocker_path(raw, lab_env), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn applocker_variable_match_is_case_insensitive() {
+        assert_eq!(
+            expand_applocker_path("%osdrive%\\x.exe", lab_env),
+            "C:\\x.exe"
+        );
+    }
+
+    #[test]
+    fn removable_media_and_unresolvable_variables_are_left_as_is() {
+        for raw in ["%HOT%\\X.EXE", "%REMOVABLE%\\X.EXE"] {
+            assert_eq!(expand_applocker_path(raw, lab_env), raw);
+        }
+        assert_eq!(
+            expand_applocker_path("%OSDRIVE%\\X.EXE", |_| None),
+            "%OSDRIVE%\\X.EXE"
+        );
+    }
+
+    #[test]
+    fn only_a_leading_variable_is_expanded() {
+        for raw in ["C:\\TOOLS\\%OSDRIVE%\\X.EXE", "C:\\X.EXE", ""] {
+            assert_eq!(expand_applocker_path(raw, lab_env), raw);
+        }
     }
 
     // ── TaskScheduler Operational EID 106 ───────────────────────────────

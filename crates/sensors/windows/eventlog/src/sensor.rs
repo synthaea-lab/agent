@@ -551,19 +551,28 @@ fn applocker_leaf_name(path: &str) -> String {
 
 /// An 8004 without a `FilePath` cannot carry a persistence artifact — nothing
 /// to hand to the sink. Skip, advancing the cursor.
+///
+/// The path is expanded from `AppLocker`'s path variables
+/// (`%OSDRIVE%\USERS\...` → `C:\USERS\...`) so path-based rules can match
+/// it, and the blocked user's SID lands in `meta.user` (#427). Still a
+/// `FileOpenEvent` for now; the move to `PolicyDenialEvent` is #427's
+/// schema step.
 fn normalize_applocker_block(block: &str) -> ParsedBlock {
-    let ev = xml::parse_applocker_block(block)?;
+    let ev = xml::parse_applocker_event(block)?;
     let record_id = ev.record_id;
     if ev.file_path.is_empty() {
         return Some((record_id, None));
     }
-    let comm = applocker_leaf_name(&ev.file_path);
-    let event = persistence_file_open(
-        ev.target_process_id,
-        comm,
-        ev.file_path,
-        FLAG_APPLICATION_BLOCKED,
-    );
+    let path = xml::expand_applocker_path(&ev.file_path, |name| std::env::var(name).ok());
+    let comm = applocker_leaf_name(&path);
+    let mut event =
+        persistence_file_open(ev.target_process_id, comm, path, FLAG_APPLICATION_BLOCKED);
+    if let (Event::FileOpen(open), Some(sid)) = (&mut event, ev.target_user) {
+        open.meta.user = User::Windows {
+            sid,
+            integrity_level: None,
+        };
+    }
     Some((record_id, Some(event)))
 }
 
@@ -1170,5 +1179,39 @@ mod scheduled_task_tests {
         };
         assert_eq!(event.path, "a.exe | com:{X}");
         assert_eq!(event.flags, FLAG_PERSISTENCE_TASK_ARTIFACT);
+    }
+}
+
+#[cfg(test)]
+mod applocker_tests {
+    use super::*;
+
+    #[test]
+    fn applocker_block_carries_the_expanded_path_and_the_blocked_user() {
+        let block = "<Event><System><EventID>8004</EventID><EventRecordID>7</EventRecordID></System>\
+            <UserData><RuleAndFileData><PolicyName>EXE</PolicyName>\
+            <TargetUser>S-1-5-21-1-2-3-1001</TargetUser><TargetProcessId>42</TargetProcessId>\
+            <FilePath>%OSDRIVE%\\USERS\\X\\EVIL.EXE</FilePath></RuleAndFileData></UserData></Event>";
+        let (record_id, event) = normalize_applocker_block(block).expect("should parse");
+        assert_eq!(record_id, 7);
+        let Some(Event::FileOpen(open)) = event else {
+            panic!("expected a FileOpen event");
+        };
+        assert!(
+            !open.path.starts_with('%'),
+            "path variable left unexpanded: {}",
+            open.path
+        );
+        assert!(open.path.ends_with("\\USERS\\X\\EVIL.EXE"), "{}", open.path);
+        assert_eq!(open.meta.comm, "evil.exe");
+        assert_eq!(open.meta.pid, 42);
+        assert_eq!(open.flags, FLAG_APPLICATION_BLOCKED);
+        assert_eq!(
+            open.meta.user,
+            User::Windows {
+                sid: "S-1-5-21-1-2-3-1001".into(),
+                integrity_level: None,
+            }
+        );
     }
 }
