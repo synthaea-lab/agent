@@ -152,11 +152,7 @@ mod tests {
 
         // feature_names longer than values
         let bad_bounds2 = FeatureBounds {
-            feature_names: vec![
-                "a".to_string(),
-                "b".to_string(),
-                "c".to_string(),
-            ],
+            feature_names: vec!["a".to_string(), "b".to_string(), "c".to_string()],
             min_values: vec![0.0, 0.0],
             max_values: vec![1.0, 1.0],
         };

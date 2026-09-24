@@ -16,9 +16,9 @@ use schema::{
     ImageLoadEvent, KernelModuleAction, KernelModuleEvent, ListenPortEvent, MemfdCreateEvent,
     MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, POLICY_MECHANISM_SELINUX,
     PolicyDenialEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent,
-    RegistrySetEvent, ScriptBlockEvent, ShellType, SignalEvent, SmbConnectEvent,
-    SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TccDecisionEvent, TlsCaptureEvent,
-    TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
+    RegistrySetEvent, ScriptBlockEvent, ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent,
+    SocketBindEvent, SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection,
+    TlsLibraryType, UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 

@@ -203,7 +203,11 @@ impl CmdlineScorer {
     /// outside training bounds (OOD detection, issue #46). Returns other
     /// [`ScorerError`] variants when inference fails, produces no score, or the
     /// attribution walk finds the model inconsistent with its parsed structure.
-    pub fn score_explained(&mut self, cmdline: &str, k: usize) -> Result<Option<Score>, ScorerError> {
+    pub fn score_explained(
+        &mut self,
+        cmdline: &str,
+        k: usize,
+    ) -> Result<Option<Score>, ScorerError> {
         let features = cmdline::extract_features(cmdline);
 
         // OOD validation
@@ -244,12 +248,15 @@ mod threshold_tests {
 
     #[test]
     fn legacy_model_without_threshold_always_returns_some() {
-        let mut scorer = CmdlineScorer::from_onnx_bytes(&fixture_model())
-            .expect("fixture model must load");
+        let mut scorer =
+            CmdlineScorer::from_onnx_bytes(&fixture_model()).expect("fixture model must load");
 
         // Legacy model (no metadata) should always return Some(score)
         let result = scorer.score("benign command").unwrap();
-        assert!(result.is_some(), "legacy model must return Some for any score");
+        assert!(
+            result.is_some(),
+            "legacy model must return Some for any score"
+        );
     }
 
     #[test]
@@ -261,11 +268,9 @@ mod threshold_tests {
         });
         let metadata_bytes = serde_json::to_vec(&metadata).unwrap();
 
-        let mut scorer = CmdlineScorer::from_onnx_bytes_with_metadata(
-            &fixture_model(),
-            Some(&metadata_bytes),
-        )
-        .expect("model with metadata must load");
+        let mut scorer =
+            CmdlineScorer::from_onnx_bytes_with_metadata(&fixture_model(), Some(&metadata_bytes))
+                .expect("model with metadata must load");
 
         // Scores below threshold (< 0.0, anomalous) should return Some
         // Scores above threshold (>= 0.0, normal) should return None
@@ -284,14 +289,15 @@ mod threshold_tests {
         });
         let metadata_bytes = serde_json::to_vec(&metadata).unwrap();
 
-        let mut scorer = CmdlineScorer::from_onnx_bytes_with_metadata(
-            &fixture_model(),
-            Some(&metadata_bytes),
-        )
-        .expect("model with metadata must load");
+        let mut scorer =
+            CmdlineScorer::from_onnx_bytes_with_metadata(&fixture_model(), Some(&metadata_bytes))
+                .expect("model with metadata must load");
 
         let result = scorer.score_explained("some command", 3);
-        assert!(result.is_ok(), "score_explained with threshold should not error");
+        assert!(
+            result.is_ok(),
+            "score_explained with threshold should not error"
+        );
         // Result can be Some or None depending on the actual score vs threshold
     }
 }
