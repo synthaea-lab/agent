@@ -115,6 +115,27 @@
 //!   *both* channels is a rules-layer deduplication concern, not a sensor-layer
 //!   one.
 //!
+//! ## Transport: polling (default) vs. `EvtSubscribe` (#322)
+//!
+//! The two transports coexist and are selected per host via
+//! [`EventLogTransport`] in [`EventLogConfig`]:
+//!
+//! - [`Polling`](EventLogTransport::Polling) — the default. One thread per
+//!   enabled target runs a `wevtutil` `qe` loop at the `POLL_INTERVAL`
+//!   cadence (2s), same shape as the pre-#322 implementation and same
+//!   trade-offs as documented in the section above.
+//! - [`Subscribe`](EventLogTransport::Subscribe) — one `EvtSubscribe`
+//!   subscription per enabled target, with a Windows callback delivering
+//!   events the moment they land in the channel. Removes the polling
+//!   latency and the subprocess churn. Available since #322; opt-in at the
+//!   config layer so hosts adopt it after validation rather than the whole
+//!   fleet flipping on a version bump.
+//!
+//! Both transports reuse the same [`PollTarget`](self::sensor) table, the
+//! same `xml::parse_*` parsers, and the same [`EventLogCounters`] — only the
+//! delivery mechanism differs. See `subscribe.rs` for the OS-facing details
+//! of the callback-based path.
+//!
 //! ## Configurable allowlist and volume counters (#94)
 //!
 // Plain code spans, not intra-doc links, for the three items below: they are
@@ -132,5 +153,10 @@ pub mod xml;
 
 #[cfg(windows)]
 mod sensor;
+// The `EvtSubscribe` transport (issue #322) — enabled per-host via
+// `EventLogConfig::transport`. Gated `#[cfg(windows)]` because it binds
+// against `windows-sys`; the Linux CI leg keeps compiling `xml.rs`.
 #[cfg(windows)]
-pub use sensor::{EventLogConfig, EventLogCounters, EventLogSensor};
+mod subscribe;
+#[cfg(windows)]
+pub use sensor::{EventLogConfig, EventLogCounters, EventLogSensor, EventLogTransport};

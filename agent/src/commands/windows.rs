@@ -104,6 +104,13 @@ impl EventSink for SharedSink {
 /// them. See `docs/adr/0006-eventlog-channel-allowlist-and-volume-counters.md`.
 fn eventlog_config(policy: &policy::EventLogPolicy) -> sensor_windows_eventlog::EventLogConfig {
     sensor_windows_eventlog::EventLogConfig {
+        // Not yet policy-configurable (issue #322 v1): the transport defaults
+        // to Polling — the pre-#322 behavior — so a version bump does not
+        // silently change delivery mechanism on any host. A follow-up (same
+        // ADR-0006 cross-crate rewiring as the per-channel toggles) will
+        // surface `transport` through `policy::EventLogPolicy` for host-by-host
+        // rollout of `Subscribe`.
+        transport: sensor_windows_eventlog::EventLogTransport::Polling,
         service_installs_enabled: policy.service_installs_enabled,
         scheduled_tasks_enabled: policy.scheduled_tasks_enabled,
         account_creations_enabled: policy.account_creations_enabled,

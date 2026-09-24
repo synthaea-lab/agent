@@ -12,3 +12,16 @@ workspace = true
 [dependencies]
 schema = { path = "../../../schema" }
 tracing = { workspace = true }
+
+# `EvtSubscribe`-backed transport (issue #322) — the push-based alternative to
+# the default `wevtutil`-polling loop. Kept as a Windows-only target dep so the
+# Linux CI leg still compiles this crate (only `xml.rs` builds cross-platform;
+# `sensor.rs` and `subscribe.rs` are already `#[cfg(windows)]`-gated).
+# `Win32_Foundation` gives us `ERROR_SUCCESS` / `GetLastError`; the
+# `Win32_System_EventLog` feature is what actually pulls in `EvtSubscribe`,
+# `EvtRender`, `EvtClose`, the `EVT_HANDLE` type, and the notify-action enum.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_EventLog",
+] }

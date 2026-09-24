@@ -89,27 +89,29 @@ fn wevtutil(args: &[&str]) -> String {
 /// What [`PollTarget::parse_block`] yields for one `<Event>` XML block.
 /// `None`: not even parseable. `Some((record_id, None))`: parsed but skipped
 /// as unusable. `Some((record_id, Some(event)))`: a normalized event.
-type ParsedBlock = Option<(u64, Option<Event>)>;
+pub(crate) type ParsedBlock = Option<(u64, Option<Event>)>;
 
 /// One poll target: a channel + `EventID` filter, and how its raw XML blocks
-/// become normalized events.
-struct PollTarget {
+/// become normalized events. Reused as-is by the push-based `subscribe`
+/// transport (`subscribe.rs`) — same channel, same filter, same parser: only
+/// the delivery mechanism differs between the two transports.
+pub(crate) struct PollTarget {
     /// Names the poll thread in logs.
-    label: &'static str,
+    pub(crate) label: &'static str,
     /// `wevtutil` channel (`System` / `Security`).
-    channel: &'static str,
+    pub(crate) channel: &'static str,
     /// The `EventID=...` predicate, without the surrounding `*[System[...]]`.
-    id_filter: &'static str,
+    pub(crate) id_filter: &'static str,
     /// Which volume counter this target increments.
-    counter: fn(&EventLogCounters) -> &AtomicU64,
+    pub(crate) counter: fn(&EventLogCounters) -> &AtomicU64,
     /// Parses one `<Event>` XML block — see [`ParsedBlock`] for the three
     /// outcomes. An unparseable block does not advance the record cursor; a
     /// parsed-but-unusable one advances it without counting (a block missing
     /// required fields is noise the sensor filtered out, not volume).
-    parse_block: fn(&str) -> ParsedBlock,
+    pub(crate) parse_block: fn(&str) -> ParsedBlock,
     /// `auditpol` enablement to run once before polling starts, for targets
     /// whose audit subcategory may be off (see each target's enable fn doc).
-    enable_audit: Option<fn()>,
+    pub(crate) enable_audit: Option<fn()>,
 }
 
 /// `EventRecordID` of the newest matching event already in the channel.
@@ -543,8 +545,53 @@ static TASK_SCHEDULER_OP: PollTarget = PollTarget {
 /// disabled group is never even queried — not filtered after the fact — so a
 /// host that, say, disables logon-event polling pays no `wevtutil` cost for it
 /// either.
+/// Which transport the sensor uses to receive Event Log records from the OS
+/// (issue #322). Both transports produce identical normalized `Event`s
+/// through the same [`PollTarget`] parsers and update the same
+/// [`EventLogCounters`] — only the delivery mechanism differs.
+///
+/// - [`Polling`](EventLogTransport::Polling) — the default. One thread per
+///   enabled target runs a `wevtutil qe` loop on `POLL_INTERVAL` cadence,
+///   filters by `EventRecordID > last_seen`, and parses each returned XML
+///   block. Adds up to `POLL_INTERVAL` of latency and one child-process
+///   spawn per tick per channel, in exchange for zero Windows API surface
+///   beyond what `wevtutil` already exposes — the safe fallback if a host's
+///   `EvtSubscribe` behavior is ever in doubt.
+///
+/// - [`Subscribe`](EventLogTransport::Subscribe) — one `EvtSubscribe` call
+///   per enabled target, callback delivery from the OS the moment an event
+///   lands in the channel. No polling latency, no subprocess churn.
+///
+/// The default is [`Polling`](EventLogTransport::Polling): opt-in for
+/// `Subscribe` at the config layer, so a deployment picks it host-by-host
+/// after validation rather than the whole fleet flipping on merge. See
+/// `docs/adr/0004-windows-persistence-detection-via-eventlog-polling.md` for
+/// the original polling-vs-subscribe investigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventLogTransport {
+    /// Default `wevtutil`-based poll loop, one thread per enabled target.
+    Polling,
+    /// `EvtSubscribe`-based push delivery via a Windows callback, one
+    /// subscription per enabled target.
+    Subscribe,
+}
+
+impl Default for EventLogTransport {
+    /// [`Polling`](EventLogTransport::Polling), matching the pre-#322
+    /// behavior — the sensor's transport does not change on a mere upgrade;
+    /// it changes when an operator explicitly says so.
+    fn default() -> Self {
+        Self::Polling
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventLogConfig {
+    /// Which OS-facing transport the sensor uses to receive channel events.
+    /// See [`EventLogTransport`] for the trade-offs; defaults to
+    /// [`Polling`](EventLogTransport::Polling) so a deployment does not
+    /// change delivery mechanism on a mere version bump.
+    pub transport: EventLogTransport,
     /// Event 7045 (T1543.003 — service install persistence).
     pub service_installs_enabled: bool,
     /// Event 4698 (T1053.005 — scheduled task persistence). Reads the Security
@@ -568,6 +615,7 @@ impl Default for EventLogConfig {
     /// existed.
     fn default() -> Self {
         Self {
+            transport: EventLogTransport::default(),
             service_installs_enabled: true,
             scheduled_tasks_enabled: true,
             account_creations_enabled: true,
@@ -665,8 +713,6 @@ impl Sensor for EventLogSensor {
         self.stop.store(false, Ordering::SeqCst);
         let sink: Arc<dyn EventSink> = Arc::from(sink);
 
-        let mut handles = Vec::new();
-
         let targets = [
             (self.config.service_installs_enabled, &SERVICE_INSTALLS),
             (self.config.scheduled_tasks_enabled, &SCHEDULED_TASKS),
@@ -675,6 +721,11 @@ impl Sensor for EventLogSensor {
             (self.config.applocker_blocks_enabled, &APPLOCKER_BLOCKS),
             (self.config.task_scheduler_op_enabled, &TASK_SCHEDULER_OP),
         ];
+
+        // Audit-subcategory enablement is transport-independent: whether
+        // events land in the channel does not depend on whether we read them
+        // via `wevtutil` or `EvtSubscribe`. So we run each target's
+        // `enable_audit` (if any) once up front, regardless of transport.
         for (enabled, target) in targets {
             if !enabled {
                 continue;
@@ -682,21 +733,71 @@ impl Sensor for EventLogSensor {
             if let Some(enable_audit) = target.enable_audit {
                 enable_audit();
             }
-            handles.push(poll(
-                target,
-                Arc::clone(&sink),
-                Arc::clone(&self.stop),
-                Arc::clone(&self.counters),
-            ));
         }
 
+        // Two kinds of "hold this alive while we run" objects, kept in
+        // separate vectors so their types stay concrete and their drops fire
+        // in the correct order on the way out (subscriptions before threads,
+        // via the natural reverse-declaration order of local drops).
+        let mut poll_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        #[cfg(windows)]
+        let mut subscriptions: Vec<crate::subscribe::SubscriptionHandle> = Vec::new();
+
+        match self.config.transport {
+            EventLogTransport::Polling => {
+                for (enabled, target) in targets {
+                    if !enabled {
+                        continue;
+                    }
+                    poll_handles.push(poll(
+                        target,
+                        Arc::clone(&sink),
+                        Arc::clone(&self.stop),
+                        Arc::clone(&self.counters),
+                    ));
+                }
+            }
+            EventLogTransport::Subscribe => {
+                #[cfg(windows)]
+                {
+                    for (enabled, target) in targets {
+                        if !enabled {
+                            continue;
+                        }
+                        // `subscribe` returns `None` on `EvtSubscribe`
+                        // failure (channel disabled, denied, invalid XPath).
+                        // The failure is logged inside `subscribe`; we
+                        // continue with the other targets — one channel
+                        // degraded is not a sensor-wide crash.
+                        if let Some(handle) = crate::subscribe::subscribe(
+                            target,
+                            Arc::clone(&sink),
+                            Arc::clone(&self.counters),
+                            Arc::clone(&self.stop),
+                        ) {
+                            subscriptions.push(handle);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Same idle loop for both transports: the subscribe transport does
+        // its own delivery on OS-managed callback threads, we only wait for
+        // the stop signal here.
         while !self.stop.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(200));
         }
 
-        for handle in handles {
+        // Under `Polling`, threads exit on their own once `stop` is
+        // observed; join to reclaim them. Under `Subscribe`, the
+        // `subscriptions` vec is dropped when this function returns, which
+        // calls `EvtClose` on each handle (see `SubscriptionHandle::Drop`).
+        for handle in poll_handles {
             let _ = handle.join();
         }
+        // `subscriptions` drops here (natural scope end), tearing down each
+        // `EvtSubscribe` before we return.
         Ok(())
     }
 
@@ -721,8 +822,33 @@ mod config_tests {
     }
 
     #[test]
+    fn default_transport_is_polling() {
+        // Contract for #322: default MUST be Polling so a mere version bump
+        // does not silently change delivery mechanism on any host. Subscribe
+        // is opt-in at the config layer, exercised host-by-host after
+        // validation.
+        assert_eq!(
+            EventLogConfig::default().transport,
+            EventLogTransport::Polling
+        );
+    }
+
+    #[test]
+    fn subscribe_transport_selectable() {
+        let cfg = EventLogConfig {
+            transport: EventLogTransport::Subscribe,
+            ..Default::default()
+        };
+        assert_eq!(cfg.transport, EventLogTransport::Subscribe);
+        // Toggling transport does not touch the per-channel enable flags.
+        assert!(cfg.service_installs_enabled);
+        assert!(cfg.logon_events_enabled);
+    }
+
+    #[test]
     fn capabilities_reflect_disabled_groups() {
         let sensor = EventLogSensor::with_config(EventLogConfig {
+            transport: EventLogTransport::default(),
             service_installs_enabled: false,
             scheduled_tasks_enabled: false,
             account_creations_enabled: false,
@@ -738,6 +864,7 @@ mod config_tests {
     #[test]
     fn capabilities_stay_true_if_any_file_group_enabled() {
         let sensor = EventLogSensor::with_config(EventLogConfig {
+            transport: EventLogTransport::default(),
             service_installs_enabled: true,
             scheduled_tasks_enabled: false,
             account_creations_enabled: false,
@@ -757,6 +884,7 @@ mod config_tests {
             logon_events_enabled: false,
             applocker_blocks_enabled: true,
             task_scheduler_op_enabled: false,
+            transport: EventLogTransport::default(),
         });
         assert!(sensor.capabilities().file_events);
     }
@@ -770,6 +898,7 @@ mod config_tests {
             logon_events_enabled: false,
             applocker_blocks_enabled: false,
             task_scheduler_op_enabled: true,
+            transport: EventLogTransport::default(),
         });
         assert!(sensor.capabilities().file_events);
     }

@@ -2433,6 +2433,7 @@ version = "0.1.0"
 dependencies = [
  "schema",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
