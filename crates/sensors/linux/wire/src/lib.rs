@@ -18,6 +18,9 @@
 #[cfg(feature = "user")]
 extern crate std;
 
+mod path_filter;
+pub use path_filter::is_filtered_path;
+
 /// Bumped on every layout-affecting change to the structs below. Not a wire header
 /// (ring-buffer items carry none) — a build-time tripwire: the userspace loader
 /// `const _`-asserts the value it was compiled against, so an ebpf/userspace version
