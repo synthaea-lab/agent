@@ -138,7 +138,7 @@ unsafe impl aya::Pod for PodLineage {}
 
 /// Loads the compiled eBPF object (bytecode embedded at build time), without
 /// initializing the eBPF logger or loading/attaching any individual program. Shared
-/// between the agent's preflight and [`LinuxSensor::run`].
+/// between the agent's preflight and [`LinuxSensor`](crate::LinuxSensor)'s `Sensor::run`.
 ///
 /// # Errors
 ///
