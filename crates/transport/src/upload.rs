@@ -69,6 +69,14 @@ pub struct EventUploader<D: EventDrain> {
     drain: D,
     config: TransportConfig,
     consecutive_failures: u32,
+    /// Subset of `consecutive_failures` that were server-side rejections
+    /// (5xx) — gates [`TransportConfig::max_drain_attempts`] on its own,
+    /// independently of any connectivity failures mixed into the same run
+    /// (issue #394).
+    consecutive_server_failures: u32,
+    /// Subset of `consecutive_failures` that were pure connectivity failures
+    /// — gates [`TransportConfig::max_network_drain_attempts`] on its own.
+    consecutive_network_failures: u32,
 }
 
 impl<D: EventDrain> EventUploader<D> {
@@ -80,6 +88,8 @@ impl<D: EventDrain> EventUploader<D> {
             drain,
             config,
             consecutive_failures: 0,
+            consecutive_server_failures: 0,
+            consecutive_network_failures: 0,
         }
     }
 
@@ -94,11 +104,17 @@ impl<D: EventDrain> EventUploader<D> {
     /// A retryable failure (e.g. the server 500s) is NOT skipped on the first
     /// attempt — it redelivers, same as any transient outage. But because the
     /// same segment stays in-flight until ack'd or skipped, [`Self::drain`]
-    /// keeps re-delivering it on every call, so `consecutive_failures`
-    /// doubles as "attempts on this segment" for as long as it keeps failing.
-    /// Once that reaches [`TransportConfig::max_drain_attempts`], the segment
-    /// is skipped too — a permanently-broken server response, not just a slow
-    /// one, must not be allowed to wedge all newer telemetry forever either.
+    /// keeps re-delivering it on every call, so the relevant counter doubles
+    /// as "attempts on this segment" for as long as it keeps failing. A 5xx
+    /// counts toward [`TransportConfig::max_drain_attempts`]; a pure
+    /// connectivity failure (DNS, connection refused, timeout) counts toward
+    /// the separate, larger [`TransportConfig::max_network_drain_attempts`]
+    /// instead (issue #394) — the server rejecting a segment is stronger
+    /// poison-segment evidence than never having reached the server at all,
+    /// which is equally consistent with a brief blip. Either budget running
+    /// out skips the segment — a permanently-broken server, or a permanently
+    /// unreachable one, must not be allowed to wedge all newer telemetry
+    /// forever.
     ///
     /// Returns the number of events uploaded, or 0 if the drain is empty.
     ///
@@ -143,24 +159,41 @@ impl<D: EventDrain> EventUploader<D> {
                         "server rejected batch permanently — skipping poison segment"
                     );
                     self.drain.skip()?;
-                    self.consecutive_failures = 0;
+                    self.reset_failure_counters();
                     return Err(e);
                 }
                 Err(e) => {
                     self.consecutive_failures += 1;
+                    let (attempts, max_attempts) = if e.is_network_error() {
+                        self.consecutive_network_failures += 1;
+                        (
+                            self.consecutive_network_failures,
+                            self.config.max_network_drain_attempts,
+                        )
+                    } else {
+                        self.consecutive_server_failures += 1;
+                        (
+                            self.consecutive_server_failures,
+                            self.config.max_drain_attempts,
+                        )
+                    };
                     tracing::warn!(
                         attempt = self.consecutive_failures,
+                        network_attempt = self.consecutive_network_failures,
+                        server_attempt = self.consecutive_server_failures,
                         error = %e,
                         "upload failed"
                     );
-                    if self.consecutive_failures >= self.config.max_drain_attempts {
+                    if attempts >= max_attempts {
                         tracing::warn!(
-                            attempts = self.consecutive_failures,
+                            attempts,
+                            max_attempts,
                             dropped = count,
+                            network = e.is_network_error(),
                             "segment exceeded max drain attempts — skipping to restore forward progress"
                         );
                         self.drain.skip()?;
-                        self.consecutive_failures = 0;
+                        self.reset_failure_counters();
                     }
                     return Err(e);
                 }
@@ -168,9 +201,18 @@ impl<D: EventDrain> EventUploader<D> {
         }
 
         self.drain.ack()?;
-        self.consecutive_failures = 0;
+        self.reset_failure_counters();
         tracing::info!(count, "uploaded events successfully");
         Ok(count)
+    }
+
+    /// Clears every per-segment failure counter — called once the segment is
+    /// no longer in flight (acked or skipped), the only point at which its
+    /// attempt history should be forgotten.
+    fn reset_failure_counters(&mut self) {
+        self.consecutive_failures = 0;
+        self.consecutive_server_failures = 0;
+        self.consecutive_network_failures = 0;
     }
 
     /// Calculates the backoff duration based on consecutive failures.
@@ -203,9 +245,9 @@ impl<D: EventDrain> EventUploader<D> {
         self.consecutive_failures
     }
 
-    /// Resets the failure counter (e.g., after a successful connection test).
+    /// Resets the failure counters (e.g., after a successful connection test).
     pub fn reset_failures(&mut self) {
-        self.consecutive_failures = 0;
+        self.reset_failure_counters();
     }
 }
 

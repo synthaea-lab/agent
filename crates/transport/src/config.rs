@@ -4,7 +4,8 @@ use std::{path::PathBuf, time::Duration};
 
 use crate::{
     DEFAULT_BATCH_SIZE, DEFAULT_HEARTBEAT_ENDPOINT, DEFAULT_INGEST_ENDPOINT,
-    DEFAULT_MAX_DRAIN_ATTEMPTS, DEFAULT_RETRY_BASE_MS, DEFAULT_RETRY_MAX_MS,
+    DEFAULT_MAX_DRAIN_ATTEMPTS, DEFAULT_MAX_NETWORK_DRAIN_ATTEMPTS, DEFAULT_RETRY_BASE_MS,
+    DEFAULT_RETRY_MAX_MS,
 };
 
 /// Configuration for the transport layer.
@@ -43,9 +44,16 @@ pub struct TransportConfig {
     /// Interval between heartbeats.
     pub heartbeat_interval: Duration,
 
-    /// Consecutive retryable upload failures on the same in-flight segment
+    /// Consecutive server-side rejections (5xx) on the same in-flight segment
     /// before it is skipped so newer segments can flow again.
     pub max_drain_attempts: u32,
+
+    /// Consecutive pure connectivity failures (DNS, connection refused,
+    /// timeout) on the same in-flight segment before it is skipped. Kept
+    /// separate from [`Self::max_drain_attempts`] (issue #394): a connectivity
+    /// blip means the server was never reached, so it deserves a longer
+    /// allowance than a segment the server actively rejected.
+    pub max_network_drain_attempts: u32,
 }
 
 impl Default for TransportConfig {
@@ -63,6 +71,7 @@ impl Default for TransportConfig {
             request_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(30),
             max_drain_attempts: DEFAULT_MAX_DRAIN_ATTEMPTS,
+            max_network_drain_attempts: DEFAULT_MAX_NETWORK_DRAIN_ATTEMPTS,
         }
     }
 }

@@ -68,9 +68,27 @@ pub const DEFAULT_RETRY_MAX_MS: u64 = 60_000;
 /// Default upload batch size (events per request).
 pub const DEFAULT_BATCH_SIZE: usize = 100;
 
-/// Default number of consecutive retryable failures on the same in-flight
-/// segment before it is skipped to restore forward progress. Mirrors
-/// `store::EventSpool`'s suggested `MAX_DRAIN_ATTEMPTS` — `store` and
+/// Default number of consecutive server-side rejections (5xx) on the same
+/// in-flight segment before it is skipped to restore forward progress.
+/// Mirrors `store::EventSpool`'s suggested `MAX_DRAIN_ATTEMPTS` — `store` and
 /// `transport` are both leaf crates and may not depend on each other, so the
 /// value is duplicated by convention rather than shared by import.
 pub const DEFAULT_MAX_DRAIN_ATTEMPTS: u32 = 5;
+
+/// Default number of consecutive pure connectivity failures (DNS, connection
+/// refused, timeout) on the same in-flight segment before it is skipped.
+/// Deliberately much larger than [`DEFAULT_MAX_DRAIN_ATTEMPTS`] (issue #394):
+/// a 5xx is evidence the segment itself is poison, but a connectivity error
+/// means the server was never reached at all, so it's equally consistent
+/// with a brief blip (VPN reconnect, DNS hiccup, a routine ingest restart) as
+/// with a real outage. At the capped 60s backoff, 20 attempts is roughly a
+/// 15-minute allowance before the segment is given up on.
+///
+/// During a genuine extended outage, skipping doesn't restore forward
+/// progress the way it does for a poison segment — the next segment fails
+/// exactly the same way — so this budget mainly guards against a segment
+/// that is itself the cause of the network error (e.g. one large enough to
+/// always time out). In the ordinary long-outage case, expect the uploader
+/// to drop one segment roughly every 15 minutes by design; don't read that
+/// as "the server rejected data" (Jean's #414 review).
+pub const DEFAULT_MAX_NETWORK_DRAIN_ATTEMPTS: u32 = 20;

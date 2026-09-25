@@ -80,10 +80,14 @@ impl TransportClient {
                 _ => TransportError::Network(e.to_string()),
             })?;
 
+        // The server was reached and answered (status already read successfully
+        // above) — a body it can't be parsed is a server-side/deterministic
+        // failure, not a connectivity blip, so it must not get the longer
+        // network retry budget (issue #414 follow-up).
         response
             .into_body()
             .read_json()
-            .map_err(|e| TransportError::Network(e.to_string()))
+            .map_err(|e| TransportError::InvalidResponse(e.to_string()))
     }
 
     /// Returns the current configuration.
