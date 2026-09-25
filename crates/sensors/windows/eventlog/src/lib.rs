@@ -17,6 +17,12 @@
 //!   event **7045** ("A service was installed in the system").
 //! - **T1053.005** — Scheduled Task/Job: Scheduled Task. Security log, event
 //!   **4698** ("A scheduled task was created").
+//! - **T1053.005**, task-hijack sub-case — an *existing* task's action rewritten.
+//!   Security log, event **4702** ("A scheduled task was updated"), same audit
+//!   subcategory as 4698, lab-validated via `schtasks /change` (2026-09-22). Own
+//!   flag (`schema::FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT`); Windows rewrites its
+//!   own tasks routinely, so the consuming rule adds a suspicious-action-path gate
+//!   the other persistence rules do not need.
 //! - **T1136.001** — Create Account: Local Account. Security log, event **4720**
 //!   ("A user account was created"). Scoped to local SAM accounts on this host;
 //!   domain account creation writes 4720 on the DC, not the reporting machine,
@@ -81,7 +87,8 @@
 //!
 //! The two persistence detections are reported as `schema::FileOpenEvent` (not a
 //! new `Event` variant), marked with `schema::FLAG_PERSISTENCE_ARTIFACT` /
-//! `FLAG_PERSISTENCE_TASK_ARTIFACT` — see those constants' docs for why, and
+//! `FLAG_PERSISTENCE_TASK_ARTIFACT` / `FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT` /
+//! `FLAG_PERSISTENCE_ACCOUNT_ARTIFACT` — see those constants' docs for why, and
 //! `rules::check_service_persistence` / `check_scheduled_task_persistence` for
 //! the consuming rules. Pragmatic reuse, not the final shape: a dedicated event
 //! family (`docs/architecture/event-schema.md` already lists "Registry" as a
@@ -140,8 +147,8 @@
 //!
 // Plain code spans, not intra-doc links, for the three items below: they are
 // Windows-gated, so links to them would break the Linux docs build CI runs.
-//! `EventLogConfig` toggles each of the six poll targets above
-//! independently (a disabled one is never even queried), and
+//! `EventLogConfig` toggles the poll targets above independently (4698 and
+//! 4702 share one toggle; a disabled target is never even queried), and
 //! `EventLogCounters` (via `EventLogSensor::counters`) exposes a live count
 //! of events actually normalized per target. This crate cannot depend on
 //! `policy` (`sensor-*` crates depend only on `schema` —

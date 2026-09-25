@@ -3,7 +3,8 @@
 use schema::{
     ExecEvent, FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT,
     FLAG_PERSISTENCE_BTM_ARTIFACT, FLAG_PERSISTENCE_SYSTEMD_ARTIFACT,
-    FLAG_PERSISTENCE_TASK_ARTIFACT, FileOpenEvent,
+    FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FLAG_PERSISTENCE_TASK_ARTIFACT,
+    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent,
 };
 
 use crate::{Alert, has_write_intent};
@@ -207,6 +208,84 @@ pub(crate) fn check_scheduled_task_persistence(event: &FileOpenEvent) -> Option<
     })
 }
 
+/// Action-path fragments (lowercase) that make a scheduled-task *update* worth an
+/// alert: user-writable staging directories, and script hosts / proxy-execution
+/// binaries a hijacked task is typically repointed at. Uncalibrated against fleet
+/// traffic (first cut, 2026-09-23) — revisit once real 4702 volume is observed.
+///
+/// Matched against the path with `/` normalized to `\`. Task actions are stored
+/// as written, so the directories also appear as their unexpanded `%VAR%` tokens
+/// — the usual shape of a user-level task. The agent runs as SYSTEM and cannot
+/// expand per-user variables reliably, so the tokens are matched as-is (#399
+/// review).
+const TASK_HIJACK_ACTION_PATTERNS: &[&str] = &[
+    r"\appdata\",
+    r"\temp\",
+    r"\downloads\",
+    r"\users\public\",
+    r"\programdata\",
+    "%temp%",
+    "%tmp%",
+    "%appdata%",
+    "%localappdata%",
+    "%public%",
+    "%userprofile%",
+    "%programdata%",
+    "cmd.exe",
+    "powershell",
+    "pwsh",
+    "mshta",
+    "wscript",
+    "cscript",
+    "rundll32",
+    "regsvr32",
+];
+
+/// T1053.005 — Scheduled Task/Job: Scheduled Task, task-hijack sub-case: an
+/// *existing* scheduled task's action was rewritten (Security log event 4702, "A
+/// scheduled task was updated"). Sibling of [`check_scheduled_task_persistence`]
+/// (4698, creation), distinct marker `FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT`.
+///
+/// Unlike the creation rule, the flag alone is not enough: Windows rewrites its own
+/// tasks routinely, and `schtasks /create` itself emits 4702 as part of its
+/// registration (lab, 2026-09-22) — alerting on every 4702 would bury the signal.
+/// The rule therefore also requires the new action path to match
+/// `TASK_HIJACK_ACTION_PATTERNS`. A benign creation that also matches still fires
+/// the 4698 rule on its own event, so the pair can double-report one `schtasks
+/// /create` pointed at a suspicious path — accepted: correlation groups them.
+///
+/// `event.path` joins **every** action of the new definition (#443), so the gate
+/// matches a malicious second action behind a benign first one. An update whose
+/// action the sensor could not read (`FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN`)
+/// alerts without the gate: routine rewrites keep a readable `Exec`/`ComHandler`,
+/// and the placeholder path would otherwise let an unreadable action slip past
+/// the pattern check — same stance as #422 for creation.
+///
+/// Alert content carries the task's leaf name (`event.meta.comm`) and its new
+/// action path (`event.path`), for triage via `schtasks /Query /TN <name> /XML`.
+#[must_use]
+pub(crate) fn check_scheduled_task_update_persistence(event: &FileOpenEvent) -> Option<Alert> {
+    if event.flags & FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT == 0 {
+        return None;
+    }
+    let reason = if event.flags & FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN == 0 {
+        let path_lower = event.path.to_ascii_lowercase().replace('/', r"\");
+        *TASK_HIJACK_ACTION_PATTERNS
+            .iter()
+            .find(|pattern| path_lower.contains(*pattern))?
+    } else {
+        "action unreadable"
+    };
+    Some(Alert {
+        technique: "T1053.005",
+        message: format!(
+            "task={} pid={}: existing scheduled task repointed ({reason}) — new action \
+             path: {}",
+            event.meta.comm, event.meta.pid, event.path,
+        ),
+    })
+}
+
 /// T1543.003 — Create or Modify System Process: Windows Service. A Windows service
 /// was just installed (Security log event 7045, "A service was installed in the
 /// system") — same eventlog-polling pipeline as T1053.005, see
@@ -349,6 +428,7 @@ pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
         .into_iter()
         .chain(check_proc_root_escape(event))
         .chain(check_scheduled_task_persistence(event))
+        .chain(check_scheduled_task_update_persistence(event))
         .chain(check_service_install_persistence(event))
         .chain(check_account_creation_persistence(event))
         .chain(check_systemd_service_persistence(event))

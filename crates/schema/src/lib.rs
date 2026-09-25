@@ -285,6 +285,57 @@ pub const FLAG_PERSISTENCE_BTM_ARTIFACT: u32 = 0x0400_0000;
 /// cross-fire off a single event.
 pub const FLAG_APPLICATION_BLOCKED: u32 = 0x0100_0000;
 
+/// Same principle as [`FLAG_PERSISTENCE_ARTIFACT`], for a Windows **scheduled task
+/// update** (event 4702, "A scheduled task was updated") — still ATT&CK T1053.005,
+/// but the task-hijack sub-case: an attacker repoints an *existing*, possibly
+/// already-trusted task at a malicious action instead of registering a new one
+/// (the 4698 / [`FLAG_PERSISTENCE_TASK_ARTIFACT`] case). Set by
+/// `sensor-windows-eventlog`.
+///
+/// Unlike the other `FLAG_PERSISTENCE_*` bits, the flag alone is **not** the
+/// signal: Windows rewrites its own tasks routinely (servicing, maintenance), and
+/// `schtasks /create` was observed in lab (2026-09-22) to emit 4702 as part of its
+/// own registration too. `rules::check_scheduled_task_update_persistence`
+/// therefore also requires a suspicious action path — see that function's doc.
+///
+/// A distinct bit from every other `FLAG_*` constant, so no two techniques
+/// cross-fire off a single event. Not a serialization-visible schema change (same
+/// reasoning as [`FLAG_PERSISTENCE_ARTIFACT`]).
+pub const FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT: u32 = 0x0080_0000;
+
+/// Every synthetic `FLAG_*` bit above, checked pairwise-disjoint at compile time.
+/// A new flag goes here in the same edit (a unit test fails if a `pub const
+/// FLAG_*` is missing). Lives next to the constants, not in a
+/// consumer's test: the first cut of [`FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT`]
+/// took `0x0200_0000`, already [`FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN`], and the
+/// hardcoded list in `rules`' collision test missed it (#399 review).
+const SYNTHETIC_FLAGS: [u32; 8] = [
+    FLAG_PERSISTENCE_ARTIFACT,
+    FLAG_PERSISTENCE_TASK_ARTIFACT,
+    FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
+    FLAG_PERSISTENCE_ACCOUNT_ARTIFACT,
+    FLAG_PERSISTENCE_SYSTEMD_ARTIFACT,
+    FLAG_PERSISTENCE_BTM_ARTIFACT,
+    FLAG_APPLICATION_BLOCKED,
+    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT,
+];
+
+const _: () = {
+    let mut i = 0;
+    while i < SYNTHETIC_FLAGS.len() {
+        assert!(SYNTHETIC_FLAGS[i] != 0, "synthetic flag is zero");
+        let mut j = i + 1;
+        while j < SYNTHETIC_FLAGS.len() {
+            assert!(
+                SYNTHETIC_FLAGS[i] & SYNTHETIC_FLAGS[j] == 0,
+                "two synthetic FLAG_* constants share a bit"
+            );
+            j += 1;
+        }
+        i += 1;
+    }
+};
+
 /// Identity of the user a process runs as, per platform.
 ///
 /// A bare `uid: u32` cannot represent Windows (audit finding F-3: SYSTEM spawning
@@ -1628,6 +1679,20 @@ impl Event {
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.
         }
+    }
+}
+
+#[cfg(test)]
+mod synthetic_flag_tests {
+    #[test]
+    fn every_pub_flag_constant_is_in_synthetic_flags() {
+        // The compile-time disjointness check only sees what the list holds; a
+        // new `pub const FLAG_*` left out of it would skip the check silently.
+        let declared = include_str!("lib.rs")
+            .lines()
+            .filter(|line| line.starts_with("pub const FLAG_"))
+            .count();
+        assert_eq!(declared, super::SYNTHETIC_FLAGS.len());
     }
 }
 

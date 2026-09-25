@@ -17,7 +17,7 @@ use std::{
 use schema::{
     AuthEvent, AuthKind, AuthOutcome, Event, EventMeta, FLAG_APPLICATION_BLOCKED,
     FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT, FLAG_PERSISTENCE_TASK_ARTIFACT,
-    FileOpenEvent, User,
+    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, User,
     sensor::{Capabilities, EventSink, Sensor, SensorError},
     time::now_ns,
 };
@@ -30,8 +30,9 @@ use crate::xml::{self, LogonEvent};
 /// constant covers all three threads.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// The audit subcategory event 4698 depends on, referenced by GUID rather than
-/// name: `auditpol` matches subcategory names against the OS's **localized**
+/// The audit subcategory events 4698 and 4702 depend on (lab, 2026-09-22: a 4702
+/// fired under the same enabled subcategory, no separate prerequisite), referenced
+/// by GUID rather than name: `auditpol` matches subcategory names against the OS's **localized**
 /// label, not the canonical English one — confirmed failing with Win32 error 87 on
 /// a French-language lab VM using the English name. The GUID is stable regardless
 /// of the OS language (Microsoft's documented approach for scripting `auditpol`).
@@ -342,31 +343,40 @@ static SERVICE_INSTALLS: PollTarget = PollTarget {
 /// primary enablement path, and its failure warning deserves urgency.
 fn enable_scheduled_task_audit() {
     enable_audit_subcategory(
-        "Other Object Access Events (event 4698)",
+        "Other Object Access Events (events 4698/4702)",
         SCHEDULED_TASK_AUDIT_SUBCATEGORY_GUID,
-        "scheduled task persistence detection (T1053.005) will not receive any 4698 events",
+        "scheduled task persistence detection (T1053.005) will not receive any 4698/4702 \
+         events",
     );
 }
 
-/// Same tolerance rule as [`normalize_service_install`]; additionally skips a
-/// task whose XML content yields no action path to report.
+/// Same tolerance rule as [`normalize_service_install`].
 fn normalize_scheduled_task(block: &str) -> ParsedBlock {
     let task = xml::parse_scheduled_task_block(block)?;
+    Some(normalize_task(task, FLAG_PERSISTENCE_TASK_ARTIFACT))
+}
+
+/// Shared by 4698 (creation) and 4702 (update): only the parser and the flag
+/// differ between the two. `(record_id, None)` for a task with no name — skipped,
+/// cursor still advanced; an unreadable action is reported, not skipped.
+fn normalize_task(task: xml::ScheduledTaskEvent, flag: u32) -> (u64, Option<Event>) {
     let record_id = task.record_id;
     if task.task_name.is_empty() {
-        return Some((record_id, None));
+        return (record_id, None);
     }
     // A task whose action we cannot read is still a persistence artifact: report
-    // it with a placeholder path instead of dropping it (#422).
+    // it with a placeholder path instead of dropping it (#422). Every action is
+    // read, not only the first (#443): a benign first action must not hide a
+    // malicious second one — on creation or on update alike.
     let (path, flags) = match xml::task_actions_display(&task.task_content) {
-        Some(actions) => (actions, FLAG_PERSISTENCE_TASK_ARTIFACT),
+        Some(actions) => (actions, flag),
         None => (
             xml::TASK_ACTION_UNKNOWN.to_string(),
-            FLAG_PERSISTENCE_TASK_ARTIFACT | schema::FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
+            flag | schema::FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
         ),
     };
     let event = persistence_file_open(task.pid, xml::task_leaf_name(&task.task_name), path, flags);
-    Some((record_id, Some(event)))
+    (record_id, Some(event))
 }
 
 static SCHEDULED_TASKS: PollTarget = PollTarget {
@@ -377,6 +387,29 @@ static SCHEDULED_TASKS: PollTarget = PollTarget {
     counter: |c| &c.scheduled_tasks,
     parse_block: normalize_scheduled_task,
     enable_audit: Some(enable_scheduled_task_audit),
+    enabled: |c| c.scheduled_tasks_enabled,
+};
+
+// ── Event 4702 — scheduled task update (T1053.005 task-hijack) ───────────────
+
+fn normalize_scheduled_task_update(block: &str) -> ParsedBlock {
+    let task = xml::parse_scheduled_task_update_block(block)?;
+    Some(normalize_task(task, FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT))
+}
+
+/// Own target rather than `EventID=4698 or EventID=4702` on [`SCHEDULED_TASKS`]:
+/// the two parse a differently named content field, and a separate volume counter
+/// keeps 4702's (much noisier) churn observable on its own. Gated by the same
+/// `scheduled_tasks_enabled` toggle — same technique, same audit subcategory.
+static SCHEDULED_TASK_UPDATES: PollTarget = PollTarget {
+    label: "scheduled-task-update",
+    heartbeat: "windows-eventlog:scheduled-task-update",
+    channel: "Security",
+    id_filter: "EventID=4702",
+    counter: |c| &c.scheduled_task_updates,
+    parse_block: normalize_scheduled_task_update,
+    // Same subcategory as 4698 — already enabled by `SCHEDULED_TASKS`.
+    enable_audit: None,
     enabled: |c| c.scheduled_tasks_enabled,
 };
 
@@ -691,8 +724,9 @@ pub struct EventLogConfig {
     pub transport: EventLogTransport,
     /// Event 7045 (T1543.003 — service install persistence).
     pub service_installs_enabled: bool,
-    /// Event 4698 (T1053.005 — scheduled task persistence). Reads the Security
-    /// channel; requires `Other Object Access Events` audit enabled.
+    /// Events 4698 and 4702 (T1053.005 — scheduled task creation and
+    /// update). Reads the Security channel; requires `Other Object Access
+    /// Events` audit enabled.
     pub scheduled_tasks_enabled: bool,
     /// Event 4720 (T1136.001 — local account creation persistence).
     pub account_creations_enabled: bool,
@@ -712,6 +746,7 @@ pub struct EventLogConfig {
 static TARGETS: &[&PollTarget] = &[
     &SERVICE_INSTALLS,
     &SCHEDULED_TASKS,
+    &SCHEDULED_TASK_UPDATES,
     &ACCOUNT_CREATIONS,
     &LOGON_EVENTS,
     &APPLOCKER_BLOCKS,
@@ -746,6 +781,7 @@ impl Default for EventLogConfig {
 pub struct EventLogCounters {
     pub service_installs: AtomicU64,
     pub scheduled_tasks: AtomicU64,
+    pub scheduled_task_updates: AtomicU64,
     pub account_creations: AtomicU64,
     pub logon_events: AtomicU64,
     pub applocker_blocks: AtomicU64,
@@ -1042,6 +1078,7 @@ mod config_tests {
         let counters = sensor.counters();
         assert_eq!(counters.service_installs.load(Ordering::Relaxed), 0);
         assert_eq!(counters.scheduled_tasks.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.scheduled_task_updates.load(Ordering::Relaxed), 0);
         assert_eq!(counters.account_creations.load(Ordering::Relaxed), 0);
         assert_eq!(counters.logon_events.load(Ordering::Relaxed), 0);
         assert_eq!(counters.applocker_blocks.load(Ordering::Relaxed), 0);
@@ -1060,6 +1097,7 @@ mod config_tests {
             [
                 "windows-eventlog:service-install",
                 "windows-eventlog:scheduled-task",
+                "windows-eventlog:scheduled-task-update",
                 "windows-eventlog:account-creation",
                 "windows-eventlog:logon",
                 "windows-eventlog:applocker-block",
@@ -1082,7 +1120,11 @@ mod config_tests {
         let names: Vec<_> = sensor.liveness().into_iter().map(|(n, _)| n).collect();
         assert_eq!(
             names,
-            ["windows-eventlog:scheduled-task", "windows-eventlog:logon"]
+            [
+                "windows-eventlog:scheduled-task",
+                "windows-eventlog:scheduled-task-update",
+                "windows-eventlog:logon"
+            ]
         );
     }
 
@@ -1179,6 +1221,46 @@ mod scheduled_task_tests {
         };
         assert_eq!(event.path, "a.exe | com:{X}");
         assert_eq!(event.flags, FLAG_PERSISTENCE_TASK_ARTIFACT);
+    }
+
+    /// Minimal 4702 block: same fields as [`block_4698`], content in `TaskContentNew`.
+    fn block_4702(task_content_escaped: &str) -> String {
+        format!(
+            "<Event><System><EventID>4702</EventID><EventRecordID>43</EventRecordID></System><EventData><Data Name='TaskName'>\\BackupTask</Data><Data Name='TaskContentNew'>{task_content_escaped}</Data><Data Name='ClientProcessId'>1234</Data></EventData></Event>"
+        )
+    }
+
+    #[test]
+    fn task_update_reports_every_action_not_only_the_first() {
+        let block = block_4702(
+            "&lt;Actions&gt;&lt;Exec&gt;&lt;Command&gt;C:\\legit\\backup.exe&lt;/Command&gt;&lt;/Exec&gt;&lt;Exec&gt;&lt;Command&gt;C:\\Users\\Public\\evil.exe&lt;/Command&gt;&lt;/Exec&gt;&lt;/Actions&gt;",
+        );
+        let Some((43, Some(Event::FileOpen(event)))) = normalize_scheduled_task_update(&block)
+        else {
+            panic!("expected a FileOpen event");
+        };
+        assert_eq!(
+            event.path,
+            r"C:\legit\backup.exe | C:\Users\Public\evil.exe"
+        );
+        assert_eq!(event.flags, FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT);
+        assert_eq!(event.meta.comm, "BackupTask");
+    }
+
+    #[test]
+    fn task_update_with_no_readable_action_is_still_reported() {
+        let block = block_4702(
+            "&lt;Task&gt;&lt;Actions&gt;&lt;ComHandler/&gt;&lt;/Actions&gt;&lt;/Task&gt;",
+        );
+        let Some((43, Some(Event::FileOpen(event)))) = normalize_scheduled_task_update(&block)
+        else {
+            panic!("an unreadable 4702 must be reported, not dropped");
+        };
+        assert_eq!(event.path, xml::TASK_ACTION_UNKNOWN);
+        assert_eq!(
+            event.flags,
+            FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT | schema::FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN
+        );
     }
 }
 

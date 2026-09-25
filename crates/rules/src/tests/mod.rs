@@ -11,7 +11,8 @@ use crate::{
     O_CREAT, O_WRONLY, RuleState, check_account_creation_persistence, check_base64_decode,
     check_btm_launch_item_persistence, check_encoded_powershell, check_ld_preload_hijack,
     check_persistence_write, check_proc_root_escape, check_scheduled_task_persistence,
-    check_service_install_persistence, check_systemd_service_persistence,
+    check_scheduled_task_update_persistence, check_service_install_persistence,
+    check_systemd_service_persistence,
     exclusions::{AUTH_FAILURE_THRESHOLD, BEACON_THRESHOLD, SELF_SPAWN_THRESHOLD},
 };
 
@@ -96,6 +97,16 @@ fn file_open_event_containerized(path: &str, container_id: &str) -> FileOpenEven
 /// `comm` is the task's leaf name.
 fn file_open_event_scheduled_task(task_name: &str, action_path: &str) -> FileOpenEvent {
     let mut event = file_open_event(action_path, schema::FLAG_PERSISTENCE_TASK_ARTIFACT);
+    event.meta.comm = task_name.to_string();
+    event
+}
+
+/// A `FileOpenEvent` shaped like what `sensor-windows-eventlog` pushes on a
+/// Security event 4702 (scheduled task updated): the
+/// `FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT` bit, `path` the task's *new* action
+/// path, `comm` the task's leaf name.
+fn file_open_event_scheduled_task_update(task_name: &str, action_path: &str) -> FileOpenEvent {
+    let mut event = file_open_event(action_path, schema::FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT);
     event.meta.comm = task_name.to_string();
     event
 }

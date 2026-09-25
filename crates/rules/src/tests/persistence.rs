@@ -5,7 +5,8 @@
 //! `check_account_creation_persistence` (T1136.001, event 4720) — plus the
 //! Linux sibling `check_systemd_service_persistence` (T1543.002, issue #93)
 //! and the macOS sibling `check_btm_launch_item_persistence`
-//! (T1543.001/T1547.015, issue #32).
+//! (T1543.001/T1547.015, issue #32), and the 4702 task-hijack sub-case
+//! `check_scheduled_task_update_persistence` (T1053.005).
 
 use super::*;
 
@@ -340,4 +341,129 @@ fn scheduled_task_with_unknown_action_still_alerts() {
     let alert = check_scheduled_task_persistence(&event).expect("must still alert");
     assert_eq!(alert.technique, "T1053.005");
     assert!(alert.message.contains("<action unknown>"));
+}
+
+// ── Scheduled task update (T1053.005 task-hijack, event 4702) ──
+
+#[test]
+fn task_update_repointed_into_appdata_alerts() {
+    let event = file_open_event_scheduled_task_update(
+        "GoogleUpdateTaskMachineUA",
+        r"C:\Users\victim\AppData\Roaming\payload.exe",
+    );
+    let alert = check_scheduled_task_update_persistence(&event).expect("hijack must alert");
+    assert_eq!(alert.technique, "T1053.005");
+    assert!(alert.message.contains("GoogleUpdateTaskMachineUA"));
+    assert!(alert.message.contains(r"AppData\Roaming\payload.exe"));
+}
+
+#[test]
+fn task_update_repointed_at_a_script_host_alerts() {
+    // The lab capture's shape (`schtasks /change /TR "cmd.exe /c ..."`).
+    let event = file_open_event_scheduled_task_update("ClaudeTest", "cmd.exe /c echo hi");
+    assert!(check_scheduled_task_update_persistence(&event).is_some());
+}
+
+#[test]
+fn task_update_pattern_match_is_case_insensitive() {
+    let event = file_open_event_scheduled_task_update("Updater", r"C:\USERS\PUBLIC\Payload.EXE");
+    assert!(check_scheduled_task_update_persistence(&event).is_some());
+}
+
+#[test]
+fn task_update_repointed_through_an_unexpanded_env_var_alerts() {
+    // Task actions keep `%VAR%` as written: `%localappdata%\…` contains none of
+    // the backslash directory patterns (#399 review).
+    for action in [
+        r"%LOCALAPPDATA%\Microsoft\updater.exe",
+        r"%TEMP%\x.exe",
+        r"%Public%\svc.exe",
+    ] {
+        let event = file_open_event_scheduled_task_update("Updater", action);
+        assert!(
+            check_scheduled_task_update_persistence(&event).is_some(),
+            "{action} must alert"
+        );
+    }
+}
+
+#[test]
+fn task_update_with_forward_slashes_alerts() {
+    let event = file_open_event_scheduled_task_update("Updater", "C:/Users/Public/x.exe");
+    assert!(check_scheduled_task_update_persistence(&event).is_some());
+}
+
+#[test]
+fn routine_task_update_under_program_files_stays_silent() {
+    // Windows and vendors rewrite their own tasks constantly — a 4702 whose new
+    // action is a normal installed binary is churn, not a hijack.
+    let event = file_open_event_scheduled_task_update(
+        "MicrosoftEdgeUpdateTaskMachineCore",
+        r"C:\Program Files (x86)\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe /c",
+    );
+    assert!(check_scheduled_task_update_persistence(&event).is_none());
+}
+
+#[test]
+fn file_open_without_task_update_flag_does_not_alert_as_task_update() {
+    let event = file_open_event(
+        r"C:\Users\victim\AppData\Local\cache.dat",
+        O_CREAT | O_WRONLY,
+    );
+    assert!(check_scheduled_task_update_persistence(&event).is_none());
+}
+
+#[test]
+fn task_update_artifact_fires_only_the_task_update_rule() {
+    // Distinct bit: a 4702 must not cross-fire the 4698/7045/4720/systemd/BTM
+    // rules — exactly one alert through the dispatcher.
+    let event = file_open_event_scheduled_task_update(
+        "LegitTask",
+        r"C:\Users\victim\AppData\Roaming\payload.exe",
+    );
+    assert!(check_scheduled_task_persistence(&event).is_none());
+    assert!(check_service_install_persistence(&event).is_none());
+    assert!(check_account_creation_persistence(&event).is_none());
+    assert!(check_systemd_service_persistence(&event).is_none());
+    assert!(check_btm_launch_item_persistence(&event).is_none());
+    let alerts = crate::evaluate_file_open(&event);
+    assert_eq!(alerts.len(), 1, "unexpected alerts: {alerts:?}");
+    assert_eq!(alerts[0].technique, "T1053.005");
+}
+
+#[test]
+fn task_creation_with_unknown_action_does_not_fire_the_task_update_rule() {
+    // Regression (#399 review): the update flag first shared its bit with
+    // FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, so an unreadable 4698 read as a 4702.
+    // Bit disjointness itself is now a compile-time check in `schema`.
+    let mut event = file_open_event_scheduled_task("HiddenTask", "<action unknown>");
+    event.flags |= schema::FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN;
+    assert!(check_scheduled_task_update_persistence(&event).is_none());
+    let alerts = crate::evaluate_file_open(&event);
+    assert_eq!(alerts.len(), 1, "unexpected alerts: {alerts:?}");
+    assert!(alerts[0].message.contains("persistence created"));
+}
+
+#[test]
+fn task_update_with_unknown_action_alerts_without_the_pattern_gate() {
+    // The placeholder matches no hijack pattern; an unreadable new action must
+    // not slip through the gate because of it.
+    let mut event = file_open_event_scheduled_task_update("GoogleUpdateTask", "<action unknown>");
+    event.flags |= schema::FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN;
+    let alert = check_scheduled_task_update_persistence(&event).expect("must alert");
+    assert_eq!(alert.technique, "T1053.005");
+    assert!(alert.message.contains("action unreadable"));
+    assert!(check_scheduled_task_persistence(&event).is_none());
+}
+
+#[test]
+fn task_update_hijacking_the_second_action_alerts() {
+    // The sensor joins every action (#443); a benign first action must not hide
+    // a repointed second one.
+    let event = file_open_event_scheduled_task_update(
+        "BackupTask",
+        r"C:\Program Files\Backup\backup.exe | C:\Users\Public\evil.exe -q",
+    );
+    let alert = check_scheduled_task_update_persistence(&event).expect("hijack must alert");
+    assert!(alert.message.contains(r"\users\public\"));
 }
