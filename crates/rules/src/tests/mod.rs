@@ -1,6 +1,7 @@
 //! Rule engine tests: shared event builders here; one submodule per rule family
 //! (`linux` — stateless + download/exec/web-server lineage; `windows` —
-//! SELF-SPAWN, PARENT-SUSPECT, LOLBIN, BEACON).
+//! SELF-SPAWN, PARENT-SUSPECT, LOLBIN, BEACON; `quarantine` — download-provenance
+//! mark → exec, T1204.002).
 
 use schema::{
     ConnectEvent, ContainerContext, EventMeta, ExecEvent, FileOpenEvent, ListenPortEvent,
@@ -203,5 +204,6 @@ fn listen_port_event_full(
 mod coverage;
 mod linux;
 mod persistence;
+mod quarantine;
 mod tamper;
 mod windows;

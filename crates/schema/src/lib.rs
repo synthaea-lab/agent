@@ -1296,14 +1296,17 @@ pub struct GatekeeperVerdictEvent {
     pub result_code: u32,
 }
 
-/// macOS download provenance — the `com.apple.quarantine` extended attribute
-/// was set on a file, marking it as downloaded from the network. Emitted by
-/// `sensor-macos` (#96) on `SETEXTATTR`, with the quarantine string and the
-/// `kMDItemWhereFroms` origin URLs read back from the file at event time.
+/// Download provenance — a file was marked as downloaded from the network.
+/// Emitted by `sensor-macos` (#96) when the `com.apple.quarantine` extended
+/// attribute is set (`SETEXTATTR`, with the quarantine string and the
+/// `kMDItemWhereFroms` origin URLs read back at event time), and by
+/// `sensor-windows` (#365) when a `Zone.Identifier` stream — the
+/// mark-of-the-web — is written (`HostUrl`/`ReferrerUrl` read back; `agent`
+/// is the writing process, Windows records no downloader name).
 ///
 /// This is the network→file link: a later exec of `path` joins this event to
-/// answer "where did that binary come from" — the macOS mark-of-the-web
-/// (cross-platform note in `docs/sensors/sources.md`).
+/// answer "where did that binary come from" (cross-platform note in
+/// `docs/sensors/sources.md`).
 ///
 /// `agent`/`origin_url`/`referrer_url` are `None` when the writing application
 /// did not (or had not yet) recorded them — the quarantine mark alone is still

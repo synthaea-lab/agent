@@ -334,6 +334,13 @@ impl DetectionSink {
         }
     }
 
+    /// `FileQuarantine` events (macOS quarantine xattr, Windows
+    /// `Zone.Identifier`): recorded for the T1204.002 download→exec join, no
+    /// alert on their own (#365).
+    fn detect_file_quarantine(&self, event: &schema::FileQuarantineEvent) {
+        self.rule_state.lock().unwrap().on_file_quarantine(event);
+    }
+
     /// Connect events: beacon detection.
     fn detect_connect(&self, event: &schema::ConnectEvent) {
         for alert in self.rule_state.lock().unwrap().on_connect(event) {
@@ -515,6 +522,7 @@ impl EventSink for DetectionSink {
             Event::Auth(e) => self.detect_auth(e),
             Event::FileDelete(e) => self.detect_file_delete(e),
             Event::Signal(e) => self.detect_signal(e),
+            Event::FileQuarantine(e) => self.detect_file_quarantine(e),
             // New telemetry categories reach the engines as they land; until a rule
             // consumes them, logging below is the whole treatment.
             _ => {}

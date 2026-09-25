@@ -5,8 +5,8 @@
 use std::{collections::HashMap, net::IpAddr};
 
 use schema::{
-    AuthEvent, AuthOutcome, ConnectEvent, ExecEvent, FileOpenEvent, ListenPortEvent,
-    NetworkFlowEvent, User,
+    AuthEvent, AuthOutcome, ConnectEvent, ExecEvent, FileOpenEvent, FileQuarantineEvent,
+    ListenPortEvent, NetworkFlowEvent, User,
 };
 use store::BoundedMap;
 
@@ -15,9 +15,9 @@ use crate::{
     exclusions::{
         AGENT_CHILD_EXCLUSIONS, AUTH_FAILURE_THRESHOLD, AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD,
         BEACON_WINDOW_NS, BROWSERS, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS,
-        LOLBIN_LEGIT_PARENTS, LOLBINS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
-        SELF_SPAWN_THRESHOLD, SELF_SPAWN_WINDOW_NS, SHELL_COMMS, STANDARD_PORTS,
-        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, WEB_SERVER_COMMS,
+        LOLBIN_LEGIT_PARENTS, LOLBINS, QUARANTINE_EXEC_WINDOW_NS, SELF_SPAWN_EXCLUSIONS,
+        SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_THRESHOLD, SELF_SPAWN_WINDOW_NS, SHELL_COMMS,
+        STANDARD_PORTS, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, WEB_SERVER_COMMS,
     },
     has_write_intent,
     sliding::{FlowPortDedup, SlidingCounter},
@@ -27,6 +27,15 @@ struct RecentWrite {
     pid: u32,
     comm: String,
     timestamp_ns: u64,
+}
+
+/// A download-provenance mark, as [`RuleState::on_file_quarantine`] saw it.
+struct RecentQuarantine {
+    timestamp_ns: u64,
+    agent: Option<String>,
+    origin_url: Option<String>,
+    /// Set by the first exec that alerted: one alert per mark, not per run.
+    alerted: bool,
 }
 
 /// Sliding history needed by the correlation rules:
@@ -47,6 +56,10 @@ pub struct RuleState {
     /// path → info about the last write by a known downloader (T1105). LRU-bounded:
     /// downloader writes are rare, but a hostile loop must not grow agent memory.
     recent_writes: BoundedMap<String, RecentWrite>,
+    /// case-folded path → its latest download-provenance mark (T1204.002,
+    /// #365). LRU-bounded like `recent_writes`: a burst of downloads, or a
+    /// hostile loop writing marks, must not grow agent memory.
+    recent_quarantines: BoundedMap<String, RecentQuarantine>,
     /// (ppid, comm) → sliding counter for SELF-SPAWN (T1059 Windows). LRU-bounded.
     self_spawn: BoundedMap<(u32, String), SlidingCounter>,
     /// (comm, daddr, dport) → sliding counter for BEACON (T1071 Windows). LRU-bounded.
@@ -99,6 +112,7 @@ impl RuleState {
         Self {
             pid_comm: BoundedMap::new(PID_COMM_CAP),
             recent_writes: BoundedMap::new(RECENT_WRITES_CAP),
+            recent_quarantines: BoundedMap::new(RECENT_WRITES_CAP),
             self_spawn: BoundedMap::new(COUNTER_CAP),
             beacon: BoundedMap::new(COUNTER_CAP),
             beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
@@ -267,6 +281,45 @@ impl RuleState {
                 format_delta(event.meta.timestamp_ns.saturating_sub(write.timestamp_ns)),
                 write.pid,
                 write.comm,
+            ),
+        })
+    }
+
+    /// T1204.002 — User Execution: Malicious File. A file carrying a
+    /// download-provenance mark (`FileQuarantine`: macOS quarantine xattr,
+    /// Windows `Zone.Identifier`) is executed within
+    /// [`QUARANTINE_EXEC_WINDOW_NS`] of being marked. Platform-neutral: the
+    /// join is on the executed image path, which both ES and ETW report as the
+    /// full path the mark was written for.
+    ///
+    /// One alert per mark (`alerted`): re-running the same download is not a
+    /// new finding, a re-download writes a fresh mark and is. Paths are
+    /// case-folded — NTFS and default APFS are both case-insensitive.
+    ///
+    /// Known gap: a downloaded *script* run through an interpreter
+    /// (`powershell -File x.ps1`, `sh x.sh`) has the interpreter as its image
+    /// path and does not join; T1105's comm-based match has the same shape of
+    /// limit on Linux.
+    fn check_quarantined_exec(&mut self, event: &ExecEvent) -> Option<Alert> {
+        let now = event.meta.timestamp_ns;
+        let mark = self
+            .recent_quarantines
+            .get_mut(&event.image_path.to_lowercase())?;
+        let age = now.saturating_sub(mark.timestamp_ns);
+        if mark.alerted || age > QUARANTINE_EXEC_WINDOW_NS {
+            return None;
+        }
+        mark.alerted = true;
+        Some(Alert {
+            technique: "T1204.002",
+            message: format!(
+                "pid={} comm={} executes {}, downloaded {} earlier (origin: {}, marked by {})",
+                event.meta.pid,
+                event.meta.comm,
+                event.image_path,
+                format_delta(age),
+                mark.origin_url.as_deref().unwrap_or("unrecorded"),
+                mark.agent.as_deref().unwrap_or("unknown"),
             ),
         })
     }
@@ -524,6 +577,7 @@ impl RuleState {
         let mut alerts = Vec::new();
         alerts.extend(self.check_web_server_spawns_shell(event));
         alerts.extend(self.check_download_then_exec(event));
+        alerts.extend(self.check_quarantined_exec(event));
         alerts.extend(self.check_self_spawn(event));
         alerts.extend(self.check_parent_suspect(event));
         alerts.extend(self.check_lolbin(event));
@@ -616,6 +670,21 @@ impl RuleState {
             }];
         }
         Vec::new()
+    }
+
+    /// To be called for every `FileQuarantineEvent` in the stream (macOS ES,
+    /// Windows ETW `Zone.Identifier`). Does not produce alerts directly —
+    /// records the mark consumed by `check_quarantined_exec`.
+    pub fn on_file_quarantine(&mut self, event: &FileQuarantineEvent) {
+        self.recent_quarantines.insert(
+            event.path.to_lowercase(),
+            RecentQuarantine {
+                timestamp_ns: event.meta.timestamp_ns,
+                agent: event.agent.clone(),
+                origin_url: event.origin_url.clone(),
+                alerted: false,
+            },
+        );
     }
 
     /// To be called for every `FileOpenEvent` in the stream. Does not produce alerts

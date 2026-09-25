@@ -24,6 +24,11 @@
 //!
 //! The provider expansion (registry, DNS, image load, AMSI, WMI — audit P2–P8) is
 //! #21; each provider arrives as its own module. Compiles to a stub off Windows.
+//!
+//! Download provenance (#365): a Kernel-File write to a `:Zone.Identifier`
+//! stream (mark-of-the-web) is read back and reported as
+//! `schema::FileQuarantineEvent`, the macOS quarantine-xattr sibling — see
+//! [`zone_identifier`].
 
 pub mod normalize;
 #[cfg(any(windows, test))]
@@ -35,5 +40,6 @@ mod providers;
 mod sensor;
 #[cfg(windows)]
 mod winapi;
+pub mod zone_identifier;
 #[cfg(windows)]
 pub use sensor::WindowsSensor;

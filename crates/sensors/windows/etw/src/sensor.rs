@@ -25,6 +25,7 @@ use crate::{
         process_provider, registry_provider, smb_provider, wmi_provider,
     },
     winapi,
+    zone_identifier::QuarantineDedup,
 };
 
 /// Cap for the pid cache. A live host rarely runs more than a few hundred
@@ -32,6 +33,14 @@ use crate::{
 /// helpers) while bounding memory if `ProcessEnd` events are lost — a documented
 /// ETW behavior under buffer pressure, not a theoretical one.
 const PID_CACHE_CAP: usize = 16_384;
+
+/// The records of one `Zone.Identifier` write arrive within milliseconds
+/// (lab, 2026-09-23); 5s absorbs ETW buffer-flush jitter without merging a
+/// genuine re-download of the same path.
+const QUARANTINE_DEDUP_WINDOW_NS: u64 = 5_000_000_000;
+/// Distinct files marked within one window — a download burst, not a steady
+/// state; past it a mark is reported without being deduplicated.
+const QUARANTINE_DEDUP_CAP: usize = 1_024;
 
 /// Where the previous session's randomized name is persisted, so orphan cleanup
 /// after a crash still works despite F-2's name randomization.
@@ -69,6 +78,8 @@ pub(crate) struct SharedState {
     pub(crate) volumes: Mutex<HashMap<String, String>>,
     /// F-7: Connect/Send dedup.
     pub(crate) dedup: Mutex<normalize::ConnectDedup>,
+    /// #365: one `FileQuarantine` per `Zone.Identifier` write.
+    pub(crate) quarantine_dedup: Mutex<QuarantineDedup>,
     /// F-2: events observed — the silence watchdog reads this.
     pub(crate) events_seen: AtomicU64,
     /// The liveness canary file: the run loop touches it every heartbeat, which
@@ -250,6 +261,10 @@ impl Sensor for WindowsSensor {
             pids: Mutex::new(PidCache::new(PID_CACHE_CAP)),
             volumes: Mutex::new(winapi::build_volume_map()),
             dedup: Mutex::new(normalize::ConnectDedup::new(60_000_000_000)),
+            quarantine_dedup: Mutex::new(QuarantineDedup::new(
+                QUARANTINE_DEDUP_WINDOW_NS,
+                QUARANTINE_DEDUP_CAP,
+            )),
             events_seen: AtomicU64::new(0),
             canary_path: canary_file
                 .file_name()

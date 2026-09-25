@@ -30,13 +30,13 @@ use core::net::{IpAddr, Ipv4Addr};
 use crate::{
     AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, CapSetEvent, ConnectEvent,
     DnsQueryEvent, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent,
-    FileOpenEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent,
-    IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent, KernelModuleAction, KernelModuleEvent,
-    ListenPortEvent, MemfdCreateEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent,
-    ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent,
-    ScriptBlockEvent, ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
-    SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User,
-    WmiActivityEvent,
+    FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
+    FileWriteEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent, KernelModuleAction,
+    KernelModuleEvent, ListenPortEvent, MemfdCreateEvent, NamespaceEvent, NamespaceSyscall,
+    NetworkFlowEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent,
+    RegistrySetEvent, ScriptBlockEvent, ShellType, SmbConnectEvent, SocketAcceptEvent,
+    SocketBindEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
+    UdpSendEvent, User, WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -189,6 +189,18 @@ pub fn auth() -> AuthEvent {
         target_user_sid: None,
         source_address: None,
         status_code: None,
+    }
+}
+
+/// Neutral [`FileQuarantineEvent`]: empty path, no agent or URLs.
+#[must_use]
+pub fn file_quarantine() -> FileQuarantineEvent {
+    FileQuarantineEvent {
+        meta: meta(),
+        path: String::new(),
+        agent: None,
+        origin_url: None,
+        referrer_url: None,
     }
 }
 
