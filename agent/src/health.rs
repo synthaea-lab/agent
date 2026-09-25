@@ -108,7 +108,13 @@ impl StopFlag {
     }
 
     fn stop(&self) {
-        self.flag.store(true, Ordering::SeqCst);
+        // Set the flag under the mutex: a sleeper checks it under the same
+        // mutex before waiting, so the notification can't fall between its
+        // check and its wait (lost wakeup → full-interval sleep).
+        {
+            let _guard = self.mutex.lock().unwrap();
+            self.flag.store(true, Ordering::SeqCst);
+        }
         self.condvar.notify_all();
     }
 
@@ -116,10 +122,13 @@ impl StopFlag {
         self.flag.load(Ordering::SeqCst)
     }
 
-    /// Sleeps for the given duration, but wakes early if `stop()` is called.
+    /// Sleeps for the given duration, but wakes early if `stop()` is called,
+    /// including when it was called just before the sleep started.
     fn sleep_interruptible(&self, duration: Duration) {
         let guard = self.mutex.lock().unwrap();
-        let _ = self.condvar.wait_timeout(guard, duration);
+        let _ = self
+            .condvar
+            .wait_timeout_while(guard, duration, |_| !self.is_stopped());
     }
 }
 
@@ -192,7 +201,7 @@ impl StopHandle {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::mpsc;
 
     use super::*;
 
@@ -239,8 +248,7 @@ mod tests {
         });
         let enrich = Arc::new(MockDropped(5));
 
-        let collected: Arc<Mutex<Vec<HealthBeacon>>> = Arc::new(Mutex::new(Vec::new()));
-        let collected_clone = collected.clone();
+        let (tx, rx) = mpsc::channel();
 
         let collector = HealthCollector::new(
             HealthCollectorConfig {
@@ -250,23 +258,22 @@ mod tests {
             sensors,
             spool,
             enrich,
-            move |b| collected_clone.lock().unwrap().push(b),
+            move |b| {
+                let _ = tx.send(b);
+            },
         );
 
         let (handle, stop) = collector.spawn();
 
-        // Wait for at least one beacon
-        thread::sleep(Duration::from_millis(50));
+        // Wait for the first beacon instead of sleeping a fixed time: a fixed
+        // 50 ms sleep failed on slow CI runners (macOS) before the thread had
+        // emitted anything.
+        let beacon = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("should have collected at least one beacon");
         stop.stop();
         handle.join().unwrap();
 
-        let beacons = collected.lock().unwrap();
-        assert!(
-            !beacons.is_empty(),
-            "should have collected at least one beacon"
-        );
-
-        let beacon = &beacons[0];
         assert_eq!(beacon.agent_version, "0.1.0-test");
         assert_eq!(beacon.sensors.len(), 1);
         assert_eq!(beacon.sensors[0].name, "linux-ebpf");
@@ -306,6 +313,21 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(1),
             "stop should interrupt sleep"
+        );
+    }
+
+    #[test]
+    fn stop_before_sleep_is_not_lost() {
+        // A stop that lands before the sleeper starts waiting must still cut
+        // the sleep short, instead of the notification being lost.
+        let flag = StopFlag::new();
+        flag.stop();
+
+        let start = std::time::Instant::now();
+        flag.sleep_interruptible(Duration::from_secs(60));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "a stop issued before the sleep should not be lost"
         );
     }
 }
