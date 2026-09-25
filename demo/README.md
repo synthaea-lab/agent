@@ -32,9 +32,11 @@ in a `try/finally` block — no residue.
   Security log (Administrators only) and to enable audit subcategories via
   `auditpol`; the scenario scripts need it to create scheduled tasks, install
   services, and add local accounts.
-- PowerShell 7+ (pwsh). PowerShell 5.1 (built-in `powershell.exe`) also
-  works — the scenarios avoid pwsh-only syntax deliberately, so switch if
-  needed.
+- The built-in Windows PowerShell 5.1 (`powershell.exe`), under any locale;
+  PowerShell 7+ (`pwsh`) works too. The scripts are ASCII-only and build
+  locale-dependent arguments (dates) from the current culture (#433).
+  `-ExecutionPolicy Bypass` is needed because a stock client's policy
+  (`Restricted`) refuses to run any script.
 
 ## Run
 
@@ -51,7 +53,7 @@ screen — this is where alerts appear.
 **Terminal B** (orchestrator, as Administrator):
 
 ```
-pwsh -File demo\run-all.ps1
+powershell -ExecutionPolicy Bypass -File demo\run-all.ps1
 ```
 
 The orchestrator runs the four scenarios in the order above, with a short

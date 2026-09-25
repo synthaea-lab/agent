@@ -14,7 +14,7 @@
     each incoming alert group with the scenario that produced it.
 
     Each scenario is self-cleaning (`try/finally` in each script); this
-    orchestrator does no cleanup of its own — a partial run leaves the
+    orchestrator does no cleanup of its own -- a partial run leaves the
     host in the correct state regardless of where it stopped.
 
 .NOTES
@@ -22,7 +22,7 @@
         Terminal A (as Administrator):
             target\release\agent.exe run
         Terminal B (as Administrator):
-            pwsh -File demo\run-all.ps1
+            powershell -ExecutionPolicy Bypass -File demo\run-all.ps1
 
     See demo\README.md for the surrounding context and demo\expected-alerts.md
     for the exact alert lines the agent should print.
@@ -32,8 +32,8 @@
     /add all require elevation) and the agent needs it to read the Security
     log and enable audit subcategories.
 
-    Timing: 3 iterations per scenario × 1s per iteration + 5s inter-scenario
-    pause × 3 gaps = roughly 30 seconds total runtime, plus the eventlog
+    Timing: 3 iterations per scenario x 1s per iteration + 5s inter-scenario
+    pause x 3 gaps = roughly 30 seconds total runtime, plus the eventlog
     sensor's 2-second poll lag on the persistence alerts.
 
 .LINK
@@ -46,19 +46,19 @@ $ScenariosDir = Join-Path $RepoRoot "lab\scenarios"
 
 $Steps = @(
     @{
-        Technique = "T1059.001 — Command and Scripting Interpreter: PowerShell (EncodedCommand)"
+        Technique = "T1059.001 -- Command and Scripting Interpreter: PowerShell (EncodedCommand)"
         Script    = Join-Path $ScenariosDir "encoded-powershell.ps1"
     },
     @{
-        Technique = "T1053.005 — Scheduled Task/Job: Scheduled Task"
+        Technique = "T1053.005 -- Scheduled Task/Job: Scheduled Task"
         Script    = Join-Path $ScenariosDir "scheduled-task-persistence.ps1"
     },
     @{
-        Technique = "T1543.003 — Create or Modify System Process: Windows Service"
+        Technique = "T1543.003 -- Create or Modify System Process: Windows Service"
         Script    = Join-Path $ScenariosDir "service-install-persistence.ps1"
     },
     @{
-        Technique = "T1136.001 — Create Account: Local Account"
+        Technique = "T1136.001 -- Create Account: Local Account"
         Script    = Join-Path $ScenariosDir "create-account-persistence.ps1"
     }
 )
@@ -66,13 +66,13 @@ $Steps = @(
 # Fail fast if any scenario is missing rather than half-running the demo.
 foreach ($step in $Steps) {
     if (-not (Test-Path $step.Script)) {
-        throw "missing scenario script: $($step.Script) — run this from a clean checkout of the repo, or check that all four PRs (T1059.001/T1053.005/T1543.003/T1136.001) are on the current branch."
+        throw "missing scenario script: $($step.Script) -- run this from a clean checkout of the repo, or check that all four PRs (T1059.001/T1053.005/T1543.003/T1136.001) are on the current branch."
     }
 }
 
 Write-Host ""
 Write-Host "============================================================"
-Write-Host "  Synthaea demo — 4 techniques, 3 iterations each"
+Write-Host "  Synthaea demo -- 4 techniques, 3 iterations each"
 Write-Host "  Watch Terminal A (agent) for alerts as this script runs."
 Write-Host "============================================================"
 Write-Host ""
@@ -80,10 +80,12 @@ Write-Host ""
 for ($i = 0; $i -lt $Steps.Count; $i++) {
     $step = $Steps[$i]
     Write-Host ""
-    Write-Host "───────────────────────────────────────────────────────────"
-    Write-Host " Step $($i + 1)/$($Steps.Count) — $($step.Technique)"
-    Write-Host "───────────────────────────────────────────────────────────"
-    & pwsh -File $step.Script
+    Write-Host "-----------------------------------------------------------"
+    Write-Host " Step $($i + 1)/$($Steps.Count) -- $($step.Technique)"
+    Write-Host "-----------------------------------------------------------"
+    # In-process rather than `pwsh -File`: pwsh is not on a stock Windows, and
+    # a scenario's `throw` must stop the demo instead of scrolling past (#433).
+    & $step.Script
     if ($i -lt $Steps.Count - 1) {
         Write-Host ""
         Write-Host "(pausing 5 seconds before the next step so alerts stay readable...)"

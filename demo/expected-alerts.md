@@ -14,9 +14,9 @@ task/service/account counters, and (for T1136.001) a system-specific SID.
 Three alerts:
 
 ```
-T1059.001 — pid=<pid> comm=powershell.exe: encoded PowerShell command: powershell.exe -EncodedCommand …
-T1059.001 — pid=<pid> comm=powershell.exe: encoded PowerShell command: powershell.exe -EncodedCommand …
-T1059.001 — pid=<pid> comm=powershell.exe: encoded PowerShell command: powershell.exe -EncodedCommand …
+T1059.001 — pid=<pid> comm=powershell.exe: PowerShell EncodedCommand invocation: powershell.exe -EncodedCommand VwByAGkAdABlAC0ASABvAHMAdAAgAGgAZQBsAGwAbwA=
+T1059.001 — pid=<pid> comm=powershell.exe: PowerShell EncodedCommand invocation: powershell.exe -EncodedCommand VwByAGkAdABlAC0ASABvAHMAdAAgAGgAZQBsAGwAbwA=
+T1059.001 — pid=<pid> comm=powershell.exe: PowerShell EncodedCommand invocation: powershell.exe -EncodedCommand VwByAGkAdABlAC0ASABvAHMAdAAgAGgAZQBsAGwAbwA=
 ```
 
 **No fire means**: the Exec-event sensor for Windows is not wired into

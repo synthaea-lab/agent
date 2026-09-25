@@ -30,6 +30,8 @@ jobs:
           cargo +nightly fmt --all --check
       - name: dependency direction
         run: python3 tools/check-deps.py
+      - name: PowerShell scripts ASCII-only
+        run: python3 tools/check-ps1-ascii.py
       - name: docs build clean
         run: cargo doc --workspace --exclude sensor-linux-ebpf --no-deps
         env:

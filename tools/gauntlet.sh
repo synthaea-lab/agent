@@ -24,6 +24,9 @@ cargo +nightly fmt --all --check
 step "dependency direction"
 python3 tools/check-deps.py
 
+step "PowerShell scripts ASCII-only (Windows PowerShell 5.1 misreads anything else)"
+python3 tools/check-ps1-ascii.py
+
 step "clippy, host, all targets, -D warnings"
 cargo clippy --workspace --exclude sensor-linux-ebpf --all-targets -- -D warnings
 
