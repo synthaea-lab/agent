@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# The full local check matrix — everything CI would enforce, runnable on one
-# machine. Exists because CI is currently billing-blocked (workflow_dispatch
-# only, see .github/workflows/ci.yml): until it is back, this script is the
-# enforcement. It mirrors ci.yml's jobs plus the cross-target sweep from
+# The full local check matrix — everything CI enforces, runnable on one
+# machine before pushing. CI (.github/workflows/ci.yml) is the enforcement;
+# this script catches the same failures earlier (#318). It mirrors ci.yml's
+# jobs plus the cross-target sweep from
 # docs/development/code-style.md ("host-only clippy misses every cfg'd item").
 #
 # Usage: tools/gauntlet.sh            # everything
