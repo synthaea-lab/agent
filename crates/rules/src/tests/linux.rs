@@ -598,3 +598,232 @@ fn listen_port_two_distinct_new_ports_each_alert() {
     assert_eq!(first.len(), 1);
     assert_eq!(second.len(), 1);
 }
+
+#[test]
+fn mass_rename_with_appended_suffix_triggers_at_threshold() {
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9000,
+            "encryptor",
+            &format!("/home/u/file{i}.docx"),
+            &format!("/home/u/file{i}.docx.locked"),
+            u64::from(i) * 100_000_000, // 100ms apart, well inside the 5s window
+        )));
+    }
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+}
+
+#[test]
+fn mass_rename_below_threshold_does_not_alert() {
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD - 1 {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9001,
+            "encryptor",
+            &format!("/home/u/file{i}.docx"),
+            &format!("/home/u/file{i}.docx.locked"),
+            u64::from(i) * 100_000_000,
+        )));
+    }
+    assert!(alerts.is_empty());
+}
+
+#[test]
+fn mass_rename_does_not_realert_within_the_same_window() {
+    let mut state = RuleState::new();
+    let mut first_batch = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        first_batch.extend(state.on_file_rename(&file_rename_event_full(
+            9002,
+            "encryptor",
+            &format!("/home/u/a{i}.docx"),
+            &format!("/home/u/a{i}.docx.locked"),
+            u64::from(i) * 100_000_000,
+        )));
+    }
+    assert_eq!(first_batch.len(), 1);
+    // One more rename immediately after, still inside the 5s window — the alert
+    // already fired for this window, so no second one.
+    let again = state.on_file_rename(&file_rename_event_full(
+        9002,
+        "encryptor",
+        "/home/u/more.docx",
+        "/home/u/more.docx.locked",
+        RANSOMWARE_RENAME_WINDOW_NS - 1,
+    ));
+    assert!(again.is_empty());
+}
+
+#[test]
+fn rename_without_a_preserved_prefix_is_never_counted() {
+    // A normal `mv a b` — new_path bears no relation to old_path — must never
+    // contribute to the ransomware counter, no matter how many happen in a burst.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD * 2 {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9003,
+            "mv",
+            &format!("/home/u/src{i}.txt"),
+            &format!("/home/u/dst{i}.txt"),
+            u64::from(i) * 100_000_000,
+        )));
+    }
+    assert!(alerts.is_empty());
+}
+
+#[test]
+fn rename_outside_the_window_does_not_accumulate() {
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        // 2s apart: any 5s window holds at most 3 renames, far under threshold.
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9004,
+            "encryptor",
+            &format!("/home/u/b{i}.docx"),
+            &format!("/home/u/b{i}.docx.locked"),
+            u64::from(i) * 2_000_000_000,
+        )));
+    }
+    assert!(alerts.is_empty());
+}
+
+#[test]
+fn log_rotation_burst_does_not_alert() {
+    // logrotate renames every log it handles within the same second, with a
+    // numeric (`app.log.1`) or dateext (`app.log-20260924`) suffix — the exact
+    // prefix-preserving shape, but no letter in the suffix.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD * 2 {
+        let suffix = if i % 2 == 0 { ".1" } else { "-20260924" };
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9005,
+            "logrotate",
+            &format!("/var/log/app{i}.log"),
+            &format!("/var/log/app{i}.log{suffix}"),
+            u64::from(i) * 10_000_000,
+        )));
+    }
+    assert!(alerts.is_empty());
+}
+
+#[test]
+fn mass_rename_with_random_hex_suffix_triggers() {
+    // Families that append a per-victim id rather than a fixed word still match.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9006,
+            "encryptor",
+            &format!("/srv/share/r{i}.xlsx"),
+            &format!("/srv/share/r{i}.xlsx.id-3fa9c1e0"),
+            u64::from(i) * 100_000_000,
+        )));
+    }
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+}
+
+#[test]
+fn shell_loop_rename_across_distinct_pids_triggers_via_ppid() {
+    // `for f in *; do mv "$f" "$f.locked"; done`: each `mv` is its own short-lived
+    // pid, so the per-pid counter never climbs — but every child shares the loop's
+    // shell as ppid. The per-ppid counter catches it (issue #262 review, old-dov).
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        let mut ev = file_rename_event_full(
+            20_000 + i, // a fresh mv pid each iteration
+            "mv",
+            &format!("/home/u/doc{i}.pdf"),
+            &format!("/home/u/doc{i}.pdf.locked"),
+            u64::from(i) * 100_000_000,
+        );
+        ev.meta.ppid = 4242; // the loop's shell
+        alerts.extend(state.on_file_rename(&ev));
+    }
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+    assert!(alerts[0].message.contains("ppid=4242"));
+}
+
+#[test]
+fn distinct_pids_with_unknown_or_init_parent_do_not_alert_via_ppid() {
+    // ppid 0 = "unknown" (a PROC_LINEAGE miss on the sensor) and ppid 1 = init are
+    // shared buckets: unrelated single-rename processes must not be lumped into a
+    // false shell-loop alert (#455 review, old-dov). Each rename is a distinct pid
+    // (so the per-pid counter never climbs) sharing ppid 0, then ppid 1.
+    for shared_ppid in [0u32, 1u32] {
+        let mut state = RuleState::new();
+        let mut alerts = Vec::new();
+        for i in 0..RANSOMWARE_RENAME_THRESHOLD * 2 {
+            let mut ev = file_rename_event_full(
+                30_000 + i, // a distinct pid each time
+                "daemon",
+                &format!("/var/lib/app/x{i}.dat"),
+                &format!("/var/lib/app/x{i}.dat.bak"),
+                u64::from(i) * 100_000_000,
+            );
+            ev.meta.ppid = shared_ppid;
+            alerts.extend(state.on_file_rename(&ev));
+        }
+        assert!(
+            alerts.is_empty(),
+            "ppid={shared_ppid} must not trigger a shell-loop alert"
+        );
+    }
+}
+
+#[test]
+fn single_process_burst_yields_exactly_one_alert_not_two() {
+    // Regression for the double-count seam: one encryptor pid's renames also land in
+    // the shared per-ppid counter. Without the RANSOMWARE_LOOP_CHILD_MAX gate, a
+    // rename after the per-pid alert would push the per-ppid counter over threshold
+    // and fire a spurious second alert. Drive 2 * threshold renames from one pid and
+    // assert exactly one alert total.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD * 2 {
+        let mut ev = file_rename_event_full(
+            9100,
+            "encryptor",
+            &format!("/home/u/c{i}.docx"),
+            &format!("/home/u/c{i}.docx.locked"),
+            u64::from(i) * 100_000_000, // all inside one 5s window
+        );
+        ev.meta.ppid = 7000;
+        alerts.extend(state.on_file_rename(&ev));
+    }
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn in_place_edit_backup_is_a_documented_false_positive() {
+    // `sed -i.bak 's/old/new/' *.conf` across 20+ files rename(2)s each original to
+    // `f.conf.bak` from one pid — the exact prefix-preserving, lettered-suffix shape.
+    // A FileRenameEvent carries only `comm`, not the exe path an evidence-gated
+    // exclusion needs, so this rule currently fires here (see check_mass_rename_pattern
+    // doc). This test pins that known behavior; the fix (exe path + comm/trusted-path
+    // gate) is tracked as a follow-up. If a future change makes this stop alerting,
+    // update the doc and this test together, deliberately.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9200,
+            "sed",
+            &format!("/etc/nginx/sites-enabled/s{i}.conf"),
+            &format!("/etc/nginx/sites-enabled/s{i}.conf.bak"),
+            u64::from(i) * 100_000_000,
+        )));
+    }
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+}

@@ -388,6 +388,13 @@ impl DetectionSink {
         }
     }
 
+    /// `FileRename` events: mass-rename ransomware detection (T1486, issue #262).
+    fn detect_file_rename(&self, event: &schema::FileRenameEvent) {
+        for alert in self.rule_state.lock().unwrap().on_file_rename(event) {
+            self.emit(alert.technique, &alert.message);
+        }
+    }
+
     /// Writes one alert to the shared log and highlighted stderr. `pub(crate)`
     /// rather than private: `silence::spawn_monitor` (#71) emits a sensor-silence
     /// verdict through the exact same path as a rule/correlator/Sigma finding —
@@ -526,6 +533,7 @@ impl EventSink for DetectionSink {
             Event::FileDelete(e) => self.detect_file_delete(e),
             Event::Signal(e) => self.detect_signal(e),
             Event::FileQuarantine(e) => self.detect_file_quarantine(e),
+            Event::FileRename(e) => self.detect_file_rename(e),
             // New telemetry categories reach the engines as they land; until a rule
             // consumes them, logging below is the whole treatment.
             _ => {}

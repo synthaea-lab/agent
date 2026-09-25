@@ -6,7 +6,7 @@ use std::{collections::HashMap, net::IpAddr};
 
 use schema::{
     AuthEvent, AuthOutcome, ConnectEvent, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
-    FileOpenEvent, FileQuarantineEvent, ListenPortEvent, NetworkFlowEvent, User,
+    FileOpenEvent, FileQuarantineEvent, FileRenameEvent, ListenPortEvent, NetworkFlowEvent, User,
 };
 use store::BoundedMap;
 
@@ -15,7 +15,8 @@ use crate::{
     exclusions::{
         AGENT_CHILD_EXCLUSIONS, AUTH_FAILURE_THRESHOLD, AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD,
         BEACON_WINDOW_NS, BROWSERS, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS,
-        LOLBIN_LEGIT_PARENTS, LOLBINS, QUARANTINE_EXEC_WINDOW_NS, SELF_SPAWN_EXCLUSIONS,
+        LOLBIN_LEGIT_PARENTS, LOLBINS, QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_LOOP_CHILD_MAX,
+        RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SELF_SPAWN_EXCLUSIONS,
         SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_THRESHOLD, SELF_SPAWN_WINDOW_NS, SHELL_COMMS,
         STANDARD_PORTS, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN,
         TASK_REGISTRATION_DEDUP_WINDOW_NS, WEB_SERVER_COMMS,
@@ -89,6 +90,18 @@ pub struct RuleState {
     /// LRU-bounded like every other counter: a spray across many fabricated
     /// usernames must not grow this without limit.
     auth_failures: BoundedMap<(String, String), SlidingCounter>,
+    /// pid → sliding counter for RANSOMWARE-RENAME (T1486, issue #262): renames by
+    /// this pid where `new_path` is `old_path` plus an appended suffix. LRU-bounded:
+    /// a hostile process renaming under many different pids (unusual, but not
+    /// impossible) must not grow this without limit either.
+    ransomware_rename: BoundedMap<u32, SlidingCounter>,
+    /// ppid → the same counter, for the shell-loop shape (`for f in *; do mv "$f"
+    /// "$f.locked"; done`, `find … -exec mv {} {}.x \;`): each rename runs in its own
+    /// short-lived `mv` pid, so the per-pid counter never climbs, but every child
+    /// shares the loop's shell as `ppid`. Real Linux ransomware ships this way, so the
+    /// per-pid counter alone would miss it (issue #262 review, old-dov). LRU-bounded.
+    /// `ppid <= 1` (unknown/init) is never keyed here — see `check_mass_rename_pattern`.
+    ransomware_rename_by_ppid: BoundedMap<u32, SlidingCounter>,
     /// Task leaf name → last reported T1053.005 registration, so one registration
     /// seen on both Security 4698 and TaskScheduler/Operational 106 alerts once
     /// (#422). LRU-bounded like the counters.
@@ -130,6 +143,8 @@ impl RuleState {
             beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
             auth_failures: BoundedMap::new(COUNTER_CAP),
+            ransomware_rename: BoundedMap::new(COUNTER_CAP),
+            ransomware_rename_by_ppid: BoundedMap::new(COUNTER_CAP),
             task_registrations: BoundedMap::new(COUNTER_CAP),
             own_pid: None,
             ld_trust_extra: Vec::new(),
@@ -760,6 +775,125 @@ impl RuleState {
             },
         );
     }
+
+    /// T1486 — Data Encrypted for Impact. Ransomware's near-universal tell: a burst
+    /// of renames, each keeping the original filename intact and appending a new
+    /// suffix (`invoice.pdf` → `invoice.pdf.locked`), from the same pid, in a tight
+    /// window. Extension-agnostic by design — matching on "`old_path` is a strict
+    /// prefix of `new_path`" catches every real family's naming scheme (`.locked`,
+    /// `.encrypted`, `.WNCRY`, a random hex suffix, ...) without a list to keep
+    /// current against new strains, and without false-positiving on renames that
+    /// *don't* preserve the original name (a normal `mv a b` has no such relation).
+    ///
+    /// Deliberately keyed on rename shape alone, not `FileWriteEvent` volume: many
+    /// legitimate bulk operations (package installs, `tar` extraction, a compiler's
+    /// intermediate files) write many files quickly, but essentially none rename
+    /// hundreds of pre-existing files to append a shared new suffix in seconds —
+    /// see `RANSOMWARE_RENAME_THRESHOLD`'s doc for the calibration reasoning.
+    ///
+    /// Counted twice, so both real shapes reach the threshold (issue #262 review):
+    /// per-pid for a single encryptor binary, and per-ppid for the shell-loop shape
+    /// (`for f in *; do mv "$f" "$f.locked"; done`) where each rename is a separate
+    /// short-lived `mv` pid but every one shares the loop's shell as `ppid`. The
+    /// per-pid branch wins when it fires, so a single process yields one alert, not
+    /// two (its renames also land in the per-ppid counter, but that branch is only
+    /// consulted when the per-pid one did not fire this event).
+    ///
+    /// Known benign producers of this exact shape that this rule does **not** yet
+    /// discriminate, because a `FileRenameEvent` carries only `comm`, never the
+    /// executable path an evidence-gated exclusion needs (CLAUDE.md — name-keyed
+    /// exclusions must be gated on evidence, cf. [`policy::name_exclusion_applies`]):
+    /// - Log rotation (`app.log` → `app.log.1`): handled by [`is_rotation_suffix`]
+    ///   (a suffix with no letter never counts) — the one case a shape signal settles.
+    /// - In-place edit with a backup: `sed -i.bak`, `perl -i.orig` `rename(2)` the
+    ///   original to `f.bak`/`f.orig` from one pid; 20+ files in one command
+    ///   (`sed -i.bak … *.conf`) trip this rule.
+    /// - Maildir flag changes (`…:2,S` → `…:2,ST`): one IMAP pid, prefix-preserving,
+    ///   lettered suffix; "mark all read" on a large folder can exceed the threshold.
+    ///
+    /// Excluding those on `comm` alone would be spoofable (an encryptor sets
+    /// `comm=sed`), so the proper fix is to add the exe path to `FileRenameEvent` and
+    /// gate on `comm` + trusted path — tracked as a follow-up. Shapes this rule
+    /// cannot see at all (write-new-then-unlink, cross-directory moves) need a
+    /// separate write/delete correlation, also follow-up.
+    fn check_mass_rename_pattern(&mut self, event: &FileRenameEvent) -> Option<Alert> {
+        let suffix = event.new_path.strip_prefix(event.old_path.as_str())?;
+        if suffix.is_empty() || is_rotation_suffix(suffix) {
+            return None;
+        }
+        let ts = event.meta.timestamp_ns;
+
+        // Per-pid: a single encryptor process renaming its way through a tree.
+        let pid_entry = self
+            .ransomware_rename
+            .get_or_insert_with(event.meta.pid, SlidingCounter::default);
+        let pid_count = pid_entry.record(ts, RANSOMWARE_RENAME_WINDOW_NS);
+        if pid_count >= RANSOMWARE_RENAME_THRESHOLD
+            && pid_entry.try_alert(ts, RANSOMWARE_RENAME_WINDOW_NS)
+        {
+            return Some(Alert {
+                technique: "T1486",
+                message: format!(
+                    "pid={} comm={}: {pid_count} files renamed with an appended suffix in {}s \
+                     (e.g. {} → {}) — suspected ransomware encryption pass",
+                    event.meta.pid,
+                    event.meta.comm,
+                    RANSOMWARE_RENAME_WINDOW_NS / 1_000_000_000,
+                    event.old_path,
+                    event.new_path,
+                ),
+            });
+        }
+
+        // Per-ppid: a shell loop spawning one short-lived `mv` per file — the per-pid
+        // counter above never climbs, but the parent shell ties the burst together.
+        // Only pids that are themselves light renamers feed this counter, so a single
+        // busy process (already handled above) does not also drive the shared per-ppid
+        // counter to a second alert — see `RANSOMWARE_LOOP_CHILD_MAX`.
+        //
+        // ppid 0 ("unknown" — a `PROC_LINEAGE` miss on the sensor, never real pid 0)
+        // and ppid 1 (init — orphans and daemons reparent there) are shared buckets
+        // that would lump unrelated processes into a false "shell-loop" alert; a real
+        // loop's children have the loop's shell as parent, so skip both (#455 review).
+        if pid_count > RANSOMWARE_LOOP_CHILD_MAX || event.meta.ppid <= 1 {
+            return None;
+        }
+        let ppid_entry = self
+            .ransomware_rename_by_ppid
+            .get_or_insert_with(event.meta.ppid, SlidingCounter::default);
+        let ppid_count = ppid_entry.record(ts, RANSOMWARE_RENAME_WINDOW_NS);
+        if ppid_count >= RANSOMWARE_RENAME_THRESHOLD
+            && ppid_entry.try_alert(ts, RANSOMWARE_RENAME_WINDOW_NS)
+        {
+            return Some(Alert {
+                technique: "T1486",
+                message: format!(
+                    "ppid={}: {ppid_count} files renamed with an appended suffix by short-lived \
+                     children in {}s (e.g. {} → {}, comm={}) — suspected ransomware encryption \
+                     pass (shell-loop pattern)",
+                    event.meta.ppid,
+                    RANSOMWARE_RENAME_WINDOW_NS / 1_000_000_000,
+                    event.old_path,
+                    event.new_path,
+                    event.meta.comm,
+                ),
+            });
+        }
+        None
+    }
+
+    /// To be called for every `FileRenameEvent` in the stream (T1486, issue #262).
+    pub fn on_file_rename(&mut self, event: &FileRenameEvent) -> Vec<Alert> {
+        self.check_mass_rename_pattern(event).into_iter().collect()
+    }
+}
+
+/// Suffixes logrotate and similar rotators append (`.1`, `-20260924`, `.1.2`, `~`
+/// backups): no ASCII letter at all. Ransomware markers carry letters (`.locked`,
+/// `.WNCRY`, `.id-<hex>.[mail]`); an all-digit random suffix is the one blind spot,
+/// accepted over alerting on every rotation run.
+fn is_rotation_suffix(suffix: &str) -> bool {
+    !suffix.bytes().any(|b| b.is_ascii_alphabetic())
 }
 
 fn format_delta(delta_ns: u64) -> String {

@@ -14,7 +14,10 @@ use crate::{
     check_persistence_write, check_proc_root_escape, check_scheduled_task_persistence,
     check_scheduled_task_update_persistence, check_service_install_persistence,
     check_systemd_service_persistence,
-    exclusions::{AUTH_FAILURE_THRESHOLD, BEACON_THRESHOLD, SELF_SPAWN_THRESHOLD},
+    exclusions::{
+        AUTH_FAILURE_THRESHOLD, BEACON_THRESHOLD, RANSOMWARE_RENAME_THRESHOLD,
+        RANSOMWARE_RENAME_WINDOW_NS, SELF_SPAWN_THRESHOLD,
+    },
 };
 
 const O_RDONLY: u32 = 0;
@@ -76,6 +79,25 @@ fn file_open_event_full(
     timestamp_ns: u64,
 ) -> FileOpenEvent {
     let mut event = file_open_event(path, flags);
+    event.meta.pid = pid;
+    event.meta.timestamp_ns = timestamp_ns;
+    event.meta.comm = comm.to_string();
+    event
+}
+
+fn file_rename_event_full(
+    pid: u32,
+    comm: &str,
+    old_path: &str,
+    new_path: &str,
+    timestamp_ns: u64,
+) -> schema::FileRenameEvent {
+    let mut event = schema::FileRenameEvent {
+        old_path: old_path.to_string(),
+        new_path: new_path.to_string(),
+        ..schema::fixtures::file_rename()
+    };
+    event.meta = meta();
     event.meta.pid = pid;
     event.meta.timestamp_ns = timestamp_ns;
     event.meta.comm = comm.to_string();
