@@ -94,14 +94,28 @@ echo "== bpf-linker =="
 # LLVM cut in lockstep with recent rustc nightly, so they Just Work and the
 # "revalidate on nightly bump" problem goes away (#113). Pin explicitly.
 BPF_LINKER_VERSION="v0.11.1"
+# SHA-256 of each release tarball, pinned with the version: a replaced release
+# asset must not run unverified code that builds our eBPF bytecode. Same value
+# as BPF_LINKER_SHA256 in .github/workflows/ci.yml (x86_64). Bump all together.
+declare -A BPF_LINKER_SHA256=(
+  [x86_64]=e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8
+  [aarch64]=341ec1c595496877cae2b073544c2226d78a922739632b5732dbaa48507f1380
+)
 install_bpf_linker() {
-  local url="https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-$(uname -m)-unknown-linux-musl.tar.zst"
-  local tmp bin rc
+  local arch sha url tmp bin rc
+  arch=$(uname -m)
+  sha=${BPF_LINKER_SHA256[$arch]:-}
+  if [ -z "$sha" ]; then
+    echo "[error] no pinned bpf-linker SHA-256 for $arch" >&2
+    return 1
+  fi
+  url="https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-${arch}-unknown-linux-musl.tar.zst"
   tmp=$(mktemp -d)
   echo "[info] bpf-linker ${BPF_LINKER_VERSION} (prebuilt): $url"
   # A single lost packet here silently makes the VM replay-only (the caller only
   # warns). Retry the fetch — 3 attempts, transient HTTP errors included.
   curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors "$url" -o "$tmp/bl.tar.zst" \
+    && echo "${sha}  $tmp/bl.tar.zst" | sha256sum -c - \
     && tar --zstd -xf "$tmp/bl.tar.zst" -C "$tmp" \
     && bin=$(find "$tmp" -type f -name bpf-linker -print -quit) && [ -n "$bin" ] \
     && install -m755 "$bin" "$HOME/.cargo/bin/bpf-linker"

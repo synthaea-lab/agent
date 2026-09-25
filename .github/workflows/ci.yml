@@ -66,5 +66,52 @@ jobs:
       - name: test
         run: cargo test --workspace --exclude sensor-linux-ebpf
 
-  # The eBPF probe crate is excluded from the workspace and gets its own job
-  # once it contains code (bpf-linker toolchain, Linux only).
+  # Linux with the eBPF probes embedded, the configuration we actually ship.
+  # The `test` runner has no bpf-linker, so there build.rs skips the probes: the
+  # eBPF crate itself never compiles, and clippy only sees the probe-less variant
+  # of sensor-linux (#448: code that was dead only in that variant). This job
+  # installs the same toolchain as lab/provisioning/linux-toolchain.sh (nightly +
+  # rust-src for aya-build, prebuilt bpf-linker at the same pin) and fails if the
+  # probes did not get embedded. No `cargo test` here: loading them needs a
+  # privileged kernel, which is what the lab VMs are for.
+  linux-ebpf:
+    runs-on: ubuntu-latest
+    env:
+      # Keep both in sync with lab/provisioning/linux-toolchain.sh. The hash is the
+      # x86_64 musl tarball's: a replaced release asset must fail here, not run.
+      BPF_LINKER_VERSION: v0.11.1
+      BPF_LINKER_SHA256: e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: nightly + rust-src (aya-build compiles the probes with it)
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+      - name: bpf-linker (prebuilt, musl-static, bundled LLVM, SHA-256 pinned)
+        run: |
+          curl -fsSL --retry 3 --retry-all-errors -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
+            "https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          echo "${BPF_LINKER_SHA256}  $RUNNER_TEMP/bpf-linker.tar.zst" | sha256sum -c -
+          tar --zstd -xf "$RUNNER_TEMP/bpf-linker.tar.zst" -C "$RUNNER_TEMP"
+          install -m755 "$(find "$RUNNER_TEMP" -type f -name bpf-linker -print -quit)" "$HOME/.cargo/bin/bpf-linker"
+          bpf-linker --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Never share a cache with the probe-less `test` job: a restored build
+          # script output from there would skip the probes (see the stale-build
+          # note in lab/provisioning/linux-toolchain.sh).
+          key: ebpf-embedded
+      - name: clippy (embedded probes)
+        run: cargo clippy -p sensor-linux -p sensor-linux-uprobes -p agent --all-targets -- -D warnings
+      - name: probes are embedded
+        run: |
+          for crate in sensor-linux sensor-linux-uprobes; do
+            obj=$(find target/debug/build -regextype posix-extended \
+              -regex ".*/build/${crate}-[0-9a-f]{16}/out/sensor-linux-ebpf" -type f -print -quit)
+            if [ -z "$obj" ]; then
+              echo "::error::${crate} was built WITHOUT embedded eBPF probes"
+              exit 1
+            fi
+            ls -la "$obj"
+          done
