@@ -117,10 +117,13 @@
 //! - **Task Scheduler Operational — task registered**
 //!   (`Microsoft-Windows-TaskScheduler/Operational` channel, event **106**):
 //!   the always-on complement to Security 4698. Emitted whenever any scheduled
-//!   task is registered on this host; reuses
-//!   `schema::FLAG_PERSISTENCE_TASK_ARTIFACT`, so a task registration seen on
-//!   *both* channels is a rules-layer deduplication concern, not a sensor-layer
-//!   one.
+//!   task is registered on this host. The event carries no task XML, so the
+//!   sensor reads the actions back from the task's definition file under
+//!   `%SystemRoot%\System32\Tasks` and reports the same shape as a 4698
+//!   (`schema::FLAG_PERSISTENCE_TASK_ARTIFACT`, action-unknown placeholder when
+//!   the file is gone or unreadable). A registration seen on *both* channels is
+//!   reported once by the rules layer (`rules::RuleState`, #422); both raw
+//!   events are kept.
 //!
 //! ## Transport: polling (default) vs. `EvtSubscribe` (#322)
 //!

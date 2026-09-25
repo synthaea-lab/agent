@@ -5,8 +5,8 @@
 use std::{collections::HashMap, net::IpAddr};
 
 use schema::{
-    AuthEvent, AuthOutcome, ConnectEvent, ExecEvent, FileOpenEvent, FileQuarantineEvent,
-    ListenPortEvent, NetworkFlowEvent, User,
+    AuthEvent, AuthOutcome, ConnectEvent, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
+    FileOpenEvent, FileQuarantineEvent, ListenPortEvent, NetworkFlowEvent, User,
 };
 use store::BoundedMap;
 
@@ -17,7 +17,8 @@ use crate::{
         BEACON_WINDOW_NS, BROWSERS, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS,
         LOLBIN_LEGIT_PARENTS, LOLBINS, QUARANTINE_EXEC_WINDOW_NS, SELF_SPAWN_EXCLUSIONS,
         SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_THRESHOLD, SELF_SPAWN_WINDOW_NS, SHELL_COMMS,
-        STANDARD_PORTS, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, WEB_SERVER_COMMS,
+        STANDARD_PORTS, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN,
+        TASK_REGISTRATION_DEDUP_WINDOW_NS, WEB_SERVER_COMMS,
     },
     has_write_intent,
     sliding::{FlowPortDedup, SlidingCounter},
@@ -36,6 +37,13 @@ struct RecentQuarantine {
     origin_url: Option<String>,
     /// Set by the first exec that alerted: one alert per mark, not per run.
     alerted: bool,
+}
+
+struct ReportedTaskRegistration {
+    timestamp_ns: u64,
+    /// The reported action list, `None` for an unknown-action report (its path
+    /// is only the sensor's placeholder).
+    actions: Option<String>,
 }
 
 /// Sliding history needed by the correlation rules:
@@ -81,6 +89,10 @@ pub struct RuleState {
     /// LRU-bounded like every other counter: a spray across many fabricated
     /// usernames must not grow this without limit.
     auth_failures: BoundedMap<(String, String), SlidingCounter>,
+    /// Task leaf name → last reported T1053.005 registration, so one registration
+    /// seen on both Security 4698 and TaskScheduler/Operational 106 alerts once
+    /// (#422). LRU-bounded like the counters.
+    task_registrations: BoundedMap<String, ReportedTaskRegistration>,
     /// The agent's own pid, for [`Self::check_self_spawn`]'s narrow exclusion of
     /// its own known children (issue #403). `None` until [`Self::seed_own_pid`] is
     /// called — `sensor-*` crates stay `schema`-only (`tools/check-deps.py`), so
@@ -118,6 +130,7 @@ impl RuleState {
             beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
             auth_failures: BoundedMap::new(COUNTER_CAP),
+            task_registrations: BoundedMap::new(COUNTER_CAP),
             own_pid: None,
             ld_trust_extra: Vec::new(),
         }
@@ -687,10 +700,53 @@ impl RuleState {
         );
     }
 
-    /// To be called for every `FileOpenEvent` in the stream. Does not produce alerts
-    /// directly — updates the history of downloader writes, consumed by
-    /// `check_download_then_exec`.
-    pub fn on_file_open(&mut self, event: &FileOpenEvent) {
+    /// To be called for every `FileOpenEvent` in the stream. Reports T1053.005
+    /// scheduled-task creation (deduplicated, see
+    /// [`Self::check_task_registration`]) and updates the history of downloader
+    /// writes, consumed by `check_download_then_exec`.
+    pub fn on_file_open(&mut self, event: &FileOpenEvent) -> Vec<Alert> {
+        let alerts = self.check_task_registration(event).into_iter().collect();
+        self.record_downloader_write(event);
+        alerts
+    }
+
+    /// T1053.005 creation (`check_scheduled_task_persistence`), reported once per
+    /// registration. With both channels up, one `schtasks /Create` yields a 4698 and
+    /// a 106 for the same task, in either order a few seconds apart; the sensor
+    /// reads the 106's actions back from the task file, so the two usually match.
+    ///
+    /// A registration of an already-reported task inside
+    /// [`TASK_REGISTRATION_DEDUP_WINDOW_NS`] is suppressed only when it adds
+    /// nothing: an unknown-action report, or the same action list. A different
+    /// action list alerts (a re-registration with a new payload), and so does a
+    /// known action list after an unknown-action report, so the first-arriving
+    /// 106 whose task file was unreadable never hides the 4698's actions.
+    fn check_task_registration(&mut self, event: &FileOpenEvent) -> Option<Alert> {
+        let alert = crate::stateless::check_scheduled_task_persistence(event)?;
+        let actions =
+            (event.flags & FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN == 0).then(|| event.path.clone());
+        let now = event.meta.timestamp_ns;
+        let duplicate = self
+            .task_registrations
+            .peek(&event.meta.comm)
+            .is_some_and(|previous| {
+                previous.timestamp_ns.abs_diff(now) <= TASK_REGISTRATION_DEDUP_WINDOW_NS
+                    && (actions.is_none() || actions == previous.actions)
+            });
+        if duplicate {
+            return None;
+        }
+        self.task_registrations.insert(
+            event.meta.comm.clone(),
+            ReportedTaskRegistration {
+                timestamp_ns: now,
+                actions,
+            },
+        );
+        Some(alert)
+    }
+
+    fn record_downloader_write(&mut self, event: &FileOpenEvent) {
         let comm = event.meta.comm.as_str();
         if !DOWNLOADER_COMMS.contains(&comm) || !has_write_intent(event.flags) {
             return;

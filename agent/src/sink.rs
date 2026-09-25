@@ -323,10 +323,13 @@ impl DetectionSink {
     /// `FileOpen` events: stateless rules, downloader-write history, and the
     /// budgeted YARA queue on write intent (off the event path).
     fn detect_file_open(&self, event: &schema::FileOpenEvent) {
-        for alert in rules::evaluate_file_open(event) {
+        let state_alerts = self.rule_state.lock().unwrap().on_file_open(event);
+        for alert in rules::evaluate_file_open(event)
+            .into_iter()
+            .chain(state_alerts)
+        {
             self.emit(alert.technique, &alert.message);
         }
-        self.rule_state.lock().unwrap().on_file_open(event);
         if let Some(yara) = &self.yara
             && event.flags & 0o103 != 0
         {
@@ -599,7 +602,9 @@ impl EventSink for BaselineSink {
             }
             // File events feed the stateful rules' history (download tracking) so
             // exclusion decisions stay accurate; connects are irrelevant here.
-            Event::FileOpen(e) => self.rule_state.lock().unwrap().on_file_open(e),
+            Event::FileOpen(e) => {
+                self.rule_state.lock().unwrap().on_file_open(e);
+            }
             _ => {}
         }
     }

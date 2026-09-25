@@ -92,6 +92,15 @@ fn file_open_event_containerized(path: &str, container_id: &str) -> FileOpenEven
     event
 }
 
+/// Every alert the agent would raise for one `FileOpenEvent` on a fresh state:
+/// the stateless dispatcher plus `RuleState::on_file_open`, as `agent`'s sink
+/// routes it.
+fn all_file_open_alerts(event: &FileOpenEvent) -> Vec<crate::Alert> {
+    let mut alerts = crate::evaluate_file_open(event);
+    alerts.extend(RuleState::new().on_file_open(event));
+    alerts
+}
+
 /// A `FileOpenEvent` shaped like what `sensor-windows-eventlog` pushes on a
 /// Security event 4698 (scheduled task creation): the `flags` field carries the
 /// `FLAG_PERSISTENCE_TASK_ARTIFACT` bit, `path` is the task's action path, and

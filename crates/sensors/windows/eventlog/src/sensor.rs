@@ -6,6 +6,9 @@
 //! normalization.
 
 use std::{
+    fs::File,
+    io::Read,
+    path::Path,
     process::Command,
     sync::{
         Arc,
@@ -631,24 +634,60 @@ static APPLOCKER_BLOCKS: PollTarget = PollTarget {
 // default** on all supported Windows SKUs (Task Scheduler being a core service)
 // — no `auditpol` interaction, complementing the Security 4698 path whose
 // `enable_scheduled_task_audit` may fail on a hardened host. When both channels
-// are up, they double-fire on the same event: the deduplication happens at the
-// rules layer (schema flag differentiation), not here.
+// are up, one registration yields a 4698 and a 106 carrying the same task and
+// actions: both raw events are kept, and the rules layer reports the pair once
+// (`RuleState`'s scheduled-task registration dedup, #422).
 
-/// A 106 without a `TaskName` is unusable — the alert quotes it as
-/// `comm`/`path`. Skip, advancing the cursor.
+/// Same shape as a 4698 once the actions are known: a 106 carries no task XML,
+/// so the definition is read back from the task's file and the result goes
+/// through [`normalize_task`], placeholder and all. The first cut reported the
+/// task *name* as the action path, and the rule printed it as an executable
+/// (#422). A task already deleted by the time of the read, or one the sensor
+/// may not read, is reported as action-unknown rather than dropped.
 fn normalize_task_scheduler_op_registered(block: &str) -> ParsedBlock {
+    let tasks_dir =
+        std::env::var_os("SystemRoot").map(|root| Path::new(&root).join("System32").join("Tasks"));
+    normalize_task_registered_from(block, tasks_dir.as_deref())
+}
+
+/// [`normalize_task_scheduler_op_registered`] with the Tasks directory passed
+/// in, so tests can point it at a temporary tree.
+fn normalize_task_registered_from(block: &str, tasks_dir: Option<&Path>) -> ParsedBlock {
     let ev = xml::parse_task_scheduler_op_registered_block(block)?;
-    let record_id = ev.record_id;
-    if ev.task_name.is_empty() {
-        return Some((record_id, None));
+    let task_content = tasks_dir
+        .and_then(|dir| read_task_definition(dir, &ev.task_name))
+        .unwrap_or_default();
+    Some(normalize_task(
+        xml::ScheduledTaskEvent {
+            record_id: ev.record_id,
+            task_name: ev.task_name,
+            task_content,
+            pid: ev.pid,
+        },
+        FLAG_PERSISTENCE_TASK_ARTIFACT,
+    ))
+}
+
+/// Task `task_name`'s definition, read from `tasks_dir`
+/// (`%SystemRoot%\System32\Tasks`, readable by SYSTEM and Administrators only,
+/// as the agent runs). `None` when the name does not map to a safe path, the
+/// file is gone or unreadable, or it exceeds [`xml::MAX_TASK_DEFINITION_BYTES`].
+fn read_task_definition(tasks_dir: &Path, task_name: &str) -> Option<String> {
+    let path = tasks_dir.join(xml::task_definition_relative_path(task_name)?);
+    let mut bytes = Vec::new();
+    let read = File::open(&path).and_then(|file| {
+        file.take(xml::MAX_TASK_DEFINITION_BYTES + 1)
+            .read_to_end(&mut bytes)
+    });
+    if let Err(error) = read {
+        tracing::debug!(%error, path = %path.display(), "task definition read-back failed");
+        return None;
     }
-    // Operational 106 carries no serialized task XML (unlike 4698), so no
-    // action path is available — the task name is the only artifact. Feed it
-    // as both `comm` (leaf) and `path` (full path form Task Scheduler uses,
-    // `\Folder\TaskName`) to keep the FileOpenEvent shape well-formed.
-    let comm = xml::task_leaf_name(&ev.task_name);
-    let event = persistence_file_open(ev.pid, comm, ev.task_name, FLAG_PERSISTENCE_TASK_ARTIFACT);
-    Some((record_id, Some(event)))
+    if bytes.len() as u64 > xml::MAX_TASK_DEFINITION_BYTES {
+        tracing::debug!(path = %path.display(), "task definition over the size cap, not parsed");
+        return None;
+    }
+    Some(xml::decode_task_definition(&bytes))
 }
 
 static TASK_SCHEDULER_OP: PollTarget = PollTarget {
@@ -1261,6 +1300,77 @@ mod scheduled_task_tests {
             event.flags,
             FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT | schema::FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN
         );
+    }
+
+    /// Minimal TaskScheduler/Operational 106 block for task `task_name`.
+    fn block_106(task_name: &str) -> String {
+        format!(
+            "<Event><System><EventID>106</EventID><EventRecordID>44</EventRecordID><Execution ProcessID='2124' ThreadID='1'/></System><EventData><Data Name='TaskName'>{task_name}</Data><Data Name='UserContext'>LAB\\victim</Data></EventData></Event>"
+        )
+    }
+
+    /// Writes `content` as Task Scheduler does: UTF-16LE with a BOM.
+    fn write_task_file(path: &Path, content: &str) {
+        std::fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(content.encode_utf16().flat_map(u16::to_le_bytes));
+        std::fs::write(path, bytes).expect("write task file");
+    }
+
+    #[test]
+    fn task_registration_106_reports_the_actions_read_back_from_the_task_file() {
+        let tasks = tempfile::tempdir().expect("tempdir");
+        write_task_file(
+            &tasks.path().join("Folder").join("EvilTask"),
+            r"<Task><Actions><Exec><Command>C:\Users\Public\evil.exe</Command><Arguments>-q</Arguments></Exec></Actions></Task>",
+        );
+        let block = block_106(r"\Folder\EvilTask");
+        let Some((44, Some(Event::FileOpen(event)))) =
+            normalize_task_registered_from(&block, Some(tasks.path()))
+        else {
+            panic!("expected a FileOpen event");
+        };
+        assert_eq!(event.path, r"C:\Users\Public\evil.exe -q");
+        assert_eq!(event.flags, FLAG_PERSISTENCE_TASK_ARTIFACT);
+        assert_eq!(event.meta.comm, "EvilTask");
+    }
+
+    #[test]
+    fn task_registration_106_never_reports_the_task_name_as_an_action_path() {
+        // Regression (#422): with no readable definition (task already deleted,
+        // or an unsafe name) the path was the task name, printed as an executable.
+        let tasks = tempfile::tempdir().expect("tempdir");
+        for name in [r"\GoneTask", r"\..\outside"] {
+            let block = block_106(name);
+            let Some((44, Some(Event::FileOpen(event)))) =
+                normalize_task_registered_from(&block, Some(tasks.path()))
+            else {
+                panic!("a 106 must be reported, not dropped: {name}");
+            };
+            assert_eq!(event.path, xml::TASK_ACTION_UNKNOWN, "{name}");
+            assert_eq!(
+                event.flags,
+                FLAG_PERSISTENCE_TASK_ARTIFACT | schema::FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN
+            );
+        }
+    }
+
+    #[test]
+    fn task_registration_106_over_the_size_cap_is_not_parsed() {
+        let tasks = tempfile::tempdir().expect("tempdir");
+        let padding = " ".repeat(usize::try_from(xml::MAX_TASK_DEFINITION_BYTES).unwrap());
+        write_task_file(
+            &tasks.path().join("Huge"),
+            &format!(
+                "<Task><Actions><Exec><Command>a.exe</Command></Exec></Actions>{padding}</Task>"
+            ),
+        );
+        let Some((44, Some(Event::FileOpen(event)))) =
+            normalize_task_registered_from(&block_106(r"\Huge"), Some(tasks.path()))
+        else {
+            panic!("expected a FileOpen event");
+        };
+        assert_eq!(event.path, xml::TASK_ACTION_UNKNOWN);
     }
 }
 

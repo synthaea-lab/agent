@@ -421,13 +421,15 @@ pub(crate) fn check_btm_launch_item_persistence(event: &FileOpenEvent) -> Option
     })
 }
 
-/// Evaluates all stateless rules applicable to a `FileOpenEvent`.
+/// Evaluates all stateless rules applicable to a `FileOpenEvent`. T1053.005
+/// creation ([`check_scheduled_task_persistence`]) is not among them: one
+/// registration arrives twice (4698 and 106), so `RuleState::on_file_open`
+/// reports it, deduplicated (#422).
 #[must_use]
 pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
     check_persistence_write(event)
         .into_iter()
         .chain(check_proc_root_escape(event))
-        .chain(check_scheduled_task_persistence(event))
         .chain(check_scheduled_task_update_persistence(event))
         .chain(check_service_install_persistence(event))
         .chain(check_account_creation_persistence(event))

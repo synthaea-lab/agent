@@ -343,6 +343,137 @@ fn scheduled_task_with_unknown_action_still_alerts() {
     assert!(alert.message.contains("<action unknown>"));
 }
 
+// ── One registration on two channels: 4698 + 106 (#422) ──
+
+const SECOND_NS: u64 = 1_000_000_000;
+
+/// A task registration as either channel reports it, at `seconds` into the run.
+/// `None` actions = the sensor could not read them (placeholder + unknown bit).
+fn task_registration(task: &str, actions: Option<&str>, seconds: u64) -> FileOpenEvent {
+    let mut event = file_open_event_scheduled_task(task, actions.unwrap_or("<action unknown>"));
+    if actions.is_none() {
+        event.flags |= schema::FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN;
+    }
+    event.meta.timestamp_ns = 1_000 * SECOND_NS + seconds * SECOND_NS;
+    event
+}
+
+#[test]
+fn task_registration_seen_on_both_channels_alerts_once() {
+    // Regression (#422): one `schtasks /Create` raised two T1053.005 alerts.
+    let mut state = RuleState::new();
+    let notepad = Some(r"C:\Windows\System32\notepad.exe");
+    assert_eq!(
+        state
+            .on_file_open(&task_registration("Demo", notepad, 0))
+            .len(),
+        1
+    );
+    assert!(
+        state
+            .on_file_open(&task_registration("Demo", notepad, 3))
+            .is_empty()
+    );
+}
+
+#[test]
+fn task_registration_dedup_holds_whichever_channel_arrives_first() {
+    // The two poll threads race: the 106 can be normalized before the 4698.
+    let mut state = RuleState::new();
+    let notepad = Some(r"C:\Windows\System32\notepad.exe");
+    assert_eq!(
+        state
+            .on_file_open(&task_registration("Demo", notepad, 5))
+            .len(),
+        1
+    );
+    assert!(
+        state
+            .on_file_open(&task_registration("Demo", notepad, 2))
+            .is_empty()
+    );
+}
+
+#[test]
+fn unknown_action_registration_after_a_known_one_is_suppressed() {
+    let mut state = RuleState::new();
+    let notepad = Some(r"C:\Windows\System32\notepad.exe");
+    assert_eq!(
+        state
+            .on_file_open(&task_registration("Demo", notepad, 0))
+            .len(),
+        1
+    );
+    assert!(
+        state
+            .on_file_open(&task_registration("Demo", None, 2))
+            .is_empty()
+    );
+}
+
+#[test]
+fn known_actions_after_an_unknown_action_report_still_alert() {
+    // A 106 whose task file was unreadable must not hide the 4698's actions.
+    let mut state = RuleState::new();
+    assert_eq!(
+        state
+            .on_file_open(&task_registration("Demo", None, 0))
+            .len(),
+        1
+    );
+    let alerts = state.on_file_open(&task_registration("Demo", Some(r"C:\evil.exe"), 2));
+    assert_eq!(alerts.len(), 1);
+    assert!(alerts[0].message.contains(r"C:\evil.exe"));
+}
+
+#[test]
+fn re_registration_with_a_different_action_alerts() {
+    let mut state = RuleState::new();
+    assert_eq!(
+        state
+            .on_file_open(&task_registration("Demo", Some("a.exe"), 0))
+            .len(),
+        1
+    );
+    assert_eq!(
+        state
+            .on_file_open(&task_registration("Demo", Some("b.exe"), 5))
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn same_registration_outside_the_window_alerts_again() {
+    let mut state = RuleState::new();
+    let window_s = crate::exclusions::TASK_REGISTRATION_DEDUP_WINDOW_NS / SECOND_NS;
+    assert_eq!(
+        state
+            .on_file_open(&task_registration("Demo", Some("a.exe"), 0))
+            .len(),
+        1
+    );
+    let later = task_registration("Demo", Some("a.exe"), window_s + 1);
+    assert_eq!(state.on_file_open(&later).len(), 1);
+}
+
+#[test]
+fn registrations_of_different_tasks_are_not_deduplicated() {
+    let mut state = RuleState::new();
+    assert_eq!(
+        state
+            .on_file_open(&task_registration("A", Some("x.exe"), 0))
+            .len(),
+        1
+    );
+    assert_eq!(
+        state
+            .on_file_open(&task_registration("B", Some("x.exe"), 1))
+            .len(),
+        1
+    );
+}
+
 // ── Scheduled task update (T1053.005 task-hijack, event 4702) ──
 
 #[test]
@@ -426,7 +557,7 @@ fn task_update_artifact_fires_only_the_task_update_rule() {
     assert!(check_account_creation_persistence(&event).is_none());
     assert!(check_systemd_service_persistence(&event).is_none());
     assert!(check_btm_launch_item_persistence(&event).is_none());
-    let alerts = crate::evaluate_file_open(&event);
+    let alerts = all_file_open_alerts(&event);
     assert_eq!(alerts.len(), 1, "unexpected alerts: {alerts:?}");
     assert_eq!(alerts[0].technique, "T1053.005");
 }
@@ -439,7 +570,7 @@ fn task_creation_with_unknown_action_does_not_fire_the_task_update_rule() {
     let mut event = file_open_event_scheduled_task("HiddenTask", "<action unknown>");
     event.flags |= schema::FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN;
     assert!(check_scheduled_task_update_persistence(&event).is_none());
-    let alerts = crate::evaluate_file_open(&event);
+    let alerts = all_file_open_alerts(&event);
     assert_eq!(alerts.len(), 1, "unexpected alerts: {alerts:?}");
     assert!(alerts[0].message.contains("persistence created"));
 }

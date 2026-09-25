@@ -590,6 +590,48 @@ pub struct TaskSchedulerOpRegisteredEvent {
     pub user_context: String,
 }
 
+/// Largest task definition file [`decode_task_definition`] is fed: a real one is
+/// a few KiB, and the file is attacker-writable content, so the read is capped.
+pub const MAX_TASK_DEFINITION_BYTES: u64 = 256 * 1024;
+
+/// Path of task `task_name`'s definition file, relative to
+/// `%SystemRoot%\System32\Tasks` (Task Scheduler stores one file per task,
+/// mirroring the task tree: `\Folder\Name` → `Folder\Name`). An event 106
+/// carries no action, so the sensor reads the actions back from this file.
+///
+/// `None` unless `task_name` is rooted (`\…`) and every component is a plain
+/// file name: the name comes from the event log, and must not be able to walk
+/// the read out of the Tasks directory (`..`, a drive or stream `:`, an empty
+/// component from `\\`), nor rely on Win32 stripping trailing dots and spaces.
+#[must_use]
+pub fn task_definition_relative_path(task_name: &str) -> Option<String> {
+    let components: Vec<&str> = task_name.strip_prefix('\\')?.split('\\').collect();
+    let plain = |c: &&str| {
+        !c.is_empty()
+            && !c.ends_with(['.', ' '])
+            && !c.chars().any(|ch| {
+                ch.is_control() || matches!(ch, '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            })
+    };
+    components.iter().all(plain).then(|| components.join("\\"))
+}
+
+/// Text of a task definition file: UTF-16LE with a BOM as Task Scheduler writes
+/// them, UTF-8 (BOM optional) otherwise. Lossy — the result only feeds
+/// [`task_actions_display`], which tolerates any input.
+#[must_use]
+pub fn decode_task_definition(bytes: &[u8]) -> String {
+    if let Some(utf16) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        let units: Vec<u16> = utf16
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    let utf8 = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    String::from_utf8_lossy(utf8).into_owned()
+}
+
 /// Parses one 106 `<Event>` block. `None` if the block is missing
 /// `EventRecordID` (same convention as the other parsers).
 #[must_use]
@@ -1143,5 +1185,65 @@ mod tests {
     fn task_scheduler_op_106_missing_record_id_does_not_parse() {
         let block = "<Event><EventData><Data Name='TaskName'>x</Data></EventData></Event>";
         assert!(parse_task_scheduler_op_registered_block(block).is_none());
+    }
+
+    // ── Task definition read-back for event 106 (#422) ───────────────────
+
+    #[test]
+    fn task_definition_path_mirrors_the_task_tree() {
+        assert_eq!(
+            task_definition_relative_path(r"\atomic-r").as_deref(),
+            Some("atomic-r")
+        );
+        assert_eq!(
+            task_definition_relative_path(r"\Microsoft\Windows\Backup\Daily task").as_deref(),
+            Some(r"Microsoft\Windows\Backup\Daily task")
+        );
+    }
+
+    #[test]
+    fn task_definition_path_refuses_to_leave_the_tasks_directory() {
+        for name in [
+            r"\..\..\Windows\win.ini",
+            r"\Folder\..",
+            r"\.",
+            r"\x...",
+            r"\trailing ",
+            r"\\server\share",
+            r"\C:\x",
+            r"\x:stream",
+            r"\a/b",
+            "relative",
+            "",
+            r"\",
+            "\\bad\u{0}name",
+        ] {
+            assert_eq!(task_definition_relative_path(name), None, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn task_definition_decodes_utf16le_with_bom() {
+        let text = "<Task><Actions><Exec><Command>C:\\x.exe</Command></Exec></Actions></Task>";
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+        assert_eq!(decode_task_definition(&bytes), text);
+        assert_eq!(
+            task_actions_display(&decode_task_definition(&bytes)).as_deref(),
+            Some(r"C:\x.exe")
+        );
+    }
+
+    #[test]
+    fn task_definition_decodes_utf8_with_or_without_bom() {
+        assert_eq!(decode_task_definition(b"\xEF\xBB\xBF<Task/>"), "<Task/>");
+        assert_eq!(decode_task_definition(b"<Task/>"), "<Task/>");
+    }
+
+    #[test]
+    fn task_definition_decoding_never_panics_on_odd_input() {
+        for bytes in [&[][..], &[0xFF, 0xFE, 0x41][..], &[0xFF][..], &[0xC3][..]] {
+            let _ = decode_task_definition(bytes);
+        }
     }
 }
