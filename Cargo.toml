@@ -134,7 +134,7 @@ serde_json = "1"
 # TOML parser used by `crates/config` (ADR-0013: TOML for on-disk agent
 # config, strict types, no silent coercion). Also usable by any future
 # crate that reads a TOML-shaped input.
-toml = "0.8"
+toml = "1.1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
