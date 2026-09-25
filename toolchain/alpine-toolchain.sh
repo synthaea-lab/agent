@@ -50,7 +50,15 @@ if ! command -v "$HOME/.cargo/bin/cargo" >/dev/null 2>&1; then
 fi
 # shellcheck disable=SC1091
 source "$HOME/.cargo/env"
-rustup toolchain install nightly --component rust-src
+# The probe toolchain is pinned in ebpf-toolchain.txt at the repo root (the one
+# source for build.rs, CI and these scripts); fall back to plain nightly only
+# when the tree isn't mounted, with a warning.
+_ebpf_tc=$(tr -d '[:space:]' 2>/dev/null < "${SYNTHAEA_SRC:-/synthaea}/ebpf-toolchain.txt" || true)
+if [ -z "${_ebpf_tc:-}" ]; then
+  echo "[warn] ${SYNTHAEA_SRC:-/synthaea}/ebpf-toolchain.txt not found — installing plain nightly; build.rs will ask for the pinned one" >&2
+  _ebpf_tc=nightly
+fi
+rustup toolchain install "$_ebpf_tc" --component rust-src
 
 # Pre-install the exact channel rust-toolchain.toml pins, with its components,
 # so the first `cargo` inside the tree doesn't download a toolchain mid-build.

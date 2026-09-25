@@ -70,8 +70,9 @@ jobs:
   # The `test` runner has no bpf-linker, so there build.rs skips the probes: the
   # eBPF crate itself never compiles, and clippy only sees the probe-less variant
   # of sensor-linux (#448: code that was dead only in that variant). This job
-  # installs the same toolchain as lab/provisioning/linux-toolchain.sh (nightly +
-  # rust-src for aya-build, prebuilt bpf-linker at the same pin) and fails if the
+  # installs the same toolchain as lab/provisioning/linux-toolchain.sh (the nightly
+  # pinned in ebpf-toolchain.txt + rust-src for aya-build, prebuilt bpf-linker at
+  # the same pin) and fails if the
   # probes did not get embedded. No `cargo test` here: loading them needs a
   # privileged kernel, which is what the lab VMs are for.
   linux-ebpf:
@@ -86,8 +87,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: nightly + rust-src (aya-build compiles the probes with it)
-        run: rustup toolchain install nightly --profile minimal --component rust-src
+      - name: pinned nightly + rust-src (aya-build compiles the probes with it)
+        run: rustup toolchain install "$(tr -d '[:space:]' < ebpf-toolchain.txt)" --profile minimal --component rust-src
       - name: bpf-linker (prebuilt, musl-static, bundled LLVM, SHA-256 pinned)
         run: |
           curl -fsSL --retry 3 --retry-all-errors -o "$RUNNER_TEMP/bpf-linker.tar.zst" \

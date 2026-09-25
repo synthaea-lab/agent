@@ -72,7 +72,15 @@ if ! command -v "$HOME/.cargo/bin/cargo" >/dev/null 2>&1; then
 fi
 # shellcheck disable=SC1091
 source "$HOME/.cargo/env"
-rustup toolchain install nightly --component rust-src
+# The probe toolchain is pinned in ebpf-toolchain.txt at the repo root (the one
+# source for build.rs, CI and these scripts); fall back to plain nightly only
+# when the tree isn't mounted, with a warning.
+_ebpf_tc=$(tr -d '[:space:]' 2>/dev/null < "${SYNTHAEA_SRC:-/synthaea}/ebpf-toolchain.txt" || true)
+if [ -z "${_ebpf_tc:-}" ]; then
+  echo "[warn] ${SYNTHAEA_SRC:-/synthaea}/ebpf-toolchain.txt not found — installing plain nightly; build.rs will ask for the pinned one" >&2
+  _ebpf_tc=nightly
+fi
+rustup toolchain install "$_ebpf_tc" --component rust-src
 
 # Pre-install the exact channel rust-toolchain.toml pins, with its components, so
 # the first `cargo` inside the tree doesn't download a toolchain mid-build — a
@@ -148,9 +156,9 @@ command -v bpf-linker >/dev/null 2>&1 && bpf-linker --version
 
 # Sanity: the prebuilt tracks a recent nightly; warn (don't fail) if the pinned
 # nightly's LLVM major looks far ahead of what v0.11.x was cut against.
-_nightly_llvm=$(rustup run nightly rustc -Vv 2>/dev/null | awk '/^LLVM version/{print $3}' | cut -d. -f1)
+_nightly_llvm=$(rustup run "$_ebpf_tc" rustc -Vv 2>/dev/null | awk '/^LLVM version/{print $3}' | cut -d. -f1)
 if [ -n "${_nightly_llvm:-}" ] && [ "$_nightly_llvm" -gt 24 ]; then
-  echo "[warn] nightly rustc uses LLVM $_nightly_llvm — bump BPF_LINKER_VERSION if probe builds hit bitcode-version errors" >&2
+  echo "[warn] $_ebpf_tc rustc uses LLVM $_nightly_llvm — bump BPF_LINKER_VERSION if probe builds hit bitcode-version errors" >&2
 fi
 
 echo "== bindgen-cli + aya-tool =="
