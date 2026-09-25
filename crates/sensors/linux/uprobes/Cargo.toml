@@ -17,7 +17,7 @@ tracing = { workspace = true }
 sensor-linux-wire = { path = "../wire", features = ["user"] }
 aya = { version = "0.14", default-features = false }
 aya-log = { version = "0.3", default-features = false }
-goblin = { version = "0.9", default-features = false, features = ["elf64", "elf32", "endian_fd", "std"] }
+goblin = { version = "0.10", default-features = false, features = ["elf64", "elf32", "endian_fd", "std"] }
 thiserror = "2.0"
 tokio = { version = "1", default-features = false, features = ["sync", "signal", "macros", "rt", "net", "time", "io-util"] }
 libc = "0.2"
