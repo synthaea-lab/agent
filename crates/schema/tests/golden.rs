@@ -1042,6 +1042,7 @@ fn policy_denial_golden() {
     // reading a file labeled for a user's home directory, the classic
     // web-shell-reading-secrets shape. `action` is absent: the AVC parser
     // doesn't yet recover the requested permission set, see the type's doc.
+    // v30 (#427): `object_path` from the AVC record's `path=`/`name=`.
     assert_golden(
         &Event::PolicyDenial(PolicyDenialEvent {
             meta: EventMeta {
@@ -1058,6 +1059,7 @@ fn policy_denial_golden() {
             object_class: Some("file".into()),
             action: None,
             enforced: true,
+            object_path: Some("/home/alice/.ssh/id_rsa".into()),
         }),
         "policy_denial",
     );
@@ -1597,6 +1599,7 @@ fn meta_accessor_covers_all_variants() {
             object_class: None,
             action: None,
             enforced: false,
+            object_path: None,
         }),
         Event::KernelModule(KernelModuleEvent {
             meta: meta.clone(),

@@ -176,7 +176,12 @@ pub mod time;
 /// 2^32 still serializes identically. 28 is claimed by #469 (ATT&CK technique
 /// ids) while both branches are open; whichever merges second renumbers —
 /// same coordination note as v13 and ADR-0005.
-pub const SCHEMA_VERSION: u32 = 29;
+///
+/// Bumped 29 → 30 for [`PolicyDenialEvent::object_path`] (#427, Linux half:
+/// filled from the AVC record's `path=`/`name=`; the Windows `AppLocker` half —
+/// switching the 8004 emitter off `FileOpenEvent` and adding the 8003 audit-
+/// mode target — is a separate follow-up, #428 was step 1 only).
+pub const SCHEMA_VERSION: u32 = 30;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -1445,6 +1450,17 @@ pub struct PolicyDenialEvent {
     /// enforcing mode); `false` when it only logged what it would have
     /// blocked (`SELinux` permissive mode) — `!permissive` at the source.
     pub enforced: bool,
+    /// The object's filesystem path, when the mechanism reported one (issue
+    /// #427). On Linux, from the AVC record's `path=` field, or `name=` when
+    /// `path=` is absent — the kernel only has what the syscall's arguments
+    /// gave it, which for `name=` is often a bare filename rather than a full
+    /// path (no `PATH` record correlation here, see
+    /// `AuditEvent::PolicyDenial`'s doc on why this sensor treats AVC as
+    /// supplementary rather than reassembling `type=PATH` siblings for it).
+    /// `None` when neither field is present, e.g. `tclass` values that don't
+    /// name a file (`process`, `capability`, `tcp_socket`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_path: Option<String>,
 }
 
 /// Which of the three kernel-module syscalls produced a [`KernelModuleEvent`].
