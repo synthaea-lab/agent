@@ -73,10 +73,13 @@ pub(crate) struct DetectionSink {
     response: Arc<Mutex<Option<ResponseHooks>>>,
     /// Issue #131: cross-engine verdict fusion, keyed the same way the correlator
     /// keys its own belief state (`(ppid, comm)` — see `verdict::EntityKey`). Every
-    /// rule/Sigma/correlator finding folds in here before it reaches the alert log,
-    /// so the same technique flagged by two engines on one entity is one finding,
-    /// not two, and `maybe_kill` reads a fused severity instead of a bare
-    /// technique-name check. YARA matches are not folded in: the scan queue is
+    /// rule/Sigma/correlator finding folds in here alongside reaching the alert
+    /// log, giving each entity a bounded, composed evidence trail — but the kill
+    /// gate (`correlate`'s `maybe_kill`) deliberately does *not* read this fused,
+    /// sticky state: it stays scoped to the triggering event's own evidence (PR
+    /// #502 review — the entity's composed severity is a max over everything
+    /// ever seen for `(ppid, comm)`, too coarse and too sticky to gate a
+    /// destructive action on). YARA matches are not folded in: the scan queue is
     /// deliberately decoupled from the triggering process (`crates/yara/src/
     /// queue.rs`'s settle delay) and carries no pid/entity context today — wiring
     /// that through is separate follow-up work, not part of this pass.
@@ -107,6 +110,23 @@ fn default_severity(technique: &str) -> schema::detection::Severity {
         schema::detection::Severity::Critical
     } else {
         schema::detection::Severity::Medium
+    }
+}
+
+/// ATT&CK technique ids folded into a [`schema::detection::Detection`] from the
+/// `technique` string this crate already uses as the dedup/alert-log key.
+/// Same convention `tools/attack-coverage.py` uses to build the coverage doc:
+/// a single alert can carry more than one id joined with `/` (a beacon flagged
+/// both C2 and exfiltration, say) — split back out here. `BAYES` (the
+/// correlator's belief-crossing sentinel) and Sigma's untagged `"Sigma"`
+/// fallback (`detect_exec`, when a hit carries no `attack.tXXXX` tag) are not
+/// real ATT&CK ids and fold to an empty list, same as
+/// `tools/attack-coverage.py`'s own `BAYES_SENTINEL` skip.
+fn techniques_from(technique: &str) -> Vec<String> {
+    if technique == "BAYES" || technique == "Sigma" {
+        Vec::new()
+    } else {
+        technique.split('/').map(str::to_string).collect()
     }
 }
 
@@ -240,13 +260,18 @@ impl DetectionSink {
     }
 
     /// Folds one engine's finding into the fused per-entity verdict (issue #131)
-    /// and emits exactly one alert line for it — unless verdict fusion already
-    /// absorbed it as a duplicate of the entity's current live finding (same
-    /// technique, another engine or a repeat, inside `VERDICT_DEDUP_WINDOW_NS`),
-    /// in which case nothing new reaches the alert log. Returns the fused
-    /// verdict whenever one was produced, so a caller that needs to act on the
-    /// entity's overall severity (`correlate`'s kill gate) can read it instead
-    /// of re-deriving significance from the technique string.
+    /// and always writes it to the alert log — `alerts.ndjson` is the audit
+    /// trail (`EVIDENCE_CAP`'s own doc: every finding lands there), and verdict
+    /// fusion's dedup is a separate, deliberately lossy view for live triage
+    /// (bounded evidence, kill-gate severity), not a substitute for it. A
+    /// finding verdict fusion absorbs as a duplicate (same technique, another
+    /// engine or a repeat, inside `VERDICT_DEDUP_WINDOW_NS`) still gets its own
+    /// alert line, it just doesn't produce a new [`verdict::Verdict`] snapshot.
+    /// Returns the fused verdict whenever one was produced, for a caller that
+    /// needs the entity's overall composed state (e.g. its evidence list) —
+    /// **not** for kill-gating: `correlate`'s kill gate reads this event's own
+    /// detection severity instead, deliberately not the entity's sticky
+    /// accumulated one (PR #502 review).
     fn record_and_emit(
         &self,
         entity: &verdict::EntityKey,
@@ -263,6 +288,7 @@ impl DetectionSink {
             source,
             score: None,
             attributions: Vec::new(),
+            techniques: techniques_from(technique),
             events: vec![event.clone()],
         };
         let result =
@@ -270,9 +296,7 @@ impl DetectionSink {
                 .lock()
                 .unwrap()
                 .record(entity.clone(), technique, detection, now_ns);
-        if result.is_some() {
-            self.emit(technique, message);
-        }
+        self.emit(technique, message);
         result
     }
 
@@ -358,10 +382,15 @@ impl DetectionSink {
         drop(engine); // Unlock correlator before alert emission (log I/O).
 
         // Fold co-occurrence rules and Bayesian belief into the entity's fused
-        // verdict (issue #131): `is_high_confidence` now reads the fused severity
-        // instead of a bare `technique == "BAYES"` check, so a future engine that
-        // also raises this entity to `Critical` gates the same kill path — not
-        // just the correlator.
+        // verdict (issue #131) for evidence/severity bookkeeping. The kill gate
+        // itself stays scoped to *this event's own* evidence — `default_severity`
+        // of the alert actually raised here, same as the pre-#131 bare
+        // `technique == "BAYES"` check — not the entity's fused, sticky
+        // severity: that's a max over everything ever seen for `(ppid, comm)`,
+        // so gating kill on it would let one sibling process's Bayes crossing
+        // condemn every later, unrelated sibling that merely shares the same
+        // parent and `comm` (PR #502 review; pinned by
+        // `a_siblings_weak_alert_never_triggers_kill_from_anothers_bayes_crossing`).
         let meta = event.meta();
         let entity = verdict::EntityKey::new(meta.ppid, meta.comm.clone());
         let case_id = format!("{}:{}", entity.ppid, entity.comm);
@@ -370,15 +399,15 @@ impl DetectionSink {
             let source = schema::detection::DetectionSource::Correlator {
                 case_id: case_id.clone(),
             };
-            if let Some(verdict) = self.record_and_emit(
+            self.record_and_emit(
                 &entity,
                 alert.technique,
                 &alert.message,
                 source,
                 event,
                 meta.timestamp_ns,
-            ) && verdict.severity >= schema::detection::Severity::Critical
-            {
+            );
+            if default_severity(alert.technique) >= schema::detection::Severity::Critical {
                 is_high_confidence = true;
             }
         }
@@ -831,12 +860,14 @@ mod tests {
         );
     }
 
-    /// Issue #131: verdict fusion dedups the same technique on the same entity
-    /// (here: same `(ppid, comm)`, and — since both events carry the fixture's
-    /// neutral `timestamp_ns: 0` — the same instant, well inside the dedup
-    /// window) rather than alerting twice for what is one finding.
+    /// Issue #131/PR #502 review point 3: verdict fusion's own dedup (bounded
+    /// evidence, one composed severity per entity — see `crates/verdict`'s own
+    /// tests, e.g. `the_same_technique_from_a_second_engine_within_the_window_is_one_finding`)
+    /// must never mean a finding disappears from `alerts.ndjson` — that file is
+    /// the audit trail, and every finding lands there regardless of whether
+    /// fusion also folded it into the entity's already-live verdict.
     #[test]
-    fn repeated_identical_exec_alerts_fold_into_one_finding() {
+    fn repeated_identical_exec_alerts_each_still_reach_the_alert_log() {
         let dir = tmp("verdict-dedup");
         let sink = sink_in(&dir);
         let ev = exec(
@@ -849,9 +880,9 @@ mod tests {
         let alerts = alerts_in(&dir);
         assert_eq!(
             alerts.matches("T1059.004").count(),
-            1,
-            "the same technique on the same entity, same instant, must fold into \
-             one finding, not two: {alerts}"
+            2,
+            "verdict fusion dedups its own entity state, but alerts.ndjson is \
+             the audit trail — every occurrence must still land there: {alerts}"
         );
     }
 
@@ -978,6 +1009,67 @@ mod tests {
             *killed.lock().unwrap(),
             vec![4244],
             "the injected terminate runs, exactly once"
+        );
+    }
+
+    /// PR #502 review: `maybe_kill`'s gate must read *this event's own*
+    /// evidence, not the entity's fused, sticky severity. `drive_bayes_crossing`'s
+    /// connect events all carry the fixture's neutral, unmodified
+    /// `(ppid, comm)` (`(0, "")`), so a second, unrelated pid's own connect
+    /// lands in the *same* verdict entity as the first pid's Bayes crossing —
+    /// exactly the "sibling process" collision the review found: a plain
+    /// `T1059/T1071` co-occurrence alert (`Medium`) on its own must never
+    /// trigger a kill just because that shared entity was earlier raised to
+    /// `Critical` by someone else's Bayes crossing.
+    #[test]
+    fn a_siblings_weak_alert_never_triggers_kill_from_anothers_bayes_crossing() {
+        let dir = tmp("bayes-sibling");
+        let sink = sink_in(&dir);
+        let killed = Arc::new(Mutex::new(Vec::new()));
+        let killed_rec = Arc::clone(&killed);
+        sink.enable_response(
+            policy::ResponsePolicy {
+                kill_enabled: true,
+                quarantine_enabled: false,
+            },
+            move |pid| {
+                killed_rec.lock().unwrap().push(pid);
+                Ok(())
+            },
+            dir.join("quarantine"),
+        );
+
+        // pid 5001 crosses Bayes — raises the shared `(0, "")` verdict entity
+        // to `Critical` and gets killed, exactly as before.
+        drive_bayes_crossing(&sink, 5001);
+
+        // pid 5002: one exec, one connect 40s later — outside
+        // VERDICT_DEDUP_WINDOW_NS (30s), so this produces a genuine fresh
+        // verdict for the shared entity, not a silently-absorbed duplicate.
+        // Correlator's own window is 60s, so the co-occurrence rule still
+        // fires: a plain, weak `T1059/T1071` finding, nothing Bayesian.
+        sink.on_event(exec(5002, "bash -c true", "/bin/bash"));
+        sink.on_event(Event::Connect(ConnectEvent {
+            meta: EventMeta {
+                pid: 5002,
+                timestamp_ns: 40_000_000_000,
+                ..schema::fixtures::meta()
+            },
+            daddr: std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+            dport: 443,
+        }));
+
+        let alerts = alerts_in(&dir);
+        assert!(
+            alerts.contains("T1059/T1071"),
+            "the sibling's weak co-occurrence finding must still alert: {alerts}"
+        );
+        assert_eq!(
+            *killed.lock().unwrap(),
+            vec![5001],
+            "only the pid that actually crossed Bayes may be killed — the \
+             sibling's own weak finding must not ride the shared entity's \
+             sticky severity to a kill: {alerts}"
         );
     }
 

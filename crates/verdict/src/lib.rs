@@ -49,11 +49,17 @@ impl EntityKey {
     }
 }
 
-/// One technique folded into an entity's verdict, with when it was last seen —
-/// the dedup window is measured from here.
+/// One technique folded into an entity's verdict, with when its current dedup
+/// window started. Measured from the *first* sighting that opened the window,
+/// not the most recent one (PR #502 review): under steady recurring activity
+/// (a webshell spawning a new `sh` for every command, say), refreshing this on
+/// every duplicate would make the window slide forever and the technique would
+/// never produce a fresh verdict — logged once, then silently absorbed for as
+/// long as the activity continues. A fixed window from the first sighting
+/// guarantees a fresh verdict at least once per [`VerdictEngine::dedup_window_ns`].
 struct TechniqueRecord {
     technique: String,
-    last_seen_ns: u64,
+    window_start_ns: u64,
 }
 
 /// Evidence kept per entity is bounded: fusion is a live-triage aid, not the
@@ -185,14 +191,18 @@ impl VerdictEngine {
             .find(|t| t.technique == technique)
         {
             Some(t) => {
-                let dup = now_ns.saturating_sub(t.last_seen_ns) <= self.dedup_window_ns;
-                t.last_seen_ns = now_ns;
+                let dup = now_ns.saturating_sub(t.window_start_ns) <= self.dedup_window_ns;
+                // Only a genuine re-occurrence (outside the window) opens a new
+                // one; a duplicate must not slide the window it's inside of.
+                if !dup {
+                    t.window_start_ns = now_ns;
+                }
                 dup
             }
             None => {
                 state.techniques.push(TechniqueRecord {
                     technique: technique.to_owned(),
-                    last_seen_ns: now_ns,
+                    window_start_ns: now_ns,
                 });
                 false
             }
@@ -298,6 +308,7 @@ mod tests {
             source,
             score,
             attributions: Vec::new(),
+            techniques: Vec::new(),
             events: Vec::new(),
         }
     }
@@ -369,6 +380,60 @@ mod tests {
             )
             .expect("a severity raise must still surface, even within the dedup window");
         assert_eq!(verdict.severity, Severity::Critical);
+    }
+
+    #[test]
+    fn steady_duplicates_do_not_slide_the_dedup_window_forever() {
+        // PR #502 review: measuring the window from the *last* sighting let a
+        // technique recurring more often than the window kept the window open
+        // indefinitely — logged once, then never again for as long as the
+        // activity continued. Duplicates inside the window here must not
+        // extend it; a fresh verdict must still land once the window elapses
+        // from the *first* sighting, even though duplicates kept arriving.
+        let mut engine = VerdictEngine::new(10_000_000_000); // 10s window
+        engine
+            .record(
+                entity(),
+                "T1059.004",
+                detection(Severity::Medium, None, rule("r1")),
+                0,
+            )
+            .unwrap();
+        // Two duplicates, each well inside 10s of the window's start.
+        assert!(
+            engine
+                .record(
+                    entity(),
+                    "T1059.004",
+                    detection(Severity::Medium, None, rule("r1")),
+                    5_000_000_000,
+                )
+                .is_none()
+        );
+        assert!(
+            engine
+                .record(
+                    entity(),
+                    "T1059.004",
+                    detection(Severity::Medium, None, rule("r1")),
+                    9_000_000_000,
+                )
+                .is_none()
+        );
+        // 11s after the *first* sighting (only 2s after the last duplicate) —
+        // with the window measured from the last sighting this would still be
+        // a duplicate; measured from the first, it's a genuine re-occurrence.
+        let verdict = engine.record(
+            entity(),
+            "T1059.004",
+            detection(Severity::Medium, None, rule("r1")),
+            11_000_000_000,
+        );
+        assert!(
+            verdict.is_some(),
+            "the window must expire from the first sighting, not keep sliding \
+             on every duplicate"
+        );
     }
 
     #[test]
