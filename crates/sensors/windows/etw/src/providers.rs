@@ -9,8 +9,8 @@ use std::sync::{Arc, atomic::Ordering};
 use ferrisetw::{EventRecord, parser::Parser, provider::Provider, schema_locator::SchemaLocator};
 use schema::{
     AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, ExecEvent, FileOpenEvent,
-    FileQuarantineEvent, ImageLoadEvent, RegistrySetEvent, ScriptBlockEvent, SmbConnectEvent,
-    UdpSendEvent, WmiActivityEvent, sensor::EventSink,
+    ImageLoadEvent, RegistrySetEvent, ScriptBlockEvent, SmbConnectEvent, UdpSendEvent,
+    WmiActivityEvent, sensor::EventSink,
 };
 
 use crate::{
@@ -265,71 +265,21 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         if path.ends_with(&state.canary_path) {
             return;
         }
-        let quarantine = zone_identifier::stream_host_path(&path)
-            .and_then(|host| quarantine_event(&state, pid, &comm, &path, host, timestamp_ns));
-        sink.on_event(Event::FileOpen(FileOpenEvent {
-            meta: meta(pid, 0, comm, timestamp_ns),
-            path,
-            flags,
-        }));
-        if let Some(event) = quarantine {
-            sink.on_event(event);
+        // #365: a create/write on `host:Zone.Identifier` is the mark-of-the-web
+        // being written. The stream is read back off this thread (#439).
+        let meta = meta(pid, 0, comm, timestamp_ns);
+        if let Some(host) = zone_identifier::stream_host_path(&path) {
+            state.marks.offer(zone_identifier::MarkWrite {
+                stream_path: path.clone(),
+                host: host.to_string(),
+                meta: meta.clone(),
+            });
         }
+        sink.on_event(Event::FileOpen(FileOpenEvent { meta, path, flags }));
     };
     Provider::by_guid(KERNEL_FILE_GUID)
         .add_callback(callback)
         .build()
-}
-
-/// #365: a create/write on `host:Zone.Identifier` is the mark-of-the-web being
-/// written. Reads the stream back (bounded) and builds the `FileQuarantine`
-/// for `host`, once per write (the write produces several records). `None`
-/// for a duplicate record or a stream placing the file in a local, intranet
-/// or trusted zone.
-///
-/// Best-effort, like the macOS sibling: ETW delivers the record after its
-/// buffer flush, so the content is usually complete by now, but a read that
-/// loses the race (empty stream, sharing violation) still reports the mark
-/// alone. `agent` is the writing process — Windows records no downloader
-/// name in the stream, and the writer is exactly that.
-///
-/// Every record is read, dedup included (it compares content): the read is
-/// synchronous on the Kernel-File callback thread. Bounded (8 KiB of a stream
-/// just written, so cache-hot) and download-rate, but a mark on a slow share
-/// stalls the callback — moving the read-back off-thread is #439.
-fn quarantine_event(
-    state: &SharedState,
-    pid: u32,
-    comm: &str,
-    stream_path: &str,
-    host: &str,
-    timestamp_ns: u64,
-) -> Option<Event> {
-    let read = read_stream(stream_path)
-        .map(|bytes| zone_identifier::parse(&bytes))
-        .unwrap_or_default();
-    let zone = state
-        .quarantine_dedup
-        .lock()
-        .unwrap()
-        .admit(host, read, timestamp_ns)?;
-    Some(Event::FileQuarantine(FileQuarantineEvent {
-        meta: meta(pid, 0, comm.to_string(), timestamp_ns),
-        path: host.to_string(),
-        agent: Some(comm.to_string()),
-        origin_url: zone.host_url,
-        referrer_url: zone.referrer_url,
-    }))
-}
-
-fn read_stream(stream_path: &str) -> Option<Vec<u8>> {
-    use std::io::Read as _;
-    let file = std::fs::File::open(stream_path).ok()?;
-    let mut bytes = Vec::new();
-    file.take(zone_identifier::MAX_STREAM_BYTES)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    Some(bytes)
 }
 
 /// DNS resolution events (EID 3008 — `QueryCompleted`).

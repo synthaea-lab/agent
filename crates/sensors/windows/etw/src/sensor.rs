@@ -25,7 +25,7 @@ use crate::{
         process_provider, registry_provider, smb_provider, wmi_provider,
     },
     winapi,
-    zone_identifier::QuarantineDedup,
+    zone_identifier::{self, MarkQueue, QuarantineDedup},
 };
 
 /// Cap for the pid cache. A live host rarely runs more than a few hundred
@@ -41,6 +41,10 @@ const QUARANTINE_DEDUP_WINDOW_NS: u64 = 5_000_000_000;
 /// Distinct files marked within one window — a download burst, not a steady
 /// state; past it a mark is reported without being deduplicated.
 const QUARANTINE_DEDUP_CAP: usize = 1_024;
+/// Marks waiting for the read-back worker (#439). A write yields 2-3 records
+/// and downloads come at human or script rate, so 256 absorbs a burst of ~100
+/// downloads behind one slow read; past it a mark is dropped and counted.
+const MARK_QUEUE_CAPACITY: usize = 256;
 
 /// Stops an orphaned ETW session. Named sessions are kernel objects that outlive
 /// the creating process: after a `taskkill /f` or crash the session stays Running
@@ -127,8 +131,9 @@ pub(crate) struct SharedState {
     pub(crate) volumes: Mutex<HashMap<String, String>>,
     /// F-7: Connect/Send dedup.
     pub(crate) dedup: Mutex<normalize::ConnectDedup>,
-    /// #365: one `FileQuarantine` per `Zone.Identifier` write.
-    pub(crate) quarantine_dedup: Mutex<QuarantineDedup>,
+    /// #365/#439: `Zone.Identifier` writes, queued for the read-back worker
+    /// (which owns the one-`FileQuarantine`-per-write dedup).
+    pub(crate) marks: MarkQueue,
     /// F-2: events observed — the silence watchdog reads this.
     pub(crate) events_seen: AtomicU64,
     /// The liveness canary file: the run loop touches it every heartbeat, which
@@ -172,6 +177,27 @@ impl SharedState {
 
 pub(crate) fn basename(path: &str) -> String {
     path.rsplit('\\').next().unwrap_or(path).to_string()
+}
+
+/// Starts the `Zone.Identifier` read-back worker (#439). It exits by itself
+/// once every [`MarkQueue`] sender is gone, i.e. when the trace's callbacks and
+/// this run's [`SharedState`] are dropped, so it is not joined.
+fn spawn_mark_reader(
+    marks: std::sync::mpsc::Receiver<zone_identifier::MarkWrite>,
+    sink: Arc<dyn EventSink>,
+) -> Result<(), SensorError> {
+    std::thread::Builder::new()
+        .name("zone-identifier-reader".into())
+        .spawn(move || {
+            zone_identifier::run_mark_reader(
+                &marks,
+                zone_identifier::read_stream,
+                QuarantineDedup::new(QUARANTINE_DEDUP_WINDOW_NS, QUARANTINE_DEDUP_CAP),
+                |event| sink.on_event(event),
+            );
+        })
+        .map(drop)
+        .map_err(|e| -> SensorError { format!("Zone.Identifier reader thread: {e}").into() })
 }
 
 pub(crate) fn meta(pid: u32, ppid: u32, comm: String, timestamp_ns: u64) -> EventMeta {
@@ -300,14 +326,13 @@ impl Sensor for WindowsSensor {
 
         let canary_file =
             std::env::temp_dir().join(format!("synthaea-canary-{}", std::process::id()));
+        let (marks, mark_rx) = MarkQueue::bounded(MARK_QUEUE_CAPACITY);
+        spawn_mark_reader(mark_rx, Arc::clone(&sink))?;
         let state = Arc::new(SharedState {
             pids: Mutex::new(PidCache::new(PID_CACHE_CAP)),
             volumes: Mutex::new(winapi::build_volume_map()),
             dedup: Mutex::new(normalize::ConnectDedup::new(60_000_000_000)),
-            quarantine_dedup: Mutex::new(QuarantineDedup::new(
-                QUARANTINE_DEDUP_WINDOW_NS,
-                QUARANTINE_DEDUP_CAP,
-            )),
+            marks,
             events_seen: AtomicU64::new(0),
             canary_path: canary_file
                 .file_name()

@@ -5,8 +5,10 @@
 //!
 //! Platform-independent on purpose: the stream content is attacker-controlled
 //! (anything can write an ADS), so the parser is unit-tested on every CI leg
-//! and has a never-panic suite in `tests/robustness.rs`. Only the ETW hook and
-//! the read-back live in the Windows-gated `providers`.
+//! and has a never-panic suite in `tests/robustness.rs`. Only the ETW hook
+//! lives in the Windows-gated `providers`: it queues each write on
+//! [`MarkQueue`], and a worker ([`run_mark_reader`]) does the read-back, off the
+//! Kernel-File callback thread (#439).
 //!
 //! Lab-confirmed (2026-09-23, local Windows 11): Kernel-File reports a write to
 //! the stream as a create/write on `C:\…\file.exe:Zone.Identifier`, for both a
@@ -17,7 +19,13 @@ use std::{
     collections::HashMap,
     fmt::Write as _,
     hash::{BuildHasher, RandomState},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver, SyncSender, TrySendError},
+    },
 };
+
+use schema::{Event, EventMeta, FileQuarantineEvent};
 
 /// Stream suffix on the path Kernel-File reports. Matched case-insensitively;
 /// an explicit `:$DATA` stream type is accepted too.
@@ -246,6 +254,128 @@ impl QuarantineDedup {
     }
 }
 
+/// The stream at `stream_path`, at most [`MAX_STREAM_BYTES`] of it. `None` if
+/// it cannot be opened or read (gone, sharing violation, unreachable share).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn read_stream(stream_path: &str) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(stream_path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_STREAM_BYTES).read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+/// One `Zone.Identifier` write seen by the Kernel-File callback, handed to the
+/// read-back worker. `meta` is built on the callback thread: it carries the
+/// writer's token identity, which a later read could no longer resolve once
+/// the process has exited.
+#[cfg_attr(not(windows), allow(dead_code))] // built by the Windows-only provider
+pub(crate) struct MarkWrite {
+    pub(crate) stream_path: String,
+    pub(crate) host: String,
+    pub(crate) meta: EventMeta,
+}
+
+/// Callback side of the `Zone.Identifier` read-back (#439): hands each mark to
+/// the worker without ever blocking. The first cut read the stream on the
+/// Kernel-File callback thread, so a mark on a slow or unreachable SMB share
+/// stalled every file event behind it and risked real-time buffer loss.
+///
+/// A full queue drops the mark, counts it and logs at powers of two, like
+/// [`QuarantineDedup`]'s cap. That's a lost `FileQuarantine`, never a stalled
+/// trace; the `FileOpen` record for the stream is still emitted by the caller.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) struct MarkQueue {
+    tx: SyncSender<MarkWrite>,
+    dropped: AtomicU64,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl MarkQueue {
+    /// A queue holding up to `capacity` pending marks, and the receiving end
+    /// for [`run_mark_reader`].
+    pub(crate) fn bounded(capacity: usize) -> (Self, Receiver<MarkWrite>) {
+        let (tx, rx) = mpsc::sync_channel(capacity);
+        (
+            Self {
+                tx,
+                dropped: AtomicU64::new(0),
+            },
+            rx,
+        )
+    }
+
+    /// Queues `mark` for the worker, or drops and counts it if the queue is
+    /// full or the worker is gone. Never blocks.
+    pub(crate) fn offer(&self, mark: MarkWrite) {
+        let reason = match self.tx.try_send(mark) {
+            Ok(()) => return,
+            Err(TrySendError::Full(_)) => "queue full",
+            Err(TrySendError::Disconnected(_)) => "reader gone",
+        };
+        let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+        // Powers of two only: a burst must not flood the log.
+        if dropped.is_power_of_two() {
+            tracing::warn!(
+                reason,
+                dropped_total = dropped,
+                "Zone.Identifier read-back queue dropped a mark"
+            );
+        }
+    }
+
+    /// Marks dropped so far.
+    #[cfg_attr(not(test), allow(dead_code))] // read by a future health surface
+    pub(crate) fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+/// Worker side: reads each queued mark's stream (`read`, bounded by the
+/// caller), deduplicates it and emits the `FileQuarantine`. Returns once every
+/// [`MarkQueue`] is dropped, which happens when the trace's callbacks go.
+/// Ordering against the stream's `FileOpen` does not matter: the T1204.002
+/// join keys on path and time.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn run_mark_reader(
+    marks: &Receiver<MarkWrite>,
+    read: impl Fn(&str) -> Option<Vec<u8>>,
+    mut dedup: QuarantineDedup,
+    emit: impl Fn(Event),
+) {
+    for mark in marks {
+        if let Some(event) = quarantine_event(mark, &read, &mut dedup) {
+            emit(event);
+        }
+    }
+}
+
+/// The `FileQuarantine` for one mark, or `None` for a duplicate record or a
+/// stream placing the file in a local, intranet or trusted zone.
+///
+/// Best-effort, like the macOS sibling: a read that loses the race with the
+/// writer (empty stream, sharing violation) still reports the mark alone.
+/// `agent` is the writing process: Windows records no downloader name in the
+/// stream, and the writer is exactly that.
+fn quarantine_event(
+    mark: MarkWrite,
+    read: impl Fn(&str) -> Option<Vec<u8>>,
+    dedup: &mut QuarantineDedup,
+) -> Option<Event> {
+    let zone = read(&mark.stream_path)
+        .map(|bytes| parse(&bytes))
+        .unwrap_or_default();
+    let zone = dedup.admit(&mark.host, zone, mark.meta.timestamp_ns)?;
+    let agent = Some(mark.meta.comm.clone());
+    Some(Event::FileQuarantine(FileQuarantineEvent {
+        meta: mark.meta,
+        path: mark.host,
+        agent,
+        origin_url: zone.host_url,
+        referrer_url: zone.referrer_url,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,5 +551,108 @@ mod tests {
         );
         assert_eq!(dedup.unremembered(), 2);
         assert_eq!(dedup.seen.len(), 2);
+    }
+
+    // ── Read-back off the callback thread (#439) ──
+
+    fn mark(host: &str, seconds: u64) -> MarkWrite {
+        MarkWrite {
+            stream_path: format!("{host}:Zone.Identifier"),
+            host: host.to_string(),
+            meta: EventMeta {
+                comm: "msedge.exe".to_string(),
+                timestamp_ns: seconds * 1_000_000_000,
+                ..schema::fixtures::meta()
+            },
+        }
+    }
+
+    fn reader_dedup() -> QuarantineDedup {
+        QuarantineDedup::new(5_000_000_000, 1_024)
+    }
+
+    #[test]
+    fn offering_to_a_full_queue_drops_and_counts_instead_of_blocking() {
+        // Regression (#439): the read ran on the Kernel-File callback thread, so a
+        // slow read stalled every file event. Nothing drains this queue, standing
+        // in for a worker stuck on an unreachable share: `offer` must still return.
+        let (queue, _stuck_reader) = MarkQueue::bounded(2);
+        for i in 0..5 {
+            queue.offer(mark(&format!(r"C:\d\{i}.exe"), 0));
+        }
+        assert_eq!(queue.dropped(), 3);
+    }
+
+    #[test]
+    fn offering_after_the_reader_is_gone_drops_and_counts() {
+        let (queue, reader) = MarkQueue::bounded(4);
+        drop(reader);
+        queue.offer(mark(r"C:\d\a.exe", 0));
+        assert_eq!(queue.dropped(), 1);
+    }
+
+    #[test]
+    fn the_reader_emits_one_quarantine_event_per_write() {
+        // A write yields 2-3 records for the same stream: one event out.
+        let (queue, reader) = MarkQueue::bounded(8);
+        for _ in 0..3 {
+            queue.offer(mark(r"C:\Users\u\Downloads\a.exe", 1));
+        }
+        drop(queue);
+        let emitted = std::cell::RefCell::new(Vec::new());
+        run_mark_reader(
+            &reader,
+            |path| {
+                assert_eq!(path, r"C:\Users\u\Downloads\a.exe:Zone.Identifier");
+                Some(BROWSER_STREAM.as_bytes().to_vec())
+            },
+            reader_dedup(),
+            |event| emitted.borrow_mut().push(event),
+        );
+        let emitted = emitted.into_inner();
+        let [Event::FileQuarantine(event)] = emitted.as_slice() else {
+            panic!("expected one FileQuarantine, got {emitted:?}");
+        };
+        assert_eq!(event.path, r"C:\Users\u\Downloads\a.exe");
+        assert_eq!(event.agent.as_deref(), Some("msedge.exe"));
+        assert_eq!(
+            event.origin_url.as_deref(),
+            Some("https://example.test/payload.exe")
+        );
+        assert_eq!(event.meta.timestamp_ns, 1_000_000_000);
+    }
+
+    #[test]
+    fn the_reader_skips_marks_placing_the_file_in_a_trusted_zone() {
+        let (queue, reader) = MarkQueue::bounded(8);
+        queue.offer(mark(r"C:\intranet\a.exe", 1));
+        drop(queue);
+        let emitted = std::cell::Cell::new(0);
+        run_mark_reader(
+            &reader,
+            |_| Some(b"[ZoneTransfer]\r\nZoneId=1\r\n".to_vec()),
+            reader_dedup(),
+            |_| emitted.set(emitted.get() + 1),
+        );
+        assert_eq!(emitted.get(), 0);
+    }
+
+    #[test]
+    fn an_unreadable_stream_still_reports_the_mark_alone() {
+        let (queue, reader) = MarkQueue::bounded(8);
+        queue.offer(mark(r"\\slow-share\drop\a.exe", 1));
+        drop(queue);
+        let emitted = std::cell::RefCell::new(Vec::new());
+        run_mark_reader(
+            &reader,
+            |_| None,
+            reader_dedup(),
+            |event| emitted.borrow_mut().push(event),
+        );
+        let emitted = emitted.into_inner();
+        let [Event::FileQuarantine(event)] = emitted.as_slice() else {
+            panic!("expected one FileQuarantine, got {emitted:?}");
+        };
+        assert_eq!(event.origin_url, None);
     }
 }
