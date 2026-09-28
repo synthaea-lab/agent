@@ -21,10 +21,10 @@ pub use state::RuleState;
 pub(crate) use stateless::{
     check_account_creation_persistence, check_base64_decode, check_btm_launch_item_persistence,
     check_encoded_powershell, check_ld_preload_hijack, check_log_clear_exec, check_log_file_delete,
-    check_masquerading, check_persistence_write, check_proc_root_escape, check_recovery_inhibit,
-    check_scheduled_task_persistence, check_scheduled_task_update_persistence,
-    check_security_process_signal, check_service_install_persistence,
-    check_systemd_service_persistence,
+    check_masquerading, check_memfd_exec, check_persistence_write, check_proc_root_escape,
+    check_recovery_inhibit, check_scheduled_task_persistence,
+    check_scheduled_task_update_persistence, check_security_process_signal,
+    check_service_install_persistence, check_systemd_service_persistence,
 };
 // The contract is the two dispatchers — callers (agent) route every event
 // through them. The individual checks are implementation detail, re-exported

@@ -827,3 +827,65 @@ fn in_place_edit_backup_is_a_documented_false_positive() {
     assert_eq!(alerts.len(), 1);
     assert_eq!(alerts[0].technique, "T1486");
 }
+
+// ── T1620 memfd fileless exec (stateless, issue #85) ───────────────────────
+// Strings below are what the kernel actually emits (traced on Alpine 6.18.50
+// against a live memfd exec, #85 review) — NOT `/memfd:<name> (deleted)`, which is
+// only what `readlink /proc/<pid>/exe` shows and the sensor never reads.
+
+#[test]
+fn memfd_exec_matches_dev_fd_path() {
+    // execveat(fd, "", AT_EMPTY_PATH): bprm->filename is /dev/fd/<n>.
+    let mut event = exec_event("");
+    event.image_path = "/dev/fd/3".to_string();
+    let alert = check_memfd_exec(&event).unwrap();
+    assert_eq!(alert.technique, "T1620");
+}
+
+#[test]
+fn memfd_exec_matches_proc_self_fd_path() {
+    // execv via /proc/self/fd/<n>.
+    let mut event = exec_event("");
+    event.image_path = "/proc/self/fd/3".to_string();
+    let alert = check_memfd_exec(&event).unwrap();
+    assert_eq!(alert.technique, "T1620");
+}
+
+#[test]
+fn memfd_exec_matches_proc_pid_fd_path() {
+    let mut event = exec_event("");
+    event.image_path = "/proc/12345/fd/3".to_string();
+    let alert = check_memfd_exec(&event).unwrap();
+    assert_eq!(alert.technique, "T1620");
+}
+
+#[test]
+fn memfd_exec_matches_via_comm() {
+    // The execveat(AT_EMPTY_PATH) case names the task after the memfd dentry.
+    let mut event = exec_event("");
+    event.meta.comm = "memfd:payload".to_string();
+    event.image_path = "/dev/fd/3".to_string();
+    let alert = check_memfd_exec(&event).unwrap();
+    assert_eq!(alert.technique, "T1620");
+}
+
+#[test]
+fn normal_exec_does_not_match_memfd() {
+    let event = exec_event("/usr/bin/ls -la");
+    assert!(check_memfd_exec(&event).is_none());
+}
+
+#[test]
+fn path_with_fd_in_an_unrelated_location_does_not_false_positive() {
+    // Contains "/fd/" but isn't rooted at /dev or /proc — a real user path.
+    let mut event = exec_event("");
+    event.image_path = "/home/user/documents/fd/notes.txt".to_string();
+    assert!(check_memfd_exec(&event).is_none());
+}
+
+#[test]
+fn proc_fd_path_with_non_numeric_pid_does_not_false_positive() {
+    let mut event = exec_event("");
+    event.image_path = "/proc/self/fd/notanumber".to_string();
+    assert!(check_memfd_exec(&event).is_none());
+}
