@@ -363,8 +363,16 @@ mod golden_fixture {
         // signed manifest — asserts the checked-in bytes haven't drifted from
         // what this crate would itself produce, so a hand-edit of the fixture
         // can't silently break the cross-language comparison it exists for.
+        // `.gitattributes` pins this file to `eol=lf`, but normalize `\r\n` on
+        // both sides anyway rather than depend on that alone — a Windows
+        // checkout that reintroduces CRLF here should fail on real content
+        // drift, not on line endings (this crate's own CI caught exactly that
+        // once, before this normalization existed).
         let manifest: ContentManifest = serde_json::from_str(GOLDEN_FIXTURE).unwrap();
         let regenerated = serde_json::to_string_pretty(&manifest).unwrap();
-        assert_eq!(GOLDEN_FIXTURE.trim_end(), regenerated.trim_end());
+        assert_eq!(
+            GOLDEN_FIXTURE.trim_end().replace("\r\n", "\n"),
+            regenerated.trim_end().replace("\r\n", "\n")
+        );
     }
 }
