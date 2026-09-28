@@ -82,7 +82,13 @@ use sensor_linux_wire as wire;
 /// added `GetAddrInfoEvent` — not imported here either (the DNS uprobe pair
 /// lives in `sensor-linux-uprobes`, not this crate's tracepoint-only
 /// surface); no existing mapping changed shape.
-const _: () = assert!(wire::WIRE_VERSION == 16);
+///
+/// v17 (#457) widened `CapSetEvent`'s `effective`/`permitted`/`inheritable`
+/// from `u32` to `u64` (the probe now reads the capability high word too);
+/// `cap_set` passes them through unchanged. `kernel_module` also takes the
+/// resolved path of a `finit_module` fd from the caller (`sensor.rs` reads
+/// `/proc/<pid>/fd/<fd>`), keeping this module free of filesystem access.
+const _: () = assert!(wire::WIRE_VERSION == 17);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
@@ -440,9 +446,12 @@ pub fn signal(
     })
 }
 
+/// `fd_path` is what `event.fd` pointed at when the event was drained (see
+/// [`KernelModuleEvent::path`]); the caller resolves it, this stays pure.
 #[must_use]
 pub fn kernel_module(
     event: &wire::KernelModuleEvent,
+    fd_path: Option<String>,
     boot_epoch_offset_ns: u64,
     container: Option<ContainerContext>,
 ) -> Event {
@@ -463,6 +472,7 @@ pub fn kernel_module(
         action,
         name,
         fd: (event.fd >= 0).then_some(event.fd),
+        path: fd_path.filter(|_| event.action == 1),
         image_len: (event.image_len > 0).then_some(event.image_len),
     })
 }
@@ -1200,7 +1210,7 @@ mod tests {
     #[test]
     fn kernel_module_unload_carries_the_name() {
         let event = wire_kernel_module(b"evil_rootkit");
-        let Event::KernelModule(e) = kernel_module(&event, 0, None) else {
+        let Event::KernelModule(e) = kernel_module(&event, None, 0, None) else {
             panic!("wrong variant")
         };
         assert_eq!(e.action, KernelModuleAction::Unload);
@@ -1214,7 +1224,7 @@ mod tests {
         let mut event = wire_kernel_module(b"");
         event.action = 0;
         event.image_len = 4096;
-        let Event::KernelModule(e) = kernel_module(&event, 0, None) else {
+        let Event::KernelModule(e) = kernel_module(&event, None, 0, None) else {
             panic!("wrong variant")
         };
         assert_eq!(e.action, KernelModuleAction::Load);
@@ -1228,13 +1238,37 @@ mod tests {
         let mut event = wire_kernel_module(b"");
         event.action = 1;
         event.fd = 5;
-        let Event::KernelModule(e) = kernel_module(&event, 0, None) else {
+        let Event::KernelModule(e) = kernel_module(&event, None, 0, None) else {
             panic!("wrong variant")
         };
         assert_eq!(e.action, KernelModuleAction::LoadFd);
         assert_eq!(e.name, None);
         assert_eq!(e.fd, Some(5));
+        assert_eq!(e.path, None);
         assert_eq!(e.image_len, None);
+    }
+
+    #[test]
+    fn kernel_module_load_fd_carries_the_resolved_path() {
+        let mut event = wire_kernel_module(b"");
+        event.action = 1;
+        event.fd = 5;
+        let path = "/usr/lib/modules/6.12.0/kernel/drivers/net/dummy.ko.xz";
+        let Event::KernelModule(e) = kernel_module(&event, Some(path.into()), 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.path.as_deref(), Some(path));
+    }
+
+    #[test]
+    fn kernel_module_path_only_applies_to_load_fd() {
+        // A path from the caller is ignored for init_module/delete_module,
+        // which have no fd to resolve.
+        let event = wire_kernel_module(b"evil_rootkit");
+        let Event::KernelModule(e) = kernel_module(&event, Some("/x.ko".into()), 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.path, None);
     }
 
     #[test]
@@ -1303,20 +1337,23 @@ mod tests {
     }
 
     #[test]
-    fn cap_set_carries_the_low_word_bits() {
+    fn cap_set_carries_the_full_64_bit_sets() {
+        // CAP_SYS_ADMIN (21, low word) and CAP_BPF (39, high word, #457).
+        let caps = 1 << 21 | 1 << 39;
         let event = wire::CapSetEvent {
             meta: wire_meta(b"evil"),
             target_pid: 0,
-            effective: 1 << 21,
-            permitted: 1 << 21,
+            effective: caps,
+            permitted: caps,
             inheritable: 0,
         };
         let Event::CapSet(e) = cap_set(&event, 0, None) else {
             panic!("wrong variant")
         };
         assert_eq!(e.target_pid, 0);
-        assert_eq!(e.effective, 1 << 21);
-        assert_eq!(e.permitted, 1 << 21);
+        assert_eq!(e.effective, caps);
+        assert_eq!(e.permitted, caps);
+        assert_eq!(e.inheritable, 0);
     }
 
     #[test]

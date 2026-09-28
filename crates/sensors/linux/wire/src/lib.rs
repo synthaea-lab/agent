@@ -171,7 +171,15 @@ pub use path_filter::is_filtered_path;
 ///   once `#262` Phase 3's xattr telemetry took v12, then to v14 once #362 and
 ///   #264 took v13 on `main`, then to v16 once #265 and #266 took v14/v15
 ///   (same coordination note as `SCHEMA_VERSION`).
-pub const WIRE_VERSION: u32 = 16;
+/// - v17: `CapSetEvent`'s `effective`/`permitted`/`inheritable` widen from
+///   `u32` to `u64` (issue #457). The probe now also reads
+///   `__user_cap_data_struct[1]`, the high word v15 skipped: capabilities 32+
+///   (`CAP_PERFMON`=38, `CAP_BPF`=39, `CAP_CHECKPOINT_RESTORE`=40) are what
+///   loading eBPF without full `CAP_SYS_ADMIN` takes, so the v15 "low word is
+///   enough" call no longer holds. The high word is read only when
+///   `cap_user_header_t.version` is not `_LINUX_CAPABILITY_VERSION_1`, whose
+///   data array has a single element.
+pub const WIRE_VERSION: u32 = 17;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
@@ -517,8 +525,9 @@ pub struct IdentityChangeEvent {
 }
 
 /// eBPF program/map lifecycle capability probe's sibling (issue #266):
-/// `capset(2)`. Decodes only the low 32 capability bits — see this file's
-/// `WIRE_VERSION` v12 changelog for why that is deliberately sufficient.
+/// `capset(2)`. Each set is the full 64-bit capability mask: the low word from
+/// `__user_cap_data_struct[0]`, the high word from `[1]` (v17, #457) — `0` for
+/// a `_LINUX_CAPABILITY_VERSION_1` header, which has no second element.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CapSetEvent {
@@ -527,9 +536,9 @@ pub struct CapSetEvent {
     /// process itself" (`capset(2)`'s own documented meaning for pid 0, not
     /// a probe failure sentinel).
     pub target_pid: u32,
-    pub effective: u32,
-    pub permitted: u32,
-    pub inheritable: u32,
+    pub effective: u64,
+    pub permitted: u64,
+    pub inheritable: u64,
 }
 
 /// Namespace manipulation (issue #266): `setns(2)` (the container-escape

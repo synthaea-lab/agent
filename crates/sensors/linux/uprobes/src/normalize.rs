@@ -54,7 +54,10 @@ use crate::redact;
 /// added `GetAddrInfoEvent` — new `dns_query` mapping function below, reusing
 /// the platform-neutral `schema::DnsQueryEvent` already shared with the
 /// Windows DNS-Client ETW producer.
-const _: () = assert!(wire::WIRE_VERSION == 16);
+///
+/// v17 (#457) widened `CapSetEvent`'s capability sets to `u64` — not imported
+/// here, same reasoning as v15.
+const _: () = assert!(wire::WIRE_VERSION == 17);
 
 /// `container` is resolved by the caller (`crate::container::container_context`,
 /// issue #312) from `EventMeta::cgroup_id` against cgroupfs, with image/name filled

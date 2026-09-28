@@ -3349,16 +3349,34 @@ pub fn sys_enter_capset(ctx: TracePointContext) -> u32 {
     }
 }
 
-/// `struct __user_cap_header_struct { __u32 version; int pid; }` — `pid` is
-/// the second field, 4 bytes in.
+/// `struct __user_cap_header_struct { __u32 version; int pid; }` — `version`
+/// first, `pid` 4 bytes in.
 const CAP_HEADER_PID_OFFSET: u64 = 4;
+/// `_LINUX_CAPABILITY_VERSION_1`: 32-bit capabilities, `datap` points at a
+/// single `__user_cap_data_struct`. Versions 2 and 3 (the ones libcap and the
+/// kernel use today) pass an array of two, the second holding capabilities
+/// 32-63.
+const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
 /// `struct __user_cap_data_struct { __u32 effective; __u32 permitted;
-/// __u32 inheritable; }` — this probe reads only element `[0]` of `datap`'s
-/// array (the low 32 capability bits; see this crate's WIRE_VERSION v12
-/// changelog for why that's deliberately sufficient), so no stride constant
-/// for element `[1]` is needed.
+/// __u32 inheritable; }`: 12 bytes, so element `[1]` (the high word, #457)
+/// starts at `CAP_DATA_STRIDE`.
 const CAP_DATA_PERMITTED_OFFSET: u64 = 4;
 const CAP_DATA_INHERITABLE_OFFSET: u64 = 8;
+const CAP_DATA_STRIDE: u64 = 12;
+
+/// Reads one `__user_cap_data_struct` at `ptr` as (effective, permitted,
+/// inheritable); a field that can't be read counts as no capability.
+#[inline(always)]
+fn read_cap_data(ptr: u64) -> (u64, u64, u64) {
+    let read = |offset: u64| {
+        unsafe { bpf_probe_read_user((ptr + offset) as *const u32) }.map_or(0, u64::from)
+    };
+    (
+        read(0),
+        read(CAP_DATA_PERMITTED_OFFSET),
+        read(CAP_DATA_INHERITABLE_OFFSET),
+    )
+}
 
 fn try_sys_enter_capset(ctx: TracePointContext) -> Result<u32, u32> {
     #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
@@ -3384,16 +3402,26 @@ fn try_sys_enter_capset(ctx: TracePointContext) -> Result<u32, u32> {
     } else {
         0
     };
+    // An unreadable header is treated as a modern one: reading `[1]` then
+    // fails cleanly (high word 0) rather than dropping bits 32+.
+    let version: u32 = if hdrp_ptr != 0 {
+        unsafe { bpf_probe_read_user(hdrp_ptr as *const u32) }.unwrap_or(0)
+    } else {
+        0
+    };
 
     let (effective, permitted, inheritable) = if data_ptr != 0 {
-        let effective = unsafe { bpf_probe_read_user(data_ptr as *const u32) }.unwrap_or(0);
-        let permitted =
-            unsafe { bpf_probe_read_user((data_ptr + CAP_DATA_PERMITTED_OFFSET) as *const u32) }
-                .unwrap_or(0);
-        let inheritable =
-            unsafe { bpf_probe_read_user((data_ptr + CAP_DATA_INHERITABLE_OFFSET) as *const u32) }
-                .unwrap_or(0);
-        (effective, permitted, inheritable)
+        let (eff_lo, perm_lo, inh_lo) = read_cap_data(data_ptr);
+        let (eff_hi, perm_hi, inh_hi) = if version == LINUX_CAPABILITY_VERSION_1 {
+            (0, 0, 0)
+        } else {
+            read_cap_data(data_ptr + CAP_DATA_STRIDE)
+        };
+        (
+            eff_hi << 32 | eff_lo,
+            perm_hi << 32 | perm_lo,
+            inh_hi << 32 | inh_lo,
+        )
     } else {
         (0, 0, 0)
     };

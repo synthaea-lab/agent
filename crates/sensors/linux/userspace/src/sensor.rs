@@ -30,6 +30,19 @@ use crate::{
 /// (Consolidated there by #295; a parallel branch merge resurrected the old
 /// local copy once already — if you are reading a full implementation here
 /// again, the same thing happened again.)
+/// The file a `finit_module(2)` event's fd points at (#457), read from
+/// `/proc/<pid>/fd/<fd>` while the event is drained. Racy by nature: the
+/// loader may already have closed the fd or exited, and then this is `None`
+/// (the event still carries the fd). `init_module`/`delete_module` have no fd.
+fn finit_module_path(event: &sensor_linux_wire::KernelModuleEvent) -> Option<String> {
+    if event.action != 1 || event.fd < 0 {
+        return None;
+    }
+    std::fs::read_link(format!("/proc/{}/fd/{}", event.meta.pid, event.fd))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 fn boot_epoch_offset_ns() -> u64 {
     sensor_linux_wire::boot_epoch_offset_ns()
 }
@@ -382,7 +395,7 @@ impl LinuxSensor {
                 guard = kernel_module_ring_buf.readable_mut() => {
                     drain!(guard, sensor_linux_wire::KernelModuleEvent, sink, own_pid,
                         |e: &sensor_linux_wire::KernelModuleEvent| {
-                            normalize::kernel_module(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                            normalize::kernel_module(e, finit_module_path(e), offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
                 guard = bpf_ring_buf.readable_mut() => {

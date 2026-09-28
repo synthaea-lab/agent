@@ -363,6 +363,7 @@ pub fn kernel_module() -> KernelModuleEvent {
         action: KernelModuleAction::Load,
         name: None,
         fd: None,
+        path: None,
         image_len: None,
     }
 }

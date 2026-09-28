@@ -168,7 +168,15 @@ pub mod time;
 /// while this branch was open, then renumbered each time another PR took the
 /// number first: 22 → 23 (#262 Phase 3 xattr), 23 → 24 (#297 `PolicyDenial`),
 /// 24 → 25 (#264), 25 → 26 → 27 (#265, #266).
-pub const SCHEMA_VERSION: u32 = 27;
+///
+/// Bumped 27 → 29 for [`CapSetEvent`]'s capability sets widening from `u32`
+/// to `u64` and the new optional [`KernelModuleEvent::path`] (#457). A v27
+/// reader rejects a capability mask above `u32::MAX` (`CAP_BPF` is bit 39),
+/// so the widening is serialization-visible even though every value below
+/// 2^32 still serializes identically. 28 is claimed by #469 (ATT&CK technique
+/// ids) while both branches are open; whichever merges second renumbers —
+/// same coordination note as v13 and ADR-0005.
+pub const SCHEMA_VERSION: u32 = 29;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -1466,11 +1474,17 @@ pub struct KernelModuleEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// The already-open file descriptor [`KernelModuleAction::LoadFd`] loads
-    /// from. Resolving it to a path is deferred — same "sensor reports the
-    /// syscall boundary, not an enriched path" posture as `FileWriteEvent`'s
-    /// fd-only shape.
+    /// from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fd: Option<i32>,
+    /// The file [`KernelModuleAction::LoadFd`]'s `fd` refers to, e.g.
+    /// `/usr/lib/modules/<release>/kernel/drivers/net/dummy.ko.xz` (v29,
+    /// #457). Resolved in userspace from `/proc/<pid>/fd/<fd>` when the event
+    /// is drained, so it is best effort: `None` if the loader already closed
+    /// the fd or exited. The module name itself still lives inside the image
+    /// and is not decoded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     /// Size in bytes of the raw module image [`KernelModuleAction::Load`]
     /// receives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1528,10 +1542,11 @@ pub struct IdentityChangeEvent {
     pub saved: Option<u32>,
 }
 
-/// Linux capability set change (issue #266): `capset(2)`. Only the low 32
-/// capability bits are decoded — see `sensor-linux-wire::CapSetEvent`'s doc
-/// for why that already covers every capability an attacker plausibly wants
-/// (`CAP_SYS_ADMIN`, `CAP_SETUID`, `CAP_NET_ADMIN`, `CAP_DAC_OVERRIDE`, ...).
+/// Linux capability set change (issue #266): `capset(2)`. Each set is the full
+/// 64-bit capability mask (bit N = capability N) since v29 (#457): the low 32
+/// bits alone missed `CAP_PERFMON` (38), `CAP_BPF` (39) and
+/// `CAP_CHECKPOINT_RESTORE` (40), which is what loading eBPF without full
+/// `CAP_SYS_ADMIN` takes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapSetEvent {
     pub meta: EventMeta,
@@ -1539,9 +1554,9 @@ pub struct CapSetEvent {
     /// `capset(2)`'s own documented meaning for pid 0, not an absent value,
     /// so it stays a plain `u32` rather than `Option<u32>`.
     pub target_pid: u32,
-    pub effective: u32,
-    pub permitted: u32,
-    pub inheritable: u32,
+    pub effective: u64,
+    pub permitted: u64,
+    pub inheritable: u64,
 }
 
 /// Which namespace syscall produced a [`NamespaceEvent`].

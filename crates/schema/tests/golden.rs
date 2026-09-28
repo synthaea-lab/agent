@@ -1082,9 +1082,35 @@ fn kernel_module_golden() {
             action: KernelModuleAction::Unload,
             name: Some("evil_rootkit".into()),
             fd: None,
+            path: None,
             image_len: None,
         }),
         "kernel_module",
+    );
+}
+
+#[test]
+fn kernel_module_load_fd_golden() {
+    // v29 (#457): `finit_module(2)` as modprobe issues it, with the fd
+    // resolved to the module file in userspace. `name` stays absent: it lives
+    // inside the image.
+    assert_golden(
+        &Event::KernelModule(KernelModuleEvent {
+            meta: EventMeta {
+                pid: 9011,
+                ppid: 1,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_029_000_000_000,
+                comm: "modprobe".into(),
+                container: None,
+            },
+            action: KernelModuleAction::LoadFd,
+            name: None,
+            fd: Some(3),
+            path: Some("/usr/lib/modules/6.12.0/kernel/drivers/net/dummy.ko.xz".into()),
+            image_len: None,
+        }),
+        "kernel_module_load_fd",
     );
 }
 
@@ -1181,7 +1207,8 @@ fn process_vm_read_golden() {
 #[test]
 fn cap_set_golden() {
     // v26 (#266): a process granting itself CAP_SYS_ADMIN (bit 21) — the
-    // capability-abuse primitive.
+    // capability-abuse primitive. v29 (#457): plus CAP_BPF (bit 39), in the
+    // high word the sets now carry.
     assert_golden(
         &Event::CapSet(CapSetEvent {
             meta: EventMeta {
@@ -1193,8 +1220,8 @@ fn cap_set_golden() {
                 container: None,
             },
             target_pid: 0,
-            effective: 1 << 21,
-            permitted: 1 << 21,
+            effective: 1 << 21 | 1 << 39,
+            permitted: 1 << 21 | 1 << 39,
             inheritable: 0,
         }),
         "cap_set",
@@ -1576,6 +1603,7 @@ fn meta_accessor_covers_all_variants() {
             action: KernelModuleAction::Load,
             name: None,
             fd: None,
+            path: None,
             image_len: None,
         }),
         Event::BpfOperation(BpfEvent {
