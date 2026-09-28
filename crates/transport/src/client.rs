@@ -59,6 +59,32 @@ impl TransportClient {
         Ok(())
     }
 
+    /// Fetches an arbitrary JSON resource via GET — used for the content
+    /// manifest fetch (ADR-0016, issue #30/#73). Generic over the response
+    /// type rather than a concrete `updater::ContentManifest`: `transport` and
+    /// `updater` are both LEAF crates and may not depend on each other
+    /// (`tools/check-deps.py`), so the binary composing them supplies the
+    /// concrete type at the call site.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response body is not
+    /// valid JSON for `R`.
+    pub fn get_json<R: serde::de::DeserializeOwned>(&self, url: &str) -> Result<R> {
+        let response = self.agent.get(url).call().map_err(|e| match &e {
+            ureq::Error::StatusCode(status) => TransportError::ServerError {
+                status: *status,
+                message: e.to_string(),
+            },
+            _ => TransportError::Network(e.to_string()),
+        })?;
+
+        response
+            .into_body()
+            .read_json()
+            .map_err(|e| TransportError::InvalidResponse(e.to_string()))
+    }
+
     /// Performs a POST request with JSON body.
     fn post_json<T: Serialize, R: serde::de::DeserializeOwned>(
         &self,

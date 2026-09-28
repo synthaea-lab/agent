@@ -24,6 +24,11 @@ tamper = { path = "../crates/tamper" }
 response = { path = "../crates/response" }
 store = { path = "../crates/store" }
 transport = { path = "../crates/transport" }
+# Content-manifest fetch/verify (ADR-0016, issue #30/#73): cross-platform, unlike
+# `updater::layout`'s Linux-only bootstrap/current/versions binary-update layout —
+# content distribution has no such constraint, so this sits in the main
+# dependency block, not the Linux-only one.
+updater = { path = "../crates/updater" }
 # Local control channel served to `cli` (issue #388). The agent is otherwise
 # thread-based: tokio only runs the IPC server, on its own dedicated thread.
 ipc = { path = "../crates/ipc" }
@@ -31,6 +36,7 @@ tokio = { workspace = true }
 
 anyhow = "1"
 serde = { workspace = true }
+serde_json = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 tracing = { workspace = true }
 # fmt + env-filter: RUST_LOG-style filtering; the default "tracing-log" feature
@@ -65,10 +71,6 @@ sensor-linux-lsm = { path = "../crates/sensors/linux/lsm" }
 # itself uses.
 aya = { version = "0.14", default-features = false }
 libc = "0.2"
-# `updater::layout` (the bootstrap/current/versions layout `crate::integrity`
-# reads the persisted release manifest through) is itself Linux-only, per
-# CLAUDE.md's platform-code exception for this crate.
-updater = { path = "../crates/updater" }
 
 [dev-dependencies]
 schema = { path = "../crates/schema", features = ["test-fixtures"] }
