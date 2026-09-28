@@ -177,6 +177,7 @@ fn detection_ml_golden() {
             model_version: "2026.09.0".into(),
         },
         score: Some(0.91),
+        techniques: Vec::new(),
         attributions: vec![
             ScoreAttribution {
                 feature: "entropy".into(),
@@ -213,6 +214,120 @@ fn detection_ml_golden() {
     };
     let serialized = serde_json::to_value(&detection).unwrap();
     assert_eq!(serialized, fixture("detection_ml"), "fixture mismatch");
+    let back: Detection = serde_json::from_value(serialized).unwrap();
+    assert_eq!(back, detection, "round trip mismatch");
+}
+
+/// Minimal exec event shared by the four engine-source golden tests below — same
+/// triggering activity, different engine verdict on it.
+fn sample_exec_event() -> Event {
+    Event::Exec(ExecEvent {
+        meta: EventMeta {
+            pid: 4242,
+            ppid: 1337,
+            user: User::Unix {
+                uid: 1000,
+                gid: 1000,
+            },
+            timestamp_ns: 1_756_900_004_123_456_789,
+            comm: "bash".into(),
+            container: None,
+        },
+        image_path: "/bin/bash".into(),
+        cmdline: "bash -c echo cGF5bG9hZAo= | base64 -d | sh".into(),
+        argv: ["bash", "-c", "echo cGF5bG9hZAo= | base64 -d | sh"]
+            .map(String::from)
+            .into(),
+        parent_comm: Some("sshd".into()),
+        parent_image_path: None,
+        sha256: None,
+        signature: None,
+        env_security: Vec::new(),
+    })
+}
+
+/// Issue #74: every engine populates `Detection.techniques` as structured data, not
+/// just a string embedded in a title/message.
+#[test]
+fn detection_rule_golden() {
+    let detection = Detection {
+        timestamp_ns: 1_756_900_005_000_000_000,
+        severity: Severity::High,
+        title: "Base64-encoded command piped to a shell".into(),
+        source: DetectionSource::Rule {
+            rule_id: "base64_pipe_shell".into(),
+        },
+        score: None,
+        techniques: vec!["T1027".into(), "T1059.004".into()],
+        attributions: Vec::new(),
+        events: vec![sample_exec_event()],
+    };
+    let serialized = serde_json::to_value(&detection).unwrap();
+    assert_eq!(serialized, fixture("detection_rule"), "fixture mismatch");
+    let back: Detection = serde_json::from_value(serialized).unwrap();
+    assert_eq!(back, detection, "round trip mismatch");
+}
+
+#[test]
+fn detection_sigma_golden() {
+    let detection = Detection {
+        timestamp_ns: 1_756_900_005_000_000_000,
+        severity: Severity::High,
+        title: "Base64-encoded command piped to a shell".into(),
+        source: DetectionSource::Sigma {
+            rule_id: "Base64-encoded command piped to a shell".into(),
+        },
+        score: None,
+        techniques: vec!["T1027".into(), "T1059.004".into()],
+        attributions: Vec::new(),
+        events: vec![sample_exec_event()],
+    };
+    let serialized = serde_json::to_value(&detection).unwrap();
+    assert_eq!(serialized, fixture("detection_sigma"), "fixture mismatch");
+    let back: Detection = serde_json::from_value(serialized).unwrap();
+    assert_eq!(back, detection, "round trip mismatch");
+}
+
+#[test]
+fn detection_yara_golden() {
+    let detection = Detection {
+        timestamp_ns: 1_756_900_005_000_000_000,
+        severity: Severity::Low,
+        title: "synthaea_lab_payload".into(),
+        source: DetectionSource::Yara {
+            rule_name: "synthaea_lab_payload".into(),
+        },
+        score: None,
+        techniques: vec!["T1105".into()],
+        attributions: Vec::new(),
+        events: vec![sample_exec_event()],
+    };
+    let serialized = serde_json::to_value(&detection).unwrap();
+    assert_eq!(serialized, fixture("detection_yara"), "fixture mismatch");
+    let back: Detection = serde_json::from_value(serialized).unwrap();
+    assert_eq!(back, detection, "round trip mismatch");
+}
+
+#[test]
+fn detection_correlator_golden() {
+    let detection = Detection {
+        timestamp_ns: 1_756_900_005_000_000_000,
+        severity: Severity::Critical,
+        title: "Encoded execution followed by outbound beacon".into(),
+        source: DetectionSource::Correlator {
+            case_id: "case-0f2a".into(),
+        },
+        score: Some(0.87),
+        techniques: vec!["T1059".into(), "T1071".into()],
+        attributions: Vec::new(),
+        events: vec![sample_exec_event()],
+    };
+    let serialized = serde_json::to_value(&detection).unwrap();
+    assert_eq!(
+        serialized,
+        fixture("detection_correlator"),
+        "fixture mismatch"
+    );
     let back: Detection = serde_json::from_value(serialized).unwrap();
     assert_eq!(back, detection, "round trip mismatch");
 }
@@ -1042,6 +1157,7 @@ fn policy_denial_golden() {
     // reading a file labeled for a user's home directory, the classic
     // web-shell-reading-secrets shape. `action` is absent: the AVC parser
     // doesn't yet recover the requested permission set, see the type's doc.
+    // v30 (#427): `object_path` from the AVC record's `path=`/`name=`.
     assert_golden(
         &Event::PolicyDenial(PolicyDenialEvent {
             meta: EventMeta {
@@ -1058,6 +1174,7 @@ fn policy_denial_golden() {
             object_class: Some("file".into()),
             action: None,
             enforced: true,
+            object_path: Some("/home/alice/.ssh/id_rsa".into()),
         }),
         "policy_denial",
     );
@@ -1597,6 +1714,7 @@ fn meta_accessor_covers_all_variants() {
             object_class: None,
             action: None,
             enforced: false,
+            object_path: None,
         }),
         Event::KernelModule(KernelModuleEvent {
             meta: meta.clone(),

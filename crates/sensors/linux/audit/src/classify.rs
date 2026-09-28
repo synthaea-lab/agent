@@ -45,6 +45,14 @@ pub enum AuditEvent {
         tcontext: Option<String>,
         tclass: Option<String>,
         permissive: bool,
+        /// The object's path, from `path=` (rare, only when the kernel
+        /// resolved a full path) or `name=` (the common case — often just a
+        /// filename, since this is the AVC line alone, no `type=PATH`
+        /// sibling record correlation, matching the rest of this variant's
+        /// "supplementary" scope, see above). `None` for non-file `tclass`
+        /// denials (`process`, `capability`, `tcp_socket`, ...), which carry
+        /// neither field.
+        object_path: Option<String>,
     },
 }
 
@@ -71,10 +79,7 @@ fn classify_exec(record: &AuditRecord) -> Option<AuditEvent> {
     let mut argv = Vec::new();
     for i in 0..argc {
         let key = format!("a{i}");
-        let value = record.fields.get(&key)?;
-        // Auditd may hex-encode arguments - decode if needed
-        let decoded = decode_audit_value(value);
-        argv.push(decoded);
+        argv.push(decoded_field(record, &key)?);
     }
 
     // First argument is the image path
@@ -158,15 +163,44 @@ fn classify_avc(record: &AuditRecord) -> Option<AuditEvent> {
         tcontext: record.fields.get("tcontext").cloned(),
         tclass,
         permissive: record.fields.get("permissive").is_some_and(|v| v == "1"),
+        // Same hex-decoding as argv (#297 review, Nikolas): the kernel hex-encodes
+        // `path=`/`name=` too whenever the value contains a space or a quote (e.g.
+        // `cp id_rsa "id rsa"` logs `name=696420727361`), so reading the field raw
+        // would leak the encoded form straight into the alert instead of decoding
+        // it — a free evasion.
+        object_path: decoded_field(record, "path").or_else(|| decoded_field(record, "name")),
     })
 }
 
-/// Decodes audit field values (handles hex-encoded strings).
+/// Reads a field and decodes it only if the kernel actually emitted it
+/// unquoted (issue #491). Quotedness on the wire is the kernel's own signal
+/// for "safe to print as-is" vs. "hex-encoded because it contained a space
+/// or a quote" — the one bit of information `decode_audit_value`'s
+/// heuristic can't recover once a value has been stripped to a plain
+/// `String` by `parse_fields`. Without this gate, a value that's quoted
+/// *and* happens to look hex-shaped (a file genuinely named `6162`) gets
+/// silently misdecoded (to `"ab"`) instead of passed through untouched.
+fn decoded_field(record: &AuditRecord, key: &str) -> Option<String> {
+    let value = record.fields.get(key)?;
+    Some(if record.unquoted_fields.contains(key) {
+        decode_audit_value(value)
+    } else {
+        value.clone()
+    })
+}
+
+/// Decodes audit field values (handles hex-encoded strings). Only meaningful
+/// on a field the kernel emitted unquoted — see `decoded_field`, its only
+/// caller outside this module's own tests.
 fn decode_audit_value(value: &str) -> String {
-    // If value looks like hex (even length, all hex chars), try to decode
+    // Callers only reach this for values the wire parser saw arrive unquoted
+    // (see `decoded_field`), so an even-length, all-hex value here can only be
+    // the kernel's own hex encoding of an untrusted string (it hex-encodes any
+    // string containing a space, a quote, or a control character, regardless
+    // of length — including a single byte, e.g. `a1=20` for a lone space).
+    // There is no ambiguity left to guard against with a minimum length.
     if value.len().is_multiple_of(2)
         && value.chars().all(|c| c.is_ascii_hexdigit())
-        && value.len() > 2
         && let Ok(bytes) = hex_decode(value)
         && let Ok(s) = String::from_utf8(bytes)
     {
@@ -246,6 +280,7 @@ mod tests {
             timestamp_ms: 0,
             seq: 0,
             fields,
+            unquoted_fields: std::collections::HashSet::new(),
         };
 
         let event = classify(&record).unwrap();
@@ -265,6 +300,102 @@ mod tests {
             }
             _ => panic!("expected Exec event"),
         }
+    }
+
+    #[test]
+    fn classify_exec_does_not_decode_a_quoted_hex_shaped_argv() {
+        // Issue #491, argv side: a program invoked as `./cafe` (a real, valid
+        // filename) is safe to quote as-is (`a0="./cafe"`... well, without the
+        // leading path prefix here to isolate just the hex-shaped token). The
+        // old heuristic decoded any even-length all-hex token regardless of
+        // whether the kernel had quoted it, silently turning a literal
+        // argument into decoded bytes.
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("argc".to_string(), "1".to_string());
+        fields.insert("a0".to_string(), "cafe".to_string());
+
+        let record = AuditRecord {
+            record_type: AUDIT_EXECVE,
+            timestamp_sec: 0,
+            timestamp_ms: 0,
+            seq: 0,
+            fields,
+            // Not in the set: quoted on the wire, same as any ordinary argv.
+            unquoted_fields: std::collections::HashSet::new(),
+        };
+
+        let AuditEvent::Exec { argv, .. } = classify(&record).unwrap() else {
+            panic!("expected Exec event");
+        };
+        assert_eq!(argv, vec!["cafe"]);
+    }
+
+    #[test]
+    fn classify_exec_decodes_a_genuinely_unquoted_hex_argv() {
+        // The other half: when the kernel *did* hex-encode (argument contained
+        // a space), decoding must still happen.
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("argc".to_string(), "1".to_string());
+        fields.insert("a0".to_string(), "2F62696E2F6C73".to_string()); // "/bin/ls"
+
+        let record = AuditRecord {
+            record_type: AUDIT_EXECVE,
+            timestamp_sec: 0,
+            timestamp_ms: 0,
+            seq: 0,
+            fields,
+            unquoted_fields: std::collections::HashSet::from(["a0".to_string()]),
+        };
+
+        let AuditEvent::Exec { argv, .. } = classify(&record).unwrap() else {
+            panic!("expected Exec event");
+        };
+        assert_eq!(argv, vec!["/bin/ls"]);
+    }
+
+    /// Runs a payload through the *real* parser (`crate::parse::parse_audit_message`),
+    /// not a hand-built `AuditRecord` — so quotedness comes from the actual wire
+    /// scan, not from what a test author assumed it would be.
+    fn classify_wire(record_type: u32, fields_payload: &str) -> AuditEvent {
+        let body = format!("msg=audit(1000.0:1): {fields_payload}");
+        let total_len = (16 + body.len()) as u32;
+        let mut raw = Vec::with_capacity(total_len as usize);
+        raw.extend_from_slice(&total_len.to_ne_bytes());
+        raw.extend_from_slice(&(record_type as u16).to_ne_bytes());
+        raw.extend_from_slice(&[0u8; 10]); // flags + seq + pid, unused here
+        raw.extend_from_slice(body.as_bytes());
+        let record = crate::parse::parse_audit_message(&raw).unwrap();
+        classify(&record).unwrap()
+    }
+
+    #[test]
+    fn classify_wire_execve_mixes_quoted_and_hex_encoded_argv() {
+        // Adapted from a real capture on a lab VM (Alpine 6.18.50, issue #504):
+        // a1 is a literal hex-shaped filename (quoted), a2 is genuinely
+        // hex-encoded (unquoted, because the real argument contained a space).
+        // Before the fix, a1 would have been wrongly decoded to "id rsa".
+        let event = classify_wire(
+            AUDIT_EXECVE,
+            r#"argc=3 a0="/bin/echo" a1="6162" a2=696420727361"#,
+        );
+        let AuditEvent::Exec { argv, .. } = event else {
+            panic!("expected Exec event, got {event:?}");
+        };
+        assert_eq!(argv, vec!["/bin/echo", "6162", "id rsa"]);
+    }
+
+    #[test]
+    fn classify_wire_decodes_a_single_hex_encoded_byte() {
+        // Reported by Jihair on #505: the kernel hex-encodes any untrusted
+        // string containing a space, a quote or a control character,
+        // regardless of length. A lone space argument arrives as `a1=20`
+        // (unquoted), and must still be decoded even though it's shorter
+        // than the old `len() > 2` guard allowed.
+        let event = classify_wire(AUDIT_EXECVE, r#"argc=2 a0="/bin/echo" a1=20"#);
+        let AuditEvent::Exec { argv, .. } = event else {
+            panic!("expected Exec event, got {event:?}");
+        };
+        assert_eq!(argv, vec!["/bin/echo", " "]);
     }
 
     #[test]
@@ -315,6 +446,7 @@ mod tests {
         );
         fields.insert("tclass".to_string(), "file".to_string());
         fields.insert("permissive".to_string(), "0".to_string());
+        fields.insert("name".to_string(), "id_rsa".to_string());
 
         let record = AuditRecord {
             record_type: AUDIT_AVC,
@@ -322,6 +454,7 @@ mod tests {
             timestamp_ms: 0,
             seq: 0,
             fields,
+            unquoted_fields: std::collections::HashSet::new(),
         };
 
         let event = classify(&record).unwrap();
@@ -332,6 +465,7 @@ mod tests {
                 tcontext,
                 tclass,
                 permissive,
+                object_path,
             } => {
                 assert_eq!(comm.as_deref(), Some("httpd"));
                 assert_eq!(scontext.as_deref(), Some("system_u:system_r:httpd_t:s0"));
@@ -341,9 +475,115 @@ mod tests {
                 );
                 assert_eq!(tclass.as_deref(), Some("file"));
                 assert!(!permissive);
+                assert_eq!(object_path.as_deref(), Some("id_rsa"));
             }
             _ => panic!("expected PolicyDenial event"),
         }
+    }
+
+    #[test]
+    fn classify_avc_prefers_path_over_name() {
+        // `path=` (a fully resolved path) is rarer than `name=` (often a bare
+        // filename) but more useful when present — issue #427.
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("scontext".to_string(), "httpd_t".to_string());
+        fields.insert("tclass".to_string(), "file".to_string());
+        fields.insert("name".to_string(), "id_rsa".to_string());
+        fields.insert("path".to_string(), "/home/alice/.ssh/id_rsa".to_string());
+
+        let record = AuditRecord {
+            record_type: AUDIT_AVC,
+            timestamp_sec: 0,
+            timestamp_ms: 0,
+            seq: 0,
+            fields,
+            unquoted_fields: std::collections::HashSet::new(),
+        };
+
+        let AuditEvent::PolicyDenial { object_path, .. } = classify(&record).unwrap() else {
+            panic!("expected PolicyDenial event");
+        };
+        assert_eq!(object_path.as_deref(), Some("/home/alice/.ssh/id_rsa"));
+    }
+
+    #[test]
+    fn classify_avc_decodes_hex_encoded_name() {
+        // The kernel hex-encodes name=/path= whenever the value contains a space
+        // or a quote — same reason argv gets the same treatment. Undecoded, this
+        // would leak "696420727361" (the hex form of "id rsa") straight into the
+        // alert instead of the actual name (review on #490, Nikolas).
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("scontext".to_string(), "httpd_t".to_string());
+        fields.insert("tclass".to_string(), "file".to_string());
+        fields.insert("name".to_string(), "696420727361".to_string());
+
+        let record = AuditRecord {
+            record_type: AUDIT_AVC,
+            timestamp_sec: 0,
+            timestamp_ms: 0,
+            seq: 0,
+            fields,
+            // Realistic: this is exactly why the kernel emitted it unquoted.
+            unquoted_fields: std::collections::HashSet::from(["name".to_string()]),
+        };
+
+        let AuditEvent::PolicyDenial { object_path, .. } = classify(&record).unwrap() else {
+            panic!("expected PolicyDenial event");
+        };
+        assert_eq!(object_path.as_deref(), Some("id rsa"));
+    }
+
+    #[test]
+    fn classify_avc_does_not_decode_a_quoted_hex_shaped_name() {
+        // Issue #491: a file genuinely named "6162" is safe to print as-is, so
+        // the kernel quotes it (`name="6162"`) instead of hex-encoding it. Once
+        // `parse_fields` strips those quotes, the stored value is
+        // indistinguishable from the unquoted hex form of "ab" by looking at the
+        // string alone — the old heuristic (even length, all hex, len() > 2)
+        // decoded it anyway, silently turning a real filename into "ab". The fix
+        // is to only decode fields the parser itself marked unquoted.
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("scontext".to_string(), "httpd_t".to_string());
+        fields.insert("tclass".to_string(), "file".to_string());
+        fields.insert("name".to_string(), "6162".to_string());
+
+        let record = AuditRecord {
+            record_type: AUDIT_AVC,
+            timestamp_sec: 0,
+            timestamp_ms: 0,
+            seq: 0,
+            fields,
+            // Not in the set: this value arrived quoted on the wire.
+            unquoted_fields: std::collections::HashSet::new(),
+        };
+
+        let AuditEvent::PolicyDenial { object_path, .. } = classify(&record).unwrap() else {
+            panic!("expected PolicyDenial event");
+        };
+        assert_eq!(object_path.as_deref(), Some("6162"));
+    }
+
+    #[test]
+    fn classify_avc_without_path_or_name_is_none() {
+        // Non-file `tclass` denials (`process`, `capability`, ...) carry neither
+        // field.
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("scontext".to_string(), "unconfined_t".to_string());
+        fields.insert("tclass".to_string(), "process".to_string());
+
+        let record = AuditRecord {
+            record_type: AUDIT_AVC,
+            timestamp_sec: 0,
+            timestamp_ms: 0,
+            seq: 0,
+            fields,
+            unquoted_fields: std::collections::HashSet::new(),
+        };
+
+        let AuditEvent::PolicyDenial { object_path, .. } = classify(&record).unwrap() else {
+            panic!("expected PolicyDenial event");
+        };
+        assert_eq!(object_path, None);
     }
 
     #[test]
@@ -362,6 +602,7 @@ mod tests {
             timestamp_ms: 0,
             seq: 0,
             fields,
+            unquoted_fields: std::collections::HashSet::new(),
         };
 
         let AuditEvent::PolicyDenial { permissive, .. } = classify(&record).unwrap() else {
@@ -381,6 +622,7 @@ mod tests {
             timestamp_ms: 0,
             seq: 0,
             fields,
+            unquoted_fields: std::collections::HashSet::new(),
         };
 
         assert!(classify(&record).is_none());

@@ -89,6 +89,12 @@ pub struct Detection {
     /// emitting engine (top-k), not by the schema.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attributions: Vec<ScoreAttribution>,
+    /// ATT&CK technique identifiers (`T1234` or `T1234.001`), issue #74. Plural: a
+    /// single alert can span more than one technique (e.g. a beacon detection
+    /// tagged both C2 and exfiltration). Empty for engines that don't yet attribute
+    /// a technique (ML tiers today — no model-to-technique mapping exists).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub techniques: Vec<String>,
     /// The triggering events, embedded by value — events carry no global id, so a
     /// detection is self-contained evidence. Engines bound how many they attach.
     pub events: Vec<Event>,

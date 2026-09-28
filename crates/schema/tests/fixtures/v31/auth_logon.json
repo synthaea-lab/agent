@@ -1,0 +1,14 @@
+{
+  "type": "auth",
+  "meta": {
+    "pid": 604,
+    "ppid": 0,
+    "user": { "os": "windows", "sid": "S-1-5-18", "integrity_level": 16384 },
+    "timestamp_ns": 1756900006000000000,
+    "comm": "lsass.exe"
+  },
+  "outcome": "success",
+  "kind": "logon",
+  "target_user": "victim",
+  "target_user_sid": "S-1-5-21-1004336348-1177238915-682003330-1001"
+}

@@ -550,6 +550,140 @@ fn beacon_flow_and_connect_share_the_same_window_state() {
     assert_eq!(alerts[0].technique, "T1071/T1041");
 }
 
+// ── SCAN-SPREAD (T1046/T1210, issue #465) ───────────────────────────────────
+
+#[test]
+fn scan_spread_below_threshold_does_not_alert() {
+    let mut state = RuleState::new();
+    for i in 0..(SCAN_SPREAD_THRESHOLD - 1) {
+        let alerts = state.on_connect(&connect_event_full(
+            500,
+            "bot",
+            [10, 0, 0, i as u8],
+            23,
+            u64::from(i) * 10_000_000,
+        ));
+        assert!(alerts.is_empty());
+    }
+}
+
+#[test]
+fn scan_spread_distinct_destinations_triggers_alert() {
+    // Shape of the live Mirai detonation that motivated #465: one pid, one
+    // port (23), many distinct destinations, back to back.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..SCAN_SPREAD_THRESHOLD {
+        alerts.extend(state.on_connect(&connect_event_full(
+            500,
+            "bot",
+            [10, 0, 0, i as u8],
+            23,
+            u64::from(i) * 10_000_000,
+        )));
+    }
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1046/T1210");
+}
+
+#[test]
+fn scan_spread_repeated_destination_does_not_count_twice() {
+    // The BEACON mirror image: hammering the *same* destination repeatedly
+    // must not cross *this* threshold, however many connections it takes —
+    // that shape is check_beacon's job, not this one's (and check_beacon
+    // does legitimately fire here on the same events — it's the
+    // T1046/T1210 alert this test asserts against, not every alert).
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..(SCAN_SPREAD_THRESHOLD * 2) {
+        alerts.extend(state.on_connect(&connect_event_full(
+            500,
+            "app",
+            [10, 0, 0, 1],
+            23,
+            u64::from(i) * 10_000_000,
+        )));
+    }
+    assert!(
+        !alerts.iter().any(|a| a.technique == "T1046/T1210"),
+        "repeating one destination is not a scan/spread burst"
+    );
+}
+
+#[test]
+fn scan_spread_outside_window_resets() {
+    let mut state = RuleState::new();
+    for i in 0..(SCAN_SPREAD_THRESHOLD - 1) {
+        state.on_connect(&connect_event_full(500, "bot", [10, 0, 0, i as u8], 23, 0));
+    }
+    // Past the window relative to the first (SCAN_SPREAD_THRESHOLD - 1)
+    // destinations — they must have expired, so one more distinct
+    // destination here must not complete the threshold.
+    let alerts = state.on_connect(&connect_event_full(
+        500,
+        "bot",
+        [10, 0, 0, 200],
+        23,
+        SCAN_SPREAD_WINDOW_NS + 1,
+    ));
+    assert!(alerts.is_empty());
+}
+
+#[test]
+fn scan_spread_correlates_only_its_own_pid_and_port() {
+    let mut state = RuleState::new();
+    for i in 0..(SCAN_SPREAD_THRESHOLD - 1) {
+        state.on_connect(&connect_event_full(500, "bot", [10, 0, 0, i as u8], 23, 0));
+    }
+    // Different pid: must not inherit the other pid's near-threshold count.
+    let alerts = state.on_connect(&connect_event_full(501, "bot", [10, 0, 0, 200], 23, 0));
+    assert!(alerts.is_empty());
+}
+
+#[test]
+fn scan_spread_standard_port_still_alerts() {
+    // Unlike BEACON, STANDARD_PORTS must not exclude this rule — a spray
+    // across many distinct hosts on a "standard" port (22, 23, 3389, ...) is
+    // exactly the lateral-movement/credential-spray case #465 exists for.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..SCAN_SPREAD_THRESHOLD {
+        alerts.extend(state.on_connect(&connect_event_full(
+            500,
+            "bot",
+            [10, 0, 0, i as u8],
+            443, // in STANDARD_PORTS
+            u64::from(i) * 10_000_000,
+        )));
+    }
+    assert_eq!(
+        alerts.len(),
+        1,
+        "STANDARD_PORTS is a BEACON-only exclusion, not SCAN-SPREAD's"
+    );
+    assert_eq!(alerts[0].technique, "T1046/T1210");
+}
+
+#[test]
+fn scan_spread_does_not_realert_within_window() {
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..(SCAN_SPREAD_THRESHOLD + 5) {
+        alerts.extend(state.on_connect(&connect_event_full(
+            500,
+            "bot",
+            [10, 0, 0, i as u8],
+            23,
+            u64::from(i) * 10_000_000,
+        )));
+    }
+    assert_eq!(
+        alerts.len(),
+        1,
+        "crossing the threshold again within the same window must not realert"
+    );
+}
+
 // ── LISTENER-DRIFT via sock_diag polling (issue #92, ListenPortEvent) ───────────
 
 #[test]

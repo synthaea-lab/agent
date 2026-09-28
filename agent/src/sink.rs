@@ -466,7 +466,11 @@ fn start_yara(
             Some(yara::ScanQueue::start(rules, move |outcome| {
                 let matched = !outcome.matches.is_empty();
                 for rule in &outcome.matches {
-                    let message = format!("yara rule {rule} matched {}", outcome.path.display());
+                    let message = format!(
+                        "yara rule {} matched {}",
+                        rule.identifier,
+                        outcome.path.display()
+                    );
                     alert_log.record("YARA", message);
                 }
                 if matched {
