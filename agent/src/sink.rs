@@ -71,6 +71,43 @@ pub(crate) struct DetectionSink {
     /// Issue #25's automated response, `None` until (if ever) `enable_response` sets
     /// it — see [`ResponseHooks`].
     response: Arc<Mutex<Option<ResponseHooks>>>,
+    /// Issue #131: cross-engine verdict fusion, keyed the same way the correlator
+    /// keys its own belief state (`(ppid, comm)` — see `verdict::EntityKey`). Every
+    /// rule/Sigma/correlator finding folds in here before it reaches the alert log,
+    /// so the same technique flagged by two engines on one entity is one finding,
+    /// not two, and `maybe_kill` reads a fused severity instead of a bare
+    /// technique-name check. YARA matches are not folded in: the scan queue is
+    /// deliberately decoupled from the triggering process (`crates/yara/src/
+    /// queue.rs`'s settle delay) and carries no pid/entity context today — wiring
+    /// that through is separate follow-up work, not part of this pass.
+    verdict: Mutex<verdict::VerdictEngine>,
+}
+
+/// How long a technique already recorded for an entity stays "the same finding":
+/// a second engine (or the same engine again) reporting it inside this window
+/// folds in silently instead of producing a second alert. Matches the
+/// ransomware-detection window's order of magnitude (`crates/rules/src/
+/// exclusions.rs`'s `RANSOMWARE_RENAME_WINDOW_NS`) — long enough to absorb
+/// ordinary cross-engine timing skew (Sigma/rules run inline, the correlator
+/// reacts to the same event a few lines later), short enough that a genuine
+/// second occurrence of the same technique still gets its own finding.
+const VERDICT_DEDUP_WINDOW_NS: u64 = 30_000_000_000; // 30s
+
+/// Severity for a finding, until issue #73/#467's per-rule severity metadata
+/// lands on `main` — `rules`/`correlator` alerts carry no severity field yet on
+/// this branch (only `technique: &'static str` + `message`), so this is a
+/// deliberate placeholder, not real calibration. `BAYES` keeps the significance
+/// it already had before this issue (the correlator's belief crossing its
+/// confidence threshold, gated for process-kill by `response`); everything else
+/// defaults to `Medium`. Swap this for reading a real per-rule `Severity` once
+/// #73 lands it — the fusion engine itself doesn't care where severity comes
+/// from.
+fn default_severity(technique: &str) -> schema::detection::Severity {
+    if technique == "BAYES" {
+        schema::detection::Severity::Critical
+    } else {
+        schema::detection::Severity::Medium
+    }
 }
 
 impl DetectionSink {
@@ -110,6 +147,7 @@ impl DetectionSink {
             enrich_queue,
             progress: Arc::new(AtomicU64::new(0)),
             response,
+            verdict: Mutex::new(verdict::VerdictEngine::new(VERDICT_DEDUP_WINDOW_NS)),
         })
     }
 
@@ -201,13 +239,66 @@ impl DetectionSink {
         Arc::clone(&self.progress)
     }
 
+    /// Folds one engine's finding into the fused per-entity verdict (issue #131)
+    /// and emits exactly one alert line for it — unless verdict fusion already
+    /// absorbed it as a duplicate of the entity's current live finding (same
+    /// technique, another engine or a repeat, inside `VERDICT_DEDUP_WINDOW_NS`),
+    /// in which case nothing new reaches the alert log. Returns the fused
+    /// verdict whenever one was produced, so a caller that needs to act on the
+    /// entity's overall severity (`correlate`'s kill gate) can read it instead
+    /// of re-deriving significance from the technique string.
+    fn record_and_emit(
+        &self,
+        entity: &verdict::EntityKey,
+        technique: &str,
+        message: &str,
+        source: schema::detection::DetectionSource,
+        event: &Event,
+        now_ns: u64,
+    ) -> Option<verdict::Verdict> {
+        let detection = schema::detection::Detection {
+            timestamp_ns: now_ns,
+            severity: default_severity(technique),
+            title: message.to_string(),
+            source,
+            score: None,
+            attributions: Vec::new(),
+            events: vec![event.clone()],
+        };
+        let result =
+            self.verdict
+                .lock()
+                .unwrap()
+                .record(entity.clone(), technique, detection, now_ns);
+        if result.is_some() {
+            self.emit(technique, message);
+        }
+        result
+    }
+
+    /// [`Self::record_and_emit`] for a batch of plain `rules::Alert`s (no Sigma/
+    /// correlator-specific `DetectionSource` needed) — the common case for every
+    /// `rule_state`/`rules::evaluate_*` call site.
+    fn record_rule_alerts(&self, event: &Event, alerts: impl IntoIterator<Item = rules::Alert>) {
+        let meta = event.meta();
+        let entity = verdict::EntityKey::new(meta.ppid, meta.comm.clone());
+        let now_ns = meta.timestamp_ns;
+        for alert in alerts {
+            let source = schema::detection::DetectionSource::Rule {
+                rule_id: alert.technique.to_string(),
+            };
+            self.record_and_emit(
+                &entity,
+                alert.technique,
+                &alert.message,
+                source,
+                event,
+                now_ns,
+            );
+        }
+    }
+
     /// Cross-event correlation (co-occurrence rules + Bayesian belief).
-    ///
-    /// `BAYES` is today's only correlator output with a real number behind it (the
-    /// belief engine's `log_odds`, gated by its own threshold before it ever fires —
-    /// see `correlator::bayes`); the co-occurrence rules carry no confidence field.
-    /// Issue #131 (verdict fusion) will give this a principled score to key off
-    /// instead of a technique-name check.
     ///
     /// ML correlation scorer (issue #46 Phase 3, #47 Phase 2): if available, scores
     /// the pid's behavior over the correlator window and updates the belief state with
@@ -264,11 +355,32 @@ impl DetectionSink {
             }
         }
 
-        // Emit alerts from co-occurrence rules and Bayesian belief.
-        let is_high_confidence = alerts.iter().any(|alert| alert.technique == "BAYES");
         drop(engine); // Unlock correlator before alert emission (log I/O).
+
+        // Fold co-occurrence rules and Bayesian belief into the entity's fused
+        // verdict (issue #131): `is_high_confidence` now reads the fused severity
+        // instead of a bare `technique == "BAYES"` check, so a future engine that
+        // also raises this entity to `Critical` gates the same kill path — not
+        // just the correlator.
+        let meta = event.meta();
+        let entity = verdict::EntityKey::new(meta.ppid, meta.comm.clone());
+        let case_id = format!("{}:{}", entity.ppid, entity.comm);
+        let mut is_high_confidence = false;
         for alert in &alerts {
-            self.emit(alert.technique, &alert.message);
+            let source = schema::detection::DetectionSource::Correlator {
+                case_id: case_id.clone(),
+            };
+            if let Some(verdict) = self.record_and_emit(
+                &entity,
+                alert.technique,
+                &alert.message,
+                source,
+                event,
+                meta.timestamp_ns,
+            ) && verdict.severity >= schema::detection::Severity::Critical
+            {
+                is_high_confidence = true;
+            }
         }
         if is_high_confidence {
             self.maybe_kill(pid);
@@ -301,35 +413,42 @@ impl DetectionSink {
     }
 
     /// Exec events: stateless rules, stateful rules, then Sigma.
-    fn detect_exec(&self, event: &schema::ExecEvent) {
-        for alert in rules::evaluate_exec(event) {
-            self.emit(alert.technique, &alert.message);
-        }
-        for alert in self.rule_state.lock().unwrap().on_exec(event) {
-            self.emit(alert.technique, &alert.message);
-        }
+    fn detect_exec(&self, wrapped: &Event, event: &schema::ExecEvent) {
+        self.record_rule_alerts(wrapped, rules::evaluate_exec(event));
+        self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_exec(event));
         if let Some(sigma) = &self.sigma {
+            let entity = verdict::EntityKey::new(event.meta.ppid, event.meta.comm.clone());
             for hit in sigma.eval_exec(event) {
                 let technique = if hit.tags.is_empty() {
                     "Sigma".to_string()
                 } else {
                     hit.tags.join("/")
                 };
-                self.emit(&technique, &hit.title);
+                let source = schema::detection::DetectionSource::Sigma {
+                    rule_id: hit.title.clone(),
+                };
+                self.record_and_emit(
+                    &entity,
+                    &technique,
+                    &hit.title,
+                    source,
+                    wrapped,
+                    event.meta.timestamp_ns,
+                );
             }
         }
     }
 
     /// `FileOpen` events: stateless rules, downloader-write history, and the
     /// budgeted YARA queue on write intent (off the event path).
-    fn detect_file_open(&self, event: &schema::FileOpenEvent) {
+    fn detect_file_open(&self, wrapped: &Event, event: &schema::FileOpenEvent) {
         let state_alerts = self.rule_state.lock().unwrap().on_file_open(event);
-        for alert in rules::evaluate_file_open(event)
-            .into_iter()
-            .chain(state_alerts)
-        {
-            self.emit(alert.technique, &alert.message);
-        }
+        self.record_rule_alerts(
+            wrapped,
+            rules::evaluate_file_open(event)
+                .into_iter()
+                .chain(state_alerts),
+        );
         if let Some(yara) = &self.yara
             && event.flags & 0o103 != 0
         {
@@ -345,55 +464,50 @@ impl DetectionSink {
     }
 
     /// Connect events: beacon detection.
-    fn detect_connect(&self, event: &schema::ConnectEvent) {
-        for alert in self.rule_state.lock().unwrap().on_connect(event) {
-            self.emit(alert.technique, &alert.message);
-        }
+    fn detect_connect(&self, wrapped: &Event, event: &schema::ConnectEvent) {
+        self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_connect(event));
     }
 
     /// `NetworkFlow` events (conntrack polling, issue #92): same beacon detection as
     /// `detect_connect`, deduped per-flow so a poll-based source doesn't
     /// false-positive on one ordinary long-lived connection.
-    fn detect_network_flow(&self, event: &schema::NetworkFlowEvent) {
-        for alert in self.rule_state.lock().unwrap().on_network_flow(event) {
-            self.emit(alert.technique, &alert.message);
-        }
+    fn detect_network_flow(&self, wrapped: &Event, event: &schema::NetworkFlowEvent) {
+        self.record_rule_alerts(
+            wrapped,
+            self.rule_state.lock().unwrap().on_network_flow(event),
+        );
     }
 
     /// `ListenPort` events (`sock_diag` polling, issue #92): LISTENER-DRIFT.
-    fn detect_listen_port(&self, event: &schema::ListenPortEvent) {
-        for alert in self.rule_state.lock().unwrap().on_listen_port(event) {
-            self.emit(alert.technique, &alert.message);
-        }
+    fn detect_listen_port(&self, wrapped: &Event, event: &schema::ListenPortEvent) {
+        self.record_rule_alerts(
+            wrapped,
+            self.rule_state.lock().unwrap().on_listen_port(event),
+        );
     }
 
     /// `Auth` events: brute-force/spray burst detection (T1110, pack #377).
-    fn detect_auth(&self, event: &schema::AuthEvent) {
-        for alert in self.rule_state.lock().unwrap().on_auth(event) {
-            self.emit(alert.technique, &alert.message);
-        }
+    fn detect_auth(&self, wrapped: &Event, event: &schema::AuthEvent) {
+        self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_auth(event));
     }
 
     /// `FileDelete` events: log-tamper detection (T1070.001/.002, pack #379).
-    fn detect_file_delete(&self, event: &schema::FileDeleteEvent) {
-        for alert in rules::evaluate_file_delete(event) {
-            self.emit(alert.technique, &alert.message);
-        }
+    fn detect_file_delete(&self, wrapped: &Event, event: &schema::FileDeleteEvent) {
+        self.record_rule_alerts(wrapped, rules::evaluate_file_delete(event));
     }
 
     /// `Signal` events: security-process tampering (T1562.001, issue #362).
-    fn detect_signal(&self, event: &schema::SignalEvent) {
-        for alert in rules::evaluate_signal(event) {
-            self.emit(alert.technique, &alert.message);
-        }
+    fn detect_signal(&self, wrapped: &Event, event: &schema::SignalEvent) {
+        self.record_rule_alerts(wrapped, rules::evaluate_signal(event));
     }
 
     /// `FileRename` events: mass-rename ransomware detection (T1486, issue #262) +
     /// write-volume corroboration (issue #82).
-    fn detect_file_rename(&self, event: &schema::FileRenameEvent) {
-        for alert in self.rule_state.lock().unwrap().on_file_rename(event) {
-            self.emit(alert.technique, &alert.message);
-        }
+    fn detect_file_rename(&self, wrapped: &Event, event: &schema::FileRenameEvent) {
+        self.record_rule_alerts(
+            wrapped,
+            self.rule_state.lock().unwrap().on_file_rename(event),
+        );
     }
 
     /// `FileWrite` events: no alert on their own — tracks per-pid write volume for
@@ -536,16 +650,16 @@ impl EventSink for DetectionSink {
         // or signature synchronously (issue #126).
         self.correlate(&event);
         match &event {
-            Event::Exec(e) => self.detect_exec(e),
-            Event::FileOpen(e) => self.detect_file_open(e),
-            Event::Connect(e) => self.detect_connect(e),
-            Event::NetworkFlow(e) => self.detect_network_flow(e),
-            Event::ListenPort(e) => self.detect_listen_port(e),
-            Event::Auth(e) => self.detect_auth(e),
-            Event::FileDelete(e) => self.detect_file_delete(e),
-            Event::Signal(e) => self.detect_signal(e),
+            Event::Exec(e) => self.detect_exec(&event, e),
+            Event::FileOpen(e) => self.detect_file_open(&event, e),
+            Event::Connect(e) => self.detect_connect(&event, e),
+            Event::NetworkFlow(e) => self.detect_network_flow(&event, e),
+            Event::ListenPort(e) => self.detect_listen_port(&event, e),
+            Event::Auth(e) => self.detect_auth(&event, e),
+            Event::FileDelete(e) => self.detect_file_delete(&event, e),
+            Event::Signal(e) => self.detect_signal(&event, e),
             Event::FileQuarantine(e) => self.detect_file_quarantine(e),
-            Event::FileRename(e) => self.detect_file_rename(e),
+            Event::FileRename(e) => self.detect_file_rename(&event, e),
             Event::FileWrite(e) => self.detect_file_write(e),
             // New telemetry categories reach the engines as they land; until a rule
             // consumes them, logging below is the whole treatment.
@@ -714,6 +828,61 @@ mod tests {
         assert!(
             alerts.contains("T1059.004"),
             "base64-decode rule must land in alerts.ndjson, got: {alerts}"
+        );
+    }
+
+    /// Issue #131: verdict fusion dedups the same technique on the same entity
+    /// (here: same `(ppid, comm)`, and — since both events carry the fixture's
+    /// neutral `timestamp_ns: 0` — the same instant, well inside the dedup
+    /// window) rather than alerting twice for what is one finding.
+    #[test]
+    fn repeated_identical_exec_alerts_fold_into_one_finding() {
+        let dir = tmp("verdict-dedup");
+        let sink = sink_in(&dir);
+        let ev = exec(
+            50,
+            "bash -c echo cGF5bG9hZAo= | base64 -d | sh",
+            "/bin/bash",
+        );
+        sink.on_event(ev.clone());
+        sink.on_event(ev);
+        let alerts = alerts_in(&dir);
+        assert_eq!(
+            alerts.matches("T1059.004").count(),
+            1,
+            "the same technique on the same entity, same instant, must fold into \
+             one finding, not two: {alerts}"
+        );
+    }
+
+    /// The flip side of the dedup test: fusion is scoped per entity
+    /// (`(ppid, comm)`) — a different entity raising the identical technique
+    /// must still get its own finding, not be silently absorbed by the first
+    /// entity's state.
+    #[test]
+    fn the_same_technique_on_a_different_entity_still_alerts() {
+        let dir = tmp("verdict-cross-entity");
+        let sink = sink_in(&dir);
+        sink.on_event(exec(
+            60,
+            "bash -c echo cGF5bG9hZAo= | base64 -d | sh",
+            "/bin/bash",
+        ));
+        let mut other = exec(
+            61,
+            "bash -c echo cGF5bG9hZAo= | base64 -d | sh",
+            "/bin/bash",
+        );
+        if let Event::Exec(e) = &mut other {
+            e.meta.ppid = 2;
+            e.meta.comm = "sh".into();
+        }
+        sink.on_event(other);
+        let alerts = alerts_in(&dir);
+        assert_eq!(
+            alerts.matches("T1059.004").count(),
+            2,
+            "a distinct entity must get its own finding: {alerts}"
         );
     }
 
