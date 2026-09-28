@@ -24,7 +24,9 @@ fn exec(image: &str, cmdline: &str) -> ExecEvent {
 
 fn parse(yaml: &str) -> SigmaRule {
     let rule: SigmaRule = serde_yaml::from_str(yaml).unwrap();
-    validate(&rule, "<test>").unwrap();
+    // Under a platform segment so the metadata validator's directory check passes —
+    // these fixtures test eval/selector behavior, not the platform check itself.
+    validate(&rule, "<test>/linux/rule.yml").unwrap();
     rule
 }
 
@@ -45,6 +47,11 @@ fn eval_rule_endswith_image() {
         r#"
 title: Test cmd
 description: test
+tags:
+  - attack.t1059
+level: medium
+falsepositives:
+  - none known
 detection:
   selection:
     Image|endswith: '\cmd.exe'
@@ -63,6 +70,11 @@ fn eval_rule_commandline_contains() {
         r#"
 title: Base64 PowerShell
 description: PS encoded
+tags:
+  - attack.t1059.001
+level: high
+falsepositives:
+  - none known
 detection:
   selection:
     Image|endswith: '\powershell.exe'
@@ -82,12 +94,44 @@ detection:
     assert!(eval_rule_exec(&rule, &ev2).is_none());
 }
 
+/// Issue #74: `SigmaAlert.techniques` is the ATT&CK-tag subset of `tags`, normalized
+/// to bare uppercase form, with non-technique tactic tags filtered out.
+#[test]
+fn eval_rule_extracts_techniques_from_tags() {
+    let rule = parse(
+        r#"
+title: Base64 PowerShell
+description: PS encoded
+tags:
+  - attack.execution
+  - attack.t1059.001
+  - attack.defense_evasion
+  - attack.t1027
+level: high
+falsepositives:
+  - none known
+detection:
+  selection:
+    Image|endswith: '\powershell.exe'
+  condition: selection
+"#,
+    );
+    let ev = exec("C:\\Windows\\System32\\powershell.exe", "powershell.exe");
+    let alert = eval_rule_exec(&rule, &ev).unwrap();
+    assert_eq!(alert.techniques, vec!["T1059.001", "T1027"]);
+}
+
 #[test]
 fn eval_rule_keywords() {
     let rule = parse(
         r#"
 title: Suspicious keyword
 description: test
+tags:
+  - attack.t1003
+level: high
+falsepositives:
+  - none known
 detection:
   selection:
     - mimikatz
@@ -107,6 +151,11 @@ fn parent_image_matches_only_with_lineage() {
         r#"
 title: Office spawning shell
 description: test
+tags:
+  - attack.t1059
+level: high
+falsepositives:
+  - none known
 detection:
   selection:
     ParentImage|endswith: '\winword.exe'
@@ -146,8 +195,9 @@ fn interior_wildcards_are_rejected_at_load() {
 
 #[test]
 fn keyword_wildcards_match_like_field_globs() {
-    let rule =
-        parse("title: KW\ndetection:\n  selection:\n    - '*mimikatz*'\n  condition: selection\n");
+    let rule = parse(
+        "title: KW\ntags:\n  - attack.t1003\nlevel: high\nfalsepositives:\n  - none known\ndetection:\n  selection:\n    - '*mimikatz*'\n  condition: selection\n",
+    );
     let ev = exec("C:\\t\\x.exe", "run mimikatz please");
     assert!(eval_rule_exec(&rule, &ev).is_some());
 }
@@ -155,7 +205,7 @@ fn keyword_wildcards_match_like_field_globs() {
 #[test]
 fn modifier_case_is_insensitive_at_eval() {
     let rule = parse(
-        "title: Case\ndetection:\n  selection:\n    Image|EndsWith: '\\cmd.exe'\n  condition: selection\n",
+        "title: Case\ntags:\n  - attack.t1059\nlevel: medium\nfalsepositives:\n  - none known\ndetection:\n  selection:\n    Image|EndsWith: '\\cmd.exe'\n  condition: selection\n",
     );
     let ev = exec("C:\\Windows\\System32\\cmd.exe", "cmd.exe");
     assert!(

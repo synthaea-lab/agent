@@ -42,6 +42,8 @@ jobs:
           cargo +nightly fmt --all --check
       - name: dependency direction
         run: python3 tools/check-deps.py
+      - name: attack coverage matrix up to date
+        run: python3 tools/attack-coverage.py --check
       - name: PowerShell scripts ASCII-only
         run: python3 tools/check-ps1-ascii.py
       - name: docs build clean

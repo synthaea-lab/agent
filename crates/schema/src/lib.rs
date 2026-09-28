@@ -173,15 +173,22 @@ pub mod time;
 /// to `u64` and the new optional [`KernelModuleEvent::path`] (#457). A v27
 /// reader rejects a capability mask above `u32::MAX` (`CAP_BPF` is bit 39),
 /// so the widening is serialization-visible even though every value below
-/// 2^32 still serializes identically. 28 is claimed by #469 (ATT&CK technique
-/// ids) while both branches are open; whichever merges second renumbers —
-/// same coordination note as v13 and ADR-0005.
+/// 2^32 still serializes identically. 28 was claimed by #469 (ATT&CK technique
+/// ids) while both branches were open; #457 merged first, so #469 renumbers
+/// below — same coordination note as v13 and ADR-0005.
 ///
 /// Bumped 29 → 30 for [`PolicyDenialEvent::object_path`] (#427, Linux half:
 /// filled from the AVC record's `path=`/`name=`; the Windows `AppLocker` half —
 /// switching the 8004 emitter off `FileOpenEvent` and adding the 8003 audit-
 /// mode target — is a separate follow-up, #428 was step 1 only).
-pub const SCHEMA_VERSION: u32 = 30;
+///
+/// Bumped 30 → 31 for [`detection::Detection::techniques`] (#74): structured
+/// ATT&CK technique identifiers on a detection, additive `Vec<String>`
+/// alongside `attributions`, no new variant. 30 was claimed by #469 while
+/// both branches were open; #427/#490 merged first, so #469 renumbers here —
+/// same coordination note as v13, v28→29, and ADR-0005. Same
+/// serialization-visible reasoning as every field addition since v13.
+pub const SCHEMA_VERSION: u32 = 31;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
