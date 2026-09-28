@@ -968,10 +968,12 @@ impl Sensor for EventLogSensor {
             EventLogTransport::Subscribe => {
                 #[cfg(windows)]
                 {
+                    let mut enabled = 0_usize;
                     for target in TARGETS {
                         if !(target.enabled)(&self.config) {
                             continue;
                         }
+                        enabled += 1;
                         // `subscribe` returns `None` on `EvtSubscribe`
                         // failure (channel disabled, denied, invalid XPath).
                         // The failure is logged inside `subscribe`; we
@@ -986,6 +988,13 @@ impl Sensor for EventLogSensor {
                             subscriptions.push(handle);
                         }
                     }
+                    // One line that tells a degraded Subscribe transport from a
+                    // healthy one; each failure is logged inside `subscribe`.
+                    tracing::info!(
+                        established = subscriptions.len(),
+                        enabled,
+                        "event log subscriptions registered"
+                    );
                 }
             }
         }
@@ -1405,5 +1414,97 @@ mod applocker_tests {
                 integrity_level: None,
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod subscribe_tests {
+    use std::{
+        io,
+        sync::{Arc, Mutex, atomic::AtomicBool},
+    };
+
+    use super::*;
+
+    struct NullSink;
+
+    impl EventSink for NullSink {
+        fn on_event(&self, _event: Event) {}
+    }
+
+    /// `tracing` output captured in memory, for asserting on log lines.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Subscribes to `target` with `tracing` captured; returns whether the
+    /// subscription registered and every line logged meanwhile.
+    fn subscribe_capturing_logs(target: &'static PollTarget) -> (bool, String) {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let handle = tracing::subscriber::with_default(subscriber, || {
+            crate::subscribe::subscribe(
+                target,
+                Arc::new(NullSink),
+                Arc::new(EventLogCounters::default()),
+                Arc::new(AtomicBool::new(false)),
+            )
+        });
+        let logs = String::from_utf8_lossy(&captured.0.lock().expect("capture lock")).into_owned();
+        (handle.is_some(), logs)
+    }
+
+    fn target_on(channel: &'static str) -> PollTarget {
+        PollTarget {
+            label: "subscribe-test",
+            heartbeat: "windows-eventlog:subscribe-test",
+            channel,
+            // An ID no provider emits: the subscription registers, nothing fires.
+            id_filter: "EventID=65000",
+            counter: |c| &c.service_installs,
+            parse_block: |_| None,
+            enable_audit: None,
+            enabled: |_| true,
+        }
+    }
+
+    static READABLE: std::sync::LazyLock<PollTarget> =
+        std::sync::LazyLock::new(|| target_on("Application"));
+    static MISSING: std::sync::LazyLock<PollTarget> =
+        std::sync::LazyLock::new(|| target_on("Synthaea-No-Such-Channel/Operational"));
+
+    #[test]
+    fn an_established_subscription_is_logged() {
+        // Regression (#423): a live Subscribe run could only be proven by the
+        // absence of poll lines. `Application` is readable without elevation.
+        let (registered, logs) = subscribe_capturing_logs(&READABLE);
+        assert!(
+            registered,
+            "EvtSubscribe on Application should register: {logs}"
+        );
+        assert!(logs.contains("subscription established"), "{logs}");
+        assert!(logs.contains("channel=\"Application\""), "{logs}");
+    }
+
+    #[test]
+    fn a_failed_subscription_is_not_logged_as_established() {
+        let (registered, logs) = subscribe_capturing_logs(&MISSING);
+        assert!(!registered);
+        assert!(logs.contains("EvtSubscribe failed to register"), "{logs}");
+        assert!(!logs.contains("subscription established"), "{logs}");
     }
 }

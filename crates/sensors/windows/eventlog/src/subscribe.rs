@@ -327,6 +327,14 @@ pub(crate) fn subscribe(
         return None;
     }
 
+    // The Subscribe transport's counterpart of "poll started": without it, a
+    // live run could only prove the subscriptions by the absence of poll lines
+    // (#423).
+    tracing::info!(
+        target = target.label,
+        channel = target.channel,
+        "subscription established"
+    );
     Some(SubscriptionHandle {
         handle,
         ctx: ctx_raw,
