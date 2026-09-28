@@ -6,7 +6,8 @@ use std::{collections::HashMap, net::IpAddr};
 
 use schema::{
     AuthEvent, AuthOutcome, ConnectEvent, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
-    FileOpenEvent, FileQuarantineEvent, FileRenameEvent, ListenPortEvent, NetworkFlowEvent, User,
+    FileOpenEvent, FileQuarantineEvent, FileRenameEvent, FileWriteEvent, ListenPortEvent,
+    NetworkFlowEvent, User,
 };
 use store::BoundedMap;
 
@@ -14,15 +15,16 @@ use crate::{
     Alert,
     exclusions::{
         AGENT_CHILD_EXCLUSIONS, AUTH_FAILURE_THRESHOLD, AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD,
-        BEACON_WINDOW_NS, BROWSERS, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS,
-        LOLBIN_LEGIT_PARENTS, LOLBINS, QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_LOOP_CHILD_MAX,
-        RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SELF_SPAWN_EXCLUSIONS,
-        SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_THRESHOLD, SELF_SPAWN_WINDOW_NS, SHELL_COMMS,
-        STANDARD_PORTS, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN,
-        TASK_REGISTRATION_DEDUP_WINDOW_NS, WEB_SERVER_COMMS,
+        BEACON_WINDOW_NS, BROWSERS, BURST_WRITE_BYTES_THRESHOLD, DOWNLOAD_EXEC_WINDOW_NS,
+        DOWNLOADER_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, QUARANTINE_EXEC_WINDOW_NS,
+        RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD,
+        RANSOMWARE_RENAME_WINDOW_NS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
+        SELF_SPAWN_THRESHOLD, SELF_SPAWN_WINDOW_NS, SHELL_COMMS, STANDARD_PORTS,
+        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
+        WEB_SERVER_COMMS,
     },
     has_write_intent,
-    sliding::{FlowPortDedup, SlidingCounter},
+    sliding::{FlowPortDedup, SlidingCounter, SlidingSum},
 };
 
 struct RecentWrite {
@@ -102,6 +104,19 @@ pub struct RuleState {
     /// per-pid counter alone would miss it (issue #262 review, old-dov). LRU-bounded.
     /// `ppid <= 1` (unknown/init) is never keyed here — see `check_mass_rename_pattern`.
     ransomware_rename_by_ppid: BoundedMap<u32, SlidingCounter>,
+    /// pid → sliding sum of `FileWriteEvent::bytes_requested` (issue #82): the
+    /// write-volume half of a second, independent T1486 corroboration signal —
+    /// heavy write volume alongside a rename burst, regardless of whether the
+    /// rename shape itself matched `check_mass_rename_pattern`'s prefix-preserving
+    /// pattern. LRU-bounded.
+    write_volume: BoundedMap<u32, SlidingSum>,
+    /// pid → sliding counter of renames, any shape — the rename half of the
+    /// write-volume corroboration signal above. Deliberately separate from
+    /// `ransomware_rename`: that counter only records prefix-preserving renames
+    /// (`check_mass_rename_pattern`'s shape), this one counts every rename, so a
+    /// pid that renames heavily without preserving the original name still
+    /// contributes here.
+    rename_count: BoundedMap<u32, SlidingCounter>,
     /// Task leaf name → last reported T1053.005 registration, so one registration
     /// seen on both Security 4698 and TaskScheduler/Operational 106 alerts once
     /// (#422). LRU-bounded like the counters.
@@ -145,6 +160,8 @@ impl RuleState {
             auth_failures: BoundedMap::new(COUNTER_CAP),
             ransomware_rename: BoundedMap::new(COUNTER_CAP),
             ransomware_rename_by_ppid: BoundedMap::new(COUNTER_CAP),
+            write_volume: BoundedMap::new(COUNTER_CAP),
+            rename_count: BoundedMap::new(COUNTER_CAP),
             task_registrations: BoundedMap::new(COUNTER_CAP),
             own_pid: None,
             ld_trust_extra: Vec::new(),
@@ -882,9 +899,72 @@ impl RuleState {
         None
     }
 
-    /// To be called for every `FileRenameEvent` in the stream (T1486, issue #262).
+    /// To be called for every `FileRenameEvent` in the stream (T1486, issue #262 +
+    /// #82's write-volume corroboration).
     pub fn on_file_rename(&mut self, event: &FileRenameEvent) -> Vec<Alert> {
-        self.check_mass_rename_pattern(event).into_iter().collect()
+        let mut alerts: Vec<Alert> = self.check_mass_rename_pattern(event).into_iter().collect();
+        alerts.extend(self.check_burst_write_volume(event));
+        alerts
+    }
+
+    /// To be called for every `FileWriteEvent` in the stream. Does not produce
+    /// alerts directly — tracks write volume per pid (issue #82), consumed by
+    /// `check_burst_write_volume` on the next `FileRenameEvent`.
+    pub fn on_file_write(&mut self, event: &FileWriteEvent) {
+        self.write_volume
+            .get_or_insert_with(event.meta.pid, SlidingSum::default)
+            .add(
+                event.meta.timestamp_ns,
+                event.bytes_requested,
+                RANSOMWARE_RENAME_WINDOW_NS,
+            );
+    }
+
+    /// Second, independent T1486 signal (issue #82): heavy write volume alongside
+    /// a rename burst, regardless of whether the rename shape matched
+    /// `check_mass_rename_pattern`'s prefix-preserving pattern — catches an
+    /// encryptor that writes-new-then-unlinks or otherwise doesn't keep the
+    /// original name as a prefix of the new one.
+    ///
+    /// Deliberately no name-keyed exclusion here: `FileRenameEvent`/`FileWriteEvent`
+    /// carry no executable path (same gap `check_mass_rename_pattern`'s doc
+    /// describes, tracked in #459), so a `comm`-only exclusion would be spoofable.
+    /// `RANSOMWARE_EXCLUDED_PATH_PREFIXES` is path-based, not name-based, and stays.
+    fn check_burst_write_volume(&mut self, event: &FileRenameEvent) -> Option<Alert> {
+        if RANSOMWARE_EXCLUDED_PATH_PREFIXES
+            .iter()
+            .any(|prefix| event.new_path.starts_with(prefix))
+        {
+            return None;
+        }
+        let ts = event.meta.timestamp_ns;
+        // Independent field from `rename_count` below — read first so the
+        // `SlidingCounter` borrow can stay held through the `try_alert` call.
+        let bytes_written = self
+            .write_volume
+            .get_or_insert_with(event.meta.pid, SlidingSum::default)
+            .total(ts, RANSOMWARE_RENAME_WINDOW_NS);
+        let entry = self
+            .rename_count
+            .get_or_insert_with(event.meta.pid, SlidingCounter::default);
+        let rename_count = entry.record(ts, RANSOMWARE_RENAME_WINDOW_NS);
+        if rename_count >= RANSOMWARE_RENAME_THRESHOLD
+            && bytes_written >= BURST_WRITE_BYTES_THRESHOLD
+            && entry.try_alert(ts, RANSOMWARE_RENAME_WINDOW_NS)
+        {
+            return Some(Alert {
+                technique: "T1486",
+                message: format!(
+                    "pid={} comm={} wrote {}MB and renamed {rename_count}x in {}s — \
+                     suspected ransomware kill chain",
+                    event.meta.pid,
+                    event.meta.comm,
+                    bytes_written / (1024 * 1024),
+                    RANSOMWARE_RENAME_WINDOW_NS / 1_000_000_000,
+                ),
+            });
+        }
+        None
     }
 }
 

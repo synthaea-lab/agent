@@ -828,6 +828,127 @@ fn in_place_edit_backup_is_a_documented_false_positive() {
     assert_eq!(alerts[0].technique, "T1486");
 }
 
+// ── T1486 write-volume corroboration (issue #82) ───────────────────────────
+// Second, independent signal alongside check_mass_rename_pattern: heavy write
+// volume + a rename burst, regardless of rename shape — catches a
+// write-new-then-unlink encryptor that doesn't preserve the original name as a
+// prefix (check_mass_rename_pattern's shape requirement). Renames below use an
+// unrelated old/new path pair so check_mass_rename_pattern's own shape check never
+// fires, isolating the volume signal under test.
+
+#[test]
+fn burst_write_and_rename_fires_without_matching_rename_shape() {
+    let mut state = RuleState::new();
+    state.on_file_write(&file_write_event_full(7100, "evil", 60 * 1024 * 1024, 0));
+    state.on_file_write(&file_write_event_full(
+        7100,
+        "evil",
+        60 * 1024 * 1024,
+        1_000_000_000,
+    ));
+
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            7100,
+            "evil",
+            &format!("/home/u/src{i}.docx"),
+            &format!("/home/u/dst{i}.docx"),
+            2_000_000_000 + u64::from(i) * 100_000_000,
+        )));
+    }
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+}
+
+#[test]
+fn burst_write_alone_does_not_alert_without_mass_rename() {
+    let mut state = RuleState::new();
+    state.on_file_write(&file_write_event_full(
+        7101,
+        "evil",
+        BURST_WRITE_BYTES_THRESHOLD * 2,
+        0,
+    ));
+    let alerts = state.on_file_rename(&file_rename_event_full(
+        7101,
+        "evil",
+        "/home/u/one_src.docx",
+        "/home/u/one_dst.docx",
+        1_000_000_000,
+    ));
+    assert!(
+        alerts.is_empty(),
+        "one rename is not a burst, even with heavy write volume"
+    );
+}
+
+#[test]
+fn mass_rename_without_write_volume_does_not_trigger_volume_signal() {
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            7102,
+            "evil",
+            &format!("/home/u/src{i}.docx"),
+            &format!("/home/u/dst{i}.docx"),
+            u64::from(i) * 100_000_000,
+        )));
+    }
+    assert!(
+        alerts.is_empty(),
+        "a rename burst with no write volume, and no rename-shape match, must not alert"
+    );
+}
+
+#[test]
+fn burst_write_and_rename_excludes_tmp_path() {
+    let mut state = RuleState::new();
+    state.on_file_write(&file_write_event_full(7103, "tar", 200 * 1024 * 1024, 0));
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            7103,
+            "tar",
+            &format!("/tmp/src{i}.docx"),
+            &format!("/tmp/dst{i}.docx"),
+            1_000_000_000 + u64::from(i) * 100_000_000,
+        )));
+    }
+    assert!(
+        alerts.is_empty(),
+        "/tmp is excluded (compression temp files)"
+    );
+}
+
+#[test]
+fn burst_write_and_rename_does_not_realert_within_window() {
+    let mut state = RuleState::new();
+    state.on_file_write(&file_write_event_full(7104, "evil", 60 * 1024 * 1024, 0));
+    state.on_file_write(&file_write_event_full(
+        7104,
+        "evil",
+        60 * 1024 * 1024,
+        1_000_000_000,
+    ));
+    let mut fired = 0;
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD + 10 {
+        let alerts = state.on_file_rename(&file_rename_event_full(
+            7104,
+            "evil",
+            &format!("/home/u/src{i}.docx"),
+            &format!("/home/u/dst{i}.docx"),
+            2_000_000_000 + u64::from(i) * 100_000_000,
+        ));
+        fired += alerts.len();
+    }
+    assert_eq!(
+        fired, 1,
+        "one alert per window, not one per rename past threshold"
+    );
+}
+
 // ── T1620 memfd fileless exec (stateless, issue #85) ───────────────────────
 // Strings below are what the kernel actually emits (traced on Alpine 6.18.50
 // against a live memfd exec, #85 review) — NOT `/memfd:<name> (deleted)`, which is

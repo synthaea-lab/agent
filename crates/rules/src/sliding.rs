@@ -1,4 +1,5 @@
-//! The sliding-window counter shared by SELF-SPAWN and BEACON.
+//! The sliding-window counter shared by SELF-SPAWN and BEACON, and the sliding-sum
+//! shared by the ransomware write-volume signal (issue #82).
 
 use std::collections::VecDeque;
 
@@ -64,6 +65,55 @@ pub(crate) struct FlowPortDedup {
 /// Same reasoning as `SLIDING_TIMESTAMPS_CAP`: bounds one key's memory, not a
 /// count of legitimate distinct flows expected in practice.
 const FLOW_PORT_DEDUP_CAP: usize = 256;
+
+/// Sliding-window sum ("N bytes written in X seconds") — `SlidingCounter` counts
+/// occurrences, this sums a value per occurrence. Used by the ransomware
+/// write-volume corroboration check (issue #82) to track write volume per pid.
+#[derive(Default)]
+pub(crate) struct SlidingSum {
+    entries: VecDeque<(u64, u64)>,
+    total: u64,
+}
+
+/// Same reasoning as `SLIDING_TIMESTAMPS_CAP`.
+const SLIDING_SUM_CAP: usize = 256;
+
+impl SlidingSum {
+    /// Drops entries older than `window_ns` relative to `ts`, keeping `total` in sync.
+    fn prune(&mut self, ts: u64, window_ns: u64) {
+        while self
+            .entries
+            .front()
+            .is_some_and(|&(t, _)| ts.saturating_sub(t) > window_ns)
+        {
+            if let Some((_, v)) = self.entries.pop_front() {
+                self.total = self.total.saturating_sub(v);
+            }
+        }
+    }
+
+    /// Prunes expired entries, adds `value` at `ts`, returns the new in-window total.
+    pub(crate) fn add(&mut self, ts: u64, value: u64, window_ns: u64) -> u64 {
+        self.prune(ts, window_ns);
+        self.entries.push_back((ts, value));
+        self.total = self.total.saturating_add(value);
+        if self.entries.len() > SLIDING_SUM_CAP
+            && let Some((_, v)) = self.entries.pop_front()
+        {
+            self.total = self.total.saturating_sub(v);
+        }
+        self.total
+    }
+
+    /// Prunes expired entries and returns the current in-window total, without
+    /// adding a new value — for a check that needs to read another event
+    /// stream's accumulated volume (the ransomware check reads write volume from
+    /// a `FileRenameEvent`).
+    pub(crate) fn total(&mut self, ts: u64, window_ns: u64) -> u64 {
+        self.prune(ts, window_ns);
+        self.total
+    }
+}
 
 impl FlowPortDedup {
     /// Prunes ports last seen outside the window, then reports whether

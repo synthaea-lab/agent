@@ -15,8 +15,8 @@ use crate::{
     check_scheduled_task_persistence, check_scheduled_task_update_persistence,
     check_service_install_persistence, check_systemd_service_persistence,
     exclusions::{
-        AUTH_FAILURE_THRESHOLD, BEACON_THRESHOLD, RANSOMWARE_RENAME_THRESHOLD,
-        RANSOMWARE_RENAME_WINDOW_NS, SELF_SPAWN_THRESHOLD,
+        AUTH_FAILURE_THRESHOLD, BEACON_THRESHOLD, BURST_WRITE_BYTES_THRESHOLD,
+        RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SELF_SPAWN_THRESHOLD,
     },
 };
 
@@ -102,6 +102,24 @@ fn file_rename_event_full(
     event.meta.timestamp_ns = timestamp_ns;
     event.meta.comm = comm.to_string();
     event
+}
+
+fn file_write_event_full(
+    pid: u32,
+    comm: &str,
+    bytes_requested: u64,
+    timestamp_ns: u64,
+) -> schema::FileWriteEvent {
+    schema::FileWriteEvent {
+        meta: EventMeta {
+            pid,
+            comm: comm.to_string(),
+            timestamp_ns,
+            ..meta()
+        },
+        bytes_requested,
+        ..schema::fixtures::file_write()
+    }
 }
 
 fn file_open_event_containerized(path: &str, container_id: &str) -> FileOpenEvent {

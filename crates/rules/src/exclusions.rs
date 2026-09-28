@@ -66,6 +66,23 @@ pub(crate) const RANSOMWARE_RENAME_WINDOW_NS: u64 = 5_000_000_000; // 5s
 /// almost immediately and is caught by the per-pid counter instead — this keeps one
 /// process's burst from also driving the shared per-ppid counter to a second alert.
 pub(crate) const RANSOMWARE_LOOP_CHILD_MAX: u32 = 3;
+
+// ── Ransomware write-volume corroboration (T1486, issue #82) ───────────────
+// Second, independent signal alongside check_mass_rename_pattern's shape check:
+// heavy write volume + a rename burst, regardless of the rename shape. Reuses
+// RANSOMWARE_RENAME_THRESHOLD/_WINDOW_NS above for "what counts as a burst" so the
+// two signals agree on calibration.
+
+/// 100MB written in the same window as `RANSOMWARE_RENAME_THRESHOLD` renames is the
+/// "full kill chain" signal: encrypt = read + heavy write + rename.
+pub(crate) const BURST_WRITE_BYTES_THRESHOLD: u64 = 100 * 1024 * 1024;
+
+/// Compression temp files land here — the one documented FP source for a
+/// heavy-write + mass-rename shape (archive extraction/creation). Path-based, not
+/// name-keyed, so it doesn't need the evidence-gating `check_mass_rename_pattern`'s
+/// doc describes for `comm`-based exclusions.
+pub(crate) const RANSOMWARE_EXCLUDED_PATH_PREFIXES: &[&str] = &["/tmp/", "/var/tmp/"];
+
 /// Pairing window for one scheduled-task registration seen on both Security 4698
 /// and TaskScheduler/Operational 106 (#422, T1053.005). The two are normalized by
 /// separate poll threads, each on a 2s cadence, so their timestamps land a few

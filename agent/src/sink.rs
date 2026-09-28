@@ -388,11 +388,19 @@ impl DetectionSink {
         }
     }
 
-    /// `FileRename` events: mass-rename ransomware detection (T1486, issue #262).
+    /// `FileRename` events: mass-rename ransomware detection (T1486, issue #262) +
+    /// write-volume corroboration (issue #82).
     fn detect_file_rename(&self, event: &schema::FileRenameEvent) {
         for alert in self.rule_state.lock().unwrap().on_file_rename(event) {
             self.emit(alert.technique, &alert.message);
         }
+    }
+
+    /// `FileWrite` events: no alert on their own — tracks per-pid write volume for
+    /// the ransomware write-volume corroboration signal (T1486, issue #82),
+    /// consumed on the next `FileRename`.
+    fn detect_file_write(&self, event: &schema::FileWriteEvent) {
+        self.rule_state.lock().unwrap().on_file_write(event);
     }
 
     /// Writes one alert to the shared log and highlighted stderr. `pub(crate)`
@@ -534,6 +542,7 @@ impl EventSink for DetectionSink {
             Event::Signal(e) => self.detect_signal(e),
             Event::FileQuarantine(e) => self.detect_file_quarantine(e),
             Event::FileRename(e) => self.detect_file_rename(e),
+            Event::FileWrite(e) => self.detect_file_write(e),
             // New telemetry categories reach the engines as they land; until a rule
             // consumes them, logging below is the whole treatment.
             _ => {}
