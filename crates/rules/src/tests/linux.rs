@@ -1083,64 +1083,201 @@ fn burst_write_and_rename_does_not_realert_within_window() {
     );
 }
 
-// ── T1620 memfd fileless exec (stateless, issue #85) ───────────────────────
+// ── T1620 memfd fileless exec (stateful since #497, issue #85) ─────────────
 // Strings below are what the kernel actually emits (traced on Alpine 6.18.50
 // against a live memfd exec, #85 review) — NOT `/memfd:<name> (deleted)`, which is
 // only what `readlink /proc/<pid>/exe` shows and the sensor never reads.
 
-#[test]
-fn memfd_exec_matches_dev_fd_path() {
-    // execveat(fd, "", AT_EMPTY_PATH): bprm->filename is /dev/fd/<n>.
-    let mut event = exec_event("");
-    event.image_path = "/dev/fd/3".to_string();
-    let alert = check_memfd_exec(&event).unwrap();
-    assert_eq!(alert.technique, "T1620");
+fn memfd_exec_event(pid: u32, comm: &str, image_path: &str, timestamp_ns: u64) -> ExecEvent {
+    let mut event = exec_event_full(pid, 1, comm, "", timestamp_ns);
+    event.image_path = image_path.to_string();
+    event
 }
 
 #[test]
-fn memfd_exec_matches_proc_self_fd_path() {
-    // execv via /proc/self/fd/<n>.
-    let mut event = exec_event("");
-    event.image_path = "/proc/self/fd/3".to_string();
-    let alert = check_memfd_exec(&event).unwrap();
-    assert_eq!(alert.technique, "T1620");
+fn memfd_exec_matches_dev_fd_path_with_memfd_comm() {
+    // execveat(fd, "", AT_EMPTY_PATH): bprm->filename is /dev/fd/<n>, and the
+    // kernel names the task after the memfd dentry.
+    let event = memfd_exec_event(100, "memfd:payload", "/dev/fd/3", 0);
+    let alerts = RuleState::new().on_exec(&event);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1620");
 }
 
 #[test]
-fn memfd_exec_matches_proc_pid_fd_path() {
-    let mut event = exec_event("");
-    event.image_path = "/proc/12345/fd/3".to_string();
-    let alert = check_memfd_exec(&event).unwrap();
-    assert_eq!(alert.technique, "T1620");
+fn dev_fd_path_without_memfd_comm_does_not_alert() {
+    // Regression (#497): the first cut treated /dev/fd/<n> alone as
+    // sufficient — a real on-disk binary exec'd via
+    // open()+execveat(fd,"",AT_EMPTY_PATH) produces this exact path shape
+    // too, with an ordinary comm, and isn't fileless.
+    let event = memfd_exec_event(100, "busybox", "/dev/fd/3", 0);
+    assert!(RuleState::new().on_exec(&event).is_empty());
 }
 
 #[test]
-fn memfd_exec_matches_via_comm() {
-    // The execveat(AT_EMPTY_PATH) case names the task after the memfd dentry.
-    let mut event = exec_event("");
-    event.meta.comm = "memfd:payload".to_string();
-    event.image_path = "/dev/fd/3".to_string();
-    let alert = check_memfd_exec(&event).unwrap();
-    assert_eq!(alert.technique, "T1620");
+fn proc_self_fd_exec_with_prior_memfd_create_matches() {
+    let mut state = RuleState::new();
+    state.on_memfd_create(&memfd_create_event_full(100, 0));
+    let event = memfd_exec_event(100, "4", "/proc/self/fd/3", 10_000_000); // 10ms later
+    let alerts = state.on_exec(&event);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1620");
+}
+
+#[test]
+fn proc_pid_fd_exec_with_prior_memfd_create_matches() {
+    let mut state = RuleState::new();
+    state.on_memfd_create(&memfd_create_event_full(100, 0));
+    let event = memfd_exec_event(100, "4", "/proc/100/fd/3", 10_000_000);
+    let alerts = state.on_exec(&event);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1620");
+}
+
+#[test]
+fn runc_style_proc_self_fd_reexec_without_memfd_create_does_not_alert() {
+    // Regression (#497, live on the lab VM): runc's own CVE-2019-5736
+    // self-protection re-execs "runc init" via /proc/self/fd/<n> on every
+    // container start — comm truncated to the fd number, parent_comm=runc,
+    // no memfd_create anywhere in the picture. `docker run --rm alpine true`
+    // x3 gave 3 false T1620 alerts before this fix.
+    let event = memfd_exec_event(200, "6", "/proc/self/fd/6", 0);
+    assert!(RuleState::new().on_exec(&event).is_empty());
+}
+
+#[test]
+fn proc_fd_exec_past_the_correlation_window_does_not_alert() {
+    let mut state = RuleState::new();
+    state.on_memfd_create(&memfd_create_event_full(100, 0));
+    let event = memfd_exec_event(100, "4", "/proc/self/fd/3", MEMFD_EXEC_WINDOW_NS + 1);
+    assert!(state.on_exec(&event).is_empty());
+}
+
+#[test]
+fn proc_fd_exec_correlates_only_its_own_pid() {
+    let mut state = RuleState::new();
+    state.on_memfd_create(&memfd_create_event_full(999, 0)); // a different pid
+    let event = memfd_exec_event(100, "4", "/proc/self/fd/3", 10_000_000);
+    assert!(state.on_exec(&event).is_empty());
 }
 
 #[test]
 fn normal_exec_does_not_match_memfd() {
     let event = exec_event("/usr/bin/ls -la");
-    assert!(check_memfd_exec(&event).is_none());
+    assert!(RuleState::new().on_exec(&event).is_empty());
 }
 
 #[test]
 fn path_with_fd_in_an_unrelated_location_does_not_false_positive() {
     // Contains "/fd/" but isn't rooted at /dev or /proc — a real user path.
-    let mut event = exec_event("");
-    event.image_path = "/home/user/documents/fd/notes.txt".to_string();
-    assert!(check_memfd_exec(&event).is_none());
+    let event = memfd_exec_event(100, "notes", "/home/user/documents/fd/notes.txt", 0);
+    assert!(RuleState::new().on_exec(&event).is_empty());
 }
 
 #[test]
 fn proc_fd_path_with_non_numeric_pid_does_not_false_positive() {
-    let mut event = exec_event("");
-    event.image_path = "/proc/self/fd/notanumber".to_string();
-    assert!(check_memfd_exec(&event).is_none());
+    let event = memfd_exec_event(100, "x", "/proc/self/fd/notanumber", 0);
+    assert!(RuleState::new().on_exec(&event).is_empty());
+}
+
+#[test]
+fn memfd_create_arriving_after_a_pending_proc_fd_exec_alerts_retroactively() {
+    // Regression (#503 review, Nikolas): the kernel always creates the memfd
+    // before executing it, but userspace drains the two ring buffers
+    // independently, so the exec event can be processed here first. The exec
+    // must not be silently dropped just because its evidence hasn't arrived
+    // yet.
+    let mut state = RuleState::new();
+    let exec = memfd_exec_event(100, "4", "/proc/self/fd/3", 10_000_000);
+    assert!(
+        state.on_exec(&exec).is_empty(),
+        "no corroborating evidence yet — held, not alerted, and not dropped"
+    );
+    let alerts = state.on_memfd_create(&memfd_create_event_full(100, 0)); // "before" the exec, kernel-time
+    assert_eq!(
+        alerts.len(),
+        1,
+        "the held exec must alert once its evidence arrives, even though \
+         the exec was processed first"
+    );
+    assert_eq!(alerts[0].technique, "T1620");
+}
+
+#[test]
+fn memfd_create_outside_the_window_does_not_retroactively_alert() {
+    let mut state = RuleState::new();
+    let exec = memfd_exec_event(100, "4", "/proc/self/fd/3", MEMFD_EXEC_WINDOW_NS + 1);
+    assert!(state.on_exec(&exec).is_empty());
+    let alerts = state.on_memfd_create(&memfd_create_event_full(100, 0));
+    assert!(
+        alerts.is_empty(),
+        "a creation more than MEMFD_EXEC_WINDOW_NS before the held exec \
+         must not retroactively alert"
+    );
+}
+
+#[test]
+fn pending_proc_fd_exec_is_consumed_and_does_not_double_alert() {
+    let mut state = RuleState::new();
+    let exec = memfd_exec_event(100, "4", "/proc/self/fd/3", 10_000_000);
+    assert!(state.on_exec(&exec).is_empty());
+    let first = state.on_memfd_create(&memfd_create_event_full(100, 0));
+    assert_eq!(first.len(), 1);
+    // A second creation for the same pid must not re-match the same
+    // already-consumed pending exec.
+    let second = state.on_memfd_create(&memfd_create_event_full(100, 5_000_000));
+    assert!(second.is_empty());
+}
+
+#[test]
+fn a_memfd_created_after_the_exec_does_not_corroborate_it_via_the_retroactive_path() {
+    // Regression (#503 review, Jihair, caught live on the lab VM): the kernel
+    // always creates the memfd before the exec, so a memfd_create timestamped
+    // *after* the held exec is a different, unrelated call — not late
+    // evidence for it. `saturating_sub` alone can't distinguish "arrived
+    // late but really was earlier" from "really did happen later": both
+    // directions produce a small delta once one timestamp exceeds the other,
+    // so the ordering itself must be checked, not just the window.
+    let mut state = RuleState::new();
+    let exec = memfd_exec_event(100, "3", "/proc/self/fd/3", 0);
+    assert!(state.on_exec(&exec).is_empty());
+    // This memfd_create is stamped 8s *after* the held exec — same shape as
+    // the live false positive (an unrelated memfd_create long after an
+    // on-disk /proc/self/fd re-exec, e.g. a payload using memfd for IPC).
+    let alerts = state.on_memfd_create(&memfd_create_event_full(100, 8_000_000_000));
+    assert!(
+        alerts.is_empty(),
+        "a memfd created after the held exec must not retroactively corroborate it"
+    );
+}
+
+#[test]
+fn a_memfd_created_after_the_exec_does_not_corroborate_it_via_the_forward_path() {
+    // Same bug, other delivery order: the memfd_create is seen first (and
+    // recorded), then an unrelated /proc/fd exec for the same pid arrives
+    // stamped *before* that creation. The creation cannot be evidence for an
+    // exec that (by wall-clock/kernel time) happened first.
+    let mut state = RuleState::new();
+    state.on_memfd_create(&memfd_create_event_full(100, 8_000_000_000));
+    let event = memfd_exec_event(100, "3", "/proc/self/fd/3", 0);
+    assert!(
+        state.on_exec(&event).is_empty(),
+        "a memfd created after this exec must not corroborate it"
+    );
+}
+
+#[test]
+fn proc_fd_shape_alert_does_not_overclaim_the_dev_fd_shapes_disk_free_evidence() {
+    // #503 review: the /proc/fd shape is pid+time correlation, not proof the
+    // executed fd is the created memfd — the message must not claim more
+    // than that.
+    let mut state = RuleState::new();
+    state.on_memfd_create(&memfd_create_event_full(100, 0));
+    let event = memfd_exec_event(100, "4", "/proc/self/fd/3", 10_000_000);
+    let alerts = state.on_exec(&event);
+    assert_eq!(alerts.len(), 1);
+    assert!(
+        !alerts[0].message.contains("no payload ever touched disk"),
+        "the /proc/fd shape can't back that claim, unlike /dev/fd + memfd: comm"
+    );
 }

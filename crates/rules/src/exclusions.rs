@@ -25,6 +25,17 @@ pub(crate) const SHELL_COMMS: &[&str] = &["sh", "bash", "dash", "zsh", "ash"];
 /// scenario anyway).
 pub(crate) const DOWNLOAD_EXEC_WINDOW_NS: u64 = 60_000_000_000; // 60s
 
+/// Correlation window between a `memfd_create(2)` and an exec via
+/// `/proc/(self|<pid>)/fd/<n>` of the same pid that still counts as the same
+/// fileless-exec sequence (T1620, issue #497). A real memfd payload is
+/// created, written, then exec'd back-to-back within one short-lived
+/// process's own syscall sequence — microseconds to low milliseconds apart in
+/// practice — so this is generous headroom for scheduling jitter while
+/// staying short enough that pid reuse (a new, unrelated process reusing the
+/// same pid number well after the original exited) can't plausibly land
+/// inside it. Uncalibrated against fleet traffic (first cut, 2026-09-28).
+pub(crate) const MEMFD_EXEC_WINDOW_NS: u64 = 5_000_000_000; // 5s
+
 /// Window between a download-provenance mark (`FileQuarantine`: macOS quarantine
 /// xattr, Windows `Zone.Identifier`) and an exec of the marked file that still
 /// counts as "downloaded, then run" (T1204.002, #365). Wider than
