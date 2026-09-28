@@ -26,10 +26,16 @@ use updater::{ContentEntry, ContentManifest, UpdaterError};
 /// boundary `updater::banlist` already accepts for its ban list).
 #[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ContentState {
-    /// The highest `release_version` successfully applied for this ring, if
-    /// any — `None` on a fresh install (day zero, same as
-    /// `ReleaseManifest::check_release_version`'s `None` case).
-    pub(crate) release_version: Option<u64>,
+    /// The highest `release_version` successfully applied, keyed by ring —
+    /// per review (PR #509), a single shared counter would let an agent that
+    /// is ever pointed at a different ring (a ring reassignment, or a
+    /// mismatched manifest that predates the `plan` ring check) lock itself
+    /// out of that ring's own real releases as "not newer than installed",
+    /// even after the mismatch itself is caught. `None`/absent for a ring is
+    /// day zero for it, same as `ReleaseManifest::check_release_version`'s
+    /// `None` case.
+    #[serde(default)]
+    pub(crate) release_version: BTreeMap<String, u64>,
     /// path -> sha256 of every artifact currently applied.
     #[serde(default)]
     pub(crate) entries: BTreeMap<String, String>,
@@ -44,6 +50,12 @@ impl ContentState {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e),
         }
+    }
+
+    /// The last-applied `release_version` for `ring`, or `None` if this ring
+    /// has never been applied.
+    fn release_version_for(&self, ring: &str) -> Option<u64> {
+        self.release_version.get(ring).copied()
     }
 }
 
@@ -64,14 +76,19 @@ pub(crate) struct FetchPlan {
 /// # Errors
 ///
 /// Propagates [`UpdaterError::SchemaVersionUnsupported`],
-/// [`UpdaterError::SignatureInvalid`], or [`UpdaterError::ReleaseNotNewer`] —
-/// the same checks a binary self-update manifest gets, applied to content.
+/// [`UpdaterError::SignatureInvalid`], [`UpdaterError::RingMismatch`] (checked
+/// right after the signature — a valid signature only proves who signed the
+/// manifest, not that it's the one for `ring`), or
+/// [`UpdaterError::ReleaseNotNewer`] — the same checks a binary self-update
+/// manifest gets, applied to content.
 pub(crate) fn plan(
     manifest: &ContentManifest,
+    ring: &str,
     state: &ContentState,
 ) -> Result<FetchPlan, UpdaterError> {
     manifest.verify_signature()?;
-    manifest.check_release_version(state.release_version)?;
+    manifest.check_ring(ring)?;
+    manifest.check_release_version(state.release_version_for(ring))?;
     let to_fetch = manifest
         .entries_to_fetch(&state.entries)
         .into_iter()
@@ -112,7 +129,7 @@ pub(crate) fn cmd_check_content_manifest(
     let manifest: ContentManifest = client.get_json(&url)?;
 
     let state = ContentState::load(state_path)?;
-    match plan(&manifest, &state) {
+    match plan(&manifest, ring, &state) {
         Ok(plan) => {
             println!(
                 "ring {ring}: release {} available, {} entr{} to fetch",
@@ -145,11 +162,19 @@ mod tests {
     /// JSON, Ed25519 over that, hex-encoded. Then round-trips through JSON so
     /// tests exercise what a real fetch would actually deserialize.
     fn signed_manifest_json(release_version: u64, entries: Vec<ContentEntry>) -> ContentManifest {
+        signed_manifest_json_for_ring("canary_0", release_version, entries)
+    }
+
+    fn signed_manifest_json_for_ring(
+        ring: &str,
+        release_version: u64,
+        entries: Vec<ContentEntry>,
+    ) -> ContentManifest {
         let mut m = ContentManifest {
             entries,
-            released_at: "2026-09-23T16:00:00Z".to_string(),
             release_version,
-            ring: "canary_0".to_string(),
+            released_at: "2026-09-23T16:00:00Z".to_string(),
+            ring: ring.to_string(),
             schema_version: updater::content::CONTENT_MANIFEST_SCHEMA_VERSION,
             signature: String::new(),
         };
@@ -173,7 +198,7 @@ mod tests {
     fn a_fresh_install_needs_every_entry() {
         let manifest = signed_manifest_json(1, vec![entry("rules/a.sigma")]);
         let state = ContentState::default();
-        let result = plan(&manifest, &state).unwrap();
+        let result = plan(&manifest, "canary_0", &state).unwrap();
         assert_eq!(result.release_version, 1);
         assert_eq!(result.to_fetch.len(), 1);
     }
@@ -185,19 +210,17 @@ mod tests {
         state
             .entries
             .insert("rules/a.sigma".to_string(), "a".repeat(64));
-        let result = plan(&manifest, &state).unwrap();
+        let result = plan(&manifest, "canary_0", &state).unwrap();
         assert!(result.to_fetch.is_empty());
     }
 
     #[test]
     fn a_manifest_no_newer_than_the_applied_release_is_rejected() {
         let manifest = signed_manifest_json(1, vec![entry("rules/a.sigma")]);
-        let state = ContentState {
-            release_version: Some(1),
-            entries: BTreeMap::new(),
-        };
+        let mut state = ContentState::default();
+        state.release_version.insert("canary_0".to_string(), 1);
         assert!(matches!(
-            plan(&manifest, &state),
+            plan(&manifest, "canary_0", &state),
             Err(UpdaterError::ReleaseNotNewer {
                 offered: 1,
                 current: 1
@@ -211,9 +234,41 @@ mod tests {
         manifest.entries.push(entry("rules/injected.sigma"));
         let state = ContentState::default();
         assert!(matches!(
-            plan(&manifest, &state),
+            plan(&manifest, "canary_0", &state),
             Err(UpdaterError::SignatureInvalid)
         ));
+    }
+
+    #[test]
+    fn a_correctly_signed_manifest_for_another_ring_is_rejected() {
+        // Concrete attack this pins (PR #509 review): a prod agent requests
+        // `prod` but is served (or a stale response cache/misrouted request
+        // returns) a validly-signed `canary_0` manifest with a higher
+        // release_version. Without a ring check this would verify and be
+        // accepted, applying the least-vetted ring's content to a prod agent.
+        let manifest = signed_manifest_json(99, vec![entry("rules/a.sigma")]);
+        let state = ContentState::default();
+        assert!(matches!(
+            plan(&manifest, "prod", &state),
+            Err(UpdaterError::RingMismatch { requested, found })
+                if requested == "prod" && found == "canary_0"
+        ));
+    }
+
+    #[test]
+    fn anti_rollback_state_is_scoped_per_ring() {
+        // A ring reassignment (or an agent that has fetched more than one
+        // ring's manifest) must not have one ring's higher release_version
+        // lock out another ring's own, independently-numbered releases.
+        let mut state = ContentState::default();
+        state.release_version.insert("canary_0".to_string(), 50);
+
+        // release_version 10 for `prod` — lower than canary_0's 50, but prod
+        // has never been applied in this state, so it must still pass.
+        let prod_manifest = signed_manifest_json_for_ring("prod", 10, vec![entry("rules/a.sigma")]);
+
+        let result = plan(&prod_manifest, "prod", &state).unwrap();
+        assert_eq!(result.release_version, 10);
     }
 
     fn tmp(name: &str) -> std::path::PathBuf {
@@ -236,7 +291,7 @@ mod tests {
         let dir = tmp("round-trip");
         let path = dir.join("content-state.json");
         let mut state = ContentState {
-            release_version: Some(3),
+            release_version: BTreeMap::from([("canary_0".to_string(), 3)]),
             entries: BTreeMap::new(),
         };
         state

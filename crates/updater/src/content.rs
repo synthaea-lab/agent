@@ -58,12 +58,12 @@ pub struct ContentEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContentManifest {
     pub entries: Vec<ContentEntry>,
+    /// Monotone, strictly increasing per `ring`. See [`Self::check_release_version`].
+    pub release_version: u64,
     /// ISO 8601 UTC timestamp, e.g. `2026-09-23T16:00:00Z`. Kept as the raw
     /// string the server sent — this crate never computes with it, only a
     /// caller displaying "last updated" would parse it.
     pub released_at: String,
-    /// Monotone, strictly increasing per `ring`. See [`Self::check_release_version`].
-    pub release_version: u64,
     /// Target ring (`canary_0`/`canary_1`/`canary_2`/`prod`). A plain string for
     /// the same reason as [`ContentEntry::content_type`] — this crate compares
     /// it, never branches on an exhaustive match.
@@ -118,6 +118,27 @@ impl ContentManifest {
         public_key
             .verify(&msg, &sig_bytes)
             .map_err(|_| UpdaterError::SignatureInvalid)
+    }
+
+    /// Rejects a manifest whose `ring` does not match `requested` — a valid
+    /// signature only proves the server signed this manifest, not that it is
+    /// the manifest for the ring the caller actually asked for. Without this,
+    /// a validly-signed manifest for a different ring (e.g. a less-vetted
+    /// canary release replayed against a prod agent) would still verify.
+    /// Callers must check this before, or alongside,
+    /// [`Self::check_release_version`] — see `agent::content::plan`.
+    ///
+    /// # Errors
+    ///
+    /// [`UpdaterError::RingMismatch`] if `self.ring != requested`.
+    pub fn check_ring(&self, requested: &str) -> Result<(), UpdaterError> {
+        if self.ring != requested {
+            return Err(UpdaterError::RingMismatch {
+                requested: requested.to_string(),
+                found: self.ring.clone(),
+            });
+        }
+        Ok(())
     }
 
     /// Anti-rollback-attack check, same shape as
@@ -245,6 +266,25 @@ mod tests {
     }
 
     #[test]
+    fn check_ring_accepts_a_matching_ring() {
+        let m = signed_manifest(1);
+        assert!(m.check_ring("canary_0").is_ok());
+    }
+
+    #[test]
+    fn check_ring_rejects_a_correctly_signed_manifest_for_another_ring() {
+        // A validly-signed canary_0 manifest must not pass as a prod manifest
+        // just because the signature verifies — the signature proves who
+        // signed it, not that it's the manifest for the ring asked for.
+        let m = signed_manifest(1);
+        assert!(matches!(
+            m.check_ring("prod"),
+            Err(UpdaterError::RingMismatch { requested, found })
+                if requested == "prod" && found == "canary_0"
+        ));
+    }
+
+    #[test]
     fn release_version_must_exceed_the_installed_one() {
         let m = signed_manifest(5);
         assert!(m.check_release_version(Some(4)).is_ok());
@@ -294,5 +334,37 @@ mod tests {
         assert_eq!(a.canonical_bytes(), b.canonical_bytes());
         a.signature.clear();
         assert_eq!(a.canonical_bytes(), b.canonical_bytes());
+    }
+}
+
+/// Parity-seam golden fixture (CLAUDE.md): one real, signed manifest checked
+/// in once at `server/tests/fixtures/content-manifest-golden.json` and
+/// verified by both this crate's tests and the server's TS unit tests
+/// (`server/tests/unit/content-manifest-golden.test.ts`), so a canonicalization
+/// mismatch between the two sides (PR #509 review) can't silently reappear.
+#[cfg(test)]
+mod golden_fixture {
+    use super::*;
+
+    const GOLDEN_FIXTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../server/tests/fixtures/content-manifest-golden.json"
+    ));
+
+    #[test]
+    fn golden_fixture_verifies_against_the_embedded_key() {
+        let manifest: ContentManifest = serde_json::from_str(GOLDEN_FIXTURE).unwrap();
+        manifest.verify_signature().unwrap();
+    }
+
+    #[test]
+    fn golden_fixture_bytes_are_the_canonical_form() {
+        // The fixture file itself is `serde_json::to_string_pretty` of the
+        // signed manifest — asserts the checked-in bytes haven't drifted from
+        // what this crate would itself produce, so a hand-edit of the fixture
+        // can't silently break the cross-language comparison it exists for.
+        let manifest: ContentManifest = serde_json::from_str(GOLDEN_FIXTURE).unwrap();
+        let regenerated = serde_json::to_string_pretty(&manifest).unwrap();
+        assert_eq!(GOLDEN_FIXTURE.trim_end(), regenerated.trim_end());
     }
 }
