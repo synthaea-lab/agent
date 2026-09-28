@@ -221,7 +221,7 @@ def main() -> None:
         print(f"ok: {OUTPUT} is up to date ({len(findings)} techniques)")
         return
 
-    OUTPUT.write_text(content, encoding="utf-8")
+    OUTPUT.write_text(content, encoding="utf-8", newline="\n")
     print(f"wrote {OUTPUT} ({len(findings)} techniques)")
 
 
