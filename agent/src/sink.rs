@@ -374,7 +374,7 @@ impl DetectionSink {
         }
     }
 
-    /// `FileDelete` events: log-tamper detection (T1070.002, pack #379).
+    /// `FileDelete` events: log-tamper detection (T1070.001/.002, pack #379).
     fn detect_file_delete(&self, event: &schema::FileDeleteEvent) {
         for alert in rules::evaluate_file_delete(event) {
             self.emit(alert.technique, &alert.message);

@@ -85,29 +85,36 @@ fn time_machine_snapshot_destruction_alerts() {
     );
 }
 
-// --- T1070.002 log clearing (exec half) ------------------------------------
+// --- T1070.001/.002 log clearing (exec half) -------------------------------
 
 #[test]
-fn windows_event_log_clear_alerts() {
-    let event = exec_event("wevtutil cl Security");
-    assert_eq!(
-        check_log_clear_exec(&event).expect("must alert").technique,
-        "T1070.002"
-    );
+fn windows_event_log_clearing_is_tagged_t1070_001() {
+    // Regression (#424): Windows event-log clearing was tagged T1070.002 (Clear
+    // Linux or Mac System Logs).
+    for cmdline in [
+        "wevtutil cl Security",
+        "wevtutil.exe clear-log System",
+        "powershell -c Clear-EventLog -LogName Application",
+    ] {
+        let alert = check_log_clear_exec(&exec_event(cmdline)).expect("must alert");
+        assert_eq!(alert.technique, "T1070.001", "{cmdline}");
+    }
 }
 
 #[test]
-fn macos_unified_log_erase_alerts() {
-    assert!(check_log_clear_exec(&exec_event("/usr/bin/log erase --all")).is_some());
+fn macos_unified_log_erase_is_tagged_t1070_002() {
+    let alert = check_log_clear_exec(&exec_event("/usr/bin/log erase --all")).expect("alert");
+    assert_eq!(alert.technique, "T1070.002");
 }
 
 #[test]
 fn journald_vacuum_alerts_but_status_queries_do_not() {
-    assert!(check_log_clear_exec(&exec_event("journalctl --vacuum-time=1s")).is_some());
+    let alert = check_log_clear_exec(&exec_event("journalctl --vacuum-time=1s")).expect("alert");
+    assert_eq!(alert.technique, "T1070.002");
     assert!(check_log_clear_exec(&exec_event("journalctl -u sshd -f")).is_none());
 }
 
-// --- T1070.002 log clearing (file-deletion half) ----------------------------
+// --- T1070.001/.002 log clearing (file-deletion half) ----------------------
 
 fn file_delete(path: &str) -> FileDeleteEvent {
     FileDeleteEvent {
@@ -128,14 +135,16 @@ fn deleting_a_log_file_alerts() {
 }
 
 #[test]
-fn journal_and_evtx_paths_alert() {
-    assert!(check_log_file_delete(&file_delete("/var/log/journal/abc/system.journal")).is_some());
-    assert!(
-        check_log_file_delete(&file_delete(
-            "C:\\Windows\\System32\\winevt\\Logs\\Security.evtx"
-        ))
-        .is_some()
-    );
+fn journal_and_evtx_paths_alert_under_their_platform_technique() {
+    let journal = check_log_file_delete(&file_delete("/var/log/journal/abc/system.journal"))
+        .expect("must alert");
+    assert_eq!(journal.technique, "T1070.002");
+    // #424: an event log file is Windows event-log clearing, T1070.001.
+    let evtx = check_log_file_delete(&file_delete(
+        "C:\\Windows\\System32\\winevt\\Logs\\Security.evtx",
+    ))
+    .expect("must alert");
+    assert_eq!(evtx.technique, "T1070.001");
 }
 
 #[test]

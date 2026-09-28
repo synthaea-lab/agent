@@ -666,25 +666,31 @@ pub(crate) fn check_recovery_inhibit(event: &ExecEvent) -> Option<Alert> {
     })
 }
 
-/// T1070.002 — Indicator Removal: Clear Logs (the exec-side half; the
-/// file-deletion half is [`check_log_file_delete`]). Platform log-wipe
-/// commands: Windows event-log clearing, the macOS unified-log erase, and
-/// journald vacuuming to nothing.
+/// ATT&CK splits log clearing by platform: T1070.001 is Windows event logs,
+/// T1070.002 is Linux and macOS system logs. The first cut tagged everything
+/// `.002`, Windows included (#424).
+const CLEAR_WINDOWS_EVENT_LOGS: &str = "T1070.001";
+const CLEAR_UNIX_SYSTEM_LOGS: &str = "T1070.002";
+
+/// T1070.001 / T1070.002 — Indicator Removal: Clear Logs (the exec-side half;
+/// the file-deletion half is [`check_log_file_delete`]). Platform log-wipe
+/// commands: Windows event-log clearing (`.001`), the macOS unified-log erase
+/// and journald vacuuming to nothing (`.002`).
 #[must_use]
 pub(crate) fn check_log_clear_exec(event: &ExecEvent) -> Option<Alert> {
-    const PATTERNS: &[&[&str]] = &[
-        &["wevtutil", "cl"],
-        &["wevtutil", "clear-log"],
-        &["clear-eventlog"],
-        &["log", "erase"],
-        &["journalctl", "--vacuum"],
+    const PATTERNS: &[(&str, &[&str])] = &[
+        (CLEAR_WINDOWS_EVENT_LOGS, &["wevtutil", "cl"]),
+        (CLEAR_WINDOWS_EVENT_LOGS, &["wevtutil", "clear-log"]),
+        (CLEAR_WINDOWS_EVENT_LOGS, &["clear-eventlog"]),
+        (CLEAR_UNIX_SYSTEM_LOGS, &["log", "erase"]),
+        (CLEAR_UNIX_SYSTEM_LOGS, &["journalctl", "--vacuum"]),
     ];
     let cmdline = event.cmdline.to_ascii_lowercase();
-    PATTERNS
+    let &(technique, _) = PATTERNS
         .iter()
-        .find(|tokens| tokens.iter().all(|t| cmdline.contains(t)))?;
+        .find(|(_, tokens)| tokens.iter().all(|t| cmdline.contains(t)))?;
     Some(Alert {
-        technique: "T1070.002",
+        technique,
         message: format!(
             "pid={} comm={}: log-clearing command: {}",
             event.meta.pid, event.meta.comm, event.cmdline,
@@ -693,19 +699,27 @@ pub(crate) fn check_log_clear_exec(event: &ExecEvent) -> Option<Alert> {
 }
 
 /// Log locations whose deletion is the anti-forensics signal
-/// ([`check_log_file_delete`]). Substring/prefix matches, same tolerance as
-/// [`check_persistence_write`]'s patterns.
-const LOG_PATH_PATTERNS: &[&str] = &["/var/log/", "/private/var/log/", "/log/journal/", ".evtx"];
+/// ([`check_log_file_delete`]), each with its technique. Substring/prefix
+/// matches, same tolerance as [`check_persistence_write`]'s patterns.
+const LOG_PATH_PATTERNS: &[(&str, &str)] = &[
+    (CLEAR_UNIX_SYSTEM_LOGS, "/var/log/"),
+    (CLEAR_UNIX_SYSTEM_LOGS, "/private/var/log/"),
+    (CLEAR_UNIX_SYSTEM_LOGS, "/log/journal/"),
+    (CLEAR_WINDOWS_EVENT_LOGS, ".evtx"),
+];
 
-/// T1070.002 — the file-deletion half: a log file removed outright. Consumes
+/// T1070.001 / T1070.002 — the file-deletion half: a log file removed outright
+/// (`.evtx` event logs are `.001`, Unix system logs `.002`). Consumes
 /// [`schema::FileDeleteEvent`]s (Linux unlink tracing, macOS ES `UNLINK`;
 /// Windows deletions arrive with the minifilter, #136).
 #[must_use]
 pub(crate) fn check_log_file_delete(event: &schema::FileDeleteEvent) -> Option<Alert> {
     let path = &event.path;
-    let matched = LOG_PATH_PATTERNS.iter().find(|p| path.contains(*p))?;
+    let &(technique, matched) = LOG_PATH_PATTERNS
+        .iter()
+        .find(|(_, pattern)| path.contains(*pattern))?;
     Some(Alert {
-        technique: "T1070.002",
+        technique,
         message: format!(
             "pid={} comm={}: log file deleted ({matched}): {path}",
             event.meta.pid, event.meta.comm,
