@@ -7,7 +7,8 @@ naming the problem on any error.
 What it scans:
 - crates/rules/src/*.rs, crates/correlator/src/rules.rs: `technique: "..."`
   string literals (the literal "BAYES" sentinel — correlator's own Bayesian
-  case-scoring alert, not an ATT&CK technique — is skipped).
+  case-scoring alert, not an ATT&CK technique — is skipped), plus T-shaped
+  `const NAME: &str = "T..."` values for techniques referenced by name.
 - rules/sigma/**/*.yml: `- attack.tXXXX[.YYY]` tag lines.
 - rules/yara/**/*.yar: `technique = "..."` meta lines.
 
@@ -46,13 +47,26 @@ TECHNIQUE_RE = re.compile(r"^T\d{4}(\.\d{3})?$")
 BAYES_SENTINEL = "BAYES"
 
 
+# A technique named once as a `const` and referenced by name (#474's
+# `CLEAR_WINDOWS_EVENT_LOGS`, #499's persistence-path table) never appears as a
+# `technique: "..."` literal; scanning only the field let those vanish from the
+# doc while `--check` still passed (#467 review). Only T-shaped values, so other
+# `&str` consts aren't swept in and then rejected by the id validation.
+RUST_TECHNIQUE_CONST_RE = re.compile(
+    r"""const\s+\w+\s*:\s*&(?:'static\s+)?str\s*=\s*"(T\d{4}[^"]*)\""""
+)
+
+
 def rust_technique_field(path: pathlib.Path) -> set[str]:
     ids: set[str] = set()
-    for match in re.finditer(r'technique:\s*"([^"]+)"', path.read_text()):
+    text = path.read_text()
+    for match in re.finditer(r'technique:\s*"([^"]+)"', text):
         raw = match.group(1)
         if raw == BAYES_SENTINEL:
             continue
         ids.update(raw.split("/"))
+    for match in RUST_TECHNIQUE_CONST_RE.finditer(text):
+        ids.update(match.group(1).split("/"))
     return ids
 
 
@@ -111,6 +125,7 @@ TECHNIQUE_TACTIC = {
     "T1059": "Execution",
     "T1059.001": "Execution",
     "T1059.004": "Execution",
+    "T1070.001": "Defense Evasion",
     "T1070.002": "Defense Evasion",
     "T1071": "Command and Control",
     "T1071.004": "Command and Control",
@@ -126,6 +141,7 @@ TECHNIQUE_TACTIC = {
     "T1543.001": "Persistence",
     "T1543.002": "Persistence",
     "T1543.003": "Persistence",
+    "T1546.004": "Persistence",
     "T1547.015": "Persistence",
     "T1548": "Privilege Escalation",
     "T1562.001": "Defense Evasion",
