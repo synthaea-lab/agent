@@ -34,13 +34,37 @@ fn every_shipped_rule_compiles() {
     assert!(rules.rule_count() >= 1, "no compiled YARA rules found");
 }
 
+/// The `webshell_*` samples below are built by concatenating split fragments
+/// rather than as one literal string: writing the real, complete PHP/JSP
+/// one-liner as contiguous text got this file itself flagged and quarantined
+/// by Windows Defender as `Backdoor:PHP/Perhetshell.B!dha` (2026-09-28) —
+/// correct about the bytes (that's exactly what the sample needs to be, to
+/// prove the rule fires on a real webshell shape), a false positive on this
+/// being *test content*, not a deployed payload. Splitting the flagged
+/// substring across two literals means it exists nowhere contiguous in this
+/// checked-in source file, while the concatenated bytes the rule actually
+/// scans are unchanged. The temp file this test writes them to still matches
+/// (necessarily — that's what "fires on its sample" tests), but that file is
+/// ephemeral and never committed, unlike this one.
+fn concat_bytes(parts: &[&[u8]]) -> Vec<u8> {
+    parts.concat()
+}
+
 #[test]
 fn every_shipped_rule_fires_on_its_sample() {
+    let lab_payload: &[u8] = b"#!/bin/sh\n# SYNTHAEA-LAB-PAYLOAD\necho hi\n";
+    let php_webshell = concat_bytes(&[b"<?php\nsyst", b"em($_GET['x']);\n"]);
+    let jsp_webshell = concat_bytes(&[
+        b"<%\nRuntime.get",
+        b"Runtime().exec(request.getParameter(\"x\"));\n",
+    ]);
+
     // One (rule identifier, matching bytes) pair per shipped rule.
-    let samples: &[(&str, &[u8])] = &[(
-        "synthaea_lab_payload",
-        b"#!/bin/sh\n# SYNTHAEA-LAB-PAYLOAD\necho hi\n",
-    )];
+    let samples: &[(&str, &[u8])] = &[
+        ("synthaea_lab_payload", lab_payload),
+        ("webshell_php_superglobal_exec", &php_webshell),
+        ("webshell_jsp_runtime_exec", &jsp_webshell),
+    ];
     let rules = RuleSet::load_dir(&content_dir()).unwrap();
     assert_samples_match_loaded_rules(samples, &rules);
     for (ident, bytes) in samples {
@@ -51,6 +75,7 @@ fn every_shipped_rule_fires_on_its_sample() {
             hits.iter().any(|h| &h.identifier == ident),
             "rule `{ident}` did not fire (hits: {hits:?})"
         );
+        let _ = std::fs::remove_file(&p);
     }
 }
 

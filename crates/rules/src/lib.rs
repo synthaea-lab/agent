@@ -24,12 +24,15 @@ pub(crate) use stateless::{
     check_masquerading, check_persistence_write, check_proc_root_escape, check_recovery_inhibit,
     check_scheduled_task_persistence, check_scheduled_task_update_persistence,
     check_security_process_signal, check_service_install_persistence,
+    check_service_unusual_outbound, check_service_write_outside_datadir,
     check_systemd_service_persistence,
 };
 // The contract is the two dispatchers — callers (agent) route every event
 // through them. The individual checks are implementation detail, re-exported
 // crate-internally for the tests under `src/tests/`.
-pub use stateless::{evaluate_exec, evaluate_file_delete, evaluate_file_open, evaluate_signal};
+pub use stateless::{
+    evaluate_connect, evaluate_exec, evaluate_file_delete, evaluate_file_open, evaluate_signal,
+};
 
 #[derive(Debug, Clone)]
 pub struct Alert {

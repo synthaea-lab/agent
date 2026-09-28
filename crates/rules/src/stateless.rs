@@ -1,13 +1,17 @@
 //! Stateless rules: a single event is enough to decide — no history, no state.
 
 use schema::{
-    ExecEvent, FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT,
+    ConnectEvent, ExecEvent, FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT,
     FLAG_PERSISTENCE_BTM_ARTIFACT, FLAG_PERSISTENCE_SYSTEMD_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FLAG_PERSISTENCE_TASK_ARTIFACT,
     FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent,
 };
 
-use crate::{Alert, has_write_intent};
+use crate::{
+    Alert,
+    exclusions::{SERVICE_COMM_PREFIXES, SERVICE_COMMS},
+    has_write_intent,
+};
 
 /// T1059.004 — Command and Scripting Interpreter: Unix Shell, sub-case base64-encoded
 /// command. Deliberately simple heuristic (`base64` substrings + a decode flag): no
@@ -423,6 +427,59 @@ pub(crate) fn check_btm_launch_item_persistence(event: &FileOpenEvent) -> Option
     })
 }
 
+/// `mysqld`/`mariadbd`, exact-`comm` match — deliberately narrower than
+/// [`SERVICE_COMMS`] (T1059's broader web+DB list): [`check_service_write_outside_datadir`]
+/// is MySQL/MariaDB-specific (issue #478's own wording), not a generic
+/// "service wrote somewhere odd" rule.
+const MYSQL_SERVICE_COMMS: &[&str] = &["mysqld", "mariadbd"];
+
+/// Paths `mysqld`/`mariadbd` legitimately write under (T1190, issue #478): the
+/// data directory, the log directory (package name varies: Debian ships
+/// `mariadb-server` but keeps the `/var/log/mysql/` path for compatibility,
+/// RHEL uses `/var/log/mariadb/`), the runtime socket/pid directory, and the
+/// system temp directory — `mysqld`'s own `tmpdir` setting defaults to
+/// `/tmp`, used for on-disk temp tables and sorts, a routine, high-volume
+/// write path that would otherwise swamp the rule in false positives.
+const MYSQL_WRITE_PATH_PREFIXES: &[&str] = &[
+    "/var/lib/mysql/",
+    "/var/lib/mariadb/",
+    "/var/log/mysql/",
+    "/var/log/mariadb/",
+    "/run/mysqld/",
+    "/var/run/mysqld/",
+    "/tmp/",
+];
+
+/// T1190 — Exploit Public-Facing Application: `mysqld`/`mariadbd` writing a
+/// file outside its normal footprint (issue #478, Level 1). A write anywhere
+/// but [`MYSQL_WRITE_PATH_PREFIXES`] is the signature this rule targets:
+/// `SELECT ... INTO OUTFILE` (SQL injection dropping a webshell under the web
+/// root) or a malicious UDF `.so` planted outside the plugin directory —
+/// MySQL/MariaDB has no legitimate reason to write anywhere else, which is
+/// exactly why this is a "very low noise" signal per the issue's own framing.
+#[must_use]
+pub(crate) fn check_service_write_outside_datadir(event: &FileOpenEvent) -> Option<Alert> {
+    let comm = event.meta.comm.as_str();
+    if !MYSQL_SERVICE_COMMS.contains(&comm) || !has_write_intent(event.flags) {
+        return None;
+    }
+    let path = &event.path;
+    if MYSQL_WRITE_PATH_PREFIXES
+        .iter()
+        .any(|p| path.starts_with(p))
+    {
+        return None;
+    }
+    Some(Alert {
+        technique: "T1190",
+        message: format!(
+            "pid={} comm={comm}: wrote outside its data/log/temp directories: {path} — \
+             signature of SQL injection (SELECT ... INTO OUTFILE) or a malicious UDF",
+            event.meta.pid,
+        ),
+    })
+}
+
 /// Evaluates all stateless rules applicable to a `FileOpenEvent`. T1053.005
 /// creation ([`check_scheduled_task_persistence`]) is not among them: one
 /// registration arrives twice (4698 and 106), so `RuleState::on_file_open`
@@ -437,6 +494,7 @@ pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
         .chain(check_account_creation_persistence(event))
         .chain(check_systemd_service_persistence(event))
         .chain(check_btm_launch_item_persistence(event))
+        .chain(check_service_write_outside_datadir(event))
         .collect()
 }
 
@@ -731,4 +789,61 @@ pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Opti
 #[must_use]
 pub fn evaluate_signal(event: &schema::SignalEvent) -> Vec<Alert> {
     check_security_process_signal(event).into_iter().collect()
+}
+
+/// Outbound ports [`check_service_unusual_outbound`] (T1071, issue #478)
+/// treats as routine for a web/DB service process, so only a connection to
+/// something else fires. Deliberately its own list, not
+/// [`crate::exclusions::STANDARD_PORTS`] (a different rule — BEACON — a
+/// different process population, calibrated separately): 80/443/8080/8443/
+/// 8000 cover a web app calling out to an HTTP(S) API or self-update
+/// endpoint, the rest are the backend services these processes routinely
+/// dial out to on a multi-tier deployment — MySQL/MariaDB (3306), `PostgreSQL`
+/// (5432), Redis (6379), Memcached (11211), Elasticsearch (9200), `MongoDB`
+/// (27017). Without these, an ordinary php-fpm-to-Redis-on-a-different-host
+/// connection would fire this rule — uncalibrated against fleet traffic
+/// otherwise (first cut, 2026-09-28).
+const SERVICE_OUTBOUND_STANDARD_PORTS: &[u16] = &[
+    80, 443, 8080, 8443, 8000, 3306, 5432, 6379, 11211, 9200, 27017,
+];
+
+/// T1071 — Application Layer Protocol: a web or database service process
+/// connecting outbound to a port outside its routine set (issue #478, Level
+/// 1). Unlike `RuleState::check_beacon` (repeated connections, a threshold +
+/// window), this fires on a *single* connection: these specific service
+/// accounts have such a narrow legitimate outbound footprint that even one
+/// connection outside it is a strong post-exploitation signal — a reverse
+/// shell after a web exploit, or (per the issue) `mysqld`/`mariadbd`, which
+/// almost never have a legitimate reason to connect out at all.
+///
+/// Loopback destinations are excluded outright: a web app dialing a
+/// same-host backend (Redis, a local API, Postgres over a Unix-mapped TCP
+/// port) is the overwhelming majority of "unusual port from these
+/// processes" traffic in practice, and a real exfil/C2 destination is never
+/// loopback — it has to leave the host to be useful to an attacker.
+#[must_use]
+pub(crate) fn check_service_unusual_outbound(event: &ConnectEvent) -> Option<Alert> {
+    let comm = event.meta.comm.as_str();
+    let is_service =
+        SERVICE_COMMS.contains(&comm) || SERVICE_COMM_PREFIXES.iter().any(|p| comm.starts_with(p));
+    if !is_service {
+        return None;
+    }
+    if event.daddr.is_loopback() || SERVICE_OUTBOUND_STANDARD_PORTS.contains(&event.dport) {
+        return None;
+    }
+    Some(Alert {
+        technique: "T1071",
+        message: format!(
+            "pid={} comm={comm}: outbound connection to {}:{} — port outside this service's \
+             routine set, possible reverse shell after exploitation",
+            event.meta.pid, event.daddr, event.dport,
+        ),
+    })
+}
+
+/// Evaluates all stateless rules applicable to a `ConnectEvent`.
+#[must_use]
+pub fn evaluate_connect(event: &ConnectEvent) -> Vec<Alert> {
+    check_service_unusual_outbound(event).into_iter().collect()
 }

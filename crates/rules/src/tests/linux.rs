@@ -225,6 +225,78 @@ fn write_to_systemd_unit_matches_persistence() {
     assert!(check_persistence_write(&event).is_some());
 }
 
+// ── T1190 mysqld/mariadbd write outside datadir (issue #478) ───────────────
+
+#[test]
+fn mysqld_write_under_web_root_matches() {
+    // SELECT ... INTO OUTFILE dropping a webshell.
+    let event = file_open_event_full(
+        200,
+        "mysqld",
+        "/var/www/html/shell.php",
+        O_WRONLY | O_CREAT,
+        0,
+    );
+    let alert = check_service_write_outside_datadir(&event).unwrap();
+    assert_eq!(alert.technique, "T1190");
+}
+
+#[test]
+fn mariadbd_write_to_plugin_dir_matches() {
+    // A malicious UDF .so: the plugin directory is delivered by the package
+    // manager, never written to by mysqld/mariadbd itself in normal
+    // operation, so it isn't in MYSQL_WRITE_PATH_PREFIXES — matches the
+    // issue's own listing of "a .so in the plugin directory" as suspicious.
+    let event = file_open_event_full(
+        201,
+        "mariadbd",
+        "/usr/lib/mysql/plugin/evil.so",
+        O_WRONLY | O_CREAT,
+        0,
+    );
+    assert!(check_service_write_outside_datadir(&event).is_some());
+}
+
+#[test]
+fn mysqld_write_under_datadir_does_not_alert() {
+    let event = file_open_event_full(
+        200,
+        "mysqld",
+        "/var/lib/mysql/mydb/table.ibd",
+        O_WRONLY | O_CREAT,
+        0,
+    );
+    assert!(check_service_write_outside_datadir(&event).is_none());
+}
+
+#[test]
+fn mysqld_write_to_tmpdir_does_not_alert() {
+    // Routine on-disk temp table/sort spill — `mysqld`'s own `tmpdir` default.
+    let event = file_open_event_full(200, "mysqld", "/tmp/#sql_1a2b_0.MYI", O_WRONLY | O_CREAT, 0);
+    assert!(check_service_write_outside_datadir(&event).is_none());
+}
+
+#[test]
+fn mysqld_readonly_open_outside_datadir_does_not_alert() {
+    // No write intent — mysqld reading e.g. a config file elsewhere is routine.
+    let event = file_open_event_full(200, "mysqld", "/etc/mysql/my.cnf", O_RDONLY, 0);
+    assert!(check_service_write_outside_datadir(&event).is_none());
+}
+
+#[test]
+fn unrelated_process_write_under_web_root_does_not_match_mysql_rule() {
+    // Not this rule's concern — a web server writing under its own web root is
+    // routine (uploads, cache, generated assets).
+    let event = file_open_event_full(
+        200,
+        "nginx",
+        "/var/www/html/shell.php",
+        O_WRONLY | O_CREAT,
+        0,
+    );
+    assert!(check_service_write_outside_datadir(&event).is_none());
+}
+
 #[test]
 fn containerized_process_opening_proc_pid_root_matches_escape() {
     let event = file_open_event_containerized("/proc/1/root/etc/shadow", "abc123");
@@ -275,6 +347,82 @@ fn nginx_spawning_shell_matches_lineage() {
     let alerts = state.on_exec(&exec_event_full(101, 100, "sh", "sh -c id", 1));
     assert_eq!(alerts.len(), 1);
     assert_eq!(alerts[0].technique, "T1059");
+}
+
+// ── T1059 service-spawns-shell, extended to DB services (issue #478) ───────
+
+#[test]
+fn mysqld_spawning_shell_matches_lineage() {
+    // mysqld spawning a shell = command execution through a UDF.
+    let mut state = RuleState::new();
+    state.on_exec(&exec_event_full(100, 1, "mysqld", "/usr/sbin/mysqld", 0));
+    let alerts = state.on_exec(&exec_event_full(101, 100, "sh", "sh -c id", 1));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1059");
+}
+
+#[test]
+fn mariadbd_spawning_shell_matches_lineage() {
+    let mut state = RuleState::new();
+    state.on_exec(&exec_event_full(
+        100,
+        1,
+        "mariadbd",
+        "/usr/sbin/mariadbd",
+        0,
+    ));
+    let alerts = state.on_exec(&exec_event_full(101, 100, "bash", "bash -c id", 1));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1059");
+}
+
+#[test]
+fn postgres_spawning_shell_matches_lineage() {
+    // The classic COPY PROGRAM / plpythonu escape.
+    let mut state = RuleState::new();
+    state.on_exec(&exec_event_full(100, 1, "postgres", "postgres", 0));
+    let alerts = state.on_exec(&exec_event_full(101, 100, "sh", "sh -c id", 1));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1059");
+}
+
+#[test]
+fn php_fpm_versioned_spawning_shell_matches_lineage() {
+    // Debian/Ubuntu suffix the pool binary's own comm with the PHP version
+    // (php-fpm7.4, php-fpm8.1, ...) — a webshell's system()/exec() call spawns
+    // a shell directly under this, not under nginx/Apache, so an exact-match
+    // list alone would miss it entirely.
+    let mut state = RuleState::new();
+    state.on_exec(&exec_event_full(
+        100,
+        1,
+        "php-fpm7.4",
+        "php-fpm: pool www",
+        0,
+    ));
+    let alerts = state.on_exec(&exec_event_full(101, 100, "sh", "sh -c id", 1));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1059");
+}
+
+#[test]
+fn php_fpm_bare_name_spawning_shell_matches_lineage() {
+    // RHEL/Fedora ship a bare `php-fpm` (no version suffix) — same signal.
+    let mut state = RuleState::new();
+    state.on_exec(&exec_event_full(100, 1, "php-fpm", "php-fpm: pool www", 0));
+    let alerts = state.on_exec(&exec_event_full(101, 100, "sh", "sh -c id", 1));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1059");
+}
+
+#[test]
+fn unrelated_service_named_process_spawning_shell_does_not_match() {
+    // "phpstorm" starts with neither a SERVICE_COMMS entry nor "php-fpm" —
+    // guards the prefix match against over-matching unrelated names.
+    let mut state = RuleState::new();
+    state.on_exec(&exec_event_full(100, 1, "phpstorm", "phpstorm", 0));
+    let alerts = state.on_exec(&exec_event_full(101, 100, "sh", "sh -c id", 1));
+    assert!(alerts.is_empty());
 }
 
 #[test]
@@ -1280,4 +1428,56 @@ fn proc_fd_shape_alert_does_not_overclaim_the_dev_fd_shapes_disk_free_evidence()
         !alerts[0].message.contains("no payload ever touched disk"),
         "the /proc/fd shape can't back that claim, unlike /dev/fd + memfd: comm"
     );
+}
+
+// ── T1071 unusual outbound from a web/DB service (issue #478) ──────────────
+
+#[test]
+fn nginx_unusual_outbound_port_matches() {
+    let event = connect_event_full(300, "nginx", [93, 184, 216, 34], 4444, 0);
+    let alert = check_service_unusual_outbound(&event).unwrap();
+    assert_eq!(alert.technique, "T1071");
+}
+
+#[test]
+fn mysqld_any_outbound_to_unusual_port_matches() {
+    // mysqld almost never has a legitimate reason to connect out at all.
+    let event = connect_event_full(301, "mysqld", [93, 184, 216, 34], 1337, 0);
+    assert!(check_service_unusual_outbound(&event).is_some());
+}
+
+#[test]
+fn php_fpm_versioned_unusual_outbound_matches() {
+    let event = connect_event_full(302, "php-fpm7.4", [93, 184, 216, 34], 4444, 0);
+    assert!(check_service_unusual_outbound(&event).is_some());
+}
+
+#[test]
+fn nginx_outbound_to_https_does_not_alert() {
+    // A web app calling out to an HTTPS API/update endpoint — routine.
+    let event = connect_event_full(300, "nginx", [93, 184, 216, 34], 443, 0);
+    assert!(check_service_unusual_outbound(&event).is_none());
+}
+
+#[test]
+fn php_fpm_outbound_to_redis_port_does_not_alert() {
+    // Common multi-tier shape: php-fpm dialing a backend cache/DB on a
+    // "non-standard" port that is nonetheless completely routine.
+    let event = connect_event_full(302, "php-fpm7.4", [10, 0, 0, 5], 6379, 0);
+    assert!(check_service_unusual_outbound(&event).is_none());
+}
+
+#[test]
+fn nginx_outbound_to_loopback_unusual_port_does_not_alert() {
+    // Same-host backend (a local API, Postgres, ...) — the overwhelming
+    // majority of "unusual port" traffic from these processes in practice,
+    // and never the real exfil/C2 path (loopback can't leave the host).
+    let event = connect_event_full(300, "nginx", [127, 0, 0, 1], 9999, 0);
+    assert!(check_service_unusual_outbound(&event).is_none());
+}
+
+#[test]
+fn unrelated_process_unusual_outbound_does_not_match_service_rule() {
+    let event = connect_event_full(303, "curl", [93, 184, 216, 34], 4444, 0);
+    assert!(check_service_unusual_outbound(&event).is_none());
 }

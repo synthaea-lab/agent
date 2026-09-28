@@ -16,8 +16,29 @@
 /// covered by the mark-of-the-web join (T1204.002) instead.
 pub(crate) const DOWNLOADER_COMMS: &[&str] =
     &["curl", "wget", "curl.exe", "wget.exe", "certutil.exe"];
-pub(crate) const WEB_SERVER_COMMS: &[&str] = &["nginx", "apache2", "httpd"];
 pub(crate) const SHELL_COMMS: &[&str] = &["sh", "bash", "dash", "zsh", "ash"];
+
+/// Service processes whose direct-child shell is a strong compromise signal
+/// (T1059), exact-`comm` match. `nginx`/`apache2`/`httpd` are the original web
+/// server rule; `mysqld`/`mariadbd`/`postgres` extend it to database services
+/// (issue #478, Level 1): `mysqld`/`mariadbd` spawning a shell is command
+/// execution through a UDF (`sys_exec`-style), `postgres` spawning one is the
+/// classic `COPY PROGRAM`/`plpythonu` escape. See [`SERVICE_COMM_PREFIXES`]
+/// for `php-fpm`, which doesn't fit an exact-match list.
+pub(crate) const SERVICE_COMMS: &[&str] = &[
+    "nginx", "apache2", "httpd", "mysqld", "mariadbd", "postgres",
+];
+
+/// Prefix-matched service names, checked in addition to [`SERVICE_COMMS`].
+/// `php-fpm`'s worker `comm` is the pool binary's own file name, which several
+/// distros suffix with the PHP version (Debian/Ubuntu: `php-fpm7.4`,
+/// `php-fpm8.1`, ...; RHEL/Fedora ship a bare `php-fpm`) — an exact-match
+/// entry would only ever catch one distro family. A shell spawned directly by
+/// php-fpm is the same T1059 signal either way, and closes a real gap the
+/// plain web-server list left open: php-fpm's own parent is the fpm master,
+/// not nginx/Apache, so a webshell's `system()`/`exec()` call spawning a shell
+/// under php-fpm never matched [`SERVICE_COMMS`] at all (issue #478).
+pub(crate) const SERVICE_COMM_PREFIXES: &[&str] = &["php-fpm"];
 
 /// Correlation window between the write of a downloaded file and its execution: past
 /// this delay, the two events are no longer linked (avoids keeping an unbounded

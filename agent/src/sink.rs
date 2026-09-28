@@ -344,8 +344,12 @@ impl DetectionSink {
         self.rule_state.lock().unwrap().on_file_quarantine(event);
     }
 
-    /// Connect events: beacon detection.
+    /// Connect events: stateless rules (unusual outbound from a web/DB
+    /// service, issue #478), then beacon detection.
     fn detect_connect(&self, event: &schema::ConnectEvent) {
+        for alert in rules::evaluate_connect(event) {
+            self.emit(alert.technique, &alert.message);
+        }
         for alert in self.rule_state.lock().unwrap().on_connect(event) {
             self.emit(alert.technique, &alert.message);
         }
