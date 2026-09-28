@@ -87,10 +87,26 @@ fn every_shipped_rule_ignores_its_negative_sample() {
     // `nocase` modifier, so this sits right at the rule's actual boundary
     // (case-sensitive exact match) instead of being an unrelated script that
     // would pass against any rule, matching or not.
-    let samples: &[(&str, &[u8])] = &[(
-        "synthaea_lab_payload",
-        b"#!/bin/sh\n# synthaea-lab-payload (lowercase, not the exact marker)\necho hi\n",
-    )];
+    // The two webshell negatives sit at the rules' actual boundary too: the
+    // sink patterns require the superglobal/getParameter call immediately
+    // inside the sink call, so routing the same tainted input through a
+    // local variable first — the one-line change a webshell author would
+    // make to evade this exact rule — produces bytes with the tag and the
+    // sink call present, just not contiguous, and must not fire.
+    let samples: &[(&str, &[u8])] = &[
+        (
+            "synthaea_lab_payload",
+            b"#!/bin/sh\n# synthaea-lab-payload (lowercase, not the exact marker)\necho hi\n",
+        ),
+        (
+            "webshell_php_superglobal_exec",
+            b"<?php\n$input = $_POST['cmd'];\neval($input);\n",
+        ),
+        (
+            "webshell_jsp_runtime_exec",
+            b"<%\nString cmd = request.getParameter(\"x\");\nRuntime.getRuntime().exec(cmd);\n%>",
+        ),
+    ];
     let rules = RuleSet::load_dir(&content_dir()).unwrap();
     assert_samples_match_loaded_rules(samples, &rules);
     for (ident, bytes) in samples {
