@@ -18,6 +18,7 @@ use schema::{
 };
 
 use crate::{
+    long_path::{self, LongPathCache},
     normalize,
     pid_cache::PidCache,
     providers::{
@@ -33,6 +34,10 @@ use crate::{
 /// helpers) while bounding memory if `ProcessEnd` events are lost — a documented
 /// ETW behavior under buffer pressure, not a theoretical one.
 const PID_CACHE_CAP: usize = 16_384;
+
+/// Short-named directories are a small, stable set per host (#489); this is a
+/// backstop, not a working-set size.
+const LONG_PATH_CACHE_CAP: usize = 4_096;
 
 /// The records of one `Zone.Identifier` write arrive within milliseconds
 /// (lab, 2026-09-23); 5s absorbs ETW buffer-flush jitter without merging a
@@ -129,6 +134,8 @@ pub(crate) struct SharedState {
     pub(crate) pids: Mutex<PidCache>,
     /// F-5: live device→drive map, refreshed on normalization misses.
     pub(crate) volumes: Mutex<HashMap<String, String>>,
+    /// #489: short-form directory → long form, so one file has one path.
+    pub(crate) long_paths: Mutex<LongPathCache>,
     /// F-7: Connect/Send dedup.
     pub(crate) dedup: Mutex<normalize::ConnectDedup>,
     /// #365/#439: `Zone.Identifier` writes, queued for the read-back worker
@@ -146,6 +153,11 @@ pub(crate) struct SharedState {
 
 impl SharedState {
     pub(crate) fn normalize_path(&self, raw: &str) -> String {
+        let dos = self.to_dos_path(raw);
+        long_path::expand(&dos, &self.long_paths, winapi::long_path_name)
+    }
+
+    fn to_dos_path(&self, raw: &str) -> String {
         let normalized = normalize::normalize_nt_path(raw, &self.volumes.lock().unwrap());
         if normalized.starts_with(r"\Device\") {
             // Unknown device: refresh the map once (a newly mounted volume) and retry.
@@ -331,6 +343,7 @@ impl Sensor for WindowsSensor {
         let state = Arc::new(SharedState {
             pids: Mutex::new(PidCache::new(PID_CACHE_CAP)),
             volumes: Mutex::new(winapi::build_volume_map()),
+            long_paths: Mutex::new(LongPathCache::new(LONG_PATH_CACHE_CAP)),
             dedup: Mutex::new(normalize::ConnectDedup::new(60_000_000_000)),
             marks,
             events_seen: AtomicU64::new(0),
