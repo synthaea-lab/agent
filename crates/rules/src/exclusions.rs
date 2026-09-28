@@ -51,6 +51,21 @@ pub(crate) const AUTH_FAILURE_WINDOW_NS: u64 = 60_000_000_000; // 60s
 pub(crate) const BEACON_THRESHOLD: u32 = 3;
 pub(crate) const BEACON_WINDOW_NS: u64 = 60_000_000_000; // 60s
 
+/// SCAN-SPREAD threshold and window (T1046/T1210, issue #465): N distinct
+/// destinations on the same (pid, dport) in X seconds. Calibrated against
+/// the live Mirai detonation that surfaced this gap (309 connections to
+/// 300+ distinct IPs on port 23 in ~30s) — 20-in-10s clears that burst with
+/// comfortable margin (the real one crossed 20 distinct destinations in
+/// under 2s) while giving a slower, throttled scanner still well inside "a
+/// worm/spray pattern" a full 10s to be counted, unlike BEACON's window this
+/// isn't recalibrated against a broader legitimate-traffic capture yet — a
+/// busy client hitting many distinct servers on the same non-standard port
+/// in a burst (a mail relay fanning out on 587, a monitoring agent probing a
+/// fleet) is the plausible false positive to watch for live.
+pub(crate) const SCAN_SPREAD_THRESHOLD: u32 = 20;
+/// Sliding window for [`SCAN_SPREAD_THRESHOLD`].
+pub(crate) const SCAN_SPREAD_WINDOW_NS: u64 = 10_000_000_000; // 10s
+
 /// RANSOMWARE-RENAME threshold and window (T1486): N renames by the same pid, each
 /// adding a new suffix onto its own old path (`document.docx` →
 /// `document.docx.locked`), in X seconds. 20-in-5s clears any plausible benign bulk

@@ -18,13 +18,13 @@ use crate::{
         BEACON_WINDOW_NS, BROWSERS, BURST_WRITE_BYTES_THRESHOLD, DOWNLOAD_EXEC_WINDOW_NS,
         DOWNLOADER_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, QUARANTINE_EXEC_WINDOW_NS,
         RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD,
-        RANSOMWARE_RENAME_WINDOW_NS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
-        SELF_SPAWN_THRESHOLD, SELF_SPAWN_WINDOW_NS, SHELL_COMMS, STANDARD_PORTS,
-        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
-        WEB_SERVER_COMMS,
+        RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
+        SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_THRESHOLD,
+        SELF_SPAWN_WINDOW_NS, SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN,
+        SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS, WEB_SERVER_COMMS,
     },
     has_write_intent,
-    sliding::{FlowPortDedup, SlidingCounter, SlidingSum},
+    sliding::{FlowPortDedup, SlidingCounter, SlidingDistinct, SlidingSum},
 };
 
 struct RecentWrite {
@@ -80,6 +80,9 @@ pub struct RuleState {
     /// [`FlowPortDedup`]'s doc); `on_connect`'s discrete syscall trace needs no
     /// dedup, each `ConnectEvent` already is one real connection attempt.
     beacon_flow_dedup: BoundedMap<(String, String, u16), FlowPortDedup>,
+    /// (pid, dport) → sliding distinct-destination counter for SCAN-SPREAD
+    /// (T1046/T1210, issue #465). LRU-bounded.
+    scan_spread: BoundedMap<(u32, u16), SlidingDistinct<IpAddr>>,
     /// (`local_addr`, `local_port`) → seen, for LISTENER-DRIFT (issue #92, T1571).
     /// [`Self::seed_listen_ports`] pre-fills this from one startup snapshot so
     /// every service already listening when the agent attaches is the baseline,
@@ -156,6 +159,7 @@ impl RuleState {
             self_spawn: BoundedMap::new(COUNTER_CAP),
             beacon: BoundedMap::new(COUNTER_CAP),
             beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
+            scan_spread: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
             auth_failures: BoundedMap::new(COUNTER_CAP),
             ransomware_rename: BoundedMap::new(COUNTER_CAP),
@@ -576,6 +580,52 @@ impl RuleState {
         )
     }
 
+    /// SCAN-SPREAD (T1046/T1210, issue #465): many distinct destinations, one
+    /// port, in a short window — a live Mirai detonation (309 connections to
+    /// 300+ distinct IPs on port 23 in ~30s, default-credential telnet
+    /// spread) produced no dedicated alert; `check_beacon`'s repeated-*same*-
+    /// destination shape is the mirror image and structurally can't catch
+    /// this. Keyed by (pid, dport): counts distinct `daddr`, not raw
+    /// connection count, so a busy client hammering one server (BEACON's own
+    /// shape, not this one) doesn't also cross this threshold.
+    ///
+    /// Deliberately not gated by `beacon_excluded`'s `STANDARD_PORTS` (22,
+    /// 23, 3389, …-style ports are exactly what credential-spray/lateral-
+    /// movement traffic targets — excluding them here would blind the rule
+    /// to the exact case that motivated it) or by name (comm is spoofable,
+    /// same reasoning the rest of this file gives elsewhere). Only pid=4
+    /// (Windows System) is excluded, same guaranteed-false-positive reason
+    /// as `check_beacon`. No other exclusions yet — none of BEACON's own
+    /// carry over cleanly to a distinct-destination shape, and none has been
+    /// calibrated against a real false positive here; the plausible one (a
+    /// mail relay or monitoring agent fanning out to many hosts on one port
+    /// in a burst) is left for a live capture to confirm, not guessed at.
+    fn check_scan_spread(&mut self, event: &ConnectEvent) -> Option<Alert> {
+        if event.meta.pid == 4 {
+            return None;
+        }
+        let key = (event.meta.pid, event.dport);
+        let ts = event.meta.timestamp_ns;
+        let entry = self
+            .scan_spread
+            .get_or_insert_with(key, SlidingDistinct::default);
+        let distinct = entry.record(event.daddr, ts, SCAN_SPREAD_WINDOW_NS);
+        if distinct >= SCAN_SPREAD_THRESHOLD && entry.try_alert(ts, SCAN_SPREAD_WINDOW_NS) {
+            return Some(Alert {
+                technique: "T1046/T1210",
+                message: format!(
+                    "pid={} comm={} contacted {distinct} distinct destinations on port {} in \
+                     {}s — suspected scan/spread burst",
+                    event.meta.pid,
+                    event.meta.comm,
+                    event.dport,
+                    SCAN_SPREAD_WINDOW_NS / 1_000_000_000,
+                ),
+            });
+        }
+        None
+    }
+
     /// T1071/T1041 via conntrack polling (issue #92) — same rule as
     /// [`Self::check_beacon`], fed by a periodic flow snapshot instead of a discrete
     /// `connect()` trace. This is the "probe-free" source `sensor-linux-netlink`
@@ -638,7 +688,9 @@ impl RuleState {
 
     /// To be called for every `ConnectEvent` in the stream (mainly Windows ETW).
     pub fn on_connect(&mut self, event: &ConnectEvent) -> Vec<Alert> {
-        self.check_beacon(event).into_iter().collect()
+        let mut alerts: Vec<Alert> = self.check_beacon(event).into_iter().collect();
+        alerts.extend(self.check_scan_spread(event));
+        alerts
     }
 
     /// To be called for every `NetworkFlowEvent` in the stream (Linux conntrack
