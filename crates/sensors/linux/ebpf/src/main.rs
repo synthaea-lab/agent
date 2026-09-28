@@ -370,6 +370,11 @@ fn emit_file_open_event(
     filename_ptr: u64,
     flags: i64,
 ) -> Result<u32, u32> {
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if is_agent_own_pid(pid) {
+        return Ok(0);
+    }
+
     let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
     let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
 
@@ -380,7 +385,7 @@ fn emit_file_open_event(
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
 
-        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*e).meta.pid = pid;
         (*e).meta.ppid = lineage_ppid();
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
@@ -476,13 +481,18 @@ fn try_sys_enter_write(ctx: TracePointContext) -> Result<u32, u32> {
     #[cfg(bpf_target_arch = "x86")]
     let count: u64 = unsafe { ctx.read_at::<u32>(WRITE_COUNT_OFFSET).map_err(|_| 1u32)? as u64 };
 
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if is_agent_own_pid(pid) {
+        return Ok(0);
+    }
+
     let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
     let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
 
     let e = WRITE_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
-        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*e).meta.pid = pid;
         (*e).meta.ppid = lineage_ppid();
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
@@ -2690,6 +2700,9 @@ fn emit_mount_event(
 /// agent's own pid is watched; the watchdog process and other registered security
 /// processes are a documented future extension (see `sensor-linux-wire`'s
 /// `WIRE_VERSION` v12 changelog), not implemented here.
+///
+/// Also reused by [`is_agent_own_pid`] (#514) to drop the agent's own file
+/// activity at its source — same value, different consumer.
 #[map]
 static SIGNAL_WATCH_PID: Array<u32> = Array::with_max_entries(1, 0);
 
@@ -2698,6 +2711,25 @@ static SIGNAL_WATCH_PID: Array<u32> = Array::with_max_entries(1, 0);
 /// its pid yet, or wrote it as an explicit "watch nothing".
 fn is_watched_signal_target(target_pid: u32) -> bool {
     matches!(SIGNAL_WATCH_PID.get(0), Some(&watched) if watched != 0 && watched == target_pid)
+}
+
+/// True when `pid` is the agent's own process — the same identity
+/// `SIGNAL_WATCH_PID` already carries for the signal-tamper probes above,
+/// reused here for a different purpose (#514): userspace's `EventSpool::push`
+/// does an `open`+2×`write`+`sync_data` on the local spool file for every
+/// single event it enriches (`crates/store/src/spool.rs`), all attributed to
+/// the agent's own pid. Under a burst that already floods `FILE_WRITE_EVENTS`
+/// (a `docker run`'s containerd/runc/dockerd writes), that self-traffic
+/// roughly doubles the pressure on the same 256 KiB ring buffer, and every
+/// drop's `warn!` was on top of that. It was already filtered — but only
+/// *after* userspace paid for the ring-buffer slot, the decode, and the
+/// allocation (`drain!`'s `schema_event.meta().pid != own_pid`,
+/// `crates/sensors/linux/userspace/src/sensor.rs`). Dropping it here instead
+/// gives that ring-buffer capacity back to real telemetry. The userspace
+/// filter is left in place as a defense-in-depth for the narrow startup
+/// window before `write_signal_watch_pid` runs (see its own doc comment).
+fn is_agent_own_pid(pid: u32) -> bool {
+    is_watched_signal_target(pid)
 }
 
 /// Ring buffer shared with userspace for `kill`/`tgkill` events that pass the
