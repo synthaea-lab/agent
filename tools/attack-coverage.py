@@ -153,7 +153,7 @@ def discover() -> dict[str, dict[str, set]]:
                     sys.exit(1)
                 entry = findings.setdefault(technique_id, {"layers": set(), "sources": set()})
                 entry["layers"].add(layer)
-                entry["sources"].add(f"{label}:{path.relative_to(REPO_ROOT)}")
+                entry["sources"].add(f"{label}:{path.relative_to(REPO_ROOT).as_posix()}")
     return findings
 
 
