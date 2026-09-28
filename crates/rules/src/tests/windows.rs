@@ -159,6 +159,24 @@ fn agent_own_wevtutil_child_does_not_alert() {
 }
 
 #[test]
+fn agent_own_logman_orphan_sweep_does_not_alert() {
+    // #408's startup sweep: one `logman query -ets` + one `logman stop` per
+    // orphan, all within milliseconds — two orphans already reach the threshold.
+    let mut state = RuleState::new();
+    state.seed_own_pid(1084);
+    let mut alerts = Vec::new();
+    for i in 0..SELF_SPAWN_THRESHOLD + 2 {
+        let mut e = exec_event_win(7000 + i, 1084, "logman.exe", "logman.exe", u64::from(i));
+        e.image_path = "C:\\Windows\\System32\\logman.exe".to_string();
+        alerts.extend(state.on_exec(&e));
+    }
+    assert!(
+        alerts.is_empty(),
+        "the agent's own logman.exe orphan-sweep children must not self-alert (#408)"
+    );
+}
+
+#[test]
 fn agent_own_auditpol_child_does_not_alert() {
     let mut state = RuleState::new();
     state.seed_own_pid(1084);

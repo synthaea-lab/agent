@@ -108,12 +108,14 @@ pub(crate) const SELF_SPAWN_PARENT_EXCLUSIONS: &[&str] = &["RuntimeBroker.exe"];
 /// 2s per enabled channel — ~60 spawns/30s across the default four channels, well
 /// past `SELF_SPAWN_THRESHOLD`. `auditpol.exe`: run once at startup per channel
 /// needing an audit subcategory enabled. Both false-positived on the agent itself
-/// in the 2026-09-23 live lab validation of #391. Never a blanket "ignore every
+/// in the 2026-09-23 live lab validation of #391. `logman.exe`: the ETW sensor's
+/// startup orphan sweep (#408) — one `logman query -ets` plus one `logman stop` per
+/// orphan, so two orphans already reach `SELF_SPAWN_THRESHOLD`. Never a blanket "ignore every
 /// child of the agent": `ppid` alone is spoofable
 /// (`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`), so `check_self_spawn` also requires
 /// the image to live at a trusted system path (`policy::name_exclusion_applies`),
 /// same pairing as `SELF_SPAWN_EXCLUSIONS`.
-pub(crate) const AGENT_CHILD_EXCLUSIONS: &[&str] = &["wevtutil.exe", "auditpol.exe"];
+pub(crate) const AGENT_CHILD_EXCLUSIONS: &[&str] = &["wevtutil.exe", "auditpol.exe", "logman.exe"];
 
 /// `LOLBins` abused for shellcode injection or executing unsigned code (T1218/T1127).
 pub(crate) const LOLBINS: &[&str] = &[

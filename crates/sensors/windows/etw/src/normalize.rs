@@ -86,6 +86,26 @@ pub fn random_session_name(seed_ns: u128, pid: u32) -> String {
     format!("wtrace-{:016x}", mix.wrapping_mul(0xBF58_476D_1CE4_E5B9))
 }
 
+/// Parses `logman query -ets`' stdout and returns every session name matching
+/// our own `wtrace-` prefix (issue #408): every ETW session we could have
+/// orphaned, across any number of consecutive unclean shutdowns — not just the
+/// single most recent one a persisted-name file can track.
+///
+/// Pure and locale-independent: `logman`'s "Type"/"Status" columns are
+/// translated (`Suivi`/`Tracking`, `En cours d'exécution`/`Running`, …) but the
+/// session-name column always comes first and is never translated, so taking
+/// each line's first whitespace-separated token is safe on any Windows display
+/// language.
+#[must_use]
+pub fn parse_orphaned_sessions(logman_query_ets_output: &str) -> Vec<String> {
+    logman_query_ets_output
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|name| name.starts_with("wtrace-"))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Short-window connect dedup (F-7): stacks that emit both Connect (42/58) and the
 /// first Send (12/26) for one connection must not double-count the beacon counter.
 pub struct ConnectDedup {
@@ -142,6 +162,78 @@ mod tests {
         assert_eq!(disposition_to_flags(1), 0, "FILE_OPEN is read-only");
         assert_eq!(disposition_to_flags(2), 0o100);
         assert_eq!(disposition_to_flags(5), 0o101);
+    }
+
+    #[test]
+    fn parses_orphans_from_real_french_locale_logman_output() {
+        // Captured live from `logman query -ets` on a French-locale Windows 11
+        // host (2026-09-23) — real column headers and state text, not invented.
+        // Two orphaned sessions from consecutive unclean shutdowns (#408),
+        // interleaved with ordinary system sessions that must NOT match.
+        let output = "Ensemble de collecteurs de donn\u{e9}es      Type                          \u{c9}tat\n\
+             -------------------------------------------------------------------------------\n\
+             Eventlog-Security                       Suivi                         En cours d'ex\u{e9}cution\n\
+             wtrace-7f3a9c21b4e08d56                  Suivi                         En cours d'ex\u{e9}cution\n\
+             NtfsLog                                 Suivi                         En cours d'ex\u{e9}cution\n\
+             wtrace-a01c88ef235690bd                  Suivi                         En cours d'ex\u{e9}cution\n\
+             WiFiSession                             Suivi                         En cours d'ex\u{e9}cution\n";
+        let orphans = parse_orphaned_sessions(output);
+        assert_eq!(
+            orphans,
+            vec!["wtrace-7f3a9c21b4e08d56", "wtrace-a01c88ef235690bd"]
+        );
+    }
+
+    #[test]
+    fn parses_orphans_from_english_locale_logman_output() {
+        let output = "Data Collector Set                      Type                          Status\n\
+             -------------------------------------------------------------------------------\n\
+             EventLog-Security                       Trace                         Running\n\
+             wtrace-deadbeefcafef00d                  Trace                         Running\n";
+        let orphans = parse_orphaned_sessions(output);
+        assert_eq!(orphans, vec!["wtrace-deadbeefcafef00d"]);
+    }
+
+    #[test]
+    fn no_orphans_on_a_clean_host_is_empty() {
+        let output = "Data Collector Set                      Type                          Status\n\
+             -------------------------------------------------------------------------------\n\
+             EventLog-Security                       Trace                         Running\n\
+             NtfsLog                                 Trace                         Running\n";
+        assert!(parse_orphaned_sessions(output).is_empty());
+    }
+
+    #[test]
+    fn empty_logman_output_is_empty() {
+        assert!(parse_orphaned_sessions("").is_empty());
+        assert!(parse_orphaned_sessions("\n\n").is_empty());
+    }
+
+    #[test]
+    fn many_consecutive_orphans_all_collected() {
+        // The exact bug #408 describes: N unclean shutdowns in a row must not
+        // lose track of the (N-1) oldest orphans.
+        let mut output = String::from("Data Collector Set   Type    Status\n---\n");
+        for i in 0..5u32 {
+            output.push_str(&format!(
+                "wtrace-{i:016x}                  Trace   Running\n"
+            ));
+        }
+        let orphans = parse_orphaned_sessions(&output);
+        assert_eq!(orphans.len(), 5);
+        assert_eq!(orphans[0], "wtrace-0000000000000000");
+        assert_eq!(orphans[4], "wtrace-0000000000000004");
+    }
+
+    #[test]
+    fn a_name_merely_containing_the_prefix_but_not_starting_with_it_does_not_match() {
+        // The match is on the session-name column's own prefix, not a substring
+        // search across the whole line — a session whose name happens to embed
+        // "wtrace-" elsewhere (or a status/type column containing it) must not
+        // be swept up as one of ours.
+        let output = "Data Collector Set   Type    Status\n---\n\
+             MyApp-wtrace-shim    Trace   Running\n";
+        assert!(parse_orphaned_sessions(output).is_empty());
     }
 
     #[test]
