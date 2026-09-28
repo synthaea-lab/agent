@@ -8,9 +8,15 @@
 //! This first slice implements ADR-0015's Linux-first scope: binary self-update —
 //! manifest signing/verification ([`manifest`]), the `bootstrap`/`current`/`versions`
 //! layout and its atomic symlink swap (`layout`, Linux-only), and the local ban
-//! list ([`banlist`]) that `rollback` (Linux-only) reads and writes. Content
-//! distribution (rules/models via canary rings, issues #73/#49) and Windows/macOS
-//! binary self-update are out of scope — see the ADR's Deferred section.
+//! list ([`banlist`]) that `rollback` (Linux-only) reads and writes. Windows/macOS
+//! binary self-update is out of scope — see the ADR's Deferred section.
+//!
+//! Content distribution (rules/models via canary rings, ADR-0016, issues #73/#49)
+//! adds [`content`]: verification of a signed [`ContentManifest`] against the
+//! same embedded key, and per-entry hash comparison against what's already
+//! applied. Fetching the manifest over the network, downloading artifacts, and
+//! reloading rules/models into a running agent are still the binary's job, not
+//! this crate's — same LEAF-crate reasoning as below.
 //!
 //! Deliberately library-only: wiring this into `agent`/`watchdog` (heartbeat
 //! registration via `tamper::heartbeat::SilenceMonitor`, supervised restart,
@@ -19,6 +25,7 @@
 //! (`tools/check-deps.py`); only a binary may compose all three.
 
 pub mod banlist;
+pub mod content;
 pub mod error;
 pub mod hash;
 pub mod key;
@@ -26,6 +33,7 @@ pub mod key;
 pub mod layout;
 pub mod manifest;
 
+pub use content::{ContentEntry, ContentManifest};
 pub use error::UpdaterError;
 pub use manifest::ReleaseManifest;
 

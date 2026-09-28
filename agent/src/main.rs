@@ -22,6 +22,7 @@
 )]
 mod alerts;
 mod commands;
+mod content;
 mod enrich_queue;
 mod health;
 #[cfg_attr(
@@ -136,6 +137,31 @@ enum Command {
         #[arg(long, default_value = "events.jsonl")]
         output: std::path::PathBuf,
     },
+    /// Fetches and verifies the content manifest for a ring (ADR-0016, issue
+    /// #30/#73): reports which rules/models/policy entries have changed since
+    /// this agent's last applied release. Does not download artifacts or apply
+    /// anything — a first, real, testable slice of content distribution, not
+    /// the full pipeline.
+    CheckContentManifest {
+        /// Control-plane base URL (e.g. `https://api.synthaea.example.com`).
+        #[arg(long)]
+        server: String,
+        /// Canary ring this agent is assigned to (`canary_0`/`canary_1`/`canary_2`/`prod`).
+        #[arg(long)]
+        ring: String,
+        /// Path to the client mTLS certificate (PEM). Omit to fetch without
+        /// mTLS (a dev server, or a server that authenticates another way).
+        #[arg(long)]
+        cert: Option<std::path::PathBuf>,
+        /// Path to the client mTLS private key (PEM). Required alongside `--cert`.
+        #[arg(long)]
+        key: Option<std::path::PathBuf>,
+        /// Where this agent's own record of already-applied content lives.
+        /// Missing means a fresh install — every manifest entry is reported
+        /// as needing a fetch.
+        #[arg(long, default_value = "content-state.json")]
+        state: std::path::PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -193,5 +219,18 @@ fn main() -> anyhow::Result<()> {
         }),
         Command::CaptureBaseline { output } => commands::cmd_capture_baseline(&output),
         Command::CaptureEvents { output } => commands::cmd_capture_events(&output),
+        Command::CheckContentManifest {
+            server,
+            ring,
+            cert,
+            key,
+            state,
+        } => content::cmd_check_content_manifest(
+            &server,
+            &ring,
+            cert.as_deref(),
+            key.as_deref(),
+            &state,
+        ),
     }
 }

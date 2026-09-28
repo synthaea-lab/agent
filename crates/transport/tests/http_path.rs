@@ -434,3 +434,66 @@ fn poison_batch_not_in_the_first_slot_still_reaches_max_drain_attempts() {
     );
     assert_eq!(acked.load(Ordering::SeqCst), 0);
 }
+
+// ── get_json (issue #30/#73's content-manifest fetch) ──────────────────────
+
+#[derive(Debug, serde::Deserialize, PartialEq)]
+struct Widget {
+    name: String,
+    count: u32,
+}
+
+#[test]
+fn get_json_fetches_and_deserializes_a_200_response() {
+    let url = canned_server(200, r#"{"name":"beacon","count":3}"#, 1);
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+
+    let widget: Widget = client.get_json(&url).unwrap();
+    assert_eq!(
+        widget,
+        Widget {
+            name: "beacon".to_string(),
+            count: 3,
+        }
+    );
+}
+
+#[test]
+fn get_json_surfaces_a_retryable_error_on_5xx() {
+    let url = canned_server(500, r#"{"error":"try later"}"#, 1);
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+
+    let err = client
+        .get_json::<Widget>(&url)
+        .expect_err("500 must surface");
+    assert!(err.is_retryable(), "5xx is transient");
+}
+
+#[test]
+fn get_json_surfaces_a_non_retryable_error_on_4xx() {
+    let url = canned_server(404, r#"{"error":"not found"}"#, 1);
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+
+    let err = client
+        .get_json::<Widget>(&url)
+        .expect_err("404 must surface");
+    assert!(!err.is_retryable(), "4xx is permanent");
+}
+
+#[test]
+fn get_json_rejects_a_response_that_is_not_valid_json_for_the_target_type() {
+    // The server was reached and answered — a body that doesn't fit the
+    // expected shape is `InvalidResponse`, not `Network`: reached-and-answered,
+    // so it must not get the longer connectivity-blip retry budget (#414).
+    let url = canned_server(200, r#"{"unexpected":"shape"}"#, 1);
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+
+    let err = client
+        .get_json::<Widget>(&url)
+        .expect_err("missing required fields must fail to deserialize");
+    assert!(
+        matches!(err, transport::TransportError::InvalidResponse(_)),
+        "got {err:?}"
+    );
+    assert!(!err.is_network_error(), "reached-and-answered, not a blip");
+}

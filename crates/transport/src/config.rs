@@ -113,6 +113,13 @@ impl TransportConfig {
         format!("{}{}", self.server_url, self.heartbeat_endpoint)
     }
 
+    /// Returns the full URL for the content manifest endpoint for `ring`
+    /// (ADR-0016 §3, issue #30/#73).
+    #[must_use]
+    pub fn content_manifest_url(&self, ring: &str) -> String {
+        format!("{}/api/content/manifest/{ring}", self.server_url)
+    }
+
     /// Returns true if mTLS client certificates are configured.
     #[must_use]
     pub fn has_client_cert(&self) -> bool {

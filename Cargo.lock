@@ -49,6 +49,7 @@ dependencies = [
  "sensor-windows-eventlog",
  "sensor-windows-sockets",
  "serde",
+ "serde_json",
  "sigma",
  "sinks",
  "store",
