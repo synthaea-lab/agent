@@ -28,6 +28,11 @@ const ETW_SILENCE_DEADLINE_NS: u64 = 120_000_000_000; // 120s
 /// for a `wevtutil` process spawn per tick.
 const EVENTLOG_SILENCE_DEADLINE_NS: u64 = 60_000_000_000; // 60s
 
+/// Silence deadline for the socket-table poller (#425). It pulses on every
+/// successful snapshot, whatever the host is doing, so it is a real canary like
+/// the Linux netlink poller: three missed polls is a stall, not bad luck.
+const SOCKET_SILENCE_DEADLINE_NS: u64 = 3 * SOCKET_POLL_INTERVAL.as_secs() * 1_000_000_000;
+
 /// Windows equivalent: pid → comm via `tasklist` (carried over from the old agent —
 /// no extra API surface; the sensor keeps its own richer store independently).
 fn seeded_rule_state() -> rules::RuleState {
@@ -77,20 +82,18 @@ const SOCKET_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// posture as the Event Log sensor.
 fn spawn_socket_poller(
     sink: Arc<dyn EventSink>,
+    heartbeat: Option<SensorHeartbeat>,
     stop: Arc<AtomicBool>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("socket-poller".into())
         .spawn(move || {
             while !stop.load(Ordering::SeqCst) {
-                match sensor_windows_sockets::listen_port_events(schema::time::now_ns()) {
-                    Ok(events) => {
-                        for event in events {
-                            sink.on_event(event);
-                        }
-                    }
-                    Err(e) => tracing::warn!(error = %e, "socket-table poll failed"),
-                }
+                forward_socket_snapshot(
+                    sensor_windows_sockets::listen_port_events(schema::time::now_ns()),
+                    sink.as_ref(),
+                    heartbeat.as_ref(),
+                );
                 // Sleep in short slices so Ctrl-C never waits a full interval.
                 let deadline = std::time::Instant::now() + SOCKET_POLL_INTERVAL;
                 while std::time::Instant::now() < deadline && !stop.load(Ordering::SeqCst) {
@@ -98,6 +101,28 @@ fn spawn_socket_poller(
                 }
             }
         })
+}
+
+/// Forwards one snapshot's listeners to `sink` and pulses `heartbeat`, or logs
+/// the failure and leaves the heartbeat alone. The first cut had no heartbeat,
+/// so a dead or stalled poller went unreported (#425); a snapshot with no
+/// listeners still pulses, since the poller itself is alive.
+fn forward_socket_snapshot<E: std::fmt::Display>(
+    snapshot: Result<Vec<Event>, E>,
+    sink: &dyn EventSink,
+    heartbeat: Option<&SensorHeartbeat>,
+) {
+    match snapshot {
+        Ok(events) => {
+            for event in events {
+                sink.on_event(event);
+            }
+            if let Some(heartbeat) = heartbeat {
+                heartbeat.pulse();
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "socket-table poll failed"),
+    }
 }
 
 /// Forwards to a shared `Arc<dyn EventSink>` — lets two sensors run concurrently
@@ -208,7 +233,11 @@ fn run_windows_sensors(
     // Registered before the ETW session starts (#388): if ETW fails straight
     // away, `hold_after_primary` keeps the run alive and the never-pulsed
     // `windows-etw` heartbeat turns into a T1562 silence alert.
-    let etw_heartbeat = silence.map(|monitor| register_heartbeats(monitor, &eventlog_sensor));
+    let (etw_heartbeat, socket_heartbeat) =
+        match silence.map(|monitor| register_heartbeats(monitor, &eventlog_sensor)) {
+            Some(heartbeats) => (Some(heartbeats.etw), Some(heartbeats.sockets)),
+            None => (None, None),
+        };
 
     // Set by Ctrl-C only; also the socket poller's stop flag.
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -224,13 +253,14 @@ fn run_windows_sensors(
         })?;
     }
 
-    let socket_poller = match spawn_socket_poller(Arc::clone(&sink), Arc::clone(&shutdown)) {
-        Ok(handle) => Some(handle),
-        Err(e) => {
-            eprintln!("[!] Socket poller failed to start (LISTENER-DRIFT degraded): {e}");
-            None
-        }
-    };
+    let socket_poller =
+        match spawn_socket_poller(Arc::clone(&sink), socket_heartbeat, Arc::clone(&shutdown)) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                eprintln!("[!] Socket poller failed to start (LISTENER-DRIFT degraded): {e}");
+                None
+            }
+        };
 
     let eventlog_thread = {
         let sink = Arc::clone(&sink);
@@ -276,22 +306,39 @@ fn run_windows_sensors(
     etw_result
 }
 
-/// Registers the Windows sensors on the silence monitor (#71/#388) and returns
-/// the ETW heartbeat for the caller to pulse. ETW is pulsed per forwarded event
-/// (`PulsingSink`); each *enabled* Event Log target has its own heartbeat, fed
-/// by the sensor's per-target liveness counter — pulsed per successful poll,
-/// so a quiet channel is not mistaken for a blinded one, and one target that
-/// stops answering (e.g. Security access denied) is not masked by the others.
+/// The heartbeats [`register_heartbeats`] hands back for the caller to pulse.
+struct WindowsHeartbeats {
+    /// Pulsed per forwarded ETW event (`PulsingSink`).
+    etw: SensorHeartbeat,
+    /// Pulsed per successful socket-table snapshot ([`forward_socket_snapshot`]).
+    sockets: SensorHeartbeat,
+}
+
+/// Registers the Windows sensors on the silence monitor (#71/#388/#425) and
+/// returns the heartbeats the caller pulses. Each *enabled* Event Log target
+/// has its own heartbeat, fed by the sensor's per-target liveness counter —
+/// pulsed per successful poll, so a quiet channel is not mistaken for a blinded
+/// one, and one target that stops answering (e.g. Security access denied) is not
+/// masked by the others. The socket poller is registered even if its thread
+/// then fails to spawn: a never-pulsed heartbeat is exactly the alert wanted.
 fn register_heartbeats(
     monitor: &Mutex<SilenceMonitor>,
     eventlog: &sensor_windows_eventlog::EventLogSensor,
-) -> SensorHeartbeat {
-    let etw = SensorHeartbeat::new("windows-etw");
+) -> WindowsHeartbeats {
+    let heartbeats = WindowsHeartbeats {
+        etw: SensorHeartbeat::new("windows-etw"),
+        sockets: SensorHeartbeat::new("windows-sockets"),
+    };
     let now_ns = schema::time::now_ns();
     let mut monitor = monitor
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    monitor.register(etw.clone(), ETW_SILENCE_DEADLINE_NS, now_ns);
+    monitor.register(heartbeats.etw.clone(), ETW_SILENCE_DEADLINE_NS, now_ns);
+    monitor.register(
+        heartbeats.sockets.clone(),
+        SOCKET_SILENCE_DEADLINE_NS,
+        now_ns,
+    );
     for (name, counter) in eventlog.liveness() {
         monitor.register(
             SensorHeartbeat::from_counter(name, counter),
@@ -299,7 +346,7 @@ fn register_heartbeats(
             now_ns,
         );
     }
-    etw
+    heartbeats
 }
 
 /// Windows: administrator privileges are required by the ETW kernel providers.
@@ -416,5 +463,57 @@ mod tests {
         let started = Instant::now();
         assert!(hold_after_primary(|| Ok(()), &shutdown).is_ok());
         assert!(started.elapsed() < SHUTDOWN_CHECK_INTERVAL);
+    }
+
+    /// Counts the events a socket snapshot forwarded.
+    #[derive(Default)]
+    struct CountingSink(std::sync::atomic::AtomicUsize);
+
+    impl EventSink for CountingSink {
+        fn on_event(&self, _event: Event) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn a_successful_socket_snapshot_pulses_the_heartbeat() {
+        // Regression (#425): the poller had no heartbeat, so a dead or stalled
+        // poll thread went unreported.
+        let sink = CountingSink::default();
+        let heartbeat = SensorHeartbeat::new("windows-sockets");
+        let listener = Event::ListenPort(schema::fixtures::listen_port());
+        forward_socket_snapshot::<String>(Ok(vec![listener]), &sink, Some(&heartbeat));
+        assert_eq!(sink.0.load(Ordering::Relaxed), 1);
+        assert_eq!(heartbeat.pulse_count(), 1);
+    }
+
+    #[test]
+    fn a_snapshot_with_no_listeners_still_pulses() {
+        let heartbeat = SensorHeartbeat::new("windows-sockets");
+        forward_socket_snapshot::<String>(
+            Ok(Vec::new()),
+            &CountingSink::default(),
+            Some(&heartbeat),
+        );
+        assert_eq!(heartbeat.pulse_count(), 1);
+    }
+
+    #[test]
+    fn a_failed_socket_snapshot_does_not_pulse() {
+        let heartbeat = SensorHeartbeat::new("windows-sockets");
+        forward_socket_snapshot(
+            Err("GetExtendedTcpTable failed"),
+            &CountingSink::default(),
+            Some(&heartbeat),
+        );
+        assert_eq!(heartbeat.pulse_count(), 0);
+    }
+
+    #[test]
+    fn the_socket_silence_deadline_is_three_missed_polls() {
+        assert_eq!(
+            SOCKET_SILENCE_DEADLINE_NS,
+            3 * u64::try_from(SOCKET_POLL_INTERVAL.as_nanos()).expect("fits")
+        );
     }
 }
