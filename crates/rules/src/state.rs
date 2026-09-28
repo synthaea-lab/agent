@@ -296,7 +296,7 @@ impl RuleState {
             self.recent_writes
                 .iter()
                 .find(|(path, write): &(&String, &RecentWrite)| {
-                    path.rsplit('/').next().unwrap_or(path.as_str()) == comm
+                    written_file_is(path, comm)
                         && event.meta.timestamp_ns.saturating_sub(write.timestamp_ns)
                             <= DOWNLOAD_EXEC_WINDOW_NS
                 })?;
@@ -894,6 +894,21 @@ impl RuleState {
 /// accepted over alerting on every rotation run.
 fn is_rotation_suffix(suffix: &str) -> bool {
     !suffix.bytes().any(|b| b.is_ascii_alphabetic())
+}
+
+/// Whether the file at `path` is the one a process named `comm` runs from. A
+/// Windows path (`C:\…`, `\\server\…`) is split on `\` and compared
+/// case-insensitively, as NTFS names files; the first cut split on `/` only, so
+/// the leaf of a Windows path was the whole path and never matched (#442).
+fn written_file_is(path: &str, comm: &str) -> bool {
+    let windows = path.as_bytes().get(1) == Some(&b':') || path.starts_with(r"\\");
+    if windows {
+        path.rsplit('\\')
+            .next()
+            .is_some_and(|leaf| leaf.eq_ignore_ascii_case(comm))
+    } else {
+        path.rsplit('/').next() == Some(comm)
+    }
 }
 
 fn format_delta(delta_ns: u64) -> String {

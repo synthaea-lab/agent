@@ -4,7 +4,18 @@
 //! exclusions only apply through `policy::name_exclusion_applies` (a rename in
 //! %TEMP% must not inherit them).
 
-pub(crate) const DOWNLOADER_COMMS: &[&str] = &["curl", "wget"];
+/// Processes whose file writes feed the T1105 download-then-exec join: tools that
+/// write the downloaded file themselves. Windows names carry `.exe` (the ETW
+/// `comm` is the image's file name); the first cut listed only `curl`/`wget`, so
+/// the rule never saw a Windows download (#442).
+///
+/// Not listed, on purpose: `bitsadmin`/BITS jobs (the BITS service, a
+/// `svchost.exe`, writes the file, not `bitsadmin.exe`; BITS telemetry is #284),
+/// and `PowerShell` `Invoke-WebRequest` (`powershell.exe` writes far too many files
+/// for one of its writes to mean "download"). Browsers and mail clients are
+/// covered by the mark-of-the-web join (T1204.002) instead.
+pub(crate) const DOWNLOADER_COMMS: &[&str] =
+    &["curl", "wget", "curl.exe", "wget.exe", "certutil.exe"];
 pub(crate) const WEB_SERVER_COMMS: &[&str] = &["nginx", "apache2", "httpd"];
 pub(crate) const SHELL_COMMS: &[&str] = &["sh", "bash", "dash", "zsh", "ash"];
 
