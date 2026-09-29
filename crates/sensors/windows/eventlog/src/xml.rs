@@ -486,6 +486,12 @@ pub struct AppLockerEvent {
     /// path variables and upper case included — see [`expand_applocker_path`].
     /// Empty if missing.
     pub file_path: String,
+    /// `RuleAndFileData/FullFilePath`: the image's real path, original case,
+    /// no path variable (e.g. `C:\Users\Public\test8003.exe`). Present in
+    /// the real 8003 captured on Windows 11 26100 (#427); `None` when the
+    /// build doesn't emit it, in which case callers fall back to
+    /// [`expand_applocker_path`] on [`Self::file_path`].
+    pub full_file_path: Option<String>,
 }
 
 /// Parses one 8003/8004 `<Event>` block. `None` if the block is missing
@@ -518,6 +524,12 @@ pub fn parse_applocker_event(block: &str) -> Option<AppLockerEvent> {
         .map(str::trim)
         .unwrap_or("")
         .to_string();
+    // `<FullFilePath>` cannot be mistaken for `<FilePath>`: the marker
+    // includes the opening `<`, so the two never overlap.
+    let full_file_path = extract_between(block, "<FullFilePath>", "</FullFilePath>")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(unescape_xml_entities);
     Some(AppLockerEvent {
         record_id,
         event_id,
@@ -525,6 +537,7 @@ pub fn parse_applocker_event(block: &str) -> Option<AppLockerEvent> {
         target_user,
         target_process_id,
         file_path,
+        full_file_path,
     })
 }
 
@@ -1073,6 +1086,38 @@ mod tests {
             parsed.file_path,
             "%OSDRIVE%\\USERS\\SOLKA\\DOWNLOADS\\POWERSHELL.EXE"
         );
+    }
+
+    /// A real 8003, captured on the Windows 11 26100 lab VM (2026-09-29,
+    /// #427): `AuditOnly` EXE collection allowing only `%WINDIR%` and
+    /// `%PROGRAMFILES%`, then `whoami.exe` copied to `C:\Users\Public` and
+    /// run. Verbatim `wevtutil qe ... /f:xml` output.
+    const APPLOCKER_AUDIT_8003_XML: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-AppLocker' Guid='{cbda4dbf-8d5d-4f69-9578-be14aa540d22}'/><EventID>8003</EventID><Version>0</Version><Level>3</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime='2026-09-29T08:12:31.6189560Z'/><EventRecordID>24</EventRecordID><Correlation/><Execution ProcessID='6868' ThreadID='564'/><Channel>Microsoft-Windows-AppLocker/EXE and DLL</Channel><Computer>Sandbox</Computer><Security UserID='S-1-5-21-1663667890-2519037288-962558911-1001'/></System><UserData><RuleAndFileData xmlns='http://schemas.microsoft.com/schemas/event/Microsoft.Windows/1.0.0.0'><PolicyNameLength>3</PolicyNameLength><PolicyName>EXE</PolicyName><RuleId>{00000000-0000-0000-0000-000000000000}</RuleId><RuleNameLength>1</RuleNameLength><RuleName>-</RuleName><RuleSddlLength>1</RuleSddlLength><RuleSddl>-</RuleSddl><TargetUser>S-1-5-21-1663667890-2519037288-962558911-1001</TargetUser><TargetProcessId>7092</TargetProcessId><FilePathLength>35</FilePathLength><FilePath>%OSDRIVE%\USERS\PUBLIC\TEST8003.EXE</FilePath><FileHashLength>32</FileHashLength><FileHash>8C972B0E2047FC0E84BBDC66A662D1E52FDE28E5D2D040BDCDA21CC7D6BB2810</FileHash><FqbnLength>118</FqbnLength><Fqbn>O=MICROSOFT CORPORATION, L=REDMOND, S=WASHINGTON, C=US\MICROSOFT® WINDOWS® OPERATING SYSTEM\WHOAMI.EXE\10.0.26100.1882</Fqbn><TargetLogonId>0x72d47</TargetLogonId><FullFilePathLength>28</FullFilePathLength><FullFilePath>C:\Users\Public\test8003.exe</FullFilePath></RuleAndFileData></UserData></Event>"#;
+
+    #[test]
+    fn parses_a_real_8003_capture() {
+        let block = split_event_blocks(APPLOCKER_AUDIT_8003_XML)[0];
+        let parsed = parse_applocker_event(block).expect("should parse");
+        assert_eq!(parsed.record_id, 24);
+        assert_eq!(parsed.event_id, 8003);
+        assert_eq!(parsed.policy_name, "EXE");
+        assert_eq!(
+            parsed.target_user.as_deref(),
+            Some("S-1-5-21-1663667890-2519037288-962558911-1001")
+        );
+        assert_eq!(parsed.target_process_id, 7092);
+        assert_eq!(parsed.file_path, "%OSDRIVE%\\USERS\\PUBLIC\\TEST8003.EXE");
+        assert_eq!(
+            parsed.full_file_path.as_deref(),
+            Some("C:\\Users\\Public\\test8003.exe")
+        );
+    }
+
+    #[test]
+    fn applocker_event_without_full_file_path_has_none() {
+        let parsed = parse_applocker_event(split_event_blocks(APPLOCKER_BLOCK_XML)[0])
+            .expect("should parse");
+        assert_eq!(parsed.full_file_path, None);
     }
 
     #[test]

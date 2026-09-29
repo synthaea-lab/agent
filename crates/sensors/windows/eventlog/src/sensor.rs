@@ -587,8 +587,10 @@ const APPLOCKER_EVENT_AUDITED: u32 = 8003;
 /// the `SELinux` enforcing/permissive split, which is what lets a rule tell
 /// "stopped at the OS boundary" from "ran, and policy only noticed".
 ///
-/// - `object_path`: `FilePath`, expanded from `AppLocker`'s path variables
-///   (`%OSDRIVE%\USERS\...` → `C:\USERS\...`) so path-based rules can match it.
+/// - `object_path`: `FullFilePath` when the event carries it (real path,
+///   original case); otherwise `FilePath`, expanded from `AppLocker`'s path
+///   variables (`%OSDRIVE%\USERS\...` → `C:\USERS\...`) so path-based rules
+///   can still match it.
 /// - `object_class`: the rule collection (`EXE`, `DLL`), as reported.
 /// - `action`: `execute` — the only operation these two collections gate.
 /// - `meta.pid`: `TargetProcessId`, the process that tried to launch the image.
@@ -612,7 +614,9 @@ fn normalize_applocker_block(block: &str) -> ParsedBlock {
     if ev.file_path.is_empty() {
         return Some((record_id, None));
     }
-    let path = xml::expand_applocker_path(&ev.file_path, |name| std::env::var(name).ok());
+    let path = ev.full_file_path.unwrap_or_else(|| {
+        xml::expand_applocker_path(&ev.file_path, |name| std::env::var(name).ok())
+    });
     let user = ev.target_user.map_or(User::Unknown, |sid| User::Windows {
         sid,
         integrity_level: None,
@@ -1462,6 +1466,26 @@ mod applocker_tests {
                 sid: "S-1-5-21-1-2-3-1001".into(),
                 integrity_level: None,
             }
+        );
+    }
+
+    #[test]
+    fn applocker_prefers_full_file_path_over_the_expanded_variable_path() {
+        // Trimmed from the real 8003 captured in the lab (#427, see xml.rs).
+        let block = "<Event><System><EventID>8003</EventID><EventRecordID>24</EventRecordID></System>\
+            <UserData><RuleAndFileData><PolicyName>EXE</PolicyName>\
+            <TargetUser>S-1-5-21-1-2-3-1001</TargetUser><TargetProcessId>7092</TargetProcessId>\
+            <FilePath>%OSDRIVE%\\USERS\\PUBLIC\\TEST8003.EXE</FilePath>\
+            <FullFilePath>C:\\Users\\Public\\test8003.exe</FullFilePath>\
+            </RuleAndFileData></UserData></Event>";
+        let (_, event) = normalize_applocker_block(block).expect("should parse");
+        let Some(Event::PolicyDenial(denial)) = event else {
+            panic!("expected a PolicyDenial event, got {event:?}");
+        };
+        assert!(!denial.enforced);
+        assert_eq!(
+            denial.object_path.as_deref(),
+            Some("C:\\Users\\Public\\test8003.exe")
         );
     }
 
