@@ -208,38 +208,38 @@ impl DetectionSink {
     /// bad rule, so a partly broken Sigma set loads *fewer* rules and is only
     /// visible through the reported count.
     pub(crate) fn reload_content(&self) -> ReloadReport {
-        let mut sigma_slot = self.sigma.lock().unwrap();
-        let sigma_reload_failed = match load_sigma_rules(&self.content_root) {
-            Load::Loaded(engine) => {
-                *sigma_slot = Some(engine);
-                false
-            }
-            Load::Absent => {
-                *sigma_slot = None;
-                false
-            }
-            Load::Failed => true,
-        };
-        let sigma_rule_count = sigma_slot.as_ref().map(sigma::SigmaEngine::rule_count);
-        drop(sigma_slot);
-
-        let mut yara_slot = self.yara.lock().unwrap();
-        let yara_reload_failed = match start_yara(
+        // Parse/compile first, lock only for the swap: `on_event` takes these
+        // locks on the capture thread for every exec and write-open, so loading
+        // under them would stall capture for the whole load, which grows with
+        // the rule set (PR #531 review).
+        let sigma_loaded = load_sigma_rules(&self.content_root);
+        let yara_loaded = start_yara(
             &self.content_root,
             self.alert_log.clone(),
             self.response.clone(),
-        ) {
-            Load::Loaded(loaded) => {
-                *yara_slot = Some(loaded);
-                false
-            }
-            Load::Absent => {
-                *yara_slot = None;
-                false
-            }
-            Load::Failed => true,
+        );
+
+        // The replaced engines are dropped after the locks are released: a
+        // `ScanQueue` joins its worker on drop, which must not stall capture.
+        let mut sigma_slot = self.sigma.lock().unwrap();
+        let (sigma_reload_failed, old_sigma) = match sigma_loaded {
+            Load::Loaded(engine) => (false, sigma_slot.replace(engine)),
+            Load::Absent => (false, sigma_slot.take()),
+            Load::Failed => (true, None),
+        };
+        let sigma_rule_count = sigma_slot.as_ref().map(sigma::SigmaEngine::rule_count);
+        drop(sigma_slot);
+        drop(old_sigma);
+
+        let mut yara_slot = self.yara.lock().unwrap();
+        let (yara_reload_failed, old_yara) = match yara_loaded {
+            Load::Loaded(loaded) => (false, yara_slot.replace(loaded)),
+            Load::Absent => (false, yara_slot.take()),
+            Load::Failed => (true, None),
         };
         let yara_rule_count = yara_slot.as_ref().map(|(_, count)| *count);
+        drop(yara_slot);
+        drop(old_yara);
 
         ReloadReport {
             sigma_rule_count,
