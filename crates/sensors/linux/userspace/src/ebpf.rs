@@ -114,6 +114,8 @@ pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
         "syscalls",
         "sys_enter_memfd_create",
     ),
+    // Pairs with the enter probe above: the returned fd only exists here (#510).
+    ("sys_exit_memfd_create", "syscalls", "sys_exit_memfd_create"),
     ("sys_enter_setuid", "syscalls", "sys_enter_setuid"),
     ("sys_enter_setgid", "syscalls", "sys_enter_setgid"),
     ("sys_enter_setresuid", "syscalls", "sys_enter_setresuid"),

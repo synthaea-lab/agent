@@ -199,7 +199,14 @@ pub mod time;
 /// `sensor-linux/normalize.rs`'s doc for that race). 31 was claimed by #74
 /// while both branches were open; #74 merged first, so this one renumbers —
 /// same coordination note as v13, v28→29, and v30→31 above.
-pub const SCHEMA_VERSION: u32 = 32;
+///
+/// Bumped 32 → 33 for [`MemfdCreateEvent::fd`] (#510): the descriptor
+/// `memfd_create(2)` returned, so `check_memfd_exec` can compare it to the
+/// `<n>` of an exec via `/proc/self/fd/<n>` instead of correlating on pid and
+/// time alone. 32 was claimed by #513 (`FileRenameEvent::executable_path`) while
+/// both branches were open; #513 merged first, so this one renumbers — same
+/// coordination note as v13, v28→29 and v30→31 above.
+pub const SCHEMA_VERSION: u32 = 33;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -849,6 +856,12 @@ pub struct MemfdCreateEvent {
     pub name: String,
     /// `MFD_CLOEXEC`, `MFD_ALLOW_SEALING`, ...
     pub flags: u32,
+    /// The file descriptor `memfd_create(2)` returned (#510). Only successful
+    /// creations are reported, so this is always `>= 0`. It is what the exec
+    /// path's `<n>` in `/proc/self/fd/<n>` names, which is the one piece of
+    /// evidence that the executed fd *is* this memfd and not an unrelated
+    /// descriptor opened in the same window.
+    pub fd: i32,
 }
 
 /// DNS resolution — the query name and answer, joined to the resolving process.

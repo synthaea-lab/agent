@@ -105,13 +105,20 @@ fn file_rename_event_full(
     event
 }
 
+/// A `memfd_create` returning fd 3 — the first free descriptor after stdio, and the
+/// `<n>` every `/proc/self/fd/3` exec in these tests names.
 fn memfd_create_event_full(pid: u32, timestamp_ns: u64) -> schema::MemfdCreateEvent {
+    memfd_create_event_with_fd(pid, timestamp_ns, 3)
+}
+
+fn memfd_create_event_with_fd(pid: u32, timestamp_ns: u64, fd: i32) -> schema::MemfdCreateEvent {
     schema::MemfdCreateEvent {
         meta: EventMeta {
             pid,
             timestamp_ns,
             ..meta()
         },
+        fd,
         ..schema::fixtures::memfd_create()
     }
 }

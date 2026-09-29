@@ -1733,19 +1733,81 @@ fn a_memfd_created_after_the_exec_does_not_corroborate_it_via_the_forward_path()
 }
 
 #[test]
-fn proc_fd_shape_alert_does_not_overclaim_the_dev_fd_shapes_disk_free_evidence() {
-    // #503 review: the /proc/fd shape is pid+time correlation, not proof the
-    // executed fd is the created memfd — the message must not claim more
-    // than that.
+fn proc_fd_alert_names_the_descriptor_that_matched() {
+    // #510: the alert can now say the executed fd *is* the created memfd, and
+    // names it, instead of the pid+time hedge #503 had to settle for.
     let mut state = RuleState::new();
     state.on_memfd_create(&memfd_create_event_full(100, 0));
     let event = memfd_exec_event(100, "4", "/proc/self/fd/3", 10_000_000);
     let alerts = state.on_exec(&event);
     assert_eq!(alerts.len(), 1);
     assert!(
-        !alerts[0].message.contains("no payload ever touched disk"),
-        "the /proc/fd shape can't back that claim, unlike /dev/fd + memfd: comm"
+        alerts[0].message.contains("file descriptor 3"),
+        "the alert must name the matched descriptor: {}",
+        alerts[0].message
     );
+}
+
+#[test]
+fn proc_fd_exec_through_a_different_fd_than_the_memfd_does_not_alert() {
+    // #510, the gap #503 left open: the process created a memfd (fd 5) for its own
+    // reasons and then exec'd an ordinary on-disk binary through an unrelated
+    // descriptor (fd 3) inside the window. Pid+time matched; the fd does not.
+    let mut state = RuleState::new();
+    state.on_memfd_create(&memfd_create_event_with_fd(100, 0, 5));
+    let event = memfd_exec_event(100, "4", "/proc/self/fd/3", 10_000_000);
+    assert!(state.on_exec(&event).is_empty());
+}
+
+#[test]
+fn proc_fd_exec_matches_any_of_the_processs_recent_memfds() {
+    // A process can hold several memfds; the exec names one of them, not
+    // necessarily the latest.
+    let mut state = RuleState::new();
+    state.on_memfd_create(&memfd_create_event_with_fd(100, 0, 3));
+    state.on_memfd_create(&memfd_create_event_with_fd(100, 1_000_000, 4));
+    let event = memfd_exec_event(100, "4", "/proc/self/fd/3", 10_000_000);
+    let alerts = state.on_exec(&event);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1620");
+}
+
+#[test]
+fn proc_fd_exec_through_another_pids_descriptor_does_not_corroborate() {
+    // /proc/<other>/fd/3 is a descriptor in a different process's table: this pid's
+    // own memfd 3 says nothing about it.
+    let mut state = RuleState::new();
+    state.on_memfd_create(&memfd_create_event_full(100, 0));
+    let event = memfd_exec_event(100, "4", "/proc/999/fd/3", 10_000_000);
+    assert!(state.on_exec(&event).is_empty());
+}
+
+#[test]
+fn memfds_beyond_the_per_pid_cap_forget_the_oldest() {
+    // Bounded per-pid history: the 9th creation pushes the 1st (fd 3) out, so an
+    // exec through fd 3 no longer corroborates. Newer ones still do.
+    let mut state = RuleState::new();
+    for (i, fd) in (3..12).enumerate() {
+        state.on_memfd_create(&memfd_create_event_with_fd(100, i as u64, fd));
+    }
+    let evicted = memfd_exec_event(100, "4", "/proc/self/fd/3", 10_000_000);
+    assert!(state.on_exec(&evicted).is_empty());
+    let kept = memfd_exec_event(100, "4", "/proc/self/fd/11", 10_000_000);
+    assert_eq!(state.on_exec(&kept).len(), 1);
+}
+
+#[test]
+fn late_memfd_create_with_a_different_fd_does_not_retroactively_alert() {
+    // Same #510 rule on the other delivery order (the exec is processed first and
+    // held): a creation that arrives afterwards must carry the same fd.
+    let mut state = RuleState::new();
+    let exec = memfd_exec_event(100, "4", "/proc/self/fd/3", 10_000_000);
+    assert!(state.on_exec(&exec).is_empty());
+    let alerts = state.on_memfd_create(&memfd_create_event_with_fd(100, 0, 5));
+    assert!(alerts.is_empty());
+    // ...and the matching one still fires afterwards: the pending exec was kept.
+    let alerts = state.on_memfd_create(&memfd_create_event_with_fd(100, 1_000_000, 3));
+    assert_eq!(alerts.len(), 1);
 }
 
 // ── T1071 unusual outbound from a web/DB service (issue #478) ──────────────

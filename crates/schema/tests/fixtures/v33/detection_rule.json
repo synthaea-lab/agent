@@ -1,0 +1,26 @@
+{
+  "timestamp_ns": 1756900005000000000,
+  "severity": "high",
+  "title": "Base64-encoded command piped to a shell",
+  "source": {
+    "engine": "rule",
+    "rule_id": "base64_pipe_shell"
+  },
+  "techniques": ["T1027", "T1059.004"],
+  "events": [
+    {
+      "type": "exec",
+      "meta": {
+        "pid": 4242,
+        "ppid": 1337,
+        "user": { "os": "unix", "uid": 1000, "gid": 1000 },
+        "timestamp_ns": 1756900004123456789,
+        "comm": "bash"
+      },
+      "image_path": "/bin/bash",
+      "cmdline": "bash -c echo cGF5bG9hZAo= | base64 -d | sh",
+      "argv": ["bash", "-c", "echo cGF5bG9hZAo= | base64 -d | sh"],
+      "parent_comm": "sshd"
+    }
+  ]
+}
