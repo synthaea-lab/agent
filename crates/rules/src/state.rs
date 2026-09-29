@@ -137,13 +137,16 @@ pub struct RuleState {
     /// [`Self::seed_ld_trust_from_system`] runs — the rule then falls back to the
     /// baseline alone, which only costs false positives on vendor directories.
     ld_trust_extra: Vec<String>,
-    /// pid → timestamp of the last `MemfdCreateEvent` seen for it (T1620, issue
-    /// #497): the evidence [`Self::check_memfd_exec`] requires before treating
-    /// an exec via `/proc/(self|<pid>)/fd/<n>` as a memfd-exec, since that path
-    /// shape alone (unlike `/dev/fd/<n>` + a `memfd:`-prefixed `comm`) is not
-    /// reliable evidence on its own — see that method's doc. LRU-bounded like
-    /// `pid_comm`, same key space.
-    recent_memfd_creates: BoundedMap<u32, u64>,
+    /// pid → the most recent `(timestamp, fd)` pairs of `MemfdCreateEvent`s seen
+    /// for it (T1620, issues #497/#510): the evidence [`Self::check_memfd_exec`]
+    /// requires before treating an exec via `/proc/(self|<pid>)/fd/<n>` as a
+    /// memfd-exec, since that path shape alone (unlike `/dev/fd/<n>` + a
+    /// `memfd:`-prefixed `comm`) is not reliable evidence on its own — see that
+    /// method's doc. The exec's `<n>` must equal one of these fds. A process can
+    /// legitimately hold several memfds, so this keeps up to
+    /// [`MEMFD_CREATES_PER_PID`] (oldest dropped) rather than only the latest.
+    /// LRU-bounded like `pid_comm`, same key space.
+    recent_memfd_creates: BoundedMap<u32, Vec<(u64, i32)>>,
     /// pid → a `/proc/.../fd/<n>` exec seen with no corroborating
     /// `MemfdCreateEvent` yet (#503 review): held instead of dropped, since
     /// the creation may still arrive after the exec despite always preceding
@@ -157,10 +160,16 @@ pub struct RuleState {
 /// See [`RuleState::pending_proc_fd_exec`].
 struct PendingProcFdExec {
     path: String,
+    /// The `<n>` of the `/proc/.../fd/<n>` path: the descriptor the exec ran.
+    fd: i32,
     comm: String,
     timestamp_ns: u64,
 }
 
+/// Memfd creations remembered per pid (see `RuleState::recent_memfd_creates`). A real
+/// fileless-exec process creates one or two; a process making more than this inside
+/// the correlation window is not something a longer list would catch better.
+const MEMFD_CREATES_PER_PID: usize = 8;
 /// Same bound as the correlator's entity table: the realistic live-pid space.
 const PID_COMM_CAP: usize = 65_536;
 /// Counter/write-history bounds — one logical entity per key, far fewer than pids.
@@ -822,13 +831,20 @@ impl RuleState {
     /// too-late creation saturates to a delta of 0, which trivially passes
     /// the window check), so the ordering itself is checked first.
     pub fn on_memfd_create(&mut self, event: &MemfdCreateEvent) -> Vec<Alert> {
-        self.recent_memfd_creates
-            .insert(event.meta.pid, event.meta.timestamp_ns);
+        let creates = self
+            .recent_memfd_creates
+            .get_or_insert_with(event.meta.pid, Vec::new);
+        if creates.len() >= MEMFD_CREATES_PER_PID {
+            creates.remove(0);
+        }
+        creates.push((event.meta.timestamp_ns, event.fd));
         if let Some(pending) = self.pending_proc_fd_exec.peek(&event.meta.pid)
+            && pending.fd == event.fd
             && event.meta.timestamp_ns <= pending.timestamp_ns
             && pending.timestamp_ns - event.meta.timestamp_ns <= MEMFD_EXEC_WINDOW_NS
         {
-            let alert = memfd_proc_fd_exec_alert(event.meta.pid, &pending.comm, &pending.path);
+            let alert =
+                memfd_proc_fd_exec_alert(event.meta.pid, &pending.comm, &pending.path, pending.fd);
             self.pending_proc_fd_exec.remove(&event.meta.pid);
             return vec![alert];
         }
@@ -874,18 +890,21 @@ impl RuleState {
     /// read. An earlier version of this check matched on that string and
     /// never fired on real telemetry.
     ///
-    /// Even with the `MemfdCreateEvent` gate, the `/proc/.../fd/<n>` shape is
-    /// correlation by pid and time, not proof that the executed fd *is* the
-    /// created memfd (#503 review, Nikolas): a process that creates a memfd
-    /// for a legitimate reason and then execs an ordinary on-disk binary
-    /// through a different, unrelated fd within the same window would still
-    /// match here. Closing that requires knowing the fd `memfd_create`
-    /// actually returned, which needs a kernel-side change this fix doesn't
-    /// make (`MemfdCreateEvent` doesn't carry it — see #505's follow-up
-    /// issue) — until then this shape's alert says exactly what was
-    /// observed (a memfd creation *and* an fd-exec close together in the same
-    /// process) rather than the stronger, unproven "no payload ever touched
-    /// disk" claim the `/dev/fd/<n>` + `memfd:` shape below can actually back.
+    /// The `/proc/.../fd/<n>` shape used to be correlation by pid and time
+    /// only (#503 review, Nikolas): a process that created a memfd for a
+    /// legitimate reason and then exec'd an ordinary on-disk binary through a
+    /// different, unrelated fd within the same window matched. Since #510 the
+    /// sensor reports the descriptor `memfd_create(2)` returned
+    /// ([`MemfdCreateEvent::fd`]), and the exec's `<n>` must equal it: the
+    /// executed fd *is* the created memfd, not merely a neighbour. The path's pid
+    /// component must also be `self` or the exec'ing pid itself — `/proc/<other>/fd/<n>`
+    /// names a descriptor in a different process's table, which this pid's memfds
+    /// say nothing about.
+    ///
+    /// What remains unproven is fd *reuse*: a process that closes its memfd, opens
+    /// an on-disk binary onto the same number and execs it inside the window would
+    /// still match. That takes close/dup tracking for a shape no fileless-exec
+    /// tool produces, so it is accepted.
     fn check_memfd_exec(&mut self, event: &ExecEvent) -> Option<Alert> {
         let path = &event.image_path;
         if is_dev_fd_path(path) {
@@ -898,19 +917,23 @@ impl RuleState {
                 path,
             ));
         }
-        if is_proc_fd_path(path) {
-            let created =
-                self.recent_memfd_creates
-                    .peek(&event.meta.pid)
-                    .is_some_and(|&created_ts| {
-                        created_ts <= event.meta.timestamp_ns
+        if let Some(fd) = proc_fd_number(path, event.meta.pid) {
+            let created = self
+                .recent_memfd_creates
+                .peek(&event.meta.pid)
+                .is_some_and(|creates| {
+                    creates.iter().any(|&(created_ts, created_fd)| {
+                        created_fd == fd
+                            && created_ts <= event.meta.timestamp_ns
                             && event.meta.timestamp_ns - created_ts <= MEMFD_EXEC_WINDOW_NS
-                    });
+                    })
+                });
             if created {
                 return Some(memfd_proc_fd_exec_alert(
                     event.meta.pid,
                     &event.meta.comm,
                     path,
+                    fd,
                 ));
             }
             // No corroborating creation seen yet — it may still arrive after
@@ -923,6 +946,7 @@ impl RuleState {
                 event.meta.pid,
                 PendingProcFdExec {
                     path: path.clone(),
+                    fd,
                     comm: event.meta.comm.clone(),
                     timestamp_ns: event.meta.timestamp_ns,
                 },
@@ -1217,13 +1241,12 @@ fn memfd_dev_fd_exec_alert(pid: u32, comm: &str, path: &str) -> Alert {
 /// The `/proc/.../fd/<n>` shape, corroborated only by a same-pid
 /// `MemfdCreateEvent` within the window (see `check_memfd_exec`'s doc for why
 /// that's timing correlation, not proof the executed fd is the created one).
-fn memfd_proc_fd_exec_alert(pid: u32, comm: &str, path: &str) -> Alert {
+fn memfd_proc_fd_exec_alert(pid: u32, comm: &str, path: &str, fd: i32) -> Alert {
     Alert {
         technique: "T1620",
         message: format!(
-            "pid={pid} comm={comm}: executed from a file descriptor ({path}) shortly after \
-             this process created a memfd — consistent with a memfd-exec payload that never \
-             touched disk, not confirmed to be the same file descriptor",
+            "pid={pid} comm={comm}: executed from file descriptor {fd} ({path}), the memfd \
+             this process created moments earlier — a payload that never touched disk",
         ),
     }
 }
@@ -1246,16 +1269,20 @@ fn is_dev_fd_path(path: &str) -> bool {
     path.strip_prefix("/dev/fd/").is_some_and(is_all_digits)
 }
 
-/// Matches `/proc/self/fd/<n>` or `/proc/<pid>/fd/<n>` — exec via
-/// `/proc/self/fd` (or another pid's), see `check_memfd_exec`'s doc.
-fn is_proc_fd_path(path: &str) -> bool {
-    let Some(rest) = path.strip_prefix("/proc/") else {
-        return false;
-    };
-    let Some((pid_or_self, fd)) = rest.split_once("/fd/") else {
-        return false;
-    };
-    (pid_or_self == "self" || is_all_digits(pid_or_self)) && is_all_digits(fd)
+/// The descriptor number `<n>` of `/proc/self/fd/<n>` or `/proc/<own_pid>/fd/<n>` — an
+/// exec through one of the *exec'ing process's own* descriptors, see
+/// `check_memfd_exec`'s doc. `None` for anything else, including
+/// `/proc/<other pid>/fd/<n>` (a descriptor in a different table) and a number that
+/// doesn't fit an `i32`.
+fn proc_fd_number(path: &str, own_pid: u32) -> Option<i32> {
+    let rest = path.strip_prefix("/proc/")?;
+    let (pid_or_self, fd) = rest.split_once("/fd/")?;
+    let own = pid_or_self == "self"
+        || (is_all_digits(pid_or_self) && pid_or_self.parse::<u32>().ok() == Some(own_pid));
+    if !own || !is_all_digits(fd) {
+        return None;
+    }
+    fd.parse().ok()
 }
 
 /// True when `old_path` is `new_path` with one of

@@ -1384,6 +1384,7 @@ fn memfd_create_golden() {
             },
             name: "payload".into(),
             flags: 1, // MFD_CLOEXEC
+            fd: 3,    // v32 (#510): the first free descriptor after stdio
         }),
         "memfd_create",
     );

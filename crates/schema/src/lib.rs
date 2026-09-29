@@ -188,7 +188,13 @@ pub mod time;
 /// both branches were open; #427/#490 merged first, so #469 renumbers here —
 /// same coordination note as v13, v28→29, and ADR-0005. Same
 /// serialization-visible reasoning as every field addition since v13.
-pub const SCHEMA_VERSION: u32 = 31;
+///
+/// Bumped 31 → 32 for [`MemfdCreateEvent::fd`] (#510): the descriptor
+/// `memfd_create(2)` returned, so `check_memfd_exec` can compare it to the
+/// `<n>` of an exec via `/proc/self/fd/<n>` instead of correlating on pid and
+/// time alone. #513 also claims 32 (its `executable_path` on rename events);
+/// whichever merges second renumbers, same coordination note as v13 and v28→29.
+pub const SCHEMA_VERSION: u32 = 32;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -830,6 +836,12 @@ pub struct MemfdCreateEvent {
     pub name: String,
     /// `MFD_CLOEXEC`, `MFD_ALLOW_SEALING`, ...
     pub flags: u32,
+    /// The file descriptor `memfd_create(2)` returned (#510). Only successful
+    /// creations are reported, so this is always `>= 0`. It is what the exec
+    /// path's `<n>` in `/proc/self/fd/<n>` names, which is the one piece of
+    /// evidence that the executed fd *is* this memfd and not an unrelated
+    /// descriptor opened in the same window.
+    pub fd: i32,
 }
 
 /// DNS resolution — the query name and answer, joined to the resolving process.

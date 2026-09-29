@@ -2367,6 +2367,18 @@ static MEMFD_CREATE_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static MEMFD_CREATE_SCRATCH: PerCpuArray<MemfdCreateEvent> = PerCpuArray::with_max_entries(1, 0);
 
+/// The half-built `MemfdCreateEvent` between `sys_enter_memfd_create` and
+/// `sys_exit_memfd_create`, keyed by `pid_tgid` (issue #510). The returned fd only
+/// exists at exit, but `name`/`flags` are arguments read from user memory at enter,
+/// so the enter probe builds the whole event and parks it here; the exit probe
+/// fills `fd` and emits. Same enter/exit pairing as `ACCEPT_ARGS`, except the value
+/// is the event itself (a few hundred bytes, inserted from map memory so it never
+/// touches the 512-byte BPF stack). Not part of `sensor-linux-wire`'s ABI. A thread
+/// that enters `memfd_create` and never returns leaks its entry — same accepted
+/// risk as `ACCEPT_ARGS`, bounded by `max_entries`, not explicitly swept.
+#[map]
+static MEMFD_ARGS: HashMap<u64, MemfdCreateEvent> = HashMap::with_max_entries(1024, 0);
+
 /// Offsets of the `syscalls:sys_enter_memfd_create` tracepoint (x86_64/aarch64):
 /// `uname`(16), `flags`(24). Verified on 2026-09-22 on Arch (kernel
 /// 6.6.9-arch1-1, x86_64) via
@@ -2432,17 +2444,55 @@ fn try_sys_enter_memfd_create(ctx: TracePointContext) -> Result<u32, u32> {
             }
         }
         (*e).flags = flags as u32;
+        (*e).fd = -1;
 
-        if MEMFD_CREATE_EVENTS
-            .output::<MemfdCreateEvent>(&*e, 0)
-            .is_err()
-        {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping memfd_create event"
-            );
+        // Emitted at `sys_exit_memfd_create`, once the fd is known (#510).
+        let pid_tgid = bpf_get_current_pid_tgid();
+        let _ = MEMFD_ARGS.insert(&pid_tgid, &*e, 0);
+    }
+
+    Ok(0)
+}
+
+#[tracepoint]
+pub fn sys_exit_memfd_create(ctx: TracePointContext) -> u32 {
+    match try_sys_exit_memfd_create(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+/// Completes the event `try_sys_enter_memfd_create` parked in `MEMFD_ARGS` with the
+/// descriptor `memfd_create(2)` returned (issue #510). Emits nothing when the matching
+/// enter wasn't tracked (`MEMFD_ARGS` was full) or the call failed (`ret < 0`), so the
+/// `fd` a consumer sees is always the real descriptor.
+fn try_sys_exit_memfd_create(ctx: TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let ret: i64 = unsafe { ctx.read_at(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let ret: i64 = unsafe { ctx.read_at::<i32>(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? as i64 };
+
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let e = match MEMFD_ARGS.get_ptr_mut(&pid_tgid) {
+        Some(e) => e,
+        None => return Ok(0),
+    };
+
+    if ret >= 0 {
+        unsafe {
+            (*e).fd = ret as i32;
+            if MEMFD_CREATE_EVENTS
+                .output::<MemfdCreateEvent>(&*e, 0)
+                .is_err()
+            {
+                warn!(
+                    &ctx,
+                    "sensor-linux-ebpf: ring buffer full, dropping memfd_create event"
+                );
+            }
         }
     }
+    let _ = MEMFD_ARGS.remove(&pid_tgid);
 
     Ok(0)
 }
