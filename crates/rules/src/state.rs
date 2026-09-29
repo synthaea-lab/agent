@@ -22,9 +22,9 @@ use crate::{
         QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX,
         RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD,
         SCAN_SPREAD_WINDOW_NS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
-        SELF_SPAWN_THRESHOLD, SELF_SPAWN_WINDOW_NS, SHELL_COMMS, STANDARD_PORTS,
-        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
-        WEB_SERVER_COMMS,
+        SELF_SPAWN_THRESHOLD, SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS,
+        SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN,
+        TASK_REGISTRATION_DEDUP_WINDOW_NS,
     },
     has_write_intent,
     sliding::{FlowPortDedup, SlidingCounter, SlidingDistinct, SlidingSum},
@@ -314,20 +314,28 @@ impl RuleState {
             .map(|s| s.trim_end().to_string())
     }
 
-    /// T1059 — a shell executed directly by a web server process.
+    /// T1059 — a shell executed directly by a web or database service process.
+    /// Originally web-server-only (`nginx`/`apache2`/`httpd`); extended to
+    /// `mysqld`/`mariadbd`/`postgres` and (by prefix) `php-fpm*` for issue
+    /// #478's Level 1 — see [`SERVICE_COMMS`] and [`SERVICE_COMM_PREFIXES`]'s
+    /// docs for why each needs its own matching.
     fn check_web_server_spawns_shell(&self, event: &ExecEvent) -> Option<Alert> {
         let comm = event.meta.comm.as_str();
         if !SHELL_COMMS.contains(&comm) {
             return None;
         }
         let parent_comm = self.resolve_comm(event.meta.ppid)?;
-        if !WEB_SERVER_COMMS.iter().any(|w| parent_comm == *w) {
+        let is_service = SERVICE_COMMS.iter().any(|w| parent_comm == *w)
+            || SERVICE_COMM_PREFIXES
+                .iter()
+                .any(|p| parent_comm.starts_with(p));
+        if !is_service {
             return None;
         }
         Some(Alert {
             technique: "T1059",
             message: format!(
-                "pid={} comm={} executed directly by ppid={} comm={parent_comm} (web server) — suspicious process lineage",
+                "pid={} comm={} executed directly by ppid={} comm={parent_comm} (service) — suspicious process lineage",
                 event.meta.pid, comm, event.meta.ppid,
             ),
         })
@@ -986,7 +994,11 @@ impl RuleState {
     /// [`Self::check_task_registration`]) and updates the history of downloader
     /// writes, consumed by `check_download_then_exec`.
     pub fn on_file_open(&mut self, event: &FileOpenEvent) -> Vec<Alert> {
-        let alerts = self.check_task_registration(event).into_iter().collect();
+        let mut alerts: Vec<Alert> = self.check_task_registration(event).into_iter().collect();
+        alerts.extend(crate::stateless::check_service_write_outside_datadir(
+            event,
+            |pid| self.resolve_comm(pid),
+        ));
         self.record_downloader_write(event);
         alerts
     }

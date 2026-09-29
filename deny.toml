@@ -21,6 +21,13 @@ ignore = [
     # requirement allows a fixed release.
     "RUSTSEC-2026-0222",
     "RUSTSEC-2026-0269",
+    # Host DoS through the component-model `wasmtime::component::Val` API only
+    # (statically-typed hosts unaffected). Our graph never enables wasmtime's
+    # `component-model` feature, even with --all-features (checked 2026-09-29:
+    # cranelift, runtime, std only), so the vulnerable code isn't compiled.
+    # yara-x 1.20.0, the latest, still requires wasmtime ^45.0.3 and the fixes
+    # are 48.0.3/49.0.1: bump the moment yara-x's requirement allows one.
+    "RUSTSEC-2026-0316",
 ]
 
 [licenses]

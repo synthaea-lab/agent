@@ -12,18 +12,31 @@
 //! In both cases the peer auth check (`check_authorized`) is expected
 //! to pass because the test process typically runs as the same user as
 //! the "server" (root on a CI runner, elevated user on a Windows dev
-//! box). A non-privileged runner sees the test skipped via
-//! `#[ignore]`-conditional wiring rather than a false failure — see
-//! the individual test's guard.
+//! box). A non-privileged process sees the test skip itself (see
+//! `skip_test!`) rather than fail, and `cargo test` hides that message on
+//! success, so the skip is indistinguishable from a pass. CI therefore runs
+//! this binary privileged and sets `SYNTHAEA_REQUIRE_PRIVILEGED_TESTS=1`,
+//! which turns a skip into a failure: a lost privilege makes the job red
+//! instead of silently green (#483).
 
 use ipc::{Client, ClientError, Server, StubHandler};
 
 /// Skip the current test with a printed message. Used when the runner
 /// process is not privileged enough to exercise the happy path (root
 /// on Unix, elevated on Windows).
+///
+/// With `SYNTHAEA_REQUIRE_PRIVILEGED_TESTS=1` (set by CI) a skip panics
+/// instead: `cargo test` hides the skip message on success, so without this a
+/// CI runner that lost its privilege reports `ok` for a test that never ran.
 macro_rules! skip_test {
     ($($arg:tt)*) => {{
-        eprintln!("skipping: {}", format!($($arg)*));
+        let reason = format!($($arg)*);
+        if std::env::var_os("SYNTHAEA_REQUIRE_PRIVILEGED_TESTS").is_some_and(|v| v == "1") {
+            panic!(
+                "skipped while SYNTHAEA_REQUIRE_PRIVILEGED_TESTS=1, the happy path did not run: {reason}"
+            );
+        }
+        eprintln!("skipping: {reason}");
         return;
     }};
 }
