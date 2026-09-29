@@ -9,7 +9,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{error::UpdaterError, hash::hash_file, manifest::ReleaseManifest};
+use crate::{
+    banlist::BannedVersions, error::UpdaterError, hash::hash_file, manifest::ReleaseManifest,
+};
 
 /// Name of the `current` symlink, directly under [`Layout::base_dir`].
 const CURRENT_LINK: &str = "current";
@@ -251,15 +253,19 @@ impl Layout {
         versions
     }
 
-    /// The newest installed release strictly older than `release_version` — the
-    /// one a failed `release_version` rolls back to — or `None` when there is no
-    /// older release (the caller then falls back to `bootstrap`).
+    /// The release a failed `release_version` should roll back to: the newest
+    /// installed release strictly older than it that is **known good**, meaning
+    /// it passed its own health check ([`Self::mark_healthy`]) and is not on the
+    /// ban list. `None` means fall back to `bootstrap`, the one floor that is
+    /// always good. A release that was never proven, or that failed, must not be
+    /// a rollback target: landing on it just runs a known-bad release again (PR
+    /// #533 review).
     #[must_use]
-    pub fn previous_release_version(&self, release_version: u64) -> Option<u64> {
+    pub fn rollback_target(&self, release_version: u64, banned: &BannedVersions) -> Option<u64> {
         self.installed_versions()
             .into_iter()
             .rev()
-            .find(|&v| v < release_version)
+            .find(|&v| v < release_version && !banned.is_banned(v) && self.is_healthy(v))
     }
 
     /// Records that `release_version` passed its health check (ADR-0015
@@ -479,16 +485,41 @@ mod tests {
     }
 
     #[test]
-    fn previous_release_version_is_the_newest_strictly_older_one() {
+    fn rollback_target_is_the_newest_older_release_that_is_healthy_and_not_banned() {
         let (_dir, layout) = layout();
-        for v in [1, 3, 4] {
+        for v in [1, 3, 4, 5] {
             fs::create_dir_all(layout.version_dir(v)).unwrap();
         }
-        assert_eq!(layout.previous_release_version(4), Some(3));
-        assert_eq!(layout.previous_release_version(3), Some(1));
-        assert_eq!(layout.previous_release_version(1), None);
-        // A version that is not installed still has a well-defined predecessor.
-        assert_eq!(layout.previous_release_version(9), Some(4));
+        // 1 and 3 proved themselves; 4 never did; 3 later ended up banned.
+        layout.mark_healthy(1).unwrap();
+        layout.mark_healthy(3).unwrap();
+        let mut banned = BannedVersions::default();
+        assert_eq!(layout.rollback_target(5, &banned), Some(3));
+        assert_eq!(
+            layout.rollback_target(5, &banned),
+            layout.rollback_target(4, &banned),
+            "an unproven release (4) is never a target"
+        );
+        banned.ban(3);
+        assert_eq!(
+            layout.rollback_target(5, &banned),
+            Some(1),
+            "banned 3 is skipped"
+        );
+        assert_eq!(
+            layout.rollback_target(1, &banned),
+            None,
+            "nothing older: bootstrap"
+        );
+        // A release that is not installed still has a well-defined target.
+        assert_eq!(layout.rollback_target(9, &banned), Some(1));
+    }
+
+    #[test]
+    fn with_no_proven_release_the_target_is_bootstrap() {
+        let (_dir, layout) = layout();
+        fs::create_dir_all(layout.version_dir(1)).unwrap();
+        assert_eq!(layout.rollback_target(2, &BannedVersions::default()), None);
     }
 
     #[test]

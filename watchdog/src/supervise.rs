@@ -922,6 +922,7 @@ mod probation_tests {
     #[test]
     fn a_promoted_release_whose_agent_never_makes_progress_is_rolled_back_and_banned() {
         let (dir, layout) = install(&[1, 2], 2);
+        layout.mark_healthy(1).unwrap();
         let agent = write_agent(&layout, 2, "#!/bin/sh\nexit 1\n");
         let alerts = dir.path().join("alerts.ndjson");
         let probation = Probation::detect(&layout.version_dir(2).join("watchdog"))
@@ -958,6 +959,7 @@ mod probation_tests {
     #[test]
     fn a_promoted_release_whose_agent_shows_progress_is_marked_healthy_and_keeps_running() {
         let (dir, layout) = install(&[1, 2, 3], 3);
+        layout.mark_healthy(2).unwrap();
         // Stands in for an agent whose heartbeat counter advances.
         let agent = write_agent(
             &layout,

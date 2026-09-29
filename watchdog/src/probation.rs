@@ -87,7 +87,7 @@ mod linux {
         time::{Duration, Instant},
     };
 
-    use updater::{UpdaterError, layout::Layout};
+    use updater::{UpdaterError, banlist::BannedVersions, layout::Layout};
 
     use super::{PROBATION_DEADLINE, Verdict, decide};
 
@@ -131,9 +131,13 @@ mod linux {
             if layout.is_healthy(release) || layout.current_release_version() != Some(release) {
                 return None;
             }
+            let ban_list = versions_dir.parent()?.join(BAN_LIST);
+            // An unreadable ban list is treated as empty: this only narrows the
+            // rollback target, and `rollback_target` still demands `.healthy`.
+            let banned = BannedVersions::load(&ban_list).unwrap_or_default();
             Some(Self {
-                previous: layout.previous_release_version(release),
-                ban_list: versions_dir.parent()?.join(BAN_LIST),
+                previous: layout.rollback_target(release, &banned),
+                ban_list,
                 layout,
                 release,
                 started: Instant::now(),
@@ -227,6 +231,7 @@ mod linux {
         #[test]
         fn a_freshly_promoted_release_is_on_probation_with_its_predecessor_recorded() {
             let (_dir, layout) = install(&[1, 2], Some(2));
+            layout.mark_healthy(1).unwrap();
             let probation = Probation::detect(&exe_of(&layout, 2)).unwrap();
             assert_eq!(probation.release(), 2);
             assert_eq!(probation.previous(), Some(1));
@@ -276,9 +281,14 @@ mod linux {
         #[test]
         fn roll_back_repoints_current_and_bans_the_failed_release() {
             let (dir, layout) = install(&[1, 2], Some(2));
+            layout.mark_healthy(1).unwrap();
             let probation = Probation::detect(&exe_of(&layout, 2)).unwrap();
             probation.roll_back().unwrap();
             assert_eq!(layout.current_release_version(), Some(1));
+            assert!(
+                !layout.version_dir(2).exists(),
+                "the failed release's directory is removed"
+            );
             let banned = fs::read_to_string(dir.path().join(BAN_LIST)).unwrap();
             assert!(banned.contains('2'), "ban list: {banned}");
         }
@@ -306,6 +316,7 @@ mod linux {
         #[test]
         fn proving_marks_the_release_and_prunes_only_what_is_older_than_its_predecessor() {
             let (_dir, layout) = install(&[1, 2, 3, 4], Some(4));
+            layout.mark_healthy(3).unwrap();
             Probation::detect(&exe_of(&layout, 4))
                 .unwrap()
                 .prove()
@@ -316,6 +327,66 @@ mod linux {
                 vec![3, 4],
                 "the current release and the one it rolls back to stay"
             );
+        }
+
+        /// Promotes `release`, which is not yet healthy, the way `apply-release`
+        /// does, and returns its probation.
+        fn promote(layout: &Layout, release: u64) -> Probation {
+            fs::create_dir_all(layout.version_dir(release)).unwrap();
+            layout.promote(release).unwrap();
+            Probation::detect(&exe_of(layout, release)).unwrap()
+        }
+
+        #[test]
+        fn a_good_release_a_bad_one_and_a_good_one_keeps_the_last_proven_release() {
+            // PR #533 review: `prove` used to prune below the banned release,
+            // deleting the last release that ever proved healthy.
+            let (_dir, layout) = install(&[2], Some(2));
+            layout.mark_healthy(2).unwrap();
+
+            promote(&layout, 3).roll_back().unwrap();
+            assert_eq!(layout.current_release_version(), Some(2));
+
+            let v4 = promote(&layout, 4);
+            assert_eq!(v4.previous(), Some(2), "not the banned release 3");
+            v4.prove().unwrap();
+            assert_eq!(layout.installed_versions(), vec![2, 4]);
+        }
+
+        #[test]
+        fn two_bad_releases_in_a_row_both_roll_back_to_the_last_proven_release() {
+            // PR #533 review: the second bad release used to roll back onto the
+            // first, a release already known to be broken.
+            let (dir, layout) = install(&[2], Some(2));
+            layout.mark_healthy(2).unwrap();
+
+            promote(&layout, 3).roll_back().unwrap();
+            let v4 = promote(&layout, 4);
+            assert_eq!(v4.previous(), Some(2));
+            v4.roll_back().unwrap();
+
+            assert_eq!(layout.current_release_version(), Some(2));
+            let banned = fs::read_to_string(dir.path().join(BAN_LIST)).unwrap();
+            assert!(banned.contains('3') && banned.contains('4'), "{banned}");
+        }
+
+        #[test]
+        fn a_banned_release_still_on_disk_is_never_the_rollback_target() {
+            // A directory left behind by an older watchdog (or a failed prune).
+            let (dir, layout) = install(&[2, 3], Some(3));
+            layout.mark_healthy(2).unwrap();
+            layout.mark_healthy(3).unwrap();
+            fs::write(dir.path().join(BAN_LIST), "[3]").unwrap();
+            let v4 = promote(&layout, 4);
+            assert_eq!(v4.previous(), Some(2));
+        }
+
+        #[test]
+        fn a_release_that_never_proved_itself_is_not_a_rollback_target() {
+            let (_dir, layout) = install(&[1], Some(1));
+            // 1 was promoted but never marked healthy: bootstrap is the floor.
+            let v2 = promote(&layout, 2);
+            assert_eq!(v2.previous(), None);
         }
     }
 }
