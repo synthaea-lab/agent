@@ -28,6 +28,13 @@ pub fn hash_file(path: &Path) -> std::io::Result<String> {
     Ok(hex_encode(&hasher.finalize()))
 }
 
+/// SHA-256 of an in-memory buffer, lowercase hex — same encoding as
+/// [`hash_file`], for a downloaded artifact that isn't on disk yet.
+#[must_use]
+pub fn hash_bytes(bytes: &[u8]) -> String {
+    hex_encode(&Sha256::digest(bytes))
+}
+
 /// Lowercase-hex encoding, used for both file hashes and the manifest signature.
 #[must_use]
 pub fn hex_encode(bytes: &[u8]) -> String {
@@ -85,6 +92,18 @@ mod tests {
         let expected = hex_encode(&hasher.finalize());
 
         assert_eq!(hash_file(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn hash_bytes_matches_hash_file_for_the_same_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.bin");
+        std::fs::write(&path, b"downloaded artifact").unwrap();
+
+        assert_eq!(
+            hash_bytes(b"downloaded artifact"),
+            hash_file(&path).unwrap()
+        );
     }
 
     #[test]

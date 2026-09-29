@@ -37,6 +37,14 @@ pub enum UpdaterError {
     #[error("release {0} is banned on this install (failed a previous health check)")]
     ReleaseBanned(u64),
 
+    /// A content manifest entry's `path` would escape a local content root —
+    /// contains a `..` component, is absolute, or uses a backslash. A valid
+    /// signature only proves who signed the manifest, not that every entry's
+    /// path is safe to write; checked before any download starts, not at
+    /// write time (PR #509 review).
+    #[error("content entry path `{0}` is not a safe relative path")]
+    UnsafeContentPath(String),
+
     /// A file the manifest lists is missing from the staged release directory.
     #[error("staged release is missing manifest entry `{path}`")]
     StagedFileMissing { path: PathBuf },
