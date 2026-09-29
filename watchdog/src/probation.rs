@@ -20,7 +20,9 @@ use std::time::Duration;
 /// Decision 6) — deliberately not a new number.
 pub(crate) const PROBATION_DEADLINE: Duration = Duration::from_secs(120);
 
-/// Where a release stands after one observation.
+/// Where a release stands after one observation. Only Linux ever constructs one
+/// (no release is on probation elsewhere), hence the allow.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Verdict {
     /// Not enough evidence either way yet.
@@ -36,6 +38,7 @@ pub(crate) enum Verdict {
 /// is observed in the same poll: a heartbeat that advanced right at the
 /// boundary is life, not failure.
 #[must_use]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn decide(elapsed: Duration, deadline: Duration, advanced: bool) -> Verdict {
     if advanced {
         Verdict::Proven
