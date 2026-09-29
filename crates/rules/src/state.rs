@@ -592,6 +592,13 @@ impl RuleState {
         if STANDARD_PORTS.contains(&dport) {
             return true;
         }
+        // `0.0.0.0` / `::` is no remote peer: it's the address-selection probe some
+        // processes run at startup, e.g. sshd-session and sshd-auth `connect()` to
+        // `0.0.0.0:65535` and `:::65535` on every login, which crossed the 3-in-60s
+        // threshold on a lab VM with three SSH logins in a minute (2026-09-29).
+        if daddr.is_unspecified() {
+            return true;
+        }
         // IPv4 multicast (224.0.0.0/4) and broadcast (last octet = 255): legitimate
         // network traffic emitted in a loop by system services (mDNS, SSDP, Spotify…),
         // never C2.
