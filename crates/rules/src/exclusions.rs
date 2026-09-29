@@ -349,14 +349,6 @@ pub(crate) const SUSPECT_CHILDREN_WIN: &[&str] = &[
     "msiexec.exe",
 ];
 
-/// The one port of the address-selection probe `sshd-session`/`sshd-auth` run on every
-/// login: a `connect()` to the unspecified address (`0.0.0.0`, `::`) on this port, which
-/// is no remote peer (#525). Only the unspecified address **on this port** is excluded
-/// from BEACON: on Linux a connect to `0.0.0.0:<port>` reaches the local host like
-/// `127.0.0.1:<port>`, which is still counted, so any other port must count too or a
-/// local-relay beacon could hide behind it (#536).
-pub(crate) const ADDRESS_SELECTION_PROBE_PORT: u16 = 65535;
-
 /// Standard ports — connections ignored for BEACON (expected legitimate traffic).
 /// 137 = NetBIOS-NS, 138 = NetBIOS-DGM, 5353 = mDNS, 5355 = LLMNR — native Windows
 /// network protocols emitted in a loop by the System process and legitimate services,
