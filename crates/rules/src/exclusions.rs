@@ -167,9 +167,11 @@ pub(crate) const PACKAGE_MANAGER_COMMS: &[&str] = &["dpkg", "dpkg-deb", "apt", "
 /// `sed` only, not `perl`: `sed -i<suffix>` can do nothing but write a backup copy of
 /// the original, while `perl` is an interpreter and the trusted binary named `perl`
 /// runs whatever script it is given, so listing it would let any mass rename written
-/// in Perl through, with any suffix (#528 review, live on Alpine). `perl -i.bak` over
-/// 20+ files alerts as a consequence, the cheaper side of that trade. Recognising the
-/// real `-i` shape (the original re-created by the same pid right after the rename)
+/// in Perl through, with any suffix (#528 review, live on Alpine). The cost is small:
+/// measured on perl 5.42, `perl -i.bak` does not rename the original to `f.bak` at all
+/// (it writes a temp file and renames that onto the original), so it never matched the
+/// appended-suffix shape; only a perl older than 5.28, which did rename the original,
+/// alerts on 20+ files as a consequence. Recognising the real `-i` shape (the original re-created by the same pid right after the rename)
 /// would settle both tools but needs the create history the rename rule does not
 /// consult.
 pub(crate) const IN_PLACE_EDIT_COMMS: &[&str] = &["sed"];

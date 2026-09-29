@@ -1054,7 +1054,8 @@ fn the_real_perl_interpreter_is_not_excluded() {
     let alerts = in_place_edit_burst_as("perl", "/usr/bin/perl", ".locked");
     assert_eq!(alerts.len(), 1);
     assert_eq!(alerts[0].technique, "T1486");
-    // The `.bak` shape alerts too now: the accepted cost of not trusting an interpreter.
+    // The rename-to-`.bak` shape (perl older than 5.28) alerts too now: the accepted cost
+    // of not trusting an interpreter. Current perl never produces it.
     assert_eq!(
         in_place_edit_burst_as("perl", "/usr/bin/perl", ".bak").len(),
         1
