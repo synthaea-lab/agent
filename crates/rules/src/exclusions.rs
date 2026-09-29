@@ -176,6 +176,26 @@ pub(crate) const APK_STAGING_FILE_PREFIX: &str = ".apk.";
 /// over whether they always do.
 pub(crate) const PACKAGE_MANAGER_COMMS: &[&str] = &["dpkg", "dpkg-deb", "apt", "apt-get", "apk"];
 
+/// `comm` values of in-place stream-edit tools whose `-i.<suffix>`/`-i .<suffix>`
+/// backup convention (`sed -i.bak 's/old/new/' *.conf`, `perl -i.orig -pe … *`)
+/// matches `check_mass_rename_pattern`'s ransomware shape exactly: one pid,
+/// prefix-preserving, lettered suffix, 20+ files in one command (#459 part 1,
+/// #455 review). Gated on `comm` + `policy::name_exclusion_applies` together,
+/// never `comm` alone (CLAUDE.md — an encryptor can set `comm=sed` for free;
+/// [`FileRenameEvent::executable_path`] existing is what makes gating on the
+/// trusted-system-path half possible at all here, where before there was
+/// nothing to gate against).
+pub(crate) const IN_PLACE_EDIT_COMMS: &[&str] = &["sed", "perl"];
+
+/// Valid Maildir flag letters (Draft/Flagged/Passed/Replied/Seen/Trashed —
+/// the Maildir spec's own convention, unrelated to any ATT&CK id despite the
+/// same letters) appended after a message filename's `:2,` info marker
+/// (#459 part 1): `check_mass_rename_pattern`'s other known false positive,
+/// "mark all read" on a large folder renaming every message's flags in one
+/// IMAP pid. See [`crate::state::is_maildir_flag_change`]'s doc for why this
+/// one is deliberately not also comm-gated.
+pub(crate) const MAILDIR_FLAG_LETTERS: &[u8] = b"DFPRST";
+
 /// Pairing window for one scheduled-task registration seen on both Security 4698
 /// and TaskScheduler/Operational 106 (#422, T1053.005). The two are normalized by
 /// separate poll threads, each on a 2s cadence, so their timestamps land a few

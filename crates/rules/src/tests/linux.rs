@@ -1162,23 +1162,124 @@ fn single_process_burst_yields_exactly_one_alert_not_two() {
     assert_eq!(alerts.len(), 1);
 }
 
-#[test]
-fn in_place_edit_backup_is_a_documented_false_positive() {
-    // `sed -i.bak 's/old/new/' *.conf` across 20+ files rename(2)s each original to
-    // `f.conf.bak` from one pid — the exact prefix-preserving, lettered-suffix shape.
-    // A FileRenameEvent carries only `comm`, not the exe path an evidence-gated
-    // exclusion needs, so this rule currently fires here (see check_mass_rename_pattern
-    // doc). This test pins that known behavior; the fix (exe path + comm/trusted-path
-    // gate) is tracked as a follow-up. If a future change makes this stop alerting,
-    // update the doc and this test together, deliberately.
+/// Runs the `sed -i.bak`-shaped rename burst (20+ files, one pid) through
+/// `on_file_rename`, with `executable_path` set to `exe_path` on every event.
+fn in_place_edit_burst(exe_path: Option<&str>) -> Vec<crate::Alert> {
+    in_place_edit_burst_after_exec(None, exe_path)
+}
+
+/// Same burst, preceded by an `ExecEvent` for the pid with `exec_image`
+/// (`None` = no exec seen), and `executable_path` = `exe_path` on every rename.
+fn in_place_edit_burst_after_exec(
+    exec_image: Option<&str>,
+    exe_path: Option<&str>,
+) -> Vec<crate::Alert> {
     let mut state = RuleState::new();
     let mut alerts = Vec::new();
+    if let Some(image) = exec_image {
+        state.on_exec(&memfd_exec_event(9200, "sed", image, 0));
+    }
     for i in 0..RANSOMWARE_RENAME_THRESHOLD {
-        alerts.extend(state.on_file_rename(&file_rename_event_full(
+        let mut event = file_rename_event_full(
             9200,
             "sed",
             &format!("/etc/nginx/sites-enabled/s{i}.conf"),
             &format!("/etc/nginx/sites-enabled/s{i}.conf.bak"),
+            u64::from(i) * 100_000_000,
+        );
+        event.executable_path = exe_path.map(str::to_string);
+        alerts.extend(state.on_file_rename(&event));
+    }
+    alerts
+}
+
+#[test]
+fn in_place_edit_backup_from_a_trusted_path_does_not_alert() {
+    // Regression for #459 part 1: `sed -i.bak 's/old/new/' *.conf` across 20+
+    // files rename(2)s each original to `f.conf.bak` from one pid — the exact
+    // prefix-preserving, lettered-suffix shape check_mass_rename_pattern
+    // otherwise flags. A real `/usr/bin/sed` must not alert.
+    assert!(in_place_edit_burst(Some("/usr/bin/sed")).is_empty());
+}
+
+#[test]
+fn in_place_edit_backup_with_a_trusted_exec_path_is_excluded_even_when_the_rename_time_path_raced()
+{
+    // Real `sed -i.bak` exits right after its renames, so the sensor's rename-time
+    // /proc/<pid>/exe read is None (#513 review, live case C). The exec-time
+    // image_path the kernel handed us is what proves it is /usr/bin/sed.
+    assert!(in_place_edit_burst_after_exec(Some("/usr/bin/sed"), None).is_empty());
+}
+
+#[test]
+fn in_place_edit_backup_from_an_untrusted_exec_path_alerts_even_when_the_rename_time_path_raced() {
+    // #513 review, live case B: a binary under an attacker-chosen path sets
+    // comm=sed, renames with a .bak suffix and exits promptly, so the rename-time
+    // executable_path is None. The exec-time path is untrusted → must alert.
+    let alerts = in_place_edit_burst_after_exec(Some("/root/fs513/A/sed"), None);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+}
+
+#[test]
+fn in_place_edit_backup_exec_path_wins_over_a_rename_time_path() {
+    // The exec-time path is authoritative: a trusted-looking rename-time value
+    // must not launder an untrusted exec.
+    let alerts = in_place_edit_burst_after_exec(Some("/home/attacker/sed"), Some("/usr/bin/sed"));
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn in_place_edit_backup_with_no_known_path_at_all_fails_closed() {
+    // No exec seen for the pid (e.g. a forked child that only set comm=sed) and
+    // no rename-time path: "unknown" is not evidence of /usr/bin/sed, and the
+    // process controls it. Unlike the other name-keyed exclusions, this one alerts.
+    let alerts = in_place_edit_burst(None);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+}
+
+#[test]
+fn in_place_edit_backup_from_an_untrusted_path_still_alerts() {
+    // The evidence gate's actual job: an encryptor can set comm="sed" for
+    // free, but not make its own binary live under a trusted system prefix.
+    let alerts = in_place_edit_burst(Some("/home/attacker/sed"));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+}
+
+#[test]
+fn maildir_flag_change_does_not_alert() {
+    // Regression for #459 part 1: "mark all read" on a large Maildir folder —
+    // one IMAP pid renaming every message's info marker (`:2,S` -> `:2,ST`),
+    // prefix-preserving, lettered suffix. Deliberately not comm-gated (see
+    // is_maildir_flag_change's doc) — an arbitrary comm here proves that.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9201,
+            "imap-flags-tool",
+            &format!("/home/u/Maildir/cur/171{i}.eml:2,S"),
+            &format!("/home/u/Maildir/cur/171{i}.eml:2,ST"),
+            u64::from(i) * 100_000_000,
+        )));
+    }
+    assert!(alerts.is_empty());
+}
+
+#[test]
+fn maildir_shaped_rename_with_an_invalid_flag_letter_still_alerts() {
+    // The structural gate must be tight: "X" is not a Maildir flag letter, so
+    // this must not be mistaken for the benign shape.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9202,
+            "evil",
+            &format!("/home/u/Maildir/cur/171{i}.eml:2,S"),
+            &format!("/home/u/Maildir/cur/171{i}.eml:2,SX"),
             u64::from(i) * 100_000_000,
         )));
     }

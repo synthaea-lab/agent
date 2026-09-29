@@ -161,6 +161,11 @@ pub fn normalize(raw: &RawEsEvent) -> Option<Event> {
             meta: event_meta(meta),
             old_path: old_path.clone(),
             new_path: new_path.clone(),
+            // Free on this platform (#459 part 1): ES hands the process's
+            // executable path in every message, unlike Linux's rename
+            // tracepoint which needs a /proc read at normalize time (see
+            // sensor-linux's exe_path_for_pid doc) — no race, no extra read.
+            executable_path: Some(meta.process_path.clone()),
         })),
         RawEsEvent::Unlink { meta, path } => Some(Event::FileDelete(FileDeleteEvent {
             meta: event_meta(meta),
@@ -419,7 +424,9 @@ mod tests {
         };
         assert!(matches!(
             normalize(&rename),
-            Some(Event::FileRename(e)) if e.new_path.ends_with(".locked")
+            Some(Event::FileRename(e))
+                if e.new_path.ends_with(".locked")
+                    && e.executable_path.as_deref() == Some("/usr/bin/curl")
         ));
 
         let unlink = RawEsEvent::Unlink {
