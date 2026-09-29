@@ -139,16 +139,39 @@ mod linux {
     /// Downloads every entry into `versions/.stage-N`, then renames it to
     /// `versions/vN` in one step, so a crash mid-download never leaves a
     /// half-populated release directory that could later be picked as a rollback
-    /// target.
+    /// target. Any failure (network, hash, write) removes the staging directory
+    /// before returning, so a server that keeps failing on one version cannot
+    /// leave up to a release's worth of bytes per attempt lying around (PR #534
+    /// review).
     fn stage(
         client: &transport::TransportClient,
         layout: &Layout,
         manifest: &ReleaseManifest,
     ) -> anyhow::Result<()> {
-        let versions_dir = layout.versions_dir();
-        let stage_dir = versions_dir.join(format!(".stage-{}", manifest.release_version));
+        let stage_dir = layout
+            .versions_dir()
+            .join(format!(".stage-{}", manifest.release_version));
         remove_leftover(&stage_dir)?;
 
+        let staged = fetch_into(client, layout, manifest, &stage_dir).and_then(|()| {
+            std::fs::rename(&stage_dir, layout.version_dir(manifest.release_version))
+                .map_err(Into::into)
+        });
+        if staged.is_err() {
+            // Best effort: the original error is the one worth reporting.
+            let _ = std::fs::remove_dir_all(&stage_dir);
+        }
+        staged
+    }
+
+    /// Fetches, hash-checks and writes every manifest entry under `stage_dir`.
+    fn fetch_into(
+        client: &transport::TransportClient,
+        layout: &Layout,
+        manifest: &ReleaseManifest,
+        stage_dir: &Path,
+    ) -> anyhow::Result<()> {
+        let versions_dir = layout.versions_dir();
         let release_version = manifest.release_version.to_string();
         for (path, expected) in &manifest.entries {
             let path_str = path.to_string_lossy();
@@ -163,7 +186,6 @@ mod linux {
             )?;
             let actual = hash_bytes(&bytes);
             if &actual != expected {
-                let _ = std::fs::remove_dir_all(&stage_dir);
                 return Err(UpdaterError::StagedFileMismatch {
                     path: path.clone(),
                     expected: expected.clone(),
@@ -171,17 +193,12 @@ mod linux {
                 }
                 .into());
             }
-            let mut dest = stage_dir.clone();
+            let mut dest = stage_dir.to_path_buf();
             for segment in path_str.split('/') {
                 dest.push(segment);
             }
-            if let Err(e) = write_executable_atomically(&versions_dir, &dest, &bytes) {
-                let _ = std::fs::remove_dir_all(&stage_dir);
-                return Err(e.into());
-            }
+            write_executable_atomically(&versions_dir, &dest, &bytes)?;
         }
-
-        std::fs::rename(&stage_dir, layout.version_dir(manifest.release_version))?;
         Ok(())
     }
 
@@ -413,6 +430,24 @@ mod linux {
             assert_eq!(layout.current_release_version(), Some(1));
             assert!(!layout.version_dir(2).exists());
             assert!(!layout.versions_dir().join(".stage-2").exists());
+        }
+
+        #[test]
+        fn a_download_that_fails_midway_leaves_no_staging_directory_behind() {
+            let (_base, layout) = install("fail-midway", &[1]);
+            let files: [(&str, &[u8]); 2] = [("agent", b"agent v2"), ("watchdog", b"watchdog v2")];
+            let manifest = signed(2, &files);
+            // `agent` downloads fine and is written; `watchdog` is a 404, so the
+            // run fails after part of the release is already on disk.
+            let server = serve(&manifest, vec![("agent", b"agent v2".to_vec())]);
+
+            assert!(apply_release(&client(&server.url), &layout).is_err());
+            assert_eq!(layout.current_release_version(), Some(1));
+            assert!(!layout.version_dir(2).exists());
+            assert!(
+                !layout.versions_dir().join(".stage-2").exists(),
+                "the partially written staging directory must be removed"
+            );
         }
 
         #[test]
