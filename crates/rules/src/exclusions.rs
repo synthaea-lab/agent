@@ -156,15 +156,23 @@ pub(crate) const APK_STAGING_FILE_PREFIX: &str = ".apk.";
 pub(crate) const PACKAGE_MANAGER_COMMS: &[&str] = &["dpkg", "dpkg-deb", "apt", "apt-get", "apk"];
 
 /// `comm` values of in-place stream-edit tools whose `-i.<suffix>`/`-i .<suffix>`
-/// backup convention (`sed -i.bak 's/old/new/' *.conf`, `perl -i.orig -pe … *`)
-/// matches `check_mass_rename_pattern`'s ransomware shape exactly: one pid,
+/// backup convention (`sed -i.bak 's/old/new/' *.conf`) matches `check_mass_rename_pattern`'s ransomware shape exactly: one pid,
 /// prefix-preserving, lettered suffix, 20+ files in one command (#459 part 1,
 /// #455 review). Gated on `comm` + `policy::name_exclusion_applies` together,
 /// never `comm` alone (CLAUDE.md — an encryptor can set `comm=sed` for free;
 /// [`FileRenameEvent::executable_path`] existing is what makes gating on the
 /// trusted-system-path half possible at all here, where before there was
 /// nothing to gate against).
-pub(crate) const IN_PLACE_EDIT_COMMS: &[&str] = &["sed", "perl"];
+///
+/// `sed` only, not `perl`: `sed -i<suffix>` can do nothing but write a backup copy of
+/// the original, while `perl` is an interpreter and the trusted binary named `perl`
+/// runs whatever script it is given, so listing it would let any mass rename written
+/// in Perl through, with any suffix (#528 review, live on Alpine). `perl -i.bak` over
+/// 20+ files alerts as a consequence, the cheaper side of that trade. Recognising the
+/// real `-i` shape (the original re-created by the same pid right after the rename)
+/// would settle both tools but needs the create history the rename rule does not
+/// consult.
+pub(crate) const IN_PLACE_EDIT_COMMS: &[&str] = &["sed"];
 
 /// Valid Maildir flag letters (Draft/Flagged/Passed/Replied/Seen/Trashed —
 /// the Maildir spec's own convention, unrelated to any ATT&CK id despite the

@@ -1045,7 +1045,7 @@ impl RuleState {
     /// two; the third stays open, see below):
     /// - Log rotation (`app.log` → `app.log.1`): handled by [`is_rotation_suffix`]
     ///   (a suffix with no letter never counts) — the one case a shape signal settles.
-    /// - In-place edit with a backup: `sed -i.bak`, `perl -i.orig` `rename(2)` the
+    /// - In-place edit with a backup: `sed -i.bak` `rename(2)`s the
     ///   original to `f.bak`/`f.orig` from one pid; 20+ files in one command
     ///   (`sed -i.bak … *.conf`) used to trip this rule. [`is_in_place_edit_backup`]
     ///   now excludes it, gated on `comm` + the pid's exec-time `image_path`
@@ -1354,8 +1354,8 @@ impl RuleState {
 /// ([`MAILDIR_FLAG_LETTERS`]).
 ///
 /// Deliberately **not** also gated on `comm`, unlike [`is_in_place_edit_backup`]
-/// and unlike issue #459's own suggestion: `sed`/`perl` are two fixed,
-/// well-known binaries, but "a mail server touching Maildir" has no small
+/// and unlike issue #459's own suggestion: `sed` is one fixed,
+/// well-known binary, but "a mail server touching Maildir" has no small
 /// fixed `comm` set to enumerate without guessing (dovecot, courier,
 /// procmail, maildrop, notmuch, mbsync, offlineimap, mutt, ...) — inventing
 /// one would be exactly the uncalibrated-exclusion-list problem this crate's
