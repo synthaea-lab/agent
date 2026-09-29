@@ -91,6 +91,22 @@ pub fn name_exclusion_applies(image_path: Option<&str>) -> bool {
     }
 }
 
+/// The port of the address-selection probe `sshd-session`/`sshd-auth` run on every
+/// login: a `connect()` to the unspecified address (`0.0.0.0`, `::`) on this port
+/// reaches no remote peer (#525).
+pub const ADDRESS_SELECTION_PROBE_PORT: u16 = 65535;
+
+/// Whether a connection is that address-selection probe: the unspecified address **on
+/// [`ADDRESS_SELECTION_PROBE_PORT`]**, not the unspecified address alone. On Linux a
+/// connect to `0.0.0.0:<port>` reaches the local host like `127.0.0.1:<port>`, which
+/// detection still counts, so any other port must count too or a local-relay beacon
+/// could hide behind it (#536). One predicate for BEACON (`rules`) and the
+/// correlator's network leg (#538), so the two cannot drift apart.
+#[must_use]
+pub fn is_address_selection_probe(daddr: std::net::IpAddr, dport: u16) -> bool {
+    daddr.is_unspecified() && dport == ADDRESS_SELECTION_PROBE_PORT
+}
+
 /// Expected parent processes for commonly-impersonated Windows system processes.
 ///
 /// Returns the allowed parent `comm` values (basename, case-insensitive) for a
@@ -254,7 +270,29 @@ mod eventlog_policy_tests {
 
 #[cfg(test)]
 mod exclusion_tests {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
     use super::*;
+
+    #[test]
+    fn only_the_unspecified_address_on_the_probe_port_is_the_probe() {
+        for unspecified in [
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        ] {
+            assert!(is_address_selection_probe(unspecified, 65535));
+            assert!(!is_address_selection_probe(unspecified, 4444));
+        }
+        // A real peer or loopback on the probe port is not the probe.
+        assert!(!is_address_selection_probe(
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            65535
+        ));
+        assert!(!is_address_selection_probe(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            65535
+        ));
+    }
 
     #[test]
     fn system_locations_are_trusted() {

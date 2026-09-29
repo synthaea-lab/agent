@@ -17,9 +17,9 @@ use store::BoundedMap;
 use crate::{
     Alert,
     exclusions::{
-        ADDRESS_SELECTION_PROBE_PORT, AGENT_CHILD_EXCLUSIONS, APK_STAGING_FILE_PREFIX,
-        AUTH_FAILURE_THRESHOLD, AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD, BEACON_WINDOW_NS,
-        BROWSERS, BURST_WRITE_BYTES_THRESHOLD, COMPRESSION_DRIVER_COMMS, COMPRESSION_SUFFIXES,
+        AGENT_CHILD_EXCLUSIONS, APK_STAGING_FILE_PREFIX, AUTH_FAILURE_THRESHOLD,
+        AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD, BEACON_WINDOW_NS, BROWSERS,
+        BURST_WRITE_BYTES_THRESHOLD, COMPRESSION_DRIVER_COMMS, COMPRESSION_SUFFIXES,
         COMPRESSOR_COMMS, CREATE_UNLINK_HISTORY_PER_PID, CREATE_UNLINK_PAIR_WINDOW_NS,
         CREATE_UNLINK_PID_CAP, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS, IN_PLACE_EDIT_COMMS,
         LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS, MEMFD_EXEC_WINDOW_NS,
@@ -599,7 +599,7 @@ impl RuleState {
         // the local host like `127.0.0.1:<port>`, which still counts, so the rest must
         // count too or a local-relay beacon could hide behind the unspecified address
         // (#536).
-        if daddr.is_unspecified() && dport == ADDRESS_SELECTION_PROBE_PORT {
+        if policy::is_address_selection_probe(daddr, dport) {
             return true;
         }
         // IPv4 multicast (224.0.0.0/4) and broadcast (last octet = 255): legitimate
