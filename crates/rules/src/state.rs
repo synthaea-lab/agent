@@ -17,13 +17,14 @@ use crate::{
         AGENT_CHILD_EXCLUSIONS, APK_STAGING_FILE_PREFIX, AUTH_FAILURE_THRESHOLD,
         AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD, BEACON_WINDOW_NS, BROWSERS,
         BURST_WRITE_BYTES_THRESHOLD, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS,
-        LOLBIN_LEGIT_PARENTS, LOLBINS, MEMFD_EXEC_WINDOW_NS, PACKAGE_MANAGER_COMMS,
-        PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES, QUARANTINE_EXEC_WINDOW_NS,
-        RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD,
-        RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
-        SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_THRESHOLD,
-        SELF_SPAWN_WINDOW_NS, SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN,
-        SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS, WEB_SERVER_COMMS,
+        IN_PLACE_EDIT_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS,
+        MEMFD_EXEC_WINDOW_NS, PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES,
+        QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX,
+        RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD,
+        SCAN_SPREAD_WINDOW_NS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
+        SELF_SPAWN_THRESHOLD, SELF_SPAWN_WINDOW_NS, SHELL_COMMS, STANDARD_PORTS,
+        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
+        WEB_SERVER_COMMS,
     },
     has_write_intent,
     sliding::{FlowPortDedup, SlidingCounter, SlidingDistinct, SlidingSum},
@@ -66,6 +67,13 @@ pub struct RuleState {
     /// userspace. LRU-bounded (`store::BoundedMap`) — a long-lived agent must not
     /// grow this without limit. `pub(crate)` for the `seed_from_proc` test.
     pub(crate) pid_comm: BoundedMap<u32, String>,
+    /// pid → kernel-reported `image_path` of the last exec seen for this pid. The
+    /// only race-free source of "which binary is this pid" for rename-time
+    /// exclusions: `FileRenameEvent::executable_path` is read from `/proc/<pid>/exe`
+    /// after the event crossed the ring buffer, so a short-lived process (real
+    /// `sed -i.bak`, or an encryptor that exits right after its renames) is already
+    /// gone and it reads `None` (#513 review). LRU-bounded like `pid_comm`.
+    pid_image_path: BoundedMap<u32, String>,
     /// path → info about the last write by a known downloader (T1105). LRU-bounded:
     /// downloader writes are rare, but a hostile loop must not grow agent memory.
     recent_writes: BoundedMap<String, RecentWrite>,
@@ -187,6 +195,7 @@ impl RuleState {
     pub fn new() -> Self {
         Self {
             pid_comm: BoundedMap::new(PID_COMM_CAP),
+            pid_image_path: BoundedMap::new(PID_COMM_CAP),
             recent_writes: BoundedMap::new(RECENT_WRITES_CAP),
             recent_quarantines: BoundedMap::new(RECENT_WRITES_CAP),
             self_spawn: BoundedMap::new(COUNTER_CAP),
@@ -719,6 +728,8 @@ impl RuleState {
 
         self.pid_comm
             .insert(event.meta.pid, event.meta.comm.clone());
+        self.pid_image_path
+            .insert(event.meta.pid, event.image_path.clone());
         alerts
     }
 
@@ -1054,26 +1065,34 @@ impl RuleState {
     /// two (its renames also land in the per-ppid counter, but that branch is only
     /// consulted when the per-pid one did not fire this event).
     ///
-    /// Known benign producers of this exact shape that this rule does **not** yet
-    /// discriminate, because a `FileRenameEvent` carries only `comm`, never the
-    /// executable path an evidence-gated exclusion needs (CLAUDE.md — name-keyed
-    /// exclusions must be gated on evidence, cf. [`policy::name_exclusion_applies`]):
+    /// Known benign producers of this exact shape (#459 part 1 closes the first
+    /// two; the third stays open, see below):
     /// - Log rotation (`app.log` → `app.log.1`): handled by [`is_rotation_suffix`]
     ///   (a suffix with no letter never counts) — the one case a shape signal settles.
     /// - In-place edit with a backup: `sed -i.bak`, `perl -i.orig` `rename(2)` the
     ///   original to `f.bak`/`f.orig` from one pid; 20+ files in one command
-    ///   (`sed -i.bak … *.conf`) trip this rule.
+    ///   (`sed -i.bak … *.conf`) used to trip this rule. [`is_in_place_edit_backup`]
+    ///   now excludes it, gated on `comm` + the pid's exec-time `image_path`
+    ///   (CLAUDE.md — name-keyed exclusions must be gated on evidence, cf.
+    ///   [`policy::name_exclusion_applies`]; excluding on `comm` alone would be
+    ///   spoofable, an encryptor can set `comm=sed` for free). Fails closed when
+    ///   no path is known, see `Self::is_in_place_edit_backup`.
     /// - Maildir flag changes (`…:2,S` → `…:2,ST`): one IMAP pid, prefix-preserving,
-    ///   lettered suffix; "mark all read" on a large folder can exceed the threshold.
+    ///   lettered suffix; "mark all read" on a large folder can exceed the
+    ///   threshold. [`is_maildir_flag_change`] now excludes it — structurally
+    ///   (the flag-letter alphabet), deliberately *not* also comm-gated; see
+    ///   that function's doc for why.
     ///
-    /// Excluding those on `comm` alone would be spoofable (an encryptor sets
-    /// `comm=sed`), so the proper fix is to add the exe path to `FileRenameEvent` and
-    /// gate on `comm` + trusted path — tracked as a follow-up. Shapes this rule
-    /// cannot see at all (write-new-then-unlink, cross-directory moves) need a
-    /// separate write/delete correlation, also follow-up.
+    /// Shapes this rule cannot see at all (write-new-then-unlink, cross-directory
+    /// moves) need a separate write/delete correlation — still a follow-up,
+    /// tracked in #459 part 2.
     fn check_mass_rename_pattern(&mut self, event: &FileRenameEvent) -> Option<Alert> {
         let suffix = event.new_path.strip_prefix(event.old_path.as_str())?;
-        if suffix.is_empty() || is_rotation_suffix(suffix) {
+        if suffix.is_empty()
+            || is_rotation_suffix(suffix)
+            || self.is_in_place_edit_backup(event)
+            || is_maildir_flag_change(&event.old_path, suffix)
+        {
             return None;
         }
         let ts = event.meta.timestamp_ns;
@@ -1317,6 +1336,61 @@ fn is_apk_staging_rename(old_path: &str, new_path: &str) -> bool {
         && old_base
             .strip_prefix(APK_STAGING_FILE_PREFIX)
             .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+impl RuleState {
+    /// True for `check_mass_rename_pattern`'s in-place-edit-with-backup false
+    /// positive (#459 part 1): `comm` is a known in-place-edit tool
+    /// ([`IN_PLACE_EDIT_COMMS`]) and the binary behind the pid is at a trusted
+    /// path ([`policy::name_exclusion_applies`]).
+    ///
+    /// The path is the exec-time `image_path` from [`Self::pid_image_path`], not
+    /// `FileRenameEvent::executable_path`: the latter is a rename-time `/proc` read
+    /// that a short-lived process loses (#513 review), and "unknown" there is
+    /// something the process controls by exiting. Unlike the other name-keyed
+    /// exclusions (whose image paths the kernel hands us at exec time), an
+    /// unresolvable path here **fails closed**: a pid with no exec seen (it never
+    /// exec'd since the agent started — e.g. a forked child that only set `comm`)
+    /// is not evidence of `/usr/bin/sed`. `executable_path` is only a fallback for
+    /// that gap, never a way to override a known exec-time path.
+    fn is_in_place_edit_backup(&self, event: &FileRenameEvent) -> bool {
+        if !IN_PLACE_EDIT_COMMS.contains(&event.meta.comm.as_str()) {
+            return false;
+        }
+        let path = self
+            .pid_image_path
+            .peek(&event.meta.pid)
+            .map(String::as_str)
+            .or(event.executable_path.as_deref());
+        matches!(path, Some(p) if !p.is_empty() && policy::name_exclusion_applies(Some(p)))
+    }
+}
+
+/// True for `check_mass_rename_pattern`'s Maildir-flag-change false positive
+/// (#459 part 1): `old_path` already ends in the Maildir info/flags marker
+/// (`:2,` optionally followed by flag letters) and `suffix` — the tail
+/// `new_path` appends — is composed entirely of valid Maildir flag letters
+/// ([`MAILDIR_FLAG_LETTERS`]).
+///
+/// Deliberately **not** also gated on `comm`, unlike [`is_in_place_edit_backup`]
+/// and unlike issue #459's own suggestion: `sed`/`perl` are two fixed,
+/// well-known binaries, but "a mail server touching Maildir" has no small
+/// fixed `comm` set to enumerate without guessing (dovecot, courier,
+/// procmail, maildrop, notmuch, mbsync, offlineimap, mutt, ...) — inventing
+/// one would be exactly the uncalibrated-exclusion-list problem this crate's
+/// own module doc warns against. The flag-letter alphabet constraint is
+/// already a tight structural signal on its own, the same class of reasoning
+/// [`is_rotation_suffix`]'s all-digit check relies on.
+fn is_maildir_flag_change(old_path: &str, suffix: &str) -> bool {
+    if suffix.is_empty() || !suffix.bytes().all(|b| MAILDIR_FLAG_LETTERS.contains(&b)) {
+        return false;
+    }
+    let Some(marker) = old_path.rfind(":2,") else {
+        return false;
+    };
+    old_path.as_bytes()[marker + 3..]
+        .iter()
+        .all(|b| MAILDIR_FLAG_LETTERS.contains(b))
 }
 
 /// Whether the file at `path` is the one a process named `comm` runs from. A

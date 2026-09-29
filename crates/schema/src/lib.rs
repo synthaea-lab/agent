@@ -189,12 +189,24 @@ pub mod time;
 /// same coordination note as v13, v28→29, and ADR-0005. Same
 /// serialization-visible reasoning as every field addition since v13.
 ///
-/// Bumped 31 → 32 for [`MemfdCreateEvent::fd`] (#510): the descriptor
+/// Bumped 31 → 32 for [`FileRenameEvent::executable_path`] (#459 part 1): the
+/// renaming process's own executable path, so an evidence-gated exclusion
+/// (comm + trusted path, `policy::name_exclusion_applies`) can discriminate
+/// `sed -i.bak`/`perl -i.orig` from a real mass-rename encryptor instead of
+/// trusting `comm` alone. `None` when the sensor couldn't resolve it (macOS
+/// ES always provides it for free; Linux reads `/proc/<pid>/exe` at rename
+/// time and the pid can have already exited by then — see
+/// `sensor-linux/normalize.rs`'s doc for that race). 31 was claimed by #74
+/// while both branches were open; #74 merged first, so this one renumbers —
+/// same coordination note as v13, v28→29, and v30→31 above.
+///
+/// Bumped 32 → 33 for [`MemfdCreateEvent::fd`] (#510): the descriptor
 /// `memfd_create(2)` returned, so `check_memfd_exec` can compare it to the
 /// `<n>` of an exec via `/proc/self/fd/<n>` instead of correlating on pid and
-/// time alone. #513 also claims 32 (its `executable_path` on rename events);
-/// whichever merges second renumbers, same coordination note as v13 and v28→29.
-pub const SCHEMA_VERSION: u32 = 32;
+/// time alone. 32 was claimed by #513 (`FileRenameEvent::executable_path`) while
+/// both branches were open; #513 merged first, so this one renumbers — same
+/// coordination note as v13, v28→29 and v30→31 above.
+pub const SCHEMA_VERSION: u32 = 33;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -658,6 +670,14 @@ pub struct FileRenameEvent {
     pub meta: EventMeta,
     pub old_path: String,
     pub new_path: String,
+    /// The renaming process's own executable path (#459 part 1) — `None`
+    /// when the sensor couldn't resolve it (see [`SCHEMA_VERSION`]'s v31
+    /// changelog entry for the per-platform reasoning). Lets an
+    /// evidence-gated exclusion tell a real in-place-edit tool
+    /// (`/usr/bin/sed`) from an encryptor claiming `comm=sed` apart, instead
+    /// of trusting `comm` alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_path: Option<String>,
 }
 
 /// File permission change (issue #262 Phase 2): `chmod(2)`/`fchmodat(2)`. `fchmod(2)`

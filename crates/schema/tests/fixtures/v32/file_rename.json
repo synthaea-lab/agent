@@ -8,5 +8,6 @@
     "comm": "encryptor"
   },
   "old_path": "/home/user/invoice.pdf",
-  "new_path": "/home/user/invoice.pdf.locked"
+  "new_path": "/home/user/invoice.pdf.locked",
+  "executable_path": "/tmp/encryptor"
 }

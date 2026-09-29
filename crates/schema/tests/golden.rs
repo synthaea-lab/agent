@@ -822,6 +822,7 @@ fn file_delete_golden() {
 #[test]
 fn file_rename_golden() {
     // v15 (#262): the ransomware signal — new_path's suffix relative to old_path's.
+    // v31 (#459 part 1): executable_path, the renaming process's own exe path.
     assert_golden(
         &Event::FileRename(FileRenameEvent {
             meta: EventMeta {
@@ -837,6 +838,7 @@ fn file_rename_golden() {
             },
             old_path: "/home/user/invoice.pdf".into(),
             new_path: "/home/user/invoice.pdf.locked".into(),
+            executable_path: Some("/tmp/encryptor".into()),
         }),
         "file_rename",
     );
@@ -1626,6 +1628,7 @@ fn meta_accessor_covers_all_variants() {
             meta: meta.clone(),
             old_path: String::new(),
             new_path: String::new(),
+            executable_path: None,
         }),
         Event::SocketBind(SocketBindEvent {
             meta: meta.clone(),

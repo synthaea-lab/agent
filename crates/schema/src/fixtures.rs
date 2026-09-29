@@ -277,6 +277,7 @@ pub fn file_rename() -> FileRenameEvent {
         meta: meta(),
         old_path: String::new(),
         new_path: String::new(),
+        executable_path: None,
     }
 }
 

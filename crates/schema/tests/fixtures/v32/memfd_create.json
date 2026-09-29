@@ -8,6 +8,5 @@
     "comm": "dropper"
   },
   "name": "payload",
-  "flags": 1,
-  "fd": 3
+  "flags": 1
 }
