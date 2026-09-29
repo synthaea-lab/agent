@@ -109,6 +109,52 @@ pub(crate) const BURST_WRITE_BYTES_THRESHOLD: u64 = 100 * 1024 * 1024;
 /// doc describes for `comm`-based exclusions.
 pub(crate) const RANSOMWARE_EXCLUDED_PATH_PREFIXES: &[&str] = &["/tmp/", "/var/tmp/"];
 
+/// Suffixes a package manager (or an editor's atomic-save convention) appends
+/// to a file it's about to replace, then renames away — the *reverse*
+/// relationship from `check_mass_rename_pattern`'s ransomware shape
+/// (`old_path` + suffix = `new_path`, e.g. `document.docx` ->
+/// `document.docx.locked`): here `old_path` = `new_path` + suffix
+/// (`lib.so.dpkg-new` -> `lib.so`). Confirmed live (#496): a package upgrade
+/// renaming a batch of `.dpkg-new` staging files into place, alongside the
+/// large writes that staged their content (120MB across 30 files in the
+/// capture), cleared both of `check_burst_write_volume`'s gates — rename
+/// count and byte volume — and false-positived T1486. `apk`'s equivalent
+/// suffix is included on the same reasoning, not independently captured live.
+/// rsync's own temp-file convention plausibly hits the same false positive
+/// (also named in the #496 report) but isn't a fixed suffix on the final
+/// name the way these are, so it isn't covered here — add it if a live
+/// capture shows the actual shape.
+pub(crate) const PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES: &[&str] = &[".dpkg-new", ".apk-new"];
+
+/// The prefix apk-tools actually stages under, confirmed live (#500 review,
+/// Jihair, real `apk fix` reinstall on Alpine): apk does *not* use the
+/// `.apk-new` suffix above for its own package-file replacement — that string
+/// is the sidecar it leaves next to a locally modified config file, which it
+/// never renames onto anything. The real staging shape extracts each file to
+/// a hidden name in the *same directory* as the final path (not derived from
+/// it by suffix) and renames that onto the final name, e.g.
+/// `usr/bin/.apk.e9a41015f8b7e04a3f02df6f500e89f18738758051d63799` ->
+/// `usr/bin/c89`. Without this, coalescing `SlidingSum` correctly (this same
+/// PR) made every apk upgrade over ~100MB in 5s a live false T1486 (806/810
+/// renames in the capture had this shape, zero had `.apk-new`).
+pub(crate) const APK_STAGING_FILE_PREFIX: &str = ".apk.";
+
+/// `comm` values a real Debian/Alpine package manager runs the staging-rename
+/// dance under. Required *alongside* [`PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES`]
+/// before `check_burst_write_volume` excludes a burst (#500 review, Nikolas):
+/// the suffix convention alone is just a filename shape the process being
+/// renamed-and-written controls — a real encryptor can name its own staging
+/// file `target.dpkg-new` then rename onto `target` purely to dodge this
+/// signal. `comm` is spoofable too (`prctl`/`argv[0]`), so this doesn't make
+/// the exclusion unspoofable — it raises the bar from "match one filename
+/// convention" to "also make the process look like the exact package manager
+/// that convention belongs to", which is what corroboration means here, not
+/// a claim of unforgeability. `dpkg-deb`/`apt`/`apt-get` shell out to `dpkg`
+/// for the actual file replacement, so `dpkg` alone already covers Debian;
+/// listed anyway since callers observing themselves is cheaper than the debate
+/// over whether they always do.
+pub(crate) const PACKAGE_MANAGER_COMMS: &[&str] = &["dpkg", "dpkg-deb", "apt", "apt-get", "apk"];
+
 /// Pairing window for one scheduled-task registration seen on both Security 4698
 /// and TaskScheduler/Operational 106 (#422, T1053.005). The two are normalized by
 /// separate poll threads, each on a 2s cadence, so their timestamps land a few
