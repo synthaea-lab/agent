@@ -1284,6 +1284,62 @@ fn write_new_then_unlink_alerts_when_the_unlink_is_processed_first() {
     assert_eq!(alerts[0].technique, "T1486");
 }
 
+/// A whole burst of one kind drained before the other, as the two ring buffers do live
+/// (#512 part B, found on the Hyper-V lab: 30 unlinks were processed before their
+/// creations, and a 16-entry history could never reach the threshold of 20).
+fn batched_write_new_then_unlink(pid: u32, unlinks_first: bool) -> Vec<crate::Alert> {
+    let mut state = RuleState::new();
+    let n = RANSOMWARE_RENAME_THRESHOLD * 3 / 2;
+    let mut alerts = Vec::new();
+    let creates = |state: &mut RuleState, alerts: &mut Vec<crate::Alert>| {
+        for i in 0..n {
+            let ts = u64::from(i) * 100_000_000;
+            let path = format!("/home/u/docs/f{i}.docx.locked");
+            alerts.extend(state.on_file_open(&file_open_event_full(
+                pid,
+                "encryptor",
+                &path,
+                O_NEW_FILE,
+                ts,
+            )));
+        }
+    };
+    let unlinks = |state: &mut RuleState, alerts: &mut Vec<crate::Alert>| {
+        for i in 0..n {
+            let ts = u64::from(i) * 100_000_000 + 1_000;
+            let path = format!("/home/u/docs/f{i}.docx");
+            alerts.extend(state.on_file_delete(&file_delete_event_full(
+                pid,
+                "encryptor",
+                &path,
+                ts,
+            )));
+        }
+    };
+    if unlinks_first {
+        unlinks(&mut state, &mut alerts);
+        creates(&mut state, &mut alerts);
+    } else {
+        creates(&mut state, &mut alerts);
+        unlinks(&mut state, &mut alerts);
+    }
+    alerts
+}
+
+#[test]
+fn a_batch_of_creations_then_a_batch_of_unlinks_alerts() {
+    let alerts = batched_write_new_then_unlink(9410, false);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+}
+
+#[test]
+fn a_batch_of_unlinks_then_a_batch_of_creations_alerts() {
+    let alerts = batched_write_new_then_unlink(9411, true);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+}
+
 #[test]
 fn a_long_burst_yields_exactly_one_alert() {
     let mut state = RuleState::new();

@@ -192,17 +192,19 @@ pub(crate) const COMPRESSOR_COMMS: &[&str] = &[
 /// content is written, which for a large file is seconds, not milliseconds.
 pub(crate) const CREATE_UNLINK_PAIR_WINDOW_NS: u64 = 60_000_000_000; // 60s
 
-/// Creations and unmatched unlinks remembered per pid for that pairing. A tool
-/// working through a tree pairs each file's creation and unlink back to back, so a
-/// short history finds the partner; a pid making more than this before either
-/// resolves is not something a longer list would catch better.
-pub(crate) const CREATE_UNLINK_HISTORY_PER_PID: usize = 16;
+/// Creations and unmatched unlinks remembered per pid for that pairing. The open and
+/// delete ring buffers are drained independently, so a whole burst of one kind can be
+/// processed before the other (live, #512: 30 unlinks first, then 30 creations): the
+/// history must hold more than [`RANSOMWARE_RENAME_THRESHOLD`] entries or the burst can
+/// never be paired up to the threshold. 64 leaves headroom for a batch of about three
+/// times the threshold.
+pub(crate) const CREATE_UNLINK_HISTORY_PER_PID: usize = 64;
 
 /// Pids tracked for that pairing. A dedicated, smaller bound than the pid tables: each
 /// entry holds up to [`CREATE_UNLINK_HISTORY_PER_PID`] path strings, so the worst case
-/// (`cap x per-pid x path`) stays a few MB rather than the ~200 MB the 65k-pid tables
-/// would allow.
-pub(crate) const CREATE_UNLINK_PID_CAP: usize = 4_096;
+/// (`cap x per-pid x path`, two maps) stays around ten MB rather than the ~200 MB the
+/// 65k-pid tables would allow.
+pub(crate) const CREATE_UNLINK_PID_CAP: usize = 1_024;
 
 /// Pairing window for one scheduled-task registration seen on both Security 4698
 /// and TaskScheduler/Operational 106 (#422, T1053.005). The two are normalized by
