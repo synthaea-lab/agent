@@ -1059,15 +1059,22 @@ impl RuleState {
     ///   (the flag-letter alphabet), deliberately *not* also comm-gated; see
     ///   that function's doc for why.
     ///
-    /// Shapes this rule cannot see at all (write-new-then-unlink, cross-directory
-    /// moves) need a separate write/delete correlation — still a follow-up,
-    /// tracked in #459 part 2.
+    /// Cross-directory moves (`~/docs/a.docx` → `~/.stash/a.docx.locked`, #512):
+    /// when the directories differ the full-path prefix test can never hold, so the
+    /// same appended-suffix relation is read off the file *names* instead
+    /// ([`appended_suffix`]). Same counters, same exclusions; the one new benign
+    /// producer that shape brings in is the Maildir delivery move
+    /// (`new/msg` → `cur/msg:2,S`), excluded by [`is_maildir_info_suffix`].
+    ///
+    /// Shapes this rule still cannot see at all (write-new-then-unlink) need a
+    /// separate open/delete correlation — still a follow-up, tracked in #512.
     fn check_mass_rename_pattern(&mut self, event: &FileRenameEvent) -> Option<Alert> {
-        let suffix = event.new_path.strip_prefix(event.old_path.as_str())?;
+        let suffix = appended_suffix(&event.old_path, &event.new_path)?;
         if suffix.is_empty()
             || is_rotation_suffix(suffix)
             || self.is_in_place_edit_backup(event)
             || is_maildir_flag_change(&event.old_path, suffix)
+            || is_maildir_info_suffix(suffix)
         {
             return None;
         }
@@ -1337,6 +1344,47 @@ impl RuleState {
             .or(event.executable_path.as_deref());
         matches!(path, Some(p) if !p.is_empty() && policy::name_exclusion_applies(Some(p)))
     }
+}
+
+/// The suffix a rename appends to a file's name, when that is what it does: the tail
+/// of `new_path` after `old_path` (same directory, `a.docx` → `a.docx.locked`), or,
+/// when the directories differ, the tail of `new_path`'s *file name* after
+/// `old_path`'s (`~/docs/a.docx` → `~/.stash/a.docx.locked`, #512). `None` when
+/// neither relation holds. Splits on `/` and `\\` alike: Windows sensors feed this
+/// rule too. Works on the raw path strings, so a relative pair (both relative to
+/// the same unresolved dirfd or cwd) compares consistently without resolving it.
+fn appended_suffix<'a>(old_path: &str, new_path: &'a str) -> Option<&'a str> {
+    if let Some(suffix) = new_path.strip_prefix(old_path) {
+        return Some(suffix);
+    }
+    let (old_dir, old_base) = split_dir_base(old_path);
+    let (new_dir, new_base) = split_dir_base(new_path);
+    if old_dir == new_dir || old_base.is_empty() {
+        return None;
+    }
+    new_base.strip_prefix(old_base)
+}
+
+/// `path` split at its last separator into `(directory, file name)`; no separator
+/// means an empty directory part.
+fn split_dir_base(path: &str) -> (&str, &str) {
+    match path.rfind(['/', '\\']) {
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => ("", path),
+    }
+}
+
+/// True for a suffix that is exactly a Maildir info marker: `:2,` followed by
+/// zero or more flag letters. Delivering a message out of `new/` into `cur/` is a
+/// cross-directory rename that appends precisely this (`msg` → `msg:2,S`), and an
+/// IMAP server or `mbsync` does it for every message a client opens: 20+ in a
+/// few seconds on "mark all read" (#512). Structural like
+/// [`is_maildir_flag_change`], for the same reason: the alphabet is a tight shape
+/// and there is no small fixed set of `comm` values to gate on.
+fn is_maildir_info_suffix(suffix: &str) -> bool {
+    suffix
+        .strip_prefix(":2,")
+        .is_some_and(|flags| flags.bytes().all(|b| MAILDIR_FLAG_LETTERS.contains(&b)))
 }
 
 /// True for `check_mass_rename_pattern`'s Maildir-flag-change false positive

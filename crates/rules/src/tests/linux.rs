@@ -1063,6 +1063,161 @@ fn maildir_shaped_rename_with_an_invalid_flag_letter_still_alerts() {
     assert_eq!(alerts[0].technique, "T1486");
 }
 
+// ── T1486 cross-directory moves (#512) ──
+
+/// `RANSOMWARE_RENAME_THRESHOLD` renames from one pid, each `old_dir/f{i}<old_ext>` →
+/// `new_dir/f{i}<old_ext><suffix>`, inside one window.
+fn cross_dir_burst(
+    comm: &str,
+    old_dir: &str,
+    new_dir: &str,
+    old_ext: &str,
+    suffix: &str,
+) -> Vec<crate::Alert> {
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9300,
+            comm,
+            &format!("{old_dir}/f{i}{old_ext}"),
+            &format!("{new_dir}/f{i}{old_ext}{suffix}"),
+            u64::from(i) * 100_000_000,
+        )));
+    }
+    alerts
+}
+
+#[test]
+fn cross_directory_move_with_an_appended_suffix_alerts() {
+    // ~/docs/a.docx -> ~/.stash/a.docx.locked: the full-path prefix test can never
+    // hold here, the file-name relation does.
+    let alerts = cross_dir_burst(
+        "encryptor",
+        "/home/u/docs",
+        "/home/u/.stash",
+        ".docx",
+        ".locked",
+    );
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+}
+
+#[test]
+fn cross_directory_move_between_relative_paths_alerts() {
+    // Raw, unresolved paths (the sensor reports the syscall argument as given):
+    // both sides are relative to the same cwd/dirfd, so the names still compare.
+    let alerts = cross_dir_burst("encryptor", "docs", "stash", ".docx", ".locked");
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn cross_directory_move_from_a_bare_name_to_a_path_alerts() {
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9301,
+            "encryptor",
+            &format!("f{i}.docx"),
+            &format!("/mnt/stash/f{i}.docx.locked"),
+            u64::from(i) * 100_000_000,
+        )));
+    }
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn cross_directory_move_with_windows_separators_alerts() {
+    // Windows sensors feed this rule too: the file-name split must honour `\`.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9302,
+            "encryptor",
+            &format!(r"C:\Users\u\Documents\f{i}.docx"),
+            &format!(r"C:\Users\u\AppData\stash\f{i}.docx.locked"),
+            u64::from(i) * 100_000_000,
+        )));
+    }
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn plain_cross_directory_move_without_a_suffix_does_not_alert() {
+    // `mv *.docx /backup/`: same name, different directory, nothing appended.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD * 2 {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9303,
+            "mv",
+            &format!("/home/u/docs/f{i}.docx"),
+            &format!("/backup/f{i}.docx"),
+            u64::from(i) * 50_000_000,
+        )));
+    }
+    assert!(alerts.is_empty());
+}
+
+#[test]
+fn cross_directory_move_to_a_different_name_does_not_alert() {
+    // The file name is not preserved: no appended-suffix relation at all.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD * 2 {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9304,
+            "mv",
+            &format!("/home/u/docs/f{i}.docx"),
+            &format!("/backup/g{i}.pdf"),
+            u64::from(i) * 50_000_000,
+        )));
+    }
+    assert!(alerts.is_empty());
+}
+
+#[test]
+fn cross_directory_log_rotation_does_not_alert() {
+    // /var/log/app.log -> /var/log/archive/app.log.1: an all-digit suffix is the
+    // one rotation shape a shape signal can settle, cross-directory or not.
+    let alerts = cross_dir_burst("logrotate", "/var/log", "/var/log/archive", ".log", ".1");
+    assert!(alerts.is_empty());
+}
+
+#[test]
+fn maildir_delivery_from_new_to_cur_does_not_alert() {
+    // new/<msg> -> cur/<msg>:2,S: a cross-directory rename appending exactly the
+    // Maildir info marker, once per message a client opens. "Mark all read" on a
+    // large folder is 20+ of them from one IMAP pid.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD * 2 {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9305,
+            "dovecot-imapd",
+            &format!("/home/u/Maildir/new/171{i}.host"),
+            &format!("/home/u/Maildir/cur/171{i}.host:2,S"),
+            u64::from(i) * 50_000_000,
+        )));
+    }
+    assert!(alerts.is_empty());
+}
+
+#[test]
+fn maildir_info_marker_with_an_invalid_flag_letter_still_alerts() {
+    // The structural gate stays tight: "X" is not a Maildir flag letter.
+    let alerts = cross_dir_burst(
+        "evil",
+        "/home/u/Maildir/new",
+        "/home/u/Maildir/cur",
+        "",
+        ":2,SX",
+    );
+    assert_eq!(alerts.len(), 1);
+}
+
 // ── T1486 write-volume corroboration (issue #82) ───────────────────────────
 // Second, independent signal alongside check_mass_rename_pattern: heavy write
 // volume + a rename burst, regardless of rename shape — catches a
