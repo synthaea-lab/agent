@@ -135,9 +135,6 @@ pub struct RuleState {
     pending_unlinks: BoundedMap<u32, VecDeque<(u64, String)>>,
     /// pid → sliding counter of write-new-then-unlink pairs (T1486, #512 part B).
     ransomware_unlink: BoundedMap<u32, SlidingCounter>,
-    /// ppid → the same, for the shell-loop shape (one short-lived process per file), like
-    /// `ransomware_rename_by_ppid`.
-    ransomware_unlink_by_ppid: BoundedMap<u32, SlidingCounter>,
     /// pid → sliding sum of `FileWriteEvent::bytes_requested` (issue #82): the
     /// write-volume half of a second, independent T1486 corroboration signal —
     /// heavy write volume alongside a rename burst, regardless of whether the
@@ -219,7 +216,6 @@ impl RuleState {
             recent_creates: BoundedMap::new(CREATE_UNLINK_PID_CAP),
             pending_unlinks: BoundedMap::new(CREATE_UNLINK_PID_CAP),
             ransomware_unlink: BoundedMap::new(COUNTER_CAP),
-            ransomware_unlink_by_ppid: BoundedMap::new(COUNTER_CAP),
             ransomware_rename: BoundedMap::new(COUNTER_CAP),
             ransomware_rename_by_ppid: BoundedMap::new(COUNTER_CAP),
             write_volume: BoundedMap::new(COUNTER_CAP),
@@ -1195,6 +1191,12 @@ impl RuleState {
     /// exceeded 2. Restricted to Unix events: the Windows and macOS producers of this
     /// shape (Explorer, `ditto`, installers) were not measured.
     ///
+    /// **Not covered**: a shell loop with one process per step (`openssl enc -out $f.enc`
+    /// creates, a separate `rm $f` unlinks). Creation and unlink then belong to different
+    /// pids, so no pair forms (confirmed live on Debian 13); tying them through the
+    /// parent would also fold in ordinary `cp x x.bak; rm x` scripts, which was not
+    /// measured. The rename shape of that loop is covered by `check_mass_rename_pattern`.
+    ///
     /// Like every pid-keyed table here it inherits #519: a recycled pid keeps a stale
     /// history until it ages out of the window.
     fn check_write_new_then_unlink(&mut self, event: &FileDeleteEvent) -> Option<Alert> {
@@ -1250,8 +1252,8 @@ impl RuleState {
         None
     }
 
-    /// Counts one matched write-new-then-unlink pair, per pid and per ppid, alerting at
-    /// the mass-rename threshold. `ts` is the later (unlink) time.
+    /// Counts one matched write-new-then-unlink pair per pid, alerting at the
+    /// mass-rename threshold. `ts` is the later (unlink) time.
     fn count_create_unlink_pair(
         &mut self,
         meta: &schema::EventMeta,
@@ -1278,31 +1280,6 @@ impl RuleState {
                     meta.pid,
                     meta.comm,
                     RANSOMWARE_RENAME_WINDOW_NS / 1_000_000_000,
-                ),
-            });
-        }
-        // Per-ppid, the shell-loop shape (`for f in *; do openssl enc -in $f -out $f.enc &&
-        // rm $f; done`): same guards as `check_mass_rename_pattern`.
-        if pid_count > RANSOMWARE_LOOP_CHILD_MAX || meta.ppid <= 1 {
-            return None;
-        }
-        let ppid_entry = self
-            .ransomware_unlink_by_ppid
-            .get_or_insert_with(meta.ppid, SlidingCounter::default);
-        let ppid_count = ppid_entry.record(ts, RANSOMWARE_RENAME_WINDOW_NS);
-        if ppid_count >= RANSOMWARE_RENAME_THRESHOLD
-            && ppid_entry.try_alert(ts, RANSOMWARE_RENAME_WINDOW_NS)
-        {
-            return Some(Alert {
-                technique: "T1486",
-                message: format!(
-                    "ppid={}: {ppid_count} files replaced by a new file with an appended suffix \
-                     and then unlinked by short-lived children in {}s (e.g. {deleted} → {created}, \
-                     comm={}) — suspected ransomware encryption pass (write-new-then-unlink, \
-                     shell-loop pattern)",
-                    meta.ppid,
-                    RANSOMWARE_RENAME_WINDOW_NS / 1_000_000_000,
-                    meta.comm,
                 ),
             });
         }

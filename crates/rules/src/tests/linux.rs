@@ -1450,33 +1450,6 @@ fn an_encryptor_that_names_its_output_dot_gz_still_alerts() {
 }
 
 #[test]
-fn a_shell_loop_of_single_file_processes_alerts_per_ppid() {
-    // `for f in *; do openssl enc -in $f -out $f.enc && rm $f; done`: one short-lived
-    // process per file, so no per-pid counter climbs; the loop's shell ties them.
-    let mut state = RuleState::new();
-    let mut alerts = Vec::new();
-    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
-        let pid = 9500 + i;
-        let ts = u64::from(i) * 100_000_000;
-        let mut created = file_open_event_full(
-            pid,
-            "openssl",
-            &format!("/home/u/docs/f{i}.docx.enc"),
-            O_NEW_FILE,
-            ts,
-        );
-        created.meta.ppid = 9499;
-        let mut deleted =
-            file_delete_event_full(pid, "rm", &format!("/home/u/docs/f{i}.docx"), ts + 1_000);
-        deleted.meta.ppid = 9499;
-        alerts.extend(state.on_file_open(&created));
-        alerts.extend(state.on_file_delete(&deleted));
-    }
-    assert_eq!(alerts.len(), 1);
-    assert!(alerts[0].message.contains("shell-loop"));
-}
-
-#[test]
 fn a_rotation_or_maildir_suffix_does_not_pair() {
     for suffix in [".1", "-20260929", ":2,S"] {
         let mut state = RuleState::new();
