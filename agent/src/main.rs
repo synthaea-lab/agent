@@ -121,6 +121,13 @@ enum Command {
         /// exactly as before.
         #[arg(long)]
         server: Option<String>,
+        /// Where downloaded content lives (issue #30) — the detection sink
+        /// loads Sigma/YARA rules from `<content-dir>/rules/{sigma,yara}`.
+        /// Same default and directory shape as `apply-content-manifest`'s
+        /// `--content-dir`; point both at the same directory so applied
+        /// content is what this agent actually loads.
+        #[arg(long, default_value = "content")]
+        content_dir: std::path::PathBuf,
     },
     /// Captures a baseline of healthy activity to train the ML models: records the
     /// command lines of exec events that trigger no deterministic rule, as
@@ -242,6 +249,7 @@ fn main() -> anyhow::Result<()> {
             enable_readline_capture,
             enable_dns_capture,
             server,
+            content_dir,
         } => commands::cmd_run(commands::RunOptions {
             alerts: &alerts,
             events: &events,
@@ -253,6 +261,7 @@ fn main() -> anyhow::Result<()> {
             enable_dns_capture,
             server: server.as_deref(),
             ipc_endpoint: &cfg.ipc.endpoint,
+            content_dir: &content_dir,
         }),
         Command::CaptureBaseline { output } => commands::cmd_capture_baseline(&output),
         Command::CaptureEvents { output } => commands::cmd_capture_events(&output),
@@ -286,6 +295,7 @@ fn main() -> anyhow::Result<()> {
                 key.as_deref(),
                 &content_dir,
                 &state,
+                &cfg.ipc.endpoint,
             )
         }
     }

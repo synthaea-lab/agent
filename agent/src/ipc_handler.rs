@@ -9,13 +9,14 @@
 use std::sync::{Arc, OnceLock};
 
 use ipc::{
-    DetectionSummary, Handler, PolicyVersionResponse, RecentDetectionsResponse, SensorHealth,
-    SensorHealthResponse, SensorState, Server, StatusResponse,
+    DetectionSummary, Handler, PolicyVersionResponse, RecentDetectionsResponse,
+    ReloadContentResponse, SensorHealth, SensorHealthResponse, SensorState, Server, StatusResponse,
 };
 
 use crate::{
     alerts::{AlertLog, RecentAlert},
     health::SensorHealthSource,
+    sink::DetectionSink,
 };
 
 /// Where a platform deposits its sensor-health source once it has built one.
@@ -24,22 +25,30 @@ use crate::{
 /// shared pipeline (and therefore after this handler) is wired.
 pub(crate) type SensorHealthSlot = Arc<OnceLock<Arc<dyn SensorHealthSource>>>;
 
-/// Answers the four IPC requests from the running agent's own state.
+/// Answers the IPC requests from the running agent's own state.
 pub(crate) struct AgentHandler {
     agent_version: String,
     started_at_ns: u64,
     alerts: Arc<AlertLog>,
     sensors: SensorHealthSlot,
+    /// Held only for [`Handler::reload_content`] (issue #30) — every other
+    /// request answers from `alerts`/`sensors` alone.
+    sink: Arc<DetectionSink>,
 }
 
 impl AgentHandler {
     #[must_use]
-    pub(crate) fn new(alerts: Arc<AlertLog>, sensors: SensorHealthSlot) -> Self {
+    pub(crate) fn new(
+        alerts: Arc<AlertLog>,
+        sensors: SensorHealthSlot,
+        sink: Arc<DetectionSink>,
+    ) -> Self {
         Self {
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             started_at_ns: schema::time::now_ns(),
             alerts,
             sensors,
+            sink,
         }
     }
 
@@ -100,6 +109,14 @@ impl Handler for AgentHandler {
             policy_version: None,
             signature_verified: None,
             issued_at_ns: None,
+        })
+    }
+
+    async fn reload_content(&self) -> Result<ReloadContentResponse, String> {
+        let report = self.sink.reload_content();
+        Ok(ReloadContentResponse {
+            sigma_rule_count: report.sigma_rule_count,
+            yara_rule_count: report.yara_rule_count,
         })
     }
 }
@@ -174,10 +191,31 @@ mod tests {
         }
     }
 
-    fn alert_log(tag: &str) -> Arc<AlertLog> {
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("synthaea-ipc-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn alert_log(tag: &str) -> Arc<AlertLog> {
+        let dir = tmp_dir(tag);
         Arc::new(AlertLog::open(&dir.join("alerts.ndjson"), RECENT_ALERTS_CAPACITY).unwrap())
+    }
+
+    /// A real `DetectionSink` — `reload_content` exercises its actual load
+    /// path, not a stub, so the test dir doubles as an (empty) content root.
+    fn sink_for(tag: &str) -> Arc<DetectionSink> {
+        let dir = tmp_dir(tag);
+        Arc::new(
+            DetectionSink::new(
+                rules::RuleState::new(),
+                &dir.join("alerts.ndjson"),
+                &dir.join("events.jsonl"),
+                None,
+                &dir.join("content"),
+            )
+            .unwrap(),
+        )
     }
 
     fn handler_with(tag: &str, sensors: Option<Vec<(&'static str, bool)>>) -> AgentHandler {
@@ -186,7 +224,7 @@ mod tests {
             let source: Arc<dyn SensorHealthSource> = Arc::new(FixedHealth(list));
             assert!(slot.set(source).is_ok());
         }
-        AgentHandler::new(alert_log(tag), slot)
+        AgentHandler::new(alert_log(tag), slot, sink_for(tag))
     }
 
     #[test]

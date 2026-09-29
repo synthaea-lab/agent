@@ -132,6 +132,13 @@ async fn round_trip_every_endpoint() {
         .expect("policy_version should succeed");
     assert_eq!(policy.schema_version, 1);
     assert!(policy.policy_version.is_none());
+
+    let reload = client
+        .reload_content()
+        .await
+        .expect("reload_content should succeed");
+    assert_eq!(reload.sigma_rule_count, None);
+    assert_eq!(reload.yara_rule_count, None);
     // Cleanup: the socket file on Unix stays after the test; not a
     // correctness issue (the endpoint is per-run) but cargo test's tmp
     // dir would accumulate. Remove best-effort.

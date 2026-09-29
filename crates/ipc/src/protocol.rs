@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The protocol version this build implements. Bump on any breaking
 /// change to the request/response types below; additive fields on
 /// existing variants stay at the same version.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 // ── Handshake ────────────────────────────────────────────────────────────
 
@@ -71,10 +71,17 @@ pub struct ServerHello {
 
 /// A single request the client sends over an established connection.
 ///
-/// v1 is intentionally read-only: every variant returns a snapshot of
-/// current agent state, no mutation. Policy-gated mutating commands
-/// (`kill`, `quarantine`, `isolate`) land as new variants when the
-/// authorization model they need is designed — deferred, not blocked.
+/// v1 was intentionally read-only: every variant returned a snapshot of
+/// current agent state, no mutation. [`Self::ReloadContent`] (v2, issue
+/// #30) is the first exception, not a reopening of that policy: it acts on
+/// the agent's own already-verified local state (content
+/// `agent apply-content-manifest` already fetched, signature-checked, and
+/// wrote to disk over a *separately* mTLS-authenticated channel), not on
+/// another process or file the way `kill`/`quarantine`/`isolate` would —
+/// those still wait on the per-capability, policy-gated authorization model
+/// named below, unchanged by this addition. The whole channel is already
+/// gated to root-on-Unix-or-elevated-on-Windows peers (`stream::PeerCreds`),
+/// the same bar those future commands will also need.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
@@ -94,6 +101,12 @@ pub enum Request {
     /// version, policy version, whether a signature was verified, and
     /// when it was issued.
     PolicyVersion,
+    /// Re-read Sigma/YARA content from the agent's configured content
+    /// directory and swap it into the running detection pipeline (issue
+    /// #30): the way `agent apply-content-manifest` — a separate, one-shot
+    /// process — tells an already-running `agent run` to pick up content it
+    /// just downloaded and verified, without a restart.
+    ReloadContent,
 }
 
 // ── Response ─────────────────────────────────────────────────────────────
@@ -113,6 +126,8 @@ pub enum Response {
     RecentDetections(RecentDetectionsResponse),
     /// Reply to [`Request::PolicyVersion`].
     PolicyVersion(PolicyVersionResponse),
+    /// Reply to [`Request::ReloadContent`].
+    ReloadContent(ReloadContentResponse),
     /// Any per-request failure the server chose to surface to the client
     /// without closing the connection. Fatal errors (peer-auth failure,
     /// bad framing) still close the connection — see [`WireError`].
@@ -223,6 +238,51 @@ pub struct PolicyVersionResponse {
     /// Nanoseconds since Unix epoch when the issuer produced the
     /// policy. `None` under the same conditions as `policy_version`.
     pub issued_at_ns: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wire-shape pin (issue #30): `ReloadContent` must round-trip through
+    /// the same externally-tagged JSON every other request/response pair
+    /// uses (`{"kind": "reload_content", ...}`), so a client and an older
+    /// or newer server can at least recognize the shape even if
+    /// `PROTOCOL_VERSION` itself gates whether they're allowed to talk.
+    #[test]
+    fn reload_content_request_round_trips_through_json() {
+        let json = serde_json::to_string(&Request::ReloadContent).unwrap();
+        assert_eq!(json, r#"{"kind":"reload_content"}"#);
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, Request::ReloadContent);
+    }
+
+    #[test]
+    fn reload_content_response_round_trips_through_json() {
+        let response = Response::ReloadContent(ReloadContentResponse {
+            sigma_rule_count: Some(12),
+            yara_rule_count: None,
+        });
+        let json = serde_json::to_string(&response).unwrap();
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, response);
+    }
+}
+
+/// Payload of [`Response::ReloadContent`]. Reports what's loaded *after*
+/// the reload, from the same content directory the agent loads at startup
+/// — `None` for an engine means its content subdirectory is absent, not an
+/// error (same posture the agent has always had for a missing `rules/sigma`
+/// or `rules/yara`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReloadContentResponse {
+    /// Sigma rules now loaded, or `None` if `rules/sigma` under the content
+    /// directory does not exist.
+    pub sigma_rule_count: Option<usize>,
+    /// YARA rules now loaded, or `None` if `rules/yara` under the content
+    /// directory does not exist.
+    pub yara_rule_count: Option<usize>,
 }
 
 // ── Wire-level errors ────────────────────────────────────────────────────

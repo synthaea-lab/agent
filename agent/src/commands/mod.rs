@@ -46,6 +46,11 @@ pub(crate) struct RunOptions<'a> {
     /// Where the local IPC control channel listens for `cli` (issue #388),
     /// from `cfg.ipc.endpoint`: a Unix socket path, or a Windows named pipe.
     pub(crate) ipc_endpoint: &'a str,
+    /// Where `agent apply-content-manifest --content-dir` writes downloaded
+    /// content (issue #30) — the detection sink loads Sigma/YARA rules from
+    /// here, and `reload_content` re-reads from the same place, so the two
+    /// commands always agree on one directory.
+    pub(crate) content_dir: &'a std::path::Path,
 }
 
 #[cfg(target_os = "linux")]
