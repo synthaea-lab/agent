@@ -958,7 +958,11 @@ impl RuleState {
     /// [`Self::check_task_registration`]) and updates the history of downloader
     /// writes, consumed by `check_download_then_exec`.
     pub fn on_file_open(&mut self, event: &FileOpenEvent) -> Vec<Alert> {
-        let alerts = self.check_task_registration(event).into_iter().collect();
+        let mut alerts: Vec<Alert> = self.check_task_registration(event).into_iter().collect();
+        alerts.extend(crate::stateless::check_service_write_outside_datadir(
+            event,
+            |pid| self.resolve_comm(pid),
+        ));
         self.record_downloader_write(event);
         alerts
     }

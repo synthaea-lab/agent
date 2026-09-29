@@ -457,17 +457,39 @@ const MYSQL_WRITE_PATH_PREFIXES: &[&str] = &[
 /// root) or a malicious UDF `.so` planted outside the plugin directory —
 /// MySQL/MariaDB has no legitimate reason to write anywhere else, which is
 /// exactly why this is a "very low noise" signal per the issue's own framing.
+///
+/// Two properties learned from the live run on real `mariadbd` (#498 review),
+/// both invisible to hand-written unit-test events:
+/// - **The process name comes from the pid, not from `event.meta.comm`.** `comm`
+///   is the *thread's* name: `SELECT ... INTO OUTFILE` runs on a connection
+///   thread named `one_connection`, so a `comm` match never sees the attack.
+///   `resolve_comm` is asked for the pid's own name (lazily — only once the path
+///   and flags already say "candidate", so the common open never pays for a
+///   `/proc` read) and is `RuleState`'s exec table, then `/proc/<pid>/comm`.
+///   The sensor's `pid` is the tgid.
+/// - **Only absolute paths alert.** The collector reports the raw `openat`
+///   argument: startup opens `./ibdata1`, `plugin.MAI`, `#binlog_cache_files/`
+///   (relative or dirfd-relative) and `/tmp` itself (`O_TMPFILE`, no trailing
+///   slash), which no absolute-prefix allowlist can match — 284 false positives
+///   on a bare start. A webshell drop needs an absolute path to reach the web
+///   root, so skipping relative paths loses no attack shape.
 #[must_use]
-pub(crate) fn check_service_write_outside_datadir(event: &FileOpenEvent) -> Option<Alert> {
-    let comm = event.meta.comm.as_str();
-    if !MYSQL_SERVICE_COMMS.contains(&comm) || !has_write_intent(event.flags) {
+pub(crate) fn check_service_write_outside_datadir(
+    event: &FileOpenEvent,
+    resolve_comm: impl FnOnce(u32) -> Option<String>,
+) -> Option<Alert> {
+    let path = &event.path;
+    if !has_write_intent(event.flags)
+        || !path.starts_with('/')
+        || path == "/tmp"
+        || MYSQL_WRITE_PATH_PREFIXES
+            .iter()
+            .any(|p| path.starts_with(p))
+    {
         return None;
     }
-    let path = &event.path;
-    if MYSQL_WRITE_PATH_PREFIXES
-        .iter()
-        .any(|p| path.starts_with(p))
-    {
+    let comm = resolve_comm(event.meta.pid)?;
+    if !MYSQL_SERVICE_COMMS.contains(&comm.as_str()) {
         return None;
     }
     Some(Alert {
@@ -483,7 +505,9 @@ pub(crate) fn check_service_write_outside_datadir(event: &FileOpenEvent) -> Opti
 /// Evaluates all stateless rules applicable to a `FileOpenEvent`. T1053.005
 /// creation ([`check_scheduled_task_persistence`]) is not among them: one
 /// registration arrives twice (4698 and 106), so `RuleState::on_file_open`
-/// reports it, deduplicated (#422).
+/// reports it, deduplicated (#422). Neither is T1190
+/// ([`check_service_write_outside_datadir`]): it needs the pid's process name,
+/// which only `RuleState` can resolve (#498 review).
 #[must_use]
 pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
     check_persistence_write(event)
@@ -494,7 +518,6 @@ pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
         .chain(check_account_creation_persistence(event))
         .chain(check_systemd_service_persistence(event))
         .chain(check_btm_launch_item_persistence(event))
-        .chain(check_service_write_outside_datadir(event))
         .collect()
 }
 
@@ -829,7 +852,14 @@ pub(crate) fn check_service_unusual_outbound(event: &ConnectEvent) -> Option<Ale
     if !is_service {
         return None;
     }
-    if event.daddr.is_loopback() || SERVICE_OUTBOUND_STANDARD_PORTS.contains(&event.dport) {
+    // Unspecified (`0.0.0.0` / `::`) is not a destination either: postgres's
+    // startup `connect()` to `0.0.0.0:65535` / `:::65535` (its stats-collector
+    // self-probe) fired this on a bare start (#498 review). On Linux it means
+    // "this host", same as loopback.
+    if event.daddr.is_loopback()
+        || event.daddr.is_unspecified()
+        || SERVICE_OUTBOUND_STANDARD_PORTS.contains(&event.dport)
+    {
         return None;
     }
     Some(Alert {

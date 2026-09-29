@@ -226,6 +226,24 @@ fn write_to_systemd_unit_matches_persistence() {
 }
 
 // ── T1190 mysqld/mariadbd write outside datadir (issue #478) ───────────────
+// Driven through `RuleState`: the rule resolves the process name from the pid
+// (#498 review), so a stateless call with a hand-written `comm` is exactly the
+// shape the live run showed the sensor does not produce.
+
+/// Every T1190 alert for one open, after the pid exec'd as `exec_comm` (`None` =
+/// no exec seen for it). The open's own `comm` is the *thread* name, set by the
+/// caller — it differs from the process name in the cases that matter.
+fn mysql_open_alerts(exec_comm: Option<&str>, event: &FileOpenEvent) -> Vec<crate::Alert> {
+    let mut state = RuleState::new();
+    if let Some(comm) = exec_comm {
+        state.on_exec(&exec_event_full(event.meta.pid, 1, comm, "", 0));
+    }
+    state
+        .on_file_open(event)
+        .into_iter()
+        .filter(|a| a.technique == "T1190")
+        .collect()
+}
 
 #[test]
 fn mysqld_write_under_web_root_matches() {
@@ -237,8 +255,22 @@ fn mysqld_write_under_web_root_matches() {
         O_WRONLY | O_CREAT,
         0,
     );
-    let alert = check_service_write_outside_datadir(&event).unwrap();
-    assert_eq!(alert.technique, "T1190");
+    assert_eq!(mysql_open_alerts(Some("mysqld"), &event).len(), 1);
+}
+
+#[test]
+fn outfile_from_a_connection_thread_matches_through_the_pids_process_name() {
+    // Live on real mariadbd (#498 review): the open comes from a connection
+    // *thread* whose comm is "one_connection", not "mariadbd". The process name
+    // has to come from the pid.
+    let event = file_open_event_full(
+        202,
+        "one_connection",
+        "/var/www/html/x498.php",
+        O_WRONLY | O_CREAT,
+        0,
+    );
+    assert_eq!(mysql_open_alerts(Some("mariadbd"), &event).len(), 1);
 }
 
 #[test]
@@ -254,7 +286,7 @@ fn mariadbd_write_to_plugin_dir_matches() {
         O_WRONLY | O_CREAT,
         0,
     );
-    assert!(check_service_write_outside_datadir(&event).is_some());
+    assert_eq!(mysql_open_alerts(Some("mariadbd"), &event).len(), 1);
 }
 
 #[test]
@@ -266,21 +298,51 @@ fn mysqld_write_under_datadir_does_not_alert() {
         O_WRONLY | O_CREAT,
         0,
     );
-    assert!(check_service_write_outside_datadir(&event).is_none());
+    assert!(mysql_open_alerts(Some("mysqld"), &event).is_empty());
 }
 
 #[test]
 fn mysqld_write_to_tmpdir_does_not_alert() {
     // Routine on-disk temp table/sort spill — `mysqld`'s own `tmpdir` default.
     let event = file_open_event_full(200, "mysqld", "/tmp/#sql_1a2b_0.MYI", O_WRONLY | O_CREAT, 0);
-    assert!(check_service_write_outside_datadir(&event).is_none());
+    assert!(mysql_open_alerts(Some("mysqld"), &event).is_empty());
+}
+
+#[test]
+fn mysqld_open_of_tmp_itself_does_not_alert() {
+    // O_TMPFILE opens the directory itself: "/tmp" with no trailing slash, which
+    // the "/tmp/" prefix never matched (#498 review, live).
+    let event = file_open_event_full(200, "mariadbd", "/tmp", O_WRONLY, 0);
+    assert!(mysql_open_alerts(Some("mariadbd"), &event).is_empty());
+}
+
+#[test]
+fn mariadbd_startup_relative_and_dirfd_relative_opens_do_not_alert() {
+    // The collector reports the raw openat argument. A bare `mariadbd` start
+    // opened ~284 files like these and every one fired T1190 (#498 review, live):
+    // no absolute-prefix allowlist can match them.
+    for path in [
+        "./ibdata1",
+        "./mysql/db.frm",
+        ".//undo001",
+        "./ddl_recovery.log",
+        "plugin.MAI",
+        "#sql-temptable-49-1-3.MAI",
+        "#binlog_cache_files/",
+    ] {
+        let event = file_open_event_full(200, "mariadbd", path, O_WRONLY | O_CREAT, 0);
+        assert!(
+            mysql_open_alerts(Some("mariadbd"), &event).is_empty(),
+            "{path} must not alert: a web-root drop needs an absolute path"
+        );
+    }
 }
 
 #[test]
 fn mysqld_readonly_open_outside_datadir_does_not_alert() {
     // No write intent — mysqld reading e.g. a config file elsewhere is routine.
     let event = file_open_event_full(200, "mysqld", "/etc/mysql/my.cnf", O_RDONLY, 0);
-    assert!(check_service_write_outside_datadir(&event).is_none());
+    assert!(mysql_open_alerts(Some("mysqld"), &event).is_empty());
 }
 
 #[test]
@@ -294,7 +356,21 @@ fn unrelated_process_write_under_web_root_does_not_match_mysql_rule() {
         O_WRONLY | O_CREAT,
         0,
     );
-    assert!(check_service_write_outside_datadir(&event).is_none());
+    assert!(mysql_open_alerts(Some("nginx"), &event).is_empty());
+}
+
+#[test]
+fn write_outside_datadir_from_a_pid_whose_process_name_is_unknown_does_not_alert() {
+    // No exec seen and no /proc entry for this pid: with no process name there is
+    // nothing to say it is mysqld, whatever the thread's own comm claims.
+    let event = file_open_event_full(
+        4_000_000_000,
+        "mysqld",
+        "/var/www/html/shell.php",
+        O_WRONLY | O_CREAT,
+        0,
+    );
+    assert!(mysql_open_alerts(None, &event).is_empty());
 }
 
 #[test]
@@ -1474,6 +1550,18 @@ fn nginx_outbound_to_loopback_unusual_port_does_not_alert() {
     // and never the real exfil/C2 path (loopback can't leave the host).
     let event = connect_event_full(300, "nginx", [127, 0, 0, 1], 9999, 0);
     assert!(check_service_unusual_outbound(&event).is_none());
+}
+
+#[test]
+fn postgres_startup_connect_to_unspecified_address_does_not_alert() {
+    // postgres's startup connect() to 0.0.0.0:65535 and :::65535 fired T1071 on a
+    // bare container start (#498 review, live). Unspecified means "this host" on
+    // Linux, same as loopback — not a destination that leaves the box.
+    let v4 = connect_event_full(304, "postgres", [0, 0, 0, 0], 65535, 0);
+    assert!(check_service_unusual_outbound(&v4).is_none());
+    let mut v6 = connect_event_full(304, "postgres", [0, 0, 0, 0], 65535, 0);
+    v6.daddr = std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
+    assert!(check_service_unusual_outbound(&v6).is_none());
 }
 
 #[test]
