@@ -99,7 +99,7 @@ const WINDOWS_RESERVED_NAMES: &[&str] = &[
 /// makes that ambiguity possible in the first place. Windows device names
 /// are reserved regardless of extension.
 #[must_use]
-fn is_safe_path_segment(segment: &str) -> bool {
+pub(crate) fn is_safe_path_segment(segment: &str) -> bool {
     if segment.is_empty() || segment == "." || segment == ".." || segment.contains(':') {
         return false;
     }

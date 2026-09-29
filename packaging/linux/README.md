@@ -26,7 +26,9 @@ This separation ensures that package managers (apt/dnf) and the updater never co
 ├── current -> bootstrap    # Symlink (updater-managed, initially points to bootstrap)
 ├── versions/           # Updater-managed version directories, named by the signed
 │   ├── v1/             # manifest's monotone release_version (ADR-0015), not semver
-│   └── v2/
+│   ├── v2/
+│   └── .stage-3/       # a release being downloaded (`agent apply-release`); renamed to
+│                       # v3 only once complete, so a crash never leaves a partial vN
 └── banned_versions.json  # Release versions that failed a health check on this
                            # install and are refused even if offered again (ADR-0015
                            # Decision 6). Bare JSON array, unsigned — created on the

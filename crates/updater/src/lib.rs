@@ -27,6 +27,7 @@
 pub mod banlist;
 pub mod content;
 pub mod error;
+pub mod fsutil;
 pub mod hash;
 pub mod key;
 #[cfg(target_os = "linux")]

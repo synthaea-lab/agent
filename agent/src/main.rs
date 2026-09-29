@@ -47,6 +47,7 @@ mod journal_cursor;
 #[cfg(target_os = "linux")]
 mod kill_loudness;
 mod protected;
+mod release;
 mod silence;
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos", windows)),
@@ -199,6 +200,26 @@ enum Command {
         #[arg(long)]
         state: Option<std::path::PathBuf>,
     },
+    /// Fetches the signed binary release the server offers, verifies it, stages it
+    /// under `<state_dir>/versions/vN`, repoints `current` at it, and restarts the
+    /// service onto it (ADR-0015, issue #30). The new release starts on
+    /// probation: the watchdog rolls it back and bans it if the agent never shows
+    /// progress. Linux only.
+    ApplyRelease {
+        /// Control-plane base URL, e.g. `https://edr.example.com`.
+        #[arg(long)]
+        server: String,
+        /// PEM client certificate for mTLS.
+        #[arg(long, requires = "key")]
+        cert: Option<std::path::PathBuf>,
+        /// PEM client private key for mTLS.
+        #[arg(long, requires = "cert")]
+        key: Option<std::path::PathBuf>,
+        /// Stage and promote only; do not restart the service. The release runs
+        /// at the next service start.
+        #[arg(long)]
+        no_restart: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -288,5 +309,17 @@ fn main() -> anyhow::Result<()> {
                 &state,
             )
         }
+        Command::ApplyRelease {
+            server,
+            cert,
+            key,
+            no_restart,
+        } => release::cmd_apply_release(
+            &server,
+            cert.as_deref(),
+            key.as_deref(),
+            &cfg.storage.state_dir,
+            !no_restart,
+        ),
     }
 }
