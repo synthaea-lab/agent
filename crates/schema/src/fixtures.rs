@@ -277,6 +277,7 @@ pub fn file_rename() -> FileRenameEvent {
         meta: meta(),
         old_path: String::new(),
         new_path: String::new(),
+        executable_path: None,
     }
 }
 
@@ -420,6 +421,7 @@ pub fn memfd_create() -> MemfdCreateEvent {
         meta: meta(),
         name: String::new(),
         flags: 0,
+        fd: 0,
     }
 }
 

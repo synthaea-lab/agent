@@ -22,6 +22,7 @@
 )]
 mod alerts;
 mod commands;
+mod content;
 mod enrich_queue;
 mod health;
 #[cfg_attr(
@@ -136,6 +137,68 @@ enum Command {
         #[arg(long, default_value = "events.jsonl")]
         output: std::path::PathBuf,
     },
+    /// Fetches and verifies the content manifest for a ring (ADR-0016, issue
+    /// #30/#73): reports which rules/models/policy entries have changed since
+    /// this agent's last applied release. Does not download artifacts or apply
+    /// anything — a first, real, testable slice of content distribution, not
+    /// the full pipeline.
+    CheckContentManifest {
+        /// Control-plane base URL (e.g. `https://api.synthaea.example.com`).
+        #[arg(long)]
+        server: String,
+        /// Canary ring this agent is assigned to (`canary_0`/`canary_1`/`canary_2`/`prod`).
+        #[arg(long)]
+        ring: String,
+        /// Path to the client mTLS certificate (PEM). Omit to fetch without
+        /// mTLS (a dev server, or a server that authenticates another way).
+        #[arg(long)]
+        cert: Option<std::path::PathBuf>,
+        /// Path to the client mTLS private key (PEM). Required alongside `--cert`.
+        #[arg(long)]
+        key: Option<std::path::PathBuf>,
+        /// Where this agent's own record of already-applied content lives.
+        /// Missing means a fresh install — every manifest entry is reported
+        /// as needing a fetch.
+        #[arg(long, default_value = "content-state.json")]
+        state: std::path::PathBuf,
+    },
+    /// Fetches, verifies, downloads, and applies the content manifest for a
+    /// ring (ADR-0016, issue #30/#73): everything `check-content-manifest`
+    /// does, plus actually downloading each missing/stale entry from
+    /// `/api/content/artifact`, verifying its SHA-256, and writing it under
+    /// `--content-dir`. Does not reload anything into a running
+    /// `DetectionSink` — that's a follow-up, not this slice.
+    ApplyContentManifest {
+        /// Control-plane base URL (e.g. `https://api.synthaea.example.com`).
+        #[arg(long)]
+        server: String,
+        /// Canary ring this agent is assigned to (`canary_0`/`canary_1`/`canary_2`/`prod`).
+        #[arg(long)]
+        ring: String,
+        /// Path to the client mTLS certificate (PEM). Omit to fetch without
+        /// mTLS (a dev server, or a server that authenticates another way).
+        #[arg(long)]
+        cert: Option<std::path::PathBuf>,
+        /// Path to the client mTLS private key (PEM). Required alongside `--cert`.
+        #[arg(long)]
+        key: Option<std::path::PathBuf>,
+        /// Where downloaded content is written, mirroring each entry's
+        /// manifest `path` underneath it (e.g. `rules/beacon.sigma`). Left
+        /// unset, defaults to `content` under `storage.state_dir`. Given
+        /// explicitly, must still resolve under `storage.state_dir` (PR #520
+        /// review) — this agent refuses a path outside it.
+        #[arg(long)]
+        content_dir: Option<std::path::PathBuf>,
+        /// Where this agent's own record of already-applied content lives.
+        /// Missing means a fresh install — every manifest entry is
+        /// downloaded and applied. Left unset, defaults to
+        /// `content-state.json` under `storage.state_dir` — this file is the
+        /// only thing standing between the agent and a replayed old signed
+        /// manifest, so (like `--content-dir`) an explicit value must still
+        /// resolve under `storage.state_dir` or this agent refuses to run.
+        #[arg(long)]
+        state: Option<std::path::PathBuf>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -193,5 +256,37 @@ fn main() -> anyhow::Result<()> {
         }),
         Command::CaptureBaseline { output } => commands::cmd_capture_baseline(&output),
         Command::CaptureEvents { output } => commands::cmd_capture_events(&output),
+        Command::CheckContentManifest {
+            server,
+            ring,
+            cert,
+            key,
+            state,
+        } => content::cmd_check_content_manifest(
+            &server,
+            &ring,
+            cert.as_deref(),
+            key.as_deref(),
+            &state,
+        ),
+        Command::ApplyContentManifest {
+            server,
+            ring,
+            cert,
+            key,
+            content_dir,
+            state,
+        } => {
+            let (content_dir, state) =
+                content::resolve_content_paths(&cfg.storage.state_dir, content_dir, state)?;
+            content::cmd_apply_content_manifest(
+                &server,
+                &ring,
+                cert.as_deref(),
+                key.as_deref(),
+                &content_dir,
+                &state,
+            )
+        }
     }
 }

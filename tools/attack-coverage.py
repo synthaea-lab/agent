@@ -59,7 +59,7 @@ RUST_TECHNIQUE_CONST_RE = re.compile(
 
 def rust_technique_field(path: pathlib.Path) -> set[str]:
     ids: set[str] = set()
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8")
     for match in re.finditer(r'technique:\s*"([^"]+)"', text):
         raw = match.group(1)
         if raw == BAYES_SENTINEL:
@@ -73,7 +73,7 @@ def rust_technique_field(path: pathlib.Path) -> set[str]:
 def sigma_tags(path: pathlib.Path) -> set[str]:
     ids: set[str] = set()
     for match in re.finditer(
-        r"-\s*(attack\.t\d{4}(?:\.\d{3})?)", path.read_text(), re.IGNORECASE
+        r"-\s*(attack\.t\d{4}(?:\.\d{3})?)", path.read_text(encoding="utf-8"), re.IGNORECASE
     ):
         tag = match.group(1).lower()
         ids.add("T" + tag[len("attack.t") :])
@@ -81,7 +81,7 @@ def sigma_tags(path: pathlib.Path) -> set[str]:
 
 
 def yara_meta(path: pathlib.Path) -> set[str]:
-    match = re.search(r'technique\s*=\s*"([^"]+)"', path.read_text())
+    match = re.search(r'technique\s*=\s*"([^"]+)"', path.read_text(encoding="utf-8"))
     return {match.group(1)} if match else set()
 
 
@@ -169,7 +169,7 @@ def discover() -> dict[str, dict[str, set]]:
                     sys.exit(1)
                 entry = findings.setdefault(technique_id, {"layers": set(), "sources": set()})
                 entry["layers"].add(layer)
-                entry["sources"].add(f"{label}:{path.relative_to(REPO_ROOT)}")
+                entry["sources"].add(f"{label}:{path.relative_to(REPO_ROOT).as_posix()}")
     return findings
 
 
@@ -227,7 +227,7 @@ def main() -> None:
     content = render(findings)
 
     if args.check:
-        current = OUTPUT.read_text() if OUTPUT.exists() else ""
+        current = OUTPUT.read_text(encoding="utf-8") if OUTPUT.exists() else ""
         if current != content:
             print(
                 f"error: {OUTPUT} is stale — run `python3 tools/attack-coverage.py` to regenerate",
@@ -237,7 +237,7 @@ def main() -> None:
         print(f"ok: {OUTPUT} is up to date ({len(findings)} techniques)")
         return
 
-    OUTPUT.write_text(content)
+    OUTPUT.write_text(content, encoding="utf-8", newline="\n")
     print(f"wrote {OUTPUT} ({len(findings)} techniques)")
 
 

@@ -7,21 +7,24 @@ use std::{collections::HashMap, net::IpAddr};
 use schema::{
     AuthEvent, AuthOutcome, ConnectEvent, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
     FileOpenEvent, FileQuarantineEvent, FileRenameEvent, FileWriteEvent, ListenPortEvent,
-    NetworkFlowEvent, User,
+    MemfdCreateEvent, NetworkFlowEvent, User,
 };
 use store::BoundedMap;
 
 use crate::{
     Alert,
     exclusions::{
-        AGENT_CHILD_EXCLUSIONS, AUTH_FAILURE_THRESHOLD, AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD,
-        BEACON_WINDOW_NS, BROWSERS, BURST_WRITE_BYTES_THRESHOLD, DOWNLOAD_EXEC_WINDOW_NS,
-        DOWNLOADER_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, QUARANTINE_EXEC_WINDOW_NS,
-        RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD,
-        RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
-        SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_THRESHOLD,
-        SELF_SPAWN_WINDOW_NS, SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN,
-        SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS, WEB_SERVER_COMMS,
+        AGENT_CHILD_EXCLUSIONS, APK_STAGING_FILE_PREFIX, AUTH_FAILURE_THRESHOLD,
+        AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD, BEACON_WINDOW_NS, BROWSERS,
+        BURST_WRITE_BYTES_THRESHOLD, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS,
+        IN_PLACE_EDIT_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS,
+        MEMFD_EXEC_WINDOW_NS, PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES,
+        QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX,
+        RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD,
+        SCAN_SPREAD_WINDOW_NS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
+        SELF_SPAWN_THRESHOLD, SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS,
+        SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN,
+        TASK_REGISTRATION_DEDUP_WINDOW_NS,
     },
     has_write_intent,
     sliding::{FlowPortDedup, SlidingCounter, SlidingDistinct, SlidingSum},
@@ -64,6 +67,13 @@ pub struct RuleState {
     /// userspace. LRU-bounded (`store::BoundedMap`) — a long-lived agent must not
     /// grow this without limit. `pub(crate)` for the `seed_from_proc` test.
     pub(crate) pid_comm: BoundedMap<u32, String>,
+    /// pid → kernel-reported `image_path` of the last exec seen for this pid. The
+    /// only race-free source of "which binary is this pid" for rename-time
+    /// exclusions: `FileRenameEvent::executable_path` is read from `/proc/<pid>/exe`
+    /// after the event crossed the ring buffer, so a short-lived process (real
+    /// `sed -i.bak`, or an encryptor that exits right after its renames) is already
+    /// gone and it reads `None` (#513 review). LRU-bounded like `pid_comm`.
+    pid_image_path: BoundedMap<u32, String>,
     /// path → info about the last write by a known downloader (T1105). LRU-bounded:
     /// downloader writes are rare, but a hostile loop must not grow agent memory.
     recent_writes: BoundedMap<String, RecentWrite>,
@@ -135,8 +145,39 @@ pub struct RuleState {
     /// [`Self::seed_ld_trust_from_system`] runs — the rule then falls back to the
     /// baseline alone, which only costs false positives on vendor directories.
     ld_trust_extra: Vec<String>,
+    /// pid → the most recent `(timestamp, fd)` pairs of `MemfdCreateEvent`s seen
+    /// for it (T1620, issues #497/#510): the evidence [`Self::check_memfd_exec`]
+    /// requires before treating an exec via `/proc/(self|<pid>)/fd/<n>` as a
+    /// memfd-exec, since that path shape alone (unlike `/dev/fd/<n>` + a
+    /// `memfd:`-prefixed `comm`) is not reliable evidence on its own — see that
+    /// method's doc. The exec's `<n>` must equal one of these fds. A process can
+    /// legitimately hold several memfds, so this keeps up to
+    /// [`MEMFD_CREATES_PER_PID`] (oldest dropped) rather than only the latest.
+    /// LRU-bounded like `pid_comm`, same key space.
+    recent_memfd_creates: BoundedMap<u32, Vec<(u64, i32)>>,
+    /// pid → a `/proc/.../fd/<n>` exec seen with no corroborating
+    /// `MemfdCreateEvent` yet (#503 review): held instead of dropped, since
+    /// the creation may still arrive after the exec despite always preceding
+    /// it at the kernel's own timestamp — two ring buffers drained
+    /// independently don't guarantee delivery order. [`Self::on_memfd_create`]
+    /// checks this and fires retroactively. LRU-bounded like `pid_comm`, same
+    /// key space.
+    pending_proc_fd_exec: BoundedMap<u32, PendingProcFdExec>,
 }
 
+/// See [`RuleState::pending_proc_fd_exec`].
+struct PendingProcFdExec {
+    path: String,
+    /// The `<n>` of the `/proc/.../fd/<n>` path: the descriptor the exec ran.
+    fd: i32,
+    comm: String,
+    timestamp_ns: u64,
+}
+
+/// Memfd creations remembered per pid (see `RuleState::recent_memfd_creates`). A real
+/// fileless-exec process creates one or two; a process making more than this inside
+/// the correlation window is not something a longer list would catch better.
+const MEMFD_CREATES_PER_PID: usize = 8;
 /// Same bound as the correlator's entity table: the realistic live-pid space.
 const PID_COMM_CAP: usize = 65_536;
 /// Counter/write-history bounds — one logical entity per key, far fewer than pids.
@@ -154,6 +195,7 @@ impl RuleState {
     pub fn new() -> Self {
         Self {
             pid_comm: BoundedMap::new(PID_COMM_CAP),
+            pid_image_path: BoundedMap::new(PID_COMM_CAP),
             recent_writes: BoundedMap::new(RECENT_WRITES_CAP),
             recent_quarantines: BoundedMap::new(RECENT_WRITES_CAP),
             self_spawn: BoundedMap::new(COUNTER_CAP),
@@ -169,6 +211,8 @@ impl RuleState {
             task_registrations: BoundedMap::new(COUNTER_CAP),
             own_pid: None,
             ld_trust_extra: Vec::new(),
+            recent_memfd_creates: BoundedMap::new(PID_COMM_CAP),
+            pending_proc_fd_exec: BoundedMap::new(PID_COMM_CAP),
         }
     }
 
@@ -270,20 +314,28 @@ impl RuleState {
             .map(|s| s.trim_end().to_string())
     }
 
-    /// T1059 — a shell executed directly by a web server process.
+    /// T1059 — a shell executed directly by a web or database service process.
+    /// Originally web-server-only (`nginx`/`apache2`/`httpd`); extended to
+    /// `mysqld`/`mariadbd`/`postgres` and (by prefix) `php-fpm*` for issue
+    /// #478's Level 1 — see [`SERVICE_COMMS`] and [`SERVICE_COMM_PREFIXES`]'s
+    /// docs for why each needs its own matching.
     fn check_web_server_spawns_shell(&self, event: &ExecEvent) -> Option<Alert> {
         let comm = event.meta.comm.as_str();
         if !SHELL_COMMS.contains(&comm) {
             return None;
         }
         let parent_comm = self.resolve_comm(event.meta.ppid)?;
-        if !WEB_SERVER_COMMS.iter().any(|w| parent_comm == *w) {
+        let is_service = SERVICE_COMMS.iter().any(|w| parent_comm == *w)
+            || SERVICE_COMM_PREFIXES
+                .iter()
+                .any(|p| parent_comm.starts_with(p));
+        if !is_service {
             return None;
         }
         Some(Alert {
             technique: "T1059",
             message: format!(
-                "pid={} comm={} executed directly by ppid={} comm={parent_comm} (web server) — suspicious process lineage",
+                "pid={} comm={} executed directly by ppid={} comm={parent_comm} (service) — suspicious process lineage",
                 event.meta.pid, comm, event.meta.ppid,
             ),
         })
@@ -676,6 +728,7 @@ impl RuleState {
         alerts.extend(self.check_self_spawn(event));
         alerts.extend(self.check_parent_suspect(event));
         alerts.extend(self.check_lolbin(event));
+        alerts.extend(self.check_memfd_exec(event));
         alerts.extend(crate::stateless::check_ld_preload_hijack(
             event,
             &self.ld_trust_extra,
@@ -683,6 +736,8 @@ impl RuleState {
 
         self.pid_comm
             .insert(event.meta.pid, event.meta.comm.clone());
+        self.pid_image_path
+            .insert(event.meta.pid, event.image_path.clone());
         alerts
     }
 
@@ -769,6 +824,156 @@ impl RuleState {
         Vec::new()
     }
 
+    /// To be called for every `MemfdCreateEvent` in the stream (Linux, issue
+    /// #265). `memfd_create(2)` alone is common in legitimate code (glibc,
+    /// systemd, browser sandboxing); it's the *exec* that's the technique, not
+    /// the creation, so this mostly just records the timestamp
+    /// `check_memfd_exec` consumes as corroborating evidence for its
+    /// `/proc/.../fd/<n>` shape.
+    ///
+    /// Can still produce an alert directly (#503 review, Nikolas): the kernel
+    /// always creates the memfd before executing it, but userspace drains the
+    /// `memfd_create` and `exec` ring buffers independently
+    /// (`crates/sensors/linux/userspace`'s `tokio::select!`), so the *exec*
+    /// event can be processed here first despite the kernel-side ordering.
+    /// `check_memfd_exec` holds that exec as [`Self::pending_proc_fd_exec`]
+    /// instead of dropping it outright; this method checks for one on every
+    /// creation and fires retroactively if it's still within
+    /// [`MEMFD_EXEC_WINDOW_NS`].
+    ///
+    /// The kernel always creates the memfd before the exec, so a creation
+    /// timestamped *after* the pending exec can only mean the process made an
+    /// unrelated `memfd_create` call later — not proof of anything (#503
+    /// review, Jihair, caught live: an on-disk `/proc/self/fd` exec followed
+    /// 8s later, same pid, by an unrelated `memfd_create` wrongly fired).
+    /// `saturating_sub` alone can't tell the two orderings apart (a
+    /// too-late creation saturates to a delta of 0, which trivially passes
+    /// the window check), so the ordering itself is checked first.
+    pub fn on_memfd_create(&mut self, event: &MemfdCreateEvent) -> Vec<Alert> {
+        let creates = self
+            .recent_memfd_creates
+            .get_or_insert_with(event.meta.pid, Vec::new);
+        if creates.len() >= MEMFD_CREATES_PER_PID {
+            creates.remove(0);
+        }
+        creates.push((event.meta.timestamp_ns, event.fd));
+        if let Some(pending) = self.pending_proc_fd_exec.peek(&event.meta.pid)
+            && pending.fd == event.fd
+            && event.meta.timestamp_ns <= pending.timestamp_ns
+            && pending.timestamp_ns - event.meta.timestamp_ns <= MEMFD_EXEC_WINDOW_NS
+        {
+            let alert =
+                memfd_proc_fd_exec_alert(event.meta.pid, &pending.comm, &pending.path, pending.fd);
+            self.pending_proc_fd_exec.remove(&event.meta.pid);
+            return vec![alert];
+        }
+        Vec::new()
+    }
+
+    /// T1620 — Reflective Code Loading: executing a payload that never touches
+    /// disk via `memfd_create(2)` + `execveat(fd, "", ..., AT_EMPTY_PATH)`
+    /// (issue #85's Linux scope).
+    ///
+    /// `ExecEvent::image_path` is `bprm->filename` at the kernel's
+    /// `sched_process_exec` tracepoint (`crates/sensors/linux/ebpf`, #111) —
+    /// **not** `/proc/<pid>/exe`. Traced against a live kernel (Alpine
+    /// 6.18.50, #85 review) with a memfd copy of `/bin/true`, two distinct
+    /// shapes, evidenced differently (#497 review — the first cut treated
+    /// either shape alone as sufficient, which false-positived on every
+    /// container start):
+    /// - `execveat(fd, "", AT_EMPTY_PATH)`: `bprm->filename` is `/dev/fd/<n>`,
+    ///   and the kernel names the task after the memfd dentry, so `comm`
+    ///   reliably starts with `memfd:`. The path shape plus that `comm`
+    ///   prefix together are the evidence — nothing else produces this exact
+    ///   combination.
+    /// - `execv` via `/proc/self/fd/<n>` (or `/proc/<pid>/fd/<n>`): `comm` is
+    ///   whatever the caller set, not reliably `memfd:` — the path shape
+    ///   *alone* is not evidence of a memfd. Confirmed live: `runc`'s own
+    ///   CVE-2019-5736 self-protection re-execs `runc init` via
+    ///   `/proc/self/fd/<n>` on every container start (any Docker/containerd/
+    ///   Kubernetes host), with `comm` truncated to the fd number and no
+    ///   memfd anywhere in the picture; a plain `open()` + `execveat(fd, "",
+    ///   AT_EMPTY_PATH)` of a real on-disk binary produces the same path
+    ///   shape too. This shape now requires corroborating evidence: a
+    ///   `MemfdCreateEvent` for the same pid within
+    ///   [`MEMFD_EXEC_WINDOW_NS`] — real memfd-exec creates, writes, then
+    ///   execs its own payload back-to-back in one short-lived process,
+    ///   while `runc init` and an on-disk exec via `/proc/self/fd` never
+    ///   called `memfd_create` at all. This is deliberately not a
+    ///   `parent_comm`-keyed exclusion for `runc` specifically (spoofable,
+    ///   same reasoning `check_burst_write_volume`'s doc gives for avoiding
+    ///   name-keyed exclusions) — the evidence gate handles it structurally.
+    ///
+    /// Neither shape ever produces `/memfd:<name> (deleted)` — that string is
+    /// only what `readlink /proc/<pid>/exe` shows, which the sensor doesn't
+    /// read. An earlier version of this check matched on that string and
+    /// never fired on real telemetry.
+    ///
+    /// The `/proc/.../fd/<n>` shape used to be correlation by pid and time
+    /// only (#503 review, Nikolas): a process that created a memfd for a
+    /// legitimate reason and then exec'd an ordinary on-disk binary through a
+    /// different, unrelated fd within the same window matched. Since #510 the
+    /// sensor reports the descriptor `memfd_create(2)` returned
+    /// ([`MemfdCreateEvent::fd`]), and the exec's `<n>` must equal it: the
+    /// executed fd *is* the created memfd, not merely a neighbour. The path's pid
+    /// component must also be `self` or the exec'ing pid itself — `/proc/<other>/fd/<n>`
+    /// names a descriptor in a different process's table, which this pid's memfds
+    /// say nothing about.
+    ///
+    /// What remains unproven is fd *reuse*: a process that closes its memfd, opens
+    /// an on-disk binary onto the same number and execs it inside the window would
+    /// still match. That takes close/dup tracking for a shape no fileless-exec
+    /// tool produces, so it is accepted.
+    fn check_memfd_exec(&mut self, event: &ExecEvent) -> Option<Alert> {
+        let path = &event.image_path;
+        if is_dev_fd_path(path) {
+            if !event.meta.comm.starts_with("memfd:") {
+                return None;
+            }
+            return Some(memfd_dev_fd_exec_alert(
+                event.meta.pid,
+                &event.meta.comm,
+                path,
+            ));
+        }
+        if let Some(fd) = proc_fd_number(path, event.meta.pid) {
+            let created = self
+                .recent_memfd_creates
+                .peek(&event.meta.pid)
+                .is_some_and(|creates| {
+                    creates.iter().any(|&(created_ts, created_fd)| {
+                        created_fd == fd
+                            && created_ts <= event.meta.timestamp_ns
+                            && event.meta.timestamp_ns - created_ts <= MEMFD_EXEC_WINDOW_NS
+                    })
+                });
+            if created {
+                return Some(memfd_proc_fd_exec_alert(
+                    event.meta.pid,
+                    &event.meta.comm,
+                    path,
+                    fd,
+                ));
+            }
+            // No corroborating creation seen yet — it may still arrive after
+            // this exec (#503 review). Hold it instead of dropping it;
+            // `on_memfd_create` checks for it. One pending exec per pid, same
+            // reasoning `recent_memfd_creates` gives for tracking only the
+            // latest creation: a second `/proc/fd` exec for the same pid
+            // before the first resolves is rare enough not to warrant a list.
+            self.pending_proc_fd_exec.insert(
+                event.meta.pid,
+                PendingProcFdExec {
+                    path: path.clone(),
+                    fd,
+                    comm: event.meta.comm.clone(),
+                    timestamp_ns: event.meta.timestamp_ns,
+                },
+            );
+        }
+        None
+    }
+
     /// To be called for every `FileQuarantineEvent` in the stream (macOS ES,
     /// Windows ETW `Zone.Identifier`). Does not produce alerts directly —
     /// records the mark consumed by `check_quarantined_exec`.
@@ -789,7 +994,11 @@ impl RuleState {
     /// [`Self::check_task_registration`]) and updates the history of downloader
     /// writes, consumed by `check_download_then_exec`.
     pub fn on_file_open(&mut self, event: &FileOpenEvent) -> Vec<Alert> {
-        let alerts = self.check_task_registration(event).into_iter().collect();
+        let mut alerts: Vec<Alert> = self.check_task_registration(event).into_iter().collect();
+        alerts.extend(crate::stateless::check_service_write_outside_datadir(
+            event,
+            |pid| self.resolve_comm(pid),
+        ));
         self.record_downloader_write(event);
         alerts
     }
@@ -868,26 +1077,34 @@ impl RuleState {
     /// two (its renames also land in the per-ppid counter, but that branch is only
     /// consulted when the per-pid one did not fire this event).
     ///
-    /// Known benign producers of this exact shape that this rule does **not** yet
-    /// discriminate, because a `FileRenameEvent` carries only `comm`, never the
-    /// executable path an evidence-gated exclusion needs (CLAUDE.md — name-keyed
-    /// exclusions must be gated on evidence, cf. [`policy::name_exclusion_applies`]):
+    /// Known benign producers of this exact shape (#459 part 1 closes the first
+    /// two; the third stays open, see below):
     /// - Log rotation (`app.log` → `app.log.1`): handled by [`is_rotation_suffix`]
     ///   (a suffix with no letter never counts) — the one case a shape signal settles.
     /// - In-place edit with a backup: `sed -i.bak`, `perl -i.orig` `rename(2)` the
     ///   original to `f.bak`/`f.orig` from one pid; 20+ files in one command
-    ///   (`sed -i.bak … *.conf`) trip this rule.
+    ///   (`sed -i.bak … *.conf`) used to trip this rule. [`is_in_place_edit_backup`]
+    ///   now excludes it, gated on `comm` + the pid's exec-time `image_path`
+    ///   (CLAUDE.md — name-keyed exclusions must be gated on evidence, cf.
+    ///   [`policy::name_exclusion_applies`]; excluding on `comm` alone would be
+    ///   spoofable, an encryptor can set `comm=sed` for free). Fails closed when
+    ///   no path is known, see `Self::is_in_place_edit_backup`.
     /// - Maildir flag changes (`…:2,S` → `…:2,ST`): one IMAP pid, prefix-preserving,
-    ///   lettered suffix; "mark all read" on a large folder can exceed the threshold.
+    ///   lettered suffix; "mark all read" on a large folder can exceed the
+    ///   threshold. [`is_maildir_flag_change`] now excludes it — structurally
+    ///   (the flag-letter alphabet), deliberately *not* also comm-gated; see
+    ///   that function's doc for why.
     ///
-    /// Excluding those on `comm` alone would be spoofable (an encryptor sets
-    /// `comm=sed`), so the proper fix is to add the exe path to `FileRenameEvent` and
-    /// gate on `comm` + trusted path — tracked as a follow-up. Shapes this rule
-    /// cannot see at all (write-new-then-unlink, cross-directory moves) need a
-    /// separate write/delete correlation, also follow-up.
+    /// Shapes this rule cannot see at all (write-new-then-unlink, cross-directory
+    /// moves) need a separate write/delete correlation — still a follow-up,
+    /// tracked in #459 part 2.
     fn check_mass_rename_pattern(&mut self, event: &FileRenameEvent) -> Option<Alert> {
         let suffix = event.new_path.strip_prefix(event.old_path.as_str())?;
-        if suffix.is_empty() || is_rotation_suffix(suffix) {
+        if suffix.is_empty()
+            || is_rotation_suffix(suffix)
+            || self.is_in_place_edit_backup(event)
+            || is_maildir_flag_change(&event.old_path, suffix)
+        {
             return None;
         }
         let ts = event.meta.timestamp_ns;
@@ -974,18 +1191,37 @@ impl RuleState {
 
     /// Second, independent T1486 signal (issue #82): heavy write volume alongside
     /// a rename burst, regardless of whether the rename shape matched
-    /// `check_mass_rename_pattern`'s prefix-preserving pattern — catches an
-    /// encryptor that writes-new-then-unlinks or otherwise doesn't keep the
-    /// original name as a prefix of the new one.
+    /// `check_mass_rename_pattern`'s prefix-preserving pattern — catches a
+    /// renamed-over-the-original-name encryptor shape that check's
+    /// suffix-appending model doesn't.
+    ///
+    /// Only ever runs on `FileRenameEvent` (dispatched from `on_file_rename`,
+    /// never on an unlink) — despite an earlier version of this doc's claim to
+    /// catch a "writes-new-then-unlinks" shape, no unlink telemetry feeds this
+    /// at all (review finding, #496). `bytes_written` comes from
+    /// `FileWriteEvent::bytes_requested`, which `sensor-linux-ebpf`'s
+    /// `sys_enter_write` hook records for every `write(2)` regardless of what
+    /// the fd refers to — a regular file, a socket, a pipe — so a chatty
+    /// network/IPC-heavy process's write volume counts the same as real disk
+    /// writes toward this total. Both caveats are honest gaps, not yet closed.
     ///
     /// Deliberately no name-keyed exclusion here: `FileRenameEvent`/`FileWriteEvent`
     /// carry no executable path (same gap `check_mass_rename_pattern`'s doc
     /// describes, tracked in #459), so a `comm`-only exclusion would be spoofable.
     /// `RANSOMWARE_EXCLUDED_PATH_PREFIXES` is path-based, not name-based, and stays.
+    /// [`is_package_manager_temp_rename`] requires both the filename shape and
+    /// `comm` to match a known package manager (#496, hardened per #500
+    /// review): the shape alone — staging heavy writes under `foo.dpkg-new`
+    /// then renaming it onto `foo` — previously cleared both gates below and
+    /// false-positived T1486, but the shape by itself is just a naming
+    /// convention the renaming process controls; requiring `comm` too raises
+    /// the bar to also impersonating the specific package manager it belongs
+    /// to, not just picking a suffix.
     fn check_burst_write_volume(&mut self, event: &FileRenameEvent) -> Option<Alert> {
         if RANSOMWARE_EXCLUDED_PATH_PREFIXES
             .iter()
             .any(|prefix| event.new_path.starts_with(prefix))
+            || is_package_manager_temp_rename(&event.old_path, &event.new_path, &event.meta.comm)
         {
             return None;
         }
@@ -1020,12 +1256,153 @@ impl RuleState {
     }
 }
 
+/// The `/dev/fd/<n>` + `comm` starting with `memfd:` shape: structural
+/// evidence (see `check_memfd_exec`'s doc), strong enough to say the payload
+/// never touched disk.
+fn memfd_dev_fd_exec_alert(pid: u32, comm: &str, path: &str) -> Alert {
+    Alert {
+        technique: "T1620",
+        message: format!(
+            "pid={pid} comm={comm}: executed from a file descriptor ({path}), not a real \
+             path — no payload ever touched disk",
+        ),
+    }
+}
+
+/// The `/proc/.../fd/<n>` shape, corroborated only by a same-pid
+/// `MemfdCreateEvent` within the window (see `check_memfd_exec`'s doc for why
+/// that's timing correlation, not proof the executed fd is the created one).
+fn memfd_proc_fd_exec_alert(pid: u32, comm: &str, path: &str, fd: i32) -> Alert {
+    Alert {
+        technique: "T1620",
+        message: format!(
+            "pid={pid} comm={comm}: executed from file descriptor {fd} ({path}), the memfd \
+             this process created moments earlier — a payload that never touched disk",
+        ),
+    }
+}
+
 /// Suffixes logrotate and similar rotators append (`.1`, `-20260924`, `.1.2`, `~`
 /// backups): no ASCII letter at all. Ransomware markers carry letters (`.locked`,
 /// `.WNCRY`, `.id-<hex>.[mail]`); an all-digit random suffix is the one blind spot,
 /// accepted over alerting on every rotation run.
 fn is_rotation_suffix(suffix: &str) -> bool {
     !suffix.bytes().any(|b| b.is_ascii_alphabetic())
+}
+
+fn is_all_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Matches `/dev/fd/<n>` — `execveat(fd, "", AT_EMPTY_PATH)`'s `bprm->filename`
+/// shape, see `check_memfd_exec`'s doc.
+fn is_dev_fd_path(path: &str) -> bool {
+    path.strip_prefix("/dev/fd/").is_some_and(is_all_digits)
+}
+
+/// The descriptor number `<n>` of `/proc/self/fd/<n>` or `/proc/<own_pid>/fd/<n>` — an
+/// exec through one of the *exec'ing process's own* descriptors, see
+/// `check_memfd_exec`'s doc. `None` for anything else, including
+/// `/proc/<other pid>/fd/<n>` (a descriptor in a different table) and a number that
+/// doesn't fit an `i32`.
+fn proc_fd_number(path: &str, own_pid: u32) -> Option<i32> {
+    let rest = path.strip_prefix("/proc/")?;
+    let (pid_or_self, fd) = rest.split_once("/fd/")?;
+    let own = pid_or_self == "self"
+        || (is_all_digits(pid_or_self) && pid_or_self.parse::<u32>().ok() == Some(own_pid));
+    if !own || !is_all_digits(fd) {
+        return None;
+    }
+    fd.parse().ok()
+}
+
+/// True when `old_path` is `new_path` with one of
+/// [`PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES`] appended *and* `comm` is one of
+/// [`PACKAGE_MANAGER_COMMS`] — the package-manager "stage under a temp name,
+/// then rename over the real one" shape `check_burst_write_volume` excludes
+/// (#496), corroborated by which process is doing it (#500 review) so the
+/// filename convention alone isn't a free pass. The path relationship is the
+/// reverse of [`is_rotation_suffix`]'s callers (`new_path` = `old_path` +
+/// suffix): here the suffix is on the *old* name.
+fn is_package_manager_temp_rename(old_path: &str, new_path: &str, comm: &str) -> bool {
+    PACKAGE_MANAGER_COMMS.contains(&comm)
+        && (old_path
+            .strip_prefix(new_path)
+            .is_some_and(|suffix| PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES.contains(&suffix))
+            || is_apk_staging_rename(old_path, new_path))
+}
+
+/// True for apk-tools' real staging shape (#500 review, Jihair): `old_path`
+/// sits in the same directory as `new_path` (not derived from it by suffix —
+/// see [`APK_STAGING_FILE_PREFIX`]'s doc) and its basename is that prefix
+/// followed by a hex digest, e.g. `usr/bin/.apk.e9a41015…` ->
+/// `usr/bin/c89`. Splits on the last `/` rather than comparing absolute
+/// prefixes because apk's renames are relative to a directory fd
+/// (`renameat`), so there's no leading `/` to anchor on — `usr/bin/foo` and
+/// `bin/foo` must both work, and no separator at all means "current
+/// directory" for both sides equally.
+fn is_apk_staging_rename(old_path: &str, new_path: &str) -> bool {
+    let (old_dir, old_base) = old_path.rsplit_once('/').unwrap_or(("", old_path));
+    let (new_dir, _) = new_path.rsplit_once('/').unwrap_or(("", new_path));
+    old_dir == new_dir
+        && old_base
+            .strip_prefix(APK_STAGING_FILE_PREFIX)
+            .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+impl RuleState {
+    /// True for `check_mass_rename_pattern`'s in-place-edit-with-backup false
+    /// positive (#459 part 1): `comm` is a known in-place-edit tool
+    /// ([`IN_PLACE_EDIT_COMMS`]) and the binary behind the pid is at a trusted
+    /// path ([`policy::name_exclusion_applies`]).
+    ///
+    /// The path is the exec-time `image_path` from [`Self::pid_image_path`], not
+    /// `FileRenameEvent::executable_path`: the latter is a rename-time `/proc` read
+    /// that a short-lived process loses (#513 review), and "unknown" there is
+    /// something the process controls by exiting. Unlike the other name-keyed
+    /// exclusions (whose image paths the kernel hands us at exec time), an
+    /// unresolvable path here **fails closed**: a pid with no exec seen (it never
+    /// exec'd since the agent started — e.g. a forked child that only set `comm`)
+    /// is not evidence of `/usr/bin/sed`. `executable_path` is only a fallback for
+    /// that gap, never a way to override a known exec-time path.
+    fn is_in_place_edit_backup(&self, event: &FileRenameEvent) -> bool {
+        if !IN_PLACE_EDIT_COMMS.contains(&event.meta.comm.as_str()) {
+            return false;
+        }
+        let path = self
+            .pid_image_path
+            .peek(&event.meta.pid)
+            .map(String::as_str)
+            .or(event.executable_path.as_deref());
+        matches!(path, Some(p) if !p.is_empty() && policy::name_exclusion_applies(Some(p)))
+    }
+}
+
+/// True for `check_mass_rename_pattern`'s Maildir-flag-change false positive
+/// (#459 part 1): `old_path` already ends in the Maildir info/flags marker
+/// (`:2,` optionally followed by flag letters) and `suffix` — the tail
+/// `new_path` appends — is composed entirely of valid Maildir flag letters
+/// ([`MAILDIR_FLAG_LETTERS`]).
+///
+/// Deliberately **not** also gated on `comm`, unlike [`is_in_place_edit_backup`]
+/// and unlike issue #459's own suggestion: `sed`/`perl` are two fixed,
+/// well-known binaries, but "a mail server touching Maildir" has no small
+/// fixed `comm` set to enumerate without guessing (dovecot, courier,
+/// procmail, maildrop, notmuch, mbsync, offlineimap, mutt, ...) — inventing
+/// one would be exactly the uncalibrated-exclusion-list problem this crate's
+/// own module doc warns against. The flag-letter alphabet constraint is
+/// already a tight structural signal on its own, the same class of reasoning
+/// [`is_rotation_suffix`]'s all-digit check relies on.
+fn is_maildir_flag_change(old_path: &str, suffix: &str) -> bool {
+    if suffix.is_empty() || !suffix.bytes().all(|b| MAILDIR_FLAG_LETTERS.contains(&b)) {
+        return false;
+    }
+    let Some(marker) = old_path.rfind(":2,") else {
+        return false;
+    };
+    old_path.as_bytes()[marker + 3..]
+        .iter()
+        .all(|b| MAILDIR_FLAG_LETTERS.contains(b))
 }
 
 /// Whether the file at `path` is the one a process named `comm` runs from. A

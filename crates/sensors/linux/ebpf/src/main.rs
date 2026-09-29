@@ -370,6 +370,11 @@ fn emit_file_open_event(
     filename_ptr: u64,
     flags: i64,
 ) -> Result<u32, u32> {
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if is_agent_own_pid(pid) {
+        return Ok(0);
+    }
+
     let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
     let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
 
@@ -380,7 +385,7 @@ fn emit_file_open_event(
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
 
-        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*e).meta.pid = pid;
         (*e).meta.ppid = lineage_ppid();
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
@@ -476,13 +481,18 @@ fn try_sys_enter_write(ctx: TracePointContext) -> Result<u32, u32> {
     #[cfg(bpf_target_arch = "x86")]
     let count: u64 = unsafe { ctx.read_at::<u32>(WRITE_COUNT_OFFSET).map_err(|_| 1u32)? as u64 };
 
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if is_agent_own_pid(pid) {
+        return Ok(0);
+    }
+
     let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
     let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
 
     let e = WRITE_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
-        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*e).meta.pid = pid;
         (*e).meta.ppid = lineage_ppid();
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
@@ -2357,6 +2367,18 @@ static MEMFD_CREATE_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static MEMFD_CREATE_SCRATCH: PerCpuArray<MemfdCreateEvent> = PerCpuArray::with_max_entries(1, 0);
 
+/// The half-built `MemfdCreateEvent` between `sys_enter_memfd_create` and
+/// `sys_exit_memfd_create`, keyed by `pid_tgid` (issue #510). The returned fd only
+/// exists at exit, but `name`/`flags` are arguments read from user memory at enter,
+/// so the enter probe builds the whole event and parks it here; the exit probe
+/// fills `fd` and emits. Same enter/exit pairing as `ACCEPT_ARGS`, except the value
+/// is the event itself (a few hundred bytes, inserted from map memory so it never
+/// touches the 512-byte BPF stack). Not part of `sensor-linux-wire`'s ABI. A thread
+/// that enters `memfd_create` and never returns leaks its entry — same accepted
+/// risk as `ACCEPT_ARGS`, bounded by `max_entries`, not explicitly swept.
+#[map]
+static MEMFD_ARGS: HashMap<u64, MemfdCreateEvent> = HashMap::with_max_entries(1024, 0);
+
 /// Offsets of the `syscalls:sys_enter_memfd_create` tracepoint (x86_64/aarch64):
 /// `uname`(16), `flags`(24). Verified on 2026-09-22 on Arch (kernel
 /// 6.6.9-arch1-1, x86_64) via
@@ -2422,17 +2444,55 @@ fn try_sys_enter_memfd_create(ctx: TracePointContext) -> Result<u32, u32> {
             }
         }
         (*e).flags = flags as u32;
+        (*e).fd = -1;
 
-        if MEMFD_CREATE_EVENTS
-            .output::<MemfdCreateEvent>(&*e, 0)
-            .is_err()
-        {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping memfd_create event"
-            );
+        // Emitted at `sys_exit_memfd_create`, once the fd is known (#510).
+        let pid_tgid = bpf_get_current_pid_tgid();
+        let _ = MEMFD_ARGS.insert(&pid_tgid, &*e, 0);
+    }
+
+    Ok(0)
+}
+
+#[tracepoint]
+pub fn sys_exit_memfd_create(ctx: TracePointContext) -> u32 {
+    match try_sys_exit_memfd_create(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+/// Completes the event `try_sys_enter_memfd_create` parked in `MEMFD_ARGS` with the
+/// descriptor `memfd_create(2)` returned (issue #510). Emits nothing when the matching
+/// enter wasn't tracked (`MEMFD_ARGS` was full) or the call failed (`ret < 0`), so the
+/// `fd` a consumer sees is always the real descriptor.
+fn try_sys_exit_memfd_create(ctx: TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let ret: i64 = unsafe { ctx.read_at(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let ret: i64 = unsafe { ctx.read_at::<i32>(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? as i64 };
+
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let e = match MEMFD_ARGS.get_ptr_mut(&pid_tgid) {
+        Some(e) => e,
+        None => return Ok(0),
+    };
+
+    if ret >= 0 {
+        unsafe {
+            (*e).fd = ret as i32;
+            if MEMFD_CREATE_EVENTS
+                .output::<MemfdCreateEvent>(&*e, 0)
+                .is_err()
+            {
+                warn!(
+                    &ctx,
+                    "sensor-linux-ebpf: ring buffer full, dropping memfd_create event"
+                );
+            }
         }
     }
+    let _ = MEMFD_ARGS.remove(&pid_tgid);
 
     Ok(0)
 }
@@ -2690,6 +2750,9 @@ fn emit_mount_event(
 /// agent's own pid is watched; the watchdog process and other registered security
 /// processes are a documented future extension (see `sensor-linux-wire`'s
 /// `WIRE_VERSION` v12 changelog), not implemented here.
+///
+/// Also reused by [`is_agent_own_pid`] (#514) to drop the agent's own file
+/// activity at its source — same value, different consumer.
 #[map]
 static SIGNAL_WATCH_PID: Array<u32> = Array::with_max_entries(1, 0);
 
@@ -2698,6 +2761,25 @@ static SIGNAL_WATCH_PID: Array<u32> = Array::with_max_entries(1, 0);
 /// its pid yet, or wrote it as an explicit "watch nothing".
 fn is_watched_signal_target(target_pid: u32) -> bool {
     matches!(SIGNAL_WATCH_PID.get(0), Some(&watched) if watched != 0 && watched == target_pid)
+}
+
+/// True when `pid` is the agent's own process — the same identity
+/// `SIGNAL_WATCH_PID` already carries for the signal-tamper probes above,
+/// reused here for a different purpose (#514): userspace's `EventSpool::push`
+/// does an `open`+2×`write`+`sync_data` on the local spool file for every
+/// single event it enriches (`crates/store/src/spool.rs`), all attributed to
+/// the agent's own pid. Under a burst that already floods `FILE_WRITE_EVENTS`
+/// (a `docker run`'s containerd/runc/dockerd writes), that self-traffic
+/// roughly doubles the pressure on the same 256 KiB ring buffer, and every
+/// drop's `warn!` was on top of that. It was already filtered — but only
+/// *after* userspace paid for the ring-buffer slot, the decode, and the
+/// allocation (`drain!`'s `schema_event.meta().pid != own_pid`,
+/// `crates/sensors/linux/userspace/src/sensor.rs`). Dropping it here instead
+/// gives that ring-buffer capacity back to real telemetry. The userspace
+/// filter is left in place as a defense-in-depth for the narrow startup
+/// window before `write_signal_watch_pid` runs (see its own doc comment).
+fn is_agent_own_pid(pid: u32) -> bool {
+    is_watched_signal_target(pid)
 }
 
 /// Ring buffer shared with userspace for `kill`/`tgkill` events that pass the

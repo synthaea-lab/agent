@@ -113,6 +113,24 @@ impl TransportConfig {
         format!("{}{}", self.server_url, self.heartbeat_endpoint)
     }
 
+    /// Returns the full URL for the content manifest endpoint for `ring`
+    /// (ADR-0016 §3, issue #30/#73).
+    #[must_use]
+    pub fn content_manifest_url(&self, ring: &str) -> String {
+        format!("{}/api/content/manifest/{ring}", self.server_url)
+    }
+
+    /// Returns the base URL for the content artifact download endpoint
+    /// (ADR-0016 §3, issue #30/#73's download/apply slice). `path` and
+    /// `sha256` are query parameters a caller adds via
+    /// [`crate::TransportClient::get_bytes`], not baked in here — that's
+    /// where percent-encoding of the (attacker-influenced-until-verified)
+    /// `path` value actually happens.
+    #[must_use]
+    pub fn content_artifact_url(&self) -> String {
+        format!("{}/api/content/artifact", self.server_url)
+    }
+
     /// Returns true if mTLS client certificates are configured.
     #[must_use]
     pub fn has_client_cert(&self) -> bool {

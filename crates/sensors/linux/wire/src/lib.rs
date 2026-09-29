@@ -179,7 +179,14 @@ pub use path_filter::is_filtered_path;
 ///   enough" call no longer holds. The high word is read only when
 ///   `cap_user_header_t.version` is not `_LINUX_CAPABILITY_VERSION_1`, whose
 ///   data array has a single element.
-pub const WIRE_VERSION: u32 = 17;
+/// - v18: `MemfdCreateEvent` gains `fd: i32`, the descriptor `memfd_create(2)`
+///   returned (issue #510). That value only exists at `sys_exit_memfd_create`,
+///   so the probe is now an enter/exit pair like accept/accept4: the enter side
+///   builds the whole event (name and flags are user-memory arguments, read
+///   before the call) and stashes it in `MEMFD_ARGS` keyed by `pid_tgid`; the
+///   exit side fills `fd` and emits. A failed call (`ret < 0`) emits nothing, so
+///   `fd` is always `>= 0`. `sys_exit_memfd_create` joins the attach list.
+pub const WIRE_VERSION: u32 = 18;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
@@ -714,6 +721,9 @@ pub struct MemfdCreateEvent {
     pub name_len: u16,
     /// The `flags` argument (`MFD_CLOEXEC`, `MFD_ALLOW_SEALING`, ...).
     pub flags: u32,
+    /// The descriptor `memfd_create(2)` returned (v18, issue #510), read at
+    /// `sys_exit_memfd_create`. Always `>= 0`: failed calls emit no event.
+    pub fd: i32,
 }
 
 /// DNS resolution via glibc's `getaddrinfo(3)` (issue #267 Phase 1): the

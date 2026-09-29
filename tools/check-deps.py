@@ -5,8 +5,8 @@ Rules (see CLAUDE.md):
   - `schema` depends on no workspace crate; `policy` depends only on `schema`.
     Together they are the BASE tier every other crate may use.
   - Sensor crates (`sensor-*`) depend only on `schema`.
-  - Detection crates (rules, sigma, correlator, ml, yara, enrich) depend on the base
-    tier, each other, and `store` — never on a sensor crate.
+  - Detection crates (rules, sigma, correlator, verdict, ml, yara, enrich) depend on
+    the base tier, each other, and `store` — never on a sensor crate.
   - Leaf crates (response, transport, ipc, sinks, updater, config, store, conformance)
     depend only on the base tier.
   - Only the binaries (`agent`, `watchdog`, `cli`) may depend on anything.
@@ -22,8 +22,8 @@ import sys
 
 SCHEMA = "schema"
 BASE = {"schema", "policy"}
-DETECTION = {"rules", "sigma", "correlator", "ml", "yara", "enrich", "intel",
-             "deception"}
+DETECTION = {"rules", "sigma", "correlator", "verdict", "ml", "yara", "enrich",
+             "intel", "deception"}
 LEAF = {"response", "transport", "ipc", "sinks", "updater", "config", "store",
         "conformance", "tamper", "mesh", "device-control", "inventory"}
 BINARIES = {"agent", "watchdog", "cli"}

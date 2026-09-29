@@ -88,7 +88,10 @@ use sensor_linux_wire as wire;
 /// `cap_set` passes them through unchanged. `kernel_module` also takes the
 /// resolved path of a `finit_module` fd from the caller (`sensor.rs` reads
 /// `/proc/<pid>/fd/<fd>`), keeping this module free of filesystem access.
-const _: () = assert!(wire::WIRE_VERSION == 17);
+///
+/// v18 (#510) added `MemfdCreateEvent::fd` (the descriptor `memfd_create(2)`
+/// returned); `memfd_create` passes it through unchanged.
+const _: () = assert!(wire::WIRE_VERSION == 18);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
@@ -222,7 +225,33 @@ pub fn file_rename(
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
         old_path: String::from_utf8_lossy(&old_raw[..old_end]).into_owned(),
         new_path: String::from_utf8_lossy(&new_raw[..new_end]).into_owned(),
+        executable_path: exe_path_for_pid(event.meta.pid),
     })
+}
+
+/// Resolves the renaming process's own executable path (#459 part 1) via
+/// `readlink /proc/<pid>/exe`, so `rules`' T1486 mass-rename check can gate a
+/// name-keyed exclusion (`sed`/`perl` in-place-edit-with-backup) on evidence
+/// instead of trusting `comm` alone — the wire event carries no image path of
+/// its own (unlike `ExecEvent`, `rename(2)` isn't an exec, nothing in the
+/// kernel hands the probe an image path to read at the tracepoint).
+///
+/// Two honest limitations, both resulting in `None` rather than a wrong
+/// answer: this is a `/proc` read at *normalize* time, after the ring buffer
+/// has already delivered the event, so a very short-lived process can have
+/// already exited (`ENOENT`) — same race any `/proc/<pid>/*` read from
+/// userspace has, unavoidable without kernel-side `d_path` resolution at the
+/// tracepoint itself. And unlike `ExecEvent::image_path` (read once, already
+/// in hand from the exec tracepoint), this is one extra syscall per
+/// `FileRenameEvent` — acceptable at rename-event rates (#82's own write-
+/// volume work says the same about `FileWriteEvent`, an even higher-rate
+/// event, needing no such read), revisit if a real workload makes it not.
+fn exe_path_for_pid(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()?
+        .into_os_string()
+        .into_string()
+        .ok()
 }
 
 #[must_use]
@@ -546,6 +575,7 @@ pub fn memfd_create(
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
         name: String::from_utf8_lossy(&raw[..end]).into_owned(),
         flags: event.flags,
+        fd: event.fd,
     })
 }
 
@@ -885,6 +915,51 @@ mod tests {
         };
         assert_eq!(e.old_path, "/home/user/invoice.pdf");
         assert_eq!(e.new_path, "/home/user/invoice.pdf.locked");
+    }
+
+    #[test]
+    fn exe_path_for_pid_returns_none_for_a_nonexistent_pid() {
+        // Cross-platform: /proc doesn't exist at all on non-Linux, and this
+        // pid won't exist as a real process either way — both must degrade
+        // to None, not panic or error out through the caller.
+        assert_eq!(exe_path_for_pid(u32::MAX), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn exe_path_for_pid_resolves_the_calling_processes_own_pid() {
+        let resolved = exe_path_for_pid(std::process::id()).expect("this process is real");
+        assert!(
+            resolved.starts_with('/'),
+            "expected an absolute path, got {resolved}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn file_rename_carries_the_renaming_processes_executable_path() {
+        let mut old_path = [0u8; wire::MAX_PATH_LEN];
+        let old_raw = b"/home/user/invoice.pdf\0";
+        old_path[..old_raw.len()].copy_from_slice(old_raw);
+        let mut new_path = [0u8; wire::MAX_PATH_LEN];
+        let new_raw = b"/home/user/invoice.pdf.locked\0";
+        new_path[..new_raw.len()].copy_from_slice(new_raw);
+        let mut meta = wire_meta(b"encryptor");
+        meta.pid = std::process::id();
+        let event = wire::FileRenameEvent {
+            meta,
+            old_path,
+            old_path_len: old_raw.len() as u16,
+            new_path,
+            new_path_len: new_raw.len() as u16,
+        };
+        let Event::FileRename(e) = file_rename(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert!(
+            e.executable_path.is_some_and(|p| p.starts_with('/')),
+            "expected the test binary's own exe path"
+        );
     }
 
     #[test]

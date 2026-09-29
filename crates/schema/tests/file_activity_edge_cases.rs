@@ -70,6 +70,7 @@ fn file_rename_special_chars() {
             meta: test_meta("encryptor"),
             old_path: old.into(),
             new_path: new.into(),
+            executable_path: None,
         });
 
         // Round-trip: special chars must survive
@@ -110,6 +111,7 @@ fn file_rename_unicode() {
             meta: test_meta("encryptor"),
             old_path: old.into(),
             new_path: new.into(),
+            executable_path: None,
         });
 
         // Round-trip: Unicode must survive
@@ -214,6 +216,7 @@ fn file_rename_same_path() {
         meta: test_meta("renamer"),
         old_path: path.into(),
         new_path: path.into(),
+        executable_path: None,
     });
 
     let json = serde_json::to_string(&event).unwrap();
@@ -236,6 +239,7 @@ fn file_rename_cross_filesystem() {
         meta: test_meta("mv"),
         old_path: "/home/user/file.txt".into(),
         new_path: "/tmp/file.txt".into(),
+        executable_path: None,
     });
 
     let json = serde_json::to_string(&event).unwrap();
@@ -257,6 +261,7 @@ fn file_rename_multiple_extensions() {
         meta: test_meta("encryptor"),
         old_path: "/home/user/invoice.pdf".into(),
         new_path: "/home/user/invoice.pdf.locked.encrypted.ransom".into(),
+        executable_path: None,
     });
 
     let json = serde_json::to_string(&event).unwrap();
