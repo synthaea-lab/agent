@@ -186,6 +186,19 @@ pub(crate) const COMPRESSOR_COMMS: &[&str] = &[
     "gzip", "bzip2", "xz", "zstd", "lz4", "pigz", "pbzip2", "lzma",
 ];
 
+/// `comm` values of tools that compress by *driving* a compressor rather than being one:
+/// `logrotate` with `compress` opens the `.gz` output itself, forks, `dup2`s it onto the
+/// child's stdout, execs `gzip` on stdin and unlinks the original itself, so the create
+/// and the unlink both carry `comm=logrotate` and [`COMPRESSOR_COMMS`] never applies
+/// (measured live on Alpine, #527 review; daily on any Debian/Ubuntu host rotating 20+
+/// logs). Gated like the compressors (trusted binary named `comm`) **and** on the new
+/// file's suffix being a compression extension ([`COMPRESSION_SUFFIXES`]).
+pub(crate) const COMPRESSION_DRIVER_COMMS: &[&str] = &["logrotate"];
+
+/// Suffixes a compression driver appends. Only meaningful together with
+/// [`COMPRESSION_DRIVER_COMMS`]: on their own they are free for an encryptor to copy.
+pub(crate) const COMPRESSION_SUFFIXES: &[&str] = &[".gz", ".xz", ".bz2", ".zst", ".lz4", ".lzma"];
+
 /// How long a creation and the unlink of the file it replaced may be apart and still
 /// count as one write-new-then-unlink (#512 part B). Generous on purpose: an encryptor
 /// creates `f.locked` at the start of a file and unlinks `f` only once the whole

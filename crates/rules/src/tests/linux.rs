@@ -1384,6 +1384,60 @@ fn compressor_burst(comm: &str, exec_image: Option<&str>) -> Vec<crate::Alert> {
     write_new_then_unlink_burst(&mut state, 9410, comm, false)
 }
 
+/// The same burst with a chosen output suffix, `.log.1` → `.log.1<suffix>`: what
+/// `logrotate` with `compress` produces when it opens the output and unlinks the input
+/// itself (both under `comm=logrotate`, #527 review).
+fn logrotate_burst(image: Option<&str>, suffix: &str) -> Vec<crate::Alert> {
+    let mut state = RuleState::new();
+    if let Some(image) = image {
+        state.on_exec(&memfd_exec_event(9420, "logrotate", image, 0));
+    }
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        let ts = u64::from(i) * 100_000_000;
+        alerts.extend(state.on_file_open(&file_open_event_full(
+            9420,
+            "logrotate",
+            &format!("/var/log/app{i}.log.1{suffix}"),
+            O_NEW_FILE,
+            ts,
+        )));
+        alerts.extend(state.on_file_delete(&file_delete_event_full(
+            9420,
+            "logrotate",
+            &format!("/var/log/app{i}.log.1"),
+            ts + 1_000,
+        )));
+    }
+    alerts
+}
+
+#[test]
+fn logrotate_compressing_its_logs_does_not_alert() {
+    for suffix in [".gz", ".xz", ".bz2", ".zst"] {
+        assert!(
+            logrotate_burst(Some("/usr/sbin/logrotate"), suffix).is_empty(),
+            "{suffix}"
+        );
+    }
+}
+
+#[test]
+fn logrotate_writing_a_non_compression_suffix_still_alerts() {
+    // The suffix gate: a trusted logrotate does not make `.locked` benign.
+    let alerts = logrotate_burst(Some("/usr/sbin/logrotate"), ".locked");
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+}
+
+#[test]
+fn a_logrotate_comm_from_an_untrusted_or_unknown_path_still_alerts() {
+    for image in [Some("/tmp/logrotate"), Some("/usr/bin/python3"), None] {
+        let alerts = logrotate_burst(image, ".gz");
+        assert_eq!(alerts.len(), 1, "{image:?}");
+    }
+}
+
 #[test]
 fn a_real_compressor_does_not_alert() {
     // Measured live: gzip/xz/bzip2/zstd each did 30 create-X.ext-then-unlink-X in 5s.

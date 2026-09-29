@@ -19,16 +19,16 @@ use crate::{
     exclusions::{
         AGENT_CHILD_EXCLUSIONS, APK_STAGING_FILE_PREFIX, AUTH_FAILURE_THRESHOLD,
         AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD, BEACON_WINDOW_NS, BROWSERS,
-        BURST_WRITE_BYTES_THRESHOLD, COMPRESSOR_COMMS, CREATE_UNLINK_HISTORY_PER_PID,
-        CREATE_UNLINK_PAIR_WINDOW_NS, CREATE_UNLINK_PID_CAP, DOWNLOAD_EXEC_WINDOW_NS,
-        DOWNLOADER_COMMS, IN_PLACE_EDIT_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS,
-        MEMFD_EXEC_WINDOW_NS, PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES,
-        QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX,
-        RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD,
-        SCAN_SPREAD_WINDOW_NS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
-        SELF_SPAWN_THRESHOLD, SELF_SPAWN_WINDOW_NS, SHELL_COMMS, STANDARD_PORTS,
-        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
-        WEB_SERVER_COMMS,
+        BURST_WRITE_BYTES_THRESHOLD, COMPRESSION_DRIVER_COMMS, COMPRESSION_SUFFIXES,
+        COMPRESSOR_COMMS, CREATE_UNLINK_HISTORY_PER_PID, CREATE_UNLINK_PAIR_WINDOW_NS,
+        CREATE_UNLINK_PID_CAP, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS, IN_PLACE_EDIT_COMMS,
+        LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS, MEMFD_EXEC_WINDOW_NS,
+        PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES, QUARANTINE_EXEC_WINDOW_NS,
+        RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD,
+        RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
+        SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_THRESHOLD,
+        SELF_SPAWN_WINDOW_NS, SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN,
+        SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS, WEB_SERVER_COMMS,
     },
     has_write_intent,
     sliding::{FlowPortDedup, SlidingCounter, SlidingDistinct, SlidingSum},
@@ -1186,7 +1186,11 @@ impl RuleState {
     /// `bzip2` and `zstd` each did 30 of these in 5 s over a `*.log` glob. They are
     /// excluded by [`COMPRESSOR_COMMS`] gated on the pid running the trusted binary of
     /// that name, failing closed ([`Self::runs_trusted_binary_named`]); a suffix
-    /// allowlist (`.gz`) would be free for an encryptor to copy. Nothing else measured
+    /// allowlist (`.gz`) alone would be free for an encryptor to copy. `logrotate` with
+    /// `compress` opens the `.gz` and unlinks the input itself (gzip only writes to an
+    /// inherited fd), so it is excluded as a compression *driver*
+    /// ([`Self::is_compression_driver`]): trusted binary named `logrotate` **and** a
+    /// compression extension, both required (found live by Jihair on Alpine, #527). Nothing else measured
     /// (`zip -m`, `rsync --remove-source-files`, `git gc`, atomic writers, `apt`)
     /// exceeded 2. Restricted to Unix events: the Windows and macOS producers of this
     /// shape (Explorer, `ditto`, installers) were not measured.
@@ -1261,7 +1265,9 @@ impl RuleState {
         deleted: &str,
         created: &str,
     ) -> Option<Alert> {
-        if self.is_compressor(meta.pid, &meta.comm) {
+        if self.is_compressor(meta.pid, &meta.comm)
+            || self.is_compression_driver(meta.pid, &meta.comm, deleted, created)
+        {
             return None;
         }
         let pid_entry = self
@@ -1284,6 +1290,16 @@ impl RuleState {
             });
         }
         None
+    }
+
+    /// True when `comm` is a compression driver ([`COMPRESSION_DRIVER_COMMS`], i.e.
+    /// `logrotate`) that really runs the trusted binary of that name and the new file
+    /// only appends a compression extension to the old name.
+    fn is_compression_driver(&self, pid: u32, comm: &str, deleted: &str, created: &str) -> bool {
+        COMPRESSION_DRIVER_COMMS.contains(&comm)
+            && appended_suffix(deleted, created)
+                .is_some_and(|suffix| COMPRESSION_SUFFIXES.contains(&suffix))
+            && self.runs_trusted_binary_named(pid, comm)
     }
 
     /// True when `comm` is a compression tool ([`COMPRESSOR_COMMS`]) and the pid really
