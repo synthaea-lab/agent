@@ -475,6 +475,13 @@ fn ensure_within_state_dir(path: &Path, state_dir: &Path, flag_name: &str) -> an
     }
 }
 
+/// Where applied content lives by default. The single definition shared by
+/// `apply-content-manifest` (writer) and `run` (reader): they must agree, or
+/// content that was downloaded and verified is never loaded.
+pub(crate) fn default_content_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("content")
+}
+
 /// Resolves `--content-dir`/`--state` for `apply-content-manifest`: left
 /// unset, each defaults to a fixed name under `state_dir`
 /// (`cfg.storage.state_dir`); given explicitly, each must still resolve
@@ -495,7 +502,7 @@ pub(crate) fn resolve_content_paths(
             ensure_within_state_dir(&dir, state_dir, "content-dir")?;
             dir
         }
-        None => state_dir.join("content"),
+        None => default_content_dir(state_dir),
     };
     let state_path = match state_path {
         Some(path) => {
@@ -1143,6 +1150,15 @@ mod tests {
         let err = resolve_content_paths(&state_dir, None, Some(outside))
             .expect_err("a --state path outside state_dir must be refused");
         assert!(err.to_string().contains("--state"), "got: {err}");
+    }
+
+    #[test]
+    fn run_and_apply_default_to_the_same_content_dir() {
+        // A default mismatch once left applied content on disk that the
+        // running agent never read (issue #530).
+        let state_dir = tmp("default-content-dir-agrees");
+        let (apply_default, _) = resolve_content_paths(&state_dir, None, None).unwrap();
+        assert_eq!(apply_default, default_content_dir(&state_dir));
     }
 
     #[test]
