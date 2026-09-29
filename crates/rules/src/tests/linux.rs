@@ -196,13 +196,30 @@ fn ld_preload_from_a_seeded_ld_so_conf_dir_does_not_alert() {
     assert!(!fired(&mut seeded));
 }
 
-// ── T1037.004 / T1053.003 persistence writes ────────────────────────────────
+// ── persistence writes (T1546.004 / T1053.003 / T1543.002) ──────────────────
 
 #[test]
 fn write_to_bashrc_matches_persistence() {
     // O_WRONLY|O_CREAT|O_TRUNC, values observed in real conditions (touch(1)).
     let event = file_open_event("/home/app/.bashrc", 577);
     assert!(check_persistence_write(&event).is_some());
+}
+
+#[test]
+fn linux_persistence_paths_are_tagged_with_their_own_technique() {
+    // Regression (#495): every path was tagged T1037.004/T1053.003, and none of
+    // them is an RC script (T1037.004).
+    for (path, technique) in [
+        ("/home/app/.bashrc", "T1546.004"),
+        ("/home/app/.zshrc", "T1546.004"),
+        ("/etc/profile.d/evil.sh", "T1546.004"),
+        ("/etc/cron.d/evil", "T1053.003"),
+        ("/etc/systemd/system/evil.service", "T1543.002"),
+    ] {
+        let alert = check_persistence_write(&file_open_event(path, O_WRONLY | O_CREAT))
+            .expect("must alert");
+        assert_eq!(alert.technique, technique, "{path}");
+    }
 }
 
 #[test]
