@@ -343,10 +343,35 @@ fn an_installed_cli_run_from_a_shell_does_not_alert() {
 
 #[test]
 fn a_system_to_system_storm_still_alerts() {
-    let alerts = spawn_burst(
+    let taskhostw = r"C:\Windows\System32\taskhostw.exe";
+    let svchost = Some(r"C:\Windows\System32\svchost.exe");
+    assert!(spawn_burst(taskhostw, svchost, SELF_SPAWN_TRUSTED_THRESHOLD - 1).is_empty());
+    assert_eq!(
+        spawn_burst(taskhostw, svchost, SELF_SPAWN_TRUSTED_THRESHOLD).len(),
+        1
+    );
+}
+
+#[test]
+fn a_system_shell_looping_a_script_host_alerts_at_the_base_threshold() {
+    // #494 review: a malicious .ps1 respawning powershell.exe a few times
+    // from a system shell, below SELF_SPAWN_TRUSTED_THRESHOLD.
+    for child in [
         r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe",
-        Some(SYSTEM_POWERSHELL),
-        SELF_SPAWN_TRUSTED_THRESHOLD,
+        r"C:\Windows\System32\cmd.exe",
+        r"C:\Windows\System32\wscript.exe",
+    ] {
+        let alerts = spawn_burst(child, Some(SYSTEM_POWERSHELL), SELF_SPAWN_THRESHOLD);
+        assert_eq!(alerts.len(), 1, "{child}");
+    }
+}
+
+#[test]
+fn a_script_host_child_matches_case_insensitively() {
+    let alerts = spawn_burst(
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\PowerShell.EXE",
+        Some(r"C:\Windows\System32\svchost.exe"),
+        SELF_SPAWN_THRESHOLD,
     );
     assert_eq!(alerts.len(), 1);
 }
