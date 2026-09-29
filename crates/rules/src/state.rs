@@ -2,12 +2,15 @@
 //! per-window counters) and consults it on every event. Each rule stays a dedicated
 //! method, with its calibration constants next to it.
 
-use std::{collections::HashMap, net::IpAddr};
+use std::{
+    collections::{HashMap, VecDeque},
+    net::IpAddr,
+};
 
 use schema::{
     AuthEvent, AuthOutcome, ConnectEvent, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
-    FileOpenEvent, FileQuarantineEvent, FileRenameEvent, FileWriteEvent, ListenPortEvent,
-    MemfdCreateEvent, NetworkFlowEvent, User,
+    FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRenameEvent, FileWriteEvent,
+    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, User,
 };
 use store::BoundedMap;
 
@@ -16,8 +19,9 @@ use crate::{
     exclusions::{
         AGENT_CHILD_EXCLUSIONS, APK_STAGING_FILE_PREFIX, AUTH_FAILURE_THRESHOLD,
         AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD, BEACON_WINDOW_NS, BROWSERS,
-        BURST_WRITE_BYTES_THRESHOLD, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS,
-        IN_PLACE_EDIT_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS,
+        BURST_WRITE_BYTES_THRESHOLD, COMPRESSOR_COMMS, CREATE_UNLINK_HISTORY_PER_PID,
+        CREATE_UNLINK_PAIR_WINDOW_NS, CREATE_UNLINK_PID_CAP, DOWNLOAD_EXEC_WINDOW_NS,
+        DOWNLOADER_COMMS, IN_PLACE_EDIT_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS,
         MEMFD_EXEC_WINDOW_NS, PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES,
         QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX,
         RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD,
@@ -117,6 +121,23 @@ pub struct RuleState {
     /// per-pid counter alone would miss it (issue #262 review, old-dov). LRU-bounded.
     /// `ppid <= 1` (unknown/init) is never keyed here — see `check_mass_rename_pattern`.
     ransomware_rename_by_ppid: BoundedMap<u32, SlidingCounter>,
+    /// pid → (timestamp, path) of the recent write-intent creations (`O_CREAT`) seen
+    /// for it, newest last: the "new file" half of the write-new-then-unlink T1486
+    /// shape (#512 part B). `FileWriteEvent` carries only an fd, so the correlation is
+    /// between this creation and a later `FileDeleteEvent`, both of which carry paths.
+    /// Bounded by [`CREATE_UNLINK_PID_CAP`] pids x [`CREATE_UNLINK_HISTORY_PER_PID`].
+    recent_creates: BoundedMap<u32, VecDeque<(u64, String)>>,
+    /// pid → (timestamp, path) of unlinks that found no creation to pair with yet.
+    /// The kernel always creates `X.suffix` before unlinking `X`, but userspace drains
+    /// the open and delete ring buffers independently, so the delete can be processed
+    /// first (the same ordering hazard as `pending_proc_fd_exec`, #503); the creation
+    /// then pairs with it on arrival. Same bounds as `recent_creates`.
+    pending_unlinks: BoundedMap<u32, VecDeque<(u64, String)>>,
+    /// pid → sliding counter of write-new-then-unlink pairs (T1486, #512 part B).
+    ransomware_unlink: BoundedMap<u32, SlidingCounter>,
+    /// ppid → the same, for the shell-loop shape (one short-lived process per file), like
+    /// `ransomware_rename_by_ppid`.
+    ransomware_unlink_by_ppid: BoundedMap<u32, SlidingCounter>,
     /// pid → sliding sum of `FileWriteEvent::bytes_requested` (issue #82): the
     /// write-volume half of a second, independent T1486 corroboration signal —
     /// heavy write volume alongside a rename burst, regardless of whether the
@@ -195,6 +216,10 @@ impl RuleState {
             scan_spread: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
             auth_failures: BoundedMap::new(COUNTER_CAP),
+            recent_creates: BoundedMap::new(CREATE_UNLINK_PID_CAP),
+            pending_unlinks: BoundedMap::new(CREATE_UNLINK_PID_CAP),
+            ransomware_unlink: BoundedMap::new(COUNTER_CAP),
+            ransomware_unlink_by_ppid: BoundedMap::new(COUNTER_CAP),
             ransomware_rename: BoundedMap::new(COUNTER_CAP),
             ransomware_rename_by_ppid: BoundedMap::new(COUNTER_CAP),
             write_volume: BoundedMap::new(COUNTER_CAP),
@@ -962,7 +987,8 @@ impl RuleState {
     /// [`Self::check_task_registration`]) and updates the history of downloader
     /// writes, consumed by `check_download_then_exec`.
     pub fn on_file_open(&mut self, event: &FileOpenEvent) -> Vec<Alert> {
-        let alerts = self.check_task_registration(event).into_iter().collect();
+        let mut alerts: Vec<Alert> = self.check_task_registration(event).into_iter().collect();
+        alerts.extend(self.record_create(event));
         self.record_downloader_write(event);
         alerts
     }
@@ -1137,6 +1163,170 @@ impl RuleState {
             });
         }
         None
+    }
+
+    /// To be called for every `FileDeleteEvent` in the stream: the unlink half of the
+    /// write-new-then-unlink T1486 shape (#512 part B), see
+    /// [`Self::check_write_new_then_unlink`].
+    pub fn on_file_delete(&mut self, event: &FileDeleteEvent) -> Vec<Alert> {
+        self.check_write_new_then_unlink(event)
+            .into_iter()
+            .collect()
+    }
+
+    /// T1486, the shape `check_mass_rename_pattern` cannot see because none of it is a
+    /// rename (#512 part B): the encryptor writes `file.docx.locked` as a **new** file and
+    /// only then unlinks `file.docx` (safer than an in-place rewrite: the original
+    /// survives until the copy is complete). Same appended-suffix relation
+    /// ([`appended_suffix`], so a cross-directory pair counts too), same lettered,
+    /// non-rotation, non-Maildir suffix filter, same threshold and window.
+    ///
+    /// The correlation is a write-intent `O_CREAT` open (`record_create`) and an unlink
+    /// of the file whose name the new one extends, by one pid within
+    /// [`CREATE_UNLINK_PAIR_WINDOW_NS`], in either arrival order (`pending_unlinks`).
+    /// It cannot use `FileWriteEvent`: that event carries an fd and no path.
+    ///
+    /// The benign producer measured live (Debian 13) is compression: `gzip`, `xz`,
+    /// `bzip2` and `zstd` each did 30 of these in 5 s over a `*.log` glob. They are
+    /// excluded by [`COMPRESSOR_COMMS`] gated on the pid running the trusted binary of
+    /// that name, failing closed ([`Self::runs_trusted_binary_named`]); a suffix
+    /// allowlist (`.gz`) would be free for an encryptor to copy. Nothing else measured
+    /// (`zip -m`, `rsync --remove-source-files`, `git gc`, atomic writers, `apt`)
+    /// exceeded 2. Restricted to Unix events: the Windows and macOS producers of this
+    /// shape (Explorer, `ditto`, installers) were not measured.
+    ///
+    /// Like every pid-keyed table here it inherits #519: a recycled pid keeps a stale
+    /// history until it ages out of the window.
+    fn check_write_new_then_unlink(&mut self, event: &FileDeleteEvent) -> Option<Alert> {
+        if !matches!(event.meta.user, User::Unix { .. }) {
+            return None;
+        }
+        let pid = event.meta.pid;
+        let ts = event.meta.timestamp_ns;
+        let created = self.recent_creates.get_mut(&pid).and_then(|creates| {
+            let idx = creates.iter().rposition(|(created_ts, path)| {
+                pairs_create_and_unlink(*created_ts, path, ts, &event.path)
+            })?;
+            creates.remove(idx).map(|(_, path)| path)
+        });
+        let Some(created) = created else {
+            // No creation seen yet: it may still arrive after this unlink.
+            let pending = self.pending_unlinks.get_or_insert_with(pid, VecDeque::new);
+            if pending.len() >= CREATE_UNLINK_HISTORY_PER_PID {
+                pending.pop_front();
+            }
+            pending.push_back((ts, event.path.clone()));
+            return None;
+        };
+        self.count_create_unlink_pair(&event.meta, ts, &event.path, &created)
+    }
+
+    /// The creation half: remembers a write-intent `O_CREAT` open, or pairs it with an
+    /// unlink that arrived first. Unix events only, see
+    /// [`Self::check_write_new_then_unlink`].
+    fn record_create(&mut self, event: &FileOpenEvent) -> Option<Alert> {
+        if event.flags & O_CREAT == 0
+            || !has_write_intent(event.flags)
+            || !matches!(event.meta.user, User::Unix { .. })
+        {
+            return None;
+        }
+        let pid = event.meta.pid;
+        let created_ts = event.meta.timestamp_ns;
+        let unlinked = self.pending_unlinks.get_mut(&pid).and_then(|pending| {
+            let idx = pending.iter().position(|(unlink_ts, path)| {
+                pairs_create_and_unlink(created_ts, &event.path, *unlink_ts, path)
+            })?;
+            pending.remove(idx)
+        });
+        if let Some((unlink_ts, deleted)) = unlinked {
+            return self.count_create_unlink_pair(&event.meta, unlink_ts, &deleted, &event.path);
+        }
+        let creates = self.recent_creates.get_or_insert_with(pid, VecDeque::new);
+        if creates.len() >= CREATE_UNLINK_HISTORY_PER_PID {
+            creates.pop_front();
+        }
+        creates.push_back((created_ts, event.path.clone()));
+        None
+    }
+
+    /// Counts one matched write-new-then-unlink pair, per pid and per ppid, alerting at
+    /// the mass-rename threshold. `ts` is the later (unlink) time.
+    fn count_create_unlink_pair(
+        &mut self,
+        meta: &schema::EventMeta,
+        ts: u64,
+        deleted: &str,
+        created: &str,
+    ) -> Option<Alert> {
+        if self.is_compressor(meta.pid, &meta.comm) {
+            return None;
+        }
+        let pid_entry = self
+            .ransomware_unlink
+            .get_or_insert_with(meta.pid, SlidingCounter::default);
+        let pid_count = pid_entry.record(ts, RANSOMWARE_RENAME_WINDOW_NS);
+        if pid_count >= RANSOMWARE_RENAME_THRESHOLD
+            && pid_entry.try_alert(ts, RANSOMWARE_RENAME_WINDOW_NS)
+        {
+            return Some(Alert {
+                technique: "T1486",
+                message: format!(
+                    "pid={} comm={}: {pid_count} files replaced by a new file with an appended \
+                     suffix and then unlinked in {}s (e.g. {deleted} → {created}) — suspected \
+                     ransomware encryption pass (write-new-then-unlink)",
+                    meta.pid,
+                    meta.comm,
+                    RANSOMWARE_RENAME_WINDOW_NS / 1_000_000_000,
+                ),
+            });
+        }
+        // Per-ppid, the shell-loop shape (`for f in *; do openssl enc -in $f -out $f.enc &&
+        // rm $f; done`): same guards as `check_mass_rename_pattern`.
+        if pid_count > RANSOMWARE_LOOP_CHILD_MAX || meta.ppid <= 1 {
+            return None;
+        }
+        let ppid_entry = self
+            .ransomware_unlink_by_ppid
+            .get_or_insert_with(meta.ppid, SlidingCounter::default);
+        let ppid_count = ppid_entry.record(ts, RANSOMWARE_RENAME_WINDOW_NS);
+        if ppid_count >= RANSOMWARE_RENAME_THRESHOLD
+            && ppid_entry.try_alert(ts, RANSOMWARE_RENAME_WINDOW_NS)
+        {
+            return Some(Alert {
+                technique: "T1486",
+                message: format!(
+                    "ppid={}: {ppid_count} files replaced by a new file with an appended suffix \
+                     and then unlinked by short-lived children in {}s (e.g. {deleted} → {created}, \
+                     comm={}) — suspected ransomware encryption pass (write-new-then-unlink, \
+                     shell-loop pattern)",
+                    meta.ppid,
+                    RANSOMWARE_RENAME_WINDOW_NS / 1_000_000_000,
+                    meta.comm,
+                ),
+            });
+        }
+        None
+    }
+
+    /// True when `comm` is a compression tool ([`COMPRESSOR_COMMS`]) and the pid really
+    /// runs the trusted binary of that name: see [`Self::runs_trusted_binary_named`].
+    fn is_compressor(&self, pid: u32, comm: &str) -> bool {
+        COMPRESSOR_COMMS.contains(&comm) && self.runs_trusted_binary_named(pid, comm)
+    }
+
+    /// True when this pid's exec-time `image_path` is known, sits at a trusted system
+    /// path **and is a binary named `comm`**. Both halves matter: a trusted path alone
+    /// is not enough, because a process running the system `python3` can rename its own
+    /// `comm` to `gzip` with `prctl(PR_SET_NAME)` and would otherwise inherit the
+    /// exclusion; what an encryptor cannot fake is that the trusted binary it runs is
+    /// *called* `gzip`. Unknown is **not** trusted (fails closed): delete events carry no
+    /// rename-time `executable_path` to fall back on, and "no exec seen" (a forked child
+    /// that only set `comm`) is not evidence of `/usr/bin/gzip`.
+    fn runs_trusted_binary_named(&self, pid: u32, comm: &str) -> bool {
+        self.pid_image_path.peek(&pid).is_some_and(|p| {
+            !p.is_empty() && policy::name_exclusion_applies(Some(p)) && written_file_is(p, comm)
+        })
     }
 
     /// To be called for every `FileRenameEvent` in the stream (T1486, issue #262 +
@@ -1363,6 +1553,18 @@ fn appended_suffix<'a>(old_path: &str, new_path: &'a str) -> Option<&'a str> {
         return None;
     }
     new_base.strip_prefix(old_base)
+}
+
+/// Whether creating `created` (at `created_ts`) and unlinking `deleted` (at `deleted_ts`)
+/// is one write-new-then-unlink: the new file's name extends the deleted one's by a
+/// lettered, non-rotation, non-Maildir suffix ([`appended_suffix`]), the kernel-time
+/// order is create-then-unlink, and they are within [`CREATE_UNLINK_PAIR_WINDOW_NS`].
+fn pairs_create_and_unlink(created_ts: u64, created: &str, deleted_ts: u64, deleted: &str) -> bool {
+    created_ts <= deleted_ts
+        && deleted_ts - created_ts <= CREATE_UNLINK_PAIR_WINDOW_NS
+        && appended_suffix(deleted, created).is_some_and(|suffix| {
+            !suffix.is_empty() && !is_rotation_suffix(suffix) && !is_maildir_info_suffix(suffix)
+        })
 }
 
 /// `path` split at its last separator into `(directory, file name)`; no separator

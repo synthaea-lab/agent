@@ -175,6 +175,35 @@ pub(crate) const IN_PLACE_EDIT_COMMS: &[&str] = &["sed", "perl"];
 /// one is deliberately not also comm-gated.
 pub(crate) const MAILDIR_FLAG_LETTERS: &[u8] = b"DFPRST";
 
+/// `comm` values of compression tools. Their normal operation is exactly the
+/// write-new-then-unlink shape (`gzip f` creates `f.gz`, then unlinks `f`), and one
+/// process handles a whole `*.log` glob: measured live (Debian 13, #512 part B),
+/// `gzip`, `xz`, `bzip2` and `zstd` each reached a burst of 30 in 5 s over 30 files,
+/// the same as an encryptor. Gated on `comm` + a trusted exec-time image path together,
+/// failing closed, never on `comm` or on the output suffix alone (CLAUDE.md: an
+/// encryptor can set `comm=gzip`, or name its output `.gz`, for free).
+pub(crate) const COMPRESSOR_COMMS: &[&str] = &[
+    "gzip", "bzip2", "xz", "zstd", "lz4", "pigz", "pbzip2", "lzma",
+];
+
+/// How long a creation and the unlink of the file it replaced may be apart and still
+/// count as one write-new-then-unlink (#512 part B). Generous on purpose: an encryptor
+/// creates `f.locked` at the start of a file and unlinks `f` only once the whole
+/// content is written, which for a large file is seconds, not milliseconds.
+pub(crate) const CREATE_UNLINK_PAIR_WINDOW_NS: u64 = 60_000_000_000; // 60s
+
+/// Creations and unmatched unlinks remembered per pid for that pairing. A tool
+/// working through a tree pairs each file's creation and unlink back to back, so a
+/// short history finds the partner; a pid making more than this before either
+/// resolves is not something a longer list would catch better.
+pub(crate) const CREATE_UNLINK_HISTORY_PER_PID: usize = 16;
+
+/// Pids tracked for that pairing. A dedicated, smaller bound than the pid tables: each
+/// entry holds up to [`CREATE_UNLINK_HISTORY_PER_PID`] path strings, so the worst case
+/// (`cap x per-pid x path`) stays a few MB rather than the ~200 MB the 65k-pid tables
+/// would allow.
+pub(crate) const CREATE_UNLINK_PID_CAP: usize = 4_096;
+
 /// Pairing window for one scheduled-task registration seen on both Security 4698
 /// and TaskScheduler/Operational 106 (#422, T1053.005). The two are normalized by
 /// separate poll threads, each on a 2s cadence, so their timestamps land a few

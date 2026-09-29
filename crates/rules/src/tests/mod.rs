@@ -105,6 +105,23 @@ fn file_rename_event_full(
     event
 }
 
+fn file_delete_event_full(
+    pid: u32,
+    comm: &str,
+    path: &str,
+    timestamp_ns: u64,
+) -> schema::FileDeleteEvent {
+    schema::FileDeleteEvent {
+        path: path.to_string(),
+        meta: EventMeta {
+            pid,
+            comm: comm.to_string(),
+            timestamp_ns,
+            ..meta()
+        },
+    }
+}
+
 fn memfd_create_event_full(pid: u32, timestamp_ns: u64) -> schema::MemfdCreateEvent {
     schema::MemfdCreateEvent {
         meta: EventMeta {

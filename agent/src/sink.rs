@@ -520,9 +520,15 @@ impl DetectionSink {
         self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_auth(event));
     }
 
-    /// `FileDelete` events: log-tamper detection (T1070.001/.002, pack #379).
+    /// `FileDelete` events: log-tamper detection (T1070.001/.002, pack #379), then the
+    /// unlink half of the write-new-then-unlink T1486 shape (#512 part B), which needs
+    /// the creation history `on_file_open` keeps.
     fn detect_file_delete(&self, wrapped: &Event, event: &schema::FileDeleteEvent) {
         self.record_rule_alerts(wrapped, rules::evaluate_file_delete(event));
+        self.record_rule_alerts(
+            wrapped,
+            self.rule_state.lock().unwrap().on_file_delete(event),
+        );
     }
 
     /// `Signal` events: security-process tampering (T1562.001, issue #362).
