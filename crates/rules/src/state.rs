@@ -1095,15 +1095,22 @@ impl RuleState {
     ///   (the flag-letter alphabet), deliberately *not* also comm-gated; see
     ///   that function's doc for why.
     ///
-    /// Shapes this rule cannot see at all (write-new-then-unlink, cross-directory
-    /// moves) need a separate write/delete correlation — still a follow-up,
-    /// tracked in #459 part 2.
+    /// Cross-directory moves (`~/docs/a.docx` → `~/.stash/a.docx.locked`, #512):
+    /// when the directories differ the full-path prefix test can never hold, so the
+    /// same appended-suffix relation is read off the file *names* instead
+    /// ([`appended_suffix`]). Same counters, same exclusions; the one new benign
+    /// producer that shape brings in is the Maildir delivery move
+    /// (`new/msg` → `cur/msg:2,S`), excluded by [`is_maildir_delivery`].
+    ///
+    /// Shapes this rule still cannot see at all (write-new-then-unlink) need a
+    /// separate open/delete correlation — still a follow-up, tracked in #512.
     fn check_mass_rename_pattern(&mut self, event: &FileRenameEvent) -> Option<Alert> {
-        let suffix = event.new_path.strip_prefix(event.old_path.as_str())?;
+        let suffix = appended_suffix(&event.old_path, &event.new_path)?;
         if suffix.is_empty()
             || is_rotation_suffix(suffix)
             || self.is_in_place_edit_backup(event)
             || is_maildir_flag_change(&event.old_path, suffix)
+            || is_maildir_delivery(&event.old_path, &event.new_path, suffix)
         {
             return None;
         }
@@ -1378,6 +1385,78 @@ impl RuleState {
     }
 }
 
+/// The suffix a rename appends to a file's name, when that is what it does: the tail
+/// of `new_path` after `old_path` (same directory, `a.docx` → `a.docx.locked`), or,
+/// when the directories differ, the tail of `new_path`'s *file name* after
+/// `old_path`'s (`~/docs/a.docx` → `~/.stash/a.docx.locked`, #512). `None` when
+/// neither relation holds. Splits on `/` and `\\` alike: Windows sensors feed this
+/// rule too. Works on the raw path strings, so a relative pair (both relative to
+/// the same unresolved dirfd or cwd) compares consistently without resolving it.
+fn appended_suffix<'a>(old_path: &str, new_path: &'a str) -> Option<&'a str> {
+    if let Some(suffix) = new_path.strip_prefix(old_path) {
+        return Some(suffix);
+    }
+    let old_base = split_dir_base(old_path).1;
+    let new_base = split_dir_base(new_path).1;
+    // No `old_dir == new_dir` shortcut: with equal directories the literal prefix test
+    // above only fails when the separators differ (`dir/a` vs `dir\a.locked`), and the
+    // base-name comparison below is exactly what must still run then.
+    if old_base.is_empty() {
+        return None;
+    }
+    new_base.strip_prefix(old_base)
+}
+
+/// `path` split at its last separator into `(directory, file name)`; no separator
+/// means an empty directory part.
+fn split_dir_base(path: &str) -> (&str, &str) {
+    match path.rfind(['/', '\\']) {
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => ("", path),
+    }
+}
+
+/// True for a suffix that is exactly a Maildir info marker: `:2,` followed by
+/// zero or more flag letters. Delivering a message out of `new/` into `cur/` is a
+/// cross-directory rename that appends precisely this (`msg` → `msg:2,S`), and an
+/// IMAP server or `mbsync` does it for every message a client opens: 20+ in a
+/// few seconds on "mark all read" (#512). Structural like
+/// [`is_maildir_flag_change`], for the same reason: the alphabet is a tight shape
+/// and there is no small fixed set of `comm` values to gate on.
+fn is_maildir_info_suffix(suffix: &str) -> bool {
+    suffix.strip_prefix(":2,").is_some_and(is_maildir_flags)
+}
+
+/// True for a real Maildir delivery: a move from a `new` directory into the `cur`
+/// directory next to it, whose new name only appends a Maildir info suffix
+/// ([`is_maildir_info_suffix`]). The directory shape is part of the test, not just the
+/// suffix: `:2,` followed by lowercase keyword letters is a free, readable extension for
+/// an encryptor (`f.docx` → `f.docx:2,locked`), so the suffix alone must never exclude
+/// a rename (#526 review, found live on Alpine).
+fn is_maildir_delivery(old_path: &str, new_path: &str, suffix: &str) -> bool {
+    if !is_maildir_info_suffix(suffix) {
+        return false;
+    }
+    let (old_dir, _) = split_dir_base(old_path);
+    let (new_dir, _) = split_dir_base(new_path);
+    let (old_parent, old_leaf) = split_dir_base(old_dir);
+    let (new_parent, new_leaf) = split_dir_base(new_dir);
+    old_leaf == "new" && new_leaf == "cur" && old_parent == new_parent
+}
+
+/// True for what follows `:2,` in a Maildir info suffix: the standard flag letters
+/// ([`MAILDIR_FLAG_LETTERS`]) and then, optionally, Dovecot's IMAP keywords, which it
+/// stores as lowercase `a`-`z` after them (`:2,Sa`, `:2,RSab`; Thunderbird tags,
+/// `$Label1`, Junk/NonJunk). Delivering or tagging 20+ messages raised T1486 on the
+/// standard alphabet alone (#526 review, live on Alpine). The order keeps the shape
+/// tight: keywords never precede a standard flag.
+fn is_maildir_flags(flags: &str) -> bool {
+    let keywords = flags.trim_start_matches(|c: char| {
+        u8::try_from(c).is_ok_and(|b| MAILDIR_FLAG_LETTERS.contains(&b))
+    });
+    keywords.bytes().all(|b| b.is_ascii_lowercase())
+}
+
 /// True for `check_mass_rename_pattern`'s Maildir-flag-change false positive
 /// (#459 part 1): `old_path` already ends in the Maildir info/flags marker
 /// (`:2,` optionally followed by flag letters) and `suffix` — the tail
@@ -1394,15 +1473,13 @@ impl RuleState {
 /// already a tight structural signal on its own, the same class of reasoning
 /// [`is_rotation_suffix`]'s all-digit check relies on.
 fn is_maildir_flag_change(old_path: &str, suffix: &str) -> bool {
-    if suffix.is_empty() || !suffix.bytes().all(|b| MAILDIR_FLAG_LETTERS.contains(&b)) {
+    if suffix.is_empty() || !is_maildir_flags(suffix) {
         return false;
     }
     let Some(marker) = old_path.rfind(":2,") else {
         return false;
     };
-    old_path.as_bytes()[marker + 3..]
-        .iter()
-        .all(|b| MAILDIR_FLAG_LETTERS.contains(b))
+    is_maildir_flags(&old_path[marker + 3..])
 }
 
 /// Whether the file at `path` is the one a process named `comm` runs from. A
