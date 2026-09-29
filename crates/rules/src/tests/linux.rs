@@ -1072,6 +1072,33 @@ fn maildir_delivery_with_dovecot_keywords_does_not_alert() {
 }
 
 #[test]
+fn a_maildir_shaped_suffix_outside_a_new_to_cur_move_still_alerts() {
+    // #526 review: `:2,` plus lowercase letters is a free extension for an encryptor, so
+    // the suffix alone must not exclude a rename; only a `new/` -> `cur/` move does.
+    for (from, to) in [
+        ("/home/u/docs/{i}.docx", "/home/u/docs/{i}.docx:2,locked"),
+        ("/home/u/docs/{i}.docx", "/home/u/stash/{i}.docx:2,locked"),
+        ("/home/u/Maildir/cur/{i}", "/home/u/Maildir/new/{i}:2,Sa"),
+        ("/home/u/Maildir/new/{i}", "/home/u/Maildir/tmp/{i}:2,Sa"),
+        ("/home/u/A/new/{i}", "/home/u/B/cur/{i}:2,Sa"),
+    ] {
+        let mut state = RuleState::new();
+        let mut alerts = Vec::new();
+        for n in 0..RANSOMWARE_RENAME_THRESHOLD {
+            let id = format!("f{n}");
+            alerts.extend(state.on_file_rename(&file_rename_event_full(
+                9206,
+                "evil",
+                &from.replace("{i}", &id),
+                &to.replace("{i}", &id),
+                u64::from(n) * 100_000_000,
+            )));
+        }
+        assert_eq!(alerts.len(), 1, "{from} -> {to}");
+    }
+}
+
+#[test]
 fn a_keyword_before_a_standard_flag_is_not_a_maildir_suffix() {
     // The order keeps the gate tight: keywords never precede a standard flag.
     let mut state = RuleState::new();

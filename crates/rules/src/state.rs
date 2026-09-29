@@ -1064,7 +1064,7 @@ impl RuleState {
     /// same appended-suffix relation is read off the file *names* instead
     /// ([`appended_suffix`]). Same counters, same exclusions; the one new benign
     /// producer that shape brings in is the Maildir delivery move
-    /// (`new/msg` → `cur/msg:2,S`), excluded by [`is_maildir_info_suffix`].
+    /// (`new/msg` → `cur/msg:2,S`), excluded by [`is_maildir_delivery`].
     ///
     /// Shapes this rule still cannot see at all (write-new-then-unlink) need a
     /// separate open/delete correlation — still a follow-up, tracked in #512.
@@ -1074,7 +1074,7 @@ impl RuleState {
             || is_rotation_suffix(suffix)
             || self.is_in_place_edit_backup(event)
             || is_maildir_flag_change(&event.old_path, suffix)
-            || is_maildir_info_suffix(suffix)
+            || is_maildir_delivery(&event.old_path, &event.new_path, suffix)
         {
             return None;
         }
@@ -1386,6 +1386,23 @@ fn split_dir_base(path: &str) -> (&str, &str) {
 /// and there is no small fixed set of `comm` values to gate on.
 fn is_maildir_info_suffix(suffix: &str) -> bool {
     suffix.strip_prefix(":2,").is_some_and(is_maildir_flags)
+}
+
+/// True for a real Maildir delivery: a move from a `new` directory into the `cur`
+/// directory next to it, whose new name only appends a Maildir info suffix
+/// ([`is_maildir_info_suffix`]). The directory shape is part of the test, not just the
+/// suffix: `:2,` followed by lowercase keyword letters is a free, readable extension for
+/// an encryptor (`f.docx` → `f.docx:2,locked`), so the suffix alone must never exclude
+/// a rename (#526 review, found live on Alpine).
+fn is_maildir_delivery(old_path: &str, new_path: &str, suffix: &str) -> bool {
+    if !is_maildir_info_suffix(suffix) {
+        return false;
+    }
+    let (old_dir, _) = split_dir_base(old_path);
+    let (new_dir, _) = split_dir_base(new_path);
+    let (old_parent, old_leaf) = split_dir_base(old_dir);
+    let (new_parent, new_leaf) = split_dir_base(new_dir);
+    old_leaf == "new" && new_leaf == "cur" && old_parent == new_parent
 }
 
 /// True for what follows `:2,` in a Maildir info suffix: the standard flag letters
