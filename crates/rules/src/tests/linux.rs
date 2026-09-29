@@ -1016,6 +1016,20 @@ fn in_place_edit_backup_with_no_known_path_at_all_fails_closed() {
 }
 
 #[test]
+fn a_trusted_binary_that_renames_its_comm_to_sed_still_alerts() {
+    // The system python3 (trusted path) calling prctl(PR_SET_NAME, "sed") passes the
+    // path gate but is not a binary named sed, at exec time or via the rename-time path.
+    for (exec_image, exe_path) in [
+        (Some("/usr/bin/python3"), None),
+        (None, Some("/usr/bin/python3")),
+    ] {
+        let alerts = in_place_edit_burst_after_exec(exec_image, exe_path);
+        assert_eq!(alerts.len(), 1, "{exec_image:?} / {exe_path:?}");
+        assert_eq!(alerts[0].technique, "T1486");
+    }
+}
+
+#[test]
 fn in_place_edit_backup_from_an_untrusted_path_still_alerts() {
     // The evidence gate's actual job: an encryptor can set comm="sed" for
     // free, but not make its own binary live under a trusted system prefix.

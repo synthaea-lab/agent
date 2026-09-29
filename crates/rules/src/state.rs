@@ -1335,7 +1335,15 @@ impl RuleState {
             .peek(&event.meta.pid)
             .map(String::as_str)
             .or(event.executable_path.as_deref());
-        matches!(path, Some(p) if !p.is_empty() && policy::name_exclusion_applies(Some(p)))
+        // A trusted path is not enough on its own: the system `python3` can set its own
+        // `comm` to `sed` (`prctl(PR_SET_NAME)`) and would inherit the exclusion. What
+        // an encryptor cannot fake is that the trusted binary it runs is *called* `comm`.
+        matches!(
+            path,
+            Some(p) if !p.is_empty()
+                && policy::name_exclusion_applies(Some(p))
+                && written_file_is(p, &event.meta.comm)
+        )
     }
 }
 
