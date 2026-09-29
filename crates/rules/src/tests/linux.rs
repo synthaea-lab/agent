@@ -434,6 +434,20 @@ fn unrelated_exec_does_not_match_download() {
     assert!(alerts.is_empty());
 }
 
+#[test]
+fn beacon_ignores_the_unspecified_address_probe() {
+    // Live on the lab VM (2026-09-29): sshd-session connects to 0.0.0.0:65535 and
+    // :::65535 on every login, so three SSH logins in a minute raised T1071/T1041.
+    let mut state = RuleState::new();
+    for i in 0..5u64 {
+        let v4 = connect_event_full(400, "sshd-session", [0, 0, 0, 0], 65535, i * 1_000_000_000);
+        assert!(state.on_connect(&v4).is_empty());
+        let mut v6 = v4.clone();
+        v6.daddr = std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
+        assert!(state.on_connect(&v6).is_empty());
+    }
+}
+
 // ── BEACON via conntrack polling (issue #92, NetworkFlowEvent) ──────────────────
 
 #[test]
