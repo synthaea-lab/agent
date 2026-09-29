@@ -1257,6 +1257,58 @@ fn in_place_edit_backup_with_no_known_path_at_all_fails_closed() {
 }
 
 #[test]
+fn a_trusted_binary_that_renames_its_comm_to_sed_still_alerts() {
+    // The system python3 (trusted path) calling prctl(PR_SET_NAME, "sed") passes the
+    // path gate but is not a binary named sed, at exec time or via the rename-time path.
+    for (exec_image, exe_path) in [
+        (Some("/usr/bin/python3"), None),
+        (None, Some("/usr/bin/python3")),
+    ] {
+        let alerts = in_place_edit_burst_after_exec(exec_image, exe_path);
+        assert_eq!(alerts.len(), 1, "{exec_image:?} / {exe_path:?}");
+        assert_eq!(alerts[0].technique, "T1486");
+    }
+}
+
+/// The `sed -i.bak`-shaped burst for an arbitrary tool: `comm` and the exec-time image.
+fn in_place_edit_burst_as(comm: &str, exec_image: &str, suffix: &str) -> Vec<crate::Alert> {
+    let mut state = RuleState::new();
+    state.on_exec(&memfd_exec_event(9210, comm, exec_image, 0));
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9210,
+            comm,
+            &format!("/home/u/docs/f{i}.docx"),
+            &format!("/home/u/docs/f{i}.docx{suffix}"),
+            u64::from(i) * 100_000_000,
+        )));
+    }
+    alerts
+}
+
+#[test]
+fn the_real_perl_interpreter_is_not_excluded() {
+    // #528 review, live on Alpine: `/usr/bin/perl` at a trusted path, `comm=perl`,
+    // renaming in bulk to `.locked`. perl runs any script, so the tool's name is no
+    // evidence of what it is doing; sed's `-i` can only write a backup copy.
+    let alerts = in_place_edit_burst_as("perl", "/usr/bin/perl", ".locked");
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+    // The rename-to-`.bak` shape (perl older than 5.28) alerts too now: the accepted cost
+    // of not trusting an interpreter. Current perl never produces it.
+    assert_eq!(
+        in_place_edit_burst_as("perl", "/usr/bin/perl", ".bak").len(),
+        1
+    );
+}
+
+#[test]
+fn the_real_sed_stays_excluded_for_a_backup_suffix() {
+    assert!(in_place_edit_burst_as("sed", "/usr/bin/sed", ".bak").is_empty());
+}
+
+#[test]
 fn in_place_edit_backup_from_an_untrusted_path_still_alerts() {
     // The evidence gate's actual job: an encryptor can set comm="sed" for
     // free, but not make its own binary live under a trusted system prefix.
