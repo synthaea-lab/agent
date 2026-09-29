@@ -94,9 +94,39 @@ pub enum ClientError {
         source: std::io::Error,
     },
 
+    /// The agent is running but will not talk to this process: the OS
+    /// refused to open its endpoint (the pipe's DACL on Windows, the
+    /// socket's permissions on Unix) or the agent's peer-auth check
+    /// answered `Unauthorized`. Per ADR-0010 only root / an elevated
+    /// Administrators token may connect (#421: this used to read "Is the
+    /// agent running?" or a bare `Unauthorized`).
+    #[error(
+        "the agent at `{endpoint}` refused this client: permission denied. \
+         Run it as root (Unix) or from an elevated Administrator prompt (Windows)"
+    )]
+    AccessDenied {
+        /// The endpoint the client tried to connect to.
+        endpoint: String,
+    },
+
+    /// The agent closed the connection during the handshake, before any
+    /// reply could be read. It does exactly that right after sending
+    /// `Unauthorized` to a peer it turns away, so a client can lose the
+    /// race and never see the reply (#421, `os error 232` on Windows):
+    /// most likely a refused client, reported as such without claiming it.
+    #[error(
+        "the agent at `{endpoint}` closed the connection during the handshake, \
+         which is how it turns away a client it does not authorize. \
+         Run it as root (Unix) or from an elevated Administrator prompt (Windows)"
+    )]
+    HandshakeClosed {
+        /// The endpoint the client tried to connect to.
+        endpoint: String,
+    },
+
     /// The connection was established but the server refused the client:
-    /// unauthorized peer, unsupported protocol version, or a bad-request
-    /// response the client cannot recover from.
+    /// unsupported protocol version, or a bad-request response the client
+    /// cannot recover from. An unauthorized peer is [`Self::AccessDenied`].
     #[error("agent refused the connection: {0}")]
     Refused(String),
 
