@@ -14,15 +14,16 @@ use store::BoundedMap;
 use crate::{
     Alert,
     exclusions::{
-        AGENT_CHILD_EXCLUSIONS, AUTH_FAILURE_THRESHOLD, AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD,
-        BEACON_WINDOW_NS, BROWSERS, BURST_WRITE_BYTES_THRESHOLD, DOWNLOAD_EXEC_WINDOW_NS,
-        DOWNLOADER_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MEMFD_EXEC_WINDOW_NS,
-        QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX,
-        RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD,
-        SCAN_SPREAD_WINDOW_NS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
-        SELF_SPAWN_THRESHOLD, SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS,
-        SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN,
-        TASK_REGISTRATION_DEDUP_WINDOW_NS,
+        AGENT_CHILD_EXCLUSIONS, APK_STAGING_FILE_PREFIX, AUTH_FAILURE_THRESHOLD,
+        AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD, BEACON_WINDOW_NS, BROWSERS,
+        BURST_WRITE_BYTES_THRESHOLD, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS,
+        LOLBIN_LEGIT_PARENTS, LOLBINS, MEMFD_EXEC_WINDOW_NS, PACKAGE_MANAGER_COMMS,
+        PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES, QUARANTINE_EXEC_WINDOW_NS,
+        RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD,
+        RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
+        SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_THRESHOLD,
+        SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STANDARD_PORTS,
+        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
     },
     has_write_intent,
     sliding::{FlowPortDedup, SlidingCounter, SlidingDistinct, SlidingSum},
@@ -1147,18 +1148,37 @@ impl RuleState {
 
     /// Second, independent T1486 signal (issue #82): heavy write volume alongside
     /// a rename burst, regardless of whether the rename shape matched
-    /// `check_mass_rename_pattern`'s prefix-preserving pattern — catches an
-    /// encryptor that writes-new-then-unlinks or otherwise doesn't keep the
-    /// original name as a prefix of the new one.
+    /// `check_mass_rename_pattern`'s prefix-preserving pattern — catches a
+    /// renamed-over-the-original-name encryptor shape that check's
+    /// suffix-appending model doesn't.
+    ///
+    /// Only ever runs on `FileRenameEvent` (dispatched from `on_file_rename`,
+    /// never on an unlink) — despite an earlier version of this doc's claim to
+    /// catch a "writes-new-then-unlinks" shape, no unlink telemetry feeds this
+    /// at all (review finding, #496). `bytes_written` comes from
+    /// `FileWriteEvent::bytes_requested`, which `sensor-linux-ebpf`'s
+    /// `sys_enter_write` hook records for every `write(2)` regardless of what
+    /// the fd refers to — a regular file, a socket, a pipe — so a chatty
+    /// network/IPC-heavy process's write volume counts the same as real disk
+    /// writes toward this total. Both caveats are honest gaps, not yet closed.
     ///
     /// Deliberately no name-keyed exclusion here: `FileRenameEvent`/`FileWriteEvent`
     /// carry no executable path (same gap `check_mass_rename_pattern`'s doc
     /// describes, tracked in #459), so a `comm`-only exclusion would be spoofable.
     /// `RANSOMWARE_EXCLUDED_PATH_PREFIXES` is path-based, not name-based, and stays.
+    /// [`is_package_manager_temp_rename`] requires both the filename shape and
+    /// `comm` to match a known package manager (#496, hardened per #500
+    /// review): the shape alone — staging heavy writes under `foo.dpkg-new`
+    /// then renaming it onto `foo` — previously cleared both gates below and
+    /// false-positived T1486, but the shape by itself is just a naming
+    /// convention the renaming process controls; requiring `comm` too raises
+    /// the bar to also impersonating the specific package manager it belongs
+    /// to, not just picking a suffix.
     fn check_burst_write_volume(&mut self, event: &FileRenameEvent) -> Option<Alert> {
         if RANSOMWARE_EXCLUDED_PATH_PREFIXES
             .iter()
             .any(|prefix| event.new_path.starts_with(prefix))
+            || is_package_manager_temp_rename(&event.old_path, &event.new_path, &event.meta.comm)
         {
             return None;
         }
@@ -1248,6 +1268,40 @@ fn is_proc_fd_path(path: &str) -> bool {
         return false;
     };
     (pid_or_self == "self" || is_all_digits(pid_or_self)) && is_all_digits(fd)
+}
+
+/// True when `old_path` is `new_path` with one of
+/// [`PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES`] appended *and* `comm` is one of
+/// [`PACKAGE_MANAGER_COMMS`] — the package-manager "stage under a temp name,
+/// then rename over the real one" shape `check_burst_write_volume` excludes
+/// (#496), corroborated by which process is doing it (#500 review) so the
+/// filename convention alone isn't a free pass. The path relationship is the
+/// reverse of [`is_rotation_suffix`]'s callers (`new_path` = `old_path` +
+/// suffix): here the suffix is on the *old* name.
+fn is_package_manager_temp_rename(old_path: &str, new_path: &str, comm: &str) -> bool {
+    PACKAGE_MANAGER_COMMS.contains(&comm)
+        && (old_path
+            .strip_prefix(new_path)
+            .is_some_and(|suffix| PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES.contains(&suffix))
+            || is_apk_staging_rename(old_path, new_path))
+}
+
+/// True for apk-tools' real staging shape (#500 review, Jihair): `old_path`
+/// sits in the same directory as `new_path` (not derived from it by suffix —
+/// see [`APK_STAGING_FILE_PREFIX`]'s doc) and its basename is that prefix
+/// followed by a hex digest, e.g. `usr/bin/.apk.e9a41015…` ->
+/// `usr/bin/c89`. Splits on the last `/` rather than comparing absolute
+/// prefixes because apk's renames are relative to a directory fd
+/// (`renameat`), so there's no leading `/` to anchor on — `usr/bin/foo` and
+/// `bin/foo` must both work, and no separator at all means "current
+/// directory" for both sides equally.
+fn is_apk_staging_rename(old_path: &str, new_path: &str) -> bool {
+    let (old_dir, old_base) = old_path.rsplit_once('/').unwrap_or(("", old_path));
+    let (new_dir, _) = new_path.rsplit_once('/').unwrap_or(("", new_path));
+    old_dir == new_dir
+        && old_base
+            .strip_prefix(APK_STAGING_FILE_PREFIX)
+            .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Whether the file at `path` is the one a process named `comm` runs from. A

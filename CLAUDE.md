@@ -18,8 +18,8 @@ never copied (`docs/README.md` has the index).
 - `policy` sits next to `schema` as the base tier (shared agent/server types); it
   depends only on `schema`, everything else may depend on both.
 - Sensor crates (`crates/sensors/*`) depend **only** on `schema`.
-- Detection crates (`rules`, `sigma`, `correlator`, `ml`, `yara`, `enrich`) depend on
-  the base tier, each other, and `store` — **never on a sensor**.
+- Detection crates (`rules`, `sigma`, `correlator`, `verdict`, `ml`, `yara`, `enrich`)
+  depend on the base tier, each other, and `store` — **never on a sensor**.
 - Leaf crates (`response`, `transport`, `ipc`, `sinks`, `updater`, `config`, `store`,
   `conformance`) depend only on the base tier.
 - Only the binaries (`agent/`, `watchdog/`, `cli/`) may depend on everything.
