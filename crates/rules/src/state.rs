@@ -1357,9 +1357,12 @@ fn appended_suffix<'a>(old_path: &str, new_path: &'a str) -> Option<&'a str> {
     if let Some(suffix) = new_path.strip_prefix(old_path) {
         return Some(suffix);
     }
-    let (old_dir, old_base) = split_dir_base(old_path);
-    let (new_dir, new_base) = split_dir_base(new_path);
-    if old_dir == new_dir || old_base.is_empty() {
+    let old_base = split_dir_base(old_path).1;
+    let new_base = split_dir_base(new_path).1;
+    // No `old_dir == new_dir` shortcut: with equal directories the literal prefix test
+    // above only fails when the separators differ (`dir/a` vs `dir\a.locked`), and the
+    // base-name comparison below is exactly what must still run then.
+    if old_base.is_empty() {
         return None;
     }
     new_base.strip_prefix(old_base)
@@ -1382,9 +1385,20 @@ fn split_dir_base(path: &str) -> (&str, &str) {
 /// [`is_maildir_flag_change`], for the same reason: the alphabet is a tight shape
 /// and there is no small fixed set of `comm` values to gate on.
 fn is_maildir_info_suffix(suffix: &str) -> bool {
-    suffix
-        .strip_prefix(":2,")
-        .is_some_and(|flags| flags.bytes().all(|b| MAILDIR_FLAG_LETTERS.contains(&b)))
+    suffix.strip_prefix(":2,").is_some_and(is_maildir_flags)
+}
+
+/// True for what follows `:2,` in a Maildir info suffix: the standard flag letters
+/// ([`MAILDIR_FLAG_LETTERS`]) and then, optionally, Dovecot's IMAP keywords, which it
+/// stores as lowercase `a`-`z` after them (`:2,Sa`, `:2,RSab`; Thunderbird tags,
+/// `$Label1`, Junk/NonJunk). Delivering or tagging 20+ messages raised T1486 on the
+/// standard alphabet alone (#526 review, live on Alpine). The order keeps the shape
+/// tight: keywords never precede a standard flag.
+fn is_maildir_flags(flags: &str) -> bool {
+    let keywords = flags.trim_start_matches(|c: char| {
+        u8::try_from(c).is_ok_and(|b| MAILDIR_FLAG_LETTERS.contains(&b))
+    });
+    keywords.bytes().all(|b| b.is_ascii_lowercase())
 }
 
 /// True for `check_mass_rename_pattern`'s Maildir-flag-change false positive
@@ -1403,15 +1417,13 @@ fn is_maildir_info_suffix(suffix: &str) -> bool {
 /// already a tight structural signal on its own, the same class of reasoning
 /// [`is_rotation_suffix`]'s all-digit check relies on.
 fn is_maildir_flag_change(old_path: &str, suffix: &str) -> bool {
-    if suffix.is_empty() || !suffix.bytes().all(|b| MAILDIR_FLAG_LETTERS.contains(&b)) {
+    if suffix.is_empty() || !is_maildir_flags(suffix) {
         return false;
     }
     let Some(marker) = old_path.rfind(":2,") else {
         return false;
     };
-    old_path.as_bytes()[marker + 3..]
-        .iter()
-        .all(|b| MAILDIR_FLAG_LETTERS.contains(b))
+    is_maildir_flags(&old_path[marker + 3..])
 }
 
 /// Whether the file at `path` is the one a process named `comm` runs from. A

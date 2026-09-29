@@ -1045,6 +1045,67 @@ fn maildir_flag_change_does_not_alert() {
 }
 
 #[test]
+fn maildir_delivery_with_dovecot_keywords_does_not_alert() {
+    // #526 review, live on Alpine: Dovecot keeps IMAP keywords as lowercase letters after
+    // the standard flags (`:2,Sa`, `:2,RSab`); delivering or tagging 20+ messages must
+    // not look like an encryptor, cross-directory or in place.
+    for (from, to) in [
+        ("new/{i}", "cur/{i}:2,Sa"),
+        ("new/{i}", "cur/{i}:2,RSab"),
+        ("cur/{i}:2,S", "cur/{i}:2,Sa"),
+        ("cur/{i}:2,S", "cur/{i}:2,Sab"),
+    ] {
+        let mut state = RuleState::new();
+        let mut alerts = Vec::new();
+        for n in 0..RANSOMWARE_RENAME_THRESHOLD * 2 {
+            let id = format!("171{n}.eml");
+            alerts.extend(state.on_file_rename(&file_rename_event_full(
+                9203,
+                "imap",
+                &format!("/home/u/Maildir/{}", from.replace("{i}", &id)),
+                &format!("/home/u/Maildir/{}", to.replace("{i}", &id)),
+                u64::from(n) * 100_000_000,
+            )));
+        }
+        assert!(alerts.is_empty(), "{from} -> {to}");
+    }
+}
+
+#[test]
+fn a_keyword_before_a_standard_flag_is_not_a_maildir_suffix() {
+    // The order keeps the gate tight: keywords never precede a standard flag.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for n in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9204,
+            "evil",
+            &format!("/home/u/Maildir/new/171{n}.eml"),
+            &format!("/home/u/Maildir/cur/171{n}.eml:2,aS"),
+            u64::from(n) * 100_000_000,
+        )));
+    }
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn a_same_directory_rename_with_mixed_separators_is_still_seen() {
+    // Windows sensors can report one directory with `/` and `\` mixed (#526 review).
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for n in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9205,
+            "enc.exe",
+            &format!(r"C:\Users\u\Documents/f{n}.docx"),
+            &format!(r"C:\Users\u\Documents\f{n}.docx.locked"),
+            u64::from(n) * 100_000_000,
+        )));
+    }
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
 fn maildir_shaped_rename_with_an_invalid_flag_letter_still_alerts() {
     // The structural gate must be tight: "X" is not a Maildir flag letter, so
     // this must not be mistaken for the benign shape.
