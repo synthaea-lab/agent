@@ -108,12 +108,13 @@
 //! techniques even on a host where the audit subcategory for 4698 was left
 //! disabled:
 //!
-//! - **`AppLocker` EXE/DLL block** (`Microsoft-Windows-AppLocker/EXE and DLL`
-//!   channel, event **8004**): an executable was refused execution by
-//!   `AppLocker` policy. Reported as `FileOpenEvent` with
-//!   `schema::FLAG_APPLICATION_BLOCKED` — a defensive signal (a known-bad
-//!   payload stopped at the OS boundary), not a persistence artifact, so it
-//!   takes its own flag rather than reusing a `FLAG_PERSISTENCE_*` bit.
+//! - **`AppLocker` EXE/DLL verdicts** (`Microsoft-Windows-AppLocker/EXE and DLL`
+//!   channel, events **8004** and **8003**): an executable or DLL was refused
+//!   by `AppLocker` policy (8004), or would have been in audit mode (8003).
+//!   Reported as `schema::PolicyDenialEvent` with
+//!   `schema::POLICY_MECHANISM_APPLOCKER` (#427) — `enforced` tells the two
+//!   apart, `object_path` carries the expanded image path. A defensive
+//!   signal, not a persistence artifact.
 //! - **Task Scheduler Operational — task registered**
 //!   (`Microsoft-Windows-TaskScheduler/Operational` channel, event **106**):
 //!   the always-on complement to Security 4698. Emitted whenever any scheduled

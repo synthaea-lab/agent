@@ -18,9 +18,10 @@ use std::{
 };
 
 use schema::{
-    AuthEvent, AuthKind, AuthOutcome, Event, EventMeta, FLAG_APPLICATION_BLOCKED,
-    FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT, FLAG_PERSISTENCE_TASK_ARTIFACT,
-    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, User,
+    AuthEvent, AuthKind, AuthOutcome, Event, EventMeta, FLAG_PERSISTENCE_ACCOUNT_ARTIFACT,
+    FLAG_PERSISTENCE_ARTIFACT, FLAG_PERSISTENCE_TASK_ARTIFACT,
+    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, POLICY_MECHANISM_APPLOCKER,
+    PolicyDenialEvent, User,
     sensor::{Capabilities, EventSink, Sensor, SensorError},
     time::now_ns,
 };
@@ -566,7 +567,7 @@ static ACCOUNT_CREATIONS: PollTarget = PollTarget {
     enabled: |c| c.account_creations_enabled,
 };
 
-// ── Event 8004 — `AppLocker` EXE/DLL block (Microsoft-Windows-AppLocker/EXE and DLL) ───
+// ── Events 8003/8004 — `AppLocker` EXE/DLL audit/block (Microsoft-Windows-AppLocker/EXE and DLL)
 //
 // `AppLocker`'s operational channel is **enabled by default** on modern Windows
 // SKUs that ship `AppLocker`: unlike 4698, no `auditpol` toggle is involved
@@ -575,40 +576,64 @@ static ACCOUNT_CREATIONS: PollTarget = PollTarget {
 // returns nothing and this poll thread stays idle — the failure mode is a
 // coverage gap, not a crash.
 
-/// Filename-only leaf of an `AppLocker` `FilePath`, which is upper-cased and
-/// backslash-separated (e.g. `%OSDRIVE%\USERS\X\DOWNLOADS\POWERSHELL.EXE`).
-/// Returns the trailing segment lowercased for `comm`.
-fn applocker_leaf_name(path: &str) -> String {
-    path.rsplit(&['\\', '/'][..])
-        .next()
-        .unwrap_or(path)
-        .to_ascii_lowercase()
-}
+/// `AppLocker` event id for "blocked" (enforce mode).
+const APPLOCKER_EVENT_BLOCKED: u32 = 8004;
+/// `AppLocker` event id for "allowed, but would have been blocked" (audit
+/// mode). Same payload shape as 8004.
+const APPLOCKER_EVENT_AUDITED: u32 = 8003;
 
-/// An 8004 without a `FilePath` cannot carry a persistence artifact — nothing
-/// to hand to the sink. Skip, advancing the cursor.
+/// Normalizes an `AppLocker` 8003/8004 into a [`PolicyDenialEvent`] (#427):
+/// 8004 is an enforced denial, 8003 an audit-mode one (`enforced: false`) —
+/// the `SELinux` enforcing/permissive split, which is what lets a rule tell
+/// "stopped at the OS boundary" from "ran, and policy only noticed".
 ///
-/// The path is expanded from `AppLocker`'s path variables
-/// (`%OSDRIVE%\USERS\...` → `C:\USERS\...`) so path-based rules can match
-/// it, and the blocked user's SID lands in `meta.user` (#427). Still a
-/// `FileOpenEvent` for now; the move to `PolicyDenialEvent` is #427's
-/// schema step.
+/// - `object_path`: `FilePath`, expanded from `AppLocker`'s path variables
+///   (`%OSDRIVE%\USERS\...` → `C:\USERS\...`) so path-based rules can match it.
+/// - `object_class`: the rule collection (`EXE`, `DLL`), as reported.
+/// - `action`: `execute` — the only operation these two collections gate.
+/// - `meta.pid`: `TargetProcessId`, the process that tried to launch the image.
+/// - `meta.user`: `TargetUser`, the SID whose execution was refused.
+/// - `meta.comm`: empty. The event names the *object* (the refused image),
+///   not the acting process; putting the image's leaf name there — as the
+///   pre-#427 `FileOpenEvent` did — would attribute the attempt to the very
+///   binary that never ran.
+///
+/// Skipped (cursor still advances): a block without `FilePath` (nothing to
+/// attribute), and any event id other than 8003/8004 the `XPath` filter let
+/// through — don't guess a verdict for an event we haven't seen the shape of.
 fn normalize_applocker_block(block: &str) -> ParsedBlock {
     let ev = xml::parse_applocker_event(block)?;
     let record_id = ev.record_id;
+    let enforced = match ev.event_id {
+        APPLOCKER_EVENT_BLOCKED => true,
+        APPLOCKER_EVENT_AUDITED => false,
+        _ => return Some((record_id, None)),
+    };
     if ev.file_path.is_empty() {
         return Some((record_id, None));
     }
     let path = xml::expand_applocker_path(&ev.file_path, |name| std::env::var(name).ok());
-    let comm = applocker_leaf_name(&path);
-    let mut event =
-        persistence_file_open(ev.target_process_id, comm, path, FLAG_APPLICATION_BLOCKED);
-    if let (Event::FileOpen(open), Some(sid)) = (&mut event, ev.target_user) {
-        open.meta.user = User::Windows {
-            sid,
-            integrity_level: None,
-        };
-    }
+    let user = ev.target_user.map_or(User::Unknown, |sid| User::Windows {
+        sid,
+        integrity_level: None,
+    });
+    let event = Event::PolicyDenial(PolicyDenialEvent {
+        meta: EventMeta {
+            pid: ev.target_process_id,
+            ppid: 0,
+            user,
+            timestamp_ns: now_ns(),
+            comm: String::new(),
+            container: None, // Windows: no container support
+        },
+        mechanism: POLICY_MECHANISM_APPLOCKER.into(),
+        subject_context: None,
+        object_context: None,
+        object_class: Some(ev.policy_name).filter(|p| !p.is_empty()),
+        action: Some("execute".into()),
+        enforced,
+        object_path: Some(path),
+    });
     Some((record_id, Some(event)))
 }
 
@@ -616,7 +641,7 @@ static APPLOCKER_BLOCKS: PollTarget = PollTarget {
     label: "applocker-block",
     heartbeat: "windows-eventlog:applocker-block",
     channel: "Microsoft-Windows-AppLocker/EXE and DLL",
-    id_filter: "EventID=8004",
+    id_filter: "EventID=8003 or EventID=8004",
     counter: |c| &c.applocker_blocks,
     parse_block: normalize_applocker_block,
     // No audit-subcategory toggle: `AppLocker`'s channel is on when `AppLocker` is
@@ -771,7 +796,8 @@ pub struct EventLogConfig {
     pub account_creations_enabled: bool,
     /// Events 4624/4625/4648/4672 (logon/session, #94).
     pub logon_events_enabled: bool,
-    /// Event 8004 (T1562.001-adjacent — `AppLocker` EXE/DLL block).
+    /// Events 8004 (block) and 8003 (audit mode) — `AppLocker` EXE/DLL
+    /// verdicts, reported as `PolicyDenialEvent` (#427).
     /// `Microsoft-Windows-AppLocker/EXE and DLL` operational channel.
     pub applocker_blocks_enabled: bool,
     /// Event 106 (T1053.005 — scheduled task registered via the
@@ -918,8 +944,11 @@ impl Sensor for EventLogSensor {
             file_events: self.config.service_installs_enabled
                 || self.config.scheduled_tasks_enabled
                 || self.config.account_creations_enabled
-                || self.config.applocker_blocks_enabled
                 || self.config.task_scheduler_op_enabled,
+            // `AppLocker` (8003/8004) is deliberately absent: it emits
+            // `PolicyDenialEvent`, not `FileOpenEvent` (#427), and
+            // `Capabilities` has no policy-denial field yet — same as the
+            // Linux audit sensor's `SELinux` AVC path.
             auth_events: self.config.logon_events_enabled,
             ..Capabilities::default()
         }
@@ -1093,7 +1122,9 @@ mod config_tests {
     }
 
     #[test]
-    fn applocker_alone_still_sets_file_events() {
+    fn applocker_alone_no_longer_sets_file_events() {
+        // #427: `AppLocker` verdicts are `PolicyDenialEvent`s now, not
+        // `FileOpenEvent`s — declaring `file_events` would be a false claim.
         let sensor = EventLogSensor::with_config(EventLogConfig {
             service_installs_enabled: false,
             scheduled_tasks_enabled: false,
@@ -1103,7 +1134,7 @@ mod config_tests {
             task_scheduler_op_enabled: false,
             transport: EventLogTransport::default(),
         });
-        assert!(sensor.capabilities().file_events);
+        assert!(!sensor.capabilities().file_events);
     }
 
     #[test]
@@ -1387,33 +1418,73 @@ mod scheduled_task_tests {
 mod applocker_tests {
     use super::*;
 
-    #[test]
-    fn applocker_block_carries_the_expanded_path_and_the_blocked_user() {
-        let block = "<Event><System><EventID>8004</EventID><EventRecordID>7</EventRecordID></System>\
+    fn applocker_block(event_id: u32) -> String {
+        format!(
+            "<Event><System><EventID>{event_id}</EventID><EventRecordID>7</EventRecordID></System>\
             <UserData><RuleAndFileData><PolicyName>EXE</PolicyName>\
             <TargetUser>S-1-5-21-1-2-3-1001</TargetUser><TargetProcessId>42</TargetProcessId>\
-            <FilePath>%OSDRIVE%\\USERS\\X\\EVIL.EXE</FilePath></RuleAndFileData></UserData></Event>";
-        let (record_id, event) = normalize_applocker_block(block).expect("should parse");
+            <FilePath>%OSDRIVE%\\USERS\\X\\EVIL.EXE</FilePath></RuleAndFileData></UserData></Event>"
+        )
+    }
+
+    fn policy_denial(event_id: u32) -> PolicyDenialEvent {
+        let (record_id, event) =
+            normalize_applocker_block(&applocker_block(event_id)).expect("should parse");
         assert_eq!(record_id, 7);
-        let Some(Event::FileOpen(open)) = event else {
-            panic!("expected a FileOpen event");
+        let Some(Event::PolicyDenial(denial)) = event else {
+            panic!("expected a PolicyDenial event, got {event:?}");
         };
+        denial
+    }
+
+    #[test]
+    fn applocker_8004_is_an_enforced_policy_denial() {
+        let denial = policy_denial(8004);
+        assert_eq!(denial.mechanism, POLICY_MECHANISM_APPLOCKER);
+        assert!(denial.enforced);
+        assert_eq!(denial.object_class.as_deref(), Some("EXE"));
+        assert_eq!(denial.action.as_deref(), Some("execute"));
+        let path = denial.object_path.expect("object_path");
         assert!(
-            !open.path.starts_with('%'),
-            "path variable left unexpanded: {}",
-            open.path
+            !path.starts_with('%'),
+            "path variable left unexpanded: {path}"
         );
-        assert!(open.path.ends_with("\\USERS\\X\\EVIL.EXE"), "{}", open.path);
-        assert_eq!(open.meta.comm, "evil.exe");
-        assert_eq!(open.meta.pid, 42);
-        assert_eq!(open.flags, FLAG_APPLICATION_BLOCKED);
+        assert!(path.ends_with("\\USERS\\X\\EVIL.EXE"), "{path}");
+        assert_eq!(denial.meta.pid, 42);
+        assert!(
+            denial.meta.comm.is_empty(),
+            "comm must not name the refused image: {}",
+            denial.meta.comm
+        );
         assert_eq!(
-            open.meta.user,
+            denial.meta.user,
             User::Windows {
                 sid: "S-1-5-21-1-2-3-1001".into(),
                 integrity_level: None,
             }
         );
+    }
+
+    #[test]
+    fn applocker_8003_is_an_audit_mode_policy_denial() {
+        let denial = policy_denial(8003);
+        assert_eq!(denial.mechanism, POLICY_MECHANISM_APPLOCKER);
+        assert!(!denial.enforced);
+    }
+
+    #[test]
+    fn applocker_unknown_event_id_is_skipped_but_advances_the_cursor() {
+        let (record_id, event) =
+            normalize_applocker_block(&applocker_block(8002)).expect("should parse");
+        assert_eq!(record_id, 7);
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn applocker_without_file_path_is_skipped() {
+        let block = "<Event><System><EventID>8004</EventID><EventRecordID>9</EventRecordID></System>\
+            <UserData><RuleAndFileData><PolicyName>EXE</PolicyName></RuleAndFileData></UserData></Event>";
+        assert_eq!(normalize_applocker_block(block), Some((9, None)));
     }
 }
 
