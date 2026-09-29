@@ -95,6 +95,9 @@ const MACOS_PATHS_PENDING_REVIEW: &str = "T1037.004/T1053.003";
 /// persistence arrives with registry telemetry, M3).
 const PERSISTENCE_PATH_PATTERNS: &[(&str, &str)] = &[
     (UNIX_SHELL_CONFIG_MODIFICATION, ".bashrc"),
+    // zsh config is the same technique as bash's, and zsh runs on Linux as much as
+    // on macOS: this entry is not platform-gated (#499 review).
+    (UNIX_SHELL_CONFIG_MODIFICATION, ".zshrc"),
     (UNIX_SHELL_CONFIG_MODIFICATION, "/etc/profile.d/"),
     (CRON, "/etc/cron.d/"),
     (SYSTEMD_SERVICE, "/etc/systemd/system/"),
@@ -102,7 +105,6 @@ const PERSISTENCE_PATH_PATTERNS: &[(&str, &str)] = &[
     // (`~/Library/...`) and system (`/Library/...`) launchd directories alike.
     (MACOS_PATHS_PENDING_REVIEW, "/Library/LaunchAgents/"),
     (MACOS_PATHS_PENDING_REVIEW, "/Library/LaunchDaemons/"),
-    (MACOS_PATHS_PENDING_REVIEW, ".zshrc"),
     (MACOS_PATHS_PENDING_REVIEW, "/etc/periodic/"),
     // at(1) jobs — rare on modern macOS, which is exactly why a write there
     // is signal.

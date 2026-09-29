@@ -211,6 +211,7 @@ fn linux_persistence_paths_are_tagged_with_their_own_technique() {
     // them is an RC script (T1037.004).
     for (path, technique) in [
         ("/home/app/.bashrc", "T1546.004"),
+        ("/home/app/.zshrc", "T1546.004"),
         ("/etc/profile.d/evil.sh", "T1546.004"),
         ("/etc/cron.d/evil", "T1053.003"),
         ("/etc/systemd/system/evil.service", "T1543.002"),
