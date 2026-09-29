@@ -506,6 +506,25 @@ fn beacon_flow_same_local_port_repolled_does_not_alert() {
 }
 
 #[test]
+fn beacon_flow_ignores_the_unspecified_address_probe() {
+    // Same sshd-session probe as `beacon_ignores_the_unspecified_address_probe`,
+    // seen by conntrack polling: distinct local ports would otherwise count as
+    // distinct connections (#525 review).
+    let mut state = RuleState::new();
+    for (i, port) in (50000..50005u16).enumerate() {
+        let alerts = state.on_network_flow(&network_flow_event_full(
+            400,
+            "sshd-session",
+            port,
+            [0, 0, 0, 0],
+            65535,
+            i as u64 * 1_000_000_000,
+        ));
+        assert!(alerts.is_empty());
+    }
+}
+
+#[test]
 fn beacon_flow_standard_port_does_not_alert() {
     let mut state = RuleState::new();
     for (i, port) in (50000..50003u16).enumerate() {
