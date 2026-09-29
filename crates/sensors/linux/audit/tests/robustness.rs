@@ -61,6 +61,10 @@ fn never_panics_on_non_utf8_and_hostile_payloads() {
         b"msg=audit(99999999999999999999.999:9): k=v", // over-long integer
         b"msg=audit(1.2:3): key=\"unterminated",
         b"msg=audit(1.2:3): ==== \"\"\"\" =",
+        // The kernel's netlink form has no `msg=` prefix (#504).
+        b"audit(1.2:3): key=\"unterminated",
+        b"audit(): ",
+        b"audit(",
         &[0u8; 200],
     ];
     for payload in payloads {

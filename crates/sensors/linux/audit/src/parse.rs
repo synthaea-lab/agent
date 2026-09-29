@@ -1,6 +1,8 @@
 //! Parses raw audit netlink messages into structured records.
 //!
-//! Wire format: 16-byte binary nlmsghdr + text payload "msg=audit(timestamp:seq): key=value ..."
+//! Wire format: 16-byte binary nlmsghdr + text payload "audit(timestamp:seq): key=value ...".
+//! That is the kernel's netlink form; auditd's log lines prefix it with `type=… msg=`, and
+//! requiring that prefix here once failed on every real record (#504).
 //! The record type comes from `nlmsghdr.nlmsg_type`, not from a "type=" text prefix.
 
 use std::collections::{HashMap, HashSet};
@@ -51,7 +53,7 @@ pub fn parse_audit_message(raw: &[u8]) -> Result<AuditRecord, String> {
     let payload = &raw[NLMSGHDR_SIZE..];
     let msg = String::from_utf8_lossy(payload);
 
-    // Parse "msg=audit(1234567890.123:456):" from the text payload
+    // Parse "audit(1234567890.123:456):" from the text payload
     let (timestamp_sec, timestamp_ms, seq) = parse_msg_header(&msg)?;
 
     // Parse remaining "key=value" pairs
@@ -68,10 +70,11 @@ pub fn parse_audit_message(raw: &[u8]) -> Result<AuditRecord, String> {
 }
 
 fn parse_msg_header(msg: &str) -> Result<(u64, u32, u64), String> {
-    let msg_prefix = "msg=audit(";
+    // Also matches inside the `msg=audit(` log-file form.
+    let msg_prefix = "audit(";
     let msg_start = msg
         .find(msg_prefix)
-        .ok_or_else(|| "missing 'msg=audit(' header".to_string())?;
+        .ok_or_else(|| "missing 'audit(' header".to_string())?;
 
     let timestamp_start = msg_start + msg_prefix.len();
     let timestamp_end = msg[timestamp_start..]
@@ -113,7 +116,7 @@ fn parse_fields(msg: &str) -> Result<(HashMap<String, String>, HashSet<String>),
     let mut fields = HashMap::new();
     let mut unquoted_fields = HashSet::new();
 
-    // Find the end of the msg=audit(...): header
+    // Find the end of the audit(...): header
     let fields_start = msg.find("): ").map(|pos| pos + 3).unwrap_or(0);
 
     if fields_start == 0 || fields_start >= msg.len() {
@@ -247,6 +250,32 @@ mod tests {
         let record = parse_audit_message(&raw).unwrap();
         assert_eq!(record.fields.get("pid"), Some(&"1234".to_string()));
         assert_eq!(record.fields.get("uid"), Some(&"1000".to_string()));
+    }
+
+    #[test]
+    fn parses_the_kernel_netlink_form() {
+        // Regression (#504): an EXECVE record exactly as the kernel multicasts it
+        // on NETLINK_AUDIT (lab VM, Alpine 6.18.50). No `msg=` prefix.
+        let raw = build_wire_message(
+            1309,
+            "audit(1790588127.857:26): argc=7 a0=\"/bin/echo\" a1=\"probe491\" a2=\"6162\" \
+             a3=\"31323334\" a4=696420727361 a5=20 a6=\"cafe\"",
+        );
+        let record = parse_audit_message(&raw).unwrap();
+        assert_eq!(record.timestamp_sec, 1_790_588_127);
+        assert_eq!(record.timestamp_ms, 857);
+        assert_eq!(record.seq, 26);
+        assert_eq!(record.fields.get("argc"), Some(&"7".to_string()));
+        assert_eq!(record.fields.get("a0"), Some(&"/bin/echo".to_string()));
+        assert_eq!(record.fields.get("a4"), Some(&"696420727361".to_string()));
+    }
+
+    #[test]
+    fn still_parses_the_auditd_log_form() {
+        let raw = build_wire_message(1309, "type=EXECVE msg=audit(1000.5:7): argc=1 a0=\"id\"");
+        let record = parse_audit_message(&raw).unwrap();
+        assert_eq!(record.seq, 7);
+        assert_eq!(record.fields.get("a0"), Some(&"id".to_string()));
     }
 
     #[test]
