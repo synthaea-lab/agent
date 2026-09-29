@@ -1,0 +1,17 @@
+[package]
+name = "verdict"
+version = "0.1.0"
+description = "Cross-engine verdict fusion: one scored finding per entity (issue #131)"
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+schema = { path = "../schema" }
+store = { path = "../store" }
+
+[dev-dependencies]
+schema = { path = "../schema", features = ["test-fixtures"] }
