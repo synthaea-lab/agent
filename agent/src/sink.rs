@@ -62,7 +62,7 @@ pub(crate) struct DetectionSink {
     /// Budgeted background content scanning; `None` when
     /// `<content_root>/rules/yara` is absent. `Mutex`-wrapped for the same
     /// reload reason as `sigma`.
-    yara: Mutex<Option<yara::ScanQueue>>,
+    yara: Mutex<Option<(yara::ScanQueue, usize)>>,
     /// Enrichment (hash + signature) and the high-volume raw-event logging, off the
     /// drain thread (issue #126). The capture thread runs detection in memory and
     /// hands the event here with a non-blocking send.
@@ -180,10 +180,9 @@ impl DetectionSink {
             rule_state: Mutex::new(rule_state),
             correlator: Mutex::new(correlator::CorrelationEngine::new()),
             ml_scorer: Mutex::new(Self::load_correlation_scorer()),
-            sigma: Mutex::new(load_sigma_rules(&content_root)),
+            sigma: Mutex::new(load_sigma_rules(&content_root).into_option()),
             yara: Mutex::new(
-                start_yara(&content_root, alert_log.clone(), response.clone())
-                    .map(|(queue, _count)| queue),
+                start_yara(&content_root, alert_log.clone(), response.clone()).into_option(),
             ),
             alert_log,
             enrich_queue,
@@ -197,27 +196,56 @@ impl DetectionSink {
     /// Re-reads Sigma/YARA content from [`Self::content_root`] and swaps it
     /// into the running pipeline (issue #30, IPC `ReloadContent`) — the way
     /// content `agent apply-content-manifest` just downloaded and verified
-    /// takes effect without restarting the agent. A missing or absent
-    /// content subdirectory unloads that engine cleanly, same "not an
-    /// error" posture startup load has always had; a present-but-broken one
-    /// still logs via `tracing::error!` inside the load helpers and leaves
-    /// that engine unloaded, exactly as it would at startup.
+    /// takes effect without restarting the agent.
+    ///
+    /// An *absent* content subdirectory unloads that engine (same "not an
+    /// error" posture startup has always had). A present-but-*broken* one
+    /// keeps the previous engine running and is reported as failed: a bad
+    /// rule file must never leave a live agent without that engine, which
+    /// startup can afford (nothing was protecting yet) and a reload cannot.
+    /// Note the asymmetry in the engines' own loaders: YARA fails the whole
+    /// set on one bad rule, while Sigma skips (and warns about) an individual
+    /// bad rule, so a partly broken Sigma set loads *fewer* rules and is only
+    /// visible through the reported count.
     pub(crate) fn reload_content(&self) -> ReloadReport {
-        let sigma = load_sigma_rules(&self.content_root);
-        let sigma_rule_count = sigma.as_ref().map(sigma::SigmaEngine::rule_count);
-        *self.sigma.lock().unwrap() = sigma;
+        let mut sigma_slot = self.sigma.lock().unwrap();
+        let sigma_reload_failed = match load_sigma_rules(&self.content_root) {
+            Load::Loaded(engine) => {
+                *sigma_slot = Some(engine);
+                false
+            }
+            Load::Absent => {
+                *sigma_slot = None;
+                false
+            }
+            Load::Failed => true,
+        };
+        let sigma_rule_count = sigma_slot.as_ref().map(sigma::SigmaEngine::rule_count);
+        drop(sigma_slot);
 
-        let yara = start_yara(
+        let mut yara_slot = self.yara.lock().unwrap();
+        let yara_reload_failed = match start_yara(
             &self.content_root,
             self.alert_log.clone(),
             self.response.clone(),
-        );
-        let yara_rule_count = yara.as_ref().map(|(_, count)| *count);
-        *self.yara.lock().unwrap() = yara.map(|(queue, _)| queue);
+        ) {
+            Load::Loaded(loaded) => {
+                *yara_slot = Some(loaded);
+                false
+            }
+            Load::Absent => {
+                *yara_slot = None;
+                false
+            }
+            Load::Failed => true,
+        };
+        let yara_rule_count = yara_slot.as_ref().map(|(_, count)| *count);
 
         ReloadReport {
             sigma_rule_count,
             yara_rule_count,
+            sigma_reload_failed,
+            yara_reload_failed,
         }
     }
 
@@ -530,7 +558,7 @@ impl DetectionSink {
                 .chain(state_alerts),
         );
         if event.flags & 0o103 != 0
-            && let Some(yara) = self.yara.lock().unwrap().as_ref()
+            && let Some((yara, _)) = self.yara.lock().unwrap().as_ref()
         {
             yara.enqueue(std::path::PathBuf::from(&event.path));
         }
@@ -628,8 +656,31 @@ impl DetectionSink {
 /// What [`DetectionSink::reload_content`] (and, indirectly, [`DetectionSink::new`])
 /// reports about what's loaded after a (re)load.
 pub(crate) struct ReloadReport {
+    /// Rules loaded *after* the reload (the previous set if the reload failed).
     pub(crate) sigma_rule_count: Option<usize>,
     pub(crate) yara_rule_count: Option<usize>,
+    /// The content was present but failed to load; the previous engine kept running.
+    pub(crate) sigma_reload_failed: bool,
+    pub(crate) yara_reload_failed: bool,
+}
+
+/// Outcome of loading one content directory.
+enum Load<T> {
+    /// The directory does not exist — not an error.
+    Absent,
+    Loaded(T),
+    /// The directory exists but its content did not load (already logged).
+    Failed,
+}
+
+impl<T> Load<T> {
+    /// Startup posture: a broken directory leaves the engine unloaded.
+    fn into_option(self) -> Option<T> {
+        match self {
+            Self::Loaded(value) => Some(value),
+            Self::Absent | Self::Failed => None,
+        }
+    }
 }
 
 /// Resolves `content_dir` to an actual directory to load content from: next
@@ -656,19 +707,19 @@ fn resolve_content_root(content_dir: &Path) -> PathBuf {
 }
 
 /// Loads the Sigma content directory if present, under `content_root`.
-fn load_sigma_rules(content_root: &Path) -> Option<sigma::SigmaEngine> {
+fn load_sigma_rules(content_root: &Path) -> Load<sigma::SigmaEngine> {
     let rules_dir = content_root.join("rules/sigma");
     if !rules_dir.is_dir() {
-        return None;
+        return Load::Absent;
     }
     match sigma::SigmaEngine::load_dir(&rules_dir) {
         Ok(engine) => {
             tracing::info!(rules = engine.rule_count(), "sigma: rules loaded");
-            Some(engine)
+            Load::Loaded(engine)
         }
         Err(e) => {
             tracing::error!(error = %e, "sigma: load error");
-            None
+            Load::Failed
         }
     }
 }
@@ -685,10 +736,10 @@ fn start_yara(
     content_root: &Path,
     alert_log: Arc<AlertLog>,
     response: Arc<Mutex<Option<ResponseHooks>>>,
-) -> Option<(yara::ScanQueue, usize)> {
+) -> Load<(yara::ScanQueue, usize)> {
     let dir = content_root.join("rules/yara");
     if !dir.is_dir() {
-        return None;
+        return Load::Absent;
     }
     match yara::RuleSet::load_dir(&dir) {
         Ok(rules) => {
@@ -708,11 +759,11 @@ fn start_yara(
                     quarantine_matched_payload(&response, &outcome.path, &alert_log);
                 }
             });
-            Some((queue, rule_count))
+            Load::Loaded((queue, rule_count))
         }
         Err(e) => {
             tracing::error!(error = %e, "yara: load error");
-            None
+            Load::Failed
         }
     }
 }
@@ -1282,6 +1333,49 @@ detection:
         assert_eq!(report.yara_rule_count, None);
         // Still safe to process events after a no-op reload.
         sink.on_event(exec(902, "ls", "/bin/ls"));
+    }
+
+    const RELOAD_TEST_YARA_RULE: &str = r#"
+rule reload_content_test_marker {
+    meta:
+        technique = "T1105"
+        severity = "low"
+        falsepositives = "none, test-only rule"
+    strings:
+        $m = "RELOAD-CONTENT-YARA-MARKER"
+    condition:
+        $m
+}
+"#;
+
+    #[test]
+    fn reload_content_keeps_the_previous_yara_rules_when_the_new_set_is_broken() {
+        // YARA's `load_dir` is all-or-nothing (a rule that doesn't compile is a
+        // hard error), which is the case a reload must survive: an applied,
+        // signed-but-broken rule set must not switch scanning off.
+        let dir = tmp("reload-broken-keeps-old");
+        let sink = sink_in(&dir);
+        let yara_dir = dir.join("content").join("rules").join("yara");
+        std::fs::create_dir_all(&yara_dir).unwrap();
+        std::fs::write(yara_dir.join("marker.yar"), RELOAD_TEST_YARA_RULE).unwrap();
+        let report = sink.reload_content();
+        assert_eq!(report.yara_rule_count, Some(1));
+        assert!(!report.yara_reload_failed);
+
+        std::fs::write(yara_dir.join("broken.yar"), "rule nope { condition: \n").unwrap();
+        let report = sink.reload_content();
+        assert!(report.yara_reload_failed, "a rule that fails to compile");
+        assert_eq!(
+            report.yara_rule_count,
+            Some(1),
+            "the previous scan queue must keep running"
+        );
+
+        // Fixing the content recovers on the next reload.
+        std::fs::remove_file(yara_dir.join("broken.yar")).unwrap();
+        let report = sink.reload_content();
+        assert!(!report.yara_reload_failed);
+        assert_eq!(report.yara_rule_count, Some(1));
     }
 
     #[test]

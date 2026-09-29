@@ -125,6 +125,8 @@ impl Handler for StubHandler {
         Ok(ReloadContentResponse {
             sigma_rule_count: None,
             yara_rule_count: None,
+            sigma_reload_failed: false,
+            yara_reload_failed: false,
         })
     }
 }

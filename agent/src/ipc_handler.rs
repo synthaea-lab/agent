@@ -117,6 +117,8 @@ impl Handler for AgentHandler {
         Ok(ReloadContentResponse {
             sigma_rule_count: report.sigma_rule_count,
             yara_rule_count: report.yara_rule_count,
+            sigma_reload_failed: report.sigma_reload_failed,
+            yara_reload_failed: report.yara_reload_failed,
         })
     }
 }

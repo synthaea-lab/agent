@@ -262,6 +262,8 @@ mod tests {
         let response = Response::ReloadContent(ReloadContentResponse {
             sigma_rule_count: Some(12),
             yara_rule_count: None,
+            sigma_reload_failed: true,
+            yara_reload_failed: false,
         });
         let json = serde_json::to_string(&response).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
@@ -273,7 +275,8 @@ mod tests {
 /// the reload, from the same content directory the agent loads at startup
 /// — `None` for an engine means its content subdirectory is absent, not an
 /// error (same posture the agent has always had for a missing `rules/sigma`
-/// or `rules/yara`).
+/// or `rules/yara`). A present-but-broken subdirectory keeps the previous
+/// engine and sets the matching `*_reload_failed` flag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReloadContentResponse {
@@ -283,6 +286,13 @@ pub struct ReloadContentResponse {
     /// YARA rules now loaded, or `None` if `rules/yara` under the content
     /// directory does not exist.
     pub yara_rule_count: Option<usize>,
+    /// `rules/sigma` exists but did not load: the previous Sigma engine kept
+    /// running, and `sigma_rule_count` is its count, not the new content's.
+    #[serde(default)]
+    pub sigma_reload_failed: bool,
+    /// Same as [`Self::sigma_reload_failed`], for `rules/yara`.
+    #[serde(default)]
+    pub yara_reload_failed: bool,
 }
 
 // ── Wire-level errors ────────────────────────────────────────────────────

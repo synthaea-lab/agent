@@ -560,11 +560,24 @@ pub(crate) fn cmd_apply_content_manifest(
     );
 
     match notify_running_agent(ipc_endpoint) {
-        Ok(report) => println!(
-            "notified the running agent — reloaded (sigma: {}, yara: {})",
-            describe_reload_count(report.sigma_rule_count),
-            describe_reload_count(report.yara_rule_count),
-        ),
+        Ok(report) => {
+            println!(
+                "notified the running agent — reloaded (sigma: {}, yara: {})",
+                describe_reload_count(report.sigma_rule_count),
+                describe_reload_count(report.yara_rule_count),
+            );
+            for (engine, failed) in [
+                ("sigma", report.sigma_reload_failed),
+                ("yara", report.yara_reload_failed),
+            ] {
+                if failed {
+                    eprintln!(
+                        "warning: the {engine} content failed to load; the agent kept its \
+                         previous {engine} rules (see the agent log)"
+                    );
+                }
+            }
+        }
         Err(e) => println!(
             "no running agent to notify at {ipc_endpoint} ({e}) — already applied to disk, \
              will be picked up on the agent's next start"
