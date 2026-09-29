@@ -57,7 +57,9 @@ use crate::redact;
 ///
 /// v17 (#457) widened `CapSetEvent`'s capability sets to `u64` — not imported
 /// here, same reasoning as v15.
-const _: () = assert!(wire::WIRE_VERSION == 17);
+///
+/// v18 (#510) added `MemfdCreateEvent::fd` — not imported here, same reasoning.
+const _: () = assert!(wire::WIRE_VERSION == 18);
 
 /// `container` is resolved by the caller (`crate::container::container_context`,
 /// issue #312) from `EventMeta::cgroup_id` against cgroupfs, with image/name filled

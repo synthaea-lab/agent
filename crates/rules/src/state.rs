@@ -27,8 +27,8 @@ use crate::{
         RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD,
         RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
         SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_THRESHOLD,
-        SELF_SPAWN_WINDOW_NS, SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN,
-        SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS, WEB_SERVER_COMMS,
+        SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STANDARD_PORTS,
+        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
     },
     has_write_intent,
     sliding::{FlowPortDedup, SlidingCounter, SlidingDistinct, SlidingSum},
@@ -163,13 +163,16 @@ pub struct RuleState {
     /// [`Self::seed_ld_trust_from_system`] runs — the rule then falls back to the
     /// baseline alone, which only costs false positives on vendor directories.
     ld_trust_extra: Vec<String>,
-    /// pid → timestamp of the last `MemfdCreateEvent` seen for it (T1620, issue
-    /// #497): the evidence [`Self::check_memfd_exec`] requires before treating
-    /// an exec via `/proc/(self|<pid>)/fd/<n>` as a memfd-exec, since that path
-    /// shape alone (unlike `/dev/fd/<n>` + a `memfd:`-prefixed `comm`) is not
-    /// reliable evidence on its own — see that method's doc. LRU-bounded like
-    /// `pid_comm`, same key space.
-    recent_memfd_creates: BoundedMap<u32, u64>,
+    /// pid → the most recent `(timestamp, fd)` pairs of `MemfdCreateEvent`s seen
+    /// for it (T1620, issues #497/#510): the evidence [`Self::check_memfd_exec`]
+    /// requires before treating an exec via `/proc/(self|<pid>)/fd/<n>` as a
+    /// memfd-exec, since that path shape alone (unlike `/dev/fd/<n>` + a
+    /// `memfd:`-prefixed `comm`) is not reliable evidence on its own — see that
+    /// method's doc. The exec's `<n>` must equal one of these fds. A process can
+    /// legitimately hold several memfds, so this keeps up to
+    /// [`MEMFD_CREATES_PER_PID`] (oldest dropped) rather than only the latest.
+    /// LRU-bounded like `pid_comm`, same key space.
+    recent_memfd_creates: BoundedMap<u32, Vec<(u64, i32)>>,
     /// pid → a `/proc/.../fd/<n>` exec seen with no corroborating
     /// `MemfdCreateEvent` yet (#503 review): held instead of dropped, since
     /// the creation may still arrive after the exec despite always preceding
@@ -183,10 +186,16 @@ pub struct RuleState {
 /// See [`RuleState::pending_proc_fd_exec`].
 struct PendingProcFdExec {
     path: String,
+    /// The `<n>` of the `/proc/.../fd/<n>` path: the descriptor the exec ran.
+    fd: i32,
     comm: String,
     timestamp_ns: u64,
 }
 
+/// Memfd creations remembered per pid (see `RuleState::recent_memfd_creates`). A real
+/// fileless-exec process creates one or two; a process making more than this inside
+/// the correlation window is not something a longer list would catch better.
+const MEMFD_CREATES_PER_PID: usize = 8;
 /// Same bound as the correlator's entity table: the realistic live-pid space.
 const PID_COMM_CAP: usize = 65_536;
 /// Counter/write-history bounds — one logical entity per key, far fewer than pids.
@@ -326,20 +335,28 @@ impl RuleState {
             .map(|s| s.trim_end().to_string())
     }
 
-    /// T1059 — a shell executed directly by a web server process.
+    /// T1059 — a shell executed directly by a web or database service process.
+    /// Originally web-server-only (`nginx`/`apache2`/`httpd`); extended to
+    /// `mysqld`/`mariadbd`/`postgres` and (by prefix) `php-fpm*` for issue
+    /// #478's Level 1 — see [`SERVICE_COMMS`] and [`SERVICE_COMM_PREFIXES`]'s
+    /// docs for why each needs its own matching.
     fn check_web_server_spawns_shell(&self, event: &ExecEvent) -> Option<Alert> {
         let comm = event.meta.comm.as_str();
         if !SHELL_COMMS.contains(&comm) {
             return None;
         }
         let parent_comm = self.resolve_comm(event.meta.ppid)?;
-        if !WEB_SERVER_COMMS.iter().any(|w| parent_comm == *w) {
+        let is_service = SERVICE_COMMS.iter().any(|w| parent_comm == *w)
+            || SERVICE_COMM_PREFIXES
+                .iter()
+                .any(|p| parent_comm.starts_with(p));
+        if !is_service {
             return None;
         }
         Some(Alert {
             technique: "T1059",
             message: format!(
-                "pid={} comm={} executed directly by ppid={} comm={parent_comm} (web server) — suspicious process lineage",
+                "pid={} comm={} executed directly by ppid={} comm={parent_comm} (service) — suspicious process lineage",
                 event.meta.pid, comm, event.meta.ppid,
             ),
         })
@@ -854,13 +871,20 @@ impl RuleState {
     /// too-late creation saturates to a delta of 0, which trivially passes
     /// the window check), so the ordering itself is checked first.
     pub fn on_memfd_create(&mut self, event: &MemfdCreateEvent) -> Vec<Alert> {
-        self.recent_memfd_creates
-            .insert(event.meta.pid, event.meta.timestamp_ns);
+        let creates = self
+            .recent_memfd_creates
+            .get_or_insert_with(event.meta.pid, Vec::new);
+        if creates.len() >= MEMFD_CREATES_PER_PID {
+            creates.remove(0);
+        }
+        creates.push((event.meta.timestamp_ns, event.fd));
         if let Some(pending) = self.pending_proc_fd_exec.peek(&event.meta.pid)
+            && pending.fd == event.fd
             && event.meta.timestamp_ns <= pending.timestamp_ns
             && pending.timestamp_ns - event.meta.timestamp_ns <= MEMFD_EXEC_WINDOW_NS
         {
-            let alert = memfd_proc_fd_exec_alert(event.meta.pid, &pending.comm, &pending.path);
+            let alert =
+                memfd_proc_fd_exec_alert(event.meta.pid, &pending.comm, &pending.path, pending.fd);
             self.pending_proc_fd_exec.remove(&event.meta.pid);
             return vec![alert];
         }
@@ -906,18 +930,21 @@ impl RuleState {
     /// read. An earlier version of this check matched on that string and
     /// never fired on real telemetry.
     ///
-    /// Even with the `MemfdCreateEvent` gate, the `/proc/.../fd/<n>` shape is
-    /// correlation by pid and time, not proof that the executed fd *is* the
-    /// created memfd (#503 review, Nikolas): a process that creates a memfd
-    /// for a legitimate reason and then execs an ordinary on-disk binary
-    /// through a different, unrelated fd within the same window would still
-    /// match here. Closing that requires knowing the fd `memfd_create`
-    /// actually returned, which needs a kernel-side change this fix doesn't
-    /// make (`MemfdCreateEvent` doesn't carry it — see #505's follow-up
-    /// issue) — until then this shape's alert says exactly what was
-    /// observed (a memfd creation *and* an fd-exec close together in the same
-    /// process) rather than the stronger, unproven "no payload ever touched
-    /// disk" claim the `/dev/fd/<n>` + `memfd:` shape below can actually back.
+    /// The `/proc/.../fd/<n>` shape used to be correlation by pid and time
+    /// only (#503 review, Nikolas): a process that created a memfd for a
+    /// legitimate reason and then exec'd an ordinary on-disk binary through a
+    /// different, unrelated fd within the same window matched. Since #510 the
+    /// sensor reports the descriptor `memfd_create(2)` returned
+    /// ([`MemfdCreateEvent::fd`]), and the exec's `<n>` must equal it: the
+    /// executed fd *is* the created memfd, not merely a neighbour. The path's pid
+    /// component must also be `self` or the exec'ing pid itself — `/proc/<other>/fd/<n>`
+    /// names a descriptor in a different process's table, which this pid's memfds
+    /// say nothing about.
+    ///
+    /// What remains unproven is fd *reuse*: a process that closes its memfd, opens
+    /// an on-disk binary onto the same number and execs it inside the window would
+    /// still match. That takes close/dup tracking for a shape no fileless-exec
+    /// tool produces, so it is accepted.
     fn check_memfd_exec(&mut self, event: &ExecEvent) -> Option<Alert> {
         let path = &event.image_path;
         if is_dev_fd_path(path) {
@@ -930,19 +957,23 @@ impl RuleState {
                 path,
             ));
         }
-        if is_proc_fd_path(path) {
-            let created =
-                self.recent_memfd_creates
-                    .peek(&event.meta.pid)
-                    .is_some_and(|&created_ts| {
-                        created_ts <= event.meta.timestamp_ns
+        if let Some(fd) = proc_fd_number(path, event.meta.pid) {
+            let created = self
+                .recent_memfd_creates
+                .peek(&event.meta.pid)
+                .is_some_and(|creates| {
+                    creates.iter().any(|&(created_ts, created_fd)| {
+                        created_fd == fd
+                            && created_ts <= event.meta.timestamp_ns
                             && event.meta.timestamp_ns - created_ts <= MEMFD_EXEC_WINDOW_NS
-                    });
+                    })
+                });
             if created {
                 return Some(memfd_proc_fd_exec_alert(
                     event.meta.pid,
                     &event.meta.comm,
                     path,
+                    fd,
                 ));
             }
             // No corroborating creation seen yet — it may still arrive after
@@ -955,6 +986,7 @@ impl RuleState {
                 event.meta.pid,
                 PendingProcFdExec {
                     path: path.clone(),
+                    fd,
                     comm: event.meta.comm.clone(),
                     timestamp_ns: event.meta.timestamp_ns,
                 },
@@ -984,6 +1016,10 @@ impl RuleState {
     /// writes, consumed by `check_download_then_exec`.
     pub fn on_file_open(&mut self, event: &FileOpenEvent) -> Vec<Alert> {
         let mut alerts: Vec<Alert> = self.check_task_registration(event).into_iter().collect();
+        alerts.extend(crate::stateless::check_service_write_outside_datadir(
+            event,
+            |pid| self.resolve_comm(pid),
+        ));
         alerts.extend(self.record_create(event));
         self.record_downloader_write(event);
         alerts
@@ -1086,7 +1122,7 @@ impl RuleState {
     /// same appended-suffix relation is read off the file *names* instead
     /// ([`appended_suffix`]). Same counters, same exclusions; the one new benign
     /// producer that shape brings in is the Maildir delivery move
-    /// (`new/msg` → `cur/msg:2,S`), excluded by [`is_maildir_info_suffix`].
+    /// (`new/msg` → `cur/msg:2,S`), excluded by [`is_maildir_delivery`].
     ///
     /// Shapes this rule still cannot see at all (write-new-then-unlink) need a
     /// separate open/delete correlation — still a follow-up, tracked in #512.
@@ -1096,7 +1132,7 @@ impl RuleState {
             || is_rotation_suffix(suffix)
             || self.is_in_place_edit_backup(event)
             || is_maildir_flag_change(&event.old_path, suffix)
-            || is_maildir_info_suffix(suffix)
+            || is_maildir_delivery(&event.old_path, &event.new_path, suffix)
         {
             return None;
         }
@@ -1426,13 +1462,12 @@ fn memfd_dev_fd_exec_alert(pid: u32, comm: &str, path: &str) -> Alert {
 /// The `/proc/.../fd/<n>` shape, corroborated only by a same-pid
 /// `MemfdCreateEvent` within the window (see `check_memfd_exec`'s doc for why
 /// that's timing correlation, not proof the executed fd is the created one).
-fn memfd_proc_fd_exec_alert(pid: u32, comm: &str, path: &str) -> Alert {
+fn memfd_proc_fd_exec_alert(pid: u32, comm: &str, path: &str, fd: i32) -> Alert {
     Alert {
         technique: "T1620",
         message: format!(
-            "pid={pid} comm={comm}: executed from a file descriptor ({path}) shortly after \
-             this process created a memfd — consistent with a memfd-exec payload that never \
-             touched disk, not confirmed to be the same file descriptor",
+            "pid={pid} comm={comm}: executed from file descriptor {fd} ({path}), the memfd \
+             this process created moments earlier — a payload that never touched disk",
         ),
     }
 }
@@ -1455,16 +1490,20 @@ fn is_dev_fd_path(path: &str) -> bool {
     path.strip_prefix("/dev/fd/").is_some_and(is_all_digits)
 }
 
-/// Matches `/proc/self/fd/<n>` or `/proc/<pid>/fd/<n>` — exec via
-/// `/proc/self/fd` (or another pid's), see `check_memfd_exec`'s doc.
-fn is_proc_fd_path(path: &str) -> bool {
-    let Some(rest) = path.strip_prefix("/proc/") else {
-        return false;
-    };
-    let Some((pid_or_self, fd)) = rest.split_once("/fd/") else {
-        return false;
-    };
-    (pid_or_self == "self" || is_all_digits(pid_or_self)) && is_all_digits(fd)
+/// The descriptor number `<n>` of `/proc/self/fd/<n>` or `/proc/<own_pid>/fd/<n>` — an
+/// exec through one of the *exec'ing process's own* descriptors, see
+/// `check_memfd_exec`'s doc. `None` for anything else, including
+/// `/proc/<other pid>/fd/<n>` (a descriptor in a different table) and a number that
+/// doesn't fit an `i32`.
+fn proc_fd_number(path: &str, own_pid: u32) -> Option<i32> {
+    let rest = path.strip_prefix("/proc/")?;
+    let (pid_or_self, fd) = rest.split_once("/fd/")?;
+    let own = pid_or_self == "self"
+        || (is_all_digits(pid_or_self) && pid_or_self.parse::<u32>().ok() == Some(own_pid));
+    if !own || !is_all_digits(fd) {
+        return None;
+    }
+    fd.parse().ok()
 }
 
 /// True when `old_path` is `new_path` with one of
@@ -1540,9 +1579,12 @@ fn appended_suffix<'a>(old_path: &str, new_path: &'a str) -> Option<&'a str> {
     if let Some(suffix) = new_path.strip_prefix(old_path) {
         return Some(suffix);
     }
-    let (old_dir, old_base) = split_dir_base(old_path);
-    let (new_dir, new_base) = split_dir_base(new_path);
-    if old_dir == new_dir || old_base.is_empty() {
+    let old_base = split_dir_base(old_path).1;
+    let new_base = split_dir_base(new_path).1;
+    // No `old_dir == new_dir` shortcut: with equal directories the literal prefix test
+    // above only fails when the separators differ (`dir/a` vs `dir\a.locked`), and the
+    // base-name comparison below is exactly what must still run then.
+    if old_base.is_empty() {
         return None;
     }
     new_base.strip_prefix(old_base)
@@ -1556,7 +1598,9 @@ fn pairs_create_and_unlink(created_ts: u64, created: &str, deleted_ts: u64, dele
     created_ts <= deleted_ts
         && deleted_ts - created_ts <= CREATE_UNLINK_PAIR_WINDOW_NS
         && appended_suffix(deleted, created).is_some_and(|suffix| {
-            !suffix.is_empty() && !is_rotation_suffix(suffix) && !is_maildir_info_suffix(suffix)
+            !suffix.is_empty()
+                && !is_rotation_suffix(suffix)
+                && !is_maildir_delivery(deleted, created, suffix)
         })
 }
 
@@ -1577,9 +1621,37 @@ fn split_dir_base(path: &str) -> (&str, &str) {
 /// [`is_maildir_flag_change`], for the same reason: the alphabet is a tight shape
 /// and there is no small fixed set of `comm` values to gate on.
 fn is_maildir_info_suffix(suffix: &str) -> bool {
-    suffix
-        .strip_prefix(":2,")
-        .is_some_and(|flags| flags.bytes().all(|b| MAILDIR_FLAG_LETTERS.contains(&b)))
+    suffix.strip_prefix(":2,").is_some_and(is_maildir_flags)
+}
+
+/// True for a real Maildir delivery: a move from a `new` directory into the `cur`
+/// directory next to it, whose new name only appends a Maildir info suffix
+/// ([`is_maildir_info_suffix`]). The directory shape is part of the test, not just the
+/// suffix: `:2,` followed by lowercase keyword letters is a free, readable extension for
+/// an encryptor (`f.docx` → `f.docx:2,locked`), so the suffix alone must never exclude
+/// a rename (#526 review, found live on Alpine).
+fn is_maildir_delivery(old_path: &str, new_path: &str, suffix: &str) -> bool {
+    if !is_maildir_info_suffix(suffix) {
+        return false;
+    }
+    let (old_dir, _) = split_dir_base(old_path);
+    let (new_dir, _) = split_dir_base(new_path);
+    let (old_parent, old_leaf) = split_dir_base(old_dir);
+    let (new_parent, new_leaf) = split_dir_base(new_dir);
+    old_leaf == "new" && new_leaf == "cur" && old_parent == new_parent
+}
+
+/// True for what follows `:2,` in a Maildir info suffix: the standard flag letters
+/// ([`MAILDIR_FLAG_LETTERS`]) and then, optionally, Dovecot's IMAP keywords, which it
+/// stores as lowercase `a`-`z` after them (`:2,Sa`, `:2,RSab`; Thunderbird tags,
+/// `$Label1`, Junk/NonJunk). Delivering or tagging 20+ messages raised T1486 on the
+/// standard alphabet alone (#526 review, live on Alpine). The order keeps the shape
+/// tight: keywords never precede a standard flag.
+fn is_maildir_flags(flags: &str) -> bool {
+    let keywords = flags.trim_start_matches(|c: char| {
+        u8::try_from(c).is_ok_and(|b| MAILDIR_FLAG_LETTERS.contains(&b))
+    });
+    keywords.bytes().all(|b| b.is_ascii_lowercase())
 }
 
 /// True for `check_mass_rename_pattern`'s Maildir-flag-change false positive
@@ -1598,15 +1670,13 @@ fn is_maildir_info_suffix(suffix: &str) -> bool {
 /// already a tight structural signal on its own, the same class of reasoning
 /// [`is_rotation_suffix`]'s all-digit check relies on.
 fn is_maildir_flag_change(old_path: &str, suffix: &str) -> bool {
-    if suffix.is_empty() || !suffix.bytes().all(|b| MAILDIR_FLAG_LETTERS.contains(&b)) {
+    if suffix.is_empty() || !is_maildir_flags(suffix) {
         return false;
     }
     let Some(marker) = old_path.rfind(":2,") else {
         return false;
     };
-    old_path.as_bytes()[marker + 3..]
-        .iter()
-        .all(|b| MAILDIR_FLAG_LETTERS.contains(b))
+    is_maildir_flags(&old_path[marker + 3..])
 }
 
 /// Whether the file at `path` is the one a process named `comm` runs from. A

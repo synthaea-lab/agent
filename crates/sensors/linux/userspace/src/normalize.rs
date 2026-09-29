@@ -88,7 +88,10 @@ use sensor_linux_wire as wire;
 /// `cap_set` passes them through unchanged. `kernel_module` also takes the
 /// resolved path of a `finit_module` fd from the caller (`sensor.rs` reads
 /// `/proc/<pid>/fd/<fd>`), keeping this module free of filesystem access.
-const _: () = assert!(wire::WIRE_VERSION == 17);
+///
+/// v18 (#510) added `MemfdCreateEvent::fd` (the descriptor `memfd_create(2)`
+/// returned); `memfd_create` passes it through unchanged.
+const _: () = assert!(wire::WIRE_VERSION == 18);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
@@ -572,6 +575,7 @@ pub fn memfd_create(
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
         name: String::from_utf8_lossy(&raw[..end]).into_owned(),
         flags: event.flags,
+        fd: event.fd,
     })
 }
 

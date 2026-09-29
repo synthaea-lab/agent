@@ -421,6 +421,7 @@ pub fn memfd_create() -> MemfdCreateEvent {
         meta: meta(),
         name: String::new(),
         flags: 0,
+        fd: 0,
     }
 }
 

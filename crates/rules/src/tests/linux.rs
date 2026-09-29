@@ -225,6 +225,154 @@ fn write_to_systemd_unit_matches_persistence() {
     assert!(check_persistence_write(&event).is_some());
 }
 
+// ── T1190 mysqld/mariadbd write outside datadir (issue #478) ───────────────
+// Driven through `RuleState`: the rule resolves the process name from the pid
+// (#498 review), so a stateless call with a hand-written `comm` is exactly the
+// shape the live run showed the sensor does not produce.
+
+/// Every T1190 alert for one open, after the pid exec'd as `exec_comm` (`None` =
+/// no exec seen for it). The open's own `comm` is the *thread* name, set by the
+/// caller — it differs from the process name in the cases that matter.
+fn mysql_open_alerts(exec_comm: Option<&str>, event: &FileOpenEvent) -> Vec<crate::Alert> {
+    let mut state = RuleState::new();
+    if let Some(comm) = exec_comm {
+        state.on_exec(&exec_event_full(event.meta.pid, 1, comm, "", 0));
+    }
+    state
+        .on_file_open(event)
+        .into_iter()
+        .filter(|a| a.technique == "T1190")
+        .collect()
+}
+
+#[test]
+fn mysqld_write_under_web_root_matches() {
+    // SELECT ... INTO OUTFILE dropping a webshell.
+    let event = file_open_event_full(
+        200,
+        "mysqld",
+        "/var/www/html/shell.php",
+        O_WRONLY | O_CREAT,
+        0,
+    );
+    assert_eq!(mysql_open_alerts(Some("mysqld"), &event).len(), 1);
+}
+
+#[test]
+fn outfile_from_a_connection_thread_matches_through_the_pids_process_name() {
+    // Live on real mariadbd (#498 review): the open comes from a connection
+    // *thread* whose comm is "one_connection", not "mariadbd". The process name
+    // has to come from the pid.
+    let event = file_open_event_full(
+        202,
+        "one_connection",
+        "/var/www/html/x498.php",
+        O_WRONLY | O_CREAT,
+        0,
+    );
+    assert_eq!(mysql_open_alerts(Some("mariadbd"), &event).len(), 1);
+}
+
+#[test]
+fn mariadbd_write_to_plugin_dir_matches() {
+    // A malicious UDF .so: the plugin directory is delivered by the package
+    // manager, never written to by mysqld/mariadbd itself in normal
+    // operation, so it isn't in MYSQL_WRITE_PATH_PREFIXES — matches the
+    // issue's own listing of "a .so in the plugin directory" as suspicious.
+    let event = file_open_event_full(
+        201,
+        "mariadbd",
+        "/usr/lib/mysql/plugin/evil.so",
+        O_WRONLY | O_CREAT,
+        0,
+    );
+    assert_eq!(mysql_open_alerts(Some("mariadbd"), &event).len(), 1);
+}
+
+#[test]
+fn mysqld_write_under_datadir_does_not_alert() {
+    let event = file_open_event_full(
+        200,
+        "mysqld",
+        "/var/lib/mysql/mydb/table.ibd",
+        O_WRONLY | O_CREAT,
+        0,
+    );
+    assert!(mysql_open_alerts(Some("mysqld"), &event).is_empty());
+}
+
+#[test]
+fn mysqld_write_to_tmpdir_does_not_alert() {
+    // Routine on-disk temp table/sort spill — `mysqld`'s own `tmpdir` default.
+    let event = file_open_event_full(200, "mysqld", "/tmp/#sql_1a2b_0.MYI", O_WRONLY | O_CREAT, 0);
+    assert!(mysql_open_alerts(Some("mysqld"), &event).is_empty());
+}
+
+#[test]
+fn mysqld_open_of_tmp_itself_does_not_alert() {
+    // O_TMPFILE opens the directory itself: "/tmp" with no trailing slash, which
+    // the "/tmp/" prefix never matched (#498 review, live).
+    let event = file_open_event_full(200, "mariadbd", "/tmp", O_WRONLY, 0);
+    assert!(mysql_open_alerts(Some("mariadbd"), &event).is_empty());
+}
+
+#[test]
+fn mariadbd_startup_relative_and_dirfd_relative_opens_do_not_alert() {
+    // The collector reports the raw openat argument. A bare `mariadbd` start
+    // opened ~284 files like these and every one fired T1190 (#498 review, live):
+    // no absolute-prefix allowlist can match them.
+    for path in [
+        "./ibdata1",
+        "./mysql/db.frm",
+        ".//undo001",
+        "./ddl_recovery.log",
+        "plugin.MAI",
+        "#sql-temptable-49-1-3.MAI",
+        "#binlog_cache_files/",
+    ] {
+        let event = file_open_event_full(200, "mariadbd", path, O_WRONLY | O_CREAT, 0);
+        assert!(
+            mysql_open_alerts(Some("mariadbd"), &event).is_empty(),
+            "{path} must not alert: a web-root drop needs an absolute path"
+        );
+    }
+}
+
+#[test]
+fn mysqld_readonly_open_outside_datadir_does_not_alert() {
+    // No write intent — mysqld reading e.g. a config file elsewhere is routine.
+    let event = file_open_event_full(200, "mysqld", "/etc/mysql/my.cnf", O_RDONLY, 0);
+    assert!(mysql_open_alerts(Some("mysqld"), &event).is_empty());
+}
+
+#[test]
+fn unrelated_process_write_under_web_root_does_not_match_mysql_rule() {
+    // Not this rule's concern — a web server writing under its own web root is
+    // routine (uploads, cache, generated assets).
+    let event = file_open_event_full(
+        200,
+        "nginx",
+        "/var/www/html/shell.php",
+        O_WRONLY | O_CREAT,
+        0,
+    );
+    assert!(mysql_open_alerts(Some("nginx"), &event).is_empty());
+}
+
+#[test]
+fn write_outside_datadir_from_a_pid_whose_process_name_is_unknown_does_not_alert() {
+    // No exec seen and no /proc entry for this pid: with no process name there is
+    // nothing to say it is mysqld, whatever the thread's own comm claims.
+    let event = file_open_event_full(
+        4_000_000_000,
+        "mysqld",
+        "/var/www/html/shell.php",
+        O_WRONLY | O_CREAT,
+        0,
+    );
+    assert!(mysql_open_alerts(None, &event).is_empty());
+}
+
 #[test]
 fn containerized_process_opening_proc_pid_root_matches_escape() {
     let event = file_open_event_containerized("/proc/1/root/etc/shadow", "abc123");
@@ -275,6 +423,82 @@ fn nginx_spawning_shell_matches_lineage() {
     let alerts = state.on_exec(&exec_event_full(101, 100, "sh", "sh -c id", 1));
     assert_eq!(alerts.len(), 1);
     assert_eq!(alerts[0].technique, "T1059");
+}
+
+// ── T1059 service-spawns-shell, extended to DB services (issue #478) ───────
+
+#[test]
+fn mysqld_spawning_shell_matches_lineage() {
+    // mysqld spawning a shell = command execution through a UDF.
+    let mut state = RuleState::new();
+    state.on_exec(&exec_event_full(100, 1, "mysqld", "/usr/sbin/mysqld", 0));
+    let alerts = state.on_exec(&exec_event_full(101, 100, "sh", "sh -c id", 1));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1059");
+}
+
+#[test]
+fn mariadbd_spawning_shell_matches_lineage() {
+    let mut state = RuleState::new();
+    state.on_exec(&exec_event_full(
+        100,
+        1,
+        "mariadbd",
+        "/usr/sbin/mariadbd",
+        0,
+    ));
+    let alerts = state.on_exec(&exec_event_full(101, 100, "bash", "bash -c id", 1));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1059");
+}
+
+#[test]
+fn postgres_spawning_shell_matches_lineage() {
+    // The classic COPY PROGRAM / plpythonu escape.
+    let mut state = RuleState::new();
+    state.on_exec(&exec_event_full(100, 1, "postgres", "postgres", 0));
+    let alerts = state.on_exec(&exec_event_full(101, 100, "sh", "sh -c id", 1));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1059");
+}
+
+#[test]
+fn php_fpm_versioned_spawning_shell_matches_lineage() {
+    // Debian/Ubuntu suffix the pool binary's own comm with the PHP version
+    // (php-fpm7.4, php-fpm8.1, ...) — a webshell's system()/exec() call spawns
+    // a shell directly under this, not under nginx/Apache, so an exact-match
+    // list alone would miss it entirely.
+    let mut state = RuleState::new();
+    state.on_exec(&exec_event_full(
+        100,
+        1,
+        "php-fpm7.4",
+        "php-fpm: pool www",
+        0,
+    ));
+    let alerts = state.on_exec(&exec_event_full(101, 100, "sh", "sh -c id", 1));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1059");
+}
+
+#[test]
+fn php_fpm_bare_name_spawning_shell_matches_lineage() {
+    // RHEL/Fedora ship a bare `php-fpm` (no version suffix) — same signal.
+    let mut state = RuleState::new();
+    state.on_exec(&exec_event_full(100, 1, "php-fpm", "php-fpm: pool www", 0));
+    let alerts = state.on_exec(&exec_event_full(101, 100, "sh", "sh -c id", 1));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1059");
+}
+
+#[test]
+fn unrelated_service_named_process_spawning_shell_does_not_match() {
+    // "phpstorm" starts with neither a SERVICE_COMMS entry nor "php-fpm" —
+    // guards the prefix match against over-matching unrelated names.
+    let mut state = RuleState::new();
+    state.on_exec(&exec_event_full(100, 1, "phpstorm", "phpstorm", 0));
+    let alerts = state.on_exec(&exec_event_full(101, 100, "sh", "sh -c id", 1));
+    assert!(alerts.is_empty());
 }
 
 #[test]
@@ -1045,6 +1269,94 @@ fn maildir_flag_change_does_not_alert() {
 }
 
 #[test]
+fn maildir_delivery_with_dovecot_keywords_does_not_alert() {
+    // #526 review, live on Alpine: Dovecot keeps IMAP keywords as lowercase letters after
+    // the standard flags (`:2,Sa`, `:2,RSab`); delivering or tagging 20+ messages must
+    // not look like an encryptor, cross-directory or in place.
+    for (from, to) in [
+        ("new/{i}", "cur/{i}:2,Sa"),
+        ("new/{i}", "cur/{i}:2,RSab"),
+        ("cur/{i}:2,S", "cur/{i}:2,Sa"),
+        ("cur/{i}:2,S", "cur/{i}:2,Sab"),
+    ] {
+        let mut state = RuleState::new();
+        let mut alerts = Vec::new();
+        for n in 0..RANSOMWARE_RENAME_THRESHOLD * 2 {
+            let id = format!("171{n}.eml");
+            alerts.extend(state.on_file_rename(&file_rename_event_full(
+                9203,
+                "imap",
+                &format!("/home/u/Maildir/{}", from.replace("{i}", &id)),
+                &format!("/home/u/Maildir/{}", to.replace("{i}", &id)),
+                u64::from(n) * 100_000_000,
+            )));
+        }
+        assert!(alerts.is_empty(), "{from} -> {to}");
+    }
+}
+
+#[test]
+fn a_maildir_shaped_suffix_outside_a_new_to_cur_move_still_alerts() {
+    // #526 review: `:2,` plus lowercase letters is a free extension for an encryptor, so
+    // the suffix alone must not exclude a rename; only a `new/` -> `cur/` move does.
+    for (from, to) in [
+        ("/home/u/docs/{i}.docx", "/home/u/docs/{i}.docx:2,locked"),
+        ("/home/u/docs/{i}.docx", "/home/u/stash/{i}.docx:2,locked"),
+        ("/home/u/Maildir/cur/{i}", "/home/u/Maildir/new/{i}:2,Sa"),
+        ("/home/u/Maildir/new/{i}", "/home/u/Maildir/tmp/{i}:2,Sa"),
+        ("/home/u/A/new/{i}", "/home/u/B/cur/{i}:2,Sa"),
+    ] {
+        let mut state = RuleState::new();
+        let mut alerts = Vec::new();
+        for n in 0..RANSOMWARE_RENAME_THRESHOLD {
+            let id = format!("f{n}");
+            alerts.extend(state.on_file_rename(&file_rename_event_full(
+                9206,
+                "evil",
+                &from.replace("{i}", &id),
+                &to.replace("{i}", &id),
+                u64::from(n) * 100_000_000,
+            )));
+        }
+        assert_eq!(alerts.len(), 1, "{from} -> {to}");
+    }
+}
+
+#[test]
+fn a_keyword_before_a_standard_flag_is_not_a_maildir_suffix() {
+    // The order keeps the gate tight: keywords never precede a standard flag.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for n in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9204,
+            "evil",
+            &format!("/home/u/Maildir/new/171{n}.eml"),
+            &format!("/home/u/Maildir/cur/171{n}.eml:2,aS"),
+            u64::from(n) * 100_000_000,
+        )));
+    }
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn a_same_directory_rename_with_mixed_separators_is_still_seen() {
+    // Windows sensors can report one directory with `/` and `\` mixed (#526 review).
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for n in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9205,
+            "enc.exe",
+            &format!(r"C:\Users\u\Documents/f{n}.docx"),
+            &format!(r"C:\Users\u\Documents\f{n}.docx.locked"),
+            u64::from(n) * 100_000_000,
+        )));
+    }
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
 fn maildir_shaped_rename_with_an_invalid_flag_letter_still_alerts() {
     // The structural gate must be tight: "X" is not a Maildir flag letter, so
     // this must not be mistaken for the benign shape.
@@ -1504,8 +1816,15 @@ fn an_encryptor_that_names_its_output_dot_gz_still_alerts() {
 }
 
 #[test]
-fn a_rotation_or_maildir_suffix_does_not_pair() {
-    for suffix in [".1", "-20260929", ":2,S"] {
+fn a_rotation_suffix_or_a_maildir_delivery_does_not_pair() {
+    // (deleted path, created path): a rotation suffix anywhere, and a Maildir delivery,
+    // which is a move from `new/` into the `cur/` beside it.
+    for (dir_old, dir_new, suffix) in [
+        ("/home/u", "/home/u", ".1"),
+        ("/home/u", "/home/u", "-20260929"),
+        ("/home/u/Maildir/new", "/home/u/Maildir/cur", ":2,S"),
+        ("/home/u/Maildir/new", "/home/u/Maildir/cur", ":2,Sa"),
+    ] {
         let mut state = RuleState::new();
         let mut alerts = Vec::new();
         for i in 0..RANSOMWARE_RENAME_THRESHOLD * 2 {
@@ -1513,18 +1832,48 @@ fn a_rotation_or_maildir_suffix_does_not_pair() {
             alerts.extend(state.on_file_open(&file_open_event_full(
                 9420,
                 "app",
-                &format!("/home/u/f{i}.log{suffix}"),
+                &format!("{dir_new}/f{i}.log{suffix}"),
                 O_NEW_FILE,
                 ts,
             )));
             alerts.extend(state.on_file_delete(&file_delete_event_full(
                 9420,
                 "app",
-                &format!("/home/u/f{i}.log"),
+                &format!("{dir_old}/f{i}.log"),
                 ts + 1_000,
             )));
         }
-        assert!(alerts.is_empty(), "suffix {suffix:?}");
+        assert!(alerts.is_empty(), "{dir_old} -> {dir_new} {suffix:?}");
+    }
+}
+
+#[test]
+fn a_maildir_shaped_suffix_outside_a_new_to_cur_move_still_pairs() {
+    // #526 review, same hole on the create/unlink side: `:2,locked` is a free extension.
+    for (dir_old, dir_new) in [
+        ("/home/u/docs", "/home/u/docs"),
+        ("/home/u/docs", "/home/u/stash"),
+        ("/home/u/A/new", "/home/u/B/cur"),
+    ] {
+        let mut state = RuleState::new();
+        let mut alerts = Vec::new();
+        for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+            let ts = u64::from(i) * 50_000_000;
+            alerts.extend(state.on_file_open(&file_open_event_full(
+                9421,
+                "evil",
+                &format!("{dir_new}/f{i}.docx:2,locked"),
+                O_NEW_FILE,
+                ts,
+            )));
+            alerts.extend(state.on_file_delete(&file_delete_event_full(
+                9421,
+                "evil",
+                &format!("{dir_old}/f{i}.docx"),
+                ts + 1_000,
+            )));
+        }
+        assert_eq!(alerts.len(), 1, "{dir_old} -> {dir_new}");
     }
 }
 
@@ -2067,17 +2416,143 @@ fn a_memfd_created_after_the_exec_does_not_corroborate_it_via_the_forward_path()
 }
 
 #[test]
-fn proc_fd_shape_alert_does_not_overclaim_the_dev_fd_shapes_disk_free_evidence() {
-    // #503 review: the /proc/fd shape is pid+time correlation, not proof the
-    // executed fd is the created memfd — the message must not claim more
-    // than that.
+fn proc_fd_alert_names_the_descriptor_that_matched() {
+    // #510: the alert can now say the executed fd *is* the created memfd, and
+    // names it, instead of the pid+time hedge #503 had to settle for.
     let mut state = RuleState::new();
     state.on_memfd_create(&memfd_create_event_full(100, 0));
     let event = memfd_exec_event(100, "4", "/proc/self/fd/3", 10_000_000);
     let alerts = state.on_exec(&event);
     assert_eq!(alerts.len(), 1);
     assert!(
-        !alerts[0].message.contains("no payload ever touched disk"),
-        "the /proc/fd shape can't back that claim, unlike /dev/fd + memfd: comm"
+        alerts[0].message.contains("file descriptor 3"),
+        "the alert must name the matched descriptor: {}",
+        alerts[0].message
     );
+}
+
+#[test]
+fn proc_fd_exec_through_a_different_fd_than_the_memfd_does_not_alert() {
+    // #510, the gap #503 left open: the process created a memfd (fd 5) for its own
+    // reasons and then exec'd an ordinary on-disk binary through an unrelated
+    // descriptor (fd 3) inside the window. Pid+time matched; the fd does not.
+    let mut state = RuleState::new();
+    state.on_memfd_create(&memfd_create_event_with_fd(100, 0, 5));
+    let event = memfd_exec_event(100, "4", "/proc/self/fd/3", 10_000_000);
+    assert!(state.on_exec(&event).is_empty());
+}
+
+#[test]
+fn proc_fd_exec_matches_any_of_the_processs_recent_memfds() {
+    // A process can hold several memfds; the exec names one of them, not
+    // necessarily the latest.
+    let mut state = RuleState::new();
+    state.on_memfd_create(&memfd_create_event_with_fd(100, 0, 3));
+    state.on_memfd_create(&memfd_create_event_with_fd(100, 1_000_000, 4));
+    let event = memfd_exec_event(100, "4", "/proc/self/fd/3", 10_000_000);
+    let alerts = state.on_exec(&event);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1620");
+}
+
+#[test]
+fn proc_fd_exec_through_another_pids_descriptor_does_not_corroborate() {
+    // /proc/<other>/fd/3 is a descriptor in a different process's table: this pid's
+    // own memfd 3 says nothing about it.
+    let mut state = RuleState::new();
+    state.on_memfd_create(&memfd_create_event_full(100, 0));
+    let event = memfd_exec_event(100, "4", "/proc/999/fd/3", 10_000_000);
+    assert!(state.on_exec(&event).is_empty());
+}
+
+#[test]
+fn memfds_beyond_the_per_pid_cap_forget_the_oldest() {
+    // Bounded per-pid history: the 9th creation pushes the 1st (fd 3) out, so an
+    // exec through fd 3 no longer corroborates. Newer ones still do.
+    let mut state = RuleState::new();
+    for (i, fd) in (3..12).enumerate() {
+        state.on_memfd_create(&memfd_create_event_with_fd(100, i as u64, fd));
+    }
+    let evicted = memfd_exec_event(100, "4", "/proc/self/fd/3", 10_000_000);
+    assert!(state.on_exec(&evicted).is_empty());
+    let kept = memfd_exec_event(100, "4", "/proc/self/fd/11", 10_000_000);
+    assert_eq!(state.on_exec(&kept).len(), 1);
+}
+
+#[test]
+fn late_memfd_create_with_a_different_fd_does_not_retroactively_alert() {
+    // Same #510 rule on the other delivery order (the exec is processed first and
+    // held): a creation that arrives afterwards must carry the same fd.
+    let mut state = RuleState::new();
+    let exec = memfd_exec_event(100, "4", "/proc/self/fd/3", 10_000_000);
+    assert!(state.on_exec(&exec).is_empty());
+    let alerts = state.on_memfd_create(&memfd_create_event_with_fd(100, 0, 5));
+    assert!(alerts.is_empty());
+    // ...and the matching one still fires afterwards: the pending exec was kept.
+    let alerts = state.on_memfd_create(&memfd_create_event_with_fd(100, 1_000_000, 3));
+    assert_eq!(alerts.len(), 1);
+}
+
+// ── T1071 unusual outbound from a web/DB service (issue #478) ──────────────
+
+#[test]
+fn nginx_unusual_outbound_port_matches() {
+    let event = connect_event_full(300, "nginx", [93, 184, 216, 34], 4444, 0);
+    let alert = check_service_unusual_outbound(&event).unwrap();
+    assert_eq!(alert.technique, "T1071");
+}
+
+#[test]
+fn mysqld_any_outbound_to_unusual_port_matches() {
+    // mysqld almost never has a legitimate reason to connect out at all.
+    let event = connect_event_full(301, "mysqld", [93, 184, 216, 34], 1337, 0);
+    assert!(check_service_unusual_outbound(&event).is_some());
+}
+
+#[test]
+fn php_fpm_versioned_unusual_outbound_matches() {
+    let event = connect_event_full(302, "php-fpm7.4", [93, 184, 216, 34], 4444, 0);
+    assert!(check_service_unusual_outbound(&event).is_some());
+}
+
+#[test]
+fn nginx_outbound_to_https_does_not_alert() {
+    // A web app calling out to an HTTPS API/update endpoint — routine.
+    let event = connect_event_full(300, "nginx", [93, 184, 216, 34], 443, 0);
+    assert!(check_service_unusual_outbound(&event).is_none());
+}
+
+#[test]
+fn php_fpm_outbound_to_redis_port_does_not_alert() {
+    // Common multi-tier shape: php-fpm dialing a backend cache/DB on a
+    // "non-standard" port that is nonetheless completely routine.
+    let event = connect_event_full(302, "php-fpm7.4", [10, 0, 0, 5], 6379, 0);
+    assert!(check_service_unusual_outbound(&event).is_none());
+}
+
+#[test]
+fn nginx_outbound_to_loopback_unusual_port_does_not_alert() {
+    // Same-host backend (a local API, Postgres, ...) — the overwhelming
+    // majority of "unusual port" traffic from these processes in practice,
+    // and never the real exfil/C2 path (loopback can't leave the host).
+    let event = connect_event_full(300, "nginx", [127, 0, 0, 1], 9999, 0);
+    assert!(check_service_unusual_outbound(&event).is_none());
+}
+
+#[test]
+fn postgres_startup_connect_to_unspecified_address_does_not_alert() {
+    // postgres's startup connect() to 0.0.0.0:65535 and :::65535 fired T1071 on a
+    // bare container start (#498 review, live). Unspecified means "this host" on
+    // Linux, same as loopback — not a destination that leaves the box.
+    let v4 = connect_event_full(304, "postgres", [0, 0, 0, 0], 65535, 0);
+    assert!(check_service_unusual_outbound(&v4).is_none());
+    let mut v6 = connect_event_full(304, "postgres", [0, 0, 0, 0], 65535, 0);
+    v6.daddr = std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
+    assert!(check_service_unusual_outbound(&v6).is_none());
+}
+
+#[test]
+fn unrelated_process_unusual_outbound_does_not_match_service_rule() {
+    let event = connect_event_full(303, "curl", [93, 184, 216, 34], 4444, 0);
+    assert!(check_service_unusual_outbound(&event).is_none());
 }
