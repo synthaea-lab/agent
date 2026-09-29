@@ -766,6 +766,47 @@ fn beacon_flow_ignores_the_unspecified_address_probe() {
 }
 
 #[test]
+fn beacon_to_the_unspecified_address_on_another_port_still_alerts() {
+    // #536: `0.0.0.0:<port>` reaches the local host like `127.0.0.1:<port>`, which is
+    // counted. Only the sshd probe port is excluded, so a local-relay beacon cannot
+    // hide behind the unspecified address.
+    for (label, daddr) in [
+        ("v4", std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+        ("v6", std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)),
+    ] {
+        let mut state = RuleState::new();
+        let mut alerts = Vec::new();
+        for i in 0..5u64 {
+            let mut event =
+                connect_event_full(401, "implant", [0, 0, 0, 0], 4444, i * 1_000_000_000);
+            event.daddr = daddr;
+            alerts.extend(state.on_connect(&event));
+        }
+        assert_eq!(alerts.len(), 1, "{label}");
+        assert_eq!(alerts[0].technique, "T1071/T1041", "{label}");
+    }
+}
+
+#[test]
+fn beacon_flow_to_the_unspecified_address_on_another_port_still_alerts() {
+    // Same on the conntrack path (#536): distinct local ports count as distinct flows.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for (i, port) in (50000..50005u16).enumerate() {
+        alerts.extend(state.on_network_flow(&network_flow_event_full(
+            401,
+            "implant",
+            port,
+            [0, 0, 0, 0],
+            4444,
+            i as u64 * 1_000_000_000,
+        )));
+    }
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1071/T1041");
+}
+
+#[test]
 fn beacon_flow_standard_port_does_not_alert() {
     let mut state = RuleState::new();
     for (i, port) in (50000..50003u16).enumerate() {
