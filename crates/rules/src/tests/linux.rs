@@ -196,13 +196,30 @@ fn ld_preload_from_a_seeded_ld_so_conf_dir_does_not_alert() {
     assert!(!fired(&mut seeded));
 }
 
-// ── T1037.004 / T1053.003 persistence writes ────────────────────────────────
+// ── persistence writes (T1546.004 / T1053.003 / T1543.002) ──────────────────
 
 #[test]
 fn write_to_bashrc_matches_persistence() {
     // O_WRONLY|O_CREAT|O_TRUNC, values observed in real conditions (touch(1)).
     let event = file_open_event("/home/app/.bashrc", 577);
     assert!(check_persistence_write(&event).is_some());
+}
+
+#[test]
+fn linux_persistence_paths_are_tagged_with_their_own_technique() {
+    // Regression (#495): every path was tagged T1037.004/T1053.003, and none of
+    // them is an RC script (T1037.004).
+    for (path, technique) in [
+        ("/home/app/.bashrc", "T1546.004"),
+        ("/home/app/.zshrc", "T1546.004"),
+        ("/etc/profile.d/evil.sh", "T1546.004"),
+        ("/etc/cron.d/evil", "T1053.003"),
+        ("/etc/systemd/system/evil.service", "T1543.002"),
+    ] {
+        let alert = check_persistence_write(&file_open_event(path, O_WRONLY | O_CREAT))
+            .expect("must alert");
+        assert_eq!(alert.technique, technique, "{path}");
+    }
 }
 
 #[test]
@@ -658,6 +675,20 @@ fn unrelated_exec_does_not_match_download() {
     assert!(alerts.is_empty());
 }
 
+#[test]
+fn beacon_ignores_the_unspecified_address_probe() {
+    // Live on the lab VM (2026-09-29): sshd-session connects to 0.0.0.0:65535 and
+    // :::65535 on every login, so three SSH logins in a minute raised T1071/T1041.
+    let mut state = RuleState::new();
+    for i in 0..5u64 {
+        let v4 = connect_event_full(400, "sshd-session", [0, 0, 0, 0], 65535, i * 1_000_000_000);
+        assert!(state.on_connect(&v4).is_empty());
+        let mut v6 = v4.clone();
+        v6.daddr = std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
+        assert!(state.on_connect(&v6).is_empty());
+    }
+}
+
 // ── BEACON via conntrack polling (issue #92, NetworkFlowEvent) ──────────────────
 
 #[test]
@@ -713,6 +744,66 @@ fn beacon_flow_same_local_port_repolled_does_not_alert() {
         ));
         assert!(alerts.is_empty());
     }
+}
+
+#[test]
+fn beacon_flow_ignores_the_unspecified_address_probe() {
+    // Same sshd-session probe as `beacon_ignores_the_unspecified_address_probe`,
+    // seen by conntrack polling: distinct local ports would otherwise count as
+    // distinct connections (#525 review).
+    let mut state = RuleState::new();
+    for (i, port) in (50000..50005u16).enumerate() {
+        let alerts = state.on_network_flow(&network_flow_event_full(
+            400,
+            "sshd-session",
+            port,
+            [0, 0, 0, 0],
+            65535,
+            i as u64 * 1_000_000_000,
+        ));
+        assert!(alerts.is_empty());
+    }
+}
+
+#[test]
+fn beacon_to_the_unspecified_address_on_another_port_still_alerts() {
+    // #536: `0.0.0.0:<port>` reaches the local host like `127.0.0.1:<port>`, which is
+    // counted. Only the sshd probe port is excluded, so a local-relay beacon cannot
+    // hide behind the unspecified address.
+    for (label, daddr) in [
+        ("v4", std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+        ("v6", std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)),
+    ] {
+        let mut state = RuleState::new();
+        let mut alerts = Vec::new();
+        for i in 0..5u64 {
+            let mut event =
+                connect_event_full(401, "implant", [0, 0, 0, 0], 4444, i * 1_000_000_000);
+            event.daddr = daddr;
+            alerts.extend(state.on_connect(&event));
+        }
+        assert_eq!(alerts.len(), 1, "{label}");
+        assert_eq!(alerts[0].technique, "T1071/T1041", "{label}");
+    }
+}
+
+#[test]
+fn beacon_flow_to_the_unspecified_address_on_another_port_still_alerts() {
+    // Same on the conntrack path (#536): distinct local ports count as distinct flows.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for (i, port) in (50000..50005u16).enumerate() {
+        alerts.extend(state.on_network_flow(&network_flow_event_full(
+            401,
+            "implant",
+            port,
+            [0, 0, 0, 0],
+            4444,
+            i as u64 * 1_000_000_000,
+        )));
+    }
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1071/T1041");
 }
 
 #[test]
@@ -1240,6 +1331,58 @@ fn in_place_edit_backup_with_no_known_path_at_all_fails_closed() {
 }
 
 #[test]
+fn a_trusted_binary_that_renames_its_comm_to_sed_still_alerts() {
+    // The system python3 (trusted path) calling prctl(PR_SET_NAME, "sed") passes the
+    // path gate but is not a binary named sed, at exec time or via the rename-time path.
+    for (exec_image, exe_path) in [
+        (Some("/usr/bin/python3"), None),
+        (None, Some("/usr/bin/python3")),
+    ] {
+        let alerts = in_place_edit_burst_after_exec(exec_image, exe_path);
+        assert_eq!(alerts.len(), 1, "{exec_image:?} / {exe_path:?}");
+        assert_eq!(alerts[0].technique, "T1486");
+    }
+}
+
+/// The `sed -i.bak`-shaped burst for an arbitrary tool: `comm` and the exec-time image.
+fn in_place_edit_burst_as(comm: &str, exec_image: &str, suffix: &str) -> Vec<crate::Alert> {
+    let mut state = RuleState::new();
+    state.on_exec(&memfd_exec_event(9210, comm, exec_image, 0));
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9210,
+            comm,
+            &format!("/home/u/docs/f{i}.docx"),
+            &format!("/home/u/docs/f{i}.docx{suffix}"),
+            u64::from(i) * 100_000_000,
+        )));
+    }
+    alerts
+}
+
+#[test]
+fn the_real_perl_interpreter_is_not_excluded() {
+    // #528 review, live on Alpine: `/usr/bin/perl` at a trusted path, `comm=perl`,
+    // renaming in bulk to `.locked`. perl runs any script, so the tool's name is no
+    // evidence of what it is doing; sed's `-i` can only write a backup copy.
+    let alerts = in_place_edit_burst_as("perl", "/usr/bin/perl", ".locked");
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+    // The rename-to-`.bak` shape (perl older than 5.28) alerts too now: the accepted cost
+    // of not trusting an interpreter. Current perl never produces it.
+    assert_eq!(
+        in_place_edit_burst_as("perl", "/usr/bin/perl", ".bak").len(),
+        1
+    );
+}
+
+#[test]
+fn the_real_sed_stays_excluded_for_a_backup_suffix() {
+    assert!(in_place_edit_burst_as("sed", "/usr/bin/sed", ".bak").is_empty());
+}
+
+#[test]
 fn in_place_edit_backup_from_an_untrusted_path_still_alerts() {
     // The evidence gate's actual job: an encryptor can set comm="sed" for
     // free, but not make its own binary live under a trusted system prefix.
@@ -1269,6 +1412,94 @@ fn maildir_flag_change_does_not_alert() {
 }
 
 #[test]
+fn maildir_delivery_with_dovecot_keywords_does_not_alert() {
+    // #526 review, live on Alpine: Dovecot keeps IMAP keywords as lowercase letters after
+    // the standard flags (`:2,Sa`, `:2,RSab`); delivering or tagging 20+ messages must
+    // not look like an encryptor, cross-directory or in place.
+    for (from, to) in [
+        ("new/{i}", "cur/{i}:2,Sa"),
+        ("new/{i}", "cur/{i}:2,RSab"),
+        ("cur/{i}:2,S", "cur/{i}:2,Sa"),
+        ("cur/{i}:2,S", "cur/{i}:2,Sab"),
+    ] {
+        let mut state = RuleState::new();
+        let mut alerts = Vec::new();
+        for n in 0..RANSOMWARE_RENAME_THRESHOLD * 2 {
+            let id = format!("171{n}.eml");
+            alerts.extend(state.on_file_rename(&file_rename_event_full(
+                9203,
+                "imap",
+                &format!("/home/u/Maildir/{}", from.replace("{i}", &id)),
+                &format!("/home/u/Maildir/{}", to.replace("{i}", &id)),
+                u64::from(n) * 100_000_000,
+            )));
+        }
+        assert!(alerts.is_empty(), "{from} -> {to}");
+    }
+}
+
+#[test]
+fn a_maildir_shaped_suffix_outside_a_new_to_cur_move_still_alerts() {
+    // #526 review: `:2,` plus lowercase letters is a free extension for an encryptor, so
+    // the suffix alone must not exclude a rename; only a `new/` -> `cur/` move does.
+    for (from, to) in [
+        ("/home/u/docs/{i}.docx", "/home/u/docs/{i}.docx:2,locked"),
+        ("/home/u/docs/{i}.docx", "/home/u/stash/{i}.docx:2,locked"),
+        ("/home/u/Maildir/cur/{i}", "/home/u/Maildir/new/{i}:2,Sa"),
+        ("/home/u/Maildir/new/{i}", "/home/u/Maildir/tmp/{i}:2,Sa"),
+        ("/home/u/A/new/{i}", "/home/u/B/cur/{i}:2,Sa"),
+    ] {
+        let mut state = RuleState::new();
+        let mut alerts = Vec::new();
+        for n in 0..RANSOMWARE_RENAME_THRESHOLD {
+            let id = format!("f{n}");
+            alerts.extend(state.on_file_rename(&file_rename_event_full(
+                9206,
+                "evil",
+                &from.replace("{i}", &id),
+                &to.replace("{i}", &id),
+                u64::from(n) * 100_000_000,
+            )));
+        }
+        assert_eq!(alerts.len(), 1, "{from} -> {to}");
+    }
+}
+
+#[test]
+fn a_keyword_before_a_standard_flag_is_not_a_maildir_suffix() {
+    // The order keeps the gate tight: keywords never precede a standard flag.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for n in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9204,
+            "evil",
+            &format!("/home/u/Maildir/new/171{n}.eml"),
+            &format!("/home/u/Maildir/cur/171{n}.eml:2,aS"),
+            u64::from(n) * 100_000_000,
+        )));
+    }
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn a_same_directory_rename_with_mixed_separators_is_still_seen() {
+    // Windows sensors can report one directory with `/` and `\` mixed (#526 review).
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for n in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9205,
+            "enc.exe",
+            &format!(r"C:\Users\u\Documents/f{n}.docx"),
+            &format!(r"C:\Users\u\Documents\f{n}.docx.locked"),
+            u64::from(n) * 100_000_000,
+        )));
+    }
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
 fn maildir_shaped_rename_with_an_invalid_flag_letter_still_alerts() {
     // The structural gate must be tight: "X" is not a Maildir flag letter, so
     // this must not be mistaken for the benign shape.
@@ -1285,6 +1516,601 @@ fn maildir_shaped_rename_with_an_invalid_flag_letter_still_alerts() {
     }
     assert_eq!(alerts.len(), 1);
     assert_eq!(alerts[0].technique, "T1486");
+}
+
+// ── T1486 cross-directory moves (#512) ──
+
+/// `RANSOMWARE_RENAME_THRESHOLD` renames from one pid, each `old_dir/f{i}<old_ext>` →
+/// `new_dir/f{i}<old_ext><suffix>`, inside one window.
+fn cross_dir_burst(
+    comm: &str,
+    old_dir: &str,
+    new_dir: &str,
+    old_ext: &str,
+    suffix: &str,
+) -> Vec<crate::Alert> {
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9300,
+            comm,
+            &format!("{old_dir}/f{i}{old_ext}"),
+            &format!("{new_dir}/f{i}{old_ext}{suffix}"),
+            u64::from(i) * 100_000_000,
+        )));
+    }
+    alerts
+}
+
+#[test]
+fn cross_directory_move_with_an_appended_suffix_alerts() {
+    // ~/docs/a.docx -> ~/.stash/a.docx.locked: the full-path prefix test can never
+    // hold here, the file-name relation does.
+    let alerts = cross_dir_burst(
+        "encryptor",
+        "/home/u/docs",
+        "/home/u/.stash",
+        ".docx",
+        ".locked",
+    );
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+}
+
+#[test]
+fn cross_directory_move_between_relative_paths_alerts() {
+    // Raw, unresolved paths (the sensor reports the syscall argument as given):
+    // both sides are relative to the same cwd/dirfd, so the names still compare.
+    let alerts = cross_dir_burst("encryptor", "docs", "stash", ".docx", ".locked");
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn cross_directory_move_from_a_bare_name_to_a_path_alerts() {
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9301,
+            "encryptor",
+            &format!("f{i}.docx"),
+            &format!("/mnt/stash/f{i}.docx.locked"),
+            u64::from(i) * 100_000_000,
+        )));
+    }
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn cross_directory_move_with_windows_separators_alerts() {
+    // Windows sensors feed this rule too: the file-name split must honour `\`.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9302,
+            "encryptor",
+            &format!(r"C:\Users\u\Documents\f{i}.docx"),
+            &format!(r"C:\Users\u\AppData\stash\f{i}.docx.locked"),
+            u64::from(i) * 100_000_000,
+        )));
+    }
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn plain_cross_directory_move_without_a_suffix_does_not_alert() {
+    // `mv *.docx /backup/`: same name, different directory, nothing appended.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD * 2 {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9303,
+            "mv",
+            &format!("/home/u/docs/f{i}.docx"),
+            &format!("/backup/f{i}.docx"),
+            u64::from(i) * 50_000_000,
+        )));
+    }
+    assert!(alerts.is_empty());
+}
+
+#[test]
+fn cross_directory_move_to_a_different_name_does_not_alert() {
+    // The file name is not preserved: no appended-suffix relation at all.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD * 2 {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9304,
+            "mv",
+            &format!("/home/u/docs/f{i}.docx"),
+            &format!("/backup/g{i}.pdf"),
+            u64::from(i) * 50_000_000,
+        )));
+    }
+    assert!(alerts.is_empty());
+}
+
+#[test]
+fn cross_directory_log_rotation_does_not_alert() {
+    // /var/log/app.log -> /var/log/archive/app.log.1: an all-digit suffix is the
+    // one rotation shape a shape signal can settle, cross-directory or not.
+    let alerts = cross_dir_burst("logrotate", "/var/log", "/var/log/archive", ".log", ".1");
+    assert!(alerts.is_empty());
+}
+
+#[test]
+fn maildir_delivery_from_new_to_cur_does_not_alert() {
+    // new/<msg> -> cur/<msg>:2,S: a cross-directory rename appending exactly the
+    // Maildir info marker, once per message a client opens. "Mark all read" on a
+    // large folder is 20+ of them from one IMAP pid.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD * 2 {
+        alerts.extend(state.on_file_rename(&file_rename_event_full(
+            9305,
+            "dovecot-imapd",
+            &format!("/home/u/Maildir/new/171{i}.host"),
+            &format!("/home/u/Maildir/cur/171{i}.host:2,S"),
+            u64::from(i) * 50_000_000,
+        )));
+    }
+    assert!(alerts.is_empty());
+}
+
+#[test]
+fn maildir_info_marker_with_an_invalid_flag_letter_still_alerts() {
+    // The structural gate stays tight: "X" is not a Maildir flag letter.
+    let alerts = cross_dir_burst(
+        "evil",
+        "/home/u/Maildir/new",
+        "/home/u/Maildir/cur",
+        "",
+        ":2,SX",
+    );
+    assert_eq!(alerts.len(), 1);
+}
+
+// ── T1486 write-new-then-unlink (#512 part B) ──────────────────────────────
+
+const O_NEW_FILE: u32 = O_WRONLY | O_CREAT;
+
+/// One file of an encryptor-shaped pass: create `dir/f{i}.docx.locked`, then unlink
+/// `dir/f{i}.docx`, both from `pid`. `unlink_first` feeds the unlink before the
+/// creation, the arrival order the two independently drained ring buffers allow.
+fn create_then_unlink(
+    state: &mut RuleState,
+    pid: u32,
+    comm: &str,
+    i: u32,
+    unlink_first: bool,
+) -> Vec<crate::Alert> {
+    let ts = u64::from(i) * 100_000_000;
+    let created = file_open_event_full(
+        pid,
+        comm,
+        &format!("/home/u/docs/f{i}.docx.locked"),
+        O_NEW_FILE,
+        ts,
+    );
+    let deleted = file_delete_event_full(pid, comm, &format!("/home/u/docs/f{i}.docx"), ts + 1_000);
+    let mut alerts = Vec::new();
+    if unlink_first {
+        alerts.extend(state.on_file_delete(&deleted));
+        alerts.extend(state.on_file_open(&created));
+    } else {
+        alerts.extend(state.on_file_open(&created));
+        alerts.extend(state.on_file_delete(&deleted));
+    }
+    alerts
+}
+
+fn write_new_then_unlink_burst(
+    state: &mut RuleState,
+    pid: u32,
+    comm: &str,
+    unlink_first: bool,
+) -> Vec<crate::Alert> {
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(create_then_unlink(state, pid, comm, i, unlink_first));
+    }
+    alerts
+}
+
+#[test]
+fn write_new_then_unlink_burst_alerts() {
+    let mut state = RuleState::new();
+    let alerts = write_new_then_unlink_burst(&mut state, 9400, "encryptor", false);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+    assert!(alerts[0].message.contains("write-new-then-unlink"));
+}
+
+#[test]
+fn write_new_then_unlink_alerts_when_the_unlink_is_processed_first() {
+    // The open and delete ring buffers are drained independently: the unlink can be
+    // processed before the creation the kernel made first (the #503 ordering hazard).
+    let mut state = RuleState::new();
+    let alerts = write_new_then_unlink_burst(&mut state, 9401, "encryptor", true);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+}
+
+/// A whole burst of one kind drained before the other, as the two ring buffers do live
+/// (#512 part B, found on the Hyper-V lab: 30 unlinks were processed before their
+/// creations, and a 16-entry history could never reach the threshold of 20).
+fn batched_write_new_then_unlink(pid: u32, unlinks_first: bool) -> Vec<crate::Alert> {
+    let mut state = RuleState::new();
+    let n = RANSOMWARE_RENAME_THRESHOLD * 3 / 2;
+    let mut alerts = Vec::new();
+    let creates = |state: &mut RuleState, alerts: &mut Vec<crate::Alert>| {
+        for i in 0..n {
+            let ts = u64::from(i) * 100_000_000;
+            let path = format!("/home/u/docs/f{i}.docx.locked");
+            alerts.extend(state.on_file_open(&file_open_event_full(
+                pid,
+                "encryptor",
+                &path,
+                O_NEW_FILE,
+                ts,
+            )));
+        }
+    };
+    let unlinks = |state: &mut RuleState, alerts: &mut Vec<crate::Alert>| {
+        for i in 0..n {
+            let ts = u64::from(i) * 100_000_000 + 1_000;
+            let path = format!("/home/u/docs/f{i}.docx");
+            alerts.extend(state.on_file_delete(&file_delete_event_full(
+                pid,
+                "encryptor",
+                &path,
+                ts,
+            )));
+        }
+    };
+    if unlinks_first {
+        unlinks(&mut state, &mut alerts);
+        creates(&mut state, &mut alerts);
+    } else {
+        creates(&mut state, &mut alerts);
+        unlinks(&mut state, &mut alerts);
+    }
+    alerts
+}
+
+#[test]
+fn a_batch_of_creations_then_a_batch_of_unlinks_alerts() {
+    let alerts = batched_write_new_then_unlink(9410, false);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+}
+
+#[test]
+fn a_batch_of_unlinks_then_a_batch_of_creations_alerts() {
+    let alerts = batched_write_new_then_unlink(9411, true);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+}
+
+#[test]
+fn a_long_burst_yields_exactly_one_alert() {
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD * 2 {
+        alerts.extend(create_then_unlink(&mut state, 9402, "encryptor", i, false));
+    }
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn write_new_then_unlink_across_directories_alerts() {
+    // create ~/.stash/f.docx.locked, unlink ~/docs/f.docx
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        let ts = u64::from(i) * 100_000_000;
+        alerts.extend(state.on_file_open(&file_open_event_full(
+            9403,
+            "encryptor",
+            &format!("/home/u/.stash/f{i}.docx.locked"),
+            O_NEW_FILE,
+            ts,
+        )));
+        alerts.extend(state.on_file_delete(&file_delete_event_full(
+            9403,
+            "encryptor",
+            &format!("/home/u/docs/f{i}.docx"),
+            ts + 1_000,
+        )));
+    }
+    assert_eq!(alerts.len(), 1);
+}
+
+/// Runs the burst as a compression tool would, after `exec_image` (`None` = no exec
+/// seen for the pid).
+fn compressor_burst(comm: &str, exec_image: Option<&str>) -> Vec<crate::Alert> {
+    let mut state = RuleState::new();
+    if let Some(image) = exec_image {
+        state.on_exec(&memfd_exec_event(9410, comm, image, 0));
+    }
+    write_new_then_unlink_burst(&mut state, 9410, comm, false)
+}
+
+/// The same burst with a chosen output suffix, `.log.1` → `.log.1<suffix>`: what
+/// `logrotate` with `compress` produces when it opens the output and unlinks the input
+/// itself (both under `comm=logrotate`, #527 review).
+fn logrotate_burst(image: Option<&str>, suffix: &str) -> Vec<crate::Alert> {
+    let mut state = RuleState::new();
+    if let Some(image) = image {
+        state.on_exec(&memfd_exec_event(9420, "logrotate", image, 0));
+    }
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        let ts = u64::from(i) * 100_000_000;
+        alerts.extend(state.on_file_open(&file_open_event_full(
+            9420,
+            "logrotate",
+            &format!("/var/log/app{i}.log.1{suffix}"),
+            O_NEW_FILE,
+            ts,
+        )));
+        alerts.extend(state.on_file_delete(&file_delete_event_full(
+            9420,
+            "logrotate",
+            &format!("/var/log/app{i}.log.1"),
+            ts + 1_000,
+        )));
+    }
+    alerts
+}
+
+#[test]
+fn logrotate_compressing_its_logs_does_not_alert() {
+    for suffix in [".gz", ".xz", ".bz2", ".zst"] {
+        assert!(
+            logrotate_burst(Some("/usr/sbin/logrotate"), suffix).is_empty(),
+            "{suffix}"
+        );
+    }
+}
+
+#[test]
+fn logrotate_writing_a_non_compression_suffix_still_alerts() {
+    // The suffix gate: a trusted logrotate does not make `.locked` benign.
+    let alerts = logrotate_burst(Some("/usr/sbin/logrotate"), ".locked");
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+}
+
+#[test]
+fn a_logrotate_comm_from_an_untrusted_or_unknown_path_still_alerts() {
+    for image in [Some("/tmp/logrotate"), Some("/usr/bin/python3"), None] {
+        let alerts = logrotate_burst(image, ".gz");
+        assert_eq!(alerts.len(), 1, "{image:?}");
+    }
+}
+
+#[test]
+fn a_real_compressor_does_not_alert() {
+    // Measured live: gzip/xz/bzip2/zstd each did 30 create-X.ext-then-unlink-X in 5s.
+    for (comm, image) in [
+        ("gzip", "/usr/bin/gzip"),
+        ("xz", "/usr/bin/xz"),
+        ("bzip2", "/usr/bin/bzip2"),
+        ("zstd", "/usr/bin/zstd"),
+    ] {
+        assert!(compressor_burst(comm, Some(image)).is_empty(), "{comm}");
+    }
+}
+
+#[test]
+fn a_compressor_comm_from_an_untrusted_path_still_alerts() {
+    // The evidence gate's actual job: an encryptor can set comm="gzip" for free, but
+    // not make its own binary live under a trusted system prefix.
+    let alerts = compressor_burst("gzip", Some("/tmp/gzip"));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+}
+
+#[test]
+fn a_trusted_binary_that_renames_its_comm_to_a_compressor_still_alerts() {
+    // A process running the system python3 can prctl(PR_SET_NAME) itself to "gzip":
+    // the exec-time path is trusted, but it is not a binary *named* gzip.
+    let alerts = compressor_burst("gzip", Some("/usr/bin/python3"));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+}
+
+#[test]
+fn a_compressor_comm_with_no_known_exec_path_fails_closed() {
+    // No exec seen (a forked child that only set comm=gzip): unknown is not evidence
+    // of /usr/bin/gzip, and the process controls it. Unlike most name-keyed exclusions
+    // this one alerts, same reasoning as the sed/perl exclusion.
+    let alerts = compressor_burst("gzip", None);
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn an_encryptor_that_names_its_output_dot_gz_still_alerts() {
+    // A suffix allowlist would be free to copy: the exclusion is on the process, not
+    // on the `.gz` shape.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        let ts = u64::from(i) * 100_000_000;
+        alerts.extend(state.on_file_open(&file_open_event_full(
+            9411,
+            "encryptor",
+            &format!("/home/u/docs/f{i}.docx.gz"),
+            O_NEW_FILE,
+            ts,
+        )));
+        alerts.extend(state.on_file_delete(&file_delete_event_full(
+            9411,
+            "encryptor",
+            &format!("/home/u/docs/f{i}.docx"),
+            ts + 1_000,
+        )));
+    }
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn a_rotation_suffix_or_a_maildir_delivery_does_not_pair() {
+    // (deleted path, created path): a rotation suffix anywhere, and a Maildir delivery,
+    // which is a move from `new/` into the `cur/` beside it.
+    for (dir_old, dir_new, suffix) in [
+        ("/home/u", "/home/u", ".1"),
+        ("/home/u", "/home/u", "-20260929"),
+        ("/home/u/Maildir/new", "/home/u/Maildir/cur", ":2,S"),
+        ("/home/u/Maildir/new", "/home/u/Maildir/cur", ":2,Sa"),
+    ] {
+        let mut state = RuleState::new();
+        let mut alerts = Vec::new();
+        for i in 0..RANSOMWARE_RENAME_THRESHOLD * 2 {
+            let ts = u64::from(i) * 50_000_000;
+            alerts.extend(state.on_file_open(&file_open_event_full(
+                9420,
+                "app",
+                &format!("{dir_new}/f{i}.log{suffix}"),
+                O_NEW_FILE,
+                ts,
+            )));
+            alerts.extend(state.on_file_delete(&file_delete_event_full(
+                9420,
+                "app",
+                &format!("{dir_old}/f{i}.log"),
+                ts + 1_000,
+            )));
+        }
+        assert!(alerts.is_empty(), "{dir_old} -> {dir_new} {suffix:?}");
+    }
+}
+
+#[test]
+fn a_maildir_shaped_suffix_outside_a_new_to_cur_move_still_pairs() {
+    // #526 review, same hole on the create/unlink side: `:2,locked` is a free extension.
+    for (dir_old, dir_new) in [
+        ("/home/u/docs", "/home/u/docs"),
+        ("/home/u/docs", "/home/u/stash"),
+        ("/home/u/A/new", "/home/u/B/cur"),
+    ] {
+        let mut state = RuleState::new();
+        let mut alerts = Vec::new();
+        for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+            let ts = u64::from(i) * 50_000_000;
+            alerts.extend(state.on_file_open(&file_open_event_full(
+                9421,
+                "evil",
+                &format!("{dir_new}/f{i}.docx:2,locked"),
+                O_NEW_FILE,
+                ts,
+            )));
+            alerts.extend(state.on_file_delete(&file_delete_event_full(
+                9421,
+                "evil",
+                &format!("{dir_old}/f{i}.docx"),
+                ts + 1_000,
+            )));
+        }
+        assert_eq!(alerts.len(), 1, "{dir_old} -> {dir_new}");
+    }
+}
+
+#[test]
+fn a_new_file_that_does_not_extend_the_deleted_name_does_not_pair() {
+    // `cp new old-name-different && rm old`: nothing in the names relates them.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD * 2 {
+        let ts = u64::from(i) * 50_000_000;
+        alerts.extend(state.on_file_open(&file_open_event_full(
+            9421,
+            "tool",
+            &format!("/home/u/out/g{i}.dat"),
+            O_NEW_FILE,
+            ts,
+        )));
+        alerts.extend(state.on_file_delete(&file_delete_event_full(
+            9421,
+            "tool",
+            &format!("/home/u/in/f{i}.docx"),
+            ts + 1_000,
+        )));
+    }
+    assert!(alerts.is_empty());
+}
+
+#[test]
+fn a_creation_and_unlink_too_far_apart_do_not_pair() {
+    let mut state = RuleState::new();
+    let created = file_open_event_full(9422, "tool", "/home/u/f.docx.locked", O_NEW_FILE, 0);
+    assert!(state.on_file_open(&created).is_empty());
+    let late = file_delete_event_full(9422, "tool", "/home/u/f.docx", 61_000_000_000);
+    assert!(state.on_file_delete(&late).is_empty());
+    // ...and the unlink was parked, not counted: nothing pairs it afterwards either.
+    let mut alerts = Vec::new();
+    for i in 1..RANSOMWARE_RENAME_THRESHOLD {
+        alerts.extend(create_then_unlink(&mut state, 9422, "tool", i + 700, false));
+    }
+    assert!(alerts.is_empty());
+}
+
+#[test]
+fn opens_that_are_not_new_files_are_not_creations() {
+    // A read-only open, or a write open without O_CREAT (appending to an existing
+    // file): not the "new file" half, so an unlink of the original pairs with nothing.
+    for flags in [O_RDONLY, O_WRONLY] {
+        let mut state = RuleState::new();
+        let mut alerts = Vec::new();
+        for i in 0..RANSOMWARE_RENAME_THRESHOLD * 2 {
+            let ts = u64::from(i) * 50_000_000;
+            alerts.extend(state.on_file_open(&file_open_event_full(
+                9423,
+                "tool",
+                &format!("/home/u/f{i}.docx.locked"),
+                flags,
+                ts,
+            )));
+            alerts.extend(state.on_file_delete(&file_delete_event_full(
+                9423,
+                "tool",
+                &format!("/home/u/f{i}.docx"),
+                ts + 1_000,
+            )));
+        }
+        assert!(alerts.is_empty(), "flags {flags:#o}");
+    }
+}
+
+#[test]
+fn non_unix_events_are_not_tracked() {
+    // Windows/macOS producers of this shape were not measured: Unix events only.
+    let mut state = RuleState::new();
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD * 2 {
+        let ts = u64::from(i) * 50_000_000;
+        let mut created = file_open_event_full(
+            9424,
+            "tool.exe",
+            &format!(r"C:\docs\f{i}.docx.locked"),
+            O_NEW_FILE,
+            ts,
+        );
+        created.meta.user = schema::User::Windows {
+            sid: "S-1-5-21-0-0-0-1000".to_string(),
+            integrity_level: Some(0x2000),
+        };
+        let mut deleted =
+            file_delete_event_full(9424, "tool.exe", &format!(r"C:\docs\f{i}.docx"), ts + 1_000);
+        deleted.meta.user = created.meta.user.clone();
+        alerts.extend(state.on_file_open(&created));
+        alerts.extend(state.on_file_delete(&deleted));
+    }
+    assert!(alerts.is_empty());
 }
 
 // ── T1486 write-volume corroboration (issue #82) ───────────────────────────

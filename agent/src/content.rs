@@ -357,6 +357,13 @@ fn ensure_within_state_dir(path: &Path, state_dir: &Path, flag_name: &str) -> an
     }
 }
 
+/// Where applied content lives by default. The single definition shared by
+/// `apply-content-manifest` (writer) and `run` (reader): they must agree, or
+/// content that was downloaded and verified is never loaded.
+pub(crate) fn default_content_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("content")
+}
+
 /// Resolves `--content-dir`/`--state` for `apply-content-manifest`: left
 /// unset, each defaults to a fixed name under `state_dir`
 /// (`cfg.storage.state_dir`); given explicitly, each must still resolve
@@ -377,7 +384,7 @@ pub(crate) fn resolve_content_paths(
             ensure_within_state_dir(&dir, state_dir, "content-dir")?;
             dir
         }
-        None => state_dir.join("content"),
+        None => default_content_dir(state_dir),
     };
     let state_path = match state_path {
         Some(path) => {
@@ -392,7 +399,11 @@ pub(crate) fn resolve_content_paths(
 /// Fetches the content manifest for `ring`, verifies it exactly like
 /// [`cmd_check_content_manifest`], and — unlike that command — actually
 /// downloads and writes every entry that's missing or stale under
-/// `content_dir`, then records what was applied in `state_path`.
+/// `content_dir`, then records what was applied in `state_path`. On
+/// success, best-effort notifies an already-running `agent run` at
+/// `ipc_endpoint` to reload the content it just applied (issue #30) — see
+/// [`notify_running_agent`] for why a failed notification is not a hard
+/// error here.
 ///
 /// # Errors
 ///
@@ -406,6 +417,7 @@ pub(crate) fn cmd_apply_content_manifest(
     key: Option<&Path>,
     content_dir: &Path,
     state_path: &Path,
+    ipc_endpoint: &str,
 ) -> anyhow::Result<()> {
     let client = build_client(server, cert, key)?;
     let url = client.config().content_manifest_url(ring);
@@ -428,7 +440,69 @@ pub(crate) fn cmd_apply_content_manifest(
         fetch_plan.release_version,
         if fetched == 1 { "y" } else { "ies" }
     );
+
+    match notify_running_agent(ipc_endpoint) {
+        Ok(report) => {
+            println!(
+                "notified the running agent — reloaded (sigma: {}, yara: {})",
+                describe_reload_count(report.sigma_rule_count),
+                describe_reload_count(report.yara_rule_count),
+            );
+            for (engine, failed) in [
+                ("sigma", report.sigma_reload_failed),
+                ("yara", report.yara_reload_failed),
+            ] {
+                if failed {
+                    eprintln!(
+                        "warning: the {engine} content failed to load; the agent kept its \
+                         previous {engine} rules (see the agent log)"
+                    );
+                }
+            }
+        }
+        Err(e) => println!(
+            "no running agent to notify at {ipc_endpoint} ({e}) — already applied to disk, \
+             will be picked up on the agent's next start"
+        ),
+    }
     Ok(())
+}
+
+/// One line for a [`ipc::ReloadContentResponse`] count field: `None` means
+/// that content subdirectory is absent, not an error.
+fn describe_reload_count(count: Option<usize>) -> String {
+    match count {
+        Some(n) => format!("{n} rules"),
+        None => "absent".to_string(),
+    }
+}
+
+/// Tells an already-running `agent run` at `ipc_endpoint` to reload content
+/// (issue #30) — a short-lived connection, exactly one request, then
+/// dropped. Deliberately **not** treated as a hard error by the caller: the
+/// content is already correctly downloaded, verified, and written to disk
+/// regardless of whether a live agent happens to be listening right now (no
+/// agent running yet, a stale/misconfigured endpoint, or the agent process
+/// simply not up at this moment are all normal, not failures of this
+/// command's own job).
+///
+/// # Errors
+///
+/// Returns an error (as a `String` — this is a best-effort notification,
+/// not a typed API another caller pattern-matches on) if a short-lived
+/// current-thread runtime cannot be built, the connection fails, or the
+/// agent's own handler reports a failure.
+fn notify_running_agent(ipc_endpoint: &str) -> Result<ipc::ReloadContentResponse, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    runtime.block_on(async {
+        let mut client = ipc::Client::connect(ipc_endpoint, "agent-apply-content-manifest")
+            .await
+            .map_err(|e| e.to_string())?;
+        client.reload_content().await.map_err(|e| e.to_string())
+    })
 }
 
 #[cfg(test)]
@@ -842,6 +916,15 @@ mod tests {
     }
 
     #[test]
+    fn run_and_apply_default_to_the_same_content_dir() {
+        // A default mismatch once left applied content on disk that the
+        // running agent never read (issue #530).
+        let state_dir = tmp("default-content-dir-agrees");
+        let (apply_default, _) = resolve_content_paths(&state_dir, None, None).unwrap();
+        assert_eq!(apply_default, default_content_dir(&state_dir));
+    }
+
+    #[test]
     fn a_not_yet_existing_subdirectory_under_state_dir_still_resolves_within_it() {
         // `resolve_as_far_as_possible` must not require the directory to
         // exist yet — the whole point is validating a path before it's
@@ -851,5 +934,28 @@ mod tests {
         let (content_dir, _) =
             resolve_content_paths(&state_dir, Some(future_content_dir.clone()), None).unwrap();
         assert_eq!(content_dir, future_content_dir);
+    }
+
+    // ── notify_running_agent (issue #30) ────────────────────────────────
+
+    /// The concrete case `cmd_apply_content_manifest`'s own doc comment
+    /// names: no agent is running at `ipc_endpoint` (or it's a stale/wrong
+    /// path). This must surface as an `Err` the caller can log and move on
+    /// from, never a panic — content already reached disk regardless of
+    /// whether a live agent is listening.
+    #[test]
+    fn notify_running_agent_returns_an_error_when_nothing_is_listening() {
+        let endpoint = std::env::temp_dir()
+            .join(format!(
+                "synthaea-notify-test-nothing-here-{}.sock",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        let result = notify_running_agent(&endpoint);
+        assert!(
+            result.is_err(),
+            "connecting to a socket nothing listens on must fail, not panic"
+        );
     }
 }

@@ -177,15 +177,25 @@ pub(crate) const APK_STAGING_FILE_PREFIX: &str = ".apk.";
 pub(crate) const PACKAGE_MANAGER_COMMS: &[&str] = &["dpkg", "dpkg-deb", "apt", "apt-get", "apk"];
 
 /// `comm` values of in-place stream-edit tools whose `-i.<suffix>`/`-i .<suffix>`
-/// backup convention (`sed -i.bak 's/old/new/' *.conf`, `perl -i.orig -pe … *`)
-/// matches `check_mass_rename_pattern`'s ransomware shape exactly: one pid,
+/// backup convention (`sed -i.bak 's/old/new/' *.conf`) matches `check_mass_rename_pattern`'s ransomware shape exactly: one pid,
 /// prefix-preserving, lettered suffix, 20+ files in one command (#459 part 1,
 /// #455 review). Gated on `comm` + `policy::name_exclusion_applies` together,
 /// never `comm` alone (CLAUDE.md — an encryptor can set `comm=sed` for free;
 /// [`FileRenameEvent::executable_path`] existing is what makes gating on the
 /// trusted-system-path half possible at all here, where before there was
 /// nothing to gate against).
-pub(crate) const IN_PLACE_EDIT_COMMS: &[&str] = &["sed", "perl"];
+///
+/// `sed` only, not `perl`: `sed -i<suffix>` can do nothing but write a backup copy of
+/// the original, while `perl` is an interpreter and the trusted binary named `perl`
+/// runs whatever script it is given, so listing it would let any mass rename written
+/// in Perl through, with any suffix (#528 review, live on Alpine). The cost is small:
+/// measured on perl 5.42, `perl -i.bak` does not rename the original to `f.bak` at all
+/// (it writes a temp file and renames that onto the original), so it never matched the
+/// appended-suffix shape; only a perl older than 5.28, which did rename the original,
+/// alerts on 20+ files as a consequence. Recognising the real `-i` shape (the original re-created by the same pid right after the rename)
+/// would settle both tools but needs the create history the rename rule does not
+/// consult.
+pub(crate) const IN_PLACE_EDIT_COMMS: &[&str] = &["sed"];
 
 /// Valid Maildir flag letters (Draft/Flagged/Passed/Replied/Seen/Trashed —
 /// the Maildir spec's own convention, unrelated to any ATT&CK id despite the
@@ -195,6 +205,50 @@ pub(crate) const IN_PLACE_EDIT_COMMS: &[&str] = &["sed", "perl"];
 /// IMAP pid. See [`crate::state::is_maildir_flag_change`]'s doc for why this
 /// one is deliberately not also comm-gated.
 pub(crate) const MAILDIR_FLAG_LETTERS: &[u8] = b"DFPRST";
+
+/// `comm` values of compression tools. Their normal operation is exactly the
+/// write-new-then-unlink shape (`gzip f` creates `f.gz`, then unlinks `f`), and one
+/// process handles a whole `*.log` glob: measured live (Debian 13, #512 part B),
+/// `gzip`, `xz`, `bzip2` and `zstd` each reached a burst of 30 in 5 s over 30 files,
+/// the same as an encryptor. Gated on `comm` + a trusted exec-time image path together,
+/// failing closed, never on `comm` or on the output suffix alone (CLAUDE.md: an
+/// encryptor can set `comm=gzip`, or name its output `.gz`, for free).
+pub(crate) const COMPRESSOR_COMMS: &[&str] = &[
+    "gzip", "bzip2", "xz", "zstd", "lz4", "pigz", "pbzip2", "lzma",
+];
+
+/// `comm` values of tools that compress by *driving* a compressor rather than being one:
+/// `logrotate` with `compress` opens the `.gz` output itself, forks, `dup2`s it onto the
+/// child's stdout, execs `gzip` on stdin and unlinks the original itself, so the create
+/// and the unlink both carry `comm=logrotate` and [`COMPRESSOR_COMMS`] never applies
+/// (measured live on Alpine, #527 review; daily on any Debian/Ubuntu host rotating 20+
+/// logs). Gated like the compressors (trusted binary named `comm`) **and** on the new
+/// file's suffix being a compression extension ([`COMPRESSION_SUFFIXES`]).
+pub(crate) const COMPRESSION_DRIVER_COMMS: &[&str] = &["logrotate"];
+
+/// Suffixes a compression driver appends. Only meaningful together with
+/// [`COMPRESSION_DRIVER_COMMS`]: on their own they are free for an encryptor to copy.
+pub(crate) const COMPRESSION_SUFFIXES: &[&str] = &[".gz", ".xz", ".bz2", ".zst", ".lz4", ".lzma"];
+
+/// How long a creation and the unlink of the file it replaced may be apart and still
+/// count as one write-new-then-unlink (#512 part B). Generous on purpose: an encryptor
+/// creates `f.locked` at the start of a file and unlinks `f` only once the whole
+/// content is written, which for a large file is seconds, not milliseconds.
+pub(crate) const CREATE_UNLINK_PAIR_WINDOW_NS: u64 = 60_000_000_000; // 60s
+
+/// Creations and unmatched unlinks remembered per pid for that pairing. The open and
+/// delete ring buffers are drained independently, so a whole burst of one kind can be
+/// processed before the other (live, #512: 30 unlinks first, then 30 creations): the
+/// history must hold more than [`RANSOMWARE_RENAME_THRESHOLD`] entries or the burst can
+/// never be paired up to the threshold. 64 leaves headroom for a batch of about three
+/// times the threshold.
+pub(crate) const CREATE_UNLINK_HISTORY_PER_PID: usize = 64;
+
+/// Pids tracked for that pairing. A dedicated, smaller bound than the pid tables: each
+/// entry holds up to [`CREATE_UNLINK_HISTORY_PER_PID`] path strings, so the worst case
+/// (`cap x per-pid x path`, two maps) stays around ten MB rather than the ~200 MB the
+/// 65k-pid tables would allow.
+pub(crate) const CREATE_UNLINK_PID_CAP: usize = 1_024;
 
 /// Pairing window for one scheduled-task registration seen on both Security 4698
 /// and TaskScheduler/Operational 106 (#422, T1053.005). The two are normalized by

@@ -5,7 +5,7 @@
 //! and a few lines in `on_event`.
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -48,16 +48,21 @@ pub(crate) struct DetectionSink {
     /// model is unavailable (missing registry, load error) — the agent works without
     /// ML (hand-calibrated features still function).
     ml_scorer: Mutex<Option<ml::CorrelationScorer>>,
-    /// Sigma rules from `rules/sigma` (next to the agent executable, falling back
-    /// to the working directory) when the folder exists — otherwise the agent runs without a Sigma engine, and that is
-    /// not an error (the load failure path IS an error: content present but broken).
-    sigma: Option<sigma::SigmaEngine>,
+    /// Sigma rules from `<content_root>/rules/sigma` when the folder exists —
+    /// otherwise the agent runs without a Sigma engine, and that is not an
+    /// error (the load failure path IS an error: content present but
+    /// broken). `Mutex`-wrapped (issue #30): `reload_content` swaps in a
+    /// freshly loaded engine while the agent keeps running, the same reason
+    /// every other mutable field on this struct is a `Mutex`.
+    sigma: Mutex<Option<sigma::SigmaEngine>>,
     /// The single alert funnel (issue #388): alerts.ndjson + stderr + the
     /// in-memory recent-alerts buffer served to `cli detections`. Shared with
     /// the YARA scan worker and quarantine.
     alert_log: Arc<AlertLog>,
-    /// Budgeted background content scanning; `None` when rules/yara is absent.
-    yara: Option<yara::ScanQueue>,
+    /// Budgeted background content scanning; `None` when
+    /// `<content_root>/rules/yara` is absent. `Mutex`-wrapped for the same
+    /// reload reason as `sigma`.
+    yara: Mutex<Option<(yara::ScanQueue, usize)>>,
     /// Enrichment (hash + signature) and the high-volume raw-event logging, off the
     /// drain thread (issue #126). The capture thread runs detection in memory and
     /// hands the event here with a non-blocking send.
@@ -84,6 +89,12 @@ pub(crate) struct DetectionSink {
     /// queue.rs`'s settle delay) and carries no pid/entity context today — wiring
     /// that through is separate follow-up work, not part of this pass.
     verdict: Mutex<verdict::VerdictEngine>,
+    /// Resolved once at construction ([`resolve_content_root`]) and reused
+    /// by every `reload_content` call — the exe/cwd resolution reflects
+    /// where the process actually started, which does not change at
+    /// runtime, so re-resolving on every reload would add nothing but a
+    /// syscall.
+    content_root: PathBuf,
 }
 
 /// How long a technique already recorded for an entity stays "the same finding":
@@ -134,13 +145,21 @@ impl DetectionSink {
     /// `rule_state` arrives already seeded by the caller (from /proc or the
     /// platform's process list — see `commands`). `spool` is the transport
     /// spool (`run --server`), `None` when the agent runs standalone.
+    /// `content_dir` is where `agent apply-content-manifest --content-dir`
+    /// writes downloaded content (issue #30) — resolved once here via
+    /// [`resolve_content_root`] and reused by every later `reload_content`
+    /// call, so the two commands agree on one directory instead of the
+    /// agent loading from a different, hardcoded location than the one
+    /// content was actually applied to.
     pub(crate) fn new(
         rule_state: rules::RuleState,
         alerts_path: &std::path::Path,
         events_path: &std::path::Path,
         spool: Option<Arc<Mutex<store::EventSpool>>>,
+        content_dir: &Path,
     ) -> std::io::Result<Self> {
         let alert_log = Arc::new(AlertLog::open(alerts_path, RECENT_ALERTS_CAPACITY)?);
+        let content_root = resolve_content_root(content_dir);
         // The raw event log is written by the enrichment worker, not the drain
         // thread — shared behind an Arc so the worker owns a handle. The spool
         // append rides the same worker for the same #126 reason: it is file
@@ -161,14 +180,73 @@ impl DetectionSink {
             rule_state: Mutex::new(rule_state),
             correlator: Mutex::new(correlator::CorrelationEngine::new()),
             ml_scorer: Mutex::new(Self::load_correlation_scorer()),
-            sigma: load_sigma_rules(),
-            yara: start_yara(alert_log.clone(), response.clone()),
+            sigma: Mutex::new(load_sigma_rules(&content_root).into_option()),
+            yara: Mutex::new(
+                start_yara(&content_root, alert_log.clone(), response.clone()).into_option(),
+            ),
             alert_log,
             enrich_queue,
             progress: Arc::new(AtomicU64::new(0)),
             response,
             verdict: Mutex::new(verdict::VerdictEngine::new(VERDICT_DEDUP_WINDOW_NS)),
+            content_root,
         })
+    }
+
+    /// Re-reads Sigma/YARA content from [`Self::content_root`] and swaps it
+    /// into the running pipeline (issue #30, IPC `ReloadContent`) — the way
+    /// content `agent apply-content-manifest` just downloaded and verified
+    /// takes effect without restarting the agent.
+    ///
+    /// An *absent* content subdirectory unloads that engine (same "not an
+    /// error" posture startup has always had). A present-but-*broken* one
+    /// keeps the previous engine running and is reported as failed: a bad
+    /// rule file must never leave a live agent without that engine, which
+    /// startup can afford (nothing was protecting yet) and a reload cannot.
+    /// Note the asymmetry in the engines' own loaders: YARA fails the whole
+    /// set on one bad rule, while Sigma skips (and warns about) an individual
+    /// bad rule, so a partly broken Sigma set loads *fewer* rules and is only
+    /// visible through the reported count.
+    pub(crate) fn reload_content(&self) -> ReloadReport {
+        // Parse/compile first, lock only for the swap: `on_event` takes these
+        // locks on the capture thread for every exec and write-open, so loading
+        // under them would stall capture for the whole load, which grows with
+        // the rule set (PR #531 review).
+        let sigma_loaded = load_sigma_rules(&self.content_root);
+        let yara_loaded = start_yara(
+            &self.content_root,
+            self.alert_log.clone(),
+            self.response.clone(),
+        );
+
+        // The replaced engines are dropped after the locks are released: a
+        // `ScanQueue` joins its worker on drop, which must not stall capture.
+        let mut sigma_slot = self.sigma.lock().unwrap();
+        let (sigma_reload_failed, old_sigma) = match sigma_loaded {
+            Load::Loaded(engine) => (false, sigma_slot.replace(engine)),
+            Load::Absent => (false, sigma_slot.take()),
+            Load::Failed => (true, None),
+        };
+        let sigma_rule_count = sigma_slot.as_ref().map(sigma::SigmaEngine::rule_count);
+        drop(sigma_slot);
+        drop(old_sigma);
+
+        let mut yara_slot = self.yara.lock().unwrap();
+        let (yara_reload_failed, old_yara) = match yara_loaded {
+            Load::Loaded(loaded) => (false, yara_slot.replace(loaded)),
+            Load::Absent => (false, yara_slot.take()),
+            Load::Failed => (true, None),
+        };
+        let yara_rule_count = yara_slot.as_ref().map(|(_, count)| *count);
+        drop(yara_slot);
+        drop(old_yara);
+
+        ReloadReport {
+            sigma_rule_count,
+            yara_rule_count,
+            sigma_reload_failed,
+            yara_reload_failed,
+        }
     }
 
     /// Loads the ML correlation scorer from the registry (issue #46 Phase 3, #47 Phase 2).
@@ -445,7 +523,8 @@ impl DetectionSink {
     fn detect_exec(&self, wrapped: &Event, event: &schema::ExecEvent) {
         self.record_rule_alerts(wrapped, rules::evaluate_exec(event));
         self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_exec(event));
-        if let Some(sigma) = &self.sigma {
+        let sigma_guard = self.sigma.lock().unwrap();
+        if let Some(sigma) = sigma_guard.as_ref() {
             let entity = verdict::EntityKey::new(event.meta.ppid, event.meta.comm.clone());
             for hit in sigma.eval_exec(event) {
                 let technique = if hit.tags.is_empty() {
@@ -478,8 +557,8 @@ impl DetectionSink {
                 .into_iter()
                 .chain(state_alerts),
         );
-        if let Some(yara) = &self.yara
-            && event.flags & 0o103 != 0
+        if event.flags & 0o103 != 0
+            && let Some((yara, _)) = self.yara.lock().unwrap().as_ref()
         {
             yara.enqueue(std::path::PathBuf::from(&event.path));
         }
@@ -522,9 +601,15 @@ impl DetectionSink {
         self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_auth(event));
     }
 
-    /// `FileDelete` events: log-tamper detection (T1070.001/.002, pack #379).
+    /// `FileDelete` events: log-tamper detection (T1070.001/.002, pack #379), then the
+    /// unlink half of the write-new-then-unlink T1486 shape (#512 part B), which needs
+    /// the creation history `on_file_open` keeps.
     fn detect_file_delete(&self, wrapped: &Event, event: &schema::FileDeleteEvent) {
         self.record_rule_alerts(wrapped, rules::evaluate_file_delete(event));
+        self.record_rule_alerts(
+            wrapped,
+            self.rule_state.lock().unwrap().on_file_delete(event),
+        );
     }
 
     /// `Signal` events: security-process tampering (T1562.001, issue #362).
@@ -576,52 +661,99 @@ impl DetectionSink {
     }
 }
 
-/// Resolves a content directory: next to the agent executable first, then the
-/// working directory. A cwd-relative path alone breaks under service managers
-/// (systemd runs with cwd=/, Windows services in System32), which silently
-/// disabled Sigma and YARA exactly in production deployments (review finding).
-fn content_dir(name: &str) -> Option<std::path::PathBuf> {
+/// What [`DetectionSink::reload_content`] (and, indirectly, [`DetectionSink::new`])
+/// reports about what's loaded after a (re)load.
+pub(crate) struct ReloadReport {
+    /// Rules loaded *after* the reload (the previous set if the reload failed).
+    pub(crate) sigma_rule_count: Option<usize>,
+    pub(crate) yara_rule_count: Option<usize>,
+    /// The content was present but failed to load; the previous engine kept running.
+    pub(crate) sigma_reload_failed: bool,
+    pub(crate) yara_reload_failed: bool,
+}
+
+/// Outcome of loading one content directory.
+enum Load<T> {
+    /// The directory does not exist — not an error.
+    Absent,
+    Loaded(T),
+    /// The directory exists but its content did not load (already logged).
+    Failed,
+}
+
+impl<T> Load<T> {
+    /// Startup posture: a broken directory leaves the engine unloaded.
+    fn into_option(self) -> Option<T> {
+        match self {
+            Self::Loaded(value) => Some(value),
+            Self::Absent | Self::Failed => None,
+        }
+    }
+}
+
+/// Resolves `content_dir` to an actual directory to load content from: next
+/// to the agent executable first, then the current working directory, same
+/// fallback order the old hardcoded `rules/sigma`/`rules/yara` convention
+/// used. A cwd-relative path alone breaks under service managers (systemd
+/// runs with cwd=/, Windows services in System32), which silently disabled
+/// Sigma and YARA exactly in production deployments (review finding this
+/// preserves). An absolute `content_dir` is used as-is — no fallback search
+/// needed when the caller already gave an unambiguous path.
+fn resolve_content_root(content_dir: &Path) -> PathBuf {
+    if content_dir.is_absolute() {
+        return content_dir.to_path_buf();
+    }
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        let candidate = dir.join(name);
+        let candidate = dir.join(content_dir);
         if candidate.is_dir() {
-            return Some(candidate);
+            return candidate;
         }
     }
-    let cwd_relative = std::path::PathBuf::from(name);
-    cwd_relative.is_dir().then_some(cwd_relative)
+    content_dir.to_path_buf()
 }
 
-/// Loads the Sigma content directory if present. Migrated from the old agent's
-/// `load_sigma_rules`.
-fn load_sigma_rules() -> Option<sigma::SigmaEngine> {
-    let rules_dir = content_dir("rules/sigma")?;
+/// Loads the Sigma content directory if present, under `content_root`.
+fn load_sigma_rules(content_root: &Path) -> Load<sigma::SigmaEngine> {
+    let rules_dir = content_root.join("rules/sigma");
+    if !rules_dir.is_dir() {
+        return Load::Absent;
+    }
     match sigma::SigmaEngine::load_dir(&rules_dir) {
         Ok(engine) => {
             tracing::info!(rules = engine.rule_count(), "sigma: rules loaded");
-            Some(engine)
+            Load::Loaded(engine)
         }
         Err(e) => {
             tracing::error!(error = %e, "sigma: load error");
-            None
+            Load::Failed
         }
     }
 }
 
-/// Loads rules/yara when present and starts the scan worker; matches are emitted as
-/// alerts by the worker thread through the shared alert log, and — issue #25 —
+/// Loads `rules/yara` under `content_root` when present and starts the scan
+/// worker, alongside the rule count for [`DetectionSink::reload_content`]'s
+/// report (the count is only available before [`yara::RuleSet`] is consumed
+/// by [`yara::ScanQueue::start`], so it has to travel out with the queue
+/// rather than be queried from it afterward). Matches are emitted as alerts
+/// by the worker thread through the shared alert log, and — issue #25 —
 /// trigger quarantine of the matched file through `response`, whenever
 /// `enable_response` set it.
 fn start_yara(
+    content_root: &Path,
     alert_log: Arc<AlertLog>,
     response: Arc<Mutex<Option<ResponseHooks>>>,
-) -> Option<yara::ScanQueue> {
-    let dir = content_dir("rules/yara")?;
+) -> Load<(yara::ScanQueue, usize)> {
+    let dir = content_root.join("rules/yara");
+    if !dir.is_dir() {
+        return Load::Absent;
+    }
     match yara::RuleSet::load_dir(&dir) {
         Ok(rules) => {
-            tracing::info!(rules = rules.rule_count(), "yara: rules loaded");
-            Some(yara::ScanQueue::start(rules, move |outcome| {
+            let rule_count = rules.rule_count();
+            tracing::info!(rules = rule_count, "yara: rules loaded");
+            let queue = yara::ScanQueue::start(rules, move |outcome| {
                 let matched = !outcome.matches.is_empty();
                 for rule in &outcome.matches {
                     let message = format!(
@@ -634,11 +766,12 @@ fn start_yara(
                 if matched {
                     quarantine_matched_payload(&response, &outcome.path, &alert_log);
                 }
-            }))
+            });
+            Load::Loaded((queue, rule_count))
         }
         Err(e) => {
             tracing::error!(error = %e, "yara: load error");
-            None
+            Load::Failed
         }
     }
 }
@@ -812,6 +945,7 @@ mod tests {
                 &dir.join("alerts.ndjson"),
                 &dir.join("events.jsonl"),
                 None,
+                &dir.join("content"),
             )
             .unwrap(),
         )
@@ -1102,6 +1236,7 @@ mod tests {
                 &dir.join("alerts.ndjson"),
                 &dir.join("events.jsonl"),
                 Some(Arc::clone(&spool)),
+                &dir.join("content"),
             )
             .unwrap(),
         );
@@ -1133,5 +1268,148 @@ mod tests {
         let dir = tmp("dyn");
         let sink: Arc<dyn schema::sensor::EventSink> = sink_in(&dir);
         sink.on_event(exec(9, "true", "/bin/true"));
+    }
+
+    // ── reload_content (issue #30) ──────────────────────────────────────
+
+    /// A minimal, valid Sigma rule (issue #73's required metadata: `level`,
+    /// `falsepositives`, an ATT&CK tag, and a recognized platform directory
+    /// — the last one is why the test writes it under a `.../linux/` path,
+    /// not just any temp dir) matching on an image path no other rule in
+    /// this crate's tests, or `crates/rules`' deterministic checks, would
+    /// ever incidentally match.
+    const RELOAD_TEST_SIGMA_RULE: &str = r#"
+title: reload-content test marker rule
+tags:
+  - attack.t1059
+level: low
+falsepositives:
+  - none, test-only rule
+detection:
+  selection:
+    Image|endswith:
+      - '/reload-content-marker'
+  condition: selection
+"#;
+
+    #[test]
+    fn reload_content_picks_up_a_sigma_rule_added_after_construction() {
+        let dir = tmp("reload-sigma");
+        let sink = sink_in(&dir);
+
+        // Before reload: no Sigma engine loaded yet (content dir is empty),
+        // so this exec produces no Sigma-sourced alert.
+        sink.on_event(exec(900, "run", "/opt/reload-content-marker"));
+        assert!(
+            !alerts_in(&dir).contains("reload-content test marker rule"),
+            "no sigma engine should be loaded before the first reload"
+        );
+
+        let sigma_dir = dir
+            .join("content")
+            .join("rules")
+            .join("sigma")
+            .join("linux");
+        std::fs::create_dir_all(&sigma_dir).unwrap();
+        std::fs::write(sigma_dir.join("marker.yml"), RELOAD_TEST_SIGMA_RULE).unwrap();
+
+        let report = sink.reload_content();
+        assert_eq!(
+            report.sigma_rule_count,
+            Some(1),
+            "the one rule just written must load"
+        );
+        assert_eq!(
+            report.yara_rule_count, None,
+            "no rules/yara directory exists in this test's content dir"
+        );
+
+        sink.on_event(exec(901, "run", "/opt/reload-content-marker"));
+        assert!(
+            alerts_in(&dir).contains("reload-content test marker rule"),
+            "the reloaded rule must now fire: {}",
+            alerts_in(&dir)
+        );
+    }
+
+    #[test]
+    fn reload_content_with_no_content_dir_present_unloads_cleanly() {
+        let dir = tmp("reload-empty");
+        let sink = sink_in(&dir);
+        let report = sink.reload_content();
+        assert_eq!(report.sigma_rule_count, None);
+        assert_eq!(report.yara_rule_count, None);
+        // Still safe to process events after a no-op reload.
+        sink.on_event(exec(902, "ls", "/bin/ls"));
+    }
+
+    const RELOAD_TEST_YARA_RULE: &str = r#"
+rule reload_content_test_marker {
+    meta:
+        technique = "T1105"
+        severity = "low"
+        falsepositives = "none, test-only rule"
+    strings:
+        $m = "RELOAD-CONTENT-YARA-MARKER"
+    condition:
+        $m
+}
+"#;
+
+    #[test]
+    fn reload_content_keeps_the_previous_yara_rules_when_the_new_set_is_broken() {
+        // YARA's `load_dir` is all-or-nothing (a rule that doesn't compile is a
+        // hard error), which is the case a reload must survive: an applied,
+        // signed-but-broken rule set must not switch scanning off.
+        let dir = tmp("reload-broken-keeps-old");
+        let sink = sink_in(&dir);
+        let yara_dir = dir.join("content").join("rules").join("yara");
+        std::fs::create_dir_all(&yara_dir).unwrap();
+        std::fs::write(yara_dir.join("marker.yar"), RELOAD_TEST_YARA_RULE).unwrap();
+        let report = sink.reload_content();
+        assert_eq!(report.yara_rule_count, Some(1));
+        assert!(!report.yara_reload_failed);
+
+        std::fs::write(yara_dir.join("broken.yar"), "rule nope { condition: \n").unwrap();
+        let report = sink.reload_content();
+        assert!(report.yara_reload_failed, "a rule that fails to compile");
+        assert_eq!(
+            report.yara_rule_count,
+            Some(1),
+            "the previous scan queue must keep running"
+        );
+
+        // Fixing the content recovers on the next reload.
+        std::fs::remove_file(yara_dir.join("broken.yar")).unwrap();
+        let report = sink.reload_content();
+        assert!(!report.yara_reload_failed);
+        assert_eq!(report.yara_rule_count, Some(1));
+    }
+
+    #[test]
+    fn reload_content_drops_a_rule_whose_file_was_removed() {
+        let dir = tmp("reload-remove");
+        let sink = sink_in(&dir);
+        let sigma_dir = dir
+            .join("content")
+            .join("rules")
+            .join("sigma")
+            .join("linux");
+        std::fs::create_dir_all(&sigma_dir).unwrap();
+        std::fs::write(sigma_dir.join("marker.yml"), RELOAD_TEST_SIGMA_RULE).unwrap();
+        assert_eq!(sink.reload_content().sigma_rule_count, Some(1));
+
+        std::fs::remove_dir_all(dir.join("content")).unwrap();
+        let report = sink.reload_content();
+        assert_eq!(
+            report.sigma_rule_count, None,
+            "removing the content dir must unload the engine, not error"
+        );
+
+        sink.on_event(exec(903, "run", "/opt/reload-content-marker"));
+        assert!(
+            !alerts_in(&dir).contains("reload-content test marker rule"),
+            "the removed rule must no longer fire"
+        );
     }
 }

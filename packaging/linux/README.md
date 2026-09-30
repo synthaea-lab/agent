@@ -26,7 +26,8 @@ This separation ensures that package managers (apt/dnf) and the updater never co
 ├── current -> bootstrap    # Symlink (updater-managed, initially points to bootstrap)
 ├── versions/           # Updater-managed version directories, named by the signed
 │   ├── v1/             # manifest's monotone release_version (ADR-0015), not semver
-│   ├── v2/
+│   ├── v2/             # a `.healthy` file appears here once the release's agent has
+│   │                   # shown progress after promotion (watchdog probation, #30)
 │   └── .stage-3/       # a release being downloaded (`agent apply-release`); renamed to
 │                       # v3 only once complete, so a crash never leaves a partial vN
 └── banned_versions.json  # Release versions that failed a health check on this

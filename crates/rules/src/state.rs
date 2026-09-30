@@ -2,12 +2,15 @@
 //! per-window counters) and consults it on every event. Each rule stays a dedicated
 //! method, with its calibration constants next to it.
 
-use std::{collections::HashMap, net::IpAddr};
+use std::{
+    collections::{HashMap, VecDeque},
+    net::IpAddr,
+};
 
 use schema::{
     AuthEvent, AuthOutcome, ConnectEvent, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
-    FileOpenEvent, FileQuarantineEvent, FileRenameEvent, FileWriteEvent, ListenPortEvent,
-    MemfdCreateEvent, NetworkFlowEvent, User,
+    FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRenameEvent, FileWriteEvent,
+    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, User,
 };
 use store::BoundedMap;
 
@@ -16,15 +19,16 @@ use crate::{
     exclusions::{
         AGENT_CHILD_EXCLUSIONS, APK_STAGING_FILE_PREFIX, AUTH_FAILURE_THRESHOLD,
         AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD, BEACON_WINDOW_NS, BROWSERS,
-        BURST_WRITE_BYTES_THRESHOLD, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS,
-        IN_PLACE_EDIT_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS,
-        MEMFD_EXEC_WINDOW_NS, PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES,
-        QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX,
-        RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD,
-        SCAN_SPREAD_WINDOW_NS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
-        SELF_SPAWN_THRESHOLD, SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS,
-        SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN,
-        TASK_REGISTRATION_DEDUP_WINDOW_NS,
+        BURST_WRITE_BYTES_THRESHOLD, COMPRESSION_DRIVER_COMMS, COMPRESSION_SUFFIXES,
+        COMPRESSOR_COMMS, CREATE_UNLINK_HISTORY_PER_PID, CREATE_UNLINK_PAIR_WINDOW_NS,
+        CREATE_UNLINK_PID_CAP, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS, IN_PLACE_EDIT_COMMS,
+        LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS, MEMFD_EXEC_WINDOW_NS,
+        PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES, QUARANTINE_EXEC_WINDOW_NS,
+        RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD,
+        RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
+        SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_THRESHOLD,
+        SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STANDARD_PORTS,
+        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
     },
     has_write_intent,
     sliding::{FlowPortDedup, SlidingCounter, SlidingDistinct, SlidingSum},
@@ -117,6 +121,20 @@ pub struct RuleState {
     /// per-pid counter alone would miss it (issue #262 review, old-dov). LRU-bounded.
     /// `ppid <= 1` (unknown/init) is never keyed here — see `check_mass_rename_pattern`.
     ransomware_rename_by_ppid: BoundedMap<u32, SlidingCounter>,
+    /// pid → (timestamp, path) of the recent write-intent creations (`O_CREAT`) seen
+    /// for it, newest last: the "new file" half of the write-new-then-unlink T1486
+    /// shape (#512 part B). `FileWriteEvent` carries only an fd, so the correlation is
+    /// between this creation and a later `FileDeleteEvent`, both of which carry paths.
+    /// Bounded by [`CREATE_UNLINK_PID_CAP`] pids x [`CREATE_UNLINK_HISTORY_PER_PID`].
+    recent_creates: BoundedMap<u32, VecDeque<(u64, String)>>,
+    /// pid → (timestamp, path) of unlinks that found no creation to pair with yet.
+    /// The kernel always creates `X.suffix` before unlinking `X`, but userspace drains
+    /// the open and delete ring buffers independently, so the delete can be processed
+    /// first (the same ordering hazard as `pending_proc_fd_exec`, #503); the creation
+    /// then pairs with it on arrival. Same bounds as `recent_creates`.
+    pending_unlinks: BoundedMap<u32, VecDeque<(u64, String)>>,
+    /// pid → sliding counter of write-new-then-unlink pairs (T1486, #512 part B).
+    ransomware_unlink: BoundedMap<u32, SlidingCounter>,
     /// pid → sliding sum of `FileWriteEvent::bytes_requested` (issue #82): the
     /// write-volume half of a second, independent T1486 corroboration signal —
     /// heavy write volume alongside a rename burst, regardless of whether the
@@ -204,6 +222,9 @@ impl RuleState {
             scan_spread: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
             auth_failures: BoundedMap::new(COUNTER_CAP),
+            recent_creates: BoundedMap::new(CREATE_UNLINK_PID_CAP),
+            pending_unlinks: BoundedMap::new(CREATE_UNLINK_PID_CAP),
+            ransomware_unlink: BoundedMap::new(COUNTER_CAP),
             ransomware_rename: BoundedMap::new(COUNTER_CAP),
             ransomware_rename_by_ppid: BoundedMap::new(COUNTER_CAP),
             write_volume: BoundedMap::new(COUNTER_CAP),
@@ -569,6 +590,16 @@ impl RuleState {
             return true;
         }
         if STANDARD_PORTS.contains(&dport) {
+            return true;
+        }
+        // `0.0.0.0:65535` / `:::65535` is no remote peer: it's the address-selection
+        // probe sshd-session and sshd-auth run with a `connect()` on every login, which
+        // crossed the 3-in-60s threshold on a lab VM with three SSH logins in a minute
+        // (2026-09-29, #525). Only on that port: a connect to `0.0.0.0:<port>` reaches
+        // the local host like `127.0.0.1:<port>`, which still counts, so the rest must
+        // count too or a local-relay beacon could hide behind the unspecified address
+        // (#536).
+        if policy::is_address_selection_probe(daddr, dport) {
             return true;
         }
         // IPv4 multicast (224.0.0.0/4) and broadcast (last octet = 255): legitimate
@@ -999,6 +1030,7 @@ impl RuleState {
             event,
             |pid| self.resolve_comm(pid),
         ));
+        alerts.extend(self.record_create(event));
         self.record_downloader_write(event);
         alerts
     }
@@ -1081,7 +1113,7 @@ impl RuleState {
     /// two; the third stays open, see below):
     /// - Log rotation (`app.log` → `app.log.1`): handled by [`is_rotation_suffix`]
     ///   (a suffix with no letter never counts) — the one case a shape signal settles.
-    /// - In-place edit with a backup: `sed -i.bak`, `perl -i.orig` `rename(2)` the
+    /// - In-place edit with a backup: `sed -i.bak` `rename(2)`s the
     ///   original to `f.bak`/`f.orig` from one pid; 20+ files in one command
     ///   (`sed -i.bak … *.conf`) used to trip this rule. [`is_in_place_edit_backup`]
     ///   now excludes it, gated on `comm` + the pid's exec-time `image_path`
@@ -1095,15 +1127,22 @@ impl RuleState {
     ///   (the flag-letter alphabet), deliberately *not* also comm-gated; see
     ///   that function's doc for why.
     ///
-    /// Shapes this rule cannot see at all (write-new-then-unlink, cross-directory
-    /// moves) need a separate write/delete correlation — still a follow-up,
-    /// tracked in #459 part 2.
+    /// Cross-directory moves (`~/docs/a.docx` → `~/.stash/a.docx.locked`, #512):
+    /// when the directories differ the full-path prefix test can never hold, so the
+    /// same appended-suffix relation is read off the file *names* instead
+    /// ([`appended_suffix`]). Same counters, same exclusions; the one new benign
+    /// producer that shape brings in is the Maildir delivery move
+    /// (`new/msg` → `cur/msg:2,S`), excluded by [`is_maildir_delivery`].
+    ///
+    /// Shapes this rule still cannot see at all (write-new-then-unlink) need a
+    /// separate open/delete correlation — still a follow-up, tracked in #512.
     fn check_mass_rename_pattern(&mut self, event: &FileRenameEvent) -> Option<Alert> {
-        let suffix = event.new_path.strip_prefix(event.old_path.as_str())?;
+        let suffix = appended_suffix(&event.old_path, &event.new_path)?;
         if suffix.is_empty()
             || is_rotation_suffix(suffix)
             || self.is_in_place_edit_backup(event)
             || is_maildir_flag_change(&event.old_path, suffix)
+            || is_maildir_delivery(&event.old_path, &event.new_path, suffix)
         {
             return None;
         }
@@ -1166,6 +1205,167 @@ impl RuleState {
             });
         }
         None
+    }
+
+    /// To be called for every `FileDeleteEvent` in the stream: the unlink half of the
+    /// write-new-then-unlink T1486 shape (#512 part B), see
+    /// [`Self::check_write_new_then_unlink`].
+    pub fn on_file_delete(&mut self, event: &FileDeleteEvent) -> Vec<Alert> {
+        self.check_write_new_then_unlink(event)
+            .into_iter()
+            .collect()
+    }
+
+    /// T1486, the shape `check_mass_rename_pattern` cannot see because none of it is a
+    /// rename (#512 part B): the encryptor writes `file.docx.locked` as a **new** file and
+    /// only then unlinks `file.docx` (safer than an in-place rewrite: the original
+    /// survives until the copy is complete). Same appended-suffix relation
+    /// ([`appended_suffix`], so a cross-directory pair counts too), same lettered,
+    /// non-rotation, non-Maildir suffix filter, same threshold and window.
+    ///
+    /// The correlation is a write-intent `O_CREAT` open (`record_create`) and an unlink
+    /// of the file whose name the new one extends, by one pid within
+    /// [`CREATE_UNLINK_PAIR_WINDOW_NS`], in either arrival order (`pending_unlinks`).
+    /// It cannot use `FileWriteEvent`: that event carries an fd and no path.
+    ///
+    /// The benign producer measured live (Debian 13) is compression: `gzip`, `xz`,
+    /// `bzip2` and `zstd` each did 30 of these in 5 s over a `*.log` glob. They are
+    /// excluded by [`COMPRESSOR_COMMS`] gated on the pid running the trusted binary of
+    /// that name, failing closed ([`Self::runs_trusted_binary_named`]); a suffix
+    /// allowlist (`.gz`) alone would be free for an encryptor to copy. `logrotate` with
+    /// `compress` opens the `.gz` and unlinks the input itself (gzip only writes to an
+    /// inherited fd), so it is excluded as a compression *driver*
+    /// ([`Self::is_compression_driver`]): trusted binary named `logrotate` **and** a
+    /// compression extension, both required (found live by Jihair on Alpine, #527). Nothing else measured
+    /// (`zip -m`, `rsync --remove-source-files`, `git gc`, atomic writers, `apt`)
+    /// exceeded 2. Restricted to Unix events: the Windows and macOS producers of this
+    /// shape (Explorer, `ditto`, installers) were not measured.
+    ///
+    /// **Not covered**: a shell loop with one process per step (`openssl enc -out $f.enc`
+    /// creates, a separate `rm $f` unlinks). Creation and unlink then belong to different
+    /// pids, so no pair forms (confirmed live on Debian 13); tying them through the
+    /// parent would also fold in ordinary `cp x x.bak; rm x` scripts, which was not
+    /// measured. The rename shape of that loop is covered by `check_mass_rename_pattern`.
+    ///
+    /// Like every pid-keyed table here it inherits #519: a recycled pid keeps a stale
+    /// history until it ages out of the window.
+    fn check_write_new_then_unlink(&mut self, event: &FileDeleteEvent) -> Option<Alert> {
+        if !matches!(event.meta.user, User::Unix { .. }) {
+            return None;
+        }
+        let pid = event.meta.pid;
+        let ts = event.meta.timestamp_ns;
+        let created = self.recent_creates.get_mut(&pid).and_then(|creates| {
+            let idx = creates.iter().rposition(|(created_ts, path)| {
+                pairs_create_and_unlink(*created_ts, path, ts, &event.path)
+            })?;
+            creates.remove(idx).map(|(_, path)| path)
+        });
+        let Some(created) = created else {
+            // No creation seen yet: it may still arrive after this unlink.
+            let pending = self.pending_unlinks.get_or_insert_with(pid, VecDeque::new);
+            if pending.len() >= CREATE_UNLINK_HISTORY_PER_PID {
+                pending.pop_front();
+            }
+            pending.push_back((ts, event.path.clone()));
+            return None;
+        };
+        self.count_create_unlink_pair(&event.meta, ts, &event.path, &created)
+    }
+
+    /// The creation half: remembers a write-intent `O_CREAT` open, or pairs it with an
+    /// unlink that arrived first. Unix events only, see
+    /// [`Self::check_write_new_then_unlink`].
+    fn record_create(&mut self, event: &FileOpenEvent) -> Option<Alert> {
+        if event.flags & O_CREAT == 0
+            || !has_write_intent(event.flags)
+            || !matches!(event.meta.user, User::Unix { .. })
+        {
+            return None;
+        }
+        let pid = event.meta.pid;
+        let created_ts = event.meta.timestamp_ns;
+        let unlinked = self.pending_unlinks.get_mut(&pid).and_then(|pending| {
+            let idx = pending.iter().position(|(unlink_ts, path)| {
+                pairs_create_and_unlink(created_ts, &event.path, *unlink_ts, path)
+            })?;
+            pending.remove(idx)
+        });
+        if let Some((unlink_ts, deleted)) = unlinked {
+            return self.count_create_unlink_pair(&event.meta, unlink_ts, &deleted, &event.path);
+        }
+        let creates = self.recent_creates.get_or_insert_with(pid, VecDeque::new);
+        if creates.len() >= CREATE_UNLINK_HISTORY_PER_PID {
+            creates.pop_front();
+        }
+        creates.push_back((created_ts, event.path.clone()));
+        None
+    }
+
+    /// Counts one matched write-new-then-unlink pair per pid, alerting at the
+    /// mass-rename threshold. `ts` is the later (unlink) time.
+    fn count_create_unlink_pair(
+        &mut self,
+        meta: &schema::EventMeta,
+        ts: u64,
+        deleted: &str,
+        created: &str,
+    ) -> Option<Alert> {
+        if self.is_compressor(meta.pid, &meta.comm)
+            || self.is_compression_driver(meta.pid, &meta.comm, deleted, created)
+        {
+            return None;
+        }
+        let pid_entry = self
+            .ransomware_unlink
+            .get_or_insert_with(meta.pid, SlidingCounter::default);
+        let pid_count = pid_entry.record(ts, RANSOMWARE_RENAME_WINDOW_NS);
+        if pid_count >= RANSOMWARE_RENAME_THRESHOLD
+            && pid_entry.try_alert(ts, RANSOMWARE_RENAME_WINDOW_NS)
+        {
+            return Some(Alert {
+                technique: "T1486",
+                message: format!(
+                    "pid={} comm={}: {pid_count} files replaced by a new file with an appended \
+                     suffix and then unlinked in {}s (e.g. {deleted} → {created}) — suspected \
+                     ransomware encryption pass (write-new-then-unlink)",
+                    meta.pid,
+                    meta.comm,
+                    RANSOMWARE_RENAME_WINDOW_NS / 1_000_000_000,
+                ),
+            });
+        }
+        None
+    }
+
+    /// True when `comm` is a compression driver ([`COMPRESSION_DRIVER_COMMS`], i.e.
+    /// `logrotate`) that really runs the trusted binary of that name and the new file
+    /// only appends a compression extension to the old name.
+    fn is_compression_driver(&self, pid: u32, comm: &str, deleted: &str, created: &str) -> bool {
+        COMPRESSION_DRIVER_COMMS.contains(&comm)
+            && appended_suffix(deleted, created)
+                .is_some_and(|suffix| COMPRESSION_SUFFIXES.contains(&suffix))
+            && self.runs_trusted_binary_named(pid, comm)
+    }
+
+    /// True when `comm` is a compression tool ([`COMPRESSOR_COMMS`]) and the pid really
+    /// runs the trusted binary of that name: see [`Self::runs_trusted_binary_named`].
+    fn is_compressor(&self, pid: u32, comm: &str) -> bool {
+        COMPRESSOR_COMMS.contains(&comm) && self.runs_trusted_binary_named(pid, comm)
+    }
+
+    /// True when this pid's exec-time `image_path` is known, sits at a trusted system
+    /// path **and is a binary named `comm`**. Both halves matter: a trusted path alone
+    /// is not enough, because a process running the system `python3` can rename its own
+    /// `comm` to `gzip` with `prctl(PR_SET_NAME)` and would otherwise inherit the
+    /// exclusion; what an encryptor cannot fake is that the trusted binary it runs is
+    /// *called* `gzip`. Unknown is **not** trusted (fails closed): delete events carry no
+    /// rename-time `executable_path` to fall back on, and "no exec seen" (a forked child
+    /// that only set `comm`) is not evidence of `/usr/bin/gzip`.
+    fn runs_trusted_binary_named(&self, pid: u32, comm: &str) -> bool {
+        self.pid_image_path.peek(&pid).is_some_and(|p| {
+            !p.is_empty() && policy::name_exclusion_applies(Some(p)) && written_file_is(p, comm)
+        })
     }
 
     /// To be called for every `FileRenameEvent` in the stream (T1486, issue #262 +
@@ -1374,8 +1574,102 @@ impl RuleState {
             .peek(&event.meta.pid)
             .map(String::as_str)
             .or(event.executable_path.as_deref());
-        matches!(path, Some(p) if !p.is_empty() && policy::name_exclusion_applies(Some(p)))
+        // A trusted path is not enough on its own: the system `python3` can set its own
+        // `comm` to `sed` (`prctl(PR_SET_NAME)`) and would inherit the exclusion. What
+        // an encryptor cannot fake is that the trusted binary it runs is *called* `comm`.
+        matches!(
+            path,
+            Some(p) if !p.is_empty()
+                && policy::name_exclusion_applies(Some(p))
+                && written_file_is(p, &event.meta.comm)
+        )
     }
+}
+
+/// The suffix a rename appends to a file's name, when that is what it does: the tail
+/// of `new_path` after `old_path` (same directory, `a.docx` → `a.docx.locked`), or,
+/// when the directories differ, the tail of `new_path`'s *file name* after
+/// `old_path`'s (`~/docs/a.docx` → `~/.stash/a.docx.locked`, #512). `None` when
+/// neither relation holds. Splits on `/` and `\\` alike: Windows sensors feed this
+/// rule too. Works on the raw path strings, so a relative pair (both relative to
+/// the same unresolved dirfd or cwd) compares consistently without resolving it.
+fn appended_suffix<'a>(old_path: &str, new_path: &'a str) -> Option<&'a str> {
+    if let Some(suffix) = new_path.strip_prefix(old_path) {
+        return Some(suffix);
+    }
+    let old_base = split_dir_base(old_path).1;
+    let new_base = split_dir_base(new_path).1;
+    // No `old_dir == new_dir` shortcut: with equal directories the literal prefix test
+    // above only fails when the separators differ (`dir/a` vs `dir\a.locked`), and the
+    // base-name comparison below is exactly what must still run then.
+    if old_base.is_empty() {
+        return None;
+    }
+    new_base.strip_prefix(old_base)
+}
+
+/// Whether creating `created` (at `created_ts`) and unlinking `deleted` (at `deleted_ts`)
+/// is one write-new-then-unlink: the new file's name extends the deleted one's by a
+/// lettered, non-rotation, non-Maildir suffix ([`appended_suffix`]), the kernel-time
+/// order is create-then-unlink, and they are within [`CREATE_UNLINK_PAIR_WINDOW_NS`].
+fn pairs_create_and_unlink(created_ts: u64, created: &str, deleted_ts: u64, deleted: &str) -> bool {
+    created_ts <= deleted_ts
+        && deleted_ts - created_ts <= CREATE_UNLINK_PAIR_WINDOW_NS
+        && appended_suffix(deleted, created).is_some_and(|suffix| {
+            !suffix.is_empty()
+                && !is_rotation_suffix(suffix)
+                && !is_maildir_delivery(deleted, created, suffix)
+        })
+}
+
+/// `path` split at its last separator into `(directory, file name)`; no separator
+/// means an empty directory part.
+fn split_dir_base(path: &str) -> (&str, &str) {
+    match path.rfind(['/', '\\']) {
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => ("", path),
+    }
+}
+
+/// True for a suffix that is exactly a Maildir info marker: `:2,` followed by
+/// zero or more flag letters. Delivering a message out of `new/` into `cur/` is a
+/// cross-directory rename that appends precisely this (`msg` → `msg:2,S`), and an
+/// IMAP server or `mbsync` does it for every message a client opens: 20+ in a
+/// few seconds on "mark all read" (#512). Structural like
+/// [`is_maildir_flag_change`], for the same reason: the alphabet is a tight shape
+/// and there is no small fixed set of `comm` values to gate on.
+fn is_maildir_info_suffix(suffix: &str) -> bool {
+    suffix.strip_prefix(":2,").is_some_and(is_maildir_flags)
+}
+
+/// True for a real Maildir delivery: a move from a `new` directory into the `cur`
+/// directory next to it, whose new name only appends a Maildir info suffix
+/// ([`is_maildir_info_suffix`]). The directory shape is part of the test, not just the
+/// suffix: `:2,` followed by lowercase keyword letters is a free, readable extension for
+/// an encryptor (`f.docx` → `f.docx:2,locked`), so the suffix alone must never exclude
+/// a rename (#526 review, found live on Alpine).
+fn is_maildir_delivery(old_path: &str, new_path: &str, suffix: &str) -> bool {
+    if !is_maildir_info_suffix(suffix) {
+        return false;
+    }
+    let (old_dir, _) = split_dir_base(old_path);
+    let (new_dir, _) = split_dir_base(new_path);
+    let (old_parent, old_leaf) = split_dir_base(old_dir);
+    let (new_parent, new_leaf) = split_dir_base(new_dir);
+    old_leaf == "new" && new_leaf == "cur" && old_parent == new_parent
+}
+
+/// True for what follows `:2,` in a Maildir info suffix: the standard flag letters
+/// ([`MAILDIR_FLAG_LETTERS`]) and then, optionally, Dovecot's IMAP keywords, which it
+/// stores as lowercase `a`-`z` after them (`:2,Sa`, `:2,RSab`; Thunderbird tags,
+/// `$Label1`, Junk/NonJunk). Delivering or tagging 20+ messages raised T1486 on the
+/// standard alphabet alone (#526 review, live on Alpine). The order keeps the shape
+/// tight: keywords never precede a standard flag.
+fn is_maildir_flags(flags: &str) -> bool {
+    let keywords = flags.trim_start_matches(|c: char| {
+        u8::try_from(c).is_ok_and(|b| MAILDIR_FLAG_LETTERS.contains(&b))
+    });
+    keywords.bytes().all(|b| b.is_ascii_lowercase())
 }
 
 /// True for `check_mass_rename_pattern`'s Maildir-flag-change false positive
@@ -1385,8 +1679,8 @@ impl RuleState {
 /// ([`MAILDIR_FLAG_LETTERS`]).
 ///
 /// Deliberately **not** also gated on `comm`, unlike [`is_in_place_edit_backup`]
-/// and unlike issue #459's own suggestion: `sed`/`perl` are two fixed,
-/// well-known binaries, but "a mail server touching Maildir" has no small
+/// and unlike issue #459's own suggestion: `sed` is one fixed,
+/// well-known binary, but "a mail server touching Maildir" has no small
 /// fixed `comm` set to enumerate without guessing (dovecot, courier,
 /// procmail, maildrop, notmuch, mbsync, offlineimap, mutt, ...) — inventing
 /// one would be exactly the uncalibrated-exclusion-list problem this crate's
@@ -1394,15 +1688,13 @@ impl RuleState {
 /// already a tight structural signal on its own, the same class of reasoning
 /// [`is_rotation_suffix`]'s all-digit check relies on.
 fn is_maildir_flag_change(old_path: &str, suffix: &str) -> bool {
-    if suffix.is_empty() || !suffix.bytes().all(|b| MAILDIR_FLAG_LETTERS.contains(&b)) {
+    if suffix.is_empty() || !is_maildir_flags(suffix) {
         return false;
     }
     let Some(marker) = old_path.rfind(":2,") else {
         return false;
     };
-    old_path.as_bytes()[marker + 3..]
-        .iter()
-        .all(|b| MAILDIR_FLAG_LETTERS.contains(b))
+    is_maildir_flags(&old_path[marker + 3..])
 }
 
 /// Whether the file at `path` is the one a process named `comm` runs from. A

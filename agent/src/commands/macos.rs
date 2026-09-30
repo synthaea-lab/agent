@@ -252,6 +252,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         enable_dns_capture: _,
         server,
         ipc_endpoint,
+        content_dir,
     } = opts;
     let pipeline = super::common::wire_run_pipeline(
         seeded_rule_state(),
@@ -259,6 +260,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         events,
         server,
         ipc_endpoint,
+        content_dir,
     )?;
     run_macos_sensors(Box::new(SharedSink(pipeline.sink)))
 }

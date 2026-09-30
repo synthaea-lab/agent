@@ -122,6 +122,7 @@ mod tests {
             &dir.join("alerts.ndjson"),
             &dir.join("events.jsonl"),
             None,
+            &dir.join("content"),
         )
         .unwrap()
     }

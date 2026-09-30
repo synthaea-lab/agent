@@ -3448,6 +3448,8 @@ dependencies = [
  "libc",
  "sha2 0.11.0",
  "signal-hook",
+ "tempfile",
+ "updater",
  "windows-service",
 ]
 

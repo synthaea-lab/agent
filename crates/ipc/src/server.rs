@@ -26,8 +26,9 @@ use crate::{
     error::ServerError,
     frame::{FrameError, read_message, write_message},
     protocol::{
-        ClientHello, PROTOCOL_VERSION, PolicyVersionResponse, RecentDetectionsResponse, Request,
-        Response, SensorHealthResponse, ServerHello, StatusResponse, WireError,
+        ClientHello, PROTOCOL_VERSION, PolicyVersionResponse, RecentDetectionsResponse,
+        ReloadContentResponse, Request, Response, SensorHealthResponse, ServerHello,
+        StatusResponse, WireError,
     },
     stream::{Listener, Stream},
 };
@@ -66,6 +67,12 @@ pub trait Handler: Send + Sync + 'static {
     fn policy_version(
         &self,
     ) -> impl std::future::Future<Output = Result<PolicyVersionResponse, String>> + Send;
+    /// Answer [`Request::ReloadContent`] — re-read Sigma/YARA content and
+    /// report what's loaded afterward. See [`Request::ReloadContent`]'s own
+    /// doc comment for why this is the one mutating request in v2.
+    fn reload_content(
+        &self,
+    ) -> impl std::future::Future<Output = Result<ReloadContentResponse, String>> + Send;
 }
 
 /// A canned handler that returns fixed responses. Ships with the crate
@@ -110,6 +117,16 @@ impl Handler for StubHandler {
             policy_version: None,
             signature_verified: None,
             issued_at_ns: None,
+        })
+    }
+    async fn reload_content(&self) -> Result<ReloadContentResponse, String> {
+        // The stub has no real detection pipeline to reload — reports both
+        // engines absent, same as a fresh install with no content dir yet.
+        Ok(ReloadContentResponse {
+            sigma_rule_count: None,
+            yara_rule_count: None,
+            sigma_reload_failed: false,
+            yara_reload_failed: false,
         })
     }
 }
@@ -270,6 +287,10 @@ async fn dispatch<H: Handler>(handler: &H, req: Request) -> Response {
         }
         Request::PolicyVersion => match handler.policy_version().await {
             Ok(r) => Response::PolicyVersion(r),
+            Err(m) => Response::Error(WireError::HandlerFailed { message: m }),
+        },
+        Request::ReloadContent => match handler.reload_content().await {
+            Ok(r) => Response::ReloadContent(r),
             Err(m) => Response::Error(WireError::HandlerFailed { message: m }),
         },
     }

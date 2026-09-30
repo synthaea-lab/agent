@@ -83,24 +83,36 @@ pub(crate) fn check_encoded_powershell(event: &ExecEvent) -> Option<Alert> {
     }
 }
 
-/// T1037.004 (Boot or Logon Initialization Scripts) / T1053.003 (Cron) — write to a
-/// known persistence path. List deliberately restricted to the threat-model examples,
-/// not exhaustive coverage of Linux persistence mechanisms. Per-platform path sets are
-/// follow-up scope (Windows persistence arrives with registry telemetry, M3).
-const PERSISTENCE_PATH_PATTERNS: &[&str] = &[
-    ".bashrc",
-    "/etc/profile.d/",
-    "/etc/cron.d/",
-    "/etc/systemd/system/",
+/// Each persistence location maps to its own ATT&CK technique. The first cut
+/// tagged every path `T1037.004/T1053.003`, but none of them is an RC script
+/// (T1037.004), and only the cron path is T1053.003 (#495).
+const UNIX_SHELL_CONFIG_MODIFICATION: &str = "T1546.004";
+const CRON: &str = "T1053.003";
+const SYSTEMD_SERVICE: &str = "T1543.002";
+/// The paths added with the macOS sensor (#32) keep the original tag until their
+/// mapping is confirmed on that side (#495).
+const MACOS_PATHS_PENDING_REVIEW: &str = "T1037.004/T1053.003";
+
+/// Write-intent opens on known persistence paths, each with its technique. List
+/// deliberately restricted to the threat-model examples, not exhaustive coverage of
+/// Linux persistence mechanisms. Per-platform path sets are follow-up scope (Windows
+/// persistence arrives with registry telemetry, M3).
+const PERSISTENCE_PATH_PATTERNS: &[(&str, &str)] = &[
+    (UNIX_SHELL_CONFIG_MODIFICATION, ".bashrc"),
+    // zsh config is the same technique as bash's, and zsh runs on Linux as much as
+    // on macOS: this entry is not platform-gated (#499 review).
+    (UNIX_SHELL_CONFIG_MODIFICATION, ".zshrc"),
+    (UNIX_SHELL_CONFIG_MODIFICATION, "/etc/profile.d/"),
+    (CRON, "/etc/cron.d/"),
+    (SYSTEMD_SERVICE, "/etc/systemd/system/"),
     // macOS (issue #32): substring match deliberately catches the per-user
     // (`~/Library/...`) and system (`/Library/...`) launchd directories alike.
-    "/Library/LaunchAgents/",
-    "/Library/LaunchDaemons/",
-    ".zshrc",
-    "/etc/periodic/",
+    (MACOS_PATHS_PENDING_REVIEW, "/Library/LaunchAgents/"),
+    (MACOS_PATHS_PENDING_REVIEW, "/Library/LaunchDaemons/"),
+    (MACOS_PATHS_PENDING_REVIEW, "/etc/periodic/"),
     // at(1) jobs — rare on modern macOS, which is exactly why a write there
     // is signal.
-    "/var/at/tabs/",
+    (MACOS_PATHS_PENDING_REVIEW, "/var/at/tabs/"),
 ];
 
 /// A path captured by the `open` collector can be relative to an unresolved `dfd`
@@ -109,16 +121,16 @@ const PERSISTENCE_PATH_PATTERNS: &[&str] = &[
 #[must_use]
 pub(crate) fn check_persistence_write(event: &FileOpenEvent) -> Option<Alert> {
     let path = &event.path;
-    let matched_pattern = PERSISTENCE_PATH_PATTERNS
+    let &(technique, matched_pattern) = PERSISTENCE_PATH_PATTERNS
         .iter()
-        .find(|pattern| path.contains(*pattern))?;
+        .find(|(_, pattern)| path.contains(*pattern))?;
 
     if !has_write_intent(event.flags) {
         return None;
     }
 
     Some(Alert {
-        technique: "T1037.004/T1053.003",
+        technique,
         message: format!(
             "pid={} comm={}: write to a known persistence path ({matched_pattern}): {path}",
             event.meta.pid, event.meta.comm,
