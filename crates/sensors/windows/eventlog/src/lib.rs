@@ -114,7 +114,11 @@
 //!   Reported as `schema::PolicyDenialEvent` with
 //!   `schema::POLICY_MECHANISM_APPLOCKER` (#427) — `enforced` tells the two
 //!   apart, `object_path` carries the expanded image path. A defensive
-//!   signal, not a persistence artifact.
+//!   signal, not a persistence artifact. **Volume:** audit mode is where
+//!   broad rules get trialled, and an audited DLL collection logs one 8003
+//!   per non-allowed load, so expect bursts there. The whole channel is gated
+//!   by `EventLogConfig::applocker_blocks_enabled`, which the agent currently
+//!   sets to `true` unconditionally (no `agent.toml` switch yet).
 //! - **Task Scheduler Operational — task registered**
 //!   (`Microsoft-Windows-TaskScheduler/Operational` channel, event **106**):
 //!   the always-on complement to Security 4698. Emitted whenever any scheduled

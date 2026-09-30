@@ -480,7 +480,14 @@ pub struct AppLockerEvent {
     /// *logged* under; the two matched in the only real capture so far (#427).
     pub target_user: Option<String>,
     /// PID of the process that tried to launch the image
-    /// (`RuleAndFileData/TargetProcessId`). 0 if missing.
+    /// (`<Execution ProcessID='...'>`). 0 if missing. Checked in the lab
+    /// (#529): for both 8003 and 8004 it equals the launching shell's `$PID`.
+    pub pid: u32,
+    /// PID of the process being *created* for the image
+    /// (`RuleAndFileData/TargetProcessId`), not its launcher. Checked in the
+    /// lab (#529): on an 8003 it is the audited binary's own live process
+    /// (`Start-Process -PassThru` reported the same id); on an 8004 the pid
+    /// was allocated but the process never ran. 0 if missing.
     pub target_process_id: u32,
     /// Path of the image as `AppLocker` reports it (`RuleAndFileData/FilePath`),
     /// path variables and upper case included — see [`expand_applocker_path`].
@@ -517,13 +524,18 @@ pub fn parse_applocker_event(block: &str) -> Option<AppLockerEvent> {
     // `AppLocker`'s payload lives in <UserData><RuleAndFileData>: children are
     // *plain* elements (`<FilePath>...</FilePath>`), not `<Data Name='...'>`
     // like on the Security channel.
+    let pid = extract_between(block, "ProcessID='", "'")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let target_process_id = extract_between(block, "<TargetProcessId>", "</TargetProcessId>")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    // Unescaped like `FullFilePath`: the fallback path would otherwise keep
+    // `&amp;` for a directory containing `&`.
     let file_path = extract_between(block, "<FilePath>", "</FilePath>")
         .map(str::trim)
-        .unwrap_or("")
-        .to_string();
+        .map(unescape_xml_entities)
+        .unwrap_or_default();
     // `<FullFilePath>` cannot be mistaken for `<FilePath>`: the marker
     // includes the opening `<`, so the two never overlap.
     let full_file_path = extract_between(block, "<FullFilePath>", "</FullFilePath>")
@@ -535,6 +547,7 @@ pub fn parse_applocker_event(block: &str) -> Option<AppLockerEvent> {
         event_id,
         policy_name,
         target_user,
+        pid,
         target_process_id,
         file_path,
         full_file_path,
@@ -1105,6 +1118,7 @@ mod tests {
             parsed.target_user.as_deref(),
             Some("S-1-5-21-1663667890-2519037288-962558911-1001")
         );
+        assert_eq!(parsed.pid, 6868);
         assert_eq!(parsed.target_process_id, 7092);
         assert_eq!(parsed.file_path, "%OSDRIVE%\\USERS\\PUBLIC\\TEST8003.EXE");
         assert_eq!(
@@ -1132,11 +1146,34 @@ mod tests {
             parsed.target_user.as_deref(),
             Some("S-1-5-21-1663667890-2519037288-962558911-1001")
         );
+        assert_eq!(parsed.pid, 7764);
         assert_eq!(parsed.target_process_id, 9184);
         assert_eq!(parsed.file_path, "%OSDRIVE%\\USERS\\PUBLIC\\TEST8004.EXE");
         assert_eq!(
             parsed.full_file_path.as_deref(),
             Some("C:\\Users\\Public\\test8004.exe")
+        );
+    }
+
+    #[test]
+    fn applocker_file_path_is_unescaped_like_full_file_path() {
+        let xml = APPLOCKER_BLOCK_8004_XML
+            .replace(
+                "TEST8004.EXE</FilePath>",
+                "R&amp;D\\TEST8004.EXE</FilePath>",
+            )
+            .replace(
+                "test8004.exe</FullFilePath>",
+                "R&amp;D\\test8004.exe</FullFilePath>",
+            );
+        let parsed = parse_applocker_event(split_event_blocks(&xml)[0]).expect("should parse");
+        assert_eq!(
+            parsed.file_path,
+            "%OSDRIVE%\\USERS\\PUBLIC\\R&D\\TEST8004.EXE"
+        );
+        assert_eq!(
+            parsed.full_file_path.as_deref(),
+            Some("C:\\Users\\Public\\R&D\\test8004.exe")
         );
     }
 

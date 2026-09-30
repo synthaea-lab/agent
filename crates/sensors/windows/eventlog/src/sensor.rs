@@ -593,12 +593,13 @@ const APPLOCKER_EVENT_AUDITED: u32 = 8003;
 ///   can still match it.
 /// - `object_class`: the rule collection (`EXE`, `DLL`), as reported.
 /// - `action`: `execute` — the only operation these two collections gate.
-/// - `meta.pid`: `TargetProcessId`, the process that tried to launch the image.
+/// - `meta.pid`: `<Execution ProcessID>`, the process that tried to launch
+///   the image — the actor. Not `TargetProcessId`, which names the process
+///   being created for the image itself (lab-checked for 8003 and 8004, #529).
 /// - `meta.user`: `TargetUser`, the SID whose execution was refused.
-/// - `meta.comm`: empty. The event names the *object* (the refused image),
-///   not the acting process; putting the image's leaf name there — as the
-///   pre-#427 `FileOpenEvent` did — would attribute the attempt to the very
-///   binary that never ran.
+/// - `meta.comm`: empty. The event carries the launcher's pid but not its
+///   name, and the image's leaf name — what the pre-#427 `FileOpenEvent` put
+///   there — names the *object*, not the actor.
 ///
 /// Skipped (cursor still advances): a block without `FilePath` (nothing to
 /// attribute), and any event id other than 8003/8004 the `XPath` filter let
@@ -623,7 +624,7 @@ fn normalize_applocker_block(block: &str) -> ParsedBlock {
     });
     let event = Event::PolicyDenial(PolicyDenialEvent {
         meta: EventMeta {
-            pid: ev.target_process_id,
+            pid: ev.pid,
             ppid: 0,
             user,
             timestamp_ns: now_ns(),
@@ -1424,7 +1425,7 @@ mod applocker_tests {
 
     fn applocker_block(event_id: u32) -> String {
         format!(
-            "<Event><System><EventID>{event_id}</EventID><EventRecordID>7</EventRecordID></System>\
+            "<Event><System><EventID>{event_id}</EventID><EventRecordID>7</EventRecordID><Execution ProcessID='4242' ThreadID='1'/></System>\
             <UserData><RuleAndFileData><PolicyName>EXE</PolicyName>\
             <TargetUser>S-1-5-21-1-2-3-1001</TargetUser><TargetProcessId>42</TargetProcessId>\
             <FilePath>%OSDRIVE%\\USERS\\X\\EVIL.EXE</FilePath></RuleAndFileData></UserData></Event>"
@@ -1454,7 +1455,8 @@ mod applocker_tests {
             "path variable left unexpanded: {path}"
         );
         assert!(path.ends_with("\\USERS\\X\\EVIL.EXE"), "{path}");
-        assert_eq!(denial.meta.pid, 42);
+        // The launcher (Execution ProcessID), not the image's TargetProcessId.
+        assert_eq!(denial.meta.pid, 4242);
         assert!(
             denial.meta.comm.is_empty(),
             "comm must not name the refused image: {}",
@@ -1492,7 +1494,7 @@ mod applocker_tests {
     #[test]
     fn a_real_8004_is_an_enforced_denial_of_its_full_file_path() {
         // Trimmed from the real 8004 captured in the lab (#529, see xml.rs).
-        let block = "<Event><System><EventID>8004</EventID><EventRecordID>29</EventRecordID></System>\
+        let block = "<Event><System><EventID>8004</EventID><EventRecordID>29</EventRecordID><Execution ProcessID='7764' ThreadID='8072'/></System>\
             <UserData><RuleAndFileData><PolicyName>EXE</PolicyName>\
             <TargetUser>S-1-5-21-1-2-3-1001</TargetUser><TargetProcessId>9184</TargetProcessId>\
             <FilePath>%OSDRIVE%\\USERS\\PUBLIC\\TEST8004.EXE</FilePath>\
@@ -1509,7 +1511,7 @@ mod applocker_tests {
             denial.object_path.as_deref(),
             Some("C:\\Users\\Public\\test8004.exe")
         );
-        assert_eq!(denial.meta.pid, 9184);
+        assert_eq!(denial.meta.pid, 7764);
     }
 
     #[test]
