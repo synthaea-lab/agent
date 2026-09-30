@@ -17,6 +17,7 @@ Abstract:
     and exposes one communication port for the Synthaea agent. The port
     follows ADR-0012 guardrails 2 and 5: SYSTEM/Administrators-only
     security descriptor, a single connection, and a connect callback that
+    accepts only the agent (NT SERVICE\SynthaEDR in its token) and
     validates the client's connection context before accepting it. No
     message callback is registered, so user mode cannot send anything to
     the driver; the channel is kernel -> user only.
@@ -52,6 +53,42 @@ typedef struct _SYNTHAEA_CONNECT_CONTEXT {
     ULONG Version;
 
 } SYNTHAEA_CONNECT_CONTEXT, *PSYNTHAEA_CONNECT_CONTEXT;
+
+//
+//  Guardrail 5, "only the agent may connect": the caller's primary token
+//  must hold NT SERVICE\SynthaEDR, the service SID of the watchdog service
+//  that spawns the agent (the agent inherits the watchdog's token). A
+//  service SID is derived from the service name alone, so it is a constant:
+//  `sc showsid SynthaEDR` gives
+//  S-1-5-80-3000362003-865703788-3960528645-4228801270-24284304.
+//  Windows only puts it in the token when the service is configured with
+//  `sc sidtype SynthaEDR unrestricted`, which `watchdog install` does.
+//
+
+//
+//  TOKEN_GROUPS attribute; the kernel headers don't define it (um/winnt.h does).
+//
+
+#ifndef SE_GROUP_ENABLED
+#define SE_GROUP_ENABLED    (0x00000004L)
+#endif
+
+typedef struct _SYNTHAEA_SERVICE_SID {
+
+    UCHAR Revision;
+    UCHAR SubAuthorityCount;
+    SID_IDENTIFIER_AUTHORITY IdentifierAuthority;
+    ULONG SubAuthority[6];
+
+} SYNTHAEA_SERVICE_SID;
+
+static const SYNTHAEA_SERVICE_SID SynthaeaAgentServiceSid = {
+    SID_REVISION,
+    6,
+    SECURITY_NT_AUTHORITY,
+    { SECURITY_SERVICE_ID_BASE_RID,
+      3000362003UL, 865703788UL, 3960528645UL, 4228801270UL, 24284304UL }
+};
 
 //---------------------------------------------------------------------------
 //      Global variables
@@ -122,6 +159,11 @@ SynthaeaCreatePort (
     VOID
     );
 
+BOOLEAN
+SynthaeaCallerIsAgent (
+    VOID
+    );
+
 //
 //  Structure that contains all the global data structures
 //  used throughout SynthaeaFilter.
@@ -140,6 +182,7 @@ SYNTHAEA_FILTER_DATA SynthaeaFilterData;
 #pragma alloc_text(PAGE, SynthaeaPortConnect)
 #pragma alloc_text(PAGE, SynthaeaPortDisconnect)
 #pragma alloc_text(PAGE, SynthaeaCreatePort)
+#pragma alloc_text(PAGE, SynthaeaCallerIsAgent)
 #endif
 
 
@@ -401,18 +444,21 @@ SynthaeaPortConnect (
 Routine Description:
 
     Called by FltMgr when a client that passed the port's security check
-    connects. Guardrail 2: the connection context comes from user mode and
-    is hostile until validated. It must be exactly one
-    SYNTHAEA_CONNECT_CONTEXT with the expected magic and version; anything
-    else is refused before the client port is kept.
+    (SYSTEM/Administrators) connects, in that client's process context.
 
-    The magic is not authentication (any administrator can send it); the
-    security descriptor is the access control. The check only refuses
-    clients that do not speak this protocol version.
+    Guardrail 5: the caller must be the agent, i.e. its primary token holds
+    NT SERVICE\SynthaEDR (see SynthaeaCallerIsAgent). Any other elevated
+    process is refused, so it cannot take the single connection slot.
+
+    Guardrail 2: the connection context comes from user mode and is hostile
+    until validated. It must be exactly one SYNTHAEA_CONNECT_CONTEXT with
+    the expected magic and version. The magic is not authentication, only a
+    protocol version check.
 
 Return Value:
 
-    STATUS_SUCCESS to accept, STATUS_INVALID_PARAMETER to refuse.
+    STATUS_SUCCESS to accept; STATUS_ACCESS_DENIED for a caller that is not
+    the agent; STATUS_INVALID_PARAMETER for a bad connection context.
 
 --*/
 {
@@ -423,6 +469,14 @@ Return Value:
     PAGED_CODE();
 
     *ConnectionPortCookie = NULL;
+
+    if (!SynthaeaCallerIsAgent()) {
+
+        DbgPrintEx( DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                    "SynthaeaFilter: connect refused, pid %p: not the agent (no NT SERVICE\\SynthaEDR in its token)\n",
+                    PsGetCurrentProcessId() );
+        return STATUS_ACCESS_DENIED;
+    }
 
     if (ConnectionContext == NULL ||
         SizeOfContext != sizeof( SYNTHAEA_CONNECT_CONTEXT )) {
@@ -479,4 +533,65 @@ Routine Description:
 
     FltCloseClientPort( SynthaeaFilterData.FilterHandle,
                         &SynthaeaFilterData.ClientPort );
+}
+
+BOOLEAN
+SynthaeaCallerIsAgent (
+    VOID
+    )
+/*++
+
+Routine Description:
+
+    Whether the current process's primary token holds the agent's service
+    SID as an enabled group. The primary token, not the thread's effective
+    token: a thread impersonating the agent from another process does not
+    count.
+
+    This raises the bar, it is not a hard boundary: an administrator can
+    still reconfigure or replace the SynthaEDR service, or take the agent's
+    token with SeDebugPrivilege. Closing that needs a protected (PPL) agent.
+
+Return Value:
+
+    TRUE if the caller is the agent, FALSE otherwise (including when the
+    token cannot be queried).
+
+--*/
+{
+    PACCESS_TOKEN token;
+    PTOKEN_GROUPS groups = NULL;
+    NTSTATUS status;
+    BOOLEAN isAgent = FALSE;
+    ULONG i;
+
+    PAGED_CODE();
+
+    token = PsReferencePrimaryToken( PsGetCurrentProcess() );
+    status = SeQueryInformationToken( token, TokenGroups, (PVOID *)&groups );
+    PsDereferencePrimaryToken( token );
+
+    if (!NT_SUCCESS( status )) {
+        DbgPrintEx( DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                    "SynthaeaFilter: SeQueryInformationToken failed 0x%08X\n", status );
+        return FALSE;
+    }
+
+    for (i = 0; i < groups->GroupCount; i++) {
+
+        if (FlagOn( groups->Groups[i].Attributes, SE_GROUP_ENABLED ) &&
+            RtlEqualSid( groups->Groups[i].Sid, (PSID)&SynthaeaAgentServiceSid )) {
+
+            isAgent = TRUE;
+            break;
+        }
+    }
+
+    //
+    //  SeQueryInformationToken allocates the buffer; the caller frees it.
+    //
+
+    ExFreePool( groups );
+
+    return isAgent;
 }

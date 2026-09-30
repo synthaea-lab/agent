@@ -9,8 +9,14 @@
       1. accepts a client with the right connection context;
       2. refuses a second client while the first is connected;
       3. refuses a missing context, a wrong size, a wrong magic, a wrong version.
-    Run once elevated (all checks), then once NOT elevated: the only
-    expected result there is "access denied" on check 1.
+    Those checks need the agent's identity (NT SERVICE\SynthaEDR in the
+    token, ADR-0012 guardrail 5): run this script through run-as-agent.ps1.
+
+    Run directly, it checks the two refusals instead:
+      - elevated, not the agent: refused by the connect callback (guardrail 5);
+      - not elevated: refused by the port's security descriptor.
+    Both are "access denied" (0x80070005); DebugView tells them apart (only
+    the first logs "not the agent").
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -63,12 +69,22 @@ function Show([string]$Name, [int]$Hr, [int]$Expected) {
     '{0}  {1,-45} hr=0x{2:X8} (expected 0x{3:X8})' -f $verdict, $Name, $Hr, $Expected
 }
 
-$elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+$me = [Security.Principal.WindowsIdentity]::GetCurrent()
+$elevated = ([Security.Principal.WindowsPrincipal]$me).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
-"elevated: $elevated"
+# NT SERVICE\SynthaEDR (`sc showsid SynthaEDR`), mirrored in SynthaeaFilter.c.
+$AgentSid = 'S-1-5-80-3000362003-865703788-3960528645-4228801270-24284304'
+$isAgent = @($me.Groups | ForEach-Object { $_.Value }) -contains $AgentSid
+"user: $($me.Name)  elevated: $elevated  agent SID: $isAgent"
 
 $h1 = [IntPtr]::Zero
 $hr = [SynPort]::Connect($good, [ref]$h1)
+if ($elevated -and -not $isAgent) {
+    Show '1. elevated non-agent client refused (guardrail 5)' $hr $E_ACCESSDENIED
+    if ($hr -eq 0) { [void][SynPort]::CloseHandle($h1) }
+    'Not the agent: only check 1 applies. Run through run-as-agent.ps1 for the full suite.'
+    return
+}
 if ($elevated) {
     Show '1. good context connects' $hr $S_OK
     if ($hr -ne $S_OK) {
