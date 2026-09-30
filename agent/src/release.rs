@@ -31,6 +31,7 @@ pub(crate) fn cmd_apply_release(
     _key: Option<&std::path::Path>,
     _base_dir: &std::path::Path,
     _restart: bool,
+    _allow_test_key: bool,
 ) -> anyhow::Result<()> {
     anyhow::bail!("binary self-update is Linux-only (ADR-0015 Deferred)")
 }
@@ -57,6 +58,34 @@ mod linux {
 
     /// Name of the ban list directly under the layout's base directory.
     const BAN_LIST: &str = "banned_versions.json";
+
+    /// Refuses to trust the public test key without an explicit acknowledgement.
+    ///
+    /// `test_key` is `updater::key::SYNTHAEA_UPDATER_TEST_KEY`, passed in so both
+    /// states are testable. With a production key (`false`) the flag means
+    /// nothing and is ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the build trusts the test key and `allow_test_key`
+    /// is not set.
+    fn ensure_key_trusted(test_key: bool, allow_test_key: bool) -> anyhow::Result<()> {
+        if !test_key {
+            return Ok(());
+        }
+        if !allow_test_key {
+            anyhow::bail!(
+                "this build verifies releases against the public test key, so anyone who can \
+                 serve the release routes could get code run as root; refusing. Pass \
+                 --allow-test-key to acknowledge this in a lab (ADR-0015 Deferred)"
+            );
+        }
+        eprintln!(
+            "warning: --allow-test-key: releases are verified against the public test key; \
+             this is safe only against a control plane you trust"
+        );
+        Ok(())
+    }
 
     /// What [`apply_release`] did.
     #[derive(Debug, PartialEq, Eq)]
@@ -228,7 +257,11 @@ mod linux {
         key: Option<&Path>,
         base_dir: &Path,
         restart: bool,
+        allow_test_key: bool,
     ) -> anyhow::Result<()> {
+        // Before any network or filesystem work: an unacknowledged test-key
+        // build must not even contact the server.
+        ensure_key_trusted(updater::key::SYNTHAEA_UPDATER_TEST_KEY, allow_test_key)?;
         let mut config = transport::TransportConfig::new(server);
         if let (Some(cert), Some(key)) = (cert, key) {
             config = config.with_client_cert(PathBuf::from(cert), PathBuf::from(key));
@@ -287,6 +320,49 @@ mod linux {
         use updater::key::test_key_pair;
 
         use super::*;
+
+        #[test]
+        fn the_public_test_key_is_refused_without_the_acknowledgement() {
+            let err = ensure_key_trusted(true, false).unwrap_err().to_string();
+            assert!(err.contains("--allow-test-key"), "{err}");
+            assert!(err.contains("public test key"), "{err}");
+        }
+
+        #[test]
+        fn the_acknowledgement_lets_a_test_key_build_proceed() {
+            assert!(ensure_key_trusted(true, true).is_ok());
+        }
+
+        #[test]
+        fn a_production_key_needs_no_acknowledgement() {
+            assert!(ensure_key_trusted(false, false).is_ok());
+            assert!(ensure_key_trusted(false, true).is_ok());
+        }
+
+        #[test]
+        fn this_build_trusts_the_test_key_until_a_production_key_is_embedded() {
+            // Pins the premise of the guard at compile time: when a production key
+            // lands this stops building, and the ADR-0015 interim-guard paragraph
+            // (and the flag itself) should be revisited.
+            const { assert!(updater::key::SYNTHAEA_UPDATER_TEST_KEY) };
+        }
+
+        #[test]
+        fn cmd_apply_release_refuses_before_touching_the_network_or_disk() {
+            // An unroutable server and a missing base dir: reaching either would
+            // fail differently, so the flag error proves the guard runs first.
+            let err = cmd_apply_release(
+                "http://127.0.0.1:1",
+                None,
+                None,
+                Path::new("/nonexistent/synthaea"),
+                false,
+                false,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("--allow-test-key"), "{err}");
+        }
 
         fn tmp(name: &str) -> PathBuf {
             let dir =

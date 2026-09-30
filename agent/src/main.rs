@@ -227,6 +227,12 @@ enum Command {
         /// at the next service start.
         #[arg(long)]
         no_restart: bool,
+        /// Acknowledge that this build verifies releases against the public test
+        /// key, so anyone who can serve the release routes can get code run as
+        /// root (ADR-0015 Deferred). Required until a production key is embedded;
+        /// for lab and development use only.
+        #[arg(long)]
+        allow_test_key: bool,
     },
 }
 
@@ -329,12 +335,14 @@ fn main() -> anyhow::Result<()> {
             cert,
             key,
             no_restart,
+            allow_test_key,
         } => release::cmd_apply_release(
             &server,
             cert.as_deref(),
             key.as_deref(),
             &cfg.storage.state_dir,
             !no_restart,
+            allow_test_key,
         ),
     }
 }
