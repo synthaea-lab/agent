@@ -52,8 +52,8 @@ impl EventDrain for SpoolDrain {
 /// `commands::linux::cmd_run`'s note on graceful shutdown).
 pub(crate) struct TransportHandle {
     pub(crate) spool: Arc<Mutex<EventSpool>>,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    // heartbeat wiring is Linux-first (#25 precedent)
+    // Read by the health beacon, which macOS doesn't wire yet (#317).
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     pub(crate) client: Arc<TransportClient>,
 }
 
@@ -88,7 +88,7 @@ pub(crate) fn start(server_url: &str, alerts: &Path) -> anyhow::Result<Transport
 
 /// The health beacon's view of the spool (`spool_bytes`/`spool_dropped` in
 /// #134's beacon) — replaces `health::NoopSpoolStats` when transport is on.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // health collector is Linux-first (#25 precedent)
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))] // no health beacon on macOS yet (#317)
 pub(crate) struct SpoolHealth(pub(crate) Arc<Mutex<EventSpool>>);
 
 impl crate::health::SpoolStatsSource for SpoolHealth {

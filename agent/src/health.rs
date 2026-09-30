@@ -8,9 +8,9 @@
 //! "Silence is a detection": an agent that stops beaconing is as suspicious as one
 //! that stops sending events.
 
-// Only wired on Linux (commands/linux.rs) — Windows build will see this as dead code
-// until health is integrated there too (see #209 review).
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+// Wired on Linux and Windows (`commands::common::health_collector`, #317); macOS
+// has no silence monitor to feed it yet.
+#![cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 
 use std::{
     sync::{

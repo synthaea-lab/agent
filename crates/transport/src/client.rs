@@ -248,4 +248,44 @@ mod tests {
         let client = TransportClient::new(config);
         assert!(client.is_ok());
     }
+
+    /// Pins the heartbeat request body the control plane parses — the contract
+    /// in `docs/architecture/control-plane.md` (#317). A change here is a change
+    /// to that contract: update the doc and the server together.
+    #[test]
+    fn heartbeat_body_is_the_documented_wire_shape() {
+        let beacon = schema::HealthBeacon {
+            timestamp_ns: 1_790_756_620_574_604_200,
+            agent_version: "0.1.0".into(),
+            sensors: vec![schema::SensorHealth {
+                name: "windows-etw".into(),
+                pulse_count: 42,
+                silent: false,
+            }],
+            spool_bytes: 1024,
+            spool_dropped: 0,
+            enrich_dropped: 3,
+        };
+        let body = serde_json::to_value(HeartbeatPayload {
+            agent_id: None,
+            beacon: &beacon,
+        })
+        .unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "agent_id": null,
+                "beacon": {
+                    "timestamp_ns": 1_790_756_620_574_604_200_u64,
+                    "agent_version": "0.1.0",
+                    "sensors": [
+                        { "name": "windows-etw", "pulse_count": 42, "silent": false }
+                    ],
+                    "spool_bytes": 1024,
+                    "spool_dropped": 0,
+                    "enrich_dropped": 3
+                }
+            })
+        );
+    }
 }
