@@ -51,7 +51,7 @@ mod upload;
 pub use client::TransportClient;
 pub use config::TransportConfig;
 pub use error::{Result, TransportError};
-pub use upload::{EventDrain, EventUploader, UploadLoop};
+pub use upload::{EventDrain, EventUploader, UploadLoop, UploadStep};
 
 /// Default server endpoint for event ingestion.
 pub const DEFAULT_INGEST_ENDPOINT: &str = "/api/v1/ingest/events";

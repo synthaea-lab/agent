@@ -6,7 +6,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use schema::Event;
@@ -251,32 +251,119 @@ impl<D: EventDrain> EventUploader<D> {
     }
 }
 
+/// One upload attempt plus the backoff it implies — the two calls
+/// [`UploadLoop`] makes on its uploader. [`EventUploader`] is the only
+/// production implementation; the trait exists so the loop's shutdown
+/// behaviour is testable without a server.
+pub trait UploadStep: Send {
+    /// See [`EventUploader::upload_once`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the upload fails.
+    fn upload_once(&mut self) -> Result<usize>;
+
+    /// See [`EventUploader::backoff_duration`].
+    fn backoff_duration(&self) -> Duration;
+}
+
+impl<D: EventDrain> UploadStep for EventUploader<D> {
+    fn upload_once(&mut self) -> Result<usize> {
+        EventUploader::upload_once(self)
+    }
+
+    fn backoff_duration(&self) -> Duration {
+        EventUploader::backoff_duration(self)
+    }
+}
+
+/// Granularity at which a sleeping [`UploadLoop`] re-checks its stop flag.
+const STOP_POLL_SLICE: Duration = Duration::from_millis(50);
+
+/// How long the final drain after a stop may keep uploading segments.
+pub const DEFAULT_FINAL_DRAIN_BUDGET: Duration = Duration::from_secs(3);
+
 /// Background upload loop that continuously drains events. Blocking — run it
 /// on a dedicated thread; another thread stops it through [`UploadLoop::stop_handle`]
 /// (the same shared-`AtomicBool` shape the sensors use — a `&mut self` stop
 /// would be uncallable while `run(&mut self)` blocks).
-pub struct UploadLoop<D: EventDrain> {
-    uploader: EventUploader<D>,
+///
+/// Stopping is prompt: poll and backoff sleeps are sliced, so the loop notices
+/// the flag within [`STOP_POLL_SLICE`]. After the flag is seen the loop makes
+/// one best-effort final drain (see [`UploadLoop::with_final_drain_budget`]).
+/// The only unbounded wait left is an upload already in flight, which the
+/// HTTP client's own timeout bounds — callers should still join with a limit.
+pub struct UploadLoop<U: UploadStep> {
+    uploader: U,
     poll_interval: Duration,
+    final_drain_budget: Duration,
     stop: Arc<AtomicBool>,
 }
 
-impl<D: EventDrain> UploadLoop<D> {
+impl<U: UploadStep> UploadLoop<U> {
     /// Creates a new upload loop.
     #[must_use]
-    pub fn new(uploader: EventUploader<D>, poll_interval: Duration) -> Self {
+    pub fn new(uploader: U, poll_interval: Duration) -> Self {
         Self {
             uploader,
             poll_interval,
+            final_drain_budget: DEFAULT_FINAL_DRAIN_BUDGET,
             stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Shared stop flag: set it to `true` to end [`UploadLoop::run`] after the
-    /// current iteration (including its sleep).
+    /// Sets how long the final drain after a stop may run (default
+    /// [`DEFAULT_FINAL_DRAIN_BUDGET`]). `Duration::ZERO` disables it.
+    #[must_use]
+    pub fn with_final_drain_budget(mut self, budget: Duration) -> Self {
+        self.final_drain_budget = budget;
+        self
+    }
+
+    /// Shared stop flag: set it to `true` to end [`UploadLoop::run`]. The
+    /// loop wakes from any sleep within [`STOP_POLL_SLICE`], then does its
+    /// final drain before returning.
     #[must_use]
     pub fn stop_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.stop)
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    fn sleep_unless_stopped(&self, total: Duration) {
+        let deadline = Instant::now() + total;
+        while !self.stopped() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            thread::sleep(left.min(STOP_POLL_SLICE));
+        }
+    }
+
+    /// Best-effort: keeps uploading segments until the spool is empty, an
+    /// upload fails, or the budget is spent. A failure is not retried — the
+    /// un-ack'd segment stays in the spool and the next run redelivers it
+    /// (at-least-once), so giving up here loses nothing.
+    fn final_drain(&mut self) {
+        if self.final_drain_budget.is_zero() {
+            return;
+        }
+        let deadline = Instant::now() + self.final_drain_budget;
+        let mut uploaded = 0usize;
+        while Instant::now() < deadline {
+            match self.uploader.upload_once() {
+                Ok(0) => break,
+                Ok(n) => uploaded += n,
+                Err(e) => {
+                    tracing::warn!(error = %e, "final spool drain failed; remaining events stay spooled");
+                    break;
+                }
+            }
+        }
+        tracing::info!(uploaded, "final spool drain finished");
     }
 
     /// Runs the upload loop until the stop flag is set.
@@ -285,11 +372,11 @@ impl<D: EventDrain> UploadLoop<D> {
     pub fn run(&mut self) {
         tracing::info!(poll_interval = ?self.poll_interval, "upload loop started");
 
-        while !self.stop.load(Ordering::SeqCst) {
+        while !self.stopped() {
             match self.uploader.upload_once() {
                 Ok(0) => {
                     // Drain empty, wait before checking again
-                    thread::sleep(self.poll_interval);
+                    self.sleep_unless_stopped(self.poll_interval);
                 }
                 Ok(n) => {
                     // Uploaded successfully, immediately try next segment
@@ -299,11 +386,12 @@ impl<D: EventDrain> UploadLoop<D> {
                     // Upload failed, apply backoff
                     let backoff = self.uploader.backoff_duration();
                     tracing::warn!(error = %e, backoff = ?backoff, "upload failed, backing off");
-                    thread::sleep(backoff);
+                    self.sleep_unless_stopped(backoff);
                 }
             }
         }
 
+        self.final_drain();
         tracing::info!("upload loop stopped");
     }
 }
@@ -376,6 +464,109 @@ mod tests {
         // Capped at max (60s)
         uploader.consecutive_failures = 20;
         assert_eq!(uploader.backoff_duration(), Duration::from_millis(60000));
+    }
+
+    /// Scripted uploader: pops one result per call, then reports an empty
+    /// drain; counts calls so tests can assert what the loop attempted.
+    struct ScriptedStep {
+        script: std::collections::VecDeque<Result<usize>>,
+        calls: Arc<std::sync::atomic::AtomicU32>,
+        backoff: Duration,
+    }
+
+    impl ScriptedStep {
+        fn new(
+            script: Vec<Result<usize>>,
+            backoff: Duration,
+        ) -> (Self, Arc<std::sync::atomic::AtomicU32>) {
+            let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let step = Self {
+                script: script.into(),
+                calls: Arc::clone(&calls),
+                backoff,
+            };
+            (step, calls)
+        }
+    }
+
+    impl UploadStep for ScriptedStep {
+        fn upload_once(&mut self) -> Result<usize> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.script.pop_front().unwrap_or(Ok(0))
+        }
+
+        fn backoff_duration(&self) -> Duration {
+            self.backoff
+        }
+    }
+
+    fn scripted_failure() -> crate::error::TransportError {
+        crate::error::TransportError::Config("scripted failure".into())
+    }
+
+    /// A loop parked in a long backoff must wake on stop, not sleep it out.
+    #[test]
+    fn stop_interrupts_a_long_backoff() {
+        let (step, _) = ScriptedStep::new(vec![Err(scripted_failure())], Duration::from_secs(60));
+        let mut upload_loop =
+            UploadLoop::new(step, Duration::from_secs(60)).with_final_drain_budget(Duration::ZERO);
+        let stop = upload_loop.stop_handle();
+        let started = Instant::now();
+        let t = thread::spawn(move || upload_loop.run());
+        thread::sleep(Duration::from_millis(100));
+        stop.store(true, Ordering::SeqCst);
+        t.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stop must not wait out the 60s backoff, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// After the stop, segments still spooled are uploaded until the spool
+    /// reports empty.
+    #[test]
+    fn final_drain_uploads_remaining_segments_then_stops() {
+        let (step, calls) = ScriptedStep::new(vec![Ok(3), Ok(2)], Duration::ZERO);
+        let mut upload_loop = UploadLoop::new(step, Duration::from_secs(60));
+        // Stopped before running: the main loop body is skipped and only the
+        // final drain executes.
+        upload_loop.stop_handle().store(true, Ordering::SeqCst);
+        upload_loop.run();
+        // Ok(3), Ok(2), then the empty drain ends it.
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// One failed upload ends the final drain — no retry storm at shutdown.
+    #[test]
+    fn final_drain_gives_up_after_one_failure() {
+        let (step, calls) =
+            ScriptedStep::new(vec![Err(scripted_failure()), Ok(5), Ok(5)], Duration::ZERO);
+        let mut upload_loop = UploadLoop::new(step, Duration::from_secs(60));
+        upload_loop.stop_handle().store(true, Ordering::SeqCst);
+        upload_loop.run();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A spool that never empties cannot hold shutdown past the budget.
+    #[test]
+    fn final_drain_is_bounded_by_its_budget() {
+        struct Endless;
+        impl UploadStep for Endless {
+            fn upload_once(&mut self) -> Result<usize> {
+                thread::sleep(Duration::from_millis(20));
+                Ok(1)
+            }
+            fn backoff_duration(&self) -> Duration {
+                Duration::ZERO
+            }
+        }
+        let mut upload_loop = UploadLoop::new(Endless, Duration::from_secs(60))
+            .with_final_drain_budget(Duration::from_millis(200));
+        upload_loop.stop_handle().store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        upload_loop.run();
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
