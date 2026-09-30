@@ -21,4 +21,6 @@ pub mod live;
 pub mod quarantine;
 
 pub use kill::{KillOutcome, kill_process};
-pub use quarantine::{QuarantineOutcome, quarantine_file, unquarantine};
+pub use quarantine::{
+    QuarantineOutcome, QuarantinedFile, list_quarantined, quarantine_file, unquarantine,
+};

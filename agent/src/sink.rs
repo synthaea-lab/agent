@@ -515,6 +515,11 @@ impl DetectionSink {
             response::KillOutcome::Failed { pid, error } => {
                 format!("failed to kill pid {pid} on a high-confidence correlated verdict: {error}")
             }
+            response::KillOutcome::Refused { pid, reason } => {
+                format!(
+                    "refused to kill pid {pid} on a high-confidence correlated verdict: {reason}"
+                )
+            }
         };
         self.emit("RESPONSE-KILL", &message);
     }
@@ -953,6 +958,88 @@ mod tests {
 
     fn alerts_in(dir: &std::path::Path) -> String {
         std::fs::read_to_string(dir.join("alerts.ndjson")).unwrap_or_default()
+    }
+
+    /// Quarantine hooks + the alert log they audit into, over a real directory
+    /// holding one payload. `terminate` is never reached on this path.
+    fn quarantine_fixture(
+        name: &str,
+        quarantine_enabled: bool,
+    ) -> (
+        std::path::PathBuf,
+        Mutex<Option<super::ResponseHooks>>,
+        crate::alerts::AlertLog,
+        std::path::PathBuf,
+    ) {
+        let dir = tmp(name);
+        let payload = dir.join("payload.bin");
+        std::fs::write(&payload, b"marker payload").unwrap();
+        let hooks = super::ResponseHooks {
+            policy: policy::ResponsePolicy {
+                kill_enabled: false,
+                quarantine_enabled,
+            },
+            terminate: Box::new(|_| panic!("quarantine never terminates")),
+            quarantine_dir: dir.join("quarantine"),
+        };
+        let log = crate::alerts::AlertLog::open(&dir.join("alerts.ndjson"), 8).unwrap();
+        (dir, Mutex::new(Some(hooks)), log, payload)
+    }
+
+    #[test]
+    fn a_yara_match_with_quarantine_disabled_leaves_the_payload_and_says_observe_only() {
+        let (dir, hooks, log, payload) = quarantine_fixture("quarantine-off", false);
+        super::quarantine_matched_payload(&hooks, &payload, &log);
+        assert!(payload.exists(), "policy off must never move the file");
+        assert!(
+            !dir.join("quarantine").exists(),
+            "policy off must not even create the quarantine directory"
+        );
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("RESPONSE-QUARANTINE"), "{alerts}");
+        assert!(alerts.contains("observe-only"), "{alerts}");
+    }
+
+    #[test]
+    fn a_yara_match_with_quarantine_enabled_moves_the_payload_and_audits_it() {
+        let (dir, hooks, log, payload) = quarantine_fixture("quarantine-on", true);
+        super::quarantine_matched_payload(&hooks, &payload, &log);
+        assert!(!payload.exists(), "the payload must be moved out of place");
+        let moved: Vec<_> = std::fs::read_dir(dir.join("quarantine"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            moved.iter().any(|n| n.ends_with(".origin")),
+            "the restore sidecar must exist: {moved:?}"
+        );
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("RESPONSE-QUARANTINE"), "{alerts}");
+        assert!(alerts.contains("quarantined"), "{alerts}");
+        assert!(
+            alerts.contains(&payload.display().to_string()),
+            "the audit line names the original path: {alerts}"
+        );
+    }
+
+    #[test]
+    fn a_payload_already_in_quarantine_is_left_alone() {
+        // The quarantine write is itself a file event the sensor sees; matching it
+        // again must not quarantine the file into itself.
+        let (dir, hooks, log, payload) = quarantine_fixture("quarantine-loop", true);
+        super::quarantine_matched_payload(&hooks, &payload, &log);
+        let before = std::fs::read_dir(dir.join("quarantine")).unwrap().count();
+        let quarantined = std::fs::read_dir(dir.join("quarantine"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_none())
+            .unwrap();
+        super::quarantine_matched_payload(&hooks, &quarantined, &log);
+        assert!(quarantined.exists());
+        assert_eq!(
+            std::fs::read_dir(dir.join("quarantine")).unwrap().count(),
+            before
+        );
     }
 
     fn exec(pid: u32, cmdline: &str, image_path: &str) -> Event {
