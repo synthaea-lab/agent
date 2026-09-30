@@ -48,16 +48,30 @@ pub(crate) fn cmd_quarantine_list(alerts: &Path, out: &mut impl Write) -> anyhow
 /// original path, I/O failure); the failure is audited first.
 pub(crate) fn cmd_quarantine_restore(alerts: &Path, sha256_hex: &str) -> anyhow::Result<()> {
     let log = AlertLog::open(alerts, 8)?;
-    match response::unquarantine(&quarantine_dir_for(alerts), sha256_hex) {
+    let quarantine_dir = quarantine_dir_for(alerts);
+    match response::unquarantine(&quarantine_dir, sha256_hex) {
         Ok(original) => {
+            // The file is back, so this is a success; but if the quarantine
+            // directory refused the cleanup, the payload is still listed there
+            // and an operator has to be told, in the audit log as well.
+            let leftover = response::is_still_quarantined(&quarantine_dir, sha256_hex).then(|| {
+                format!(
+                    "; the quarantined copy could not be removed and is still in {}: remove it by hand",
+                    quarantine_dir.display()
+                )
+            });
+            let leftover = leftover.as_deref().unwrap_or("");
             log.record(
                 "RESPONSE-UNQUARANTINE",
                 format!(
-                    "restored {} ({sha256_hex}) from quarantine at an operator's request",
+                    "restored {} ({sha256_hex}) from quarantine at an operator's request{leftover}",
                     original.display()
                 ),
             );
             println!("restored {}", original.display());
+            if !leftover.is_empty() {
+                eprintln!("warning{leftover}");
+            }
             Ok(())
         }
         Err(e) => {
@@ -152,5 +166,27 @@ mod tests {
             std::fs::read(&payload).unwrap(),
             b"took the original's place"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restore_that_cannot_clean_up_succeeds_and_audits_the_leftover() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = dir("restore-leftover");
+        let (alerts, payload, digest) = quarantined(&dir);
+        let qdir = quarantine_dir_for(&alerts);
+        std::fs::set_permissions(&qdir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(qdir.join("probe"), b"x").is_ok() {
+            return; // root ignores directory permissions: the scenario cannot be built
+        }
+
+        let restored = cmd_quarantine_restore(&alerts, &digest);
+
+        std::fs::set_permissions(&qdir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        restored.unwrap();
+        assert_eq!(std::fs::read(&payload).unwrap(), b"marker payload");
+        let log = std::fs::read_to_string(&alerts).unwrap();
+        assert!(log.contains("restored"), "{log}");
+        assert!(log.contains("could not be removed"), "{log}");
     }
 }

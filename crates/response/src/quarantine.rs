@@ -101,7 +101,11 @@ fn try_quarantine(path: &Path, quarantine_dir: &Path) -> std::io::Result<(PathBu
 /// know about immediately if it didn't work. Also fails, changing nothing, with
 /// `InvalidData` when `sha256_hex` is not a lowercase SHA-256 digest or the stored file
 /// no longer hashes to its name, and with `AlreadyExists` when the original path is
-/// occupied (a restore never overwrites).
+/// occupied (a restore never overwrites). Once the file is back at its original path
+/// the restore has succeeded: failing to remove the quarantined copy or the sidecar
+/// afterwards is not an error, and [`is_still_quarantined`] reports it. A failure
+/// before that point changes nothing, including on the cross-filesystem copy path,
+/// where a half-written destination is removed.
 pub fn unquarantine(quarantine_dir: &Path, sha256_hex: &str) -> std::io::Result<PathBuf> {
     // The digest becomes a file name under `quarantine_dir`: refuse anything that
     // is not exactly what `quarantine_file` writes, so it cannot name a path
@@ -120,7 +124,9 @@ pub fn unquarantine(quarantine_dir: &Path, sha256_hex: &str) -> std::io::Result<
         return Err(invalid("quarantined file no longer matches its hash"));
     }
     move_file_no_clobber(&stored, &original)?;
-    std::fs::remove_file(&origin_path)?;
+    // The file is back: the restore has happened. Dropping the sidecar is
+    // cleanup, and [`is_still_quarantined`] tells a caller when it did not work.
+    let _ = std::fs::remove_file(&origin_path);
 
     Ok(original)
 }
@@ -181,22 +187,63 @@ fn invalid(message: &'static str) -> std::io::Error {
 /// taken the original's place. `hard_link` is the atomic no-replace primitive;
 /// across filesystems it fails, and the copy fallback uses `create_new` for the
 /// same guarantee.
+///
+/// Once this returns `Ok` the file is complete at `to`. Removing `from` is
+/// best-effort after that: it is a duplicate by then, and failing to delete it
+/// must not turn a finished restore into an error (a retry would only fail with
+/// `AlreadyExists` on the very file that was restored).
 fn move_file_no_clobber(from: &Path, to: &Path) -> std::io::Result<()> {
     match std::fs::hard_link(from, to) {
-        Ok(()) => std::fs::remove_file(from),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
-        Err(_) => {
-            let mut src = std::fs::File::open(from)?;
-            let mut dst = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(to)?;
-            std::io::copy(&mut src, &mut dst)?;
-            // `hard_link` keeps the read-only bit for free; a copy must carry it.
-            dst.set_permissions(src.metadata()?.permissions())?;
-            std::fs::remove_file(from)
-        }
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(e),
+        Err(_) => copy_no_clobber(from, to)?,
     }
+    let _ = std::fs::remove_file(from);
+    Ok(())
+}
+
+/// Copies `from` to a new file `to`, carrying the read-only bit that `hard_link`
+/// would have kept for free.
+fn copy_no_clobber(from: &Path, to: &Path) -> std::io::Result<()> {
+    copy_no_clobber_with(from, to, |src, dst| {
+        std::io::copy(src, dst)?;
+        dst.set_permissions(src.metadata()?.permissions())
+    })
+}
+
+/// [`copy_no_clobber`] with the fill step injected, so its failure path can be
+/// exercised. If `fill` fails, the half-written `to` is removed: this call
+/// created it one line earlier, so deleting it is safe, and leaving it would
+/// break "a failed restore changes nothing" and jam every retry behind our own
+/// debris. If `create_new` itself fails (`AlreadyExists`) nothing was created and
+/// nothing is removed: the file at `to` is somebody else's.
+fn copy_no_clobber_with(
+    from: &Path,
+    to: &Path,
+    fill: impl FnOnce(&mut std::fs::File, &mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut src = std::fs::File::open(from)?;
+    let mut dst = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    if let Err(e) = fill(&mut src, &mut dst) {
+        drop(dst); // an open file cannot be removed on Windows
+        let _ = std::fs::remove_file(to);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Whether anything of `sha256_hex` is still in `quarantine_dir`: the stored
+/// payload or its sidecar. After a successful [`unquarantine`] this should be
+/// `false`; `true` means a cleanup step failed after the file was restored (a
+/// read-only or busy quarantine directory), which the caller should report.
+#[must_use]
+pub fn is_still_quarantined(quarantine_dir: &Path, sha256_hex: &str) -> bool {
+    is_sha256_hex(sha256_hex)
+        && (quarantine_dir.join(sha256_hex).exists()
+            || origin_sidecar_path(quarantine_dir, sha256_hex).exists())
 }
 
 fn origin_sidecar_path(quarantine_dir: &Path, sha256_hex: &str) -> PathBuf {
@@ -455,6 +502,131 @@ mod tests {
             let err = unquarantine(&dir.join("quarantine"), bad).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{bad:?}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_copy_that_fails_midway_leaves_nothing_at_the_destination() {
+        let dir = temp_dir("copy-fails");
+        let from = dir.join("from.bin");
+        let to = dir.join("to.bin");
+        std::fs::write(&from, b"the quarantined payload").unwrap();
+
+        let err = copy_no_clobber_with(&from, &to, |_, dst| {
+            use std::io::Write as _;
+            dst.write_all(b"half of it")?; // the disk fills up here
+            Err(std::io::Error::other("no space left on device"))
+        })
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "no space left on device");
+        assert!(!to.exists(), "our own half-written file must be removed");
+        assert_eq!(std::fs::read(&from).unwrap(), b"the quarantined payload");
+        // And a retry is not jammed behind that debris.
+        copy_no_clobber(&from, &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"the quarantined payload");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_copy_never_removes_a_file_it_did_not_create() {
+        let dir = temp_dir("copy-not-ours");
+        let from = dir.join("from.bin");
+        let to = dir.join("to.bin");
+        std::fs::write(&from, b"payload").unwrap();
+        std::fs::write(&to, b"somebody else's file").unwrap();
+
+        let err = copy_no_clobber_with(&from, &to, |_, _| {
+            panic!("nothing may be written when the destination exists")
+        })
+        .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&to).unwrap(), b"somebody else's file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_completed_copy_carries_the_read_only_bit() {
+        let dir = temp_dir("copy-readonly");
+        let from = dir.join("from.bin");
+        let to = dir.join("to.bin");
+        std::fs::write(&from, b"payload").unwrap();
+        let mut perms = std::fs::metadata(&from).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&from, perms).unwrap();
+
+        copy_no_clobber(&from, &to).unwrap();
+
+        assert!(std::fs::metadata(&to).unwrap().permissions().readonly());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nothing_is_left_after_a_normal_restore() {
+        let dir = temp_dir("leftover-none");
+        let (_, qdir, digest) = quarantine_one(&dir, "payload.bin", b"malware");
+        assert!(
+            is_still_quarantined(&qdir, &digest),
+            "it is quarantined before the restore"
+        );
+        unquarantine(&qdir, &digest).unwrap();
+        assert!(!is_still_quarantined(&qdir, &digest));
+        assert!(
+            !is_still_quarantined(&qdir, "../../etc/passwd"),
+            "a bad digest is never 'quarantined'"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A quarantine directory that refuses deletes, so the restore itself works
+    /// (the file is linked into place) but removing the quarantined copy and the
+    /// sidecar afterwards cannot. `None` when this process ignores permissions
+    /// (root), where the scenario cannot be built and the test must skip.
+    #[cfg(unix)]
+    fn undeletable_quarantine(name: &str) -> Option<(PathBuf, PathBuf, PathBuf, String)> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = temp_dir(name);
+        let (payload, qdir, digest) = quarantine_one(&dir, "payload.bin", b"malware");
+        std::fs::set_permissions(&qdir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(qdir.join("probe"), b"x").is_ok() {
+            let _ = std::fs::remove_file(qdir.join("probe"));
+            return None;
+        }
+        Some((dir, payload, qdir, digest))
+    }
+
+    #[cfg(unix)]
+    fn make_deletable(qdir: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(qdir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restore_that_cannot_clean_up_still_succeeds_and_says_something_is_left() {
+        let Some((dir, payload, qdir, digest)) = undeletable_quarantine("leftover") else {
+            return; // root ignores directory permissions
+        };
+
+        let restored = unquarantine(&qdir, &digest);
+
+        make_deletable(&qdir);
+        assert_eq!(
+            restored.unwrap(),
+            payload,
+            "the file is back, so the restore worked"
+        );
+        assert_eq!(std::fs::read(&payload).unwrap(), b"malware");
+        assert!(
+            is_still_quarantined(&qdir, &digest),
+            "the leftover must be reported, not hidden"
+        );
+        // A retry now refuses (the original is occupied) instead of overwriting.
+        assert_eq!(
+            unquarantine(&qdir, &digest).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
