@@ -1030,6 +1030,145 @@ mod tests {
         );
     }
 
+    /// The response chain through the real detection path, in-process: real
+    /// correlator, real YARA queue and rule set, real filesystem; only the
+    /// kernel-level `terminate` call is a recorder. The stream is the shape of
+    /// `lab/scenarios/response.sh`: an implant that connects out quickly and keeps
+    /// beaconing, while a payload carrying a YARA marker is written to disk.
+    const RESPONSE_MARKER_RULE: &str = r#"
+rule response_marker {
+    meta:
+        technique = "T1105"
+        severity = "low"
+        falsepositives = "none, test-only rule"
+    strings:
+        $m = "RESPONSE-SCENARIO-MARKER"
+    condition:
+        $m
+}
+"#;
+
+    /// An implant execs and reaches an external address (TEST-NET-1, never
+    /// routed) within a second, then repeats: the beacon shape.
+    fn drive_linux_beacon(sink: &DetectionSink, pid: u32) {
+        sink.on_event(exec(pid, "/tmp/implant", "/tmp/implant"));
+        for i in 0..4u64 {
+            sink.on_event(Event::Connect(ConnectEvent {
+                meta: EventMeta {
+                    pid,
+                    timestamp_ns: (i + 1) * 500_000_000,
+                    ..schema::fixtures::meta()
+                },
+                daddr: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+                dport: 4444,
+            }));
+        }
+    }
+
+    /// Writes the marker payload, loads the YARA rule into the sink, enables
+    /// response with `policy`, then drives the beacon and reports the write
+    /// to the sensor path so YARA scans the payload. Returns the payload path
+    /// and the pids `terminate` was asked to kill.
+    fn run_response_scenario(
+        dir: &std::path::Path,
+        policy: policy::ResponsePolicy,
+    ) -> (std::path::PathBuf, Arc<Mutex<Vec<u32>>>) {
+        let yara_dir = dir.join("content").join("rules").join("yara");
+        std::fs::create_dir_all(&yara_dir).unwrap();
+        std::fs::write(yara_dir.join("marker.yar"), RESPONSE_MARKER_RULE).unwrap();
+        let payload = dir.join("payload.bin");
+        std::fs::write(&payload, b"dropped payload RESPONSE-SCENARIO-MARKER").unwrap();
+
+        let sink = sink_in(dir);
+        assert_eq!(sink.reload_content().yara_rule_count, Some(1));
+        let killed = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&killed);
+        sink.enable_response(
+            policy,
+            move |pid| {
+                recorder.lock().unwrap().push(pid);
+                Ok(())
+            },
+            dir.join("quarantine"),
+        );
+
+        sink.on_event(Event::FileOpen(schema::FileOpenEvent {
+            path: payload.display().to_string(),
+            flags: 0o101, // O_WRONLY | O_CREAT: write intent, what queues a scan
+            ..schema::fixtures::file_open()
+        }));
+        drive_linux_beacon(&sink, 6262);
+        (payload, killed)
+    }
+
+    /// The YARA scan runs on its own thread; wait for its response line.
+    fn wait_for_alert(dir: &std::path::Path, technique: &str) -> String {
+        for _ in 0..200 {
+            let alerts = alerts_in(dir);
+            if alerts.contains(technique) {
+                return alerts;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("no {technique} within 10s: {}", alerts_in(dir));
+    }
+
+    #[test]
+    fn a_beacon_with_a_dropped_payload_is_killed_and_quarantined_and_both_are_audited() {
+        let dir = tmp("response-enforce");
+        let (payload, killed) = run_response_scenario(
+            &dir,
+            policy::ResponsePolicy {
+                kill_enabled: true,
+                quarantine_enabled: true,
+            },
+        );
+        let alerts = wait_for_alert(&dir, "RESPONSE-QUARANTINE");
+
+        // Killed, audited.
+        assert_eq!(*killed.lock().unwrap(), vec![6262]);
+        assert!(alerts.contains("RESPONSE-KILL"), "{alerts}");
+        assert!(alerts.contains("killed pid 6262"), "{alerts}");
+        // Quarantined, audited.
+        assert!(!payload.exists(), "the payload must have been moved");
+        assert!(alerts.contains("quarantined"), "{alerts}");
+        assert!(!alerts.contains("observe-only"), "policy is on: {alerts}");
+
+        // And reversible from what the audit trail and the directory record.
+        let listed = response::list_quarantined(&dir.join("quarantine")).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].original, payload);
+        response::unquarantine(&dir.join("quarantine"), &listed[0].sha256_hex).unwrap();
+        assert_eq!(
+            std::fs::read(&payload).unwrap(),
+            b"dropped payload RESPONSE-SCENARIO-MARKER"
+        );
+    }
+
+    #[test]
+    fn the_same_beacon_and_payload_with_policy_off_kill_nothing_and_move_nothing() {
+        let dir = tmp("response-observe");
+        let (payload, killed) = run_response_scenario(&dir, policy::ResponsePolicy::default());
+        let alerts = wait_for_alert(&dir, "RESPONSE-QUARANTINE");
+
+        assert!(
+            killed.lock().unwrap().is_empty(),
+            "terminate must never run"
+        );
+        assert!(payload.exists(), "the payload must stay where it was");
+        assert!(
+            !dir.join("quarantine").exists(),
+            "nothing may be quarantined"
+        );
+        // Both would-have-acted decisions are still audited, as observe-only.
+        let observe_only: Vec<_> = alerts
+            .lines()
+            .filter(|l| l.contains("RESPONSE-") && l.contains("observe-only"))
+            .collect();
+        assert_eq!(observe_only.len(), 2, "one per action: {alerts}");
+        assert!(alerts.contains("RESPONSE-KILL"), "{alerts}");
+    }
+
     #[test]
     fn a_payload_already_in_quarantine_is_left_alone() {
         // The quarantine write is itself a file event the sensor sees; matching it
