@@ -121,6 +121,14 @@ enum Command {
         /// exactly as before.
         #[arg(long)]
         server: Option<String>,
+        /// Where downloaded content lives (issue #30) — the detection sink
+        /// loads Sigma/YARA rules from `<content-dir>/rules/{sigma,yara}`.
+        /// Defaults to `<storage.state_dir>/content`, exactly like
+        /// `apply-content-manifest`'s `--content-dir`, so what an apply
+        /// writes is what this agent loads. To run against the in-repo
+        /// content (`rules/sigma`, `rules/yara`) pass `--content-dir .`.
+        #[arg(long)]
+        content_dir: Option<std::path::PathBuf>,
     },
     /// Captures a baseline of healthy activity to train the ML models: records the
     /// command lines of exec events that trigger no deterministic rule, as
@@ -242,18 +250,24 @@ fn main() -> anyhow::Result<()> {
             enable_readline_capture,
             enable_dns_capture,
             server,
-        } => commands::cmd_run(commands::RunOptions {
-            alerts: &alerts,
-            events: &events,
-            state_dir: &cfg.storage.state_dir,
-            enable_kill,
-            enable_quarantine,
-            enable_tls_capture,
-            enable_readline_capture,
-            enable_dns_capture,
-            server: server.as_deref(),
-            ipc_endpoint: &cfg.ipc.endpoint,
-        }),
+            content_dir,
+        } => {
+            let content_dir =
+                content_dir.unwrap_or_else(|| content::default_content_dir(&cfg.storage.state_dir));
+            commands::cmd_run(commands::RunOptions {
+                alerts: &alerts,
+                events: &events,
+                state_dir: &cfg.storage.state_dir,
+                enable_kill,
+                enable_quarantine,
+                enable_tls_capture,
+                enable_readline_capture,
+                enable_dns_capture,
+                server: server.as_deref(),
+                ipc_endpoint: &cfg.ipc.endpoint,
+                content_dir: &content_dir,
+            })
+        }
         Command::CaptureBaseline { output } => commands::cmd_capture_baseline(&output),
         Command::CaptureEvents { output } => commands::cmd_capture_events(&output),
         Command::CheckContentManifest {
@@ -286,6 +300,7 @@ fn main() -> anyhow::Result<()> {
                 key.as_deref(),
                 &content_dir,
                 &state,
+                &cfg.ipc.endpoint,
             )
         }
     }
