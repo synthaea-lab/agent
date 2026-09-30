@@ -15,11 +15,19 @@
 //! Redacting *all* query values is reserved for `RedactionPolicy`'s
 //! `pii_scrub_enabled`, once policy reaches the agent.
 //!
-//! Best-effort by design, and known to miss: a secret in the path
-//! (`/dl/<token>/x.exe`), a one-time link keyed by a generic name (`?id=`),
-//! and a percent-encoded parameter name. These URLs are written by browsers
-//! and download tools, not crafted to evade — the goal is not storing benign
-//! credentials, not winning against an adversary who controls the URL.
+//! Best-effort by design. Known to miss (ADR-0018 lists them):
+//! - a secret in the path (`/dl/<token>/x.exe`), including a matrix parameter
+//!   (`;jsessionid=`) and `;`-separated query parameters;
+//! - a short, host-specific name, too generic to match on its own: Slack's
+//!   `t=`, Google Drive's `at=`, Discord's `hm=`, a one-time `?id=`;
+//! - the first parameter of an unencoded URL nested in a value
+//!   (`?next=https://idp/cb?access_token=…` reads as `next`'s value);
+//! - a name whose secret part is itself percent-encoded (`%74oken`). A merely
+//!   encoded separator (`Access%5FToken`) is caught, since `token` survives.
+//!
+//! These URLs are written by browsers and download tools, not crafted to evade:
+//! the goal is not storing benign credentials, not winning against an adversary
+//! who controls the URL.
 
 // Only the Windows and macOS sensors emit `FileQuarantine`; Linux wires no
 // `RedactingSink` until a Linux producer exists (ADR-0018).
@@ -34,7 +42,7 @@ use schema::{Event, sensor::EventSink};
 pub(crate) const REDACTED: &str = "REDACTED";
 
 /// Parameter names that are secrets whole. Matched case-insensitively.
-const SECRET_KEYS: &[&str] = &["sig", "code", "pwd", "pass", "sid", "jwt", "auth"];
+const SECRET_KEYS: &[&str] = &["sig", "code", "pwd", "pass", "sid", "jwt"];
 
 /// Substrings that mark a parameter name as a secret: `X-Amz-Signature`,
 /// `X-Goog-Credential`, `X-Amz-Security-Token`, `access_token`,
@@ -51,8 +59,10 @@ const SECRET_KEY_PARTS: &[&str] = &[
 ];
 
 /// Suffixes that mark a parameter name as a secret: `api_key`, `apikey`,
-/// `x-api-key`, `oauth_consumer_key`, `AWSAccessKeyId`, …
-const SECRET_KEY_SUFFIXES: &[&str] = &["key", "keyid"];
+/// `x-api-key`, `oauth_consumer_key`, `AWSAccessKeyId`, `auth`, `oauth`, and
+/// SharePoint/OneDrive's `tempauth` bearer token on `download.aspx` links, the
+/// most common download source on a managed Windows fleet (#550 review).
+const SECRET_KEY_SUFFIXES: &[&str] = &["key", "keyid", "auth"];
 
 /// Wraps a sink, redacting credentials in every `FileQuarantine` URL before
 /// forwarding (see the module doc). Everything else passes through untouched.
@@ -214,6 +224,23 @@ mod tests {
             ),
             "https://h/cb?Access_Token=REDACTED&CODE=REDACTED&client_secret=REDACTED\
              &PHPSESSID=REDACTED&api_key=REDACTED&x-api-key=REDACTED&state=keep"
+        );
+    }
+
+    #[test]
+    fn a_sharepoint_tempauth_link_loses_its_bearer_token() {
+        // #550 review: the most common download source on a managed fleet.
+        assert_eq!(
+            redact_url_secrets(
+                "https://contoso.sharepoint.com/sites/x/_layouts/15/download.aspx\
+                 ?UniqueId=0a1b2c3d&Translate=false&tempauth=eyJ0eXAiOiJKV1Qi.v1&ApiVersion=2.0"
+            ),
+            "https://contoso.sharepoint.com/sites/x/_layouts/15/download.aspx\
+             ?UniqueId=0a1b2c3d&Translate=false&tempauth=REDACTED&ApiVersion=2.0"
+        );
+        assert_eq!(
+            redact_url_secrets("https://h/x?auth=a&OAuth=b&author=keep"),
+            "https://h/x?auth=REDACTED&OAuth=REDACTED&author=keep"
         );
     }
 
