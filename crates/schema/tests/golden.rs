@@ -15,10 +15,11 @@ use schema::{
     FileWriteEvent, GatekeeperVerdictEvent, IdentityChangeEvent, IdentityChangeKind,
     ImageLoadEvent, KernelModuleAction, KernelModuleEvent, ListenPortEvent, MemfdCreateEvent,
     MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, POLICY_MECHANISM_SELINUX,
-    PolicyDenialEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent,
-    RegistrySetEvent, ScriptBlockEvent, ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent,
-    SocketBindEvent, SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection,
-    TlsLibraryType, UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
+    PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
+    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType, SignalEvent,
+    SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TccDecisionEvent,
+    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
+    XpcConnectEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -1411,6 +1412,29 @@ fn namespace_golden() {
             flags: 0x4000_0000, // CLONE_NEWNET
         }),
         "namespace",
+    );
+}
+
+#[test]
+fn prctl_securebits_golden() {
+    // v34 (#457): PR_SET_SECUREBITS locking SECBIT_NOROOT (bit 0) and its
+    // LOCKED twin (bit 1) — the process tree can never regain root's implicit
+    // capabilities. PR_CAPBSET_DROP is the second option that reaches this
+    // stream; every other prctl option is filtered in-kernel.
+    assert_golden(
+        &Event::Prctl(PrctlEvent {
+            meta: EventMeta {
+                pid: 9010,
+                ppid: 1,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_028_000_000_000,
+                comm: "sandbox_init".into(),
+                container: None,
+            },
+            option: schema::PR_SET_SECUREBITS,
+            arg: 0b11, // SECBIT_NOROOT | SECBIT_NOROOT_LOCKED
+        }),
+        "prctl",
     );
 }
 

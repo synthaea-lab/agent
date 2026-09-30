@@ -33,10 +33,10 @@ use crate::{
     FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
     FileWriteEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent, KernelModuleAction,
     KernelModuleEvent, ListenPortEvent, MemfdCreateEvent, NamespaceEvent, NamespaceSyscall,
-    NetworkFlowEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent,
-    RegistrySetEvent, ScriptBlockEvent, ShellType, SmbConnectEvent, SocketAcceptEvent,
-    SocketBindEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
-    UdpSendEvent, User, WmiActivityEvent,
+    NetworkFlowEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
+    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType, SmbConnectEvent,
+    SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection,
+    TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -457,5 +457,15 @@ pub fn namespace() -> NamespaceEvent {
         syscall: NamespaceSyscall::SetNs,
         fd: None,
         flags: 0,
+    }
+}
+
+/// Neutral [`PrctlEvent`].
+#[must_use]
+pub fn prctl() -> PrctlEvent {
+    PrctlEvent {
+        meta: meta(),
+        option: crate::PR_CAPBSET_DROP,
+        arg: 0,
     }
 }

@@ -206,7 +206,13 @@ pub mod time;
 /// time alone. 32 was claimed by #513 (`FileRenameEvent::executable_path`) while
 /// both branches were open; #513 merged first, so this one renumbers — same
 /// coordination note as v13, v28→29 and v30→31 above.
-pub const SCHEMA_VERSION: u32 = 33;
+///
+/// Bumped 33 → 34 for [`Event::Prctl`] (#457): the two `prctl(2)` options that
+/// reshape a process tree's privilege ceiling, `PR_SET_SECUREBITS` and
+/// `PR_CAPBSET_DROP`, filtered at the source. Linux-only, no cross-platform
+/// reuse (same posture as `Ptrace`/`Namespace`). Same serialization-visible
+/// reasoning as v13-v33.
+pub const SCHEMA_VERSION: u32 = 34;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -1575,6 +1581,35 @@ pub struct BpfEvent {
     pub cmd: u32,
 }
 
+/// `prctl(2)` option: drop a capability from the calling thread's bounding set
+/// (`arg` is the capability number). Irreversible for the thread.
+pub const PR_CAPBSET_DROP: u32 = 24;
+
+/// `prctl(2)` option: set the calling thread's securebits (`arg` is the
+/// `SECBIT_*` bitmask, e.g. `SECBIT_NOROOT`, `SECBIT_NO_SETUID_FIXUP`, and the
+/// `*_LOCKED` bits that make them permanent).
+pub const PR_SET_SECUREBITS: u32 = 28;
+
+/// Capability-model tampering via `prctl(2)` (issue #457, from #266): the two
+/// options that change *which privileges a process tree can ever hold*,
+/// [`PR_SET_SECUREBITS`] and [`PR_CAPBSET_DROP`]. Filtered at the source — every
+/// other `prctl` option (dozens, some very hot, e.g. `PR_SET_NAME`) never reaches
+/// this event stream (see `sensor-linux-wire::PrctlEvent`'s doc). Legitimate
+/// users exist (systemd's `CapabilityBoundingSet=`, container runtimes dropping
+/// their bounding set at start), so this is telemetry for the detection layer to
+/// interpret, not a verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrctlEvent {
+    pub meta: EventMeta,
+    /// Raw `prctl` option: always [`PR_SET_SECUREBITS`] or [`PR_CAPBSET_DROP`];
+    /// not decoded to a name here, same "sensor reports, detection interprets"
+    /// split as [`BpfEvent::cmd`].
+    pub option: u32,
+    /// The option's `arg2`: the `SECBIT_*` mask for [`PR_SET_SECUREBITS`], the
+    /// capability number for [`PR_CAPBSET_DROP`].
+    pub arg: u64,
+}
+
 /// Which user/group identity syscall produced an [`IdentityChangeEvent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1709,6 +1744,7 @@ pub enum Event {
     IdentityChange(IdentityChangeEvent),
     CapSet(CapSetEvent),
     Namespace(NamespaceEvent),
+    Prctl(PrctlEvent),
 }
 
 impl Event {
@@ -1762,6 +1798,7 @@ impl Event {
             Event::IdentityChange(e) => &e.meta,
             Event::CapSet(e) => &e.meta,
             Event::Namespace(e) => &e.meta,
+            Event::Prctl(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.

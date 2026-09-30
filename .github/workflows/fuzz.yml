@@ -1,0 +1,94 @@
+name: Fuzz
+
+# Coverage-guided fuzzing only pays out over accumulated CPU time (#320): each
+# run resumes from the previous run's corpus and adds to it. Not part of the PR
+# gate — a crash here means "a parser can panic", to be fixed and pinned as a
+# regression test (fuzz/README.md), not a reason to block an unrelated merge.
+#
+# Scheduled workflows only run from the default branch, and GitHub disables
+# them after 60 days without repository activity.
+
+on:
+  schedule:
+    # Monday and Thursday: the longest gap is 4 days, so the corpus cache
+    # (evicted after 7 days without access) never expires between runs.
+    - cron: "17 3 * * 1,4"
+  # Smoke run (30s per target) when a PR changes the fuzz setup itself, so a
+  # broken workflow is caught before it silently never fuzzes anything.
+  pull_request:
+    paths:
+      - ".github/workflows/fuzz.yml"
+      - "fuzz/**"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Fuzzing time per target, in seconds
+        default: "600"
+
+# One run at a time: two runs would race to save the same corpus key.
+concurrency:
+  group: fuzz
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  FUZZ_SECONDS: ${{ inputs.seconds || (github.event_name == 'pull_request' && '30') || '600' }}
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      # A crash in one target must not stop the other from running.
+      fail-fast: false
+      matrix:
+        target: [audit_parse, netlink_parse]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fuzz
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # Restore the newest corpus for this target. The run id in the key makes
+      # every save a new entry (caches are immutable); restore-keys picks the
+      # latest one back up.
+      - name: restore corpus
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: fuzz ${{ matrix.target }}
+        # A crash or timeout makes libFuzzer exit non-zero and drop the
+        # reproducer under fuzz/artifacts/<target>/, which fails the job.
+        run: >
+          cargo +nightly fuzz run ${{ matrix.target }} --
+          -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048
+
+      # Save even after a crash: the inputs that reached the crash are part of
+      # the coverage worth keeping.
+      - name: save corpus
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+
+      - name: upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: warn
