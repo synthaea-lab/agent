@@ -27,6 +27,7 @@
 pub mod banlist;
 pub mod content;
 pub mod error;
+pub mod fsutil;
 pub mod hash;
 pub mod key;
 #[cfg(target_os = "linux")]
@@ -61,7 +62,14 @@ pub fn rollback(
     }
     let mut banned = banlist::BannedVersions::load(ban_list_path)?;
     banned.ban(failed);
-    banned.save(ban_list_path)
+    banned.save(ban_list_path)?;
+    // The ban list keeps the release from being re-staged, but its directory
+    // would still be picked as a rollback target or kept by pruning; remove it
+    // so nothing can select it again (PR #533 review). Best effort: a leftover
+    // directory costs disk, and `Layout::rollback_target` skips banned releases
+    // regardless.
+    let _ = layout.prune(failed);
+    Ok(())
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -125,6 +133,10 @@ mod integration_tests {
 
         let banned = crate::banlist::BannedVersions::load(&ban_list_path).unwrap();
         assert!(banned.is_banned(2));
+        assert!(
+            !layout.version_dir(2).exists(),
+            "the failed release's directory is removed so nothing can pick it again"
+        );
 
         // A second offer of the exact same failed release is refused — the same
         // manifest that verified and staged cleanly the first time is now

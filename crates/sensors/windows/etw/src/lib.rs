@@ -20,7 +20,8 @@
 //! - **F-4**: unbounded strings via the new schema — multi-KB encoded command lines
 //!   survive intact.
 //! - **F-5**: NT device paths normalize through a real `QueryDosDeviceW` volume map,
-//!   not a hardcoded `C:`.
+//!   not a hardcoded `C:`, then 8.3 short components expand to their long names
+//!   (#489) so one file has one path.
 //! - **F-6** (partial): `CreateNewFile` (EID 30) joins `NameCreate` (EID 12); full
 //!   delete/rename semantics need schema variants and land with the ransomware pack
 //!   (#82) / driver (#39).
@@ -35,6 +36,8 @@
 //! `schema::FileQuarantineEvent`, the macOS quarantine-xattr sibling — see
 //! [`zone_identifier`].
 
+#[cfg(any(windows, test))]
+mod long_path;
 pub mod normalize;
 #[cfg(any(windows, test))]
 mod pid_cache;

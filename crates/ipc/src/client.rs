@@ -17,8 +17,9 @@ use crate::{
     error::ClientError,
     frame::{FrameError, read_message, write_message},
     protocol::{
-        ClientHello, PROTOCOL_VERSION, PolicyVersionResponse, RecentDetectionsResponse, Request,
-        Response, SensorHealthResponse, ServerHello, StatusResponse, WireError,
+        ClientHello, PROTOCOL_VERSION, PolicyVersionResponse, RecentDetectionsResponse,
+        ReloadContentResponse, Request, Response, SensorHealthResponse, ServerHello,
+        StatusResponse, WireError,
     },
     stream::{Stream, connect},
 };
@@ -162,6 +163,20 @@ impl Client {
             Response::PolicyVersion(p) => Ok(p),
             Response::Error(e) => Err(refused_from(e)),
             other => Err(mismatched_response(&other, "policy_version")),
+        }
+    }
+
+    /// Tell the agent to re-read Sigma/YARA content from its configured
+    /// content directory and swap it into the running pipeline (issue #30).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::status`].
+    pub async fn reload_content(&mut self) -> Result<ReloadContentResponse, ClientError> {
+        match self.call(Request::ReloadContent).await? {
+            Response::ReloadContent(r) => Ok(r),
+            Response::Error(e) => Err(refused_from(e)),
+            other => Err(mismatched_response(&other, "reload_content")),
         }
     }
 }

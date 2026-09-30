@@ -25,11 +25,12 @@
 
 use std::{
     collections::BTreeMap,
-    io::Write as _,
     path::{Path, PathBuf},
 };
 
-use updater::{ContentEntry, ContentManifest, UpdaterError, hash::hash_bytes};
+use updater::{
+    ContentEntry, ContentManifest, UpdaterError, fsutil::write_atomically, hash::hash_bytes,
+};
 
 /// Hard ceiling on a single content artifact's declared `size` (PR #520
 /// review): `get_bytes` already bounds the *response* to the manifest's
@@ -205,125 +206,6 @@ fn artifact_dest(root: &Path, entry_path: &str) -> PathBuf {
     dest
 }
 
-/// Refuses if `dest`, or any of its already-existing path components
-/// *under* `root`, is a symlink — checked with [`std::fs::symlink_metadata`]
-/// (never follows a symlink, unlike [`std::fs::metadata`]). This agent can
-/// run with elevated rights (PR #520 review), so a symlink planted anywhere
-/// under the content directory it writes into — not just at the leaf —
-/// could otherwise redirect a write outside that directory entirely.
-///
-/// Deliberately does **not** walk `root`'s own ancestors: real systems
-/// routinely have a symlink somewhere above any given directory (macOS's
-/// `/var` is itself `-> /private/var`, which is exactly what turned this
-/// check into a false positive on every `std::env::temp_dir()`-rooted test
-/// before this fix — CI on macOS caught it) and none of that is under this
-/// agent's control or part of the threat this check defends against. `root`
-/// itself is trusted — it's `content_dir`/`state_dir`, already validated by
-/// [`ensure_within_state_dir`] — only what gets created *under* it, by this
-/// process, is what needs checking.
-///
-/// # Errors
-///
-/// Returns an error naming the offending path if any existing component
-/// under `root` is a symlink.
-fn reject_symlink_components(root: &Path, dest: &Path) -> std::io::Result<()> {
-    let relative = dest.strip_prefix(root).unwrap_or(dest);
-    let mut probe = root.to_path_buf();
-    for component in relative.components() {
-        probe.push(component);
-        if let Ok(meta) = std::fs::symlink_metadata(&probe)
-            && meta.file_type().is_symlink()
-        {
-            return Err(std::io::Error::other(format!(
-                "refusing to write: {} is a symlink",
-                probe.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Writes `bytes` to `dest` atomically: to a same-directory temporary file
-/// first (so the eventual `rename` stays on one filesystem), `fsync`ed, then
-/// renamed over `dest` (PR #520 review). A `rename` onto an existing path
-/// replaces it in one filesystem operation — a reader (or a re-run of this
-/// same command after a crash) only ever sees the complete old file or the
-/// complete new one, never a truncated one. [`reject_symlink_components`] is
-/// checked both before and after creating any missing parent directories
-/// (the latter guards a symlink race in between; `create_dir_all` itself
-/// cannot produce a symlink, since it only creates plain directories).
-/// `rename` does not follow a symlink at `dest` itself on any platform this
-/// agent targets — it replaces the link, never writes through it — so this
-/// covers the parent-directory case that actually mattered.
-///
-/// The temp file is opened with `create_new`, so a symlink (or anything else)
-/// pre-planted at its name makes the write fail rather than be followed
-/// (PR #520 review round 3); it is removed if the write or rename fails.
-///
-/// `root` bounds the symlink check ([`reject_symlink_components`]) to `dest`'s
-/// components under it — `dest` must be `root` or a descendant of it.
-///
-/// # Errors
-///
-/// Returns an error if any existing path component under `root` is a
-/// symlink, or if any filesystem operation fails.
-fn write_atomically(root: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    reject_symlink_components(root, dest)?;
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    reject_symlink_components(root, dest)?;
-
-    let file_name = dest.file_name().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "destination path has no file name",
-        )
-    })?;
-    let tmp_path = dest.with_file_name(format!(
-        "{}.tmp-{}",
-        file_name.to_string_lossy(),
-        unique_suffix()
-    ));
-
-    // `create_new` (O_EXCL / CREATE_NEW) fails on any existing entry —
-    // including a dangling symlink planted at the temp name — instead of
-    // following it, so the write can never land outside `root`.
-    let mut tmp_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp_path)?;
-    let written = tmp_file
-        .write_all(bytes)
-        .and_then(|()| tmp_file.sync_all())
-        .and_then(|()| {
-            drop(tmp_file);
-            std::fs::rename(&tmp_path, dest)
-        });
-    if written.is_err() {
-        // Best effort: the original error is the one worth reporting.
-        let _ = std::fs::remove_file(&tmp_path);
-    }
-    written
-}
-
-/// Unpredictable-enough temp-file suffix: PID, wall-clock nanoseconds and a
-/// process-wide counter. Uniqueness is not what protects against planted
-/// links (`create_new` is); it only keeps an attacker from pre-creating the
-/// name cheaply and makes benign collisions vanishingly rare.
-fn unique_suffix() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    format!(
-        "{}-{nanos:x}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
 /// Downloads every entry in `fetch_plan.to_fetch` from the (already-real)
 /// `/api/content/artifact` endpoint, verifies its SHA-256 against the
 /// manifest's declared hash, and writes it under `content_dir`. Persists
@@ -353,7 +235,7 @@ fn download_and_apply(
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(content_dir)?;
     // The symlink check bounds itself to components under this root, not
-    // the whole filesystem ancestry (see `reject_symlink_components`) — for
+    // the whole filesystem ancestry (see `updater::fsutil::reject_symlink_components`) — for
     // the state file, that root is its own containing directory.
     let state_root = state_path.parent().unwrap_or_else(|| Path::new("."));
 
@@ -414,7 +296,7 @@ fn download_and_apply(
 /// be interpreted.
 ///
 /// Documented limitation: a component created *after* this check runs (a
-/// TOCTOU symlink swap) is not caught here — [`reject_symlink_components`]
+/// TOCTOU symlink swap) is not caught here — [`updater::fsutil::reject_symlink_components`]
 /// is the check that actually runs at write time and is what closes that
 /// gap for content this agent writes.
 fn resolve_as_far_as_possible(path: &Path) -> std::io::Result<PathBuf> {
@@ -475,6 +357,13 @@ fn ensure_within_state_dir(path: &Path, state_dir: &Path, flag_name: &str) -> an
     }
 }
 
+/// Where applied content lives by default. The single definition shared by
+/// `apply-content-manifest` (writer) and `run` (reader): they must agree, or
+/// content that was downloaded and verified is never loaded.
+pub(crate) fn default_content_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("content")
+}
+
 /// Resolves `--content-dir`/`--state` for `apply-content-manifest`: left
 /// unset, each defaults to a fixed name under `state_dir`
 /// (`cfg.storage.state_dir`); given explicitly, each must still resolve
@@ -495,7 +384,7 @@ pub(crate) fn resolve_content_paths(
             ensure_within_state_dir(&dir, state_dir, "content-dir")?;
             dir
         }
-        None => state_dir.join("content"),
+        None => default_content_dir(state_dir),
     };
     let state_path = match state_path {
         Some(path) => {
@@ -507,10 +396,65 @@ pub(crate) fn resolve_content_paths(
     Ok((content_dir, state_path))
 }
 
+/// Where and how to reach the control plane, after `--server`/`--cert`/`--key`
+/// have been reconciled with `agent.toml` ([`resolve_endpoint`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Endpoint {
+    pub(crate) server: String,
+    pub(crate) cert: Option<PathBuf>,
+    pub(crate) key: Option<PathBuf>,
+}
+
+/// Picks the control plane for `apply-content-manifest`. `--server` omitted
+/// means "this install's own control plane": the configured URL with the
+/// configured mTLS pair (an explicit `--cert`/`--key` still wins). `--server`
+/// given means exactly that server, with mTLS only if the flags say so — the
+/// config's client certificate is never presented to a server the operator
+/// named by hand.
+pub(crate) fn resolve_endpoint(
+    server: Option<String>,
+    cert: Option<PathBuf>,
+    key: Option<PathBuf>,
+    configured: &config::ServerConfig,
+) -> Endpoint {
+    match server {
+        Some(server) => Endpoint { server, cert, key },
+        None => Endpoint {
+            server: configured.control_plane_url.clone(),
+            cert: Some(cert.unwrap_or_else(|| configured.mtls_cert.clone())),
+            key: Some(key.unwrap_or_else(|| configured.mtls_key.clone())),
+        },
+    }
+}
+
+/// Picks the ring for `apply-content-manifest`: `--ring`, else
+/// `updates.ring`. There is no default ring — an agent that lands in `prod`
+/// by omission would bypass the canary rollout (ADR-0016).
+///
+/// # Errors
+///
+/// Returns an error when neither the flag nor the config names a ring.
+pub(crate) fn resolve_ring(
+    flag: Option<String>,
+    updates: &config::UpdatesConfig,
+) -> anyhow::Result<String> {
+    flag.or_else(|| updates.ring.clone()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no content ring: pass --ring, or set `ring` under `[updates]` in agent.toml \
+             (one of {})",
+            config::CONTENT_RINGS.join(", ")
+        )
+    })
+}
+
 /// Fetches the content manifest for `ring`, verifies it exactly like
 /// [`cmd_check_content_manifest`], and — unlike that command — actually
 /// downloads and writes every entry that's missing or stale under
-/// `content_dir`, then records what was applied in `state_path`.
+/// `content_dir`, then records what was applied in `state_path`. On
+/// success, best-effort notifies an already-running `agent run` at
+/// `ipc_endpoint` to reload the content it just applied (issue #30) — see
+/// [`notify_running_agent`] for why a failed notification is not a hard
+/// error here.
 ///
 /// # Errors
 ///
@@ -524,6 +468,7 @@ pub(crate) fn cmd_apply_content_manifest(
     key: Option<&Path>,
     content_dir: &Path,
     state_path: &Path,
+    ipc_endpoint: &str,
 ) -> anyhow::Result<()> {
     let client = build_client(server, cert, key)?;
     let url = client.config().content_manifest_url(ring);
@@ -546,12 +491,151 @@ pub(crate) fn cmd_apply_content_manifest(
         fetch_plan.release_version,
         if fetched == 1 { "y" } else { "ies" }
     );
+
+    match notify_running_agent(ipc_endpoint) {
+        Ok(report) => {
+            println!(
+                "notified the running agent — reloaded (sigma: {}, yara: {})",
+                describe_reload_count(report.sigma_rule_count),
+                describe_reload_count(report.yara_rule_count),
+            );
+            for (engine, failed) in [
+                ("sigma", report.sigma_reload_failed),
+                ("yara", report.yara_reload_failed),
+            ] {
+                if failed {
+                    eprintln!(
+                        "warning: the {engine} content failed to load; the agent kept its \
+                         previous {engine} rules (see the agent log)"
+                    );
+                }
+            }
+        }
+        Err(e) => println!(
+            "no running agent to notify at {ipc_endpoint} ({e}) — already applied to disk, \
+             will be picked up on the agent's next start"
+        ),
+    }
     Ok(())
+}
+
+/// One line for a [`ipc::ReloadContentResponse`] count field: `None` means
+/// that content subdirectory is absent, not an error.
+fn describe_reload_count(count: Option<usize>) -> String {
+    match count {
+        Some(n) => format!("{n} rules"),
+        None => "absent".to_string(),
+    }
+}
+
+/// Tells an already-running `agent run` at `ipc_endpoint` to reload content
+/// (issue #30) — a short-lived connection, exactly one request, then
+/// dropped. Deliberately **not** treated as a hard error by the caller: the
+/// content is already correctly downloaded, verified, and written to disk
+/// regardless of whether a live agent happens to be listening right now (no
+/// agent running yet, a stale/misconfigured endpoint, or the agent process
+/// simply not up at this moment are all normal, not failures of this
+/// command's own job).
+///
+/// # Errors
+///
+/// Returns an error (as a `String` — this is a best-effort notification,
+/// not a typed API another caller pattern-matches on) if a short-lived
+/// current-thread runtime cannot be built, the connection fails, or the
+/// agent's own handler reports a failure.
+fn notify_running_agent(ipc_endpoint: &str) -> Result<ipc::ReloadContentResponse, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    runtime.block_on(async {
+        let mut client = ipc::Client::connect(ipc_endpoint, "agent-apply-content-manifest")
+            .await
+            .map_err(|e| e.to_string())?;
+        client.reload_content().await.map_err(|e| e.to_string())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn configured_server() -> config::ServerConfig {
+        config::ServerConfig {
+            control_plane_url: "https://cp.example".to_string(),
+            mtls_cert: PathBuf::from("/etc/synthaea/certs/client.crt"),
+            mtls_key: PathBuf::from("/etc/synthaea/certs/client.key"),
+            mtls_passphrase: config::SecretRef::Invalid(String::new()),
+            offline_fallback: true,
+        }
+    }
+
+    #[test]
+    fn omitting_server_uses_the_configured_control_plane_and_mtls_pair() {
+        let endpoint = resolve_endpoint(None, None, None, &configured_server());
+        assert_eq!(endpoint.server, "https://cp.example");
+        assert_eq!(
+            endpoint.cert.as_deref(),
+            Some(Path::new("/etc/synthaea/certs/client.crt"))
+        );
+        assert_eq!(
+            endpoint.key.as_deref(),
+            Some(Path::new("/etc/synthaea/certs/client.key"))
+        );
+    }
+
+    #[test]
+    fn an_explicit_server_never_borrows_the_configured_client_certificate() {
+        let endpoint = resolve_endpoint(
+            Some("http://127.0.0.1:3000".to_string()),
+            None,
+            None,
+            &configured_server(),
+        );
+        assert_eq!(endpoint.server, "http://127.0.0.1:3000");
+        assert_eq!(endpoint.cert, None);
+        assert_eq!(endpoint.key, None);
+    }
+
+    #[test]
+    fn an_explicit_cert_overrides_the_configured_one_but_keeps_the_configured_key() {
+        let endpoint = resolve_endpoint(
+            None,
+            Some(PathBuf::from("/tmp/other.crt")),
+            None,
+            &configured_server(),
+        );
+        assert_eq!(endpoint.cert.as_deref(), Some(Path::new("/tmp/other.crt")));
+        assert_eq!(
+            endpoint.key.as_deref(),
+            Some(Path::new("/etc/synthaea/certs/client.key"))
+        );
+    }
+
+    #[test]
+    fn the_ring_flag_wins_over_the_configured_ring() {
+        let updates = config::UpdatesConfig {
+            ring: Some("canary_1".to_string()),
+        };
+        let ring = resolve_ring(Some("prod".to_string()), &updates).unwrap();
+        assert_eq!(ring, "prod");
+    }
+
+    #[test]
+    fn the_configured_ring_applies_when_no_flag_is_given() {
+        let updates = config::UpdatesConfig {
+            ring: Some("canary_1".to_string()),
+        };
+        assert_eq!(resolve_ring(None, &updates).unwrap(), "canary_1");
+    }
+
+    #[test]
+    fn no_ring_anywhere_is_refused_rather_than_defaulted() {
+        let err = resolve_ring(None, &config::UpdatesConfig::default()).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("--ring"), "{message}");
+        assert!(message.contains("[updates]"), "{message}");
+    }
 
     /// Builds a manifest and signs it exactly the way `updater::content`'s own
     /// tests do (this crate can't call that module's private signing helper
@@ -889,138 +973,6 @@ mod tests {
         assert!(!state.release_version.contains_key("canary_0"));
     }
 
-    // ── write_atomically / reject_symlink_components (issue #30, PR #520 review) ──
-
-    #[test]
-    fn write_atomically_writes_the_full_content() {
-        let dir = tmp("atomic-happy-path");
-        let dest = dir.join("rules").join("beacon.sigma");
-        write_atomically(&dir, &dest, b"title: beacon\n").unwrap();
-        assert_eq!(std::fs::read(&dest).unwrap(), b"title: beacon\n");
-        // The temp file used to get there is gone — renamed, not copied.
-        let leftovers: Vec<_> = std::fs::read_dir(dest.parent().unwrap())
-            .unwrap()
-            .filter_map(Result::ok)
-            .collect();
-        assert_eq!(leftovers.len(), 1, "only the final file should remain");
-    }
-
-    #[test]
-    fn write_atomically_overwrites_an_existing_file_completely() {
-        let dir = tmp("atomic-overwrite");
-        let dest = dir.join("beacon.sigma");
-        write_atomically(&dir, &dest, b"old, much longer content here").unwrap();
-        write_atomically(&dir, &dest, b"new").unwrap();
-        // Not "newlonger" or any splice of the two — a full replacement.
-        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn write_atomically_refuses_a_symlinked_destination() {
-        let dir = tmp("atomic-symlink-dest");
-        let real_target = dir.join("outside-content-dir.txt");
-        std::fs::write(&real_target, b"pre-existing, must not be touched").unwrap();
-        let content_dir = dir.join("content");
-        let dest = content_dir.join("rules").join("beacon.sigma");
-        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(&real_target, &dest).unwrap();
-
-        // `rename` would not actually write through this symlink (it
-        // replaces the link itself), but the explicit refusal is the
-        // documented, auditable behavior rather than relying on that
-        // platform-specific rename semantic.
-        let err = write_atomically(&content_dir, &dest, b"malicious").unwrap_err();
-        assert!(err.to_string().contains("symlink"), "got: {err}");
-        assert_eq!(
-            std::fs::read(&real_target).unwrap(),
-            b"pre-existing, must not be touched"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn write_atomically_refuses_when_a_parent_directory_is_a_symlink() {
-        let dir = tmp("atomic-symlink-parent");
-        let real_dir = dir.join("real-elsewhere");
-        std::fs::create_dir_all(&real_dir).unwrap();
-        let content_dir = dir.join("content");
-        std::fs::create_dir_all(&content_dir).unwrap();
-        // `content/rules` is a symlink to a directory outside `content/`.
-        std::os::unix::fs::symlink(&real_dir, content_dir.join("rules")).unwrap();
-
-        let dest = content_dir.join("rules").join("beacon.sigma");
-        let err = write_atomically(&content_dir, &dest, b"malicious").unwrap_err();
-        assert!(err.to_string().contains("symlink"), "got: {err}");
-        assert!(
-            !real_dir.join("beacon.sigma").exists(),
-            "must not have written through the symlinked parent"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn write_atomically_never_follows_a_symlink_planted_at_the_temp_name() {
-        let dir = tmp("atomic-symlink-tmp");
-        let victim = dir.join("victim.txt");
-        std::fs::write(&victim, b"ORIGINAL").unwrap();
-        let content_dir = dir.join("content");
-        let dest = content_dir.join("rules").join("beacon.sigma");
-        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
-        // Plant links at every plausible temp name, including the old
-        // predictable `<name>.tmp-<pid>` form.
-        std::os::unix::fs::symlink(
-            &victim,
-            dest.with_file_name(format!("beacon.sigma.tmp-{}", std::process::id())),
-        )
-        .unwrap();
-
-        write_atomically(&content_dir, &dest, b"SIGNED-CONTENT").unwrap();
-        assert_eq!(std::fs::read(&victim).unwrap(), b"ORIGINAL");
-        assert!(!std::fs::symlink_metadata(&dest).unwrap().is_symlink());
-        assert_eq!(std::fs::read(&dest).unwrap(), b"SIGNED-CONTENT");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn write_atomically_refuses_a_directory_junction_parent() {
-        let dir = tmp("atomic-junction-parent");
-        let outside = dir.join("outside");
-        std::fs::create_dir_all(&outside).unwrap();
-        let content_dir = dir.join("content");
-        std::fs::create_dir_all(&content_dir).unwrap();
-        let junction = content_dir.join("rules");
-        // Junctions need no privilege, unlike file symlinks.
-        let status = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(&junction)
-            .arg(&outside)
-            .output()
-            .unwrap();
-        assert!(status.status.success(), "mklink /J failed");
-
-        let dest = junction.join("beacon.sigma");
-        let err = write_atomically(&content_dir, &dest, b"malicious").unwrap_err();
-        assert!(err.to_string().contains("symlink"), "got: {err}");
-        assert!(!outside.join("beacon.sigma").exists());
-    }
-
-    #[test]
-    fn write_atomically_does_not_trip_on_a_symlink_above_root() {
-        // The exact bug this test pins (caught by macOS CI): `root`'s own
-        // ancestors are not checked, only components under it — on macOS
-        // `/var` is itself `-> /private/var`, so `std::env::temp_dir()`
-        // (which every other test in this module is rooted under) sits
-        // below a real, benign symlink that has nothing to do with this
-        // agent's content directory.
-        let dir = tmp("atomic-symlink-above-root");
-        let dest = dir.join("rules").join("beacon.sigma");
-        // `dir` itself is under `std::env::temp_dir()`, which is a symlink
-        // on macOS — this must still succeed.
-        write_atomically(&dir, &dest, b"title: beacon\n").unwrap();
-        assert_eq!(std::fs::read(&dest).unwrap(), b"title: beacon\n");
-    }
-
     // ── MAX_CONTENT_ARTIFACT_BYTES (issue #30, PR #520 review) ──────────
 
     #[test]
@@ -1092,6 +1044,15 @@ mod tests {
     }
 
     #[test]
+    fn run_and_apply_default_to_the_same_content_dir() {
+        // A default mismatch once left applied content on disk that the
+        // running agent never read (issue #530).
+        let state_dir = tmp("default-content-dir-agrees");
+        let (apply_default, _) = resolve_content_paths(&state_dir, None, None).unwrap();
+        assert_eq!(apply_default, default_content_dir(&state_dir));
+    }
+
+    #[test]
     fn a_not_yet_existing_subdirectory_under_state_dir_still_resolves_within_it() {
         // `resolve_as_far_as_possible` must not require the directory to
         // exist yet — the whole point is validating a path before it's
@@ -1101,5 +1062,28 @@ mod tests {
         let (content_dir, _) =
             resolve_content_paths(&state_dir, Some(future_content_dir.clone()), None).unwrap();
         assert_eq!(content_dir, future_content_dir);
+    }
+
+    // ── notify_running_agent (issue #30) ────────────────────────────────
+
+    /// The concrete case `cmd_apply_content_manifest`'s own doc comment
+    /// names: no agent is running at `ipc_endpoint` (or it's a stale/wrong
+    /// path). This must surface as an `Err` the caller can log and move on
+    /// from, never a panic — content already reached disk regardless of
+    /// whether a live agent is listening.
+    #[test]
+    fn notify_running_agent_returns_an_error_when_nothing_is_listening() {
+        let endpoint = std::env::temp_dir()
+            .join(format!(
+                "synthaea-notify-test-nothing-here-{}.sock",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        let result = notify_running_agent(&endpoint);
+        assert!(
+            result.is_err(),
+            "connecting to a socket nothing listens on must fail, not panic"
+        );
     }
 }

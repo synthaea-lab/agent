@@ -49,6 +49,28 @@ pub struct AgentConfig {
     pub ipc: IpcConfig,
     /// Boot-time resource ceilings.
     pub resources: ResourcesConfig,
+    /// Content-distribution assignment (ADR-0016, issue #30). The one
+    /// optional section: an absent `[updates]` table means "no ring
+    /// assigned", never a default ring.
+    #[serde(default)]
+    pub updates: UpdatesConfig,
+}
+
+/// Rings a content manifest can target (ADR-0016). A plain list rather than
+/// an enum: the wire format carries the ring as a string and the server owns
+/// the set, so this only rejects typos before a fetch is attempted.
+pub const CONTENT_RINGS: [&str; 4] = ["canary_0", "canary_1", "canary_2", "prod"];
+
+/// Which content ring this install is assigned to.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatesConfig {
+    /// One of [`CONTENT_RINGS`]. Absent means unassigned: `agent
+    /// apply-content-manifest` then needs `--ring` and refuses to guess,
+    /// because silently landing an agent in `prod` would defeat the canary
+    /// rollout (ADR-0013 §5, fail fast).
+    #[serde(default)]
+    pub ring: Option<String>,
 }
 
 /// Control-plane reachability and offline-mode fallback.

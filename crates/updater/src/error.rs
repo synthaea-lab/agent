@@ -45,6 +45,11 @@ pub enum UpdaterError {
     #[error("content entry path `{0}` is not a safe relative path")]
     UnsafeContentPath(String),
 
+    /// A release manifest entry's path would escape the release directory (same
+    /// rules as [`Self::UnsafeContentPath`]): checked before any download starts.
+    #[error("release entry path `{0}` is not a safe relative path")]
+    UnsafeReleasePath(String),
+
     /// A file the manifest lists is missing from the staged release directory.
     #[error("staged release is missing manifest entry `{path}`")]
     StagedFileMissing { path: PathBuf },

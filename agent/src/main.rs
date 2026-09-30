@@ -47,6 +47,7 @@ mod journal_cursor;
 #[cfg(target_os = "linux")]
 mod kill_loudness;
 mod protected;
+mod release;
 mod shutdown;
 mod silence;
 #[cfg_attr(
@@ -122,6 +123,14 @@ enum Command {
         /// exactly as before.
         #[arg(long)]
         server: Option<String>,
+        /// Where downloaded content lives (issue #30) — the detection sink
+        /// loads Sigma/YARA rules from `<content-dir>/rules/{sigma,yara}`.
+        /// Defaults to `<storage.state_dir>/content`, exactly like
+        /// `apply-content-manifest`'s `--content-dir`, so what an apply
+        /// writes is what this agent loads. To run against the in-repo
+        /// content (`rules/sigma`, `rules/yara`) pass `--content-dir .`.
+        #[arg(long)]
+        content_dir: Option<std::path::PathBuf>,
     },
     /// Captures a baseline of healthy activity to train the ML models: records the
     /// command lines of exec events that trigger no deterministic rule, as
@@ -171,13 +180,18 @@ enum Command {
     /// `DetectionSink` — that's a follow-up, not this slice.
     ApplyContentManifest {
         /// Control-plane base URL (e.g. `https://api.synthaea.example.com`).
+        /// Left unset, the command uses `server.control_plane_url` and the
+        /// `server.mtls_cert`/`mtls_key` pair from `agent.toml`; given, it
+        /// talks to exactly that server with mTLS only if `--cert`/`--key`
+        /// are given too.
         #[arg(long)]
-        server: String,
+        server: Option<String>,
         /// Canary ring this agent is assigned to (`canary_0`/`canary_1`/`canary_2`/`prod`).
+        /// Left unset, `updates.ring` from `agent.toml`; with neither, the
+        /// command refuses rather than guess a ring.
         #[arg(long)]
-        ring: String,
-        /// Path to the client mTLS certificate (PEM). Omit to fetch without
-        /// mTLS (a dev server, or a server that authenticates another way).
+        ring: Option<String>,
+        /// Path to the client mTLS certificate (PEM), overriding the config's.
         #[arg(long)]
         cert: Option<std::path::PathBuf>,
         /// Path to the client mTLS private key (PEM). Required alongside `--cert`.
@@ -199,6 +213,32 @@ enum Command {
         /// resolve under `storage.state_dir` or this agent refuses to run.
         #[arg(long)]
         state: Option<std::path::PathBuf>,
+    },
+    /// Fetches the signed binary release the server offers, verifies it, stages it
+    /// under `<state_dir>/versions/vN`, repoints `current` at it, and restarts the
+    /// service onto it (ADR-0015, issue #30). The new release starts on
+    /// probation: the watchdog rolls it back and bans it if the agent never shows
+    /// progress. Linux only.
+    ApplyRelease {
+        /// Control-plane base URL, e.g. `https://edr.example.com`.
+        #[arg(long)]
+        server: String,
+        /// PEM client certificate for mTLS.
+        #[arg(long, requires = "key")]
+        cert: Option<std::path::PathBuf>,
+        /// PEM client private key for mTLS.
+        #[arg(long, requires = "cert")]
+        key: Option<std::path::PathBuf>,
+        /// Stage and promote only; do not restart the service. The release runs
+        /// at the next service start.
+        #[arg(long)]
+        no_restart: bool,
+        /// Acknowledge that this build verifies releases against the public test
+        /// key, so anyone who can serve the release routes can get code run as
+        /// root (ADR-0015 Deferred). Required until a production key is embedded;
+        /// for lab and development use only.
+        #[arg(long)]
+        allow_test_key: bool,
     },
 }
 
@@ -243,18 +283,24 @@ fn main() -> anyhow::Result<()> {
             enable_readline_capture,
             enable_dns_capture,
             server,
-        } => commands::cmd_run(commands::RunOptions {
-            alerts: &alerts,
-            events: &events,
-            state_dir: &cfg.storage.state_dir,
-            enable_kill,
-            enable_quarantine,
-            enable_tls_capture,
-            enable_readline_capture,
-            enable_dns_capture,
-            server: server.as_deref(),
-            ipc_endpoint: &cfg.ipc.endpoint,
-        }),
+            content_dir,
+        } => {
+            let content_dir =
+                content_dir.unwrap_or_else(|| content::default_content_dir(&cfg.storage.state_dir));
+            commands::cmd_run(commands::RunOptions {
+                alerts: &alerts,
+                events: &events,
+                state_dir: &cfg.storage.state_dir,
+                enable_kill,
+                enable_quarantine,
+                enable_tls_capture,
+                enable_readline_capture,
+                enable_dns_capture,
+                server: server.as_deref(),
+                ipc_endpoint: &cfg.ipc.endpoint,
+                content_dir: &content_dir,
+            })
+        }
         Command::CaptureBaseline { output } => commands::cmd_capture_baseline(&output),
         Command::CaptureEvents { output } => commands::cmd_capture_events(&output),
         Command::CheckContentManifest {
@@ -280,14 +326,31 @@ fn main() -> anyhow::Result<()> {
         } => {
             let (content_dir, state) =
                 content::resolve_content_paths(&cfg.storage.state_dir, content_dir, state)?;
+            let ring = content::resolve_ring(ring, &cfg.updates)?;
+            let endpoint = content::resolve_endpoint(server, cert, key, &cfg.server);
             content::cmd_apply_content_manifest(
-                &server,
+                &endpoint.server,
                 &ring,
-                cert.as_deref(),
-                key.as_deref(),
+                endpoint.cert.as_deref(),
+                endpoint.key.as_deref(),
                 &content_dir,
                 &state,
+                &cfg.ipc.endpoint,
             )
         }
+        Command::ApplyRelease {
+            server,
+            cert,
+            key,
+            no_restart,
+            allow_test_key,
+        } => release::cmd_apply_release(
+            &server,
+            cert.as_deref(),
+            key.as_deref(),
+            &cfg.storage.state_dir,
+            !no_restart,
+            allow_test_key,
+        ),
     }
 }
