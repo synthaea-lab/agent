@@ -10,6 +10,8 @@ Source0:        synthaea-agent-%{version}.tar.gz
 BuildRequires:  rust >= 1.70, cargo, systemd-rpm-macros
 Requires:       systemd
 Requires(post): systemd
+# semanage: the file-context rules below (bin_t on the binaries), see %post
+Requires(post): policycoreutils-python-utils
 Requires(preun): systemd
 Requires(postun): systemd
 
@@ -21,13 +23,16 @@ ML-based anomaly detection, and response capabilities.
 %setup -q
 
 %build
-cargo build --release --bins --exclude sensor-linux-ebpf
+# --exclude needs --workspace. Honour CARGO_TARGET_DIR (a small build host may keep
+# its target directory elsewhere); %install reads the same variable.
+cargo build --release --workspace --bins --exclude sensor-linux-ebpf
 
 %install
 # Binaries to bootstrap directory
-install -D -m 0755 target/release/agent %{buildroot}/var/lib/synthaea/bootstrap/agent
-install -D -m 0755 target/release/watchdog %{buildroot}/var/lib/synthaea/bootstrap/watchdog
-install -D -m 0755 target/release/cli %{buildroot}/var/lib/synthaea/bootstrap/cli
+T="${CARGO_TARGET_DIR:-target}/release"
+install -D -m 0755 "$T/agent" %{buildroot}/var/lib/synthaea/bootstrap/agent
+install -D -m 0755 "$T/watchdog" %{buildroot}/var/lib/synthaea/bootstrap/watchdog
+install -D -m 0755 "$T/cli" %{buildroot}/var/lib/synthaea/bootstrap/cli
 
 # systemd integration
 install -D -m 0644 packaging/linux/systemd/synthaea-agent.service \
@@ -44,6 +49,11 @@ install -d -m 0750 %{buildroot}/var/log/synthaea
 # Config directory (placeholder)
 install -d -m 0755 %{buildroot}/etc/synthaea
 
+# CLI symlink, as the .deb postinst creates it. The unit cannot: it runs as the
+# unprivileged synthaea user under ProtectSystem=strict, so /usr is read-only.
+install -d -m 0755 %{buildroot}%{_bindir}
+ln -s /var/lib/synthaea/current/cli %{buildroot}%{_bindir}/synthaea-ctl
+
 %pre
 %sysusers_create_compat packaging/linux/systemd/synthaea.sysusers
 
@@ -56,7 +66,16 @@ fi
 # Enable and start service
 %systemd_post synthaea-agent.service
 
-# Apply SELinux contexts
+# SELinux: the binaries live under /var/lib/synthaea, whose default type is
+# var_lib_t, and init_t is denied execute/execute_no_trans/map on that type, so
+# the service dies with status=203/EXEC on an Enforcing host. bin_t makes them
+# executable (the service then runs as unconfined_service_t). The rule also covers
+# the updater's versions/vN trees; files the updater writes still need a
+# restorecon after staging (they inherit var_lib_t from the directory).
+if command -v semanage >/dev/null 2>&1; then
+    semanage fcontext -a -t bin_t '/var/lib/synthaea/bootstrap(/.*)?' 2>/dev/null || :
+    semanage fcontext -a -t bin_t '/var/lib/synthaea/versions/[^/]+/.+' 2>/dev/null || :
+fi
 if command -v restorecon >/dev/null 2>&1; then
     restorecon -R /var/lib/synthaea /var/log/synthaea || :
 fi
@@ -71,6 +90,10 @@ systemd-tmpfiles --create synthaea.conf || :
 %systemd_postun_with_restart synthaea-agent.service
 # Clean uninstall (not upgrade)
 if [ $1 -eq 0 ]; then
+    if command -v semanage >/dev/null 2>&1; then
+        semanage fcontext -d '/var/lib/synthaea/bootstrap(/.*)?' 2>/dev/null || :
+        semanage fcontext -d '/var/lib/synthaea/versions/[^/]+/.+' 2>/dev/null || :
+    fi
     rm -rf /var/lib/synthaea /var/log/synthaea
     userdel synthaea 2>/dev/null || :
 fi
@@ -82,6 +105,7 @@ fi
 /var/lib/synthaea/bootstrap/watchdog
 /var/lib/synthaea/bootstrap/cli
 %{_unitdir}/synthaea-agent.service
+%{_bindir}/synthaea-ctl
 %{_sysusersdir}/synthaea.conf
 %{_tmpfilesdir}/synthaea.conf
 %dir %attr(0750,synthaea,synthaea) /var/lib/synthaea
@@ -90,5 +114,5 @@ fi
 %dir /etc/synthaea
 
 %changelog
-* Thu Sep 18 2026 Synthaea Team <noreply@synthaea.io> - 0.1.0-1
+* Fri Sep 18 2026 Synthaea Team <noreply@synthaea.io> - 0.1.0-1
 - Initial RPM release with systemd integration
