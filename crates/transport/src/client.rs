@@ -228,6 +228,7 @@ fn build_tls_config(config: &TransportConfig) -> Result<ureq::tls::TlsConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DEFAULT_HEARTBEAT_ENDPOINT;
 
     #[test]
     fn config_builds_urls_correctly() {
@@ -238,8 +239,23 @@ mod tests {
         );
         assert_eq!(
             config.heartbeat_url(),
-            "https://api.example.com/api/v1/ingest/heartbeat"
+            "https://api.example.com/api/ingest/heartbeat"
         );
+    }
+
+    /// Regression (#317 review): the endpoint carried a `/v1` prefix no route
+    /// served, and only a mock server that accepts any path was ever tested.
+    /// Next.js app router: the route for `<path>` is `server/app<path>/route.ts`.
+    /// Under `/api/ingest/` is also what puts it behind nginx's mTLS location and
+    /// past the middleware's login redirect.
+    #[test]
+    fn the_heartbeat_endpoint_is_a_real_server_route() {
+        assert!(DEFAULT_HEARTBEAT_ENDPOINT.starts_with("/api/ingest/"));
+        let route = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../server/app")
+            .join(DEFAULT_HEARTBEAT_ENDPOINT.trim_start_matches('/'))
+            .join("route.ts");
+        assert!(route.is_file(), "no server route at {}", route.display());
     }
 
     #[test]

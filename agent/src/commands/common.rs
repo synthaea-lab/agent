@@ -188,6 +188,9 @@ mod tests {
             .into_iter()
             .map(|s| s.name)
             .collect();
+        // The sink holds its files open, and Windows can't delete an open file.
+        drop(pipeline);
+        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(names, ["windows-etw"]);
     }
 }
