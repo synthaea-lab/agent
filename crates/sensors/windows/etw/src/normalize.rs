@@ -106,6 +106,50 @@ pub fn parse_orphaned_sessions(logman_query_ets_output: &str) -> Vec<String> {
         .collect()
 }
 
+/// Runs `start`, and on failure calls `stop_session(session)` before returning
+/// the error (#408). `ferrisetw`'s `start_and_process` creates the session
+/// (`StartTrace`), then enables each provider and opens the consumer; if one of
+/// those steps fails it returns before building the `UserTrace`, so no `Drop`
+/// ever stops the session it created. Left alone, every failed start (and the
+/// watchdog retries one every few seconds) leaks a live ETW session.
+///
+/// # Errors
+///
+/// Whatever `start` returns, unchanged, after the session was stopped.
+pub fn start_or_stop_session<T, E>(
+    session: &str,
+    start: impl FnOnce() -> Result<T, E>,
+    stop_session: impl FnOnce(&str),
+) -> Result<T, E> {
+    let result = start();
+    if result.is_err() {
+        stop_session(session);
+    }
+    result
+}
+
+/// Describes our session's state from `logman query -ets` output, for the error
+/// the liveness canary raises after 30 s of silence (#408). "Stopped from the
+/// outside" and "still running but blind" call for different investigations, and
+/// the old message ("trace stopped or tampered") didn't tell them apart. Other
+/// `wtrace-` sessions at that point are not orphans (startup stopped those): they
+/// belong to another running instance. `None`: logman itself failed.
+#[must_use]
+pub fn describe_silent_session(session: &str, logman_query_ets_output: Option<&str>) -> String {
+    let Some(output) = logman_query_ets_output else {
+        return format!("session {session}: state unknown (logman query -ets failed)");
+    };
+    let ours = parse_orphaned_sessions(output);
+    let running = ours.iter().any(|name| name == session);
+    let others = ours.iter().filter(|name| *name != session).count();
+    let state = if running {
+        "is still running but delivers no events (blind, not stopped)"
+    } else {
+        "is no longer running (stopped from outside the agent)"
+    };
+    format!("session {session} {state}; other wtrace- sessions running: {others}")
+}
+
 /// Short-window connect dedup (F-7): stacks that emit both Connect (42/58) and the
 /// first Send (12/26) for one connection must not double-count the beacon counter.
 pub struct ConnectDedup {
@@ -234,6 +278,66 @@ mod tests {
         let output = "Data Collector Set   Type    Status\n---\n\
              MyApp-wtrace-shim    Trace   Running\n";
         assert!(parse_orphaned_sessions(output).is_empty());
+    }
+
+    #[test]
+    fn a_failed_start_stops_the_session_it_may_have_created() {
+        // #408: ferrisetw leaves the session running when a provider fails to
+        // enable after StartTrace, so a failed start must stop it by name.
+        let mut stopped = Vec::new();
+        let result: Result<(), &str> = start_or_stop_session(
+            "wtrace-0123456789abcdef",
+            || Err("enable failed"),
+            |s| {
+                stopped.push(s.to_string());
+            },
+        );
+        assert_eq!(result, Err("enable failed"));
+        assert_eq!(stopped, vec!["wtrace-0123456789abcdef"]);
+    }
+
+    #[test]
+    fn a_successful_start_leaves_the_session_alone() {
+        let mut stopped = 0;
+        let result: Result<u8, ()> = start_or_stop_session("wtrace-x", || Ok(7), |_| stopped += 1);
+        assert_eq!(result, Ok(7));
+        assert_eq!(stopped, 0);
+    }
+
+    #[test]
+    fn a_silent_session_still_listed_is_reported_blind_not_stopped() {
+        let output = "Data Collector Set                      Type                          Status\n\
+             -------------------------------------------------------------------------------\n\
+             EventLog-Security                       Trace                         Running\n\
+             wtrace-aaaaaaaaaaaaaaaa                  Trace                         Running\n\
+             wtrace-bbbbbbbbbbbbbbbb                  Trace                         Running\n";
+        let text = describe_silent_session("wtrace-aaaaaaaaaaaaaaaa", Some(output));
+        assert!(
+            text.contains("still running but delivers no events"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("other wtrace- sessions running: 1"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_silent_session_gone_from_the_list_is_reported_stopped() {
+        let output = "Data Collector Set   Type    Status\n---\n\
+             EventLog-Security    Trace   Running\n";
+        let text = describe_silent_session("wtrace-aaaaaaaaaaaaaaaa", Some(output));
+        assert!(text.contains("no longer running"), "{text}");
+        assert!(
+            text.ends_with("other wtrace- sessions running: 0"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_failed_logman_says_the_state_is_unknown() {
+        let text = describe_silent_session("wtrace-aaaaaaaaaaaaaaaa", None);
+        assert!(text.contains("state unknown"), "{text}");
     }
 
     #[test]

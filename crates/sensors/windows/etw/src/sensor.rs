@@ -126,6 +126,33 @@ fn stop_all_orphaned_sessions() {
     }
 }
 
+/// Stops the session a failed `start_and_process` left behind (#408, see
+/// `normalize::start_or_stop_session`). "Not found" is nominal: the failure may
+/// have come before `StartTrace` created anything.
+fn stop_session_after_failed_start(session: &str) {
+    match ferrisetw::trace::stop_trace_by_name(session) {
+        Ok(()) => tracing::warn!(
+            session,
+            "ETW start failed; stopped the session it had created"
+        ),
+        Err(e) => {
+            tracing::debug!(session, error = ?e, "no session to stop after a failed ETW start");
+        }
+    }
+}
+
+/// The liveness error's diagnosis (#408): is our silent session still listed by
+/// `logman query -ets` (running but blind) or gone (stopped from outside)?
+fn silent_session_diagnosis(session: &str) -> String {
+    let output = std::process::Command::new("logman")
+        .args(["query", "-ets"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    normalize::describe_silent_session(session, output.as_deref())
+}
+
 // ── Shared state between provider callbacks ──────────────────────────────────
 
 pub(crate) struct SharedState {
@@ -272,7 +299,8 @@ fn liveness_watch(
             if silent_intervals >= 15 {
                 return Err(format!(
                     "sensor produced no events for 30s despite liveness canary \
-                     writes (session {session}) — trace stopped or tampered"
+                     writes: {}",
+                    silent_session_diagnosis(session)
                 )
                 .into());
             }
@@ -358,7 +386,7 @@ impl Sensor for WindowsSensor {
         stop_all_orphaned_sessions();
         let session = new_session_name();
 
-        let trace = UserTrace::new()
+        let builder = UserTrace::new()
             .named(session.clone())
             .enable(process_provider(sink.clone(), state.clone()))
             .enable(network_provider(sink.clone(), state.clone()))
@@ -368,9 +396,13 @@ impl Sensor for WindowsSensor {
             .enable(powershell_provider(sink.clone(), state.clone()))
             .enable(wmi_provider(sink.clone(), state.clone()))
             .enable(dotnet_provider(sink.clone(), state.clone()))
-            .enable(smb_provider(sink, state.clone()))
-            .start_and_process()
-            .map_err(|e| -> SensorError { format!("ETW startup error: {e:?}").into() })?;
+            .enable(smb_provider(sink, state.clone()));
+        let trace = normalize::start_or_stop_session(
+            &session,
+            || builder.start_and_process(),
+            stop_session_after_failed_start,
+        )
+        .map_err(|e| -> SensorError { format!("ETW startup error: {e:?}").into() })?;
 
         let result = liveness_watch(&self.stop, &state, &canary_file, &session);
 
