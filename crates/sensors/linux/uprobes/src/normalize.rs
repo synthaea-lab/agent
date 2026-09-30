@@ -59,7 +59,9 @@ use crate::redact;
 /// here, same reasoning as v15.
 ///
 /// v18 (#510) added `MemfdCreateEvent::fd` — not imported here, same reasoning.
-const _: () = assert!(wire::WIRE_VERSION == 18);
+///
+/// v19 (#457) added `PrctlEvent` — not imported here, same reasoning.
+const _: () = assert!(wire::WIRE_VERSION == 19);
 
 /// `container` is resolved by the caller (`crate::container::container_context`,
 /// issue #312) from `EventMeta::cgroup_id` against cgroupfs, with image/name filled

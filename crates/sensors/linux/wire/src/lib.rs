@@ -186,7 +186,15 @@ pub use path_filter::is_filtered_path;
 ///   before the call) and stashes it in `MEMFD_ARGS` keyed by `pid_tgid`; the
 ///   exit side fills `fd` and emits. A failed call (`ret < 0`) emits nothing, so
 ///   `fd` is always `>= 0`. `sys_exit_memfd_create` joins the attach list.
-pub const WIRE_VERSION: u32 = 18;
+/// - v19: `PrctlEvent` added (issue #457, from #266). `syscalls:sys_enter_prctl`
+///   filtered in-kernel to `option == PR_SET_SECUREBITS` (28) or
+///   `PR_CAPBSET_DROP` (24), the shape of the `sys_enter_bpf` cmd filter (#264):
+///   `prctl(2)` has dozens of options and some are very hot (`PR_SET_NAME` runs
+///   on every thread rename), so every other option returns before touching a
+///   ring buffer. Carries the raw `option` and `arg2` (the `SECBIT_*` mask, or
+///   the capability number). New ring buffer `PRCTL_EVENTS`; the probe joins the
+///   attach list.
+pub const WIRE_VERSION: u32 = 19;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
@@ -564,6 +572,21 @@ pub struct NamespaceEvent {
     /// "any"), or `unshare(2)`'s `flags` (a bitmask of one or more
     /// `CLONE_NEW*` bits).
     pub flags: u32,
+}
+
+/// Capability-model tampering (issue #457): `prctl(2)`, filtered in-kernel to
+/// `PR_SET_SECUREBITS` and `PR_CAPBSET_DROP` (see this file's v19 changelog).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PrctlEvent {
+    pub meta: EventMeta,
+    /// Raw `prctl` option — always 28 (`PR_SET_SECUREBITS`) or 24
+    /// (`PR_CAPBSET_DROP`).
+    pub option: u32,
+    /// `arg2`: the `SECBIT_*` mask, or the capability number to drop. Kept as
+    /// `u64` (the syscall's `unsigned long`) so a 64-bit caller's full value
+    /// survives.
+    pub arg: u64,
 }
 
 /// TLS plaintext capture (uprobes on `SSL_read`/`SSL_write`, issue #90).
