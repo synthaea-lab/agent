@@ -1016,9 +1016,17 @@ mod tests {
         let alerts = alerts_in(&dir);
         assert!(alerts.contains("RESPONSE-QUARANTINE"), "{alerts}");
         assert!(alerts.contains("quarantined"), "{alerts}");
+        // `alerts.ndjson` is JSON: a Windows path is written with doubled
+        // backslashes, so compare the decoded message, not the raw text.
+        let message = alerts
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| record["technique"] == "RESPONSE-QUARANTINE")
+            .and_then(|record| record["message"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| panic!("no RESPONSE-QUARANTINE record: {alerts}"));
         assert!(
-            alerts.contains(&payload.display().to_string()),
-            "the audit line names the original path: {alerts}"
+            message.contains(&payload.display().to_string()),
+            "the audit line names the original path: {message}"
         );
     }
 
