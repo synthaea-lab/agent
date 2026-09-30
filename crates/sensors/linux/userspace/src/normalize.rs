@@ -10,8 +10,8 @@ use schema::{
     FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent, FileRemovexattrEvent,
     FileRenameEvent, FileSetxattrEvent, FileWriteEvent, IdentityChangeEvent, IdentityChangeKind,
     KernelModuleAction, KernelModuleEvent, MemfdCreateEvent, MountEvent, NamespaceEvent,
-    NamespaceSyscall, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, SignalEvent,
-    SocketAcceptEvent, SocketBindEvent, SocketListenEvent, UdpSendEvent, User,
+    NamespaceSyscall, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
+    SignalEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, UdpSendEvent, User,
 };
 use sensor_linux_wire as wire;
 
@@ -91,7 +91,9 @@ use sensor_linux_wire as wire;
 ///
 /// v18 (#510) added `MemfdCreateEvent::fd` (the descriptor `memfd_create(2)`
 /// returned); `memfd_create` passes it through unchanged.
-const _: () = assert!(wire::WIRE_VERSION == 18);
+///
+/// v19 (#457) added `PrctlEvent`; `prctl` maps it one-to-one.
+const _: () = assert!(wire::WIRE_VERSION == 19);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
@@ -515,6 +517,19 @@ pub fn bpf_operation(
     Event::BpfOperation(BpfEvent {
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
         cmd: event.cmd,
+    })
+}
+
+#[must_use]
+pub fn prctl(
+    event: &wire::PrctlEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    Event::Prctl(PrctlEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        option: event.option,
+        arg: event.arg,
     })
 }
 
@@ -1344,6 +1359,23 @@ mod tests {
             panic!("wrong variant")
         };
         assert_eq!(e.path, None);
+    }
+
+    #[test]
+    fn prctl_carries_the_option_and_the_full_64_bit_argument() {
+        // A capability number or a SECBIT_* mask fits 32 bits, but the syscall
+        // argument is an `unsigned long`: nothing may narrow it on the way.
+        let event = wire::PrctlEvent {
+            meta: wire_meta(b"sandbox_init"),
+            option: schema::PR_SET_SECUREBITS,
+            arg: 0x1_0000_0003,
+        };
+        let Event::Prctl(e) = prctl(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.option, schema::PR_SET_SECUREBITS);
+        assert_eq!(e.arg, 0x1_0000_0003);
+        assert_eq!(e.meta.comm, "sandbox_init");
     }
 
     #[test]

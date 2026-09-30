@@ -98,6 +98,7 @@ pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
         "sys_enter_delete_module",
     ),
     ("sys_enter_bpf", "syscalls", "sys_enter_bpf"),
+    ("sys_enter_prctl", "syscalls", "sys_enter_prctl"),
     ("sys_enter_ptrace", "syscalls", "sys_enter_ptrace"),
     (
         "sys_enter_process_vm_readv",
