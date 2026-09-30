@@ -1,9 +1,11 @@
 //! Parses raw audit netlink messages into structured records.
 //!
-//! Wire format: 16-byte binary nlmsghdr + text payload "msg=audit(timestamp:seq): key=value ..."
+//! Wire format: 16-byte binary nlmsghdr + text payload "audit(timestamp:seq): key=value ...".
+//! That is the kernel's netlink form; auditd's log lines prefix it with `type=… msg=`, and
+//! requiring that prefix here once failed on every real record (#504).
 //! The record type comes from `nlmsghdr.nlmsg_type`, not from a "type=" text prefix.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Size of the netlink message header — `struct nlmsghdr`: `nlmsg_len: u32`,
 /// `nlmsg_type: u16`, `nlmsg_flags: u16`, `nlmsg_seq: u32`, `nlmsg_pid: u32`.
@@ -17,6 +19,14 @@ pub struct AuditRecord {
     pub timestamp_ms: u32,
     pub seq: u64,
     pub fields: HashMap<String, String>,
+    /// Keys whose value arrived on the wire *unquoted* (`a0=2F62696E2F6C73`,
+    /// not `a0="/bin/ls"`) — the kernel's own signal for "this needed
+    /// hex-encoding", lost once the surrounding quotes are stripped into a
+    /// plain `String` (issue #491). `classify.rs`'s `decode_audit_value` must
+    /// only run on keys in this set — otherwise a quoted-but-hex-*shaped*
+    /// literal value (a file genuinely named `6162`) gets silently
+    /// misdecoded (to `"ab"`) instead of passed through as-is.
+    pub unquoted_fields: HashSet<String>,
 }
 
 /// Parses one audit message from the wire.
@@ -43,11 +53,11 @@ pub fn parse_audit_message(raw: &[u8]) -> Result<AuditRecord, String> {
     let payload = &raw[NLMSGHDR_SIZE..];
     let msg = String::from_utf8_lossy(payload);
 
-    // Parse "msg=audit(1234567890.123:456):" from the text payload
+    // Parse "audit(1234567890.123:456):" from the text payload
     let (timestamp_sec, timestamp_ms, seq) = parse_msg_header(&msg)?;
 
     // Parse remaining "key=value" pairs
-    let fields = parse_fields(&msg)?;
+    let (fields, unquoted_fields) = parse_fields(&msg)?;
 
     Ok(AuditRecord {
         record_type,
@@ -55,14 +65,16 @@ pub fn parse_audit_message(raw: &[u8]) -> Result<AuditRecord, String> {
         timestamp_ms,
         seq,
         fields,
+        unquoted_fields,
     })
 }
 
 fn parse_msg_header(msg: &str) -> Result<(u64, u32, u64), String> {
-    let msg_prefix = "msg=audit(";
+    // Also matches inside the `msg=audit(` log-file form.
+    let msg_prefix = "audit(";
     let msg_start = msg
         .find(msg_prefix)
-        .ok_or_else(|| "missing 'msg=audit(' header".to_string())?;
+        .ok_or_else(|| "missing 'audit(' header".to_string())?;
 
     let timestamp_start = msg_start + msg_prefix.len();
     let timestamp_end = msg[timestamp_start..]
@@ -100,14 +112,15 @@ fn parse_msg_header(msg: &str) -> Result<(u64, u32, u64), String> {
     Ok((timestamp_sec, timestamp_ms, seq))
 }
 
-fn parse_fields(msg: &str) -> Result<HashMap<String, String>, String> {
+fn parse_fields(msg: &str) -> Result<(HashMap<String, String>, HashSet<String>), String> {
     let mut fields = HashMap::new();
+    let mut unquoted_fields = HashSet::new();
 
-    // Find the end of the msg=audit(...): header
+    // Find the end of the audit(...): header
     let fields_start = msg.find("): ").map(|pos| pos + 3).unwrap_or(0);
 
     if fields_start == 0 || fields_start >= msg.len() {
-        return Ok(fields);
+        return Ok((fields, unquoted_fields));
     }
 
     let fields_str = &msg[fields_start..];
@@ -135,7 +148,7 @@ fn parse_fields(msg: &str) -> Result<HashMap<String, String>, String> {
         current = eq_pos + 1;
 
         // Parse value (may be quoted)
-        let (value, next_pos) = if current < bytes.len() && bytes[current] == b'"' {
+        let (value, next_pos, was_quoted) = if current < bytes.len() && bytes[current] == b'"' {
             // Quoted value
             current += 1;
             let value_end = bytes[current..]
@@ -145,7 +158,7 @@ fn parse_fields(msg: &str) -> Result<HashMap<String, String>, String> {
                 .unwrap_or(bytes.len());
 
             let value = fields_str[current..value_end].to_string();
-            (value, value_end + 1)
+            (value, value_end + 1, true)
         } else {
             // Unquoted value (until space or end)
             let value_end = bytes[current..]
@@ -155,14 +168,19 @@ fn parse_fields(msg: &str) -> Result<HashMap<String, String>, String> {
                 .unwrap_or(bytes.len());
 
             let value = fields_str[current..value_end].to_string();
-            (value, value_end)
+            (value, value_end, false)
         };
 
+        if was_quoted {
+            unquoted_fields.remove(&key);
+        } else {
+            unquoted_fields.insert(key.clone());
+        }
         fields.insert(key, value);
         current = next_pos;
     }
 
-    Ok(fields)
+    Ok((fields, unquoted_fields))
 }
 
 #[cfg(test)]
@@ -232,6 +250,53 @@ mod tests {
         let record = parse_audit_message(&raw).unwrap();
         assert_eq!(record.fields.get("pid"), Some(&"1234".to_string()));
         assert_eq!(record.fields.get("uid"), Some(&"1000".to_string()));
+    }
+
+    #[test]
+    fn parses_the_kernel_netlink_form() {
+        // Regression (#504): an EXECVE record exactly as the kernel multicasts it
+        // on NETLINK_AUDIT (lab VM, Alpine 6.18.50). No `msg=` prefix.
+        let raw = build_wire_message(
+            1309,
+            "audit(1790588127.857:26): argc=7 a0=\"/bin/echo\" a1=\"probe491\" a2=\"6162\" \
+             a3=\"31323334\" a4=696420727361 a5=20 a6=\"cafe\"",
+        );
+        let record = parse_audit_message(&raw).unwrap();
+        assert_eq!(record.timestamp_sec, 1_790_588_127);
+        assert_eq!(record.timestamp_ms, 857);
+        assert_eq!(record.seq, 26);
+        assert_eq!(record.fields.get("argc"), Some(&"7".to_string()));
+        assert_eq!(record.fields.get("a0"), Some(&"/bin/echo".to_string()));
+        assert_eq!(record.fields.get("a4"), Some(&"696420727361".to_string()));
+    }
+
+    #[test]
+    fn still_parses_the_auditd_log_form() {
+        let raw = build_wire_message(1309, "type=EXECVE msg=audit(1000.5:7): argc=1 a0=\"id\"");
+        let record = parse_audit_message(&raw).unwrap();
+        assert_eq!(record.seq, 7);
+        assert_eq!(record.fields.get("a0"), Some(&"id".to_string()));
+    }
+
+    #[test]
+    fn tracks_which_fields_arrived_unquoted() {
+        // Issue #491: the kernel's own quoting choice is the only reliable
+        // signal for "was this value hex-encoded", and it's lost the moment
+        // the surrounding quotes are stripped into a plain `String` — so this
+        // has to be captured here, at parse time, not guessed later from the
+        // stripped value alone.
+        let raw = build_wire_message(1309, "msg=audit(1000.0:1): a0=\"6162\" a1=2F62696E2F6C73");
+        let record = parse_audit_message(&raw).unwrap();
+        assert_eq!(record.fields.get("a0"), Some(&"6162".to_string()));
+        assert_eq!(record.fields.get("a1"), Some(&"2F62696E2F6C73".to_string()));
+        assert!(
+            !record.unquoted_fields.contains("a0"),
+            "a0 was quoted on the wire"
+        );
+        assert!(
+            record.unquoted_fields.contains("a1"),
+            "a1 was unquoted on the wire"
+        );
     }
 
     #[test]

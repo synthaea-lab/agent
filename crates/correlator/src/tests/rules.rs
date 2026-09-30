@@ -459,3 +459,93 @@ fn eviction_outside_window() {
         "an exec outside the window must no longer correlate"
     );
 }
+
+// ── sshd's address-selection probe is not a network connection (#538) ──────────
+
+fn probe_connect(pid: u32, ppid: u32, comm: &str, ts_ns: u64) -> Event {
+    connect_to(meta_full(pid, ppid, comm, ts_ns), [0, 0, 0, 0], 65535)
+}
+
+fn relay_connect(pid: u32, ppid: u32, comm: &str, ts_ns: u64) -> Event {
+    connect_to(meta_full(pid, ppid, comm, ts_ns), [0, 0, 0, 0], 4444)
+}
+
+#[test]
+fn spawn_then_the_sshd_probe_does_not_alert() {
+    // `sshd-auth` execs, then `connect()`s to 0.0.0.0:65535 on every login.
+    let mut engine = CorrelationEngine::new();
+    assert!(
+        engine
+            .on_event(exec_with_meta(
+                meta_full(4259, 1, "sshd-auth", 1_000_000_000),
+                ""
+            ))
+            .is_empty()
+    );
+    let alerts = engine.on_event(probe_connect(4259, 1, "sshd-auth", 2_000_000_000));
+    assert!(alerts.is_empty(), "{alerts:?}");
+}
+
+#[test]
+fn spawn_then_a_connect_to_the_unspecified_address_on_another_port_still_alerts() {
+    // Only the probe is skipped: `0.0.0.0:4444` reaches the local host like loopback.
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(exec_with_meta(
+        meta_full(4260, 1, "implant", 1_000_000_000),
+        "",
+    ));
+    let alerts = engine.on_event(relay_connect(4260, 1, "implant", 2_000_000_000));
+    assert!(
+        alerts.iter().any(|a| a.technique == "T1059/T1071"),
+        "{alerts:?}"
+    );
+}
+
+#[test]
+fn the_sshd_probe_plus_a_payload_write_does_not_alert() {
+    // The staging (R2) and full dropper chain (R3) rules take the same network leg.
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(exec_event(4261, 1_000_000_000));
+    engine.on_event(probe_connect(4261, 0, "", 2_000_000_000));
+    let alerts = engine.on_event(file_write_event(4261, 3_000_000_000));
+    assert!(alerts.is_empty(), "{alerts:?}");
+}
+
+#[test]
+fn repeated_sshd_logins_do_not_raise_a_respawn_alert() {
+    // 27 logins produced 54 sshd-auth/sshd-session execs and one "automatic respawn
+    // with suspected beaconing" alert on the lab VM.
+    let mut engine = CorrelationEngine::new();
+    let mut alerts = Vec::new();
+    for (i, pid) in (300..306u32).enumerate() {
+        let ts = i as u64 * 1_000_000_000;
+        alerts.extend(engine.on_event(exec_with_meta(meta_full(pid, 900, "sshd-session", ts), "")));
+        alerts.extend(engine.on_event(probe_connect(pid, 900, "sshd-session", ts + 1_000)));
+    }
+    assert!(alerts.is_empty(), "{alerts:?}");
+}
+
+#[test]
+fn a_respawning_process_beaconing_to_the_unspecified_address_still_alerts() {
+    let mut engine = CorrelationEngine::new();
+    let mut alerts = Vec::new();
+    for (i, pid) in (310..316u32).enumerate() {
+        let ts = i as u64 * 1_000_000_000;
+        alerts.extend(engine.on_event(exec_with_meta(meta_full(pid, 901, "listener", ts), "")));
+        alerts.extend(engine.on_event(relay_connect(pid, 901, "listener", ts + 1_000)));
+    }
+    assert!(
+        alerts
+            .iter()
+            .any(|a| a.message.contains("automatic respawn")),
+        "{alerts:?}"
+    );
+}
+
+#[test]
+fn an_assembly_load_plus_the_sshd_probe_does_not_alert() {
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(assembly_load_event(4262, 1_000_000_000));
+    let alerts = engine.on_event(probe_connect(4262, 0, "", 2_000_000_000));
+    assert!(alerts.is_empty(), "{alerts:?}");
+}

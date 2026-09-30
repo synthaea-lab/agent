@@ -7,6 +7,12 @@ use tokio::sync::Notify;
 
 use crate::{AuditSocket, classify, normalize, parse};
 
+/// Records read per readiness wakeup before yielding back to `select!`. One
+/// exec is 7 records on the lab kernel (SYSCALL, EXECVE, CWD, PATH ×2,
+/// PROCTITLE, EOE), so this covers a ~36-exec burst per wakeup without letting
+/// a flood starve the stop signal.
+const DRAIN_BUDGET: usize = 256;
+
 pub struct AuditSensor {
     stop: Arc<Notify>,
 }
@@ -32,47 +38,61 @@ impl AuditSensor {
         tokio::pin!(ctrl_c);
 
         let mut buf = vec![0u8; 8192];
+        // A record this parser can't read is skipped and counted, never fatal:
+        // returning the parse error here once stopped the sensor on the first
+        // record it received (#504).
+        let mut unparsed: u64 = 0;
+        let mut overruns: u64 = 0;
         loop {
             tokio::select! {
                 _ = &mut ctrl_c => break,
                 _ = self.stop.notified() => break,
                 guard = async_socket.readable_mut() => {
                     let mut guard = guard.map_err(|e| format!("poll: {e}"))?;
-                    let socket = guard.get_inner_mut();
-
-                    match socket.recv(&mut buf) {
-                        Ok(n) => {
-                            let record = parse::parse_audit_message(&buf[..n])
-                                .map_err(|e| format!("parse: {e}"))?;
-
-                            if let Some(event) = classify::classify(&record) {
-                                let timestamp_ns = audit_ts_to_epoch_ns(
-                                    record.timestamp_sec,
-                                    record.timestamp_ms,
-                                );
-
-                                let schema_event = match &event {
-                                    crate::AuditEvent::Exec { .. } => normalize::exec_event(&event, timestamp_ns),
-                                    crate::AuditEvent::Connect { .. } => normalize::connect_event(&event, timestamp_ns),
-                                    crate::AuditEvent::PolicyDenial { .. } => {
-                                        normalize::policy_denial_event(&event, timestamp_ns)
+                    // Drain what is queued before re-arming: readiness is edge-
+                    // triggered, and clearing it after a single recv left the rest
+                    // queued until the next record arrived, so the sensor fell
+                    // further behind with every burst and lost the tail on exit
+                    // (#504). Bounded per wakeup so a flood can't starve `stop`;
+                    // readiness stays set when the budget runs out.
+                    for _ in 0..DRAIN_BUDGET {
+                        match guard.get_inner_mut().recv(&mut buf) {
+                            Ok(n) => match parse::parse_audit_message(&buf[..n]) {
+                                Ok(record) => forward(&record, sink.as_ref()),
+                                Err(e) => {
+                                    unparsed += 1;
+                                    // Powers of two only: a stream of bad records must not flood the log.
+                                    if unparsed.is_power_of_two() {
+                                        tracing::warn!(
+                                            error = %e,
+                                            unparsed_total = unparsed,
+                                            "sensor-linux-audit: unparseable record skipped"
+                                        );
                                     }
-                                };
-
-                                sink.on_event(schema_event);
+                                }
+                            },
+                            Err(crate::AuditError::Netlink(errno))
+                                if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK =>
+                            {
+                                guard.clear_ready();
+                                break;
+                            }
+                            // The kernel dropped records because the socket buffer
+                            // overflowed; the socket itself is still usable.
+                            Err(crate::AuditError::Netlink(libc::ENOBUFS)) => {
+                                overruns += 1;
+                                if overruns.is_power_of_two() {
+                                    tracing::warn!(
+                                        overruns_total = overruns,
+                                        "sensor-linux-audit: kernel dropped records (socket buffer overrun)"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                return Err(format!("recv: {e}").into());
                             }
                         }
-                        Err(crate::AuditError::Netlink(errno))
-                            if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK =>
-                        {
-                            // Spurious wakeup - no data available. Clear ready and continue.
-                        }
-                        Err(e) => {
-                            return Err(format!("recv: {e}").into());
-                        }
                     }
-
-                    guard.clear_ready();
                 }
             }
         }
@@ -115,6 +135,22 @@ impl Sensor for AuditSensor {
     fn stop(&mut self) {
         self.stop.notify_one();
     }
+}
+
+/// Classifies one parsed record and hands the resulting event, if any, to `sink`.
+fn forward(record: &parse::AuditRecord, sink: &dyn EventSink) {
+    let Some(event) = classify::classify(record) else {
+        return;
+    };
+    let timestamp_ns = audit_ts_to_epoch_ns(record.timestamp_sec, record.timestamp_ms);
+    let schema_event = match &event {
+        crate::AuditEvent::Exec { .. } => normalize::exec_event(&event, timestamp_ns),
+        crate::AuditEvent::Connect { .. } => normalize::connect_event(&event, timestamp_ns),
+        crate::AuditEvent::PolicyDenial { .. } => {
+            normalize::policy_denial_event(&event, timestamp_ns)
+        }
+    };
+    sink.on_event(schema_event);
 }
 
 fn audit_ts_to_epoch_ns(sec: u64, ms: u32) -> u64 {

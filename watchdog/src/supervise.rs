@@ -44,7 +44,10 @@ use std::{
 #[cfg(unix)]
 use anyhow::Context as _;
 
-use crate::paths::{child_log_path, heartbeat_path_for, resolve_agent_bin};
+use crate::{
+    paths::{child_log_path, heartbeat_path_for, resolve_agent_bin},
+    probation::{Probation, Verdict},
+};
 
 /// Below this uptime, an exit counts as a "fast crash" for [`Backoff`]
 /// purposes; at or above it, the agent ran long enough that a later crash
@@ -121,6 +124,9 @@ struct HeartbeatMonitor {
     ticks_since_check: u32,
     last_value: Option<u64>,
     misses: u32,
+    /// Set once the counter has moved from a value already seen — the proof of
+    /// life a release on probation needs (`crate::probation`).
+    progressed: bool,
 }
 
 impl HeartbeatMonitor {
@@ -134,6 +140,7 @@ impl HeartbeatMonitor {
             ticks_since_check: 0,
             last_value: None,
             misses: 0,
+            progressed: false,
         }
     }
 
@@ -149,6 +156,11 @@ impl HeartbeatMonitor {
         self.observe(read_heartbeat(&self.path))
     }
 
+    /// Whether the counter has advanced at least once since this monitor started.
+    fn progressed(&self) -> bool {
+        self.progressed
+    }
+
     /// The pure state transition behind [`Self::tick`], split out so it is
     /// testable without a real heartbeat file on disk.
     fn observe(&mut self, current: Option<u64>) -> bool {
@@ -158,7 +170,8 @@ impl HeartbeatMonitor {
             // grace), and a filesystem hiccup shouldn't kill a healthy agent.
             (None, _) => {}
             (Some(v), Some(prev)) if v == prev => self.misses += 1,
-            (Some(v), _) => {
+            (Some(v), prev) => {
+                self.progressed |= prev.is_some();
                 self.last_value = Some(v);
                 self.misses = 0;
             }
@@ -175,7 +188,28 @@ fn read_heartbeat(path: &Path) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// Restarts the agent in a loop until `stop_flag` becomes true.
+/// Why [`supervise_loop`] returned.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LoopExit {
+    /// The stop flag rose: a clean stop.
+    Stopped,
+    /// The release under supervision failed its health check and was rolled
+    /// back; the caller must exit so the service manager restarts the watchdog
+    /// from the rolled-back `current`.
+    RolledBack { failed: u64, restored: Option<u64> },
+}
+
+/// What one [`watch_child`] run ended with.
+enum WatchOutcome {
+    Restart,
+    Stop,
+    RolledBack { failed: u64, restored: Option<u64> },
+}
+
+/// Restarts the agent in a loop until `stop_flag` becomes true. The Windows
+/// service entry point calls this: versioned self-update is Linux-only, so no
+/// release is ever on probation there.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn watchdog_loop(
     agent: &Path,
     alerts: &Path,
@@ -184,6 +218,28 @@ pub(crate) fn watchdog_loop(
     heartbeat_miss_limit: u32,
     stop_flag: &AtomicBool,
 ) {
+    supervise_loop(
+        agent,
+        alerts,
+        restart_delay,
+        heartbeat_interval_secs,
+        heartbeat_miss_limit,
+        stop_flag,
+        None,
+    );
+}
+
+/// The supervision loop itself. With a `probation`, the release must show a
+/// heartbeat advance in time or it is rolled back ([`crate::probation`]).
+pub(crate) fn supervise_loop(
+    agent: &Path,
+    alerts: &Path,
+    restart_delay: u64,
+    heartbeat_interval_secs: u64,
+    heartbeat_miss_limit: u32,
+    stop_flag: &AtomicBool,
+    mut probation: Option<Probation>,
+) -> LoopExit {
     let mut backoff = Backoff::new(restart_delay);
     let heartbeat_path = heartbeat_path_for(alerts);
 
@@ -209,6 +265,13 @@ pub(crate) fn watchdog_loop(
     let definition_baseline = crate::service::snapshot_definition().ok();
 
     while !stop_flag.load(Ordering::SeqCst) {
+        // Every path that loops back here — a crash, a refused spawn, a stalled
+        // heartbeat — passes through this check, so a release whose agent never
+        // even starts still runs out its probation.
+        if let Some(exit) = settle_probation(&mut probation, false, alerts) {
+            return exit;
+        }
+
         #[cfg(target_os = "linux")]
         if let Some(baseline) = &definition_baseline
             && let Ok(current) = crate::service::snapshot_definition()
@@ -231,7 +294,7 @@ pub(crate) fn watchdog_loop(
             );
             let (delay, _) = backoff.record_exit(Duration::ZERO);
             if !sleep_unless_stopped(stop_flag, delay) {
-                return;
+                return LoopExit::Stopped;
             }
             continue;
         }
@@ -253,19 +316,81 @@ pub(crate) fn watchdog_loop(
                 let (delay, _) = backoff.record_exit(Duration::ZERO);
                 eprintln!("[watchdog] spawn failed: {e}. Retrying in {delay}s...");
                 if !sleep_unless_stopped(stop_flag, delay) {
-                    return;
+                    return LoopExit::Stopped;
                 }
                 continue;
             }
         };
-        if !watch_child(
+        match watch_child(
             &mut child,
             spawn_time,
             &mut backoff,
             &mut heartbeat,
+            &mut probation,
+            alerts,
             stop_flag,
         ) {
-            return;
+            WatchOutcome::Restart => {}
+            WatchOutcome::Stop => return LoopExit::Stopped,
+            WatchOutcome::RolledBack { failed, restored } => {
+                return LoopExit::RolledBack { failed, restored };
+            }
+        }
+    }
+    LoopExit::Stopped
+}
+
+/// Feeds one observation to the release on probation, if any. Returns the loop
+/// exit when the release failed and was rolled back; a proven release ends its
+/// probation (`*probation` becomes `None`). A rollback that itself fails is
+/// reported and ends probation too: exiting into a restart loop on a broken
+/// layout would be worse than staying up on the release that is running.
+fn settle_probation(
+    probation: &mut Option<Probation>,
+    advanced: bool,
+    alerts: &Path,
+) -> Option<LoopExit> {
+    let current = probation.as_ref()?;
+    match current.verdict(advanced) {
+        Verdict::Pending => None,
+        Verdict::Proven => {
+            let release = current.release();
+            match current.prove() {
+                Ok(()) => eprintln!("[watchdog] release {release} passed its health check"),
+                Err(e) => eprintln!(
+                    "[watchdog] release {release} is healthy but could not be recorded: {e}"
+                ),
+            }
+            *probation = None;
+            None
+        }
+        Verdict::Failed => {
+            let (failed, restored) = (current.release(), current.previous());
+            let target =
+                restored.map_or_else(|| "bootstrap".to_string(), |v| format!("release {v}"));
+            match current.roll_back() {
+                Ok(()) => {
+                    report_self_protection_event(
+                        alerts,
+                        &format!(
+                            "release {failed} never showed agent progress after promotion — \
+                             rolled back to {target} and banned it; restarting from there"
+                        ),
+                    );
+                    Some(LoopExit::RolledBack { failed, restored })
+                }
+                Err(e) => {
+                    report_self_protection_event(
+                        alerts,
+                        &format!(
+                            "release {failed} failed its health check but rolling back to \
+                             {target} failed: {e} — staying on it"
+                        ),
+                    );
+                    *probation = None;
+                    None
+                }
+            }
         }
     }
 }
@@ -337,20 +462,31 @@ fn die_with_parent(cmd: &mut std::process::Command) {
 }
 
 /// Watches one child until it exits or is killed for a stalled heartbeat (→
-/// `true`: restart it) or the stop flag rises (→ `false`: kill it and end
-/// supervision). Polls in short steps to react to the stop flag quickly.
+/// [`WatchOutcome::Restart`]), the stop flag rises (→ [`WatchOutcome::Stop`]:
+/// kill it and end supervision), or the release on probation fails its health
+/// check (→ [`WatchOutcome::RolledBack`]: kill it and hand the exit up). Polls in
+/// short steps to react to the stop flag quickly.
 fn watch_child(
     child: &mut Child,
     spawn_time: Instant,
     backoff: &mut Backoff,
     heartbeat: &mut HeartbeatMonitor,
+    probation: &mut Option<Probation>,
+    alerts: &Path,
     stop_flag: &AtomicBool,
-) -> bool {
+) -> WatchOutcome {
+    let restart_after = |delay: u64| {
+        if sleep_unless_stopped(stop_flag, delay) {
+            WatchOutcome::Restart
+        } else {
+            WatchOutcome::Stop
+        }
+    };
     loop {
         if stop_flag.load(Ordering::SeqCst) {
             let _ = child.kill();
             let _ = child.wait();
-            return false;
+            return WatchOutcome::Stop;
         }
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -365,7 +501,7 @@ fn watch_child(
                         eprintln!("[watchdog] agent exited ({status}). Restarting in {delay}s...");
                     }
                 }
-                return sleep_unless_stopped(stop_flag, delay);
+                return restart_after(delay);
             }
             Ok(None) => {
                 if heartbeat.tick() {
@@ -377,13 +513,20 @@ fn watch_child(
                     let _ = child.kill();
                     let _ = child.wait();
                     let (delay, _) = backoff.record_exit(spawn_time.elapsed());
-                    return sleep_unless_stopped(stop_flag, delay);
+                    return restart_after(delay);
+                }
+                if let Some(LoopExit::RolledBack { failed, restored }) =
+                    settle_probation(probation, heartbeat.progressed(), alerts)
+                {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return WatchOutcome::RolledBack { failed, restored };
                 }
                 std::thread::sleep(POLL_TICK);
             }
             Err(e) => {
                 eprintln!("[watchdog] try_wait error: {e}");
-                return true;
+                return WatchOutcome::Restart;
             }
         }
     }
@@ -457,16 +600,41 @@ pub(crate) fn cmd_run(
     }
     eprintln!("[watchdog] Ctrl+C / SIGTERM stops the watchdog (the agent will be stopped too)");
 
-    watchdog_loop(
+    // A release `updater` just promoted supervises itself on probation; anything
+    // else (bootstrap, a development binary, an already-proven release) gets none.
+    let probation = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Probation::detect_for_current(&exe));
+    if let Some(p) = &probation {
+        eprintln!(
+            "[watchdog] release {} is on probation: the agent must show progress \
+             within {}s or it is rolled back",
+            p.release(),
+            crate::probation::PROBATION_DEADLINE.as_secs()
+        );
+    }
+
+    match supervise_loop(
         &agent,
         &alerts,
         restart_delay,
         heartbeat_interval_secs,
         heartbeat_miss_limit,
         &stop,
-    );
-    eprintln!("[watchdog] stopped.");
-    Ok(())
+        probation,
+    ) {
+        LoopExit::Stopped => {
+            eprintln!("[watchdog] stopped.");
+            Ok(())
+        }
+        // A non-zero exit on purpose: the service manager restarts the watchdog
+        // from `current`, which now points at the rolled-back release.
+        LoopExit::RolledBack { failed, restored } => anyhow::bail!(
+            "release {failed} failed its health check and was rolled back to {}; \
+             exiting so the service manager restarts from there",
+            restored.map_or_else(|| "bootstrap".to_string(), |v| format!("release {v}"))
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -716,5 +884,146 @@ mod pdeathsig_tests {
             std::thread::sleep(Duration::from_secs(60));
             let _ = grandchild.try_wait();
         }
+    }
+}
+
+/// End-to-end probation tests (issue #30): a real supervision loop against a
+/// real versioned layout in a temp directory, with a shell script standing in for
+/// the agent of the release under test.
+#[cfg(all(test, target_os = "linux"))]
+mod probation_tests {
+    use std::{fs, os::unix::fs::PermissionsExt as _};
+
+    use updater::layout::Layout;
+
+    use super::*;
+
+    /// `base/{bootstrap,versions/v<N>...}` with `current -> versions/v<current>`.
+    fn install(versions: &[u64], current: u64) -> (tempfile::TempDir, Layout) {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        fs::create_dir_all(layout.bootstrap_dir()).unwrap();
+        fs::create_dir_all(layout.versions_dir()).unwrap();
+        std::os::unix::fs::symlink(layout.bootstrap_dir(), layout.current_link()).unwrap();
+        for &v in versions {
+            fs::create_dir_all(layout.version_dir(v)).unwrap();
+        }
+        layout.promote(current).unwrap();
+        (dir, layout)
+    }
+
+    fn write_agent(layout: &Layout, release: u64, script: &str) -> PathBuf {
+        let agent = layout.version_dir(release).join("agent");
+        fs::write(&agent, script).unwrap();
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755)).unwrap();
+        agent
+    }
+
+    #[test]
+    fn a_promoted_release_whose_agent_never_makes_progress_is_rolled_back_and_banned() {
+        let (dir, layout) = install(&[1, 2], 2);
+        layout.mark_healthy(1).unwrap();
+        let agent = write_agent(&layout, 2, "#!/bin/sh\nexit 1\n");
+        let alerts = dir.path().join("alerts.ndjson");
+        let probation = Probation::detect(&layout.version_dir(2).join("watchdog"))
+            .unwrap()
+            .with_deadline(Duration::from_secs(1));
+
+        let exit = supervise_loop(
+            &agent,
+            &alerts,
+            0,
+            1,
+            6,
+            &AtomicBool::new(false),
+            Some(probation),
+        );
+
+        assert_eq!(
+            exit,
+            LoopExit::RolledBack {
+                failed: 2,
+                restored: Some(1)
+            }
+        );
+        assert_eq!(layout.current_release_version(), Some(1));
+        let banned = fs::read_to_string(dir.path().join("banned_versions.json")).unwrap();
+        assert!(banned.contains('2'), "ban list: {banned}");
+        let alert_log = fs::read_to_string(&alerts).unwrap();
+        assert!(
+            alert_log.contains("rolled back to release 1"),
+            "the rollback must be reported: {alert_log}"
+        );
+    }
+
+    #[test]
+    fn a_promoted_release_whose_agent_shows_progress_is_marked_healthy_and_keeps_running() {
+        let (dir, layout) = install(&[1, 2, 3], 3);
+        layout.mark_healthy(2).unwrap();
+        // Stands in for an agent whose heartbeat counter advances.
+        let agent = write_agent(
+            &layout,
+            3,
+            "#!/bin/sh\nhb=\"${3%.*}.heartbeat\"\ni=0\nwhile :; do i=$((i+1)); echo $i > \"$hb\"; sleep 0.2; done\n",
+        );
+        let alerts = dir.path().join("alerts.ndjson");
+        let probation = Probation::detect(&layout.version_dir(3).join("watchdog"))
+            .unwrap()
+            .with_deadline(Duration::from_secs(60));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let stop = stop.clone();
+            let layout = layout.clone();
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    if layout.is_healthy(3) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                stop.store(true, Ordering::SeqCst);
+            })
+        };
+        let exit = supervise_loop(&agent, &alerts, 0, 1, 1000, &stop, Some(probation));
+        watcher.join().unwrap();
+
+        assert_eq!(exit, LoopExit::Stopped);
+        assert!(
+            layout.is_healthy(3),
+            "progress must mark the release healthy"
+        );
+        assert_eq!(
+            layout.current_release_version(),
+            Some(3),
+            "a healthy release stays current"
+        );
+        assert_eq!(
+            layout.installed_versions(),
+            vec![2, 3],
+            "the release older than the rollback target is pruned"
+        );
+        assert!(!dir.path().join("banned_versions.json").exists());
+    }
+
+    #[test]
+    fn without_probation_a_failing_agent_is_never_rolled_back() {
+        // Bootstrap / development runs: nothing to roll back to, so the loop only
+        // restarts the agent, as before this feature.
+        let (dir, layout) = install(&[1], 1);
+        let agent = write_agent(&layout, 1, "#!/bin/sh\nexit 1\n");
+        let alerts = dir.path().join("alerts.ndjson");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopper = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(3));
+                stop.store(true, Ordering::SeqCst);
+            })
+        };
+        let exit = supervise_loop(&agent, &alerts, 0, 1, 6, &stop, None);
+        stopper.join().unwrap();
+        assert_eq!(exit, LoopExit::Stopped);
+        assert_eq!(layout.current_release_version(), Some(1));
     }
 }

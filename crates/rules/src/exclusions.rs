@@ -16,14 +16,46 @@
 /// covered by the mark-of-the-web join (T1204.002) instead.
 pub(crate) const DOWNLOADER_COMMS: &[&str] =
     &["curl", "wget", "curl.exe", "wget.exe", "certutil.exe"];
-pub(crate) const WEB_SERVER_COMMS: &[&str] = &["nginx", "apache2", "httpd"];
 pub(crate) const SHELL_COMMS: &[&str] = &["sh", "bash", "dash", "zsh", "ash"];
+
+/// Service processes whose direct-child shell is a strong compromise signal
+/// (T1059), exact-`comm` match. `nginx`/`apache2`/`httpd` are the original web
+/// server rule; `mysqld`/`mariadbd`/`postgres` extend it to database services
+/// (issue #478, Level 1): `mysqld`/`mariadbd` spawning a shell is command
+/// execution through a UDF (`sys_exec`-style), `postgres` spawning one is the
+/// classic `COPY PROGRAM`/`plpythonu` escape. See [`SERVICE_COMM_PREFIXES`]
+/// for `php-fpm`, which doesn't fit an exact-match list.
+pub(crate) const SERVICE_COMMS: &[&str] = &[
+    "nginx", "apache2", "httpd", "mysqld", "mariadbd", "postgres",
+];
+
+/// Prefix-matched service names, checked in addition to [`SERVICE_COMMS`].
+/// `php-fpm`'s worker `comm` is the pool binary's own file name, which several
+/// distros suffix with the PHP version (Debian/Ubuntu: `php-fpm7.4`,
+/// `php-fpm8.1`, ...; RHEL/Fedora ship a bare `php-fpm`) — an exact-match
+/// entry would only ever catch one distro family. A shell spawned directly by
+/// php-fpm is the same T1059 signal either way, and closes a real gap the
+/// plain web-server list left open: php-fpm's own parent is the fpm master,
+/// not nginx/Apache, so a webshell's `system()`/`exec()` call spawning a shell
+/// under php-fpm never matched [`SERVICE_COMMS`] at all (issue #478).
+pub(crate) const SERVICE_COMM_PREFIXES: &[&str] = &["php-fpm"];
 
 /// Correlation window between the write of a downloaded file and its execution: past
 /// this delay, the two events are no longer linked (avoids keeping an unbounded
 /// history, and an execution hours later is no longer the same "download & run"
 /// scenario anyway).
 pub(crate) const DOWNLOAD_EXEC_WINDOW_NS: u64 = 60_000_000_000; // 60s
+
+/// Correlation window between a `memfd_create(2)` and an exec via
+/// `/proc/(self|<pid>)/fd/<n>` of the same pid that still counts as the same
+/// fileless-exec sequence (T1620, issue #497). A real memfd payload is
+/// created, written, then exec'd back-to-back within one short-lived
+/// process's own syscall sequence — microseconds to low milliseconds apart in
+/// practice — so this is generous headroom for scheduling jitter while
+/// staying short enough that pid reuse (a new, unrelated process reusing the
+/// same pid number well after the original exited) can't plausibly land
+/// inside it. Uncalibrated against fleet traffic (first cut, 2026-09-28).
+pub(crate) const MEMFD_EXEC_WINDOW_NS: u64 = 5_000_000_000; // 5s
 
 /// Window between a download-provenance mark (`FileQuarantine`: macOS quarantine
 /// xattr, Windows `Zone.Identifier`) and an exec of the marked file that still
@@ -50,6 +82,21 @@ pub(crate) const AUTH_FAILURE_THRESHOLD: u32 = 5;
 pub(crate) const AUTH_FAILURE_WINDOW_NS: u64 = 60_000_000_000; // 60s
 pub(crate) const BEACON_THRESHOLD: u32 = 3;
 pub(crate) const BEACON_WINDOW_NS: u64 = 60_000_000_000; // 60s
+
+/// SCAN-SPREAD threshold and window (T1046/T1210, issue #465): N distinct
+/// destinations on the same (pid, dport) in X seconds. Calibrated against
+/// the live Mirai detonation that surfaced this gap (309 connections to
+/// 300+ distinct IPs on port 23 in ~30s) — 20-in-10s clears that burst with
+/// comfortable margin (the real one crossed 20 distinct destinations in
+/// under 2s) while giving a slower, throttled scanner still well inside "a
+/// worm/spray pattern" a full 10s to be counted, unlike BEACON's window this
+/// isn't recalibrated against a broader legitimate-traffic capture yet — a
+/// busy client hitting many distinct servers on the same non-standard port
+/// in a burst (a mail relay fanning out on 587, a monitoring agent probing a
+/// fleet) is the plausible false positive to watch for live.
+pub(crate) const SCAN_SPREAD_THRESHOLD: u32 = 20;
+/// Sliding window for [`SCAN_SPREAD_THRESHOLD`].
+pub(crate) const SCAN_SPREAD_WINDOW_NS: u64 = 10_000_000_000; // 10s
 
 /// RANSOMWARE-RENAME threshold and window (T1486): N renames by the same pid, each
 /// adding a new suffix onto its own old path (`document.docx` →
@@ -82,6 +129,126 @@ pub(crate) const BURST_WRITE_BYTES_THRESHOLD: u64 = 100 * 1024 * 1024;
 /// name-keyed, so it doesn't need the evidence-gating `check_mass_rename_pattern`'s
 /// doc describes for `comm`-based exclusions.
 pub(crate) const RANSOMWARE_EXCLUDED_PATH_PREFIXES: &[&str] = &["/tmp/", "/var/tmp/"];
+
+/// Suffixes a package manager (or an editor's atomic-save convention) appends
+/// to a file it's about to replace, then renames away — the *reverse*
+/// relationship from `check_mass_rename_pattern`'s ransomware shape
+/// (`old_path` + suffix = `new_path`, e.g. `document.docx` ->
+/// `document.docx.locked`): here `old_path` = `new_path` + suffix
+/// (`lib.so.dpkg-new` -> `lib.so`). Confirmed live (#496): a package upgrade
+/// renaming a batch of `.dpkg-new` staging files into place, alongside the
+/// large writes that staged their content (120MB across 30 files in the
+/// capture), cleared both of `check_burst_write_volume`'s gates — rename
+/// count and byte volume — and false-positived T1486. `apk`'s equivalent
+/// suffix is included on the same reasoning, not independently captured live.
+/// rsync's own temp-file convention plausibly hits the same false positive
+/// (also named in the #496 report) but isn't a fixed suffix on the final
+/// name the way these are, so it isn't covered here — add it if a live
+/// capture shows the actual shape.
+pub(crate) const PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES: &[&str] = &[".dpkg-new", ".apk-new"];
+
+/// The prefix apk-tools actually stages under, confirmed live (#500 review,
+/// Jihair, real `apk fix` reinstall on Alpine): apk does *not* use the
+/// `.apk-new` suffix above for its own package-file replacement — that string
+/// is the sidecar it leaves next to a locally modified config file, which it
+/// never renames onto anything. The real staging shape extracts each file to
+/// a hidden name in the *same directory* as the final path (not derived from
+/// it by suffix) and renames that onto the final name, e.g.
+/// `usr/bin/.apk.e9a41015f8b7e04a3f02df6f500e89f18738758051d63799` ->
+/// `usr/bin/c89`. Without this, coalescing `SlidingSum` correctly (this same
+/// PR) made every apk upgrade over ~100MB in 5s a live false T1486 (806/810
+/// renames in the capture had this shape, zero had `.apk-new`).
+pub(crate) const APK_STAGING_FILE_PREFIX: &str = ".apk.";
+
+/// `comm` values a real Debian/Alpine package manager runs the staging-rename
+/// dance under. Required *alongside* [`PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES`]
+/// before `check_burst_write_volume` excludes a burst (#500 review, Nikolas):
+/// the suffix convention alone is just a filename shape the process being
+/// renamed-and-written controls — a real encryptor can name its own staging
+/// file `target.dpkg-new` then rename onto `target` purely to dodge this
+/// signal. `comm` is spoofable too (`prctl`/`argv[0]`), so this doesn't make
+/// the exclusion unspoofable — it raises the bar from "match one filename
+/// convention" to "also make the process look like the exact package manager
+/// that convention belongs to", which is what corroboration means here, not
+/// a claim of unforgeability. `dpkg-deb`/`apt`/`apt-get` shell out to `dpkg`
+/// for the actual file replacement, so `dpkg` alone already covers Debian;
+/// listed anyway since callers observing themselves is cheaper than the debate
+/// over whether they always do.
+pub(crate) const PACKAGE_MANAGER_COMMS: &[&str] = &["dpkg", "dpkg-deb", "apt", "apt-get", "apk"];
+
+/// `comm` values of in-place stream-edit tools whose `-i.<suffix>`/`-i .<suffix>`
+/// backup convention (`sed -i.bak 's/old/new/' *.conf`) matches `check_mass_rename_pattern`'s ransomware shape exactly: one pid,
+/// prefix-preserving, lettered suffix, 20+ files in one command (#459 part 1,
+/// #455 review). Gated on `comm` + `policy::name_exclusion_applies` together,
+/// never `comm` alone (CLAUDE.md — an encryptor can set `comm=sed` for free;
+/// [`FileRenameEvent::executable_path`] existing is what makes gating on the
+/// trusted-system-path half possible at all here, where before there was
+/// nothing to gate against).
+///
+/// `sed` only, not `perl`: `sed -i<suffix>` can do nothing but write a backup copy of
+/// the original, while `perl` is an interpreter and the trusted binary named `perl`
+/// runs whatever script it is given, so listing it would let any mass rename written
+/// in Perl through, with any suffix (#528 review, live on Alpine). The cost is small:
+/// measured on perl 5.42, `perl -i.bak` does not rename the original to `f.bak` at all
+/// (it writes a temp file and renames that onto the original), so it never matched the
+/// appended-suffix shape; only a perl older than 5.28, which did rename the original,
+/// alerts on 20+ files as a consequence. Recognising the real `-i` shape (the original re-created by the same pid right after the rename)
+/// would settle both tools but needs the create history the rename rule does not
+/// consult.
+pub(crate) const IN_PLACE_EDIT_COMMS: &[&str] = &["sed"];
+
+/// Valid Maildir flag letters (Draft/Flagged/Passed/Replied/Seen/Trashed —
+/// the Maildir spec's own convention, unrelated to any ATT&CK id despite the
+/// same letters) appended after a message filename's `:2,` info marker
+/// (#459 part 1): `check_mass_rename_pattern`'s other known false positive,
+/// "mark all read" on a large folder renaming every message's flags in one
+/// IMAP pid. See [`crate::state::is_maildir_flag_change`]'s doc for why this
+/// one is deliberately not also comm-gated.
+pub(crate) const MAILDIR_FLAG_LETTERS: &[u8] = b"DFPRST";
+
+/// `comm` values of compression tools. Their normal operation is exactly the
+/// write-new-then-unlink shape (`gzip f` creates `f.gz`, then unlinks `f`), and one
+/// process handles a whole `*.log` glob: measured live (Debian 13, #512 part B),
+/// `gzip`, `xz`, `bzip2` and `zstd` each reached a burst of 30 in 5 s over 30 files,
+/// the same as an encryptor. Gated on `comm` + a trusted exec-time image path together,
+/// failing closed, never on `comm` or on the output suffix alone (CLAUDE.md: an
+/// encryptor can set `comm=gzip`, or name its output `.gz`, for free).
+pub(crate) const COMPRESSOR_COMMS: &[&str] = &[
+    "gzip", "bzip2", "xz", "zstd", "lz4", "pigz", "pbzip2", "lzma",
+];
+
+/// `comm` values of tools that compress by *driving* a compressor rather than being one:
+/// `logrotate` with `compress` opens the `.gz` output itself, forks, `dup2`s it onto the
+/// child's stdout, execs `gzip` on stdin and unlinks the original itself, so the create
+/// and the unlink both carry `comm=logrotate` and [`COMPRESSOR_COMMS`] never applies
+/// (measured live on Alpine, #527 review; daily on any Debian/Ubuntu host rotating 20+
+/// logs). Gated like the compressors (trusted binary named `comm`) **and** on the new
+/// file's suffix being a compression extension ([`COMPRESSION_SUFFIXES`]).
+pub(crate) const COMPRESSION_DRIVER_COMMS: &[&str] = &["logrotate"];
+
+/// Suffixes a compression driver appends. Only meaningful together with
+/// [`COMPRESSION_DRIVER_COMMS`]: on their own they are free for an encryptor to copy.
+pub(crate) const COMPRESSION_SUFFIXES: &[&str] = &[".gz", ".xz", ".bz2", ".zst", ".lz4", ".lzma"];
+
+/// How long a creation and the unlink of the file it replaced may be apart and still
+/// count as one write-new-then-unlink (#512 part B). Generous on purpose: an encryptor
+/// creates `f.locked` at the start of a file and unlinks `f` only once the whole
+/// content is written, which for a large file is seconds, not milliseconds.
+pub(crate) const CREATE_UNLINK_PAIR_WINDOW_NS: u64 = 60_000_000_000; // 60s
+
+/// Creations and unmatched unlinks remembered per pid for that pairing. The open and
+/// delete ring buffers are drained independently, so a whole burst of one kind can be
+/// processed before the other (live, #512: 30 unlinks first, then 30 creations): the
+/// history must hold more than [`RANSOMWARE_RENAME_THRESHOLD`] entries or the burst can
+/// never be paired up to the threshold. 64 leaves headroom for a batch of about three
+/// times the threshold.
+pub(crate) const CREATE_UNLINK_HISTORY_PER_PID: usize = 64;
+
+/// Pids tracked for that pairing. A dedicated, smaller bound than the pid tables: each
+/// entry holds up to [`CREATE_UNLINK_HISTORY_PER_PID`] path strings, so the worst case
+/// (`cap x per-pid x path`, two maps) stays around ten MB rather than the ~200 MB the
+/// 65k-pid tables would allow.
+pub(crate) const CREATE_UNLINK_PID_CAP: usize = 1_024;
 
 /// Pairing window for one scheduled-task registration seen on both Security 4698
 /// and TaskScheduler/Operational 106 (#422, T1053.005). The two are normalized by

@@ -37,6 +37,7 @@ pub(crate) fn wire_run_pipeline(
     events: &std::path::Path,
     server: Option<&str>,
     ipc_endpoint: &str,
+    content_dir: &std::path::Path,
 ) -> anyhow::Result<RunPipeline> {
     // Transport first: the sink needs the spool handle at construction.
     let transport = server
@@ -44,7 +45,13 @@ pub(crate) fn wire_run_pipeline(
         .transpose()?;
     let spool = transport.as_ref().map(|t| Arc::clone(&t.spool));
 
-    let sink = Arc::new(DetectionSink::new(rule_state, alerts, events, spool)?);
+    let sink = Arc::new(DetectionSink::new(
+        rule_state,
+        alerts,
+        events,
+        spool,
+        content_dir,
+    )?);
 
     eprintln!("Synthaea agent — detection active (Ctrl-C to stop)");
     eprintln!(
@@ -71,7 +78,11 @@ pub(crate) fn wire_run_pipeline(
     let sensor_health: SensorHealthSlot = Arc::new(std::sync::OnceLock::new());
     crate::ipc_handler::spawn(
         ipc_endpoint.to_string(),
-        AgentHandler::new(sink.alert_log(), Arc::clone(&sensor_health)),
+        AgentHandler::new(
+            sink.alert_log(),
+            Arc::clone(&sensor_health),
+            Arc::clone(&sink),
+        ),
     );
 
     Ok(RunPipeline {

@@ -113,9 +113,63 @@ impl TransportConfig {
         format!("{}{}", self.server_url, self.heartbeat_endpoint)
     }
 
+    /// Returns the full URL for the content manifest endpoint for `ring`
+    /// (ADR-0016 §3, issue #30/#73).
+    #[must_use]
+    pub fn content_manifest_url(&self, ring: &str) -> String {
+        format!("{}/api/content/manifest/{ring}", self.server_url)
+    }
+
+    /// Returns the base URL for the content artifact download endpoint
+    /// (ADR-0016 §3, issue #30/#73's download/apply slice). `path` and
+    /// `sha256` are query parameters a caller adds via
+    /// [`crate::TransportClient::get_bytes`], not baked in here — that's
+    /// where percent-encoding of the (attacker-influenced-until-verified)
+    /// `path` value actually happens.
+    #[must_use]
+    pub fn content_artifact_url(&self) -> String {
+        format!("{}/api/content/artifact", self.server_url)
+    }
+
+    /// Returns the full URL for the signed binary-release manifest endpoint
+    /// (ADR-0015, issue #30's update trigger). Unlike the content manifest it
+    /// carries no ring in the path: which release an agent is offered is the
+    /// server's call, made from the agent's mTLS identity.
+    #[must_use]
+    pub fn release_manifest_url(&self) -> String {
+        format!("{}/api/release/manifest", self.server_url)
+    }
+
+    /// Returns the base URL for the release artifact download endpoint. The
+    /// `release_version`, `path` and `sha256` query parameters are added by the
+    /// caller through [`crate::TransportClient::get_bytes`], which percent-encodes
+    /// them (`path` is attacker-influenced until the signature is verified).
+    #[must_use]
+    pub fn release_artifact_url(&self) -> String {
+        format!("{}/api/release/artifact", self.server_url)
+    }
+
     /// Returns true if mTLS client certificates are configured.
     #[must_use]
     pub fn has_client_cert(&self) -> bool {
         self.client_cert_path.is_some() && self.client_key_path.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_urls_hang_off_the_server_url_and_carry_no_ring() {
+        let config = TransportConfig::new("https://edr.example.com");
+        assert_eq!(
+            config.release_manifest_url(),
+            "https://edr.example.com/api/release/manifest"
+        );
+        assert_eq!(
+            config.release_artifact_url(),
+            "https://edr.example.com/api/release/artifact"
+        );
     }
 }

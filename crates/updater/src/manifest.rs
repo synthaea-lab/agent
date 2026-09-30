@@ -106,6 +106,32 @@ impl ReleaseManifest {
             .map_err(|_| UpdaterError::SignatureInvalid)
     }
 
+    /// Rejects the whole manifest if any entry's path could escape the release
+    /// directory: not valid UTF-8, empty, absolute, containing a backslash or NUL,
+    /// or with a segment that is empty, `.`, `..`, contains `:`, ends in `.`/space
+    /// or is a Windows device name (the same per-segment rule content paths use).
+    /// A valid signature only proves who signed the manifest, not that every path
+    /// is safe to write, so this runs once before anything is downloaded.
+    ///
+    /// # Errors
+    ///
+    /// [`UpdaterError::UnsafeReleasePath`] naming the first offending entry.
+    pub fn validate_entry_paths(&self) -> Result<(), UpdaterError> {
+        for path in self.entries.keys() {
+            let safe = path.to_str().is_some_and(|p| {
+                !p.is_empty()
+                    && !p.starts_with('/')
+                    && !p.contains('\\')
+                    && !p.contains('\0')
+                    && p.split('/').all(crate::content::is_safe_path_segment)
+            });
+            if !safe {
+                return Err(UpdaterError::UnsafeReleasePath(path.display().to_string()));
+            }
+        }
+        Ok(())
+    }
+
     /// Anti-rollback-attack check (ADR-0015 Decision 2): rejects a manifest whose
     /// `release_version` is not strictly greater than `current` — `None` means no
     /// release is installed yet (day 0, still on `bootstrap`; ADR-0015 Decision 7),
@@ -138,6 +164,44 @@ mod tests {
         let mut m = ReleaseManifest::new(release_version, entries);
         m.sign(&test_key_pair());
         m
+    }
+
+    #[test]
+    fn entry_paths_that_could_escape_the_release_directory_are_rejected() {
+        for bad in [
+            "../evil",
+            "a/../../evil",
+            "/etc/cron.d/x",
+            "C:evil",
+            "a\\b",
+            "",
+            "agent:stream",
+            "nul",
+        ] {
+            let mut entries = BTreeMap::new();
+            entries.insert(PathBuf::from(bad), "a".repeat(64));
+            let m = ReleaseManifest::new(1, entries);
+            assert!(
+                matches!(
+                    m.validate_entry_paths(),
+                    Err(UpdaterError::UnsafeReleasePath(_))
+                ),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_release_entry_paths_are_accepted() {
+        let mut entries = BTreeMap::new();
+        for ok in ["agent", "watchdog", "cli", "lib/libort.so.1"] {
+            entries.insert(PathBuf::from(ok), "a".repeat(64));
+        }
+        assert!(
+            ReleaseManifest::new(1, entries)
+                .validate_entry_paths()
+                .is_ok()
+        );
     }
 
     #[test]

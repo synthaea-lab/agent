@@ -1,13 +1,17 @@
 //! Stateless rules: a single event is enough to decide — no history, no state.
 
 use schema::{
-    ExecEvent, FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT,
+    ConnectEvent, ExecEvent, FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT,
     FLAG_PERSISTENCE_BTM_ARTIFACT, FLAG_PERSISTENCE_SYSTEMD_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FLAG_PERSISTENCE_TASK_ARTIFACT,
     FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent,
 };
 
-use crate::{Alert, has_write_intent};
+use crate::{
+    Alert,
+    exclusions::{SERVICE_COMM_PREFIXES, SERVICE_COMMS},
+    has_write_intent,
+};
 
 /// T1059.004 — Command and Scripting Interpreter: Unix Shell, sub-case base64-encoded
 /// command. Deliberately simple heuristic (`base64` substrings + a decode flag): no
@@ -79,24 +83,36 @@ pub(crate) fn check_encoded_powershell(event: &ExecEvent) -> Option<Alert> {
     }
 }
 
-/// T1037.004 (Boot or Logon Initialization Scripts) / T1053.003 (Cron) — write to a
-/// known persistence path. List deliberately restricted to the threat-model examples,
-/// not exhaustive coverage of Linux persistence mechanisms. Per-platform path sets are
-/// follow-up scope (Windows persistence arrives with registry telemetry, M3).
-const PERSISTENCE_PATH_PATTERNS: &[&str] = &[
-    ".bashrc",
-    "/etc/profile.d/",
-    "/etc/cron.d/",
-    "/etc/systemd/system/",
+/// Each persistence location maps to its own ATT&CK technique. The first cut
+/// tagged every path `T1037.004/T1053.003`, but none of them is an RC script
+/// (T1037.004), and only the cron path is T1053.003 (#495).
+const UNIX_SHELL_CONFIG_MODIFICATION: &str = "T1546.004";
+const CRON: &str = "T1053.003";
+const SYSTEMD_SERVICE: &str = "T1543.002";
+/// The paths added with the macOS sensor (#32) keep the original tag until their
+/// mapping is confirmed on that side (#495).
+const MACOS_PATHS_PENDING_REVIEW: &str = "T1037.004/T1053.003";
+
+/// Write-intent opens on known persistence paths, each with its technique. List
+/// deliberately restricted to the threat-model examples, not exhaustive coverage of
+/// Linux persistence mechanisms. Per-platform path sets are follow-up scope (Windows
+/// persistence arrives with registry telemetry, M3).
+const PERSISTENCE_PATH_PATTERNS: &[(&str, &str)] = &[
+    (UNIX_SHELL_CONFIG_MODIFICATION, ".bashrc"),
+    // zsh config is the same technique as bash's, and zsh runs on Linux as much as
+    // on macOS: this entry is not platform-gated (#499 review).
+    (UNIX_SHELL_CONFIG_MODIFICATION, ".zshrc"),
+    (UNIX_SHELL_CONFIG_MODIFICATION, "/etc/profile.d/"),
+    (CRON, "/etc/cron.d/"),
+    (SYSTEMD_SERVICE, "/etc/systemd/system/"),
     // macOS (issue #32): substring match deliberately catches the per-user
     // (`~/Library/...`) and system (`/Library/...`) launchd directories alike.
-    "/Library/LaunchAgents/",
-    "/Library/LaunchDaemons/",
-    ".zshrc",
-    "/etc/periodic/",
+    (MACOS_PATHS_PENDING_REVIEW, "/Library/LaunchAgents/"),
+    (MACOS_PATHS_PENDING_REVIEW, "/Library/LaunchDaemons/"),
+    (MACOS_PATHS_PENDING_REVIEW, "/etc/periodic/"),
     // at(1) jobs — rare on modern macOS, which is exactly why a write there
     // is signal.
-    "/var/at/tabs/",
+    (MACOS_PATHS_PENDING_REVIEW, "/var/at/tabs/"),
 ];
 
 /// A path captured by the `open` collector can be relative to an unresolved `dfd`
@@ -105,16 +121,16 @@ const PERSISTENCE_PATH_PATTERNS: &[&str] = &[
 #[must_use]
 pub(crate) fn check_persistence_write(event: &FileOpenEvent) -> Option<Alert> {
     let path = &event.path;
-    let matched_pattern = PERSISTENCE_PATH_PATTERNS
+    let &(technique, matched_pattern) = PERSISTENCE_PATH_PATTERNS
         .iter()
-        .find(|pattern| path.contains(*pattern))?;
+        .find(|(_, pattern)| path.contains(*pattern))?;
 
     if !has_write_intent(event.flags) {
         return None;
     }
 
     Some(Alert {
-        technique: "T1037.004/T1053.003",
+        technique,
         message: format!(
             "pid={} comm={}: write to a known persistence path ({matched_pattern}): {path}",
             event.meta.pid, event.meta.comm,
@@ -122,7 +138,9 @@ pub(crate) fn check_persistence_write(event: &FileOpenEvent) -> Option<Alert> {
     })
 }
 
-/// Evaluates all stateless rules applicable to an `ExecEvent`.
+/// Evaluates all stateless rules applicable to an `ExecEvent`. T1620 memfd-exec
+/// (`RuleState::check_memfd_exec`) is not among them: it now needs
+/// `MemfdCreateEvent` correlation state, see that method's doc (#497).
 #[must_use]
 pub fn evaluate_exec(event: &ExecEvent) -> Vec<Alert> {
     check_base64_decode(event)
@@ -131,64 +149,7 @@ pub fn evaluate_exec(event: &ExecEvent) -> Vec<Alert> {
         .chain(check_masquerading(event))
         .chain(check_recovery_inhibit(event))
         .chain(check_log_clear_exec(event))
-        .chain(check_memfd_exec(event))
         .collect()
-}
-
-/// T1620 — Reflective Code Loading: executing a payload that never touches disk via
-/// `memfd_create(2)` + `execveat(fd, "", ..., AT_EMPTY_PATH)` (issue #85's Linux
-/// scope; `schema::MemfdCreateEvent`, #265, is the creation-time telemetry — this
-/// check does not correlate to it, see below).
-///
-/// `ExecEvent::image_path` is `bprm->filename` at the kernel's `sched_process_exec`
-/// tracepoint (`crates/sensors/linux/ebpf`, #111) — **not** `/proc/<pid>/exe`.
-/// Traced against a live kernel (Alpine 6.18.50, #85 review) with a memfd copy of
-/// `/bin/true`:
-/// - `execveat(fd, "", AT_EMPTY_PATH)` (the memfd-exec primitive): `bprm->filename`
-///   is `/dev/fd/<n>`, and the kernel names the task after the memfd dentry, so
-///   `comm` starts with `memfd:`.
-/// - `execv` via `/proc/self/fd/<n>`: `bprm->filename` is `/proc/self/fd/<n>` (or
-///   `/proc/<pid>/fd/<n>`); `comm` is whatever the caller set.
-///
-/// Neither shape ever produces `/memfd:<name> (deleted)` — that string is only what
-/// `readlink /proc/<pid>/exe` shows, which the sensor doesn't read. An earlier
-/// version of this check matched on that string and never fired on real telemetry.
-///
-/// Correlating to `MemfdCreateEvent` instead of matching the exec shape directly was
-/// considered and rejected: `memfd_create` alone is common in legitimate code
-/// (glibc, systemd, browser sandboxing) — the *exec* is the technique, not the
-/// creation, so creation-only telemetry stays undispatched rather than becoming a
-/// noisy signal on its own.
-#[must_use]
-pub(crate) fn check_memfd_exec(event: &ExecEvent) -> Option<Alert> {
-    if !event.meta.comm.starts_with("memfd:") && !is_fd_exec_path(&event.image_path) {
-        return None;
-    }
-    Some(Alert {
-        technique: "T1620",
-        message: format!(
-            "pid={} comm={}: executed from a file descriptor ({}), not a real path — \
-             no payload ever touched disk",
-            event.meta.pid, event.meta.comm, event.image_path,
-        ),
-    })
-}
-
-/// Matches `/dev/fd/<n>` or `/proc/(self|<pid>)/fd/<n>` — exec via a file
-/// descriptor (`fexecve`/`execveat` with `AT_EMPTY_PATH`, or exec via
-/// `/proc/self/fd`) rather than a real on-disk path.
-fn is_fd_exec_path(path: &str) -> bool {
-    let is_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    if let Some(fd) = path.strip_prefix("/dev/fd/") {
-        return is_digits(fd);
-    }
-    let Some(rest) = path.strip_prefix("/proc/") else {
-        return false;
-    };
-    let Some((pid_or_self, fd)) = rest.split_once("/fd/") else {
-        return false;
-    };
-    (pid_or_self == "self" || is_digits(pid_or_self)) && is_digits(fd)
 }
 
 /// T1611 — Escape to Host: a containerized process opening `/proc/<pid>/root` reaches
@@ -478,10 +439,87 @@ pub(crate) fn check_btm_launch_item_persistence(event: &FileOpenEvent) -> Option
     })
 }
 
+/// `mysqld`/`mariadbd`, exact-`comm` match — deliberately narrower than
+/// [`SERVICE_COMMS`] (T1059's broader web+DB list): [`check_service_write_outside_datadir`]
+/// is MySQL/MariaDB-specific (issue #478's own wording), not a generic
+/// "service wrote somewhere odd" rule.
+const MYSQL_SERVICE_COMMS: &[&str] = &["mysqld", "mariadbd"];
+
+/// Paths `mysqld`/`mariadbd` legitimately write under (T1190, issue #478): the
+/// data directory, the log directory (package name varies: Debian ships
+/// `mariadb-server` but keeps the `/var/log/mysql/` path for compatibility,
+/// RHEL uses `/var/log/mariadb/`), the runtime socket/pid directory, and the
+/// system temp directory — `mysqld`'s own `tmpdir` setting defaults to
+/// `/tmp`, used for on-disk temp tables and sorts, a routine, high-volume
+/// write path that would otherwise swamp the rule in false positives.
+const MYSQL_WRITE_PATH_PREFIXES: &[&str] = &[
+    "/var/lib/mysql/",
+    "/var/lib/mariadb/",
+    "/var/log/mysql/",
+    "/var/log/mariadb/",
+    "/run/mysqld/",
+    "/var/run/mysqld/",
+    "/tmp/",
+];
+
+/// T1190 — Exploit Public-Facing Application: `mysqld`/`mariadbd` writing a
+/// file outside its normal footprint (issue #478, Level 1). A write anywhere
+/// but [`MYSQL_WRITE_PATH_PREFIXES`] is the signature this rule targets:
+/// `SELECT ... INTO OUTFILE` (SQL injection dropping a webshell under the web
+/// root) or a malicious UDF `.so` planted outside the plugin directory —
+/// MySQL/MariaDB has no legitimate reason to write anywhere else, which is
+/// exactly why this is a "very low noise" signal per the issue's own framing.
+///
+/// Two properties learned from the live run on real `mariadbd` (#498 review),
+/// both invisible to hand-written unit-test events:
+/// - **The process name comes from the pid, not from `event.meta.comm`.** `comm`
+///   is the *thread's* name: `SELECT ... INTO OUTFILE` runs on a connection
+///   thread named `one_connection`, so a `comm` match never sees the attack.
+///   `resolve_comm` is asked for the pid's own name (lazily — only once the path
+///   and flags already say "candidate", so the common open never pays for a
+///   `/proc` read) and is `RuleState`'s exec table, then `/proc/<pid>/comm`.
+///   The sensor's `pid` is the tgid.
+/// - **Only absolute paths alert.** The collector reports the raw `openat`
+///   argument: startup opens `./ibdata1`, `plugin.MAI`, `#binlog_cache_files/`
+///   (relative or dirfd-relative) and `/tmp` itself (`O_TMPFILE`, no trailing
+///   slash), which no absolute-prefix allowlist can match — 284 false positives
+///   on a bare start. A webshell drop needs an absolute path to reach the web
+///   root, so skipping relative paths loses no attack shape.
+#[must_use]
+pub(crate) fn check_service_write_outside_datadir(
+    event: &FileOpenEvent,
+    resolve_comm: impl FnOnce(u32) -> Option<String>,
+) -> Option<Alert> {
+    let path = &event.path;
+    if !has_write_intent(event.flags)
+        || !path.starts_with('/')
+        || path == "/tmp"
+        || MYSQL_WRITE_PATH_PREFIXES
+            .iter()
+            .any(|p| path.starts_with(p))
+    {
+        return None;
+    }
+    let comm = resolve_comm(event.meta.pid)?;
+    if !MYSQL_SERVICE_COMMS.contains(&comm.as_str()) {
+        return None;
+    }
+    Some(Alert {
+        technique: "T1190",
+        message: format!(
+            "pid={} comm={comm}: wrote outside its data/log/temp directories: {path} — \
+             signature of SQL injection (SELECT ... INTO OUTFILE) or a malicious UDF",
+            event.meta.pid,
+        ),
+    })
+}
+
 /// Evaluates all stateless rules applicable to a `FileOpenEvent`. T1053.005
 /// creation ([`check_scheduled_task_persistence`]) is not among them: one
 /// registration arrives twice (4698 and 106), so `RuleState::on_file_open`
-/// reports it, deduplicated (#422).
+/// reports it, deduplicated (#422). Neither is T1190
+/// ([`check_service_write_outside_datadir`]): it needs the pid's process name,
+/// which only `RuleState` can resolve (#498 review).
 #[must_use]
 pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
     check_persistence_write(event)
@@ -786,4 +824,68 @@ pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Opti
 #[must_use]
 pub fn evaluate_signal(event: &schema::SignalEvent) -> Vec<Alert> {
     check_security_process_signal(event).into_iter().collect()
+}
+
+/// Outbound ports [`check_service_unusual_outbound`] (T1071, issue #478)
+/// treats as routine for a web/DB service process, so only a connection to
+/// something else fires. Deliberately its own list, not
+/// [`crate::exclusions::STANDARD_PORTS`] (a different rule — BEACON — a
+/// different process population, calibrated separately): 80/443/8080/8443/
+/// 8000 cover a web app calling out to an HTTP(S) API or self-update
+/// endpoint, the rest are the backend services these processes routinely
+/// dial out to on a multi-tier deployment — MySQL/MariaDB (3306), `PostgreSQL`
+/// (5432), Redis (6379), Memcached (11211), Elasticsearch (9200), `MongoDB`
+/// (27017). Without these, an ordinary php-fpm-to-Redis-on-a-different-host
+/// connection would fire this rule — uncalibrated against fleet traffic
+/// otherwise (first cut, 2026-09-28).
+const SERVICE_OUTBOUND_STANDARD_PORTS: &[u16] = &[
+    80, 443, 8080, 8443, 8000, 3306, 5432, 6379, 11211, 9200, 27017,
+];
+
+/// T1071 — Application Layer Protocol: a web or database service process
+/// connecting outbound to a port outside its routine set (issue #478, Level
+/// 1). Unlike `RuleState::check_beacon` (repeated connections, a threshold +
+/// window), this fires on a *single* connection: these specific service
+/// accounts have such a narrow legitimate outbound footprint that even one
+/// connection outside it is a strong post-exploitation signal — a reverse
+/// shell after a web exploit, or (per the issue) `mysqld`/`mariadbd`, which
+/// almost never have a legitimate reason to connect out at all.
+///
+/// Loopback destinations are excluded outright: a web app dialing a
+/// same-host backend (Redis, a local API, Postgres over a Unix-mapped TCP
+/// port) is the overwhelming majority of "unusual port from these
+/// processes" traffic in practice, and a real exfil/C2 destination is never
+/// loopback — it has to leave the host to be useful to an attacker.
+#[must_use]
+pub(crate) fn check_service_unusual_outbound(event: &ConnectEvent) -> Option<Alert> {
+    let comm = event.meta.comm.as_str();
+    let is_service =
+        SERVICE_COMMS.contains(&comm) || SERVICE_COMM_PREFIXES.iter().any(|p| comm.starts_with(p));
+    if !is_service {
+        return None;
+    }
+    // Unspecified (`0.0.0.0` / `::`) is not a destination either: postgres's
+    // startup `connect()` to `0.0.0.0:65535` / `:::65535` (its stats-collector
+    // self-probe) fired this on a bare start (#498 review). On Linux it means
+    // "this host", same as loopback.
+    if event.daddr.is_loopback()
+        || event.daddr.is_unspecified()
+        || SERVICE_OUTBOUND_STANDARD_PORTS.contains(&event.dport)
+    {
+        return None;
+    }
+    Some(Alert {
+        technique: "T1071",
+        message: format!(
+            "pid={} comm={comm}: outbound connection to {}:{} — port outside this service's \
+             routine set, possible reverse shell after exploitation",
+            event.meta.pid, event.daddr, event.dport,
+        ),
+    })
+}
+
+/// Evaluates all stateless rules applicable to a `ConnectEvent`.
+#[must_use]
+pub fn evaluate_connect(event: &ConnectEvent) -> Vec<Alert> {
+    check_service_unusual_outbound(event).into_iter().collect()
 }

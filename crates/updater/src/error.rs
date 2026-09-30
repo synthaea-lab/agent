@@ -24,10 +24,31 @@ pub enum UpdaterError {
     #[error("release {offered} is not newer than the installed release {current}")]
     ReleaseNotNewer { offered: u64, current: u64 },
 
+    /// A content manifest's `ring` does not match the ring the caller actually
+    /// requested. A valid signature only proves "we signed this manifest", not
+    /// "this is the manifest for the ring you asked for" — without this check a
+    /// correctly-signed manifest for a different (e.g. less-vetted canary) ring
+    /// would still verify and be accepted.
+    #[error("manifest is for ring `{found}`, expected `{requested}`")]
+    RingMismatch { requested: String, found: String },
+
     /// `release_version` is on the local ban list — a previous install of this
     /// exact release failed its health check (ADR-0015 Decision 6).
     #[error("release {0} is banned on this install (failed a previous health check)")]
     ReleaseBanned(u64),
+
+    /// A content manifest entry's `path` would escape a local content root —
+    /// contains a `..` component, is absolute, or uses a backslash. A valid
+    /// signature only proves who signed the manifest, not that every entry's
+    /// path is safe to write; checked before any download starts, not at
+    /// write time (PR #509 review).
+    #[error("content entry path `{0}` is not a safe relative path")]
+    UnsafeContentPath(String),
+
+    /// A release manifest entry's path would escape the release directory (same
+    /// rules as [`Self::UnsafeContentPath`]): checked before any download starts.
+    #[error("release entry path `{0}` is not a safe relative path")]
+    UnsafeReleasePath(String),
 
     /// A file the manifest lists is missing from the staged release directory.
     #[error("staged release is missing manifest entry `{path}`")]

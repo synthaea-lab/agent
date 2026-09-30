@@ -63,6 +63,14 @@ impl<K: Eq + Hash + Clone, V> BoundedMap<K, V> {
         self.entries.get(key).map(|(v, _)| v)
     }
 
+    /// Removes and returns `key`'s value, if present — for a one-shot piece
+    /// of pending state a caller consumes once matched (e.g. an exec held
+    /// awaiting out-of-order corroborating evidence), so a stale entry can't
+    /// be matched a second time.
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        self.entries.remove(key).map(|(v, _)| v)
+    }
+
     /// # Panics
     ///
     /// The internal `expect` is unreachable: the entry was just inserted or
@@ -169,5 +177,14 @@ mod tests {
         *map.get_or_insert_with("a", || 0) += 1;
         *map.get_or_insert_with("a", || 0) += 1;
         assert_eq!(map.peek(&"a"), Some(&2));
+    }
+
+    #[test]
+    fn remove_takes_the_entry_out() {
+        let mut map = BoundedMap::new(4);
+        map.insert("a", 1);
+        assert_eq!(map.remove(&"a"), Some(1));
+        assert_eq!(map.peek(&"a"), None);
+        assert_eq!(map.remove(&"a"), None, "already removed");
     }
 }

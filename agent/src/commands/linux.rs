@@ -215,6 +215,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         enable_dns_capture,
         server,
         ipc_endpoint,
+        content_dir,
     } = opts;
     // Kill-loudness (#71): must run before any other thread exists — the signal mask
     // set here is inherited by every thread spawned below, including `DetectionSink`'s
@@ -227,6 +228,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         events,
         server,
         ipc_endpoint,
+        content_dir,
     )?;
     let sink = pipeline.sink;
 

@@ -98,6 +98,7 @@ pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
         "sys_enter_delete_module",
     ),
     ("sys_enter_bpf", "syscalls", "sys_enter_bpf"),
+    ("sys_enter_prctl", "syscalls", "sys_enter_prctl"),
     ("sys_enter_ptrace", "syscalls", "sys_enter_ptrace"),
     (
         "sys_enter_process_vm_readv",
@@ -114,6 +115,8 @@ pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
         "syscalls",
         "sys_enter_memfd_create",
     ),
+    // Pairs with the enter probe above: the returned fd only exists here (#510).
+    ("sys_exit_memfd_create", "syscalls", "sys_exit_memfd_create"),
     ("sys_enter_setuid", "syscalls", "sys_enter_setuid"),
     ("sys_enter_setgid", "syscalls", "sys_enter_setgid"),
     ("sys_enter_setresuid", "syscalls", "sys_enter_setresuid"),

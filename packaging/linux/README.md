@@ -26,7 +26,10 @@ This separation ensures that package managers (apt/dnf) and the updater never co
 ├── current -> bootstrap    # Symlink (updater-managed, initially points to bootstrap)
 ├── versions/           # Updater-managed version directories, named by the signed
 │   ├── v1/             # manifest's monotone release_version (ADR-0015), not semver
-│   └── v2/
+│   ├── v2/             # a `.healthy` file appears here once the release's agent has
+│   │                   # shown progress after promotion (watchdog probation, #30)
+│   └── .stage-3/       # a release being downloaded (`agent apply-release`); renamed to
+│                       # v3 only once complete, so a crash never leaves a partial vN
 └── banned_versions.json  # Release versions that failed a health check on this
                            # install and are refused even if offered again (ADR-0015
                            # Decision 6). Bare JSON array, unsigned — created on the
@@ -220,19 +223,35 @@ sudo systemd-sysusers /usr/lib/sysusers.d/synthaea.conf
 
 ### SELinux Denials (RHEL/Fedora)
 
-**Check for denials:**
+The binaries live under `/var/lib/synthaea`, whose default type is `var_lib_t`,
+and `init_t` may not execute that type: an unlabelled install dies with
+`status=203/EXEC`, `Permission denied`. The RPM's `%post` therefore adds file-context
+rules that label the binaries `bin_t` (`semanage fcontext`, then `restorecon`); the
+service then runs as `unconfined_service_t`. A custom policy is still deferred (#112).
+
+**Check for denials.** `ausearch` reads `/var/log/audit/audit.log`, which does not
+exist unless `auditd` runs (it does not on a default Fedora cloud image), so it
+answers "no matches" whatever happened. Read the journal instead:
 ```bash
-sudo ausearch -m avc -ts recent | grep synthaea
+sudo journalctl _TRANSPORT=audit | grep AVC | grep synthaea
 ```
+
+**Check the labels:**
+```bash
+ls -Z /var/lib/synthaea/bootstrap        # expect bin_t
+sudo semanage fcontext -l | grep synthaea
+```
+
+**Repair after a manual copy:**
+```bash
+sudo restorecon -R /var/lib/synthaea /var/log/synthaea
+```
+Files written by the updater into `versions/vN/` inherit `var_lib_t` from the
+directory and need a `restorecon` before they can be executed on an Enforcing host.
 
 **Temporary workaround (testing only):**
 ```bash
 sudo setenforce 0  # Permissive mode
-```
-
-**Permanent fix:**
-```bash
-sudo restorecon -R /var/lib/synthaea /var/log/synthaea
 ```
 
 ---

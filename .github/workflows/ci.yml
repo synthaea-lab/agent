@@ -42,6 +42,8 @@ jobs:
           cargo +nightly fmt --all --check
       - name: dependency direction
         run: python3 tools/check-deps.py
+      - name: attack coverage matrix up to date
+        run: python3 tools/attack-coverage.py --check
       - name: PowerShell scripts ASCII-only
         run: python3 tools/check-ps1-ascii.py
       - name: docs build clean
@@ -82,6 +84,25 @@ jobs:
         run: cargo clippy --workspace --exclude sensor-linux-ebpf --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace --exclude sensor-linux-ebpf
+      # The ipc end-to-end test needs root / an elevated process to pass peer-auth, and
+      # skips itself otherwise: `cargo test` hides that message, so the step above
+      # reports `ok` on the unprivileged ubuntu/macos runners without ever running the
+      # happy path (#483). Build as the runner user (a root-owned target/ would break
+      # the cache save), run only the test binary under sudo, and make a skip fatal.
+      - name: ipc e2e, privileged (Unix)
+        if: runner.os != 'Windows'
+        env:
+          SYNTHAEA_REQUIRE_PRIVILEGED_TESTS: "1"
+        run: |
+          exe="$(cargo test -p ipc --test e2e --no-run --message-format=json             | jq -r 'select(.profile.test == true and .target.name == "e2e") | .executable'             | tail -n 1)"
+          test -x "$exe"
+          sudo -E "$exe"
+      # The Windows runner is already elevated: just make a skip fatal.
+      - name: ipc e2e, elevated (Windows)
+        if: runner.os == 'Windows'
+        env:
+          SYNTHAEA_REQUIRE_PRIVILEGED_TESTS: "1"
+        run: cargo test -p ipc --test e2e
 
   # Linux with the eBPF probes embedded, the configuration we actually ship.
   # The `test` runner has no bpf-linker, so there build.rs skips the probes: the

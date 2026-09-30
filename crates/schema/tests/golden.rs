@@ -15,10 +15,11 @@ use schema::{
     FileWriteEvent, GatekeeperVerdictEvent, IdentityChangeEvent, IdentityChangeKind,
     ImageLoadEvent, KernelModuleAction, KernelModuleEvent, ListenPortEvent, MemfdCreateEvent,
     MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, POLICY_MECHANISM_SELINUX,
-    PolicyDenialEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent,
-    RegistrySetEvent, ScriptBlockEvent, ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent,
-    SocketBindEvent, SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection,
-    TlsLibraryType, UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
+    PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
+    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType, SignalEvent,
+    SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TccDecisionEvent,
+    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
+    XpcConnectEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -177,6 +178,7 @@ fn detection_ml_golden() {
             model_version: "2026.09.0".into(),
         },
         score: Some(0.91),
+        techniques: Vec::new(),
         attributions: vec![
             ScoreAttribution {
                 feature: "entropy".into(),
@@ -213,6 +215,120 @@ fn detection_ml_golden() {
     };
     let serialized = serde_json::to_value(&detection).unwrap();
     assert_eq!(serialized, fixture("detection_ml"), "fixture mismatch");
+    let back: Detection = serde_json::from_value(serialized).unwrap();
+    assert_eq!(back, detection, "round trip mismatch");
+}
+
+/// Minimal exec event shared by the four engine-source golden tests below — same
+/// triggering activity, different engine verdict on it.
+fn sample_exec_event() -> Event {
+    Event::Exec(ExecEvent {
+        meta: EventMeta {
+            pid: 4242,
+            ppid: 1337,
+            user: User::Unix {
+                uid: 1000,
+                gid: 1000,
+            },
+            timestamp_ns: 1_756_900_004_123_456_789,
+            comm: "bash".into(),
+            container: None,
+        },
+        image_path: "/bin/bash".into(),
+        cmdline: "bash -c echo cGF5bG9hZAo= | base64 -d | sh".into(),
+        argv: ["bash", "-c", "echo cGF5bG9hZAo= | base64 -d | sh"]
+            .map(String::from)
+            .into(),
+        parent_comm: Some("sshd".into()),
+        parent_image_path: None,
+        sha256: None,
+        signature: None,
+        env_security: Vec::new(),
+    })
+}
+
+/// Issue #74: every engine populates `Detection.techniques` as structured data, not
+/// just a string embedded in a title/message.
+#[test]
+fn detection_rule_golden() {
+    let detection = Detection {
+        timestamp_ns: 1_756_900_005_000_000_000,
+        severity: Severity::High,
+        title: "Base64-encoded command piped to a shell".into(),
+        source: DetectionSource::Rule {
+            rule_id: "base64_pipe_shell".into(),
+        },
+        score: None,
+        techniques: vec!["T1027".into(), "T1059.004".into()],
+        attributions: Vec::new(),
+        events: vec![sample_exec_event()],
+    };
+    let serialized = serde_json::to_value(&detection).unwrap();
+    assert_eq!(serialized, fixture("detection_rule"), "fixture mismatch");
+    let back: Detection = serde_json::from_value(serialized).unwrap();
+    assert_eq!(back, detection, "round trip mismatch");
+}
+
+#[test]
+fn detection_sigma_golden() {
+    let detection = Detection {
+        timestamp_ns: 1_756_900_005_000_000_000,
+        severity: Severity::High,
+        title: "Base64-encoded command piped to a shell".into(),
+        source: DetectionSource::Sigma {
+            rule_id: "Base64-encoded command piped to a shell".into(),
+        },
+        score: None,
+        techniques: vec!["T1027".into(), "T1059.004".into()],
+        attributions: Vec::new(),
+        events: vec![sample_exec_event()],
+    };
+    let serialized = serde_json::to_value(&detection).unwrap();
+    assert_eq!(serialized, fixture("detection_sigma"), "fixture mismatch");
+    let back: Detection = serde_json::from_value(serialized).unwrap();
+    assert_eq!(back, detection, "round trip mismatch");
+}
+
+#[test]
+fn detection_yara_golden() {
+    let detection = Detection {
+        timestamp_ns: 1_756_900_005_000_000_000,
+        severity: Severity::Low,
+        title: "synthaea_lab_payload".into(),
+        source: DetectionSource::Yara {
+            rule_name: "synthaea_lab_payload".into(),
+        },
+        score: None,
+        techniques: vec!["T1105".into()],
+        attributions: Vec::new(),
+        events: vec![sample_exec_event()],
+    };
+    let serialized = serde_json::to_value(&detection).unwrap();
+    assert_eq!(serialized, fixture("detection_yara"), "fixture mismatch");
+    let back: Detection = serde_json::from_value(serialized).unwrap();
+    assert_eq!(back, detection, "round trip mismatch");
+}
+
+#[test]
+fn detection_correlator_golden() {
+    let detection = Detection {
+        timestamp_ns: 1_756_900_005_000_000_000,
+        severity: Severity::Critical,
+        title: "Encoded execution followed by outbound beacon".into(),
+        source: DetectionSource::Correlator {
+            case_id: "case-0f2a".into(),
+        },
+        score: Some(0.87),
+        techniques: vec!["T1059".into(), "T1071".into()],
+        attributions: Vec::new(),
+        events: vec![sample_exec_event()],
+    };
+    let serialized = serde_json::to_value(&detection).unwrap();
+    assert_eq!(
+        serialized,
+        fixture("detection_correlator"),
+        "fixture mismatch"
+    );
     let back: Detection = serde_json::from_value(serialized).unwrap();
     assert_eq!(back, detection, "round trip mismatch");
 }
@@ -707,6 +823,7 @@ fn file_delete_golden() {
 #[test]
 fn file_rename_golden() {
     // v15 (#262): the ransomware signal — new_path's suffix relative to old_path's.
+    // v31 (#459 part 1): executable_path, the renaming process's own exe path.
     assert_golden(
         &Event::FileRename(FileRenameEvent {
             meta: EventMeta {
@@ -722,6 +839,7 @@ fn file_rename_golden() {
             },
             old_path: "/home/user/invoice.pdf".into(),
             new_path: "/home/user/invoice.pdf.locked".into(),
+            executable_path: Some("/tmp/encryptor".into()),
         }),
         "file_rename",
     );
@@ -1042,6 +1160,7 @@ fn policy_denial_golden() {
     // reading a file labeled for a user's home directory, the classic
     // web-shell-reading-secrets shape. `action` is absent: the AVC parser
     // doesn't yet recover the requested permission set, see the type's doc.
+    // v30 (#427): `object_path` from the AVC record's `path=`/`name=`.
     assert_golden(
         &Event::PolicyDenial(PolicyDenialEvent {
             meta: EventMeta {
@@ -1058,6 +1177,7 @@ fn policy_denial_golden() {
             object_class: Some("file".into()),
             action: None,
             enforced: true,
+            object_path: Some("/home/alice/.ssh/id_rsa".into()),
         }),
         "policy_denial",
     );
@@ -1267,6 +1387,7 @@ fn memfd_create_golden() {
             },
             name: "payload".into(),
             flags: 1, // MFD_CLOEXEC
+            fd: 3,    // v32 (#510): the first free descriptor after stdio
         }),
         "memfd_create",
     );
@@ -1291,6 +1412,29 @@ fn namespace_golden() {
             flags: 0x4000_0000, // CLONE_NEWNET
         }),
         "namespace",
+    );
+}
+
+#[test]
+fn prctl_securebits_golden() {
+    // v34 (#457): PR_SET_SECUREBITS locking SECBIT_NOROOT (bit 0) and its
+    // LOCKED twin (bit 1) — the process tree can never regain root's implicit
+    // capabilities. PR_CAPBSET_DROP is the second option that reaches this
+    // stream; every other prctl option is filtered in-kernel.
+    assert_golden(
+        &Event::Prctl(PrctlEvent {
+            meta: EventMeta {
+                pid: 9010,
+                ppid: 1,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_028_000_000_000,
+                comm: "sandbox_init".into(),
+                container: None,
+            },
+            option: schema::PR_SET_SECUREBITS,
+            arg: 0b11, // SECBIT_NOROOT | SECBIT_NOROOT_LOCKED
+        }),
+        "prctl",
     );
 }
 
@@ -1508,6 +1652,7 @@ fn meta_accessor_covers_all_variants() {
             meta: meta.clone(),
             old_path: String::new(),
             new_path: String::new(),
+            executable_path: None,
         }),
         Event::SocketBind(SocketBindEvent {
             meta: meta.clone(),
@@ -1597,6 +1742,7 @@ fn meta_accessor_covers_all_variants() {
             object_class: None,
             action: None,
             enforced: false,
+            object_path: None,
         }),
         Event::KernelModule(KernelModuleEvent {
             meta: meta.clone(),
