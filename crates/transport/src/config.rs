@@ -3,9 +3,9 @@
 use std::{path::PathBuf, time::Duration};
 
 use crate::{
-    DEFAULT_BATCH_SIZE, DEFAULT_HEARTBEAT_ENDPOINT, DEFAULT_INGEST_ENDPOINT,
-    DEFAULT_MAX_DRAIN_ATTEMPTS, DEFAULT_MAX_NETWORK_DRAIN_ATTEMPTS, DEFAULT_RETRY_BASE_MS,
-    DEFAULT_RETRY_MAX_MS,
+    DEFAULT_BATCH_SIZE, DEFAULT_DETECTION_ENDPOINT, DEFAULT_HEARTBEAT_ENDPOINT,
+    DEFAULT_INGEST_ENDPOINT, DEFAULT_MAX_DRAIN_ATTEMPTS, DEFAULT_MAX_NETWORK_DRAIN_ATTEMPTS,
+    DEFAULT_RETRY_BASE_MS, DEFAULT_RETRY_MAX_MS,
 };
 
 /// Configuration for the transport layer.
@@ -25,6 +25,9 @@ pub struct TransportConfig {
 
     /// Endpoint for event ingestion.
     pub ingest_endpoint: String,
+
+    /// Endpoint for structured detection ingestion.
+    pub detection_endpoint: String,
 
     /// Endpoint for heartbeat.
     pub heartbeat_endpoint: String,
@@ -64,6 +67,7 @@ impl Default for TransportConfig {
             client_key_path: None,
             agent_id: None,
             ingest_endpoint: DEFAULT_INGEST_ENDPOINT.to_string(),
+            detection_endpoint: DEFAULT_DETECTION_ENDPOINT.to_string(),
             heartbeat_endpoint: DEFAULT_HEARTBEAT_ENDPOINT.to_string(),
             batch_size: DEFAULT_BATCH_SIZE,
             retry_base: Duration::from_millis(DEFAULT_RETRY_BASE_MS),
@@ -105,6 +109,12 @@ impl TransportConfig {
     #[must_use]
     pub fn ingest_url(&self) -> String {
         format!("{}{}", self.server_url, self.ingest_endpoint)
+    }
+
+    /// Returns the full URL for structured detection ingestion.
+    #[must_use]
+    pub fn detection_url(&self) -> String {
+        format!("{}{}", self.server_url, self.detection_endpoint)
     }
 
     /// Returns the full URL for the heartbeat endpoint.

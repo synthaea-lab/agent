@@ -56,6 +56,9 @@ pub use upload::{EventDrain, EventUploader, UploadLoop};
 /// Default server endpoint for event ingestion.
 pub const DEFAULT_INGEST_ENDPOINT: &str = "/api/v1/ingest/events";
 
+/// Default server endpoint for structured detection ingestion.
+pub const DEFAULT_DETECTION_ENDPOINT: &str = "/api/ingest/detection";
+
 /// Default server endpoint for heartbeat.
 pub const DEFAULT_HEARTBEAT_ENDPOINT: &str = "/api/v1/ingest/heartbeat";
 
