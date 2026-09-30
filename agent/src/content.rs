@@ -396,6 +396,57 @@ pub(crate) fn resolve_content_paths(
     Ok((content_dir, state_path))
 }
 
+/// Where and how to reach the control plane, after `--server`/`--cert`/`--key`
+/// have been reconciled with `agent.toml` ([`resolve_endpoint`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Endpoint {
+    pub(crate) server: String,
+    pub(crate) cert: Option<PathBuf>,
+    pub(crate) key: Option<PathBuf>,
+}
+
+/// Picks the control plane for `apply-content-manifest`. `--server` omitted
+/// means "this install's own control plane": the configured URL with the
+/// configured mTLS pair (an explicit `--cert`/`--key` still wins). `--server`
+/// given means exactly that server, with mTLS only if the flags say so — the
+/// config's client certificate is never presented to a server the operator
+/// named by hand.
+pub(crate) fn resolve_endpoint(
+    server: Option<String>,
+    cert: Option<PathBuf>,
+    key: Option<PathBuf>,
+    configured: &config::ServerConfig,
+) -> Endpoint {
+    match server {
+        Some(server) => Endpoint { server, cert, key },
+        None => Endpoint {
+            server: configured.control_plane_url.clone(),
+            cert: Some(cert.unwrap_or_else(|| configured.mtls_cert.clone())),
+            key: Some(key.unwrap_or_else(|| configured.mtls_key.clone())),
+        },
+    }
+}
+
+/// Picks the ring for `apply-content-manifest`: `--ring`, else
+/// `updates.ring`. There is no default ring — an agent that lands in `prod`
+/// by omission would bypass the canary rollout (ADR-0016).
+///
+/// # Errors
+///
+/// Returns an error when neither the flag nor the config names a ring.
+pub(crate) fn resolve_ring(
+    flag: Option<String>,
+    updates: &config::UpdatesConfig,
+) -> anyhow::Result<String> {
+    flag.or_else(|| updates.ring.clone()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no content ring: pass --ring, or set `ring` under `[updates]` in agent.toml \
+             (one of {})",
+            config::CONTENT_RINGS.join(", ")
+        )
+    })
+}
+
 /// Fetches the content manifest for `ring`, verifies it exactly like
 /// [`cmd_check_content_manifest`], and — unlike that command — actually
 /// downloads and writes every entry that's missing or stale under
@@ -508,6 +559,83 @@ fn notify_running_agent(ipc_endpoint: &str) -> Result<ipc::ReloadContentResponse
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn configured_server() -> config::ServerConfig {
+        config::ServerConfig {
+            control_plane_url: "https://cp.example".to_string(),
+            mtls_cert: PathBuf::from("/etc/synthaea/certs/client.crt"),
+            mtls_key: PathBuf::from("/etc/synthaea/certs/client.key"),
+            mtls_passphrase: config::SecretRef::Invalid(String::new()),
+            offline_fallback: true,
+        }
+    }
+
+    #[test]
+    fn omitting_server_uses_the_configured_control_plane_and_mtls_pair() {
+        let endpoint = resolve_endpoint(None, None, None, &configured_server());
+        assert_eq!(endpoint.server, "https://cp.example");
+        assert_eq!(
+            endpoint.cert.as_deref(),
+            Some(Path::new("/etc/synthaea/certs/client.crt"))
+        );
+        assert_eq!(
+            endpoint.key.as_deref(),
+            Some(Path::new("/etc/synthaea/certs/client.key"))
+        );
+    }
+
+    #[test]
+    fn an_explicit_server_never_borrows_the_configured_client_certificate() {
+        let endpoint = resolve_endpoint(
+            Some("http://127.0.0.1:3000".to_string()),
+            None,
+            None,
+            &configured_server(),
+        );
+        assert_eq!(endpoint.server, "http://127.0.0.1:3000");
+        assert_eq!(endpoint.cert, None);
+        assert_eq!(endpoint.key, None);
+    }
+
+    #[test]
+    fn an_explicit_cert_overrides_the_configured_one_but_keeps_the_configured_key() {
+        let endpoint = resolve_endpoint(
+            None,
+            Some(PathBuf::from("/tmp/other.crt")),
+            None,
+            &configured_server(),
+        );
+        assert_eq!(endpoint.cert.as_deref(), Some(Path::new("/tmp/other.crt")));
+        assert_eq!(
+            endpoint.key.as_deref(),
+            Some(Path::new("/etc/synthaea/certs/client.key"))
+        );
+    }
+
+    #[test]
+    fn the_ring_flag_wins_over_the_configured_ring() {
+        let updates = config::UpdatesConfig {
+            ring: Some("canary_1".to_string()),
+        };
+        let ring = resolve_ring(Some("prod".to_string()), &updates).unwrap();
+        assert_eq!(ring, "prod");
+    }
+
+    #[test]
+    fn the_configured_ring_applies_when_no_flag_is_given() {
+        let updates = config::UpdatesConfig {
+            ring: Some("canary_1".to_string()),
+        };
+        assert_eq!(resolve_ring(None, &updates).unwrap(), "canary_1");
+    }
+
+    #[test]
+    fn no_ring_anywhere_is_refused_rather_than_defaulted() {
+        let err = resolve_ring(None, &config::UpdatesConfig::default()).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("--ring"), "{message}");
+        assert!(message.contains("[updates]"), "{message}");
+    }
 
     /// Builds a manifest and signs it exactly the way `updater::content`'s own
     /// tests do (this crate can't call that module's private signing helper

@@ -182,6 +182,19 @@ fn validate_semantics(cfg: &AgentConfig, source_path: &Path) -> Result<(), Confi
         });
     }
 
+    // updates.ring — a typo'd ring would otherwise surface as a server-side
+    // 404 (or worse, a valid but unintended ring) at the first fetch.
+    if let Some(ring) = &cfg.updates.ring
+        && !crate::schema::CONTENT_RINGS.contains(&ring.as_str())
+    {
+        return Err(ConfigError::Invalid {
+            field: "updates.ring".into(),
+            expected: format!("one of {}", crate::schema::CONTENT_RINGS.join(", ")),
+            value: ring.clone(),
+            origin: src.clone(),
+        });
+    }
+
     // ipc.endpoint — shape check per OS. On Windows the endpoint is a named
     // pipe (`\\.\pipe\...`), everywhere else it's an absolute filesystem
     // path (Unix domain socket).
@@ -442,6 +455,35 @@ max_reconnect_backoff_ms = 60000
         assert_eq!(cfg.storage.spool_max_mb, 4096);
         assert_eq!(cfg.resources.worker_threads, 0);
         assert_eq!(cfg.resources.max_reconnect_backoff().as_secs(), 60);
+    }
+
+    #[test]
+    fn an_absent_updates_section_means_no_ring_is_assigned() {
+        let f = write_tmp(&valid_toml());
+        let cfg = load_from(f.path()).expect("valid config should load");
+        assert_eq!(cfg.updates.ring, None);
+    }
+
+    #[test]
+    fn a_configured_ring_is_loaded() {
+        let f = write_tmp(&format!(
+            "{}\n[updates]\nring = \"canary_1\"\n",
+            valid_toml()
+        ));
+        let cfg = load_from(f.path()).expect("valid config should load");
+        assert_eq!(cfg.updates.ring.as_deref(), Some("canary_1"));
+    }
+
+    #[test]
+    fn an_unknown_ring_is_refused_with_the_field_named() {
+        let f = write_tmp(&format!("{}\n[updates]\nring = \"canary\"\n", valid_toml()));
+        match load_from(f.path()).unwrap_err() {
+            ConfigError::Invalid { field, value, .. } => {
+                assert_eq!(field, "updates.ring");
+                assert_eq!(value, "canary");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     #[test]

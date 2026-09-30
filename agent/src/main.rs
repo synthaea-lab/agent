@@ -179,13 +179,18 @@ enum Command {
     /// `DetectionSink` — that's a follow-up, not this slice.
     ApplyContentManifest {
         /// Control-plane base URL (e.g. `https://api.synthaea.example.com`).
+        /// Left unset, the command uses `server.control_plane_url` and the
+        /// `server.mtls_cert`/`mtls_key` pair from `agent.toml`; given, it
+        /// talks to exactly that server with mTLS only if `--cert`/`--key`
+        /// are given too.
         #[arg(long)]
-        server: String,
+        server: Option<String>,
         /// Canary ring this agent is assigned to (`canary_0`/`canary_1`/`canary_2`/`prod`).
+        /// Left unset, `updates.ring` from `agent.toml`; with neither, the
+        /// command refuses rather than guess a ring.
         #[arg(long)]
-        ring: String,
-        /// Path to the client mTLS certificate (PEM). Omit to fetch without
-        /// mTLS (a dev server, or a server that authenticates another way).
+        ring: Option<String>,
+        /// Path to the client mTLS certificate (PEM), overriding the config's.
         #[arg(long)]
         cert: Option<std::path::PathBuf>,
         /// Path to the client mTLS private key (PEM). Required alongside `--cert`.
@@ -320,11 +325,13 @@ fn main() -> anyhow::Result<()> {
         } => {
             let (content_dir, state) =
                 content::resolve_content_paths(&cfg.storage.state_dir, content_dir, state)?;
+            let ring = content::resolve_ring(ring, &cfg.updates)?;
+            let endpoint = content::resolve_endpoint(server, cert, key, &cfg.server);
             content::cmd_apply_content_manifest(
-                &server,
+                &endpoint.server,
                 &ring,
-                cert.as_deref(),
-                key.as_deref(),
+                endpoint.cert.as_deref(),
+                endpoint.key.as_deref(),
                 &content_dir,
                 &state,
                 &cfg.ipc.endpoint,
