@@ -21,9 +21,11 @@
 //!
 //! Module map: `paths` (agent/binary/log resolution), `supervise` (the respawn
 //! loop), `service` (per-platform install/uninstall: SCM, systemd, launchd),
-//! `tamper` (install-surface hardening and integrity checks, issue #103).
+//! `tamper` (install-surface hardening and integrity checks, issue #103),
+//! `probation` (post-promotion health gate and rollback, issue #30).
 
 mod paths;
+mod probation;
 mod service;
 mod supervise;
 mod tamper;
