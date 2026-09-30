@@ -1490,6 +1490,29 @@ mod applocker_tests {
     }
 
     #[test]
+    fn a_real_8004_is_an_enforced_denial_of_its_full_file_path() {
+        // Trimmed from the real 8004 captured in the lab (#529, see xml.rs).
+        let block = "<Event><System><EventID>8004</EventID><EventRecordID>29</EventRecordID></System>\
+            <UserData><RuleAndFileData><PolicyName>EXE</PolicyName>\
+            <TargetUser>S-1-5-21-1-2-3-1001</TargetUser><TargetProcessId>9184</TargetProcessId>\
+            <FilePath>%OSDRIVE%\\USERS\\PUBLIC\\TEST8004.EXE</FilePath>\
+            <FileHashLength>0</FileHashLength><FileHash></FileHash><Fqbn>-</Fqbn>\
+            <FullFilePath>C:\\Users\\Public\\test8004.exe</FullFilePath>\
+            </RuleAndFileData></UserData></Event>";
+        let (record_id, event) = normalize_applocker_block(block).expect("should parse");
+        assert_eq!(record_id, 29);
+        let Some(Event::PolicyDenial(denial)) = event else {
+            panic!("expected a PolicyDenial event, got {event:?}");
+        };
+        assert!(denial.enforced);
+        assert_eq!(
+            denial.object_path.as_deref(),
+            Some("C:\\Users\\Public\\test8004.exe")
+        );
+        assert_eq!(denial.meta.pid, 9184);
+    }
+
+    #[test]
     fn applocker_8003_is_an_audit_mode_policy_denial() {
         let denial = policy_denial(8003);
         assert_eq!(denial.mechanism, POLICY_MECHANISM_APPLOCKER);

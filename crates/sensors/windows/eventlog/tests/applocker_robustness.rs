@@ -13,14 +13,17 @@ use sensor_windows_eventlog::xml::{
 /// which makes the truncation sweep cross char boundaries.
 const CAPTURE_8003: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-AppLocker' Guid='{cbda4dbf-8d5d-4f69-9578-be14aa540d22}'/><EventID>8003</EventID><Version>0</Version><Level>3</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime='2026-09-29T08:12:31.6189560Z'/><EventRecordID>24</EventRecordID><Correlation/><Execution ProcessID='6868' ThreadID='564'/><Channel>Microsoft-Windows-AppLocker/EXE and DLL</Channel><Computer>Sandbox</Computer><Security UserID='S-1-5-21-1663667890-2519037288-962558911-1001'/></System><UserData><RuleAndFileData xmlns='http://schemas.microsoft.com/schemas/event/Microsoft.Windows/1.0.0.0'><PolicyNameLength>3</PolicyNameLength><PolicyName>EXE</PolicyName><RuleId>{00000000-0000-0000-0000-000000000000}</RuleId><RuleNameLength>1</RuleNameLength><RuleName>-</RuleName><RuleSddlLength>1</RuleSddlLength><RuleSddl>-</RuleSddl><TargetUser>S-1-5-21-1663667890-2519037288-962558911-1001</TargetUser><TargetProcessId>7092</TargetProcessId><FilePathLength>35</FilePathLength><FilePath>%OSDRIVE%\USERS\PUBLIC\TEST8003.EXE</FilePath><FileHashLength>32</FileHashLength><FileHash>8C972B0E2047FC0E84BBDC66A662D1E52FDE28E5D2D040BDCDA21CC7D6BB2810</FileHash><FqbnLength>118</FqbnLength><Fqbn>O=MICROSOFT CORPORATION, L=REDMOND, S=WASHINGTON, C=US\MICROSOFT® WINDOWS® OPERATING SYSTEM\WHOAMI.EXE\10.0.26100.1882</Fqbn><TargetLogonId>0x72d47</TargetLogonId><FullFilePathLength>28</FullFilePathLength><FullFilePath>C:\Users\Public\test8003.exe</FullFilePath></RuleAndFileData></UserData></Event>"#;
 
-#[test]
-fn every_truncation_of_a_real_8003_is_handled_without_panicking() {
+/// The real 8004 (enforced block) captured on the same VM, copied from
+/// `src/xml.rs`. Its `FileHash` element is empty (`FileHashLength` 0).
+const CAPTURE_8004: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-AppLocker' Guid='{cbda4dbf-8d5d-4f69-9578-be14aa540d22}'/><EventID>8004</EventID><Version>0</Version><Level>2</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime='2026-09-30T08:21:58.8915403Z'/><EventRecordID>29</EventRecordID><Correlation/><Execution ProcessID='7764' ThreadID='8072'/><Channel>Microsoft-Windows-AppLocker/EXE and DLL</Channel><Computer>SYN-DRV-W11</Computer><Security UserID='S-1-5-21-1663667890-2519037288-962558911-1001'/></System><UserData><RuleAndFileData xmlns='http://schemas.microsoft.com/schemas/event/Microsoft.Windows/1.0.0.0'><PolicyNameLength>3</PolicyNameLength><PolicyName>EXE</PolicyName><RuleId>{00000000-0000-0000-0000-000000000000}</RuleId><RuleNameLength>1</RuleNameLength><RuleName>-</RuleName><RuleSddlLength>1</RuleSddlLength><RuleSddl>-</RuleSddl><TargetUser>S-1-5-21-1663667890-2519037288-962558911-1001</TargetUser><TargetProcessId>9184</TargetProcessId><FilePathLength>35</FilePathLength><FilePath>%OSDRIVE%\USERS\PUBLIC\TEST8004.EXE</FilePath><FileHashLength>0</FileHashLength><FileHash></FileHash><FqbnLength>1</FqbnLength><Fqbn>-</Fqbn><TargetLogonId>0x92d46</TargetLogonId><FullFilePathLength>28</FullFilePathLength><FullFilePath>C:\Users\Public\test8004.exe</FullFilePath></RuleAndFileData></UserData></Event>"#;
+
+fn assert_every_truncation_is_handled(capture: &str, event_id: u32) {
     let mut cuts = 0;
-    for end in 0..CAPTURE_8003.len() {
-        if !CAPTURE_8003.is_char_boundary(end) {
+    for end in 0..capture.len() {
+        if !capture.is_char_boundary(end) {
             continue;
         }
-        let prefix = &CAPTURE_8003[..end];
+        let prefix = &capture[..end];
         cuts += 1;
         // A truncated document never yields an `<Event>` block to parse.
         assert!(split_event_blocks(prefix).is_empty(), "cut at {end}");
@@ -28,10 +31,20 @@ fn every_truncation_of_a_real_8003_is_handled_without_panicking() {
         let _ = parse_applocker_event(prefix);
     }
     assert!(cuts > 1_000, "the sweep must actually cover the capture");
-    let full = split_event_blocks(CAPTURE_8003);
+    let full = split_event_blocks(capture);
     assert_eq!(full.len(), 1);
     let parsed = parse_applocker_event(full[0]).expect("the complete capture parses");
-    assert_eq!(parsed.event_id, 8003);
+    assert_eq!(parsed.event_id, event_id);
+}
+
+#[test]
+fn every_truncation_of_a_real_8003_is_handled_without_panicking() {
+    assert_every_truncation_is_handled(CAPTURE_8003, 8003);
+}
+
+#[test]
+fn every_truncation_of_a_real_8004_is_handled_without_panicking() {
+    assert_every_truncation_is_handled(CAPTURE_8004, 8004);
 }
 
 /// The capture with one element's text replaced, for the malformed-field cases.
