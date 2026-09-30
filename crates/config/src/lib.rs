@@ -55,7 +55,8 @@ pub use discovery::{DEFAULT_CONFIG_PATH, ENV_CONFIG_PATH, discover};
 pub use error::ConfigError;
 pub use load::{apply_env_overrides, load, load_from};
 pub use schema::{
-    AgentConfig, IpcConfig, LogConfig, ResourcesConfig, SCHEMA_VERSION, ServerConfig, StorageConfig,
+    AgentConfig, CONTENT_RINGS, IpcConfig, LogConfig, ResourcesConfig, SCHEMA_VERSION,
+    ServerConfig, StorageConfig, UpdatesConfig,
 };
 pub use secret::SecretRef;
 pub use template::{DEFAULT_TEMPLATE, write_default_template};

@@ -75,3 +75,10 @@ worker_threads = 0
 # Maximum backoff (milliseconds) between consecutive control-plane
 # reconnection attempts. Default: 60_000 ms = 60 s.
 max_reconnect_backoff_ms = 60000
+
+[updates]
+# Content ring this install is assigned to (ADR-0016): canary_0, canary_1,
+# canary_2 or prod. Optional, and there is deliberately no default: without
+# it `agent apply-content-manifest` requires `--ring`. Assign new installs to
+# a canary ring first; `prod` receives content only after the canaries.
+# ring = "canary_0"                                  # CHANGE ME
