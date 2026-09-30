@@ -29,10 +29,12 @@
 //!   root-on-Unix-or-elevated-on-Windows; a non-privileged caller sees
 //!   [`WireError::Unauthorized`] and gets EOF immediately after.
 //!
-//! Mutating commands are deliberately out of scope in v1 — every request
-//! is read-only. The variants for `kill`, `quarantine`, `isolate` land
-//! when the authorization model they need (per-capability, policy-gated)
-//! is designed.
+//! Mutating commands are deliberately out of scope for the most part —
+//! `kill`, `quarantine`, `isolate` land as new variants once the
+//! authorization model they need (per-capability, policy-gated) is
+//! designed. `ReloadContent` (v2, issue #30) is a deliberate, narrow
+//! exception: see its own doc comment in [`protocol::Request`] for why it
+//! doesn't need that same model.
 
 pub mod client;
 pub mod error;
@@ -45,8 +47,8 @@ pub use client::Client;
 pub use error::{ClientError, ServerError};
 pub use protocol::{
     ClientHello, DetectionSummary, PROTOCOL_VERSION, PolicyVersionResponse,
-    RecentDetectionsResponse, Request, Response, SensorHealth, SensorHealthResponse, SensorState,
-    ServerHello, StatusResponse, WireError,
+    RecentDetectionsResponse, ReloadContentResponse, Request, Response, SensorHealth,
+    SensorHealthResponse, SensorState, ServerHello, StatusResponse, WireError,
 };
 pub use server::{Handler, RECENT_DETECTIONS_HARD_LIMIT, Server, StubHandler};
 pub use stream::PeerCreds;

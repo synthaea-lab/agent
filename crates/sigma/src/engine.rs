@@ -85,4 +85,14 @@ impl SigmaEngine {
     pub fn rule_count(&self) -> usize {
         self.rules.len()
     }
+
+    /// Titles of every loaded rule, in load order. Lets a caller (the content
+    /// test suite's sample-pairing checks) assert against the actual rule set
+    /// rather than only its size — a count match alone (review, Jihair54/
+    /// Sollykhan) can't catch a renamed or swapped rule keeping a stale sample
+    /// label.
+    #[must_use]
+    pub fn rule_titles(&self) -> Vec<&str> {
+        self.rules.iter().map(|r| r.title.as_str()).collect()
+    }
 }

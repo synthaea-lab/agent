@@ -12,18 +12,31 @@
 //! In both cases the peer auth check (`check_authorized`) is expected
 //! to pass because the test process typically runs as the same user as
 //! the "server" (root on a CI runner, elevated user on a Windows dev
-//! box). A non-privileged runner sees the test skipped via
-//! `#[ignore]`-conditional wiring rather than a false failure — see
-//! the individual test's guard.
+//! box). A non-privileged process sees the test skip itself (see
+//! `skip_test!`) rather than fail, and `cargo test` hides that message on
+//! success, so the skip is indistinguishable from a pass. CI therefore runs
+//! this binary privileged and sets `SYNTHAEA_REQUIRE_PRIVILEGED_TESTS=1`,
+//! which turns a skip into a failure: a lost privilege makes the job red
+//! instead of silently green (#483).
 
 use ipc::{Client, ClientError, Server, StubHandler};
 
 /// Skip the current test with a printed message. Used when the runner
 /// process is not privileged enough to exercise the happy path (root
 /// on Unix, elevated on Windows).
+///
+/// With `SYNTHAEA_REQUIRE_PRIVILEGED_TESTS=1` (set by CI) a skip panics
+/// instead: `cargo test` hides the skip message on success, so without this a
+/// CI runner that lost its privilege reports `ok` for a test that never ran.
 macro_rules! skip_test {
     ($($arg:tt)*) => {{
-        eprintln!("skipping: {}", format!($($arg)*));
+        let reason = format!($($arg)*);
+        if std::env::var_os("SYNTHAEA_REQUIRE_PRIVILEGED_TESTS").is_some_and(|v| v == "1") {
+            panic!(
+                "skipped while SYNTHAEA_REQUIRE_PRIVILEGED_TESTS=1, the happy path did not run: {reason}"
+            );
+        }
+        eprintln!("skipping: {reason}");
         return;
     }};
 }
@@ -89,7 +102,7 @@ async fn round_trip_every_endpoint() {
 
     let mut client = match Client::connect(&endpoint, "e2e-test").await {
         Ok(c) => c,
-        Err(ClientError::Refused(msg)) if msg.contains("Unauthorized") => {
+        Err(ClientError::AccessDenied { .. } | ClientError::HandshakeClosed { .. }) => {
             skip_test!(
                 "peer-auth rejected the test process (need root on Unix / elevated on Windows)"
             );
@@ -119,6 +132,13 @@ async fn round_trip_every_endpoint() {
         .expect("policy_version should succeed");
     assert_eq!(policy.schema_version, 1);
     assert!(policy.policy_version.is_none());
+
+    let reload = client
+        .reload_content()
+        .await
+        .expect("reload_content should succeed");
+    assert_eq!(reload.sigma_rule_count, None);
+    assert_eq!(reload.yara_rule_count, None);
     // Cleanup: the socket file on Unix stays after the test; not a
     // correctness issue (the endpoint is per-run) but cargo test's tmp
     // dir would accumulate. Remove best-effort.

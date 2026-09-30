@@ -75,6 +75,37 @@ fn write_response(stream: &mut TcpStream, status: u16, body: &str) {
     );
 }
 
+/// Same shape as [`write_response`] but for a binary body — content
+/// artifact downloads aren't JSON.
+fn write_binary_response(stream: &mut TcpStream, status: u16, body: &[u8]) {
+    let reason = if status == 200 { "OK" } else { "NOPE" };
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(body);
+}
+
+/// Reads one request and returns its request line (e.g. `GET /path?a=b
+/// HTTP/1.1`) — enough to assert on the query string a client actually sent,
+/// without a full HTTP parser.
+fn read_request_line(stream: &mut TcpStream) -> String {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let Ok(n) = stream.read(&mut chunk) else {
+            return String::new();
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.windows(2).any(|w| w == b"\r\n") {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    text.lines().next().unwrap_or_default().to_string()
+}
+
 /// Serves `count` requests on an ephemeral port, always answering with
 /// `status` and `body`, then exits. Returns the base URL.
 fn canned_server(status: u16, body: &'static str, count: usize) -> String {
@@ -433,4 +464,128 @@ fn poison_batch_not_in_the_first_slot_still_reaches_max_drain_attempts() {
         "poison segment skipped even though its poison batch isn't the first"
     );
     assert_eq!(acked.load(Ordering::SeqCst), 0);
+}
+
+// ── get_json (issue #30/#73's content-manifest fetch) ──────────────────────
+
+#[derive(Debug, serde::Deserialize, PartialEq)]
+struct Widget {
+    name: String,
+    count: u32,
+}
+
+#[test]
+fn get_json_fetches_and_deserializes_a_200_response() {
+    let url = canned_server(200, r#"{"name":"beacon","count":3}"#, 1);
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+
+    let widget: Widget = client.get_json(&url).unwrap();
+    assert_eq!(
+        widget,
+        Widget {
+            name: "beacon".to_string(),
+            count: 3,
+        }
+    );
+}
+
+#[test]
+fn get_json_surfaces_a_retryable_error_on_5xx() {
+    let url = canned_server(500, r#"{"error":"try later"}"#, 1);
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+
+    let err = client
+        .get_json::<Widget>(&url)
+        .expect_err("500 must surface");
+    assert!(err.is_retryable(), "5xx is transient");
+}
+
+#[test]
+fn get_json_surfaces_a_non_retryable_error_on_4xx() {
+    let url = canned_server(404, r#"{"error":"not found"}"#, 1);
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+
+    let err = client
+        .get_json::<Widget>(&url)
+        .expect_err("404 must surface");
+    assert!(!err.is_retryable(), "4xx is permanent");
+}
+
+#[test]
+fn get_json_rejects_a_response_that_is_not_valid_json_for_the_target_type() {
+    // The server was reached and answered — a body that doesn't fit the
+    // expected shape is `InvalidResponse`, not `Network`: reached-and-answered,
+    // so it must not get the longer connectivity-blip retry budget (#414).
+    let url = canned_server(200, r#"{"unexpected":"shape"}"#, 1);
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+
+    let err = client
+        .get_json::<Widget>(&url)
+        .expect_err("missing required fields must fail to deserialize");
+    assert!(
+        matches!(err, transport::TransportError::InvalidResponse(_)),
+        "got {err:?}"
+    );
+    assert!(!err.is_network_error(), "reached-and-answered, not a blip");
+}
+
+// ── get_bytes (issue #30/#73's content artifact download) ──────────────────
+
+#[test]
+fn get_bytes_fetches_the_raw_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        write_binary_response(&mut stream, 200, b"rule-file-bytes");
+    });
+    let url = format!("http://{addr}/api/content/artifact");
+    let client = TransportClient::new(TransportConfig::new(format!("http://{addr}"))).unwrap();
+
+    let bytes = client.get_bytes(&url, &[], 1024).unwrap();
+    assert_eq!(bytes, b"rule-file-bytes");
+    handle.join().unwrap();
+}
+
+#[test]
+fn get_bytes_percent_encodes_query_parameters() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let line = read_request_line(&mut stream);
+        write_binary_response(&mut stream, 200, b"ok");
+        line
+    });
+    let url = format!("http://{addr}/api/content/artifact");
+    let client = TransportClient::new(TransportConfig::new(format!("http://{addr}"))).unwrap();
+
+    let _ = client
+        .get_bytes(&url, &[("path", "rules/a b.sigma"), ("sha256", "ab")], 1024)
+        .unwrap();
+    let line = handle.join().unwrap();
+    assert!(
+        line.contains("path=rules%2Fa%20b.sigma") || line.contains("path=rules%2Fa+b.sigma"),
+        "query must be percent-encoded, got: {line}"
+    );
+    assert!(line.contains("sha256=ab"));
+}
+
+#[test]
+fn get_bytes_rejects_a_body_larger_than_the_limit() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        write_binary_response(&mut stream, 200, &[0u8; 100]);
+    });
+    let url = format!("http://{addr}/api/content/artifact");
+    let client = TransportClient::new(TransportConfig::new(format!("http://{addr}"))).unwrap();
+
+    let err = client
+        .get_bytes(&url, &[], 10)
+        .expect_err("a 100-byte body must not fit a 10-byte limit");
+    assert!(matches!(err, transport::TransportError::InvalidResponse(_)));
 }

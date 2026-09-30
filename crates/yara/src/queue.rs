@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::RuleSet;
+use crate::{RuleSet, YaraMatch};
 
 /// Queue capacity: a burst of file writes beyond this sheds scan requests (counted).
 const QUEUE_CAP: usize = 512;
@@ -23,9 +23,9 @@ const SETTLE: Duration = Duration::from_millis(200);
 #[derive(Debug, Clone)]
 pub struct ScanOutcome {
     pub path: PathBuf,
-    /// Identifiers of the matching rules (non-empty by construction — clean scans
-    /// are not delivered).
-    pub matches: Vec<String>,
+    /// Matching rules, with metadata (non-empty by construction — clean scans are
+    /// not delivered).
+    pub matches: Vec<YaraMatch>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -115,12 +115,23 @@ mod tests {
     fn queue_scans_and_reports_matches_only() {
         let mut compiler = yara_x::Compiler::new();
         compiler
-            .add_source(b"rule q { strings: $m = \"QUEUE-MARKER\" condition: $m }" as &[u8])
+            .add_source(
+                br#"
+rule q {
+    meta:
+        severity = "high"
+        technique = "T1105"
+        falsepositives = "none known"
+    strings:
+        $m = "QUEUE-MARKER"
+    condition:
+        $m
+}
+"#
+                .as_slice(),
+            )
             .unwrap();
-        let rules = RuleSet {
-            rules: compiler.build(),
-            count: 1,
-        };
+        let rules = RuleSet::from_compiled(compiler.build()).unwrap();
         let hits: Arc<Mutex<Vec<ScanOutcome>>> = Arc::new(Mutex::new(Vec::new()));
         let hits_w = hits.clone();
         let queue = ScanQueue::start(rules, move |o| hits_w.lock().unwrap().push(o));
@@ -143,6 +154,7 @@ mod tests {
         let hits = hits.lock().unwrap();
         assert_eq!(hits.len(), 1, "only the matching file is delivered");
         assert_eq!(hits[0].path, hit);
-        assert_eq!(hits[0].matches, vec!["q"]);
+        assert_eq!(hits[0].matches.len(), 1);
+        assert_eq!(hits[0].matches[0].identifier, "q");
     }
 }

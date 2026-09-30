@@ -480,12 +480,25 @@ pub struct AppLockerEvent {
     /// *logged* under; the two matched in the only real capture so far (#427).
     pub target_user: Option<String>,
     /// PID of the process that tried to launch the image
-    /// (`RuleAndFileData/TargetProcessId`). 0 if missing.
+    /// (`<Execution ProcessID='...'>`). 0 if missing. Checked in the lab
+    /// (#529): for both 8003 and 8004 it equals the launching shell's `$PID`.
+    pub pid: u32,
+    /// PID of the process being *created* for the image
+    /// (`RuleAndFileData/TargetProcessId`), not its launcher. Checked in the
+    /// lab (#529): on an 8003 it is the audited binary's own live process
+    /// (`Start-Process -PassThru` reported the same id); on an 8004 the pid
+    /// was allocated but the process never ran. 0 if missing.
     pub target_process_id: u32,
     /// Path of the image as `AppLocker` reports it (`RuleAndFileData/FilePath`),
     /// path variables and upper case included — see [`expand_applocker_path`].
     /// Empty if missing.
     pub file_path: String,
+    /// `RuleAndFileData/FullFilePath`: the image's real path, original case,
+    /// no path variable (e.g. `C:\Users\Public\test8003.exe`). Present in
+    /// the real 8003 captured on Windows 11 26100 (#427); `None` when the
+    /// build doesn't emit it, in which case callers fall back to
+    /// [`expand_applocker_path`] on [`Self::file_path`].
+    pub full_file_path: Option<String>,
 }
 
 /// Parses one 8003/8004 `<Event>` block. `None` if the block is missing
@@ -511,20 +524,33 @@ pub fn parse_applocker_event(block: &str) -> Option<AppLockerEvent> {
     // `AppLocker`'s payload lives in <UserData><RuleAndFileData>: children are
     // *plain* elements (`<FilePath>...</FilePath>`), not `<Data Name='...'>`
     // like on the Security channel.
+    let pid = extract_between(block, "ProcessID='", "'")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let target_process_id = extract_between(block, "<TargetProcessId>", "</TargetProcessId>")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    // Unescaped like `FullFilePath`: the fallback path would otherwise keep
+    // `&amp;` for a directory containing `&`.
     let file_path = extract_between(block, "<FilePath>", "</FilePath>")
         .map(str::trim)
-        .unwrap_or("")
-        .to_string();
+        .map(unescape_xml_entities)
+        .unwrap_or_default();
+    // `<FullFilePath>` cannot be mistaken for `<FilePath>`: the marker
+    // includes the opening `<`, so the two never overlap.
+    let full_file_path = extract_between(block, "<FullFilePath>", "</FullFilePath>")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(unescape_xml_entities);
     Some(AppLockerEvent {
         record_id,
         event_id,
         policy_name,
         target_user,
+        pid,
         target_process_id,
         file_path,
+        full_file_path,
     })
 }
 
@@ -1073,6 +1099,89 @@ mod tests {
             parsed.file_path,
             "%OSDRIVE%\\USERS\\SOLKA\\DOWNLOADS\\POWERSHELL.EXE"
         );
+    }
+
+    /// A real 8003, captured on the Windows 11 26100 lab VM (2026-09-29,
+    /// #427): `AuditOnly` EXE collection allowing only `%WINDIR%` and
+    /// `%PROGRAMFILES%`, then `whoami.exe` copied to `C:\Users\Public` and
+    /// run. Verbatim `wevtutil qe ... /f:xml` output.
+    const APPLOCKER_AUDIT_8003_XML: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-AppLocker' Guid='{cbda4dbf-8d5d-4f69-9578-be14aa540d22}'/><EventID>8003</EventID><Version>0</Version><Level>3</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime='2026-09-29T08:12:31.6189560Z'/><EventRecordID>24</EventRecordID><Correlation/><Execution ProcessID='6868' ThreadID='564'/><Channel>Microsoft-Windows-AppLocker/EXE and DLL</Channel><Computer>Sandbox</Computer><Security UserID='S-1-5-21-1663667890-2519037288-962558911-1001'/></System><UserData><RuleAndFileData xmlns='http://schemas.microsoft.com/schemas/event/Microsoft.Windows/1.0.0.0'><PolicyNameLength>3</PolicyNameLength><PolicyName>EXE</PolicyName><RuleId>{00000000-0000-0000-0000-000000000000}</RuleId><RuleNameLength>1</RuleNameLength><RuleName>-</RuleName><RuleSddlLength>1</RuleSddlLength><RuleSddl>-</RuleSddl><TargetUser>S-1-5-21-1663667890-2519037288-962558911-1001</TargetUser><TargetProcessId>7092</TargetProcessId><FilePathLength>35</FilePathLength><FilePath>%OSDRIVE%\USERS\PUBLIC\TEST8003.EXE</FilePath><FileHashLength>32</FileHashLength><FileHash>8C972B0E2047FC0E84BBDC66A662D1E52FDE28E5D2D040BDCDA21CC7D6BB2810</FileHash><FqbnLength>118</FqbnLength><Fqbn>O=MICROSOFT CORPORATION, L=REDMOND, S=WASHINGTON, C=US\MICROSOFT® WINDOWS® OPERATING SYSTEM\WHOAMI.EXE\10.0.26100.1882</Fqbn><TargetLogonId>0x72d47</TargetLogonId><FullFilePathLength>28</FullFilePathLength><FullFilePath>C:\Users\Public\test8003.exe</FullFilePath></RuleAndFileData></UserData></Event>"#;
+
+    #[test]
+    fn parses_a_real_8003_capture() {
+        let block = split_event_blocks(APPLOCKER_AUDIT_8003_XML)[0];
+        let parsed = parse_applocker_event(block).expect("should parse");
+        assert_eq!(parsed.record_id, 24);
+        assert_eq!(parsed.event_id, 8003);
+        assert_eq!(parsed.policy_name, "EXE");
+        assert_eq!(
+            parsed.target_user.as_deref(),
+            Some("S-1-5-21-1663667890-2519037288-962558911-1001")
+        );
+        assert_eq!(parsed.pid, 6868);
+        assert_eq!(parsed.target_process_id, 7092);
+        assert_eq!(parsed.file_path, "%OSDRIVE%\\USERS\\PUBLIC\\TEST8003.EXE");
+        assert_eq!(
+            parsed.full_file_path.as_deref(),
+            Some("C:\\Users\\Public\\test8003.exe")
+        );
+    }
+
+    /// A real 8004, captured on the same lab VM (renamed `SYN-DRV-W11`,
+    /// Windows 11 Pro 26200, 2026-09-30, #529): same rules as the 8003 above
+    /// but the EXE collection `Enabled` (enforced), then `whoami.exe` copied
+    /// to `C:\Users\Public\test8004.exe` and run — refused. Unlike the 8003,
+    /// the block carries no `FileHash` (length 0, empty element) and `Fqbn`
+    /// is `-`. Verbatim `wevtutil qe ... /f:xml` output.
+    const APPLOCKER_BLOCK_8004_XML: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-AppLocker' Guid='{cbda4dbf-8d5d-4f69-9578-be14aa540d22}'/><EventID>8004</EventID><Version>0</Version><Level>2</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime='2026-09-30T08:21:58.8915403Z'/><EventRecordID>29</EventRecordID><Correlation/><Execution ProcessID='7764' ThreadID='8072'/><Channel>Microsoft-Windows-AppLocker/EXE and DLL</Channel><Computer>SYN-DRV-W11</Computer><Security UserID='S-1-5-21-1663667890-2519037288-962558911-1001'/></System><UserData><RuleAndFileData xmlns='http://schemas.microsoft.com/schemas/event/Microsoft.Windows/1.0.0.0'><PolicyNameLength>3</PolicyNameLength><PolicyName>EXE</PolicyName><RuleId>{00000000-0000-0000-0000-000000000000}</RuleId><RuleNameLength>1</RuleNameLength><RuleName>-</RuleName><RuleSddlLength>1</RuleSddlLength><RuleSddl>-</RuleSddl><TargetUser>S-1-5-21-1663667890-2519037288-962558911-1001</TargetUser><TargetProcessId>9184</TargetProcessId><FilePathLength>35</FilePathLength><FilePath>%OSDRIVE%\USERS\PUBLIC\TEST8004.EXE</FilePath><FileHashLength>0</FileHashLength><FileHash></FileHash><FqbnLength>1</FqbnLength><Fqbn>-</Fqbn><TargetLogonId>0x92d46</TargetLogonId><FullFilePathLength>28</FullFilePathLength><FullFilePath>C:\Users\Public\test8004.exe</FullFilePath></RuleAndFileData></UserData></Event>"#;
+
+    #[test]
+    fn parses_a_real_8004_capture() {
+        let block = split_event_blocks(APPLOCKER_BLOCK_8004_XML)[0];
+        let parsed = parse_applocker_event(block).expect("should parse");
+        assert_eq!(parsed.record_id, 29);
+        assert_eq!(parsed.event_id, 8004);
+        assert_eq!(parsed.policy_name, "EXE");
+        assert_eq!(
+            parsed.target_user.as_deref(),
+            Some("S-1-5-21-1663667890-2519037288-962558911-1001")
+        );
+        assert_eq!(parsed.pid, 7764);
+        assert_eq!(parsed.target_process_id, 9184);
+        assert_eq!(parsed.file_path, "%OSDRIVE%\\USERS\\PUBLIC\\TEST8004.EXE");
+        assert_eq!(
+            parsed.full_file_path.as_deref(),
+            Some("C:\\Users\\Public\\test8004.exe")
+        );
+    }
+
+    #[test]
+    fn applocker_file_path_is_unescaped_like_full_file_path() {
+        let xml = APPLOCKER_BLOCK_8004_XML
+            .replace(
+                "TEST8004.EXE</FilePath>",
+                "R&amp;D\\TEST8004.EXE</FilePath>",
+            )
+            .replace(
+                "test8004.exe</FullFilePath>",
+                "R&amp;D\\test8004.exe</FullFilePath>",
+            );
+        let parsed = parse_applocker_event(split_event_blocks(&xml)[0]).expect("should parse");
+        assert_eq!(
+            parsed.file_path,
+            "%OSDRIVE%\\USERS\\PUBLIC\\R&D\\TEST8004.EXE"
+        );
+        assert_eq!(
+            parsed.full_file_path.as_deref(),
+            Some("C:\\Users\\Public\\R&D\\test8004.exe")
+        );
+    }
+
+    #[test]
+    fn applocker_event_without_full_file_path_has_none() {
+        let parsed = parse_applocker_event(split_event_blocks(APPLOCKER_BLOCK_XML)[0])
+            .expect("should parse");
+        assert_eq!(parsed.full_file_path, None);
     }
 
     #[test]

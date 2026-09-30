@@ -5,7 +5,7 @@
 //! and a few lines in `on_event`.
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -48,16 +48,21 @@ pub(crate) struct DetectionSink {
     /// model is unavailable (missing registry, load error) — the agent works without
     /// ML (hand-calibrated features still function).
     ml_scorer: Mutex<Option<ml::CorrelationScorer>>,
-    /// Sigma rules from `rules/sigma` (next to the agent executable, falling back
-    /// to the working directory) when the folder exists — otherwise the agent runs without a Sigma engine, and that is
-    /// not an error (the load failure path IS an error: content present but broken).
-    sigma: Option<sigma::SigmaEngine>,
+    /// Sigma rules from `<content_root>/rules/sigma` when the folder exists —
+    /// otherwise the agent runs without a Sigma engine, and that is not an
+    /// error (the load failure path IS an error: content present but
+    /// broken). `Mutex`-wrapped (issue #30): `reload_content` swaps in a
+    /// freshly loaded engine while the agent keeps running, the same reason
+    /// every other mutable field on this struct is a `Mutex`.
+    sigma: Mutex<Option<sigma::SigmaEngine>>,
     /// The single alert funnel (issue #388): alerts.ndjson + stderr + the
     /// in-memory recent-alerts buffer served to `cli detections`. Shared with
     /// the YARA scan worker and quarantine.
     alert_log: Arc<AlertLog>,
-    /// Budgeted background content scanning; `None` when rules/yara is absent.
-    yara: Option<yara::ScanQueue>,
+    /// Budgeted background content scanning; `None` when
+    /// `<content_root>/rules/yara` is absent. `Mutex`-wrapped for the same
+    /// reload reason as `sigma`.
+    yara: Mutex<Option<(yara::ScanQueue, usize)>>,
     /// Enrichment (hash + signature) and the high-volume raw-event logging, off the
     /// drain thread (issue #126). The capture thread runs detection in memory and
     /// hands the event here with a non-blocking send.
@@ -71,19 +76,90 @@ pub(crate) struct DetectionSink {
     /// Issue #25's automated response, `None` until (if ever) `enable_response` sets
     /// it — see [`ResponseHooks`].
     response: Arc<Mutex<Option<ResponseHooks>>>,
+    /// Issue #131: cross-engine verdict fusion, keyed the same way the correlator
+    /// keys its own belief state (`(ppid, comm)` — see `verdict::EntityKey`). Every
+    /// rule/Sigma/correlator finding folds in here alongside reaching the alert
+    /// log, giving each entity a bounded, composed evidence trail — but the kill
+    /// gate (`correlate`'s `maybe_kill`) deliberately does *not* read this fused,
+    /// sticky state: it stays scoped to the triggering event's own evidence (PR
+    /// #502 review — the entity's composed severity is a max over everything
+    /// ever seen for `(ppid, comm)`, too coarse and too sticky to gate a
+    /// destructive action on). YARA matches are not folded in: the scan queue is
+    /// deliberately decoupled from the triggering process (`crates/yara/src/
+    /// queue.rs`'s settle delay) and carries no pid/entity context today — wiring
+    /// that through is separate follow-up work, not part of this pass.
+    verdict: Mutex<verdict::VerdictEngine>,
+    /// Resolved once at construction ([`resolve_content_root`]) and reused
+    /// by every `reload_content` call — the exe/cwd resolution reflects
+    /// where the process actually started, which does not change at
+    /// runtime, so re-resolving on every reload would add nothing but a
+    /// syscall.
+    content_root: PathBuf,
+}
+
+/// How long a technique already recorded for an entity stays "the same finding":
+/// a second engine (or the same engine again) reporting it inside this window
+/// folds in silently instead of producing a second alert. Matches the
+/// ransomware-detection window's order of magnitude (`crates/rules/src/
+/// exclusions.rs`'s `RANSOMWARE_RENAME_WINDOW_NS`) — long enough to absorb
+/// ordinary cross-engine timing skew (Sigma/rules run inline, the correlator
+/// reacts to the same event a few lines later), short enough that a genuine
+/// second occurrence of the same technique still gets its own finding.
+const VERDICT_DEDUP_WINDOW_NS: u64 = 30_000_000_000; // 30s
+
+/// Severity for a finding, until issue #73/#467's per-rule severity metadata
+/// lands on `main` — `rules`/`correlator` alerts carry no severity field yet on
+/// this branch (only `technique: &'static str` + `message`), so this is a
+/// deliberate placeholder, not real calibration. `BAYES` keeps the significance
+/// it already had before this issue (the correlator's belief crossing its
+/// confidence threshold, gated for process-kill by `response`); everything else
+/// defaults to `Medium`. Swap this for reading a real per-rule `Severity` once
+/// #73 lands it — the fusion engine itself doesn't care where severity comes
+/// from.
+fn default_severity(technique: &str) -> schema::detection::Severity {
+    if technique == "BAYES" {
+        schema::detection::Severity::Critical
+    } else {
+        schema::detection::Severity::Medium
+    }
+}
+
+/// ATT&CK technique ids folded into a [`schema::detection::Detection`] from the
+/// `technique` string this crate already uses as the dedup/alert-log key.
+/// Same convention `tools/attack-coverage.py` uses to build the coverage doc:
+/// a single alert can carry more than one id joined with `/` (a beacon flagged
+/// both C2 and exfiltration, say) — split back out here. `BAYES` (the
+/// correlator's belief-crossing sentinel) and Sigma's untagged `"Sigma"`
+/// fallback (`detect_exec`, when a hit carries no `attack.tXXXX` tag) are not
+/// real ATT&CK ids and fold to an empty list, same as
+/// `tools/attack-coverage.py`'s own `BAYES_SENTINEL` skip.
+fn techniques_from(technique: &str) -> Vec<String> {
+    if technique == "BAYES" || technique == "Sigma" {
+        Vec::new()
+    } else {
+        technique.split('/').map(str::to_string).collect()
+    }
 }
 
 impl DetectionSink {
     /// `rule_state` arrives already seeded by the caller (from /proc or the
     /// platform's process list — see `commands`). `spool` is the transport
     /// spool (`run --server`), `None` when the agent runs standalone.
+    /// `content_dir` is where `agent apply-content-manifest --content-dir`
+    /// writes downloaded content (issue #30) — resolved once here via
+    /// [`resolve_content_root`] and reused by every later `reload_content`
+    /// call, so the two commands agree on one directory instead of the
+    /// agent loading from a different, hardcoded location than the one
+    /// content was actually applied to.
     pub(crate) fn new(
         rule_state: rules::RuleState,
         alerts_path: &std::path::Path,
         events_path: &std::path::Path,
         spool: Option<Arc<Mutex<store::EventSpool>>>,
+        content_dir: &Path,
     ) -> std::io::Result<Self> {
         let alert_log = Arc::new(AlertLog::open(alerts_path, RECENT_ALERTS_CAPACITY)?);
+        let content_root = resolve_content_root(content_dir);
         // The raw event log is written by the enrichment worker, not the drain
         // thread — shared behind an Arc so the worker owns a handle. The spool
         // append rides the same worker for the same #126 reason: it is file
@@ -104,13 +180,73 @@ impl DetectionSink {
             rule_state: Mutex::new(rule_state),
             correlator: Mutex::new(correlator::CorrelationEngine::new()),
             ml_scorer: Mutex::new(Self::load_correlation_scorer()),
-            sigma: load_sigma_rules(),
-            yara: start_yara(alert_log.clone(), response.clone()),
+            sigma: Mutex::new(load_sigma_rules(&content_root).into_option()),
+            yara: Mutex::new(
+                start_yara(&content_root, alert_log.clone(), response.clone()).into_option(),
+            ),
             alert_log,
             enrich_queue,
             progress: Arc::new(AtomicU64::new(0)),
             response,
+            verdict: Mutex::new(verdict::VerdictEngine::new(VERDICT_DEDUP_WINDOW_NS)),
+            content_root,
         })
+    }
+
+    /// Re-reads Sigma/YARA content from [`Self::content_root`] and swaps it
+    /// into the running pipeline (issue #30, IPC `ReloadContent`) — the way
+    /// content `agent apply-content-manifest` just downloaded and verified
+    /// takes effect without restarting the agent.
+    ///
+    /// An *absent* content subdirectory unloads that engine (same "not an
+    /// error" posture startup has always had). A present-but-*broken* one
+    /// keeps the previous engine running and is reported as failed: a bad
+    /// rule file must never leave a live agent without that engine, which
+    /// startup can afford (nothing was protecting yet) and a reload cannot.
+    /// Note the asymmetry in the engines' own loaders: YARA fails the whole
+    /// set on one bad rule, while Sigma skips (and warns about) an individual
+    /// bad rule, so a partly broken Sigma set loads *fewer* rules and is only
+    /// visible through the reported count.
+    pub(crate) fn reload_content(&self) -> ReloadReport {
+        // Parse/compile first, lock only for the swap: `on_event` takes these
+        // locks on the capture thread for every exec and write-open, so loading
+        // under them would stall capture for the whole load, which grows with
+        // the rule set (PR #531 review).
+        let sigma_loaded = load_sigma_rules(&self.content_root);
+        let yara_loaded = start_yara(
+            &self.content_root,
+            self.alert_log.clone(),
+            self.response.clone(),
+        );
+
+        // The replaced engines are dropped after the locks are released: a
+        // `ScanQueue` joins its worker on drop, which must not stall capture.
+        let mut sigma_slot = self.sigma.lock().unwrap();
+        let (sigma_reload_failed, old_sigma) = match sigma_loaded {
+            Load::Loaded(engine) => (false, sigma_slot.replace(engine)),
+            Load::Absent => (false, sigma_slot.take()),
+            Load::Failed => (true, None),
+        };
+        let sigma_rule_count = sigma_slot.as_ref().map(sigma::SigmaEngine::rule_count);
+        drop(sigma_slot);
+        drop(old_sigma);
+
+        let mut yara_slot = self.yara.lock().unwrap();
+        let (yara_reload_failed, old_yara) = match yara_loaded {
+            Load::Loaded(loaded) => (false, yara_slot.replace(loaded)),
+            Load::Absent => (false, yara_slot.take()),
+            Load::Failed => (true, None),
+        };
+        let yara_rule_count = yara_slot.as_ref().map(|(_, count)| *count);
+        drop(yara_slot);
+        drop(old_yara);
+
+        ReloadReport {
+            sigma_rule_count,
+            yara_rule_count,
+            sigma_reload_failed,
+            yara_reload_failed,
+        }
     }
 
     /// Loads the ML correlation scorer from the registry (issue #46 Phase 3, #47 Phase 2).
@@ -201,13 +337,70 @@ impl DetectionSink {
         Arc::clone(&self.progress)
     }
 
+    /// Folds one engine's finding into the fused per-entity verdict (issue #131)
+    /// and always writes it to the alert log — `alerts.ndjson` is the audit
+    /// trail (`EVIDENCE_CAP`'s own doc: every finding lands there), and verdict
+    /// fusion's dedup is a separate, deliberately lossy view for live triage
+    /// (bounded evidence, kill-gate severity), not a substitute for it. A
+    /// finding verdict fusion absorbs as a duplicate (same technique, another
+    /// engine or a repeat, inside `VERDICT_DEDUP_WINDOW_NS`) still gets its own
+    /// alert line, it just doesn't produce a new [`verdict::Verdict`] snapshot.
+    /// Returns the fused verdict whenever one was produced, for a caller that
+    /// needs the entity's overall composed state (e.g. its evidence list) —
+    /// **not** for kill-gating: `correlate`'s kill gate reads this event's own
+    /// detection severity instead, deliberately not the entity's sticky
+    /// accumulated one (PR #502 review).
+    fn record_and_emit(
+        &self,
+        entity: &verdict::EntityKey,
+        technique: &str,
+        message: &str,
+        source: schema::detection::DetectionSource,
+        event: &Event,
+        now_ns: u64,
+    ) -> Option<verdict::Verdict> {
+        let detection = schema::detection::Detection {
+            timestamp_ns: now_ns,
+            severity: default_severity(technique),
+            title: message.to_string(),
+            source,
+            score: None,
+            attributions: Vec::new(),
+            techniques: techniques_from(technique),
+            events: vec![event.clone()],
+        };
+        let result =
+            self.verdict
+                .lock()
+                .unwrap()
+                .record(entity.clone(), technique, detection, now_ns);
+        self.emit(technique, message);
+        result
+    }
+
+    /// [`Self::record_and_emit`] for a batch of plain `rules::Alert`s (no Sigma/
+    /// correlator-specific `DetectionSource` needed) — the common case for every
+    /// `rule_state`/`rules::evaluate_*` call site.
+    fn record_rule_alerts(&self, event: &Event, alerts: impl IntoIterator<Item = rules::Alert>) {
+        let meta = event.meta();
+        let entity = verdict::EntityKey::new(meta.ppid, meta.comm.clone());
+        let now_ns = meta.timestamp_ns;
+        for alert in alerts {
+            let source = schema::detection::DetectionSource::Rule {
+                rule_id: alert.technique.to_string(),
+            };
+            self.record_and_emit(
+                &entity,
+                alert.technique,
+                &alert.message,
+                source,
+                event,
+                now_ns,
+            );
+        }
+    }
+
     /// Cross-event correlation (co-occurrence rules + Bayesian belief).
-    ///
-    /// `BAYES` is today's only correlator output with a real number behind it (the
-    /// belief engine's `log_odds`, gated by its own threshold before it ever fires —
-    /// see `correlator::bayes`); the co-occurrence rules carry no confidence field.
-    /// Issue #131 (verdict fusion) will give this a principled score to key off
-    /// instead of a technique-name check.
     ///
     /// ML correlation scorer (issue #46 Phase 3, #47 Phase 2): if available, scores
     /// the pid's behavior over the correlator window and updates the belief state with
@@ -264,11 +457,37 @@ impl DetectionSink {
             }
         }
 
-        // Emit alerts from co-occurrence rules and Bayesian belief.
-        let is_high_confidence = alerts.iter().any(|alert| alert.technique == "BAYES");
         drop(engine); // Unlock correlator before alert emission (log I/O).
+
+        // Fold co-occurrence rules and Bayesian belief into the entity's fused
+        // verdict (issue #131) for evidence/severity bookkeeping. The kill gate
+        // itself stays scoped to *this event's own* evidence — `default_severity`
+        // of the alert actually raised here, same as the pre-#131 bare
+        // `technique == "BAYES"` check — not the entity's fused, sticky
+        // severity: that's a max over everything ever seen for `(ppid, comm)`,
+        // so gating kill on it would let one sibling process's Bayes crossing
+        // condemn every later, unrelated sibling that merely shares the same
+        // parent and `comm` (PR #502 review; pinned by
+        // `a_siblings_weak_alert_never_triggers_kill_from_anothers_bayes_crossing`).
+        let meta = event.meta();
+        let entity = verdict::EntityKey::new(meta.ppid, meta.comm.clone());
+        let case_id = format!("{}:{}", entity.ppid, entity.comm);
+        let mut is_high_confidence = false;
         for alert in &alerts {
-            self.emit(alert.technique, &alert.message);
+            let source = schema::detection::DetectionSource::Correlator {
+                case_id: case_id.clone(),
+            };
+            self.record_and_emit(
+                &entity,
+                alert.technique,
+                &alert.message,
+                source,
+                event,
+                meta.timestamp_ns,
+            );
+            if default_severity(alert.technique) >= schema::detection::Severity::Critical {
+                is_high_confidence = true;
+            }
         }
         if is_high_confidence {
             self.maybe_kill(pid);
@@ -301,37 +520,45 @@ impl DetectionSink {
     }
 
     /// Exec events: stateless rules, stateful rules, then Sigma.
-    fn detect_exec(&self, event: &schema::ExecEvent) {
-        for alert in rules::evaluate_exec(event) {
-            self.emit(alert.technique, &alert.message);
-        }
-        for alert in self.rule_state.lock().unwrap().on_exec(event) {
-            self.emit(alert.technique, &alert.message);
-        }
-        if let Some(sigma) = &self.sigma {
+    fn detect_exec(&self, wrapped: &Event, event: &schema::ExecEvent) {
+        self.record_rule_alerts(wrapped, rules::evaluate_exec(event));
+        self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_exec(event));
+        let sigma_guard = self.sigma.lock().unwrap();
+        if let Some(sigma) = sigma_guard.as_ref() {
+            let entity = verdict::EntityKey::new(event.meta.ppid, event.meta.comm.clone());
             for hit in sigma.eval_exec(event) {
                 let technique = if hit.tags.is_empty() {
                     "Sigma".to_string()
                 } else {
                     hit.tags.join("/")
                 };
-                self.emit(&technique, &hit.title);
+                let source = schema::detection::DetectionSource::Sigma {
+                    rule_id: hit.title.clone(),
+                };
+                self.record_and_emit(
+                    &entity,
+                    &technique,
+                    &hit.title,
+                    source,
+                    wrapped,
+                    event.meta.timestamp_ns,
+                );
             }
         }
     }
 
     /// `FileOpen` events: stateless rules, downloader-write history, and the
     /// budgeted YARA queue on write intent (off the event path).
-    fn detect_file_open(&self, event: &schema::FileOpenEvent) {
+    fn detect_file_open(&self, wrapped: &Event, event: &schema::FileOpenEvent) {
         let state_alerts = self.rule_state.lock().unwrap().on_file_open(event);
-        for alert in rules::evaluate_file_open(event)
-            .into_iter()
-            .chain(state_alerts)
-        {
-            self.emit(alert.technique, &alert.message);
-        }
-        if let Some(yara) = &self.yara
-            && event.flags & 0o103 != 0
+        self.record_rule_alerts(
+            wrapped,
+            rules::evaluate_file_open(event)
+                .into_iter()
+                .chain(state_alerts),
+        );
+        if event.flags & 0o103 != 0
+            && let Some((yara, _)) = self.yara.lock().unwrap().as_ref()
         {
             yara.enqueue(std::path::PathBuf::from(&event.path));
         }
@@ -344,56 +571,59 @@ impl DetectionSink {
         self.rule_state.lock().unwrap().on_file_quarantine(event);
     }
 
-    /// Connect events: beacon detection.
-    fn detect_connect(&self, event: &schema::ConnectEvent) {
-        for alert in self.rule_state.lock().unwrap().on_connect(event) {
-            self.emit(alert.technique, &alert.message);
-        }
+    /// Connect events: stateless rules (unusual outbound from a web/DB
+    /// service, issue #478), then beacon detection.
+    fn detect_connect(&self, wrapped: &Event, event: &schema::ConnectEvent) {
+        self.record_rule_alerts(wrapped, rules::evaluate_connect(event));
+        self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_connect(event));
     }
 
     /// `NetworkFlow` events (conntrack polling, issue #92): same beacon detection as
     /// `detect_connect`, deduped per-flow so a poll-based source doesn't
     /// false-positive on one ordinary long-lived connection.
-    fn detect_network_flow(&self, event: &schema::NetworkFlowEvent) {
-        for alert in self.rule_state.lock().unwrap().on_network_flow(event) {
-            self.emit(alert.technique, &alert.message);
-        }
+    fn detect_network_flow(&self, wrapped: &Event, event: &schema::NetworkFlowEvent) {
+        self.record_rule_alerts(
+            wrapped,
+            self.rule_state.lock().unwrap().on_network_flow(event),
+        );
     }
 
     /// `ListenPort` events (`sock_diag` polling, issue #92): LISTENER-DRIFT.
-    fn detect_listen_port(&self, event: &schema::ListenPortEvent) {
-        for alert in self.rule_state.lock().unwrap().on_listen_port(event) {
-            self.emit(alert.technique, &alert.message);
-        }
+    fn detect_listen_port(&self, wrapped: &Event, event: &schema::ListenPortEvent) {
+        self.record_rule_alerts(
+            wrapped,
+            self.rule_state.lock().unwrap().on_listen_port(event),
+        );
     }
 
     /// `Auth` events: brute-force/spray burst detection (T1110, pack #377).
-    fn detect_auth(&self, event: &schema::AuthEvent) {
-        for alert in self.rule_state.lock().unwrap().on_auth(event) {
-            self.emit(alert.technique, &alert.message);
-        }
+    fn detect_auth(&self, wrapped: &Event, event: &schema::AuthEvent) {
+        self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_auth(event));
     }
 
-    /// `FileDelete` events: log-tamper detection (T1070.001/.002, pack #379).
-    fn detect_file_delete(&self, event: &schema::FileDeleteEvent) {
-        for alert in rules::evaluate_file_delete(event) {
-            self.emit(alert.technique, &alert.message);
-        }
+    /// `FileDelete` events: log-tamper detection (T1070.001/.002, pack #379), then the
+    /// unlink half of the write-new-then-unlink T1486 shape (#512 part B), which needs
+    /// the creation history `on_file_open` keeps.
+    fn detect_file_delete(&self, wrapped: &Event, event: &schema::FileDeleteEvent) {
+        self.record_rule_alerts(wrapped, rules::evaluate_file_delete(event));
+        self.record_rule_alerts(
+            wrapped,
+            self.rule_state.lock().unwrap().on_file_delete(event),
+        );
     }
 
     /// `Signal` events: security-process tampering (T1562.001, issue #362).
-    fn detect_signal(&self, event: &schema::SignalEvent) {
-        for alert in rules::evaluate_signal(event) {
-            self.emit(alert.technique, &alert.message);
-        }
+    fn detect_signal(&self, wrapped: &Event, event: &schema::SignalEvent) {
+        self.record_rule_alerts(wrapped, rules::evaluate_signal(event));
     }
 
     /// `FileRename` events: mass-rename ransomware detection (T1486, issue #262) +
     /// write-volume corroboration (issue #82).
-    fn detect_file_rename(&self, event: &schema::FileRenameEvent) {
-        for alert in self.rule_state.lock().unwrap().on_file_rename(event) {
-            self.emit(alert.technique, &alert.message);
-        }
+    fn detect_file_rename(&self, wrapped: &Event, event: &schema::FileRenameEvent) {
+        self.record_rule_alerts(
+            wrapped,
+            self.rule_state.lock().unwrap().on_file_rename(event),
+        );
     }
 
     /// `FileWrite` events: no alert on their own — tracks per-pid write volume for
@@ -401,6 +631,19 @@ impl DetectionSink {
     /// consumed on the next `FileRename`.
     fn detect_file_write(&self, event: &schema::FileWriteEvent) {
         self.rule_state.lock().unwrap().on_file_write(event);
+    }
+
+    /// `MemfdCreate` events (Linux, issue #265): usually no alert on its own —
+    /// tracks per-pid memfd-creation history consumed by the memfd-exec
+    /// signal (T1620, issue #497) on a later `Exec`. Can still emit directly
+    /// when a matching `/proc/.../fd/<n>` exec was already seen and is
+    /// waiting on this corroborating evidence (#503 review: the two ring
+    /// buffers can deliver out of order even though the kernel always
+    /// creates the memfd before executing it).
+    fn detect_memfd_create(&self, event: &schema::MemfdCreateEvent) {
+        for alert in self.rule_state.lock().unwrap().on_memfd_create(event) {
+            self.emit(alert.technique, &alert.message);
+        }
     }
 
     /// Writes one alert to the shared log and highlighted stderr. `pub(crate)`
@@ -418,65 +661,117 @@ impl DetectionSink {
     }
 }
 
-/// Resolves a content directory: next to the agent executable first, then the
-/// working directory. A cwd-relative path alone breaks under service managers
-/// (systemd runs with cwd=/, Windows services in System32), which silently
-/// disabled Sigma and YARA exactly in production deployments (review finding).
-fn content_dir(name: &str) -> Option<std::path::PathBuf> {
+/// What [`DetectionSink::reload_content`] (and, indirectly, [`DetectionSink::new`])
+/// reports about what's loaded after a (re)load.
+pub(crate) struct ReloadReport {
+    /// Rules loaded *after* the reload (the previous set if the reload failed).
+    pub(crate) sigma_rule_count: Option<usize>,
+    pub(crate) yara_rule_count: Option<usize>,
+    /// The content was present but failed to load; the previous engine kept running.
+    pub(crate) sigma_reload_failed: bool,
+    pub(crate) yara_reload_failed: bool,
+}
+
+/// Outcome of loading one content directory.
+enum Load<T> {
+    /// The directory does not exist — not an error.
+    Absent,
+    Loaded(T),
+    /// The directory exists but its content did not load (already logged).
+    Failed,
+}
+
+impl<T> Load<T> {
+    /// Startup posture: a broken directory leaves the engine unloaded.
+    fn into_option(self) -> Option<T> {
+        match self {
+            Self::Loaded(value) => Some(value),
+            Self::Absent | Self::Failed => None,
+        }
+    }
+}
+
+/// Resolves `content_dir` to an actual directory to load content from: next
+/// to the agent executable first, then the current working directory, same
+/// fallback order the old hardcoded `rules/sigma`/`rules/yara` convention
+/// used. A cwd-relative path alone breaks under service managers (systemd
+/// runs with cwd=/, Windows services in System32), which silently disabled
+/// Sigma and YARA exactly in production deployments (review finding this
+/// preserves). An absolute `content_dir` is used as-is — no fallback search
+/// needed when the caller already gave an unambiguous path.
+fn resolve_content_root(content_dir: &Path) -> PathBuf {
+    if content_dir.is_absolute() {
+        return content_dir.to_path_buf();
+    }
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        let candidate = dir.join(name);
+        let candidate = dir.join(content_dir);
         if candidate.is_dir() {
-            return Some(candidate);
+            return candidate;
         }
     }
-    let cwd_relative = std::path::PathBuf::from(name);
-    cwd_relative.is_dir().then_some(cwd_relative)
+    content_dir.to_path_buf()
 }
 
-/// Loads the Sigma content directory if present. Migrated from the old agent's
-/// `load_sigma_rules`.
-fn load_sigma_rules() -> Option<sigma::SigmaEngine> {
-    let rules_dir = content_dir("rules/sigma")?;
+/// Loads the Sigma content directory if present, under `content_root`.
+fn load_sigma_rules(content_root: &Path) -> Load<sigma::SigmaEngine> {
+    let rules_dir = content_root.join("rules/sigma");
+    if !rules_dir.is_dir() {
+        return Load::Absent;
+    }
     match sigma::SigmaEngine::load_dir(&rules_dir) {
         Ok(engine) => {
             tracing::info!(rules = engine.rule_count(), "sigma: rules loaded");
-            Some(engine)
+            Load::Loaded(engine)
         }
         Err(e) => {
             tracing::error!(error = %e, "sigma: load error");
-            None
+            Load::Failed
         }
     }
 }
 
-/// Loads rules/yara when present and starts the scan worker; matches are emitted as
-/// alerts by the worker thread through the shared alert log, and — issue #25 —
+/// Loads `rules/yara` under `content_root` when present and starts the scan
+/// worker, alongside the rule count for [`DetectionSink::reload_content`]'s
+/// report (the count is only available before [`yara::RuleSet`] is consumed
+/// by [`yara::ScanQueue::start`], so it has to travel out with the queue
+/// rather than be queried from it afterward). Matches are emitted as alerts
+/// by the worker thread through the shared alert log, and — issue #25 —
 /// trigger quarantine of the matched file through `response`, whenever
 /// `enable_response` set it.
 fn start_yara(
+    content_root: &Path,
     alert_log: Arc<AlertLog>,
     response: Arc<Mutex<Option<ResponseHooks>>>,
-) -> Option<yara::ScanQueue> {
-    let dir = content_dir("rules/yara")?;
+) -> Load<(yara::ScanQueue, usize)> {
+    let dir = content_root.join("rules/yara");
+    if !dir.is_dir() {
+        return Load::Absent;
+    }
     match yara::RuleSet::load_dir(&dir) {
         Ok(rules) => {
-            tracing::info!(rules = rules.rule_count(), "yara: rules loaded");
-            Some(yara::ScanQueue::start(rules, move |outcome| {
+            let rule_count = rules.rule_count();
+            tracing::info!(rules = rule_count, "yara: rules loaded");
+            let queue = yara::ScanQueue::start(rules, move |outcome| {
                 let matched = !outcome.matches.is_empty();
                 for rule in &outcome.matches {
-                    let message = format!("yara rule {rule} matched {}", outcome.path.display());
+                    let message = format!(
+                        "yara rule {} matched {}",
+                        rule.identifier,
+                        outcome.path.display()
+                    );
                     alert_log.record("YARA", message);
                 }
                 if matched {
                     quarantine_matched_payload(&response, &outcome.path, &alert_log);
                 }
-            }))
+            });
+            Load::Loaded((queue, rule_count))
         }
         Err(e) => {
             tracing::error!(error = %e, "yara: load error");
-            None
+            Load::Failed
         }
     }
 }
@@ -532,17 +827,18 @@ impl EventSink for DetectionSink {
         // or signature synchronously (issue #126).
         self.correlate(&event);
         match &event {
-            Event::Exec(e) => self.detect_exec(e),
-            Event::FileOpen(e) => self.detect_file_open(e),
-            Event::Connect(e) => self.detect_connect(e),
-            Event::NetworkFlow(e) => self.detect_network_flow(e),
-            Event::ListenPort(e) => self.detect_listen_port(e),
-            Event::Auth(e) => self.detect_auth(e),
-            Event::FileDelete(e) => self.detect_file_delete(e),
-            Event::Signal(e) => self.detect_signal(e),
+            Event::Exec(e) => self.detect_exec(&event, e),
+            Event::FileOpen(e) => self.detect_file_open(&event, e),
+            Event::Connect(e) => self.detect_connect(&event, e),
+            Event::NetworkFlow(e) => self.detect_network_flow(&event, e),
+            Event::ListenPort(e) => self.detect_listen_port(&event, e),
+            Event::Auth(e) => self.detect_auth(&event, e),
+            Event::FileDelete(e) => self.detect_file_delete(&event, e),
+            Event::Signal(e) => self.detect_signal(&event, e),
             Event::FileQuarantine(e) => self.detect_file_quarantine(e),
-            Event::FileRename(e) => self.detect_file_rename(e),
+            Event::FileRename(e) => self.detect_file_rename(&event, e),
             Event::FileWrite(e) => self.detect_file_write(e),
+            Event::MemfdCreate(e) => self.detect_memfd_create(e),
             // New telemetry categories reach the engines as they land; until a rule
             // consumes them, logging below is the whole treatment.
             _ => {}
@@ -649,6 +945,7 @@ mod tests {
                 &dir.join("alerts.ndjson"),
                 &dir.join("events.jsonl"),
                 None,
+                &dir.join("content"),
             )
             .unwrap(),
         )
@@ -710,6 +1007,63 @@ mod tests {
         assert!(
             alerts.contains("T1059.004"),
             "base64-decode rule must land in alerts.ndjson, got: {alerts}"
+        );
+    }
+
+    /// Issue #131/PR #502 review point 3: verdict fusion's own dedup (bounded
+    /// evidence, one composed severity per entity — see `crates/verdict`'s own
+    /// tests, e.g. `the_same_technique_from_a_second_engine_within_the_window_is_one_finding`)
+    /// must never mean a finding disappears from `alerts.ndjson` — that file is
+    /// the audit trail, and every finding lands there regardless of whether
+    /// fusion also folded it into the entity's already-live verdict.
+    #[test]
+    fn repeated_identical_exec_alerts_each_still_reach_the_alert_log() {
+        let dir = tmp("verdict-dedup");
+        let sink = sink_in(&dir);
+        let ev = exec(
+            50,
+            "bash -c echo cGF5bG9hZAo= | base64 -d | sh",
+            "/bin/bash",
+        );
+        sink.on_event(ev.clone());
+        sink.on_event(ev);
+        let alerts = alerts_in(&dir);
+        assert_eq!(
+            alerts.matches("T1059.004").count(),
+            2,
+            "verdict fusion dedups its own entity state, but alerts.ndjson is \
+             the audit trail — every occurrence must still land there: {alerts}"
+        );
+    }
+
+    /// The flip side of the dedup test: fusion is scoped per entity
+    /// (`(ppid, comm)`) — a different entity raising the identical technique
+    /// must still get its own finding, not be silently absorbed by the first
+    /// entity's state.
+    #[test]
+    fn the_same_technique_on_a_different_entity_still_alerts() {
+        let dir = tmp("verdict-cross-entity");
+        let sink = sink_in(&dir);
+        sink.on_event(exec(
+            60,
+            "bash -c echo cGF5bG9hZAo= | base64 -d | sh",
+            "/bin/bash",
+        ));
+        let mut other = exec(
+            61,
+            "bash -c echo cGF5bG9hZAo= | base64 -d | sh",
+            "/bin/bash",
+        );
+        if let Event::Exec(e) = &mut other {
+            e.meta.ppid = 2;
+            e.meta.comm = "sh".into();
+        }
+        sink.on_event(other);
+        let alerts = alerts_in(&dir);
+        assert_eq!(
+            alerts.matches("T1059.004").count(),
+            2,
+            "a distinct entity must get its own finding: {alerts}"
         );
     }
 
@@ -808,6 +1162,67 @@ mod tests {
         );
     }
 
+    /// PR #502 review: `maybe_kill`'s gate must read *this event's own*
+    /// evidence, not the entity's fused, sticky severity. `drive_bayes_crossing`'s
+    /// connect events all carry the fixture's neutral, unmodified
+    /// `(ppid, comm)` (`(0, "")`), so a second, unrelated pid's own connect
+    /// lands in the *same* verdict entity as the first pid's Bayes crossing —
+    /// exactly the "sibling process" collision the review found: a plain
+    /// `T1059/T1071` co-occurrence alert (`Medium`) on its own must never
+    /// trigger a kill just because that shared entity was earlier raised to
+    /// `Critical` by someone else's Bayes crossing.
+    #[test]
+    fn a_siblings_weak_alert_never_triggers_kill_from_anothers_bayes_crossing() {
+        let dir = tmp("bayes-sibling");
+        let sink = sink_in(&dir);
+        let killed = Arc::new(Mutex::new(Vec::new()));
+        let killed_rec = Arc::clone(&killed);
+        sink.enable_response(
+            policy::ResponsePolicy {
+                kill_enabled: true,
+                quarantine_enabled: false,
+            },
+            move |pid| {
+                killed_rec.lock().unwrap().push(pid);
+                Ok(())
+            },
+            dir.join("quarantine"),
+        );
+
+        // pid 5001 crosses Bayes — raises the shared `(0, "")` verdict entity
+        // to `Critical` and gets killed, exactly as before.
+        drive_bayes_crossing(&sink, 5001);
+
+        // pid 5002: one exec, one connect 40s later — outside
+        // VERDICT_DEDUP_WINDOW_NS (30s), so this produces a genuine fresh
+        // verdict for the shared entity, not a silently-absorbed duplicate.
+        // Correlator's own window is 60s, so the co-occurrence rule still
+        // fires: a plain, weak `T1059/T1071` finding, nothing Bayesian.
+        sink.on_event(exec(5002, "bash -c true", "/bin/bash"));
+        sink.on_event(Event::Connect(ConnectEvent {
+            meta: EventMeta {
+                pid: 5002,
+                timestamp_ns: 40_000_000_000,
+                ..schema::fixtures::meta()
+            },
+            daddr: std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+            dport: 443,
+        }));
+
+        let alerts = alerts_in(&dir);
+        assert!(
+            alerts.contains("T1059/T1071"),
+            "the sibling's weak co-occurrence finding must still alert: {alerts}"
+        );
+        assert_eq!(
+            *killed.lock().unwrap(),
+            vec![5001],
+            "only the pid that actually crossed Bayes may be killed — the \
+             sibling's own weak finding must not ride the shared entity's \
+             sticky severity to a kill: {alerts}"
+        );
+    }
+
     #[test]
     fn events_and_spool_receive_the_raw_event_via_the_enrich_worker() {
         let dir = tmp("spool");
@@ -821,6 +1236,7 @@ mod tests {
                 &dir.join("alerts.ndjson"),
                 &dir.join("events.jsonl"),
                 Some(Arc::clone(&spool)),
+                &dir.join("content"),
             )
             .unwrap(),
         );
@@ -852,5 +1268,148 @@ mod tests {
         let dir = tmp("dyn");
         let sink: Arc<dyn schema::sensor::EventSink> = sink_in(&dir);
         sink.on_event(exec(9, "true", "/bin/true"));
+    }
+
+    // ── reload_content (issue #30) ──────────────────────────────────────
+
+    /// A minimal, valid Sigma rule (issue #73's required metadata: `level`,
+    /// `falsepositives`, an ATT&CK tag, and a recognized platform directory
+    /// — the last one is why the test writes it under a `.../linux/` path,
+    /// not just any temp dir) matching on an image path no other rule in
+    /// this crate's tests, or `crates/rules`' deterministic checks, would
+    /// ever incidentally match.
+    const RELOAD_TEST_SIGMA_RULE: &str = r#"
+title: reload-content test marker rule
+tags:
+  - attack.t1059
+level: low
+falsepositives:
+  - none, test-only rule
+detection:
+  selection:
+    Image|endswith:
+      - '/reload-content-marker'
+  condition: selection
+"#;
+
+    #[test]
+    fn reload_content_picks_up_a_sigma_rule_added_after_construction() {
+        let dir = tmp("reload-sigma");
+        let sink = sink_in(&dir);
+
+        // Before reload: no Sigma engine loaded yet (content dir is empty),
+        // so this exec produces no Sigma-sourced alert.
+        sink.on_event(exec(900, "run", "/opt/reload-content-marker"));
+        assert!(
+            !alerts_in(&dir).contains("reload-content test marker rule"),
+            "no sigma engine should be loaded before the first reload"
+        );
+
+        let sigma_dir = dir
+            .join("content")
+            .join("rules")
+            .join("sigma")
+            .join("linux");
+        std::fs::create_dir_all(&sigma_dir).unwrap();
+        std::fs::write(sigma_dir.join("marker.yml"), RELOAD_TEST_SIGMA_RULE).unwrap();
+
+        let report = sink.reload_content();
+        assert_eq!(
+            report.sigma_rule_count,
+            Some(1),
+            "the one rule just written must load"
+        );
+        assert_eq!(
+            report.yara_rule_count, None,
+            "no rules/yara directory exists in this test's content dir"
+        );
+
+        sink.on_event(exec(901, "run", "/opt/reload-content-marker"));
+        assert!(
+            alerts_in(&dir).contains("reload-content test marker rule"),
+            "the reloaded rule must now fire: {}",
+            alerts_in(&dir)
+        );
+    }
+
+    #[test]
+    fn reload_content_with_no_content_dir_present_unloads_cleanly() {
+        let dir = tmp("reload-empty");
+        let sink = sink_in(&dir);
+        let report = sink.reload_content();
+        assert_eq!(report.sigma_rule_count, None);
+        assert_eq!(report.yara_rule_count, None);
+        // Still safe to process events after a no-op reload.
+        sink.on_event(exec(902, "ls", "/bin/ls"));
+    }
+
+    const RELOAD_TEST_YARA_RULE: &str = r#"
+rule reload_content_test_marker {
+    meta:
+        technique = "T1105"
+        severity = "low"
+        falsepositives = "none, test-only rule"
+    strings:
+        $m = "RELOAD-CONTENT-YARA-MARKER"
+    condition:
+        $m
+}
+"#;
+
+    #[test]
+    fn reload_content_keeps_the_previous_yara_rules_when_the_new_set_is_broken() {
+        // YARA's `load_dir` is all-or-nothing (a rule that doesn't compile is a
+        // hard error), which is the case a reload must survive: an applied,
+        // signed-but-broken rule set must not switch scanning off.
+        let dir = tmp("reload-broken-keeps-old");
+        let sink = sink_in(&dir);
+        let yara_dir = dir.join("content").join("rules").join("yara");
+        std::fs::create_dir_all(&yara_dir).unwrap();
+        std::fs::write(yara_dir.join("marker.yar"), RELOAD_TEST_YARA_RULE).unwrap();
+        let report = sink.reload_content();
+        assert_eq!(report.yara_rule_count, Some(1));
+        assert!(!report.yara_reload_failed);
+
+        std::fs::write(yara_dir.join("broken.yar"), "rule nope { condition: \n").unwrap();
+        let report = sink.reload_content();
+        assert!(report.yara_reload_failed, "a rule that fails to compile");
+        assert_eq!(
+            report.yara_rule_count,
+            Some(1),
+            "the previous scan queue must keep running"
+        );
+
+        // Fixing the content recovers on the next reload.
+        std::fs::remove_file(yara_dir.join("broken.yar")).unwrap();
+        let report = sink.reload_content();
+        assert!(!report.yara_reload_failed);
+        assert_eq!(report.yara_rule_count, Some(1));
+    }
+
+    #[test]
+    fn reload_content_drops_a_rule_whose_file_was_removed() {
+        let dir = tmp("reload-remove");
+        let sink = sink_in(&dir);
+        let sigma_dir = dir
+            .join("content")
+            .join("rules")
+            .join("sigma")
+            .join("linux");
+        std::fs::create_dir_all(&sigma_dir).unwrap();
+        std::fs::write(sigma_dir.join("marker.yml"), RELOAD_TEST_SIGMA_RULE).unwrap();
+        assert_eq!(sink.reload_content().sigma_rule_count, Some(1));
+
+        std::fs::remove_dir_all(dir.join("content")).unwrap();
+        let report = sink.reload_content();
+        assert_eq!(
+            report.sigma_rule_count, None,
+            "removing the content dir must unload the engine, not error"
+        );
+
+        sink.on_event(exec(903, "run", "/opt/reload-content-marker"));
+        assert!(
+            !alerts_in(&dir).contains("reload-content test marker rule"),
+            "the removed rule must no longer fire"
+        );
     }
 }

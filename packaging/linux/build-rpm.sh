@@ -16,14 +16,15 @@ echo "Version: $VERSION"
 
 # Build binaries
 echo "Building release binaries..."
-cargo build --release --bins --exclude sensor-linux-ebpf
+cargo build --release --workspace --bins --exclude sensor-linux-ebpf
 
 # Create source tarball
 echo "Creating source tarball..."
 tar czf "$RPMBUILD_DIR/SOURCES/synthaea-agent-$VERSION.tar.gz" \
   --transform "s,^,synthaea-agent-$VERSION/," \
   --exclude-vcs --exclude target \
-  agent/ watchdog/ cli/ crates/ Cargo.* packaging/linux/systemd/
+  agent/ watchdog/ cli/ crates/ Cargo.* rust-toolchain.toml ebpf-toolchain.txt LICENSE README.md \
+  packaging/linux/systemd/
 
 # Copy spec file
 cp packaging/linux/rpm/synthaea-agent.spec.template \

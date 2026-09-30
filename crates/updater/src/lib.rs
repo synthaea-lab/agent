@@ -8,9 +8,15 @@
 //! This first slice implements ADR-0015's Linux-first scope: binary self-update —
 //! manifest signing/verification ([`manifest`]), the `bootstrap`/`current`/`versions`
 //! layout and its atomic symlink swap (`layout`, Linux-only), and the local ban
-//! list ([`banlist`]) that `rollback` (Linux-only) reads and writes. Content
-//! distribution (rules/models via canary rings, issues #73/#49) and Windows/macOS
-//! binary self-update are out of scope — see the ADR's Deferred section.
+//! list ([`banlist`]) that `rollback` (Linux-only) reads and writes. Windows/macOS
+//! binary self-update is out of scope — see the ADR's Deferred section.
+//!
+//! Content distribution (rules/models via canary rings, ADR-0016, issues #73/#49)
+//! adds [`content`]: verification of a signed [`ContentManifest`] against the
+//! same embedded key, and per-entry hash comparison against what's already
+//! applied. Fetching the manifest over the network, downloading artifacts, and
+//! reloading rules/models into a running agent are still the binary's job, not
+//! this crate's — same LEAF-crate reasoning as below.
 //!
 //! Deliberately library-only: wiring this into `agent`/`watchdog` (heartbeat
 //! registration via `tamper::heartbeat::SilenceMonitor`, supervised restart,
@@ -19,13 +25,16 @@
 //! (`tools/check-deps.py`); only a binary may compose all three.
 
 pub mod banlist;
+pub mod content;
 pub mod error;
+pub mod fsutil;
 pub mod hash;
 pub mod key;
 #[cfg(target_os = "linux")]
 pub mod layout;
 pub mod manifest;
 
+pub use content::{ContentEntry, ContentManifest};
 pub use error::UpdaterError;
 pub use manifest::ReleaseManifest;
 
@@ -53,7 +62,14 @@ pub fn rollback(
     }
     let mut banned = banlist::BannedVersions::load(ban_list_path)?;
     banned.ban(failed);
-    banned.save(ban_list_path)
+    banned.save(ban_list_path)?;
+    // The ban list keeps the release from being re-staged, but its directory
+    // would still be picked as a rollback target or kept by pruning; remove it
+    // so nothing can select it again (PR #533 review). Best effort: a leftover
+    // directory costs disk, and `Layout::rollback_target` skips banned releases
+    // regardless.
+    let _ = layout.prune(failed);
+    Ok(())
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -117,6 +133,10 @@ mod integration_tests {
 
         let banned = crate::banlist::BannedVersions::load(&ban_list_path).unwrap();
         assert!(banned.is_banned(2));
+        assert!(
+            !layout.version_dir(2).exists(),
+            "the failed release's directory is removed so nothing can pick it again"
+        );
 
         // A second offer of the exact same failed release is refused — the same
         // manifest that verified and staged cleanly the first time is now

@@ -11,7 +11,7 @@ use windows_sys::Win32::{
         Authorization::ConvertSidToStringSidW, GetTokenInformation, TOKEN_MANDATORY_LABEL,
         TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenUser,
     },
-    Storage::FileSystem::QueryDosDeviceW,
+    Storage::FileSystem::{GetLongPathNameW, QueryDosDeviceW},
     System::{
         Diagnostics::{
             Debug::ReadProcessMemory,
@@ -297,6 +297,30 @@ pub(crate) fn build_volume_map() -> HashMap<String, String> {
     map
 }
 
+// ── #489: 8.3 short-name expansion ───────────────────────────────────────────
+
+/// `path` with its 8.3 short components replaced by their long names, via
+/// `GetLongPathNameW`. `None` if the path doesn't exist or can't be queried —
+/// the caller keeps the raw form. Driven by [`crate::long_path::expand`].
+pub(crate) fn long_path_name(path: &str) -> Option<String> {
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut buf = vec![0u16; 512];
+    // One retry: a first call that doesn't fit returns the size needed.
+    for _ in 0..2 {
+        let cap = u32::try_from(buf.len()).ok()?;
+        // SAFETY: `wide` is NUL-terminated; `buf` is valid for `cap` wide chars.
+        let n = unsafe { GetLongPathNameW(wide.as_ptr(), buf.as_mut_ptr(), cap) };
+        if n == 0 {
+            return None;
+        }
+        if n < cap {
+            return Some(String::from_utf16_lossy(&buf[..n as usize]));
+        }
+        buf.resize(n as usize, 0);
+    }
+    None
+}
+
 // ── Process-table seeding + live lookup (carried over from the old sensor) ───
 
 /// Fills the pid→image table with every process running at call time (before the
@@ -356,5 +380,42 @@ pub(crate) fn resolve_pid_live(pid: u32) -> Option<String> {
         }
         let path = String::from_utf16_lossy(&buf[..len as usize]);
         Some(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+
+    use super::*;
+
+    fn short_path_name(path: &str) -> String {
+        let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut buf = [0u16; 512];
+        // SAFETY: `wide` is NUL-terminated; `buf` is valid for 512 wide chars.
+        let n = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), 512) };
+        assert!(n > 0 && n < 512, "GetShortPathNameW failed for {path}");
+        String::from_utf16_lossy(&buf[..n as usize])
+    }
+
+    /// Holds whether or not the volume generates 8.3 names: without them the
+    /// short form is the long form and the round trip is the identity.
+    #[test]
+    fn a_short_path_round_trips_to_its_long_form() {
+        let dir = std::env::temp_dir().join(format!("synthaea long path {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a long file name.exe");
+        std::fs::write(&file, b"x").unwrap();
+        let long = long_path_name(file.to_str().unwrap());
+        let short = short_path_name(file.to_str().unwrap());
+        let expanded = long_path_name(&short);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(expanded, long);
+        assert!(expanded.unwrap().ends_with(r"\a long file name.exe"));
+    }
+
+    #[test]
+    fn a_missing_path_has_no_long_form() {
+        assert_eq!(long_path_name(r"C:\definitely\not\here~1\x.exe"), None);
     }
 }

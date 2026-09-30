@@ -11,12 +11,13 @@ use schema::{
 use crate::{
     O_CREAT, O_WRONLY, RuleState, check_account_creation_persistence, check_base64_decode,
     check_btm_launch_item_persistence, check_encoded_powershell, check_ld_preload_hijack,
-    check_memfd_exec, check_persistence_write, check_proc_root_escape,
-    check_scheduled_task_persistence, check_scheduled_task_update_persistence,
-    check_service_install_persistence, check_systemd_service_persistence,
+    check_persistence_write, check_proc_root_escape, check_scheduled_task_persistence,
+    check_scheduled_task_update_persistence, check_service_install_persistence,
+    check_service_unusual_outbound, check_systemd_service_persistence,
     exclusions::{
         AUTH_FAILURE_THRESHOLD, BEACON_THRESHOLD, BURST_WRITE_BYTES_THRESHOLD,
-        RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SELF_SPAWN_THRESHOLD,
+        MEMFD_EXEC_WINDOW_NS, RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS,
+        SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS, SELF_SPAWN_THRESHOLD,
     },
 };
 
@@ -102,6 +103,41 @@ fn file_rename_event_full(
     event.meta.timestamp_ns = timestamp_ns;
     event.meta.comm = comm.to_string();
     event
+}
+
+fn file_delete_event_full(
+    pid: u32,
+    comm: &str,
+    path: &str,
+    timestamp_ns: u64,
+) -> schema::FileDeleteEvent {
+    schema::FileDeleteEvent {
+        path: path.to_string(),
+        meta: EventMeta {
+            pid,
+            comm: comm.to_string(),
+            timestamp_ns,
+            ..meta()
+        },
+    }
+}
+
+/// A `memfd_create` returning fd 3 — the first free descriptor after stdio, and the
+/// `<n>` every `/proc/self/fd/3` exec in these tests names.
+fn memfd_create_event_full(pid: u32, timestamp_ns: u64) -> schema::MemfdCreateEvent {
+    memfd_create_event_with_fd(pid, timestamp_ns, 3)
+}
+
+fn memfd_create_event_with_fd(pid: u32, timestamp_ns: u64, fd: i32) -> schema::MemfdCreateEvent {
+    schema::MemfdCreateEvent {
+        meta: EventMeta {
+            pid,
+            timestamp_ns,
+            ..meta()
+        },
+        fd,
+        ..schema::fixtures::memfd_create()
+    }
 }
 
 fn file_write_event_full(

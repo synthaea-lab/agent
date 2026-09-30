@@ -9,7 +9,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{error::UpdaterError, hash::hash_file, manifest::ReleaseManifest};
+use crate::{
+    banlist::BannedVersions, error::UpdaterError, hash::hash_file, manifest::ReleaseManifest,
+};
 
 /// Name of the `current` symlink, directly under [`Layout::base_dir`].
 const CURRENT_LINK: &str = "current";
@@ -19,6 +21,9 @@ const BOOTSTRAP_DIR: &str = "bootstrap";
 /// Name of the updater-managed versions directory, directly under the base
 /// directory.
 const VERSIONS_DIR: &str = "versions";
+/// Name of the marker file a release writes into its own directory once it has
+/// passed its post-promotion health check (ADR-0015 Decision 6).
+const HEALTHY_MARKER: &str = ".healthy";
 
 /// The `bootstrap`/`current`/`versions` layout rooted at one base directory
 /// (`/var/lib/synthaea` in production; a temp dir in tests).
@@ -224,6 +229,76 @@ impl Layout {
         })
     }
 
+    /// Every release directory under `versions/`, ascending. A name that is not
+    /// `v<number>` (a stray file, a half-staged temp directory) is ignored: only
+    /// directories this crate itself creates count as releases.
+    #[must_use]
+    pub fn installed_versions(&self) -> Vec<u64> {
+        let Ok(entries) = fs::read_dir(self.versions_dir()) else {
+            return Vec::new();
+        };
+        let mut versions: Vec<u64> = entries
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| {
+                entry
+                    .file_name()
+                    .to_str()?
+                    .strip_prefix('v')?
+                    .parse::<u64>()
+                    .ok()
+            })
+            .collect();
+        versions.sort_unstable();
+        versions
+    }
+
+    /// The release a failed `release_version` should roll back to: the newest
+    /// installed release strictly older than it that is **known good**, meaning
+    /// it passed its own health check ([`Self::mark_healthy`]) and is not on the
+    /// ban list. `None` means fall back to `bootstrap`, the one floor that is
+    /// always good. A release that was never proven, or that failed, must not be
+    /// a rollback target: landing on it just runs a known-bad release again (PR
+    /// #533 review).
+    #[must_use]
+    pub fn rollback_target(&self, release_version: u64, banned: &BannedVersions) -> Option<u64> {
+        self.installed_versions()
+            .into_iter()
+            .rev()
+            .find(|&v| v < release_version && !banned.is_banned(v) && self.is_healthy(v))
+    }
+
+    /// Records that `release_version` passed its health check (ADR-0015
+    /// Decision 6), so a later start of the same release is not put on probation
+    /// again. Written through a same-directory temp file and `rename` like every
+    /// other file this crate persists.
+    ///
+    /// # Errors
+    ///
+    /// [`UpdaterError::Io`] if the marker cannot be written.
+    pub fn mark_healthy(&self, release_version: u64) -> Result<(), UpdaterError> {
+        let dir = self.version_dir(release_version);
+        let marker = dir.join(HEALTHY_MARKER);
+        let tmp = dir.join(format!("{HEALTHY_MARKER}.tmp"));
+        fs::write(&tmp, b"").map_err(|source| UpdaterError::Io {
+            path: tmp.clone(),
+            source,
+        })?;
+        fs::rename(&tmp, &marker).map_err(|source| UpdaterError::Io {
+            path: marker,
+            source,
+        })
+    }
+
+    /// Whether `release_version` has passed its health check
+    /// ([`Self::mark_healthy`]).
+    #[must_use]
+    pub fn is_healthy(&self, release_version: u64) -> bool {
+        self.version_dir(release_version)
+            .join(HEALTHY_MARKER)
+            .is_file()
+    }
+
     /// Deletes a superseded release's directory entirely (ADR-0015 Decision 8:
     /// called once the *new* release has passed its health check, keeping exactly
     /// two release trees on disk at steady state). Never call this on the release
@@ -395,5 +470,75 @@ mod tests {
     fn prune_is_idempotent_on_an_already_gone_directory() {
         let (_dir, layout) = layout();
         assert!(layout.prune(99).is_ok());
+    }
+
+    #[test]
+    fn installed_versions_lists_release_directories_ascending_and_ignores_strays() {
+        let (_dir, layout) = layout();
+        for v in [10, 2, 7] {
+            fs::create_dir_all(layout.version_dir(v)).unwrap();
+        }
+        fs::create_dir_all(layout.versions_dir().join("not-a-release")).unwrap();
+        fs::create_dir_all(layout.versions_dir().join("vX")).unwrap();
+        fs::write(layout.versions_dir().join("v99"), b"a file, not a dir").unwrap();
+        assert_eq!(layout.installed_versions(), vec![2, 7, 10]);
+    }
+
+    #[test]
+    fn rollback_target_is_the_newest_older_release_that_is_healthy_and_not_banned() {
+        let (_dir, layout) = layout();
+        for v in [1, 3, 4, 5] {
+            fs::create_dir_all(layout.version_dir(v)).unwrap();
+        }
+        // 1 and 3 proved themselves; 4 never did; 3 later ended up banned.
+        layout.mark_healthy(1).unwrap();
+        layout.mark_healthy(3).unwrap();
+        let mut banned = BannedVersions::default();
+        assert_eq!(layout.rollback_target(5, &banned), Some(3));
+        assert_eq!(
+            layout.rollback_target(5, &banned),
+            layout.rollback_target(4, &banned),
+            "an unproven release (4) is never a target"
+        );
+        banned.ban(3);
+        assert_eq!(
+            layout.rollback_target(5, &banned),
+            Some(1),
+            "banned 3 is skipped"
+        );
+        assert_eq!(
+            layout.rollback_target(1, &banned),
+            None,
+            "nothing older: bootstrap"
+        );
+        // A release that is not installed still has a well-defined target.
+        assert_eq!(layout.rollback_target(9, &banned), Some(1));
+    }
+
+    #[test]
+    fn with_no_proven_release_the_target_is_bootstrap() {
+        let (_dir, layout) = layout();
+        fs::create_dir_all(layout.version_dir(1)).unwrap();
+        assert_eq!(layout.rollback_target(2, &BannedVersions::default()), None);
+    }
+
+    #[test]
+    fn a_release_is_unhealthy_until_it_is_marked() {
+        let (_dir, layout) = layout();
+        fs::create_dir_all(layout.version_dir(2)).unwrap();
+        assert!(!layout.is_healthy(2));
+        layout.mark_healthy(2).unwrap();
+        assert!(layout.is_healthy(2));
+        assert!(!layout.is_healthy(3), "the marker is per release");
+    }
+
+    #[test]
+    fn marking_a_release_that_is_not_installed_fails_instead_of_creating_it() {
+        let (_dir, layout) = layout();
+        assert!(matches!(
+            layout.mark_healthy(42),
+            Err(UpdaterError::Io { .. })
+        ));
+        assert!(!layout.version_dir(42).exists());
     }
 }

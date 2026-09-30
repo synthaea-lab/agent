@@ -101,6 +101,7 @@ pub fn policy_denial_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
         tcontext,
         tclass,
         permissive,
+        object_path,
     } = evt
     else {
         panic!("normalize::policy_denial_event called on non-PolicyDenial event");
@@ -121,6 +122,7 @@ pub fn policy_denial_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
         object_class: tclass.clone(),
         action: None, // Not yet parsed — see PolicyDenialEvent's doc
         enforced: !permissive,
+        object_path: object_path.clone(),
     })
 }
 
@@ -186,6 +188,7 @@ mod tests {
             tcontext: Some("system_u:object_r:user_home_t:s0".to_string()),
             tclass: Some("file".to_string()),
             permissive: false,
+            object_path: Some("/home/alice/.ssh/id_rsa".to_string()),
         };
 
         let schema_evt = policy_denial_event(&audit_evt, 1_756_900_100_000_000_000);
@@ -205,6 +208,7 @@ mod tests {
                 assert_eq!(e.object_class.as_deref(), Some("file"));
                 assert_eq!(e.action, None);
                 assert!(e.enforced);
+                assert_eq!(e.object_path.as_deref(), Some("/home/alice/.ssh/id_rsa"));
             }
             _ => panic!("expected Event::PolicyDenial"),
         }
@@ -218,6 +222,7 @@ mod tests {
             tcontext: None,
             tclass: Some("process".to_string()),
             permissive: true,
+            object_path: None,
         };
 
         let Event::PolicyDenial(e) = policy_denial_event(&audit_evt, 0) else {
@@ -225,6 +230,7 @@ mod tests {
         };
         assert!(!e.enforced);
         assert_eq!(e.meta.comm, "unknown"); // Honest: no comm on this record
+        assert_eq!(e.object_path, None);
     }
 
     #[test]

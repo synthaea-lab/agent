@@ -173,10 +173,46 @@ pub mod time;
 /// to `u64` and the new optional [`KernelModuleEvent::path`] (#457). A v27
 /// reader rejects a capability mask above `u32::MAX` (`CAP_BPF` is bit 39),
 /// so the widening is serialization-visible even though every value below
-/// 2^32 still serializes identically. 28 is claimed by #469 (ATT&CK technique
-/// ids) while both branches are open; whichever merges second renumbers —
-/// same coordination note as v13 and ADR-0005.
-pub const SCHEMA_VERSION: u32 = 29;
+/// 2^32 still serializes identically. 28 was claimed by #469 (ATT&CK technique
+/// ids) while both branches were open; #457 merged first, so #469 renumbers
+/// below — same coordination note as v13 and ADR-0005.
+///
+/// Bumped 29 → 30 for [`PolicyDenialEvent::object_path`] (#427, Linux half:
+/// filled from the AVC record's `path=`/`name=`; the Windows `AppLocker` half —
+/// switching the 8004 emitter off `FileOpenEvent` and adding the 8003 audit-
+/// mode target — is a separate follow-up, #428 was step 1 only).
+///
+/// Bumped 30 → 31 for [`detection::Detection::techniques`] (#74): structured
+/// ATT&CK technique identifiers on a detection, additive `Vec<String>`
+/// alongside `attributions`, no new variant. 30 was claimed by #469 while
+/// both branches were open; #427/#490 merged first, so #469 renumbers here —
+/// same coordination note as v13, v28→29, and ADR-0005. Same
+/// serialization-visible reasoning as every field addition since v13.
+///
+/// Bumped 31 → 32 for [`FileRenameEvent::executable_path`] (#459 part 1): the
+/// renaming process's own executable path, so an evidence-gated exclusion
+/// (comm + trusted path, `policy::name_exclusion_applies`) can discriminate
+/// `sed -i.bak`/`perl -i.orig` from a real mass-rename encryptor instead of
+/// trusting `comm` alone. `None` when the sensor couldn't resolve it (macOS
+/// ES always provides it for free; Linux reads `/proc/<pid>/exe` at rename
+/// time and the pid can have already exited by then — see
+/// `sensor-linux/normalize.rs`'s doc for that race). 31 was claimed by #74
+/// while both branches were open; #74 merged first, so this one renumbers —
+/// same coordination note as v13, v28→29, and v30→31 above.
+///
+/// Bumped 32 → 33 for [`MemfdCreateEvent::fd`] (#510): the descriptor
+/// `memfd_create(2)` returned, so `check_memfd_exec` can compare it to the
+/// `<n>` of an exec via `/proc/self/fd/<n>` instead of correlating on pid and
+/// time alone. 32 was claimed by #513 (`FileRenameEvent::executable_path`) while
+/// both branches were open; #513 merged first, so this one renumbers — same
+/// coordination note as v13, v28→29 and v30→31 above.
+///
+/// Bumped 33 → 34 for [`Event::Prctl`] (#457): the two `prctl(2)` options that
+/// reshape a process tree's privilege ceiling, `PR_SET_SECUREBITS` and
+/// `PR_CAPBSET_DROP`, filtered at the source. Linux-only, no cross-platform
+/// reuse (same posture as `Ptrace`/`Namespace`). Same serialization-visible
+/// reasoning as v13-v33.
+pub const SCHEMA_VERSION: u32 = 34;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -281,9 +317,14 @@ pub const FLAG_PERSISTENCE_BTM_ARTIFACT: u32 = 0x0400_0000;
 /// signal — a known-bad payload was stopped at the OS boundary — that the
 /// EDR still forwards so operators see the attempt.
 ///
-/// Reuses [`FileOpenEvent`] like the other Windows persistence flags (see
-/// ADR-0004): `path` carries `FilePath` from the event's `RuleAndFileData`
-/// section, `meta::comm` carries its leaf name.
+/// **No longer emitted** (#427): `sensor-windows-eventlog` now reports 8004
+/// (and the 8003 audit-mode twin) as [`Event::PolicyDenial`] with
+/// [`POLICY_MECHANISM_APPLOCKER`]. The constant stays so the bit is never
+/// reassigned to another technique — a stale reader must not misread it.
+///
+/// Historically reused [`FileOpenEvent`] like the other Windows persistence
+/// flags (see ADR-0004): `path` carried `FilePath` from the event's
+/// `RuleAndFileData` section, `meta::comm` its leaf name.
 ///
 /// Not a persistence-family flag — the executable never ran, so nothing was
 /// installed — but it lives in the same reserved high-bit space because the
@@ -640,6 +681,14 @@ pub struct FileRenameEvent {
     pub meta: EventMeta,
     pub old_path: String,
     pub new_path: String,
+    /// The renaming process's own executable path (#459 part 1) — `None`
+    /// when the sensor couldn't resolve it (see [`SCHEMA_VERSION`]'s v31
+    /// changelog entry for the per-platform reasoning). Lets an
+    /// evidence-gated exclusion tell a real in-place-edit tool
+    /// (`/usr/bin/sed`) from an encryptor claiming `comm=sed` apart, instead
+    /// of trusting `comm` alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_path: Option<String>,
 }
 
 /// File permission change (issue #262 Phase 2): `chmod(2)`/`fchmodat(2)`. `fchmod(2)`
@@ -818,6 +867,12 @@ pub struct MemfdCreateEvent {
     pub name: String,
     /// `MFD_CLOEXEC`, `MFD_ALLOW_SEALING`, ...
     pub flags: u32,
+    /// The file descriptor `memfd_create(2)` returned (#510). Only successful
+    /// creations are reported, so this is always `>= 0`. It is what the exec
+    /// path's `<n>` in `/proc/self/fd/<n>` names, which is the one piece of
+    /// evidence that the executed fd *is* this memfd and not an unrelated
+    /// descriptor opened in the same window.
+    pub fd: i32,
 }
 
 /// DNS resolution — the query name and answer, joined to the resolving process.
@@ -1398,6 +1453,14 @@ pub struct XpcConnectEvent {
 /// (`sensor-linux-audit`, #297).
 pub const POLICY_MECHANISM_SELINUX: &str = "selinux";
 
+/// [`PolicyDenialEvent::mechanism`] value for Windows `AppLocker` verdicts
+/// (`sensor-windows-eventlog`, #427): event 8004 (blocked, `enforced: true`)
+/// and 8003 (audit mode, would have been blocked, `enforced: false`) on the
+/// `Microsoft-Windows-AppLocker/EXE and DLL` channel. A new value of an
+/// existing `String` field — not a schema version bump (see
+/// [`PolicyDenialEvent`]'s doc on why `mechanism` is not a closed enum).
+pub const POLICY_MECHANISM_APPLOCKER: &str = "applocker";
+
 /// An OS security mechanism denied a subject an action on an object —
 /// `SELinux`/`AppArmor` on Linux, AppLocker/WDAC on Windows, TCC/Gatekeeper on
 /// macOS all report the same underlying shape (issue #297). A dedicated,
@@ -1422,7 +1485,8 @@ pub const POLICY_MECHANISM_SELINUX: &str = "selinux";
 pub struct PolicyDenialEvent {
     pub meta: EventMeta,
     /// Which security mechanism denied the action — see
-    /// [`POLICY_MECHANISM_SELINUX`] for the one value emitted today.
+    /// [`POLICY_MECHANISM_SELINUX`] and [`POLICY_MECHANISM_APPLOCKER`] for the
+    /// values emitted today.
     pub mechanism: String,
     /// The acting subject's security context (`SELinux` `scontext`, e.g.
     /// `system_u:system_r:httpd_t:s0`). Opaque per-mechanism label syntax —
@@ -1445,6 +1509,17 @@ pub struct PolicyDenialEvent {
     /// enforcing mode); `false` when it only logged what it would have
     /// blocked (`SELinux` permissive mode) — `!permissive` at the source.
     pub enforced: bool,
+    /// The object's filesystem path, when the mechanism reported one (issue
+    /// #427). On Linux, from the AVC record's `path=` field, or `name=` when
+    /// `path=` is absent — the kernel only has what the syscall's arguments
+    /// gave it, which for `name=` is often a bare filename rather than a full
+    /// path (no `PATH` record correlation here, see
+    /// `AuditEvent::PolicyDenial`'s doc on why this sensor treats AVC as
+    /// supplementary rather than reassembling `type=PATH` siblings for it).
+    /// `None` when neither field is present, e.g. `tclass` values that don't
+    /// name a file (`process`, `capability`, `tcp_socket`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_path: Option<String>,
 }
 
 /// Which of the three kernel-module syscalls produced a [`KernelModuleEvent`].
@@ -1504,6 +1579,35 @@ pub struct BpfEvent {
     /// filtered commands above; not decoded to a name here, same
     /// "sensor reports, detection interprets" split as `PtraceEvent::request`.
     pub cmd: u32,
+}
+
+/// `prctl(2)` option: drop a capability from the calling thread's bounding set
+/// (`arg` is the capability number). Irreversible for the thread.
+pub const PR_CAPBSET_DROP: u32 = 24;
+
+/// `prctl(2)` option: set the calling thread's securebits (`arg` is the
+/// `SECBIT_*` bitmask, e.g. `SECBIT_NOROOT`, `SECBIT_NO_SETUID_FIXUP`, and the
+/// `*_LOCKED` bits that make them permanent).
+pub const PR_SET_SECUREBITS: u32 = 28;
+
+/// Capability-model tampering via `prctl(2)` (issue #457, from #266): the two
+/// options that change *which privileges a process tree can ever hold*,
+/// [`PR_SET_SECUREBITS`] and [`PR_CAPBSET_DROP`]. Filtered at the source — every
+/// other `prctl` option (dozens, some very hot, e.g. `PR_SET_NAME`) never reaches
+/// this event stream (see `sensor-linux-wire::PrctlEvent`'s doc). Legitimate
+/// users exist (systemd's `CapabilityBoundingSet=`, container runtimes dropping
+/// their bounding set at start), so this is telemetry for the detection layer to
+/// interpret, not a verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrctlEvent {
+    pub meta: EventMeta,
+    /// Raw `prctl` option: always [`PR_SET_SECUREBITS`] or [`PR_CAPBSET_DROP`];
+    /// not decoded to a name here, same "sensor reports, detection interprets"
+    /// split as [`BpfEvent::cmd`].
+    pub option: u32,
+    /// The option's `arg2`: the `SECBIT_*` mask for [`PR_SET_SECUREBITS`], the
+    /// capability number for [`PR_CAPBSET_DROP`].
+    pub arg: u64,
 }
 
 /// Which user/group identity syscall produced an [`IdentityChangeEvent`].
@@ -1640,6 +1744,7 @@ pub enum Event {
     IdentityChange(IdentityChangeEvent),
     CapSet(CapSetEvent),
     Namespace(NamespaceEvent),
+    Prctl(PrctlEvent),
 }
 
 impl Event {
@@ -1693,6 +1798,7 @@ impl Event {
             Event::IdentityChange(e) => &e.meta,
             Event::CapSet(e) => &e.meta,
             Event::Namespace(e) => &e.meta,
+            Event::Prctl(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.

@@ -59,6 +59,70 @@ impl TransportClient {
         Ok(())
     }
 
+    /// Fetches an arbitrary JSON resource via GET — used for the content
+    /// manifest fetch (ADR-0016, issue #30/#73). Generic over the response
+    /// type rather than a concrete `updater::ContentManifest`: `transport` and
+    /// `updater` are both LEAF crates and may not depend on each other
+    /// (`tools/check-deps.py`), so the binary composing them supplies the
+    /// concrete type at the call site.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response body is not
+    /// valid JSON for `R`.
+    pub fn get_json<R: serde::de::DeserializeOwned>(&self, url: &str) -> Result<R> {
+        let response = self.agent.get(url).call().map_err(|e| match &e {
+            ureq::Error::StatusCode(status) => TransportError::ServerError {
+                status: *status,
+                message: e.to_string(),
+            },
+            _ => TransportError::Network(e.to_string()),
+        })?;
+
+        response
+            .into_body()
+            .read_json()
+            .map_err(|e| TransportError::InvalidResponse(e.to_string()))
+    }
+
+    /// Fetches a raw byte payload via GET — used for content artifact
+    /// download (ADR-0016, issue #30/#73's download/apply slice). `query`
+    /// pairs are percent-encoded by `ureq` before being appended, so a
+    /// caller passes a content path's raw string, not a pre-encoded one.
+    /// `max_bytes` bounds how much of the body is read *before* any hash
+    /// check runs — the manifest's own declared `size` is the natural
+    /// choice, so a response can't be arbitrarily larger than what was
+    /// signed for. Inclusive: a body of exactly `max_bytes` is accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the body exceeds `max_bytes`.
+    pub fn get_bytes(&self, url: &str, query: &[(&str, &str)], max_bytes: u64) -> Result<Vec<u8>> {
+        let mut req = self.agent.get(url);
+        for (key, value) in query {
+            req = req.query(*key, *value);
+        }
+        let response = req.call().map_err(|e| match &e {
+            ureq::Error::StatusCode(status) => TransportError::ServerError {
+                status: *status,
+                message: e.to_string(),
+            },
+            _ => TransportError::Network(e.to_string()),
+        })?;
+
+        let mut body = response.into_body();
+        body.with_config()
+            // ureq's limit is exclusive in practice: its `LimitReader` treats
+            // hitting exactly `limit` bytes read as "still need one more read
+            // to confirm EOF", and that next read is rejected outright rather
+            // than allowed to return 0. `max_bytes + 1` keeps this method's
+            // own contract ("a body of exactly `max_bytes` is accepted")
+            // true despite that.
+            .limit(max_bytes.saturating_add(1))
+            .read_to_vec()
+            .map_err(|e| TransportError::InvalidResponse(e.to_string()))
+    }
+
     /// Performs a POST request with JSON body.
     fn post_json<T: Serialize, R: serde::de::DeserializeOwned>(
         &self,

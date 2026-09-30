@@ -13,6 +13,20 @@ pub struct CorrelationAlert {
     pub message: String,
 }
 
+/// The "network" leg of the co-occurrence rules: a `ConnectEvent`, except sshd's
+/// address-selection probe (`connect()` to `0.0.0.0:65535` / `:::65535`), which reaches
+/// no remote peer. Without this, every SSH login (`sshd-auth` and `sshd-session` exec,
+/// then probe) raised `rule_spawn_connect` twice and, after a few logins,
+/// `rule_respawn_connect` (#538). The same predicate BEACON uses
+/// ([`policy::is_address_selection_probe`]), and only the probe, not the whole
+/// unspecified address.
+///
+/// `BehaviorVector`'s connect features are deliberately not filtered here: they feed
+/// the ML side, whose calibration this fix should not shift.
+fn is_network_connect(event: &Event) -> bool {
+    matches!(event, Event::Connect(c) if !policy::is_address_selection_probe(c.daddr, c.dport))
+}
+
 /// T1059/T1071 — A recently spawned process establishes a network connection within
 /// the same time window. Weak signal on its own, strong in combination (LOLBIN +
 /// beacon, for example). Co-occurrence by pid, order unconstrained.
@@ -20,7 +34,7 @@ pub(crate) fn rule_spawn_connect(pid: u32, bus: &EventBus) -> Option<Correlation
     let events: Vec<&Event> = bus.events_for_pid(pid).collect();
 
     let has_exec = events.iter().any(|e| matches!(e, Event::Exec(_)));
-    let has_connect = events.iter().any(|e| matches!(e, Event::Connect(_)));
+    let has_connect = events.iter().any(|e| is_network_connect(e));
 
     if has_exec && has_connect {
         Some(CorrelationAlert {
@@ -81,7 +95,7 @@ fn writes_payload_file(event: &Event) -> bool {
 pub(crate) fn rule_connect_filewrite(pid: u32, bus: &EventBus) -> Option<CorrelationAlert> {
     let events: Vec<&Event> = bus.events_for_pid(pid).collect();
 
-    let has_connect = events.iter().any(|e| matches!(e, Event::Connect(_)));
+    let has_connect = events.iter().any(|e| is_network_connect(e));
     let has_filewrite = events.iter().any(|e| writes_payload_file(e));
 
     if has_connect && has_filewrite {
@@ -103,7 +117,7 @@ pub(crate) fn rule_spawn_connect_filewrite(pid: u32, bus: &EventBus) -> Option<C
     let events: Vec<&Event> = bus.events_for_pid(pid).collect();
 
     let has_exec = events.iter().any(|e| matches!(e, Event::Exec(_)));
-    let has_connect = events.iter().any(|e| matches!(e, Event::Connect(_)));
+    let has_connect = events.iter().any(|e| is_network_connect(e));
     let has_filewrite = events.iter().any(|e| writes_payload_file(e));
 
     if has_exec && has_connect && has_filewrite {
@@ -143,7 +157,7 @@ pub(crate) fn rule_respawn_connect(pid: u32, bus: &EventBus) -> Option<Correlati
         .iter()
         .filter(|e| matches!(e, Event::Exec(_)))
         .count();
-    let has_connect = events.iter().any(|e| matches!(e, Event::Connect(_)));
+    let has_connect = events.iter().any(|e| is_network_connect(e));
 
     if spawn_count >= RESPAWN_THRESHOLD && has_connect {
         Some(CorrelationAlert {
@@ -197,7 +211,7 @@ pub(crate) fn rule_assembly_connect(pid: u32, bus: &EventBus) -> Option<Correlat
     let events: Vec<&Event> = bus.events_for_pid(pid).collect();
 
     let has_assembly = events.iter().any(|e| matches!(e, Event::AssemblyLoad(_)));
-    let has_connect = events.iter().any(|e| matches!(e, Event::Connect(_)));
+    let has_connect = events.iter().any(|e| is_network_connect(e));
 
     if has_assembly && has_connect {
         let assembly_name = events.iter().find_map(|e| {
