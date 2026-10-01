@@ -30,8 +30,12 @@ fn is_network_connect(event: &Event) -> bool {
 /// T1059/T1071 — A recently spawned process establishes a network connection within
 /// the same time window. Weak signal on its own, strong in combination (LOLBIN +
 /// beacon, for example). Co-occurrence by pid, order unconstrained.
-pub(crate) fn rule_spawn_connect(pid: u32, bus: &EventBus) -> Option<CorrelationAlert> {
-    let events: Vec<&Event> = bus.events_for_pid(pid).collect();
+pub(crate) fn rule_spawn_connect(
+    pid: u32,
+    generation: Option<u64>,
+    bus: &EventBus,
+) -> Option<CorrelationAlert> {
+    let events: Vec<&Event> = bus.events_for_pid(pid, generation).collect();
 
     let has_exec = events.iter().any(|e| matches!(e, Event::Exec(_)));
     let has_connect = events.iter().any(|e| is_network_connect(e));
@@ -92,8 +96,12 @@ fn writes_payload_file(event: &Event) -> bool {
 /// Co-occurrence by pid, order unconstrained.
 /// Filter: only files with an executable/script extension or in a temp directory
 /// are considered — eliminates FPs on app caches (sentry, Chrome, Spotify…).
-pub(crate) fn rule_connect_filewrite(pid: u32, bus: &EventBus) -> Option<CorrelationAlert> {
-    let events: Vec<&Event> = bus.events_for_pid(pid).collect();
+pub(crate) fn rule_connect_filewrite(
+    pid: u32,
+    generation: Option<u64>,
+    bus: &EventBus,
+) -> Option<CorrelationAlert> {
+    let events: Vec<&Event> = bus.events_for_pid(pid, generation).collect();
 
     let has_connect = events.iter().any(|e| is_network_connect(e));
     let has_filewrite = events.iter().any(|e| writes_payload_file(e));
@@ -113,8 +121,12 @@ pub(crate) fn rule_connect_filewrite(pid: u32, bus: &EventBus) -> Option<Correla
 /// T1105 (full chain) — Spawn + network connection + file write by the same pid
 /// within the same window. High confidence: complete dropper (spawned, connects,
 /// writes a payload to disk).
-pub(crate) fn rule_spawn_connect_filewrite(pid: u32, bus: &EventBus) -> Option<CorrelationAlert> {
-    let events: Vec<&Event> = bus.events_for_pid(pid).collect();
+pub(crate) fn rule_spawn_connect_filewrite(
+    pid: u32,
+    generation: Option<u64>,
+    bus: &EventBus,
+) -> Option<CorrelationAlert> {
+    let events: Vec<&Event> = bus.events_for_pid(pid, generation).collect();
 
     let has_exec = events.iter().any(|e| matches!(e, Event::Exec(_)));
     let has_connect = events.iter().any(|e| is_network_connect(e));
@@ -146,12 +158,21 @@ pub(crate) fn rule_spawn_connect_filewrite(pid: u32, bus: &EventBus) -> Option<C
 /// (ppid, comm).
 const RESPAWN_THRESHOLD: usize = 3;
 
-pub(crate) fn rule_respawn_connect(pid: u32, bus: &EventBus) -> Option<CorrelationAlert> {
-    let (ppid, comm) = bus
-        .events_for_pid(pid)
-        .next()
-        .map(|e| (e.meta().ppid, e.meta().comm.clone()))?;
-    let events: Vec<&Event> = bus.events_for_ppid_comm(ppid, &comm).collect();
+pub(crate) fn rule_respawn_connect(
+    pid: u32,
+    generation: Option<u64>,
+    bus: &EventBus,
+) -> Option<CorrelationAlert> {
+    let (ppid, parent_generation, comm) = bus.events_for_pid(pid, generation).last().map(|e| {
+        (
+            e.meta().ppid,
+            e.meta().parent_process_generation,
+            e.meta().comm.clone(),
+        )
+    })?;
+    let events: Vec<&Event> = bus
+        .events_for_ppid_comm(ppid, parent_generation, &comm)
+        .collect();
 
     let spawn_count = events
         .iter()
@@ -207,8 +228,12 @@ const DNS_TUNNEL_LABEL_MIN_ENTROPY: f64 = 3.5;
 /// Noise guard: `DotNETRuntime` EID 154 is already filtered to dynamic
 /// (in-memory) assemblies by the sensor — file-backed .NET loads never reach
 /// the bus, so no additional filter is needed here.
-pub(crate) fn rule_assembly_connect(pid: u32, bus: &EventBus) -> Option<CorrelationAlert> {
-    let events: Vec<&Event> = bus.events_for_pid(pid).collect();
+pub(crate) fn rule_assembly_connect(
+    pid: u32,
+    generation: Option<u64>,
+    bus: &EventBus,
+) -> Option<CorrelationAlert> {
+    let events: Vec<&Event> = bus.events_for_pid(pid, generation).collect();
 
     let has_assembly = events.iter().any(|e| matches!(e, Event::AssemblyLoad(_)));
     let has_connect = events.iter().any(|e| is_network_connect(e));
@@ -241,8 +266,12 @@ pub(crate) fn rule_assembly_connect(pid: u32, bus: &EventBus) -> Option<Correlat
 ///
 /// Correlation is by pid: the exec and the SMB connection must come from the same
 /// process, not a parent/child pair — psexec initiates both from the same pid.
-pub(crate) fn rule_exec_smb(pid: u32, bus: &EventBus) -> Option<CorrelationAlert> {
-    let events: Vec<&Event> = bus.events_for_pid(pid).collect();
+pub(crate) fn rule_exec_smb(
+    pid: u32,
+    generation: Option<u64>,
+    bus: &EventBus,
+) -> Option<CorrelationAlert> {
+    let events: Vec<&Event> = bus.events_for_pid(pid, generation).collect();
 
     let has_exec = events.iter().any(|e| matches!(e, Event::Exec(_)));
     let has_smb = events.iter().any(|e| matches!(e, Event::SmbConnect(_)));
@@ -278,8 +307,12 @@ pub(crate) fn rule_exec_smb(pid: u32, bus: &EventBus) -> Option<CorrelationAlert
 /// already be injected and only emits an `AssemblyLoad`. The combination
 /// (`AssemblyLoad`, `SmbConnect`) by the same pid is a high-confidence signal with
 /// virtually no legitimate equivalent.
-pub(crate) fn rule_assembly_smb(pid: u32, bus: &EventBus) -> Option<CorrelationAlert> {
-    let events: Vec<&Event> = bus.events_for_pid(pid).collect();
+pub(crate) fn rule_assembly_smb(
+    pid: u32,
+    generation: Option<u64>,
+    bus: &EventBus,
+) -> Option<CorrelationAlert> {
+    let events: Vec<&Event> = bus.events_for_pid(pid, generation).collect();
 
     let has_assembly = events.iter().any(|e| matches!(e, Event::AssemblyLoad(_)));
     let has_smb = events.iter().any(|e| matches!(e, Event::SmbConnect(_)));
@@ -353,15 +386,19 @@ fn is_tunnel_like_label(label: &str) -> bool {
         && shannon_entropy(&label.to_ascii_lowercase()) > DNS_TUNNEL_LABEL_MIN_ENTROPY
 }
 
-pub(crate) fn rule_dns_exfil(pid: u32, bus: &EventBus) -> Option<CorrelationAlert> {
+pub(crate) fn rule_dns_exfil(
+    pid: u32,
+    generation: Option<u64>,
+    bus: &EventBus,
+) -> Option<CorrelationAlert> {
     let comm = bus
-        .events_for_pid(pid)
-        .next()
+        .events_for_pid(pid, generation)
+        .last()
         .map(|e| e.meta().comm.clone())?;
 
     // parent domain → set of distinct tunnel-like leftmost labels seen under it.
     let mut per_parent: HashMap<String, HashSet<String>> = HashMap::new();
-    for event in bus.events_for_pid(pid) {
+    for event in bus.events_for_pid(pid, generation) {
         let Event::DnsQuery(dns) = event else {
             continue;
         };

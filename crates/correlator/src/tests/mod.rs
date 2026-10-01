@@ -26,6 +26,15 @@ fn meta_full(pid: u32, ppid: u32, comm: &str, ts_ns: u64) -> EventMeta {
     }
 }
 
+fn stamped(mut event: Event, generation: u64) -> Event {
+    match &mut event {
+        Event::Exec(e) => e.meta.process_generation = Some(generation),
+        Event::Connect(e) => e.meta.process_generation = Some(generation),
+        _ => panic!("test stamp helper only supports Exec and Connect"),
+    }
+    event
+}
+
 fn exec_event(pid: u32, ts_ns: u64) -> Event {
     exec_with_meta(meta(pid, ts_ns), "")
 }
