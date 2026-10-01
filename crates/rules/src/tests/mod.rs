@@ -287,6 +287,7 @@ fn listen_port_event_full(
     }
 }
 
+mod bits;
 mod coverage;
 mod linux;
 mod persistence;

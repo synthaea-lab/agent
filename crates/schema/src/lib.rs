@@ -239,7 +239,15 @@ pub mod time;
 /// of its Operational channel). Windows-only. #632 (`LdapSearch`) also
 /// targets v38 while both branches are open: whichever merges second
 /// renumbers, same coordination note as v13, v28→29, v30→31 and v32→33.
-pub const SCHEMA_VERSION: u32 = 38;
+///
+/// Bumped 38 → 40 for [`Event::BitsJob`] (#284): BITS jobs from
+/// `Microsoft-Windows-Bits-Client`, the only record that ties a BITS download
+/// (whose network I/O the service does itself) back to the process that asked
+/// for it. Windows-only. First claimed v35 (taken by #519), then rebased past
+/// v39, which #650 and #654 both target while open: 40 rather than a third
+/// claim on 39. Versions are labels, not a sequence: a gap is fine (see
+/// `tests/fixtures/`).
+pub const SCHEMA_VERSION: u32 = 40;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -1195,6 +1203,54 @@ pub struct SmbConnectEvent {
     pub server_name: String,
 }
 
+/// What a [`BitsJobEvent`] reports about its job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BitsJobState {
+    /// A file (remote URL → local path) was added to the job: the download
+    /// is requested.
+    FileAdded,
+    /// The job transferred everything.
+    Completed,
+    /// The job was cancelled.
+    Cancelled,
+    /// A transfer stopped on an error; [`BitsJobEvent::hresult`] says which.
+    TransferError,
+}
+
+/// A Background Intelligent Transfer Service job (#284, T1197) from
+/// `Microsoft-Windows-Bits-Client`.
+///
+/// BITS does the network I/O from its own service (`svchost.exe`), so the
+/// connect and DNS events never name the process that asked for the download.
+/// This event does: `meta` is the job's client, the process that added the
+/// file (or cancelled the job). For a completion or a transfer error, which
+/// BITS reports from the service, it is the client that added the job's file.
+///
+/// One event per job state the sensor forwards, all sharing `job_id`. Jobs
+/// owned by service accounts or fetching from Microsoft update hosts are
+/// filtered at the sensor, see `sensor-windows`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BitsJobEvent {
+    pub meta: EventMeta,
+    /// The job GUID, braces included, as BITS writes it.
+    pub job_id: String,
+    /// The job's display name, chosen by the client
+    /// (`bitsadmin /transfer <name>`, `Start-BitsTransfer -DisplayName`).
+    pub job_title: String,
+    pub state: BitsJobState,
+    /// The remote URL of the job's file (its latest one, for a multi-file job).
+    pub url: String,
+    /// Where BITS writes that file.
+    pub local_path: String,
+    /// Bytes transferred so far, when the record reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_transferred: Option<u64>,
+    /// The failing HRESULT of a [`BitsJobState::TransferError`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hresult: Option<u32>,
+}
+
 /// UDP datagram sent — the primary signal for DNS-tunneling and C2-over-UDP detection.
 ///
 /// Emitted on EID 14 (`UDPSend` IPv4) of the Microsoft-Windows-Kernel-Network
@@ -2028,6 +2084,7 @@ pub enum Event {
     Prctl(PrctlEvent),
     HttpRequest(HttpRequestEvent),
     HttpSummary(HttpSummaryEvent),
+    BitsJob(BitsJobEvent),
 }
 
 impl Event {
@@ -2086,6 +2143,7 @@ impl Event {
             Event::Prctl(e) => &e.meta,
             Event::HttpRequest(e) => &e.meta,
             Event::HttpSummary(e) => &e.meta,
+            Event::BitsJob(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.

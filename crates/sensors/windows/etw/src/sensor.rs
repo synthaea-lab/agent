@@ -18,12 +18,14 @@ use schema::{
 };
 
 use crate::{
-    amsi, etw_sessions,
+    amsi,
+    bits::BitsJobs,
+    etw_sessions,
     long_path::{self, LongPathCache},
     normalize,
     pid_cache::PidCache,
     providers::{
-        ALL_PROVIDERS, amsi_provider, dns_provider, dotnet_provider, file_provider,
+        ALL_PROVIDERS, amsi_provider, bits_provider, dns_provider, dotnet_provider, file_provider,
         network_provider, powershell_provider, process_provider, registry_provider, smb_provider,
         wmi_provider,
     },
@@ -190,6 +192,9 @@ pub(crate) struct SharedState {
     /// #365/#439: `Zone.Identifier` writes, queued for the read-back worker
     /// (which owns the one-`FileQuarantine`-per-write dedup).
     pub(crate) marks: MarkQueue,
+    /// #284: BITS jobs in flight, between their file-added record and their
+    /// last one.
+    pub(crate) bits: Mutex<BitsJobs>,
     /// F-2: events observed — the silence watchdog reads this.
     pub(crate) events_seen: AtomicU64,
     /// AMSI volume gate (#282): dedup + per-process budget.
@@ -400,6 +405,7 @@ impl Sensor for WindowsSensor {
             long_paths: Mutex::new(LongPathCache::new(LONG_PATH_CACHE_CAP)),
             dedup: Mutex::new(normalize::ConnectDedup::new(60_000_000_000)),
             marks,
+            bits: Mutex::new(BitsJobs::default()),
             events_seen: AtomicU64::new(0),
             amsi: Mutex::new(amsi::AmsiGate::default()),
             canary_path: canary_file
@@ -424,7 +430,8 @@ impl Sensor for WindowsSensor {
             .enable(wmi_provider(sink.clone(), state.clone()))
             .enable(dotnet_provider(sink.clone(), state.clone()))
             .enable(smb_provider(sink.clone(), state.clone()))
-            .enable(amsi_provider(sink, state.clone()));
+            .enable(amsi_provider(sink.clone(), state.clone()))
+            .enable(bits_provider(sink, state.clone()));
         let trace = normalize::start_or_stop_session(
             &session,
             || builder.start_and_process(),

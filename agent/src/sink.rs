@@ -669,6 +669,12 @@ impl DetectionSink {
         self.rule_state.lock().unwrap().on_file_quarantine(event);
     }
 
+    /// `BitsJob` events (Windows BITS-Client): recorded for the T1197
+    /// download→exec join, no alert on their own (#284).
+    fn detect_bits_job(&self, event: &schema::BitsJobEvent) {
+        self.rule_state.lock().unwrap().on_bits_job(event);
+    }
+
     /// Connect events: stateless rules (unusual outbound from a web/DB
     /// service, issue #478), then beacon detection.
     fn detect_connect(&self, wrapped: &Event, event: &schema::ConnectEvent) {
@@ -1056,6 +1062,7 @@ impl EventSink for DetectionSink {
             Event::FileDelete(e) => self.detect_file_delete(&event, e),
             Event::Signal(e) => self.detect_signal(&event, e),
             Event::FileQuarantine(e) => self.detect_file_quarantine(e),
+            Event::BitsJob(e) => self.detect_bits_job(e),
             Event::FileRename(e) => self.detect_file_rename(&event, e),
             Event::FileWrite(e) => self.detect_file_write(e),
             Event::MemfdCreate(e) => self.detect_memfd_create(e),

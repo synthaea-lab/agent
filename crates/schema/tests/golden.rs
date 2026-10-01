@@ -9,18 +9,19 @@
 use std::net::IpAddr;
 
 use schema::{
-    AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, CapSetEvent,
-    ConnectEvent, DefenderEvent, DefenderEventKind, DnsQueryEvent, Event, EventMeta, ExecEvent,
-    FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent, FileQuarantineEvent,
-    FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent,
-    GatekeeperVerdictEvent, HttpClientCount, HttpEvidence, HttpRequestEvent, HttpSignature,
-    HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent, KernelModuleAction,
-    KernelModuleEvent, ListenPortEvent, MemfdCreateEvent, MountEvent, NamespaceEvent,
-    NamespaceSyscall, NetworkFlowEvent, POLICY_MECHANISM_SELINUX, PolicyDenialEvent, PrctlEvent,
-    ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent,
-    ScriptBlockEvent, ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
-    SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
-    UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
+    AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BitsJobEvent,
+    BitsJobState, BpfEvent, CapSetEvent, ConnectEvent, DefenderEvent, DefenderEventKind,
+    DnsQueryEvent, Event, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent,
+    FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
+    FileWriteEvent, GatekeeperVerdictEvent, HttpClientCount, HttpEvidence, HttpRequestEvent,
+    HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent,
+    KernelModuleAction, KernelModuleEvent, ListenPortEvent, MemfdCreateEvent, MountEvent,
+    NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, POLICY_MECHANISM_SELINUX,
+    PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
+    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType, SignalEvent,
+    SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TccDecisionEvent,
+    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
+    XpcConnectEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -1647,6 +1648,68 @@ fn namespace_golden() {
             flags: 0x4000_0000, // CLONE_NEWNET
         }),
         "namespace",
+    );
+}
+
+#[test]
+fn bits_job_golden() {
+    // v40 (#284): `bitsadmin /transfer` adding a file to a BITS job. The
+    // service does the download; this record names the client that asked.
+    assert_golden(
+        &Event::BitsJob(BitsJobEvent {
+            meta: EventMeta {
+                pid: 6412,
+                ppid: 5120,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-1001".into(),
+                    integrity_level: Some(0x2000),
+                },
+                timestamp_ns: 1_756_900_029_000_000_000,
+                comm: "bitsadmin.exe".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            job_id: "{c40080ab-6fe4-418a-8ba6-c271c5298f18}".into(),
+            job_title: "update".into(),
+            state: BitsJobState::FileAdded,
+            url: "https://example.test/payload.exe".into(),
+            local_path: r"C:\Users\u\AppData\Local\Temp\p.exe".into(),
+            bytes_transferred: None,
+            hresult: None,
+        }),
+        "bits_job",
+    );
+}
+
+#[test]
+fn bits_job_transfer_error_golden() {
+    // v40 (#284): the same job failing mid-transfer, reported by the BITS
+    // service and attributed to the client that added the file.
+    assert_golden(
+        &Event::BitsJob(BitsJobEvent {
+            meta: EventMeta {
+                pid: 6412,
+                ppid: 5120,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-1001".into(),
+                    integrity_level: Some(0x2000),
+                },
+                timestamp_ns: 1_756_900_030_000_000_000,
+                comm: "bitsadmin.exe".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            job_id: "{c40080ab-6fe4-418a-8ba6-c271c5298f18}".into(),
+            job_title: "update".into(),
+            state: BitsJobState::TransferError,
+            url: "https://example.test/payload.exe".into(),
+            local_path: r"C:\Users\u\AppData\Local\Temp\p.exe".into(),
+            bytes_transferred: Some(1917),
+            hresult: Some(0x8019_0194), // BG_E_HTTP_ERROR_404
+        }),
+        "bits_job_transfer_error",
     );
 }
 

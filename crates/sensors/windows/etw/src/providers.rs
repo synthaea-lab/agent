@@ -7,13 +7,13 @@
 use std::sync::{Arc, atomic::Ordering};
 
 use ferrisetw::{
-    EventRecord,
+    EventRecord, GUID,
     parser::{Parser, Pointer},
     provider::Provider,
     schema_locator::SchemaLocator,
 };
 use schema::{
-    AmsiContentEvent, AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, ExecEvent,
+    AmsiContentEvent, AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent,
     FileOpenEvent, ImageLoadEvent, RegistrySetEvent, ScriptBlockEvent, SmbConnectEvent,
     UdpSendEvent, WmiActivityEvent, sensor::EventSink,
 };
@@ -41,10 +41,12 @@ const DOTNET_RUNTIME_GUID: &str = "e13c0d23-ccbc-4e12-931b-d9cc2eee27e4";
 const AMSI_GUID: &str = "2A576B87-09A7-520E-C21A-4942F0271D67";
 /// Microsoft-Windows-SMBClient (EID 30704 — TCP connection established to SMB server)
 const SMB_CLIENT_GUID: &str = "988C59C5-0A1C-45B6-A555-0C62276E327D";
+/// Microsoft-Windows-Bits-Client (EIDs 16403/4/5/61 — BITS jobs, #284)
+const BITS_CLIENT_GUID: &str = "EF1CC15B-46C1-414E-BB95-E76B077BD51E";
 
 /// Every provider the sensor enables, by short name — for the blind-session
 /// attribution (#408), which asks the OS who else enables them.
-pub(crate) const ALL_PROVIDERS: [(&str, &str); 10] = [
+pub(crate) const ALL_PROVIDERS: [(&str, &str); 11] = [
     ("Kernel-Process", KERNEL_PROCESS_GUID),
     ("Kernel-Network", KERNEL_NETWORK_GUID),
     ("Kernel-File", KERNEL_FILE_GUID),
@@ -55,6 +57,7 @@ pub(crate) const ALL_PROVIDERS: [(&str, &str); 10] = [
     ("DotNETRuntime", DOTNET_RUNTIME_GUID),
     ("SMBClient", SMB_CLIENT_GUID),
     ("AMSI", AMSI_GUID),
+    ("Bits-Client", BITS_CLIENT_GUID),
 ];
 
 /// `AssemblyFlags` bit indicating a dynamic (in-memory) assembly load.
@@ -744,4 +747,99 @@ pub(crate) fn smb_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
     Provider::by_guid(SMB_CLIENT_GUID)
         .add_callback(callback)
         .build()
+}
+
+/// BITS jobs (#284, T1197) from `Microsoft-Windows-Bits-Client`: 16403 (file
+/// added), 4 (completed), 5 (cancelled), 61 (transfer error), each turned into
+/// a `BitsJobEvent` by [`crate::bits::BitsJobs`], which also drops Microsoft
+/// update jobs (see [`crate::bits::MICROSOFT_UPDATE_HOSTS`]). The record
+/// header's pid is the BITS service's; the client comes from the record's
+/// `processId` (16403, 5) or, for the service's own records, from the job's
+/// file-added record. Field layout per EID in the [`crate::bits`] module docs.
+pub(crate) fn bits_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
+    let callback = move |record: &EventRecord, locator: &SchemaLocator| {
+        let eid = record.event_id();
+        if !matches!(eid, 4 | 5 | 61 | 16403) {
+            return;
+        }
+        state.events_seen.fetch_add(1, Ordering::Relaxed);
+        let Ok(schema_def) = locator.event_schema(record) else {
+            return;
+        };
+        let parser = Parser::create(record, &schema_def);
+        // 61 names its job `Id`; the job-level records, `jobId`.
+        let Ok(job_guid) = parser.try_parse::<GUID>(if eid == 61 { "Id" } else { "jobId" }) else {
+            return;
+        };
+        let job_id = format_guid(&job_guid);
+        let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
+        let bytes_transferred: Option<u64> = parser.try_parse("bytesTransferred").ok();
+        let event = match eid {
+            16403 => {
+                let client = client_meta(&parser, &state, timestamp_ns);
+                let job_title: String = parser.try_parse("jobTitle").unwrap_or_default();
+                let url: String = parser.try_parse("RemoteName").unwrap_or_default();
+                let local_name: String = parser.try_parse("LocalName").unwrap_or_default();
+                let local_path = state.normalize_path(&local_name);
+                let mut jobs = state.bits.lock().unwrap();
+                let (filtered, evicted) = (jobs.filtered(), jobs.evicted());
+                let event = jobs.file_added(client, job_id, job_title, url, local_path);
+                if jobs.filtered() > filtered {
+                    tracing::debug!(
+                        filtered = jobs.filtered(),
+                        "BITS job from a Microsoft update host dropped"
+                    );
+                }
+                if jobs.evicted() > evicted {
+                    tracing::debug!(
+                        evicted = jobs.evicted(),
+                        "BITS job table full, oldest job forgotten"
+                    );
+                }
+                event
+            }
+            4 => state
+                .bits
+                .lock()
+                .unwrap()
+                .completed(&job_id, timestamp_ns, bytes_transferred),
+            5 => {
+                let canceller = client_meta(&parser, &state, timestamp_ns);
+                state.bits.lock().unwrap().cancelled(&job_id, canceller)
+            }
+            _ => {
+                let hresult: u32 = parser.try_parse("hr").unwrap_or(0);
+                state.bits.lock().unwrap().transfer_error(
+                    &job_id,
+                    timestamp_ns,
+                    bytes_transferred,
+                    hresult,
+                )
+            }
+        };
+        if let Some(event) = event {
+            sink.on_event(Event::BitsJob(event));
+        }
+    };
+
+    Provider::by_guid(BITS_CLIENT_GUID)
+        .add_callback(callback)
+        .build()
+}
+
+/// The client a BITS record names in its `processId` field.
+fn client_meta(parser: &Parser<'_, '_>, state: &SharedState, timestamp_ns: u64) -> EventMeta {
+    let pid: u32 = parser.try_parse("processId").unwrap_or(0);
+    let comm = state.comm_for(pid).unwrap_or_default();
+    meta(pid, 0, comm, timestamp_ns)
+}
+
+/// `{c40080ab-6fe4-418a-8ba6-c271c5298f18}`: the braced, lowercase form the
+/// BITS event log writes, so a job id greps the same in both.
+fn format_guid(guid: &GUID) -> String {
+    let d = guid.data4;
+    format!(
+        "{{{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}}}",
+        guid.data1, guid.data2, guid.data3, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+    )
 }

@@ -66,6 +66,14 @@ pub(crate) const MEMFD_EXEC_WINDOW_NS: u64 = 5_000_000_000; // 5s
 /// fleet volume.
 pub(crate) const QUARANTINE_EXEC_WINDOW_NS: u64 = 600_000_000_000; // 10 min
 
+/// Window between a BITS job adding or completing a file and an exec of that
+/// file that still counts as "BITS-downloaded, then run" (T1197, #284). The
+/// same 10 min as [`QUARANTINE_EXEC_WINDOW_NS`]: the window runs from the
+/// completion, and a dropper runs its payload seconds after it, a user
+/// minutes after. Uncalibrated first cut (2026-10-01): the browser and
+/// updater jobs that pass the sensor's filter were not measured on a fleet.
+pub(crate) const BITS_EXEC_WINDOW_NS: u64 = QUARANTINE_EXEC_WINDOW_NS;
+
 // ── Windows constants (ETW rules — T1059/T1218/T1071) ───────────────────────
 
 /// SELF-SPAWN threshold and window (T1059): N spawns of the same name in X seconds.

@@ -28,16 +28,17 @@
 use core::net::{IpAddr, Ipv4Addr};
 
 use crate::{
-    AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, CapSetEvent,
-    ConnectEvent, DefenderEvent, DefenderEventKind, DnsQueryEvent, EventMeta, ExecEvent,
-    FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent, FileQuarantineEvent,
-    FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent, HttpRequestEvent,
-    HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent,
-    KernelModuleAction, KernelModuleEvent, ListenPortEvent, MemfdCreateEvent, NamespaceEvent,
-    NamespaceSyscall, NetworkFlowEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent,
-    PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType,
-    SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TlsCaptureEvent,
-    TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
+    AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BitsJobEvent,
+    BitsJobState, BpfEvent, CapSetEvent, ConnectEvent, DefenderEvent, DefenderEventKind,
+    DnsQueryEvent, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent,
+    FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
+    FileWriteEvent, HttpRequestEvent, HttpSignature, HttpSummaryEvent, IdentityChangeEvent,
+    IdentityChangeKind, ImageLoadEvent, KernelModuleAction, KernelModuleEvent, ListenPortEvent,
+    MemfdCreateEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, PrctlEvent,
+    ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent,
+    ScriptBlockEvent, ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
+    SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User,
+    WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -241,6 +242,21 @@ pub fn file_quarantine() -> FileQuarantineEvent {
         agent: None,
         origin_url: None,
         referrer_url: None,
+    }
+}
+
+/// Neutral [`BitsJobEvent`]: a file added to an untitled job, empty URL and path.
+#[must_use]
+pub fn bits_job() -> BitsJobEvent {
+    BitsJobEvent {
+        meta: meta(),
+        job_id: String::new(),
+        job_title: String::new(),
+        state: BitsJobState::FileAdded,
+        url: String::new(),
+        local_path: String::new(),
+        bytes_transferred: None,
+        hresult: None,
     }
 }
 

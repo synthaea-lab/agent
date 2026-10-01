@@ -134,6 +134,7 @@ TECHNIQUE_TACTIC = {
     "T1110": "Credential Access",
     "T1127": "Defense Evasion",
     "T1136.001": "Persistence",
+    "T1197": "Defense Evasion",
     "T1204": "Execution",
     "T1218": "Defense Evasion",
     "T1218.011": "Defense Evasion",

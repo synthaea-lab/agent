@@ -1,0 +1,13 @@
+{
+  "type": "defender",
+  "meta": {
+    "pid": 0,
+    "ppid": 0,
+    "user": { "os": "unknown" },
+    "timestamp_ns": 1759400000000000000,
+    "comm": ""
+  },
+  "kind": "config_changed",
+  "setting": "HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths\\C:\\Users\\Public",
+  "new_value": "0x0"
+}
