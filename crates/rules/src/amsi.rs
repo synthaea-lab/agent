@@ -27,6 +27,9 @@ use crate::Alert;
 const AMSI_RESULT_DETECTED: u32 = 32_768;
 /// Characters of the content quoted in an alert message.
 const EXCERPT_CHARS: usize = 200;
+/// Bytes between a fetch and an execution primitive for them to count as one
+/// cradle: comfortably one statement or pipeline, far less than a script.
+const CRADLE_SPAN: usize = 300;
 
 /// T1059.001 + T1105: something fetched over the network and executed in
 /// memory, the "download cradle".
@@ -161,9 +164,7 @@ pub fn evaluate_amsi_content(event: &AmsiContentEvent) -> Vec<Alert> {
     };
     let lower = text.to_lowercase();
 
-    let downloads = contains_any(&lower, DOWNLOAD_MARKERS) || has_any_word(&lower, DOWNLOAD_WORDS);
-    let executes = contains_any(&lower, EXEC_MARKERS) || has_any_word(&lower, EXEC_WORDS);
-    if downloads && executes {
+    if !is_module_manifest(&lower) && is_download_cradle(&lower) {
         alerts.push(alert(DOWNLOAD_CRADLE, "download cradle executed in memory"));
     }
     if contains_any(&lower, &AMSI_TAMPER_MARKERS) {
@@ -196,6 +197,50 @@ pub fn evaluate_amsi_content(event: &AmsiContentEvent) -> Vec<Alert> {
         ));
     }
     alerts
+}
+
+/// A fetch primitive and an in-memory execution primitive within
+/// [`CRADLE_SPAN`] of each other. Proximity, not just co-occurrence: a long
+/// legitimate script may download a file at the top and `iex` a local string
+/// far below.
+fn is_download_cradle(lower: &str) -> bool {
+    let fetches = positions(lower, DOWNLOAD_MARKERS, DOWNLOAD_WORDS);
+    if fetches.is_empty() {
+        return false;
+    }
+    let runs = positions(lower, EXEC_MARKERS, EXEC_WORDS);
+    fetches
+        .iter()
+        .any(|f| runs.iter().any(|r| f.abs_diff(*r) <= CRADLE_SPAN))
+}
+
+/// A `PowerShell` module manifest (`.psd1`), which AMSI scans when a module
+/// loads. Its export lists name cmdlets without running them: on the
+/// 2026-10-01 lab, `Microsoft.PowerShell.Utility`'s manifest (exports
+/// `Invoke-WebRequest` and `Invoke-Expression` side by side) raised a cradle
+/// alert on every `PowerShell` start.
+fn is_module_manifest(lower: &str) -> bool {
+    lower.trim_start().starts_with("@{")
+        && ["moduleversion", "cmdletstoexport", "functionstoexport"]
+            .iter()
+            .any(|key| lower.contains(key))
+}
+
+/// Byte offsets of every marker (substring) and every whole-word match.
+fn positions(haystack: &str, markers: &[&str], words: &[&str]) -> Vec<usize> {
+    let mut found: Vec<usize> = markers
+        .iter()
+        .flat_map(|m| haystack.match_indices(m).map(|(i, _)| i))
+        .collect();
+    for word in words {
+        found.extend(
+            haystack
+                .match_indices(word)
+                .map(|(i, _)| i)
+                .filter(|&i| is_whole_word(haystack, i, word.len())),
+        );
+    }
+    found
 }
 
 /// `VBScript`, `JScript` (WSH) and Office VBA, as AMSI names them.
@@ -232,19 +277,19 @@ fn contains_any<S: AsRef<str>>(haystack: &str, needles: &[S]) -> bool {
     needles.iter().any(|n| haystack.contains(n.as_ref()))
 }
 
-fn has_any_word(haystack: &str, words: &[&str]) -> bool {
-    words.iter().any(|w| has_word(haystack, w))
-}
-
 /// `word` as a whole token: not preceded or followed by a letter, digit, `_`
 /// or `-` (so `iex` matches `iex(…)` and `| iex`, not inside an identifier).
 fn has_word(haystack: &str, word: &str) -> bool {
+    haystack
+        .match_indices(word)
+        .any(|(i, _)| is_whole_word(haystack, i, word.len()))
+}
+
+fn is_whole_word(haystack: &str, start: usize, len: usize) -> bool {
     let is_part = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
-    haystack.match_indices(word).any(|(i, _)| {
-        let before = haystack[..i].chars().next_back();
-        let after = haystack[i + word.len()..].chars().next();
-        !before.is_some_and(is_part) && !after.is_some_and(is_part)
-    })
+    let before = haystack[..start].chars().next_back();
+    let after = haystack[start + len..].chars().next();
+    !before.is_some_and(is_part) && !after.is_some_and(is_part)
 }
 
 #[cfg(test)]
@@ -364,6 +409,27 @@ mod tests {
         );
         // The same text from PowerShell is not a script-host launch.
         assert!(techniques(&ps(launch)).is_empty());
+    }
+
+    #[test]
+    fn a_module_manifest_exporting_both_cmdlets_is_quiet() {
+        // The 2026-10-01 lab false positive: Microsoft.PowerShell.Utility's
+        // manifest, scanned by AMSI on every module load.
+        let manifest = r#"@{
+GUID="1DA87E53-152B-403E-98DC-74D7B4D63D59"
+Author="PowerShell"
+ModuleVersion="3.1.0.0"
+CmdletsToExport= "Format-List", "Invoke-Expression", "Invoke-RestMethod", "Invoke-WebRequest", "Measure-Object"
+}"#;
+        assert!(techniques(&ps(manifest)).is_empty());
+    }
+
+    #[test]
+    fn a_fetch_and_an_iex_far_apart_are_not_a_cradle() {
+        let far = masked!(b"Invoke-WebRequest https://x/tool.zip -OutFile t.zip")
+            + &"\n# setup step\n".repeat(40)
+            + &masked!(b"iex $localCommand");
+        assert!(techniques(&ps(&far)).is_empty());
     }
 
     #[test]
