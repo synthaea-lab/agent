@@ -59,6 +59,89 @@ mod linux {
     /// Name of the ban list directly under the layout's base directory.
     const BAN_LIST: &str = "banned_versions.json";
 
+    /// Where the kernel exposes selinuxfs' `enforce` file. It exists exactly when
+    /// `SELinux` is enabled, and reads `1` when Enforcing.
+    const SELINUX_ENFORCE: &str = "/sys/fs/selinux/enforce";
+
+    /// Where `restorecon` lives (policycoreutils): `/usr/sbin` on current
+    /// RHEL-family systems, `/sbin` where `sbin` is not merged into `usr`.
+    const RESTORECON: [&str; 2] = ["/usr/sbin/restorecon", "/sbin/restorecon"];
+
+    /// What [`restore_selinux_labels`] did for a staged release.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum Relabel {
+        /// `SELinux` is not enabled: nothing to do.
+        NotApplicable,
+        /// `restorecon -R` ran on the staged release and succeeded.
+        Done,
+        /// `SELinux` is Permissive and the relabel could not run; the release is
+        /// promoted anyway because Permissive does not block the exec. Carries why.
+        SkippedPermissive(String),
+    }
+
+    /// The host files `SELinux` handling reads, injectable so tests do not depend on
+    /// the machine they run on.
+    pub(super) struct SelinuxProbe {
+        enforce_file: PathBuf,
+        restorecon: Vec<PathBuf>,
+    }
+
+    impl SelinuxProbe {
+        /// The real host.
+        pub(super) fn host() -> Self {
+            Self {
+                enforce_file: PathBuf::from(SELINUX_ENFORCE),
+                restorecon: RESTORECON.iter().map(PathBuf::from).collect(),
+            }
+        }
+    }
+
+    /// Gives the files of a staged release the `SELinux` labels the policy assigns
+    /// to their path (`restorecon -R`), so the service can execute them.
+    ///
+    /// Files this updater writes into `versions/vN/` inherit the type of the
+    /// directory (`var_lib_t`), which `init_t` may not execute: the unit then dies
+    /// with `status=203/EXEC`. The packaging adds file-context rules that label
+    /// `versions/<n>/*` as `bin_t`, but those rules only apply once something runs
+    /// `restorecon` (#559, item C). It runs as the identity that performs the
+    /// update, so what the acceptance test exercises is that identity's rights, not
+    /// those of a root shell.
+    ///
+    /// Fails closed under Enforcing: a release that cannot be executed must not
+    /// become `current`. Under Permissive the problem is reported, not fatal.
+    ///
+    /// # Errors
+    ///
+    /// `SELinux` is Enforcing and `restorecon` is missing, cannot be started, or
+    /// exits non-zero.
+    fn restore_selinux_labels(release_dir: &Path, probe: &SelinuxProbe) -> anyhow::Result<Relabel> {
+        let Ok(enforce) = std::fs::read_to_string(&probe.enforce_file) else {
+            return Ok(Relabel::NotApplicable);
+        };
+        let enforcing = enforce.trim() == "1";
+        let fail = |why: String| -> anyhow::Result<Relabel> {
+            if enforcing {
+                anyhow::bail!(
+                    "SELinux is Enforcing and {} cannot be relabelled: {why}",
+                    release_dir.display()
+                );
+            }
+            Ok(Relabel::SkippedPermissive(why))
+        };
+        let Some(restorecon) = probe.restorecon.iter().find(|p| p.is_file()) else {
+            return fail("restorecon not found (is policycoreutils installed?)".to_string());
+        };
+        match std::process::Command::new(restorecon)
+            .arg("-R")
+            .arg(release_dir)
+            .status()
+        {
+            Ok(status) if status.success() => Ok(Relabel::Done),
+            Ok(status) => fail(format!("restorecon exited with {status}")),
+            Err(e) => fail(format!("could not run restorecon: {e}")),
+        }
+    }
+
     /// Refuses to trust the public test key without an explicit acknowledgement.
     ///
     /// `test_key` is `updater::key::SYNTHAEA_UPDATER_TEST_KEY`, passed in so both
@@ -98,6 +181,8 @@ mod linux {
             /// Artifacts fetched this run (`0` when a complete staged copy was
             /// already on disk from an earlier, interrupted run).
             downloaded: usize,
+            /// Whether the staged files were relabelled for `SELinux`.
+            relabel: Relabel,
         },
     }
 
@@ -113,6 +198,15 @@ mod linux {
     pub(super) fn apply_release(
         client: &transport::TransportClient,
         layout: &Layout,
+    ) -> anyhow::Result<Outcome> {
+        apply_release_with(client, layout, &SelinuxProbe::host())
+    }
+
+    /// [`apply_release`] with the host's `SELinux` files injected.
+    fn apply_release_with(
+        client: &transport::TransportClient,
+        layout: &Layout,
+        selinux: &SelinuxProbe,
     ) -> anyhow::Result<Outcome> {
         anyhow::ensure!(
             layout.bootstrap_dir().is_dir(),
@@ -150,11 +244,21 @@ mod linux {
             }
             return Err(e.into());
         }
+        let relabel = match restore_selinux_labels(&release_dir, selinux) {
+            Ok(relabel) => relabel,
+            Err(e) => {
+                if downloaded > 0 {
+                    let _ = std::fs::remove_dir_all(&release_dir);
+                }
+                return Err(e);
+            }
+        };
         layout.persist_manifest(&manifest)?;
         layout.promote(manifest.release_version)?;
         Ok(Outcome::Promoted {
             release_version: manifest.release_version,
             downloaded,
+            relabel,
         })
     }
 
@@ -276,11 +380,20 @@ mod linux {
             Outcome::Promoted {
                 release_version,
                 downloaded,
+                relabel,
             } => {
                 println!(
                     "promoted release {release_version} ({downloaded} artifact{} fetched)",
                     if downloaded == 1 { "" } else { "s" }
                 );
+                match relabel {
+                    Relabel::NotApplicable => {}
+                    Relabel::Done => println!("relabelled the release for SELinux (restorecon)"),
+                    Relabel::SkippedPermissive(why) => eprintln!(
+                        "warning: SELinux is Permissive and the release was not relabelled \
+                         ({why}); it needs a restorecon before an Enforcing host can run it"
+                    ),
+                }
                 if restart {
                     restart_service();
                 } else {
@@ -320,6 +433,23 @@ mod linux {
         use updater::key::test_key_pair;
 
         use super::*;
+
+        /// Shadows the host-reading `apply_release` so these tests give the same
+        /// answer on a machine that has `SELinux` (a Fedora dev box) as on CI.
+        fn apply_release(
+            client: &transport::TransportClient,
+            layout: &Layout,
+        ) -> anyhow::Result<Outcome> {
+            apply_release_with(client, layout, &absent_selinux())
+        }
+
+        /// `SELinux` not enabled: no `enforce` file.
+        fn absent_selinux() -> SelinuxProbe {
+            SelinuxProbe {
+                enforce_file: PathBuf::from("/nonexistent/selinux/enforce"),
+                restorecon: Vec::new(),
+            }
+        }
 
         #[test]
         fn the_public_test_key_is_refused_without_the_acknowledgement() {
@@ -470,7 +600,8 @@ mod linux {
                 outcome,
                 Outcome::Promoted {
                     release_version: 2,
-                    downloaded: 2
+                    downloaded: 2,
+                    relabel: Relabel::NotApplicable,
                 }
             );
             assert_eq!(layout.current_release_version(), Some(2));
@@ -631,7 +762,8 @@ mod linux {
                 outcome,
                 Outcome::Promoted {
                     release_version: 2,
-                    downloaded: 0
+                    downloaded: 0,
+                    relabel: Relabel::NotApplicable,
                 }
             );
             assert_eq!(layout.current_release_version(), Some(2));
@@ -667,6 +799,147 @@ mod linux {
             assert!(
                 layout.version_dir(2).exists(),
                 "a directory this run did not create is not deleted"
+            );
+        }
+
+        // ── SELinux relabel after staging (#559, item C) ────────────────────────
+
+        /// A fake host: an `enforce` file reading `mode` (`None` = `SELinux` off) and,
+        /// when `restorecon_exit` is set, a `restorecon` script that logs its
+        /// arguments and exits with that code. Returns the probe and the log path.
+        fn selinux_host(
+            name: &str,
+            mode: Option<&str>,
+            restorecon_exit: Option<i32>,
+        ) -> (SelinuxProbe, PathBuf) {
+            let dir = tmp(name);
+            let log = dir.join("restorecon.log");
+            let enforce_file = dir.join("enforce");
+            if let Some(mode) = mode {
+                std::fs::write(&enforce_file, mode).unwrap();
+            }
+            let mut restorecon = Vec::new();
+            if let Some(code) = restorecon_exit {
+                let script = dir.join("restorecon");
+                std::fs::write(
+                    &script,
+                    format!(
+                        "#!/bin/sh\necho \"$@\" >> '{}'\nexit {code}\n",
+                        log.display()
+                    ),
+                )
+                .unwrap();
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+                restorecon.push(script);
+            }
+            (
+                SelinuxProbe {
+                    enforce_file,
+                    restorecon,
+                },
+                log,
+            )
+        }
+
+        #[test]
+        fn nothing_is_relabelled_when_selinux_is_not_enabled() {
+            let (probe, log) = selinux_host("selinux-off", None, Some(0));
+            let outcome = restore_selinux_labels(Path::new("/some/release"), &probe).unwrap();
+            assert_eq!(outcome, Relabel::NotApplicable);
+            assert!(
+                !log.exists(),
+                "restorecon must not run on a host without SELinux"
+            );
+        }
+
+        #[test]
+        fn an_enforcing_host_gets_a_recursive_restorecon_on_the_release_directory() {
+            let (probe, log) = selinux_host("selinux-enforcing", Some("1\n"), Some(0));
+            let outcome =
+                restore_selinux_labels(Path::new("/var/lib/synthaea/versions/v7"), &probe).unwrap();
+            assert_eq!(outcome, Relabel::Done);
+            assert_eq!(
+                std::fs::read_to_string(log).unwrap().trim(),
+                "-R /var/lib/synthaea/versions/v7"
+            );
+        }
+
+        #[test]
+        fn a_failing_restorecon_under_enforcing_refuses_the_release() {
+            let (probe, _log) = selinux_host("selinux-fails", Some("1"), Some(1));
+            let err = restore_selinux_labels(Path::new("/r/v7"), &probe)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Enforcing"), "{err}");
+            assert!(err.contains("restorecon exited"), "{err}");
+        }
+
+        #[test]
+        fn a_missing_restorecon_under_enforcing_refuses_the_release() {
+            let (probe, _log) = selinux_host("selinux-no-tool", Some("1"), None);
+            let err = restore_selinux_labels(Path::new("/r/v7"), &probe)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("restorecon not found"), "{err}");
+        }
+
+        #[test]
+        fn under_permissive_a_failed_relabel_is_reported_not_fatal() {
+            let (probe, _log) = selinux_host("selinux-permissive", Some("0"), Some(1));
+            let outcome = restore_selinux_labels(Path::new("/r/v7"), &probe).unwrap();
+            assert!(
+                matches!(&outcome, Relabel::SkippedPermissive(why) if why.contains("restorecon exited")),
+                "{outcome:?}"
+            );
+        }
+
+        #[test]
+        fn a_release_that_cannot_be_relabelled_under_enforcing_is_not_promoted() {
+            let (_base, layout) = install("relabel-refused", &[1]);
+            let files: [(&str, &[u8]); 1] = [("agent", b"agent v2")];
+            let manifest = signed(2, &files);
+            let server = serve(&manifest, vec![("agent", b"agent v2".to_vec())]);
+            let (probe, _log) = selinux_host("relabel-refused-host", Some("1"), Some(1));
+
+            let err = apply_release_with(&client(&server.url), &layout, &probe).unwrap_err();
+
+            assert!(err.to_string().contains("cannot be relabelled"), "{err:#}");
+            assert_eq!(
+                layout.current_release_version(),
+                Some(1),
+                "current is untouched"
+            );
+            assert!(
+                !layout.version_dir(2).exists(),
+                "a release this run downloaded and could not label is removed"
+            );
+        }
+
+        #[test]
+        fn a_promoted_release_was_relabelled_first() {
+            let (_base, layout) = install("relabel-promoted", &[1]);
+            let files: [(&str, &[u8]); 1] = [("agent", b"agent v2")];
+            let manifest = signed(2, &files);
+            let server = serve(&manifest, vec![("agent", b"agent v2".to_vec())]);
+            let (probe, log) = selinux_host("relabel-promoted-host", Some("1"), Some(0));
+
+            let outcome = apply_release_with(&client(&server.url), &layout, &probe).unwrap();
+
+            assert_eq!(
+                outcome,
+                Outcome::Promoted {
+                    release_version: 2,
+                    downloaded: 1,
+                    relabel: Relabel::Done,
+                }
+            );
+            assert_eq!(layout.current_release_version(), Some(2));
+            let logged = std::fs::read_to_string(log).unwrap();
+            assert!(
+                logged
+                    .trim()
+                    .ends_with(&layout.version_dir(2).display().to_string()),
+                "{logged}"
             );
         }
 
