@@ -4,10 +4,17 @@
 //! the detection sink, the banner, the progress heartbeat — is assembled here,
 //! so a new pipeline stage lands once instead of per-platform.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use tamper::heartbeat::SilenceMonitor;
 
 use crate::{
+    health::{
+        DroppedCounter, HealthCollector, HealthCollectorConfig, NoopSpoolStats, SensorHealthSource,
+        SpoolStatsSource,
+    },
     ipc_handler::{AgentHandler, SensorHealthSlot},
+    silence::SilenceHealthSource,
     sink::DetectionSink,
 };
 
@@ -16,9 +23,9 @@ pub(crate) struct RunPipeline {
     pub(crate) sink: Arc<DetectionSink>,
     /// `Some` when `--server` was given: the upload thread is already running
     /// and the sink is spooling — see [`crate::upload`].
-    // Read back only on Linux (spool health stats + heartbeat client, see
-    // `commands::linux::cmd_run`) — `windows.rs` uses `pipeline.sink` alone.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    // Read back by `health_collector` (spool stats + heartbeat client), which
+    // only the platforms with a silence monitor call.
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     pub(crate) transport: Option<crate::upload::TransportHandle>,
     /// Where the platform deposits its sensor-health source for `cli health`
     /// (issue #388). Left empty on a platform with no silence monitor wired:
@@ -90,4 +97,100 @@ pub(crate) fn wire_run_pipeline(
         transport,
         sensor_health,
     })
+}
+
+/// Builds the health-beacon collector (#134) over the platform's silence
+/// monitor, and publishes the same live snapshot to `cli health` (#388) so the
+/// two never disagree. The caller spawns it and owns its shutdown.
+///
+/// The beacon is logged every tick and, with `--server`, sent as a `POST` to the
+/// heartbeat endpoint — the signal the control plane's silent-agent detection
+/// keys on (contract in `docs/architecture/control-plane.md`). Windows agents
+/// were invisible to it until they called this too (#317).
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+pub(crate) fn health_collector(
+    pipeline: &RunPipeline,
+    silence_monitor: Arc<Mutex<SilenceMonitor>>,
+) -> HealthCollector {
+    let spool_stats: Arc<dyn SpoolStatsSource> = match &pipeline.transport {
+        Some(t) => Arc::new(crate::upload::SpoolHealth(Arc::clone(&t.spool))),
+        None => Arc::new(NoopSpoolStats),
+    };
+    let heartbeat_client = pipeline.transport.as_ref().map(|t| Arc::clone(&t.client));
+    let silence_health: Arc<dyn SensorHealthSource> =
+        Arc::new(SilenceHealthSource::new(silence_monitor));
+    let _ = pipeline.sensor_health.set(Arc::clone(&silence_health));
+    HealthCollector::new(
+        HealthCollectorConfig::default(),
+        silence_health,
+        spool_stats,
+        Arc::new(pipeline.sink.enrich_queue().clone()) as Arc<dyn DroppedCounter>,
+        move |beacon| {
+            tracing::info!(
+                sensors = beacon.sensors.len(),
+                spool_bytes = beacon.spool_bytes,
+                enrich_dropped = beacon.enrich_dropped,
+                "health beacon"
+            );
+            // #24/#134: the dedicated health channel — best-effort, an
+            // unreachable server is nominal (events spool; the beacon's next
+            // tick retries by construction).
+            if let Some(client) = &heartbeat_client
+                && let Err(e) = client.send_heartbeat(&beacon)
+            {
+                tracing::debug!(error = %e, "health beacon heartbeat POST failed");
+            }
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::OnceLock;
+
+    use tamper::heartbeat::SensorHeartbeat;
+
+    use super::*;
+
+    #[test]
+    fn the_health_beacon_and_cli_health_read_the_same_silence_monitor() {
+        // #317: Windows builds its beacon here now, and used to publish the
+        // `cli health` source itself — the helper must keep doing that, over
+        // the very monitor the beacon reads.
+        let dir = std::env::temp_dir().join(format!("common-health-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pipeline = RunPipeline {
+            sink: Arc::new(
+                DetectionSink::new(
+                    rules::RuleState::new(),
+                    &dir.join("alerts.ndjson"),
+                    &dir.join("events.jsonl"),
+                    None,
+                    &dir.join("content"),
+                )
+                .unwrap(),
+            ),
+            transport: None,
+            sensor_health: Arc::new(OnceLock::new()),
+        };
+        let monitor = Arc::new(Mutex::new(SilenceMonitor::new()));
+
+        let _collector = health_collector(&pipeline, Arc::clone(&monitor));
+        monitor
+            .lock()
+            .unwrap()
+            .register(SensorHeartbeat::new("windows-etw"), 1, 0);
+
+        let published = pipeline.sensor_health.get().expect("cli health source");
+        let names: Vec<String> = published
+            .sensor_health()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        // The sink holds its files open, and Windows can't delete an open file.
+        drop(pipeline);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(names, ["windows-etw"]);
+    }
 }

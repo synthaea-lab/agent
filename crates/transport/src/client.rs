@@ -251,6 +251,7 @@ fn build_tls_config(config: &TransportConfig) -> Result<ureq::tls::TlsConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DEFAULT_HEARTBEAT_ENDPOINT;
 
     #[test]
     fn config_builds_urls_correctly() {
@@ -261,8 +262,23 @@ mod tests {
         );
         assert_eq!(
             config.heartbeat_url(),
-            "https://api.example.com/api/v1/ingest/heartbeat"
+            "https://api.example.com/api/ingest/heartbeat"
         );
+    }
+
+    /// Regression (#317 review): the endpoint carried a `/v1` prefix no route
+    /// served, and only a mock server that accepts any path was ever tested.
+    /// Next.js app router: the route for `<path>` is `server/app<path>/route.ts`.
+    /// Under `/api/ingest/` is also what puts it behind nginx's mTLS location and
+    /// past the middleware's login redirect.
+    #[test]
+    fn the_heartbeat_endpoint_is_a_real_server_route() {
+        assert!(DEFAULT_HEARTBEAT_ENDPOINT.starts_with("/api/ingest/"));
+        let route = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../server/app")
+            .join(DEFAULT_HEARTBEAT_ENDPOINT.trim_start_matches('/'))
+            .join("route.ts");
+        assert!(route.is_file(), "no server route at {}", route.display());
     }
 
     #[test]
@@ -270,5 +286,45 @@ mod tests {
         let config = TransportConfig::new("https://api.example.com");
         let client = TransportClient::new(config);
         assert!(client.is_ok());
+    }
+
+    /// Pins the heartbeat request body the control plane parses — the contract
+    /// in `docs/architecture/control-plane.md` (#317). A change here is a change
+    /// to that contract: update the doc and the server together.
+    #[test]
+    fn heartbeat_body_is_the_documented_wire_shape() {
+        let beacon = schema::HealthBeacon {
+            timestamp_ns: 1_790_756_620_574_604_200,
+            agent_version: "0.1.0".into(),
+            sensors: vec![schema::SensorHealth {
+                name: "windows-etw".into(),
+                pulse_count: 42,
+                silent: false,
+            }],
+            spool_bytes: 1024,
+            spool_dropped: 0,
+            enrich_dropped: 3,
+        };
+        let body = serde_json::to_value(HeartbeatPayload {
+            agent_id: None,
+            beacon: &beacon,
+        })
+        .unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "agent_id": null,
+                "beacon": {
+                    "timestamp_ns": 1_790_756_620_574_604_200_u64,
+                    "agent_version": "0.1.0",
+                    "sensors": [
+                        { "name": "windows-etw", "pulse_count": 42, "silent": false }
+                    ],
+                    "spool_bytes": 1024,
+                    "spool_dropped": 0,
+                    "enrich_dropped": 3
+                }
+            })
+        );
     }
 }

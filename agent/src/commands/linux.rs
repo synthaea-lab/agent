@@ -13,7 +13,7 @@ use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
 use crate::{
     protected::ProtectedResourceGuard,
     shutdown::{SHUTDOWN_BUDGET, ShutdownPlan, sleep_unless_stopped},
-    silence::{PulsingSink, SilenceHealthSource},
+    silence::PulsingSink,
     sink::DetectionSink,
 };
 
@@ -234,7 +234,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         ipc_endpoint,
         content_dir,
     )?;
-    let sink = pipeline.sink;
+    let sink = Arc::clone(&pipeline.sink);
 
     // The watcher thread itself can start any time after the mask above — only the
     // masking has to precede every other thread. Started here (not right after the
@@ -308,42 +308,9 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // one that was actually shipped).
     crate::integrity::spawn_monitor(state_dir.to_path_buf(), sink.clone());
 
-    // Spawn health beacon thread — emits periodic self-diagnostics to the control
-    // plane (issue #134). Sensor health is now the real silence-monitor snapshot
-    // (#71) rather than a no-op; spool stays a no-op until that component exists.
-    let health_config = crate::health::HealthCollectorConfig::default();
-    let spool_stats: Arc<dyn crate::health::SpoolStatsSource> = match &pipeline.transport {
-        Some(t) => Arc::new(crate::upload::SpoolHealth(Arc::clone(&t.spool))),
-        None => Arc::new(crate::health::NoopSpoolStats),
-    };
-    let heartbeat_client = pipeline.transport.as_ref().map(|t| Arc::clone(&t.client));
-    // One live silence snapshot, shared by the health beacon and `cli health`
-    // (#388) so both always report the same state.
-    let silence_health: Arc<dyn crate::health::SensorHealthSource> =
-        Arc::new(SilenceHealthSource::new(silence_monitor));
-    let _ = pipeline.sensor_health.set(Arc::clone(&silence_health));
-    let health = crate::health::HealthCollector::new(
-        health_config,
-        silence_health,
-        spool_stats,
-        Arc::new(sink.enrich_queue().clone()) as Arc<dyn crate::health::DroppedCounter>,
-        move |beacon| {
-            tracing::info!(
-                sensors = beacon.sensors.len(),
-                spool_bytes = beacon.spool_bytes,
-                enrich_dropped = beacon.enrich_dropped,
-                "health beacon"
-            );
-            // #24/#134: the dedicated health channel — best-effort, an
-            // unreachable server is nominal (events spool; the beacon's next
-            // tick retries by construction).
-            if let Some(client) = &heartbeat_client
-                && let Err(e) = client.send_heartbeat(&beacon)
-            {
-                tracing::debug!(error = %e, "health beacon heartbeat POST failed");
-            }
-        },
-    );
+    // Health beacon (#134): periodic self-diagnostics to the control plane, over
+    // the silence monitor above.
+    let health = super::common::health_collector(&pipeline, silence_monitor);
     // Workers wound down after `sensor.run` returns (#316).
     let mut shutdown = ShutdownPlan::default();
     let (health_handle, health_stop) = health.spawn();

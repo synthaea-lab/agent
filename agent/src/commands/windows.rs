@@ -13,7 +13,7 @@ use schema::{
 };
 use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
 
-use crate::silence::{PulsingSink, SilenceHealthSource};
+use crate::silence::PulsingSink;
 
 /// Silence deadline (#71/#388) for the ETW sensor, pulsed on every event it
 /// forwards. ETW is the high-volume sensor (process, file, registry, DNS...),
@@ -408,16 +408,17 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     )?;
 
     // Sensor-silence detection (#71/#388): the same monitor feeds T1562
-    // alerts and `cli health`. Heartbeats are registered once the sensors are
-    // built (`run_windows_sensors`); the monitor thread polls an empty list
-    // until then, which is harmless.
+    // alerts, `cli health` and the health beacon. Heartbeats are registered
+    // once the sensors are built (`run_windows_sensors`); the monitor thread
+    // polls an empty list until then, which is harmless.
     let silence_monitor = Arc::new(Mutex::new(SilenceMonitor::new()));
-    let _ = pipeline
-        .sensor_health
-        .set(Arc::new(SilenceHealthSource::new(Arc::clone(
-            &silence_monitor,
-        ))));
     crate::silence::spawn_monitor(Arc::clone(&silence_monitor), Arc::clone(&pipeline.sink));
+
+    // Health beacon (#134/#317): without it the control plane never hears from
+    // a Windows agent, and its silent-agent detection flags every one of them.
+    // No shutdown hook yet: the thread ends with the process.
+    let health = super::common::health_collector(&pipeline, Arc::clone(&silence_monitor));
+    let (_health_handle, _health_stop) = health.spawn();
 
     run_windows_sensors(Box::new(SharedSink(pipeline.sink)), Some(&silence_monitor))
 }
