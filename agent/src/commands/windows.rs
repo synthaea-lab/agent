@@ -188,14 +188,27 @@ fn hold_after_primary(
     {
         tracing::error!(error = %e, "ETW sensor failed; Event Log and socket-table sensors keep running");
         eprintln!(
-            "[!] {e} — process/network/file detection is down (not elevated?). Event Log \
-             and socket-table (LISTENER-DRIFT) sensors keep running; Ctrl-C to stop."
+            "[!] {e} — process/network/file detection is down{}. Event Log \
+             and socket-table (LISTENER-DRIFT) sensors keep running; Ctrl-C to stop.",
+            etw_failure_hint(&e.to_string())
         );
         while !shutdown.load(Ordering::SeqCst) {
             std::thread::sleep(SHUTDOWN_CHECK_INTERVAL);
         }
     }
     result
+}
+
+/// The operator hint after an ETW failure. A start refused without elevation
+/// is the usual cause, but a session that went silent after starting was
+/// elevated by definition: it was stopped or blinded from outside (#408), and
+/// "not elevated?" would send the operator the wrong way.
+fn etw_failure_hint(error: &str) -> &'static str {
+    if error.contains("produced no events") {
+        " (session stopped or blinded from outside, see above)"
+    } else {
+        " (not elevated?)"
+    }
 }
 
 /// Runs the ETW sensor (blocking, on the calling thread — same as before) and the
@@ -457,6 +470,19 @@ mod tests {
         let result = hold_after_primary(|| Err(anyhow::anyhow!("session torn down")), &shutdown);
         assert!(result.is_err());
         assert!(started.elapsed() < SHUTDOWN_CHECK_INTERVAL);
+    }
+
+    #[test]
+    fn hint_blames_elevation_only_for_a_start_failure() {
+        assert_eq!(
+            etw_failure_hint("ETW startup error: TraceError(AccessDenied)"),
+            " (not elevated?)"
+        );
+        // The sensor's liveness error (#408): it started, so it was elevated.
+        let silent = "ETW sensor failed: sensor produced no events for 30s despite \
+                      liveness canary writes: session wtrace-x is still running but \
+                      delivers no events (blind, not stopped)";
+        assert!(!etw_failure_hint(silent).contains("elevated"));
     }
 
     #[test]
