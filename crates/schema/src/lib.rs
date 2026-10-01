@@ -985,6 +985,11 @@ pub struct ScriptBlockEvent {
 /// Framework 4.8+ assembly loads). Complements [`ScriptBlockEvent`], which only
 /// covers the `PowerShell` runtime and only what it logs.
 ///
+/// What a runtime hands over differs: `PowerShell` passes every script and
+/// command, de-obfuscated; Windows Script Host passes only its sensitive
+/// runtime calls with their arguments (`IWshShell3.Run("cmd /c …")`,
+/// `VBScript` `Execute` content), not the whole script (lab, 2026-10-01).
+///
 /// `meta` is the scanning process (AMSI runs in-process). Identical content is
 /// rescanned constantly, so the sensor deduplicates on [`Self::content_hash`]
 /// and rate-limits per process; see the sensor's `amsi` module.
