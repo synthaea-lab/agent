@@ -9,7 +9,7 @@ use store::BoundedMap;
 use crate::{
     bayes::{BAYES_THRESHOLD, BeliefState, apply_ml_llr, update_belief},
     behavior::BehaviorVector,
-    bus::EventBus,
+    bus::{EventBus, same_generation},
     event::is_correlated,
     rules::{
         CorrelationAlert, rule_assembly_connect, rule_assembly_smb, rule_connect_filewrite,
@@ -67,6 +67,17 @@ fn is_ignored(comm: &str) -> bool {
 /// tester).
 const BAYES_NAME_EXCLUSIONS: &[&str] = &["wget", "chronyd"];
 
+struct Stamped<T> {
+    generation: Option<u64>,
+    value: T,
+}
+
+impl<T> Stamped<T> {
+    fn current(&self, generation: Option<u64>) -> bool {
+        same_generation(self.generation, generation)
+    }
+}
+
 fn is_bayes_excluded(comm: &str) -> bool {
     let name = comm.rsplit('\\').next().unwrap_or(comm);
     BAYES_NAME_EXCLUSIONS
@@ -85,17 +96,17 @@ pub struct CorrelationEngine {
     beliefs: BoundedMap<(u32, String), BeliefState>,
     /// pid → (ppid, comm) mapping populated by `ExecEvents`, LRU-bounded.
     /// Lets `ConnectEvents` (ppid=0) find the right entity key.
-    pid_entities: BoundedMap<u32, (u32, String)>,
+    pid_entities: BoundedMap<u32, Stamped<(u32, String)>>,
     /// (technique, pid) → last alert timestamp. A satisfied co-occurrence pattern
     /// stays satisfied for every later event in the window — without this, one
     /// exec+connect pair re-alerted on every subsequent event of that pid (review
     /// finding: identical alert floods from a single pattern).
-    fired: BoundedMap<(&'static str, u32), u64>,
+    fired: BoundedMap<(&'static str, u32), Stamped<u64>>,
     /// Pids whose `ExecEvent` showed an IGNORED-list name running from an
     /// untrusted location — a rename masquerade (`/tmp/svchost.exe`). The
     /// exclusion is name-keyed and would otherwise be a trivial bypass (user
     /// finding); these pids keep full rule evaluation.
-    masquerading: BoundedMap<u32, ()>,
+    masquerading: BoundedMap<u32, Option<u64>>,
 }
 
 /// Bounds for a long-lived agent: entities cover the realistic live-pid space with
@@ -132,6 +143,7 @@ impl CorrelationEngine {
             return Vec::new();
         }
         let pid = event.meta().pid;
+        let generation = event.meta().process_generation;
         let comm = event.meta().comm.clone();
         let ppid = event.meta().ppid;
 
@@ -141,7 +153,13 @@ impl CorrelationEngine {
         // is filled in on all events, so the table is redundant but harmless.
         if let Event::Exec(exec) = &event {
             if ppid != 0 {
-                self.pid_entities.insert(pid, (ppid, comm.clone()));
+                self.pid_entities.insert(
+                    pid,
+                    Stamped {
+                        generation,
+                        value: (ppid, comm.clone()),
+                    },
+                );
             }
             // Masquerade detection: an IGNORED-list or BAYES_NAME_EXCLUSIONS name is
             // suspicious when EITHER the image path is not in a trusted system
@@ -154,7 +172,7 @@ impl CorrelationEngine {
                 && (!policy::name_exclusion_applies(Some(exec.image_path.as_str()))
                     || !policy::parent_exclusion_applies(&comm, exec.parent_comm.as_deref()))
             {
-                self.masquerading.insert(pid, ());
+                self.masquerading.insert(pid, generation);
             }
         }
 
@@ -166,14 +184,15 @@ impl CorrelationEngine {
         let entity_key = self
             .pid_entities
             .get(&pid)
-            .cloned()
+            .filter(|entry| entry.current(generation))
+            .map(|entry| entry.value.clone())
             .unwrap_or_else(|| (pid, comm.clone()));
 
         // Bayesian update with the pid's current BehaviorVector.
-        if let Some(bv) = self.behavior_vector_for_pid(pid) {
+        if let Some(bv) = self.behavior_vector_for_pid(pid, generation) {
             let now_ns = self
                 .bus
-                .events_for_pid(pid)
+                .events_for_pid(pid, generation)
                 .map(|e| e.meta().timestamp_ns)
                 .max()
                 .unwrap_or(0);
@@ -184,21 +203,27 @@ impl CorrelationEngine {
             update_belief(state, &bv, None, now_ns);
         }
 
-        if is_ignored(&comm) && self.masquerading.peek(&pid).is_none() {
+        if is_ignored(&comm) && !self.is_masquerading(pid, generation) {
             return Vec::new();
         }
 
         let now_ns = self
             .bus
-            .events_for_pid(pid)
+            .events_for_pid(pid, generation)
             .map(|e| e.meta().timestamp_ns)
             .max()
             .unwrap_or(0);
-        let mut alerts = self.evaluate(pid, now_ns);
-        if !is_bayes_excluded(&comm) || self.masquerading.peek(&pid).is_some() {
+        let mut alerts = self.evaluate(pid, generation, now_ns);
+        if !is_bayes_excluded(&comm) || self.is_masquerading(pid, generation) {
             alerts.extend(self.bayes_alert(pid, &comm, &entity_key));
         }
         alerts
+    }
+
+    fn is_masquerading(&self, pid: u32, generation: Option<u64>) -> bool {
+        self.masquerading
+            .peek(&pid)
+            .is_some_and(|&recorded| same_generation(recorded, generation))
     }
 
     /// Returns a reference to the internal event bus (for ML scoring).
@@ -247,22 +272,32 @@ impl CorrelationEngine {
     ///     Err(ScorerError::FeatureOutOfBounds { .. }) => None,  // OOD
     ///     Err(e) => { error!("ML scorer: {e}"); None }  // Fail open
     /// };
-    /// engine.update_belief_with_ml(pid, ml_llr)?;
+    /// engine.update_belief_with_ml(pid, generation, ml_llr)?;
     /// ```
     #[allow(clippy::result_unit_err)]
-    pub fn update_belief_with_ml(&mut self, pid: u32, ml_llr: Option<f32>) -> Result<(), ()> {
+    pub fn update_belief_with_ml(
+        &mut self,
+        pid: u32,
+        generation: Option<u64>,
+        ml_llr: Option<f32>,
+    ) -> Result<(), ()> {
         let Some(llr) = ml_llr else {
             return Ok(());
         };
 
         let comm = self
             .bus
-            .events_for_pid(pid)
-            .next()
+            .events_for_pid(pid, generation)
+            .last()
             .map(|e| e.meta().comm.clone())
             .ok_or(())?;
 
-        let entity_key = self.pid_entities.get(&pid).cloned().unwrap_or((pid, comm));
+        let entity_key = self
+            .pid_entities
+            .get(&pid)
+            .filter(|entry| entry.current(generation))
+            .map(|entry| entry.value.clone())
+            .unwrap_or((pid, comm));
 
         // `on_event` creates this entity's belief state in the same cycle whenever a
         // `BehaviorVector` is available; if it isn't there yet either, there is no
@@ -309,53 +344,73 @@ impl CorrelationEngine {
     /// `pub` when a real consumer appears.
     #[cfg(test)]
     pub(crate) fn belief_for_pid(&self, pid: u32) -> Option<&BeliefState> {
-        if let Some(entity_key) = self.pid_entities.peek(&pid) {
-            return self.beliefs.peek(entity_key);
+        let event = self.bus.events_for_pid(pid, None).last()?;
+        let generation = event.meta().process_generation;
+        if let Some(entry) = self.pid_entities.peek(&pid)
+            && entry.current(generation)
+        {
+            return self.beliefs.peek(&entry.value);
         }
         // Fallback: recover the comm from the bus to rebuild the same key
         // as the one inserted in on_event — (pid, comm.clone()).
-        let comm = self.bus.events_for_pid(pid).next()?.meta().comm.clone();
+        let comm = event.meta().comm.clone();
         self.beliefs.peek(&(pid, comm))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn belief_for_entity(&self, parent: u32, comm: &str) -> Option<&BeliefState> {
+        self.beliefs.peek(&(parent, comm.to_string()))
     }
 
     /// Evaluates all the co-occurrence rules for a given pid, emitting each
     /// satisfied pattern once per correlation window rather than on every event.
-    fn evaluate(&mut self, pid: u32, now_ns: u64) -> Vec<CorrelationAlert> {
+    fn evaluate(
+        &mut self,
+        pid: u32,
+        generation: Option<u64>,
+        now_ns: u64,
+    ) -> Vec<CorrelationAlert> {
         let mut alerts = Vec::new();
         let window_ns = self.window_ns;
 
         // Keyed by rule identity, not technique — spawn+connect and
         // respawn+connect share "T1059/T1071" but are distinct findings.
-        let mut push_once = |fired: &mut BoundedMap<(&'static str, u32), u64>,
+        let mut push_once = |fired: &mut BoundedMap<(&'static str, u32), Stamped<u64>>,
                              rule_id: &'static str,
                              alert: CorrelationAlert| {
             let key = (rule_id, pid);
-            let recently = fired
-                .get(&key)
-                .is_some_and(|&t| now_ns.saturating_sub(t) <= window_ns);
+            let recently = fired.get(&key).is_some_and(|entry| {
+                entry.current(generation) && now_ns.saturating_sub(entry.value) <= window_ns
+            });
             if !recently {
-                fired.insert(key, now_ns);
+                fired.insert(
+                    key,
+                    Stamped {
+                        generation,
+                        value: now_ns,
+                    },
+                );
                 alerts.push(alert);
             }
         };
 
-        if let Some(alert) = rule_spawn_connect_filewrite(pid, &self.bus) {
+        if let Some(alert) = rule_spawn_connect_filewrite(pid, generation, &self.bus) {
             push_once(&mut self.fired, "spawn_connect_filewrite", alert);
-        } else if let Some(alert) = rule_spawn_connect(pid, &self.bus) {
+        } else if let Some(alert) = rule_spawn_connect(pid, generation, &self.bus) {
             // Subset of the full chain — only alert if the full chain has not
             // already been reported, to avoid the duplicate.
             push_once(&mut self.fired, "spawn_connect", alert);
         }
 
-        if let Some(alert) = rule_connect_filewrite(pid, &self.bus) {
+        if let Some(alert) = rule_connect_filewrite(pid, generation, &self.bus) {
             push_once(&mut self.fired, "connect_filewrite", alert);
         }
 
-        if let Some(alert) = rule_respawn_connect(pid, &self.bus) {
+        if let Some(alert) = rule_respawn_connect(pid, generation, &self.bus) {
             push_once(&mut self.fired, "respawn_connect", alert);
         }
 
-        if let Some(alert) = rule_dns_exfil(pid, &self.bus) {
+        if let Some(alert) = rule_dns_exfil(pid, generation, &self.bus) {
             push_once(&mut self.fired, "dns_exfil", alert);
         }
 
@@ -363,13 +418,13 @@ impl CorrelationEngine {
         // `rule_assembly_smb` is the superset; check it first and skip the two
         // subset rules (exec_smb, assembly_connect) if the full chain fires,
         // matching the pattern of rule_spawn_connect_filewrite above.
-        if let Some(alert) = rule_assembly_smb(pid, &self.bus) {
+        if let Some(alert) = rule_assembly_smb(pid, generation, &self.bus) {
             push_once(&mut self.fired, "assembly_smb", alert);
         } else {
-            if let Some(alert) = rule_assembly_connect(pid, &self.bus) {
+            if let Some(alert) = rule_assembly_connect(pid, generation, &self.bus) {
                 push_once(&mut self.fired, "assembly_connect", alert);
             }
-            if let Some(alert) = rule_exec_smb(pid, &self.bus) {
+            if let Some(alert) = rule_exec_smb(pid, generation, &self.bus) {
                 push_once(&mut self.fired, "exec_smb", alert);
             }
         }
@@ -382,8 +437,12 @@ impl CorrelationEngine {
     ///
     /// Returns `None` if the PID has no events in the window.
     #[must_use]
-    pub(crate) fn behavior_vector_for_pid(&self, pid: u32) -> Option<BehaviorVector> {
-        let events: Vec<&Event> = self.bus.events_for_pid(pid).collect();
+    pub(crate) fn behavior_vector_for_pid(
+        &self,
+        pid: u32,
+        generation: Option<u64>,
+    ) -> Option<BehaviorVector> {
+        let events: Vec<&Event> = self.bus.events_for_pid(pid, generation).collect();
         BehaviorVector::from_window(&events)
     }
 }

@@ -92,7 +92,7 @@ fn scores_match_onnxruntime_reference() {
         for e in row["events"].as_array().unwrap() {
             bus.push(event_from_json(e));
         }
-        let got = scorer.score(&bus, pid).unwrap();
+        let got = scorer.score(&bus, pid, None).unwrap();
         match row["score"].as_f64() {
             None => {
                 assert!(
@@ -134,8 +134,8 @@ fn score_explained_agrees_with_score_and_attributes() {
         for e in row["events"].as_array().unwrap() {
             bus.push(event_from_json(e));
         }
-        let bare = scorer.score(&bus, pid).unwrap().unwrap();
-        let explained = scorer.score_explained(&bus, pid, 3).unwrap().unwrap();
+        let bare = scorer.score(&bus, pid, None).unwrap().unwrap();
+        let explained = scorer.score_explained(&bus, pid, None, 3).unwrap().unwrap();
         assert_eq!(
             bare, explained.value,
             "explained score must equal bare score"
@@ -165,8 +165,8 @@ fn gate_returns_none_before_the_model_runs() {
         &serde_json::json!({"type":"connect","pid":42,"ts_ns":1_000_000_000,"daddr_v4":[1,1,1,1],"dport":53}),
     ));
     // Two events < MIN_EVENT_COUNT.
-    assert!(scorer.score(&bus, 42).unwrap().is_none());
-    assert!(scorer.score_explained(&bus, 42, 3).unwrap().is_none());
+    assert!(scorer.score(&bus, 42, None).unwrap().is_none());
+    assert!(scorer.score_explained(&bus, 42, None, 3).unwrap().is_none());
 }
 
 #[test]
