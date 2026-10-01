@@ -299,7 +299,7 @@ packaging/linux/
 2. **APT/YUM Repository** - Host packages in proper repos for `apt install synthaea-agent`
 3. **musl Static Builds** - `.tar.gz` distribution for containers
 4. **SELinux Custom Policy** - RHEL hardening (deferred to issue #112)
-5. **Capability Management** - Fine-grained privileges for sensors
+5. **Capability Management** - The unit grants a minimal ambient capability set (ADR-0014); `CAP_SYS_PTRACE`, `CAP_CHOWN`/`CAP_FOWNER` and the audit capabilities are added with the features that need them
 6. **Configuration Format** - Currently placeholder (blocked on issue #19)
 
 ---
