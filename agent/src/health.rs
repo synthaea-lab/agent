@@ -107,6 +107,7 @@ impl StopFlag {
         }
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn stop(&self) {
         // Set the flag under the mutex: a sleeper checks it under the same
         // mutex before waiting, so the notification can't fall between its
@@ -189,10 +190,12 @@ impl HealthCollector {
 }
 
 /// Handle to stop the health collector.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct StopHandle(Arc<StopFlag>);
 
 impl StopHandle {
     /// Signals the collector to stop and wakes it from sleep immediately.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn stop(&self) {
         self.0.stop();
     }
