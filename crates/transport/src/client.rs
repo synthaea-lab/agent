@@ -52,13 +52,20 @@ impl TransportClient {
     pub fn upload_detection(&self, detection: &Detection) -> Result<()> {
         let response: DetectionUploadResponse =
             self.post_json(&self.config.detection_url(), detection)?;
-        if response.status != "accepted" {
-            return Err(TransportError::InvalidResponse(format!(
-                "unexpected detection ingest status: {}",
-                response.status
-            )));
-        }
-        Ok(())
+        validate_detection_response(response)
+    }
+
+    /// Uploads a detection with a stable key retained by the caller's durable
+    /// spool. Reusing the key on retry lets the server acknowledge a stored
+    /// detection without creating another row or counting prevalence twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the detection or cannot be reached.
+    pub fn upload_detection_with_key(&self, detection: &Detection, key: &str) -> Result<()> {
+        let response: DetectionUploadResponse =
+            self.post_json_with_key(&self.config.detection_url(), detection, Some(key))?;
+        validate_detection_response(response)
     }
 
     /// Sends a heartbeat to the server with arbitrary payload.
@@ -147,20 +154,28 @@ impl TransportClient {
         url: &str,
         payload: &T,
     ) -> Result<R> {
+        self.post_json_with_key(url, payload, None)
+    }
+
+    fn post_json_with_key<T: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        payload: &T,
+        key: Option<&str>,
+    ) -> Result<R> {
         let body = serde_json::to_string(payload).map_err(TransportError::Serialization)?;
 
-        let response = self
-            .agent
-            .post(url)
-            .content_type("application/json")
-            .send(&body)
-            .map_err(|e| match &e {
-                ureq::Error::StatusCode(status) => TransportError::ServerError {
-                    status: *status,
-                    message: e.to_string(),
-                },
-                _ => TransportError::Network(e.to_string()),
-            })?;
+        let mut request = self.agent.post(url).content_type("application/json");
+        if let Some(key) = key {
+            request = request.header("Idempotency-Key", key);
+        }
+        let response = request.send(&body).map_err(|e| match &e {
+            ureq::Error::StatusCode(status) => TransportError::ServerError {
+                status: *status,
+                message: e.to_string(),
+            },
+            _ => TransportError::Network(e.to_string()),
+        })?;
 
         // The server was reached and answered (status already read successfully
         // above) — a body it can't be parsed is a server-side/deterministic
@@ -177,6 +192,16 @@ impl TransportClient {
     pub fn config(&self) -> &TransportConfig {
         &self.config
     }
+}
+
+fn validate_detection_response(response: DetectionUploadResponse) -> Result<()> {
+    if response.status != "accepted" {
+        return Err(TransportError::InvalidResponse(format!(
+            "unexpected detection ingest status: {}",
+            response.status
+        )));
+    }
+    Ok(())
 }
 
 /// Payload for event upload requests.
