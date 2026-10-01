@@ -395,7 +395,7 @@ impl DetectionSink {
             && let Err(detection) = self.enrich_queue.enqueue_detection(detection)
         {
             tracing::warn!("detection queue full; persisting on capture thread");
-            if let Err(e) = crate::upload::persist_detection(spool, detection) {
+            if let Err(e) = crate::upload::persist_detection(spool, *detection) {
                 tracing::error!(error = %e, "detection spool append failed on fallback");
             }
         }

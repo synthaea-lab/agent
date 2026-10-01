@@ -122,13 +122,13 @@ impl EnrichQueue {
     /// Queues a finding for durable storage without file I/O on the capture
     /// thread. Returns the finding if the queue is full or disconnected so the
     /// caller can use a synchronous fallback instead of silently losing it.
-    pub(crate) fn enqueue_detection(&self, detection: Detection) -> Result<(), Detection> {
+    pub(crate) fn enqueue_detection(&self, detection: Detection) -> Result<(), Box<Detection>> {
         match self.tx.try_send(QueueItem::Detection(Box::new(detection))) {
             Ok(()) => Ok(()),
             Err(
                 mpsc::TrySendError::Full(QueueItem::Detection(detection))
                 | mpsc::TrySendError::Disconnected(QueueItem::Detection(detection)),
-            ) => Err(*detection),
+            ) => Err(detection),
             Err(_) => unreachable!("only a detection was sent"),
         }
     }
