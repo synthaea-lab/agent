@@ -2,3 +2,5 @@
 d      /run/synthaea       0755 synthaea synthaea -   -
 d      /var/log/synthaea   0750 synthaea synthaea -   -
 d      /var/lib/synthaea   0750 synthaea synthaea -   -
+# bpffs pin directory for the sensor (#559); needs bpffs mounted, which systemd does at boot
+d      /sys/fs/bpf/synthaea 0750 synthaea synthaea -   -
