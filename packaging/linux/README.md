@@ -248,6 +248,10 @@ sudo restorecon -R /var/lib/synthaea /var/log/synthaea
 ```
 Files written by the updater into `versions/vN/` inherit `var_lib_t` from the
 directory and need a `restorecon` before they can be executed on an Enforcing host.
+`agent apply-release` runs `restorecon -R` on the staged release itself, before it
+promotes it (#559): on an Enforcing host it refuses the release, leaving `current`
+untouched, if `restorecon` is missing or fails; on a Permissive host it warns and
+promotes. A manual copy still needs the command above.
 
 **Temporary workaround (testing only):**
 ```bash
