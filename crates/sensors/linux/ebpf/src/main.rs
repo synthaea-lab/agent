@@ -49,14 +49,17 @@ static EXEC_SCRATCH: PerCpuArray<ExecEvent> = PerCpuArray::with_max_entries(1, 0
 #[map]
 static PROC_LINEAGE: HashMap<u32, LineageEntry> = HashMap::with_max_entries(65_536, 0);
 
-/// `real_parent` of the current thread group, from `PROC_LINEAGE`. `0` when the
-/// parent forked before the probe attached and `/proc` priming missed it — callers
-/// treat `0` as "unknown", never as pid 0.
-fn lineage_ppid() -> u32 {
+/// Fills `meta.ppid` and `meta.process_generation` for the current thread group from
+/// `PROC_LINEAGE`. Both stay `0` when the process forked before the probe attached
+/// and `/proc` priming missed it — callers treat `ppid == 0` as "unknown", never as
+/// pid 0, and `process_generation == 0` as "no stamp", never as a real generation
+/// (issue #519). One lookup for both, since every probe wants both.
+fn fill_lineage(meta: &mut sensor_linux_wire::EventMeta) {
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    match unsafe { PROC_LINEAGE.get(&tgid) } {
-        Some(entry) => entry.ppid,
-        None => 0,
+    if let Some(entry) = unsafe { PROC_LINEAGE.get(&tgid) } {
+        meta.ppid = entry.ppid;
+        meta.process_generation = entry.generation;
+        meta.parent_generation = entry.parent_generation;
     }
 }
 
@@ -149,9 +152,20 @@ fn try_sched_process_fork(ctx: &TracePointContext) -> Result<(), i64> {
     let comm_src = unsafe { (ctx.as_ptr() as *const u8).add(comm_offset) };
     let _ = unsafe { bpf_probe_read_kernel_str_bytes(comm_src, &mut comm) };
 
+    // The stamp that tells this incarnation of `child_pid` from the next one to
+    // hold the number (issue #519): a recycled pid goes through a new fork, so it
+    // gets a new value here. Nanoseconds since boot never reach bit 63, which the
+    // `/proc`-primed stamps use (`PRIMED_GENERATION_BIT`).
     let entry = LineageEntry {
         ppid: parent_pid as u32,
         comm,
+        reserved: 0,
+        generation: unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() },
+        // The parent's own stamp, so an event can name its parent's incarnation.
+        parent_generation: match unsafe { PROC_LINEAGE.get(&(parent_pid as u32)) } {
+            Some(parent) => parent.generation,
+            None => 0,
+        },
     };
     // BPF_ANY: overwrite a stale entry left by pid reuse.
     let inserted = PROC_LINEAGE.insert(&(child_pid as u32), &entry, 0);
@@ -230,6 +244,8 @@ fn try_sched_process_exec(ctx: TracePointContext) -> Result<u32, u32> {
         // Parent identity from the fork-lineage map.
         if let Some(l) = PROC_LINEAGE.get(&tgid) {
             (*e).meta.ppid = l.ppid;
+            (*e).meta.process_generation = l.generation;
+            (*e).meta.parent_generation = l.parent_generation;
             let mut i = 0usize;
             while i < TASK_COMM_LEN {
                 (*e).pcomm[i] = l.comm[i];
@@ -386,7 +402,7 @@ fn emit_file_open_event(
         core::ptr::write_bytes(e, 0, 1);
 
         (*e).meta.pid = pid;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -493,7 +509,7 @@ fn try_sys_enter_write(ctx: TracePointContext) -> Result<u32, u32> {
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
         (*e).meta.pid = pid;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -588,7 +604,7 @@ fn emit_file_delete_event(ctx: &TracePointContext, pathname_ptr: u64) -> Result<
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -768,7 +784,7 @@ fn emit_file_rename_event(
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -922,7 +938,7 @@ fn emit_file_chmod_event(
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -1113,7 +1129,7 @@ fn emit_file_chown_event(
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -1215,7 +1231,7 @@ fn try_sys_enter_setxattr(ctx: TracePointContext) -> Result<u32, u32> {
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -1305,7 +1321,7 @@ fn try_sys_enter_removexattr(ctx: TracePointContext) -> Result<u32, u32> {
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -1437,7 +1453,7 @@ fn try_sys_enter_connect(ctx: TracePointContext) -> Result<u32, u32> {
         core::ptr::write_bytes(e, 0, 1);
 
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -1579,7 +1595,7 @@ fn try_sys_enter_bind(ctx: TracePointContext) -> Result<u32, u32> {
         core::ptr::write_bytes(e, 0, 1);
 
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -1693,7 +1709,7 @@ fn try_sys_enter_listen(ctx: TracePointContext) -> Result<u32, u32> {
         core::ptr::write_bytes(e, 0, 1);
 
         (*e).meta.pid = pid;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -1811,7 +1827,7 @@ fn try_sys_enter_sendto(ctx: TracePointContext) -> Result<u32, u32> {
         core::ptr::write_bytes(e, 0, 1);
 
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -2016,7 +2032,7 @@ fn try_sys_exit_accept(ctx: TracePointContext) -> Result<u32, u32> {
         core::ptr::write_bytes(e, 0, 1);
 
         (*e).meta.pid = (pid_tgid >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -2114,7 +2130,7 @@ fn try_sys_enter_ptrace(ctx: TracePointContext) -> Result<u32, u32> {
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -2252,7 +2268,7 @@ fn try_sys_enter_process_vm_readv(ctx: TracePointContext) -> Result<u32, u32> {
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -2331,7 +2347,7 @@ fn try_sys_enter_process_vm_writev(ctx: TracePointContext) -> Result<u32, u32> {
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -2427,7 +2443,7 @@ fn try_sys_enter_memfd_create(ctx: TracePointContext) -> Result<u32, u32> {
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -2697,7 +2713,7 @@ fn emit_mount_event(
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -2897,7 +2913,7 @@ fn emit_signal_event(ctx: &TracePointContext, target_pid: u32, sig: u32) -> Resu
         // meta is the SENDER, not the target — same convention as macOS's
         // `SignalToEsClient` (see `SignalEvent`'s doc comment in `sensor-linux-wire`).
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -2999,7 +3015,7 @@ fn emit_kernel_module_event(
         core::ptr::write_bytes(e, 0, 1);
 
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -3184,7 +3200,7 @@ fn try_sys_enter_bpf(ctx: TracePointContext) -> Result<u32, u32> {
         core::ptr::write_bytes(e, 0, 1);
 
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -3272,7 +3288,7 @@ fn try_sys_enter_prctl(ctx: TracePointContext) -> Result<u32, u32> {
         core::ptr::write_bytes(e, 0, 1);
 
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -3362,7 +3378,7 @@ fn emit_identity_change_event(
         core::ptr::write_bytes(e, 0, 1);
 
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -3605,7 +3621,7 @@ fn try_sys_enter_capset(ctx: TracePointContext) -> Result<u32, u32> {
         core::ptr::write_bytes(e, 0, 1);
 
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -3677,7 +3693,7 @@ fn emit_namespace_event(ctx: &TracePointContext, syscall: u8, fd: i32, flags: u3
         core::ptr::write_bytes(e, 0, 1);
 
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -3814,7 +3830,7 @@ fn try_ssl_write(ctx: ProbeContext, lib_type: u8) -> Result<u32, u32> {
         core::ptr::write_bytes(e, 0, 1);
 
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -3942,7 +3958,7 @@ fn try_ssl_read_exit(ctx: RetProbeContext) -> Result<u32, u32> {
         core::ptr::write_bytes(e, 0, 1);
 
         (*e).meta.pid = (pid_tgid >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -4022,7 +4038,7 @@ fn try_readline_exit(ctx: RetProbeContext) -> Result<u32, u32> {
         core::ptr::write_bytes(e, 0, 1);
 
         (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
@@ -4188,7 +4204,7 @@ fn try_getaddrinfo_exit(ctx: RetProbeContext) -> Result<u32, u32> {
         core::ptr::write_bytes(e, 0, 1);
 
         (*e).meta.pid = (pid_tgid >> 32) as u32;
-        (*e).meta.ppid = lineage_ppid();
+        fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();

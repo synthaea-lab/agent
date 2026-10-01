@@ -488,7 +488,7 @@ const MYSQL_WRITE_PATH_PREFIXES: &[&str] = &[
 #[must_use]
 pub(crate) fn check_service_write_outside_datadir(
     event: &FileOpenEvent,
-    resolve_comm: impl FnOnce(u32) -> Option<String>,
+    resolve_comm: impl FnOnce(u32, Option<u64>) -> Option<String>,
 ) -> Option<Alert> {
     let path = &event.path;
     if !has_write_intent(event.flags)
@@ -500,7 +500,7 @@ pub(crate) fn check_service_write_outside_datadir(
     {
         return None;
     }
-    let comm = resolve_comm(event.meta.pid)?;
+    let comm = resolve_comm(event.meta.pid, event.meta.process_generation)?;
     if !MYSQL_SERVICE_COMMS.contains(&comm.as_str()) {
         return None;
     }

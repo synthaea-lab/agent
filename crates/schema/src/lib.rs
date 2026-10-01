@@ -212,7 +212,15 @@ pub mod time;
 /// `PR_CAPBSET_DROP`, filtered at the source. Linux-only, no cross-platform
 /// reuse (same posture as `Ptrace`/`Namespace`). Same serialization-visible
 /// reasoning as v13-v33.
-pub const SCHEMA_VERSION: u32 = 34;
+///
+/// Bumped 34 → 35 for [`EventMeta::process_generation`] and
+/// [`EventMeta::parent_process_generation`] (#519): an opaque stamp
+/// that tells two incarnations of one pid apart, so a pid-keyed cache (`rules`'
+/// `pid_comm`, `pid_image_path`) can tell a recycled pid from the process it
+/// remembers. Additive and optional (`None` on Windows and macOS, and on Linux
+/// events the sensor could not stamp), the same serialization-visible reasoning
+/// as v13-v34.
+pub const SCHEMA_VERSION: u32 = 35;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -428,6 +436,21 @@ pub struct EventMeta {
     /// (out of scope, issue #80), just the container runtime's own identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<ContainerContext>,
+    /// Opaque stamp of this incarnation of `pid`, for telling a recycled pid from
+    /// the process a cache remembers (#519). Only **equality between two events
+    /// that carry the same `pid`** means anything: it is not a timestamp, not
+    /// comparable across pids, and not stable across agent restarts (the Linux
+    /// sensor assigns it at `sched_process_fork`, or from `/proc` for a process
+    /// that predates the agent). `None` when the sensor has no such stamp
+    /// (Windows, macOS) or could not read it; a consumer must then treat the pid
+    /// as unchanged, never as new.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_generation: Option<u64>,
+    /// [`Self::process_generation`] of `ppid`, as the sensor recorded it when `pid`
+    /// forked. A cache keyed on the parent's pid needs the parent's incarnation, not
+    /// the child's. Same meaning and same `None` rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_process_generation: Option<u64>,
 }
 
 /// Identity of the container a process runs in, resolved from its cgroup (issue #80).

@@ -48,8 +48,10 @@ pub fn listen_port_event(
             timestamp_ns,
             comm: proc.comm.clone(),
             container: None, // sock_diag has no cgroup to read this from (issue #80's
-                             // technique needs an actual /proc/<pid>/cgroup read,
-                             // not plumbed into this crate — a further follow-up).
+            process_generation: None,
+            parent_process_generation: None,
+            // technique needs an actual /proc/<pid>/cgroup read,
+            // not plumbed into this crate — a further follow-up).
         },
         local_addr: entry.local.ip(),
         local_port: entry.local.port(),
@@ -148,6 +150,8 @@ pub fn conntrack_flow_events_for(
                     timestamp_ns,
                     comm: proc.comm.clone(),
                     container: None, // see listen_port_event's identical note.
+                    process_generation: None,
+                    parent_process_generation: None,
                 },
                 local_port: sock.local.port(),
                 daddr: peer.ip(),

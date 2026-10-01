@@ -56,6 +56,42 @@ struct ReportedTaskRegistration {
     actions: Option<String>,
 }
 
+/// What the rules remember about a pid, and for which incarnation of it.
+///
+/// The kernel recycles pids, and the schema has no exit event, so a cache keyed on
+/// the pid alone hands a new process the name or image path of the one that held the
+/// number before it (#519). `generation` is the sensor's stamp for the incarnation
+/// the fact was recorded for ([`schema::EventMeta::process_generation`]); a lookup
+/// that names a different one misses. `None` on either side means "cannot tell" and
+/// reads as a match: an entry seeded at startup, or an event from a platform with no
+/// stamp (Windows, macOS), behaves exactly as before.
+#[derive(Debug, Clone)]
+pub(crate) struct PidFact {
+    generation: Option<u64>,
+    pub(crate) value: String,
+}
+
+impl PidFact {
+    fn new(generation: Option<u64>, value: String) -> Self {
+        Self { generation, value }
+    }
+
+    /// A fact read from `/proc` or an external table at startup: no stamp to compare.
+    fn seeded(value: String) -> Self {
+        Self::new(None, value)
+    }
+
+    /// The value cached for `pid`, unless it was recorded for another incarnation
+    /// than `generation`.
+    fn current(map: &BoundedMap<u32, Self>, pid: u32, generation: Option<u64>) -> Option<&str> {
+        let fact = map.peek(&pid)?;
+        match (fact.generation, generation) {
+            (Some(recorded), Some(wanted)) if recorded != wanted => None,
+            _ => Some(fact.value.as_str()),
+        }
+    }
+}
+
 /// Sliding history needed by the correlation rules:
 /// - T1105 (Ingress Tool Transfer): a path recently written by `curl`/`wget` is
 ///   executed shortly after. Correlated by path + time window rather than by a strict
@@ -70,14 +106,14 @@ pub struct RuleState {
     /// (T1059) with a simple `ppid` lookup without having to walk the process tree in
     /// userspace. LRU-bounded (`store::BoundedMap`) — a long-lived agent must not
     /// grow this without limit. `pub(crate)` for the `seed_from_proc` test.
-    pub(crate) pid_comm: BoundedMap<u32, String>,
+    pub(crate) pid_comm: BoundedMap<u32, PidFact>,
     /// pid → kernel-reported `image_path` of the last exec seen for this pid. The
     /// only race-free source of "which binary is this pid" for rename-time
     /// exclusions: `FileRenameEvent::executable_path` is read from `/proc/<pid>/exe`
     /// after the event crossed the ring buffer, so a short-lived process (real
     /// `sed -i.bak`, or an encryptor that exits right after its renames) is already
     /// gone and it reads `None` (#513 review). LRU-bounded like `pid_comm`.
-    pid_image_path: BoundedMap<u32, String>,
+    pid_image_path: BoundedMap<u32, PidFact>,
     /// path → info about the last write by a known downloader (T1105). LRU-bounded:
     /// downloader writes are rare, but a hostile loop must not grow agent memory.
     recent_writes: BoundedMap<String, RecentWrite>,
@@ -286,7 +322,10 @@ impl RuleState {
     /// exclusions (SELF-SPAWN, T1059) also apply to processes started before the agent
     /// (e.g. RuntimeBroker.exe).
     pub fn seed_pid_comm(&mut self, map: HashMap<u32, String>) {
-        self.pid_comm.extend(map);
+        self.pid_comm.extend(
+            map.into_iter()
+                .map(|(pid, comm)| (pid, PidFact::seeded(comm))),
+        );
     }
 
     /// Pre-fills `pid_comm` with the processes already running at startup (read from
@@ -310,7 +349,8 @@ impl RuleState {
             let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else {
                 continue;
             };
-            self.pid_comm.insert(pid, comm.trim_end().to_string());
+            self.pid_comm
+                .insert(pid, PidFact::seeded(comm.trim_end().to_string()));
         }
     }
 
@@ -326,9 +366,13 @@ impl RuleState {
     /// `/proc/{ppid}/comm`, valid as long as the parent is still alive at evaluation
     /// time — true in the vast majority of cases, the child executing right after the
     /// fork.
-    pub(crate) fn resolve_comm(&self, pid: u32) -> Option<String> {
-        if let Some(comm) = self.pid_comm.peek(&pid) {
-            return Some(comm.clone());
+    ///
+    /// `generation` is the incarnation of `pid` the caller means ([`PidFact`]): a
+    /// cached name recorded for a different incarnation is a recycled pid's
+    /// inheritance, not an answer, and falls through to the `/proc` read (#519).
+    pub(crate) fn resolve_comm(&self, pid: u32, generation: Option<u64>) -> Option<String> {
+        if let Some(comm) = PidFact::current(&self.pid_comm, pid, generation) {
+            return Some(comm.to_string());
         }
         std::fs::read_to_string(format!("/proc/{pid}/comm"))
             .ok()
@@ -345,7 +389,8 @@ impl RuleState {
         if !SHELL_COMMS.contains(&comm) {
             return None;
         }
-        let parent_comm = self.resolve_comm(event.meta.ppid)?;
+        let parent_comm =
+            self.resolve_comm(event.meta.ppid, event.meta.parent_process_generation)?;
         let is_service = SERVICE_COMMS.iter().any(|w| parent_comm == *w)
             || SERVICE_COMM_PREFIXES
                 .iter()
@@ -493,11 +538,13 @@ impl RuleState {
         }
         // Parent-side exclusion: some system processes legitimately spawn the same
         // child in a loop (e.g. RuntimeBroker.exe → powershell.exe for UWP tasks).
-        let parent_comm = self
-            .pid_comm
-            .peek(&event.meta.ppid)
-            .cloned()
-            .unwrap_or_default();
+        let parent_comm = PidFact::current(
+            &self.pid_comm,
+            event.meta.ppid,
+            event.meta.parent_process_generation,
+        )
+        .unwrap_or_default()
+        .to_string();
         if SELF_SPAWN_PARENT_EXCLUSIONS
             .iter()
             .any(|&e| parent_comm.eq_ignore_ascii_case(e))
@@ -537,7 +584,8 @@ impl RuleState {
         {
             return None;
         }
-        let parent_comm = self.resolve_comm(event.meta.ppid)?;
+        let parent_comm =
+            self.resolve_comm(event.meta.ppid, event.meta.parent_process_generation)?;
         if !SUSPECT_PARENTS_WIN
             .iter()
             .any(|&p| parent_comm.eq_ignore_ascii_case(p))
@@ -559,7 +607,8 @@ impl RuleState {
         if !LOLBINS.iter().any(|&l| comm.eq_ignore_ascii_case(l)) {
             return None;
         }
-        let parent_comm = self.resolve_comm(event.meta.ppid)?;
+        let parent_comm =
+            self.resolve_comm(event.meta.ppid, event.meta.parent_process_generation)?;
         if LOLBIN_LEGIT_PARENTS
             .iter()
             .any(|&p| parent_comm.eq_ignore_ascii_case(p))
@@ -765,10 +814,15 @@ impl RuleState {
             &self.ld_trust_extra,
         ));
 
-        self.pid_comm
-            .insert(event.meta.pid, event.meta.comm.clone());
-        self.pid_image_path
-            .insert(event.meta.pid, event.image_path.clone());
+        let generation = event.meta.process_generation;
+        self.pid_comm.insert(
+            event.meta.pid,
+            PidFact::new(generation, event.meta.comm.clone()),
+        );
+        self.pid_image_path.insert(
+            event.meta.pid,
+            PidFact::new(generation, event.image_path.clone()),
+        );
         alerts
     }
 
@@ -1028,7 +1082,7 @@ impl RuleState {
         let mut alerts: Vec<Alert> = self.check_task_registration(event).into_iter().collect();
         alerts.extend(crate::stateless::check_service_write_outside_datadir(
             event,
-            |pid| self.resolve_comm(pid),
+            |pid, generation| self.resolve_comm(pid, generation),
         ));
         alerts.extend(self.record_create(event));
         self.record_downloader_write(event);
@@ -1311,9 +1365,7 @@ impl RuleState {
         deleted: &str,
         created: &str,
     ) -> Option<Alert> {
-        if self.is_compressor(meta.pid, &meta.comm)
-            || self.is_compression_driver(meta.pid, &meta.comm, deleted, created)
-        {
+        if self.is_compressor(meta) || self.is_compression_driver(meta, deleted, created) {
             return None;
         }
         let pid_entry = self
@@ -1341,17 +1393,22 @@ impl RuleState {
     /// True when `comm` is a compression driver ([`COMPRESSION_DRIVER_COMMS`], i.e.
     /// `logrotate`) that really runs the trusted binary of that name and the new file
     /// only appends a compression extension to the old name.
-    fn is_compression_driver(&self, pid: u32, comm: &str, deleted: &str, created: &str) -> bool {
-        COMPRESSION_DRIVER_COMMS.contains(&comm)
+    fn is_compression_driver(
+        &self,
+        meta: &schema::EventMeta,
+        deleted: &str,
+        created: &str,
+    ) -> bool {
+        COMPRESSION_DRIVER_COMMS.contains(&meta.comm.as_str())
             && appended_suffix(deleted, created)
                 .is_some_and(|suffix| COMPRESSION_SUFFIXES.contains(&suffix))
-            && self.runs_trusted_binary_named(pid, comm)
+            && self.runs_trusted_binary_named(meta)
     }
 
     /// True when `comm` is a compression tool ([`COMPRESSOR_COMMS`]) and the pid really
     /// runs the trusted binary of that name: see [`Self::runs_trusted_binary_named`].
-    fn is_compressor(&self, pid: u32, comm: &str) -> bool {
-        COMPRESSOR_COMMS.contains(&comm) && self.runs_trusted_binary_named(pid, comm)
+    fn is_compressor(&self, meta: &schema::EventMeta) -> bool {
+        COMPRESSOR_COMMS.contains(&meta.comm.as_str()) && self.runs_trusted_binary_named(meta)
     }
 
     /// True when this pid's exec-time `image_path` is known, sits at a trusted system
@@ -1362,9 +1419,11 @@ impl RuleState {
     /// *called* `gzip`. Unknown is **not** trusted (fails closed): delete events carry no
     /// rename-time `executable_path` to fall back on, and "no exec seen" (a forked child
     /// that only set `comm`) is not evidence of `/usr/bin/gzip`.
-    fn runs_trusted_binary_named(&self, pid: u32, comm: &str) -> bool {
-        self.pid_image_path.peek(&pid).is_some_and(|p| {
-            !p.is_empty() && policy::name_exclusion_applies(Some(p)) && written_file_is(p, comm)
+    fn runs_trusted_binary_named(&self, meta: &schema::EventMeta) -> bool {
+        PidFact::current(&self.pid_image_path, meta.pid, meta.process_generation).is_some_and(|p| {
+            !p.is_empty()
+                && policy::name_exclusion_applies(Some(p))
+                && written_file_is(p, &meta.comm)
         })
     }
 
@@ -1569,11 +1628,12 @@ impl RuleState {
         if !IN_PLACE_EDIT_COMMS.contains(&event.meta.comm.as_str()) {
             return false;
         }
-        let path = self
-            .pid_image_path
-            .peek(&event.meta.pid)
-            .map(String::as_str)
-            .or(event.executable_path.as_deref());
+        let path = PidFact::current(
+            &self.pid_image_path,
+            event.meta.pid,
+            event.meta.process_generation,
+        )
+        .or(event.executable_path.as_deref());
         // A trusted path is not enough on its own: the system `python3` can set its own
         // `comm` to `sed` (`prctl(PR_SET_NAME)`) and would inherit the exclusion. What
         // an encryptor cannot fake is that the trusted binary it runs is *called* `comm`.

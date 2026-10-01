@@ -37,6 +37,8 @@ pub fn listen_port_event(entry: &SocketSnapshotEntry, timestamp_ns: u64) -> Opti
             timestamp_ns,
             comm: comm(entry.process_path.as_deref()),
             container: None,
+            process_generation: None,
+            parent_process_generation: None,
         },
         local_addr: entry.local.ip(),
         local_port: entry.local.port(),
