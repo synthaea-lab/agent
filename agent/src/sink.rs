@@ -415,8 +415,9 @@ impl DetectionSink {
         // itself accesses the bus while still holding the correlator lock, which is
         // acceptable — inference is fast and this is the capture thread.
         let pid = event.meta().pid;
+        let generation = event.meta().process_generation;
         if let Some(ref mut scorer) = *self.ml_scorer.lock().unwrap() {
-            let ml_llr = match scorer.score(engine.bus(), pid) {
+            let ml_llr = match scorer.score(engine.bus(), pid, generation) {
                 Ok(Some(score)) => {
                     // Scored successfully: convert to log-likelihood ratio.
                     Some(ml::score_to_llr(score))
@@ -451,7 +452,7 @@ impl DetectionSink {
             };
 
             // Update belief with the ML LLR (None = no ML evidence, not "benign").
-            if let Err(()) = engine.update_belief_with_ml(pid, ml_llr) {
+            if let Err(()) = engine.update_belief_with_ml(pid, generation, ml_llr) {
                 // No behavior vector available yet for this pid — not enough events.
                 // Silent: this is normal for the first few events of a new pid.
             }

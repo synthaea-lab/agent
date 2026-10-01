@@ -62,8 +62,11 @@ fn is_modeled(event: &Event) -> bool {
 /// [`FEATURE_NAMES`] order. Pid filtering happens here (mirror of the Python side
 /// taking the whole window), via [`EventBus::events_for_pid`].
 #[must_use]
-pub fn extract_features(bus: &EventBus, pid: u32) -> [f32; 8] {
-    let events: Vec<&Event> = bus.events_for_pid(pid).filter(|e| is_modeled(e)).collect();
+pub fn extract_features(bus: &EventBus, pid: u32, generation: Option<u64>) -> [f32; 8] {
+    let events: Vec<&Event> = bus
+        .events_for_pid(pid, generation)
+        .filter(|e| is_modeled(e))
+        .collect();
 
     let spawn_count = events
         .iter()
@@ -178,7 +181,7 @@ mod tests {
     #[test]
     fn empty_vector_for_absent_pid() {
         let bus = EventBus::new(Duration::from_secs(60));
-        assert_eq!(extract_features(&bus, 1234), [0.0; 8]);
+        assert_eq!(extract_features(&bus, 1234, None), [0.0; 8]);
     }
 
     #[test]
@@ -188,7 +191,7 @@ mod tests {
         bus.push(connect(99, 1_000_000_000, 4444));
         bus.push(file_write(99, 2_000_000_000));
 
-        let f = extract_features(&bus, 99);
+        let f = extract_features(&bus, 99, None);
         assert_eq!(f[0], 1.0, "spawn_count");
         assert_eq!(f[1], 1.0, "connect_count");
         assert_eq!(f[2], 1.0, "filewrite_count");
@@ -204,7 +207,7 @@ mod tests {
         bus.push(connect(7, 1_000_000_000, 4444)); // same dest
         bus.push(connect(7, 2_000_000_000, 8080)); // different port
 
-        let f = extract_features(&bus, 7);
+        let f = extract_features(&bus, 7, None);
         assert_eq!(f[1], 3.0, "connect_count");
         assert_eq!(f[3], 1.0, "unique_daddr_count");
         assert_eq!(f[4], 2.0, "unique_dport_count");
@@ -219,7 +222,7 @@ mod tests {
         bus.push(network_flow(7, 1_000_000_000, "10.0.0.1", 4444)); // same dest as connect
         bus.push(network_flow(7, 2_000_000_000, "10.0.0.2", 9999)); // netlink-only dest
 
-        let f = extract_features(&bus, 7);
+        let f = extract_features(&bus, 7, None);
         assert_eq!(f[3], 3.0, "unique_daddr_count spans Connect + NetworkFlow");
         assert_eq!(f[4], 2.0, "unique_dport_count spans Connect + NetworkFlow");
         assert_eq!(
@@ -244,7 +247,7 @@ mod tests {
             status: 0,
         }));
 
-        let f = extract_features(&bus, 5);
+        let f = extract_features(&bus, 5, None);
         assert_eq!(f[7], 2.0, "event_count counts only modeled events");
         assert_eq!(f[6], 1.0, "span_s ignores the later DNS lookup");
     }
@@ -254,7 +257,31 @@ mod tests {
         let mut bus = EventBus::new(Duration::from_secs(60));
         bus.push(exec(1, 0));
         bus.push(connect(2, 1_000_000_000, 4444));
-        assert_eq!(extract_features(&bus, 1)[1], 0.0);
-        assert_eq!(extract_features(&bus, 2)[0], 0.0);
+        assert_eq!(extract_features(&bus, 1, None)[1], 0.0);
+        assert_eq!(extract_features(&bus, 2, None)[0], 0.0);
+    }
+
+    #[test]
+    fn recycled_pid_does_not_inherit_the_first_incarnations_features() {
+        let mut bus = EventBus::new(Duration::from_secs(60));
+        let mut old_exec = meta(7, 1_000_000_000);
+        old_exec.process_generation = Some(1);
+        bus.push(Event::Exec(ExecEvent {
+            meta: old_exec,
+            ..schema::fixtures::exec()
+        }));
+        let mut new_connect = meta(7, 2_000_000_000);
+        new_connect.process_generation = Some(2);
+        bus.push(Event::Connect(ConnectEvent {
+            meta: new_connect,
+            daddr: "127.0.0.1".parse().unwrap(),
+            dport: 443,
+        }));
+
+        let features = extract_features(&bus, 7, Some(2));
+        assert_eq!(features[0], 0.0, "spawn_count is from the current process");
+        assert_eq!(features[1], 1.0);
+        assert_eq!(features[5], 0.0, "old exec must not complete a new chain");
+        assert_eq!(features[7], 1.0, "event_count excludes the old process");
     }
 }
