@@ -114,7 +114,7 @@ fn secure_payload(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        return std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400));
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400))
     }
     #[cfg(not(unix))]
     {
