@@ -189,11 +189,10 @@ impl HealthCollector {
 }
 
 /// Handle to stop the health collector.
-pub struct StopHandle(#[allow(dead_code)] Arc<StopFlag>);
+pub struct StopHandle(Arc<StopFlag>);
 
 impl StopHandle {
     /// Signals the collector to stop and wakes it from sleep immediately.
-    #[allow(dead_code)] // Will be used for graceful shutdown
     pub fn stop(&self) {
         self.0.stop();
     }
