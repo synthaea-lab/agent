@@ -35,6 +35,20 @@ const DOTNET_RUNTIME_GUID: &str = "e13c0d23-ccbc-4e12-931b-d9cc2eee27e4";
 /// Microsoft-Windows-SMBClient (EID 30704 — TCP connection established to SMB server)
 const SMB_CLIENT_GUID: &str = "988C59C5-0A1C-45B6-A555-0C62276E327D";
 
+/// Every provider the sensor enables, by short name — for the blind-session
+/// attribution (#408), which asks the OS who else enables them.
+pub(crate) const ALL_PROVIDERS: [(&str, &str); 9] = [
+    ("Kernel-Process", KERNEL_PROCESS_GUID),
+    ("Kernel-Network", KERNEL_NETWORK_GUID),
+    ("Kernel-File", KERNEL_FILE_GUID),
+    ("DNS-Client", DNS_CLIENT_GUID),
+    ("Kernel-Registry", KERNEL_REGISTRY_GUID),
+    ("PowerShell", POWERSHELL_GUID),
+    ("WMI-Activity", WMI_ACTIVITY_GUID),
+    ("DotNETRuntime", DOTNET_RUNTIME_GUID),
+    ("SMBClient", SMB_CLIENT_GUID),
+];
+
 /// `AssemblyFlags` bit indicating a dynamic (in-memory) assembly load.
 /// File-backed assemblies are high-volume noise; only dynamic loads are forwarded.
 const ASSEMBLY_FLAG_DYNAMIC: u32 = 0x2;

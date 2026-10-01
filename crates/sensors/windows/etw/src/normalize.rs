@@ -150,6 +150,100 @@ pub fn describe_silent_session(session: &str, logman_query_ets_output: Option<&s
     format!("session {session} {state}; other wtrace- sessions running: {others}")
 }
 
+/// One session enabling one of our providers, as the OS reports it (#408).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderEnablement {
+    /// Our provider's short name (e.g. `Kernel-Process`).
+    pub provider: &'static str,
+    /// The enabling session's name.
+    pub session: String,
+    /// The level it enabled the provider at (5 = verbose).
+    pub level: u8,
+    /// Its match-any keyword mask.
+    pub match_any_keyword: u64,
+}
+
+/// A running session's mode and write counter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionStats {
+    /// The session name.
+    pub name: String,
+    /// Real-time mode (events delivered to a consumer, not a file).
+    pub real_time: bool,
+    /// Buffers flushed so far; a real-time session nobody consumes stays at 0.
+    pub buffers_written: u32,
+}
+
+/// At most this many foreign sessions are named in a diagnosis.
+const MAX_FOREIGN_NAMED: usize = 3;
+
+/// The attribution half of the blind-session diagnosis (#408): the foreign
+/// sessions that enable our providers, most of ours first. A real-time one
+/// with no buffer written is flagged: a real-time session nobody consumes
+/// stalls real-time delivery for every consumer on the host (lab, 2026-10-01),
+/// so it is the prime suspect. Empty when no foreign session enables ours.
+#[must_use]
+pub fn describe_foreign_sessions(
+    our_session: &str,
+    enablements: &[ProviderEnablement],
+    sessions: &[SessionStats],
+) -> String {
+    // session → (our providers it enables, highest level).
+    let mut by_session: Vec<(&str, Vec<&'static str>, u8)> = Vec::new();
+    for e in enablements.iter().filter(|e| e.session != our_session) {
+        match by_session.iter_mut().find(|(s, _, _)| *s == e.session) {
+            Some((_, providers, level)) => {
+                if !providers.contains(&e.provider) {
+                    providers.push(e.provider);
+                }
+                *level = (*level).max(e.level);
+            }
+            None => by_session.push((&e.session, vec![e.provider], e.level)),
+        }
+    }
+    if by_session.is_empty() {
+        return String::new();
+    }
+    let undrained = |name: &str| {
+        sessions
+            .iter()
+            .any(|s| s.name == name && s.real_time && s.buffers_written == 0)
+    };
+    // Undrained first, then most of our providers, then name (stable output).
+    by_session.sort_by(|a, b| {
+        undrained(b.0)
+            .cmp(&undrained(a.0))
+            .then(b.1.len().cmp(&a.1.len()))
+            .then(a.0.cmp(b.0))
+    });
+    let total = by_session.len();
+    let named: Vec<String> = by_session
+        .iter()
+        .take(MAX_FOREIGN_NAMED)
+        .map(|(name, providers, level)| {
+            let flag = if undrained(name) {
+                ", real-time with 0 buffers written: nobody consumes it"
+            } else {
+                ""
+            };
+            format!(
+                "{name} ({} of our providers, level {level}{flag}: {})",
+                providers.len(),
+                providers.join(", ")
+            )
+        })
+        .collect();
+    let more = if total > MAX_FOREIGN_NAMED {
+        format!(" and {} more", total - MAX_FOREIGN_NAMED)
+    } else {
+        String::new()
+    };
+    format!(
+        "; foreign sessions enabling our providers: {}{more}",
+        named.join("; ")
+    )
+}
+
 /// Short-window connect dedup (F-7): stacks that emit both Connect (42/58) and the
 /// first Send (12/26) for one connection must not double-count the beacon counter.
 pub struct ConnectDedup {
@@ -409,5 +503,78 @@ mod tests {
         assert!(!d.is_duplicate(100, 5555, ip, 4444, 9_000_000_000));
         // A different source port is a different flow, never a duplicate.
         assert!(!d.is_duplicate(100, 6666, ip, 4444, 9_100_000_000));
+    }
+
+    fn enables(provider: &'static str, session: &str, level: u8) -> ProviderEnablement {
+        ProviderEnablement {
+            provider,
+            session: session.to_string(),
+            level,
+            match_any_keyword: u64::MAX,
+        }
+    }
+
+    fn stats(name: &str, real_time: bool, buffers_written: u32) -> SessionStats {
+        SessionStats {
+            name: name.to_string(),
+            real_time,
+            buffers_written,
+        }
+    }
+
+    #[test]
+    fn no_foreign_session_adds_nothing() {
+        let ours = [enables("Kernel-Process", "wtrace-x", 5)];
+        assert_eq!(
+            describe_foreign_sessions("wtrace-x", &ours, &[stats("wtrace-x", true, 0)]),
+            ""
+        );
+    }
+
+    #[test]
+    fn the_undrained_real_time_session_is_named_first_and_flagged() {
+        // The 2026-10-01 lab shape: one foreign real-time session nobody
+        // consumes on all our providers, next to a legitimate drained one.
+        let enablements = [
+            enables("Kernel-Process", "wtrace-x", 5),
+            enables("Kernel-Process", "EventLog-System", 4),
+            enables("Kernel-File", "EventLog-System", 4),
+            enables("Kernel-Process", "lab408b-allnine", 5),
+            enables("Kernel-Process", "lab408b-allnine", 5),
+        ];
+        let sessions = [
+            stats("wtrace-x", true, 0),
+            stats("EventLog-System", true, 40),
+            stats("lab408b-allnine", true, 0),
+        ];
+        let text = describe_foreign_sessions("wtrace-x", &enablements, &sessions);
+        assert!(
+            text.starts_with("; foreign sessions enabling our providers: lab408b-allnine (1 of our providers, level 5, real-time with 0 buffers written: nobody consumes it: Kernel-Process)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "EventLog-System (2 of our providers, level 4: Kernel-Process, Kernel-File)"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("wtrace-x"),
+            "our own session is never a suspect: {text}"
+        );
+    }
+
+    #[test]
+    fn only_three_sessions_are_named() {
+        let enablements: Vec<_> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|s| enables("Kernel-File", s, 4))
+            .collect();
+        let text = describe_foreign_sessions("wtrace-x", &enablements, &[]);
+        assert!(text.ends_with(" and 2 more"), "{text}");
+        assert!(
+            text.contains("a (") && text.contains("c (") && !text.contains("d ("),
+            "{text}"
+        );
     }
 }

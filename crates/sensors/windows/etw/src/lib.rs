@@ -36,6 +36,8 @@
 //! `schema::FileQuarantineEvent`, the macOS quarantine-xattr sibling — see
 //! [`zone_identifier`].
 
+#[cfg(windows)]
+mod etw_sessions;
 #[cfg(any(windows, test))]
 mod long_path;
 pub mod normalize;

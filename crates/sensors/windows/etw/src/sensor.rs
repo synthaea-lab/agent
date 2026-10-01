@@ -18,12 +18,13 @@ use schema::{
 };
 
 use crate::{
+    etw_sessions,
     long_path::{self, LongPathCache},
     normalize,
     pid_cache::PidCache,
     providers::{
-        dns_provider, dotnet_provider, file_provider, network_provider, powershell_provider,
-        process_provider, registry_provider, smb_provider, wmi_provider,
+        ALL_PROVIDERS, dns_provider, dotnet_provider, file_provider, network_provider,
+        powershell_provider, process_provider, registry_provider, smb_provider, wmi_provider,
     },
     winapi,
     zone_identifier::{self, MarkQueue, QuarantineDedup},
@@ -142,7 +143,10 @@ fn stop_session_after_failed_start(session: &str) {
 }
 
 /// The liveness error's diagnosis (#408): is our silent session still listed by
-/// `logman query -ets` (running but blind) or gone (stopped from outside)?
+/// `logman query -ets` (running but blind) or gone (stopped from outside)? And
+/// which foreign sessions enable our providers: a real-time one nobody consumes
+/// blinds every real-time consumer on the host (lab, 2026-10-01), so naming it
+/// is what the operator needs to act.
 fn silent_session_diagnosis(session: &str) -> String {
     let output = std::process::Command::new("logman")
         .args(["query", "-ets"])
@@ -150,7 +154,24 @@ fn silent_session_diagnosis(session: &str) -> String {
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
-    normalize::describe_silent_session(session, output.as_deref())
+    let state = normalize::describe_silent_session(session, output.as_deref());
+
+    let sessions = etw_sessions::running_sessions();
+    let enablements: Vec<normalize::ProviderEnablement> =
+        etw_sessions::provider_enablements(&ALL_PROVIDERS)
+            .into_iter()
+            .filter_map(|(provider, logger_id, level, match_any_keyword)| {
+                let (_, stats) = sessions.iter().find(|(id, _)| *id == logger_id)?;
+                Some(normalize::ProviderEnablement {
+                    provider,
+                    session: stats.name.clone(),
+                    level,
+                    match_any_keyword,
+                })
+            })
+            .collect();
+    let stats: Vec<normalize::SessionStats> = sessions.into_iter().map(|(_, s)| s).collect();
+    state + &normalize::describe_foreign_sessions(session, &enablements, &stats)
 }
 
 // ── Shared state between provider callbacks ──────────────────────────────────
