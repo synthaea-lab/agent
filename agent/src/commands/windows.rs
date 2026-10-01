@@ -373,7 +373,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     let super::RunOptions {
         alerts,
         events,
-        state_dir: _,
+        state_dir,
         enable_kill: _,
         enable_quarantine: _,
         // uprobes are a Linux mechanism — the capture flags are accepted for CLI
@@ -392,6 +392,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         server,
         ipc_endpoint,
         content_dir,
+        state_dir,
     )?;
 
     // Sensor-silence detection (#71/#388): the same monitor feeds T1562

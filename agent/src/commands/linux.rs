@@ -233,6 +233,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         server,
         ipc_endpoint,
         content_dir,
+        state_dir,
     )?;
     let sink = pipeline.sink;
 

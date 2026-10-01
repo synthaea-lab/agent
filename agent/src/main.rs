@@ -89,9 +89,11 @@ enum Command {
         #[arg(long, default_value = "alerts.ndjson")]
         alerts: std::path::PathBuf,
         /// JSON-Lines file every normalized event is appended to (raw capture,
-        /// consumed by ML calibration and lab assertions).
-        #[arg(long, default_value = "events.jsonl")]
-        events: std::path::PathBuf,
+        /// consumed by ML calibration and lab assertions). Off unless given: the
+        /// file grows without bound and is no part of a production run, so the
+        /// packaged service never writes it (#559).
+        #[arg(long)]
+        events: Option<std::path::PathBuf>,
         /// Enables automated process termination on a high-confidence correlated
         /// verdict (issue #25). Off by default: observe-only — logs what would have
         /// been killed without acting. See `policy::ResponsePolicy`.
@@ -314,7 +316,7 @@ fn main() -> anyhow::Result<()> {
                 content_dir.unwrap_or_else(|| content::default_content_dir(&cfg.storage.state_dir));
             commands::cmd_run(commands::RunOptions {
                 alerts: &alerts,
-                events: &events,
+                events: events.as_deref(),
                 state_dir: &cfg.storage.state_dir,
                 enable_kill,
                 enable_quarantine,

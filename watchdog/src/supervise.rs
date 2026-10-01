@@ -45,7 +45,7 @@ use std::{
 use anyhow::Context as _;
 
 use crate::{
-    paths::{child_log_path, heartbeat_path_for, resolve_agent_bin},
+    paths::{heartbeat_path_for, resolve_agent_bin},
     probation::{Probation, Verdict},
 };
 
@@ -395,28 +395,37 @@ fn settle_probation(
     }
 }
 
-/// Spawns one agent run with its output captured to the child log.
+/// Spawns one agent run. On Windows its output goes to the child log file; on Unix
+/// it inherits the watchdog's streams, which under systemd are the journal (#559).
 fn spawn_agent(agent: &Path, alerts: &Path) -> std::io::Result<Child> {
     // Force the working directory to the agent binary's folder. In a service
     // session (session 0 on Windows), the default working dir is System32 — the
     // agent would not find rules content nor write alerts.ndjson in the right
     // place.
     let work_dir = agent.parent().unwrap_or_else(|| Path::new("."));
-    let log_out = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(child_log_path())
-        .ok();
     let mut cmd = std::process::Command::new(agent);
     cmd.arg("run")
         .arg("--alerts")
         .arg(alerts)
         .current_dir(work_dir);
-    if let Some(f) = log_out {
-        let f2 = f.try_clone().ok();
-        cmd.stderr(std::process::Stdio::from(f));
-        if let Some(f2) = f2 {
-            cmd.stdout(std::process::Stdio::from(f2));
+    // Windows service sessions give the inherited streams nowhere to go, so the
+    // output is captured to a file there. On Unix the file was `/var/tmp/...`,
+    // which the unit's `PrivateTmp=true` hides from the host, so a crash left no
+    // diagnostics anyone could read; the inherited streams reach the journal
+    // (`StandardOutput=journal`) and `journalctl -u synthaea-agent` shows them.
+    #[cfg(windows)]
+    {
+        let log_out = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(crate::paths::child_log_path())
+            .ok();
+        if let Some(f) = log_out {
+            let f2 = f.try_clone().ok();
+            cmd.stderr(std::process::Stdio::from(f));
+            if let Some(f2) = f2 {
+                cmd.stdout(std::process::Stdio::from(f2));
+            }
         }
     }
     #[cfg(target_os = "linux")]

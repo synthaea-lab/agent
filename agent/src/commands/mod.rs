@@ -22,7 +22,7 @@ mod windows;
 /// "accepted for parity, inert here" posture the individual fields already had.
 pub(crate) struct RunOptions<'a> {
     pub(crate) alerts: &'a std::path::Path,
-    pub(crate) events: &'a std::path::Path,
+    pub(crate) events: Option<&'a std::path::Path>,
     // Read only by `linux::cmd_run` (integrity monitoring, response, uprobes
     // capture — all Linux-only mechanisms); `windows`/`macos::cmd_run` destructure
     // and discard them for CLI-signature parity, same "accepted, inert here"
