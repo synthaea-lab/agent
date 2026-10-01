@@ -244,7 +244,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     let super::RunOptions {
         alerts,
         events,
-        state_dir: _,
+        state_dir,
         enable_kill: _,
         enable_quarantine: _,
         enable_tls_capture: _,
@@ -261,6 +261,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         server,
         ipc_endpoint,
         content_dir,
+        state_dir,
     )?;
     run_macos_sensors(Box::new(SharedSink(pipeline.sink)))
 }

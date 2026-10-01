@@ -141,6 +141,28 @@ fn techniques_from(technique: &str) -> Vec<String> {
     }
 }
 
+/// Where the agent looks for ML model families first: under the state directory,
+/// like the content and the updater's files, not the process's working directory
+/// (#559). Lab runs and source checkouts keep working through the relative
+/// `ml/registry` fallback in [`DetectionSink::load_correlation_scorer`].
+pub(crate) fn model_root(state_dir: &Path) -> std::path::PathBuf {
+    state_dir.join("ml").join("registry")
+}
+
+/// The version directory of `family` under the first of `roots` that holds a
+/// `model.onnx`. When none does, the first root's directory: it is the one the
+/// "scorer unavailable" warning should name, where an operator would put the model.
+fn locate_model_dir(roots: &[&Path], family: &str) -> std::path::PathBuf {
+    let dirs: Vec<std::path::PathBuf> = roots
+        .iter()
+        .map(|root| root.join(family).join("0.1.0"))
+        .collect();
+    dirs.iter()
+        .find(|dir| dir.join("model.onnx").is_file())
+        .unwrap_or(&dirs[0])
+        .clone()
+}
+
 impl DetectionSink {
     /// `rule_state` arrives already seeded by the caller (from /proc or the
     /// platform's process list — see `commands`). `spool` is the transport
@@ -154,9 +176,10 @@ impl DetectionSink {
     pub(crate) fn new(
         rule_state: rules::RuleState,
         alerts_path: &std::path::Path,
-        events_path: &std::path::Path,
+        events_path: Option<&std::path::Path>,
         spool: Option<Arc<Mutex<store::EventSpool>>>,
         content_dir: &Path,
+        model_root: &Path,
     ) -> std::io::Result<Self> {
         let alert_log = Arc::new(AlertLog::open(alerts_path, RECENT_ALERTS_CAPACITY)?);
         let content_root = resolve_content_root(content_dir);
@@ -164,9 +187,16 @@ impl DetectionSink {
         // thread — shared behind an Arc so the worker owns a handle. The spool
         // append rides the same worker for the same #126 reason: it is file
         // I/O that must never stall the capture thread.
-        let events_log = Arc::new(JsonlWriter::open(events_path)?);
+        // `None` (the default, and what the packaged service runs) writes no raw
+        // capture at all: it grows without bound and only labs and ML calibration
+        // want it (#559).
+        let events_log = events_path
+            .map(|path| JsonlWriter::open(path).map(Arc::new))
+            .transpose()?;
         let enrich_queue = EnrichQueue::start(enrich::Enricher::new(), move |event| {
-            events_log.write(&event);
+            if let Some(events_log) = &events_log {
+                events_log.write(&event);
+            }
             if let Some(spool) = &spool
                 && let Err(e) = spool.lock().unwrap().push(&event)
             {
@@ -179,7 +209,7 @@ impl DetectionSink {
         Ok(Self {
             rule_state: Mutex::new(rule_state),
             correlator: Mutex::new(correlator::CorrelationEngine::new()),
-            ml_scorer: Mutex::new(Self::load_correlation_scorer()),
+            ml_scorer: Mutex::new(Self::load_correlation_scorer(model_root)),
             sigma: Mutex::new(load_sigma_rules(&content_root).into_option()),
             yara: Mutex::new(
                 start_yara(&content_root, alert_log.clone(), response.clone()).into_option(),
@@ -255,9 +285,12 @@ impl DetectionSink {
     /// the agent works without ML (hand-calibrated Bayesian features still function).
     /// Logs a warning on load failure so the operator sees the degradation.
     ///
-    /// Model location: `ml/registry/correlation-iforest-{linux,windows}/0.1.0/`
-    /// next to the agent binary (or in the current working directory as fallback).
-    fn load_correlation_scorer() -> Option<ml::CorrelationScorer> {
+    /// Model location: `<model_root>/correlation-iforest-{linux,windows,macos}/0.1.0/`,
+    /// where `model_root` is [`model_root`] (`<state_dir>/ml/registry`), then the
+    /// relative `ml/registry` of the current working directory, which is where a
+    /// source checkout (lab, ML calibration) keeps it. A packaged service has no
+    /// useful working directory, so the first location is the one it can rely on.
+    fn load_correlation_scorer(model_root: &Path) -> Option<ml::CorrelationScorer> {
         /// Platform-specific model family names.
         #[cfg(target_os = "linux")]
         const MODEL_FAMILY: &str = "correlation-iforest-linux";
@@ -266,9 +299,7 @@ impl DetectionSink {
         #[cfg(target_os = "macos")]
         const MODEL_FAMILY: &str = "correlation-iforest-macos";
 
-        let model_dir = std::path::Path::new("ml/registry")
-            .join(MODEL_FAMILY)
-            .join("0.1.0");
+        let model_dir = locate_model_dir(&[model_root, Path::new("ml/registry")], MODEL_FAMILY);
 
         match Self::try_load_scorer(&model_dir) {
             Ok(scorer) => {
@@ -948,9 +979,10 @@ mod tests {
             DetectionSink::new(
                 rules::RuleState::new(),
                 &dir.join("alerts.ndjson"),
-                &dir.join("events.jsonl"),
+                Some(&dir.join("events.jsonl")),
                 None,
                 &dir.join("content"),
+                &dir.join("ml-registry"),
             )
             .unwrap(),
         )
@@ -1468,9 +1500,10 @@ rule response_marker {
             DetectionSink::new(
                 rules::RuleState::new(),
                 &dir.join("alerts.ndjson"),
-                &dir.join("events.jsonl"),
+                Some(&dir.join("events.jsonl")),
                 Some(Arc::clone(&spool)),
                 &dir.join("content"),
+                &dir.join("ml-registry"),
             )
             .unwrap(),
         );
@@ -1492,6 +1525,77 @@ rule response_marker {
             events_log.contains("/bin/ls"),
             "raw event log written off-thread"
         );
+    }
+
+    #[test]
+    fn without_an_events_path_no_raw_event_log_is_written_but_the_spool_still_is() {
+        let dir = tmp("no-events-log");
+        let spool = Arc::new(Mutex::new(
+            store::EventSpool::open(&dir.join("spool"), u64::MAX).unwrap(),
+        ));
+        let sink = Arc::new(
+            DetectionSink::new(
+                rules::RuleState::new(),
+                &dir.join("alerts.ndjson"),
+                None,
+                Some(Arc::clone(&spool)),
+                &dir.join("content"),
+                &dir.join("ml-registry"),
+            )
+            .unwrap(),
+        );
+        sink.on_event(exec(7, "ls", "/bin/ls"));
+
+        // The enrich worker is what appends to the spool: once the event is there,
+        // it has also gone past the (absent) raw-log step.
+        let mut spooled: Vec<Event> = Vec::new();
+        for _ in 0..200 {
+            spooled = spool.lock().unwrap().drain_oldest().unwrap();
+            if !spooled.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(spooled.len(), 1, "the event must still reach the spool");
+        assert!(
+            !dir.join("events.jsonl").exists(),
+            "no events path means no raw event log, not a file at a default path"
+        );
+    }
+
+    #[test]
+    fn the_model_is_found_under_the_state_directory_before_the_working_directory() {
+        let state = tmp("model-root");
+        let under_state = super::model_root(&state).join("fam").join("0.1.0");
+        std::fs::create_dir_all(&under_state).unwrap();
+        std::fs::write(under_state.join("model.onnx"), b"x").unwrap();
+        let cwd_root = tmp("model-cwd");
+        let under_cwd = cwd_root.join("fam").join("0.1.0");
+        std::fs::create_dir_all(&under_cwd).unwrap();
+        std::fs::write(under_cwd.join("model.onnx"), b"y").unwrap();
+
+        let found = super::locate_model_dir(&[&super::model_root(&state), &cwd_root], "fam");
+        assert_eq!(found, under_state);
+    }
+
+    #[test]
+    fn the_working_directory_registry_is_the_fallback_for_a_source_checkout() {
+        let state = tmp("model-root-empty");
+        let cwd_root = tmp("model-cwd-only");
+        let under_cwd = cwd_root.join("fam").join("0.1.0");
+        std::fs::create_dir_all(&under_cwd).unwrap();
+        std::fs::write(under_cwd.join("model.onnx"), b"y").unwrap();
+
+        let found = super::locate_model_dir(&[&super::model_root(&state), &cwd_root], "fam");
+        assert_eq!(found, under_cwd);
+    }
+
+    #[test]
+    fn with_no_model_anywhere_the_state_directory_is_the_one_named() {
+        let state = tmp("model-none");
+        let cwd_root = tmp("model-none-cwd");
+        let found = super::locate_model_dir(&[&super::model_root(&state), &cwd_root], "fam");
+        assert_eq!(found, super::model_root(&state).join("fam").join("0.1.0"));
     }
 
     /// A counting sink for wiring tests elsewhere would go through `EventSink`;

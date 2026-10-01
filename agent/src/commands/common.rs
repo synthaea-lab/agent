@@ -41,10 +41,11 @@ pub(crate) struct RunPipeline {
 pub(crate) fn wire_run_pipeline(
     rule_state: rules::RuleState,
     alerts: &std::path::Path,
-    events: &std::path::Path,
+    events: Option<&std::path::Path>,
     server: Option<&str>,
     ipc_endpoint: &str,
     content_dir: &std::path::Path,
+    state_dir: &std::path::Path,
 ) -> anyhow::Result<RunPipeline> {
     // Transport first: the sink needs the spool handle at construction.
     let transport = server
@@ -58,13 +59,14 @@ pub(crate) fn wire_run_pipeline(
         events,
         spool,
         content_dir,
+        &crate::sink::model_root(state_dir),
     )?);
 
     eprintln!("Synthaea agent — detection active (Ctrl-C to stop)");
     eprintln!(
         "alerts: {} · events: {}",
         alerts.display(),
-        events.display()
+        events.map_or_else(|| "off".to_string(), |p| p.display().to_string())
     );
     if let Some(url) = server {
         eprintln!(
