@@ -36,6 +36,8 @@
 //! `schema::FileQuarantineEvent`, the macOS quarantine-xattr sibling — see
 //! [`zone_identifier`].
 
+#[cfg(any(windows, test))]
+mod amsi;
 #[cfg(windows)]
 mod etw_sessions;
 #[cfg(any(windows, test))]

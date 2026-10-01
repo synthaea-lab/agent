@@ -18,13 +18,14 @@ use schema::{
 };
 
 use crate::{
-    etw_sessions,
+    amsi, etw_sessions,
     long_path::{self, LongPathCache},
     normalize,
     pid_cache::PidCache,
     providers::{
-        ALL_PROVIDERS, dns_provider, dotnet_provider, file_provider, network_provider,
-        powershell_provider, process_provider, registry_provider, smb_provider, wmi_provider,
+        ALL_PROVIDERS, amsi_provider, dns_provider, dotnet_provider, file_provider,
+        network_provider, powershell_provider, process_provider, registry_provider, smb_provider,
+        wmi_provider,
     },
     winapi,
     zone_identifier::{self, MarkQueue, QuarantineDedup},
@@ -191,6 +192,8 @@ pub(crate) struct SharedState {
     pub(crate) marks: MarkQueue,
     /// F-2: events observed — the silence watchdog reads this.
     pub(crate) events_seen: AtomicU64,
+    /// AMSI volume gate (#282): dedup + per-process budget.
+    pub(crate) amsi: Mutex<amsi::AmsiGate>,
     /// The liveness canary file: the run loop touches it every heartbeat, which
     /// MUST produce a Kernel-File event (our pid is tracked) — so sensor liveness
     /// is deterministic instead of traffic-dependent (a quiet host produces no
@@ -398,6 +401,7 @@ impl Sensor for WindowsSensor {
             dedup: Mutex::new(normalize::ConnectDedup::new(60_000_000_000)),
             marks,
             events_seen: AtomicU64::new(0),
+            amsi: Mutex::new(amsi::AmsiGate::default()),
             canary_path: canary_file
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -419,7 +423,8 @@ impl Sensor for WindowsSensor {
             .enable(powershell_provider(sink.clone(), state.clone()))
             .enable(wmi_provider(sink.clone(), state.clone()))
             .enable(dotnet_provider(sink.clone(), state.clone()))
-            .enable(smb_provider(sink, state.clone()));
+            .enable(smb_provider(sink.clone(), state.clone()))
+            .enable(amsi_provider(sink, state.clone()));
         let trace = normalize::start_or_stop_session(
             &session,
             || builder.start_and_process(),
