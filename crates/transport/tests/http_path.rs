@@ -29,7 +29,10 @@ use std::{
     },
 };
 
-use schema::{Event, ExecEvent};
+use schema::{
+    Event, ExecEvent,
+    detection::{Detection, DetectionSource, Severity},
+};
 use transport::{EventDrain, EventUploader, TransportClient, TransportConfig};
 
 /// Reads one request until the header terminator, then its Content-Length
@@ -191,6 +194,41 @@ fn events(n: usize) -> Vec<Event> {
             })
         })
         .collect()
+}
+
+fn detection() -> Detection {
+    Detection {
+        timestamp_ns: 1_700_000_000_000_000_000,
+        severity: Severity::High,
+        title: "Unusual process chain".into(),
+        source: DetectionSource::Correlator {
+            case_id: "42:python".into(),
+        },
+        score: Some(0.91),
+        attributions: Vec::new(),
+        techniques: vec!["T1059".into()],
+        events: events(1),
+    }
+}
+
+#[test]
+fn structured_detection_upload_uses_the_server_route_and_acceptance_contract() {
+    let url = canned_server(200, r#"{"status":"accepted"}"#, 1);
+    let config = TransportConfig::new(&url);
+    assert_eq!(
+        config.detection_url(),
+        format!("{url}/api/ingest/detection")
+    );
+    let client = TransportClient::new(config).unwrap();
+    client.upload_detection(&detection()).unwrap();
+}
+
+#[test]
+fn structured_detection_upload_rejects_an_unexpected_server_response() {
+    let url = canned_server(200, r#"{"status":"ignored"}"#, 1);
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+    let err = client.upload_detection(&detection()).unwrap_err();
+    assert!(matches!(err, transport::TransportError::InvalidResponse(_)));
 }
 
 #[test]
