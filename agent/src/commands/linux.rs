@@ -313,7 +313,10 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // (#71) rather than a no-op; spool stays a no-op until that component exists.
     let health_config = crate::health::HealthCollectorConfig::default();
     let spool_stats: Arc<dyn crate::health::SpoolStatsSource> = match &pipeline.transport {
-        Some(t) => Arc::new(crate::upload::SpoolHealth(Arc::clone(&t.spool))),
+        Some(t) => Arc::new(crate::upload::SpoolHealth {
+            events: Arc::clone(&t.spool),
+            detections: Arc::clone(&t.detection_spool),
+        }),
         None => Arc::new(crate::health::NoopSpoolStats),
     };
     let heartbeat_client = pipeline.transport.as_ref().map(|t| Arc::clone(&t.client));
@@ -374,8 +377,15 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // events, so only its chain needs the guard — the netlink/journal sinks above
     // never see one.
     let protected = crate::protected::protected_paths(alerts, events);
-    let guarded = ProtectedResourceGuard::new(sink.clone(), protected, sink);
+    let guarded = ProtectedResourceGuard::new(sink.clone(), protected, sink.clone());
     let result = sensor.run(Box::new(PulsingSink::new(guarded, primary_heartbeat)));
+
+    // Persist findings already accepted by the in-memory queue before the
+    // uploader makes its final drain. A bounded wait preserves shutdown's
+    // overall deadline if enrichment is stalled on a slow file.
+    if !sink.enrich_queue().flush(std::time::Duration::from_secs(1)) {
+        tracing::warn!("pending detection/event queue did not flush before shutdown");
+    }
 
     // `sensor.run` returned (Ctrl-C or a sensor failure): wind the workers down —
     // the upload loop gets one last spool drain — within one bounded budget. What

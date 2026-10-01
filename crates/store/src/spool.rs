@@ -43,6 +43,7 @@ pub struct SpoolStats {
 pub struct EventSpool {
     dir: PathBuf,
     max_bytes: u64,
+    segment_records: usize,
     /// Sequence number of the segment currently being appended.
     head_seq: u64,
     head_records: usize,
@@ -65,6 +66,20 @@ impl EventSpool {
     /// Returns the underlying I/O error when the directory cannot be created or
     /// its existing segments cannot be listed.
     pub fn open(dir: &Path, max_bytes: u64) -> std::io::Result<Self> {
+        Self::open_with_segment_records(dir, max_bytes, SEGMENT_RECORDS)
+    }
+
+    /// Opens a spool with a smaller record limit per segment. A detection
+    /// uploader uses one record per segment so a permanent rejection can skip
+    /// only that finding, not other valid findings beside it.
+    ///
+    /// # Errors
+    /// Returns an I/O error when the directory cannot be created or listed.
+    pub fn open_with_segment_records(
+        dir: &Path,
+        max_bytes: u64,
+        segment_records: usize,
+    ) -> std::io::Result<Self> {
         fs::create_dir_all(dir)?;
         // Recover in-flight segments from a previous crash: rename .inflight back to .jsonl
         for entry in fs::read_dir(dir)?.flatten() {
@@ -82,6 +97,7 @@ impl EventSpool {
         Ok(Self {
             dir: dir.to_path_buf(),
             max_bytes,
+            segment_records: segment_records.max(1),
             head_seq,
             head_records: 0,
             head_bytes: 0,
@@ -132,7 +148,7 @@ impl EventSpool {
         self.head_bytes += line_bytes;
 
         // Rotate on record count threshold.
-        if self.head_records >= SEGMENT_RECORDS {
+        if self.head_records >= self.segment_records {
             self.head_seq += 1;
             self.head_records = 0;
             self.head_bytes = 0;
@@ -374,6 +390,20 @@ mod tests {
         assert!(spool.ack().unwrap(), "should ack the drained segment");
         let empty: Vec<u32> = spool.drain_oldest().unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn one_record_segments_isolate_a_poison_detection() {
+        let dir = tmp("one-record");
+        let mut spool = EventSpool::open_with_segment_records(&dir, u64::MAX, 1).unwrap();
+        spool.push(&"bad").unwrap();
+        spool.push(&"good").unwrap();
+        let first: Vec<String> = spool.drain_oldest().unwrap();
+        assert_eq!(first, vec!["bad"]);
+        assert!(spool.skip().unwrap());
+        let second: Vec<String> = spool.drain_oldest().unwrap();
+        assert_eq!(second, vec!["good"]);
+        assert_eq!(spool.stats().dropped_records, 1);
     }
 
     #[test]

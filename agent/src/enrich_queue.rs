@@ -37,7 +37,7 @@ use std::{
 };
 
 use enrich::Enricher;
-use schema::Event;
+use schema::{Event, detection::Detection};
 
 /// Queue depth: a burst of events beyond this sheds enrichment/logging (counted).
 /// Sized so a normal exec rate has ample headroom and only a pathological burst
@@ -51,6 +51,7 @@ enum QueueItem {
     // Boxed: `Event`'s largest variant otherwise sets every channel slot's size,
     // multiplied by `QUEUE_CAP` — `Flush` doesn't need anywhere near that much room.
     Event(Box<Event>),
+    Detection(Box<Detection>),
     // Only `kill_loudness` (Linux-gated) flushes today — the shutdown path on
     // the other platforms doesn't exist yet, not a reason to lose the variant.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -70,9 +71,17 @@ impl EnrichQueue {
     /// finished event to `on_enriched` — which the sink wires to the raw event log.
     /// The [`Enricher`] is owned exclusively by the worker, so its cache needs no
     /// lock and a long hash never blocks another thread.
-    pub(crate) fn start(
+    #[cfg(test)]
+    pub(crate) fn start(enricher: Enricher, on_enriched: impl Fn(Event) + Send + 'static) -> Self {
+        Self::start_with_detections(enricher, on_enriched, |_| {})
+    }
+
+    /// Starts the event worker with a second callback for structured detections.
+    /// Both callbacks run off the sensor capture thread and share its FIFO queue.
+    pub(crate) fn start_with_detections(
         mut enricher: Enricher,
         on_enriched: impl Fn(Event) + Send + 'static,
+        on_detection: impl Fn(Detection) + Send + 'static,
     ) -> Self {
         let (tx, rx) = mpsc::sync_channel::<QueueItem>(QUEUE_CAP);
         let dropped = Arc::new(AtomicU64::new(0));
@@ -85,6 +94,7 @@ impl EnrichQueue {
                             enrich_event(&mut enricher, &mut event);
                             on_enriched(*event);
                         }
+                        QueueItem::Detection(detection) => on_detection(*detection),
                         // Nothing to do but signal back — arriving here at all means
                         // every `Event` sent before it has already been enriched and
                         // handed to `on_enriched`, since this is a single-consumer
@@ -106,6 +116,20 @@ impl EnrichQueue {
     pub(crate) fn enqueue(&self, event: Event) {
         if self.tx.try_send(QueueItem::Event(Box::new(event))).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Queues a finding for durable storage without file I/O on the capture
+    /// thread. Returns the finding if the queue is full or disconnected so the
+    /// caller can use a synchronous fallback instead of silently losing it.
+    pub(crate) fn enqueue_detection(&self, detection: Detection) -> Result<(), Detection> {
+        match self.tx.try_send(QueueItem::Detection(Box::new(detection))) {
+            Ok(()) => Ok(()),
+            Err(
+                mpsc::TrySendError::Full(QueueItem::Detection(detection))
+                | mpsc::TrySendError::Disconnected(QueueItem::Detection(detection)),
+            ) => Err(*detection),
+            Err(_) => unreachable!("only a detection was sent"),
         }
     }
 

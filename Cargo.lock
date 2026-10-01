@@ -28,6 +28,7 @@ dependencies = [
  "correlator",
  "ctrlc",
  "enrich",
+ "getrandom 0.2.17",
  "ipc",
  "libc",
  "ml",

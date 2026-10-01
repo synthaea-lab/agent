@@ -44,12 +44,14 @@ pub(crate) fn wire_run_pipeline(
         .map(|url| crate::upload::start(url, alerts))
         .transpose()?;
     let spool = transport.as_ref().map(|t| Arc::clone(&t.spool));
+    let detection_spool = transport.as_ref().map(|t| Arc::clone(&t.detection_spool));
 
     let sink = Arc::new(DetectionSink::new(
         rule_state,
         alerts,
         events,
         spool,
+        detection_spool,
         content_dir,
     )?);
 
@@ -61,8 +63,9 @@ pub(crate) fn wire_run_pipeline(
     );
     if let Some(url) = server {
         eprintln!(
-            "server: {url} · spool: {} (store-and-forward, at-least-once)",
-            alerts.with_file_name("spool").display()
+            "server: {url} · event spool: {} · detection spool: {} (store-and-forward, at-least-once)",
+            alerts.with_file_name("spool").display(),
+            alerts.with_file_name("detection-spool").display(),
         );
     }
 

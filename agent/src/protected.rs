@@ -150,6 +150,7 @@ mod tests {
                 &alerts,
                 &events,
                 None,
+                None,
                 &alerts_dir.join("content"),
             )
             .unwrap(),
@@ -192,6 +193,7 @@ mod tests {
                 &alerts,
                 &events,
                 None,
+                None,
                 &alerts_dir.join("content"),
             )
             .unwrap(),
@@ -232,6 +234,7 @@ mod tests {
                 rules::RuleState::new(),
                 &alerts,
                 &events,
+                None,
                 None,
                 &alerts_dir.join("content"),
             )

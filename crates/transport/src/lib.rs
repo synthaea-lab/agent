@@ -45,11 +45,13 @@
 
 mod client;
 mod config;
+mod detection_upload;
 mod error;
 mod upload;
 
 pub use client::TransportClient;
 pub use config::TransportConfig;
+pub use detection_upload::{DetectionDrain, DetectionUploader, QueuedDetection};
 pub use error::{Result, TransportError};
 pub use upload::{EventDrain, EventUploader, UploadLoop, UploadStep};
 

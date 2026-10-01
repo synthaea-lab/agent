@@ -67,6 +67,10 @@ pub(crate) struct DetectionSink {
     /// drain thread (issue #126). The capture thread runs detection in memory and
     /// hands the event here with a non-blocking send.
     enrich_queue: EnrichQueue,
+    /// Structured findings are persisted on the enrichment worker. A full
+    /// queue falls back to a direct append so overload does not silently drop
+    /// a detection.
+    detection_spool: Option<Arc<Mutex<store::EventSpool>>>,
     /// Liveness counter for the watchdog's heartbeat monitor (#102): incremented
     /// once `on_event` has fully processed an event, so `agent::heartbeat`'s
     /// writer thread can sample it and expose real forward progress — not just
@@ -156,6 +160,7 @@ impl DetectionSink {
         alerts_path: &std::path::Path,
         events_path: &std::path::Path,
         spool: Option<Arc<Mutex<store::EventSpool>>>,
+        detection_spool: Option<Arc<Mutex<store::EventSpool>>>,
         content_dir: &Path,
     ) -> std::io::Result<Self> {
         let alert_log = Arc::new(AlertLog::open(alerts_path, RECENT_ALERTS_CAPACITY)?);
@@ -165,16 +170,25 @@ impl DetectionSink {
         // append rides the same worker for the same #126 reason: it is file
         // I/O that must never stall the capture thread.
         let events_log = Arc::new(JsonlWriter::open(events_path)?);
-        let enrich_queue = EnrichQueue::start(enrich::Enricher::new(), move |event| {
-            events_log.write(&event);
-            if let Some(spool) = &spool
-                && let Err(e) = spool.lock().unwrap().push(&event)
-            {
-                // Spool full is handled inside push (shed-oldest, counted);
-                // reaching here is a real I/O failure — degrade to local-only.
-                tracing::warn!(error = %e, "spool append failed — event stays local-only");
-            }
-        });
+        let detection_spool_for_worker = detection_spool.clone();
+        let enrich_queue = EnrichQueue::start_with_detections(
+            enrich::Enricher::new(),
+            move |event| {
+                events_log.write(&event);
+                if let Some(spool) = &spool
+                    && let Err(e) = spool.lock().unwrap().push(&event)
+                {
+                    tracing::warn!(error = %e, "spool append failed — event stays local-only");
+                }
+            },
+            move |detection| {
+                if let Some(spool) = &detection_spool_for_worker
+                    && let Err(e) = crate::upload::persist_detection(spool, detection)
+                {
+                    tracing::warn!(error = %e, "detection spool append failed");
+                }
+            },
+        );
         let response: Arc<Mutex<Option<ResponseHooks>>> = Arc::new(Mutex::new(None));
         Ok(Self {
             rule_state: Mutex::new(rule_state),
@@ -186,6 +200,7 @@ impl DetectionSink {
             ),
             alert_log,
             enrich_queue,
+            detection_spool,
             progress: Arc::new(AtomicU64::new(0)),
             response,
             verdict: Mutex::new(verdict::VerdictEngine::new(VERDICT_DEDUP_WINDOW_NS)),
@@ -369,12 +384,21 @@ impl DetectionSink {
             techniques: techniques_from(technique),
             events: vec![event.clone()],
         };
+        let spooled = self.detection_spool.as_ref().map(|_| detection.clone());
         let result =
             self.verdict
                 .lock()
                 .unwrap()
                 .record(entity.clone(), technique, detection, now_ns);
         self.emit(technique, message);
+        if let (Some(spool), Some(detection)) = (&self.detection_spool, spooled)
+            && let Err(detection) = self.enrich_queue.enqueue_detection(detection)
+        {
+            tracing::warn!("detection queue full; persisting on capture thread");
+            if let Err(e) = crate::upload::persist_detection(spool, detection) {
+                tracing::error!(error = %e, "detection spool append failed on fallback");
+            }
+        }
         result
     }
 
@@ -950,6 +974,7 @@ mod tests {
                 &dir.join("alerts.ndjson"),
                 &dir.join("events.jsonl"),
                 None,
+                None,
                 &dir.join("content"),
             )
             .unwrap(),
@@ -1470,6 +1495,7 @@ rule response_marker {
                 &dir.join("alerts.ndjson"),
                 &dir.join("events.jsonl"),
                 Some(Arc::clone(&spool)),
+                None,
                 &dir.join("content"),
             )
             .unwrap(),
@@ -1492,6 +1518,41 @@ rule response_marker {
             events_log.contains("/bin/ls"),
             "raw event log written off-thread"
         );
+    }
+
+    #[test]
+    fn emitted_finding_reaches_the_durable_detection_spool() {
+        let dir = tmp("detection-spool");
+        let spool = Arc::new(Mutex::new(
+            store::EventSpool::open(&dir.join("detection-spool"), u64::MAX).unwrap(),
+        ));
+        let sink = DetectionSink::new(
+            rules::RuleState::new(),
+            &dir.join("alerts.ndjson"),
+            &dir.join("events.jsonl"),
+            None,
+            Some(Arc::clone(&spool)),
+            &dir.join("content"),
+        )
+        .unwrap();
+        let event = exec(7, "test", "/bin/test");
+        sink.record_and_emit(
+            &verdict::EntityKey::new(1, "test".into()),
+            "T1059",
+            "test finding",
+            schema::detection::DetectionSource::Rule {
+                rule_id: "T1059".into(),
+            },
+            &event,
+            event.meta().timestamp_ns,
+        );
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+        let records: Vec<transport::QueuedDetection> =
+            spool.lock().unwrap().drain_oldest().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].detection.title, "test finding");
+        assert_eq!(records[0].detection.events, vec![event]);
+        assert_eq!(records[0].key.len(), 36);
     }
 
     /// A counting sink for wiring tests elsewhere would go through `EventSink`;
