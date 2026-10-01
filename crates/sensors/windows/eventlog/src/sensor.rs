@@ -264,6 +264,8 @@ fn persistence_file_open(pid: u32, comm: String, path: String, flags: u32) -> Ev
             timestamp_ns: now_ns(),
             comm,
             container: None, // Windows: no container support
+            process_generation: None,
+            parent_process_generation: None,
         },
         path,
         flags,
@@ -507,6 +509,8 @@ fn to_auth_event(logon: &LogonEvent) -> Option<Event> {
             timestamp_ns: now_ns(),
             comm: LSASS_COMM.to_string(),
             container: None, // Windows: no container support
+            process_generation: None,
+            parent_process_generation: None,
         },
         outcome,
         kind,
@@ -630,6 +634,8 @@ fn normalize_applocker_block(block: &str) -> ParsedBlock {
             timestamp_ns: now_ns(),
             comm: String::new(),
             container: None, // Windows: no container support
+            process_generation: None,
+            parent_process_generation: None,
         },
         mechanism: POLICY_MECHANISM_APPLOCKER.into(),
         subject_context: None,

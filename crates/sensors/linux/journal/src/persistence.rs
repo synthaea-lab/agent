@@ -71,6 +71,8 @@ impl UnitPersistenceTracker {
                 timestamp_ns: record.realtime_us.saturating_mul(1_000),
                 comm: unit.clone(),
                 container: None,
+                process_generation: None,
+                parent_process_generation: None,
             },
             path: unit,
             flags: FLAG_PERSISTENCE_SYSTEMD_ARTIFACT,

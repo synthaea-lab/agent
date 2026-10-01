@@ -36,6 +36,8 @@ pub fn exec_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
             },
             comm: comm_from_path(image_path),
             container: None, // Phase 1: no container attribution
+            process_generation: None,
+            parent_process_generation: None,
         },
         image_path: image_path.clone(),
         cmdline: argv.join(" "),
@@ -77,6 +79,8 @@ pub fn connect_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
             },
             comm: String::from("unknown"), // audit doesn't provide comm
             container: None,
+            process_generation: None,
+            parent_process_generation: None,
         },
         daddr: remote_addr.ip(),
         dport: remote_addr.port(),
@@ -115,6 +119,8 @@ pub fn policy_denial_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
             user: User::Unknown, // HONEST: classify_avc doesn't extract uid/gid
             comm: comm.clone().unwrap_or_else(|| "unknown".into()),
             container: None,
+            process_generation: None,
+            parent_process_generation: None,
         },
         mechanism: POLICY_MECHANISM_SELINUX.into(),
         subject_context: scontext.clone(),

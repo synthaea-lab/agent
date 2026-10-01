@@ -20,6 +20,8 @@ fn test_meta(comm: &str) -> EventMeta {
         timestamp_ns: 1_756_900_100_000_000_000,
         comm: comm.into(),
         container: None,
+        process_generation: None,
+        parent_process_generation: None,
     }
 }
 
@@ -342,6 +344,8 @@ fn file_events_high_frequency() {
                 timestamp_ns: 1_756_900_100_000_000_000 + (i * 1_000_000), // 1ms apart
                 comm: "encryptor".into(),
                 container: None,
+                process_generation: None,
+                parent_process_generation: None,
             },
             fd: 4,
             bytes_requested: 4096,

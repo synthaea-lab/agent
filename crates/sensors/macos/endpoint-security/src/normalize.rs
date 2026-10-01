@@ -81,6 +81,8 @@ fn event_meta(meta: &RawMeta) -> EventMeta {
         timestamp_ns: meta.wall_time_ns,
         comm: basename(&meta.process_path),
         container: None,
+        process_generation: None,
+        parent_process_generation: None,
     }
 }
 

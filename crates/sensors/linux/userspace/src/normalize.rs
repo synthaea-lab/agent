@@ -93,7 +93,7 @@ use sensor_linux_wire as wire;
 /// returned); `memfd_create` passes it through unchanged.
 ///
 /// v19 (#457) added `PrctlEvent`; `prctl` maps it one-to-one.
-const _: () = assert!(wire::WIRE_VERSION == 19);
+const _: () = assert!(wire::WIRE_VERSION == 20);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
@@ -122,6 +122,10 @@ fn meta(
         timestamp_ns: meta.timestamp_ns.saturating_add(boot_epoch_offset_ns),
         comm: wire::comm_str(&meta.comm),
         container,
+        // `0` is the wire's "no stamp" (a `PROC_LINEAGE` miss), which the schema
+        // spells `None` so a consumer never mistakes it for a generation (#519).
+        process_generation: (meta.process_generation != 0).then_some(meta.process_generation),
+        parent_process_generation: (meta.parent_generation != 0).then_some(meta.parent_generation),
     }
 }
 
@@ -666,6 +670,8 @@ mod tests {
             timestamp_ns: 1_000,
             comm: c,
             cgroup_id: 0,
+            process_generation: 0,
+            parent_generation: 0,
         }
     }
 

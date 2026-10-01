@@ -527,7 +527,7 @@ fn resolve_comm_falls_back_to_live_proc_when_not_cached() {
         .unwrap()
         .trim_end()
         .to_string();
-    assert_eq!(state.resolve_comm(own_pid), Some(expected_comm));
+    assert_eq!(state.resolve_comm(own_pid, None), Some(expected_comm));
 }
 
 #[test]
@@ -540,7 +540,10 @@ fn seed_from_proc_finds_own_pid_comm() {
         .unwrap()
         .trim_end()
         .to_string();
-    assert_eq!(state.pid_comm.peek(&own_pid), Some(&expected_comm));
+    assert_eq!(
+        state.pid_comm.peek(&own_pid).map(|f| f.value.as_str()),
+        Some(expected_comm.as_str())
+    );
 }
 
 #[test]
@@ -1342,6 +1345,95 @@ fn a_trusted_binary_that_renames_its_comm_to_sed_still_alerts() {
         assert_eq!(alerts.len(), 1, "{exec_image:?} / {exe_path:?}");
         assert_eq!(alerts[0].technique, "T1486");
     }
+}
+
+// ── pid reuse (#519): the pid-keyed caches must not outlive their process ──────
+
+/// A real `/usr/bin/sed` exec stamped `exec_generation`, then the `sed -i.bak`-shaped
+/// burst from the same pid stamped `burst_generation`, with no rename-time path (the
+/// process has already exited by the time the sensor would read it).
+fn in_place_edit_burst_with_generations(
+    exec_generation: Option<u64>,
+    burst_generation: Option<u64>,
+) -> Vec<crate::Alert> {
+    let mut state = RuleState::new();
+    let mut exec = memfd_exec_event(9200, "sed", "/usr/bin/sed", 0);
+    exec.meta.process_generation = exec_generation;
+    state.on_exec(&exec);
+    let mut alerts = Vec::new();
+    for i in 0..RANSOMWARE_RENAME_THRESHOLD {
+        let mut event = file_rename_event_full(
+            9200,
+            "sed",
+            &format!("/etc/nginx/sites-enabled/s{i}.conf"),
+            &format!("/etc/nginx/sites-enabled/s{i}.conf.bak"),
+            u64::from(i) * 100_000_000,
+        );
+        event.executable_path = None;
+        event.meta.process_generation = burst_generation;
+        alerts.extend(state.on_file_rename(&event));
+    }
+    alerts
+}
+
+#[test]
+fn a_recycled_pid_does_not_inherit_a_real_seds_exclusion() {
+    // The reproduction from #519: a real `sed` exits, the kernel hands its pid to a
+    // forked child that only sets `comm=sed` and renames 20+ files. Same pid, but a
+    // different incarnation: the cached exec-time `/usr/bin/sed` is not its own.
+    let alerts = in_place_edit_burst_with_generations(Some(1_000), Some(2_000));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+}
+
+#[test]
+fn the_same_incarnation_keeps_the_in_place_edit_exclusion() {
+    // The stamp must not break the legitimate case it sits next to.
+    assert!(in_place_edit_burst_with_generations(Some(1_000), Some(1_000)).is_empty());
+}
+
+#[test]
+fn a_missing_stamp_on_either_side_reads_as_the_same_process() {
+    // Entries seeded at startup, and events from a platform with no stamp, behave as
+    // they did before the stamp existed.
+    assert!(in_place_edit_burst_with_generations(None, Some(2_000)).is_empty());
+    assert!(in_place_edit_burst_with_generations(Some(1_000), None).is_empty());
+    assert!(in_place_edit_burst_with_generations(None, None).is_empty());
+}
+
+/// An exec of `comm` at `pid` with its stamp, then a `sh` child of `pid` whose event
+/// names `parent_generation` as its parent's incarnation.
+fn shell_under_a_service(
+    service_comm: &str,
+    parent_pid: u32,
+    parent_exec_generation: Option<u64>,
+    parent_generation_seen_by_child: Option<u64>,
+) -> Vec<crate::Alert> {
+    let mut state = RuleState::new();
+    let mut parent = exec_event_full(parent_pid, 1, service_comm, "", 0);
+    parent.meta.process_generation = parent_exec_generation;
+    state.on_exec(&parent);
+    let mut shell = exec_event_full(parent_pid + 1, parent_pid, "sh", "sh -c id", 1);
+    shell.meta.parent_process_generation = parent_generation_seen_by_child;
+    state.on_exec(&shell)
+}
+
+#[test]
+fn a_shell_under_the_same_service_incarnation_still_matches() {
+    // Pid far above any real `pid_max`, so the `/proc` fallback finds nothing and the
+    // verdict comes from the cache alone.
+    let alerts = shell_under_a_service("nginx", 4_000_000_000, Some(7), Some(7));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1059");
+}
+
+#[test]
+fn a_recycled_parent_pid_is_not_credited_with_the_services_name() {
+    // `nginx` exited, its pid was recycled by something else that then forked a
+    // shell: the cache must not say the parent is nginx. (`/proc` has no such pid,
+    // so with the stale entry rejected the parent is unknown, and nothing matches.)
+    let alerts = shell_under_a_service("nginx", 4_000_000_000, Some(7), Some(8));
+    assert!(alerts.is_empty(), "{alerts:?}");
 }
 
 /// The `sed -i.bak`-shaped burst for an arbitrary tool: `comm` and the exec-time image.

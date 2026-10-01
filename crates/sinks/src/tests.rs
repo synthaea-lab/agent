@@ -48,6 +48,8 @@ fn events_round_trip_through_the_file() {
                 timestamp_ns: 43,
                 comm: "cron".into(),
                 container: None,
+                process_generation: None,
+                parent_process_generation: None,
             },
             path: "/etc/cron.d/job".into(),
             flags: 0o101,

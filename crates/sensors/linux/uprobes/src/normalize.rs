@@ -61,7 +61,7 @@ use crate::redact;
 /// v18 (#510) added `MemfdCreateEvent::fd` — not imported here, same reasoning.
 ///
 /// v19 (#457) added `PrctlEvent` — not imported here, same reasoning.
-const _: () = assert!(wire::WIRE_VERSION == 19);
+const _: () = assert!(wire::WIRE_VERSION == 20);
 
 /// `container` is resolved by the caller (`crate::container::container_context`,
 /// issue #312) from `EventMeta::cgroup_id` against cgroupfs, with image/name filled
@@ -82,6 +82,9 @@ fn meta(
         timestamp_ns: meta.timestamp_ns.saturating_add(boot_epoch_offset_ns),
         comm: wire::comm_str(&meta.comm),
         container,
+        // `0` is the wire's "no stamp"; the schema spells it `None` (#519).
+        process_generation: (meta.process_generation != 0).then_some(meta.process_generation),
+        parent_process_generation: (meta.parent_generation != 0).then_some(meta.parent_generation),
     }
 }
 
@@ -224,6 +227,8 @@ mod tests {
             cgroup_id: 0,
             timestamp_ns: 1_000,
             comm: c,
+            process_generation: 0,
+            parent_generation: 0,
         }
     }
 

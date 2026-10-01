@@ -40,6 +40,8 @@ fn meta(ts_ns: u64, pid: u32, process_path: Option<&str>) -> EventMeta {
         timestamp_ns: ts_ns,
         comm: comm_from_path(process_path),
         container: None,
+        process_generation: None,
+        parent_process_generation: None,
     }
 }
 

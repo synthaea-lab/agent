@@ -1,6 +1,6 @@
 //! HTTP client with mTLS support.
 
-use schema::Event;
+use schema::{Event, detection::Detection};
 use serde::Serialize;
 
 use crate::{
@@ -41,6 +41,24 @@ impl TransportClient {
         };
 
         self.post_json(&url, &payload)
+    }
+
+    /// Uploads one structured detection to the control plane. The caller owns
+    /// durable queuing and retries; this method only performs the HTTP exchange.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the detection or cannot be reached.
+    pub fn upload_detection(&self, detection: &Detection) -> Result<()> {
+        let response: DetectionUploadResponse =
+            self.post_json(&self.config.detection_url(), detection)?;
+        if response.status != "accepted" {
+            return Err(TransportError::InvalidResponse(format!(
+                "unexpected detection ingest status: {}",
+                response.status
+            )));
+        }
+        Ok(())
     }
 
     /// Sends a heartbeat to the server with arbitrary payload.
@@ -182,6 +200,11 @@ pub struct UploadResponse {
     pub accepted: usize,
     /// Server-assigned batch ID for tracking.
     pub batch_id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct DetectionUploadResponse {
+    status: String,
 }
 
 /// Builds a ureq agent with the configured TLS settings.

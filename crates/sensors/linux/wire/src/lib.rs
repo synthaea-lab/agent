@@ -194,7 +194,20 @@ pub use path_filter::is_filtered_path;
 ///   ring buffer. Carries the raw `option` and `arg2` (the `SECBIT_*` mask, or
 ///   the capability number). New ring buffer `PRCTL_EVENTS`; the probe joins the
 ///   attach list.
-pub const WIRE_VERSION: u32 = 19;
+/// - v20: `EventMeta` gains `process_generation: u64` and `LineageEntry` gains the
+///   `generation` it is copied from (issue #519). `PROC_LINEAGE` is written at
+///   `sched_process_fork`, so a recycled pid necessarily goes through a new fork:
+///   stamping the entry there (`bpf_ktime_get_ns()`) gives each incarnation of a
+///   pid its own value, and every probe copies it into `meta` next to `ppid`
+///   (`fill_lineage`). A process that predates the agent is primed from
+///   `/proc/<pid>/stat` `starttime` with the top bit set, which keeps the two
+///   sources apart (`bpf_ktime_get_ns()` never sets bit 63). `0` means no stamp
+///   (a `PROC_LINEAGE` miss), never a real generation. `LineageEntry` gets an
+///   explicit `reserved: u32` so the new `u64` leaves no implicit padding for the
+///   `aya::Pod` impl to hide. Both structs also carry `parent_generation`, the
+///   parent's stamp as the fork recorded it, so a lookup keyed on `ppid` can tell a
+///   recycled parent too.
+pub const WIRE_VERSION: u32 = 20;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
@@ -247,6 +260,15 @@ pub struct EventMeta {
     /// against `/proc` at drain time (issue #204) — the userspace loader maps this
     /// to a container id by inode against cgroupfs. `0` if the helper failed.
     pub cgroup_id: u64,
+    /// Which incarnation of `pid` this is, copied from `PROC_LINEAGE` by
+    /// `fill_lineage` (issue #519). `0` when the pid had no lineage entry. Equality
+    /// between two events with the same `pid` is the only meaning it has: see
+    /// `schema::EventMeta::process_generation`.
+    pub process_generation: u64,
+    /// The same stamp for `ppid`, as `PROC_LINEAGE` recorded it at the fork (issue
+    /// #519): a lookup keyed on the parent's pid (`resolve_comm(ppid)`) needs the
+    /// parent's incarnation, not the child's. `0` when unknown.
+    pub parent_generation: u64,
 }
 
 /// Process execution (`sched:sched_process_exec`, success only).
@@ -275,7 +297,22 @@ pub struct ExecEvent {
 pub struct LineageEntry {
     pub ppid: u32,
     pub comm: [u8; TASK_COMM_LEN],
+    /// Explicit padding so `generation` is 8-aligned without implicit padding bytes.
+    /// Always zero.
+    pub reserved: u32,
+    /// Stamp of this incarnation of the pid (issue #519): `bpf_ktime_get_ns()` at the
+    /// fork, or `PRIMED_GENERATION_BIT | starttime` for a process primed from `/proc`.
+    pub generation: u64,
+    /// `generation` of `ppid` at the time of the fork (the parent's own
+    /// `PROC_LINEAGE` entry), `0` when the parent had none. Lets an event name the
+    /// parent's incarnation, which the parent's pid alone cannot (issue #519).
+    pub parent_generation: u64,
 }
+
+/// Top bit of a [`LineageEntry::generation`] primed from `/proc/<pid>/stat`. Keeps a
+/// primed stamp (clock ticks since boot) from ever equalling a live one
+/// (`bpf_ktime_get_ns()`, nanoseconds since boot, which never reaches bit 63).
+pub const PRIMED_GENERATION_BIT: u64 = 1 << 63;
 
 /// File open (`syscalls:sys_enter_openat`). `path` is the raw path passed by the
 /// caller, not resolved against `dfd` (known limitation, documented in the probe).

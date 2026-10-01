@@ -43,6 +43,8 @@ fn reporter_meta(record: &LogRecord) -> Option<EventMeta> {
         timestamp_ns: record.timestamp_ns,
         comm: image_basename(&record.process_image_path).to_string(),
         container: None,
+        process_generation: None,
+        parent_process_generation: None,
     })
 }
 

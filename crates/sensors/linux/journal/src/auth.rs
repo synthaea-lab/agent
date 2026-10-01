@@ -111,6 +111,8 @@ fn reporter_meta(record: &JournalRecord) -> Option<EventMeta> {
             .clone()
             .unwrap_or_else(|| "journald".to_string()),
         container: None, // Auth subsystem events aren't attributed to a container.
+        process_generation: None,
+        parent_process_generation: None,
     })
 }
 

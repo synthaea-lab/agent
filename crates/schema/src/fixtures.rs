@@ -52,6 +52,8 @@ pub fn meta() -> EventMeta {
         timestamp_ns: 0,
         comm: String::new(),
         container: None,
+        process_generation: None,
+        parent_process_generation: None,
     }
 }
 

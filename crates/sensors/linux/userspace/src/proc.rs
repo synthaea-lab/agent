@@ -131,11 +131,48 @@ pub(crate) fn parse_stat_ppid_comm(stat: &str) -> Option<(u32, &str)> {
     Some((ppid, comm))
 }
 
+/// `starttime` (field 22 of `/proc/<pid>/stat`: clock ticks since boot at which the
+/// process started), the identity stamp for a process that predates the agent
+/// (issue #519). Fields after the closing `)` are counted from the state (field 3):
+/// `starttime` is the 20th of them.
+pub(crate) fn parse_stat_starttime(stat: &str) -> Option<u64> {
+    let close = stat.rfind(')')?;
+    stat.get(close + 1..)?
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         is_proc_exit_race, parse_proc_cmdline, parse_proc_environ_security, parse_stat_ppid_comm,
+        parse_stat_starttime,
     };
+
+    #[test]
+    fn stat_starttime_is_the_twentieth_field_after_the_comm() {
+        // Real shape: state ppid pgrp session tty tpgid flags minflt cminflt majflt
+        // cmajflt utime stime cutime cstime priority nice threads itrealvalue starttime
+        let stat =
+            "123 (bash) S 1 123 123 34816 123 4194304 100 0 0 0 1 2 0 0 20 0 1 0 98765 1000 200";
+        assert_eq!(parse_stat_starttime(stat), Some(98765));
+    }
+
+    #[test]
+    fn stat_starttime_survives_a_comm_with_spaces_and_parens() {
+        let stat = "7 (a ) b) S 1 7 7 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 42 0 0";
+        assert_eq!(parse_stat_starttime(stat), Some(42));
+    }
+
+    #[test]
+    fn stat_starttime_rejects_a_truncated_or_malformed_line() {
+        assert_eq!(parse_stat_starttime("1 (x) S 0 1 1"), None);
+        assert_eq!(parse_stat_starttime("not a stat line"), None);
+        let stat = "1 (x) S 0 1 1 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 notanumber 0 0";
+        assert_eq!(parse_stat_starttime(stat), None);
+    }
 
     #[test]
     fn cmdline_splits_on_nul_and_drops_trailing_empty() {

@@ -6,7 +6,7 @@
 
 use schema::sensor::SensorError;
 
-use crate::proc::parse_stat_ppid_comm;
+use crate::proc::{parse_stat_ppid_comm, parse_stat_starttime};
 
 /// The message-to-error helper every module in this crate shares.
 pub(crate) fn err(msg: String) -> SensorError {
@@ -128,8 +128,9 @@ pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
     ("sys_enter_unshare", "syscalls", "sys_enter_unshare"),
 ];
 
-/// `sensor_linux_wire::LineageEntry` is `repr(C)` over a `u32` and a `[u8; 16]` — every
-/// bit pattern is valid, so it is plain-old-data. A transparent newtype carries the
+/// `sensor_linux_wire::LineageEntry` is `repr(C)` over two `u32`, a `[u8; 16]` and a `u64`,
+/// laid out with no implicit padding (`reserved` is explicit) — every bit pattern is
+/// valid, so it is plain-old-data. A transparent newtype carries the
 /// `aya::Pod` impl (the orphan rule forbids implementing it on the wire type directly).
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -341,7 +342,9 @@ pub(crate) fn prime_proc_lineage(ebpf: &mut aya::Ebpf) -> Result<u32, SensorErro
         .map_err(|e| err(format!("PROC_LINEAGE is not a hash map: {e}")))?;
 
     let entries = std::fs::read_dir("/proc").map_err(|e| err(format!("read /proc: {e}")))?;
-    let mut primed = 0u32;
+    // First pass: every process's identity, so the second can name each parent's
+    // incarnation (issue #519) whichever order `/proc` lists them in.
+    let mut scanned: Vec<(u32, u32, String, u64)> = Vec::new();
     for entry in entries.flatten() {
         let Some(pid) = entry
             .file_name()
@@ -359,15 +362,31 @@ pub(crate) fn prime_proc_lineage(ebpf: &mut aya::Ebpf) -> Result<u32, SensorErro
         let Some((ppid, comm)) = parse_stat_ppid_comm(stat) else {
             continue;
         };
+        // The pid's incarnation stamp. A process that predates the agent never went
+        // through our `sched_process_fork`, so its stamp is its own `starttime`,
+        // tagged so it can never equal a live `bpf_ktime_get_ns()` stamp. `0` ("no
+        // stamp") when `starttime` is unreadable: better unknown than wrong.
+        let generation = parse_stat_starttime(stat)
+            .map_or(0, |ticks| ticks | sensor_linux_wire::PRIMED_GENERATION_BIT);
+        scanned.push((pid, ppid, comm.to_string(), generation));
+    }
+    let generation_of: std::collections::HashMap<u32, u64> =
+        scanned.iter().map(|(pid, _, _, g)| (*pid, *g)).collect();
+
+    let mut primed = 0u32;
+    for (pid, ppid, comm, generation) in &scanned {
         let mut val = sensor_linux_wire::LineageEntry {
-            ppid,
+            ppid: *ppid,
             comm: [0u8; sensor_linux_wire::TASK_COMM_LEN],
+            reserved: 0,
+            generation: *generation,
+            parent_generation: generation_of.get(ppid).copied().unwrap_or(0),
         };
         let bytes = comm.as_bytes();
         let n = bytes.len().min(sensor_linux_wire::TASK_COMM_LEN);
         val.comm[..n].copy_from_slice(&bytes[..n]);
 
-        if lineage.insert(pid, PodLineage(val), 0).is_ok() {
+        if lineage.insert(*pid, PodLineage(val), 0).is_ok() {
             primed += 1;
         }
     }
