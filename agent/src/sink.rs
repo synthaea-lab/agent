@@ -1537,7 +1537,7 @@ rule response_marker {
         .unwrap();
         let event = exec(7, "test", "/bin/test");
         sink.record_and_emit(
-            &verdict::EntityKey::new(1, "test".into()),
+            &verdict::EntityKey::new(1, "test"),
             "T1059",
             "test finding",
             schema::detection::DetectionSource::Rule {
