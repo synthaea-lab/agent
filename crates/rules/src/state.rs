@@ -50,6 +50,16 @@ struct RecentQuarantine {
     alerted: bool,
 }
 
+/// A mark-of-the-web removal (`FileDelete` of a `:Zone.Identifier` stream), as
+/// [`RuleState::on_file_delete`] saw it.
+struct MotwRemoval {
+    timestamp_ns: u64,
+    pid: u32,
+    comm: String,
+    /// Set by the first exec that alerted: one alert per removal, not per run.
+    alerted: bool,
+}
+
 struct ReportedTaskRegistration {
     timestamp_ns: u64,
     /// The reported action list, `None` for an unknown-action report (its path
@@ -122,6 +132,10 @@ pub struct RuleState {
     /// #365). LRU-bounded like `recent_writes`: a burst of downloads, or a
     /// hostile loop writing marks, must not grow agent memory.
     recent_quarantines: BoundedMap<String, RecentQuarantine>,
+    /// case-folded host path → its latest mark-of-the-web removal (T1553.005,
+    /// #442). LRU-bounded: `Unblock-File` over a whole module tree removes
+    /// hundreds of marks at once.
+    recent_motw_removals: BoundedMap<String, MotwRemoval>,
     /// (ppid, comm) → sliding counter for SELF-SPAWN (T1059 Windows). LRU-bounded.
     self_spawn: BoundedMap<(u32, String), SlidingCounter>,
     /// (comm, daddr, dport) → sliding counter for BEACON (T1071 Windows). LRU-bounded.
@@ -253,6 +267,7 @@ impl RuleState {
             pid_image_path: BoundedMap::new(PID_COMM_CAP),
             recent_writes: BoundedMap::new(RECENT_WRITES_CAP),
             recent_quarantines: BoundedMap::new(RECENT_WRITES_CAP),
+            recent_motw_removals: BoundedMap::new(RECENT_WRITES_CAP),
             self_spawn: BoundedMap::new(COUNTER_CAP),
             beacon: BoundedMap::new(COUNTER_CAP),
             beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
@@ -835,6 +850,7 @@ impl RuleState {
         alerts.extend(self.check_web_server_spawns_shell(event));
         alerts.extend(self.check_download_then_exec(event));
         alerts.extend(self.check_quarantined_exec(event));
+        alerts.extend(self.check_exec_after_motw_removal(event));
         alerts.extend(self.check_self_spawn(event));
         alerts.extend(self.check_parent_suspect(event));
         alerts.extend(self.check_lolbin(event));
@@ -1297,11 +1313,78 @@ impl RuleState {
 
     /// To be called for every `FileDeleteEvent` in the stream: the unlink half of the
     /// write-new-then-unlink T1486 shape (#512 part B), see
-    /// [`Self::check_write_new_then_unlink`].
+    /// [`Self::check_write_new_then_unlink`], and the mark-of-the-web removal
+    /// consumed by [`Self::check_exec_after_motw_removal`].
     pub fn on_file_delete(&mut self, event: &FileDeleteEvent) -> Vec<Alert> {
+        self.record_motw_removal(event);
         self.check_write_new_then_unlink(event)
             .into_iter()
             .collect()
+    }
+
+    /// Remembers a Windows `FileDelete` of a `:Zone.Identifier` stream: the
+    /// mark-of-the-web removed from its host file (#442). No alert on its own —
+    /// `Unblock-File` over a downloaded module tree removes hundreds of marks
+    /// legitimately, and the event itself stays in the telemetry for hunting.
+    fn record_motw_removal(&mut self, event: &FileDeleteEvent) {
+        if !matches!(event.meta.user, User::Windows { .. }) {
+            return;
+        }
+        let Some(host) = motw_stream_host(&event.path) else {
+            return;
+        };
+        self.recent_motw_removals.insert(
+            host.to_lowercase(),
+            MotwRemoval {
+                timestamp_ns: event.meta.timestamp_ns,
+                pid: event.meta.pid,
+                comm: event.meta.comm.clone(),
+                alerted: false,
+            },
+        );
+    }
+
+    /// T1553.005 — Subvert Trust Controls: Mark-of-the-Web Bypass. A file whose
+    /// mark-of-the-web was removed is executed within
+    /// [`QUARANTINE_EXEC_WINDOW_NS`] of the removal: the SmartScreen/Office
+    /// protected-view prompt that mark would have raised was taken out of the
+    /// way first (#442). The removal alone doesn't alert, see
+    /// [`Self::record_motw_removal`].
+    ///
+    /// Independent of T1204.002 ([`Self::check_quarantined_exec`]): a file both
+    /// marked and unmarked inside the window raises both, since they are two
+    /// techniques; the origin URL, when the mark was seen, is quoted here too.
+    ///
+    /// Not covered: a download that never got a mark (curl, certutil, most
+    /// droppers, see `DOWNLOADER_COMMS`) and an archive extractor that drops it
+    /// — there is no removal to see.
+    fn check_exec_after_motw_removal(&mut self, event: &ExecEvent) -> Option<Alert> {
+        let key = event.image_path.to_lowercase();
+        let now = event.meta.timestamp_ns;
+        let removal = self.recent_motw_removals.get_mut(&key)?;
+        let age = now.saturating_sub(removal.timestamp_ns);
+        if removal.alerted || age > QUARANTINE_EXEC_WINDOW_NS {
+            return None;
+        }
+        removal.alerted = true;
+        let (remover_pid, remover_comm) = (removal.pid, removal.comm.clone());
+        let origin = self
+            .recent_quarantines
+            .get_mut(&key)
+            .and_then(|mark| mark.origin_url.clone());
+        Some(Alert {
+            technique: "T1553.005",
+            message: format!(
+                "pid={} comm={} executes {}, {} after its mark-of-the-web was removed by pid={} comm={} (origin: {})",
+                event.meta.pid,
+                event.meta.comm,
+                event.image_path,
+                format_delta(age),
+                remover_pid,
+                remover_comm,
+                origin.as_deref().unwrap_or("unrecorded"),
+            ),
+        })
     }
 
     /// T1486, the shape `check_mass_rename_pattern` cannot see because none of it is a
@@ -1815,6 +1898,21 @@ fn written_file_is(path: &str, comm: &str) -> bool {
 /// raises an alert threshold, so the absence of evidence must not buy it.
 fn is_known_trusted(path: Option<&str>) -> bool {
     path.is_some_and(|p| !p.is_empty() && policy::name_exclusion_applies(Some(p)))
+}
+
+/// The host file of a `:Zone.Identifier` stream path, `$DATA` type suffix or
+/// not (`C:\d\a.exe:Zone.Identifier:$DATA` → `C:\d\a.exe`). Same rule as
+/// the Windows sensor's `stream_host_path`, which this crate can't depend on.
+fn motw_stream_host(path: &str) -> Option<&str> {
+    let path = strip_suffix_ignore_ascii_case(path, ":$DATA").unwrap_or(path);
+    let host = strip_suffix_ignore_ascii_case(path, ":Zone.Identifier")?;
+    (!host.is_empty() && !host.ends_with(['\\', '/', ':'])).then_some(host)
+}
+
+fn strip_suffix_ignore_ascii_case<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
+    let split = s.len().checked_sub(suffix.len())?;
+    let tail = s.get(split..)?;
+    tail.eq_ignore_ascii_case(suffix).then(|| &s[..split])
 }
 
 fn format_delta(delta_ns: u64) -> String {
