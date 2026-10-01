@@ -2,12 +2,20 @@
 //! programs through the kernel verifier without attaching them); run/capture
 //! drive `LinuxSensor` with the appropriate sink.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use schema::sensor::{EventSink as _, Sensor as _};
 use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
 
-use crate::{protected::ProtectedResourceGuard, silence::PulsingSink, sink::DetectionSink};
+use crate::{
+    protected::ProtectedResourceGuard,
+    shutdown::{SHUTDOWN_BUDGET, ShutdownPlan, sleep_unless_stopped},
+    silence::PulsingSink,
+    sink::DetectionSink,
+};
 
 /// Silence deadlines (#71) fed to `SilenceMonitor::register`. The eBPF sensor and
 /// the journal tail have no self-generated canary (see `silence::PulsingSink`'s
@@ -303,9 +311,15 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // Health beacon (#134): periodic self-diagnostics to the control plane, over
     // the silence monitor above.
     let health = super::common::health_collector(&pipeline, silence_monitor);
-    let (_health_handle, _health_stop) = health.spawn();
+    // Workers wound down after `sensor.run` returns (#316).
+    let mut shutdown = ShutdownPlan::default();
+    let (health_handle, health_stop) = health.spawn();
+    shutdown.register("health-beacon", move || health_stop.stop(), health_handle);
+    if let Some(transport) = pipeline.transport {
+        transport.register_shutdown(&mut shutdown);
+    }
 
-    spawn_netlink_poller(sink.clone(), netlink_heartbeat);
+    spawn_netlink_poller(sink.clone(), netlink_heartbeat, &mut shutdown);
     spawn_journal_tail(sink.clone(), journal_heartbeat, alerts);
     if enable_tls_capture || enable_readline_capture || enable_dns_capture {
         spawn_uprobes_sensor(
@@ -328,11 +342,21 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // never see one.
     let protected = crate::protected::protected_paths(alerts, events);
     let guarded = ProtectedResourceGuard::new(sink.clone(), protected, sink);
-    sensor
-        .run(Box::new(PulsingSink::new(guarded, primary_heartbeat)))
-        .map_err(|e| anyhow::anyhow!("sensor failed: {e}"))
-    // Health beacon thread stops when the process exits (sensor.run() blocks until
-    // Ctrl-C). For graceful shutdown, call health_stop.stop() before exiting.
+    let result = sensor.run(Box::new(PulsingSink::new(guarded, primary_heartbeat)));
+
+    // `sensor.run` returned (Ctrl-C or a sensor failure): wind the workers down —
+    // the upload loop gets one last spool drain — within one bounded budget. What
+    // is still spooled after that is redelivered on the next start (at-least-once).
+    // SIGTERM/SIGHUP/SIGQUIT do not come through here: `kill_loudness`'s watcher
+    // ends the process itself (after the enrich-queue flush, #341).
+    let stragglers = shutdown.execute(SHUTDOWN_BUDGET);
+    if !stragglers.is_empty() {
+        tracing::warn!(
+            ?stragglers,
+            "workers still running at the shutdown deadline"
+        );
+    }
+    result.map_err(|e| anyhow::anyhow!("sensor failed: {e}"))
 }
 
 /// Polling interval for [`spawn_netlink_poller`]. `crates/rules`' BEACON window is
@@ -347,16 +371,22 @@ const NETLINK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// says doesn't exist yet: that crate produces `schema::Event`s but leaves the
 /// polling cadence and the handoff to `EventSink` entirely to its caller.
 ///
-/// Runs until the process exits (no `Sensor::stop`-style shutdown): `agent run`'s
-/// only exit path today is Ctrl-C ending the whole process, same as every other
-/// background worker here (`EnrichQueue`, `yara::ScanQueue`).
-fn spawn_netlink_poller(sink: Arc<DetectionSink>, heartbeat: SensorHeartbeat) {
-    std::thread::Builder::new()
+/// Registers itself with `shutdown` (#316): the poll loop exits within one sleep
+/// slice of the stop. (`EnrichQueue` and `yara::ScanQueue` workers still end with
+/// the process.)
+fn spawn_netlink_poller(
+    sink: Arc<DetectionSink>,
+    heartbeat: SensorHeartbeat,
+    shutdown: &mut ShutdownPlan,
+) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
+    let handle = std::thread::Builder::new()
         .name("netlink-poll".into())
         .spawn(move || {
             let mut listen_warned = false;
             let mut conntrack_warned = false;
-            loop {
+            while !worker_stop.load(Ordering::SeqCst) {
                 let ts = schema::time::now_ns();
                 forward_netlink_events(
                     sensor_linux_netlink::listen_port_events(ts),
@@ -372,10 +402,15 @@ fn spawn_netlink_poller(sink: Arc<DetectionSink>, heartbeat: SensorHeartbeat) {
                     &mut conntrack_warned,
                     "conntrack",
                 );
-                std::thread::sleep(NETLINK_POLL_INTERVAL);
+                sleep_unless_stopped(&worker_stop, NETLINK_POLL_INTERVAL);
             }
         })
         .expect("spawning the netlink poll thread");
+    shutdown.register(
+        "netlink-poll",
+        move || stop.store(true, Ordering::SeqCst),
+        handle,
+    );
 }
 
 /// Forwards one poll's events to `sink`, or logs a kernel error — once per

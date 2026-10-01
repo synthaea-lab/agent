@@ -9,12 +9,18 @@
 
 use std::{
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::JoinHandle,
     time::Duration,
 };
 
 use store::EventSpool;
 use transport::{EventDrain, EventUploader, TransportClient, TransportConfig, UploadLoop};
+
+use crate::shutdown::ShutdownPlan;
 
 /// On-disk cap for the spool. Beyond it the spool sheds oldest and counts
 /// (`store::EventSpool`'s own policy) — visible in the health beacon as
@@ -47,14 +53,33 @@ impl EventDrain for SpoolDrain {
 
 /// What `run` keeps after starting the upload pipeline: the spool handle the
 /// sink appends to (and health reads), and a client for the health beacon's
-/// heartbeat POSTs. The upload thread itself needs no handle — like the
-/// health-beacon thread, it stops when the process exits (see
-/// `commands::linux::cmd_run`'s note on graceful shutdown).
+/// heartbeat POSTs, plus the upload thread's stop flag and join handle so a
+/// graceful shutdown (#316) can end it with one last drain. Platforms that do
+/// not shut down gracefully yet just let the thread die with the process —
+/// safe, the spool redelivers.
 pub(crate) struct TransportHandle {
     pub(crate) spool: Arc<Mutex<EventSpool>>,
     // Read by the health beacon, which macOS doesn't wire yet (#317).
     #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     pub(crate) client: Arc<TransportClient>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // graceful shutdown is Linux-first
+    upload_stop: Arc<AtomicBool>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    upload_thread: JoinHandle<()>,
+}
+
+impl TransportHandle {
+    /// Registers the upload thread with `plan`: stopping it makes the loop
+    /// exit its poll/backoff sleep and attempt the final spool drain.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn register_shutdown(self, plan: &mut ShutdownPlan) {
+        let stop = self.upload_stop;
+        plan.register(
+            "transport-upload",
+            move || stop.store(true, Ordering::SeqCst),
+            self.upload_thread,
+        );
+    }
 }
 
 /// Opens the spool (next to the alerts file — the same "derived, no separate
@@ -75,7 +100,8 @@ pub(crate) fn start(server_url: &str, alerts: &Path) -> anyhow::Result<Transport
 
     let uploader = EventUploader::new(upload_client, SpoolDrain(Arc::clone(&spool)));
     let mut upload_loop = UploadLoop::new(uploader, UPLOAD_POLL_INTERVAL);
-    std::thread::Builder::new()
+    let upload_stop = upload_loop.stop_handle();
+    let upload_thread = std::thread::Builder::new()
         .name("transport-upload".into())
         .spawn(move || upload_loop.run())
         .expect("spawning the transport upload thread");
@@ -83,6 +109,8 @@ pub(crate) fn start(server_url: &str, alerts: &Path) -> anyhow::Result<Transport
     Ok(TransportHandle {
         spool,
         client: heartbeat_client,
+        upload_stop,
+        upload_thread,
     })
 }
 

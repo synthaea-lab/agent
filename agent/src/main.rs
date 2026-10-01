@@ -48,6 +48,7 @@ mod journal_cursor;
 mod kill_loudness;
 mod protected;
 mod release;
+mod shutdown;
 mod silence;
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos", windows)),
