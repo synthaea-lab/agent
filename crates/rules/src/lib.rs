@@ -10,6 +10,7 @@
 //! Migrated from `old/crates/synthaea-rules`; the false-positive exclusion lists carry
 //! dated lab observations — treat them as data with provenance, not tunable noise.
 
+mod amsi;
 mod exclusions;
 mod ld_trust;
 mod sliding;
@@ -29,6 +30,7 @@ pub(crate) use stateless::{
 // The contract is the two dispatchers — callers (agent) route every event
 // through them. The individual checks are implementation detail, re-exported
 // crate-internally for the tests under `src/tests/`.
+pub use amsi::evaluate_amsi_content;
 pub use stateless::{
     evaluate_connect, evaluate_exec, evaluate_file_delete, evaluate_file_open, evaluate_signal,
 };

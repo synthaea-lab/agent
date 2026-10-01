@@ -683,6 +683,13 @@ impl DetectionSink {
         }
     }
 
+    /// `AmsiContent` events (Windows, #282): the de-obfuscated buffer a
+    /// runtime hands to AMSI — download cradles, AMSI tampering, reflective
+    /// loads, credential-dumping modules, script hosts launching interpreters.
+    fn detect_amsi_content(&self, wrapped: &Event, event: &schema::AmsiContentEvent) {
+        self.record_rule_alerts(wrapped, rules::evaluate_amsi_content(event));
+    }
+
     /// Writes one alert to the shared log and highlighted stderr. `pub(crate)`
     /// rather than private: `silence::spawn_monitor` (#71) emits a sensor-silence
     /// verdict through the exact same path as a rule/correlator/Sigma finding —
@@ -876,6 +883,7 @@ impl EventSink for DetectionSink {
             Event::FileRename(e) => self.detect_file_rename(&event, e),
             Event::FileWrite(e) => self.detect_file_write(e),
             Event::MemfdCreate(e) => self.detect_memfd_create(e),
+            Event::AmsiContent(e) => self.detect_amsi_content(&event, e),
             // New telemetry categories reach the engines as they land; until a rule
             // consumes them, logging below is the whole treatment.
             _ => {}
