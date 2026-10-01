@@ -47,6 +47,7 @@ mod journal_cursor;
 #[cfg(target_os = "linux")]
 mod kill_loudness;
 mod protected;
+mod quarantine_cmd;
 mod release;
 mod shutdown;
 mod silence;
@@ -240,6 +241,30 @@ enum Command {
         #[arg(long)]
         allow_test_key: bool,
     },
+    /// Lists or restores payloads automated quarantine moved aside (issue #25).
+    /// The quarantine directory is derived from `--alerts` exactly as `run`
+    /// derives it, so pass the same path the running agent was given.
+    Quarantine {
+        /// The alert log of the agent whose quarantine to act on; restores are
+        /// audited into it.
+        #[arg(long, default_value = "alerts.ndjson", global = true)]
+        alerts: std::path::PathBuf,
+        #[command(subcommand)]
+        action: QuarantineAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum QuarantineAction {
+    /// Prints each quarantined payload's SHA-256 and original path.
+    List,
+    /// Puts a payload back at its original path. Refuses to overwrite a file
+    /// that has taken its place, or to restore a payload altered since
+    /// quarantine. The restored file stays read-only.
+    Restore {
+        /// The payload's SHA-256, as printed by `list`.
+        sha256: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -338,6 +363,14 @@ fn main() -> anyhow::Result<()> {
                 &cfg.ipc.endpoint,
             )
         }
+        Command::Quarantine { alerts, action } => match action {
+            QuarantineAction::List => {
+                quarantine_cmd::cmd_quarantine_list(&alerts, &mut std::io::stdout().lock())
+            }
+            QuarantineAction::Restore { sha256 } => {
+                quarantine_cmd::cmd_quarantine_restore(&alerts, &sha256)
+            }
+        },
         Command::ApplyRelease {
             server,
             cert,

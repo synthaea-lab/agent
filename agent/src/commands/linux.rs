@@ -255,7 +255,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
             quarantine_enabled: enable_quarantine,
         },
         terminate_process,
-        alerts.with_file_name("quarantine"),
+        crate::quarantine_cmd::quarantine_dir_for(alerts),
     );
     if enable_kill || enable_quarantine {
         eprintln!(
