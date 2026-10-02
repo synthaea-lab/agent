@@ -9,6 +9,8 @@
 //! `'`, `@` and spaces. The host cannot contain `'@'`, so the split is on the *last*
 //! `'@'` before the fixed ` (using password: ...)` suffix.
 
+use schema::{AuthEvent, AuthKind, AuthOutcome, EventMeta, User};
+
 use crate::{ParseError, clamp};
 
 /// One failed authentication attempt.
@@ -68,6 +70,46 @@ pub fn parse_mysql_error_line(line: &str) -> Result<Option<MysqlLoginFailure>, P
     }))
 }
 
+/// The `comm` of events built from this log. It names the source, not a process: an
+/// error-log line carries no pid, so [`to_auth_event`] sets `pid` and `ppid` to 0.
+pub const MYSQL_LOG_COMM: &str = "mysql-error-log";
+
+/// A failed login as the shared logon event (ADR-0022 §3, ADR-0005), so the existing
+/// brute-force rule (T1110, keyed on target user and source address) covers it.
+///
+/// `timestamp_ns` is when the agent read the line, not the line's own time: `MariaDB`
+/// writes no zone, and a restart's catch-up reads old lines. The source address is
+/// the client host when it is an IP; a resolved name or `localhost` leaves it `None`,
+/// which the rule keys as "local" (never a fabricated loopback).
+#[must_use]
+pub fn to_auth_event(failure: &MysqlLoginFailure, timestamp_ns: u64) -> AuthEvent {
+    AuthEvent {
+        meta: EventMeta {
+            pid: 0,
+            ppid: 0,
+            user: User::Unknown,
+            timestamp_ns,
+            comm: MYSQL_LOG_COMM.to_owned(),
+            container: None,
+            process_generation: None,
+            parent_process_generation: None,
+        },
+        outcome: AuthOutcome::Failure,
+        kind: AuthKind::LogonFailure,
+        target_user: failure.user.clone(),
+        target_user_sid: None,
+        source_address: failure.host.parse().ok(),
+        status_code: Some(
+            if failure.used_password {
+                "using_password"
+            } else {
+                "no_password"
+            }
+            .to_owned(),
+        ),
+    }
+}
+
 /// `2026-10-01T12:00:00.123456Z` or `2026-10-01 12:00:00`: the leading token(s) of
 /// `head`, accepted only when they start with a `YYYY-MM-DD` date.
 fn timestamp_prefix(head: &str) -> Option<&str> {
@@ -108,6 +150,28 @@ mod tests {
         assert_eq!(f.timestamp, "2026-10-01T12:00:00.123456Z");
         assert_eq!((f.user.as_str(), f.host.as_str()), ("root", "10.0.0.5"));
         assert!(f.used_password);
+    }
+
+    #[test]
+    fn a_failed_login_becomes_a_logon_failure_with_the_client_ip() {
+        let l = "2026-10-01 12:00:00 12 [Warning] Access denied for user 'root'@'10.0.0.5' (using password: YES)";
+        let f = parse_mysql_error_line(l).unwrap().unwrap();
+        let e = to_auth_event(&f, 42);
+        assert_eq!(
+            (e.outcome, e.kind),
+            (AuthOutcome::Failure, AuthKind::LogonFailure)
+        );
+        assert_eq!(e.target_user, "root");
+        assert_eq!(e.source_address, Some("10.0.0.5".parse().unwrap()));
+        assert_eq!((e.meta.pid, e.meta.ppid, e.meta.timestamp_ns), (0, 0, 42));
+        assert_eq!(e.meta.comm, MYSQL_LOG_COMM);
+    }
+
+    #[test]
+    fn a_host_name_is_not_an_address() {
+        let l = "2026-10-01 12:00:00 12 [Warning] Access denied for user 'u'@'localhost' (using password: NO)";
+        let f = parse_mysql_error_line(l).unwrap().unwrap();
+        assert_eq!(to_auth_event(&f, 1).source_address, None);
     }
 
     #[test]

@@ -29,7 +29,7 @@ mod tail;
 mod tokenizer;
 
 pub use access::{AccessFormat, AccessRecord, parse_access_line};
-pub use mysql::{MysqlLoginFailure, parse_mysql_error_line};
+pub use mysql::{MYSQL_LOG_COMM, MysqlLoginFailure, parse_mysql_error_line, to_auth_event};
 pub use tail::{FileId, PollOutcome, Position, Tailer};
 
 /// Longest line a parser reads; the rest is dropped and the record is flagged

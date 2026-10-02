@@ -220,6 +220,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         server,
         ipc_endpoint,
         content_dir,
+        log_sources,
     } = opts;
     // Kill-loudness (#71): must run before any other thread exists — the signal mask
     // set here is inherited by every thread spawned below, including `DetectionSink`'s
@@ -322,6 +323,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
 
     spawn_netlink_poller(sink.clone(), netlink_heartbeat, &mut shutdown);
     spawn_journal_tail(sink.clone(), journal_heartbeat, alerts);
+    crate::log_sources::spawn(sink.clone(), log_sources, alerts, &mut shutdown);
     if enable_tls_capture || enable_readline_capture || enable_dns_capture {
         spawn_uprobes_sensor(
             sink.clone(),

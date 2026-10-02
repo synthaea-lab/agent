@@ -397,6 +397,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         server,
         ipc_endpoint,
         content_dir,
+        log_sources: _,
     } = opts;
     let pipeline = super::common::wire_run_pipeline(
         seeded_rule_state(),
