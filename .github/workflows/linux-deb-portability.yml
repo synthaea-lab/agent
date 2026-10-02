@@ -50,10 +50,11 @@ jobs:
             -v "$GITHUB_WORKSPACE:/work" \
             -v /sys/kernel/btf:/sys/kernel/btf:ro \
             -w /work alpine:3.24 sh -lc '
-              apk add --no-cache sudo
+              set -eux
+              apk add --no-cache sudo bash
               export SYNTHAEA_SRC=/work
-              ./lab/provisioning/alpine-toolchain.sh
-              ./packaging/linux/build-deb.sh
+              bash ./lab/provisioning/alpine-toolchain.sh
+              bash ./packaging/linux/build-deb.sh
               chown -R "$(stat -c %u /work)":"$(stat -c %g /work)" /work/target /work/onnxruntime
             '
 
