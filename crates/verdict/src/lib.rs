@@ -33,20 +33,45 @@ use store::BoundedMap;
 /// key, reused here so a verdict and the correlator's belief state key
 /// identically. `ppid` rather than `pid`: the same reasoning as `correlator`'s
 /// own choice — a respawned process (crash-restart, a loop) keeps one identity.
+///
+/// `parent_generation` is the incarnation of the parent `ppid` names
+/// ([`schema::EventMeta::parent_process_generation`]): without it a **recycled parent
+/// pid** that spawns a child with the same `comm` would join the previous parent's
+/// entity and inherit its evidence and suppressions (#592). It is not part of the
+/// entity's identity (the engine looks entities up by `(ppid, comm)`); it is compared
+/// with the same rule as the rest of the stack: two known, different stamps are two
+/// incarnations, and a `None` on either side cannot disprove identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EntityKey {
     pub ppid: u32,
     pub comm: String,
+    pub parent_generation: Option<u64>,
 }
 
 impl EntityKey {
+    /// A key with no parent stamp: the old behaviour, for platforms and events that
+    /// carry none.
     #[must_use]
     pub fn new(ppid: u32, comm: impl Into<String>) -> Self {
         Self {
             ppid,
             comm: comm.into(),
+            parent_generation: None,
         }
     }
+
+    /// The same key for a known incarnation of the parent.
+    #[must_use]
+    pub fn with_parent_generation(mut self, parent_generation: Option<u64>) -> Self {
+        self.parent_generation = parent_generation;
+        self
+    }
+}
+
+/// An unstamped side cannot disprove identity; two known, different stamps can.
+/// The rule `correlator` and `rules` apply to every pid-keyed map.
+fn same_generation(recorded: Option<u64>, wanted: Option<u64>) -> bool {
+    !matches!((recorded, wanted), (Some(a), Some(b)) if a != b)
 }
 
 /// One technique folded into an entity's verdict, with when its current dedup
@@ -71,6 +96,8 @@ const EVIDENCE_CAP: usize = 16;
 
 /// One entity's fused state: every technique/source/detection folded in so far.
 struct EntityState {
+    /// The parent incarnation this state was built for ([`EntityKey::parent_generation`]).
+    parent_generation: Option<u64>,
     severity: Severity,
     score: Option<f64>,
     techniques: Vec<TechniqueRecord>,
@@ -79,8 +106,9 @@ struct EntityState {
 }
 
 impl EntityState {
-    fn new() -> Self {
+    fn new(parent_generation: Option<u64>) -> Self {
         Self {
+            parent_generation,
             severity: Severity::Low,
             score: None,
             techniques: Vec::new(),
@@ -128,7 +156,9 @@ const ENTITY_CAP: usize = 16_384;
 
 /// Folds per-engine findings into one scored verdict per entity.
 pub struct VerdictEngine {
-    entities: BoundedMap<EntityKey, EntityState>,
+    /// Keyed by `(ppid, comm)`; the parent's incarnation is checked against the stored
+    /// state's, see [`EntityKey::parent_generation`].
+    entities: BoundedMap<(u32, String), EntityState>,
     /// Explicit, operator-applied overrides: (entity, technique) pairs to drop
     /// silently. Above and independent of the per-engine dated FP exclusions
     /// (`policy::name_exclusion_applies` and its callers): those live inside
@@ -136,6 +166,9 @@ pub struct VerdictEngine {
     /// runtime override an operator applies after the fact, to one entity, not
     /// a rule change. No expiry in this pass — an operator who wants it back
     /// removes the mark explicitly (`unsuppress`).
+    ///
+    /// A mark made with a parent stamp covers that incarnation only; a mark made
+    /// without one covers every incarnation (the old behaviour).
     suppressed: HashSet<(EntityKey, String)>,
     dedup_window_ns: u64,
 }
@@ -148,6 +181,17 @@ impl VerdictEngine {
             suppressed: HashSet::new(),
             dedup_window_ns,
         }
+    }
+
+    /// True when a mark for `entity` and `technique` applies to this finding: same
+    /// `(ppid, comm)`, same technique, and an incarnation the mark does not rule out.
+    fn is_suppressed(&self, entity: &EntityKey, technique: &str) -> bool {
+        self.suppressed.iter().any(|(mark, t)| {
+            t == technique
+                && mark.ppid == entity.ppid
+                && mark.comm == entity.comm
+                && same_generation(mark.parent_generation, entity.parent_generation)
+        })
     }
 
     /// Folds one engine's finding into the entity's fused verdict.
@@ -174,16 +218,28 @@ impl VerdictEngine {
         detection: Detection,
         now_ns: u64,
     ) -> Option<Verdict> {
-        if self
-            .suppressed
-            .contains(&(entity.clone(), technique.to_owned()))
-        {
+        if self.is_suppressed(&entity, technique) {
             return None;
         }
 
+        let id = (entity.ppid, entity.comm.clone());
+        // A recycled parent pid that spawns a child of the same `comm` is a new entity:
+        // it must not inherit the previous parent's evidence (#592).
+        if self
+            .entities
+            .peek(&id)
+            .is_some_and(|s| !same_generation(s.parent_generation, entity.parent_generation))
+        {
+            self.entities.remove(&id);
+        }
         let state = self
             .entities
-            .get_or_insert_with(entity.clone(), EntityState::new);
+            .get_or_insert_with(id, || EntityState::new(entity.parent_generation));
+        // A state built before any stamp was seen adopts the first one that arrives,
+        // so a later, different stamp is recognised as another incarnation.
+        if state.parent_generation.is_none() {
+            state.parent_generation = entity.parent_generation;
+        }
 
         let is_dup = match state
             .techniques
@@ -262,7 +318,10 @@ impl VerdictEngine {
     /// health/status surface). `None` if the entity has never been recorded.
     #[must_use]
     pub fn peek(&self, entity: &EntityKey) -> Option<Verdict> {
-        let state = self.entities.peek(entity)?;
+        let state = self.entities.peek(&(entity.ppid, entity.comm.clone()))?;
+        if !same_generation(state.parent_generation, entity.parent_generation) {
+            return None;
+        }
         Some(Verdict {
             entity: entity.clone(),
             severity: state.severity,
@@ -612,6 +671,159 @@ mod tests {
             before, after,
             "peek must be idempotent, no hidden state change"
         );
+    }
+
+    // ── Parent incarnation (#592) ───────────────────────────────────────────
+
+    fn stamped(generation: u64) -> EntityKey {
+        entity().with_parent_generation(Some(generation))
+    }
+
+    #[test]
+    fn a_recycled_parent_does_not_inherit_the_previous_parents_evidence() {
+        let mut engine = VerdictEngine::new(60_000_000_000);
+        engine
+            .record(
+                stamped(1),
+                "T1059.004",
+                detection(Severity::Critical, Some(0.9), rule("r1")),
+                0,
+            )
+            .unwrap();
+
+        // The parent pid is recycled (new incarnation), and a child with the same comm
+        // raises a weak finding: it starts clean, not at Critical with the old trail.
+        let verdict = engine
+            .record(
+                stamped(2),
+                "T1071",
+                detection(Severity::Low, None, rule("r2")),
+                1,
+            )
+            .unwrap();
+        assert_eq!(verdict.severity, Severity::Low);
+        assert_eq!(verdict.score, None);
+        assert_eq!(verdict.techniques, vec!["T1071"]);
+        assert_eq!(verdict.sources, vec![rule("r2")]);
+        assert_eq!(verdict.detections.len(), 1);
+        // The old incarnation's state is gone, not merged.
+        assert_eq!(engine.peek(&stamped(1)), None);
+    }
+
+    #[test]
+    fn the_same_incarnation_keeps_accumulating() {
+        let mut engine = VerdictEngine::new(60_000_000_000);
+        engine
+            .record(
+                stamped(7),
+                "T1059.004",
+                detection(Severity::Medium, None, rule("r1")),
+                0,
+            )
+            .unwrap();
+        let verdict = engine
+            .record(
+                stamped(7),
+                "T1071",
+                detection(Severity::Low, None, rule("r2")),
+                1,
+            )
+            .unwrap();
+        assert_eq!(verdict.techniques, vec!["T1059.004", "T1071"]);
+        assert_eq!(verdict.severity, Severity::Medium);
+    }
+
+    #[test]
+    fn a_suppression_covers_only_the_incarnation_it_was_made_for() {
+        let mut engine = VerdictEngine::new(60_000_000_000);
+        engine.suppress(stamped(1), "T1059.004");
+        let d = || detection(Severity::Medium, None, rule("r1"));
+        assert_eq!(engine.record(stamped(1), "T1059.004", d(), 0), None);
+        assert!(
+            engine.record(stamped(2), "T1059.004", d(), 1).is_some(),
+            "the recycled parent's child must not inherit the mark"
+        );
+    }
+
+    #[test]
+    fn a_suppression_without_a_stamp_covers_every_incarnation_as_before() {
+        let mut engine = VerdictEngine::new(60_000_000_000);
+        engine.suppress(entity(), "T1059.004");
+        let d = detection(Severity::Medium, None, rule("r1"));
+        assert_eq!(engine.record(stamped(1), "T1059.004", d.clone(), 0), None);
+        assert_eq!(engine.record(stamped(2), "T1059.004", d.clone(), 0), None);
+        assert_eq!(engine.record(entity(), "T1059.004", d, 0), None);
+    }
+
+    #[test]
+    fn without_stamps_the_entity_is_shared_exactly_as_before() {
+        let mut engine = VerdictEngine::new(60_000_000_000);
+        engine
+            .record(
+                entity(),
+                "T1059.004",
+                detection(Severity::High, None, rule("r1")),
+                0,
+            )
+            .unwrap();
+        let verdict = engine
+            .record(
+                entity(),
+                "T1071",
+                detection(Severity::Low, None, rule("r2")),
+                1,
+            )
+            .unwrap();
+        assert_eq!(verdict.techniques, vec!["T1059.004", "T1071"]);
+        assert_eq!(verdict.severity, Severity::High);
+    }
+
+    #[test]
+    fn a_missing_stamp_on_either_side_cannot_disprove_identity() {
+        let mut engine = VerdictEngine::new(60_000_000_000);
+        let d = |s| detection(s, None, rule("r1"));
+        // Stamped, then unstamped: same entity.
+        engine
+            .record(stamped(1), "T1059.004", d(Severity::High), 0)
+            .unwrap();
+        let v = engine
+            .record(entity(), "T1071", d(Severity::Low), 1)
+            .unwrap();
+        assert_eq!(v.techniques, vec!["T1059.004", "T1071"]);
+
+        // Unstamped, then stamped: same entity, and the stamp is adopted so a different
+        // one afterwards is recognised as another incarnation.
+        let mut engine = VerdictEngine::new(60_000_000_000);
+        engine
+            .record(entity(), "T1059.004", d(Severity::High), 0)
+            .unwrap();
+        let v = engine
+            .record(stamped(5), "T1071", d(Severity::Low), 1)
+            .unwrap();
+        assert_eq!(v.techniques, vec!["T1059.004", "T1071"]);
+        let v = engine
+            .record(stamped(6), "T1105", d(Severity::Low), 2)
+            .unwrap();
+        assert_eq!(v.techniques, vec!["T1105"], "stamp 6 is a new incarnation");
+    }
+
+    #[test]
+    fn peek_does_not_return_another_incarnations_verdict() {
+        let mut engine = VerdictEngine::new(60_000_000_000);
+        engine
+            .record(
+                stamped(1),
+                "T1059.004",
+                detection(Severity::High, None, rule("r1")),
+                0,
+            )
+            .unwrap();
+        assert!(engine.peek(&stamped(1)).is_some());
+        assert!(
+            engine.peek(&entity()).is_some(),
+            "an unstamped read cannot disprove it"
+        );
+        assert!(engine.peek(&stamped(2)).is_none());
     }
 
     #[test]
