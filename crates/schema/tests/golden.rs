@@ -16,11 +16,11 @@ use schema::{
     HttpRequestEvent, HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind,
     ImageLoadEvent, KernelModuleAction, KernelModuleEvent, LdapSearchEvent, ListenPortEvent,
     MemfdCreateEvent, MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent,
-    POLICY_MECHANISM_SELINUX, PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent,
-    ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
-    ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent,
-    TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User,
-    WmiActivityEvent, XpcConnectEvent,
+    NtlmAuthEvent, NtlmDirection, POLICY_MECHANISM_SELINUX, PolicyDenialEvent, PrctlEvent,
+    ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent,
+    ScriptBlockEvent, ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
+    SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
+    UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -447,6 +447,31 @@ fn wmi_activity_golden() {
             method: Some("Win32_Process.Create".into()),
         }),
         "wmi_activity",
+    );
+}
+
+#[test]
+fn ntlm_auth_golden() {
+    assert_golden(
+        &Event::NtlmAuth(NtlmAuthEvent {
+            meta: EventMeta {
+                pid: 4,
+                ppid: 0,
+                user: User::Unknown,
+                timestamp_ns: 1_759_405_827_000_000_000,
+                comm: "System".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            direction: NtlmDirection::Outgoing,
+            user: "synlabnobody".into(),
+            target: "cifs/127.0.0.1".into(),
+            remote_address: Some("127.0.0.1".parse().unwrap()),
+            ntlm_version: "NTLMv2".into(),
+            status: None,
+        }),
+        "ntlm_auth",
     );
 }
 
@@ -1895,6 +1920,15 @@ fn meta_accessor_covers_all_variants() {
             namespace: String::new(),
             query: None,
             method: None,
+        }),
+        Event::NtlmAuth(NtlmAuthEvent {
+            meta: meta.clone(),
+            direction: NtlmDirection::Incoming,
+            user: String::new(),
+            target: String::new(),
+            remote_address: None,
+            ntlm_version: String::new(),
+            status: None,
         }),
         Event::LdapSearch(LdapSearchEvent {
             meta: meta.clone(),

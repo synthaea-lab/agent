@@ -244,6 +244,29 @@ pub fn describe_foreign_sessions(
     )
 }
 
+/// The NTLM provider's `ProcessPID` (#364): a hex string (`0x4`) in the
+/// events seen on Windows 11 24H2, decimal accepted too.
+#[must_use]
+pub fn parse_ntlm_pid(raw: &str) -> Option<u32> {
+    let raw = raw.trim();
+    match raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => raw.parse().ok(),
+    }
+}
+
+/// The NTLM provider's `DomainName` + `Username` as one account name; its
+/// "no value" spellings (`Null`, `(NULL)`, `-`, empty) count as absent.
+#[must_use]
+pub fn ntlm_account(user: &str, domain: &str) -> String {
+    let absent = |s: &str| matches!(s.trim(), "" | "-" | "Null" | "(NULL)");
+    match (absent(domain), absent(user)) {
+        (_, true) => String::new(),
+        (true, false) => user.trim().to_string(),
+        (false, false) => format!("{}\\{}", domain.trim(), user.trim()),
+    }
+}
+
 /// LDAP-Client's `AttributeList` (EID 30, #364) split into attribute names.
 /// The provider joins the names with `;` (lab 2026-10-02, code points of
 /// `cn;ms-Mcs-AdmPwd`); a whitespace-only split had glued them together and
@@ -300,6 +323,17 @@ impl ConnectDedup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ntlm_pids_and_accounts_parse_like_the_lab_events() {
+        assert_eq!(parse_ntlm_pid("0x4"), Some(4));
+        assert_eq!(parse_ntlm_pid("0x26D8"), Some(9944));
+        assert_eq!(parse_ntlm_pid("9944"), Some(9944));
+        assert_eq!(parse_ntlm_pid("-"), None);
+        assert_eq!(ntlm_account("synlabnobody", "Null"), "synlabnobody");
+        assert_eq!(ntlm_account("alice", "CORP"), "CORP\\alice");
+        assert_eq!(ntlm_account("(NULL)", "CORP"), "");
+    }
 
     #[test]
     fn ldap_attribute_lists_split_on_any_separator() {

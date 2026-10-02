@@ -34,10 +34,10 @@ use crate::{
     FileSetxattrEvent, FileWriteEvent, HttpRequestEvent, HttpSignature, HttpSummaryEvent,
     IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent, KernelModuleAction, KernelModuleEvent,
     LdapSearchEvent, ListenPortEvent, MemfdCreateEvent, NamespaceEvent, NamespaceSyscall,
-    NetworkFlowEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
-    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType, SmbConnectEvent,
-    SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection,
-    TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
+    NetworkFlowEvent, NtlmAuthEvent, NtlmDirection, PrctlEvent, ProcessVmReadEvent,
+    ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
+    ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent,
+    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -124,6 +124,20 @@ pub fn image_load() -> ImageLoadEvent {
     ImageLoadEvent {
         meta: meta(),
         image_path: String::new(),
+    }
+}
+
+/// Neutral [`NtlmAuthEvent`].
+#[must_use]
+pub fn ntlm_auth() -> NtlmAuthEvent {
+    NtlmAuthEvent {
+        meta: meta(),
+        direction: NtlmDirection::Outgoing,
+        user: String::new(),
+        target: String::new(),
+        remote_address: None,
+        ntlm_version: String::new(),
+        status: None,
     }
 }
 

@@ -56,9 +56,64 @@ impl PidBudget {
     }
 }
 
+/// Reports one event per key per window (NTLM, #364): the same account
+/// re-authenticating to the same target with the same version is one fact.
+/// Bounded like [`PidBudget`].
+#[derive(Debug)]
+pub(crate) struct KeyDedup {
+    window_ns: u64,
+    seen: HashMap<String, u64>,
+    pub(crate) duplicates: u64,
+}
+
+/// Keys remembered at once.
+const KEY_DEDUP_CAP: usize = 4_096;
+
+impl KeyDedup {
+    pub(crate) fn new(window_ns: u64) -> Self {
+        Self {
+            window_ns,
+            seen: HashMap::new(),
+            duplicates: 0,
+        }
+    }
+
+    /// `true` the first time `key` is seen within the window.
+    pub(crate) fn first(&mut self, key: &str, now_ns: u64) -> bool {
+        if self
+            .seen
+            .get(key)
+            .is_some_and(|&t| now_ns.saturating_sub(t) < self.window_ns)
+        {
+            self.duplicates += 1;
+            return false;
+        }
+        if self.seen.len() >= KEY_DEDUP_CAP {
+            let window_ns = self.window_ns;
+            self.seen
+                .retain(|_, t| now_ns.saturating_sub(*t) < window_ns);
+            if self.seen.len() >= KEY_DEDUP_CAP {
+                self.seen.clear();
+            }
+        }
+        self.seen.insert(key.to_string(), now_ns);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_key_is_reported_once_per_window() {
+        let mut dedup = KeyDedup::new(10);
+        assert!(dedup.first("a", 0));
+        assert!(!dedup.first("a", 5));
+        assert!(dedup.first("b", 5));
+        assert!(dedup.first("a", 10));
+        assert_eq!(dedup.duplicates, 1);
+    }
 
     #[test]
     fn a_process_is_capped_per_window_then_gets_a_fresh_budget() {

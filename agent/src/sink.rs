@@ -1071,6 +1071,7 @@ impl EventSink for DetectionSink {
             Event::MemfdCreate(e) => self.detect_memfd_create(e),
             Event::AmsiContent(e) => self.detect_amsi_content(&event, e),
             Event::LdapSearch(e) => self.detect_ldap_search(&event, e),
+            Event::NtlmAuth(e) => self.record_rule_alerts(&event, rules::evaluate_ntlm_auth(e)),
             // New telemetry categories reach the engines as they land; until a rule
             // consumes them, logging below is the whole treatment.
             _ => {}
