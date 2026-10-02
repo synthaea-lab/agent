@@ -84,11 +84,11 @@ pub(crate) struct DetectionSink {
     /// sticky state: it stays scoped to the triggering event's own evidence (PR
     /// #502 review — the entity's composed severity is a max over everything
     /// ever seen for `(ppid, comm)`, too coarse and too sticky to gate a
-    /// destructive action on). YARA matches are not folded in: the scan queue is
-    /// deliberately decoupled from the triggering process (`crates/yara/src/
-    /// queue.rs`'s settle delay) and carries no pid/entity context today — wiring
-    /// that through is separate follow-up work, not part of this pass.
-    verdict: Mutex<verdict::VerdictEngine>,
+    /// destructive action on). YARA matches are folded in too (#614): the scan
+    /// request carries the writing process's `(ppid, comm)` through the queue's
+    /// settle delay ([`yara::ScanContext`]), and the match is keyed to the same
+    /// entity as the rule alerts on it.
+    verdict: Arc<Mutex<verdict::VerdictEngine>>,
     /// Resolved once at construction ([`resolve_content_root`]) and reused
     /// by every `reload_content` call — the exe/cwd resolution reflects
     /// where the process actually started, which does not change at
@@ -219,19 +219,28 @@ impl DetectionSink {
             }
         });
         let response: Arc<Mutex<Option<ResponseHooks>>> = Arc::new(Mutex::new(None));
+        let verdict = Arc::new(Mutex::new(verdict::VerdictEngine::new(
+            VERDICT_DEDUP_WINDOW_NS,
+        )));
         Ok(Self {
             rule_state: Mutex::new(rule_state),
             correlator: Mutex::new(correlator::CorrelationEngine::new()),
             ml_scorer: Mutex::new(Self::load_correlation_scorer(model_root)),
             sigma: Mutex::new(load_sigma_rules(&content_root).into_option()),
             yara: Mutex::new(
-                start_yara(&content_root, alert_log.clone(), response.clone()).into_option(),
+                start_yara(
+                    &content_root,
+                    alert_log.clone(),
+                    response.clone(),
+                    verdict.clone(),
+                )
+                .into_option(),
             ),
             alert_log,
             enrich_queue,
             progress: Arc::new(AtomicU64::new(0)),
             response,
-            verdict: Mutex::new(verdict::VerdictEngine::new(VERDICT_DEDUP_WINDOW_NS)),
+            verdict,
             content_root,
         })
     }
@@ -260,6 +269,7 @@ impl DetectionSink {
             &self.content_root,
             self.alert_log.clone(),
             self.response.clone(),
+            self.verdict.clone(),
         );
 
         // The replaced engines are dropped after the locks are released: a
@@ -633,7 +643,15 @@ impl DetectionSink {
         if event.flags & 0o103 != 0
             && let Some((yara, _)) = self.yara.lock().unwrap().as_ref()
         {
-            yara.enqueue(std::path::PathBuf::from(&event.path));
+            let meta = wrapped.meta();
+            yara.enqueue_for(
+                std::path::PathBuf::from(&event.path),
+                yara::ScanContext {
+                    ppid: meta.ppid,
+                    comm: meta.comm.clone(),
+                    timestamp_ns: meta.timestamp_ns,
+                },
+            );
         }
     }
 
@@ -885,6 +903,7 @@ fn start_yara(
     content_root: &Path,
     alert_log: Arc<AlertLog>,
     response: Arc<Mutex<Option<ResponseHooks>>>,
+    verdict: Arc<Mutex<verdict::VerdictEngine>>,
 ) -> Load<(yara::ScanQueue, usize)> {
     let dir = content_root.join("rules/yara");
     if !dir.is_dir() {
@@ -896,6 +915,11 @@ fn start_yara(
             tracing::info!(rules = rule_count, "yara: rules loaded");
             let queue = yara::ScanQueue::start(rules, move |outcome| {
                 let matched = !outcome.matches.is_empty();
+                if let Some(context) = &outcome.context {
+                    for rule in &outcome.matches {
+                        fuse_yara_match(&verdict, context, rule);
+                    }
+                }
                 for rule in &outcome.matches {
                     let message = format!(
                         "yara rule {} matched {}",
@@ -915,6 +939,36 @@ fn start_yara(
             Load::Failed
         }
     }
+}
+
+/// Issue #614: folds a YARA match into the verdict of the process that wrote the
+/// scanned file, keyed by the rule's ATT&CK technique so the same behavior flagged
+/// by a native rule or Sigma on that entity inside the dedup window stays one
+/// finding. The match still gets its own `YARA` line in the alert log (the audit
+/// trail); this is the fused, bounded view only. The detection is stamped with the
+/// triggering event's timestamp, the clock the entity's other findings use.
+fn fuse_yara_match(
+    verdict: &Mutex<verdict::VerdictEngine>,
+    context: &yara::ScanContext,
+    rule: &yara::YaraMatch,
+) -> Option<verdict::Verdict> {
+    let detection = schema::detection::Detection {
+        timestamp_ns: context.timestamp_ns,
+        severity: rule.severity,
+        title: format!("yara rule {} matched", rule.identifier),
+        source: schema::detection::DetectionSource::Yara {
+            rule_name: rule.identifier.clone(),
+        },
+        score: None,
+        attributions: Vec::new(),
+        techniques: techniques_from(&rule.technique),
+        events: Vec::new(),
+    };
+    let entity = verdict::EntityKey::new(context.ppid, context.comm.clone());
+    verdict
+        .lock()
+        .unwrap()
+        .record(entity, &rule.technique, detection, context.timestamp_ns)
 }
 
 /// Issue #25: policy-gates quarantining a YARA-confirmed payload. A no-op whenever
@@ -1826,6 +1880,117 @@ detection:
             .peek(&verdict::EntityKey::new(1, "bash"))
             .expect("the Sigma hit is folded into the entity's verdict");
         assert_eq!(verdict.severity, schema::detection::Severity::Critical);
+    }
+
+    fn yara_match(technique: &str, severity: schema::detection::Severity) -> yara::YaraMatch {
+        yara::YaraMatch {
+            identifier: "response_marker".into(),
+            severity,
+            technique: technique.into(),
+        }
+    }
+
+    fn yara_context(meta: &EventMeta) -> yara::ScanContext {
+        yara::ScanContext {
+            ppid: meta.ppid,
+            comm: meta.comm.clone(),
+            timestamp_ns: meta.timestamp_ns,
+        }
+    }
+
+    /// #614: a native rule and a YARA rule flagging the same technique on the same
+    /// entity are one finding, whichever engine reports first.
+    #[test]
+    fn a_yara_match_and_a_rule_alert_on_the_same_entity_and_technique_are_one_verdict() {
+        let dir = tmp("yara-fusion-dedup");
+        let sink = sink_in(&dir);
+        let meta = schema::fixtures::meta();
+        let entity = verdict::EntityKey::new(meta.ppid, meta.comm.clone());
+        let event = Event::FileOpen(schema::FileOpenEvent {
+            meta: meta.clone(),
+            ..schema::fixtures::file_open()
+        });
+        sink.record_and_emit(
+            &entity,
+            "T1105",
+            "downloader wrote then ran a binary",
+            schema::detection::DetectionSource::Rule {
+                rule_id: "T1105".into(),
+            },
+            schema::detection::Severity::Medium,
+            &event,
+        );
+
+        let absorbed = super::fuse_yara_match(
+            &sink.verdict,
+            &yara_context(&meta),
+            &yara_match("T1105", schema::detection::Severity::Low),
+        );
+        assert_eq!(absorbed, None, "same technique, same entity: a duplicate");
+
+        let fused = sink.verdict.lock().unwrap().peek(&entity).unwrap();
+        assert_eq!(fused.techniques, vec!["T1105"], "one finding, not two");
+        assert_eq!(fused.sources.len(), 2, "both engines are on the evidence");
+        assert_eq!(fused.severity, schema::detection::Severity::Medium);
+    }
+
+    #[test]
+    fn a_yara_match_on_a_different_entity_is_its_own_verdict() {
+        let dir = tmp("yara-fusion-entity");
+        let sink = sink_in(&dir);
+        let meta = EventMeta {
+            ppid: 900,
+            comm: "dropper".into(),
+            ..schema::fixtures::meta()
+        };
+        let fused = super::fuse_yara_match(
+            &sink.verdict,
+            &yara_context(&meta),
+            &yara_match("T1105", schema::detection::Severity::High),
+        )
+        .expect("first sighting on this entity");
+        assert_eq!(fused.entity, verdict::EntityKey::new(900, "dropper"));
+        assert_eq!(fused.severity, schema::detection::Severity::High);
+        assert_eq!(
+            fused.sources,
+            vec![schema::detection::DetectionSource::Yara {
+                rule_name: "response_marker".into()
+            }]
+        );
+    }
+
+    /// End to end: the scan runs on its own thread after the settle delay, and the
+    /// match must still land on the process that wrote the file.
+    #[test]
+    fn a_scanned_payloads_match_reaches_the_verdict_of_the_process_that_wrote_it() {
+        let dir = tmp("yara-fusion-e2e");
+        let yara_dir = dir.join("content").join("rules").join("yara");
+        std::fs::create_dir_all(&yara_dir).unwrap();
+        std::fs::write(yara_dir.join("marker.yar"), RESPONSE_MARKER_RULE).unwrap();
+        let payload = dir.join("payload.bin");
+        std::fs::write(&payload, b"dropped payload RESPONSE-SCENARIO-MARKER").unwrap();
+        let sink = sink_in(&dir);
+        assert_eq!(sink.reload_content().yara_rule_count, Some(1));
+
+        let meta = EventMeta {
+            ppid: 777,
+            comm: "dropper".into(),
+            ..schema::fixtures::meta()
+        };
+        sink.on_event(Event::FileOpen(schema::FileOpenEvent {
+            meta,
+            path: payload.display().to_string(),
+            flags: 0o101,
+        }));
+        wait_for_alert(&dir, "YARA");
+
+        let fused = sink
+            .verdict
+            .lock()
+            .unwrap()
+            .peek(&verdict::EntityKey::new(777, "dropper"))
+            .expect("the match is folded into the writer's verdict");
+        assert_eq!(fused.techniques, vec!["T1105"]);
     }
 
     #[test]
