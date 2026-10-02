@@ -164,9 +164,11 @@ pub struct LogConfig {
 pub struct StorageConfig {
     /// Root directory for agent state (spool, cache, model registry).
     pub state_dir: PathBuf,
-    /// Maximum on-disk size of the event spool, in mebibytes. Enforced at
-    /// boot — the spooler refuses to start if it can't reserve this much
-    /// under [`Self::state_dir`].
+    /// Maximum on-disk size of the event spool, in mebibytes: the cap the upload
+    /// spool is opened with (#604; it used to be a fixed 64 MiB whatever this said).
+    /// Past it the oldest segments are shed and counted as `spool_dropped` in the
+    /// health beacon. A cap, not a reservation: nothing is preallocated and the
+    /// agent does not check that the disk has this much room.
     #[serde(default = "default_spool_max_mb")]
     pub spool_max_mb: u64,
 }

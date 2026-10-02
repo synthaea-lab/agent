@@ -319,7 +319,7 @@ fn main() -> anyhow::Result<()> {
             commands::cmd_run(commands::RunOptions {
                 alerts: &alerts,
                 events: events.as_deref(),
-                state_dir: &cfg.storage.state_dir,
+                storage: &cfg.storage,
                 enable_kill,
                 enable_quarantine,
                 enable_tls_capture,
