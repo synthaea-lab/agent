@@ -92,6 +92,8 @@ max_reconnect_backoff_ms = 60000
 # Today only mysql_error is read; the access_* kinds are accepted and logged as
 # not yet active. `mysql_error` needs the error log to be a FILE: Debian/Ubuntu
 # MariaDB logs to the journal by default, so set `log_error` in the server first.
+# MySQL 8 writes the failed-login lines only at `log_error_verbosity = 3` (its default
+# of 2 writes none, so the source would stay silent).
 # The agent must be able to read it (root, or CAP_DAC_READ_SEARCH).
 # [[logs.sources]]
 # path = "/var/log/mysql/error.log"
