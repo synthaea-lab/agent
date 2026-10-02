@@ -13,10 +13,15 @@
 //! refused. A short settle delay runs before each scan so a just-opened-for-write
 //! file has content by the time it is read.
 
+pub mod memory;
 mod queue;
 
 use std::{collections::HashMap, path::Path};
 
+pub use memory::{
+    MemoryBudget, MemoryRegion, MemoryScanOutcome, MemoryScanQueue, MemoryScanReport,
+    MemoryScanStats, MemorySource, RegionKind, RegionPerms, scan_memory,
+};
 pub use queue::{ScanContext, ScanOutcome, ScanQueue, ScanStats};
 use schema::detection::Severity;
 
@@ -187,9 +192,20 @@ impl RuleSet {
             tracing::debug!(path = %path.display(), "yara: grew past the scan budget, skipping");
             return Ok(Vec::new());
         }
+        self.scan_bytes(&data, &path.display().to_string())
+    }
+
+    /// Scans an in-memory buffer (a file's contents, or one process memory region,
+    /// see [`memory`]), returning the matching rules. `origin` names the buffer in
+    /// an engine error (a path, or `pid 123 0x7f00..0x7f10`).
+    ///
+    /// # Errors
+    ///
+    /// [`YaraError::Compile`] when the scan fails inside the engine.
+    pub fn scan_bytes(&self, data: &[u8], origin: &str) -> Result<Vec<YaraMatch>, YaraError> {
         let mut scanner = yara_x::Scanner::new(&self.rules);
-        let results = scanner.scan(&data).map_err(|e| YaraError::Compile {
-            path: path.display().to_string(),
+        let results = scanner.scan(data).map_err(|e| YaraError::Compile {
+            path: origin.to_string(),
             message: e.to_string(),
         })?;
         Ok(results
@@ -199,7 +215,7 @@ impl RuleSet {
                 // Every rule in `self.rules` got a metadata entry from the same
                 // `rules.iter()` pass in `from_compiled` — this is defensive, not
                 // expected to ever fall back, kept panic-free because scanning runs
-                // on attacker-influenced file content.
+                // on attacker-influenced content.
                 let found = self.metadata.get(&identifier);
                 let severity = found.map_or(Severity::Low, |m| m.severity);
                 let technique = found.map_or_else(String::new, |m| m.technique.clone());
