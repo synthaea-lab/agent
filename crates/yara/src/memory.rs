@@ -249,7 +249,7 @@ pub struct MemoryScanOutcome {
 /// Counters of the memory-scan queue: every scan not run is accounted for by a reason.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MemoryScanStats {
-    /// Scans that ran to a report.
+    /// Scans fully handled: ran to a report and, if it matched, the callback returned.
     pub scanned: u64,
     /// Requests dropped because the queue was full.
     pub shed_queue_full: u64,
@@ -326,7 +326,6 @@ impl MemoryScanQueue {
                 {
                     match scan_memory(&rules, source.as_ref(), pid, &budget) {
                         Ok(report) => {
-                            scanned_w.fetch_add(1, Ordering::Relaxed);
                             if !report.matches.is_empty() {
                                 on_match(MemoryScanOutcome {
                                     pid,
@@ -335,6 +334,9 @@ impl MemoryScanQueue {
                                     report,
                                 });
                             }
+                            // After the callback, so "scanned" means fully handled and a
+                            // caller waiting on it never beats the match it is waiting for.
+                            scanned_w.fetch_add(1, Ordering::Relaxed);
                         }
                         // Exited, or no right to read it: the normal outcomes, counted.
                         Err(e) => {
