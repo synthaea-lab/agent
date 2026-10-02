@@ -45,11 +45,12 @@ pub(crate) fn wire_run_pipeline(
     server: Option<&str>,
     ipc_endpoint: &str,
     content_dir: &std::path::Path,
-    state_dir: &std::path::Path,
+    storage: &config::StorageConfig,
 ) -> anyhow::Result<RunPipeline> {
     // Transport first: the sink needs the spool handle at construction.
+    let spool_cap = crate::upload::spool_cap_bytes(storage.spool_max_mb);
     let transport = server
-        .map(|url| crate::upload::start(url, alerts))
+        .map(|url| crate::upload::start(url, alerts, spool_cap))
         .transpose()?;
     let spool = transport.as_ref().map(|t| Arc::clone(&t.spool));
 
@@ -59,7 +60,7 @@ pub(crate) fn wire_run_pipeline(
         events,
         spool,
         content_dir,
-        &crate::sink::model_root(state_dir),
+        &crate::sink::model_root(&storage.state_dir),
     )?);
 
     eprintln!("Synthaea agent — detection active (Ctrl-C to stop)");
