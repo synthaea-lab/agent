@@ -657,6 +657,12 @@ impl DetectionSink {
                     comm: meta.comm.clone(),
                     parent_generation: meta.parent_process_generation,
                     timestamp_ns: meta.timestamp_ns,
+                    // The path is whatever the process named, even when the kernel
+                    // refused the open: scan it only if that user could read it (#594).
+                    requester: match meta.user {
+                        schema::User::Unix { uid, gid } => Some(yara::Requester { uid, gid }),
+                        _ => None,
+                    },
                 },
             );
         }
@@ -1922,6 +1928,7 @@ detection:
             comm: meta.comm.clone(),
             parent_generation: meta.parent_process_generation,
             timestamp_ns: meta.timestamp_ns,
+            requester: None,
         }
     }
 
