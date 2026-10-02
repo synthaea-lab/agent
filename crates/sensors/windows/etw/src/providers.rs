@@ -672,10 +672,21 @@ pub(crate) fn ntlm_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         if !state.ntlm.lock().unwrap().first(&key, timestamp_ns) {
             return;
         }
-        let pid =
-            normalize::parse_ntlm_pid(&text("ProcessPID")).unwrap_or_else(|| record.process_id());
+        // `ProcessPID` and `Status` are integers the event viewer *displays*
+        // in hex (`0x4`, `0xc000006d`): a string parse fails on them (lab:
+        // the header pid, lsass, and an empty status came out). Integer
+        // first, the string forms as a fallback.
+        let pid = parser
+            .try_parse::<u32>("ProcessPID")
+            .ok()
+            .or_else(|| normalize::parse_ntlm_pid(&text("ProcessPID")))
+            .unwrap_or_else(|| record.process_id());
         let status = match direction {
-            NtlmDirection::Incoming => Some(text("Status")).filter(|s| s.starts_with("0x")),
+            NtlmDirection::Incoming => parser
+                .try_parse::<u32>("Status")
+                .map(|s| format!("{s:#010x}"))
+                .ok()
+                .or_else(|| Some(text("Status")).filter(|s| s.starts_with("0x"))),
             NtlmDirection::Outgoing => None,
         };
         let comm = state.comm_for(pid).unwrap_or_else(|| text("ProcessName"));
