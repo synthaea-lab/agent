@@ -12,6 +12,8 @@ Group=synthaea
 # Bootstrap setup: create symlinks and directories on first start (issue #36)
 ExecStartPre=/bin/sh -c 'test -e /var/lib/synthaea/current || ln -s bootstrap /var/lib/synthaea/current'
 ExecStartPre=/bin/sh -c 'test -d /var/lib/synthaea/versions || mkdir -p /var/lib/synthaea/versions'
+# Use the package-installed bootstrap watchdog to recover a release that cannot exec.
+ExecStartPre=/var/lib/synthaea/bootstrap/watchdog recover --base-dir /var/lib/synthaea
 
 # Use updater-managed current symlink, fallback to bootstrap
 ExecStart=/var/lib/synthaea/current/watchdog run \
