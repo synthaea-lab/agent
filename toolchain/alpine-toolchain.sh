@@ -118,7 +118,7 @@ echo "== bindgen-cli + aya-tool =="
 # works fine static-pie, no rebuild needed.
 command -v bindgen >/dev/null 2>&1 \
   || RUSTFLAGS="-C target-feature=-crt-static" cargo install bindgen-cli --locked
-command -v aya-tool >/dev/null 2>&1 || cargo install --git https://github.com/aya-rs/aya aya-tool
+command -v aya-tool >/dev/null 2>&1 || cargo +stable install --git https://github.com/aya-rs/aya aya-tool
 
 for tool in bindgen aya-tool bpf-linker; do
   [ -x "$HOME/.cargo/bin/$tool" ] && sudo ln -sf "$HOME/.cargo/bin/$tool" "/usr/local/bin/$tool"
