@@ -31,12 +31,12 @@ use crate::sink::DetectionSink;
 /// Best-effort on the executable path: `current_exe` can fail (rare — e.g. the binary
 /// was unlinked out from under a running process), in which case the binary just isn't
 /// watched rather than failing agent startup over a self-protection nicety.
-pub(crate) fn protected_paths(alerts: &Path, events: &Path) -> Vec<PathBuf> {
+pub(crate) fn protected_paths(alerts: &Path, events: Option<&Path>) -> Vec<PathBuf> {
     let mut paths = vec![
         alerts.to_path_buf(),
-        events.to_path_buf(),
         crate::heartbeat::heartbeat_path_for(alerts),
     ];
+    paths.extend(events.map(Path::to_path_buf));
     if let Ok(exe) = std::env::current_exe() {
         paths.push(exe);
     }
@@ -127,6 +127,16 @@ mod tests {
     const O_RDONLY: u32 = 0o0;
 
     #[test]
+    fn protected_paths_skip_the_events_file_when_there_is_none() {
+        let alerts = std::path::Path::new("/var/log/synthaea/alerts.ndjson");
+        let without = protected_paths(alerts, None);
+        assert!(without.iter().all(|p| !p.ends_with("events.jsonl")));
+        assert!(without.contains(&alerts.to_path_buf()));
+        let with = protected_paths(alerts, Some(std::path::Path::new("/tmp/e")));
+        assert!(with.contains(&std::path::PathBuf::from("/tmp/e")));
+    }
+
+    #[test]
     fn matches_protected_tolerates_a_dfd_relative_suffix() {
         assert!(matches_protected(Path::new("/opt/synthaea/agent"), "agent"));
         assert!(!matches_protected(
@@ -148,17 +158,18 @@ mod tests {
             DetectionSink::new(
                 rules::RuleState::new(),
                 &alerts,
-                &events,
+                Some(&events),
                 None,
                 None,
                 &alerts_dir.join("content"),
+                &alerts_dir.join("ml-registry"),
             )
             .unwrap(),
         );
 
         let guard = ProtectedResourceGuard::new(
             CountingSink(forwarded.clone()),
-            protected_paths(&alerts, &events),
+            protected_paths(&alerts, Some(&events)),
             sink,
         );
 
@@ -191,17 +202,18 @@ mod tests {
             DetectionSink::new(
                 rules::RuleState::new(),
                 &alerts,
-                &events,
+                Some(&events),
                 None,
                 None,
                 &alerts_dir.join("content"),
+                &alerts_dir.join("ml-registry"),
             )
             .unwrap(),
         );
 
         let guard = ProtectedResourceGuard::new(
             CountingSink(forwarded.clone()),
-            protected_paths(&alerts, &events),
+            protected_paths(&alerts, Some(&events)),
             sink,
         );
 
@@ -233,17 +245,18 @@ mod tests {
             DetectionSink::new(
                 rules::RuleState::new(),
                 &alerts,
-                &events,
+                Some(&events),
                 None,
                 None,
                 &alerts_dir.join("content"),
+                &alerts_dir.join("ml-registry"),
             )
             .unwrap(),
         );
 
         let guard = ProtectedResourceGuard::new(
             CountingSink(forwarded.clone()),
-            protected_paths(&alerts, &events),
+            protected_paths(&alerts, Some(&events)),
             sink,
         );
 

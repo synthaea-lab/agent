@@ -248,6 +248,10 @@ sudo restorecon -R /var/lib/synthaea /var/log/synthaea
 ```
 Files written by the updater into `versions/vN/` inherit `var_lib_t` from the
 directory and need a `restorecon` before they can be executed on an Enforcing host.
+`agent apply-release` runs `restorecon -R` on the staged release itself, before it
+promotes it (#559): on an Enforcing host it refuses the release, leaving `current`
+untouched, if `restorecon` is missing or fails; on a Permissive host it warns and
+promotes. A manual copy still needs the command above.
 
 **Temporary workaround (testing only):**
 ```bash
@@ -295,7 +299,7 @@ packaging/linux/
 2. **APT/YUM Repository** - Host packages in proper repos for `apt install synthaea-agent`
 3. **musl Static Builds** - `.tar.gz` distribution for containers
 4. **SELinux Custom Policy** - RHEL hardening (deferred to issue #112)
-5. **Capability Management** - Fine-grained privileges for sensors
+5. **Capability Management** - The unit grants a minimal ambient capability set (ADR-0014); `CAP_SYS_PTRACE`, `CAP_CHOWN`/`CAP_FOWNER` and the audit capabilities are added with the features that need them
 6. **Configuration Format** - Currently placeholder (blocked on issue #19)
 
 ---

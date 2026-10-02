@@ -46,6 +46,8 @@ mod ipc_handler;
 mod journal_cursor;
 #[cfg(target_os = "linux")]
 mod kill_loudness;
+#[cfg(target_os = "linux")]
+mod log_sources;
 mod protected;
 mod quarantine_cmd;
 mod release;
@@ -89,9 +91,11 @@ enum Command {
         #[arg(long, default_value = "alerts.ndjson")]
         alerts: std::path::PathBuf,
         /// JSON-Lines file every normalized event is appended to (raw capture,
-        /// consumed by ML calibration and lab assertions).
-        #[arg(long, default_value = "events.jsonl")]
-        events: std::path::PathBuf,
+        /// consumed by ML calibration and lab assertions). Off unless given: the
+        /// file grows without bound and is no part of a production run, so the
+        /// packaged service never writes it (#559).
+        #[arg(long)]
+        events: Option<std::path::PathBuf>,
         /// Enables automated process termination on a high-confidence correlated
         /// verdict (issue #25). Off by default: observe-only — logs what would have
         /// been killed without acting. See `policy::ResponsePolicy`.
@@ -314,8 +318,8 @@ fn main() -> anyhow::Result<()> {
                 content_dir.unwrap_or_else(|| content::default_content_dir(&cfg.storage.state_dir));
             commands::cmd_run(commands::RunOptions {
                 alerts: &alerts,
-                events: &events,
-                state_dir: &cfg.storage.state_dir,
+                events: events.as_deref(),
+                storage: &cfg.storage,
                 enable_kill,
                 enable_quarantine,
                 enable_tls_capture,
@@ -323,6 +327,7 @@ fn main() -> anyhow::Result<()> {
                 enable_dns_capture,
                 server: server.as_deref(),
                 ipc_endpoint: &cfg.ipc.endpoint,
+                log_sources: &cfg.logs.sources,
                 content_dir: &content_dir,
             })
         }

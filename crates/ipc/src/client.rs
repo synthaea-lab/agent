@@ -19,7 +19,7 @@ use crate::{
     protocol::{
         ClientHello, PROTOCOL_VERSION, PolicyVersionResponse, RecentDetectionsResponse,
         ReloadContentResponse, Request, Response, SensorHealthResponse, ServerHello,
-        StatusResponse, WireError,
+        StatusResponse, SuppressionResponse, WireError,
     },
     stream::{Stream, connect},
 };
@@ -177,6 +177,54 @@ impl Client {
             Response::ReloadContent(r) => Ok(r),
             Response::Error(e) => Err(refused_from(e)),
             other => Err(mismatched_response(&other, "reload_content")),
+        }
+    }
+
+    /// Silence `technique` on the entity `(ppid, comm)` in the agent's fused
+    /// verdict (issue #613). `changed` is `false` when it already was.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::status`].
+    pub async fn suppress_verdict(
+        &mut self,
+        ppid: u32,
+        comm: &str,
+        technique: &str,
+    ) -> Result<SuppressionResponse, ClientError> {
+        let request = Request::SuppressVerdict {
+            ppid,
+            comm: comm.to_string(),
+            technique: technique.to_string(),
+        };
+        match self.call(request).await? {
+            Response::Suppression(r) => Ok(r),
+            Response::Error(e) => Err(refused_from(e)),
+            other => Err(mismatched_response(&other, "suppress_verdict")),
+        }
+    }
+
+    /// Lift a suppression made with [`Self::suppress_verdict`]. `changed` is
+    /// `false` when there was none.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::status`].
+    pub async fn unsuppress_verdict(
+        &mut self,
+        ppid: u32,
+        comm: &str,
+        technique: &str,
+    ) -> Result<SuppressionResponse, ClientError> {
+        let request = Request::UnsuppressVerdict {
+            ppid,
+            comm: comm.to_string(),
+            technique: technique.to_string(),
+        };
+        match self.call(request).await? {
+            Response::Suppression(r) => Ok(r),
+            Response::Error(e) => Err(refused_from(e)),
+            other => Err(mismatched_response(&other, "unsuppress_verdict")),
         }
     }
 }

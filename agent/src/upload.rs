@@ -26,10 +26,16 @@ use transport::{
 
 use crate::shutdown::ShutdownPlan;
 
-/// On-disk cap for the spool. Beyond it the spool sheds oldest and counts
-/// (`store::EventSpool`'s own policy) — visible in the health beacon as
-/// `spool_dropped`, never a blocked capture path.
-const SPOOL_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// The spool's on-disk cap in bytes, from `storage.spool_max_mb` (mebibytes, as the
+/// configuration documents; 4096 by default). Beyond it the spool sheds oldest and
+/// counts (`store::EventSpool`'s own policy) — visible in the health beacon as
+/// `spool_dropped`, never a blocked capture path. Saturates instead of wrapping, and
+/// the configuration already rejects 0 at load, so the cap is never 0.
+///
+/// Until #604 this was a hard-coded 64 MiB and the configured value was never read.
+pub(crate) fn spool_cap_bytes(spool_max_mb: u64) -> u64 {
+    spool_max_mb.saturating_mul(1024 * 1024)
+}
 
 /// How long the upload loop sleeps when the spool is empty. Uploads are
 /// batched and latency-tolerant by design (store-and-forward); detection is
@@ -108,8 +114,8 @@ impl EventDrain for SpoolDrain {
 pub(crate) struct TransportHandle {
     pub(crate) spool: Arc<Mutex<EventSpool>>,
     pub(crate) detection_spool: Arc<Mutex<EventSpool>>,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    // heartbeat wiring is Linux-first (#25 precedent)
+    // Read by the health beacon, which macOS doesn't wire yet (#317).
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     pub(crate) client: Arc<TransportClient>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // graceful shutdown is Linux-first
     upload_stop: Arc<AtomicBool>,
@@ -141,9 +147,13 @@ impl TransportHandle {
 /// Opens the spool (next to the alerts file — the same "derived, no separate
 /// flag" convention as `quarantine/` and the heartbeat file) and starts the
 /// upload thread against `server_url`.
-pub(crate) fn start(server_url: &str, alerts: &Path) -> anyhow::Result<TransportHandle> {
+pub(crate) fn start(
+    server_url: &str,
+    alerts: &Path,
+    spool_max_bytes: u64,
+) -> anyhow::Result<TransportHandle> {
     let dir = alerts.with_file_name("spool");
-    let spool = Arc::new(Mutex::new(EventSpool::open(&dir, SPOOL_MAX_BYTES)?));
+    let spool = Arc::new(Mutex::new(EventSpool::open(&dir, spool_max_bytes)?));
     let detection_dir = alerts.with_file_name("detection-spool");
     let detection_spool = Arc::new(Mutex::new(EventSpool::open_with_segment_records(
         &detection_dir,
@@ -194,7 +204,7 @@ pub(crate) fn start(server_url: &str, alerts: &Path) -> anyhow::Result<Transport
 
 /// The health beacon's view of the spool (`spool_bytes`/`spool_dropped` in
 /// #134's beacon) — replaces `health::NoopSpoolStats` when transport is on.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // health collector is Linux-first (#25 precedent)
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))] // no health beacon on macOS yet (#317)
 pub(crate) struct SpoolHealth {
     pub(crate) events: Arc<Mutex<EventSpool>>,
     pub(crate) detections: Arc<Mutex<EventSpool>>,
@@ -219,6 +229,20 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn the_spool_cap_follows_the_configured_mebibytes() {
+        assert_eq!(spool_cap_bytes(1), 1024 * 1024);
+        assert_eq!(spool_cap_bytes(64), 64 * 1024 * 1024);
+        // The documented default, 4096 MiB, is 4 GiB: not the old hard-coded 64 MiB.
+        assert_eq!(spool_cap_bytes(4096), 4 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn an_absurd_configured_value_saturates_instead_of_wrapping() {
+        assert_eq!(spool_cap_bytes(u64::MAX), u64::MAX);
+        assert!(spool_cap_bytes(u64::MAX / 2) > spool_cap_bytes(4096));
+    }
 
     fn spool(name: &str) -> Arc<Mutex<EventSpool>> {
         let dir = std::env::temp_dir().join(format!("agent-upload-{name}-{}", std::process::id()));

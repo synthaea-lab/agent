@@ -640,6 +640,11 @@ fn emit_file_delete_event(ctx: &TracePointContext, pathname_ptr: u64) -> Result<
     Ok(0)
 }
 
+/// `AT_FDCWD`: the "directory fd" `rename(2)` implicitly has, and what a `renameat`
+/// caller passes to mean the current directory (#515). Userspace resolves a relative
+/// path against the renaming process's cwd when it sees it.
+const AT_FDCWD: i32 = -100;
+
 /// Offsets of the `syscalls:sys_enter_rename` tracepoint (x86_64/aarch64):
 /// `oldname`(16), `newname`(24). Verified on 2026-09-21 on Alpine
 /// (kernel 6.18.50-0-virt, x86_64) via
@@ -659,10 +664,18 @@ const RENAME_NEWNAME_PTR_OFFSET: usize = 16;
 /// on Alpine (kernel 6.18.50-0-virt, x86_64) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_renameat/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const RENAMEAT_OLDDFD_OFFSET: usize = 16;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const RENAMEAT_NEWDFD_OFFSET: usize = 32;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const RENAMEAT_OLDNAME_PTR_OFFSET: usize = 24;
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const RENAMEAT_NEWNAME_PTR_OFFSET: usize = 40;
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
+#[cfg(bpf_target_arch = "x86")]
+const RENAMEAT_OLDDFD_OFFSET: usize = 12;
+#[cfg(bpf_target_arch = "x86")]
+const RENAMEAT_NEWDFD_OFFSET: usize = 20;
 #[cfg(bpf_target_arch = "x86")]
 const RENAMEAT_OLDNAME_PTR_OFFSET: usize = 16;
 #[cfg(bpf_target_arch = "x86")]
@@ -675,10 +688,18 @@ const RENAMEAT_NEWNAME_PTR_OFFSET: usize = 24;
 /// oldname/newname offsets as `renameat` above (the trailing `flags` field doesn't
 /// shift them).
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const RENAMEAT2_OLDDFD_OFFSET: usize = 16;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const RENAMEAT2_NEWDFD_OFFSET: usize = 32;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const RENAMEAT2_OLDNAME_PTR_OFFSET: usize = 24;
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const RENAMEAT2_NEWNAME_PTR_OFFSET: usize = 40;
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
+#[cfg(bpf_target_arch = "x86")]
+const RENAMEAT2_OLDDFD_OFFSET: usize = 12;
+#[cfg(bpf_target_arch = "x86")]
+const RENAMEAT2_NEWDFD_OFFSET: usize = 20;
 #[cfg(bpf_target_arch = "x86")]
 const RENAMEAT2_OLDNAME_PTR_OFFSET: usize = 16;
 #[cfg(bpf_target_arch = "x86")]
@@ -708,7 +729,7 @@ fn try_sys_enter_rename(ctx: TracePointContext) -> Result<u32, u32> {
             .map_err(|_| 1u32)? as u64
     };
 
-    emit_file_rename_event(&ctx, oldname_ptr, newname_ptr)
+    emit_file_rename_event(&ctx, AT_FDCWD, oldname_ptr, AT_FDCWD, newname_ptr)
 }
 
 #[tracepoint]
@@ -735,7 +756,30 @@ fn try_sys_enter_renameat(ctx: TracePointContext) -> Result<u32, u32> {
             .map_err(|_| 1u32)? as u64
     };
 
-    emit_file_rename_event(&ctx, oldname_ptr, newname_ptr)
+    // The tracepoint field is a `long` holding an `int`: the low 32 bits are the fd,
+    // little-endian on every supported target (#515).
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let olddfd: i32 = unsafe {
+        ctx.read_at::<u64>(RENAMEAT_OLDDFD_OFFSET)
+            .map_err(|_| 1u32)?
+    } as i32;
+    #[cfg(bpf_target_arch = "x86")]
+    let olddfd: i32 = unsafe {
+        ctx.read_at::<u32>(RENAMEAT_OLDDFD_OFFSET)
+            .map_err(|_| 1u32)?
+    } as i32;
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let newdfd: i32 = unsafe {
+        ctx.read_at::<u64>(RENAMEAT_NEWDFD_OFFSET)
+            .map_err(|_| 1u32)?
+    } as i32;
+    #[cfg(bpf_target_arch = "x86")]
+    let newdfd: i32 = unsafe {
+        ctx.read_at::<u32>(RENAMEAT_NEWDFD_OFFSET)
+            .map_err(|_| 1u32)?
+    } as i32;
+
+    emit_file_rename_event(&ctx, olddfd, oldname_ptr, newdfd, newname_ptr)
 }
 
 #[tracepoint]
@@ -768,13 +812,38 @@ fn try_sys_enter_renameat2(ctx: TracePointContext) -> Result<u32, u32> {
             .map_err(|_| 1u32)? as u64
     };
 
-    emit_file_rename_event(&ctx, oldname_ptr, newname_ptr)
+    // The tracepoint field is a `long` holding an `int`: the low 32 bits are the fd,
+    // little-endian on every supported target (#515).
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let olddfd: i32 = unsafe {
+        ctx.read_at::<u64>(RENAMEAT2_OLDDFD_OFFSET)
+            .map_err(|_| 1u32)?
+    } as i32;
+    #[cfg(bpf_target_arch = "x86")]
+    let olddfd: i32 = unsafe {
+        ctx.read_at::<u32>(RENAMEAT2_OLDDFD_OFFSET)
+            .map_err(|_| 1u32)?
+    } as i32;
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let newdfd: i32 = unsafe {
+        ctx.read_at::<u64>(RENAMEAT2_NEWDFD_OFFSET)
+            .map_err(|_| 1u32)?
+    } as i32;
+    #[cfg(bpf_target_arch = "x86")]
+    let newdfd: i32 = unsafe {
+        ctx.read_at::<u32>(RENAMEAT2_NEWDFD_OFFSET)
+            .map_err(|_| 1u32)?
+    } as i32;
+
+    emit_file_rename_event(&ctx, olddfd, oldname_ptr, newdfd, newname_ptr)
 }
 
 /// Shared by `sys_enter_rename`/`sys_enter_renameat`/`sys_enter_renameat2` above.
 fn emit_file_rename_event(
     ctx: &TracePointContext,
+    olddfd: i32,
     oldname_ptr: u64,
+    newdfd: i32,
     newname_ptr: u64,
 ) -> Result<u32, u32> {
     let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
@@ -789,6 +858,8 @@ fn emit_file_rename_event(
         (*e).meta.gid = (uid_gid >> 32) as u32;
         (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
         (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
+        (*e).old_dfd = olddfd;
+        (*e).new_dfd = newdfd;
         let mut i = 0usize;
         while i < TASK_COMM_LEN {
             (*e).meta.comm[i] = comm[i];

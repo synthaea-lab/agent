@@ -22,12 +22,29 @@ ExecStart=/var/lib/synthaea/current/watchdog run \
 Restart=always
 RestartSec=5s
 
+# Capabilities (#559, ADR-0014): the agent runs as the unprivileged `synthaea` user and is
+# granted only these, as ambient capabilities so the watchdog's agent child inherits them
+# across exec. Everything else is dropped from the bounding set, so a bug in a sensor is
+# not a root bug. Granted, each for a feature checked against the code:
+#   CAP_BPF CAP_PERFMON      load programs, attach tracepoints/kprobes (eBPF sensor)
+#   CAP_SYS_RESOURCE         raise RLIMIT_MEMLOCK for the BPF maps
+#   CAP_DAC_READ_SEARCH      read /proc/<pid>/* and files of other users (hashing, cmdline)
+#   CAP_NET_ADMIN            conntrack netlink (network flows)
+#   CAP_KILL                 signal other users' processes (response action, off by default)
+# Deliberately not granted until a feature check on a real host shows the need:
+#   CAP_SYS_PTRACE (`/proc/<pid>/exe` of other users), CAP_CHOWN/CAP_FOWNER/CAP_DAC_OVERRIDE
+#   (quarantine of files the agent does not own), CAP_AUDIT_* (audit fallback sensor).
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_DAC_READ_SEARCH CAP_NET_ADMIN CAP_KILL
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_DAC_READ_SEARCH CAP_NET_ADMIN CAP_KILL
+
 # Security hardening
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/synthaea /var/log/synthaea /run/synthaea
+# /sys/fs/bpf/synthaea is where the sensor pins its tamper map (created by tmpfiles); the
+# leading `-` keeps the unit startable on a host without bpffs.
+ReadWritePaths=/var/lib/synthaea /var/log/synthaea /run/synthaea -/sys/fs/bpf/synthaea
 
 # Logging to systemd journal
 StandardOutput=journal

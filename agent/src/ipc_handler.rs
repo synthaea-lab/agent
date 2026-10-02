@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock};
 use ipc::{
     DetectionSummary, Handler, PolicyVersionResponse, RecentDetectionsResponse,
     ReloadContentResponse, SensorHealth, SensorHealthResponse, SensorState, Server, StatusResponse,
+    SuppressionEntry, SuppressionResponse,
 };
 
 use crate::{
@@ -31,8 +32,9 @@ pub(crate) struct AgentHandler {
     started_at_ns: u64,
     alerts: Arc<AlertLog>,
     sensors: SensorHealthSlot,
-    /// Held only for [`Handler::reload_content`] (issue #30) — every other
-    /// request answers from `alerts`/`sensors` alone.
+    /// Held for [`Handler::reload_content`] (issue #30) and the verdict
+    /// suppression requests (#613), and read for the suppressions `status`
+    /// lists — every other request answers from `alerts`/`sensors` alone.
     sink: Arc<DetectionSink>,
 }
 
@@ -79,6 +81,16 @@ impl Handler for AgentHandler {
             agent_version: self.agent_version.clone(),
             started_at_ns: self.started_at_ns,
             pipeline_healthy,
+            suppressions: self
+                .sink
+                .suppressions()
+                .into_iter()
+                .map(|(ppid, comm, technique)| SuppressionEntry {
+                    ppid,
+                    comm,
+                    technique,
+                })
+                .collect(),
         })
     }
 
@@ -120,6 +132,26 @@ impl Handler for AgentHandler {
             sigma_reload_failed: report.sigma_reload_failed,
             yara_reload_failed: report.yara_reload_failed,
         })
+    }
+
+    async fn suppress_verdict(
+        &self,
+        entry: SuppressionEntry,
+    ) -> Result<SuppressionResponse, String> {
+        let changed = self
+            .sink
+            .suppress_verdict(entry.ppid, &entry.comm, &entry.technique)?;
+        Ok(SuppressionResponse { changed })
+    }
+
+    async fn unsuppress_verdict(
+        &self,
+        entry: SuppressionEntry,
+    ) -> Result<SuppressionResponse, String> {
+        let changed = self
+            .sink
+            .unsuppress_verdict(entry.ppid, &entry.comm, &entry.technique);
+        Ok(SuppressionResponse { changed })
     }
 }
 
@@ -212,10 +244,11 @@ mod tests {
             DetectionSink::new(
                 rules::RuleState::new(),
                 &dir.join("alerts.ndjson"),
-                &dir.join("events.jsonl"),
+                Some(&dir.join("events.jsonl")),
                 None,
                 None,
                 &dir.join("content"),
+                &dir.join("ml-registry"),
             )
             .unwrap(),
         )
@@ -280,6 +313,69 @@ mod tests {
         assert_eq!(p.policy_version, None);
         assert_eq!(p.signature_verified, None);
         assert_eq!(p.issued_at_ns, None);
+    }
+
+    fn entry(technique: &str) -> SuppressionEntry {
+        SuppressionEntry {
+            ppid: 7,
+            comm: "bash".into(),
+            technique: technique.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_suppression_is_listed_in_status_audited_and_lifted_again() {
+        let handler = handler_with("suppress", None);
+        assert!(handler.status().await.unwrap().suppressions.is_empty());
+
+        assert!(
+            handler
+                .suppress_verdict(entry("T1059.004"))
+                .await
+                .unwrap()
+                .changed
+        );
+        assert!(
+            !handler
+                .suppress_verdict(entry("T1059.004"))
+                .await
+                .unwrap()
+                .changed,
+            "suppressing the same pair twice changes nothing"
+        );
+        assert_eq!(
+            handler.status().await.unwrap().suppressions,
+            vec![entry("T1059.004")]
+        );
+
+        assert!(
+            handler
+                .unsuppress_verdict(entry("T1059.004"))
+                .await
+                .unwrap()
+                .changed
+        );
+        assert!(handler.status().await.unwrap().suppressions.is_empty());
+
+        // One audit line per actual change, none for the no-op.
+        let audit: Vec<String> = handler
+            .sink
+            .alert_log()
+            .latest(10)
+            .into_iter()
+            .map(|a| a.technique)
+            .collect();
+        assert_eq!(audit, vec!["VERDICT-SUPPRESS", "VERDICT-UNSUPPRESS"]);
+    }
+
+    #[tokio::test]
+    async fn an_empty_technique_or_comm_is_refused() {
+        let handler = handler_with("suppress-empty", None);
+        assert!(handler.suppress_verdict(entry("")).await.is_err());
+        let mut no_comm = entry("T1059.004");
+        no_comm.comm.clear();
+        assert!(handler.suppress_verdict(no_comm).await.is_err());
+        assert!(handler.status().await.unwrap().suppressions.is_empty());
     }
 
     #[tokio::test]

@@ -1,0 +1,12 @@
+{
+  "type": "listen_port",
+  "meta": {
+    "pid": 4242,
+    "ppid": 1,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900090000000000,
+    "comm": "sshd-backdoor"
+  },
+  "local_addr": "0.0.0.0",
+  "local_port": 31337
+}

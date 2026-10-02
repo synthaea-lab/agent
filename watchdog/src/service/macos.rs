@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, bail};
 
 use super::resolve_paths;
-use crate::paths::child_log_path;
 
 const LAUNCHD_LABEL: &str = "com.synthaea.agent";
 const LAUNCHD_PLIST: &str = "/Library/LaunchDaemons/com.synthaea.agent.plist";
@@ -83,10 +82,7 @@ pub(crate) fn cmd_install(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow
     println!("[watchdog] launchd daemon installed and started.");
     println!("  Alerts: {}", paths.alerts_abs.display());
     println!("  Check: watchdog status");
-    println!(
-        "  Logs : /var/log/synthaea-watchdog.log (watchdog); agent output in {}",
-        child_log_path()
-    );
+    println!("  Logs : /var/log/synthaea-watchdog.log (watchdog and agent output)");
     println!("  Uninstall: watchdog uninstall");
     Ok(())
 }

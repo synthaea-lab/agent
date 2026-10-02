@@ -195,6 +195,37 @@ fn validate_semantics(cfg: &AgentConfig, source_path: &Path) -> Result<(), Confi
         });
     }
 
+    // logs.sources — each one is a file the agent tails and a parser fed by
+    // attacker-controlled text (ADR-0022): a bounded, absolute, duplicate-free
+    // list, so a typo fails at boot instead of silently reading nothing.
+    if cfg.logs.sources.len() > crate::schema::MAX_LOG_SOURCES {
+        return Err(ConfigError::Invalid {
+            field: "logs.sources".into(),
+            expected: format!("at most {} sources", crate::schema::MAX_LOG_SOURCES),
+            value: format!("{} sources", cfg.logs.sources.len()),
+            origin: src.clone(),
+        });
+    }
+    for (i, source) in cfg.logs.sources.iter().enumerate() {
+        if !source.path.is_absolute() {
+            return Err(ConfigError::Invalid {
+                field: format!("logs.sources[{i}].path"),
+                expected: "an absolute filesystem path".into(),
+                value: source.path.display().to_string(),
+                origin: src.clone(),
+            });
+        }
+        if cfg.logs.sources[..i].iter().any(|s| s.path == source.path) {
+            return Err(ConfigError::Invalid {
+                field: format!("logs.sources[{i}].path"),
+                expected: "a path declared once (two parsers on one file would read it twice)"
+                    .into(),
+                value: source.path.display().to_string(),
+                origin: src.clone(),
+            });
+        }
+    }
+
     // ipc.endpoint — shape check per OS. On Windows the endpoint is a named
     // pipe (`\\.\pipe\...`), everywhere else it's an absolute filesystem
     // path (Unix domain socket).
@@ -654,6 +685,78 @@ control_plane_url = "https://cp.example"
         }
         match err {
             ConfigError::Invalid { field, .. } => assert_eq!(field, "log.level"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    /// An absolute path for the host OS, escaped for a TOML basic string.
+    fn abs_log(name: &str) -> String {
+        if cfg!(windows) {
+            format!("C:\\\\logs\\\\{name}")
+        } else {
+            format!("/var/log/{name}")
+        }
+    }
+
+    fn source(path: &str, kind: &str) -> String {
+        format!("[[logs.sources]]\npath = \"{path}\"\nkind = \"{kind}\"\n\n")
+    }
+
+    fn load_with_logs(extra: &str) -> Result<AgentConfig, ConfigError> {
+        let f = write_tmp(&format!("{}\n{extra}", valid_toml()));
+        load_from(f.path())
+    }
+
+    #[test]
+    fn no_logs_table_means_no_sources() {
+        let cfg = load_with_logs("").unwrap();
+        assert!(cfg.logs.sources.is_empty());
+    }
+
+    #[test]
+    fn loads_declared_log_sources() {
+        let extra = source(&abs_log("access.log"), "access_combined")
+            + &source(&abs_log("mysql.err"), "mysql_error");
+        let cfg = load_with_logs(&extra).unwrap();
+        assert_eq!(cfg.logs.sources.len(), 2);
+        assert_eq!(
+            cfg.logs.sources[0].kind,
+            crate::LogSourceKind::AccessCombined
+        );
+        assert_eq!(cfg.logs.sources[1].kind, crate::LogSourceKind::MysqlError);
+    }
+
+    #[test]
+    fn a_relative_log_path_is_rejected() {
+        match load_with_logs(&source("access.log", "access_common")).unwrap_err() {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "logs.sources[0].path"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_duplicate_log_path_is_rejected() {
+        let p = abs_log("access.log");
+        let extra = source(&p, "access_common") + &source(&p, "access_combined");
+        match load_with_logs(&extra).unwrap_err() {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "logs.sources[1].path"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_kind_is_a_parse_error() {
+        let err = load_with_logs(&source(&abs_log("a.log"), "postgres")).unwrap_err();
+        assert!(!matches!(err, ConfigError::Invalid { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn too_many_log_sources_are_rejected() {
+        let many: String = (0..=crate::MAX_LOG_SOURCES)
+            .map(|i| source(&abs_log(&format!("{i}.log")), "access_common"))
+            .collect();
+        match load_with_logs(&many).unwrap_err() {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "logs.sources"),
             other => panic!("expected Invalid, got {other:?}"),
         }
     }

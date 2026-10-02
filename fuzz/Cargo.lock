@@ -145,6 +145,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sensor-linux-logs"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "sensor-linux-netlink"
 version = "0.1.0"
 dependencies = [
@@ -236,6 +243,7 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "sensor-linux-audit",
+ "sensor-linux-logs",
  "sensor-linux-netlink",
 ]
 

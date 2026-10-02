@@ -120,10 +120,11 @@ mod tests {
         DetectionSink::new(
             rules::RuleState::new(),
             &dir.join("alerts.ndjson"),
-            &dir.join("events.jsonl"),
+            Some(&dir.join("events.jsonl")),
             None,
             None,
             &dir.join("content"),
+            &dir.join("ml-registry"),
         )
         .unwrap()
     }

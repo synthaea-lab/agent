@@ -4,7 +4,7 @@ use schema::{
     ConnectEvent, ExecEvent, FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT,
     FLAG_PERSISTENCE_BTM_ARTIFACT, FLAG_PERSISTENCE_SYSTEMD_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FLAG_PERSISTENCE_TASK_ARTIFACT,
-    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent,
+    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, detection::Severity,
 };
 
 use crate::{
@@ -26,6 +26,7 @@ pub(crate) fn check_base64_decode(event: &ExecEvent) -> Option<Alert> {
     if has_base64 && has_decode_flag {
         Some(Alert {
             technique: "T1059.004",
+            severity: Severity::Medium,
             message: format!(
                 "pid={} comm={}: command line contains a base64 decode: {cmdline}",
                 event.meta.pid, event.meta.comm,
@@ -73,6 +74,7 @@ pub(crate) fn check_encoded_powershell(event: &ExecEvent) -> Option<Alert> {
     if has_encoded_flag {
         Some(Alert {
             technique: "T1059.001",
+            severity: Severity::Medium,
             message: format!(
                 "pid={} comm={}: PowerShell EncodedCommand invocation: {cmdline}",
                 event.meta.pid, event.meta.comm,
@@ -131,6 +133,7 @@ pub(crate) fn check_persistence_write(event: &FileOpenEvent) -> Option<Alert> {
 
     Some(Alert {
         technique,
+        severity: Severity::High,
         message: format!(
             "pid={} comm={}: write to a known persistence path ({matched_pattern}): {path}",
             event.meta.pid, event.meta.comm,
@@ -185,6 +188,7 @@ pub(crate) fn check_proc_root_escape(event: &FileOpenEvent) -> Option<Alert> {
 
     Some(Alert {
         technique: "T1611",
+        severity: Severity::High,
         message: format!(
             "pid={} comm={} container={}: opened {} — containerized process reaching \
              into another process's root filesystem via procfs, a common \
@@ -219,6 +223,7 @@ pub(crate) fn check_scheduled_task_persistence(event: &FileOpenEvent) -> Option<
     }
     Some(Alert {
         technique: "T1053.005",
+        severity: Severity::Medium,
         message: format!(
             "task={} pid={}: scheduled task persistence created — action path: {}",
             event.meta.comm, event.meta.pid, event.path,
@@ -296,6 +301,7 @@ pub(crate) fn check_scheduled_task_update_persistence(event: &FileOpenEvent) -> 
     };
     Some(Alert {
         technique: "T1053.005",
+        severity: Severity::High,
         message: format!(
             "task={} pid={}: existing scheduled task repointed ({reason}) — new action \
              path: {}",
@@ -330,6 +336,7 @@ pub(crate) fn check_service_install_persistence(event: &FileOpenEvent) -> Option
     }
     Some(Alert {
         technique: "T1543.003",
+        severity: Severity::High,
         message: format!(
             "service={} pid={}: service persistence installed — image path: {}",
             event.meta.comm, event.meta.pid, event.path,
@@ -363,6 +370,7 @@ pub(crate) fn check_account_creation_persistence(event: &FileOpenEvent) -> Optio
     }
     Some(Alert {
         technique: "T1136.001",
+        severity: Severity::High,
         message: format!(
             "account={} pid={}: local account persistence created — sid: {}",
             event.meta.comm, event.meta.pid, event.path,
@@ -396,6 +404,7 @@ pub(crate) fn check_systemd_service_persistence(event: &FileOpenEvent) -> Option
     }
     Some(Alert {
         technique: "T1543.002",
+        severity: Severity::Medium,
         message: format!(
             "unit={} pid={}: systemd service first seen starting — unit: {}",
             event.meta.comm, event.meta.pid, event.path,
@@ -432,6 +441,7 @@ pub(crate) fn check_btm_launch_item_persistence(event: &FileOpenEvent) -> Option
     }
     Some(Alert {
         technique: "T1543.001/T1547.015",
+        severity: Severity::Medium,
         message: format!(
             "instigator={} pid={}: macOS launch item registered — payload: {}",
             event.meta.comm, event.meta.pid, event.path,
@@ -506,6 +516,7 @@ pub(crate) fn check_service_write_outside_datadir(
     }
     Some(Alert {
         technique: "T1190",
+        severity: Severity::High,
         message: format!(
             "pid={} comm={comm}: wrote outside its data/log/temp directories: {path} — \
              signature of SQL injection (SELECT ... INTO OUTFILE) or a malicious UDF",
@@ -628,6 +639,7 @@ pub(crate) fn check_masquerading(event: &ExecEvent) -> Option<Alert> {
     }
     Some(Alert {
         technique: "T1036.005",
+        severity: Severity::High,
         message: format!(
             "pid={} comm={}: system-binary name `{matched}` executing from outside its \
              legitimate location: {path}",
@@ -662,6 +674,7 @@ pub(crate) fn check_ld_preload_hijack(event: &ExecEvent, extra_trust: &[String])
     }
     Some(Alert {
         technique: "T1574.006",
+        severity: Severity::High,
         message: format!(
             "pid={} comm={}: {name}={value} loads a shared object outside the dynamic \
              linker's trusted search path",
@@ -697,6 +710,7 @@ pub(crate) fn check_recovery_inhibit(event: &ExecEvent) -> Option<Alert> {
         .find(|(_, tokens)| tokens.iter().all(|t| cmdline.contains(t)))?;
     Some(Alert {
         technique: "T1490",
+        severity: Severity::High,
         message: format!(
             "pid={} comm={}: {label} — the pre-encryption tell: {}",
             event.meta.pid, event.meta.comm, event.cmdline,
@@ -729,6 +743,7 @@ pub(crate) fn check_log_clear_exec(event: &ExecEvent) -> Option<Alert> {
         .find(|(_, tokens)| tokens.iter().all(|t| cmdline.contains(t)))?;
     Some(Alert {
         technique,
+        severity: Severity::High,
         message: format!(
             "pid={} comm={}: log-clearing command: {}",
             event.meta.pid, event.meta.comm, event.cmdline,
@@ -758,6 +773,7 @@ pub(crate) fn check_log_file_delete(event: &schema::FileDeleteEvent) -> Option<A
         .find(|(_, pattern)| path.contains(*pattern))?;
     Some(Alert {
         technique,
+        severity: Severity::Medium,
         message: format!(
             "pid={} comm={}: log file deleted ({matched}): {path}",
             event.meta.pid, event.meta.comm,
@@ -813,6 +829,7 @@ pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Opti
     };
     Some(Alert {
         technique: "T1562.001",
+        severity: Severity::High,
         message: format!(
             "pid={} comm={}{sender_uid}: sent {name} ({}) to security process pid={} ({target})",
             event.meta.pid, event.meta.comm, event.signal, event.target_pid,
@@ -876,6 +893,7 @@ pub(crate) fn check_service_unusual_outbound(event: &ConnectEvent) -> Option<Ale
     }
     Some(Alert {
         technique: "T1071",
+        severity: Severity::Medium,
         message: format!(
             "pid={} comm={comm}: outbound connection to {}:{} — port outside this service's \
              routine set, possible reverse shell after exploitation",

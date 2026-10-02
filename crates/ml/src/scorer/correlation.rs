@@ -132,8 +132,13 @@ impl CorrelationScorer {
     /// Returns [`ScorerError::FeatureOutOfBounds`] if the feature vector falls
     /// outside training bounds (OOD detection, issue #46). Returns other
     /// [`ScorerError`] variants when ONNX inference fails or produces no score.
-    pub fn score(&mut self, bus: &EventBus, pid: u32) -> Result<Option<f32>, ScorerError> {
-        let features = correlation::extract_features(bus, pid);
+    pub fn score(
+        &mut self,
+        bus: &EventBus,
+        pid: u32,
+        generation: Option<u64>,
+    ) -> Result<Option<f32>, ScorerError> {
+        let features = correlation::extract_features(bus, pid, generation);
         if features[EVENT_COUNT_IDX] < MIN_EVENT_COUNT {
             return Ok(None);
         }
@@ -171,9 +176,10 @@ impl CorrelationScorer {
         &mut self,
         bus: &EventBus,
         pid: u32,
+        generation: Option<u64>,
         k: usize,
     ) -> Result<Option<Score>, ScorerError> {
-        let features = correlation::extract_features(bus, pid);
+        let features = correlation::extract_features(bus, pid, generation);
         if features[EVENT_COUNT_IDX] < MIN_EVENT_COUNT {
             return Ok(None);
         }

@@ -61,8 +61,11 @@ pub const DEFAULT_INGEST_ENDPOINT: &str = "/api/v1/ingest/events";
 /// Default server endpoint for structured detection ingestion.
 pub const DEFAULT_DETECTION_ENDPOINT: &str = "/api/ingest/detection";
 
-/// Default server endpoint for heartbeat.
-pub const DEFAULT_HEARTBEAT_ENDPOINT: &str = "/api/v1/ingest/heartbeat";
+/// Default server endpoint for heartbeat: `server/app/api/ingest/heartbeat/route.ts`,
+/// behind nginx's `location /api/ingest/` mTLS gate. It used to carry a `/v1`
+/// prefix that no route served, so the server's middleware redirected every
+/// beacon to `/login` and `lastSeen` never moved (#317 review).
+pub const DEFAULT_HEARTBEAT_ENDPOINT: &str = "/api/ingest/heartbeat";
 
 /// Default retry backoff base (doubles on each retry, capped).
 pub const DEFAULT_RETRY_BASE_MS: u64 = 1000;
