@@ -43,5 +43,9 @@ pub(crate) fn is_correlated(event: &Event) -> bool {
             // against — both cross-cutting calls left for a follow-up, not
             // decided solo here.
             | Event::NetworkFlow(_)
+            // `HttpRequest` (#478, from a web access log) has pid 0: it joins a web
+            // server's shell spawn by time, not by pid, in `rule_web_request_shell`,
+            // and the engine returns before any pid-keyed step for it.
+            | Event::HttpRequest(_)
     )
 }

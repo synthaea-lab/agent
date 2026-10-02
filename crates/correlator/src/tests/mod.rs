@@ -106,3 +106,4 @@ fn dns_query_event(pid: u32, ts_ns: u64, query: &str) -> Event {
 
 mod behavior;
 mod rules;
+mod web;

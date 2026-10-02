@@ -12,9 +12,9 @@ use crate::{
     bus::{EventBus, same_generation},
     event::is_correlated,
     rules::{
-        CorrelationAlert, rule_assembly_connect, rule_assembly_smb, rule_connect_filewrite,
-        rule_dns_exfil, rule_exec_smb, rule_respawn_connect, rule_spawn_connect,
-        rule_spawn_connect_filewrite,
+        CorrelationAlert, is_web_server_shell, rule_assembly_connect, rule_assembly_smb,
+        rule_connect_filewrite, rule_dns_exfil, rule_exec_smb, rule_respawn_connect,
+        rule_spawn_connect, rule_spawn_connect_filewrite, rule_web_request_shell,
     },
 };
 
@@ -142,6 +142,13 @@ impl CorrelationEngine {
         if !is_correlated(&event) {
             return Vec::new();
         }
+        // An access-log request has no pid: it only joins a web server's shell by time.
+        // Record it, look for that pairing, and skip every pid-keyed step below.
+        if matches!(event, Event::HttpRequest(_)) {
+            self.bus.push(event);
+            return self.web_shell_alerts();
+        }
+        let is_web_shell = matches!(&event, Event::Exec(e) if is_web_server_shell(e));
         let pid = event.meta().pid;
         let generation = event.meta().process_generation;
         let comm = event.meta().comm.clone();
@@ -203,8 +210,16 @@ impl CorrelationEngine {
             update_belief(state, &bv, None, now_ns);
         }
 
+        // The shell is the late half of a request-then-shell pairing when the log line
+        // was already read; the other order is handled when the request arrives.
+        let web_alerts = if is_web_shell {
+            self.web_shell_alerts()
+        } else {
+            Vec::new()
+        };
+
         if is_ignored(&comm) && !self.is_masquerading(pid, generation) {
-            return Vec::new();
+            return web_alerts;
         }
 
         let now_ns = self
@@ -213,9 +228,34 @@ impl CorrelationEngine {
             .map(|e| e.meta().timestamp_ns)
             .max()
             .unwrap_or(0);
-        let mut alerts = self.evaluate(pid, generation, now_ns);
+        let mut alerts = web_alerts;
+        alerts.extend(self.evaluate(pid, generation, now_ns));
         if !is_bayes_excluded(&comm) || self.is_masquerading(pid, generation) {
             alerts.extend(self.bayes_alert(pid, &comm, &entity_key));
+        }
+        alerts
+    }
+
+    /// Evaluates [`rule_web_request_shell`] over the bus, once per shell per window.
+    fn web_shell_alerts(&mut self) -> Vec<CorrelationAlert> {
+        let window_ns = self.window_ns;
+        let mut alerts = Vec::new();
+        for case in rule_web_request_shell(&self.bus) {
+            let key = ("web_request_shell", case.pid);
+            let recently = self.fired.get(&key).is_some_and(|entry| {
+                entry.current(case.generation)
+                    && case.timestamp_ns.saturating_sub(entry.value) <= window_ns
+            });
+            if !recently {
+                self.fired.insert(
+                    key,
+                    Stamped {
+                        generation: case.generation,
+                        value: case.timestamp_ns,
+                    },
+                );
+                alerts.push(case.alert);
+            }
         }
         alerts
     }
