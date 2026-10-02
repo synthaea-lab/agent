@@ -53,6 +53,7 @@ jobs:
               set -eux
               apk add --no-cache sudo bash
               export SYNTHAEA_SRC=/work
+              export SYNTHAEA_ALLOW_ORT_ROOT_BUILD=1
               bash ./lab/provisioning/alpine-toolchain.sh
               bash ./packaging/linux/build-deb.sh
               chown -R "$(stat -c %u /work)":"$(stat -c %g /work)" /work/target /work/onnxruntime

@@ -74,13 +74,20 @@ cd "$ONNX_DIR"
 
 # Build static libraries
 echo "[onnxruntime] Building static libraries (this takes 5-15 minutes)"
+ORT_BUILD_ARGS=()
+# ONNX Runtime blocks root by default. The package-portability workflow runs in
+# an isolated root-owned Alpine container and opts in explicitly for this build.
+if [ "${SYNTHAEA_ALLOW_ORT_ROOT_BUILD:-0}" = "1" ] && [ "$(id -u)" -eq 0 ]; then
+  ORT_BUILD_ARGS+=(--allow_running_as_root)
+fi
 ./build.sh \
   --config Release \
   --update \
   --build \
   --no_telemetry \
   --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF \
-  --parallel "$JOBS"
+  --parallel "$JOBS" \
+  "${ORT_BUILD_ARGS[@]}"
 
 # Ubuntu-specific: re2 is an orphaned CMake target in static-only builds
 # (onnxruntime_providers_cpu.cmake only does onnxruntime_add_include_to_target,
