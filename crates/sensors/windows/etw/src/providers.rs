@@ -587,7 +587,7 @@ pub(crate) fn amsi_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
 /// # Field notes (manifest + lab, Windows 11 24H2, 2026-10-02)
 ///
 /// `ScopeOfSearch` (u32: 0 base, 1 one level, 2 subtree), `SearchFilter`,
-/// `DistinguishedName` (the base), `AttributeList` (space-separated),
+/// `DistinguishedName` (the base), `AttributeList` (`;`-separated),
 /// `ProcessId`. Logged when the request is sent: a search to a listener that
 /// never answers shows up, a failed connect does not.
 pub(crate) fn ldap_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {

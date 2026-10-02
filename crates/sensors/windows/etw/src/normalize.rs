@@ -245,10 +245,11 @@ pub fn describe_foreign_sessions(
 }
 
 /// LDAP-Client's `AttributeList` (EID 30, #364) split into attribute names.
-/// The console shows the names space-separated, but a lab run (2026-10-02)
-/// lost the second of two attributes with a whitespace-only split: the
-/// separator is not (only) whitespace. Split on whitespace, NUL, `;` and `,`,
-/// none of which can appear in an attribute name (RFC 4512 `descr`/OID).
+/// The provider joins the names with `;` (lab 2026-10-02, code points of
+/// `cn;ms-Mcs-AdmPwd`); a whitespace-only split had glued them together and
+/// hidden the LAPS attribute. Split on `;`, and on whitespace, NUL and `,` as
+/// well, none of which can appear in an attribute name (RFC 4512
+/// `descr`/OID).
 #[must_use]
 pub fn split_ldap_attributes(raw: &str) -> Vec<String> {
     raw.split(|c: char| c.is_whitespace() || matches!(c, '\0' | ';' | ','))

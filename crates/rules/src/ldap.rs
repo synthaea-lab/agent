@@ -120,7 +120,8 @@ pub fn evaluate_ldap_search(event: &LdapSearchEvent) -> Vec<Alert> {
         alerts.push(alert(DOMAIN_TRUST_DISCOVERY, "domain trusts"));
     }
     // Substring over the joined list, not an exact per-name match: robust to
-    // a sensor that could not split the provider's separator (#364 lab).
+    // a list the sensor could not split (the provider's `;` separator
+    // once hid a LAPS attribute this way, #364 lab).
     let attributes = event.attributes.join(" ").to_ascii_lowercase();
     let reads_password = PASSWORD_ATTRIBUTES.iter().any(|a| attributes.contains(a))
         || PASSWORD_ATTRIBUTES
