@@ -13,4 +13,5 @@ workspace = true
 schema = { path = "../schema" }
 yara-x = { version = "1", default-features = false }
 thiserror = { workspace = true }
+store = { path = "../store" }
 tracing = { workspace = true }
