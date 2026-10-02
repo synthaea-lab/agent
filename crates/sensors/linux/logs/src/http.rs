@@ -449,6 +449,52 @@ mod tests {
         );
     }
 
+    /// Verbatim from Apache 2.4.58 (Ubuntu 24.04), its stock `combined` `CustomLog`.
+    /// Unlike nginx, Apache writes a quote as `\"`, a backslash as `\\` and bytes as
+    /// lower-case `\xhh`; the first two decode, the last stays literal.
+    #[test]
+    fn real_apache_lines() {
+        let rec = |line: &str| parse_access_line(line, AccessFormat::Combined).unwrap();
+        let sig = |line: &str| match_request(&rec(line)).map(|m| m.signature);
+
+        assert_eq!(
+            sig(
+                r#"127.0.0.1 - - [02/Oct/2026:10:47:10 +0200] "GET / HTTP/1.1" 200 10926 "-" "curl/8.5.0""#
+            ),
+            None
+        );
+        assert_eq!(
+            sig(
+                r#"127.0.0.1 - - [02/Oct/2026:10:47:10 +0200] "GET /?id=1+UNION+SELECT+1,2,3 HTTP/1.1" 200 10926 "-" "curl/8.5.0""#
+            ),
+            Some(HttpSignature::SqlInjection)
+        );
+        let nikto = match_request(&rec(
+            r#"127.0.0.1 - - [02/Oct/2026:10:47:10 +0200] "GET / HTTP/1.1" 200 10926 "-" "Mozilla/5.00 (Nikto/2.5.0) (Evasions:None)""#,
+        ))
+        .unwrap();
+        assert_eq!(nikto.scanner, Some("nikto"));
+
+        let quoted = rec(
+            r#"127.0.0.1 - - [02/Oct/2026:10:47:10 +0200] "GET / HTTP/1.1" 200 10926 "-" "evil\" 999 \"x""#,
+        );
+        assert_eq!(quoted.user_agent.as_deref(), Some(r#"evil" 999 "x"#));
+        let escaped = rec(
+            r#"127.0.0.1 - - [02/Oct/2026:10:47:10 +0200] "GET / HTTP/1.1" 200 10926 "http://ref.example/\"quoted\"" "back\\slash""#,
+        );
+        assert_eq!(
+            escaped.referer.as_deref(),
+            Some(r#"http://ref.example/"quoted""#)
+        );
+        assert_eq!(escaped.user_agent.as_deref(), Some(r"back\slash"));
+
+        let control = rec(
+            r#"127.0.0.1 - - [02/Oct/2026:10:47:10 +0200] "GET /\x01\x02\x7f HTTP/1.1" 400 501 "-" "-""#,
+        );
+        assert_eq!(control.target(), Some(r"/\x01\x02\x7f"));
+        assert_eq!(match_request(&control), None);
+    }
+
     #[test]
     fn a_host_name_client_is_not_an_address() {
         let line = r#"www.example.org - - [t] "GET /?q=union+select+1 HTTP/1.1" 200 1 "-" "x""#;

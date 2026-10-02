@@ -1,13 +1,18 @@
 //! MySQL/MariaDB error log: failed logins.
 //!
 //! ```text
-//! MariaDB 10.11 (seen on a real server): 2026-10-02  9:26:33 31 [Warning] Access denied for user 'root'@'localhost'
-//! MySQL 8 (from its documentation):      2026-10-01T12:00:00.123456Z 12 [Note] [MY-010926] [Server] Access denied for user 'root'@'10.0.0.5' (using password: YES)
+//! MariaDB 10.11.14:  2026-10-02  9:26:33 31 [Warning] Access denied for user 'root'@'localhost'
+//! MySQL 8.0.46:      2026-10-02T08:44:19.951075Z 18 [Note] [MY-010926] [Server] Access denied for user 'eviluser'@'localhost' (using password: YES)
+//! MySQL 8.0.46:      2026-10-02T08:44:19.914365Z 16 [Note] [MY-010925] [Server] Access denied for user 'root'@'localhost'
 //! ```
 //!
-//! `MariaDB` omits the ` (using password: ...)` clause that `MySQL` appends, and pads a
-//! one-digit hour with a space, so the clause is optional and the time may be preceded
-//! by two spaces.
+//! Both seen on real servers (Ubuntu 24.04). `MariaDB` pads a one-digit hour with a
+//! space and never writes the ` (using password: ...)` clause; `MySQL` writes it for
+//! message `MY-010926` (a password was sent) and omits it for `MY-010925` (a plugin such
+//! as `auth_socket` refused, or no password was sent). The clause is therefore
+//! optional, and the time may be preceded by two spaces. `MySQL` 8 writes these lines
+//! only at `log_error_verbosity = 3` (the default 2 writes none); `MariaDB` writes them
+//! at its default `log_warnings = 2`.
 //!
 //! The user name is attacker-chosen and the server does not escape it, so it can contain
 //! `'`, `@` and spaces. The host cannot contain `'@'`, so the split is on the *last*
@@ -170,6 +175,37 @@ mod tests {
         assert_eq!((f.user.as_str(), f.host.as_str()), ("root", "localhost"));
         assert_eq!(f.used_password, None);
         assert_eq!(to_auth_event(&f, 1).status_code, None);
+    }
+
+    /// Verbatim from a `MySQL` 8.0.46 on Ubuntu 24.04, `log_error_verbosity = 3`: both
+    /// message ids, an attacker-chosen name containing `'@'` and a quote, and a
+    /// neighbouring warning that is not a failed login.
+    #[test]
+    fn real_mysql8_lines() {
+        let parse = |l: &str| parse_mysql_error_line(l).unwrap();
+        let denied = parse("2026-10-02T08:44:19.914365Z 16 [Note] [MY-010925] [Server] Access denied for user 'root'@'localhost'").unwrap();
+        assert_eq!(denied.timestamp, "2026-10-02T08:44:19.914365Z");
+        assert_eq!(
+            (denied.user.as_str(), denied.host.as_str()),
+            ("root", "localhost")
+        );
+        assert_eq!(denied.used_password, None);
+
+        let pw = parse("2026-10-02T08:44:19.951075Z 18 [Note] [MY-010926] [Server] Access denied for user 'eviluser'@'localhost' (using password: YES)").unwrap();
+        assert_eq!(pw.used_password, Some(true));
+        assert_eq!(pw.user, "eviluser");
+
+        let hostile = parse("2026-10-02T08:44:19.972756Z 19 [Note] [MY-010926] [Server] Access denied for user 'a'@'1.2.3.4'@'localhost' (using password: YES)").unwrap();
+        assert_eq!(
+            (hostile.user.as_str(), hostile.host.as_str()),
+            ("a'@'1.2.3.4", "localhost")
+        );
+
+        let quote = parse("2026-10-02T08:44:19.991358Z 20 [Note] [MY-010926] [Server] Access denied for user 'good\"quote'@'localhost' (using password: YES)").unwrap();
+        assert_eq!(quote.user, "good\"quote");
+
+        let warning = "2026-10-02T08:44:19.950964Z 18 [Warning] [MY-013360] [Server] Plugin sha256_password reported: ''sha256_password' is deprecated and will be removed in a future release. Please use caching_sha2_password instead'";
+        assert_eq!(parse_mysql_error_line(warning), Ok(None));
     }
 
     #[test]
