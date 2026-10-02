@@ -5,8 +5,7 @@
 //! client table stops growing at [`MAX_TRACKED_CLIENTS`] (a scan from a /16 must not
 //! grow agent memory), and the ranking is [`TOP_CLIENTS`] long.
 
-use std::collections::HashMap;
-use std::net::IpAddr;
+use std::{collections::HashMap, net::IpAddr};
 
 use schema::{EventMeta, HttpClientCount, HttpSummaryEvent, User};
 
