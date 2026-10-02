@@ -122,3 +122,29 @@ fn each_shell_gets_its_own_alert() {
     assert_eq!(web_alerts(&first).len(), 1);
     assert_eq!(web_alerts(&second).len(), 1);
 }
+
+#[test]
+fn requests_read_in_one_poll_pair_with_the_last_one_in_the_log() {
+    // One poll reads a burst and stamps all of it with the same instant, so only the
+    // order says which request came last.
+    let mut engine = CorrelationEngine::new();
+    let probe = Event::HttpRequest(HttpRequestEvent {
+        signature: HttpSignature::SqlInjection,
+        path: "/index.php".into(),
+        ..match request(100 * SEC) {
+            Event::HttpRequest(r) => r,
+            _ => unreachable!(),
+        }
+    });
+    engine.on_event(probe);
+    engine.on_event(request(100 * SEC));
+    let alerts = engine.on_event(shell_under("nginx", 900, 101 * SEC));
+    let web = web_alerts(&alerts);
+    assert_eq!(web.len(), 1, "{alerts:?}");
+    assert!(
+        web[0].message.contains("WebshellLike"),
+        "{}",
+        web[0].message
+    );
+    assert!(web[0].message.contains("/up/s.php"), "{}", web[0].message);
+}

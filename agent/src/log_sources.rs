@@ -5,15 +5,23 @@
 //! [`Position`] in a file derived from the alerts path (same convention as
 //! `crate::journal_cursor`), so a restart resumes where it stopped.
 //!
-//! **Active today:** `mysql_error`, whose failed logins become `schema::AuthEvent`s and
-//! so feed the existing brute-force rule (T1110). The `access_*` kinds are accepted by
-//! the configuration but not read yet: they need the `HttpRequest` event and the
-//! redaction of what leaves the host, which are separate changes. Declaring one logs a
-//! warning rather than silently doing nothing.
+//! Two kinds of source:
+//!
+//! - `mysql_error`: a failed login becomes a `schema::AuthEvent` and so feeds the
+//!   existing brute-force rule (T1110).
+//! - `access_common` / `access_combined`: a request that matches a detection signature
+//!   becomes a `schema::HttpRequestEvent` (at most [`sensor_linux_logs::PER_SIGNATURE_PER_WINDOW`]
+//!   per signature per window, the rest counted and logged), and every request is counted
+//!   in one `schema::HttpSummaryEvent` per 60 s window. Nothing is emitted per ordinary
+//!   request (ADR-0022 §3).
+//!
+//! Every event goes through [`deliver`], the one place it leaves this module: the
+//! credential redaction of an `HttpRequest`'s evidence value belongs there (ADR-0018, no
+//! second redaction path).
 //!
 //! No silence alert and no heartbeat: a quiet log is normal on a quiet site (ADR-0022,
 //! decision 4). A line that does not parse is counted and sampled in the log, never
-//! skipped silently; the "misparsing" health event is a follow-up.
+//! skipped silently, and a source whose lines mostly fail raises the `LOG-SOURCE` alert.
 
 use std::{
     path::{Path, PathBuf},
@@ -27,7 +35,8 @@ use std::{
 use config::{LogSourceConfig, LogSourceKind};
 use schema::sensor::EventSink as _;
 use sensor_linux_logs::{
-    Misparse, MisparseWatch, Position, Tailer, parse_mysql_error_line, to_auth_event,
+    AccessFormat, Misparse, MisparseWatch, Position, SignatureBudget, Summarizer, Tailer,
+    match_request, parse_access_line, parse_mysql_error_line, to_auth_event, to_http_request_event,
 };
 
 use crate::{
@@ -81,6 +90,34 @@ struct Stats {
     watch: MisparseWatch,
 }
 
+/// Counts a line that did not match its declared kind and samples it in the log.
+fn note_parse_failure(
+    line: &str,
+    error: &dyn std::fmt::Display,
+    now_ns: u64,
+    stats: &mut Stats,
+    path: &Path,
+) {
+    stats.parse_failures += 1;
+    stats.watch.record(false, now_ns);
+    // First failure, then every thousandth: a custom format would otherwise log once
+    // per line. The sample is attacker-controlled text, so it is cut and escaped
+    // (`{:?}`), never written raw.
+    if stats.parse_failures == 1 || stats.parse_failures.is_multiple_of(1000) {
+        let mut end = line.len().min(SAMPLE_BYTES);
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        tracing::warn!(
+            log = %path.display(),
+            failures = stats.parse_failures,
+            error = %error,
+            sample = ?&line[..end],
+            "log source: line does not match its declared kind"
+        );
+    }
+}
+
 /// One log line of a `mysql_error` source, as the event it yields. `None` for an
 /// ordinary line and for one that did not parse (counted and sampled).
 fn mysql_line_to_event(
@@ -96,24 +133,51 @@ fn mysql_line_to_event(
         }
         Ok(None) => None,
         Err(e) => {
-            stats.parse_failures += 1;
-            stats.watch.record(false, now_ns);
-            // First failure, then every thousandth: a custom format would otherwise
-            // log once per line. The sample is attacker-controlled text, so it is
-            // cut and escaped (`{:?}`), never written raw.
-            if stats.parse_failures == 1 || stats.parse_failures.is_multiple_of(1000) {
-                let mut end = line.len().min(SAMPLE_BYTES);
-                while !line.is_char_boundary(end) {
-                    end -= 1;
-                }
-                tracing::warn!(
-                    log = %path.display(),
-                    failures = stats.parse_failures,
-                    error = %e,
-                    sample = ?&line[..end],
-                    "log source: line does not match its declared kind"
-                );
-            }
+            note_parse_failure(line, &e, now_ns, stats, path);
+            None
+        }
+    }
+}
+
+/// What an `access_*` source keeps between polls.
+struct Access {
+    format: AccessFormat,
+    summarizer: Summarizer,
+    budget: SignatureBudget,
+}
+
+impl Access {
+    fn new(format: AccessFormat, path: &Path) -> Self {
+        Self {
+            format,
+            summarizer: Summarizer::new(path.display().to_string()),
+            budget: SignatureBudget::new(),
+        }
+    }
+}
+
+/// One log line of an `access_*` source. Every parsed request is counted in the window
+/// summary; only one that matches a signature, and is within the signature's budget,
+/// yields an event. `None` for an ordinary request and for a line that did not parse
+/// (counted and sampled).
+fn access_line_to_event(
+    line: &str,
+    now_ns: u64,
+    access: &mut Access,
+    stats: &mut Stats,
+    path: &Path,
+) -> Option<schema::Event> {
+    match parse_access_line(line, access.format) {
+        Ok(record) => {
+            stats.watch.record(true, now_ns);
+            access.summarizer.observe(&record, now_ns);
+            let matched = match_request(&record)?;
+            access.budget.allow(matched.signature, now_ns).then(|| {
+                schema::Event::HttpRequest(to_http_request_event(&record, &matched, now_ns))
+            })
+        }
+        Err(e) => {
+            note_parse_failure(line, &e, now_ns, stats, path);
             None
         }
     }
@@ -137,6 +201,8 @@ fn misparse_message(path: &Path, kind: LogSourceKind, m: Misparse) -> String {
 
 struct Source {
     kind: LogSourceKind,
+    /// Present for an `access_*` source.
+    access: Option<Access>,
     tailer: Tailer,
     position_path: PathBuf,
     last_saved: Option<Position>,
@@ -145,8 +211,8 @@ struct Source {
     warned: bool,
 }
 
-/// Starts the tail thread for the `mysql_error` sources of `sources`, registering it
-/// with `shutdown`. Does nothing, and starts no thread, when none is active.
+/// Starts the tail thread for the sources of `sources`, registering it with `shutdown`.
+/// Does nothing, and starts no thread, when there are none.
 pub(crate) fn spawn(
     sink: Arc<DetectionSink>,
     sources: &[LogSourceConfig],
@@ -155,26 +221,24 @@ pub(crate) fn spawn(
 ) {
     let mut active = Vec::new();
     for source in sources {
-        match source.kind {
-            LogSourceKind::MysqlError => {
-                let position_path = position_path_for(alerts, &source.path);
-                let saved = read_position(&position_path);
-                active.push(Source {
-                    kind: source.kind,
-                    tailer: Tailer::new(&source.path, saved),
-                    position_path,
-                    last_saved: saved,
-                    stats: Stats::default(),
-                    warned: false,
-                });
+        let access = match source.kind {
+            LogSourceKind::MysqlError => None,
+            LogSourceKind::AccessCommon => Some(Access::new(AccessFormat::Common, &source.path)),
+            LogSourceKind::AccessCombined => {
+                Some(Access::new(AccessFormat::Combined, &source.path))
             }
-            LogSourceKind::AccessCommon | LogSourceKind::AccessCombined => {
-                tracing::warn!(
-                    log = %source.path.display(),
-                    "log source: access logs are declared but not read yet (needs the HttpRequest event)"
-                );
-            }
-        }
+        };
+        let position_path = position_path_for(alerts, &source.path);
+        let saved = read_position(&position_path);
+        active.push(Source {
+            kind: source.kind,
+            access,
+            tailer: Tailer::new(&source.path, saved),
+            position_path,
+            last_saved: saved,
+            stats: Stats::default(),
+            warned: false,
+        });
     }
     if active.is_empty() {
         return;
@@ -200,17 +264,53 @@ pub(crate) fn spawn(
     );
 }
 
+/// The one place an event leaves this module for the sink. ADR-0018's credential
+/// redaction of an `HttpRequest`'s evidence value is applied here and nowhere else.
+fn deliver(sink: &DetectionSink, event: schema::Event) {
+    sink.on_event(event);
+}
+
 fn poll_source(source: &mut Source, sink: &DetectionSink) {
     let now_ns = schema::time::now_ns();
     let path = source.tailer.path().to_path_buf();
     let mut events = Vec::new();
-    let result = source.tailer.poll(|line| {
-        if let Some(event) = mysql_line_to_event(line, now_ns, &mut source.stats, &path) {
+    // The window's allowance is judged before this poll's lines, and what the window
+    // shed is said once, when it ends.
+    if let Some(access) = &mut source.access
+        && let Some(dropped) = access.budget.tick(now_ns)
+    {
+        tracing::warn!(
+            log = %path.display(),
+            dropped = dropped.total(),
+            path_traversal = dropped.path_traversal,
+            sql_injection = dropped.sql_injection,
+            scanner_user_agent = dropped.scanner_user_agent,
+            webshell_like = dropped.webshell_like,
+            "log source: request events shed over budget (still counted in the window summary)"
+        );
+    }
+    let Source {
+        tailer,
+        stats,
+        access,
+        ..
+    } = &mut *source;
+    let result = tailer.poll(|line| {
+        let event = match access {
+            Some(access) => access_line_to_event(line, now_ns, access, stats, &path),
+            None => mysql_line_to_event(line, now_ns, stats, &path),
+        };
+        if let Some(event) = event {
             events.push(event);
         }
     });
+    if let Some(access) = &mut source.access
+        && let Some(summary) = access.summarizer.tick(now_ns)
+    {
+        events.push(schema::Event::HttpSummary(summary));
+    }
     for event in events {
-        sink.on_event(event);
+        deliver(sink, event);
     }
     if let Some(m) = source.stats.watch.tick(now_ns) {
         sink.emit(MISPARSE_TECHNIQUE, &misparse_message(&path, source.kind, m));
@@ -318,5 +418,106 @@ mod tests {
         std::fs::write(&path, "garbage").unwrap();
         assert_eq!(read_position(&path), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const SEC: u64 = 1_000_000_000;
+    const NGINX: &str = "/var/log/nginx/access.log";
+
+    fn access_line(target: &str, status: u16, agent: &str) -> String {
+        format!(
+            r#"203.0.113.9 - - [10/Oct/2026:13:55:36 +0000] "GET {target} HTTP/1.1" {status} 10 "-" "{agent}""#
+        )
+    }
+
+    fn access() -> (Access, Stats) {
+        (
+            Access::new(AccessFormat::Combined, Path::new(NGINX)),
+            Stats::default(),
+        )
+    }
+
+    #[test]
+    fn a_request_that_matches_a_signature_yields_an_event_and_an_ordinary_one_does_not() {
+        let (mut acc, mut stats) = access();
+        let p = Path::new(NGINX);
+        let hit = access_line("/a.php?id=1%20union%20select%201", 200, "curl/8");
+        let Some(schema::Event::HttpRequest(e)) =
+            access_line_to_event(&hit, 7, &mut acc, &mut stats, p)
+        else {
+            panic!("expected an HttpRequest event");
+        };
+        assert_eq!(e.signature, schema::HttpSignature::SqlInjection);
+        assert_eq!(e.path, "/a.php");
+        assert_eq!(e.meta.timestamp_ns, 7);
+
+        let ordinary = access_line("/index.html", 200, "Mozilla/5.0");
+        assert!(access_line_to_event(&ordinary, 8, &mut acc, &mut stats, p).is_none());
+        assert_eq!(stats.parse_failures, 0);
+    }
+
+    #[test]
+    fn every_parsed_request_reaches_the_window_summary_matched_or_not() {
+        let (mut acc, mut stats) = access();
+        let p = Path::new(NGINX);
+        access_line_to_event(&access_line("/", 200, "x"), SEC, &mut acc, &mut stats, p);
+        access_line_to_event(
+            &access_line("/missing", 404, "x"),
+            SEC,
+            &mut acc,
+            &mut stats,
+            p,
+        );
+        access_line_to_event(
+            &access_line("/a?q=../../etc/passwd", 200, "x"),
+            SEC,
+            &mut acc,
+            &mut stats,
+            p,
+        );
+        let summary = acc
+            .summarizer
+            .tick(62 * SEC)
+            .expect("a full window with requests");
+        assert_eq!(summary.requests, 3);
+        assert_eq!(summary.status_4xx, 1);
+        assert_eq!(summary.source, NGINX);
+    }
+
+    #[test]
+    fn a_flood_of_one_signature_is_shed_but_still_counted_and_does_not_hide_another() {
+        let (mut acc, mut stats) = access();
+        let p = Path::new(NGINX);
+        let sqli = access_line("/a?id=1%20union%20select%201", 200, "x");
+        let mut emitted = 0;
+        for _ in 0..100 {
+            if access_line_to_event(&sqli, SEC, &mut acc, &mut stats, p).is_some() {
+                emitted += 1;
+            }
+        }
+        assert_eq!(emitted, sensor_linux_logs::PER_SIGNATURE_PER_WINDOW);
+        let shell = access_line("/uploads/c99.php", 200, "x");
+        assert!(access_line_to_event(&shell, SEC, &mut acc, &mut stats, p).is_some());
+        let summary = acc.summarizer.tick(62 * SEC).unwrap();
+        assert_eq!(summary.requests, 101, "shed events are still counted");
+        assert_eq!(acc.budget.tick(62 * SEC).unwrap().sql_injection, 70);
+    }
+
+    #[test]
+    fn a_line_that_is_not_an_access_line_is_counted_and_feeds_the_misparse_watch() {
+        let (mut acc, mut stats) = access();
+        let p = Path::new(NGINX);
+        for _ in 0..20 {
+            assert!(
+                access_line_to_event("not an access log line", 10 * SEC, &mut acc, &mut stats, p)
+                    .is_none()
+            );
+        }
+        assert_eq!(stats.parse_failures, 20);
+        let m = stats.watch.tick(70 * SEC).expect("20 of 20 failed");
+        assert_eq!((m.parsed, m.failed), (0, 20));
+        assert!(
+            acc.summarizer.tick(70 * SEC).is_none(),
+            "no request, no summary"
+        );
     }
 }

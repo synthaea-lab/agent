@@ -22,12 +22,13 @@
 //! `HttpRequest` event when it matches a detection signature; a [`Summarizer`] yields
 //! one `HttpSummary` per source per window.
 //!
-//! **Status:** everything here is pure and tested; nothing writes or sends an event.
-//! Not here yet: wiring the access sources into the agent, and the credential
-//! redaction of an event's evidence value, which ADR-0018 puts at the agent's sink
-//! boundary (so the evidence leaves this crate cut but raw).
+//! **Status:** everything here is pure and tested; nothing writes or sends an event, the
+//! agent does (`agent/src/log_sources.rs`). The credential redaction of an event's
+//! evidence value is not here either: ADR-0018 puts it at the agent's sink boundary, so
+//! the evidence leaves this crate cut but raw.
 
 mod access;
+mod budget;
 mod health;
 mod http;
 mod mysql;
@@ -36,6 +37,7 @@ mod tail;
 mod tokenizer;
 
 pub use access::{AccessFormat, AccessRecord, parse_access_line};
+pub use budget::{Dropped, PER_SIGNATURE_PER_WINDOW, SignatureBudget};
 pub use health::{MIN_LINES, Misparse, MisparseWatch};
 pub use http::{EVIDENCE_MAX_CHARS, HTTP_LOG_COMM, Match, match_request, to_http_request_event};
 pub use mysql::{MYSQL_LOG_COMM, MysqlLoginFailure, parse_mysql_error_line, to_auth_event};
