@@ -17,7 +17,7 @@ mod queue;
 
 use std::{collections::HashMap, path::Path};
 
-pub use queue::{ScanOutcome, ScanQueue, ScanStats};
+pub use queue::{ScanContext, ScanOutcome, ScanQueue, ScanStats};
 use schema::detection::Severity;
 
 pub const MAX_SCAN_BYTES: u64 = 64 * 1024 * 1024;
