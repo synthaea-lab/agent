@@ -26,7 +26,9 @@ use std::{
 
 use config::{LogSourceConfig, LogSourceKind};
 use schema::sensor::EventSink as _;
-use sensor_linux_logs::{Position, Tailer, parse_mysql_error_line, to_auth_event};
+use sensor_linux_logs::{
+    Misparse, MisparseWatch, Position, Tailer, parse_mysql_error_line, to_auth_event,
+};
 
 use crate::{
     shutdown::{ShutdownPlan, sleep_unless_stopped},
@@ -70,10 +72,13 @@ pub(crate) fn write_position(path: &Path, position: &Position) {
     }
 }
 
-/// Health counters for one source. Logged for now; the health beacon is a follow-up.
+/// Health counters for one source. The counts are logged; a source whose lines mostly
+/// fail to parse is reported as an alert (see [`poll_source`]), not on the health
+/// beacon, whose wire shape the server reads and this slice does not change.
 #[derive(Debug, Default)]
 struct Stats {
     parse_failures: u64,
+    watch: MisparseWatch,
 }
 
 /// One log line of a `mysql_error` source, as the event it yields. `None` for an
@@ -85,10 +90,14 @@ fn mysql_line_to_event(
     path: &Path,
 ) -> Option<schema::Event> {
     match parse_mysql_error_line(line) {
-        Ok(Some(failure)) => Some(schema::Event::Auth(to_auth_event(&failure, now_ns))),
+        Ok(Some(failure)) => {
+            stats.watch.record(true, now_ns);
+            Some(schema::Event::Auth(to_auth_event(&failure, now_ns)))
+        }
         Ok(None) => None,
         Err(e) => {
             stats.parse_failures += 1;
+            stats.watch.record(false, now_ns);
             // First failure, then every thousandth: a custom format would otherwise
             // log once per line. The sample is attacker-controlled text, so it is
             // cut and escaped (`{:?}`), never written raw.
@@ -110,7 +119,24 @@ fn mysql_line_to_event(
     }
 }
 
+/// Alert id for a source that is read but not understood. Not an ATT&CK technique: a
+/// sentinel like the correlator's `BAYES`, since the finding is that a detection source
+/// is blind (a custom format, a server wording change), not an attacker behaviour.
+const MISPARSE_TECHNIQUE: &str = "LOG-SOURCE";
+
+fn misparse_message(path: &Path, kind: LogSourceKind, m: Misparse) -> String {
+    format!(
+        "log source {} ({kind:?}): {} of {} lines in the last minute do not match the \
+         declared kind: the source is probably misconfigured (a custom format, or a server \
+         that words the line differently) and detections from it are blind",
+        path.display(),
+        m.failed,
+        m.parsed.saturating_add(m.failed),
+    )
+}
+
 struct Source {
+    kind: LogSourceKind,
     tailer: Tailer,
     position_path: PathBuf,
     last_saved: Option<Position>,
@@ -134,6 +160,7 @@ pub(crate) fn spawn(
                 let position_path = position_path_for(alerts, &source.path);
                 let saved = read_position(&position_path);
                 active.push(Source {
+                    kind: source.kind,
                     tailer: Tailer::new(&source.path, saved),
                     position_path,
                     last_saved: saved,
@@ -184,6 +211,9 @@ fn poll_source(source: &mut Source, sink: &DetectionSink) {
     });
     for event in events {
         sink.on_event(event);
+    }
+    if let Some(m) = source.stats.watch.tick(now_ns) {
+        sink.emit(MISPARSE_TECHNIQUE, &misparse_message(&path, source.kind, m));
     }
     match result {
         Ok(outcome) => {
@@ -240,6 +270,27 @@ mod tests {
         let broken = "[Warning] Access denied for user 'u'@'h' (using password: YES)";
         assert!(mysql_line_to_event(broken, 1, &mut stats, p).is_none());
         assert_eq!(stats.parse_failures, 1);
+    }
+
+    #[test]
+    fn a_source_whose_login_lines_all_fail_to_parse_is_flagged_once() {
+        const SEC: u64 = 1_000_000_000;
+        let mut stats = Stats::default();
+        let p = Path::new("/var/log/mysql/error.log");
+        let broken = "[Warning] Access denied for user 'u'@'h' wat";
+        for _ in 0..20 {
+            assert!(mysql_line_to_event(broken, 10 * SEC, &mut stats, p).is_none());
+        }
+        let m = stats.watch.tick(70 * SEC).expect("20 of 20 failed");
+        assert_eq!((m.parsed, m.failed), (0, 20));
+        let text = misparse_message(p, LogSourceKind::MysqlError, m);
+        assert!(text.contains("20 of 20") && text.contains("/var/log/mysql/error.log"));
+        // Ordinary lines the parser ignores on purpose say nothing about the format.
+        let ok_line = "2026-10-01 12:00:00 0 [Note] ready for connections";
+        for _ in 0..50 {
+            mysql_line_to_event(ok_line, 80 * SEC, &mut stats, p);
+        }
+        assert_eq!(stats.watch.tick(140 * SEC), None);
     }
 
     #[test]

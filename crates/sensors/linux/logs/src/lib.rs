@@ -28,6 +28,7 @@
 //! boundary (so the evidence leaves this crate cut but raw).
 
 mod access;
+mod health;
 mod http;
 mod mysql;
 mod summary;
@@ -35,6 +36,7 @@ mod tail;
 mod tokenizer;
 
 pub use access::{AccessFormat, AccessRecord, parse_access_line};
+pub use health::{MIN_LINES, Misparse, MisparseWatch};
 pub use http::{EVIDENCE_MAX_CHARS, HTTP_LOG_COMM, Match, match_request, to_http_request_event};
 pub use mysql::{MYSQL_LOG_COMM, MysqlLoginFailure, parse_mysql_error_line, to_auth_event};
 pub use summary::{MAX_TRACKED_CLIENTS, Summarizer, TOP_CLIENTS, WINDOW_SECS};
