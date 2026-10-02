@@ -1,0 +1,20 @@
+[package]
+name = "release-tool"
+version = "0.1.0"
+description = "Offline release tooling: build and sign the manifests the updater verifies (ADR-0015, ADR-0016)"
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ring = "0.17"
+serde_json = { workspace = true }
+updater = { path = "../crates/updater" }
+
+[dev-dependencies]
+tempfile = "3"
