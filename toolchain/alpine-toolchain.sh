@@ -33,7 +33,8 @@ $APK update -q
 # with "unrecognized option: zstd") — needed to unpack bpf-linker's release
 # archive below.
 $APK add -q \
-  build-base curl git pkgconf rsync tar zstd bind-tools \
+  bash build-base binutils cmake coreutils curl dpkg file findutils git pkgconf \
+  python3 python3-dev py3-pip rsync tar zstd bind-tools \
   openssl-dev zstd-dev elfutils-dev \
   clang llvm-dev
 

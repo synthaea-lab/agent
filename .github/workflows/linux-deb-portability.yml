@@ -1,0 +1,70 @@
+name: Linux static .deb portability
+
+on:
+  pull_request:
+    paths:
+      - "agent/**"
+      - "crates/ml/**"
+      - "crates/sensors/linux/**"
+      - "crates/updater/**"
+      - "packaging/linux/**"
+      - "lab/provisioning/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/config.toml"
+      - "rust-toolchain.toml"
+      - "ebpf-toolchain.txt"
+      - ".github/workflows/linux-deb-portability.yml"
+  push:
+    branches: [main]
+    paths:
+      - "agent/**"
+      - "crates/ml/**"
+      - "crates/sensors/linux/**"
+      - "crates/updater/**"
+      - "packaging/linux/**"
+      - "lab/provisioning/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/config.toml"
+      - "rust-toolchain.toml"
+      - "ebpf-toolchain.txt"
+      - ".github/workflows/linux-deb-portability.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-check-static-deb:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build and test the package on Alpine/musl
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -v /sys/kernel/btf:/sys/kernel/btf:ro \
+            -w /work alpine:3.24 sh -lc '
+              apk add --no-cache sudo
+              export SYNTHAEA_SRC=/work
+              ./lab/provisioning/alpine-toolchain.sh
+              ./packaging/linux/build-deb.sh
+              chown -R "$(stat -c %u /work)":"$(stat -c %g /work)" /work/target /work/onnxruntime
+            '
+
+      - name: Run packaged agent on supported glibc userlands
+        run: |
+          mkdir -p "$RUNNER_TEMP/synthaea-package"
+          dpkg-deb -x target/debian/*.deb "$RUNNER_TEMP/synthaea-package"
+          for image in ubuntu:22.04 debian:12 rockylinux:9; do
+            echo "Checking agent in $image"
+            docker run --rm \
+              -v "$RUNNER_TEMP/synthaea-package:/package:ro" \
+              "$image" \
+              /package/var/lib/synthaea/bootstrap/agent --help
+          done
