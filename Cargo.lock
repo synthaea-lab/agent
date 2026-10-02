@@ -2341,6 +2341,7 @@ name = "sensor-linux-logs"
 version = "0.1.0"
 dependencies = [
  "schema",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.20",
 ]
