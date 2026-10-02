@@ -16,10 +16,12 @@
 //! Host isolation and [`live`] (blocked on `transport`/server-side analyst auth)
 //! are follow-up scope.
 
+pub mod escalate;
 pub mod kill;
 pub mod live;
 pub mod quarantine;
 
+pub use escalate::{ESCALATION_THRESHOLD, should_escalate};
 pub use kill::{KillOutcome, kill_process};
 pub use quarantine::{
     QuarantineOutcome, QuarantinedFile, is_still_quarantined, list_quarantined, quarantine_file,

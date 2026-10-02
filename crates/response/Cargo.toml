@@ -11,4 +11,5 @@ workspace = true
 
 [dependencies]
 policy = { path = "../policy" }
+schema = { path = "../schema" }
 sha2 = "0.11"

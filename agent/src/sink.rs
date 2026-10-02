@@ -437,7 +437,30 @@ impl DetectionSink {
                 .unwrap()
                 .record(entity.clone(), technique, detection, now_ns);
         self.emit(technique, message);
+        if let Some(fused) = &result {
+            self.maybe_escalate(fused);
+        }
         result
+    }
+
+    /// Issue #612: the first response decision to read the fused verdict. A new
+    /// verdict snapshot (first sighting, a severity raise, or a recurrence outside
+    /// the dedup window — never a silently absorbed duplicate) whose composed
+    /// severity warrants it raises one `RESPONSE-ESCALATE` audit alert. Never
+    /// kills or quarantines, and works with or without `enable_response`.
+    fn maybe_escalate(&self, fused: &verdict::Verdict) {
+        if !response::should_escalate(fused.severity) {
+            return;
+        }
+        let message = format!(
+            "escalated {}:{} at {:?} severity across {} source(s): {}",
+            fused.entity.ppid,
+            fused.entity.comm,
+            fused.severity,
+            fused.sources.len(),
+            fused.techniques.join(", ")
+        );
+        self.emit("RESPONSE-ESCALATE", &message);
     }
 
     /// [`Self::record_and_emit`] for a batch of plain `rules::Alert`s (no Sigma/
@@ -1752,6 +1775,45 @@ detection:
             .peek(&verdict::EntityKey::new(1, "bash"))
             .expect("the Sigma hit is folded into the entity's verdict");
         assert_eq!(verdict.severity, schema::detection::Severity::Critical);
+    }
+
+    #[test]
+    fn a_critical_fused_verdict_raises_an_escalation_alert_without_killing() {
+        let (dir, sink) = critical_sigma_sink("sigma-critical-escalates");
+        let killed = Arc::new(Mutex::new(Vec::new()));
+        let killed_rec = Arc::clone(&killed);
+        sink.enable_response(
+            policy::ResponsePolicy {
+                kill_enabled: true,
+                quarantine_enabled: true,
+            },
+            move |pid| {
+                killed_rec.lock().unwrap().push(pid);
+                Ok(())
+            },
+            dir.join("quarantine"),
+        );
+        sink.on_event(exec(912, "run", "/opt/reload-content-marker"));
+        assert!(
+            alerts_in(&dir).contains("RESPONSE-ESCALATE"),
+            "{}",
+            alerts_in(&dir)
+        );
+        assert!(killed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_medium_fused_verdict_does_not_escalate() {
+        let dir = tmp("medium-no-escalate");
+        let sink = sink_in(&dir);
+        sink.on_event(exec(
+            913,
+            "bash -c echo cGF5bG9hZAo= | base64 -d | sh",
+            "/bin/bash",
+        ));
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("T1059.004"), "{alerts}");
+        assert!(!alerts.contains("RESPONSE-ESCALATE"), "{alerts}");
     }
 
     #[test]
