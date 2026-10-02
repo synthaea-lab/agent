@@ -22,11 +22,16 @@ const SETTLE: Duration = Duration::from_millis(200);
 /// Who caused a scan request: the process behind the file write that queued it.
 /// Scanning is deliberately decoupled from that process (the settle delay below),
 /// so the identity has to travel with the request for a match to be attributed.
-/// The fields mirror the correlator's entity join `(ppid, comm)` (issue #614).
+/// The fields mirror the correlator's entity join `(ppid, comm)` plus the parent's
+/// incarnation (issues #614, #592).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanContext {
     pub ppid: u32,
     pub comm: String,
+    /// The incarnation of the parent `ppid` names, when the sensor stamped one
+    /// (`EventMeta::parent_process_generation`): without it a recycled parent pid
+    /// would let a match join the previous parent's entity.
+    pub parent_generation: Option<u64>,
     /// Timestamp of the triggering event: the clock the entity's other findings
     /// use, not the later scan time, so dedup windows compare like with like.
     pub timestamp_ns: u64,
@@ -234,6 +239,7 @@ rule ctx {
         let context = ScanContext {
             ppid: 42,
             comm: "dropper".into(),
+            parent_generation: Some(3),
             timestamp_ns: 7,
         };
         queue.enqueue_for(path, context.clone());

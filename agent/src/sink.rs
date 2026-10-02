@@ -105,6 +105,23 @@ fn entity_key(meta: &schema::EventMeta) -> verdict::EntityKey {
         .with_parent_generation(meta.parent_process_generation)
 }
 
+/// The escalation decision (#612) as a free function so the YARA scan worker, which
+/// has no `DetectionSink`, raises the same alert as every other engine (#614).
+fn escalate_if_warranted(alert_log: &AlertLog, fused: &verdict::Verdict) {
+    if !response::should_escalate(fused.severity) {
+        return;
+    }
+    let message = format!(
+        "escalated {}:{} at {:?} severity across {} source(s): {}",
+        fused.entity.ppid,
+        fused.entity.comm,
+        fused.severity,
+        fused.sources.len(),
+        fused.techniques.join(", ")
+    );
+    alert_log.record("RESPONSE-ESCALATE", message);
+}
+
 /// The `case_id` of a correlator finding: `{ppid}:{comm}`, with `@{generation}` of the
 /// parent appended when it is known, so two incarnations of a recycled parent pid do not
 /// share one case. The server treats it as an opaque string.
@@ -442,18 +459,7 @@ impl DetectionSink {
     /// severity warrants it raises one `RESPONSE-ESCALATE` audit alert. Never
     /// kills or quarantines, and works with or without `enable_response`.
     fn maybe_escalate(&self, fused: &verdict::Verdict) {
-        if !response::should_escalate(fused.severity) {
-            return;
-        }
-        let message = format!(
-            "escalated {}:{} at {:?} severity across {} source(s): {}",
-            fused.entity.ppid,
-            fused.entity.comm,
-            fused.severity,
-            fused.sources.len(),
-            fused.techniques.join(", ")
-        );
-        self.emit("RESPONSE-ESCALATE", &message);
+        escalate_if_warranted(&self.alert_log, fused);
     }
 
     /// [`Self::record_and_emit`] for a batch of plain `rules::Alert`s (no Sigma/
@@ -649,6 +655,7 @@ impl DetectionSink {
                 yara::ScanContext {
                     ppid: meta.ppid,
                     comm: meta.comm.clone(),
+                    parent_generation: meta.parent_process_generation,
                     timestamp_ns: meta.timestamp_ns,
                 },
             );
@@ -915,11 +922,18 @@ fn start_yara(
             tracing::info!(rules = rule_count, "yara: rules loaded");
             let queue = yara::ScanQueue::start(rules, move |outcome| {
                 let matched = !outcome.matches.is_empty();
-                if let Some(context) = &outcome.context {
-                    for rule in &outcome.matches {
-                        fuse_yara_match(&verdict, context, rule);
-                    }
-                }
+                // Fuse before the alert lines below: the verdict is the state they
+                // report on, and a reader waiting for the `YARA` line may look at it.
+                let fused: Vec<verdict::Verdict> = outcome
+                    .context
+                    .iter()
+                    .flat_map(|context| {
+                        outcome
+                            .matches
+                            .iter()
+                            .filter_map(|rule| fuse_yara_match(&verdict, context, rule))
+                    })
+                    .collect();
                 for rule in &outcome.matches {
                     let message = format!(
                         "yara rule {} matched {}",
@@ -927,6 +941,9 @@ fn start_yara(
                         outcome.path.display()
                     );
                     alert_log.record("YARA", message);
+                }
+                for verdict in &fused {
+                    escalate_if_warranted(&alert_log, verdict);
                 }
                 if matched {
                     quarantine_matched_payload(&response, &outcome.path, &alert_log);
@@ -964,7 +981,8 @@ fn fuse_yara_match(
         techniques: techniques_from(&rule.technique),
         events: Vec::new(),
     };
-    let entity = verdict::EntityKey::new(context.ppid, context.comm.clone());
+    let entity = verdict::EntityKey::new(context.ppid, context.comm.clone())
+        .with_parent_generation(context.parent_generation);
     verdict
         .lock()
         .unwrap()
@@ -1894,6 +1912,7 @@ detection:
         yara::ScanContext {
             ppid: meta.ppid,
             comm: meta.comm.clone(),
+            parent_generation: meta.parent_process_generation,
             timestamp_ns: meta.timestamp_ns,
         }
     }
@@ -2124,6 +2143,70 @@ detection:
 
         assert!(sink.unsuppress_verdict(meta.ppid, &meta.comm, "T1105"));
         assert!(record().is_some(), "lifting the mark restores fusion");
+    }
+
+    /// #592 applied to YARA: a match from a recycled parent pid is a new entity and
+    /// must not inherit the previous parent's evidence or severity.
+    #[test]
+    fn a_yara_match_from_a_recycled_parent_does_not_inherit_the_previous_parents_verdict() {
+        let dir = tmp("yara-fusion-recycled-parent");
+        let sink = sink_in(&dir);
+        let first = EventMeta {
+            ppid: 500,
+            comm: "dropper".into(),
+            parent_process_generation: Some(1),
+            ..schema::fixtures::meta()
+        };
+        super::fuse_yara_match(
+            &sink.verdict,
+            &yara_context(&first),
+            &yara_match("T1105", schema::detection::Severity::Critical),
+        )
+        .unwrap();
+
+        let recycled = EventMeta {
+            parent_process_generation: Some(2),
+            ..first
+        };
+        let fused = super::fuse_yara_match(
+            &sink.verdict,
+            &yara_context(&recycled),
+            &yara_match("T1071", schema::detection::Severity::Low),
+        )
+        .unwrap();
+        assert_eq!(fused.severity, schema::detection::Severity::Low);
+        assert_eq!(fused.techniques, vec!["T1071"]);
+    }
+
+    /// #614 + #612: a High-or-above YARA match escalates like any other engine's
+    /// finding; the low-severity marker rule used elsewhere does not.
+    #[test]
+    fn a_high_severity_yara_match_raises_an_escalation_alert() {
+        let dir = tmp("yara-fusion-escalate");
+        let yara_dir = dir.join("content").join("rules").join("yara");
+        std::fs::create_dir_all(&yara_dir).unwrap();
+        std::fs::write(
+            yara_dir.join("marker.yar"),
+            RESPONSE_MARKER_RULE.replace("severity = \"low\"", "severity = \"high\""),
+        )
+        .unwrap();
+        let payload = dir.join("payload.bin");
+        std::fs::write(&payload, b"dropped payload RESPONSE-SCENARIO-MARKER").unwrap();
+        let sink = sink_in(&dir);
+        assert_eq!(sink.reload_content().yara_rule_count, Some(1));
+
+        let meta = EventMeta {
+            ppid: 778,
+            comm: "dropper".into(),
+            ..schema::fixtures::meta()
+        };
+        sink.on_event(Event::FileOpen(schema::FileOpenEvent {
+            meta,
+            path: payload.display().to_string(),
+            flags: 0o101,
+        }));
+        let alerts = wait_for_alert(&dir, "RESPONSE-ESCALATE");
+        assert!(alerts.contains("778:dropper"), "{alerts}");
     }
 
     #[test]
