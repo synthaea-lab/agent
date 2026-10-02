@@ -13,6 +13,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 sensor-linux-audit = { path = "../crates/sensors/linux/audit" }
+sensor-linux-logs = { path = "../crates/sensors/linux/logs" }
 sensor-linux-netlink = { path = "../crates/sensors/linux/netlink" }
 
 [[bin]]
@@ -25,6 +26,13 @@ bench = false
 [[bin]]
 name = "netlink_parse"
 path = "fuzz_targets/netlink_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "logs_parse"
+path = "fuzz_targets/logs_parse.rs"
 test = false
 doc = false
 bench = false
