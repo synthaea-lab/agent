@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use schema::Event;
+use schema::{Event, detection::Severity};
 use store::BoundedMap;
 
 use crate::{
@@ -424,6 +424,7 @@ impl CorrelationEngine {
             state.alerted = true;
             Some(CorrelationAlert {
                 technique: "BAYES",
+                severity: Severity::Critical,
                 message: format!(
                     "pid={pid} comm={comm}: high Bayesian score \
                      (log_odds={:.2}, P={:.0}%)",

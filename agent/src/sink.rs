@@ -125,31 +125,14 @@ fn correlator_case_id(entity: &verdict::EntityKey) -> String {
 /// second occurrence of the same technique still gets its own finding.
 const VERDICT_DEDUP_WINDOW_NS: u64 = 30_000_000_000; // 30s
 
-/// Severity for a finding, until issue #73/#467's per-rule severity metadata
-/// lands on `main` — `rules`/`correlator` alerts carry no severity field yet on
-/// this branch (only `technique: &'static str` + `message`), so this is a
-/// deliberate placeholder, not real calibration. `BAYES` keeps the significance
-/// it already had before this issue (the correlator's belief crossing its
-/// confidence threshold, gated for process-kill by `response`); everything else
-/// defaults to `Medium`. Swap this for reading a real per-rule `Severity` once
-/// #73 lands it — the fusion engine itself doesn't care where severity comes
-/// from.
-fn default_severity(technique: &str) -> schema::detection::Severity {
-    if technique == "BAYES" {
-        schema::detection::Severity::Critical
-    } else {
-        schema::detection::Severity::Medium
-    }
-}
-
 /// Whether an alert raised by the correlator makes its process eligible for
 /// `response`'s kill (issue #25). Deliberately its own question, not "severity is
 /// `Critical`": a Sigma rule's `level: critical` is an analyst-facing ranking
 /// written by a rule author, not a belief the correlator has earned, and a
 /// severity that merely feeds the verdict must never widen what the agent kills
 /// (issue #131 follow-up). Only the correlator's belief crossing its threshold
-/// qualifies, which is what `default_severity` made `Critical` before severity
-/// became data.
+/// qualifies. (`BAYES` also carries `Critical` severity, but that is a coincidence
+/// of the ranking, not what gates the kill.)
 fn crosses_kill_gate(technique: &str) -> bool {
     technique == "BAYES"
 }
@@ -478,7 +461,7 @@ impl DetectionSink {
                 alert.technique,
                 &alert.message,
                 source,
-                default_severity(alert.technique),
+                alert.severity,
                 event,
             );
         }
@@ -567,7 +550,7 @@ impl DetectionSink {
                 alert.technique,
                 &alert.message,
                 source,
-                default_severity(alert.technique),
+                alert.severity,
                 event,
             );
             if crosses_kill_gate(alert.technique) {
@@ -1814,6 +1797,58 @@ detection:
         let alerts = alerts_in(&dir);
         assert!(alerts.contains("T1059.004"), "{alerts}");
         assert!(!alerts.contains("RESPONSE-ESCALATE"), "{alerts}");
+    }
+
+    /// A built-in rule that fires on a plain exec: `T1490`, severity `High`.
+    const SHADOW_DELETE: &str = "vssadmin.exe Delete Shadows /All /Quiet";
+
+    /// #615: a built-in rule's own severity reaches the fused verdict, instead of
+    /// the flat placeholder every non-`BAYES` finding used to get.
+    #[test]
+    fn a_built_in_rules_own_severity_reaches_the_fused_verdict() {
+        let dir = tmp("builtin-severity");
+        let sink = sink_in(&dir);
+        sink.on_event(exec(920, SHADOW_DELETE, "/usr/bin/vssadmin"));
+        let fused = sink
+            .verdict
+            .lock()
+            .unwrap()
+            .peek(&verdict::EntityKey::new(1, "bash"))
+            .expect("the built-in alert is folded into the entity's verdict");
+        assert!(fused.techniques.contains(&"T1490".to_string()), "{fused:?}");
+        assert_eq!(fused.severity, schema::detection::Severity::High);
+    }
+
+    /// #615: a high-severity built-in alert must never terminate a process by
+    /// severity alone: only the correlator's `BAYES` crossing gates kill.
+    #[test]
+    fn a_high_severity_built_in_alert_never_triggers_a_kill() {
+        let dir = tmp("builtin-high-no-kill");
+        let sink = sink_in(&dir);
+        let killed = Arc::new(Mutex::new(Vec::new()));
+        let killed_rec = Arc::clone(&killed);
+        sink.enable_response(
+            policy::ResponsePolicy {
+                kill_enabled: true,
+                quarantine_enabled: false,
+            },
+            move |pid| {
+                killed_rec.lock().unwrap().push(pid);
+                Ok(())
+            },
+            dir.join("quarantine"),
+        );
+        sink.on_event(exec(921, SHADOW_DELETE, "/usr/bin/vssadmin"));
+        assert!(alerts_in(&dir).contains("T1490"), "{}", alerts_in(&dir));
+        assert!(
+            killed.lock().unwrap().is_empty(),
+            "severity alone must never gate a kill"
+        );
+        assert!(
+            !alerts_in(&dir).contains("killed pid"),
+            "{}",
+            alerts_in(&dir)
+        );
     }
 
     #[test]
