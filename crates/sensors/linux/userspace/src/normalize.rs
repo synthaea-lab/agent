@@ -93,7 +93,10 @@ use sensor_linux_wire as wire;
 /// returned); `memfd_create` passes it through unchanged.
 ///
 /// v19 (#457) added `PrctlEvent`; `prctl` maps it one-to-one.
-const _: () = assert!(wire::WIRE_VERSION == 20);
+///
+/// v21 (#515) added `old_dfd`/`new_dfd` to `FileRenameEvent`; `file_rename` resolves a
+/// relative path against them.
+const _: () = assert!(wire::WIRE_VERSION == 21);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
@@ -227,11 +230,60 @@ pub fn file_rename(
         .iter()
         .position(|&b| b == 0)
         .unwrap_or(new_raw.len());
+    let pid = event.meta.pid;
     Event::FileRename(FileRenameEvent {
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
-        old_path: String::from_utf8_lossy(&old_raw[..old_end]).into_owned(),
-        new_path: String::from_utf8_lossy(&new_raw[..new_end]).into_owned(),
-        executable_path: exe_path_for_pid(event.meta.pid),
+        old_path: resolve_dirfd_path(pid, event.old_dfd, &old_raw[..old_end]),
+        new_path: resolve_dirfd_path(pid, event.new_dfd, &new_raw[..new_end]),
+        executable_path: exe_path_for_pid(pid),
+    })
+}
+
+/// `AT_FDCWD`: "relative to the current directory", what `rename(2)` implies and what
+/// a `renameat` caller passes for the same.
+const AT_FDCWD: i32 = -100;
+
+/// Turns a rename path the caller wrote relative to a directory fd into an absolute
+/// one (#515), so path-prefix rules (`RANSOMWARE_EXCLUDED_PATH_PREFIXES`) can see it.
+/// An absolute path is returned as it is (the kernel ignores the fd for those).
+///
+/// The directory comes from `/proc/<pid>/cwd` for `AT_FDCWD` and `/proc/<pid>/fd/<n>`
+/// otherwise, read at *normalize* time. That races the process: a short-lived `mv`
+/// that has already exited cannot be resolved, and neither can a directory fd that
+/// was closed or whose directory was deleted. In every such case the raw relative
+/// path is returned unchanged, which is exactly what the sensor reported before and
+/// never a guessed directory: a wrong absolute path would be worse than a relative
+/// one, because a prefix exclusion would then act on a place the rename never touched.
+fn resolve_dirfd_path(pid: u32, dfd: i32, raw: &[u8]) -> String {
+    let path = String::from_utf8_lossy(raw).into_owned();
+    if path.is_empty() || path.starts_with('/') {
+        return path;
+    }
+    let link = if dfd == AT_FDCWD {
+        format!("/proc/{pid}/cwd")
+    } else if dfd >= 0 {
+        format!("/proc/{pid}/fd/{dfd}")
+    } else {
+        return path;
+    };
+    match std::fs::read_link(link) {
+        Ok(base) => join_resolved(&base, &path).unwrap_or(path),
+        Err(_) => path,
+    }
+}
+
+/// `base` joined with the relative `path`, or `None` when `base` is not a usable
+/// directory: not absolute (a pipe or socket fd reads as `pipe:[123]`), or a directory
+/// that has since been deleted (the kernel appends ` (deleted)`).
+fn join_resolved(base: &std::path::Path, path: &str) -> Option<String> {
+    let base = base.to_str()?;
+    if !base.starts_with('/') || base.ends_with(" (deleted)") {
+        return None;
+    }
+    Some(if base.ends_with('/') {
+        format!("{base}{path}")
+    } else {
+        format!("{base}/{path}")
     })
 }
 
@@ -930,6 +982,9 @@ mod tests {
             old_path_len: old_raw.len() as u16,
             new_path,
             new_path_len: new_raw.len() as u16,
+            reserved: 0,
+            old_dfd: AT_FDCWD,
+            new_dfd: AT_FDCWD,
         };
         let Event::FileRename(e) = file_rename(&event, 0, None) else {
             panic!("wrong variant")
@@ -973,6 +1028,9 @@ mod tests {
             old_path_len: old_raw.len() as u16,
             new_path,
             new_path_len: new_raw.len() as u16,
+            reserved: 0,
+            old_dfd: AT_FDCWD,
+            new_dfd: AT_FDCWD,
         };
         let Event::FileRename(e) = file_rename(&event, 0, None) else {
             panic!("wrong variant")
@@ -1499,5 +1557,101 @@ mod tests {
         assert_eq!(e.syscall, NamespaceSyscall::Unshare);
         assert_eq!(e.fd, None);
         assert_eq!(e.flags, 0x0002_0000);
+    }
+
+    fn rename_with(
+        pid: u32,
+        old: &[u8],
+        old_dfd: i32,
+        new: &[u8],
+        new_dfd: i32,
+    ) -> FileRenameEvent {
+        let mut old_path = [0u8; wire::MAX_PATH_LEN];
+        old_path[..old.len()].copy_from_slice(old);
+        let mut new_path = [0u8; wire::MAX_PATH_LEN];
+        new_path[..new.len()].copy_from_slice(new);
+        let mut meta = wire_meta(b"mv");
+        meta.pid = pid;
+        let event = wire::FileRenameEvent {
+            meta,
+            old_path,
+            old_path_len: old.len() as u16,
+            new_path,
+            new_path_len: new.len() as u16,
+            reserved: 0,
+            old_dfd,
+            new_dfd,
+        };
+        let Event::FileRename(e) = file_rename(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        e
+    }
+
+    #[test]
+    fn an_absolute_rename_path_is_never_touched() {
+        let e = rename_with(u32::MAX, b"/tmp/a\0", AT_FDCWD, b"/tmp/b\0", 3);
+        assert_eq!(
+            (e.old_path.as_str(), e.new_path.as_str()),
+            ("/tmp/a", "/tmp/b")
+        );
+    }
+
+    #[test]
+    fn a_relative_path_whose_process_is_gone_stays_as_the_sensor_reported_it() {
+        // No such pid: nothing to resolve against, so no guess.
+        let e = rename_with(u32::MAX, b"f1\0", AT_FDCWD, b"f1.bak\0", AT_FDCWD);
+        assert_eq!((e.old_path.as_str(), e.new_path.as_str()), ("f1", "f1.bak"));
+    }
+
+    #[test]
+    fn a_negative_dirfd_other_than_the_cwd_is_not_resolved() {
+        assert_eq!(resolve_dirfd_path(std::process::id(), -1, b"x"), "x");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_relative_path_is_resolved_against_the_processs_cwd_for_at_fdcwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let resolved = resolve_dirfd_path(std::process::id(), AT_FDCWD, b"f1.bak");
+        assert_eq!(resolved, format!("{}/f1.bak", cwd.display()));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_relative_path_is_resolved_against_a_real_directory_fd() {
+        use std::os::fd::AsRawFd as _;
+        let dir = std::env::temp_dir().join(format!("normalize-dfd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let handle = std::fs::File::open(&dir).unwrap();
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+
+        let resolved = resolve_dirfd_path(std::process::id(), handle.as_raw_fd(), b"usr/bin/x");
+
+        assert_eq!(resolved, format!("{}/usr/bin/x", canonical.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_dirfd_that_is_not_a_directory_is_not_resolved() {
+        use std::os::fd::AsRawFd as _;
+        let (reader, _writer) = std::io::pipe().unwrap();
+        // /proc/<pid>/fd/<n> reads as `pipe:[ino]`, which is no directory.
+        assert_eq!(
+            resolve_dirfd_path(std::process::id(), reader.as_raw_fd(), b"x"),
+            "x"
+        );
+    }
+
+    #[test]
+    fn a_deleted_directory_is_not_a_base() {
+        let base = std::path::Path::new("/tmp/gone (deleted)");
+        assert_eq!(join_resolved(base, "f"), None);
+        assert_eq!(join_resolved(std::path::Path::new("pipe:[1]"), "f"), None);
+        assert_eq!(
+            join_resolved(std::path::Path::new("/tmp/"), "f").as_deref(),
+            Some("/tmp/f")
+        );
     }
 }
