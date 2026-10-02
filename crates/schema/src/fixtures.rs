@@ -28,15 +28,16 @@
 use core::net::{IpAddr, Ipv4Addr};
 
 use crate::{
-    AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, CapSetEvent, ConnectEvent,
-    DnsQueryEvent, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent,
-    FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
-    FileWriteEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent, KernelModuleAction,
-    KernelModuleEvent, ListenPortEvent, MemfdCreateEvent, NamespaceEvent, NamespaceSyscall,
-    NetworkFlowEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
-    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType, SmbConnectEvent,
-    SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection,
-    TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
+    AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, CapSetEvent,
+    ConnectEvent, DnsQueryEvent, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent,
+    FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent,
+    FileSetxattrEvent, FileWriteEvent, HttpRequestEvent, HttpSignature, HttpSummaryEvent,
+    IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent, KernelModuleAction, KernelModuleEvent,
+    ListenPortEvent, MemfdCreateEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent,
+    PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent,
+    RegistrySetEvent, ScriptBlockEvent, ShellType, SmbConnectEvent, SocketAcceptEvent,
+    SocketBindEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
+    UdpSendEvent, User, WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -123,6 +124,23 @@ pub fn image_load() -> ImageLoadEvent {
     ImageLoadEvent {
         meta: meta(),
         image_path: String::new(),
+    }
+}
+
+/// Neutral [`AmsiContentEvent`].
+#[must_use]
+pub fn amsi_content() -> AmsiContentEvent {
+    AmsiContentEvent {
+        meta: meta(),
+        session: 0,
+        app_name: String::new(),
+        content_name: None,
+        content_size: 0,
+        original_size: 0,
+        text: None,
+        text_truncated: false,
+        content_hash: String::new(),
+        scan_result: 0,
     }
 }
 
@@ -459,6 +477,38 @@ pub fn namespace() -> NamespaceEvent {
         syscall: NamespaceSyscall::SetNs,
         fd: None,
         flags: 0,
+    }
+}
+
+/// Neutral [`HttpRequestEvent`].
+#[must_use]
+pub fn http_request() -> HttpRequestEvent {
+    HttpRequestEvent {
+        meta: meta(),
+        client: None,
+        method: None,
+        path: String::new(),
+        param_names: Vec::new(),
+        status: 200,
+        signature: HttpSignature::PathTraversal,
+        evidence: None,
+        scanner: None,
+        truncated: false,
+    }
+}
+
+/// Neutral [`HttpSummaryEvent`].
+#[must_use]
+pub fn http_summary() -> HttpSummaryEvent {
+    HttpSummaryEvent {
+        meta: meta(),
+        source: String::new(),
+        window_secs: 60,
+        requests: 0,
+        status_4xx: 0,
+        status_5xx: 0,
+        distinct_clients: 0,
+        top_clients: Vec::new(),
     }
 }
 

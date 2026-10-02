@@ -220,7 +220,20 @@ pub mod time;
 /// remembers. Additive and optional (`None` on Windows and macOS, and on Linux
 /// events the sensor could not stamp), the same serialization-visible reasoning
 /// as v13-v34.
-pub const SCHEMA_VERSION: u32 = 35;
+///
+/// Bumped 35 → 36 for [`Event::HttpRequest`] and [`Event::HttpSummary`] (#478, ADR-0022):
+/// what the agent derives from a web server's access log — one event for a request
+/// that matches a detection signature, one summary per source per window. Neither
+/// reuses an existing variant (ADR-0022 §6); both carry a `meta` with `pid`/`ppid` 0,
+/// since a log line names no process. Same serialization-visible reasoning as v13-v35.
+///
+/// Bumped 36 → 37 for [`Event::AmsiContent`] (#282): the post-decoding buffer
+/// a runtime hands to AMSI before running it (EID 1101 of
+/// Microsoft-Antimalware-Scan-Interface). Windows-only, same posture as
+/// `ScriptBlock`. 36 was claimed by #478 (`HttpRequest`/`HttpSummary`) while
+/// both branches were open; #478 merged first, so this one renumbers — same
+/// coordination note as v13, v28→29, v30→31 and v32→33 above.
+pub const SCHEMA_VERSION: u32 = 37;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -969,6 +982,57 @@ pub struct ScriptBlockEvent {
     pub message_total: u32,
 }
 
+/// Content a runtime handed to AMSI before running it, from EID 1101 of the
+/// Microsoft-Antimalware-Scan-Interface provider (#282).
+///
+/// AMSI sees the **post-decoding** buffer: a Base64/XOR/format-string obfuscated
+/// payload is readable here, from every runtime that scans through AMSI
+/// (`PowerShell`, Windows Script Host's `VBScript`/`JScript`, Office VBA, .NET
+/// Framework 4.8+ assembly loads). Complements [`ScriptBlockEvent`], which only
+/// covers the `PowerShell` runtime and only what it logs.
+///
+/// What a runtime hands over differs: `PowerShell` passes every script and
+/// command, de-obfuscated; Windows Script Host passes only its sensitive
+/// runtime calls with their arguments (`IWshShell3.Run("cmd /c …")`,
+/// `VBScript` `Execute` content), not the whole script (lab, 2026-10-01).
+///
+/// `meta` is the scanning process (AMSI runs in-process). Identical content is
+/// rescanned constantly, so the sensor deduplicates on [`Self::content_hash`]
+/// and rate-limits per process; see the sensor's `amsi` module.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmsiContentEvent {
+    pub meta: EventMeta,
+    /// AMSI session handle: scans that belong together (e.g. the fragments of
+    /// one `PowerShell` command) share it. Opaque.
+    pub session: u64,
+    /// The runtime that asked for the scan, as AMSI reports it
+    /// (`PowerShell_C:\…\powershell.exe_10.0…`, `VBScript`, `JScript`,
+    /// `DotNet`, `OFFICE_VBA`, …).
+    pub app_name: String,
+    /// The content's name when the runtime gave one (a script path, a URL);
+    /// `None` for inline content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_name: Option<String>,
+    /// Size in bytes of the scanned buffer as AMSI reports it.
+    pub content_size: u32,
+    /// Size in bytes of the content before the runtime's own processing, as
+    /// AMSI reports it.
+    pub original_size: u32,
+    /// The scanned content decoded as text (UTF-16LE, as the script runtimes
+    /// hand it over), cut to the sensor's limit. `None` when the buffer is not
+    /// text (a .NET assembly image, Office VBA p-code) or AMSI filtered it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// `true` when [`Self::text`] was cut to the sensor's limit.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub text_truncated: bool,
+    /// SHA-256 of the scanned buffer, lowercase hex, as AMSI computed it.
+    pub content_hash: String,
+    /// The `AMSI_RESULT` the antimalware provider returned (0 clean,
+    /// `>= 32768` detected / blocked by admin policy).
+    pub scan_result: u32,
+}
+
 /// Image (DLL or EXE) loaded into a process address space.
 ///
 /// Emitted on EID 5 of the Microsoft-Windows-Kernel-Process provider, which is
@@ -1633,6 +1697,99 @@ pub struct PrctlEvent {
     pub arg: u64,
 }
 
+/// Which detection signature an [`HttpRequestEvent`] matched (ADR-0022 §3). A small
+/// fixed set: the agent never emits one event per request, only for these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpSignature {
+    /// `../` or its encoded forms in the path or a parameter value.
+    PathTraversal,
+    /// SQL injection markers in a parameter value.
+    SqlInjection,
+    /// A known scanner or exploitation tool named in the `User-Agent`.
+    ScannerUserAgent,
+    /// A request for a path or parameter typical of a dropped webshell.
+    WebshellLike,
+}
+
+/// The one parameter value a signature matched on, the only value of a request that
+/// leaves the host (ADR-0022 §4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpEvidence {
+    /// Name of the matched query parameter.
+    pub param: String,
+    /// The value, cut to 128 characters by the producer. Credential redaction
+    /// (ADR-0018) is not the producer's job: the agent's sink boundary applies it,
+    /// so a consumer downstream of that sink sees the redacted form.
+    pub value: String,
+}
+
+/// A web request that matched a detection signature, derived from an access-log line
+/// by the agent (issue #478, ADR-0022). Not one event per request: a request that
+/// matches nothing never becomes an event. The URL arrives reduced: the path and the
+/// query parameter *names*, never the values, except [`Self::evidence`].
+///
+/// `meta.pid`/`ppid` are 0 and `meta.comm` names the log source: an access-log line
+/// carries no process. `meta.timestamp_ns` is when the agent read the line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpRequestEvent {
+    pub meta: EventMeta,
+    /// The client, when the log holds an address. `None` for a resolved host name
+    /// (`HostnameLookups On`), never a fabricated one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<core::net::IpAddr>,
+    /// `None` when the request line was not parseable (`"-"`, or garbage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// The request path with the query string removed.
+    pub path: String,
+    /// Names of the query parameters, in order, without values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub param_names: Vec<String>,
+    pub status: u16,
+    pub signature: HttpSignature,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<HttpEvidence>,
+    /// For [`HttpSignature::ScannerUserAgent`]: the name of the matched tool
+    /// (`sqlmap`, `nikto`), not the `User-Agent` string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanner: Option<String>,
+    /// The log line was over the length cap and cut before it was parsed.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// One client in an [`HttpSummaryEvent`]'s ranking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpClientCount {
+    pub client: core::net::IpAddr,
+    /// Requests from this client that ended in a 4xx or 5xx status in the window.
+    pub failures: u32,
+}
+
+/// The access log of one source over one window (issue #478, ADR-0022 §3): counters
+/// and the clients with the most failing requests, the only thing the server sees of
+/// requests that matched no signature. Emitted once per source per window that saw at
+/// least one request: a quiet log is normal and an empty summary says nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpSummaryEvent {
+    /// Same `pid`/`ppid` 0 convention as [`HttpRequestEvent`]; `timestamp_ns` is the
+    /// end of the window.
+    pub meta: EventMeta,
+    /// The declared log file the counters come from.
+    pub source: String,
+    pub window_secs: u32,
+    pub requests: u32,
+    pub status_4xx: u32,
+    pub status_5xx: u32,
+    /// Distinct client addresses seen. A line with a host name instead of an address
+    /// counts in `requests` but not here.
+    pub distinct_clients: u32,
+    /// Highest failure counts first, bounded by the producer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_clients: Vec<HttpClientCount>,
+}
+
 /// Which user/group identity syscall produced an [`IdentityChangeEvent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1732,6 +1889,7 @@ pub enum Event {
     RegistrySet(RegistrySetEvent),
     ImageLoad(ImageLoadEvent),
     ScriptBlock(ScriptBlockEvent),
+    AmsiContent(AmsiContentEvent),
     WmiActivity(WmiActivityEvent),
     AssemblyLoad(AssemblyLoadEvent),
     SmbConnect(SmbConnectEvent),
@@ -1768,6 +1926,8 @@ pub enum Event {
     CapSet(CapSetEvent),
     Namespace(NamespaceEvent),
     Prctl(PrctlEvent),
+    HttpRequest(HttpRequestEvent),
+    HttpSummary(HttpSummaryEvent),
 }
 
 impl Event {
@@ -1786,6 +1946,7 @@ impl Event {
             Event::RegistrySet(e) => &e.meta,
             Event::ImageLoad(e) => &e.meta,
             Event::ScriptBlock(e) => &e.meta,
+            Event::AmsiContent(e) => &e.meta,
             Event::WmiActivity(e) => &e.meta,
             Event::AssemblyLoad(e) => &e.meta,
             Event::SmbConnect(e) => &e.meta,
@@ -1822,6 +1983,8 @@ impl Event {
             Event::CapSet(e) => &e.meta,
             Event::Namespace(e) => &e.meta,
             Event::Prctl(e) => &e.meta,
+            Event::HttpRequest(e) => &e.meta,
+            Event::HttpSummary(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.

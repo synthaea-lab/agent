@@ -13,7 +13,7 @@ use schema::{
 };
 use tamper::heartbeat::{SensorHeartbeat, SilenceMonitor};
 
-use crate::silence::{PulsingSink, SilenceHealthSource};
+use crate::silence::PulsingSink;
 
 /// Silence deadline (#71/#388) for the ETW sensor, pulsed on every event it
 /// forwards. ETW is the high-volume sensor (process, file, registry, DNS...),
@@ -188,14 +188,27 @@ fn hold_after_primary(
     {
         tracing::error!(error = %e, "ETW sensor failed; Event Log and socket-table sensors keep running");
         eprintln!(
-            "[!] {e} — process/network/file detection is down (not elevated?). Event Log \
-             and socket-table (LISTENER-DRIFT) sensors keep running; Ctrl-C to stop."
+            "[!] {e} — process/network/file detection is down{}. Event Log \
+             and socket-table (LISTENER-DRIFT) sensors keep running; Ctrl-C to stop.",
+            etw_failure_hint(&e.to_string())
         );
         while !shutdown.load(Ordering::SeqCst) {
             std::thread::sleep(SHUTDOWN_CHECK_INTERVAL);
         }
     }
     result
+}
+
+/// The operator hint after an ETW failure. A start refused without elevation
+/// is the usual cause, but a session that went silent after starting was
+/// elevated by definition: it was stopped or blinded from outside (#408), and
+/// "not elevated?" would send the operator the wrong way.
+fn etw_failure_hint(error: &str) -> &'static str {
+    if error.contains("produced no events") {
+        " (session stopped or blinded from outside, see above)"
+    } else {
+        " (not elevated?)"
+    }
 }
 
 /// Runs the ETW sensor (blocking, on the calling thread — same as before) and the
@@ -373,7 +386,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     let super::RunOptions {
         alerts,
         events,
-        state_dir: _,
+        storage,
         enable_kill: _,
         enable_quarantine: _,
         // uprobes are a Linux mechanism — the capture flags are accepted for CLI
@@ -384,6 +397,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         server,
         ipc_endpoint,
         content_dir,
+        log_sources: _,
     } = opts;
     let pipeline = super::common::wire_run_pipeline(
         seeded_rule_state(),
@@ -392,19 +406,21 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         server,
         ipc_endpoint,
         content_dir,
+        storage,
     )?;
 
     // Sensor-silence detection (#71/#388): the same monitor feeds T1562
-    // alerts and `cli health`. Heartbeats are registered once the sensors are
-    // built (`run_windows_sensors`); the monitor thread polls an empty list
-    // until then, which is harmless.
+    // alerts, `cli health` and the health beacon. Heartbeats are registered
+    // once the sensors are built (`run_windows_sensors`); the monitor thread
+    // polls an empty list until then, which is harmless.
     let silence_monitor = Arc::new(Mutex::new(SilenceMonitor::new()));
-    let _ = pipeline
-        .sensor_health
-        .set(Arc::new(SilenceHealthSource::new(Arc::clone(
-            &silence_monitor,
-        ))));
     crate::silence::spawn_monitor(Arc::clone(&silence_monitor), Arc::clone(&pipeline.sink));
+
+    // Health beacon (#134/#317): without it the control plane never hears from
+    // a Windows agent, and its silent-agent detection flags every one of them.
+    // No shutdown hook yet: the thread ends with the process.
+    let health = super::common::health_collector(&pipeline, Arc::clone(&silence_monitor));
+    let (_health_handle, _health_stop) = health.spawn();
 
     run_windows_sensors(Box::new(SharedSink(pipeline.sink)), Some(&silence_monitor))
 }
@@ -457,6 +473,19 @@ mod tests {
         let result = hold_after_primary(|| Err(anyhow::anyhow!("session torn down")), &shutdown);
         assert!(result.is_err());
         assert!(started.elapsed() < SHUTDOWN_CHECK_INTERVAL);
+    }
+
+    #[test]
+    fn hint_blames_elevation_only_for_a_start_failure() {
+        assert_eq!(
+            etw_failure_hint("ETW startup error: TraceError(AccessDenied)"),
+            " (not elevated?)"
+        );
+        // The sensor's liveness error (#408): it started, so it was elevated.
+        let silent = "ETW sensor failed: sensor produced no events for 30s despite \
+                      liveness canary writes: session wtrace-x is still running but \
+                      delivers no events (blind, not stopped)";
+        assert!(!etw_failure_hint(silent).contains("elevated"));
     }
 
     #[test]

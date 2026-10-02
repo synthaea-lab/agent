@@ -29,18 +29,21 @@ use std::{
     },
 };
 
-use schema::{Event, ExecEvent};
+use schema::{
+    Event, ExecEvent,
+    detection::{Detection, DetectionSource, Severity},
+};
 use transport::{EventDrain, EventUploader, TransportClient, TransportConfig};
 
 /// Reads one request until the header terminator, then its Content-Length
 /// body — enough HTTP for a canned test server, not a real one. Returns
 /// nothing usable on a closed connection; callers just stop.
-fn read_request(stream: &mut TcpStream) {
+fn read_request(stream: &mut TcpStream) -> String {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
     let (header_end, body_len) = loop {
         let Ok(n) = stream.read(&mut chunk) else {
-            return;
+            return String::new();
         };
         buf.extend_from_slice(&chunk[..n]);
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -60,10 +63,11 @@ fn read_request(stream: &mut TcpStream) {
     };
     while buf.len() < header_end + body_len {
         let Ok(n) = stream.read(&mut chunk) else {
-            return;
+            return String::new();
         };
         buf.extend_from_slice(&chunk[..n]);
     }
+    String::from_utf8_lossy(&buf[..header_end]).into_owned()
 }
 
 fn write_response(stream: &mut TcpStream, status: u16, body: &str) {
@@ -116,7 +120,7 @@ fn canned_server(status: u16, body: &'static str, count: usize) -> String {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
-            read_request(&mut stream);
+            let _ = read_request(&mut stream);
             write_response(&mut stream, status, body);
         }
     });
@@ -133,7 +137,7 @@ fn sequenced_server(responses: Vec<(u16, &'static str)>) -> String {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
-            read_request(&mut stream);
+            let _ = read_request(&mut stream);
             write_response(&mut stream, status, body);
         }
     });
@@ -191,6 +195,58 @@ fn events(n: usize) -> Vec<Event> {
             })
         })
         .collect()
+}
+
+fn detection() -> Detection {
+    Detection {
+        timestamp_ns: 1_700_000_000_000_000_000,
+        severity: Severity::High,
+        title: "Unusual process chain".into(),
+        source: DetectionSource::Correlator {
+            case_id: "42:python".into(),
+        },
+        score: Some(0.91),
+        attributions: Vec::new(),
+        techniques: vec!["T1059".into()],
+        events: events(1),
+    }
+}
+
+#[test]
+fn structured_detection_upload_uses_the_server_route_and_acceptance_contract() {
+    let url = canned_server(200, r#"{"status":"accepted"}"#, 1);
+    let config = TransportConfig::new(&url);
+    assert_eq!(
+        config.detection_url(),
+        format!("{url}/api/ingest/detection")
+    );
+    let client = TransportClient::new(config).unwrap();
+    client.upload_detection(&detection()).unwrap();
+}
+
+#[test]
+fn structured_detection_upload_rejects_an_unexpected_server_response() {
+    let url = canned_server(200, r#"{"status":"ignored"}"#, 1);
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+    let err = client.upload_detection(&detection()).unwrap_err();
+    assert!(matches!(err, transport::TransportError::InvalidResponse(_)));
+}
+
+#[test]
+fn structured_detection_retry_sends_a_stable_idempotency_key() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let headers = read_request(&mut stream);
+        write_response(&mut stream, 200, r#"{"status":"accepted"}"#);
+        headers
+    });
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+    let key = "b9628fc1-2134-4d4d-bbe6-83fdd1929d7a";
+    client.upload_detection_with_key(&detection(), key).unwrap();
+    let headers = server.join().unwrap().to_ascii_lowercase();
+    assert!(headers.contains(&format!("idempotency-key: {key}")));
 }
 
 #[test]
@@ -537,7 +593,7 @@ fn get_bytes_fetches_the_raw_body() {
     let addr = listener.local_addr().unwrap();
     let handle = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        read_request(&mut stream);
+        let _ = read_request(&mut stream);
         write_binary_response(&mut stream, 200, b"rule-file-bytes");
     });
     let url = format!("http://{addr}/api/content/artifact");
@@ -578,7 +634,7 @@ fn get_bytes_rejects_a_body_larger_than_the_limit() {
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        read_request(&mut stream);
+        let _ = read_request(&mut stream);
         write_binary_response(&mut stream, 200, &[0u8; 100]);
     });
     let url = format!("http://{addr}/api/content/artifact");

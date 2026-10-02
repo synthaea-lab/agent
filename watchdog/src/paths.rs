@@ -44,16 +44,13 @@ pub(crate) fn strip_unc_prefix(path: PathBuf) -> PathBuf {
     }
 }
 
-/// Where the supervised agent's stdout/stderr go: in a service session the inherited
-/// streams go nowhere and crash diagnostics would be lost. (The old iteration used a
-/// single hardcoded `C:\Windows\Temp` path on every OS — on Linux that literally
-/// created a file named `C:\Windows\Temp\…` in the working directory.)
+/// Where the supervised agent's stdout/stderr go on Windows: in a service session the
+/// inherited streams go nowhere and crash diagnostics would be lost. Unix has no such
+/// file: the agent inherits the watchdog's streams, which under systemd are the
+/// journal (#559; the former `/var/tmp` file was hidden by `PrivateTmp=true`).
+#[cfg(windows)]
 pub(crate) fn child_log_path() -> &'static str {
-    if cfg!(windows) {
-        r"C:\Windows\Temp\synthaea-agent.log"
-    } else {
-        "/var/tmp/synthaea-agent.log"
-    }
+    r"C:\Windows\Temp\synthaea-agent.log"
 }
 
 /// Derives the heartbeat file path from the alerts output path (#102) — the

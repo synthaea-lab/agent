@@ -7,14 +7,14 @@ use super::*;
 #[test]
 fn bv_unknown_pid_returns_none() {
     let engine = CorrelationEngine::new();
-    assert!(engine.behavior_vector_for_pid(9999).is_none());
+    assert!(engine.behavior_vector_for_pid(9999, None).is_none());
 }
 
 #[test]
 fn bv_exec_only() {
     let mut engine = CorrelationEngine::new();
     engine.on_event(exec_event(11, 1_000_000_000));
-    let bv = engine.behavior_vector_for_pid(11).unwrap();
+    let bv = engine.behavior_vector_for_pid(11, None).unwrap();
     assert_eq!(bv.has_exec, 1.0);
     assert_eq!(bv.has_connect, 0.0);
     assert_eq!(bv.has_filewrite, 0.0);
@@ -23,12 +23,35 @@ fn bv_exec_only() {
 }
 
 #[test]
+fn recycled_pid_does_not_update_the_old_entity_belief() {
+    let mut engine = CorrelationEngine::new();
+    let old_exec = stamped(
+        exec_with_meta(meta_full(5000, 77, "old", 1_000_000_000), ""),
+        1,
+    );
+    engine.on_event(old_exec);
+    let old_odds = engine.belief_for_entity(77, "old").unwrap().log_odds;
+
+    let new_connect = stamped(
+        connect_to(meta_full(5000, 0, "new", 2_000_000_000), [8, 8, 8, 8], 80),
+        2,
+    );
+    engine.on_event(new_connect);
+
+    assert_eq!(
+        engine.belief_for_entity(77, "old").unwrap().log_odds,
+        old_odds
+    );
+    assert!(engine.belief_for_entity(5000, "new").is_some());
+}
+
+#[test]
 fn bv_exec_connect_delta_correct() {
     let mut engine = CorrelationEngine::new();
     // Exec at t=0, Connect at t=500ms
     engine.on_event(exec_event(22, 0));
     engine.on_event(connect_event(22, 500_000_000));
-    let bv = engine.behavior_vector_for_pid(22).unwrap();
+    let bv = engine.behavior_vector_for_pid(22, None).unwrap();
     assert_eq!(bv.has_exec, 1.0);
     assert_eq!(bv.has_connect, 1.0);
     assert!(
@@ -43,7 +66,7 @@ fn bv_exec_connect_delta_correct() {
 fn bv_external_ip_detected() {
     let mut engine = CorrelationEngine::new();
     engine.on_event(connect_to(meta(33, 1_000_000_000), [8, 8, 8, 8], 53));
-    let bv = engine.behavior_vector_for_pid(33).unwrap();
+    let bv = engine.behavior_vector_for_pid(33, None).unwrap();
     assert_eq!(bv.dest_is_external, 1.0);
 }
 
@@ -51,7 +74,7 @@ fn bv_external_ip_detected() {
 fn bv_private_ip_not_external() {
     let mut engine = CorrelationEngine::new();
     engine.on_event(connect_to(meta(44, 1_000_000_000), [192, 168, 1, 1], 80));
-    let bv = engine.behavior_vector_for_pid(44).unwrap();
+    let bv = engine.behavior_vector_for_pid(44, None).unwrap();
     assert_eq!(bv.dest_is_external, 0.0);
 }
 
@@ -61,7 +84,7 @@ fn bv_unspecified_ip_not_external() {
     // `connect()` from `sshd` in a real session — must not be classified as external.
     let mut engine = CorrelationEngine::new();
     engine.on_event(connect_to(meta(55, 1_000_000_000), [0, 0, 0, 0], 22));
-    let bv = engine.behavior_vector_for_pid(55).unwrap();
+    let bv = engine.behavior_vector_for_pid(55, None).unwrap();
     assert_eq!(bv.dest_is_external, 0.0);
 }
 
@@ -71,7 +94,7 @@ fn bv_distinct_dports() {
     // Two connections to different ports
     engine.on_event(connect_event(66, 1_000_000_000)); // port 4444
     engine.on_event(connect_to(meta(66, 2_000_000_000), [1, 2, 3, 4], 80));
-    let bv = engine.behavior_vector_for_pid(66).unwrap();
+    let bv = engine.behavior_vector_for_pid(66, None).unwrap();
     assert_eq!(bv.connect_count, 2.0);
     assert_eq!(bv.distinct_dports, 2.0);
 }
@@ -80,7 +103,7 @@ fn bv_distinct_dports() {
 fn bv_filewrite_present() {
     let mut engine = CorrelationEngine::new();
     engine.on_event(file_write_event(77, 1_000_000_000));
-    let bv = engine.behavior_vector_for_pid(77).unwrap();
+    let bv = engine.behavior_vector_for_pid(77, None).unwrap();
     assert_eq!(bv.has_filewrite, 1.0);
     assert_eq!(bv.has_exec, 0.0);
 }
@@ -89,7 +112,7 @@ fn bv_filewrite_present() {
 fn bv_to_vec_has_9_features() {
     let mut engine = CorrelationEngine::new();
     engine.on_event(exec_event(88, 1_000_000_000));
-    let bv = engine.behavior_vector_for_pid(88).unwrap();
+    let bv = engine.behavior_vector_for_pid(88, None).unwrap();
     assert_eq!(bv.to_vec().len(), 9);
 }
 
@@ -223,7 +246,7 @@ fn update_belief_with_ml_adds_the_llr_exactly_once() {
         .log_odds;
 
     engine
-        .update_belief_with_ml(600, Some(0.75))
+        .update_belief_with_ml(600, None, Some(0.75))
         .expect("belief state exists, must not error");
     let after = engine
         .belief_for_pid(600)
@@ -248,7 +271,7 @@ fn update_belief_with_ml_none_leaves_the_belief_untouched() {
         .expect("belief expected")
         .log_odds;
 
-    engine.update_belief_with_ml(601, None).unwrap();
+    engine.update_belief_with_ml(601, None, None).unwrap();
     let after = engine
         .belief_for_pid(601)
         .expect("belief expected")
@@ -261,7 +284,7 @@ fn update_belief_with_ml_none_leaves_the_belief_untouched() {
 fn update_belief_with_ml_before_any_belief_state_is_silent_err() {
     // No prior `on_event` for this pid → no belief state to add an ML term to.
     let mut engine = CorrelationEngine::new();
-    assert!(engine.update_belief_with_ml(9999, Some(1.0)).is_err());
+    assert!(engine.update_belief_with_ml(9999, None, Some(1.0)).is_err());
 }
 
 // ── BAYES_NAME_EXCLUSIONS (issue #212) ──────────────────────────────────────

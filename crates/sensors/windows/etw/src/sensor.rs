@@ -18,12 +18,14 @@ use schema::{
 };
 
 use crate::{
+    amsi, etw_sessions,
     long_path::{self, LongPathCache},
     normalize,
     pid_cache::PidCache,
     providers::{
-        dns_provider, dotnet_provider, file_provider, network_provider, powershell_provider,
-        process_provider, registry_provider, smb_provider, wmi_provider,
+        ALL_PROVIDERS, amsi_provider, dns_provider, dotnet_provider, file_provider,
+        network_provider, powershell_provider, process_provider, registry_provider, smb_provider,
+        wmi_provider,
     },
     winapi,
     zone_identifier::{self, MarkQueue, QuarantineDedup},
@@ -126,6 +128,53 @@ fn stop_all_orphaned_sessions() {
     }
 }
 
+/// Stops the session a failed `start_and_process` left behind (#408, see
+/// `normalize::start_or_stop_session`). "Not found" is nominal: the failure may
+/// have come before `StartTrace` created anything.
+fn stop_session_after_failed_start(session: &str) {
+    match ferrisetw::trace::stop_trace_by_name(session) {
+        Ok(()) => tracing::warn!(
+            session,
+            "ETW start failed; stopped the session it had created"
+        ),
+        Err(e) => {
+            tracing::debug!(session, error = ?e, "no session to stop after a failed ETW start");
+        }
+    }
+}
+
+/// The liveness error's diagnosis (#408): is our silent session still listed by
+/// `logman query -ets` (running but blind) or gone (stopped from outside)? And
+/// which foreign sessions enable our providers: a real-time one nobody consumes
+/// blinds every real-time consumer on the host (lab, 2026-10-01), so naming it
+/// is what the operator needs to act.
+fn silent_session_diagnosis(session: &str) -> String {
+    let output = std::process::Command::new("logman")
+        .args(["query", "-ets"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let state = normalize::describe_silent_session(session, output.as_deref());
+
+    let sessions = etw_sessions::running_sessions();
+    let enablements: Vec<normalize::ProviderEnablement> =
+        etw_sessions::provider_enablements(&ALL_PROVIDERS)
+            .into_iter()
+            .filter_map(|(provider, logger_id, level, match_any_keyword)| {
+                let (_, stats) = sessions.iter().find(|(id, _)| *id == logger_id)?;
+                Some(normalize::ProviderEnablement {
+                    provider,
+                    session: stats.name.clone(),
+                    level,
+                    match_any_keyword,
+                })
+            })
+            .collect();
+    let stats: Vec<normalize::SessionStats> = sessions.into_iter().map(|(_, s)| s).collect();
+    state + &normalize::describe_foreign_sessions(session, &enablements, &stats)
+}
+
 // ── Shared state between provider callbacks ──────────────────────────────────
 
 pub(crate) struct SharedState {
@@ -143,6 +192,8 @@ pub(crate) struct SharedState {
     pub(crate) marks: MarkQueue,
     /// F-2: events observed — the silence watchdog reads this.
     pub(crate) events_seen: AtomicU64,
+    /// AMSI volume gate (#282): dedup + per-process budget.
+    pub(crate) amsi: Mutex<amsi::AmsiGate>,
     /// The liveness canary file: the run loop touches it every heartbeat, which
     /// MUST produce a Kernel-File event (our pid is tracked) — so sensor liveness
     /// is deterministic instead of traffic-dependent (a quiet host produces no
@@ -274,7 +325,8 @@ fn liveness_watch(
             if silent_intervals >= 15 {
                 return Err(format!(
                     "sensor produced no events for 30s despite liveness canary \
-                     writes (session {session}) — trace stopped or tampered"
+                     writes: {}",
+                    silent_session_diagnosis(session)
                 )
                 .into());
             }
@@ -349,6 +401,7 @@ impl Sensor for WindowsSensor {
             dedup: Mutex::new(normalize::ConnectDedup::new(60_000_000_000)),
             marks,
             events_seen: AtomicU64::new(0),
+            amsi: Mutex::new(amsi::AmsiGate::default()),
             canary_path: canary_file
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -360,7 +413,7 @@ impl Sensor for WindowsSensor {
         stop_all_orphaned_sessions();
         let session = new_session_name();
 
-        let trace = UserTrace::new()
+        let builder = UserTrace::new()
             .named(session.clone())
             .enable(process_provider(sink.clone(), state.clone()))
             .enable(network_provider(sink.clone(), state.clone()))
@@ -370,9 +423,14 @@ impl Sensor for WindowsSensor {
             .enable(powershell_provider(sink.clone(), state.clone()))
             .enable(wmi_provider(sink.clone(), state.clone()))
             .enable(dotnet_provider(sink.clone(), state.clone()))
-            .enable(smb_provider(sink, state.clone()))
-            .start_and_process()
-            .map_err(|e| -> SensorError { format!("ETW startup error: {e:?}").into() })?;
+            .enable(smb_provider(sink.clone(), state.clone()))
+            .enable(amsi_provider(sink, state.clone()));
+        let trace = normalize::start_or_stop_session(
+            &session,
+            || builder.start_and_process(),
+            stop_session_after_failed_start,
+        )
+        .map_err(|e| -> SensorError { format!("ETW startup error: {e:?}").into() })?;
 
         let result = liveness_watch(&self.stop, &state, &canary_file, &session);
 

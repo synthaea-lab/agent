@@ -30,6 +30,58 @@ fn different_pids_do_not_correlate() {
     assert!(alerts.is_empty());
 }
 
+#[test]
+fn recycled_pid_does_not_join_the_old_exec_or_suppress_a_new_alert() {
+    let mut engine = CorrelationEngine::new();
+    let old_exec = stamped(exec_event(1234, 1_000_000_000), 1);
+    engine.on_event(old_exec);
+    let old_connect = stamped(connect_event(1234, 2_000_000_000), 1);
+    let old_alerts = engine.on_event(old_connect);
+    assert!(old_alerts.iter().any(|a| a.technique == "T1059/T1071"));
+
+    let new_connect = stamped(connect_event(1234, 3_000_000_000), 2);
+    let early_alerts = engine.on_event(new_connect);
+    assert!(
+        early_alerts.is_empty(),
+        "old exec must not join new connect"
+    );
+    let vector = engine.behavior_vector_for_pid(1234, Some(2)).unwrap();
+    assert_eq!(vector.has_exec, 0.0);
+    assert_eq!(vector.connect_count, 1.0);
+
+    let new_exec = stamped(exec_event(1234, 4_000_000_000), 2);
+    let new_alerts = engine.on_event(new_exec);
+    assert!(
+        new_alerts.iter().any(|a| a.technique == "T1059/T1071"),
+        "the first incarnation's fired record must not suppress the second: {new_alerts:?}"
+    );
+}
+
+#[test]
+fn recycled_pid_does_not_inherit_a_masquerade_flag() {
+    let mut engine = CorrelationEngine::new();
+    let mut old_exec = exec_event(4000, 1_000_000_000);
+    exec_set_comm_and_path(&mut old_exec, "svchost.exe", "/tmp/svchost.exe");
+    engine.on_event(stamped(old_exec, 1));
+
+    let mut new_exec = exec_event(4000, 2_000_000_000);
+    exec_set_comm_and_path(
+        &mut new_exec,
+        "svchost.exe",
+        "C:\\Windows\\System32\\svchost.exe",
+    );
+    engine.on_event(stamped(new_exec, 2));
+    let mut connect = connect_event(4000, 3_000_000_000);
+    if let Event::Connect(c) = &mut connect {
+        c.meta.comm = "svchost.exe".to_string();
+    }
+    let alerts = engine.on_event(stamped(connect, 2));
+    assert!(
+        alerts.is_empty(),
+        "new trusted svchost must be ignored: {alerts:?}"
+    );
+}
+
 // ── R2: connect + filewrite ───────────────────────────────────────────────
 
 #[test]

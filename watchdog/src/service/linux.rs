@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, bail};
 
 use super::{SERVICE_DESC, resolve_paths};
-use crate::paths::child_log_path;
 
 const SYSTEMD_UNIT: &str = "/etc/systemd/system/synthaea-agent.service";
 const OPENRC_SCRIPT: &str = "/etc/init.d/synthaea-agent";
@@ -173,10 +172,7 @@ fn install_systemd(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Resul
     println!("[watchdog] systemd service installed and started (development mode).");
     println!("  Alerts: {}", paths.alerts_abs.display());
     println!("  Check: watchdog status");
-    println!(
-        "  Logs : journalctl -u synthaea-agent -f (watchdog); agent output in {}",
-        child_log_path()
-    );
+    println!("  Logs : journalctl -u synthaea-agent -f (watchdog and agent output)");
     Ok(())
 }
 
@@ -246,10 +242,7 @@ fn install_openrc(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Result
     println!("[watchdog] OpenRC service installed and started.");
     println!("  Alerts: {}", paths.alerts_abs.display());
     println!("  Check: watchdog status");
-    println!(
-        "  Logs : /var/log/synthaea-watchdog.log (watchdog); agent output in {}",
-        child_log_path()
-    );
+    println!("  Logs : /var/log/synthaea-watchdog.log (watchdog and agent output)");
     Ok(())
 }
 

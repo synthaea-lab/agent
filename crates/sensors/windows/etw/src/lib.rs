@@ -37,6 +37,10 @@
 //! [`zone_identifier`].
 
 #[cfg(any(windows, test))]
+mod amsi;
+#[cfg(windows)]
+mod etw_sessions;
+#[cfg(any(windows, test))]
 mod long_path;
 pub mod normalize;
 #[cfg(any(windows, test))]

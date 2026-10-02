@@ -7,6 +7,12 @@ use std::{collections::VecDeque, time::Duration};
 
 use schema::Event;
 
+/// An unstamped event cannot disprove identity. This preserves the existing
+/// Windows/macOS behavior and Linux fallback when a stamp could not be read.
+pub(crate) fn same_generation(recorded: Option<u64>, wanted: Option<u64>) -> bool {
+    !matches!((recorded, wanted), (Some(a), Some(b)) if a != b)
+}
+
 /// Sliding queue of recent events. Events older than `window` are
 /// evicted automatically on every insertion.
 pub struct EventBus {
@@ -35,9 +41,21 @@ impl EventBus {
         self.evict();
     }
 
-    /// Filters events by pid.
-    pub fn events_for_pid(&self, pid: u32) -> impl Iterator<Item = &Event> {
-        self.events.iter().filter(move |e| e.meta().pid == pid)
+    /// Every event currently in the window, oldest first.
+    pub(crate) fn events(&self) -> impl Iterator<Item = &Event> {
+        self.events.iter()
+    }
+
+    /// Filters events by pid and process incarnation. Missing stamps preserve the
+    /// previous pid-only behavior; two known, different stamps never mix.
+    pub fn events_for_pid(
+        &self,
+        pid: u32,
+        generation: Option<u64>,
+    ) -> impl Iterator<Item = &Event> {
+        self.events.iter().filter(move |e| {
+            e.meta().pid == pid && same_generation(e.meta().process_generation, generation)
+        })
     }
 
     /// Filters events by (ppid, comm) — the logical identity of a respawned process
@@ -45,11 +63,14 @@ impl EventBus {
     pub(crate) fn events_for_ppid_comm<'a>(
         &'a self,
         ppid: u32,
+        parent_generation: Option<u64>,
         comm: &'a str,
     ) -> impl Iterator<Item = &'a Event> {
-        self.events
-            .iter()
-            .filter(move |e| e.meta().ppid == ppid && e.meta().comm == comm)
+        self.events.iter().filter(move |e| {
+            e.meta().ppid == ppid
+                && e.meta().comm == comm
+                && same_generation(e.meta().parent_process_generation, parent_generation)
+        })
     }
 
     fn evict(&mut self) {

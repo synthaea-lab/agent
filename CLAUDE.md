@@ -22,7 +22,7 @@ never copied (`docs/README.md` has the index).
   depend on the base tier, each other, and `store` — **never on a sensor**.
 - Leaf crates (`response`, `transport`, `ipc`, `sinks`, `updater`, `config`, `store`,
   `conformance`) depend only on the base tier.
-- Only the binaries (`agent/`, `watchdog/`, `cli/`) may depend on everything.
+- Only the binaries (`agent/`, `watchdog/`, `cli/`, and the offline `release-tool/`) may depend on everything.
 
 New crate? Add it to the rules in `tools/check-deps.py` in the same change.
 

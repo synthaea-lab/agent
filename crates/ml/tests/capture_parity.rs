@@ -51,7 +51,7 @@ fn vectors_match_python_aggregator() {
             .collect();
         assert_eq!(expected.len(), FEATURE_NAMES.len());
 
-        let got = extract_features(&bus, pid);
+        let got = extract_features(&bus, pid, None);
         for (i, name) in FEATURE_NAMES.iter().enumerate() {
             // Counts and spans are exact integers/ratios here — no float slack needed
             // beyond f32 rounding on span_s.
