@@ -4,6 +4,12 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
+# Provisioning is often run in a separate shell, so restore rustup's PATH here.
+if [ -f "${HOME:-}/.cargo/env" ]; then
+    # shellcheck disable=SC1091
+    . "${HOME}/.cargo/env"
+fi
+
 TARGET="x86_64-unknown-linux-musl"
 
 fail() {
