@@ -46,6 +46,8 @@ mod ipc_handler;
 mod journal_cursor;
 #[cfg(target_os = "linux")]
 mod kill_loudness;
+#[cfg(target_os = "linux")]
+mod log_sources;
 mod protected;
 mod quarantine_cmd;
 mod release;
@@ -317,7 +319,7 @@ fn main() -> anyhow::Result<()> {
             commands::cmd_run(commands::RunOptions {
                 alerts: &alerts,
                 events: events.as_deref(),
-                state_dir: &cfg.storage.state_dir,
+                storage: &cfg.storage,
                 enable_kill,
                 enable_quarantine,
                 enable_tls_capture,
@@ -325,6 +327,7 @@ fn main() -> anyhow::Result<()> {
                 enable_dns_capture,
                 server: server.as_deref(),
                 ipc_endpoint: &cfg.ipc.endpoint,
+                log_sources: &cfg.logs.sources,
                 content_dir: &content_dir,
             })
         }

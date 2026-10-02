@@ -12,9 +12,9 @@ use crate::{
     bus::{EventBus, same_generation},
     event::is_correlated,
     rules::{
-        CorrelationAlert, rule_assembly_connect, rule_assembly_smb, rule_connect_filewrite,
-        rule_dns_exfil, rule_exec_smb, rule_respawn_connect, rule_spawn_connect,
-        rule_spawn_connect_filewrite,
+        CorrelationAlert, is_web_server_shell, rule_assembly_connect, rule_assembly_smb,
+        rule_connect_filewrite, rule_dns_exfil, rule_exec_smb, rule_respawn_connect,
+        rule_spawn_connect, rule_spawn_connect_filewrite, rule_web_request_shell,
     },
 };
 
@@ -78,6 +78,22 @@ impl<T> Stamped<T> {
     }
 }
 
+/// The logical entity a belief is kept for: `(ppid, comm)`, plus the incarnation of
+/// that parent. When the pid is not known from an `ExecEvent`, `ppid` holds the pid
+/// itself and `parent_generation` that pid's own incarnation.
+#[derive(Clone)]
+struct EntityRef {
+    ppid: u32,
+    comm: String,
+    parent_generation: Option<u64>,
+}
+
+impl EntityRef {
+    fn id(&self) -> (u32, String) {
+        (self.ppid, self.comm.clone())
+    }
+}
+
 fn is_bayes_excluded(comm: &str) -> bool {
     let name = comm.rsplit('\\').next().unwrap_or(comm);
     BAYES_NAME_EXCLUSIONS
@@ -93,10 +109,15 @@ pub struct CorrelationEngine {
     /// Bayesian beliefs per entity (ppid, comm), LRU-bounded (`store::BoundedMap`) —
     /// the old iteration's unbounded `HashMap` was a documented known limitation.
     /// Keyed by (ppid, comm), not pid: survives respawns.
-    beliefs: BoundedMap<(u32, String), BeliefState>,
-    /// pid → (ppid, comm) mapping populated by `ExecEvents`, LRU-bounded.
+    ///
+    /// The stamp on each entry is the **parent's** incarnation
+    /// ([`EntityRef::parent_generation`], #592): a recycled parent pid that spawns a
+    /// child of the same `comm` is a new entity and must not inherit the old
+    /// parent's belief. Handled by [`Self::belief_or_insert`] / [`Self::belief_mut`].
+    beliefs: BoundedMap<(u32, String), Stamped<BeliefState>>,
+    /// pid → entity mapping populated by `ExecEvents`, LRU-bounded.
     /// Lets `ConnectEvents` (ppid=0) find the right entity key.
-    pid_entities: BoundedMap<u32, Stamped<(u32, String)>>,
+    pid_entities: BoundedMap<u32, Stamped<EntityRef>>,
     /// (technique, pid) → last alert timestamp. A satisfied co-occurrence pattern
     /// stays satisfied for every later event in the window — without this, one
     /// exec+connect pair re-alerted on every subsequent event of that pid (review
@@ -142,10 +163,18 @@ impl CorrelationEngine {
         if !is_correlated(&event) {
             return Vec::new();
         }
+        // An access-log request has no pid: it only joins a web server's shell by time.
+        // Record it, look for that pairing, and skip every pid-keyed step below.
+        if matches!(event, Event::HttpRequest(_)) {
+            self.bus.push(event);
+            return self.web_shell_alerts();
+        }
+        let is_web_shell = matches!(&event, Event::Exec(e) if is_web_server_shell(e));
         let pid = event.meta().pid;
         let generation = event.meta().process_generation;
         let comm = event.meta().comm.clone();
         let ppid = event.meta().ppid;
+        let parent_generation = event.meta().parent_process_generation;
 
         // Record pid → (ppid, comm) as soon as the ExecEvent arrives.
         // On Windows (ETW), the sensor does not fill in ppid for ConnectEvent
@@ -157,7 +186,11 @@ impl CorrelationEngine {
                     pid,
                     Stamped {
                         generation,
-                        value: (ppid, comm.clone()),
+                        value: EntityRef {
+                            ppid,
+                            comm: comm.clone(),
+                            parent_generation,
+                        },
                     },
                 );
             }
@@ -186,7 +219,11 @@ impl CorrelationEngine {
             .get(&pid)
             .filter(|entry| entry.current(generation))
             .map(|entry| entry.value.clone())
-            .unwrap_or_else(|| (pid, comm.clone()));
+            .unwrap_or_else(|| EntityRef {
+                ppid: pid,
+                comm: comm.clone(),
+                parent_generation: generation,
+            });
 
         // Bayesian update with the pid's current BehaviorVector.
         if let Some(bv) = self.behavior_vector_for_pid(pid, generation) {
@@ -196,15 +233,21 @@ impl CorrelationEngine {
                 .map(|e| e.meta().timestamp_ns)
                 .max()
                 .unwrap_or(0);
-            let state = self
-                .beliefs
-                .get_or_insert_with(entity_key.clone(), || BeliefState::new(now_ns));
+            let state = self.belief_or_insert(&entity_key, now_ns);
             // No ML LLR in internal path — external callers use `update_belief_with_ml`.
             update_belief(state, &bv, None, now_ns);
         }
 
+        // The shell is the late half of a request-then-shell pairing when the log line
+        // was already read; the other order is handled when the request arrives.
+        let web_alerts = if is_web_shell {
+            self.web_shell_alerts()
+        } else {
+            Vec::new()
+        };
+
         if is_ignored(&comm) && !self.is_masquerading(pid, generation) {
-            return Vec::new();
+            return web_alerts;
         }
 
         let now_ns = self
@@ -213,9 +256,34 @@ impl CorrelationEngine {
             .map(|e| e.meta().timestamp_ns)
             .max()
             .unwrap_or(0);
-        let mut alerts = self.evaluate(pid, generation, now_ns);
+        let mut alerts = web_alerts;
+        alerts.extend(self.evaluate(pid, generation, now_ns));
         if !is_bayes_excluded(&comm) || self.is_masquerading(pid, generation) {
             alerts.extend(self.bayes_alert(pid, &comm, &entity_key));
+        }
+        alerts
+    }
+
+    /// Evaluates [`rule_web_request_shell`] over the bus, once per shell per window.
+    fn web_shell_alerts(&mut self) -> Vec<CorrelationAlert> {
+        let window_ns = self.window_ns;
+        let mut alerts = Vec::new();
+        for case in rule_web_request_shell(&self.bus) {
+            let key = ("web_request_shell", case.pid);
+            let recently = self.fired.get(&key).is_some_and(|entry| {
+                entry.current(case.generation)
+                    && case.timestamp_ns.saturating_sub(entry.value) <= window_ns
+            });
+            if !recently {
+                self.fired.insert(
+                    key,
+                    Stamped {
+                        generation: case.generation,
+                        value: case.timestamp_ns,
+                    },
+                );
+                alerts.push(case.alert);
+            }
         }
         alerts
     }
@@ -297,14 +365,50 @@ impl CorrelationEngine {
             .get(&pid)
             .filter(|entry| entry.current(generation))
             .map(|entry| entry.value.clone())
-            .unwrap_or((pid, comm));
+            .unwrap_or(EntityRef {
+                ppid: pid,
+                comm,
+                parent_generation: generation,
+            });
 
         // `on_event` creates this entity's belief state in the same cycle whenever a
         // `BehaviorVector` is available; if it isn't there yet either, there is no
         // base update to add the ML term to.
-        let state = self.beliefs.get_mut(&entity_key).ok_or(())?;
+        let state = self.belief_mut(&entity_key).ok_or(())?;
         apply_ml_llr(state, llr);
         Ok(())
+    }
+
+    /// The belief for `entity`, created if absent. A stored belief built for a
+    /// *different* incarnation of the parent (two known, different stamps) belongs to
+    /// another entity that happens to share `(ppid, comm)`: it is replaced, not
+    /// inherited (#592). A stamp is adopted when the stored belief had none, so a later
+    /// different one is recognised.
+    fn belief_or_insert(&mut self, entity: &EntityRef, now_ns: u64) -> &mut BeliefState {
+        let id = entity.id();
+        let stale = self
+            .beliefs
+            .peek(&id)
+            .is_some_and(|b| !same_generation(b.generation, entity.parent_generation));
+        if stale {
+            self.beliefs.remove(&id);
+        }
+        let entry = self.beliefs.get_or_insert_with(id, || Stamped {
+            generation: entity.parent_generation,
+            value: BeliefState::new(now_ns),
+        });
+        if entry.generation.is_none() {
+            entry.generation = entity.parent_generation;
+        }
+        &mut entry.value
+    }
+
+    /// The belief for `entity` if one exists for this incarnation of the parent.
+    fn belief_mut(&mut self, entity: &EntityRef) -> Option<&mut BeliefState> {
+        let entry = self.beliefs.get_mut(&entity.id())?;
+        entry
+            .current(entity.parent_generation)
+            .then_some(&mut entry.value)
     }
 
     /// Bayesian alert — only once per threshold crossing.
@@ -313,9 +417,9 @@ impl CorrelationEngine {
         &mut self,
         pid: u32,
         comm: &str,
-        entity_key: &(u32, String),
+        entity_key: &EntityRef,
     ) -> Option<CorrelationAlert> {
-        let state = self.beliefs.get_mut(entity_key)?;
+        let state = self.belief_mut(entity_key)?;
         if state.log_odds > BAYES_THRESHOLD && !state.alerted {
             state.alerted = true;
             Some(CorrelationAlert {
@@ -349,17 +453,19 @@ impl CorrelationEngine {
         if let Some(entry) = self.pid_entities.peek(&pid)
             && entry.current(generation)
         {
-            return self.beliefs.peek(&entry.value);
+            return self.beliefs.peek(&entry.value.id()).map(|b| &b.value);
         }
         // Fallback: recover the comm from the bus to rebuild the same key
         // as the one inserted in on_event — (pid, comm.clone()).
         let comm = event.meta().comm.clone();
-        self.beliefs.peek(&(pid, comm))
+        self.beliefs.peek(&(pid, comm)).map(|b| &b.value)
     }
 
     #[cfg(test)]
     pub(crate) fn belief_for_entity(&self, parent: u32, comm: &str) -> Option<&BeliefState> {
-        self.beliefs.peek(&(parent, comm.to_string()))
+        self.beliefs
+            .peek(&(parent, comm.to_string()))
+            .map(|b| &b.value)
     }
 
     /// Evaluates all the co-occurrence rules for a given pid, emitting each

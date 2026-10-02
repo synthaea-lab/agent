@@ -41,6 +41,11 @@ impl EventBus {
         self.evict();
     }
 
+    /// Every event currently in the window, oldest first.
+    pub(crate) fn events(&self) -> impl Iterator<Item = &Event> {
+        self.events.iter()
+    }
+
     /// Filters events by pid and process incarnation. Missing stamps preserve the
     /// previous pid-only behavior; two known, different stamps never mix.
     pub fn events_for_pid(

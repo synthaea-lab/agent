@@ -30,8 +30,10 @@ pub(crate) struct RunOptions<'a> {
     // them turns that per-platform inertness into a whole-field dead-code
     // finding on any target that isn't Linux, unlike a bare unused fn parameter —
     // hence the explicit allow rather than relying on the `_` destructuring alone.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) state_dir: &'a std::path::Path,
+    // The whole `[storage]` section rather than just `state_dir`: the upload spool's
+    // cap (`spool_max_mb`, #604) travels with it. Every platform reads it for the
+    // spool; only Linux also reads `state_dir` for the integrity monitor.
+    pub(crate) storage: &'a config::StorageConfig,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) enable_kill: bool,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -51,6 +53,10 @@ pub(crate) struct RunOptions<'a> {
     /// here, and `reload_content` re-reads from the same place, so the two
     /// commands always agree on one directory.
     pub(crate) content_dir: &'a std::path::Path,
+    /// Service logs declared in `[logs]` (ADR-0022, #478). Read only by
+    /// `linux::cmd_run`; the other platforms accept and ignore it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) log_sources: &'a [config::LogSourceConfig],
 }
 
 #[cfg(target_os = "linux")]

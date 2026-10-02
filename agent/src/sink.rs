@@ -97,6 +97,24 @@ pub(crate) struct DetectionSink {
     content_root: PathBuf,
 }
 
+/// The verdict entity an event belongs to: `(ppid, comm)` plus the incarnation of the
+/// parent when the sensor stamped one, so a recycled parent pid does not join the
+/// previous parent's entity (#592).
+fn entity_key(meta: &schema::EventMeta) -> verdict::EntityKey {
+    verdict::EntityKey::new(meta.ppid, meta.comm.clone())
+        .with_parent_generation(meta.parent_process_generation)
+}
+
+/// The `case_id` of a correlator finding: `{ppid}:{comm}`, with `@{generation}` of the
+/// parent appended when it is known, so two incarnations of a recycled parent pid do not
+/// share one case. The server treats it as an opaque string.
+fn correlator_case_id(entity: &verdict::EntityKey) -> String {
+    match entity.parent_generation {
+        Some(generation) => format!("{}:{}@{generation}", entity.ppid, entity.comm),
+        None => format!("{}:{}", entity.ppid, entity.comm),
+    }
+}
+
 /// How long a technique already recorded for an entity stays "the same finding":
 /// a second engine (or the same engine again) reporting it inside this window
 /// folds in silently instead of producing a second alert. Matches the
@@ -122,6 +140,18 @@ fn default_severity(technique: &str) -> schema::detection::Severity {
     } else {
         schema::detection::Severity::Medium
     }
+}
+
+/// Whether an alert raised by the correlator makes its process eligible for
+/// `response`'s kill (issue #25). Deliberately its own question, not "severity is
+/// `Critical`": a Sigma rule's `level: critical` is an analyst-facing ranking
+/// written by a rule author, not a belief the correlator has earned, and a
+/// severity that merely feeds the verdict must never widen what the agent kills
+/// (issue #131 follow-up). Only the correlator's belief crossing its threshold
+/// qualifies, which is what `default_severity` made `Critical` before severity
+/// became data.
+fn crosses_kill_gate(technique: &str) -> bool {
+    technique == "BAYES"
 }
 
 /// ATT&CK technique ids folded into a [`schema::detection::Detection`] from the
@@ -387,12 +417,13 @@ impl DetectionSink {
         technique: &str,
         message: &str,
         source: schema::detection::DetectionSource,
+        severity: schema::detection::Severity,
         event: &Event,
-        now_ns: u64,
     ) -> Option<verdict::Verdict> {
+        let now_ns = event.meta().timestamp_ns;
         let detection = schema::detection::Detection {
             timestamp_ns: now_ns,
-            severity: default_severity(technique),
+            severity,
             title: message.to_string(),
             source,
             score: None,
@@ -406,7 +437,30 @@ impl DetectionSink {
                 .unwrap()
                 .record(entity.clone(), technique, detection, now_ns);
         self.emit(technique, message);
+        if let Some(fused) = &result {
+            self.maybe_escalate(fused);
+        }
         result
+    }
+
+    /// Issue #612: the first response decision to read the fused verdict. A new
+    /// verdict snapshot (first sighting, a severity raise, or a recurrence outside
+    /// the dedup window — never a silently absorbed duplicate) whose composed
+    /// severity warrants it raises one `RESPONSE-ESCALATE` audit alert. Never
+    /// kills or quarantines, and works with or without `enable_response`.
+    fn maybe_escalate(&self, fused: &verdict::Verdict) {
+        if !response::should_escalate(fused.severity) {
+            return;
+        }
+        let message = format!(
+            "escalated {}:{} at {:?} severity across {} source(s): {}",
+            fused.entity.ppid,
+            fused.entity.comm,
+            fused.severity,
+            fused.sources.len(),
+            fused.techniques.join(", ")
+        );
+        self.emit("RESPONSE-ESCALATE", &message);
     }
 
     /// [`Self::record_and_emit`] for a batch of plain `rules::Alert`s (no Sigma/
@@ -414,8 +468,7 @@ impl DetectionSink {
     /// `rule_state`/`rules::evaluate_*` call site.
     fn record_rule_alerts(&self, event: &Event, alerts: impl IntoIterator<Item = rules::Alert>) {
         let meta = event.meta();
-        let entity = verdict::EntityKey::new(meta.ppid, meta.comm.clone());
-        let now_ns = meta.timestamp_ns;
+        let entity = entity_key(meta);
         for alert in alerts {
             let source = schema::detection::DetectionSource::Rule {
                 rule_id: alert.technique.to_string(),
@@ -425,8 +478,8 @@ impl DetectionSink {
                 alert.technique,
                 &alert.message,
                 source,
+                default_severity(alert.technique),
                 event,
-                now_ns,
             );
         }
     }
@@ -493,17 +546,17 @@ impl DetectionSink {
 
         // Fold co-occurrence rules and Bayesian belief into the entity's fused
         // verdict (issue #131) for evidence/severity bookkeeping. The kill gate
-        // itself stays scoped to *this event's own* evidence — `default_severity`
-        // of the alert actually raised here, same as the pre-#131 bare
-        // `technique == "BAYES"` check — not the entity's fused, sticky
+        // itself stays scoped to *this event's own* evidence — whether the alert
+        // actually raised here crosses it ([`crosses_kill_gate`], the pre-#131 bare
+        // `technique == "BAYES"` check) — not the entity's fused, sticky
         // severity: that's a max over everything ever seen for `(ppid, comm)`,
         // so gating kill on it would let one sibling process's Bayes crossing
         // condemn every later, unrelated sibling that merely shares the same
         // parent and `comm` (PR #502 review; pinned by
         // `a_siblings_weak_alert_never_triggers_kill_from_anothers_bayes_crossing`).
         let meta = event.meta();
-        let entity = verdict::EntityKey::new(meta.ppid, meta.comm.clone());
-        let case_id = format!("{}:{}", entity.ppid, entity.comm);
+        let entity = entity_key(meta);
+        let case_id = correlator_case_id(&entity);
         let mut is_high_confidence = false;
         for alert in &alerts {
             let source = schema::detection::DetectionSource::Correlator {
@@ -514,10 +567,10 @@ impl DetectionSink {
                 alert.technique,
                 &alert.message,
                 source,
+                default_severity(alert.technique),
                 event,
-                meta.timestamp_ns,
             );
-            if default_severity(alert.technique) >= schema::detection::Severity::Critical {
+            if crosses_kill_gate(alert.technique) {
                 is_high_confidence = true;
             }
         }
@@ -562,7 +615,7 @@ impl DetectionSink {
         self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_exec(event));
         let sigma_guard = self.sigma.lock().unwrap();
         if let Some(sigma) = sigma_guard.as_ref() {
-            let entity = verdict::EntityKey::new(event.meta.ppid, event.meta.comm.clone());
+            let entity = entity_key(&event.meta);
             for hit in sigma.eval_exec(event) {
                 let technique = if hit.tags.is_empty() {
                     "Sigma".to_string()
@@ -577,8 +630,8 @@ impl DetectionSink {
                     &technique,
                     &hit.title,
                     source,
+                    hit.severity,
                     wrapped,
-                    event.meta.timestamp_ns,
                 );
             }
         }
@@ -985,7 +1038,27 @@ mod tests {
 
     use schema::{ConnectEvent, Event, EventMeta, ExecEvent, User, sensor::EventSink as _};
 
-    use super::DetectionSink;
+    use super::{DetectionSink, correlator_case_id, entity_key};
+
+    #[test]
+    fn the_verdict_entity_carries_the_parents_incarnation_when_stamped() {
+        let mut meta = schema::fixtures::meta();
+        meta.ppid = 50;
+        meta.comm = "evil".into();
+        assert_eq!(entity_key(&meta).parent_generation, None);
+        meta.parent_process_generation = Some(7);
+        let entity = entity_key(&meta);
+        assert_eq!(entity.parent_generation, Some(7));
+        assert_eq!((entity.ppid, entity.comm.as_str()), (50, "evil"));
+    }
+
+    #[test]
+    fn the_correlator_case_id_names_the_parent_incarnation_only_when_known() {
+        let plain = verdict::EntityKey::new(50, "evil");
+        assert_eq!(correlator_case_id(&plain), "50:evil");
+        let stamped = plain.with_parent_generation(Some(7));
+        assert_eq!(correlator_case_id(&stamped), "50:evil@7");
+    }
 
     fn tmp(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("sink-test-{}-{}", name, std::process::id()));
@@ -1686,6 +1759,111 @@ detection:
         assert!(
             alerts_in(&dir).contains("reload-content test marker rule"),
             "the reloaded rule must now fire: {}",
+            alerts_in(&dir)
+        );
+    }
+
+    /// A rule author's `level:` is data on the finding, not a kill decision
+    /// (#131): the rule below is `critical` and must still never terminate anything.
+    fn critical_sigma_sink(name: &str) -> (std::path::PathBuf, Arc<DetectionSink>) {
+        let dir = tmp(name);
+        let sigma_dir = dir
+            .join("content")
+            .join("rules")
+            .join("sigma")
+            .join("linux");
+        std::fs::create_dir_all(&sigma_dir).unwrap();
+        std::fs::write(
+            sigma_dir.join("critical.yml"),
+            RELOAD_TEST_SIGMA_RULE.replace("level: low", "level: critical"),
+        )
+        .unwrap();
+        let sink = sink_in(&dir);
+        assert_eq!(sink.reload_content().sigma_rule_count, Some(1));
+        (dir, sink)
+    }
+
+    #[test]
+    fn a_sigma_rules_severity_reaches_the_fused_verdict() {
+        let (_dir, sink) = critical_sigma_sink("sigma-severity-verdict");
+        sink.on_event(exec(910, "run", "/opt/reload-content-marker"));
+        let verdict = sink
+            .verdict
+            .lock()
+            .unwrap()
+            .peek(&verdict::EntityKey::new(1, "bash"))
+            .expect("the Sigma hit is folded into the entity's verdict");
+        assert_eq!(verdict.severity, schema::detection::Severity::Critical);
+    }
+
+    #[test]
+    fn a_critical_fused_verdict_raises_an_escalation_alert_without_killing() {
+        let (dir, sink) = critical_sigma_sink("sigma-critical-escalates");
+        let killed = Arc::new(Mutex::new(Vec::new()));
+        let killed_rec = Arc::clone(&killed);
+        sink.enable_response(
+            policy::ResponsePolicy {
+                kill_enabled: true,
+                quarantine_enabled: true,
+            },
+            move |pid| {
+                killed_rec.lock().unwrap().push(pid);
+                Ok(())
+            },
+            dir.join("quarantine"),
+        );
+        sink.on_event(exec(912, "run", "/opt/reload-content-marker"));
+        assert!(
+            alerts_in(&dir).contains("RESPONSE-ESCALATE"),
+            "{}",
+            alerts_in(&dir)
+        );
+        assert!(killed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_medium_fused_verdict_does_not_escalate() {
+        let dir = tmp("medium-no-escalate");
+        let sink = sink_in(&dir);
+        sink.on_event(exec(
+            913,
+            "bash -c echo cGF5bG9hZAo= | base64 -d | sh",
+            "/bin/bash",
+        ));
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("T1059.004"), "{alerts}");
+        assert!(!alerts.contains("RESPONSE-ESCALATE"), "{alerts}");
+    }
+
+    #[test]
+    fn a_critical_sigma_hit_never_triggers_a_kill() {
+        let (dir, sink) = critical_sigma_sink("sigma-critical-no-kill");
+        let killed = Arc::new(Mutex::new(Vec::new()));
+        let killed_rec = Arc::clone(&killed);
+        sink.enable_response(
+            policy::ResponsePolicy {
+                kill_enabled: true,
+                quarantine_enabled: false,
+            },
+            move |pid| {
+                killed_rec.lock().unwrap().push(pid);
+                Ok(())
+            },
+            dir.join("quarantine"),
+        );
+        sink.on_event(exec(911, "run", "/opt/reload-content-marker"));
+        assert!(
+            alerts_in(&dir).contains("reload-content test marker rule"),
+            "the critical rule must fire: {}",
+            alerts_in(&dir)
+        );
+        assert!(
+            killed.lock().unwrap().is_empty(),
+            "only a correlator belief crossing its threshold may terminate a process"
+        );
+        assert!(
+            !alerts_in(&dir).contains("killed pid"),
+            "{}",
             alerts_in(&dir)
         );
     }

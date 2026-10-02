@@ -12,10 +12,11 @@ use schema::{
     AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, CapSetEvent,
     ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent,
     FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent,
-    FileSetxattrEvent, FileWriteEvent, GatekeeperVerdictEvent, IdentityChangeEvent,
-    IdentityChangeKind, ImageLoadEvent, KernelModuleAction, KernelModuleEvent, LdapSearchEvent,
-    ListenPortEvent, MemfdCreateEvent, MountEvent, NamespaceEvent, NamespaceSyscall,
-    NetworkFlowEvent, POLICY_MECHANISM_SELINUX, PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent,
+    FileSetxattrEvent, FileWriteEvent, GatekeeperVerdictEvent, HttpClientCount, HttpEvidence,
+    HttpRequestEvent, HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind,
+    ImageLoadEvent, KernelModuleAction, KernelModuleEvent, LdapSearchEvent, ListenPortEvent,
+    MemfdCreateEvent, MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent,
+    POLICY_MECHANISM_SELINUX, PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent,
     ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
     ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent,
     TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User,
@@ -1636,6 +1637,106 @@ fn prctl_securebits_golden() {
             arg: 0b11, // SECBIT_NOROOT | SECBIT_NOROOT_LOCKED
         }),
         "prctl",
+    );
+}
+
+#[test]
+fn http_request_golden() {
+    // v36 (#478): a SQL-injection probe seen in a web access log. The value of the
+    // matched parameter is the only value that leaves the host; the other parameter
+    // is reduced to its name. No process behind the line: pid/ppid 0.
+    assert_golden(
+        &Event::HttpRequest(HttpRequestEvent {
+            meta: EventMeta {
+                pid: 0,
+                ppid: 0,
+                user: User::Unknown,
+                timestamp_ns: 1_756_900_029_000_000_000,
+                comm: "http-access-log".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            client: Some("203.0.113.9".parse().unwrap()),
+            method: Some("GET".into()),
+            path: "/index.php".into(),
+            param_names: vec!["id".into(), "page".into()],
+            status: 200,
+            signature: HttpSignature::SqlInjection,
+            evidence: Some(HttpEvidence {
+                param: "id".into(),
+                value: "1' OR '1'='1".into(),
+            }),
+            scanner: None,
+            truncated: false,
+        }),
+        "http_request",
+    );
+}
+
+#[test]
+fn http_request_scanner_golden() {
+    // v36 (#478): a scanner named by its User-Agent. Only the tool name is kept,
+    // and a request line the server could not parse leaves `method` out.
+    assert_golden(
+        &Event::HttpRequest(HttpRequestEvent {
+            meta: EventMeta {
+                pid: 0,
+                ppid: 0,
+                user: User::Unknown,
+                timestamp_ns: 1_756_900_030_000_000_000,
+                comm: "http-access-log".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            client: None,
+            method: None,
+            path: "/".into(),
+            param_names: Vec::new(),
+            status: 400,
+            signature: HttpSignature::ScannerUserAgent,
+            evidence: None,
+            scanner: Some("nikto".into()),
+            truncated: true,
+        }),
+        "http_request_scanner",
+    );
+}
+
+#[test]
+fn http_summary_golden() {
+    // v36 (#478): one 60 s window of one access log.
+    assert_golden(
+        &Event::HttpSummary(HttpSummaryEvent {
+            meta: EventMeta {
+                pid: 0,
+                ppid: 0,
+                user: User::Unknown,
+                timestamp_ns: 1_756_900_031_000_000_000,
+                comm: "http-access-log".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            source: "/var/log/nginx/access.log".into(),
+            window_secs: 60,
+            requests: 412,
+            status_4xx: 37,
+            status_5xx: 2,
+            distinct_clients: 19,
+            top_clients: vec![
+                HttpClientCount {
+                    client: "198.51.100.7".parse().unwrap(),
+                    failures: 31,
+                },
+                HttpClientCount {
+                    client: "2001:db8::5".parse().unwrap(),
+                    failures: 4,
+                },
+            ],
+        }),
+        "http_summary",
     );
 }
 
