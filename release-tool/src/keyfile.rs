@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 use updater::hash::{hex_decode, hex_encode};
 
@@ -34,7 +34,7 @@ pub(crate) fn load(path: &Path) -> anyhow::Result<Ed25519KeyPair> {
             .permissions()
             .mode();
         if mode & 0o077 != 0 {
-            bail!(
+            anyhow::bail!(
                 "{} is readable by group or others (mode {:o}); run `chmod 600` on it",
                 path.display(),
                 mode & 0o777
