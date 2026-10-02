@@ -11,7 +11,8 @@
 //! - **`config`** — the local install configuration: `config init`
 //!   writes the committed default template, `config check` / `config
 //!   path` inspect it. No network involved. Cheap, always available.
-//! - **`status` / `health` / `detections` / `policy`** — IPC calls to
+//! - **`status` / `health` / `detections` / `policy` / `suppress` /
+//!   `unsuppress`** — IPC calls to
 //!   the running agent, over the endpoint declared in the config
 //!   (`config.ipc.endpoint`). Every one of these exits with a non-zero
 //!   code and a copy-pasteable message if the agent is unreachable or
@@ -78,6 +79,30 @@ enum Command {
     /// Ask the running agent about the currently applied policy —
     /// schema/policy versions, signature verification state.
     Policy,
+
+    /// Drop findings of one technique on one entity from the running agent's
+    /// fused verdict (and so from escalation). The alert log still records
+    /// every finding; `unsuppress` reverses this, and `status` lists what is
+    /// suppressed. The entity is `<ppid>:<comm>` as printed in
+    /// `RESPONSE-ESCALATE` lines.
+    Suppress {
+        /// Parent pid of the entity.
+        ppid: u32,
+        /// Command name of the entity.
+        comm: String,
+        /// Technique to silence, e.g. `T1059.004`.
+        technique: String,
+    },
+
+    /// Lift a suppression made with `suppress`.
+    Unsuppress {
+        /// Parent pid of the entity.
+        ppid: u32,
+        /// Command name of the entity.
+        comm: String,
+        /// Technique to restore.
+        technique: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -122,6 +147,36 @@ async fn main() -> anyhow::Result<()> {
             cmd_detections(cli.config.as_deref(), cli.json, limit).await
         }
         Command::Policy => cmd_policy(cli.config.as_deref(), cli.json).await,
+        Command::Suppress {
+            ppid,
+            comm,
+            technique,
+        } => {
+            cmd_suppress(
+                cli.config.as_deref(),
+                cli.json,
+                ppid,
+                &comm,
+                &technique,
+                true,
+            )
+            .await
+        }
+        Command::Unsuppress {
+            ppid,
+            comm,
+            technique,
+        } => {
+            cmd_suppress(
+                cli.config.as_deref(),
+                cli.json,
+                ppid,
+                &comm,
+                &technique,
+                false,
+            )
+            .await
+        }
     }
 }
 
@@ -195,6 +250,48 @@ async fn cmd_status(cli_arg: Option<&std::path::Path>, json: bool) -> anyhow::Re
             "pipeline healthy : {}",
             if s.pipeline_healthy { "yes" } else { "no" }
         );
+        if s.suppressions.is_empty() {
+            println!("suppressions     : (none)");
+        } else {
+            println!("suppressions     :");
+            for m in &s.suppressions {
+                println!("  {}:{}  {}", m.ppid, m.comm, m.technique);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `suppress` (`suppress == true`) and `unsuppress`: one request, one answer
+/// that says whether anything changed, so re-running either is safe.
+async fn cmd_suppress(
+    cli_arg: Option<&std::path::Path>,
+    json: bool,
+    ppid: u32,
+    comm: &str,
+    technique: &str,
+    suppress: bool,
+) -> anyhow::Result<()> {
+    let mut client = ipc_client(cli_arg).await?;
+    let r = if suppress {
+        client.suppress_verdict(ppid, comm, technique).await
+    } else {
+        client.unsuppress_verdict(ppid, comm, technique).await
+    }
+    .map_err(anyhow::Error::new)?;
+    if json {
+        println!("{}", serde_json::to_string(&r)?);
+    } else {
+        let (done, noop) = if suppress {
+            ("suppressed", "already suppressed")
+        } else {
+            ("lifted suppression of", "was not suppressed")
+        };
+        if r.changed {
+            println!("{done} {technique} on {ppid}:{comm}");
+        } else {
+            println!("{technique} on {ppid}:{comm} {noop}; nothing changed");
+        }
     }
     Ok(())
 }

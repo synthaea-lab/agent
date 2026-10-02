@@ -727,6 +727,74 @@ impl DetectionSink {
         self.alert_log.record(technique, message.to_string());
     }
 
+    /// Issue #613: an operator's request to silence `technique` on the entity
+    /// `(ppid, comm)` in the fused verdict. Returns whether the mark is new.
+    /// Audited as `VERDICT-SUPPRESS` in the alert log, which itself keeps every
+    /// finding: this only changes what the fused view (and so escalation) sees.
+    ///
+    /// # Errors
+    ///
+    /// An empty `comm` or `technique` (it could never match a finding), or the
+    /// suppression list being full ([`verdict::MAX_SUPPRESSIONS`]).
+    pub(crate) fn suppress_verdict(
+        &self,
+        ppid: u32,
+        comm: &str,
+        technique: &str,
+    ) -> Result<bool, String> {
+        if comm.is_empty() || technique.is_empty() {
+            return Err("comm and technique must not be empty".to_string());
+        }
+        let outcome = self
+            .verdict
+            .lock()
+            .unwrap()
+            .suppress(verdict::EntityKey::new(ppid, comm), technique);
+        match outcome {
+            verdict::SuppressOutcome::Added => {
+                self.emit(
+                    "VERDICT-SUPPRESS",
+                    &format!("suppressed {technique} on {ppid}:{comm} by operator request"),
+                );
+                Ok(true)
+            }
+            verdict::SuppressOutcome::AlreadySuppressed => Ok(false),
+            verdict::SuppressOutcome::Full => Err(format!(
+                "suppression list is full ({} entries): lift one first",
+                verdict::MAX_SUPPRESSIONS
+            )),
+        }
+    }
+
+    /// Issue #613: lifts a suppression made with [`Self::suppress_verdict`].
+    /// Returns whether one was removed; audited as `VERDICT-UNSUPPRESS`.
+    pub(crate) fn unsuppress_verdict(&self, ppid: u32, comm: &str, technique: &str) -> bool {
+        let removed = self
+            .verdict
+            .lock()
+            .unwrap()
+            .unsuppress(&verdict::EntityKey::new(ppid, comm), technique);
+        if removed {
+            self.emit(
+                "VERDICT-UNSUPPRESS",
+                &format!("lifted suppression of {technique} on {ppid}:{comm} by operator request"),
+            );
+        }
+        removed
+    }
+
+    /// Every active verdict suppression as `(ppid, comm, technique)`, for the
+    /// agent status (issue #613).
+    pub(crate) fn suppressions(&self) -> Vec<(u32, String, String)> {
+        self.verdict
+            .lock()
+            .unwrap()
+            .suppressions()
+            .into_iter()
+            .map(|(entity, technique)| (entity.ppid, entity.comm, technique))
+            .collect()
+    }
+
     /// Handle to the alert funnel, for the IPC handler's `recent_detections`
     /// endpoint (issue #388).
     pub(crate) fn alert_log(&self) -> Arc<AlertLog> {
@@ -1849,6 +1917,48 @@ detection:
             "{}",
             alerts_in(&dir)
         );
+    }
+
+    /// #613: a suppression drops the finding from the fused verdict, never from
+    /// the audit trail.
+    #[test]
+    fn a_suppressed_technique_leaves_the_verdict_but_stays_in_the_alert_log() {
+        let dir = tmp("suppress-verdict");
+        let sink = sink_in(&dir);
+        let meta = EventMeta {
+            comm: "dropper".into(),
+            ..schema::fixtures::meta()
+        };
+        let entity = verdict::EntityKey::new(meta.ppid, meta.comm.clone());
+        let event = Event::FileOpen(schema::FileOpenEvent {
+            meta: meta.clone(),
+            ..schema::fixtures::file_open()
+        });
+        let record = || {
+            sink.record_and_emit(
+                &entity,
+                "T1105",
+                "downloader wrote then ran a binary",
+                schema::detection::DetectionSource::Rule {
+                    rule_id: "T1105".into(),
+                },
+                schema::detection::Severity::Medium,
+                &event,
+            )
+        };
+
+        assert_eq!(
+            sink.suppress_verdict(meta.ppid, &meta.comm, "T1105"),
+            Ok(true)
+        );
+        assert_eq!(record(), None, "a suppressed finding yields no verdict");
+        assert!(
+            alerts_in(&dir).contains("T1105"),
+            "the audit trail keeps it"
+        );
+
+        assert!(sink.unsuppress_verdict(meta.ppid, &meta.comm, "T1105"));
+        assert!(record().is_some(), "lifting the mark restores fusion");
     }
 
     #[test]
