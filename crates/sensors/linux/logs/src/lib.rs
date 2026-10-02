@@ -15,17 +15,22 @@
 //! - a line that does not match its preset is an `Err`, so the caller can count and
 //!   sample it. Nothing is skipped silently.
 //!
-//! **Status:** parsing only. Not here yet, by design of the slicing: file tailing and
-//! rotation, the `[logs]` configuration table, signatures, the per-window summary,
-//! the schema events and the redaction of what leaves the host (ADR-0018). Those need
-//! the ADR's open questions (data protection first) closed or a separate change.
+//! [`Tailer`] follows one file: a persistable [`Position`], rotation by file identity,
+//! bounded memory per line.
+//!
+//! **Status:** parsing and tailing. Not here yet, by design of the slicing: wiring the
+//! sources from `[logs]` into the agent (and persisting each position), signatures,
+//! the per-window summary, the schema events and the redaction of what leaves the
+//! host (ADR-0018).
 
 mod access;
 mod mysql;
+mod tail;
 mod tokenizer;
 
 pub use access::{AccessFormat, AccessRecord, parse_access_line};
 pub use mysql::{MysqlLoginFailure, parse_mysql_error_line};
+pub use tail::{FileId, PollOutcome, Position, Tailer};
 
 /// Longest line a parser reads; the rest is dropped and the record is flagged
 /// `truncated`. Apache's `LimitRequestLine` default is 8190 bytes, so a normal

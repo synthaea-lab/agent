@@ -2339,6 +2339,7 @@ dependencies = [
 name = "sensor-linux-logs"
 version = "0.1.0"
 dependencies = [
+ "tempfile",
  "thiserror 2.0.20",
 ]
 
