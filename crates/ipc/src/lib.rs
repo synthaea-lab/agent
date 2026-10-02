@@ -34,7 +34,10 @@
 //! authorization model they need (per-capability, policy-gated) is
 //! designed. `ReloadContent` (v2, issue #30) is a deliberate, narrow
 //! exception: see its own doc comment in [`protocol::Request`] for why it
-//! doesn't need that same model.
+//! doesn't need that same model. So are `SuppressVerdict`/`UnsuppressVerdict`
+//! (v3, issue #613): they change only the agent's own fused-verdict view
+//! (never the alert log, a process, or a file), are reversible, and every
+//! change is audited.
 
 pub mod client;
 pub mod error;
@@ -48,7 +51,8 @@ pub use error::{ClientError, ServerError};
 pub use protocol::{
     ClientHello, DetectionSummary, PROTOCOL_VERSION, PolicyVersionResponse,
     RecentDetectionsResponse, ReloadContentResponse, Request, Response, SensorHealth,
-    SensorHealthResponse, SensorState, ServerHello, StatusResponse, WireError,
+    SensorHealthResponse, SensorState, ServerHello, StatusResponse, SuppressionEntry,
+    SuppressionResponse, WireError,
 };
 pub use server::{Handler, RECENT_DETECTIONS_HARD_LIMIT, Server, StubHandler};
 pub use stream::PeerCreds;

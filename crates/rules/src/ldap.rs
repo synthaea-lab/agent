@@ -8,7 +8,7 @@
 //! query the directory constantly as the machine. Reconnaissance runs as a
 //! user, even an administrator.
 
-use schema::{LdapSearchEvent, User};
+use schema::{LdapSearchEvent, User, detection::Severity};
 use store::BoundedMap;
 
 use crate::{Alert, sliding::SlidingDistinct};
@@ -26,6 +26,17 @@ const DOMAIN_ACCOUNT_DISCOVERY: &str = "T1087.002";
 const DOMAIN_TRUST_DISCOVERY: &str = "T1482";
 /// T1552: reading stored credentials out of the directory (LAPS, gMSA).
 const DIRECTORY_CREDENTIAL_READ: &str = "T1552";
+
+/// Per-rule severity (#615). Each technique above belongs to one rule here,
+/// except T1087.002 (privileged accounts, delegation, and the sweep), all
+/// three reconnaissance: Medium. Searching for roasting targets or reading
+/// stored passwords is the step right before credential theft: High.
+fn severity(technique: &str) -> Severity {
+    match technique {
+        KERBEROAST_RECON | ASREP_ROAST_RECON | DIRECTORY_CREDENTIAL_READ => Severity::High,
+        _ => Severity::Medium,
+    }
+}
 
 /// `userAccountControl` bitwise-AND rule (`LDAP_MATCHING_RULE_BIT_AND`) with
 /// `DONT_REQUIRE_PREAUTH` (0x400000).
@@ -83,6 +94,7 @@ pub fn evaluate_ldap_search(event: &LdapSearchEvent) -> Vec<Alert> {
     let filter = normalized(&event.filter);
     let alert = |technique: &'static str, what: &str| Alert {
         technique,
+        severity: severity(technique),
         message: format!(
             "pid={} comm={}: LDAP search for {what}: filter={} base={}",
             event.meta.pid, event.meta.comm, event.filter, event.base_dn,
@@ -168,6 +180,7 @@ impl LdapBurst {
         let count = distinct.record(search, ts, BURST_WINDOW_NS);
         (count >= BURST_THRESHOLD && distinct.try_alert(ts, BURST_WINDOW_NS)).then(|| Alert {
             technique: DOMAIN_ACCOUNT_DISCOVERY,
+            severity: severity(DOMAIN_ACCOUNT_DISCOVERY),
             message: format!(
                 "pid={} comm={}: {count} distinct LDAP searches in {}s — directory enumeration sweep (last: {})",
                 event.meta.pid,
@@ -277,6 +290,17 @@ mod tests {
             techniques(&search("(objectClass=computer)", &["cn\0ms-Mcs-AdmPwd"])),
             [DIRECTORY_CREDENTIAL_READ]
         );
+    }
+
+    #[test]
+    fn severity_follows_the_rule() {
+        let roast = evaluate_ldap_search(&search(
+            "(&(samAccountType=805306368)(servicePrincipalName=*))",
+            &[],
+        ));
+        assert_eq!(roast[0].severity, Severity::High);
+        let trusts = evaluate_ldap_search(&search("(objectClass=trustedDomain)", &[]));
+        assert_eq!(trusts[0].severity, Severity::Medium);
     }
 
     #[test]

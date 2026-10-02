@@ -10,7 +10,7 @@ use std::{
 use schema::{
     AuthEvent, AuthOutcome, ConnectEvent, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
     FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRenameEvent, FileWriteEvent,
-    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, User,
+    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, User, detection::Severity,
 };
 use store::BoundedMap;
 
@@ -404,6 +404,7 @@ impl RuleState {
         }
         Some(Alert {
             technique: "T1059",
+            severity: Severity::Medium,
             message: format!(
                 "pid={} comm={} executed directly by ppid={} comm={parent_comm} (service) — suspicious process lineage",
                 event.meta.pid, comm, event.meta.ppid,
@@ -445,6 +446,7 @@ impl RuleState {
                 })?;
         Some(Alert {
             technique: "T1105",
+            severity: Severity::High,
             message: format!(
                 "pid={} comm={} executes {path}, written {} earlier by pid={} comm={}",
                 event.meta.pid,
@@ -483,6 +485,7 @@ impl RuleState {
         mark.alerted = true;
         Some(Alert {
             technique: "T1204.002",
+            severity: Severity::High,
             message: format!(
                 "pid={} comm={} executes {}, downloaded {} earlier (origin: {}, marked by {})",
                 event.meta.pid,
@@ -565,6 +568,7 @@ impl RuleState {
         if count >= SELF_SPAWN_THRESHOLD && entry.try_alert(ts, SELF_SPAWN_WINDOW_NS) {
             return Some(Alert {
                 technique: "T1059",
+                severity: Severity::Medium,
                 message: format!(
                     "pid={} comm={comm} spawned {count}x in {}s by ppid={} — suspected self-spawn",
                     event.meta.pid,
@@ -598,6 +602,7 @@ impl RuleState {
         }
         Some(Alert {
             technique: "T1204/T1059",
+            severity: Severity::High,
             message: format!(
                 "pid={} comm={comm} spawned by ppid={} comm={parent_comm} — Office→interpreter lineage",
                 event.meta.pid, event.meta.ppid,
@@ -621,6 +626,7 @@ impl RuleState {
         }
         Some(Alert {
             technique: "T1218/T1127",
+            severity: Severity::Medium,
             message: format!(
                 "pid={} comm={comm} (LOLBin) spawned by ppid={} comm={parent_comm}",
                 event.meta.pid, event.meta.ppid,
@@ -686,6 +692,7 @@ impl RuleState {
         if count >= BEACON_THRESHOLD && entry.try_alert(ts, BEACON_WINDOW_NS) {
             return Some(Alert {
                 technique: "T1071/T1041",
+                severity: Severity::High,
                 message: format!(
                     "pid={pid} comm={comm} → {daddr}:{dport} | {count}x in {}s — suspected beaconing",
                     BEACON_WINDOW_NS / 1_000_000_000,
@@ -749,6 +756,7 @@ impl RuleState {
         if distinct >= SCAN_SPREAD_THRESHOLD && entry.try_alert(ts, SCAN_SPREAD_WINDOW_NS) {
             return Some(Alert {
                 technique: "T1046/T1210",
+                severity: Severity::Medium,
                 message: format!(
                     "pid={} comm={} contacted {distinct} distinct destinations on port {} in \
                      {}s — suspected scan/spread burst",
@@ -864,6 +872,7 @@ impl RuleState {
         self.known_listeners.insert(key, ());
         Some(Alert {
             technique: "T1571",
+            severity: Severity::Medium,
             message: format!(
                 "pid={} comm={} new listener on {}:{} — not seen at agent startup",
                 event.meta.pid, event.meta.comm, event.local_addr, event.local_port,
@@ -911,6 +920,7 @@ impl RuleState {
         if count >= AUTH_FAILURE_THRESHOLD && entry.try_alert(ts, AUTH_FAILURE_WINDOW_NS) {
             return vec![Alert {
                 technique: "T1110",
+                severity: Severity::Medium,
                 message: format!(
                     "target={} source={source}: {count} failed authentications in {}s —                      brute-force/spray burst",
                     event.target_user,
@@ -1224,6 +1234,7 @@ impl RuleState {
         {
             return Some(Alert {
                 technique: "T1486",
+                severity: Severity::Critical,
                 message: format!(
                     "pid={} comm={}: {pid_count} files renamed with an appended suffix in {}s \
                      (e.g. {} → {}) — suspected ransomware encryption pass",
@@ -1258,6 +1269,7 @@ impl RuleState {
         {
             return Some(Alert {
                 technique: "T1486",
+                severity: Severity::Critical,
                 message: format!(
                     "ppid={}: {ppid_count} files renamed with an appended suffix by short-lived \
                      children in {}s (e.g. {} → {}, comm={}) — suspected ransomware encryption \
@@ -1389,6 +1401,7 @@ impl RuleState {
         {
             return Some(Alert {
                 technique: "T1486",
+                severity: Severity::Critical,
                 message: format!(
                     "pid={} comm={}: {pid_count} files replaced by a new file with an appended \
                      suffix and then unlinked in {}s (e.g. {deleted} → {created}) — suspected \
@@ -1513,6 +1526,7 @@ impl RuleState {
         {
             return Some(Alert {
                 technique: "T1486",
+                severity: Severity::Critical,
                 message: format!(
                     "pid={} comm={} wrote {}MB and renamed {rename_count}x in {}s — \
                      suspected ransomware kill chain",
@@ -1533,6 +1547,7 @@ impl RuleState {
 fn memfd_dev_fd_exec_alert(pid: u32, comm: &str, path: &str) -> Alert {
     Alert {
         technique: "T1620",
+        severity: Severity::High,
         message: format!(
             "pid={pid} comm={comm}: executed from a file descriptor ({path}), not a real \
              path — no payload ever touched disk",
@@ -1546,6 +1561,7 @@ fn memfd_dev_fd_exec_alert(pid: u32, comm: &str, path: &str) -> Alert {
 fn memfd_proc_fd_exec_alert(pid: u32, comm: &str, path: &str, fd: i32) -> Alert {
     Alert {
         technique: "T1620",
+        severity: Severity::High,
         message: format!(
             "pid={pid} comm={comm}: executed from file descriptor {fd} ({path}), the memfd \
              this process created moments earlier — a payload that never touched disk",
