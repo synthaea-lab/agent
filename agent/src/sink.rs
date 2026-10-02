@@ -97,6 +97,24 @@ pub(crate) struct DetectionSink {
     content_root: PathBuf,
 }
 
+/// The verdict entity an event belongs to: `(ppid, comm)` plus the incarnation of the
+/// parent when the sensor stamped one, so a recycled parent pid does not join the
+/// previous parent's entity (#592).
+fn entity_key(meta: &schema::EventMeta) -> verdict::EntityKey {
+    verdict::EntityKey::new(meta.ppid, meta.comm.clone())
+        .with_parent_generation(meta.parent_process_generation)
+}
+
+/// The `case_id` of a correlator finding: `{ppid}:{comm}`, with `@{generation}` of the
+/// parent appended when it is known, so two incarnations of a recycled parent pid do not
+/// share one case. The server treats it as an opaque string.
+fn correlator_case_id(entity: &verdict::EntityKey) -> String {
+    match entity.parent_generation {
+        Some(generation) => format!("{}:{}@{generation}", entity.ppid, entity.comm),
+        None => format!("{}:{}", entity.ppid, entity.comm),
+    }
+}
+
 /// How long a technique already recorded for an entity stays "the same finding":
 /// a second engine (or the same engine again) reporting it inside this window
 /// folds in silently instead of producing a second alert. Matches the
@@ -427,7 +445,7 @@ impl DetectionSink {
     /// `rule_state`/`rules::evaluate_*` call site.
     fn record_rule_alerts(&self, event: &Event, alerts: impl IntoIterator<Item = rules::Alert>) {
         let meta = event.meta();
-        let entity = verdict::EntityKey::new(meta.ppid, meta.comm.clone());
+        let entity = entity_key(meta);
         for alert in alerts {
             let source = schema::detection::DetectionSource::Rule {
                 rule_id: alert.technique.to_string(),
@@ -514,8 +532,8 @@ impl DetectionSink {
         // parent and `comm` (PR #502 review; pinned by
         // `a_siblings_weak_alert_never_triggers_kill_from_anothers_bayes_crossing`).
         let meta = event.meta();
-        let entity = verdict::EntityKey::new(meta.ppid, meta.comm.clone());
-        let case_id = format!("{}:{}", entity.ppid, entity.comm);
+        let entity = entity_key(meta);
+        let case_id = correlator_case_id(&entity);
         let mut is_high_confidence = false;
         for alert in &alerts {
             let source = schema::detection::DetectionSource::Correlator {
@@ -574,7 +592,7 @@ impl DetectionSink {
         self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_exec(event));
         let sigma_guard = self.sigma.lock().unwrap();
         if let Some(sigma) = sigma_guard.as_ref() {
-            let entity = verdict::EntityKey::new(event.meta.ppid, event.meta.comm.clone());
+            let entity = entity_key(&event.meta);
             for hit in sigma.eval_exec(event) {
                 let technique = if hit.tags.is_empty() {
                     "Sigma".to_string()
@@ -978,7 +996,27 @@ mod tests {
 
     use schema::{ConnectEvent, Event, EventMeta, ExecEvent, User, sensor::EventSink as _};
 
-    use super::DetectionSink;
+    use super::{DetectionSink, correlator_case_id, entity_key};
+
+    #[test]
+    fn the_verdict_entity_carries_the_parents_incarnation_when_stamped() {
+        let mut meta = schema::fixtures::meta();
+        meta.ppid = 50;
+        meta.comm = "evil".into();
+        assert_eq!(entity_key(&meta).parent_generation, None);
+        meta.parent_process_generation = Some(7);
+        let entity = entity_key(&meta);
+        assert_eq!(entity.parent_generation, Some(7));
+        assert_eq!((entity.ppid, entity.comm.as_str()), (50, "evil"));
+    }
+
+    #[test]
+    fn the_correlator_case_id_names_the_parent_incarnation_only_when_known() {
+        let plain = verdict::EntityKey::new(50, "evil");
+        assert_eq!(correlator_case_id(&plain), "50:evil");
+        let stamped = plain.with_parent_generation(Some(7));
+        assert_eq!(correlator_case_id(&stamped), "50:evil@7");
+    }
 
     fn tmp(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("sink-test-{}-{}", name, std::process::id()));
