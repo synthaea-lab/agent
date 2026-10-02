@@ -16,7 +16,11 @@ use std::collections::BTreeMap;
 use ring::signature::{self, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
-use crate::{error::UpdaterError, hash::hex_decode, key::UPDATER_PUBLIC_KEY};
+use crate::{
+    error::UpdaterError,
+    hash::{hex_decode, hex_encode},
+    key::UPDATER_PUBLIC_KEY,
+};
 
 /// The only `schema_version` this build accepts — same anti-drift stance as
 /// [`crate::manifest::MANIFEST_SCHEMA_VERSION`], a separate constant because the
@@ -172,6 +176,16 @@ impl ContentManifest {
             .expect("ContentManifest has no non-serializable content")
     }
 
+    /// Signs this manifest in place with `key_pair`, replacing whatever
+    /// `signature` holds, over the same canonical bytes [`Self::verify_signature`]
+    /// checks. Production signing is offline (ADR-0015); `release-tool sign` is the
+    /// operator-facing way to call this.
+    pub fn sign(&mut self, key_pair: &ring::signature::Ed25519KeyPair) {
+        self.signature.clear();
+        let sig = key_pair.sign(&self.canonical_bytes());
+        self.signature = hex_encode(sig.as_ref());
+    }
+
     /// Verifies this manifest's `schema_version` and Ed25519 signature against
     /// [`UPDATER_PUBLIC_KEY`] — the same embedded key that verifies binary
     /// release manifests. Does not check `release_version` monotonicity,
@@ -300,7 +314,7 @@ mod tests {
         };
         let msg = m.canonical_bytes();
         let sig = test_key_pair().sign(&msg);
-        m.signature = crate::hash::hex_encode(sig.as_ref());
+        m.signature = hex_encode(sig.as_ref());
         m
     }
 

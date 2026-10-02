@@ -386,7 +386,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     let super::RunOptions {
         alerts,
         events,
-        state_dir,
+        storage,
         enable_kill: _,
         enable_quarantine: _,
         // uprobes are a Linux mechanism — the capture flags are accepted for CLI
@@ -397,6 +397,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         server,
         ipc_endpoint,
         content_dir,
+        log_sources: _,
     } = opts;
     let pipeline = super::common::wire_run_pipeline(
         seeded_rule_state(),
@@ -405,7 +406,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         server,
         ipc_endpoint,
         content_dir,
-        state_dir,
+        storage,
     )?;
 
     // Sensor-silence detection (#71/#388): the same monitor feeds T1562

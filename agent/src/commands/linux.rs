@@ -211,7 +211,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     let super::RunOptions {
         alerts,
         events,
-        state_dir,
+        storage,
         enable_kill,
         enable_quarantine,
         enable_tls_capture,
@@ -220,6 +220,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         server,
         ipc_endpoint,
         content_dir,
+        log_sources,
     } = opts;
     // Kill-loudness (#71): must run before any other thread exists — the signal mask
     // set here is inherited by every thread spawned below, including `DetectionSink`'s
@@ -233,7 +234,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         server,
         ipc_endpoint,
         content_dir,
-        state_dir,
+        storage,
     )?;
     let sink = Arc::clone(&pipeline.sink);
 
@@ -307,7 +308,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // time — the real root of trust the heartbeat above cannot provide (silence
     // proves a sensor stopped producing, not that the binary producing it is the
     // one that was actually shipped).
-    crate::integrity::spawn_monitor(state_dir.to_path_buf(), sink.clone());
+    crate::integrity::spawn_monitor(storage.state_dir.clone(), sink.clone());
 
     // Health beacon (#134): periodic self-diagnostics to the control plane, over
     // the silence monitor above.
@@ -322,6 +323,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
 
     spawn_netlink_poller(sink.clone(), netlink_heartbeat, &mut shutdown);
     spawn_journal_tail(sink.clone(), journal_heartbeat, alerts);
+    crate::log_sources::spawn(sink.clone(), log_sources, alerts, &mut shutdown);
     if enable_tls_capture || enable_readline_capture || enable_dns_capture {
         spawn_uprobes_sensor(
             sink.clone(),
