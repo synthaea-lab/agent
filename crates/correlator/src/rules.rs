@@ -429,3 +429,105 @@ pub(crate) fn rule_dns_exfil(
         None
     }
 }
+
+/// Names of web-serving processes whose direct-child shell is the web-shell signal.
+/// The same set `rules` uses for its stateless T1059 rule (#478 level 1), repeated
+/// here because those constants are crate-private.
+const WEB_SERVER_COMMS: &[&str] = &["nginx", "apache2", "httpd", "lighttpd", "php-cgi"];
+/// Prefix-matched, like `rules`: php-fpm's `comm` carries the PHP version on
+/// Debian/Ubuntu (`php-fpm8.3`) and none on RHEL/Fedora.
+const WEB_SERVER_COMM_PREFIXES: &[&str] = &["php-fpm"];
+const SHELL_NAMES: &[&str] = &["sh", "bash", "dash", "zsh", "ash"];
+
+/// True for a shell exec whose direct parent is a web server: what a web shell's
+/// `system()`/`exec()` call looks like to the exec sensor.
+pub(crate) fn is_web_server_shell(exec: &schema::ExecEvent) -> bool {
+    let Some(parent) = exec.parent_comm.as_deref() else {
+        return false;
+    };
+    let parent_is_web = WEB_SERVER_COMMS.contains(&parent)
+        || WEB_SERVER_COMM_PREFIXES
+            .iter()
+            .any(|p| parent.starts_with(p));
+    let name = exec
+        .image_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(&exec.image_path);
+    parent_is_web && SHELL_NAMES.contains(&name)
+}
+
+/// One satisfied [`rule_web_request_shell`] pairing, with the identity of the shell
+/// it concerns so the engine can alert once per shell.
+pub(crate) struct WebShellCase {
+    pub(crate) pid: u32,
+    pub(crate) generation: Option<u64>,
+    /// The shell exec's timestamp.
+    pub(crate) timestamp_ns: u64,
+    pub(crate) alert: CorrelationAlert,
+}
+
+/// T1505.003 / T1190 — a web server spawns a shell within the window of a request that
+/// matched a detection signature (`Event::HttpRequest`, from the access log). Either
+/// can arrive first: the log line is written when the request ends, after the shell
+/// the request caused, and the agent reads it a moment later.
+///
+/// This is temporal co-occurrence on one host, not proof the request caused the shell
+/// (a log line names no process): on a busy site a probe and an unrelated cron job
+/// under php-fpm can land in the same minute. For each qualifying shell the closest
+/// request is named. The message carries the request's signature, path, client and
+/// the matched parameter's *name*, never its value: the value is only redacted at the
+/// agent's sink (ADR-0018), downstream of this crate.
+pub(crate) fn rule_web_request_shell(bus: &EventBus) -> Vec<WebShellCase> {
+    let events: Vec<&Event> = bus.events().collect();
+    let requests: Vec<&schema::HttpRequestEvent> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::HttpRequest(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    if requests.is_empty() {
+        return Vec::new();
+    }
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Exec(exec) if is_web_server_shell(exec) => Some((e.meta(), exec)),
+            _ => None,
+        })
+        .filter_map(|(meta, exec)| {
+            let request = requests
+                .iter()
+                .min_by_key(|r| r.meta.timestamp_ns.abs_diff(meta.timestamp_ns))?;
+            let delta_s = request.meta.timestamp_ns.abs_diff(meta.timestamp_ns) / 1_000_000_000;
+            let client = request
+                .client
+                .map_or_else(|| "unknown".to_owned(), |c| c.to_string());
+            let param = request
+                .evidence
+                .as_ref()
+                .map_or_else(String::new, |ev| format!(" param={}", ev.param));
+            Some(WebShellCase {
+                pid: meta.pid,
+                generation: meta.process_generation,
+                timestamp_ns: meta.timestamp_ns,
+                alert: CorrelationAlert {
+                    technique: "T1505.003",
+                    message: format!(
+                        "pid={} comm={} parent={}: shell spawned by a web server {delta_s}s \
+                         from a {:?} request ({} {}{param}, status {}, client {client}) — \
+                         suspected web shell or exploited web application",
+                        meta.pid,
+                        meta.comm,
+                        exec.parent_comm.as_deref().unwrap_or("?"),
+                        request.signature,
+                        request.method.as_deref().unwrap_or("?"),
+                        request.path,
+                        request.status,
+                    ),
+                },
+            })
+        })
+        .collect()
+}

@@ -38,6 +38,7 @@ dependencies = [
  "sensor-linux",
  "sensor-linux-audit",
  "sensor-linux-journal",
+ "sensor-linux-logs",
  "sensor-linux-lsm",
  "sensor-linux-netlink",
  "sensor-linux-uprobes",
@@ -2339,6 +2340,9 @@ dependencies = [
 name = "sensor-linux-logs"
 version = "0.1.0"
 dependencies = [
+ "schema",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
 ]
 

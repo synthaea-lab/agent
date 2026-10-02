@@ -220,7 +220,13 @@ pub mod time;
 /// remembers. Additive and optional (`None` on Windows and macOS, and on Linux
 /// events the sensor could not stamp), the same serialization-visible reasoning
 /// as v13-v34.
-pub const SCHEMA_VERSION: u32 = 35;
+///
+/// Bumped 35 → 36 for [`Event::HttpRequest`] and [`Event::HttpSummary`] (#478, ADR-0022):
+/// what the agent derives from a web server's access log — one event for a request
+/// that matches a detection signature, one summary per source per window. Neither
+/// reuses an existing variant (ADR-0022 §6); both carry a `meta` with `pid`/`ppid` 0,
+/// since a log line names no process. Same serialization-visible reasoning as v13-v35.
+pub const SCHEMA_VERSION: u32 = 36;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -1633,6 +1639,99 @@ pub struct PrctlEvent {
     pub arg: u64,
 }
 
+/// Which detection signature an [`HttpRequestEvent`] matched (ADR-0022 §3). A small
+/// fixed set: the agent never emits one event per request, only for these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpSignature {
+    /// `../` or its encoded forms in the path or a parameter value.
+    PathTraversal,
+    /// SQL injection markers in a parameter value.
+    SqlInjection,
+    /// A known scanner or exploitation tool named in the `User-Agent`.
+    ScannerUserAgent,
+    /// A request for a path or parameter typical of a dropped webshell.
+    WebshellLike,
+}
+
+/// The one parameter value a signature matched on, the only value of a request that
+/// leaves the host (ADR-0022 §4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpEvidence {
+    /// Name of the matched query parameter.
+    pub param: String,
+    /// The value, cut to 128 characters by the producer. Credential redaction
+    /// (ADR-0018) is not the producer's job: the agent's sink boundary applies it,
+    /// so a consumer downstream of that sink sees the redacted form.
+    pub value: String,
+}
+
+/// A web request that matched a detection signature, derived from an access-log line
+/// by the agent (issue #478, ADR-0022). Not one event per request: a request that
+/// matches nothing never becomes an event. The URL arrives reduced: the path and the
+/// query parameter *names*, never the values, except [`Self::evidence`].
+///
+/// `meta.pid`/`ppid` are 0 and `meta.comm` names the log source: an access-log line
+/// carries no process. `meta.timestamp_ns` is when the agent read the line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpRequestEvent {
+    pub meta: EventMeta,
+    /// The client, when the log holds an address. `None` for a resolved host name
+    /// (`HostnameLookups On`), never a fabricated one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<core::net::IpAddr>,
+    /// `None` when the request line was not parseable (`"-"`, or garbage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// The request path with the query string removed.
+    pub path: String,
+    /// Names of the query parameters, in order, without values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub param_names: Vec<String>,
+    pub status: u16,
+    pub signature: HttpSignature,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<HttpEvidence>,
+    /// For [`HttpSignature::ScannerUserAgent`]: the name of the matched tool
+    /// (`sqlmap`, `nikto`), not the `User-Agent` string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanner: Option<String>,
+    /// The log line was over the length cap and cut before it was parsed.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// One client in an [`HttpSummaryEvent`]'s ranking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpClientCount {
+    pub client: core::net::IpAddr,
+    /// Requests from this client that ended in a 4xx or 5xx status in the window.
+    pub failures: u32,
+}
+
+/// The access log of one source over one window (issue #478, ADR-0022 §3): counters
+/// and the clients with the most failing requests, the only thing the server sees of
+/// requests that matched no signature. Emitted once per source per window that saw at
+/// least one request: a quiet log is normal and an empty summary says nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpSummaryEvent {
+    /// Same `pid`/`ppid` 0 convention as [`HttpRequestEvent`]; `timestamp_ns` is the
+    /// end of the window.
+    pub meta: EventMeta,
+    /// The declared log file the counters come from.
+    pub source: String,
+    pub window_secs: u32,
+    pub requests: u32,
+    pub status_4xx: u32,
+    pub status_5xx: u32,
+    /// Distinct client addresses seen. A line with a host name instead of an address
+    /// counts in `requests` but not here.
+    pub distinct_clients: u32,
+    /// Highest failure counts first, bounded by the producer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_clients: Vec<HttpClientCount>,
+}
+
 /// Which user/group identity syscall produced an [`IdentityChangeEvent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1768,6 +1867,8 @@ pub enum Event {
     CapSet(CapSetEvent),
     Namespace(NamespaceEvent),
     Prctl(PrctlEvent),
+    HttpRequest(HttpRequestEvent),
+    HttpSummary(HttpSummaryEvent),
 }
 
 impl Event {
@@ -1822,6 +1923,8 @@ impl Event {
             Event::CapSet(e) => &e.meta,
             Event::Namespace(e) => &e.meta,
             Event::Prctl(e) => &e.meta,
+            Event::HttpRequest(e) => &e.meta,
+            Event::HttpSummary(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.

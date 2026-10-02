@@ -66,7 +66,19 @@ fn dash_owned(s: String) -> Option<String> {
 /// # Errors
 /// [`ParseError`] when the line does not match the preset; the caller counts it.
 pub fn parse_access_line(line: &str, format: AccessFormat) -> Result<AccessRecord, ParseError> {
-    let (line, truncated) = clamp(line);
+    let (clamped, truncated) = clamp(line);
+    // A line cut at the cap that no longer parses is the cap's doing, not the source's
+    // format: reported apart so an over-long request (a probe, or a 414) does not
+    // count towards a source being declared misparsing.
+    parse_clamped(clamped, truncated, format)
+        .map_err(|e| if truncated { ParseError::Truncated } else { e })
+}
+
+fn parse_clamped(
+    line: &str,
+    truncated: bool,
+    format: AccessFormat,
+) -> Result<AccessRecord, ParseError> {
     let mut c = Cursor::new(line);
 
     let client = c.word("client")?.to_owned();
@@ -216,7 +228,7 @@ mod tests {
         );
         assert_eq!(
             parse_access_line(&in_request, AccessFormat::Common),
-            Err(ParseError::Unterminated)
+            Err(ParseError::Truncated)
         );
         // The cut lands inside the user agent: also an error.
         let in_agent = format!(

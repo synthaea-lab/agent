@@ -82,3 +82,17 @@ max_reconnect_backoff_ms = 60000
 # it `agent apply-content-manifest` requires `--ring`. Assign new installs to
 # a canary ring first; `prod` receives content only after the canaries.
 # ring = "canary_0"                                  # CHANGE ME
+
+# Service logs the agent reads (ADR-0022): web access logs and the MySQL/MariaDB
+# error log. Optional; nothing is discovered, every source is declared here, at
+# most 16. Not the same as [log] above, which is the agent's own log.
+# `kind` is one of: access_common (Apache common), access_combined (Apache or
+# nginx combined), mysql_error (MySQL/MariaDB error log, failed logins). A site
+# with a custom LogFormat is not supported in v1. `path` must be absolute.
+# Today only mysql_error is read; the access_* kinds are accepted and logged as
+# not yet active. `mysql_error` needs the error log to be a FILE: Debian/Ubuntu
+# MariaDB logs to the journal by default, so set `log_error` in the server first.
+# The agent must be able to read it (root, or CAP_DAC_READ_SEARCH).
+# [[logs.sources]]
+# path = "/var/log/mysql/error.log"
+# kind = "mysql_error"

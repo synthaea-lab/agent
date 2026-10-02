@@ -15,17 +15,30 @@
 //! - a line that does not match its preset is an `Err`, so the caller can count and
 //!   sample it. Nothing is skipped silently.
 //!
-//! **Status:** parsing only. Not here yet, by design of the slicing: file tailing and
-//! rotation, the `[logs]` configuration table, signatures, the per-window summary,
-//! the schema events and the redaction of what leaves the host (ADR-0018). Those need
-//! the ADR's open questions (data protection first) closed or a separate change.
+//! [`Tailer`] follows one file: a persistable [`Position`], rotation by file identity,
+//! bounded memory per line.
+//!
+//! [`match_request`] and [`to_http_request_event`] turn a parsed access-log line into an
+//! `HttpRequest` event when it matches a detection signature; a [`Summarizer`] yields
+//! one `HttpSummary` per source per window.
+//!
+//! **Status:** everything here is pure and tested; nothing writes or sends an event.
+//! Not here yet: wiring the access sources into the agent, and the credential
+//! redaction of an event's evidence value, which ADR-0018 puts at the agent's sink
+//! boundary (so the evidence leaves this crate cut but raw).
 
 mod access;
+mod http;
 mod mysql;
+mod summary;
+mod tail;
 mod tokenizer;
 
 pub use access::{AccessFormat, AccessRecord, parse_access_line};
-pub use mysql::{MysqlLoginFailure, parse_mysql_error_line};
+pub use http::{EVIDENCE_MAX_CHARS, HTTP_LOG_COMM, Match, match_request, to_http_request_event};
+pub use mysql::{MYSQL_LOG_COMM, MysqlLoginFailure, parse_mysql_error_line, to_auth_event};
+pub use summary::{MAX_TRACKED_CLIENTS, Summarizer, TOP_CLIENTS, WINDOW_SECS};
+pub use tail::{FileId, PollOutcome, Position, Tailer};
 
 /// Longest line a parser reads; the rest is dropped and the record is flagged
 /// `truncated`. Apache's `LimitRequestLine` default is 8190 bytes, so a normal
@@ -43,6 +56,10 @@ pub enum ParseError {
     BadField(&'static str, String),
     #[error("unexpected data after the last field of the format")]
     TrailingData,
+    /// The line was longer than [`MAX_LINE_BYTES`], was cut, and the rest does not
+    /// parse. Not evidence that the source's format is wrong.
+    #[error("line cut at the length cap and no longer parses")]
+    Truncated,
 }
 
 /// Cuts `line` to at most [`MAX_LINE_BYTES`] on a character boundary, after removing

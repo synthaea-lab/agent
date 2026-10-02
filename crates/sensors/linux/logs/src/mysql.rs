@@ -1,13 +1,19 @@
 //! MySQL/MariaDB error log: failed logins.
 //!
 //! ```text
-//! MySQL 8:  2026-10-01T12:00:00.123456Z 12 [Note] [MY-010926] [Server] Access denied for user 'root'@'10.0.0.5' (using password: YES)
-//! MariaDB:  2026-10-01 12:00:00 12 [Warning] Access denied for user 'root'@'10.0.0.5' (using password: YES)
+//! MariaDB 10.11 (seen on a real server): 2026-10-02  9:26:33 31 [Warning] Access denied for user 'root'@'localhost'
+//! MySQL 8 (from its documentation):      2026-10-01T12:00:00.123456Z 12 [Note] [MY-010926] [Server] Access denied for user 'root'@'10.0.0.5' (using password: YES)
 //! ```
+//!
+//! `MariaDB` omits the ` (using password: ...)` clause that `MySQL` appends, and pads a
+//! one-digit hour with a space, so the clause is optional and the time may be preceded
+//! by two spaces.
 //!
 //! The user name is attacker-chosen and the server does not escape it, so it can contain
 //! `'`, `@` and spaces. The host cannot contain `'@'`, so the split is on the *last*
-//! `'@'` before the fixed ` (using password: ...)` suffix.
+//! `'@'` of the identity.
+
+use schema::{AuthEvent, AuthKind, AuthOutcome, EventMeta, User};
 
 use crate::{ParseError, clamp};
 
@@ -18,7 +24,9 @@ pub struct MysqlLoginFailure {
     pub timestamp: String,
     pub user: String,
     pub host: String,
-    pub used_password: bool,
+    /// `Some` when the server says whether a password was sent (`MySQL` does, `MariaDB`
+    /// does not).
+    pub used_password: Option<bool>,
     pub truncated: bool,
 }
 
@@ -29,7 +37,7 @@ const MARKER: &str = "Access denied for user '";
 ///
 /// # Errors
 /// [`ParseError`] when the line contains the access-denied marker but not the
-/// `'user'@'host' (using password: ...)` shape or a leading timestamp.
+/// `'user'@'host'` shape or a leading timestamp.
 pub fn parse_mysql_error_line(line: &str) -> Result<Option<MysqlLoginFailure>, ParseError> {
     let (line, truncated) = clamp(line);
     let Some(at) = line.find(MARKER) else {
@@ -40,32 +48,74 @@ pub fn parse_mysql_error_line(line: &str) -> Result<Option<MysqlLoginFailure>, P
 
     let body = &line[at + MARKER.len()..];
     let (identity, used_password) = if let Some(i) = body.strip_suffix(" (using password: YES)") {
-        (i, true)
+        (i, Some(true))
     } else if let Some(i) = body.strip_suffix(" (using password: NO)") {
-        (i, false)
+        (i, Some(false))
     } else {
-        // "... to database 'db'" is an authorization failure, not a login failure.
-        return if body.contains(" to database ") {
-            Ok(None)
-        } else {
-            Err(ParseError::BadField("password_clause", body.into()))
-        };
+        (body, None)
     };
 
-    let identity = identity
-        .strip_suffix('\'')
-        .ok_or_else(|| ParseError::BadField("host", identity.into()))?;
     let split = identity
         .rfind("'@'")
         .ok_or_else(|| ParseError::BadField("host", identity.into()))?;
+    let tail = &identity[split + 3..];
+    // "... 'user'@'host' to database 'db'" is an authorization failure of an account
+    // that did log in, not a failed login. Judged on what follows the last '@', the
+    // part the client cannot shape from the user name.
+    if tail.contains("' to database '") {
+        return Ok(None);
+    }
+    let host = tail
+        .strip_suffix('\'')
+        .ok_or_else(|| ParseError::BadField("host", tail.into()))?;
 
     Ok(Some(MysqlLoginFailure {
         timestamp: timestamp.to_owned(),
         user: identity[..split].to_owned(),
-        host: identity[split + 3..].to_owned(),
+        host: host.to_owned(),
         used_password,
         truncated,
     }))
+}
+
+/// The `comm` of events built from this log. It names the source, not a process: an
+/// error-log line carries no pid, so [`to_auth_event`] sets `pid` and `ppid` to 0.
+pub const MYSQL_LOG_COMM: &str = "mysql-error-log";
+
+/// A failed login as the shared logon event (ADR-0022 §3, ADR-0005), so the existing
+/// brute-force rule (T1110, keyed on target user and source address) covers it.
+///
+/// `timestamp_ns` is when the agent read the line, not the line's own time: `MariaDB`
+/// writes no zone, and a restart's catch-up reads old lines. The source address is
+/// the client host when it is an IP; a resolved name or `localhost` leaves it `None`,
+/// which the rule keys as "local" (never a fabricated loopback).
+#[must_use]
+pub fn to_auth_event(failure: &MysqlLoginFailure, timestamp_ns: u64) -> AuthEvent {
+    AuthEvent {
+        meta: EventMeta {
+            pid: 0,
+            ppid: 0,
+            user: User::Unknown,
+            timestamp_ns,
+            comm: MYSQL_LOG_COMM.to_owned(),
+            container: None,
+            process_generation: None,
+            parent_process_generation: None,
+        },
+        outcome: AuthOutcome::Failure,
+        kind: AuthKind::LogonFailure,
+        target_user: failure.user.clone(),
+        target_user_sid: None,
+        source_address: failure.host.parse().ok(),
+        status_code: failure.used_password.map(|used| {
+            if used {
+                "using_password"
+            } else {
+                "no_password"
+            }
+            .to_owned()
+        }),
+    }
 }
 
 /// `2026-10-01T12:00:00.123456Z` or `2026-10-01 12:00:00`: the leading token(s) of
@@ -107,7 +157,50 @@ mod tests {
         let f = parse_mysql_error_line(l).unwrap().unwrap();
         assert_eq!(f.timestamp, "2026-10-01T12:00:00.123456Z");
         assert_eq!((f.user.as_str(), f.host.as_str()), ("root", "10.0.0.5"));
-        assert!(f.used_password);
+        assert_eq!(f.used_password, Some(true));
+    }
+
+    /// Verbatim from a `MariaDB` 10.11.14 on Ubuntu 24.04: no password clause, and a
+    /// one-digit hour padded with a second space.
+    #[test]
+    fn a_real_mariadb_line() {
+        let l = "2026-10-02  9:26:33 31 [Warning] Access denied for user 'root'@'localhost'";
+        let f = parse_mysql_error_line(l).unwrap().unwrap();
+        assert_eq!(f.timestamp, "2026-10-02  9:26:33");
+        assert_eq!((f.user.as_str(), f.host.as_str()), ("root", "localhost"));
+        assert_eq!(f.used_password, None);
+        assert_eq!(to_auth_event(&f, 1).status_code, None);
+    }
+
+    #[test]
+    fn a_user_name_imitating_an_authorization_failure_does_not_hide_the_attempt() {
+        let l =
+            "2026-10-02 09:26:33 5 [Warning] Access denied for user 'x' to database 'y'@'10.0.0.9'";
+        let f = parse_mysql_error_line(l).unwrap().unwrap();
+        assert_eq!(f.user, "x' to database 'y");
+        assert_eq!(f.host, "10.0.0.9");
+    }
+
+    #[test]
+    fn a_failed_login_becomes_a_logon_failure_with_the_client_ip() {
+        let l = "2026-10-01 12:00:00 12 [Warning] Access denied for user 'root'@'10.0.0.5' (using password: YES)";
+        let f = parse_mysql_error_line(l).unwrap().unwrap();
+        let e = to_auth_event(&f, 42);
+        assert_eq!(
+            (e.outcome, e.kind),
+            (AuthOutcome::Failure, AuthKind::LogonFailure)
+        );
+        assert_eq!(e.target_user, "root");
+        assert_eq!(e.source_address, Some("10.0.0.5".parse().unwrap()));
+        assert_eq!((e.meta.pid, e.meta.ppid, e.meta.timestamp_ns), (0, 0, 42));
+        assert_eq!(e.meta.comm, MYSQL_LOG_COMM);
+    }
+
+    #[test]
+    fn a_host_name_is_not_an_address() {
+        let l = "2026-10-01 12:00:00 12 [Warning] Access denied for user 'u'@'localhost' (using password: NO)";
+        let f = parse_mysql_error_line(l).unwrap().unwrap();
+        assert_eq!(to_auth_event(&f, 1).source_address, None);
     }
 
     #[test]
@@ -116,7 +209,7 @@ mod tests {
         let f = parse_mysql_error_line(l).unwrap().unwrap();
         assert_eq!(f.timestamp, "2026-10-01 12:00:00");
         assert_eq!((f.user.as_str(), f.host.as_str()), ("app", "localhost"));
-        assert!(!f.used_password);
+        assert_eq!(f.used_password, Some(false));
     }
 
     #[test]

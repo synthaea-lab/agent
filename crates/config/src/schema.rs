@@ -54,6 +54,49 @@ pub struct AgentConfig {
     /// assigned", never a default ring.
     #[serde(default)]
     pub updates: UpdatesConfig,
+    /// Service logs the agent reads (ADR-0022, issue #478). Optional: an
+    /// absent `[logs]` table means no source, never a discovered one.
+    #[serde(default)]
+    pub logs: LogsConfig,
+}
+
+/// Most log sources one agent reads. Each is a tailed file and a parser fed by
+/// text an attacker chooses, so the set is declared, bounded and small.
+pub const MAX_LOG_SOURCES: usize = 16;
+
+/// The `[logs]` table: service logs declared by the operator (ADR-0022 §1).
+///
+/// Not to be confused with `[log]` ([`LogConfig`]), which is where the agent
+/// writes *its own* log.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogsConfig {
+    /// One `[[logs.sources]]` entry per file. Empty by default.
+    #[serde(default)]
+    pub sources: Vec<LogSourceConfig>,
+}
+
+/// One declared service log: a file and the fixed preset it is parsed with.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogSourceConfig {
+    /// Absolute path of the log file. The agent reads it; it never creates it.
+    pub path: PathBuf,
+    /// Which preset parses it. Explicit, never auto-detected (ADR-0022 §2).
+    pub kind: LogSourceKind,
+}
+
+/// The presets ADR-0022 §1 puts in v1. There is no free-form pattern: a custom
+/// `LogFormat` is reported as a misparsing source, not guessed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogSourceKind {
+    /// Apache `common` (`%h %l %u %t "%r" %>s %b`).
+    AccessCommon,
+    /// Apache `combined` or nginx's default `combined`.
+    AccessCombined,
+    /// `MySQL` or `MariaDB` error log, for failed logins.
+    MysqlError,
 }
 
 /// Rings a content manifest can target (ADR-0016). A plain list rather than
