@@ -66,6 +66,22 @@ fn shadow_copy_deletion_alerts() {
     let event = exec_event("vssadmin.exe Delete Shadows /All /Quiet");
     let alert = check_recovery_inhibit(&event).expect("must alert");
     assert_eq!(alert.technique, "T1490");
+    assert_eq!(alert.severity, schema::detection::Severity::High);
+}
+
+/// #615: severity is per rule, not per technique string: the same ATT&CK id can be a
+/// routine-looking finding from one rule and a serious one from another.
+#[test]
+fn severity_is_assigned_per_rule_not_flat() {
+    use schema::detection::Severity;
+    let base64 = crate::evaluate_exec(&exec_event("bash -c echo cGF5bG9hZAo= | base64 -d | sh"));
+    assert!(
+        base64
+            .iter()
+            .any(|a| a.technique == "T1059.004" && a.severity == Severity::Medium)
+    );
+    let shadow = check_recovery_inhibit(&exec_event("vssadmin.exe Delete Shadows /All /Quiet"));
+    assert_eq!(shadow.unwrap().severity, Severity::High);
 }
 
 #[test]
