@@ -1779,8 +1779,8 @@ rule response_marker {
             schema::detection::DetectionSource::Rule {
                 rule_id: "T1059".into(),
             },
+            schema::detection::Severity::Medium,
             &event,
-            event.meta().timestamp_ns,
         );
         assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
         let records: Vec<transport::QueuedDetection> =

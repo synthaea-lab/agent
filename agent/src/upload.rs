@@ -157,7 +157,7 @@ pub(crate) fn start(
     let detection_dir = alerts.with_file_name("detection-spool");
     let detection_spool = Arc::new(Mutex::new(EventSpool::open_with_segment_records(
         &detection_dir,
-        SPOOL_MAX_BYTES,
+        spool_max_bytes,
         1,
     )?));
 
