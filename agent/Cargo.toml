@@ -63,6 +63,7 @@ sensor-linux-audit = { path = "../crates/sensors/linux/audit" }
 sensor-linux-netlink = { path = "../crates/sensors/linux/netlink" }
 sensor-linux-journal = { path = "../crates/sensors/linux/journal" }
 sensor-linux-logs = { path = "../crates/sensors/linux/logs" }
+sensor-linux-procmem = { path = "../crates/sensors/linux/procmem" }
 sensor-linux-uprobes = { path = "../crates/sensors/linux/uprobes" }
 # Observation-only file_open hook (issue #91/#313): cmd_run attaches it
 # best-effort alongside the primary sensor. Inline blocking (-EPERM on a

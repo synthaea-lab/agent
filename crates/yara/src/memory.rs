@@ -31,7 +31,7 @@ use std::{
 
 use store::BoundedMap;
 
-use crate::{RuleSet, YaraMatch};
+use crate::{RuleSet, ScanContext, YaraMatch};
 
 /// Permissions of a mapped region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +239,10 @@ pub fn scan_memory(
 pub struct MemoryScanOutcome {
     pub pid: u32,
     pub generation: Option<u64>,
+    /// Who the scan was about, as the trigger described them (`(ppid, comm)` and the
+    /// triggering event's time), so a match can be keyed to the same entity as the
+    /// finding that caused the scan.
+    pub context: Option<ScanContext>,
     pub report: MemoryScanReport,
 }
 
@@ -270,6 +274,7 @@ const MINUTE_NS: u64 = 60 * 1_000_000_000;
 struct Request {
     pid: u32,
     generation: Option<u64>,
+    context: Option<ScanContext>,
 }
 
 /// Admission control shared by every caller of [`MemoryScanQueue::enqueue`].
@@ -313,7 +318,12 @@ impl MemoryScanQueue {
         std::thread::Builder::new()
             .name("yara-memscan".into())
             .spawn(move || {
-                while let Ok(Request { pid, generation }) = rx.recv() {
+                while let Ok(Request {
+                    pid,
+                    generation,
+                    context,
+                }) = rx.recv()
+                {
                     match scan_memory(&rules, source.as_ref(), pid, &budget) {
                         Ok(report) => {
                             scanned_w.fetch_add(1, Ordering::Relaxed);
@@ -321,6 +331,7 @@ impl MemoryScanQueue {
                                 on_match(MemoryScanOutcome {
                                     pid,
                                     generation,
+                                    context,
                                     report,
                                 });
                             }
@@ -355,7 +366,13 @@ impl MemoryScanQueue {
     /// # Panics
     ///
     /// Only if the admission lock is poisoned by a panic elsewhere.
-    pub fn enqueue(&self, pid: u32, generation: Option<u64>, now_ns: u64) -> bool {
+    pub fn enqueue(
+        &self,
+        pid: u32,
+        generation: Option<u64>,
+        now_ns: u64,
+        context: Option<ScanContext>,
+    ) -> bool {
         let mut gate = self.gate.lock().unwrap();
         let key = (pid, generation);
         if let Some(&last) = gate.last_scan.peek(&key)
@@ -375,7 +392,15 @@ impl MemoryScanQueue {
             self.shed_rate.fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        if self.tx.try_send(Request { pid, generation }).is_err() {
+        if self
+            .tx
+            .try_send(Request {
+                pid,
+                generation,
+                context,
+            })
+            .is_err()
+        {
             self.shed_queue_full.fetch_add(1, Ordering::Relaxed);
             return false;
         }
@@ -676,47 +701,58 @@ rule mem_marker {
     #[test]
     fn a_triggered_scan_delivers_a_match_attributed_to_the_process() {
         let (queue, hits) = queue_over(implant());
-        assert!(queue.enqueue(42, Some(7), 1));
+        let context = ScanContext {
+            ppid: 9,
+            comm: "implant".into(),
+            parent_generation: Some(3),
+            timestamp_ns: 5,
+        };
+        assert!(queue.enqueue(42, Some(7), 1, Some(context.clone())));
         assert!(queue.wait_for_completed(1, Duration::from_secs(5)));
         let hits = hits.lock().unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!((hits[0].pid, hits[0].generation), (42, Some(7)));
+        assert_eq!(
+            hits[0].context,
+            Some(context),
+            "the trigger's identity travels"
+        );
         assert_eq!(hits[0].report.matches[0].identifier, "mem_marker");
     }
 
     #[test]
     fn a_process_is_not_rescanned_within_the_cooldown() {
         let (queue, _hits) = queue_over(implant());
-        assert!(queue.enqueue(42, Some(1), 0));
+        assert!(queue.enqueue(42, Some(1), 0, None));
         assert!(
-            !queue.enqueue(42, Some(1), COOLDOWN_NS - 1),
+            !queue.enqueue(42, Some(1), COOLDOWN_NS - 1, None),
             "still cooling down"
         );
-        assert!(queue.enqueue(42, Some(1), COOLDOWN_NS), "window over");
+        assert!(queue.enqueue(42, Some(1), COOLDOWN_NS, None), "window over");
         assert_eq!(queue.stats().shed_cooldown, 1);
     }
 
     #[test]
     fn a_recycled_pid_is_a_new_process_for_the_cooldown() {
         let (queue, _hits) = queue_over(implant());
-        assert!(queue.enqueue(42, Some(1), 0));
+        assert!(queue.enqueue(42, Some(1), 0, None));
         assert!(
-            queue.enqueue(42, Some(2), 1),
+            queue.enqueue(42, Some(2), 1, None),
             "another incarnation of pid 42"
         );
-        assert!(!queue.enqueue(42, Some(2), 2));
+        assert!(!queue.enqueue(42, Some(2), 2, None));
     }
 
     #[test]
     fn the_global_rate_cap_sheds_and_counts_then_recovers() {
         let (queue, _hits) = queue_over(implant());
         for pid in 0..MAX_SCANS_PER_MINUTE as u32 {
-            assert!(queue.enqueue(100 + pid, None, 1_000 + u64::from(pid)));
+            assert!(queue.enqueue(100 + pid, None, 1_000 + u64::from(pid), None));
         }
-        assert!(!queue.enqueue(999, None, 2_000), "cap spent");
+        assert!(!queue.enqueue(999, None, 2_000, None), "cap spent");
         assert_eq!(queue.stats().shed_rate, 1);
         assert!(
-            queue.enqueue(999, None, 61 * 1_000_000_000),
+            queue.enqueue(999, None, 61 * 1_000_000_000, None),
             "a minute later"
         );
     }
@@ -725,12 +761,12 @@ rule mem_marker {
     fn a_shed_request_does_not_spend_the_cooldown() {
         let (queue, _hits) = queue_over(implant());
         for pid in 0..MAX_SCANS_PER_MINUTE as u32 {
-            assert!(queue.enqueue(100 + pid, None, 1_000));
+            assert!(queue.enqueue(100 + pid, None, 1_000, None));
         }
-        assert!(!queue.enqueue(999, None, 2_000), "rate-shed");
+        assert!(!queue.enqueue(999, None, 2_000, None), "rate-shed");
         // 999 was shed by the rate cap, not scanned: once the minute passes it is
         // admitted at once, not held back by a cooldown it never earned.
-        assert!(queue.enqueue(999, None, 61 * 1_000_000_000));
+        assert!(queue.enqueue(999, None, 61 * 1_000_000_000, None));
     }
 
     #[test]
@@ -738,7 +774,7 @@ rule mem_marker {
         let mut fake = implant();
         fake.regions = Err(io::Error::from(io::ErrorKind::PermissionDenied));
         let (queue, hits) = queue_over(fake);
-        assert!(queue.enqueue(1, None, 0));
+        assert!(queue.enqueue(1, None, 0, None));
         assert!(queue.wait_for_completed(1, Duration::from_secs(5)));
         assert_eq!(queue.stats().unreadable, 1);
         assert_eq!(queue.stats().scanned, 0);
@@ -752,7 +788,7 @@ rule mem_marker {
             vec![(0x1000, vec![0x90; 64])],
         );
         let (queue, hits) = queue_over(clean);
-        assert!(queue.enqueue(1, None, 0));
+        assert!(queue.enqueue(1, None, 0, None));
         assert!(queue.wait_for_completed(1, Duration::from_secs(5)));
         assert_eq!(queue.stats().scanned, 1);
         assert!(hits.lock().unwrap().is_empty());
@@ -793,7 +829,7 @@ rule mem_marker {
         let minute = MINUTE_NS + 1;
         let mut admitted = 0_u32;
         for pid in 0..(QUEUE_CAP as u32 + 4) {
-            if queue.enqueue(pid, None, u64::from(pid) * minute) {
+            if queue.enqueue(pid, None, u64::from(pid) * minute, None) {
                 admitted += 1;
             }
         }

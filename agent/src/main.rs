@@ -48,6 +48,8 @@ mod journal_cursor;
 mod kill_loudness;
 #[cfg(target_os = "linux")]
 mod log_sources;
+#[cfg(target_os = "linux")]
+mod memscan;
 mod protected;
 mod quarantine_cmd;
 mod release;

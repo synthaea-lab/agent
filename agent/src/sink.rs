@@ -63,6 +63,11 @@ pub(crate) struct DetectionSink {
     /// `<content_root>/rules/yara` is absent. `Mutex`-wrapped for the same
     /// reload reason as `sigma`.
     yara: Mutex<Option<(yara::ScanQueue, usize)>>,
+    /// Budgeted YARA scanning of one process's memory (#85, ADR-0023), requested by a
+    /// detection about that process (today the memfd-exec rule, T1620), never swept.
+    /// `None` when `<content_root>/rules/yara` is absent, and on every platform but
+    /// Linux. `Mutex`-wrapped for the same reload reason as `yara`.
+    memscan: Mutex<Option<yara::MemoryScanQueue>>,
     /// Enrichment (hash + signature) and the high-volume raw-event logging, off the
     /// drain thread (issue #126). The capture thread runs detection in memory and
     /// hands the event here with a non-blocking send.
@@ -104,6 +109,10 @@ fn entity_key(meta: &schema::EventMeta) -> verdict::EntityKey {
     verdict::EntityKey::new(meta.ppid, meta.comm.clone())
         .with_parent_generation(meta.parent_process_generation)
 }
+
+/// The ATT&CK technique the memfd-exec rule reports (`rules`, T1620 reflective code
+/// loading): the trigger for a memory scan of that process (#85).
+const MEMFD_EXEC_TECHNIQUE: &str = "T1620";
 
 /// The escalation decision (#612) as a free function so the YARA scan worker, which
 /// has no `DetectionSink`, raises the same alert as every other engine (#614).
@@ -253,6 +262,9 @@ impl DetectionSink {
                 )
                 .into_option(),
             ),
+            memscan: Mutex::new(
+                start_memscan(&content_root, alert_log.clone(), verdict.clone()).into_option(),
+            ),
             alert_log,
             enrich_queue,
             progress: Arc::new(AtomicU64::new(0)),
@@ -288,6 +300,11 @@ impl DetectionSink {
             self.response.clone(),
             self.verdict.clone(),
         );
+        let memscan_loaded = start_memscan(
+            &self.content_root,
+            self.alert_log.clone(),
+            self.verdict.clone(),
+        );
 
         // The replaced engines are dropped after the locks are released: a
         // `ScanQueue` joins its worker on drop, which must not stall capture.
@@ -310,6 +327,17 @@ impl DetectionSink {
         let yara_rule_count = yara_slot.as_ref().map(|(_, count)| *count);
         drop(yara_slot);
         drop(old_yara);
+
+        // Same rules, same posture as the file scanner: absent unloads, broken keeps
+        // the previous queue (its failure is already reported through `yara`).
+        let mut memscan_slot = self.memscan.lock().unwrap();
+        let old_memscan = match memscan_loaded {
+            Load::Loaded(queue) => memscan_slot.replace(queue),
+            Load::Absent => memscan_slot.take(),
+            Load::Failed => None,
+        };
+        drop(memscan_slot);
+        drop(old_memscan);
 
         ReloadReport {
             sigma_rule_count,
@@ -462,6 +490,28 @@ impl DetectionSink {
         escalate_if_warranted(&self.alert_log, fused);
     }
 
+    /// Asks for a budgeted YARA scan of the memory of the process behind `event` (#85):
+    /// the payload of a fileless exec exists only there. The scan queue applies the
+    /// cooldown, the global cap and the per-scan budget; a shed request is counted there.
+    fn request_memory_scan(&self, event: &Event) {
+        let guard = self.memscan.lock().unwrap();
+        let Some(queue) = guard.as_ref() else {
+            return;
+        };
+        let meta = event.meta();
+        queue.enqueue(
+            meta.pid,
+            meta.process_generation,
+            meta.timestamp_ns,
+            Some(yara::ScanContext {
+                ppid: meta.ppid,
+                comm: meta.comm.clone(),
+                parent_generation: meta.parent_process_generation,
+                timestamp_ns: meta.timestamp_ns,
+            }),
+        );
+    }
+
     /// [`Self::record_and_emit`] for a batch of plain `rules::Alert`s (no Sigma/
     /// correlator-specific `DetectionSource` needed) — the common case for every
     /// `rule_state`/`rules::evaluate_*` call site.
@@ -469,6 +519,9 @@ impl DetectionSink {
         let meta = event.meta();
         let entity = entity_key(meta);
         for alert in alerts {
+            if alert.technique == MEMFD_EXEC_TECHNIQUE {
+                self.request_memory_scan(event);
+            }
             let source = schema::detection::DetectionSource::Rule {
                 rule_id: alert.technique.to_string(),
             };
@@ -962,6 +1015,80 @@ fn start_yara(
             tracing::error!(error = %e, "yara: load error");
             Load::Failed
         }
+    }
+}
+
+/// Starts the memory scanner over the same `rules/yara` content as the file scanner
+/// (#85, ADR-0023). The rule set is compiled a second time because the file queue owns
+/// its copy; memory and file scanning share rules, not state. Linux only: reading
+/// another process's memory is the `sensor-linux-procmem` mechanism.
+#[cfg(target_os = "linux")]
+fn start_memscan(
+    content_root: &Path,
+    alert_log: Arc<AlertLog>,
+    verdict: Arc<Mutex<verdict::VerdictEngine>>,
+) -> Load<yara::MemoryScanQueue> {
+    let dir = content_root.join("rules/yara");
+    if !dir.is_dir() {
+        return Load::Absent;
+    }
+    match yara::RuleSet::load_dir(&dir) {
+        Ok(rules) => Load::Loaded(yara::MemoryScanQueue::start(
+            rules,
+            Arc::new(crate::memscan::ProcMemSource),
+            yara::MemoryBudget::default(),
+            move |outcome| report_memory_matches(&alert_log, &verdict, &outcome),
+        )),
+        // The file scanner reports the same load failure; this one only follows it.
+        Err(_) => Load::Failed,
+    }
+}
+
+/// No memory scanner off Linux (ADR-0023: Windows and macOS need their own mechanism).
+#[cfg(not(target_os = "linux"))]
+fn start_memscan(
+    _content_root: &Path,
+    _alert_log: Arc<AlertLog>,
+    _verdict: Arc<Mutex<verdict::VerdictEngine>>,
+) -> Load<yara::MemoryScanQueue> {
+    Load::Absent
+}
+
+/// What a memory scan that matched produces: the match fused into the verdict of the
+/// process that was scanned (the same path as a file match), a `YARA-MEM` audit line per
+/// rule, and the escalation the fused severity warrants. A memory match does not
+/// quarantine anything: there is no file to move.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn report_memory_matches(
+    alert_log: &AlertLog,
+    verdict: &Mutex<verdict::VerdictEngine>,
+    outcome: &yara::MemoryScanOutcome,
+) {
+    let fused: Vec<verdict::Verdict> = outcome
+        .context
+        .iter()
+        .flat_map(|context| {
+            outcome
+                .report
+                .matches
+                .iter()
+                .filter_map(|rule| fuse_yara_match(verdict, context, rule))
+        })
+        .collect();
+    for rule in &outcome.report.matches {
+        alert_log.record(
+            "YARA-MEM",
+            format!(
+                "yara rule {} matched in the memory of pid {} ({} region(s) scanned, {} skipped by budget)",
+                rule.identifier,
+                outcome.pid,
+                outcome.report.regions_scanned,
+                outcome.report.regions_skipped,
+            ),
+        );
+    }
+    for verdict in &fused {
+        escalate_if_warranted(alert_log, verdict);
     }
 }
 
@@ -2215,6 +2342,124 @@ detection:
         }));
         let alerts = wait_for_alert(&dir, "RESPONSE-ESCALATE");
         assert!(alerts.contains("778:dropper"), "{alerts}");
+    }
+
+    /// Maps one page of anonymous read-write-execute memory holding `payload`: the shape
+    /// of shellcode or a reflectively loaded image. `None` when the host refuses RWX
+    /// mappings (`SELinux` `execmem` denial, a hardened kernel), so the test can skip.
+    #[cfg(target_os = "linux")]
+    fn plant_in_executable_memory(payload: &[u8]) -> Option<*mut libc::c_void> {
+        assert!(payload.len() <= 4096);
+        // SAFETY: a fresh private anonymous page, checked against MAP_FAILED before use,
+        // and `payload` fits inside it (asserted above).
+        unsafe {
+            let page = libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            if page == libc::MAP_FAILED {
+                return None;
+            }
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), page.cast::<u8>(), payload.len());
+            Some(page)
+        }
+    }
+
+    /// A fileless exec: the process image is a `/dev/fd/N` path and the comm says memfd,
+    /// which is what the T1620 rule keys on. `pid` is a real, readable process so the
+    /// memory scan it triggers is a real one.
+    #[cfg(target_os = "linux")]
+    fn memfd_exec_of(pid: u32) -> Event {
+        Event::Exec(ExecEvent {
+            meta: EventMeta {
+                pid,
+                ppid: 1,
+                comm: "memfd:implant".into(),
+                ..schema::fixtures::meta()
+            },
+            image_path: "/dev/fd/3".into(),
+            argv: vec!["/dev/fd/3".into()],
+            ..schema::fixtures::exec()
+        })
+    }
+
+    /// #85 end to end, no mocks: a payload that exists only in executable anonymous
+    /// memory of a real process is found by the scan the memfd-exec alert triggers.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_payload_present_only_in_executable_memory_is_found_after_a_memfd_exec_alert() {
+        let dir = tmp("memscan-e2e");
+        let yara_dir = dir.join("content").join("rules").join("yara");
+        std::fs::create_dir_all(&yara_dir).unwrap();
+        std::fs::write(
+            yara_dir.join("marker.yar"),
+            RESPONSE_MARKER_RULE.replace("severity = \"low\"", "severity = \"high\""),
+        )
+        .unwrap();
+        let sink = sink_in(&dir);
+        assert_eq!(sink.reload_content().yara_rule_count, Some(1));
+
+        let Some(page) = plant_in_executable_memory(b"..RESPONSE-SCENARIO-MARKER..") else {
+            eprintln!("skipped: this host refuses RWX anonymous mappings");
+            return;
+        };
+        sink.on_event(memfd_exec_of(std::process::id()));
+        let alerts = wait_for_alert(&dir, "YARA-MEM");
+        // SAFETY: `page` is the one-page mapping created above and is not used again.
+        unsafe { libc::munmap(page, 4096) };
+
+        assert!(alerts.contains("T1620"), "the trigger is audited: {alerts}");
+        assert!(
+            alerts.contains("matched in the memory of pid"),
+            "the memory match is audited: {alerts}"
+        );
+        assert!(
+            alerts.contains("RESPONSE-ESCALATE"),
+            "a High memory match escalates like any other finding: {alerts}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_memfd_exec_of_a_clean_process_triggers_a_scan_that_finds_nothing() {
+        let dir = tmp("memscan-clean");
+        let yara_dir = dir.join("content").join("rules").join("yara");
+        std::fs::create_dir_all(&yara_dir).unwrap();
+        std::fs::write(yara_dir.join("marker.yar"), RESPONSE_MARKER_RULE).unwrap();
+        let sink = sink_in(&dir);
+        assert_eq!(sink.reload_content().yara_rule_count, Some(1));
+
+        sink.on_event(memfd_exec_of(std::process::id()));
+        let stats_done = || {
+            sink.memscan
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|q| q.wait_for_completed(1, std::time::Duration::from_secs(10)))
+        };
+        assert_eq!(stats_done(), Some(true), "the scan ran");
+        assert!(
+            !alerts_in(&dir).contains("YARA-MEM"),
+            "no marker in executable memory: {}",
+            alerts_in(&dir)
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn without_yara_content_a_memfd_exec_requests_no_scan() {
+        let dir = tmp("memscan-no-content");
+        let sink = sink_in(&dir);
+        sink.on_event(memfd_exec_of(std::process::id()));
+        assert!(sink.memscan.lock().unwrap().is_none());
+        assert!(
+            alerts_in(&dir).contains("T1620"),
+            "the rule itself still fires"
+        );
     }
 
     #[test]
