@@ -139,6 +139,19 @@ async fn round_trip_every_endpoint() {
         .expect("reload_content should succeed");
     assert_eq!(reload.sigma_rule_count, None);
     assert_eq!(reload.yara_rule_count, None);
+
+    // The stub has no verdict engine, so both suppression calls round-trip
+    // and report that nothing changed.
+    let suppressed = client
+        .suppress_verdict(7, "bash", "T1059.004")
+        .await
+        .expect("suppress_verdict should succeed");
+    assert!(!suppressed.changed);
+    let lifted = client
+        .unsuppress_verdict(7, "bash", "T1059.004")
+        .await
+        .expect("unsuppress_verdict should succeed");
+    assert!(!lifted.changed);
     // Cleanup: the socket file on Unix stays after the test; not a
     // correctness issue (the endpoint is per-run) but cargo test's tmp
     // dir would accumulate. Remove best-effort.

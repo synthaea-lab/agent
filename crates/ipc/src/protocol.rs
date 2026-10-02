@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The protocol version this build implements. Bump on any breaking
 /// change to the request/response types below; additive fields on
 /// existing variants stay at the same version.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 // ── Handshake ────────────────────────────────────────────────────────────
 
@@ -107,6 +107,27 @@ pub enum Request {
     /// process — tells an already-running `agent run` to pick up content it
     /// just downloaded and verified, without a restart.
     ReloadContent,
+    /// Drop findings of `technique` on the entity `(ppid, comm)` from the fused
+    /// verdict from now on (issue #613). A runtime operator override above the
+    /// per-engine FP exclusions; it never touches the alert log, which keeps
+    /// every finding. Reversed by [`Self::UnsuppressVerdict`].
+    SuppressVerdict {
+        /// Parent pid of the entity, as shown in `escalated <ppid>:<comm>` lines.
+        ppid: u32,
+        /// Command name of the entity.
+        comm: String,
+        /// The technique key to silence (an ATT&CK id such as `T1059.004`).
+        technique: String,
+    },
+    /// Reverse a [`Self::SuppressVerdict`] for the same entity and technique.
+    UnsuppressVerdict {
+        /// See [`Self::SuppressVerdict`].
+        ppid: u32,
+        /// See [`Self::SuppressVerdict`].
+        comm: String,
+        /// See [`Self::SuppressVerdict`].
+        technique: String,
+    },
 }
 
 // ── Response ─────────────────────────────────────────────────────────────
@@ -128,6 +149,8 @@ pub enum Response {
     PolicyVersion(PolicyVersionResponse),
     /// Reply to [`Request::ReloadContent`].
     ReloadContent(ReloadContentResponse),
+    /// Reply to [`Request::SuppressVerdict`] and [`Request::UnsuppressVerdict`].
+    Suppression(SuppressionResponse),
     /// Any per-request failure the server chose to surface to the client
     /// without closing the connection. Fatal errors (peer-auth failure,
     /// bad framing) still close the connection — see [`WireError`].
@@ -149,6 +172,33 @@ pub struct StatusResponse {
     pub started_at_ns: u64,
     /// Whether the agent's own pipeline is considered up.
     pub pipeline_healthy: bool,
+    /// Verdict suppressions currently active (issue #613), ordered by entity
+    /// then technique. Empty when none; defaulted so an older agent's status
+    /// still parses.
+    #[serde(default)]
+    pub suppressions: Vec<SuppressionEntry>,
+}
+
+/// One active verdict suppression: findings of `technique` on `(ppid, comm)`
+/// are dropped from the fused verdict until it is lifted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuppressionEntry {
+    /// Parent pid of the suppressed entity.
+    pub ppid: u32,
+    /// Command name of the suppressed entity.
+    pub comm: String,
+    /// The suppressed technique key.
+    pub technique: String,
+}
+
+/// Payload of [`Response::Suppression`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuppressionResponse {
+    /// Whether the request changed anything: `false` when the pair was already
+    /// suppressed (suppress) or was not suppressed (unsuppress).
+    pub changed: bool,
 }
 
 /// Payload of [`Response::SensorHealth`]. One entry per sensor the agent
@@ -255,6 +305,30 @@ mod tests {
         assert_eq!(json, r#"{"kind":"reload_content"}"#);
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(back, Request::ReloadContent);
+    }
+
+    #[test]
+    fn suppression_requests_round_trip_through_json() {
+        let request = Request::SuppressVerdict {
+            ppid: 7,
+            comm: "bash".into(),
+            technique: "T1059.004".into(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"suppress_verdict","ppid":7,"comm":"bash","technique":"T1059.004"}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+    }
+
+    #[test]
+    fn a_status_without_suppressions_still_parses() {
+        let status: StatusResponse = serde_json::from_str(
+            r#"{"agent_version":"1","started_at_ns":0,"pipeline_healthy":true}"#,
+        )
+        .unwrap();
+        assert!(status.suppressions.is_empty());
     }
 
     #[test]

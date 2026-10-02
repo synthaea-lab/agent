@@ -19,6 +19,7 @@ mod stateless;
 
 // AMSI content rules (#282): the dispatcher for `AmsiContent` events.
 pub use amsi::evaluate_amsi_content;
+use schema::detection::Severity;
 pub use state::RuleState;
 #[cfg(test)]
 pub(crate) use stateless::{
@@ -40,6 +41,10 @@ pub use stateless::{
 pub struct Alert {
     /// ATT&CK identifier of the detected technique.
     pub technique: &'static str,
+    /// How seriously an analyst should take this finding, assigned per rule at the
+    /// construction site (issue #615). It ranks and fuses findings (`verdict`); it
+    /// is not a response trigger, and no destructive action may be gated on it.
+    pub severity: Severity,
     pub message: String,
 }
 

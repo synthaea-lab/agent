@@ -28,7 +28,7 @@ use crate::{
     protocol::{
         ClientHello, PROTOCOL_VERSION, PolicyVersionResponse, RecentDetectionsResponse,
         ReloadContentResponse, Request, Response, SensorHealthResponse, ServerHello,
-        StatusResponse, WireError,
+        StatusResponse, SuppressionEntry, SuppressionResponse, WireError,
     },
     stream::{Listener, Stream},
 };
@@ -73,6 +73,18 @@ pub trait Handler: Send + Sync + 'static {
     fn reload_content(
         &self,
     ) -> impl std::future::Future<Output = Result<ReloadContentResponse, String>> + Send;
+    /// Answer [`Request::SuppressVerdict`] — silence `entry`'s technique on its
+    /// entity in the fused verdict, and audit the change (issue #613).
+    fn suppress_verdict(
+        &self,
+        entry: SuppressionEntry,
+    ) -> impl std::future::Future<Output = Result<SuppressionResponse, String>> + Send;
+    /// Answer [`Request::UnsuppressVerdict`] — the reverse of
+    /// [`Self::suppress_verdict`].
+    fn unsuppress_verdict(
+        &self,
+        entry: SuppressionEntry,
+    ) -> impl std::future::Future<Output = Result<SuppressionResponse, String>> + Send;
 }
 
 /// A canned handler that returns fixed responses. Ships with the crate
@@ -102,6 +114,7 @@ impl Handler for StubHandler {
             agent_version: self.agent_version.clone(),
             started_at_ns: self.started_at_ns,
             pipeline_healthy: true,
+            suppressions: vec![],
         })
     }
     async fn sensor_health(&self) -> Result<SensorHealthResponse, String> {
@@ -128,6 +141,19 @@ impl Handler for StubHandler {
             sigma_reload_failed: false,
             yara_reload_failed: false,
         })
+    }
+    async fn suppress_verdict(
+        &self,
+        _entry: SuppressionEntry,
+    ) -> Result<SuppressionResponse, String> {
+        // The stub has no verdict engine: nothing can be suppressed.
+        Ok(SuppressionResponse { changed: false })
+    }
+    async fn unsuppress_verdict(
+        &self,
+        _entry: SuppressionEntry,
+    ) -> Result<SuppressionResponse, String> {
+        Ok(SuppressionResponse { changed: false })
     }
 }
 
@@ -291,6 +317,36 @@ async fn dispatch<H: Handler>(handler: &H, req: Request) -> Response {
         },
         Request::ReloadContent => match handler.reload_content().await {
             Ok(r) => Response::ReloadContent(r),
+            Err(m) => Response::Error(WireError::HandlerFailed { message: m }),
+        },
+        Request::SuppressVerdict {
+            ppid,
+            comm,
+            technique,
+        } => match handler
+            .suppress_verdict(SuppressionEntry {
+                ppid,
+                comm,
+                technique,
+            })
+            .await
+        {
+            Ok(r) => Response::Suppression(r),
+            Err(m) => Response::Error(WireError::HandlerFailed { message: m }),
+        },
+        Request::UnsuppressVerdict {
+            ppid,
+            comm,
+            technique,
+        } => match handler
+            .unsuppress_verdict(SuppressionEntry {
+                ppid,
+                comm,
+                technique,
+            })
+            .await
+        {
+            Ok(r) => Response::Suppression(r),
             Err(m) => Response::Error(WireError::HandlerFailed { message: m }),
         },
     }

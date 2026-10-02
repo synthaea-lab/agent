@@ -125,31 +125,14 @@ fn correlator_case_id(entity: &verdict::EntityKey) -> String {
 /// second occurrence of the same technique still gets its own finding.
 const VERDICT_DEDUP_WINDOW_NS: u64 = 30_000_000_000; // 30s
 
-/// Severity for a finding, until issue #73/#467's per-rule severity metadata
-/// lands on `main` — `rules`/`correlator` alerts carry no severity field yet on
-/// this branch (only `technique: &'static str` + `message`), so this is a
-/// deliberate placeholder, not real calibration. `BAYES` keeps the significance
-/// it already had before this issue (the correlator's belief crossing its
-/// confidence threshold, gated for process-kill by `response`); everything else
-/// defaults to `Medium`. Swap this for reading a real per-rule `Severity` once
-/// #73 lands it — the fusion engine itself doesn't care where severity comes
-/// from.
-fn default_severity(technique: &str) -> schema::detection::Severity {
-    if technique == "BAYES" {
-        schema::detection::Severity::Critical
-    } else {
-        schema::detection::Severity::Medium
-    }
-}
-
 /// Whether an alert raised by the correlator makes its process eligible for
 /// `response`'s kill (issue #25). Deliberately its own question, not "severity is
 /// `Critical`": a Sigma rule's `level: critical` is an analyst-facing ranking
 /// written by a rule author, not a belief the correlator has earned, and a
 /// severity that merely feeds the verdict must never widen what the agent kills
 /// (issue #131 follow-up). Only the correlator's belief crossing its threshold
-/// qualifies, which is what `default_severity` made `Critical` before severity
-/// became data.
+/// qualifies. (`BAYES` also carries `Critical` severity, but that is a coincidence
+/// of the ranking, not what gates the kill.)
 fn crosses_kill_gate(technique: &str) -> bool {
     technique == "BAYES"
 }
@@ -478,7 +461,7 @@ impl DetectionSink {
                 alert.technique,
                 &alert.message,
                 source,
-                default_severity(alert.technique),
+                alert.severity,
                 event,
             );
         }
@@ -567,7 +550,7 @@ impl DetectionSink {
                 alert.technique,
                 &alert.message,
                 source,
-                default_severity(alert.technique),
+                alert.severity,
                 event,
             );
             if crosses_kill_gate(alert.technique) {
@@ -749,6 +732,74 @@ impl DetectionSink {
     /// one alert shape, whatever detected it.
     pub(crate) fn emit(&self, technique: &str, message: &str) {
         self.alert_log.record(technique, message.to_string());
+    }
+
+    /// Issue #613: an operator's request to silence `technique` on the entity
+    /// `(ppid, comm)` in the fused verdict. Returns whether the mark is new.
+    /// Audited as `VERDICT-SUPPRESS` in the alert log, which itself keeps every
+    /// finding: this only changes what the fused view (and so escalation) sees.
+    ///
+    /// # Errors
+    ///
+    /// An empty `comm` or `technique` (it could never match a finding), or the
+    /// suppression list being full ([`verdict::MAX_SUPPRESSIONS`]).
+    pub(crate) fn suppress_verdict(
+        &self,
+        ppid: u32,
+        comm: &str,
+        technique: &str,
+    ) -> Result<bool, String> {
+        if comm.is_empty() || technique.is_empty() {
+            return Err("comm and technique must not be empty".to_string());
+        }
+        let outcome = self
+            .verdict
+            .lock()
+            .unwrap()
+            .suppress(verdict::EntityKey::new(ppid, comm), technique);
+        match outcome {
+            verdict::SuppressOutcome::Added => {
+                self.emit(
+                    "VERDICT-SUPPRESS",
+                    &format!("suppressed {technique} on {ppid}:{comm} by operator request"),
+                );
+                Ok(true)
+            }
+            verdict::SuppressOutcome::AlreadySuppressed => Ok(false),
+            verdict::SuppressOutcome::Full => Err(format!(
+                "suppression list is full ({} entries): lift one first",
+                verdict::MAX_SUPPRESSIONS
+            )),
+        }
+    }
+
+    /// Issue #613: lifts a suppression made with [`Self::suppress_verdict`].
+    /// Returns whether one was removed; audited as `VERDICT-UNSUPPRESS`.
+    pub(crate) fn unsuppress_verdict(&self, ppid: u32, comm: &str, technique: &str) -> bool {
+        let removed = self
+            .verdict
+            .lock()
+            .unwrap()
+            .unsuppress(&verdict::EntityKey::new(ppid, comm), technique);
+        if removed {
+            self.emit(
+                "VERDICT-UNSUPPRESS",
+                &format!("lifted suppression of {technique} on {ppid}:{comm} by operator request"),
+            );
+        }
+        removed
+    }
+
+    /// Every active verdict suppression as `(ppid, comm, technique)`, for the
+    /// agent status (issue #613).
+    pub(crate) fn suppressions(&self) -> Vec<(u32, String, String)> {
+        self.verdict
+            .lock()
+            .unwrap()
+            .suppressions()
+            .into_iter()
+            .map(|(entity, technique)| (entity.ppid, entity.comm, technique))
+            .collect()
     }
 
     /// Handle to the alert funnel, for the IPC handler's `recent_detections`
@@ -1822,6 +1873,100 @@ detection:
         let alerts = alerts_in(&dir);
         assert!(alerts.contains("T1059.004"), "{alerts}");
         assert!(!alerts.contains("RESPONSE-ESCALATE"), "{alerts}");
+    }
+
+    /// A built-in rule that fires on a plain exec: `T1490`, severity `High`.
+    const SHADOW_DELETE: &str = "vssadmin.exe Delete Shadows /All /Quiet";
+
+    /// #615: a built-in rule's own severity reaches the fused verdict, instead of
+    /// the flat placeholder every non-`BAYES` finding used to get.
+    #[test]
+    fn a_built_in_rules_own_severity_reaches_the_fused_verdict() {
+        let dir = tmp("builtin-severity");
+        let sink = sink_in(&dir);
+        sink.on_event(exec(920, SHADOW_DELETE, "/usr/bin/vssadmin"));
+        let fused = sink
+            .verdict
+            .lock()
+            .unwrap()
+            .peek(&verdict::EntityKey::new(1, "bash"))
+            .expect("the built-in alert is folded into the entity's verdict");
+        assert!(fused.techniques.contains(&"T1490".to_string()), "{fused:?}");
+        assert_eq!(fused.severity, schema::detection::Severity::High);
+    }
+
+    /// #615: a high-severity built-in alert must never terminate a process by
+    /// severity alone: only the correlator's `BAYES` crossing gates kill.
+    #[test]
+    fn a_high_severity_built_in_alert_never_triggers_a_kill() {
+        let dir = tmp("builtin-high-no-kill");
+        let sink = sink_in(&dir);
+        let killed = Arc::new(Mutex::new(Vec::new()));
+        let killed_rec = Arc::clone(&killed);
+        sink.enable_response(
+            policy::ResponsePolicy {
+                kill_enabled: true,
+                quarantine_enabled: false,
+            },
+            move |pid| {
+                killed_rec.lock().unwrap().push(pid);
+                Ok(())
+            },
+            dir.join("quarantine"),
+        );
+        sink.on_event(exec(921, SHADOW_DELETE, "/usr/bin/vssadmin"));
+        assert!(alerts_in(&dir).contains("T1490"), "{}", alerts_in(&dir));
+        assert!(
+            killed.lock().unwrap().is_empty(),
+            "severity alone must never gate a kill"
+        );
+        assert!(
+            !alerts_in(&dir).contains("killed pid"),
+            "{}",
+            alerts_in(&dir)
+        );
+    }
+
+    /// #613: a suppression drops the finding from the fused verdict, never from
+    /// the audit trail.
+    #[test]
+    fn a_suppressed_technique_leaves_the_verdict_but_stays_in_the_alert_log() {
+        let dir = tmp("suppress-verdict");
+        let sink = sink_in(&dir);
+        let meta = EventMeta {
+            comm: "dropper".into(),
+            ..schema::fixtures::meta()
+        };
+        let entity = verdict::EntityKey::new(meta.ppid, meta.comm.clone());
+        let event = Event::FileOpen(schema::FileOpenEvent {
+            meta: meta.clone(),
+            ..schema::fixtures::file_open()
+        });
+        let record = || {
+            sink.record_and_emit(
+                &entity,
+                "T1105",
+                "downloader wrote then ran a binary",
+                schema::detection::DetectionSource::Rule {
+                    rule_id: "T1105".into(),
+                },
+                schema::detection::Severity::Medium,
+                &event,
+            )
+        };
+
+        assert_eq!(
+            sink.suppress_verdict(meta.ppid, &meta.comm, "T1105"),
+            Ok(true)
+        );
+        assert_eq!(record(), None, "a suppressed finding yields no verdict");
+        assert!(
+            alerts_in(&dir).contains("T1105"),
+            "the audit trail keeps it"
+        );
+
+        assert!(sink.unsuppress_verdict(meta.ppid, &meta.comm, "T1105"));
+        assert!(record().is_some(), "lifting the mark restores fusion");
     }
 
     #[test]

@@ -150,6 +150,21 @@ pub struct Verdict {
     pub detections: Vec<Detection>,
 }
 
+/// Bound on active suppressions. Far above what an operator applies by hand; it
+/// exists so a script looping over `suppress` cannot grow the list without limit.
+pub const MAX_SUPPRESSIONS: usize = 1024;
+
+/// What [`VerdictEngine::suppress`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuppressOutcome {
+    /// A new mark was recorded.
+    Added,
+    /// The exact pair was already suppressed; nothing changed.
+    AlreadySuppressed,
+    /// [`MAX_SUPPRESSIONS`] marks are active; the new one was refused.
+    Full,
+}
+
 /// Bound on distinct entities tracked — same order of magnitude as
 /// `correlator`'s own state maps (`crates/correlator/src/engine.rs`).
 const ENTITY_CAP: usize = 16_384;
@@ -301,16 +316,44 @@ impl VerdictEngine {
 
     /// Marks `technique` suppressed for `entity`: every future `record` call for
     /// that exact pair returns `None`. See the `suppressed` field doc for how
-    /// this differs from the per-engine FP exclusions.
-    pub fn suppress(&mut self, entity: EntityKey, technique: impl Into<String>) {
-        self.suppressed.insert((entity, technique.into()));
+    /// this differs from the per-engine FP exclusions. Bounded by
+    /// [`MAX_SUPPRESSIONS`]: marks are operator-applied and have no expiry, so an
+    /// unbounded list is a leak with a human on the other end of it.
+    pub fn suppress(&mut self, entity: EntityKey, technique: impl Into<String>) -> SuppressOutcome {
+        let mark = (entity, technique.into());
+        if self.suppressed.contains(&mark) {
+            return SuppressOutcome::AlreadySuppressed;
+        }
+        if self.suppressed.len() >= MAX_SUPPRESSIONS {
+            return SuppressOutcome::Full;
+        }
+        self.suppressed.insert(mark);
+        SuppressOutcome::Added
     }
 
-    /// Reverses a previous [`Self::suppress`] call. A no-op if the pair was
-    /// never suppressed.
-    pub fn unsuppress(&mut self, entity: &EntityKey, technique: &str) {
+    /// Reverses a previous [`Self::suppress`] call. Returns whether a mark was
+    /// removed; `false` (a no-op) if the pair was never suppressed.
+    pub fn unsuppress(&mut self, entity: &EntityKey, technique: &str) -> bool {
+        let before = self.suppressed.len();
         self.suppressed
             .retain(|(e, t)| !(e == entity && t == technique));
+        self.suppressed.len() != before
+    }
+
+    /// Every active suppression, ordered by entity then technique so two calls
+    /// compare equal when nothing changed (a status surface, an audit diff).
+    #[must_use]
+    pub fn suppressions(&self) -> Vec<(EntityKey, String)> {
+        let mut marks: Vec<_> = self.suppressed.iter().cloned().collect();
+        marks.sort_by(|(ea, ta), (eb, tb)| {
+            (ea.ppid, &ea.comm, ea.parent_generation, ta).cmp(&(
+                eb.ppid,
+                &eb.comm,
+                eb.parent_generation,
+                tb,
+            ))
+        });
+        marks
     }
 
     /// The current verdict for `entity`, without folding in a new finding —
@@ -670,6 +713,69 @@ mod tests {
         assert_eq!(
             before, after,
             "peek must be idempotent, no hidden state change"
+        );
+    }
+
+    // ── Operator suppression surface (#613) ─────────────────────────────────
+
+    #[test]
+    fn suppress_and_unsuppress_report_whether_anything_changed() {
+        let mut engine = VerdictEngine::new(60_000_000_000);
+        assert_eq!(
+            engine.suppress(entity(), "T1059.004"),
+            SuppressOutcome::Added
+        );
+        assert_eq!(
+            engine.suppress(entity(), "T1059.004"),
+            SuppressOutcome::AlreadySuppressed
+        );
+        assert!(engine.unsuppress(&entity(), "T1059.004"));
+        assert!(
+            !engine.unsuppress(&entity(), "T1059.004"),
+            "nothing left to remove"
+        );
+    }
+
+    #[test]
+    fn suppressions_lists_every_active_mark_in_a_stable_order() {
+        let mut engine = VerdictEngine::new(60_000_000_000);
+        engine.suppress(EntityKey::new(9, "zsh"), "T1071");
+        engine.suppress(EntityKey::new(2, "bash"), "T1105");
+        engine.suppress(EntityKey::new(2, "bash"), "T1059.004");
+        let marks: Vec<_> = engine
+            .suppressions()
+            .into_iter()
+            .map(|(e, t)| (e.ppid, e.comm, t))
+            .collect();
+        assert_eq!(
+            marks,
+            vec![
+                (2, "bash".to_string(), "T1059.004".to_string()),
+                (2, "bash".to_string(), "T1105".to_string()),
+                (9, "zsh".to_string(), "T1071".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_suppression_list_is_bounded() {
+        let mut engine = VerdictEngine::new(60_000_000_000);
+        for i in 0..MAX_SUPPRESSIONS {
+            let ppid = u32::try_from(i).unwrap();
+            assert_eq!(
+                engine.suppress(EntityKey::new(ppid, "x"), "T1"),
+                SuppressOutcome::Added
+            );
+        }
+        assert_eq!(
+            engine.suppress(EntityKey::new(u32::MAX, "x"), "T1"),
+            SuppressOutcome::Full
+        );
+        // Removing one makes room again.
+        assert!(engine.unsuppress(&EntityKey::new(0, "x"), "T1"));
+        assert_eq!(
+            engine.suppress(EntityKey::new(u32::MAX, "x"), "T1"),
+            SuppressOutcome::Added
         );
     }
 

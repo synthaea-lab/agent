@@ -3,13 +3,16 @@
 
 use std::collections::{HashMap, HashSet};
 
-use schema::Event;
+use schema::{Event, detection::Severity};
 
 use crate::{bus::EventBus, event::is_file_write};
 
 #[derive(Debug, Clone)]
 pub struct CorrelationAlert {
     pub technique: &'static str,
+    /// Analyst-facing severity of this co-occurrence pattern (issue #615). Ranks
+    /// and fuses the finding; never a response trigger (see `rules::Alert`).
+    pub severity: Severity,
     pub message: String,
 }
 
@@ -43,6 +46,7 @@ pub(crate) fn rule_spawn_connect(
     if has_exec && has_connect {
         Some(CorrelationAlert {
             technique: "T1059/T1071",
+            severity: Severity::Medium,
             message: format!("pid={pid}: spawn + network connection in the same time window"),
         })
     } else {
@@ -109,6 +113,7 @@ pub(crate) fn rule_connect_filewrite(
     if has_connect && has_filewrite {
         Some(CorrelationAlert {
             technique: "T1105",
+            severity: Severity::Medium,
             message: format!(
                 "pid={pid}: network connection + file write in the same window — suspected staging"
             ),
@@ -135,6 +140,7 @@ pub(crate) fn rule_spawn_connect_filewrite(
     if has_exec && has_connect && has_filewrite {
         Some(CorrelationAlert {
             technique: "T1105/T1059/T1071",
+            severity: Severity::High,
             message: format!(
                 "pid={pid}: spawn + network connection + file write — complete dropper chain"
             ),
@@ -183,6 +189,7 @@ pub(crate) fn rule_respawn_connect(
     if spawn_count >= RESPAWN_THRESHOLD && has_connect {
         Some(CorrelationAlert {
             technique: "T1059/T1071",
+            severity: Severity::Medium,
             message: format!(
                 "ppid={ppid} comm={comm}: {spawn_count} spawns + network connection — automatic respawn with suspected beaconing"
             ),
@@ -248,6 +255,7 @@ pub(crate) fn rule_assembly_connect(
         });
         Some(CorrelationAlert {
             technique: "T1055/T1620",
+            severity: Severity::High,
             message: format!(
                 "pid={pid}: in-memory .NET assembly + network connection — suspected execute-assembly C2{}",
                 assembly_name
@@ -286,6 +294,7 @@ pub(crate) fn rule_exec_smb(
         });
         Some(CorrelationAlert {
             technique: "T1021.002",
+            severity: Severity::Medium,
             message: format!(
                 "pid={pid}: process spawn + SMB connection — suspected lateral movement{}",
                 server
@@ -334,6 +343,7 @@ pub(crate) fn rule_assembly_smb(
         });
         Some(CorrelationAlert {
             technique: "T1021.002/T1055",
+            severity: Severity::High,
             message: format!(
                 "pid={pid}: in-memory .NET assembly + SMB connection — suspected fileless lateral movement{}{}",
                 assembly_name
@@ -420,6 +430,7 @@ pub(crate) fn rule_dns_exfil(
     if count >= DNS_TUNNEL_MIN_QUERIES {
         Some(CorrelationAlert {
             technique: "T1048.003/T1071.004",
+            severity: Severity::Medium,
             message: format!(
                 "pid={pid} comm={comm}: {count} distinct high-entropy subdomains of {parent} \
                  within the window — suspected DNS tunnelling / exfiltration"
@@ -514,6 +525,7 @@ pub(crate) fn rule_web_request_shell(bus: &EventBus) -> Vec<WebShellCase> {
                 timestamp_ns: meta.timestamp_ns,
                 alert: CorrelationAlert {
                     technique: "T1505.003",
+                    severity: Severity::High,
                     message: format!(
                         "pid={} comm={} parent={}: shell spawned by a web server {delta_s}s \
                          from a {:?} request ({} {}{param}, status {}, client {client}) — \
