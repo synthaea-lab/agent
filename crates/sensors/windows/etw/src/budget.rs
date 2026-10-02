@@ -10,6 +10,8 @@ const PER_PID_CAP: usize = 1_024;
 /// `limit` events per process per `window_ns`.
 #[derive(Debug)]
 pub(crate) struct PidBudget {
+    /// Names the provider in the shedding warning.
+    label: &'static str,
     limit: u32,
     window_ns: u64,
     /// pid → (window start, events admitted in it).
@@ -18,8 +20,9 @@ pub(crate) struct PidBudget {
 }
 
 impl PidBudget {
-    pub(crate) fn new(limit: u32, window_ns: u64) -> Self {
+    pub(crate) fn new(label: &'static str, limit: u32, window_ns: u64) -> Self {
         Self {
+            label,
             limit,
             window_ns,
             windows: HashMap::new(),
@@ -44,6 +47,18 @@ impl PidBudget {
         }
         if window.1 >= self.limit {
             self.refused += 1;
+            // Observable, not silent (#632 review): one warning at the 1st,
+            // 2nd, 4th, 8th... refusal bounds the log however long a runaway
+            // client keeps going.
+            if self.refused.is_power_of_two() {
+                tracing::warn!(
+                    provider = self.label,
+                    pid,
+                    refused = self.refused,
+                    limit = self.limit,
+                    "per-process event budget exhausted: events dropped"
+                );
+            }
             return false;
         }
         window.1 += 1;
@@ -62,7 +77,7 @@ mod tests {
 
     #[test]
     fn a_process_is_capped_per_window_then_gets_a_fresh_budget() {
-        let mut budget = PidBudget::new(3, 10);
+        let mut budget = PidBudget::new("test", 3, 10);
         assert!(budget.spend(7, 0) && budget.spend(7, 1) && budget.spend(7, 2));
         assert!(!budget.spend(7, 3));
         assert!(budget.spend(8, 3), "budget is per process");
@@ -72,7 +87,7 @@ mod tests {
 
     #[test]
     fn memory_stays_bounded() {
-        let mut budget = PidBudget::new(1, 1_000_000);
+        let mut budget = PidBudget::new("test", 1, 1_000_000);
         for pid in 0..(PER_PID_CAP as u32 * 2) {
             budget.spend(pid, 0);
         }
