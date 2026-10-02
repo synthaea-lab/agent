@@ -616,7 +616,7 @@ pub(crate) fn ldap_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
             filter: parser.try_parse("SearchFilter").unwrap_or_default(),
             base_dn: parser.try_parse("DistinguishedName").unwrap_or_default(),
             scope: parser.try_parse("ScopeOfSearch").unwrap_or(0),
-            attributes: attributes.split_whitespace().map(str::to_string).collect(),
+            attributes: normalize::split_ldap_attributes(&attributes),
         }));
     };
 

@@ -119,12 +119,13 @@ pub fn evaluate_ldap_search(event: &LdapSearchEvent) -> Vec<Alert> {
     if filter.contains("objectclass=trusteddomain") {
         alerts.push(alert(DOMAIN_TRUST_DISCOVERY, "domain trusts"));
     }
-    let reads_password = event.attributes.iter().any(|a| {
-        let a = a.to_ascii_lowercase();
-        PASSWORD_ATTRIBUTES.contains(&a.as_str())
-    }) || PASSWORD_ATTRIBUTES
-        .iter()
-        .any(|a| filter.contains(&format!("{a}=*")));
+    // Substring over the joined list, not an exact per-name match: robust to
+    // a sensor that could not split the provider's separator (#364 lab).
+    let attributes = event.attributes.join(" ").to_ascii_lowercase();
+    let reads_password = PASSWORD_ATTRIBUTES.iter().any(|a| attributes.contains(a))
+        || PASSWORD_ATTRIBUTES
+            .iter()
+            .any(|a| filter.contains(&format!("{a}=*")));
     if reads_password {
         alerts.push(alert(
             DIRECTORY_CREDENTIAL_READ,
@@ -268,6 +269,11 @@ mod tests {
         );
         assert_eq!(
             techniques(&search("(msLAPS-Password=*)", &[])),
+            [DIRECTORY_CREDENTIAL_READ]
+        );
+        // An unsplit list (NUL separator) still matches.
+        assert_eq!(
+            techniques(&search("(objectClass=computer)", &["cn\0ms-Mcs-AdmPwd"])),
             [DIRECTORY_CREDENTIAL_READ]
         );
     }

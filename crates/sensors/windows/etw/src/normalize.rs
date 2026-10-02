@@ -244,6 +244,19 @@ pub fn describe_foreign_sessions(
     )
 }
 
+/// LDAP-Client's `AttributeList` (EID 30, #364) split into attribute names.
+/// The console shows the names space-separated, but a lab run (2026-10-02)
+/// lost the second of two attributes with a whitespace-only split: the
+/// separator is not (only) whitespace. Split on whitespace, NUL, `;` and `,`,
+/// none of which can appear in an attribute name (RFC 4512 `descr`/OID).
+#[must_use]
+pub fn split_ldap_attributes(raw: &str) -> Vec<String> {
+    raw.split(|c: char| c.is_whitespace() || matches!(c, '\0' | ';' | ','))
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Short-window connect dedup (F-7): stacks that emit both Connect (42/58) and the
 /// first Send (12/26) for one connection must not double-count the beacon counter.
 pub struct ConnectDedup {
@@ -286,6 +299,24 @@ impl ConnectDedup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ldap_attribute_lists_split_on_any_separator() {
+        for raw in [
+            "cn ms-Mcs-AdmPwd",
+            "cn\0ms-Mcs-AdmPwd",
+            "cn\0ms-Mcs-AdmPwd\0",
+            "cn;ms-Mcs-AdmPwd",
+            " cn,  ms-Mcs-AdmPwd ",
+        ] {
+            assert_eq!(
+                split_ldap_attributes(raw),
+                ["cn", "ms-Mcs-AdmPwd"],
+                "{raw:?}"
+            );
+        }
+        assert!(split_ldap_attributes("").is_empty());
+    }
 
     #[test]
     fn filetime_epoch_conversion() {
