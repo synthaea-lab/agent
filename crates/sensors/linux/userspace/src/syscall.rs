@@ -130,8 +130,9 @@ fn syscall_id_to_i64(syscall_id: libc::c_long) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::DISPATCH_ENTRIES;
     use std::collections::HashSet;
+
+    use super::DISPATCH_ENTRIES;
 
     #[test]
     fn dispatch_actions_are_unique_and_in_range() {

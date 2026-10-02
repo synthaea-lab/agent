@@ -12,7 +12,7 @@
 
 pub mod normalize;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(ebpf_embedded, test)))]
 mod btf;
 #[cfg(target_os = "linux")]
 mod container;
@@ -24,7 +24,7 @@ mod ebpf;
 mod proc;
 #[cfg(target_os = "linux")]
 mod sensor;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(ebpf_embedded, test)))]
 mod syscall;
 #[cfg(target_os = "linux")]
 pub use ebpf::{RAW_TRACEPOINTS, load_ebpf, load_program};
