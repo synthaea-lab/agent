@@ -56,6 +56,10 @@ pub enum ParseError {
     BadField(&'static str, String),
     #[error("unexpected data after the last field of the format")]
     TrailingData,
+    /// The line was longer than [`MAX_LINE_BYTES`], was cut, and the rest does not
+    /// parse. Not evidence that the source's format is wrong.
+    #[error("line cut at the length cap and no longer parses")]
+    Truncated,
 }
 
 /// Cuts `line` to at most [`MAX_LINE_BYTES`] on a character boundary, after removing

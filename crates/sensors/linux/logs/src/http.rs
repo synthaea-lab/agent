@@ -408,6 +408,47 @@ mod tests {
         );
     }
 
+    /// Verbatim from nginx 1.24 (Ubuntu 24.04) answering real `curl` requests.
+    #[test]
+    fn real_nginx_lines() {
+        let m = |line: &str| {
+            let r = parse_access_line(line, AccessFormat::Combined).unwrap();
+            match_request(&r).map(|m| m.signature)
+        };
+        assert_eq!(
+            m(
+                r#"127.0.0.1 - - [02/Oct/2026:09:53:18 +0200] "GET / HTTP/1.1" 200 615 "-" "curl/8.5.0""#
+            ),
+            None
+        );
+        assert_eq!(
+            m(
+                r#"127.0.0.1 - - [02/Oct/2026:09:53:19 +0200] "GET /?id=1+UNION+SELECT+1,2,3 HTTP/1.1" 200 615 "-" "curl/8.5.0""#
+            ),
+            Some(HttpSignature::SqlInjection)
+        );
+        assert_eq!(
+            m(
+                r#"127.0.0.1 - - [02/Oct/2026:09:53:20 +0200] "GET /static/../../etc/passwd HTTP/1.1" 400 157 "-" "curl/8.5.0""#
+            ),
+            Some(HttpSignature::PathTraversal)
+        );
+        // nginx writes a quote in a header as \x22, which stays literal.
+        assert_eq!(
+            m(
+                r#"127.0.0.1 - - [02/Oct/2026:09:53:21 +0200] "GET / HTTP/1.1" 200 615 "-" "evil\x22 999 \x22x""#
+            ),
+            None
+        );
+        // Non-printable bytes in the request line are \x-escaped by nginx too.
+        assert_eq!(
+            m(
+                r#"127.0.0.1 - - [02/Oct/2026:09:53:22 +0200] "GET /\x01\x02\x7F HTTP/1.1" 400 157 "-" "-""#
+            ),
+            None
+        );
+    }
+
     #[test]
     fn a_host_name_client_is_not_an_address() {
         let line = r#"www.example.org - - [t] "GET /?q=union+select+1 HTTP/1.1" 200 1 "-" "x""#;
