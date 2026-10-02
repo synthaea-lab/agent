@@ -12,6 +12,8 @@
 
 use std::collections::HashMap;
 
+use crate::budget::PidBudget;
+
 /// Text kept per event, in UTF-16 code units' worth of characters. The point
 /// of the signal is the decoded payload, so this is generous; past it the
 /// event says `text_truncated`.
@@ -24,8 +26,6 @@ pub(crate) const DEDUP_CAP: usize = 4_096;
 pub(crate) const PER_PID_LIMIT: u32 = 64;
 /// Per-process budget: window length.
 pub(crate) const PER_PID_WINDOW_NS: u64 = 10_000_000_000;
-/// Processes with a live budget window remembered at once.
-const PER_PID_CAP: usize = 1_024;
 
 /// A text buffer has few control characters; an assembly image or VBA p-code
 /// is mostly them. Above this share the buffer is not reported as text.
@@ -84,14 +84,22 @@ pub(crate) enum Refusal {
 }
 
 /// Dedup + per-process budget, see the module doc.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct AmsiGate {
     /// content hash → last time it was admitted.
     seen: HashMap<String, u64>,
-    /// pid → (window start, events admitted in it).
-    budgets: HashMap<u32, (u64, u32)>,
+    budget: PidBudget,
     pub(crate) duplicates: u64,
-    pub(crate) rate_limited: u64,
+}
+
+impl Default for AmsiGate {
+    fn default() -> Self {
+        Self {
+            seen: HashMap::new(),
+            budget: PidBudget::new(PER_PID_LIMIT, PER_PID_WINDOW_NS),
+            duplicates: 0,
+        }
+    }
 }
 
 impl AmsiGate {
@@ -108,22 +116,9 @@ impl AmsiGate {
             return Err(Refusal::Duplicate);
         }
 
-        if self.budgets.len() >= PER_PID_CAP && !self.budgets.contains_key(&pid) {
-            self.budgets
-                .retain(|_, (start, _)| now_ns.saturating_sub(*start) < PER_PID_WINDOW_NS);
-            if self.budgets.len() >= PER_PID_CAP {
-                self.budgets.clear(); // a pid storm: start every budget afresh
-            }
-        }
-        let budget = self.budgets.entry(pid).or_insert((now_ns, 0));
-        if now_ns.saturating_sub(budget.0) >= PER_PID_WINDOW_NS {
-            *budget = (now_ns, 0);
-        }
-        if budget.1 >= PER_PID_LIMIT {
-            self.rate_limited += 1;
+        if !self.budget.spend(pid, now_ns) {
             return Err(Refusal::RateLimited);
         }
-        budget.1 += 1;
 
         if !hash.is_empty() {
             if self.seen.len() >= DEDUP_CAP {
@@ -220,7 +215,7 @@ mod tests {
             "budget is per process"
         );
         assert_eq!(gate.admit(7, "new", PER_PID_WINDOW_NS + 1), Ok(()));
-        assert_eq!(gate.rate_limited, 1);
+        assert_eq!(gate.budget.refused, 1);
     }
 
     #[test]
@@ -242,6 +237,6 @@ mod tests {
             let _ = gate.admit(pid, &format!("h{i}"), i);
         }
         assert!(gate.seen.len() <= DEDUP_CAP);
-        assert!(gate.budgets.len() <= PER_PID_CAP);
+        assert!(gate.budget.tracked() <= 1_024);
     }
 }

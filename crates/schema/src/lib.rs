@@ -227,7 +227,12 @@ pub mod time;
 /// `ScriptBlock`. #577 (`BitsJob`) also targets v36 while both branches are
 /// open: whichever merges second renumbers, same coordination note as v13,
 /// v28→29, v30→31 and v32→33 above.
-pub const SCHEMA_VERSION: u32 = 36;
+///
+/// Bumped 36 → 37 for [`Event::LdapSearch`] (#364): the LDAP searches a
+/// process sends (EID 30 of Microsoft-Windows-LDAP-Client), the endpoint's
+/// view of directory reconnaissance. Windows-only, same posture as
+/// `WmiActivity`.
+pub const SCHEMA_VERSION: u32 = 37;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -926,6 +931,31 @@ pub struct DnsQueryEvent {
     pub result: Option<String>,
     /// Win32 status code (0 = success, 9003 = NXDOMAIN, ...).
     pub status: u32,
+}
+
+/// An LDAP search a process sent, from EID 30 of the
+/// Microsoft-Windows-LDAP-Client provider (#364): the directory-reconnaissance
+/// fingerprint an endpoint can see. Kerberoasting / AS-REP roasting start with
+/// a search for roastable accounts, and SharpHound-style collection is a burst
+/// of wide searches from one process; the ticket requests themselves are only
+/// visible on a domain controller.
+///
+/// Emitted when the request is actually sent (lab, 2026-10-02: a search to a
+/// listener that never answers is logged, a failed connect is not). `meta` is
+/// the requesting process (`wldap32` runs in-process). Windows-only, same
+/// posture as [`WmiActivityEvent`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LdapSearchEvent {
+    pub meta: EventMeta,
+    /// The search filter as sent (RFC 4515 text).
+    pub filter: String,
+    /// The search base distinguished name.
+    pub base_dn: String,
+    /// Search scope: 0 base object, 1 one level, 2 whole subtree.
+    pub scope: u32,
+    /// Attributes requested; empty means "all".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attributes: Vec<String>,
 }
 
 /// WMI activity — query execution (EID 23) or method invocation (EID 24) from the
@@ -1791,6 +1821,7 @@ pub enum Event {
     ImageLoad(ImageLoadEvent),
     ScriptBlock(ScriptBlockEvent),
     AmsiContent(AmsiContentEvent),
+    LdapSearch(LdapSearchEvent),
     WmiActivity(WmiActivityEvent),
     AssemblyLoad(AssemblyLoadEvent),
     SmbConnect(SmbConnectEvent),
@@ -1846,6 +1877,7 @@ impl Event {
             Event::ImageLoad(e) => &e.meta,
             Event::ScriptBlock(e) => &e.meta,
             Event::AmsiContent(e) => &e.meta,
+            Event::LdapSearch(e) => &e.meta,
             Event::WmiActivity(e) => &e.meta,
             Event::AssemblyLoad(e) => &e.meta,
             Event::SmbConnect(e) => &e.meta,

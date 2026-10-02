@@ -18,12 +18,12 @@ use schema::{
 };
 
 use crate::{
-    amsi, etw_sessions,
+    amsi, budget, etw_sessions,
     long_path::{self, LongPathCache},
     normalize,
     pid_cache::PidCache,
     providers::{
-        ALL_PROVIDERS, amsi_provider, dns_provider, dotnet_provider, file_provider,
+        ALL_PROVIDERS, amsi_provider, dns_provider, dotnet_provider, file_provider, ldap_provider,
         network_provider, powershell_provider, process_provider, registry_provider, smb_provider,
         wmi_provider,
     },
@@ -52,6 +52,11 @@ const QUARANTINE_DEDUP_CAP: usize = 1_024;
 /// and downloads come at human or script rate, so 256 absorbs a burst of ~100
 /// downloads behind one slow read; past it a mark is dropped and counted.
 const MARK_QUEUE_CAPACITY: usize = 256;
+/// LDAP searches reported per process per window (#364). SharpHound-style
+/// collection runs hundreds of searches; the burst rule needs well under
+/// this to fire, the cap only bounds a runaway client.
+const LDAP_PER_PID_LIMIT: u32 = 128;
+const LDAP_PER_PID_WINDOW_NS: u64 = 10_000_000_000;
 
 /// Stops an orphaned ETW session. Named sessions are kernel objects that outlive
 /// the creating process: after a `taskkill /f` or crash the session stays Running
@@ -194,6 +199,9 @@ pub(crate) struct SharedState {
     pub(crate) events_seen: AtomicU64,
     /// AMSI volume gate (#282): dedup + per-process budget.
     pub(crate) amsi: Mutex<amsi::AmsiGate>,
+    /// LDAP search budget (#364): per process, no dedup (the burst rule
+    /// counts distinct searches).
+    pub(crate) ldap: Mutex<budget::PidBudget>,
     /// The liveness canary file: the run loop touches it every heartbeat, which
     /// MUST produce a Kernel-File event (our pid is tracked) — so sensor liveness
     /// is deterministic instead of traffic-dependent (a quiet host produces no
@@ -402,6 +410,10 @@ impl Sensor for WindowsSensor {
             marks,
             events_seen: AtomicU64::new(0),
             amsi: Mutex::new(amsi::AmsiGate::default()),
+            ldap: Mutex::new(budget::PidBudget::new(
+                LDAP_PER_PID_LIMIT,
+                LDAP_PER_PID_WINDOW_NS,
+            )),
             canary_path: canary_file
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -424,7 +436,8 @@ impl Sensor for WindowsSensor {
             .enable(wmi_provider(sink.clone(), state.clone()))
             .enable(dotnet_provider(sink.clone(), state.clone()))
             .enable(smb_provider(sink.clone(), state.clone()))
-            .enable(amsi_provider(sink, state.clone()));
+            .enable(amsi_provider(sink.clone(), state.clone()))
+            .enable(ldap_provider(sink, state.clone()));
         let trace = normalize::start_or_stop_session(
             &session,
             || builder.start_and_process(),

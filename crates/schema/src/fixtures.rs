@@ -32,11 +32,11 @@ use crate::{
     ConnectEvent, DnsQueryEvent, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent,
     FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent,
     FileSetxattrEvent, FileWriteEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent,
-    KernelModuleAction, KernelModuleEvent, ListenPortEvent, MemfdCreateEvent, NamespaceEvent,
-    NamespaceSyscall, NetworkFlowEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent,
-    PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType,
-    SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TlsCaptureEvent,
-    TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
+    KernelModuleAction, KernelModuleEvent, LdapSearchEvent, ListenPortEvent, MemfdCreateEvent,
+    NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, PrctlEvent, ProcessVmReadEvent,
+    ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
+    ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent,
+    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -123,6 +123,18 @@ pub fn image_load() -> ImageLoadEvent {
     ImageLoadEvent {
         meta: meta(),
         image_path: String::new(),
+    }
+}
+
+/// Neutral [`LdapSearchEvent`].
+#[must_use]
+pub fn ldap_search() -> LdapSearchEvent {
+    LdapSearchEvent {
+        meta: meta(),
+        filter: String::new(),
+        base_dn: String::new(),
+        scope: 2,
+        attributes: Vec::new(),
     }
 }
 

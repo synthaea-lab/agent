@@ -13,9 +13,9 @@ use schema::{
     ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent,
     FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent,
     FileSetxattrEvent, FileWriteEvent, GatekeeperVerdictEvent, IdentityChangeEvent,
-    IdentityChangeKind, ImageLoadEvent, KernelModuleAction, KernelModuleEvent, ListenPortEvent,
-    MemfdCreateEvent, MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent,
-    POLICY_MECHANISM_SELINUX, PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent,
+    IdentityChangeKind, ImageLoadEvent, KernelModuleAction, KernelModuleEvent, LdapSearchEvent,
+    ListenPortEvent, MemfdCreateEvent, MountEvent, NamespaceEvent, NamespaceSyscall,
+    NetworkFlowEvent, POLICY_MECHANISM_SELINUX, PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent,
     ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
     ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent,
     TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User,
@@ -446,6 +446,32 @@ fn wmi_activity_golden() {
             method: Some("Win32_Process.Create".into()),
         }),
         "wmi_activity",
+    );
+}
+
+#[test]
+fn ldap_search_golden() {
+    assert_golden(
+        &Event::LdapSearch(LdapSearchEvent {
+            meta: EventMeta {
+                pid: 3740,
+                ppid: 0,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-1001".into(),
+                    integrity_level: Some(0x2000),
+                },
+                timestamp_ns: 1_759_396_502_000_000_000,
+                comm: "powershell.exe".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            filter: "(&(samAccountType=805306368)(servicePrincipalName=*))".into(),
+            base_dn: "DC=lab,DC=local".into(),
+            scope: 2,
+            attributes: vec!["sAMAccountName".into(), "servicePrincipalName".into()],
+        }),
+        "ldap_search",
     );
 }
 
@@ -1768,6 +1794,13 @@ fn meta_accessor_covers_all_variants() {
             namespace: String::new(),
             query: None,
             method: None,
+        }),
+        Event::LdapSearch(LdapSearchEvent {
+            meta: meta.clone(),
+            filter: String::new(),
+            base_dn: String::new(),
+            scope: 0,
+            attributes: Vec::new(),
         }),
         Event::AmsiContent(AmsiContentEvent {
             meta: meta.clone(),

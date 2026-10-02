@@ -13,12 +13,16 @@
 mod amsi;
 mod exclusions;
 mod ld_trust;
+mod ldap;
 mod sliding;
 mod state;
 mod stateless;
 
 // AMSI content rules (#282): the dispatcher for `AmsiContent` events.
 pub use amsi::evaluate_amsi_content;
+// LDAP search rules (#364): the single-search dispatcher; the burst rule is
+// `RuleState::on_ldap_search`.
+pub use ldap::evaluate_ldap_search;
 pub use state::RuleState;
 #[cfg(test)]
 pub(crate) use stateless::{

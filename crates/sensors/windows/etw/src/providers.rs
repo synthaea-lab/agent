@@ -14,8 +14,8 @@ use ferrisetw::{
 };
 use schema::{
     AmsiContentEvent, AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, ExecEvent,
-    FileOpenEvent, ImageLoadEvent, RegistrySetEvent, ScriptBlockEvent, SmbConnectEvent,
-    UdpSendEvent, WmiActivityEvent, sensor::EventSink,
+    FileOpenEvent, ImageLoadEvent, LdapSearchEvent, RegistrySetEvent, ScriptBlockEvent,
+    SmbConnectEvent, UdpSendEvent, WmiActivityEvent, sensor::EventSink,
 };
 
 use crate::{
@@ -39,12 +39,14 @@ const WMI_ACTIVITY_GUID: &str = "1418EF04-B0B4-4623-BF7E-D74AB47BBDAA";
 const DOTNET_RUNTIME_GUID: &str = "e13c0d23-ccbc-4e12-931b-d9cc2eee27e4";
 /// Microsoft-Antimalware-Scan-Interface (EID 1101, the scanned buffer, #282)
 const AMSI_GUID: &str = "2A576B87-09A7-520E-C21A-4942F0271D67";
+/// Microsoft-Windows-LDAP-Client (EID 30, the search request, #364)
+const LDAP_CLIENT_GUID: &str = "099614a5-5dd7-4788-8bc9-e29f43db28fc";
 /// Microsoft-Windows-SMBClient (EID 30704 — TCP connection established to SMB server)
 const SMB_CLIENT_GUID: &str = "988C59C5-0A1C-45B6-A555-0C62276E327D";
 
 /// Every provider the sensor enables, by short name — for the blind-session
 /// attribution (#408), which asks the OS who else enables them.
-pub(crate) const ALL_PROVIDERS: [(&str, &str); 10] = [
+pub(crate) const ALL_PROVIDERS: [(&str, &str); 11] = [
     ("Kernel-Process", KERNEL_PROCESS_GUID),
     ("Kernel-Network", KERNEL_NETWORK_GUID),
     ("Kernel-File", KERNEL_FILE_GUID),
@@ -55,6 +57,7 @@ pub(crate) const ALL_PROVIDERS: [(&str, &str); 10] = [
     ("DotNETRuntime", DOTNET_RUNTIME_GUID),
     ("SMBClient", SMB_CLIENT_GUID),
     ("AMSI", AMSI_GUID),
+    ("LDAP-Client", LDAP_CLIENT_GUID),
 ];
 
 /// `AssemblyFlags` bit indicating a dynamic (in-memory) assembly load.
@@ -575,6 +578,51 @@ pub(crate) fn amsi_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
     };
 
     Provider::by_guid(AMSI_GUID).add_callback(callback).build()
+}
+
+/// LDAP searches (EID 30): the directory-reconnaissance fingerprint (#364).
+/// Budgeted per process ([`SharedState::ldap`]) but not deduplicated: the
+/// burst rule needs the real count of distinct searches.
+///
+/// # Field notes (manifest + lab, Windows 11 24H2, 2026-10-02)
+///
+/// `ScopeOfSearch` (u32: 0 base, 1 one level, 2 subtree), `SearchFilter`,
+/// `DistinguishedName` (the base), `AttributeList` (space-separated),
+/// `ProcessId`. Logged when the request is sent: a search to a listener that
+/// never answers shows up, a failed connect does not.
+pub(crate) fn ldap_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
+    let callback = move |record: &EventRecord, locator: &SchemaLocator| {
+        if record.event_id() != 30 {
+            return;
+        }
+        state.events_seen.fetch_add(1, Ordering::Relaxed);
+        let Ok(schema_def) = locator.event_schema(record) else {
+            return;
+        };
+        let parser = Parser::create(record, &schema_def);
+        // The field, not the header: the header pid of a provider running
+        // in-process is the same, but the field is what the manifest promises.
+        let pid = parser
+            .try_parse::<u32>("ProcessId")
+            .unwrap_or_else(|_| record.process_id());
+        let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
+        if !state.ldap.lock().unwrap().spend(pid, timestamp_ns) {
+            return;
+        }
+        let attributes: String = parser.try_parse("AttributeList").unwrap_or_default();
+        let comm = state.comm_for(pid).unwrap_or_default();
+        sink.on_event(Event::LdapSearch(LdapSearchEvent {
+            meta: meta(pid, 0, comm, timestamp_ns),
+            filter: parser.try_parse("SearchFilter").unwrap_or_default(),
+            base_dn: parser.try_parse("DistinguishedName").unwrap_or_default(),
+            scope: parser.try_parse("ScopeOfSearch").unwrap_or(0),
+            attributes: attributes.split_whitespace().map(str::to_string).collect(),
+        }));
+    };
+
+    Provider::by_guid(LDAP_CLIENT_GUID)
+        .add_callback(callback)
+        .build()
 }
 
 /// WMI activity events (EID 23 — `ExecQuery`, EID 24 — `ExecMethod`).
