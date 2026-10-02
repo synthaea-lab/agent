@@ -29,15 +29,15 @@ use core::net::{IpAddr, Ipv4Addr};
 
 use crate::{
     AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, CapSetEvent,
-    ConnectEvent, DnsQueryEvent, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent,
-    FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent,
-    FileSetxattrEvent, FileWriteEvent, HttpRequestEvent, HttpSignature, HttpSummaryEvent,
-    IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent, KernelModuleAction, KernelModuleEvent,
-    ListenPortEvent, MemfdCreateEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent,
-    PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent,
-    RegistrySetEvent, ScriptBlockEvent, ShellType, SmbConnectEvent, SocketAcceptEvent,
-    SocketBindEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
-    UdpSendEvent, User, WmiActivityEvent,
+    ConnectEvent, DefenderEvent, DefenderEventKind, DnsQueryEvent, EventMeta, ExecEvent,
+    FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent, FileQuarantineEvent,
+    FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent, HttpRequestEvent,
+    HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent,
+    KernelModuleAction, KernelModuleEvent, ListenPortEvent, MemfdCreateEvent, NamespaceEvent,
+    NamespaceSyscall, NetworkFlowEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent,
+    PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType,
+    SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TlsCaptureEvent,
+    TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -124,6 +124,26 @@ pub fn image_load() -> ImageLoadEvent {
     ImageLoadEvent {
         meta: meta(),
         image_path: String::new(),
+    }
+}
+
+/// Neutral [`DefenderEvent`].
+#[must_use]
+pub fn defender() -> DefenderEvent {
+    DefenderEvent {
+        meta: meta(),
+        kind: DefenderEventKind::Detection,
+        detection_id: None,
+        threat_name: None,
+        severity_id: None,
+        category_id: None,
+        action_id: None,
+        path: None,
+        process_name: None,
+        user: None,
+        setting: None,
+        old_value: None,
+        new_value: None,
     }
 }
 

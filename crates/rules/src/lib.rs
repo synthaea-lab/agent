@@ -11,6 +11,7 @@
 //! dated lab observations — treat them as data with provenance, not tunable noise.
 
 mod amsi;
+mod defender;
 mod exclusions;
 mod ld_trust;
 mod sliding;
@@ -19,6 +20,8 @@ mod stateless;
 
 // AMSI content rules (#282): the dispatcher for `AmsiContent` events.
 pub use amsi::evaluate_amsi_content;
+// Defender tamper rules (#283): protection turned off, risky exclusions.
+pub use defender::evaluate_defender_event;
 use schema::detection::Severity;
 pub use state::RuleState;
 #[cfg(test)]
