@@ -207,7 +207,14 @@ pub use path_filter::is_filtered_path;
 ///   `aya::Pod` impl to hide. Both structs also carry `parent_generation`, the
 ///   parent's stamp as the fork recorded it, so a lookup keyed on `ppid` can tell a
 ///   recycled parent too.
-pub const WIRE_VERSION: u32 = 20;
+/// - v21: `FileRenameEvent` gains `old_dfd`/`new_dfd`, the directory fds the rename
+///   was relative to (issue #515). `rename(2)` has none and reports `AT_FDCWD`
+///   (-100); `renameat(2)`/`renameat2(2)` pass theirs. The paths stay the raw
+///   caller-supplied strings; the userspace normalizer resolves a relative one
+///   against the fd (`/proc/<pid>/fd/<n>`, or `/proc/<pid>/cwd` for `AT_FDCWD`).
+///   `reserved` is explicit so the two `i32`s leave no implicit padding for the
+///   `aya::Pod` impl to hide.
+pub const WIRE_VERSION: u32 = 21;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
@@ -352,10 +359,11 @@ pub struct FileDeleteEvent {
 
 /// File rename (`syscalls:sys_enter_rename`/`sys_enter_renameat`/
 /// `sys_enter_renameat2`). Both `old_path`/`new_path` are raw caller-supplied paths,
-/// not resolved against `olddfd`/`newdfd` — same known limitation as
-/// `FileOpenEvent::path`. The classic ransomware signal (`document.docx` →
-/// `document.docx.encrypted`) lives entirely in `new_path`'s suffix, no fd
-/// resolution needed to see it.
+/// not resolved in the kernel: `old_dfd`/`new_dfd` carry the directory fds they are
+/// relative to (`AT_FDCWD`, -100, for `rename(2)` and for a `renameat` that passed
+/// it), and the userspace normalizer resolves a relative path against them (#515).
+/// The classic ransomware signal (`document.docx` → `document.docx.encrypted`) lives
+/// entirely in `new_path`'s suffix, no fd resolution needed to see it.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FileRenameEvent {
@@ -364,6 +372,11 @@ pub struct FileRenameEvent {
     pub old_path_len: u16,
     pub new_path: [u8; MAX_PATH_LEN],
     pub new_path_len: u16,
+    /// Explicit padding so the `i32`s below are 4-aligned without implicit padding
+    /// bytes. Always zero.
+    pub reserved: u16,
+    pub old_dfd: i32,
+    pub new_dfd: i32,
 }
 
 /// File permission change (`syscalls:sys_enter_chmod`/`sys_enter_fchmodat`, issue #262
