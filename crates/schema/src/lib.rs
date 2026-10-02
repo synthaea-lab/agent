@@ -1660,8 +1660,9 @@ pub enum HttpSignature {
 pub struct HttpEvidence {
     /// Name of the matched query parameter.
     pub param: String,
-    /// The value, cut to 128 characters and passed through the ADR-0018 credential
-    /// redaction by the producer before it reaches this field.
+    /// The value, cut to 128 characters by the producer. Credential redaction
+    /// (ADR-0018) is not the producer's job: the agent's sink boundary applies it,
+    /// so a consumer downstream of that sink sees the redacted form.
     pub value: String,
 }
 
@@ -1710,8 +1711,8 @@ pub struct HttpClientCount {
 
 /// The access log of one source over one window (issue #478, ADR-0022 §3): counters
 /// and the clients with the most failing requests, the only thing the server sees of
-/// requests that matched no signature. Emitted once per source per window, whether
-/// or not the window was quiet.
+/// requests that matched no signature. Emitted once per source per window that saw at
+/// least one request: a quiet log is normal and an empty summary says nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpSummaryEvent {
     /// Same `pid`/`ppid` 0 convention as [`HttpRequestEvent`]; `timestamp_ns` is the
