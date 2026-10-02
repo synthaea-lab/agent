@@ -121,7 +121,9 @@ mod tests {
     };
 
     fn dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("yara-access-{name}-{}", std::process::id()));
+        // `/tmp`, not `temp_dir()`: on macOS that is a 0700 directory under /var/folders,
+        // which no stranger can search, so the "world-readable" cases would be refused.
+        let dir = Path::new("/tmp").join(format!("yara-access-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
