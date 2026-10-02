@@ -17,6 +17,8 @@ mod sliding;
 mod state;
 mod stateless;
 
+// AMSI content rules (#282): the dispatcher for `AmsiContent` events.
+pub use amsi::evaluate_amsi_content;
 pub use state::RuleState;
 #[cfg(test)]
 pub(crate) use stateless::{
@@ -30,7 +32,6 @@ pub(crate) use stateless::{
 // The contract is the two dispatchers — callers (agent) route every event
 // through them. The individual checks are implementation detail, re-exported
 // crate-internally for the tests under `src/tests/`.
-pub use amsi::evaluate_amsi_content;
 pub use stateless::{
     evaluate_connect, evaluate_exec, evaluate_file_delete, evaluate_file_open, evaluate_signal,
 };
