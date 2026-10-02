@@ -18,18 +18,26 @@
 //! [`Tailer`] follows one file: a persistable [`Position`], rotation by file identity,
 //! bounded memory per line.
 //!
-//! **Status:** parsing and tailing. Not here yet, by design of the slicing: wiring the
-//! sources from `[logs]` into the agent (and persisting each position), signatures,
-//! the per-window summary, the schema events and the redaction of what leaves the
-//! host (ADR-0018).
+//! [`match_request`] and [`to_http_request_event`] turn a parsed access-log line into an
+//! `HttpRequest` event when it matches a detection signature; a [`Summarizer`] yields
+//! one `HttpSummary` per source per window.
+//!
+//! **Status:** everything here is pure and tested; nothing writes or sends an event.
+//! Not here yet: wiring the access sources into the agent, and the credential
+//! redaction of an event's evidence value, which ADR-0018 puts at the agent's sink
+//! boundary (so the evidence leaves this crate cut but raw).
 
 mod access;
+mod http;
 mod mysql;
+mod summary;
 mod tail;
 mod tokenizer;
 
 pub use access::{AccessFormat, AccessRecord, parse_access_line};
+pub use http::{EVIDENCE_MAX_CHARS, HTTP_LOG_COMM, Match, match_request, to_http_request_event};
 pub use mysql::{MYSQL_LOG_COMM, MysqlLoginFailure, parse_mysql_error_line, to_auth_event};
+pub use summary::{MAX_TRACKED_CLIENTS, Summarizer, TOP_CLIENTS, WINDOW_SECS};
 pub use tail::{FileId, PollOutcome, Position, Tailer};
 
 /// Longest line a parser reads; the rest is dropped and the record is flagged
