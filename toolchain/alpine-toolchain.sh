@@ -35,7 +35,7 @@ $APK update -q
 $APK add -q \
   bash build-base binutils cmake coreutils curl dpkg file findutils git pkgconf \
   python3 python3-dev py3-pip rsync tar zstd bind-tools \
-  openssl-dev zstd-dev elfutils-dev \
+  openssl-dev xz-dev zstd-dev elfutils-dev \
   clang llvm-dev
 
 echo "== BTF check =="
