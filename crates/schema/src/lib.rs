@@ -226,7 +226,14 @@ pub mod time;
 /// that matches a detection signature, one summary per source per window. Neither
 /// reuses an existing variant (ADR-0022 §6); both carry a `meta` with `pid`/`ppid` 0,
 /// since a log line names no process. Same serialization-visible reasoning as v13-v35.
-pub const SCHEMA_VERSION: u32 = 36;
+///
+/// Bumped 36 → 37 for [`Event::AmsiContent`] (#282): the post-decoding buffer
+/// a runtime hands to AMSI before running it (EID 1101 of
+/// Microsoft-Antimalware-Scan-Interface). Windows-only, same posture as
+/// `ScriptBlock`. 36 was claimed by #478 (`HttpRequest`/`HttpSummary`) while
+/// both branches were open; #478 merged first, so this one renumbers — same
+/// coordination note as v13, v28→29, v30→31 and v32→33 above.
+pub const SCHEMA_VERSION: u32 = 37;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -973,6 +980,57 @@ pub struct ScriptBlockEvent {
     pub message_number: u32,
     /// Total number of fragments for this script block.
     pub message_total: u32,
+}
+
+/// Content a runtime handed to AMSI before running it, from EID 1101 of the
+/// Microsoft-Antimalware-Scan-Interface provider (#282).
+///
+/// AMSI sees the **post-decoding** buffer: a Base64/XOR/format-string obfuscated
+/// payload is readable here, from every runtime that scans through AMSI
+/// (`PowerShell`, Windows Script Host's `VBScript`/`JScript`, Office VBA, .NET
+/// Framework 4.8+ assembly loads). Complements [`ScriptBlockEvent`], which only
+/// covers the `PowerShell` runtime and only what it logs.
+///
+/// What a runtime hands over differs: `PowerShell` passes every script and
+/// command, de-obfuscated; Windows Script Host passes only its sensitive
+/// runtime calls with their arguments (`IWshShell3.Run("cmd /c …")`,
+/// `VBScript` `Execute` content), not the whole script (lab, 2026-10-01).
+///
+/// `meta` is the scanning process (AMSI runs in-process). Identical content is
+/// rescanned constantly, so the sensor deduplicates on [`Self::content_hash`]
+/// and rate-limits per process; see the sensor's `amsi` module.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmsiContentEvent {
+    pub meta: EventMeta,
+    /// AMSI session handle: scans that belong together (e.g. the fragments of
+    /// one `PowerShell` command) share it. Opaque.
+    pub session: u64,
+    /// The runtime that asked for the scan, as AMSI reports it
+    /// (`PowerShell_C:\…\powershell.exe_10.0…`, `VBScript`, `JScript`,
+    /// `DotNet`, `OFFICE_VBA`, …).
+    pub app_name: String,
+    /// The content's name when the runtime gave one (a script path, a URL);
+    /// `None` for inline content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_name: Option<String>,
+    /// Size in bytes of the scanned buffer as AMSI reports it.
+    pub content_size: u32,
+    /// Size in bytes of the content before the runtime's own processing, as
+    /// AMSI reports it.
+    pub original_size: u32,
+    /// The scanned content decoded as text (UTF-16LE, as the script runtimes
+    /// hand it over), cut to the sensor's limit. `None` when the buffer is not
+    /// text (a .NET assembly image, Office VBA p-code) or AMSI filtered it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// `true` when [`Self::text`] was cut to the sensor's limit.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub text_truncated: bool,
+    /// SHA-256 of the scanned buffer, lowercase hex, as AMSI computed it.
+    pub content_hash: String,
+    /// The `AMSI_RESULT` the antimalware provider returned (0 clean,
+    /// `>= 32768` detected / blocked by admin policy).
+    pub scan_result: u32,
 }
 
 /// Image (DLL or EXE) loaded into a process address space.
@@ -1831,6 +1889,7 @@ pub enum Event {
     RegistrySet(RegistrySetEvent),
     ImageLoad(ImageLoadEvent),
     ScriptBlock(ScriptBlockEvent),
+    AmsiContent(AmsiContentEvent),
     WmiActivity(WmiActivityEvent),
     AssemblyLoad(AssemblyLoadEvent),
     SmbConnect(SmbConnectEvent),
@@ -1887,6 +1946,7 @@ impl Event {
             Event::RegistrySet(e) => &e.meta,
             Event::ImageLoad(e) => &e.meta,
             Event::ScriptBlock(e) => &e.meta,
+            Event::AmsiContent(e) => &e.meta,
             Event::WmiActivity(e) => &e.meta,
             Event::AssemblyLoad(e) => &e.meta,
             Event::SmbConnect(e) => &e.meta,

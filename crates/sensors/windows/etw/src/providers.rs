@@ -6,15 +6,20 @@
 
 use std::sync::{Arc, atomic::Ordering};
 
-use ferrisetw::{EventRecord, parser::Parser, provider::Provider, schema_locator::SchemaLocator};
+use ferrisetw::{
+    EventRecord,
+    parser::{Parser, Pointer},
+    provider::Provider,
+    schema_locator::SchemaLocator,
+};
 use schema::{
-    AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, ExecEvent, FileOpenEvent,
-    ImageLoadEvent, RegistrySetEvent, ScriptBlockEvent, SmbConnectEvent, UdpSendEvent,
-    WmiActivityEvent, sensor::EventSink,
+    AmsiContentEvent, AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, ExecEvent,
+    FileOpenEvent, ImageLoadEvent, RegistrySetEvent, ScriptBlockEvent, SmbConnectEvent,
+    UdpSendEvent, WmiActivityEvent, sensor::EventSink,
 };
 
 use crate::{
-    normalize,
+    amsi, normalize,
     sensor::{SharedState, basename, meta},
     winapi, zone_identifier,
 };
@@ -32,12 +37,14 @@ const POWERSHELL_GUID: &str = "A0C1853B-5C40-4B15-8766-3CF1C58F985A";
 const WMI_ACTIVITY_GUID: &str = "1418EF04-B0B4-4623-BF7E-D74AB47BBDAA";
 /// Microsoft-Windows-DotNETRuntime (Assembly keyword, EID 154 `AssemblyLoad`)
 const DOTNET_RUNTIME_GUID: &str = "e13c0d23-ccbc-4e12-931b-d9cc2eee27e4";
+/// Microsoft-Antimalware-Scan-Interface (EID 1101, the scanned buffer, #282)
+const AMSI_GUID: &str = "2A576B87-09A7-520E-C21A-4942F0271D67";
 /// Microsoft-Windows-SMBClient (EID 30704 — TCP connection established to SMB server)
 const SMB_CLIENT_GUID: &str = "988C59C5-0A1C-45B6-A555-0C62276E327D";
 
 /// Every provider the sensor enables, by short name — for the blind-session
 /// attribution (#408), which asks the OS who else enables them.
-pub(crate) const ALL_PROVIDERS: [(&str, &str); 9] = [
+pub(crate) const ALL_PROVIDERS: [(&str, &str); 10] = [
     ("Kernel-Process", KERNEL_PROCESS_GUID),
     ("Kernel-Network", KERNEL_NETWORK_GUID),
     ("Kernel-File", KERNEL_FILE_GUID),
@@ -47,6 +54,7 @@ pub(crate) const ALL_PROVIDERS: [(&str, &str); 9] = [
     ("WMI-Activity", WMI_ACTIVITY_GUID),
     ("DotNETRuntime", DOTNET_RUNTIME_GUID),
     ("SMBClient", SMB_CLIENT_GUID),
+    ("AMSI", AMSI_GUID),
 ];
 
 /// `AssemblyFlags` bit indicating a dynamic (in-memory) assembly load.
@@ -499,6 +507,74 @@ pub(crate) fn powershell_provider(sink: Arc<dyn EventSink>, state: Arc<SharedSta
     Provider::by_guid(POWERSHELL_GUID)
         .add_callback(callback)
         .build()
+}
+
+/// AMSI scans (EID 1101): the buffer a runtime hands to AMSI before running
+/// it, i.e. the de-obfuscated script (#282). Volume is gated by
+/// [`amsi::AmsiGate`] (dedup on AMSI's own SHA-256, per-process budget).
+///
+/// # Field notes (manifest, Windows 11 24H2, 2026-10-01)
+///
+/// `session` (Pointer), `scanStatus` (u8), `scanResult` (u32), `appname`,
+/// `contentname` (strings), `contentsize`, `originalsize` (u32), `content`
+/// (Binary, `contentsize` bytes), `hash` (Binary, 32), `contentFiltered`
+/// (bool); v1 adds `hashoriginalcontent`. The record's pid is the scanning
+/// process: AMSI runs in-process.
+pub(crate) fn amsi_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
+    let callback = move |record: &EventRecord, locator: &SchemaLocator| {
+        if record.event_id() != 1101 {
+            return;
+        }
+        state.events_seen.fetch_add(1, Ordering::Relaxed);
+        let Ok(schema_def) = locator.event_schema(record) else {
+            return;
+        };
+        let parser = Parser::create(record, &schema_def);
+        let pid = record.process_id();
+        let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
+        let hash: Vec<u8> = parser.try_parse("hash").unwrap_or_default();
+        let content_hash = amsi::hex(&hash);
+        // The gate runs before any parsing or token lookup: a refused rescan
+        // costs one map probe on the consumer thread (#408).
+        if let Err(refusal) = state
+            .amsi
+            .lock()
+            .unwrap()
+            .admit(pid, &content_hash, timestamp_ns)
+        {
+            tracing::trace!(pid, ?refusal, "AMSI scan not reported");
+            return;
+        }
+
+        let content: Vec<u8> = parser.try_parse("content").unwrap_or_default();
+        let filtered: bool = parser.try_parse("contentFiltered").unwrap_or(false);
+        let (text, text_truncated) = match amsi::decode_text(&content, filtered) {
+            Some((text, cut)) => (Some(text), cut),
+            None => (None, false),
+        };
+        // `session` is a Pointer: 4 or 8 bytes depending on the scanning
+        // process's bitness, which ferrisetw's `Pointer` handles.
+        let session = parser
+            .try_parse::<Pointer>("session")
+            .map_or(0, |p| u64::try_from(*p).unwrap_or(0));
+        let content_name: String = parser.try_parse("contentname").unwrap_or_default();
+        let comm = state.comm_for(pid).unwrap_or_default();
+
+        sink.on_event(Event::AmsiContent(AmsiContentEvent {
+            meta: meta(pid, 0, comm, timestamp_ns),
+            session,
+            app_name: parser.try_parse("appname").unwrap_or_default(),
+            content_name: (!content_name.is_empty()).then_some(content_name),
+            content_size: parser.try_parse("contentsize").unwrap_or(0),
+            original_size: parser.try_parse("originalsize").unwrap_or(0),
+            text,
+            text_truncated,
+            content_hash,
+            scan_result: parser.try_parse("scanResult").unwrap_or(0),
+        }));
+    };
+
+    Provider::by_guid(AMSI_GUID).add_callback(callback).build()
 }
 
 /// WMI activity events (EID 23 — `ExecQuery`, EID 24 — `ExecMethod`).

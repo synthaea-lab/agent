@@ -13,7 +13,7 @@ Coverage targets (from the Windows coverage audit, priority order):
 | DNS | DNS-Client ETW | `etw/` — P3 |
 | Image/DLL load | Kernel-Process EID 5 | `etw/` — P6 |
 | File hash + Authenticode on exec | SHA-256 + WinVerifyTrust, cached | `etw/` — P7 |
-| Script content | AMSI ETW + PowerShell script-block | `etw/` — P8 |
+| Script content | AMSI ETW (EID 1101, #282) + PowerShell script-block (EID 4104) | `etw/` — P8 |
 | WMI activity | WMI-Activity ETW | `etw/` |
 | TCP in/outbound, IPv6 | Kernel-Network ETW | `etw/` |
 | Listening ports (LISTENER-DRIFT baseline) | `GetExtendedTcpTable` snapshots | `sockets/` — #366 |
