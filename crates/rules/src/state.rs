@@ -886,13 +886,6 @@ impl RuleState {
         self.check_listen_port_drift(event).into_iter().collect()
     }
 
-    /// To be called for every `AuthEvent` in the stream (issue #377, T1110):
-    /// counts failures per (target user, source) on a sliding window and
-    /// alerts once per window when the burst threshold is crossed. Successes
-    /// deliberately don't reset the counter — a success right after a burst
-    /// is the *stronger* signal, not an all-clear (success-after-burst gets
-    /// its own alert shape in a follow-up; today the burst itself already
-    /// fired).
     /// To be called for every `LdapSearchEvent` (Windows, #364): the
     /// directory-enumeration sweep, many distinct searches from one process
     /// in a short window. The single-search rules are
@@ -901,6 +894,13 @@ impl RuleState {
         self.ldap_burst.observe(event).into_iter().collect()
     }
 
+    /// To be called for every `AuthEvent` in the stream (issue #377, T1110):
+    /// counts failures per (target user, source) on a sliding window and
+    /// alerts once per window when the burst threshold is crossed. Successes
+    /// deliberately don't reset the counter — a success right after a burst
+    /// is the *stronger* signal, not an all-clear (success-after-burst gets
+    /// its own alert shape in a follow-up; today the burst itself already
+    /// fired).
     pub fn on_auth(&mut self, event: &AuthEvent) -> Vec<Alert> {
         if event.outcome != AuthOutcome::Failure {
             return Vec::new();

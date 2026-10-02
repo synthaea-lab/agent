@@ -96,7 +96,7 @@ impl Default for AmsiGate {
     fn default() -> Self {
         Self {
             seen: HashMap::new(),
-            budget: PidBudget::new(PER_PID_LIMIT, PER_PID_WINDOW_NS),
+            budget: PidBudget::new("amsi", PER_PID_LIMIT, PER_PID_WINDOW_NS),
             duplicates: 0,
         }
     }

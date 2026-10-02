@@ -6,7 +6,10 @@
 //! Every rule ignores the built-in service accounts (SYSTEM, LOCAL SERVICE,
 //! NETWORK SERVICE): Group Policy, the domain-join machinery and the like
 //! query the directory constantly as the machine. Reconnaissance runs as a
-//! user, even an administrator.
+//! user, even an administrator. A search whose process had already exited
+//! when the sensor read its token carries `User::Unknown` and is **not**
+//! ignored: a SYSTEM service's short-lived search can therefore reach the
+//! rules (rare; the cost of not guessing an identity).
 
 use schema::{LdapSearchEvent, User, detection::Severity};
 use store::BoundedMap;
@@ -27,13 +30,15 @@ const DOMAIN_TRUST_DISCOVERY: &str = "T1482";
 /// T1552: reading stored credentials out of the directory (LAPS, gMSA).
 const DIRECTORY_CREDENTIAL_READ: &str = "T1552";
 
-/// Per-rule severity (#615). Each technique above belongs to one rule here,
-/// except T1087.002 (privileged accounts, delegation, and the sweep), all
-/// three reconnaissance: Medium. Searching for roasting targets or reading
-/// stored passwords is the step right before credential theft: High.
+/// Per-rule severity (#615). Reconnaissance is Medium, including the two
+/// roasting-target searches: an administrator's plain
+/// `Get-ADUser -Filter {ServicePrincipalName -ne $null}` sends the same
+/// search, and at High each one would become a `RESPONSE-ESCALATE`. Reading a
+/// stored password (LAPS, gMSA) is the step that yields a credential: High.
+/// Easy to raise once there is fleet data (#632 review).
 fn severity(technique: &str) -> Severity {
     match technique {
-        KERBEROAST_RECON | ASREP_ROAST_RECON | DIRECTORY_CREDENTIAL_READ => Severity::High,
+        DIRECTORY_CREDENTIAL_READ => Severity::High,
         _ => Severity::Medium,
     }
 }
@@ -68,6 +73,17 @@ pub(crate) const BURST_THRESHOLD: u32 = 20;
 pub(crate) const BURST_WINDOW_NS: u64 = 60_000_000_000;
 /// Processes tracked at once for the burst rule.
 const BURST_PIDS_CAP: usize = 4_096;
+
+/// The requested attribute names, lowercased and split on the provider's
+/// separators (`;`, whitespace, NUL, `,`), none of which occurs in a name.
+fn requested_attributes(attributes: &[String]) -> Vec<String> {
+    attributes
+        .iter()
+        .flat_map(|list| list.split(|c: char| c.is_whitespace() || matches!(c, '\0' | ';' | ',')))
+        .filter(|name| !name.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
 
 /// The built-in service accounts, see the module doc.
 fn is_service_account(user: &User) -> bool {
@@ -131,11 +147,15 @@ pub fn evaluate_ldap_search(event: &LdapSearchEvent) -> Vec<Alert> {
     if filter.contains("objectclass=trusteddomain") {
         alerts.push(alert(DOMAIN_TRUST_DISCOVERY, "domain trusts"));
     }
-    // Substring over the joined list, not an exact per-name match: robust to
-    // a list the sensor could not split (the provider's `;` separator
-    // once hid a LAPS attribute this way, #364 lab).
-    let attributes = event.attributes.join(" ").to_ascii_lowercase();
-    let reads_password = PASSWORD_ATTRIBUTES.iter().any(|a| attributes.contains(a))
+    // Whole attribute names, not substrings: `ms-Mcs-AdmPwdExpirationTime` and
+    // `msLAPS-PasswordExpirationTime` hold no secret and are what LAPS
+    // reporting reads routinely (#632 review). The names are split again here
+    // so a list the sensor could not split (the provider's `;` separator once
+    // hid a LAPS attribute that way, #364 lab) still matches.
+    let names = requested_attributes(&event.attributes);
+    let reads_password = names
+        .iter()
+        .any(|name| PASSWORD_ATTRIBUTES.contains(&name.as_str()))
         || PASSWORD_ATTRIBUTES
             .iter()
             .any(|a| filter.contains(&format!("{a}=*")));
@@ -293,12 +313,41 @@ mod tests {
     }
 
     #[test]
+    fn laps_expiration_attributes_are_not_passwords() {
+        // The #632 review's false positive: routine LAPS reporting.
+        for attrs in [
+            vec!["cn", "ms-Mcs-AdmPwdExpirationTime"],
+            vec!["msLAPS-PasswordExpirationTime"],
+            vec!["cn\0ms-Mcs-AdmPwdExpirationTime"],
+            vec!["cn;msLAPS-PasswordExpirationTime"],
+        ] {
+            assert!(
+                techniques(&search("(objectClass=computer)", &attrs)).is_empty(),
+                "{attrs:?}"
+            );
+        }
+        assert!(techniques(&search("(msLAPS-PasswordExpirationTime=*)", &[])).is_empty());
+        assert!(techniques(&search("(ms-Mcs-AdmPwdExpirationTime<=0)", &[])).is_empty());
+        // The real attributes still match, in any case and in an unsplit list.
+        assert_eq!(
+            techniques(&search("(objectClass=computer)", &["MS-MCS-ADMPWD"])),
+            [DIRECTORY_CREDENTIAL_READ]
+        );
+        assert_eq!(
+            techniques(&search("(objectClass=computer)", &["cn;msLAPS-Password"])),
+            [DIRECTORY_CREDENTIAL_READ]
+        );
+    }
+
+    #[test]
     fn severity_follows_the_rule() {
         let roast = evaluate_ldap_search(&search(
             "(&(samAccountType=805306368)(servicePrincipalName=*))",
             &[],
         ));
-        assert_eq!(roast[0].severity, Severity::High);
+        assert_eq!(roast[0].severity, Severity::Medium);
+        let stored = evaluate_ldap_search(&search("(objectClass=computer)", &["ms-Mcs-AdmPwd"]));
+        assert_eq!(stored[0].severity, Severity::High);
         let trusts = evaluate_ldap_search(&search("(objectClass=trustedDomain)", &[]));
         assert_eq!(trusts[0].severity, Severity::Medium);
     }

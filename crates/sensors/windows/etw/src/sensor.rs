@@ -414,6 +414,7 @@ impl Sensor for WindowsSensor {
             events_seen: AtomicU64::new(0),
             amsi: Mutex::new(amsi::AmsiGate::default()),
             ldap: Mutex::new(budget::PidBudget::new(
+                "ldap",
                 LDAP_PER_PID_LIMIT,
                 LDAP_PER_PID_WINDOW_NS,
             )),
