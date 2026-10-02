@@ -14,7 +14,7 @@ fail() {
 if [ "$(uname -m)" != "x86_64" ]; then
     fail "the static .deb builder currently supports x86_64 only (found $(uname -m))"
 fi
-if ! ldd --version 2>&1 | head -n 1 | grep -qi musl; then
+if [ ! -r /etc/alpine-release ] || [ ! -e /lib/ld-musl-x86_64.so.1 ]; then
     fail "run this script on an x86_64 musl host (Alpine); the ONNX Runtime archives must be built for musl"
 fi
 command -v dpkg-deb >/dev/null || fail "install dpkg-deb (on Alpine: apk add dpkg)"
