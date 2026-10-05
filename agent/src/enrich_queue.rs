@@ -12,9 +12,12 @@
 //! channel: the drain thread runs the in-memory detection engines and hands the
 //! event off with a non-blocking `try_send`. No on-device engine consumes the hash
 //! or signature synchronously (rules/Sigma/correlator all work on cmdline, lineage,
-//! paths, and ports), so nothing detection-relevant waits on this. Overflow sheds
-//! and counts, like `yara::ScanQueue` — the loss is a logged/enriched record under
-//! extreme load, never a dropped detection and never stalled capture.
+//! paths, and ports). The one finding that needs the signature, T1204.002 (#441),
+//! rides here with its event as a `rules::SignatureGatedAlert` and is resolved by
+//! the worker once the verdict exists. Overflow sheds and counts, like
+//! `yara::ScanQueue` — the loss is a logged/enriched record under extreme load,
+//! never a dropped detection (a shed event hands its gated alert back to be raised
+//! unverified) and never stalled capture.
 //!
 //! [`EnrichQueue::flush`] (issue #341) gives `kill_loudness`'s shutdown path a
 //! bounded way to wait for this backlog before the process exits — the backlog is
@@ -37,6 +40,7 @@ use std::{
 };
 
 use enrich::Enricher;
+use rules::SignatureGatedAlert;
 use schema::{Event, detection::Detection};
 
 /// Queue depth: a burst of events beyond this sheds enrichment/logging (counted).
@@ -50,7 +54,9 @@ const QUEUE_CAP: usize = 4_096;
 enum QueueItem {
     // Boxed: `Event`'s largest variant otherwise sets every channel slot's size,
     // multiplied by `QUEUE_CAP` — `Flush` doesn't need anywhere near that much room.
-    Event(Box<Event>),
+    // The gated alert rides with its event: only this worker learns the
+    // signature it waits for (#441).
+    Event(Box<Event>, Option<SignatureGatedAlert>),
     Detection(Box<Detection>),
     // Only `kill_loudness` (Linux-gated) flushes today — the shutdown path on
     // the other platforms doesn't exist yet, not a reason to lose the variant.
@@ -72,7 +78,10 @@ impl EnrichQueue {
     /// The [`Enricher`] is owned exclusively by the worker, so its cache needs no
     /// lock and a long hash never blocks another thread.
     #[cfg(test)]
-    pub(crate) fn start(enricher: Enricher, on_enriched: impl Fn(Event) + Send + 'static) -> Self {
+    pub(crate) fn start(
+        enricher: Enricher,
+        on_enriched: impl Fn(Event, Option<SignatureGatedAlert>) + Send + 'static,
+    ) -> Self {
         Self::start_with_detections(enricher, on_enriched, |_| {})
     }
 
@@ -80,7 +89,7 @@ impl EnrichQueue {
     /// Both callbacks run off the sensor capture thread and share its FIFO queue.
     pub(crate) fn start_with_detections(
         mut enricher: Enricher,
-        on_enriched: impl Fn(Event) + Send + 'static,
+        on_enriched: impl Fn(Event, Option<SignatureGatedAlert>) + Send + 'static,
         on_detection: impl Fn(Detection) + Send + 'static,
     ) -> Self {
         let (tx, rx) = mpsc::sync_channel::<QueueItem>(QUEUE_CAP);
@@ -90,9 +99,9 @@ impl EnrichQueue {
             .spawn(move || {
                 while let Ok(item) = rx.recv() {
                     match item {
-                        QueueItem::Event(mut event) => {
+                        QueueItem::Event(mut event, gated) => {
                             enrich_event(&mut enricher, &mut event);
-                            on_enriched(*event);
+                            on_enriched(*event, gated);
                         }
                         QueueItem::Detection(detection) => on_detection(*detection),
                         // Nothing to do but signal back — arriving here at all means
@@ -112,10 +121,22 @@ impl EnrichQueue {
     }
 
     /// Hands an event to the worker; sheds (and counts) when the queue is full so
-    /// the caller — the capture thread — never blocks.
-    pub(crate) fn enqueue(&self, event: Event) {
-        if self.tx.try_send(QueueItem::Event(Box::new(event))).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+    /// the caller — the capture thread — never blocks. A shed event that carried
+    /// a gated alert comes back with it, for the caller to raise unverified: the
+    /// queue sheds enrichment, never a detection.
+    #[must_use = "a shed event hands its gated alert back; dropping it loses a finding"]
+    pub(crate) fn enqueue(
+        &self,
+        event: Event,
+        gated: Option<SignatureGatedAlert>,
+    ) -> Option<(Event, SignatureGatedAlert)> {
+        let item = QueueItem::Event(Box::new(event), gated);
+        let (mpsc::TrySendError::Full(item) | mpsc::TrySendError::Disconnected(item)) =
+            self.tx.try_send(item).err()?;
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        match item {
+            QueueItem::Event(event, Some(gated)) => Some((*event, gated)),
+            _ => None,
         }
     }
 
@@ -228,8 +249,8 @@ mod tests {
 
         let out: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
         let out_w = out.clone();
-        let queue = EnrichQueue::start(Enricher::new(), move |e| out_w.lock().unwrap().push(e));
-        queue.enqueue(exec(&path.to_string_lossy()));
+        let queue = EnrichQueue::start(Enricher::new(), move |e, _| out_w.lock().unwrap().push(e));
+        assert!(queue.enqueue(exec(&path.to_string_lossy()), None).is_none());
 
         // Wait for the worker to deliver.
         for _ in 0..100 {
@@ -258,16 +279,65 @@ mod tests {
         let gate = Arc::new(Mutex::new(()));
         let held = gate.lock().unwrap();
         let gate_worker = gate.clone();
-        let queue = EnrichQueue::start(Enricher::new(), move |_| {
+        let queue = EnrichQueue::start(Enricher::new(), move |_, _| {
             let _wait = gate_worker.lock().unwrap();
         });
         // First send is accepted (worker takes it, then blocks); fill the buffer and
         // then some. try_send must never block — the loop returning proves it.
         for _ in 0..(QUEUE_CAP + 200) {
-            queue.enqueue(exec("/nonexistent/x"));
+            let _ = queue.enqueue(exec("/nonexistent/x"), None);
         }
         assert!(queue.dropped() > 0, "a full queue must shed, not block");
         drop(held); // release the worker so it can exit cleanly
+    }
+
+    /// A T1204.002 gated alert, as the rules hand it to the sink.
+    fn gated_alert() -> SignatureGatedAlert {
+        let path = "/Users/u/Downloads/x";
+        let mut state = rules::RuleState::new();
+        state.on_file_quarantine(&schema::FileQuarantineEvent {
+            path: path.into(),
+            ..schema::fixtures::file_quarantine()
+        });
+        let Event::Exec(run) = exec(path) else {
+            unreachable!()
+        };
+        state
+            .on_exec_signature_gated(&run)
+            .expect("a marked file run inside the window")
+    }
+
+    #[test]
+    fn the_worker_receives_the_gated_alert_with_its_event() {
+        let got: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+        let got_w = got.clone();
+        let queue = EnrichQueue::start(Enricher::new(), move |_, gated| {
+            got_w.lock().unwrap().push(gated.is_some());
+        });
+        assert!(
+            queue
+                .enqueue(exec("/nonexistent/x"), Some(gated_alert()))
+                .is_none()
+        );
+        assert!(queue.flush(Duration::from_secs(2)));
+        assert_eq!(*got.lock().unwrap(), [true]);
+    }
+
+    #[test]
+    fn a_shed_event_hands_its_gated_alert_back() {
+        let gate = Arc::new(Mutex::new(()));
+        let held = gate.lock().unwrap();
+        let gate_worker = gate.clone();
+        let queue = EnrichQueue::start(Enricher::new(), move |_, _| {
+            let _wait = gate_worker.lock().unwrap();
+        });
+        for _ in 0..=QUEUE_CAP {
+            let _ = queue.enqueue(exec("/nonexistent/x"), None);
+        }
+        let back = queue.enqueue(exec("/nonexistent/x"), Some(gated_alert()));
+        let (_, gated) = back.expect("a full queue must hand the gated alert back");
+        assert_eq!(gated.unverified().technique, "T1204.002");
+        drop(held);
     }
 
     #[test]
@@ -281,12 +351,12 @@ mod tests {
         // Slows the worker down (not to zero — flush must still finish inside its
         // own budget) so a flush racing an in-flight enrichment is exercised, not
         // just the trivially-already-empty case.
-        let queue = EnrichQueue::start(Enricher::new(), move |e| {
+        let queue = EnrichQueue::start(Enricher::new(), move |e, _| {
             std::thread::sleep(std::time::Duration::from_millis(20));
             out_w.lock().unwrap().push(e);
         });
         for _ in 0..5 {
-            queue.enqueue(exec(&path.to_string_lossy()));
+            assert!(queue.enqueue(exec(&path.to_string_lossy()), None).is_none());
         }
 
         assert!(
@@ -307,10 +377,10 @@ mod tests {
         let gate = Arc::new(Mutex::new(()));
         let held = gate.lock().unwrap();
         let gate_worker = gate.clone();
-        let queue = EnrichQueue::start(Enricher::new(), move |_| {
+        let queue = EnrichQueue::start(Enricher::new(), move |_, _| {
             let _wait = gate_worker.lock().unwrap();
         });
-        queue.enqueue(exec("/nonexistent/x"));
+        let _ = queue.enqueue(exec("/nonexistent/x"), None);
 
         let start = Instant::now();
         let flushed = queue.flush(Duration::from_millis(100));

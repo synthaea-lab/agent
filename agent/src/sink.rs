@@ -119,7 +119,11 @@ fn entity_key(meta: &schema::EventMeta) -> verdict::EntityKey {
 const MEMFD_EXEC_TECHNIQUE: &str = "T1620";
 
 /// The escalation decision (#612) as a free function so the YARA scan worker, which
-/// has no `DetectionSink`, raises the same alert as every other engine (#614).
+/// has no `DetectionSink`, raises the same alert as every other engine (#614). A new
+/// verdict snapshot (first sighting, a severity raise, or a recurrence outside the
+/// dedup window — never a silently absorbed duplicate) whose composed severity
+/// warrants it raises one `RESPONSE-ESCALATE` audit alert. Never kills or
+/// quarantines, and works with or without `enable_response`.
 fn escalate_if_warranted(alert_log: &AlertLog, fused: &verdict::Verdict) {
     if !response::should_escalate(fused.severity) {
         return;
@@ -133,6 +137,107 @@ fn escalate_if_warranted(alert_log: &AlertLog, fused: &verdict::Verdict) {
         fused.techniques.join(", ")
     );
     alert_log.record("RESPONSE-ESCALATE", message);
+}
+
+/// Records one finding: fused into the verdict, written to the alert log, and
+/// escalated when the fused severity warrants it, then handed to `persist` (the
+/// durable detection spool, when one is configured). A free function so the
+/// enrichment worker, which has no `DetectionSink`, records the signature-gated
+/// findings the same way (#441).
+///
+/// The worker records a gated finding when it reaches the event, so it can enter
+/// the verdict after findings the capture thread already recorded for later
+/// events of the same entity. Fusion keys on the event's own timestamp and its
+/// dedup check saturates, so a late arrival can at most be absorbed as a
+/// duplicate, never reopen a window; only the order of the evidence list differs.
+fn record_detection(
+    verdict: &Mutex<verdict::VerdictEngine>,
+    alert_log: &AlertLog,
+    finding: Finding<'_>,
+    event: &Event,
+    persist: Option<&dyn Fn(schema::detection::Detection)>,
+) -> Option<verdict::Verdict> {
+    let now_ns = event.meta().timestamp_ns;
+    let detection = schema::detection::Detection {
+        timestamp_ns: now_ns,
+        severity: finding.severity,
+        title: finding.message.to_string(),
+        source: finding.source,
+        score: None,
+        attributions: Vec::new(),
+        techniques: techniques_from(finding.technique),
+        events: vec![event.clone()],
+    };
+    let spooled = persist.map(|_| detection.clone());
+    let result = verdict.lock().unwrap().record(
+        finding.entity.clone(),
+        finding.technique,
+        detection,
+        now_ns,
+    );
+    alert_log.record(finding.technique, finding.message.to_string());
+    if let Some(fused) = &result {
+        escalate_if_warranted(alert_log, fused);
+    }
+    if let (Some(persist), Some(detection)) = (persist, spooled) {
+        persist(detection);
+    }
+    result
+}
+
+/// One engine's finding, as [`record_detection`] takes it.
+struct Finding<'a> {
+    entity: &'a verdict::EntityKey,
+    technique: &'a str,
+    message: &'a str,
+    source: schema::detection::DetectionSource,
+    severity: schema::detection::Severity,
+}
+
+/// [`record_detection`] for one `rules::Alert`.
+fn record_rule_alert(
+    verdict: &Mutex<verdict::VerdictEngine>,
+    alert_log: &AlertLog,
+    event: &Event,
+    alert: &rules::Alert,
+    persist: Option<&dyn Fn(schema::detection::Detection)>,
+) {
+    let finding = Finding {
+        entity: &entity_key(event.meta()),
+        technique: alert.technique,
+        message: &alert.message,
+        source: schema::detection::DetectionSource::Rule {
+            rule_id: alert.technique.to_string(),
+        },
+        severity: alert.severity,
+    };
+    record_detection(verdict, alert_log, finding, event, persist);
+}
+
+/// The enrichment worker's append to the durable detection spool. A failure
+/// loses only the upload copy: the finding is already in the alert log.
+fn spool_on_worker(
+    spool: Option<&Mutex<store::EventSpool>>,
+    detection: schema::detection::Detection,
+) {
+    if let Some(spool) = spool
+        && let Err(e) = crate::upload::persist_detection(spool, detection)
+    {
+        tracing::warn!(error = %e, "detection spool append failed");
+    }
+}
+
+/// What the enrichment learnt about an exec's image. `chain_verified`: the
+/// verdict is Authenticode, whose `Valid` is a chain to a trusted root; macOS
+/// `codesign` and the ES flags call ad-hoc signatures valid too.
+fn image_signature(event: &Event) -> rules::ImageSignature {
+    rules::ImageSignature {
+        verdict: match event {
+            Event::Exec(e) => e.signature,
+            _ => None,
+        },
+        chain_verified: cfg!(windows),
+    }
 }
 
 /// The `case_id` of a correlator finding: `{ppid}:{comm}`, with `@{generation}` of the
@@ -237,10 +342,21 @@ impl DetectionSink {
         let events_log = events_path
             .map(|path| JsonlWriter::open(path).map(Arc::new))
             .transpose()?;
-        let detection_spool_for_worker = detection_spool.clone();
+        let verdict = Arc::new(Mutex::new(verdict::VerdictEngine::new(
+            VERDICT_DEDUP_WINDOW_NS,
+        )));
+        let (gate_verdict, gate_alert_log) = (verdict.clone(), alert_log.clone());
+        let (gate_spool, worker_spool) = (detection_spool.clone(), detection_spool.clone());
         let enrich_queue = EnrichQueue::start_with_detections(
             enrich::Enricher::new(),
-            move |event| {
+            move |event, gated| {
+                if let Some(alert) = gated.and_then(|gated| gated.resolve(image_signature(&event)))
+                {
+                    // Already on the worker: append directly, no trip through the queue.
+                    let persist = |detection| spool_on_worker(gate_spool.as_deref(), detection);
+                    let persist = gate_spool.as_ref().map(|_| &persist as &dyn Fn(_));
+                    record_rule_alert(&gate_verdict, &gate_alert_log, &event, &alert, persist);
+                }
                 if let Some(events_log) = &events_log {
                     events_log.write(&event);
                 }
@@ -252,18 +368,9 @@ impl DetectionSink {
                     tracing::warn!(error = %e, "spool append failed — event stays local-only");
                 }
             },
-            move |detection| {
-                if let Some(spool) = &detection_spool_for_worker
-                    && let Err(e) = crate::upload::persist_detection(spool, detection)
-                {
-                    tracing::warn!(error = %e, "detection spool append failed");
-                }
-            },
+            move |detection| spool_on_worker(worker_spool.as_deref(), detection),
         );
         let response: Arc<Mutex<Option<ResponseHooks>>> = Arc::new(Mutex::new(None));
-        let verdict = Arc::new(Mutex::new(verdict::VerdictEngine::new(
-            VERDICT_DEDUP_WINDOW_NS,
-        )));
         Ok(Self {
             rule_state: Mutex::new(rule_state),
             correlator: Mutex::new(correlator::CorrelationEngine::new()),
@@ -475,49 +582,35 @@ impl DetectionSink {
         severity: schema::detection::Severity,
         event: &Event,
     ) -> Option<verdict::Verdict> {
-        let now_ns = event.meta().timestamp_ns;
-        let detection = schema::detection::Detection {
-            timestamp_ns: now_ns,
-            severity,
-            title: message.to_string(),
+        let finding = Finding {
+            entity,
+            technique,
+            message,
             source,
-            score: None,
-            attributions: Vec::new(),
-            techniques: techniques_from(technique),
-            events: vec![event.clone()],
+            severity,
         };
-        let spooled = self.detection_spool.as_ref().map(|_| detection.clone());
-        let result =
-            self.verdict
-                .lock()
-                .unwrap()
-                .record(entity.clone(), technique, detection, now_ns);
-        self.emit(technique, message);
-        if let Some(fused) = &result {
-            self.maybe_escalate(fused);
-        }
-        if let (Some(spool), Some(detection)) = (&self.detection_spool, spooled)
-            && let Err(detection) = self.enrich_queue.enqueue_detection(detection)
-        {
+        let persist = |detection| self.spool_detection(detection);
+        let persist = self
+            .detection_spool
+            .as_ref()
+            .map(|_| &persist as &dyn Fn(_));
+        record_detection(&self.verdict, &self.alert_log, finding, event, persist)
+    }
+
+    /// Hands a finding to the worker for the durable detection spool.
+    fn spool_detection(&self, detection: schema::detection::Detection) {
+        if let Err(detection) = self.enrich_queue.enqueue_detection(detection) {
             // The queue is full, so the capture thread does this file append
             // itself, which the #126 design otherwise keeps off it. Under sustained
             // overload every finding takes this path; accepted on purpose (a finding
             // is never lost), and only reached once the queue is already shedding.
             tracing::warn!("detection queue full; persisting on capture thread");
-            if let Err(e) = crate::upload::persist_detection(spool, *detection) {
+            if let Some(spool) = &self.detection_spool
+                && let Err(e) = crate::upload::persist_detection(spool, *detection)
+            {
                 tracing::error!(error = %e, "detection spool append failed on fallback");
             }
         }
-        result
-    }
-
-    /// Issue #612: the first response decision to read the fused verdict. A new
-    /// verdict snapshot (first sighting, a severity raise, or a recurrence outside
-    /// the dedup window — never a silently absorbed duplicate) whose composed
-    /// severity warrants it raises one `RESPONSE-ESCALATE` audit alert. Never
-    /// kills or quarantines, and works with or without `enable_response`.
-    fn maybe_escalate(&self, fused: &verdict::Verdict) {
-        escalate_if_warranted(&self.alert_log, fused);
     }
 
     /// Asks for a budgeted YARA scan of the memory of the process behind `event` (#85):
@@ -550,23 +643,16 @@ impl DetectionSink {
     /// correlator-specific `DetectionSource` needed) — the common case for every
     /// `rule_state`/`rules::evaluate_*` call site.
     fn record_rule_alerts(&self, event: &Event, alerts: impl IntoIterator<Item = rules::Alert>) {
-        let meta = event.meta();
-        let entity = entity_key(meta);
+        let persist = |detection| self.spool_detection(detection);
+        let persist = self
+            .detection_spool
+            .as_ref()
+            .map(|_| &persist as &dyn Fn(_));
         for alert in alerts {
             if alert.technique == MEMFD_EXEC_TECHNIQUE {
                 self.request_memory_scan(event);
             }
-            let source = schema::detection::DetectionSource::Rule {
-                rule_id: alert.technique.to_string(),
-            };
-            self.record_and_emit(
-                &entity,
-                alert.technique,
-                &alert.message,
-                source,
-                alert.severity,
-                event,
-            );
+            record_rule_alert(&self.verdict, &self.alert_log, event, &alert, persist);
         }
     }
 
@@ -1246,8 +1332,15 @@ impl EventSink for DetectionSink {
             // consumes them, logging below is the whole treatment.
             _ => {}
         }
-        // Enrichment + the high-volume raw-event write happen off this thread.
-        self.enrich_queue.enqueue(event);
+        // Enrichment + the high-volume raw-event write happen off this thread, and
+        // with them the findings that wait for the image's signature (#441).
+        let gated = match &event {
+            Event::Exec(e) => self.rule_state.lock().unwrap().on_exec_signature_gated(e),
+            _ => None,
+        };
+        if let Some((event, gated)) = self.enrich_queue.enqueue(event, gated) {
+            self.record_rule_alerts(&event, [gated.unverified()]);
+        }
         // Last: only counts as "progress" once everything above has actually
         // completed for this event (#102) — a hang anywhere above (a poisoned
         // lock, a wedged Sigma/YARA call) stops the heartbeat from advancing.
@@ -1300,8 +1393,13 @@ impl EventSink for BaselineSink {
                 // from the baseline (they are exactly what the model must not learn
                 // as normal).
                 let det_alerts = rules::evaluate_exec(e);
-                let state_alerts = self.rule_state.lock().unwrap().on_exec(e);
-                if !det_alerts.is_empty() || !state_alerts.is_empty() {
+                let mut rule_state = self.rule_state.lock().unwrap();
+                // Conservative: a gated finding excludes the cmdline whatever the
+                // signature would have said.
+                let gated = rule_state.on_exec_signature_gated(e);
+                let state_alerts = rule_state.on_exec(e);
+                drop(rule_state);
+                if !det_alerts.is_empty() || !state_alerts.is_empty() || gated.is_some() {
                     return;
                 }
                 self.out.write(&BaselineRecord {
@@ -2731,5 +2829,57 @@ rule reload_content_test_marker {
             !alerts_in(&dir).contains("reload-content test marker rule"),
             "the removed rule must no longer fire"
         );
+    }
+
+    /// A download-provenance mark on `image`, then `image` run inside the
+    /// window, then the enrichment worker drained (#441).
+    fn mark_then_run(sink: &DetectionSink, image: &str) {
+        sink.on_event(Event::FileQuarantine(schema::FileQuarantineEvent {
+            path: image.into(),
+            ..schema::fixtures::file_quarantine()
+        }));
+        sink.on_event(Event::Exec(schema::ExecEvent {
+            image_path: image.into(),
+            ..schema::fixtures::exec()
+        }));
+        assert!(
+            sink.enrich_queue()
+                .flush(std::time::Duration::from_secs(30)),
+            "the enrichment worker must drain"
+        );
+    }
+
+    #[test]
+    fn a_marked_unsigned_file_run_alerts_after_enrichment() {
+        let dir = tmp("gate-unsigned");
+        let image = dir.join("invoice.exe");
+        // A real unsigned PE: this test binary. Bytes that are not a PE verify
+        // as `Unsupported` on Windows, not `Unsigned`.
+        std::fs::copy(std::env::current_exe().unwrap(), &image).unwrap();
+        let sink = sink_in(&dir);
+        mark_then_run(&sink, &image.to_string_lossy());
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("T1204.002"), "{alerts}");
+        #[cfg(windows)]
+        assert!(alerts.contains("[unsigned]"), "{alerts}");
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The issue's done-when: a signed installer run does not alert. notepad.exe
+    /// is catalog-signed, so it verifies `Valid` (the enrich crate's own test).
+    #[cfg(windows)]
+    #[test]
+    fn a_marked_signed_file_run_does_not_alert() {
+        let image = r"C:\Windows\System32\notepad.exe";
+        if !std::path::Path::new(image).exists() {
+            eprintln!("skipping: {image} not present on this host");
+            return;
+        }
+        let dir = tmp("gate-signed");
+        let sink = sink_in(&dir);
+        mark_then_run(&sink, image);
+        let alerts = alerts_in(&dir);
+        assert!(!alerts.contains("T1204.002"), "{alerts}");
     }
 }

@@ -61,9 +61,15 @@ pub(crate) const MEMFD_EXEC_WINDOW_NS: u64 = 5_000_000_000; // 5s
 /// xattr, Windows `Zone.Identifier`) and an exec of the marked file that still
 /// counts as "downloaded, then run" (T1204.002, #365). Wider than
 /// [`DOWNLOAD_EXEC_WINDOW_NS`]: a user opens a download minutes later, not
-/// within a script's seconds. Uncalibrated first cut (2026-09-23) — every
-/// legitimate installer run inside the window alerts too; revisit against
-/// fleet volume.
+/// within a script's seconds.
+///
+/// Justified, not calibrated (#441): there is no fleet telemetry to calibrate
+/// against yet. The window bounds how long a mark stays fresh, not the noise:
+/// the installer noise it used to let through is now removed by the signature
+/// gate on Windows (a chain-verified image does not alert), so widening it
+/// would mostly add unsigned tools run long after download, and narrowing it
+/// would lose the user who reads the mail, then runs the attachment. Ten
+/// minutes stays; macOS, without the gate, keeps the noise.
 pub(crate) const QUARANTINE_EXEC_WINDOW_NS: u64 = 600_000_000_000; // 10 min
 
 // ── Windows constants (ETW rules — T1059/T1218/T1071) ───────────────────────
