@@ -1,8 +1,15 @@
 //! Populate the eBPF raw-syscall dispatcher from the host syscall ABI.
 
+// The dispatcher is only populated when the probes are embedded; without
+// bpf-linker (e.g. the plain `test` CI job) this module is compiled for its
+// unit tests alone, so everything below that only `load_embedded` reaches is
+// gated on `ebpf_embedded` too, or `-D warnings` rejects it as dead code.
+#[cfg(ebpf_embedded)]
 use aya::maps::Array;
+#[cfg(ebpf_embedded)]
 use schema::sensor::SensorError;
 
+#[cfg(ebpf_embedded)]
 use crate::ebpf::err;
 
 /// Handler numbers must match the `raw_sys_enter` match in `ebpf/src/raw.rs`.
@@ -97,6 +104,7 @@ const DISPATCH_ENTRIES: &[(libc::c_long, u32)] = &[
     (97, 43),  // unshare
 ];
 
+#[cfg(ebpf_embedded)]
 pub(crate) fn populate_dispatch(ebpf: &mut aya::Ebpf) -> Result<(), SensorError> {
     let map = ebpf
         .map_mut("SYSCALL_DISPATCH")
@@ -118,12 +126,12 @@ pub(crate) fn populate_dispatch(ebpf: &mut aya::Ebpf) -> Result<(), SensorError>
     Ok(())
 }
 
-#[cfg(target_arch = "x86")]
+#[cfg(all(ebpf_embedded, target_arch = "x86"))]
 fn syscall_id_to_i64(syscall_id: libc::c_long) -> i64 {
     i64::from(syscall_id)
 }
 
-#[cfg(not(target_arch = "x86"))]
+#[cfg(all(ebpf_embedded, not(target_arch = "x86")))]
 fn syscall_id_to_i64(syscall_id: libc::c_long) -> i64 {
     syscall_id
 }
