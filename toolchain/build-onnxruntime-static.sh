@@ -80,6 +80,11 @@ ORT_BUILD_ARGS=()
 if [ "${SYNTHAEA_ALLOW_ORT_ROOT_BUILD:-0}" = "1" ] && [ "$(id -u)" -eq 0 ]; then
   ORT_BUILD_ARGS+=(--allow_running_as_root)
 fi
+# ONNX Runtime builds with -Werror by default. Newer toolchains warn inside their
+# own headers (GCC 15's libstdc++ raises -Wmaybe-uninitialized in bits/unicode.h
+# while compiling onnxruntime_common/logging.cc on Alpine), which is not ours to
+# fix and would stop the whole build. Keep warnings visible, but not fatal.
+ORT_BUILD_ARGS+=(--compile_no_warning_as_error)
 ./build.sh \
   --config Release \
   --update \
