@@ -39,9 +39,14 @@ AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_DAC_READ_SEARCH CAP
 
 # Security hardening
 NoNewPrivileges=true
-PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
+# Events carry host paths and the agent opens them by path (YARA, hashing), so it must see
+# the host's /tmp, /var/tmp and /home (#594, ADR-0014). `PrivateTmp=true` and
+# `ProtectHome=true` hid all three, so payloads dropped there were never scanned or hashed.
+# Homes are read-only; quarantining a file out of them is the opt-in drop-in in
+# docs/operations/response.md.
+PrivateTmp=false
+ProtectHome=read-only
 # /sys/fs/bpf/synthaea is where the sensor pins its tamper map (created by tmpfiles); the
 # leading `-` keeps the unit startable on a host without bpffs.
 ReadWritePaths=/var/lib/synthaea /var/log/synthaea /run/synthaea -/sys/fs/bpf/synthaea
