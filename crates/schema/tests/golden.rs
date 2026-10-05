@@ -10,7 +10,6 @@ use std::net::IpAddr;
 
 use schema::{
     AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, CapSetEvent,
-<<<<<<< HEAD
     ConnectEvent, DefenderEvent, DefenderEventKind, DnsQueryEvent, Event, EventMeta, ExecEvent,
     FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent, FileQuarantineEvent,
     FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent,
