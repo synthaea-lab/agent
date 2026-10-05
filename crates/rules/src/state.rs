@@ -1374,6 +1374,9 @@ impl RuleState {
             .and_then(|mark| mark.origin_url.clone());
         Some(Alert {
             technique: "T1553.005",
+            // At least T1204.002's: the same execution, plus a deliberate step
+            // to take the warning out of the way first.
+            severity: Severity::High,
             message: format!(
                 "pid={} comm={} executes {}, {} after its mark-of-the-web was removed by pid={} comm={} (origin: {})",
                 event.meta.pid,

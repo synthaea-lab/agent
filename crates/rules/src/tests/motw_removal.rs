@@ -59,6 +59,7 @@ fn executing_a_file_after_its_mark_was_removed_alerts() {
     let alerts = state.on_exec(&run(DOWNLOAD, 30_000_000_000));
     assert_eq!(alerts.len(), 1);
     assert_eq!(alerts[0].technique, "T1553.005");
+    assert_eq!(alerts[0].severity, schema::detection::Severity::High);
     let message = &alerts[0].message;
     assert!(
         message.contains("removed by pid=777 comm=powershell.exe"),
