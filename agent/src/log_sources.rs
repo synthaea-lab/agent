@@ -266,7 +266,8 @@ pub(crate) fn spawn(
 
 /// The one place an event leaves this module for the sink. ADR-0018's credential
 /// redaction of an `HttpRequest`'s evidence value is applied here and nowhere else.
-fn deliver(sink: &DetectionSink, event: schema::Event) {
+fn deliver(sink: &DetectionSink, mut event: schema::Event) {
+    crate::redact::redact_event(&mut event);
     sink.on_event(event);
 }
 
@@ -518,6 +519,83 @@ mod tests {
         assert!(
             acc.summarizer.tick(70 * SEC).is_none(),
             "no request, no summary"
+        );
+    }
+
+    /// Runs one access-log line through `poll_source` into a real `DetectionSink` and
+    /// returns what reached the raw event log (`events.jsonl`). This is the path an
+    /// `HttpRequest` takes in the agent, so it pins that [`deliver`] really is the one
+    /// choke point where the evidence is redacted (ADR-0018), not a convention.
+    fn raw_events_after_polling(name: &str, request_target: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("log-sources-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("access.log");
+        // The tailer starts at the end of a log that already exists; this one does not
+        // yet, so the first poll reads it from the top.
+        let mut source = Source {
+            kind: LogSourceKind::AccessCombined,
+            access: Some(Access::new(AccessFormat::Combined, &log)),
+            tailer: Tailer::new(&log, None),
+            position_path: dir.join("position"),
+            last_saved: None,
+            stats: Stats::default(),
+            warned: false,
+        };
+        std::fs::write(
+            &log,
+            format!("{}\n", access_line(request_target, 200, "curl/8")),
+        )
+        .unwrap();
+        let sink = DetectionSink::new(
+            rules::RuleState::new(),
+            &dir.join("alerts.ndjson"),
+            Some(&dir.join("events.jsonl")),
+            None,
+            &dir.join("content"),
+            &dir.join("ml-registry"),
+        )
+        .unwrap();
+
+        poll_source(&mut source, &sink);
+
+        // The raw event log is written by the enrichment worker, not the caller: wait.
+        let events = dir.join("events.jsonl");
+        for _ in 0..200 {
+            let text = std::fs::read_to_string(&events).unwrap_or_default();
+            if text.contains("/a.php") {
+                let _ = std::fs::remove_dir_all(&dir);
+                return text;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("no http_request event in the raw log within 10 s");
+    }
+
+    #[test]
+    fn a_secret_in_the_matched_parameter_never_reaches_the_event_log() {
+        let events = raw_events_after_polling(
+            "secret-param",
+            "/a.php?token=s3cr3t-9f2a%20union%20select%201",
+        );
+        assert!(
+            !events.contains("s3cr3t"),
+            "the credential must not leave the host: {events}"
+        );
+        assert!(events.contains("REDACTED"), "{events}");
+        assert!(
+            events.contains("token"),
+            "the parameter name stays, the finding is still readable: {events}"
+        );
+    }
+
+    #[test]
+    fn the_evidence_of_an_ordinary_parameter_still_reaches_the_event_log() {
+        let events = raw_events_after_polling("plain-param", "/a.php?id=1%20union%20select%201");
+        assert!(events.contains("union"), "the evidence is kept: {events}");
+        assert!(
+            !events.contains("REDACTED"),
+            "nothing to redact on `id`: {events}"
         );
     }
 }

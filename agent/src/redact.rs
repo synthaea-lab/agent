@@ -7,6 +7,9 @@
 //! event, so the spool, `events.jsonl`, the server and the T1204.002 alert
 //! message only ever get the redacted form.
 //!
+//! On Linux the same [`redact_event`] also covers an `HttpRequest`'s evidence value
+//! (#478, ADR-0022 §4) when the matched parameter's name is a secret; see its doc.
+//!
 //! What goes, unconditionally: the userinfo (`user:pass@`), the fragment
 //! (OAuth implicit-flow tokens live there), and the value of every query
 //! parameter whose *name* marks it as a secret ([`is_secret_key`]). Names stay,
@@ -81,14 +84,34 @@ pub(crate) fn redacting(sink: Box<dyn EventSink>) -> Arc<dyn EventSink> {
     Arc::new(RedactingSink(Arc::<dyn EventSink>::from(sink)))
 }
 
-fn redact_event(event: &mut Event) {
-    if let Event::FileQuarantine(quarantine) = event {
-        for url in [&mut quarantine.origin_url, &mut quarantine.referrer_url]
-            .into_iter()
-            .flatten()
-        {
-            *url = redact_url_secrets(url);
+/// The one place an event is redacted: [`RedactingSink`] calls it for the sensors'
+/// sink, and `log_sources::deliver` (the one place an access-log event leaves that
+/// module) calls it for the Linux log sources, so there is a single implementation
+/// (ADR-0018).
+///
+/// An `HttpRequest`'s evidence is the one query parameter a signature matched on,
+/// and its value is what leaves the host (ADR-0022 §4). When that parameter's *name*
+/// marks it as a secret (`?token=…`, `?password=…`), the whole value is replaced by
+/// [`REDACTED`], the name is kept so the finding still reads. A parameter that is not
+/// named like a secret (`?id=1 union select 1`) keeps its value: it is the evidence.
+pub(crate) fn redact_event(event: &mut Event) {
+    match event {
+        Event::FileQuarantine(quarantine) => {
+            for url in [&mut quarantine.origin_url, &mut quarantine.referrer_url]
+                .into_iter()
+                .flatten()
+            {
+                *url = redact_url_secrets(url);
+            }
         }
+        Event::HttpRequest(request) => {
+            if let Some(evidence) = &mut request.evidence
+                && is_secret_key(&evidence.param)
+            {
+                evidence.value = REDACTED.to_owned();
+            }
+        }
+        _ => {}
     }
 }
 
@@ -350,5 +373,82 @@ mod tests {
         });
         sink.on_event(exec.clone());
         assert_eq!(*sink.0.0.lock().unwrap(), [exec]);
+    }
+
+    fn http_request_with(param: &str, value: &str) -> Event {
+        Event::HttpRequest(schema::HttpRequestEvent {
+            path: "/a.php".into(),
+            param_names: vec![param.into()],
+            signature: schema::HttpSignature::SqlInjection,
+            evidence: Some(schema::HttpEvidence {
+                param: param.into(),
+                value: value.into(),
+            }),
+            ..schema::fixtures::http_request()
+        })
+    }
+
+    fn evidence_of(event: &Event) -> &schema::HttpEvidence {
+        let Event::HttpRequest(request) = event else {
+            panic!("expected an HttpRequest, got {event:?}");
+        };
+        request.evidence.as_ref().expect("evidence")
+    }
+
+    #[test]
+    fn an_http_evidence_value_on_a_secret_named_parameter_is_redacted_and_its_name_kept() {
+        for param in ["token", "password", "access_token", "api_key", "PHPSESSID"] {
+            let mut event = http_request_with(param, "s3cr3t' union select 1");
+            redact_event(&mut event);
+            let evidence = evidence_of(&event);
+            assert_eq!(evidence.param, param, "the name stays: it is the finding");
+            assert_eq!(evidence.value, REDACTED, "{param}");
+        }
+    }
+
+    #[test]
+    fn an_http_evidence_value_on_an_ordinary_parameter_is_the_evidence_and_is_kept() {
+        for param in ["id", "cmd", "file", "q"] {
+            let mut event = http_request_with(param, "1 union select 1");
+            redact_event(&mut event);
+            assert_eq!(evidence_of(&event).value, "1 union select 1", "{param}");
+        }
+    }
+
+    #[test]
+    fn redacting_an_http_request_twice_changes_nothing_and_only_touches_the_value() {
+        let original = http_request_with("token", "s3cr3t");
+        let mut once = original.clone();
+        redact_event(&mut once);
+        let mut twice = once.clone();
+        redact_event(&mut twice);
+        assert_eq!(once, twice);
+
+        let (Event::HttpRequest(before), Event::HttpRequest(after)) = (&original, &once) else {
+            unreachable!()
+        };
+        assert_eq!(
+            schema::HttpRequestEvent {
+                evidence: None,
+                ..before.clone()
+            },
+            schema::HttpRequestEvent {
+                evidence: None,
+                ..after.clone()
+            },
+            "nothing but the evidence value changes"
+        );
+    }
+
+    #[test]
+    fn an_http_request_without_evidence_is_left_alone() {
+        let mut event = Event::HttpRequest(schema::HttpRequestEvent {
+            signature: schema::HttpSignature::ScannerUserAgent,
+            scanner: Some("sqlmap".into()),
+            ..schema::fixtures::http_request()
+        });
+        let before = event.clone();
+        redact_event(&mut event);
+        assert_eq!(event, before);
     }
 }
