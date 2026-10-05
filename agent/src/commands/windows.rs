@@ -162,6 +162,8 @@ fn eventlog_config(policy: &policy::EventLogPolicy) -> sensor_windows_eventlog::
         // per-channel toggles through `policy::EventLogPolicy`.
         applocker_blocks_enabled: true,
         task_scheduler_op_enabled: true,
+        defender_enabled: true,
+        wdac_enabled: true,
     }
 }
 
