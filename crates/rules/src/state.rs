@@ -56,6 +56,11 @@ struct RecentBitsDownload {
     /// The job's latest file-added or completion time: the exec window runs
     /// from when the file is actually there.
     timestamp_ns: u64,
+    /// The job that armed this path.
+    job_id: String,
+    /// That job completed: the file is on disk, and no cancellation of
+    /// another job (or a late one of this job) removes it.
+    on_disk: bool,
     client_pid: u32,
     client_comm: String,
     job_title: String,
@@ -520,9 +525,9 @@ impl RuleState {
     /// rule (keyed on one pid) can see it; the job record is what names the
     /// client.
     ///
-    /// One alert per download (`alerted`), case-folded paths. Jobs filtered
-    /// at the sensor (service-account owners, Microsoft update hosts) never
-    /// reach this table.
+    /// One alert per download (`alerted`), case-folded paths. Files fetched
+    /// from Microsoft update hosts are filtered at the sensor and never reach
+    /// this table; the job's owner is not a filter.
     ///
     /// Not covered: notify-command persistence (`bitsadmin /SetNotifyCmdLine`)
     /// is no job state the provider reports, so its set-up shows only as the
@@ -1175,31 +1180,58 @@ impl RuleState {
     /// also how browsers and updaters fetch their components.
     pub fn on_bits_job(&mut self, event: &BitsJobEvent) {
         let key = event.local_path.to_lowercase();
+        let previous = self.recent_bits_downloads.peek(&key);
+        let same_job = previous.is_some_and(|d| d.job_id == event.job_id);
         match event.state {
-            BitsJobState::FileAdded | BitsJobState::Completed => {
-                let alerted = self
-                    .recent_bits_downloads
-                    .get_mut(&key)
-                    .is_some_and(|d| d.alerted && event.state == BitsJobState::Completed);
-                self.recent_bits_downloads.insert(
-                    key,
-                    RecentBitsDownload {
-                        timestamp_ns: event.meta.timestamp_ns,
-                        client_pid: event.meta.pid,
-                        client_comm: event.meta.comm.clone(),
-                        job_title: event.job_title.clone(),
-                        url: event.url.clone(),
-                        alerted,
-                    },
-                );
+            BitsJobState::FileAdded => {
+                // Another job's completed download is what sits at the path:
+                // its window and attribution stand until a completion
+                // replaces the file (#577 review).
+                if previous.is_some_and(|d| d.on_disk && !same_job) {
+                    return;
+                }
+                self.arm_bits_download(key, event, false, false);
             }
-            // A cancelled job deletes its partial file: nothing left to run.
+            BitsJobState::Completed => {
+                // A late completion of the download that already alerted is not
+                // a new download; another job's completion is.
+                let alerted = same_job && previous.is_some_and(|d| d.alerted);
+                self.arm_bits_download(key, event, true, alerted);
+            }
+            // A cancelled job deletes its own partial file: nothing of it left
+            // to run. Only its own, and only a partial one: cancelling job B,
+            // which targeted the path job A already downloaded, leaves A's
+            // payload in place (#577 review).
             BitsJobState::Cancelled => {
-                self.recent_bits_downloads.remove(&key);
+                if same_job && previous.is_some_and(|d| !d.on_disk) {
+                    self.recent_bits_downloads.remove(&key);
+                }
             }
             // BITS retries a failed transfer on its own; keep the entry.
             BitsJobState::TransferError => {}
         }
+    }
+
+    fn arm_bits_download(
+        &mut self,
+        key: String,
+        event: &BitsJobEvent,
+        on_disk: bool,
+        alerted: bool,
+    ) {
+        self.recent_bits_downloads.insert(
+            key,
+            RecentBitsDownload {
+                timestamp_ns: event.meta.timestamp_ns,
+                job_id: event.job_id.clone(),
+                on_disk,
+                client_pid: event.meta.pid,
+                client_comm: event.meta.comm.clone(),
+                job_title: event.job_title.clone(),
+                url: event.url.clone(),
+                alerted,
+            },
+        );
     }
 
     /// To be called for every `FileOpenEvent` in the stream. Reports T1053.005

@@ -751,11 +751,16 @@ pub(crate) fn smb_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
 
 /// BITS jobs (#284, T1197) from `Microsoft-Windows-Bits-Client`: 16403 (file
 /// added), 4 (completed), 5 (cancelled), 61 (transfer error), each turned into
-/// a `BitsJobEvent` by [`crate::bits::BitsJobs`], which also drops Microsoft
-/// update jobs (see [`crate::bits::MICROSOFT_UPDATE_HOSTS`]). The record
+/// `BitsJobEvent`s by [`crate::bits::BitsJobs`], which also drops Microsoft
+/// update files (see [`crate::bits::MICROSOFT_UPDATE_HOSTS`]). The record
 /// header's pid is the BITS service's; the client comes from the record's
 /// `processId` (16403, 5) or, for the service's own records, from the job's
-/// file-added record. Field layout per EID in the [`crate::bits`] module docs.
+/// file-added records. Field layout per EID in the [`crate::bits`] module docs.
+///
+/// Enabled with no keyword or level mask: the provider writes a handful of
+/// records per job and the callback drops every id but these four before
+/// parsing, which keeps it the cheapest provider on the shared session
+/// (#408 counts every provider there).
 pub(crate) fn bits_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
         let eid = record.event_id();
@@ -774,50 +779,42 @@ pub(crate) fn bits_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         let job_id = format_guid(&job_guid);
         let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
         let bytes_transferred: Option<u64> = parser.try_parse("bytesTransferred").ok();
-        let event = match eid {
-            16403 => {
-                let client = client_meta(&parser, &state, timestamp_ns);
-                let job_title: String = parser.try_parse("jobTitle").unwrap_or_default();
-                let url: String = parser.try_parse("RemoteName").unwrap_or_default();
-                let local_name: String = parser.try_parse("LocalName").unwrap_or_default();
-                let local_path = state.normalize_path(&local_name);
-                let mut jobs = state.bits.lock().unwrap();
-                let (filtered, evicted) = (jobs.filtered(), jobs.evicted());
-                let event = jobs.file_added(client, job_id, job_title, url, local_path);
-                if jobs.filtered() > filtered {
-                    tracing::debug!(
-                        filtered = jobs.filtered(),
-                        "BITS job from a Microsoft update host dropped"
-                    );
-                }
-                if jobs.evicted() > evicted {
-                    tracing::debug!(
-                        evicted = jobs.evicted(),
-                        "BITS job table full, oldest job forgotten"
-                    );
-                }
-                event
-            }
+        let events = match eid {
+            16403 => bits_file_added(&parser, &state, job_id, timestamp_ns)
+                .into_iter()
+                .collect(),
             4 => state
                 .bits
                 .lock()
                 .unwrap()
                 .completed(&job_id, timestamp_ns, bytes_transferred),
-            5 => {
-                let canceller = client_meta(&parser, &state, timestamp_ns);
-                state.bits.lock().unwrap().cancelled(&job_id, canceller)
-            }
+            5 => match client_meta(&parser, &state, timestamp_ns) {
+                Some(canceller) => state.bits.lock().unwrap().cancelled(&job_id, &canceller),
+                None => {
+                    state.bits.lock().unwrap().record_missing_client();
+                    Vec::new()
+                }
+            },
             _ => {
                 let hresult: u32 = parser.try_parse("hr").unwrap_or(0);
-                state.bits.lock().unwrap().transfer_error(
-                    &job_id,
-                    timestamp_ns,
-                    bytes_transferred,
-                    hresult,
-                )
+                let url: Option<String> = parser.try_parse("url").ok();
+                state
+                    .bits
+                    .lock()
+                    .unwrap()
+                    .transfer_error(
+                        &job_id,
+                        url.as_deref(),
+                        timestamp_ns,
+                        bytes_transferred,
+                        hresult,
+                    )
+                    .into_iter()
+                    .collect()
             }
         };
-        if let Some(event) = event {
+        // The lock is released: the sink may take its own.
+        for event in events {
             sink.on_event(Event::BitsJob(event));
         }
     };
@@ -827,11 +824,57 @@ pub(crate) fn bits_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         .build()
 }
 
-/// The client a BITS record names in its `processId` field.
-fn client_meta(parser: &Parser<'_, '_>, state: &SharedState, timestamp_ns: u64) -> EventMeta {
-    let pid: u32 = parser.try_parse("processId").unwrap_or(0);
+/// EID 16403 through the job table, with its drops logged at debug and
+/// counted in the table.
+fn bits_file_added(
+    parser: &Parser<'_, '_>,
+    state: &SharedState,
+    job_id: String,
+    timestamp_ns: u64,
+) -> Option<schema::BitsJobEvent> {
+    let Some(client) = client_meta(parser, state, timestamp_ns) else {
+        let mut jobs = state.bits.lock().unwrap();
+        jobs.record_missing_client();
+        tracing::debug!(
+            missing_client = jobs.missing_client(),
+            "BITS file-added record without a client pid dropped"
+        );
+        return None;
+    };
+    let job_title: String = parser.try_parse("jobTitle").unwrap_or_default();
+    let url: String = parser.try_parse("RemoteName").unwrap_or_default();
+    let local_name: String = parser.try_parse("LocalName").unwrap_or_default();
+    let local_path = state.normalize_path(&crate::bits::local_path_for_join(&local_name));
+    let mut jobs = state.bits.lock().unwrap();
+    let (filtered, evicted) = (jobs.filtered(), jobs.evicted());
+    let event = jobs.file_added(client, job_id, job_title, url, local_path);
+    if jobs.filtered() > filtered {
+        tracing::debug!(
+            filtered = jobs.filtered(),
+            "BITS file from a Microsoft update host dropped"
+        );
+    }
+    if jobs.evicted() > evicted {
+        tracing::debug!(
+            evicted = jobs.evicted(),
+            "BITS job table full, oldest job or file forgotten"
+        );
+    }
+    event
+}
+
+/// The client a record names in `processId`; `None` when it names none, which
+/// the caller drops and counts rather than forwarding pid 0 with no name. A
+/// client that already exited (a fire-and-forget `Start-BitsTransfer`) keeps
+/// its pid with an empty name.
+fn client_meta(
+    parser: &Parser<'_, '_>,
+    state: &SharedState,
+    timestamp_ns: u64,
+) -> Option<EventMeta> {
+    let pid: u32 = parser.try_parse("processId").ok().filter(|&pid| pid != 0)?;
     let comm = state.comm_for(pid).unwrap_or_default();
-    meta(pid, 0, comm, timestamp_ns)
+    Some(meta(pid, 0, comm, timestamp_ns))
 }
 
 /// `{c40080ab-6fe4-418a-8ba6-c271c5298f18}`: the braced, lowercase form the

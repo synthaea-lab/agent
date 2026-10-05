@@ -146,3 +146,49 @@ fn another_file_does_not_join() {
             .is_empty()
     );
 }
+
+fn job_b(state: BitsJobState, timestamp_ns: u64) -> BitsJobEvent {
+    BitsJobEvent {
+        job_id: "{0000000b-0000-0000-0000-000000000000}".into(),
+        url: "https://example.test/decoy".into(),
+        ..job(state, timestamp_ns)
+    }
+}
+
+#[test]
+fn cancelling_another_job_for_the_same_path_keeps_the_payload_armed() {
+    // #577 review: job A downloads the payload, job B targets the same path
+    // and is cancelled. BITS only discards B's temporary file.
+    let mut state = RuleState::new();
+    state.on_bits_job(&job(BitsJobState::FileAdded, 0));
+    state.on_bits_job(&job(BitsJobState::Completed, 1));
+    state.on_bits_job(&job_b(BitsJobState::FileAdded, 2));
+    state.on_bits_job(&job_b(BitsJobState::Cancelled, 3));
+    let alerts = state.on_exec(&run(PAYLOAD, 4));
+    assert_eq!(alerts.len(), 1);
+    assert!(
+        alerts[0]
+            .message
+            .contains("url: https://example.test/payload.exe"),
+        "the completed download keeps its attribution: {}",
+        alerts[0].message
+    );
+}
+
+#[test]
+fn cancelling_a_partial_download_of_another_pending_job_keeps_the_newer_one() {
+    let mut state = RuleState::new();
+    state.on_bits_job(&job(BitsJobState::FileAdded, 0));
+    state.on_bits_job(&job_b(BitsJobState::FileAdded, 1));
+    state.on_bits_job(&job(BitsJobState::Cancelled, 2));
+    assert_eq!(state.on_exec(&run(PAYLOAD, 3)).len(), 1);
+}
+
+#[test]
+fn another_jobs_completion_over_an_alerted_download_alerts_again() {
+    let mut state = RuleState::new();
+    state.on_bits_job(&job(BitsJobState::Completed, 0));
+    assert_eq!(state.on_exec(&run(PAYLOAD, 1)).len(), 1);
+    state.on_bits_job(&job_b(BitsJobState::Completed, 2));
+    assert_eq!(state.on_exec(&run(PAYLOAD, 3)).len(), 1);
+}

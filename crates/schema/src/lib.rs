@@ -1227,9 +1227,10 @@ pub enum BitsJobState {
 /// file (or cancelled the job). For a completion or a transfer error, which
 /// BITS reports from the service, it is the client that added the job's file.
 ///
-/// One event per job state the sensor forwards, all sharing `job_id`. Jobs
-/// owned by service accounts or fetching from Microsoft update hosts are
-/// filtered at the sensor, see `sensor-windows`.
+/// One event per job state the sensor forwards, all sharing `job_id`; a
+/// completion or a cancellation is one event per file of the job. Files
+/// fetched from Microsoft update hosts are filtered at the sensor, see
+/// `sensor-windows`; the job's owner is not a filter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BitsJobEvent {
     pub meta: EventMeta,
@@ -1239,11 +1240,12 @@ pub struct BitsJobEvent {
     /// (`bitsadmin /transfer <name>`, `Start-BitsTransfer -DisplayName`).
     pub job_title: String,
     pub state: BitsJobState,
-    /// The remote URL of the job's file (its latest one, for a multi-file job).
+    /// The remote URL of the file this event is about.
     pub url: String,
     /// Where BITS writes that file.
     pub local_path: String,
-    /// Bytes transferred so far, when the record reports it.
+    /// Bytes the job transferred so far, when the record reports it: a job
+    /// total, repeated on each file's event of a multi-file job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes_transferred: Option<u64>,
     /// The failing HRESULT of a [`BitsJobState::TransferError`].

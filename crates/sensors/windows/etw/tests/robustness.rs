@@ -11,7 +11,7 @@
 //! lone surrogates, missing `=`/`]`, huge values), all covered explicitly.
 
 use sensor_windows::{
-    bits::{is_microsoft_update_url, url_host},
+    bits::{is_microsoft_update_url, local_path_for_join, url_host},
     zone_identifier::{parse, stream_host_path},
 };
 
@@ -173,6 +173,7 @@ fn bits_url_checks_never_panic_on_arbitrary_urls() {
         "-",
         "%2e",
         "microsoft.com",
+        "UNC",
         "a",
         "0",
         "é",
@@ -189,5 +190,7 @@ fn bits_url_checks_never_panic_on_arbitrary_urls() {
             .collect();
         let _ = url_host(&url);
         let _ = is_microsoft_update_url(&url);
+        // `LocalName` is the client's choice too.
+        let _ = local_path_for_join(&url);
     }
 }
