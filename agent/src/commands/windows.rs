@@ -164,6 +164,7 @@ fn eventlog_config(policy: &policy::EventLogPolicy) -> sensor_windows_eventlog::
         task_scheduler_op_enabled: true,
         defender_enabled: true,
         wdac_enabled: true,
+        terminal_sessions_enabled: true,
     }
 }
 

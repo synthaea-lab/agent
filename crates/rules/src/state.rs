@@ -10,7 +10,8 @@ use std::{
 use schema::{
     AuthEvent, AuthOutcome, ConnectEvent, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
     FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRenameEvent, FileWriteEvent,
-    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, User, detection::Severity,
+    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, SessionEvent, User,
+    detection::Severity,
 };
 use store::BoundedMap;
 
@@ -32,6 +33,7 @@ use crate::{
         SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
     },
     has_write_intent,
+    session::SessionHijack,
     sliding::{FlowPortDedup, SlidingCounter, SlidingDistinct, SlidingSum},
 };
 
@@ -189,6 +191,9 @@ pub struct RuleState {
     /// seen on both Security 4698 and TaskScheduler/Operational 106 alerts once
     /// (#422). LRU-bounded like the counters.
     task_registrations: BoundedMap<String, ReportedTaskRegistration>,
+    /// Disconnected sessions and the client each was left from, for the
+    /// T1563.002 reconnect check (#285).
+    session_hijack: SessionHijack,
     /// The agent's own pid, for [`Self::check_self_spawn`]'s narrow exclusion of
     /// its own known children (issue #403). `None` until [`Self::seed_own_pid`] is
     /// called — `sensor-*` crates stay `schema`-only (`tools/check-deps.py`), so
@@ -267,6 +272,7 @@ impl RuleState {
             write_volume: BoundedMap::new(COUNTER_CAP),
             rename_count: BoundedMap::new(COUNTER_CAP),
             task_registrations: BoundedMap::new(COUNTER_CAP),
+            session_hijack: SessionHijack::new(),
             own_pid: None,
             ld_trust_extra: Vec::new(),
             recent_memfd_creates: BoundedMap::new(PID_COMM_CAP),
@@ -939,6 +945,13 @@ impl RuleState {
             }];
         }
         Vec::new()
+    }
+
+    /// To be called for every `SessionEvent` in the stream (Windows Terminal
+    /// Services, #285): a disconnected session reconnected from another
+    /// client, T1563.002 (see the `session` module).
+    pub fn on_session(&mut self, event: &SessionEvent) -> Vec<Alert> {
+        self.session_hijack.on_session(event).into_iter().collect()
     }
 
     /// To be called for every `MemfdCreateEvent` in the stream (Linux, issue

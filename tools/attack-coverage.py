@@ -150,6 +150,7 @@ TECHNIQUE_TACTIC = {
     "T1611": "Privilege Escalation",
     "T1620": "Defense Evasion",
     "T1021.002": "Lateral Movement",
+    "T1563.002": "Lateral Movement",
 }
 
 UNMAPPED_TACTIC = "Unmapped — add to TECHNIQUE_TACTIC"

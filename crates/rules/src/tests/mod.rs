@@ -291,5 +291,6 @@ mod coverage;
 mod linux;
 mod persistence;
 mod quarantine;
+mod session;
 mod tamper;
 mod windows;
