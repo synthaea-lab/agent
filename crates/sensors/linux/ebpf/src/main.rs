@@ -8,7 +8,7 @@ use aya_ebpf::{
         bpf_probe_read_user, bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
     },
     macros::{lsm, map, tracepoint, uprobe, uretprobe},
-    maps::{Array, HashMap, PerCpuArray, RingBuf},
+    maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
     programs::{LsmContext, ProbeContext, RetProbeContext, TracePointContext},
 };
 use aya_log_ebpf::{info, warn};
@@ -2149,23 +2149,37 @@ static UDP_RECV_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static UDP_RECV_SCRATCH: PerCpuArray<UdpRecvEvent> = PerCpuArray::with_max_entries(1, 0);
 
-/// `addr` pointer stashed at `sys_enter_recvfrom`, keyed by `pid_tgid`, consumed at
-/// `sys_exit_recvfrom`. Not part of `sensor-linux-wire`'s ABI. A thread blocked
-/// forever in `recvfrom` leaks its entry, bounded by `max_entries` (same accepted
-/// risk as `ACCEPT_ARGS`).
-#[map]
-static RECVFROM_ARGS: HashMap<u64, u64> = HashMap::with_max_entries(1024, 0);
+/// Stashed at `sys_enter_recvfrom`, consumed at `sys_exit_recvfrom`, keyed by
+/// `pid_tgid`. The kernel writes the sender's address and `*addr_len` only on
+/// return, and only for sockets that have a source address: a connected TCP
+/// socket leaves both untouched, so the exit probe must check `*addr_len` first.
+/// Not part of `sensor-linux-wire`'s ABI.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RecvfromArgs {
+    addr_ptr: u64,
+    addr_len_ptr: u64,
+}
 
-/// Offset of `addr` in `syscalls:sys_enter_recvfrom` (x86_64/aarch64): `fd`(16),
-/// `ubuf`(24), `size`(32), `flags`(40), `addr`(48), `addr_len`(56) — the same layout
-/// `sys_enter_sendto` reports, so it shares that probe's offset. Verified on
-/// 2026-10-05 on Alpine (kernel 6.18.50-0-virt, x86_64) via
-/// `/sys/kernel/tracing/events/syscalls/sys_enter_recvfrom/format`.
+/// LRU rather than a plain hash: a thread that blocks in `recvfrom` forever leaks
+/// its entry, and a full plain map would silently refuse every later insert
+/// host-wide. The LRU evicts the stalest stash instead.
+#[map]
+static RECVFROM_ARGS: LruHashMap<u64, RecvfromArgs> = LruHashMap::with_max_entries(1024, 0);
+
+/// Offsets of `addr`(48) and `addr_len`(56) in `syscalls:sys_enter_recvfrom`
+/// (x86_64/aarch64): `fd`(16), `ubuf`(24), `size`(32), `flags`(40), the same layout
+/// `sys_enter_sendto` reports. Verified on 2026-10-05 on Alpine (kernel 6.18.50-0-virt,
+/// x86_64) via `/sys/kernel/tracing/events/syscalls/sys_enter_recvfrom/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const RECVFROM_ADDR_PTR_OFFSET: usize = 48;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const RECVFROM_ADDR_LEN_PTR_OFFSET: usize = 56;
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
 #[cfg(bpf_target_arch = "x86")]
 const RECVFROM_ADDR_PTR_OFFSET: usize = 28;
+#[cfg(bpf_target_arch = "x86")]
+const RECVFROM_ADDR_LEN_PTR_OFFSET: usize = 32;
 
 #[tracepoint]
 pub fn sys_enter_recvfrom(ctx: TracePointContext) -> u32 {
@@ -2178,15 +2192,31 @@ pub fn sys_enter_recvfrom(ctx: TracePointContext) -> u32 {
 fn stash_recvfrom_addr(ctx: &TracePointContext) -> Result<u32, u32> {
     #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     let addr_ptr: u64 = unsafe { ctx.read_at(RECVFROM_ADDR_PTR_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let addr_len_ptr: u64 = unsafe {
+        ctx.read_at(RECVFROM_ADDR_LEN_PTR_OFFSET)
+            .map_err(|_| 1u32)?
+    };
     #[cfg(bpf_target_arch = "x86")]
     let addr_ptr: u64 = unsafe {
         ctx.read_at::<u32>(RECVFROM_ADDR_PTR_OFFSET)
             .map_err(|_| 1u32)? as u64
     };
+    #[cfg(bpf_target_arch = "x86")]
+    let addr_len_ptr: u64 = unsafe {
+        ctx.read_at::<u32>(RECVFROM_ADDR_LEN_PTR_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
 
+    let pid_tgid = bpf_get_current_pid_tgid();
     if addr_ptr != 0 {
-        let pid_tgid = bpf_get_current_pid_tgid();
-        let _ = RECVFROM_ARGS.insert(&pid_tgid, &addr_ptr, 0);
+        let args = RecvfromArgs {
+            addr_ptr,
+            addr_len_ptr,
+        };
+        let _ = RECVFROM_ARGS.insert(&pid_tgid, &args, 0);
+    } else {
+        let _ = RECVFROM_ARGS.remove(&pid_tgid);
     }
 
     Ok(0)
@@ -2200,8 +2230,10 @@ pub fn sys_exit_recvfrom(ctx: TracePointContext) -> u32 {
     }
 }
 
-/// No-ops when the matching enter wasn't tracked, the call failed (`ret < 0`), or
-/// the sender's address family isn't `AF_INET`/`AF_INET6`.
+/// No-ops when the matching enter wasn't tracked, the call failed (`ret < 0`), the
+/// kernel wrote no source address (`*addr_len == 0`, e.g. a connected TCP socket,
+/// whose `addr` buffer still holds whatever the caller put there), or the sender's
+/// address family isn't `AF_INET`/`AF_INET6`.
 fn try_sys_exit_recvfrom(ctx: TracePointContext) -> Result<u32, u32> {
     #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     let ret: i64 = unsafe { ctx.read_at(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? };
@@ -2209,8 +2241,8 @@ fn try_sys_exit_recvfrom(ctx: TracePointContext) -> Result<u32, u32> {
     let ret: i64 = unsafe { ctx.read_at::<i32>(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? as i64 };
 
     let pid_tgid = bpf_get_current_pid_tgid();
-    let addr_ptr = match unsafe { RECVFROM_ARGS.get(&pid_tgid) } {
-        Some(p) => *p,
+    let args = match unsafe { RECVFROM_ARGS.get(&pid_tgid) } {
+        Some(a) => *a,
         None => return Ok(0),
     };
     let _ = RECVFROM_ARGS.remove(&pid_tgid);
@@ -2218,6 +2250,15 @@ fn try_sys_exit_recvfrom(ctx: TracePointContext) -> Result<u32, u32> {
     if ret < 0 {
         return Ok(0);
     }
+
+    let addr_len: u32 = match unsafe { bpf_probe_read_user(args.addr_len_ptr as *const u32) } {
+        Ok(len) => len,
+        Err(_) => return Ok(0),
+    };
+    if addr_len == 0 {
+        return Ok(0);
+    }
+    let addr_ptr = args.addr_ptr;
 
     let family: u16 = match unsafe { bpf_probe_read_user(addr_ptr as *const u16) } {
         Ok(f) => f,
