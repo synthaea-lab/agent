@@ -11,8 +11,8 @@ use schema::{
     FileRenameEvent, FileSetxattrEvent, FileWriteEvent, IdentityChangeEvent, IdentityChangeKind,
     KernelModuleAction, KernelModuleEvent, MemfdCreateEvent, MountEvent, NamespaceEvent,
     NamespaceSyscall, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
-    SignalEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, UdpRecvEvent,
-    UdpSendEvent, User,
+    SignalEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, UdpRecvEvent, UdpSendEvent,
+    User,
 };
 use sensor_linux_wire as wire;
 

@@ -18,8 +18,8 @@ use sensor_linux_wire::{
     FileWriteEvent, GetAddrInfoEvent, IdentityChangeEvent, KernelModuleEvent, LineageEntry,
     MAX_TLS_CAPTURE, MemfdCreateEvent, MountEvent, NamespaceEvent, PrctlEvent, ProcessVmReadEvent,
     ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, SignalEvent, SocketAcceptEvent,
-    SocketBindEvent, SocketListenEvent, TASK_COMM_LEN, TlsCaptureEvent, UdpRecvEvent,
-    UdpSendEvent, is_filtered_path,
+    SocketBindEvent, SocketListenEvent, TASK_COMM_LEN, TlsCaptureEvent, UdpRecvEvent, UdpSendEvent,
+    is_filtered_path,
 };
 
 // This probe reads NO `task_struct`/`mm_struct` frozen offset: parent lineage (ppid +
