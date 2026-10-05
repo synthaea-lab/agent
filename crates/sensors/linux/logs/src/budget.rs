@@ -15,17 +15,25 @@ use crate::WINDOW_SECS;
 /// attack shows the pattern within the first few; the rest is volume.
 pub const PER_SIGNATURE_PER_WINDOW: u32 = 30;
 
-/// One budget slot per [`HttpSignature`] variant.
-const SLOTS: usize = 4;
+/// One counter per [`HttpSignature`], reached through an exhaustive `match` and never
+/// by number: a new variant is a compile error here, not a silent share of another
+/// signature's budget, and there is no index that could go out of range on a log line.
+#[derive(Debug, Default, Clone, Copy)]
+struct PerSignature {
+    path_traversal: u32,
+    sql_injection: u32,
+    scanner_user_agent: u32,
+    webshell_like: u32,
+}
 
-/// The slot of a signature. An exhaustive `match`, on purpose: a new variant is a
-/// compile error here, not a silent share of another signature's budget.
-fn slot(signature: HttpSignature) -> usize {
-    match signature {
-        HttpSignature::PathTraversal => 0,
-        HttpSignature::SqlInjection => 1,
-        HttpSignature::ScannerUserAgent => 2,
-        HttpSignature::WebshellLike => 3,
+impl PerSignature {
+    fn of(&mut self, signature: HttpSignature) -> &mut u32 {
+        match signature {
+            HttpSignature::PathTraversal => &mut self.path_traversal,
+            HttpSignature::SqlInjection => &mut self.sql_injection,
+            HttpSignature::ScannerUserAgent => &mut self.scanner_user_agent,
+            HttpSignature::WebshellLike => &mut self.webshell_like,
+        }
     }
 }
 
@@ -53,8 +61,8 @@ impl Dropped {
 #[derive(Debug, Default)]
 pub struct SignatureBudget {
     window_start_ns: Option<u64>,
-    emitted: [u32; SLOTS],
-    dropped: [u32; SLOTS],
+    emitted: PerSignature,
+    dropped: PerSignature,
 }
 
 impl SignatureBudget {
@@ -67,12 +75,13 @@ impl SignatureBudget {
     /// A refusal is counted.
     pub fn allow(&mut self, signature: HttpSignature, now_ns: u64) -> bool {
         self.window_start_ns.get_or_insert(now_ns);
-        let i = slot(signature);
-        if self.emitted[i] < PER_SIGNATURE_PER_WINDOW {
-            self.emitted[i] += 1;
+        let emitted = self.emitted.of(signature);
+        if *emitted < PER_SIGNATURE_PER_WINDOW {
+            *emitted += 1;
             true
         } else {
-            self.dropped[i] = self.dropped[i].saturating_add(1);
+            let dropped = self.dropped.of(signature);
+            *dropped = dropped.saturating_add(1);
             false
         }
     }
@@ -86,14 +95,14 @@ impl SignatureBudget {
             return None;
         }
         let dropped = Dropped {
-            path_traversal: self.dropped[slot(HttpSignature::PathTraversal)],
-            sql_injection: self.dropped[slot(HttpSignature::SqlInjection)],
-            scanner_user_agent: self.dropped[slot(HttpSignature::ScannerUserAgent)],
-            webshell_like: self.dropped[slot(HttpSignature::WebshellLike)],
+            path_traversal: self.dropped.path_traversal,
+            sql_injection: self.dropped.sql_injection,
+            scanner_user_agent: self.dropped.scanner_user_agent,
+            webshell_like: self.dropped.webshell_like,
         };
         self.window_start_ns = None;
-        self.emitted = [0; SLOTS];
-        self.dropped = [0; SLOTS];
+        self.emitted = PerSignature::default();
+        self.dropped = PerSignature::default();
         (dropped.total() > 0).then_some(dropped)
     }
 }
@@ -148,21 +157,32 @@ mod tests {
     }
 
     #[test]
-    fn every_signature_has_its_own_slot_inside_the_arrays() {
-        // `slot` is an exhaustive match, so a new variant stops compiling there; this
-        // pins that the slot numbers it returns stay distinct and within `SLOTS`.
-        let mut taken = [false; SLOTS];
-        for signature in [
+    fn every_signature_has_its_own_allowance_and_its_own_shed_count() {
+        // `PerSignature::of` is an exhaustive match, so a new variant stops compiling
+        // there; this pins that each of today's four counts on its own.
+        let all = [
             HttpSignature::PathTraversal,
             HttpSignature::SqlInjection,
             HttpSignature::ScannerUserAgent,
             HttpSignature::WebshellLike,
-        ] {
-            let i = slot(signature);
-            assert!(i < SLOTS, "{signature:?} has slot {i}, past the arrays");
-            assert!(!taken[i], "{signature:?} shares slot {i}");
-            taken[i] = true;
+        ];
+        let mut b = SignatureBudget::new();
+        for (n, signature) in all.into_iter().enumerate() {
+            let extra = u32::try_from(n).unwrap() + 1;
+            for _ in 0..PER_SIGNATURE_PER_WINDOW + extra {
+                b.allow(signature, SEC);
+            }
         }
-        assert!(taken.iter().all(|t| *t), "a slot nobody uses");
+        let d = b.tick(61 * SEC).expect("every signature went over");
+        assert_eq!(
+            (
+                d.path_traversal,
+                d.sql_injection,
+                d.scanner_user_agent,
+                d.webshell_like
+            ),
+            (1, 2, 3, 4),
+            "each signature sheds only what it went over by"
+        );
     }
 }
