@@ -10,6 +10,7 @@ use std::net::IpAddr;
 
 use schema::{
     AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, CapSetEvent,
+<<<<<<< HEAD
     ConnectEvent, DefenderEvent, DefenderEventKind, DnsQueryEvent, Event, EventMeta, ExecEvent,
     FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent, FileQuarantineEvent,
     FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent,
@@ -20,7 +21,7 @@ use schema::{
     ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent,
     ScriptBlockEvent, ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
     SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
-    UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
+    UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -699,6 +700,28 @@ fn udp_send_golden() {
             size: 120,
         }),
         "udp_send",
+    );
+}
+
+#[test]
+fn udp_recv_golden() {
+    assert_golden(
+        &Event::UdpRecv(UdpRecvEvent {
+            meta: EventMeta {
+                pid: 4242,
+                ppid: 1337,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_090_000_000_000,
+                comm: "dnsd".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            peer_addr: "203.0.113.42".parse::<IpAddr>().unwrap(),
+            peer_port: 53,
+            size: 120,
+        }),
+        "udp_recv",
     );
 }
 
@@ -1971,6 +1994,12 @@ fn meta_accessor_covers_all_variants() {
             meta: meta.clone(),
             daddr: "10.0.0.1".parse::<IpAddr>().unwrap(),
             dport: 53,
+            size: 0,
+        }),
+        Event::UdpRecv(UdpRecvEvent {
+            meta: meta.clone(),
+            peer_addr: "10.0.0.1".parse::<IpAddr>().unwrap(),
+            peer_port: 53,
             size: 0,
         }),
         Event::Auth(AuthEvent {
