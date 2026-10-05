@@ -26,9 +26,10 @@ use crate::{
         PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES, QUARANTINE_EXEC_WINDOW_NS,
         RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD,
         RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
-        SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_THRESHOLD,
-        SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STANDARD_PORTS,
-        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
+        SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS,
+        SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS,
+        SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN,
+        SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
     },
     has_write_intent,
     sliding::{FlowPortDedup, SlidingCounter, SlidingDistinct, SlidingSum},
@@ -511,6 +512,16 @@ impl RuleState {
     /// `SELF_SPAWN_PARENT_EXCLUSIONS`. The agent's own children (issue #403,
     /// 2026-09-23) — excluded via `AGENT_CHILD_EXCLUSIONS`, gated on
     /// [`Self::seed_own_pid`].
+    ///
+    /// Three same-name children of one parent in 30s is routine when both sides
+    /// are system images (a service host, an interactive shell running `schtasks`
+    /// or the operator's `cli`; #432), so that pair needs
+    /// [`SELF_SPAWN_TRUSTED_THRESHOLD`]. Either side outside a trusted path, or
+    /// unknown, keeps [`SELF_SPAWN_THRESHOLD`]: a dropped payload respawning
+    /// itself, or dropping a system `LOLBin` in a loop, is exactly the signal.
+    /// So does a script-host child ([`SELF_SPAWN_SCRIPT_HOSTS`]), whatever the
+    /// paths: a system shell looping `powershell.exe` is how a malicious script
+    /// respawns itself without dropping a binary.
     fn check_self_spawn(&mut self, event: &ExecEvent) -> Option<Alert> {
         if !matches!(event.meta.user, User::Windows { .. }) {
             return None;
@@ -561,7 +572,18 @@ impl RuleState {
             .self_spawn
             .get_or_insert_with(key, SlidingCounter::default);
         let count = entry.record(ts, SELF_SPAWN_WINDOW_NS);
-        if count >= SELF_SPAWN_THRESHOLD && entry.try_alert(ts, SELF_SPAWN_WINDOW_NS) {
+        let script_host = SELF_SPAWN_SCRIPT_HOSTS
+            .iter()
+            .any(|&h| comm.eq_ignore_ascii_case(h));
+        let threshold = if !script_host
+            && is_known_trusted(Some(&event.image_path))
+            && is_known_trusted(event.parent_image_path.as_deref())
+        {
+            SELF_SPAWN_TRUSTED_THRESHOLD
+        } else {
+            SELF_SPAWN_THRESHOLD
+        };
+        if count >= threshold && entry.try_alert(ts, SELF_SPAWN_WINDOW_NS) {
             return Some(Alert {
                 technique: "T1059",
                 severity: Severity::Medium,
@@ -1786,6 +1808,13 @@ fn written_file_is(path: &str, comm: &str) -> bool {
     } else {
         path.rsplit('/').next() == Some(comm)
     }
+}
+
+/// A path the sensor actually reported, at a trusted system location. Unlike
+/// [`policy::name_exclusion_applies`], an unknown path is not trusted: here trust
+/// raises an alert threshold, so the absence of evidence must not buy it.
+fn is_known_trusted(path: Option<&str>) -> bool {
+    path.is_some_and(|p| !p.is_empty() && policy::name_exclusion_applies(Some(p)))
 }
 
 fn format_delta(delta_ns: u64) -> String {

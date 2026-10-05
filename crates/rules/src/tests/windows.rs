@@ -286,6 +286,127 @@ fn self_spawn_outside_window_resets_counter() {
     assert!(alerts.is_empty());
 }
 
+// ── SELF-SPAWN on system images (#432) ───────────────────────────────────
+
+/// `n` spawns of `child` by pid 1, one second apart, with both image paths set.
+fn spawn_burst(child_image: &str, parent_image: Option<&str>, n: u32) -> Vec<crate::Alert> {
+    let mut state = RuleState::new();
+    let comm = child_image.rsplit('\\').next().unwrap_or(child_image);
+    let mut alerts = Vec::new();
+    for i in 0..n {
+        let mut e = exec_event_win(500 + i, 1, comm, comm, u64::from(i) * 1_000_000_000);
+        e.image_path = child_image.to_string();
+        e.parent_image_path = parent_image.map(str::to_string);
+        alerts.extend(state.on_exec(&e));
+    }
+    alerts
+        .into_iter()
+        .filter(|a| a.technique == "T1059")
+        .collect()
+}
+
+const SYSTEM_POWERSHELL: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+
+#[test]
+fn three_system_children_of_a_system_parent_do_not_alert() {
+    // #432: an operator running `schtasks` three times from PowerShell, and
+    // svchost → taskhostw.exe, both read as self-spawn at the base threshold.
+    assert!(
+        spawn_burst(
+            r"C:\Windows\System32\schtasks.exe",
+            Some(SYSTEM_POWERSHELL),
+            3
+        )
+        .is_empty()
+    );
+    assert!(
+        spawn_burst(
+            r"C:\Windows\System32\taskhostw.exe",
+            Some(r"C:\Windows\System32\svchost.exe"),
+            3
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn an_installed_cli_run_from_a_shell_does_not_alert() {
+    assert!(
+        spawn_burst(
+            r"C:\Program Files\Synthaea\cli.exe",
+            Some(SYSTEM_POWERSHELL),
+            3
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn a_system_to_system_storm_still_alerts() {
+    let taskhostw = r"C:\Windows\System32\taskhostw.exe";
+    let svchost = Some(r"C:\Windows\System32\svchost.exe");
+    assert!(spawn_burst(taskhostw, svchost, SELF_SPAWN_TRUSTED_THRESHOLD - 1).is_empty());
+    assert_eq!(
+        spawn_burst(taskhostw, svchost, SELF_SPAWN_TRUSTED_THRESHOLD).len(),
+        1
+    );
+}
+
+#[test]
+fn a_system_shell_looping_a_script_host_alerts_at_the_base_threshold() {
+    // #494 review: a malicious .ps1 respawning powershell.exe a few times
+    // from a system shell, below SELF_SPAWN_TRUSTED_THRESHOLD.
+    for child in [
+        r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe",
+        r"C:\Windows\System32\cmd.exe",
+        r"C:\Windows\System32\wscript.exe",
+    ] {
+        let alerts = spawn_burst(child, Some(SYSTEM_POWERSHELL), SELF_SPAWN_THRESHOLD);
+        assert_eq!(alerts.len(), 1, "{child}");
+    }
+}
+
+#[test]
+fn a_script_host_child_matches_case_insensitively() {
+    let alerts = spawn_burst(
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\PowerShell.EXE",
+        Some(r"C:\Windows\System32\svchost.exe"),
+        SELF_SPAWN_THRESHOLD,
+    );
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn a_dropped_parent_spawning_a_system_child_alerts_at_the_base_threshold() {
+    // The 2026-09-07 malware3 capture: malware3.exe → powershell.exe, 20 in 30s.
+    let alerts = spawn_burst(
+        r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe",
+        Some(r"C:\Users\Public\malware3.exe"),
+        SELF_SPAWN_THRESHOLD,
+    );
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn a_dropped_child_of_a_system_shell_alerts_at_the_base_threshold() {
+    let alerts = spawn_burst(
+        r"C:\Users\victim\AppData\Local\Temp\payload.exe",
+        Some(r"C:\Windows\System32\cmd.exe"),
+        SELF_SPAWN_THRESHOLD,
+    );
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn an_unknown_parent_image_keeps_the_base_threshold() {
+    let alerts = spawn_burst(
+        r"C:\Windows\System32\schtasks.exe",
+        None,
+        SELF_SPAWN_THRESHOLD,
+    );
+    assert_eq!(alerts.len(), 1);
+}
+
 // ── PARENT-SUSPECT (T1204/T1059) ──────────────────────────────────────────
 
 #[test]
