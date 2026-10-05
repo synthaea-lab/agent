@@ -95,7 +95,7 @@ max_reconnect_backoff_ms = 60000
 # signature (SQL injection, path traversal, a webshell-like request, a scanner user
 # agent), and one summary per minute (counts, top failing clients); no per-request
 # event. The query-string value of the matched parameter is the only value that
-# leaves the host, cut to 128 characters and credential-redacted.
+# leaves the host, cut to 128 characters, NOT yet credential-redacted (#550).
 # `mysql_error` needs the error log to be a FILE: Debian/Ubuntu MariaDB logs to the
 # journal by default, so set `log_error` in the server first.
 # MySQL 8 writes the failed-login lines only at `log_error_verbosity = 3` (its default
