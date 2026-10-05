@@ -85,12 +85,18 @@ pub fn parse_maps(text: &str) -> (Vec<MapsEntry>, usize) {
 
 /// The mappings of `pid`, and how many lines could not be parsed.
 ///
+/// The file is read as bytes and decoded lossily: the pathname column is raw bytes, and
+/// `memfd_create` accepts any name, so a process can name its memfd with bytes that are
+/// not UTF-8. Strict decoding would fail the whole file and let exactly the process this
+/// scan targets opt out of it; lossy decoding costs that one name its invalid bytes
+/// (they become U+FFFD) and nothing else.
+///
 /// # Errors
 ///
 /// When `/proc/<pid>/maps` cannot be read (the process exited, or access is denied).
 pub fn read_maps(pid: u32) -> io::Result<(Vec<MapsEntry>, usize)> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/maps"))?;
-    Ok(parse_maps(&text))
+    let bytes = std::fs::read(format!("/proc/{pid}/maps"))?;
+    Ok(parse_maps(&String::from_utf8_lossy(&bytes)))
 }
 
 /// Up to `len` bytes of `pid`'s memory at `start`: fewer if the read comes up short, and
@@ -210,6 +216,58 @@ mod tests {
         assert!(region.perms.starts_with('r'));
         let got = read_memory(pid, addr, marker.len()).unwrap();
         assert_eq!(got, marker);
+    }
+
+    /// A memfd named with bytes that are not UTF-8 must not cost the scan the rest of the
+    /// process's mappings: it used to fail the whole file with `InvalidData`, which let a
+    /// memfd-exec implant opt out of the scan by how it named its memfd.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_memfd_with_a_non_utf8_name_does_not_hide_the_other_mappings() {
+        let marker = b"PROCMEM-NON-UTF8-MARKER".to_vec();
+        // SAFETY: a NUL-terminated name, and the fd returned is checked before use.
+        let fd = unsafe { libc::memfd_create(c"\xff x".as_ptr(), 0) };
+        assert!(
+            fd >= 0,
+            "memfd_create failed: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: `fd` is the memfd just created and owned here; resizing it to one page
+        // and mapping that page read-only is bounded, and MAP_FAILED is checked.
+        let page = unsafe {
+            assert_eq!(libc::ftruncate(fd, 4096), 0);
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(page, libc::MAP_FAILED, "{}", io::Error::last_os_error());
+
+        let result = read_maps(std::process::id());
+
+        // SAFETY: the mapping and fd created above, released exactly once.
+        unsafe {
+            libc::munmap(page, 4096);
+            libc::close(fd);
+        }
+        let (entries, _) = result.expect("one hostile name must not fail the whole file");
+        let hostile = entries
+            .iter()
+            .find(|e| e.pathname.as_deref().is_some_and(|p| p.contains("memfd:")))
+            .expect("the hostile memfd mapping is still listed");
+        assert!(
+            hostile.pathname.as_deref().unwrap().contains('\u{FFFD}'),
+            "the invalid byte is replaced, not dropped with the line: {hostile:?}"
+        );
+        let addr = marker.as_ptr() as u64;
+        assert!(
+            entries.iter().any(|e| e.start <= addr && addr < e.end),
+            "the mapping holding another region's marker is still found"
+        );
     }
 
     #[cfg(target_os = "linux")]

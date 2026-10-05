@@ -2387,11 +2387,28 @@ detection:
         })
     }
 
+    /// Held by every test that scans this test process's own memory. The tests run in
+    /// parallel in one process, so a marker one of them plants in an executable page is
+    /// visible to a scan another one requests: the "clean" test then failed 17 times out
+    /// of 30 on a `YARA-MEM` it never planted.
+    #[cfg(target_os = "linux")]
+    static OWN_PROCESS_MEMORY: Mutex<()> = Mutex::new(());
+
+    /// Serializes the tests that scan `std::process::id()`. Poison-tolerant: one test's
+    /// failed assertion must not fail the others on a poisoned lock.
+    #[cfg(target_os = "linux")]
+    fn own_process_memory() -> std::sync::MutexGuard<'static, ()> {
+        OWN_PROCESS_MEMORY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// #85 end to end, no mocks: a payload that exists only in executable anonymous
     /// memory of a real process is found by the scan the memfd-exec alert triggers.
     #[test]
     #[cfg(target_os = "linux")]
     fn a_payload_present_only_in_executable_memory_is_found_after_a_memfd_exec_alert() {
+        let _own_memory = own_process_memory();
         let dir = tmp("memscan-e2e");
         let yara_dir = dir.join("content").join("rules").join("yara");
         std::fs::create_dir_all(&yara_dir).unwrap();
@@ -2426,6 +2443,7 @@ detection:
     #[test]
     #[cfg(target_os = "linux")]
     fn a_memfd_exec_of_a_clean_process_triggers_a_scan_that_finds_nothing() {
+        let _own_memory = own_process_memory();
         let dir = tmp("memscan-clean");
         let yara_dir = dir.join("content").join("rules").join("yara");
         std::fs::create_dir_all(&yara_dir).unwrap();
