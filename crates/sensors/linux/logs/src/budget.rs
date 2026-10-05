@@ -15,15 +15,18 @@ use crate::WINDOW_SECS;
 /// attack shows the pattern within the first few; the rest is volume.
 pub const PER_SIGNATURE_PER_WINDOW: u32 = 30;
 
-const SIGNATURES: [HttpSignature; 4] = [
-    HttpSignature::PathTraversal,
-    HttpSignature::SqlInjection,
-    HttpSignature::ScannerUserAgent,
-    HttpSignature::WebshellLike,
-];
+/// One budget slot per [`HttpSignature`] variant.
+const SLOTS: usize = 4;
 
+/// The slot of a signature. An exhaustive `match`, on purpose: a new variant is a
+/// compile error here, not a silent share of another signature's budget.
 fn slot(signature: HttpSignature) -> usize {
-    SIGNATURES.iter().position(|s| *s == signature).unwrap_or(0)
+    match signature {
+        HttpSignature::PathTraversal => 0,
+        HttpSignature::SqlInjection => 1,
+        HttpSignature::ScannerUserAgent => 2,
+        HttpSignature::WebshellLike => 3,
+    }
 }
 
 /// Events shed in the window that just ended, per signature, for the log line.
@@ -50,8 +53,8 @@ impl Dropped {
 #[derive(Debug, Default)]
 pub struct SignatureBudget {
     window_start_ns: Option<u64>,
-    emitted: [u32; 4],
-    dropped: [u32; 4],
+    emitted: [u32; SLOTS],
+    dropped: [u32; SLOTS],
 }
 
 impl SignatureBudget {
@@ -89,8 +92,8 @@ impl SignatureBudget {
             webshell_like: self.dropped[slot(HttpSignature::WebshellLike)],
         };
         self.window_start_ns = None;
-        self.emitted = [0; 4];
-        self.dropped = [0; 4];
+        self.emitted = [0; SLOTS];
+        self.dropped = [0; SLOTS];
         (dropped.total() > 0).then_some(dropped)
     }
 }
@@ -142,5 +145,24 @@ mod tests {
         assert!(b.tick(100 * SEC).is_none(), "no window opened yet");
         b.allow(HttpSignature::ScannerUserAgent, SEC);
         assert!(b.tick(61 * SEC).is_none(), "nothing was shed");
+    }
+
+    #[test]
+    fn every_signature_has_its_own_slot_inside_the_arrays() {
+        // `slot` is an exhaustive match, so a new variant stops compiling there; this
+        // pins that the slot numbers it returns stay distinct and within `SLOTS`.
+        let mut taken = [false; SLOTS];
+        for signature in [
+            HttpSignature::PathTraversal,
+            HttpSignature::SqlInjection,
+            HttpSignature::ScannerUserAgent,
+            HttpSignature::WebshellLike,
+        ] {
+            let i = slot(signature);
+            assert!(i < SLOTS, "{signature:?} has slot {i}, past the arrays");
+            assert!(!taken[i], "{signature:?} shares slot {i}");
+            taken[i] = true;
+        }
+        assert!(taken.iter().all(|t| *t), "a slot nobody uses");
     }
 }

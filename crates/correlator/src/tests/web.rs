@@ -148,3 +148,28 @@ fn requests_read_in_one_poll_pair_with_the_last_one_in_the_log() {
     );
     assert!(web[0].message.contains("/up/s.php"), "{}", web[0].message);
 }
+
+#[test]
+fn two_requests_at_the_same_distance_pair_with_the_one_before_the_shell() {
+    // 5 s before and 5 s after: only the earlier one can have started the shell.
+    let mut engine = CorrelationEngine::new();
+    let before = Event::HttpRequest(HttpRequestEvent {
+        signature: HttpSignature::SqlInjection,
+        path: "/index.php".into(),
+        ..match request(95 * SEC) {
+            Event::HttpRequest(r) => r,
+            _ => unreachable!(),
+        }
+    });
+    engine.on_event(before);
+    engine.on_event(request(105 * SEC));
+    let alerts = engine.on_event(shell_under("nginx", 900, 100 * SEC));
+    let web = web_alerts(&alerts);
+    assert_eq!(web.len(), 1, "{alerts:?}");
+    assert!(
+        web[0].message.contains("SqlInjection"),
+        "{}",
+        web[0].message
+    );
+    assert!(web[0].message.contains("/index.php"), "{}", web[0].message);
+}
