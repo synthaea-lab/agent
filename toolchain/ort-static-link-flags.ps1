@@ -11,8 +11,9 @@
     that really are linked into onnxruntime's own libraries but sit in
     directories ort-sys never searches. Rather than keep a list that drifts with
     every onnxruntime release, this walks $env:ORT_LIB_LOCATION for every .lib
-    the build produced and emits `-L native=<dir>` and `-l static=<name>` for
-    each.
+    the build produced and emits `-L native=<dir>` for its directory and
+    `-C link-arg=<path>` for it (not `-l static=`, which bundles every library into
+    every crate's rlib; see the comment in the script body).
 
     As on Linux, re2 is never scheduled by onnxruntime's own build graph, so
     its .lib does not exist until it is built explicitly;
@@ -71,7 +72,15 @@ foreach ($lib in $libs) {
         $dirs[$dir] = $true
     }
     if (-not $names.Contains($name)) {
-        $flags.Add('-l'); $flags.Add("static=$name")
+        # Each library goes to the linker as a path (-C link-arg), not as
+        # `-l static=<name>`. RUSTFLAGS reaches every crate, and `-l static=`
+        # bundles the library into each rlib: 101 libraries (1.1 GB) grew a
+        # target directory to 276 GB and filled the disk. `-l static:-bundle=`
+        # avoids that but is refused for any library ort-sys also names itself
+        # ("overriding linking modifiers from command line is not supported"),
+        # and ort-sys names most of them. A plain link argument has neither
+        # problem: nothing is copied, and a library given twice is ignored.
+        $flags.Add('-C'); $flags.Add("link-arg=$($lib.FullName)")
         $names[$name] = $true
     }
 }

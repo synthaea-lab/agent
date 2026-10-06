@@ -197,6 +197,15 @@ Measured on a 12-thread laptop, cold: the onnxruntime build took 48 minutes and 
 - **`shell32` must be linked.** onnxruntime's `telemetry.cc` calls `CommandLineToArgvW`;
   without `-l dylib=shell32` the link fails with `LNK2019 unresolved external symbol
   __imp_CommandLineToArgvW`. The flags script adds it. `shell32.dll` is on every Windows.
+- **Libraries go to the linker as paths, not as `-l static=`.** `RUSTFLAGS` reaches every
+  crate, and `-l static=<name>` bundles the library into each crate's `.rlib`: 101
+  libraries (1.1 GB) times every dependency grew a `target` directory to 276 GB and filled
+  a 950 GB disk. `-l static:-bundle=` avoids it but is refused for any library `ort-sys`
+  also names itself ("overriding linking modifiers from command line is not supported"),
+  and it names most of them. The flags script therefore emits `-C link-arg=<path to .lib>`:
+  nothing is copied (the `ml` test run leaves a 4.3 GB `target`) and a library given twice
+  is ignored. The Linux script uses `-l static=` and has the same bundling mechanism; its
+  `target` size is worth a look.
 - **Run cargo with `-j 1` (or 2) while linking the tests.** Each test binary links all
   101 libraries; several at once exhausted the commit limit on a 16 GB machine (`os error
   1455`, reported by `rustc` as "found invalid metadata files for crate `serde`", which
