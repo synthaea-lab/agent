@@ -239,7 +239,12 @@ pub mod time;
 /// of its Operational channel). Windows-only. #632 (`LdapSearch`) also
 /// targets v38 while both branches are open: whichever merges second
 /// renumbers, same coordination note as v13, v28→29, v30→31 and v32→33.
-pub const SCHEMA_VERSION: u32 = 38;
+///
+/// Bumped 38 → 39 for [`Event::UdpRecv`] (#263): one new enum variant for inbound
+/// UDP datagrams (`recvfrom(2)`) on Linux, the counterpart of [`Event::UdpSend`].
+/// #654 also targets v39 while both branches are open: whichever merges second
+/// renumbers, as above.
+pub const SCHEMA_VERSION: u32 = 39;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -1215,6 +1220,20 @@ pub struct UdpSendEvent {
     pub size: u32,
 }
 
+/// UDP datagram received (`recvfrom(2)`, Linux, issue #263) — the inbound
+/// counterpart of [`UdpSendEvent`], carrying the sender's address. Emitted only
+/// when the kernel reported a source address (a connected-socket `recv(2)` has
+/// none), and only on success. `size` is the bytes actually received, not the
+/// buffer length requested.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UdpRecvEvent {
+    pub meta: EventMeta,
+    /// Sender's address (the remote end of the datagram).
+    pub peer_addr: core::net::IpAddr,
+    pub peer_port: u16,
+    pub size: u32,
+}
+
 /// A TCP socket found listening, from a periodic socket-table snapshot rather than a
 /// discrete `bind`/`listen()` syscall trace (Linux: `NETLINK_SOCK_DIAG`, issue #92 —
 /// a probe-free source that runs where eBPF/ETW cannot, or as a redundant cross-check
@@ -1994,6 +2013,7 @@ pub enum Event {
     AssemblyLoad(AssemblyLoadEvent),
     SmbConnect(SmbConnectEvent),
     UdpSend(UdpSendEvent),
+    UdpRecv(UdpRecvEvent),
     Auth(AuthEvent),
     ListenPort(ListenPortEvent),
     NetworkFlow(NetworkFlowEvent),
@@ -2052,6 +2072,7 @@ impl Event {
             Event::AssemblyLoad(e) => &e.meta,
             Event::SmbConnect(e) => &e.meta,
             Event::UdpSend(e) => &e.meta,
+            Event::UdpRecv(e) => &e.meta,
             Event::Auth(e) => &e.meta,
             Event::ListenPort(e) => &e.meta,
             Event::NetworkFlow(e) => &e.meta,

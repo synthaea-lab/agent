@@ -37,7 +37,7 @@ use crate::{
     NamespaceSyscall, NetworkFlowEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent,
     PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType,
     SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TlsCaptureEvent,
-    TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
+    TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -214,6 +214,17 @@ pub fn udp_send() -> UdpSendEvent {
         meta: meta(),
         daddr: TEST_ADDR,
         dport: 0,
+        size: 0,
+    }
+}
+
+/// Neutral [`UdpRecvEvent`] from [`TEST_ADDR`].
+#[must_use]
+pub fn udp_recv() -> UdpRecvEvent {
+    UdpRecvEvent {
+        meta: meta(),
+        peer_addr: TEST_ADDR,
+        peer_port: 0,
         size: 0,
     }
 }

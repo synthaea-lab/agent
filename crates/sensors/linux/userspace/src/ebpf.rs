@@ -36,6 +36,9 @@ pub(crate) fn err(msg: String) -> SensorError {
 /// only populated once the kernel-side call returns, so the enter and exit halves
 /// are attached as a pair (`ebpf/src/main.rs`'s `ACCEPT_ARGS` map correlates them).
 ///
+/// `sys_enter_recvfrom`/`sys_exit_recvfrom` (issue #263) use the same pair for the
+/// sender's address (`ebpf/src/main.rs`'s `RECVFROM_ARGS`).
+///
 /// `sys_enter_setxattr`/`sys_enter_removexattr` (issue #262 Phase 3) cover the
 /// plain path-taking syscalls only — `lsetxattr`/`fsetxattr` (symlink/fd-only
 /// variants) are deferred, same posture as `chmod`/`chown`'s fd-only siblings.
@@ -80,6 +83,8 @@ pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
     ("sys_enter_accept4", "syscalls", "sys_enter_accept4"),
     ("sys_exit_accept", "syscalls", "sys_exit_accept"),
     ("sys_exit_accept4", "syscalls", "sys_exit_accept4"),
+    ("sys_enter_recvfrom", "syscalls", "sys_enter_recvfrom"),
+    ("sys_exit_recvfrom", "syscalls", "sys_exit_recvfrom"),
     ("sys_enter_setxattr", "syscalls", "sys_enter_setxattr"),
     ("sys_enter_removexattr", "syscalls", "sys_enter_removexattr"),
     ("sys_enter_mount", "syscalls", "sys_enter_mount"),
