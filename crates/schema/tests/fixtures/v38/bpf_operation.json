@@ -1,0 +1,11 @@
+{
+  "type": "bpf_operation",
+  "meta": {
+    "pid": 9006,
+    "ppid": 1,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900024000000000,
+    "comm": "evil_loader"
+  },
+  "cmd": 5
+}

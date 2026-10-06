@@ -71,6 +71,31 @@ pub(crate) const QUARANTINE_EXEC_WINDOW_NS: u64 = 600_000_000_000; // 10 min
 /// SELF-SPAWN threshold and window (T1059): N spawns of the same name in X seconds.
 pub(crate) const SELF_SPAWN_THRESHOLD: u32 = 3;
 pub(crate) const SELF_SPAWN_WINDOW_NS: u64 = 30_000_000_000; // 30s
+/// SELF-SPAWN threshold when both the parent and the child image live at a trusted
+/// system path (#432). Calibrated 2026-09-28 on the 2026-09-07 Windows Server
+/// captures plus #432's Win11 lab observations: every benign system→system group
+/// peaked at 3 (`taskhostw.exe`, `slui.exe`, `MusNotification.exe`, `svchost.exe`,
+/// `schtasks.exe`, an operator's `cli.exe`), while the one real storm with a
+/// system child (`malware3.exe` → `powershell.exe`) reached 20. That storm is
+/// caught at [`SELF_SPAWN_THRESHOLD`] anyway through its untrusted parent; this
+/// tier is for the same storm launched from a system parent.
+pub(crate) const SELF_SPAWN_TRUSTED_THRESHOLD: u32 = 10;
+/// Script hosts that keep [`SELF_SPAWN_THRESHOLD`] as SELF-SPAWN children even
+/// when both images are system ones (#494 review): a malicious `.ps1` looping
+/// `powershell.exe` 3-9 times from a system shell would otherwise stay under
+/// [`SELF_SPAWN_TRUSTED_THRESHOLD`]. Replayed 2026-09-29 on the same captures:
+/// no benign group reaching 3 has a script-host child, and the only one that
+/// does is the `malware3.exe` storm. Deliberately narrower than
+/// [`SUSPECT_CHILDREN_WIN`]: `msiexec.exe` and `rundll32.exe` loop
+/// legitimately (installs, shell extensions).
+pub(crate) const SELF_SPAWN_SCRIPT_HOSTS: &[&str] = &[
+    "powershell.exe",
+    "pwsh.exe",
+    "cmd.exe",
+    "wscript.exe",
+    "cscript.exe",
+    "mshta.exe",
+];
 
 /// BEACON threshold and window (T1071/T1041): N connections to the same dest in X seconds.
 /// T1110 — failed authentications per (target user, source) inside
