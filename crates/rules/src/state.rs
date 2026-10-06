@@ -1363,7 +1363,9 @@ impl RuleState {
     ///
     /// Not covered: a download that never got a mark (curl, certutil, most
     /// droppers, see `DOWNLOADER_COMMS`) and an archive extractor that drops it
-    /// — there is no removal to see.
+    /// — there is no removal to see; a mark rewritten in place to `ZoneId=0`,
+    /// or its stream renamed (Kernel-File 27) rather than deleted. The full
+    /// list is in `docs/detection/download-provenance.md`.
     fn check_exec_after_motw_removal(&mut self, event: &ExecEvent) -> Option<Alert> {
         let key = event.image_path.to_lowercase();
         let now = event.meta.timestamp_ns;

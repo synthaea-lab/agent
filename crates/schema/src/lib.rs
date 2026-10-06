@@ -713,7 +713,9 @@ pub struct FileWriteEvent {
     pub bytes_requested: u64,
 }
 
-/// File delete (issue #262): `unlink(2)`/`unlinkat(2)`.
+/// File delete (issue #262): `unlink(2)`/`unlinkat(2)` on Linux, ES `UNLINK`
+/// on macOS. On Windows, only the deletion of a `:Zone.Identifier` stream, the
+/// mark-of-the-web removed (#442); `path` is then the stream path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileDeleteEvent {
     pub meta: EventMeta,
