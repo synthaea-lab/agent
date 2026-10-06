@@ -3709,6 +3709,7 @@ dependencies = [
 name = "yara"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "schema",
  "store",
  "thiserror 2.0.21",

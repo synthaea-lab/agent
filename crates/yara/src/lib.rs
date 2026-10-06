@@ -13,11 +13,13 @@
 //! refused. A short settle delay runs before each scan so a just-opened-for-write
 //! file has content by the time it is read.
 
+mod access;
 pub mod memory;
 mod queue;
 
 use std::{collections::HashMap, path::Path};
 
+pub use access::{Refused, Requester};
 pub use memory::{
     MemoryBudget, MemoryRegion, MemoryScanOutcome, MemoryScanQueue, MemoryScanReport,
     MemoryScanStats, MemorySource, RegionKind, RegionPerms, scan_memory,
@@ -176,14 +178,55 @@ impl RuleSet {
             tracing::debug!(path = %path.display(), "yara: not a regular file, skipping");
             return Ok(Vec::new());
         }
-        if meta.len() > MAX_SCAN_BYTES {
-            tracing::debug!(path = %path.display(), size = meta.len(), "yara: over scan budget, skipping");
+        let file = std::fs::File::open(path).map_err(io)?;
+        self.scan_open_file(path, file)
+    }
+
+    /// [`Self::scan_file`] on behalf of the user whose process queued the scan (#594):
+    /// the file is read only if that user could read it themselves
+    /// ([`Requester::open`]), otherwise the request is dropped as if it had matched
+    /// nothing. The agent holds `CAP_DAC_READ_SEARCH`, so without this any local user
+    /// could have it scan a file they cannot read.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::scan_file`].
+    pub fn scan_file_as(
+        &self,
+        path: &Path,
+        requester: Requester,
+    ) -> Result<Vec<YaraMatch>, YaraError> {
+        let io = |source: std::io::Error| YaraError::Io {
+            path: path.display().to_string(),
+            source,
+        };
+        match requester.open(path).map_err(io)? {
+            Ok(file) => self.scan_open_file(path, file),
+            Err(refused) => {
+                tracing::debug!(path = %path.display(), ?refused, "yara: not the requester's to read, skipping");
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// The size budget, the bounded read and the scan, on a file already opened.
+    fn scan_open_file(
+        &self,
+        path: &Path,
+        file: std::fs::File,
+    ) -> Result<Vec<YaraMatch>, YaraError> {
+        let io = |source: std::io::Error| YaraError::Io {
+            path: path.display().to_string(),
+            source,
+        };
+        let len = file.metadata().map_err(io)?.len();
+        if len > MAX_SCAN_BYTES {
+            tracing::debug!(path = %path.display(), size = len, "yara: over scan budget, skipping");
             return Ok(Vec::new());
         }
         let mut data = Vec::new();
         {
             use std::io::Read as _;
-            let file = std::fs::File::open(path).map_err(io)?;
             file.take(MAX_SCAN_BYTES + 1)
                 .read_to_end(&mut data)
                 .map_err(io)?;
@@ -383,5 +426,44 @@ rule test_marker {
         std::fs::write(dir.join("broken.yar"), "rule x { cond").unwrap();
         let err = RuleSet::load_dir(&dir).unwrap_err();
         assert!(err.to_string().contains("broken.yar"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_the_requester_cannot_read_is_not_scanned_on_their_behalf() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let rules = ruleset_from(
+            r#"
+rule as_user {
+    meta:
+        severity = "high"
+        technique = "T1105"
+        falsepositives = "none known"
+    strings:
+        $m = "AS-USER-MARKER"
+    condition:
+        $m
+}
+"#,
+        );
+        let path = std::env::temp_dir().join(format!("yara-as-user-{}", std::process::id()));
+        std::fs::write(&path, b"AS-USER-MARKER").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let owner = Requester {
+            uid: meta.uid(),
+            gid: meta.gid(),
+        };
+        let stranger = Requester {
+            uid: 4_000_000,
+            gid: 4_000_000,
+        };
+
+        // The agent itself can read it, and so can its owner; a stranger's request finds
+        // nothing, as if the file had not matched.
+        assert_eq!(rules.scan_file(&path).unwrap().len(), 1);
+        assert_eq!(rules.scan_file_as(&path, owner).unwrap().len(), 1);
+        assert!(rules.scan_file_as(&path, stranger).unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
     }
 }

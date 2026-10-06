@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{RuleSet, YaraMatch};
+use crate::{RuleSet, YaraMatch, access::Requester};
 
 /// Queue capacity: a burst of file writes beyond this sheds scan requests (counted).
 const QUEUE_CAP: usize = 512;
@@ -35,6 +35,11 @@ pub struct ScanContext {
     /// Timestamp of the triggering event: the clock the entity's other findings
     /// use, not the later scan time, so dedup windows compare like with like.
     pub timestamp_ns: u64,
+    /// The user behind the request (#594). The path is whatever the process named, even
+    /// when the kernel refused the open, and the agent reads with `CAP_DAC_READ_SEARCH`:
+    /// the file is scanned only if this user could read it themselves. `None` where the
+    /// platform has no uid, which scans as before.
+    pub requester: Option<Requester>,
 }
 
 /// One scan result delivered to the callback.
@@ -99,7 +104,11 @@ impl ScanQueue {
                     if ready_at > now {
                         std::thread::sleep(ready_at - now);
                     }
-                    match rules.scan_file(&path) {
+                    let scanned = match context.as_ref().and_then(|c| c.requester) {
+                        Some(requester) => rules.scan_file_as(&path, requester),
+                        None => rules.scan_file(&path),
+                    };
+                    match scanned {
                         Ok(matches) if !matches.is_empty() => {
                             on_match(ScanOutcome {
                                 path,
@@ -246,6 +255,7 @@ rule ctx {
             comm: "dropper".into(),
             parent_generation: Some(3),
             timestamp_ns: 7,
+            requester: None,
         };
         queue.enqueue_for(path, context.clone());
 
@@ -258,5 +268,60 @@ rule ctx {
         let hits = hits.lock().unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].context, Some(context));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_scan_queued_for_a_user_who_cannot_read_the_file_finds_nothing() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut compiler = yara_x::Compiler::new();
+        compiler
+            .add_source(
+                br#"
+rule as_user_q {
+    meta:
+        severity = "high"
+        technique = "T1105"
+        falsepositives = "none known"
+    strings:
+        $m = "AS-USER-QUEUE-MARKER"
+    condition:
+        $m
+}
+"#
+                .as_slice(),
+            )
+            .unwrap();
+        let rules = RuleSet::from_compiled(compiler.build()).unwrap();
+        let hits: Arc<Mutex<Vec<ScanOutcome>>> = Arc::new(Mutex::new(Vec::new()));
+        let hits_w = hits.clone();
+        let queue = ScanQueue::start(rules, move |o| hits_w.lock().unwrap().push(o));
+
+        let path = std::env::temp_dir().join(format!("yara-q-as-{}", std::process::id()));
+        std::fs::write(&path, b"AS-USER-QUEUE-MARKER").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        queue.enqueue_for(
+            path.clone(),
+            ScanContext {
+                ppid: 1,
+                comm: "stranger".into(),
+                parent_generation: None,
+                timestamp_ns: 1,
+                requester: Some(Requester {
+                    uid: 4_000_000,
+                    gid: 4_000_000,
+                }),
+            },
+        );
+
+        for _ in 0..100 {
+            if queue.stats().scanned >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(queue.stats().scanned, 1, "the request was handled");
+        assert!(hits.lock().unwrap().is_empty(), "but nothing was read");
+        let _ = std::fs::remove_file(&path);
     }
 }
