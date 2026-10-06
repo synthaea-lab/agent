@@ -1,5 +1,8 @@
 //! Live regression for #660: blocked accept calls cannot blind later telemetry.
 //!
+//! The accepts run in child processes: the sensor drops events from its own pid
+//! (self-exclusion, #340), so a test that accepts in its own process observes nothing.
+//!
 //! Build with the eBPF toolchain, then run as root on a Linux lab host:
 //! `cargo build -p sensor-linux --example accept_map_pressure`
 //! `sudo target/debug/examples/accept_map_pressure`
@@ -10,6 +13,7 @@ mod linux {
         error::Error,
         io,
         net::{TcpListener, TcpStream},
+        process::{Command, Stdio},
         sync::{
             Arc, Barrier,
             mpsc::{self, Receiver, Sender},
@@ -49,6 +53,51 @@ mod linux {
         Ok(peer_port)
     }
 
+    fn block_accepts() -> Result<TcpListener, Box<dyn Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let ready = Arc::new(Barrier::new(MAP_CAPACITY + 1));
+        for _ in 0..MAP_CAPACITY {
+            let socket = listener.try_clone()?;
+            let ready = Arc::clone(&ready);
+            thread::Builder::new()
+                .stack_size(64 * 1024)
+                .spawn(move || {
+                    ready.wait();
+                    let _ = socket.accept();
+                })?;
+        }
+        ready.wait();
+        thread::sleep(Duration::from_secs(2));
+        Ok(listener)
+    }
+
+    fn child(mode: &str) -> Result<u16, Box<dyn Error>> {
+        match mode {
+            "control" => one_accept(),
+            "pressure" => {
+                let _blocked = block_accepts()?;
+                one_accept()
+            }
+            other => Err(io::Error::other(format!("unknown child mode {other}")).into()),
+        }
+    }
+
+    fn run_child(mode: &str) -> Result<u16, Box<dyn Error>> {
+        let output = Command::new(std::env::current_exe()?)
+            .args(["--child", mode])
+            .stdin(Stdio::null())
+            .stderr(Stdio::inherit())
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!("child {mode} failed")).into());
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("PORT "))
+            .and_then(|port| port.trim().parse().ok())
+            .ok_or_else(|| io::Error::other(format!("child {mode} printed no port")).into())
+    }
+
     fn wait_for_port(events: &Receiver<u16>, peer_port: u16) -> Result<(), Box<dyn Error>> {
         let deadline = Instant::now() + EVENT_TIMEOUT;
         loop {
@@ -72,27 +121,14 @@ mod linux {
         }
     }
 
-    fn block_accepts() -> Result<TcpListener, Box<dyn Error>> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let ready = Arc::new(Barrier::new(MAP_CAPACITY + 1));
-        for _ in 0..MAP_CAPACITY {
-            let socket = listener.try_clone()?;
-            let ready = Arc::clone(&ready);
-            thread::Builder::new()
-                .stack_size(64 * 1024)
-                .spawn(move || {
-                    ready.wait();
-                    let _ = socket.accept();
-                })?;
-        }
-        ready.wait();
-        // The barrier releases the workers together; give them time to enter
-        // the blocking syscall before inserting one more stash.
-        thread::sleep(Duration::from_secs(2));
-        Ok(listener)
-    }
-
     pub(super) fn run() -> Result<(), Box<dyn Error>> {
+        let args: Vec<String> = std::env::args().collect();
+        if args.get(1).map(String::as_str) == Some("--child") {
+            let mode = args.get(2).map(String::as_str).unwrap_or("");
+            println!("PORT {}", child(mode)?);
+            return Ok(());
+        }
+
         let (tx, events) = mpsc::channel();
         thread::spawn(move || {
             let mut sensor = LinuxSensor::new();
@@ -103,11 +139,10 @@ mod linux {
         });
         thread::sleep(Duration::from_secs(3));
 
-        let control_port = one_accept()?;
+        let control_port = run_child("control")?;
         wait_for_port(&events, control_port)
             .map_err(|error| io::Error::other(format!("control accept: {error}")))?;
-        let _blocked_listener = block_accepts()?;
-        let sentinel_port = one_accept()?;
+        let sentinel_port = run_child("pressure")?;
         wait_for_port(&events, sentinel_port)
             .map_err(|error| io::Error::other(format!("post-pressure accept: {error}")))?;
         println!(
