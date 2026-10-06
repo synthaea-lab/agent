@@ -153,6 +153,10 @@ pub(crate) struct ControlPlane<'a> {
     pub(crate) ca_cert: Option<&'a Path>,
     /// `(certificate, key)`, both PEM.
     pub(crate) client_cert: Option<(&'a Path, &'a Path)>,
+    /// `server.offline_fallback`: whether a failure to set the upload up (an unreadable
+    /// client certificate, a missing CA) lets `run` start without it (see
+    /// [`start_or_disable`]) or stops it.
+    pub(crate) offline_fallback: bool,
 }
 
 impl ControlPlane<'_> {
@@ -175,6 +179,7 @@ pub(crate) struct RunTarget {
     url: String,
     ca_cert: Option<PathBuf>,
     client_cert: Option<(PathBuf, PathBuf)>,
+    offline_fallback: bool,
 }
 
 impl RunTarget {
@@ -187,6 +192,7 @@ impl RunTarget {
                 .client_cert
                 .as_ref()
                 .map(|(cert, key)| (cert.as_path(), key.as_path())),
+            offline_fallback: self.offline_fallback,
         }
     }
 }
@@ -216,15 +222,18 @@ pub(crate) fn resolve_run_target(
     }
     let ca_cert = crate::content::resolve_ca_cert(ca_cert, configured);
     let flagged = cert.zip(key);
+    let offline_fallback = configured.offline_fallback;
     Some(match server {
         Some(url) => RunTarget {
             url,
             ca_cert,
             client_cert: flagged,
+            offline_fallback,
         },
         None => RunTarget {
             url: configured.control_plane_url.clone(),
             ca_cert,
+            offline_fallback,
             client_cert: Some(
                 flagged
                     .unwrap_or_else(|| (configured.mtls_cert.clone(), configured.mtls_key.clone())),
@@ -313,6 +322,44 @@ impl crate::health::SpoolStatsSource for SpoolHealth {
     }
 }
 
+/// What [`start_or_disable`] came to.
+pub(crate) enum UploadStart {
+    /// The spool and the upload threads are running.
+    Running(TransportHandle),
+    /// Upload could not be set up and the agent runs without it: why. The caller says so
+    /// loudly (an alert and the journal); the detection side is untouched.
+    Disabled(String),
+}
+
+/// [`start`], with the failure policy of `server.offline_fallback`.
+///
+/// Setting the upload up fails for reasons that are configuration and not the network: an
+/// unreadable or passphrase-protected client key, a missing CA bundle, a spool directory
+/// that cannot be opened. If that stopped `run`, an agent without its certificates would
+/// detect nothing at all (a day-0 install from `bootstrap/` loops on restart forever), and
+/// the watchdog, which only sees that the heartbeat never advances, would roll back and ban
+/// a release that is otherwise healthy (ADR-0015 probation). So with `offline_fallback`
+/// (the default) the agent keeps detecting locally and reports that it is not uploading;
+/// with it off, the failure stays fatal, as ADR-0013 describes.
+///
+/// # Errors
+///
+/// The error of [`start`] when `offline_fallback` is off.
+pub(crate) fn start_or_disable(
+    control_plane: &ControlPlane<'_>,
+    alerts: &Path,
+    spool_max_bytes: u64,
+) -> anyhow::Result<UploadStart> {
+    match start(control_plane, alerts, spool_max_bytes) {
+        Ok(handle) => Ok(UploadStart::Running(handle)),
+        Err(error) if control_plane.offline_fallback => Ok(UploadStart::Disabled(format!(
+            "not uploading to {}: {error:#}",
+            control_plane.url
+        ))),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use schema::{
@@ -333,6 +380,7 @@ mod tests {
             url: "https://cp.example",
             ca_cert: Some(ca),
             client_cert: Some((cert, key)),
+            offline_fallback: true,
         }
         .transport_config();
         assert_eq!(full.ca_cert_path.as_deref(), Some(ca));
@@ -343,6 +391,7 @@ mod tests {
             url: "https://cp.example",
             ca_cert: None,
             client_cert: None,
+            offline_fallback: true,
         }
         .transport_config();
         assert_eq!(bare.ca_cert_path, None);
@@ -541,5 +590,69 @@ mod tests {
             panic!("expected exec");
         };
         assert_eq!(e.cmdline, "fresh");
+    }
+
+    /// A control plane whose client certificate does not exist: setting the upload up fails.
+    fn control_plane_with_a_missing_certificate(offline_fallback: bool) -> ControlPlane<'static> {
+        ControlPlane {
+            url: "https://cp.example",
+            ca_cert: None,
+            client_cert: Some((
+                Path::new("/nonexistent/client.crt"),
+                Path::new("/nonexistent/client.key"),
+            )),
+            offline_fallback,
+        }
+    }
+
+    #[test]
+    fn a_missing_client_certificate_disables_the_upload_when_offline_fallback_is_on() {
+        let dir = std::env::temp_dir().join(format!("agent-upload-degrade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let started = start_or_disable(
+            &control_plane_with_a_missing_certificate(true),
+            &dir.join("alerts.ndjson"),
+            1 << 20,
+        )
+        .expect("with offline_fallback the agent still starts");
+
+        let UploadStart::Disabled(reason) = started else {
+            panic!("upload cannot be running without its certificate");
+        };
+        assert!(reason.contains("https://cp.example"), "{reason}");
+        assert!(
+            reason.contains("client.crt"),
+            "the cause is named: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_missing_client_certificate_stops_the_agent_when_offline_fallback_is_off() {
+        let dir = std::env::temp_dir().join(format!("agent-upload-strict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let result = start_or_disable(
+            &control_plane_with_a_missing_certificate(false),
+            &dir.join("alerts.ndjson"),
+            1 << 20,
+        );
+
+        assert!(result.is_err(), "offline_fallback = false keeps it fatal");
+    }
+
+    #[test]
+    fn offline_fallback_comes_from_the_configuration_for_either_server() {
+        let mut server = configured();
+        server.offline_fallback = false;
+        for named in [None, Some("https://lab".to_string())] {
+            let target = resolve_run_target(named, false, None, None, None, &server).unwrap();
+            assert!(!target.control_plane().offline_fallback);
+        }
+        server.offline_fallback = true;
+        let target = resolve_run_target(None, false, None, None, None, &server).unwrap();
+        assert!(target.control_plane().offline_fallback);
     }
 }
