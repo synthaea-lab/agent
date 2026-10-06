@@ -552,6 +552,7 @@ mod tests {
             &dir.join("alerts.ndjson"),
             Some(&dir.join("events.jsonl")),
             None,
+            None,
             &dir.join("content"),
             &dir.join("ml-registry"),
         )
