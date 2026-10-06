@@ -804,6 +804,12 @@ impl DetectionSink {
         self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_auth(event));
     }
 
+    /// `Session` events: a disconnected session reconnected from another client
+    /// (T1563.002, #285).
+    fn detect_session(&self, wrapped: &Event, event: &schema::SessionEvent) {
+        self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_session(event));
+    }
+
     /// `FileDelete` events: log-tamper detection (T1070.001/.002, pack #379), then the
     /// unlink half of the write-new-then-unlink T1486 shape (#512 part B), which needs
     /// the creation history `on_file_open` keeps.
@@ -1232,6 +1238,7 @@ impl EventSink for DetectionSink {
             Event::NetworkFlow(e) => self.detect_network_flow(&event, e),
             Event::ListenPort(e) => self.detect_listen_port(&event, e),
             Event::Auth(e) => self.detect_auth(&event, e),
+            Event::Session(e) => self.detect_session(&event, e),
             Event::FileDelete(e) => self.detect_file_delete(&event, e),
             Event::Signal(e) => self.detect_signal(&event, e),
             Event::FileQuarantine(e) => self.detect_file_quarantine(e),

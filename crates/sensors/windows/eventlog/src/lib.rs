@@ -6,6 +6,8 @@
 //! - System: 7045 (service install — persistence)
 //! - Security: 4720 (local account creation — persistence)
 //! - Microsoft-Windows-AppLocker + WDAC, Defender operational, Task-Scheduler
+//! - Terminal Services: session lifecycle 21/23/24/25 and RDP authentication
+//!   1149 (#285, see the section below)
 //!
 //! Implements three persistence detections, ported from a spike validated
 //! end-to-end on a real Windows VM (see
@@ -140,6 +142,28 @@
 //!   the file is gone or unreadable). A registration seen on *both* channels is
 //!   reported once by the rules layer (`rules::RuleState`, #422); both raw
 //!   events are kept.
+//!
+//! ## Session lifecycle (#285)
+//!
+//! Two Terminal Services channels report what 4624 cannot: whether a logon is
+//! a new session or a reconnect, when a session was disconnected (left alive
+//! for later) rather than logged off, and which client each step came from.
+//! Both become `schema::SessionEvent`:
+//!
+//! - `Microsoft-Windows-TerminalServices-LocalSessionManager/Operational`
+//!   **21** logon, **23** logoff, **24** disconnect, **25** reconnect, each
+//!   with the `SessionID` and, except 23, the client (`Address`: an IP, or
+//!   `LOCAL` for the console). The console session logs them too, so the
+//!   channel is not RDP-only.
+//! - `Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational`
+//!   **1149**: a client authenticated to the RDP listener (with Network Level
+//!   Authentication, the default, the credentials were good), with its source
+//!   IP and no session yet.
+//!
+//! Both are on by default on every SKU and need no audit toggle; one switch,
+//! `EventLogConfig::terminal_sessions_enabled`, gates the pair. The consuming
+//! rule (`rules`' `session` module) flags a disconnected session reconnected
+//! from another client, T1563.002.
 //!
 //! ## Transport: polling (default) vs. `EvtSubscribe` (#322)
 //!

@@ -14,6 +14,7 @@ mod amsi;
 mod defender;
 mod exclusions;
 mod ld_trust;
+mod session;
 mod sliding;
 mod state;
 mod stateless;
