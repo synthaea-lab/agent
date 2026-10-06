@@ -33,12 +33,13 @@ tempfile = "3"
 name = "synthaea-agent"
 maintainer-scripts = "../packaging/linux/debian/maintainer-scripts"
 
-# Assets: binaries, configs, systemd units (paths relative to watchdog/ directory)
+# Assets: binaries use cargo-deb's target/release/ prefix, which it rewrites for
+# --target and workspaces; other paths are relative to watchdog/.
 assets = [
     # Bootstrap binaries
-    ["../target/release/watchdog", "var/lib/synthaea/bootstrap/", "755"],
-    ["../target/release/agent", "var/lib/synthaea/bootstrap/", "755"],
-    ["../target/release/cli", "var/lib/synthaea/bootstrap/", "755"],
+    ["target/release/watchdog", "var/lib/synthaea/bootstrap/", "755"],
+    ["target/release/agent", "var/lib/synthaea/bootstrap/", "755"],
+    ["target/release/cli", "var/lib/synthaea/bootstrap/", "755"],
 
     # systemd integration
     ["../packaging/linux/systemd/synthaea-agent.service", "usr/lib/systemd/system/", "644"],
