@@ -18,10 +18,10 @@ use std::{
 };
 
 use schema::{
-    AuthEvent, AuthKind, AuthOutcome, Event, EventMeta, FLAG_PERSISTENCE_ACCOUNT_ARTIFACT,
-    FLAG_PERSISTENCE_ARTIFACT, FLAG_PERSISTENCE_TASK_ARTIFACT,
+    AuthEvent, AuthKind, AuthOutcome, DefenderEvent, DefenderEventKind, Event, EventMeta,
+    FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT, FLAG_PERSISTENCE_TASK_ARTIFACT,
     FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, POLICY_MECHANISM_APPLOCKER,
-    PolicyDenialEvent, User,
+    POLICY_MECHANISM_WDAC, PolicyDenialEvent, User,
     sensor::{Capabilities, EventSink, Sensor, SensorError},
     time::now_ns,
 };
@@ -738,6 +738,256 @@ static TASK_SCHEDULER_OP: PollTarget = PollTarget {
     enabled: |c| c.task_scheduler_op_enabled,
 };
 
+// ── Microsoft Defender Operational (#283) ──────────────────────────────────
+//
+// The channel's own verdicts (1116 detected, 1117 action taken) and the traces
+// of someone weakening it (5001/5010/5012 protection turned off, 5007 a setting
+// changed, T1562.001). Enabled by default on every Windows SKU that ships
+// Defender: no audit toggle. The channel is **localized**: only numeric ids and
+// the untranslated `Threat Name`/`Path` are read, never the `* Name` texts.
+
+const DEFENDER_DETECTED: u32 = 1116;
+const DEFENDER_REMEDIATED: u32 = 1117;
+const DEFENDER_REALTIME_DISABLED: u32 = 5001;
+const DEFENDER_CONFIG_CHANGED: u32 = 5007;
+const DEFENDER_SPYWARE_DISABLED: u32 = 5010;
+const DEFENDER_VIRUS_DISABLED: u32 = 5012;
+
+/// A command-line detection's `Path` is the whole command line (lab,
+/// 2026-10-02: a multi-line script). The event keeps the start: enough to
+/// identify what was caught, bounded so one detection cannot carry a script.
+const DEFENDER_PATH_MAX_CHARS: usize = 1024;
+
+/// Registry value names (last path component, lowercase) whose change is a
+/// protection being weakened. The rules decide which changes alert; the sensor
+/// only has to keep the rest of the 5007 flood (service start-up progress:
+/// 42 % of the channel on the lab host) out of the pipeline.
+const DEFENDER_SECURITY_VALUES: &[&str] = &[
+    "disablerealtimemonitoring",
+    "disablebehaviormonitoring",
+    "disableonaccessprotection",
+    "disableioavprotection",
+    "disablescriptscanning",
+    "disableantispyware",
+    "disableantivirus",
+    "tamperprotection",
+];
+
+/// Whether a 5007's registry value is one a rule could act on: any
+/// exclusion, or one of [`DEFENDER_SECURITY_VALUES`].
+fn is_security_relevant_setting(setting: &str) -> bool {
+    let lower = setting.to_ascii_lowercase();
+    lower.contains("\\exclusions\\")
+        || DEFENDER_SECURITY_VALUES
+            .iter()
+            .any(|value| lower.ends_with(&format!("\\{value}")))
+}
+
+/// Defender renders a changed setting as `<registry value path> = <data>`.
+fn split_registry_assignment(text: &str) -> (&str, &str) {
+    match text.split_once(" = ") {
+        Some((path, data)) => (path.trim(), data.trim()),
+        None => (text.trim(), ""),
+    }
+}
+
+fn truncate_chars(text: String, max: usize) -> String {
+    if text.chars().count() <= max {
+        text
+    } else {
+        text.chars().take(max).collect()
+    }
+}
+
+/// A [`DefenderEvent`] of `kind` with nothing filled in. Defender names no
+/// actor (which process changed a setting, or owns a detection): pid 0, no
+/// comm, no user.
+fn defender_base(kind: DefenderEventKind) -> DefenderEvent {
+    DefenderEvent {
+        meta: EventMeta {
+            pid: 0,
+            ppid: 0,
+            user: User::Unknown,
+            timestamp_ns: now_ns(),
+            comm: String::new(),
+            container: None, // Windows: no container support
+            process_generation: None,
+            parent_process_generation: None,
+        },
+        kind,
+        detection_id: None,
+        threat_name: None,
+        severity_id: None,
+        category_id: None,
+        action_id: None,
+        path: None,
+        process_name: None,
+        user: None,
+        setting: None,
+        old_value: None,
+        new_value: None,
+    }
+}
+
+/// Normalizes a Defender Operational event into a [`DefenderEvent`].
+///
+/// Skipped (cursor still advances): a detection without a threat name, a
+/// 5007 about a setting no rule watches, and any event id the `XPath` filter
+/// let through that this function has no shape for.
+fn normalize_defender_block(block: &str) -> ParsedBlock {
+    let ev = xml::parse_defender_event(block)?;
+    let record_id = ev.record_id;
+    let event = match ev.event_id {
+        DEFENDER_DETECTED | DEFENDER_REMEDIATED => {
+            let Some(threat_name) = ev.threat_name else {
+                return Some((record_id, None));
+            };
+            let kind = if ev.event_id == DEFENDER_DETECTED {
+                DefenderEventKind::Detection
+            } else {
+                DefenderEventKind::Remediation
+            };
+            DefenderEvent {
+                detection_id: ev.detection_id,
+                threat_name: Some(threat_name),
+                severity_id: ev.severity_id,
+                category_id: ev.category_id,
+                action_id: ev
+                    .action_id
+                    .filter(|_| kind == DefenderEventKind::Remediation),
+                path: ev.path.map(|p| truncate_chars(p, DEFENDER_PATH_MAX_CHARS)),
+                process_name: ev.process_name,
+                user: ev.detection_user,
+                ..defender_base(kind)
+            }
+        }
+        DEFENDER_REALTIME_DISABLED | DEFENDER_SPYWARE_DISABLED | DEFENDER_VIRUS_DISABLED => {
+            // Fixed English labels: the event text is localized.
+            let component = match ev.event_id {
+                DEFENDER_REALTIME_DISABLED => "real-time protection",
+                DEFENDER_SPYWARE_DISABLED => "spyware scanning",
+                _ => "virus scanning",
+            };
+            DefenderEvent {
+                setting: Some(component.to_string()),
+                ..defender_base(DefenderEventKind::ProtectionDisabled)
+            }
+        }
+        DEFENDER_CONFIG_CHANGED => {
+            let old = ev.old_value.as_deref().map(split_registry_assignment);
+            let new = ev.new_value.as_deref().map(split_registry_assignment);
+            // The path is the same on both sides; after a removal only the
+            // old side has one.
+            let Some(path) = new
+                .map(|(path, _)| path)
+                .filter(|p| !p.is_empty())
+                .or_else(|| old.map(|(path, _)| path))
+            else {
+                return Some((record_id, None));
+            };
+            if !is_security_relevant_setting(path) {
+                return Some((record_id, None));
+            }
+            let value = |side: Option<(&str, &str)>| {
+                side.map(|(_, data)| data.to_string())
+                    .filter(|data| !data.is_empty())
+            };
+            DefenderEvent {
+                setting: Some(path.to_string()),
+                old_value: value(old),
+                new_value: value(new),
+                ..defender_base(DefenderEventKind::ConfigChanged)
+            }
+        }
+        _ => return Some((record_id, None)),
+    };
+    Some((record_id, Some(Event::Defender(event))))
+}
+
+static DEFENDER_OP: PollTarget = PollTarget {
+    label: "defender",
+    heartbeat: "windows-eventlog:defender",
+    channel: "Microsoft-Windows-Windows Defender/Operational",
+    id_filter: "EventID=1116 or EventID=1117 or EventID=5001 or EventID=5007 or EventID=5010 \
+                or EventID=5012",
+    counter: |c| &c.defender,
+    parse_block: normalize_defender_block,
+    // On by default; a disabled channel is the operator's policy decision, not
+    // something the sensor overrides (same stance as `AppLocker`).
+    enable_audit: None,
+    enabled: |c| c.defender_enabled,
+};
+
+// ── WDAC (CodeIntegrity Operational) 3076 / 3077 (#283) ─────────────────────
+
+const WDAC_EVENT_ENFORCED: u32 = 3077;
+const WDAC_EVENT_AUDITED: u32 = 3076;
+
+/// Normalizes a WDAC 3077 (blocked) / 3076 (audit mode, would have been
+/// blocked) into a [`PolicyDenialEvent`], the shape `AppLocker` verdicts use.
+///
+/// - `object_path`: `File Name`, as the **NT device path** the event carries
+///   (`\Device\HarddiskVolume3\...`): not converted to a drive letter here.
+/// - `subject_context`: `Process Name` (also an NT path), the loader.
+/// - `object_class`: `kernel-mode` / `user-mode` from `SI Signing Scenario`.
+/// - `action`: `load`. `meta.pid` is 0: the event logs the policy engine,
+///   not the loader's pid.
+///
+/// The issue's third id, 3033 (a DLL failed a signing level), is deliberately
+/// not subscribed: 584 of them on one lab host in a day, all Chrome loading
+/// its own DLLs. Skipped (cursor advances): a block without a file name, and
+/// any other event id the filter let through.
+fn normalize_wdac_block(block: &str) -> ParsedBlock {
+    let ev = xml::parse_code_integrity_event(block)?;
+    let record_id = ev.record_id;
+    let enforced = match ev.event_id {
+        WDAC_EVENT_ENFORCED => true,
+        WDAC_EVENT_AUDITED => false,
+        _ => return Some((record_id, None)),
+    };
+    let Some(file_name) = ev.file_name else {
+        return Some((record_id, None));
+    };
+    let object_class = match ev.signing_scenario {
+        Some(0) => Some("kernel-mode".to_string()),
+        Some(1) => Some("user-mode".to_string()),
+        _ => None,
+    };
+    let event = Event::PolicyDenial(PolicyDenialEvent {
+        meta: EventMeta {
+            pid: 0,
+            ppid: 0,
+            user: User::Unknown,
+            timestamp_ns: now_ns(),
+            comm: String::new(),
+            container: None, // Windows: no container support
+            process_generation: None,
+            parent_process_generation: None,
+        },
+        mechanism: POLICY_MECHANISM_WDAC.into(),
+        subject_context: ev.process_name,
+        object_context: None,
+        object_class,
+        action: Some("load".into()),
+        enforced,
+        object_path: Some(file_name),
+    });
+    Some((record_id, Some(event)))
+}
+
+static WDAC_OP: PollTarget = PollTarget {
+    label: "wdac",
+    heartbeat: "windows-eventlog:wdac",
+    channel: "Microsoft-Windows-CodeIntegrity/Operational",
+    id_filter: "EventID=3076 or EventID=3077",
+    counter: |c| &c.wdac,
+    parse_block: normalize_wdac_block,
+    // The channel is on by default; 3076/3077 only exist once a WDAC policy
+    // does. No audit toggle, nothing for the sensor to enable.
+    enable_audit: None,
+    enabled: |c| c.wdac_enabled,
+};
+
 // ── Policy-configurable allowlist and volume counters (#94) ─────────────────
 //
 // `sensor-*` crates may depend only on `schema` (`tools/check-deps.py`), so
@@ -815,6 +1065,12 @@ pub struct EventLogConfig {
     /// `Microsoft-Windows-TaskScheduler/Operational` channel; always-on
     /// complement to the 4698 path).
     pub task_scheduler_op_enabled: bool,
+    /// Defender Operational: 1116/1117 verdicts and the 5001/5007/5010/5012
+    /// tamper traces, reported as `DefenderEvent` (#283).
+    pub defender_enabled: bool,
+    /// WDAC 3076/3077 on the `CodeIntegrity` Operational channel, reported as
+    /// `PolicyDenialEvent` with `POLICY_MECHANISM_WDAC` (#283).
+    pub wdac_enabled: bool,
 }
 
 /// Every poll target. Adding one = one entry here: its switch, heartbeat name
@@ -827,6 +1083,8 @@ static TARGETS: &[&PollTarget] = &[
     &LOGON_EVENTS,
     &APPLOCKER_BLOCKS,
     &TASK_SCHEDULER_OP,
+    &DEFENDER_OP,
+    &WDAC_OP,
 ];
 
 impl Default for EventLogConfig {
@@ -841,6 +1099,8 @@ impl Default for EventLogConfig {
             logon_events_enabled: true,
             applocker_blocks_enabled: true,
             task_scheduler_op_enabled: true,
+            defender_enabled: true,
+            wdac_enabled: true,
         }
     }
 }
@@ -862,6 +1122,8 @@ pub struct EventLogCounters {
     pub logon_events: AtomicU64,
     pub applocker_blocks: AtomicU64,
     pub task_scheduler_op: AtomicU64,
+    pub defender: AtomicU64,
+    pub wdac: AtomicU64,
 }
 
 // ── The sensor ────────────────────────────────────────────────────────────────
@@ -1076,6 +1338,8 @@ mod config_tests {
         assert!(config.logon_events_enabled);
         assert!(config.applocker_blocks_enabled);
         assert!(config.task_scheduler_op_enabled);
+        assert!(config.defender_enabled);
+        assert!(config.wdac_enabled);
     }
 
     #[test]
@@ -1112,6 +1376,8 @@ mod config_tests {
             logon_events_enabled: false,
             applocker_blocks_enabled: false,
             task_scheduler_op_enabled: false,
+            defender_enabled: false,
+            wdac_enabled: false,
         });
         let caps = sensor.capabilities();
         assert!(!caps.file_events);
@@ -1128,6 +1394,8 @@ mod config_tests {
             logon_events_enabled: false,
             applocker_blocks_enabled: false,
             task_scheduler_op_enabled: false,
+            defender_enabled: false,
+            wdac_enabled: false,
         });
         assert!(sensor.capabilities().file_events);
     }
@@ -1143,6 +1411,8 @@ mod config_tests {
             logon_events_enabled: false,
             applocker_blocks_enabled: true,
             task_scheduler_op_enabled: false,
+            defender_enabled: false,
+            wdac_enabled: false,
             transport: EventLogTransport::default(),
         });
         assert!(!sensor.capabilities().file_events);
@@ -1157,6 +1427,8 @@ mod config_tests {
             logon_events_enabled: false,
             applocker_blocks_enabled: false,
             task_scheduler_op_enabled: true,
+            defender_enabled: false,
+            wdac_enabled: false,
             transport: EventLogTransport::default(),
         });
         assert!(sensor.capabilities().file_events);
@@ -1173,6 +1445,8 @@ mod config_tests {
         assert_eq!(counters.logon_events.load(Ordering::Relaxed), 0);
         assert_eq!(counters.applocker_blocks.load(Ordering::Relaxed), 0);
         assert_eq!(counters.task_scheduler_op.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.defender.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.wdac.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1192,6 +1466,8 @@ mod config_tests {
                 "windows-eventlog:logon",
                 "windows-eventlog:applocker-block",
                 "windows-eventlog:task-scheduler-op",
+                "windows-eventlog:defender",
+                "windows-eventlog:wdac",
             ]
         );
     }
@@ -1205,6 +1481,8 @@ mod config_tests {
             logon_events_enabled: true,
             applocker_blocks_enabled: false,
             task_scheduler_op_enabled: false,
+            defender_enabled: false,
+            wdac_enabled: false,
             transport: EventLogTransport::Polling,
         });
         let names: Vec<_> = sensor.liveness().into_iter().map(|(n, _)| n).collect();
@@ -1540,6 +1818,224 @@ mod applocker_tests {
         let block = "<Event><System><EventID>8004</EventID><EventRecordID>9</EventRecordID></System>\
             <UserData><RuleAndFileData><PolicyName>EXE</PolicyName></RuleAndFileData></UserData></Event>";
         assert_eq!(normalize_applocker_block(block), Some((9, None)));
+    }
+}
+
+#[cfg(test)]
+mod defender_wdac_tests {
+    use super::*;
+
+    fn defender_block(event_id: u32, data: &str) -> String {
+        format!(
+            "<Event><System><EventID>{event_id}</EventID><EventRecordID>31</EventRecordID></System><EventData>{data}</EventData></Event>"
+        )
+    }
+
+    fn defender_event(block: &str) -> DefenderEvent {
+        let (record_id, event) = normalize_defender_block(block).expect("should parse");
+        assert_eq!(record_id, 31);
+        match event.expect("should normalize") {
+            Event::Defender(e) => e,
+            other => panic!("expected a DefenderEvent, got {other:?}"),
+        }
+    }
+
+    fn skipped(block: &str) -> bool {
+        matches!(normalize_defender_block(block), Some((31, None)))
+    }
+
+    const DETECTION: &str = "<Data Name='Detection ID'>{AAAA}</Data><Data Name='Threat Name'>Trojan:Win32/Lab.A</Data><Data Name='Severity ID'>5</Data><Data Name='Category ID'>8</Data><Data Name='Process Name'>Unknown</Data><Data Name='Detection User'>LAB\\alice</Data><Data Name='Path'>file:_C:\\Users\\Public\\x.exe</Data><Data Name='Action ID'>9</Data>";
+
+    #[test]
+    fn a_detection_keeps_ids_and_drops_the_action_of_a_non_remediation() {
+        let e = defender_event(&defender_block(1116, DETECTION));
+        assert_eq!(e.kind, DefenderEventKind::Detection);
+        assert_eq!(e.threat_name.as_deref(), Some("Trojan:Win32/Lab.A"));
+        assert_eq!((e.severity_id, e.category_id), (Some(5), Some(8)));
+        assert_eq!(
+            e.action_id, None,
+            "1116 carries `Action ID` 9 = not applicable"
+        );
+        assert_eq!(e.user.as_deref(), Some(r"LAB\alice"));
+        assert_eq!(e.process_name, None);
+        assert_eq!(e.meta.pid, 0);
+        let r = defender_event(&defender_block(1117, &DETECTION.replace(">9<", ">3<")));
+        assert_eq!(r.kind, DefenderEventKind::Remediation);
+        assert_eq!(r.action_id, Some(3));
+    }
+
+    #[test]
+    fn a_command_line_detection_path_is_cut() {
+        let long = "x".repeat(DEFENDER_PATH_MAX_CHARS * 3);
+        let data = format!(
+            "<Data Name='Threat Name'>HackTool:Win32/Lab.B</Data><Data Name='Path'>CmdLine:_{long}</Data>"
+        );
+        let e = defender_event(&defender_block(1116, &data));
+        assert_eq!(e.path.unwrap().chars().count(), DEFENDER_PATH_MAX_CHARS);
+    }
+
+    #[test]
+    fn a_detection_without_a_threat_name_is_skipped() {
+        assert!(skipped(&defender_block(
+            1116,
+            "<Data Name='Severity ID'>4</Data>"
+        )));
+    }
+
+    #[test]
+    fn protection_turned_off_uses_fixed_english_labels() {
+        for (id, label) in [
+            (5001, "real-time protection"),
+            (5010, "spyware scanning"),
+            (5012, "virus scanning"),
+        ] {
+            let e = defender_event(&defender_block(
+                id,
+                "<Data Name='Product Name'>Antivirus Microsoft Defender</Data>",
+            ));
+            assert_eq!(e.kind, DefenderEventKind::ProtectionDisabled, "{id}");
+            assert_eq!(e.setting.as_deref(), Some(label), "{id}");
+        }
+    }
+
+    #[test]
+    fn an_exclusion_added_keeps_path_and_value() {
+        let data = r"<Data Name='Old Value'></Data><Data Name='New Value'>HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths\C:\Users\Public = 0x0</Data>";
+        let e = defender_event(&defender_block(5007, data));
+        assert_eq!(e.kind, DefenderEventKind::ConfigChanged);
+        assert_eq!(
+            e.setting.as_deref(),
+            Some(r"HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths\C:\Users\Public")
+        );
+        assert_eq!((e.old_value, e.new_value.as_deref()), (None, Some("0x0")));
+    }
+
+    #[test]
+    fn an_exclusion_removed_is_reported_from_the_old_side() {
+        let data = r"<Data Name='Old Value'>HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Extensions\.zip = 0x0</Data><Data Name='New Value'></Data>";
+        let e = defender_event(&defender_block(5007, data));
+        assert_eq!(
+            e.setting.as_deref(),
+            Some(r"HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Extensions\.zip")
+        );
+        assert_eq!((e.old_value.as_deref(), e.new_value), (Some("0x0"), None));
+    }
+
+    #[test]
+    fn a_protection_switch_change_carries_both_values() {
+        let data = r"<Data Name='Old Value'>HKLM\SOFTWARE\Microsoft\Windows Defender\Real-Time Protection\DisableRealtimeMonitoring = 0x0</Data><Data Name='New Value'>HKLM\SOFTWARE\Microsoft\Windows Defender\Real-Time Protection\DisableRealtimeMonitoring = 0x1</Data>";
+        let e = defender_event(&defender_block(5007, data));
+        assert!(e.setting.unwrap().ends_with(r"\DisableRealtimeMonitoring"));
+        assert_eq!(
+            (e.old_value.as_deref(), e.new_value.as_deref()),
+            (Some("0x0"), Some("0x1"))
+        );
+    }
+
+    #[test]
+    fn the_5007_start_up_flood_is_filtered_out() {
+        // The values that were 40 % of the lab host's whole channel.
+        for noise in [
+            r"HKLM\SOFTWARE\Microsoft\Windows Defender\IsServiceRunning = 0x1",
+            r"HKLM\SOFTWARE\Microsoft\Windows Defender\Diagnostics\InitializingComponentProgress = LoadingEngine",
+            r"HKLM\SOFTWARE\Microsoft\Windows Defender\CoreService\WdConfigHash = 0x8FF20051",
+            r"HKLM\SOFTWARE\Microsoft\Windows Defender\ServiceStartStates = 0x1",
+        ] {
+            let data =
+                format!("<Data Name='Old Value'></Data><Data Name='New Value'>{noise}</Data>");
+            assert!(skipped(&defender_block(5007, &data)), "{noise}");
+        }
+    }
+
+    #[test]
+    fn a_5007_without_any_value_is_skipped_and_unknown_ids_too() {
+        assert!(skipped(&defender_block(5007, "")));
+        assert!(skipped(&defender_block(1234, DETECTION)));
+    }
+
+    // ── WDAC ────────────────────────────────────────────────────────────────
+
+    fn wdac_block(event_id: u32, data: &str) -> String {
+        format!(
+            "<Event><System><EventID>{event_id}</EventID><EventRecordID>8</EventRecordID></System><EventData>{data}</EventData></Event>"
+        )
+    }
+
+    const WDAC_DATA: &str = r"<Data Name='File Name'>\Device\HarddiskVolume3\Users\Public\x.dll</Data><Data Name='Process Name'>\Device\HarddiskVolume3\Windows\System32\rundll32.exe</Data><Data Name='SI Signing Scenario'>1</Data>";
+
+    fn wdac_denial(event_id: u32, data: &str) -> PolicyDenialEvent {
+        match normalize_wdac_block(&wdac_block(event_id, data))
+            .expect("should parse")
+            .1
+            .expect("should normalize")
+        {
+            Event::PolicyDenial(e) => e,
+            other => panic!("expected a PolicyDenialEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wdac_3077_is_an_enforced_denial_and_3076_an_audit_one() {
+        let blocked = wdac_denial(3077, WDAC_DATA);
+        assert_eq!(blocked.mechanism, POLICY_MECHANISM_WDAC);
+        assert!(blocked.enforced);
+        assert_eq!(
+            blocked.object_path.as_deref(),
+            Some(r"\Device\HarddiskVolume3\Users\Public\x.dll")
+        );
+        assert_eq!(
+            blocked.subject_context.as_deref(),
+            Some(r"\Device\HarddiskVolume3\Windows\System32\rundll32.exe")
+        );
+        assert_eq!(blocked.object_class.as_deref(), Some("user-mode"));
+        assert_eq!(blocked.action.as_deref(), Some("load"));
+        assert!(!wdac_denial(3076, WDAC_DATA).enforced);
+    }
+
+    #[test]
+    fn wdac_kernel_scenario_and_unknown_scenario() {
+        let kernel = wdac_denial(3077, &WDAC_DATA.replace(">1<", ">0<"));
+        assert_eq!(kernel.object_class.as_deref(), Some("kernel-mode"));
+        let unknown = wdac_denial(3077, &WDAC_DATA.replace(">1<", ">7<"));
+        assert_eq!(unknown.object_class, None);
+    }
+
+    #[test]
+    fn wdac_without_a_file_name_or_with_another_id_is_skipped() {
+        assert!(matches!(
+            normalize_wdac_block(&wdac_block(
+                3077,
+                "<Data Name='SI Signing Scenario'>1</Data>"
+            )),
+            Some((8, None))
+        ));
+        // 3033 (a DLL failed a signing level) is Chrome noise: not subscribed,
+        // and refused here if the filter ever let one through.
+        assert!(matches!(
+            normalize_wdac_block(&wdac_block(3033, WDAC_DATA)),
+            Some((8, None))
+        ));
+    }
+
+    #[test]
+    fn the_new_targets_are_wired_with_their_filters() {
+        assert_eq!(
+            DEFENDER_OP.channel,
+            "Microsoft-Windows-Windows Defender/Operational"
+        );
+        for id in ["1116", "1117", "5001", "5007", "5010", "5012"] {
+            assert!(
+                DEFENDER_OP.id_filter.contains(&format!("EventID={id}")),
+                "{id}"
+            );
+        }
+        assert_eq!(
+            WDAC_OP.channel,
+            "Microsoft-Windows-CodeIntegrity/Operational"
+        );
+        assert!(!WDAC_OP.id_filter.contains("3033"));
+        assert!(TARGETS.iter().any(|t| t.label == "defender"));
+        assert!(TARGETS.iter().any(|t| t.label == "wdac"));
     }
 }
 

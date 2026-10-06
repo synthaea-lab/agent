@@ -58,6 +58,7 @@ const DISPATCH_ENTRIES: &[(libc::c_long, u32)] = &[
     (libc::SYS_capset, 41),
     (libc::SYS_setns, 42),
     (libc::SYS_unshare, 43),
+    (libc::SYS_recvfrom, 44),
 ];
 
 /// Linux's asm-generic syscall numbers used by native AArch64. Legacy syscalls
@@ -102,6 +103,7 @@ const DISPATCH_ENTRIES: &[(libc::c_long, u32)] = &[
     (91, 41),  // capset
     (268, 42), // setns
     (97, 43),  // unshare
+    (207, 44), // recvfrom
 ];
 
 #[cfg(ebpf_embedded)]
