@@ -1326,11 +1326,17 @@ impl RuleState {
     /// mark-of-the-web removed from its host file (#442). No alert on its own —
     /// `Unblock-File` over a downloaded module tree removes hundreds of marks
     /// legitimately, and the event itself stays in the telemetry for hunting.
+    ///
+    /// A `User::Unknown` remover counts: the Windows sensor reports it when the
+    /// process exited or is protected before its token was read, which is the
+    /// shape of a one-shot `cmd /c "powershell Unblock-File x.exe & x.exe"`.
+    /// What rules out a Unix file merely named `x:Zone.Identifier` is a Unix
+    /// user or a POSIX path, the evidence that it is not a Windows stream.
     fn record_motw_removal(&mut self, event: &FileDeleteEvent) {
-        if !matches!(event.meta.user, User::Windows { .. }) {
+        if matches!(event.meta.user, User::Unix { .. }) {
             return;
         }
-        let Some(host) = motw_stream_host(&event.path) else {
+        let Some(host) = motw_stream_host(&event.path).filter(|host| !host.starts_with('/')) else {
             return;
         };
         self.recent_motw_removals.insert(

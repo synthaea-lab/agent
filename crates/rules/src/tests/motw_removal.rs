@@ -144,6 +144,48 @@ fn deleting_the_file_itself_or_another_stream_is_not_a_mark_removal() {
 }
 
 #[test]
+fn a_remover_whose_token_was_unreadable_still_counts() {
+    // `cmd /c "powershell Unblock-File x.exe & x.exe"`: the unblocking
+    // process is gone before the sensor reads its token.
+    let mut state = RuleState::new();
+    state.on_file_delete(&delete(
+        EventMeta {
+            pid: 778,
+            timestamp_ns: 0,
+            comm: "powershell.exe".into(),
+            user: User::Unknown,
+            ..meta()
+        },
+        &stream(DOWNLOAD),
+    ));
+    let alerts = state.on_exec(&run(DOWNLOAD, 1_000_000_000));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1553.005");
+}
+
+#[test]
+fn a_unix_users_delete_named_like_a_windows_stream_is_ignored() {
+    let mut state = RuleState::new();
+    let unix = EventMeta {
+        user: User::Unix {
+            uid: 1000,
+            gid: 1000,
+        },
+        ..meta()
+    };
+    state.on_file_delete(&delete(unix.clone(), &stream(DOWNLOAD)));
+    assert!(
+        state
+            .on_exec(&ExecEvent {
+                meta: unix,
+                image_path: DOWNLOAD.into(),
+                ..schema::fixtures::exec()
+            })
+            .is_empty()
+    );
+}
+
+#[test]
 fn a_unix_delete_named_like_a_stream_is_ignored() {
     let mut state = RuleState::new();
     state.on_file_delete(&delete(meta(), "/tmp/x:Zone.Identifier"));
