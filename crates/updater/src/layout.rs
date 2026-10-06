@@ -305,24 +305,52 @@ impl Layout {
     /// recovery even when `apply-release` ran as root (#656). Symlinks are
     /// re-owned, never followed.
     ///
+    /// The walk is post-order: a directory is handed over only after everything under
+    /// it, and `versions/` last. A directory the service user owns is one it can
+    /// rename entries in, so handing it over first would let a compromised agent swap
+    /// an entry for a symlink while this process, running as root, is still
+    /// descending (the next `lchown` would follow it). Until its own turn a directory
+    /// is still root's.
+    ///
     /// The base directory is the reference rather than a configured user name
     /// because the package already gives it to the service user; a layout owned by
     /// the caller (a dev run, the tests) makes this a no-op.
     ///
     /// # Errors
     ///
-    /// [`UpdaterError::Io`] if the base directory cannot be read or a path cannot be
-    /// re-owned.
+    /// [`UpdaterError::Io`] if the base directory cannot be read, `versions/` or the
+    /// release is missing or is not a real directory (a symlink is refused), or a
+    /// path cannot be re-owned.
     pub fn adopt_service_ownership(&self, release_version: u64) -> Result<(), UpdaterError> {
-        let io_at = |path: &Path| {
-            let path = path.to_path_buf();
-            move |source| UpdaterError::Io { path, source }
-        };
-        let owner = fs::metadata(&self.base_dir).map_err(io_at(&self.base_dir))?;
+        let owner = fs::metadata(&self.base_dir).map_err(|source| UpdaterError::Io {
+            path: self.base_dir.clone(),
+            source,
+        })?;
         let (uid, gid) = (owner.uid(), owner.gid());
+        self.adopt_with(release_version, &mut |path| {
+            lchown(path, Some(uid), Some(gid))
+        })
+    }
+
+    /// [`Self::adopt_service_ownership`] with the re-owning injected, so the order of
+    /// the walk can be asserted without being root.
+    fn adopt_with(
+        &self,
+        release_version: u64,
+        chown: &mut dyn FnMut(&Path) -> io::Result<()>,
+    ) -> Result<(), UpdaterError> {
         let versions = self.versions_dir();
-        lchown(&versions, Some(uid), Some(gid)).map_err(io_at(&versions))?;
-        chown_tree(&self.version_dir(release_version), uid, gid)
+        let release = self.version_dir(release_version);
+        // Checked before anything is re-owned, so a missing release leaves `versions/`
+        // as it was and a path swapped for a symlink is never walked.
+        for dir in [&versions, &release] {
+            require_real_dir(dir)?;
+        }
+        chown_tree(&release, chown)?;
+        chown(&versions).map_err(|source| UpdaterError::Io {
+            path: versions,
+            source,
+        })
     }
 
     /// Deletes a superseded release's directory entirely (ADR-0015 Decision 8:
@@ -344,20 +372,37 @@ impl Layout {
     }
 }
 
-/// `lchown` of `path` and everything under it; a symlink is re-owned itself and
-/// never descended into.
-fn chown_tree(path: &Path, uid: u32, gid: u32) -> Result<(), UpdaterError> {
+/// Fails unless `path` is itself a directory, not a symlink to one.
+fn require_real_dir(path: &Path) -> Result<(), UpdaterError> {
     let io_at = |source| UpdaterError::Io {
         path: path.to_path_buf(),
         source,
     };
-    lchown(path, Some(uid), Some(gid)).map_err(io_at)?;
+    if fs::symlink_metadata(path).map_err(io_at)?.is_dir() {
+        return Ok(());
+    }
+    Err(io_at(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "not a directory (a symlink is refused)",
+    )))
+}
+
+/// Re-owns `path` and everything under it, children before their directory; a symlink
+/// is re-owned itself and never descended into.
+fn chown_tree(
+    path: &Path,
+    chown: &mut dyn FnMut(&Path) -> io::Result<()>,
+) -> Result<(), UpdaterError> {
+    let io_at = |source| UpdaterError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
     if fs::symlink_metadata(path).map_err(io_at)?.is_dir() {
         for entry in fs::read_dir(path).map_err(io_at)? {
-            chown_tree(&entry.map_err(io_at)?.path(), uid, gid)?;
+            chown_tree(&entry.map_err(io_at)?.path(), chown)?;
         }
     }
-    Ok(())
+    chown(path).map_err(io_at)
 }
 
 #[cfg(test)]
@@ -610,5 +655,115 @@ mod tests {
         let (_dir, layout) = layout();
         assert!(layout.adopt_service_ownership(9).is_err());
         assert!(!layout.version_dir(9).exists());
+    }
+
+    /// A directory the service user owns is one it can rename entries in, so the walk
+    /// must hand each directory over after everything under it (#656 review).
+    #[test]
+    fn a_directory_is_handed_over_only_after_everything_under_it() {
+        let (_dir, layout) = layout();
+        let release = layout.version_dir(2);
+        fs::create_dir_all(release.join("a/b")).unwrap();
+        fs::write(release.join("a/b/file"), b"x").unwrap();
+        fs::write(release.join("agent"), b"x").unwrap();
+        symlink("/etc", release.join("a/link")).unwrap();
+
+        let mut order = Vec::new();
+        layout
+            .adopt_with(2, &mut |path| {
+                order.push(path.to_path_buf());
+                Ok(())
+            })
+            .unwrap();
+
+        let position = |p: &Path| order.iter().position(|o| o == p).unwrap();
+        for path in &order {
+            for later in order.iter().filter(|o| o.starts_with(path) && *o != path) {
+                assert!(
+                    position(later) < position(path),
+                    "{} was handed over before {}, which is under it",
+                    path.display(),
+                    later.display()
+                );
+            }
+        }
+        assert_eq!(
+            order.last(),
+            Some(&layout.versions_dir()),
+            "versions/ is last"
+        );
+        assert_eq!(
+            order[order.len() - 2],
+            release,
+            "the release directory comes right before versions/"
+        );
+        assert!(
+            order.contains(&release.join("a/link")),
+            "the link itself is re-owned"
+        );
+        assert!(
+            !order.iter().any(|p| p.starts_with("/etc")),
+            "a symlink is never followed"
+        );
+    }
+
+    #[test]
+    fn a_release_swapped_for_a_symlink_is_refused_before_anything_is_handed_over() {
+        let (dir, layout) = layout();
+        let target = dir.path().join("elsewhere");
+        fs::create_dir_all(&target).unwrap();
+        symlink(&target, layout.version_dir(2)).unwrap();
+
+        let mut handed_over = 0;
+        let result = layout.adopt_with(2, &mut |_| {
+            handed_over += 1;
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(handed_over, 0);
+    }
+
+    /// The real thing, which needs root (or a user namespace where one is root and
+    /// another uid is mapped: `unshare -U --map-root-user --map-users=auto
+    /// --map-groups=auto cargo test -p updater adopting`). Skipped otherwise.
+    #[test]
+    fn adopting_ownership_re_owns_a_root_owned_release_to_the_base_owner() {
+        // `/proc/self` belongs to the effective uid.
+        if fs::metadata("/proc/self").unwrap().uid() != 0 {
+            eprintln!("skipped: needs root to re-own to another uid");
+            return;
+        }
+        const SERVICE: u32 = 1;
+        let (dir, layout) = layout();
+        let release = layout.version_dir(2);
+        fs::create_dir_all(release.join("sub")).unwrap();
+        fs::write(release.join("sub/agent"), b"x").unwrap();
+        let outside = dir.path().join("outside");
+        fs::write(&outside, b"x").unwrap();
+        symlink(&outside, release.join("link")).unwrap();
+        lchown(&layout.base_dir, Some(SERVICE), Some(SERVICE)).unwrap();
+
+        layout.adopt_service_ownership(2).unwrap();
+
+        let owner = |p: &Path| {
+            let m = fs::symlink_metadata(p).unwrap();
+            (m.uid(), m.gid())
+        };
+        for path in [
+            layout.versions_dir(),
+            release.clone(),
+            release.join("sub"),
+            release.join("sub/agent"),
+            release.join("link"),
+        ] {
+            assert_eq!(owner(&path), (SERVICE, SERVICE), "{}", path.display());
+        }
+        assert_eq!(owner(&outside), (0, 0), "the link's target is not touched");
+        assert_eq!(
+            owner(&layout.bootstrap_dir()),
+            (0, 0),
+            "bootstrap is not touched"
+        );
     }
 }
