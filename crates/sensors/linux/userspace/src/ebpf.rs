@@ -36,6 +36,9 @@ pub(crate) fn err(msg: String) -> SensorError {
 /// only populated once the kernel-side call returns, so the enter and exit halves
 /// are attached as a pair (`ebpf/src/main.rs`'s `ACCEPT_ARGS` map correlates them).
 ///
+/// `sys_enter_recvfrom`/`sys_exit_recvfrom` (issue #263) use the same pair for the
+/// sender's address (`ebpf/src/main.rs`'s `RECVFROM_ARGS`).
+///
 /// `sys_enter_setxattr`/`sys_enter_removexattr` (issue #262 Phase 3) cover the
 /// plain path-taking syscalls only — `lsetxattr`/`fsetxattr` (symlink/fd-only
 /// variants) are deferred, same posture as `chmod`/`chown`'s fd-only siblings.
@@ -80,6 +83,8 @@ pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
     ("sys_enter_accept4", "syscalls", "sys_enter_accept4"),
     ("sys_exit_accept", "syscalls", "sys_exit_accept"),
     ("sys_exit_accept4", "syscalls", "sys_exit_accept4"),
+    ("sys_enter_recvfrom", "syscalls", "sys_enter_recvfrom"),
+    ("sys_exit_recvfrom", "syscalls", "sys_exit_recvfrom"),
     ("sys_enter_setxattr", "syscalls", "sys_enter_setxattr"),
     ("sys_enter_removexattr", "syscalls", "sys_enter_removexattr"),
     ("sys_enter_mount", "syscalls", "sys_enter_mount"),
@@ -231,6 +236,45 @@ fn tamper_pin_path() -> std::path::PathBuf {
     ))
 }
 
+/// What [`reclaim_foreign_pin`] found at the pin path.
+#[derive(Debug)]
+#[cfg_attr(not(ebpf_embedded), allow(dead_code))]
+enum PinState {
+    /// No pin: nothing to do.
+    Absent,
+    /// The pin belongs to this user: aya reuses it, which is the point of pinning.
+    Ours,
+    /// A pin left by another user was removed, so a fresh one can be created.
+    Reclaimed { owner: u32 },
+    /// A pin left by another user is still there: this user cannot remove it.
+    Stuck { owner: u32, error: std::io::Error },
+}
+
+/// Removes a pin that another user left (#589). A host that ran the agent as root
+/// before the packaged unit (an older package, a lab run) keeps
+/// `signal_tamper_last_v*` owned by `root:root 0600`, which the unprivileged
+/// `synthaea` agent can neither open nor replace: it then started without the pin and
+/// logged only a generic warning. The pin directory is the agent's own (`0700`, owned
+/// by it), and unlinking needs write access to the directory, not to the file, so the
+/// agent can clear the stale entry itself. Only a pin owned by someone else is
+/// touched; its own is the cross-restart state this exists to keep.
+#[cfg_attr(not(ebpf_embedded), allow(dead_code))]
+fn reclaim_foreign_pin(pin: &std::path::Path, me: u32) -> PinState {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let Ok(meta) = std::fs::symlink_metadata(pin) else {
+        return PinState::Absent;
+    };
+    if meta.uid() == me {
+        return PinState::Ours;
+    }
+    let owner = meta.uid();
+    match std::fs::remove_file(pin) {
+        Ok(()) => PinState::Reclaimed { owner },
+        Err(error) => PinState::Stuck { owner, error },
+    }
+}
+
 /// [`load_ebpf`] for `LinuxSensor::run` (issue #362): same object, but
 /// `SIGNAL_TAMPER_LAST` is pinned under [`PIN_DIR`] so it outlives the agent. A
 /// `SIGKILL` is then still attributable after the restart that follows it. Without
@@ -245,10 +289,31 @@ fn tamper_pin_path() -> std::path::PathBuf {
 pub(crate) fn load_ebpf_for_run() -> Result<aya::Ebpf, SensorError> {
     use std::os::unix::fs::PermissionsExt as _;
 
+    let pin = tamper_pin_path();
     let pinned = std::fs::create_dir_all(PIN_DIR)
         .and_then(|()| std::fs::set_permissions(PIN_DIR, std::fs::Permissions::from_mode(0o700)))
         .map_err(|e| e.to_string())
-        .and_then(|()| load_embedded(Some(&tamper_pin_path())).map_err(|e| e.to_string()));
+        .and_then(|()| {
+            // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+            let me = unsafe { libc::geteuid() };
+            match reclaim_foreign_pin(&pin, me) {
+                PinState::Reclaimed { owner } => tracing::info!(
+                    pin = %pin.display(),
+                    owner,
+                    "removed a SIGNAL_TAMPER_LAST pin left by another user; creating a fresh one"
+                ),
+                PinState::Stuck { owner, error } => tracing::warn!(
+                    pin = %pin.display(),
+                    owner,
+                    %error,
+                    "a SIGNAL_TAMPER_LAST pin left by another user cannot be removed by this \
+                     user: remove it with `sudo rm {}` and restart",
+                    pin.display()
+                ),
+                PinState::Absent | PinState::Ours => {}
+            }
+            load_embedded(Some(&pin)).map_err(|e| e.to_string())
+        });
     match pinned {
         Ok(ebpf) => Ok(ebpf),
         Err(e) => {
@@ -462,4 +527,77 @@ pub(crate) fn clear_tamper_slot(slot: &mut TamperSlot) -> Result<(), SensorError
     let zero: sensor_linux_wire::SignalEvent = unsafe { core::mem::zeroed() };
     slot.set(0, PodSignal(zero), 0)
         .map_err(|e| err(format!("failed to clear SIGNAL_TAMPER_LAST: {e}")))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod pin_tests {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    use super::*;
+
+    fn dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sensor-pin-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn my_uid(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path).unwrap().uid()
+    }
+
+    #[test]
+    fn no_pin_means_nothing_to_do() {
+        let d = dir("absent");
+        assert!(matches!(
+            reclaim_foreign_pin(&d.join("signal_tamper_last_v21"), my_uid(&d)),
+            PinState::Absent
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_pin_this_user_owns_is_kept() {
+        let d = dir("ours");
+        let pin = d.join("signal_tamper_last_v21");
+        std::fs::write(&pin, b"x").unwrap();
+        assert!(matches!(
+            reclaim_foreign_pin(&pin, my_uid(&d)),
+            PinState::Ours
+        ));
+        assert!(pin.exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_pin_another_user_left_is_removed() {
+        let d = dir("foreign");
+        let pin = d.join("signal_tamper_last_v21");
+        std::fs::write(&pin, b"x").unwrap();
+        std::fs::set_permissions(&pin, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // The file is ours; the agent running as some other uid sees it as foreign.
+        let other = my_uid(&d) + 1;
+        assert!(matches!(
+            reclaim_foreign_pin(&pin, other),
+            PinState::Reclaimed { owner } if owner == my_uid(&d)
+        ));
+        assert!(!pin.exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_foreign_pin_in_a_directory_we_cannot_write_is_reported_not_hidden() {
+        let d = dir("stuck");
+        let pin = d.join("signal_tamper_last_v21");
+        std::fs::write(&pin, b"x").unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let state = reclaim_foreign_pin(&pin, my_uid(&d) + 1);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // root ignores directory permissions, where the removal simply succeeds.
+        if !matches!(state, PinState::Reclaimed { .. }) {
+            assert!(matches!(state, PinState::Stuck { .. }), "{state:?}");
+            assert!(pin.exists());
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

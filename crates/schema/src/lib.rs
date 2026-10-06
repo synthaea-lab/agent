@@ -233,7 +233,18 @@ pub mod time;
 /// `ScriptBlock`. 36 was claimed by #478 (`HttpRequest`/`HttpSummary`) while
 /// both branches were open; #478 merged first, so this one renumbers — same
 /// coordination note as v13, v28→29, v30→31 and v32→33 above.
-pub const SCHEMA_VERSION: u32 = 37;
+///
+/// Bumped 37 → 38 for [`Event::Defender`] (#283): Microsoft Defender
+/// Antivirus verdicts and tamper traces (EIDs 1116/1117/5001/5007/5010/5012
+/// of its Operational channel). Windows-only. #632 (`LdapSearch`) also
+/// targets v38 while both branches are open: whichever merges second
+/// renumbers, same coordination note as v13, v28→29, v30→31 and v32→33.
+///
+/// Bumped 38 → 39 for [`Event::UdpRecv`] (#263): one new enum variant for inbound
+/// UDP datagrams (`recvfrom(2)`) on Linux, the counterpart of [`Event::UdpSend`].
+/// #654 also targets v39 while both branches are open: whichever merges second
+/// renumbers, as above.
+pub const SCHEMA_VERSION: u32 = 39;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -934,6 +945,91 @@ pub struct DnsQueryEvent {
     pub status: u32,
 }
 
+/// What a [`DefenderEvent`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefenderEventKind {
+    /// Defender detected a threat (EID 1116).
+    Detection,
+    /// Defender acted on a detected threat (EID 1117). Shares
+    /// [`DefenderEvent::detection_id`] with the [`Detection`](Self::Detection)
+    /// it follows.
+    Remediation,
+    /// A protection component was turned off (EIDs 5001 real-time protection,
+    /// 5010 spyware scanning, 5012 virus scanning): [`DefenderEvent::setting`]
+    /// names which.
+    ProtectionDisabled,
+    /// A security-relevant Defender setting changed (EID 5007): exclusions,
+    /// the real-time/behavior/script protection switches, Tamper Protection.
+    /// The channel logs every internal state write as a 5007 (42 % of the
+    /// Operational channel on a lab host, almost all service start-up
+    /// progress), so the sensor forwards only these keys.
+    ConfigChanged,
+}
+
+/// An event from the Microsoft Defender Antivirus Operational channel (#283):
+/// its own verdicts, and the traces of someone weakening it (T1562.001).
+///
+/// Everything here is as Defender reports it, **not translated**: the channel
+/// is localized (a French host writes `Severity Name` as "Élevée" and
+/// `Action Name` as "Supprimer"), so identifiers are numeric ids and the
+/// component names of [`DefenderEventKind::ProtectionDisabled`] are fixed
+/// English labels chosen by the sensor, never Defender's text. `meta` carries
+/// no actor: Defender does not say which process changed a setting or which
+/// one a detection belongs to, so `pid`/`ppid` are 0 and `comm` is empty.
+/// Fields are `None` when the kind does not carry them or the event left them
+/// empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefenderEvent {
+    pub meta: EventMeta,
+    pub kind: DefenderEventKind,
+    /// Detection / Remediation: Defender's detection GUID, the same for a
+    /// 1116 and the 1117 that follows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection_id: Option<String>,
+    /// Detection / Remediation: the threat as Defender names it
+    /// (`HackTool:Win32/Mimikatz.I`). Not localized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threat_name: Option<String>,
+    /// Detection / Remediation: Defender's `Severity ID` (1 low, 2 moderate,
+    /// 4 high, 5 severe).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity_id: Option<u32>,
+    /// Detection / Remediation: Defender's `Category ID`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category_id: Option<u32>,
+    /// Remediation: Defender's `Action ID` (1 clean, 2 quarantine, 3 remove,
+    /// 4 allow, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<u32>,
+    /// Detection / Remediation: the resource, as Defender reports it
+    /// (`file:_C:\x.exe`, `CmdLine:_...`, `regkey:_...`). Cut to the sensor's
+    /// limit: for a command-line detection it is the whole command line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Detection / Remediation: the process Defender associates with the
+    /// resource, when it knows one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+    /// Detection / Remediation: the account Defender attributes the detection
+    /// to, as a name (`DOMAIN\user`), not a SID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// `ProtectionDisabled`: which component (`real-time protection`,
+    /// `spyware scanning`, `virus scanning`). `ConfigChanged`: the registry
+    /// value that changed (`HKLM\SOFTWARE\Microsoft\Windows
+    /// Defender\Exclusions\Paths\C:\Temp`; for an exclusion the value name
+    /// *is* the excluded item).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setting: Option<String>,
+    /// `ConfigChanged`: the value before, as Defender wrote it (`0x1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_value: Option<String>,
+    /// `ConfigChanged`: the value after. Empty after a removal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_value: Option<String>,
+}
+
 /// WMI activity — query execution (EID 23) or method invocation (EID 24) from the
 /// Microsoft-Windows-WMI-Activity provider.
 ///
@@ -1121,6 +1217,20 @@ pub struct UdpSendEvent {
     pub dport: u16,
     /// UDP payload size in bytes. Useful for detecting large DNS queries (tunneling)
     /// and volumetric anomalies — normal DNS queries are under 512 bytes.
+    pub size: u32,
+}
+
+/// UDP datagram received (`recvfrom(2)`, Linux, issue #263) — the inbound
+/// counterpart of [`UdpSendEvent`], carrying the sender's address. Emitted only
+/// when the kernel reported a source address (a connected-socket `recv(2)` has
+/// none), and only on success. `size` is the bytes actually received, not the
+/// buffer length requested.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UdpRecvEvent {
+    pub meta: EventMeta,
+    /// Sender's address (the remote end of the datagram).
+    pub peer_addr: core::net::IpAddr,
+    pub peer_port: u16,
     pub size: u32,
 }
 
@@ -1548,6 +1658,14 @@ pub const POLICY_MECHANISM_SELINUX: &str = "selinux";
 /// [`PolicyDenialEvent`]'s doc on why `mechanism` is not a closed enum).
 pub const POLICY_MECHANISM_APPLOCKER: &str = "applocker";
 
+/// [`PolicyDenialEvent::mechanism`] value for Windows Defender Application
+/// Control (WDAC / App Control for Business) verdicts (`sensor-windows-eventlog`,
+/// #283): event 3077 (blocked, `enforced: true`) and 3076 (audit mode, would
+/// have been blocked, `enforced: false`) on the
+/// `Microsoft-Windows-CodeIntegrity/Operational` channel. A new value of the
+/// existing `String` field, not a schema version bump.
+pub const POLICY_MECHANISM_WDAC: &str = "wdac";
+
 /// An OS security mechanism denied a subject an action on an object —
 /// `SELinux`/`AppArmor` on Linux, AppLocker/WDAC on Windows, TCC/Gatekeeper on
 /// macOS all report the same underlying shape (issue #297). A dedicated,
@@ -1890,10 +2008,12 @@ pub enum Event {
     ImageLoad(ImageLoadEvent),
     ScriptBlock(ScriptBlockEvent),
     AmsiContent(AmsiContentEvent),
+    Defender(DefenderEvent),
     WmiActivity(WmiActivityEvent),
     AssemblyLoad(AssemblyLoadEvent),
     SmbConnect(SmbConnectEvent),
     UdpSend(UdpSendEvent),
+    UdpRecv(UdpRecvEvent),
     Auth(AuthEvent),
     ListenPort(ListenPortEvent),
     NetworkFlow(NetworkFlowEvent),
@@ -1947,10 +2067,12 @@ impl Event {
             Event::ImageLoad(e) => &e.meta,
             Event::ScriptBlock(e) => &e.meta,
             Event::AmsiContent(e) => &e.meta,
+            Event::Defender(e) => &e.meta,
             Event::WmiActivity(e) => &e.meta,
             Event::AssemblyLoad(e) => &e.meta,
             Event::SmbConnect(e) => &e.meta,
             Event::UdpSend(e) => &e.meta,
+            Event::UdpRecv(e) => &e.meta,
             Event::Auth(e) => &e.meta,
             Event::ListenPort(e) => &e.meta,
             Event::NetworkFlow(e) => &e.meta,

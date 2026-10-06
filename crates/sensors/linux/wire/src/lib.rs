@@ -214,7 +214,13 @@ pub use path_filter::is_filtered_path;
 ///   against the fd (`/proc/<pid>/fd/<n>`, or `/proc/<pid>/cwd` for `AT_FDCWD`).
 ///   `reserved` is explicit so the two `i32`s leave no implicit padding for the
 ///   `aya::Pod` impl to hide.
-pub const WIRE_VERSION: u32 = 21;
+/// - v22: `UdpRecvEvent` added (issue #263) — `recvfrom(2)`. Uses the paired
+///   `sys_enter_recvfrom`/`sys_exit_recvfrom` probe shape from `accept`: the
+///   sender's address is only written by the kernel on return, so the entry probe
+///   stashes the caller's `addr` pointer per `pid_tgid` (internal to the ebpf crate).
+///   `size` is the return value (bytes actually received). `recv(2)` is not
+///   captured: glibc issues it as `recvfrom(..., NULL, NULL)`, which the probe skips.
+pub const WIRE_VERSION: u32 = 22;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
@@ -482,6 +488,21 @@ pub struct UdpSendEvent {
     pub daddr_v4: [u8; 4],
     pub daddr_v6: [u8; 16],
     pub dport: u16,
+    pub is_ipv6: bool,
+    pub size: u32,
+}
+
+/// Inbound UDP datagram (`syscalls:sys_enter_recvfrom` + `sys_exit_recvfrom`,
+/// issue #263) — the sender's address and the bytes actually received. Only
+/// emitted on success with a source address. See this file's `WIRE_VERSION` v22
+/// changelog for the entry/exit correlation.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct UdpRecvEvent {
+    pub meta: EventMeta,
+    pub peer_addr_v4: [u8; 4],
+    pub peer_addr_v6: [u8; 16],
+    pub peer_port: u16,
     pub is_ipv6: bool,
     pub size: u32,
 }

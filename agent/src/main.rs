@@ -50,6 +50,7 @@ mod kill_loudness;
 mod log_sources;
 mod protected;
 mod quarantine_cmd;
+mod redact;
 mod release;
 mod shutdown;
 mod silence;
