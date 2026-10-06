@@ -5,7 +5,7 @@
 
 use std::{
     fs, io,
-    os::unix::fs::symlink,
+    os::unix::fs::{MetadataExt, lchown, symlink},
     path::{Path, PathBuf},
 };
 
@@ -299,6 +299,32 @@ impl Layout {
             .is_file()
     }
 
+    /// Hands `versions/` and the whole `versions/vN` tree to the identity that owns
+    /// the base directory — the service user the package created it for — so the
+    /// watchdog can write `.healthy` into the release and delete it on rollback or
+    /// recovery even when `apply-release` ran as root (#656). Symlinks are
+    /// re-owned, never followed.
+    ///
+    /// The base directory is the reference rather than a configured user name
+    /// because the package already gives it to the service user; a layout owned by
+    /// the caller (a dev run, the tests) makes this a no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`UpdaterError::Io`] if the base directory cannot be read or a path cannot be
+    /// re-owned.
+    pub fn adopt_service_ownership(&self, release_version: u64) -> Result<(), UpdaterError> {
+        let io_at = |path: &Path| {
+            let path = path.to_path_buf();
+            move |source| UpdaterError::Io { path, source }
+        };
+        let owner = fs::metadata(&self.base_dir).map_err(io_at(&self.base_dir))?;
+        let (uid, gid) = (owner.uid(), owner.gid());
+        let versions = self.versions_dir();
+        lchown(&versions, Some(uid), Some(gid)).map_err(io_at(&versions))?;
+        chown_tree(&self.version_dir(release_version), uid, gid)
+    }
+
     /// Deletes a superseded release's directory entirely (ADR-0015 Decision 8:
     /// called once the *new* release has passed its health check, keeping exactly
     /// two release trees on disk at steady state). Never call this on the release
@@ -316,6 +342,22 @@ impl Layout {
             Err(source) => Err(UpdaterError::Io { path: dir, source }),
         }
     }
+}
+
+/// `lchown` of `path` and everything under it; a symlink is re-owned itself and
+/// never descended into.
+fn chown_tree(path: &Path, uid: u32, gid: u32) -> Result<(), UpdaterError> {
+    let io_at = |source| UpdaterError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    lchown(path, Some(uid), Some(gid)).map_err(io_at)?;
+    if fs::symlink_metadata(path).map_err(io_at)?.is_dir() {
+        for entry in fs::read_dir(path).map_err(io_at)? {
+            chown_tree(&entry.map_err(io_at)?.path(), uid, gid)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -540,5 +582,33 @@ mod tests {
             Err(UpdaterError::Io { .. })
         ));
         assert!(!layout.version_dir(42).exists());
+    }
+
+    #[test]
+    fn adopting_ownership_on_a_layout_the_caller_owns_changes_nothing_and_keeps_symlinks() {
+        let (_dir, layout) = layout();
+        let release = layout.version_dir(2);
+        fs::create_dir_all(release.join("sub")).unwrap();
+        fs::write(release.join("sub/agent"), b"x").unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        symlink(outside.path(), release.join("link")).unwrap();
+
+        layout.adopt_service_ownership(2).unwrap();
+
+        assert_eq!(fs::read(release.join("sub/agent")).unwrap(), b"x");
+        assert!(
+            fs::symlink_metadata(release.join("link"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a symlink stays a symlink"
+        );
+    }
+
+    #[test]
+    fn adopting_ownership_of_a_release_that_is_not_installed_fails_instead_of_creating_it() {
+        let (_dir, layout) = layout();
+        assert!(layout.adopt_service_ownership(9).is_err());
+        assert!(!layout.version_dir(9).exists());
     }
 }

@@ -254,6 +254,10 @@ mod linux {
             }
         };
         layout.persist_manifest(&manifest)?;
+        // After the last write: run as root, `apply-release` owns every file it
+        // made, and the watchdog (the service user) must write `.healthy` into the
+        // release and delete it on rollback (#656).
+        layout.adopt_service_ownership(manifest.release_version)?;
         layout.promote(manifest.release_version)?;
         Ok(Outcome::Promoted {
             release_version: manifest.release_version,
