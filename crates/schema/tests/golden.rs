@@ -10,17 +10,18 @@ use std::net::IpAddr;
 
 use schema::{
     AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, CapSetEvent,
-    ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent,
-    FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent,
-    FileSetxattrEvent, FileWriteEvent, GatekeeperVerdictEvent, HttpClientCount, HttpEvidence,
-    HttpRequestEvent, HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind,
-    ImageLoadEvent, KernelModuleAction, KernelModuleEvent, LdapSearchEvent, ListenPortEvent,
-    MemfdCreateEvent, MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent,
-    NtlmAuthEvent, NtlmDirection, POLICY_MECHANISM_SELINUX, PolicyDenialEvent, PrctlEvent,
-    ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent,
-    ScriptBlockEvent, ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
-    SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
-    UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
+    ConnectEvent, DefenderEvent, DefenderEventKind, DnsQueryEvent, Event, EventMeta, ExecEvent,
+    FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent, FileQuarantineEvent,
+    FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent,
+    GatekeeperVerdictEvent, HttpClientCount, HttpEvidence, HttpRequestEvent, HttpSignature,
+    HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent, KernelModuleAction,
+    KernelModuleEvent, LdapSearchEvent, ListenPortEvent, MemfdCreateEvent, MountEvent,
+    NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, NtlmAuthEvent, NtlmDirection,
+    POLICY_MECHANISM_SELINUX, PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent,
+    ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
+    ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent,
+    TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent,
+    User, WmiActivityEvent, XpcConnectEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -502,6 +503,67 @@ fn ldap_search_golden() {
 }
 
 #[test]
+fn defender_remediation_golden() {
+    assert_golden(
+        &Event::Defender(DefenderEvent {
+            meta: defender_meta(),
+            kind: DefenderEventKind::Remediation,
+            detection_id: Some("{3F813A68-3FA3-456D-8818-54AB191C87B3}".into()),
+            threat_name: Some("HackTool:Win32/Mimikatz.I".into()),
+            severity_id: Some(4),
+            category_id: Some(34),
+            action_id: Some(3),
+            path: Some(r"file:_C:\Users\Public\tool.exe".into()),
+            process_name: None,
+            user: Some(r"LAB\alice".into()),
+            setting: None,
+            old_value: None,
+            new_value: None,
+        }),
+        "defender_remediation",
+    );
+}
+
+#[test]
+fn defender_config_changed_golden() {
+    assert_golden(
+        &Event::Defender(DefenderEvent {
+            meta: defender_meta(),
+            kind: DefenderEventKind::ConfigChanged,
+            detection_id: None,
+            threat_name: None,
+            severity_id: None,
+            category_id: None,
+            action_id: None,
+            path: None,
+            process_name: None,
+            user: None,
+            setting: Some(
+                r"HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths\C:\Users\Public".into(),
+            ),
+            old_value: None,
+            new_value: Some("0x0".into()),
+        }),
+        "defender_config_changed",
+    );
+}
+
+/// No actor: Defender does not say which process a verdict or a setting
+/// change belongs to.
+fn defender_meta() -> EventMeta {
+    EventMeta {
+        pid: 0,
+        ppid: 0,
+        user: User::Unknown,
+        timestamp_ns: 1_759_400_000_000_000_000,
+        comm: String::new(),
+        container: None,
+        process_generation: None,
+        parent_process_generation: None,
+    }
+}
+
+#[test]
 fn amsi_content_golden() {
     assert_golden(
         &Event::AmsiContent(AmsiContentEvent {
@@ -689,6 +751,28 @@ fn udp_send_golden() {
             size: 120,
         }),
         "udp_send",
+    );
+}
+
+#[test]
+fn udp_recv_golden() {
+    assert_golden(
+        &Event::UdpRecv(UdpRecvEvent {
+            meta: EventMeta {
+                pid: 4242,
+                ppid: 1337,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_090_000_000_000,
+                comm: "dnsd".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            peer_addr: "203.0.113.42".parse::<IpAddr>().unwrap(),
+            peer_port: 53,
+            size: 120,
+        }),
+        "udp_recv",
     );
 }
 
@@ -1937,6 +2021,21 @@ fn meta_accessor_covers_all_variants() {
             scope: 0,
             attributes: Vec::new(),
         }),
+        Event::Defender(DefenderEvent {
+            meta: meta.clone(),
+            kind: DefenderEventKind::ProtectionDisabled,
+            detection_id: None,
+            threat_name: None,
+            severity_id: None,
+            category_id: None,
+            action_id: None,
+            path: None,
+            process_name: None,
+            user: None,
+            setting: None,
+            old_value: None,
+            new_value: None,
+        }),
         Event::AmsiContent(AmsiContentEvent {
             meta: meta.clone(),
             session: 0,
@@ -1962,6 +2061,12 @@ fn meta_accessor_covers_all_variants() {
             meta: meta.clone(),
             daddr: "10.0.0.1".parse::<IpAddr>().unwrap(),
             dport: 53,
+            size: 0,
+        }),
+        Event::UdpRecv(UdpRecvEvent {
+            meta: meta.clone(),
+            peer_addr: "10.0.0.1".parse::<IpAddr>().unwrap(),
+            peer_port: 53,
             size: 0,
         }),
         Event::Auth(AuthEvent {

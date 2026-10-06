@@ -3710,6 +3710,7 @@ name = "yara"
 version = "0.1.0"
 dependencies = [
  "schema",
+ "store",
  "thiserror 2.0.21",
  "tracing",
  "yara-x",

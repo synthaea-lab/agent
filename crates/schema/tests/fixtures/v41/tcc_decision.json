@@ -1,0 +1,19 @@
+{
+  "type": "tcc_decision",
+  "meta": {
+    "pid": 427,
+    "ppid": 1,
+    "user": {
+      "os": "unix",
+      "uid": 0,
+      "gid": 0
+    },
+    "timestamp_ns": 1756900000123456789,
+    "comm": "tccd"
+  },
+  "service": "kTCCServiceScreenCapture",
+  "allowed": true,
+  "auth_value": 2,
+  "auth_reason": 11,
+  "client": "/Users/mal/.hidden/payload"
+}
