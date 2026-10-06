@@ -2882,4 +2882,54 @@ rule reload_content_test_marker {
         let alerts = alerts_in(&dir);
         assert!(!alerts.contains("T1204.002"), "{alerts}");
     }
+
+    /// #655 review: a signed file runs once (its `Valid` verdict cached), then an
+    /// unsigned file of the same size takes its path with the mtime restored. The
+    /// Windows cache key has no file identity, so only an uncached verification
+    /// keeps the gate from reading the old file's verdict.
+    #[cfg(windows)]
+    #[test]
+    fn a_cached_valid_verdict_for_a_replaced_file_does_not_silence_t1204_002() {
+        let signed = std::path::Path::new(r"C:\Windows\System32\notepad.exe");
+        let Ok(bytes) = std::fs::read(signed) else {
+            eprintln!("skipping: {} not readable on this host", signed.display());
+            return;
+        };
+        let dir = tmp("gate-replaced");
+        let image = dir.join("setup.exe");
+        std::fs::write(&image, &bytes).unwrap();
+        // Catalog-signed: a copy verifies by its hash, so it is `Valid` too.
+        if enrich::Enricher::new().enrich(&image).signature != schema::Signature::Valid {
+            eprintln!("skipping: the notepad.exe copy does not verify on this host");
+            return;
+        }
+        let sink = sink_in(&dir);
+        let path = image.to_string_lossy().into_owned();
+        sink.on_event(Event::Exec(schema::ExecEvent {
+            image_path: path.clone(),
+            ..schema::fixtures::exec()
+        }));
+        assert!(
+            sink.enrich_queue()
+                .flush(std::time::Duration::from_secs(30))
+        );
+
+        let mtime = std::fs::metadata(&image).unwrap().modified().unwrap();
+        let mut tampered = bytes;
+        let mid = tampered.len() / 2;
+        tampered[mid] ^= 0xFF;
+        std::fs::write(&image, &tampered).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&image)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+
+        mark_then_run(&sink, &path);
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("T1204.002"), "{alerts}");
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

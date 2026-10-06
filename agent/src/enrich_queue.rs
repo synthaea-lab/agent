@@ -100,7 +100,7 @@ impl EnrichQueue {
                 while let Ok(item) = rx.recv() {
                     match item {
                         QueueItem::Event(mut event, gated) => {
-                            enrich_event(&mut enricher, &mut event);
+                            enrich_event(&mut enricher, &mut event, gated.is_some());
                             on_enriched(*event, gated);
                         }
                         QueueItem::Detection(detection) => on_detection(*detection),
@@ -210,12 +210,22 @@ impl crate::health::DroppedCounter for EnrichQueue {
 /// Fills an exec event's hash + signature from the enricher. A cache hit is a
 /// metadata stat; a miss is one bounded hash + one offline signature check. Runs on
 /// the worker, never the capture thread.
-fn enrich_event(enricher: &mut Enricher, event: &mut Event) {
+///
+/// `gated`: a finding waits on this verdict (#441), so it is computed fresh. A
+/// cached `Valid` could describe a signed file that used to be at this path
+/// (#655 review). Gated execs are marked files run inside the join window, rare
+/// enough that skipping the cache costs nothing measurable.
+fn enrich_event(enricher: &mut Enricher, event: &mut Event, gated: bool) {
     if let Event::Exec(e) = event
         && !e.image_path.is_empty()
         && e.sha256.is_none()
     {
-        let enrichment = enricher.enrich(std::path::Path::new(&e.image_path));
+        let path = std::path::Path::new(&e.image_path);
+        let enrichment = if gated {
+            enricher.enrich_uncached(path)
+        } else {
+            enricher.enrich(path)
+        };
         e.sha256 = enrichment.sha256;
         e.signature = Some(enrichment.signature);
     }

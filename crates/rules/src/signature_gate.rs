@@ -7,6 +7,14 @@
 //! on the signature therefore returns a [`SignatureGatedAlert`] instead of an
 //! [`Alert`], the agent hands it to that worker with the event, and the worker
 //! calls [`SignatureGatedAlert::resolve`] once the verdict is known.
+//!
+//! The verdict describes the file at the image's path when the worker opens it,
+//! not necessarily the image that ran. The worker verifies a gated exec without
+//! its cache (a cached `Valid` could belong to a file the path used to hold), but
+//! a running image can be renamed on Windows: a dropper that moves itself aside
+//! and puts a signed copy at its old path before the worker gets there passes the
+//! gate. Closing that needs the image's identity at exec time to compare with the
+//! file verified; a backlog on the worker widens the window.
 
 use schema::Signature;
 
