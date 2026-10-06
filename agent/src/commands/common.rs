@@ -53,12 +53,14 @@ pub(crate) fn wire_run_pipeline(
         .map(|url| crate::upload::start(url, alerts, spool_cap))
         .transpose()?;
     let spool = transport.as_ref().map(|t| Arc::clone(&t.spool));
+    let detection_spool = transport.as_ref().map(|t| Arc::clone(&t.detection_spool));
 
     let sink = Arc::new(DetectionSink::new(
         rule_state,
         alerts,
         events,
         spool,
+        detection_spool,
         content_dir,
         &crate::sink::model_root(&storage.state_dir),
     )?);
@@ -71,8 +73,9 @@ pub(crate) fn wire_run_pipeline(
     );
     if let Some(url) = server {
         eprintln!(
-            "server: {url} · spool: {} (store-and-forward, at-least-once)",
-            alerts.with_file_name("spool").display()
+            "server: {url} · event spool: {} · detection spool: {} (store-and-forward, at-least-once)",
+            alerts.with_file_name("spool").display(),
+            alerts.with_file_name("detection-spool").display(),
         );
     }
 
@@ -116,7 +119,10 @@ pub(crate) fn health_collector(
     silence_monitor: Arc<Mutex<SilenceMonitor>>,
 ) -> HealthCollector {
     let spool_stats: Arc<dyn SpoolStatsSource> = match &pipeline.transport {
-        Some(t) => Arc::new(crate::upload::SpoolHealth(Arc::clone(&t.spool))),
+        Some(t) => Arc::new(crate::upload::SpoolHealth {
+            events: Arc::clone(&t.spool),
+            detections: Arc::clone(&t.detection_spool),
+        }),
         None => Arc::new(NoopSpoolStats),
     };
     let heartbeat_client = pipeline.transport.as_ref().map(|t| Arc::clone(&t.client));
@@ -169,6 +175,7 @@ mod tests {
                     rules::RuleState::new(),
                     &dir.join("alerts.ndjson"),
                     Some(&dir.join("events.jsonl")),
+                    None,
                     None,
                     &dir.join("content"),
                     &dir.join("ml-registry"),

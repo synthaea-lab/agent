@@ -344,8 +344,15 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // events, so only its chain needs the guard — the netlink/journal sinks above
     // never see one.
     let protected = crate::protected::protected_paths(alerts, events);
-    let guarded = ProtectedResourceGuard::new(sink.clone(), protected, sink);
+    let guarded = ProtectedResourceGuard::new(sink.clone(), protected, sink.clone());
     let result = sensor.run(Box::new(PulsingSink::new(guarded, primary_heartbeat)));
+
+    // Persist findings already accepted by the in-memory queue before the
+    // uploader makes its final drain. A bounded wait preserves shutdown's
+    // overall deadline if enrichment is stalled on a slow file.
+    if !sink.enrich_queue().flush(std::time::Duration::from_secs(1)) {
+        tracing::warn!("pending detection/event queue did not flush before shutdown");
+    }
 
     // `sensor.run` returned (Ctrl-C or a sensor failure): wind the workers down —
     // the upload loop gets one last spool drain — within one bounded budget. What

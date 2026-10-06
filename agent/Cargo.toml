@@ -43,6 +43,7 @@ tracing = { workspace = true }
 # fmt + env-filter: RUST_LOG-style filtering; the default "tracing-log" feature
 # bridges `log` records (aya-log, dependencies) into the subscriber.
 tracing-subscriber = { workspace = true }
+getrandom = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 sensor-windows = { path = "../crates/sensors/windows/etw" }

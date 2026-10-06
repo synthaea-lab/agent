@@ -8,6 +8,7 @@
 //! nothing is spooled and the agent behaves exactly as before.
 
 use std::{
+    fmt::Write as _,
     path::Path,
     sync::{
         Arc, Mutex,
@@ -18,7 +19,10 @@ use std::{
 };
 
 use store::EventSpool;
-use transport::{EventDrain, EventUploader, TransportClient, TransportConfig, UploadLoop};
+use transport::{
+    DetectionDrain, DetectionUploader, EventDrain, EventUploader, QueuedDetection, TransportClient,
+    TransportConfig, UploadLoop,
+};
 
 use crate::shutdown::ShutdownPlan;
 
@@ -43,6 +47,50 @@ const UPLOAD_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// discards a poison segment the server permanently rejects.
 struct SpoolDrain(Arc<Mutex<EventSpool>>);
 
+struct DetectionSpoolDrain(Arc<Mutex<EventSpool>>);
+
+impl DetectionDrain for DetectionSpoolDrain {
+    fn drain(&mut self) -> std::io::Result<Vec<QueuedDetection>> {
+        self.0.lock().unwrap().drain_oldest()
+    }
+
+    fn ack(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().ack().map(|_| ())
+    }
+
+    fn skip(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().skip().map(|_| ())
+    }
+}
+
+/// Creates the retry identity and persists it atomically with the detection.
+/// A recovered segment carries the same identity after a crash.
+pub(crate) fn persist_detection(
+    spool: &Mutex<EventSpool>,
+    detection: schema::detection::Detection,
+) -> std::io::Result<()> {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let mut hex = String::with_capacity(32);
+    for byte in bytes {
+        write!(&mut hex, "{byte:02x}").expect("writing to String");
+    }
+    let key = format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    );
+    spool
+        .lock()
+        .unwrap()
+        .push(&QueuedDetection { key, detection })
+}
+
 impl EventDrain for SpoolDrain {
     fn drain(&mut self) -> std::io::Result<Vec<schema::Event>> {
         self.0.lock().unwrap().drain_oldest()
@@ -65,6 +113,7 @@ impl EventDrain for SpoolDrain {
 /// safe, the spool redelivers.
 pub(crate) struct TransportHandle {
     pub(crate) spool: Arc<Mutex<EventSpool>>,
+    pub(crate) detection_spool: Arc<Mutex<EventSpool>>,
     // Read by the health beacon, which macOS doesn't wire yet (#317).
     #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     pub(crate) client: Arc<TransportClient>,
@@ -72,6 +121,8 @@ pub(crate) struct TransportHandle {
     upload_stop: Arc<AtomicBool>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     upload_thread: JoinHandle<()>,
+    detection_upload_stop: Arc<AtomicBool>,
+    detection_upload_thread: JoinHandle<()>,
 }
 
 impl TransportHandle {
@@ -85,12 +136,20 @@ impl TransportHandle {
             move || stop.store(true, Ordering::SeqCst),
             self.upload_thread,
         );
+        plan.register(
+            "detection-upload",
+            move || self.detection_upload_stop.store(true, Ordering::SeqCst),
+            self.detection_upload_thread,
+        );
     }
 }
 
 /// Opens the spool (next to the alerts file — the same "derived, no separate
 /// flag" convention as `quarantine/` and the heartbeat file) and starts the
 /// upload thread against `server_url`.
+///
+/// `spool_max_bytes` caps **each** of the two spools (events, and the detection
+/// spool beside it), so the worst case on disk is twice `storage.spool_max_mb`.
 pub(crate) fn start(
     server_url: &str,
     alerts: &Path,
@@ -98,11 +157,19 @@ pub(crate) fn start(
 ) -> anyhow::Result<TransportHandle> {
     let dir = alerts.with_file_name("spool");
     let spool = Arc::new(Mutex::new(EventSpool::open(&dir, spool_max_bytes)?));
+    let detection_dir = alerts.with_file_name("detection-spool");
+    let detection_spool = Arc::new(Mutex::new(EventSpool::open_with_segment_records(
+        &detection_dir,
+        spool_max_bytes,
+        1,
+    )?));
 
     // Two clients on one config: `EventUploader` consumes its client, and the
     // health beacon needs one of its own for heartbeats.
     let config = TransportConfig::new(server_url);
     let upload_client = TransportClient::new(config.clone())
+        .map_err(|e| anyhow::anyhow!("transport client: {e}"))?;
+    let detection_client = TransportClient::new(config.clone())
         .map_err(|e| anyhow::anyhow!("transport client: {e}"))?;
     let heartbeat_client = Arc::new(
         TransportClient::new(config).map_err(|e| anyhow::anyhow!("transport client: {e}"))?,
@@ -116,32 +183,53 @@ pub(crate) fn start(
         .spawn(move || upload_loop.run())
         .expect("spawning the transport upload thread");
 
+    let detection_uploader = DetectionUploader::new(
+        detection_client,
+        DetectionSpoolDrain(Arc::clone(&detection_spool)),
+    );
+    let mut detection_loop = UploadLoop::new(detection_uploader, UPLOAD_POLL_INTERVAL);
+    let detection_upload_stop = detection_loop.stop_handle();
+    let detection_upload_thread = std::thread::Builder::new()
+        .name("detection-upload".into())
+        .spawn(move || detection_loop.run())
+        .expect("spawning the detection upload thread");
+
     Ok(TransportHandle {
         spool,
+        detection_spool,
         client: heartbeat_client,
         upload_stop,
         upload_thread,
+        detection_upload_stop,
+        detection_upload_thread,
     })
 }
 
 /// The health beacon's view of the spool (`spool_bytes`/`spool_dropped` in
 /// #134's beacon) — replaces `health::NoopSpoolStats` when transport is on.
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))] // no health beacon on macOS yet (#317)
-pub(crate) struct SpoolHealth(pub(crate) Arc<Mutex<EventSpool>>);
+pub(crate) struct SpoolHealth {
+    pub(crate) events: Arc<Mutex<EventSpool>>,
+    pub(crate) detections: Arc<Mutex<EventSpool>>,
+}
 
 impl crate::health::SpoolStatsSource for SpoolHealth {
     fn spool_bytes(&self) -> u64 {
-        self.0.lock().unwrap().stats().bytes
+        self.events.lock().unwrap().stats().bytes + self.detections.lock().unwrap().stats().bytes
     }
 
     fn spool_dropped(&self) -> u64 {
-        self.0.lock().unwrap().stats().dropped_records
+        self.events.lock().unwrap().stats().dropped_records
+            + self.detections.lock().unwrap().stats().dropped_records
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use schema::{Event, ExecEvent};
+    use schema::{
+        Event, ExecEvent,
+        detection::{Detection, DetectionSource, Severity},
+    };
 
     use super::*;
 
@@ -170,6 +258,41 @@ mod tests {
             cmdline: cmdline.into(),
             ..schema::fixtures::exec()
         })
+    }
+
+    #[test]
+    fn detection_retry_key_survives_spool_reopen_until_ack() {
+        let dir =
+            std::env::temp_dir().join(format!("agent-detection-spool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let detection = Detection {
+            timestamp_ns: 1_700_000_000_000_000_000,
+            severity: Severity::High,
+            title: "rule hit".into(),
+            source: DetectionSource::Rule {
+                rule_id: "T1059".into(),
+            },
+            score: None,
+            attributions: Vec::new(),
+            techniques: vec!["T1059".into()],
+            events: vec![exec("test")],
+        };
+        let spool = Mutex::new(EventSpool::open(&dir, u64::MAX).unwrap());
+        persist_detection(&spool, detection.clone()).unwrap();
+        // The persisted record, including its key, is recovered after a crash
+        // that happened between drain and acknowledgement.
+        let mut first = spool.into_inner().unwrap();
+        let original: Vec<QueuedDetection> = first.drain_oldest().unwrap();
+        assert_eq!(original.len(), 1);
+        assert_eq!(original[0].detection, detection);
+        assert_eq!(original[0].key.len(), 36);
+        drop(first);
+        let mut reopened = EventSpool::open(&dir, u64::MAX).unwrap();
+        let retry: Vec<QueuedDetection> = reopened.drain_oldest().unwrap();
+        assert_eq!(retry, original);
+        assert!(reopened.ack().unwrap());
+        let empty: Vec<QueuedDetection> = reopened.drain_oldest().unwrap();
+        assert!(empty.is_empty());
     }
 
     /// The at-least-once property the whole wiring exists for: a drain that is
