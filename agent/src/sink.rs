@@ -222,6 +222,9 @@ impl DetectionSink {
         // thread — shared behind an Arc so the worker owns a handle. The spool
         // append rides the same worker for the same #126 reason: it is file
         // I/O that must never stall the capture thread.
+        // `None` (the default, and what the packaged service runs) writes no raw
+        // capture at all: it grows without bound and only labs and ML calibration
+        // want it (#559).
         let events_log = events_path
             .map(|path| JsonlWriter::open(path).map(Arc::new))
             .transpose()?;
@@ -235,6 +238,8 @@ impl DetectionSink {
                 if let Some(spool) = &spool
                     && let Err(e) = spool.lock().unwrap().push(&event)
                 {
+                    // Spool full is handled inside push (shed-oldest, counted);
+                    // reaching here is a real I/O failure — degrade to local-only.
                     tracing::warn!(error = %e, "spool append failed — event stays local-only");
                 }
             },
@@ -466,6 +471,10 @@ impl DetectionSink {
         if let (Some(spool), Some(detection)) = (&self.detection_spool, spooled)
             && let Err(detection) = self.enrich_queue.enqueue_detection(detection)
         {
+            // The queue is full, so the capture thread does this file append
+            // itself, which the #126 design otherwise keeps off it. Under sustained
+            // overload every finding takes this path; accepted on purpose (a finding
+            // is never lost), and only reached once the queue is already shedding.
             tracing::warn!("detection queue full; persisting on capture thread");
             if let Err(e) = crate::upload::persist_detection(spool, *detection) {
                 tracing::error!(error = %e, "detection spool append failed on fallback");

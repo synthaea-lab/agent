@@ -147,6 +147,9 @@ impl TransportHandle {
 /// Opens the spool (next to the alerts file — the same "derived, no separate
 /// flag" convention as `quarantine/` and the heartbeat file) and starts the
 /// upload thread against `server_url`.
+///
+/// `spool_max_bytes` caps **each** of the two spools (events, and the detection
+/// spool beside it), so the worst case on disk is twice `storage.spool_max_mb`.
 pub(crate) fn start(
     server_url: &str,
     alerts: &Path,
