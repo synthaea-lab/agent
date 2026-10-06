@@ -1788,11 +1788,11 @@ struct AcceptArgs {
 
 /// Correlates `sys_enter_accept{,4}` with its matching `sys_exit_accept{,4}` on the
 /// same thread. Not part of `sensor-linux-wire`'s ABI (never read by userspace).
-/// A thread that enters `accept()` and never returns (blocked forever, or the
-/// process is killed mid-call) leaks its entry — same accepted risk as
-/// `SSL_READ_ARGS`, bounded by `max_entries`, not explicitly swept.
+/// A thread that enters `accept()` and never returns retains its entry. An LRU
+/// evicts the stalest stash when full so blocked threads cannot blind later
+/// accept telemetry host-wide.
 #[map]
-static ACCEPT_ARGS: HashMap<u64, AcceptArgs> = HashMap::with_max_entries(1024, 0);
+static ACCEPT_ARGS: LruHashMap<u64, AcceptArgs> = LruHashMap::with_max_entries(1024, 0);
 
 /// Offsets of the `syscalls:sys_enter_accept`/`sys_enter_accept4` tracepoints
 /// (x86_64/aarch64): `fd`(16), `upeer_sockaddr`(24) — identical shape for both
@@ -1851,13 +1851,15 @@ fn stash_accept_args(ctx: &TracePointContext) -> Result<u32, u32> {
             .map_err(|_| 1u32)? as u64
     };
 
+    let pid_tgid = bpf_get_current_pid_tgid();
     if addr_ptr != 0 {
-        let pid_tgid = bpf_get_current_pid_tgid();
         let args = AcceptArgs {
             fd: fd as u32,
             addr_ptr,
         };
         let _ = ACCEPT_ARGS.insert(&pid_tgid, &args, 0);
+    } else {
+        let _ = ACCEPT_ARGS.remove(&pid_tgid);
     }
 
     Ok(0)
@@ -1878,8 +1880,8 @@ pub fn sys_exit_accept4(ctx: TracePointContext) -> u32 {
 }
 
 /// Shared by `sys_exit_accept` and `sys_exit_accept4`. No-ops (returns `Ok(0)`
-/// without emitting) when: the matching `sys_enter` wasn't tracked (NULL addr, or
-/// `ACCEPT_ARGS` was full), the call failed (`ret < 0`), or the peer's address
+/// without emitting) when: the matching `sys_enter` wasn't tracked (NULL addr
+/// or an evicted stash), the call failed (`ret < 0`), or the peer's address
 /// family isn't one this sensor tracks.
 fn try_sys_exit_accept(ctx: TracePointContext) -> Result<u32, u32> {
     #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
