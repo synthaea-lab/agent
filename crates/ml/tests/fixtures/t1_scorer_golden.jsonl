@@ -1,0 +1,7 @@
+{"pid": 100, "process_generation": 1, "score": -0.012346982955932617}
+{"pid": 100, "process_generation": 2, "score": 0.1230752170085907}
+{"pid": 200, "process_generation": null, "score": 0.11084741353988647}
+{"pid": 300, "process_generation": null, "score": 0.10042911767959595}
+{"pid": 400, "process_generation": null, "score": -0.005487024784088135}
+{"pid": 500, "process_generation": null, "score": -0.04510772228240967}
+{"pid": 9999, "process_generation": null, "score": null}
