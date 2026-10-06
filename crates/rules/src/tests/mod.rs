@@ -289,6 +289,7 @@ fn listen_port_event_full(
 
 mod coverage;
 mod linux;
+mod motw_removal;
 mod persistence;
 mod quarantine;
 mod session;

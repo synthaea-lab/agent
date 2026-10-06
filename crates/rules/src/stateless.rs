@@ -751,26 +751,38 @@ pub(crate) fn check_log_clear_exec(event: &ExecEvent) -> Option<Alert> {
     })
 }
 
-/// Log locations whose deletion is the anti-forensics signal
-/// ([`check_log_file_delete`]), each with its technique. Substring/prefix
-/// matches, same tolerance as [`check_persistence_write`]'s patterns.
-const LOG_PATH_PATTERNS: &[(&str, &str)] = &[
-    (CLEAR_UNIX_SYSTEM_LOGS, "/var/log/"),
-    (CLEAR_UNIX_SYSTEM_LOGS, "/private/var/log/"),
-    (CLEAR_UNIX_SYSTEM_LOGS, "/log/journal/"),
-    (CLEAR_WINDOWS_EVENT_LOGS, ".evtx"),
-];
+/// Unix log locations whose deletion is the anti-forensics signal
+/// ([`check_log_file_delete`]). Substring/prefix matches, same tolerance as
+/// [`check_persistence_write`]'s patterns.
+const UNIX_LOG_DIRS: &[&str] = &["/var/log/", "/private/var/log/", "/log/journal/"];
+
+/// A Windows event log, matched on its extension at the very end of the path
+/// (any case): `Security.evtx:Zone.Identifier` is a stream of the file, and
+/// its deletion is `Unblock-File` on a downloaded `.evtx`, not a log deleted.
+const WINDOWS_EVENT_LOG_EXTENSION: &str = ".evtx";
+
+/// The technique and the matched pattern when `path` is a log file.
+fn log_file_technique(path: &str) -> Option<(&'static str, &'static str)> {
+    if let Some(dir) = UNIX_LOG_DIRS.iter().find(|dir| path.contains(**dir)) {
+        return Some((CLEAR_UNIX_SYSTEM_LOGS, dir));
+    }
+    let tail = path
+        .as_bytes()
+        .get(path.len().saturating_sub(WINDOWS_EVENT_LOG_EXTENSION.len())..)?;
+    tail.eq_ignore_ascii_case(WINDOWS_EVENT_LOG_EXTENSION.as_bytes())
+        .then_some((CLEAR_WINDOWS_EVENT_LOGS, WINDOWS_EVENT_LOG_EXTENSION))
+}
 
 /// T1070.001 / T1070.002 — the file-deletion half: a log file removed outright
 /// (`.evtx` event logs are `.001`, Unix system logs `.002`). Consumes
-/// [`schema::FileDeleteEvent`]s (Linux unlink tracing, macOS ES `UNLINK`;
-/// Windows deletions arrive with the minifilter, #136).
+/// [`schema::FileDeleteEvent`]s: Linux unlink tracing and macOS ES `UNLINK`.
+/// On Windows the ETW sensor forwards only `:Zone.Identifier` stream deletes
+/// (#442), which never match; an `.evtx` deleted outright is seen once the
+/// minifilter reports deletions (#136).
 #[must_use]
 pub(crate) fn check_log_file_delete(event: &schema::FileDeleteEvent) -> Option<Alert> {
     let path = &event.path;
-    let &(technique, matched) = LOG_PATH_PATTERNS
-        .iter()
-        .find(|(_, pattern)| path.contains(*pattern))?;
+    let (technique, matched) = log_file_technique(path)?;
     Some(Alert {
         technique,
         severity: Severity::Medium,

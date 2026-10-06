@@ -25,7 +25,7 @@ use std::{
     },
 };
 
-use schema::{Event, EventMeta, FileQuarantineEvent};
+use schema::{Event, EventMeta, FileDeleteEvent, FileQuarantineEvent};
 
 /// Stream suffix on the path Kernel-File reports. Matched case-insensitively;
 /// an explicit `:$DATA` stream type is accepted too.
@@ -48,6 +48,27 @@ pub fn stream_host_path(path: &str) -> Option<&str> {
     let path = strip_suffix_ignore_ascii_case(path, STREAM_TYPE_SUFFIX).unwrap_or(path);
     let host = strip_suffix_ignore_ascii_case(path, STREAM_SUFFIX)?;
     (!host.is_empty() && !host.ends_with(['\\', '/', ':'])).then_some(host)
+}
+
+/// The `FileDelete` for a Kernel-File `DeletePath` of `raw_path`, when it
+/// removes a mark (T1553.005, #442); `None` for every other delete.
+///
+/// `normalize` and `meta` run only for a match: `meta` reads the process
+/// token (`OpenProcess` + SID lookup), and a build or `git checkout` deleting
+/// thousands of tracked files must not cost that per file on the ETW
+/// consumer thread (#408). Normalization is deferred for the same reason
+/// (#481).
+#[cfg_attr(not(windows), allow(dead_code))] // driven by the Windows-only provider
+pub(crate) fn mark_removal(
+    raw_path: &str,
+    normalize: impl FnOnce(&str) -> String,
+    meta: impl FnOnce() -> EventMeta,
+) -> Option<FileDeleteEvent> {
+    stream_host_path(raw_path)?;
+    Some(FileDeleteEvent {
+        path: normalize(raw_path),
+        meta: meta(),
+    })
 }
 
 fn strip_suffix_ignore_ascii_case<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
@@ -406,6 +427,28 @@ mod tests {
         assert_eq!(stream_host_path(":Zone.Identifier"), None);
         assert_eq!(stream_host_path(r"C:\d\:Zone.Identifier"), None);
         assert_eq!(stream_host_path(""), None);
+    }
+
+    #[test]
+    fn a_non_mark_delete_reads_no_token_and_normalizes_nothing() {
+        let removal = mark_removal(
+            r"\Device\HarddiskVolume3\src\target\debug\deps\a.o",
+            |_| panic!("normalized a delete that is not a mark"),
+            || panic!("read the token of a delete that is not a mark"),
+        );
+        assert!(removal.is_none());
+    }
+
+    #[test]
+    fn a_mark_delete_is_a_file_delete_of_the_normalized_stream_path() {
+        let removal = mark_removal(
+            r"\Device\HarddiskVolume3\d\a.exe:Zone.Identifier",
+            |raw| raw.replace(r"\Device\HarddiskVolume3", "C:"),
+            schema::fixtures::meta,
+        )
+        .expect("a mark removal");
+        assert_eq!(removal.path, r"C:\d\a.exe:Zone.Identifier");
+        assert_eq!(removal.meta, schema::fixtures::meta());
     }
 
     #[test]
