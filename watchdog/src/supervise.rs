@@ -369,8 +369,8 @@ fn settle_probation(
             let target =
                 restored.map_or_else(|| "bootstrap".to_string(), |v| format!("release {v}"));
             match current.roll_back() {
-                Ok(report) => {
-                    if let Some(cause) = report.and_then(|r| r.cleanup_error) {
+                Ok(cleanup_error) => {
+                    if let Some(cause) = cleanup_error {
                         eprintln!(
                             "[watchdog] could not remove the failed release {failed}'s directory: \
                              {cause}"

@@ -75,7 +75,7 @@ impl Probation {
     pub(crate) fn prove(&self) -> Result<(), updater::UpdaterError> {
         match *self {}
     }
-    pub(crate) fn roll_back(&self) -> Result<(), updater::UpdaterError> {
+    pub(crate) fn roll_back(&self) -> Result<Option<updater::UpdaterError>, updater::UpdaterError> {
         match *self {}
     }
 }
@@ -194,13 +194,15 @@ mod linux {
         /// # Errors
         ///
         /// Propagates [`UpdaterError`] from the symlink swap or ban-list write. A
-        /// failed removal of the release's directory is not an error; it is in the
-        /// returned report (`None` when the rollback did not run).
-        pub(crate) fn roll_back(&self) -> Result<Option<updater::RollbackReport>, UpdaterError> {
+        /// failed removal of the release's directory is not an error; it is the
+        /// returned `Some` (`None` when the directory was removed or the rollback
+        /// did not run).
+        pub(crate) fn roll_back(&self) -> Result<Option<UpdaterError>, UpdaterError> {
             if self.layout.current_release_version() != Some(self.release) {
                 return Ok(None);
             }
-            updater::rollback(&self.layout, &self.ban_list, self.previous, self.release).map(Some)
+            updater::rollback(&self.layout, &self.ban_list, self.previous, self.release)
+                .map(|report| report.cleanup_error)
         }
     }
 
