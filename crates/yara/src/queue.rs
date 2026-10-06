@@ -51,6 +51,7 @@ pub struct ScanOutcome {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScanStats {
+    /// Scans fully handled: the match callback, when there was a match, has returned.
     pub scanned: u64,
     pub dropped: u64,
 }
@@ -100,12 +101,16 @@ impl ScanQueue {
                     }
                     match rules.scan_file(&path) {
                         Ok(matches) if !matches.is_empty() => {
-                            scanned_w.fetch_add(1, Ordering::Relaxed);
                             on_match(ScanOutcome {
                                 path,
                                 context,
                                 matches,
                             });
+                            // Counted only once the callback has returned: `scanned`
+                            // means "fully handled", so a caller that waits on it (a
+                            // test, an orderly shutdown) never sees a match that the
+                            // callback has not yet delivered.
+                            scanned_w.fetch_add(1, Ordering::Relaxed);
                         }
                         Ok(_) => {
                             scanned_w.fetch_add(1, Ordering::Relaxed);

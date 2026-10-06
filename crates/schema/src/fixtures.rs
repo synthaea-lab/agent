@@ -29,15 +29,16 @@ use core::net::{IpAddr, Ipv4Addr};
 
 use crate::{
     AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, CapSetEvent,
-    ConnectEvent, DnsQueryEvent, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent,
-    FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent,
-    FileSetxattrEvent, FileWriteEvent, HttpRequestEvent, HttpSignature, HttpSummaryEvent,
-    IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent, KernelModuleAction, KernelModuleEvent,
-    LdapSearchEvent, ListenPortEvent, MemfdCreateEvent, NamespaceEvent, NamespaceSyscall,
-    NetworkFlowEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
-    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType, SmbConnectEvent,
-    SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection,
-    TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
+    ConnectEvent, DefenderEvent, DefenderEventKind, DnsQueryEvent, EventMeta, ExecEvent,
+    FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent, FileQuarantineEvent,
+    FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent, HttpRequestEvent,
+    HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent,
+    KernelModuleAction, KernelModuleEvent, LdapSearchEvent, ListenPortEvent, MemfdCreateEvent,
+    NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, PrctlEvent, ProcessVmReadEvent,
+    ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
+    ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent,
+    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, User,
+    WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -139,6 +140,26 @@ pub fn ldap_search() -> LdapSearchEvent {
     }
 }
 
+/// Neutral [`DefenderEvent`].
+#[must_use]
+pub fn defender() -> DefenderEvent {
+    DefenderEvent {
+        meta: meta(),
+        kind: DefenderEventKind::Detection,
+        detection_id: None,
+        threat_name: None,
+        severity_id: None,
+        category_id: None,
+        action_id: None,
+        path: None,
+        process_name: None,
+        user: None,
+        setting: None,
+        old_value: None,
+        new_value: None,
+    }
+}
+
 /// Neutral [`AmsiContentEvent`].
 #[must_use]
 pub fn amsi_content() -> AmsiContentEvent {
@@ -206,6 +227,17 @@ pub fn udp_send() -> UdpSendEvent {
         meta: meta(),
         daddr: TEST_ADDR,
         dport: 0,
+        size: 0,
+    }
+}
+
+/// Neutral [`UdpRecvEvent`] from [`TEST_ADDR`].
+#[must_use]
+pub fn udp_recv() -> UdpRecvEvent {
+    UdpRecvEvent {
+        meta: meta(),
+        peer_addr: TEST_ADDR,
+        peer_port: 0,
         size: 0,
     }
 }

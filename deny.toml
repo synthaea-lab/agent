@@ -28,6 +28,14 @@ ignore = [
     # yara-x 1.20.0, the latest, still requires wasmtime ^45.0.3 and the fixes
     # are 48.0.3/49.0.1: bump the moment yara-x's requirement allows one.
     "RUSTSEC-2026-0316",
+    # Stack buffer overflow in the component-model async-lifted callback path. Same
+    # blast radius as 0316: our graph never enables wasmtime's `component-model` or
+    # `async` features, even with --all-features (checked 2026-10-05 with
+    # `cargo tree -e features -i wasmtime`: cranelift, once_cell, runtime, std,
+    # jit-icache-coherence, unwinder), so the vulnerable code isn't compiled.
+    # yara-x 1.21.0, the latest, still requires wasmtime ^45.0.3 and the fixes are
+    # 48.0.4/49.0.2: bump the moment yara-x's requirement allows one.
+    "RUSTSEC-2026-0327",
 ]
 
 [licenses]

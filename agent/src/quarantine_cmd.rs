@@ -159,7 +159,14 @@ mod tests {
         let (alerts, payload, digest) = quarantined(&dir);
         std::fs::write(&payload, b"took the original's place").unwrap();
         let err = cmd_quarantine_restore(&alerts, &digest).unwrap_err();
-        assert!(err.to_string().contains("exists"), "{err}");
+        // The kind, not the message: the OS text is localized ("Impossible de
+        // créer un fichier déjà existant." on a fr-FR Windows).
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::AlreadyExists),
+            "{err}"
+        );
         let log = std::fs::read_to_string(&alerts).unwrap();
         assert!(log.contains("failed to restore"), "{log}");
         assert_eq!(

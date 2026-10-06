@@ -30,6 +30,9 @@ mod service;
 mod supervise;
 mod tamper;
 
+#[cfg(target_os = "linux")]
+mod recovery;
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -55,6 +58,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Rolls back `current` before startup if its watchdog cannot be executed.
+    #[cfg(target_os = "linux")]
+    Recover {
+        /// Root of the bootstrap/current/versions layout.
+        #[arg(long, default_value = "/var/lib/synthaea")]
+        base_dir: PathBuf,
+    },
     /// Installs the watchdog as a system service with automatic restart.
     /// Requires administrator / root rights.
     Install {
@@ -103,6 +113,13 @@ enum Command {
 fn run_cli() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Recovery must run before loading the agent config: a broken active release
+    // should not prevent the bootstrap watchdog from restoring a known-good one.
+    #[cfg(target_os = "linux")]
+    if let Command::Recover { base_dir } = &cli.command {
+        return recovery::recover_if_current_is_unexecutable(base_dir);
+    }
+
     // Load the local install configuration eagerly. Per ADR-0013 §5 the
     // watchdog fails fast with a copy-pasteable message if the config is
     // missing or invalid — the alternative (silently falling back on
@@ -121,6 +138,8 @@ fn run_cli() -> anyhow::Result<()> {
     );
 
     match cli.command {
+        #[cfg(target_os = "linux")]
+        Command::Recover { .. } => unreachable!("handled before config loading"),
         Command::Install { agent_bin, alerts } => service::cmd_install(agent_bin, alerts),
         Command::Uninstall => service::cmd_uninstall(),
         Command::Status => service::cmd_status(),

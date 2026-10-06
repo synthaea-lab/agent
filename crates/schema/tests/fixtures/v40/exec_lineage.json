@@ -1,0 +1,19 @@
+{
+  "type": "exec",
+  "meta": {
+    "pid": 6100,
+    "ppid": 4988,
+    "user": {
+      "os": "windows",
+      "sid": "S-1-5-21-1004336348-1177238915-682003330-1001",
+      "integrity_level": 8192
+    },
+    "timestamp_ns": 1756900004000000000,
+    "comm": "cmd.exe"
+  },
+  "image_path": "C:\\Windows\\System32\\cmd.exe",
+  "cmdline": "cmd.exe /c whoami",
+  "argv": [],
+  "parent_comm": "winword.exe",
+  "parent_image_path": "C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE"
+}

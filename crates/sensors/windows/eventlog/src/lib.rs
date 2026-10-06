@@ -119,6 +119,17 @@
 //!   per non-allowed load, so expect bursts there. The whole channel is gated
 //!   by `EventLogConfig::applocker_blocks_enabled`, which the agent currently
 //!   sets to `true` unconditionally (no `agent.toml` switch yet).
+//! - **Microsoft Defender Operational** (`Microsoft-Windows-Windows Defender/Operational`,
+//!   events **1116/1117** verdicts and **5001/5010/5012/5007** tamper traces):
+//!   reported as `schema::DefenderEvent`, gated by
+//!   `EventLogConfig::defender_enabled`. The channel is localized, so only
+//!   numeric ids are read. **Volume:** 5007 is the bulk of the channel (service
+//!   start-up progress), so only exclusions, the `Disable*` switches and Tamper
+//!   Protection are forwarded.
+//! - **WDAC** (`Microsoft-Windows-CodeIntegrity/Operational`, events **3077**
+//!   enforced / **3076** audit): reported as `schema::PolicyDenialEvent` with
+//!   `schema::POLICY_MECHANISM_WDAC`, gated by `EventLogConfig::wdac_enabled`.
+//!   3033 is deliberately not subscribed (Chrome DLL-load noise).
 //! - **Task Scheduler Operational — task registered**
 //!   (`Microsoft-Windows-TaskScheduler/Operational` channel, event **106**):
 //!   the always-on complement to Security 4698. Emitted whenever any scheduled
