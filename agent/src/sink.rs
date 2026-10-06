@@ -538,6 +538,10 @@ impl DetectionSink {
                 comm: meta.comm.clone(),
                 parent_generation: meta.parent_process_generation,
                 timestamp_ns: meta.timestamp_ns,
+                // The #594 gate is about reading a path the requester named, as the agent
+                // with `CAP_DAC_READ_SEARCH`. A memory scan reads no named path: it reads
+                // `/proc/<pid>/mem`, which the kernel gates by `ptrace_may_access` (ADR-0023).
+                requester: None,
             }),
         );
     }
