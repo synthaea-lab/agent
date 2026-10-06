@@ -3055,6 +3055,7 @@ name = "updater"
 version = "0.1.0"
 dependencies = [
  "ring",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.0",
