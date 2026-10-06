@@ -708,6 +708,7 @@ rule mem_marker {
             comm: "implant".into(),
             parent_generation: Some(3),
             timestamp_ns: 5,
+            requester: None,
         };
         assert!(queue.enqueue(42, Some(7), 1, Some(context.clone())));
         assert!(queue.wait_for_completed(1, Duration::from_secs(5)));
