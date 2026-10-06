@@ -2,7 +2,7 @@
 
 **Status:** Implementation of ADR-0002 decision #2 (static linking for single-binary deployment)
 **Issue:** #110
-**Platform:** Linux (Ubuntu 24.04+ tested; Alpine/musl tested but not a target platform)
+**Platform:** Linux (Ubuntu 24.04+ tested; Alpine/musl tested but not a target platform) and Windows MSVC (see the Windows section below)
 
 ## Background
 
@@ -145,17 +145,82 @@ Measure final agent binary size, not just the `ml` crate test binaries.
 
 Decision deferred pending binary size measurement and platform support requirements.
 
+## Windows (MSVC)
+
+Issue #337. Same idea as Linux, different tools: PowerShell scripts, `.lib` files, the
+Visual Studio generator.
+
+### Prerequisites
+
+- Visual Studio 2022 Build Tools with the "Desktop development with C++" workload
+  (MSVC 14.3x and a Windows SDK). CMake is taken from `PATH`, else from the Build Tools.
+- Git and Python 3 on `PATH`, Rust with the `x86_64-pc-windows-msvc` target.
+- A path without spaces: `RUSTFLAGS` is split on whitespace.
+
+### Build
+
+```powershell
+# 1. Build onnxruntime v1.30.0 from source (CPU only), then re2 explicitly
+.\lab\provisioning\build-onnxruntime-static.ps1
+
+# 2. Point ort-sys at the result and generate the link flags
+$env:ORT_LIB_LOCATION = "$PWD\onnxruntime\build\Windows\Release\Release"
+.\lab\provisioning\ort-static-link-flags.ps1 | Invoke-Expression
+
+# 3. Build and test with static linking (disables dynamic-onnx)
+cargo test -j 1 -p ml --release --no-default-features
+
+# 4. Check what the result depends on
+python tools\check-pe-imports.py target\release\deps\ml-*.exe
+```
+
+Measured on a 12-thread laptop, cold: the onnxruntime build took 48 minutes and left a
+3.4 GB build directory with 101 `.lib` files (1.1 GB). `cargo test -p ml` then passes
+(58 tests across the lib and the integration tests).
+
+### What is different from Linux
+
+- **CPU only, on purpose.** The prebuilt archive that `dynamic-onnx` downloads links
+  DirectML, so the agent imports `directml.dll` and `d3d12.dll` for an execution provider
+  it never uses. The source build has neither. `dxgi.dll` stays: onnxruntime's own device
+  discovery imports it, and it is an OS component, not something to ship or sign.
+- **Dynamic C runtime (`/MD`).** Same as rustc's MSVC target; mixing `/MT` libraries into
+  a Rust binary fails with duplicate CRT symbols. The consequence is that the binary
+  imports `msvcp140.dll` and `vcruntime140.dll` (the Visual C++ Redistributable), as the
+  agent built on the prebuilt download already does. A static CRT would need the whole
+  workspace on `-C target-feature=+crt-static`; not attempted here.
+- **`re2` is not built either.** Same cause as on Linux (the CPU provider only takes its
+  include path), so `ort-sys` stops with ``could not find native static library `re2` ``.
+  `cmake --build --target re2` does not find it with the Visual Studio generator, because
+  it lives in a sub-project; the build script builds `_deps\re2-build\re2.vcxproj` with
+  MSBuild.
+- **`shell32` must be linked.** onnxruntime's `telemetry.cc` calls `CommandLineToArgvW`;
+  without `-l dylib=shell32` the link fails with `LNK2019 unresolved external symbol
+  __imp_CommandLineToArgvW`. The flags script adds it. `shell32.dll` is on every Windows.
+- **Run cargo with `-j 1` (or 2) while linking the tests.** Each test binary links all
+  101 libraries; several at once exhausted the commit limit on a 16 GB machine (`os error
+  1455`, reported by `rustc` as "found invalid metadata files for crate `serde`", which
+  points nowhere near the cause). Stop WSL first if it is running: its VM reserves memory.
+
+### Still open for #337
+
+- A `dumpbin`-based or CI check: `tools/check-pe-imports.py` reads the import tables
+  without Visual Studio, but nothing runs it in CI because CI does not build a static
+  Windows binary yet (the build takes about an hour).
+- Binary size of the full agent against the prebuilt-download build; see the issue.
+
 ## Platform Support
 
 **Currently tested:**
 - ✅ Ubuntu 24.04 (glibc) - ADR-0002 target platform
 - ✅ Alpine 3.x (musl) - Not a target platform, but confirms approach works cross-libc
+- ✅ Windows 11 (MSVC, CPU only) - `cargo test -p ml` passes, no `onnxruntime.dll`, no
+  `directml.dll`, no `d3d12.dll` (see above)
 
 **TODO:**
-- ⏳ Windows (MSVC `.lib` files, different flag syntax)
 - ⏳ macOS (similar `.a` workflow, but untested)
 
-Both Windows and macOS are ADR-0002 target platforms but haven't been attempted yet.
+macOS is an ADR-0002 target platform that has not been attempted yet.
 
 ## References
 

@@ -36,9 +36,9 @@
 #   eval "$(./lab/provisioning/ort-static-link-flags.sh)"
 #   cargo test -p ml --release
 #
-# Linux only (`.a` extension, GNU ld/lld `-l`/`-L` syntax) — Windows (`.lib`,
-# MSVC) and macOS would need their own variant; neither has an ADR-0002 static
-# build attempted yet (issue #110 is Linux-only so far).
+# Linux only (`.a` extension, GNU ld/lld `-l`/`-L` syntax). Windows (`.lib`, MSVC)
+# has its own variant, ort-static-link-flags.ps1 (#337); macOS would need one too
+# and has no ADR-0002 static build attempted yet.
 set -euo pipefail
 
 : "${ORT_LIB_LOCATION:?set ORT_LIB_LOCATION to the onnxruntime build/Linux/Release directory}"
