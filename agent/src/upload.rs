@@ -315,6 +315,13 @@ impl crate::health::SpoolStatsSource for SpoolHealth {
 
 #[cfg(test)]
 mod tests {
+    use schema::{
+        Event, ExecEvent,
+        detection::{Detection, DetectionSource, Severity},
+    };
+
+    use super::*;
+
     #[test]
     fn the_ca_and_the_client_certificate_reach_the_transport_config() {
         let ca = Path::new("/etc/synthaea/certs/ca.pem");
@@ -435,13 +442,6 @@ mod tests {
         .unwrap();
         assert_eq!(target.ca_cert, Some(PathBuf::from("/lab/ca.pem")));
     }
-
-    use schema::{
-        Event, ExecEvent,
-        detection::{Detection, DetectionSource, Severity},
-    };
-
-    use super::*;
 
     #[test]
     fn the_spool_cap_follows_the_configured_mebibytes() {
