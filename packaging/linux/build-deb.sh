@@ -43,7 +43,18 @@ fi
 
 # ort-sys's pinned static-link list omits libraries produced by ONNX Runtime
 # 1.30.0; discover them from the source build rather than linking pyke's glibc archive.
-eval "$("$REPO_ROOT/lab/provisioning/ort-static-link-flags.sh")"
+# Run through bash rather than by exec bit, and fail loudly: with the script at
+# mode 644 the `Permission denied` went to stderr, `eval` received an empty
+# string and the build carried on without any flag, then failed at the link on
+# the very symbols this script adds (abseil Cord, utf8_range, ModelPackage*;
+# #647 CI, 2026-10-05).
+ort_flags="$(bash "$REPO_ROOT/lab/provisioning/ort-static-link-flags.sh")" \
+    || fail "ort-static-link-flags.sh failed: ONNX Runtime cannot be linked statically"
+case "$ort_flags" in
+    *"-l static="*) ;;
+    *) fail "ort-static-link-flags.sh produced no link flags" ;;
+esac
+eval "$ort_flags"
 export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-feature=+crt-static"
 rustup target add "$TARGET"
 
