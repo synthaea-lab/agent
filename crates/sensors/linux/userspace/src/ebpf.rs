@@ -13,8 +13,9 @@ pub(crate) fn err(msg: String) -> SensorError {
     msg.into()
 }
 
-/// Raw tracepoints attached by the sensor: the three scheduler hooks plus one
-/// shared syscall-entry and syscall-exit router.
+/// Raw tracepoints attached by the sensor: three scheduler hooks and shared
+/// syscall entry/exit routers. The routers preserve the syscall handlers,
+/// including the paired accept, recvfrom, and memfd_create exit events.
 pub const RAW_TRACEPOINTS: &[(&str, &str)] = &[
     ("raw_sched_process_fork", "sched_process_fork"),
     ("raw_sched_process_exit", "sched_process_exit"),
