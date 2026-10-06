@@ -149,13 +149,13 @@ mod tests {
         let mut actions = HashSet::new();
         for &(syscall_id, action) in DISPATCH_ENTRIES {
             assert!((0..1024).contains(&syscall_id));
-            assert!((1..=43).contains(&action));
+            assert!((1..=44).contains(&action));
             assert!(
                 actions.insert(action),
                 "duplicate dispatcher action {action}"
             );
         }
         assert!(actions.contains(&1));
-        assert!(actions.contains(&43));
+        assert!(actions.contains(&44));
     }
 }
