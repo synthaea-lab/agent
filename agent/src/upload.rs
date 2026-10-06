@@ -144,6 +144,24 @@ impl TransportHandle {
     }
 }
 
+/// The control plane `run` uploads to: its URL and, for one on a private CA, the PEM
+/// bundle that is the only trust root (`--ca-cert`, else `server.ca_cert`; #658).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ControlPlane<'a> {
+    pub(crate) url: &'a str,
+    pub(crate) ca_cert: Option<&'a Path>,
+}
+
+impl ControlPlane<'_> {
+    fn transport_config(&self) -> TransportConfig {
+        let config = TransportConfig::new(self.url);
+        match self.ca_cert {
+            Some(ca_cert) => config.with_ca_cert(ca_cert.to_path_buf()),
+            None => config,
+        }
+    }
+}
+
 /// Opens the spool (next to the alerts file — the same "derived, no separate
 /// flag" convention as `quarantine/` and the heartbeat file) and starts the
 /// upload thread against `server_url`.
@@ -151,7 +169,7 @@ impl TransportHandle {
 /// `spool_max_bytes` caps **each** of the two spools (events, and the detection
 /// spool beside it), so the worst case on disk is twice `storage.spool_max_mb`.
 pub(crate) fn start(
-    server_url: &str,
+    control_plane: &ControlPlane<'_>,
     alerts: &Path,
     spool_max_bytes: u64,
 ) -> anyhow::Result<TransportHandle> {
@@ -166,7 +184,7 @@ pub(crate) fn start(
 
     // Two clients on one config: `EventUploader` consumes its client, and the
     // health beacon needs one of its own for heartbeats.
-    let config = TransportConfig::new(server_url);
+    let config = control_plane.transport_config();
     let upload_client = TransportClient::new(config.clone())
         .map_err(|e| anyhow::anyhow!("transport client: {e}"))?;
     let detection_client = TransportClient::new(config.clone())
@@ -226,6 +244,21 @@ impl crate::health::SpoolStatsSource for SpoolHealth {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_configured_ca_reaches_the_transport_config() {
+        let ca = Path::new("/etc/synthaea/certs/ca.pem");
+        let pinned = ControlPlane {
+            url: "https://cp.example",
+            ca_cert: Some(ca),
+        };
+        assert_eq!(pinned.transport_config().ca_cert_path.as_deref(), Some(ca));
+        let default = ControlPlane {
+            url: "https://cp.example",
+            ca_cert: None,
+        };
+        assert_eq!(default.transport_config().ca_cert_path, None);
+    }
+
     use schema::{
         Event, ExecEvent,
         detection::{Detection, DetectionSource, Severity},

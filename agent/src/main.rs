@@ -129,6 +129,11 @@ enum Command {
         /// exactly as before.
         #[arg(long)]
         server: Option<String>,
+        /// PEM bundle of the only CA(s) trusted for `--server`'s certificate, for a
+        /// control plane on a private CA. Left unset, `server.ca_cert` from
+        /// `agent.toml`; with neither, the built-in public roots.
+        #[arg(long)]
+        ca_cert: Option<std::path::PathBuf>,
         /// Where downloaded content lives (issue #30) — the detection sink
         /// loads Sigma/YARA rules from `<content-dir>/rules/{sigma,yara}`.
         /// Defaults to `<storage.state_dir>/content`, exactly like
@@ -328,8 +333,10 @@ fn main() -> anyhow::Result<()> {
             enable_readline_capture,
             enable_dns_capture,
             server,
+            ca_cert,
             content_dir,
         } => {
+            let ca_cert = content::resolve_ca_cert(ca_cert, &cfg.server);
             let content_dir =
                 content_dir.unwrap_or_else(|| content::default_content_dir(&cfg.storage.state_dir));
             commands::cmd_run(commands::RunOptions {
@@ -341,7 +348,10 @@ fn main() -> anyhow::Result<()> {
                 enable_tls_capture,
                 enable_readline_capture,
                 enable_dns_capture,
-                server: server.as_deref(),
+                server: server.as_deref().map(|url| upload::ControlPlane {
+                    url,
+                    ca_cert: ca_cert.as_deref(),
+                }),
                 ipc_endpoint: &cfg.ipc.endpoint,
                 log_sources: &cfg.logs.sources,
                 content_dir: &content_dir,
@@ -361,7 +371,7 @@ fn main() -> anyhow::Result<()> {
             &ring,
             cert.as_deref(),
             key.as_deref(),
-            ca_cert.as_deref(),
+            content::resolve_ca_cert(ca_cert, &cfg.server).as_deref(),
             &state,
         ),
         Command::ApplyContentManifest {
@@ -376,7 +386,13 @@ fn main() -> anyhow::Result<()> {
             let (content_dir, state) =
                 content::resolve_content_paths(&cfg.storage.state_dir, content_dir, state)?;
             let ring = content::resolve_ring(ring, &cfg.updates)?;
-            let endpoint = content::resolve_endpoint(server, cert, key, ca_cert, &cfg.server);
+            let endpoint = content::resolve_endpoint(
+                server,
+                cert,
+                key,
+                content::resolve_ca_cert(ca_cert, &cfg.server),
+                &cfg.server,
+            );
             content::cmd_apply_content_manifest(
                 &endpoint,
                 &ring,
@@ -404,7 +420,7 @@ fn main() -> anyhow::Result<()> {
             &server,
             cert.as_deref(),
             key.as_deref(),
-            ca_cert.as_deref(),
+            content::resolve_ca_cert(ca_cert, &cfg.server).as_deref(),
             &cfg.storage.state_dir,
             !no_restart,
             allow_test_key,
