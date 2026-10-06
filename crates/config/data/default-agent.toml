@@ -96,9 +96,14 @@ max_reconnect_backoff_ms = 60000
 # `kind` is one of: access_common (Apache common), access_combined (Apache or
 # nginx combined), mysql_error (MySQL/MariaDB error log, failed logins). A site
 # with a custom LogFormat is not supported in v1. `path` must be absolute.
-# Today only mysql_error is read; the access_* kinds are accepted and logged as
-# not yet active. `mysql_error` needs the error log to be a FILE: Debian/Ubuntu
-# MariaDB logs to the journal by default, so set `log_error` in the server first.
+# An access_* source yields an event only for a request that matches a detection
+# signature (SQL injection, path traversal, a webshell-like request, a scanner user
+# agent), and one summary per minute (counts, top failing clients); no per-request
+# event. The query-string value of the matched parameter is the only value that
+# leaves the host, cut to 128 characters; the value of a parameter named like a secret
+# (token, password, api_key, ...) is replaced by REDACTED (ADR-0018, best effort).
+# `mysql_error` needs the error log to be a FILE: Debian/Ubuntu MariaDB logs to the
+# journal by default, so set `log_error` in the server first.
 # MySQL 8 writes the failed-login lines only at `log_error_verbosity = 3` (its default
 # of 2 writes none, so the source would stay silent).
 # The agent must be able to read it (root, or CAP_DAC_READ_SEARCH).
