@@ -70,9 +70,11 @@ impl SessionHijack {
     }
 
     /// Records a disconnect; on a reconnect from another client than the one
-    /// the session was disconnected from, alerts. A disconnect or reconnect
-    /// that names no usable client is not evidence either way: it clears
-    /// nothing it cannot replace and alerts on nothing.
+    /// the session was disconnected from, alerts. A client that cannot be
+    /// read is not evidence either way, and never alerts. A disconnect without
+    /// one records nothing. A reconnect always consumes the stored disconnect
+    /// before reading its client, because the session is attached again
+    /// whoever it was attached to.
     pub(crate) fn on_session(&mut self, event: &SessionEvent) -> Option<Alert> {
         let id = event.session_id?;
         match event.state {
