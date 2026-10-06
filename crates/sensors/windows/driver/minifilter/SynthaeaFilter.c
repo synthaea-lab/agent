@@ -157,7 +157,11 @@ Return Value:
                                 &FilterRegistration,
                                 &SynthaeaFilterData.FilterHandle );
 
-    FLT_ASSERT( NT_SUCCESS( status ) );
+    //
+    //  No FLT_ASSERT on the status: it is NT_ASSERT, which bugchecks a Debug
+    //  build with no kernel debugger attached before the failure is traced
+    //  below (reachable when the service has no Instances key).
+    //
 
     if (NT_SUCCESS( status )) {
 
