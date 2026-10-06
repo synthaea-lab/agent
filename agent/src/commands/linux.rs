@@ -106,14 +106,14 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
     let mut ebpf = sensor_linux::load_ebpf()
         .map_err(|e| anyhow::anyhow!("failed to load the embedded eBPF bytecode: {e}"))?;
     let mut failures = 0u32;
-    for (program_name, category, name) in sensor_linux::TRACEPOINTS {
+    for (program_name, name) in sensor_linux::RAW_TRACEPOINTS {
         match sensor_linux::load_program(&mut ebpf, program_name) {
             Ok(()) => println!(
-                "[OK]   program `{program_name}` ({category}:{name}) accepted by the verifier"
+                "[OK]   raw tracepoint program `{program_name}` ({name}) accepted by the verifier"
             ),
             Err(e) => {
                 failures += 1;
-                println!("[FAIL] program `{program_name}` ({category}:{name}) rejected: {e}");
+                println!("[FAIL] raw tracepoint program `{program_name}` ({name}) rejected: {e}");
             }
         }
     }
@@ -191,7 +191,7 @@ fn can_use_ebpf() -> bool {
 
     // Check 4: Can load programs (verifier acceptance)
     // Test at least one program to catch verifier rejections (strict lockdown/LSM)
-    if let Some((program_name, _category, _name)) = sensor_linux::TRACEPOINTS.first()
+    if let Some((program_name, _name)) = sensor_linux::RAW_TRACEPOINTS.first()
         && let Err(e) = sensor_linux::load_program(&mut ebpf, program_name)
     {
         tracing::debug!(program = program_name, error = %e, "eBPF preflight: program rejected");

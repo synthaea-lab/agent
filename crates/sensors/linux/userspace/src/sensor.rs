@@ -2,7 +2,7 @@
 //! buffers, dispatching normalized events to an `EventSink`. Migrated from
 //! `old/crates/synthaea-sensor-linux`.
 //!
-//! `load_ebpf`/`load_program`/`TRACEPOINTS` stay `pub`: the agent's status command
+//! `load_ebpf`/`load_program`/`RAW_TRACEPOINTS` stay `pub`: the agent's status command
 //! reuses them for the preflight (loads each program without attaching it), which is
 //! not part of the `Sensor` contract.
 
@@ -19,8 +19,9 @@ use tracing::warn;
 use crate::{
     container::{CgroupIdCache, DockerInfoCache, container_context},
     ebpf::{
-        TRACEPOINTS, TamperSlot, attach_tracepoint, clear_tamper_slot, err, load_ebpf_for_run,
-        prime_proc_lineage, read_tamper_slot, take_tamper_slot, write_signal_watch_pid,
+        RAW_TRACEPOINTS, TamperSlot, attach_raw_tracepoint, clear_tamper_slot, err,
+        load_ebpf_for_run, prime_proc_lineage, read_tamper_slot, take_tamper_slot,
+        write_signal_watch_pid,
     },
     normalize,
     proc::{read_proc_cmdline, read_proc_environ_security},
@@ -213,8 +214,8 @@ impl LinuxSensor {
             ),
         }
 
-        for (program, category, name) in TRACEPOINTS {
-            attach_tracepoint(&mut ebpf, program, category, name)?;
+        for (program, name) in RAW_TRACEPOINTS {
+            attach_raw_tracepoint(&mut ebpf, program, name)?;
         }
 
         let mut ring = |map: &str| -> Result<_, SensorError> {
