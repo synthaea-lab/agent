@@ -14,8 +14,8 @@ use ferrisetw::{
 };
 use schema::{
     AmsiContentEvent, AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent,
-    FileDeleteEvent, FileOpenEvent, ImageLoadEvent, RegistrySetEvent, ScriptBlockEvent,
-    SmbConnectEvent, UdpSendEvent, WmiActivityEvent, sensor::EventSink,
+    FileOpenEvent, ImageLoadEvent, RegistrySetEvent, ScriptBlockEvent, SmbConnectEvent,
+    UdpSendEvent, WmiActivityEvent, sensor::EventSink,
 };
 
 use crate::{
@@ -268,12 +268,9 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
             return;
         };
         if eid == 26 {
-            forward_mark_removal(
-                &parser,
-                &state,
-                sink.as_ref(),
-                meta(pid, 0, comm, timestamp_ns),
-            );
+            forward_mark_removal(&parser, &state, sink.as_ref(), || {
+                meta(pid, 0, comm, timestamp_ns)
+            });
             return;
         }
 
@@ -322,8 +319,9 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
 /// (#136), which also sees what this userland path can't.
 ///
 /// The stream check runs on the raw NT path first, so the path normalization
-/// (volume map, 8.3 expansion) only runs for the rare matching delete, never
-/// for the host's whole delete volume on the ETW thread (#481).
+/// (volume map, 8.3 expansion) and the token lookup behind `meta` only run
+/// for the rare matching delete, never for the host's whole delete volume on
+/// the ETW thread (#481, #408).
 ///
 /// Not distinguished: a disposition call that *clears* delete-on-close. The
 /// event doesn't carry the flag's value, and un-deleting a mark is not
@@ -332,14 +330,14 @@ fn forward_mark_removal(
     parser: &Parser<'_, '_>,
     state: &SharedState,
     sink: &dyn EventSink,
-    meta: EventMeta,
+    meta: impl FnOnce() -> EventMeta,
 ) {
     let raw_path: String = parser.try_parse("FilePath").unwrap_or_default();
-    if zone_identifier::stream_host_path(&raw_path).is_none() {
-        return;
+    if let Some(removal) =
+        zone_identifier::mark_removal(&raw_path, |raw| state.normalize_path(raw), meta)
+    {
+        sink.on_event(Event::FileDelete(removal));
     }
-    let path = state.normalize_path(&raw_path);
-    sink.on_event(Event::FileDelete(FileDeleteEvent { meta, path }));
 }
 
 /// DNS resolution events (EID 3008 — `QueryCompleted`).
