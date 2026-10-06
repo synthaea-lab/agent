@@ -5,7 +5,14 @@
 //!
 //! Build with the eBPF toolchain, then run as root on a Linux lab host:
 //! `cargo build -p sensor-linux --example accept_map_pressure`
-//! `sudo target/debug/examples/accept_map_pressure`
+//! `sudo sh -c "ulimit -n 8192; exec target/debug/examples/accept_map_pressure"`
+//!
+//! The file descriptor limit must exceed the thread count: every blocked thread holds
+//! a cloned listener. Without it the run fails with "Too many open files", then
+//! "child pressure failed". `ACCEPT_PRESSURE_THREADS` sets the thread count (default 1024).
+//!
+//! Blocked threads keep their entries in the sensor's parent-side maps (`ACCEPT_ARGS`,
+//! `PENDING_SYSCALL_EXIT`) until the process exits; that is the pressure being measured.
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -28,7 +35,14 @@ mod linux {
     };
     use sensor_linux::LinuxSensor;
 
-    const MAP_CAPACITY: usize = 1024;
+    const DEFAULT_THREADS: usize = 1024;
+
+    fn pressure_threads() -> usize {
+        std::env::var("ACCEPT_PRESSURE_THREADS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_THREADS)
+    }
     const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 
     struct AcceptSink(Sender<u16>);
@@ -53,10 +67,10 @@ mod linux {
         Ok(peer_port)
     }
 
-    fn block_accepts() -> Result<TcpListener, Box<dyn Error>> {
+    fn block_accepts(threads: usize) -> Result<TcpListener, Box<dyn Error>> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
-        let ready = Arc::new(Barrier::new(MAP_CAPACITY + 1));
-        for _ in 0..MAP_CAPACITY {
+        let ready = Arc::new(Barrier::new(threads + 1));
+        for _ in 0..threads {
             let socket = listener.try_clone()?;
             let ready = Arc::clone(&ready);
             thread::Builder::new()
@@ -75,7 +89,7 @@ mod linux {
         match mode {
             "control" => one_accept(),
             "pressure" => {
-                let _blocked = block_accepts()?;
+                let _blocked = block_accepts(pressure_threads())?;
                 one_accept()
             }
             other => Err(io::Error::other(format!("unknown child mode {other}")).into()),
@@ -146,7 +160,8 @@ mod linux {
         wait_for_port(&events, sentinel_port)
             .map_err(|error| io::Error::other(format!("post-pressure accept: {error}")))?;
         println!(
-            "PASS #660: socket_accept survived {MAP_CAPACITY} blocked calls (peer port {sentinel_port})"
+            "PASS #660: socket_accept survived {} blocked calls (peer port {sentinel_port})",
+            pressure_threads()
         );
         Ok(())
     }
