@@ -189,6 +189,36 @@ fn bounds_for_other_features_are_refused_at_load() {
 }
 
 #[test]
+fn metadata_without_the_bounds_or_the_threshold_is_refused_not_half_applied() {
+    let bounds = serde_json::json!({
+        "feature_names": FEATURE_NAMES,
+        "min_values": vec![-1.0e9_f32; FEATURE_COUNT],
+        "max_values": vec![1.0e9_f32; FEATURE_COUNT],
+    });
+    let cases = [
+        ("no bounds", serde_json::json!({ "threshold": 0.0 })),
+        (
+            "no threshold",
+            serde_json::json!({ "feature_bounds": bounds }),
+        ),
+        ("neither", serde_json::json!({})),
+    ];
+    for (name, meta) in cases {
+        let meta = serde_json::to_vec(&meta).unwrap();
+        assert!(
+            BehaviorScorer::from_onnx_bytes_with_metadata(MODEL, Some(&meta)).is_err(),
+            "{name}: a guard would be silently off"
+        );
+    }
+    // Both present: calibrated. None at all: uncalibrated, the explicit mode.
+    let both =
+        serde_json::to_vec(&serde_json::json!({ "threshold": 0.0, "feature_bounds": bounds }))
+            .unwrap();
+    assert!(BehaviorScorer::from_onnx_bytes_with_metadata(MODEL, Some(&both)).is_ok());
+    assert!(BehaviorScorer::from_onnx_bytes(MODEL).is_ok());
+}
+
+#[test]
 fn a_model_of_another_width_is_refused_at_load() {
     // The T0 cmdline model is 9 features wide, the T2 correlation model 8.
     for fixture in ["cmdline_scorer.onnx", "correlation_scorer.onnx"] {

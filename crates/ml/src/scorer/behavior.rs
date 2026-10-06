@@ -34,18 +34,23 @@ pub struct BehaviorScorer {
 }
 
 impl BehaviorScorer {
-    /// Loads a model from ONNX bytes with optional `model_metadata.json` bytes
-    /// (conformal threshold and feature bounds, see
-    /// [`super::CmdlineScorer::from_onnx_bytes_with_metadata`]).
+    /// Loads a model from ONNX bytes with optional `model_metadata.json` bytes.
+    ///
+    /// With metadata the model is **calibrated**: the file must carry both the conformal
+    /// threshold and the feature bounds (as `train_behavior.py` always writes them), and
+    /// both are applied. Without metadata the model is **uncalibrated**: every score is
+    /// returned and no vector is rejected as out of distribution. There is no half-way:
+    /// metadata with only one of the two is refused, since that would leave one guard off
+    /// silently.
     ///
     /// # Errors
     ///
     /// Returns [`ScorerError`] when the ONNX session cannot be built, the tree
     /// structure cannot be parsed, the model is not 23 features wide (a T0 or T2 model
-    /// shipped to this scorer), the metadata JSON is malformed, or its feature bounds
-    /// are not for exactly the T1 features, in this order. A bounds sidecar for fewer
-    /// features would otherwise skip the out-of-distribution guard on the rest without
-    /// a word.
+    /// shipped to this scorer), the metadata JSON is malformed or lacks the threshold or
+    /// the feature bounds, or its feature bounds are not for exactly the T1 features, in
+    /// this order (bounds for fewer features would skip the out-of-distribution guard on
+    /// the rest).
     pub fn from_onnx_bytes_with_metadata(
         model: &[u8],
         metadata: Option<&[u8]>,
@@ -64,16 +69,24 @@ impl BehaviorScorer {
             Some(bytes) => {
                 let parsed: ModelMetadata = serde_json::from_slice(bytes)
                     .map_err(|_| ParseError::Malformed("invalid metadata JSON"))?;
-                if let Some(bounds) = &parsed.feature_bounds {
-                    bounds.check_invariant()?;
-                    if bounds.feature_names != FEATURE_NAMES {
-                        return Err(ParseError::Malformed(
-                            "feature bounds are not for the T1 features",
-                        )
-                        .into());
-                    }
+                // A metadata file means a calibrated model, and `train_behavior.py` always
+                // writes both halves. Either one missing would switch its guard off without
+                // a word (no bounds: any vector is scored; no threshold: every score is
+                // returned), so it is refused here.
+                let bounds = parsed
+                    .feature_bounds
+                    .ok_or(ParseError::Malformed("metadata has no feature bounds"))?;
+                let threshold = parsed
+                    .threshold
+                    .ok_or(ParseError::Malformed("metadata has no threshold"))?;
+                bounds.check_invariant()?;
+                if bounds.feature_names != FEATURE_NAMES {
+                    return Err(ParseError::Malformed(
+                        "feature bounds are not for the T1 features",
+                    )
+                    .into());
                 }
-                (parsed.feature_bounds, parsed.threshold)
+                (Some(bounds), Some(threshold))
             }
             None => (None, None),
         };
@@ -86,7 +99,8 @@ impl BehaviorScorer {
         })
     }
 
-    /// Loads a model from ONNX bytes, without calibration metadata.
+    /// Loads an uncalibrated model from ONNX bytes: no threshold and no bounds (see
+    /// [`Self::from_onnx_bytes_with_metadata`]).
     ///
     /// # Errors
     ///
