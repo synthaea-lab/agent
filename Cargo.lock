@@ -3006,6 +3006,7 @@ dependencies = [
 name = "transport"
 version = "0.1.0"
 dependencies = [
+ "rustls",
  "schema",
  "serde",
  "serde_json",
