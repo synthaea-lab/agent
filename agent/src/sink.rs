@@ -650,6 +650,21 @@ impl DetectionSink {
             && let Some((yara, _)) = self.yara.lock().unwrap().as_ref()
         {
             let meta = wrapped.meta();
+            let requester = match meta.user {
+                schema::User::Unix { uid, gid } => Some(yara::Requester { uid, gid }),
+                // No uid to check on this platform: scanned as before.
+                _ if !cfg!(unix) => None,
+                // On unix a user the sensor could not resolve must not fall through to
+                // the unrestricted read, which runs with `CAP_DAC_READ_SEARCH` (#594).
+                _ => {
+                    tracing::warn!(
+                        pid = meta.pid,
+                        path = %event.path,
+                        "yara: not scanning a path opened by a user the sensor could not resolve"
+                    );
+                    return;
+                }
+            };
             yara.enqueue_for(
                 std::path::PathBuf::from(&event.path),
                 yara::ScanContext {
@@ -659,10 +674,7 @@ impl DetectionSink {
                     timestamp_ns: meta.timestamp_ns,
                     // The path is whatever the process named, even when the kernel
                     // refused the open: scan it only if that user could read it (#594).
-                    requester: match meta.user {
-                        schema::User::Unix { uid, gid } => Some(yara::Requester { uid, gid }),
-                        _ => None,
-                    },
+                    requester,
                 },
             );
         }
@@ -1341,7 +1353,11 @@ rule response_marker {
         sink.on_event(Event::FileOpen(schema::FileOpenEvent {
             path: payload.display().to_string(),
             flags: 0o101, // O_WRONLY | O_CREAT: write intent, what queues a scan
-            ..schema::fixtures::file_open()
+            meta: EventMeta {
+                // Root: unrestricted, the payload is the test's own file.
+                user: schema::User::Unix { uid: 0, gid: 0 },
+                ..schema::fixtures::meta()
+            },
         }));
         drive_linux_beacon(&sink, 6262);
         (payload, killed)
@@ -1413,6 +1429,42 @@ rule response_marker {
             .collect();
         assert_eq!(observe_only.len(), 2, "one per action: {alerts}");
         assert!(alerts.contains("RESPONSE-KILL"), "{alerts}");
+    }
+
+    /// #594: a write whose user the sensor could not resolve is not scanned at all, not
+    /// read with the agent's own privileges. The control event after it proves the
+    /// queue and the rule work, so the single scan is the root one.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_by_an_unresolved_user_is_not_scanned_on_unix() {
+        let dir = tmp("yara-unknown-user");
+        let yara_dir = dir.join("content").join("rules").join("yara");
+        std::fs::create_dir_all(&yara_dir).unwrap();
+        std::fs::write(yara_dir.join("marker.yar"), RESPONSE_MARKER_RULE).unwrap();
+        let payload = dir.join("payload.bin");
+        std::fs::write(&payload, b"dropped payload RESPONSE-SCENARIO-MARKER").unwrap();
+        let sink = sink_in(&dir);
+        assert_eq!(sink.reload_content().yara_rule_count, Some(1));
+        let write_as = |user: schema::User| {
+            sink.on_event(Event::FileOpen(schema::FileOpenEvent {
+                meta: EventMeta {
+                    user,
+                    ..schema::fixtures::meta()
+                },
+                path: payload.display().to_string(),
+                flags: 0o101,
+            }));
+        };
+
+        write_as(schema::User::Unknown);
+        write_as(schema::User::Unix { uid: 0, gid: 0 });
+        wait_for_alert(&dir, "YARA");
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let stats = sink.yara.lock().unwrap().as_ref().unwrap().0.stats();
+        assert_eq!(
+            stats.scanned, 1,
+            "only the root write is scanned, the unresolved one never reaches the queue"
+        );
     }
 
     #[test]
@@ -2010,6 +2062,8 @@ detection:
         assert_eq!(sink.reload_content().yara_rule_count, Some(1));
 
         let meta = EventMeta {
+            // Root: unrestricted, the payload is the test's own file (#594).
+            user: schema::User::Unix { uid: 0, gid: 0 },
             ppid: 777,
             comm: "dropper".into(),
             ..schema::fixtures::meta()
@@ -2214,6 +2268,8 @@ detection:
         assert_eq!(sink.reload_content().yara_rule_count, Some(1));
 
         let meta = EventMeta {
+            // Root: unrestricted, the payload is the test's own file (#594).
+            user: schema::User::Unix { uid: 0, gid: 0 },
             ppid: 778,
             comm: "dropper".into(),
             ..schema::fixtures::meta()

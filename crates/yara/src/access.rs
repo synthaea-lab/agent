@@ -45,7 +45,7 @@ impl Requester {
     /// refused.
     pub fn open(&self, path: &Path) -> io::Result<Result<File, Refused>> {
         if self.uid == 0 {
-            return open_regular(path);
+            return open_regular(path, true);
         }
         // Resolved, so a planted symlink is judged by where it leads. The kernel's
         // `fs.protected_symlinks` covers sticky directories only, and not on every host.
@@ -57,7 +57,7 @@ impl Requester {
         }
         // Checked on the opened file, not on the path: the mode and owner are those of
         // the inode actually read, whatever the path was swapped to meanwhile.
-        let file = match open_regular(&resolved)? {
+        let file = match open_regular(&resolved, false)? {
             Ok(file) => file,
             refused => return Ok(refused),
         };
@@ -91,21 +91,42 @@ impl Requester {
     ///
     /// The `io::Error` of opening the path.
     pub fn open(&self, path: &Path) -> io::Result<Result<File, Refused>> {
-        open_regular(path)
+        open_regular(path, true)
     }
 }
 
-/// Opens `path` if it is a regular file. The `stat` comes first because opening a FIFO
-/// with no writer blocks forever.
-fn open_regular(path: &Path) -> io::Result<Result<File, Refused>> {
-    if !std::fs::metadata(path)?.is_file() {
-        return Ok(Err(Refused::NotRegular));
-    }
-    let file = File::open(path)?;
+/// Opens `path` if it is a regular file. The type is checked on the opened descriptor,
+/// not on the path: a `stat` first would leave a window for the path to be swapped for a
+/// FIFO, and opening a FIFO with no writer blocks forever (the single scan worker with
+/// it). `O_NONBLOCK` makes that open return at once, and the `fstat` then refuses it.
+///
+/// `follow` is false for a path already resolved by [`Requester::open`]: the final
+/// component must then still be what was resolved, not a symlink swapped in since.
+fn open_regular(path: &Path, follow: bool) -> io::Result<Result<File, Refused>> {
+    let file = open_nonblocking(path, follow)?;
     if !file.metadata()?.is_file() {
         return Ok(Err(Refused::NotRegular));
     }
     Ok(Ok(file))
+}
+
+#[cfg(unix)]
+fn open_nonblocking(path: &Path, follow: bool) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let flags = if follow {
+        libc::O_NONBLOCK
+    } else {
+        libc::O_NONBLOCK | libc::O_NOFOLLOW
+    };
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_nonblocking(path: &Path, _follow: bool) -> io::Result<File> {
+    File::open(path)
 }
 
 #[cfg(all(test, unix))]
@@ -226,6 +247,32 @@ mod tests {
             owner_of(&f).open(&d),
             Ok(Err(Refused::NotRegular))
         ));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_fifo_is_refused_at_once_instead_of_blocking_the_scan_worker() {
+        let d = dir("fifo");
+        let fifo = d.join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path for the duration of the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o666) }, 0);
+        // No writer is ever opened: a blocking `open` would hang this test forever.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (path, other) = (fifo.clone(), fifo);
+        std::thread::spawn(move || {
+            let _ = tx.send((
+                matches!(
+                    Requester { uid: 0, gid: 0 }.open(&path),
+                    Ok(Err(Refused::NotRegular))
+                ),
+                matches!(STRANGER.open(&other), Ok(Err(Refused::NotRegular))),
+            ));
+        });
+        let (as_root, as_stranger) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("opening a FIFO must not block");
+        assert!(as_root && as_stranger);
         let _ = std::fs::remove_dir_all(&d);
     }
 
