@@ -260,12 +260,22 @@ fn build_tls_config(config: &TransportConfig) -> Result<ureq::tls::TlsConfig> {
 
     if let (Some(cert_path), Some(key_path)) = (&config.client_cert_path, &config.client_key_path) {
         // Load certificate from PEM file
-        let cert_pem = std::fs::read(cert_path)?;
+        let cert_pem = std::fs::read(cert_path).map_err(|e| {
+            TransportError::Config(format!(
+                "cannot read the client certificate {}: {e}",
+                cert_path.display()
+            ))
+        })?;
         let cert = Certificate::from_pem(&cert_pem)
             .map_err(|e| TransportError::Config(format!("failed to parse cert: {e}")))?;
 
         // Load private key from PEM file
-        let key_pem = std::fs::read(key_path)?;
+        let key_pem = std::fs::read(key_path).map_err(|e| {
+            TransportError::Config(format!(
+                "cannot read the client key {}: {e}",
+                key_path.display()
+            ))
+        })?;
         if is_encrypted_pem(&key_pem) {
             return Err(TransportError::Config(format!(
                 "the client key {} is passphrase-protected, which the transport cannot use \
@@ -417,5 +427,26 @@ mod tests {
             b"Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00"
         ));
         assert!(!is_encrypted_pem(b"-----BEGIN PRIVATE KEY-----"));
+    }
+
+    #[test]
+    fn an_unreadable_client_certificate_or_key_names_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = (dir.path().join("c.crt"), dir.path().join("c.key"));
+        let missing_cert =
+            TransportConfig::new("https://cp.example").with_client_cert(cert.clone(), key.clone());
+        let Err(err) = TransportClient::new(missing_cert) else {
+            panic!("a missing certificate must be refused");
+        };
+        assert!(err.to_string().contains("client certificate"), "{err}");
+        assert!(err.to_string().contains("c.crt"), "{err}");
+
+        std::fs::write(&cert, include_str!("../tests/fixtures/ca.pem")).unwrap();
+        let missing_key = TransportConfig::new("https://cp.example").with_client_cert(cert, key);
+        let Err(err) = TransportClient::new(missing_key) else {
+            panic!("a missing key must be refused");
+        };
+        assert!(err.to_string().contains("client key"), "{err}");
+        assert!(err.to_string().contains("c.key"), "{err}");
     }
 }
