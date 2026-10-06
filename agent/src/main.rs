@@ -124,15 +124,26 @@ enum Command {
         /// redacted. Linux only.
         #[arg(long)]
         enable_dns_capture: bool,
-        /// Control-plane base URL (e.g. `https://api.synthaea.example.com`).
-        /// When set, every normalized event is spooled next to the alerts file
-        /// and uploaded store-and-forward (at-least-once; the spool sheds
-        /// oldest past its byte cap). Without it the agent runs standalone,
-        /// exactly as before.
-        #[arg(long)]
+        /// Control-plane base URL, overriding `server.control_plane_url` from
+        /// `agent.toml`. Left unset, the agent uploads to the configured control plane
+        /// (store-and-forward, at-least-once; the spool sheds oldest past its byte cap),
+        /// presenting `server.mtls_cert`/`mtls_key`. A server named here never receives
+        /// the configured client certificate: pass `--cert`/`--key` for one that needs it.
+        #[arg(long, conflicts_with = "standalone")]
         server: Option<String>,
-        /// PEM bundle of the only CA(s) trusted for `--server`'s certificate, for a
-        /// control plane on a private CA. Left unset, `server.ca_cert` from
+        /// Run without uploading anything: events stay local, as before the agent read
+        /// its control plane from `agent.toml`.
+        #[arg(long)]
+        standalone: bool,
+        /// Client mTLS certificate (PEM) to present to the control plane, overriding the
+        /// configured one.
+        #[arg(long, requires = "key")]
+        cert: Option<std::path::PathBuf>,
+        /// Client mTLS private key (PEM). Required alongside `--cert`.
+        #[arg(long, requires = "cert")]
+        key: Option<std::path::PathBuf>,
+        /// PEM bundle of the only CA(s) trusted for the control plane's certificate, for
+        /// one on a private CA. Left unset, `server.ca_cert` from
         /// `agent.toml`; with neither, the built-in public roots.
         #[arg(long)]
         ca_cert: Option<std::path::PathBuf>,
@@ -335,10 +346,14 @@ fn main() -> anyhow::Result<()> {
             enable_readline_capture,
             enable_dns_capture,
             server,
+            standalone,
+            cert,
+            key,
             ca_cert,
             content_dir,
         } => {
-            let ca_cert = content::resolve_ca_cert(ca_cert, &cfg.server);
+            let target =
+                upload::resolve_run_target(server, standalone, cert, key, ca_cert, &cfg.server);
             let content_dir =
                 content_dir.unwrap_or_else(|| content::default_content_dir(&cfg.storage.state_dir));
             commands::cmd_run(commands::RunOptions {
@@ -350,10 +365,7 @@ fn main() -> anyhow::Result<()> {
                 enable_tls_capture,
                 enable_readline_capture,
                 enable_dns_capture,
-                server: server.as_deref().map(|url| upload::ControlPlane {
-                    url,
-                    ca_cert: ca_cert.as_deref(),
-                }),
+                server: target.as_ref().map(upload::RunTarget::control_plane),
                 ipc_endpoint: &cfg.ipc.endpoint,
                 log_sources: &cfg.logs.sources,
                 content_dir: &content_dir,

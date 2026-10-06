@@ -266,6 +266,13 @@ fn build_tls_config(config: &TransportConfig) -> Result<ureq::tls::TlsConfig> {
 
         // Load private key from PEM file
         let key_pem = std::fs::read(key_path)?;
+        if is_encrypted_pem(&key_pem) {
+            return Err(TransportError::Config(format!(
+                "the client key {} is passphrase-protected, which the transport cannot use \
+                 yet (`server.mtls_passphrase` is not wired): provide an unencrypted key",
+                key_path.display()
+            )));
+        }
         let key = PrivateKey::from_pem(&key_pem)
             .map_err(|e| TransportError::Config(format!("failed to parse key: {e}")))?;
 
@@ -274,6 +281,14 @@ fn build_tls_config(config: &TransportConfig) -> Result<ureq::tls::TlsConfig> {
     }
 
     Ok(builder.build())
+}
+
+/// Whether a PEM private key is passphrase-protected (PKCS#8 `ENCRYPTED PRIVATE KEY`, or the
+/// legacy `Proc-Type: 4,ENCRYPTED` header). Said plainly, because the parse error of an
+/// encrypted key does not name the cause.
+fn is_encrypted_pem(pem: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(pem);
+    text.contains("BEGIN ENCRYPTED PRIVATE KEY") || text.contains("Proc-Type: 4,ENCRYPTED")
 }
 
 /// Reads every certificate of a PEM bundle as a trust root. An unreadable file or
@@ -379,5 +394,28 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn a_passphrase_protected_client_key_is_refused_with_a_clear_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = (dir.path().join("c.crt"), dir.path().join("c.key"));
+        std::fs::write(&cert, include_str!("../tests/fixtures/ca.pem")).unwrap();
+        std::fs::write(
+            &key,
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n-----END ENCRYPTED PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let config = TransportConfig::new("https://cp.example").with_client_cert(cert, key);
+
+        let Err(err) = TransportClient::new(config) else {
+            panic!("an encrypted key must be refused");
+        };
+        assert!(err.to_string().contains("passphrase-protected"), "{err}");
+
+        assert!(is_encrypted_pem(
+            b"Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00"
+        ));
+        assert!(!is_encrypted_pem(b"-----BEGIN PRIVATE KEY-----"));
     }
 }
