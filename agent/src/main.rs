@@ -395,13 +395,17 @@ fn main() -> anyhow::Result<()> {
                 content::resolve_ca_cert(ca_cert, &cfg.server),
                 &cfg.server,
             );
-            content::cmd_apply_content_manifest(
+            let outcome = content::cmd_apply_content_manifest(
                 &endpoint,
                 &ring,
                 &content_dir,
                 &state,
                 &cfg.ipc.endpoint,
-            )
+            )?;
+            if outcome == content::ApplyOutcome::RingHalted {
+                std::process::exit(content::EXIT_RING_HALTED);
+            }
+            Ok(())
         }
         Command::Quarantine { alerts, action } => match action {
             QuarantineAction::List => {

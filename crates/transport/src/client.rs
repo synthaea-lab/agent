@@ -96,13 +96,7 @@ impl TransportClient {
     /// Returns an error if the request fails or the response body is not
     /// valid JSON for `R`.
     pub fn get_json<R: serde::de::DeserializeOwned>(&self, url: &str) -> Result<R> {
-        let response = self.agent.get(url).call().map_err(|e| match &e {
-            ureq::Error::StatusCode(status) => TransportError::ServerError {
-                status: *status,
-                message: e.to_string(),
-            },
-            _ => TransportError::Network(e.to_string()),
-        })?;
+        let response = send_get(self.agent.get(url))?;
 
         response
             .into_body()
@@ -127,13 +121,7 @@ impl TransportClient {
         for (key, value) in query {
             req = req.query(*key, *value);
         }
-        let response = req.call().map_err(|e| match &e {
-            ureq::Error::StatusCode(status) => TransportError::ServerError {
-                status: *status,
-                message: e.to_string(),
-            },
-            _ => TransportError::Network(e.to_string()),
-        })?;
+        let response = send_get(req)?;
 
         let mut body = response.into_body();
         body.with_config()
@@ -192,6 +180,52 @@ impl TransportClient {
     pub fn config(&self) -> &TransportConfig {
         &self.config
     }
+}
+
+/// Longest server explanation kept from an error response.
+const ERROR_BODY_LIMIT: u64 = 2048;
+
+/// Sends a GET and turns a 4xx/5xx into [`TransportError::ServerError`] that
+/// carries what the server said. `ureq`'s own status error discards the body, so
+/// a `423 Locked` carrying "Content delivery is halted for ring `canary_0` at
+/// release 3" reached the operator as `http status: 423` (#667).
+fn send_get(
+    request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+) -> Result<ureq::http::Response<ureq::Body>> {
+    let response = request
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()
+        .map_err(|e| TransportError::Network(e.to_string()))?;
+    let status = response.status().as_u16();
+    if status < 400 {
+        return Ok(response);
+    }
+    let text = response
+        .into_body()
+        .with_config()
+        .limit(ERROR_BODY_LIMIT)
+        .read_to_string()
+        .unwrap_or_default();
+    Err(TransportError::ServerError {
+        status,
+        message: error_reason(&text).unwrap_or_else(|| format!("http status: {status}")),
+    })
+}
+
+/// The explanation in an error body: the `error`, `message` or `reason` string
+/// of a JSON object, else the plain text. `None` when the body says nothing.
+fn error_reason(body: &str) -> Option<String> {
+    let body = body.trim();
+    if let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(body) {
+        return ["error", "message", "reason"]
+            .iter()
+            .find_map(|key| fields.get(*key)?.as_str())
+            .map(str::to_string)
+            .filter(|reason| !reason.is_empty());
+    }
+    (!body.is_empty()).then(|| body.to_string())
 }
 
 fn validate_detection_response(response: DetectionUploadResponse) -> Result<()> {
