@@ -49,13 +49,17 @@ pub use manifest::ReleaseManifest;
 /// The symlink swap runs first: if the ban-list write then fails, `current` has
 /// already moved off the failed release — the higher-priority half of rollback —
 /// even though the anti-repeat guard did not get recorded that time.
+///
+/// Removing the failed release's directory is best effort and its failure is not an
+/// error here, but it is not silent either: it comes back in
+/// [`RollbackReport::cleanup_error`] for the caller to log (#657).
 #[cfg(target_os = "linux")]
 pub fn rollback(
     layout: &layout::Layout,
     ban_list_path: &std::path::Path,
     previous: Option<u64>,
     failed: u64,
-) -> Result<(), UpdaterError> {
+) -> Result<RollbackReport, UpdaterError> {
     match previous {
         Some(release_version) => layout.promote(release_version)?,
         None => layout.reset_to_bootstrap()?,
@@ -68,8 +72,19 @@ pub fn rollback(
     // so nothing can select it again (PR #533 review). Best effort: a leftover
     // directory costs disk, and `Layout::rollback_target` skips banned releases
     // regardless.
-    let _ = layout.prune(failed);
-    Ok(())
+    Ok(RollbackReport {
+        cleanup_error: layout.prune(failed).err(),
+    })
+}
+
+/// What [`rollback`] did beyond the repoint and the ban, which are errors when they
+/// fail.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct RollbackReport {
+    /// Why the failed release's directory could not be removed, if it could not
+    /// (a banned release's files stay on disk until someone removes them).
+    pub cleanup_error: Option<UpdaterError>,
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -168,5 +183,27 @@ mod integration_tests {
                 current: 5
             })
         ));
+    }
+
+    #[test]
+    fn a_failed_cleanup_is_reported_and_does_not_abort_the_rollback() {
+        let base = tempfile::tempdir().unwrap();
+        let layout = Layout::new(base.path());
+        fs::create_dir_all(layout.bootstrap_dir()).unwrap();
+        fs::create_dir_all(layout.version_dir(1)).unwrap();
+        fs::write(layout.version_dir(2), b"not a directory").unwrap();
+        std::os::unix::fs::symlink(layout.bootstrap_dir(), layout.current_link()).unwrap();
+        layout.promote(1).unwrap();
+        let ban_list_path = base.path().join("banned_versions.json");
+
+        let report = rollback(&layout, &ban_list_path, Some(1), 2).unwrap();
+
+        assert!(report.cleanup_error.is_some(), "the leftover is reported");
+        assert_eq!(layout.current_release_version(), Some(1));
+        assert!(
+            crate::banlist::BannedVersions::load(&ban_list_path)
+                .unwrap()
+                .is_banned(2)
+        );
     }
 }
