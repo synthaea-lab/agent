@@ -442,6 +442,17 @@ pub(crate) fn resolve_endpoint(
     }
 }
 
+/// The CA bundle to trust for the control plane: `--ca-cert`, else `server.ca_cert`
+/// from `agent.toml`, else none (the built-in roots). A CA is a trust anchor and not a
+/// credential, so unlike the client certificate it applies to a server named by hand
+/// too; it can only make verification stricter.
+pub(crate) fn resolve_ca_cert(
+    flag: Option<PathBuf>,
+    configured: &config::ServerConfig,
+) -> Option<PathBuf> {
+    flag.or_else(|| configured.ca_cert.clone())
+}
+
 /// Picks the ring for `apply-content-manifest`: `--ring`, else
 /// `updates.ring`. There is no default ring — an agent that lands in `prod`
 /// by omission would bypass the canary rollout (ADR-0016).
@@ -584,6 +595,7 @@ mod tests {
             mtls_cert: PathBuf::from("/etc/synthaea/certs/client.crt"),
             mtls_key: PathBuf::from("/etc/synthaea/certs/client.key"),
             mtls_passphrase: config::SecretRef::Invalid(String::new()),
+            ca_cert: None,
             offline_fallback: true,
         }
     }

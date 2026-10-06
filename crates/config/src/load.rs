@@ -278,6 +278,18 @@ fn validate_semantics(cfg: &AgentConfig, source_path: &Path) -> Result<(), Confi
         }
     }
 
+    // server.ca_cert — optional; when given, absolute for the same reason.
+    if let Some(ca_cert) = &cfg.server.ca_cert
+        && !ca_cert.is_absolute()
+    {
+        return Err(ConfigError::Invalid {
+            field: "server.ca_cert".into(),
+            expected: "an absolute filesystem path".into(),
+            value: ca_cert.display().to_string(),
+            origin: src.clone(),
+        });
+    }
+
     // storage.state_dir — absolute, same rationale.
     if !cfg.storage.state_dir.is_absolute() {
         return Err(ConfigError::Invalid {
@@ -486,6 +498,38 @@ max_reconnect_backoff_ms = 60000
         assert_eq!(cfg.storage.spool_max_mb, 4096);
         assert_eq!(cfg.resources.worker_threads, 0);
         assert_eq!(cfg.resources.max_reconnect_backoff().as_secs(), 60);
+    }
+
+    #[test]
+    fn an_absent_ca_cert_means_the_builtin_roots() {
+        let f = write_tmp(&valid_toml());
+        let cfg = load_from(f.path()).expect("valid config should load");
+        assert_eq!(cfg.server.ca_cert, None);
+    }
+
+    #[test]
+    fn a_configured_ca_cert_is_loaded() {
+        let ca = FIXTURE_MTLS_CERT.replace("client.crt", "ca.pem");
+        let toml = valid_toml().replace(
+            "mtls_passphrase =",
+            &format!("ca_cert = \"{}\"\nmtls_passphrase =", ca.replace('\\', "\\\\")),
+        );
+        let f = write_tmp(&toml);
+        let cfg = load_from(f.path()).expect("valid config should load");
+        assert_eq!(cfg.server.ca_cert.as_deref(), Some(Path::new(&ca)));
+    }
+
+    #[test]
+    fn a_relative_ca_cert_is_rejected() {
+        let toml = valid_toml().replace(
+            "mtls_passphrase =",
+            "ca_cert = \"certs/ca.pem\"\nmtls_passphrase =",
+        );
+        let f = write_tmp(&toml);
+        match load_from(f.path()).unwrap_err() {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "server.ca_cert"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     #[test]

@@ -29,6 +29,11 @@ control_plane_url = "https://cp.synthaea.example"    # CHANGE ME
 mtls_cert       = "/etc/synthaea/certs/client.crt"   # CHANGE ME
 mtls_key        = "/etc/synthaea/certs/client.key"   # CHANGE ME
 
+# Optional: PEM bundle of the CA(s) that sign the control plane's server
+# certificate, for a control plane on a private CA. When set, ONLY these roots
+# are trusted (the built-in public roots are not). Absolute path.
+# ca_cert = "/etc/synthaea/certs/ca.pem"
+
 # Reference to the private-key passphrase. Two providers are supported:
 #   envvar:NAME               (read from the process's environment)
 #   file:/absolute/path       (read from a 0600 file)

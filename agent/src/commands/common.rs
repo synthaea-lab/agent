@@ -42,7 +42,7 @@ pub(crate) fn wire_run_pipeline(
     rule_state: rules::RuleState,
     alerts: &std::path::Path,
     events: Option<&std::path::Path>,
-    server: Option<&str>,
+    server: Option<crate::upload::ControlPlane<'_>>,
     ipc_endpoint: &str,
     content_dir: &std::path::Path,
     storage: &config::StorageConfig,
@@ -50,7 +50,7 @@ pub(crate) fn wire_run_pipeline(
     // Transport first: the sink needs the spool handle at construction.
     let spool_cap = crate::upload::spool_cap_bytes(storage.spool_max_mb);
     let transport = server
-        .map(|url| crate::upload::start(url, alerts, spool_cap))
+        .map(|control_plane| crate::upload::start(&control_plane, alerts, spool_cap))
         .transpose()?;
     let spool = transport.as_ref().map(|t| Arc::clone(&t.spool));
     let detection_spool = transport.as_ref().map(|t| Arc::clone(&t.detection_spool));
@@ -71,7 +71,8 @@ pub(crate) fn wire_run_pipeline(
         alerts.display(),
         events.map_or_else(|| "off".to_string(), |p| p.display().to_string())
     );
-    if let Some(url) = server {
+    if let Some(control_plane) = server {
+        let url = control_plane.url;
         eprintln!(
             "server: {url} · event spool: {} · detection spool: {} (store-and-forward, at-least-once)",
             alerts.with_file_name("spool").display(),
