@@ -143,9 +143,10 @@ pub(crate) fn cmd_check_content_manifest(
     ring: &str,
     cert: Option<&Path>,
     key: Option<&Path>,
+    ca_cert: Option<&Path>,
     state_path: &Path,
 ) -> anyhow::Result<()> {
-    let client = build_client(server, cert, key)?;
+    let client = build_client(server, cert, key, ca_cert)?;
     let url = client.config().content_manifest_url(ring);
     let manifest: ContentManifest = client.get_json(&url)?;
 
@@ -174,7 +175,8 @@ pub(crate) fn cmd_check_content_manifest(
 }
 
 /// Builds a [`transport::TransportClient`] for `server`, with mTLS if both
-/// `cert` and `key` are given — shared by [`cmd_check_content_manifest`] and
+/// `cert` and `key` are given, and trusting only `ca_cert`'s roots when it is
+/// (a control plane on a private CA, #658) — shared by [`cmd_check_content_manifest`] and
 /// [`cmd_apply_content_manifest`].
 ///
 /// # Errors
@@ -184,10 +186,14 @@ fn build_client(
     server: &str,
     cert: Option<&Path>,
     key: Option<&Path>,
+    ca_cert: Option<&Path>,
 ) -> anyhow::Result<transport::TransportClient> {
     let mut config = transport::TransportConfig::new(server);
     if let (Some(cert), Some(key)) = (cert, key) {
         config = config.with_client_cert(PathBuf::from(cert), PathBuf::from(key));
+    }
+    if let Some(ca_cert) = ca_cert {
+        config = config.with_ca_cert(PathBuf::from(ca_cert));
     }
     Ok(transport::TransportClient::new(config)?)
 }
@@ -403,6 +409,8 @@ pub(crate) struct Endpoint {
     pub(crate) server: String,
     pub(crate) cert: Option<PathBuf>,
     pub(crate) key: Option<PathBuf>,
+    /// PEM bundle of the only CA(s) trusted for the server's certificate.
+    pub(crate) ca_cert: Option<PathBuf>,
 }
 
 /// Picks the control plane for `apply-content-manifest`. `--server` omitted
@@ -415,11 +423,18 @@ pub(crate) fn resolve_endpoint(
     server: Option<String>,
     cert: Option<PathBuf>,
     key: Option<PathBuf>,
+    ca_cert: Option<PathBuf>,
     configured: &config::ServerConfig,
 ) -> Endpoint {
     match server {
-        Some(server) => Endpoint { server, cert, key },
+        Some(server) => Endpoint {
+            server,
+            cert,
+            key,
+            ca_cert,
+        },
         None => Endpoint {
+            ca_cert,
             server: configured.control_plane_url.clone(),
             cert: Some(cert.unwrap_or_else(|| configured.mtls_cert.clone())),
             key: Some(key.unwrap_or_else(|| configured.mtls_key.clone())),
@@ -462,15 +477,18 @@ pub(crate) fn resolve_ring(
 /// verification, or [`download_and_apply`] fails partway through (already-
 /// applied entries stay recorded in `state_path` for the next attempt).
 pub(crate) fn cmd_apply_content_manifest(
-    server: &str,
+    endpoint: &Endpoint,
     ring: &str,
-    cert: Option<&Path>,
-    key: Option<&Path>,
     content_dir: &Path,
     state_path: &Path,
     ipc_endpoint: &str,
 ) -> anyhow::Result<()> {
-    let client = build_client(server, cert, key)?;
+    let client = build_client(
+        &endpoint.server,
+        endpoint.cert.as_deref(),
+        endpoint.key.as_deref(),
+        endpoint.ca_cert.as_deref(),
+    )?;
     let url = client.config().content_manifest_url(ring);
     let manifest: ContentManifest = client.get_json(&url)?;
 
@@ -572,7 +590,7 @@ mod tests {
 
     #[test]
     fn omitting_server_uses_the_configured_control_plane_and_mtls_pair() {
-        let endpoint = resolve_endpoint(None, None, None, &configured_server());
+        let endpoint = resolve_endpoint(None, None, None, None, &configured_server());
         assert_eq!(endpoint.server, "https://cp.example");
         assert_eq!(
             endpoint.cert.as_deref(),
@@ -590,6 +608,7 @@ mod tests {
             Some("http://127.0.0.1:3000".to_string()),
             None,
             None,
+            None,
             &configured_server(),
         );
         assert_eq!(endpoint.server, "http://127.0.0.1:3000");
@@ -602,6 +621,7 @@ mod tests {
         let endpoint = resolve_endpoint(
             None,
             Some(PathBuf::from("/tmp/other.crt")),
+            None,
             None,
             &configured_server(),
         );

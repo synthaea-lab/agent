@@ -29,6 +29,7 @@ pub(crate) fn cmd_apply_release(
     _server: &str,
     _cert: Option<&std::path::Path>,
     _key: Option<&std::path::Path>,
+    _ca_cert: Option<&std::path::Path>,
     _base_dir: &std::path::Path,
     _restart: bool,
     _allow_test_key: bool,
@@ -359,6 +360,7 @@ mod linux {
         server: &str,
         cert: Option<&Path>,
         key: Option<&Path>,
+        ca_cert: Option<&Path>,
         base_dir: &Path,
         restart: bool,
         allow_test_key: bool,
@@ -369,6 +371,9 @@ mod linux {
         let mut config = transport::TransportConfig::new(server);
         if let (Some(cert), Some(key)) = (cert, key) {
             config = config.with_client_cert(PathBuf::from(cert), PathBuf::from(key));
+        }
+        if let Some(ca_cert) = ca_cert {
+            config = config.with_ca_cert(PathBuf::from(ca_cert));
         }
         let client = transport::TransportClient::new(config)?;
         let layout = Layout::new(base_dir);
@@ -483,6 +488,7 @@ mod linux {
             // fail differently, so the flag error proves the guard runs first.
             let err = cmd_apply_release(
                 "http://127.0.0.1:1",
+                None,
                 None,
                 None,
                 Path::new("/nonexistent/synthaea"),

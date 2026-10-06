@@ -238,39 +238,67 @@ fn build_agent(config: &TransportConfig) -> Result<ureq::Agent> {
         .timeout_global(Some(config.request_timeout))
         .user_agent(format!("synthaea-agent/{}", env!("CARGO_PKG_VERSION")));
 
-    // Configure mTLS if certificates are provided
-    if config.has_client_cert() {
-        let tls_config = build_tls_config(config)?;
-        agent_builder = agent_builder.tls_config(tls_config);
+    // A custom TLS config is only needed for mTLS or a private CA; otherwise
+    // ureq's defaults (built-in public roots) stand.
+    if config.has_client_cert() || config.ca_cert_path.is_some() {
+        agent_builder = agent_builder.tls_config(build_tls_config(config)?);
     }
 
     Ok(agent_builder.build().into())
 }
 
-/// Builds TLS config with client certificate authentication.
+/// Builds the TLS config: the client certificate for mTLS and/or the pinned CA
+/// roots, whichever are configured.
 fn build_tls_config(config: &TransportConfig) -> Result<ureq::tls::TlsConfig> {
     use ureq::tls::{Certificate, ClientCert, PrivateKey, TlsConfig};
 
-    let (Some(cert_path), Some(key_path)) = (&config.client_cert_path, &config.client_key_path)
-    else {
-        // No client cert configured, use default TLS
-        return Ok(TlsConfig::default());
-    };
+    let mut builder = TlsConfig::builder();
 
-    // Load certificate from PEM file
-    let cert_pem = std::fs::read(cert_path)?;
-    let cert = Certificate::from_pem(&cert_pem)
-        .map_err(|e| TransportError::Config(format!("failed to parse cert: {e}")))?;
+    if let Some(ca_path) = &config.ca_cert_path {
+        builder = builder.root_certs(load_ca_roots(ca_path)?);
+    }
 
-    // Load private key from PEM file
-    let key_pem = std::fs::read(key_path)?;
-    let key = PrivateKey::from_pem(&key_pem)
-        .map_err(|e| TransportError::Config(format!("failed to parse key: {e}")))?;
+    if let (Some(cert_path), Some(key_path)) = (&config.client_cert_path, &config.client_key_path) {
+        // Load certificate from PEM file
+        let cert_pem = std::fs::read(cert_path)?;
+        let cert = Certificate::from_pem(&cert_pem)
+            .map_err(|e| TransportError::Config(format!("failed to parse cert: {e}")))?;
 
-    // Create client certificate with chain and key
-    let client_cert = ClientCert::new_with_certs(&[cert], key);
+        // Load private key from PEM file
+        let key_pem = std::fs::read(key_path)?;
+        let key = PrivateKey::from_pem(&key_pem)
+            .map_err(|e| TransportError::Config(format!("failed to parse key: {e}")))?;
 
-    Ok(TlsConfig::builder().client_cert(Some(client_cert)).build())
+        // Create client certificate with chain and key
+        builder = builder.client_cert(Some(ClientCert::new_with_certs(&[cert], key)));
+    }
+
+    Ok(builder.build())
+}
+
+/// Reads every certificate of a PEM bundle as a trust root. An unreadable file or
+/// a bundle with no certificate is a configuration error, not a silent fallback to
+/// the public roots: the operator asked for a pinned CA.
+fn load_ca_roots(path: &std::path::Path) -> Result<ureq::tls::RootCerts> {
+    let pem = std::fs::read(path).map_err(|e| {
+        TransportError::Config(format!("cannot read CA bundle {}: {e}", path.display()))
+    })?;
+    let mut roots = Vec::new();
+    for item in ureq::tls::parse_pem(&pem) {
+        let item = item.map_err(|e| {
+            TransportError::Config(format!("invalid CA bundle {}: {e}", path.display()))
+        })?;
+        if let ureq::tls::PemItem::Certificate(cert) = item {
+            roots.push(cert);
+        }
+    }
+    if roots.is_empty() {
+        return Err(TransportError::Config(format!(
+            "CA bundle {} contains no certificate",
+            path.display()
+        )));
+    }
+    Ok(ureq::tls::RootCerts::new_with_certs(&roots))
 }
 
 #[cfg(test)]
