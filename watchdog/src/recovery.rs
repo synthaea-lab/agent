@@ -45,8 +45,11 @@ fn recover_with_probe(
     let ban_list_path = base_dir.join(BAN_LIST);
     let banned = BannedVersions::load(&ban_list_path).context("read updater ban list")?;
     let previous = layout.rollback_target(failed, &banned);
-    updater::rollback(&layout, &ban_list_path, previous, failed)
+    let report = updater::rollback(&layout, &ban_list_path, previous, failed)
         .context("roll back unexecutable watchdog release")?;
+    if let Some(cause) = report.cleanup_error {
+        eprintln!("[watchdog] could not remove the failed release {failed}'s directory: {cause}");
+    }
 
     match previous {
         Some(version) => eprintln!(

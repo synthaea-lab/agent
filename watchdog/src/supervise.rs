@@ -369,7 +369,13 @@ fn settle_probation(
             let target =
                 restored.map_or_else(|| "bootstrap".to_string(), |v| format!("release {v}"));
             match current.roll_back() {
-                Ok(()) => {
+                Ok(report) => {
+                    if let Some(cause) = report.and_then(|r| r.cleanup_error) {
+                        eprintln!(
+                            "[watchdog] could not remove the failed release {failed}'s directory: \
+                             {cause}"
+                        );
+                    }
                     report_self_protection_event(
                         alerts,
                         &format!(

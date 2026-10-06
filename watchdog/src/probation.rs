@@ -193,12 +193,14 @@ mod linux {
         ///
         /// # Errors
         ///
-        /// Propagates [`UpdaterError`] from the symlink swap or ban-list write.
-        pub(crate) fn roll_back(&self) -> Result<(), UpdaterError> {
+        /// Propagates [`UpdaterError`] from the symlink swap or ban-list write. A
+        /// failed removal of the release's directory is not an error; it is in the
+        /// returned report (`None` when the rollback did not run).
+        pub(crate) fn roll_back(&self) -> Result<Option<updater::RollbackReport>, UpdaterError> {
             if self.layout.current_release_version() != Some(self.release) {
-                return Ok(());
+                return Ok(None);
             }
-            updater::rollback(&self.layout, &self.ban_list, self.previous, self.release)
+            updater::rollback(&self.layout, &self.ban_list, self.previous, self.release).map(Some)
         }
     }
 
