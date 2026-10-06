@@ -11,7 +11,7 @@
 //! - [`forest`] — tree structure parsed back out of the ONNX model, for per-feature
 //!   attribution (the explanation side of "never a bare score", `docs/detection/ml.md`);
 //! - [`bounds`] — out-of-distribution detection (issue #46);
-//! - [`scorer`] — [`CmdlineScorer`] (T0) and [`CorrelationScorer`] (T2), which run a
+//! - [`scorer`] — [`CmdlineScorer`] (T0), [`BehaviorScorer`] (T1) and [`CorrelationScorer`] (T2), which run a
 //!   model through `ort` and pair each score with its attribution.
 
 mod proto;
@@ -25,5 +25,6 @@ pub use bounds::FeatureBounds;
 pub use forest::{Attribution, Forest, ParseError, top_attributions};
 pub use scorer::{
     CmdlineScorer, Score, ScorerError,
+    behavior::BehaviorScorer,
     correlation::{CorrelationScorer, MIN_EVENT_COUNT, score_to_llr},
 };
