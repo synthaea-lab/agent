@@ -58,6 +58,7 @@ const DISPATCH_ENTRIES: &[(libc::c_long, u32)] = &[
     (libc::SYS_capset, 41),
     (libc::SYS_setns, 42),
     (libc::SYS_unshare, 43),
+    (libc::SYS_recvfrom, 44),
 ];
 
 /// Linux's asm-generic syscall numbers used by native AArch64. Legacy syscalls
@@ -102,6 +103,7 @@ const DISPATCH_ENTRIES: &[(libc::c_long, u32)] = &[
     (91, 41),  // capset
     (268, 42), // setns
     (97, 43),  // unshare
+    (207, 44), // recvfrom
 ];
 
 #[cfg(ebpf_embedded)]
@@ -147,13 +149,13 @@ mod tests {
         let mut actions = HashSet::new();
         for &(syscall_id, action) in DISPATCH_ENTRIES {
             assert!((0..1024).contains(&syscall_id));
-            assert!((1..=43).contains(&action));
+            assert!((1..=44).contains(&action));
             assert!(
                 actions.insert(action),
                 "duplicate dispatcher action {action}"
             );
         }
         assert!(actions.contains(&1));
-        assert!(actions.contains(&43));
+        assert!(actions.contains(&44));
     }
 }

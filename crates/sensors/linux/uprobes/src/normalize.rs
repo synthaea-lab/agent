@@ -64,7 +64,9 @@ use crate::redact;
 ///
 /// v21 (#515) added `old_dfd`/`new_dfd` to `FileRenameEvent` — not imported here, same
 /// reasoning.
-const _: () = assert!(wire::WIRE_VERSION == 21);
+///
+/// v22 (#263) added `UdpRecvEvent` — not imported here, same reasoning.
+const _: () = assert!(wire::WIRE_VERSION == 22);
 
 /// `container` is resolved by the caller (`crate::container::container_context`,
 /// issue #312) from `EventMeta::cgroup_id` against cgroupfs, with image/name filled
