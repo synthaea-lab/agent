@@ -35,9 +35,10 @@ use crate::{
     HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent,
     KernelModuleAction, KernelModuleEvent, ListenPortEvent, MemfdCreateEvent, NamespaceEvent,
     NamespaceSyscall, NetworkFlowEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent,
-    PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType,
-    SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TlsCaptureEvent,
-    TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
+    PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent,
+    SessionState, ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
+    SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent,
+    User, WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -240,6 +241,19 @@ pub fn auth() -> AuthEvent {
         target_user_sid: None,
         source_address: None,
         status_code: None,
+    }
+}
+
+/// Neutral [`SessionEvent`]: a console logon to session 1, no account.
+#[must_use]
+pub fn session() -> SessionEvent {
+    SessionEvent {
+        meta: meta(),
+        state: SessionState::Logon,
+        session_id: Some(1),
+        target_user: String::new(),
+        source_address: None,
+        console: true,
     }
 }
 

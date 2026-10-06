@@ -649,6 +649,47 @@ mod tests {
         }
     }
 
+    fn ca(path: &str) -> Option<PathBuf> {
+        Some(PathBuf::from(path))
+    }
+
+    #[test]
+    fn resolve_ca_cert_takes_the_flag_the_config_or_both_with_the_flag_winning() {
+        let mut server = configured_server();
+        // Neither: the built-in roots.
+        assert_eq!(resolve_ca_cert(None, &server), None);
+        // Flag only.
+        assert_eq!(
+            resolve_ca_cert(ca("/lab/ca.pem"), &server),
+            ca("/lab/ca.pem")
+        );
+        // Config only.
+        server.ca_cert = ca("/etc/synthaea/certs/ca.pem");
+        assert_eq!(
+            resolve_ca_cert(None, &server),
+            ca("/etc/synthaea/certs/ca.pem")
+        );
+        // Both: the flag wins.
+        assert_eq!(
+            resolve_ca_cert(ca("/lab/ca.pem"), &server),
+            ca("/lab/ca.pem")
+        );
+    }
+
+    #[test]
+    fn a_ca_bundle_is_kept_for_the_configured_and_for_an_explicit_server() {
+        let configured = resolve_endpoint(None, None, None, ca("/x/ca.pem"), &configured_server());
+        let explicit = resolve_endpoint(
+            Some("https://lab.example".to_string()),
+            None,
+            None,
+            ca("/x/ca.pem"),
+            &configured_server(),
+        );
+        assert_eq!(configured.ca_cert, ca("/x/ca.pem"));
+        assert_eq!(explicit.ca_cert, ca("/x/ca.pem"));
+    }
+
     #[test]
     fn omitting_server_uses_the_configured_control_plane_and_mtls_pair() {
         let endpoint = resolve_endpoint(None, None, None, None, &configured_server());

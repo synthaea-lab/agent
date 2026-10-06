@@ -538,6 +538,10 @@ impl DetectionSink {
                 comm: meta.comm.clone(),
                 parent_generation: meta.parent_process_generation,
                 timestamp_ns: meta.timestamp_ns,
+                // The #594 gate is about reading a path the requester named, as the agent
+                // with `CAP_DAC_READ_SEARCH`. A memory scan reads no named path: it reads
+                // `/proc/<pid>/mem`, which the kernel gates by `ptrace_may_access` (ADR-0023).
+                requester: None,
             }),
         );
     }
@@ -798,6 +802,12 @@ impl DetectionSink {
     /// `Auth` events: brute-force/spray burst detection (T1110, pack #377).
     fn detect_auth(&self, wrapped: &Event, event: &schema::AuthEvent) {
         self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_auth(event));
+    }
+
+    /// `Session` events: a disconnected session reconnected from another client
+    /// (T1563.002, #285).
+    fn detect_session(&self, wrapped: &Event, event: &schema::SessionEvent) {
+        self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_session(event));
     }
 
     /// `FileDelete` events: log-tamper detection (T1070.001/.002, pack #379), then the
@@ -1228,6 +1238,7 @@ impl EventSink for DetectionSink {
             Event::NetworkFlow(e) => self.detect_network_flow(&event, e),
             Event::ListenPort(e) => self.detect_listen_port(&event, e),
             Event::Auth(e) => self.detect_auth(&event, e),
+            Event::Session(e) => self.detect_session(&event, e),
             Event::FileDelete(e) => self.detect_file_delete(&event, e),
             Event::Signal(e) => self.detect_signal(&event, e),
             Event::FileQuarantine(e) => self.detect_file_quarantine(e),
