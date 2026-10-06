@@ -512,7 +512,10 @@ max_reconnect_backoff_ms = 60000
         let ca = FIXTURE_MTLS_CERT.replace("client.crt", "ca.pem");
         let toml = valid_toml().replace(
             "mtls_passphrase =",
-            &format!("ca_cert = \"{}\"\nmtls_passphrase =", ca.replace('\\', "\\\\")),
+            &format!(
+                "ca_cert = \"{}\"\nmtls_passphrase =",
+                ca.replace('\\', "\\\\")
+            ),
         );
         let f = write_tmp(&toml);
         let cfg = load_from(f.path()).expect("valid config should load");
