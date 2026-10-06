@@ -25,8 +25,8 @@
 //!   `t=`, Google Drive's `at=`, Discord's `hm=`, a one-time `?id=`;
 //! - the first parameter of an unencoded URL nested in a value
 //!   (`?next=https://idp/cb?access_token=…` reads as `next`'s value);
-//! - a name whose secret part is itself percent-encoded (`%74oken`). A merely
-//!   encoded separator (`Access%5FToken`) is caught, since `token` survives.
+//! - a name encoded more than twice, or in a charset other than UTF-8. One or two
+//!   rounds of percent-encoding (`%74oken`, `pass%77ord`) are decoded before the test.
 //!
 //! These URLs are written by browsers and download tools, not crafted to evade:
 //! the goal is not storing benign credentials, not winning against an adversary
@@ -187,14 +187,53 @@ fn push_redacted_query(out: &mut String, query: &str) {
     }
 }
 
-/// Whether a query parameter name marks its value as a credential.
+/// Whether a query parameter name marks its value as a credential. The name is read
+/// as written and percent-decoded twice (the web-log matcher's own normalisation), so
+/// `pass%77ord` and `%74oken` do not slip past.
 fn is_secret_key(key: &str) -> bool {
+    is_secret_name(key) || is_secret_name(&percent_decode(&percent_decode(key)))
+}
+
+fn is_secret_name(key: &str) -> bool {
     let key = key.trim_end_matches("[]").to_ascii_lowercase();
     SECRET_KEYS.contains(&key.as_str())
         || SECRET_KEY_PARTS.iter().any(|part| key.contains(part))
         || SECRET_KEY_SUFFIXES
             .iter()
             .any(|suffix| key.ends_with(suffix))
+}
+
+/// Percent-decodes `s` (`+` is a space); invalid escapes are kept as written.
+fn percent_decode(s: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        char::from(b).to_digit(16).map(|d| d as u8)
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                (Some(hi), Some(lo)) => {
+                    out.push(hi << 4 | lo);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -404,6 +443,21 @@ mod tests {
             assert_eq!(evidence.param, param, "the name stays: it is the finding");
             assert_eq!(evidence.value, REDACTED, "{param}");
         }
+    }
+
+    #[test]
+    fn a_percent_encoded_secret_name_is_still_a_secret_name() {
+        for param in ["pass%77ord", "%74oken", "pass%2577ord", "Access%5FToken"] {
+            let mut event = http_request_with(param, "hunter2 union select 1");
+            redact_event(&mut event);
+            let evidence = evidence_of(&event);
+            assert_eq!(evidence.param, param, "the name stays as written");
+            assert_eq!(evidence.value, REDACTED, "{param}");
+        }
+        assert_eq!(
+            redact_url_secrets("https://h/x?pass%77ord=hunter2&id=7"),
+            "https://h/x?pass%77ord=REDACTED&id=7"
+        );
     }
 
     #[test]
