@@ -61,7 +61,7 @@ fn connect_after_five_failures_across_accounts_alerts_once_per_window() {
 }
 
 #[test]
-fn application_log_failures_do_not_feed_the_join() {
+fn unknown_identity_failures_do_not_feed_the_rdp_join() {
     // A `[logs]` source stamps its failures when the line is read, not with the event's
     // own time: they must not complete a join that runs on event time.
     let mut state = RuleState::new();
@@ -128,6 +128,19 @@ fn connect_without_a_source_address_is_ignored() {
             .on_session(&connect(None, "alice", 10 * SEC))
             .is_empty()
     );
+}
+
+#[test]
+fn console_connect_is_not_joined_to_later_failures_from_its_address() {
+    let mut state = RuleState::new();
+    let mut console = connect(Some("192.0.2.50"), "alice", 10 * SEC);
+    console.console = true;
+    assert!(state.on_session(&console).is_empty());
+
+    for i in 0..THRESHOLD {
+        let alerts = state.on_auth(&failure("192.0.2.50", "alice", i * SEC));
+        assert!(!alerts.iter().any(|alert| alert.technique == "T1021.001"));
+    }
 }
 
 #[test]

@@ -412,6 +412,28 @@ mod tests {
     }
 
     #[test]
+    fn alerted_windows_evict_the_oldest_at_the_fixed_cap() {
+        let mut state = RdpSuccessAfterFailures::new();
+        let mut alerts = 0;
+        for window in 0..=ALERTED_WINDOWS_CAP as u64 {
+            let start = window * RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS;
+            for offset in 0..RDP_SUCCESS_AFTER_FAILURES_THRESHOLD as u64 {
+                assert!(state.on_failure(ADDRESS, start + offset).is_none());
+            }
+            alerts += usize::from(state.on_success(ADDRESS, start + 10, "alice").is_some());
+        }
+
+        let source = state.sources.iter().next().unwrap().1;
+        assert_eq!(alerts, ALERTED_WINDOWS_CAP + 1);
+        assert_eq!(source.alerted_windows.len(), ALERTED_WINDOWS_CAP);
+        assert_eq!(source.alerted_windows.front(), Some(&1));
+        assert_eq!(
+            source.alerted_windows.back(),
+            Some(&(ALERTED_WINDOWS_CAP as u64))
+        );
+    }
+
+    #[test]
     fn zero_and_u64_max_timestamps_do_not_overflow() {
         let mut at_zero = RdpSuccessAfterFailures::new();
         for _ in 0..EXPECTED_THRESHOLD {
