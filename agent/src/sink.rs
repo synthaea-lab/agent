@@ -116,6 +116,9 @@ pub(crate) struct DetectionSink {
     /// bounded; the hits it absorbs are counted in `canary_hits_absorbed`.
     canary_last_hit: Mutex<store::BoundedMap<CanaryKey, u64>>,
     canary_hits_absorbed: AtomicU64,
+    /// The ransomware reflex's trigger (#82): a process that raised the burst rule and
+    /// touched a canary inside one window. See [`crate::ransomware_join`].
+    ransomware_join: Mutex<crate::ransomware_join::RansomwareJoin>,
 }
 
 /// The verdict entity an event belongs to: `(ppid, comm)` plus the incarnation of the
@@ -162,6 +165,12 @@ const CANARY_COOLDOWN_NS: u64 = 60 * 1_000_000_000;
 /// Most `(canary, pid)` pairs the cooldown remembers; the oldest are evicted first, which
 /// at worst lets one more detection through.
 const CANARY_COOLDOWN_KEYS: usize = 1024;
+
+/// The reason the audit line gives when the ransomware reflex kills (#82). A trigger of its
+/// own, never severity or the Bayes gate: it needs both the burst rule and a canary touch
+/// from the same process (`crate::ransomware_join`).
+const RANSOMWARE_REFLEX_REASON: &str =
+    "a corroborated ransomware signal (burst rule + canary touch)";
 
 /// `DetectionSource::Rule` id of a canary hit. `DetectionSource` is part of the
 /// semi-frozen schema, so deception provenance rides in the rule id until a dedicated
@@ -347,6 +356,7 @@ impl DetectionSink {
             canary_allow: std::sync::OnceLock::new(),
             canary_last_hit: Mutex::new(store::BoundedMap::new(CANARY_COOLDOWN_KEYS)),
             canary_hits_absorbed: AtomicU64::new(0),
+            ransomware_join: Mutex::new(crate::ransomware_join::RansomwareJoin::new()),
         })
     }
 
@@ -668,6 +678,11 @@ impl DetectionSink {
             return;
         }
         let meta = event.meta();
+        let corroborated = self
+            .ransomware_join
+            .lock()
+            .unwrap()
+            .note_canary((hit.pid, meta.process_generation), meta.timestamp_ns);
         if absorbable(&hit.touch)
             && self.canary_in_cooldown(
                 (hit.canary.path.clone(), hit.pid, meta.process_generation),
@@ -680,6 +695,11 @@ impl DetectionSink {
                 absorbed,
                 "deception: repeat canary touch absorbed"
             );
+            // The finding was raised by the touch that started the cooldown; the reflex
+            // does not wait for a new one.
+            if corroborated {
+                self.ransomware_reflex(hit.pid);
+            }
             return;
         }
         let message = format!(
@@ -700,6 +720,9 @@ impl DetectionSink {
             event,
             Vec::new(),
         );
+        if corroborated {
+            self.ransomware_reflex(hit.pid);
+        }
     }
 
     /// True when `key` already raised a detection within the cooldown; otherwise records
@@ -728,7 +751,9 @@ impl DetectionSink {
             let source = schema::detection::DetectionSource::Rule {
                 rule_id: alert.technique.to_string(),
             };
-            let manifest = if alert.technique == RANSOMWARE_TECHNIQUE {
+            let is_burst = alert.technique == RANSOMWARE_TECHNIQUE;
+            let corroborated = is_burst && self.note_ransomware_burst(event);
+            let manifest = if is_burst {
                 self.damage_manifest(event)
             } else {
                 Vec::new()
@@ -742,6 +767,9 @@ impl DetectionSink {
                 event,
                 manifest,
             );
+            if corroborated {
+                self.ransomware_reflex(event.meta().pid);
+            }
         }
     }
 
@@ -864,6 +892,12 @@ impl DetectionSink {
     /// Issue #25: policy-gates killing the process behind a high-confidence
     /// correlated verdict. A no-op whenever `enable_response` was never called.
     fn maybe_kill(&self, pid: u32) {
+        self.kill_for(pid, "a high-confidence correlated verdict");
+    }
+
+    /// The policy-gated kill behind every automated trigger; `reason` names which one, in
+    /// the audit line (`RESPONSE-KILL`).
+    fn kill_for(&self, pid: u32, reason: &str) {
         let guard = self.response.lock().unwrap();
         let Some(hooks) = guard.as_ref() else {
             return;
@@ -871,24 +905,35 @@ impl DetectionSink {
         let outcome = response::kill_process(pid, &hooks.policy, |p| (hooks.terminate)(p));
         drop(guard);
         let message = match outcome {
-            response::KillOutcome::Killed { pid } => {
-                format!("killed pid {pid} on a high-confidence correlated verdict")
-            }
+            response::KillOutcome::Killed { pid } => format!("killed pid {pid} on {reason}"),
             response::KillOutcome::ObserveOnly { pid } => {
-                format!(
-                    "pid {pid} would have been killed on a high-confidence correlated verdict (observe-only)"
-                )
+                format!("pid {pid} would have been killed on {reason} (observe-only)")
             }
             response::KillOutcome::Failed { pid, error } => {
-                format!("failed to kill pid {pid} on a high-confidence correlated verdict: {error}")
+                format!("failed to kill pid {pid} on {reason}: {error}")
             }
-            response::KillOutcome::Refused { pid, reason } => {
-                format!(
-                    "refused to kill pid {pid} on a high-confidence correlated verdict: {reason}"
-                )
+            response::KillOutcome::Refused { pid, reason: why } => {
+                format!("refused to kill pid {pid} on {reason}: {why}")
             }
         };
         self.emit("RESPONSE-KILL", &message);
+    }
+
+    /// The process behind `event` raised the ransomware burst rule (#82). True when it also
+    /// touched a canary in the window: the corroborated signal. The caller records the
+    /// detection first and then calls [`Self::ransomware_reflex`].
+    fn note_ransomware_burst(&self, event: &Event) -> bool {
+        let meta = event.meta();
+        self.ransomware_join
+            .lock()
+            .unwrap()
+            .note_burst((meta.pid, meta.process_generation), meta.timestamp_ns)
+    }
+
+    /// The reflex: the policy-gated kill of the corroborated process. Observe-only unless
+    /// kill is enabled, like every other automated kill.
+    fn ransomware_reflex(&self, pid: u32) {
+        self.kill_for(pid, RANSOMWARE_REFLEX_REASON);
     }
 
     /// Exec events: stateless rules, stateful rules, then Sigma.
@@ -2416,6 +2461,127 @@ rule response_marker {
             new_path: format!("/home/u/doc{i}.txt{to}"),
             ..schema::fixtures::file_rename()
         })
+    }
+
+    fn canary_open_at(path: &str, pid: u32, timestamp_ns: u64) -> Event {
+        Event::FileOpen(schema::FileOpenEvent {
+            path: path.to_string(),
+            meta: EventMeta {
+                pid,
+                timestamp_ns,
+                comm: "encryptor".into(),
+                ..schema::fixtures::meta()
+            },
+            ..schema::fixtures::file_open()
+        })
+    }
+
+    /// A sink watching one canary, with kill wired to a recorder.
+    fn reflex_sink(
+        dir: &std::path::Path,
+        kill_enabled: bool,
+    ) -> (Arc<DetectionSink>, String, Arc<Mutex<Vec<u32>>>) {
+        let (sink, canary) = sink_watching_canary(dir);
+        let killed = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&killed);
+        sink.enable_response(
+            policy::ResponsePolicy {
+                kill_enabled,
+                quarantine_enabled: false,
+            },
+            move |pid| {
+                recorder.lock().unwrap().push(pid);
+                Ok(())
+            },
+            dir.join("quarantine"),
+        );
+        (sink, canary, killed)
+    }
+
+    fn burst(sink: &DetectionSink, pid: u32) {
+        for i in 0..30 {
+            sink.on_event(rename_of(pid, i, ".locked"));
+        }
+    }
+
+    const BURST_END_NS: u64 = 1_000_000_000 + 30 * 50_000_000;
+
+    #[test]
+    fn a_burst_then_a_canary_touch_by_the_same_process_kills_it() {
+        let dir = tmp("reflex-burst-first");
+        let (sink, canary, killed) = reflex_sink(&dir, true);
+        burst(&sink, 900);
+        assert!(
+            killed.lock().unwrap().is_empty(),
+            "a burst alone never kills"
+        );
+        sink.on_event(canary_open_at(&canary, 900, BURST_END_NS + 1_000_000));
+        assert_eq!(*killed.lock().unwrap(), vec![900]);
+        let alerts = alerts_in(&dir);
+        assert!(
+            alerts.contains("killed pid 900 on a corroborated ransomware signal"),
+            "{alerts}"
+        );
+        assert!(
+            alerts.find("canary file touched").unwrap() < alerts.find("RESPONSE-KILL").unwrap(),
+            "the finding is recorded before the kill"
+        );
+    }
+
+    #[test]
+    fn a_canary_touch_then_a_burst_by_the_same_process_kills_it_once() {
+        let dir = tmp("reflex-canary-first");
+        let (sink, canary, killed) = reflex_sink(&dir, true);
+        sink.on_event(canary_open_at(&canary, 900, 1_000_000_000));
+        assert!(
+            killed.lock().unwrap().is_empty(),
+            "a canary touch alone never kills"
+        );
+        burst(&sink, 900);
+        assert_eq!(
+            *killed.lock().unwrap(),
+            vec![900],
+            "the burst keeps raising alerts but the process is killed once"
+        );
+    }
+
+    #[test]
+    fn a_burst_and_a_canary_touch_from_two_processes_kill_neither() {
+        let dir = tmp("reflex-two-processes");
+        let (sink, canary, killed) = reflex_sink(&dir, true);
+        burst(&sink, 900);
+        sink.on_event(canary_open_at(&canary, 901, BURST_END_NS + 1_000_000));
+        assert!(killed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_canary_touch_long_before_the_burst_does_not_corroborate() {
+        let dir = tmp("reflex-stale");
+        let (sink, canary, killed) = reflex_sink(&dir, true);
+        sink.on_event(canary_open_at(&canary, 900, 1_000_000_000));
+        // The same process starts its burst two minutes later.
+        for i in 0..30 {
+            let Event::FileRename(mut e) = rename_of(900, i, ".locked") else {
+                unreachable!()
+            };
+            e.meta.timestamp_ns += 120_000_000_000;
+            sink.on_event(Event::FileRename(e));
+        }
+        assert!(killed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn with_kill_disabled_the_reflex_is_observe_only() {
+        let dir = tmp("reflex-observe");
+        let (sink, canary, killed) = reflex_sink(&dir, false);
+        burst(&sink, 900);
+        sink.on_event(canary_open_at(&canary, 900, BURST_END_NS + 1_000_000));
+        assert!(killed.lock().unwrap().is_empty());
+        let alerts = alerts_in(&dir);
+        assert!(
+            alerts.contains("pid 900 would have been killed on a corroborated ransomware signal"),
+            "{alerts}"
+        );
     }
 
     /// The ransomware detection (T1486, issue #82) carries the files the process touched
