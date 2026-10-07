@@ -151,6 +151,6 @@ Write-Host ''
 Write-Host 'Next steps:'
 Write-Host "  1. `$env:ORT_LIB_LOCATION = `"$BuildDir`""
 Write-Host '  2. .\lab\provisioning\ort-static-link-flags.ps1 | Invoke-Expression'
-Write-Host '  3. cargo test -p ml --release --no-default-features'
+Write-Host '  3. cargo test -j 1 -p ml --release --no-default-features'
 Write-Host '  4. Check the result has no onnxruntime, directml or d3d12 dependency:'
 Write-Host '       python tools\check-pe-imports.py target\release\deps\ml-*.exe'
