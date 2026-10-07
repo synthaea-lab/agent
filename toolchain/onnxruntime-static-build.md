@@ -176,7 +176,12 @@ python tools\check-pe-imports.py target\release\deps\ml-*.exe
 
 Measured on a 12-thread laptop, cold: the onnxruntime build took 48 minutes and left a
 3.4 GB build directory with 101 `.lib` files (1.1 GB). `cargo test -p ml` then passes
-(58 tests across the lib and the integration tests).
+(58 tests across the lib and the integration tests when measured; 67 after later merges
+of `main`, as re-checked on a second host).
+
+**The checkout path must not contain a space.** onnxruntime's generated project files
+quote nothing, so a path such as `C:\Users\First Last\...` fails with `LNK1181` on
+`symbols.def` after a long build; the script now refuses to start under such a path.
 
 ### What is different from Linux
 

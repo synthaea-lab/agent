@@ -47,6 +47,15 @@ $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot '..\..')
 $OnnxDir = Join-Path $RepoRoot 'onnxruntime'
 $OnnxVersion = 'v1.30.0'
 
+# onnxruntime's generated .vcxproj passes /DEF: paths unquoted, so a space anywhere in
+# the build path fails deep inside MSVC with `LNK1181: cannot open input file
+# '<second word of the path>\...\symbols.def'` (seen under a profile directory named
+# "First Last", review of #692), and the link flags cannot carry a space either. Say
+# so before a 40-minute build, not after.
+if ($OnnxDir -match '\s') {
+    throw "The build path contains a space: $OnnxDir. Check the repository out under a space-free path (for example C:\src\edr) and run this script from there."
+}
+
 function Assert-Tool([string]$Name, [string]$Hint) {
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
         throw "$Name not found on PATH. $Hint"
