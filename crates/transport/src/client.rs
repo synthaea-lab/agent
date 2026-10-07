@@ -1,5 +1,7 @@
 //! HTTP client with mTLS support.
 
+use std::io::Read;
+
 use schema::{Event, detection::Detection};
 use serde::Serialize;
 
@@ -199,12 +201,7 @@ fn send_get(
     if status < 400 {
         return Ok(response);
     }
-    let text = response
-        .into_body()
-        .with_config()
-        .limit(ERROR_BODY_LIMIT)
-        .read_to_string()
-        .unwrap_or_default();
+    let text = read_error_body(response.into_body().into_reader());
     Err(server_error(
         status,
         error_reason(&text).unwrap_or_else(|| format!("http status: {status}")),
@@ -217,6 +214,12 @@ fn server_error(status: u16, message: String) -> TransportError {
         .filter(|character| !character.is_control() && !is_bidi_control(*character))
         .collect();
     TransportError::ServerError { status, message }
+}
+
+fn read_error_body<R: Read>(reader: R) -> String {
+    let mut bytes = Vec::new();
+    let _ = reader.take(ERROR_BODY_LIMIT).read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn is_bidi_control(character: char) -> bool {
@@ -390,6 +393,22 @@ mod tests {
         let expected = "[31mhaltednext line";
         assert_eq!(err.locked_reason(), Some(expected));
         assert_eq!(err.to_string(), format!("server error: 423 - {expected}"));
+    }
+
+    #[test]
+    fn error_body_is_capped_at_two_kibibytes() {
+        let input = "x".repeat(3 * 1024);
+        let actual = read_error_body(input.as_bytes());
+        assert_eq!(actual.len(), ERROR_BODY_LIMIT as usize);
+        assert_eq!(actual, "x".repeat(ERROR_BODY_LIMIT as usize));
+    }
+
+    #[test]
+    fn error_body_truncation_inside_utf8_is_lossy_not_a_panic() {
+        let input = format!("{}é", "a".repeat(ERROR_BODY_LIMIT as usize - 1));
+        let actual = read_error_body(input.as_bytes());
+        let expected = format!("{}�", "a".repeat(ERROR_BODY_LIMIT as usize - 1));
+        assert_eq!(actual, expected);
     }
 
     #[test]
