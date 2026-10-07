@@ -48,5 +48,7 @@ pub use lifecycle::{
     DeceptionError, Drift, DriftKind, Inventory, InventoryEntry, PlantReport, RemoveReport,
     Skipped, plant, remove, sha256_hex, verify,
 };
-pub use plan::{Canary, DECOY_HEADER, Kind, Placement, Seed, plan};
+pub use plan::{
+    Canary, DECOY_HEADER, DECOY_TOKEN_PREFIX, Kind, Placement, Seed, decoy_tokens, plan,
+};
 pub use tripwire::{Hit, Touch, Tripwires};

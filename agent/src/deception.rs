@@ -176,17 +176,28 @@ fn read_blind_dirs(dirs: &[PathBuf]) -> Vec<&PathBuf> {
 ///
 /// With no directories configured, canaries planted by an earlier run are removed: dropping
 /// the `[deception]` table is how an operator turns the feature off, and it leaves no residue.
+#[cfg(test)]
 pub(crate) fn start(config: &config::DeceptionConfig, state_dir: &Path) -> Option<Tripwires> {
+    start_with_decoys(config, state_dir).0
+}
+
+/// [`start`], and the SHA-256 (lowercase hex) of the decoy tokens in the canaries it planned,
+/// for the control plane to recognise one when it is presented. Hashes only: a token never
+/// leaves the host. Empty when nothing was planned.
+pub(crate) fn start_with_decoys(
+    config: &config::DeceptionConfig,
+    state_dir: &Path,
+) -> (Option<Tripwires>, Vec<String>) {
     let inventory = inventory_path(state_dir);
     if config.canary_dirs.is_empty() {
         retire(&inventory);
-        return None;
+        return (None, Vec::new());
     }
     let seed = match load_or_create_seed(state_dir) {
         Ok(seed) => seed,
         Err(error) => {
             tracing::error!(%error, "deception: no seed, no canaries planted");
-            return None;
+            return (None, Vec::new());
         }
     };
     for dir in read_blind_dirs(&config.canary_dirs) {
@@ -205,13 +216,104 @@ pub(crate) fn start(config: &config::DeceptionConfig, state_dir: &Path) -> Optio
             kinds: Kind::ALL.to_vec(),
         })
         .collect();
-    plant_each_directory(&deception::plan(&seed, &placements), &inventory);
+    let canaries = deception::plan(&seed, &placements);
+    plant_each_directory(&canaries, &inventory);
+    let decoys = decoy_hashes(&canaries);
     match Inventory::load(&inventory) {
-        Ok(inventory) => Some(Tripwires::from_inventory(&inventory)).filter(|t| !t.is_empty()),
+        Ok(inventory) => (
+            Some(Tripwires::from_inventory(&inventory)).filter(|t| !t.is_empty()),
+            decoys,
+        ),
         Err(error) => {
             tracing::error!(%error, "deception: inventory unreadable, no tripwires");
-            None
+            (None, decoys)
         }
+    }
+}
+
+/// SHA-256 of every decoy token in `canaries`.
+fn decoy_hashes(canaries: &[deception::Canary]) -> Vec<String> {
+    deception::decoy_tokens(canaries)
+        .iter()
+        .map(|token| deception::sha256_hex(token.as_bytes()))
+        .collect()
+}
+
+/// Delays between registration attempts, then the last one repeats. A control plane that is
+/// down at start is the ordinary case (the agent starts at boot), so this waits it out for
+/// about half a day before giving up; the next start tries again.
+const REGISTER_DELAYS: [std::time::Duration; 7] = [
+    std::time::Duration::from_secs(5),
+    std::time::Duration::from_secs(15),
+    std::time::Duration::from_secs(60),
+    std::time::Duration::from_secs(300),
+    std::time::Duration::from_secs(900),
+    std::time::Duration::from_secs(1800),
+    std::time::Duration::from_secs(3600),
+];
+
+/// Most attempts before giving up for this run.
+const REGISTER_ATTEMPTS: usize = 12;
+
+/// What came of registering the decoy hashes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Registration {
+    /// The control plane has them.
+    Registered { attempts: usize },
+    /// The control plane refused them and asking again would not change that.
+    Refused { attempts: usize },
+    /// Still unreachable after every attempt; the next start tries again.
+    GaveUp { attempts: usize },
+}
+
+/// Calls `register` until it succeeds, is refused for good, or `REGISTER_ATTEMPTS` is spent,
+/// sleeping `REGISTER_DELAYS` between tries. `sleep` is injected so the schedule is testable.
+pub(crate) fn register_with_retry(
+    mut register: impl FnMut() -> Result<(), transport::TransportError>,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> Registration {
+    for attempt in 1..=REGISTER_ATTEMPTS {
+        match register() {
+            Ok(()) => return Registration::Registered { attempts: attempt },
+            Err(error) if !error.is_retryable() => {
+                tracing::error!(%error, "deception: the control plane refused the decoy registration");
+                return Registration::Refused { attempts: attempt };
+            }
+            Err(error) => {
+                tracing::warn!(%error, attempt, "deception: decoy registration failed, will retry");
+                if attempt < REGISTER_ATTEMPTS {
+                    sleep(REGISTER_DELAYS[(attempt - 1).min(REGISTER_DELAYS.len() - 1)]);
+                }
+            }
+        }
+    }
+    Registration::GaveUp {
+        attempts: REGISTER_ATTEMPTS,
+    }
+}
+
+/// Registers `hashes` with the control plane in the background: a detached thread, so the
+/// agent's start and its shutdown never wait for it.
+pub(crate) fn register_decoys_in_background(
+    client: std::sync::Arc<transport::TransportClient>,
+    hashes: Vec<String>,
+) {
+    if hashes.is_empty() {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("decoy-register".into())
+        .spawn(move || {
+            let outcome =
+                register_with_retry(|| client.register_decoy_tokens(&hashes), std::thread::sleep);
+            tracing::info!(
+                ?outcome,
+                count = hashes.len(),
+                "deception: decoy registration"
+            );
+        });
+    if let Err(error) = spawned {
+        tracing::error!(%error, "deception: could not start the decoy registration thread");
     }
 }
 
@@ -559,5 +661,127 @@ mod tests {
     fn an_entry_that_does_not_resolve_is_kept_as_written() {
         let missing = Path::new("/usr/sbin/not-installed-here");
         assert_eq!(canonical_entry(missing), missing);
+    }
+
+    #[test]
+    fn the_decoy_hashes_are_the_hashes_of_the_tokens_in_the_planted_files() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (_, hashes) = start_with_decoys(&config_for(&[dir.path()]), state.path());
+        // One token in the credentials canary and one in the config canary.
+        assert_eq!(hashes.len(), 2);
+        let mut on_disk: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .flat_map(|entry| {
+                let text = fs::read_to_string(entry.unwrap().path()).unwrap();
+                text.split_whitespace()
+                    .filter(|w| w.starts_with("syn_dk_"))
+                    .map(|t| deception::sha256_hex(t.as_bytes()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut sent = hashes;
+        on_disk.sort();
+        sent.sort();
+        assert_eq!(sent, on_disk);
+        assert!(
+            sent.iter()
+                .all(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        );
+    }
+
+    #[test]
+    fn a_restart_registers_the_same_hashes() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let first = start_with_decoys(&config_for(&[dir.path()]), state.path()).1;
+        let second = start_with_decoys(&config_for(&[dir.path()]), state.path()).1;
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn nothing_configured_registers_nothing() {
+        let state = tempfile::tempdir().unwrap();
+        assert!(
+            start_with_decoys(&config_for(&[]), state.path())
+                .1
+                .is_empty()
+        );
+    }
+
+    fn network_error() -> transport::TransportError {
+        transport::TransportError::Network("connection refused".into())
+    }
+
+    #[test]
+    fn registration_that_succeeds_at_once_never_sleeps() {
+        let mut sleeps = Vec::new();
+        let outcome = register_with_retry(|| Ok(()), |d| sleeps.push(d));
+        assert_eq!(outcome, Registration::Registered { attempts: 1 });
+        assert!(sleeps.is_empty());
+    }
+
+    #[test]
+    fn an_unreachable_control_plane_is_waited_out_on_the_schedule() {
+        let mut failures = 3;
+        let mut sleeps = Vec::new();
+        let outcome = register_with_retry(
+            || {
+                if failures > 0 {
+                    failures -= 1;
+                    Err(network_error())
+                } else {
+                    Ok(())
+                }
+            },
+            |d| sleeps.push(d),
+        );
+        assert_eq!(outcome, Registration::Registered { attempts: 4 });
+        assert_eq!(sleeps, REGISTER_DELAYS[..3].to_vec());
+    }
+
+    #[test]
+    fn a_refusal_that_will_not_change_stops_the_attempts() {
+        let mut calls = 0;
+        let mut slept = false;
+        let outcome = register_with_retry(
+            || {
+                calls += 1;
+                Err(transport::TransportError::ServerError {
+                    status: 409,
+                    message: "at most 256 decoy tokens per agent".into(),
+                })
+            },
+            |_| slept = true,
+        );
+        assert_eq!(outcome, Registration::Refused { attempts: 1 });
+        assert_eq!(calls, 1);
+        assert!(!slept);
+    }
+
+    #[test]
+    fn registration_gives_up_after_the_attempts_with_the_last_delay_repeated() {
+        let mut calls = 0;
+        let mut sleeps = Vec::new();
+        let outcome = register_with_retry(
+            || {
+                calls += 1;
+                Err(network_error())
+            },
+            |d| sleeps.push(d),
+        );
+        assert_eq!(
+            outcome,
+            Registration::GaveUp {
+                attempts: REGISTER_ATTEMPTS
+            }
+        );
+        assert_eq!(calls, REGISTER_ATTEMPTS);
+        assert_eq!(
+            sleeps.len(),
+            REGISTER_ATTEMPTS - 1,
+            "no sleep after the last try"
+        );
+        assert_eq!(sleeps.last(), REGISTER_DELAYS.last());
     }
 }

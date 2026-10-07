@@ -84,6 +84,21 @@ impl TransportClient {
         Ok(())
     }
 
+    /// Registers the SHA-256 (lowercase hex) of the decoy credentials this agent planted
+    /// (issue #81), so the control plane can recognise one when it is presented. Hashes only:
+    /// the token itself never leaves the host. Idempotent on the server, so the caller may
+    /// repeat it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the registration (a malformed hash, too many
+    /// for this agent) or cannot be reached; [`TransportError::is_retryable`] says which.
+    pub fn register_decoy_tokens(&self, sha256_hex: &[String]) -> Result<()> {
+        let payload = DecoyPayload { tokens: sha256_hex };
+        let _response: serde_json::Value = self.post_json(&self.config.decoy_url(), &payload)?;
+        Ok(())
+    }
+
     /// Fetches an arbitrary JSON resource via GET — used for the content
     /// manifest fetch (ADR-0016, issue #30/#73). Generic over the response
     /// type rather than a concrete `updater::ContentManifest`: `transport` and
@@ -252,6 +267,12 @@ struct HeartbeatPayload<'a, T: Serialize> {
     beacon: &'a T,
 }
 
+/// Payload for decoy credential registration: hashes only.
+#[derive(Serialize)]
+struct DecoyPayload<'a> {
+    tokens: &'a [String],
+}
+
 /// Response from an event upload.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct UploadResponse {
@@ -391,6 +412,33 @@ mod tests {
             .join(DEFAULT_HEARTBEAT_ENDPOINT.trim_start_matches('/'))
             .join("route.ts");
         assert!(route.is_file(), "no server route at {}", route.display());
+    }
+
+    #[test]
+    fn the_decoy_endpoint_is_a_real_server_route() {
+        let config = TransportConfig::new("https://api.example.com");
+        assert_eq!(
+            config.decoy_url(),
+            "https://api.example.com/api/ingest/decoy"
+        );
+        assert!(crate::DEFAULT_DECOY_ENDPOINT.starts_with("/api/ingest/"));
+        let route = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../server/app")
+            .join(crate::DEFAULT_DECOY_ENDPOINT.trim_start_matches('/'))
+            .join("route.ts");
+        assert!(route.is_file(), "no server route at {}", route.display());
+    }
+
+    /// The body the server parses (`DecoyRegistration` in `server/lib/decoy.ts`): a `tokens`
+    /// array of lowercase SHA-256 hex, and nothing else.
+    #[test]
+    fn decoy_registration_body_is_the_documented_wire_shape() {
+        let hashes = vec!["a".repeat(64), "b".repeat(64)];
+        let body = serde_json::to_value(DecoyPayload { tokens: &hashes }).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "tokens": [hashes[0], hashes[1]] })
+        );
     }
 
     #[test]
