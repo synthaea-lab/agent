@@ -424,6 +424,26 @@ fn winword_spawning_powershell_matches_parent_suspect() {
     assert_eq!(alerts[0].technique, "T1204/T1059");
 }
 
+/// #725: Windows reuses pids quickly. An interpreter whose parent pid now
+/// belongs to another incarnation than the cached `winword.exe` gets no Office
+/// lineage; the same parent incarnation still alerts.
+#[test]
+fn a_recycled_windows_parent_pid_does_not_lend_office_lineage() {
+    let mut state = RuleState::new();
+    let mut word = exec_event_win(100, 1, "winword.exe", "winword.exe", 0);
+    word.meta.process_generation = Some(7001);
+    state.on_exec(&word);
+
+    let mut child = exec_event_win(101, 100, "powershell.exe", "powershell.exe", 1);
+    child.meta.parent_process_generation = Some(7002);
+    assert!(state.on_exec(&child).is_empty());
+
+    child.meta.parent_process_generation = Some(7001);
+    let alerts = state.on_exec(&child);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1204/T1059");
+}
+
 #[test]
 fn winword_spawning_notepad_does_not_match_parent_suspect() {
     // notepad.exe is not in SUSPECT_CHILDREN_WIN.

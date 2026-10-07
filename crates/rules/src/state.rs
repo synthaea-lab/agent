@@ -78,7 +78,7 @@ struct ReportedTaskRegistration {
 /// the fact was recorded for ([`schema::EventMeta::process_generation`]); a lookup
 /// that names a different one misses. `None` on either side means "cannot tell" and
 /// reads as a match: an entry seeded at startup, or an event from a platform with no
-/// stamp (Windows, macOS), behaves exactly as before.
+/// stamp (macOS), behaves exactly as before.
 #[derive(Debug, Clone)]
 pub(crate) struct PidFact {
     generation: Option<u64>,

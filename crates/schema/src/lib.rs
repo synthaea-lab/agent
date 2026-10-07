@@ -478,8 +478,9 @@ pub struct EventMeta {
     /// that carry the same `pid`** means anything: it is not a timestamp, not
     /// comparable across pids, and not stable across agent restarts (the Linux
     /// sensor assigns it at `sched_process_fork`, or from `/proc` for a process
-    /// that predates the agent). `None` when the sensor has no such stamp
-    /// (Windows, macOS) or could not read it; a consumer must then treat the pid
+    /// that predates the agent; the Windows sensor reports the kernel's process
+    /// sequence number, #725). `None` when the sensor has no such stamp (macOS)
+    /// or could not read it; a consumer must then treat the pid
     /// as unchanged, never as new.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_generation: Option<u64>,

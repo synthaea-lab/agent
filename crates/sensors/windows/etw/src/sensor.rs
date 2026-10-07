@@ -211,6 +211,32 @@ pub(crate) struct SharedState {
 }
 
 impl SharedState {
+    /// The identity of the process an event is about: its token user (F-3) and
+    /// the incarnation stamps of it and its parent (#725), as the pid store
+    /// recorded them. `ppid` 0 (an event that names no parent) has no stamp.
+    pub(crate) fn meta(&self, pid: u32, ppid: u32, comm: String, timestamp_ns: u64) -> EventMeta {
+        let (process_generation, parent_process_generation) = {
+            let pids = self.pids.lock().unwrap();
+            let parent = if ppid == 0 {
+                None
+            } else {
+                pids.generation(ppid)
+            };
+            (pids.generation(pid), parent)
+        };
+        EventMeta {
+            pid,
+            ppid,
+            // F-3: real token identity; Unknown when the process is gone/protected.
+            user: winapi::read_process_user(pid),
+            timestamp_ns,
+            comm,
+            container: None,
+            process_generation,
+            parent_process_generation,
+        }
+    }
+
     pub(crate) fn normalize_path(&self, raw: &str) -> String {
         let dos = self.to_dos_path(raw);
         long_path::expand(&dos, &self.long_paths, winapi::long_path_name)
@@ -238,7 +264,11 @@ impl SharedState {
             None => {
                 // ETW race: ConnectEvent before the ExecEvent populated the store.
                 let resolved = winapi::resolve_pid_live(pid)?;
-                self.pids.lock().unwrap().insert(pid, resolved.clone());
+                let generation = winapi::read_process_sequence_number(pid);
+                self.pids
+                    .lock()
+                    .unwrap()
+                    .insert(pid, resolved.clone(), generation);
                 resolved
             }
         };
@@ -271,26 +301,12 @@ fn spawn_mark_reader(
         .map_err(|e| -> SensorError { format!("Zone.Identifier reader thread: {e}").into() })
 }
 
-pub(crate) fn meta(pid: u32, ppid: u32, comm: String, timestamp_ns: u64) -> EventMeta {
-    EventMeta {
-        pid,
-        ppid,
-        // F-3: real token identity; Unknown when the process is gone/protected.
-        user: winapi::read_process_user(pid),
-        timestamp_ns,
-        comm,
-        container: None,
-        process_generation: None,
-        parent_process_generation: None,
-    }
-}
-
 /// Seeds the pid store before the trace: already-running processes resolve from
 /// the very first `ConnectEvent`, and parent lineage/exclusions apply to them.
 fn seed_pid_store(state: &SharedState) {
     let mut pids = state.pids.lock().unwrap();
     for (pid, name) in winapi::snapshot_processes() {
-        pids.insert(pid, name);
+        pids.insert(pid, name, winapi::read_process_sequence_number(pid));
     }
     tracing::info!(processes = pids.len(), "pid store seeded");
 }
