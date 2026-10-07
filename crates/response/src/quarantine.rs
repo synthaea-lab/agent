@@ -153,6 +153,16 @@ struct Source {
     /// `(device, inode)` of the opened file, to recognise its name again before removing it.
     #[cfg(unix)]
     id: (u64, u64),
+    /// Size and modification time at open: what an in-place write between the hash and the
+    /// store changes, so that content is never stored under a digest it no longer has.
+    #[cfg(unix)]
+    snapshot: (u64, i64, i64),
+}
+
+#[cfg(unix)]
+fn snapshot_of(metadata: &std::fs::Metadata) -> (u64, i64, i64) {
+    use std::os::unix::fs::MetadataExt as _;
+    (metadata.len(), metadata.mtime(), metadata.mtime_nsec())
 }
 
 fn not_a_regular_file() -> std::io::Error {
@@ -182,6 +192,7 @@ impl Source {
         }
         Ok(Self {
             id: (metadata.dev(), metadata.ino()),
+            snapshot: snapshot_of(&metadata),
             file,
         })
     }
@@ -200,7 +211,9 @@ impl Source {
         #[cfg(unix)]
         {
             let _ = path;
-            sha256_reader(&mut &self.file)
+            let digest = sha256_reader(&mut &self.file)?;
+            self.refuse_if_written()?;
+            Ok(digest)
         }
         #[cfg(not(unix))]
         sha256_file(path)
@@ -215,19 +228,62 @@ impl Source {
     /// took the name. It cannot redirect what was stored, nor any `chmod` (#689).
     #[cfg(unix)]
     fn move_into_quarantine(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        self.refuse_if_written()?;
+        let linked = match link_open_file(&self.file, to) {
+            Ok(()) => true,
+            // No link to give (another filesystem, an unlinked file, too many links, a
+            // platform without `/proc/self/fd`): copy from the same descriptor. Any other
+            // error (no space, no permission, no descriptors left) is the real answer and
+            // is not turned into a possibly large copy.
+            Err(error) if can_fall_back_to_copy(&error) => {
+                copy_open_file_no_clobber(&self.file, to)?;
+                false
+            }
+            Err(error) => return Err(error),
+        };
+        self.release_name(from, to, linked)
+    }
+
+    /// Removes the name `from` once the opened file is stored at `to`, but only while it
+    /// still names that file: a name that now points at something else is not ours to delete.
+    ///
+    /// When `from` was taken by something else after a hard link, the link and the name share
+    /// the opened inode, which `secure_payload` then makes `0400`, so no name of it stays
+    /// executable and `Ok` is the right answer. After a copy nothing ties the opened file to
+    /// its other names: if it still has one it may stay executable there, so that is an error
+    /// and the copy is removed. When the name was replaced or removed, the opened file has no
+    /// name left (the usual swap) and disappears once closed: the copy is all that is left, so
+    /// that is fine.
+    #[cfg(unix)]
+    fn release_name(&self, from: &Path, to: &Path, linked: bool) -> std::io::Result<()> {
         use std::os::unix::fs::MetadataExt as _;
-        match link_open_file(&self.file, to) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Err(error),
-            // No link to give (another filesystem, an unlinked file, a platform without
-            // `/proc/self/fd`): copy from the same descriptor.
-            Err(_) => copy_open_file_no_clobber(&self.file, to)?,
+        match std::fs::symlink_metadata(from) {
+            Ok(m) if m.file_type().is_file() && (m.dev(), m.ino()) == self.id => {
+                if let Err(error) = std::fs::remove_file(from) {
+                    let _ = std::fs::remove_file(to);
+                    return Err(error);
+                }
+            }
+            Ok(_) if !linked && self.file.metadata()?.nlink() > 0 => {
+                let _ = std::fs::remove_file(to);
+                return Err(invalid(
+                    "the source name no longer refers to the file that was checked; \
+                     nothing was quarantined",
+                ));
+            }
+            _ => {}
         }
-        let still_named = std::fs::symlink_metadata(from)
-            .is_ok_and(|m| m.file_type().is_file() && (m.dev(), m.ino()) == self.id);
-        if still_named && let Err(error) = std::fs::remove_file(from) {
-            let _ = std::fs::remove_file(to);
-            return Err(error);
+        Ok(())
+    }
+
+    /// Fails when the opened file was written to since it was opened (size or modification
+    /// time differ), so that it is not stored under a digest computed on other content.
+    #[cfg(unix)]
+    fn refuse_if_written(&self) -> std::io::Result<()> {
+        if snapshot_of(&self.file.metadata()?) != self.snapshot {
+            return Err(invalid(
+                "the quarantine source was modified while it was being processed",
+            ));
         }
         Ok(())
     }
@@ -267,6 +323,17 @@ fn link_open_file(file: &std::fs::File, to: &Path) -> std::io::Result<()> {
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+/// Whether a failed `link_open_file` means "cannot link this one", for which copying from the
+/// descriptor is the answer, rather than a real failure to report.
+#[cfg(unix)]
+fn can_fall_back_to_copy(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::Unsupported
+        || matches!(
+            error.raw_os_error(),
+            Some(code) if code == libc::EXDEV || code == libc::ENOENT || code == libc::EMLINK
+        )
 }
 
 /// No `/proc/self/fd` to link through: the caller copies from the descriptor instead.
@@ -1238,6 +1305,133 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&taken).unwrap(), b"already here");
         assert!(source.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_cannot_link_errors_fall_back_to_a_copy() {
+        for code in [libc::EXDEV, libc::ENOENT, libc::EMLINK] {
+            assert!(can_fall_back_to_copy(&std::io::Error::from_raw_os_error(
+                code
+            )));
+        }
+        assert!(can_fall_back_to_copy(&std::io::Error::from(
+            std::io::ErrorKind::Unsupported
+        )));
+        for code in [
+            libc::ENOSPC,
+            libc::EACCES,
+            libc::EMFILE,
+            libc::EPERM,
+            libc::EIO,
+        ] {
+            assert!(
+                !can_fall_back_to_copy(&std::io::Error::from_raw_os_error(code)),
+                "errno {code}"
+            );
+        }
+    }
+
+    /// #713 review: after a copy, a name that was taken by something else must not end as
+    /// "quarantined" while the checked file may stay executable under another name.
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_is_refused_when_another_file_took_the_name() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("copy-name-taken");
+        let source = dir.join("payload");
+        let stored = dir.join("stored");
+        std::fs::write(&source, b"the payload").unwrap();
+        let opened = Source::open(&source).unwrap();
+        copy_open_file_no_clobber(&opened.file, &stored).unwrap();
+        std::fs::rename(&source, dir.join("moved-elsewhere")).unwrap();
+        symlink(dir.join("moved-elsewhere"), &source).unwrap();
+
+        let error = opened.release_name(&source, &stored, false).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!stored.exists(), "the copy is not kept");
+        assert!(std::fs::symlink_metadata(&source).unwrap().is_symlink());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_name_that_is_gone_or_taken_after_a_link_is_not_an_error() {
+        let dir = temp_dir("name-gone-or-taken");
+        let source = dir.join("payload");
+        let stored = dir.join("stored");
+        std::fs::write(&source, b"the payload").unwrap();
+        let opened = Source::open(&source).unwrap();
+        std::fs::write(&stored, b"stands for the stored copy").unwrap();
+        std::fs::remove_file(&source).unwrap();
+        // Gone: fine after a copy as after a link.
+        opened.release_name(&source, &stored, false).unwrap();
+        opened.release_name(&source, &stored, true).unwrap();
+        // Taken by another file after a link: the shared inode is secured by the caller.
+        std::fs::write(&source, b"somebody else's").unwrap();
+        opened.release_name(&source, &stored, true).unwrap();
+        // Taken after a copy while the checked file has no name left (the usual swap): it
+        // disappears once closed, the copy is all that remains, so this is fine too.
+        opened.release_name(&source, &stored, false).unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"somebody else's");
+        assert!(stored.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #713 review: a write between the open and the store would put content under a digest
+    /// it no longer has.
+    #[cfg(unix)]
+    #[test]
+    fn a_source_written_to_after_it_was_opened_is_refused() {
+        use std::io::Write as _;
+
+        let dir = temp_dir("written-after-open");
+        let source = dir.join("payload");
+        let stored = dir.join("stored");
+        std::fs::write(&source, b"the payload").unwrap();
+        let opened = Source::open(&source).unwrap();
+        opened.sha256(&source).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(b" and more")
+            .unwrap();
+
+        assert_eq!(
+            opened.sha256(&source).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            opened
+                .move_into_quarantine(&source, &stored)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(!stored.exists());
+        assert!(source.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_source_whose_modification_time_moved_is_refused_even_at_the_same_size() {
+        let dir = temp_dir("mtime-moved");
+        let source = dir.join("payload");
+        std::fs::write(&source, b"the payload").unwrap();
+        let opened = Source::open(&source).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
+            .unwrap();
+
+        assert!(opened.refuse_if_written().is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
