@@ -107,6 +107,9 @@ pub(crate) struct DetectionSink {
     /// The planted canary files (#81), set once at start by [`Self::set_tripwires`]; empty
     /// of effect when the operator configured no `[deception]` directories.
     tripwires: std::sync::OnceLock<deception::Tripwires>,
+    /// Executables allowed to touch a canary without a detection (`[deception] allow_exe`),
+    /// set once with the tripwires.
+    canary_allow: std::sync::OnceLock<crate::deception::CanaryAllow>,
     /// When each `(canary, pid, incarnation of pid)` last raised a detection (event time,
     /// ns), so a tool that reads the same canary again and again raises one finding per
     /// cooldown, not one per open. Only read opens are absorbed (see [`absorbable`]);
@@ -341,6 +344,7 @@ impl DetectionSink {
             verdict,
             content_root,
             tripwires: std::sync::OnceLock::new(),
+            canary_allow: std::sync::OnceLock::new(),
             canary_last_hit: Mutex::new(store::BoundedMap::new(CANARY_COOLDOWN_KEYS)),
             canary_hits_absorbed: AtomicU64::new(0),
         })
@@ -633,6 +637,12 @@ impl DetectionSink {
         let _ = self.tripwires.set(tripwires);
     }
 
+    /// Installs the executables allowed to touch a canary (#81). Called once, with the
+    /// tripwires.
+    pub(crate) fn set_canary_allow(&self, allow: crate::deception::CanaryAllow) {
+        let _ = self.canary_allow.set(allow);
+    }
+
     /// A touch of a planted canary by any process but the agent itself is a detection:
     /// nothing legitimate reads these files. The agent's own pid is skipped because it
     /// writes them at start and verifies them later.
@@ -644,6 +654,17 @@ impl DetectionSink {
             return;
         };
         if hit.pid == std::process::id() {
+            return;
+        }
+        if self
+            .canary_allow
+            .get()
+            .is_some_and(|allow| allow.allows(hit.pid))
+        {
+            tracing::debug!(
+                pid = hit.pid,
+                "deception: canary touch by an allowed executable"
+            );
             return;
         }
         let meta = event.meta();
@@ -1723,6 +1744,7 @@ rule response_marker {
         let tripwires = crate::deception::start(
             &config::DeceptionConfig {
                 canary_dirs: vec![planted.clone()],
+                ..Default::default()
             },
             &dir.join("state"),
         )
@@ -1877,6 +1899,18 @@ rule response_marker {
         sink.on_event(open_event_at(&canary, pid, 5));
         sink.on_event(open_event_at(&canary, pid + 1, 6));
         assert_eq!(canary_alert_count(&dir), 2);
+    }
+
+    #[test]
+    fn an_allowed_executable_touching_a_canary_is_not_a_detection() {
+        let dir = tmp("canary-allowed");
+        let (sink, canary) = sink_watching_canary(&dir);
+        sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
+            "/usr/bin/updatedb",
+            |_| Some("/usr/bin/updatedb".into()),
+        ));
+        sink.on_event(open_event(&canary, std::process::id() + 1));
+        assert_eq!(canary_alert_count(&dir), 0);
     }
 
     #[test]

@@ -255,6 +255,30 @@ fn validate_semantics(cfg: &AgentConfig, source_path: &Path) -> Result<(), Confi
         }
     }
 
+    // deception.allow_exe — matched against a resolved executable path, so a relative
+    // entry could never match and would silently leave the canary noisy.
+    if cfg.deception.allow_exe.len() > crate::schema::MAX_CANARY_ALLOW_EXES {
+        return Err(ConfigError::Invalid {
+            field: "deception.allow_exe".into(),
+            expected: format!(
+                "at most {} executables",
+                crate::schema::MAX_CANARY_ALLOW_EXES
+            ),
+            value: format!("{} executables", cfg.deception.allow_exe.len()),
+            origin: src.clone(),
+        });
+    }
+    for (i, exe) in cfg.deception.allow_exe.iter().enumerate() {
+        if !exe.is_absolute() {
+            return Err(ConfigError::Invalid {
+                field: format!("deception.allow_exe[{i}]"),
+                expected: "an absolute executable path".into(),
+                value: exe.display().to_string(),
+                origin: src.clone(),
+            });
+        }
+    }
+
     // ipc.endpoint — shape check per OS. On Windows the endpoint is a named
     // pipe (`\\.\pipe\...`), everywhere else it's an absolute filesystem
     // path (Unix domain socket).
@@ -879,6 +903,27 @@ control_plane_url = "https://cp.example"
             .collect();
         match load_with_logs(&deception_table(&many)).unwrap_err() {
             ConfigError::Invalid { field, .. } => assert_eq!(field, "deception.canary_dirs"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_relative_allowed_executable_is_rejected() {
+        let extra = "[deception]\nallow_exe = [\"updatedb\"]\n";
+        match load_with_logs(extra).unwrap_err() {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "deception.allow_exe[0]"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn too_many_allowed_executables_are_rejected() {
+        let many: Vec<String> = (0..=crate::MAX_CANARY_ALLOW_EXES)
+            .map(|i| format!("\"{}\"", abs_log(&i.to_string())))
+            .collect();
+        let extra = format!("[deception]\nallow_exe = [{}]\n", many.join(", "));
+        match load_with_logs(&extra).unwrap_err() {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "deception.allow_exe"),
             other => panic!("expected Invalid, got {other:?}"),
         }
     }

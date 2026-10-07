@@ -53,6 +53,76 @@ fn load_or_create_seed(state_dir: &Path) -> io::Result<Seed> {
     Ok(Seed::from_bytes(bytes))
 }
 
+/// Executables the operator declared as legitimate canary readers (indexers, backup
+/// agents), matched on the toucher's resolved image path.
+///
+/// An allow-list keyed on `comm` would let any process rename itself past the tripwire, so
+/// the entry must match `/proc/<pid>/exe` and sit in a trusted system location
+/// (`policy::name_exclusion_applies`). Anything that cannot be resolved (the process
+/// already exited, a non-Linux platform, a binary replaced since: `... (deleted)`) is not
+/// allowed. This fails closed, the opposite of the exclusions that keep an unknown path.
+pub(crate) struct CanaryAllow {
+    exes: Vec<PathBuf>,
+    resolve: fn(u32) -> Option<PathBuf>,
+}
+
+impl CanaryAllow {
+    /// The allow-list of `config`; an entry outside a trusted system location is dropped
+    /// with a warning rather than honoured.
+    pub(crate) fn new(config: &config::DeceptionConfig) -> Self {
+        Self::with_resolver(config, proc_exe)
+    }
+
+    fn with_resolver(
+        config: &config::DeceptionConfig,
+        resolve: fn(u32) -> Option<PathBuf>,
+    ) -> Self {
+        let exes = config
+            .allow_exe
+            .iter()
+            .filter(|exe| {
+                let trusted = policy::name_exclusion_applies(exe.to_str());
+                if !trusted {
+                    tracing::warn!(
+                        exe = %exe.display(),
+                        "deception: allow_exe entry is not in a trusted system location, ignored"
+                    );
+                }
+                trusted && exe.to_str().is_some_and(|p| !p.is_empty())
+            })
+            .cloned()
+            .collect();
+        Self { exes, resolve }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(exe: &str, resolve: fn(u32) -> Option<PathBuf>) -> Self {
+        Self {
+            exes: vec![PathBuf::from(exe)],
+            resolve,
+        }
+    }
+
+    /// Whether `pid` runs an allowed executable.
+    pub(crate) fn allows(&self, pid: u32) -> bool {
+        !self.exes.is_empty() && (self.resolve)(pid).is_some_and(|exe| self.exes.contains(&exe))
+    }
+}
+
+/// The executable behind `pid`. Linux only; elsewhere nothing resolves, so nothing is
+/// allowed.
+fn proc_exe(pid: u32) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// Plants the configured canaries and returns the tripwires over everything inventoried.
 /// `None` when nothing is configured or planting failed (said in the log).
 ///
@@ -161,6 +231,7 @@ mod tests {
     fn config_for(dirs: &[&Path]) -> config::DeceptionConfig {
         config::DeceptionConfig {
             canary_dirs: dirs.iter().map(|d| d.to_path_buf()).collect(),
+            ..Default::default()
         }
     }
 
@@ -304,5 +375,47 @@ mod tests {
         assert!(tripwires.is_none());
         let inventory = Inventory::load(&inventory_path(state.path())).unwrap();
         assert!(inventory.entries.is_empty());
+    }
+
+    fn allow_of(exes: &[&str], resolve: fn(u32) -> Option<PathBuf>) -> CanaryAllow {
+        CanaryAllow::with_resolver(
+            &config::DeceptionConfig {
+                allow_exe: exes.iter().map(PathBuf::from).collect(),
+                ..Default::default()
+            },
+            resolve,
+        )
+    }
+
+    #[test]
+    fn a_process_running_an_allowed_system_executable_is_allowed() {
+        let allow = allow_of(&["/usr/bin/updatedb"], |_| Some("/usr/bin/updatedb".into()));
+        assert!(allow.allows(10));
+    }
+
+    #[test]
+    fn another_executable_is_not_allowed_even_with_the_same_name() {
+        let allow = allow_of(&["/usr/bin/updatedb"], |_| Some("/tmp/updatedb".into()));
+        assert!(!allow.allows(10));
+    }
+
+    #[test]
+    fn an_unresolvable_process_is_not_allowed() {
+        let allow = allow_of(&["/usr/bin/updatedb"], |_| None);
+        assert!(!allow.allows(10));
+    }
+
+    #[test]
+    fn an_entry_outside_a_trusted_location_is_ignored() {
+        let allow = allow_of(&["/tmp/updatedb"], |_| Some("/tmp/updatedb".into()));
+        assert!(!allow.allows(10));
+    }
+
+    #[test]
+    fn a_replaced_binary_is_not_allowed() {
+        let allow = allow_of(&["/usr/bin/updatedb"], |_| {
+            Some("/usr/bin/updatedb (deleted)".into())
+        });
+        assert!(!allow.allows(10));
     }
 }
