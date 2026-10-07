@@ -1,4 +1,5 @@
-//! The canary lifecycle: plant, verify and remove (refresh is not built yet), with an on-disk inventory.
+//! The canary lifecycle: plant, verify, refresh (put back what was deleted) and remove, with an
+//! on-disk inventory.
 //!
 //! The inventory is the contract for the packaging residue rule: every file this crate
 //! creates is in it before it exists, and [`remove`] deletes exactly those files, so an
@@ -155,7 +156,7 @@ pub enum Skipped {
     /// overwritten.
     Occupied,
     /// This install planted a canary here and the file is gone: someone deleted it. It is
-    /// not recreated (refreshing is a separate policy), and the caller can tell this from a
+    /// not recreated by `plant` (that is [`refresh`]'s job), and the caller can tell this from a
     /// user's file being in the way.
     Missing,
 }
@@ -238,6 +239,82 @@ pub fn plant(canaries: &[Canary], inventory_path: &Path) -> Result<PlantReport, 
                 inventory.save(inventory_path)?;
                 return Err(io_at(&canary.path)(e));
             }
+        }
+    }
+    Ok(report)
+}
+
+/// What [`refresh`] did.
+#[derive(Debug, Default)]
+pub struct RefreshReport {
+    /// Canaries that were gone and are back, with the content they were planted with.
+    pub restored: Vec<PathBuf>,
+    /// Already there with the planted content.
+    pub intact: Vec<PathBuf>,
+    /// There, but not with the planted content (modified, or replaced by someone's own data):
+    /// left alone, [`verify`] says how.
+    pub changed: Vec<PathBuf>,
+    /// Gone, but not restorable: the plan no longer produces the content the inventory
+    /// recorded (it changed since), the directory is gone, or a symlink or directory took the
+    /// name.
+    pub unrestorable: Vec<PathBuf>,
+}
+
+/// Puts back the canaries of `canaries` that are inventoried and whose file is gone.
+///
+/// The refresh policy (issue #81): a canary somebody deleted is replanted, with the content it
+/// was planted with, so the decoy is there for the next one. It only ever fills a gap:
+/// a file that is present is left as it is whatever it holds, a canary that is not in the
+/// inventory is not planted (that is [`plant`]'s job), and a path that is no longer free
+/// (a symlink, a directory) is not touched. The file is created with `create_new`, so a race
+/// with something taking the name loses to it.
+///
+/// # Errors
+///
+/// [`DeceptionError`] if the inventory cannot be read, or a file cannot be written for a reason
+/// other than the name having been taken.
+pub fn refresh(
+    canaries: &[Canary],
+    inventory_path: &Path,
+) -> Result<RefreshReport, DeceptionError> {
+    let inventory = Inventory::load(inventory_path)?;
+    let mut report = RefreshReport::default();
+    for canary in canaries {
+        let Some(known) = inventory.entries.iter().find(|e| e.path == canary.path) else {
+            continue;
+        };
+        match fs::symlink_metadata(&canary.path) {
+            Ok(meta) if meta.is_file() => match fs::read(&canary.path) {
+                Ok(bytes) if sha256_hex(&bytes) == known.sha256 => {
+                    report.intact.push(canary.path.clone());
+                }
+                _ => report.changed.push(canary.path.clone()),
+            },
+            Ok(_) => report.unrestorable.push(canary.path.clone()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let restorable = sha256_hex(canary.content.as_bytes()) == known.sha256
+                    && canary.path.parent().is_some_and(Path::is_dir);
+                if !restorable {
+                    report.unrestorable.push(canary.path.clone());
+                    continue;
+                }
+                match OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&canary.path)
+                {
+                    Ok(mut file) => {
+                        file.write_all(canary.content.as_bytes())
+                            .map_err(io_at(&canary.path))?;
+                        report.restored.push(canary.path.clone());
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        report.changed.push(canary.path.clone());
+                    }
+                    Err(e) => return Err(io_at(&canary.path)(e)),
+                }
+            }
+            Err(e) => return Err(io_at(&canary.path)(e)),
         }
     }
     Ok(report)
@@ -544,6 +621,79 @@ mod tests {
         assert!(report.is_clean());
         assert!(canaries.iter().all(|c| !c.path.exists()));
         assert!(!inventory.exists(), "no residue: the inventory goes too");
+    }
+
+    #[test]
+    fn refresh_puts_back_a_deleted_canary_with_the_content_it_was_planted_with() {
+        let (_dir, inventory, canaries) = setup();
+        plant(&canaries, &inventory).unwrap();
+        fs::remove_file(&canaries[0].path).unwrap();
+        let report = refresh(&canaries, &inventory).unwrap();
+        assert_eq!(report.restored, vec![canaries[0].path.clone()]);
+        assert_eq!(report.intact, vec![canaries[1].path.clone()]);
+        assert_eq!(
+            fs::read_to_string(&canaries[0].path).unwrap(),
+            canaries[0].content
+        );
+        assert!(verify(&Inventory::load(&inventory).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn refresh_is_a_no_op_when_nothing_is_missing() {
+        let (_dir, inventory, canaries) = setup();
+        plant(&canaries, &inventory).unwrap();
+        let report = refresh(&canaries, &inventory).unwrap();
+        assert!(report.restored.is_empty() && report.changed.is_empty());
+        assert_eq!(report.intact.len(), 2);
+    }
+
+    #[test]
+    fn refresh_leaves_a_modified_or_replaced_canary_alone() {
+        let (_dir, inventory, canaries) = setup();
+        plant(&canaries, &inventory).unwrap();
+        fs::write(&canaries[0].path, "someone's own data").unwrap();
+        let report = refresh(&canaries, &inventory).unwrap();
+        assert_eq!(report.changed, vec![canaries[0].path.clone()]);
+        assert_eq!(
+            fs::read_to_string(&canaries[0].path).unwrap(),
+            "someone's own data"
+        );
+    }
+
+    #[test]
+    fn refresh_does_not_plant_a_canary_the_inventory_does_not_know() {
+        let (_dir, inventory, canaries) = setup();
+        plant(&canaries[..1], &inventory).unwrap();
+        let report = refresh(&canaries, &inventory).unwrap();
+        assert!(report.restored.is_empty());
+        assert!(!canaries[1].path.exists());
+    }
+
+    #[test]
+    fn refresh_does_not_restore_content_the_plan_no_longer_produces() {
+        let (_dir, inventory, canaries) = setup();
+        plant(&canaries, &inventory).unwrap();
+        fs::remove_file(&canaries[0].path).unwrap();
+        let mut changed_plan = canaries.clone();
+        changed_plan[0]
+            .content
+            .push_str("a line added by a newer build\n");
+        let report = refresh(&changed_plan, &inventory).unwrap();
+        assert_eq!(report.unrestorable, vec![canaries[0].path.clone()]);
+        assert!(!canaries[0].path.exists());
+    }
+
+    #[test]
+    fn refresh_does_not_recreate_a_directory_or_touch_a_path_that_is_taken() {
+        let (dir, inventory, canaries) = setup();
+        plant(&canaries, &inventory).unwrap();
+        fs::remove_file(&canaries[0].path).unwrap();
+        fs::create_dir(&canaries[0].path).unwrap();
+        fs::remove_file(&canaries[1].path).unwrap();
+        fs::remove_dir_all(dir.path().join("share")).unwrap();
+        let report = refresh(&canaries, &inventory).unwrap();
+        assert_eq!(report.unrestorable.len(), 2);
+        assert!(!dir.path().join("share").exists());
     }
 
     #[test]
