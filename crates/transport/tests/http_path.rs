@@ -680,6 +680,49 @@ fn get_json_rejects_a_response_that_is_not_valid_json_for_the_target_type() {
     assert!(!err.is_network_error(), "reached-and-answered, not a blip");
 }
 
+#[test]
+fn get_json_keeps_the_servers_reason_on_a_423_locked() {
+    // A halted content ring (#667): the reason must reach the operator, and a
+    // 423 is not retried.
+    let url = canned_server(
+        423,
+        r#"{"error":"Content delivery is halted for ring 'canary_0' at release 3"}"#,
+        1,
+    );
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+
+    let err = client
+        .get_json::<Widget>(&url)
+        .expect_err("423 must surface");
+    assert_eq!(
+        err.locked_reason(),
+        Some("Content delivery is halted for ring 'canary_0' at release 3")
+    );
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn an_error_body_may_be_plain_text_or_empty() {
+    let url = canned_server(423, "halted: release 3", 1);
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+    let err = client.get_json::<Widget>(&url).unwrap_err();
+    assert_eq!(err.locked_reason(), Some("halted: release 3"));
+
+    let url = canned_server(423, "", 1);
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+    let err = client.get_json::<Widget>(&url).unwrap_err();
+    assert_eq!(err.locked_reason(), Some("http status: 423"));
+}
+
+#[test]
+fn only_a_423_is_a_locked_reason_and_other_statuses_keep_their_message() {
+    let url = canned_server(404, r#"{"error":"no such ring"}"#, 1);
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+    let err = client.get_json::<Widget>(&url).unwrap_err();
+    assert_eq!(err.locked_reason(), None);
+    assert!(err.to_string().contains("no such ring"), "{err}");
+}
+
 // ── get_bytes (issue #30/#73's content artifact download) ──────────────────
 
 #[test]
