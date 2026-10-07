@@ -58,6 +58,25 @@ pub struct AgentConfig {
     /// absent `[logs]` table means no source, never a discovered one.
     #[serde(default)]
     pub logs: LogsConfig,
+    /// Decoy files the agent plants (issue #81). Optional: an absent
+    /// `[deception]` table plants nothing, never a default location.
+    #[serde(default)]
+    pub deception: DeceptionConfig,
+}
+
+/// Most directories one agent plants canaries in. Each directory gets one canary per
+/// kind, so the count of decoys on disk is bounded by this and nothing else.
+pub const MAX_CANARY_DIRS: usize = 16;
+
+/// The `[deception]` table: where canary files go. Off unless the operator names
+/// directories, because a decoy belongs where nothing legitimate reads it and only
+/// the operator knows which directories those are on this host.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeceptionConfig {
+    /// Existing directories that each receive one canary per kind. Empty by default.
+    #[serde(default)]
+    pub canary_dirs: Vec<PathBuf>,
 }
 
 /// Most log sources one agent reads. Each is a tailed file and a parser fed by
