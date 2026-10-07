@@ -176,11 +176,12 @@ pub fn describe_silent_session(session: &str, session_listing: Option<&str>) -> 
     format!("session {session} {state}; other wtrace- sessions running: {others}")
 }
 
-/// Whether a session listing can say that `session` is *not* running. A listing cut
-/// at the API's limit proves presence but never absence: the session may be among
-/// the ones that were not returned (review of #712).
+/// Whether a session listing can decide if `session` is running. A complete listing
+/// always can; one cut at the API's limit only when it contains the session (presence
+/// is proven, absence never: the session may be among those not returned). When this
+/// is false the state must be asked of another source or reported as unknown.
 #[must_use]
-pub fn listing_proves_absence(possibly_truncated: bool, names: &[&str], session: &str) -> bool {
+pub fn listing_is_conclusive(possibly_truncated: bool, names: &[&str], session: &str) -> bool {
     !possibly_truncated || names.contains(&session)
 }
 
@@ -639,9 +640,9 @@ mod tests {
     #[test]
     fn a_truncated_listing_proves_presence_but_not_absence() {
         let names = ["wtrace-a", "other"];
-        assert!(listing_proves_absence(false, &names, "wtrace-missing"));
-        assert!(!listing_proves_absence(true, &names, "wtrace-missing"));
-        assert!(listing_proves_absence(true, &names, "wtrace-a"));
+        assert!(listing_is_conclusive(false, &names, "wtrace-missing"));
+        assert!(!listing_is_conclusive(true, &names, "wtrace-missing"));
+        assert!(listing_is_conclusive(true, &names, "wtrace-a"));
     }
 
     proptest! {
@@ -689,7 +690,7 @@ mod tests {
             let borrowed: Vec<_> = names.iter().map(String::as_str).collect();
             let independently_expected = !truncated || names.iter().any(|name| name == &session);
             prop_assert_eq!(
-                listing_proves_absence(truncated, &borrowed, &session),
+                listing_is_conclusive(truncated, &borrowed, &session),
                 independently_expected
             );
         }

@@ -223,18 +223,15 @@ fn silent_session_diagnosis(session: &str) -> String {
                 .iter()
                 .map(|(_, stats)| stats.name.as_str())
                 .collect();
-            let state = if normalize::listing_proves_absence(
-                snapshot.possibly_truncated,
-                &names,
-                session,
-            ) {
-                normalize::describe_silent_session(session, Some(&names.join("\n")))
-            } else {
-                // A full list without our session: it may be one of those not
-                // returned, so "stopped from outside" would be a guess. Ask logman;
-                // if that fails too, the state is unknown.
-                normalize::describe_silent_session(session, logman_listing().as_deref())
-            };
+            let state =
+                if normalize::listing_is_conclusive(snapshot.possibly_truncated, &names, session) {
+                    normalize::describe_silent_session(session, Some(&names.join("\n")))
+                } else {
+                    // A full list without our session: it may be one of those not
+                    // returned, so "stopped from outside" would be a guess. Ask logman;
+                    // if that fails too, the state is unknown.
+                    normalize::describe_silent_session(session, logman_listing().as_deref())
+                };
             (sessions, state)
         }
         Err(status) => {
