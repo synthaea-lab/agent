@@ -4,38 +4,89 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-echo "==> Building Synthaea Agent .deb package"
-
-# Install cargo-deb if needed
-if ! command -v cargo-deb &> /dev/null; then
-    echo "cargo-deb not found. Installing..."
-    cargo install cargo-deb
+# Provisioning is often run in a separate shell, so restore rustup's PATH here.
+if [ -f "${HOME:-}/.cargo/env" ]; then
+    # shellcheck disable=SC1091
+    . "${HOME}/.cargo/env"
 fi
 
-# Build release binaries
-echo "Building release binaries..."
-cargo build --release --workspace --exclude sensor-linux-ebpf
+TARGET="x86_64-unknown-linux-musl"
 
-# Generate .deb
-echo "Generating .deb package..."
-cargo deb -p watchdog --no-build
+fail() {
+    echo "error: $*" >&2
+    exit 1
+}
 
-# Output
-DEB_FILE=$(ls -t target/debian/*.deb | head -1)
-echo ""
-echo "==> Package created: $DEB_FILE"
-echo ""
+if [ "$(uname -m)" != "x86_64" ]; then
+    fail "the static .deb builder currently supports x86_64 only (found $(uname -m))"
+fi
+if [ ! -r /etc/alpine-release ] || [ ! -e /lib/ld-musl-x86_64.so.1 ]; then
+    fail "run this script on an x86_64 musl host (Alpine); the ONNX Runtime archives must be built for musl"
+fi
+command -v dpkg-deb >/dev/null || fail "install dpkg-deb (on Alpine: apk add dpkg)"
+command -v readelf >/dev/null || fail "install readelf (on Alpine: apk add binutils)"
+command -v bpf-linker >/dev/null || fail "install bpf-linker with lab/provisioning/alpine-toolchain.sh"
+
+# cargo-deb only packages; build the exact musl artifacts ourselves so Cargo
+# cannot re-enable ml's default download-binaries feature.
+if ! command -v cargo-deb >/dev/null 2>&1; then
+    echo "cargo-deb not found. Installing..."
+    cargo install cargo-deb --locked
+fi
+
+if [ -z "${ORT_LIB_LOCATION:-}" ]; then
+    echo "Building static ONNX Runtime libraries from source on this musl host..."
+    "$REPO_ROOT/lab/provisioning/build-onnxruntime-static.sh"
+    export ORT_LIB_LOCATION="$REPO_ROOT/onnxruntime/build/Linux/Release"
+fi
+[ -d "$ORT_LIB_LOCATION" ] || fail "ORT_LIB_LOCATION does not exist: $ORT_LIB_LOCATION"
+
+# ort-sys's pinned static-link list omits libraries produced by ONNX Runtime
+# 1.30.0; discover them from the source build rather than linking pyke's glibc archive.
+# Run through bash rather than by exec bit, and fail loudly: with the script at
+# mode 644 the `Permission denied` went to stderr, `eval` received an empty
+# string and the build carried on without any flag, then failed at the link on
+# the very symbols this script adds (abseil Cord, utf8_range, ModelPackage*;
+# #647 CI, 2026-10-05).
+ort_flags="$(bash "$REPO_ROOT/lab/provisioning/ort-static-link-flags.sh")" \
+    || fail "ort-static-link-flags.sh failed: ONNX Runtime cannot be linked statically"
+case "$ort_flags" in
+    *"-l static="*) ;;
+    *) fail "ort-static-link-flags.sh produced no link flags" ;;
+esac
+eval "$ort_flags"
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-feature=+crt-static"
+rustup target add "$TARGET"
+
+# Real inference stays enabled; only the prebuilt, glibc-built download is disabled.
+CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUNNER=env \
+    cargo test --locked --release --target "$TARGET" --no-default-features -p ml
+CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" cargo build --locked --release \
+    --target "$TARGET" --no-default-features -p agent -p watchdog -p cli
+
+for binary in agent watchdog cli; do
+    path="$REPO_ROOT/target/$TARGET/release/$binary"
+    [ -x "$path" ] || fail "expected release binary missing: $path"
+    if readelf -l "$path" | grep -q 'Requesting program interpreter'; then
+        fail "$binary is dynamically linked; the package must contain static musl binaries"
+    fi
+done
+
+for crate in sensor-linux sensor-linux-uprobes; do
+    probe="$(find "$REPO_ROOT/target/$TARGET/release/build" -type f -path "*/build/${crate}-*/out/sensor-linux-ebpf" -print -quit)"
+    [ -n "$probe" ] || fail "$crate was built without embedded eBPF probes"
+done
+"$REPO_ROOT/target/$TARGET/release/agent" --help >/dev/null
+
+cargo deb -p watchdog --target "$TARGET" --no-build
+DEB_FILE="$(find "$REPO_ROOT/target/debian" -maxdepth 1 -type f -name '*.deb' -print | sort | head -n 1)"
+[ -n "$DEB_FILE" ] || fail "cargo-deb did not produce a .deb"
+
+echo
+echo "==> Static musl package created: $DEB_FILE"
 echo "Package contents:"
 dpkg-deb -c "$DEB_FILE"
-
-# Lintian check (optional)
-if command -v lintian &> /dev/null; then
-    echo ""
-    echo "Running lintian checks..."
-    lintian "$DEB_FILE" || true
-fi
-
-echo ""
-echo "==> Installation command:"
-echo "    sudo dpkg -i $DEB_FILE"
-echo "    sudo apt-get install -f"
+echo
+echo "Install with: sudo dpkg -i $DEB_FILE"
+echo "             sudo apt-get install -f"

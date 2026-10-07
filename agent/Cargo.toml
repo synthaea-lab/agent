@@ -9,6 +9,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Keep one-command development builds convenient. Linux release packaging disables
+# the downloaded glibc-built runtime and links a source-built musl runtime instead.
+default = ["ml/dynamic-onnx"]
+
 [dependencies]
 schema = { path = "../crates/schema" }
 config = { path = "../crates/config" }
@@ -16,7 +21,7 @@ policy = { path = "../crates/policy" }
 rules = { path = "../crates/rules" }
 correlator = { path = "../crates/correlator" }
 verdict = { path = "../crates/verdict" }
-ml = { path = "../crates/ml" }
+ml = { path = "../crates/ml", default-features = false }
 sigma = { path = "../crates/sigma" }
 enrich = { path = "../crates/enrich" }
 yara = { path = "../crates/yara" }
