@@ -123,6 +123,30 @@ fn proc_exe(pid: u32) -> Option<PathBuf> {
     }
 }
 
+/// The configured directories whose canaries the Linux sensor does not report a read of.
+///
+/// The sensor drops read-only opens under `/tmp`, `/var/tmp`, `/dev/shm` (and everything
+/// under `/dev`, `/sys`, `/proc`), so a canary placed there still fires on a delete, rename
+/// or write-intent open (the ransomware path) but never on a read (the recon path). The
+/// answer comes from the sensor's own filter, so the two cannot drift. Empty off Linux.
+fn read_blind_dirs(dirs: &[PathBuf]) -> Vec<&PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        dirs.iter()
+            .filter(|dir| {
+                let probe = dir.join("canary");
+                sensor_linux_wire::is_filtered_path(probe.as_os_str().as_bytes(), 0, false)
+            })
+            .collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dirs;
+        Vec::new()
+    }
+}
+
 /// Plants the configured canaries and returns the tripwires over everything inventoried.
 /// `None` when nothing is configured or planting failed (said in the log).
 ///
@@ -141,6 +165,14 @@ pub(crate) fn start(config: &config::DeceptionConfig, state_dir: &Path) -> Optio
             return None;
         }
     };
+    for dir in read_blind_dirs(&config.canary_dirs) {
+        tracing::warn!(
+            dir = %dir.display(),
+            "deception: the sensor does not report read-only opens under this directory, so a \
+             canary here fires on delete, rename and write but not on a read; place canaries \
+             elsewhere to catch reconnaissance"
+        );
+    }
     let placements: Vec<Placement> = config
         .canary_dirs
         .iter()
@@ -417,5 +449,25 @@ mod tests {
             Some("/usr/bin/updatedb (deleted)".into())
         });
         assert!(!allow.allows(10));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directories_the_sensor_does_not_read_report_are_flagged() {
+        let dirs: Vec<PathBuf> = [
+            "/tmp/x",
+            "/var/tmp",
+            "/dev/shm/a",
+            "/srv/share",
+            "/home/u/docs",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        let blind: Vec<_> = read_blind_dirs(&dirs)
+            .into_iter()
+            .map(|d| d.to_str().unwrap())
+            .collect();
+        assert_eq!(blind, ["/tmp/x", "/var/tmp", "/dev/shm/a"]);
     }
 }
