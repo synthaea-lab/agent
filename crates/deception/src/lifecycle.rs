@@ -1,4 +1,4 @@
-//! The canary lifecycle: plant, verify, refresh and remove, with an on-disk inventory.
+//! The canary lifecycle: plant, verify and remove (refresh is not built yet), with an on-disk inventory.
 //!
 //! The inventory is the contract for the packaging residue rule: every file this crate
 //! creates is in it before it exists, and [`remove`] deletes exactly those files, so an
@@ -137,6 +137,10 @@ pub enum Skipped {
     /// A file already exists there that is not this install's canary. It is never
     /// overwritten.
     Occupied,
+    /// This install planted a canary here and the file is gone: someone deleted it. It is
+    /// not recreated (refreshing is a separate policy), and the caller can tell this from a
+    /// user's file being in the way.
+    Missing,
 }
 
 /// What [`plant`] did.
@@ -168,13 +172,18 @@ pub fn plant(canaries: &[Canary], inventory_path: &Path) -> Result<PlantReport, 
     for canary in canaries {
         let sha256 = sha256_hex(canary.content.as_bytes());
         if let Some(known) = inventory.entries.iter().find(|e| e.path == canary.path) {
-            let intact = fs::read(&canary.path).is_ok_and(|b| sha256_hex(&b) == known.sha256);
-            if intact {
-                report.unchanged.push(canary.path.clone());
-            } else {
-                report
-                    .skipped
-                    .push((canary.path.clone(), Skipped::Occupied));
+            match fs::read(&canary.path) {
+                Ok(bytes) if sha256_hex(&bytes) == known.sha256 => {
+                    report.unchanged.push(canary.path.clone());
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    report.skipped.push((canary.path.clone(), Skipped::Missing));
+                }
+                _ => {
+                    report
+                        .skipped
+                        .push((canary.path.clone(), Skipped::Occupied));
+                }
             }
             continue;
         }
@@ -370,6 +379,31 @@ mod tests {
         assert!(again.planted.is_empty());
         assert_eq!(again.unchanged.len(), 2);
         assert_eq!(Inventory::load(&inventory).unwrap().entries.len(), 2);
+    }
+
+    #[test]
+    fn a_deleted_canary_is_reported_missing_and_not_recreated() {
+        let (_dir, inventory, canaries) = setup();
+        plant(&canaries, &inventory).unwrap();
+        fs::remove_file(&canaries[0].path).unwrap();
+        let again = plant(&canaries, &inventory).unwrap();
+        assert_eq!(
+            again.skipped,
+            vec![(canaries[0].path.clone(), Skipped::Missing)]
+        );
+        assert!(!canaries[0].path.exists());
+    }
+
+    #[test]
+    fn a_canary_replaced_by_another_file_is_occupied_not_missing() {
+        let (_dir, inventory, canaries) = setup();
+        plant(&canaries, &inventory).unwrap();
+        fs::write(&canaries[0].path, "someone else's content").unwrap();
+        let again = plant(&canaries, &inventory).unwrap();
+        assert_eq!(
+            again.skipped,
+            vec![(canaries[0].path.clone(), Skipped::Occupied)]
+        );
     }
 
     #[test]
