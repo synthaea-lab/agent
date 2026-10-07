@@ -45,6 +45,7 @@ dependencies = [
  "sensor-linux-netlink",
  "sensor-linux-procmem",
  "sensor-linux-uprobes",
+ "sensor-linux-wire",
  "sensor-macos",
  "sensor-macos-network-extension",
  "sensor-macos-sockets",
