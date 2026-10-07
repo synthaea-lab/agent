@@ -23,6 +23,7 @@
 mod alerts;
 mod commands;
 mod content;
+mod deception;
 mod enrich_queue;
 mod health;
 #[cfg_attr(
@@ -368,6 +369,7 @@ fn main() -> anyhow::Result<()> {
                 server: target.as_ref().map(upload::RunTarget::control_plane),
                 ipc_endpoint: &cfg.ipc.endpoint,
                 log_sources: &cfg.logs.sources,
+                deception: &cfg.deception,
                 content_dir: &content_dir,
             })
         }
