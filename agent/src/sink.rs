@@ -2572,6 +2572,37 @@ rule response_marker {
     }
 
     #[test]
+    fn an_allowed_executable_that_also_bursts_is_not_killed_by_the_reflex() {
+        let dir = tmp("reflex-allowed");
+        let (sink, canary, killed) = reflex_sink(&dir, true);
+        // A backup tool: it reads the canaries and rotates archives (a burst of renames).
+        sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
+            "/usr/bin/backup-tool",
+            |_| Some("/usr/bin/backup-tool".into()),
+        ));
+        burst(&sink, 900);
+        sink.on_event(canary_open_at(&canary, 900, BURST_END_NS + 1_000_000));
+        assert!(
+            killed.lock().unwrap().is_empty(),
+            "an allowed process never notes a canary signal"
+        );
+        assert!(!alerts_in(&dir).contains("RESPONSE-KILL"));
+    }
+
+    #[test]
+    fn a_process_that_is_not_on_the_allow_list_is_still_killed_when_a_list_exists() {
+        let dir = tmp("reflex-not-allowed");
+        let (sink, canary, killed) = reflex_sink(&dir, true);
+        sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
+            "/usr/bin/backup-tool",
+            |_| Some("/tmp/encryptor".into()),
+        ));
+        burst(&sink, 900);
+        sink.on_event(canary_open_at(&canary, 900, BURST_END_NS + 1_000_000));
+        assert_eq!(*killed.lock().unwrap(), vec![900]);
+    }
+
+    #[test]
     fn with_kill_disabled_the_reflex_is_observe_only() {
         let dir = tmp("reflex-observe");
         let (sink, canary, killed) = reflex_sink(&dir, false);
