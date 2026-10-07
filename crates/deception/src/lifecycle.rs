@@ -1,4 +1,4 @@
-//! The canary lifecycle: plant, verify, refresh and remove, with an on-disk inventory.
+//! The canary lifecycle: plant, verify and remove (refresh is not built yet), with an on-disk inventory.
 //!
 //! The inventory is the contract for the packaging residue rule: every file this crate
 //! creates is in it before it exists, and [`remove`] deletes exactly those files, so an
@@ -13,7 +13,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::plan::{Canary, Kind};
+use crate::plan::{Canary, DECOY_HEADER, Kind};
 
 /// Inventory file format version.
 const INVENTORY_VERSION: u32 = 1;
@@ -114,7 +114,24 @@ impl Inventory {
             path: path.to_path_buf(),
             reason: e.to_string(),
         })?;
-        fs::write(&tmp, bytes).map_err(io_at(&tmp))?;
+        // A leftover from a crash is cleared first (removing a symlink removes the link, not
+        // its target), then the file is created exclusively: `create_new` refuses a path that
+        // appeared in between, including a symlink, instead of writing through it.
+        match fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_at(&tmp)(e)),
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(io_at(&tmp))?;
+        file.write_all(&bytes).map_err(io_at(&tmp))?;
+        // Data on disk before the rename makes it visible: otherwise a power loss can leave
+        // the new name over an empty file.
+        file.sync_all().map_err(io_at(&tmp))?;
+        drop(file);
         fs::rename(&tmp, path).map_err(io_at(path))
     }
 }
@@ -275,6 +292,10 @@ pub struct RemoveReport {
     pub refused: Vec<PathBuf>,
     /// Could not be deleted.
     pub failed: Vec<(PathBuf, io::Error)>,
+    /// Left alone and dropped from the inventory: the file at the path is no longer a
+    /// canary (its content changed and it does not start with [`DECOY_HEADER`], or it is too
+    /// big to be one), so it is someone's own data.
+    pub foreign: Vec<PathBuf>,
 }
 
 impl RemoveReport {
@@ -285,9 +306,28 @@ impl RemoveReport {
     }
 }
 
+/// The most bytes of a file [`remove`] reads to decide whether it is still a canary. A
+/// canary is a few hundred bytes; anything larger was replaced.
+const MAX_CANARY_BYTES: u64 = 64 * 1024;
+
+/// Whether the file at an inventoried path is still this install's canary: unchanged, or
+/// modified but still carrying the decoy header (an attacker or a tool appended to it).
+/// Content that has neither is someone's own data that replaced the canary.
+fn is_ours(entry: &InventoryEntry) -> io::Result<bool> {
+    use io::Read as _;
+    let mut bytes = Vec::new();
+    fs::File::open(&entry.path)
+        .and_then(|file| file.take(MAX_CANARY_BYTES + 1).read_to_end(&mut bytes))?;
+    if bytes.len() as u64 > MAX_CANARY_BYTES {
+        return Ok(false);
+    }
+    Ok(sha256_hex(&bytes) == entry.sha256 || bytes.starts_with(DECOY_HEADER.as_bytes()))
+}
+
 /// Deletes every canary in the inventory at `inventory_path`, then the inventory itself if
-/// nothing was refused or failed. A canary that was modified is still deleted: it is this
-/// install's file. One that is no longer a regular file is refused.
+/// nothing was refused or failed. A canary that was modified is still deleted as long as it
+/// carries the decoy header; one replaced by other content is left alone and reported in
+/// [`RemoveReport::foreign`]. One that is no longer a regular file is refused.
 ///
 /// # Errors
 ///
@@ -307,8 +347,15 @@ pub fn remove(inventory_path: &Path) -> Result<RemoveReport, DeceptionError> {
                 report.refused.push(entry.path.clone());
                 kept.push(entry);
             }
-            Ok(_) => match fs::remove_file(&entry.path) {
-                Ok(()) => report.removed.push(entry.path),
+            Ok(_) => match is_ours(&entry) {
+                Ok(true) => match fs::remove_file(&entry.path) {
+                    Ok(()) => report.removed.push(entry.path),
+                    Err(e) => {
+                        report.failed.push((entry.path.clone(), e));
+                        kept.push(entry);
+                    }
+                },
+                Ok(false) => report.foreign.push(entry.path),
                 Err(e) => {
                     report.failed.push((entry.path.clone(), e));
                     kept.push(entry);
@@ -424,7 +471,11 @@ mod tests {
     fn a_modified_canary_is_reported_by_verify_and_still_removed() {
         let (_dir, inventory, canaries) = setup();
         plant(&canaries, &inventory).unwrap();
-        fs::write(&canaries[0].path, "encrypted by an attacker").unwrap();
+        fs::write(
+            &canaries[0].path,
+            format!("{}\ntampered with", canaries[0].content),
+        )
+        .unwrap();
         fs::remove_file(&canaries[1].path).unwrap();
         let drift = verify(&Inventory::load(&inventory).unwrap());
         assert_eq!(
