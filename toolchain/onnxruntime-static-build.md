@@ -211,12 +211,25 @@ Measured on a 12-thread laptop, cold: the onnxruntime build took 48 minutes and 
   1455`, reported by `rustc` as "found invalid metadata files for crate `serde`", which
   points nowhere near the cause). Stop WSL first if it is running: its VM reserves memory.
 
+### The full agent, measured
+
+`cargo build -j 2 --release --no-default-features -p agent -p watchdog -p cli` with the
+flags above: 20 minutes, exit 0 (onnxruntime already built).
+
+| | static source build | prebuilt download (`dynamic-onnx`) |
+|---|---|---|
+| `agent.exe` | 39.1 MB | 42.6 MB |
+| DLL imports (`check-pe-imports.py`) | 31 | 32 |
+| `directml.dll`, `d3d12.dll` | no | yes |
+
+The static agent is smaller and imports no DirectML. `agent.exe --help` runs. One host, one
+build; not run under load or as the service.
+
 ### Still open for #337
 
 - A `dumpbin`-based or CI check: `tools/check-pe-imports.py` reads the import tables
   without Visual Studio, but nothing runs it in CI because CI does not build a static
   Windows binary yet (the build takes about an hour).
-- Binary size of the full agent against the prebuilt-download build; see the issue.
 
 ## Platform Support
 
