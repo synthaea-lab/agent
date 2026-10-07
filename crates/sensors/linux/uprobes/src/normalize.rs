@@ -66,7 +66,9 @@ use crate::redact;
 /// reasoning.
 ///
 /// v22 (#263) added `UdpRecvEvent` — not imported here, same reasoning.
-const _: () = assert!(wire::WIRE_VERSION == 22);
+///
+/// v23 (#263) added `SocketCreateEvent` — not imported here, same reasoning.
+const _: () = assert!(wire::WIRE_VERSION == 23);
 
 /// `container` is resolved by the caller (`crate::container::container_context`,
 /// issue #312) from `EventMeta::cgroup_id` against cgroupfs, with image/name filled

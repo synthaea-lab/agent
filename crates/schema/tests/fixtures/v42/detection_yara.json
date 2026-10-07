@@ -1,0 +1,26 @@
+{
+  "timestamp_ns": 1756900005000000000,
+  "severity": "low",
+  "title": "synthaea_lab_payload",
+  "source": {
+    "engine": "yara",
+    "rule_name": "synthaea_lab_payload"
+  },
+  "techniques": ["T1105"],
+  "events": [
+    {
+      "type": "exec",
+      "meta": {
+        "pid": 4242,
+        "ppid": 1337,
+        "user": { "os": "unix", "uid": 1000, "gid": 1000 },
+        "timestamp_ns": 1756900004123456789,
+        "comm": "bash"
+      },
+      "image_path": "/bin/bash",
+      "cmdline": "bash -c echo cGF5bG9hZAo= | base64 -d | sh",
+      "argv": ["bash", "-c", "echo cGF5bG9hZAo= | base64 -d | sh"],
+      "parent_comm": "sshd"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "type": "dns_query",
+  "meta": {
+    "pid": 4242,
+    "ppid": 1337,
+    "user": { "os": "unknown" },
+    "timestamp_ns": 1756900010000000000,
+    "comm": "chrome-update.exe"
+  },
+  "query": "beacon.example.test",
+  "qtype": 1,
+  "result": "type:1 172.67.143.127;",
+  "status": 0
+}

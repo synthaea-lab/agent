@@ -46,6 +46,16 @@ jobs:
 
       - name: Build and test the package on Alpine/musl
         run: |
+          # Docker Hub's anonymous-pull rate limit is shared across every GitHub-hosted
+          # runner's IP pool, not just our own CI volume, so an unauthenticated `docker
+          # run` (which pulls first) can fail with "unauthorized" under load that has
+          # nothing to do with this repo (seen on #722, passed minutes earlier on #713).
+          # Retry with backoff before run instead of adding a Docker Hub login secret.
+          for i in 1 2 3 4 5; do
+            docker pull alpine:3.24 && break
+            echo "::warning::docker pull alpine:3.24 failed (attempt $i/5)"
+            [ "$i" -lt 5 ] && sleep $((i * 10))
+          done
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/work" \
             -v /sys/kernel/btf:/sys/kernel/btf:ro \
@@ -65,6 +75,11 @@ jobs:
           dpkg-deb -x target/debian/*.deb "$RUNNER_TEMP/synthaea-package"
           for image in ubuntu:22.04 debian:12 rockylinux:9; do
             echo "Checking agent in $image"
+            for i in 1 2 3 4 5; do
+              docker pull "$image" && break
+              echo "::warning::docker pull $image failed (attempt $i/5)"
+              [ "$i" -lt 5 ] && sleep $((i * 10))
+            done
             docker run --rm \
               -v "$RUNNER_TEMP/synthaea-package:/package:ro" \
               "$image" \
