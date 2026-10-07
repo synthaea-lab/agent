@@ -106,6 +106,32 @@ pub fn parse_orphaned_sessions(logman_query_ets_output: &str) -> Vec<String> {
         .collect()
 }
 
+/// Names `wtrace-` sessions from a native ETW enumeration and notes when the
+/// caller filled its fixed-size session buffer, so more sessions may be hidden.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanedSessionSelection {
+    /// Sessions that this agent family may have orphaned.
+    pub names: Vec<String>,
+    /// True when the enumeration capacity was reached.
+    pub possibly_truncated: bool,
+}
+
+#[must_use]
+pub fn select_orphaned_sessions(
+    sessions: &[SessionStats],
+    capacity: usize,
+    api_reported_more: bool,
+) -> OrphanedSessionSelection {
+    OrphanedSessionSelection {
+        names: sessions
+            .iter()
+            .filter(|session| session.name.starts_with("wtrace-"))
+            .map(|session| session.name.clone())
+            .collect(),
+        possibly_truncated: api_reported_more || (capacity > 0 && sessions.len() >= capacity),
+    }
+}
+
 /// Runs `start`, and on failure calls `stop_session(session)` before returning
 /// the error (#408). `ferrisetw`'s `start_and_process` creates the session
 /// (`StartTrace`), then enables each provider and opens the consumer; if one of
@@ -128,16 +154,16 @@ pub fn start_or_stop_session<T, E>(
     result
 }
 
-/// Describes our session's state from `logman query -ets` output, for the error
+/// Describes our session's state from an ETW session listing, for the error
 /// the liveness canary raises after 30 s of silence (#408). "Stopped from the
 /// outside" and "still running but blind" call for different investigations, and
 /// the old message ("trace stopped or tampered") didn't tell them apart. Other
 /// `wtrace-` sessions at that point are not orphans (startup stopped those): they
-/// belong to another running instance. `None`: logman itself failed.
+/// belong to another running instance. `None`: enumeration failed.
 #[must_use]
-pub fn describe_silent_session(session: &str, logman_query_ets_output: Option<&str>) -> String {
-    let Some(output) = logman_query_ets_output else {
-        return format!("session {session}: state unknown (logman query -ets failed)");
+pub fn describe_silent_session(session: &str, session_listing: Option<&str>) -> String {
+    let Some(output) = session_listing else {
+        return format!("session {session}: state unknown (ETW session enumeration failed)");
     };
     let ours = parse_orphaned_sessions(output);
     let running = ours.iter().any(|name| name == session);
@@ -172,6 +198,21 @@ pub struct SessionStats {
     pub real_time: bool,
     /// Buffers flushed so far; a real-time session nobody consumes stays at 0.
     pub buffers_written: u32,
+    /// Events the ETW session could not record.
+    pub events_lost: u32,
+    /// Real-time buffers the consumer could not keep up with.
+    pub real_time_buffers_lost: u32,
+    /// Log-file buffers the writer could not keep up with.
+    pub log_buffers_lost: u32,
+}
+
+/// Formats the three loss counters returned by `EVENT_TRACE_PROPERTIES`.
+#[must_use]
+pub fn describe_session_losses(stats: &SessionStats) -> String {
+    format!(
+        "EventsLost={} RealTimeBuffersLost={} LogBuffersLost={}",
+        stats.events_lost, stats.real_time_buffers_lost, stats.log_buffers_lost
+    )
 }
 
 /// At most this many foreign sessions are named in a diagnosis.
@@ -226,8 +267,13 @@ pub fn describe_foreign_sessions(
             } else {
                 ""
             };
+            let losses = sessions
+                .iter()
+                .find(|stats| stats.name == *name)
+                .map(describe_session_losses)
+                .unwrap_or_else(|| "loss counters unavailable".to_string());
             format!(
-                "{name} ({} of our providers, level {level}{flag}: {})",
+                "{name} ({} of our providers, level {level}{flag}: {}; {losses})",
                 providers.len(),
                 providers.join(", ")
             )
@@ -461,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_logman_says_the_state_is_unknown() {
+    fn a_failed_session_enumeration_says_the_state_is_unknown() {
         let text = describe_silent_session("wtrace-aaaaaaaaaaaaaaaa", None);
         assert!(text.contains("state unknown"), "{text}");
     }
@@ -551,7 +597,43 @@ mod tests {
             name: name.to_string(),
             real_time,
             buffers_written,
+            events_lost: 0,
+            real_time_buffers_lost: 0,
+            log_buffers_lost: 0,
         }
+    }
+
+    #[test]
+    fn native_enumeration_selects_only_our_session_prefix() {
+        let sessions = [
+            stats("wtrace-orphan-a", true, 0),
+            stats("EventLog-System", true, 4),
+            stats("wtrace-orphan-b", false, 3),
+        ];
+        let selected = select_orphaned_sessions(&sessions, 64, false);
+        assert_eq!(selected.names, ["wtrace-orphan-a", "wtrace-orphan-b"]);
+        assert!(!selected.possibly_truncated);
+    }
+
+    #[test]
+    fn a_full_native_session_list_is_reported_as_potentially_truncated() {
+        let sessions: Vec<_> = (0..64)
+            .map(|i| stats(&format!("session-{i}"), true, 1))
+            .collect();
+        let selected = select_orphaned_sessions(&sessions, 64, false);
+        assert!(selected.possibly_truncated);
+    }
+
+    #[test]
+    fn loss_counters_are_formatted_with_the_windows_field_names() {
+        let mut session = stats("EventLog-System", true, 4);
+        session.events_lost = 7;
+        session.real_time_buffers_lost = 2;
+        session.log_buffers_lost = 3;
+        assert_eq!(
+            describe_session_losses(&session),
+            "EventsLost=7 RealTimeBuffersLost=2 LogBuffersLost=3"
+        );
     }
 
     #[test]
@@ -581,12 +663,12 @@ mod tests {
         ];
         let text = describe_foreign_sessions("wtrace-x", &enablements, &sessions);
         assert!(
-            text.starts_with("; foreign sessions enabling our providers: lab408b-allnine (1 of our providers, level 5, real-time with 0 buffers written: nobody consumes it: Kernel-Process)"),
+            text.starts_with("; foreign sessions enabling our providers: lab408b-allnine (1 of our providers, level 5, real-time with 0 buffers written: nobody consumes it: Kernel-Process; EventsLost=0 RealTimeBuffersLost=0 LogBuffersLost=0)"),
             "{text}"
         );
         assert!(
             text.contains(
-                "EventLog-System (2 of our providers, level 4: Kernel-Process, Kernel-File)"
+                "EventLog-System (2 of our providers, level 4: Kernel-Process, Kernel-File; EventsLost=0 RealTimeBuffersLost=0 LogBuffersLost=0)"
             ),
             "{text}"
         );
