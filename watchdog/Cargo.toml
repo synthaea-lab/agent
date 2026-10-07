@@ -31,6 +31,11 @@ tempfile = "3"
 
 [package.metadata.deb]
 name = "synthaea-agent"
+# `[workspace.metadata.deb]` does not propagate here — cargo-deb reads each crate's
+# own `[package.metadata.deb]`, and arbitrary tool tables never participate in
+# Cargo's own workspace-inheritance machinery. Set explicitly (#675: `dpkg` warned
+# "missing 'Maintainer' field" without this).
+maintainer = "Synthaea Security <security@synthaea.io>"
 maintainer-scripts = "../packaging/linux/debian/maintainer-scripts"
 
 # Assets: binaries use cargo-deb's target/release/ prefix, which it rewrites for
@@ -46,8 +51,11 @@ assets = [
     ["../packaging/linux/systemd/synthaea.sysusers", "usr/lib/sysusers.d/synthaea.conf", "644"],
     ["../packaging/linux/systemd/synthaea.tmpfiles", "usr/lib/tmpfiles.d/synthaea.conf", "644"],
 
-    # Config template
-    ["../packaging/linux/debian/agent.conf.template", "etc/synthaea/agent.conf", "644"],
+    # Config (ADR-0013): the agent fails fast without a valid agent.toml, so the
+    # package ships the same template `cli config init` writes, not a placeholder
+    # (#675). Every control-plane field is a `# CHANGE ME` the operator must fill
+    # in, but `offline_fallback = true` lets the agent start and run on it as-is.
+    ["../crates/config/data/default-agent.toml", "etc/synthaea/agent.toml", "644"],
 ]
 
 [package.metadata.deb.systemd-units]
