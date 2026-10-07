@@ -10,7 +10,11 @@
 //! Design intentions:
 //! - **Per-host uniqueness**: decoy names/paths/contents derive from the install's
 //!   seed (the per-install variation story), so decoys learned from one host don't
-//!   transfer — an attacker cannot build an avoid-list.
+//!   transfer. A name's stem, template, separator, qualifier, extension and the way its
+//!   32-bit token is written all come from the seed, so no single pattern matches every
+//!   canary of every install. The stems come from a public vocabulary of real-looking
+//!   words, so an attacker can still skip *every file with such a word in its name*; that
+//!   costs them the real files they are after, and it is the limit of the claim.
 //! - **Detection via the normal stream**: canary paths register as tripwire
 //!   indicators; matching happens on existing file/connect events — no new hooks.
 //!   Planted credentials pair with server-side alarms (use of a decoy token anywhere

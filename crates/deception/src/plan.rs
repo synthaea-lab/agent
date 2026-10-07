@@ -61,22 +61,148 @@ impl Kind {
     /// Every kind, in a fixed order.
     pub const ALL: [Self; 4] = [Self::Credentials, Self::Finance, Self::Config, Self::Notes];
 
-    const fn extension(self) -> &'static str {
+    /// Extensions a canary of this kind may carry; the plan picks one per canary.
+    const fn extensions(self) -> &'static [&'static str] {
         match self {
-            Self::Credentials | Self::Notes => "txt",
-            Self::Finance => "csv",
-            Self::Config => "conf",
+            Self::Credentials => &["txt", "csv", "md", "json"],
+            Self::Finance => &["csv", "txt", "tsv", "json"],
+            Self::Config => &["conf", "ini", "env", "cfg", "yaml"],
+            Self::Notes => &["txt", "md", "text"],
         }
     }
 
-    const fn stems(self) -> [&'static str; 4] {
+    /// The words a name of this kind is built from: what an attacker greps a host for.
+    const fn stems(self) -> [&'static str; 16] {
         match self {
-            Self::Credentials => ["passwords", "logins", "creds", "vpn_access"],
-            Self::Finance => ["payroll", "budget", "invoices", "bank_export"],
-            Self::Config => ["backup", "prod", "deploy", "infra"],
-            Self::Notes => ["notes", "todo", "meeting", "private"],
+            Self::Credentials => [
+                "passwords",
+                "logins",
+                "creds",
+                "vpn_access",
+                "accounts",
+                "secrets",
+                "keys",
+                "admin_logins",
+                "service_accounts",
+                "wifi",
+                "root_access",
+                "tokens",
+                "sso",
+                "db_credentials",
+                "ssh_access",
+                "api_keys",
+            ],
+            Self::Finance => [
+                "payroll",
+                "budget",
+                "invoices",
+                "bank_export",
+                "salaries",
+                "forecast",
+                "expenses",
+                "ledger",
+                "revenue",
+                "tax",
+                "accounts_payable",
+                "transactions",
+                "bonuses",
+                "audit_prep",
+                "cashflow",
+                "quarterly",
+            ],
+            Self::Config => [
+                "backup",
+                "prod",
+                "deploy",
+                "infra",
+                "staging",
+                "ansible",
+                "terraform",
+                "k8s",
+                "database",
+                "ci",
+                "hosts_prod",
+                "firewall",
+                "docker",
+                "vault",
+                "nginx",
+                "env",
+            ],
+            Self::Notes => [
+                "notes",
+                "todo",
+                "meeting",
+                "private",
+                "ideas",
+                "reminders",
+                "onboarding",
+                "passwords_todo",
+                "handover",
+                "contacts",
+                "plan",
+                "minutes",
+                "draft",
+                "personal",
+                "checklist",
+                "reading",
+            ],
         }
     }
+}
+
+/// Words and years a name may carry besides its stem, the way real files pick up versions.
+const QUALIFIERS: [&str; 16] = [
+    "old", "backup", "final", "new", "copy", "2023", "2024", "2025", "v2", "export", "archive",
+    "draft", "shared", "internal", "latest", "orig",
+];
+
+const SEPARATORS: [char; 3] = ['_', '-', '.'];
+
+/// The name of one canary, shaped by the seed so no single pattern describes every canary
+/// of every install: the stem, the template, the separator, the qualifier, how the
+/// random token is written and the extension are each drawn from the seed.
+///
+/// The token always carries 32 seed-derived bits, however it is written: it keeps two
+/// canaries apart and a name unguessable without the seed, and the tripwire's file-name
+/// fallback for relative opens relies on it.
+fn canary_name(kind: Kind, bits: &[u8; 32]) -> String {
+    let stems = kind.stems();
+    let stem = stems[usize::from(bits[0]) % stems.len()];
+    let qualifier = QUALIFIERS[usize::from(bits[2]) % QUALIFIERS.len()];
+    let sep = SEPARATORS[usize::from(bits[9]) % SEPARATORS.len()];
+    let value = u32::from_le_bytes([bits[4], bits[5], bits[6], bits[7]]);
+    let token = match bits[3] % 4 {
+        0 => format!("{value:08x}"),
+        1 => format!("{value:08X}"),
+        2 => value.to_string(),
+        _ => base36(value),
+    };
+    let base = match bits[1] % 5 {
+        0 => format!("{stem}{sep}{token}"),
+        1 => format!("{token}{sep}{stem}"),
+        2 => format!("{stem}{sep}{qualifier}{sep}{token}"),
+        3 => format!("{qualifier}{sep}{stem}{sep}{token}"),
+        _ => format!("{stem}{sep}{token}{sep}{qualifier}"),
+    };
+    let extensions = kind.extensions();
+    format!(
+        "{base}.{}",
+        extensions[usize::from(bits[8]) % extensions.len()]
+    )
+}
+
+fn base36(mut value: u32) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if value == 0 {
+        return "0".to_string();
+    }
+    let mut out = Vec::new();
+    while value > 0 {
+        out.push(DIGITS[(value % 36) as usize]);
+        value /= 36;
+    }
+    out.reverse();
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A directory the caller chose, and the kinds of canary to plant in it. The caller
@@ -112,15 +238,9 @@ pub fn plan(seed: &Seed, placements: &[Placement]) -> Vec<Canary> {
     for (p, placement) in placements.iter().enumerate() {
         for (k, kind) in placement.kinds.iter().enumerate() {
             let index = p * Kind::ALL.len() + k;
-            let name_bits = seed.derive("name", index);
-            let stems = kind.stems();
-            let stem = stems[usize::from(name_bits[0]) % stems.len()];
-            // 4 hex bytes after the stem keep two canaries in one directory apart and make
-            // a name unguessable without the seed.
-            let suffix = hex(&name_bits[1..5]);
             let path = placement
                 .dir
-                .join(format!("{stem}_{suffix}.{}", kind.extension()));
+                .join(canary_name(*kind, &seed.derive("name", index)));
             canaries.push(Canary {
                 path,
                 kind: *kind,
@@ -214,5 +334,119 @@ mod tests {
             format!("{:?}", Seed::from_bytes([9; 32])),
             "Seed(<redacted>)"
         );
+    }
+
+    fn names_across_installs(installs: u8) -> Vec<String> {
+        (0..installs)
+            .flat_map(|i| plan(&Seed::from_bytes([i; 32]), &placements()))
+            .map(|c| c.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn no_single_name_pattern_describes_every_install() {
+        let old_shape = regex_free_old_shape_matches;
+        let names = names_across_installs(200);
+        let matching = names.iter().filter(|n| old_shape(n)).count();
+        assert!(
+            matching * 100 < names.len() * 20,
+            "{matching} of {} names still fit stem_hex8.ext",
+            names.len()
+        );
+    }
+
+    /// `^[a-z_]+_[0-9a-f]{8}\.(txt|csv|conf)$`, the first slice's only shape.
+    fn regex_free_old_shape_matches(name: &str) -> bool {
+        let Some((base, ext)) = name.rsplit_once('.') else {
+            return false;
+        };
+        let Some((stem, token)) = base.rsplit_once('_') else {
+            return false;
+        };
+        ["txt", "csv", "conf"].contains(&ext)
+            && !stem.is_empty()
+            && stem.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+            && token.len() == 8
+            && token.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+    }
+
+    /// Seed bytes with every name-shaping byte pinned: stem 0, template 0, qualifier 0,
+    /// token style 0, token `0x0000_00ff`, extension 0, separator 0.
+    fn pinned() -> [u8; 32] {
+        let mut bits = [0u8; 32];
+        bits[4] = 0xff;
+        bits
+    }
+
+    #[test]
+    fn the_template_decides_where_stem_qualifier_and_token_sit() {
+        let name = |template: u8| {
+            let mut bits = pinned();
+            bits[1] = template;
+            canary_name(Kind::Notes, &bits)
+        };
+        assert_eq!(name(0), "notes_000000ff.txt");
+        assert_eq!(name(1), "000000ff_notes.txt");
+        assert_eq!(name(2), "notes_old_000000ff.txt");
+        assert_eq!(name(3), "old_notes_000000ff.txt");
+        assert_eq!(name(4), "notes_000000ff_old.txt");
+    }
+
+    #[test]
+    fn the_token_is_written_in_one_of_four_styles_carrying_the_same_value() {
+        let name = |style: u8| {
+            let mut bits = pinned();
+            bits[3] = style;
+            canary_name(Kind::Notes, &bits)
+        };
+        assert_eq!(name(0), "notes_000000ff.txt");
+        assert_eq!(name(1), "notes_000000FF.txt");
+        assert_eq!(name(2), "notes_255.txt");
+        assert_eq!(name(3), "notes_73.txt");
+    }
+
+    #[test]
+    fn the_separator_and_extension_come_from_the_seed() {
+        let name = |sep: u8, ext: u8| {
+            let mut bits = pinned();
+            bits[9] = sep;
+            bits[8] = ext;
+            canary_name(Kind::Config, &bits)
+        };
+        assert_eq!(name(0, 0), "backup_000000ff.conf");
+        assert_eq!(name(1, 1), "backup-000000ff.ini");
+        assert_eq!(name(2, 2), "backup.000000ff.env");
+    }
+
+    #[test]
+    fn extensions_vary_across_installs() {
+        let extensions: std::collections::HashSet<_> = names_across_installs(200)
+            .iter()
+            .filter_map(|n| n.rsplit_once('.').map(|(_, e)| e.to_string()))
+            .collect();
+        assert!(extensions.len() >= 10, "{extensions:?}");
+    }
+
+    #[test]
+    fn many_canaries_of_one_install_keep_distinct_names() {
+        let placements: Vec<Placement> = (0..500)
+            .map(|i| Placement {
+                dir: PathBuf::from(format!("/srv/d{i}")),
+                kinds: Kind::ALL.to_vec(),
+            })
+            .collect();
+        let canaries = plan(&Seed::from_bytes([11; 32]), &placements);
+        let names: std::collections::HashSet<_> = canaries
+            .iter()
+            .map(|c| c.path.file_name().unwrap().to_owned())
+            .collect();
+        assert_eq!(names.len(), canaries.len());
+    }
+
+    #[test]
+    fn base36_round_trips() {
+        for v in [0u32, 1, 35, 36, 1_295, u32::MAX] {
+            assert_eq!(u32::from_str_radix(&base36(v), 36).unwrap(), v);
+        }
     }
 }

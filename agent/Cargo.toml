@@ -25,6 +25,7 @@ ml = { path = "../crates/ml", default-features = false }
 sigma = { path = "../crates/sigma" }
 enrich = { path = "../crates/enrich" }
 yara = { path = "../crates/yara" }
+deception = { path = "../crates/deception" }
 sinks = { path = "../crates/sinks" }
 tamper = { path = "../crates/tamper" }
 response = { path = "../crates/response" }
@@ -82,4 +83,5 @@ aya = { version = "0.14", default-features = false }
 libc = "0.2"
 
 [dev-dependencies]
+tempfile = "3"
 schema = { path = "../crates/schema", features = ["test-fixtures"] }
