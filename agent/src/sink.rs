@@ -660,8 +660,14 @@ impl DetectionSink {
             return;
         }
         if self.canary_allow.get().is_some_and(|allow| {
-            let images = self.exec_images.lock().unwrap();
-            allow.allows(hit.pid, event.meta().process_generation, Some(&images))
+            // Cloned out so the lock is not held across the `/proc` fallback inside `allows`:
+            // `detect_exec` takes it for every exec event.
+            let seen = self
+                .exec_images
+                .lock()
+                .unwrap()
+                .image_of(hit.pid, event.meta().process_generation);
+            allow.allows(hit.pid, seen.as_ref())
         }) {
             tracing::debug!(
                 pid = hit.pid,

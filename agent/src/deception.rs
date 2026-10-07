@@ -167,18 +167,15 @@ impl CanaryAllow {
         }
     }
 
-    /// Whether the process `pid` (of incarnation `generation`) runs an allowed executable.
-    /// `seen` is what the agent recorded when it executed, if anything.
-    pub(crate) fn allows(
-        &self,
-        pid: u32,
-        generation: Option<u64>,
-        seen: Option<&ExecImages>,
-    ) -> bool {
+    /// Whether the process `pid` runs an allowed executable. `seen` is what the agent recorded
+    /// when this incarnation of the pid executed ([`ExecImages::image_of`], already checked
+    /// against the pid's incarnation), if anything; with none, the `/proc` route decides.
+    /// The caller passes a clone and holds no lock: the `/proc` read below can be slow.
+    pub(crate) fn allows(&self, pid: u32, seen: Option<&ExecImage>) -> bool {
         if self.exes.is_empty() {
             return false;
         }
-        if let Some(image) = seen.and_then(|images| images.image_of(pid, generation)) {
+        if let Some(image) = seen {
             return !image.in_container && self.matches_image(&image.path);
         }
         (self.resolve)(pid).is_some_and(|exe| self.exes.contains(&exe))
@@ -187,10 +184,26 @@ impl CanaryAllow {
     /// An absolute image equal to an entry, resolved or as written. A relative exec
     /// (`./updatedb`) names nothing and never matches.
     fn matches_image(&self, image: &str) -> bool {
-        let path = Path::new(image);
-        path.is_absolute()
-            && (self.exes.iter().any(|e| e == path) || self.as_written.iter().any(|e| e == path))
+        is_absolute_image(image) && {
+            let path = Path::new(image);
+            self.exes.iter().any(|e| e == path) || self.as_written.iter().any(|e| e == path)
+        }
     }
+}
+
+/// Whether an image path from a sensor names an absolute location. Decided on the string, not
+/// with `Path::is_absolute`: that follows the rules of the host the agent runs on, and a
+/// Linux sensor's `/usr/bin/updatedb` has no drive letter, so it is not absolute on Windows
+/// (a Windows build compiles this code and its tests too). A leading separator, a drive
+/// letter or a UNC prefix counts; `./updatedb` and `updatedb` do not.
+fn is_absolute_image(image: &str) -> bool {
+    let bytes = image.as_bytes();
+    image.starts_with('/')
+        || image.starts_with('\\')
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'\\' || bytes[2] == b'/'))
 }
 
 /// An entry as `/proc/<pid>/exe` will show it: with symlinks resolved. `/usr/bin/updatedb`
@@ -530,25 +543,25 @@ mod tests {
     #[test]
     fn a_process_running_an_allowed_system_executable_is_allowed() {
         let allow = allow_of(&["/usr/bin/updatedb"], |_| Some("/usr/bin/updatedb".into()));
-        assert!(allow.allows(10, None, None));
+        assert!(allow.allows(10, None));
     }
 
     #[test]
     fn another_executable_is_not_allowed_even_with_the_same_name() {
         let allow = allow_of(&["/usr/bin/updatedb"], |_| Some("/tmp/updatedb".into()));
-        assert!(!allow.allows(10, None, None));
+        assert!(!allow.allows(10, None));
     }
 
     #[test]
     fn an_unresolvable_process_is_not_allowed() {
         let allow = allow_of(&["/usr/bin/updatedb"], |_| None);
-        assert!(!allow.allows(10, None, None));
+        assert!(!allow.allows(10, None));
     }
 
     #[test]
     fn an_entry_outside_a_trusted_location_is_ignored() {
         let allow = allow_of(&["/tmp/updatedb"], |_| Some("/tmp/updatedb".into()));
-        assert!(!allow.allows(10, None, None));
+        assert!(!allow.allows(10, None));
     }
 
     #[test]
@@ -556,7 +569,7 @@ mod tests {
         let allow = allow_of(&["/usr/bin/updatedb"], |_| {
             Some("/usr/bin/updatedb (deleted)".into())
         });
-        assert!(!allow.allows(10, None, None));
+        assert!(!allow.allows(10, None));
     }
 
     #[cfg(target_os = "linux")]
@@ -679,7 +692,7 @@ mod tests {
     #[test]
     fn a_process_whose_exec_was_seen_is_allowed_without_reading_proc() {
         let seen = images(&[exec_of(10, Some(1), "/usr/bin/updatedb", false)]);
-        assert!(table_only("/usr/bin/updatedb").allows(10, Some(1), Some(&seen)));
+        assert!(table_only("/usr/bin/updatedb").allows(10, seen.image_of(10, Some(1)).as_ref()));
     }
 
     #[test]
@@ -688,7 +701,7 @@ mod tests {
         let allow =
             CanaryAllow::for_test("/usr/bin/updatedb", |_| Some("/usr/bin/updatedb".into()));
         assert!(
-            !allow.allows(10, Some(1), Some(&seen)),
+            !allow.allows(10, seen.image_of(10, Some(1)).as_ref()),
             "the image the agent saw wins"
         );
     }
@@ -697,25 +710,25 @@ mod tests {
     fn a_recycled_pid_is_not_taken_for_the_process_that_was_seen() {
         let seen = images(&[exec_of(10, Some(1), "/usr/bin/updatedb", false)]);
         // Another incarnation of pid 10: the entry is not its, and /proc says nothing.
-        assert!(!table_only("/usr/bin/updatedb").allows(10, Some(2), Some(&seen)));
+        assert!(!table_only("/usr/bin/updatedb").allows(10, seen.image_of(10, Some(2)).as_ref()));
     }
 
     #[test]
     fn an_unstamped_process_is_not_trusted_from_the_table() {
         let seen = images(&[exec_of(10, None, "/usr/bin/updatedb", false)]);
-        assert!(!table_only("/usr/bin/updatedb").allows(10, None, Some(&seen)));
+        assert!(!table_only("/usr/bin/updatedb").allows(10, seen.image_of(10, None).as_ref()));
     }
 
     #[test]
     fn a_process_in_a_container_is_not_allowed_even_with_an_allowed_image() {
         let seen = images(&[exec_of(10, Some(1), "/usr/bin/updatedb", true)]);
-        assert!(!table_only("/usr/bin/updatedb").allows(10, Some(1), Some(&seen)));
+        assert!(!table_only("/usr/bin/updatedb").allows(10, seen.image_of(10, Some(1)).as_ref()));
     }
 
     #[test]
     fn a_relative_exec_never_matches() {
         let seen = images(&[exec_of(10, Some(1), "./updatedb", false)]);
-        assert!(!table_only("./updatedb").allows(10, Some(1), Some(&seen)));
+        assert!(!table_only("./updatedb").allows(10, seen.image_of(10, Some(1)).as_ref()));
     }
 
     #[test]
@@ -736,7 +749,7 @@ mod tests {
                 resolve: |_| None,
             };
             let seen = images(&[exec_of(10, Some(1), &as_exec, false)]);
-            assert!(allow.allows(10, Some(1), Some(&seen)));
+            assert!(allow.allows(10, seen.image_of(10, Some(1)).as_ref()));
         }
     }
 
@@ -744,8 +757,8 @@ mod tests {
     fn a_process_the_agent_never_saw_exec_falls_back_to_proc() {
         let allow =
             CanaryAllow::for_test("/usr/bin/updatedb", |_| Some("/usr/bin/updatedb".into()));
-        assert!(allow.allows(10, Some(1), Some(&ExecImages::new())));
-        assert!(allow.allows(10, Some(1), None));
+        assert!(allow.allows(10, ExecImages::new().image_of(10, Some(1)).as_ref()));
+        assert!(allow.allows(10, None));
     }
 
     #[test]
@@ -756,5 +769,27 @@ mod tests {
         }
         assert!(images.seen.len() <= EXEC_IMAGES);
         assert!(images.seen.evicted() > 0);
+    }
+
+    #[test]
+    fn an_image_is_absolute_by_its_text_on_every_host() {
+        for absolute in [
+            "/usr/bin/updatedb",
+            "C:\\Windows\\x.exe",
+            "c:/x.exe",
+            "\\\\host\\share\\x.exe",
+        ] {
+            assert!(is_absolute_image(absolute), "{absolute}");
+        }
+        for relative in [
+            "",
+            "updatedb",
+            "./updatedb",
+            "../bin/updatedb",
+            "bin/updatedb",
+            "C:x.exe",
+        ] {
+            assert!(!is_absolute_image(relative), "{relative}");
+        }
     }
 }
