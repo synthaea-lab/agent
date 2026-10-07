@@ -107,6 +107,11 @@ pub(crate) struct DetectionSink {
     /// The planted canary files (#81), set once at start by [`Self::set_tripwires`]; empty
     /// of effect when the operator configured no `[deception]` directories.
     tripwires: std::sync::OnceLock<deception::Tripwires>,
+    /// When each `(canary, pid)` last raised a detection (event time, ns), so a tool that
+    /// opens the same canary again and again raises one finding per cooldown, not one per
+    /// open. Bounded; the hits it absorbs are counted in `canary_hits_absorbed`.
+    canary_last_hit: Mutex<store::BoundedMap<(PathBuf, u32), u64>>,
+    canary_hits_absorbed: AtomicU64,
 }
 
 /// The verdict entity an event belongs to: `(ppid, comm)` plus the incarnation of the
@@ -128,6 +133,13 @@ const RANSOMWARE_TECHNIQUE: &str = "T1486";
 /// The ATT&CK technique a canary hit reports: someone looked through files nothing
 /// legitimate reads (T1083 file and directory discovery). The rule id names the provenance.
 const CANARY_TECHNIQUE: &str = "T1083";
+
+/// How long one process's repeat touches of one canary are absorbed after a detection.
+const CANARY_COOLDOWN_NS: u64 = 60 * 1_000_000_000;
+
+/// Most `(canary, pid)` pairs the cooldown remembers; the oldest are evicted first, which
+/// at worst lets one more detection through.
+const CANARY_COOLDOWN_KEYS: usize = 1024;
 
 /// `DetectionSource::Rule` id of a canary hit. `DetectionSource` is part of the
 /// semi-frozen schema, so deception provenance rides in the rule id until a dedicated
@@ -310,6 +322,8 @@ impl DetectionSink {
             verdict,
             content_root,
             tripwires: std::sync::OnceLock::new(),
+            canary_last_hit: Mutex::new(store::BoundedMap::new(CANARY_COOLDOWN_KEYS)),
+            canary_hits_absorbed: AtomicU64::new(0),
         })
     }
 
@@ -614,6 +628,15 @@ impl DetectionSink {
             return;
         }
         let meta = event.meta();
+        if self.canary_in_cooldown(&hit.canary.path, hit.pid, meta.timestamp_ns) {
+            let absorbed = self.canary_hits_absorbed.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::debug!(
+                pid = hit.pid,
+                absorbed,
+                "deception: repeat canary touch absorbed"
+            );
+            return;
+        }
         let message = format!(
             "canary file touched: {} ({:?}) by pid {} ({})",
             hit.canary.path.display(),
@@ -632,6 +655,20 @@ impl DetectionSink {
             event,
             Vec::new(),
         );
+    }
+
+    /// True when `(path, pid)` already raised a detection within the cooldown; otherwise
+    /// records this touch as the one that did.
+    fn canary_in_cooldown(&self, path: &Path, pid: u32, now_ns: u64) -> bool {
+        let mut last = self.canary_last_hit.lock().unwrap();
+        let key = (path.to_path_buf(), pid);
+        if let Some(&at) = last.peek(&key)
+            && now_ns.saturating_sub(at) < CANARY_COOLDOWN_NS
+        {
+            return true;
+        }
+        last.insert(key, now_ns);
+        false
     }
 
     /// [`Self::record_and_emit`] for a batch of plain `rules::Alert`s (no Sigma/
@@ -1699,6 +1736,47 @@ rule response_marker {
         let alerts = alerts_in(&dir);
         assert!(alerts.contains("T1083"), "{alerts}");
         assert!(alerts.contains("canary file touched"), "{alerts}");
+    }
+
+    fn open_event_at(path: &str, pid: u32, timestamp_ns: u64) -> Event {
+        let Event::FileOpen(mut e) = open_event(path, pid) else {
+            unreachable!()
+        };
+        e.meta.timestamp_ns = timestamp_ns;
+        Event::FileOpen(e)
+    }
+
+    fn canary_alert_count(dir: &std::path::Path) -> usize {
+        alerts_in(dir).matches("canary file touched").count()
+    }
+
+    #[test]
+    fn a_process_reopening_a_canary_raises_one_detection_per_cooldown() {
+        let dir = tmp("canary-cooldown");
+        let (sink, canary) = sink_watching_canary(&dir);
+        let pid = std::process::id() + 1;
+        let t0 = 1_000_000_000_000;
+        for i in 0..5 {
+            sink.on_event(open_event_at(&canary, pid, t0 + i * 1_000_000_000));
+        }
+        assert_eq!(canary_alert_count(&dir), 1);
+        assert_eq!(sink.canary_hits_absorbed.load(Ordering::Relaxed), 4);
+        sink.on_event(open_event_at(
+            &canary,
+            pid,
+            t0 + super::CANARY_COOLDOWN_NS + 1,
+        ));
+        assert_eq!(canary_alert_count(&dir), 2);
+    }
+
+    #[test]
+    fn a_second_process_touching_the_same_canary_is_not_absorbed() {
+        let dir = tmp("canary-two-pids");
+        let (sink, canary) = sink_watching_canary(&dir);
+        let pid = std::process::id() + 1;
+        sink.on_event(open_event_at(&canary, pid, 5));
+        sink.on_event(open_event_at(&canary, pid + 1, 6));
+        assert_eq!(canary_alert_count(&dir), 2);
     }
 
     #[test]
