@@ -970,8 +970,14 @@ impl RuleState {
         let ts = event.meta.timestamp_ns;
         // A success can reach the rules before the last failures that precede
         // it (two channels, two poll threads): this failure may complete it.
+        // Only failures from the Windows Security log feed the join: they carry a
+        // Windows identity and are stamped with the event's own time, like the 1149.
+        // Application-log failures (`[logs]` sources) are stamped when the line is
+        // read, so a restart replaying a backlog would make hours-old failures look
+        // current: other clock, not joined.
         let mut alerts: Vec<Alert> = event
             .source_address
+            .filter(|_| matches!(event.meta.user, User::Windows { .. }))
             .and_then(|address| self.rdp_success.on_failure(address, ts))
             .into_iter()
             .collect();

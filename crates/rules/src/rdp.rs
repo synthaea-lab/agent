@@ -15,9 +15,10 @@
 //! future (a clock step, a stalled channel catching up) erase what a late event still
 //! needs, and the alert count would depend on delivery order again.
 //!
-//! The failures are every authentication failure with a source address, from
-//! any source (`Event::Auth` also carries application-log failures), not only
-//! RDP ones.
+//! The failures are the Windows Security-log failures that carry a source address
+//! (the caller, `RuleState::on_auth`, only passes events with a Windows identity:
+//! application-log failures are stamped when the line is read, not with event time),
+//! from any logon type, not only RDP ones.
 
 use std::{collections::VecDeque, net::IpAddr};
 
@@ -50,9 +51,15 @@ struct Source {
     failures: VecDeque<u64>,
     /// Successes, oldest first.
     successes: VecDeque<Success>,
-    /// When the last alert for this address fired: one alert per window.
-    last_alert_ns: Option<u64>,
+    /// The fixed windows (`timestamp / window`) an alert already fired for: one alert
+    /// per window per address. Fixed slots, not "within a window of the last alert":
+    /// the latter moves with the order alerts are emitted in, so the number of alerts
+    /// would depend on delivery order again (a success at 0, 400 and 700 s gave 2 or 3).
+    alerted_windows: VecDeque<u64>,
 }
+
+/// Alerted windows remembered per address. Far more than the successes kept.
+const ALERTED_WINDOWS_CAP: usize = 16;
 
 /// Per-address history that joins an RDP success to the failures before it.
 pub(crate) struct RdpSuccessAfterFailures {
@@ -127,12 +134,14 @@ impl Source {
                 .iter()
                 .filter(|&&t| t >= from && t <= success.timestamp_ns)
                 .count();
-            let recent = self.last_alert_ns.is_some_and(|last| {
-                last.abs_diff(success.timestamp_ns) <= RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS
-            });
+            let window = success.timestamp_ns / RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS;
+            let recent = self.alerted_windows.contains(&window);
             if count >= RDP_SUCCESS_AFTER_FAILURES_THRESHOLD as usize && !recent {
                 success.alerted = true;
-                self.last_alert_ns = Some(success.timestamp_ns);
+                self.alerted_windows.push_back(window);
+                if self.alerted_windows.len() > ALERTED_WINDOWS_CAP {
+                    self.alerted_windows.pop_front();
+                }
                 return Some(Alert {
                     technique: "T1021.001",
                     severity: Severity::Medium,
@@ -193,6 +202,46 @@ mod tests {
             let mut order = [0, 1, 2, 3, 4, 5];
             order.sort_by_key(|&index| (keys[index], index));
             prop_assert_eq!(fixed_game(order), 1);
+        }
+
+        #[test]
+        fn several_successes_alert_once_per_window_in_any_delivery_order(
+            successes in prop::collection::vec(301_u64..5_000, 1..=6),
+            keys in prop::collection::vec(any::<u32>(), 36),
+        ) {
+            // Each success has five failures in the seconds before it; the
+            // reference is independent of the code under test: one alert per
+            // distinct fixed window that holds a success.
+            let mut events: Vec<(bool, u64)> = Vec::new();
+            for &second in &successes {
+                for before in 1..=5 {
+                    events.push((false, (second - before) * SECOND));
+                }
+                events.push((true, second * SECOND));
+            }
+            let mut order: Vec<usize> = (0..events.len()).collect();
+            order.sort_by_key(|&index| (keys[index], index));
+
+            let mut state = RdpSuccessAfterFailures::new();
+            let alerts = order
+                .into_iter()
+                .filter_map(|index| {
+                    let (success, timestamp) = events[index];
+                    if success {
+                        state.on_success(ADDRESS, timestamp, "alice")
+                    } else {
+                        state.on_failure(ADDRESS, timestamp)
+                    }
+                })
+                .count();
+
+            let mut windows: Vec<u64> = successes
+                .iter()
+                .map(|second| second * SECOND / EXPECTED_WINDOW_NS)
+                .collect();
+            windows.sort_unstable();
+            windows.dedup();
+            prop_assert_eq!(alerts, windows.len());
         }
 
         #[test]
@@ -283,6 +332,37 @@ mod tests {
                 .iter()
                 .any(|success| success.alerted)
         );
+    }
+
+    #[test]
+    fn alert_count_for_successes_at_0_400_and_700_seconds_does_not_depend_on_order() {
+        // The review example: the second success handled first used to give 3
+        // alerts instead of 2 (the last-alert timestamp moved backwards).
+        let successes = [(5_u64, 0_u64), (405, 400), (705, 700)];
+        for order in [
+            [0, 1, 2],
+            [1, 0, 2],
+            [2, 1, 0],
+            [1, 2, 0],
+            [0, 2, 1],
+            [2, 0, 1],
+        ] {
+            let mut state = RdpSuccessAfterFailures::new();
+            let mut alerts = 0;
+            for index in order {
+                let (_, second) = successes[index];
+                for before in 1..=5 {
+                    let at = (second + 10).saturating_sub(before) * SECOND;
+                    alerts += usize::from(state.on_failure(ADDRESS, at).is_some());
+                }
+                alerts += usize::from(
+                    state
+                        .on_success(ADDRESS, (second + 10) * SECOND, "alice")
+                        .is_some(),
+                );
+            }
+            assert_eq!(alerts, 3, "order {order:?}");
+        }
     }
 
     #[test]

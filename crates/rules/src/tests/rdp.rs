@@ -1,6 +1,6 @@
 //! RDP success-after-failures rule (T1021.001).
 
-use schema::{AuthEvent, AuthOutcome, SessionEvent, SessionState, fixtures};
+use schema::{AuthEvent, AuthOutcome, SessionEvent, SessionState, User, fixtures};
 
 use super::*;
 use crate::exclusions::{
@@ -14,6 +14,10 @@ fn failure(source: &str, user: &str, ts: u64) -> AuthEvent {
     AuthEvent {
         meta: EventMeta {
             timestamp_ns: ts,
+            user: User::Windows {
+                sid: "S-1-5-18".into(),
+                integrity_level: None,
+            },
             ..meta()
         },
         outcome: AuthOutcome::Failure,
@@ -24,17 +28,17 @@ fn failure(source: &str, user: &str, ts: u64) -> AuthEvent {
 }
 
 fn connect(source: Option<&str>, user: &str, ts: u64) -> SessionEvent {
-    SessionEvent {
-        meta: EventMeta {
-            timestamp_ns: ts,
-            ..meta()
-        },
-        state: SessionState::Connect,
-        session_id: None,
-        target_user: user.to_string(),
-        source_address: source.map(|address| address.parse().unwrap()),
-        console: false,
-    }
+    let mut event = fixtures::session();
+    event.meta = EventMeta {
+        timestamp_ns: ts,
+        ..meta()
+    };
+    event.state = SessionState::Connect;
+    event.session_id = None;
+    event.target_user = user.to_string();
+    event.source_address = source.map(|address| address.parse().unwrap());
+    event.console = false;
+    event
 }
 
 #[test]
@@ -54,6 +58,23 @@ fn connect_after_five_failures_across_accounts_alerts_once_per_window() {
     assert!(alerts[0].message.contains("192.0.2.50"));
     assert!(alerts[0].message.contains("5 failed authentications"));
     assert!(state.on_session(&success).is_empty());
+}
+
+#[test]
+fn application_log_failures_do_not_feed_the_join() {
+    // A `[logs]` source stamps its failures when the line is read, not with the event's
+    // own time: they must not complete a join that runs on event time.
+    let mut state = RuleState::new();
+    for i in 0..THRESHOLD {
+        let mut failure = failure("192.0.2.50", "alice", i * SEC);
+        failure.meta.user = User::Unknown;
+        state.on_auth(&failure);
+    }
+    assert!(
+        state
+            .on_session(&connect(Some("192.0.2.50"), "alice", 10 * SEC))
+            .is_empty()
+    );
 }
 
 #[test]
