@@ -110,6 +110,8 @@ pub(crate) struct DetectionSink {
     /// Executables allowed to touch a canary without a detection (`[deception] allow_exe`),
     /// set once with the tripwires.
     canary_allow: std::sync::OnceLock<crate::deception::CanaryAllow>,
+    /// The image each process was seen to execute, so `canary_allow` need not read `/proc`.
+    exec_images: Mutex<crate::deception::ExecImages>,
     /// When each `(canary, pid, incarnation of pid)` last raised a detection (event time,
     /// ns), so a tool that reads the same canary again and again raises one finding per
     /// cooldown, not one per open. Only read opens are absorbed (see [`absorbable`]);
@@ -345,6 +347,7 @@ impl DetectionSink {
             content_root,
             tripwires: std::sync::OnceLock::new(),
             canary_allow: std::sync::OnceLock::new(),
+            exec_images: Mutex::new(crate::deception::ExecImages::new()),
             canary_last_hit: Mutex::new(store::BoundedMap::new(CANARY_COOLDOWN_KEYS)),
             canary_hits_absorbed: AtomicU64::new(0),
         })
@@ -656,11 +659,10 @@ impl DetectionSink {
         if hit.pid == std::process::id() {
             return;
         }
-        if self
-            .canary_allow
-            .get()
-            .is_some_and(|allow| allow.allows(hit.pid))
-        {
+        if self.canary_allow.get().is_some_and(|allow| {
+            let images = self.exec_images.lock().unwrap();
+            allow.allows(hit.pid, event.meta().process_generation, Some(&images))
+        }) {
             tracing::debug!(
                 pid = hit.pid,
                 "deception: canary touch by an allowed executable"
@@ -893,6 +895,7 @@ impl DetectionSink {
 
     /// Exec events: stateless rules, stateful rules, then Sigma.
     fn detect_exec(&self, wrapped: &Event, event: &schema::ExecEvent) {
+        self.exec_images.lock().unwrap().record(event);
         self.record_rule_alerts(wrapped, rules::evaluate_exec(event));
         self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_exec(event));
         let sigma_guard = self.sigma.lock().unwrap();
@@ -1911,6 +1914,41 @@ rule response_marker {
         ));
         sink.on_event(open_event(&canary, std::process::id() + 1));
         assert_eq!(canary_alert_count(&dir), 0);
+    }
+
+    #[test]
+    fn a_process_seen_to_exec_an_allowed_image_may_touch_a_canary_without_proc() {
+        let dir = tmp("canary-exec-image");
+        let (sink, canary) = sink_watching_canary(&dir);
+        // The /proc fallback resolves nothing: only the Exec the sink saw can allow.
+        sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
+            "/usr/bin/updatedb",
+            |_| None,
+        ));
+        let pid = std::process::id() + 1;
+        let mut exec = schema::fixtures::exec();
+        exec.meta.pid = pid;
+        exec.meta.process_generation = Some(3);
+        exec.image_path = "/usr/bin/updatedb".into();
+        sink.on_event(Event::Exec(exec));
+        let mut open = schema::fixtures::file_open();
+        open.path = canary.clone();
+        open.meta.pid = pid;
+        open.meta.process_generation = Some(3);
+        sink.on_event(Event::FileOpen(open));
+        assert_eq!(
+            canary_alert_count(&dir),
+            0,
+            "an allowed image raises no hit"
+        );
+
+        // The same pid, another incarnation that never exec'd: not allowed.
+        let mut other = schema::fixtures::file_open();
+        other.path = canary;
+        other.meta.pid = pid;
+        other.meta.process_generation = Some(4);
+        sink.on_event(Event::FileOpen(other));
+        assert_eq!(canary_alert_count(&dir), 1, "a recycled pid raises the hit");
     }
 
     #[test]

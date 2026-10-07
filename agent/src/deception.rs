@@ -53,16 +53,74 @@ fn load_or_create_seed(state_dir: &Path) -> io::Result<Seed> {
     Ok(Seed::from_bytes(bytes))
 }
 
+/// What the agent saw when a process executed: the image the sensor reported, and whether the
+/// process runs in a container. Kept per pid by [`ExecImages`], so that allowing a process
+/// does not depend on reading `/proc` (which needs `CAP_SYS_PTRACE` for another user's).
+#[derive(Clone, Debug)]
+pub(crate) struct ExecImage {
+    path: String,
+    /// The process incarnation (`process_generation`) that exec'd it, when the sensor stamps one.
+    generation: Option<u64>,
+    in_container: bool,
+}
+
+/// Bounded `pid -> image` table fed by `Exec` events. Newest wins (a process that execs again
+/// replaces its entry); eviction is counted by the map and costs a `/proc` fallback.
+pub(crate) struct ExecImages {
+    seen: store::BoundedMap<u32, ExecImage>,
+}
+
+/// Most pids remembered. An exec is short-lived state: the oldest are dropped first.
+const EXEC_IMAGES: usize = 8192;
+
+impl ExecImages {
+    pub(crate) fn new() -> Self {
+        Self {
+            seen: store::BoundedMap::new(EXEC_IMAGES),
+        }
+    }
+
+    /// Records the image a process executed.
+    pub(crate) fn record(&mut self, exec: &schema::ExecEvent) {
+        self.seen.insert(
+            exec.meta.pid,
+            ExecImage {
+                path: exec.image_path.clone(),
+                generation: exec.meta.process_generation,
+                in_container: exec.meta.container.is_some(),
+            },
+        );
+    }
+
+    /// The image `pid` was seen to execute, if it was and the entry is of this incarnation:
+    /// both stamped and equal. An unstamped side is not enough to tell a recycled pid, so it
+    /// is not trusted (the caller falls back to `/proc`).
+    pub(crate) fn image_of(&self, pid: u32, generation: Option<u64>) -> Option<ExecImage> {
+        let seen = self.seen.peek(&pid)?;
+        match (seen.generation, generation) {
+            (Some(a), Some(b)) if a == b => Some(seen.clone()),
+            _ => None,
+        }
+    }
+}
+
 /// Executables the operator declared as legitimate canary readers (indexers, backup
-/// agents), matched on the toucher's resolved image path.
+/// agents), matched on the toucher's image, never its name.
 ///
-/// An allow-list keyed on `comm` would let any process rename itself past the tripwire, so
-/// the entry must match `/proc/<pid>/exe` and sit in a trusted system location
-/// (`policy::name_exclusion_applies`). Anything that cannot be resolved (the process
-/// already exited, a non-Linux platform, a binary replaced since: `... (deleted)`) is not
-/// allowed. This fails closed, the opposite of the exclusions that keep an unknown path.
+/// An allow-list keyed on `comm` would let any process rename itself past the tripwire. The
+/// image comes from the process's own `Exec` event when the agent saw it start (the kernel's
+/// `bprm->filename`, which is what the sensor reports as `image_path`), and from
+/// `/proc/<pid>/exe` otherwise (a process that predates the agent). Either way the entry sits
+/// in a trusted system location (`policy::name_exclusion_applies`) and anything that cannot be
+/// resolved (the process exited, a non-Linux platform, a binary replaced since: `(deleted)`,
+/// a container, a relative exec) is not allowed. This fails closed, the opposite of the
+/// exclusions that keep an unknown path.
 pub(crate) struct CanaryAllow {
+    /// Entries as `/proc/<pid>/exe` shows them (symlinks resolved).
     exes: Vec<PathBuf>,
+    /// The same entries as the operator wrote them: an exec through the link's name
+    /// (`/usr/bin/updatedb`) is reported as written, not resolved.
+    as_written: Vec<PathBuf>,
     resolve: fn(u32) -> Option<PathBuf>,
 }
 
@@ -77,35 +135,61 @@ impl CanaryAllow {
         config: &config::DeceptionConfig,
         resolve: fn(u32) -> Option<PathBuf>,
     ) -> Self {
-        let exes = config
-            .allow_exe
-            .iter()
-            .map(|exe| canonical_entry(exe))
-            .filter(|exe| {
-                let trusted = policy::name_exclusion_applies(exe.to_str());
-                if !trusted {
-                    tracing::warn!(
-                        exe = %exe.display(),
-                        "deception: allow_exe entry is not in a trusted system location, ignored"
-                    );
-                }
-                trusted && exe.to_str().is_some_and(|p| !p.is_empty())
-            })
-            .collect();
-        Self { exes, resolve }
+        let mut exes = Vec::new();
+        let mut as_written = Vec::new();
+        for written in &config.allow_exe {
+            let canonical = canonical_entry(written);
+            let trusted = policy::name_exclusion_applies(canonical.to_str());
+            if !trusted {
+                tracing::warn!(
+                    exe = %canonical.display(),
+                    "deception: allow_exe entry is not in a trusted system location, ignored"
+                );
+            }
+            if trusted && canonical.to_str().is_some_and(|p| !p.is_empty()) {
+                exes.push(canonical);
+                as_written.push(written.clone());
+            }
+        }
+        Self {
+            exes,
+            as_written,
+            resolve,
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn for_test(exe: &str, resolve: fn(u32) -> Option<PathBuf>) -> Self {
         Self {
             exes: vec![PathBuf::from(exe)],
+            as_written: vec![PathBuf::from(exe)],
             resolve,
         }
     }
 
-    /// Whether `pid` runs an allowed executable.
-    pub(crate) fn allows(&self, pid: u32) -> bool {
-        !self.exes.is_empty() && (self.resolve)(pid).is_some_and(|exe| self.exes.contains(&exe))
+    /// Whether the process `pid` (of incarnation `generation`) runs an allowed executable.
+    /// `seen` is what the agent recorded when it executed, if anything.
+    pub(crate) fn allows(
+        &self,
+        pid: u32,
+        generation: Option<u64>,
+        seen: Option<&ExecImages>,
+    ) -> bool {
+        if self.exes.is_empty() {
+            return false;
+        }
+        if let Some(image) = seen.and_then(|images| images.image_of(pid, generation)) {
+            return !image.in_container && self.matches_image(&image.path);
+        }
+        (self.resolve)(pid).is_some_and(|exe| self.exes.contains(&exe))
+    }
+
+    /// An absolute image equal to an entry, resolved or as written. A relative exec
+    /// (`./updatedb`) names nothing and never matches.
+    fn matches_image(&self, image: &str) -> bool {
+        let path = Path::new(image);
+        path.is_absolute()
+            && (self.exes.iter().any(|e| e == path) || self.as_written.iter().any(|e| e == path))
     }
 }
 
@@ -446,25 +530,25 @@ mod tests {
     #[test]
     fn a_process_running_an_allowed_system_executable_is_allowed() {
         let allow = allow_of(&["/usr/bin/updatedb"], |_| Some("/usr/bin/updatedb".into()));
-        assert!(allow.allows(10));
+        assert!(allow.allows(10, None, None));
     }
 
     #[test]
     fn another_executable_is_not_allowed_even_with_the_same_name() {
         let allow = allow_of(&["/usr/bin/updatedb"], |_| Some("/tmp/updatedb".into()));
-        assert!(!allow.allows(10));
+        assert!(!allow.allows(10, None, None));
     }
 
     #[test]
     fn an_unresolvable_process_is_not_allowed() {
         let allow = allow_of(&["/usr/bin/updatedb"], |_| None);
-        assert!(!allow.allows(10));
+        assert!(!allow.allows(10, None, None));
     }
 
     #[test]
     fn an_entry_outside_a_trusted_location_is_ignored() {
         let allow = allow_of(&["/tmp/updatedb"], |_| Some("/tmp/updatedb".into()));
-        assert!(!allow.allows(10));
+        assert!(!allow.allows(10, None, None));
     }
 
     #[test]
@@ -472,7 +556,7 @@ mod tests {
         let allow = allow_of(&["/usr/bin/updatedb"], |_| {
             Some("/usr/bin/updatedb (deleted)".into())
         });
-        assert!(!allow.allows(10));
+        assert!(!allow.allows(10, None, None));
     }
 
     #[cfg(target_os = "linux")]
@@ -559,5 +643,118 @@ mod tests {
     fn an_entry_that_does_not_resolve_is_kept_as_written() {
         let missing = Path::new("/usr/sbin/not-installed-here");
         assert_eq!(canonical_entry(missing), missing);
+    }
+
+    fn exec_of(
+        pid: u32,
+        generation: Option<u64>,
+        image: &str,
+        in_container: bool,
+    ) -> schema::ExecEvent {
+        let mut e = schema::fixtures::exec();
+        e.meta.pid = pid;
+        e.meta.process_generation = generation;
+        e.meta.container = in_container.then(|| schema::ContainerContext {
+            id: "abc".into(),
+            image: None,
+            name: None,
+        });
+        e.image_path = image.into();
+        e
+    }
+
+    fn images(execs: &[schema::ExecEvent]) -> ExecImages {
+        let mut images = ExecImages::new();
+        for e in execs {
+            images.record(e);
+        }
+        images
+    }
+
+    /// An allow-list whose `/proc` fallback always fails: only the exec table can allow.
+    fn table_only(entry: &str) -> CanaryAllow {
+        CanaryAllow::for_test(entry, |_| None)
+    }
+
+    #[test]
+    fn a_process_whose_exec_was_seen_is_allowed_without_reading_proc() {
+        let seen = images(&[exec_of(10, Some(1), "/usr/bin/updatedb", false)]);
+        assert!(table_only("/usr/bin/updatedb").allows(10, Some(1), Some(&seen)));
+    }
+
+    #[test]
+    fn the_exec_table_overrides_what_proc_would_say() {
+        let seen = images(&[exec_of(10, Some(1), "/tmp/encryptor", false)]);
+        let allow =
+            CanaryAllow::for_test("/usr/bin/updatedb", |_| Some("/usr/bin/updatedb".into()));
+        assert!(
+            !allow.allows(10, Some(1), Some(&seen)),
+            "the image the agent saw wins"
+        );
+    }
+
+    #[test]
+    fn a_recycled_pid_is_not_taken_for_the_process_that_was_seen() {
+        let seen = images(&[exec_of(10, Some(1), "/usr/bin/updatedb", false)]);
+        // Another incarnation of pid 10: the entry is not its, and /proc says nothing.
+        assert!(!table_only("/usr/bin/updatedb").allows(10, Some(2), Some(&seen)));
+    }
+
+    #[test]
+    fn an_unstamped_process_is_not_trusted_from_the_table() {
+        let seen = images(&[exec_of(10, None, "/usr/bin/updatedb", false)]);
+        assert!(!table_only("/usr/bin/updatedb").allows(10, None, Some(&seen)));
+    }
+
+    #[test]
+    fn a_process_in_a_container_is_not_allowed_even_with_an_allowed_image() {
+        let seen = images(&[exec_of(10, Some(1), "/usr/bin/updatedb", true)]);
+        assert!(!table_only("/usr/bin/updatedb").allows(10, Some(1), Some(&seen)));
+    }
+
+    #[test]
+    fn a_relative_exec_never_matches() {
+        let seen = images(&[exec_of(10, Some(1), "./updatedb", false)]);
+        assert!(!table_only("./updatedb").allows(10, Some(1), Some(&seen)));
+    }
+
+    #[test]
+    fn an_exec_through_the_name_the_operator_wrote_matches_a_resolved_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("updatedb.plocate");
+        fs::write(&target, b"x").unwrap();
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("updatedb");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            // The sensor reports the path the exec was given: the link's name.
+            let as_exec = link.to_string_lossy().into_owned();
+            let canonical = fs::canonicalize(&target).unwrap();
+            let allow = CanaryAllow {
+                exes: vec![canonical],
+                as_written: vec![link],
+                resolve: |_| None,
+            };
+            let seen = images(&[exec_of(10, Some(1), &as_exec, false)]);
+            assert!(allow.allows(10, Some(1), Some(&seen)));
+        }
+    }
+
+    #[test]
+    fn a_process_the_agent_never_saw_exec_falls_back_to_proc() {
+        let allow =
+            CanaryAllow::for_test("/usr/bin/updatedb", |_| Some("/usr/bin/updatedb".into()));
+        assert!(allow.allows(10, Some(1), Some(&ExecImages::new())));
+        assert!(allow.allows(10, Some(1), None));
+    }
+
+    #[test]
+    fn the_exec_table_is_bounded() {
+        let mut images = ExecImages::new();
+        for pid in 0..(EXEC_IMAGES as u32 + 100) {
+            images.record(&exec_of(pid, Some(1), "/usr/bin/x", false));
+        }
+        assert!(images.seen.len() <= EXEC_IMAGES);
+        assert!(images.seen.evicted() > 0);
     }
 }
