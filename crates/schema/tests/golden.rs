@@ -18,10 +18,10 @@ use schema::{
     KernelModuleEvent, LdapSearchEvent, ListenPortEvent, MemfdCreateEvent, MountEvent,
     NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, POLICY_MECHANISM_SELINUX,
     PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
-    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType, SignalEvent,
-    SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TccDecisionEvent,
-    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, User,
-    WmiActivityEvent, XpcConnectEvent,
+    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent, SessionState, ShellType,
+    SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent,
+    TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent,
+    User, WmiActivityEvent, XpcConnectEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -919,6 +919,72 @@ fn auth_logon_golden() {
         }),
         "auth_logon",
     );
+}
+
+#[test]
+fn session_reconnect_golden() {
+    // An RDP client attached to a disconnected session (LocalSessionManager
+    // 25): the session number and the client's address are what the
+    // hijack rule compares across the disconnect and the reconnect.
+    assert_golden(
+        &Event::Session(SessionEvent {
+            meta: session_meta(),
+            state: SessionState::Reconnect,
+            session_id: Some(2),
+            target_user: r"LAB\alice".into(),
+            source_address: Some("198.51.100.40".parse::<IpAddr>().unwrap()),
+            console: false,
+        }),
+        "session_reconnect",
+    );
+}
+
+#[test]
+fn session_connect_golden() {
+    // RemoteConnectionManager 1149: before any session exists, so no
+    // `session_id` (absent, not null).
+    assert_golden(
+        &Event::Session(SessionEvent {
+            meta: session_meta(),
+            state: SessionState::Connect,
+            session_id: None,
+            target_user: r"LAB\alice".into(),
+            source_address: Some("198.51.100.40".parse::<IpAddr>().unwrap()),
+            console: false,
+        }),
+        "session_connect",
+    );
+}
+
+#[test]
+fn session_console_logoff_golden() {
+    // A logoff names no client: `console` false and no address, which is
+    // not the same as the console (`Address` = `LOCAL` on a 21/24/25).
+    assert_golden(
+        &Event::Session(SessionEvent {
+            meta: session_meta(),
+            state: SessionState::Logoff,
+            session_id: Some(1),
+            target_user: r"LAB\alice".into(),
+            source_address: None,
+            console: false,
+        }),
+        "session_logoff",
+    );
+}
+
+/// The reporting service, not an actor: Terminal Services' svchost pid.
+fn session_meta() -> EventMeta {
+    EventMeta {
+        pid: 2312,
+        ppid: 0,
+        user: User::Unknown,
+        timestamp_ns: 1_759_600_000_000_000_000,
+        comm: String::new(),
+        container: None,
+        process_generation: None,
+        parent_process_generation: None,
+    }
 }
 
 #[test]
@@ -2043,6 +2109,14 @@ fn meta_accessor_covers_all_variants() {
             target_user_sid: None,
             source_address: None,
             status_code: None,
+        }),
+        Event::Session(SessionEvent {
+            meta: meta.clone(),
+            state: SessionState::Logon,
+            session_id: None,
+            target_user: String::new(),
+            source_address: None,
+            console: false,
         }),
         Event::ListenPort(ListenPortEvent {
             meta: meta.clone(),

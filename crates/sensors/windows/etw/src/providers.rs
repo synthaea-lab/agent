@@ -13,7 +13,7 @@ use ferrisetw::{
     schema_locator::SchemaLocator,
 };
 use schema::{
-    AmsiContentEvent, AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, ExecEvent,
+    AmsiContentEvent, AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent,
     FileOpenEvent, ImageLoadEvent, LdapSearchEvent, RegistrySetEvent, ScriptBlockEvent,
     SmbConnectEvent, UdpSendEvent, WmiActivityEvent, sensor::EventSink,
 };
@@ -250,9 +250,10 @@ pub(crate) fn network_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
 pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
         let eid = record.event_id();
-        // 12=NameCreate; 30=CreateNewFile (F-6 partial — delete/rename semantics
-        // need schema variants and land with #82/#39).
-        if eid != 12 && eid != 30 {
+        // 12=NameCreate; 30=CreateNewFile; 26=DeletePath, for mark-of-the-web
+        // removal only (F-6 partial — general delete/rename semantics land with
+        // #82/#39).
+        if eid != 12 && eid != 26 && eid != 30 {
             return;
         }
         state.events_seen.fetch_add(1, Ordering::Relaxed);
@@ -269,6 +270,12 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         let Some(comm) = state.pids.lock().unwrap().get(pid).map(basename) else {
             return;
         };
+        if eid == 26 {
+            forward_mark_removal(&parser, &state, sink.as_ref(), || {
+                meta(pid, 0, comm, timestamp_ns)
+            });
+            return;
+        }
 
         let flags = if eid == 30 {
             0o101 // CreateNewFile: create+write by definition
@@ -305,6 +312,35 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
     Provider::by_guid(KERNEL_FILE_GUID)
         .add_callback(callback)
         .build()
+}
+
+/// Kernel-File 26 (`DeletePath`, `FilePath` field): forwards the deletion of a
+/// `:Zone.Identifier` stream — the mark-of-the-web being removed by
+/// `Unblock-File`, `Remove-Item -Stream` or Explorer's "Unblock" (T1553.005,
+/// #442) — as a `FileDelete` of the stream path. Every other delete is
+/// dropped: Windows delete semantics in general land with the minifilter
+/// (#136), which also sees what this userland path can't.
+///
+/// The stream check runs on the raw NT path first, so the path normalization
+/// (volume map, 8.3 expansion) and the token lookup behind `meta` only run
+/// for the rare matching delete, never for the host's whole delete volume on
+/// the ETW thread (#481, #408).
+///
+/// Not distinguished: a disposition call that *clears* delete-on-close. The
+/// event doesn't carry the flag's value, and un-deleting a mark is not
+/// something tools do.
+fn forward_mark_removal(
+    parser: &Parser<'_, '_>,
+    state: &SharedState,
+    sink: &dyn EventSink,
+    meta: impl FnOnce() -> EventMeta,
+) {
+    let raw_path: String = parser.try_parse("FilePath").unwrap_or_default();
+    if let Some(removal) =
+        zone_identifier::mark_removal(&raw_path, |raw| state.normalize_path(raw), meta)
+    {
+        sink.on_event(Event::FileDelete(removal));
+    }
 }
 
 /// DNS resolution events (EID 3008 — `QueryCompleted`).

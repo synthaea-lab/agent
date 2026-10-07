@@ -160,6 +160,7 @@ mod tests {
                 &alerts,
                 Some(&events),
                 None,
+                None,
                 &alerts_dir.join("content"),
                 &alerts_dir.join("ml-registry"),
             )
@@ -203,6 +204,7 @@ mod tests {
                 &alerts,
                 Some(&events),
                 None,
+                None,
                 &alerts_dir.join("content"),
                 &alerts_dir.join("ml-registry"),
             )
@@ -244,6 +246,7 @@ mod tests {
                 rules::RuleState::new(),
                 &alerts,
                 Some(&events),
+                None,
                 None,
                 &alerts_dir.join("content"),
                 &alerts_dir.join("ml-registry"),

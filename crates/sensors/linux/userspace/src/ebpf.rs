@@ -1,6 +1,6 @@
-//! Loading and attaching the eBPF side: the embedded object, the tracepoint
+//! Loading and attaching the eBPF side: the embedded object, the raw tracepoint
 //! programs, and the `PROC_LINEAGE` map seeding. The public pieces
-//! (`load_ebpf`, `load_program`, [`TRACEPOINTS`]) also serve the agent's
+//! (`load_ebpf`, `load_program`, [`RAW_TRACEPOINTS`]) also serve the agent's
 //! preflight, which loads programs without attaching them. Split out of
 //! `sensor.rs` when that file had accumulated five concerns.
 
@@ -13,124 +13,15 @@ pub(crate) fn err(msg: String) -> SensorError {
     msg.into()
 }
 
-/// The tracepoints implemented to date: (program, category, name). `sched_process_fork`
-/// and `sched_process_exit` maintain the `PROC_LINEAGE` map (parent pid/comm) that the
-/// other probes read — attach them first so it is populating before events flow.
-///
-/// Both `sys_enter_openat` and `sys_enter_open` are attached: musl (and every busybox
-/// applet linked against it) still issues the plain `open(2)` syscall directly, while
-/// glibc rewrites `open()` into `openat(AT_FDCWD, ...)` since 2.26 — attaching only one
-/// of the two misses file opens on whichever libc doesn't use it. Both feed the same
-/// `FileOpenEvent`/`file_open` event type.
-///
-/// `sys_enter_write` (write/delete/rename telemetry, issue #262) covers `write(2)`
-/// only — `writev`/`pwrite64`/`pwritev` are not yet attached. `sys_enter_unlink`/
-/// `sys_enter_unlinkat` and `sys_enter_rename`/`sys_enter_renameat`/
-/// `sys_enter_renameat2` are each attached in pairs/triples for the same libc-variant
-/// reason as open above. `sys_enter_chmod`/`sys_enter_fchmodat` and
-/// `sys_enter_chown`/`sys_enter_lchown`/`sys_enter_fchownat` (issue #262 Phase 2)
-/// follow the same pattern — the fd-only variants (`fchmod`/`fchown`) are deferred.
-///
-/// `sys_enter_accept{,4}`/`sys_exit_accept{,4}` (issue #263 Phase 2) are this
-/// sensor's first `sys_exit_*` attachments — `accept`/`accept4`'s peer address is
-/// only populated once the kernel-side call returns, so the enter and exit halves
-/// are attached as a pair (`ebpf/src/main.rs`'s `ACCEPT_ARGS` map correlates them).
-///
-/// `sys_enter_recvfrom`/`sys_exit_recvfrom` (issue #263) use the same pair for the
-/// sender's address (`ebpf/src/main.rs`'s `RECVFROM_ARGS`).
-///
-/// `sys_enter_setxattr`/`sys_enter_removexattr` (issue #262 Phase 3) cover the
-/// plain path-taking syscalls only — `lsetxattr`/`fsetxattr` (symlink/fd-only
-/// variants) are deferred, same posture as `chmod`/`chown`'s fd-only siblings.
-///
-/// `sys_enter_mount`/`sys_enter_umount` (issue #362) feed `Event::Mount` — note
-/// `sys_enter_umount`, not `sys_enter_umount2`: glibc's `umount2(2)` libc wrapper
-/// maps to a kernel syscall the kernel itself names plain `umount`
-/// (`fs/namespace.c`'s `SYSCALL_DEFINE2(umount, ...)`), confirmed live on the lab
-/// (`sys_enter_umount2` does not exist). `move_mount(2)` is deferred (see
-/// `sensor-linux-wire`'s `WIRE_VERSION` v13 changelog). `sys_enter_kill`/
-/// `sys_enter_tgkill` feed `Event::Signal`, filtered
-/// kernel-side to the agent's own pid by `SIGNAL_WATCH_PID` — [`write_signal_watch_pid`]
-/// **must** run before these two are attached, same ordering requirement
-/// `prime_proc_lineage` documents for the fork/exit pair above. `sys_enter_tkill` is
-/// not attached — see `sensor-linux-wire`'s `WIRE_VERSION` v13 changelog for why.
-///
-/// `sys_enter_ptrace`/`sys_enter_process_vm_readv`/`sys_enter_process_vm_writev`/
-/// `sys_enter_memfd_create` (issue #265) round out process injection/debugging
-/// telemetry — no libc-variant pairing needed, each has exactly one syscall name.
-pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
-    ("sched_process_fork", "sched", "sched_process_fork"),
-    ("sched_process_exit", "sched", "sched_process_exit"),
-    ("sched_process_exec", "sched", "sched_process_exec"),
-    ("sys_enter_openat", "syscalls", "sys_enter_openat"),
-    ("sys_enter_open", "syscalls", "sys_enter_open"),
-    ("sys_enter_connect", "syscalls", "sys_enter_connect"),
-    ("sys_enter_write", "syscalls", "sys_enter_write"),
-    ("sys_enter_unlink", "syscalls", "sys_enter_unlink"),
-    ("sys_enter_unlinkat", "syscalls", "sys_enter_unlinkat"),
-    ("sys_enter_rename", "syscalls", "sys_enter_rename"),
-    ("sys_enter_renameat", "syscalls", "sys_enter_renameat"),
-    ("sys_enter_renameat2", "syscalls", "sys_enter_renameat2"),
-    ("sys_enter_bind", "syscalls", "sys_enter_bind"),
-    ("sys_enter_chmod", "syscalls", "sys_enter_chmod"),
-    ("sys_enter_fchmodat", "syscalls", "sys_enter_fchmodat"),
-    ("sys_enter_chown", "syscalls", "sys_enter_chown"),
-    ("sys_enter_lchown", "syscalls", "sys_enter_lchown"),
-    ("sys_enter_fchownat", "syscalls", "sys_enter_fchownat"),
-    ("sys_enter_sendto", "syscalls", "sys_enter_sendto"),
-    ("sys_enter_listen", "syscalls", "sys_enter_listen"),
-    ("sys_enter_accept", "syscalls", "sys_enter_accept"),
-    ("sys_enter_accept4", "syscalls", "sys_enter_accept4"),
-    ("sys_exit_accept", "syscalls", "sys_exit_accept"),
-    ("sys_exit_accept4", "syscalls", "sys_exit_accept4"),
-    ("sys_enter_recvfrom", "syscalls", "sys_enter_recvfrom"),
-    ("sys_exit_recvfrom", "syscalls", "sys_exit_recvfrom"),
-    ("sys_enter_setxattr", "syscalls", "sys_enter_setxattr"),
-    ("sys_enter_removexattr", "syscalls", "sys_enter_removexattr"),
-    ("sys_enter_mount", "syscalls", "sys_enter_mount"),
-    ("sys_enter_umount", "syscalls", "sys_enter_umount"),
-    ("sys_enter_kill", "syscalls", "sys_enter_kill"),
-    ("sys_enter_tgkill", "syscalls", "sys_enter_tgkill"),
-    ("sys_enter_init_module", "syscalls", "sys_enter_init_module"),
-    (
-        "sys_enter_finit_module",
-        "syscalls",
-        "sys_enter_finit_module",
-    ),
-    (
-        "sys_enter_delete_module",
-        "syscalls",
-        "sys_enter_delete_module",
-    ),
-    ("sys_enter_bpf", "syscalls", "sys_enter_bpf"),
-    ("sys_enter_prctl", "syscalls", "sys_enter_prctl"),
-    ("sys_enter_ptrace", "syscalls", "sys_enter_ptrace"),
-    (
-        "sys_enter_process_vm_readv",
-        "syscalls",
-        "sys_enter_process_vm_readv",
-    ),
-    (
-        "sys_enter_process_vm_writev",
-        "syscalls",
-        "sys_enter_process_vm_writev",
-    ),
-    (
-        "sys_enter_memfd_create",
-        "syscalls",
-        "sys_enter_memfd_create",
-    ),
-    // Pairs with the enter probe above: the returned fd only exists here (#510).
-    ("sys_exit_memfd_create", "syscalls", "sys_exit_memfd_create"),
-    ("sys_enter_setuid", "syscalls", "sys_enter_setuid"),
-    ("sys_enter_setgid", "syscalls", "sys_enter_setgid"),
-    ("sys_enter_setresuid", "syscalls", "sys_enter_setresuid"),
-    ("sys_enter_setresgid", "syscalls", "sys_enter_setresgid"),
-    ("sys_enter_setfsuid", "syscalls", "sys_enter_setfsuid"),
-    ("sys_enter_setfsgid", "syscalls", "sys_enter_setfsgid"),
-    ("sys_enter_capset", "syscalls", "sys_enter_capset"),
-    ("sys_enter_setns", "syscalls", "sys_enter_setns"),
-    ("sys_enter_unshare", "syscalls", "sys_enter_unshare"),
+/// Raw tracepoints attached by the sensor: three scheduler hooks and shared
+/// syscall entry/exit routers. The routers preserve the syscall handlers,
+/// including the paired `accept`, `recvfrom`, and `memfd_create` exit events.
+pub const RAW_TRACEPOINTS: &[(&str, &str)] = &[
+    ("raw_sched_process_fork", "sched_process_fork"),
+    ("raw_sched_process_exit", "sched_process_exit"),
+    ("raw_sched_process_exec", "sched_process_exec"),
+    ("raw_sys_enter", "sys_enter"),
+    ("raw_sys_exit", "sys_exit"),
 ];
 
 /// `sensor_linux_wire::LineageEntry` is `repr(C)` over two `u32`, a `[u8; 16]` and a `u64`,
@@ -167,58 +58,34 @@ pub fn load_ebpf() -> Result<aya::Ebpf, SensorError> {
         tracing::debug!(ret, "remove limit on locked memory failed");
     }
 
-    load_embedded(None).map_err(|e| err(format!("failed to load the eBPF object: {e}")))
+    load_embedded(None)
 }
 
 #[cfg(ebpf_embedded)]
-fn load_embedded(tamper_pin: Option<&std::path::Path>) -> Result<aya::Ebpf, aya::EbpfError> {
-    // `sched_process_fork`'s record layout differs across kernels (issue #415): feed
-    // the probe the running kernel's offsets, or leave it disabled (it then inserts
-    // nothing, and lineage falls back to the `/proc` priming snapshot) rather than
-    // let it read garbage pids at a compiled-in guess.
-    let fork = crate::tracefs::read_fork_layout();
-    let (known, comm_offset, comm_data_loc, parent_pid_offset, child_pid_offset) = match fork {
-        Some(l) => {
-            tracing::info!(
-                parent_comm_offset = l.parent_comm_offset,
-                parent_comm_data_loc = l.parent_comm_data_loc,
-                parent_pid_offset = l.parent_pid_offset,
-                child_pid_offset = l.child_pid_offset,
-                "sched_process_fork layout read from tracefs"
-            );
-            (
-                1u32,
-                l.parent_comm_offset,
-                u32::from(l.parent_comm_data_loc),
-                l.parent_pid_offset,
-                l.child_pid_offset,
-            )
-        }
-        None => {
-            tracing::warn!(
-                "sched_process_fork format unreadable or unrecognised (tracefs not mounted \
-                 at /sys/kernel/tracing or /sys/kernel/debug/tracing?) — fork lineage \
-                 disabled; exec events keep the parent only for processes primed from \
-                 /proc at startup"
-            );
-            (0, 8, 0, 24, 44)
-        }
-    };
+fn load_embedded(tamper_pin: Option<&std::path::Path>) -> Result<aya::Ebpf, SensorError> {
+    let offsets = crate::btf::read_scheduler_field_offsets().map_err(|e| {
+        err(format!(
+            "could not read required fields from kernel BTF: {e}"
+        ))
+    })?;
 
     let mut loader = aya::EbpfLoader::new();
     loader
-        .override_global("FORK_LAYOUT_KNOWN", &known, true)
-        .override_global("FORK_PARENT_COMM_OFFSET", &comm_offset, true)
-        .override_global("FORK_PARENT_COMM_DATA_LOC", &comm_data_loc, true)
-        .override_global("FORK_PARENT_PID_OFFSET", &parent_pid_offset, true)
-        .override_global("FORK_CHILD_PID_OFFSET", &child_pid_offset, true);
+        .override_global("TASK_PID_OFFSET", &offsets.task_pid, true)
+        .override_global("TASK_COMM_OFFSET", &offsets.task_comm, true)
+        .override_global("BINPRM_FILENAME_OFFSET", &offsets.binprm_filename, true)
+        .override_global("SYSCALL_ARG_OFFSETS", &offsets.syscall_args, true);
     if let Some(path) = tamper_pin {
         loader.map_pin_path("SIGNAL_TAMPER_LAST", path);
     }
-    loader.load(aya::include_bytes_aligned!(concat!(
-        env!("OUT_DIR"),
-        "/sensor-linux-ebpf"
-    )))
+    let mut ebpf = loader
+        .load(aya::include_bytes_aligned!(concat!(
+            env!("OUT_DIR"),
+            "/sensor-linux-ebpf"
+        )))
+        .map_err(|e| err(format!("failed to load eBPF object: {e}")))?;
+    crate::syscall::populate_dispatch(&mut ebpf)?;
+    Ok(ebpf)
 }
 
 /// bpffs directory holding the agent's pinned maps (issue #362).
@@ -354,39 +221,38 @@ pub(crate) fn load_ebpf_for_run() -> Result<aya::Ebpf, SensorError> {
     load_ebpf()
 }
 
-/// Loads (kernel verifier included) the program `program_name` without attaching it.
+/// Loads (kernel verifier included) the raw-tracepoint program `program_name` without attaching it.
 ///
 /// # Errors
 ///
 /// Returns [`SensorError`] when the program is missing from the eBPF object, is
-/// not a tracepoint, or is rejected by the kernel verifier.
+/// not a raw tracepoint, or is rejected by the kernel verifier.
 pub fn load_program(ebpf: &mut aya::Ebpf, program_name: &str) -> Result<(), SensorError> {
-    let program: &mut aya::programs::TracePoint = ebpf
+    let program: &mut aya::programs::RawTracePoint = ebpf
         .program_mut(program_name)
         .ok_or_else(|| err(format!("program `{program_name}` not found in eBPF object")))?
         .try_into()
-        .map_err(|e| err(format!("`{program_name}` is not a tracepoint: {e}")))?;
+        .map_err(|e| err(format!("`{program_name}` is not a raw tracepoint: {e}")))?;
     program
         .load()
         .map_err(|e| err(format!("kernel verifier rejected `{program_name}`: {e}")))?;
     Ok(())
 }
 
-pub(crate) fn attach_tracepoint(
+pub(crate) fn attach_raw_tracepoint(
     ebpf: &mut aya::Ebpf,
     program_name: &str,
-    category: &str,
-    name: &str,
+    tracepoint: &str,
 ) -> Result<(), SensorError> {
     load_program(ebpf, program_name)?;
-    let program: &mut aya::programs::TracePoint = ebpf
+    let program: &mut aya::programs::RawTracePoint = ebpf
         .program_mut(program_name)
         .expect("loaded just above")
         .try_into()
         .expect("checked just above");
-    program.attach(category, name).map_err(|e| {
+    program.attach(tracepoint).map_err(|e| {
         err(format!(
-            "failed to attach {category}:{name} tracepoint (needs CAP_BPF/root): {e}"
+            "failed to attach raw tracepoint `{tracepoint}` (needs CAP_BPF and CAP_PERFMON or root): {e}"
         ))
     })?;
     Ok(())

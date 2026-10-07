@@ -238,39 +238,92 @@ fn build_agent(config: &TransportConfig) -> Result<ureq::Agent> {
         .timeout_global(Some(config.request_timeout))
         .user_agent(format!("synthaea-agent/{}", env!("CARGO_PKG_VERSION")));
 
-    // Configure mTLS if certificates are provided
-    if config.has_client_cert() {
-        let tls_config = build_tls_config(config)?;
-        agent_builder = agent_builder.tls_config(tls_config);
+    // A custom TLS config is only needed for mTLS or a private CA; otherwise
+    // ureq's defaults (built-in public roots) stand.
+    if config.has_client_cert() || config.ca_cert_path.is_some() {
+        agent_builder = agent_builder.tls_config(build_tls_config(config)?);
     }
 
     Ok(agent_builder.build().into())
 }
 
-/// Builds TLS config with client certificate authentication.
+/// Builds the TLS config: the client certificate for mTLS and/or the pinned CA
+/// roots, whichever are configured.
 fn build_tls_config(config: &TransportConfig) -> Result<ureq::tls::TlsConfig> {
     use ureq::tls::{Certificate, ClientCert, PrivateKey, TlsConfig};
 
-    let (Some(cert_path), Some(key_path)) = (&config.client_cert_path, &config.client_key_path)
-    else {
-        // No client cert configured, use default TLS
-        return Ok(TlsConfig::default());
-    };
+    let mut builder = TlsConfig::builder();
 
-    // Load certificate from PEM file
-    let cert_pem = std::fs::read(cert_path)?;
-    let cert = Certificate::from_pem(&cert_pem)
-        .map_err(|e| TransportError::Config(format!("failed to parse cert: {e}")))?;
+    if let Some(ca_path) = &config.ca_cert_path {
+        builder = builder.root_certs(load_ca_roots(ca_path)?);
+    }
 
-    // Load private key from PEM file
-    let key_pem = std::fs::read(key_path)?;
-    let key = PrivateKey::from_pem(&key_pem)
-        .map_err(|e| TransportError::Config(format!("failed to parse key: {e}")))?;
+    if let (Some(cert_path), Some(key_path)) = (&config.client_cert_path, &config.client_key_path) {
+        // Load certificate from PEM file
+        let cert_pem = std::fs::read(cert_path).map_err(|e| {
+            TransportError::Config(format!(
+                "cannot read the client certificate {}: {e}",
+                cert_path.display()
+            ))
+        })?;
+        let cert = Certificate::from_pem(&cert_pem)
+            .map_err(|e| TransportError::Config(format!("failed to parse cert: {e}")))?;
 
-    // Create client certificate with chain and key
-    let client_cert = ClientCert::new_with_certs(&[cert], key);
+        // Load private key from PEM file
+        let key_pem = std::fs::read(key_path).map_err(|e| {
+            TransportError::Config(format!(
+                "cannot read the client key {}: {e}",
+                key_path.display()
+            ))
+        })?;
+        if is_encrypted_pem(&key_pem) {
+            return Err(TransportError::Config(format!(
+                "the client key {} is passphrase-protected, which the transport cannot use \
+                 yet (`server.mtls_passphrase` is not wired): provide an unencrypted key",
+                key_path.display()
+            )));
+        }
+        let key = PrivateKey::from_pem(&key_pem)
+            .map_err(|e| TransportError::Config(format!("failed to parse key: {e}")))?;
 
-    Ok(TlsConfig::builder().client_cert(Some(client_cert)).build())
+        // Create client certificate with chain and key
+        builder = builder.client_cert(Some(ClientCert::new_with_certs(&[cert], key)));
+    }
+
+    Ok(builder.build())
+}
+
+/// Whether a PEM private key is passphrase-protected (PKCS#8 `ENCRYPTED PRIVATE KEY`, or the
+/// legacy `Proc-Type: 4,ENCRYPTED` header). Said plainly, because the parse error of an
+/// encrypted key does not name the cause.
+fn is_encrypted_pem(pem: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(pem);
+    text.contains("BEGIN ENCRYPTED PRIVATE KEY") || text.contains("Proc-Type: 4,ENCRYPTED")
+}
+
+/// Reads every certificate of a PEM bundle as a trust root. An unreadable file or
+/// a bundle with no certificate is a configuration error, not a silent fallback to
+/// the public roots: the operator asked for a pinned CA.
+fn load_ca_roots(path: &std::path::Path) -> Result<ureq::tls::RootCerts> {
+    let pem = std::fs::read(path).map_err(|e| {
+        TransportError::Config(format!("cannot read CA bundle {}: {e}", path.display()))
+    })?;
+    let mut roots = Vec::new();
+    for item in ureq::tls::parse_pem(&pem) {
+        let item = item.map_err(|e| {
+            TransportError::Config(format!("invalid CA bundle {}: {e}", path.display()))
+        })?;
+        if let ureq::tls::PemItem::Certificate(cert) = item {
+            roots.push(cert);
+        }
+    }
+    if roots.is_empty() {
+        return Err(TransportError::Config(format!(
+            "CA bundle {} contains no certificate",
+            path.display()
+        )));
+    }
+    Ok(ureq::tls::RootCerts::new_with_certs(&roots))
 }
 
 #[cfg(test)]
@@ -351,5 +404,49 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn a_passphrase_protected_client_key_is_refused_with_a_clear_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = (dir.path().join("c.crt"), dir.path().join("c.key"));
+        std::fs::write(&cert, include_str!("../tests/fixtures/ca.pem")).unwrap();
+        std::fs::write(
+            &key,
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n-----END ENCRYPTED PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let config = TransportConfig::new("https://cp.example").with_client_cert(cert, key);
+
+        let Err(err) = TransportClient::new(config) else {
+            panic!("an encrypted key must be refused");
+        };
+        assert!(err.to_string().contains("passphrase-protected"), "{err}");
+
+        assert!(is_encrypted_pem(
+            b"Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00"
+        ));
+        assert!(!is_encrypted_pem(b"-----BEGIN PRIVATE KEY-----"));
+    }
+
+    #[test]
+    fn an_unreadable_client_certificate_or_key_names_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = (dir.path().join("c.crt"), dir.path().join("c.key"));
+        let missing_cert =
+            TransportConfig::new("https://cp.example").with_client_cert(cert.clone(), key.clone());
+        let Err(err) = TransportClient::new(missing_cert) else {
+            panic!("a missing certificate must be refused");
+        };
+        assert!(err.to_string().contains("client certificate"), "{err}");
+        assert!(err.to_string().contains("c.crt"), "{err}");
+
+        std::fs::write(&cert, include_str!("../tests/fixtures/ca.pem")).unwrap();
+        let missing_key = TransportConfig::new("https://cp.example").with_client_cert(cert, key);
+        let Err(err) = TransportClient::new(missing_key) else {
+            panic!("a missing key must be refused");
+        };
+        assert!(err.to_string().contains("client key"), "{err}");
+        assert!(err.to_string().contains("c.key"), "{err}");
     }
 }

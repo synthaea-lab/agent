@@ -143,9 +143,10 @@ pub(crate) fn cmd_check_content_manifest(
     ring: &str,
     cert: Option<&Path>,
     key: Option<&Path>,
+    ca_cert: Option<&Path>,
     state_path: &Path,
 ) -> anyhow::Result<()> {
-    let client = build_client(server, cert, key)?;
+    let client = build_client(server, cert, key, ca_cert)?;
     let url = client.config().content_manifest_url(ring);
     let manifest: ContentManifest = client.get_json(&url)?;
 
@@ -174,7 +175,8 @@ pub(crate) fn cmd_check_content_manifest(
 }
 
 /// Builds a [`transport::TransportClient`] for `server`, with mTLS if both
-/// `cert` and `key` are given — shared by [`cmd_check_content_manifest`] and
+/// `cert` and `key` are given, and trusting only `ca_cert`'s roots when it is
+/// (a control plane on a private CA, #658) — shared by [`cmd_check_content_manifest`] and
 /// [`cmd_apply_content_manifest`].
 ///
 /// # Errors
@@ -184,10 +186,14 @@ fn build_client(
     server: &str,
     cert: Option<&Path>,
     key: Option<&Path>,
+    ca_cert: Option<&Path>,
 ) -> anyhow::Result<transport::TransportClient> {
     let mut config = transport::TransportConfig::new(server);
     if let (Some(cert), Some(key)) = (cert, key) {
         config = config.with_client_cert(PathBuf::from(cert), PathBuf::from(key));
+    }
+    if let Some(ca_cert) = ca_cert {
+        config = config.with_ca_cert(PathBuf::from(ca_cert));
     }
     Ok(transport::TransportClient::new(config)?)
 }
@@ -403,6 +409,8 @@ pub(crate) struct Endpoint {
     pub(crate) server: String,
     pub(crate) cert: Option<PathBuf>,
     pub(crate) key: Option<PathBuf>,
+    /// PEM bundle of the only CA(s) trusted for the server's certificate.
+    pub(crate) ca_cert: Option<PathBuf>,
 }
 
 /// Picks the control plane for `apply-content-manifest`. `--server` omitted
@@ -415,16 +423,34 @@ pub(crate) fn resolve_endpoint(
     server: Option<String>,
     cert: Option<PathBuf>,
     key: Option<PathBuf>,
+    ca_cert: Option<PathBuf>,
     configured: &config::ServerConfig,
 ) -> Endpoint {
     match server {
-        Some(server) => Endpoint { server, cert, key },
+        Some(server) => Endpoint {
+            server,
+            cert,
+            key,
+            ca_cert,
+        },
         None => Endpoint {
+            ca_cert,
             server: configured.control_plane_url.clone(),
             cert: Some(cert.unwrap_or_else(|| configured.mtls_cert.clone())),
             key: Some(key.unwrap_or_else(|| configured.mtls_key.clone())),
         },
     }
+}
+
+/// The CA bundle to trust for the control plane: `--ca-cert`, else `server.ca_cert`
+/// from `agent.toml`, else none (the built-in roots). A CA is a trust anchor and not a
+/// credential, so unlike the client certificate it applies to a server named by hand
+/// too; it can only make verification stricter.
+pub(crate) fn resolve_ca_cert(
+    flag: Option<PathBuf>,
+    configured: &config::ServerConfig,
+) -> Option<PathBuf> {
+    flag.or_else(|| configured.ca_cert.clone())
 }
 
 /// Picks the ring for `apply-content-manifest`: `--ring`, else
@@ -462,15 +488,18 @@ pub(crate) fn resolve_ring(
 /// verification, or [`download_and_apply`] fails partway through (already-
 /// applied entries stay recorded in `state_path` for the next attempt).
 pub(crate) fn cmd_apply_content_manifest(
-    server: &str,
+    endpoint: &Endpoint,
     ring: &str,
-    cert: Option<&Path>,
-    key: Option<&Path>,
     content_dir: &Path,
     state_path: &Path,
     ipc_endpoint: &str,
 ) -> anyhow::Result<()> {
-    let client = build_client(server, cert, key)?;
+    let client = build_client(
+        &endpoint.server,
+        endpoint.cert.as_deref(),
+        endpoint.key.as_deref(),
+        endpoint.ca_cert.as_deref(),
+    )?;
     let url = client.config().content_manifest_url(ring);
     let manifest: ContentManifest = client.get_json(&url)?;
 
@@ -566,13 +595,55 @@ mod tests {
             mtls_cert: PathBuf::from("/etc/synthaea/certs/client.crt"),
             mtls_key: PathBuf::from("/etc/synthaea/certs/client.key"),
             mtls_passphrase: config::SecretRef::Invalid(String::new()),
+            ca_cert: None,
             offline_fallback: true,
         }
     }
 
+    fn ca(path: &str) -> Option<PathBuf> {
+        Some(PathBuf::from(path))
+    }
+
+    #[test]
+    fn resolve_ca_cert_takes_the_flag_the_config_or_both_with_the_flag_winning() {
+        let mut server = configured_server();
+        // Neither: the built-in roots.
+        assert_eq!(resolve_ca_cert(None, &server), None);
+        // Flag only.
+        assert_eq!(
+            resolve_ca_cert(ca("/lab/ca.pem"), &server),
+            ca("/lab/ca.pem")
+        );
+        // Config only.
+        server.ca_cert = ca("/etc/synthaea/certs/ca.pem");
+        assert_eq!(
+            resolve_ca_cert(None, &server),
+            ca("/etc/synthaea/certs/ca.pem")
+        );
+        // Both: the flag wins.
+        assert_eq!(
+            resolve_ca_cert(ca("/lab/ca.pem"), &server),
+            ca("/lab/ca.pem")
+        );
+    }
+
+    #[test]
+    fn a_ca_bundle_is_kept_for_the_configured_and_for_an_explicit_server() {
+        let configured = resolve_endpoint(None, None, None, ca("/x/ca.pem"), &configured_server());
+        let explicit = resolve_endpoint(
+            Some("https://lab.example".to_string()),
+            None,
+            None,
+            ca("/x/ca.pem"),
+            &configured_server(),
+        );
+        assert_eq!(configured.ca_cert, ca("/x/ca.pem"));
+        assert_eq!(explicit.ca_cert, ca("/x/ca.pem"));
+    }
+
     #[test]
     fn omitting_server_uses_the_configured_control_plane_and_mtls_pair() {
-        let endpoint = resolve_endpoint(None, None, None, &configured_server());
+        let endpoint = resolve_endpoint(None, None, None, None, &configured_server());
         assert_eq!(endpoint.server, "https://cp.example");
         assert_eq!(
             endpoint.cert.as_deref(),
@@ -590,6 +661,7 @@ mod tests {
             Some("http://127.0.0.1:3000".to_string()),
             None,
             None,
+            None,
             &configured_server(),
         );
         assert_eq!(endpoint.server, "http://127.0.0.1:3000");
@@ -602,6 +674,7 @@ mod tests {
         let endpoint = resolve_endpoint(
             None,
             Some(PathBuf::from("/tmp/other.crt")),
+            None,
             None,
             &configured_server(),
         );

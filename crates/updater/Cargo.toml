@@ -16,5 +16,9 @@ thiserror = { workspace = true }
 sha2 = "0.11"
 ring = "0.17"
 
+# The descriptor-relative ownership walk in `layout` (Linux-only, like `layout` itself).
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
+
 [dev-dependencies]
 tempfile = "3"

@@ -132,6 +132,13 @@ pub struct ServerConfig {
     /// Reference to the private-key passphrase. Never a cleartext literal;
     /// see [`SecretRef`] and ADR-0013 §7.
     pub mtls_passphrase: SecretRef,
+    /// Path to a PEM bundle of the CA(s) that sign the control plane's server
+    /// certificate, for a control plane on a private CA (#658). When set, **only**
+    /// these roots are trusted, not the built-in public ones; when absent, the
+    /// built-in roots apply. A CA is not a credential, so it also applies to a
+    /// server named by hand on the command line.
+    #[serde(default)]
+    pub ca_cert: Option<PathBuf>,
     /// If `true`, the agent continues to operate against its cached policy
     /// snapshot when the control plane is unreachable. If `false`, an
     /// unreachable control plane is a hard failure at boot.

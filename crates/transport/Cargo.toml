@@ -28,4 +28,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 schema = { path = "../schema", features = ["test-fixtures"] }
