@@ -104,6 +104,15 @@ pub(crate) struct DetectionSink {
     /// runtime, so re-resolving on every reload would add nothing but a
     /// syscall.
     content_root: PathBuf,
+    /// The planted canary files (#81), set once at start by [`Self::set_tripwires`]; empty
+    /// of effect when the operator configured no `[deception]` directories.
+    tripwires: std::sync::OnceLock<deception::Tripwires>,
+    /// When each `(canary, pid, incarnation of pid)` last raised a detection (event time,
+    /// ns), so a tool that reads the same canary again and again raises one finding per
+    /// cooldown, not one per open. Only read opens are absorbed (see [`absorbable`]);
+    /// bounded; the hits it absorbs are counted in `canary_hits_absorbed`.
+    canary_last_hit: Mutex<store::BoundedMap<CanaryKey, u64>>,
+    canary_hits_absorbed: AtomicU64,
 }
 
 /// The verdict entity an event belongs to: `(ppid, comm)` plus the incarnation of the
@@ -121,6 +130,40 @@ const MEMFD_EXEC_TECHNIQUE: &str = "T1620";
 /// The ATT&CK technique the ransomware rules report (T1486): its detection carries a
 /// damage manifest of the process's recent renames and deletions (#82).
 const RANSOMWARE_TECHNIQUE: &str = "T1486";
+
+/// The ATT&CK technique a canary hit reports: someone looked through files nothing
+/// legitimate reads (T1083 file and directory discovery). The rule id names the provenance.
+const CANARY_TECHNIQUE: &str = "T1083";
+
+/// `(canary path, pid, process incarnation)`: the incarnation, when the sensor stamps one,
+/// keeps a process that reuses the pid inside the cooldown from being absorbed as its
+/// predecessor.
+type CanaryKey = (PathBuf, u32, Option<u64>);
+
+/// Open flags that mean write intent on Linux (`O_WRONLY | O_RDWR | O_CREAT`), the same
+/// mask the YARA trigger uses. On a platform whose flags mean something else the mask can
+/// only let more opens through, never absorb more.
+const WRITE_INTENT_FLAGS: u32 = 0o103;
+
+/// Whether a repeat of this touch may be absorbed by the cooldown. Only a read open may: a
+/// delete, a rename or a write-intent open is the destructive touch an encryptor makes after
+/// reading, and absorbing it behind the first open would hide the one finding an analyst
+/// needs. Those always raise a detection (bounded by the number of canaries).
+fn absorbable(touch: &deception::Touch) -> bool {
+    matches!(touch, deception::Touch::Open { flags } if flags & WRITE_INTENT_FLAGS == 0)
+}
+
+/// How long one process's repeat touches of one canary are absorbed after a detection.
+const CANARY_COOLDOWN_NS: u64 = 60 * 1_000_000_000;
+
+/// Most `(canary, pid)` pairs the cooldown remembers; the oldest are evicted first, which
+/// at worst lets one more detection through.
+const CANARY_COOLDOWN_KEYS: usize = 1024;
+
+/// `DetectionSource::Rule` id of a canary hit. `DetectionSource` is part of the
+/// semi-frozen schema, so deception provenance rides in the rule id until a dedicated
+/// variant is decided (#81).
+const CANARY_RULE_ID: &str = "DECEPTION-CANARY";
 
 /// Most renames and deletions a ransomware detection carries beyond its triggering event.
 /// A bound on the size of one detection: the correlator window is 60 s, and a fast
@@ -297,6 +340,9 @@ impl DetectionSink {
             response,
             verdict,
             content_root,
+            tripwires: std::sync::OnceLock::new(),
+            canary_last_hit: Mutex::new(store::BoundedMap::new(CANARY_COOLDOWN_KEYS)),
+            canary_hits_absorbed: AtomicU64::new(0),
         })
     }
 
@@ -579,6 +625,73 @@ impl DetectionSink {
                 requester: None,
             }),
         );
+    }
+
+    /// Installs the planted canaries (#81). Called once, before the sensor starts; a second
+    /// call is ignored.
+    pub(crate) fn set_tripwires(&self, tripwires: deception::Tripwires) {
+        let _ = self.tripwires.set(tripwires);
+    }
+
+    /// A touch of a planted canary by any process but the agent itself is a detection:
+    /// nothing legitimate reads these files. The agent's own pid is skipped because it
+    /// writes them at start and verifies them later.
+    fn detect_canary(&self, event: &Event) {
+        let Some(tripwires) = self.tripwires.get() else {
+            return;
+        };
+        let Some(hit) = tripwires.matches(event) else {
+            return;
+        };
+        if hit.pid == std::process::id() {
+            return;
+        }
+        let meta = event.meta();
+        if absorbable(&hit.touch)
+            && self.canary_in_cooldown(
+                (hit.canary.path.clone(), hit.pid, meta.process_generation),
+                meta.timestamp_ns,
+            )
+        {
+            let absorbed = self.canary_hits_absorbed.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::debug!(
+                pid = hit.pid,
+                absorbed,
+                "deception: repeat canary touch absorbed"
+            );
+            return;
+        }
+        let message = format!(
+            "canary file touched: {} ({:?}) by pid {} ({})",
+            hit.canary.path.display(),
+            hit.touch,
+            hit.pid,
+            meta.comm
+        );
+        self.record_and_emit_with(
+            &entity_key(meta),
+            CANARY_TECHNIQUE,
+            &message,
+            schema::detection::DetectionSource::Rule {
+                rule_id: CANARY_RULE_ID.to_string(),
+            },
+            schema::detection::Severity::High,
+            event,
+            Vec::new(),
+        );
+    }
+
+    /// True when `key` already raised a detection within the cooldown; otherwise records
+    /// this touch as the one that did.
+    fn canary_in_cooldown(&self, key: CanaryKey, now_ns: u64) -> bool {
+        let mut last = self.canary_last_hit.lock().unwrap();
+        if let Some(&at) = last.peek(&key)
+            && now_ns.saturating_sub(at) < CANARY_COOLDOWN_NS
+        {
+            return true;
+        }
+        last.insert(key, now_ns);
+        false
     }
 
     /// [`Self::record_and_emit`] for a batch of plain `rules::Alert`s (no Sigma/
@@ -1300,6 +1413,7 @@ impl EventSink for DetectionSink {
         // Detection runs in memory on the capture thread — no engine needs the hash
         // or signature synchronously (issue #126).
         self.correlate(&event);
+        self.detect_canary(&event);
         match &event {
             Event::Exec(e) => self.detect_exec(&event, e),
             Event::FileOpen(e) => self.detect_file_open(&event, e),
@@ -1600,6 +1714,193 @@ rule response_marker {
         }));
         drive_linux_beacon(&sink, 6262);
         (payload, killed)
+    }
+
+    /// A sink watching the one canary a plant into `dir/canaries` produced.
+    fn sink_watching_canary(dir: &std::path::Path) -> (Arc<DetectionSink>, String) {
+        let planted = dir.join("canaries");
+        std::fs::create_dir_all(&planted).unwrap();
+        let tripwires = crate::deception::start(
+            &config::DeceptionConfig {
+                canary_dirs: vec![planted.clone()],
+            },
+            &dir.join("state"),
+        )
+        .unwrap();
+        let canary = std::fs::read_dir(&planted)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .display()
+            .to_string();
+        let sink = sink_in(dir);
+        sink.set_tripwires(tripwires);
+        (sink, canary)
+    }
+
+    fn open_event(path: &str, pid: u32) -> Event {
+        Event::FileOpen(schema::FileOpenEvent {
+            path: path.to_string(),
+            meta: EventMeta {
+                pid,
+                ..schema::fixtures::meta()
+            },
+            ..schema::fixtures::file_open()
+        })
+    }
+
+    #[test]
+    fn another_process_opening_a_canary_raises_a_deception_detection() {
+        let dir = tmp("canary-hit");
+        let (sink, canary) = sink_watching_canary(&dir);
+        sink.on_event(open_event(&canary, std::process::id() + 1));
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("T1083"), "{alerts}");
+        assert!(alerts.contains("canary file touched"), "{alerts}");
+    }
+
+    fn open_event_at(path: &str, pid: u32, timestamp_ns: u64) -> Event {
+        let Event::FileOpen(mut e) = open_event(path, pid) else {
+            unreachable!()
+        };
+        e.meta.timestamp_ns = timestamp_ns;
+        Event::FileOpen(e)
+    }
+
+    fn canary_alert_count(dir: &std::path::Path) -> usize {
+        alerts_in(dir).matches("canary file touched").count()
+    }
+
+    #[test]
+    fn a_process_reopening_a_canary_raises_one_detection_per_cooldown() {
+        let dir = tmp("canary-cooldown");
+        let (sink, canary) = sink_watching_canary(&dir);
+        let pid = std::process::id() + 1;
+        let t0 = 1_000_000_000_000;
+        for i in 0..5 {
+            sink.on_event(open_event_at(&canary, pid, t0 + i * 1_000_000_000));
+        }
+        assert_eq!(canary_alert_count(&dir), 1);
+        assert_eq!(sink.canary_hits_absorbed.load(Ordering::Relaxed), 4);
+        sink.on_event(open_event_at(
+            &canary,
+            pid,
+            t0 + super::CANARY_COOLDOWN_NS + 1,
+        ));
+        assert_eq!(canary_alert_count(&dir), 2);
+    }
+
+    fn event_by(
+        canary: &str,
+        pid: u32,
+        generation: Option<u64>,
+        timestamp_ns: u64,
+        kind: &str,
+    ) -> Event {
+        let meta = EventMeta {
+            pid,
+            process_generation: generation,
+            timestamp_ns,
+            ..schema::fixtures::meta()
+        };
+        match kind {
+            "read" | "write" => {
+                let mut e = schema::fixtures::file_open();
+                e.path = canary.into();
+                e.flags = if kind == "write" { 0o102 } else { 0 };
+                e.meta = meta;
+                Event::FileOpen(e)
+            }
+            "delete" => {
+                let mut e = schema::fixtures::file_delete();
+                e.path = canary.into();
+                e.meta = meta;
+                Event::FileDelete(e)
+            }
+            "rename" => Event::FileRename(schema::FileRenameEvent {
+                old_path: canary.into(),
+                new_path: format!("{canary}.locked"),
+                meta,
+                ..schema::fixtures::file_rename()
+            }),
+            other => panic!("unknown touch {other}"),
+        }
+    }
+
+    #[test]
+    fn a_delete_rename_or_write_open_after_a_read_open_is_not_absorbed() {
+        for destructive in ["delete", "rename", "write"] {
+            let dir = tmp(&format!("canary-destructive-{destructive}"));
+            let (sink, canary) = sink_watching_canary(&dir);
+            let pid = std::process::id() + 1;
+            sink.on_event(event_by(&canary, pid, None, 5, "read"));
+            sink.on_event(event_by(&canary, pid, None, 6, destructive));
+            assert_eq!(
+                canary_alert_count(&dir),
+                2,
+                "{destructive} must not hide behind the read open"
+            );
+            assert_eq!(sink.canary_hits_absorbed.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn repeated_destructive_touches_each_raise_a_detection() {
+        let dir = tmp("canary-repeat-delete");
+        let (sink, canary) = sink_watching_canary(&dir);
+        let pid = std::process::id() + 1;
+        for t in 0..3 {
+            sink.on_event(event_by(&canary, pid, None, 5 + t, "rename"));
+        }
+        assert_eq!(canary_alert_count(&dir), 3);
+    }
+
+    #[test]
+    fn a_process_that_reuses_the_pid_is_not_absorbed_as_its_predecessor() {
+        let dir = tmp("canary-pid-reuse");
+        let (sink, canary) = sink_watching_canary(&dir);
+        let pid = std::process::id() + 1;
+        sink.on_event(event_by(&canary, pid, Some(7), 5, "read"));
+        sink.on_event(event_by(&canary, pid, Some(7), 6, "read"));
+        assert_eq!(canary_alert_count(&dir), 1, "same incarnation: absorbed");
+        sink.on_event(event_by(&canary, pid, Some(8), 7, "read"));
+        assert_eq!(canary_alert_count(&dir), 2, "new incarnation: reported");
+    }
+
+    #[test]
+    fn a_second_process_touching_the_same_canary_is_not_absorbed() {
+        let dir = tmp("canary-two-pids");
+        let (sink, canary) = sink_watching_canary(&dir);
+        let pid = std::process::id() + 1;
+        sink.on_event(open_event_at(&canary, pid, 5));
+        sink.on_event(open_event_at(&canary, pid + 1, 6));
+        assert_eq!(canary_alert_count(&dir), 2);
+    }
+
+    #[test]
+    fn the_agents_own_pid_touching_a_canary_is_not_a_detection() {
+        let dir = tmp("canary-own-pid");
+        let (sink, canary) = sink_watching_canary(&dir);
+        sink.on_event(open_event(&canary, std::process::id()));
+        assert!(!alerts_in(&dir).contains("canary file touched"));
+    }
+
+    #[test]
+    fn an_ordinary_path_is_not_a_canary_hit() {
+        let dir = tmp("canary-miss");
+        let (sink, _canary) = sink_watching_canary(&dir);
+        sink.on_event(open_event("/etc/hostname", std::process::id() + 1));
+        assert!(!alerts_in(&dir).contains("canary file touched"));
+    }
+
+    #[test]
+    fn without_tripwires_a_canary_looking_path_is_ordinary() {
+        let dir = tmp("canary-off");
+        let sink = sink_in(&dir);
+        sink.on_event(open_event("/srv/passwords_00000000.txt", 1));
+        assert!(!alerts_in(&dir).contains("canary file touched"));
     }
 
     /// The YARA scan runs on its own thread; wait for its response line.

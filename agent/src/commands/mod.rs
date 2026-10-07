@@ -57,6 +57,8 @@ pub(crate) struct RunOptions<'a> {
     /// `linux::cmd_run`; the other platforms accept and ignore it.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) log_sources: &'a [config::LogSourceConfig],
+    /// Canary directories declared in `[deception]` (#81), planted by `common::plant_canaries`.
+    pub(crate) deception: &'a config::DeceptionConfig,
 }
 
 #[cfg(target_os = "linux")]

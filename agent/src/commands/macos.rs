@@ -256,6 +256,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         ipc_endpoint,
         content_dir,
         log_sources: _,
+        deception,
     } = opts;
     let pipeline = super::common::wire_run_pipeline(
         seeded_rule_state(),
@@ -266,6 +267,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         content_dir,
         storage,
     )?;
+    super::common::plant_canaries(&pipeline.sink, deception, storage);
     run_macos_sensors(Box::new(SharedSink(pipeline.sink)))
 }
 
