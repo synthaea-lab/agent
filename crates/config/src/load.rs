@@ -226,6 +226,35 @@ fn validate_semantics(cfg: &AgentConfig, source_path: &Path) -> Result<(), Confi
         }
     }
 
+    // deception.canary_dirs — each one gets files written into it by the agent, so a
+    // typo must fail at boot rather than plant under a relative path of the cwd.
+    if cfg.deception.canary_dirs.len() > crate::schema::MAX_CANARY_DIRS {
+        return Err(ConfigError::Invalid {
+            field: "deception.canary_dirs".into(),
+            expected: format!("at most {} directories", crate::schema::MAX_CANARY_DIRS),
+            value: format!("{} directories", cfg.deception.canary_dirs.len()),
+            origin: src.clone(),
+        });
+    }
+    for (i, dir) in cfg.deception.canary_dirs.iter().enumerate() {
+        if !dir.is_absolute() {
+            return Err(ConfigError::Invalid {
+                field: format!("deception.canary_dirs[{i}]"),
+                expected: "an absolute directory path".into(),
+                value: dir.display().to_string(),
+                origin: src.clone(),
+            });
+        }
+        if cfg.deception.canary_dirs[..i].contains(dir) {
+            return Err(ConfigError::Invalid {
+                field: format!("deception.canary_dirs[{i}]"),
+                expected: "a directory listed once".into(),
+                value: dir.display().to_string(),
+                origin: src.clone(),
+            });
+        }
+    }
+
     // ipc.endpoint — shape check per OS. On Windows the endpoint is a named
     // pipe (`\\.\pipe\...`), everywhere else it's an absolute filesystem
     // path (Unix domain socket).
@@ -804,6 +833,52 @@ control_plane_url = "https://cp.example"
             .collect();
         match load_with_logs(&many).unwrap_err() {
             ConfigError::Invalid { field, .. } => assert_eq!(field, "logs.sources"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    fn deception_table(dirs: &[String]) -> String {
+        let list: Vec<String> = dirs.iter().map(|d| format!("\"{d}\"")).collect();
+        format!("[deception]\ncanary_dirs = [{}]\n", list.join(", "))
+    }
+
+    #[test]
+    fn no_deception_table_plants_nothing() {
+        let cfg = load_with_logs("").unwrap();
+        assert!(cfg.deception.canary_dirs.is_empty());
+    }
+
+    #[test]
+    fn declared_canary_dirs_are_loaded() {
+        let dirs = [abs_log("a"), abs_log("b")];
+        let cfg = load_with_logs(&deception_table(&dirs)).unwrap();
+        assert_eq!(cfg.deception.canary_dirs.len(), 2);
+    }
+
+    #[test]
+    fn a_relative_canary_dir_is_rejected() {
+        match load_with_logs(&deception_table(&["srv/share".into()])).unwrap_err() {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "deception.canary_dirs[0]"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_duplicate_canary_dir_is_rejected() {
+        let d = abs_log("a");
+        match load_with_logs(&deception_table(&[d.clone(), d])).unwrap_err() {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "deception.canary_dirs[1]"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn too_many_canary_dirs_are_rejected() {
+        let many: Vec<String> = (0..=crate::MAX_CANARY_DIRS)
+            .map(|i| abs_log(&i.to_string()))
+            .collect();
+        match load_with_logs(&deception_table(&many)).unwrap_err() {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "deception.canary_dirs"),
             other => panic!("expected Invalid, got {other:?}"),
         }
     }

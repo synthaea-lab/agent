@@ -104,6 +104,9 @@ pub(crate) struct DetectionSink {
     /// runtime, so re-resolving on every reload would add nothing but a
     /// syscall.
     content_root: PathBuf,
+    /// The planted canary files (#81), set once at start by [`Self::set_tripwires`]; empty
+    /// of effect when the operator configured no `[deception]` directories.
+    tripwires: std::sync::OnceLock<deception::Tripwires>,
 }
 
 /// The verdict entity an event belongs to: `(ppid, comm)` plus the incarnation of the
@@ -121,6 +124,15 @@ const MEMFD_EXEC_TECHNIQUE: &str = "T1620";
 /// The ATT&CK technique the ransomware rules report (T1486): its detection carries a
 /// damage manifest of the process's recent renames and deletions (#82).
 const RANSOMWARE_TECHNIQUE: &str = "T1486";
+
+/// The ATT&CK technique a canary hit reports: someone looked through files nothing
+/// legitimate reads (T1083 file and directory discovery). The rule id names the provenance.
+const CANARY_TECHNIQUE: &str = "T1083";
+
+/// `DetectionSource::Rule` id of a canary hit. `DetectionSource` is part of the
+/// semi-frozen schema, so deception provenance rides in the rule id until a dedicated
+/// variant is decided (#81).
+const CANARY_RULE_ID: &str = "DECEPTION-CANARY";
 
 /// Most renames and deletions a ransomware detection carries beyond its triggering event.
 /// A bound on the size of one detection: the correlator window is 60 s, and a fast
@@ -297,6 +309,7 @@ impl DetectionSink {
             response,
             verdict,
             content_root,
+            tripwires: std::sync::OnceLock::new(),
         })
     }
 
@@ -584,6 +597,46 @@ impl DetectionSink {
     /// [`Self::record_and_emit`] for a batch of plain `rules::Alert`s (no Sigma/
     /// correlator-specific `DetectionSource` needed) — the common case for every
     /// `rule_state`/`rules::evaluate_*` call site.
+    /// Installs the planted canaries (#81). Called once, before the sensor starts; a second
+    /// call is ignored.
+    pub(crate) fn set_tripwires(&self, tripwires: deception::Tripwires) {
+        let _ = self.tripwires.set(tripwires);
+    }
+
+    /// A touch of a planted canary by any process but the agent itself is a detection:
+    /// nothing legitimate reads these files. The agent's own pid is skipped because it
+    /// writes them at start and verifies them later.
+    fn detect_canary(&self, event: &Event) {
+        let Some(tripwires) = self.tripwires.get() else {
+            return;
+        };
+        let Some(hit) = tripwires.matches(event) else {
+            return;
+        };
+        if hit.pid == std::process::id() {
+            return;
+        }
+        let meta = event.meta();
+        let message = format!(
+            "canary file touched: {} ({:?}) by pid {} ({})",
+            hit.canary.path.display(),
+            hit.touch,
+            hit.pid,
+            meta.comm
+        );
+        self.record_and_emit_with(
+            &entity_key(meta),
+            CANARY_TECHNIQUE,
+            &message,
+            schema::detection::DetectionSource::Rule {
+                rule_id: CANARY_RULE_ID.to_string(),
+            },
+            schema::detection::Severity::High,
+            event,
+            Vec::new(),
+        );
+    }
+
     fn record_rule_alerts(&self, event: &Event, alerts: impl IntoIterator<Item = rules::Alert>) {
         let meta = event.meta();
         let entity = entity_key(meta);
@@ -1300,6 +1353,7 @@ impl EventSink for DetectionSink {
         // Detection runs in memory on the capture thread — no engine needs the hash
         // or signature synchronously (issue #126).
         self.correlate(&event);
+        self.detect_canary(&event);
         match &event {
             Event::Exec(e) => self.detect_exec(&event, e),
             Event::FileOpen(e) => self.detect_file_open(&event, e),
@@ -1600,6 +1654,75 @@ rule response_marker {
         }));
         drive_linux_beacon(&sink, 6262);
         (payload, killed)
+    }
+
+    /// A sink watching the one canary a plant into `dir/canaries` produced.
+    fn sink_watching_canary(dir: &std::path::Path) -> (Arc<DetectionSink>, String) {
+        let planted = dir.join("canaries");
+        std::fs::create_dir_all(&planted).unwrap();
+        let tripwires = crate::deception::start(
+            &config::DeceptionConfig {
+                canary_dirs: vec![planted.clone()],
+            },
+            &dir.join("state"),
+        )
+        .unwrap();
+        let canary = std::fs::read_dir(&planted)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .display()
+            .to_string();
+        let sink = sink_in(dir);
+        sink.set_tripwires(tripwires);
+        (sink, canary)
+    }
+
+    fn open_event(path: &str, pid: u32) -> Event {
+        Event::FileOpen(schema::FileOpenEvent {
+            path: path.to_string(),
+            meta: EventMeta {
+                pid,
+                ..schema::fixtures::meta()
+            },
+            ..schema::fixtures::file_open()
+        })
+    }
+
+    #[test]
+    fn another_process_opening_a_canary_raises_a_deception_detection() {
+        let dir = tmp("canary-hit");
+        let (sink, canary) = sink_watching_canary(&dir);
+        sink.on_event(open_event(&canary, std::process::id() + 1));
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("T1083"), "{alerts}");
+        assert!(alerts.contains("canary file touched"), "{alerts}");
+    }
+
+    #[test]
+    fn the_agents_own_pid_touching_a_canary_is_not_a_detection() {
+        let dir = tmp("canary-own-pid");
+        let (sink, canary) = sink_watching_canary(&dir);
+        sink.on_event(open_event(&canary, std::process::id()));
+        assert!(!alerts_in(&dir).contains("canary file touched"));
+    }
+
+    #[test]
+    fn an_ordinary_path_is_not_a_canary_hit() {
+        let dir = tmp("canary-miss");
+        let (sink, _canary) = sink_watching_canary(&dir);
+        sink.on_event(open_event("/etc/hostname", std::process::id() + 1));
+        assert!(!alerts_in(&dir).contains("canary file touched"));
+    }
+
+    #[test]
+    fn without_tripwires_a_canary_looking_path_is_ordinary() {
+        let dir = tmp("canary-off");
+        let sink = sink_in(&dir);
+        sink.on_event(open_event("/srv/passwords_00000000.txt", 1));
+        assert!(!alerts_in(&dir).contains("canary file touched"));
     }
 
     /// The YARA scan runs on its own thread; wait for its response line.
