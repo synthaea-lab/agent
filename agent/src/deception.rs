@@ -124,20 +124,33 @@ fn plant_each_directory(canaries: &[deception::Canary], inventory: &Path) {
 /// Removes canaries a previous run planted, when the operator no longer configures any.
 fn retire(inventory: &Path) {
     match deception::remove(inventory) {
-        Ok(report) if report.is_clean() => {
-            if !report.removed.is_empty() {
-                tracing::info!(
-                    removed = report.removed.len(),
-                    "deception: canaries removed"
-                );
-            }
-        }
-        Ok(report) => tracing::warn!(
+        Ok(report) => report_removal(&report),
+        Err(error) => tracing::error!(%error, "deception: removing old canaries failed"),
+    }
+}
+
+/// Says what a removal left behind. A canary replaced by someone's own data is left in place
+/// and dropped from the inventory, so without this line nobody would learn it is still there.
+fn report_removal(report: &deception::RemoveReport) {
+    if !report.removed.is_empty() {
+        tracing::info!(
+            removed = report.removed.len(),
+            "deception: canaries removed"
+        );
+    }
+    if !report.foreign.is_empty() {
+        tracing::warn!(
+            foreign = report.foreign.len(),
+            "deception: canaries replaced by other content were left in place and are no \
+             longer tracked; look for them by hand"
+        );
+    }
+    if !report.is_clean() {
+        tracing::warn!(
             refused = report.refused.len(),
             failed = report.failed.len(),
             "deception: some canaries could not be removed"
-        ),
-        Err(error) => tracing::error!(%error, "deception: removing old canaries failed"),
+        );
     }
 }
 
@@ -201,6 +214,24 @@ mod tests {
         start(&config_for(&[dir.path()]), state.path()).unwrap();
         assert!(start(&config_for(&[]), state.path()).is_none());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn dropping_the_configuration_leaves_a_canary_replaced_by_the_users_own_data() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        start(&config_for(&[dir.path()]), state.path()).unwrap();
+        let mine = fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        fs::write(&mine, "my own data").unwrap();
+        assert!(start(&config_for(&[]), state.path()).is_none());
+        assert_eq!(fs::read_to_string(&mine).unwrap(), "my own data");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert!(!inventory_path(state.path()).exists());
     }
 
     #[test]
