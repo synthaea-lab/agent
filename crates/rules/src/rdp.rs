@@ -10,6 +10,11 @@
 //! checked against the successes it falls before, and either arrival can
 //! complete the join. A failure timestamped after the success never counts.
 //!
+//! History is bounded by the caps below and the least-recently-seen address, never
+//! by time: pruning against the newest timestamp seen would let one event far in the
+//! future (a clock step, a stalled channel catching up) erase what a late event still
+//! needs, and the alert count would depend on delivery order again.
+//!
 //! The failures are every authentication failure with a source address, from
 //! any source (`Event::Auth` also carries application-log failures), not only
 //! RDP ones.
@@ -47,8 +52,6 @@ struct Source {
     successes: VecDeque<Success>,
     /// When the last alert for this address fired: one alert per window.
     last_alert_ns: Option<u64>,
-    /// The newest timestamp seen, which the history is pruned against.
-    newest_ns: u64,
 }
 
 /// Per-address history that joins an RDP success to the failures before it.
@@ -69,7 +72,6 @@ impl RdpSuccessAfterFailures {
         let address = address.to_canonical();
         let source = self.sources.get_or_insert_with(address, Source::default);
         insert_sorted(&mut source.failures, timestamp_ns, FAILURES_PER_SOURCE_CAP);
-        source.touch(timestamp_ns);
         source.join(address)
     }
 
@@ -96,7 +98,6 @@ impl RdpSuccessAfterFailures {
         if source.successes.len() > SUCCESSES_PER_SOURCE_CAP {
             source.successes.pop_front();
         }
-        source.touch(timestamp_ns);
         source.join(address)
     }
 }
@@ -111,26 +112,6 @@ fn insert_sorted(deque: &mut VecDeque<u64>, value: u64, cap: usize) {
 }
 
 impl Source {
-    /// Records the newest timestamp and drops what no later arrival can use:
-    /// events older than two windows before it. Two windows, not one, because
-    /// the other channel's events can trail by a poll interval or more.
-    fn touch(&mut self, timestamp_ns: u64) {
-        self.newest_ns = self.newest_ns.max(timestamp_ns);
-        let keep_from = self
-            .newest_ns
-            .saturating_sub(2 * RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS);
-        while self.failures.front().is_some_and(|&t| t < keep_from) {
-            self.failures.pop_front();
-        }
-        while self
-            .successes
-            .front()
-            .is_some_and(|s| s.timestamp_ns < keep_from)
-        {
-            self.successes.pop_front();
-        }
-    }
-
     /// The first remembered success that now has enough failures in the window
     /// ending at it, once per window.
     fn join(&mut self, address: IpAddr) -> Option<Alert> {
@@ -319,7 +300,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known production bug: a >2-window timestamp jump prunes history needed by late events"]
     fn arbitrary_large_timestamp_reordering_keeps_the_alert_count() {
         let mut chronological = RdpSuccessAfterFailures::new();
         let mut reordered = RdpSuccessAfterFailures::new();
@@ -364,35 +344,6 @@ mod tests {
             at_max.on_failure(ADDRESS, u64::MAX);
         }
         assert!(at_max.on_success(ADDRESS, u64::MAX, "alice").is_some());
-    }
-
-    #[test]
-    fn touch_prunes_before_the_two_window_cutoff_and_keeps_the_cutoff() {
-        let cutoff = 100;
-        let newest = 2 * EXPECTED_WINDOW_NS + cutoff;
-        let mut source = Source::default();
-        source.failures.extend([cutoff - 1, cutoff]);
-        source.successes.extend([
-            Success {
-                timestamp_ns: cutoff - 1,
-                user: "old".into(),
-                alerted: false,
-            },
-            Success {
-                timestamp_ns: cutoff,
-                user: "kept".into(),
-                alerted: false,
-            },
-        ]);
-
-        source.touch(newest);
-
-        assert_eq!(
-            source.failures.iter().copied().collect::<Vec<_>>(),
-            [cutoff]
-        );
-        assert_eq!(source.successes.len(), 1);
-        assert_eq!(source.successes.front().unwrap().timestamp_ns, cutoff);
     }
 
     #[test]
