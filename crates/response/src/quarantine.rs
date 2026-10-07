@@ -14,7 +14,9 @@
 //! check of the source's name and its removal are not atomic. A source that is written to
 //! while it is processed is not refused (a writer could then defeat the quarantine): it is
 //! copied from the descriptor into a private file, hashed as it is copied and filed under that
-//! digest, so the stored bytes and their digest agree whatever the writer does. A hard-linked
+//! digest, so the stored bytes and their digest agree whatever the writer does; the copy is
+//! bounded to the length the file had when it started, so a writer that keeps appending cannot
+//! make it grow or run without end, and a snapshot left by a killed agent is swept. A hard-linked
 //! payload shares its inode with the source, so a process that already holds it open for
 //! writing can still change the quarantined file (`restore` then reports a hash mismatch);
 //! containment holds, since it is `0400` and no name is left at the source.
@@ -182,6 +184,7 @@ fn quarantine_snapshot(
     path: &Path,
     quarantine_dir: &Path,
 ) -> std::io::Result<(PathBuf, String)> {
+    sweep_stale_snapshots(quarantine_dir);
     let (temp, sha256_hex) = snapshot_hashed(&source.file, quarantine_dir)?;
     let stored = Source::open(&temp)
         .and_then(|snapshot| store_in_slot(&snapshot, &temp, path, quarantine_dir, &sha256_hex));
@@ -198,13 +201,52 @@ fn quarantine_snapshot(
     Ok((quarantined_at, sha256_hex))
 }
 
+/// Removes the partial snapshots (`.incoming-<pid>-<n>`) that a process which was killed
+/// mid-copy left in `dir`: the watchdog restarts the agent under a new pid, so any such file of
+/// another pid is a leftover. Best effort. Those of this process are in flight and kept.
+#[cfg(unix)]
+fn sweep_stale_snapshots(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let own = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(".incoming-")) else {
+            continue;
+        };
+        let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid != own {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Copies the open file (rewound) to a new private file in `dir`, returning its path and the
-/// SHA-256 of the bytes written to it.
+/// SHA-256 of the bytes written to it. Copies at most the length the descriptor reports when
+/// it starts: a writer that keeps appending then cannot make the copy grow, or run, without
+/// bound (the stored bytes are a consistent prefix and the digest is that prefix's).
 #[cfg(unix)]
 fn snapshot_hashed(file: &std::fs::File, dir: &Path) -> std::io::Result<(PathBuf, String)> {
-    use std::{io::Seek as _, os::unix::fs::OpenOptionsExt as _};
+    copy_prefix_hashed(file, dir, file.metadata()?.len())
+}
+
+/// [`snapshot_hashed`] for the first `len` bytes.
+#[cfg(unix)]
+fn copy_prefix_hashed(
+    file: &std::fs::File,
+    dir: &Path,
+    len: u64,
+) -> std::io::Result<(PathBuf, String)> {
+    use std::{
+        io::{Read as _, Seek as _},
+        os::unix::fs::OpenOptionsExt as _,
+    };
     let mut source = file.try_clone()?;
     source.rewind()?;
+    let mut source = source.take(len);
     let mut attempt = 0u64;
     let (temp, mut out) = loop {
         let temp = dir.join(format!(".incoming-{}-{attempt}", std::process::id()));
@@ -1593,6 +1635,48 @@ mod tests {
         );
         assert_eq!(unquarantine(&qdir, &digest).unwrap(), source);
         assert_eq!(std::fs::read(&source).unwrap(), b"first and more");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #713 review: the snapshot is bounded to the length the file had when it started, so a
+    /// file that grew since is stored as a consistent prefix, hashed as that prefix.
+    #[cfg(unix)]
+    #[test]
+    fn a_snapshot_copies_at_most_the_length_it_started_with() {
+        let dir = temp_dir("bounded-snapshot");
+        let source = dir.join("payload");
+        std::fs::write(&source, vec![9u8; 5000]).unwrap();
+        let file = std::fs::File::open(&source).unwrap();
+
+        let (stored, digest) = copy_prefix_hashed(&file, &dir, 1000).unwrap();
+
+        let bytes = std::fs::read(&stored).unwrap();
+        assert_eq!(bytes.len(), 1000, "a growing file ends the copy");
+        assert_eq!(digest, sha256_file(&stored).unwrap());
+        assert_eq!(digest, sha256_reader(&mut &bytes[..]).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #713 review: a partial snapshot left by a process that was killed is swept, one of this
+    /// process (in flight) and everything else is kept.
+    #[cfg(unix)]
+    #[test]
+    fn partial_snapshots_of_another_process_are_swept() {
+        let dir = temp_dir("sweep-snapshots");
+        let stale = dir.join(".incoming-1-0");
+        let in_flight = dir.join(format!(".incoming-{}-0", std::process::id()));
+        let stored = dir.join("0".repeat(64));
+        let odd = dir.join(".incoming-notapid-0");
+        for path in [&stale, &in_flight, &stored, &odd] {
+            std::fs::write(path, b"x").unwrap();
+        }
+
+        sweep_stale_snapshots(&dir);
+
+        assert!(!stale.exists());
+        assert!(in_flight.exists());
+        assert!(stored.exists());
+        assert!(odd.exists(), "a name that is not ours is not touched");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
