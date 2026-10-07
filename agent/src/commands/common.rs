@@ -43,6 +43,7 @@ pub(crate) fn plant_canaries(
 ) {
     if let Some(tripwires) = crate::deception::start(deception, &storage.state_dir) {
         sink.set_tripwires(tripwires);
+        sink.set_canary_allow(crate::deception::CanaryAllow::new(deception));
     }
 }
 
