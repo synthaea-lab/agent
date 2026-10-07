@@ -975,6 +975,8 @@ pub fn parse_task_scheduler_op_registered_block(
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     /// Field names and general shape observed on `wevtutil qe System /f:xml` for a
@@ -1802,6 +1804,97 @@ mod tests {
             "20x6-09-21T13:29:23Z",
         ] {
             assert_eq!(at(bad), None, "{bad:?}");
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn time_created_round_trips_against_time_crate(
+            // `time_created_ns` returns u64 nanoseconds, so cap the reference
+            // generator below u64::MAX / 1e9; a separate boundary case covers
+            // the overflow edge.
+            seconds in 0_u64..18_446_744_073,
+            nanos in 0_u32..1_000_000_000,
+        ) {
+            let reference = time::OffsetDateTime::from_unix_timestamp(seconds as i64)
+                .unwrap()
+                .replace_nanosecond(nanos)
+                .unwrap();
+            let date = reference.date();
+            let clock = reference.time();
+            let timestamp = format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}Z",
+                date.year(),
+                u8::from(date.month()),
+                date.day(),
+                clock.hour(),
+                clock.minute(),
+                clock.second(),
+                clock.nanosecond(),
+            );
+            let event = format!("<TimeCreated SystemTime='{timestamp}'/>");
+            prop_assert_eq!(
+                time_created_ns(&event),
+                Some(reference.unix_timestamp_nanos() as u64),
+            );
+        }
+    }
+
+    #[test]
+    fn time_created_handles_gregorian_century_leap_years() {
+        let at = |text: &str| time_created_ns(&format!("<TimeCreated SystemTime='{text}'/>"));
+        assert_eq!(at("2000-02-29T00:00:00Z"), Some(951_782_400_000_000_000));
+        assert_eq!(at("1900-02-29T00:00:00Z"), None);
+        assert_eq!(at("2100-02-29T00:00:00Z"), None);
+        assert_eq!(at("2100-03-01T00:00:00Z"), Some(4_107_542_400_000_000_000));
+    }
+
+    #[test]
+    fn time_created_rejects_nanoseconds_beyond_u64() {
+        assert_eq!(
+            time_created_ns("<TimeCreated SystemTime='2554-07-21T23:34:33.709551616Z'/>"),
+            None,
+        );
+    }
+
+    #[test]
+    fn time_created_accepts_both_attribute_quote_styles_and_rejects_hostile_text() {
+        assert_eq!(
+            time_created_ns("<TimeCreated SystemTime=\"2026-01-02T03:04:05.000000006Z\"/>"),
+            Some(1_767_323_045_000_000_006),
+        );
+        assert_eq!(
+            time_created_ns("<TimeCreated SystemTime='2026-01-02T03:04:05.000000006Z'/>"),
+            Some(1_767_323_045_000_000_006),
+        );
+        for hostile in [
+            "2026-0é-02T03:04:05Z",
+            "2026-01-02T03:04:é5Z",
+            "2026-01-02T03:04:05\"Z",
+            "2026-01-02T03:04:05'Z",
+        ] {
+            let event = format!("<TimeCreated SystemTime='{hostile}'/>");
+            assert_eq!(time_created_ns(&event), None, "{hostile:?}");
+        }
+        let million_digits = format!(
+            "<TimeCreated SystemTime='2026-01-02T03:04:05.{}Z'/>",
+            "7".repeat(1_000_000),
+        );
+        assert_eq!(time_created_ns(&million_digits), None);
+    }
+
+    #[test]
+    fn time_created_rejects_each_required_delimiter_when_only_it_is_wrong() {
+        for malformed in [
+            "2026/01-02T03:04:05Z",
+            "2026-01/02T03:04:05Z",
+            "2026-01-02t03:04:05Z",
+            "2026-01-02T03.04:05Z",
+            "2026-01-02T03:04.05Z",
+            "2026-01-02T03:04:05X",
+        ] {
+            let event = format!("<TimeCreated SystemTime='{malformed}'/>");
+            assert_eq!(time_created_ns(&event), None, "{malformed}");
         }
     }
 

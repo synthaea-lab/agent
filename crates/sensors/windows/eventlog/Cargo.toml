@@ -29,3 +29,5 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 tempfile = "3"
 tracing-subscriber = { workspace = true }
+proptest = "1"
+time = "0.3"
