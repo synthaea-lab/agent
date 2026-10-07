@@ -10,7 +10,7 @@ use std::{
 use schema::{
     AuthEvent, AuthOutcome, ConnectEvent, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
     FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRenameEvent, FileWriteEvent,
-    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, SessionEvent, User,
+    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, SessionEvent, SessionState, User,
     detection::Severity,
 };
 use store::BoundedMap;
@@ -26,7 +26,8 @@ use crate::{
         LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS, MEMFD_EXEC_WINDOW_NS,
         PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES, QUARANTINE_EXEC_WINDOW_NS,
         RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD,
-        RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
+        RANSOMWARE_RENAME_WINDOW_NS, RDP_SUCCESS_AFTER_FAILURES_THRESHOLD,
+        RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
         SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS,
         SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS,
         SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN,
@@ -162,6 +163,10 @@ pub struct RuleState {
     /// LRU-bounded like every other counter: a spray across many fabricated
     /// usernames must not grow this without limit.
     auth_failures: BoundedMap<(String, String), SlidingCounter>,
+    /// Source address → sliding authentication-failure counter for RDP
+    /// success-after-failures (T1021.001), across all target accounts. LRU-bounded
+    /// like the per-account T1110 counter above.
+    rdp_source_auth_failures: BoundedMap<IpAddr, SlidingCounter>,
     /// pid → sliding counter for RANSOMWARE-RENAME (T1486, issue #262): renames by
     /// this pid where `new_path` is `old_path` plus an appended suffix. LRU-bounded:
     /// a hostile process renaming under many different pids (unusual, but not
@@ -279,6 +284,7 @@ impl RuleState {
             scan_spread: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
             auth_failures: BoundedMap::new(COUNTER_CAP),
+            rdp_source_auth_failures: BoundedMap::new(COUNTER_CAP),
             recent_creates: BoundedMap::new(CREATE_UNLINK_PID_CAP),
             pending_unlinks: BoundedMap::new(CREATE_UNLINK_PID_CAP),
             ransomware_unlink: BoundedMap::new(COUNTER_CAP),
@@ -945,6 +951,11 @@ impl RuleState {
             .map_or_else(|| "local".to_string(), |a| a.to_string());
         let key = (event.target_user.clone(), source.clone());
         let ts = event.meta.timestamp_ns;
+        if let Some(address) = event.source_address {
+            self.rdp_source_auth_failures
+                .get_or_insert_with(address, SlidingCounter::default)
+                .record(ts, RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS);
+        }
         let entry = self
             .auth_failures
             .get_or_insert_with(key, SlidingCounter::default);
@@ -965,9 +976,36 @@ impl RuleState {
 
     /// To be called for every `SessionEvent` in the stream (Windows Terminal
     /// Services, #285): a disconnected session reconnected from another
-    /// client, T1563.002 (see the `session` module).
+    /// client, T1563.002 (see the `session` module), or a successful RDP listener
+    /// authentication after failures from that source, T1021.001.
     pub fn on_session(&mut self, event: &SessionEvent) -> Vec<Alert> {
-        self.session_hijack.on_session(event).into_iter().collect()
+        let mut alerts: Vec<Alert> = self.session_hijack.on_session(event).into_iter().collect();
+
+        if event.state != SessionState::Connect || event.console {
+            return alerts;
+        }
+        let Some(address) = event.source_address else {
+            return alerts;
+        };
+        let Some(failures) = self.rdp_source_auth_failures.get_mut(&address) else {
+            return alerts;
+        };
+        let ts = event.meta.timestamp_ns;
+        let count = failures.count_within(ts, RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS);
+        if count >= RDP_SUCCESS_AFTER_FAILURES_THRESHOLD
+            && failures.try_alert(ts, RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS)
+        {
+            alerts.push(Alert {
+                technique: "T1021.001",
+                severity: Severity::High,
+                message: format!(
+                    "user={} source={address}: RDP authentication succeeded after {count} failed authentications from that address in {}s — guessed or sprayed credentials worked",
+                    event.target_user,
+                    RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS / 1_000_000_000,
+                ),
+            });
+        }
+        alerts
     }
 
     /// To be called for every `MemfdCreateEvent` in the stream (Linux, issue

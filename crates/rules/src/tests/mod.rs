@@ -292,6 +292,7 @@ mod linux;
 mod motw_removal;
 mod persistence;
 mod quarantine;
+mod rdp;
 mod session;
 mod tamper;
 mod windows;
