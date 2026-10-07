@@ -468,9 +468,10 @@ pub struct EventMeta {
     /// property reported by conformance, not a schema limit.
     pub comm: String,
     /// Container the emitting process runs in, when the sensor can attribute one.
-    /// `None` on every platform without container support (Windows, macOS) and on
-    /// bare-metal/VM Linux processes — this is not a Kubernetes pod/namespace context
-    /// (out of scope, issue #80), just the container runtime's own identity.
+    /// `None` on macOS, on bare-metal/VM Linux processes, and on Windows host
+    /// processes (Windows attributes process-isolated containers only, from the
+    /// ETW sensor, #371) — this is not a Kubernetes pod/namespace context (out of
+    /// scope, issue #80), just the container runtime's own identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<ContainerContext>,
     /// Opaque stamp of this incarnation of `pid`, for telling a recycled pid from
@@ -490,17 +491,21 @@ pub struct EventMeta {
     pub parent_process_generation: Option<u64>,
 }
 
-/// Identity of the container a process runs in, resolved from its cgroup (issue #80).
+/// Identity of the container a process runs in, resolved from its cgroup on Linux
+/// (issue #80) and from its server silo on Windows (#371).
 ///
-/// `id` is the only field a Linux sensor can fill today (cgroup path parsing alone,
-/// no daemon call). `image`/`name` need a cached lookup against the Docker/containerd
+/// `id` is the only field a sensor can fill today (cgroup path parsing alone on
+/// Linux, the Host Compute Service on Windows; no daemon call). `image`/`name` need a cached lookup against the Docker/containerd
 /// socket — deliberately left as a follow-up so this attribution foundation doesn't
 /// block on it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerContext {
     /// Full container id, as it appears in the cgroup path (64 hex chars for
     /// Docker/containerd) — not truncated to the 12-char short id, so it stays a
-    /// stable join key for a later Docker/containerd socket lookup.
+    /// stable join key for a later Docker/containerd socket lookup. On Windows,
+    /// the Host Compute Service's compute-system id (the same Docker/containerd
+    /// id), or `silo:<n>` (the server silo id) until the service has named the
+    /// container: still a container, just not yet a joinable one.
     pub id: String,
     /// Image reference (e.g. `nginx:1.27`). `None` until the socket lookup lands.
     #[serde(default, skip_serializing_if = "Option::is_none")]

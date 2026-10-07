@@ -1,8 +1,11 @@
 //! Win32/NT API access for enrichment of ETW events: real command lines (F-1),
-//! token identity (F-3), the volume map (F-5), and process-table seeding. Every
-//! function here is best-effort — a failure degrades one field, never the event.
+//! token identity (F-3), the volume map (F-5), process-table seeding, and server
+//! silo membership (#371). Every function here is best-effort — a failure degrades one field, never the event.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use schema::User;
 use windows_sys::Win32::{
@@ -383,6 +386,55 @@ pub(crate) fn resolve_pid_live(pid: u32) -> Option<String> {
     }
 }
 
+// ── #371: server silo membership ─────────────────────────────────────────────
+
+/// `ProcessMembershipInformation`: a `PROCESS_MEMBERSHIP_INFORMATION`, one
+/// `ULONG ServerSiloId` (ntddk.h, Windows 11 22H2 and later).
+const PROCESS_MEMBERSHIP_INFORMATION: u32 = 109;
+const STATUS_INVALID_INFO_CLASS: i32 = 0xC000_0003_u32 as i32;
+
+/// Set by the first "unknown class" answer: an older build never learns it.
+static SILO_QUERY_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+
+/// The server silo the process runs in, 0 for the host. `None` when it cannot
+/// be opened (exited, protected) or the build predates the query; after one
+/// "unsupported" answer the query is not tried again.
+pub(crate) fn read_server_silo_id(pid: u32) -> Option<u32> {
+    if SILO_QUERY_UNSUPPORTED.load(Ordering::Relaxed) {
+        return None;
+    }
+    // SAFETY: the handle is null-checked and closed on every path;
+    // NtQueryInformationProcess writes at most the 4 bytes of the local u32.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let mut silo = 0u32;
+        let mut ret_len = 0u32;
+        let status = NtQueryInformationProcess(
+            process,
+            PROCESS_MEMBERSHIP_INFORMATION,
+            (&mut silo as *mut u32).cast(),
+            size_of::<u32>() as u32,
+            &mut ret_len,
+        );
+        CloseHandle(process);
+        match status {
+            0 => Some(silo),
+            STATUS_INVALID_INFO_CLASS => {
+                if !SILO_QUERY_UNSUPPORTED.swap(true, Ordering::Relaxed) {
+                    tracing::info!(
+                        "server silo query unsupported on this build: no container attribution"
+                    );
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
@@ -412,6 +464,16 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(expanded, long);
         assert!(expanded.unwrap().ends_with(r"\a long file name.exe"));
+    }
+
+    #[test]
+    fn a_host_process_is_in_no_server_silo() {
+        // Some(0) on Windows 11 22H2 / Server 2025 and later, None on an older
+        // build: either way, never a silo.
+        assert!(matches!(
+            read_server_silo_id(std::process::id()),
+            Some(0) | None
+        ));
     }
 
     #[test]

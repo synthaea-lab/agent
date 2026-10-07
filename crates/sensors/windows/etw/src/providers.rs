@@ -20,8 +20,8 @@ use schema::{
 
 use crate::{
     amsi, normalize,
-    sensor::{SharedState, basename, meta},
-    winapi, zone_identifier,
+    sensor::{SharedState, basename},
+    silo, winapi, zone_identifier,
 };
 
 const KERNEL_PROCESS_GUID: &str = "22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716";
@@ -69,8 +69,9 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         let eid = record.event_id();
         // 1=ProcessStart (new spawn → ExecEvent), 2=ProcessEnd (prune the store —
         // PID recycling), 3=ProcessDCStart (rundown of already-running processes →
-        // store only, not a spawn), 5=ImageLoad (DLL/EXE mapped into a process).
-        if eid != 1 && eid != 2 && eid != 3 && eid != 5 {
+        // store only, not a spawn), 5=ImageLoad (DLL/EXE mapped into a process),
+        // 23-26=server silo create/terminate callbacks (#371).
+        if !matches!(eid, 1 | 2 | 3 | 5 | 23..=26) {
             return;
         }
         state.events_seen.fetch_add(1, Ordering::Relaxed);
@@ -83,6 +84,15 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         if eid == 2 {
             if pid != 0 {
                 state.pids.lock().unwrap().remove(pid);
+            }
+            return;
+        }
+
+        if eid >= 23 {
+            // #371: a server silo is created or torn down, so whichever
+            // container its id named is stale.
+            if let Ok(silo) = parser.try_parse::<u32>("Job ID") {
+                state.silos.lock().unwrap().forget(silo);
             }
             return;
         }
@@ -107,7 +117,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             // yielded 0 anyway.
             let ppid = 0;
             sink.on_event(Event::ImageLoad(ImageLoadEvent {
-                meta: meta(pid, ppid, comm, timestamp_ns),
+                meta: state.meta(pid, ppid, comm, timestamp_ns),
                 image_path,
             }));
             return;
@@ -122,7 +132,15 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
 
         // Never store "<unknown>": a cache hit on it would suppress live lookups.
         if image_path != "<unknown>" {
-            state.pids.lock().unwrap().insert(pid, image_path.clone());
+            // #371: read while the process most likely still runs; one already
+            // gone is in its parent's silo.
+            let parent_silo = state.pids.lock().unwrap().silo(ppid);
+            let silo = silo::exec_silo(winapi::read_server_silo_id(pid), parent_silo);
+            state
+                .pids
+                .lock()
+                .unwrap()
+                .insert(pid, image_path.clone(), silo);
         }
         if eid == 3 {
             return; // rundown: store populated, nothing else to do
@@ -140,7 +158,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
 
         let comm = basename(&image_path);
         sink.on_event(Event::Exec(ExecEvent {
-            meta: meta(pid, ppid, comm, timestamp_ns),
+            meta: state.meta(pid, ppid, comm, timestamp_ns),
             image_path,
             cmdline,
             argv: vec![], // Windows has a flat command line; consumers fall back
@@ -182,7 +200,7 @@ pub(crate) fn network_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
                 return;
             };
             sink.on_event(Event::UdpSend(UdpSendEvent {
-                meta: meta(pid, 0, comm, timestamp_ns),
+                meta: state.meta(pid, 0, comm, timestamp_ns),
                 daddr,
                 dport,
                 size,
@@ -237,7 +255,7 @@ pub(crate) fn network_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             return;
         };
         sink.on_event(Event::Connect(ConnectEvent {
-            meta: meta(pid, 0, comm, timestamp_ns),
+            meta: state.meta(pid, 0, comm, timestamp_ns),
             daddr,
             dport,
         }));
@@ -272,7 +290,7 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         };
         if eid == 26 {
             forward_mark_removal(&parser, &state, sink.as_ref(), || {
-                meta(pid, 0, comm, timestamp_ns)
+                state.meta(pid, 0, comm, timestamp_ns)
             });
             return;
         }
@@ -299,7 +317,7 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         }
         // #365: a create/write on `host:Zone.Identifier` is the mark-of-the-web
         // being written. The stream is read back off this thread (#439).
-        let meta = meta(pid, 0, comm, timestamp_ns);
+        let meta = state.meta(pid, 0, comm, timestamp_ns);
         if let Some(host) = zone_identifier::stream_host_path(&path) {
             state.marks.offer(zone_identifier::MarkWrite {
                 stream_path: path.clone(),
@@ -385,7 +403,7 @@ pub(crate) fn dns_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
         let comm = state.comm_for(pid).unwrap_or_default();
 
         sink.on_event(Event::DnsQuery(DnsQueryEvent {
-            meta: meta(pid, 0, comm, timestamp_ns),
+            meta: state.meta(pid, 0, comm, timestamp_ns),
             query,
             qtype: u32::from(qtype),
             result: if result_raw.is_empty() {
@@ -470,7 +488,7 @@ pub(crate) fn registry_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState
         let comm = state.comm_for(pid).unwrap_or_default();
 
         sink.on_event(Event::RegistrySet(RegistrySetEvent {
-            meta: meta(pid, 0, comm, timestamp_ns),
+            meta: state.meta(pid, 0, comm, timestamp_ns),
             key,
             value_name,
             data_type,
@@ -534,7 +552,7 @@ pub(crate) fn powershell_provider(sink: Arc<dyn EventSink>, state: Arc<SharedSta
         let comm = state.comm_for(pid).unwrap_or_default();
 
         sink.on_event(Event::ScriptBlock(ScriptBlockEvent {
-            meta: meta(pid, 0, comm, timestamp_ns),
+            meta: state.meta(pid, 0, comm, timestamp_ns),
             script_block_id,
             path,
             text,
@@ -600,7 +618,7 @@ pub(crate) fn amsi_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         let comm = state.comm_for(pid).unwrap_or_default();
 
         sink.on_event(Event::AmsiContent(AmsiContentEvent {
-            meta: meta(pid, 0, comm, timestamp_ns),
+            meta: state.meta(pid, 0, comm, timestamp_ns),
             session,
             app_name: parser.try_parse("appname").unwrap_or_default(),
             content_name: (!content_name.is_empty()).then_some(content_name),
@@ -648,7 +666,7 @@ pub(crate) fn ldap_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         let attributes: String = parser.try_parse("AttributeList").unwrap_or_default();
         let comm = state.comm_for(pid).unwrap_or_default();
         sink.on_event(Event::LdapSearch(LdapSearchEvent {
-            meta: meta(pid, 0, comm, timestamp_ns),
+            meta: state.meta(pid, 0, comm, timestamp_ns),
             filter: parser.try_parse("SearchFilter").unwrap_or_default(),
             base_dn: parser.try_parse("DistinguishedName").unwrap_or_default(),
             scope: parser.try_parse("ScopeOfSearch").unwrap_or(0),
@@ -714,7 +732,7 @@ pub(crate) fn wmi_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
         }
 
         sink.on_event(Event::WmiActivity(WmiActivityEvent {
-            meta: meta(pid, 0, comm, timestamp_ns),
+            meta: state.meta(pid, 0, comm, timestamp_ns),
             namespace,
             query,
             method,
@@ -772,7 +790,7 @@ pub(crate) fn dotnet_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>)
         let comm = state.comm_for(pid).unwrap_or_default();
 
         sink.on_event(Event::AssemblyLoad(AssemblyLoadEvent {
-            meta: meta(pid, 0, comm, timestamp_ns),
+            meta: state.meta(pid, 0, comm, timestamp_ns),
             assembly_name,
             flags,
         }));
@@ -820,7 +838,7 @@ pub(crate) fn smb_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
         let comm = state.comm_for(pid).unwrap_or_default();
 
         sink.on_event(Event::SmbConnect(SmbConnectEvent {
-            meta: meta(pid, 0, comm, timestamp_ns),
+            meta: state.meta(pid, 0, comm, timestamp_ns),
             server_name,
         }));
     };

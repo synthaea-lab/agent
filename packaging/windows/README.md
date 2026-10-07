@@ -94,6 +94,19 @@ for lab-only testing (`New-SelfSignedCertificate` + `Set-AuthenticodeSignature`)
 but is not a substitute for the real thing before this goes anywhere near a
 managed fleet.
 
+## Containers
+
+A host install covers **process-isolated** containers: their processes run on the
+host kernel and carry the container id (#371, `docs/sensors/windows.md`). It does
+not cover:
+
+- **Hyper-V-isolated containers**: each runs its own kernel in a utility VM. Treat
+  one as a separate machine (the agent inside it), or run the workload
+  process-isolated where the image's build allows it.
+- **WSL2 distributions and Docker Desktop's Linux engine**: Linux in a VM. Install
+  the Linux package (`packaging/linux`) inside the distribution;
+  Docker Desktop's own `docker-desktop` distribution is not an install target.
+
 ## Known gaps (first pass, #37)
 
 - `rules/sigma` and `rules/yara` content directories are not included -

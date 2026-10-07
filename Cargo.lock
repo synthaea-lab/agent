@@ -2473,6 +2473,7 @@ version = "0.1.0"
 dependencies = [
  "ferrisetw",
  "schema",
+ "serde_json",
  "tracing",
  "windows-sys 0.61.2",
 ]
