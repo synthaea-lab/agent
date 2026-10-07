@@ -68,6 +68,9 @@ pub struct AgentConfig {
 /// kind, so the count of decoys on disk is bounded by this and nothing else.
 pub const MAX_CANARY_DIRS: usize = 16;
 
+/// Most executables `[deception] allow_exe` may list.
+pub const MAX_CANARY_ALLOW_EXES: usize = 32;
+
 /// The `[deception]` table: where canary files go. Off unless the operator names
 /// directories, because a decoy belongs where nothing legitimate reads it and only
 /// the operator knows which directories those are on this host.
@@ -77,6 +80,12 @@ pub struct DeceptionConfig {
     /// Existing directories that each receive one canary per kind. Empty by default.
     #[serde(default)]
     pub canary_dirs: Vec<PathBuf>,
+    /// Executables whose touches of a canary are not a detection: indexers and backup
+    /// agents that walk every directory. Absolute paths, matched against the toucher's
+    /// resolved executable, never its name; the agent also requires the path to be a
+    /// trusted system location. Empty by default.
+    #[serde(default)]
+    pub allow_exe: Vec<PathBuf>,
 }
 
 /// Most log sources one agent reads. Each is a tailed file and a parser fed by

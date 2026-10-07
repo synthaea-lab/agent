@@ -45,6 +45,7 @@ dependencies = [
  "sensor-linux-netlink",
  "sensor-linux-procmem",
  "sensor-linux-uprobes",
+ "sensor-linux-wire",
  "sensor-macos",
  "sensor-macos-network-extension",
  "sensor-macos-sockets",
@@ -2583,6 +2584,7 @@ name = "sensor-windows"
 version = "0.1.0"
 dependencies = [
  "ferrisetw",
+ "proptest",
  "schema",
  "tracing",
  "windows-sys 0.61.2",

@@ -53,6 +53,124 @@ fn load_or_create_seed(state_dir: &Path) -> io::Result<Seed> {
     Ok(Seed::from_bytes(bytes))
 }
 
+/// Executables the operator declared as legitimate canary readers (indexers, backup
+/// agents), matched on the toucher's resolved image path.
+///
+/// An allow-list keyed on `comm` would let any process rename itself past the tripwire, so
+/// the entry must match `/proc/<pid>/exe` and sit in a trusted system location
+/// (`policy::name_exclusion_applies`). Anything that cannot be resolved (the process
+/// already exited, a non-Linux platform, a binary replaced since: `... (deleted)`) is not
+/// allowed. This fails closed, the opposite of the exclusions that keep an unknown path.
+pub(crate) struct CanaryAllow {
+    exes: Vec<PathBuf>,
+    resolve: fn(u32) -> Option<PathBuf>,
+}
+
+impl CanaryAllow {
+    /// The allow-list of `config`; an entry outside a trusted system location is dropped
+    /// with a warning rather than honoured.
+    pub(crate) fn new(config: &config::DeceptionConfig) -> Self {
+        Self::with_resolver(config, proc_exe)
+    }
+
+    fn with_resolver(
+        config: &config::DeceptionConfig,
+        resolve: fn(u32) -> Option<PathBuf>,
+    ) -> Self {
+        let exes = config
+            .allow_exe
+            .iter()
+            .map(|exe| canonical_entry(exe))
+            .filter(|exe| {
+                let trusted = policy::name_exclusion_applies(exe.to_str());
+                if !trusted {
+                    tracing::warn!(
+                        exe = %exe.display(),
+                        "deception: allow_exe entry is not in a trusted system location, ignored"
+                    );
+                }
+                trusted && exe.to_str().is_some_and(|p| !p.is_empty())
+            })
+            .collect();
+        Self { exes, resolve }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(exe: &str, resolve: fn(u32) -> Option<PathBuf>) -> Self {
+        Self {
+            exes: vec![PathBuf::from(exe)],
+            resolve,
+        }
+    }
+
+    /// Whether `pid` runs an allowed executable.
+    pub(crate) fn allows(&self, pid: u32) -> bool {
+        !self.exes.is_empty() && (self.resolve)(pid).is_some_and(|exe| self.exes.contains(&exe))
+    }
+}
+
+/// An entry as `/proc/<pid>/exe` will show it: with symlinks resolved. `/usr/bin/updatedb`
+/// is a link to `updatedb.plocate` on Debian and `/bin/x` is `/usr/bin/x` under usrmerge, and
+/// the kernel reports the real file, so an entry under the link's name would never match.
+/// An entry that does not resolve (not installed here) is kept as written: it can only match
+/// by being exactly what the kernel reports.
+fn canonical_entry(exe: &Path) -> PathBuf {
+    fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf())
+}
+
+/// The mount namespace of `pid` (`mnt:[inode]`), `None` when it cannot be read.
+#[cfg(target_os = "linux")]
+fn mount_namespace(pid: impl std::fmt::Display) -> Option<PathBuf> {
+    fs::read_link(format!("/proc/{pid}/ns/mnt")).ok()
+}
+
+/// The executable behind `pid`, as a path the agent can compare with its allow-list. Linux
+/// only; elsewhere nothing resolves, so nothing is allowed.
+///
+/// A process in another mount namespace (a container, a chroot) reports a path in *its* view,
+/// so its own `/usr/bin/updatedb` would equal the host's. Such a process is not resolved:
+/// the agent's namespace is the only one in which a path means what the allow-list says.
+/// Reading either namespace link of another user's process needs the same ptrace access as
+/// `/proc/<pid>/exe` does, so where the agent lacks it nothing resolves and the hit is raised.
+fn proc_exe(pid: u32) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        if mount_namespace(pid)? != mount_namespace("self")? {
+            return None;
+        }
+        fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// The configured directories whose canaries the Linux sensor does not report a read of.
+///
+/// The sensor drops read-only opens under `/tmp`, `/var/tmp`, `/dev/shm` (and everything
+/// under `/dev`, `/sys`, `/proc`), so a canary placed there still fires on a delete, rename
+/// or write-intent open (the ransomware path) but never on a read (the recon path). The
+/// answer comes from the sensor's own filter, so the two cannot drift. Empty off Linux.
+fn read_blind_dirs(dirs: &[PathBuf]) -> Vec<&PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        dirs.iter()
+            .filter(|dir| {
+                let probe = dir.join("canary");
+                sensor_linux_wire::is_filtered_path(probe.as_os_str().as_bytes(), 0, false)
+            })
+            .collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dirs;
+        Vec::new()
+    }
+}
+
 /// Plants the configured canaries and returns the tripwires over everything inventoried.
 /// `None` when nothing is configured or planting failed (said in the log).
 ///
@@ -71,6 +189,29 @@ pub(crate) fn start(config: &config::DeceptionConfig, state_dir: &Path) -> Optio
             return None;
         }
     };
+    for dir in read_blind_dirs(&config.canary_dirs) {
+        tracing::warn!(
+            dir = %dir.display(),
+            "deception: the sensor does not report read-only opens under this directory, so a \
+             canary here fires on delete, rename and write but not on a read; place canaries \
+             elsewhere to catch reconnaissance"
+        );
+    }
+    let canaries = planned_canaries(config, &seed);
+    plant_each_directory(&canaries, &inventory);
+    // A canary deleted while the agent was down is put back now; see `refresh_once`.
+    refresh_once(&canaries, &inventory);
+    match Inventory::load(&inventory) {
+        Ok(inventory) => Some(Tripwires::from_inventory(&inventory)).filter(|t| !t.is_empty()),
+        Err(error) => {
+            tracing::error!(%error, "deception: inventory unreadable, no tripwires");
+            None
+        }
+    }
+}
+
+/// The canaries `config` calls for, named and filled from `seed`: the same on every call.
+fn planned_canaries(config: &config::DeceptionConfig, seed: &Seed) -> Vec<deception::Canary> {
     let placements: Vec<Placement> = config
         .canary_dirs
         .iter()
@@ -79,13 +220,59 @@ pub(crate) fn start(config: &config::DeceptionConfig, state_dir: &Path) -> Optio
             kinds: Kind::ALL.to_vec(),
         })
         .collect();
-    plant_each_directory(&deception::plan(&seed, &placements), &inventory);
-    match Inventory::load(&inventory) {
-        Ok(inventory) => Some(Tripwires::from_inventory(&inventory)).filter(|t| !t.is_empty()),
-        Err(error) => {
-            tracing::error!(%error, "deception: inventory unreadable, no tripwires");
-            None
+    deception::plan(seed, &placements)
+}
+
+/// How often the refresh puts back canaries that were deleted while the agent runs.
+const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The refresh policy (issue #81): a planted canary that is gone is planted again, with the
+/// content it had, so the decoy is there for the next intruder. It fills gaps and nothing
+/// else: a file that was modified or replaced is left alone and counted, and a canary the
+/// inventory does not know is not planted here. The deletion itself was already a tripwire
+/// hit (a delete of a canary), so restoring it hides nothing.
+pub(crate) fn refresh_once(canaries: &[deception::Canary], inventory: &Path) {
+    match deception::refresh(canaries, inventory) {
+        Ok(report) => {
+            if !report.restored.is_empty() {
+                tracing::info!(
+                    restored = report.restored.len(),
+                    "deception: deleted canaries replanted"
+                );
+            }
+            if !report.changed.is_empty() || !report.unrestorable.is_empty() {
+                tracing::warn!(
+                    changed = report.changed.len(),
+                    unrestorable = report.unrestorable.len(),
+                    "deception: some canaries are not as planted and were left alone"
+                );
+            }
         }
+        Err(error) => tracing::error!(%error, "deception: refresh failed"),
+    }
+}
+
+/// Runs [`refresh_once`] every [`REFRESH_INTERVAL`] in a detached thread: nothing waits for it.
+pub(crate) fn spawn_refresh(config: config::DeceptionConfig, state_dir: PathBuf) {
+    if config.canary_dirs.is_empty() {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("deception-refresh".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(REFRESH_INTERVAL);
+                match load_or_create_seed(&state_dir) {
+                    Ok(seed) => refresh_once(
+                        &planned_canaries(&config, &seed),
+                        &inventory_path(&state_dir),
+                    ),
+                    Err(error) => tracing::error!(%error, "deception: refresh has no seed"),
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::error!(%error, "deception: could not start the refresh thread");
     }
 }
 
@@ -161,6 +348,7 @@ mod tests {
     fn config_for(dirs: &[&Path]) -> config::DeceptionConfig {
         config::DeceptionConfig {
             canary_dirs: dirs.iter().map(|d| d.to_path_buf()).collect(),
+            ..Default::default()
         }
     }
 
@@ -304,5 +492,179 @@ mod tests {
         assert!(tripwires.is_none());
         let inventory = Inventory::load(&inventory_path(state.path())).unwrap();
         assert!(inventory.entries.is_empty());
+    }
+
+    fn allow_of(exes: &[&str], resolve: fn(u32) -> Option<PathBuf>) -> CanaryAllow {
+        CanaryAllow::with_resolver(
+            &config::DeceptionConfig {
+                allow_exe: exes.iter().map(PathBuf::from).collect(),
+                ..Default::default()
+            },
+            resolve,
+        )
+    }
+
+    #[test]
+    fn a_process_running_an_allowed_system_executable_is_allowed() {
+        let allow = allow_of(&["/usr/bin/updatedb"], |_| Some("/usr/bin/updatedb".into()));
+        assert!(allow.allows(10));
+    }
+
+    #[test]
+    fn another_executable_is_not_allowed_even_with_the_same_name() {
+        let allow = allow_of(&["/usr/bin/updatedb"], |_| Some("/tmp/updatedb".into()));
+        assert!(!allow.allows(10));
+    }
+
+    #[test]
+    fn an_unresolvable_process_is_not_allowed() {
+        let allow = allow_of(&["/usr/bin/updatedb"], |_| None);
+        assert!(!allow.allows(10));
+    }
+
+    #[test]
+    fn an_entry_outside_a_trusted_location_is_ignored() {
+        let allow = allow_of(&["/tmp/updatedb"], |_| Some("/tmp/updatedb".into()));
+        assert!(!allow.allows(10));
+    }
+
+    #[test]
+    fn a_replaced_binary_is_not_allowed() {
+        let allow = allow_of(&["/usr/bin/updatedb"], |_| {
+            Some("/usr/bin/updatedb (deleted)".into())
+        });
+        assert!(!allow.allows(10));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directories_the_sensor_does_not_read_report_are_flagged() {
+        let dirs: Vec<PathBuf> = [
+            "/tmp/x",
+            "/var/tmp",
+            "/dev/shm/a",
+            "/srv/share",
+            "/home/u/docs",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        let blind: Vec<_> = read_blind_dirs(&dirs)
+            .into_iter()
+            .map(|d| d.to_str().unwrap())
+            .collect();
+        assert_eq!(blind, ["/tmp/x", "/var/tmp", "/dev/shm/a"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_executable_of_the_agents_own_process_resolves() {
+        let exe = proc_exe(std::process::id()).expect("own exe in own namespace");
+        assert_eq!(
+            exe,
+            fs::canonicalize(std::env::current_exe().unwrap()).unwrap()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pid_that_does_not_exist_does_not_resolve() {
+        assert!(mount_namespace(u32::MAX).is_none());
+        assert!(proc_exe(u32::MAX).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_in_another_mount_namespace_does_not_resolve() {
+        // `unshare` needs privilege that CI and a normal user lack; where it is not
+        // available there is nothing to test, and the comparison itself is a one-line
+        // inequality on the two links.
+        let Ok(child) = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "sleep", "5"])
+            .spawn()
+        else {
+            return;
+        };
+        let mut child = child;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let theirs = mount_namespace(child.id());
+        let ours = mount_namespace("self");
+        let resolved = proc_exe(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        if theirs.is_some() && theirs != ours {
+            assert!(
+                resolved.is_none(),
+                "another mount namespace must not resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn an_entry_that_is_a_symlink_is_compared_by_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("updatedb.plocate");
+        fs::write(&target, b"x").unwrap();
+        let link = dir.path().join("updatedb");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(not(unix))]
+        fs::write(&link, b"x").unwrap();
+        let resolved = fs::canonicalize(&target).unwrap();
+        #[cfg(unix)]
+        assert_eq!(canonical_entry(&link), resolved);
+        assert_eq!(canonical_entry(&target), resolved);
+    }
+
+    #[test]
+    fn an_entry_that_does_not_resolve_is_kept_as_written() {
+        let missing = Path::new("/usr/sbin/not-installed-here");
+        assert_eq!(canonical_entry(missing), missing);
+    }
+
+    #[test]
+    fn a_canary_deleted_while_the_agent_was_down_is_back_after_a_restart() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        start(&config_for(&[dir.path()]), state.path()).unwrap();
+        let gone = fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let content = fs::read_to_string(&gone).unwrap();
+        fs::remove_file(&gone).unwrap();
+        start(&config_for(&[dir.path()]), state.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(&gone).unwrap(),
+            content,
+            "replanted as it was"
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), Kind::ALL.len());
+    }
+
+    #[test]
+    fn refresh_once_replants_a_deleted_canary_and_leaves_a_replaced_one() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_for(&[dir.path()]);
+        start(&config, state.path()).unwrap();
+        let seed = load_or_create_seed(state.path()).unwrap();
+        let canaries = planned_canaries(&config, &seed);
+        fs::remove_file(&canaries[0].path).unwrap();
+        fs::write(&canaries[1].path, "the user's own file").unwrap();
+        refresh_once(&canaries, &inventory_path(state.path()));
+        assert!(canaries[0].path.exists());
+        assert_eq!(
+            fs::read_to_string(&canaries[1].path).unwrap(),
+            "the user's own file"
+        );
+    }
+
+    #[test]
+    fn no_refresh_thread_without_canary_directories() {
+        // An empty config returns before any thread exists: nothing to assert but no panic.
+        spawn_refresh(config_for(&[]), PathBuf::from("/nonexistent"));
     }
 }

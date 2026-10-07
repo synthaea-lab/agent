@@ -53,6 +53,7 @@ mod log_sources;
 mod memscan;
 mod protected;
 mod quarantine_cmd;
+mod ransomware_join;
 mod redact;
 mod release;
 mod shutdown;
@@ -306,7 +307,17 @@ enum QuarantineAction {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> std::process::ExitCode {
+    match try_main() {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn try_main() -> anyhow::Result<std::process::ExitCode> {
     let cli = Cli::parse();
 
     // Load the local install configuration BEFORE anything else — logging
@@ -336,7 +347,8 @@ fn main() -> anyhow::Result<()> {
         cfg.server.control_plane_url
     );
 
-    match cli.command {
+    let mut exit_code = std::process::ExitCode::SUCCESS;
+    let result = match cli.command {
         Command::Status => commands::cmd_status(),
         Command::Run {
             alerts,
@@ -417,7 +429,7 @@ fn main() -> anyhow::Result<()> {
                 &cfg.ipc.endpoint,
             )?;
             if outcome == content::ApplyOutcome::RingHalted {
-                std::process::exit(content::EXIT_RING_HALTED);
+                exit_code = std::process::ExitCode::from(apply_exit_status(outcome) as u8);
             }
             Ok(())
         }
@@ -445,5 +457,26 @@ fn main() -> anyhow::Result<()> {
             !no_restart,
             allow_test_key,
         ),
+    };
+    result?;
+    Ok(exit_code)
+}
+
+fn apply_exit_status(outcome: content::ApplyOutcome) -> i32 {
+    if outcome == content::ApplyOutcome::RingHalted {
+        content::EXIT_RING_HALTED
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod exit_code_tests {
+    use super::*;
+
+    #[test]
+    fn a_halted_content_ring_returns_exit_status_75() {
+        assert_eq!(apply_exit_status(content::ApplyOutcome::RingHalted), 75);
+        assert_eq!(apply_exit_status(content::ApplyOutcome::Done), 0);
     }
 }

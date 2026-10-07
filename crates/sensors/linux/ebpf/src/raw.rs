@@ -21,9 +21,9 @@ use crate::{
     sys_enter_process_vm_writev, sys_enter_ptrace, sys_enter_recvfrom, sys_enter_removexattr,
     sys_enter_rename, sys_enter_renameat, sys_enter_renameat2, sys_enter_sendto,
     sys_enter_setfsgid, sys_enter_setfsuid, sys_enter_setgid, sys_enter_setns, sys_enter_setresgid,
-    sys_enter_setresuid, sys_enter_setuid, sys_enter_setxattr, sys_enter_tgkill, sys_enter_umount,
-    sys_enter_unlink, sys_enter_unlinkat, sys_enter_unshare, sys_enter_write, sys_exit_accept,
-    sys_exit_accept4, sys_exit_memfd_create, sys_exit_recvfrom,
+    sys_enter_setresuid, sys_enter_setuid, sys_enter_setxattr, sys_enter_socket, sys_enter_tgkill,
+    sys_enter_umount, sys_enter_unlink, sys_enter_unlinkat, sys_enter_unshare, sys_enter_write,
+    sys_exit_accept, sys_exit_accept4, sys_exit_memfd_create, sys_exit_recvfrom, sys_exit_socket,
 };
 
 const MAX_SYSCALL_ID: u32 = 1024;
@@ -31,6 +31,7 @@ const EXIT_ACCEPT: u32 = 1;
 const EXIT_ACCEPT4: u32 = 2;
 const EXIT_MEMFD_CREATE: u32 = 3;
 const EXIT_RECVFROM: u32 = 4;
+const EXIT_SOCKET: u32 = 5;
 
 /// syscall id → handler id. Userspace fills this from libc's architecture ABI.
 #[map]
@@ -298,6 +299,10 @@ pub fn raw_sys_enter(ctx: RawTracePointContext) -> u32 {
             stash_pending_syscall_exit(pid_tgid, EXIT_RECVFROM);
             sys_enter_recvfrom(trace_ctx)
         }
+        45 => {
+            stash_pending_syscall_exit(pid_tgid, EXIT_SOCKET);
+            sys_enter_socket(trace_ctx)
+        }
         _ => 0,
     }
 }
@@ -337,6 +342,7 @@ pub fn raw_sys_exit(ctx: RawTracePointContext) -> u32 {
         EXIT_ACCEPT4 => sys_exit_accept4(trace_ctx),
         EXIT_MEMFD_CREATE => sys_exit_memfd_create(trace_ctx),
         EXIT_RECVFROM => sys_exit_recvfrom(trace_ctx),
+        EXIT_SOCKET => sys_exit_socket(trace_ctx),
         _ => 0,
     }
 }

@@ -48,6 +48,20 @@ ldd target/release/deps/ml-* | grep -i onnx  # Should return nothing
 
 **Note:** The `--no-default-features` flag disables the `dynamic-onnx` feature, forcing static linking.
 
+#### Windows (MSVC)
+
+```powershell
+.\lab\provisioning\build-onnxruntime-static.ps1
+$env:ORT_LIB_LOCATION = "$PWD\onnxruntime\build\Windows\Release\Release"
+.\lab\provisioning\ort-static-link-flags.ps1 | Invoke-Expression
+cargo test -j 1 -p ml --release --no-default-features
+python tools\check-pe-imports.py target\release\deps\ml-*.exe   # no onnxruntime/directml/d3d12
+```
+
+The source build is CPU only, so unlike the prebuilt download the binary does not import
+`directml.dll` or `d3d12.dll`. Prerequisites, timings and the Windows-specific pitfalls
+(`re2`, `shell32`, memory while linking) are in `lab/provisioning/onnxruntime-static-build.md`.
+
 #### Detailed Documentation
 
 See `lab/provisioning/onnxruntime-static-build.md` for:
