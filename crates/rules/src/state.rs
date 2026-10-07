@@ -26,8 +26,7 @@ use crate::{
         LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS, MEMFD_EXEC_WINDOW_NS,
         PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES, QUARANTINE_EXEC_WINDOW_NS,
         RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD,
-        RANSOMWARE_RENAME_WINDOW_NS, RDP_SUCCESS_AFTER_FAILURES_THRESHOLD,
-        RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
+        RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
         SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS,
         SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS,
         SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN,
@@ -35,6 +34,7 @@ use crate::{
         TOUCHED_FILES_PID_CAP,
     },
     has_write_intent,
+    rdp::RdpSuccessAfterFailures,
     session::SessionHijack,
     sliding::{FlowPortDedup, SlidingCounter, SlidingDistinct, SlidingSum},
 };
@@ -164,10 +164,9 @@ pub struct RuleState {
     /// LRU-bounded like every other counter: a spray across many fabricated
     /// usernames must not grow this without limit.
     auth_failures: BoundedMap<(String, String), SlidingCounter>,
-    /// Source address → sliding authentication-failure counter for RDP
-    /// success-after-failures (T1021.001), across all target accounts. LRU-bounded
-    /// like the per-account T1110 counter above.
-    rdp_source_auth_failures: BoundedMap<IpAddr, SlidingCounter>,
+    /// RDP authentication successes joined to the failures from the same address,
+    /// by event time (T1021.001, #285); see the `rdp` module.
+    rdp_success: RdpSuccessAfterFailures,
     /// pid → sliding counter for RANSOMWARE-RENAME (T1486, issue #262): renames by
     /// this pid where `new_path` is `old_path` plus an appended suffix. LRU-bounded:
     /// a hostile process renaming under many different pids (unusual, but not
@@ -293,7 +292,7 @@ impl RuleState {
             scan_spread: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
             auth_failures: BoundedMap::new(COUNTER_CAP),
-            rdp_source_auth_failures: BoundedMap::new(COUNTER_CAP),
+            rdp_success: RdpSuccessAfterFailures::new(),
             recent_creates: BoundedMap::new(CREATE_UNLINK_PID_CAP),
             pending_unlinks: BoundedMap::new(CREATE_UNLINK_PID_CAP),
             touched_files: BoundedMap::new(TOUCHED_FILES_PID_CAP),
@@ -969,17 +968,19 @@ impl RuleState {
             .map_or_else(|| "local".to_string(), |a| a.to_string());
         let key = (event.target_user.clone(), source.clone());
         let ts = event.meta.timestamp_ns;
-        if let Some(address) = event.source_address {
-            self.rdp_source_auth_failures
-                .get_or_insert_with(address, SlidingCounter::default)
-                .record(ts, RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS);
-        }
+        // A success can reach the rules before the last failures that precede
+        // it (two channels, two poll threads): this failure may complete it.
+        let mut alerts: Vec<Alert> = event
+            .source_address
+            .and_then(|address| self.rdp_success.on_failure(address, ts))
+            .into_iter()
+            .collect();
         let entry = self
             .auth_failures
             .get_or_insert_with(key, SlidingCounter::default);
         let count = entry.record(ts, AUTH_FAILURE_WINDOW_NS);
         if count >= AUTH_FAILURE_THRESHOLD && entry.try_alert(ts, AUTH_FAILURE_WINDOW_NS) {
-            return vec![Alert {
+            alerts.push(Alert {
                 technique: "T1110",
                 severity: Severity::Medium,
                 message: format!(
@@ -987,9 +988,9 @@ impl RuleState {
                     event.target_user,
                     AUTH_FAILURE_WINDOW_NS / 1_000_000_000,
                 ),
-            }];
+            });
         }
-        Vec::new()
+        alerts
     }
 
     /// To be called for every `SessionEvent` in the stream (Windows Terminal
@@ -1002,26 +1003,12 @@ impl RuleState {
         if event.state != SessionState::Connect || event.console {
             return alerts;
         }
-        let Some(address) = event.source_address else {
-            return alerts;
-        };
-        let Some(failures) = self.rdp_source_auth_failures.get_mut(&address) else {
-            return alerts;
-        };
-        let ts = event.meta.timestamp_ns;
-        let count = failures.count_within(ts, RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS);
-        if count >= RDP_SUCCESS_AFTER_FAILURES_THRESHOLD
-            && failures.try_alert(ts, RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS)
-        {
-            alerts.push(Alert {
-                technique: "T1021.001",
-                severity: Severity::High,
-                message: format!(
-                    "user={} source={address}: RDP authentication succeeded after {count} failed authentications from that address in {}s — guessed or sprayed credentials worked",
-                    event.target_user,
-                    RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS / 1_000_000_000,
-                ),
-            });
+        if let Some(address) = event.source_address {
+            alerts.extend(self.rdp_success.on_success(
+                address,
+                event.meta.timestamp_ns,
+                &event.target_user,
+            ));
         }
         alerts
     }

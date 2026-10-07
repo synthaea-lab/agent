@@ -1,6 +1,6 @@
 //! RDP success-after-failures rule (T1021.001).
 
-use schema::{AuthEvent, AuthKind, AuthOutcome, SessionEvent, SessionState};
+use schema::{AuthEvent, AuthOutcome, SessionEvent, SessionState, fixtures};
 
 use super::*;
 use crate::exclusions::{
@@ -8,6 +8,7 @@ use crate::exclusions::{
 };
 
 const SEC: u64 = 1_000_000_000;
+const THRESHOLD: u64 = RDP_SUCCESS_AFTER_FAILURES_THRESHOLD as u64;
 
 fn failure(source: &str, user: &str, ts: u64) -> AuthEvent {
     AuthEvent {
@@ -16,11 +17,9 @@ fn failure(source: &str, user: &str, ts: u64) -> AuthEvent {
             ..meta()
         },
         outcome: AuthOutcome::Failure,
-        kind: AuthKind::LogonFailure,
         target_user: user.to_string(),
-        target_user_sid: None,
         source_address: Some(source.parse().unwrap()),
-        status_code: None,
+        ..fixtures::auth()
     }
 }
 
@@ -41,7 +40,7 @@ fn connect(source: Option<&str>, user: &str, ts: u64) -> SessionEvent {
 #[test]
 fn connect_after_five_failures_across_accounts_alerts_once_per_window() {
     let mut state = RuleState::new();
-    for i in 0..u64::from(RDP_SUCCESS_AFTER_FAILURES_THRESHOLD) {
+    for i in 0..THRESHOLD {
         let user = if i % 2 == 0 { "alice" } else { "bob" };
         state.on_auth(&failure("192.0.2.50", user, i * SEC));
     }
@@ -50,7 +49,7 @@ fn connect_after_five_failures_across_accounts_alerts_once_per_window() {
     let alerts = state.on_session(&success);
     assert_eq!(alerts.len(), 1);
     assert_eq!(alerts[0].technique, "T1021.001");
-    assert_eq!(alerts[0].severity, schema::detection::Severity::High);
+    assert_eq!(alerts[0].severity, schema::detection::Severity::Medium);
     assert!(alerts[0].message.contains("LAB\\alice"));
     assert!(alerts[0].message.contains("192.0.2.50"));
     assert!(alerts[0].message.contains("5 failed authentications"));
@@ -60,7 +59,7 @@ fn connect_after_five_failures_across_accounts_alerts_once_per_window() {
 #[test]
 fn connect_below_threshold_does_not_alert() {
     let mut state = RuleState::new();
-    for i in 0..u64::from(RDP_SUCCESS_AFTER_FAILURES_THRESHOLD - 1) {
+    for i in 0..THRESHOLD - 1 {
         state.on_auth(&failure("192.0.2.50", "alice", i * SEC));
     }
     assert!(
@@ -73,7 +72,7 @@ fn connect_below_threshold_does_not_alert() {
 #[test]
 fn failures_from_another_source_do_not_count() {
     let mut state = RuleState::new();
-    for i in 0..u64::from(RDP_SUCCESS_AFTER_FAILURES_THRESHOLD) {
+    for i in 0..THRESHOLD {
         state.on_auth(&failure("192.0.2.50", "alice", i * SEC));
     }
     assert!(
@@ -86,30 +85,102 @@ fn failures_from_another_source_do_not_count() {
 #[test]
 fn failures_outside_the_window_do_not_count() {
     let mut state = RuleState::new();
-    for i in 0..u64::from(RDP_SUCCESS_AFTER_FAILURES_THRESHOLD) {
+    for i in 0..THRESHOLD {
         state.on_auth(&failure("192.0.2.50", "alice", i * SEC));
     }
-    let success_ts = RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS + 5 * SEC;
+    let late = RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS + 10 * SEC;
     assert!(
         state
-            .on_session(&connect(Some("192.0.2.50"), "alice", success_ts))
+            .on_session(&connect(Some("192.0.2.50"), "alice", late))
             .is_empty()
     );
 }
 
 #[test]
-fn console_or_addressless_connect_never_alerts() {
+fn connect_without_a_source_address_is_ignored() {
     let mut state = RuleState::new();
-    for i in 0..u64::from(RDP_SUCCESS_AFTER_FAILURES_THRESHOLD) {
+    for i in 0..THRESHOLD {
         state.on_auth(&failure("192.0.2.50", "alice", i * SEC));
     }
-
-    let mut console = connect(Some("192.0.2.50"), "alice", 10 * SEC);
-    console.console = true;
-    assert!(state.on_session(&console).is_empty());
     assert!(
         state
             .on_session(&connect(None, "alice", 10 * SEC))
+            .is_empty()
+    );
+}
+
+#[test]
+fn success_delivered_before_the_last_failure_still_alerts() {
+    // The two channels are polled by independent threads: the 1149 can reach
+    // the rules before the fifth 4625 that precedes it in time.
+    let mut state = RuleState::new();
+    for i in 0..THRESHOLD - 1 {
+        state.on_auth(&failure("192.0.2.50", "alice", i * SEC));
+    }
+    assert!(
+        state
+            .on_session(&connect(Some("192.0.2.50"), "alice", 10 * SEC))
+            .is_empty(),
+        "four failures are not enough yet"
+    );
+
+    let alerts = state.on_auth(&failure("192.0.2.50", "alice", 6 * SEC));
+    let rdp: Vec<_> = alerts
+        .iter()
+        .filter(|a| a.technique == "T1021.001")
+        .collect();
+    assert_eq!(rdp.len(), 1, "the late failure completes the join");
+    assert!(rdp[0].message.contains("alice"));
+
+    assert!(
+        state
+            .on_auth(&failure("192.0.2.50", "alice", 7 * SEC))
+            .iter()
+            .all(|a| a.technique != "T1021.001"),
+        "once per window"
+    );
+}
+
+#[test]
+fn failure_timestamped_after_the_success_does_not_count() {
+    let mut state = RuleState::new();
+    for i in 0..THRESHOLD - 1 {
+        state.on_auth(&failure("192.0.2.50", "alice", i * SEC));
+    }
+    state.on_session(&connect(Some("192.0.2.50"), "alice", 10 * SEC));
+
+    let alerts = state.on_auth(&failure("192.0.2.50", "alice", 11 * SEC));
+    assert!(
+        alerts.iter().all(|a| a.technique != "T1021.001"),
+        "a failure after the success is not a failure before it"
+    );
+}
+
+#[test]
+fn ipv4_mapped_ipv6_address_is_the_same_source() {
+    let mut state = RuleState::new();
+    for i in 0..THRESHOLD {
+        state.on_auth(&failure("::ffff:192.0.2.50", "alice", i * SEC));
+    }
+    let alerts = state.on_session(&connect(Some("192.0.2.50"), "alice", 10 * SEC));
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn a_second_success_in_the_same_window_does_not_alert_again() {
+    let mut state = RuleState::new();
+    for i in 0..THRESHOLD {
+        state.on_auth(&failure("192.0.2.50", "alice", i * SEC));
+    }
+    assert_eq!(
+        state
+            .on_session(&connect(Some("192.0.2.50"), "alice", 10 * SEC))
+            .len(),
+        1
+    );
+    assert!(
+        state
+            .on_session(&connect(Some("192.0.2.50"), "alice", 20 * SEC))
             .is_empty()
     );
 }

@@ -15,6 +15,7 @@ mod defender;
 mod exclusions;
 mod ld_trust;
 mod ldap;
+mod rdp;
 mod session;
 mod sliding;
 mod state;

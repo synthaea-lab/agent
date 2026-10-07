@@ -507,7 +507,7 @@ fn to_auth_event(logon: &LogonEvent) -> Option<Event> {
             pid: logon.pid,
             ppid: 0,
             user,
-            timestamp_ns: now_ns(),
+            timestamp_ns: logon.time_created_ns.unwrap_or_else(now_ns),
             comm: LSASS_COMM.to_string(),
             container: None, // Windows: no container support
             process_generation: None,
@@ -1021,7 +1021,7 @@ fn session_event(ev: xml::TerminalSessionEvent, state: SessionState) -> Event {
             pid: ev.pid,
             ppid: 0,
             user: User::Unknown,
-            timestamp_ns: now_ns(),
+            timestamp_ns: ev.time_created_ns.unwrap_or_else(now_ns),
             comm: String::new(),
             container: None, // Windows: no container support
             process_generation: None,

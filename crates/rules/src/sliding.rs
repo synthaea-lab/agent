@@ -35,15 +35,6 @@ impl SlidingCounter {
         self.timestamps.len() as u32
     }
 
-    /// In-window count at `ts` without recording anything: how many recorded
-    /// timestamps are at most `window_ns` old.
-    pub(crate) fn count_within(&self, ts: u64, window_ns: u64) -> u32 {
-        self.timestamps
-            .iter()
-            .filter(|&&t| ts.saturating_sub(t) <= window_ns)
-            .count() as u32
-    }
-
     /// One alert per window: true (and remembers) unless one already fired within
     /// the window.
     pub(crate) fn try_alert(&mut self, ts: u64, window_ns: u64) -> bool {
