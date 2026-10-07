@@ -678,11 +678,11 @@ impl DetectionSink {
             return;
         }
         let meta = event.meta();
-        let corroborated = self
-            .ransomware_join
-            .lock()
-            .unwrap()
-            .note_canary((hit.pid, meta.process_generation), meta.timestamp_ns);
+        let corroborated = self.ransomware_join.lock().unwrap().note_canary(
+            hit.pid,
+            meta.process_generation,
+            meta.timestamp_ns,
+        );
         if absorbable(&hit.touch)
             && self.canary_in_cooldown(
                 (hit.canary.path.clone(), hit.pid, meta.process_generation),
@@ -924,10 +924,11 @@ impl DetectionSink {
     /// detection first and then calls [`Self::ransomware_reflex`].
     fn note_ransomware_burst(&self, event: &Event) -> bool {
         let meta = event.meta();
-        self.ransomware_join
-            .lock()
-            .unwrap()
-            .note_burst((meta.pid, meta.process_generation), meta.timestamp_ns)
+        self.ransomware_join.lock().unwrap().note_burst(
+            meta.pid,
+            meta.process_generation,
+            meta.timestamp_ns,
+        )
     }
 
     /// The reflex: the policy-gated kill of the corroborated process. Observe-only unless
