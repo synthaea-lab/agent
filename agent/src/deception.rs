@@ -79,23 +79,44 @@ pub(crate) fn start(config: &config::DeceptionConfig, state_dir: &Path) -> Optio
             kinds: Kind::ALL.to_vec(),
         })
         .collect();
-    match deception::plant(&deception::plan(&seed, &placements), &inventory) {
-        Ok(report) => tracing::info!(
-            planted = report.planted.len(),
-            unchanged = report.unchanged.len(),
-            skipped = report.skipped.len(),
-            "deception: canaries planted"
-        ),
-        Err(error) => {
-            tracing::error!(%error, "deception: planting failed");
-            return None;
-        }
-    }
+    plant_each_directory(&deception::plan(&seed, &placements), &inventory);
     match Inventory::load(&inventory) {
         Ok(inventory) => Some(Tripwires::from_inventory(&inventory)).filter(|t| !t.is_empty()),
         Err(error) => {
             tracing::error!(%error, "deception: inventory unreadable, no tripwires");
             None
+        }
+    }
+}
+
+/// Plants the canaries one directory at a time, so a directory the agent cannot write (the
+/// packaged unit's `ProtectSystem=strict` makes most of the host read-only) costs only its
+/// own canaries. The plan is made once for every placement: planning per directory would
+/// give each the same names.
+fn plant_each_directory(canaries: &[deception::Canary], inventory: &Path) {
+    let mut by_dir: Vec<(&Path, Vec<deception::Canary>)> = Vec::new();
+    for canary in canaries {
+        let dir = canary.path.parent().unwrap_or(Path::new(""));
+        match by_dir.iter_mut().find(|(d, _)| *d == dir) {
+            Some((_, group)) => group.push(canary.clone()),
+            None => by_dir.push((dir, vec![canary.clone()])),
+        }
+    }
+    for (dir, group) in by_dir {
+        match deception::plant(&group, inventory) {
+            Ok(report) => tracing::info!(
+                dir = %dir.display(),
+                planted = report.planted.len(),
+                unchanged = report.unchanged.len(),
+                skipped = report.skipped.len(),
+                "deception: canaries planted"
+            ),
+            Err(error) => tracing::error!(
+                dir = %dir.display(),
+                %error,
+                "deception: planting failed here (is the directory writable by the agent? \
+                 the packaged unit needs it in ReadWritePaths, see docs/operations/deception.md)"
+            ),
         }
     }
 }
@@ -203,5 +224,54 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// Makes `dir` read-only and says whether that bound this process. Root ignores the mode
+    /// bits, and then the failure these tests need cannot be produced.
+    #[cfg(unix)]
+    fn locked(dir: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let probe = dir.join("probe");
+        let writable = fs::write(&probe, b"x").is_ok();
+        let _ = fs::remove_file(probe);
+        !writable
+    }
+
+    #[cfg(unix)]
+    fn unlock(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_the_agent_cannot_write_costs_only_its_own_canaries() {
+        let state = tempfile::tempdir().unwrap();
+        let (ro, open) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        if !locked(ro.path()) {
+            return;
+        }
+        let tripwires = start(&config_for(&[ro.path(), open.path()]), state.path());
+        unlock(ro.path());
+        // The agent keeps running with the writable directory's canaries watched.
+        assert_eq!(tripwires.unwrap().len(), Kind::ALL.len());
+        assert_eq!(fs::read_dir(ro.path()).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(open.path()).unwrap().count(), Kind::ALL.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn when_no_directory_is_writable_there_are_no_tripwires_and_no_inventory_entries() {
+        let state = tempfile::tempdir().unwrap();
+        let ro = tempfile::tempdir().unwrap();
+        if !locked(ro.path()) {
+            return;
+        }
+        let tripwires = start(&config_for(&[ro.path()]), state.path());
+        unlock(ro.path());
+        assert!(tripwires.is_none());
+        let inventory = Inventory::load(&inventory_path(state.path())).unwrap();
+        assert!(inventory.entries.is_empty());
     }
 }

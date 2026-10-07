@@ -594,9 +594,6 @@ impl DetectionSink {
         );
     }
 
-    /// [`Self::record_and_emit`] for a batch of plain `rules::Alert`s (no Sigma/
-    /// correlator-specific `DetectionSource` needed) — the common case for every
-    /// `rule_state`/`rules::evaluate_*` call site.
     /// Installs the planted canaries (#81). Called once, before the sensor starts; a second
     /// call is ignored.
     pub(crate) fn set_tripwires(&self, tripwires: deception::Tripwires) {
@@ -637,6 +634,9 @@ impl DetectionSink {
         );
     }
 
+    /// [`Self::record_and_emit`] for a batch of plain `rules::Alert`s (no Sigma/
+    /// correlator-specific `DetectionSource` needed) — the common case for every
+    /// `rule_state`/`rules::evaluate_*` call site.
     fn record_rule_alerts(&self, event: &Event, alerts: impl IntoIterator<Item = rules::Alert>) {
         let meta = event.meta();
         let entity = entity_key(meta);
