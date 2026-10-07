@@ -7,7 +7,11 @@ import tables directly (regular and delay-load) with the standard library, so it
 runs anywhere Python does.
 
     python3 tools/check-pe-imports.py target/release/deps/ml-*.exe
-    python3 tools/check-pe-imports.py --forbid directml.dll agent.exe
+    python3 tools/check-pe-imports.py --forbid vcruntime140.dll -- agent.exe
+
+Patterns with `*` or `?` are expanded by the script (PowerShell and cmd do not).
+`--forbid` adds a DLL to the default list and can be repeated; put `--` before the
+files when it is the last option.
 
 Exits 1 if any file imports a forbidden DLL (default: onnxruntime.dll, the shared
 build; directml.dll and d3d12.dll, the DirectML execution provider the prebuilt
@@ -17,6 +21,7 @@ so it stays in a source build too. Exits 2 on a file that is not a 64-bit PE.
 """
 
 import argparse
+import glob
 import struct
 import sys
 
@@ -86,13 +91,25 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("files", nargs="+")
     parser.add_argument(
-        "--forbid", nargs="*", default=list(DEFAULT_FORBIDDEN),
-        help="DLL names that must not be imported (default: %(default)s)",
+        "--forbid", action="append", default=[], metavar="DLL",
+        help="an extra DLL that must not be imported, added to the default "
+        f"list ({', '.join(sorted(DEFAULT_FORBIDDEN))}); repeatable",
     )
     args = parser.parse_args()
-    forbidden = {name.lower() for name in args.forbid}
+    forbidden = {name.lower() for name in DEFAULT_FORBIDDEN} | {
+        name.lower() for name in args.forbid
+    }
+    paths = []
+    for pattern in args.files:
+        # PowerShell and cmd leave `ml-*.exe` as is; a pattern that matches nothing
+        # is an error, not a silent pass.
+        matches = sorted(glob.glob(pattern)) if glob.has_magic(pattern) else [pattern]
+        if not matches:
+            print(f"{pattern}: no file matches", file=sys.stderr)
+            return 2
+        paths.extend(matches)
     status = 0
-    for path in args.files:
+    for path in paths:
         try:
             regular, delayed = imports(path)
         except (OSError, ValueError) as error:

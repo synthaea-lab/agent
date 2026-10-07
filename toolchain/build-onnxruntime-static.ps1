@@ -63,11 +63,11 @@ $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer
 if (-not (Test-Path $vswhere)) {
     throw 'vswhere.exe not found: install Visual Studio 2022 Build Tools (C++ workload).'
 }
-$vsPath = & $vswhere -latest -products * `
+$vsPath = & $vswhere -latest -products * -version '[17.0,18.0)' `
     -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
     -property installationPath
 if (-not $vsPath) {
-    throw 'No Visual Studio with the MSVC x64 toolset (Microsoft.VisualStudio.Component.VC.Tools.x86.x64) found.'
+    throw 'No Visual Studio 2022 (17.x) with the MSVC x64 toolset (Microsoft.VisualStudio.Component.VC.Tools.x86.x64) found; the CMake generator is forced to Visual Studio 17 2022.'
 }
 
 if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
