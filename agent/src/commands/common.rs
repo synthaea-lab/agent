@@ -34,6 +34,19 @@ pub(crate) struct RunPipeline {
     pub(crate) sensor_health: SensorHealthSlot,
 }
 
+/// Plants the configured canary files and hands the sink the tripwires over them (#81).
+/// Called before the sensors start, so the first touch of a canary is already matched.
+pub(crate) fn plant_canaries(
+    sink: &DetectionSink,
+    deception: &config::DeceptionConfig,
+    storage: &config::StorageConfig,
+) {
+    if let Some(tripwires) = crate::deception::start(deception, &storage.state_dir) {
+        sink.set_tripwires(tripwires);
+        sink.set_canary_allow(crate::deception::CanaryAllow::new(deception));
+    }
+}
+
 /// Builds the shared pipeline: optional transport (spool + upload thread),
 /// the detection sink (spooling into it when transport is on), the operator
 /// banner, the progress-backed liveness heartbeat (#102), and the local IPC

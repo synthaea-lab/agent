@@ -23,6 +23,7 @@
 mod alerts;
 mod commands;
 mod content;
+mod deception;
 mod enrich_queue;
 mod health;
 #[cfg_attr(
@@ -305,7 +306,17 @@ enum QuarantineAction {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> std::process::ExitCode {
+    match try_main() {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn try_main() -> anyhow::Result<std::process::ExitCode> {
     let cli = Cli::parse();
 
     // Load the local install configuration BEFORE anything else — logging
@@ -335,7 +346,8 @@ fn main() -> anyhow::Result<()> {
         cfg.server.control_plane_url
     );
 
-    match cli.command {
+    let mut exit_code = std::process::ExitCode::SUCCESS;
+    let result = match cli.command {
         Command::Status => commands::cmd_status(),
         Command::Run {
             alerts,
@@ -368,6 +380,7 @@ fn main() -> anyhow::Result<()> {
                 server: target.as_ref().map(upload::RunTarget::control_plane),
                 ipc_endpoint: &cfg.ipc.endpoint,
                 log_sources: &cfg.logs.sources,
+                deception: &cfg.deception,
                 content_dir: &content_dir,
             })
         }
@@ -407,13 +420,17 @@ fn main() -> anyhow::Result<()> {
                 content::resolve_ca_cert(ca_cert, &cfg.server),
                 &cfg.server,
             );
-            content::cmd_apply_content_manifest(
+            let outcome = content::cmd_apply_content_manifest(
                 &endpoint,
                 &ring,
                 &content_dir,
                 &state,
                 &cfg.ipc.endpoint,
-            )
+            )?;
+            if outcome == content::ApplyOutcome::RingHalted {
+                exit_code = std::process::ExitCode::from(apply_exit_status(outcome) as u8);
+            }
+            Ok(())
         }
         Command::Quarantine { alerts, action } => match action {
             QuarantineAction::List => {
@@ -439,5 +456,26 @@ fn main() -> anyhow::Result<()> {
             !no_restart,
             allow_test_key,
         ),
+    };
+    result?;
+    Ok(exit_code)
+}
+
+fn apply_exit_status(outcome: content::ApplyOutcome) -> i32 {
+    if outcome == content::ApplyOutcome::RingHalted {
+        content::EXIT_RING_HALTED
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod exit_code_tests {
+    use super::*;
+
+    #[test]
+    fn a_halted_content_ring_returns_exit_status_75() {
+        assert_eq!(apply_exit_status(content::ApplyOutcome::RingHalted), 75);
+        assert_eq!(apply_exit_status(content::ApplyOutcome::Done), 0);
     }
 }

@@ -221,6 +221,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         ipc_endpoint,
         content_dir,
         log_sources,
+        deception,
     } = opts;
     // Kill-loudness (#71): must run before any other thread exists — the signal mask
     // set here is inherited by every thread spawned below, including `DetectionSink`'s
@@ -236,6 +237,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         content_dir,
         storage,
     )?;
+    super::common::plant_canaries(&pipeline.sink, deception, storage);
     let sink = Arc::clone(&pipeline.sink);
 
     // The watcher thread itself can start any time after the mask above — only the
