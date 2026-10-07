@@ -442,6 +442,17 @@ pub(crate) fn resolve_endpoint(
     }
 }
 
+/// The CA bundle to trust for the control plane: `--ca-cert`, else `server.ca_cert`
+/// from `agent.toml`, else none (the built-in roots). A CA is a trust anchor and not a
+/// credential, so unlike the client certificate it applies to a server named by hand
+/// too; it can only make verification stricter.
+pub(crate) fn resolve_ca_cert(
+    flag: Option<PathBuf>,
+    configured: &config::ServerConfig,
+) -> Option<PathBuf> {
+    flag.or_else(|| configured.ca_cert.clone())
+}
+
 /// Picks the ring for `apply-content-manifest`: `--ring`, else
 /// `updates.ring`. There is no default ring — an agent that lands in `prod`
 /// by omission would bypass the canary rollout (ADR-0016).
@@ -584,8 +595,50 @@ mod tests {
             mtls_cert: PathBuf::from("/etc/synthaea/certs/client.crt"),
             mtls_key: PathBuf::from("/etc/synthaea/certs/client.key"),
             mtls_passphrase: config::SecretRef::Invalid(String::new()),
+            ca_cert: None,
             offline_fallback: true,
         }
+    }
+
+    fn ca(path: &str) -> Option<PathBuf> {
+        Some(PathBuf::from(path))
+    }
+
+    #[test]
+    fn resolve_ca_cert_takes_the_flag_the_config_or_both_with_the_flag_winning() {
+        let mut server = configured_server();
+        // Neither: the built-in roots.
+        assert_eq!(resolve_ca_cert(None, &server), None);
+        // Flag only.
+        assert_eq!(
+            resolve_ca_cert(ca("/lab/ca.pem"), &server),
+            ca("/lab/ca.pem")
+        );
+        // Config only.
+        server.ca_cert = ca("/etc/synthaea/certs/ca.pem");
+        assert_eq!(
+            resolve_ca_cert(None, &server),
+            ca("/etc/synthaea/certs/ca.pem")
+        );
+        // Both: the flag wins.
+        assert_eq!(
+            resolve_ca_cert(ca("/lab/ca.pem"), &server),
+            ca("/lab/ca.pem")
+        );
+    }
+
+    #[test]
+    fn a_ca_bundle_is_kept_for_the_configured_and_for_an_explicit_server() {
+        let configured = resolve_endpoint(None, None, None, ca("/x/ca.pem"), &configured_server());
+        let explicit = resolve_endpoint(
+            Some("https://lab.example".to_string()),
+            None,
+            None,
+            ca("/x/ca.pem"),
+            &configured_server(),
+        );
+        assert_eq!(configured.ca_cert, ca("/x/ca.pem"));
+        assert_eq!(explicit.ca_cert, ca("/x/ca.pem"));
     }
 
     #[test]

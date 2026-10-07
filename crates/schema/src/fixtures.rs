@@ -33,11 +33,12 @@ use crate::{
     FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent, FileQuarantineEvent,
     FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent, HttpRequestEvent,
     HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent,
-    KernelModuleAction, KernelModuleEvent, ListenPortEvent, MemfdCreateEvent, NamespaceEvent,
-    NamespaceSyscall, NetworkFlowEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent,
-    PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType,
-    SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TlsCaptureEvent,
-    TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
+    KernelModuleAction, KernelModuleEvent, LdapSearchEvent, ListenPortEvent, MemfdCreateEvent,
+    NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, PrctlEvent, ProcessVmReadEvent,
+    ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
+    SessionEvent, SessionState, ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
+    SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent,
+    User, WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -124,6 +125,18 @@ pub fn image_load() -> ImageLoadEvent {
     ImageLoadEvent {
         meta: meta(),
         image_path: String::new(),
+    }
+}
+
+/// Neutral [`LdapSearchEvent`].
+#[must_use]
+pub fn ldap_search() -> LdapSearchEvent {
+    LdapSearchEvent {
+        meta: meta(),
+        filter: String::new(),
+        base_dn: String::new(),
+        scope: 2,
+        attributes: Vec::new(),
     }
 }
 
@@ -240,6 +253,19 @@ pub fn auth() -> AuthEvent {
         target_user_sid: None,
         source_address: None,
         status_code: None,
+    }
+}
+
+/// Neutral [`SessionEvent`]: a console logon to session 1, no account.
+#[must_use]
+pub fn session() -> SessionEvent {
+    SessionEvent {
+        meta: meta(),
+        state: SessionState::Logon,
+        session_id: Some(1),
+        target_user: String::new(),
+        source_address: None,
+        console: true,
     }
 }
 

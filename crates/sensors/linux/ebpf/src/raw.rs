@@ -6,7 +6,7 @@ use aya_ebpf::{
     Global,
     helpers::bpf_probe_read_kernel,
     macros::{map, raw_tracepoint},
-    maps::{Array, HashMap, PerCpuArray},
+    maps::{Array, LruHashMap, PerCpuArray},
     programs::{RawTracePointContext, TracePointContext},
 };
 use aya_log_ebpf::{info, warn};
@@ -36,9 +36,35 @@ const EXIT_RECVFROM: u32 = 4;
 #[map]
 static SYSCALL_DISPATCH: Array<u32> = Array::with_max_entries(MAX_SYSCALL_ID, 0);
 
-/// syscall id of an in-flight call whose event needs its return value.
+/// syscall id of an in-flight call whose event needs its return value. A thread
+/// blocked forever in `accept`, `accept4`, `memfd_create` or `recvfrom` keeps its
+/// entry; an LRU evicts the stalest one when full so that blocked thread cannot
+/// blind the other three syscalls host-wide (#672, the idea of #668's
+/// `ACCEPT_ARGS`). Insert overwrites by key, so a later `sys_enter_*` on the same
+/// `pid_tgid` always replaces a stale tag before `sys_exit` can misroute into it.
 #[map]
-static PENDING_SYSCALL_EXIT: HashMap<u64, u32> = HashMap::with_max_entries(4096, 0);
+static PENDING_SYSCALL_EXIT: LruHashMap<u64, u32> = LruHashMap::with_max_entries(4096, 0);
+
+/// Counts a `PENDING_SYSCALL_EXIT` insert that still failed — shed, not silently
+/// lost (the LRU's own eviction keeps steady-state inserts succeeding; this is
+/// the rarer case of failing even after eviction). Per-CPU, summed by
+/// `bpftool map dump`; not wired into agent-side health yet.
+#[map]
+static PENDING_SYSCALL_EXIT_DROPPED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+/// [`PENDING_SYSCALL_EXIT`]'s insert, with the drop counted instead of discarded.
+#[inline(always)]
+fn stash_pending_syscall_exit(pid_tgid: u64, action: u32) {
+    if PENDING_SYSCALL_EXIT.insert(&pid_tgid, &action, 0).is_err()
+        && let Some(count) = PENDING_SYSCALL_EXIT_DROPPED.get_ptr_mut(0)
+    {
+        // SAFETY: `count` is a valid per-CPU slot pointer from `get_ptr_mut`; no
+        // concurrent access from another CPU (each CPU owns its own slot).
+        unsafe {
+            *count = (*count).wrapping_add(1);
+        }
+    }
+}
 
 #[unsafe(no_mangle)]
 static TASK_PID_OFFSET: Global<u32> = Global::new(0);
@@ -234,11 +260,11 @@ pub fn raw_sys_enter(ctx: RawTracePointContext) -> u32 {
         16 => sys_enter_sendto(trace_ctx),
         17 => sys_enter_listen(trace_ctx),
         18 => {
-            let _ = PENDING_SYSCALL_EXIT.insert(&pid_tgid, &EXIT_ACCEPT, 0);
+            stash_pending_syscall_exit(pid_tgid, EXIT_ACCEPT);
             sys_enter_accept(trace_ctx)
         }
         19 => {
-            let _ = PENDING_SYSCALL_EXIT.insert(&pid_tgid, &EXIT_ACCEPT4, 0);
+            stash_pending_syscall_exit(pid_tgid, EXIT_ACCEPT4);
             sys_enter_accept4(trace_ctx)
         }
         20 => sys_enter_setxattr(trace_ctx),
@@ -256,7 +282,7 @@ pub fn raw_sys_enter(ctx: RawTracePointContext) -> u32 {
         32 => sys_enter_process_vm_readv(trace_ctx),
         33 => sys_enter_process_vm_writev(trace_ctx),
         34 => {
-            let _ = PENDING_SYSCALL_EXIT.insert(&pid_tgid, &EXIT_MEMFD_CREATE, 0);
+            stash_pending_syscall_exit(pid_tgid, EXIT_MEMFD_CREATE);
             sys_enter_memfd_create(trace_ctx)
         }
         35 => sys_enter_setuid(trace_ctx),
@@ -269,7 +295,7 @@ pub fn raw_sys_enter(ctx: RawTracePointContext) -> u32 {
         42 => sys_enter_setns(trace_ctx),
         43 => sys_enter_unshare(trace_ctx),
         44 => {
-            let _ = PENDING_SYSCALL_EXIT.insert(&pid_tgid, &EXIT_RECVFROM, 0);
+            stash_pending_syscall_exit(pid_tgid, EXIT_RECVFROM);
             sys_enter_recvfrom(trace_ctx)
         }
         _ => 0,

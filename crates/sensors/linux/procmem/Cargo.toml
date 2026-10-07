@@ -1,0 +1,20 @@
+[package]
+name = "sensor-linux-procmem"
+version = "0.1.0"
+description = "Linux process-memory access over /proc: the maps parser and a bounded reader (ADR-0023)"
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+# The memfd regression test names a real memfd and maps it; Linux only, so target-gated.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"

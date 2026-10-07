@@ -42,16 +42,22 @@ pub(crate) fn wire_run_pipeline(
     rule_state: rules::RuleState,
     alerts: &std::path::Path,
     events: Option<&std::path::Path>,
-    server: Option<&str>,
+    server: Option<crate::upload::ControlPlane<'_>>,
     ipc_endpoint: &str,
     content_dir: &std::path::Path,
     storage: &config::StorageConfig,
 ) -> anyhow::Result<RunPipeline> {
     // Transport first: the sink needs the spool handle at construction.
     let spool_cap = crate::upload::spool_cap_bytes(storage.spool_max_mb);
-    let transport = server
-        .map(|url| crate::upload::start(url, alerts, spool_cap))
-        .transpose()?;
+    let (transport, upload_disabled) = match server {
+        None => (None, None),
+        Some(control_plane) => {
+            match crate::upload::start_or_disable(&control_plane, alerts, spool_cap)? {
+                crate::upload::UploadStart::Running(handle) => (Some(handle), None),
+                crate::upload::UploadStart::Disabled(reason) => (None, Some(reason)),
+            }
+        }
+    };
     let spool = transport.as_ref().map(|t| Arc::clone(&t.spool));
     let detection_spool = transport.as_ref().map(|t| Arc::clone(&t.detection_spool));
 
@@ -65,13 +71,20 @@ pub(crate) fn wire_run_pipeline(
         &crate::sink::model_root(&storage.state_dir),
     )?);
 
+    // Said where the operator reads it (the journal) and in the alert log, where `cli` and
+    // the console look: detection runs, upload does not (`offline_fallback`).
+    if let Some(reason) = &upload_disabled {
+        eprintln!("Synthaea agent — UPLOAD DISABLED: {reason}");
+        sink.emit("UPLOAD-DISABLED", reason);
+    }
     eprintln!("Synthaea agent — detection active (Ctrl-C to stop)");
     eprintln!(
         "alerts: {} · events: {}",
         alerts.display(),
         events.map_or_else(|| "off".to_string(), |p| p.display().to_string())
     );
-    if let Some(url) = server {
+    if let (Some(control_plane), true) = (server, transport.is_some()) {
+        let url = control_plane.url;
         eprintln!(
             "server: {url} · event spool: {} · detection spool: {} (store-and-forward, at-least-once)",
             alerts.with_file_name("spool").display(),

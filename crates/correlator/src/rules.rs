@@ -508,9 +508,16 @@ pub(crate) fn rule_web_request_shell(bus: &EventBus) -> Vec<WebShellCase> {
             _ => None,
         })
         .filter_map(|(meta, exec)| {
-            let request = requests
-                .iter()
-                .min_by_key(|r| r.meta.timestamp_ns.abs_diff(meta.timestamp_ns))?;
+            // The nearest request in time. On a tie in distance, the one before the shell:
+            // a request answered after the shell started cannot have started it. Then the
+            // one read last: the agent stamps a request with the moment it read the line,
+            // so a burst read in one poll shares a timestamp, and arrival order (the log's
+            // order) is the only tie-break left, the request just before the shell being
+            // the one that matters.
+            let request = requests.iter().rev().min_by_key(|r| {
+                let ts = r.meta.timestamp_ns;
+                (ts.abs_diff(meta.timestamp_ns), ts > meta.timestamp_ns)
+            })?;
             let delta_s = request.meta.timestamp_ns.abs_diff(meta.timestamp_ns) / 1_000_000_000;
             let client = request
                 .client
