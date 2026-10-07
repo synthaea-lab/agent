@@ -41,6 +41,8 @@
 
 #[cfg(any(windows, test))]
 mod amsi;
+#[cfg(any(windows, test))]
+mod budget;
 #[cfg(windows)]
 mod etw_sessions;
 #[cfg(any(windows, test))]

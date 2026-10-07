@@ -118,6 +118,15 @@ fn entity_key(meta: &schema::EventMeta) -> verdict::EntityKey {
 /// loading): the trigger for a memory scan of that process (#85).
 const MEMFD_EXEC_TECHNIQUE: &str = "T1620";
 
+/// The ATT&CK technique the ransomware rules report (T1486): its detection carries a
+/// damage manifest of the process's recent renames and deletions (#82).
+const RANSOMWARE_TECHNIQUE: &str = "T1486";
+
+/// Most renames and deletions a ransomware detection carries beyond its triggering event.
+/// A bound on the size of one detection: the correlator window is 60 s, and a fast
+/// encryptor renames far more than this in it.
+const DAMAGE_MANIFEST_MAX: usize = 100;
+
 /// The escalation decision (#612) as a free function so the YARA scan worker, which
 /// has no `DetectionSink`, raises the same alert as every other engine (#614).
 fn escalate_if_warranted(alert_log: &AlertLog, fused: &verdict::Verdict) {
@@ -475,6 +484,32 @@ impl DetectionSink {
         severity: schema::detection::Severity,
         event: &Event,
     ) -> Option<verdict::Verdict> {
+        self.record_and_emit_with(
+            entity,
+            technique,
+            message,
+            source,
+            severity,
+            event,
+            Vec::new(),
+        )
+    }
+
+    /// [`Self::record_and_emit`] with further evidence events after the triggering one.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one more than the plain call: the extra evidence, appended after the trigger"
+    )]
+    fn record_and_emit_with(
+        &self,
+        entity: &verdict::EntityKey,
+        technique: &str,
+        message: &str,
+        source: schema::detection::DetectionSource,
+        severity: schema::detection::Severity,
+        event: &Event,
+        evidence: Vec<Event>,
+    ) -> Option<verdict::Verdict> {
         let now_ns = event.meta().timestamp_ns;
         let detection = schema::detection::Detection {
             timestamp_ns: now_ns,
@@ -484,7 +519,7 @@ impl DetectionSink {
             score: None,
             attributions: Vec::new(),
             techniques: techniques_from(technique),
-            events: vec![event.clone()],
+            events: std::iter::once(event.clone()).chain(evidence).collect(),
         };
         let spooled = self.detection_spool.as_ref().map(|_| detection.clone());
         let result =
@@ -559,15 +594,42 @@ impl DetectionSink {
             let source = schema::detection::DetectionSource::Rule {
                 rule_id: alert.technique.to_string(),
             };
-            self.record_and_emit(
+            let manifest = if alert.technique == RANSOMWARE_TECHNIQUE {
+                self.damage_manifest(event)
+            } else {
+                Vec::new()
+            };
+            self.record_and_emit_with(
                 &entity,
                 alert.technique,
                 &alert.message,
                 source,
                 alert.severity,
                 event,
+                manifest,
             );
         }
+    }
+
+    /// The damage manifest of a ransomware alert (issue #82): the file renames and
+    /// deletions of the alerting process incarnation that the rule state remembers (the
+    /// newest `DAMAGE_MANIFEST_MAX`), oldest first, without the triggering event (which is
+    /// the detection's first event already). It rides in `Detection::events`, so no schema
+    /// change: the control plane keeps events after the first as the detection's further
+    /// triggering events, and a restoration tool reads the scope from them.
+    ///
+    /// Takes the rule-state lock: callers must not hold it (see `detect_file_rename`).
+    fn damage_manifest(&self, trigger: &Event) -> Vec<Event> {
+        let meta = trigger.meta();
+        let mut touched = self
+            .rule_state
+            .lock()
+            .unwrap()
+            .touched_files(meta.pid, meta.process_generation);
+        touched.retain(|e| e != trigger);
+        let excess = touched.len().saturating_sub(DAMAGE_MANIFEST_MAX);
+        touched.drain(..excess);
+        touched
     }
 
     /// Cross-event correlation (co-occurrence rules + Bayesian belief).
@@ -815,10 +877,8 @@ impl DetectionSink {
     /// the creation history `on_file_open` keeps.
     fn detect_file_delete(&self, wrapped: &Event, event: &schema::FileDeleteEvent) {
         self.record_rule_alerts(wrapped, rules::evaluate_file_delete(event));
-        self.record_rule_alerts(
-            wrapped,
-            self.rule_state.lock().unwrap().on_file_delete(event),
-        );
+        let alerts = self.rule_state.lock().unwrap().on_file_delete(event);
+        self.record_rule_alerts(wrapped, alerts);
     }
 
     /// `Signal` events: security-process tampering (T1562.001, issue #362).
@@ -829,10 +889,9 @@ impl DetectionSink {
     /// `FileRename` events: mass-rename ransomware detection (T1486, issue #262) +
     /// write-volume corroboration (issue #82).
     fn detect_file_rename(&self, wrapped: &Event, event: &schema::FileRenameEvent) {
-        self.record_rule_alerts(
-            wrapped,
-            self.rule_state.lock().unwrap().on_file_rename(event),
-        );
+        // Bound first: `record_rule_alerts` takes the lock again for the damage manifest.
+        let alerts = self.rule_state.lock().unwrap().on_file_rename(event);
+        self.record_rule_alerts(wrapped, alerts);
     }
 
     /// `FileWrite` events: no alert on their own — tracks per-pid write volume for
@@ -860,6 +919,16 @@ impl DetectionSink {
     /// loads, credential-dumping modules, script hosts launching interpreters.
     fn detect_amsi_content(&self, wrapped: &Event, event: &schema::AmsiContentEvent) {
         self.record_rule_alerts(wrapped, rules::evaluate_amsi_content(event));
+    }
+
+    /// `LdapSearch` events (Windows, #364): roasting / privilege / trust /
+    /// stored-password searches, then the enumeration-sweep burst.
+    fn detect_ldap_search(&self, wrapped: &Event, event: &schema::LdapSearchEvent) {
+        self.record_rule_alerts(wrapped, rules::evaluate_ldap_search(event));
+        self.record_rule_alerts(
+            wrapped,
+            self.rule_state.lock().unwrap().on_ldap_search(event),
+        );
     }
 
     /// Writes one alert to the shared log and highlighted stderr. `pub(crate)`
@@ -1249,6 +1318,7 @@ impl EventSink for DetectionSink {
             Event::Defender(e) => {
                 self.record_rule_alerts(&event, rules::evaluate_defender_event(e));
             }
+            Event::LdapSearch(e) => self.detect_ldap_search(&event, e),
             // New telemetry categories reach the engines as they land; until a rule
             // consumes them, logging below is the whole treatment.
             _ => {}
@@ -1997,6 +2067,118 @@ rule response_marker {
         assert_eq!(records[0].detection.title, "test finding");
         assert_eq!(records[0].detection.events, vec![event]);
         assert_eq!(records[0].key.len(), 36);
+    }
+
+    fn rename_of(pid: u32, i: u64, to: &str) -> Event {
+        Event::FileRename(schema::FileRenameEvent {
+            meta: EventMeta {
+                pid,
+                timestamp_ns: 1_000_000_000 + i * 50_000_000,
+                comm: "encryptor".into(),
+                ..schema::fixtures::meta()
+            },
+            old_path: format!("/home/u/doc{i}.txt"),
+            new_path: format!("/home/u/doc{i}.txt{to}"),
+            ..schema::fixtures::file_rename()
+        })
+    }
+
+    /// The ransomware detection (T1486, issue #82) carries the files the process touched
+    /// in the window, so the case records the scope of the damage.
+    #[test]
+    fn a_ransomware_detection_carries_the_files_the_process_renamed_as_a_damage_manifest() {
+        let dir = tmp("damage-manifest");
+        let spool = Arc::new(Mutex::new(
+            store::EventSpool::open(&dir.join("detection-spool"), u64::MAX).unwrap(),
+        ));
+        let sink = DetectionSink::new(
+            rules::RuleState::new(),
+            &dir.join("alerts.ndjson"),
+            None,
+            None,
+            Some(Arc::clone(&spool)),
+            &dir.join("content"),
+            &dir.join("ml-registry"),
+        )
+        .unwrap();
+
+        // 30 renames to an encrypted extension by one process, then a different process's
+        // rename that must not appear in the manifest.
+        for i in 0..30 {
+            sink.on_event(rename_of(900, i, ".locked"));
+        }
+        sink.on_event(rename_of(901, 99, ".bak"));
+
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+        let records: Vec<transport::QueuedDetection> =
+            spool.lock().unwrap().drain_oldest().unwrap();
+        let ransomware: Vec<_> = records
+            .iter()
+            .filter(|r| r.detection.techniques.iter().any(|t| t == "T1486"))
+            .collect();
+        assert!(
+            !ransomware.is_empty(),
+            "the burst must raise a T1486 detection"
+        );
+        let detection = &ransomware[0].detection;
+
+        // First the triggering event, then the earlier renames of the same process.
+        assert!(detection.events.len() > 1, "the manifest is attached");
+        for event in &detection.events {
+            let Event::FileRename(rename) = event else {
+                panic!("only renames expected, got {event:?}");
+            };
+            assert_eq!(
+                rename.meta.pid, 900,
+                "another process's files are not this one's damage"
+            );
+        }
+        let triggering = detection.events[0].clone();
+        assert!(
+            !detection.events[1..].contains(&triggering),
+            "the triggering event is not repeated in the manifest"
+        );
+        // Oldest first.
+        let stamps: Vec<u64> = detection.events[1..]
+            .iter()
+            .map(|e| e.meta().timestamp_ns)
+            .collect();
+        assert!(stamps.windows(2).all(|w| w[0] <= w[1]));
+        assert!(detection.events.len() <= 1 + super::DAMAGE_MANIFEST_MAX);
+    }
+
+    #[test]
+    fn a_detection_that_is_not_ransomware_carries_only_its_triggering_event() {
+        let dir = tmp("no-manifest");
+        let spool = Arc::new(Mutex::new(
+            store::EventSpool::open(&dir.join("detection-spool"), u64::MAX).unwrap(),
+        ));
+        let sink = DetectionSink::new(
+            rules::RuleState::new(),
+            &dir.join("alerts.ndjson"),
+            None,
+            None,
+            Some(Arc::clone(&spool)),
+            &dir.join("content"),
+            &dir.join("ml-registry"),
+        )
+        .unwrap();
+        sink.on_event(rename_of(900, 0, ".bak"));
+        let event = exec(7, "test", "/bin/test");
+        sink.record_and_emit(
+            &verdict::EntityKey::new(1, "test"),
+            "T1059",
+            "test finding",
+            schema::detection::DetectionSource::Rule {
+                rule_id: "T1059".into(),
+            },
+            schema::detection::Severity::Medium,
+            &event,
+        );
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+        let records: Vec<transport::QueuedDetection> =
+            spool.lock().unwrap().drain_oldest().unwrap();
+        assert_eq!(records[0].detection.events, vec![event]);
     }
 
     #[test]

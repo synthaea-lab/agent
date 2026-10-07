@@ -250,7 +250,14 @@ pub mod time;
 /// logoff). It claimed 39 alongside #650 (`UdpRecv`), which merged first, so
 /// this one renumbers. #577 (`BitsJob`) also targets v40 while both branches
 /// are open: whichever merges second renumbers, as above.
-pub const SCHEMA_VERSION: u32 = 40;
+///
+/// Bumped 40 → 41 for [`Event::LdapSearch`] (#364): the LDAP searches a
+/// process sends (EID 30 of Microsoft-Windows-LDAP-Client), the endpoint's
+/// view of directory reconnaissance. Windows-only, same posture as
+/// `WmiActivity`. 38 was claimed by #283 (`Defender`), 39 by #263 (`UdpRecv`) and 40 by
+/// #285 (`Session`) while this branch was open; all merged first, so this
+/// one renumbers, same coordination note as above.
+pub const SCHEMA_VERSION: u32 = 41;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -1036,6 +1043,31 @@ pub struct DefenderEvent {
     /// `ConfigChanged`: the value after. Empty after a removal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_value: Option<String>,
+}
+
+/// An LDAP search a process sent, from EID 30 of the
+/// Microsoft-Windows-LDAP-Client provider (#364): the directory-reconnaissance
+/// fingerprint an endpoint can see. Kerberoasting / AS-REP roasting start with
+/// a search for roastable accounts, and SharpHound-style collection is a burst
+/// of wide searches from one process; the ticket requests themselves are only
+/// visible on a domain controller.
+///
+/// Emitted when the request is actually sent (lab, 2026-10-02: a search to a
+/// listener that never answers is logged, a failed connect is not). `meta` is
+/// the requesting process (`wldap32` runs in-process). Windows-only, same
+/// posture as [`WmiActivityEvent`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LdapSearchEvent {
+    pub meta: EventMeta,
+    /// The search filter as sent (RFC 4515 text).
+    pub filter: String,
+    /// The search base distinguished name.
+    pub base_dn: String,
+    /// Search scope: 0 base object, 1 one level, 2 whole subtree.
+    pub scope: u32,
+    /// Attributes requested; empty means "all".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attributes: Vec<String>,
 }
 
 /// WMI activity — query execution (EID 23) or method invocation (EID 24) from the
@@ -2070,6 +2102,7 @@ pub enum Event {
     ScriptBlock(ScriptBlockEvent),
     AmsiContent(AmsiContentEvent),
     Defender(DefenderEvent),
+    LdapSearch(LdapSearchEvent),
     WmiActivity(WmiActivityEvent),
     AssemblyLoad(AssemblyLoadEvent),
     SmbConnect(SmbConnectEvent),
@@ -2130,6 +2163,7 @@ impl Event {
             Event::ScriptBlock(e) => &e.meta,
             Event::AmsiContent(e) => &e.meta,
             Event::Defender(e) => &e.meta,
+            Event::LdapSearch(e) => &e.meta,
             Event::WmiActivity(e) => &e.meta,
             Event::AssemblyLoad(e) => &e.meta,
             Event::SmbConnect(e) => &e.meta,

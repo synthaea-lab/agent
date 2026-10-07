@@ -8,7 +8,7 @@ use std::{
 };
 
 use schema::{
-    AuthEvent, AuthOutcome, ConnectEvent, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
+    AuthEvent, AuthOutcome, ConnectEvent, Event, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
     FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRenameEvent, FileWriteEvent,
     ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, SessionEvent, SessionState, User,
     detection::Severity,
@@ -31,7 +31,8 @@ use crate::{
         SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS,
         SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS,
         SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN,
-        SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
+        SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS, TOUCHED_FILES_PER_PID,
+        TOUCHED_FILES_PID_CAP,
     },
     has_write_intent,
     session::SessionHijack,
@@ -172,6 +173,9 @@ pub struct RuleState {
     /// a hostile process renaming under many different pids (unusual, but not
     /// impossible) must not grow this without limit either.
     ransomware_rename: BoundedMap<u32, SlidingCounter>,
+    /// Distinct LDAP searches per process for the enumeration-sweep rule
+    /// (T1087.002, #364).
+    ldap_burst: crate::ldap::LdapBurst,
     /// ppid → the same counter, for the shell-loop shape (`for f in *; do mv "$f"
     /// "$f.locked"; done`, `find … -exec mv {} {}.x \;`): each rename runs in its own
     /// short-lived `mv` pid, so the per-pid counter never climbs, but every child
@@ -191,6 +195,10 @@ pub struct RuleState {
     /// first (the same ordering hazard as `pending_proc_fd_exec`, #503); the creation
     /// then pairs with it on arrival. Same bounds as `recent_creates`.
     pending_unlinks: BoundedMap<u32, VecDeque<(u64, String)>>,
+    /// pid → the newest renames and deletions seen for it (oldest first): the damage
+    /// manifest of a ransomware detection (issue #82), read through [`Self::touched_files`].
+    /// Bounded by [`TOUCHED_FILES_PID_CAP`] pids x [`TOUCHED_FILES_PER_PID`] events.
+    touched_files: BoundedMap<u32, VecDeque<Event>>,
     /// pid → sliding counter of write-new-then-unlink pairs (T1486, #512 part B).
     ransomware_unlink: BoundedMap<u32, SlidingCounter>,
     /// pid → sliding sum of `FileWriteEvent::bytes_requested` (issue #82): the
@@ -279,6 +287,7 @@ impl RuleState {
             recent_quarantines: BoundedMap::new(RECENT_WRITES_CAP),
             recent_motw_removals: BoundedMap::new(RECENT_WRITES_CAP),
             self_spawn: BoundedMap::new(COUNTER_CAP),
+            ldap_burst: crate::ldap::LdapBurst::new(),
             beacon: BoundedMap::new(COUNTER_CAP),
             beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
             scan_spread: BoundedMap::new(COUNTER_CAP),
@@ -287,6 +296,7 @@ impl RuleState {
             rdp_source_auth_failures: BoundedMap::new(COUNTER_CAP),
             recent_creates: BoundedMap::new(CREATE_UNLINK_PID_CAP),
             pending_unlinks: BoundedMap::new(CREATE_UNLINK_PID_CAP),
+            touched_files: BoundedMap::new(TOUCHED_FILES_PID_CAP),
             ransomware_unlink: BoundedMap::new(COUNTER_CAP),
             ransomware_rename: BoundedMap::new(COUNTER_CAP),
             ransomware_rename_by_ppid: BoundedMap::new(COUNTER_CAP),
@@ -932,6 +942,14 @@ impl RuleState {
         self.check_listen_port_drift(event).into_iter().collect()
     }
 
+    /// To be called for every `LdapSearchEvent` (Windows, #364): the
+    /// directory-enumeration sweep, many distinct searches from one process
+    /// in a short window. The single-search rules are
+    /// [`crate::evaluate_ldap_search`].
+    pub fn on_ldap_search(&mut self, event: &schema::LdapSearchEvent) -> Vec<Alert> {
+        self.ldap_burst.observe(event).into_iter().collect()
+    }
+
     /// To be called for every `AuthEvent` in the stream (issue #377, T1110):
     /// counts failures per (target user, source) on a sliding window and
     /// alerts once per window when the burst threshold is crossed. Successes
@@ -1368,6 +1386,7 @@ impl RuleState {
     /// consumed by [`Self::check_exec_after_motw_removal`].
     pub fn on_file_delete(&mut self, event: &FileDeleteEvent) -> Vec<Alert> {
         self.record_motw_removal(event);
+        self.record_touched(event.meta.pid, Event::FileDelete(event.clone()));
         self.check_write_new_then_unlink(event)
             .into_iter()
             .collect()
@@ -1610,9 +1629,40 @@ impl RuleState {
     /// To be called for every `FileRenameEvent` in the stream (T1486, issue #262 +
     /// #82's write-volume corroboration).
     pub fn on_file_rename(&mut self, event: &FileRenameEvent) -> Vec<Alert> {
+        self.record_touched(event.meta.pid, Event::FileRename(event.clone()));
         let mut alerts: Vec<Alert> = self.check_mass_rename_pattern(event).into_iter().collect();
         alerts.extend(self.check_burst_write_volume(event));
         alerts
+    }
+
+    /// Remembers a rename or deletion for `pid`, dropping the oldest past the per-pid bound.
+    fn record_touched(&mut self, pid: u32, event: Event) {
+        let history = self.touched_files.get_or_insert_with(pid, VecDeque::new);
+        if history.len() == TOUCHED_FILES_PER_PID {
+            history.pop_front();
+        }
+        history.push_back(event);
+    }
+
+    /// The renames and deletions of the process incarnation `(pid, generation)` still
+    /// remembered, oldest first: the damage manifest a ransomware detection carries
+    /// (issue #82). Two known, different generations never mix (a recycled pid's earlier
+    /// life is not this process's damage); a missing stamp keeps the pid-only behavior.
+    #[must_use]
+    pub fn touched_files(&self, pid: u32, generation: Option<u64>) -> Vec<Event> {
+        self.touched_files
+            .peek(&pid)
+            .map(|history| {
+                history
+                    .iter()
+                    .filter(|e| match (e.meta().process_generation, generation) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => true,
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// To be called for every `FileWriteEvent` in the stream. Does not produce

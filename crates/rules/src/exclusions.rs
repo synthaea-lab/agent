@@ -284,6 +284,17 @@ pub(crate) const CREATE_UNLINK_HISTORY_PER_PID: usize = 64;
 /// 65k-pid tables would allow.
 pub(crate) const CREATE_UNLINK_PID_CAP: usize = 1_024;
 
+/// Renames and deletions remembered per pid for the damage manifest of a ransomware
+/// detection (issue #82): the newest this many, as the events themselves so a detection
+/// can carry them.
+pub(crate) const TOUCHED_FILES_PER_PID: usize = 100;
+
+/// Pids tracked for that manifest. Each entry holds up to [`TOUCHED_FILES_PER_PID`]
+/// events (a few hundred bytes each), so 64 pids stay near two MB at the worst; a process
+/// pushed out by 64 busier ones loses its manifest (counted in the map's eviction counter,
+/// like every other bound here), not its detection.
+pub(crate) const TOUCHED_FILES_PID_CAP: usize = 64;
+
 /// Pairing window for one scheduled-task registration seen on both Security 4698
 /// and TaskScheduler/Operational 106 (#422, T1053.005). The two are normalized by
 /// separate poll threads, each on a 2s cadence, so their timestamps land a few
