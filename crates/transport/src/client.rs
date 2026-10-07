@@ -158,10 +158,7 @@ impl TransportClient {
             request = request.header("Idempotency-Key", key);
         }
         let response = request.send(&body).map_err(|e| match &e {
-            ureq::Error::StatusCode(status) => TransportError::ServerError {
-                status: *status,
-                message: e.to_string(),
-            },
+            ureq::Error::StatusCode(status) => server_error(*status, e.to_string()),
             _ => TransportError::Network(e.to_string()),
         })?;
 
@@ -208,10 +205,29 @@ fn send_get(
         .limit(ERROR_BODY_LIMIT)
         .read_to_string()
         .unwrap_or_default();
-    Err(TransportError::ServerError {
+    Err(server_error(
         status,
-        message: error_reason(&text).unwrap_or_else(|| format!("http status: {status}")),
-    })
+        error_reason(&text).unwrap_or_else(|| format!("http status: {status}")),
+    ))
+}
+
+fn server_error(status: u16, message: String) -> TransportError {
+    let message = message
+        .chars()
+        .filter(|character| !character.is_control() && !is_bidi_control(*character))
+        .collect();
+    TransportError::ServerError { status, message }
+}
+
+fn is_bidi_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200e}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{206a}'..='\u{206f}'
+    )
 }
 
 /// The explanation in an error body: the `error`, `message` or `reason` string
@@ -364,6 +380,17 @@ fn load_ca_roots(path: &std::path::Path) -> Result<ureq::tls::RootCerts> {
 mod tests {
     use super::*;
     use crate::DEFAULT_HEARTBEAT_ENDPOINT;
+
+    #[test]
+    fn server_error_reason_removes_terminal_controls_and_bidi_markers() {
+        let err = server_error(
+            423,
+            "\x1b[31mhalted\nnext line\r\0\u{0080}\u{009f}\u{202e}".into(),
+        );
+        let expected = "[31mhaltednext line";
+        assert_eq!(err.locked_reason(), Some(expected));
+        assert_eq!(err.to_string(), format!("server error: 423 - {expected}"));
+    }
 
     #[test]
     fn config_builds_urls_correctly() {
