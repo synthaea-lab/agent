@@ -168,6 +168,9 @@ pub struct RuleState {
     /// a hostile process renaming under many different pids (unusual, but not
     /// impossible) must not grow this without limit either.
     ransomware_rename: BoundedMap<u32, SlidingCounter>,
+    /// Distinct LDAP searches per process for the enumeration-sweep rule
+    /// (T1087.002, #364).
+    ldap_burst: crate::ldap::LdapBurst,
     /// ppid → the same counter, for the shell-loop shape (`for f in *; do mv "$f"
     /// "$f.locked"; done`, `find … -exec mv {} {}.x \;`): each rename runs in its own
     /// short-lived `mv` pid, so the per-pid counter never climbs, but every child
@@ -279,6 +282,7 @@ impl RuleState {
             recent_quarantines: BoundedMap::new(RECENT_WRITES_CAP),
             recent_motw_removals: BoundedMap::new(RECENT_WRITES_CAP),
             self_spawn: BoundedMap::new(COUNTER_CAP),
+            ldap_burst: crate::ldap::LdapBurst::new(),
             beacon: BoundedMap::new(COUNTER_CAP),
             beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
             scan_spread: BoundedMap::new(COUNTER_CAP),
@@ -930,6 +934,14 @@ impl RuleState {
     /// polling, issue #92) — see [`Self::check_listen_port_drift`].
     pub fn on_listen_port(&mut self, event: &ListenPortEvent) -> Vec<Alert> {
         self.check_listen_port_drift(event).into_iter().collect()
+    }
+
+    /// To be called for every `LdapSearchEvent` (Windows, #364): the
+    /// directory-enumeration sweep, many distinct searches from one process
+    /// in a short window. The single-search rules are
+    /// [`crate::evaluate_ldap_search`].
+    pub fn on_ldap_search(&mut self, event: &schema::LdapSearchEvent) -> Vec<Alert> {
+        self.ldap_burst.observe(event).into_iter().collect()
     }
 
     /// To be called for every `AuthEvent` in the stream (issue #377, T1110):

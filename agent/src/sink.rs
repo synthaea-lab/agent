@@ -921,6 +921,16 @@ impl DetectionSink {
         self.record_rule_alerts(wrapped, rules::evaluate_amsi_content(event));
     }
 
+    /// `LdapSearch` events (Windows, #364): roasting / privilege / trust /
+    /// stored-password searches, then the enumeration-sweep burst.
+    fn detect_ldap_search(&self, wrapped: &Event, event: &schema::LdapSearchEvent) {
+        self.record_rule_alerts(wrapped, rules::evaluate_ldap_search(event));
+        self.record_rule_alerts(
+            wrapped,
+            self.rule_state.lock().unwrap().on_ldap_search(event),
+        );
+    }
+
     /// Writes one alert to the shared log and highlighted stderr. `pub(crate)`
     /// rather than private: `silence::spawn_monitor` (#71) emits a sensor-silence
     /// verdict through the exact same path as a rule/correlator/Sigma finding —
@@ -1308,6 +1318,7 @@ impl EventSink for DetectionSink {
             Event::Defender(e) => {
                 self.record_rule_alerts(&event, rules::evaluate_defender_event(e));
             }
+            Event::LdapSearch(e) => self.detect_ldap_search(&event, e),
             // New telemetry categories reach the engines as they land; until a rule
             // consumes them, logging below is the whole treatment.
             _ => {}
