@@ -8,7 +8,10 @@
 //!
 //! On Unix the source is opened once (`O_NOFOLLOW`, checked with `fstat`) and then hashed and
 //! moved through that descriptor, so a name swapped for a symlink after the check cannot
-//! redirect the move or the `chmod` (#689).
+//! redirect the move or the `chmod` (#689). Known limits: `O_NOFOLLOW` covers the last path
+//! component only, so a symlinked parent directory under an attacker's control is still
+//! followed (`openat2` with `RESOLVE_NO_SYMLINKS`, Linux 5.6+, would close that); and the
+//! check of the source's name and its removal are not atomic.
 //!
 //! Unix permissions are tightened here because `set_readonly` alone preserves the
 //! execute bits. The Windows agent does not wire automated quarantine yet; its ACL
@@ -206,6 +209,10 @@ impl Source {
     /// Puts the opened file into quarantine at `to` and removes its name `from`, but only
     /// while `from` still names it: a name that now points at something else is not ours to
     /// delete. Never replaces `to`.
+    ///
+    /// The check of `from` and the removal of its name are two steps, not one atomic one: a
+    /// swap in that last window can at worst make the removal act on a link or a file that
+    /// took the name. It cannot redirect what was stored, nor any `chmod` (#689).
     #[cfg(unix)]
     fn move_into_quarantine(&self, from: &Path, to: &Path) -> std::io::Result<()> {
         use std::os::unix::fs::MetadataExt as _;
@@ -358,14 +365,30 @@ fn secure_quarantine_dir(path: &Path) -> std::io::Result<()> {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
         let me = unsafe { libc::geteuid() };
-        if metadata.uid() != me {
-            return Err(invalid(
-                "quarantine directory is owned by another user; refusing to change it",
-            ));
+        if quarantine_dir_needs_chmod(metadata.uid() == me, metadata.mode())? {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
         }
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
+}
+
+/// Whether an existing quarantine directory has to be set to `0700`, or is refused.
+///
+/// Ours: tightened, as before. Somebody else's: left alone when it already is `0700` (an
+/// administrator running `list` or `restore` on the service user's directory), refused when
+/// its mode would have to change, since changing the mode of a directory the agent does not
+/// own is not the agent's call (#689).
+#[cfg(unix)]
+fn quarantine_dir_needs_chmod(owned_by_me: bool, mode: u32) -> std::io::Result<bool> {
+    if owned_by_me {
+        return Ok(true);
+    }
+    if mode & 0o7777 == 0o700 {
+        return Ok(false);
+    }
+    Err(invalid(
+        "quarantine directory is owned by another user and is not mode 0700; refusing to change it",
+    ))
 }
 
 fn secure_payload(path: &Path) -> std::io::Result<()> {
@@ -1302,6 +1325,21 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(!qdir.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_of_another_user_is_left_alone_only_when_it_is_already_private() {
+        // Ours: always set to 0700, whatever it was.
+        assert!(quarantine_dir_needs_chmod(true, 0o040_755).unwrap());
+        assert!(quarantine_dir_needs_chmod(true, 0o040_700).unwrap());
+        // Someone else's and already 0700 (root running `list`): no chmod, no refusal.
+        assert!(!quarantine_dir_needs_chmod(false, 0o040_700).unwrap());
+        // Someone else's and it would have to change: refused.
+        for mode in [0o040_755, 0o040_750, 0o040_777, 0o040_500] {
+            let err = quarantine_dir_needs_chmod(false, mode).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{mode:o}");
+        }
     }
 
     /// #689 (review note): an existing directory that belongs to someone else is refused, not
