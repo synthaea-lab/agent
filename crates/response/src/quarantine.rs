@@ -6,13 +6,17 @@
 //! path — the only state [`unquarantine`] needs to reverse the action (issue #25:
 //! "reversible where possible").
 //!
+//! On Unix the source is opened once (`O_NOFOLLOW`, checked with `fstat`) and then hashed and
+//! moved through that descriptor, so a name swapped for a symlink after the check cannot
+//! redirect the move or the `chmod` (#689).
+//!
 //! Unix permissions are tightened here because `set_readonly` alone preserves the
 //! execute bits. The Windows agent does not wire automated quarantine yet; its ACL
 //! policy must be established before that path is enabled.
 
 use std::{
     fmt::Write as _,
-    io::{Read as _, Write as _},
+    io::Write as _,
     path::{Path, PathBuf},
 };
 
@@ -69,13 +73,10 @@ pub fn quarantine_file(
 }
 
 fn try_quarantine(path: &Path, quarantine_dir: &Path) -> std::io::Result<(PathBuf, String)> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(invalid(
-            "quarantine source must be a regular, non-symlink file",
-        ));
-    }
-    let sha256_hex = sha256_file(path)?;
+    // Open once and do everything from that descriptor (#689): the check, the hash and the
+    // move then all concern one inode, whatever happens to the path in between.
+    let source = Source::open(path)?;
+    let sha256_hex = source.sha256(path)?;
     secure_quarantine_dir(quarantine_dir)?;
 
     // Reserve the sidecar before moving the source. A failed sidecar write leaves
@@ -115,7 +116,7 @@ fn try_quarantine(path: &Path, quarantine_dir: &Path) -> std::io::Result<(PathBu
         match move_and_secure(
             path,
             &quarantined_at,
-            move_to_quarantine,
+            |from, to| source.move_into_quarantine(from, to),
             secure_payload,
             move_file_no_clobber,
         ) {
@@ -134,6 +135,150 @@ fn try_quarantine(path: &Path, quarantine_dir: &Path) -> std::io::Result<(PathBu
             }
         }
     }
+}
+
+/// The file being quarantined, opened once.
+///
+/// On Unix the source is opened with `O_NOFOLLOW` and checked with `fstat` on the descriptor,
+/// then hashed and moved *through that descriptor*, so a path swapped for a symlink (or for
+/// another file) after the check cannot redirect the move or the `chmod` that follows, and
+/// the digest is the digest of the inode that is stored (#689). Elsewhere the path is
+/// checked and used as before.
+struct Source {
+    #[cfg(unix)]
+    file: std::fs::File,
+    /// `(device, inode)` of the opened file, to recognise its name again before removing it.
+    #[cfg(unix)]
+    id: (u64, u64),
+}
+
+fn not_a_regular_file() -> std::io::Error {
+    invalid("quarantine source must be a regular, non-symlink file")
+}
+
+impl Source {
+    #[cfg(unix)]
+    fn open(path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        // `O_NONBLOCK` so that opening a FIFO does not block: it is refused by the `fstat`
+        // just below.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|error| {
+                if error.raw_os_error() == Some(libc::ELOOP) {
+                    not_a_regular_file()
+                } else {
+                    error
+                }
+            })?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(not_a_regular_file());
+        }
+        Ok(Self {
+            id: (metadata.dev(), metadata.ino()),
+            file,
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn open(path: &Path) -> std::io::Result<Self> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(not_a_regular_file());
+        }
+        Ok(Self {})
+    }
+
+    /// SHA-256 of the opened file (of `path` where there is no descriptor to read).
+    fn sha256(&self, path: &Path) -> std::io::Result<String> {
+        #[cfg(unix)]
+        {
+            let _ = path;
+            sha256_reader(&mut &self.file)
+        }
+        #[cfg(not(unix))]
+        sha256_file(path)
+    }
+
+    /// Puts the opened file into quarantine at `to` and removes its name `from`, but only
+    /// while `from` still names it: a name that now points at something else is not ours to
+    /// delete. Never replaces `to`.
+    #[cfg(unix)]
+    fn move_into_quarantine(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+        match link_open_file(&self.file, to) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Err(error),
+            // No link to give (another filesystem, an unlinked file, a platform without
+            // `/proc/self/fd`): copy from the same descriptor.
+            Err(_) => copy_open_file_no_clobber(&self.file, to)?,
+        }
+        let still_named = std::fs::symlink_metadata(from)
+            .is_ok_and(|m| m.file_type().is_file() && (m.dev(), m.ino()) == self.id);
+        if still_named && let Err(error) = std::fs::remove_file(from) {
+            let _ = std::fs::remove_file(to);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn move_into_quarantine(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        move_to_quarantine(from, to)
+    }
+}
+
+/// Links the open file's inode at `to` without replacing anything (`AlreadyExists`
+/// otherwise). Through `/proc/self/fd` with `AT_SYMLINK_FOLLOW`, the one way to link an
+/// open file without privileges: the new name is that inode, whatever any path says.
+#[cfg(target_os = "linux")]
+fn link_open_file(file: &std::fs::File, to: &Path) -> std::io::Result<()> {
+    use std::{
+        ffi::CString,
+        os::{fd::AsRawFd as _, unix::ffi::OsStrExt as _},
+    };
+    let old = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .map_err(std::io::Error::other)?;
+    let new = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| invalid("quarantine path contains a NUL byte"))?;
+    // SAFETY: `old` and `new` are valid NUL-terminated strings that live for the whole
+    // call, and `linkat` does not retain either pointer.
+    let rc = unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            old.as_ptr(),
+            libc::AT_FDCWD,
+            new.as_ptr(),
+            libc::AT_SYMLINK_FOLLOW,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// No `/proc/self/fd` to link through: the caller copies from the descriptor instead.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn link_open_file(_file: &std::fs::File, _to: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+
+/// Copies the open file to a new file `to` that must not exist, from the descriptor
+/// (rewound), carrying its permissions.
+#[cfg(unix)]
+fn copy_open_file_no_clobber(file: &std::fs::File, to: &Path) -> std::io::Result<()> {
+    use std::io::Seek as _;
+    let mut src = file.try_clone()?;
+    src.rewind()?;
+    copy_open_no_clobber_with(src, to, |src, dst| {
+        std::io::copy(src, dst)?;
+        dst.set_permissions(src.metadata()?.permissions())
+    })
 }
 
 struct QuarantineMoveFailure {
@@ -210,7 +355,14 @@ fn secure_quarantine_dir(path: &Path) -> std::io::Result<()> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        if metadata.uid() != me {
+            return Err(invalid(
+                "quarantine directory is owned by another user; refusing to change it",
+            ));
+        }
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
@@ -263,6 +415,16 @@ pub fn unquarantine(quarantine_dir: &Path, sha256_hex: &str) -> std::io::Result<
     if !is_sha256_hex(sha256_hex) {
         return Err(invalid("not a lowercase SHA-256 hex digest"));
     }
+    // Nothing was ever quarantined here: say so before `secure_quarantine_dir` creates the
+    // directory or changes the mode of one somebody else made.
+    if let Err(error) = std::fs::symlink_metadata(quarantine_dir)
+        && error.kind() == std::io::ErrorKind::NotFound
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no payload with this digest is quarantined",
+        ));
+    }
     secure_quarantine_dir(quarantine_dir)?;
     secure_existing_files(quarantine_dir)?;
     let slots = quarantine_slots(quarantine_dir, sha256_hex)?;
@@ -274,6 +436,7 @@ pub fn unquarantine(quarantine_dir: &Path, sha256_hex: &str) -> std::io::Result<
     }
 
     let mut occupied = None;
+    let mut tampered = None;
     for (stored, origin_path) in slots {
         if !stored.exists() {
             continue;
@@ -286,8 +449,11 @@ pub fn unquarantine(quarantine_dir: &Path, sha256_hex: &str) -> std::io::Result<
 
         // Every slot is named from the content digest; reject tampering before
         // giving a quarantined payload back to an operator.
+        // A slot that no longer matches is reported, but the slots after it are still tried:
+        // one tampered copy must not make an intact one unrecoverable.
         if sha256_file(&stored)? != sha256_hex {
-            return Err(invalid("quarantined file no longer matches its hash"));
+            tampered = Some(invalid("quarantined file no longer matches its hash"));
+            continue;
         }
         match move_file_no_clobber(&stored, &original) {
             Ok(()) => {
@@ -300,7 +466,7 @@ pub fn unquarantine(quarantine_dir: &Path, sha256_hex: &str) -> std::io::Result<
             Err(error) => return Err(error),
         }
     }
-    Err(occupied.unwrap_or_else(|| {
+    Err(tampered.or(occupied).unwrap_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "no restorable payload with this digest is quarantined",
@@ -462,9 +628,11 @@ fn move_file_no_clobber(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Moves a source into quarantine without leaving its original path live. Unlike
+/// Moves a source into quarantine by path, without leaving its original path live. Unlike
 /// restore, failure to remove the source after creating the destination is an
-/// error: both copies must not be reported as a successful quarantine.
+/// error: both copies must not be reported as a successful quarantine. Unix quarantines go
+/// through [`Source::move_into_quarantine`] instead, which holds the file open (#689).
+#[cfg(any(test, not(unix)))]
 fn move_to_quarantine(from: &Path, to: &Path) -> std::io::Result<()> {
     match std::fs::hard_link(from, to) {
         Ok(()) => {}
@@ -498,7 +666,15 @@ fn copy_no_clobber_with(
     to: &Path,
     fill: impl FnOnce(&mut std::fs::File, &mut std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    let mut src = std::fs::File::open(from)?;
+    copy_open_no_clobber_with(std::fs::File::open(from)?, to, fill)
+}
+
+/// [`copy_no_clobber_with`] for a source that is already open.
+fn copy_open_no_clobber_with(
+    mut src: std::fs::File,
+    to: &Path,
+    fill: impl FnOnce(&mut std::fs::File, &mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let mut dst = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -540,8 +716,11 @@ fn origin_sidecar_path(quarantine_dir: &Path, sha256_hex: &str) -> PathBuf {
 }
 
 fn sha256_file(path: &Path) -> std::io::Result<String> {
+    sha256_reader(&mut std::fs::File::open(path)?)
+}
+
+fn sha256_reader(file: &mut impl std::io::Read) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
-    let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -900,6 +1079,243 @@ mod tests {
         assert!(!dir.join("quarantine").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #689: the name is swapped for a symlink to a victim file after the source was opened
+    /// and checked. The move must store the inode that was checked, leave the symlink and its
+    /// target alone, and the `chmod` that follows must not reach the victim.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_symlink_swapped_in_after_the_check_does_not_redirect_the_move_or_the_chmod() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let dir = temp_dir("swap-symlink");
+        let source = dir.join("payload");
+        let victim = dir.join("victim");
+        let stored = dir.join("stored");
+        std::fs::write(&source, b"the payload").unwrap();
+        std::fs::write(&victim, b"someone else's file").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let opened = Source::open(&source).unwrap();
+        let digest = opened.sha256(&source).unwrap();
+        // The race: between the check and the move, the name becomes a symlink.
+        std::fs::remove_file(&source).unwrap();
+        symlink(&victim, &source).unwrap();
+
+        move_and_secure(
+            &source,
+            &stored,
+            |from, to| opened.move_into_quarantine(from, to),
+            secure_payload,
+            move_file_no_clobber,
+        )
+        .unwrap_or_else(|failure| panic!("move failed: {}", failure.error));
+
+        assert!(!std::fs::symlink_metadata(&stored).unwrap().is_symlink());
+        assert_eq!(
+            sha256_file(&stored).unwrap(),
+            digest,
+            "stored what was hashed"
+        );
+        assert_eq!(std::fs::read(&stored).unwrap(), b"the payload");
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "the symlink's target is untouched"
+        );
+        assert!(
+            std::fs::symlink_metadata(&source).unwrap().is_symlink(),
+            "a name that is no longer ours is left alone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #689: the file is replaced by another one after it was hashed. What is stored is the
+    /// file that was hashed, so the digest it is filed under is its own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_file_replaced_after_hashing_is_stored_under_its_own_digest() {
+        let dir = temp_dir("swap-file");
+        let source = dir.join("payload");
+        let other = dir.join("other");
+        let stored = dir.join("stored");
+        std::fs::write(&source, b"hashed content").unwrap();
+        std::fs::write(&other, b"replacement content").unwrap();
+
+        let opened = Source::open(&source).unwrap();
+        let digest = opened.sha256(&source).unwrap();
+        std::fs::rename(&other, &source).unwrap();
+
+        opened.move_into_quarantine(&source, &stored).unwrap();
+
+        assert_eq!(sha256_file(&stored).unwrap(), digest);
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"replacement content",
+            "the replacement is not ours to remove"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #689: a file deleted after it was opened cannot be linked; it is copied from the
+    /// descriptor, which is also the path taken across filesystems.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_unlinked_after_the_check_is_still_stored_from_its_descriptor() {
+        let dir = temp_dir("unlinked-source");
+        let source = dir.join("payload");
+        let stored = dir.join("stored");
+        std::fs::write(&source, b"still readable").unwrap();
+
+        let opened = Source::open(&source).unwrap();
+        let digest = opened.sha256(&source).unwrap();
+        std::fs::remove_file(&source).unwrap();
+
+        opened.move_into_quarantine(&source, &stored).unwrap();
+
+        assert_eq!(sha256_file(&stored).unwrap(), digest);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_copy_from_a_descriptor_ignores_a_symlink_that_took_the_name() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("copy-from-fd");
+        let source = dir.join("payload");
+        let victim = dir.join("victim");
+        let stored = dir.join("stored");
+        std::fs::write(&source, b"the payload").unwrap();
+        std::fs::write(&victim, b"someone else's file").unwrap();
+
+        let opened = Source::open(&source).unwrap();
+        std::fs::remove_file(&source).unwrap();
+        symlink(&victim, &source).unwrap();
+
+        copy_open_file_no_clobber(&opened.file, &stored).unwrap();
+
+        assert_eq!(std::fs::read(&stored).unwrap(), b"the payload");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linking_an_open_file_never_replaces_an_existing_name() {
+        let dir = temp_dir("link-no-clobber");
+        let source = dir.join("payload");
+        let taken = dir.join("taken");
+        std::fs::write(&source, b"payload").unwrap();
+        std::fs::write(&taken, b"already here").unwrap();
+
+        let opened = Source::open(&source).unwrap();
+        let error = opened.move_into_quarantine(&source, &taken).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&taken).unwrap(), b"already here");
+        assert!(source.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A FIFO under the file's name must be refused, not waited on.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_source_is_refused_without_blocking() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt as _};
+
+        let dir = temp_dir("fifo-source");
+        let fifo = dir.join("pipe");
+        let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+
+        let outcome = quarantine_file(
+            &fifo,
+            &dir.join("quarantine"),
+            &ResponsePolicy {
+                kill_enabled: false,
+                quarantine_enabled: true,
+            },
+        );
+
+        assert!(
+            matches!(outcome, QuarantineOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
+        assert!(!dir.join("quarantine").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #689 (review note): a tampered slot returned early, so the intact copies of the same
+    /// digest after it could never be restored.
+    #[test]
+    fn a_tampered_slot_does_not_hide_an_intact_one_of_the_same_digest() {
+        let dir = temp_dir("tampered-then-intact");
+        let first = dir.join("first");
+        let second = dir.join("second");
+        std::fs::write(&first, b"same bytes").unwrap();
+        std::fs::write(&second, b"same bytes").unwrap();
+        let qdir = dir.join("quarantine");
+        let policy = ResponsePolicy {
+            kill_enabled: false,
+            quarantine_enabled: true,
+        };
+        let QuarantineOutcome::Quarantined {
+            sha256_hex: digest,
+            quarantined_at: first_stored,
+            ..
+        } = quarantine_file(&first, &qdir, &policy)
+        else {
+            panic!("first payload must be quarantined");
+        };
+        assert!(matches!(
+            quarantine_file(&second, &qdir, &policy),
+            QuarantineOutcome::Quarantined { .. }
+        ));
+        let mut perms = std::fs::metadata(&first_stored).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&first_stored, perms).unwrap();
+        std::fs::write(&first_stored, b"swapped by someone").unwrap();
+
+        let restored = unquarantine(&qdir, &digest).unwrap();
+
+        assert_eq!(restored, second);
+        assert_eq!(std::fs::read(&second).unwrap(), b"same bytes");
+        assert!(!first.exists(), "the tampered copy is not put back");
+        // What is left is the tampered slot, still refused.
+        let err = unquarantine(&qdir, &digest).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #689 (review note): asking to restore from a quarantine that was never created must
+    /// not create it.
+    #[test]
+    fn restoring_from_a_quarantine_that_does_not_exist_creates_nothing() {
+        let dir = temp_dir("restore-nothing");
+        let qdir = dir.join("never-created");
+
+        let err = unquarantine(&qdir, &"0".repeat(64)).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(!qdir.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #689 (review note): an existing directory that belongs to someone else is refused, not
+    /// `chmod`ed. `/usr` is root's; as root it would be this process's own, so the test only
+    /// runs unprivileged (it must never reach the `chmod`).
+    #[cfg(unix)]
+    #[test]
+    fn a_quarantine_directory_owned_by_another_user_is_refused() {
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let err = secure_quarantine_dir(Path::new("/usr")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     fn quarantine_one(dir: &Path, name: &str, body: &[u8]) -> (PathBuf, PathBuf, String) {
