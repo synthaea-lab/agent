@@ -176,6 +176,14 @@ pub fn describe_silent_session(session: &str, session_listing: Option<&str>) -> 
     format!("session {session} {state}; other wtrace- sessions running: {others}")
 }
 
+/// Whether a session listing can say that `session` is *not* running. A listing cut
+/// at the API's limit proves presence but never absence: the session may be among
+/// the ones that were not returned (review of #712).
+#[must_use]
+pub fn listing_proves_absence(possibly_truncated: bool, names: &[&str], session: &str) -> bool {
+    !possibly_truncated || names.contains(&session)
+}
+
 /// One session enabling one of our providers, as the OS reports it (#408).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderEnablement {
@@ -622,6 +630,14 @@ mod tests {
             .collect();
         let selected = select_orphaned_sessions(&sessions, 64, false);
         assert!(selected.possibly_truncated);
+    }
+
+    #[test]
+    fn a_truncated_listing_proves_presence_but_not_absence() {
+        let names = ["wtrace-a", "other"];
+        assert!(listing_proves_absence(false, &names, "wtrace-missing"));
+        assert!(!listing_proves_absence(true, &names, "wtrace-missing"));
+        assert!(listing_proves_absence(true, &names, "wtrace-a"));
     }
 
     #[test]

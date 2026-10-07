@@ -125,14 +125,15 @@ fn stop_all_orphaned_sessions() {
                 etw_sessions::MAX_SESSIONS,
                 snapshot.possibly_truncated,
             );
+            for name in selected.names {
+                stop_orphaned_session(&name);
+            }
             if selected.possibly_truncated {
                 tracing::warn!(
                     limit = etw_sessions::MAX_SESSIONS,
-                    "QueryAllTracesW returned a full session list; ETW orphans may be hidden"
+                    "QueryAllTracesW returned a full session list; checking logman for orphans beyond it"
                 );
-            }
-            for name in selected.names {
-                stop_orphaned_session(&name);
+                stop_orphans_via_logman();
             }
         }
         Err(status) => {
@@ -140,31 +141,48 @@ fn stop_all_orphaned_sessions() {
                 status,
                 "QueryAllTracesW failed; falling back to logman for ETW orphan enumeration"
             );
-            let out = std::process::Command::new("logman")
-                .args(["query", "-ets"])
-                .output();
-            match out {
-                Ok(o) if o.status.success() => {
-                    tracing::info!(
-                        source = "logman",
-                        "ETW orphan enumeration succeeded via fallback"
-                    );
-                    let stdout = String::from_utf8_lossy(&o.stdout);
-                    for name in normalize::parse_orphaned_sessions(&stdout) {
-                        stop_orphaned_session(&name);
-                    }
-                }
-                Ok(o) => tracing::warn!(
-                    status = %o.status,
-                    stderr = %String::from_utf8_lossy(&o.stderr).trim(),
-                    "logman query -ets fallback failed — ETW orphan enumeration skipped"
-                ),
-                Err(e) => {
-                    tracing::warn!(error = %e, "logman unavailable — ETW orphan enumeration skipped");
-                }
-            }
+            stop_orphans_via_logman();
         }
     }
+}
+
+/// Enumerates `logman query -ets` and stops every `wtrace-` session in it. Used when
+/// `QueryAllTracesW` fails, and when its list is full and may hide some (a session
+/// the native pass already stopped is "not found" here, which is nominal).
+fn stop_orphans_via_logman() {
+    let out = std::process::Command::new("logman")
+        .args(["query", "-ets"])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            tracing::info!(
+                source = "logman",
+                "ETW orphan enumeration succeeded via fallback"
+            );
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            for name in normalize::parse_orphaned_sessions(&stdout) {
+                stop_orphaned_session(&name);
+            }
+        }
+        Ok(o) => tracing::warn!(
+            status = %o.status,
+            stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+            "logman query -ets fallback failed — ETW orphan enumeration skipped"
+        ),
+        Err(e) => {
+            tracing::warn!(error = %e, "logman unavailable — ETW orphan enumeration skipped");
+        }
+    }
+}
+
+/// `logman query -ets` output, `None` when it cannot be run or fails.
+fn logman_listing() -> Option<String> {
+    std::process::Command::new("logman")
+        .args(["query", "-ets"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
 /// Stops the session a failed `start_and_process` left behind (#408, see
@@ -201,12 +219,22 @@ fn silent_session_diagnosis(session: &str) -> String {
                 "ETW blind-session diagnosis enumerated sessions"
             );
             let sessions = snapshot.entries;
-            let output = sessions
+            let names: Vec<&str> = sessions
                 .iter()
                 .map(|(_, stats)| stats.name.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            let state = normalize::describe_silent_session(session, Some(&output));
+                .collect();
+            let state = if normalize::listing_proves_absence(
+                snapshot.possibly_truncated,
+                &names,
+                session,
+            ) {
+                normalize::describe_silent_session(session, Some(&names.join("\n")))
+            } else {
+                // A full list without our session: it may be one of those not
+                // returned, so "stopped from outside" would be a guess. Ask logman;
+                // if that fails too, the state is unknown.
+                normalize::describe_silent_session(session, logman_listing().as_deref())
+            };
             (sessions, state)
         }
         Err(status) => {
@@ -214,12 +242,7 @@ fn silent_session_diagnosis(session: &str) -> String {
                 status,
                 "QueryAllTracesW failed during blind-session diagnosis; falling back to logman"
             );
-            let output = std::process::Command::new("logman")
-                .args(["query", "-ets"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+            let output = logman_listing();
             let state = normalize::describe_silent_session(session, output.as_deref());
             (Vec::new(), state)
         }
