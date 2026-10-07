@@ -353,6 +353,10 @@ impl ConnectDedup {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use proptest::prelude::*;
+
     use super::*;
 
     #[test]
@@ -638,6 +642,117 @@ mod tests {
         assert!(listing_proves_absence(false, &names, "wtrace-missing"));
         assert!(!listing_proves_absence(true, &names, "wtrace-missing"));
         assert!(listing_proves_absence(true, &names, "wtrace-a"));
+    }
+
+    proptest! {
+        #[test]
+        fn selected_wtrace_set_is_independent_of_session_order(
+            entries in prop::collection::vec((any::<String>(), any::<u64>()), 0..100)
+        ) {
+            let sessions: Vec<_> = entries
+                .iter()
+                .map(|(name, _)| stats(name, true, 0))
+                .collect();
+            let mut permuted: Vec<_> = entries
+                .iter()
+                .enumerate()
+                .map(|(index, (name, key))| (*key, index, stats(name, true, 0)))
+                .collect();
+            permuted.sort_by_key(|(key, index, _)| (*key, *index));
+            let permuted_sessions: Vec<_> = permuted.into_iter().map(|(_, _, session)| session).collect();
+
+            let original = select_orphaned_sessions(&sessions, usize::MAX, false);
+            let reordered = select_orphaned_sessions(&permuted_sessions, usize::MAX, false);
+            let original_names: BTreeSet<_> = original.names.into_iter().collect();
+            let reordered_names: BTreeSet<_> = reordered.names.into_iter().collect();
+            prop_assert_eq!(original_names, reordered_names);
+        }
+
+        #[test]
+        fn selected_session_names_always_have_the_owned_prefix(
+            names in prop::collection::vec(any::<String>(), 0..100)
+        ) {
+            let sessions: Vec<_> = names.iter().map(|name| stats(name, false, 0)).collect();
+            let selected = select_orphaned_sessions(&sessions, usize::MAX, false);
+            prop_assert!(selected.names.iter().all(|name| name.starts_with("wtrace-")));
+            for name in names.iter().filter(|name| !name.starts_with("wtrace-")) {
+                prop_assert!(!selected.names.contains(name));
+            }
+        }
+
+        #[test]
+        fn a_truncated_listing_only_decides_present_names(
+            names in prop::collection::vec("[a-zA-Z0-9-]{1,24}", 0..30),
+            session in "[a-zA-Z0-9-]{1,24}",
+            truncated in any::<bool>()
+        ) {
+            let borrowed: Vec<_> = names.iter().map(String::as_str).collect();
+            let independently_expected = !truncated || names.iter().any(|name| name == &session);
+            prop_assert_eq!(
+                listing_proves_absence(truncated, &borrowed, &session),
+                independently_expected
+            );
+        }
+
+        #[test]
+        fn silent_diagnosis_reports_target_presence_and_other_count(
+            other_count in 0usize..20
+        ) {
+            let session = "wtrace-target";
+            let mut output = String::from("Header\r\n");
+            for index in 0..other_count {
+                output.push_str(&format!("wtrace-other-{index}\tTrace\tRunning\r\n"));
+            }
+            output.push_str("wtrace-target\tTrace\tRunning\r\n");
+            let diagnosis = describe_silent_session(session, Some(&output));
+            let expected_suffix = format!("other wtrace- sessions running: {other_count}");
+            prop_assert!(diagnosis.contains("still running but delivers no events"));
+            prop_assert!(diagnosis.ends_with(&expected_suffix), "diagnosis: {}", diagnosis);
+        }
+    }
+
+    #[test]
+    fn native_session_capacity_reports_exactly_64_as_possibly_truncated() {
+        let below_capacity: Vec<_> = (0..63)
+            .map(|index| stats(&format!("session-{index}"), true, 1))
+            .collect();
+        let at_capacity: Vec<_> = (0..64)
+            .map(|index| stats(&format!("session-{index}"), true, 1))
+            .collect();
+
+        assert!(!select_orphaned_sessions(&below_capacity, 64, false).possibly_truncated);
+        assert!(select_orphaned_sessions(&at_capacity, 64, false).possibly_truncated);
+    }
+
+    #[test]
+    fn parser_handles_localized_crlf_blank_control_and_long_rows() {
+        let long_name = format!("wtrace-{}", "x".repeat(32 * 1024));
+        let output = format!(
+            "Ensemble de collecteurs de donn\u{e9}es\tType\t\u{c9}tat\r\n\r\n\
+             {long_name}\tSuivi\tEn cours d'ex\u{e9}cution\r\n\
+             wtrace- \tSuivi\tEn cours d'ex\u{e9}cution\r\n\
+             wtrace-\u{7}alert\tSuivi\tEn cours d'ex\u{e9}cution\r\n\
+             ordinary-wtrace-not-ours\tSuivi\tEn cours d'ex\u{e9}cution\r\n"
+        );
+        let parsed = parse_orphaned_sessions(&output);
+
+        assert_eq!(
+            parsed,
+            [
+                long_name,
+                "wtrace-".to_string(),
+                "wtrace-\u{7}alert".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn silent_diagnosis_with_failed_enumeration_is_explicitly_unknown() {
+        let diagnosis = describe_silent_session("wtrace-target", None);
+        assert_eq!(
+            diagnosis,
+            "session wtrace-target: state unknown (ETW session enumeration failed)"
+        );
     }
 
     #[test]
