@@ -1,0 +1,6 @@
+# WDK / MSBuild outputs
+x64/
+ARM64/
+.vs/
+*.user
+*.cer
