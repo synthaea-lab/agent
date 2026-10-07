@@ -11,7 +11,13 @@
 //! redirect the move or the `chmod` (#689). Known limits: `O_NOFOLLOW` covers the last path
 //! component only, so a symlinked parent directory under an attacker's control is still
 //! followed (`openat2` with `RESOLVE_NO_SYMLINKS`, Linux 5.6+, would close that); and the
-//! check of the source's name and its removal are not atomic.
+//! check of the source's name and its removal are not atomic. A source that is written to
+//! while it is processed is not refused (a writer could then defeat the quarantine): it is
+//! copied from the descriptor into a private file, hashed as it is copied and filed under that
+//! digest, so the stored bytes and their digest agree whatever the writer does. A hard-linked
+//! payload shares its inode with the source, so a process that already holds it open for
+//! writing can still change the quarantined file (`restore` then reports a hash mismatch);
+//! containment holds, since it is `0400` and no name is left at the source.
 //!
 //! Unix permissions are tightened here because `set_readonly` alone preserves the
 //! execute bits. The Windows agent does not wire automated quarantine yet; its ACL
@@ -82,12 +88,37 @@ fn try_quarantine(path: &Path, quarantine_dir: &Path) -> std::io::Result<(PathBu
     let sha256_hex = source.sha256(path)?;
     secure_quarantine_dir(quarantine_dir)?;
 
+    // Somebody is writing to the file (a dropper still downloading, or an attacker keeping it
+    // busy): the digest may not be the digest of what a link or a copy would now store.
+    // Refusing would let a writer defeat the quarantine, so take a private snapshot instead.
+    #[cfg(unix)]
+    if source.written_since_open()? {
+        return quarantine_snapshot(&source, path, quarantine_dir);
+    }
+    match store_in_slot(&source, path, path, quarantine_dir, &sha256_hex) {
+        #[cfg(unix)]
+        Err(error) if is_written_after_hash(&error) => {
+            quarantine_snapshot(&source, path, quarantine_dir)
+        }
+        stored => stored.map(|quarantined_at| (quarantined_at, sha256_hex)),
+    }
+}
+
+/// Reserves a slot for `sha256_hex`, then moves `source` (named `from`) into it. `origin`
+/// is the path recorded in the sidecar, which [`unquarantine`] restores to.
+fn store_in_slot(
+    source: &Source,
+    from: &Path,
+    origin: &Path,
+    quarantine_dir: &Path,
+    sha256_hex: &str,
+) -> std::io::Result<PathBuf> {
     // Reserve the sidecar before moving the source. A failed sidecar write leaves
     // the source untouched; a later move failure removes the reservation. Each
     // duplicate digest receives its own slot so every live copy is contained.
     let mut slot = 0u64;
     loop {
-        let stem = slot_stem(&sha256_hex, slot);
+        let stem = slot_stem(sha256_hex, slot);
         let quarantined_at = quarantine_dir.join(&stem);
         let origin_path = quarantine_dir.join(format!("{stem}.origin"));
         let mut sidecar = match std::fs::OpenOptions::new()
@@ -103,7 +134,7 @@ fn try_quarantine(path: &Path, quarantine_dir: &Path) -> std::io::Result<(PathBu
             Err(error) => return Err(error),
         };
         if let Err(error) = sidecar
-            .write_all(path.to_string_lossy().as_bytes())
+            .write_all(origin.to_string_lossy().as_bytes())
             .and_then(|()| sidecar.sync_all())
         {
             drop(sidecar);
@@ -117,13 +148,13 @@ fn try_quarantine(path: &Path, quarantine_dir: &Path) -> std::io::Result<(PathBu
         }
 
         match move_and_secure(
-            path,
+            from,
             &quarantined_at,
             |from, to| source.move_into_quarantine(from, to),
             secure_payload,
             move_file_no_clobber,
         ) {
-            Ok(()) => return Ok((quarantined_at, sha256_hex)),
+            Ok(()) => return Ok(quarantined_at),
             Err(failure) => {
                 if !failure.retained_in_quarantine {
                     let _ = std::fs::remove_file(&origin_path);
@@ -138,6 +169,88 @@ fn try_quarantine(path: &Path, quarantine_dir: &Path) -> std::io::Result<(PathBu
             }
         }
     }
+}
+
+/// Quarantines a source that is being written to: copies it from the descriptor into a private
+/// file in the quarantine directory, hashing the bytes as they are copied, and files that
+/// copy under that digest. The stored bytes and their digest agree by construction, whatever
+/// the writer does, and the writer cannot stop the quarantine. The source's name is removed
+/// afterwards, only while it still names the opened file.
+#[cfg(unix)]
+fn quarantine_snapshot(
+    source: &Source,
+    path: &Path,
+    quarantine_dir: &Path,
+) -> std::io::Result<(PathBuf, String)> {
+    let (temp, sha256_hex) = snapshot_hashed(&source.file, quarantine_dir)?;
+    let stored = Source::open(&temp)
+        .and_then(|snapshot| store_in_slot(&snapshot, &temp, path, quarantine_dir, &sha256_hex));
+    // Gone already once the snapshot was moved into its slot; this covers a failure.
+    let _ = std::fs::remove_file(&temp);
+    let quarantined_at = stored?;
+    if let Err(error) = source.remove_name_if_same(path) {
+        let _ = std::fs::remove_file(&quarantined_at);
+        if let Some(name) = quarantined_at.file_name().and_then(|n| n.to_str()) {
+            let _ = std::fs::remove_file(quarantined_at.with_file_name(format!("{name}.origin")));
+        }
+        return Err(error);
+    }
+    Ok((quarantined_at, sha256_hex))
+}
+
+/// Copies the open file (rewound) to a new private file in `dir`, returning its path and the
+/// SHA-256 of the bytes written to it.
+#[cfg(unix)]
+fn snapshot_hashed(file: &std::fs::File, dir: &Path) -> std::io::Result<(PathBuf, String)> {
+    use std::{io::Seek as _, os::unix::fs::OpenOptionsExt as _};
+    let mut source = file.try_clone()?;
+    source.rewind()?;
+    let mut attempt = 0u64;
+    let (temp, mut out) = loop {
+        let temp = dir.join(format!(".incoming-{}-{attempt}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)
+        {
+            Ok(out) => break (temp, out),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt = attempt.checked_add(1).ok_or(error)?;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    match sha256_copy(&mut source, &mut out).and_then(|digest| out.sync_all().map(|()| digest)) {
+        Ok(digest) => Ok((temp, digest)),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(error)
+        }
+    }
+}
+
+/// Raised between the hash and the store when the source was written to in that window:
+/// the caller takes a snapshot and hashes that instead of refusing.
+#[cfg(unix)]
+#[derive(Debug)]
+struct WrittenAfterHash;
+
+#[cfg(unix)]
+impl std::fmt::Display for WrittenAfterHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the quarantine source was written to after it was hashed")
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for WrittenAfterHash {}
+
+#[cfg(unix)]
+fn is_written_after_hash(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<WrittenAfterHash>())
 }
 
 /// The file being quarantined, opened once.
@@ -211,9 +324,7 @@ impl Source {
         #[cfg(unix)]
         {
             let _ = path;
-            let digest = sha256_reader(&mut &self.file)?;
-            self.refuse_if_written()?;
-            Ok(digest)
+            sha256_reader(&mut &self.file)
         }
         #[cfg(not(unix))]
         sha256_file(path)
@@ -228,7 +339,9 @@ impl Source {
     /// took the name. It cannot redirect what was stored, nor any `chmod` (#689).
     #[cfg(unix)]
     fn move_into_quarantine(&self, from: &Path, to: &Path) -> std::io::Result<()> {
-        self.refuse_if_written()?;
+        if self.written_since_open()? {
+            return Err(std::io::Error::other(WrittenAfterHash));
+        }
         let linked = match link_open_file(&self.file, to) {
             Ok(()) => true,
             // No link to give (another filesystem, an unlinked file, too many links, a
@@ -276,16 +389,23 @@ impl Source {
         Ok(())
     }
 
-    /// Fails when the opened file was written to since it was opened (size or modification
-    /// time differ), so that it is not stored under a digest computed on other content.
+    /// Whether the opened file was written to since it was opened (size or modification time
+    /// differ): the digest then may not be that of what a link or a copy would store.
     #[cfg(unix)]
-    fn refuse_if_written(&self) -> std::io::Result<()> {
-        if snapshot_of(&self.file.metadata()?) != self.snapshot {
-            return Err(invalid(
-                "the quarantine source was modified while it was being processed",
-            ));
+    fn written_since_open(&self) -> std::io::Result<bool> {
+        Ok(snapshot_of(&self.file.metadata()?) != self.snapshot)
+    }
+
+    /// Removes the name `from` while it still names the opened file.
+    #[cfg(unix)]
+    fn remove_name_if_same(&self, from: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+        match std::fs::symlink_metadata(from) {
+            Ok(m) if m.file_type().is_file() && (m.dev(), m.ino()) == self.id => {
+                std::fs::remove_file(from)
+            }
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     #[cfg(not(unix))]
@@ -810,15 +930,24 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
 }
 
 fn sha256_reader(file: &mut impl std::io::Read) -> std::io::Result<String> {
+    sha256_copy(file, &mut std::io::sink())
+}
+
+/// Copies `from` to `to` and returns the SHA-256 of exactly the bytes copied.
+fn sha256_copy(
+    from: &mut impl std::io::Read,
+    to: &mut impl std::io::Write,
+) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = file.read(&mut buf)?;
+        let n = from.read(&mut buf)?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
+        to.write_all(&buf[..n])?;
     }
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(64);
@@ -1381,11 +1510,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #713 review: a write between the open and the store would put content under a digest
-    /// it no longer has.
+    /// #713 review: a write between the open and the store is noticed, and the store itself
+    /// reports it with a marker the caller turns into a snapshot, not into a refusal.
     #[cfg(unix)]
     #[test]
-    fn a_source_written_to_after_it_was_opened_is_refused() {
+    fn a_source_written_to_after_it_was_opened_is_noticed_not_refused_by_the_hash() {
         use std::io::Write as _;
 
         let dir = temp_dir("written-after-open");
@@ -1394,6 +1523,7 @@ mod tests {
         std::fs::write(&source, b"the payload").unwrap();
         let opened = Source::open(&source).unwrap();
         opened.sha256(&source).unwrap();
+        assert!(!opened.written_since_open().unwrap());
         std::fs::OpenOptions::new()
             .append(true)
             .open(&source)
@@ -1401,17 +1531,10 @@ mod tests {
             .write_all(b" and more")
             .unwrap();
 
-        assert_eq!(
-            opened.sha256(&source).unwrap_err().kind(),
-            std::io::ErrorKind::InvalidData
-        );
-        assert_eq!(
-            opened
-                .move_into_quarantine(&source, &stored)
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::InvalidData
-        );
+        assert!(opened.written_since_open().unwrap());
+        assert!(opened.sha256(&source).is_ok(), "hashing is not refused");
+        let error = opened.move_into_quarantine(&source, &stored).unwrap_err();
+        assert!(is_written_after_hash(&error));
         assert!(!stored.exists());
         assert!(source.exists());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1419,7 +1542,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_source_whose_modification_time_moved_is_refused_even_at_the_same_size() {
+    fn a_source_whose_modification_time_moved_is_noticed_even_at_the_same_size() {
         let dir = temp_dir("mtime-moved");
         let source = dir.join("payload");
         std::fs::write(&source, b"the payload").unwrap();
@@ -1431,7 +1554,101 @@ mod tests {
             .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
             .unwrap();
 
-        assert!(opened.refuse_if_written().is_err());
+        assert!(opened.written_since_open().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #713 review: the snapshot is filed under the digest of the bytes it holds, the source
+    /// name is removed, nothing is left behind, and the payload can be restored.
+    #[cfg(unix)]
+    #[test]
+    fn a_snapshot_of_a_written_source_is_stored_under_its_own_digest_and_restores() {
+        use std::io::Write as _;
+
+        let dir = temp_dir("snapshot");
+        let source = dir.join("payload");
+        let qdir = dir.join("quarantine");
+        std::fs::write(&source, b"first").unwrap();
+        secure_quarantine_dir(&qdir).unwrap();
+        let opened = Source::open(&source).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(b" and more")
+            .unwrap();
+
+        let (stored, digest) = quarantine_snapshot(&opened, &source, &qdir).unwrap();
+
+        assert_eq!(sha256_file(&stored).unwrap(), digest);
+        assert_eq!(std::fs::read(&stored).unwrap(), b"first and more");
+        assert!(!source.exists(), "the name is removed");
+        assert!(
+            std::fs::read_dir(&qdir).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".incoming")),
+            "no temporary file is left"
+        );
+        assert_eq!(unquarantine(&qdir, &digest).unwrap(), source);
+        assert_eq!(std::fs::read(&source).unwrap(), b"first and more");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #713 review (measured by the reviewer): a writer that keeps appending must not make the
+    /// quarantine fail, and what is stored must match the digest it is filed under.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_keeps_being_written_is_still_quarantined() {
+        use std::{
+            io::Write as _,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+        };
+
+        let dir = temp_dir("busy-writer");
+        let source = dir.join("payload");
+        std::fs::write(&source, vec![7u8; 4 * 1024 * 1024]).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (source, stop) = (source.clone(), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    match std::fs::OpenOptions::new().append(true).open(&source) {
+                        Ok(mut file) => {
+                            let _ = file.write_all(b"x");
+                        }
+                        Err(_) => break,
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+            })
+        };
+
+        let outcome = quarantine_file(
+            &source,
+            &dir.join("quarantine"),
+            &ResponsePolicy {
+                kill_enabled: false,
+                quarantine_enabled: true,
+            },
+        );
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+
+        let QuarantineOutcome::Quarantined {
+            quarantined_at,
+            sha256_hex,
+            ..
+        } = outcome
+        else {
+            panic!("a busy writer must not defeat the quarantine: {outcome:?}");
+        };
+        assert_eq!(sha256_file(&quarantined_at).unwrap(), sha256_hex);
+        assert!(!source.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
