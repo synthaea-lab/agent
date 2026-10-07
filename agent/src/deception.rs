@@ -80,6 +80,7 @@ impl CanaryAllow {
         let exes = config
             .allow_exe
             .iter()
+            .map(|exe| canonical_entry(exe))
             .filter(|exe| {
                 let trusted = policy::name_exclusion_applies(exe.to_str());
                 if !trusted {
@@ -90,7 +91,6 @@ impl CanaryAllow {
                 }
                 trusted && exe.to_str().is_some_and(|p| !p.is_empty())
             })
-            .cloned()
             .collect();
         Self { exes, resolve }
     }
@@ -109,11 +109,35 @@ impl CanaryAllow {
     }
 }
 
-/// The executable behind `pid`. Linux only; elsewhere nothing resolves, so nothing is
-/// allowed.
+/// An entry as `/proc/<pid>/exe` will show it: with symlinks resolved. `/usr/bin/updatedb`
+/// is a link to `updatedb.plocate` on Debian and `/bin/x` is `/usr/bin/x` under usrmerge, and
+/// the kernel reports the real file, so an entry under the link's name would never match.
+/// An entry that does not resolve (not installed here) is kept as written: it can only match
+/// by being exactly what the kernel reports.
+fn canonical_entry(exe: &Path) -> PathBuf {
+    fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf())
+}
+
+/// The mount namespace of `pid` (`mnt:[inode]`), `None` when it cannot be read.
+#[cfg(target_os = "linux")]
+fn mount_namespace(pid: impl std::fmt::Display) -> Option<PathBuf> {
+    fs::read_link(format!("/proc/{pid}/ns/mnt")).ok()
+}
+
+/// The executable behind `pid`, as a path the agent can compare with its allow-list. Linux
+/// only; elsewhere nothing resolves, so nothing is allowed.
+///
+/// A process in another mount namespace (a container, a chroot) reports a path in *its* view,
+/// so its own `/usr/bin/updatedb` would equal the host's. Such a process is not resolved:
+/// the agent's namespace is the only one in which a path means what the allow-list says.
+/// Reading either namespace link of another user's process needs the same ptrace access as
+/// `/proc/<pid>/exe` does, so where the agent lacks it nothing resolves and the hit is raised.
 fn proc_exe(pid: u32) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
+        if mount_namespace(pid)? != mount_namespace("self")? {
+            return None;
+        }
         fs::read_link(format!("/proc/{pid}/exe")).ok()
     }
     #[cfg(not(target_os = "linux"))]
@@ -469,5 +493,71 @@ mod tests {
             .map(|d| d.to_str().unwrap())
             .collect();
         assert_eq!(blind, ["/tmp/x", "/var/tmp", "/dev/shm/a"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_executable_of_the_agents_own_process_resolves() {
+        let exe = proc_exe(std::process::id()).expect("own exe in own namespace");
+        assert_eq!(
+            exe,
+            fs::canonicalize(std::env::current_exe().unwrap()).unwrap()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pid_that_does_not_exist_does_not_resolve() {
+        assert!(mount_namespace(u32::MAX).is_none());
+        assert!(proc_exe(u32::MAX).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_in_another_mount_namespace_does_not_resolve() {
+        // `unshare` needs privilege that CI and a normal user lack; where it is not
+        // available there is nothing to test, and the comparison itself is a one-line
+        // inequality on the two links.
+        let Ok(child) = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "sleep", "5"])
+            .spawn()
+        else {
+            return;
+        };
+        let mut child = child;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let theirs = mount_namespace(child.id());
+        let ours = mount_namespace("self");
+        let resolved = proc_exe(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        if theirs.is_some() && theirs != ours {
+            assert!(
+                resolved.is_none(),
+                "another mount namespace must not resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn an_entry_that_is_a_symlink_is_compared_by_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("updatedb.plocate");
+        fs::write(&target, b"x").unwrap();
+        let link = dir.path().join("updatedb");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(not(unix))]
+        fs::write(&link, b"x").unwrap();
+        let resolved = fs::canonicalize(&target).unwrap();
+        #[cfg(unix)]
+        assert_eq!(canonical_entry(&link), resolved);
+        assert_eq!(canonical_entry(&target), resolved);
+    }
+
+    #[test]
+    fn an_entry_that_does_not_resolve_is_kept_as_written() {
+        let missing = Path::new("/usr/sbin/not-installed-here");
+        assert_eq!(canonical_entry(missing), missing);
     }
 }

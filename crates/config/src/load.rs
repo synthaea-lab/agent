@@ -118,6 +118,52 @@ struct SchemaProbe {
 /// valid values (URL shapes, non-zero budgets, log level enum).
 ///
 /// Everything in here is a rule the type system alone can't enforce.
+/// Names that run whatever they are given: allowing one exempts every script and command
+/// line it executes, so an attacker needs only to start their tool through it. Matched on the
+/// file name, by exact name or by family prefix (`python3.12`, `perl5.38`). Not a complete
+/// list, a guard against the obvious mistake; the operator still chooses what to trust.
+fn is_interpreter(path: &Path) -> bool {
+    const EXACT: &[&str] = &[
+        "sh",
+        "bash",
+        "dash",
+        "ash",
+        "zsh",
+        "ksh",
+        "csh",
+        "tcsh",
+        "fish",
+        "busybox",
+        "env",
+        "xargs",
+        "find",
+        "awk",
+        "gawk",
+        "mawk",
+        "sed",
+        "lua",
+        "luajit",
+        "tclsh",
+        "wish",
+        "expect",
+        "gdb",
+        "sudo",
+        "su",
+        "nsenter",
+        "chroot",
+        "pwsh",
+        "powershell",
+    ];
+    const FAMILIES: &[&str] = &[
+        "python", "perl", "ruby", "node", "php", "java", "bun", "deno",
+    ];
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    EXACT.contains(&name.as_str()) || FAMILIES.iter().any(|family| name.starts_with(family))
+}
+
 fn validate_semantics(cfg: &AgentConfig, source_path: &Path) -> Result<(), ConfigError> {
     let src = source_path.display().to_string();
 
@@ -269,6 +315,16 @@ fn validate_semantics(cfg: &AgentConfig, source_path: &Path) -> Result<(), Confi
         });
     }
     for (i, exe) in cfg.deception.allow_exe.iter().enumerate() {
+        if is_interpreter(exe) {
+            return Err(ConfigError::Invalid {
+                field: format!("deception.allow_exe[{i}]"),
+                expected: "a specific indexer or backup binary, not a shell, interpreter or \
+                           launcher (every script it runs would be allowed to read the canaries)"
+                    .into(),
+                value: exe.display().to_string(),
+                origin: src.clone(),
+            });
+        }
         if !exe.is_absolute() {
             return Err(ConfigError::Invalid {
                 field: format!("deception.allow_exe[{i}]"),
@@ -914,6 +970,37 @@ control_plane_url = "https://cp.example"
             ConfigError::Invalid { field, .. } => assert_eq!(field, "deception.allow_exe[0]"),
             other => panic!("expected Invalid, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_shell_or_interpreter_is_rejected_as_an_allowed_executable() {
+        for exe in [
+            "/usr/bin/bash",
+            "/bin/sh",
+            "/usr/bin/python3.12",
+            "/usr/bin/perl",
+            "/usr/bin/find",
+            "/usr/bin/env",
+        ] {
+            let extra = format!("[deception]\nallow_exe = [\"{exe}\"]\n");
+            match load_with_logs(&extra) {
+                Err(ConfigError::Invalid { field, .. }) => {
+                    assert_eq!(field, "deception.allow_exe[0]", "{exe}");
+                }
+                other => panic!("{exe}: expected Invalid, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_indexer_is_accepted_as_an_allowed_executable() {
+        if cfg!(windows) {
+            return;
+        }
+        let extra =
+            "[deception]\nallow_exe = [\"/usr/bin/updatedb.plocate\", \"/usr/sbin/bacula-fd\"]\n";
+        let cfg = load_with_logs(extra).unwrap();
+        assert_eq!(cfg.deception.allow_exe.len(), 2);
     }
 
     #[test]
