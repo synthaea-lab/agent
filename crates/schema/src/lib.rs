@@ -257,7 +257,13 @@ pub mod time;
 /// `WmiActivity`. 38 was claimed by #283 (`Defender`), 39 by #263 (`UdpRecv`) and 40 by
 /// #285 (`Session`) while this branch was open; all merged first, so this
 /// one renumbers, same coordination note as above.
-pub const SCHEMA_VERSION: u32 = 41;
+///
+/// Bumped 41 → 42 for [`Event::SocketCreate`] (#263): `socket(2)`, context
+/// rather than an address — the domain/type/protocol the caller asked for.
+/// Closes the last gap in #263's telemetry proposal besides the netlink
+/// socket-table baseline (a separate, periodic-snapshot source, not a
+/// discrete syscall trace like the rest of this file).
+pub const SCHEMA_VERSION: u32 = 42;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -857,6 +863,30 @@ pub struct SocketAcceptEvent {
     pub accepted_fd: u32,
     pub peer_addr: core::net::IpAddr,
     pub peer_port: u16,
+}
+
+/// Socket creation (issue #263): `socket(2)` — context rather than an address.
+/// `bind`/`connect`/`accept` all tell you WHERE a socket talked; this tells you
+/// WHAT it was made as, before any of that happens. Not filtered to
+/// `AF_INET`/`AF_INET6` like its siblings: an `AF_PACKET` or `SOCK_RAW` creation
+/// (packet capture, spoofed-source tooling, a port scanner) is exactly the signal
+/// this event exists to carry, and those families have no `bind`/`connect`
+/// sockaddr `SocketBindEvent`/`ConnectEvent` would ever see. The one exclusion is
+/// `AF_UNIX` (local IPC — systemd, journald, D-Bus, every Unix-domain client):
+/// pure volume with no `bind`/`connect`-shaped risk and no current consumer
+/// (#714 review). Only emitted on success — a failed `socket()` created nothing
+/// to report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocketCreateEvent {
+    pub meta: EventMeta,
+    /// `AF_INET` (2), `AF_INET6` (10), `AF_PACKET` (17), `AF_NETLINK` (16), ...
+    pub domain: i32,
+    /// `SOCK_STREAM` (1), `SOCK_DGRAM` (2), `SOCK_RAW` (3), ... with
+    /// `SOCK_CLOEXEC`/`SOCK_NONBLOCK` masked off by the sensor.
+    pub socket_type: i32,
+    pub protocol: i32,
+    /// The new file descriptor (`socket(2)`'s return value).
+    pub fd: u32,
 }
 
 /// Process debugging/injection primitive (issue #265): `ptrace(2)`, every request
@@ -2122,6 +2152,7 @@ pub enum Event {
     FileChown(FileChownEvent),
     SocketListen(SocketListenEvent),
     SocketAccept(SocketAcceptEvent),
+    SocketCreate(SocketCreateEvent),
     TccDecision(TccDecisionEvent),
     GatekeeperVerdict(GatekeeperVerdictEvent),
     FileQuarantine(FileQuarantineEvent),
@@ -2183,6 +2214,7 @@ impl Event {
             Event::FileChown(e) => &e.meta,
             Event::SocketListen(e) => &e.meta,
             Event::SocketAccept(e) => &e.meta,
+            Event::SocketCreate(e) => &e.meta,
             Event::TccDecision(e) => &e.meta,
             Event::GatekeeperVerdict(e) => &e.meta,
             Event::FileQuarantine(e) => &e.meta,
