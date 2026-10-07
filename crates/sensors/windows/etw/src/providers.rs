@@ -14,8 +14,8 @@ use ferrisetw::{
 };
 use schema::{
     AmsiContentEvent, AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent,
-    FileOpenEvent, ImageLoadEvent, RegistrySetEvent, ScriptBlockEvent, SmbConnectEvent,
-    UdpSendEvent, WmiActivityEvent, sensor::EventSink,
+    FileOpenEvent, ImageLoadEvent, LdapSearchEvent, RegistrySetEvent, ScriptBlockEvent,
+    SmbConnectEvent, UdpSendEvent, WmiActivityEvent, sensor::EventSink,
 };
 
 use crate::{
@@ -39,6 +39,8 @@ const WMI_ACTIVITY_GUID: &str = "1418EF04-B0B4-4623-BF7E-D74AB47BBDAA";
 const DOTNET_RUNTIME_GUID: &str = "e13c0d23-ccbc-4e12-931b-d9cc2eee27e4";
 /// Microsoft-Antimalware-Scan-Interface (EID 1101, the scanned buffer, #282)
 const AMSI_GUID: &str = "2A576B87-09A7-520E-C21A-4942F0271D67";
+/// Microsoft-Windows-LDAP-Client (EID 30, the search request, #364)
+const LDAP_CLIENT_GUID: &str = "099614a5-5dd7-4788-8bc9-e29f43db28fc";
 /// Microsoft-Windows-SMBClient (EID 30704 — TCP connection established to SMB server)
 const SMB_CLIENT_GUID: &str = "988C59C5-0A1C-45B6-A555-0C62276E327D";
 /// Microsoft-Windows-Bits-Client (EIDs 16403/4/5/61 — BITS jobs, #284)
@@ -46,7 +48,7 @@ const BITS_CLIENT_GUID: &str = "EF1CC15B-46C1-414E-BB95-E76B077BD51E";
 
 /// Every provider the sensor enables, by short name — for the blind-session
 /// attribution (#408), which asks the OS who else enables them.
-pub(crate) const ALL_PROVIDERS: [(&str, &str); 11] = [
+pub(crate) const ALL_PROVIDERS: [(&str, &str); 12] = [
     ("Kernel-Process", KERNEL_PROCESS_GUID),
     ("Kernel-Network", KERNEL_NETWORK_GUID),
     ("Kernel-File", KERNEL_FILE_GUID),
@@ -58,6 +60,7 @@ pub(crate) const ALL_PROVIDERS: [(&str, &str); 11] = [
     ("SMBClient", SMB_CLIENT_GUID),
     ("AMSI", AMSI_GUID),
     ("Bits-Client", BITS_CLIENT_GUID),
+    ("LDAP-Client", LDAP_CLIENT_GUID),
 ];
 
 /// `AssemblyFlags` bit indicating a dynamic (in-memory) assembly load.
@@ -250,9 +253,10 @@ pub(crate) fn network_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
 pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
         let eid = record.event_id();
-        // 12=NameCreate; 30=CreateNewFile (F-6 partial — delete/rename semantics
-        // need schema variants and land with #82/#39).
-        if eid != 12 && eid != 30 {
+        // 12=NameCreate; 30=CreateNewFile; 26=DeletePath, for mark-of-the-web
+        // removal only (F-6 partial — general delete/rename semantics land with
+        // #82/#39).
+        if eid != 12 && eid != 26 && eid != 30 {
             return;
         }
         state.events_seen.fetch_add(1, Ordering::Relaxed);
@@ -269,6 +273,12 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         let Some(comm) = state.pids.lock().unwrap().get(pid).map(basename) else {
             return;
         };
+        if eid == 26 {
+            forward_mark_removal(&parser, &state, sink.as_ref(), || {
+                meta(pid, 0, comm, timestamp_ns)
+            });
+            return;
+        }
 
         let flags = if eid == 30 {
             0o101 // CreateNewFile: create+write by definition
@@ -305,6 +315,35 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
     Provider::by_guid(KERNEL_FILE_GUID)
         .add_callback(callback)
         .build()
+}
+
+/// Kernel-File 26 (`DeletePath`, `FilePath` field): forwards the deletion of a
+/// `:Zone.Identifier` stream — the mark-of-the-web being removed by
+/// `Unblock-File`, `Remove-Item -Stream` or Explorer's "Unblock" (T1553.005,
+/// #442) — as a `FileDelete` of the stream path. Every other delete is
+/// dropped: Windows delete semantics in general land with the minifilter
+/// (#136), which also sees what this userland path can't.
+///
+/// The stream check runs on the raw NT path first, so the path normalization
+/// (volume map, 8.3 expansion) and the token lookup behind `meta` only run
+/// for the rare matching delete, never for the host's whole delete volume on
+/// the ETW thread (#481, #408).
+///
+/// Not distinguished: a disposition call that *clears* delete-on-close. The
+/// event doesn't carry the flag's value, and un-deleting a mark is not
+/// something tools do.
+fn forward_mark_removal(
+    parser: &Parser<'_, '_>,
+    state: &SharedState,
+    sink: &dyn EventSink,
+    meta: impl FnOnce() -> EventMeta,
+) {
+    let raw_path: String = parser.try_parse("FilePath").unwrap_or_default();
+    if let Some(removal) =
+        zone_identifier::mark_removal(&raw_path, |raw| state.normalize_path(raw), meta)
+    {
+        sink.on_event(Event::FileDelete(removal));
+    }
 }
 
 /// DNS resolution events (EID 3008 — `QueryCompleted`).
@@ -578,6 +617,51 @@ pub(crate) fn amsi_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
     };
 
     Provider::by_guid(AMSI_GUID).add_callback(callback).build()
+}
+
+/// LDAP searches (EID 30): the directory-reconnaissance fingerprint (#364).
+/// Budgeted per process ([`SharedState::ldap`]) but not deduplicated: the
+/// burst rule needs the real count of distinct searches.
+///
+/// # Field notes (manifest + lab, Windows 11 24H2, 2026-10-02)
+///
+/// `ScopeOfSearch` (u32: 0 base, 1 one level, 2 subtree), `SearchFilter`,
+/// `DistinguishedName` (the base), `AttributeList` (`;`-separated),
+/// `ProcessId`. Logged when the request is sent: a search to a listener that
+/// never answers shows up, a failed connect does not.
+pub(crate) fn ldap_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
+    let callback = move |record: &EventRecord, locator: &SchemaLocator| {
+        if record.event_id() != 30 {
+            return;
+        }
+        state.events_seen.fetch_add(1, Ordering::Relaxed);
+        let Ok(schema_def) = locator.event_schema(record) else {
+            return;
+        };
+        let parser = Parser::create(record, &schema_def);
+        // The field, not the header: the header pid of a provider running
+        // in-process is the same, but the field is what the manifest promises.
+        let pid = parser
+            .try_parse::<u32>("ProcessId")
+            .unwrap_or_else(|_| record.process_id());
+        let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
+        if !state.ldap.lock().unwrap().spend(pid, timestamp_ns) {
+            return;
+        }
+        let attributes: String = parser.try_parse("AttributeList").unwrap_or_default();
+        let comm = state.comm_for(pid).unwrap_or_default();
+        sink.on_event(Event::LdapSearch(LdapSearchEvent {
+            meta: meta(pid, 0, comm, timestamp_ns),
+            filter: parser.try_parse("SearchFilter").unwrap_or_default(),
+            base_dn: parser.try_parse("DistinguishedName").unwrap_or_default(),
+            scope: parser.try_parse("ScopeOfSearch").unwrap_or(0),
+            attributes: normalize::split_ldap_attributes(&attributes),
+        }));
+    };
+
+    Provider::by_guid(LDAP_CLIENT_GUID)
+        .add_callback(callback)
+        .build()
 }
 
 /// WMI activity events (EID 23 — `ExecQuery`, EID 24 — `ExecMethod`).

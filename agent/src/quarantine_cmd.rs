@@ -177,7 +177,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_restore_that_cannot_clean_up_succeeds_and_audits_the_leftover() {
+    fn a_restore_tightens_legacy_directory_and_cleans_up() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = dir("restore-leftover");
         let (alerts, payload, digest) = quarantined(&dir);
@@ -189,11 +189,15 @@ mod tests {
 
         let restored = cmd_quarantine_restore(&alerts, &digest);
 
-        std::fs::set_permissions(&qdir, std::fs::Permissions::from_mode(0o755)).unwrap();
         restored.unwrap();
         assert_eq!(std::fs::read(&payload).unwrap(), b"marker payload");
+        assert_eq!(
+            std::fs::metadata(&qdir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         let log = std::fs::read_to_string(&alerts).unwrap();
         assert!(log.contains("restored"), "{log}");
-        assert!(log.contains("could not be removed"), "{log}");
+        assert!(!log.contains("could not be removed"), "{log}");
+        assert!(!response::is_still_quarantined(&qdir, &digest));
     }
 }

@@ -28,6 +28,7 @@ dependencies = [
  "correlator",
  "ctrlc",
  "enrich",
+ "getrandom 0.2.17",
  "ipc",
  "libc",
  "ml",
@@ -41,6 +42,7 @@ dependencies = [
  "sensor-linux-logs",
  "sensor-linux-lsm",
  "sensor-linux-netlink",
+ "sensor-linux-procmem",
  "sensor-linux-uprobes",
  "sensor-macos",
  "sensor-macos-network-extension",
@@ -896,6 +898,14 @@ dependencies = [
 [[package]]
 name = "deception"
 version = "0.1.0"
+dependencies = [
+ "schema",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "deranged"
@@ -2377,6 +2387,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sensor-linux-procmem"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "sensor-linux-uprobes"
 version = "0.1.0"
 dependencies = [
@@ -3005,6 +3024,7 @@ dependencies = [
 name = "transport"
 version = "0.1.0"
 dependencies = [
+ "rustls",
  "schema",
  "serde",
  "serde_json",
@@ -3055,6 +3075,7 @@ name = "updater"
 version = "0.1.0"
 dependencies = [
  "ring",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3709,6 +3730,7 @@ dependencies = [
 name = "yara"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "schema",
  "store",
  "thiserror 2.0.21",

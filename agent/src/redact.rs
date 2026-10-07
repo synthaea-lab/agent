@@ -1,0 +1,508 @@
+//! Credential redaction in download-provenance URLs (#440, ADR-0018).
+//!
+//! `FileQuarantine`'s `origin_url`/`referrer_url` come verbatim from the
+//! mark-of-the-web (`HostUrl`/`ReferrerUrl`) or `kMDItemWhereFroms`, and are
+//! often bearer credentials: pre-signed S3/GCS/Azure links, OAuth tokens,
+//! session ids. [`RedactingSink`] rewrites them before any consumer sees the
+//! event, so the spool, `events.jsonl`, the server and the T1204.002 alert
+//! message only ever get the redacted form.
+//!
+//! On Linux the same [`redact_event`] also covers an `HttpRequest`'s evidence value
+//! (#478, ADR-0022 §4) when the matched parameter's name is a secret; see its doc.
+//!
+//! What goes, unconditionally: the userinfo (`user:pass@`), the fragment
+//! (OAuth implicit-flow tokens live there), and the value of every query
+//! parameter whose *name* marks it as a secret ([`is_secret_key`]). Names stay,
+//! so `X-Amz-Signature=REDACTED` still says "pre-signed S3". Every other
+//! parameter is kept: a campaign id or tracking parameter can be the evidence.
+//! Redacting *all* query values is reserved for `RedactionPolicy`'s
+//! `pii_scrub_enabled`, once policy reaches the agent.
+//!
+//! Best-effort by design. Known to miss (ADR-0018 lists them):
+//! - a secret in the path (`/dl/<token>/x.exe`), including a matrix parameter
+//!   (`;jsessionid=`) and `;`-separated query parameters;
+//! - a short, host-specific name, too generic to match on its own: Slack's
+//!   `t=`, Google Drive's `at=`, Discord's `hm=`, a one-time `?id=`;
+//! - the first parameter of an unencoded URL nested in a value
+//!   (`?next=https://idp/cb?access_token=…` reads as `next`'s value);
+//! - a name encoded more than twice, or in a charset other than UTF-8. One or two
+//!   rounds of percent-encoding (`%74oken`, `pass%77ord`) are decoded before the test.
+//!
+//! These URLs are written by browsers and download tools, not crafted to evade:
+//! the goal is not storing benign credentials, not winning against an adversary
+//! who controls the URL.
+
+// Only the Windows and macOS sensors emit `FileQuarantine`; Linux wires no
+// `RedactingSink` until a Linux producer exists (ADR-0018).
+#![cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+
+use std::sync::Arc;
+
+use schema::{Event, sensor::EventSink};
+
+/// What a redacted value is replaced with. URL-safe, so a redacted URL is
+/// still a well-formed URL.
+pub(crate) const REDACTED: &str = "REDACTED";
+
+/// Parameter names that are secrets whole. Matched case-insensitively.
+const SECRET_KEYS: &[&str] = &["sig", "code", "pwd", "pass", "sid", "jwt"];
+
+/// Substrings that mark a parameter name as a secret: `X-Amz-Signature`,
+/// `X-Goog-Credential`, `X-Amz-Security-Token`, `access_token`,
+/// `client_secret`, `password`, `sessionid`, `PHPSESSID`, …
+const SECRET_KEY_PARTS: &[&str] = &[
+    "signature",
+    "token",
+    "secret",
+    "passw",
+    "credential",
+    "session",
+    "sessid",
+    "authoriz",
+];
+
+/// Suffixes that mark a parameter name as a secret: `api_key`, `apikey`,
+/// `x-api-key`, `oauth_consumer_key`, `AWSAccessKeyId`, `auth`, `oauth`, and
+/// SharePoint/OneDrive's `tempauth` bearer token on `download.aspx` links, the
+/// most common download source on a managed Windows fleet (#550 review).
+const SECRET_KEY_SUFFIXES: &[&str] = &["key", "keyid", "auth"];
+
+/// Wraps a sink, redacting credentials in every `FileQuarantine` URL before
+/// forwarding (see the module doc). Everything else passes through untouched.
+pub(crate) struct RedactingSink<S>(pub(crate) S);
+
+impl<S: EventSink> EventSink for RedactingSink<S> {
+    fn on_event(&self, mut event: Event) {
+        redact_event(&mut event);
+        self.0.on_event(event);
+    }
+}
+
+/// Puts a [`RedactingSink`] in front of a platform's sensor sink — what
+/// `run_windows_sensors`/`run_macos_sensors` share with their sensors.
+pub(crate) fn redacting(sink: Box<dyn EventSink>) -> Arc<dyn EventSink> {
+    Arc::new(RedactingSink(Arc::<dyn EventSink>::from(sink)))
+}
+
+/// The one place an event is redacted: [`RedactingSink`] calls it for the sensors'
+/// sink, and `log_sources::deliver` (the one place an access-log event leaves that
+/// module) calls it for the Linux log sources, so there is a single implementation
+/// (ADR-0018).
+///
+/// An `HttpRequest`'s evidence is the one query parameter a signature matched on,
+/// and its value is what leaves the host (ADR-0022 §4). When that parameter's *name*
+/// marks it as a secret (`?token=…`, `?password=…`), the whole value is replaced by
+/// [`REDACTED`], the name is kept so the finding still reads. A parameter that is not
+/// named like a secret (`?id=1 union select 1`) keeps its value: it is the evidence.
+pub(crate) fn redact_event(event: &mut Event) {
+    match event {
+        Event::FileQuarantine(quarantine) => {
+            for url in [&mut quarantine.origin_url, &mut quarantine.referrer_url]
+                .into_iter()
+                .flatten()
+            {
+                *url = redact_url_secrets(url);
+            }
+        }
+        Event::HttpRequest(request) => {
+            if let Some(evidence) = &mut request.evidence
+                && is_secret_key(&evidence.param)
+            {
+                evidence.value = REDACTED.to_owned();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Returns `url` with its userinfo, fragment, and secret query values replaced
+/// by [`REDACTED`]. Anything that isn't a hierarchical URL (`about:internet`,
+/// a bare path) keeps everything but a query or fragment it happens to carry.
+/// Idempotent, and never panics on arbitrary input.
+pub(crate) fn redact_url_secrets(url: &str) -> String {
+    // RFC 3986: the fragment starts at the first `#`, the query at the first
+    // `?` before it — a `?` inside the fragment is fragment data.
+    let (before_fragment, fragment) = match url.split_once('#') {
+        Some((head, fragment)) => (head, Some(fragment)),
+        None => (url, None),
+    };
+    let (base, query) = match before_fragment.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (before_fragment, None),
+    };
+
+    let mut out = String::with_capacity(url.len());
+    push_without_userinfo(&mut out, base);
+    if let Some(query) = query {
+        out.push('?');
+        push_redacted_query(&mut out, query);
+    }
+    if let Some(fragment) = fragment {
+        out.push('#');
+        if !fragment.is_empty() {
+            out.push_str(REDACTED);
+        }
+    }
+    out
+}
+
+/// Pushes `base` (scheme, authority, path) with any `userinfo@` in the
+/// authority replaced by [`REDACTED`]. The last `@` ends the userinfo, as in
+/// browsers: `https://a@b@host/` has userinfo `a@b`.
+fn push_without_userinfo(out: &mut String, base: &str) {
+    let Some(scheme_end) = base.find("://") else {
+        out.push_str(base);
+        return;
+    };
+    let authority_start = scheme_end + "://".len();
+    let authority_end = base[authority_start..]
+        .find('/')
+        .map_or(base.len(), |i| authority_start + i);
+    match base[authority_start..authority_end].rfind('@') {
+        Some(at) => {
+            out.push_str(&base[..authority_start]);
+            out.push_str(REDACTED);
+            out.push_str(&base[authority_start + at..]);
+        }
+        None => out.push_str(base),
+    }
+}
+
+/// Pushes `query` with the value of every secret-named parameter replaced by
+/// [`REDACTED`]. Separators, order, valueless and empty parameters are kept
+/// as they were.
+fn push_redacted_query(out: &mut String, query: &str) {
+    for (i, param) in query.split('&').enumerate() {
+        if i > 0 {
+            out.push('&');
+        }
+        match param.split_once('=') {
+            Some((key, value)) if !value.is_empty() && is_secret_key(key) => {
+                out.push_str(key);
+                out.push('=');
+                out.push_str(REDACTED);
+            }
+            _ => out.push_str(param),
+        }
+    }
+}
+
+/// Whether a query parameter name marks its value as a credential. The name is read
+/// as written and percent-decoded twice (the web-log matcher's own normalisation), so
+/// `pass%77ord` and `%74oken` do not slip past.
+fn is_secret_key(key: &str) -> bool {
+    is_secret_name(key) || is_secret_name(&percent_decode(&percent_decode(key)))
+}
+
+fn is_secret_name(key: &str) -> bool {
+    let key = key.trim_end_matches("[]").to_ascii_lowercase();
+    SECRET_KEYS.contains(&key.as_str())
+        || SECRET_KEY_PARTS.iter().any(|part| key.contains(part))
+        || SECRET_KEY_SUFFIXES
+            .iter()
+            .any(|suffix| key.ends_with(suffix))
+}
+
+/// Percent-decodes `s` (`+` is a space); invalid escapes are kept as written.
+fn percent_decode(s: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        char::from(b).to_digit(16).map(|d| d as u8)
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                (Some(hi), Some(lo)) => {
+                    out.push(hi << 4 | lo);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    #[test]
+    fn a_presigned_s3_url_keeps_its_shape_and_loses_its_credentials() {
+        let url = "https://bucket.s3.amazonaws.com/kit/payload.exe?X-Amz-Algorithm=AWS4-HMAC-SHA256\
+                   &X-Amz-Credential=AKIAEXAMPLE%2F20260930%2Fus-east-1%2Fs3%2Faws4_request\
+                   &X-Amz-Date=20260930T101500Z&X-Amz-Expires=300\
+                   &X-Amz-Security-Token=FwoGZXIvYXdzEXAMPLE\
+                   &X-Amz-SignedHeaders=host&X-Amz-Signature=0123abcd&utm_campaign=q3-invoice";
+        assert_eq!(
+            redact_url_secrets(url),
+            "https://bucket.s3.amazonaws.com/kit/payload.exe?X-Amz-Algorithm=AWS4-HMAC-SHA256\
+             &X-Amz-Credential=REDACTED&X-Amz-Date=20260930T101500Z&X-Amz-Expires=300\
+             &X-Amz-Security-Token=REDACTED&X-Amz-SignedHeaders=host\
+             &X-Amz-Signature=REDACTED&utm_campaign=q3-invoice"
+        );
+    }
+
+    #[test]
+    fn gcs_azure_and_legacy_s3_signatures_are_redacted() {
+        for (url, expected) in [
+            (
+                "https://storage.googleapis.com/b/x.msi?X-Goog-Credential=svc%40p.iam&X-Goog-Signature=beef",
+                "https://storage.googleapis.com/b/x.msi?X-Goog-Credential=REDACTED&X-Goog-Signature=REDACTED",
+            ),
+            (
+                "https://acct.blob.core.windows.net/c/x.zip?sv=2022-11-02&se=2026-10-01&sp=r&sig=abc%3D",
+                "https://acct.blob.core.windows.net/c/x.zip?sv=2022-11-02&se=2026-10-01&sp=r&sig=REDACTED",
+            ),
+            (
+                "https://b.s3.amazonaws.com/x.exe?AWSAccessKeyId=AKIA&Expires=1&Signature=zz",
+                "https://b.s3.amazonaws.com/x.exe?AWSAccessKeyId=REDACTED&Expires=1&Signature=REDACTED",
+            ),
+        ] {
+            assert_eq!(redact_url_secrets(url), expected, "{url}");
+        }
+    }
+
+    #[test]
+    fn oauth_and_session_parameters_are_redacted_case_insensitively() {
+        assert_eq!(
+            redact_url_secrets(
+                "https://h/cb?Access_Token=a&CODE=b&client_secret=c&PHPSESSID=d&api_key=e&x-api-key=f&state=keep"
+            ),
+            "https://h/cb?Access_Token=REDACTED&CODE=REDACTED&client_secret=REDACTED\
+             &PHPSESSID=REDACTED&api_key=REDACTED&x-api-key=REDACTED&state=keep"
+        );
+    }
+
+    #[test]
+    fn a_sharepoint_tempauth_link_loses_its_bearer_token() {
+        // #550 review: the most common download source on a managed fleet.
+        assert_eq!(
+            redact_url_secrets(
+                "https://contoso.sharepoint.com/sites/x/_layouts/15/download.aspx\
+                 ?UniqueId=0a1b2c3d&Translate=false&tempauth=eyJ0eXAiOiJKV1Qi.v1&ApiVersion=2.0"
+            ),
+            "https://contoso.sharepoint.com/sites/x/_layouts/15/download.aspx\
+             ?UniqueId=0a1b2c3d&Translate=false&tempauth=REDACTED&ApiVersion=2.0"
+        );
+        assert_eq!(
+            redact_url_secrets("https://h/x?auth=a&OAuth=b&author=keep"),
+            "https://h/x?auth=REDACTED&OAuth=REDACTED&author=keep"
+        );
+    }
+
+    #[test]
+    fn userinfo_and_fragment_are_always_redacted() {
+        assert_eq!(
+            redact_url_secrets("https://user:hunter2@host:8443/x.exe#access_token=abc"),
+            "https://REDACTED@host:8443/x.exe#REDACTED"
+        );
+        // The last `@` in the authority ends the userinfo; one in the path is not userinfo.
+        assert_eq!(
+            redact_url_secrets("ftp://a@b@host/p@th"),
+            "ftp://REDACTED@host/p@th"
+        );
+    }
+
+    #[test]
+    fn a_question_mark_inside_the_fragment_is_not_a_query() {
+        assert_eq!(
+            redact_url_secrets("https://h/x.exe#frag?token=abc"),
+            "https://h/x.exe#REDACTED"
+        );
+    }
+
+    #[test]
+    fn urls_without_secrets_are_unchanged() {
+        for url in [
+            "https://example.test/invoice.exe",
+            "https://example.test/dl?id=42&utm_source=mail",
+            "about:internet",
+            "C:\\Users\\Public\\x.exe",
+            "https://h/x?flag&=v&k=&&",
+            "https://h/x#",
+            "",
+        ] {
+            assert_eq!(redact_url_secrets(url), url, "{url}");
+        }
+    }
+
+    #[test]
+    fn redaction_is_idempotent() {
+        let url = "https://u:p@h/x?sig=1&keep=2&token=3#f";
+        let once = redact_url_secrets(url);
+        assert_eq!(redact_url_secrets(&once), once);
+    }
+
+    #[test]
+    fn never_panics_on_any_truncation_or_odd_input() {
+        // The URL comes from an attacker-writable ADS or xattr: every prefix of
+        // a dense URL (multi-byte chars included), plus separator soup.
+        let dense = "https://ü:p@h\u{e9}ll\u{f6}/\u{1f600}?sig=\u{e9}&a=b=c&&token#x?y@z";
+        for (end, _) in dense.char_indices() {
+            let _ = redact_url_secrets(&dense[..end]);
+        }
+        for odd in [
+            "://",
+            "://@",
+            "?",
+            "#",
+            "?#",
+            "@",
+            "a://b@",
+            "?=",
+            "?&=&",
+            "#?@://",
+            "\u{0}?\u{0}=\u{0}",
+        ] {
+            let _ = redact_url_secrets(odd);
+        }
+    }
+
+    /// Records what reaches the inner sink.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<Event>>);
+
+    impl EventSink for Recorder {
+        fn on_event(&self, event: Event) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    #[test]
+    fn the_sink_redacts_both_quarantine_urls_before_forwarding() {
+        let sink = RedactingSink(Recorder::default());
+        sink.on_event(Event::FileQuarantine(schema::FileQuarantineEvent {
+            origin_url: Some("https://h/x.exe?token=abc".into()),
+            referrer_url: Some("https://u:p@h/page".into()),
+            ..schema::fixtures::file_quarantine()
+        }));
+        let events = sink.0.0.lock().unwrap();
+        let [Event::FileQuarantine(q)] = events.as_slice() else {
+            panic!("expected one FileQuarantine, got {events:?}");
+        };
+        assert_eq!(
+            q.origin_url.as_deref(),
+            Some("https://h/x.exe?token=REDACTED")
+        );
+        assert_eq!(q.referrer_url.as_deref(), Some("https://REDACTED@h/page"));
+    }
+
+    #[test]
+    fn the_sink_leaves_other_events_untouched() {
+        let sink = RedactingSink(Recorder::default());
+        let exec = Event::Exec(schema::ExecEvent {
+            cmdline: "curl https://h/x?token=abc".into(),
+            ..schema::fixtures::exec()
+        });
+        sink.on_event(exec.clone());
+        assert_eq!(*sink.0.0.lock().unwrap(), [exec]);
+    }
+
+    fn http_request_with(param: &str, value: &str) -> Event {
+        Event::HttpRequest(schema::HttpRequestEvent {
+            path: "/a.php".into(),
+            param_names: vec![param.into()],
+            signature: schema::HttpSignature::SqlInjection,
+            evidence: Some(schema::HttpEvidence {
+                param: param.into(),
+                value: value.into(),
+            }),
+            ..schema::fixtures::http_request()
+        })
+    }
+
+    fn evidence_of(event: &Event) -> &schema::HttpEvidence {
+        let Event::HttpRequest(request) = event else {
+            panic!("expected an HttpRequest, got {event:?}");
+        };
+        request.evidence.as_ref().expect("evidence")
+    }
+
+    #[test]
+    fn an_http_evidence_value_on_a_secret_named_parameter_is_redacted_and_its_name_kept() {
+        for param in ["token", "password", "access_token", "api_key", "PHPSESSID"] {
+            let mut event = http_request_with(param, "s3cr3t' union select 1");
+            redact_event(&mut event);
+            let evidence = evidence_of(&event);
+            assert_eq!(evidence.param, param, "the name stays: it is the finding");
+            assert_eq!(evidence.value, REDACTED, "{param}");
+        }
+    }
+
+    #[test]
+    fn a_percent_encoded_secret_name_is_still_a_secret_name() {
+        for param in ["pass%77ord", "%74oken", "pass%2577ord", "Access%5FToken"] {
+            let mut event = http_request_with(param, "hunter2 union select 1");
+            redact_event(&mut event);
+            let evidence = evidence_of(&event);
+            assert_eq!(evidence.param, param, "the name stays as written");
+            assert_eq!(evidence.value, REDACTED, "{param}");
+        }
+        assert_eq!(
+            redact_url_secrets("https://h/x?pass%77ord=hunter2&id=7"),
+            "https://h/x?pass%77ord=REDACTED&id=7"
+        );
+    }
+
+    #[test]
+    fn an_http_evidence_value_on_an_ordinary_parameter_is_the_evidence_and_is_kept() {
+        for param in ["id", "cmd", "file", "q"] {
+            let mut event = http_request_with(param, "1 union select 1");
+            redact_event(&mut event);
+            assert_eq!(evidence_of(&event).value, "1 union select 1", "{param}");
+        }
+    }
+
+    #[test]
+    fn redacting_an_http_request_twice_changes_nothing_and_only_touches_the_value() {
+        let original = http_request_with("token", "s3cr3t");
+        let mut once = original.clone();
+        redact_event(&mut once);
+        let mut twice = once.clone();
+        redact_event(&mut twice);
+        assert_eq!(once, twice);
+
+        let (Event::HttpRequest(before), Event::HttpRequest(after)) = (&original, &once) else {
+            unreachable!()
+        };
+        assert_eq!(
+            schema::HttpRequestEvent {
+                evidence: None,
+                ..before.clone()
+            },
+            schema::HttpRequestEvent {
+                evidence: None,
+                ..after.clone()
+            },
+            "nothing but the evidence value changes"
+        );
+    }
+
+    #[test]
+    fn an_http_request_without_evidence_is_left_alone() {
+        let mut event = Event::HttpRequest(schema::HttpRequestEvent {
+            signature: schema::HttpSignature::ScannerUserAgent,
+            scanner: Some("sqlmap".into()),
+            ..schema::fixtures::http_request()
+        });
+        let before = event.clone();
+        redact_event(&mut event);
+        assert_eq!(event, before);
+    }
+}

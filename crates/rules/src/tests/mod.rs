@@ -18,7 +18,7 @@ use crate::{
         AUTH_FAILURE_THRESHOLD, BEACON_THRESHOLD, BURST_WRITE_BYTES_THRESHOLD,
         MEMFD_EXEC_WINDOW_NS, RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS,
         SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS, SELF_SPAWN_THRESHOLD,
-        SELF_SPAWN_TRUSTED_THRESHOLD,
+        SELF_SPAWN_TRUSTED_THRESHOLD, TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
     },
 };
 
@@ -290,7 +290,9 @@ fn listen_port_event_full(
 mod bits;
 mod coverage;
 mod linux;
+mod motw_removal;
 mod persistence;
 mod quarantine;
+mod session;
 mod tamper;
 mod windows;

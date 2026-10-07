@@ -164,6 +164,7 @@ fn eventlog_config(policy: &policy::EventLogPolicy) -> sensor_windows_eventlog::
         task_scheduler_op_enabled: true,
         defender_enabled: true,
         wdac_enabled: true,
+        terminal_sessions_enabled: true,
     }
 }
 
@@ -230,7 +231,9 @@ fn run_windows_sensors(
     sink: Box<dyn EventSink>,
     silence: Option<&Mutex<SilenceMonitor>>,
 ) -> anyhow::Result<()> {
-    let sink: Arc<dyn EventSink> = Arc::from(sink);
+    // Run and both capture commands funnel through here, so this is the one
+    // place credential redaction has to sit in front of (#440).
+    let sink = crate::redact::redacting(sink);
 
     let mut etw_sensor = sensor_windows::WindowsSensor::new();
     let etw_stop = etw_sensor.stop_handle();

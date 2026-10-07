@@ -1,14 +1,15 @@
 #![no_std]
 #![no_main]
 
+mod raw;
+
 use aya_ebpf::{
-    EbpfContext, Global,
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_kernel_str_bytes,
         bpf_probe_read_user, bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
     },
-    macros::{lsm, map, tracepoint, uprobe, uretprobe},
-    maps::{Array, HashMap, PerCpuArray, RingBuf},
+    macros::{lsm, map, uprobe, uretprobe},
+    maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
     programs::{LsmContext, ProbeContext, RetProbeContext, TracePointContext},
 };
 use aya_log_ebpf::{info, warn};
@@ -18,16 +19,13 @@ use sensor_linux_wire::{
     FileWriteEvent, GetAddrInfoEvent, IdentityChangeEvent, KernelModuleEvent, LineageEntry,
     MAX_TLS_CAPTURE, MemfdCreateEvent, MountEvent, NamespaceEvent, PrctlEvent, ProcessVmReadEvent,
     ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, SignalEvent, SocketAcceptEvent,
-    SocketBindEvent, SocketListenEvent, TASK_COMM_LEN, TlsCaptureEvent, UdpSendEvent,
+    SocketBindEvent, SocketListenEvent, TASK_COMM_LEN, TlsCaptureEvent, UdpRecvEvent, UdpSendEvent,
     is_filtered_path,
 };
 
-// This probe reads NO `task_struct`/`mm_struct` frozen offset: parent lineage (ppid +
-// parent comm) comes from `sched_process_fork` tracepoint fields via `PROC_LINEAGE`
-// (issue #53), the executed image from the `sched_process_exec` tracepoint's
-// `__data_loc filename` (issue #111), and argv from `/proc/<pid>/cmdline` read by the
-// userspace loader (issue #152). No `vmlinux` BTF bindings, no per-kernel offset
-// table — every remaining read is a stable tracepoint field or a syscall argument.
+// Raw scheduler tracepoints expose task pointers instead of formatted event records.
+// Their field offsets come from the running kernel's BTF in `userspace/src/btf.rs`;
+// syscall arguments are decoded from `pt_regs` and passed to the existing handlers.
 
 /// Ring buffer shared with userspace for `exec` events. `ExecEvent` is assembled in
 /// the per-CPU `EXEC_SCRATCH` entry (not on the stack — `image` is `MAX_PATH_LEN`
@@ -47,7 +45,7 @@ static EXEC_SCRATCH: PerCpuArray<ExecEvent> = PerCpuArray::with_max_entries(1, 0
 /// by `sched_process_exit`. Sized to the realistic live-pid space — a full map (fork
 /// bomb) simply yields `ppid = 0`, which the correlation rules tolerate.
 #[map]
-static PROC_LINEAGE: HashMap<u32, LineageEntry> = HashMap::with_max_entries(65_536, 0);
+pub(crate) static PROC_LINEAGE: HashMap<u32, LineageEntry> = HashMap::with_max_entries(65_536, 0);
 
 /// Fills `meta.ppid` and `meta.process_generation` for the current thread group from
 /// `PROC_LINEAGE`. Both stay `0` when the process forked before the probe attached
@@ -63,161 +61,17 @@ fn fill_lineage(meta: &mut sensor_linux_wire::EventMeta) {
     }
 }
 
-// --- sched:sched_process_fork -------------------------------------------------------
+// --- sched_process_exec -------------------------------------------------------------
 //
-// Records `child_pid -> {parent_pid, parent_comm}`. The record layout is NOT stable
-// across kernels (issue #415). Two families exist in the wild:
-//
-//   inline (5.15, 6.1, 6.8 — verified on the Hyper-V lab):
-//     field:char parent_comm[16];            offset:8;  size:16;
-//     field:pid_t parent_pid;                offset:24; size:4;
-//     field:pid_t child_pid;                 offset:44; size:4;
-//
-//   __data_loc (Alpine 6.18.50-0-virt — verified by #205):
-//     field:__data_loc char[] parent_comm;   offset:8;  size:4;
-//     field:pid_t parent_pid;                offset:12; size:4;
-//     field:pid_t child_pid;                 offset:20; size:4;
-//
-// Hard-coding either one silently zeroes lineage on the other (#205 fixed 6.18 and
-// broke every inline-comm kernel). So the offsets are read-only globals that
-// userspace overrides at load time from the running kernel's
-// `/sys/kernel/tracing/events/sched/sched_process_fork/format`
-// (`sensor-linux::tracefs`). The compiled-in defaults describe the inline layout,
-// but `FORK_LAYOUT_KNOWN` stays 0 unless userspace actually parsed the format: an
-// unrecognised kernel makes this probe a no-op (lineage then degrades to the
-// `/proc` priming snapshot) instead of inserting garbage pids. All fields are
-// ints/u32s read through `bpf_probe_read`, so the variable offsets are
-// verifier-safe and arch-independent.
+// The raw tracepoint supplies `task_struct *` and `linux_binprm *`; userspace
+// provides their BTF-derived member offsets, and this helper keeps event creation
+// shared with the old formatted tracepoint implementation.
+pub(crate) fn record_sched_process_exec(pid: u32, filename_ptr: *const u8) -> u32 {
+    let tgid = pid;
 
-/// 1 once userspace has parsed the running kernel's fork format; 0 = do nothing.
-#[unsafe(no_mangle)]
-static FORK_LAYOUT_KNOWN: Global<u32> = Global::new(0);
-/// Offset of `parent_comm`: the `char[16]` itself (inline) or its data-locator.
-#[unsafe(no_mangle)]
-static FORK_PARENT_COMM_OFFSET: Global<u32> = Global::new(8);
-/// 1 when `parent_comm` is a `__data_loc` field, 0 when it is an inline `char[16]`.
-#[unsafe(no_mangle)]
-static FORK_PARENT_COMM_DATA_LOC: Global<u32> = Global::new(0);
-/// Offset of `pid_t parent_pid`.
-#[unsafe(no_mangle)]
-static FORK_PARENT_PID_OFFSET: Global<u32> = Global::new(24);
-/// Offset of `pid_t child_pid`.
-#[unsafe(no_mangle)]
-static FORK_CHILD_PID_OFFSET: Global<u32> = Global::new(44);
-
-#[tracepoint]
-pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
-    let _ = try_sched_process_fork(&ctx);
-    0
-}
-
-fn try_sched_process_fork(ctx: &TracePointContext) -> Result<(), i64> {
-    if FORK_LAYOUT_KNOWN.load() == 0 {
-        return Ok(());
-    }
-    let parent_pid: i32 = unsafe {
-        ctx.read_at(FORK_PARENT_PID_OFFSET.load() as usize)
-            .map_err(|_| {
-                warn!(ctx, "sensor-linux-ebpf: fork read parent_pid failed");
-                1i64
-            })?
+    let Ok(comm) = bpf_get_current_comm() else {
+        return 1;
     };
-    let child_pid: i32 = unsafe {
-        ctx.read_at(FORK_CHILD_PID_OFFSET.load() as usize)
-            .map_err(|_| {
-                warn!(ctx, "sensor-linux-ebpf: fork read child_pid failed");
-                1i64
-            })?
-    };
-
-    let comm_field = FORK_PARENT_COMM_OFFSET.load() as usize;
-    let comm_offset = if FORK_PARENT_COMM_DATA_LOC.load() != 0 {
-        // u32 data-locator: low 16 bits = byte offset from the record start, high 16
-        // bits = length — same decoding as `sched_process_exec`'s `filename` (#111).
-        let data_loc: u32 = unsafe {
-            ctx.read_at(comm_field).map_err(|_| {
-                warn!(
-                    ctx,
-                    "sensor-linux-ebpf: fork read parent_comm data_loc failed"
-                );
-                1i64
-            })?
-        };
-        (data_loc & 0xffff) as usize
-    } else {
-        comm_field
-    };
-
-    let mut comm = [0u8; TASK_COMM_LEN];
-    let comm_src = unsafe { (ctx.as_ptr() as *const u8).add(comm_offset) };
-    let _ = unsafe { bpf_probe_read_kernel_str_bytes(comm_src, &mut comm) };
-
-    // The stamp that tells this incarnation of `child_pid` from the next one to
-    // hold the number (issue #519): a recycled pid goes through a new fork, so it
-    // gets a new value here. Nanoseconds since boot never reach bit 63, which the
-    // `/proc`-primed stamps use (`PRIMED_GENERATION_BIT`).
-    let entry = LineageEntry {
-        ppid: parent_pid as u32,
-        comm,
-        reserved: 0,
-        generation: unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() },
-        // The parent's own stamp, so an event can name its parent's incarnation.
-        parent_generation: match unsafe { PROC_LINEAGE.get(&(parent_pid as u32)) } {
-            Some(parent) => parent.generation,
-            None => 0,
-        },
-    };
-    // BPF_ANY: overwrite a stale entry left by pid reuse.
-    let inserted = PROC_LINEAGE.insert(&(child_pid as u32), &entry, 0);
-    match inserted {
-        Ok(_) => info!(
-            ctx,
-            "sensor-linux-ebpf: fork child={} parent={} inserted=1", child_pid, parent_pid
-        ),
-        Err(_) => info!(
-            ctx,
-            "sensor-linux-ebpf: fork child={} parent={} inserted=0", child_pid, parent_pid
-        ),
-    }
-    Ok(())
-}
-
-// --- sched:sched_process_exit -----------------------------------------------------
-//
-// `sched_process_*` share the `sched_process_template` record: `comm[16]` at 8,
-// `pid_t pid` at 24. Arch-independent.
-const EXIT_PID_OFFSET: usize = 24;
-
-#[tracepoint]
-pub fn sched_process_exit(ctx: TracePointContext) -> u32 {
-    if let Ok(pid) = unsafe { ctx.read_at::<i32>(EXIT_PID_OFFSET) } {
-        let _ = PROC_LINEAGE.remove(&(pid as u32));
-    }
-    0
-}
-
-// --- sched:sched_process_exec --------------------------------------------------------
-//
-// Standard tracepoint layout, validated on 2026-08-12 on WSL2 6.6.114:
-// `__data_loc char[] filename` at 8 (u32: low 16 bits offset, high 16 bits length),
-// `pid_t pid` at 12. Arch-independent (no pointers in the record).
-const FILENAME_DATA_LOC_OFFSET: usize = 8;
-const PID_OFFSET: usize = 12;
-
-#[tracepoint]
-pub fn sched_process_exec(ctx: TracePointContext) -> u32 {
-    match try_sched_process_exec(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
-}
-
-fn try_sched_process_exec(ctx: TracePointContext) -> Result<u32, u32> {
-    let pid: i32 = unsafe { ctx.read_at(PID_OFFSET).map_err(|_| 1u32)? };
-    let tgid = pid as u32;
-
-    let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
-    let data_loc: u32 = unsafe { ctx.read_at(FILENAME_DATA_LOC_OFFSET).map_err(|_| 1u32)? };
     let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
     let timestamp_ns = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
 
@@ -226,7 +80,9 @@ fn try_sched_process_exec(ctx: TracePointContext) -> Result<u32, u32> {
     // MAX_PATH_LEN, which blow the verifier's 1M-instruction budget on pre-6.6
     // kernels). One `output` copy emits it. argv is not read here — the userspace
     // loader reads `/proc/<pid>/cmdline` on receipt (issue #152).
-    let e = EXEC_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
+    let Some(e) = EXEC_SCRATCH.get_ptr_mut(0) else {
+        return 1;
+    };
     unsafe {
         core::ptr::write_bytes(e, 0, 1);
 
@@ -256,22 +112,16 @@ fn try_sched_process_exec(ctx: TracePointContext) -> Result<u32, u32> {
         // Authoritative image path: the tracepoint's own `filename` field (the
         // kernel's resolved `bprm->filename`), never argv[0]. One bounded
         // `…_str_bytes` copy into the scratch entry.
-        let filename_offset = (data_loc & 0xffff) as usize;
-        let filename_src = (ctx.as_ptr() as *const u8).add(filename_offset);
-        if let Ok(s) = bpf_probe_read_kernel_str_bytes(filename_src, &mut (*e).image) {
+        if let Ok(s) = bpf_probe_read_kernel_str_bytes(filename_ptr, &mut (*e).image) {
             (*e).image_len = s.len() as u16;
         }
 
         if EXEC_EVENTS.output::<ExecEvent>(&*e, 0).is_err() {
-            warn!(
-                &ctx,
-                "sensor-linux-ebpf: ring buffer full, dropping exec event"
-            );
+            return 1;
         }
     }
 
-    info!(&ctx, "sensor-linux-ebpf: exec pid={}", pid);
-    Ok(0)
+    0
 }
 
 /// Ring buffer shared with userspace for `open` events.
@@ -328,7 +178,6 @@ const OPEN_FILENAME_PTR_OFFSET: usize = 12;
 #[cfg(bpf_target_arch = "x86")]
 const OPEN_FLAGS_OFFSET: usize = 16;
 
-#[tracepoint]
 pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
     match try_sys_enter_openat(ctx) {
         Ok(ret) => ret,
@@ -353,7 +202,6 @@ fn try_sys_enter_openat(ctx: TracePointContext) -> Result<u32, u32> {
     emit_file_open_event(&ctx, filename_ptr, flags)
 }
 
-#[tracepoint]
 pub fn sys_enter_open(ctx: TracePointContext) -> u32 {
     match try_sys_enter_open(ctx) {
         Ok(ret) => ret,
@@ -478,7 +326,6 @@ const WRITE_FD_OFFSET: usize = 12;
 #[cfg(bpf_target_arch = "x86")]
 const WRITE_COUNT_OFFSET: usize = 20;
 
-#[tracepoint]
 pub fn sys_enter_write(ctx: TracePointContext) -> u32 {
     match try_sys_enter_write(ctx) {
         Ok(ret) => ret,
@@ -552,7 +399,6 @@ const UNLINKAT_PATHNAME_PTR_OFFSET: usize = 24;
 #[cfg(bpf_target_arch = "x86")]
 const UNLINKAT_PATHNAME_PTR_OFFSET: usize = 16;
 
-#[tracepoint]
 pub fn sys_enter_unlink(ctx: TracePointContext) -> u32 {
     match try_sys_enter_unlink(ctx) {
         Ok(ret) => ret,
@@ -572,7 +418,6 @@ fn try_sys_enter_unlink(ctx: TracePointContext) -> Result<u32, u32> {
     emit_file_delete_event(&ctx, pathname_ptr)
 }
 
-#[tracepoint]
 pub fn sys_enter_unlinkat(ctx: TracePointContext) -> u32 {
     match try_sys_enter_unlinkat(ctx) {
         Ok(ret) => ret,
@@ -705,7 +550,6 @@ const RENAMEAT2_OLDNAME_PTR_OFFSET: usize = 16;
 #[cfg(bpf_target_arch = "x86")]
 const RENAMEAT2_NEWNAME_PTR_OFFSET: usize = 24;
 
-#[tracepoint]
 pub fn sys_enter_rename(ctx: TracePointContext) -> u32 {
     match try_sys_enter_rename(ctx) {
         Ok(ret) => ret,
@@ -732,7 +576,6 @@ fn try_sys_enter_rename(ctx: TracePointContext) -> Result<u32, u32> {
     emit_file_rename_event(&ctx, AT_FDCWD, oldname_ptr, AT_FDCWD, newname_ptr)
 }
 
-#[tracepoint]
 pub fn sys_enter_renameat(ctx: TracePointContext) -> u32 {
     match try_sys_enter_renameat(ctx) {
         Ok(ret) => ret,
@@ -782,7 +625,6 @@ fn try_sys_enter_renameat(ctx: TracePointContext) -> Result<u32, u32> {
     emit_file_rename_event(&ctx, olddfd, oldname_ptr, newdfd, newname_ptr)
 }
 
-#[tracepoint]
 pub fn sys_enter_renameat2(ctx: TracePointContext) -> u32 {
     match try_sys_enter_renameat2(ctx) {
         Ok(ret) => ret,
@@ -945,7 +787,6 @@ const FCHMODAT_FILENAME_PTR_OFFSET: usize = 16;
 #[cfg(bpf_target_arch = "x86")]
 const FCHMODAT_MODE_OFFSET: usize = 20;
 
-#[tracepoint]
 pub fn sys_enter_chmod(ctx: TracePointContext) -> u32 {
     match try_sys_enter_chmod(ctx) {
         Ok(ret) => ret,
@@ -969,7 +810,6 @@ fn try_sys_enter_chmod(ctx: TracePointContext) -> Result<u32, u32> {
     emit_file_chmod_event(&ctx, filename_ptr, mode)
 }
 
-#[tracepoint]
 pub fn sys_enter_fchmodat(ctx: TracePointContext) -> u32 {
     match try_sys_enter_fchmodat(ctx) {
         Ok(ret) => ret,
@@ -1096,7 +936,6 @@ const FCHOWNAT_USER_OFFSET: usize = 20;
 #[cfg(bpf_target_arch = "x86")]
 const FCHOWNAT_GROUP_OFFSET: usize = 24;
 
-#[tracepoint]
 pub fn sys_enter_chown(ctx: TracePointContext) -> u32 {
     match try_sys_enter_chown(ctx) {
         Ok(ret) => ret,
@@ -1124,7 +963,6 @@ fn try_sys_enter_chown(ctx: TracePointContext) -> Result<u32, u32> {
     emit_file_chown_event(&ctx, filename_ptr, user, group)
 }
 
-#[tracepoint]
 pub fn sys_enter_lchown(ctx: TracePointContext) -> u32 {
     match try_sys_enter_lchown(ctx) {
         Ok(ret) => ret,
@@ -1152,7 +990,6 @@ fn try_sys_enter_lchown(ctx: TracePointContext) -> Result<u32, u32> {
     emit_file_chown_event(&ctx, filename_ptr, user, group)
 }
 
-#[tracepoint]
 pub fn sys_enter_fchownat(ctx: TracePointContext) -> u32 {
     match try_sys_enter_fchownat(ctx) {
         Ok(ret) => ret,
@@ -1267,7 +1104,6 @@ const SETXATTR_PATHNAME_PTR_OFFSET: usize = 12;
 #[cfg(bpf_target_arch = "x86")]
 const SETXATTR_NAME_PTR_OFFSET: usize = 16;
 
-#[tracepoint]
 pub fn sys_enter_setxattr(ctx: TracePointContext) -> u32 {
     match try_sys_enter_setxattr(ctx) {
         Ok(ret) => ret,
@@ -1357,7 +1193,6 @@ const REMOVEXATTR_PATHNAME_PTR_OFFSET: usize = 12;
 #[cfg(bpf_target_arch = "x86")]
 const REMOVEXATTR_NAME_PTR_OFFSET: usize = 16;
 
-#[tracepoint]
 pub fn sys_enter_removexattr(ctx: TracePointContext) -> u32 {
     match try_sys_enter_removexattr(ctx) {
         Ok(ret) => ret,
@@ -1462,7 +1297,6 @@ const CONNECT_USERVADDR_PTR_OFFSET: usize = 16;
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
 
-#[tracepoint]
 pub fn sys_enter_connect(ctx: TracePointContext) -> u32 {
     match try_sys_enter_connect(ctx) {
         Ok(ret) => ret,
@@ -1607,7 +1441,6 @@ struct BindAddrValue {
 #[map]
 static BIND_ADDR_MAP: HashMap<BindAddrKey, BindAddrValue> = HashMap::with_max_entries(4096, 0);
 
-#[tracepoint]
 pub fn sys_enter_bind(ctx: TracePointContext) -> u32 {
     match try_sys_enter_bind(ctx) {
         Ok(ret) => ret,
@@ -1742,7 +1575,6 @@ const LISTEN_FD_OFFSET: usize = 12;
 #[cfg(bpf_target_arch = "x86")]
 const LISTEN_BACKLOG_OFFSET: usize = 16;
 
-#[tracepoint]
 pub fn sys_enter_listen(ctx: TracePointContext) -> u32 {
     match try_sys_enter_listen(ctx) {
         Ok(ret) => ret,
@@ -1838,7 +1670,6 @@ const SENDTO_LEN_OFFSET: usize = 20;
 #[cfg(bpf_target_arch = "x86")]
 const SENDTO_ADDR_PTR_OFFSET: usize = 28;
 
-#[tracepoint]
 pub fn sys_enter_sendto(ctx: TracePointContext) -> u32 {
     match try_sys_enter_sendto(ctx) {
         Ok(ret) => ret,
@@ -1957,11 +1788,11 @@ struct AcceptArgs {
 
 /// Correlates `sys_enter_accept{,4}` with its matching `sys_exit_accept{,4}` on the
 /// same thread. Not part of `sensor-linux-wire`'s ABI (never read by userspace).
-/// A thread that enters `accept()` and never returns (blocked forever, or the
-/// process is killed mid-call) leaks its entry — same accepted risk as
-/// `SSL_READ_ARGS`, bounded by `max_entries`, not explicitly swept.
+/// A thread that enters `accept()` and never returns retains its entry. An LRU
+/// evicts the stalest stash when full so blocked threads cannot blind later
+/// accept telemetry host-wide.
 #[map]
-static ACCEPT_ARGS: HashMap<u64, AcceptArgs> = HashMap::with_max_entries(1024, 0);
+static ACCEPT_ARGS: LruHashMap<u64, AcceptArgs> = LruHashMap::with_max_entries(1024, 0);
 
 /// Offsets of the `syscalls:sys_enter_accept`/`sys_enter_accept4` tracepoints
 /// (x86_64/aarch64): `fd`(16), `upeer_sockaddr`(24) — identical shape for both
@@ -1990,7 +1821,6 @@ const SYS_EXIT_RET_OFFSET: usize = 16;
 #[cfg(bpf_target_arch = "x86")]
 const SYS_EXIT_RET_OFFSET: usize = 12;
 
-#[tracepoint]
 pub fn sys_enter_accept(ctx: TracePointContext) -> u32 {
     match stash_accept_args(&ctx) {
         Ok(ret) => ret,
@@ -1998,7 +1828,6 @@ pub fn sys_enter_accept(ctx: TracePointContext) -> u32 {
     }
 }
 
-#[tracepoint]
 pub fn sys_enter_accept4(ctx: TracePointContext) -> u32 {
     match stash_accept_args(&ctx) {
         Ok(ret) => ret,
@@ -2022,19 +1851,20 @@ fn stash_accept_args(ctx: &TracePointContext) -> Result<u32, u32> {
             .map_err(|_| 1u32)? as u64
     };
 
+    let pid_tgid = bpf_get_current_pid_tgid();
     if addr_ptr != 0 {
-        let pid_tgid = bpf_get_current_pid_tgid();
         let args = AcceptArgs {
             fd: fd as u32,
             addr_ptr,
         };
         let _ = ACCEPT_ARGS.insert(&pid_tgid, &args, 0);
+    } else {
+        let _ = ACCEPT_ARGS.remove(&pid_tgid);
     }
 
     Ok(0)
 }
 
-#[tracepoint]
 pub fn sys_exit_accept(ctx: TracePointContext) -> u32 {
     match try_sys_exit_accept(ctx) {
         Ok(ret) => ret,
@@ -2042,7 +1872,6 @@ pub fn sys_exit_accept(ctx: TracePointContext) -> u32 {
     }
 }
 
-#[tracepoint]
 pub fn sys_exit_accept4(ctx: TracePointContext) -> u32 {
     match try_sys_exit_accept(ctx) {
         Ok(ret) => ret,
@@ -2051,8 +1880,8 @@ pub fn sys_exit_accept4(ctx: TracePointContext) -> u32 {
 }
 
 /// Shared by `sys_exit_accept` and `sys_exit_accept4`. No-ops (returns `Ok(0)`
-/// without emitting) when: the matching `sys_enter` wasn't tracked (NULL addr, or
-/// `ACCEPT_ARGS` was full), the call failed (`ret < 0`), or the peer's address
+/// without emitting) when: the matching `sys_enter` wasn't tracked (NULL addr
+/// or an evicted stash), the call failed (`ret < 0`), or the peer's address
 /// family isn't one this sensor tracks.
 fn try_sys_exit_accept(ctx: TracePointContext) -> Result<u32, u32> {
     #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
@@ -2134,6 +1963,186 @@ fn try_sys_exit_accept(ctx: TracePointContext) -> Result<u32, u32> {
     Ok(0)
 }
 
+// --- Datagram receive (issue #263) ----------------------------------------------
+//
+// Same entry/exit shape as accept: `recvfrom(2)`'s source address is written by the
+// kernel during the call, so `sys_enter_recvfrom` stashes the caller's `addr`
+// pointer and `sys_exit_recvfrom` reads the sender from it on return. `recv(2)` is
+// glibc's `recvfrom(..., NULL, NULL)` and is skipped by the NULL check.
+
+/// Ring buffer shared with userspace for `recvfrom` events.
+#[map]
+static UDP_RECV_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Per-CPU scratch for building one `UdpRecvEvent` (see `EXEC_SCRATCH`).
+#[map]
+static UDP_RECV_SCRATCH: PerCpuArray<UdpRecvEvent> = PerCpuArray::with_max_entries(1, 0);
+
+/// Stashed at `sys_enter_recvfrom`, consumed at `sys_exit_recvfrom`, keyed by
+/// `pid_tgid`. The kernel writes the sender's address and `*addr_len` only on
+/// return, and only for sockets that have a source address: a connected TCP
+/// socket leaves both untouched, so the exit probe must check `*addr_len` first.
+/// Not part of `sensor-linux-wire`'s ABI.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RecvfromArgs {
+    addr_ptr: u64,
+    addr_len_ptr: u64,
+}
+
+/// LRU rather than a plain hash: a thread that blocks in `recvfrom` forever leaks
+/// its entry, and a full plain map would silently refuse every later insert
+/// host-wide. The LRU evicts the stalest stash instead.
+#[map]
+static RECVFROM_ARGS: LruHashMap<u64, RecvfromArgs> = LruHashMap::with_max_entries(1024, 0);
+
+/// Offsets of `addr`(48) and `addr_len`(56) in `syscalls:sys_enter_recvfrom`
+/// (x86_64/aarch64): `fd`(16), `ubuf`(24), `size`(32), `flags`(40), the same layout
+/// `sys_enter_sendto` reports. Verified on 2026-10-05 on Alpine (kernel 6.18.50-0-virt,
+/// x86_64) via `/sys/kernel/tracing/events/syscalls/sys_enter_recvfrom/format`.
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const RECVFROM_ADDR_PTR_OFFSET: usize = 48;
+#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+const RECVFROM_ADDR_LEN_PTR_OFFSET: usize = 56;
+/// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
+#[cfg(bpf_target_arch = "x86")]
+const RECVFROM_ADDR_PTR_OFFSET: usize = 28;
+#[cfg(bpf_target_arch = "x86")]
+const RECVFROM_ADDR_LEN_PTR_OFFSET: usize = 32;
+
+pub fn sys_enter_recvfrom(ctx: TracePointContext) -> u32 {
+    match stash_recvfrom_addr(&ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn stash_recvfrom_addr(ctx: &TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let addr_ptr: u64 = unsafe { ctx.read_at(RECVFROM_ADDR_PTR_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let addr_len_ptr: u64 = unsafe {
+        ctx.read_at(RECVFROM_ADDR_LEN_PTR_OFFSET)
+            .map_err(|_| 1u32)?
+    };
+    #[cfg(bpf_target_arch = "x86")]
+    let addr_ptr: u64 = unsafe {
+        ctx.read_at::<u32>(RECVFROM_ADDR_PTR_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
+    #[cfg(bpf_target_arch = "x86")]
+    let addr_len_ptr: u64 = unsafe {
+        ctx.read_at::<u32>(RECVFROM_ADDR_LEN_PTR_OFFSET)
+            .map_err(|_| 1u32)? as u64
+    };
+
+    let pid_tgid = bpf_get_current_pid_tgid();
+    if addr_ptr != 0 {
+        let args = RecvfromArgs {
+            addr_ptr,
+            addr_len_ptr,
+        };
+        let _ = RECVFROM_ARGS.insert(&pid_tgid, &args, 0);
+    } else {
+        let _ = RECVFROM_ARGS.remove(&pid_tgid);
+    }
+
+    Ok(0)
+}
+
+pub fn sys_exit_recvfrom(ctx: TracePointContext) -> u32 {
+    match try_sys_exit_recvfrom(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+/// No-ops when the matching enter wasn't tracked, the call failed (`ret < 0`), the
+/// kernel wrote no source address (`*addr_len == 0`, e.g. a connected TCP socket,
+/// whose `addr` buffer still holds whatever the caller put there), or the sender's
+/// address family isn't `AF_INET`/`AF_INET6`.
+fn try_sys_exit_recvfrom(ctx: TracePointContext) -> Result<u32, u32> {
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    let ret: i64 = unsafe { ctx.read_at(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? };
+    #[cfg(bpf_target_arch = "x86")]
+    let ret: i64 = unsafe { ctx.read_at::<i32>(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? as i64 };
+
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let args = match unsafe { RECVFROM_ARGS.get(&pid_tgid) } {
+        Some(a) => *a,
+        None => return Ok(0),
+    };
+    let _ = RECVFROM_ARGS.remove(&pid_tgid);
+
+    if ret < 0 {
+        return Ok(0);
+    }
+
+    let addr_len: u32 = match unsafe { bpf_probe_read_user(args.addr_len_ptr as *const u32) } {
+        Ok(len) => len,
+        Err(_) => return Ok(0),
+    };
+    if addr_len == 0 {
+        return Ok(0);
+    }
+    let addr_ptr = args.addr_ptr;
+
+    let family: u16 = match unsafe { bpf_probe_read_user(addr_ptr as *const u16) } {
+        Ok(f) => f,
+        Err(_) => return Ok(0),
+    };
+    if family != AF_INET && family != AF_INET6 {
+        return Ok(0);
+    }
+
+    let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
+    let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
+
+    let port_be: u16 =
+        unsafe { bpf_probe_read_user((addr_ptr + 2) as *const u16).map_err(|_| 1u32)? };
+    let (v4, v6): ([u8; 4], [u8; 16]) = if family == AF_INET {
+        (
+            unsafe { bpf_probe_read_user((addr_ptr + 4) as *const [u8; 4]).map_err(|_| 1u32)? },
+            [0u8; 16],
+        )
+    } else {
+        ([0u8; 4], unsafe {
+            bpf_probe_read_user((addr_ptr + 8) as *const [u8; 16]).map_err(|_| 1u32)?
+        })
+    };
+
+    let e = UDP_RECV_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
+    unsafe {
+        core::ptr::write_bytes(e, 0, 1);
+
+        (*e).meta.pid = (pid_tgid >> 32) as u32;
+        fill_lineage(&mut (*e).meta);
+        (*e).meta.uid = uid_gid as u32;
+        (*e).meta.gid = (uid_gid >> 32) as u32;
+        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
+        let mut i = 0usize;
+        while i < TASK_COMM_LEN {
+            (*e).meta.comm[i] = comm[i];
+            i += 1;
+        }
+        (*e).peer_addr_v4 = v4;
+        (*e).peer_addr_v6 = v6;
+        (*e).peer_port = u16::from_be(port_be);
+        (*e).is_ipv6 = family == AF_INET6;
+        (*e).size = ret as u32;
+
+        if UDP_RECV_EVENTS.output::<UdpRecvEvent>(&*e, 0).is_err() {
+            warn!(
+                &ctx,
+                "sensor-linux-ebpf: ring buffer full, dropping udp recv event"
+            );
+        }
+    }
+
+    Ok(0)
+}
+
 /// Ring buffer shared with userspace for `ptrace` events (issue #265).
 #[map]
 static PTRACE_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -2164,7 +2173,6 @@ const PTRACE_ADDR_OFFSET: usize = 24;
 #[cfg(bpf_target_arch = "x86")]
 const PTRACE_DATA_OFFSET: usize = 28;
 
-#[tracepoint]
 pub fn sys_enter_ptrace(ctx: TracePointContext) -> u32 {
     match try_sys_enter_ptrace(ctx) {
         Ok(ret) => ret,
@@ -2289,7 +2297,6 @@ fn read_first_iovec_len(iov_ptr: u64, count: u64) -> u64 {
     }
 }
 
-#[tracepoint]
 pub fn sys_enter_process_vm_readv(ctx: TracePointContext) -> u32 {
     match try_sys_enter_process_vm_readv(ctx) {
         Ok(ret) => ret,
@@ -2368,7 +2375,6 @@ fn try_sys_enter_process_vm_readv(ctx: TracePointContext) -> Result<u32, u32> {
     Ok(0)
 }
 
-#[tracepoint]
 pub fn sys_enter_process_vm_writev(ctx: TracePointContext) -> u32 {
     match try_sys_enter_process_vm_writev(ctx) {
         Ok(ret) => ret,
@@ -2480,7 +2486,6 @@ const MEMFD_CREATE_NAME_PTR_OFFSET: usize = 12;
 #[cfg(bpf_target_arch = "x86")]
 const MEMFD_CREATE_FLAGS_OFFSET: usize = 16;
 
-#[tracepoint]
 pub fn sys_enter_memfd_create(ctx: TracePointContext) -> u32 {
     match try_sys_enter_memfd_create(ctx) {
         Ok(ret) => ret,
@@ -2541,7 +2546,6 @@ fn try_sys_enter_memfd_create(ctx: TracePointContext) -> Result<u32, u32> {
     Ok(0)
 }
 
-#[tracepoint]
 pub fn sys_exit_memfd_create(ctx: TracePointContext) -> u32 {
     match try_sys_exit_memfd_create(ctx) {
         Ok(ret) => ret,
@@ -2708,7 +2712,6 @@ const UMOUNT_TARGET_PTR_OFFSET: usize = 16;
 #[cfg(bpf_target_arch = "x86")]
 const UMOUNT_TARGET_PTR_OFFSET: usize = 12;
 
-#[tracepoint]
 pub fn sys_enter_mount(ctx: TracePointContext) -> u32 {
     match try_sys_enter_mount(ctx) {
         Ok(ret) => ret,
@@ -2746,7 +2749,6 @@ fn try_sys_enter_mount(ctx: TracePointContext) -> Result<u32, u32> {
     emit_mount_event(&ctx, target_ptr, source_ptr, fstype_ptr, flags, true)
 }
 
-#[tracepoint]
 pub fn sys_enter_umount(ctx: TracePointContext) -> u32 {
     match try_sys_enter_umount(ctx) {
         Ok(ret) => ret,
@@ -2924,7 +2926,6 @@ const TGKILL_SIG_OFFSET: usize = 20;
 // `pthread_kill` uses `tgkill`, and a plain `kill(1)` uses `kill(2)`), so this
 // is a narrow, accepted gap rather than a missing common path.
 
-#[tracepoint]
 pub fn sys_enter_kill(ctx: TracePointContext) -> u32 {
     match try_sys_enter_kill(ctx) {
         Ok(ret) => ret,
@@ -2945,7 +2946,6 @@ fn try_sys_enter_kill(ctx: TracePointContext) -> Result<u32, u32> {
     emit_signal_event(&ctx, pid as u32, sig as u32)
 }
 
-#[tracepoint]
 pub fn sys_enter_tgkill(ctx: TracePointContext) -> u32 {
     match try_sys_enter_tgkill(ctx) {
         Ok(ret) => ret,
@@ -3121,7 +3121,6 @@ fn emit_kernel_module_event(
     Ok(0)
 }
 
-#[tracepoint]
 pub fn sys_enter_init_module(ctx: TracePointContext) -> u32 {
     match try_sys_enter_init_module(ctx) {
         Ok(ret) => ret,
@@ -3144,7 +3143,6 @@ fn try_sys_enter_init_module(ctx: TracePointContext) -> Result<u32, u32> {
     emit_kernel_module_event(&ctx, KERNEL_MODULE_ACTION_LOAD, 0, -1, len, 0)
 }
 
-#[tracepoint]
 pub fn sys_enter_finit_module(ctx: TracePointContext) -> u32 {
     match try_sys_enter_finit_module(ctx) {
         Ok(ret) => ret,
@@ -3179,7 +3177,6 @@ fn try_sys_enter_finit_module(ctx: TracePointContext) -> Result<u32, u32> {
     )
 }
 
-#[tracepoint]
 pub fn sys_enter_delete_module(ctx: TracePointContext) -> u32 {
     match try_sys_enter_delete_module(ctx) {
         Ok(ret) => ret,
@@ -3244,7 +3241,6 @@ const BPF_CMD_OFFSET: usize = 16;
 #[cfg(bpf_target_arch = "x86")]
 const BPF_CMD_OFFSET: usize = 12;
 
-#[tracepoint]
 pub fn sys_enter_bpf(ctx: TracePointContext) -> u32 {
     match try_sys_enter_bpf(ctx) {
         Ok(ret) => ret,
@@ -3325,7 +3321,6 @@ const PRCTL_OPTION_OFFSET: usize = 12;
 #[cfg(bpf_target_arch = "x86")]
 const PRCTL_ARG2_OFFSET: usize = 16;
 
-#[tracepoint]
 pub fn sys_enter_prctl(ctx: TracePointContext) -> u32 {
     match try_sys_enter_prctl(ctx) {
         Ok(ret) => ret,
@@ -3489,7 +3484,6 @@ fn read_single_id(ctx: &TracePointContext) -> Result<u32, u32> {
     Ok(id as u32)
 }
 
-#[tracepoint]
 pub fn sys_enter_setuid(ctx: TracePointContext) -> u32 {
     match read_single_id(&ctx) {
         Ok(uid) => match emit_identity_change_event(&ctx, IDENTITY_KIND_SETUID, uid, 0, 0) {
@@ -3499,7 +3493,6 @@ pub fn sys_enter_setuid(ctx: TracePointContext) -> u32 {
     }
 }
 
-#[tracepoint]
 pub fn sys_enter_setgid(ctx: TracePointContext) -> u32 {
     match read_single_id(&ctx) {
         Ok(gid) => match emit_identity_change_event(&ctx, IDENTITY_KIND_SETGID, gid, 0, 0) {
@@ -3509,7 +3502,6 @@ pub fn sys_enter_setgid(ctx: TracePointContext) -> u32 {
     }
 }
 
-#[tracepoint]
 pub fn sys_enter_setfsuid(ctx: TracePointContext) -> u32 {
     match read_single_id(&ctx) {
         Ok(fsuid) => match emit_identity_change_event(&ctx, IDENTITY_KIND_SETFSUID, fsuid, 0, 0) {
@@ -3519,7 +3511,6 @@ pub fn sys_enter_setfsuid(ctx: TracePointContext) -> u32 {
     }
 }
 
-#[tracepoint]
 pub fn sys_enter_setfsgid(ctx: TracePointContext) -> u32 {
     match read_single_id(&ctx) {
         Ok(fsgid) => match emit_identity_change_event(&ctx, IDENTITY_KIND_SETFSGID, fsgid, 0, 0) {
@@ -3529,7 +3520,6 @@ pub fn sys_enter_setfsgid(ctx: TracePointContext) -> u32 {
     }
 }
 
-#[tracepoint]
 pub fn sys_enter_setresuid(ctx: TracePointContext) -> u32 {
     match try_sys_enter_setres(&ctx) {
         Ok((real, effective, saved)) => {
@@ -3542,7 +3532,6 @@ pub fn sys_enter_setresuid(ctx: TracePointContext) -> u32 {
     }
 }
 
-#[tracepoint]
 pub fn sys_enter_setresgid(ctx: TracePointContext) -> u32 {
     match try_sys_enter_setres(&ctx) {
         Ok((real, effective, saved)) => {
@@ -3599,7 +3588,6 @@ const CAPSET_HDRP_PTR_OFFSET: usize = 12;
 #[cfg(bpf_target_arch = "x86")]
 const CAPSET_DATA_PTR_OFFSET: usize = 16;
 
-#[tracepoint]
 pub fn sys_enter_capset(ctx: TracePointContext) -> u32 {
     match try_sys_enter_capset(ctx) {
         Ok(ret) => ret,
@@ -3789,7 +3777,6 @@ fn emit_namespace_event(ctx: &TracePointContext, syscall: u8, fd: i32, flags: u3
     0
 }
 
-#[tracepoint]
 pub fn sys_enter_setns(ctx: TracePointContext) -> u32 {
     #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     let fd: u64 = match unsafe { ctx.read_at(SETNS_FD_OFFSET) } {
@@ -3816,7 +3803,6 @@ pub fn sys_enter_setns(ctx: TracePointContext) -> u32 {
     emit_namespace_event(&ctx, NAMESPACE_SYSCALL_SETNS, fd as i32, nstype as u32)
 }
 
-#[tracepoint]
 pub fn sys_enter_unshare(ctx: TracePointContext) -> u32 {
     #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     let flags: u64 = match unsafe { ctx.read_at(UNSHARE_FLAGS_OFFSET) } {

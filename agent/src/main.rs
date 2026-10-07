@@ -48,8 +48,11 @@ mod journal_cursor;
 mod kill_loudness;
 #[cfg(target_os = "linux")]
 mod log_sources;
+#[cfg(target_os = "linux")]
+mod memscan;
 mod protected;
 mod quarantine_cmd;
+mod redact;
 mod release;
 mod shutdown;
 mod silence;
@@ -121,13 +124,29 @@ enum Command {
         /// redacted. Linux only.
         #[arg(long)]
         enable_dns_capture: bool,
-        /// Control-plane base URL (e.g. `https://api.synthaea.example.com`).
-        /// When set, every normalized event is spooled next to the alerts file
-        /// and uploaded store-and-forward (at-least-once; the spool sheds
-        /// oldest past its byte cap). Without it the agent runs standalone,
-        /// exactly as before.
-        #[arg(long)]
+        /// Control-plane base URL, overriding `server.control_plane_url` from
+        /// `agent.toml`. Left unset, the agent uploads to the configured control plane
+        /// (store-and-forward, at-least-once; the spool sheds oldest past its byte cap),
+        /// presenting `server.mtls_cert`/`mtls_key`. A server named here never receives
+        /// the configured client certificate: pass `--cert`/`--key` for one that needs it.
+        #[arg(long, conflicts_with = "standalone")]
         server: Option<String>,
+        /// Run without uploading anything: events stay local, as before the agent read
+        /// its control plane from `agent.toml`.
+        #[arg(long)]
+        standalone: bool,
+        /// Client mTLS certificate (PEM) to present to the control plane, overriding the
+        /// configured one.
+        #[arg(long, requires = "key")]
+        cert: Option<std::path::PathBuf>,
+        /// Client mTLS private key (PEM). Required alongside `--cert`.
+        #[arg(long, requires = "cert")]
+        key: Option<std::path::PathBuf>,
+        /// PEM bundle of the only CA(s) trusted for the control plane's certificate, for
+        /// one on a private CA. Left unset, `server.ca_cert` from
+        /// `agent.toml`; with neither, the built-in public roots.
+        #[arg(long)]
+        ca_cert: Option<std::path::PathBuf>,
         /// Where downloaded content lives (issue #30) — the detection sink
         /// loads Sigma/YARA rules from `<content-dir>/rules/{sigma,yara}`.
         /// Defaults to `<storage.state_dir>/content`, exactly like
@@ -171,6 +190,11 @@ enum Command {
         /// Path to the client mTLS private key (PEM). Required alongside `--cert`.
         #[arg(long)]
         key: Option<std::path::PathBuf>,
+        /// PEM bundle of the CA(s) that signed the server's certificate, for a
+        /// control plane on a private CA. When given, only these roots are
+        /// trusted (the public roots are not).
+        #[arg(long)]
+        ca_cert: Option<std::path::PathBuf>,
         /// Where this agent's own record of already-applied content lives.
         /// Missing means a fresh install — every manifest entry is reported
         /// as needing a fetch.
@@ -202,6 +226,11 @@ enum Command {
         /// Path to the client mTLS private key (PEM). Required alongside `--cert`.
         #[arg(long)]
         key: Option<std::path::PathBuf>,
+        /// PEM bundle of the CA(s) that signed the server's certificate, for a
+        /// control plane on a private CA. When given, only these roots are
+        /// trusted (the public roots are not).
+        #[arg(long)]
+        ca_cert: Option<std::path::PathBuf>,
         /// Where downloaded content is written, mirroring each entry's
         /// manifest `path` underneath it (e.g. `rules/beacon.sigma`). Left
         /// unset, defaults to `content` under `storage.state_dir`. Given
@@ -234,6 +263,11 @@ enum Command {
         /// PEM client private key for mTLS.
         #[arg(long, requires = "cert")]
         key: Option<std::path::PathBuf>,
+        /// PEM bundle of the CA(s) that signed the server's certificate, for a
+        /// control plane on a private CA. When given, only these roots are
+        /// trusted (the public roots are not).
+        #[arg(long)]
+        ca_cert: Option<std::path::PathBuf>,
         /// Stage and promote only; do not restart the service. The release runs
         /// at the next service start.
         #[arg(long)]
@@ -312,8 +346,14 @@ fn main() -> anyhow::Result<()> {
             enable_readline_capture,
             enable_dns_capture,
             server,
+            standalone,
+            cert,
+            key,
+            ca_cert,
             content_dir,
         } => {
+            let target =
+                upload::resolve_run_target(server, standalone, cert, key, ca_cert, &cfg.server);
             let content_dir =
                 content_dir.unwrap_or_else(|| content::default_content_dir(&cfg.storage.state_dir));
             commands::cmd_run(commands::RunOptions {
@@ -325,7 +365,7 @@ fn main() -> anyhow::Result<()> {
                 enable_tls_capture,
                 enable_readline_capture,
                 enable_dns_capture,
-                server: server.as_deref(),
+                server: target.as_ref().map(upload::RunTarget::control_plane),
                 ipc_endpoint: &cfg.ipc.endpoint,
                 log_sources: &cfg.logs.sources,
                 content_dir: &content_dir,
@@ -338,12 +378,14 @@ fn main() -> anyhow::Result<()> {
             ring,
             cert,
             key,
+            ca_cert,
             state,
         } => content::cmd_check_content_manifest(
             &server,
             &ring,
             cert.as_deref(),
             key.as_deref(),
+            content::resolve_ca_cert(ca_cert, &cfg.server).as_deref(),
             &state,
         ),
         Command::ApplyContentManifest {
@@ -351,18 +393,23 @@ fn main() -> anyhow::Result<()> {
             ring,
             cert,
             key,
+            ca_cert,
             content_dir,
             state,
         } => {
             let (content_dir, state) =
                 content::resolve_content_paths(&cfg.storage.state_dir, content_dir, state)?;
             let ring = content::resolve_ring(ring, &cfg.updates)?;
-            let endpoint = content::resolve_endpoint(server, cert, key, &cfg.server);
+            let endpoint = content::resolve_endpoint(
+                server,
+                cert,
+                key,
+                content::resolve_ca_cert(ca_cert, &cfg.server),
+                &cfg.server,
+            );
             content::cmd_apply_content_manifest(
-                &endpoint.server,
+                &endpoint,
                 &ring,
-                endpoint.cert.as_deref(),
-                endpoint.key.as_deref(),
                 &content_dir,
                 &state,
                 &cfg.ipc.endpoint,
@@ -380,12 +427,14 @@ fn main() -> anyhow::Result<()> {
             server,
             cert,
             key,
+            ca_cert,
             no_restart,
             allow_test_key,
         } => release::cmd_apply_release(
             &server,
             cert.as_deref(),
             key.as_deref(),
+            content::resolve_ca_cert(ca_cert, &cfg.server).as_deref(),
             &cfg.storage.state_dir,
             !no_restart,
             allow_test_key,

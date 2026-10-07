@@ -19,3 +19,30 @@
 //!   fully removed on uninstall (the packaging residue rule applies to decoys too).
 //! - **Safety**: decoys are inert (no real entitlements), clearly machine-generated
 //!   on inspection by the operator's runbook, and never placed where users work.
+//!
+//! ## What is built (issue #81, slice 1: canary files)
+//!
+//! - [`plan`] turns a [`Seed`] and the directories an operator chose ([`Placement`]) into
+//!   [`Canary`] files whose names and contents differ per install.
+//! - [`plant`], [`verify`] and [`remove`] are the lifecycle, with an on-disk [`Inventory`]
+//!   written before a file exists, so an uninstall deletes exactly what was planted and
+//!   nothing else (a file that was already there is never overwritten, a symlink put in a
+//!   canary's place is never followed).
+//! - [`Tripwires`] matches the existing file events (open, delete, rename) against the
+//!   inventory and says which canary, how it was touched and by which pid.
+//!
+//! Not built yet: decoy credentials and their server-side alarm, honeypot listeners, the
+//! agent wiring (choosing directories, keeping the seed, raising the detection), and the
+//! refresh policy. This crate does no I/O except through [`plant`], [`verify`] and
+//! [`remove`], and holds no platform branches.
+
+mod lifecycle;
+mod plan;
+mod tripwire;
+
+pub use lifecycle::{
+    DeceptionError, Drift, DriftKind, Inventory, InventoryEntry, PlantReport, RemoveReport,
+    Skipped, plant, remove, sha256_hex, verify,
+};
+pub use plan::{Canary, DECOY_HEADER, Kind, Placement, Seed, plan};
+pub use tripwire::{Hit, Touch, Tripwires};

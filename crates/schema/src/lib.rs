@@ -240,14 +240,31 @@ pub mod time;
 /// targets v38 while both branches are open: whichever merges second
 /// renumbers, same coordination note as v13, v28→29, v30→31 and v32→33.
 ///
-/// Bumped 38 → 40 for [`Event::BitsJob`] (#284): BITS jobs from
+/// Bumped 38 → 39 for [`Event::UdpRecv`] (#263): one new enum variant for inbound
+/// UDP datagrams (`recvfrom(2)`) on Linux, the counterpart of [`Event::UdpSend`].
+/// #654 also targets v39 while both branches are open: whichever merges second
+/// renumbers, as above.
+///
+/// Bumped 39 → 40 for [`Event::Session`] (#285): session lifecycle from the
+/// Windows Terminal Services channels (connect, logon, disconnect, reconnect,
+/// logoff). It claimed 39 alongside #650 (`UdpRecv`), which merged first, so
+/// this one renumbers. #577 (`BitsJob`) also targets v40 while both branches
+/// are open: whichever merges second renumbers, as above.
+///
+/// Bumped 40 → 41 for [`Event::LdapSearch`] (#364): the LDAP searches a
+/// process sends (EID 30 of Microsoft-Windows-LDAP-Client), the endpoint's
+/// view of directory reconnaissance. Windows-only, same posture as
+/// `WmiActivity`. 38 was claimed by #283 (`Defender`), 39 by #263 (`UdpRecv`) and 40 by
+/// #285 (`Session`) while this branch was open; all merged first, so this
+/// one renumbers, same coordination note as above.
+///
+/// Bumped 41 → 42 for [`Event::BitsJob`] (#284): BITS jobs from
 /// `Microsoft-Windows-Bits-Client`, the only record that ties a BITS download
 /// (whose network I/O the service does itself) back to the process that asked
-/// for it. Windows-only. First claimed v35 (taken by #519), then rebased past
-/// v39, which #650 and #654 both target while open: 40 rather than a third
-/// claim on 39. Versions are labels, not a sequence: a gap is fine (see
-/// `tests/fixtures/`).
-pub const SCHEMA_VERSION: u32 = 40;
+/// for it. Windows-only. It claimed 35, then 40, while #519, #654 and #632
+/// merged first with 35, 40 and 41, so this one renumbers, same
+/// coordination note as above.
+pub const SCHEMA_VERSION: u32 = 42;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -716,7 +733,9 @@ pub struct FileWriteEvent {
     pub bytes_requested: u64,
 }
 
-/// File delete (issue #262): `unlink(2)`/`unlinkat(2)`.
+/// File delete (issue #262): `unlink(2)`/`unlinkat(2)` on Linux, ES `UNLINK`
+/// on macOS. On Windows, only the deletion of a `:Zone.Identifier` stream, the
+/// mark-of-the-web removed (#442); `path` is then the stream path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileDeleteEvent {
     pub meta: EventMeta,
@@ -1033,6 +1052,31 @@ pub struct DefenderEvent {
     pub new_value: Option<String>,
 }
 
+/// An LDAP search a process sent, from EID 30 of the
+/// Microsoft-Windows-LDAP-Client provider (#364): the directory-reconnaissance
+/// fingerprint an endpoint can see. Kerberoasting / AS-REP roasting start with
+/// a search for roastable accounts, and SharpHound-style collection is a burst
+/// of wide searches from one process; the ticket requests themselves are only
+/// visible on a domain controller.
+///
+/// Emitted when the request is actually sent (lab, 2026-10-02: a search to a
+/// listener that never answers is logged, a failed connect is not). `meta` is
+/// the requesting process (`wldap32` runs in-process). Windows-only, same
+/// posture as [`WmiActivityEvent`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LdapSearchEvent {
+    pub meta: EventMeta,
+    /// The search filter as sent (RFC 4515 text).
+    pub filter: String,
+    /// The search base distinguished name.
+    pub base_dn: String,
+    /// Search scope: 0 base object, 1 one level, 2 whole subtree.
+    pub scope: u32,
+    /// Attributes requested; empty means "all".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attributes: Vec<String>,
+}
+
 /// WMI activity — query execution (EID 23) or method invocation (EID 24) from the
 /// Microsoft-Windows-WMI-Activity provider.
 ///
@@ -1270,6 +1314,20 @@ pub struct UdpSendEvent {
     pub dport: u16,
     /// UDP payload size in bytes. Useful for detecting large DNS queries (tunneling)
     /// and volumetric anomalies — normal DNS queries are under 512 bytes.
+    pub size: u32,
+}
+
+/// UDP datagram received (`recvfrom(2)`, Linux, issue #263) — the inbound
+/// counterpart of [`UdpSendEvent`], carrying the sender's address. Emitted only
+/// when the kernel reported a source address (a connected-socket `recv(2)` has
+/// none), and only on success. `size` is the bytes actually received, not the
+/// buffer length requested.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UdpRecvEvent {
+    pub meta: EventMeta,
+    /// Sender's address (the remote end of the datagram).
+    pub peer_addr: core::net::IpAddr,
+    pub peer_port: u16,
     pub size: u32,
 }
 
@@ -1524,6 +1582,59 @@ pub enum AuthKind {
     /// event 4672, typically alongside a 4624 for administrative accounts; Linux
     /// a successful `sudo`).
     PrivilegedSession,
+}
+
+/// Which step in a session's life a [`SessionEvent`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    /// A remote client authenticated to the remote-desktop listener (Windows
+    /// `TerminalServices-RemoteConnectionManager` 1149). Comes before the
+    /// logon and belongs to no session yet, so `session_id` is `None`.
+    Connect,
+    /// A session logon completed (`TerminalServices-LocalSessionManager` 21).
+    Logon,
+    /// A session was disconnected and stays alive on the host, ready to be
+    /// reconnected to (24).
+    Disconnect,
+    /// A client was attached to an existing disconnected session (25).
+    Reconnect,
+    /// A session was logged off (23). Its `session_id` may be reused.
+    Logoff,
+}
+
+/// One step in the life of an interactive session (#285): Windows Terminal
+/// Services, which covers RDP and the local console alike.
+///
+/// What [`AuthEvent`] cannot say: whether a session is new or reconnected,
+/// when it was disconnected (left alive for later) rather than logged off,
+/// and which client a given session was attached to at each step. A
+/// disconnected session reconnected from another client is the trace of RDP
+/// session hijacking (T1563.002), invisible in the Security channel. A
+/// separate type rather than more [`AuthKind`]s: these steps are not
+/// authentications, and [`AuthEvent::outcome`] would mean nothing on them.
+///
+/// `meta` names the reporting service (`pid` from the event, `comm` empty,
+/// `user` unknown), not an actor. The account is [`Self::target_user`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEvent {
+    pub meta: EventMeta,
+    pub state: SessionState,
+    /// The OS session number (Windows `SessionID`). Unique among live
+    /// sessions only: reused once a session is logged off. `None` for
+    /// [`SessionState::Connect`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<u32>,
+    /// The session's account as the OS reports it (`DOMAIN\user`). Empty
+    /// when the event names none.
+    pub target_user: String,
+    /// The remote client's address, when the event reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_address: Option<core::net::IpAddr>,
+    /// The client is the host's own console (Windows `Address` = `LOCAL`).
+    /// `false` with no `source_address` means the event named no client at
+    /// all, as a logoff does: not the same thing as the console.
+    pub console: bool,
 }
 
 /// macOS TCC privacy-permission decision — tccd answered a process's request
@@ -2048,11 +2159,14 @@ pub enum Event {
     ScriptBlock(ScriptBlockEvent),
     AmsiContent(AmsiContentEvent),
     Defender(DefenderEvent),
+    LdapSearch(LdapSearchEvent),
     WmiActivity(WmiActivityEvent),
     AssemblyLoad(AssemblyLoadEvent),
     SmbConnect(SmbConnectEvent),
     UdpSend(UdpSendEvent),
+    UdpRecv(UdpRecvEvent),
     Auth(AuthEvent),
+    Session(SessionEvent),
     ListenPort(ListenPortEvent),
     NetworkFlow(NetworkFlowEvent),
     TlsCapture(TlsCaptureEvent),
@@ -2107,11 +2221,14 @@ impl Event {
             Event::ScriptBlock(e) => &e.meta,
             Event::AmsiContent(e) => &e.meta,
             Event::Defender(e) => &e.meta,
+            Event::LdapSearch(e) => &e.meta,
             Event::WmiActivity(e) => &e.meta,
             Event::AssemblyLoad(e) => &e.meta,
             Event::SmbConnect(e) => &e.meta,
             Event::UdpSend(e) => &e.meta,
+            Event::UdpRecv(e) => &e.meta,
             Event::Auth(e) => &e.meta,
+            Event::Session(e) => &e.meta,
             Event::ListenPort(e) => &e.meta,
             Event::NetworkFlow(e) => &e.meta,
             Event::TlsCapture(e) => &e.meta,

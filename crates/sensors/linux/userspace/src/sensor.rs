@@ -2,7 +2,7 @@
 //! buffers, dispatching normalized events to an `EventSink`. Migrated from
 //! `old/crates/synthaea-sensor-linux`.
 //!
-//! `load_ebpf`/`load_program`/`TRACEPOINTS` stay `pub`: the agent's status command
+//! `load_ebpf`/`load_program`/`RAW_TRACEPOINTS` stay `pub`: the agent's status command
 //! reuses them for the preflight (loads each program without attaching it), which is
 //! not part of the `Sensor` contract.
 
@@ -19,8 +19,9 @@ use tracing::warn;
 use crate::{
     container::{CgroupIdCache, DockerInfoCache, container_context},
     ebpf::{
-        TRACEPOINTS, TamperSlot, attach_tracepoint, clear_tamper_slot, err, load_ebpf_for_run,
-        prime_proc_lineage, read_tamper_slot, take_tamper_slot, write_signal_watch_pid,
+        RAW_TRACEPOINTS, TamperSlot, attach_raw_tracepoint, clear_tamper_slot, err,
+        load_ebpf_for_run, prime_proc_lineage, read_tamper_slot, take_tamper_slot,
+        write_signal_watch_pid,
     },
     normalize,
     proc::{read_proc_cmdline, read_proc_environ_security},
@@ -213,8 +214,8 @@ impl LinuxSensor {
             ),
         }
 
-        for (program, category, name) in TRACEPOINTS {
-            attach_tracepoint(&mut ebpf, program, category, name)?;
+        for (program, name) in RAW_TRACEPOINTS {
+            attach_raw_tracepoint(&mut ebpf, program, name)?;
         }
 
         let mut ring = |map: &str| -> Result<_, SensorError> {
@@ -236,6 +237,7 @@ impl LinuxSensor {
         let mut file_chmod_ring_buf = ring("FILE_CHMOD_EVENTS")?;
         let mut file_chown_ring_buf = ring("FILE_CHOWN_EVENTS")?;
         let mut udp_send_ring_buf = ring("UDP_SEND_EVENTS")?;
+        let mut udp_recv_ring_buf = ring("UDP_RECV_EVENTS")?;
         let mut socket_listen_ring_buf = ring("SOCKET_LISTEN_EVENTS")?;
         let mut socket_accept_ring_buf = ring("SOCKET_ACCEPT_EVENTS")?;
         let mut file_setxattr_ring_buf = ring("FILE_SETXATTR_EVENTS")?;
@@ -254,7 +256,7 @@ impl LinuxSensor {
         let mut namespace_ring_buf = ring("NAMESPACE_EVENTS")?;
 
         tracing::info!(
-            "sensor-linux: listening for exec/open/connect/write/delete/rename/bind/chmod/chown/udp_send/listen/accept/setxattr/removexattr/mount/signal/kernel_module/bpf/prctl/ptrace/process_vm_readv/process_vm_writev/memfd_create/identity_change/capset/namespace events"
+            "sensor-linux: listening for exec/open/connect/write/delete/rename/bind/chmod/chown/udp_send/udp_recv/listen/accept/setxattr/removexattr/mount/signal/kernel_module/bpf/prctl/ptrace/process_vm_readv/process_vm_writev/memfd_create/identity_change/capset/namespace events"
         );
 
         let mut container_ids = CgroupIdCache::new();
@@ -351,6 +353,12 @@ impl LinuxSensor {
                     drain!(guard, sensor_linux_wire::UdpSendEvent, sink, own_pid,
                         |e: &sensor_linux_wire::UdpSendEvent| {
                             normalize::udp_send(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = udp_recv_ring_buf.readable_mut() => {
+                    drain!(guard, sensor_linux_wire::UdpRecvEvent, sink, own_pid,
+                        |e: &sensor_linux_wire::UdpRecvEvent| {
+                            normalize::udp_recv(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
                 guard = socket_listen_ring_buf.readable_mut() => {

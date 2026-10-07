@@ -11,7 +11,8 @@ use schema::{
     FileRenameEvent, FileSetxattrEvent, FileWriteEvent, IdentityChangeEvent, IdentityChangeKind,
     KernelModuleAction, KernelModuleEvent, MemfdCreateEvent, MountEvent, NamespaceEvent,
     NamespaceSyscall, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
-    SignalEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, UdpSendEvent, User,
+    SignalEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, UdpRecvEvent, UdpSendEvent,
+    User,
 };
 use sensor_linux_wire as wire;
 
@@ -46,6 +47,9 @@ use sensor_linux_wire as wire;
 /// v11 (#263 Phase 2) added `SocketAcceptEvent` — new `socket_accept` mapping
 /// function below, same address-family logic as `connect`/`socket_bind`; no
 /// existing mapping changed shape.
+///
+/// v22 (#263) added `UdpRecvEvent` — new `udp_recv` mapping function below, the
+/// peer-address counterpart of `udp_send`; no existing mapping changed shape.
 ///
 /// v12 (#262 Phase 3) added `FileSetxattrEvent`/`FileRemovexattrEvent` — new
 /// mapping functions `file_setxattr`/`file_removexattr` below, same path-decoding
@@ -96,7 +100,9 @@ use sensor_linux_wire as wire;
 ///
 /// v21 (#515) added `old_dfd`/`new_dfd` to `FileRenameEvent`; `file_rename` resolves a
 /// relative path against them.
-const _: () = assert!(wire::WIRE_VERSION == 21);
+///
+/// v22 (#263) added `UdpRecvEvent`; `udp_recv` maps it one-to-one.
+const _: () = assert!(wire::WIRE_VERSION == 22);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
@@ -440,6 +446,25 @@ pub fn udp_send(
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
         daddr,
         dport: event.dport,
+        size: event.size,
+    })
+}
+
+#[must_use]
+pub fn udp_recv(
+    event: &wire::UdpRecvEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    let peer_addr = if event.is_ipv6 {
+        std::net::IpAddr::V6(event.peer_addr_v6.into())
+    } else {
+        std::net::IpAddr::V4(event.peer_addr_v4.into())
+    };
+    Event::UdpRecv(UdpRecvEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        peer_addr,
+        peer_port: event.peer_port,
         size: event.size,
     })
 }
@@ -1185,6 +1210,40 @@ mod tests {
         };
         assert_eq!(e.daddr.to_string(), "::1");
         assert_eq!(e.size, 512);
+    }
+
+    #[test]
+    fn udp_recv_reports_the_sender_and_received_size_for_both_families() {
+        let v4 = wire::UdpRecvEvent {
+            meta: wire_meta(b"dnsd"),
+            peer_addr_v4: [203, 0, 113, 42],
+            peer_addr_v6: [0; 16],
+            peer_port: 53,
+            is_ipv6: false,
+            size: 31,
+        };
+        let Event::UdpRecv(e) = udp_recv(&v4, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.peer_addr.to_string(), "203.0.113.42");
+        assert_eq!(e.peer_port, 53);
+        assert_eq!(e.size, 31);
+
+        let mut p6 = [0u8; 16];
+        p6[15] = 0x01;
+        let v6 = wire::UdpRecvEvent {
+            meta: wire_meta(b"dnsd"),
+            peer_addr_v4: [0; 4],
+            peer_addr_v6: p6,
+            peer_port: 5353,
+            is_ipv6: true,
+            size: 64,
+        };
+        let Event::UdpRecv(e) = udp_recv(&v6, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.peer_addr.to_string(), "::1");
+        assert_eq!(e.peer_port, 5353);
     }
 
     #[test]

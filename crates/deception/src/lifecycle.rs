@@ -1,0 +1,492 @@
+//! The canary lifecycle: plant, verify, refresh and remove, with an on-disk inventory.
+//!
+//! The inventory is the contract for the packaging residue rule: every file this crate
+//! creates is in it before it exists, and [`remove`] deletes exactly those files, so an
+//! uninstall leaves no decoy behind and touches nothing that was not planted.
+
+use std::{
+    fs::{self, OpenOptions},
+    io::{self, Write as _},
+    path::{Path, PathBuf},
+};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::plan::{Canary, Kind};
+
+/// Inventory file format version.
+const INVENTORY_VERSION: u32 = 1;
+
+/// What can go wrong planting, reading or removing canaries.
+#[derive(Debug, thiserror::Error)]
+pub enum DeceptionError {
+    /// A filesystem operation failed.
+    #[error("{path}: {source}")]
+    Io {
+        /// The path involved.
+        path: PathBuf,
+        /// The underlying error.
+        #[source]
+        source: io::Error,
+    },
+    /// The inventory file exists but is not a valid inventory.
+    #[error("inventory {path} is not valid: {reason}")]
+    Corrupt {
+        /// The inventory path.
+        path: PathBuf,
+        /// What is wrong with it.
+        reason: String,
+    },
+}
+
+fn io_at(path: &Path) -> impl FnOnce(io::Error) -> DeceptionError + '_ {
+    move |source| DeceptionError::Io {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+/// One planted canary, as recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryEntry {
+    /// Where the file is.
+    pub path: PathBuf,
+    /// What it pretends to be.
+    pub kind: Kind,
+    /// Lowercase hex SHA-256 of the content as planted.
+    pub sha256: String,
+}
+
+/// Every canary this install planted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Inventory {
+    version: u32,
+    /// The canaries, in the order they were planted.
+    pub entries: Vec<InventoryEntry>,
+}
+
+impl Default for Inventory {
+    fn default() -> Self {
+        Self {
+            version: INVENTORY_VERSION,
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl Inventory {
+    /// Reads the inventory at `path`; a missing file is an empty inventory.
+    ///
+    /// # Errors
+    ///
+    /// [`DeceptionError::Io`] if the file cannot be read, [`DeceptionError::Corrupt`] if it
+    /// is not a valid inventory of a known version.
+    pub fn load(path: &Path) -> Result<Self, DeceptionError> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(io_at(path)(e)),
+        };
+        let inventory: Self =
+            serde_json::from_slice(&bytes).map_err(|e| DeceptionError::Corrupt {
+                path: path.to_path_buf(),
+                reason: e.to_string(),
+            })?;
+        if inventory.version != INVENTORY_VERSION {
+            return Err(DeceptionError::Corrupt {
+                path: path.to_path_buf(),
+                reason: format!("unknown version {}", inventory.version),
+            });
+        }
+        Ok(inventory)
+    }
+
+    /// Writes the inventory to `path` through a same-directory temp file and a rename, so
+    /// a crash leaves the old inventory or the new one, never half of one.
+    ///
+    /// # Errors
+    ///
+    /// [`DeceptionError::Io`] if it cannot be written.
+    pub fn save(&self, path: &Path) -> Result<(), DeceptionError> {
+        let tmp = path.with_extension("tmp");
+        let bytes = serde_json::to_vec_pretty(self).map_err(|e| DeceptionError::Corrupt {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        })?;
+        fs::write(&tmp, bytes).map_err(io_at(&tmp))?;
+        fs::rename(&tmp, path).map_err(io_at(path))
+    }
+}
+
+/// Lowercase hex SHA-256 of `bytes`.
+#[must_use]
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Why a canary was not planted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Skipped {
+    /// The directory does not exist. Canaries never create directories: that would put
+    /// something where the operator did not point.
+    NoDirectory,
+    /// A file already exists there that is not this install's canary. It is never
+    /// overwritten.
+    Occupied,
+}
+
+/// What [`plant`] did.
+#[derive(Debug, Default)]
+pub struct PlantReport {
+    /// Created by this call.
+    pub planted: Vec<PathBuf>,
+    /// Already planted by this install, with the planted content: left alone.
+    pub unchanged: Vec<PathBuf>,
+    /// Not planted, and why.
+    pub skipped: Vec<(PathBuf, Skipped)>,
+}
+
+/// Plants `canaries` and records each one in the inventory at `inventory_path`.
+///
+/// A canary is written into the inventory **before** its file is created and dropped from
+/// it again if the creation fails, so a crash between the two leaves an inventoried path
+/// with no file (harmless to [`remove`]) and never a file the inventory does not know. Files
+/// are created with `create_new`: an existing file is never overwritten. Planting again is
+/// idempotent.
+///
+/// # Errors
+///
+/// [`DeceptionError`] if the inventory cannot be read or written, or a file cannot be
+/// written for a reason other than the directory missing or the path being taken.
+pub fn plant(canaries: &[Canary], inventory_path: &Path) -> Result<PlantReport, DeceptionError> {
+    let mut inventory = Inventory::load(inventory_path)?;
+    let mut report = PlantReport::default();
+    for canary in canaries {
+        let sha256 = sha256_hex(canary.content.as_bytes());
+        if let Some(known) = inventory.entries.iter().find(|e| e.path == canary.path) {
+            let intact = fs::read(&canary.path).is_ok_and(|b| sha256_hex(&b) == known.sha256);
+            if intact {
+                report.unchanged.push(canary.path.clone());
+            } else {
+                report
+                    .skipped
+                    .push((canary.path.clone(), Skipped::Occupied));
+            }
+            continue;
+        }
+        if canary.path.parent().is_none_or(|dir| !dir.is_dir()) {
+            report
+                .skipped
+                .push((canary.path.clone(), Skipped::NoDirectory));
+            continue;
+        }
+        inventory.entries.push(InventoryEntry {
+            path: canary.path.clone(),
+            kind: canary.kind,
+            sha256,
+        });
+        inventory.save(inventory_path)?;
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&canary.path)
+        {
+            Ok(mut file) => {
+                file.write_all(canary.content.as_bytes())
+                    .map_err(io_at(&canary.path))?;
+                report.planted.push(canary.path.clone());
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                inventory.entries.pop();
+                inventory.save(inventory_path)?;
+                report
+                    .skipped
+                    .push((canary.path.clone(), Skipped::Occupied));
+            }
+            Err(e) => {
+                inventory.entries.pop();
+                inventory.save(inventory_path)?;
+                return Err(io_at(&canary.path)(e));
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// How an inventoried canary differs from what was planted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriftKind {
+    /// The file is gone.
+    Missing,
+    /// It is not a regular file any more (a directory, or a symlink).
+    NotARegularFile,
+    /// The content no longer hashes to the planted value.
+    Modified,
+}
+
+/// One drifted canary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Drift {
+    /// The canary's path.
+    pub path: PathBuf,
+    /// What changed.
+    pub kind: DriftKind,
+}
+
+/// Compares every inventoried canary with the disk. An empty result means all are intact.
+/// A drifted canary is a fact worth reporting, not an alert by itself: the tripwire on the
+/// event stream is what says who touched it.
+#[must_use]
+pub fn verify(inventory: &Inventory) -> Vec<Drift> {
+    inventory
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let kind = match fs::symlink_metadata(&entry.path) {
+                Err(_) => DriftKind::Missing,
+                Ok(meta) if !meta.is_file() => DriftKind::NotARegularFile,
+                Ok(_) => match fs::read(&entry.path) {
+                    Ok(bytes) if sha256_hex(&bytes) == entry.sha256 => return None,
+                    Ok(_) => DriftKind::Modified,
+                    Err(_) => DriftKind::Missing,
+                },
+            };
+            Some(Drift {
+                path: entry.path.clone(),
+                kind,
+            })
+        })
+        .collect()
+}
+
+/// What [`remove`] did.
+#[derive(Debug, Default)]
+pub struct RemoveReport {
+    /// Deleted.
+    pub removed: Vec<PathBuf>,
+    /// Already gone.
+    pub missing: Vec<PathBuf>,
+    /// Not deleted because the path is no longer a regular file (a symlink or directory put
+    /// there since): deleting through it could remove something that is not ours.
+    pub refused: Vec<PathBuf>,
+    /// Could not be deleted.
+    pub failed: Vec<(PathBuf, io::Error)>,
+}
+
+impl RemoveReport {
+    /// True when nothing is left behind: no refusal and no failure.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.refused.is_empty() && self.failed.is_empty()
+    }
+}
+
+/// Deletes every canary in the inventory at `inventory_path`, then the inventory itself if
+/// nothing was refused or failed. A canary that was modified is still deleted: it is this
+/// install's file. One that is no longer a regular file is refused.
+///
+/// # Errors
+///
+/// [`DeceptionError`] if the inventory cannot be read or rewritten.
+pub fn remove(inventory_path: &Path) -> Result<RemoveReport, DeceptionError> {
+    let mut inventory = Inventory::load(inventory_path)?;
+    let mut report = RemoveReport::default();
+    let mut kept = Vec::new();
+    for entry in inventory.entries.drain(..) {
+        match fs::symlink_metadata(&entry.path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => report.missing.push(entry.path),
+            Err(e) => {
+                report.failed.push((entry.path.clone(), e));
+                kept.push(entry);
+            }
+            Ok(meta) if !meta.is_file() => {
+                report.refused.push(entry.path.clone());
+                kept.push(entry);
+            }
+            Ok(_) => match fs::remove_file(&entry.path) {
+                Ok(()) => report.removed.push(entry.path),
+                Err(e) => {
+                    report.failed.push((entry.path.clone(), e));
+                    kept.push(entry);
+                }
+            },
+        }
+    }
+    if kept.is_empty() {
+        match fs::remove_file(inventory_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_at(inventory_path)(e)),
+        }
+    } else {
+        inventory.entries = kept;
+        inventory.save(inventory_path)?;
+    }
+    Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::{Placement, Seed, plan};
+
+    fn setup() -> (tempfile::TempDir, PathBuf, Vec<Canary>) {
+        let dir = tempfile::tempdir().unwrap();
+        let share = dir.path().join("share");
+        fs::create_dir(&share).unwrap();
+        let canaries = plan(
+            &Seed::from_bytes([5; 32]),
+            &[Placement {
+                dir: share,
+                kinds: vec![Kind::Credentials, Kind::Finance],
+            }],
+        );
+        let inventory = dir.path().join("canaries.json");
+        (dir, inventory, canaries)
+    }
+
+    #[test]
+    fn plant_creates_the_files_and_inventories_them() {
+        let (_dir, inventory, canaries) = setup();
+        let report = plant(&canaries, &inventory).unwrap();
+        assert_eq!(report.planted.len(), 2);
+        for c in &canaries {
+            assert_eq!(fs::read_to_string(&c.path).unwrap(), c.content);
+        }
+        let saved = Inventory::load(&inventory).unwrap();
+        assert_eq!(saved.entries.len(), 2);
+        assert!(verify(&saved).is_empty());
+    }
+
+    #[test]
+    fn planting_twice_changes_nothing() {
+        let (_dir, inventory, canaries) = setup();
+        plant(&canaries, &inventory).unwrap();
+        let again = plant(&canaries, &inventory).unwrap();
+        assert!(again.planted.is_empty());
+        assert_eq!(again.unchanged.len(), 2);
+        assert_eq!(Inventory::load(&inventory).unwrap().entries.len(), 2);
+    }
+
+    #[test]
+    fn an_existing_file_is_never_overwritten_or_inventoried() {
+        let (_dir, inventory, canaries) = setup();
+        fs::write(&canaries[0].path, "the user's own file").unwrap();
+        let report = plant(&canaries, &inventory).unwrap();
+        assert_eq!(report.planted.len(), 1);
+        assert_eq!(
+            report.skipped,
+            vec![(canaries[0].path.clone(), Skipped::Occupied)]
+        );
+        assert_eq!(
+            fs::read_to_string(&canaries[0].path).unwrap(),
+            "the user's own file"
+        );
+        let saved = Inventory::load(&inventory).unwrap();
+        assert!(saved.entries.iter().all(|e| e.path != canaries[0].path));
+        // And removing must not delete the user's file.
+        remove(&inventory).unwrap();
+        assert!(canaries[0].path.exists());
+    }
+
+    #[test]
+    fn a_missing_directory_is_skipped_not_created() {
+        let (dir, inventory, _) = setup();
+        let gone = dir.path().join("not-there");
+        let canaries = plan(
+            &Seed::from_bytes([6; 32]),
+            &[Placement {
+                dir: gone.clone(),
+                kinds: vec![Kind::Notes],
+            }],
+        );
+        let report = plant(&canaries, &inventory).unwrap();
+        assert_eq!(report.skipped[0].1, Skipped::NoDirectory);
+        assert!(!gone.exists());
+    }
+
+    #[test]
+    fn remove_deletes_every_canary_and_the_inventory() {
+        let (_dir, inventory, canaries) = setup();
+        plant(&canaries, &inventory).unwrap();
+        let report = remove(&inventory).unwrap();
+        assert_eq!(report.removed.len(), 2);
+        assert!(report.is_clean());
+        assert!(canaries.iter().all(|c| !c.path.exists()));
+        assert!(!inventory.exists(), "no residue: the inventory goes too");
+    }
+
+    #[test]
+    fn a_modified_canary_is_reported_by_verify_and_still_removed() {
+        let (_dir, inventory, canaries) = setup();
+        plant(&canaries, &inventory).unwrap();
+        fs::write(&canaries[0].path, "encrypted by an attacker").unwrap();
+        fs::remove_file(&canaries[1].path).unwrap();
+        let drift = verify(&Inventory::load(&inventory).unwrap());
+        assert_eq!(
+            drift,
+            vec![
+                Drift {
+                    path: canaries[0].path.clone(),
+                    kind: DriftKind::Modified
+                },
+                Drift {
+                    path: canaries[1].path.clone(),
+                    kind: DriftKind::Missing
+                },
+            ]
+        );
+        let report = remove(&inventory).unwrap();
+        assert_eq!(report.removed, vec![canaries[0].path.clone()]);
+        assert_eq!(report.missing, vec![canaries[1].path.clone()]);
+        assert!(report.is_clean());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_canary_replaced_by_a_symlink_is_refused_not_followed() {
+        let (dir, inventory, canaries) = setup();
+        plant(&canaries, &inventory).unwrap();
+        let precious = dir.path().join("precious");
+        fs::write(&precious, "keep me").unwrap();
+        fs::remove_file(&canaries[0].path).unwrap();
+        std::os::unix::fs::symlink(&precious, &canaries[0].path).unwrap();
+
+        let report = remove(&inventory).unwrap();
+
+        assert_eq!(report.refused, vec![canaries[0].path.clone()]);
+        assert!(!report.is_clean());
+        assert_eq!(fs::read_to_string(&precious).unwrap(), "keep me");
+        assert!(
+            inventory.exists(),
+            "the inventory keeps what was not removed"
+        );
+        assert_eq!(Inventory::load(&inventory).unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn a_corrupt_or_future_inventory_is_an_error_not_an_empty_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("canaries.json");
+        fs::write(&path, "not json").unwrap();
+        assert!(matches!(
+            Inventory::load(&path),
+            Err(DeceptionError::Corrupt { .. })
+        ));
+        fs::write(&path, r#"{"version": 99, "entries": []}"#).unwrap();
+        assert!(matches!(
+            Inventory::load(&path),
+            Err(DeceptionError::Corrupt { .. })
+        ));
+        assert!(
+            Inventory::load(&dir.path().join("absent.json"))
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+    }
+}

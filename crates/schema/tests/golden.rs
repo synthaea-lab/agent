@@ -15,13 +15,13 @@ use schema::{
     FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
     FileWriteEvent, GatekeeperVerdictEvent, HttpClientCount, HttpEvidence, HttpRequestEvent,
     HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent,
-    KernelModuleAction, KernelModuleEvent, ListenPortEvent, MemfdCreateEvent, MountEvent,
-    NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, POLICY_MECHANISM_SELINUX,
+    KernelModuleAction, KernelModuleEvent, LdapSearchEvent, ListenPortEvent, MemfdCreateEvent,
+    MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, POLICY_MECHANISM_SELINUX,
     PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
-    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, ShellType, SignalEvent,
-    SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, TccDecisionEvent,
-    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpSendEvent, User, WmiActivityEvent,
-    XpcConnectEvent,
+    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent, SessionState, ShellType,
+    SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent,
+    TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent,
+    User, WmiActivityEvent, XpcConnectEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -452,6 +452,32 @@ fn wmi_activity_golden() {
 }
 
 #[test]
+fn ldap_search_golden() {
+    assert_golden(
+        &Event::LdapSearch(LdapSearchEvent {
+            meta: EventMeta {
+                pid: 3740,
+                ppid: 0,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-1001".into(),
+                    integrity_level: Some(0x2000),
+                },
+                timestamp_ns: 1_759_396_502_000_000_000,
+                comm: "powershell.exe".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            filter: "(&(samAccountType=805306368)(servicePrincipalName=*))".into(),
+            base_dn: "DC=lab,DC=local".into(),
+            scope: 2,
+            attributes: vec!["sAMAccountName".into(), "servicePrincipalName".into()],
+        }),
+        "ldap_search",
+    );
+}
+
+#[test]
 fn defender_remediation_golden() {
     assert_golden(
         &Event::Defender(DefenderEvent {
@@ -704,6 +730,28 @@ fn udp_send_golden() {
 }
 
 #[test]
+fn udp_recv_golden() {
+    assert_golden(
+        &Event::UdpRecv(UdpRecvEvent {
+            meta: EventMeta {
+                pid: 4242,
+                ppid: 1337,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_090_000_000_000,
+                comm: "dnsd".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            peer_addr: "203.0.113.42".parse::<IpAddr>().unwrap(),
+            peer_port: 53,
+            size: 120,
+        }),
+        "udp_recv",
+    );
+}
+
+#[test]
 fn connect_v6_golden() {
     assert_golden(
         &Event::Connect(ConnectEvent {
@@ -871,6 +919,72 @@ fn auth_logon_golden() {
         }),
         "auth_logon",
     );
+}
+
+#[test]
+fn session_reconnect_golden() {
+    // An RDP client attached to a disconnected session (LocalSessionManager
+    // 25): the session number and the client's address are what the
+    // hijack rule compares across the disconnect and the reconnect.
+    assert_golden(
+        &Event::Session(SessionEvent {
+            meta: session_meta(),
+            state: SessionState::Reconnect,
+            session_id: Some(2),
+            target_user: r"LAB\alice".into(),
+            source_address: Some("198.51.100.40".parse::<IpAddr>().unwrap()),
+            console: false,
+        }),
+        "session_reconnect",
+    );
+}
+
+#[test]
+fn session_connect_golden() {
+    // RemoteConnectionManager 1149: before any session exists, so no
+    // `session_id` (absent, not null).
+    assert_golden(
+        &Event::Session(SessionEvent {
+            meta: session_meta(),
+            state: SessionState::Connect,
+            session_id: None,
+            target_user: r"LAB\alice".into(),
+            source_address: Some("198.51.100.40".parse::<IpAddr>().unwrap()),
+            console: false,
+        }),
+        "session_connect",
+    );
+}
+
+#[test]
+fn session_console_logoff_golden() {
+    // A logoff names no client: `console` false and no address, which is
+    // not the same as the console (`Address` = `LOCAL` on a 21/24/25).
+    assert_golden(
+        &Event::Session(SessionEvent {
+            meta: session_meta(),
+            state: SessionState::Logoff,
+            session_id: Some(1),
+            target_user: r"LAB\alice".into(),
+            source_address: None,
+            console: false,
+        }),
+        "session_logoff",
+    );
+}
+
+/// The reporting service, not an actor: Terminal Services' svchost pid.
+fn session_meta() -> EventMeta {
+    EventMeta {
+        pid: 2312,
+        ppid: 0,
+        user: User::Unknown,
+        timestamp_ns: 1_759_600_000_000_000_000,
+        comm: String::new(),
+        container: None,
+        process_generation: None,
+        parent_process_generation: None,
+    }
 }
 
 #[test]
@@ -1653,7 +1767,7 @@ fn namespace_golden() {
 
 #[test]
 fn bits_job_golden() {
-    // v40 (#284): `bitsadmin /transfer` adding a file to a BITS job. The
+    // v42 (#284): `bitsadmin /transfer` adding a file to a BITS job. The
     // service does the download; this record names the client that asked.
     assert_golden(
         &Event::BitsJob(BitsJobEvent {
@@ -1684,7 +1798,7 @@ fn bits_job_golden() {
 
 #[test]
 fn bits_job_transfer_error_golden() {
-    // v40 (#284): the same job failing mid-transfer, reported by the BITS
+    // v42 (#284): the same job failing mid-transfer, reported by the BITS
     // service and attributed to the client that added the file.
     assert_golden(
         &Event::BitsJob(BitsJobEvent {
@@ -1994,6 +2108,13 @@ fn meta_accessor_covers_all_variants() {
             query: None,
             method: None,
         }),
+        Event::LdapSearch(LdapSearchEvent {
+            meta: meta.clone(),
+            filter: String::new(),
+            base_dn: String::new(),
+            scope: 0,
+            attributes: Vec::new(),
+        }),
         Event::Defender(DefenderEvent {
             meta: meta.clone(),
             kind: DefenderEventKind::ProtectionDisabled,
@@ -2036,6 +2157,12 @@ fn meta_accessor_covers_all_variants() {
             dport: 53,
             size: 0,
         }),
+        Event::UdpRecv(UdpRecvEvent {
+            meta: meta.clone(),
+            peer_addr: "10.0.0.1".parse::<IpAddr>().unwrap(),
+            peer_port: 53,
+            size: 0,
+        }),
         Event::Auth(AuthEvent {
             meta: meta.clone(),
             outcome: AuthOutcome::Success,
@@ -2044,6 +2171,14 @@ fn meta_accessor_covers_all_variants() {
             target_user_sid: None,
             source_address: None,
             status_code: None,
+        }),
+        Event::Session(SessionEvent {
+            meta: meta.clone(),
+            state: SessionState::Logon,
+            session_id: None,
+            target_user: String::new(),
+            source_address: None,
+            console: false,
         }),
         Event::ListenPort(ListenPortEvent {
             meta: meta.clone(),

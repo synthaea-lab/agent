@@ -46,6 +46,8 @@ jobs:
         run: python3 tools/attack-coverage.py --check
       - name: PowerShell scripts ASCII-only
         run: python3 tools/check-ps1-ascii.py
+      - name: shell scripts with a shebang are executable in git
+        run: python3 tools/check-exec-bits.py
       - name: docs build clean
         run: cargo doc --workspace --exclude sensor-linux-ebpf --no-deps
         env:
