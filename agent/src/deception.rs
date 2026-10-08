@@ -221,6 +221,14 @@ pub(crate) fn start_with_decoys(
     let canaries = deception::plan(&seed, &placements);
     let present = plant_each_directory(&canaries, &inventory);
     let decoys = decoy_hashes_on_disk(&canaries, &present);
+    if canaries_hold_no_decoy(present.len(), decoys.len()) {
+        tracing::warn!(
+            canaries = present.len(),
+            "deception: canaries are in place but none holds a decoy token (planted by an \
+             earlier build): no decoy is registered, so a stolen decoy will not raise an alarm \
+             on this host; remove the canaries and restart to plant them again"
+        );
+    }
     match Inventory::load(&inventory) {
         Ok(inventory) => (
             Some(Tripwires::from_inventory(&inventory)).filter(|t| !t.is_empty()),
@@ -231,6 +239,14 @@ pub(crate) fn start_with_decoys(
             (None, decoys)
         }
     }
+}
+
+/// Whether canaries exist on this host but none carries a decoy token: the state of a host
+/// upgraded from a build that planted canaries without one, where the tripwires watch but the
+/// decoy-credential alarm cannot fire. The files keep their old content, so nothing else
+/// tells the operator why.
+fn canaries_hold_no_decoy(present: usize, decoys: usize) -> bool {
+    present > 0 && decoys == 0
 }
 
 /// SHA-256 of every decoy token that is in the files of `present` (the canaries `plant` wrote
@@ -868,6 +884,19 @@ mod tests {
         assert!(
             hashes.is_empty(),
             "the plan's tokens are in no file: {hashes:?}"
+        );
+    }
+
+    #[test]
+    fn an_upgraded_host_with_canaries_but_no_decoy_line_is_flagged() {
+        assert!(canaries_hold_no_decoy(4, 0));
+        assert!(
+            !canaries_hold_no_decoy(4, 2),
+            "a host that registers decoys is fine"
+        );
+        assert!(
+            !canaries_hold_no_decoy(0, 0),
+            "nothing planted is another message"
         );
     }
 
