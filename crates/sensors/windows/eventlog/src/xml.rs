@@ -459,19 +459,17 @@ pub fn parse_account_created_block(block: &str) -> Option<AccountCreatedEvent> {
     })
 }
 
-/// One `Microsoft-Windows-AppLocker/EXE and DLL` event: **8004** (an image
-/// was refused — deny rule matched, or no allow rule in an allowlist policy)
-/// or **8003** (audit-only mode: it *would* have been refused, #427).
-/// `AppLocker`'s channel emits these as `<UserData>` / `<RuleAndFileData>`
-/// rather than the `<EventData><Data Name=...>` shape the Security channel
-/// uses, so this parser reads the raw child elements directly.
+/// One `AppLocker` policy-decision event. EXE/DLL and MSI/Script use `FilePath`;
+/// packaged-app channels use `Package` instead. `AppLocker` emits these as
+/// `<UserData>` / `<RuleAndFileData>` rather than the
+/// `<EventData><Data Name=...>` shape the Security channel uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppLockerEvent {
     pub record_id: u64,
-    /// `System/EventID`: 8004 (blocked) or 8003 (audit mode). 0 if missing.
+    /// `System/EventID`, one of the channel's audited or enforced decision ids.
     pub event_id: u32,
-    /// Which rule collection matched (`RuleAndFileData/PolicyName`): `EXE`
-    /// for executables, `DLL` for libraries — the channel carries both.
+    /// Collection or policy name from `RuleAndFileData/PolicyName` (for
+    /// example `EXE`, `DLL`, `MSI`, `SCRIPT`, or a packaged-app identity).
     /// Empty if missing.
     pub policy_name: String,
     /// SID of the user whose execution was refused
@@ -479,9 +477,8 @@ pub struct AppLockerEvent {
     /// `System/Security/@UserID`, which names the account the event was
     /// *logged* under; the two matched in the only real capture so far (#427).
     pub target_user: Option<String>,
-    /// PID of the process that tried to launch the image
-    /// (`<Execution ProcessID='...'>`). 0 if missing. Checked in the lab
-    /// (#529): for both 8003 and 8004 it equals the launching shell's `$PID`.
+    /// PID from `<Execution ProcessID='...'>`. 0 if missing. Checked in the
+    /// lab (#529) for 8003 and 8004; the other channels have not been lab-tested.
     pub pid: u32,
     /// PID of the process being *created* for the image
     /// (`RuleAndFileData/TargetProcessId`), not its launcher. Checked in the
@@ -489,9 +486,9 @@ pub struct AppLockerEvent {
     /// (`Start-Process -PassThru` reported the same id); on an 8004 the pid
     /// was allocated but the process never ran. 0 if missing.
     pub target_process_id: u32,
-    /// Path of the image as `AppLocker` reports it (`RuleAndFileData/FilePath`),
-    /// path variables and upper case included — see [`expand_applocker_path`].
-    /// Empty if missing.
+    /// Affected object from `RuleAndFileData/FilePath`, or the `Package`
+    /// identity used by packaged-app events. File paths retain variables and
+    /// case — see [`expand_applocker_path`]. Empty if no identity is present.
     pub file_path: String,
     /// `RuleAndFileData/FullFilePath`: the image's real path, original case,
     /// no path variable (e.g. `C:\Users\Public\test8003.exe`). Present in
@@ -501,44 +498,46 @@ pub struct AppLockerEvent {
     pub full_file_path: Option<String>,
 }
 
-/// Parses one 8003/8004 `<Event>` block. `None` if the block is missing
-/// `EventRecordID` (a genuinely different event matched the `XPath` filter, or
-/// a `wevtutil` output shape change — skip rather than guess, same convention
-/// as the other parsers in this module).
+/// Parses one `AppLocker` policy-decision `<Event>` block. `None` if the block
+/// is missing `EventRecordID` (a genuinely different event matched the `XPath`
+/// filter, or a `wevtutil` output shape change — skip rather than guess, same
+/// convention as the other parsers in this module).
 #[must_use]
 pub fn parse_applocker_event(block: &str) -> Option<AppLockerEvent> {
-    let record_id = extract_between(block, "<EventRecordID>", "</EventRecordID>")?
-        .parse()
-        .ok()?;
-    let event_id = extract_between(block, "<EventID>", "</EventID>")
+    let record_id = element_text(block, "EventRecordID")?.parse().ok()?;
+    let event_id = element_text(block, "EventID")
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
-    let policy_name = extract_between(block, "<PolicyName>", "</PolicyName>")
+    let policy_name = event_field(block, "PolicyName")
         .map(str::trim)
         .unwrap_or("")
         .to_string();
-    let target_user = extract_between(block, "<TargetUser>", "</TargetUser>")
+    let target_user = event_field(block, "TargetUser")
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     // `AppLocker`'s payload lives in <UserData><RuleAndFileData>: children are
     // *plain* elements (`<FilePath>...</FilePath>`), not `<Data Name='...'>`
     // like on the Security channel.
-    let pid = extract_between(block, "ProcessID='", "'")
+    let pid = attribute_value(block, "ProcessID")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let target_process_id = extract_between(block, "<TargetProcessId>", "</TargetProcessId>")
+    let target_process_id = event_field(block, "TargetProcessId")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     // Unescaped like `FullFilePath`: the fallback path would otherwise keep
     // `&amp;` for a directory containing `&`.
-    let file_path = extract_between(block, "<FilePath>", "</FilePath>")
+    let file_path = event_field(block, "FilePath")
+        // Packaged app events carry the package identity in place of a file
+        // path. It is still the policy's affected object and fits the existing
+        // PolicyDenial object_path field without a schema change.
+        .or_else(|| event_field(block, "Package"))
         .map(str::trim)
         .map(unescape_xml_entities)
         .unwrap_or_default();
     // `<FullFilePath>` cannot be mistaken for `<FilePath>`: the marker
     // includes the opening `<`, so the two never overlap.
-    let full_file_path = extract_between(block, "<FullFilePath>", "</FullFilePath>")
+    let full_file_path = event_field(block, "FullFilePath")
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(unescape_xml_entities);
@@ -552,6 +551,114 @@ pub fn parse_applocker_event(block: &str) -> Option<AppLockerEvent> {
         file_path,
         full_file_path,
     })
+}
+
+/// Reads an element's text without depending on whether the serializer added
+/// attributes to its opening tag (for example, `EventID Qualifiers='16384'`).
+/// Namespaces are ignored because Event Log's XML uses a default namespace.
+fn element_text<'a>(block: &'a str, name: &str) -> Option<&'a str> {
+    let mut search_from = 0;
+    while let Some(relative) = block.get(search_from..)?.find('<') {
+        let start = search_from + relative + 1;
+        let rest = block.get(start..)?;
+        if rest.starts_with('/') || rest.starts_with('!') || rest.starts_with('?') {
+            search_from = start + 1;
+            continue;
+        }
+        let name_end = rest.find([' ', '\t', '\r', '\n', '/', '>'])?;
+        if rest[..name_end]
+            .rsplit(':')
+            .next()?
+            .eq_ignore_ascii_case(name)
+        {
+            let open_end = rest.find('>')?;
+            let value_start = start + open_end + 1;
+            let close = format!("</{}", &rest[..name_end]);
+            let value_end = block.get(value_start..)?.find(&close)? + value_start;
+            if block.get(value_end..)?.starts_with(&close) {
+                return block.get(value_start..value_end);
+            }
+        }
+        search_from = start + name_end + 1;
+    }
+    None
+}
+
+/// Reads a named event field in either `AppLocker`'s `<UserData>` shape or the
+/// `EventData` `<Data Name='...'>value</Data>` shape. Field-name matching is
+/// case-insensitive; the channel name is deliberately not consulted because
+/// localized Event Viewer labels are not stable identifiers.
+fn event_field<'a>(block: &'a str, name: &str) -> Option<&'a str> {
+    let mut search_from = 0;
+    while let Some(relative) = block.get(search_from..)?.find('<') {
+        let start = search_from + relative + 1;
+        let rest = block.get(start..)?;
+        if rest.starts_with('/') || rest.starts_with('!') || rest.starts_with('?') {
+            search_from = start + 1;
+            continue;
+        }
+        let name_end = rest.find([' ', '\t', '\r', '\n', '/', '>'])?;
+        let element_name = rest[..name_end].rsplit(':').next()?;
+        let open_end = rest.find('>')?;
+        if element_name.eq_ignore_ascii_case("Data") {
+            let open = &rest[..open_end];
+            if attribute_value(open, "Name").is_some_and(|field| field.eq_ignore_ascii_case(name)) {
+                let value_start = start + open_end + 1;
+                let value_end = block.get(value_start..)?.find("</Data>")? + value_start;
+                return block.get(value_start..value_end);
+            }
+        } else if element_name.eq_ignore_ascii_case(name) {
+            let value_start = start + open_end + 1;
+            let close = format!("</{}", &rest[..name_end]);
+            let value_end = block.get(value_start..)?.find(&close)? + value_start;
+            return block.get(value_start..value_end);
+        }
+        search_from = start + name_end + 1;
+    }
+    None
+}
+
+/// Finds an XML attribute by name without requiring a particular quote style.
+fn attribute_value<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        while at < bytes.len() && !bytes[at].is_ascii_alphabetic() {
+            at += 1;
+        }
+        let key_start = at;
+        while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_') {
+            at += 1;
+        }
+        if key_start == at {
+            continue;
+        }
+        let key = text.get(key_start..at)?;
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        if at >= bytes.len() || bytes[at] != b'=' {
+            continue;
+        }
+        at += 1;
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        if at >= bytes.len() || (bytes[at] != b'\'' && bytes[at] != b'"') {
+            continue;
+        }
+        let quote = bytes[at];
+        at += 1;
+        let value_start = at;
+        while at < bytes.len() && bytes[at] != quote {
+            at += 1;
+        }
+        if key.eq_ignore_ascii_case(name) {
+            return text.get(value_start..at);
+        }
+        at += usize::from(at < bytes.len());
+    }
+    None
 }
 
 /// `<Data Name='name'>value</Data>` of an `<EventData>` block: trimmed, XML
