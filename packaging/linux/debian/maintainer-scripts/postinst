@@ -1,0 +1,68 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # The whole block is guarded on systemd actually being there, not just
+        # `systemd-sysusers`/`systemd-tmpfiles` (old-dov, #738 review, round 2):
+        # this package declares no dependency on systemd, and nothing past that
+        # guard is safe to run without it anyway — the chown below needs the
+        # `synthaea` user sysusers would have just created, and the unit it
+        # starts does not exist. A debian:12 container, or a chroot used to
+        # build an image, now unpacks the files and stops there instead of
+        # aborting `dpkg -i` partway through (confirmed: skipping only the two
+        # systemd-* calls still left `chown` failing on "invalid user", since
+        # sysusers never ran to create it). This comment must never spell out
+        # the literal token placed near the end of this file, verbatim, a
+        # second time — see the paragraph right above that token for why
+        # (old-dov caught the exact mistake here on #738's round 2, live:
+        # a syntax error from the corruption it causes).
+        if [ -d /run/systemd/system ]; then
+            # Strict order, each step depending on the one before (#675 live
+            # install hit both failures in turn): the user/group must exist
+            # before anything is chowned to it, and /var/log/synthaea and
+            # /var/lib/synthaea itself are created by tmpfiles
+            # (synthaea.conf), not by this package's data.tar — chowning them
+            # before this runs fails with "No such file or directory", not a
+            # permissions error. Not `|| true`: a real failure here must stop
+            # the install.
+            systemd-sysusers synthaea.conf
+            systemd-tmpfiles --create synthaea.conf
+
+            # Create initial 'current' symlink if doesn't exist
+            if [ ! -e /var/lib/synthaea/current ]; then
+                ln -s bootstrap /var/lib/synthaea/current
+            fi
+
+            # Create version directory for updater
+            mkdir -p /var/lib/synthaea/versions
+
+            # Set ownership (tmpfiles already owns the dirs themselves; this
+            # covers the bootstrap/ files unpacked by dpkg as root, and
+            # versions/ just created above).
+            chown -R synthaea:synthaea /var/lib/synthaea /var/log/synthaea
+
+            # Create CLI symlink
+            ln -sf /var/lib/synthaea/current/cli /usr/bin/synthaea-ctl
+
+            # The shipped config starts and runs (offline_fallback = true,
+            # #675), so systemctl status alone does not tell an operator it
+            # is still on every # CHANGE ME placeholder and reporting
+            # nowhere (old-dov, #738 review).
+            echo "synthaea-agent: edit /etc/synthaea/agent.toml, then: systemctl restart synthaea-agent"
+        else
+            echo "synthaea-agent: no systemd detected, leaving the package unpacked but not configured (no user/service)."
+        fi
+        ;;
+esac
+
+# cargo-deb requires this exact token, verbatim and present exactly once —
+# it refuses to build without it when `[package.metadata.deb.systemd-units]`
+# is configured (confirmed live, #675) — and replaces it textually with the
+# deb-systemd-helper enable/start snippet its own `systemd-units` config
+# generates, so a second occurrence anywhere in this file (even inside a
+# comment explaining this token by name) gets replaced too, splitting that
+# comment around injected shell code. Never spell this token a second time
+# in this file, in a comment or otherwise.
+#DEBHELPER#
+exit 0
