@@ -80,6 +80,13 @@ impl ExecImages {
         }
     }
 
+    #[cfg(test)]
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            seen: store::BoundedMap::new(cap),
+        }
+    }
+
     /// Records the image a process executed.
     pub(crate) fn record(&mut self, exec: &schema::ExecEvent) {
         self.seen.insert(
@@ -94,9 +101,11 @@ impl ExecImages {
 
     /// The image `pid` was seen to execute, if it was and the entry is of this incarnation:
     /// both stamped and equal. An unstamped side is not enough to tell a recycled pid, so it
-    /// is not trusted (the caller falls back to `/proc`).
-    pub(crate) fn image_of(&self, pid: u32, generation: Option<u64>) -> Option<ExecImage> {
-        let seen = self.seen.peek(&pid)?;
+    /// is not trusted (the caller falls back to `/proc`). A lookup refreshes the entry's
+    /// recency: an allowed process that keeps touching canaries must not be evicted by the
+    /// execs of everything else, which would make it look unknown again.
+    pub(crate) fn image_of(&mut self, pid: u32, generation: Option<u64>) -> Option<ExecImage> {
+        let seen = self.seen.get(&pid)?;
         match (seen.generation, generation) {
             (Some(a), Some(b)) if a == b => Some(seen.clone()),
             _ => None,
@@ -148,7 +157,19 @@ impl CanaryAllow {
             }
             if trusted && canonical.to_str().is_some_and(|p| !p.is_empty()) {
                 exes.push(canonical);
-                as_written.push(written.clone());
+                // The name an exec is reported under is matched as text, so it must sit in a
+                // trusted location itself: a user-writable link (`/tmp/tools/updatedb` to
+                // `/usr/bin/updatedb`) passes the canonical check, and whoever can repoint it
+                // would be allowed. Without it only the resolved path matches.
+                if policy::name_exclusion_applies(written.to_str()) {
+                    as_written.push(written.clone());
+                } else {
+                    tracing::warn!(
+                        exe = %written.display(),
+                        "deception: allow_exe entry resolves to a trusted location but its own \
+                         path is not in one; an exec through that name is not matched"
+                    );
+                }
             }
         }
         Self {
@@ -175,10 +196,21 @@ impl CanaryAllow {
         if self.exes.is_empty() {
             return false;
         }
-        if let Some(image) = seen {
-            return !image.in_container && self.matches_image(&image.path);
+        let now = (self.resolve)(pid);
+        match seen {
+            // The table is the image of the last `Exec` the agent recorded for this incarnation.
+            // The generation is stamped at fork, not at exec, so it cannot tell that the process
+            // exec'd again and that event was shed or arrived late. `/proc`, where the agent can
+            // read it, shows the image now: if it names something else the entry is stale and
+            // the process is not allowed. Where `/proc` says nothing (no ptrace access, another
+            // mount namespace) the table decides alone, and that residue is documented.
+            Some(image) => {
+                !image.in_container
+                    && self.matches_image(&image.path)
+                    && now.is_none_or(|exe| self.exes.contains(&exe))
+            }
+            None => now.is_some_and(|exe| self.exes.contains(&exe)),
         }
-        (self.resolve)(pid).is_some_and(|exe| self.exes.contains(&exe))
     }
 
     /// An absolute image equal to an entry, resolved or as written. A relative exec
@@ -752,18 +784,77 @@ mod tests {
 
     #[test]
     fn a_process_whose_exec_was_seen_is_allowed_without_reading_proc() {
-        let seen = images(&[exec_of(10, Some(1), "/usr/bin/updatedb", false)]);
+        let mut seen = images(&[exec_of(10, Some(1), "/usr/bin/updatedb", false)]);
         assert!(table_only("/usr/bin/updatedb").allows(10, seen.image_of(10, Some(1)).as_ref()));
     }
 
     #[test]
     fn the_exec_table_overrides_what_proc_would_say() {
-        let seen = images(&[exec_of(10, Some(1), "/tmp/encryptor", false)]);
+        let mut seen = images(&[exec_of(10, Some(1), "/tmp/encryptor", false)]);
         let allow =
             CanaryAllow::for_test("/usr/bin/updatedb", |_| Some("/usr/bin/updatedb".into()));
         assert!(
             !allow.allows(10, seen.image_of(10, Some(1)).as_ref()),
             "the image the agent saw wins"
+        );
+    }
+
+    #[test]
+    fn a_seen_exec_is_not_trusted_when_proc_shows_the_process_runs_something_else() {
+        // The process exec'd an allowed binary, then exec'd `/tmp/payload` and that second
+        // event never reached the table: `/proc` is the only witness of the change.
+        let mut seen = images(&[exec_of(10, Some(1), "/usr/bin/updatedb", false)]);
+        let allow = CanaryAllow::for_test("/usr/bin/updatedb", |_| Some("/tmp/payload".into()));
+        assert!(!allow.allows(10, seen.image_of(10, Some(1)).as_ref()));
+    }
+
+    #[test]
+    fn a_seen_exec_is_allowed_when_proc_agrees_with_it() {
+        let mut seen = images(&[exec_of(10, Some(1), "/usr/bin/updatedb", false)]);
+        let allow =
+            CanaryAllow::for_test("/usr/bin/updatedb", |_| Some("/usr/bin/updatedb".into()));
+        assert!(allow.allows(10, seen.image_of(10, Some(1)).as_ref()));
+    }
+
+    #[test]
+    fn an_entry_that_is_read_again_survives_the_eviction_of_newer_ones() {
+        let mut seen = ExecImages::with_capacity(3);
+        seen.record(&exec_of(1, Some(1), "/usr/bin/updatedb", false));
+        seen.record(&exec_of(2, Some(1), "/usr/bin/a", false));
+        seen.record(&exec_of(3, Some(1), "/usr/bin/b", false));
+        assert!(seen.image_of(1, Some(1)).is_some(), "read: now the newest");
+        seen.record(&exec_of(4, Some(1), "/usr/bin/c", false));
+        assert!(
+            seen.image_of(1, Some(1)).is_some(),
+            "pid 2 was the oldest and went, not the one read since"
+        );
+        assert!(seen.image_of(2, Some(1)).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exec_through_a_link_outside_a_trusted_location_is_not_matched_by_its_name() {
+        // `/usr/bin/ls` stands for a real binary in a trusted location; the link to it lives in
+        // a temporary directory, which is not one.
+        let target = Path::new("/usr/bin/ls");
+        if !target.exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("updatedb");
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        let mut config = config_for(&[]);
+        config.allow_exe = vec![link.clone()];
+        let allow = CanaryAllow::with_resolver(&config, |_| None);
+        let mut seen = images(&[exec_of(10, Some(1), &link.to_string_lossy(), false)]);
+        assert!(
+            !allow.allows(10, seen.image_of(10, Some(1)).as_ref()),
+            "the link's own name is user-writable, so it cannot vouch for the process"
+        );
+        let mut by_target = images(&[exec_of(11, Some(1), "/usr/bin/ls", false)]);
+        assert!(
+            allow.allows(11, by_target.image_of(11, Some(1)).as_ref()),
+            "the resolved path still matches"
         );
     }
 
@@ -809,26 +900,26 @@ mod tests {
 
     #[test]
     fn a_recycled_pid_is_not_taken_for_the_process_that_was_seen() {
-        let seen = images(&[exec_of(10, Some(1), "/usr/bin/updatedb", false)]);
+        let mut seen = images(&[exec_of(10, Some(1), "/usr/bin/updatedb", false)]);
         // Another incarnation of pid 10: the entry is not its, and /proc says nothing.
         assert!(!table_only("/usr/bin/updatedb").allows(10, seen.image_of(10, Some(2)).as_ref()));
     }
 
     #[test]
     fn an_unstamped_process_is_not_trusted_from_the_table() {
-        let seen = images(&[exec_of(10, None, "/usr/bin/updatedb", false)]);
+        let mut seen = images(&[exec_of(10, None, "/usr/bin/updatedb", false)]);
         assert!(!table_only("/usr/bin/updatedb").allows(10, seen.image_of(10, None).as_ref()));
     }
 
     #[test]
     fn a_process_in_a_container_is_not_allowed_even_with_an_allowed_image() {
-        let seen = images(&[exec_of(10, Some(1), "/usr/bin/updatedb", true)]);
+        let mut seen = images(&[exec_of(10, Some(1), "/usr/bin/updatedb", true)]);
         assert!(!table_only("/usr/bin/updatedb").allows(10, seen.image_of(10, Some(1)).as_ref()));
     }
 
     #[test]
     fn a_relative_exec_never_matches() {
-        let seen = images(&[exec_of(10, Some(1), "./updatedb", false)]);
+        let mut seen = images(&[exec_of(10, Some(1), "./updatedb", false)]);
         assert!(!table_only("./updatedb").allows(10, seen.image_of(10, Some(1)).as_ref()));
     }
 
@@ -849,7 +940,7 @@ mod tests {
                 as_written: vec![link],
                 resolve: |_| None,
             };
-            let seen = images(&[exec_of(10, Some(1), &as_exec, false)]);
+            let mut seen = images(&[exec_of(10, Some(1), &as_exec, false)]);
             assert!(allow.allows(10, seen.image_of(10, Some(1)).as_ref()));
         }
     }
