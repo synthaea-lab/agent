@@ -3,44 +3,53 @@ set -e
 
 case "$1" in
     configure)
-        # Strict order, each step depending on the one before (#675 live install
-        # hit both failures in turn): the user/group must exist before anything
-        # is chowned to it, and /var/log/synthaea and /var/lib/synthaea itself
-        # are created by tmpfiles (synthaea.conf), not by this package's data.tar
-        # — chown-ing them before this runs fails with "No such file or
-        # directory", not a permissions error.
-        # Guarded, not `|| true`: a real failure here must still stop the
-        # install (that is the whole point of dropping `|| true`, #675 review),
-        # but this package declares no dependency on systemd, so a host that
-        # genuinely has none — a debian:12 container, a chroot used to build an
-        # image — must not abort `dpkg -i` on "command not found" either
-        # (old-dov, #738 review).
+        # The whole block is guarded on systemd actually being there, not just
+        # `systemd-sysusers`/`systemd-tmpfiles` (old-dov, #738 review, round 2):
+        # this package declares no dependency on systemd, and nothing past that
+        # guard is safe to run without it anyway — the chown below needs the
+        # `synthaea` user sysusers would have just created, the unit it starts
+        # does not exist, and `cargo-deb`'s own injected snippet (below
+        # `#DEBHELPER#`) already skips itself the same way. A debian:12
+        # container, or a chroot used to build an image, now unpacks the
+        # files and stops there instead of aborting `dpkg -i` partway through
+        # (confirmed: skipping only the two systemd-* calls still left `chown`
+        # failing on "invalid user", since sysusers never ran to create it).
         if [ -d /run/systemd/system ]; then
+            # Strict order, each step depending on the one before (#675 live
+            # install hit both failures in turn): the user/group must exist
+            # before anything is chowned to it, and /var/log/synthaea and
+            # /var/lib/synthaea itself are created by tmpfiles
+            # (synthaea.conf), not by this package's data.tar — chowning them
+            # before this runs fails with "No such file or directory", not a
+            # permissions error. Not `|| true`: a real failure here must stop
+            # the install.
             systemd-sysusers synthaea.conf
             systemd-tmpfiles --create synthaea.conf
+
+            # Create initial 'current' symlink if doesn't exist
+            if [ ! -e /var/lib/synthaea/current ]; then
+                ln -s bootstrap /var/lib/synthaea/current
+            fi
+
+            # Create version directory for updater
+            mkdir -p /var/lib/synthaea/versions
+
+            # Set ownership (tmpfiles already owns the dirs themselves; this
+            # covers the bootstrap/ files unpacked by dpkg as root, and
+            # versions/ just created above).
+            chown -R synthaea:synthaea /var/lib/synthaea /var/log/synthaea
+
+            # Create CLI symlink
+            ln -sf /var/lib/synthaea/current/cli /usr/bin/synthaea-ctl
+
+            # The shipped config starts and runs (offline_fallback = true,
+            # #675), so systemctl status alone does not tell an operator it
+            # is still on every # CHANGE ME placeholder and reporting
+            # nowhere (old-dov, #738 review).
+            echo "synthaea-agent: edit /etc/synthaea/agent.toml, then: systemctl restart synthaea-agent"
+        else
+            echo "synthaea-agent: no systemd detected, leaving the package unpacked but not configured (no user/service)."
         fi
-
-        # Create initial 'current' symlink if doesn't exist
-        if [ ! -e /var/lib/synthaea/current ]; then
-            ln -s bootstrap /var/lib/synthaea/current
-        fi
-
-        # Create version directory for updater
-        mkdir -p /var/lib/synthaea/versions
-
-        # Set ownership (tmpfiles already owns the dirs themselves; this covers
-        # the bootstrap/ files unpacked by dpkg as root, and versions/ just
-        # created above).
-        chown -R synthaea:synthaea /var/lib/synthaea /var/log/synthaea
-
-        # Create CLI symlink
-        ln -sf /var/lib/synthaea/current/cli /usr/bin/synthaea-ctl
-
-        # The shipped config starts and runs (offline_fallback = true, #675),
-        # so systemctl status alone does not tell an operator it is still on
-        # every # CHANGE ME placeholder and reporting nowhere (old-dov, #738
-        # review).
-        echo "synthaea-agent: edit /etc/synthaea/agent.toml, then: systemctl restart synthaea-agent"
         ;;
 esac
 
