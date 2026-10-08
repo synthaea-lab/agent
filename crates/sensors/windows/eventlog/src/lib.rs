@@ -110,15 +110,15 @@
 //! techniques even on a host where the audit subcategory for 4698 was left
 //! disabled:
 //!
-//! - **`AppLocker` EXE/DLL verdicts** (`Microsoft-Windows-AppLocker/EXE and DLL`
-//!   channel, events **8004** and **8003**): an executable or DLL was refused
-//!   by `AppLocker` policy (8004), or would have been in audit mode (8003).
-//!   Reported as `schema::PolicyDenialEvent` with
-//!   `schema::POLICY_MECHANISM_APPLOCKER` (#427) — `enforced` tells the two
-//!   apart, `object_path` carries the expanded image path. A defensive
-//!   signal, not a persistence artifact. **Volume:** audit mode is where
-//!   broad rules get trialled, and an audited DLL collection logs one 8003
-//!   per non-allowed load, so expect bursts there. The whole channel is gated
+//! - **`AppLocker` policy decisions** (EXE/DLL **8003/8004**, MSI/Script
+//!   **8006/8007**, Packaged app-Execution **8021/8022**, and Packaged
+//!   app-Deployment **8024/8025**): audit and enforced policy decisions are
+//!   reported as the existing `schema::PolicyDenialEvent` with
+//!   `schema::POLICY_MECHANISM_APPLOCKER` (#427). `enforced` distinguishes the
+//!   modes; `object_path` carries a file path or, for packaged apps, the package
+//!   identity. Deployment decisions use action `install`. Allowed events are
+//!   filtered out. A defensive signal, not a persistence artifact. **Volume:**
+//!   not measured by channel yet. The targets are gated
 //!   by `EventLogConfig::applocker_blocks_enabled`, which the agent currently
 //!   sets to `true` unconditionally (no `agent.toml` switch yet).
 //! - **Microsoft Defender Operational** (`Microsoft-Windows-Windows Defender/Operational`,
