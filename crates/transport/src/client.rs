@@ -1,5 +1,7 @@
 //! HTTP client with mTLS support.
 
+use std::io::Read;
+
 use schema::{Event, detection::Detection};
 use serde::Serialize;
 
@@ -173,10 +175,7 @@ impl TransportClient {
             request = request.header("Idempotency-Key", key);
         }
         let response = request.send(&body).map_err(|e| match &e {
-            ureq::Error::StatusCode(status) => TransportError::ServerError {
-                status: *status,
-                message: e.to_string(),
-            },
+            ureq::Error::StatusCode(status) => server_error(*status, e.to_string()),
             _ => TransportError::Network(e.to_string()),
         })?;
 
@@ -217,16 +216,36 @@ fn send_get(
     if status < 400 {
         return Ok(response);
     }
-    let text = response
-        .into_body()
-        .with_config()
-        .limit(ERROR_BODY_LIMIT)
-        .read_to_string()
-        .unwrap_or_default();
-    Err(TransportError::ServerError {
+    let text = read_error_body(response.into_body().into_reader());
+    Err(server_error(
         status,
-        message: error_reason(&text).unwrap_or_else(|| format!("http status: {status}")),
-    })
+        error_reason(&text).unwrap_or_else(|| format!("http status: {status}")),
+    ))
+}
+
+fn server_error(status: u16, message: String) -> TransportError {
+    let message = message
+        .chars()
+        .filter(|character| !character.is_control() && !is_bidi_control(*character))
+        .collect();
+    TransportError::ServerError { status, message }
+}
+
+fn read_error_body<R: Read>(reader: R) -> String {
+    let mut bytes = Vec::new();
+    let _ = reader.take(ERROR_BODY_LIMIT).read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn is_bidi_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200e}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{206a}'..='\u{206f}'
+    )
 }
 
 /// The explanation in an error body: the `error`, `message` or `reason` string
@@ -385,6 +404,33 @@ fn load_ca_roots(path: &std::path::Path) -> Result<ureq::tls::RootCerts> {
 mod tests {
     use super::*;
     use crate::DEFAULT_HEARTBEAT_ENDPOINT;
+
+    #[test]
+    fn server_error_reason_removes_terminal_controls_and_bidi_markers() {
+        let err = server_error(
+            423,
+            "\x1b[31mhalted\nnext line\r\0\u{0080}\u{009f}\u{202e}".into(),
+        );
+        let expected = "[31mhaltednext line";
+        assert_eq!(err.locked_reason(), Some(expected));
+        assert_eq!(err.to_string(), format!("server error: 423 - {expected}"));
+    }
+
+    #[test]
+    fn error_body_is_capped_at_two_kibibytes() {
+        let input = "x".repeat(3 * 1024);
+        let actual = read_error_body(input.as_bytes());
+        assert_eq!(actual.len(), ERROR_BODY_LIMIT as usize);
+        assert_eq!(actual, "x".repeat(ERROR_BODY_LIMIT as usize));
+    }
+
+    #[test]
+    fn error_body_truncation_inside_utf8_is_lossy_not_a_panic() {
+        let input = format!("{}é", "a".repeat(ERROR_BODY_LIMIT as usize - 1));
+        let actual = read_error_body(input.as_bytes());
+        let expected = format!("{}�", "a".repeat(ERROR_BODY_LIMIT as usize - 1));
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn config_builds_urls_correctly() {

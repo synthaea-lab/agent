@@ -22,7 +22,7 @@ use crate::normalize::SessionStats;
 /// (`MAX_PATH`-ish UTF-16 each, generous).
 const NAME_BYTES: usize = 1024 * 2;
 /// `QueryAllTracesW` accepts at most 64 sessions on current Windows.
-const MAX_SESSIONS: usize = 64;
+pub(crate) const MAX_SESSIONS: usize = 64;
 
 /// "22fb2cd6-0e7b-..." → GUID; `None` on a malformed constant.
 fn parse_guid(text: &str) -> Option<GUID> {
@@ -118,8 +118,16 @@ pub(crate) fn provider_enablements(
     out
 }
 
-/// Every running session: logger id, name, real-time mode, buffers written.
-pub(crate) fn running_sessions() -> Vec<(u16, SessionStats)> {
+/// Every running session returned by `QueryAllTracesW` and whether the fixed
+/// API buffer may have hidden additional sessions.
+pub(crate) struct RunningSessions {
+    pub(crate) entries: Vec<(u16, SessionStats)>,
+    pub(crate) possibly_truncated: bool,
+}
+
+/// Enumerates running sessions. `ERROR_MORE_DATA` still returns the entries
+/// that fit, but the caller must treat the list as incomplete.
+pub(crate) fn running_sessions() -> Result<RunningSessions, u32> {
     let stride = size_of::<EVENT_TRACE_PROPERTIES>() + 2 * NAME_BYTES;
     // u64 backing keeps each EVENT_TRACE_PROPERTIES 8-aligned (stride is a
     // multiple of 8: the struct is, and NAME_BYTES is).
@@ -148,7 +156,7 @@ pub(crate) fn running_sessions() -> Vec<(u16, SessionStats)> {
         )
     };
     if status != ERROR_SUCCESS && status != ERROR_MORE_DATA {
-        return Vec::new();
+        return Err(status);
     }
     let mut out = Vec::new();
     for &p in ptrs.iter().take(count as usize) {
@@ -174,8 +182,14 @@ pub(crate) fn running_sessions() -> Vec<(u16, SessionStats)> {
                 name,
                 real_time: props.LogFileMode & EVENT_TRACE_REAL_TIME_MODE != 0,
                 buffers_written: props.BuffersWritten,
+                events_lost: props.EventsLost,
+                real_time_buffers_lost: props.RealTimeBuffersLost,
+                log_buffers_lost: props.LogBuffersLost,
             },
         ));
     }
-    out
+    Ok(RunningSessions {
+        entries: out,
+        possibly_truncated: status == ERROR_MORE_DATA || count as usize >= MAX_SESSIONS,
+    })
 }

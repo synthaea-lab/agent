@@ -210,15 +210,10 @@ pub(crate) fn start_with_decoys(
              elsewhere to catch reconnaissance"
         );
     }
-    let placements: Vec<Placement> = config
-        .canary_dirs
-        .iter()
-        .map(|dir| Placement {
-            dir: dir.clone(),
-            kinds: Kind::ALL.to_vec(),
-        })
-        .collect();
-    let canaries = deception::plan(&seed, &placements);
+    let canaries = planned_canaries(config, &seed);
+    // A canary deleted while the agent was down is put back first (see `refresh_once`), so that
+    // planting finds it unchanged: its decoy is then on disk and registered with the others.
+    refresh_once(&canaries, &inventory);
     let present = plant_each_directory(&canaries, &inventory);
     let decoys = decoy_hashes_on_disk(&canaries, &present);
     if canaries_hold_no_decoy(present.len(), decoys.len()) {
@@ -238,6 +233,72 @@ pub(crate) fn start_with_decoys(
             tracing::error!(%error, "deception: inventory unreadable, no tripwires");
             (None, decoys)
         }
+    }
+}
+
+/// The canaries `config` calls for, named and filled from `seed`: the same on every call.
+fn planned_canaries(config: &config::DeceptionConfig, seed: &Seed) -> Vec<deception::Canary> {
+    let placements: Vec<Placement> = config
+        .canary_dirs
+        .iter()
+        .map(|dir| Placement {
+            dir: dir.clone(),
+            kinds: Kind::ALL.to_vec(),
+        })
+        .collect();
+    deception::plan(seed, &placements)
+}
+
+/// How often the refresh puts back canaries that were deleted while the agent runs.
+const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The refresh policy (issue #81): a planted canary that is gone is planted again, with the
+/// content it had, so the decoy is there for the next intruder. It fills gaps and nothing
+/// else: a file that was modified or replaced is left alone and counted, and a canary the
+/// inventory does not know is not planted here. The deletion itself was already a tripwire
+/// hit (a delete of a canary), so restoring it hides nothing.
+pub(crate) fn refresh_once(canaries: &[deception::Canary], inventory: &Path) {
+    match deception::refresh(canaries, inventory) {
+        Ok(report) => {
+            if !report.restored.is_empty() {
+                tracing::info!(
+                    restored = report.restored.len(),
+                    "deception: deleted canaries replanted"
+                );
+            }
+            if !report.changed.is_empty() || !report.unrestorable.is_empty() {
+                tracing::warn!(
+                    changed = report.changed.len(),
+                    unrestorable = report.unrestorable.len(),
+                    "deception: some canaries are not as planted and were left alone"
+                );
+            }
+        }
+        Err(error) => tracing::error!(%error, "deception: refresh failed"),
+    }
+}
+
+/// Runs [`refresh_once`] every [`REFRESH_INTERVAL`] in a detached thread: nothing waits for it.
+pub(crate) fn spawn_refresh(config: config::DeceptionConfig, state_dir: PathBuf) {
+    if config.canary_dirs.is_empty() {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("deception-refresh".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(REFRESH_INTERVAL);
+                match load_or_create_seed(&state_dir) {
+                    Ok(seed) => refresh_once(
+                        &planned_canaries(&config, &seed),
+                        &inventory_path(&state_dir),
+                    ),
+                    Err(error) => tracing::error!(%error, "deception: refresh has no seed"),
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::error!(%error, "deception: could not start the refresh thread");
     }
 }
 
@@ -757,6 +818,29 @@ mod tests {
     }
 
     #[test]
+    fn a_decoy_canary_deleted_while_the_agent_was_down_is_registered_after_the_restart() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_for(&[dir.path()]);
+        let mut first = start_with_decoys(&config, state.path()).1;
+        assert_eq!(first.len(), 2);
+        let seed = load_or_create_seed(state.path()).unwrap();
+        let carrier = plan_for(&config, &seed)
+            .into_iter()
+            .find(|canary| !deception::decoy_tokens(std::slice::from_ref(canary)).is_empty())
+            .unwrap();
+        fs::remove_file(&carrier.path).unwrap();
+
+        let mut second = start_with_decoys(&config, state.path()).1;
+        first.sort();
+        second.sort();
+        assert_eq!(
+            second, first,
+            "the replanted canary holds its decoy again, and it is registered"
+        );
+    }
+
+    #[test]
     fn nothing_configured_registers_nothing() {
         let state = tempfile::tempdir().unwrap();
         assert!(
@@ -844,15 +928,7 @@ mod tests {
 
     /// The plan `start_with_decoys` makes for `config`, for the tests that need the paths.
     fn plan_for(config: &config::DeceptionConfig, seed: &Seed) -> Vec<deception::Canary> {
-        let placements: Vec<Placement> = config
-            .canary_dirs
-            .iter()
-            .map(|dir| Placement {
-                dir: dir.clone(),
-                kinds: Kind::ALL.to_vec(),
-            })
-            .collect();
-        deception::plan(seed, &placements)
+        planned_canaries(config, seed)
     }
 
     /// Plants the canaries as an earlier build did: same files, no decoy line, inventoried.
@@ -996,5 +1072,51 @@ mod tests {
         );
         assert_eq!(outcome, Registration::Registered { attempts: 3 });
         assert_eq!(sleeps, REGISTER_DELAYS[..2].to_vec());
+    }
+
+    #[test]
+    fn a_canary_deleted_while_the_agent_was_down_is_back_after_a_restart() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        start(&config_for(&[dir.path()]), state.path()).unwrap();
+        let gone = fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let content = fs::read_to_string(&gone).unwrap();
+        fs::remove_file(&gone).unwrap();
+        start(&config_for(&[dir.path()]), state.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(&gone).unwrap(),
+            content,
+            "replanted as it was"
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), Kind::ALL.len());
+    }
+
+    #[test]
+    fn refresh_once_replants_a_deleted_canary_and_leaves_a_replaced_one() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_for(&[dir.path()]);
+        start(&config, state.path()).unwrap();
+        let seed = load_or_create_seed(state.path()).unwrap();
+        let canaries = planned_canaries(&config, &seed);
+        fs::remove_file(&canaries[0].path).unwrap();
+        fs::write(&canaries[1].path, "the user's own file").unwrap();
+        refresh_once(&canaries, &inventory_path(state.path()));
+        assert!(canaries[0].path.exists());
+        assert_eq!(
+            fs::read_to_string(&canaries[1].path).unwrap(),
+            "the user's own file"
+        );
+    }
+
+    #[test]
+    fn no_refresh_thread_without_canary_directories() {
+        // An empty config returns before any thread exists: nothing to assert but no panic.
+        spawn_refresh(config_for(&[]), PathBuf::from("/nonexistent"));
     }
 }

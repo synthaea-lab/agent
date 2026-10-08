@@ -11,8 +11,8 @@ use schema::{
     FileRenameEvent, FileSetxattrEvent, FileWriteEvent, IdentityChangeEvent, IdentityChangeKind,
     KernelModuleAction, KernelModuleEvent, MemfdCreateEvent, MountEvent, NamespaceEvent,
     NamespaceSyscall, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
-    SignalEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent, UdpRecvEvent, UdpSendEvent,
-    User,
+    SignalEvent, SocketAcceptEvent, SocketBindEvent, SocketCreateEvent, SocketListenEvent,
+    UdpRecvEvent, UdpSendEvent, User,
 };
 use sensor_linux_wire as wire;
 
@@ -102,7 +102,11 @@ use sensor_linux_wire as wire;
 /// relative path against them.
 ///
 /// v22 (#263) added `UdpRecvEvent`; `udp_recv` maps it one-to-one.
-const _: () = assert!(wire::WIRE_VERSION == 22);
+///
+/// v23 (#263) added `SocketCreateEvent` — new `socket_create` mapping function
+/// below, maps `domain`/`socket_type`/`protocol`/`fd` one-to-one; no existing
+/// mapping changed shape.
+const _: () = assert!(wire::WIRE_VERSION == 23);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
@@ -510,6 +514,21 @@ pub fn socket_accept(
         accepted_fd: event.accepted_fd,
         peer_addr,
         peer_port: event.peer_port,
+    })
+}
+
+#[must_use]
+pub fn socket_create(
+    event: &wire::SocketCreateEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    Event::SocketCreate(SocketCreateEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        domain: event.domain,
+        socket_type: event.socket_type,
+        protocol: event.protocol,
+        fd: event.fd,
     })
 }
 
@@ -1304,6 +1323,26 @@ mod tests {
         assert_eq!(e.accepted_fd, 7);
         assert_eq!(e.peer_addr.to_string(), "203.0.113.42");
         assert_eq!(e.peer_port, 54321);
+    }
+
+    #[test]
+    fn socket_create_maps_domain_type_protocol_and_fd_one_to_one() {
+        // AF_PACKET (17) / SOCK_RAW (3): the shape worth flagging, not an
+        // AF_INET socket bind/connect would already show.
+        let event = wire::SocketCreateEvent {
+            meta: wire_meta(b"tcpdump"),
+            domain: 17,
+            socket_type: 3,
+            protocol: 768,
+            fd: 5,
+        };
+        let Event::SocketCreate(e) = socket_create(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.domain, 17);
+        assert_eq!(e.socket_type, 3);
+        assert_eq!(e.protocol, 768);
+        assert_eq!(e.fd, 5);
     }
 
     fn packed_str<const N: usize>(s: &[u8]) -> ([u8; N], u16) {

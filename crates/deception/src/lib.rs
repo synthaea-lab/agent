@@ -35,18 +35,21 @@
 //! - [`Tripwires`] matches the existing file events (open, delete, rename) against the
 //!   inventory and says which canary, how it was touched and by which pid.
 //!
-//! Not built yet: decoy credentials and their server-side alarm, honeypot listeners, the
-//! agent wiring (choosing directories, keeping the seed, raising the detection), and the
-//! refresh policy. This crate does no I/O except through [`plant`], [`verify`] and
-//! [`remove`], and holds no platform branches.
+//! - [`refresh`] puts back a canary that was deleted, with the content it had, and nothing
+//!   else.
+//!
+//! Not built here: honeypot listeners. The agent wiring, the decoy credentials and their
+//! server-side alarm live in the agent and the control plane (ADR-0029, ADR-0030). This crate
+//! does no I/O except through [`plant`], [`verify`], [`refresh`] and [`remove`], and holds no
+//! platform branches.
 
 mod lifecycle;
 mod plan;
 mod tripwire;
 
 pub use lifecycle::{
-    DeceptionError, Drift, DriftKind, Inventory, InventoryEntry, PlantReport, RemoveReport,
-    Skipped, plant, remove, sha256_hex, verify,
+    DeceptionError, Drift, DriftKind, Inventory, InventoryEntry, PlantReport, RefreshReport,
+    RemoveReport, Skipped, plant, refresh, remove, sha256_hex, verify,
 };
 pub use plan::{
     Canary, DECOY_HEADER, DECOY_TOKEN_PREFIX, Kind, Placement, Seed, decoy_tokens, plan,

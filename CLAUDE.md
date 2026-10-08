@@ -32,14 +32,14 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
   with `-D warnings`.
 - Platform-specific code (`#[cfg(target_os = ...)]`, platform-only deps) is allowed
   **only inside `crates/sensors/*`, `crates/updater`, and the narrow filesystem
-  permission helpers in `crates/response/src/quarantine.rs`**. Sensors and updater compile to empty
+  permission and descriptor helpers in `crates/response/src/quarantine.rs`**. Sensors and updater compile to empty
   stubs elsewhere. `updater`'s exception is scoped narrowly: ADR-0015 is a
   Linux-first slice (the `bootstrap`/`current`/`versions` layout and its atomic
   symlink swap are POSIX-shaped by nature), and Windows/macOS self-update need
   their own design before they get a stub worth writing (ADR-0015 Deferred) — this
   is not a general invitation for leaf crates to grow platform branches. The
-  quarantine exception is limited to mode/ACL enforcement at the privileged
-  response boundary; see ADR-0021.
+  quarantine exception is limited to mode/ACL enforcement and to opening and moving the
+  source by descriptor at the privileged response boundary; see ADR-0021.
   Platform deps must be target-gated: `[target.'cfg(windows)'.dependencies]`, never
   unconditional.
 - `crates/sensors/linux-ebpf` is excluded from the workspace (special toolchain, GPLv2);

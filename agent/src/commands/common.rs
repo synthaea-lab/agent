@@ -50,6 +50,7 @@ pub(crate) fn plant_canaries(
     if let Some(tripwires) = tripwires {
         sink.set_tripwires(tripwires);
         sink.set_canary_allow(crate::deception::CanaryAllow::new(deception));
+        crate::deception::spawn_refresh(deception.clone(), storage.state_dir.clone());
     }
     match transport {
         Some(handle) => crate::deception::register_decoys_in_background(
