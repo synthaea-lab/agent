@@ -188,6 +188,11 @@ impl CanaryAllow {
         }
     }
 
+    /// Whether nothing is allowed: the exec table has no use then, and the sink does not fill it.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.exes.is_empty()
+    }
+
     /// Whether the process `pid` runs an allowed executable. `seen` is what the agent recorded
     /// when this incarnation of the pid executed ([`ExecImages::image_of`], already checked
     /// against the pid's incarnation), if anything; with none, the `/proc` route decides.
@@ -196,7 +201,6 @@ impl CanaryAllow {
         if self.exes.is_empty() {
             return false;
         }
-        let now = (self.resolve)(pid);
         match seen {
             // The table is the image of the last `Exec` the agent recorded for this incarnation.
             // The generation is stamped at fork, not at exec, so it cannot tell that the process
@@ -204,12 +208,19 @@ impl CanaryAllow {
             // read it, shows the image now: if it names something else the entry is stale and
             // the process is not allowed. Where `/proc` says nothing (no ptrace access, another
             // mount namespace) the table decides alone, and that residue is documented.
+            // The string checks go first: a process the table already rejects costs no read.
             Some(image) => {
-                !image.in_container
-                    && self.matches_image(&image.path)
-                    && now.is_none_or(|exe| self.exes.contains(&exe))
+                if image.in_container || !self.matches_image(&image.path) {
+                    return false;
+                }
+                match (self.resolve)(pid) {
+                    None => true,
+                    Some(exe) => {
+                        self.exes.contains(&exe) || is_interpreter_of(&exe, Path::new(&image.path))
+                    }
+                }
             }
-            None => now.is_some_and(|exe| self.exes.contains(&exe)),
+            None => (self.resolve)(pid).is_some_and(|exe| self.exes.contains(&exe)),
         }
     }
 
@@ -221,6 +232,33 @@ impl CanaryAllow {
             self.exes.iter().any(|e| e == path) || self.as_written.iter().any(|e| e == path)
         }
     }
+}
+
+/// Whether `exe`, what `/proc/<pid>/exe` shows, is consistent with a process that exec'd the
+/// script `image`. A `#!` script runs as its interpreter, so `/proc` names the interpreter and
+/// never the script: without this a listed script would be refused whenever `/proc` is
+/// readable and allowed whenever it is not. An `env` shebang (`#!/usr/bin/env python3`) names
+/// `env` while `/proc` shows the program `env` found, so the interpreter cannot be told from
+/// the file and `/proc` does not contradict the table. A file that is not a script, or cannot
+/// be read, never excuses a difference.
+fn is_interpreter_of(exe: &Path, image: &Path) -> bool {
+    use std::io::Read as _;
+    let mut head = [0u8; 256];
+    let Ok(mut file) = fs::File::open(image) else {
+        return false;
+    };
+    let Ok(read) = file.read(&mut head) else {
+        return false;
+    };
+    let Some(line) = head[..read].strip_prefix(b"#!") else {
+        return false;
+    };
+    let line = String::from_utf8_lossy(line.split(|&b| b == b'\n').next().unwrap_or_default())
+        .into_owned();
+    let Some(interpreter) = line.split_whitespace().next().map(Path::new) else {
+        return false;
+    };
+    interpreter.file_name().is_some_and(|name| name == "env") || canonical_entry(interpreter) == exe
 }
 
 /// Whether an image path from a sensor names an absolute location. Decided on the string, not
@@ -805,6 +843,61 @@ mod tests {
         // event never reached the table: `/proc` is the only witness of the change.
         let mut seen = images(&[exec_of(10, Some(1), "/usr/bin/updatedb", false)]);
         let allow = CanaryAllow::for_test("/usr/bin/updatedb", |_| Some("/tmp/payload".into()));
+        assert!(!allow.allows(10, seen.image_of(10, Some(1)).as_ref()));
+    }
+
+    /// A script in a temporary directory with `shebang` as its first line, listed as allowed.
+    #[cfg(unix)]
+    fn listed_script(shebang: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("backup.sh");
+        fs::write(&script, format!("{shebang}\necho ok\n")).unwrap();
+        let path = script.to_string_lossy().into_owned();
+        (dir, path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_listed_script_is_allowed_when_proc_shows_its_interpreter() {
+        if !Path::new("/bin/sh").exists() {
+            return;
+        }
+        let (_dir, script) = listed_script("#!/bin/sh");
+        let mut seen = images(&[exec_of(10, Some(1), &script, false)]);
+        let allow = CanaryAllow::for_test(&script, |_| fs::canonicalize("/bin/sh").ok());
+        assert!(
+            allow.allows(10, seen.image_of(10, Some(1)).as_ref()),
+            "/proc names the interpreter of a script, never the script"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_listed_script_is_not_allowed_when_proc_shows_another_program() {
+        let (_dir, script) = listed_script("#!/bin/sh");
+        let mut seen = images(&[exec_of(10, Some(1), &script, false)]);
+        let allow = CanaryAllow::for_test(&script, |_| Some("/tmp/payload".into()));
+        assert!(!allow.allows(10, seen.image_of(10, Some(1)).as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_env_shebang_script_is_decided_by_the_table_because_proc_cannot_contradict_it() {
+        let (_dir, script) = listed_script("#!/usr/bin/env python3");
+        let mut seen = images(&[exec_of(10, Some(1), &script, false)]);
+        let allow = CanaryAllow::for_test(&script, |_| Some("/usr/bin/python3.12".into()));
+        assert!(allow.allows(10, seen.image_of(10, Some(1)).as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_is_not_a_script_never_excuses_a_difference_with_proc() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("updatedb");
+        fs::write(&binary, b"\x7fELF not a script").unwrap();
+        let path = binary.to_string_lossy().into_owned();
+        let mut seen = images(&[exec_of(10, Some(1), &path, false)]);
+        let allow = CanaryAllow::for_test(&path, |_| Some("/tmp/payload".into()));
         assert!(!allow.allows(10, seen.image_of(10, Some(1)).as_ref()));
     }
 

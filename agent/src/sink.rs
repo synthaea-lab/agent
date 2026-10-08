@@ -675,7 +675,7 @@ impl DetectionSink {
             let seen = self
                 .exec_images
                 .lock()
-                .unwrap()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .image_of(hit.pid, event.meta().process_generation);
             allow.allows(hit.pid, seen.as_ref())
         }) {
@@ -947,7 +947,18 @@ impl DetectionSink {
 
     /// Exec events: stateless rules, stateful rules, then Sigma.
     fn detect_exec(&self, wrapped: &Event, event: &schema::ExecEvent) {
-        self.exec_images.lock().unwrap().record(event);
+        // The table is read only when an executable may be allowed: recording every exec of a
+        // host that allows none would take a lock and clone a path for nothing.
+        if self
+            .canary_allow
+            .get()
+            .is_some_and(|allow| !allow.is_empty())
+        {
+            self.exec_images
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record(event);
+        }
         self.record_rule_alerts(wrapped, rules::evaluate_exec(event));
         self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_exec(event));
         let sigma_guard = self.sigma.lock().unwrap();
@@ -1966,6 +1977,39 @@ rule response_marker {
         ));
         sink.on_event(open_event(&canary, std::process::id() + 1));
         assert_eq!(canary_alert_count(&dir), 0);
+    }
+
+    #[test]
+    fn an_exec_is_recorded_only_when_an_executable_may_be_allowed() {
+        let pid = std::process::id() + 1;
+        let record = |sink: &DetectionSink| {
+            let mut exec = schema::fixtures::exec();
+            exec.meta.pid = pid;
+            exec.meta.process_generation = Some(3);
+            exec.image_path = "/usr/bin/updatedb".into();
+            sink.on_event(Event::Exec(exec));
+            sink.exec_images.lock().unwrap().image_of(pid, Some(3))
+        };
+        let dir = tmp("exec-record-none");
+        let (sink, _canary) = sink_watching_canary(&dir);
+        assert!(record(&sink).is_none(), "no allow list: nothing recorded");
+        let dir = tmp("exec-record-empty");
+        let (sink, _canary) = sink_watching_canary(&dir);
+        // What a host with `[deception]` but no `allow_exe` has: an allow list, empty.
+        sink.set_canary_allow(crate::deception::CanaryAllow::new(
+            &config::DeceptionConfig::default(),
+        ));
+        assert!(
+            record(&sink).is_none(),
+            "an empty allow list: nothing recorded"
+        );
+        let dir = tmp("exec-record-listed");
+        let (sink, _canary) = sink_watching_canary(&dir);
+        sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
+            "/usr/bin/updatedb",
+            |_| None,
+        ));
+        assert!(record(&sink).is_some(), "an allow list: recorded");
     }
 
     #[test]
