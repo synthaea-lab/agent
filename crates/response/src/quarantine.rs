@@ -15,8 +15,9 @@
 //! while it is processed is not refused (a writer could then defeat the quarantine): it is
 //! copied from the descriptor into a private file, hashed as it is copied and filed under that
 //! digest, so the stored bytes and their digest agree whatever the writer does; the copy is
-//! bounded to the length the file had when it started, so a writer that keeps appending cannot
-//! make it grow or run without end, and a snapshot left by a killed agent is swept. A hard-linked
+//! bounded, like the hash that precedes it, to the length the file had when it was opened, so a
+//! writer that keeps appending cannot make either grow or run without end, and a snapshot left
+//! by a killed agent is swept at the next quarantine. A hard-linked
 //! payload shares its inode with the source, so a process that already holds it open for
 //! writing can still change the quarantined file (`restore` then reports a hash mismatch);
 //! containment holds, since it is `0400` and no name is left at the source.
@@ -89,6 +90,9 @@ fn try_quarantine(path: &Path, quarantine_dir: &Path) -> std::io::Result<(PathBu
     let source = Source::open(path)?;
     let sha256_hex = source.sha256(path)?;
     secure_quarantine_dir(quarantine_dir)?;
+    // A leftover of a killed agent goes at the next quarantine, written source or not.
+    #[cfg(unix)]
+    sweep_stale_snapshots(quarantine_dir);
 
     // Somebody is writing to the file (a dropper still downloading, or an attacker keeping it
     // busy): the digest may not be the digest of what a link or a copy would now store.
@@ -184,8 +188,7 @@ fn quarantine_snapshot(
     path: &Path,
     quarantine_dir: &Path,
 ) -> std::io::Result<(PathBuf, String)> {
-    sweep_stale_snapshots(quarantine_dir);
-    let (temp, sha256_hex) = snapshot_hashed(&source.file, quarantine_dir)?;
+    let (temp, sha256_hex) = copy_prefix_hashed(&source.file, quarantine_dir, source.snapshot.0)?;
     let stored = Source::open(&temp)
         .and_then(|snapshot| store_in_slot(&snapshot, &temp, path, quarantine_dir, &sha256_hex));
     // Gone already once the snapshot was moved into its slot; this covers a failure.
@@ -224,16 +227,11 @@ fn sweep_stale_snapshots(dir: &Path) {
     }
 }
 
-/// Copies the open file (rewound) to a new private file in `dir`, returning its path and the
-/// SHA-256 of the bytes written to it. Copies at most the length the descriptor reports when
-/// it starts: a writer that keeps appending then cannot make the copy grow, or run, without
-/// bound (the stored bytes are a consistent prefix and the digest is that prefix's).
-#[cfg(unix)]
-fn snapshot_hashed(file: &std::fs::File, dir: &Path) -> std::io::Result<(PathBuf, String)> {
-    copy_prefix_hashed(file, dir, file.metadata()?.len())
-}
-
-/// [`snapshot_hashed`] for the first `len` bytes.
+/// Copies the first `len` bytes of the open file (rewound) to a new private file in `dir`,
+/// returning its path and the SHA-256 of the bytes written to it. The caller passes the length
+/// the file had when it was opened, so a writer that keeps appending cannot make the hash or
+/// the copy grow, or run, without bound (the stored bytes are a consistent prefix and the
+/// digest is that prefix's).
 #[cfg(unix)]
 fn copy_prefix_hashed(
     file: &std::fs::File,
@@ -361,12 +359,16 @@ impl Source {
         Ok(Self {})
     }
 
-    /// SHA-256 of the opened file (of `path` where there is no descriptor to read).
+    /// SHA-256 of the opened file (of `path` where there is no descriptor to read). Reads at
+    /// most the length the file had when it was opened, so a writer that keeps appending
+    /// cannot keep the hash from finishing: the digest is that of the prefix, which is what
+    /// [`quarantine_snapshot`] stores if the file changed.
     fn sha256(&self, path: &Path) -> std::io::Result<String> {
         #[cfg(unix)]
         {
+            use std::io::Read as _;
             let _ = path;
-            sha256_reader(&mut &self.file)
+            sha256_reader(&mut (&self.file).take(self.snapshot.0))
         }
         #[cfg(not(unix))]
         sha256_file(path)
@@ -1601,7 +1603,8 @@ mod tests {
     }
 
     /// #713 review: the snapshot is filed under the digest of the bytes it holds, the source
-    /// name is removed, nothing is left behind, and the payload can be restored.
+    /// name is removed, nothing is left behind, and the payload can be restored. What is stored
+    /// is the prefix the file had when it was opened, not what was appended since.
     #[cfg(unix)]
     #[test]
     fn a_snapshot_of_a_written_source_is_stored_under_its_own_digest_and_restores() {
@@ -1623,7 +1626,7 @@ mod tests {
         let (stored, digest) = quarantine_snapshot(&opened, &source, &qdir).unwrap();
 
         assert_eq!(sha256_file(&stored).unwrap(), digest);
-        assert_eq!(std::fs::read(&stored).unwrap(), b"first and more");
+        assert_eq!(std::fs::read(&stored).unwrap(), b"first");
         assert!(!source.exists(), "the name is removed");
         assert!(
             std::fs::read_dir(&qdir).unwrap().all(|entry| !entry
@@ -1634,7 +1637,56 @@ mod tests {
             "no temporary file is left"
         );
         assert_eq!(unquarantine(&qdir, &digest).unwrap(), source);
-        assert_eq!(std::fs::read(&source).unwrap(), b"first and more");
+        assert_eq!(std::fs::read(&source).unwrap(), b"first");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #713 review (second round): the hash and the snapshot both use the length from the
+    /// open, so appending after it changes neither the digest nor the stored bytes, whatever
+    /// the writer does in between.
+    #[cfg(unix)]
+    #[test]
+    fn hash_and_snapshot_both_stop_at_the_length_the_file_had_when_opened() {
+        use std::io::Write as _;
+
+        let dir = temp_dir("prefix-at-open");
+        let source = dir.join("payload");
+        let qdir = dir.join("quarantine");
+        std::fs::write(&source, b"original bytes").unwrap();
+        secure_quarantine_dir(&qdir).unwrap();
+        let opened = Source::open(&source).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(&[b'x'; 4096])
+            .unwrap();
+
+        let hashed = opened.sha256(&source).unwrap();
+        let (stored, digest) = quarantine_snapshot(&opened, &source, &qdir).unwrap();
+
+        assert_eq!(hashed, sha256_reader(&mut &b"original bytes"[..]).unwrap());
+        assert_eq!(digest, hashed, "both steps saw the same prefix");
+        assert_eq!(std::fs::read(&stored).unwrap(), b"original bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #713 review (second round): the sweep runs at every quarantine, so a leftover of a
+    /// killed agent does not wait for a written source to be cleaned up.
+    #[cfg(unix)]
+    #[test]
+    fn a_leftover_snapshot_is_swept_by_an_ordinary_quarantine() {
+        let dir = temp_dir("sweep-on-quarantine");
+        let source = dir.join("payload");
+        let qdir = dir.join("quarantine");
+        secure_quarantine_dir(&qdir).unwrap();
+        let stale = qdir.join(".incoming-1-0");
+        std::fs::write(&stale, b"partial").unwrap();
+        std::fs::write(&source, b"not being written").unwrap();
+
+        try_quarantine(&source, &qdir).unwrap();
+
+        assert!(!stale.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
