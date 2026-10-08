@@ -17,7 +17,13 @@
 //! digest, so the stored bytes and their digest agree whatever the writer does; the copy is
 //! bounded, like the hash that precedes it, to the length the file had when it was opened, so a
 //! writer that keeps appending cannot make either grow or run without end, and a snapshot left
-//! by a killed agent is swept at the next quarantine. A hard-linked
+//! by a killed agent is swept at the next quarantine (an in-flight one is protected by an
+//! advisory lock). Bytes appended after the open are not stored: the outcome is still
+//! `Quarantined`, with the digest of the prefix. A write is noticed from the size and the
+//! modification time, so one that keeps both (an overwrite within a single timestamp tick, a
+//! write through a shared mapping) can go unnoticed; this depends on the filesystem and was not
+//! measured. When the file is copied rather than linked, only the opened name is removed:
+//! other hard links to the original inode keep their execute bits. A hard-linked
 //! payload shares its inode with the source, so a process that already holds it open for
 //! writing can still change the quarantined file (`restore` then reports a hash mismatch);
 //! containment holds, since it is `0400` and no name is left at the source.
@@ -188,7 +194,10 @@ fn quarantine_snapshot(
     path: &Path,
     quarantine_dir: &Path,
 ) -> std::io::Result<(PathBuf, String)> {
-    let (temp, sha256_hex) = copy_prefix_hashed(&source.file, quarantine_dir, source.snapshot.0)?;
+    // `_in_flight` keeps the advisory lock on the temporary file until it is in its slot or
+    // removed, so that no sweep of another process takes it for a leftover.
+    let (temp, sha256_hex, _in_flight) =
+        copy_prefix_hashed(&source.file, quarantine_dir, source.snapshot.0)?;
     let stored = Source::open(&temp)
         .and_then(|snapshot| store_in_slot(&snapshot, &temp, path, quarantine_dir, &sha256_hex));
     // Gone already once the snapshot was moved into its slot; this covers a failure.
@@ -204,24 +213,52 @@ fn quarantine_snapshot(
     Ok((quarantined_at, sha256_hex))
 }
 
+/// How long a partial snapshot must have been left alone before a sweep may take it, so that
+/// one that has just been created (and not yet locked) is not taken.
+#[cfg(unix)]
+const SNAPSHOT_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Takes the advisory lock a snapshot holds while it is in flight, without waiting.
+#[cfg(unix)]
+fn try_lock_exclusive(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: `flock` on a descriptor that stays open for the whole call; it retains nothing.
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
 /// Removes the partial snapshots (`.incoming-<pid>-<n>`) that a process which was killed
-/// mid-copy left in `dir`: the watchdog restarts the agent under a new pid, so any such file of
-/// another pid is a leftover. Best effort. Those of this process are in flight and kept.
+/// mid-copy left in `dir`. A snapshot in flight, of this process or of any other (a second
+/// agent, the CLI), holds an advisory lock on its file, so a file is taken only when the lock
+/// can be had and it is older than [`SNAPSHOT_GRACE`]. That does not depend on the pid, which
+/// is the same (1) for every process in a container. Best effort.
 #[cfg(unix)]
 fn sweep_stale_snapshots(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let own = std::process::id();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(".incoming-")) else {
             continue;
         };
-        let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+        if rest
+            .split('-')
+            .next()
+            .and_then(|p| p.parse::<u32>().ok())
+            .is_none()
+        {
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(entry.path()) else {
             continue;
         };
-        if pid != own {
+        let old_enough = file
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= SNAPSHOT_GRACE);
+        if old_enough && try_lock_exclusive(&file) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -231,13 +268,14 @@ fn sweep_stale_snapshots(dir: &Path) {
 /// returning its path and the SHA-256 of the bytes written to it. The caller passes the length
 /// the file had when it was opened, so a writer that keeps appending cannot make the hash or
 /// the copy grow, or run, without bound (the stored bytes are a consistent prefix and the
-/// digest is that prefix's).
+/// digest is that prefix's). The returned file holds the advisory lock that tells a sweep the
+/// snapshot is in flight: the caller keeps it until the snapshot is stored or removed.
 #[cfg(unix)]
 fn copy_prefix_hashed(
     file: &std::fs::File,
     dir: &Path,
     len: u64,
-) -> std::io::Result<(PathBuf, String)> {
+) -> std::io::Result<(PathBuf, String, std::fs::File)> {
     use std::{
         io::{Read as _, Seek as _},
         os::unix::fs::OpenOptionsExt as _,
@@ -261,8 +299,11 @@ fn copy_prefix_hashed(
             Err(error) => return Err(error),
         }
     };
+    // Nobody else can hold the lock of a file that did not exist a moment ago; a failure here
+    // is not worth failing the snapshot for, the grace period still protects a fresh file.
+    let _ = try_lock_exclusive(&out);
     match sha256_copy(&mut source, &mut out).and_then(|digest| out.sync_all().map(|()| digest)) {
-        Ok(digest) => Ok((temp, digest)),
+        Ok(digest) => Ok((temp, digest, out)),
         Err(error) => {
             let _ = std::fs::remove_file(&temp);
             Err(error)
@@ -330,7 +371,7 @@ impl Source {
         // just below.
         let file = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
             .open(path)
             .map_err(|error| {
                 if error.raw_os_error() == Some(libc::ELOOP) {
@@ -389,15 +430,22 @@ impl Source {
         let linked = match link_open_file(&self.file, to) {
             Ok(()) => true,
             // No link to give (another filesystem, an unlinked file, too many links, a
-            // platform without `/proc/self/fd`): copy from the same descriptor. Any other
-            // error (no space, no permission, no descriptors left) is the real answer and
+            // filesystem or policy that refuses hard links, a platform without
+            // `/proc/self/fd`): copy from the same descriptor, no further than the length
+            // at open. Any other error (no space, no descriptors left) is the real answer and
             // is not turned into a possibly large copy.
             Err(error) if can_fall_back_to_copy(&error) => {
-                copy_open_file_no_clobber(&self.file, to)?;
+                copy_open_file_no_clobber(&self.file, to, self.snapshot.0)?;
                 false
             }
             Err(error) => return Err(error),
         };
+        // A write during the link or the copy: the digest may not be that of what is stored.
+        // Undo and let the caller take a snapshot, which is hashed as it is copied.
+        if self.written_since_open()? {
+            let _ = std::fs::remove_file(to);
+            return Err(std::io::Error::other(WrittenAfterHash));
+        }
         self.release_name(from, to, linked)
     }
 
@@ -490,13 +538,20 @@ fn link_open_file(file: &std::fs::File, to: &Path) -> std::io::Result<()> {
 }
 
 /// Whether a failed `link_open_file` means "cannot link this one", for which copying from the
-/// descriptor is the answer, rather than a real failure to report.
+/// descriptor is the answer, rather than a real failure to report. `EPERM` is what `linkat`
+/// returns on a filesystem without hard links (vfat) and under `fs.protected_hardlinks`;
+/// `EOPNOTSUPP` is what some FUSE and network filesystems return. `EACCES` is not here: a
+/// directory we cannot write to cannot take a copy either.
 #[cfg(unix)]
 fn can_fall_back_to_copy(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::Unsupported
         || matches!(
             error.raw_os_error(),
-            Some(code) if code == libc::EXDEV || code == libc::ENOENT || code == libc::EMLINK
+            Some(code) if code == libc::EXDEV
+                || code == libc::ENOENT
+                || code == libc::EMLINK
+                || code == libc::EPERM
+                || code == libc::EOPNOTSUPP
         )
 }
 
@@ -507,14 +562,15 @@ fn link_open_file(_file: &std::fs::File, _to: &Path) -> std::io::Result<()> {
 }
 
 /// Copies the open file to a new file `to` that must not exist, from the descriptor
-/// (rewound), carrying its permissions.
+/// (rewound), carrying its permissions. Copies at most `len` bytes (the length the file had
+/// when it was opened), so a writer cannot make the copy grow without end.
 #[cfg(unix)]
-fn copy_open_file_no_clobber(file: &std::fs::File, to: &Path) -> std::io::Result<()> {
-    use std::io::Seek as _;
+fn copy_open_file_no_clobber(file: &std::fs::File, to: &Path, len: u64) -> std::io::Result<()> {
+    use std::io::{Read as _, Seek as _};
     let mut src = file.try_clone()?;
     src.rewind()?;
     copy_open_no_clobber_with(src, to, |src, dst| {
-        std::io::copy(src, dst)?;
+        std::io::copy(&mut src.take(len), dst)?;
         dst.set_permissions(src.metadata()?.permissions())
     })
 }
@@ -1457,7 +1513,7 @@ mod tests {
         std::fs::remove_file(&source).unwrap();
         symlink(&victim, &source).unwrap();
 
-        copy_open_file_no_clobber(&opened.file, &stored).unwrap();
+        copy_open_file_no_clobber(&opened.file, &stored, u64::MAX).unwrap();
 
         assert_eq!(std::fs::read(&stored).unwrap(), b"the payload");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1484,7 +1540,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn only_the_cannot_link_errors_fall_back_to_a_copy() {
-        for code in [libc::EXDEV, libc::ENOENT, libc::EMLINK] {
+        for code in [
+            libc::EXDEV,
+            libc::ENOENT,
+            libc::EMLINK,
+            libc::EPERM,
+            libc::EOPNOTSUPP,
+        ] {
             assert!(can_fall_back_to_copy(&std::io::Error::from_raw_os_error(
                 code
             )));
@@ -1492,13 +1554,7 @@ mod tests {
         assert!(can_fall_back_to_copy(&std::io::Error::from(
             std::io::ErrorKind::Unsupported
         )));
-        for code in [
-            libc::ENOSPC,
-            libc::EACCES,
-            libc::EMFILE,
-            libc::EPERM,
-            libc::EIO,
-        ] {
+        for code in [libc::ENOSPC, libc::EACCES, libc::EMFILE, libc::EIO] {
             assert!(
                 !can_fall_back_to_copy(&std::io::Error::from_raw_os_error(code)),
                 "errno {code}"
@@ -1518,7 +1574,7 @@ mod tests {
         let stored = dir.join("stored");
         std::fs::write(&source, b"the payload").unwrap();
         let opened = Source::open(&source).unwrap();
-        copy_open_file_no_clobber(&opened.file, &stored).unwrap();
+        copy_open_file_no_clobber(&opened.file, &stored, u64::MAX).unwrap();
         std::fs::rename(&source, dir.join("moved-elsewhere")).unwrap();
         symlink(dir.join("moved-elsewhere"), &source).unwrap();
 
@@ -1682,6 +1738,7 @@ mod tests {
         secure_quarantine_dir(&qdir).unwrap();
         let stale = qdir.join(".incoming-1-0");
         std::fs::write(&stale, b"partial").unwrap();
+        backdate(&stale);
         std::fs::write(&source, b"not being written").unwrap();
 
         try_quarantine(&source, &qdir).unwrap();
@@ -1700,7 +1757,7 @@ mod tests {
         std::fs::write(&source, vec![9u8; 5000]).unwrap();
         let file = std::fs::File::open(&source).unwrap();
 
-        let (stored, digest) = copy_prefix_hashed(&file, &dir, 1000).unwrap();
+        let (stored, digest, _lock) = copy_prefix_hashed(&file, &dir, 1000).unwrap();
 
         let bytes = std::fs::read(&stored).unwrap();
         assert_eq!(bytes.len(), 1000, "a growing file ends the copy");
@@ -1709,26 +1766,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #713 review: a partial snapshot left by a process that was killed is swept, one of this
-    /// process (in flight) and everything else is kept.
+    /// Makes `path` look as if it had been left an hour ago.
+    #[cfg(unix)]
+    fn backdate(path: &Path) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+    }
+
+    /// #713 review: a partial snapshot left by a process that was killed is swept, whatever
+    /// its pid (1 in every container); one that is locked (in flight, of this process or of
+    /// another), a fresh one and everything else are kept.
     #[cfg(unix)]
     #[test]
-    fn partial_snapshots_of_another_process_are_swept() {
+    fn only_abandoned_partial_snapshots_are_swept() {
         let dir = temp_dir("sweep-snapshots");
         let stale = dir.join(".incoming-1-0");
-        let in_flight = dir.join(format!(".incoming-{}-0", std::process::id()));
+        let stale_same_pid = dir.join(format!(".incoming-{}-0", std::process::id()));
+        let in_flight = dir.join(".incoming-4242-0");
+        let fresh = dir.join(".incoming-4343-0");
         let stored = dir.join("0".repeat(64));
         let odd = dir.join(".incoming-notapid-0");
-        for path in [&stale, &in_flight, &stored, &odd] {
+        for path in [&stale, &stale_same_pid, &in_flight, &fresh, &stored, &odd] {
             std::fs::write(path, b"x").unwrap();
         }
+        for path in [&stale, &stale_same_pid, &in_flight, &odd] {
+            backdate(path);
+        }
+        let lock = std::fs::File::open(&in_flight).unwrap();
+        assert!(try_lock_exclusive(&lock));
 
         sweep_stale_snapshots(&dir);
 
-        assert!(!stale.exists());
-        assert!(in_flight.exists());
+        assert!(!stale.exists(), "abandoned, pid of another process");
+        assert!(
+            !stale_same_pid.exists(),
+            "abandoned, pid reused (1 in a container)"
+        );
+        assert!(in_flight.exists(), "locked by a snapshot in flight");
+        assert!(fresh.exists(), "just created, maybe not locked yet");
         assert!(stored.exists());
         assert!(odd.exists(), "a name that is not ours is not touched");
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #713 review: the copy used when a file cannot be linked stops at the length given, so
+    /// a writer that keeps appending cannot make it run without end.
+    #[cfg(unix)]
+    #[test]
+    fn the_copy_fallback_stops_at_the_length_at_open() {
+        let dir = temp_dir("bounded-copy");
+        let source = dir.join("payload");
+        let stored = dir.join("stored");
+        std::fs::write(&source, vec![5u8; 5000]).unwrap();
+        let opened = Source::open(&source).unwrap();
+
+        copy_open_file_no_clobber(&opened.file, &stored, 1000).unwrap();
+
+        assert_eq!(std::fs::read(&stored).unwrap().len(), 1000);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
