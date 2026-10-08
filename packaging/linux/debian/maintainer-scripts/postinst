@@ -7,13 +7,16 @@ case "$1" in
         # `systemd-sysusers`/`systemd-tmpfiles` (old-dov, #738 review, round 2):
         # this package declares no dependency on systemd, and nothing past that
         # guard is safe to run without it anyway — the chown below needs the
-        # `synthaea` user sysusers would have just created, the unit it starts
-        # does not exist, and `cargo-deb`'s own injected snippet (below
-        # `#DEBHELPER#`) already skips itself the same way. A debian:12
-        # container, or a chroot used to build an image, now unpacks the
-        # files and stops there instead of aborting `dpkg -i` partway through
-        # (confirmed: skipping only the two systemd-* calls still left `chown`
-        # failing on "invalid user", since sysusers never ran to create it).
+        # `synthaea` user sysusers would have just created, and the unit it
+        # starts does not exist. A debian:12 container, or a chroot used to
+        # build an image, now unpacks the files and stops there instead of
+        # aborting `dpkg -i` partway through (confirmed: skipping only the two
+        # systemd-* calls still left `chown` failing on "invalid user", since
+        # sysusers never ran to create it). This comment must never spell out
+        # the literal token placed near the end of this file, verbatim, a
+        # second time — see the paragraph right above that token for why
+        # (old-dov caught the exact mistake here on #738's round 2, live:
+        # a syntax error from the corruption it causes).
         if [ -d /run/systemd/system ]; then
             # Strict order, each step depending on the one before (#675 live
             # install hit both failures in turn): the user/group must exist
