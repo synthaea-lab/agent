@@ -5,7 +5,7 @@
 //!
 //! Both rules are Medium until they have run on real traffic: an on-prem web
 //! app reached through a public address, an NTLM proxy or NAS with one, and old
-//! printers, scanners and NAS speaking NTLMv1 are legitimate sources of both
+//! printers, scanners and NAS speaking `NTLMv1` are legitimate sources of both
 //! (review of #744). The lab only ever produced `NTLMv2` over loopback.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
