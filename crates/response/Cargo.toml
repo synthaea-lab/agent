@@ -13,3 +13,7 @@ workspace = true
 policy = { path = "../policy" }
 schema = { path = "../schema" }
 sha2 = "0.11"
+
+[target.'cfg(unix)'.dependencies]
+# `linkat`, `O_NOFOLLOW`: the quarantine source is opened once and moved by descriptor (#689).
+libc = "0.2"
