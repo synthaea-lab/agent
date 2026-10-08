@@ -43,6 +43,7 @@ fn kernel_file_keyword_mask_respects_the_requested_event_ids() {
     let callback_ids = Arc::clone(&observed);
     let provider = Provider::by_guid(KERNEL_FILE_GUID)
         .any(mask)
+        // Same as the agent's `file_provider`, which leaves ferrisetw's default (5, verbose).
         .level(5)
         .add_callback(move |record: &EventRecord, _schema: &SchemaLocator| {
             if record.process_id() != pid {

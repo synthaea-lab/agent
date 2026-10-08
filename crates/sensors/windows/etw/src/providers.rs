@@ -855,6 +855,11 @@ pub(crate) fn smb_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
 mod file_keyword_tests {
     use super::*;
 
+    /// Guards the table's own arithmetic and that no dispatched id loses its keyword;
+    /// it compares the table with literals it also contains, so it cannot tell whether
+    /// the manifest really maps these ids to these keywords. That is checked against a
+    /// real session by `tests/kernel_file_keyword_mask.rs` (`#[ignore]`, elevated; lab
+    /// phase F of `lab/validate-windows-admin.ps1`).
     #[test]
     fn every_dispatched_file_event_is_enabled_by_its_keyword() {
         for (event_id, keyword) in FILE_EVENT_KEYWORDS {
