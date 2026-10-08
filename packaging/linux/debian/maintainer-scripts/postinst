@@ -3,6 +3,15 @@ set -e
 
 case "$1" in
     configure)
+        # Strict order, each step depending on the one before (#675 live install
+        # hit both failures in turn): the user/group must exist before anything
+        # is chowned to it, and /var/log/synthaea and /var/lib/synthaea itself
+        # are created by tmpfiles (synthaea.conf), not by this package's data.tar
+        # — chown-ing them before this runs fails with "No such file or
+        # directory", not a permissions error.
+        systemd-sysusers synthaea.conf
+        systemd-tmpfiles --create synthaea.conf
+
         # Create initial 'current' symlink if doesn't exist
         if [ ! -e /var/lib/synthaea/current ]; then
             ln -s bootstrap /var/lib/synthaea/current
@@ -11,17 +20,23 @@ case "$1" in
         # Create version directory for updater
         mkdir -p /var/lib/synthaea/versions
 
-        # Set ownership
+        # Set ownership (tmpfiles already owns the dirs themselves; this covers
+        # the bootstrap/ files unpacked by dpkg as root, and versions/ just
+        # created above).
         chown -R synthaea:synthaea /var/lib/synthaea /var/log/synthaea
 
         # Create CLI symlink
         ln -sf /var/lib/synthaea/current/cli /usr/bin/synthaea-ctl
-
-        # Activate systemd integration
-        systemd-sysusers synthaea.conf || true
-        systemd-tmpfiles --create synthaea.conf || true
         ;;
 esac
 
+# cargo-deb requires this exact token, verbatim and present exactly once —
+# it refuses to build without it when `[package.metadata.deb.systemd-units]`
+# is configured (confirmed live, #675) — and replaces it textually with the
+# deb-systemd-helper enable/start snippet its own `systemd-units` config
+# generates, so a second occurrence anywhere in this file (even inside a
+# comment explaining this token by name) gets replaced too, splitting that
+# comment around injected shell code. Never spell this token a second time
+# in this file, in a comment or otherwise.
 #DEBHELPER#
 exit 0
