@@ -1,4 +1,5 @@
-//! The canary lifecycle: plant, verify and remove (refresh is not built yet), with an on-disk inventory.
+//! The canary lifecycle: plant, verify, refresh (put back what was deleted) and remove, with an
+//! on-disk inventory.
 //!
 //! The inventory is the contract for the packaging residue rule: every file this crate
 //! creates is in it before it exists, and [`remove`] deletes exactly those files, so an
@@ -155,7 +156,7 @@ pub enum Skipped {
     /// overwritten.
     Occupied,
     /// This install planted a canary here and the file is gone: someone deleted it. It is
-    /// not recreated (refreshing is a separate policy), and the caller can tell this from a
+    /// not recreated by `plant` (that is [`refresh`]'s job), and the caller can tell this from a
     /// user's file being in the way.
     Missing,
 }
@@ -243,6 +244,82 @@ pub fn plant(canaries: &[Canary], inventory_path: &Path) -> Result<PlantReport, 
     Ok(report)
 }
 
+/// What [`refresh`] did.
+#[derive(Debug, Default)]
+pub struct RefreshReport {
+    /// Canaries that were gone and are back, with the content they were planted with.
+    pub restored: Vec<PathBuf>,
+    /// Already there with the planted content.
+    pub intact: Vec<PathBuf>,
+    /// There, but not with the planted content (modified, or replaced by someone's own data):
+    /// left alone, [`verify`] says how.
+    pub changed: Vec<PathBuf>,
+    /// Gone, but not restorable: the plan no longer produces the content the inventory
+    /// recorded (it changed since), the directory is gone, or a symlink or directory took the
+    /// name.
+    pub unrestorable: Vec<PathBuf>,
+}
+
+/// Puts back the canaries of `canaries` that are inventoried and whose file is gone.
+///
+/// The refresh policy (issue #81): a canary somebody deleted is replanted, with the content it
+/// was planted with, so the decoy is there for the next one. It only ever fills a gap:
+/// a file that is present is left as it is whatever it holds, a canary that is not in the
+/// inventory is not planted (that is [`plant`]'s job), and a path that is no longer free
+/// (a symlink, a directory) is not touched. The file is created with `create_new`, so a race
+/// with something taking the name loses to it.
+///
+/// # Errors
+///
+/// [`DeceptionError`] if the inventory cannot be read, or a file cannot be written for a reason
+/// other than the name having been taken.
+pub fn refresh(
+    canaries: &[Canary],
+    inventory_path: &Path,
+) -> Result<RefreshReport, DeceptionError> {
+    let inventory = Inventory::load(inventory_path)?;
+    let mut report = RefreshReport::default();
+    for canary in canaries {
+        let Some(known) = inventory.entries.iter().find(|e| e.path == canary.path) else {
+            continue;
+        };
+        match fs::symlink_metadata(&canary.path) {
+            Ok(meta) if meta.is_file() => match fs::read(&canary.path) {
+                Ok(bytes) if sha256_hex(&bytes) == known.sha256 => {
+                    report.intact.push(canary.path.clone());
+                }
+                _ => report.changed.push(canary.path.clone()),
+            },
+            Ok(_) => report.unrestorable.push(canary.path.clone()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let restorable = sha256_hex(canary.content.as_bytes()) == known.sha256
+                    && canary.path.parent().is_some_and(Path::is_dir);
+                if !restorable {
+                    report.unrestorable.push(canary.path.clone());
+                    continue;
+                }
+                match OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&canary.path)
+                {
+                    Ok(mut file) => {
+                        file.write_all(canary.content.as_bytes())
+                            .map_err(io_at(&canary.path))?;
+                        report.restored.push(canary.path.clone());
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        report.changed.push(canary.path.clone());
+                    }
+                    Err(e) => return Err(io_at(&canary.path)(e)),
+                }
+            }
+            Err(e) => return Err(io_at(&canary.path)(e)),
+        }
+    }
+    Ok(report)
+}
+
 /// How an inventoried canary differs from what was planted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriftKind {
@@ -319,18 +396,59 @@ impl RemoveReport {
 /// canary is a few hundred bytes; anything larger was replaced.
 const MAX_CANARY_BYTES: u64 = 64 * 1024;
 
+/// What [`ownership`] found at an inventoried path.
+enum Ownership {
+    /// Still this install's canary.
+    Ours,
+    /// Someone's own data that replaced the canary.
+    Foreign,
+    /// Not a regular file any more, or it changed while being read: a swap in progress.
+    Changed,
+}
+
+/// Size and modification time: what a swap of the path for another file changes and a
+/// read-only look cannot fake. Not an inode comparison, which would need a platform branch
+/// this crate does not have (see [`ownership`]).
+fn identity(meta: &fs::Metadata) -> (u64, Option<std::time::SystemTime>) {
+    (meta.len(), meta.modified().ok())
+}
+
+/// True when the path still names a regular file that looks like the one that was opened.
+fn still_the_opened_file(path: &Path, opened: &fs::Metadata) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|now| now.is_file() && identity(&now) == identity(opened))
+}
+
 /// Whether the file at an inventoried path is still this install's canary: unchanged, or
 /// modified but still carrying the decoy header (an attacker or a tool appended to it).
 /// Content that has neither is someone's own data that replaced the canary.
-fn is_ours(entry: &InventoryEntry) -> io::Result<bool> {
+///
+/// The file is opened once and judged from that descriptor (its type, then its content), and
+/// the path is checked again afterwards: a path swapped for a symlink or another file while
+/// it was read is [`Ownership::Changed`], not deleted. This narrows the race between looking
+/// and deleting; it does not close it. `O_NOFOLLOW | O_NONBLOCK` on open (which also stops a
+/// FIFO swapped in from blocking the open) and an inode comparison would, and both need a
+/// `cfg(unix)` branch that this crate, by the platform-code rule, does not have.
+fn ownership(entry: &InventoryEntry) -> io::Result<Ownership> {
     use io::Read as _;
-    let mut bytes = Vec::new();
-    fs::File::open(&entry.path)
-        .and_then(|file| file.take(MAX_CANARY_BYTES + 1).read_to_end(&mut bytes))?;
-    if bytes.len() as u64 > MAX_CANARY_BYTES {
-        return Ok(false);
+    let file = fs::File::open(&entry.path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() {
+        return Ok(Ownership::Changed);
     }
-    Ok(sha256_hex(&bytes) == entry.sha256 || bytes.starts_with(DECOY_HEADER.as_bytes()))
+    let mut bytes = Vec::new();
+    file.take(MAX_CANARY_BYTES + 1).read_to_end(&mut bytes)?;
+    if !still_the_opened_file(&entry.path, &opened) {
+        return Ok(Ownership::Changed);
+    }
+    if bytes.len() as u64 > MAX_CANARY_BYTES {
+        return Ok(Ownership::Foreign);
+    }
+    let ours = sha256_hex(&bytes) == entry.sha256 || bytes.starts_with(DECOY_HEADER.as_bytes());
+    Ok(if ours {
+        Ownership::Ours
+    } else {
+        Ownership::Foreign
+    })
 }
 
 /// Deletes every canary in the inventory at `inventory_path`, then the inventory itself if
@@ -356,15 +474,19 @@ pub fn remove(inventory_path: &Path) -> Result<RemoveReport, DeceptionError> {
                 report.refused.push(entry.path.clone());
                 kept.push(entry);
             }
-            Ok(_) => match is_ours(&entry) {
-                Ok(true) => match fs::remove_file(&entry.path) {
+            Ok(_) => match ownership(&entry) {
+                Ok(Ownership::Ours) => match fs::remove_file(&entry.path) {
                     Ok(()) => report.removed.push(entry.path),
                     Err(e) => {
                         report.failed.push((entry.path.clone(), e));
                         kept.push(entry);
                     }
                 },
-                Ok(false) => report.foreign.push(entry.path),
+                Ok(Ownership::Foreign) => report.foreign.push(entry.path),
+                Ok(Ownership::Changed) => {
+                    report.refused.push(entry.path.clone());
+                    kept.push(entry);
+                }
                 Err(e) => {
                     report.failed.push((entry.path.clone(), e));
                     kept.push(entry);
@@ -499,6 +621,171 @@ mod tests {
         assert!(report.is_clean());
         assert!(canaries.iter().all(|c| !c.path.exists()));
         assert!(!inventory.exists(), "no residue: the inventory goes too");
+    }
+
+    #[test]
+    fn refresh_puts_back_a_deleted_canary_with_the_content_it_was_planted_with() {
+        let (_dir, inventory, canaries) = setup();
+        plant(&canaries, &inventory).unwrap();
+        fs::remove_file(&canaries[0].path).unwrap();
+        let report = refresh(&canaries, &inventory).unwrap();
+        assert_eq!(report.restored, vec![canaries[0].path.clone()]);
+        assert_eq!(report.intact, vec![canaries[1].path.clone()]);
+        assert_eq!(
+            fs::read_to_string(&canaries[0].path).unwrap(),
+            canaries[0].content
+        );
+        assert!(verify(&Inventory::load(&inventory).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn refresh_is_a_no_op_when_nothing_is_missing() {
+        let (_dir, inventory, canaries) = setup();
+        plant(&canaries, &inventory).unwrap();
+        let report = refresh(&canaries, &inventory).unwrap();
+        assert!(report.restored.is_empty() && report.changed.is_empty());
+        assert_eq!(report.intact.len(), 2);
+    }
+
+    #[test]
+    fn refresh_leaves_a_modified_or_replaced_canary_alone() {
+        let (_dir, inventory, canaries) = setup();
+        plant(&canaries, &inventory).unwrap();
+        fs::write(&canaries[0].path, "someone's own data").unwrap();
+        let report = refresh(&canaries, &inventory).unwrap();
+        assert_eq!(report.changed, vec![canaries[0].path.clone()]);
+        assert_eq!(
+            fs::read_to_string(&canaries[0].path).unwrap(),
+            "someone's own data"
+        );
+    }
+
+    #[test]
+    fn refresh_does_not_plant_a_canary_the_inventory_does_not_know() {
+        let (_dir, inventory, canaries) = setup();
+        plant(&canaries[..1], &inventory).unwrap();
+        let report = refresh(&canaries, &inventory).unwrap();
+        assert!(report.restored.is_empty());
+        assert!(!canaries[1].path.exists());
+    }
+
+    #[test]
+    fn refresh_does_not_restore_content_the_plan_no_longer_produces() {
+        let (_dir, inventory, canaries) = setup();
+        plant(&canaries, &inventory).unwrap();
+        fs::remove_file(&canaries[0].path).unwrap();
+        let mut changed_plan = canaries.clone();
+        changed_plan[0]
+            .content
+            .push_str("a line added by a newer build\n");
+        let report = refresh(&changed_plan, &inventory).unwrap();
+        assert_eq!(report.unrestorable, vec![canaries[0].path.clone()]);
+        assert!(!canaries[0].path.exists());
+    }
+
+    #[test]
+    fn refresh_does_not_recreate_a_directory_or_touch_a_path_that_is_taken() {
+        let (dir, inventory, canaries) = setup();
+        plant(&canaries, &inventory).unwrap();
+        fs::remove_file(&canaries[0].path).unwrap();
+        fs::create_dir(&canaries[0].path).unwrap();
+        fs::remove_file(&canaries[1].path).unwrap();
+        fs::remove_dir_all(dir.path().join("share")).unwrap();
+        let report = refresh(&canaries, &inventory).unwrap();
+        assert_eq!(report.unrestorable.len(), 2);
+        assert!(!dir.path().join("share").exists());
+    }
+
+    #[test]
+    fn a_modified_canary_keeping_its_header_is_removed() {
+        let (_dir, inventory, canaries) = setup();
+        plant(&canaries, &inventory).unwrap();
+        let mut grown = canaries[0].content.clone();
+        grown.push_str("\nappended by someone");
+        fs::write(&canaries[0].path, grown).unwrap();
+        let report = remove(&inventory).unwrap();
+        assert!(report.foreign.is_empty());
+        assert!(!canaries[0].path.exists());
+    }
+
+    #[test]
+    fn a_canary_replaced_by_the_users_own_data_is_left_alone_and_dropped() {
+        let (_dir, inventory, canaries) = setup();
+        plant(&canaries, &inventory).unwrap();
+        fs::write(&canaries[0].path, "my real passwords").unwrap();
+        let report = remove(&inventory).unwrap();
+        assert_eq!(report.foreign, vec![canaries[0].path.clone()]);
+        assert!(report.is_clean());
+        assert_eq!(
+            fs::read_to_string(&canaries[0].path).unwrap(),
+            "my real passwords"
+        );
+        assert!(!canaries[1].path.exists());
+        assert!(!inventory.exists());
+    }
+
+    #[test]
+    fn a_large_replacement_is_left_alone() {
+        let (_dir, inventory, canaries) = setup();
+        plant(&canaries, &inventory).unwrap();
+        let mut big = DECOY_HEADER.to_string();
+        big.push_str(&"x".repeat(MAX_CANARY_BYTES as usize));
+        fs::write(&canaries[0].path, big).unwrap();
+        let report = remove(&inventory).unwrap();
+        assert_eq!(report.foreign.len(), 1);
+        assert!(canaries[0].path.exists());
+    }
+
+    #[test]
+    fn a_stale_inventory_temp_file_does_not_block_saving() {
+        let (_dir, inventory, canaries) = setup();
+        fs::write(inventory.with_extension("tmp"), "left by a crash").unwrap();
+        plant(&canaries, &inventory).unwrap();
+        assert_eq!(Inventory::load(&inventory).unwrap().entries.len(), 2);
+        assert!(!inventory.with_extension("tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_planted_at_the_temp_name_is_not_written_through() {
+        let (dir, inventory, canaries) = setup();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "precious").unwrap();
+        std::os::unix::fs::symlink(&victim, inventory.with_extension("tmp")).unwrap();
+        plant(&canaries, &inventory).unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+        assert_eq!(Inventory::load(&inventory).unwrap().entries.len(), 2);
+    }
+
+    #[test]
+    fn a_path_that_changed_since_it_was_opened_is_not_the_opened_file() {
+        let (_dir, inventory, canaries) = setup();
+        plant(&canaries, &inventory).unwrap();
+        let path = &canaries[0].path;
+        let opened = fs::metadata(path).unwrap();
+        assert!(still_the_opened_file(path, &opened));
+        // Grown in place (size changes), then replaced by something that is not a file.
+        fs::write(path, "a different, longer content than the canary had").unwrap();
+        assert!(!still_the_opened_file(path, &opened));
+        fs::remove_file(path).unwrap();
+        fs::create_dir(path).unwrap();
+        assert!(!still_the_opened_file(path, &opened));
+        fs::remove_dir(path).unwrap();
+        assert!(!still_the_opened_file(path, &opened));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_swapped_in_after_the_open_is_not_the_opened_file() {
+        let (dir, inventory, canaries) = setup();
+        plant(&canaries, &inventory).unwrap();
+        let path = &canaries[0].path;
+        let opened = fs::metadata(path).unwrap();
+        let target = dir.path().join("users-file");
+        fs::write(&target, &canaries[0].content).unwrap();
+        fs::remove_file(path).unwrap();
+        std::os::unix::fs::symlink(&target, path).unwrap();
+        assert!(!still_the_opened_file(path, &opened));
     }
 
     #[test]

@@ -498,6 +498,12 @@ fn halted_reason(error: &anyhow::Error) -> Option<&str> {
     })
 }
 
+fn halted_message(ring: &str, reason: &str) -> String {
+    format!(
+        "ring {ring}: content delivery is halted by the control plane ({reason}); no further content was applied, and any completed entries remain recorded"
+    )
+}
+
 /// Fetches the content manifest for `ring`, verifies it exactly like
 /// [`cmd_check_content_manifest`], and — unlike that command — actually
 /// downloads and writes every entry that's missing or stale under
@@ -525,9 +531,7 @@ pub(crate) fn cmd_apply_content_manifest(
     match apply_content_manifest(endpoint, ring, content_dir, state_path, ipc_endpoint) {
         Err(e) => match halted_reason(&e) {
             Some(reason) => {
-                println!(
-                    "ring {ring}: content delivery is halted by the control plane ({reason}); nothing was changed, the current content stays active"
-                );
+                println!("{}", halted_message(ring, reason));
                 Ok(ApplyOutcome::RingHalted)
             }
             None => Err(e),
@@ -1005,6 +1009,14 @@ mod tests {
     }
 
     #[test]
+    fn halt_message_does_not_claim_nothing_changed_after_partial_apply() {
+        assert_eq!(
+            halted_message("canary_0", "paused"),
+            "ring canary_0: content delivery is halted by the control plane (paused); no further content was applied, and any completed entries remain recorded"
+        );
+    }
+
+    #[test]
     fn another_server_error_still_fails() {
         let dir = tmp("apply-server-error");
         let url = artifact_server(vec![(500, b"boom".to_vec())]);
@@ -1141,6 +1153,46 @@ mod tests {
         assert_eq!(state.entries.get("rules/first.sigma"), Some(&e1.sha256));
         assert!(!state.entries.contains_key("rules/second.sigma"));
         // The release isn't marked applied until every entry lands.
+        assert!(!state.release_version.contains_key("canary_0"));
+    }
+
+    #[test]
+    fn a_halt_on_the_second_artifact_preserves_the_first_applied_entry() {
+        let dir = tmp("apply-halted-midway");
+        let content_dir = dir.join("content");
+        let state_path = dir.join("content-state.json");
+        let first_bytes = b"first artifact";
+        let first = entry_for("rules/first.sigma", first_bytes);
+        let second = entry_for("rules/second.sigma", b"second artifact");
+        let manifest = signed_manifest_json(9, vec![first.clone(), second]);
+        let responses = vec![
+            (200, serde_json::to_vec(&manifest).unwrap()),
+            (200, first_bytes.to_vec()),
+            (
+                423,
+                br#"{"error":"Content delivery paused during artifact download"}"#.to_vec(),
+            ),
+        ];
+        let url = artifact_server(responses);
+
+        let outcome = cmd_apply_content_manifest(
+            &endpoint_at(&url),
+            "canary_0",
+            &content_dir,
+            &state_path,
+            "unused-ipc-endpoint",
+        )
+        .expect("a mid-apply halt is an intended outcome");
+
+        assert_eq!(outcome, ApplyOutcome::RingHalted);
+        assert_eq!(
+            std::fs::read(content_dir.join("rules/first.sigma")).unwrap(),
+            first_bytes
+        );
+        assert!(!content_dir.join("rules/second.sigma").exists());
+        let state = ContentState::load(&state_path).unwrap();
+        assert_eq!(state.entries.get("rules/first.sigma"), Some(&first.sha256));
+        assert!(!state.entries.contains_key("rules/second.sigma"));
         assert!(!state.release_version.contains_key("canary_0"));
     }
 

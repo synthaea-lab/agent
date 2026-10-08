@@ -220,7 +220,17 @@ pub use path_filter::is_filtered_path;
 ///   stashes the caller's `addr` pointer per `pid_tgid` (internal to the ebpf crate).
 ///   `size` is the return value (bytes actually received). `recv(2)` is not
 ///   captured: glibc issues it as `recvfrom(..., NULL, NULL)`, which the probe skips.
-pub const WIRE_VERSION: u32 = 22;
+/// - v23: `SocketCreateEvent` added (issue #263) — `socket(2)`, for context rather
+///   than an address: `domain`/`type`/`protocol` are the caller's own arguments
+///   (already available at `sys_enter`, unlike `bind`/`connect`'s sockaddr), but the
+///   resulting fd only exists once the call returns, so this still uses the paired
+///   `sys_enter_socket`/`sys_exit_socket` shape — the entry probe stashes the three
+///   caller arguments per `pid_tgid` (internal to the ebpf crate), and the exit probe
+///   reads them back together with the fd. Only emitted on success (`fd >= 0`); no
+///   address filtering happens here (unlike `connect`/`bind`, `socket(2)` isn't
+///   necessarily `AF_INET`/`AF_INET6` — `AF_PACKET`/`AF_NETLINK`/raw sockets are
+///   exactly the kind of creation this event exists to surface).
+pub const WIRE_VERSION: u32 = 23;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
@@ -548,6 +558,26 @@ pub struct SocketAcceptEvent {
     pub peer_addr_v6: [u8; 16],
     pub peer_port: u16,
     pub is_ipv6: bool,
+}
+
+/// Socket creation (`syscalls:sys_enter_socket` + `sys_exit_socket`, issue #263) —
+/// context only: the address family, type and protocol the caller asked for, and
+/// the fd the kernel handed back. See this file's `WIRE_VERSION` v23 changelog for
+/// the `sys_enter`/`sys_exit` correlation. Only emitted on success.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SocketCreateEvent {
+    pub meta: EventMeta,
+    /// `AF_INET`, `AF_INET6`, `AF_PACKET`, `AF_NETLINK`, ... — not filtered, unlike
+    /// `ConnectEvent`/`SocketBindEvent`: a non-IP domain is exactly the signal this
+    /// event exists to carry.
+    pub domain: i32,
+    /// `SOCK_STREAM`, `SOCK_DGRAM`, `SOCK_RAW`, ... masked of `SOCK_CLOEXEC`/
+    /// `SOCK_NONBLOCK`, which the kernel ORs into the same argument.
+    pub socket_type: i32,
+    pub protocol: i32,
+    /// The new fd (`socket(2)`'s return value).
+    pub fd: u32,
 }
 
 /// Mount/unmount (`syscalls:sys_enter_mount`/`sys_enter_umount`, issue #362 — the
