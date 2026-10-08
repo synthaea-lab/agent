@@ -57,6 +57,10 @@ const MARK_QUEUE_CAPACITY: usize = 256;
 /// this to fire, the cap only bounds a runaway client.
 const LDAP_PER_PID_LIMIT: u32 = 128;
 const LDAP_PER_PID_WINDOW_NS: u64 = 10_000_000_000;
+/// An identical NTLM authentication (direction, account, target, address, version) is
+/// reported once per this window (#364): most come from pid 4, so there is no per-process
+/// budget.
+const NTLM_DEDUP_WINDOW_NS: u64 = 60_000_000_000;
 
 /// Stops an orphaned ETW session. Named sessions are kernel objects that outlive
 /// the creating process: after a `taskkill /f` or crash the session stays Running
@@ -506,7 +510,7 @@ impl Sensor for WindowsSensor {
                 LDAP_PER_PID_LIMIT,
                 LDAP_PER_PID_WINDOW_NS,
             )),
-            ntlm: Mutex::new(budget::KeyDedup::new(60_000_000_000)),
+            ntlm: Mutex::new(budget::KeyDedup::new(NTLM_DEDUP_WINDOW_NS)),
             canary_path: canary_file
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())

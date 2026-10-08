@@ -729,6 +729,12 @@ pub(crate) fn ntlm_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         if !state.ntlm.lock().unwrap().first(&key, timestamp_ns) {
             return;
         }
+        // Only `NTLMv2` was ever observed; the weak-version rule matches the other
+        // spellings loosely. Log any version that is not `NTLMv2` (once per dedup key) so
+        // the first real sample of `NTLMv1`/`LM` shows how the provider writes it.
+        if !ntlm_version.trim().eq_ignore_ascii_case("NTLMv2") {
+            tracing::debug!(version = %ntlm_version, "NTLM version other than NTLMv2");
+        }
         // `ProcessPID` and `Status` are integers the event viewer *displays*
         // in hex (`0x4`, `0xc000006d`): a string parse fails on them (lab:
         // the header pid, lsass, and an empty status came out). Integer

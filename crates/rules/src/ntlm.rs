@@ -2,6 +2,11 @@
 //! the kernel (SMB) and is not used; both rules key on the protocol facts the
 //! provider does report reliably: where the authentication went, and which
 //! NTLM version was negotiated.
+//!
+//! Both rules are Medium until they have run on real traffic: an on-prem web
+//! app reached through a public address, an NTLM proxy or NAS with one, and old
+//! printers, scanners and NAS speaking NTLMv1 are legitimate sources of both
+//! (review of #744). The lab only ever produced `NTLMv2` over loopback.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -45,7 +50,7 @@ pub fn evaluate_ntlm_auth(event: &NtlmAuthEvent) -> Vec<Alert> {
     {
         alerts.push(Alert {
             technique: NTLM_TO_INTERNET,
-            severity: Severity::High,
+            severity: Severity::Medium,
             message: who("NTLM authentication sent to an Internet address"),
         });
     }
@@ -56,7 +61,7 @@ pub fn evaluate_ntlm_auth(event: &NtlmAuthEvent) -> Vec<Alert> {
         };
         alerts.push(Alert {
             technique: NTLM_DOWNGRADE,
-            severity: Severity::High,
+            severity: Severity::Medium,
             message: who(&format!(
                 "{direction} NTLM authentication with a weak version"
             )),
@@ -67,9 +72,19 @@ pub fn evaluate_ntlm_auth(event: &NtlmAuthEvent) -> Vec<Alert> {
 
 /// `NTLMv1` (any variant, e.g. with session security) or `LM`, as the provider
 /// spells the negotiated version. `NTLMv2` is not weak.
+///
+/// Only `NTLMv2` was ever observed, so the other spellings come from the manifest
+/// and are matched loosely: case, spaces and punctuation are ignored (`NTLM V1`,
+/// `ntlmv1 (ESS)`, `NTLMv1 with ESS`). A spelling this misses makes the rule
+/// silent, which is why the sensor logs every version that is not `NTLMv2`.
 fn is_weak_version(version: &str) -> bool {
-    let v = version.trim().to_ascii_lowercase();
-    v.starts_with("ntlmv1") || v == "lm" || v.starts_with("lm ")
+    let tokens: Vec<String> = version
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let compact = tokens.concat();
+    compact.starts_with("ntlmv1") || tokens.first().is_some_and(|t| t == "lm")
 }
 
 /// An address that routes over the Internet: not loopback, private,
@@ -89,6 +104,8 @@ fn is_internet_v4(v4: Ipv4Addr) -> bool {
     let [a, b, ..] = v4.octets();
     let carrier_grade_nat = a == 100 && (64..128).contains(&b);
     let benchmarking = a == 198 && (b == 18 || b == 19);
+    // 192.0.0.0/24, IETF protocol assignments.
+    let ietf_assignments = v4.octets()[..3] == [192, 0, 0];
     !(v4.is_private()
         || v4.is_loopback()
         || v4.is_link_local()
@@ -98,6 +115,7 @@ fn is_internet_v4(v4: Ipv4Addr) -> bool {
         || v4.is_unspecified()
         || carrier_grade_nat
         || benchmarking
+        || ietf_assignments
         || a == 0
         || a >= 240)
 }
@@ -215,11 +233,57 @@ mod tests {
     }
 
     #[test]
-    fn both_rules_can_fire_together_with_high_severity() {
+    fn both_rules_can_fire_together_at_medium_severity() {
         let alerts = evaluate_ntlm_auth(&ntlm(NtlmDirection::Outgoing, "1.1.1.1", "NTLMv1"));
         assert_eq!(alerts.len(), 2);
-        assert!(alerts.iter().all(|a| a.severity == Severity::High));
+        assert!(alerts.iter().all(|a| a.severity == Severity::Medium));
         assert!(alerts[0].message.contains("account=CORP\\alice"));
+    }
+
+    #[test]
+    fn weak_versions_are_matched_whatever_the_spelling() {
+        for spelling in [
+            "NTLMv1",
+            "ntlmv1",
+            "NTLM V1",
+            "NTLMv1 (ESS)",
+            "NTLMv1 with ESS",
+            "NTLMv1-ESS",
+            "  NTLMv1  ",
+            "LM",
+            "lm",
+            "LM, NTLMv1",
+            "LM with ESS",
+        ] {
+            assert_eq!(
+                techniques(&ntlm(NtlmDirection::Outgoing, "10.0.0.5", spelling)),
+                [NTLM_DOWNGRADE],
+                "{spelling:?}"
+            );
+        }
+        for strong in [
+            "NTLMv2",
+            "ntlmv2",
+            "NTLM V2",
+            "NTLMv2 with MIC",
+            "",
+            "unknown",
+        ] {
+            assert!(
+                techniques(&ntlm(NtlmDirection::Outgoing, "10.0.0.5", strong)).is_empty(),
+                "{strong:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ietf_protocol_assignment_range_is_not_the_internet() {
+        assert!(techniques(&ntlm(NtlmDirection::Outgoing, "192.0.0.9", "NTLMv2")).is_empty());
+        assert_eq!(
+            techniques(&ntlm(NtlmDirection::Outgoing, "192.0.1.9", "NTLMv2")),
+            [NTLM_TO_INTERNET],
+            "192.0.1.0/24 is not part of the reserved /24"
+        );
     }
 
     #[test]
