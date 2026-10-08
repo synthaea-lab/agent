@@ -22,7 +22,10 @@
 //! `Quarantined`, with the digest of the prefix. A write is noticed from the size and the
 //! modification time, so one that keeps both (an overwrite within a single timestamp tick, a
 //! write through a shared mapping) can go unnoticed; this depends on the filesystem and was not
-//! measured. When the file is copied rather than linked, only the opened name is removed:
+//! measured. The re-check after the link or the copy narrows the window between the hash and
+//! the removal of the source name but cannot close it: a write after the last check still
+//! leaves stored bytes that differ from the digest (`restore` then reports a mismatch).
+//! When the file is copied rather than linked, only the opened name is removed:
 //! other hard links to the original inode keep their execute bits. A hard-linked
 //! payload shares its inode with the source, so a process that already holds it open for
 //! writing can still change the quarantined file (`restore` then reports a hash mismatch);
@@ -300,7 +303,10 @@ fn copy_prefix_hashed(
         }
     };
     // Nobody else can hold the lock of a file that did not exist a moment ago; a failure here
-    // is not worth failing the snapshot for, the grace period still protects a fresh file.
+    // is not worth failing the snapshot for. Without the lock, only the grace period protects
+    // the file, and only while the copy keeps writing (its mtime stays fresh): a copy that
+    // stalls for longer than `SNAPSHOT_GRACE` on a slow device could be swept by another
+    // process. That is accepted, because it needs a failed lock on a new file and a stall.
     let _ = try_lock_exclusive(&out);
     match sha256_copy(&mut source, &mut out).and_then(|digest| out.sync_all().map(|()| digest)) {
         Ok(digest) => Ok((temp, digest, out)),
