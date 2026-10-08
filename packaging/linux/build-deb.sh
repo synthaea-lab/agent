@@ -29,9 +29,19 @@ command -v bpf-linker >/dev/null || fail "install bpf-linker with lab/provisioni
 
 # cargo-deb only packages; build the exact musl artifacts ourselves so Cargo
 # cannot re-enable ml's default download-binaries feature.
-if ! command -v cargo-deb >/dev/null 2>&1; then
-    echo "cargo-deb not found. Installing..."
-    cargo install cargo-deb --locked
+#
+# Pinned, not "whichever is already on PATH": cargo-deb's generated
+# #DEBHELPER# snippet (the systemd-sysusers/enable/start block injected into
+# this package's postinst) is cargo-deb's own template, not ours, and differs
+# across releases — old-dov's #738 review ran 3.8.0 live and reported its
+# exact generated content, which this package's own postinst now documents
+# assumptions about. Reinstall whenever a different version is on PATH, not
+# only when cargo-deb is entirely missing.
+CARGO_DEB_VERSION="3.8.0"
+installed_version="$(cargo-deb --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+if [ "$installed_version" != "$CARGO_DEB_VERSION" ]; then
+    echo "cargo-deb $CARGO_DEB_VERSION required (found: ${installed_version:-none}). Installing..."
+    cargo install cargo-deb --version "$CARGO_DEB_VERSION" --locked --force
 fi
 
 if [ -z "${ORT_LIB_LOCATION:-}" ]; then
