@@ -22,8 +22,9 @@
 //! - **F-5**: NT device paths normalize through a real `QueryDosDeviceW` volume map,
 //!   not a hardcoded `C:`, then 8.3 short components expand to their long names
 //!   (#489) so one file has one path.
-//! - **F-6** (partial): `CreateNewFile` (EID 30) joins `NameCreate` (EID 12); full
-//!   delete/rename semantics need schema variants and land with the ransomware pack
+//! - **F-6** (partial): `CreateNewFile` (EID 30) joins `NameCreate` (EID 12), and
+//!   `DeletePath` (EID 26) is kept for one case, a `:Zone.Identifier` stream
+//!   deletion (#442); full delete/rename semantics land with the ransomware pack
 //!   (#82) / driver (#39).
 //! - **F-7**: IPv6 connects (EID 58/26) are first-class, and a short dedup window
 //!   prevents Connect+Send double-counting.
@@ -35,6 +36,8 @@
 //! stream (mark-of-the-web) is read back and reported as
 //! `schema::FileQuarantineEvent`, the macOS quarantine-xattr sibling — see
 //! [`zone_identifier`].
+//! Deleting that stream (the mark removed, T1553.005) is reported as a
+//! `schema::FileDeleteEvent` of the stream path (#442).
 
 #[cfg(any(windows, test))]
 mod amsi;

@@ -63,10 +63,19 @@ pub(crate) struct DetectionSink {
     /// `<content_root>/rules/yara` is absent. `Mutex`-wrapped for the same
     /// reload reason as `sigma`.
     yara: Mutex<Option<(yara::ScanQueue, usize)>>,
+    /// Budgeted YARA scanning of one process's memory (#85, ADR-0023), requested by a
+    /// detection about that process (today the memfd-exec rule, T1620), never swept.
+    /// `None` when `<content_root>/rules/yara` is absent, and on every platform but
+    /// Linux. `Mutex`-wrapped for the same reload reason as `yara`.
+    memscan: Mutex<Option<yara::MemoryScanQueue>>,
     /// Enrichment (hash + signature) and the high-volume raw-event logging, off the
     /// drain thread (issue #126). The capture thread runs detection in memory and
     /// hands the event here with a non-blocking send.
     enrich_queue: EnrichQueue,
+    /// Structured findings are persisted on the enrichment worker. A full
+    /// queue falls back to a direct append so overload does not silently drop
+    /// a detection.
+    detection_spool: Option<Arc<Mutex<store::EventSpool>>>,
     /// Liveness counter for the watchdog's heartbeat monitor (#102): incremented
     /// once `on_event` has fully processed an event, so `agent::heartbeat`'s
     /// writer thread can sample it and expose real forward progress — not just
@@ -95,6 +104,21 @@ pub(crate) struct DetectionSink {
     /// runtime, so re-resolving on every reload would add nothing but a
     /// syscall.
     content_root: PathBuf,
+    /// The planted canary files (#81), set once at start by [`Self::set_tripwires`]; empty
+    /// of effect when the operator configured no `[deception]` directories.
+    tripwires: std::sync::OnceLock<deception::Tripwires>,
+    /// Executables allowed to touch a canary without a detection (`[deception] allow_exe`),
+    /// set once with the tripwires.
+    canary_allow: std::sync::OnceLock<crate::deception::CanaryAllow>,
+    /// When each `(canary, pid, incarnation of pid)` last raised a detection (event time,
+    /// ns), so a tool that reads the same canary again and again raises one finding per
+    /// cooldown, not one per open. Only read opens are absorbed (see [`absorbable`]);
+    /// bounded; the hits it absorbs are counted in `canary_hits_absorbed`.
+    canary_last_hit: Mutex<store::BoundedMap<CanaryKey, u64>>,
+    canary_hits_absorbed: AtomicU64,
+    /// The ransomware reflex's trigger (#82): a process that raised the burst rule and
+    /// touched a canary inside one window. See [`crate::ransomware_join`].
+    ransomware_join: Mutex<crate::ransomware_join::RansomwareJoin>,
 }
 
 /// The verdict entity an event belongs to: `(ppid, comm)` plus the incarnation of the
@@ -104,6 +128,59 @@ fn entity_key(meta: &schema::EventMeta) -> verdict::EntityKey {
     verdict::EntityKey::new(meta.ppid, meta.comm.clone())
         .with_parent_generation(meta.parent_process_generation)
 }
+
+/// The ATT&CK technique the memfd-exec rule reports (`rules`, T1620 reflective code
+/// loading): the trigger for a memory scan of that process (#85).
+const MEMFD_EXEC_TECHNIQUE: &str = "T1620";
+
+/// The ATT&CK technique the ransomware rules report (T1486): its detection carries a
+/// damage manifest of the process's recent renames and deletions (#82).
+const RANSOMWARE_TECHNIQUE: &str = "T1486";
+
+/// The ATT&CK technique a canary hit reports: someone looked through files nothing
+/// legitimate reads (T1083 file and directory discovery). The rule id names the provenance.
+const CANARY_TECHNIQUE: &str = "T1083";
+
+/// `(canary path, pid, process incarnation)`: the incarnation, when the sensor stamps one,
+/// keeps a process that reuses the pid inside the cooldown from being absorbed as its
+/// predecessor.
+type CanaryKey = (PathBuf, u32, Option<u64>);
+
+/// Open flags that mean write intent on Linux (`O_WRONLY | O_RDWR | O_CREAT`), the same
+/// mask the YARA trigger uses. On a platform whose flags mean something else the mask can
+/// only let more opens through, never absorb more.
+const WRITE_INTENT_FLAGS: u32 = 0o103;
+
+/// Whether a repeat of this touch may be absorbed by the cooldown. Only a read open may: a
+/// delete, a rename or a write-intent open is the destructive touch an encryptor makes after
+/// reading, and absorbing it behind the first open would hide the one finding an analyst
+/// needs. Those always raise a detection (bounded by the number of canaries).
+fn absorbable(touch: &deception::Touch) -> bool {
+    matches!(touch, deception::Touch::Open { flags } if flags & WRITE_INTENT_FLAGS == 0)
+}
+
+/// How long one process's repeat touches of one canary are absorbed after a detection.
+const CANARY_COOLDOWN_NS: u64 = 60 * 1_000_000_000;
+
+/// Most `(canary, pid)` pairs the cooldown remembers; the oldest are evicted first, which
+/// at worst lets one more detection through.
+const CANARY_COOLDOWN_KEYS: usize = 1024;
+
+/// The reason the audit line gives when the ransomware reflex kills (#82). A trigger of its
+/// own, never severity or the Bayes gate: it needs both the burst rule and a canary touch
+/// from the same process (`crate::ransomware_join`).
+const RANSOMWARE_REFLEX_REASON: &str =
+    "a corroborated ransomware signal (burst rule + canary touch)";
+
+/// `DetectionSource::Rule` id of a canary hit. `DetectionSource` is part of the
+/// semi-frozen schema, so deception provenance rides in the rule id until a dedicated
+/// variant is decided (#81).
+const CANARY_RULE_ID: &str = "DECEPTION-CANARY";
+
+/// Most renames and deletions a ransomware detection carries beyond its triggering event.
+/// A bound on the size of one detection: the correlator window is 60 s, and a fast
+/// encryptor renames far more than this in it.
+const DAMAGE_MANIFEST_MAX: usize = 100;
 
 /// The escalation decision (#612) as a free function so the YARA scan worker, which
 /// has no `DetectionSink`, raises the same alert as every other engine (#614).
@@ -208,6 +285,7 @@ impl DetectionSink {
         alerts_path: &std::path::Path,
         events_path: Option<&std::path::Path>,
         spool: Option<Arc<Mutex<store::EventSpool>>>,
+        detection_spool: Option<Arc<Mutex<store::EventSpool>>>,
         content_dir: &Path,
         model_root: &Path,
     ) -> std::io::Result<Self> {
@@ -223,18 +301,29 @@ impl DetectionSink {
         let events_log = events_path
             .map(|path| JsonlWriter::open(path).map(Arc::new))
             .transpose()?;
-        let enrich_queue = EnrichQueue::start(enrich::Enricher::new(), move |event| {
-            if let Some(events_log) = &events_log {
-                events_log.write(&event);
-            }
-            if let Some(spool) = &spool
-                && let Err(e) = spool.lock().unwrap().push(&event)
-            {
-                // Spool full is handled inside push (shed-oldest, counted);
-                // reaching here is a real I/O failure — degrade to local-only.
-                tracing::warn!(error = %e, "spool append failed — event stays local-only");
-            }
-        });
+        let detection_spool_for_worker = detection_spool.clone();
+        let enrich_queue = EnrichQueue::start_with_detections(
+            enrich::Enricher::new(),
+            move |event| {
+                if let Some(events_log) = &events_log {
+                    events_log.write(&event);
+                }
+                if let Some(spool) = &spool
+                    && let Err(e) = spool.lock().unwrap().push(&event)
+                {
+                    // Spool full is handled inside push (shed-oldest, counted);
+                    // reaching here is a real I/O failure — degrade to local-only.
+                    tracing::warn!(error = %e, "spool append failed — event stays local-only");
+                }
+            },
+            move |detection| {
+                if let Some(spool) = &detection_spool_for_worker
+                    && let Err(e) = crate::upload::persist_detection(spool, detection)
+                {
+                    tracing::warn!(error = %e, "detection spool append failed");
+                }
+            },
+        );
         let response: Arc<Mutex<Option<ResponseHooks>>> = Arc::new(Mutex::new(None));
         let verdict = Arc::new(Mutex::new(verdict::VerdictEngine::new(
             VERDICT_DEDUP_WINDOW_NS,
@@ -253,12 +342,21 @@ impl DetectionSink {
                 )
                 .into_option(),
             ),
+            memscan: Mutex::new(
+                start_memscan(&content_root, alert_log.clone(), verdict.clone()).into_option(),
+            ),
             alert_log,
             enrich_queue,
+            detection_spool,
             progress: Arc::new(AtomicU64::new(0)),
             response,
             verdict,
             content_root,
+            tripwires: std::sync::OnceLock::new(),
+            canary_allow: std::sync::OnceLock::new(),
+            canary_last_hit: Mutex::new(store::BoundedMap::new(CANARY_COOLDOWN_KEYS)),
+            canary_hits_absorbed: AtomicU64::new(0),
+            ransomware_join: Mutex::new(crate::ransomware_join::RansomwareJoin::new()),
         })
     }
 
@@ -288,6 +386,11 @@ impl DetectionSink {
             self.response.clone(),
             self.verdict.clone(),
         );
+        let memscan_loaded = start_memscan(
+            &self.content_root,
+            self.alert_log.clone(),
+            self.verdict.clone(),
+        );
 
         // The replaced engines are dropped after the locks are released: a
         // `ScanQueue` joins its worker on drop, which must not stall capture.
@@ -310,6 +413,17 @@ impl DetectionSink {
         let yara_rule_count = yara_slot.as_ref().map(|(_, count)| *count);
         drop(yara_slot);
         drop(old_yara);
+
+        // Same rules, same posture as the file scanner: absent unloads, broken keeps
+        // the previous queue (its failure is already reported through `yara`).
+        let mut memscan_slot = self.memscan.lock().unwrap();
+        let old_memscan = match memscan_loaded {
+            Load::Loaded(queue) => memscan_slot.replace(queue),
+            Load::Absent => memscan_slot.take(),
+            Load::Failed => None,
+        };
+        drop(memscan_slot);
+        drop(old_memscan);
 
         ReloadReport {
             sigma_rule_count,
@@ -430,6 +544,32 @@ impl DetectionSink {
         severity: schema::detection::Severity,
         event: &Event,
     ) -> Option<verdict::Verdict> {
+        self.record_and_emit_with(
+            entity,
+            technique,
+            message,
+            source,
+            severity,
+            event,
+            Vec::new(),
+        )
+    }
+
+    /// [`Self::record_and_emit`] with further evidence events after the triggering one.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one more than the plain call: the extra evidence, appended after the trigger"
+    )]
+    fn record_and_emit_with(
+        &self,
+        entity: &verdict::EntityKey,
+        technique: &str,
+        message: &str,
+        source: schema::detection::DetectionSource,
+        severity: schema::detection::Severity,
+        event: &Event,
+        evidence: Vec<Event>,
+    ) -> Option<verdict::Verdict> {
         let now_ns = event.meta().timestamp_ns;
         let detection = schema::detection::Detection {
             timestamp_ns: now_ns,
@@ -439,8 +579,9 @@ impl DetectionSink {
             score: None,
             attributions: Vec::new(),
             techniques: techniques_from(technique),
-            events: vec![event.clone()],
+            events: std::iter::once(event.clone()).chain(evidence).collect(),
         };
+        let spooled = self.detection_spool.as_ref().map(|_| detection.clone());
         let result =
             self.verdict
                 .lock()
@@ -449,6 +590,18 @@ impl DetectionSink {
         self.emit(technique, message);
         if let Some(fused) = &result {
             self.maybe_escalate(fused);
+        }
+        if let (Some(spool), Some(detection)) = (&self.detection_spool, spooled)
+            && let Err(detection) = self.enrich_queue.enqueue_detection(detection)
+        {
+            // The queue is full, so the capture thread does this file append
+            // itself, which the #126 design otherwise keeps off it. Under sustained
+            // overload every finding takes this path; accepted on purpose (a finding
+            // is never lost), and only reached once the queue is already shedding.
+            tracing::warn!("detection queue full; persisting on capture thread");
+            if let Err(e) = crate::upload::persist_detection(spool, *detection) {
+                tracing::error!(error = %e, "detection spool append failed on fallback");
+            }
         }
         result
     }
@@ -462,6 +615,129 @@ impl DetectionSink {
         escalate_if_warranted(&self.alert_log, fused);
     }
 
+    /// Asks for a budgeted YARA scan of the memory of the process behind `event` (#85):
+    /// the payload of a fileless exec exists only there. The scan queue applies the
+    /// cooldown, the global cap and the per-scan budget; a shed request is counted there.
+    fn request_memory_scan(&self, event: &Event) {
+        let guard = self.memscan.lock().unwrap();
+        let Some(queue) = guard.as_ref() else {
+            return;
+        };
+        let meta = event.meta();
+        queue.enqueue(
+            meta.pid,
+            meta.process_generation,
+            meta.timestamp_ns,
+            Some(yara::ScanContext {
+                ppid: meta.ppid,
+                comm: meta.comm.clone(),
+                parent_generation: meta.parent_process_generation,
+                timestamp_ns: meta.timestamp_ns,
+                // The #594 gate is about reading a path the requester named, as the agent
+                // with `CAP_DAC_READ_SEARCH`. A memory scan reads no named path: it reads
+                // `/proc/<pid>/mem`, which the kernel gates by `ptrace_may_access` (ADR-0023).
+                requester: None,
+            }),
+        );
+    }
+
+    /// Installs the planted canaries (#81). Called once, before the sensor starts; a second
+    /// call is ignored.
+    pub(crate) fn set_tripwires(&self, tripwires: deception::Tripwires) {
+        let _ = self.tripwires.set(tripwires);
+    }
+
+    /// Installs the executables allowed to touch a canary (#81). Called once, with the
+    /// tripwires.
+    pub(crate) fn set_canary_allow(&self, allow: crate::deception::CanaryAllow) {
+        let _ = self.canary_allow.set(allow);
+    }
+
+    /// A touch of a planted canary by any process but the agent itself is a detection:
+    /// nothing legitimate reads these files. The agent's own pid is skipped because it
+    /// writes them at start and verifies them later.
+    fn detect_canary(&self, event: &Event) {
+        let Some(tripwires) = self.tripwires.get() else {
+            return;
+        };
+        let Some(hit) = tripwires.matches(event) else {
+            return;
+        };
+        if hit.pid == std::process::id() {
+            return;
+        }
+        if self
+            .canary_allow
+            .get()
+            .is_some_and(|allow| allow.allows(hit.pid))
+        {
+            tracing::debug!(
+                pid = hit.pid,
+                "deception: canary touch by an allowed executable"
+            );
+            return;
+        }
+        let meta = event.meta();
+        let corroborated = self.ransomware_join.lock().unwrap().note_canary(
+            hit.pid,
+            meta.process_generation,
+            meta.timestamp_ns,
+        );
+        if absorbable(&hit.touch)
+            && self.canary_in_cooldown(
+                (hit.canary.path.clone(), hit.pid, meta.process_generation),
+                meta.timestamp_ns,
+            )
+        {
+            let absorbed = self.canary_hits_absorbed.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::debug!(
+                pid = hit.pid,
+                absorbed,
+                "deception: repeat canary touch absorbed"
+            );
+            // The finding was raised by the touch that started the cooldown; the reflex
+            // does not wait for a new one.
+            if corroborated {
+                self.ransomware_reflex(hit.pid);
+            }
+            return;
+        }
+        let message = format!(
+            "canary file touched: {} ({:?}) by pid {} ({})",
+            hit.canary.path.display(),
+            hit.touch,
+            hit.pid,
+            meta.comm
+        );
+        self.record_and_emit_with(
+            &entity_key(meta),
+            CANARY_TECHNIQUE,
+            &message,
+            schema::detection::DetectionSource::Rule {
+                rule_id: CANARY_RULE_ID.to_string(),
+            },
+            schema::detection::Severity::High,
+            event,
+            Vec::new(),
+        );
+        if corroborated {
+            self.ransomware_reflex(hit.pid);
+        }
+    }
+
+    /// True when `key` already raised a detection within the cooldown; otherwise records
+    /// this touch as the one that did.
+    fn canary_in_cooldown(&self, key: CanaryKey, now_ns: u64) -> bool {
+        let mut last = self.canary_last_hit.lock().unwrap();
+        if let Some(&at) = last.peek(&key)
+            && now_ns.saturating_sub(at) < CANARY_COOLDOWN_NS
+        {
+            return true;
+        }
+        last.insert(key, now_ns);
+        false
+    }
+
     /// [`Self::record_and_emit`] for a batch of plain `rules::Alert`s (no Sigma/
     /// correlator-specific `DetectionSource` needed) — the common case for every
     /// `rule_state`/`rules::evaluate_*` call site.
@@ -469,18 +745,53 @@ impl DetectionSink {
         let meta = event.meta();
         let entity = entity_key(meta);
         for alert in alerts {
+            if alert.technique == MEMFD_EXEC_TECHNIQUE {
+                self.request_memory_scan(event);
+            }
             let source = schema::detection::DetectionSource::Rule {
                 rule_id: alert.technique.to_string(),
             };
-            self.record_and_emit(
+            let is_burst = alert.technique == RANSOMWARE_TECHNIQUE;
+            let corroborated = is_burst && self.note_ransomware_burst(event);
+            let manifest = if is_burst {
+                self.damage_manifest(event)
+            } else {
+                Vec::new()
+            };
+            self.record_and_emit_with(
                 &entity,
                 alert.technique,
                 &alert.message,
                 source,
                 alert.severity,
                 event,
+                manifest,
             );
+            if corroborated {
+                self.ransomware_reflex(event.meta().pid);
+            }
         }
+    }
+
+    /// The damage manifest of a ransomware alert (issue #82): the file renames and
+    /// deletions of the alerting process incarnation that the rule state remembers (the
+    /// newest `DAMAGE_MANIFEST_MAX`), oldest first, without the triggering event (which is
+    /// the detection's first event already). It rides in `Detection::events`, so no schema
+    /// change: the control plane keeps events after the first as the detection's further
+    /// triggering events, and a restoration tool reads the scope from them.
+    ///
+    /// Takes the rule-state lock: callers must not hold it (see `detect_file_rename`).
+    fn damage_manifest(&self, trigger: &Event) -> Vec<Event> {
+        let meta = trigger.meta();
+        let mut touched = self
+            .rule_state
+            .lock()
+            .unwrap()
+            .touched_files(meta.pid, meta.process_generation);
+        touched.retain(|e| e != trigger);
+        let excess = touched.len().saturating_sub(DAMAGE_MANIFEST_MAX);
+        touched.drain(..excess);
+        touched
     }
 
     /// Cross-event correlation (co-occurrence rules + Bayesian belief).
@@ -581,6 +892,12 @@ impl DetectionSink {
     /// Issue #25: policy-gates killing the process behind a high-confidence
     /// correlated verdict. A no-op whenever `enable_response` was never called.
     fn maybe_kill(&self, pid: u32) {
+        self.kill_for(pid, "a high-confidence correlated verdict");
+    }
+
+    /// The policy-gated kill behind every automated trigger; `reason` names which one, in
+    /// the audit line (`RESPONSE-KILL`).
+    fn kill_for(&self, pid: u32, reason: &str) {
         let guard = self.response.lock().unwrap();
         let Some(hooks) = guard.as_ref() else {
             return;
@@ -588,24 +905,36 @@ impl DetectionSink {
         let outcome = response::kill_process(pid, &hooks.policy, |p| (hooks.terminate)(p));
         drop(guard);
         let message = match outcome {
-            response::KillOutcome::Killed { pid } => {
-                format!("killed pid {pid} on a high-confidence correlated verdict")
-            }
+            response::KillOutcome::Killed { pid } => format!("killed pid {pid} on {reason}"),
             response::KillOutcome::ObserveOnly { pid } => {
-                format!(
-                    "pid {pid} would have been killed on a high-confidence correlated verdict (observe-only)"
-                )
+                format!("pid {pid} would have been killed on {reason} (observe-only)")
             }
             response::KillOutcome::Failed { pid, error } => {
-                format!("failed to kill pid {pid} on a high-confidence correlated verdict: {error}")
+                format!("failed to kill pid {pid} on {reason}: {error}")
             }
-            response::KillOutcome::Refused { pid, reason } => {
-                format!(
-                    "refused to kill pid {pid} on a high-confidence correlated verdict: {reason}"
-                )
+            response::KillOutcome::Refused { pid, reason: why } => {
+                format!("refused to kill pid {pid} on {reason}: {why}")
             }
         };
         self.emit("RESPONSE-KILL", &message);
+    }
+
+    /// The process behind `event` raised the ransomware burst rule (#82). True when it also
+    /// touched a canary in the window: the corroborated signal. The caller records the
+    /// detection first and then calls [`Self::ransomware_reflex`].
+    fn note_ransomware_burst(&self, event: &Event) -> bool {
+        let meta = event.meta();
+        self.ransomware_join.lock().unwrap().note_burst(
+            meta.pid,
+            meta.process_generation,
+            meta.timestamp_ns,
+        )
+    }
+
+    /// The reflex: the policy-gated kill of the corroborated process. Observe-only unless
+    /// kill is enabled, like every other automated kill.
+    fn ransomware_reflex(&self, pid: u32) {
+        self.kill_for(pid, RANSOMWARE_REFLEX_REASON);
     }
 
     /// Exec events: stateless rules, stateful rules, then Sigma.
@@ -650,6 +979,21 @@ impl DetectionSink {
             && let Some((yara, _)) = self.yara.lock().unwrap().as_ref()
         {
             let meta = wrapped.meta();
+            let requester = match meta.user {
+                schema::User::Unix { uid, gid } => Some(yara::Requester { uid, gid }),
+                // No uid to check on this platform: scanned as before.
+                _ if !cfg!(unix) => None,
+                // On unix a user the sensor could not resolve must not fall through to
+                // the unrestricted read, which runs with `CAP_DAC_READ_SEARCH` (#594).
+                _ => {
+                    tracing::warn!(
+                        pid = meta.pid,
+                        path = %event.path,
+                        "yara: not scanning a path opened by a user the sensor could not resolve"
+                    );
+                    return;
+                }
+            };
             yara.enqueue_for(
                 std::path::PathBuf::from(&event.path),
                 yara::ScanContext {
@@ -657,6 +1001,9 @@ impl DetectionSink {
                     comm: meta.comm.clone(),
                     parent_generation: meta.parent_process_generation,
                     timestamp_ns: meta.timestamp_ns,
+                    // The path is whatever the process named, even when the kernel
+                    // refused the open: scan it only if that user could read it (#594).
+                    requester,
                 },
             );
         }
@@ -699,15 +1046,19 @@ impl DetectionSink {
         self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_auth(event));
     }
 
+    /// `Session` events: a disconnected session reconnected from another client
+    /// (T1563.002, #285).
+    fn detect_session(&self, wrapped: &Event, event: &schema::SessionEvent) {
+        self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_session(event));
+    }
+
     /// `FileDelete` events: log-tamper detection (T1070.001/.002, pack #379), then the
     /// unlink half of the write-new-then-unlink T1486 shape (#512 part B), which needs
     /// the creation history `on_file_open` keeps.
     fn detect_file_delete(&self, wrapped: &Event, event: &schema::FileDeleteEvent) {
         self.record_rule_alerts(wrapped, rules::evaluate_file_delete(event));
-        self.record_rule_alerts(
-            wrapped,
-            self.rule_state.lock().unwrap().on_file_delete(event),
-        );
+        let alerts = self.rule_state.lock().unwrap().on_file_delete(event);
+        self.record_rule_alerts(wrapped, alerts);
     }
 
     /// `Signal` events: security-process tampering (T1562.001, issue #362).
@@ -718,10 +1069,9 @@ impl DetectionSink {
     /// `FileRename` events: mass-rename ransomware detection (T1486, issue #262) +
     /// write-volume corroboration (issue #82).
     fn detect_file_rename(&self, wrapped: &Event, event: &schema::FileRenameEvent) {
-        self.record_rule_alerts(
-            wrapped,
-            self.rule_state.lock().unwrap().on_file_rename(event),
-        );
+        // Bound first: `record_rule_alerts` takes the lock again for the damage manifest.
+        let alerts = self.rule_state.lock().unwrap().on_file_rename(event);
+        self.record_rule_alerts(wrapped, alerts);
     }
 
     /// `FileWrite` events: no alert on their own — tracks per-pid write volume for
@@ -975,6 +1325,80 @@ fn start_yara(
     }
 }
 
+/// Starts the memory scanner over the same `rules/yara` content as the file scanner
+/// (#85, ADR-0023). The rule set is compiled a second time because the file queue owns
+/// its copy; memory and file scanning share rules, not state. Linux only: reading
+/// another process's memory is the `sensor-linux-procmem` mechanism.
+#[cfg(target_os = "linux")]
+fn start_memscan(
+    content_root: &Path,
+    alert_log: Arc<AlertLog>,
+    verdict: Arc<Mutex<verdict::VerdictEngine>>,
+) -> Load<yara::MemoryScanQueue> {
+    let dir = content_root.join("rules/yara");
+    if !dir.is_dir() {
+        return Load::Absent;
+    }
+    match yara::RuleSet::load_dir(&dir) {
+        Ok(rules) => Load::Loaded(yara::MemoryScanQueue::start(
+            rules,
+            Arc::new(crate::memscan::ProcMemSource),
+            yara::MemoryBudget::default(),
+            move |outcome| report_memory_matches(&alert_log, &verdict, &outcome),
+        )),
+        // The file scanner reports the same load failure; this one only follows it.
+        Err(_) => Load::Failed,
+    }
+}
+
+/// No memory scanner off Linux (ADR-0023: Windows and macOS need their own mechanism).
+#[cfg(not(target_os = "linux"))]
+fn start_memscan(
+    _content_root: &Path,
+    _alert_log: Arc<AlertLog>,
+    _verdict: Arc<Mutex<verdict::VerdictEngine>>,
+) -> Load<yara::MemoryScanQueue> {
+    Load::Absent
+}
+
+/// What a memory scan that matched produces: the match fused into the verdict of the
+/// process that was scanned (the same path as a file match), a `YARA-MEM` audit line per
+/// rule, and the escalation the fused severity warrants. A memory match does not
+/// quarantine anything: there is no file to move.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn report_memory_matches(
+    alert_log: &AlertLog,
+    verdict: &Mutex<verdict::VerdictEngine>,
+    outcome: &yara::MemoryScanOutcome,
+) {
+    let fused: Vec<verdict::Verdict> = outcome
+        .context
+        .iter()
+        .flat_map(|context| {
+            outcome
+                .report
+                .matches
+                .iter()
+                .filter_map(|rule| fuse_yara_match(verdict, context, rule))
+        })
+        .collect();
+    for rule in &outcome.report.matches {
+        alert_log.record(
+            "YARA-MEM",
+            format!(
+                "yara rule {} matched in the memory of pid {} ({} region(s) scanned, {} skipped by budget)",
+                rule.identifier,
+                outcome.pid,
+                outcome.report.regions_scanned,
+                outcome.report.regions_skipped,
+            ),
+        );
+    }
+    for verdict in &fused {
+        escalate_if_warranted(alert_log, verdict);
+    }
+}
+
 /// Issue #614: folds a YARA match into the verdict of the process that wrote the
 /// scanned file, keyed by the rule's ATT&CK technique so the same behavior flagged
 /// by a native rule or Sigma on that entity inside the dedup window stays one
@@ -1056,6 +1480,7 @@ impl EventSink for DetectionSink {
         // Detection runs in memory on the capture thread — no engine needs the hash
         // or signature synchronously (issue #126).
         self.correlate(&event);
+        self.detect_canary(&event);
         match &event {
             Event::Exec(e) => self.detect_exec(&event, e),
             Event::FileOpen(e) => self.detect_file_open(&event, e),
@@ -1063,6 +1488,7 @@ impl EventSink for DetectionSink {
             Event::NetworkFlow(e) => self.detect_network_flow(&event, e),
             Event::ListenPort(e) => self.detect_listen_port(&event, e),
             Event::Auth(e) => self.detect_auth(&event, e),
+            Event::Session(e) => self.detect_session(&event, e),
             Event::FileDelete(e) => self.detect_file_delete(&event, e),
             Event::Signal(e) => self.detect_signal(&event, e),
             Event::FileQuarantine(e) => self.detect_file_quarantine(e),
@@ -1200,6 +1626,7 @@ mod tests {
                 rules::RuleState::new(),
                 &dir.join("alerts.ndjson"),
                 Some(&dir.join("events.jsonl")),
+                None,
                 None,
                 &dir.join("content"),
                 &dir.join("ml-registry"),
@@ -1347,10 +1774,214 @@ rule response_marker {
         sink.on_event(Event::FileOpen(schema::FileOpenEvent {
             path: payload.display().to_string(),
             flags: 0o101, // O_WRONLY | O_CREAT: write intent, what queues a scan
-            ..schema::fixtures::file_open()
+            meta: EventMeta {
+                // Root: unrestricted, the payload is the test's own file.
+                user: schema::User::Unix { uid: 0, gid: 0 },
+                ..schema::fixtures::meta()
+            },
         }));
         drive_linux_beacon(&sink, 6262);
         (payload, killed)
+    }
+
+    /// A sink watching the one canary a plant into `dir/canaries` produced.
+    fn sink_watching_canary(dir: &std::path::Path) -> (Arc<DetectionSink>, String) {
+        let planted = dir.join("canaries");
+        std::fs::create_dir_all(&planted).unwrap();
+        let tripwires = crate::deception::start(
+            &config::DeceptionConfig {
+                canary_dirs: vec![planted.clone()],
+                ..Default::default()
+            },
+            &dir.join("state"),
+        )
+        .unwrap();
+        let canary = std::fs::read_dir(&planted)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .display()
+            .to_string();
+        let sink = sink_in(dir);
+        sink.set_tripwires(tripwires);
+        (sink, canary)
+    }
+
+    fn open_event(path: &str, pid: u32) -> Event {
+        Event::FileOpen(schema::FileOpenEvent {
+            path: path.to_string(),
+            meta: EventMeta {
+                pid,
+                ..schema::fixtures::meta()
+            },
+            ..schema::fixtures::file_open()
+        })
+    }
+
+    #[test]
+    fn another_process_opening_a_canary_raises_a_deception_detection() {
+        let dir = tmp("canary-hit");
+        let (sink, canary) = sink_watching_canary(&dir);
+        sink.on_event(open_event(&canary, std::process::id() + 1));
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("T1083"), "{alerts}");
+        assert!(alerts.contains("canary file touched"), "{alerts}");
+    }
+
+    fn open_event_at(path: &str, pid: u32, timestamp_ns: u64) -> Event {
+        let Event::FileOpen(mut e) = open_event(path, pid) else {
+            unreachable!()
+        };
+        e.meta.timestamp_ns = timestamp_ns;
+        Event::FileOpen(e)
+    }
+
+    fn canary_alert_count(dir: &std::path::Path) -> usize {
+        alerts_in(dir).matches("canary file touched").count()
+    }
+
+    #[test]
+    fn a_process_reopening_a_canary_raises_one_detection_per_cooldown() {
+        let dir = tmp("canary-cooldown");
+        let (sink, canary) = sink_watching_canary(&dir);
+        let pid = std::process::id() + 1;
+        let t0 = 1_000_000_000_000;
+        for i in 0..5 {
+            sink.on_event(open_event_at(&canary, pid, t0 + i * 1_000_000_000));
+        }
+        assert_eq!(canary_alert_count(&dir), 1);
+        assert_eq!(sink.canary_hits_absorbed.load(Ordering::Relaxed), 4);
+        sink.on_event(open_event_at(
+            &canary,
+            pid,
+            t0 + super::CANARY_COOLDOWN_NS + 1,
+        ));
+        assert_eq!(canary_alert_count(&dir), 2);
+    }
+
+    fn event_by(
+        canary: &str,
+        pid: u32,
+        generation: Option<u64>,
+        timestamp_ns: u64,
+        kind: &str,
+    ) -> Event {
+        let meta = EventMeta {
+            pid,
+            process_generation: generation,
+            timestamp_ns,
+            ..schema::fixtures::meta()
+        };
+        match kind {
+            "read" | "write" => {
+                let mut e = schema::fixtures::file_open();
+                e.path = canary.into();
+                e.flags = if kind == "write" { 0o102 } else { 0 };
+                e.meta = meta;
+                Event::FileOpen(e)
+            }
+            "delete" => {
+                let mut e = schema::fixtures::file_delete();
+                e.path = canary.into();
+                e.meta = meta;
+                Event::FileDelete(e)
+            }
+            "rename" => Event::FileRename(schema::FileRenameEvent {
+                old_path: canary.into(),
+                new_path: format!("{canary}.locked"),
+                meta,
+                ..schema::fixtures::file_rename()
+            }),
+            other => panic!("unknown touch {other}"),
+        }
+    }
+
+    #[test]
+    fn a_delete_rename_or_write_open_after_a_read_open_is_not_absorbed() {
+        for destructive in ["delete", "rename", "write"] {
+            let dir = tmp(&format!("canary-destructive-{destructive}"));
+            let (sink, canary) = sink_watching_canary(&dir);
+            let pid = std::process::id() + 1;
+            sink.on_event(event_by(&canary, pid, None, 5, "read"));
+            sink.on_event(event_by(&canary, pid, None, 6, destructive));
+            assert_eq!(
+                canary_alert_count(&dir),
+                2,
+                "{destructive} must not hide behind the read open"
+            );
+            assert_eq!(sink.canary_hits_absorbed.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn repeated_destructive_touches_each_raise_a_detection() {
+        let dir = tmp("canary-repeat-delete");
+        let (sink, canary) = sink_watching_canary(&dir);
+        let pid = std::process::id() + 1;
+        for t in 0..3 {
+            sink.on_event(event_by(&canary, pid, None, 5 + t, "rename"));
+        }
+        assert_eq!(canary_alert_count(&dir), 3);
+    }
+
+    #[test]
+    fn a_process_that_reuses_the_pid_is_not_absorbed_as_its_predecessor() {
+        let dir = tmp("canary-pid-reuse");
+        let (sink, canary) = sink_watching_canary(&dir);
+        let pid = std::process::id() + 1;
+        sink.on_event(event_by(&canary, pid, Some(7), 5, "read"));
+        sink.on_event(event_by(&canary, pid, Some(7), 6, "read"));
+        assert_eq!(canary_alert_count(&dir), 1, "same incarnation: absorbed");
+        sink.on_event(event_by(&canary, pid, Some(8), 7, "read"));
+        assert_eq!(canary_alert_count(&dir), 2, "new incarnation: reported");
+    }
+
+    #[test]
+    fn a_second_process_touching_the_same_canary_is_not_absorbed() {
+        let dir = tmp("canary-two-pids");
+        let (sink, canary) = sink_watching_canary(&dir);
+        let pid = std::process::id() + 1;
+        sink.on_event(open_event_at(&canary, pid, 5));
+        sink.on_event(open_event_at(&canary, pid + 1, 6));
+        assert_eq!(canary_alert_count(&dir), 2);
+    }
+
+    #[test]
+    fn an_allowed_executable_touching_a_canary_is_not_a_detection() {
+        let dir = tmp("canary-allowed");
+        let (sink, canary) = sink_watching_canary(&dir);
+        sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
+            "/usr/bin/updatedb",
+            |_| Some("/usr/bin/updatedb".into()),
+        ));
+        sink.on_event(open_event(&canary, std::process::id() + 1));
+        assert_eq!(canary_alert_count(&dir), 0);
+    }
+
+    #[test]
+    fn the_agents_own_pid_touching_a_canary_is_not_a_detection() {
+        let dir = tmp("canary-own-pid");
+        let (sink, canary) = sink_watching_canary(&dir);
+        sink.on_event(open_event(&canary, std::process::id()));
+        assert!(!alerts_in(&dir).contains("canary file touched"));
+    }
+
+    #[test]
+    fn an_ordinary_path_is_not_a_canary_hit() {
+        let dir = tmp("canary-miss");
+        let (sink, _canary) = sink_watching_canary(&dir);
+        sink.on_event(open_event("/etc/hostname", std::process::id() + 1));
+        assert!(!alerts_in(&dir).contains("canary file touched"));
+    }
+
+    #[test]
+    fn without_tripwires_a_canary_looking_path_is_ordinary() {
+        let dir = tmp("canary-off");
+        let sink = sink_in(&dir);
+        sink.on_event(open_event("/srv/passwords_00000000.txt", 1));
+        assert!(!alerts_in(&dir).contains("canary file touched"));
     }
 
     /// The YARA scan runs on its own thread; wait for its response line.
@@ -1419,6 +2050,42 @@ rule response_marker {
             .collect();
         assert_eq!(observe_only.len(), 2, "one per action: {alerts}");
         assert!(alerts.contains("RESPONSE-KILL"), "{alerts}");
+    }
+
+    /// #594: a write whose user the sensor could not resolve is not scanned at all, not
+    /// read with the agent's own privileges. The control event after it proves the
+    /// queue and the rule work, so the single scan is the root one.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_by_an_unresolved_user_is_not_scanned_on_unix() {
+        let dir = tmp("yara-unknown-user");
+        let yara_dir = dir.join("content").join("rules").join("yara");
+        std::fs::create_dir_all(&yara_dir).unwrap();
+        std::fs::write(yara_dir.join("marker.yar"), RESPONSE_MARKER_RULE).unwrap();
+        let payload = dir.join("payload.bin");
+        std::fs::write(&payload, b"dropped payload RESPONSE-SCENARIO-MARKER").unwrap();
+        let sink = sink_in(&dir);
+        assert_eq!(sink.reload_content().yara_rule_count, Some(1));
+        let write_as = |user: schema::User| {
+            sink.on_event(Event::FileOpen(schema::FileOpenEvent {
+                meta: EventMeta {
+                    user,
+                    ..schema::fixtures::meta()
+                },
+                path: payload.display().to_string(),
+                flags: 0o101,
+            }));
+        };
+
+        write_as(schema::User::Unknown);
+        write_as(schema::User::Unix { uid: 0, gid: 0 });
+        wait_for_alert(&dir, "YARA");
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let stats = sink.yara.lock().unwrap().as_ref().unwrap().0.stats();
+        assert_eq!(
+            stats.scanned, 1,
+            "only the root write is scanned, the unresolved one never reaches the queue"
+        );
     }
 
     #[test]
@@ -1722,6 +2389,7 @@ rule response_marker {
                 &dir.join("alerts.ndjson"),
                 Some(&dir.join("events.jsonl")),
                 Some(Arc::clone(&spool)),
+                None,
                 &dir.join("content"),
                 &dir.join("ml-registry"),
             )
@@ -1748,6 +2416,306 @@ rule response_marker {
     }
 
     #[test]
+    fn emitted_finding_reaches_the_durable_detection_spool() {
+        let dir = tmp("detection-spool");
+        let spool = Arc::new(Mutex::new(
+            store::EventSpool::open(&dir.join("detection-spool"), u64::MAX).unwrap(),
+        ));
+        let sink = DetectionSink::new(
+            rules::RuleState::new(),
+            &dir.join("alerts.ndjson"),
+            Some(&dir.join("events.jsonl")),
+            None,
+            Some(Arc::clone(&spool)),
+            &dir.join("content"),
+            &dir.join("ml-registry"),
+        )
+        .unwrap();
+        let event = exec(7, "test", "/bin/test");
+        sink.record_and_emit(
+            &verdict::EntityKey::new(1, "test"),
+            "T1059",
+            "test finding",
+            schema::detection::DetectionSource::Rule {
+                rule_id: "T1059".into(),
+            },
+            schema::detection::Severity::Medium,
+            &event,
+        );
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+        let records: Vec<transport::QueuedDetection> =
+            spool.lock().unwrap().drain_oldest().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].detection.title, "test finding");
+        assert_eq!(records[0].detection.events, vec![event]);
+        assert_eq!(records[0].key.len(), 36);
+    }
+
+    fn rename_of(pid: u32, i: u64, to: &str) -> Event {
+        Event::FileRename(schema::FileRenameEvent {
+            meta: EventMeta {
+                pid,
+                timestamp_ns: 1_000_000_000 + i * 50_000_000,
+                comm: "encryptor".into(),
+                ..schema::fixtures::meta()
+            },
+            old_path: format!("/home/u/doc{i}.txt"),
+            new_path: format!("/home/u/doc{i}.txt{to}"),
+            ..schema::fixtures::file_rename()
+        })
+    }
+
+    fn canary_open_at(path: &str, pid: u32, timestamp_ns: u64) -> Event {
+        Event::FileOpen(schema::FileOpenEvent {
+            path: path.to_string(),
+            meta: EventMeta {
+                pid,
+                timestamp_ns,
+                comm: "encryptor".into(),
+                ..schema::fixtures::meta()
+            },
+            ..schema::fixtures::file_open()
+        })
+    }
+
+    /// A sink watching one canary, with kill wired to a recorder.
+    fn reflex_sink(
+        dir: &std::path::Path,
+        kill_enabled: bool,
+    ) -> (Arc<DetectionSink>, String, Arc<Mutex<Vec<u32>>>) {
+        let (sink, canary) = sink_watching_canary(dir);
+        let killed = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&killed);
+        sink.enable_response(
+            policy::ResponsePolicy {
+                kill_enabled,
+                quarantine_enabled: false,
+            },
+            move |pid| {
+                recorder.lock().unwrap().push(pid);
+                Ok(())
+            },
+            dir.join("quarantine"),
+        );
+        (sink, canary, killed)
+    }
+
+    fn burst(sink: &DetectionSink, pid: u32) {
+        for i in 0..30 {
+            sink.on_event(rename_of(pid, i, ".locked"));
+        }
+    }
+
+    const BURST_END_NS: u64 = 1_000_000_000 + 30 * 50_000_000;
+
+    #[test]
+    fn a_burst_then_a_canary_touch_by_the_same_process_kills_it() {
+        let dir = tmp("reflex-burst-first");
+        let (sink, canary, killed) = reflex_sink(&dir, true);
+        burst(&sink, 900);
+        assert!(
+            killed.lock().unwrap().is_empty(),
+            "a burst alone never kills"
+        );
+        sink.on_event(canary_open_at(&canary, 900, BURST_END_NS + 1_000_000));
+        assert_eq!(*killed.lock().unwrap(), vec![900]);
+        let alerts = alerts_in(&dir);
+        assert!(
+            alerts.contains("killed pid 900 on a corroborated ransomware signal"),
+            "{alerts}"
+        );
+        assert!(
+            alerts.find("canary file touched").unwrap() < alerts.find("RESPONSE-KILL").unwrap(),
+            "the finding is recorded before the kill"
+        );
+    }
+
+    #[test]
+    fn a_canary_touch_then_a_burst_by_the_same_process_kills_it_once() {
+        let dir = tmp("reflex-canary-first");
+        let (sink, canary, killed) = reflex_sink(&dir, true);
+        sink.on_event(canary_open_at(&canary, 900, 1_000_000_000));
+        assert!(
+            killed.lock().unwrap().is_empty(),
+            "a canary touch alone never kills"
+        );
+        burst(&sink, 900);
+        assert_eq!(
+            *killed.lock().unwrap(),
+            vec![900],
+            "the burst keeps raising alerts but the process is killed once"
+        );
+    }
+
+    #[test]
+    fn a_burst_and_a_canary_touch_from_two_processes_kill_neither() {
+        let dir = tmp("reflex-two-processes");
+        let (sink, canary, killed) = reflex_sink(&dir, true);
+        burst(&sink, 900);
+        sink.on_event(canary_open_at(&canary, 901, BURST_END_NS + 1_000_000));
+        assert!(killed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_canary_touch_long_before_the_burst_does_not_corroborate() {
+        let dir = tmp("reflex-stale");
+        let (sink, canary, killed) = reflex_sink(&dir, true);
+        sink.on_event(canary_open_at(&canary, 900, 1_000_000_000));
+        // The same process starts its burst two minutes later.
+        for i in 0..30 {
+            let Event::FileRename(mut e) = rename_of(900, i, ".locked") else {
+                unreachable!()
+            };
+            e.meta.timestamp_ns += 120_000_000_000;
+            sink.on_event(Event::FileRename(e));
+        }
+        assert!(killed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_allowed_executable_that_also_bursts_is_not_killed_by_the_reflex() {
+        let dir = tmp("reflex-allowed");
+        let (sink, canary, killed) = reflex_sink(&dir, true);
+        // A backup tool: it reads the canaries and rotates archives (a burst of renames).
+        sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
+            "/usr/bin/backup-tool",
+            |_| Some("/usr/bin/backup-tool".into()),
+        ));
+        burst(&sink, 900);
+        sink.on_event(canary_open_at(&canary, 900, BURST_END_NS + 1_000_000));
+        assert!(
+            killed.lock().unwrap().is_empty(),
+            "an allowed process never notes a canary signal"
+        );
+        assert!(!alerts_in(&dir).contains("RESPONSE-KILL"));
+    }
+
+    #[test]
+    fn a_process_that_is_not_on_the_allow_list_is_still_killed_when_a_list_exists() {
+        let dir = tmp("reflex-not-allowed");
+        let (sink, canary, killed) = reflex_sink(&dir, true);
+        sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
+            "/usr/bin/backup-tool",
+            |_| Some("/tmp/encryptor".into()),
+        ));
+        burst(&sink, 900);
+        sink.on_event(canary_open_at(&canary, 900, BURST_END_NS + 1_000_000));
+        assert_eq!(*killed.lock().unwrap(), vec![900]);
+    }
+
+    #[test]
+    fn with_kill_disabled_the_reflex_is_observe_only() {
+        let dir = tmp("reflex-observe");
+        let (sink, canary, killed) = reflex_sink(&dir, false);
+        burst(&sink, 900);
+        sink.on_event(canary_open_at(&canary, 900, BURST_END_NS + 1_000_000));
+        assert!(killed.lock().unwrap().is_empty());
+        let alerts = alerts_in(&dir);
+        assert!(
+            alerts.contains("pid 900 would have been killed on a corroborated ransomware signal"),
+            "{alerts}"
+        );
+    }
+
+    /// The ransomware detection (T1486, issue #82) carries the files the process touched
+    /// in the window, so the case records the scope of the damage.
+    #[test]
+    fn a_ransomware_detection_carries_the_files_the_process_renamed_as_a_damage_manifest() {
+        let dir = tmp("damage-manifest");
+        let spool = Arc::new(Mutex::new(
+            store::EventSpool::open(&dir.join("detection-spool"), u64::MAX).unwrap(),
+        ));
+        let sink = DetectionSink::new(
+            rules::RuleState::new(),
+            &dir.join("alerts.ndjson"),
+            None,
+            None,
+            Some(Arc::clone(&spool)),
+            &dir.join("content"),
+            &dir.join("ml-registry"),
+        )
+        .unwrap();
+
+        // 30 renames to an encrypted extension by one process, then a different process's
+        // rename that must not appear in the manifest.
+        for i in 0..30 {
+            sink.on_event(rename_of(900, i, ".locked"));
+        }
+        sink.on_event(rename_of(901, 99, ".bak"));
+
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+        let records: Vec<transport::QueuedDetection> =
+            spool.lock().unwrap().drain_oldest().unwrap();
+        let ransomware: Vec<_> = records
+            .iter()
+            .filter(|r| r.detection.techniques.iter().any(|t| t == "T1486"))
+            .collect();
+        assert!(
+            !ransomware.is_empty(),
+            "the burst must raise a T1486 detection"
+        );
+        let detection = &ransomware[0].detection;
+
+        // First the triggering event, then the earlier renames of the same process.
+        assert!(detection.events.len() > 1, "the manifest is attached");
+        for event in &detection.events {
+            let Event::FileRename(rename) = event else {
+                panic!("only renames expected, got {event:?}");
+            };
+            assert_eq!(
+                rename.meta.pid, 900,
+                "another process's files are not this one's damage"
+            );
+        }
+        let triggering = detection.events[0].clone();
+        assert!(
+            !detection.events[1..].contains(&triggering),
+            "the triggering event is not repeated in the manifest"
+        );
+        // Oldest first.
+        let stamps: Vec<u64> = detection.events[1..]
+            .iter()
+            .map(|e| e.meta().timestamp_ns)
+            .collect();
+        assert!(stamps.windows(2).all(|w| w[0] <= w[1]));
+        assert!(detection.events.len() <= 1 + super::DAMAGE_MANIFEST_MAX);
+    }
+
+    #[test]
+    fn a_detection_that_is_not_ransomware_carries_only_its_triggering_event() {
+        let dir = tmp("no-manifest");
+        let spool = Arc::new(Mutex::new(
+            store::EventSpool::open(&dir.join("detection-spool"), u64::MAX).unwrap(),
+        ));
+        let sink = DetectionSink::new(
+            rules::RuleState::new(),
+            &dir.join("alerts.ndjson"),
+            None,
+            None,
+            Some(Arc::clone(&spool)),
+            &dir.join("content"),
+            &dir.join("ml-registry"),
+        )
+        .unwrap();
+        sink.on_event(rename_of(900, 0, ".bak"));
+        let event = exec(7, "test", "/bin/test");
+        sink.record_and_emit(
+            &verdict::EntityKey::new(1, "test"),
+            "T1059",
+            "test finding",
+            schema::detection::DetectionSource::Rule {
+                rule_id: "T1059".into(),
+            },
+            schema::detection::Severity::Medium,
+            &event,
+        );
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+        let records: Vec<transport::QueuedDetection> =
+            spool.lock().unwrap().drain_oldest().unwrap();
+        assert_eq!(records[0].detection.events, vec![event]);
+    }
+
+    #[test]
     fn without_an_events_path_no_raw_event_log_is_written_but_the_spool_still_is() {
         let dir = tmp("no-events-log");
         let spool = Arc::new(Mutex::new(
@@ -1759,6 +2727,7 @@ rule response_marker {
                 &dir.join("alerts.ndjson"),
                 None,
                 Some(Arc::clone(&spool)),
+                None,
                 &dir.join("content"),
                 &dir.join("ml-registry"),
             )
@@ -1937,6 +2906,7 @@ detection:
             comm: meta.comm.clone(),
             parent_generation: meta.parent_process_generation,
             timestamp_ns: meta.timestamp_ns,
+            requester: None,
         }
     }
 
@@ -2015,6 +2985,8 @@ detection:
         assert_eq!(sink.reload_content().yara_rule_count, Some(1));
 
         let meta = EventMeta {
+            // Root: unrestricted, the payload is the test's own file (#594).
+            user: schema::User::Unix { uid: 0, gid: 0 },
             ppid: 777,
             comm: "dropper".into(),
             ..schema::fixtures::meta()
@@ -2219,6 +3191,8 @@ detection:
         assert_eq!(sink.reload_content().yara_rule_count, Some(1));
 
         let meta = EventMeta {
+            // Root: unrestricted, the payload is the test's own file (#594).
+            user: schema::User::Unix { uid: 0, gid: 0 },
             ppid: 778,
             comm: "dropper".into(),
             ..schema::fixtures::meta()
@@ -2230,6 +3204,142 @@ detection:
         }));
         let alerts = wait_for_alert(&dir, "RESPONSE-ESCALATE");
         assert!(alerts.contains("778:dropper"), "{alerts}");
+    }
+
+    /// Maps one page of anonymous read-write-execute memory holding `payload`: the shape
+    /// of shellcode or a reflectively loaded image. `None` when the host refuses RWX
+    /// mappings (`SELinux` `execmem` denial, a hardened kernel), so the test can skip.
+    #[cfg(target_os = "linux")]
+    fn plant_in_executable_memory(payload: &[u8]) -> Option<*mut libc::c_void> {
+        assert!(payload.len() <= 4096);
+        // SAFETY: a fresh private anonymous page, checked against MAP_FAILED before use,
+        // and `payload` fits inside it (asserted above).
+        unsafe {
+            let page = libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            if page == libc::MAP_FAILED {
+                return None;
+            }
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), page.cast::<u8>(), payload.len());
+            Some(page)
+        }
+    }
+
+    /// A fileless exec: the process image is a `/dev/fd/N` path and the comm says memfd,
+    /// which is what the T1620 rule keys on. `pid` is a real, readable process so the
+    /// memory scan it triggers is a real one.
+    #[cfg(target_os = "linux")]
+    fn memfd_exec_of(pid: u32) -> Event {
+        Event::Exec(ExecEvent {
+            meta: EventMeta {
+                pid,
+                ppid: 1,
+                comm: "memfd:implant".into(),
+                ..schema::fixtures::meta()
+            },
+            image_path: "/dev/fd/3".into(),
+            argv: vec!["/dev/fd/3".into()],
+            ..schema::fixtures::exec()
+        })
+    }
+
+    /// Held by every test that scans this test process's own memory. The tests run in
+    /// parallel in one process, so a marker one of them plants in an executable page is
+    /// visible to a scan another one requests: the "clean" test then failed 17 times out
+    /// of 30 on a `YARA-MEM` it never planted.
+    #[cfg(target_os = "linux")]
+    static OWN_PROCESS_MEMORY: Mutex<()> = Mutex::new(());
+
+    /// Serializes the tests that scan `std::process::id()`. Poison-tolerant: one test's
+    /// failed assertion must not fail the others on a poisoned lock.
+    #[cfg(target_os = "linux")]
+    fn own_process_memory() -> std::sync::MutexGuard<'static, ()> {
+        OWN_PROCESS_MEMORY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// #85 end to end, no mocks: a payload that exists only in executable anonymous
+    /// memory of a real process is found by the scan the memfd-exec alert triggers.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_payload_present_only_in_executable_memory_is_found_after_a_memfd_exec_alert() {
+        let _own_memory = own_process_memory();
+        let dir = tmp("memscan-e2e");
+        let yara_dir = dir.join("content").join("rules").join("yara");
+        std::fs::create_dir_all(&yara_dir).unwrap();
+        std::fs::write(
+            yara_dir.join("marker.yar"),
+            RESPONSE_MARKER_RULE.replace("severity = \"low\"", "severity = \"high\""),
+        )
+        .unwrap();
+        let sink = sink_in(&dir);
+        assert_eq!(sink.reload_content().yara_rule_count, Some(1));
+
+        let Some(page) = plant_in_executable_memory(b"..RESPONSE-SCENARIO-MARKER..") else {
+            eprintln!("skipped: this host refuses RWX anonymous mappings");
+            return;
+        };
+        sink.on_event(memfd_exec_of(std::process::id()));
+        let alerts = wait_for_alert(&dir, "YARA-MEM");
+        // SAFETY: `page` is the one-page mapping created above and is not used again.
+        unsafe { libc::munmap(page, 4096) };
+
+        assert!(alerts.contains("T1620"), "the trigger is audited: {alerts}");
+        assert!(
+            alerts.contains("matched in the memory of pid"),
+            "the memory match is audited: {alerts}"
+        );
+        assert!(
+            alerts.contains("RESPONSE-ESCALATE"),
+            "a High memory match escalates like any other finding: {alerts}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_memfd_exec_of_a_clean_process_triggers_a_scan_that_finds_nothing() {
+        let _own_memory = own_process_memory();
+        let dir = tmp("memscan-clean");
+        let yara_dir = dir.join("content").join("rules").join("yara");
+        std::fs::create_dir_all(&yara_dir).unwrap();
+        std::fs::write(yara_dir.join("marker.yar"), RESPONSE_MARKER_RULE).unwrap();
+        let sink = sink_in(&dir);
+        assert_eq!(sink.reload_content().yara_rule_count, Some(1));
+
+        sink.on_event(memfd_exec_of(std::process::id()));
+        let stats_done = || {
+            sink.memscan
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|q| q.wait_for_completed(1, std::time::Duration::from_secs(10)))
+        };
+        assert_eq!(stats_done(), Some(true), "the scan ran");
+        assert!(
+            !alerts_in(&dir).contains("YARA-MEM"),
+            "no marker in executable memory: {}",
+            alerts_in(&dir)
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn without_yara_content_a_memfd_exec_requests_no_scan() {
+        let dir = tmp("memscan-no-content");
+        let sink = sink_in(&dir);
+        sink.on_event(memfd_exec_of(std::process::id()));
+        assert!(sink.memscan.lock().unwrap().is_none());
+        assert!(
+            alerts_in(&dir).contains("T1620"),
+            "the rule itself still fires"
+        );
     }
 
     #[test]

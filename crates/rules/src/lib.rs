@@ -16,6 +16,7 @@ mod exclusions;
 mod ld_trust;
 mod ldap;
 mod ntlm;
+mod session;
 mod sliding;
 mod state;
 mod stateless;

@@ -34,6 +34,20 @@ pub(crate) struct RunPipeline {
     pub(crate) sensor_health: SensorHealthSlot,
 }
 
+/// Plants the configured canary files and hands the sink the tripwires over them (#81).
+/// Called before the sensors start, so the first touch of a canary is already matched.
+pub(crate) fn plant_canaries(
+    sink: &DetectionSink,
+    deception: &config::DeceptionConfig,
+    storage: &config::StorageConfig,
+) {
+    if let Some(tripwires) = crate::deception::start(deception, &storage.state_dir) {
+        sink.set_tripwires(tripwires);
+        sink.set_canary_allow(crate::deception::CanaryAllow::new(deception));
+        crate::deception::spawn_refresh(deception.clone(), storage.state_dir.clone());
+    }
+}
+
 /// Builds the shared pipeline: optional transport (spool + upload thread),
 /// the detection sink (spooling into it when transport is on), the operator
 /// banner, the progress-backed liveness heartbeat (#102), and the local IPC
@@ -42,37 +56,53 @@ pub(crate) fn wire_run_pipeline(
     rule_state: rules::RuleState,
     alerts: &std::path::Path,
     events: Option<&std::path::Path>,
-    server: Option<&str>,
+    server: Option<crate::upload::ControlPlane<'_>>,
     ipc_endpoint: &str,
     content_dir: &std::path::Path,
     storage: &config::StorageConfig,
 ) -> anyhow::Result<RunPipeline> {
     // Transport first: the sink needs the spool handle at construction.
     let spool_cap = crate::upload::spool_cap_bytes(storage.spool_max_mb);
-    let transport = server
-        .map(|url| crate::upload::start(url, alerts, spool_cap))
-        .transpose()?;
+    let (transport, upload_disabled) = match server {
+        None => (None, None),
+        Some(control_plane) => {
+            match crate::upload::start_or_disable(&control_plane, alerts, spool_cap)? {
+                crate::upload::UploadStart::Running(handle) => (Some(handle), None),
+                crate::upload::UploadStart::Disabled(reason) => (None, Some(reason)),
+            }
+        }
+    };
     let spool = transport.as_ref().map(|t| Arc::clone(&t.spool));
+    let detection_spool = transport.as_ref().map(|t| Arc::clone(&t.detection_spool));
 
     let sink = Arc::new(DetectionSink::new(
         rule_state,
         alerts,
         events,
         spool,
+        detection_spool,
         content_dir,
         &crate::sink::model_root(&storage.state_dir),
     )?);
 
+    // Said where the operator reads it (the journal) and in the alert log, where `cli` and
+    // the console look: detection runs, upload does not (`offline_fallback`).
+    if let Some(reason) = &upload_disabled {
+        eprintln!("Synthaea agent — UPLOAD DISABLED: {reason}");
+        sink.emit("UPLOAD-DISABLED", reason);
+    }
     eprintln!("Synthaea agent — detection active (Ctrl-C to stop)");
     eprintln!(
         "alerts: {} · events: {}",
         alerts.display(),
         events.map_or_else(|| "off".to_string(), |p| p.display().to_string())
     );
-    if let Some(url) = server {
+    if let (Some(control_plane), true) = (server, transport.is_some()) {
+        let url = control_plane.url;
         eprintln!(
-            "server: {url} · spool: {} (store-and-forward, at-least-once)",
-            alerts.with_file_name("spool").display()
+            "server: {url} · event spool: {} · detection spool: {} (store-and-forward, at-least-once)",
+            alerts.with_file_name("spool").display(),
+            alerts.with_file_name("detection-spool").display(),
         );
     }
 
@@ -116,7 +146,10 @@ pub(crate) fn health_collector(
     silence_monitor: Arc<Mutex<SilenceMonitor>>,
 ) -> HealthCollector {
     let spool_stats: Arc<dyn SpoolStatsSource> = match &pipeline.transport {
-        Some(t) => Arc::new(crate::upload::SpoolHealth(Arc::clone(&t.spool))),
+        Some(t) => Arc::new(crate::upload::SpoolHealth {
+            events: Arc::clone(&t.spool),
+            detections: Arc::clone(&t.detection_spool),
+        }),
         None => Arc::new(NoopSpoolStats),
     };
     let heartbeat_client = pipeline.transport.as_ref().map(|t| Arc::clone(&t.client));
@@ -169,6 +202,7 @@ mod tests {
                     rules::RuleState::new(),
                     &dir.join("alerts.ndjson"),
                     Some(&dir.join("events.jsonl")),
+                    None,
                     None,
                     &dir.join("content"),
                     &dir.join("ml-registry"),

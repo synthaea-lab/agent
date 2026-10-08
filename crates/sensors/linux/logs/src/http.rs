@@ -11,8 +11,9 @@
 //!
 //! **Redaction is not done here.** ADR-0018 puts credential redaction at the agent's
 //! sink boundary so no producer carries a second path; the evidence value leaves this
-//! crate raw (cut, not redacted) and the agent's `RedactingSink` is what must see it
-//! before anything is stored or sent. Nothing in this crate writes or sends an event.
+//! crate raw (cut, not redacted) and the agent's `redact::redact_event`, called by
+//! `log_sources::deliver`, is what sees it before anything is stored or sent. Nothing in
+//! this crate writes or sends an event.
 //!
 //! These are cheap substring tests, not a WAF: they catch the obvious probes and the
 //! common tools, and an attacker who encodes beyond two rounds or splits a marker

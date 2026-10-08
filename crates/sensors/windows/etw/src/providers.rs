@@ -13,7 +13,7 @@ use ferrisetw::{
     schema_locator::SchemaLocator,
 };
 use schema::{
-    AmsiContentEvent, AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, ExecEvent,
+    AmsiContentEvent, AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent,
     FileOpenEvent, ImageLoadEvent, LdapSearchEvent, NtlmAuthEvent, NtlmDirection, RegistrySetEvent,
     ScriptBlockEvent, SmbConnectEvent, UdpSendEvent, WmiActivityEvent, sensor::EventSink,
 };
@@ -27,6 +27,26 @@ use crate::{
 const KERNEL_PROCESS_GUID: &str = "22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716";
 const KERNEL_NETWORK_GUID: &str = "7dd42a49-5329-4832-8dfd-43d979153a88";
 const KERNEL_FILE_GUID: &str = "edd08927-9cc4-4e65-b970-c2560fb5c289";
+/// Kernel-File manifest keyword bits for the event IDs handled below.
+const FILE_KEYWORD_CREATE: u64 = 0x80;
+const FILE_KEYWORD_DELETE_PATH: u64 = 0x400;
+const FILE_KEYWORD_CREATE_NEW_FILE: u64 = 0x1000;
+/// EID 12 Create, EID 26 `DeletePath`, and EID 30 `CreateNewFile` only.
+/// `FILE_EVENT_KEYWORDS` is the single source of truth for dispatched IDs.
+const FILE_KEYWORDS: u64 =
+    FILE_KEYWORD_CREATE | FILE_KEYWORD_DELETE_PATH | FILE_KEYWORD_CREATE_NEW_FILE;
+const FILE_EVENT_KEYWORDS: [(u16, u64); 3] = [
+    (12, FILE_KEYWORD_CREATE),
+    (26, FILE_KEYWORD_DELETE_PATH),
+    (30, FILE_KEYWORD_CREATE_NEW_FILE),
+];
+
+fn file_event_keyword(event_id: u16) -> Option<u64> {
+    FILE_EVENT_KEYWORDS
+        .iter()
+        .find_map(|(id, keyword)| (*id == event_id).then_some(*keyword))
+}
+
 /// Microsoft-Windows-DNS-Client
 const DNS_CLIENT_GUID: &str = "1C95126E-7EEA-49A9-A3FE-A378B03DDB4D";
 /// Microsoft-Windows-Kernel-Registry
@@ -253,9 +273,10 @@ pub(crate) fn network_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
 pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
         let eid = record.event_id();
-        // 12=NameCreate; 30=CreateNewFile (F-6 partial — delete/rename semantics
-        // need schema variants and land with #82/#39).
-        if eid != 12 && eid != 30 {
+        // 12=Create; 30=CreateNewFile; 26=DeletePath, for mark-of-the-web
+        // removal only (F-6 partial — general delete/rename semantics land with
+        // #82/#39).
+        if file_event_keyword(eid).is_none() {
             return;
         }
         state.events_seen.fetch_add(1, Ordering::Relaxed);
@@ -272,11 +293,17 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         let Some(comm) = state.pids.lock().unwrap().get(pid).map(basename) else {
             return;
         };
+        if eid == 26 {
+            forward_mark_removal(&parser, &state, sink.as_ref(), || {
+                meta(pid, 0, comm, timestamp_ns)
+            });
+            return;
+        }
 
         let flags = if eid == 30 {
             0o101 // CreateNewFile: create+write by definition
         } else {
-            // NameCreate: disposition in the high byte of CreateOptions.
+            // Create: disposition in the high byte of CreateOptions.
             let create_options: u32 = parser.try_parse("CreateOptions").unwrap_or(0x0100_0000);
             normalize::disposition_to_flags((create_options >> 24) & 0xFF)
         };
@@ -306,8 +333,38 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         sink.on_event(Event::FileOpen(FileOpenEvent { meta, path, flags }));
     };
     Provider::by_guid(KERNEL_FILE_GUID)
+        .any(FILE_KEYWORDS)
         .add_callback(callback)
         .build()
+}
+
+/// Kernel-File 26 (`DeletePath`, `FilePath` field): forwards the deletion of a
+/// `:Zone.Identifier` stream — the mark-of-the-web being removed by
+/// `Unblock-File`, `Remove-Item -Stream` or Explorer's "Unblock" (T1553.005,
+/// #442) — as a `FileDelete` of the stream path. Every other delete is
+/// dropped: Windows delete semantics in general land with the minifilter
+/// (#136), which also sees what this userland path can't.
+///
+/// The stream check runs on the raw NT path first, so the path normalization
+/// (volume map, 8.3 expansion) and the token lookup behind `meta` only run
+/// for the rare matching delete, never for the host's whole delete volume on
+/// the ETW thread (#481, #408).
+///
+/// Not distinguished: a disposition call that *clears* delete-on-close. The
+/// event doesn't carry the flag's value, and un-deleting a mark is not
+/// something tools do.
+fn forward_mark_removal(
+    parser: &Parser<'_, '_>,
+    state: &SharedState,
+    sink: &dyn EventSink,
+    meta: impl FnOnce() -> EventMeta,
+) {
+    let raw_path: String = parser.try_parse("FilePath").unwrap_or_default();
+    if let Some(removal) =
+        zone_identifier::mark_removal(&raw_path, |raw| state.normalize_path(raw), meta)
+    {
+        sink.on_event(Event::FileDelete(removal));
+    }
 }
 
 /// DNS resolution events (EID 3008 — `QueryCompleted`).
@@ -871,4 +928,28 @@ pub(crate) fn smb_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
     Provider::by_guid(SMB_CLIENT_GUID)
         .add_callback(callback)
         .build()
+}
+
+#[cfg(test)]
+mod file_keyword_tests {
+    use super::*;
+
+    /// Guards the table's own arithmetic and that no dispatched id loses its keyword;
+    /// it compares the table with literals it also contains, so it cannot tell whether
+    /// the manifest really maps these ids to these keywords. That is checked against a
+    /// real session by `tests/kernel_file_keyword_mask.rs` (`#[ignore]`, elevated; lab
+    /// phase F of `lab/validate-windows-admin.ps1`).
+    #[test]
+    fn every_dispatched_file_event_is_enabled_by_its_keyword() {
+        for (event_id, keyword) in FILE_EVENT_KEYWORDS {
+            assert_ne!(
+                keyword & FILE_KEYWORDS,
+                0,
+                "Kernel-File EID {event_id} has no enabled keyword"
+            );
+            assert!(file_event_keyword(event_id).is_some());
+        }
+        assert_eq!(FILE_KEYWORDS, 0x80 | 0x400 | 0x1000);
+        assert_eq!(file_event_keyword(10), None, "NameCreate is not handled");
+    }
 }

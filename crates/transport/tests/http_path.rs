@@ -33,7 +33,10 @@ use schema::{
     Event, ExecEvent,
     detection::{Detection, DetectionSource, Severity},
 };
-use transport::{EventDrain, EventUploader, TransportClient, TransportConfig};
+use transport::{
+    DetectionDrain, DetectionUploader, EventDrain, EventUploader, QueuedDetection, TransportClient,
+    TransportConfig,
+};
 
 /// Reads one request until the header terminator, then its Content-Length
 /// body — enough HTTP for a canned test server, not a real one. Returns
@@ -247,6 +250,98 @@ fn structured_detection_retry_sends_a_stable_idempotency_key() {
     client.upload_detection_with_key(&detection(), key).unwrap();
     let headers = server.join().unwrap().to_ascii_lowercase();
     assert!(headers.contains(&format!("idempotency-key: {key}")));
+}
+
+struct CountingDetectionDrain {
+    records: Vec<QueuedDetection>,
+    acked: Arc<AtomicU32>,
+    skipped: Arc<AtomicU32>,
+}
+
+impl DetectionDrain for CountingDetectionDrain {
+    fn drain(&mut self) -> std::io::Result<Vec<QueuedDetection>> {
+        Ok(self.records.clone())
+    }
+    fn ack(&mut self) -> std::io::Result<()> {
+        self.acked.fetch_add(1, Ordering::SeqCst);
+        self.records.clear();
+        Ok(())
+    }
+    fn skip(&mut self) -> std::io::Result<()> {
+        self.skipped.fetch_add(1, Ordering::SeqCst);
+        self.records.clear();
+        Ok(())
+    }
+}
+
+#[test]
+fn detection_uploader_redelivers_the_same_keys_after_partial_failure() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for status in [200, 500, 200, 200] {
+            let (mut stream, _) = listener.accept().unwrap();
+            seen.push(read_request(&mut stream).to_ascii_lowercase());
+            let body = if status == 200 {
+                r#"{"status":"accepted"}"#
+            } else {
+                r#"{"error":"retry"}"#
+            };
+            write_response(&mut stream, status, body);
+        }
+        seen
+    });
+    let a = "b9628fc1-2134-4d4d-bbe6-83fdd1929d7a";
+    let b = "b9628fc1-2134-4d4d-bbe6-83fdd1929d7b";
+    let acked = Arc::new(AtomicU32::new(0));
+    let skipped = Arc::new(AtomicU32::new(0));
+    let drain = CountingDetectionDrain {
+        records: [a, b]
+            .into_iter()
+            .map(|key| QueuedDetection {
+                key: key.into(),
+                detection: detection(),
+            })
+            .collect(),
+        acked: Arc::clone(&acked),
+        skipped: Arc::clone(&skipped),
+    };
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+    let mut uploader = DetectionUploader::new(client, drain);
+    assert!(uploader.upload_once().is_err());
+    assert_eq!(acked.load(Ordering::SeqCst), 0);
+    assert_eq!(skipped.load(Ordering::SeqCst), 0);
+    assert_eq!(uploader.upload_once().unwrap(), 2);
+    assert_eq!(acked.load(Ordering::SeqCst), 1);
+    let seen = server.join().unwrap();
+    for (headers, key) in seen.iter().zip([a, b, a, b]) {
+        assert!(headers.contains(&format!("idempotency-key: {key}")));
+    }
+}
+
+#[test]
+fn detection_uploader_keeps_network_failures_spooled() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let acked = Arc::new(AtomicU32::new(0));
+    let skipped = Arc::new(AtomicU32::new(0));
+    let drain = CountingDetectionDrain {
+        records: vec![QueuedDetection {
+            key: "b9628fc1-2134-4d4d-bbe6-83fdd1929d7a".into(),
+            detection: detection(),
+        }],
+        acked: Arc::clone(&acked),
+        skipped: Arc::clone(&skipped),
+    };
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+    let mut uploader = DetectionUploader::new(client, drain);
+    for _ in 0..3 {
+        assert!(uploader.upload_once().is_err());
+    }
+    assert_eq!(acked.load(Ordering::SeqCst), 0);
+    assert_eq!(skipped.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -583,6 +678,49 @@ fn get_json_rejects_a_response_that_is_not_valid_json_for_the_target_type() {
         "got {err:?}"
     );
     assert!(!err.is_network_error(), "reached-and-answered, not a blip");
+}
+
+#[test]
+fn get_json_keeps_the_servers_reason_on_a_423_locked() {
+    // A halted content ring (#667): the reason must reach the operator, and a
+    // 423 is not retried.
+    let url = canned_server(
+        423,
+        r#"{"error":"Content delivery is halted for ring 'canary_0' at release 3"}"#,
+        1,
+    );
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+
+    let err = client
+        .get_json::<Widget>(&url)
+        .expect_err("423 must surface");
+    assert_eq!(
+        err.locked_reason(),
+        Some("Content delivery is halted for ring 'canary_0' at release 3")
+    );
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn an_error_body_may_be_plain_text_or_empty() {
+    let url = canned_server(423, "halted: release 3", 1);
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+    let err = client.get_json::<Widget>(&url).unwrap_err();
+    assert_eq!(err.locked_reason(), Some("halted: release 3"));
+
+    let url = canned_server(423, "", 1);
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+    let err = client.get_json::<Widget>(&url).unwrap_err();
+    assert_eq!(err.locked_reason(), Some("http status: 423"));
+}
+
+#[test]
+fn only_a_423_is_a_locked_reason_and_other_statuses_keep_their_message() {
+    let url = canned_server(404, r#"{"error":"no such ring"}"#, 1);
+    let client = TransportClient::new(TransportConfig::new(&url)).unwrap();
+    let err = client.get_json::<Widget>(&url).unwrap_err();
+    assert_eq!(err.locked_reason(), None);
+    assert!(err.to_string().contains("no such ring"), "{err}");
 }
 
 // ── get_bytes (issue #30/#73's content artifact download) ──────────────────

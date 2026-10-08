@@ -245,17 +245,31 @@ pub mod time;
 /// #654 also targets v39 while both branches are open: whichever merges second
 /// renumbers, as above.
 ///
-/// Bumped 39 → 40 for [`Event::LdapSearch`] (#364): the LDAP searches a
+/// Bumped 39 → 40 for [`Event::Session`] (#285): session lifecycle from the
+/// Windows Terminal Services channels (connect, logon, disconnect, reconnect,
+/// logoff). It claimed 39 alongside #650 (`UdpRecv`), which merged first, so
+/// this one renumbers. #577 (`BitsJob`) also targets v40 while both branches
+/// are open: whichever merges second renumbers, as above.
+///
+/// Bumped 40 → 41 for [`Event::LdapSearch`] (#364): the LDAP searches a
 /// process sends (EID 30 of Microsoft-Windows-LDAP-Client), the endpoint's
 /// view of directory reconnaissance. Windows-only, same posture as
-/// `WmiActivity`. 38 was claimed by #283 (`Defender`) and 39 by #263
-/// (`UdpRecv`) while this branch was open; both merged first, so this one
-/// renumbers, same coordination note as above.
+/// `WmiActivity`. 38 was claimed by #283 (`Defender`), 39 by #263 (`UdpRecv`) and 40 by
+/// #285 (`Session`) while this branch was open; all merged first, so this
+/// one renumbers, same coordination note as above.
 ///
-/// Bumped 40 → 41 for [`Event::NtlmAuth`] (#364): NTLM authentications from
+/// Bumped 41 → 42 for [`Event::SocketCreate`] (#263): `socket(2)`, context
+/// rather than an address — the domain/type/protocol the caller asked for.
+/// Closes the last gap in #263's telemetry proposal besides the netlink
+/// socket-table baseline (a separate, periodic-snapshot source, not a
+/// discrete syscall trace like the rest of this file).
+///
+/// Bumped 42 → 43 for [`Event::NtlmAuth`] (#364): NTLM authentications from
 /// the Microsoft-Windows-NTLM provider (direction, account, target, remote
-/// address, NTLM version). Windows-only.
-pub const SCHEMA_VERSION: u32 = 41;
+/// address, NTLM version). Windows-only. It claimed 41 while #632 (`LdapSearch`)
+/// was open, then 43 after #263 (`SocketCreate`, 42) merged; same coordination
+/// note as above.
+pub const SCHEMA_VERSION: u32 = 43;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -724,7 +738,9 @@ pub struct FileWriteEvent {
     pub bytes_requested: u64,
 }
 
-/// File delete (issue #262): `unlink(2)`/`unlinkat(2)`.
+/// File delete (issue #262): `unlink(2)`/`unlinkat(2)` on Linux, ES `UNLINK`
+/// on macOS. On Windows, only the deletion of a `:Zone.Identifier` stream, the
+/// mark-of-the-web removed (#442); `path` is then the stream path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileDeleteEvent {
     pub meta: EventMeta,
@@ -853,6 +869,30 @@ pub struct SocketAcceptEvent {
     pub accepted_fd: u32,
     pub peer_addr: core::net::IpAddr,
     pub peer_port: u16,
+}
+
+/// Socket creation (issue #263): `socket(2)` — context rather than an address.
+/// `bind`/`connect`/`accept` all tell you WHERE a socket talked; this tells you
+/// WHAT it was made as, before any of that happens. Not filtered to
+/// `AF_INET`/`AF_INET6` like its siblings: an `AF_PACKET` or `SOCK_RAW` creation
+/// (packet capture, spoofed-source tooling, a port scanner) is exactly the signal
+/// this event exists to carry, and those families have no `bind`/`connect`
+/// sockaddr `SocketBindEvent`/`ConnectEvent` would ever see. The one exclusion is
+/// `AF_UNIX` (local IPC — systemd, journald, D-Bus, every Unix-domain client):
+/// pure volume with no `bind`/`connect`-shaped risk and no current consumer
+/// (#714 review). Only emitted on success — a failed `socket()` created nothing
+/// to report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocketCreateEvent {
+    pub meta: EventMeta,
+    /// `AF_INET` (2), `AF_INET6` (10), `AF_PACKET` (17), `AF_NETLINK` (16), ...
+    pub domain: i32,
+    /// `SOCK_STREAM` (1), `SOCK_DGRAM` (2), `SOCK_RAW` (3), ... with
+    /// `SOCK_CLOEXEC`/`SOCK_NONBLOCK` masked off by the sensor.
+    pub socket_type: i32,
+    pub protocol: i32,
+    /// The new file descriptor (`socket(2)`'s return value).
+    pub fd: u32,
 }
 
 /// Process debugging/injection primitive (issue #265): `ptrace(2)`, every request
@@ -1566,6 +1606,59 @@ pub enum AuthKind {
     PrivilegedSession,
 }
 
+/// Which step in a session's life a [`SessionEvent`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    /// A remote client authenticated to the remote-desktop listener (Windows
+    /// `TerminalServices-RemoteConnectionManager` 1149). Comes before the
+    /// logon and belongs to no session yet, so `session_id` is `None`.
+    Connect,
+    /// A session logon completed (`TerminalServices-LocalSessionManager` 21).
+    Logon,
+    /// A session was disconnected and stays alive on the host, ready to be
+    /// reconnected to (24).
+    Disconnect,
+    /// A client was attached to an existing disconnected session (25).
+    Reconnect,
+    /// A session was logged off (23). Its `session_id` may be reused.
+    Logoff,
+}
+
+/// One step in the life of an interactive session (#285): Windows Terminal
+/// Services, which covers RDP and the local console alike.
+///
+/// What [`AuthEvent`] cannot say: whether a session is new or reconnected,
+/// when it was disconnected (left alive for later) rather than logged off,
+/// and which client a given session was attached to at each step. A
+/// disconnected session reconnected from another client is the trace of RDP
+/// session hijacking (T1563.002), invisible in the Security channel. A
+/// separate type rather than more [`AuthKind`]s: these steps are not
+/// authentications, and [`AuthEvent::outcome`] would mean nothing on them.
+///
+/// `meta` names the reporting service (`pid` from the event, `comm` empty,
+/// `user` unknown), not an actor. The account is [`Self::target_user`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEvent {
+    pub meta: EventMeta,
+    pub state: SessionState,
+    /// The OS session number (Windows `SessionID`). Unique among live
+    /// sessions only: reused once a session is logged off. `None` for
+    /// [`SessionState::Connect`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<u32>,
+    /// The session's account as the OS reports it (`DOMAIN\user`). Empty
+    /// when the event names none.
+    pub target_user: String,
+    /// The remote client's address, when the event reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_address: Option<core::net::IpAddr>,
+    /// The client is the host's own console (Windows `Address` = `LOCAL`).
+    /// `false` with no `source_address` means the event named no client at
+    /// all, as a logoff does: not the same thing as the console.
+    pub console: bool,
+}
+
 /// macOS TCC privacy-permission decision — tccd answered a process's request
 /// for a protected capability (screen capture, microphone, Accessibility, full
 /// disk access, ...). Emitted by `sensor-macos-unifiedlog` (issue #95) from the
@@ -2096,6 +2189,7 @@ pub enum Event {
     UdpSend(UdpSendEvent),
     UdpRecv(UdpRecvEvent),
     Auth(AuthEvent),
+    Session(SessionEvent),
     ListenPort(ListenPortEvent),
     NetworkFlow(NetworkFlowEvent),
     TlsCapture(TlsCaptureEvent),
@@ -2108,6 +2202,7 @@ pub enum Event {
     FileChown(FileChownEvent),
     SocketListen(SocketListenEvent),
     SocketAccept(SocketAcceptEvent),
+    SocketCreate(SocketCreateEvent),
     TccDecision(TccDecisionEvent),
     GatekeeperVerdict(GatekeeperVerdictEvent),
     FileQuarantine(FileQuarantineEvent),
@@ -2157,6 +2252,7 @@ impl Event {
             Event::UdpSend(e) => &e.meta,
             Event::UdpRecv(e) => &e.meta,
             Event::Auth(e) => &e.meta,
+            Event::Session(e) => &e.meta,
             Event::ListenPort(e) => &e.meta,
             Event::NetworkFlow(e) => &e.meta,
             Event::TlsCapture(e) => &e.meta,
@@ -2169,6 +2265,7 @@ impl Event {
             Event::FileChown(e) => &e.meta,
             Event::SocketListen(e) => &e.meta,
             Event::SocketAccept(e) => &e.meta,
+            Event::SocketCreate(e) => &e.meta,
             Event::TccDecision(e) => &e.meta,
             Event::GatekeeperVerdict(e) => &e.meta,
             Event::FileQuarantine(e) => &e.meta,

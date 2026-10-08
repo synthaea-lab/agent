@@ -19,9 +19,10 @@ use schema::{
     NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, NtlmAuthEvent, NtlmDirection,
     POLICY_MECHANISM_SELINUX, PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent,
     ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
-    ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent,
-    TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent,
-    User, WmiActivityEvent, XpcConnectEvent,
+    SessionEvent, SessionState, ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent,
+    SocketBindEvent, SocketCreateEvent, SocketListenEvent, TccDecisionEvent, TlsCaptureEvent,
+    TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
+    XpcConnectEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -947,6 +948,72 @@ fn auth_logon_golden() {
 }
 
 #[test]
+fn session_reconnect_golden() {
+    // An RDP client attached to a disconnected session (LocalSessionManager
+    // 25): the session number and the client's address are what the
+    // hijack rule compares across the disconnect and the reconnect.
+    assert_golden(
+        &Event::Session(SessionEvent {
+            meta: session_meta(),
+            state: SessionState::Reconnect,
+            session_id: Some(2),
+            target_user: r"LAB\alice".into(),
+            source_address: Some("198.51.100.40".parse::<IpAddr>().unwrap()),
+            console: false,
+        }),
+        "session_reconnect",
+    );
+}
+
+#[test]
+fn session_connect_golden() {
+    // RemoteConnectionManager 1149: before any session exists, so no
+    // `session_id` (absent, not null).
+    assert_golden(
+        &Event::Session(SessionEvent {
+            meta: session_meta(),
+            state: SessionState::Connect,
+            session_id: None,
+            target_user: r"LAB\alice".into(),
+            source_address: Some("198.51.100.40".parse::<IpAddr>().unwrap()),
+            console: false,
+        }),
+        "session_connect",
+    );
+}
+
+#[test]
+fn session_console_logoff_golden() {
+    // A logoff names no client: `console` false and no address, which is
+    // not the same as the console (`Address` = `LOCAL` on a 21/24/25).
+    assert_golden(
+        &Event::Session(SessionEvent {
+            meta: session_meta(),
+            state: SessionState::Logoff,
+            session_id: Some(1),
+            target_user: r"LAB\alice".into(),
+            source_address: None,
+            console: false,
+        }),
+        "session_logoff",
+    );
+}
+
+/// The reporting service, not an actor: Terminal Services' svchost pid.
+fn session_meta() -> EventMeta {
+    EventMeta {
+        pid: 2312,
+        ppid: 0,
+        user: User::Unknown,
+        timestamp_ns: 1_759_600_000_000_000_000,
+        comm: String::new(),
+        container: None,
+        process_generation: None,
+        parent_process_generation: None,
+    }
+}
+
+#[test]
 fn auth_logon_failure_golden() {
     // Failed network logon: source address present, target_user_sid is the Null
     // SID (S-1-0-0) — what Windows reports in 4625 when the account name itself
@@ -1438,6 +1505,31 @@ fn socket_accept_golden() {
             peer_port: 54321,
         }),
         "socket_accept",
+    );
+}
+
+#[test]
+fn socket_create_golden() {
+    // v42 (#263): AF_PACKET/SOCK_RAW — the shape bind/connect/accept never see,
+    // since raw sockets don't go through those calls the same way.
+    assert_golden(
+        &Event::SocketCreate(SocketCreateEvent {
+            meta: EventMeta {
+                pid: 8101,
+                ppid: 1,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_019_000_000_000,
+                comm: "tcpdump".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            domain: 17,
+            socket_type: 3,
+            protocol: 768,
+            fd: 5,
+        }),
+        "socket_create",
     );
 }
 
@@ -2078,6 +2170,14 @@ fn meta_accessor_covers_all_variants() {
             source_address: None,
             status_code: None,
         }),
+        Event::Session(SessionEvent {
+            meta: meta.clone(),
+            state: SessionState::Logon,
+            session_id: None,
+            target_user: String::new(),
+            source_address: None,
+            console: false,
+        }),
         Event::ListenPort(ListenPortEvent {
             meta: meta.clone(),
             local_addr: "0.0.0.0".parse::<IpAddr>().unwrap(),
@@ -2241,6 +2341,13 @@ fn meta_accessor_covers_all_variants() {
             syscall: NamespaceSyscall::Unshare,
             fd: None,
             flags: 0,
+        }),
+        Event::SocketCreate(SocketCreateEvent {
+            meta: meta.clone(),
+            domain: 2,
+            socket_type: 1,
+            protocol: 6,
+            fd: 0,
         }),
     ];
     for e in &events {

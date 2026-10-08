@@ -20,6 +20,11 @@ pub struct TransportConfig {
     /// Path to the client private key (PEM format).
     pub client_key_path: Option<PathBuf>,
 
+    /// Path to a PEM bundle of the CA(s) that sign the control plane's server
+    /// certificate. When set, **only** these roots are trusted (the control plane
+    /// is pinned to its own CA, #658); when unset, the built-in public roots apply.
+    pub ca_cert_path: Option<PathBuf>,
+
     /// Agent ID (assigned during enrollment).
     pub agent_id: Option<String>,
 
@@ -65,6 +70,7 @@ impl Default for TransportConfig {
             server_url: String::new(),
             client_cert_path: None,
             client_key_path: None,
+            ca_cert_path: None,
             agent_id: None,
             ingest_endpoint: DEFAULT_INGEST_ENDPOINT.to_string(),
             detection_endpoint: DEFAULT_DETECTION_ENDPOINT.to_string(),
@@ -95,6 +101,14 @@ impl TransportConfig {
     pub fn with_client_cert(mut self, cert_path: PathBuf, key_path: PathBuf) -> Self {
         self.client_cert_path = Some(cert_path);
         self.client_key_path = Some(key_path);
+        self
+    }
+
+    /// Trusts only the CA(s) in this PEM bundle for the control plane's server
+    /// certificate, instead of the built-in public roots (#658).
+    #[must_use]
+    pub fn with_ca_cert(mut self, ca_cert_path: PathBuf) -> Self {
+        self.ca_cert_path = Some(ca_cert_path);
         self
     }
 

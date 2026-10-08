@@ -143,9 +143,10 @@ pub(crate) fn cmd_check_content_manifest(
     ring: &str,
     cert: Option<&Path>,
     key: Option<&Path>,
+    ca_cert: Option<&Path>,
     state_path: &Path,
 ) -> anyhow::Result<()> {
-    let client = build_client(server, cert, key)?;
+    let client = build_client(server, cert, key, ca_cert)?;
     let url = client.config().content_manifest_url(ring);
     let manifest: ContentManifest = client.get_json(&url)?;
 
@@ -174,7 +175,8 @@ pub(crate) fn cmd_check_content_manifest(
 }
 
 /// Builds a [`transport::TransportClient`] for `server`, with mTLS if both
-/// `cert` and `key` are given — shared by [`cmd_check_content_manifest`] and
+/// `cert` and `key` are given, and trusting only `ca_cert`'s roots when it is
+/// (a control plane on a private CA, #658) — shared by [`cmd_check_content_manifest`] and
 /// [`cmd_apply_content_manifest`].
 ///
 /// # Errors
@@ -184,10 +186,14 @@ fn build_client(
     server: &str,
     cert: Option<&Path>,
     key: Option<&Path>,
+    ca_cert: Option<&Path>,
 ) -> anyhow::Result<transport::TransportClient> {
     let mut config = transport::TransportConfig::new(server);
     if let (Some(cert), Some(key)) = (cert, key) {
         config = config.with_client_cert(PathBuf::from(cert), PathBuf::from(key));
+    }
+    if let Some(ca_cert) = ca_cert {
+        config = config.with_ca_cert(PathBuf::from(ca_cert));
     }
     Ok(transport::TransportClient::new(config)?)
 }
@@ -403,6 +409,8 @@ pub(crate) struct Endpoint {
     pub(crate) server: String,
     pub(crate) cert: Option<PathBuf>,
     pub(crate) key: Option<PathBuf>,
+    /// PEM bundle of the only CA(s) trusted for the server's certificate.
+    pub(crate) ca_cert: Option<PathBuf>,
 }
 
 /// Picks the control plane for `apply-content-manifest`. `--server` omitted
@@ -415,16 +423,34 @@ pub(crate) fn resolve_endpoint(
     server: Option<String>,
     cert: Option<PathBuf>,
     key: Option<PathBuf>,
+    ca_cert: Option<PathBuf>,
     configured: &config::ServerConfig,
 ) -> Endpoint {
     match server {
-        Some(server) => Endpoint { server, cert, key },
+        Some(server) => Endpoint {
+            server,
+            cert,
+            key,
+            ca_cert,
+        },
         None => Endpoint {
+            ca_cert,
             server: configured.control_plane_url.clone(),
             cert: Some(cert.unwrap_or_else(|| configured.mtls_cert.clone())),
             key: Some(key.unwrap_or_else(|| configured.mtls_key.clone())),
         },
     }
+}
+
+/// The CA bundle to trust for the control plane: `--ca-cert`, else `server.ca_cert`
+/// from `agent.toml`, else none (the built-in roots). A CA is a trust anchor and not a
+/// credential, so unlike the client certificate it applies to a server named by hand
+/// too; it can only make verification stricter.
+pub(crate) fn resolve_ca_cert(
+    flag: Option<PathBuf>,
+    configured: &config::ServerConfig,
+) -> Option<PathBuf> {
+    flag.or_else(|| configured.ca_cert.clone())
 }
 
 /// Picks the ring for `apply-content-manifest`: `--ring`, else
@@ -447,6 +473,37 @@ pub(crate) fn resolve_ring(
     })
 }
 
+/// Exit status of `apply-content-manifest` when the control plane has halted
+/// the ring (`423 Locked`): `EX_TEMPFAIL` from `sysexits.h`, so it cannot be
+/// mistaken for a network or verification failure (exit 1). A halt is an
+/// intended, temporary state; a timer unit should list it under
+/// `SuccessExitStatus=` (docs/operations/content.md).
+pub(crate) const EXIT_RING_HALTED: i32 = 75;
+
+/// How an `apply-content-manifest` run ended, when it did not fail.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ApplyOutcome {
+    /// Applied, or already up to date.
+    Done,
+    /// The control plane halted the ring: nothing was fetched or changed.
+    RingHalted,
+}
+
+/// The server's reason if `error` is a `423 Locked` from the control plane
+/// (the manifest, or an artifact when the halt lands mid-apply).
+fn halted_reason(error: &anyhow::Error) -> Option<&str> {
+    error.chain().find_map(|e| {
+        e.downcast_ref::<transport::TransportError>()?
+            .locked_reason()
+    })
+}
+
+fn halted_message(ring: &str, reason: &str) -> String {
+    format!(
+        "ring {ring}: content delivery is halted by the control plane ({reason}); no further content was applied, and any completed entries remain recorded"
+    )
+}
+
 /// Fetches the content manifest for `ring`, verifies it exactly like
 /// [`cmd_check_content_manifest`], and — unlike that command — actually
 /// downloads and writes every entry that's missing or stale under
@@ -460,17 +517,42 @@ pub(crate) fn resolve_ring(
 ///
 /// Returns an error if the server is unreachable, the manifest fails
 /// verification, or [`download_and_apply`] fails partway through (already-
-/// applied entries stay recorded in `state_path` for the next attempt).
+/// applied entries stay recorded in `state_path` for the next attempt). A
+/// halted ring (`423`) is not an error: it prints the server's reason and
+/// returns [`ApplyOutcome::RingHalted`], leaving the state file and the
+/// content directory as they were (#667).
 pub(crate) fn cmd_apply_content_manifest(
-    server: &str,
+    endpoint: &Endpoint,
     ring: &str,
-    cert: Option<&Path>,
-    key: Option<&Path>,
     content_dir: &Path,
     state_path: &Path,
     ipc_endpoint: &str,
-) -> anyhow::Result<()> {
-    let client = build_client(server, cert, key)?;
+) -> anyhow::Result<ApplyOutcome> {
+    match apply_content_manifest(endpoint, ring, content_dir, state_path, ipc_endpoint) {
+        Err(e) => match halted_reason(&e) {
+            Some(reason) => {
+                println!("{}", halted_message(ring, reason));
+                Ok(ApplyOutcome::RingHalted)
+            }
+            None => Err(e),
+        },
+        ok => ok,
+    }
+}
+
+fn apply_content_manifest(
+    endpoint: &Endpoint,
+    ring: &str,
+    content_dir: &Path,
+    state_path: &Path,
+    ipc_endpoint: &str,
+) -> anyhow::Result<ApplyOutcome> {
+    let client = build_client(
+        &endpoint.server,
+        endpoint.cert.as_deref(),
+        endpoint.key.as_deref(),
+        endpoint.ca_cert.as_deref(),
+    )?;
     let url = client.config().content_manifest_url(ring);
     let manifest: ContentManifest = client.get_json(&url)?;
 
@@ -479,7 +561,7 @@ pub(crate) fn cmd_apply_content_manifest(
         Ok(fetch_plan) => fetch_plan,
         Err(UpdaterError::ReleaseNotNewer { offered, current }) => {
             println!("ring {ring}: up to date (release {current}, server offers {offered})");
-            return Ok(());
+            return Ok(ApplyOutcome::Done);
         }
         Err(e) => return Err(e.into()),
     };
@@ -516,7 +598,7 @@ pub(crate) fn cmd_apply_content_manifest(
              will be picked up on the agent's next start"
         ),
     }
-    Ok(())
+    Ok(ApplyOutcome::Done)
 }
 
 /// One line for a [`ipc::ReloadContentResponse`] count field: `None` means
@@ -566,13 +648,55 @@ mod tests {
             mtls_cert: PathBuf::from("/etc/synthaea/certs/client.crt"),
             mtls_key: PathBuf::from("/etc/synthaea/certs/client.key"),
             mtls_passphrase: config::SecretRef::Invalid(String::new()),
+            ca_cert: None,
             offline_fallback: true,
         }
     }
 
+    fn ca(path: &str) -> Option<PathBuf> {
+        Some(PathBuf::from(path))
+    }
+
+    #[test]
+    fn resolve_ca_cert_takes_the_flag_the_config_or_both_with_the_flag_winning() {
+        let mut server = configured_server();
+        // Neither: the built-in roots.
+        assert_eq!(resolve_ca_cert(None, &server), None);
+        // Flag only.
+        assert_eq!(
+            resolve_ca_cert(ca("/lab/ca.pem"), &server),
+            ca("/lab/ca.pem")
+        );
+        // Config only.
+        server.ca_cert = ca("/etc/synthaea/certs/ca.pem");
+        assert_eq!(
+            resolve_ca_cert(None, &server),
+            ca("/etc/synthaea/certs/ca.pem")
+        );
+        // Both: the flag wins.
+        assert_eq!(
+            resolve_ca_cert(ca("/lab/ca.pem"), &server),
+            ca("/lab/ca.pem")
+        );
+    }
+
+    #[test]
+    fn a_ca_bundle_is_kept_for_the_configured_and_for_an_explicit_server() {
+        let configured = resolve_endpoint(None, None, None, ca("/x/ca.pem"), &configured_server());
+        let explicit = resolve_endpoint(
+            Some("https://lab.example".to_string()),
+            None,
+            None,
+            ca("/x/ca.pem"),
+            &configured_server(),
+        );
+        assert_eq!(configured.ca_cert, ca("/x/ca.pem"));
+        assert_eq!(explicit.ca_cert, ca("/x/ca.pem"));
+    }
+
     #[test]
     fn omitting_server_uses_the_configured_control_plane_and_mtls_pair() {
-        let endpoint = resolve_endpoint(None, None, None, &configured_server());
+        let endpoint = resolve_endpoint(None, None, None, None, &configured_server());
         assert_eq!(endpoint.server, "https://cp.example");
         assert_eq!(
             endpoint.cert.as_deref(),
@@ -590,6 +714,7 @@ mod tests {
             Some("http://127.0.0.1:3000".to_string()),
             None,
             None,
+            None,
             &configured_server(),
         );
         assert_eq!(endpoint.server, "http://127.0.0.1:3000");
@@ -602,6 +727,7 @@ mod tests {
         let endpoint = resolve_endpoint(
             None,
             Some(PathBuf::from("/tmp/other.crt")),
+            None,
             None,
             &configured_server(),
         );
@@ -848,6 +974,63 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// An endpoint with no client certificate and no pinned CA, for a plain-http test server.
+    fn endpoint_at(url: &str) -> Endpoint {
+        Endpoint {
+            server: url.to_string(),
+            cert: None,
+            key: None,
+            ca_cert: None,
+        }
+    }
+
+    #[test]
+    fn a_halted_ring_is_reported_not_failed_and_changes_nothing() {
+        let dir = tmp("apply-halted");
+        let content_dir = dir.join("content");
+        let state_path = dir.join("content-state.json");
+        let url = artifact_server(vec![(
+            423,
+            br#"{"error":"Content delivery is halted for ring 'canary_0' at release 3"}"#.to_vec(),
+        )]);
+
+        let outcome = cmd_apply_content_manifest(
+            &endpoint_at(&url),
+            "canary_0",
+            &content_dir,
+            &state_path,
+            "unused-ipc-endpoint",
+        )
+        .expect("a halt is not an error");
+
+        assert_eq!(outcome, ApplyOutcome::RingHalted);
+        assert!(!state_path.exists(), "no state written");
+        assert!(!content_dir.exists(), "no content written");
+    }
+
+    #[test]
+    fn halt_message_does_not_claim_nothing_changed_after_partial_apply() {
+        assert_eq!(
+            halted_message("canary_0", "paused"),
+            "ring canary_0: content delivery is halted by the control plane (paused); no further content was applied, and any completed entries remain recorded"
+        );
+    }
+
+    #[test]
+    fn another_server_error_still_fails() {
+        let dir = tmp("apply-server-error");
+        let url = artifact_server(vec![(500, b"boom".to_vec())]);
+        let err = cmd_apply_content_manifest(
+            &endpoint_at(&url),
+            "canary_0",
+            &dir.join("content"),
+            &dir.join("content-state.json"),
+            "unused-ipc-endpoint",
+        )
+        .unwrap_err();
+        assert!(halted_reason(&err).is_none());
+    }
+
     fn entry_for(path: &str, bytes: &[u8]) -> ContentEntry {
         ContentEntry {
             metadata: None,
@@ -970,6 +1153,46 @@ mod tests {
         assert_eq!(state.entries.get("rules/first.sigma"), Some(&e1.sha256));
         assert!(!state.entries.contains_key("rules/second.sigma"));
         // The release isn't marked applied until every entry lands.
+        assert!(!state.release_version.contains_key("canary_0"));
+    }
+
+    #[test]
+    fn a_halt_on_the_second_artifact_preserves_the_first_applied_entry() {
+        let dir = tmp("apply-halted-midway");
+        let content_dir = dir.join("content");
+        let state_path = dir.join("content-state.json");
+        let first_bytes = b"first artifact";
+        let first = entry_for("rules/first.sigma", first_bytes);
+        let second = entry_for("rules/second.sigma", b"second artifact");
+        let manifest = signed_manifest_json(9, vec![first.clone(), second]);
+        let responses = vec![
+            (200, serde_json::to_vec(&manifest).unwrap()),
+            (200, first_bytes.to_vec()),
+            (
+                423,
+                br#"{"error":"Content delivery paused during artifact download"}"#.to_vec(),
+            ),
+        ];
+        let url = artifact_server(responses);
+
+        let outcome = cmd_apply_content_manifest(
+            &endpoint_at(&url),
+            "canary_0",
+            &content_dir,
+            &state_path,
+            "unused-ipc-endpoint",
+        )
+        .expect("a mid-apply halt is an intended outcome");
+
+        assert_eq!(outcome, ApplyOutcome::RingHalted);
+        assert_eq!(
+            std::fs::read(content_dir.join("rules/first.sigma")).unwrap(),
+            first_bytes
+        );
+        assert!(!content_dir.join("rules/second.sigma").exists());
+        let state = ContentState::load(&state_path).unwrap();
+        assert_eq!(state.entries.get("rules/first.sigma"), Some(&first.sha256));
+        assert!(!state.entries.contains_key("rules/second.sigma"));
         assert!(!state.release_version.contains_key("canary_0"));
     }
 

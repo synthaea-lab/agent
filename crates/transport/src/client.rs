@@ -1,5 +1,7 @@
 //! HTTP client with mTLS support.
 
+use std::io::Read;
+
 use schema::{Event, detection::Detection};
 use serde::Serialize;
 
@@ -96,13 +98,7 @@ impl TransportClient {
     /// Returns an error if the request fails or the response body is not
     /// valid JSON for `R`.
     pub fn get_json<R: serde::de::DeserializeOwned>(&self, url: &str) -> Result<R> {
-        let response = self.agent.get(url).call().map_err(|e| match &e {
-            ureq::Error::StatusCode(status) => TransportError::ServerError {
-                status: *status,
-                message: e.to_string(),
-            },
-            _ => TransportError::Network(e.to_string()),
-        })?;
+        let response = send_get(self.agent.get(url))?;
 
         response
             .into_body()
@@ -127,13 +123,7 @@ impl TransportClient {
         for (key, value) in query {
             req = req.query(*key, *value);
         }
-        let response = req.call().map_err(|e| match &e {
-            ureq::Error::StatusCode(status) => TransportError::ServerError {
-                status: *status,
-                message: e.to_string(),
-            },
-            _ => TransportError::Network(e.to_string()),
-        })?;
+        let response = send_get(req)?;
 
         let mut body = response.into_body();
         body.with_config()
@@ -170,10 +160,7 @@ impl TransportClient {
             request = request.header("Idempotency-Key", key);
         }
         let response = request.send(&body).map_err(|e| match &e {
-            ureq::Error::StatusCode(status) => TransportError::ServerError {
-                status: *status,
-                message: e.to_string(),
-            },
+            ureq::Error::StatusCode(status) => server_error(*status, e.to_string()),
             _ => TransportError::Network(e.to_string()),
         })?;
 
@@ -192,6 +179,72 @@ impl TransportClient {
     pub fn config(&self) -> &TransportConfig {
         &self.config
     }
+}
+
+/// Longest server explanation kept from an error response.
+const ERROR_BODY_LIMIT: u64 = 2048;
+
+/// Sends a GET and turns a 4xx/5xx into [`TransportError::ServerError`] that
+/// carries what the server said. `ureq`'s own status error discards the body, so
+/// a `423 Locked` carrying "Content delivery is halted for ring `canary_0` at
+/// release 3" reached the operator as `http status: 423` (#667).
+fn send_get(
+    request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+) -> Result<ureq::http::Response<ureq::Body>> {
+    let response = request
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()
+        .map_err(|e| TransportError::Network(e.to_string()))?;
+    let status = response.status().as_u16();
+    if status < 400 {
+        return Ok(response);
+    }
+    let text = read_error_body(response.into_body().into_reader());
+    Err(server_error(
+        status,
+        error_reason(&text).unwrap_or_else(|| format!("http status: {status}")),
+    ))
+}
+
+fn server_error(status: u16, message: String) -> TransportError {
+    let message = message
+        .chars()
+        .filter(|character| !character.is_control() && !is_bidi_control(*character))
+        .collect();
+    TransportError::ServerError { status, message }
+}
+
+fn read_error_body<R: Read>(reader: R) -> String {
+    let mut bytes = Vec::new();
+    let _ = reader.take(ERROR_BODY_LIMIT).read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn is_bidi_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200e}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{206a}'..='\u{206f}'
+    )
+}
+
+/// The explanation in an error body: the `error`, `message` or `reason` string
+/// of a JSON object, else the plain text. `None` when the body says nothing.
+fn error_reason(body: &str) -> Option<String> {
+    let body = body.trim();
+    if let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(body) {
+        return ["error", "message", "reason"]
+            .iter()
+            .find_map(|key| fields.get(*key)?.as_str())
+            .map(str::to_string)
+            .filter(|reason| !reason.is_empty());
+    }
+    (!body.is_empty()).then(|| body.to_string())
 }
 
 fn validate_detection_response(response: DetectionUploadResponse) -> Result<()> {
@@ -238,45 +291,125 @@ fn build_agent(config: &TransportConfig) -> Result<ureq::Agent> {
         .timeout_global(Some(config.request_timeout))
         .user_agent(format!("synthaea-agent/{}", env!("CARGO_PKG_VERSION")));
 
-    // Configure mTLS if certificates are provided
-    if config.has_client_cert() {
-        let tls_config = build_tls_config(config)?;
-        agent_builder = agent_builder.tls_config(tls_config);
+    // A custom TLS config is only needed for mTLS or a private CA; otherwise
+    // ureq's defaults (built-in public roots) stand.
+    if config.has_client_cert() || config.ca_cert_path.is_some() {
+        agent_builder = agent_builder.tls_config(build_tls_config(config)?);
     }
 
     Ok(agent_builder.build().into())
 }
 
-/// Builds TLS config with client certificate authentication.
+/// Builds the TLS config: the client certificate for mTLS and/or the pinned CA
+/// roots, whichever are configured.
 fn build_tls_config(config: &TransportConfig) -> Result<ureq::tls::TlsConfig> {
     use ureq::tls::{Certificate, ClientCert, PrivateKey, TlsConfig};
 
-    let (Some(cert_path), Some(key_path)) = (&config.client_cert_path, &config.client_key_path)
-    else {
-        // No client cert configured, use default TLS
-        return Ok(TlsConfig::default());
-    };
+    let mut builder = TlsConfig::builder();
 
-    // Load certificate from PEM file
-    let cert_pem = std::fs::read(cert_path)?;
-    let cert = Certificate::from_pem(&cert_pem)
-        .map_err(|e| TransportError::Config(format!("failed to parse cert: {e}")))?;
+    if let Some(ca_path) = &config.ca_cert_path {
+        builder = builder.root_certs(load_ca_roots(ca_path)?);
+    }
 
-    // Load private key from PEM file
-    let key_pem = std::fs::read(key_path)?;
-    let key = PrivateKey::from_pem(&key_pem)
-        .map_err(|e| TransportError::Config(format!("failed to parse key: {e}")))?;
+    if let (Some(cert_path), Some(key_path)) = (&config.client_cert_path, &config.client_key_path) {
+        // Load certificate from PEM file
+        let cert_pem = std::fs::read(cert_path).map_err(|e| {
+            TransportError::Config(format!(
+                "cannot read the client certificate {}: {e}",
+                cert_path.display()
+            ))
+        })?;
+        let cert = Certificate::from_pem(&cert_pem)
+            .map_err(|e| TransportError::Config(format!("failed to parse cert: {e}")))?;
 
-    // Create client certificate with chain and key
-    let client_cert = ClientCert::new_with_certs(&[cert], key);
+        // Load private key from PEM file
+        let key_pem = std::fs::read(key_path).map_err(|e| {
+            TransportError::Config(format!(
+                "cannot read the client key {}: {e}",
+                key_path.display()
+            ))
+        })?;
+        if is_encrypted_pem(&key_pem) {
+            return Err(TransportError::Config(format!(
+                "the client key {} is passphrase-protected, which the transport cannot use \
+                 yet (`server.mtls_passphrase` is not wired): provide an unencrypted key",
+                key_path.display()
+            )));
+        }
+        let key = PrivateKey::from_pem(&key_pem)
+            .map_err(|e| TransportError::Config(format!("failed to parse key: {e}")))?;
 
-    Ok(TlsConfig::builder().client_cert(Some(client_cert)).build())
+        // Create client certificate with chain and key
+        builder = builder.client_cert(Some(ClientCert::new_with_certs(&[cert], key)));
+    }
+
+    Ok(builder.build())
+}
+
+/// Whether a PEM private key is passphrase-protected (PKCS#8 `ENCRYPTED PRIVATE KEY`, or the
+/// legacy `Proc-Type: 4,ENCRYPTED` header). Said plainly, because the parse error of an
+/// encrypted key does not name the cause.
+fn is_encrypted_pem(pem: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(pem);
+    text.contains("BEGIN ENCRYPTED PRIVATE KEY") || text.contains("Proc-Type: 4,ENCRYPTED")
+}
+
+/// Reads every certificate of a PEM bundle as a trust root. An unreadable file or
+/// a bundle with no certificate is a configuration error, not a silent fallback to
+/// the public roots: the operator asked for a pinned CA.
+fn load_ca_roots(path: &std::path::Path) -> Result<ureq::tls::RootCerts> {
+    let pem = std::fs::read(path).map_err(|e| {
+        TransportError::Config(format!("cannot read CA bundle {}: {e}", path.display()))
+    })?;
+    let mut roots = Vec::new();
+    for item in ureq::tls::parse_pem(&pem) {
+        let item = item.map_err(|e| {
+            TransportError::Config(format!("invalid CA bundle {}: {e}", path.display()))
+        })?;
+        if let ureq::tls::PemItem::Certificate(cert) = item {
+            roots.push(cert);
+        }
+    }
+    if roots.is_empty() {
+        return Err(TransportError::Config(format!(
+            "CA bundle {} contains no certificate",
+            path.display()
+        )));
+    }
+    Ok(ureq::tls::RootCerts::new_with_certs(&roots))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::DEFAULT_HEARTBEAT_ENDPOINT;
+
+    #[test]
+    fn server_error_reason_removes_terminal_controls_and_bidi_markers() {
+        let err = server_error(
+            423,
+            "\x1b[31mhalted\nnext line\r\0\u{0080}\u{009f}\u{202e}".into(),
+        );
+        let expected = "[31mhaltednext line";
+        assert_eq!(err.locked_reason(), Some(expected));
+        assert_eq!(err.to_string(), format!("server error: 423 - {expected}"));
+    }
+
+    #[test]
+    fn error_body_is_capped_at_two_kibibytes() {
+        let input = "x".repeat(3 * 1024);
+        let actual = read_error_body(input.as_bytes());
+        assert_eq!(actual.len(), ERROR_BODY_LIMIT as usize);
+        assert_eq!(actual, "x".repeat(ERROR_BODY_LIMIT as usize));
+    }
+
+    #[test]
+    fn error_body_truncation_inside_utf8_is_lossy_not_a_panic() {
+        let input = format!("{}é", "a".repeat(ERROR_BODY_LIMIT as usize - 1));
+        let actual = read_error_body(input.as_bytes());
+        let expected = format!("{}�", "a".repeat(ERROR_BODY_LIMIT as usize - 1));
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn config_builds_urls_correctly() {
@@ -351,5 +484,49 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn a_passphrase_protected_client_key_is_refused_with_a_clear_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = (dir.path().join("c.crt"), dir.path().join("c.key"));
+        std::fs::write(&cert, include_str!("../tests/fixtures/ca.pem")).unwrap();
+        std::fs::write(
+            &key,
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n-----END ENCRYPTED PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let config = TransportConfig::new("https://cp.example").with_client_cert(cert, key);
+
+        let Err(err) = TransportClient::new(config) else {
+            panic!("an encrypted key must be refused");
+        };
+        assert!(err.to_string().contains("passphrase-protected"), "{err}");
+
+        assert!(is_encrypted_pem(
+            b"Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00"
+        ));
+        assert!(!is_encrypted_pem(b"-----BEGIN PRIVATE KEY-----"));
+    }
+
+    #[test]
+    fn an_unreadable_client_certificate_or_key_names_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = (dir.path().join("c.crt"), dir.path().join("c.key"));
+        let missing_cert =
+            TransportConfig::new("https://cp.example").with_client_cert(cert.clone(), key.clone());
+        let Err(err) = TransportClient::new(missing_cert) else {
+            panic!("a missing certificate must be refused");
+        };
+        assert!(err.to_string().contains("client certificate"), "{err}");
+        assert!(err.to_string().contains("c.crt"), "{err}");
+
+        std::fs::write(&cert, include_str!("../tests/fixtures/ca.pem")).unwrap();
+        let missing_key = TransportConfig::new("https://cp.example").with_client_cert(cert, key);
+        let Err(err) = TransportClient::new(missing_key) else {
+            panic!("a missing key must be refused");
+        };
+        assert!(err.to_string().contains("client key"), "{err}");
+        assert!(err.to_string().contains("c.key"), "{err}");
     }
 }

@@ -52,10 +52,11 @@ This separation ensures that package managers (apt/dnf) and the updater never co
 
 ### Prerequisites
 
-**Debian/Ubuntu (.deb):**
-```bash
-cargo install cargo-deb
-```
+**Static .deb:** build on an x86_64 Alpine/musl host with the toolchain provisioned by
+`lab/provisioning/alpine-toolchain.sh`. The build creates ONNX Runtime from source and
+needs several gigabytes of disk and build time on first run. The resulting binaries are
+static musl executables, so one `.deb` runs on glibc-based Debian and Ubuntu versions
+without inheriting the build host's glibc or libstdc++ baseline.
 
 **RHEL/Fedora (.rpm):**
 ```bash
@@ -68,12 +69,19 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ### Build Debian Package
 
+On an x86_64 Alpine host with `lab/provisioning/alpine-toolchain.sh` already run:
+
 ```bash
-cd packaging/linux
-./build-deb.sh
+./packaging/linux/build-deb.sh
 ```
 
-Output: `target/debian/synthaea-agent_0.1.0-1_amd64.deb`
+The script builds and tests ML with source-built static ONNX Runtime, builds the agent,
+watchdog and CLI for `x86_64-unknown-linux-musl`, checks that none has a program
+interpreter, then packages those exact artifacts. `ORT_LIB_LOCATION` may point to an
+existing ONNX Runtime 1.30.0 musl static build; otherwise the first run builds it under
+`onnxruntime/build/Linux/Release`.
+
+Output: `target/debian/synthaea-agent_<version>-1_amd64.deb`
 
 ### Build RPM Package
 
