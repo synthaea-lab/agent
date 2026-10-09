@@ -23,6 +23,7 @@
 mod alerts;
 mod commands;
 mod content;
+mod deception;
 mod enrich_queue;
 mod health;
 #[cfg_attr(
@@ -52,6 +53,7 @@ mod log_sources;
 mod memscan;
 mod protected;
 mod quarantine_cmd;
+mod ransomware_join;
 mod redact;
 mod release;
 mod shutdown;
@@ -124,15 +126,26 @@ enum Command {
         /// redacted. Linux only.
         #[arg(long)]
         enable_dns_capture: bool,
-        /// Control-plane base URL (e.g. `https://api.synthaea.example.com`).
-        /// When set, every normalized event is spooled next to the alerts file
-        /// and uploaded store-and-forward (at-least-once; the spool sheds
-        /// oldest past its byte cap). Without it the agent runs standalone,
-        /// exactly as before.
-        #[arg(long)]
+        /// Control-plane base URL, overriding `server.control_plane_url` from
+        /// `agent.toml`. Left unset, the agent uploads to the configured control plane
+        /// (store-and-forward, at-least-once; the spool sheds oldest past its byte cap),
+        /// presenting `server.mtls_cert`/`mtls_key`. A server named here never receives
+        /// the configured client certificate: pass `--cert`/`--key` for one that needs it.
+        #[arg(long, conflicts_with = "standalone")]
         server: Option<String>,
-        /// PEM bundle of the only CA(s) trusted for `--server`'s certificate, for a
-        /// control plane on a private CA. Left unset, `server.ca_cert` from
+        /// Run without uploading anything: events stay local, as before the agent read
+        /// its control plane from `agent.toml`.
+        #[arg(long)]
+        standalone: bool,
+        /// Client mTLS certificate (PEM) to present to the control plane, overriding the
+        /// configured one.
+        #[arg(long, requires = "key")]
+        cert: Option<std::path::PathBuf>,
+        /// Client mTLS private key (PEM). Required alongside `--cert`.
+        #[arg(long, requires = "cert")]
+        key: Option<std::path::PathBuf>,
+        /// PEM bundle of the only CA(s) trusted for the control plane's certificate, for
+        /// one on a private CA. Left unset, `server.ca_cert` from
         /// `agent.toml`; with neither, the built-in public roots.
         #[arg(long)]
         ca_cert: Option<std::path::PathBuf>,
@@ -294,7 +307,17 @@ enum QuarantineAction {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> std::process::ExitCode {
+    match try_main() {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn try_main() -> anyhow::Result<std::process::ExitCode> {
     let cli = Cli::parse();
 
     // Load the local install configuration BEFORE anything else — logging
@@ -324,7 +347,8 @@ fn main() -> anyhow::Result<()> {
         cfg.server.control_plane_url
     );
 
-    match cli.command {
+    let mut exit_code = std::process::ExitCode::SUCCESS;
+    let result = match cli.command {
         Command::Status => commands::cmd_status(),
         Command::Run {
             alerts,
@@ -335,10 +359,14 @@ fn main() -> anyhow::Result<()> {
             enable_readline_capture,
             enable_dns_capture,
             server,
+            standalone,
+            cert,
+            key,
             ca_cert,
             content_dir,
         } => {
-            let ca_cert = content::resolve_ca_cert(ca_cert, &cfg.server);
+            let target =
+                upload::resolve_run_target(server, standalone, cert, key, ca_cert, &cfg.server);
             let content_dir =
                 content_dir.unwrap_or_else(|| content::default_content_dir(&cfg.storage.state_dir));
             commands::cmd_run(commands::RunOptions {
@@ -350,12 +378,10 @@ fn main() -> anyhow::Result<()> {
                 enable_tls_capture,
                 enable_readline_capture,
                 enable_dns_capture,
-                server: server.as_deref().map(|url| upload::ControlPlane {
-                    url,
-                    ca_cert: ca_cert.as_deref(),
-                }),
+                server: target.as_ref().map(upload::RunTarget::control_plane),
                 ipc_endpoint: &cfg.ipc.endpoint,
                 log_sources: &cfg.logs.sources,
+                deception: &cfg.deception,
                 content_dir: &content_dir,
             })
         }
@@ -395,13 +421,17 @@ fn main() -> anyhow::Result<()> {
                 content::resolve_ca_cert(ca_cert, &cfg.server),
                 &cfg.server,
             );
-            content::cmd_apply_content_manifest(
+            let outcome = content::cmd_apply_content_manifest(
                 &endpoint,
                 &ring,
                 &content_dir,
                 &state,
                 &cfg.ipc.endpoint,
-            )
+            )?;
+            if outcome == content::ApplyOutcome::RingHalted {
+                exit_code = std::process::ExitCode::from(apply_exit_status(outcome) as u8);
+            }
+            Ok(())
         }
         Command::Quarantine { alerts, action } => match action {
             QuarantineAction::List => {
@@ -427,5 +457,26 @@ fn main() -> anyhow::Result<()> {
             !no_restart,
             allow_test_key,
         ),
+    };
+    result?;
+    Ok(exit_code)
+}
+
+fn apply_exit_status(outcome: content::ApplyOutcome) -> i32 {
+    if outcome == content::ApplyOutcome::RingHalted {
+        content::EXIT_RING_HALTED
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod exit_code_tests {
+    use super::*;
+
+    #[test]
+    fn a_halted_content_ring_returns_exit_status_75() {
+        assert_eq!(apply_exit_status(content::ApplyOutcome::RingHalted), 75);
+        assert_eq!(apply_exit_status(content::ApplyOutcome::Done), 0);
     }
 }

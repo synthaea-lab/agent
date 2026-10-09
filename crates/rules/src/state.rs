@@ -8,9 +8,10 @@ use std::{
 };
 
 use schema::{
-    AuthEvent, AuthOutcome, ConnectEvent, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
+    AuthEvent, AuthOutcome, ConnectEvent, Event, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
     FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRenameEvent, FileWriteEvent,
-    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, User, detection::Severity,
+    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, SessionEvent, User,
+    detection::Severity,
 };
 use store::BoundedMap;
 
@@ -29,9 +30,11 @@ use crate::{
         SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS,
         SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS,
         SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN,
-        SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
+        SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS, TOUCHED_FILES_PER_PID,
+        TOUCHED_FILES_PID_CAP,
     },
     has_write_intent,
+    session::SessionHijack,
     signature_gate::SignatureGatedAlert,
     sliding::{FlowPortDedup, SlidingCounter, SlidingDistinct, SlidingSum},
 };
@@ -48,6 +51,16 @@ struct RecentQuarantine {
     agent: Option<String>,
     origin_url: Option<String>,
     /// Set by the first exec that alerted: one alert per mark, not per run.
+    alerted: bool,
+}
+
+/// A mark-of-the-web removal (`FileDelete` of a `:Zone.Identifier` stream), as
+/// [`RuleState::on_file_delete`] saw it.
+struct MotwRemoval {
+    timestamp_ns: u64,
+    pid: u32,
+    comm: String,
+    /// Set by the first exec that alerted: one alert per removal, not per run.
     alerted: bool,
 }
 
@@ -123,6 +136,10 @@ pub struct RuleState {
     /// #365). LRU-bounded like `recent_writes`: a burst of downloads, or a
     /// hostile loop writing marks, must not grow agent memory.
     recent_quarantines: BoundedMap<String, RecentQuarantine>,
+    /// case-folded host path → its latest mark-of-the-web removal (T1553.005,
+    /// #442). LRU-bounded: `Unblock-File` over a whole module tree removes
+    /// hundreds of marks at once.
+    recent_motw_removals: BoundedMap<String, MotwRemoval>,
     /// (ppid, comm) → sliding counter for SELF-SPAWN (T1059 Windows). LRU-bounded.
     self_spawn: BoundedMap<(u32, String), SlidingCounter>,
     /// (comm, daddr, dport) → sliding counter for BEACON (T1071 Windows). LRU-bounded.
@@ -152,6 +169,9 @@ pub struct RuleState {
     /// a hostile process renaming under many different pids (unusual, but not
     /// impossible) must not grow this without limit either.
     ransomware_rename: BoundedMap<u32, SlidingCounter>,
+    /// Distinct LDAP searches per process for the enumeration-sweep rule
+    /// (T1087.002, #364).
+    ldap_burst: crate::ldap::LdapBurst,
     /// ppid → the same counter, for the shell-loop shape (`for f in *; do mv "$f"
     /// "$f.locked"; done`, `find … -exec mv {} {}.x \;`): each rename runs in its own
     /// short-lived `mv` pid, so the per-pid counter never climbs, but every child
@@ -171,6 +191,10 @@ pub struct RuleState {
     /// first (the same ordering hazard as `pending_proc_fd_exec`, #503); the creation
     /// then pairs with it on arrival. Same bounds as `recent_creates`.
     pending_unlinks: BoundedMap<u32, VecDeque<(u64, String)>>,
+    /// pid → the newest renames and deletions seen for it (oldest first): the damage
+    /// manifest of a ransomware detection (issue #82), read through [`Self::touched_files`].
+    /// Bounded by [`TOUCHED_FILES_PID_CAP`] pids x [`TOUCHED_FILES_PER_PID`] events.
+    touched_files: BoundedMap<u32, VecDeque<Event>>,
     /// pid → sliding counter of write-new-then-unlink pairs (T1486, #512 part B).
     ransomware_unlink: BoundedMap<u32, SlidingCounter>,
     /// pid → sliding sum of `FileWriteEvent::bytes_requested` (issue #82): the
@@ -190,6 +214,9 @@ pub struct RuleState {
     /// seen on both Security 4698 and TaskScheduler/Operational 106 alerts once
     /// (#422). LRU-bounded like the counters.
     task_registrations: BoundedMap<String, ReportedTaskRegistration>,
+    /// Disconnected sessions and the client each was left from, for the
+    /// T1563.002 reconnect check (#285).
+    session_hijack: SessionHijack,
     /// The agent's own pid, for [`Self::check_self_spawn`]'s narrow exclusion of
     /// its own known children (issue #403). `None` until [`Self::seed_own_pid`] is
     /// called — `sensor-*` crates stay `schema`-only (`tools/check-deps.py`), so
@@ -254,7 +281,9 @@ impl RuleState {
             pid_image_path: BoundedMap::new(PID_COMM_CAP),
             recent_writes: BoundedMap::new(RECENT_WRITES_CAP),
             recent_quarantines: BoundedMap::new(RECENT_WRITES_CAP),
+            recent_motw_removals: BoundedMap::new(RECENT_WRITES_CAP),
             self_spawn: BoundedMap::new(COUNTER_CAP),
+            ldap_burst: crate::ldap::LdapBurst::new(),
             beacon: BoundedMap::new(COUNTER_CAP),
             beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
             scan_spread: BoundedMap::new(COUNTER_CAP),
@@ -262,12 +291,14 @@ impl RuleState {
             auth_failures: BoundedMap::new(COUNTER_CAP),
             recent_creates: BoundedMap::new(CREATE_UNLINK_PID_CAP),
             pending_unlinks: BoundedMap::new(CREATE_UNLINK_PID_CAP),
+            touched_files: BoundedMap::new(TOUCHED_FILES_PID_CAP),
             ransomware_unlink: BoundedMap::new(COUNTER_CAP),
             ransomware_rename: BoundedMap::new(COUNTER_CAP),
             ransomware_rename_by_ppid: BoundedMap::new(COUNTER_CAP),
             write_volume: BoundedMap::new(COUNTER_CAP),
             rename_count: BoundedMap::new(COUNTER_CAP),
             task_registrations: BoundedMap::new(COUNTER_CAP),
+            session_hijack: SessionHijack::new(),
             own_pid: None,
             ld_trust_extra: Vec::new(),
             recent_memfd_creates: BoundedMap::new(PID_COMM_CAP),
@@ -840,6 +871,7 @@ impl RuleState {
         let mut alerts = Vec::new();
         alerts.extend(self.check_web_server_spawns_shell(event));
         alerts.extend(self.check_download_then_exec(event));
+        alerts.extend(self.check_exec_after_motw_removal(event));
         alerts.extend(self.check_self_spawn(event));
         alerts.extend(self.check_parent_suspect(event));
         alerts.extend(self.check_lolbin(event));
@@ -918,6 +950,14 @@ impl RuleState {
         self.check_listen_port_drift(event).into_iter().collect()
     }
 
+    /// To be called for every `LdapSearchEvent` (Windows, #364): the
+    /// directory-enumeration sweep, many distinct searches from one process
+    /// in a short window. The single-search rules are
+    /// [`crate::evaluate_ldap_search`].
+    pub fn on_ldap_search(&mut self, event: &schema::LdapSearchEvent) -> Vec<Alert> {
+        self.ldap_burst.observe(event).into_iter().collect()
+    }
+
     /// To be called for every `AuthEvent` in the stream (issue #377, T1110):
     /// counts failures per (target user, source) on a sliding window and
     /// alerts once per window when the burst threshold is crossed. Successes
@@ -953,6 +993,13 @@ impl RuleState {
             }];
         }
         Vec::new()
+    }
+
+    /// To be called for every `SessionEvent` in the stream (Windows Terminal
+    /// Services, #285): a disconnected session reconnected from another
+    /// client, T1563.002 (see the `session` module).
+    pub fn on_session(&mut self, event: &SessionEvent) -> Vec<Alert> {
+        self.session_hijack.on_session(event).into_iter().collect()
     }
 
     /// To be called for every `MemfdCreateEvent` in the stream (Linux, issue
@@ -1311,11 +1358,90 @@ impl RuleState {
 
     /// To be called for every `FileDeleteEvent` in the stream: the unlink half of the
     /// write-new-then-unlink T1486 shape (#512 part B), see
-    /// [`Self::check_write_new_then_unlink`].
+    /// [`Self::check_write_new_then_unlink`], and the mark-of-the-web removal
+    /// consumed by [`Self::check_exec_after_motw_removal`].
     pub fn on_file_delete(&mut self, event: &FileDeleteEvent) -> Vec<Alert> {
+        self.record_motw_removal(event);
+        self.record_touched(event.meta.pid, Event::FileDelete(event.clone()));
         self.check_write_new_then_unlink(event)
             .into_iter()
             .collect()
+    }
+
+    /// Remembers a Windows `FileDelete` of a `:Zone.Identifier` stream: the
+    /// mark-of-the-web removed from its host file (#442). No alert on its own —
+    /// `Unblock-File` over a downloaded module tree removes hundreds of marks
+    /// legitimately, and the event itself stays in the telemetry for hunting.
+    ///
+    /// A `User::Unknown` remover counts: the Windows sensor reports it when the
+    /// process exited or is protected before its token was read, which is the
+    /// shape of a one-shot `cmd /c "powershell Unblock-File x.exe & x.exe"`.
+    /// What rules out a Unix file merely named `x:Zone.Identifier` is a Unix
+    /// user or a POSIX path, the evidence that it is not a Windows stream.
+    fn record_motw_removal(&mut self, event: &FileDeleteEvent) {
+        if matches!(event.meta.user, User::Unix { .. }) {
+            return;
+        }
+        let Some(host) = motw_stream_host(&event.path).filter(|host| !host.starts_with('/')) else {
+            return;
+        };
+        self.recent_motw_removals.insert(
+            host.to_lowercase(),
+            MotwRemoval {
+                timestamp_ns: event.meta.timestamp_ns,
+                pid: event.meta.pid,
+                comm: event.meta.comm.clone(),
+                alerted: false,
+            },
+        );
+    }
+
+    /// T1553.005 — Subvert Trust Controls: Mark-of-the-Web Bypass. A file whose
+    /// mark-of-the-web was removed is executed within
+    /// [`QUARANTINE_EXEC_WINDOW_NS`] of the removal: the SmartScreen/Office
+    /// protected-view prompt that mark would have raised was taken out of the
+    /// way first (#442). The removal alone doesn't alert, see
+    /// [`Self::record_motw_removal`].
+    ///
+    /// Independent of T1204.002 ([`Self::check_quarantined_exec`]): a file both
+    /// marked and unmarked inside the window raises both, since they are two
+    /// techniques; the origin URL, when the mark was seen, is quoted here too.
+    ///
+    /// Not covered: a download that never got a mark (curl, certutil, most
+    /// droppers, see `DOWNLOADER_COMMS`) and an archive extractor that drops it
+    /// — there is no removal to see; a mark rewritten in place to `ZoneId=0`,
+    /// or its stream renamed (Kernel-File 27) rather than deleted. The full
+    /// list is in `docs/detection/download-provenance.md`.
+    fn check_exec_after_motw_removal(&mut self, event: &ExecEvent) -> Option<Alert> {
+        let key = event.image_path.to_lowercase();
+        let now = event.meta.timestamp_ns;
+        let removal = self.recent_motw_removals.get_mut(&key)?;
+        let age = now.saturating_sub(removal.timestamp_ns);
+        if removal.alerted || age > QUARANTINE_EXEC_WINDOW_NS {
+            return None;
+        }
+        removal.alerted = true;
+        let (remover_pid, remover_comm) = (removal.pid, removal.comm.clone());
+        let origin = self
+            .recent_quarantines
+            .get_mut(&key)
+            .and_then(|mark| mark.origin_url.clone());
+        Some(Alert {
+            technique: "T1553.005",
+            // At least T1204.002's: the same execution, plus a deliberate step
+            // to take the warning out of the way first.
+            severity: Severity::High,
+            message: format!(
+                "pid={} comm={} executes {}, {} after its mark-of-the-web was removed by pid={} comm={} (origin: {})",
+                event.meta.pid,
+                event.meta.comm,
+                event.image_path,
+                format_delta(age),
+                remover_pid,
+                remover_comm,
+                origin.as_deref().unwrap_or("unrecorded"),
+            ),
+        })
     }
 
     /// T1486, the shape `check_mass_rename_pattern` cannot see because none of it is a
@@ -1479,9 +1605,40 @@ impl RuleState {
     /// To be called for every `FileRenameEvent` in the stream (T1486, issue #262 +
     /// #82's write-volume corroboration).
     pub fn on_file_rename(&mut self, event: &FileRenameEvent) -> Vec<Alert> {
+        self.record_touched(event.meta.pid, Event::FileRename(event.clone()));
         let mut alerts: Vec<Alert> = self.check_mass_rename_pattern(event).into_iter().collect();
         alerts.extend(self.check_burst_write_volume(event));
         alerts
+    }
+
+    /// Remembers a rename or deletion for `pid`, dropping the oldest past the per-pid bound.
+    fn record_touched(&mut self, pid: u32, event: Event) {
+        let history = self.touched_files.get_or_insert_with(pid, VecDeque::new);
+        if history.len() == TOUCHED_FILES_PER_PID {
+            history.pop_front();
+        }
+        history.push_back(event);
+    }
+
+    /// The renames and deletions of the process incarnation `(pid, generation)` still
+    /// remembered, oldest first: the damage manifest a ransomware detection carries
+    /// (issue #82). Two known, different generations never mix (a recycled pid's earlier
+    /// life is not this process's damage); a missing stamp keeps the pid-only behavior.
+    #[must_use]
+    pub fn touched_files(&self, pid: u32, generation: Option<u64>) -> Vec<Event> {
+        self.touched_files
+            .peek(&pid)
+            .map(|history| {
+                history
+                    .iter()
+                    .filter(|e| match (e.meta().process_generation, generation) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => true,
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// To be called for every `FileWriteEvent` in the stream. Does not produce
@@ -1829,6 +1986,21 @@ fn written_file_is(path: &str, comm: &str) -> bool {
 /// raises an alert threshold, so the absence of evidence must not buy it.
 fn is_known_trusted(path: Option<&str>) -> bool {
     path.is_some_and(|p| !p.is_empty() && policy::name_exclusion_applies(Some(p)))
+}
+
+/// The host file of a `:Zone.Identifier` stream path, `$DATA` type suffix or
+/// not (`C:\d\a.exe:Zone.Identifier:$DATA` → `C:\d\a.exe`). Same rule as
+/// the Windows sensor's `stream_host_path`, which this crate can't depend on.
+fn motw_stream_host(path: &str) -> Option<&str> {
+    let path = strip_suffix_ignore_ascii_case(path, ":$DATA").unwrap_or(path);
+    let host = strip_suffix_ignore_ascii_case(path, ":Zone.Identifier")?;
+    (!host.is_empty() && !host.ends_with(['\\', '/', ':'])).then_some(host)
+}
+
+fn strip_suffix_ignore_ascii_case<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
+    let split = s.len().checked_sub(suffix.len())?;
+    let tail = s.get(split..)?;
+    tail.eq_ignore_ascii_case(suffix).then(|| &s[..split])
 }
 
 fn format_delta(delta_ns: u64) -> String {

@@ -6,6 +6,8 @@
 //! - System: 7045 (service install — persistence)
 //! - Security: 4720 (local account creation — persistence)
 //! - Microsoft-Windows-AppLocker + WDAC, Defender operational, Task-Scheduler
+//! - Terminal Services: session lifecycle 21/23/24/25 and RDP authentication
+//!   1149 (#285, see the section below)
 //!
 //! Implements three persistence detections, ported from a spike validated
 //! end-to-end on a real Windows VM (see
@@ -108,15 +110,15 @@
 //! techniques even on a host where the audit subcategory for 4698 was left
 //! disabled:
 //!
-//! - **`AppLocker` EXE/DLL verdicts** (`Microsoft-Windows-AppLocker/EXE and DLL`
-//!   channel, events **8004** and **8003**): an executable or DLL was refused
-//!   by `AppLocker` policy (8004), or would have been in audit mode (8003).
-//!   Reported as `schema::PolicyDenialEvent` with
-//!   `schema::POLICY_MECHANISM_APPLOCKER` (#427) — `enforced` tells the two
-//!   apart, `object_path` carries the expanded image path. A defensive
-//!   signal, not a persistence artifact. **Volume:** audit mode is where
-//!   broad rules get trialled, and an audited DLL collection logs one 8003
-//!   per non-allowed load, so expect bursts there. The whole channel is gated
+//! - **`AppLocker` policy decisions** (EXE/DLL **8003/8004**, MSI/Script
+//!   **8006/8007**, Packaged app-Execution **8021/8022**, and Packaged
+//!   app-Deployment **8024/8025**): audit and enforced policy decisions are
+//!   reported as the existing `schema::PolicyDenialEvent` with
+//!   `schema::POLICY_MECHANISM_APPLOCKER` (#427). `enforced` distinguishes the
+//!   modes; `object_path` carries a file path or, for packaged apps, the package
+//!   identity. Deployment decisions use action `install`. Allowed events are
+//!   filtered out. A defensive signal, not a persistence artifact. **Volume:**
+//!   not measured by channel yet. The targets are gated
 //!   by `EventLogConfig::applocker_blocks_enabled`, which the agent currently
 //!   sets to `true` unconditionally (no `agent.toml` switch yet).
 //! - **Microsoft Defender Operational** (`Microsoft-Windows-Windows Defender/Operational`,
@@ -140,6 +142,28 @@
 //!   the file is gone or unreadable). A registration seen on *both* channels is
 //!   reported once by the rules layer (`rules::RuleState`, #422); both raw
 //!   events are kept.
+//!
+//! ## Session lifecycle (#285)
+//!
+//! Two Terminal Services channels report what 4624 cannot: whether a logon is
+//! a new session or a reconnect, when a session was disconnected (left alive
+//! for later) rather than logged off, and which client each step came from.
+//! Both become `schema::SessionEvent`:
+//!
+//! - `Microsoft-Windows-TerminalServices-LocalSessionManager/Operational`
+//!   **21** logon, **23** logoff, **24** disconnect, **25** reconnect, each
+//!   with the `SessionID` and, except 23, the client (`Address`: an IP, or
+//!   `LOCAL` for the console). The console session logs them too, so the
+//!   channel is not RDP-only.
+//! - `Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational`
+//!   **1149**: a client authenticated to the RDP listener (with Network Level
+//!   Authentication, the default, the credentials were good), with its source
+//!   IP and no session yet.
+//!
+//! Both are on by default on every SKU and need no audit toggle; one switch,
+//! `EventLogConfig::terminal_sessions_enabled`, gates the pair. The consuming
+//! rule (`rules`' `session` module) flags a disconnected session reconnected
+//! from another client, T1563.002.
 //!
 //! ## Transport: polling (default) vs. `EvtSubscribe` (#322)
 //!

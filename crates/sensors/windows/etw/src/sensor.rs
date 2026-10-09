@@ -18,12 +18,12 @@ use schema::{
 };
 
 use crate::{
-    amsi, etw_sessions,
+    amsi, budget, etw_sessions,
     long_path::{self, LongPathCache},
     normalize,
     pid_cache::PidCache,
     providers::{
-        ALL_PROVIDERS, amsi_provider, dns_provider, dotnet_provider, file_provider,
+        ALL_PROVIDERS, amsi_provider, dns_provider, dotnet_provider, file_provider, ldap_provider,
         network_provider, powershell_provider, process_provider, registry_provider, smb_provider,
         wmi_provider,
     },
@@ -52,6 +52,11 @@ const QUARANTINE_DEDUP_CAP: usize = 1_024;
 /// and downloads come at human or script rate, so 256 absorbs a burst of ~100
 /// downloads behind one slow read; past it a mark is dropped and counted.
 const MARK_QUEUE_CAPACITY: usize = 256;
+/// LDAP searches reported per process per window (#364). SharpHound-style
+/// collection runs hundreds of searches; the burst rule needs well under
+/// this to fire, the cap only bounds a runaway client.
+const LDAP_PER_PID_LIMIT: u32 = 128;
+const LDAP_PER_PID_WINDOW_NS: u64 = 10_000_000_000;
 
 /// Stops an orphaned ETW session. Named sessions are kernel objects that outlive
 /// the creating process: after a `taskkill /f` or crash the session stays Running
@@ -104,16 +109,56 @@ fn stop_orphaned_session(name: &str) {
 /// doesn't keep it around forever — the new mechanism doesn't use it.
 fn stop_all_orphaned_sessions() {
     let _ = std::fs::remove_file(std::env::temp_dir().join("synthaea-etw-session"));
+    match etw_sessions::running_sessions() {
+        Ok(snapshot) => {
+            tracing::info!(
+                source = "QueryAllTracesW",
+                "ETW orphan enumeration succeeded"
+            );
+            let sessions: Vec<normalize::SessionStats> = snapshot
+                .entries
+                .into_iter()
+                .map(|(_, stats)| stats)
+                .collect();
+            let selected = normalize::select_orphaned_sessions(
+                &sessions,
+                etw_sessions::MAX_SESSIONS,
+                snapshot.possibly_truncated,
+            );
+            for name in selected.names {
+                stop_orphaned_session(&name);
+            }
+            if selected.possibly_truncated {
+                tracing::warn!(
+                    limit = etw_sessions::MAX_SESSIONS,
+                    "QueryAllTracesW returned a full session list; checking logman for orphans beyond it"
+                );
+                stop_orphans_via_logman();
+            }
+        }
+        Err(status) => {
+            tracing::warn!(
+                status,
+                "QueryAllTracesW failed; falling back to logman for ETW orphan enumeration"
+            );
+            stop_orphans_via_logman();
+        }
+    }
+}
 
+/// Enumerates `logman query -ets` and stops every `wtrace-` session in it. Used when
+/// `QueryAllTracesW` fails, and when its list is full and may hide some (a session
+/// the native pass already stopped is "not found" here, which is nominal).
+fn stop_orphans_via_logman() {
     let out = std::process::Command::new("logman")
         .args(["query", "-ets"])
         .output();
-    // A failed `logman` (access denied, ETW service trouble) prints no session
-    // table, so without the status check it parses as "no orphans" and cleanup is
-    // silently skipped — orphans accumulate, which is exactly #408 (same class as
-    // the failed-`wevtutil`-reads-as-empty bug in #391).
     match out {
         Ok(o) if o.status.success() => {
+            tracing::info!(
+                source = "logman",
+                "ETW orphan enumeration succeeded via fallback"
+            );
             let stdout = String::from_utf8_lossy(&o.stdout);
             for name in normalize::parse_orphaned_sessions(&stdout) {
                 stop_orphaned_session(&name);
@@ -122,10 +167,22 @@ fn stop_all_orphaned_sessions() {
         Ok(o) => tracing::warn!(
             status = %o.status,
             stderr = %String::from_utf8_lossy(&o.stderr).trim(),
-            "logman query -ets failed — ETW orphan enumeration skipped"
+            "logman query -ets fallback failed — ETW orphan enumeration skipped"
         ),
-        Err(e) => tracing::warn!(error = %e, "logman unavailable — ETW orphan enumeration skipped"),
+        Err(e) => {
+            tracing::warn!(error = %e, "logman unavailable — ETW orphan enumeration skipped");
+        }
     }
+}
+
+/// `logman query -ets` output, `None` when it cannot be run or fails.
+fn logman_listing() -> Option<String> {
+    std::process::Command::new("logman")
+        .args(["query", "-ets"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
 /// Stops the session a failed `start_and_process` left behind (#408, see
@@ -149,15 +206,51 @@ fn stop_session_after_failed_start(session: &str) {
 /// blinds every real-time consumer on the host (lab, 2026-10-01), so naming it
 /// is what the operator needs to act.
 fn silent_session_diagnosis(session: &str) -> String {
-    let output = std::process::Command::new("logman")
-        .args(["query", "-ets"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
-    let state = normalize::describe_silent_session(session, output.as_deref());
+    let (sessions, state) = match etw_sessions::running_sessions() {
+        Ok(snapshot) => {
+            if snapshot.possibly_truncated {
+                tracing::warn!(
+                    limit = etw_sessions::MAX_SESSIONS,
+                    "QueryAllTracesW session list may be truncated during blind-session diagnosis"
+                );
+            }
+            tracing::info!(
+                source = "QueryAllTracesW",
+                "ETW blind-session diagnosis enumerated sessions"
+            );
+            let sessions = snapshot.entries;
+            let names: Vec<&str> = sessions
+                .iter()
+                .map(|(_, stats)| stats.name.as_str())
+                .collect();
+            let state =
+                if normalize::listing_is_conclusive(snapshot.possibly_truncated, &names, session) {
+                    normalize::describe_silent_session(session, Some(&names.join("\n")))
+                } else {
+                    // A full list without our session: it may be one of those not
+                    // returned, so "stopped from outside" would be a guess. Ask logman;
+                    // if that fails too, the state is unknown.
+                    normalize::describe_silent_session(session, logman_listing().as_deref())
+                };
+            (sessions, state)
+        }
+        Err(status) => {
+            tracing::warn!(
+                status,
+                "QueryAllTracesW failed during blind-session diagnosis; falling back to logman"
+            );
+            let output = logman_listing();
+            let state = normalize::describe_silent_session(session, output.as_deref());
+            (Vec::new(), state)
+        }
+    };
+    let own_losses = sessions
+        .iter()
+        .find(|(_, stats)| stats.name == session)
+        .map(|(_, stats)| normalize::describe_session_losses(stats))
+        .unwrap_or_else(|| "loss counters unavailable".to_string());
+    let state = format!("{state}; own session ETW losses: {own_losses}");
 
-    let sessions = etw_sessions::running_sessions();
     let enablements: Vec<normalize::ProviderEnablement> =
         etw_sessions::provider_enablements(&ALL_PROVIDERS)
             .into_iter()
@@ -194,6 +287,9 @@ pub(crate) struct SharedState {
     pub(crate) events_seen: AtomicU64,
     /// AMSI volume gate (#282): dedup + per-process budget.
     pub(crate) amsi: Mutex<amsi::AmsiGate>,
+    /// LDAP search budget (#364): per process, no dedup (the burst rule
+    /// counts distinct searches).
+    pub(crate) ldap: Mutex<budget::PidBudget>,
     /// The liveness canary file: the run loop touches it every heartbeat, which
     /// MUST produce a Kernel-File event (our pid is tracked) — so sensor liveness
     /// is deterministic instead of traffic-dependent (a quiet host produces no
@@ -402,6 +498,11 @@ impl Sensor for WindowsSensor {
             marks,
             events_seen: AtomicU64::new(0),
             amsi: Mutex::new(amsi::AmsiGate::default()),
+            ldap: Mutex::new(budget::PidBudget::new(
+                "ldap",
+                LDAP_PER_PID_LIMIT,
+                LDAP_PER_PID_WINDOW_NS,
+            )),
             canary_path: canary_file
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -424,7 +525,8 @@ impl Sensor for WindowsSensor {
             .enable(wmi_provider(sink.clone(), state.clone()))
             .enable(dotnet_provider(sink.clone(), state.clone()))
             .enable(smb_provider(sink.clone(), state.clone()))
-            .enable(amsi_provider(sink, state.clone()));
+            .enable(amsi_provider(sink.clone(), state.clone()))
+            .enable(ldap_provider(sink, state.clone()));
         let trace = normalize::start_or_stop_session(
             &session,
             || builder.start_and_process(),

@@ -118,6 +118,52 @@ struct SchemaProbe {
 /// valid values (URL shapes, non-zero budgets, log level enum).
 ///
 /// Everything in here is a rule the type system alone can't enforce.
+/// Names that run whatever they are given: allowing one exempts every script and command
+/// line it executes, so an attacker needs only to start their tool through it. Matched on the
+/// file name, by exact name or by family prefix (`python3.12`, `perl5.38`). Not a complete
+/// list, a guard against the obvious mistake; the operator still chooses what to trust.
+fn is_interpreter(path: &Path) -> bool {
+    const EXACT: &[&str] = &[
+        "sh",
+        "bash",
+        "dash",
+        "ash",
+        "zsh",
+        "ksh",
+        "csh",
+        "tcsh",
+        "fish",
+        "busybox",
+        "env",
+        "xargs",
+        "find",
+        "awk",
+        "gawk",
+        "mawk",
+        "sed",
+        "lua",
+        "luajit",
+        "tclsh",
+        "wish",
+        "expect",
+        "gdb",
+        "sudo",
+        "su",
+        "nsenter",
+        "chroot",
+        "pwsh",
+        "powershell",
+    ];
+    const FAMILIES: &[&str] = &[
+        "python", "perl", "ruby", "node", "php", "java", "bun", "deno",
+    ];
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    EXACT.contains(&name.as_str()) || FAMILIES.iter().any(|family| name.starts_with(family))
+}
+
 fn validate_semantics(cfg: &AgentConfig, source_path: &Path) -> Result<(), ConfigError> {
     let src = source_path.display().to_string();
 
@@ -221,6 +267,69 @@ fn validate_semantics(cfg: &AgentConfig, source_path: &Path) -> Result<(), Confi
                 expected: "a path declared once (two parsers on one file would read it twice)"
                     .into(),
                 value: source.path.display().to_string(),
+                origin: src.clone(),
+            });
+        }
+    }
+
+    // deception.canary_dirs — each one gets files written into it by the agent, so a
+    // typo must fail at boot rather than plant under a relative path of the cwd.
+    if cfg.deception.canary_dirs.len() > crate::schema::MAX_CANARY_DIRS {
+        return Err(ConfigError::Invalid {
+            field: "deception.canary_dirs".into(),
+            expected: format!("at most {} directories", crate::schema::MAX_CANARY_DIRS),
+            value: format!("{} directories", cfg.deception.canary_dirs.len()),
+            origin: src.clone(),
+        });
+    }
+    for (i, dir) in cfg.deception.canary_dirs.iter().enumerate() {
+        if !dir.is_absolute() {
+            return Err(ConfigError::Invalid {
+                field: format!("deception.canary_dirs[{i}]"),
+                expected: "an absolute directory path".into(),
+                value: dir.display().to_string(),
+                origin: src.clone(),
+            });
+        }
+        if cfg.deception.canary_dirs[..i].contains(dir) {
+            return Err(ConfigError::Invalid {
+                field: format!("deception.canary_dirs[{i}]"),
+                expected: "a directory listed once".into(),
+                value: dir.display().to_string(),
+                origin: src.clone(),
+            });
+        }
+    }
+
+    // deception.allow_exe — matched against a resolved executable path, so a relative
+    // entry could never match and would silently leave the canary noisy.
+    if cfg.deception.allow_exe.len() > crate::schema::MAX_CANARY_ALLOW_EXES {
+        return Err(ConfigError::Invalid {
+            field: "deception.allow_exe".into(),
+            expected: format!(
+                "at most {} executables",
+                crate::schema::MAX_CANARY_ALLOW_EXES
+            ),
+            value: format!("{} executables", cfg.deception.allow_exe.len()),
+            origin: src.clone(),
+        });
+    }
+    for (i, exe) in cfg.deception.allow_exe.iter().enumerate() {
+        if is_interpreter(exe) {
+            return Err(ConfigError::Invalid {
+                field: format!("deception.allow_exe[{i}]"),
+                expected: "a specific indexer or backup binary, not a shell, interpreter or \
+                           launcher (every script it runs would be allowed to read the canaries)"
+                    .into(),
+                value: exe.display().to_string(),
+                origin: src.clone(),
+            });
+        }
+        if !exe.is_absolute() {
+            return Err(ConfigError::Invalid {
+                field: format!("deception.allow_exe[{i}]"),
+                expected: "an absolute executable path".into(),
+                value: exe.display().to_string(),
                 origin: src.clone(),
             });
         }
@@ -804,6 +913,104 @@ control_plane_url = "https://cp.example"
             .collect();
         match load_with_logs(&many).unwrap_err() {
             ConfigError::Invalid { field, .. } => assert_eq!(field, "logs.sources"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    fn deception_table(dirs: &[String]) -> String {
+        let list: Vec<String> = dirs.iter().map(|d| format!("\"{d}\"")).collect();
+        format!("[deception]\ncanary_dirs = [{}]\n", list.join(", "))
+    }
+
+    #[test]
+    fn no_deception_table_plants_nothing() {
+        let cfg = load_with_logs("").unwrap();
+        assert!(cfg.deception.canary_dirs.is_empty());
+    }
+
+    #[test]
+    fn declared_canary_dirs_are_loaded() {
+        let dirs = [abs_log("a"), abs_log("b")];
+        let cfg = load_with_logs(&deception_table(&dirs)).unwrap();
+        assert_eq!(cfg.deception.canary_dirs.len(), 2);
+    }
+
+    #[test]
+    fn a_relative_canary_dir_is_rejected() {
+        match load_with_logs(&deception_table(&["srv/share".into()])).unwrap_err() {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "deception.canary_dirs[0]"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_duplicate_canary_dir_is_rejected() {
+        let d = abs_log("a");
+        match load_with_logs(&deception_table(&[d.clone(), d])).unwrap_err() {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "deception.canary_dirs[1]"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn too_many_canary_dirs_are_rejected() {
+        let many: Vec<String> = (0..=crate::MAX_CANARY_DIRS)
+            .map(|i| abs_log(&i.to_string()))
+            .collect();
+        match load_with_logs(&deception_table(&many)).unwrap_err() {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "deception.canary_dirs"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_relative_allowed_executable_is_rejected() {
+        let extra = "[deception]\nallow_exe = [\"updatedb\"]\n";
+        match load_with_logs(extra).unwrap_err() {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "deception.allow_exe[0]"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_shell_or_interpreter_is_rejected_as_an_allowed_executable() {
+        for exe in [
+            "/usr/bin/bash",
+            "/bin/sh",
+            "/usr/bin/python3.12",
+            "/usr/bin/perl",
+            "/usr/bin/find",
+            "/usr/bin/env",
+        ] {
+            let extra = format!("[deception]\nallow_exe = [\"{exe}\"]\n");
+            match load_with_logs(&extra) {
+                Err(ConfigError::Invalid { field, .. }) => {
+                    assert_eq!(field, "deception.allow_exe[0]", "{exe}");
+                }
+                other => panic!("{exe}: expected Invalid, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_indexer_is_accepted_as_an_allowed_executable() {
+        if cfg!(windows) {
+            return;
+        }
+        let extra =
+            "[deception]\nallow_exe = [\"/usr/bin/updatedb.plocate\", \"/usr/sbin/bacula-fd\"]\n";
+        let cfg = load_with_logs(extra).unwrap();
+        assert_eq!(cfg.deception.allow_exe.len(), 2);
+    }
+
+    #[test]
+    fn too_many_allowed_executables_are_rejected() {
+        let many: Vec<String> = (0..=crate::MAX_CANARY_ALLOW_EXES)
+            .map(|i| format!("\"{}\"", abs_log(&i.to_string())))
+            .collect();
+        let extra = format!("[deception]\nallow_exe = [{}]\n", many.join(", "));
+        match load_with_logs(&extra).unwrap_err() {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "deception.allow_exe"),
             other => panic!("expected Invalid, got {other:?}"),
         }
     }

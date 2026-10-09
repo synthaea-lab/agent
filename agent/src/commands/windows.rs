@@ -164,6 +164,7 @@ fn eventlog_config(policy: &policy::EventLogPolicy) -> sensor_windows_eventlog::
         task_scheduler_op_enabled: true,
         defender_enabled: true,
         wdac_enabled: true,
+        terminal_sessions_enabled: true,
     }
 }
 
@@ -402,6 +403,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         ipc_endpoint,
         content_dir,
         log_sources: _,
+        deception,
     } = opts;
     let pipeline = super::common::wire_run_pipeline(
         seeded_rule_state(),
@@ -412,6 +414,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         content_dir,
         storage,
     )?;
+    super::common::plant_canaries(&pipeline.sink, deception, storage);
 
     // Sensor-silence detection (#71/#388): the same monitor feeds T1562
     // alerts, `cli health` and the health beacon. Heartbeats are registered

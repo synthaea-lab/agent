@@ -10,3 +10,12 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+schema = { path = "../schema" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.11"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+schema = { path = "../schema", features = ["test-fixtures"] }
+tempfile = "3"

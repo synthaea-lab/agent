@@ -8,6 +8,7 @@
 use std::{
     fs::File,
     io::Read,
+    net::IpAddr,
     path::Path,
     process::Command,
     sync::{
@@ -21,7 +22,7 @@ use schema::{
     AuthEvent, AuthKind, AuthOutcome, DefenderEvent, DefenderEventKind, Event, EventMeta,
     FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT, FLAG_PERSISTENCE_TASK_ARTIFACT,
     FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, POLICY_MECHANISM_APPLOCKER,
-    POLICY_MECHANISM_WDAC, PolicyDenialEvent, User,
+    POLICY_MECHANISM_WDAC, PolicyDenialEvent, SessionEvent, SessionState, User,
     sensor::{Capabilities, EventSink, Sensor, SensorError},
     time::now_ns,
 };
@@ -585,9 +586,17 @@ const APPLOCKER_EVENT_BLOCKED: u32 = 8004;
 /// `AppLocker` event id for "allowed, but would have been blocked" (audit
 /// mode). Same payload shape as 8004.
 const APPLOCKER_EVENT_AUDITED: u32 = 8003;
+const APPLOCKER_MSI_AUDITED: u32 = 8006;
+const APPLOCKER_MSI_BLOCKED: u32 = 8007;
+const APPLOCKER_PACKAGED_EXEC_AUDITED: u32 = 8021;
+const APPLOCKER_PACKAGED_EXEC_BLOCKED: u32 = 8022;
+const APPLOCKER_PACKAGED_DEPLOY_AUDITED: u32 = 8024;
+const APPLOCKER_PACKAGED_DEPLOY_BLOCKED: u32 = 8025;
 
-/// Normalizes an `AppLocker` 8003/8004 into a [`PolicyDenialEvent`] (#427):
-/// 8004 is an enforced denial, 8003 an audit-mode one (`enforced: false`) —
+/// Normalizes a blocked or audit-only `AppLocker` decision into a
+/// [`PolicyDenialEvent`] (#427):
+/// 8004/8007/8022/8025 are enforced denials, 8003/8006/8021/8024 are audit
+/// decisions (`enforced: false`) —
 /// the `SELinux` enforcing/permissive split, which is what lets a rule tell
 /// "stopped at the OS boundary" from "ran, and policy only noticed".
 ///
@@ -595,8 +604,8 @@ const APPLOCKER_EVENT_AUDITED: u32 = 8003;
 ///   original case); otherwise `FilePath`, expanded from `AppLocker`'s path
 ///   variables (`%OSDRIVE%\USERS\...` → `C:\USERS\...`) so path-based rules
 ///   can still match it.
-/// - `object_class`: the rule collection (`EXE`, `DLL`), as reported.
-/// - `action`: `execute` — the only operation these two collections gate.
+/// - `object_class`: the rule collection (`EXE`, `DLL`, `MSI`, `SCRIPT`, `APPX`), as reported.
+/// - `action`: `install` for packaged-app deployment decisions, `execute` otherwise.
 /// - `meta.pid`: `<Execution ProcessID>`, the process that tried to launch
 ///   the image — the actor. Not `TargetProcessId`, which names the process
 ///   being created for the image itself (lab-checked for 8003 and 8004, #529).
@@ -605,15 +614,22 @@ const APPLOCKER_EVENT_AUDITED: u32 = 8003;
 ///   name, and the image's leaf name — what the pre-#427 `FileOpenEvent` put
 ///   there — names the *object*, not the actor.
 ///
-/// Skipped (cursor still advances): a block without `FilePath` (nothing to
-/// attribute), and any event id other than 8003/8004 the `XPath` filter let
-/// through — don't guess a verdict for an event we haven't seen the shape of.
+/// Skipped (cursor still advances): a block without `FilePath` or a packaged
+/// app's `Package` identity (nothing to attribute), and any event id outside
+/// the audit/enforced allowlist that an `XPath` filter let through — don't guess
+/// a verdict for an event we haven't seen the shape of.
 fn normalize_applocker_block(block: &str) -> ParsedBlock {
     let ev = xml::parse_applocker_event(block)?;
     let record_id = ev.record_id;
     let enforced = match ev.event_id {
-        APPLOCKER_EVENT_BLOCKED => true,
-        APPLOCKER_EVENT_AUDITED => false,
+        APPLOCKER_EVENT_BLOCKED
+        | APPLOCKER_MSI_BLOCKED
+        | APPLOCKER_PACKAGED_EXEC_BLOCKED
+        | APPLOCKER_PACKAGED_DEPLOY_BLOCKED => true,
+        APPLOCKER_EVENT_AUDITED
+        | APPLOCKER_MSI_AUDITED
+        | APPLOCKER_PACKAGED_EXEC_AUDITED
+        | APPLOCKER_PACKAGED_DEPLOY_AUDITED => false,
         _ => return Some((record_id, None)),
     };
     if ev.file_path.is_empty() {
@@ -641,7 +657,17 @@ fn normalize_applocker_block(block: &str) -> ParsedBlock {
         subject_context: None,
         object_context: None,
         object_class: Some(ev.policy_name).filter(|p| !p.is_empty()),
-        action: Some("execute".into()),
+        action: Some(
+            if matches!(
+                ev.event_id,
+                APPLOCKER_PACKAGED_DEPLOY_AUDITED | APPLOCKER_PACKAGED_DEPLOY_BLOCKED
+            ) {
+                "install"
+            } else {
+                "execute"
+            }
+            .into(),
+        ),
         enforced,
         object_path: Some(path),
     });
@@ -660,6 +686,39 @@ static APPLOCKER_BLOCKS: PollTarget = PollTarget {
     // `wevtutil sl <channel> /e:true`, which is best done by the operator's
     // deployment (a disabled channel is a policy decision, not an oversight
     // the sensor should override on its own).
+    enable_audit: None,
+    enabled: |c| c.applocker_blocks_enabled,
+};
+
+static APPLOCKER_MSI_SCRIPT: PollTarget = PollTarget {
+    label: "applocker-msi-script",
+    heartbeat: "windows-eventlog:applocker-msi-script",
+    channel: "Microsoft-Windows-AppLocker/MSI and Script",
+    id_filter: "EventID=8006 or EventID=8007",
+    counter: |c| &c.applocker_blocks,
+    parse_block: normalize_applocker_block,
+    enable_audit: None,
+    enabled: |c| c.applocker_blocks_enabled,
+};
+
+static APPLOCKER_PACKAGED_EXECUTION: PollTarget = PollTarget {
+    label: "applocker-packaged-execution",
+    heartbeat: "windows-eventlog:applocker-packaged-execution",
+    channel: "Microsoft-Windows-AppLocker/Packaged app-Execution",
+    id_filter: "EventID=8021 or EventID=8022",
+    counter: |c| &c.applocker_blocks,
+    parse_block: normalize_applocker_block,
+    enable_audit: None,
+    enabled: |c| c.applocker_blocks_enabled,
+};
+
+static APPLOCKER_PACKAGED_DEPLOYMENT: PollTarget = PollTarget {
+    label: "applocker-packaged-deployment",
+    heartbeat: "windows-eventlog:applocker-packaged-deployment",
+    channel: "Microsoft-Windows-AppLocker/Packaged app-Deployment",
+    id_filter: "EventID=8024 or EventID=8025",
+    counter: |c| &c.applocker_blocks,
+    parse_block: normalize_applocker_block,
     enable_audit: None,
     enabled: |c| c.applocker_blocks_enabled,
 };
@@ -988,6 +1047,115 @@ static WDAC_OP: PollTarget = PollTarget {
     enabled: |c| c.wdac_enabled,
 };
 
+// ── Terminal Services session lifecycle (#285) ──────────────────────────────
+//
+// What 4624 cannot say: new session or reconnect, disconnected (left alive)
+// or logged off, and which client each step came from. Both channels are on by
+// default on every SKU, RDP host or not: the console session logs 21/23 too
+// (`Address` `LOCAL`), and a host without an RDP listener simply never writes
+// a 1149. No audit toggle.
+
+const SESSION_LOGON: u32 = 21;
+const SESSION_LOGOFF: u32 = 23;
+const SESSION_DISCONNECT: u32 = 24;
+const SESSION_RECONNECT: u32 = 25;
+const RDP_AUTHENTICATED: u32 = 1149;
+
+/// `(source_address, console)` from the event's client field. `LOCAL` is the
+/// console; anything else that is not an IP address (a gateway name, a shape
+/// not seen yet) is reported as no address rather than guessed at.
+fn session_origin(address: Option<&str>) -> (Option<IpAddr>, bool) {
+    match address {
+        Some(a) if a.eq_ignore_ascii_case("LOCAL") => (None, true),
+        Some(a) => (a.parse().ok(), false),
+        None => (None, false),
+    }
+}
+
+fn session_event(ev: xml::TerminalSessionEvent, state: SessionState) -> Event {
+    let (source_address, console) = session_origin(ev.address.as_deref());
+    Event::Session(SessionEvent {
+        meta: EventMeta {
+            pid: ev.pid,
+            ppid: 0,
+            user: User::Unknown,
+            timestamp_ns: now_ns(),
+            comm: String::new(),
+            container: None, // Windows: no container support
+            process_generation: None,
+            parent_process_generation: None,
+        },
+        state,
+        session_id: ev.session_id,
+        target_user: ev.user.unwrap_or_default(),
+        source_address,
+        console,
+    })
+}
+
+/// Normalizes a `LocalSessionManager` 21/23/24/25 into a [`SessionEvent`].
+///
+/// Skipped (cursor still advances): a block without a `SessionID` (every
+/// consumer keys on it), and any event id the `XPath` filter let through
+/// that this function has no state for. 22 (shell start) is not subscribed:
+/// it repeats the 21 it follows.
+fn normalize_session_lifecycle_block(block: &str) -> ParsedBlock {
+    let ev = xml::parse_local_session_event(block)?;
+    let record_id = ev.record_id;
+    let state = match ev.event_id {
+        SESSION_LOGON => SessionState::Logon,
+        SESSION_LOGOFF => SessionState::Logoff,
+        SESSION_DISCONNECT => SessionState::Disconnect,
+        SESSION_RECONNECT => SessionState::Reconnect,
+        _ => return Some((record_id, None)),
+    };
+    if ev.session_id.is_none() {
+        return Some((record_id, None));
+    }
+    Some((record_id, Some(session_event(ev, state))))
+}
+
+/// `LocalSessionManager` also writes an RPC trace (59) for every session
+/// capability query: 1 444 of 1 588 records on the 2026-10-05 host. The
+/// filter names the four lifecycle ids so none of that is ever read.
+static SESSION_LIFECYCLE: PollTarget = PollTarget {
+    label: "session-lifecycle",
+    heartbeat: "windows-eventlog:session-lifecycle",
+    channel: "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
+    id_filter: "EventID=21 or EventID=23 or EventID=24 or EventID=25",
+    counter: |c| &c.session_lifecycle,
+    parse_block: normalize_session_lifecycle_block,
+    enable_audit: None,
+    enabled: |c| c.terminal_sessions_enabled,
+};
+
+/// Normalizes a `RemoteConnectionManager` 1149 (a client authenticated to the
+/// RDP listener) into a [`SessionEvent`] with [`SessionState::Connect`]. With
+/// Network Level Authentication on (the default) that means the credentials
+/// were good; without it, only that a client connected. 4625 is where failed
+/// attempts land, and it carries the source address too.
+///
+/// Skipped: a block naming neither a user nor a client, and any other id.
+fn normalize_rdp_connection_block(block: &str) -> ParsedBlock {
+    let ev = xml::parse_remote_connection_event(block)?;
+    let record_id = ev.record_id;
+    if ev.event_id != RDP_AUTHENTICATED || (ev.user.is_none() && ev.address.is_none()) {
+        return Some((record_id, None));
+    }
+    Some((record_id, Some(session_event(ev, SessionState::Connect))))
+}
+
+static RDP_CONNECTIONS: PollTarget = PollTarget {
+    label: "rdp-connection",
+    heartbeat: "windows-eventlog:rdp-connection",
+    channel: "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational",
+    id_filter: "EventID=1149",
+    counter: |c| &c.rdp_connections,
+    parse_block: normalize_rdp_connection_block,
+    enable_audit: None,
+    enabled: |c| c.terminal_sessions_enabled,
+};
+
 // ── Policy-configurable allowlist and volume counters (#94) ─────────────────
 //
 // `sensor-*` crates may depend only on `schema` (`tools/check-deps.py`), so
@@ -1057,9 +1225,9 @@ pub struct EventLogConfig {
     pub account_creations_enabled: bool,
     /// Events 4624/4625/4648/4672 (logon/session, #94).
     pub logon_events_enabled: bool,
-    /// Events 8004 (block) and 8003 (audit mode) — `AppLocker` EXE/DLL
-    /// verdicts, reported as `PolicyDenialEvent` (#427).
-    /// `Microsoft-Windows-AppLocker/EXE and DLL` operational channel.
+    /// Audit and enforced `AppLocker` decisions from EXE/DLL, MSI/Script,
+    /// Packaged app-Execution, and Packaged app-Deployment, reported as
+    /// `PolicyDenialEvent` (#427).
     pub applocker_blocks_enabled: bool,
     /// Event 106 (T1053.005 — scheduled task registered via the
     /// `Microsoft-Windows-TaskScheduler/Operational` channel; always-on
@@ -1071,6 +1239,10 @@ pub struct EventLogConfig {
     /// WDAC 3076/3077 on the `CodeIntegrity` Operational channel, reported as
     /// `PolicyDenialEvent` with `POLICY_MECHANISM_WDAC` (#283).
     pub wdac_enabled: bool,
+    /// Terminal Services session lifecycle (`LocalSessionManager` 21/23/24/25)
+    /// and RDP authentications (`RemoteConnectionManager` 1149), reported as
+    /// `SessionEvent` (#285). Console sessions included.
+    pub terminal_sessions_enabled: bool,
 }
 
 /// Every poll target. Adding one = one entry here: its switch, heartbeat name
@@ -1082,9 +1254,14 @@ static TARGETS: &[&PollTarget] = &[
     &ACCOUNT_CREATIONS,
     &LOGON_EVENTS,
     &APPLOCKER_BLOCKS,
+    &APPLOCKER_MSI_SCRIPT,
+    &APPLOCKER_PACKAGED_EXECUTION,
+    &APPLOCKER_PACKAGED_DEPLOYMENT,
     &TASK_SCHEDULER_OP,
     &DEFENDER_OP,
     &WDAC_OP,
+    &SESSION_LIFECYCLE,
+    &RDP_CONNECTIONS,
 ];
 
 impl Default for EventLogConfig {
@@ -1101,6 +1278,7 @@ impl Default for EventLogConfig {
             task_scheduler_op_enabled: true,
             defender_enabled: true,
             wdac_enabled: true,
+            terminal_sessions_enabled: true,
         }
     }
 }
@@ -1124,6 +1302,8 @@ pub struct EventLogCounters {
     pub task_scheduler_op: AtomicU64,
     pub defender: AtomicU64,
     pub wdac: AtomicU64,
+    pub session_lifecycle: AtomicU64,
+    pub rdp_connections: AtomicU64,
 }
 
 // ── The sensor ────────────────────────────────────────────────────────────────
@@ -1340,6 +1520,7 @@ mod config_tests {
         assert!(config.task_scheduler_op_enabled);
         assert!(config.defender_enabled);
         assert!(config.wdac_enabled);
+        assert!(config.terminal_sessions_enabled);
     }
 
     #[test]
@@ -1378,6 +1559,7 @@ mod config_tests {
             task_scheduler_op_enabled: false,
             defender_enabled: false,
             wdac_enabled: false,
+            terminal_sessions_enabled: false,
         });
         let caps = sensor.capabilities();
         assert!(!caps.file_events);
@@ -1396,6 +1578,7 @@ mod config_tests {
             task_scheduler_op_enabled: false,
             defender_enabled: false,
             wdac_enabled: false,
+            terminal_sessions_enabled: false,
         });
         assert!(sensor.capabilities().file_events);
     }
@@ -1413,6 +1596,7 @@ mod config_tests {
             task_scheduler_op_enabled: false,
             defender_enabled: false,
             wdac_enabled: false,
+            terminal_sessions_enabled: false,
             transport: EventLogTransport::default(),
         });
         assert!(!sensor.capabilities().file_events);
@@ -1429,6 +1613,7 @@ mod config_tests {
             task_scheduler_op_enabled: true,
             defender_enabled: false,
             wdac_enabled: false,
+            terminal_sessions_enabled: false,
             transport: EventLogTransport::default(),
         });
         assert!(sensor.capabilities().file_events);
@@ -1447,6 +1632,8 @@ mod config_tests {
         assert_eq!(counters.task_scheduler_op.load(Ordering::Relaxed), 0);
         assert_eq!(counters.defender.load(Ordering::Relaxed), 0);
         assert_eq!(counters.wdac.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.session_lifecycle.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.rdp_connections.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1465,9 +1652,14 @@ mod config_tests {
                 "windows-eventlog:account-creation",
                 "windows-eventlog:logon",
                 "windows-eventlog:applocker-block",
+                "windows-eventlog:applocker-msi-script",
+                "windows-eventlog:applocker-packaged-execution",
+                "windows-eventlog:applocker-packaged-deployment",
                 "windows-eventlog:task-scheduler-op",
                 "windows-eventlog:defender",
                 "windows-eventlog:wdac",
+                "windows-eventlog:session-lifecycle",
+                "windows-eventlog:rdp-connection",
             ]
         );
     }
@@ -1483,6 +1675,7 @@ mod config_tests {
             task_scheduler_op_enabled: false,
             defender_enabled: false,
             wdac_enabled: false,
+            terminal_sessions_enabled: false,
             transport: EventLogTransport::Polling,
         });
         let names: Vec<_> = sensor.liveness().into_iter().map(|(n, _)| n).collect();
@@ -1548,6 +1741,16 @@ mod wevtutil_tests {
         let err = wevtutil(&["qe", "Synthaea-No-Such-Channel", "/c:1"])
             .expect_err("an unknown channel must not look like a quiet one");
         assert!(err.contains("exited with"), "{err}");
+    }
+
+    #[test]
+    fn the_session_channels_exist_unelevated_and_accept_their_filters() {
+        // A misspelt channel would fail every poll and silence the target
+        // for good; unit tests on XML strings cannot see it.
+        for target in [&SESSION_LIFECYCLE, &RDP_CONNECTIONS] {
+            last_known_record_id(target)
+                .unwrap_or_else(|e| panic!("{} on {}: {e}", target.label, target.channel));
+        }
     }
 }
 
@@ -1724,6 +1927,123 @@ mod applocker_tests {
             panic!("expected a PolicyDenial event, got {event:?}");
         };
         denial
+    }
+
+    fn applocker_decision_xml(event_id: u32, channel: &str, policy_name: &str) -> String {
+        let object = if policy_name == "APPX" {
+            "<PackageLength>14</PackageLength><Package>Contoso.Reader</Package>"
+        } else if policy_name == "SCRIPT" {
+            "<FilePathLength>18</FilePathLength><FilePath>C:\\Users\\X\\RUN.PS1</FilePath>"
+        } else {
+            "<FilePathLength>22</FilePathLength><FilePath>C:\\Users\\X\\INSTALL.MSI</FilePath>"
+        };
+        let policy_length = policy_name.len();
+        format!(
+            "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-AppLocker' Guid='{{cbda4dbf-8d5d-4f69-9578-be14aa540d22}}'/><EventID Qualifiers='0'>{event_id}</EventID><Version>0</Version><Level>2</Level><TimeCreated SystemTime='2026-10-01T12:00:00.0000000Z'/><EventRecordID>991</EventRecordID><Correlation/><Execution ProcessID=\"4242\" ThreadID=\"8\"/><Channel>{channel}</Channel><Computer>HOST</Computer><Security UserID='S-1-5-21-1-2-3-1001'/></System><UserData><RuleAndFileData xmlns='http://schemas.microsoft.com/schemas/event/Microsoft.Windows/1.0.0.0'><PolicyNameLength>{policy_length}</PolicyNameLength><PolicyName>{policy_name}</PolicyName><RuleId>{{00000000-0000-0000-0000-000000000000}}</RuleId><RuleNameLength>4</RuleNameLength><RuleName>Rule</RuleName><RuleSddlLength>1</RuleSddlLength><RuleSddl>-</RuleSddl><TargetUser>S-1-5-21-1-2-3-1001</TargetUser><TargetProcessId>7777</TargetProcessId>{object}<FqbnLength>1</FqbnLength><Fqbn>-</Fqbn></RuleAndFileData></UserData></Event>"
+        )
+    }
+
+    #[test]
+    fn applocker_other_channels_reuse_policy_denial_and_ignore_localized_channel_text() {
+        for (event_id, channel, policy_name, enforced, action) in [
+            (
+                8006,
+                "Microsoft-Windows-AppLocker/MSI et Script",
+                "MSI",
+                false,
+                "execute",
+            ),
+            (
+                8007,
+                "Microsoft-Windows-AppLocker/MSI et Script",
+                "MSI",
+                true,
+                "execute",
+            ),
+            (
+                8006,
+                "Microsoft-Windows-AppLocker/MSI et Script",
+                "SCRIPT",
+                false,
+                "execute",
+            ),
+            (
+                8007,
+                "Microsoft-Windows-AppLocker/MSI et Script",
+                "SCRIPT",
+                true,
+                "execute",
+            ),
+            (
+                8021,
+                "Microsoft-Windows-AppLocker/Packaged app-Execution",
+                "APPX",
+                false,
+                "execute",
+            ),
+            (
+                8022,
+                "Microsoft-Windows-AppLocker/Packaged app-Execution",
+                "APPX",
+                true,
+                "execute",
+            ),
+            (
+                8024,
+                "Microsoft-Windows-AppLocker/Packaged app-Deployment",
+                "APPX",
+                false,
+                "install",
+            ),
+            (
+                8025,
+                "Microsoft-Windows-AppLocker/Packaged app-Deployment",
+                "APPX",
+                true,
+                "install",
+            ),
+        ] {
+            let block = applocker_decision_xml(event_id, channel, policy_name);
+            let (record_id, event) =
+                normalize_applocker_block(&block).expect("valid Event Log XML");
+            assert_eq!(record_id, 991, "event id {event_id}");
+            let Some(Event::PolicyDenial(denial)) = event else {
+                panic!("event {event_id} should reuse PolicyDenial");
+            };
+            assert_eq!(denial.mechanism, POLICY_MECHANISM_APPLOCKER);
+            assert_eq!(denial.enforced, enforced, "event id {event_id}");
+            assert_eq!(denial.object_class.as_deref(), Some(policy_name));
+            assert_eq!(
+                denial.action.as_deref(),
+                Some(action),
+                "event id {event_id}"
+            );
+            assert_eq!(denial.meta.pid, 4242, "event id {event_id}");
+            assert_eq!(
+                denial.object_path.as_deref(),
+                Some(if policy_name == "APPX" {
+                    "Contoso.Reader"
+                } else if policy_name == "SCRIPT" {
+                    "C:\\Users\\X\\RUN.PS1"
+                } else {
+                    "C:\\Users\\X\\INSTALL.MSI"
+                }),
+                "event id {event_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn applocker_allow_events_and_unrecognized_ids_are_skipped() {
+        for event_id in [8005, 8020, 8023, 8035, 8028, 8029, 8999] {
+            let (_, event) = normalize_applocker_block(&applocker_decision_xml(
+                event_id,
+                "localized channel name",
+                "APPX",
+            ))
+            .expect("the record id remains usable");
+            assert!(event.is_none(), "event id {event_id} is not a denial");
+        }
     }
 
     #[test]
@@ -2036,6 +2356,128 @@ mod defender_wdac_tests {
         assert!(!WDAC_OP.id_filter.contains("3033"));
         assert!(TARGETS.iter().any(|t| t.label == "defender"));
         assert!(TARGETS.iter().any(|t| t.label == "wdac"));
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    fn lsm_block(event_id: u32, user_data: &str) -> String {
+        format!(
+            "<Event><System><EventID>{event_id}</EventID><EventRecordID>40</EventRecordID><Execution ProcessID='2312' ThreadID='1'/></System><UserData><EventXML xmlns='Event_NS'>{user_data}</EventXML></UserData></Event>"
+        )
+    }
+
+    fn session(parsed: ParsedBlock) -> SessionEvent {
+        let (record_id, event) = parsed.expect("should parse");
+        assert_eq!(record_id, 40);
+        match event.expect("should normalize") {
+            Event::Session(e) => e,
+            other => panic!("expected a SessionEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_remote_reconnect_carries_session_and_client_address() {
+        let e = session(normalize_session_lifecycle_block(&lsm_block(
+            25,
+            r"<User>LAB\alice</User><SessionID>2</SessionID><Address>198.51.100.40</Address>",
+        )));
+        assert_eq!(e.state, SessionState::Reconnect);
+        assert_eq!(e.session_id, Some(2));
+        assert_eq!(e.target_user, r"LAB\alice");
+        assert_eq!(e.source_address, Some("198.51.100.40".parse().unwrap()));
+        assert!(!e.console);
+        assert_eq!(e.meta.pid, 2312);
+    }
+
+    #[test]
+    fn local_is_the_console_not_an_address() {
+        let e = session(normalize_session_lifecycle_block(&lsm_block(
+            24,
+            r"<User>LAB\alice</User><SessionID>1</SessionID><Address>LOCAL</Address>",
+        )));
+        assert_eq!(e.state, SessionState::Disconnect);
+        assert!(e.console);
+        assert_eq!(e.source_address, None);
+    }
+
+    #[test]
+    fn an_ipv6_client_address_is_kept() {
+        let e = session(normalize_session_lifecycle_block(&lsm_block(
+            21,
+            r"<User>LAB\alice</User><SessionID>3</SessionID><Address>2001:db8::7</Address>",
+        )));
+        assert_eq!(e.source_address, Some("2001:db8::7".parse().unwrap()));
+    }
+
+    #[test]
+    fn an_unparseable_client_is_no_address_and_not_the_console() {
+        let e = session(normalize_session_lifecycle_block(&lsm_block(
+            25,
+            r"<User>LAB\alice</User><SessionID>2</SessionID><Address>gw.lab.example</Address>",
+        )));
+        assert_eq!(e.source_address, None);
+        assert!(!e.console);
+    }
+
+    #[test]
+    fn a_logoff_names_no_client() {
+        let e = session(normalize_session_lifecycle_block(&lsm_block(
+            23,
+            r"<User>LAB\alice</User><SessionID>2</SessionID>",
+        )));
+        assert_eq!(e.state, SessionState::Logoff);
+        assert_eq!((e.source_address, e.console), (None, false));
+    }
+
+    #[test]
+    fn a_lifecycle_event_without_session_id_is_skipped() {
+        let block = lsm_block(25, r"<User>LAB\alice</User><Address>LOCAL</Address>");
+        assert!(matches!(
+            normalize_session_lifecycle_block(&block),
+            Some((40, None))
+        ));
+    }
+
+    #[test]
+    fn other_session_manager_ids_are_skipped() {
+        // 59 is the RPC trace that makes up most of the channel.
+        let block = lsm_block(59, "<SessionId>0</SessionId>");
+        assert!(matches!(
+            normalize_session_lifecycle_block(&block),
+            Some((40, None))
+        ));
+    }
+
+    #[test]
+    fn an_rdp_authentication_is_a_connect_with_no_session() {
+        let block = lsm_block(
+            1149,
+            "<Param1>alice</Param1><Param2>LAB</Param2><Param3>198.51.100.40</Param3>",
+        );
+        let e = session(normalize_rdp_connection_block(&block));
+        assert_eq!(e.state, SessionState::Connect);
+        assert_eq!(e.session_id, None);
+        assert_eq!(e.target_user, r"LAB\alice");
+        assert_eq!(e.source_address, Some("198.51.100.40".parse().unwrap()));
+    }
+
+    #[test]
+    fn an_rdp_authentication_naming_nothing_is_skipped() {
+        let block = lsm_block(1149, "<Param1></Param1><Param2></Param2><Param3></Param3>");
+        assert!(matches!(
+            normalize_rdp_connection_block(&block),
+            Some((40, None))
+        ));
+    }
+
+    #[test]
+    fn session_targets_poll_only_the_lifecycle_ids() {
+        assert!(!SESSION_LIFECYCLE.id_filter.contains("59"));
+        assert!(!SESSION_LIFECYCLE.id_filter.contains("EventID=22"));
+        assert_eq!(RDP_CONNECTIONS.id_filter, "EventID=1149");
     }
 }
 

@@ -15,10 +15,11 @@ use schema::{
     FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent,
     GatekeeperVerdictEvent, HttpClientCount, HttpEvidence, HttpRequestEvent, HttpSignature,
     HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent, KernelModuleAction,
-    KernelModuleEvent, ListenPortEvent, MemfdCreateEvent, MountEvent, NamespaceEvent,
-    NamespaceSyscall, NetworkFlowEvent, POLICY_MECHANISM_SELINUX, PolicyDenialEvent, PrctlEvent,
-    ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent,
-    ScriptBlockEvent, ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
+    KernelModuleEvent, LdapSearchEvent, ListenPortEvent, MemfdCreateEvent, MountEvent,
+    NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, POLICY_MECHANISM_SELINUX,
+    PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
+    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent, SessionState, ShellType,
+    SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketCreateEvent,
     SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
     UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
@@ -447,6 +448,32 @@ fn wmi_activity_golden() {
             method: Some("Win32_Process.Create".into()),
         }),
         "wmi_activity",
+    );
+}
+
+#[test]
+fn ldap_search_golden() {
+    assert_golden(
+        &Event::LdapSearch(LdapSearchEvent {
+            meta: EventMeta {
+                pid: 3740,
+                ppid: 0,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-1001".into(),
+                    integrity_level: Some(0x2000),
+                },
+                timestamp_ns: 1_759_396_502_000_000_000,
+                comm: "powershell.exe".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            filter: "(&(samAccountType=805306368)(servicePrincipalName=*))".into(),
+            base_dn: "DC=lab,DC=local".into(),
+            scope: 2,
+            attributes: vec!["sAMAccountName".into(), "servicePrincipalName".into()],
+        }),
+        "ldap_search",
     );
 }
 
@@ -892,6 +919,72 @@ fn auth_logon_golden() {
         }),
         "auth_logon",
     );
+}
+
+#[test]
+fn session_reconnect_golden() {
+    // An RDP client attached to a disconnected session (LocalSessionManager
+    // 25): the session number and the client's address are what the
+    // hijack rule compares across the disconnect and the reconnect.
+    assert_golden(
+        &Event::Session(SessionEvent {
+            meta: session_meta(),
+            state: SessionState::Reconnect,
+            session_id: Some(2),
+            target_user: r"LAB\alice".into(),
+            source_address: Some("198.51.100.40".parse::<IpAddr>().unwrap()),
+            console: false,
+        }),
+        "session_reconnect",
+    );
+}
+
+#[test]
+fn session_connect_golden() {
+    // RemoteConnectionManager 1149: before any session exists, so no
+    // `session_id` (absent, not null).
+    assert_golden(
+        &Event::Session(SessionEvent {
+            meta: session_meta(),
+            state: SessionState::Connect,
+            session_id: None,
+            target_user: r"LAB\alice".into(),
+            source_address: Some("198.51.100.40".parse::<IpAddr>().unwrap()),
+            console: false,
+        }),
+        "session_connect",
+    );
+}
+
+#[test]
+fn session_console_logoff_golden() {
+    // A logoff names no client: `console` false and no address, which is
+    // not the same as the console (`Address` = `LOCAL` on a 21/24/25).
+    assert_golden(
+        &Event::Session(SessionEvent {
+            meta: session_meta(),
+            state: SessionState::Logoff,
+            session_id: Some(1),
+            target_user: r"LAB\alice".into(),
+            source_address: None,
+            console: false,
+        }),
+        "session_logoff",
+    );
+}
+
+/// The reporting service, not an actor: Terminal Services' svchost pid.
+fn session_meta() -> EventMeta {
+    EventMeta {
+        pid: 2312,
+        ppid: 0,
+        user: User::Unknown,
+        timestamp_ns: 1_759_600_000_000_000_000,
+        comm: String::new(),
+        container: None,
+        process_generation: None,
+        parent_process_generation: None,
+    }
 }
 
 #[test]
@@ -1386,6 +1479,31 @@ fn socket_accept_golden() {
             peer_port: 54321,
         }),
         "socket_accept",
+    );
+}
+
+#[test]
+fn socket_create_golden() {
+    // v42 (#263): AF_PACKET/SOCK_RAW — the shape bind/connect/accept never see,
+    // since raw sockets don't go through those calls the same way.
+    assert_golden(
+        &Event::SocketCreate(SocketCreateEvent {
+            meta: EventMeta {
+                pid: 8101,
+                ppid: 1,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_019_000_000_000,
+                comm: "tcpdump".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            domain: 17,
+            socket_type: 3,
+            protocol: 768,
+            fd: 5,
+        }),
+        "socket_create",
     );
 }
 
@@ -1953,6 +2071,13 @@ fn meta_accessor_covers_all_variants() {
             query: None,
             method: None,
         }),
+        Event::LdapSearch(LdapSearchEvent {
+            meta: meta.clone(),
+            filter: String::new(),
+            base_dn: String::new(),
+            scope: 0,
+            attributes: Vec::new(),
+        }),
         Event::Defender(DefenderEvent {
             meta: meta.clone(),
             kind: DefenderEventKind::ProtectionDisabled,
@@ -2009,6 +2134,14 @@ fn meta_accessor_covers_all_variants() {
             target_user_sid: None,
             source_address: None,
             status_code: None,
+        }),
+        Event::Session(SessionEvent {
+            meta: meta.clone(),
+            state: SessionState::Logon,
+            session_id: None,
+            target_user: String::new(),
+            source_address: None,
+            console: false,
         }),
         Event::ListenPort(ListenPortEvent {
             meta: meta.clone(),
@@ -2173,6 +2306,13 @@ fn meta_accessor_covers_all_variants() {
             syscall: NamespaceSyscall::Unshare,
             fd: None,
             flags: 0,
+        }),
+        Event::SocketCreate(SocketCreateEvent {
+            meta: meta.clone(),
+            domain: 2,
+            socket_type: 1,
+            protocol: 6,
+            fd: 0,
         }),
     ];
     for e in &events {

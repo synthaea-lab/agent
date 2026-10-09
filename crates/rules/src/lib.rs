@@ -14,6 +14,8 @@ mod amsi;
 mod defender;
 mod exclusions;
 mod ld_trust;
+mod ldap;
+mod session;
 mod signature_gate;
 mod sliding;
 mod state;
@@ -23,6 +25,9 @@ mod stateless;
 pub use amsi::evaluate_amsi_content;
 // Defender tamper rules (#283): protection turned off, risky exclusions.
 pub use defender::evaluate_defender_event;
+// LDAP search rules (#364): the single-search dispatcher; the burst rule is
+// `RuleState::on_ldap_search`.
+pub use ldap::evaluate_ldap_search;
 use schema::detection::Severity;
 pub use signature_gate::{ImageSignature, SignatureGatedAlert};
 pub use state::RuleState;

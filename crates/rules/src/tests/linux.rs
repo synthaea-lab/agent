@@ -1068,6 +1068,110 @@ fn mass_rename_with_appended_suffix_triggers_at_threshold() {
     assert_eq!(alerts[0].technique, "T1486");
 }
 
+/// The damage manifest of a ransomware detection (issue #82): what the rule state
+/// remembers of the files a process renamed or deleted.
+#[test]
+fn touched_files_remembers_a_pids_renames_and_deletes_oldest_first() {
+    let mut state = RuleState::new();
+    state.on_file_rename(&file_rename_event_full(7, "enc", "/h/a", "/h/a.locked", 1));
+    state.on_file_delete(&schema::FileDeleteEvent {
+        meta: schema::EventMeta {
+            pid: 7,
+            timestamp_ns: 2,
+            ..schema::fixtures::meta()
+        },
+        path: "/h/b".into(),
+    });
+    state.on_file_rename(&file_rename_event_full(8, "other", "/h/c", "/h/c.x", 3));
+
+    let touched = state.touched_files(7, None);
+    let kinds: Vec<&str> = touched
+        .iter()
+        .map(|e| match e {
+            schema::Event::FileRename(_) => "rename",
+            schema::Event::FileDelete(_) => "delete",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(kinds, ["rename", "delete"]);
+    assert!(state.touched_files(99, None).is_empty());
+}
+
+#[test]
+fn touched_files_keeps_only_the_newest_per_pid() {
+    let mut state = RuleState::new();
+    for i in 0..(TOUCHED_FILES_PER_PID as u64 + 25) {
+        state.on_file_rename(&file_rename_event_full(
+            7,
+            "enc",
+            &format!("/h/{i}"),
+            &format!("/h/{i}.x"),
+            i,
+        ));
+    }
+    let touched = state.touched_files(7, None);
+    assert_eq!(touched.len(), TOUCHED_FILES_PER_PID);
+    assert_eq!(
+        touched[0].meta().timestamp_ns,
+        25,
+        "the oldest 25 were dropped"
+    );
+    assert_eq!(
+        touched.last().unwrap().meta().timestamp_ns,
+        TOUCHED_FILES_PER_PID as u64 + 24
+    );
+}
+
+#[test]
+fn touched_files_bounds_the_pids_it_tracks() {
+    let mut state = RuleState::new();
+    let total = TOUCHED_FILES_PID_CAP as u32 + 10;
+    for pid in 0..total {
+        state.on_file_rename(&file_rename_event_full(
+            1000 + pid,
+            "enc",
+            "/h/a",
+            "/h/a.x",
+            u64::from(pid),
+        ));
+    }
+    // The map sheds in batches, so the exact count is its business; what matters is that
+    // it never exceeds the cap and that the least recent pids go first.
+    let tracked = (0..total)
+        .filter(|pid| !state.touched_files(1000 + pid, None).is_empty())
+        .count();
+    assert!(tracked <= TOUCHED_FILES_PID_CAP, "tracked {tracked}");
+    assert!(tracked > TOUCHED_FILES_PID_CAP / 2, "tracked {tracked}");
+    assert!(
+        state.touched_files(1000, None).is_empty(),
+        "the oldest pid was shed"
+    );
+    assert!(
+        !state.touched_files(1000 + total - 1, None).is_empty(),
+        "the newest is kept"
+    );
+}
+
+#[test]
+fn touched_files_never_mixes_two_incarnations_of_a_recycled_pid() {
+    let mut state = RuleState::new();
+    let mut first = file_rename_event_full(7, "enc", "/h/old", "/h/old.x", 1);
+    first.meta.process_generation = Some(1);
+    let mut second = file_rename_event_full(7, "enc", "/h/new", "/h/new.x", 2);
+    second.meta.process_generation = Some(2);
+    state.on_file_rename(&first);
+    state.on_file_rename(&second);
+
+    let of_second = state.touched_files(7, Some(2));
+    assert_eq!(of_second.len(), 1);
+    assert_eq!(of_second[0].meta().process_generation, Some(2));
+    assert_eq!(
+        state.touched_files(7, None).len(),
+        2,
+        "no stamp: pid-only, as everywhere else"
+    );
+}
+
 #[test]
 fn mass_rename_below_threshold_does_not_alert() {
     let mut state = RuleState::new();

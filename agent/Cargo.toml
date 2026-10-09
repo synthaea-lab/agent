@@ -9,6 +9,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Keep one-command development builds convenient. Linux release packaging disables
+# the downloaded glibc-built runtime and links a source-built musl runtime instead.
+default = ["ml/dynamic-onnx"]
+
 [dependencies]
 schema = { path = "../crates/schema" }
 config = { path = "../crates/config" }
@@ -16,10 +21,11 @@ policy = { path = "../crates/policy" }
 rules = { path = "../crates/rules" }
 correlator = { path = "../crates/correlator" }
 verdict = { path = "../crates/verdict" }
-ml = { path = "../crates/ml" }
+ml = { path = "../crates/ml", default-features = false }
 sigma = { path = "../crates/sigma" }
 enrich = { path = "../crates/enrich" }
 yara = { path = "../crates/yara" }
+deception = { path = "../crates/deception" }
 sinks = { path = "../crates/sinks" }
 tamper = { path = "../crates/tamper" }
 response = { path = "../crates/response" }
@@ -65,6 +71,9 @@ sensor-linux-netlink = { path = "../crates/sensors/linux/netlink" }
 sensor-linux-journal = { path = "../crates/sensors/linux/journal" }
 sensor-linux-logs = { path = "../crates/sensors/linux/logs" }
 sensor-linux-procmem = { path = "../crates/sensors/linux/procmem" }
+# `is_filtered_path`: the canary placement check uses the sensor's own filter, so the two
+# cannot drift apart (#81).
+sensor-linux-wire = { path = "../crates/sensors/linux/wire" }
 sensor-linux-uprobes = { path = "../crates/sensors/linux/uprobes" }
 # Observation-only file_open hook (issue #91/#313): cmd_run attaches it
 # best-effort alongside the primary sensor. Inline blocking (-EPERM on a
@@ -77,4 +86,5 @@ aya = { version = "0.14", default-features = false }
 libc = "0.2"
 
 [dev-dependencies]
+tempfile = "3"
 schema = { path = "../crates/schema", features = ["test-fixtures"] }

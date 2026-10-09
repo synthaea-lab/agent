@@ -164,6 +164,25 @@ fn journal_and_evtx_paths_alert_under_their_platform_technique() {
 }
 
 #[test]
+fn unblocking_a_downloaded_evtx_is_not_a_log_deletion() {
+    // `Unblock-File` deletes the `Zone.Identifier` stream, not the log.
+    for path in [
+        r"C:\Users\u\Downloads\Security.evtx:Zone.Identifier",
+        r"C:\Users\u\Downloads\Security.evtx:Zone.Identifier:$DATA",
+    ] {
+        assert!(
+            check_log_file_delete(&file_delete(path)).is_none(),
+            "{path}"
+        );
+    }
+    let upper = check_log_file_delete(&file_delete(
+        r"C:\Windows\System32\winevt\Logs\SECURITY.EVTX",
+    ))
+    .expect("an event log in any case is still one");
+    assert_eq!(upper.technique, "T1070.001");
+}
+
+#[test]
 fn ordinary_deletions_stay_silent() {
     assert!(check_log_file_delete(&file_delete("/tmp/build.o")).is_none());
     assert!(evaluate_file_delete(&file_delete("/home/u/notes.txt")).is_empty());
