@@ -978,9 +978,8 @@ impl RuleState {
         let mut alerts: Vec<Alert> = event
             .source_address
             .filter(|_| matches!(event.meta.user, User::Windows { .. }))
-            .and_then(|address| self.rdp_success.on_failure(address, ts))
-            .into_iter()
-            .collect();
+            .map(|address| self.rdp_success.on_failure(address, ts))
+            .unwrap_or_default();
         let entry = self
             .auth_failures
             .get_or_insert_with(key, SlidingCounter::default);

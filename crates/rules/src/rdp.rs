@@ -74,8 +74,8 @@ impl RdpSuccessAfterFailures {
     }
 
     /// An authentication failure from `address` at `timestamp_ns`. May complete
-    /// the join of a success that was already seen.
-    pub(crate) fn on_failure(&mut self, address: IpAddr, timestamp_ns: u64) -> Option<Alert> {
+    /// the join of several successes that were already seen, one per window.
+    pub(crate) fn on_failure(&mut self, address: IpAddr, timestamp_ns: u64) -> Vec<Alert> {
         let address = address.to_canonical();
         let source = self.sources.get_or_insert_with(address, Source::default);
         insert_sorted(&mut source.failures, timestamp_ns, FAILURES_PER_SOURCE_CAP);
@@ -88,7 +88,7 @@ impl RdpSuccessAfterFailures {
         address: IpAddr,
         timestamp_ns: u64,
         user: &str,
-    ) -> Option<Alert> {
+    ) -> Vec<Alert> {
         let address = address.to_canonical();
         let source = self.sources.get_or_insert_with(address, Source::default);
         let at = source
@@ -119,9 +119,12 @@ fn insert_sorted(deque: &mut VecDeque<u64>, value: u64, cap: usize) {
 }
 
 impl Source {
-    /// The first remembered success that now has enough failures in the window
-    /// ending at it, once per window.
-    fn join(&mut self, address: IpAddr) -> Option<Alert> {
+    /// Every remembered success that now has enough failures in the window ending
+    /// at it, once per window. One arrival can complete several successes (a single
+    /// late failure that falls in the windows of two of them), so this returns all
+    /// of them, not the first.
+    fn join(&mut self, address: IpAddr) -> Vec<Alert> {
+        let mut alerts = Vec::new();
         for success in &mut self.successes {
             if success.alerted {
                 continue;
@@ -142,7 +145,7 @@ impl Source {
                 if self.alerted_windows.len() > ALERTED_WINDOWS_CAP {
                     self.alerted_windows.pop_front();
                 }
-                return Some(Alert {
+                alerts.push(Alert {
                     technique: "T1021.001",
                     severity: Severity::Medium,
                     message: format!(
@@ -155,7 +158,7 @@ impl Source {
                 });
             }
         }
-        None
+        alerts
     }
 }
 
@@ -185,7 +188,7 @@ mod tests {
         let mut state = RdpSuccessAfterFailures::new();
         order
             .into_iter()
-            .filter_map(|index| {
+            .flat_map(|index| {
                 let (success, timestamp) = events[index];
                 if success {
                     state.on_success(ADDRESS, timestamp, "alice")
@@ -225,7 +228,7 @@ mod tests {
             let mut state = RdpSuccessAfterFailures::new();
             let alerts = order
                 .into_iter()
-                .filter_map(|index| {
+                .flat_map(|index| {
                     let (success, timestamp) = events[index];
                     if success {
                         state.on_success(ADDRESS, timestamp, "alice")
@@ -251,9 +254,9 @@ mod tests {
         ) {
             let mut state = RdpSuccessAfterFailures::new();
             for timestamp in timestamps {
-                prop_assert!(state.on_failure(ADDRESS, timestamp).is_none());
+                prop_assert!(state.on_failure(ADDRESS, timestamp).is_empty());
             }
-            prop_assert!(state.on_success(ADDRESS, success_at, "alice").is_none());
+            prop_assert!(state.on_success(ADDRESS, success_at, "alice").is_empty());
         }
     }
 
@@ -263,7 +266,7 @@ mod tests {
         for second in 0..EXPECTED_THRESHOLD as u64 {
             state.on_failure("::ffff:192.0.2.7".parse().unwrap(), second * SECOND);
         }
-        assert!(state.on_success(ADDRESS, 10 * SECOND, "alice").is_some());
+        assert!(!state.on_success(ADDRESS, 10 * SECOND, "alice").is_empty());
         assert_eq!(state.sources.len(), 1);
     }
 
@@ -290,7 +293,7 @@ mod tests {
             }
             state.on_failure(ADDRESS, boundary);
             assert_eq!(
-                state.on_success(ADDRESS, success, "alice").is_some(),
+                !state.on_success(ADDRESS, success, "alice").is_empty(),
                 expected,
                 "boundary timestamp {boundary}"
             );
@@ -306,7 +309,7 @@ mod tests {
         let source = state.sources.iter().next().unwrap().1;
         assert_eq!(source.failures.len(), EXPECTED_FAILURES_CAP);
         assert_eq!(source.failures.front(), Some(&SECOND));
-        assert!(state.on_success(ADDRESS, 300 * SECOND, "alice").is_some());
+        assert!(!state.on_success(ADDRESS, 300 * SECOND, "alice").is_empty());
     }
 
     #[test]
@@ -353,16 +356,32 @@ mod tests {
                 let (_, second) = successes[index];
                 for before in 1..=5 {
                     let at = (second + 10).saturating_sub(before) * SECOND;
-                    alerts += usize::from(state.on_failure(ADDRESS, at).is_some());
+                    alerts += state.on_failure(ADDRESS, at).len();
                 }
-                alerts += usize::from(
-                    state
-                        .on_success(ADDRESS, (second + 10) * SECOND, "alice")
-                        .is_some(),
-                );
+                alerts += state
+                    .on_success(ADDRESS, (second + 10) * SECOND, "alice")
+                    .len();
             }
             assert_eq!(alerts, 3, "order {order:?}");
         }
+    }
+
+    #[test]
+    fn one_late_failure_completes_two_successes_in_two_windows() {
+        // Hugo's review: successes at 299 s and 301 s fall in different fixed windows
+        // (0 and 1) and both are covered by failures at 295..=299 s. The successes
+        // arrive first, so the last failure completes both joins in one call, and each
+        // window must get its alert.
+        let mut state = RdpSuccessAfterFailures::new();
+        assert!(state.on_success(ADDRESS, 299 * SECOND, "alice").is_empty());
+        assert!(state.on_success(ADDRESS, 301 * SECOND, "alice").is_empty());
+        for second in 295..299 {
+            assert!(state.on_failure(ADDRESS, second * SECOND).is_empty());
+        }
+        let alerts = state.on_failure(ADDRESS, 299 * SECOND);
+        assert_eq!(alerts.len(), 2);
+        // Nothing is left to fire afterwards.
+        assert!(state.on_failure(ADDRESS, 300 * SECOND).is_empty());
     }
 
     #[test]
@@ -372,9 +391,9 @@ mod tests {
         for second in [9, 2, 8, 1, 7] {
             let alert = state.on_failure(ADDRESS, second * SECOND);
             if second != 7 {
-                assert!(alert.is_none());
+                assert!(alert.is_empty());
             } else {
-                assert!(alert.is_some());
+                assert!(!alert.is_empty());
             }
         }
     }
@@ -386,27 +405,18 @@ mod tests {
         let mut chronological_alerts = 0;
         let mut reordered_alerts = 0;
         for second in 1..=5 {
-            chronological_alerts +=
-                usize::from(chronological.on_failure(ADDRESS, second * SECOND).is_some());
+            chronological_alerts += chronological.on_failure(ADDRESS, second * SECOND).len();
         }
-        chronological_alerts += usize::from(
-            chronological
-                .on_success(ADDRESS, 10 * SECOND, "alice")
-                .is_some(),
-        );
-        chronological_alerts +=
-            usize::from(chronological.on_failure(ADDRESS, 1_000 * SECOND).is_some());
+        chronological_alerts += chronological
+            .on_success(ADDRESS, 10 * SECOND, "alice")
+            .len();
+        chronological_alerts += chronological.on_failure(ADDRESS, 1_000 * SECOND).len();
 
-        reordered_alerts += usize::from(reordered.on_failure(ADDRESS, 1_000 * SECOND).is_some());
+        reordered_alerts += reordered.on_failure(ADDRESS, 1_000 * SECOND).len();
         for second in 1..=5 {
-            reordered_alerts +=
-                usize::from(reordered.on_failure(ADDRESS, second * SECOND).is_some());
+            reordered_alerts += reordered.on_failure(ADDRESS, second * SECOND).len();
         }
-        reordered_alerts += usize::from(
-            reordered
-                .on_success(ADDRESS, 10 * SECOND, "alice")
-                .is_some(),
-        );
+        reordered_alerts += reordered.on_success(ADDRESS, 10 * SECOND, "alice").len();
 
         assert_eq!(reordered_alerts, chronological_alerts);
     }
@@ -418,9 +428,9 @@ mod tests {
         for window in 0..=ALERTED_WINDOWS_CAP as u64 {
             let start = window * RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS;
             for offset in 0..RDP_SUCCESS_AFTER_FAILURES_THRESHOLD as u64 {
-                assert!(state.on_failure(ADDRESS, start + offset).is_none());
+                assert!(state.on_failure(ADDRESS, start + offset).is_empty());
             }
-            alerts += usize::from(state.on_success(ADDRESS, start + 10, "alice").is_some());
+            alerts += state.on_success(ADDRESS, start + 10, "alice").len();
         }
 
         let source = state.sources.iter().next().unwrap().1;
@@ -439,13 +449,13 @@ mod tests {
         for _ in 0..EXPECTED_THRESHOLD {
             at_zero.on_failure(ADDRESS, 0);
         }
-        assert!(at_zero.on_success(ADDRESS, 0, "alice").is_some());
+        assert!(!at_zero.on_success(ADDRESS, 0, "alice").is_empty());
 
         let mut at_max = RdpSuccessAfterFailures::new();
         for _ in 0..EXPECTED_THRESHOLD {
             at_max.on_failure(ADDRESS, u64::MAX);
         }
-        assert!(at_max.on_success(ADDRESS, u64::MAX, "alice").is_some());
+        assert!(!at_max.on_success(ADDRESS, u64::MAX, "alice").is_empty());
     }
 
     #[test]
