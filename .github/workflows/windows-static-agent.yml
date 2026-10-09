@@ -55,18 +55,39 @@ jobs:
           persist-credentials: false
 
       # Only the .lib files are cached (about 1.1 GB, against 3.4 GB for the whole build
-      # directory): the link needs nothing else. The onnxruntime version is pinned inside
+      # directory): the link needs nothing else. They are copied out of the build tree
+      # first, keeping their relative paths: a glob over the build tree makes the cache
+      # action stat a symlink in flatbuffers' sources (EPERM), and it then skips the save
+      # with a warning only (first run of #762). The onnxruntime version is pinned inside
       # the build script, so hashing the script covers a version bump.
       - name: Restore onnxruntime static libraries
         id: ort-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: onnxruntime/build/Windows/Release/**/*.lib
+          path: ort-static
           key: ort-static-windows-2022-${{ hashFiles('lab/provisioning/build-onnxruntime-static.ps1') }}
 
       - name: Build onnxruntime from source
         if: steps.ort-cache.outputs.cache-hit != 'true'
         run: ./lab/provisioning/build-onnxruntime-static.ps1
+
+      # `ort-static\Release` mirrors `build\Windows\Release`, so ORT_LIB_LOCATION keeps the
+      # `Release\Release` shape the link-flags script expects. The build tree is removed
+      # afterwards: the link then reads the same files a cached run does.
+      - name: Stage the libraries for the cache
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        run: |
+          $from = (Resolve-Path onnxruntime\build\Windows\Release).Path
+          $to = Join-Path $PWD 'ort-static\Release'
+          $libs = @(Get-ChildItem $from -Recurse -Filter *.lib)
+          foreach ($lib in $libs) {
+            $dest = Join-Path $to $lib.FullName.Substring($from.Length + 1)
+            New-Item -ItemType Directory -Force (Split-Path $dest) | Out-Null
+            Copy-Item $lib.FullName $dest
+          }
+          if ($libs.Count -eq 0) { throw 'no .lib files to stage' }
+          "Staged $($libs.Count) libraries"
+          cmd /c rmdir /s /q onnxruntime
 
       # Saved right after the build, not at the end of the job: a later link or import
       # failure must not throw away an hour of onnxruntime build.
@@ -74,12 +95,12 @@ jobs:
         if: steps.ort-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: onnxruntime/build/Windows/Release/**/*.lib
+          path: ort-static
           key: ${{ steps.ort-cache.outputs.cache-primary-key }}
 
       - name: Generate the static link flags
         run: |
-          $env:ORT_LIB_LOCATION = "$PWD\onnxruntime\build\Windows\Release\Release"
+          $env:ORT_LIB_LOCATION = "$PWD\ort-static\Release\Release"
           ./lab/provisioning/ort-static-link-flags.ps1 | Invoke-Expression
           "ORT_LIB_LOCATION=$env:ORT_LIB_LOCATION" >> $env:GITHUB_ENV
           "RUSTFLAGS=$env:RUSTFLAGS" >> $env:GITHUB_ENV
