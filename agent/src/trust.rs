@@ -7,6 +7,8 @@
 /// What a manifest is verified for, to word the refusal.
 #[derive(Clone, Copy)]
 pub(crate) enum Manifest {
+    /// Only `apply-release` builds this, and that command is Linux-only.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Release,
     Content,
 }
@@ -75,11 +77,13 @@ pub(crate) fn ensure_key_trusted(
     Ok(())
 }
 
-/// [`ensure_key_trusted`] for this build's release key.
+/// [`ensure_key_trusted`] for this build's release key. Used by `apply-release`, which is
+/// Linux-only (ADR-0015 Deferred).
 ///
 /// # Errors
 ///
 /// As [`ensure_key_trusted`].
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn ensure_release_key_trusted(allow_test_key: bool) -> anyhow::Result<()> {
     ensure_key_trusted(
         Manifest::Release,
