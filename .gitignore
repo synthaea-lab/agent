@@ -27,3 +27,7 @@ __pycache__/
 .vscode/
 *.egg-info/
 /baselines/
+
+# ML datasets built from lab captures: data on disk, never committed (ml/datasets/README.md)
+ml/datasets/captures/
+ml/datasets/labeled/
