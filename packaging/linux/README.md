@@ -39,8 +39,10 @@ This separation ensures that package managers (apt/dnf) and the updater never co
 ├── agent.log           # Agent stdout/stderr
 └── alerts.ndjson       # Detection alerts
 
-/etc/synthaea/          # Configuration directory (reserved for issue #19)
-└── agent.conf          # Config template (empty for now)
+/etc/synthaea/          # Configuration directory
+└── agent.toml          # Default template (ADR-0013); every control-plane field
+                         # is a # CHANGE ME placeholder, offline_fallback = true
+                         # lets the agent run as shipped
 
 /usr/bin/
 └── synthaea-ctl -> /var/lib/synthaea/current/cli   # CLI symlink
@@ -155,7 +157,7 @@ sudo dnf upgrade ./synthaea-agent-0.2.0-1.rpm
 Verify:
 - [ ] Service restarted cleanly
 - [ ] Data preserved: `/var/lib/synthaea/versions/` intact
-- [ ] Config preserved: `/etc/synthaea/agent.conf` unchanged
+- [ ] Config preserved: `/etc/synthaea/agent.toml` unchanged
 
 **4. Clean Uninstall**
 
@@ -290,11 +292,10 @@ packaging/linux/
 │   ├── synthaea.sysusers              # User creation manifest
 │   └── synthaea.tmpfiles              # Runtime directory creation
 ├── debian/
-│   ├── agent.conf.template            # Empty config template
 │   └── maintainer-scripts/
-│       ├── postinst.sh                # Post-install (create symlinks, enable service)
-│       ├── prerm.sh                   # Pre-removal (stop service)
-│       └── postrm.sh                  # Post-removal (cleanup on purge)
+│       ├── postinst                   # Post-install (create symlinks, enable service)
+│       ├── prerm                      # Pre-removal (stop service)
+│       └── postrm                     # Post-removal (cleanup on purge)
 └── rpm/
     └── synthaea-agent.spec.template   # RPM spec file with scriptlets
 ```
@@ -308,7 +309,6 @@ packaging/linux/
 3. **musl Static Builds** - `.tar.gz` distribution for containers
 4. **SELinux Custom Policy** - RHEL hardening (deferred to issue #112)
 5. **Capability Management** - The unit grants a minimal ambient capability set (ADR-0014); `CAP_SYS_PTRACE`, `CAP_CHOWN`/`CAP_FOWNER` and the audit capabilities are added with the features that need them
-6. **Configuration Format** - Currently placeholder (blocked on issue #19)
 
 ---
 

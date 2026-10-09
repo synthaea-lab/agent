@@ -29,9 +29,29 @@ command -v bpf-linker >/dev/null || fail "install bpf-linker with lab/provisioni
 
 # cargo-deb only packages; build the exact musl artifacts ourselves so Cargo
 # cannot re-enable ml's default download-binaries feature.
-if ! command -v cargo-deb >/dev/null 2>&1; then
-    echo "cargo-deb not found. Installing..."
-    cargo install cargo-deb --locked
+#
+# Pinned, not "whichever is already on PATH": cargo-deb's generated
+# #DEBHELPER# snippet (the systemd-sysusers/enable/start block injected into
+# this package's postinst) is cargo-deb's own template, not ours, and differs
+# across releases — old-dov's #738 review ran 3.8.0 live and reported its
+# exact generated content, which this package's own postinst now documents
+# assumptions about. Reinstall whenever a different version is on PATH, not
+# only when cargo-deb is entirely missing.
+CARGO_DEB_VERSION="3.8.0"
+# `|| true`, not left bare: under `set -euo pipefail` (top of this file), a
+# cargo-deb that isn't installed yet exits the pipeline's first stage 127 and
+# `grep` then matches nothing (exit 1) — pipefail propagates that into the
+# assignment and `set -e` kills the script right here, silently (stderr from
+# the missing-binary message is the stage this redirects to /dev/null), before
+# ever reaching the install line below. That is exactly CI's case: every job
+# runs in a fresh `alpine:3.24` container with no cargo-deb on PATH at all
+# (confirmed live on #738 round 2 — no output, no error, just exit 1 at this
+# line). `|| true` makes a not-yet-installed cargo-deb read as "none", which
+# correctly takes the install branch below, instead of aborting before it.
+installed_version="$(cargo-deb --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+if [ "$installed_version" != "$CARGO_DEB_VERSION" ]; then
+    echo "cargo-deb $CARGO_DEB_VERSION required (found: ${installed_version:-none}). Installing..."
+    cargo install cargo-deb --version "$CARGO_DEB_VERSION" --locked --force
 fi
 
 if [ -z "${ORT_LIB_LOCATION:-}" ]; then
@@ -82,6 +102,18 @@ done
 cargo deb -p watchdog --target "$TARGET" --no-build
 DEB_FILE="$(find "$REPO_ROOT/target/debian" -maxdepth 1 -type f -name '*.deb' -print | sort | head -n 1)"
 [ -n "$DEB_FILE" ] || fail "cargo-deb did not produce a .deb"
+
+# The source maintainer scripts parsing (`sh -n` in CI on the files directly)
+# proves nothing about what ships: cargo-deb's #DEBHELPER# substitution runs
+# only here, after packaging, and a corrupted result (old-dov, #738 round 2 —
+# the token spelled a second time in a comment) still built a .deb and still
+# passed CI, because nothing until now actually parsed the generated script.
+maintainer_scripts_dir="$(mktemp -d)"
+dpkg-deb -e "$DEB_FILE" "$maintainer_scripts_dir"
+for script in postinst postrm prerm; do
+    sh -n "$maintainer_scripts_dir/$script" || fail "generated $script is not valid shell (check #DEBHELPER# substitution)"
+done
+rm -rf "$maintainer_scripts_dir"
 
 echo
 echo "==> Static musl package created: $DEB_FILE"
