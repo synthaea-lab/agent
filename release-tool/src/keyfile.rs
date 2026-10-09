@@ -62,7 +62,12 @@ mod tests {
         let key = parse_seed(&format!("  {SEED}\n")).unwrap();
         assert_eq!(
             public_key_hex(&key),
-            hex_encode(updater::key::UPDATER_PUBLIC_KEY.as_slice())
+            hex_encode(
+                updater::key::RELEASE_PUBLIC_KEY
+                    .as_ref()
+                    .expect("the test set is embedded in tests")
+                    .as_slice()
+            )
         );
     }
 

@@ -19,6 +19,11 @@ pub enum UpdaterError {
     #[error("manifest signature does not verify")]
     SignatureInvalid,
 
+    /// This build embeds no production signing key for the manifest's kind, so nothing can
+    /// be verified (ADR-0027: the key files under `crates/updater/keys/` are unprovisioned).
+    #[error("this build embeds no production signing key for this manifest (ADR-0027)")]
+    SigningKeyUnprovisioned,
+
     /// `release_version` is not strictly greater than the currently installed
     /// one (ADR-0015 Decision 2: anti-rollback-attack check).
     #[error("release {offered} is not newer than the installed release {current}")]

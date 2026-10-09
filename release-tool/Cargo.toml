@@ -9,12 +9,18 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# `--test-key`: sign with the public test key (lab and dev releases only).
+default = ["test-key"]
+test-key = ["updater/test-key"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ring = "0.17"
 serde_json = { workspace = true }
-updater = { path = "../crates/updater" }
+updater = { path = "../crates/updater", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
+updater = { path = "../crates/updater", features = ["test-key"] }

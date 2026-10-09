@@ -16,7 +16,7 @@ echo "Version: $VERSION"
 
 # Build binaries
 echo "Building release binaries..."
-cargo build --release --workspace --bins --exclude sensor-linux-ebpf
+cargo build --release --bins -p agent -p watchdog -p cli --no-default-features --features agent/dynamic-onnx
 
 # Create source tarball
 echo "Creating source tarball..."

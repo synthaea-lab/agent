@@ -9,6 +9,12 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The public test key set (ADR-0027). On by default so development and the lab keep working;
+# a packaged build turns it off and then embeds only what `keys/*.pub` holds.
+default = ["test-key"]
+test-key = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -22,3 +28,7 @@ rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[[example]]
+name = "stage_demo_release"
+required-features = ["test-key"]

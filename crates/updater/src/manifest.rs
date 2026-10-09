@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::UpdaterError,
     hash::{hex_decode, hex_encode},
-    key::UPDATER_PUBLIC_KEY,
+    key::RELEASE_PUBLIC_KEY,
 };
 
 /// The only `schema_version` this build accepts (ADR-0015 Decision 2: readers
@@ -82,7 +82,7 @@ impl ReleaseManifest {
     }
 
     /// Verifies this manifest's `schema_version` and Ed25519 signature against
-    /// [`UPDATER_PUBLIC_KEY`]. Does not check `release_version` monotonicity or
+    /// [`RELEASE_PUBLIC_KEY`]. Does not check `release_version` monotonicity or
     /// per-file hashes — see [`Self::check_release_version`] and
     /// `crate::layout::Layout::verify_staged`.
     ///
@@ -90,7 +90,8 @@ impl ReleaseManifest {
     ///
     /// [`UpdaterError::SchemaVersionUnsupported`] if `schema_version` does not
     /// match [`MANIFEST_SCHEMA_VERSION`]; [`UpdaterError::SignatureInvalid`] if
-    /// the signature is malformed or does not verify.
+    /// the signature is malformed or does not verify;
+    /// [`UpdaterError::SigningKeyUnprovisioned`] if this build embeds no `release` key.
     pub fn verify_signature(&self) -> Result<(), UpdaterError> {
         if self.schema_version != MANIFEST_SCHEMA_VERSION {
             return Err(UpdaterError::SchemaVersionUnsupported {
@@ -100,7 +101,13 @@ impl ReleaseManifest {
         }
         let sig_bytes = hex_decode(&self.signature).ok_or(UpdaterError::SignatureInvalid)?;
         let msg = self.canonical_bytes();
-        let public_key = UnparsedPublicKey::new(&signature::ED25519, UPDATER_PUBLIC_KEY.as_slice());
+        let public_key = UnparsedPublicKey::new(
+            &signature::ED25519,
+            RELEASE_PUBLIC_KEY
+                .as_ref()
+                .ok_or(UpdaterError::SigningKeyUnprovisioned)?
+                .as_slice(),
+        );
         public_key
             .verify(&msg, &sig_bytes)
             .map_err(|_| UpdaterError::SignatureInvalid)

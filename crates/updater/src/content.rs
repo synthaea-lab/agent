@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::UpdaterError,
     hash::{hex_decode, hex_encode},
-    key::UPDATER_PUBLIC_KEY,
+    key::CONTENT_PUBLIC_KEY,
 };
 
 /// The only `schema_version` this build accepts — same anti-drift stance as
@@ -187,8 +187,8 @@ impl ContentManifest {
     }
 
     /// Verifies this manifest's `schema_version` and Ed25519 signature against
-    /// [`UPDATER_PUBLIC_KEY`] — the same embedded key that verifies binary
-    /// release manifests. Does not check `release_version` monotonicity,
+    /// [`CONTENT_PUBLIC_KEY`], the `content` key of the trust set (not the
+    /// `release` key; they are one key only in the test set). Does not check `release_version` monotonicity,
     /// `ring` assignment, or per-entry hashes — see [`Self::check_release_version`]
     /// and the caller's own per-artifact hash check after download.
     ///
@@ -196,7 +196,8 @@ impl ContentManifest {
     ///
     /// [`UpdaterError::SchemaVersionUnsupported`] if `schema_version` does not
     /// match [`CONTENT_MANIFEST_SCHEMA_VERSION`]; [`UpdaterError::SignatureInvalid`]
-    /// if the signature is malformed or does not verify.
+    /// if the signature is malformed or does not verify;
+    /// [`UpdaterError::SigningKeyUnprovisioned`] if this build embeds no `content` key.
     pub fn verify_signature(&self) -> Result<(), UpdaterError> {
         if self.schema_version != CONTENT_MANIFEST_SCHEMA_VERSION {
             return Err(UpdaterError::SchemaVersionUnsupported {
@@ -206,7 +207,13 @@ impl ContentManifest {
         }
         let sig_bytes = hex_decode(&self.signature).ok_or(UpdaterError::SignatureInvalid)?;
         let msg = self.canonical_bytes();
-        let public_key = UnparsedPublicKey::new(&signature::ED25519, UPDATER_PUBLIC_KEY.as_slice());
+        let public_key = UnparsedPublicKey::new(
+            &signature::ED25519,
+            CONTENT_PUBLIC_KEY
+                .as_ref()
+                .ok_or(UpdaterError::SigningKeyUnprovisioned)?
+                .as_slice(),
+        );
         public_key
             .verify(&msg, &sig_bytes)
             .map_err(|_| UpdaterError::SignatureInvalid)
