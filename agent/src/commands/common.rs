@@ -101,6 +101,7 @@ pub(crate) fn wire_run_pipeline(
         content_dir,
         &crate::sink::model_root(&storage.state_dir),
     )?);
+    sink.start_correlator_ticker()?;
 
     // Said where the operator reads it (the journal) and in the alert log, where `cli` and
     // the console look: detection runs, upload does not (`offline_fallback`).

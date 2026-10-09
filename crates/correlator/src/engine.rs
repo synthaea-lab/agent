@@ -1,9 +1,9 @@
 //! The engine: receives events from the sensor, feeds the bus, evaluates the
 //! co-occurrence rules and the Bayesian belief, and emits alerts.
 
-use std::time::Duration;
+use std::{collections::VecDeque, time::Duration};
 
-use schema::{Event, detection::Severity};
+use schema::{Event, HttpRequestEvent, detection::Severity};
 use store::BoundedMap;
 
 use crate::{
@@ -12,9 +12,10 @@ use crate::{
     bus::{EventBus, same_generation},
     event::is_correlated,
     rules::{
-        CorrelationAlert, rule_assembly_connect, rule_assembly_smb, rule_connect_filewrite,
-        rule_dns_exfil, rule_exec_smb, rule_respawn_connect, rule_spawn_connect,
-        rule_spawn_connect_filewrite, rule_web_request_shell,
+        CorrelationAlert, WEB_SHELL_GRACE_NS, WEB_SHELL_LATE_REQUEST_NS, rule_assembly_connect,
+        rule_assembly_smb, rule_connect_filewrite, rule_dns_exfil, rule_exec_smb,
+        rule_respawn_connect, rule_spawn_connect, rule_spawn_connect_filewrite,
+        rule_web_request_shell, web_request_is_after_shell, web_request_key,
     },
 };
 
@@ -109,6 +110,11 @@ pub struct CorrelationEngine {
     /// Greatest observation timestamp seen by this engine; out-of-order delivery must not
     /// move a pending web-shell grace period backwards.
     web_shell_watermark_ns: u64,
+    /// At most 256 shell contexts await an initial or late access-log alert.
+    pending_web_shells: VecDeque<PendingWebShell>,
+    /// Recent access-log requests retained for request-before-shell delivery order.
+    /// This avoids rebuilding/scanning the full telemetry bus when a shell arrives.
+    recent_web_requests: VecDeque<HttpRequestEvent>,
     /// Bayesian beliefs per entity (ppid, comm), LRU-bounded (`store::BoundedMap`) —
     /// the old iteration's unbounded `HashMap` was a documented known limitation.
     /// Keyed by (ppid, comm), not pid: survives respawns.
@@ -138,6 +144,17 @@ pub struct CorrelationEngine {
 /// observable via the maps' counters.
 const ENTITY_CAP: usize = 65_536;
 const BELIEF_CAP: usize = 16_384;
+const MAX_PENDING_WEB_SHELLS: usize = 256;
+const MAX_RECENT_WEB_REQUESTS: usize = 512;
+
+struct PendingWebShell {
+    event: Event,
+    request: Option<HttpRequestEvent>,
+    initial_deadline_ns: u64,
+    late_deadline_ns: u64,
+    initial_emitted: bool,
+    completion_emitted: bool,
+}
 
 impl CorrelationEngine {
     /// Default window: 60 seconds.
@@ -152,6 +169,8 @@ impl CorrelationEngine {
             bus: EventBus::new(window),
             window_ns: window.as_nanos() as u64,
             web_shell_watermark_ns: 0,
+            pending_web_shells: VecDeque::with_capacity(MAX_PENDING_WEB_SHELLS),
+            recent_web_requests: VecDeque::with_capacity(MAX_RECENT_WEB_REQUESTS),
             beliefs: BoundedMap::new(BELIEF_CAP),
             pid_entities: BoundedMap::new(ENTITY_CAP),
             fired: BoundedMap::new(BELIEF_CAP),
@@ -164,16 +183,25 @@ impl CorrelationEngine {
     /// parent/child correlation) but do not evaluate the rules — too much system
     /// noise. Other event variants can still advance a pending web-shell grace period.
     pub fn on_event(&mut self, event: Event) -> Vec<CorrelationAlert> {
-        self.web_shell_watermark_ns = self.web_shell_watermark_ns.max(event.meta().timestamp_ns);
+        self.advance_web_shell_watermark(event.meta().timestamp_ns);
         if !is_correlated(&event) {
-            return self.web_shell_alerts();
+            return self.flush_web_shells();
         }
         // An access-log request has no pid: it only joins a web server's shell by time.
         // Record it, look for that pairing, and skip every pid-keyed step below.
-        if matches!(event, Event::HttpRequest(_)) {
-            self.bus.push(event);
-            return self.web_shell_alerts();
+        if let Event::HttpRequest(request) = &event {
+            self.bus.push(event.clone());
+            if self.recent_web_requests.len() == MAX_RECENT_WEB_REQUESTS {
+                self.recent_web_requests.pop_front();
+            }
+            self.recent_web_requests.push_back(request.clone());
+            self.observe_web_request(request);
+            return self.flush_web_shells();
         }
+        let web_shell_event = match &event {
+            Event::Exec(exec) if crate::rules::is_web_server_shell(exec) => Some(event.clone()),
+            _ => None,
+        };
         let pid = event.meta().pid;
         let generation = event.meta().process_generation;
         let comm = event.meta().comm.clone();
@@ -242,9 +270,11 @@ impl CorrelationEngine {
             update_belief(state, &bv, None, now_ns);
         }
 
-        // Each event advances the bounded request grace period, including an unrelated event
-        // after a shell whose access-log line never arrives.
-        let web_alerts = self.web_shell_alerts();
+        let mut web_alerts =
+            web_shell_event.map_or_else(Vec::new, |shell_event| self.queue_web_shell(shell_event));
+        // Only inspect bounded pending shell state. We no longer rebuild the full bus event
+        // and request vectors for every incoming telemetry event.
+        web_alerts.extend(self.flush_web_shells());
 
         if is_ignored(&comm) && !self.is_masquerading(pid, generation) {
             return web_alerts;
@@ -269,31 +299,126 @@ impl CorrelationEngine {
     /// period at its deadline.
     #[must_use]
     pub fn advance_time(&mut self, now_ns: u64) -> Vec<CorrelationAlert> {
-        self.web_shell_watermark_ns = self.web_shell_watermark_ns.max(now_ns);
-        self.web_shell_alerts()
+        self.advance_web_shell_watermark(now_ns);
+        self.flush_web_shells()
     }
 
-    /// Evaluates [`rule_web_request_shell`] over the bus after the grace period, once per shell.
-    fn web_shell_alerts(&mut self) -> Vec<CorrelationAlert> {
-        let window_ns = self.window_ns;
-        let mut alerts = Vec::new();
-        for case in rule_web_request_shell(&self.bus, self.web_shell_watermark_ns) {
-            let key = ("web_request_shell", case.pid);
-            let recently = self.fired.get(&key).is_some_and(|entry| {
-                entry.current(case.generation)
-                    && case.timestamp_ns.saturating_sub(entry.value) <= window_ns
+    /// Clamp event-clock progress to the local wall clock. Event timestamps ahead of the
+    /// host clock remain eligible data, but cannot expire their own grace period.
+    fn advance_web_shell_watermark(&mut self, proposed_ns: u64) {
+        let bounded_ns = proposed_ns.min(schema::time::now_ns());
+        self.web_shell_watermark_ns = self.web_shell_watermark_ns.max(bounded_ns);
+    }
+
+    fn queue_web_shell(&mut self, event: Event) -> Vec<CorrelationAlert> {
+        let meta = event.meta();
+        let key = ("web_request_shell", meta.pid);
+        if self.pending_web_shells.iter().any(|pending| {
+            let pending_meta = pending.event.meta();
+            pending_meta.pid == meta.pid
+                && pending_meta.process_generation == meta.process_generation
+                && pending_meta.timestamp_ns == meta.timestamp_ns
+        }) || self.fired.get(&key).is_some_and(|entry| {
+            entry.current(meta.process_generation) && entry.value == meta.timestamp_ns
+        }) {
+            return Vec::new();
+        }
+
+        let request = self
+            .recent_web_requests
+            .iter()
+            .filter(|request| web_request_is_after_shell(meta, request))
+            .min_by(|left, right| web_request_key(left).cmp(&web_request_key(right)))
+            .cloned();
+
+        let timestamp_ns = meta.timestamp_ns;
+        let generation = meta.process_generation;
+        if self.pending_web_shells.len() == MAX_PENDING_WEB_SHELLS {
+            tracing::warn!(
+                pid = meta.pid,
+                "web-shell pending capacity reached; emitting generic alert immediately"
+            );
+            self.fired.insert(
+                key,
+                Stamped {
+                    generation,
+                    value: timestamp_ns,
+                },
+            );
+            return vec![rule_web_request_shell(&event, None, false)];
+        }
+
+        self.pending_web_shells.push_back(PendingWebShell {
+            event,
+            request,
+            initial_deadline_ns: timestamp_ns.saturating_add(WEB_SHELL_GRACE_NS),
+            late_deadline_ns: timestamp_ns.saturating_add(WEB_SHELL_LATE_REQUEST_NS),
+            initial_emitted: false,
+            completion_emitted: false,
+        });
+        Vec::new()
+    }
+
+    fn observe_web_request(&mut self, request: &HttpRequestEvent) {
+        for pending in &mut self.pending_web_shells {
+            let meta = pending.event.meta();
+            if !web_request_is_after_shell(meta, request) {
+                continue;
+            }
+            let replace = pending.request.as_ref().is_none_or(|current| {
+                web_request_key(request)
+                    .cmp(&web_request_key(current))
+                    .is_lt()
             });
-            if !recently {
-                self.fired.insert(
-                    key,
-                    Stamped {
-                        generation: case.generation,
-                        value: case.timestamp_ns,
-                    },
-                );
-                alerts.push(case.alert);
+            if replace {
+                pending.request = Some(request.clone());
             }
         }
+    }
+
+    fn flush_web_shells(&mut self) -> Vec<CorrelationAlert> {
+        if self.pending_web_shells.is_empty() {
+            return Vec::new();
+        }
+
+        let now_ns = self.web_shell_watermark_ns;
+        let mut alerts = Vec::new();
+        let mut retained = VecDeque::with_capacity(self.pending_web_shells.len());
+        while let Some(mut pending) = self.pending_web_shells.pop_front() {
+            let meta = pending.event.meta();
+            let shell_key = ("web_request_shell", meta.pid);
+            if !pending.initial_emitted && now_ns >= pending.initial_deadline_ns {
+                let initial_request = pending
+                    .request
+                    .as_ref()
+                    .filter(|request| request.meta.timestamp_ns <= pending.initial_deadline_ns);
+                alerts.push(rule_web_request_shell(
+                    &pending.event,
+                    initial_request,
+                    false,
+                ));
+                pending.initial_emitted = true;
+                pending.completion_emitted = initial_request.is_some();
+                self.fired.insert(
+                    shell_key,
+                    Stamped {
+                        generation: meta.process_generation,
+                        value: meta.timestamp_ns,
+                    },
+                );
+            }
+            if pending.initial_emitted
+                && !pending.completion_emitted
+                && let Some(request) = pending.request.as_ref()
+            {
+                alerts.push(rule_web_request_shell(&pending.event, Some(request), true));
+                pending.completion_emitted = true;
+            }
+            if !pending.completion_emitted && now_ns <= pending.late_deadline_ns {
+                retained.push_back(pending);
+            }
+        }
+        self.pending_web_shells = retained;
         alerts
     }
 
@@ -434,6 +559,7 @@ impl CorrelationEngine {
             Some(CorrelationAlert {
                 technique: "BAYES",
                 severity: Severity::Critical,
+                trigger_event: None,
                 message: format!(
                     "pid={pid} comm={comm}: high Bayesian score \
                      (log_odds={:.2}, P={:.0}%)",

@@ -646,6 +646,7 @@ dependencies = [
  "proptest",
  "schema",
  "store",
+ "tracing",
 ]
 
 [[package]]

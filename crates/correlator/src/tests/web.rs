@@ -178,6 +178,28 @@ fn requests_with_equal_read_timestamps_use_a_stable_tiebreaker() {
 }
 
 #[test]
+fn requests_arriving_while_a_shell_is_pending_use_the_stable_tiebreaker() {
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(shell_under("nginx", 907, 101 * SEC));
+    engine.on_event(request(102 * SEC));
+    let probe = Event::HttpRequest(HttpRequestEvent {
+        signature: HttpSignature::SqlInjection,
+        path: "/index.php".into(),
+        ..match request(102 * SEC) {
+            Event::HttpRequest(r) => r,
+            _ => unreachable!(),
+        }
+    });
+    engine.on_event(probe);
+
+    let alerts = engine.advance_time(104 * SEC);
+    let web = web_alerts(&alerts);
+    assert_eq!(web.len(), 1, "{alerts:?}");
+    assert!(web[0].message.contains("SqlInjection"));
+    assert!(web[0].message.contains("/index.php"));
+}
+
+#[test]
 fn post_shell_request_is_selected_even_when_an_older_request_is_present() {
     // The older access-log record is unrelated; the one read after the shell is eligible.
     let mut engine = CorrelationEngine::new();
@@ -212,9 +234,109 @@ fn a_request_after_the_grace_window_is_not_paired() {
     engine.on_event(shell_under("nginx", 902, 100 * SEC));
     let late = engine.on_event(request(103 * SEC + 1));
     let web = web_alerts(&late);
-    assert_eq!(web.len(), 1, "the late request arrived after expiry");
+    assert_eq!(web.len(), 2, "generic alert followed by completion");
     assert!(web[0].message.contains("no matching access-log request"));
-    assert!(!web[0].message.contains("/up/s.php"));
+    assert!(web[1].message.contains("late access-log request observed"));
+    assert!(web[1].message.contains("/up/s.php"));
+}
+
+#[test]
+fn a_late_access_log_completes_a_generic_alert_with_the_original_shell() {
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(shell_under("nginx", 903, 100 * SEC));
+    let generic = engine.advance_time(103 * SEC);
+    assert_eq!(web_alerts(&generic).len(), 1);
+    assert!(web_alerts(&generic)[0].trigger_event.is_some());
+
+    let completion = engine.on_event(request(100 * SEC + 90 * SEC));
+    let web = web_alerts(&completion);
+    assert_eq!(web.len(), 1);
+    assert!(web[0].message.contains("late access-log request observed"));
+    assert!(web[0].message.contains("/up/s.php"));
+    assert_eq!(web[0].trigger_event.as_ref().unwrap().meta().pid, 903);
+}
+
+#[test]
+fn a_request_at_the_late_completion_deadline_is_included() {
+    let mut engine = CorrelationEngine::new();
+    let now = schema::time::now_ns();
+    let shell_ns = now.saturating_sub(3_600 * SEC);
+    engine.on_event(shell_under("nginx", 905, shell_ns));
+    let generic = engine.advance_time(now);
+    assert_eq!(web_alerts(&generic).len(), 1);
+
+    let completion = engine.on_event(request(now));
+    let web = web_alerts(&completion);
+    assert_eq!(web.len(), 1);
+    assert!(web[0].message.contains("late access-log request observed"));
+}
+
+#[test]
+fn a_request_beyond_the_late_completion_deadline_is_ignored() {
+    let mut engine = CorrelationEngine::new();
+    let now = schema::time::now_ns();
+    let shell_ns = now.saturating_sub(10 * SEC);
+    engine.on_event(shell_under("nginx", 906, shell_ns));
+    let generic = engine.advance_time(now);
+    assert_eq!(web_alerts(&generic).len(), 1);
+
+    let too_late = engine.on_event(request(shell_ns + 3_600 * SEC + 1));
+    assert!(web_alerts(&too_late).is_empty());
+}
+
+#[test]
+fn a_future_shell_timestamp_cannot_fast_forward_the_grace_watermark() {
+    let mut engine = CorrelationEngine::new();
+    let wall_now = schema::time::now_ns();
+    let future_shell = wall_now.saturating_add(120 * SEC);
+    let alerts = engine.on_event(shell_under("nginx", 904, future_shell));
+    assert!(web_alerts(&alerts).is_empty());
+    assert!(web_alerts(&engine.advance_time(wall_now.saturating_add(600 * SEC))).is_empty());
+}
+
+#[test]
+fn pending_web_shell_state_is_bounded() {
+    let mut engine = CorrelationEngine::new();
+    let now = schema::time::now_ns();
+    for i in 0..256 {
+        engine.on_event(shell_under("nginx", 10_000 + i, now));
+    }
+    let overflow = engine.on_event(shell_under("nginx", 20_000, now));
+    assert_eq!(web_alerts(&overflow).len(), 1);
+}
+
+#[test]
+fn duplicate_shell_events_do_not_queue_two_alerts() {
+    let mut engine = CorrelationEngine::new();
+    let shell = shell_under("nginx", 20_001, 100 * SEC);
+    assert!(web_alerts(&engine.on_event(shell.clone())).is_empty());
+    assert!(web_alerts(&engine.on_event(shell)).is_empty());
+
+    let alerts = engine.advance_time(103 * SEC);
+    assert_eq!(web_alerts(&alerts).len(), 1, "{alerts:?}");
+}
+
+#[test]
+fn a_new_shell_timestamp_for_the_same_pid_is_not_suppressed_as_a_duplicate() {
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(shell_under("nginx", 20_002, 100 * SEC));
+    assert_eq!(web_alerts(&engine.advance_time(103 * SEC)).len(), 1);
+
+    assert!(web_alerts(&engine.on_event(shell_under("nginx", 20_002, 101 * SEC))).is_empty());
+    assert_eq!(web_alerts(&engine.advance_time(104 * SEC)).len(), 1);
+}
+
+#[test]
+fn completed_shell_contexts_release_the_bounded_pending_capacity() {
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(shell_under("nginx", 20_003, 100 * SEC));
+    assert_eq!(web_alerts(&engine.advance_time(103 * SEC)).len(), 1);
+    assert_eq!(web_alerts(&engine.on_event(request(104 * SEC))).len(), 1);
+
+    for i in 0..256 {
+        let alerts = engine.on_event(shell_under("nginx", 30_000 + i, 200 * SEC));
+        assert!(web_alerts(&alerts).is_empty(), "queue overflowed at {i}");
+    }
 }
 
 proptest! {
