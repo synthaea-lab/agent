@@ -12,9 +12,9 @@ use crate::{
     bus::{EventBus, same_generation},
     event::is_correlated,
     rules::{
-        CorrelationAlert, is_web_server_shell, rule_assembly_connect, rule_assembly_smb,
-        rule_connect_filewrite, rule_dns_exfil, rule_exec_smb, rule_respawn_connect,
-        rule_spawn_connect, rule_spawn_connect_filewrite, rule_web_request_shell,
+        CorrelationAlert, rule_assembly_connect, rule_assembly_smb, rule_connect_filewrite,
+        rule_dns_exfil, rule_exec_smb, rule_respawn_connect, rule_spawn_connect,
+        rule_spawn_connect_filewrite, rule_web_request_shell,
     },
 };
 
@@ -106,6 +106,9 @@ fn is_bayes_excluded(comm: &str) -> bool {
 pub struct CorrelationEngine {
     bus: EventBus,
     window_ns: u64,
+    /// Greatest observation timestamp seen by this engine; out-of-order delivery must not
+    /// move a pending web-shell grace period backwards.
+    web_shell_watermark_ns: u64,
     /// Bayesian beliefs per entity (ppid, comm), LRU-bounded (`store::BoundedMap`) —
     /// the old iteration's unbounded `HashMap` was a documented known limitation.
     /// Keyed by (ppid, comm), not pid: survives respawns.
@@ -148,6 +151,7 @@ impl CorrelationEngine {
         Self {
             bus: EventBus::new(window),
             window_ns: window.as_nanos() as u64,
+            web_shell_watermark_ns: 0,
             beliefs: BoundedMap::new(BELIEF_CAP),
             pid_entities: BoundedMap::new(ENTITY_CAP),
             fired: BoundedMap::new(BELIEF_CAP),
@@ -158,10 +162,11 @@ impl CorrelationEngine {
     /// Records an event and returns the alerts it triggered, if any.
     /// Processes in the IGNORED list are recorded in the bus (for future
     /// parent/child correlation) but do not evaluate the rules — too much system
-    /// noise. Event variants this crate does not correlate yet are ignored entirely.
+    /// noise. Other event variants can still advance a pending web-shell grace period.
     pub fn on_event(&mut self, event: Event) -> Vec<CorrelationAlert> {
+        self.web_shell_watermark_ns = self.web_shell_watermark_ns.max(event.meta().timestamp_ns);
         if !is_correlated(&event) {
-            return Vec::new();
+            return self.web_shell_alerts();
         }
         // An access-log request has no pid: it only joins a web server's shell by time.
         // Record it, look for that pairing, and skip every pid-keyed step below.
@@ -169,7 +174,6 @@ impl CorrelationEngine {
             self.bus.push(event);
             return self.web_shell_alerts();
         }
-        let is_web_shell = matches!(&event, Event::Exec(e) if is_web_server_shell(e));
         let pid = event.meta().pid;
         let generation = event.meta().process_generation;
         let comm = event.meta().comm.clone();
@@ -238,13 +242,9 @@ impl CorrelationEngine {
             update_belief(state, &bv, None, now_ns);
         }
 
-        // The shell is the late half of a request-then-shell pairing when the log line
-        // was already read; the other order is handled when the request arrives.
-        let web_alerts = if is_web_shell {
-            self.web_shell_alerts()
-        } else {
-            Vec::new()
-        };
+        // Each event advances the bounded request grace period, including an unrelated event
+        // after a shell whose access-log line never arrives.
+        let web_alerts = self.web_shell_alerts();
 
         if is_ignored(&comm) && !self.is_masquerading(pid, generation) {
             return web_alerts;
@@ -264,11 +264,20 @@ impl CorrelationEngine {
         alerts
     }
 
-    /// Evaluates [`rule_web_request_shell`] over the bus, once per shell per window.
+    /// Advances observation time without adding a telemetry event. Callers with an idle event
+    /// stream can pass [`schema::time::now_ns`] from their timer to expire a web-shell grace
+    /// period at its deadline.
+    #[must_use]
+    pub fn advance_time(&mut self, now_ns: u64) -> Vec<CorrelationAlert> {
+        self.web_shell_watermark_ns = self.web_shell_watermark_ns.max(now_ns);
+        self.web_shell_alerts()
+    }
+
+    /// Evaluates [`rule_web_request_shell`] over the bus after the grace period, once per shell.
     fn web_shell_alerts(&mut self) -> Vec<CorrelationAlert> {
         let window_ns = self.window_ns;
         let mut alerts = Vec::new();
-        for case in rule_web_request_shell(&self.bus) {
+        for case in rule_web_request_shell(&self.bus, self.web_shell_watermark_ns) {
             let key = ("web_request_shell", case.pid);
             let recently = self.fired.get(&key).is_some_and(|entry| {
                 entry.current(case.generation)

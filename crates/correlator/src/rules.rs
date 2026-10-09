@@ -478,6 +478,10 @@ pub(crate) struct WebShellCase {
     pub(crate) alert: CorrelationAlert,
 }
 
+/// Access-log polling runs once per second; allow a short, bounded interval for the line
+/// written at response completion to reach the agent after the shell it caused.
+pub(crate) const WEB_SHELL_GRACE_NS: u64 = 3_000_000_000;
+
 /// T1505.003 / T1190 — a web server spawns a shell within the window of a request that
 /// matched a detection signature (`Event::HttpRequest`, from the access log). Either
 /// can arrive first: the log line is written when the request ends, after the shell
@@ -485,11 +489,14 @@ pub(crate) struct WebShellCase {
 ///
 /// This is temporal co-occurrence on one host, not proof the request caused the shell
 /// (a log line names no process): on a busy site a probe and an unrelated cron job
-/// under php-fpm can land in the same minute. For each qualifying shell the closest
-/// request is named. The message carries the request's signature, path, client and
-/// the matched parameter's *name*, never its value: the value is only redacted at the
-/// agent's sink (ADR-0018), downstream of this crate.
-pub(crate) fn rule_web_request_shell(bus: &EventBus) -> Vec<WebShellCase> {
+/// under php-fpm can land in the same minute. A request read within the grace period
+/// after the shell is named. Requests are stamped when read, not with the access-log
+/// event time, so a request timestamp after the shell is expected for the request that
+/// caused it. If no such line arrives, the alert says that no request was read instead
+/// of naming an older request. The message carries the request's signature, path, client
+/// and matched parameter's *name*, never its value: the value is redacted at the agent's
+/// sink (ADR-0018), downstream of this crate.
+pub(crate) fn rule_web_request_shell(bus: &EventBus, now_ns: u64) -> Vec<WebShellCase> {
     let events: Vec<&Event> = bus.events().collect();
     let requests: Vec<&schema::HttpRequestEvent> = events
         .iter()
@@ -498,9 +505,6 @@ pub(crate) fn rule_web_request_shell(bus: &EventBus) -> Vec<WebShellCase> {
             _ => None,
         })
         .collect();
-    if requests.is_empty() {
-        return Vec::new();
-    }
     events
         .iter()
         .filter_map(|e| match e {
@@ -508,24 +512,60 @@ pub(crate) fn rule_web_request_shell(bus: &EventBus) -> Vec<WebShellCase> {
             _ => None,
         })
         .filter_map(|(meta, exec)| {
-            // The nearest request in time. On a tie in distance, the one before the shell:
-            // a request answered after the shell started cannot have started it. Then the
-            // one read last: the agent stamps a request with the moment it read the line,
-            // so a burst read in one poll shares a timestamp, and arrival order (the log's
-            // order) is the only tie-break left, the request just before the shell being
-            // the one that matters.
-            let request = requests.iter().rev().min_by_key(|r| {
-                let ts = r.meta.timestamp_ns;
-                (ts.abs_diff(meta.timestamp_ns), ts > meta.timestamp_ns)
-            })?;
-            let delta_s = request.meta.timestamp_ns.abs_diff(meta.timestamp_ns) / 1_000_000_000;
-            let client = request
-                .client
-                .map_or_else(|| "unknown".to_owned(), |c| c.to_string());
-            let param = request
-                .evidence
-                .as_ref()
-                .map_or_else(String::new, |ev| format!(" param={}", ev.param));
+            if now_ns.saturating_sub(meta.timestamp_ns) < WEB_SHELL_GRACE_NS {
+                return None;
+            }
+            // Only a line read after the shell can describe the request that caused it.
+            // Stable fields break equal-time ties, so delivery order cannot change the pick.
+            let request = requests
+                .iter()
+                .filter(|r| {
+                    r.meta.timestamp_ns >= meta.timestamp_ns
+                        && r.meta.timestamp_ns - meta.timestamp_ns <= WEB_SHELL_GRACE_NS
+                })
+                .min_by_key(|r| {
+                    (
+                        r.meta.timestamp_ns,
+                        r.path.as_str(),
+                        r.status,
+                        r.method.as_deref().unwrap_or(""),
+                        format!("{:?}", r.signature),
+                        r.client
+                            .map_or_else(|| "unknown".to_owned(), |c| c.to_string()),
+                    )
+                });
+            let message = if let Some(request) = request {
+                let delta_s =
+                    request.meta.timestamp_ns.saturating_sub(meta.timestamp_ns) / 1_000_000_000;
+                let client = request
+                    .client
+                    .map_or_else(|| "unknown".to_owned(), |c| c.to_string());
+                let param = request
+                    .evidence
+                    .as_ref()
+                    .map_or_else(String::new, |ev| format!(" param={}", ev.param));
+                format!(
+                    "pid={} comm={} parent={}: shell spawned by a web server {delta_s}s \
+                     after a {:?} request ({} {}{param}, status {}, client {client}) — \
+                     suspected web shell or exploited web application",
+                    meta.pid,
+                    meta.comm,
+                    exec.parent_comm.as_deref().unwrap_or("?"),
+                    request.signature,
+                    request.method.as_deref().unwrap_or("?"),
+                    request.path,
+                    request.status,
+                )
+            } else {
+                format!(
+                    "pid={} comm={} parent={}: shell spawned by a web server; no matching \
+                     access-log request was read within the 3s grace period (the line may be \
+                     delayed or missing)",
+                    meta.pid,
+                    meta.comm,
+                    exec.parent_comm.as_deref().unwrap_or("?"),
+                )
+            };
             Some(WebShellCase {
                 pid: meta.pid,
                 generation: meta.process_generation,
@@ -533,18 +573,7 @@ pub(crate) fn rule_web_request_shell(bus: &EventBus) -> Vec<WebShellCase> {
                 alert: CorrelationAlert {
                     technique: "T1505.003",
                     severity: Severity::High,
-                    message: format!(
-                        "pid={} comm={} parent={}: shell spawned by a web server {delta_s}s \
-                         from a {:?} request ({} {}{param}, status {}, client {client}) — \
-                         suspected web shell or exploited web application",
-                        meta.pid,
-                        meta.comm,
-                        exec.parent_comm.as_deref().unwrap_or("?"),
-                        request.signature,
-                        request.method.as_deref().unwrap_or("?"),
-                        request.path,
-                        request.status,
-                    ),
+                    message,
                 },
             })
         })
