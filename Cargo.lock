@@ -2232,6 +2232,7 @@ dependencies = [
  "policy",
  "schema",
  "sha2 0.11.0",
+ "tracing",
 ]
 
 [[package]]

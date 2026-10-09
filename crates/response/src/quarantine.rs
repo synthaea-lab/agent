@@ -949,7 +949,7 @@ pub fn unquarantine(quarantine_dir: &Path, sha256_hex: &str) -> std::io::Result<
         }
         #[cfg(unix)]
         let restore = match record.mode {
-            Some(mode) => restore_file_with_mode(&stored, &original, mode, sha256_hex),
+            Some(mode) => restore_file_with_mode(&stored, &original, mode & 0o777, sha256_hex),
             None => move_file_no_clobber(&stored, &original),
         };
         #[cfg(not(unix))]
@@ -988,9 +988,10 @@ pub struct QuarantinedFile {
 ///
 /// # Errors
 ///
-/// Propagates a failure reading the directory or a sidecar. A sidecar whose name
-/// is not a digest slot is not one of ours and is skipped. Existing entries are
-/// tightened on Unix when this command is used.
+/// Propagates a failure reading or securing the directory. A malformed or unreadable
+/// sidecar is warned about and skipped so one bad companion cannot hide other entries.
+/// A sidecar whose name is not a digest slot is not one of ours and is skipped. Existing
+/// entries are tightened on Unix when this command is used.
 pub fn list_quarantined(quarantine_dir: &Path) -> std::io::Result<Vec<QuarantinedFile>> {
     match std::fs::read_dir(quarantine_dir) {
         Ok(_) => {}
@@ -1017,11 +1018,35 @@ pub fn list_quarantined(quarantine_dir: &Path) -> std::io::Result<Vec<Quarantine
         if !stored.is_file() {
             continue;
         }
-        let sidecar = std::fs::read(&path)?;
+        let sidecar = match std::fs::read(&path) {
+            Ok(sidecar) => sidecar,
+            Err(error) => {
+                tracing::warn!(
+                    sidecar = %path.display(),
+                    %error,
+                    "ignoring unreadable quarantine sidecar"
+                );
+                continue;
+            }
+        };
         if sidecar.is_empty() {
+            tracing::warn!(
+                sidecar = %path.display(),
+                "ignoring empty quarantine sidecar"
+            );
             continue;
         }
-        let record = decode_origin_record(&sidecar)?;
+        let record = match decode_origin_record(&sidecar) {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::warn!(
+                    sidecar = %path.display(),
+                    %error,
+                    "ignoring invalid quarantine sidecar"
+                );
+                continue;
+            }
+        };
         found.push(QuarantinedFile {
             sha256_hex,
             original: record.original,
@@ -1582,6 +1607,25 @@ mod tests {
             0o400,
             "a legacy record has no mode to restore"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn altered_sidecar_cannot_restore_special_mode_bits() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = temp_dir("altered-mode-sidecar");
+        let (original, quarantine_dir, digest) =
+            quarantine_one(&dir, "payload.bin", b"mode tamper payload");
+        let sidecar = origin_sidecar_path(&quarantine_dir, &digest);
+        // Simulate a sidecar edit that asks restore to setuid, setgid, and sticky.
+        std::fs::write(&sidecar, encode_origin_record(&original, Some(0o7777))).unwrap();
+
+        let restored = unquarantine(&quarantine_dir, &digest).unwrap();
+
+        let mode = std::fs::metadata(restored).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o777, "only ordinary permission bits may be restored");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2455,6 +2499,29 @@ mod tests {
         ];
         expected.sort_by(|a, b| a.sha256_hex.cmp(&b.sha256_hex));
         assert_eq!(listed, expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn listing_skips_one_invalid_companion_and_keeps_valid_entries() {
+        let dir = temp_dir("list-invalid-sidecar");
+        let (_payload, quarantine_dir, digest) =
+            quarantine_one(&dir, "valid.bin", b"valid listed payload");
+        std::fs::write(
+            quarantine_dir.join(format!("{digest}.1")),
+            b"another payload",
+        )
+        .unwrap();
+        std::fs::write(
+            quarantine_dir.join(format!("{digest}.1.origin")),
+            b"\0synthaea-origin-v1\0\x01",
+        )
+        .unwrap();
+
+        let listed = list_quarantined(&quarantine_dir).unwrap();
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].sha256_hex, digest);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
