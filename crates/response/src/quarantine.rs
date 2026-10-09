@@ -18,7 +18,8 @@
 //! bounded, like the hash that precedes it, to the length the file had when it was opened, so a
 //! writer that keeps appending cannot make either grow or run without end, and a snapshot left
 //! by a killed agent is swept at the next quarantine (an in-flight one is protected by an
-//! advisory lock). Bytes appended after the open are not stored: the outcome is still
+//! advisory lock; on a filesystem without `flock`, such as some NFS and FUSE mounts, only a
+//! snapshot untouched for an hour is taken). Bytes appended after the open are not stored: the outcome is still
 //! `Quarantined`, with the digest of the prefix. A write is noticed from the size and the
 //! modification time, so one that keeps both (an overwrite within a single timestamp tick, a
 //! write through a shared mapping) can go unnoticed; this depends on the filesystem and was not
@@ -221,21 +222,61 @@ fn quarantine_snapshot(
 #[cfg(unix)]
 const SNAPSHOT_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a partial snapshot must have been left alone before a sweep may take it when the
+/// filesystem cannot lock files at all (some NFS and FUSE mounts): nothing then marks a
+/// snapshot in flight but its modification time, which the copy keeps fresh while it writes.
+#[cfg(unix)]
+const UNLOCKABLE_GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// What an attempt at the advisory lock of a snapshot found.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum SnapshotLock {
+    /// The lock was taken: no snapshot in flight holds this file.
+    Acquired,
+    /// Another descriptor holds it (or the answer is unclear): a snapshot may be in flight.
+    Held,
+    /// The filesystem does not support `flock`: the lock says nothing either way.
+    Unsupported,
+}
+
 /// Takes the advisory lock a snapshot holds while it is in flight, without waiting.
 #[cfg(unix)]
-fn try_lock_exclusive(file: &std::fs::File) -> bool {
+fn try_lock_exclusive(file: &std::fs::File) -> SnapshotLock {
     use std::os::fd::AsRawFd as _;
     // SAFETY: `flock` on a descriptor that stays open for the whole call; it retains nothing.
-    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return SnapshotLock::Acquired;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL) => {
+            SnapshotLock::Unsupported
+        }
+        _ => SnapshotLock::Held,
+    }
+}
+
+/// Whether a sweep may take a snapshot that is `age` old and whose lock attempt gave `lock`.
+/// Where locks work, the lock decides; where they do not, only a long silence does.
+#[cfg(unix)]
+fn may_take_snapshot(age: std::time::Duration, lock: &SnapshotLock) -> bool {
+    age >= SNAPSHOT_GRACE
+        && match lock {
+            SnapshotLock::Acquired => true,
+            SnapshotLock::Held => false,
+            SnapshotLock::Unsupported => age >= UNLOCKABLE_GRACE,
+        }
 }
 
 /// Removes the partial snapshots (`.incoming-<pid>-<n>`) that a process which was killed
 /// mid-copy left in `dir`. A snapshot in flight, of this process or of any other (a second
 /// agent, the CLI), holds an advisory lock on its file, so a file is taken only when the lock
 /// can be had and it is older than [`SNAPSHOT_GRACE`]. That does not depend on the pid, which
-/// is the same (1) for every process in a container. Best effort.
+/// is the same (1) for every process in a container. On a filesystem without `flock` a file
+/// is taken only after [`UNLOCKABLE_GRACE`] without a write. Best effort.
 #[cfg(unix)]
 fn sweep_stale_snapshots(dir: &Path) {
+    use std::os::unix::fs::OpenOptionsExt as _;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -252,16 +293,29 @@ fn sweep_stale_snapshots(dir: &Path) {
         {
             continue;
         }
-        let Ok(file) = std::fs::File::open(entry.path()) else {
+        // Like `Source::open`: never follow a link, never block on a FIFO. Only a regular file
+        // is a snapshot; anything else under that name is left alone.
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open(entry.path())
+        else {
             continue;
         };
-        let old_enough = file
-            .metadata()
-            .and_then(|m| m.modified())
+        let Ok(metadata) = file.metadata() else {
+            continue;
+        };
+        let Some(age) = metadata
+            .modified()
             .ok()
             .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age >= SNAPSHOT_GRACE);
-        if old_enough && try_lock_exclusive(&file) {
+            .filter(|_| metadata.is_file())
+        else {
+            continue;
+        };
+        // Only a file old enough is locked at all: a fresh one may not have been locked by its
+        // own snapshot yet, and taking the lock here would make that attempt fail.
+        if age >= SNAPSHOT_GRACE && may_take_snapshot(age, &try_lock_exclusive(&file)) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -430,6 +484,18 @@ impl Source {
     /// took the name. It cannot redirect what was stored, nor any `chmod` (#689).
     #[cfg(unix)]
     fn move_into_quarantine(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        self.move_into_quarantine_with(from, to, || {})
+    }
+
+    /// [`Self::move_into_quarantine`] with a hook that runs after the link or the copy and
+    /// before the check that follows them: the only way for a test to write in that window.
+    #[cfg(unix)]
+    fn move_into_quarantine_with(
+        &self,
+        from: &Path,
+        to: &Path,
+        after_store: impl FnOnce(),
+    ) -> std::io::Result<()> {
         if self.written_since_open()? {
             return Err(std::io::Error::other(WrittenAfterHash));
         }
@@ -446,6 +512,7 @@ impl Source {
             }
             Err(error) => return Err(error),
         };
+        after_store();
         // A write during the link or the copy: the digest may not be that of what is stored.
         // Undo and let the caller take a snapshot, which is hashed as it is copied.
         if self.written_since_open()? {
@@ -1803,7 +1870,7 @@ mod tests {
             backdate(path);
         }
         let lock = std::fs::File::open(&in_flight).unwrap();
-        assert!(try_lock_exclusive(&lock));
+        assert_eq!(try_lock_exclusive(&lock), SnapshotLock::Acquired);
 
         sweep_stale_snapshots(&dir);
 
@@ -1817,6 +1884,91 @@ mod tests {
         assert!(stored.exists());
         assert!(odd.exists(), "a name that is not ours is not touched");
         drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #713 follow-up: where `flock` does not work, only a long silence lets a sweep take a
+    /// snapshot; where it works, the lock decides.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_decision_depends_on_what_the_lock_can_tell() {
+        use std::time::Duration;
+        let secs = Duration::from_secs;
+        assert!(may_take_snapshot(secs(3600), &SnapshotLock::Acquired));
+        assert!(
+            !may_take_snapshot(secs(5), &SnapshotLock::Acquired),
+            "too fresh"
+        );
+        assert!(
+            !may_take_snapshot(secs(7200), &SnapshotLock::Held),
+            "in flight"
+        );
+        assert!(!may_take_snapshot(secs(60), &SnapshotLock::Unsupported));
+        assert!(may_take_snapshot(secs(3600), &SnapshotLock::Unsupported));
+    }
+
+    /// #713 follow-up: the sweep neither blocks on a FIFO nor follows a link under a snapshot
+    /// name, and leaves both alone.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_ignores_a_fifo_and_a_link_under_a_snapshot_name() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = temp_dir("sweep-odd-entries");
+        let fifo = dir.join(".incoming-1-1");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let target = dir.join("target");
+        std::fs::write(&target, b"x").unwrap();
+        backdate(&target);
+        let link = dir.join(".incoming-2-2");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let swept = dir.clone();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            sweep_stale_snapshots(&swept);
+            let _ = done.send(());
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the sweep must not block on a FIFO");
+
+        assert!(fifo.exists(), "not a regular file: left alone");
+        assert!(
+            link.symlink_metadata().is_ok(),
+            "a link is not followed or removed"
+        );
+        assert!(target.exists(), "what the link points at is untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #713 follow-up: a write between the link (or the copy) and the check that follows is
+    /// noticed, the stored name is undone and the source name is untouched, so that the caller
+    /// goes on to the snapshot.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_during_the_link_undoes_it_and_sends_the_caller_to_the_snapshot() {
+        use std::io::Write as _;
+        let dir = temp_dir("write-during-link");
+        let source = dir.join("payload");
+        let stored = dir.join("stored");
+        std::fs::write(&source, vec![1u8; 4096]).unwrap();
+        let opened = Source::open(&source).unwrap();
+
+        let error = opened
+            .move_into_quarantine_with(&source, &stored, || {
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&source)
+                    .unwrap();
+                file.write_all(b"more").unwrap();
+            })
+            .unwrap_err();
+
+        assert!(is_written_after_hash(&error));
+        assert!(!stored.exists(), "the link or copy is removed");
+        assert!(source.exists(), "the source name is not touched");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
