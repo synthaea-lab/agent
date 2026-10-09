@@ -1,0 +1,20 @@
+[package]
+name = "sensor-windows-minifilter"
+version = "0.1.0"
+description = "User-mode client of the SynthaeaFilter minifilter's communication port (#136)"
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_InstallableFileSystems",
+] }

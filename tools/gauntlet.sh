@@ -55,7 +55,7 @@ if [[ $FAST -eq 0 ]]; then
     # Only the Windows-gated crates: a full workspace pass needs a cross C
     # toolchain for ring (transport) that most dev machines lack; CI's native
     # windows-latest job covers the rest.
-    cargo clippy -p sensor-windows -p sensor-windows-eventlog -p sensor-windows-sockets --all-targets \
+    cargo clippy -p sensor-windows -p sensor-windows-eventlog -p sensor-windows-sockets -p sensor-windows-minifilter --all-targets \
         --target x86_64-pc-windows-msvc -- -D warnings
 
     step "docs, -D warnings, Linux view (what CI's lint job builds)"
