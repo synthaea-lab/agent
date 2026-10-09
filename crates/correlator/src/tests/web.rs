@@ -201,8 +201,20 @@ fn post_shell_request_is_selected_even_when_an_older_request_is_present() {
         "{}",
         web[0].message
     );
+    assert!(web[0].message.contains("1s after"), "{}", web[0].message);
     assert!(web[0].message.contains("/up/s.php"), "{}", web[0].message);
     assert!(!web[0].message.contains("/uploads/c99.php"));
+}
+
+#[test]
+fn a_request_after_the_grace_window_is_not_paired() {
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(shell_under("nginx", 902, 100 * SEC));
+    let late = engine.on_event(request(103 * SEC + 1));
+    let web = web_alerts(&late);
+    assert_eq!(web.len(), 1, "the late request arrived after expiry");
+    assert!(web[0].message.contains("no matching access-log request"));
+    assert!(!web[0].message.contains("/up/s.php"));
 }
 
 proptest! {
