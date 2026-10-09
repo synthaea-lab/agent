@@ -1,20 +1,32 @@
 //! Protected-resource monitoring (issue #71, capability 3): the agent watches its own
 //! on-disk footprint through the live event stream, and treats a write-intent open of
-//! one of those paths by any process other than itself as a high-severity detection —
-//! "any non-`updater` writer" per the issue, though no updater (#30) exists yet to name
-//! as the one legitimate exception, so today every foreign writer qualifies.
+//! one of those paths by any process other than itself as a high-severity detection.
 //!
 //! Scope is deliberately limited to paths this agent process can know for certain at
-//! its own runtime: its own executable (`std::env::current_exe`) plus the
-//! alerts/events/heartbeat files it was launched with. It does **not** cover the
-//! watchdog binary or the systemd unit/OpenRC install surface — those live in
-//! `watchdog`'s own path resolution (`watchdog/src/service/linux.rs`), and naming them
-//! here would mean either guessing the packaging layout or a cross-binary dependency,
-//! neither of which this pass takes on; `watchdog::tamper` (#103) already covers that
-//! surface from the install/supervise side. True deletion is also out of scope:
-//! `FileOpenEvent` only observes `open(2)`, so this catches a foreign write, truncate,
-//! or overwrite, not a foreign `rm`/`rename` — both gaps stay tracked by issue #71
-//! rather than being silently implied as covered.
+//! its own runtime: its own executable (`std::env::current_exe`), its config file
+//! (the path `config::discover` resolved at startup — the same file ADR-0013 makes
+//! the agent fail fast over if it's missing, so it is worth protecting even though
+//! operator-edited, not updater-managed), plus the alerts/events/heartbeat files it
+//! was launched with. It does **not** cover the watchdog binary or the systemd
+//! unit/OpenRC install surface — those live in `watchdog`'s own path resolution
+//! (`watchdog/src/service/linux.rs`), and naming them here would mean either guessing
+//! the packaging layout or a cross-binary dependency, neither of which this pass takes
+//! on; `watchdog::tamper` (#103) already covers that surface from the install/supervise
+//! side. True deletion is also out of scope: `FileOpenEvent` only observes `open(2)`,
+//! so this catches a foreign write, truncate, or overwrite, not a foreign `rm`/`rename`
+//! — both gaps stay tracked by issue #71 rather than being silently implied as covered.
+//!
+//! ## No `updater` allowlist (and why one line of #71 is stale)
+//!
+//! #71 originally called for treating `updater` as the one legitimate non-self writer
+//! of these paths, since no updater existed yet to name. #30 shipped it since, and
+//! turns out not to need the exception: `agent::release::cmd_apply_release` (ADR-0015)
+//! downloads and verifies a new release into its own `versions/<N>/` directory and only
+//! then swaps the `current` symlink — it never writes into the version directory the
+//! running process's `current_exe` already resolves to, and it does not touch the
+//! config file, alerts, events, or heartbeat paths at all (those are runtime/operator
+//! state, not release artifacts). So a real self-update never opens a path this module
+//! watches for write, and there is nothing today for an allowlist to legitimately admit.
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
@@ -31,10 +43,18 @@ use crate::sink::DetectionSink;
 /// Best-effort on the executable path: `current_exe` can fail (rare — e.g. the binary
 /// was unlinked out from under a running process), in which case the binary just isn't
 /// watched rather than failing agent startup over a self-protection nicety.
-pub(crate) fn protected_paths(alerts: &Path, events: Option<&Path>) -> Vec<PathBuf> {
+/// `config_path` is the path `config::discover` actually resolved at startup (not a
+/// recomputed guess) — passing it rather than re-deriving it here keeps this module
+/// agreeing with whichever of `--config`/`SYNTHAEA_CONFIG`/the OS default won.
+pub(crate) fn protected_paths(
+    alerts: &Path,
+    events: Option<&Path>,
+    config_path: &Path,
+) -> Vec<PathBuf> {
     let mut paths = vec![
         alerts.to_path_buf(),
         crate::heartbeat::heartbeat_path_for(alerts),
+        config_path.to_path_buf(),
     ];
     paths.extend(events.map(Path::to_path_buf));
     if let Ok(exe) = std::env::current_exe() {
@@ -126,14 +146,28 @@ mod tests {
     const O_WRONLY: u32 = 0o1;
     const O_RDONLY: u32 = 0o0;
 
+    fn config() -> &'static Path {
+        Path::new("/etc/synthaea/agent.toml")
+    }
+
     #[test]
     fn protected_paths_skip_the_events_file_when_there_is_none() {
         let alerts = std::path::Path::new("/var/log/synthaea/alerts.ndjson");
-        let without = protected_paths(alerts, None);
+        let without = protected_paths(alerts, None, config());
         assert!(without.iter().all(|p| !p.ends_with("events.jsonl")));
         assert!(without.contains(&alerts.to_path_buf()));
-        let with = protected_paths(alerts, Some(std::path::Path::new("/tmp/e")));
+        let with = protected_paths(alerts, Some(std::path::Path::new("/tmp/e")), config());
         assert!(with.contains(&std::path::PathBuf::from("/tmp/e")));
+    }
+
+    #[test]
+    fn protected_paths_includes_the_resolved_config_path() {
+        let alerts = std::path::Path::new("/var/log/synthaea/alerts.ndjson");
+        let paths = protected_paths(alerts, None, config());
+        assert!(
+            paths.contains(&config().to_path_buf()),
+            "the config path `config::discover` resolved must be watched too"
+        );
     }
 
     #[test]
@@ -169,7 +203,7 @@ mod tests {
 
         let guard = ProtectedResourceGuard::new(
             CountingSink(forwarded.clone()),
-            protected_paths(&alerts, Some(&events)),
+            protected_paths(&alerts, Some(&events), config()),
             sink,
         );
 
@@ -186,6 +220,48 @@ mod tests {
             "expected a T1562 alert, got: {written}"
         );
         assert!(written.contains("evil"));
+
+        let _ = std::fs::remove_dir_all(&alerts_dir);
+    }
+
+    #[test]
+    fn a_foreign_write_to_the_config_file_fires_an_alert() {
+        // The gap #71 explicitly flagged as uncovered: `agent.toml` is operator-edited,
+        // not updater-managed, but a foreign process rewriting it (disabling rules,
+        // pointing the agent at a rogue control plane) is exactly the kind of tamper
+        // this module exists to catch — same as the binary or alerts path.
+        let forwarded = Arc::new(AtomicUsize::new(0));
+        let alerts_dir =
+            std::env::temp_dir().join(format!("protected-test-config-{}", std::process::id()));
+        std::fs::create_dir_all(&alerts_dir).unwrap();
+        let alerts = alerts_dir.join("alerts.ndjson");
+        let events = alerts_dir.join("events.jsonl");
+        let sink = Arc::new(
+            DetectionSink::new(
+                rules::RuleState::new(),
+                &alerts,
+                Some(&events),
+                None,
+                None,
+                &alerts_dir.join("content"),
+                &alerts_dir.join("ml-registry"),
+            )
+            .unwrap(),
+        );
+
+        let guard = ProtectedResourceGuard::new(
+            CountingSink(forwarded.clone()),
+            protected_paths(&alerts, Some(&events), config()),
+            sink,
+        );
+
+        guard.on_event(open_event(9999, "evil", "agent.toml", O_WRONLY));
+
+        let written = std::fs::read_to_string(&alerts).unwrap();
+        assert!(
+            written.contains("T1562"),
+            "expected a T1562 alert for the config write, got: {written}"
+        );
 
         let _ = std::fs::remove_dir_all(&alerts_dir);
     }
@@ -213,7 +289,7 @@ mod tests {
 
         let guard = ProtectedResourceGuard::new(
             CountingSink(forwarded.clone()),
-            protected_paths(&alerts, Some(&events)),
+            protected_paths(&alerts, Some(&events), config()),
             sink,
         );
 
@@ -256,7 +332,7 @@ mod tests {
 
         let guard = ProtectedResourceGuard::new(
             CountingSink(forwarded.clone()),
-            protected_paths(&alerts, Some(&events)),
+            protected_paths(&alerts, Some(&events), config()),
             sink,
         );
 

@@ -222,6 +222,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         content_dir,
         log_sources,
         deception,
+        config_path,
     } = opts;
     // Kill-loudness (#71): must run before any other thread exists — the signal mask
     // set here is inherited by every thread spawned below, including `DetectionSink`'s
@@ -345,7 +346,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // Protected-resource monitoring (#71): only the eBPF sensor produces `FileOpen`
     // events, so only its chain needs the guard — the netlink/journal sinks above
     // never see one.
-    let protected = crate::protected::protected_paths(alerts, events);
+    let protected = crate::protected::protected_paths(alerts, events, config_path);
     let guarded = ProtectedResourceGuard::new(sink.clone(), protected, sink.clone());
     let result = sensor.run(Box::new(PulsingSink::new(guarded, primary_heartbeat)));
 
