@@ -312,6 +312,11 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // one that was actually shipped).
     crate::integrity::spawn_monitor(storage.state_dir.clone(), sink.clone());
 
+    // Diffed package inventory (#87): periodic dpkg-status diff, turned into a
+    // real case-attachable Detection through the normal sink path (not a
+    // local-only alert like the two monitors above).
+    crate::inventory::spawn_monitor(storage.state_dir.clone(), sink.clone());
+
     // Health beacon (#134): periodic self-diagnostics to the control plane, over
     // the silence monitor above.
     let health = super::common::health_collector(&pipeline, silence_monitor);

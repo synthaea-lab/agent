@@ -17,11 +17,12 @@ use schema::{
     HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent, KernelModuleAction,
     KernelModuleEvent, LdapSearchEvent, ListenPortEvent, MemfdCreateEvent, MountEvent,
     NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, POLICY_MECHANISM_SELINUX,
-    PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
-    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent, SessionState, ShellType,
-    SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketCreateEvent,
-    SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
-    UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
+    PackageChangeEvent, PackageChangeKind, PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent,
+    ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
+    SessionEvent, SessionState, ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent,
+    SocketBindEvent, SocketCreateEvent, SocketListenEvent, TccDecisionEvent, TlsCaptureEvent,
+    TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
+    XpcConnectEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -1508,6 +1509,31 @@ fn socket_create_golden() {
 }
 
 #[test]
+fn package_change_upgraded_golden() {
+    // v43 (#87): a diffed inventory snapshot, not a kernel event — pid/ppid 0 and
+    // comm names the package manager, same convention as `HttpRequestEvent`.
+    assert_golden(
+        &Event::PackageChange(PackageChangeEvent {
+            meta: EventMeta {
+                pid: 0,
+                ppid: 0,
+                user: User::Unknown,
+                timestamp_ns: 1_756_900_020_000_000_000,
+                comm: "dpkg".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            package: "openssl".into(),
+            change: PackageChangeKind::Upgraded,
+            previous_version: Some("3.0.13-1".into()),
+            version: Some("3.0.15-1".into()),
+        }),
+        "package_change_upgraded",
+    );
+}
+
+#[test]
 fn policy_denial_golden() {
     // v23 (#297): a SELinux AVC denial — httpd blocked (enforcing mode) from
     // reading a file labeled for a user's home directory, the classic
@@ -2313,6 +2339,13 @@ fn meta_accessor_covers_all_variants() {
             socket_type: 1,
             protocol: 6,
             fd: 0,
+        }),
+        Event::PackageChange(PackageChangeEvent {
+            meta: meta.clone(),
+            package: "x".into(),
+            change: PackageChangeKind::Added,
+            previous_version: None,
+            version: Some("1".into()),
         }),
     ];
     for e in &events {

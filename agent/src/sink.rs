@@ -1520,6 +1520,9 @@ impl EventSink for DetectionSink {
                 self.record_rule_alerts(&event, rules::evaluate_defender_event(e));
             }
             Event::LdapSearch(e) => self.detect_ldap_search(&event, e),
+            Event::PackageChange(e) => {
+                self.record_rule_alerts(&event, rules::evaluate_package_change(e));
+            }
             // New telemetry categories reach the engines as they land; until a rule
             // consumes them, logging below is the whole treatment.
             _ => {}

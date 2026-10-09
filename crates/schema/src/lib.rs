@@ -263,7 +263,12 @@ pub mod time;
 /// Closes the last gap in #263's telemetry proposal besides the netlink
 /// socket-table baseline (a separate, periodic-snapshot source, not a
 /// discrete syscall trace like the rest of this file).
-pub const SCHEMA_VERSION: u32 = 42;
+///
+/// Bumped 42 → 43 for [`Event::PackageChange`] (#87): a package was added,
+/// removed, or changed version since the agent's last diffed inventory
+/// snapshot — the walking-skeleton slice of the asset inventory, packages
+/// only, Linux only.
+pub const SCHEMA_VERSION: u32 = 43;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -2031,6 +2036,34 @@ pub struct HttpSummaryEvent {
     pub top_clients: Vec<HttpClientCount>,
 }
 
+/// What happened to a package between two inventory snapshots (`crates/inventory`'s
+/// pure diff, issue #87). `Upgraded` carries both versions so a case shows the actual
+/// transition, not just "something changed".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageChangeKind {
+    Added,
+    Removed,
+    Upgraded,
+}
+
+/// A package was added, removed, or changed version since the agent's last inventory
+/// snapshot (issue #87). Not a kernel event: the diff runs periodically against the
+/// package manager's own database (`dpkg`/`rpm`/...), so `meta.pid`/`ppid` are 0 and
+/// `meta.comm` names the package manager, same convention as [`HttpRequestEvent`].
+/// `previous_version`/`version` are `None` exactly when [`Self::change`] is
+/// `Removed`/`Added` respectively — both `Some` only for `Upgraded`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageChangeEvent {
+    pub meta: EventMeta,
+    pub package: String,
+    pub change: PackageChangeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
 /// Which user/group identity syscall produced an [`IdentityChangeEvent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2174,6 +2207,7 @@ pub enum Event {
     Prctl(PrctlEvent),
     HttpRequest(HttpRequestEvent),
     HttpSummary(HttpSummaryEvent),
+    PackageChange(PackageChangeEvent),
 }
 
 impl Event {
@@ -2236,6 +2270,7 @@ impl Event {
             Event::Prctl(e) => &e.meta,
             Event::HttpRequest(e) => &e.meta,
             Event::HttpSummary(e) => &e.meta,
+            Event::PackageChange(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.

@@ -28,6 +28,7 @@ yara = { path = "../crates/yara" }
 deception = { path = "../crates/deception" }
 sinks = { path = "../crates/sinks" }
 tamper = { path = "../crates/tamper" }
+inventory = { path = "../crates/inventory" }
 response = { path = "../crates/response" }
 store = { path = "../crates/store" }
 transport = { path = "../crates/transport" }
