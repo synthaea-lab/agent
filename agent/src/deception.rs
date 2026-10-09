@@ -131,13 +131,18 @@ pub(crate) struct CanaryAllow {
     /// (`/usr/bin/updatedb`) is reported as written, not resolved.
     as_written: Vec<PathBuf>,
     resolve: fn(u32) -> Option<PathBuf>,
+    /// Whether `pid` is positively in another mount namespace than the agent. Unreadable is
+    /// not foreign: that is the "`/proc` says nothing" case, which the exec table may decide.
+    foreign_mount_ns: fn(u32) -> bool,
 }
 
 impl CanaryAllow {
     /// The allow-list of `config`; an entry outside a trusted system location is dropped
     /// with a warning rather than honoured.
     pub(crate) fn new(config: &config::DeceptionConfig) -> Self {
-        Self::with_resolver(config, proc_exe)
+        let mut allow = Self::with_resolver(config, proc_exe);
+        allow.foreign_mount_ns = in_foreign_mount_namespace;
+        allow
     }
 
     fn with_resolver(
@@ -176,6 +181,7 @@ impl CanaryAllow {
             exes,
             as_written,
             resolve,
+            foreign_mount_ns: |_| false,
         }
     }
 
@@ -185,6 +191,7 @@ impl CanaryAllow {
             exes: vec![PathBuf::from(exe)],
             as_written: vec![PathBuf::from(exe)],
             resolve,
+            foreign_mount_ns: |_| false,
         }
     }
 
@@ -201,27 +208,33 @@ impl CanaryAllow {
         if self.exes.is_empty() {
             return false;
         }
-        match seen {
+        if let Some(image) = seen {
+            // A path string is only as good as the namespace that resolved it: a process that is
+            // positively in another mount namespace may have bind-mounted its own binary over a
+            // listed one, so the table's `bprm->filename` proves nothing about it. (Unreadable
+            // is not foreign: see `foreign_mount_ns`.)
+            if image.in_container || (self.foreign_mount_ns)(pid) {
+                return false;
+            }
             // The table is the image of the last `Exec` the agent recorded for this incarnation.
             // The generation is stamped at fork, not at exec, so it cannot tell that the process
             // exec'd again and that event was shed or arrived late. `/proc`, where the agent can
             // read it, shows the image now: if it names something else the entry is stale and
-            // the process is not allowed. Where `/proc` says nothing (no ptrace access, another
-            // mount namespace) the table decides alone, and that residue is documented.
-            // The string checks go first: a process the table already rejects costs no read.
-            Some(image) => {
-                if image.in_container || !self.matches_image(&image.path) {
-                    return false;
-                }
-                match (self.resolve)(pid) {
+            // the process is not allowed. Where `/proc` says nothing (no ptrace access) the
+            // table decides alone, and that residue is documented.
+            // The string checks go first. A name the table does not list is not a refusal: the
+            // exec may have gone through a link (`/bin/updatedb` under usrmerge, a `PATH` lookup)
+            // that `/proc` canonicalises, so that process takes the `/proc` route below.
+            if self.matches_image(&image.path) {
+                return match (self.resolve)(pid) {
                     None => true,
                     Some(exe) => {
                         self.exes.contains(&exe) || is_interpreter_of(&exe, Path::new(&image.path))
                     }
-                }
+                };
             }
-            None => (self.resolve)(pid).is_some_and(|exe| self.exes.contains(&exe)),
         }
+        (self.resolve)(pid).is_some_and(|exe| self.exes.contains(&exe))
     }
 
     /// An absolute image equal to an entry, resolved or as written. A relative exec
@@ -239,8 +252,8 @@ impl CanaryAllow {
 /// never the script: without this a listed script would be refused whenever `/proc` is
 /// readable and allowed whenever it is not. An `env` shebang (`#!/usr/bin/env python3`) names
 /// `env` while `/proc` shows the program `env` found, so the interpreter cannot be told from
-/// the file and `/proc` does not contradict the table. A file that is not a script, or cannot
-/// be read, never excuses a difference.
+/// the file: it is accepted when that program is in a trusted system location. A file that is
+/// not a script, or cannot be read, never excuses a difference.
 fn is_interpreter_of(exe: &Path, image: &Path) -> bool {
     use std::io::Read as _;
     let mut head = [0u8; 256];
@@ -258,7 +271,12 @@ fn is_interpreter_of(exe: &Path, image: &Path) -> bool {
     let Some(interpreter) = line.split_whitespace().next().map(Path::new) else {
         return false;
     };
-    interpreter.file_name().is_some_and(|name| name == "env") || canonical_entry(interpreter) == exe
+    // `/proc` is readable here, so an `env` shebang is excused only when the program `env` found
+    // (through the process's own `PATH`) sits in a trusted location: a user who runs the script
+    // with `PATH=/tmp/x:$PATH` must not get their own interpreter allowed.
+    (interpreter.file_name().is_some_and(|name| name == "env")
+        && policy::name_exclusion_applies(exe.to_str()))
+        || canonical_entry(interpreter) == exe
 }
 
 /// Whether an image path from a sensor names an absolute location. Decided on the string, not
@@ -289,6 +307,23 @@ fn canonical_entry(exe: &Path) -> PathBuf {
 #[cfg(target_os = "linux")]
 fn mount_namespace(pid: impl std::fmt::Display) -> Option<PathBuf> {
     fs::read_link(format!("/proc/{pid}/ns/mnt")).ok()
+}
+
+/// Whether `pid` is positively in a different mount namespace than the agent. Both links
+/// must be readable to say so; where either is not (no ptrace access) this is `false`.
+fn in_foreign_mount_namespace(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        matches!(
+            (mount_namespace(pid), mount_namespace("self")),
+            (Some(theirs), Some(ours)) if theirs != ours
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 /// The executable behind `pid`, as a path the agent can compare with its allow-list. Linux
@@ -827,14 +862,13 @@ mod tests {
     }
 
     #[test]
-    fn the_exec_table_overrides_what_proc_would_say() {
+    fn an_exec_name_the_list_does_not_hold_is_judged_by_what_proc_shows() {
+        // The table names `/tmp/encryptor`, which no entry matches, so it cannot vouch for the
+        // process; `/proc` shows a listed binary, as on `main`, and decides.
         let mut seen = images(&[exec_of(10, Some(1), "/tmp/encryptor", false)]);
         let allow =
             CanaryAllow::for_test("/usr/bin/updatedb", |_| Some("/usr/bin/updatedb".into()));
-        assert!(
-            !allow.allows(10, seen.image_of(10, Some(1)).as_ref()),
-            "the image the agent saw wins"
-        );
+        assert!(allow.allows(10, seen.image_of(10, Some(1)).as_ref()));
     }
 
     #[test]
@@ -882,11 +916,58 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn an_env_shebang_script_is_decided_by_the_table_because_proc_cannot_contradict_it() {
+    fn an_env_shebang_script_is_allowed_when_proc_shows_a_trusted_interpreter() {
         let (_dir, script) = listed_script("#!/usr/bin/env python3");
         let mut seen = images(&[exec_of(10, Some(1), &script, false)]);
         let allow = CanaryAllow::for_test(&script, |_| Some("/usr/bin/python3.12".into()));
         assert!(allow.allows(10, seen.image_of(10, Some(1)).as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_env_shebang_script_is_not_allowed_when_path_made_env_find_an_untrusted_interpreter() {
+        // `PATH=/tmp/x:$PATH ./backup.sh` with their own `/tmp/x/python3`: `/proc` is readable
+        // and names the program `env` found, which no trusted location holds.
+        let (_dir, script) = listed_script("#!/usr/bin/env python3");
+        let mut seen = images(&[exec_of(10, Some(1), &script, false)]);
+        let allow = CanaryAllow::for_test(&script, |_| Some("/tmp/x/python3".into()));
+        assert!(!allow.allows(10, seen.image_of(10, Some(1)).as_ref()));
+    }
+
+    #[test]
+    fn a_process_in_another_mount_namespace_is_not_allowed_by_the_exec_table_alone() {
+        // `unshare -Urm` and a bind mount over a listed binary: the exec reports exactly the
+        // listed string and `/proc` cannot be resolved, but the namespace is positively foreign.
+        let mut seen = images(&[exec_of(10, Some(1), "/usr/bin/updatedb", false)]);
+        let mut allow = table_only("/usr/bin/updatedb");
+        allow.foreign_mount_ns = |_| true;
+        assert!(!allow.allows(10, seen.image_of(10, Some(1)).as_ref()));
+    }
+
+    #[test]
+    fn a_process_exec_through_another_name_for_a_listed_binary_is_allowed_by_proc() {
+        // Exec'd as `/bin/updatedb` (usrmerge, a `PATH` lookup) while the list holds
+        // `/usr/bin/updatedb`: the string check fails, `/proc` canonicalises it and decides.
+        let mut seen = images(&[exec_of(10, Some(1), "/bin/updatedb", false)]);
+        let allow =
+            CanaryAllow::for_test("/usr/bin/updatedb", |_| Some("/usr/bin/updatedb".into()));
+        assert!(allow.allows(10, seen.image_of(10, Some(1)).as_ref()));
+    }
+
+    #[test]
+    fn a_process_exec_through_an_unlisted_name_stays_denied_when_proc_agrees() {
+        let mut seen = images(&[exec_of(10, Some(1), "/tmp/encryptor", false)]);
+        let allow = CanaryAllow::for_test("/usr/bin/updatedb", |_| Some("/tmp/encryptor".into()));
+        assert!(!allow.allows(10, seen.image_of(10, Some(1)).as_ref()));
+    }
+
+    #[test]
+    fn a_deleted_listed_binary_is_denied_even_though_the_table_names_it() {
+        let mut seen = images(&[exec_of(10, Some(1), "/usr/bin/updatedb", false)]);
+        let allow = CanaryAllow::for_test("/usr/bin/updatedb", |_| {
+            Some("/usr/bin/updatedb (deleted)".into())
+        });
+        assert!(!allow.allows(10, seen.image_of(10, Some(1)).as_ref()));
     }
 
     #[cfg(unix)]
@@ -1032,6 +1113,7 @@ mod tests {
                 exes: vec![canonical],
                 as_written: vec![link],
                 resolve: |_| None,
+                foreign_mount_ns: |_| false,
             };
             let mut seen = images(&[exec_of(10, Some(1), &as_exec, false)]);
             assert!(allow.allows(10, seen.image_of(10, Some(1)).as_ref()));
