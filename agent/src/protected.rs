@@ -46,21 +46,42 @@ use crate::sink::DetectionSink;
 /// `config_path` is the path `config::discover` actually resolved at startup (not a
 /// recomputed guess) — passing it rather than re-deriving it here keeps this module
 /// agreeing with whichever of `--config`/`SYNTHAEA_CONFIG`/the OS default won.
+///
+/// Every path is made absolute here (via [`absolute_or_given`]) before it is
+/// returned, whatever form the caller passed in. `matches_protected` below is a
+/// path-*suffix* comparison against the absolute path a real `FileOpenEvent`
+/// reports, so a still-relative protected path (`--config agent.toml`, `--alerts
+/// alerts.ndjson` from a non-default working directory) would never match
+/// anything and leave that resource silently unwatched — a real finding from
+/// PR #770's review, caught on `config_path` specifically but just as true of
+/// `alerts`/`events`, which is why the fix sits here rather than on one caller.
 pub(crate) fn protected_paths(
     alerts: &Path,
     events: Option<&Path>,
     config_path: &Path,
 ) -> Vec<PathBuf> {
     let mut paths = vec![
-        alerts.to_path_buf(),
-        crate::heartbeat::heartbeat_path_for(alerts),
-        config_path.to_path_buf(),
+        absolute_or_given(alerts),
+        absolute_or_given(&crate::heartbeat::heartbeat_path_for(alerts)),
+        absolute_or_given(config_path),
     ];
-    paths.extend(events.map(Path::to_path_buf));
+    paths.extend(events.map(absolute_or_given));
     if let Ok(exe) = std::env::current_exe() {
+        // Already absolute by construction (the OS resolves it to a real path,
+        // never the argv0 fragment a shell found via `$PATH`) — no second pass.
         paths.push(exe);
     }
     paths
+}
+
+/// `std::path::absolute(path)` resolved against the current directory, falling
+/// back to `path` unchanged on the rare failure (an invalid path on this
+/// platform, or `getcwd` itself failing) rather than dropping the path from
+/// coverage entirely. Unlike `canonicalize`, this never touches the filesystem
+/// and does not require the path to exist yet — true at startup for `alerts`/
+/// `events`, which the agent itself creates.
+fn absolute_or_given(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Wraps an inner [`EventSink`]: every event is forwarded unchanged, but a
@@ -150,14 +171,22 @@ mod tests {
         Path::new("/etc/synthaea/agent.toml")
     }
 
+    /// Resolves `p` the same way `protected_paths` now does internally, so a test
+    /// comparing its output against a literal does not depend on this platform's
+    /// absolute-path spelling (`/var/...` resolves differently on Windows than on
+    /// Linux once `std::path::absolute` runs it through the current directory).
+    fn abs(p: &str) -> PathBuf {
+        std::path::absolute(p).unwrap()
+    }
+
     #[test]
     fn protected_paths_skip_the_events_file_when_there_is_none() {
         let alerts = std::path::Path::new("/var/log/synthaea/alerts.ndjson");
         let without = protected_paths(alerts, None, config());
         assert!(without.iter().all(|p| !p.ends_with("events.jsonl")));
-        assert!(without.contains(&alerts.to_path_buf()));
+        assert!(without.contains(&abs("/var/log/synthaea/alerts.ndjson")));
         let with = protected_paths(alerts, Some(std::path::Path::new("/tmp/e")), config());
-        assert!(with.contains(&std::path::PathBuf::from("/tmp/e")));
+        assert!(with.contains(&abs("/tmp/e")));
     }
 
     #[test]
@@ -165,9 +194,46 @@ mod tests {
         let alerts = std::path::Path::new("/var/log/synthaea/alerts.ndjson");
         let paths = protected_paths(alerts, None, config());
         assert!(
-            paths.contains(&config().to_path_buf()),
+            paths.contains(&abs("/etc/synthaea/agent.toml")),
             "the config path `config::discover` resolved must be watched too"
         );
+    }
+
+    #[test]
+    fn a_relative_config_path_is_still_watched() {
+        // PR #770's review: `matches_protected` is a suffix comparison against an
+        // *absolute* path a real `FileOpenEvent` reports, so a still-relative
+        // `--config agent.toml` used to leave the config unwatched no matter what
+        // actually opened it. `protected_paths` must resolve it before returning.
+        let alerts = Path::new("/var/log/synthaea/alerts.ndjson");
+        let relative = Path::new("agent.toml");
+        let paths = protected_paths(alerts, None, relative);
+        assert!(
+            paths.iter().all(|p| p.is_absolute()),
+            "every protected path must be absolute: {paths:?}"
+        );
+        let resolved = std::path::absolute(relative).unwrap();
+        let observed = resolved.to_str().unwrap();
+        assert!(
+            paths.iter().any(|p| matches_protected(p, observed)),
+            "a relative --config must still match the absolute path a real open reports: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn matches_protected_needs_both_sides_resolved_the_same_way() {
+        // Pins why `a_relative_config_path_is_still_watched` above matters: this
+        // is not a bug in `matches_protected` itself (it is documented as a
+        // suffix match), but a trap for any caller — `protected_paths`, not this
+        // function — that does not make its protected paths absolute first.
+        assert!(!matches_protected(
+            Path::new("agent.toml"),
+            "/home/u/agent.toml"
+        ));
+        assert!(matches_protected(
+            Path::new("/etc/synthaea/agent.toml"),
+            "/etc/synthaea/agent.toml"
+        ));
     }
 
     #[test]

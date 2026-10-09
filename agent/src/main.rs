@@ -331,6 +331,9 @@ fn try_main() -> anyhow::Result<std::process::ExitCode> {
     // (a pure, side-effect-free recomputation — `config::discover`'s own doc) so
     // `protected::protected_paths` (#71) watches the exact file that was actually
     // read, not a guessed default that could disagree with `--config`/`SYNTHAEA_CONFIG`.
+    // `protected_paths` makes it (and `--alerts`/`--events`) absolute itself —
+    // see that function's doc for why a relative path here would otherwise end up
+    // silently unwatched.
     let config_path = config::discover(cli.config.as_deref())?.path;
 
     // Init the logger with the level from the config file. `cfg.log.level` is
