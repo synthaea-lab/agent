@@ -94,6 +94,11 @@ impl ParentImages {
 
     fn record(&mut self, pid: u32, generation: u64, image: String) {
         if image.is_empty() {
+            // An exec we saw but could not read the image of. The generation is stamped
+            // at fork and survives exec, so the previous entry would keep matching and
+            // hand its children the image from before this exec: wrong, where unknown
+            // is the contract. Forget it.
+            self.entries.remove(&pid);
             return;
         }
         self.tick += 1;
@@ -174,6 +179,21 @@ mod tests {
         let mut child = exec(200, 9, 100, 7, "/usr/bin/id");
         cache.annotate(&mut child);
         assert_eq!(child.parent_image_path.as_deref(), Some("/usr/bin/python3"));
+    }
+
+    #[test]
+    fn an_exec_whose_image_could_not_be_read_makes_the_parent_unknown_not_stale() {
+        let mut cache = ParentImages::new(8);
+        cache.annotate(&mut exec(100, 7, 1, 1, "/usr/bin/bash"));
+        // bash exec'd again, and the probe could not copy the filename: same pid, same
+        // generation (exec does not change it), empty image.
+        cache.annotate(&mut exec(100, 7, 1, 1, ""));
+        let mut child = exec(200, 9, 100, 7, "/usr/bin/id");
+        cache.annotate(&mut child);
+        assert_eq!(
+            child.parent_image_path, None,
+            "the child must not be told its parent is still /usr/bin/bash"
+        );
     }
 
     #[test]
