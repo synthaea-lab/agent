@@ -59,15 +59,26 @@ impl SigmaEngine {
     /// constructs this engine rejects at validation.
     pub fn load_rule(path: &Path) -> Result<SigmaRule, SigmaError> {
         let display = path.display().to_string();
+        let too_large = std::fs::metadata(path)
+            .map(|meta| meta.len() > MAX_RULE_FILE_BYTES)
+            .unwrap_or(false);
+        if too_large {
+            return Err(SigmaError::Io {
+                path: display,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("rule file larger than {MAX_RULE_FILE_BYTES} bytes"),
+                ),
+            });
+        }
         let content = std::fs::read_to_string(path).map_err(|source| SigmaError::Io {
             path: display.clone(),
             source,
         })?;
-        let rule: SigmaRule =
-            serde_yaml::from_str(&content).map_err(|source| SigmaError::Yaml {
-                path: display.clone(),
-                source,
-            })?;
+        let rule = parse_rule_yaml(&content).map_err(|error| SigmaError::Yaml {
+            path: display.clone(),
+            message: describe_yaml_error(&error),
+        })?;
         validate(&rule, &display)?;
         Ok(rule)
     }
@@ -94,5 +105,65 @@ impl SigmaEngine {
     #[must_use]
     pub fn rule_titles(&self) -> Vec<&str> {
         self.rules.iter().map(|r| r.title.as_str()).collect()
+    }
+}
+
+/// A rule is a few dozen lines; anything near this is not one. Checked before the file is read.
+const MAX_RULE_FILE_BYTES: u64 = 1024 * 1024;
+
+/// The one place a rule's YAML text becomes a [`SigmaRule`] (the loader and the tests both
+/// go through it, so a test exercises the parser settings the engine really runs with).
+///
+/// The parser is `serde-saphyr`, safe Rust, which replaced `serde_yaml` (and its
+/// `unsafe-libyaml`, archived: RUSTSEC-2024-0449, #790). Rule files ship as signed content to
+/// every agent and what the parser accepts is part of what a rule means, so **every option that
+/// could change it is set explicitly**: a default that moves in a later release must not change
+/// what a rule means. What they do, from a differential run over the shipped rules and a corpus
+/// of edge cases (every shipped rule parsed identically):
+/// - duplicate keys are an error (a second `selection:` used to win silently, which let a rule
+///   be weakened without a trace), and so are merge keys (`<<`) and any tag the parser does not
+///   recognise (a tag on a key is part of its identity for the duplicate check, so it could hide a
+///   duplicate `selection`);
+/// - a `!!binary` value stays the literal text it shows (`ignore_binary_tag_for_string`), as under
+///   the old parser, instead of being base64-decoded into a value a reviewer cannot read;
+/// - only the exact literals `true` and `false` are booleans (`strict_booleans`): an unquoted
+///   `yes`, `no`, `on`, `off` or `y` stays the string it looks like. (Numbers such as `017`, `08`
+///   or `1_000` were strings before and are integers now: such a rule is refused at load, loudly.)
+/// - the budget is sized for a rule, not for a configuration file: a few thousand nodes, a
+///   shallow depth and almost no aliases, with the parser's own defaults far looser;
+/// - errors carry no source snippet, so a log line stays one line and does not hint at weakening
+///   the duplicate-key policy.
+pub(crate) fn parse_rule_yaml(content: &str) -> Result<SigmaRule, serde_saphyr::Error> {
+    use serde_saphyr::options::{DuplicateKeyPolicy, MergeKeyPolicy};
+    // `Options` and `Budget` are non-exhaustive, hence the macros.
+    let options = serde_saphyr::options! {
+        strict_booleans: true,
+        duplicate_keys: DuplicateKeyPolicy::Error,
+        merge_keys: MergeKeyPolicy::Error,
+        reject_unsupported_tags: true,
+        ignore_binary_tag_for_string: true,
+        with_snippet: false,
+        budget: serde_saphyr::budget! {
+            max_events: 100_000,
+            max_nodes: 20_000,
+            max_depth: 16,
+            max_aliases: 100,
+            max_anchors: 100,
+            max_total_scalar_bytes: 1024 * 1024,
+        },
+    };
+    serde_saphyr::from_str_with_options(content, options)
+}
+
+/// The parser's message with the hints it adds for its own library users removed: a duplicate
+/// key error ends with "set `DuplicateKeyPolicy` in `Options` if acceptable", which in a log line
+/// next to a rule file reads as advice to weaken the policy. Kept on one line.
+fn describe_yaml_error(error: &serde_saphyr::Error) -> String {
+    let text = error.to_string().replace('\n', " ");
+    match (text.find(", set "), text.find(" at line")) {
+        (Some(hint), Some(end)) if hint < end && text[hint..end].contains("Options") => {
+            format!("{}{}", &text[..hint], &text[end..])
+        }
+        _ => text,
     }
 }
