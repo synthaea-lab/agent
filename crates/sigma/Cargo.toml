@@ -12,7 +12,7 @@ workspace = true
 [dependencies]
 schema = { path = "../schema" }
 serde = { workspace = true }
-serde-saphyr = "1.3"
+serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

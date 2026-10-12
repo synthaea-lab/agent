@@ -17,12 +17,11 @@ pub enum SigmaError {
         path: String,
         source: std::io::Error,
     },
-    #[error("invalid YAML in {path}: {source}")]
+    #[error("invalid YAML in {path}: {message}")]
     Yaml {
         path: String,
-        // Boxed: the parser's error is over 130 bytes, which would make every `Result` in
-        // this crate that large (clippy::result_large_err).
-        source: Box<serde_saphyr::Error>,
+        /// The parser's message on one line: see `engine::describe_yaml_error`.
+        message: String,
     },
     #[error("unsupported Sigma construct in {path}: {what}")]
     Unsupported { path: String, what: String },
@@ -136,6 +135,17 @@ fn validate_field_map(
             path,
             "empty selection (would match everything)".into(),
         ));
+    }
+    // Two keys that differ only by case are different keys to the parser, and evaluation ANDs
+    // them: a selection could be made never to fire, or a field silently doubled.
+    let mut seen = std::collections::HashSet::new();
+    for spec in fields.keys() {
+        if !seen.insert(spec.to_lowercase()) {
+            return Err(unsupported(
+                path,
+                format!("field `{spec}` appears twice, differing only by case"),
+            ));
+        }
     }
     for (spec, values) in fields {
         let (field, modifier) = parse_field_spec(spec);
