@@ -79,6 +79,8 @@ impl ConnectError {
     }
 }
 
+pub mod wire;
+
 #[cfg(windows)]
 mod port;
 #[cfg(windows)]
