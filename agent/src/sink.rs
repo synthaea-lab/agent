@@ -2048,11 +2048,17 @@ rule response_marker {
     }
 
     #[test]
-    fn the_agents_own_pid_touching_a_canary_is_not_a_detection() {
+    fn planting_canary_mtime_does_not_trip_the_agent_or_hide_a_real_touch() {
         let dir = tmp("canary-own-pid");
         let (sink, canary) = sink_watching_canary(&dir);
+        let modified = std::fs::metadata(&canary).unwrap().modified().unwrap();
+        assert!(modified < std::time::SystemTime::now());
+
         sink.on_event(open_event(&canary, std::process::id()));
         assert!(!alerts_in(&dir).contains("canary file touched"));
+
+        sink.on_event(open_event(&canary, std::process::id() + 1));
+        assert!(alerts_in(&dir).contains("canary file touched"));
     }
 
     #[test]

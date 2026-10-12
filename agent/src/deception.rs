@@ -527,6 +527,7 @@ fn decoy_hashes_on_disk(canaries: &[deception::Canary], present: &[PathBuf]) -> 
                 path: canary.path.clone(),
                 kind: canary.kind,
                 content,
+                mtime_seed: canary.mtime_seed,
             })
         })
         .collect();
@@ -655,6 +656,14 @@ fn plant_each_directory(canaries: &[deception::Canary], inventory: &Path) -> Vec
                     skipped = report.skipped.len(),
                     "deception: canaries planted"
                 );
+                if !report.planted.is_empty() || !report.unchanged.is_empty() {
+                    tracing::warn!(
+                        dir = %dir.display(),
+                        unmatched = "owner, mode",
+                        "deception: canary owner and mode remain the agent defaults; matching \
+                         these fields is not implemented"
+                    );
+                }
                 present.extend(report.planted);
                 present.extend(report.unchanged);
             }
