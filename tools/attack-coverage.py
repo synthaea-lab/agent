@@ -113,6 +113,11 @@ TACTIC_ORDER = [
 # The one hand-maintained table (see module docstring). Extend when a genuinely
 # new technique family is tagged in source.
 TECHNIQUE_TACTIC = {
+    "T1003.001": "Credential Access",
+    "T1003.002": "Credential Access",
+    "T1003.003": "Credential Access",
+    "T1003.004": "Credential Access",
+    "T1003.008": "Credential Access",
     "T1189": "Initial Access",
     "T1190": "Initial Access",
     "T1027": "Defense Evasion",
