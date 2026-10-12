@@ -10,8 +10,8 @@ use std::{
 use schema::{
     AuthEvent, AuthOutcome, ConnectEvent, Event, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
     FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRenameEvent, FileWriteEvent,
-    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, PolicyDenialEvent, SessionEvent,
-    User, detection::Severity,
+    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, POLICY_MECHANISM_SELINUX,
+    PolicyDenialEvent, SessionEvent, User, detection::Severity,
 };
 use store::BoundedMap;
 
@@ -162,13 +162,24 @@ pub struct RuleState {
     /// (mechanism, subject context, object context, object class) → seen, for
     /// POLICY-DENIAL-DRIFT (issue #774, T1562-adjacent). Same "first new shape
     /// wins, the routine repeat doesn't" principle as `known_listeners` above:
-    /// a `SELinux`-Enforcing or AppLocker/WDAC-managed host denies constantly as
-    /// part of normal operation, so alerting on every `PolicyDenial` would be
-    /// unusable — a *new* (subject, object, class) triple appearing is the
-    /// signal. No startup-baseline seeding (unlike listeners, there's no
-    /// enumerable "current state" of past denials to snapshot at agent start) —
-    /// the first run is cold by design. LRU-bounded like every other stateful
+    /// a `SELinux`-Enforcing host denies constantly as part of normal
+    /// operation, so alerting on every `PolicyDenial` would be unusable — a
+    /// *new* (subject, object, class) triple appearing is the signal. No
+    /// startup-baseline seeding (unlike listeners, there's no enumerable
+    /// "current state" of past denials to snapshot at agent start) — the
+    /// first run is cold by design. LRU-bounded like every other stateful
     /// rule.
+    ///
+    /// `SELinux` only (`check_policy_denial_drift` gates on
+    /// [`POLICY_MECHANISM_SELINUX`]): `scontext`/`tcontext` give each denial a
+    /// rich, domain-specific triple. AppLocker/WDAC `PolicyDenialEvent`s carry
+    /// no subject/object context at all (`None`/`None`), so their "shape"
+    /// would collapse to `object_class` alone — 5 values for `AppLocker`
+    /// (`EXE`/`DLL`/`MSI`/`SCRIPT`/`APPX`), 2 for WDAC — meaning the *first*
+    /// blocked `.exe` ever seen would alert and every distinct one after it,
+    /// forever, would not. Needs a richer per-mechanism key (likely
+    /// `object_path`) before it's worth extending; tracked as a follow-up,
+    /// not done here.
     known_policy_denials: BoundedMap<PolicyDenialKey, ()>,
     /// (target user, source) → sliding failure counter for T1110 (AUTH-BURST).
     /// LRU-bounded like every other counter: a spray across many fabricated
@@ -958,7 +969,14 @@ impl RuleState {
     /// `PolicyDenialEvent::enforced` either way (`SELinux` permissive logs the
     /// same fact a managed Enforcing host would act on) — the point is a new
     /// *shape* of denial, not whether this particular one was blocked.
+    ///
+    /// `SELinux` only for now — see `known_policy_denials`'s doc for why an
+    /// AppLocker/WDAC `PolicyDenialEvent` would collapse to a far coarser
+    /// shape with this same key.
     fn check_policy_denial_drift(&mut self, event: &PolicyDenialEvent) -> Option<Alert> {
+        if event.mechanism != POLICY_MECHANISM_SELINUX {
+            return None;
+        }
         let key: PolicyDenialKey = (
             event.mechanism.clone(),
             event.subject_context.clone(),

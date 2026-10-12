@@ -1051,7 +1051,7 @@ fn listen_port_two_distinct_new_ports_each_alert() {
     assert_eq!(second.len(), 1);
 }
 
-// ── POLICY-DENIAL-DRIFT via SELinux AVC / AppLocker/WDAC (issue #774, PolicyDenialEvent) ──
+// ── POLICY-DENIAL-DRIFT via SELinux AVC (issue #774, PolicyDenialEvent) ──
 
 #[test]
 fn a_new_policy_denial_shape_alerts_once() {
@@ -1131,27 +1131,20 @@ fn permissive_mode_still_alerts_on_a_new_shape() {
 }
 
 #[test]
-fn different_mechanisms_are_independent_shapes() {
-    // Windows AppLocker/WDAC and Linux SELinux share the event shape but not
-    // the state: the same subject/object/class strings under a different
-    // mechanism must count as a distinct first-seen triple.
+fn only_selinux_denials_alert_for_now() {
+    // AppLocker/WDAC PolicyDenialEvents carry no subject/object context
+    // (always None), so this rule's shape would collapse to object_class
+    // alone — far too coarse (see known_policy_denials' doc) — gated off
+    // until a richer per-mechanism key exists.
     let mut state = RuleState::new();
-    let selinux = state.on_policy_denial(&policy_denial_event_full(
-        "selinux",
-        Some("x"),
-        Some("y"),
-        Some("z"),
-        true,
-    ));
     let applocker = state.on_policy_denial(&policy_denial_event_full(
         "applocker",
-        Some("x"),
-        Some("y"),
-        Some("z"),
+        None,
+        None,
+        Some("EXE"),
         true,
     ));
-    assert_eq!(selinux.len(), 1);
-    assert_eq!(applocker.len(), 1);
+    assert!(applocker.is_empty());
 }
 
 #[test]
