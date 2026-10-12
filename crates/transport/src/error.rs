@@ -58,6 +58,20 @@ impl TransportError {
         }
     }
 
+    /// The server's reason when it answered `423 Locked`: the resource is
+    /// deliberately withheld (a halted content ring, ADR-0016), which is an
+    /// intended, temporary state rather than a failure.
+    #[must_use]
+    pub fn locked_reason(&self) -> Option<&str> {
+        match self {
+            TransportError::ServerError {
+                status: 423,
+                message,
+            } => Some(message),
+            _ => None,
+        }
+    }
+
     /// Returns true for a pure connectivity failure (DNS, connection refused,
     /// timeout) as opposed to a response the server actually sent (even a
     /// rejection). Used to give connectivity blips their own, longer

@@ -48,6 +48,12 @@ jobs:
         run: python3 tools/check-ps1-ascii.py
       - name: shell scripts with a shebang are executable in git
         run: python3 tools/check-exec-bits.py
+      - name: packaged build carries no test signing key (ADR-0027)
+        run: tools/check-no-test-key.sh
+      - name: updater trust set without the test key (production code path)
+        # Unit tests always compile under cfg(test), where the test seed exists; the
+        # integration test is the only thing that exercises the packaged variant.
+        run: cargo test -p updater --no-default-features
       - name: docs build clean
         run: cargo doc --workspace --exclude sensor-linux-ebpf --no-deps
         env:

@@ -19,9 +19,9 @@ use schema::{
     MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, POLICY_MECHANISM_SELINUX,
     PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
     ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent, SessionState, ShellType,
-    SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketListenEvent,
-    TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent,
-    User, WmiActivityEvent, XpcConnectEvent,
+    SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketCreateEvent,
+    SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
+    UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -1483,6 +1483,31 @@ fn socket_accept_golden() {
 }
 
 #[test]
+fn socket_create_golden() {
+    // v42 (#263): AF_PACKET/SOCK_RAW — the shape bind/connect/accept never see,
+    // since raw sockets don't go through those calls the same way.
+    assert_golden(
+        &Event::SocketCreate(SocketCreateEvent {
+            meta: EventMeta {
+                pid: 8101,
+                ppid: 1,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_019_000_000_000,
+                comm: "tcpdump".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            domain: 17,
+            socket_type: 3,
+            protocol: 768,
+            fd: 5,
+        }),
+        "socket_create",
+    );
+}
+
+#[test]
 fn policy_denial_golden() {
     // v23 (#297): a SELinux AVC denial — httpd blocked (enforcing mode) from
     // reading a file labeled for a user's home directory, the classic
@@ -1767,7 +1792,7 @@ fn namespace_golden() {
 
 #[test]
 fn bits_job_golden() {
-    // v42 (#284): `bitsadmin /transfer` adding a file to a BITS job. The
+    // v43 (#284): `bitsadmin /transfer` adding a file to a BITS job. The
     // service does the download; this record names the client that asked.
     assert_golden(
         &Event::BitsJob(BitsJobEvent {
@@ -1798,7 +1823,7 @@ fn bits_job_golden() {
 
 #[test]
 fn bits_job_transfer_error_golden() {
-    // v42 (#284): the same job failing mid-transfer, reported by the BITS
+    // v43 (#284): the same job failing mid-transfer, reported by the BITS
     // service and attributed to the client that added the file.
     assert_golden(
         &Event::BitsJob(BitsJobEvent {
@@ -2343,6 +2368,13 @@ fn meta_accessor_covers_all_variants() {
             syscall: NamespaceSyscall::Unshare,
             fd: None,
             flags: 0,
+        }),
+        Event::SocketCreate(SocketCreateEvent {
+            meta: meta.clone(),
+            domain: 2,
+            socket_type: 1,
+            protocol: 6,
+            fd: 0,
         }),
     ];
     for e in &events {

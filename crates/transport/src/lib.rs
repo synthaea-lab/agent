@@ -67,6 +67,10 @@ pub const DEFAULT_DETECTION_ENDPOINT: &str = "/api/ingest/detection";
 /// beacon to `/login` and `lastSeen` never moved (#317 review).
 pub const DEFAULT_HEARTBEAT_ENDPOINT: &str = "/api/ingest/heartbeat";
 
+/// Default server endpoint where an agent registers the hashes of its decoy credentials
+/// (issue #81): `server/app/api/ingest/decoy/route.ts`, behind nginx's `/api/ingest/` mTLS gate.
+pub const DEFAULT_DECOY_ENDPOINT: &str = "/api/ingest/decoy";
+
 /// Default retry backoff base (doubles on each retry, capped).
 pub const DEFAULT_RETRY_BASE_MS: u64 = 1000;
 

@@ -50,6 +50,9 @@ pub struct Hit<'a> {
 pub struct Tripwires {
     entries: Vec<InventoryEntry>,
     index: HashMap<String, usize>,
+    /// Canaries by file name, for events whose path is relative. `None` when two canaries
+    /// share a name: a bare name cannot say which one was meant, so it matches neither.
+    by_name: HashMap<String, Option<usize>>,
 }
 
 /// The lookup key of a path: separators unified and case folded. Folding is always on, not
@@ -58,6 +61,19 @@ pub struct Tripwires {
 /// one rule for every platform keeps this crate free of platform branches.
 fn key(path: &str) -> String {
     path.replace('\\', "/").to_lowercase()
+}
+
+/// True for a path that does not say where it is rooted (no leading separator, no drive
+/// letter, no UNC prefix).
+fn is_relative(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    !(path.starts_with(['/', '\\']) || (bytes.len() >= 2 && bytes[1] == b':'))
+}
+
+/// The last component of a path, in lookup form.
+fn name_key(path: &str) -> String {
+    let k = key(path);
+    k.rsplit('/').next().unwrap_or_default().to_string()
 }
 
 impl Tripwires {
@@ -70,7 +86,18 @@ impl Tripwires {
             .enumerate()
             .map(|(i, e)| (key(&e.path.to_string_lossy()), i))
             .collect();
-        Self { entries, index }
+        let mut by_name: HashMap<String, Option<usize>> = HashMap::new();
+        for (i, e) in entries.iter().enumerate() {
+            by_name
+                .entry(name_key(&e.path.to_string_lossy()))
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(i));
+        }
+        Self {
+            entries,
+            index,
+            by_name,
+        }
     }
 
     /// How many canaries are watched.
@@ -85,8 +112,20 @@ impl Tripwires {
         self.entries.is_empty()
     }
 
+    /// Exact path first. A relative path (the Linux sensor reports `openat` names as the
+    /// caller passed them, unresolved against the directory descriptor, so `cd dir && cat
+    /// name` and `grep -r` arrive as a bare name) falls back to the file name: a canary's
+    /// name ends in four random bytes in hex, so a name match on its own is
+    /// nearly collision-free.
     fn entry(&self, path: &str) -> Option<&InventoryEntry> {
-        self.index.get(&key(path)).map(|&i| &self.entries[i])
+        if let Some(&i) = self.index.get(&key(path)) {
+            return Some(&self.entries[i]);
+        }
+        if !is_relative(path) {
+            return None;
+        }
+        let i = (*self.by_name.get(&name_key(path))?)?;
+        Some(&self.entries[i])
     }
 
     /// The canary `event` touches, if any. Only events that carry a path can match: a
@@ -228,6 +267,51 @@ mod tests {
                 .is_some()
         );
         assert!(wires.matches(&open(&CANARY.to_uppercase(), 1)).is_some());
+    }
+
+    #[test]
+    fn a_relative_open_of_a_canary_name_is_a_hit() {
+        let wires = tripwires();
+        assert!(wires.matches(&open("passwords_a1b2c3d4.txt", 7)).is_some());
+        assert!(
+            wires
+                .matches(&open("./sub/Passwords_A1B2C3D4.txt", 7))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn an_absolute_path_elsewhere_with_a_canary_name_is_not_a_hit() {
+        let wires = tripwires();
+        assert!(
+            wires
+                .matches(&open("/home/u/passwords_a1b2c3d4.txt", 7))
+                .is_none()
+        );
+        assert!(
+            wires
+                .matches(&open(r"C:\\Users\\u\\passwords_a1b2c3d4.txt", 7))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_name_shared_by_two_canaries_matches_neither_when_relative() {
+        let mut inventory = Inventory::default();
+        for dir in ["/srv/a", "/srv/b"] {
+            inventory.entries.push(InventoryEntry {
+                path: PathBuf::from(format!("{dir}/notes_00112233.txt")),
+                kind: Kind::Notes,
+                sha256: "00".into(),
+            });
+        }
+        let wires = Tripwires::from_inventory(&inventory);
+        assert!(wires.matches(&open("notes_00112233.txt", 1)).is_none());
+        assert!(
+            wires
+                .matches(&open("/srv/b/notes_00112233.txt", 1))
+                .is_some()
+        );
     }
 
     #[test]
