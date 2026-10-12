@@ -355,6 +355,42 @@ fn only_true_and_false_are_booleans_so_an_unquoted_yes_or_no_stays_a_string() {
 }
 
 #[test]
+fn a_merge_key_is_refused_so_it_cannot_override_a_selection_unseen() {
+    let in_selection = rule_with_detection(
+        "  base: &b\n    Image: a\n  selection:\n    <<: *b\n    Image: other\n  condition: selection\n",
+    );
+    assert!(parse_rule_yaml(&in_selection).is_err());
+    let in_detection = rule_with_detection(
+        "  <<: &d\n    selection:\n      Image: a\n  selection:\n    Image: b\n  condition: selection\n",
+    );
+    assert!(parse_rule_yaml(&in_detection).is_err());
+}
+
+#[test]
+fn a_tagged_key_does_not_escape_the_duplicate_check() {
+    let tagged = rule_with_detection(
+        "  selection:\n    Image: a\n  !x selection:\n    Image: b\n  condition: selection\n",
+    );
+    assert!(parse_rule_yaml(&tagged).is_err());
+}
+
+#[test]
+fn a_binary_tagged_value_stays_the_literal_text_it_shows() {
+    let yaml = rule_with_detection(
+        "  selection:\n    CommandLine: !!binary aGVsbG8=\n  condition: selection\n",
+    );
+    // Either refused or kept literal is acceptable; decoded to `hello` is not.
+    if let Ok(rule) = parse_rule_yaml(&yaml) {
+        let crate::rule::Selection::FieldMap(fields) =
+            rule.detection.selections.get("selection").unwrap()
+        else {
+            panic!("expected a field map");
+        };
+        assert_eq!(fields["CommandLine"].as_slice(), ["aGVsbG8="]);
+    }
+}
+
+#[test]
 fn an_alias_bomb_is_refused_by_the_parser_budget() {
     let mut yaml = String::from(RULE_HEAD);
     yaml.push_str("lol: &a0 [x,x,x,x,x,x,x,x,x]\n");

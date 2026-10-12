@@ -107,15 +107,27 @@ impl SigmaEngine {
 ///   rule be weakened without a trace), as is a duplicate top-level `title`;
 /// - an alias bomb is refused by the parser's budget instead of being expanded;
 /// - a UTF-8 byte-order mark is accepted;
+/// - merge keys (`<<`) and tags the parser does not know are errors, and a `!!binary` value
+///   stays the literal text it shows (`merge_keys`, `reject_unsupported_tags`,
+///   `ignore_binary_tag_for_string`): none of them may change what a rule matches unseen;
 /// - only the exact literals `true` and `false` are booleans (`strict_booleans`), as before:
 ///   an unquoted `yes`, `no`, `on`, `off` or `y` stays the string it looks like. Without the
 ///   option the new parser reads them as YAML 1.1 booleans and the rule would fail to load.
 pub(crate) fn parse_rule_yaml(content: &str) -> Result<SigmaRule, serde_saphyr::Error> {
-    // Both set explicitly: a default that moves in a later release must not change what a
-    // rule means. (`Options` is non-exhaustive, hence the macro.)
+    // Set explicitly: a default that moves in a later release must not change what a rule
+    // means, and rule files ship as signed content to every agent. (`Options` is
+    // non-exhaustive, hence the macro.)
     let options = serde_saphyr::options! {
         strict_booleans: true,
         duplicate_keys: serde_saphyr::options::DuplicateKeyPolicy::Error,
+        // `<<` would resolve a duplicate silently (a merged field or selection is
+        // overridden without an error), the same hole the duplicate-key policy closes.
+        merge_keys: serde_saphyr::options::MergeKeyPolicy::Error,
+        // A tag on a key (`!x selection:`) otherwise escapes the duplicate check and the
+        // last one wins; custom tags have no meaning in a rule.
+        reject_unsupported_tags: true,
+        // `!!binary` would base64-decode a matched value, hiding it from a reviewer.
+        ignore_binary_tag_for_string: true,
     };
     serde_saphyr::from_str_with_options(content, options)
 }
