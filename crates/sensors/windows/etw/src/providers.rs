@@ -80,6 +80,12 @@ pub(crate) const ALL_PROVIDERS: [(&str, &str); 11] = [
     ("LDAP-Client", LDAP_CLIENT_GUID),
 ];
 
+/// Kernel-Process keywords the sensor reads: `WINEVENT_KEYWORD_PROCESS` (0x10,
+/// EIDs 1/2) and `WINEVENT_KEYWORD_IMAGE` (0x40, EID 5). Left unset, ferrisetw
+/// enables every keyword, and every thread start on the host (EID 3, keyword
+/// 0x20) went through the callback for nothing (#726).
+const KERNEL_PROCESS_KEYWORDS: u64 = 0x10 | 0x40;
+
 /// `AssemblyFlags` bit indicating a dynamic (in-memory) assembly load.
 /// File-backed assemblies are high-volume noise; only dynamic loads are forwarded.
 const ASSEMBLY_FLAG_DYNAMIC: u32 = 0x2;
@@ -88,9 +94,10 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
         let eid = record.event_id();
         // 1=ProcessStart (new spawn → ExecEvent), 2=ProcessEnd (prune the store —
-        // PID recycling), 3=ProcessDCStart (rundown of already-running processes →
-        // store only, not a spawn), 5=ImageLoad (DLL/EXE mapped into a process).
-        if eid != 1 && eid != 2 && eid != 3 && eid != 5 {
+        // PID recycling), 5=ImageLoad (DLL/EXE mapped into a process). Processes
+        // already running come from the pid-store seed, not from a rundown (that
+        // would be EID 15; EID 3 is ThreadStart, #726).
+        if eid != 1 && eid != 2 && eid != 5 {
             return;
         }
         state.events_seen.fetch_add(1, Ordering::Relaxed);
@@ -144,10 +151,6 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         if image_path != "<unknown>" {
             state.pids.lock().unwrap().insert(pid, image_path.clone());
         }
-        if eid == 3 {
-            return; // rundown: store populated, nothing else to do
-        }
-
         // Lineage at exec time (schema parent fields): the parent is usually alive
         // and already in the store.
         let parent_image_path = state.pids.lock().unwrap().get(ppid).map(str::to_owned);
@@ -172,6 +175,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         }));
     };
     Provider::by_guid(KERNEL_PROCESS_GUID)
+        .any(KERNEL_PROCESS_KEYWORDS)
         .add_callback(callback)
         .build()
 }
@@ -849,6 +853,24 @@ pub(crate) fn smb_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
     Provider::by_guid(SMB_CLIENT_GUID)
         .add_callback(callback)
         .build()
+}
+
+#[cfg(test)]
+mod process_keyword_tests {
+    use super::*;
+
+    /// Guards the constant; whether the provider really keeps ids 3 and 4 out under this
+    /// mask is checked against a real session by `tests/kernel_process_keyword_mask.rs`
+    /// (`#[ignore]`, elevated; lab phase G of `lab/validate-windows-admin.ps1`).
+    #[test]
+    fn kernel_process_reads_process_and_image_events_but_not_threads() {
+        const PROCESS: u64 = 0x10;
+        const THREAD: u64 = 0x20;
+        const IMAGE: u64 = 0x40;
+        assert_ne!(KERNEL_PROCESS_KEYWORDS & PROCESS, 0);
+        assert_ne!(KERNEL_PROCESS_KEYWORDS & IMAGE, 0);
+        assert_eq!(KERNEL_PROCESS_KEYWORDS & THREAD, 0);
+    }
 }
 
 #[cfg(test)]

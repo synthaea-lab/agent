@@ -36,15 +36,32 @@ pub(crate) struct RunPipeline {
 
 /// Plants the configured canary files and hands the sink the tripwires over them (#81).
 /// Called before the sensors start, so the first touch of a canary is already matched.
+///
+/// The decoy tokens in those canaries are registered, as hashes, with the control plane when
+/// there is one (`transport`); standalone, or with the upload disabled, they are planted and
+/// never recognised anywhere.
 pub(crate) fn plant_canaries(
     sink: &DetectionSink,
     deception: &config::DeceptionConfig,
     storage: &config::StorageConfig,
+    transport: Option<&crate::upload::TransportHandle>,
 ) {
-    if let Some(tripwires) = crate::deception::start(deception, &storage.state_dir) {
+    let (tripwires, decoys) = crate::deception::start_with_decoys(deception, &storage.state_dir);
+    if let Some(tripwires) = tripwires {
         sink.set_tripwires(tripwires);
         sink.set_canary_allow(crate::deception::CanaryAllow::new(deception));
         crate::deception::spawn_refresh(deception.clone(), storage.state_dir.clone());
+    }
+    match transport {
+        Some(handle) => crate::deception::register_decoys_in_background(
+            std::sync::Arc::clone(&handle.client),
+            decoys,
+        ),
+        None if !decoys.is_empty() => tracing::info!(
+            count = decoys.len(),
+            "deception: no control plane, decoy credentials are planted but nothing will recognise them"
+        ),
+        None => {}
     }
 }
 

@@ -110,6 +110,8 @@ pub(crate) struct DetectionSink {
     /// Executables allowed to touch a canary without a detection (`[deception] allow_exe`),
     /// set once with the tripwires.
     canary_allow: std::sync::OnceLock<crate::deception::CanaryAllow>,
+    /// The image each process was seen to execute, so `canary_allow` need not read `/proc`.
+    exec_images: Mutex<crate::deception::ExecImages>,
     /// When each `(canary, pid, incarnation of pid)` last raised a detection (event time,
     /// ns), so a tool that reads the same canary again and again raises one finding per
     /// cooldown, not one per open. Only read opens are absorbed (see [`absorbable`]);
@@ -354,6 +356,7 @@ impl DetectionSink {
             content_root,
             tripwires: std::sync::OnceLock::new(),
             canary_allow: std::sync::OnceLock::new(),
+            exec_images: Mutex::new(crate::deception::ExecImages::new()),
             canary_last_hit: Mutex::new(store::BoundedMap::new(CANARY_COOLDOWN_KEYS)),
             canary_hits_absorbed: AtomicU64::new(0),
             ransomware_join: Mutex::new(crate::ransomware_join::RansomwareJoin::new()),
@@ -666,11 +669,16 @@ impl DetectionSink {
         if hit.pid == std::process::id() {
             return;
         }
-        if self
-            .canary_allow
-            .get()
-            .is_some_and(|allow| allow.allows(hit.pid))
-        {
+        if self.canary_allow.get().is_some_and(|allow| {
+            // Cloned out so the lock is not held across the `/proc` fallback inside `allows`:
+            // `detect_exec` takes it for every exec event.
+            let seen = self
+                .exec_images
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .image_of(hit.pid, event.meta().process_generation);
+            allow.allows(hit.pid, seen.as_ref())
+        }) {
             tracing::debug!(
                 pid = hit.pid,
                 "deception: canary touch by an allowed executable"
@@ -939,6 +947,18 @@ impl DetectionSink {
 
     /// Exec events: stateless rules, stateful rules, then Sigma.
     fn detect_exec(&self, wrapped: &Event, event: &schema::ExecEvent) {
+        // The table is read only when an executable may be allowed: recording every exec of a
+        // host that allows none would take a lock and clone a path for nothing.
+        if self
+            .canary_allow
+            .get()
+            .is_some_and(|allow| !allow.is_empty())
+        {
+            self.exec_images
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record(event);
+        }
         self.record_rule_alerts(wrapped, rules::evaluate_exec(event));
         self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_exec(event));
         let sigma_guard = self.sigma.lock().unwrap();
@@ -1960,6 +1980,74 @@ rule response_marker {
     }
 
     #[test]
+    fn an_exec_is_recorded_only_when_an_executable_may_be_allowed() {
+        let pid = std::process::id() + 1;
+        let record = |sink: &DetectionSink| {
+            let mut exec = schema::fixtures::exec();
+            exec.meta.pid = pid;
+            exec.meta.process_generation = Some(3);
+            exec.image_path = "/usr/bin/updatedb".into();
+            sink.on_event(Event::Exec(exec));
+            sink.exec_images.lock().unwrap().image_of(pid, Some(3))
+        };
+        let dir = tmp("exec-record-none");
+        let (sink, _canary) = sink_watching_canary(&dir);
+        assert!(record(&sink).is_none(), "no allow list: nothing recorded");
+        let dir = tmp("exec-record-empty");
+        let (sink, _canary) = sink_watching_canary(&dir);
+        // What a host with `[deception]` but no `allow_exe` has: an allow list, empty.
+        sink.set_canary_allow(crate::deception::CanaryAllow::new(
+            &config::DeceptionConfig::default(),
+        ));
+        assert!(
+            record(&sink).is_none(),
+            "an empty allow list: nothing recorded"
+        );
+        let dir = tmp("exec-record-listed");
+        let (sink, _canary) = sink_watching_canary(&dir);
+        sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
+            "/usr/bin/updatedb",
+            |_| None,
+        ));
+        assert!(record(&sink).is_some(), "an allow list: recorded");
+    }
+
+    #[test]
+    fn a_process_seen_to_exec_an_allowed_image_may_touch_a_canary_without_proc() {
+        let dir = tmp("canary-exec-image");
+        let (sink, canary) = sink_watching_canary(&dir);
+        // The /proc fallback resolves nothing: only the Exec the sink saw can allow.
+        sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
+            "/usr/bin/updatedb",
+            |_| None,
+        ));
+        let pid = std::process::id() + 1;
+        let mut exec = schema::fixtures::exec();
+        exec.meta.pid = pid;
+        exec.meta.process_generation = Some(3);
+        exec.image_path = "/usr/bin/updatedb".into();
+        sink.on_event(Event::Exec(exec));
+        let mut open = schema::fixtures::file_open();
+        open.path = canary.clone();
+        open.meta.pid = pid;
+        open.meta.process_generation = Some(3);
+        sink.on_event(Event::FileOpen(open));
+        assert_eq!(
+            canary_alert_count(&dir),
+            0,
+            "an allowed image raises no hit"
+        );
+
+        // The same pid, another incarnation that never exec'd: not allowed.
+        let mut other = schema::fixtures::file_open();
+        other.path = canary;
+        other.meta.pid = pid;
+        other.meta.process_generation = Some(4);
+        sink.on_event(Event::FileOpen(other));
+        assert_eq!(canary_alert_count(&dir), 1, "a recycled pid raises the hit");
+    }
+
+    #[test]
     fn the_agents_own_pid_touching_a_canary_is_not_a_detection() {
         let dir = tmp("canary-own-pid");
         let (sink, canary) = sink_watching_canary(&dir);
@@ -2586,6 +2674,38 @@ rule response_marker {
             killed.lock().unwrap().is_empty(),
             "an allowed process never notes a canary signal"
         );
+        assert!(!alerts_in(&dir).contains("RESPONSE-KILL"));
+    }
+
+    /// #731 with #722: an allow-listed image recognised from the process's own `Exec` (no
+    /// `/proc` read) is not killed by the reflex either, even when it bursts and reads a canary.
+    #[test]
+    fn a_process_allowed_from_its_exec_that_also_bursts_is_not_killed_by_the_reflex() {
+        let dir = tmp("reflex-allowed-by-exec");
+        let (sink, canary, killed) = reflex_sink(&dir, true);
+        sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
+            "/usr/bin/backup-tool",
+            |_| None,
+        ));
+        let mut exec = schema::fixtures::exec();
+        exec.meta.pid = 900;
+        exec.meta.process_generation = Some(5);
+        exec.image_path = "/usr/bin/backup-tool".into();
+        sink.on_event(Event::Exec(exec));
+        for i in 0..30 {
+            let Event::FileRename(mut e) = rename_of(900, i, ".locked") else {
+                unreachable!()
+            };
+            e.meta.process_generation = Some(5);
+            sink.on_event(Event::FileRename(e));
+        }
+        let Event::FileOpen(mut open) = canary_open_at(&canary, 900, BURST_END_NS + 1_000_000)
+        else {
+            unreachable!()
+        };
+        open.meta.process_generation = Some(5);
+        sink.on_event(Event::FileOpen(open));
+        assert!(killed.lock().unwrap().is_empty());
         assert!(!alerts_in(&dir).contains("RESPONSE-KILL"));
     }
 
