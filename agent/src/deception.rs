@@ -656,13 +656,30 @@ fn plant_each_directory(canaries: &[deception::Canary], inventory: &Path) -> Vec
                     skipped = report.skipped.len(),
                     "deception: canaries planted"
                 );
+                #[cfg(unix)]
                 if !report.planted.is_empty() || !report.unchanged.is_empty() {
-                    tracing::warn!(
-                        dir = %dir.display(),
-                        unmatched = "owner, mode",
-                        "deception: canary owner and mode remain the agent defaults; matching \
-                         these fields is not implemented"
-                    );
+                    let canary_paths: Vec<PathBuf> = report
+                        .planted
+                        .iter()
+                        .chain(&report.unchanged)
+                        .cloned()
+                        .collect();
+                    if let Some(outcome) = match_canary_metadata(dir, &canary_paths) {
+                        let mut unmatched = Vec::new();
+                        if !outcome.owner_matched {
+                            unmatched.push("owner");
+                        }
+                        if !outcome.mode_matched {
+                            unmatched.push("mode");
+                        }
+                        if !unmatched.is_empty() {
+                            tracing::warn!(
+                                dir = %dir.display(),
+                                unmatched = %unmatched.join(", "),
+                                "deception: could not match canary metadata to neighboring files"
+                            );
+                        }
+                    }
                 }
                 present.extend(report.planted);
                 present.extend(report.unchanged);
@@ -676,6 +693,75 @@ fn plant_each_directory(canaries: &[deception::Canary], inventory: &Path) -> Vec
         }
     }
     present
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CanaryMetadataOutcome {
+    owner_matched: bool,
+    mode_matched: bool,
+}
+
+/// Copies the directory's common ownership and permissions to its canaries. This is in the
+/// agent because the lifecycle crate stays platform-neutral. No regular neighbours means the
+/// canary defaults are left alone.
+#[cfg(unix)]
+fn match_canary_metadata(dir: &Path, canary_paths: &[PathBuf]) -> Option<CanaryMetadataOutcome> {
+    use std::{
+        collections::BTreeMap,
+        os::unix::fs::{MetadataExt as _, PermissionsExt as _},
+    };
+
+    let canaries: std::collections::HashSet<&Path> =
+        canary_paths.iter().map(PathBuf::as_path).collect();
+    let mut owners = BTreeMap::<(u32, u32), usize>::new();
+    let mut modes = BTreeMap::<u32, usize>::new();
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if canaries.contains(path.as_path()) || !entry.file_type().is_ok_and(|kind| kind.is_file())
+        {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        *owners.entry((metadata.uid(), metadata.gid())).or_default() += 1;
+        *modes.entry(metadata.mode() & 0o777).or_default() += 1;
+    }
+
+    let owner = owners.into_iter().max_by_key(|(_, count)| *count)?.0;
+    let mode = modes.into_iter().max_by_key(|(_, count)| *count)?.0;
+    let mut owner_matched = true;
+    let mut mode_matched = true;
+    for path in canary_paths {
+        let Ok(file) = fs::File::open(path) else {
+            owner_matched = false;
+            mode_matched = false;
+            continue;
+        };
+        if std::os::unix::fs::fchown(&file, Some(owner.0), Some(owner.1)).is_err() {
+            owner_matched = false;
+        }
+        // The agent verifies the canary contents after planting. Retain owner-read if the
+        // neighbours' common mode would otherwise make that verification impossible.
+        let readable_mode = mode | 0o400;
+        if readable_mode != mode {
+            mode_matched = false;
+        }
+        if file
+            .set_permissions(fs::Permissions::from_mode(readable_mode))
+            .is_err()
+        {
+            mode_matched = false;
+        }
+    }
+    Some(CanaryMetadataOutcome {
+        owner_matched,
+        mode_matched,
+    })
 }
 
 /// Removes canaries a previous run planted, when the operator no longer configures any.
@@ -736,6 +822,79 @@ mod tests {
         let tripwires = start(&config_for(&[dir.path()]), state.path()).unwrap();
         assert_eq!(tripwires.len(), Kind::ALL.len());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), Kind::ALL.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canary_metadata_uses_regular_neighbour_majorities_and_skips_links() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let neighbour = dir.path().join("document.txt");
+        let canary = dir.path().join("canary.txt");
+        let link_target = dir.path().join("link-target.txt");
+        let link = dir.path().join("linked-document.txt");
+        fs::write(&neighbour, "ordinary neighbour").unwrap();
+        fs::set_permissions(&neighbour, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::write(&link_target, "must not be sampled").unwrap();
+        fs::set_permissions(&link_target, fs::Permissions::from_mode(0o000)).unwrap();
+        std::os::unix::fs::symlink(&link_target, &link).unwrap();
+        fs::write(&canary, "canary contents").unwrap();
+        fs::set_permissions(&canary, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let target = fs::metadata(&neighbour).unwrap();
+        let outcome = match_canary_metadata(dir.path(), std::slice::from_ref(&canary)).unwrap();
+        let actual = fs::metadata(&canary).unwrap();
+
+        assert_eq!(actual.uid(), target.uid());
+        assert_eq!(actual.gid(), target.gid());
+        assert_eq!(actual.mode() & 0o777, 0o640);
+        assert!(outcome.owner_matched);
+        assert!(outcome.mode_matched);
+        assert_eq!(fs::read_to_string(&canary).unwrap(), "canary contents");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canary_keeps_owner_read_when_neighbour_mode_would_hide_it_from_verification() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let neighbour = dir.path().join("private.txt");
+        let canary = dir.path().join("canary.txt");
+        fs::write(&neighbour, "private").unwrap();
+        fs::set_permissions(&neighbour, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::write(&canary, "still readable").unwrap();
+
+        let outcome = match_canary_metadata(dir.path(), std::slice::from_ref(&canary)).unwrap();
+
+        assert!(outcome.owner_matched);
+        assert!(
+            !outcome.mode_matched,
+            "the added owner-read bit is reported"
+        );
+        assert_eq!(
+            fs::metadata(&canary).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        assert_eq!(fs::read_to_string(&canary).unwrap(), "still readable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_regular_neighbours_leave_canary_metadata_unchanged() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let canary = dir.path().join("canary.txt");
+        fs::write(&canary, "defaults").unwrap();
+        fs::set_permissions(&canary, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(match_canary_metadata(dir.path(), std::slice::from_ref(&canary)).is_none());
+        assert_eq!(
+            fs::metadata(&canary).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
