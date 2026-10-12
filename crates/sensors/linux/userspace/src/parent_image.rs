@@ -21,10 +21,12 @@
 //! carry), the exec time is stored with each image. One thing this cannot see: a subshell
 //! that did exec, if that event was lost, would be given its forker's image.
 //!
-//! Bounded like the other per-pid state: least-recently-used entries go first, in
-//! batches, and the loss is counted and logged, never silent. There is no exit event
-//! on this path, so stale entries are only ever replaced (by the pid's next exec) or
-//! evicted; the generation check is what keeps a stale one from being read.
+//! Bounded like the other per-pid state, in batches, and the loss is counted and logged, never
+//! silent. There is no exit event on this path, so stale entries are only ever replaced (by the
+//! pid's next exec) or evicted, and the generation check is what keeps a stale one from being
+//! read. Eviction prefers the entries of processes that no longer exist (asked of `/proc`)
+//! before the least recently used live ones, so an idle long-lived parent is not pushed out by
+//! the short-lived processes that came after it (#783).
 
 use std::collections::HashMap;
 
@@ -56,11 +58,18 @@ pub(crate) struct ExecStamps {
     pub(crate) grandparent_generation: u64,
 }
 
+/// Whether `pid` is a live process (its `/proc/<pid>` exists).
+fn process_exists(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
 pub(crate) struct ParentImages {
     entries: HashMap<u32, Entry>,
     cap: usize,
     tick: u64,
     evicted: u64,
+    /// Whether a pid is a live process now; swapped in tests.
+    is_alive: fn(u32) -> bool,
 }
 
 impl ParentImages {
@@ -68,12 +77,23 @@ impl ParentImages {
     ///
     /// Panics when `cap` is 0: a configuration bug, not a runtime condition.
     pub(crate) fn new(cap: usize) -> Self {
+        Self::with_liveness(cap, process_exists)
+    }
+
+    /// [`Self::new`] with another liveness test, for tests that must not depend on which pids
+    /// the machine running them happens to have.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `cap` is 0: a configuration bug, not a runtime condition.
+    pub(crate) fn with_liveness(cap: usize, is_alive: fn(u32) -> bool) -> Self {
         assert!(cap >= 1, "ParentImages cap must be >= 1");
         Self {
             entries: HashMap::new(),
             cap,
             tick: 0,
             evicted: 0,
+            is_alive,
         }
     }
 
@@ -104,6 +124,11 @@ impl ParentImages {
 
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, pid: u32) -> bool {
+        self.entries.contains_key(&pid)
     }
 
     /// Entries dropped by the cap since creation (also in the warning each batch logs).
@@ -167,6 +192,13 @@ impl ParentImages {
         }
     }
 
+    /// Frees a batch of the least valuable entries. Nothing tells this cache when a process
+    /// exits (the probe removes its own `PROC_LINEAGE` entry but sends no event), so recency
+    /// alone ranks an idle `sshd` or `nginx`, which is exactly the parent the cache is for, below
+    /// every short-lived process that came after it. Among the oldest entries the ones whose
+    /// process is gone (`/proc/<pid>` missing) go first, oldest first; only if there are not
+    /// enough of those do the oldest live ones follow, as before. The scan asks `/proc` about at
+    /// most four batches of entries, so the work per eviction is bounded.
     fn evict_batch(&mut self) {
         let batch = (self.cap / 8).max(1);
         let mut by_age: Vec<(u64, u32)> = self
@@ -175,7 +207,22 @@ impl ParentImages {
             .map(|(pid, entry)| (entry.last_used, *pid))
             .collect();
         by_age.sort_unstable();
-        for (_, pid) in by_age.into_iter().take(batch) {
+        let window = by_age.len().min(batch * 4);
+        let mut victims: Vec<u32> = by_age[..window]
+            .iter()
+            .map(|(_, pid)| *pid)
+            .filter(|pid| !(self.is_alive)(*pid))
+            .take(batch)
+            .collect();
+        for (_, pid) in &by_age {
+            if victims.len() >= batch {
+                break;
+            }
+            if !victims.contains(pid) {
+                victims.push(*pid);
+            }
+        }
+        for pid in victims {
             self.entries.remove(&pid);
             self.evicted += 1;
         }
@@ -475,5 +522,77 @@ mod tests {
             },
         );
         assert_eq!(child.parent_image_path.as_deref(), Some("/usr/sbin/sshd"));
+    }
+
+    // --- eviction: the processes that are gone go first (#783) -----------------------------
+
+    fn only_pid_100_is_alive(pid: u32) -> bool {
+        pid == 100
+    }
+
+    #[test]
+    fn an_idle_long_lived_parent_survives_a_flood_of_short_lived_processes() {
+        // sshd (pid 100) execs once and then sits idle while far more than the cap of short-lived
+        // processes come and go: strictly oldest-first eviction drops it, and its next child
+        // gets no parent_image_path. There is no exit event, so liveness is asked of /proc.
+        let mut cache = ParentImages::with_liveness(8, only_pid_100_is_alive);
+        let mut sshd = exec(100, 7, 1, 1, "/usr/sbin/sshd");
+        note(&mut cache, &mut sshd);
+        for pid in 1_000..1_100u32 {
+            let mut short_lived = exec(pid, 1, 1, 1, "/usr/bin/true");
+            note(&mut cache, &mut short_lived);
+        }
+        assert!(cache.evicted() > 0, "the flood must have caused eviction");
+        let mut child = exec(5_000, 30, 100, 7, "/usr/bin/id");
+        note(&mut cache, &mut child);
+        assert_eq!(child.parent_image_path.as_deref(), Some("/usr/sbin/sshd"));
+    }
+
+    #[test]
+    fn a_dead_process_goes_before_an_older_live_one() {
+        let mut cache = ParentImages::with_liveness(8, only_pid_100_is_alive);
+        let mut sshd = exec(100, 7, 1, 1, "/usr/sbin/sshd"); // the oldest entry, alive
+        note(&mut cache, &mut sshd);
+        for pid in 200..208u32 {
+            let mut dead = exec(pid, 1, 1, 1, "/bin/x"); // the ninth insert triggers eviction
+            note(&mut cache, &mut dead);
+        }
+        assert!(cache.contains(100), "the live idle parent must stay");
+        assert!(!cache.contains(200), "the oldest DEAD entry goes instead");
+    }
+
+    fn every_pid_is_alive(_pid: u32) -> bool {
+        true
+    }
+
+    #[test]
+    fn when_every_candidate_is_alive_the_oldest_go_first_as_before() {
+        let mut cache = ParentImages::with_liveness(8, every_pid_is_alive);
+        for pid in 100..109u32 {
+            let mut e = exec(pid, 1, 1, 1, "/bin/x");
+            note(&mut cache, &mut e);
+        }
+        assert!(
+            !cache.contains(100),
+            "the oldest live entry is evicted when nothing is dead"
+        );
+        assert!(cache.contains(108));
+        assert!(cache.evicted() >= 1);
+    }
+
+    #[test]
+    fn the_cache_still_never_grows_past_its_cap_when_every_process_is_alive() {
+        let mut cache = ParentImages::with_liveness(64, every_pid_is_alive);
+        for pid in 0..10_000u32 {
+            let mut e = exec(pid + 10, 1, 1, 1, "/bin/x");
+            note(&mut cache, &mut e);
+        }
+        assert!(cache.len() <= 64);
+    }
+
+    #[test]
+    fn process_exists_says_yes_for_this_process_and_no_for_an_impossible_pid() {
+        assert!(process_exists(std::process::id()));
+        assert!(!process_exists(u32::MAX));
     }
 }
