@@ -29,7 +29,10 @@ use std::{
 };
 
 use updater::{
-    ContentEntry, ContentManifest, UpdaterError, fsutil::write_atomically, hash::hash_bytes,
+    ContentEntry, ContentManifest, UpdaterError,
+    content::is_safe_content_path,
+    fsutil::{remove_file_under, write_atomically},
+    hash::hash_bytes,
 };
 
 /// Hard ceiling on a single content artifact's declared `size` (PR #520
@@ -89,6 +92,9 @@ impl ContentState {
 pub(crate) struct FetchPlan {
     pub(crate) release_version: u64,
     pub(crate) to_fetch: Vec<ContentEntry>,
+    /// Applied paths this manifest no longer lists: deleted once the new entries have
+    /// landed, so that a release which drops a file actually withdraws it (#666).
+    pub(crate) to_remove: Vec<String>,
 }
 
 /// Verifies `manifest` (signature + anti-rollback against `state`) and reports
@@ -119,9 +125,11 @@ pub(crate) fn plan(
         .into_iter()
         .cloned()
         .collect();
+    let to_remove = manifest.entries_to_remove(&state.entries);
     Ok(FetchPlan {
         release_version: manifest.release_version,
         to_fetch,
+        to_remove,
     })
 }
 
@@ -154,11 +162,15 @@ pub(crate) fn cmd_check_content_manifest(
     match plan(&manifest, ring, &state) {
         Ok(plan) => {
             println!(
-                "ring {ring}: release {} available, {} entr{} to fetch",
+                "ring {ring}: release {} available, {} entr{} to fetch, {} to remove",
                 plan.release_version,
                 plan.to_fetch.len(),
-                if plan.to_fetch.len() == 1 { "y" } else { "ies" }
+                if plan.to_fetch.len() == 1 { "y" } else { "ies" },
+                plan.to_remove.len()
             );
+            for path in &plan.to_remove {
+                println!("  remove {path} (no longer listed)");
+            }
             for entry in &plan.to_fetch {
                 println!(
                     "  {} ({}, {} bytes, sha256={})",
@@ -222,6 +234,10 @@ fn artifact_dest(root: &Path, entry_path: &str) -> PathBuf {
 /// every entry has landed, so a caller retrying a partially-applied
 /// manifest still passes `check_release_version` on the next attempt.
 ///
+/// Once every entry has landed, deletes what the manifest no longer lists
+/// ([`FetchPlan::to_remove`]), recording each removal in the state file as it goes (see
+/// [`prune_unlisted`]); returns how many were removed.
+///
 /// Deliberately stops there — does not reload anything into a running
 /// `DetectionSink` (module doc).
 ///
@@ -230,7 +246,8 @@ fn artifact_dest(root: &Path, entry_path: &str) -> PathBuf {
 /// Returns an error if a download fails, a downloaded artifact's hash
 /// doesn't match the manifest's declared value
 /// ([`UpdaterError::StagedFileMismatch`]), a declared `size` exceeds
-/// [`MAX_CONTENT_ARTIFACT_BYTES`], or a filesystem write fails.
+/// [`MAX_CONTENT_ARTIFACT_BYTES`], a filesystem write fails, or a file to remove sits
+/// behind a symlink or cannot be deleted.
 fn download_and_apply(
     client: &transport::TransportClient,
     fetch_plan: &FetchPlan,
@@ -238,7 +255,7 @@ fn download_and_apply(
     content_dir: &Path,
     state_path: &Path,
     mut state: ContentState,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     std::fs::create_dir_all(content_dir)?;
     // The symlink check bounds itself to components under this root, not
     // the whole filesystem ancestry (see `updater::fsutil::reject_symlink_components`) — for
@@ -284,11 +301,57 @@ fn download_and_apply(
         write_atomically(state_root, state_path, &serde_json::to_vec(&state)?)?;
     }
 
+    let removed = prune_unlisted(
+        content_dir,
+        state_root,
+        state_path,
+        &mut state,
+        &fetch_plan.to_remove,
+    )?;
+
     state
         .release_version
         .insert(ring.to_string(), fetch_plan.release_version);
     write_atomically(state_root, state_path, &serde_json::to_vec(&state)?)?;
-    Ok(())
+    Ok(removed)
+}
+
+/// Deletes the files in `to_remove` from `content_dir` and forgets them in `state`,
+/// persisting the state after each one: a crash leaves, at worst, a state entry whose file
+/// is already gone, which the next run finds and drops (a missing file is not an error).
+///
+/// The list comes from the agent's own unsigned state file, so each path is checked again
+/// before it is joined onto the content root: one that is not a safe relative content path
+/// is dropped from the state without touching the disk (nothing this agent wrote can look
+/// like that), and a file whose path crosses a symlink is refused, like the download path.
+///
+/// # Errors
+///
+/// Returns an error if a path crosses a symlink or a file cannot be deleted.
+fn prune_unlisted(
+    content_dir: &Path,
+    state_root: &Path,
+    state_path: &Path,
+    state: &mut ContentState,
+    to_remove: &[String],
+) -> anyhow::Result<usize> {
+    let mut removed = 0;
+    for path in to_remove {
+        if is_safe_content_path(path) {
+            let dest = artifact_dest(content_dir, path);
+            let deleted = remove_file_under(content_dir, &dest)
+                .map_err(|e| anyhow::Error::from(e).context(format!("removing {path}")))?;
+            removed += usize::from(deleted);
+        } else {
+            tracing::warn!(
+                path = %path,
+                "content state lists an unsafe path; dropping it without deleting anything"
+            );
+        }
+        state.entries.remove(path);
+        write_atomically(state_root, state_path, &serde_json::to_vec(&*state)?)?;
+    }
+    Ok(removed)
 }
 
 /// Resolves `path`'s furthest already-existing ancestor via
@@ -567,9 +630,9 @@ fn apply_content_manifest(
     };
 
     let fetched = fetch_plan.to_fetch.len();
-    download_and_apply(&client, &fetch_plan, ring, content_dir, state_path, state)?;
+    let removed = download_and_apply(&client, &fetch_plan, ring, content_dir, state_path, state)?;
     println!(
-        "ring {ring}: applied release {} ({fetched} entr{} fetched)",
+        "ring {ring}: applied release {} ({fetched} entr{} fetched, {removed} removed)",
         fetch_plan.release_version,
         if fetched == 1 { "y" } else { "ies" }
     );
@@ -1058,6 +1121,7 @@ mod tests {
         let fetch_plan = FetchPlan {
             release_version: 7,
             to_fetch: vec![e1.clone(), e2.clone()],
+            to_remove: vec![],
         };
 
         download_and_apply(
@@ -1105,6 +1169,7 @@ mod tests {
         let fetch_plan = FetchPlan {
             release_version: 1,
             to_fetch: vec![entry],
+            to_remove: vec![],
         };
 
         let err = download_and_apply(
@@ -1135,6 +1200,7 @@ mod tests {
         let fetch_plan = FetchPlan {
             release_version: 5,
             to_fetch: vec![e1.clone(), e2],
+            to_remove: vec![],
         };
 
         download_and_apply(
@@ -1154,6 +1220,157 @@ mod tests {
         assert!(!state.entries.contains_key("rules/second.sigma"));
         // The release isn't marked applied until every entry lands.
         assert!(!state.release_version.contains_key("canary_0"));
+    }
+
+    fn offline_client() -> transport::TransportClient {
+        transport::TransportClient::new(transport::TransportConfig::new("http://127.0.0.1:1"))
+            .unwrap()
+    }
+
+    /// A content dir holding `files` and a state file that records them as applied at
+    /// release 4, as a lab agent that applied v2..v4 would have.
+    fn applied(dir: &Path, files: &[&str]) -> (PathBuf, PathBuf, ContentState) {
+        let content_dir = dir.join("content");
+        let state_path = dir.join("content-state.json");
+        let mut state = ContentState::default();
+        for path in files {
+            let dest = artifact_dest(&content_dir, path);
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::write(&dest, path.as_bytes()).unwrap();
+            state.entries.insert((*path).to_string(), "a".repeat(64));
+        }
+        state.release_version.insert("canary_0".to_string(), 4);
+        std::fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        (content_dir, state_path, state)
+    }
+
+    #[test]
+    fn a_roll_forward_that_stops_listing_a_rule_removes_it_from_disk_and_state() {
+        // #666: release 5 carries v2's content only; v3's and v4's rule files stayed on disk
+        // and stayed loaded.
+        let dir = tmp("prune-roll-forward");
+        let (content_dir, state_path, state) = applied(
+            &dir,
+            &["rules/v2.sigma", "rules/v3.sigma", "rules/v4.sigma"],
+        );
+        let manifest = signed_manifest_json(5, vec![entry("rules/v2.sigma")]);
+        let fetch_plan = plan(&manifest, "canary_0", &state).unwrap();
+        assert!(fetch_plan.to_fetch.is_empty());
+        assert_eq!(fetch_plan.to_remove, ["rules/v3.sigma", "rules/v4.sigma"]);
+
+        let removed = download_and_apply(
+            &offline_client(),
+            &fetch_plan,
+            "canary_0",
+            &content_dir,
+            &state_path,
+            state,
+        )
+        .unwrap();
+
+        assert_eq!(removed, 2);
+        assert!(content_dir.join("rules/v2.sigma").exists());
+        assert!(!content_dir.join("rules/v3.sigma").exists());
+        assert!(!content_dir.join("rules/v4.sigma").exists());
+        let state = ContentState::load(&state_path).unwrap();
+        assert_eq!(
+            state.entries.keys().collect::<Vec<_>>(),
+            ["rules/v2.sigma"],
+            "the state must list exactly what is on disk"
+        );
+        assert_eq!(state.release_version.get("canary_0"), Some(&5));
+    }
+
+    #[test]
+    fn a_failed_download_removes_nothing() {
+        let dir = tmp("prune-after-failed-download");
+        let (content_dir, state_path, state) = applied(&dir, &["rules/old.sigma"]);
+        let mut bad = entry_for("rules/new.sigma", b"new");
+        bad.sha256 = "f".repeat(64);
+        let url = artifact_server(vec![(200, b"new".to_vec())]);
+        let client =
+            transport::TransportClient::new(transport::TransportConfig::new(&url)).unwrap();
+        let fetch_plan = FetchPlan {
+            release_version: 5,
+            to_fetch: vec![bad],
+            to_remove: vec!["rules/old.sigma".to_string()],
+        };
+
+        download_and_apply(
+            &client,
+            &fetch_plan,
+            "canary_0",
+            &content_dir,
+            &state_path,
+            state,
+        )
+        .expect_err("the hash mismatch must surface");
+
+        assert!(
+            content_dir.join("rules/old.sigma").exists(),
+            "what the agent runs today stays until the new release has fully landed"
+        );
+    }
+
+    #[test]
+    fn a_file_already_gone_after_a_crash_is_dropped_from_the_state_not_an_error() {
+        let dir = tmp("prune-crash-recovery");
+        let (content_dir, state_path, state) = applied(&dir, &["rules/a.sigma", "rules/b.sigma"]);
+        std::fs::remove_file(content_dir.join("rules/b.sigma")).unwrap();
+        let fetch_plan = FetchPlan {
+            release_version: 5,
+            to_fetch: vec![],
+            to_remove: vec!["rules/b.sigma".to_string()],
+        };
+
+        let removed = download_and_apply(
+            &offline_client(),
+            &fetch_plan,
+            "canary_0",
+            &content_dir,
+            &state_path,
+            state,
+        )
+        .unwrap();
+
+        assert_eq!(removed, 0, "nothing was left to delete");
+        let state = ContentState::load(&state_path).unwrap();
+        assert!(!state.entries.contains_key("rules/b.sigma"));
+        assert!(state.entries.contains_key("rules/a.sigma"));
+    }
+
+    #[test]
+    fn a_state_path_that_escapes_the_content_dir_deletes_nothing_outside_it() {
+        // The state file is the agent's own, unsigned record: a rewritten entry must not
+        // turn a roll-forward into an arbitrary delete as root.
+        let dir = tmp("prune-unsafe-state-path");
+        let (content_dir, state_path, mut state) = applied(&dir, &["rules/a.sigma"]);
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, b"keep me").unwrap();
+        let absolute = victim.to_string_lossy().into_owned();
+        for unsafe_path in ["../victim.txt", absolute.as_str(), "rules/../../victim.txt"] {
+            state
+                .entries
+                .insert(unsafe_path.to_string(), "a".repeat(64));
+        }
+        let manifest = signed_manifest_json(5, vec![entry("rules/a.sigma")]);
+        let fetch_plan = plan(&manifest, "canary_0", &state).unwrap();
+        assert_eq!(fetch_plan.to_remove.len(), 3);
+
+        let removed = download_and_apply(
+            &offline_client(),
+            &fetch_plan,
+            "canary_0",
+            &content_dir,
+            &state_path,
+            state,
+        )
+        .unwrap();
+
+        assert_eq!(removed, 0);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+        let state = ContentState::load(&state_path).unwrap();
+        assert_eq!(state.entries.keys().collect::<Vec<_>>(), ["rules/a.sigma"]);
     }
 
     #[test]
@@ -1209,6 +1426,7 @@ mod tests {
         let fetch_plan = FetchPlan {
             release_version: 1,
             to_fetch: vec![entry],
+            to_remove: vec![],
         };
         // No server at all — if this reached `get_bytes` it would fail with
         // a connection error instead, so a config/network-shaped error here

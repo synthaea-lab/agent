@@ -116,20 +116,28 @@ pub(crate) fn is_safe_path_segment(segment: &str) -> bool {
         .any(|reserved| stem.eq_ignore_ascii_case(reserved))
 }
 
+/// True if `path` is safe to join onto a local content root on every platform this agent
+/// targets: non-empty, relative, forward-slash-only, and every component passes
+/// [`is_safe_path_segment`]. Applies to a signed manifest's paths and equally to the paths
+/// of the agent's own state file, which is unsigned and so is checked again before anything
+/// is deleted by it.
+#[must_use]
+pub fn is_safe_content_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path.contains('\0')
+        && path.split('/').all(is_safe_path_segment)
+}
+
 impl ContentEntry {
-    /// True if [`Self::path`] is safe to join onto a local content root on
-    /// every platform this agent targets: non-empty, relative,
-    /// forward-slash-only, and every component passes
-    /// [`is_safe_path_segment`]. A signed path only proves who signed the
+    /// True if [`Self::path`] is safe to join onto a local content root
+    /// ([`is_safe_content_path`]). A signed path only proves who signed the
     /// manifest, not that it's safe to write — checked before any download
     /// happens (PR #509 review), not deferred to write time.
     #[must_use]
     pub fn is_safe_relative_path(&self) -> bool {
-        !self.path.is_empty()
-            && !self.path.starts_with('/')
-            && !self.path.contains('\\')
-            && !self.path.contains('\0')
-            && self.path.split('/').all(is_safe_path_segment)
+        is_safe_content_path(&self.path)
     }
 }
 
@@ -270,6 +278,18 @@ impl ContentManifest {
             .collect()
     }
 
+    /// Paths in `have` (the caller's map of already-applied `path -> sha256`) that this
+    /// manifest no longer lists, in path order. A release that stops listing a file is how
+    /// a bad rule is withdrawn: without removing these, a roll-forward leaves the old file
+    /// on disk and active (#666).
+    #[must_use]
+    pub fn entries_to_remove(&self, have: &BTreeMap<String, String>) -> Vec<String> {
+        have.keys()
+            .filter(|path| !self.entries.iter().any(|e| &e.path == *path))
+            .cloned()
+            .collect()
+    }
+
     /// Rejects the whole manifest if any entry's path is not safe to join
     /// onto a local content root ([`ContentEntry::is_safe_relative_path`]) —
     /// checked once, before anything is downloaded, rather than skipping the
@@ -316,6 +336,22 @@ mod tests {
         let sig = test_key_pair().sign(&msg);
         m.signature = hex_encode(sig.as_ref());
         m
+    }
+
+    #[test]
+    fn entries_the_manifest_no_longer_lists_are_reported_for_removal() {
+        let manifest = signed_manifest(2); // lists only rules/beacon.sigma
+        let have: BTreeMap<String, String> = [
+            ("rules/beacon.sigma".to_string(), "a".repeat(64)),
+            ("rules/old.sigma".to_string(), "b".repeat(64)),
+            ("models/m.pkl".to_string(), "c".repeat(64)),
+        ]
+        .into();
+        assert_eq!(
+            manifest.entries_to_remove(&have),
+            vec!["models/m.pkl".to_string(), "rules/old.sigma".to_string()]
+        );
+        assert!(manifest.entries_to_remove(&BTreeMap::new()).is_empty());
     }
 
     #[test]
