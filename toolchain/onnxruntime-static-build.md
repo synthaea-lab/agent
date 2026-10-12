@@ -249,11 +249,10 @@ changes that can break the link, not on every PR.
 - ✅ Windows 11 (MSVC, CPU only) - `cargo test -p ml` passes, no `onnxruntime.dll`, no
   `directml.dll`, no `d3d12.dll` (see above)
 
-**TODO:**
-- ⏳ macOS: the same `.a` workflow, prepared in issue #338 (`onnxruntime-static-build-macos.md`,
-  a macOS branch in `build-onnxruntime-static.sh`, `tools/check-macho-imports.py`,
-  `.github/workflows/macos-static-agent.yml`) but **never run on a Mac**: untested until that
-  workflow has a first run.
+- ✅ macOS on Apple Silicon (hosted runner `macos-15`, 2026-10-12, issue #338): onnxruntime from
+  source in 20 minutes, `cargo test -p ml` and the agent linked statically, no
+  `libonnxruntime.dylib` (`tools/check-macho-imports.py`, same list as `otool -L`); see
+  `onnxruntime-static-build-macos.md`. Intel: see that file.
 
 ## References
 

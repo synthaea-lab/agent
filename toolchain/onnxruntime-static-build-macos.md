@@ -5,11 +5,13 @@ ADR-0002 asks for one statically linked agent binary on every platform: no
 could hijack in a privileged process. Linux (`onnxruntime-static-build.md`) and Windows
 (`build-onnxruntime-static.ps1`, #337) have it. This is the macOS recipe.
 
-> **Status: written, never run.** Everything below was prepared without a Mac. The scripts and the
-> parser were tested for what can be tested on Linux (see "What was checked"); the build of
-> onnxruntime on macOS, the link, and the `otool` comparison have **not** been done by anyone.
-> `.github/workflows/macos-static-agent.yml` is the first run. Treat the "What this assumes"
-> section as a list of hypotheses that run must confirm or correct, and update this file from its log.
+> **Status: validated on a hosted Apple Silicon runner (2026-10-12), not on a Mac of ours, and
+> not yet on Intel.** The scripts were written without a Mac; the first run of
+> `.github/workflows/macos-static-agent.yml` (PR #788, `macos-15`, macOS 15.7.9, Xcode 16.4, CMake
+> 4.4.3, Rust 1.94.1) passed every step: onnxruntime from source, the link flags, the ML tests under
+> static linking, the agent, and the import check against `otool -L`. See "Measured" and "What the
+> assumptions turned out to be". The Intel result is recorded at the end of this file once the run
+> has finished.
 
 ## Prerequisites
 
@@ -46,7 +48,11 @@ What the scripts do on macOS that they do not do on Linux:
   onnxruntime and the agent target the same system.
 - After the build it runs `lipo -archs` on every archive and stops if one is not built for this
   machine (`uname -m`): a build under Rosetta, or a universal archive, would link or fail
-  depending on the Rust target. An archive `lipo` cannot describe (no object files) is skipped.
+  depending on the Rust target. An archive `lipo` cannot describe (no object files) is skipped,
+  but if it cannot describe *any* the script stops (the check would have looked at nothing).
+- Both platforms now check that the onnxruntime checkout is at the commit the `v1.30.0` tag
+  pointed at when this was pinned (`ONNX_COMMIT`), so a moved tag or a stale checkout fails
+  instead of building something nobody reviewed.
 - `ort-static-link-flags.sh` no longer needs bash 4 (`mapfile`, associative arrays), which
   macOS does not ship: `/bin/bash` there is 3.2. Its Linux output is byte-identical to before
   (checked on a synthetic tree).
@@ -63,33 +69,53 @@ also run against real Mach-O files (a thin arm64 `.dylib` and universal x86_64+a
 from unrelated software): the install names it printed are plausible, but it has not been
 compared with `otool -L` on a binary this project built; the workflow prints both.
 
-## What this assumes (to confirm on the first real run)
+## Measured (first run, `macos-15`, Apple Silicon, 3 cores, 2026-10-12)
 
-1. `./build.sh --config Release --update --build --no_telemetry ...` works unchanged on macOS
-   with the Xcode command line tools and a recent CMake, and writes to `build/MacOS/Release`.
-2. A native build needs no architecture flag (onnxruntime follows the host). If the
-   `lipo` check fails on a native Apple Silicon runner, this is the assumption that was wrong.
-3. `re2` is an orphaned CMake target here as on Linux, so the explicit
-   `cmake --build ... --target re2` is needed (if the target does not exist the script stops there).
-4. The ~78 abseil libraries, `utf8_range` and `model_package` that `ort-sys` 2.0.0-rc.13 does not
-   list are found by the same `.a` discovery the Linux script uses.
-5. `ort-sys` adds what a static link needs from the C++ runtime and the system frameworks on
-   macOS. If the link fails with undefined `std::` or Objective-C/CoreFoundation symbols, that
-   assumption is wrong: add `-C link-arg=-lc++` or `-C link-arg=-framework -C link-arg=Foundation`
-   to `RUSTFLAGS` in the script and record why here.
-6. `MACOSX_DEPLOYMENT_TARGET=13.0` is accepted by onnxruntime's CMake and by cargo for this
-   dependency graph; some macOS APIs the sensors use are 14+ and are gated at run time.
-7. The hosted runners: `macos-15` is Apple Silicon, `macos-15-intel` is Intel (a label this file
-   cannot verify; hence the Intel leg only runs on `workflow_dispatch`), both have `cmake`,
-   `python3`, `cpio` and rustup, and a cold onnxruntime build fits the job's 240 minutes. The cold
-   duration and the cache size are unknown and should be written here after the first run.
+| What | Result |
+| --- | --- |
+| onnxruntime v1.30.0 from source, cold (`--jobs 3`) | 20 min 11 s, 97 `.a` files in 23 directories |
+| `ort-static-link-flags.sh` | "23 directories, 97 libraries", no adjustment needed |
+| `cargo test -p ml --release --no-default-features` | all pass (42 in the lib, the golden and scorer suites), 1 min 20 s |
+| the `ml` test binary's imports | CoreFoundation, CoreML, Foundation, libSystem, libc++, libiconv; no onnxruntime |
+| agent link (`cargo build -j 2 --release --no-default-features -p agent`) | 14 min 17 s |
+| the agent's imports | the same set plus `libEndpointSecurity` and `libbsm` (the sensor); **`check-macho-imports.py` and `otool -L` list the same nine libraries** |
+| the agent's deployment target | `minos 13.0`, SDK 15.5 (`MACOSX_DEPLOYMENT_TARGET` was honoured) |
+| the agent's size | 50,663,424 bytes (48.3 MiB), arm64 only |
+| `agent --help` | runs |
+| a second run with the libraries cached | the tests and the agent link only, about 16 minutes |
+
+## What the assumptions turned out to be
+
+1. **onnxruntime builds unchanged with the Xcode tools and writes to `build/MacOS/Release`:** confirmed
+   (its own argument dump shows `build_dir=.../build/MacOS`).
+2. **A native build needs no architecture flag:** confirmed (`osx_arch='arm64'` by default, and the
+   `lipo -archs` check passed on all 97 archives).
+3. **`re2` needs the explicit target as on Linux:** the step ran and the build continued; whether it
+   was *needed* was not tested.
+4. **The abseil, utf8_range and model_package libraries are found by the same `.a` discovery:** confirmed.
+5. **`ort-sys` adds the C++ runtime and the frameworks a static link needs:** confirmed, no extra
+   flag was needed. **Surprise:** the link loads `CoreML.framework`, although this build has
+   `use_coreml=False`. It is an OS framework (present since macOS 10.13, so it satisfies the
+   "system libraries only" rule), and `ort-sys` is what asks for it; the agent therefore needs it
+   at load time even though the CoreML execution provider is not compiled in.
+6. **`MACOSX_DEPLOYMENT_TARGET=13.0` is accepted:** confirmed (`minos 13.0`).
+7. **Runners:** `macos-15` is Apple Silicon; **`macos-15-intel` is a real Intel runner** (its CMake
+   configured `CMAKE_OSX_ARCHITECTURES=x86_64`). `cmake`, `python3`, `cpio` and rustup were all
+   there, and the cold build fits the job's limit with a wide margin.
+
+**One thing the assumptions did not cover:** onnxruntime's CMake downloads its dependencies from
+GitHub while it configures (protobuf's `protoc`, `cpuinfo`, abseil, ...). On the first manual
+run both legs stopped a minute and a half in with `HTTP 504` on one of those downloads. The
+workflow now retries the build up to three times (the checkout and what was already fetched are
+reused). A build in a place with no route to GitHub needs those dependencies mirrored first
+(`--cmake_deps_mirror_dir` in onnxruntime's `build.py`; not tried).
 
 ## Not covered
 
 - Universal (fat) binaries: build each architecture natively and merge with `lipo` later if wanted.
 - Code signing and notarization of the agent: unaffected by static linking, tracked with the
   macOS packaging (`packaging/macos`).
-- The size of the binary: the workflow prints it in its job summary; record it here after a run.
+- A universal agent: the measured size is for arm64 only.
 - Anything that needs the Endpoint Security entitlement: this only checks the link and the ML
   tests, not a running sensor.
 
@@ -101,4 +127,5 @@ compared with `otool -L` on a binary this project built; the workflow prints bot
 | `build-onnxruntime-static.sh`, Linux path | yes | a stub `build.sh` and `cmake`: same steps and output as before |
 | `build-onnxruntime-static.sh`, macOS branch | the shell logic only | stubbed `uname`, `sysctl`, `lipo` on Linux: `MacOS` directory, `hw.ncpu` jobs, the architecture check passes and refuses |
 | `tools/check-macho-imports.py` | yes | 14 unit tests, plus real Mach-O files from other software |
-| onnxruntime build, link, tests, `otool -L`, size | **no** | `macos-static-agent.yml`, never run |
+| onnxruntime build, link, tests, `otool -L`, size (Apple Silicon) | **yes** | `macos-static-agent.yml` on `macos-15`, 2026-10-12 |
+| the same on Intel (`macos-15-intel`) | see the end of this file | `workflow_dispatch` with `intel: true` |

@@ -21,8 +21,10 @@ next to the agent (ADR-0002: one binary, no library to hijack). A name containin
 `onnxruntime` fails even under an allowed prefix.
 
 Exits 1 if any slice of any file loads a library that is not accepted. Exits 2 on a file
-that is not a Mach-O executable or is truncated or malformed, and on a pattern that
-matches nothing (a check that looked at nothing must not pass).
+that is not a Mach-O executable or is truncated or malformed, on a slice that loads no
+library at all (every macOS program loads libSystem, so zero means the parser did not read
+what it thinks it read), and on a pattern that matches nothing (a check that looked at
+nothing must not pass).
 """
 
 import argparse
@@ -197,6 +199,9 @@ def main() -> int:
         print(path)
         for one in slices:
             print(f"  [{one.arch}]")
+            if not one.libraries:
+                print(f"{path} [{one.arch}]: no dylib load commands at all", file=sys.stderr)
+                return 2
             for kind, name in sorted(set(one.libraries)):
                 verdict = judge(name, allowed)
                 suffix = f"  <- {verdict}" if verdict else ""

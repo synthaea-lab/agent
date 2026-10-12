@@ -25,6 +25,8 @@ CPU_I386 = 0x00000007
 LC_LOAD_DYLIB = 0xC
 LC_LOAD_WEAK_DYLIB = 0x80000018
 LC_REEXPORT_DYLIB = 0x8000001F
+LC_LAZY_LOAD_DYLIB = 0x20
+LC_LOAD_UPWARD_DYLIB = 0x80000023
 LC_RPATH = 0x8000001C
 LC_SEGMENT_64 = 0x19
 
@@ -150,13 +152,24 @@ class CheckMachoImportsTests(unittest.TestCase):
         path = self.write("agent", thin([dylib_command(LC_LOAD_DYLIB, "@rpath/libz.dylib")]))
         self.assertEqual(self.run_checker(str(path)).returncode, 1)
 
-    def test_weak_and_reexported_libraries_count_like_any_other(self) -> None:
-        for cmd in (LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB):
+    def test_weak_reexported_lazy_and_upward_libraries_count_like_any_other(self) -> None:
+        for cmd in (LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_LAZY_LOAD_DYLIB, LC_LOAD_UPWARD_DYLIB):
             with self.subTest(cmd=hex(cmd)):
                 path = self.write(f"agent-{cmd:x}", thin([dylib_command(cmd, "@rpath/libonnxruntime.dylib")]))
                 result = self.run_checker(str(path))
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("FORBIDDEN", result.stdout)
+
+    def test_a_slice_that_loads_no_library_is_refused_not_called_clean(self) -> None:
+        for name, data in (
+            ("no-commands", thin([])),
+            ("only-an-rpath", thin([rpath_command("@executable_path/../lib")])),
+            ("only-a-segment", thin([segment_command()])),
+        ):
+            with self.subTest(name=name):
+                result = self.run_checker(str(self.write(name, data)))
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("no dylib load commands", result.stderr)
 
     def test_rpaths_are_listed_and_do_not_fail_by_themselves(self) -> None:
         path = self.write("agent", thin([rpath_command("@executable_path/../lib"), dylib_command(LC_LOAD_DYLIB, SYSTEM[0])]))

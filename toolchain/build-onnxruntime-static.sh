@@ -9,9 +9,9 @@
 # Tested on:
 # - Ubuntu 24.04 (glibc) — ADR-0002 target platform
 # - Alpine 3.x (musl) — not a target, but confirms cross-libc viability
-# - macOS (Apple Silicon and Intel, #338): NOT TESTED by whoever wrote the macOS branch of
-#   this script (no Mac was available). It is exercised by .github/workflows/macos-static-agent.yml;
-#   read onnxruntime-static-build-macos.md for what is assumed and what that run must confirm.
+# - macOS (#338): Apple Silicon (hosted runner macos-15, 2026-10-12: built, linked, tested; see
+#   onnxruntime-static-build-macos.md for the measurements). Intel: see that file. The macOS
+#   branch was written without a Mac and first run by .github/workflows/macos-static-agent.yml.
 #
 # Prerequisites (Ubuntu):
 #   sudo apt-get install -y build-essential cmake git python3
@@ -34,6 +34,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ONNX_DIR="$REPO_ROOT/onnxruntime"
 ONNX_VERSION="v1.30.0"
+# The commit the tag pointed at when this was pinned (2026-10-12). A tag can be moved; a build
+# of something else than what was reviewed must fail, not run.
+ONNX_COMMIT="f2c39fe2f838cf35ce7da92824f5a5e3ee6e88a7"
 CLEAN=false
 
 # The platform decides the build directory onnxruntime's build.py uses and how to count CPUs
@@ -95,6 +98,13 @@ else
   echo "[onnxruntime] Using existing checkout: $ONNX_DIR"
 fi
 
+ACTUAL_COMMIT="$(git -C "$ONNX_DIR" rev-parse HEAD)"
+if [ "$ACTUAL_COMMIT" != "$ONNX_COMMIT" ]; then
+  echo "[onnxruntime] ERROR: $ONNX_DIR is at $ACTUAL_COMMIT, expected $ONNX_COMMIT ($ONNX_VERSION)." >&2
+  echo "  A moved tag or a stale checkout: rerun with --clean, or update ONNX_COMMIT on purpose." >&2
+  exit 1
+fi
+
 cd "$ONNX_DIR"
 
 # Build static libraries
@@ -143,10 +153,12 @@ fi
 if [ "$(uname -s)" = "Darwin" ]; then
   HOST_ARCH="$(uname -m)"
   WRONG=0
+  DESCRIBED=0
   while IFS= read -r archive; do
     archs="$(lipo -archs "$archive" 2>/dev/null || true)"
     # An archive lipo cannot describe (no object files) says nothing about the architecture.
     [ -n "$archs" ] || continue
+    DESCRIBED=$((DESCRIBED + 1))
     case " $archs " in
       *" $HOST_ARCH "*) ;;
       *)
@@ -155,6 +167,10 @@ if [ "$(uname -s)" = "Darwin" ]; then
         ;;
     esac
   done < <(find "$BUILD_DIR" -name 'lib*.a')
+  if [ "$DESCRIBED" -eq 0 ]; then
+    echo "[onnxruntime] ERROR: lipo could not describe any of the $LIB_COUNT archives: the architecture check looked at nothing." >&2
+    exit 1
+  fi
   if [ "$WRONG" -gt 0 ]; then
     echo "[onnxruntime] $WRONG archive(s) for another architecture; is this shell running under Rosetta?" >&2
     exit 1

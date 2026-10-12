@@ -68,6 +68,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # Part of the cache key below: libraries built with another Xcode or SDK, or for another
+      # deployment target, must not be reused (the script's hash covers neither).
+      - name: Xcode and SDK versions
+        id: xcode
+        run: |
+          echo "id=$(xcodebuild -version | tr -s ' \n' '--')-sdk$(xcrun --show-sdk-version)" >> "$GITHUB_OUTPUT"
+
       - name: Toolchain versions (for the log)
         run: |
           uname -m
@@ -87,7 +94,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ort-static
-          key: ort-static-macos-${{ runner.arch }}-${{ matrix.os }}-${{ hashFiles('lab/provisioning/build-onnxruntime-static.sh') }}
+          key: ort-static-macos-${{ runner.arch }}-${{ matrix.os }}-${{ steps.xcode.outputs.id }}-dt${{ env.MACOSX_DEPLOYMENT_TARGET }}-${{ hashFiles('lab/provisioning/build-onnxruntime-static.sh') }}
 
       # onnxruntime's CMake downloads its dependencies (protobuf's protoc, cpuinfo, abseil, ...)
       # from GitHub while it configures, and a download that answers HTTP 504 stops the whole
@@ -159,9 +166,12 @@ jobs:
       - name: Check the agent's dynamic libraries
         run: |
           set -euo pipefail
-          otool -L target/release/agent
+          libs="$(otool -L target/release/agent)"
+          echo "$libs"
           python3 tools/check-macho-imports.py target/release/agent
-          if otool -L target/release/agent | grep -qi onnxruntime; then
+          # Captured first: `otool | grep -q` under pipefail reports "no match" when grep
+          # exits early and otool dies of SIGPIPE.
+          if grep -qi onnxruntime <<<"$libs"; then
             echo "otool sees onnxruntime in the agent's imports" >&2
             exit 1
           fi
