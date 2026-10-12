@@ -378,17 +378,30 @@ fn read_blind_dirs(dirs: &[PathBuf]) -> Vec<&PathBuf> {
 ///
 /// With no directories configured, canaries planted by an earlier run are removed: dropping
 /// the `[deception]` table is how an operator turns the feature off, and it leaves no residue.
+#[cfg(test)]
 pub(crate) fn start(config: &config::DeceptionConfig, state_dir: &Path) -> Option<Tripwires> {
+    start_with_decoys(config, state_dir).0
+}
+
+/// `start`, and the SHA-256 (lowercase hex) of the decoy tokens found **in the canary files on
+/// disk** after planting, for the control plane to recognise one when it is presented. Hashes
+/// only: a token never leaves the host. Empty when nothing was planted. The tokens are read
+/// back from the files, not taken from the plan: a canary planted by an earlier build keeps
+/// its old content (`plant` never overwrites), so the plan's token would be one no file holds.
+pub(crate) fn start_with_decoys(
+    config: &config::DeceptionConfig,
+    state_dir: &Path,
+) -> (Option<Tripwires>, Vec<String>) {
     let inventory = inventory_path(state_dir);
     if config.canary_dirs.is_empty() {
         retire(&inventory);
-        return None;
+        return (None, Vec::new());
     }
     let seed = match load_or_create_seed(state_dir) {
         Ok(seed) => seed,
         Err(error) => {
             tracing::error!(%error, "deception: no seed, no canaries planted");
-            return None;
+            return (None, Vec::new());
         }
     };
     for dir in read_blind_dirs(&config.canary_dirs) {
@@ -400,14 +413,27 @@ pub(crate) fn start(config: &config::DeceptionConfig, state_dir: &Path) -> Optio
         );
     }
     let canaries = planned_canaries(config, &seed);
-    plant_each_directory(&canaries, &inventory);
-    // A canary deleted while the agent was down is put back now; see `refresh_once`.
+    // A canary deleted while the agent was down is put back first (see `refresh_once`), so that
+    // planting finds it unchanged: its decoy is then on disk and registered with the others.
     refresh_once(&canaries, &inventory);
+    let present = plant_each_directory(&canaries, &inventory);
+    let decoys = decoy_hashes_on_disk(&canaries, &present);
+    if canaries_hold_no_decoy(present.len(), decoys.len()) {
+        tracing::warn!(
+            canaries = present.len(),
+            "deception: canaries are in place but none holds a decoy token (planted by an \
+             earlier build): no decoy is registered, so a stolen decoy will not raise an alarm \
+             on this host; remove the canaries and restart to plant them again"
+        );
+    }
     match Inventory::load(&inventory) {
-        Ok(inventory) => Some(Tripwires::from_inventory(&inventory)).filter(|t| !t.is_empty()),
+        Ok(inventory) => (
+            Some(Tripwires::from_inventory(&inventory)).filter(|t| !t.is_empty()),
+            decoys,
+        ),
         Err(error) => {
             tracing::error!(%error, "deception: inventory unreadable, no tripwires");
-            None
+            (None, decoys)
         }
     }
 }
@@ -478,11 +504,138 @@ pub(crate) fn spawn_refresh(config: config::DeceptionConfig, state_dir: PathBuf)
     }
 }
 
+/// Whether canaries exist on this host but none carries a decoy token: the state of a host
+/// upgraded from a build that planted canaries without one, where the tripwires watch but the
+/// decoy-credential alarm cannot fire. The files keep their old content, so nothing else
+/// tells the operator why.
+fn canaries_hold_no_decoy(present: usize, decoys: usize) -> bool {
+    present > 0 && decoys == 0
+}
+
+/// SHA-256 of every decoy token that is in the files of `present` (the canaries `plant` wrote
+/// or found unchanged), read back from disk. A canary that was skipped (occupied, missing, in
+/// a directory that does not exist) contributes nothing, and neither does one planted by an
+/// earlier build whose content has no decoy line: registering a token no file holds would
+/// only spend one of the 256 slots a host has.
+fn decoy_hashes_on_disk(canaries: &[deception::Canary], present: &[PathBuf]) -> Vec<String> {
+    let on_disk: Vec<deception::Canary> = canaries
+        .iter()
+        .filter(|canary| present.contains(&canary.path))
+        .filter_map(|canary| {
+            let content = fs::read_to_string(&canary.path).ok()?;
+            Some(deception::Canary {
+                path: canary.path.clone(),
+                kind: canary.kind,
+                content,
+            })
+        })
+        .collect();
+    deception::decoy_tokens(&on_disk)
+        .iter()
+        .map(|token| deception::sha256_hex(token.as_bytes()))
+        .collect()
+}
+
+/// Delays between registration attempts, then the last one repeats. A control plane that is
+/// down at start is the ordinary case (the agent starts at boot), so this waits it out for
+/// about half a day before giving up; the next start tries again.
+const REGISTER_DELAYS: [std::time::Duration; 7] = [
+    std::time::Duration::from_secs(5),
+    std::time::Duration::from_secs(15),
+    std::time::Duration::from_secs(60),
+    std::time::Duration::from_secs(300),
+    std::time::Duration::from_secs(900),
+    std::time::Duration::from_secs(1800),
+    std::time::Duration::from_secs(3600),
+];
+
+/// Most attempts before giving up for this run.
+const REGISTER_ATTEMPTS: usize = 12;
+
+/// What came of registering the decoy hashes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Registration {
+    /// The control plane has them.
+    Registered { attempts: usize },
+    /// The control plane refused them and asking again would not change that.
+    Refused { attempts: usize },
+    /// Still unreachable after every attempt; the next start tries again.
+    GaveUp { attempts: usize },
+}
+
+/// Whether asking again cannot change the answer: the control plane called the request itself
+/// wrong (400 malformed, 409 over the per-agent bound, 413 too large, 422), or it could not be
+/// built (serialization, configuration). Everything else is worth the schedule, including
+/// what `TransportError::is_retryable` treats as final: a `429` or `408` from the proxy, a
+/// `401`/`403` from a proxy hiccup or a certificate not yet in place, a TLS or I/O error. The
+/// thread runs once per start and a daemon may not restart for days, so giving up early costs
+/// more than a few extra tries.
+fn refusal_will_not_change(error: &transport::TransportError) -> bool {
+    match error {
+        transport::TransportError::ServerError { status, .. } => {
+            matches!(*status, 400 | 409 | 413 | 422)
+        }
+        transport::TransportError::Serialization(_) | transport::TransportError::Config(_) => true,
+        _ => false,
+    }
+}
+
+/// Calls `register` until it succeeds, is refused for good, or `REGISTER_ATTEMPTS` is spent,
+/// sleeping `REGISTER_DELAYS` between tries. `sleep` is injected so the schedule is testable.
+pub(crate) fn register_with_retry(
+    mut register: impl FnMut() -> Result<(), transport::TransportError>,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> Registration {
+    for attempt in 1..=REGISTER_ATTEMPTS {
+        match register() {
+            Ok(()) => return Registration::Registered { attempts: attempt },
+            Err(error) if refusal_will_not_change(&error) => {
+                tracing::error!(%error, "deception: the control plane refused the decoy registration");
+                return Registration::Refused { attempts: attempt };
+            }
+            Err(error) => {
+                tracing::warn!(%error, attempt, "deception: decoy registration failed, will retry");
+                if attempt < REGISTER_ATTEMPTS {
+                    sleep(REGISTER_DELAYS[(attempt - 1).min(REGISTER_DELAYS.len() - 1)]);
+                }
+            }
+        }
+    }
+    Registration::GaveUp {
+        attempts: REGISTER_ATTEMPTS,
+    }
+}
+
+/// Registers `hashes` with the control plane in the background: a detached thread, so the
+/// agent's start and its shutdown never wait for it.
+pub(crate) fn register_decoys_in_background(
+    client: std::sync::Arc<transport::TransportClient>,
+    hashes: Vec<String>,
+) {
+    if hashes.is_empty() {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("decoy-register".into())
+        .spawn(move || {
+            let outcome =
+                register_with_retry(|| client.register_decoy_tokens(&hashes), std::thread::sleep);
+            tracing::info!(
+                ?outcome,
+                count = hashes.len(),
+                "deception: decoy registration"
+            );
+        });
+    if let Err(error) = spawned {
+        tracing::error!(%error, "deception: could not start the decoy registration thread");
+    }
+}
+
 /// Plants the canaries one directory at a time, so a directory the agent cannot write (the
 /// packaged unit's `ProtectSystem=strict` makes most of the host read-only) costs only its
 /// own canaries. The plan is made once for every placement: planning per directory would
 /// give each the same names.
-fn plant_each_directory(canaries: &[deception::Canary], inventory: &Path) {
+fn plant_each_directory(canaries: &[deception::Canary], inventory: &Path) -> Vec<PathBuf> {
     let mut by_dir: Vec<(&Path, Vec<deception::Canary>)> = Vec::new();
     for canary in canaries {
         let dir = canary.path.parent().unwrap_or(Path::new(""));
@@ -491,15 +644,20 @@ fn plant_each_directory(canaries: &[deception::Canary], inventory: &Path) {
             None => by_dir.push((dir, vec![canary.clone()])),
         }
     }
+    let mut present = Vec::new();
     for (dir, group) in by_dir {
         match deception::plant(&group, inventory) {
-            Ok(report) => tracing::info!(
-                dir = %dir.display(),
-                planted = report.planted.len(),
-                unchanged = report.unchanged.len(),
-                skipped = report.skipped.len(),
-                "deception: canaries planted"
-            ),
+            Ok(report) => {
+                tracing::info!(
+                    dir = %dir.display(),
+                    planted = report.planted.len(),
+                    unchanged = report.unchanged.len(),
+                    skipped = report.skipped.len(),
+                    "deception: canaries planted"
+                );
+                present.extend(report.planted);
+                present.extend(report.unchanged);
+            }
             Err(error) => tracing::error!(
                 dir = %dir.display(),
                 %error,
@@ -508,6 +666,7 @@ fn plant_each_directory(canaries: &[deception::Canary], inventory: &Path) {
             ),
         }
     }
+    present
 }
 
 /// Removes canaries a previous run planted, when the operator no longer configures any.
@@ -1030,6 +1189,299 @@ mod tests {
             allow.allows(11, by_target.image_of(11, Some(1)).as_ref()),
             "the resolved path still matches"
         );
+    }
+
+    #[test]
+    fn the_decoy_hashes_are_the_hashes_of_the_tokens_in_the_planted_files() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (_, hashes) = start_with_decoys(&config_for(&[dir.path()]), state.path());
+        // One token in the credentials canary and one in the config canary.
+        assert_eq!(hashes.len(), 2);
+        let mut on_disk: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .flat_map(|entry| {
+                let text = fs::read_to_string(entry.unwrap().path()).unwrap();
+                text.split_whitespace()
+                    .filter(|w| w.starts_with("syn_dk_"))
+                    .map(|t| deception::sha256_hex(t.as_bytes()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut sent = hashes;
+        on_disk.sort();
+        sent.sort();
+        assert_eq!(sent, on_disk);
+        assert!(
+            sent.iter()
+                .all(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        );
+    }
+
+    #[test]
+    fn a_restart_registers_the_same_hashes() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let first = start_with_decoys(&config_for(&[dir.path()]), state.path()).1;
+        let second = start_with_decoys(&config_for(&[dir.path()]), state.path()).1;
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_decoy_canary_deleted_while_the_agent_was_down_is_registered_after_the_restart() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_for(&[dir.path()]);
+        let mut first = start_with_decoys(&config, state.path()).1;
+        assert_eq!(first.len(), 2);
+        let seed = load_or_create_seed(state.path()).unwrap();
+        let carrier = plan_for(&config, &seed)
+            .into_iter()
+            .find(|canary| !deception::decoy_tokens(std::slice::from_ref(canary)).is_empty())
+            .unwrap();
+        fs::remove_file(&carrier.path).unwrap();
+
+        let mut second = start_with_decoys(&config, state.path()).1;
+        first.sort();
+        second.sort();
+        assert_eq!(
+            second, first,
+            "the replanted canary holds its decoy again, and it is registered"
+        );
+    }
+
+    #[test]
+    fn nothing_configured_registers_nothing() {
+        let state = tempfile::tempdir().unwrap();
+        assert!(
+            start_with_decoys(&config_for(&[]), state.path())
+                .1
+                .is_empty()
+        );
+    }
+
+    fn network_error() -> transport::TransportError {
+        transport::TransportError::Network("connection refused".into())
+    }
+
+    #[test]
+    fn registration_that_succeeds_at_once_never_sleeps() {
+        let mut sleeps = Vec::new();
+        let outcome = register_with_retry(|| Ok(()), |d| sleeps.push(d));
+        assert_eq!(outcome, Registration::Registered { attempts: 1 });
+        assert!(sleeps.is_empty());
+    }
+
+    #[test]
+    fn an_unreachable_control_plane_is_waited_out_on_the_schedule() {
+        let mut failures = 3;
+        let mut sleeps = Vec::new();
+        let outcome = register_with_retry(
+            || {
+                if failures > 0 {
+                    failures -= 1;
+                    Err(network_error())
+                } else {
+                    Ok(())
+                }
+            },
+            |d| sleeps.push(d),
+        );
+        assert_eq!(outcome, Registration::Registered { attempts: 4 });
+        assert_eq!(sleeps, REGISTER_DELAYS[..3].to_vec());
+    }
+
+    #[test]
+    fn a_refusal_that_will_not_change_stops_the_attempts() {
+        let mut calls = 0;
+        let mut slept = false;
+        let outcome = register_with_retry(
+            || {
+                calls += 1;
+                Err(transport::TransportError::ServerError {
+                    status: 409,
+                    message: "at most 256 decoy tokens per agent".into(),
+                })
+            },
+            |_| slept = true,
+        );
+        assert_eq!(outcome, Registration::Refused { attempts: 1 });
+        assert_eq!(calls, 1);
+        assert!(!slept);
+    }
+
+    #[test]
+    fn registration_gives_up_after_the_attempts_with_the_last_delay_repeated() {
+        let mut calls = 0;
+        let mut sleeps = Vec::new();
+        let outcome = register_with_retry(
+            || {
+                calls += 1;
+                Err(network_error())
+            },
+            |d| sleeps.push(d),
+        );
+        assert_eq!(
+            outcome,
+            Registration::GaveUp {
+                attempts: REGISTER_ATTEMPTS
+            }
+        );
+        assert_eq!(calls, REGISTER_ATTEMPTS);
+        assert_eq!(
+            sleeps.len(),
+            REGISTER_ATTEMPTS - 1,
+            "no sleep after the last try"
+        );
+        assert_eq!(sleeps.last(), REGISTER_DELAYS.last());
+    }
+
+    /// The plan `start_with_decoys` makes for `config`, for the tests that need the paths.
+    fn plan_for(config: &config::DeceptionConfig, seed: &Seed) -> Vec<deception::Canary> {
+        planned_canaries(config, seed)
+    }
+
+    /// Plants the canaries as an earlier build did: same files, no decoy line, inventoried.
+    fn plant_without_decoys(config: &config::DeceptionConfig, state: &Path) {
+        let seed = load_or_create_seed(state).unwrap();
+        let stripped: Vec<deception::Canary> = plan_for(config, &seed)
+            .into_iter()
+            .map(|mut canary| {
+                canary.content = canary
+                    .content
+                    .lines()
+                    .filter(|line| !line.contains("syn_dk_"))
+                    .map(|line| format!("{line}\n"))
+                    .collect();
+                canary
+            })
+            .collect();
+        deception::plant(&stripped, &inventory_path(state)).unwrap();
+    }
+
+    #[test]
+    fn canaries_planted_by_an_earlier_build_register_no_token_that_no_file_holds() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_for(&[dir.path()]);
+        plant_without_decoys(&config, state.path());
+        let (tripwires, hashes) = start_with_decoys(&config, state.path());
+        assert!(tripwires.is_some(), "the old canaries still watch");
+        assert!(
+            hashes.is_empty(),
+            "the plan's tokens are in no file: {hashes:?}"
+        );
+    }
+
+    #[test]
+    fn an_upgraded_host_with_canaries_but_no_decoy_line_is_flagged() {
+        assert!(canaries_hold_no_decoy(4, 0));
+        assert!(
+            !canaries_hold_no_decoy(4, 2),
+            "a host that registers decoys is fine"
+        );
+        assert!(
+            !canaries_hold_no_decoy(0, 0),
+            "nothing planted is another message"
+        );
+    }
+
+    #[test]
+    fn a_directory_that_does_not_exist_contributes_no_decoy_hash() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-created");
+        let (_, hashes) = start_with_decoys(&config_for(&[dir.path(), &missing]), state.path());
+        assert_eq!(
+            hashes.len(),
+            2,
+            "the two tokens of the directory that exists"
+        );
+    }
+
+    #[test]
+    fn a_canary_replaced_by_the_users_own_file_contributes_no_decoy_hash() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_for(&[dir.path()]);
+        let seed = load_or_create_seed(state.path()).unwrap();
+        let planned = plan_for(&config, &seed);
+        let token_canary = planned
+            .iter()
+            .find(|c| c.content.contains("syn_dk_"))
+            .unwrap();
+        fs::write(&token_canary.path, "the user's own file").unwrap();
+        let (_, hashes) = start_with_decoys(&config, state.path());
+        assert_eq!(hashes.len(), 1, "only the other token-carrying canary");
+    }
+
+    #[test]
+    fn a_file_that_was_not_planted_is_not_read_for_tokens_even_if_it_holds_one() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_for(&[dir.path()]);
+        let seed = load_or_create_seed(state.path()).unwrap();
+        let planned = plan_for(&config, &seed);
+        // Someone's own file sits at a canary's path and happens to contain a token (a copy
+        // of one from elsewhere): `plant` skips it as occupied and it is not ours to register.
+        let token_canary = planned
+            .iter()
+            .find(|c| c.content.contains("syn_dk_"))
+            .unwrap();
+        fs::write(&token_canary.path, &token_canary.content).unwrap();
+        let (_, hashes) = start_with_decoys(&config, state.path());
+        assert_eq!(
+            hashes.len(),
+            1,
+            "only the token of the canary that was planted"
+        );
+    }
+
+    #[test]
+    fn only_a_refusal_that_will_not_change_stops_the_attempts() {
+        let server_error = |status| transport::TransportError::ServerError {
+            status,
+            message: String::new(),
+        };
+        for status in [400, 409, 413, 422] {
+            assert!(refusal_will_not_change(&server_error(status)), "{status}");
+        }
+        for status in [401, 403, 404, 408, 429, 500, 502, 503] {
+            assert!(!refusal_will_not_change(&server_error(status)), "{status}");
+        }
+        assert!(!refusal_will_not_change(&network_error()));
+        assert!(!refusal_will_not_change(&transport::TransportError::Tls(
+            "certificate expired".into()
+        )));
+        assert!(refusal_will_not_change(&transport::TransportError::Config(
+            "no url".into()
+        )));
+        let bad_json = serde_json::from_str::<u8>("x").unwrap_err();
+        assert!(refusal_will_not_change(&transport::TransportError::from(
+            bad_json
+        )));
+    }
+
+    #[test]
+    fn a_429_from_the_proxy_is_retried_on_the_schedule() {
+        let mut failures = 2;
+        let mut sleeps = Vec::new();
+        let outcome = register_with_retry(
+            || {
+                if failures > 0 {
+                    failures -= 1;
+                    Err(transport::TransportError::ServerError {
+                        status: 429,
+                        message: "slow down".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+            |d| sleeps.push(d),
+        );
+        assert_eq!(outcome, Registration::Registered { attempts: 3 });
+        assert_eq!(sleeps, REGISTER_DELAYS[..2].to_vec());
     }
 
     #[test]
