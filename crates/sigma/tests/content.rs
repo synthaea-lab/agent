@@ -20,6 +20,9 @@ use sigma::SigmaEngine;
 struct Sample {
     image: String,
     cmdline: String,
+    /// The parent process image, for the rules that key on lineage (`ParentImage`).
+    #[serde(default)]
+    parentimage: Option<String>,
     /// Why this event is in the file; for a negative sample, which boundary it probes.
     #[serde(default)]
     #[allow(dead_code)]
@@ -47,6 +50,7 @@ fn exec(sample: &Sample) -> ExecEvent {
         },
         image_path: sample.image.clone(),
         cmdline: sample.cmdline.clone(),
+        parent_image_path: sample.parentimage.clone(),
         ..schema::fixtures::exec()
     }
 }
