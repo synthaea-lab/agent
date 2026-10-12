@@ -132,7 +132,12 @@ mod tests {
             let text =
                 std::fs::read_to_string(format!("{}/keys/{file}.pub", env!("CARGO_MANIFEST_DIR")))
                     .unwrap();
-            assert_eq!(parse_key_file(&text), None, "{file}.pub");
+            assert_eq!(
+                parse_key_file(&text),
+                None,
+                "{file}.pub holds a key now: this test pins the unprovisioned state and is meant \
+                 to be replaced with a check that the embedded keys are the committed ones"
+            );
         }
     }
 
@@ -153,7 +158,48 @@ mod tests {
     }
 
     #[test]
-    fn the_marker_follows_the_feature_that_compiles_the_test_seed_in() {
-        const { assert!(SYNTHAEA_UPDATER_TEST_KEY) };
+    fn every_committed_key_file_is_unprovisioned_or_a_valid_key() {
+        // A typo or a truncated key parses to `None`, which at run time reads as "no
+        // production key" and hides the real cause. Catch it where the file is committed.
+        for file in ["release", "content", "recovery"] {
+            let text =
+                std::fs::read_to_string(format!("{}/keys/{file}.pub", env!("CARGO_MANIFEST_DIR")))
+                    .unwrap();
+            let line = text
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty() && !l.starts_with('#'))
+                .unwrap_or_else(|| panic!("{file}.pub has no key line"));
+            assert!(
+                line == "unprovisioned" || parse_key_file(&text).is_some(),
+                "{file}.pub is neither `unprovisioned` nor 64 hex characters: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn committed_keys_are_distinct_per_role_and_not_all_zero() {
+        // Identical files would silently collapse the role separation (ADR-0027): a
+        // content signer could then sign releases. Vacuous while the files are
+        // `unprovisioned`, and the day real keys land it starts to bite.
+        let keys: Vec<(&str, [u8; 32])> = ["release", "content", "recovery"]
+            .into_iter()
+            .filter_map(|file| {
+                let text = std::fs::read_to_string(format!(
+                    "{}/keys/{file}.pub",
+                    env!("CARGO_MANIFEST_DIR")
+                ))
+                .unwrap();
+                parse_key_file(&text).map(|key| (file, key))
+            })
+            .collect();
+        for (file, key) in &keys {
+            assert_ne!(*key, [0u8; 32], "{file}.pub is all zeros");
+        }
+        for (i, (a_file, a)) in keys.iter().enumerate() {
+            for (b_file, b) in &keys[i + 1..] {
+                assert_ne!(a, b, "{a_file}.pub and {b_file}.pub hold the same key");
+            }
+        }
     }
 }

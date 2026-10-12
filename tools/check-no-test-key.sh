@@ -36,6 +36,29 @@ default_build="$(tree -p agent -p watchdog -p cli)"
 grep -q 'feature "test-key"' <<<"$default_build" \
     || fail "the default build no longer enables updater/test-key: this check lost its positive control"
 
+# The packaging scripts hold the real flags; this script's own copy above must not drift from
+# them, so assert that each still builds the same package set without default features.
+for script in packaging/linux/build-deb.sh packaging/linux/build-rpm.sh; do
+    # Join backslash continuations first: build-deb.sh spreads the command over two lines.
+    build_line="$(sed -e ':a' -e '/\\$/N; s/\\\n//; ta' "$script" \
+        | grep -E '^[^#]*cargo build .*-p agent -p watchdog -p cli' || true)"
+    [ -n "$build_line" ] || fail "$script no longer has a \`cargo build ... -p agent -p watchdog -p cli\` line: update this check"
+    grep -q -- '--no-default-features' <<<"$build_line" \
+        || fail "$script builds the packaged binaries with default features (test key)"
+    grep -q 'assert-no-test-key.sh' "$script" \
+        || fail "$script does not scan its built binaries with tools/assert-no-test-key.sh"
+done
+
+# The binary scan must be able to see the marker, or its silence means nothing.
+probe="$(mktemp)"
+printf 'xx SYNTHAEA-PUBLIC-TEST-KEY-SET-V1 xx' > "$probe"
+if tools/assert-no-test-key.sh "$probe" 2>/dev/null; then
+    rm -f "$probe"
+    fail "tools/assert-no-test-key.sh did not flag a file that carries the marker"
+fi
+rm -f "$probe"
+tools/assert-no-test-key.sh /nonexistent 2>/dev/null && fail "assert-no-test-key.sh accepted a missing binary"
+
 marker="SYNTHAEA-PUBLIC-TEST-KEY-SET-V1"
 target="$(mktemp -d)"
 trap 'rm -rf "$target"' EXIT
