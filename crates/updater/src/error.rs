@@ -19,10 +19,22 @@ pub enum UpdaterError {
     #[error("manifest signature does not verify")]
     SignatureInvalid,
 
+    /// This build embeds no production signing key for the manifest's kind, so nothing can
+    /// be verified (ADR-0027: the key files under `crates/updater/keys/` are unprovisioned).
+    #[error("this build embeds no production signing key for this manifest (ADR-0027)")]
+    SigningKeyUnprovisioned,
+
     /// `release_version` is not strictly greater than the currently installed
     /// one (ADR-0015 Decision 2: anti-rollback-attack check).
     #[error("release {offered} is not newer than the installed release {current}")]
     ReleaseNotNewer { offered: u64, current: u64 },
+
+    /// A content manifest lists nothing while the agent has applied content: applying it
+    /// would delete every recorded file and leave the agent with no rules. A release that
+    /// really withdraws everything must be a deliberate, separate decision; an empty or
+    /// mis-globbed build must not be able to do it by accident.
+    #[error("the manifest lists no content but {would_remove} applied file(s) would be removed")]
+    EmptyContentManifest { would_remove: usize },
 
     /// A content manifest's `ring` does not match the ring the caller actually
     /// requested. A valid signature only proves "we signed this manifest", not

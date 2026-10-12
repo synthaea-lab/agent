@@ -23,9 +23,12 @@ ML-based anomaly detection, and response capabilities.
 %setup -q
 
 %build
-# --exclude needs --workspace. Honour CARGO_TARGET_DIR (a small build host may keep
-# its target directory elsewhere); %install reads the same variable.
-cargo build --release --workspace --bins --exclude sensor-linux-ebpf
+# Only the packaged binaries, and without the agent's default `test-key` feature: a
+# `--workspace` build unifies features, so release-tool (which keeps the public test key for
+# lab releases) would put that key into the agent (ADR-0027; tools/check-no-test-key.sh).
+# Honour CARGO_TARGET_DIR (a small build host may keep its target directory elsewhere);
+# %install reads the same variable.
+cargo build --release --bins -p agent -p watchdog -p cli --no-default-features --features agent/dynamic-onnx
 
 %install
 # Binaries to bootstrap directory

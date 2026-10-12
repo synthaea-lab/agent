@@ -31,4 +31,5 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 schema = { path = "../../../schema", features = ["test-fixtures"] }
+proptest = "1.11.0"
 serde_json = { workspace = true }

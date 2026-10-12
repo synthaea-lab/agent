@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::UpdaterError,
     hash::{hex_decode, hex_encode},
-    key::UPDATER_PUBLIC_KEY,
+    key::CONTENT_PUBLIC_KEY,
 };
 
 /// The only `schema_version` this build accepts — same anti-drift stance as
@@ -116,20 +116,28 @@ pub(crate) fn is_safe_path_segment(segment: &str) -> bool {
         .any(|reserved| stem.eq_ignore_ascii_case(reserved))
 }
 
+/// True if `path` is safe to join onto a local content root on every platform this agent
+/// targets: non-empty, relative, forward-slash-only, and every component passes
+/// [`is_safe_path_segment`]. Applies to a signed manifest's paths and equally to the paths
+/// of the agent's own state file, which is unsigned and so is checked again before anything
+/// is deleted by it.
+#[must_use]
+pub fn is_safe_content_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path.contains('\0')
+        && path.split('/').all(is_safe_path_segment)
+}
+
 impl ContentEntry {
-    /// True if [`Self::path`] is safe to join onto a local content root on
-    /// every platform this agent targets: non-empty, relative,
-    /// forward-slash-only, and every component passes
-    /// [`is_safe_path_segment`]. A signed path only proves who signed the
+    /// True if [`Self::path`] is safe to join onto a local content root
+    /// ([`is_safe_content_path`]). A signed path only proves who signed the
     /// manifest, not that it's safe to write — checked before any download
     /// happens (PR #509 review), not deferred to write time.
     #[must_use]
     pub fn is_safe_relative_path(&self) -> bool {
-        !self.path.is_empty()
-            && !self.path.starts_with('/')
-            && !self.path.contains('\\')
-            && !self.path.contains('\0')
-            && self.path.split('/').all(is_safe_path_segment)
+        is_safe_content_path(&self.path)
     }
 }
 
@@ -187,8 +195,8 @@ impl ContentManifest {
     }
 
     /// Verifies this manifest's `schema_version` and Ed25519 signature against
-    /// [`UPDATER_PUBLIC_KEY`] — the same embedded key that verifies binary
-    /// release manifests. Does not check `release_version` monotonicity,
+    /// [`CONTENT_PUBLIC_KEY`], the `content` key of the trust set (not the
+    /// `release` key; they are one key only in the test set). Does not check `release_version` monotonicity,
     /// `ring` assignment, or per-entry hashes — see [`Self::check_release_version`]
     /// and the caller's own per-artifact hash check after download.
     ///
@@ -196,7 +204,8 @@ impl ContentManifest {
     ///
     /// [`UpdaterError::SchemaVersionUnsupported`] if `schema_version` does not
     /// match [`CONTENT_MANIFEST_SCHEMA_VERSION`]; [`UpdaterError::SignatureInvalid`]
-    /// if the signature is malformed or does not verify.
+    /// if the signature is malformed or does not verify;
+    /// [`UpdaterError::SigningKeyUnprovisioned`] if this build embeds no `content` key.
     pub fn verify_signature(&self) -> Result<(), UpdaterError> {
         if self.schema_version != CONTENT_MANIFEST_SCHEMA_VERSION {
             return Err(UpdaterError::SchemaVersionUnsupported {
@@ -206,7 +215,13 @@ impl ContentManifest {
         }
         let sig_bytes = hex_decode(&self.signature).ok_or(UpdaterError::SignatureInvalid)?;
         let msg = self.canonical_bytes();
-        let public_key = UnparsedPublicKey::new(&signature::ED25519, UPDATER_PUBLIC_KEY.as_slice());
+        let public_key = UnparsedPublicKey::new(
+            &signature::ED25519,
+            CONTENT_PUBLIC_KEY
+                .as_ref()
+                .ok_or(UpdaterError::SigningKeyUnprovisioned)?
+                .as_slice(),
+        );
         public_key
             .verify(&msg, &sig_bytes)
             .map_err(|_| UpdaterError::SignatureInvalid)
@@ -270,6 +285,18 @@ impl ContentManifest {
             .collect()
     }
 
+    /// Paths in `have` (the caller's map of already-applied `path -> sha256`) that this
+    /// manifest no longer lists, in path order. A release that stops listing a file is how
+    /// a bad rule is withdrawn: without removing these, a roll-forward leaves the old file
+    /// on disk and active (#666).
+    #[must_use]
+    pub fn entries_to_remove(&self, have: &BTreeMap<String, String>) -> Vec<String> {
+        have.keys()
+            .filter(|path| !self.entries.iter().any(|e| &e.path == *path))
+            .cloned()
+            .collect()
+    }
+
     /// Rejects the whole manifest if any entry's path is not safe to join
     /// onto a local content root ([`ContentEntry::is_safe_relative_path`]) —
     /// checked once, before anything is downloaded, rather than skipping the
@@ -316,6 +343,39 @@ mod tests {
         let sig = test_key_pair().sign(&msg);
         m.signature = hex_encode(sig.as_ref());
         m
+    }
+
+    #[test]
+    fn a_content_path_that_is_not_a_safe_relative_path_is_refused() {
+        for unsafe_path in [
+            "/etc/hostname",
+            "C:/Windows/x",
+            "rules/../../x",
+            "..",
+            "",
+            "rules\\x",
+            "rules/a.sigma:stream",
+            "rules/CON",
+        ] {
+            assert!(!is_safe_content_path(unsafe_path), "{unsafe_path:?}");
+        }
+        assert!(is_safe_content_path("rules/beacon.sigma"));
+    }
+
+    #[test]
+    fn entries_the_manifest_no_longer_lists_are_reported_for_removal() {
+        let manifest = signed_manifest(2); // lists only rules/beacon.sigma
+        let have: BTreeMap<String, String> = [
+            ("rules/beacon.sigma".to_string(), "a".repeat(64)),
+            ("rules/old.sigma".to_string(), "b".repeat(64)),
+            ("models/m.pkl".to_string(), "c".repeat(64)),
+        ]
+        .into();
+        assert_eq!(
+            manifest.entries_to_remove(&have),
+            vec!["models/m.pkl".to_string(), "rules/old.sigma".to_string()]
+        );
+        assert!(manifest.entries_to_remove(&BTreeMap::new()).is_empty());
     }
 
     #[test]

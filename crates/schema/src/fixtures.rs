@@ -37,8 +37,8 @@ use crate::{
     NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, PrctlEvent, ProcessVmReadEvent,
     ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
     SessionEvent, SessionState, ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
-    SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent,
-    User, WmiActivityEvent,
+    SocketCreateEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
+    UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -430,6 +430,18 @@ pub fn socket_accept() -> SocketAcceptEvent {
         accepted_fd: 0,
         peer_addr: TEST_ADDR,
         peer_port: 0,
+    }
+}
+
+/// Neutral [`SocketCreateEvent`] (`AF_INET`/`SOCK_STREAM`/`IPPROTO_TCP`).
+#[must_use]
+pub fn socket_create() -> SocketCreateEvent {
+    SocketCreateEvent {
+        meta: meta(),
+        domain: 2,
+        socket_type: 1,
+        protocol: 6,
+        fd: 0,
     }
 }
 

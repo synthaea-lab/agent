@@ -13,6 +13,14 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use crate::sink::DetectionSink;
 
+/// Whether a failed manifest verification says anything about the file: a build with no
+/// release key (ADR-0027, `crates/updater/keys` unprovisioned) cannot verify any manifest, so
+/// reporting that as "the manifest may have been tampered with" would be a false detection on
+/// every pass. Everything else (a bad signature, an unsupported schema) is about the file.
+fn signature_failure_is_tamper(error: &updater::UpdaterError) -> bool {
+    !matches!(error, updater::UpdaterError::SigningKeyUnprovisioned)
+}
+
 /// How often the active release is re-verified. Deliberately much coarser than
 /// `silence::POLL_INTERVAL` (10s) — this hashes every protected file (real I/O),
 /// and a same-privilege on-disk swap is not a race that needs sub-minute detection
@@ -73,6 +81,14 @@ fn check_once(layout: &updater::layout::Layout, sink: &DetectionSink) {
     // manifest swapped on disk *after* a clean earlier check still gets caught on
     // the next one.
     if let Err(e) = manifest.verify_signature() {
+        if !signature_failure_is_tamper(&e) {
+            tracing::warn!(
+                release_version,
+                "self-integrity: this build embeds no release key, so the persisted manifest \
+                 cannot be verified; the check is skipped"
+            );
+            return;
+        }
         tracing::warn!(
             error = %e,
             release_version,
@@ -107,6 +123,16 @@ mod tests {
     use updater::{ReleaseManifest, key::test_key_pair, layout::Layout};
 
     use super::*;
+
+    #[test]
+    fn a_build_with_no_release_key_does_not_report_tamper() {
+        assert!(!signature_failure_is_tamper(
+            &updater::UpdaterError::SigningKeyUnprovisioned
+        ));
+        assert!(signature_failure_is_tamper(
+            &updater::UpdaterError::SignatureInvalid
+        ));
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let dir =
