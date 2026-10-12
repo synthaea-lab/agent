@@ -308,6 +308,15 @@ pub struct ExecEvent {
     /// Parent short name at exec time, from the `PROC_LINEAGE` map. Empty when the
     /// parent forked before the probe attached and `/proc` priming missed it.
     pub pcomm: [u8; TASK_COMM_LEN],
+    /// The parent's own parent (`PROC_LINEAGE[ppid].ppid`), `0` when unknown. A parent
+    /// that forked and never exec'd (a subshell: `$(...)`, a pipeline stage) runs the image
+    /// of the process that forked it, so this is how userspace answers for it (#784).
+    pub grandparent_pid: u32,
+    /// Explicit padding so `grandparent_generation` is 8-aligned. Always zero.
+    pub reserved: u32,
+    /// The stamp of `grandparent_pid` as the parent's fork recorded it
+    /// (`PROC_LINEAGE[ppid].parent_generation`), `0` when unknown.
+    pub grandparent_generation: u64,
 }
 
 /// Value of the `PROC_LINEAGE` fork-tracking map: a pid's parent identity, captured

@@ -107,6 +107,12 @@ pub(crate) fn record_sched_process_exec(pid: u32, filename_ptr: *const u8) -> u3
                 (*e).pcomm[i] = l.comm[i];
                 i += 1;
             }
+            // The parent's own parent and its stamp, for a parent that forked and never
+            // exec'd (#784): one more lookup, the parent's entry, left zero when it has none.
+            if let Some(parent) = PROC_LINEAGE.get(&l.ppid) {
+                (*e).grandparent_pid = parent.ppid;
+                (*e).grandparent_generation = parent.parent_generation;
+            }
         }
 
         // Authoritative image path: the tracepoint's own `filename` field (the

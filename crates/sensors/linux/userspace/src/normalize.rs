@@ -782,6 +782,9 @@ mod tests {
             image: image_buf,
             image_len: image.len() as u16,
             pcomm: pcomm_buf,
+            grandparent_pid: 0,
+            reserved: 0,
+            grandparent_generation: 0,
         }
     }
 
