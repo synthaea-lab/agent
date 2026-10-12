@@ -8,6 +8,8 @@
 //! ```text
 //! release-tool manifest --release-version 3 --dir dist/ --out manifest.json
 //! release-tool sign --kind release --key-file release.key manifest.json --out signed.json
+//! release-tool roll-forward --from v2.json --release-version 5 --released-at 2026-10-12T09:30:00Z --out v5.json
+//! release-tool sign --kind content --key-file release.key v5.json --out v5-signed.json
 //! release-tool public-key --key-file release.key
 //! ```
 //!
@@ -18,6 +20,7 @@
 
 mod keyfile;
 mod manifest_dir;
+mod roll_forward;
 mod sign;
 
 use std::{io::Write as _, path::PathBuf};
@@ -46,6 +49,23 @@ enum Command {
         /// Directory holding the release files (`agent`, `watchdog`, `cli`, ...).
         #[arg(long)]
         dir: PathBuf,
+        /// Write here instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Rebuild an earlier content manifest as a newer, unsigned one: the corrective release that
+    /// withdraws content from agents that already applied a later release (ADR-0032).
+    RollForward {
+        /// The earlier content manifest to restore (its signature is dropped).
+        #[arg(long)]
+        from: PathBuf,
+        /// The corrective release's `release_version`: the next number the control plane will assign,
+        /// one above the highest release of the ring (rolled-back ones included).
+        #[arg(long)]
+        release_version: u64,
+        /// When it is released, UTC, `YYYY-MM-DDTHH:MM:SSZ`.
+        #[arg(long)]
+        released_at: String,
         /// Write here instead of stdout.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -116,6 +136,25 @@ fn main() -> anyhow::Result<()> {
             eprintln!(
                 "unsigned release manifest v{release_version}: {} entries",
                 manifest.entries.len()
+            );
+            emit(&serde_json::to_string_pretty(&manifest)?, out.as_ref())
+        }
+        Command::RollForward {
+            from,
+            release_version,
+            released_at,
+            out,
+        } => {
+            let text = std::fs::read_to_string(&from)
+                .with_context(|| format!("cannot read {}", from.display()))?;
+            let manifest = roll_forward::roll_forward(&text, release_version, &released_at)?;
+            eprintln!(
+                "unsigned corrective content manifest v{release_version} for ring {} ({} entries, \
+                 the content of v{}); sign it with `release-tool sign --kind content`",
+                manifest.ring,
+                manifest.entries.len(),
+                serde_json::from_str::<updater::ContentManifest>(&text)
+                    .map_or(0, |earlier| earlier.release_version)
             );
             emit(&serde_json::to_string_pretty(&manifest)?, out.as_ref())
         }
