@@ -237,7 +237,12 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         content_dir,
         storage,
     )?;
-    super::common::plant_canaries(&pipeline.sink, deception, storage);
+    super::common::plant_canaries(
+        &pipeline.sink,
+        deception,
+        storage,
+        pipeline.transport.as_ref(),
+    );
     let sink = Arc::clone(&pipeline.sink);
 
     // The watcher thread itself can start any time after the mask above — only the
