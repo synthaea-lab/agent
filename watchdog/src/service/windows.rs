@@ -231,6 +231,11 @@ pub(crate) fn cmd_install(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow
         "DisplayName=",
         SERVICE_DISPLAY,
     ])?;
+    // Puts the service SID `NT SERVICE\SynthaEDR` in the watchdog's token, and so
+    // in the agent's (spawned with the watchdog's token): the minifilter's
+    // communication port only accepts a client holding it (ADR-0012 guardrail 5,
+    // #136). Without it the agent can't connect to the driver.
+    run_sc(&["sidtype", SERVICE_NAME, "unrestricted"])?;
     run_sc(&["description", SERVICE_NAME, SERVICE_DESC])?;
     // Automatic restart if the watchdog itself is killed (2 layers of protection).
     run_sc(&[

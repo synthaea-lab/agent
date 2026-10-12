@@ -1,5 +1,7 @@
 //! HTTP client with mTLS support.
 
+use std::io::Read;
+
 use schema::{Event, detection::Detection};
 use serde::Serialize;
 
@@ -84,6 +86,21 @@ impl TransportClient {
         Ok(())
     }
 
+    /// Registers the SHA-256 (lowercase hex) of the decoy credentials this agent planted
+    /// (issue #81), so the control plane can recognise one when it is presented. Hashes only:
+    /// the token itself never leaves the host. Idempotent on the server, so the caller may
+    /// repeat it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the registration (a malformed hash, too many
+    /// for this agent) or cannot be reached; [`TransportError::is_retryable`] says which.
+    pub fn register_decoy_tokens(&self, sha256_hex: &[String]) -> Result<()> {
+        let payload = DecoyPayload { tokens: sha256_hex };
+        let _response: serde_json::Value = self.post_json(&self.config.decoy_url(), &payload)?;
+        Ok(())
+    }
+
     /// Fetches an arbitrary JSON resource via GET — used for the content
     /// manifest fetch (ADR-0016, issue #30/#73). Generic over the response
     /// type rather than a concrete `updater::ContentManifest`: `transport` and
@@ -158,10 +175,7 @@ impl TransportClient {
             request = request.header("Idempotency-Key", key);
         }
         let response = request.send(&body).map_err(|e| match &e {
-            ureq::Error::StatusCode(status) => TransportError::ServerError {
-                status: *status,
-                message: e.to_string(),
-            },
+            ureq::Error::StatusCode(status) => server_error(*status, e.to_string()),
             _ => TransportError::Network(e.to_string()),
         })?;
 
@@ -202,16 +216,36 @@ fn send_get(
     if status < 400 {
         return Ok(response);
     }
-    let text = response
-        .into_body()
-        .with_config()
-        .limit(ERROR_BODY_LIMIT)
-        .read_to_string()
-        .unwrap_or_default();
-    Err(TransportError::ServerError {
+    let text = read_error_body(response.into_body().into_reader());
+    Err(server_error(
         status,
-        message: error_reason(&text).unwrap_or_else(|| format!("http status: {status}")),
-    })
+        error_reason(&text).unwrap_or_else(|| format!("http status: {status}")),
+    ))
+}
+
+fn server_error(status: u16, message: String) -> TransportError {
+    let message = message
+        .chars()
+        .filter(|character| !character.is_control() && !is_bidi_control(*character))
+        .collect();
+    TransportError::ServerError { status, message }
+}
+
+fn read_error_body<R: Read>(reader: R) -> String {
+    let mut bytes = Vec::new();
+    let _ = reader.take(ERROR_BODY_LIMIT).read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn is_bidi_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200e}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{206a}'..='\u{206f}'
+    )
 }
 
 /// The explanation in an error body: the `error`, `message` or `reason` string
@@ -250,6 +284,12 @@ struct UploadPayload<'a> {
 struct HeartbeatPayload<'a, T: Serialize> {
     agent_id: Option<&'a str>,
     beacon: &'a T,
+}
+
+/// Payload for decoy credential registration: hashes only.
+#[derive(Serialize)]
+struct DecoyPayload<'a> {
+    tokens: &'a [String],
 }
 
 /// Response from an event upload.
@@ -366,6 +406,33 @@ mod tests {
     use crate::DEFAULT_HEARTBEAT_ENDPOINT;
 
     #[test]
+    fn server_error_reason_removes_terminal_controls_and_bidi_markers() {
+        let err = server_error(
+            423,
+            "\x1b[31mhalted\nnext line\r\0\u{0080}\u{009f}\u{202e}".into(),
+        );
+        let expected = "[31mhaltednext line";
+        assert_eq!(err.locked_reason(), Some(expected));
+        assert_eq!(err.to_string(), format!("server error: 423 - {expected}"));
+    }
+
+    #[test]
+    fn error_body_is_capped_at_two_kibibytes() {
+        let input = "x".repeat(3 * 1024);
+        let actual = read_error_body(input.as_bytes());
+        assert_eq!(actual.len(), ERROR_BODY_LIMIT as usize);
+        assert_eq!(actual, "x".repeat(ERROR_BODY_LIMIT as usize));
+    }
+
+    #[test]
+    fn error_body_truncation_inside_utf8_is_lossy_not_a_panic() {
+        let input = format!("{}é", "a".repeat(ERROR_BODY_LIMIT as usize - 1));
+        let actual = read_error_body(input.as_bytes());
+        let expected = format!("{}�", "a".repeat(ERROR_BODY_LIMIT as usize - 1));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn config_builds_urls_correctly() {
         let config = TransportConfig::new("https://api.example.com");
         assert_eq!(
@@ -391,6 +458,33 @@ mod tests {
             .join(DEFAULT_HEARTBEAT_ENDPOINT.trim_start_matches('/'))
             .join("route.ts");
         assert!(route.is_file(), "no server route at {}", route.display());
+    }
+
+    #[test]
+    fn the_decoy_endpoint_is_a_real_server_route() {
+        let config = TransportConfig::new("https://api.example.com");
+        assert_eq!(
+            config.decoy_url(),
+            "https://api.example.com/api/ingest/decoy"
+        );
+        assert!(crate::DEFAULT_DECOY_ENDPOINT.starts_with("/api/ingest/"));
+        let route = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../server/app")
+            .join(crate::DEFAULT_DECOY_ENDPOINT.trim_start_matches('/'))
+            .join("route.ts");
+        assert!(route.is_file(), "no server route at {}", route.display());
+    }
+
+    /// The body the server parses (`DecoyRegistration` in `server/lib/decoy.ts`): a `tokens`
+    /// array of lowercase SHA-256 hex, and nothing else.
+    #[test]
+    fn decoy_registration_body_is_the_documented_wire_shape() {
+        let hashes = vec!["a".repeat(64), "b".repeat(64)];
+        let body = serde_json::to_value(DecoyPayload { tokens: &hashes }).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "tokens": [hashes[0], hashes[1]] })
+        );
     }
 
     #[test]

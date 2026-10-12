@@ -24,7 +24,8 @@ use crate::{
         write_signal_watch_pid,
     },
     normalize,
-    proc::{read_proc_cmdline, read_proc_environ_security},
+    parent_image::{IMAGE_CACHE_CAP, ParentImages},
+    proc::{read_proc_cmdline, read_proc_environ_security, read_proc_images},
 };
 
 /// See `sensor_linux_wire::boot_epoch_offset_ns` — computed once at startup.
@@ -214,6 +215,17 @@ impl LinuxSensor {
             ),
         }
 
+        // The same processes' image paths, so the first child of an already-running
+        // parent resolves `parent_image_path` too (#768).
+        let mut parent_images = ParentImages::new(IMAGE_CACHE_CAP);
+        for (pid, generation, image) in read_proc_images(IMAGE_CACHE_CAP) {
+            parent_images.prime(pid, generation, image);
+        }
+        tracing::info!(
+            primed = parent_images.len(),
+            "sensor-linux: primed process images for parent_image_path"
+        );
+
         for (program, name) in RAW_TRACEPOINTS {
             attach_raw_tracepoint(&mut ebpf, program, name)?;
         }
@@ -240,6 +252,7 @@ impl LinuxSensor {
         let mut udp_recv_ring_buf = ring("UDP_RECV_EVENTS")?;
         let mut socket_listen_ring_buf = ring("SOCKET_LISTEN_EVENTS")?;
         let mut socket_accept_ring_buf = ring("SOCKET_ACCEPT_EVENTS")?;
+        let mut socket_create_ring_buf = ring("SOCKET_CREATE_EVENTS")?;
         let mut file_setxattr_ring_buf = ring("FILE_SETXATTR_EVENTS")?;
         let mut file_removexattr_ring_buf = ring("FILE_REMOVEXATTR_EVENTS")?;
         let mut mount_ring_buf = ring("MOUNT_EVENTS")?;
@@ -256,7 +269,7 @@ impl LinuxSensor {
         let mut namespace_ring_buf = ring("NAMESPACE_EVENTS")?;
 
         tracing::info!(
-            "sensor-linux: listening for exec/open/connect/write/delete/rename/bind/chmod/chown/udp_send/udp_recv/listen/accept/setxattr/removexattr/mount/signal/kernel_module/bpf/prctl/ptrace/process_vm_readv/process_vm_writev/memfd_create/identity_change/capset/namespace events"
+            "sensor-linux: listening for exec/open/connect/write/delete/rename/bind/chmod/chown/udp_send/udp_recv/listen/accept/socket_create/setxattr/removexattr/mount/signal/kernel_module/bpf/prctl/ptrace/process_vm_readv/process_vm_writev/memfd_create/identity_change/capset/namespace events"
         );
 
         let mut container_ids = CgroupIdCache::new();
@@ -298,7 +311,11 @@ impl LinuxSensor {
                     // file family, same tradeoff). Container attribution no longer
                     // touches `/proc` at all — see `CgroupIdCache`.
                     drain!(guard, sensor_linux_wire::ExecEvent, sink, own_pid, |e: &sensor_linux_wire::ExecEvent| {
-                        normalize::exec(e, offset, read_proc_cmdline(e.meta.pid), read_proc_environ_security(e.meta.pid), container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        let mut event = normalize::exec(e, offset, read_proc_cmdline(e.meta.pid), read_proc_environ_security(e.meta.pid), container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache));
+                        if let schema::Event::Exec(exec) = &mut event {
+                            parent_images.annotate(exec);
+                        }
+                        event
                     });
                 }
                 guard = file_open_ring_buf.readable_mut() => {
@@ -371,6 +388,12 @@ impl LinuxSensor {
                     drain!(guard, sensor_linux_wire::SocketAcceptEvent, sink, own_pid,
                         |e: &sensor_linux_wire::SocketAcceptEvent| {
                             normalize::socket_accept(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = socket_create_ring_buf.readable_mut() => {
+                    drain!(guard, sensor_linux_wire::SocketCreateEvent, sink, own_pid,
+                        |e: &sensor_linux_wire::SocketCreateEvent| {
+                            normalize::socket_create(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
                 guard = file_setxattr_ring_buf.readable_mut() => {

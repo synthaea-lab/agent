@@ -106,6 +106,32 @@ pub fn parse_orphaned_sessions(logman_query_ets_output: &str) -> Vec<String> {
         .collect()
 }
 
+/// Names `wtrace-` sessions from a native ETW enumeration and notes when the
+/// caller filled its fixed-size session buffer, so more sessions may be hidden.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanedSessionSelection {
+    /// Sessions that this agent family may have orphaned.
+    pub names: Vec<String>,
+    /// True when the enumeration capacity was reached.
+    pub possibly_truncated: bool,
+}
+
+#[must_use]
+pub fn select_orphaned_sessions(
+    sessions: &[SessionStats],
+    capacity: usize,
+    api_reported_more: bool,
+) -> OrphanedSessionSelection {
+    OrphanedSessionSelection {
+        names: sessions
+            .iter()
+            .filter(|session| session.name.starts_with("wtrace-"))
+            .map(|session| session.name.clone())
+            .collect(),
+        possibly_truncated: api_reported_more || (capacity > 0 && sessions.len() >= capacity),
+    }
+}
+
 /// Runs `start`, and on failure calls `stop_session(session)` before returning
 /// the error (#408). `ferrisetw`'s `start_and_process` creates the session
 /// (`StartTrace`), then enables each provider and opens the consumer; if one of
@@ -128,16 +154,16 @@ pub fn start_or_stop_session<T, E>(
     result
 }
 
-/// Describes our session's state from `logman query -ets` output, for the error
+/// Describes our session's state from an ETW session listing, for the error
 /// the liveness canary raises after 30 s of silence (#408). "Stopped from the
 /// outside" and "still running but blind" call for different investigations, and
 /// the old message ("trace stopped or tampered") didn't tell them apart. Other
 /// `wtrace-` sessions at that point are not orphans (startup stopped those): they
-/// belong to another running instance. `None`: logman itself failed.
+/// belong to another running instance. `None`: enumeration failed.
 #[must_use]
-pub fn describe_silent_session(session: &str, logman_query_ets_output: Option<&str>) -> String {
-    let Some(output) = logman_query_ets_output else {
-        return format!("session {session}: state unknown (logman query -ets failed)");
+pub fn describe_silent_session(session: &str, session_listing: Option<&str>) -> String {
+    let Some(output) = session_listing else {
+        return format!("session {session}: state unknown (ETW session enumeration failed)");
     };
     let ours = parse_orphaned_sessions(output);
     let running = ours.iter().any(|name| name == session);
@@ -148,6 +174,15 @@ pub fn describe_silent_session(session: &str, logman_query_ets_output: Option<&s
         "is no longer running (stopped from outside the agent)"
     };
     format!("session {session} {state}; other wtrace- sessions running: {others}")
+}
+
+/// Whether a session listing can decide if `session` is running. A complete listing
+/// always can; one cut at the API's limit only when it contains the session (presence
+/// is proven, absence never: the session may be among those not returned). When this
+/// is false the state must be asked of another source or reported as unknown.
+#[must_use]
+pub fn listing_is_conclusive(possibly_truncated: bool, names: &[&str], session: &str) -> bool {
+    !possibly_truncated || names.contains(&session)
 }
 
 /// One session enabling one of our providers, as the OS reports it (#408).
@@ -172,6 +207,21 @@ pub struct SessionStats {
     pub real_time: bool,
     /// Buffers flushed so far; a real-time session nobody consumes stays at 0.
     pub buffers_written: u32,
+    /// Events the ETW session could not record.
+    pub events_lost: u32,
+    /// Real-time buffers the consumer could not keep up with.
+    pub real_time_buffers_lost: u32,
+    /// Log-file buffers the writer could not keep up with.
+    pub log_buffers_lost: u32,
+}
+
+/// Formats the three loss counters returned by `EVENT_TRACE_PROPERTIES`.
+#[must_use]
+pub fn describe_session_losses(stats: &SessionStats) -> String {
+    format!(
+        "EventsLost={} RealTimeBuffersLost={} LogBuffersLost={}",
+        stats.events_lost, stats.real_time_buffers_lost, stats.log_buffers_lost
+    )
 }
 
 /// At most this many foreign sessions are named in a diagnosis.
@@ -226,8 +276,13 @@ pub fn describe_foreign_sessions(
             } else {
                 ""
             };
+            let losses = sessions
+                .iter()
+                .find(|stats| stats.name == *name)
+                .map(describe_session_losses)
+                .unwrap_or_else(|| "loss counters unavailable".to_string());
             format!(
-                "{name} ({} of our providers, level {level}{flag}: {})",
+                "{name} ({} of our providers, level {level}{flag}: {}; {losses})",
                 providers.len(),
                 providers.join(", ")
             )
@@ -299,6 +354,10 @@ impl ConnectDedup {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use proptest::prelude::*;
+
     use super::*;
 
     #[test]
@@ -461,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_logman_says_the_state_is_unknown() {
+    fn a_failed_session_enumeration_says_the_state_is_unknown() {
         let text = describe_silent_session("wtrace-aaaaaaaaaaaaaaaa", None);
         assert!(text.contains("state unknown"), "{text}");
     }
@@ -551,7 +610,162 @@ mod tests {
             name: name.to_string(),
             real_time,
             buffers_written,
+            events_lost: 0,
+            real_time_buffers_lost: 0,
+            log_buffers_lost: 0,
         }
+    }
+
+    #[test]
+    fn native_enumeration_selects_only_our_session_prefix() {
+        let sessions = [
+            stats("wtrace-orphan-a", true, 0),
+            stats("EventLog-System", true, 4),
+            stats("wtrace-orphan-b", false, 3),
+        ];
+        let selected = select_orphaned_sessions(&sessions, 64, false);
+        assert_eq!(selected.names, ["wtrace-orphan-a", "wtrace-orphan-b"]);
+        assert!(!selected.possibly_truncated);
+    }
+
+    #[test]
+    fn a_full_native_session_list_is_reported_as_potentially_truncated() {
+        let sessions: Vec<_> = (0..64)
+            .map(|i| stats(&format!("session-{i}"), true, 1))
+            .collect();
+        let selected = select_orphaned_sessions(&sessions, 64, false);
+        assert!(selected.possibly_truncated);
+    }
+
+    #[test]
+    fn a_truncated_listing_proves_presence_but_not_absence() {
+        let names = ["wtrace-a", "other"];
+        assert!(listing_is_conclusive(false, &names, "wtrace-missing"));
+        assert!(!listing_is_conclusive(true, &names, "wtrace-missing"));
+        assert!(listing_is_conclusive(true, &names, "wtrace-a"));
+    }
+
+    proptest! {
+        #[test]
+        fn selected_wtrace_set_is_independent_of_session_order(
+            entries in prop::collection::vec((any::<String>(), any::<u64>()), 0..100)
+        ) {
+            let sessions: Vec<_> = entries
+                .iter()
+                .map(|(name, _)| stats(name, true, 0))
+                .collect();
+            let mut permuted: Vec<_> = entries
+                .iter()
+                .enumerate()
+                .map(|(index, (name, key))| (*key, index, stats(name, true, 0)))
+                .collect();
+            permuted.sort_by_key(|(key, index, _)| (*key, *index));
+            let permuted_sessions: Vec<_> = permuted.into_iter().map(|(_, _, session)| session).collect();
+
+            let original = select_orphaned_sessions(&sessions, usize::MAX, false);
+            let reordered = select_orphaned_sessions(&permuted_sessions, usize::MAX, false);
+            let original_names: BTreeSet<_> = original.names.into_iter().collect();
+            let reordered_names: BTreeSet<_> = reordered.names.into_iter().collect();
+            prop_assert_eq!(original_names, reordered_names);
+        }
+
+        #[test]
+        fn selected_session_names_always_have_the_owned_prefix(
+            names in prop::collection::vec(any::<String>(), 0..100)
+        ) {
+            let sessions: Vec<_> = names.iter().map(|name| stats(name, false, 0)).collect();
+            let selected = select_orphaned_sessions(&sessions, usize::MAX, false);
+            prop_assert!(selected.names.iter().all(|name| name.starts_with("wtrace-")));
+            for name in names.iter().filter(|name| !name.starts_with("wtrace-")) {
+                prop_assert!(!selected.names.contains(name));
+            }
+        }
+
+        #[test]
+        fn a_truncated_listing_only_decides_present_names(
+            names in prop::collection::vec("[a-zA-Z0-9-]{1,24}", 0..30),
+            session in "[a-zA-Z0-9-]{1,24}",
+            truncated in any::<bool>()
+        ) {
+            let borrowed: Vec<_> = names.iter().map(String::as_str).collect();
+            let independently_expected = !truncated || names.iter().any(|name| name == &session);
+            prop_assert_eq!(
+                listing_is_conclusive(truncated, &borrowed, &session),
+                independently_expected
+            );
+        }
+
+        #[test]
+        fn silent_diagnosis_reports_target_presence_and_other_count(
+            other_count in 0usize..20
+        ) {
+            let session = "wtrace-target";
+            let mut output = String::from("Header\r\n");
+            for index in 0..other_count {
+                output.push_str(&format!("wtrace-other-{index}\tTrace\tRunning\r\n"));
+            }
+            output.push_str("wtrace-target\tTrace\tRunning\r\n");
+            let diagnosis = describe_silent_session(session, Some(&output));
+            let expected_suffix = format!("other wtrace- sessions running: {other_count}");
+            prop_assert!(diagnosis.contains("still running but delivers no events"));
+            prop_assert!(diagnosis.ends_with(&expected_suffix), "diagnosis: {}", diagnosis);
+        }
+    }
+
+    #[test]
+    fn native_session_capacity_reports_exactly_64_as_possibly_truncated() {
+        let below_capacity: Vec<_> = (0..63)
+            .map(|index| stats(&format!("session-{index}"), true, 1))
+            .collect();
+        let at_capacity: Vec<_> = (0..64)
+            .map(|index| stats(&format!("session-{index}"), true, 1))
+            .collect();
+
+        assert!(!select_orphaned_sessions(&below_capacity, 64, false).possibly_truncated);
+        assert!(select_orphaned_sessions(&at_capacity, 64, false).possibly_truncated);
+    }
+
+    #[test]
+    fn parser_handles_localized_crlf_blank_control_and_long_rows() {
+        let long_name = format!("wtrace-{}", "x".repeat(32 * 1024));
+        let output = format!(
+            "Ensemble de collecteurs de donn\u{e9}es\tType\t\u{c9}tat\r\n\r\n\
+             {long_name}\tSuivi\tEn cours d'ex\u{e9}cution\r\n\
+             wtrace- \tSuivi\tEn cours d'ex\u{e9}cution\r\n\
+             wtrace-\u{7}alert\tSuivi\tEn cours d'ex\u{e9}cution\r\n\
+             ordinary-wtrace-not-ours\tSuivi\tEn cours d'ex\u{e9}cution\r\n"
+        );
+        let parsed = parse_orphaned_sessions(&output);
+
+        assert_eq!(
+            parsed,
+            [
+                long_name,
+                "wtrace-".to_string(),
+                "wtrace-\u{7}alert".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn silent_diagnosis_with_failed_enumeration_is_explicitly_unknown() {
+        let diagnosis = describe_silent_session("wtrace-target", None);
+        assert_eq!(
+            diagnosis,
+            "session wtrace-target: state unknown (ETW session enumeration failed)"
+        );
+    }
+
+    #[test]
+    fn loss_counters_are_formatted_with_the_windows_field_names() {
+        let mut session = stats("EventLog-System", true, 4);
+        session.events_lost = 7;
+        session.real_time_buffers_lost = 2;
+        session.log_buffers_lost = 3;
+        assert_eq!(
+            describe_session_losses(&session),
+            "EventsLost=7 RealTimeBuffersLost=2 LogBuffersLost=3"
+        );
     }
 
     #[test]
@@ -581,12 +795,12 @@ mod tests {
         ];
         let text = describe_foreign_sessions("wtrace-x", &enablements, &sessions);
         assert!(
-            text.starts_with("; foreign sessions enabling our providers: lab408b-allnine (1 of our providers, level 5, real-time with 0 buffers written: nobody consumes it: Kernel-Process)"),
+            text.starts_with("; foreign sessions enabling our providers: lab408b-allnine (1 of our providers, level 5, real-time with 0 buffers written: nobody consumes it: Kernel-Process; EventsLost=0 RealTimeBuffersLost=0 LogBuffersLost=0)"),
             "{text}"
         );
         assert!(
             text.contains(
-                "EventLog-System (2 of our providers, level 4: Kernel-Process, Kernel-File)"
+                "EventLog-System (2 of our providers, level 4: Kernel-Process, Kernel-File; EventsLost=0 RealTimeBuffersLost=0 LogBuffersLost=0)"
             ),
             "{text}"
         );

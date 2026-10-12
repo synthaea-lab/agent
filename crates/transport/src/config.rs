@@ -3,9 +3,9 @@
 use std::{path::PathBuf, time::Duration};
 
 use crate::{
-    DEFAULT_BATCH_SIZE, DEFAULT_DETECTION_ENDPOINT, DEFAULT_HEARTBEAT_ENDPOINT,
-    DEFAULT_INGEST_ENDPOINT, DEFAULT_MAX_DRAIN_ATTEMPTS, DEFAULT_MAX_NETWORK_DRAIN_ATTEMPTS,
-    DEFAULT_RETRY_BASE_MS, DEFAULT_RETRY_MAX_MS,
+    DEFAULT_BATCH_SIZE, DEFAULT_DECOY_ENDPOINT, DEFAULT_DETECTION_ENDPOINT,
+    DEFAULT_HEARTBEAT_ENDPOINT, DEFAULT_INGEST_ENDPOINT, DEFAULT_MAX_DRAIN_ATTEMPTS,
+    DEFAULT_MAX_NETWORK_DRAIN_ATTEMPTS, DEFAULT_RETRY_BASE_MS, DEFAULT_RETRY_MAX_MS,
 };
 
 /// Configuration for the transport layer.
@@ -36,6 +36,8 @@ pub struct TransportConfig {
 
     /// Endpoint for heartbeat.
     pub heartbeat_endpoint: String,
+    /// Path where decoy credential hashes are registered (issue #81).
+    pub decoy_endpoint: String,
 
     /// Maximum events per upload request.
     pub batch_size: usize,
@@ -75,6 +77,7 @@ impl Default for TransportConfig {
             ingest_endpoint: DEFAULT_INGEST_ENDPOINT.to_string(),
             detection_endpoint: DEFAULT_DETECTION_ENDPOINT.to_string(),
             heartbeat_endpoint: DEFAULT_HEARTBEAT_ENDPOINT.to_string(),
+            decoy_endpoint: DEFAULT_DECOY_ENDPOINT.to_string(),
             batch_size: DEFAULT_BATCH_SIZE,
             retry_base: Duration::from_millis(DEFAULT_RETRY_BASE_MS),
             retry_max: Duration::from_millis(DEFAULT_RETRY_MAX_MS),
@@ -135,6 +138,12 @@ impl TransportConfig {
     #[must_use]
     pub fn heartbeat_url(&self) -> String {
         format!("{}{}", self.server_url, self.heartbeat_endpoint)
+    }
+
+    /// Returns the full URL for decoy credential registration.
+    #[must_use]
+    pub fn decoy_url(&self) -> String {
+        format!("{}{}", self.server_url, self.decoy_endpoint)
     }
 
     /// Returns the full URL for the content manifest endpoint for `ring`

@@ -2,7 +2,7 @@
 
 **Status:** Implementation of ADR-0002 decision #2 (static linking for single-binary deployment)
 **Issue:** #110
-**Platform:** Linux (Ubuntu 24.04+ tested; Alpine/musl tested but not a target platform)
+**Platform:** Linux (Ubuntu 24.04+ tested; Alpine/musl tested but not a target platform) and Windows MSVC (see the Windows section below)
 
 ## Background
 
@@ -137,7 +137,9 @@ Measure final agent binary size, not just the `ml` crate test binaries.
 
 ## CI Integration
 
-**Not yet implemented.** Options:
+**Windows:** `windows-static-agent.yml`, see the Windows section below. **Linux:**
+`linux-deb-portability.yml` builds the static `.deb` on Alpine/musl. The options below
+were the ones weighed before either existed. Options:
 
 1. **Pre-built static libraries:** Cache onnxruntime static build artifacts in CI, keyed by version + platform
 2. **Build on demand:** Run the full onnxruntime build in CI (adds ~5-10 minutes to build time)
@@ -145,17 +147,112 @@ Measure final agent binary size, not just the `ml` crate test binaries.
 
 Decision deferred pending binary size measurement and platform support requirements.
 
+## Windows (MSVC)
+
+Issue #337. Same idea as Linux, different tools: PowerShell scripts, `.lib` files, the
+Visual Studio generator.
+
+### Prerequisites
+
+- Visual Studio 2022 Build Tools with the "Desktop development with C++" workload
+  (MSVC 14.3x and a Windows SDK). CMake is taken from `PATH`, else from the Build Tools.
+- Git and Python 3 on `PATH`, Rust with the `x86_64-pc-windows-msvc` target.
+- A path without spaces: `RUSTFLAGS` is split on whitespace.
+
+### Build
+
+```powershell
+# 1. Build onnxruntime v1.30.0 from source (CPU only), then re2 explicitly
+.\lab\provisioning\build-onnxruntime-static.ps1
+
+# 2. Point ort-sys at the result and generate the link flags
+$env:ORT_LIB_LOCATION = "$PWD\onnxruntime\build\Windows\Release\Release"
+.\lab\provisioning\ort-static-link-flags.ps1 | Invoke-Expression
+
+# 3. Build and test with static linking (disables dynamic-onnx)
+cargo test -j 1 -p ml --release --no-default-features
+
+# 4. Check what the result depends on
+python tools\check-pe-imports.py target\release\deps\ml-*.exe
+```
+
+Measured on a 12-thread laptop, cold: the onnxruntime build took 48 minutes and left a
+3.4 GB build directory with 101 `.lib` files (1.1 GB). `cargo test -p ml` then passes
+(58 tests across the lib and the integration tests when measured; 67 after later merges
+of `main`, as re-checked on a second host).
+
+**The checkout path must not contain a space.** onnxruntime's generated project files
+quote nothing, so a path such as `C:\Users\First Last\...` fails with `LNK1181` on
+`symbols.def` after a long build; the script now refuses to start under such a path.
+
+### What is different from Linux
+
+- **CPU only, on purpose.** The prebuilt archive that `dynamic-onnx` downloads links
+  DirectML, so the agent imports `directml.dll` and `d3d12.dll` for an execution provider
+  it never uses. The source build has neither. `dxgi.dll` stays: onnxruntime's own device
+  discovery imports it, and it is an OS component, not something to ship or sign.
+- **Dynamic C runtime (`/MD`).** Same as rustc's MSVC target; mixing `/MT` libraries into
+  a Rust binary fails with duplicate CRT symbols. The consequence is that the binary
+  imports `msvcp140.dll` and `vcruntime140.dll` (the Visual C++ Redistributable), as the
+  agent built on the prebuilt download already does. A static CRT would need the whole
+  workspace on `-C target-feature=+crt-static`; not attempted here.
+- **`re2` is not built either.** Same cause as on Linux (the CPU provider only takes its
+  include path), so `ort-sys` stops with ``could not find native static library `re2` ``.
+  `cmake --build --target re2` does not find it with the Visual Studio generator, because
+  it lives in a sub-project; the build script builds `_deps\re2-build\re2.vcxproj` with
+  MSBuild.
+- **`shell32` must be linked.** onnxruntime's `telemetry.cc` calls `CommandLineToArgvW`;
+  without `-l dylib=shell32` the link fails with `LNK2019 unresolved external symbol
+  __imp_CommandLineToArgvW`. The flags script adds it. `shell32.dll` is on every Windows.
+- **Libraries go to the linker as paths, not as `-l static=`.** `RUSTFLAGS` reaches every
+  crate, and `-l static=<name>` bundles the library into each crate's `.rlib`: 101
+  libraries (1.1 GB) times every dependency grew a `target` directory to 276 GB and filled
+  a 950 GB disk. `-l static:-bundle=` avoids it but is refused for any library `ort-sys`
+  also names itself ("overriding linking modifiers from command line is not supported"),
+  and it names most of them. The flags script therefore emits `-C link-arg=<path to .lib>`:
+  nothing is copied (the `ml` test run leaves a 4.3 GB `target`) and a library given twice
+  is ignored. The Linux script uses `-l static=` and has the same bundling mechanism; its
+  `target` size is worth a look.
+- **Run cargo with `-j 1` (or 2) while linking the tests.** Each test binary links all
+  101 libraries; several at once exhausted the commit limit on a 16 GB machine (`os error
+  1455`, reported by `rustc` as "found invalid metadata files for crate `serde`", which
+  points nowhere near the cause). Stop WSL first if it is running: its VM reserves memory.
+
+### The full agent, measured
+
+`cargo build -j 2 --release --no-default-features -p agent -p watchdog -p cli` with the
+flags above: 20 minutes, exit 0 (onnxruntime already built).
+
+| | static source build | prebuilt download (`dynamic-onnx`) |
+|---|---|---|
+| `agent.exe` | 39.1 MB | 42.6 MB |
+| DLL imports (`check-pe-imports.py`) | 31 | 32 |
+| `directml.dll`, `d3d12.dll` | no | yes |
+
+The static agent is smaller and imports no DirectML. `agent.exe --help` runs. One host, one
+build; not run under load or as the service.
+
+### In CI
+
+`.github/workflows/windows-static-agent.yml` (#746) runs the steps above on `windows-2022`.
+It builds onnxruntime with `build-onnxruntime-static.ps1`, copies the `.lib` files out of
+the build tree and caches them on the script's hash (a version bump rebuilds them). It then
+links the agent with `--no-default-features`, and fails if `tools/check-pe-imports.py` finds
+`onnxruntime.dll`, `directml.dll` or `d3d12.dll` among its imports. It runs on `main` and on
+changes that can break the link, not on every PR.
+
 ## Platform Support
 
 **Currently tested:**
 - ✅ Ubuntu 24.04 (glibc) - ADR-0002 target platform
 - ✅ Alpine 3.x (musl) - Not a target platform, but confirms approach works cross-libc
+- ✅ Windows 11 (MSVC, CPU only) - `cargo test -p ml` passes, no `onnxruntime.dll`, no
+  `directml.dll`, no `d3d12.dll` (see above)
 
 **TODO:**
-- ⏳ Windows (MSVC `.lib` files, different flag syntax)
 - ⏳ macOS (similar `.a` workflow, but untested)
 
-Both Windows and macOS are ADR-0002 target platforms but haven't been attempted yet.
+macOS is an ADR-0002 target platform that has not been attempted yet.
 
 ## References
 

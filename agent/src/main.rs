@@ -53,6 +53,7 @@ mod log_sources;
 mod memscan;
 mod protected;
 mod quarantine_cmd;
+mod ransomware_join;
 mod redact;
 mod release;
 mod shutdown;
@@ -66,6 +67,7 @@ mod sink;
     not(any(target_os = "linux", target_os = "macos", windows)),
     allow(dead_code)
 )]
+mod trust;
 mod upload;
 
 use clap::{Parser, Subcommand};
@@ -248,6 +250,12 @@ enum Command {
         /// resolve under `storage.state_dir` or this agent refuses to run.
         #[arg(long)]
         state: Option<std::path::PathBuf>,
+        /// Acknowledge that this build verifies content against the public test key,
+        /// so anyone who can serve the content routes can weaken detection (ADR-0027).
+        /// Exists only in a `test-key` build, for lab and development use.
+        #[cfg(feature = "test-key")]
+        #[arg(long)]
+        allow_test_key: bool,
     },
     /// Fetches the signed binary release the server offers, verifies it, stages it
     /// under `<state_dir>/versions/vN`, repoints `current` at it, and restarts the
@@ -275,8 +283,9 @@ enum Command {
         no_restart: bool,
         /// Acknowledge that this build verifies releases against the public test
         /// key, so anyone who can serve the release routes can get code run as
-        /// root (ADR-0015 Deferred). Required until a production key is embedded;
-        /// for lab and development use only.
+        /// root (ADR-0015 Deferred). Exists only in a `test-key` build; for lab and
+        /// development use only.
+        #[cfg(feature = "test-key")]
         #[arg(long)]
         allow_test_key: bool,
     },
@@ -306,7 +315,17 @@ enum QuarantineAction {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> std::process::ExitCode {
+    match try_main() {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn try_main() -> anyhow::Result<std::process::ExitCode> {
     let cli = Cli::parse();
 
     // Load the local install configuration BEFORE anything else — logging
@@ -336,7 +355,8 @@ fn main() -> anyhow::Result<()> {
         cfg.server.control_plane_url
     );
 
-    match cli.command {
+    let mut exit_code = std::process::ExitCode::SUCCESS;
+    let result = match cli.command {
         Command::Status => commands::cmd_status(),
         Command::Run {
             alerts,
@@ -398,7 +418,13 @@ fn main() -> anyhow::Result<()> {
             ca_cert,
             content_dir,
             state,
+            #[cfg(feature = "test-key")]
+            allow_test_key,
         } => {
+            #[cfg(not(feature = "test-key"))]
+            let allow_test_key = false;
+            // Before any path, config or network work, as for `apply-release`.
+            trust::ensure_content_key_trusted(allow_test_key)?;
             let (content_dir, state) =
                 content::resolve_content_paths(&cfg.storage.state_dir, content_dir, state)?;
             let ring = content::resolve_ring(ring, &cfg.updates)?;
@@ -417,7 +443,7 @@ fn main() -> anyhow::Result<()> {
                 &cfg.ipc.endpoint,
             )?;
             if outcome == content::ApplyOutcome::RingHalted {
-                std::process::exit(content::EXIT_RING_HALTED);
+                exit_code = std::process::ExitCode::from(apply_exit_status(outcome) as u8);
             }
             Ok(())
         }
@@ -435,6 +461,7 @@ fn main() -> anyhow::Result<()> {
             key,
             ca_cert,
             no_restart,
+            #[cfg(feature = "test-key")]
             allow_test_key,
         } => release::cmd_apply_release(
             &server,
@@ -443,7 +470,34 @@ fn main() -> anyhow::Result<()> {
             content::resolve_ca_cert(ca_cert, &cfg.server).as_deref(),
             &cfg.storage.state_dir,
             !no_restart,
-            allow_test_key,
+            {
+                #[cfg(feature = "test-key")]
+                let acknowledged = allow_test_key;
+                #[cfg(not(feature = "test-key"))]
+                let acknowledged = false;
+                acknowledged
+            },
         ),
+    };
+    result?;
+    Ok(exit_code)
+}
+
+fn apply_exit_status(outcome: content::ApplyOutcome) -> i32 {
+    if outcome == content::ApplyOutcome::RingHalted {
+        content::EXIT_RING_HALTED
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod exit_code_tests {
+    use super::*;
+
+    #[test]
+    fn a_halted_content_ring_returns_exit_status_75() {
+        assert_eq!(apply_exit_status(content::ApplyOutcome::RingHalted), 75);
+        assert_eq!(apply_exit_status(content::ApplyOutcome::Done), 0);
     }
 }
