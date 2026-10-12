@@ -9,8 +9,8 @@
 # Tested on:
 # - Ubuntu 24.04 (glibc) — ADR-0002 target platform
 # - Alpine 3.x (musl) — not a target, but confirms cross-libc viability
-# - macOS (#338): Apple Silicon (hosted runner macos-15, 2026-10-12: built, linked, tested; see
-#   onnxruntime-static-build-macos.md for the measurements). Intel: see that file. The macOS
+# - macOS (#338): Apple Silicon and Intel (hosted runners macos-15 and macos-15-intel, 2026-10-12:
+#   built, linked, tested; see onnxruntime-static-build-macos.md for the measurements). The macOS
 #   branch was written without a Mac and first run by .github/workflows/macos-static-agent.yml.
 #
 # Prerequisites (Ubuntu):

@@ -74,7 +74,7 @@ See `lab/provisioning/onnxruntime-static-build.md` for:
 
 - ✅ **Linux (Ubuntu 24.04+)**: Fully tested, production-ready
 - ⏳ **Windows**: Not yet implemented (issue #110)
-- ✅ **macOS (Apple Silicon)**: validated on a hosted runner (issue #338, PR #788): onnxruntime from source, `cargo test -p ml` and the agent linked statically, no `libonnxruntime.dylib`; Intel pending; see `lab/provisioning/onnxruntime-static-build-macos.md`
+- ✅ **macOS (Apple Silicon and Intel)**: validated on hosted runners (issue #338, PR #788): onnxruntime from source, `cargo test -p ml` and the agent linked statically, no `libonnxruntime.dylib`; see `lab/provisioning/onnxruntime-static-build-macos.md`
 
 ## Features
 

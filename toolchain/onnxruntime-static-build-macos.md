@@ -5,13 +5,13 @@ ADR-0002 asks for one statically linked agent binary on every platform: no
 could hijack in a privileged process. Linux (`onnxruntime-static-build.md`) and Windows
 (`build-onnxruntime-static.ps1`, #337) have it. This is the macOS recipe.
 
-> **Status: validated on a hosted Apple Silicon runner (2026-10-12), not on a Mac of ours, and
-> not yet on Intel.** The scripts were written without a Mac; the first run of
+> **Status: validated on hosted Apple Silicon and Intel runners (2026-10-12), not on a Mac of
+> ours.** The scripts were written without a Mac; the first run of
 > `.github/workflows/macos-static-agent.yml` (PR #788, `macos-15`, macOS 15.7.9, Xcode 16.4, CMake
 > 4.4.3, Rust 1.94.1) passed every step: onnxruntime from source, the link flags, the ML tests under
-> static linking, the agent, and the import check against `otool -L`. See "Measured" and "What the
-> assumptions turned out to be". The Intel result is recorded at the end of this file once the run
-> has finished.
+> static linking, the agent, and the import check against `otool -L`; the Intel runner
+> (`macos-15-intel`, same macOS and Xcode) passed the same steps on its first complete run. See
+> "Measured" and "What the assumptions turned out to be".
 
 ## Prerequisites
 
@@ -69,20 +69,20 @@ also run against real Mach-O files (a thin arm64 `.dylib` and universal x86_64+a
 from unrelated software): the install names it printed are plausible, but it has not been
 compared with `otool -L` on a binary this project built; the workflow prints both.
 
-## Measured (first run, `macos-15`, Apple Silicon, 3 cores, 2026-10-12)
+## Measured (2026-10-12; macOS 15.7.9, Xcode 16.4, Rust 1.94.1)
 
-| What | Result |
-| --- | --- |
-| onnxruntime v1.30.0 from source, cold (`--jobs 3`) | 20 min 11 s, 97 `.a` files in 23 directories |
-| `ort-static-link-flags.sh` | "23 directories, 97 libraries", no adjustment needed |
-| `cargo test -p ml --release --no-default-features` | all pass (42 in the lib, the golden and scorer suites), 1 min 20 s |
-| the `ml` test binary's imports | CoreFoundation, CoreML, Foundation, libSystem, libc++, libiconv; no onnxruntime |
-| agent link (`cargo build -j 2 --release --no-default-features -p agent`) | 14 min 17 s |
-| the agent's imports | the same set plus `libEndpointSecurity` and `libbsm` (the sensor); **`check-macho-imports.py` and `otool -L` list the same nine libraries** |
-| the agent's deployment target | `minos 13.0`, SDK 15.5 (`MACOSX_DEPLOYMENT_TARGET` was honoured) |
-| the agent's size | 50,663,424 bytes (48.3 MiB), arm64 only |
-| `agent --help` | runs |
-| a second run with the libraries cached | the tests and the agent link only, about 16 minutes |
+| What | Apple Silicon (`macos-15`, 3 cores) | Intel (`macos-15-intel`) |
+| --- | --- | --- |
+| onnxruntime v1.30.0 from source, cold | 20 min 11 s (23 min 06 s on a second cold run); 97 `.a` files, 23 directories | 40 min 41 s; 96 `.a` files, 22 directories |
+| `ort-static-link-flags.sh` | no adjustment needed | no adjustment needed |
+| `cargo test -p ml --release --no-default-features` | all pass (42 in the lib, the golden and scorer suites), 1 min 20 s | all pass, 4 min 37 s |
+| agent link (`cargo build -j 2 --release --no-default-features -p agent`) | 13 to 14 min | 20 min 06 s |
+| the agent's imports | nine libraries, **identical in `check-macho-imports.py` and `otool -L`**: CoreFoundation, CoreML, Foundation, libEndpointSecurity, libSystem, libbsm, libc++, libiconv, libobjc | the same nine |
+| the `ml` test binary's imports | the first six of those (no sensor libraries); no onnxruntime | not printed |
+| deployment target | `minos 13.0`, SDK 15.5 | `minos 13.0`, SDK 15.5 |
+| the agent's size | 50,663,424 bytes (48.3 MiB), arm64 | 56,975,180 bytes (54.3 MiB), x86_64 |
+| `agent --help` | runs | runs |
+| a run with the libraries cached | the tests and the agent link only, about 16 to 17 minutes | not run |
 
 ## What the assumptions turned out to be
 
@@ -115,7 +115,7 @@ reused). A build in a place with no route to GitHub needs those dependencies mir
 - Universal (fat) binaries: build each architecture natively and merge with `lipo` later if wanted.
 - Code signing and notarization of the agent: unaffected by static linking, tracked with the
   macOS packaging (`packaging/macos`).
-- A universal agent: the measured size is for arm64 only.
+- A universal agent: each architecture is built natively and the sizes above are per architecture.
 - Anything that needs the Endpoint Security entitlement: this only checks the link and the ML
   tests, not a running sensor.
 
@@ -128,4 +128,4 @@ reused). A build in a place with no route to GitHub needs those dependencies mir
 | `build-onnxruntime-static.sh`, macOS branch | the shell logic only | stubbed `uname`, `sysctl`, `lipo` on Linux: `MacOS` directory, `hw.ncpu` jobs, the architecture check passes and refuses |
 | `tools/check-macho-imports.py` | yes | 14 unit tests, plus real Mach-O files from other software |
 | onnxruntime build, link, tests, `otool -L`, size (Apple Silicon) | **yes** | `macos-static-agent.yml` on `macos-15`, 2026-10-12 |
-| the same on Intel (`macos-15-intel`) | see the end of this file | `workflow_dispatch` with `intel: true` |
+| the same on Intel (`macos-15-intel`) | **yes** | `workflow_dispatch` with `intel: true`, 2026-10-12 |
