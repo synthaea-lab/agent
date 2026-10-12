@@ -2267,6 +2267,7 @@ name = "rules"
 version = "0.1.0"
 dependencies = [
  "policy",
+ "proptest",
  "schema",
  "store",
 ]
@@ -2595,8 +2596,10 @@ dependencies = [
 name = "sensor-windows-eventlog"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "schema",
  "tempfile",
+ "time",
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.61.2",

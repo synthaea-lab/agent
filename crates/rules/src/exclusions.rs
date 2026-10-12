@@ -105,6 +105,15 @@ pub(crate) const SELF_SPAWN_SCRIPT_HOSTS: &[&str] = &[
 pub(crate) const AUTH_FAILURE_THRESHOLD: u32 = 5;
 /// Sliding window for [`AUTH_FAILURE_THRESHOLD`].
 pub(crate) const AUTH_FAILURE_WINDOW_NS: u64 = 60_000_000_000; // 60s
+/// T1021.001 — successful RDP authentication from a source after this many
+/// authentication failures from the same source, across all accounts.
+/// Five failures catches a credential guess/spray that eventually succeeds
+/// while tolerating ordinary one-off authentication errors.
+pub(crate) const RDP_SUCCESS_AFTER_FAILURES_THRESHOLD: u32 = 5;
+/// Sliding look-back window for [`RDP_SUCCESS_AFTER_FAILURES_THRESHOLD`]. A
+/// five-minute interval includes slower interactive guessing while limiting
+/// stale failures that are no longer meaningful evidence for a later success.
+pub(crate) const RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS: u64 = 300_000_000_000; // 300s
 pub(crate) const BEACON_THRESHOLD: u32 = 3;
 pub(crate) const BEACON_WINDOW_NS: u64 = 60_000_000_000; // 60s
 

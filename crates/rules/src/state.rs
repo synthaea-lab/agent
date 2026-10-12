@@ -10,7 +10,7 @@ use std::{
 use schema::{
     AuthEvent, AuthOutcome, ConnectEvent, Event, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
     FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRenameEvent, FileWriteEvent,
-    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, SessionEvent, User,
+    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, SessionEvent, SessionState, User,
     detection::Severity,
 };
 use store::BoundedMap;
@@ -34,6 +34,7 @@ use crate::{
         TOUCHED_FILES_PID_CAP,
     },
     has_write_intent,
+    rdp::RdpSuccessAfterFailures,
     session::SessionHijack,
     sliding::{FlowPortDedup, SlidingCounter, SlidingDistinct, SlidingSum},
 };
@@ -163,6 +164,9 @@ pub struct RuleState {
     /// LRU-bounded like every other counter: a spray across many fabricated
     /// usernames must not grow this without limit.
     auth_failures: BoundedMap<(String, String), SlidingCounter>,
+    /// RDP authentication successes joined to the failures from the same address,
+    /// by event time (T1021.001, #285); see the `rdp` module.
+    rdp_success: RdpSuccessAfterFailures,
     /// pid → sliding counter for RANSOMWARE-RENAME (T1486, issue #262): renames by
     /// this pid where `new_path` is `old_path` plus an appended suffix. LRU-bounded:
     /// a hostile process renaming under many different pids (unusual, but not
@@ -288,6 +292,7 @@ impl RuleState {
             scan_spread: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
             auth_failures: BoundedMap::new(COUNTER_CAP),
+            rdp_success: RdpSuccessAfterFailures::new(),
             recent_creates: BoundedMap::new(CREATE_UNLINK_PID_CAP),
             pending_unlinks: BoundedMap::new(CREATE_UNLINK_PID_CAP),
             touched_files: BoundedMap::new(TOUCHED_FILES_PID_CAP),
@@ -963,12 +968,24 @@ impl RuleState {
             .map_or_else(|| "local".to_string(), |a| a.to_string());
         let key = (event.target_user.clone(), source.clone());
         let ts = event.meta.timestamp_ns;
+        // A success can reach the rules before the last failures that precede
+        // it (two channels, two poll threads): this failure may complete it.
+        // Only failures from the Windows Security log feed the join: they carry a
+        // Windows identity and are stamped with the event's own time, like the 1149.
+        // Application-log failures (`[logs]` sources) are stamped when the line is
+        // read, so a restart replaying a backlog would make hours-old failures look
+        // current: other clock, not joined.
+        let mut alerts: Vec<Alert> = event
+            .source_address
+            .filter(|_| matches!(event.meta.user, User::Windows { .. }))
+            .map(|address| self.rdp_success.on_failure(address, ts))
+            .unwrap_or_default();
         let entry = self
             .auth_failures
             .get_or_insert_with(key, SlidingCounter::default);
         let count = entry.record(ts, AUTH_FAILURE_WINDOW_NS);
         if count >= AUTH_FAILURE_THRESHOLD && entry.try_alert(ts, AUTH_FAILURE_WINDOW_NS) {
-            return vec![Alert {
+            alerts.push(Alert {
                 technique: "T1110",
                 severity: Severity::Medium,
                 message: format!(
@@ -976,16 +993,29 @@ impl RuleState {
                     event.target_user,
                     AUTH_FAILURE_WINDOW_NS / 1_000_000_000,
                 ),
-            }];
+            });
         }
-        Vec::new()
+        alerts
     }
 
     /// To be called for every `SessionEvent` in the stream (Windows Terminal
     /// Services, #285): a disconnected session reconnected from another
-    /// client, T1563.002 (see the `session` module).
+    /// client, T1563.002 (see the `session` module), or a successful RDP listener
+    /// authentication after failures from that source, T1021.001.
     pub fn on_session(&mut self, event: &SessionEvent) -> Vec<Alert> {
-        self.session_hijack.on_session(event).into_iter().collect()
+        let mut alerts: Vec<Alert> = self.session_hijack.on_session(event).into_iter().collect();
+
+        if event.state != SessionState::Connect || event.console {
+            return alerts;
+        }
+        if let Some(address) = event.source_address {
+            alerts.extend(self.rdp_success.on_success(
+                address,
+                event.meta.timestamp_ns,
+                &event.target_user,
+            ));
+        }
+        alerts
     }
 
     /// To be called for every `MemfdCreateEvent` in the stream (Linux, issue
