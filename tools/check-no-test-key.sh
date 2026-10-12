@@ -14,12 +14,26 @@ cd "$(dirname "$0")/.."
 fail() { echo "check-no-test-key: $*" >&2; exit 1; }
 
 # The packaged set and flags: keep in step with packaging/linux (build-deb.sh, build-rpm.sh).
-tree() { cargo tree --locked "$@" -e features,no-dev -i updater 2>/dev/null; }
+# The tree is captured and its exit status tested before anything greps it: a failing
+# `cargo tree` (a renamed package, a lockfile problem) must stop the script, not look like
+# "the feature is absent".
+tree() {
+    local out
+    out="$(cargo tree --locked "$@" -e features,no-dev -i updater)" \
+        || fail "cargo tree failed for: $* (the check would otherwise pass without having looked)"
+    printf '%s\n' "$out"
+}
 
-if tree -p agent -p watchdog -p cli --no-default-features | grep -q 'feature "test-key"'; then
+packaged="$(tree -p agent -p watchdog -p cli --no-default-features)"
+[ -n "$packaged" ] || fail "cargo tree printed nothing for the packaged build"
+if grep -q 'feature "test-key"' <<<"$packaged"; then
     fail "a packaged build (agent, watchdog, cli, --no-default-features) enables updater/test-key"
 fi
-tree -p agent -p watchdog -p cli | grep -q 'feature "test-key"' \
+# The no-default-features tree must still show the updater itself, or it proves nothing.
+grep -q '^updater ' <<<"$packaged" \
+    || fail "the packaged build's cargo tree does not list the updater: the check is blind"
+default_build="$(tree -p agent -p watchdog -p cli)"
+grep -q 'feature "test-key"' <<<"$default_build" \
     || fail "the default build no longer enables updater/test-key: this check lost its positive control"
 
 marker="SYNTHAEA-PUBLIC-TEST-KEY-SET-V1"
