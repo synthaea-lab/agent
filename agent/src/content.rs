@@ -203,11 +203,31 @@ pub(crate) fn cmd_check_content_manifest(
             }
         }
         Err(UpdaterError::ReleaseNotNewer { offered, current }) => {
-            println!("ring {ring}: up to date (release {current}, server offers {offered})");
+            println!("{}", describe_unchanged_offer(ring, offered, current));
         }
         Err(e) => return Err(e.into()),
     }
     Ok(())
+}
+
+/// The line for an offer that is not newer than what this agent has applied (#665). Two
+/// different situations used to read the same, "up to date": an offer of the release already
+/// applied (nothing to do), and an **older** one, which is what the server offers after it
+/// rolled a release back. The agent never goes to a lower release number (anti-replay,
+/// ADR-0016), so an agent that already applied the rolled-back release stays on it, and the
+/// operator must be told that, not that all is well. ADR-0032: such content is withdrawn by a
+/// corrective release with a higher number.
+fn describe_unchanged_offer(ring: &str, offered: u64, current: u64) -> String {
+    if offered < current {
+        format!(
+            "ring {ring}: the server offers release {offered}, OLDER than release {current}, which \
+             this agent has applied. An older offer is never applied (anti-rollback), so this agent \
+             stays on release {current}. To withdraw content from agents that already have it, \
+             publish a corrective release numbered above {current} (docs/operations/content.md)"
+        )
+    } else {
+        format!("ring {ring}: up to date (release {current}, server offers {offered})")
+    }
 }
 
 /// Builds a [`transport::TransportClient`] for `server`, with mTLS if both
@@ -713,7 +733,15 @@ fn apply_content_manifest(
     let fetch_plan = match plan(&manifest, ring, &state) {
         Ok(fetch_plan) => fetch_plan,
         Err(UpdaterError::ReleaseNotNewer { offered, current }) => {
-            println!("ring {ring}: up to date (release {current}, server offers {offered})");
+            println!("{}", describe_unchanged_offer(ring, offered, current));
+            if offered < current {
+                tracing::warn!(
+                    ring,
+                    offered,
+                    current,
+                    "the server offers an older content release than the one applied; ignored"
+                );
+            }
             return Ok(ApplyOutcome::Done);
         }
         Err(e) => return Err(e.into()),
@@ -960,6 +988,48 @@ mod tests {
             size: 10,
             content_type: "rule".to_string(),
         }
+    }
+
+    #[test]
+    fn an_older_offer_is_reported_as_such_not_as_up_to_date() {
+        // #665: the server rolled release 4 back and offers 2 to an agent that applied 4.
+        let older = describe_unchanged_offer("canary_0", 2, 4);
+        assert!(older.contains("OLDER than release 4"), "{older}");
+        assert!(older.contains("stays on release 4"), "{older}");
+        assert!(
+            older.contains("corrective release numbered above 4"),
+            "{older}"
+        );
+        assert!(!older.contains("up to date"), "{older}");
+        // The release already applied is still plainly up to date, wording unchanged.
+        assert_eq!(
+            describe_unchanged_offer("canary_0", 4, 4),
+            "ring canary_0: up to date (release 4, server offers 4)"
+        );
+    }
+
+    #[test]
+    fn an_agent_on_release_n_ignores_the_servers_n_minus_1_after_a_rollback() {
+        let mut state = ContentState::default();
+        state
+            .entries
+            .insert("rules/v4.sigma".into(), "a".repeat(64));
+        state.release_version.insert("canary_0".into(), 4);
+        let rolled_back_to = signed_manifest_json(2, vec![entry("rules/v2.sigma")]);
+        assert!(matches!(
+            plan(&rolled_back_to, "canary_0", &state),
+            Err(UpdaterError::ReleaseNotNewer {
+                offered: 2,
+                current: 4
+            })
+        ));
+        // And a corrective release numbered above the applied one *is* applied: it carries the
+        // older content, so the agent converges on it.
+        let corrective = signed_manifest_json(5, vec![entry("rules/v2.sigma")]);
+        let fetch_plan = plan(&corrective, "canary_0", &state).unwrap();
+        assert_eq!(fetch_plan.release_version, 5);
+        assert_eq!(fetch_plan.to_fetch.len(), 1);
+        assert_eq!(fetch_plan.to_remove, ["rules/v4.sigma"]);
     }
 
     #[test]
