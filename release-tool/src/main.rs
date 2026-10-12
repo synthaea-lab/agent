@@ -66,6 +66,11 @@ enum Command {
         /// When it is released, UTC, `YYYY-MM-DDTHH:MM:SSZ`.
         #[arg(long)]
         released_at: String,
+        /// The manifest of the release the ring is on now (the one being withdrawn). Optional:
+        /// prints what the corrective release removes and which paths need their earlier
+        /// bytes put back in the artifact store first.
+        #[arg(long)]
+        current: Option<PathBuf>,
         /// Write here instead of stdout.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -114,6 +119,33 @@ impl KeySource {
     }
 }
 
+/// What the corrective release does against the release the ring is on, for the operator.
+fn report_change(change: &roll_forward::Change, current_version: u64) {
+    eprintln!(
+        "against release {current_version}: {} unchanged, {} removed from agents, {} brought back",
+        change.unchanged,
+        change.removed.len(),
+        change.brought_back.len()
+    );
+    for path in &change.removed {
+        eprintln!("  removed        {path}");
+    }
+    for path in &change.brought_back {
+        eprintln!("  brought back   {path} (its bytes must be in the artifact store)");
+    }
+    if !change.restored_bytes.is_empty() {
+        eprintln!(
+            "WARNING: {} path(s) hold different bytes in the release being withdrawn. The artifact \
+             store keeps one file per path, so put the earlier bytes back at these paths BEFORE \
+             publishing, or the publish is refused and agents could not fetch them:",
+            change.restored_bytes.len()
+        );
+        for path in &change.restored_bytes {
+            eprintln!("  restore bytes  {path}");
+        }
+    }
+}
+
 fn emit(text: &str, out: Option<&PathBuf>) -> anyhow::Result<()> {
     match out {
         Some(path) => std::fs::write(path, format!("{text}\n"))
@@ -143,6 +175,7 @@ fn main() -> anyhow::Result<()> {
             from,
             release_version,
             released_at,
+            current,
             out,
         } => {
             let text = std::fs::read_to_string(&from)
@@ -156,6 +189,17 @@ fn main() -> anyhow::Result<()> {
                 serde_json::from_str::<updater::ContentManifest>(&text)
                     .map_or(0, |earlier| earlier.release_version)
             );
+            if let Some(current) = current {
+                let text = std::fs::read_to_string(&current)
+                    .with_context(|| format!("cannot read {}", current.display()))?;
+                let now: updater::ContentManifest =
+                    serde_json::from_str(&text).context("--current is not a content manifest")?;
+                let earlier: updater::ContentManifest = serde_json::from_str(
+                    &std::fs::read_to_string(&from)
+                        .with_context(|| format!("cannot read {}", from.display()))?,
+                )?;
+                report_change(&roll_forward::compare(&earlier, &now), now.release_version);
+            }
             emit(&serde_json::to_string_pretty(&manifest)?, out.as_ref())
         }
         Command::Sign {
