@@ -16,7 +16,7 @@ config = { path = "../crates/config" }
 sha2 = "0.11"
 # Post-promotion health gate (ADR-0015 Decision 6, issue #30): the watchdog rolls a
 # release that never proves itself back, via the updater's layout + ban list.
-updater = { path = "../crates/updater" }
+updater = { path = "../crates/updater", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
