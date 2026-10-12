@@ -250,9 +250,10 @@ changes that can break the link, not on every PR.
   `directml.dll`, no `d3d12.dll` (see above)
 
 **TODO:**
-- ⏳ macOS (similar `.a` workflow, but untested)
-
-macOS is an ADR-0002 target platform that has not been attempted yet.
+- ⏳ macOS: the same `.a` workflow, prepared in issue #338 (`onnxruntime-static-build-macos.md`,
+  a macOS branch in `build-onnxruntime-static.sh`, `tools/check-macho-imports.py`,
+  `.github/workflows/macos-static-agent.yml`) but **never run on a Mac**: untested until that
+  workflow has a first run.
 
 ## References
 

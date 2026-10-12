@@ -1,0 +1,163 @@
+name: macOS static agent
+
+# The release posture of ADR-0002 on macOS (#338): onnxruntime built from source and linked
+# statically, so the agent loads no libonnxruntime.dylib. The default `dynamic-onnx` build
+# that ci.yml runs never exercises this link, so without this job a shared-library dependency
+# could come back unnoticed. Same posture as the Windows and Linux static jobs: on main and on
+# the changes that can break the link, not on every PR.
+#
+# NEVER RUN YET. Written without a Mac to try it on: what it assumes about onnxruntime's macOS
+# build is listed in lab/provisioning/onnxruntime-static-build-macos.md ("What this assumes").
+# The first run is the experiment; expect to fix it from the log.
+on:
+  pull_request:
+    paths:
+      - "agent/Cargo.toml"
+      - "crates/ml/**"
+      - "lab/provisioning/build-onnxruntime-static.sh"
+      - "lab/provisioning/ort-static-link-flags.sh"
+      - "tools/check-macho-imports.py"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/config.toml"
+      - "rust-toolchain.toml"
+      - ".github/workflows/macos-static-agent.yml"
+  push:
+    branches: [main]
+    paths:
+      - "agent/Cargo.toml"
+      - "crates/ml/**"
+      - "lab/provisioning/build-onnxruntime-static.sh"
+      - "lab/provisioning/ort-static-link-flags.sh"
+      - "tools/check-macho-imports.py"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/config.toml"
+      - "rust-toolchain.toml"
+      - ".github/workflows/macos-static-agent.yml"
+  workflow_dispatch:
+    inputs:
+      intel:
+        description: "Also build on an Intel runner (macos-15-intel; the label is an assumption)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-check-static-agent:
+    # Pinned images, not macos-latest: the SDK and the Xcode toolchain decide what
+    # onnxruntime's build produces, so a runner image moving is a deliberate change here.
+    # Apple Silicon always; Intel only when asked for (a runner label that does not exist
+    # leaves a job queued for ever, and that must not hold up every PR).
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.intel && '["macos-15","macos-15-intel"]' || '["macos-15"]') }}
+    # A cold onnxruntime build has no measured duration on a hosted macOS runner (3 to 4
+    # cores). Once the libraries are cached the job is the agent link alone.
+    timeout-minutes: 240
+    env:
+      # One deployment target for onnxruntime and for the agent that links it
+      # (build-onnxruntime-static.sh sets the same default).
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain versions (for the log)
+        run: |
+          uname -m
+          sw_vers
+          xcodebuild -version || true
+          cmake --version
+          python3 --version
+          rustup show active-toolchain
+
+      # Only the .a files are cached, staged with their relative paths (the link needs
+      # nothing else; the same trick as the Windows job, where a glob over the whole build
+      # tree tripped the cache action). The onnxruntime version is pinned inside the build
+      # script, so hashing the script covers a version bump. The key carries the
+      # architecture: arm64 and x86_64 archives must never be mixed.
+      - name: Restore onnxruntime static libraries
+        id: ort-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ort-static
+          key: ort-static-macos-${{ runner.arch }}-${{ matrix.os }}-${{ hashFiles('lab/provisioning/build-onnxruntime-static.sh') }}
+
+      - name: Build onnxruntime from source
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        run: ./lab/provisioning/build-onnxruntime-static.sh --jobs "$(sysctl -n hw.ncpu)"
+
+      # `ort-static/Release` mirrors `build/MacOS/Release`, so the link-flags script finds
+      # the same tree a cached run does. The build tree is removed afterwards.
+      - name: Stage the libraries for the cache
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          from="$PWD/onnxruntime/build/MacOS/Release"
+          to="$PWD/ort-static/Release"
+          mkdir -p "$to"
+          (cd "$from" && find . -name 'lib*.a' | cpio -pdm "$to")
+          count="$(find "$to" -name 'lib*.a' | wc -l | tr -d ' ')"
+          echo "Staged $count libraries"
+          [ "$count" -gt 0 ] || { echo "no .a files to stage" >&2; exit 1; }
+          rm -rf onnxruntime
+
+      # Saved right after the build, not at the end of the job: a later link or import
+      # failure must not throw away the onnxruntime build.
+      - name: Save onnxruntime static libraries
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ort-static
+          key: ${{ steps.ort-cache.outputs.cache-primary-key }}
+
+      - name: Generate the static link flags
+        run: |
+          set -euo pipefail
+          export ORT_LIB_LOCATION="$PWD/ort-static/Release"
+          eval "$(./lab/provisioning/ort-static-link-flags.sh)"
+          echo "ORT_LIB_LOCATION=$ORT_LIB_LOCATION" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=$RUSTFLAGS" >> "$GITHUB_ENV"
+
+      # The tests of the ml crate against the static libraries (the issue's "all ML tests
+      # pass"), then the imports of each test binary, then the agent.
+      - name: Test the ml crate with static onnxruntime
+        run: cargo test -p ml --release --no-default-features
+
+      - name: Check the ml test binaries' imports
+        run: |
+          set -euo pipefail
+          binaries="$(find target/release/deps -maxdepth 1 -type f -perm -u+x -name 'ml-*' ! -name '*.d')"
+          [ -n "$binaries" ] || { echo "no ml test binary found" >&2; exit 1; }
+          echo "$binaries" | xargs python3 tools/check-macho-imports.py
+
+      # The agent alone: it is the only binary that links `ml`. `-j 2` because every
+      # binary links all onnxruntime libraries and several links at once are memory-hungry.
+      - name: Build the agent with static onnxruntime
+        run: cargo build -j 2 --release --no-default-features -p agent
+
+      # The parser is checked against the real thing: `otool -L` is printed beside it, so a
+      # disagreement is visible in the log, not hidden by the check passing.
+      - name: Check the agent's dynamic libraries
+        run: |
+          set -euo pipefail
+          otool -L target/release/agent
+          python3 tools/check-macho-imports.py target/release/agent
+          if otool -L target/release/agent | grep -qi onnxruntime; then
+            echo "otool sees onnxruntime in the agent's imports" >&2
+            exit 1
+          fi
+
+      - name: Run the static agent
+        run: |
+          set -euo pipefail
+          ./target/release/agent --help > /dev/null
+          lipo -archs target/release/agent
+          size="$(du -m target/release/agent | cut -f1)"
+          echo "agent (static onnxruntime, $(uname -m)): ${size} MB" >> "$GITHUB_STEP_SUMMARY"

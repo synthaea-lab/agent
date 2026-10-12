@@ -74,7 +74,7 @@ See `lab/provisioning/onnxruntime-static-build.md` for:
 
 - ✅ **Linux (Ubuntu 24.04+)**: Fully tested, production-ready
 - ⏳ **Windows**: Not yet implemented (issue #110)
-- ⏳ **macOS**: Not yet implemented (issue #110)
+- ⏳ **macOS**: scripts, a Mach-O import checker and a CI job are written but **have never run on a Mac** (issue #338); see `lab/provisioning/onnxruntime-static-build-macos.md`
 
 ## Features
 
