@@ -63,11 +63,10 @@ impl SigmaEngine {
             path: display.clone(),
             source,
         })?;
-        let rule: SigmaRule =
-            serde_yaml::from_str(&content).map_err(|source| SigmaError::Yaml {
-                path: display.clone(),
-                source,
-            })?;
+        let rule = parse_rule_yaml(&content).map_err(|source| SigmaError::Yaml {
+            path: display.clone(),
+            source: Box::new(source),
+        })?;
         validate(&rule, &display)?;
         Ok(rule)
     }
@@ -95,4 +94,28 @@ impl SigmaEngine {
     pub fn rule_titles(&self) -> Vec<&str> {
         self.rules.iter().map(|r| r.title.as_str()).collect()
     }
+}
+
+/// The one place a rule's YAML text becomes a [`SigmaRule`] (the loader and the tests both
+/// go through it, so a test exercises the parser settings the engine really runs with).
+///
+/// The parser is `serde-saphyr`, safe Rust, which replaced `serde_yaml` (and its
+/// `unsafe-libyaml`, archived: RUSTSEC-2024-0449, #790). What it does with the same input,
+/// from a differential run over the shipped rules and a corpus of edge cases (every shipped
+/// rule parsed identically):
+/// - **duplicate keys are an error** (a second `selection:` used to win silently, which let a
+///   rule be weakened without a trace), as is a duplicate top-level `title`;
+/// - an alias bomb is refused by the parser's budget instead of being expanded;
+/// - a UTF-8 byte-order mark is accepted;
+/// - only the exact literals `true` and `false` are booleans (`strict_booleans`), as before:
+///   an unquoted `yes`, `no`, `on`, `off` or `y` stays the string it looks like. Without the
+///   option the new parser reads them as YAML 1.1 booleans and the rule would fail to load.
+pub(crate) fn parse_rule_yaml(content: &str) -> Result<SigmaRule, serde_saphyr::Error> {
+    // Both set explicitly: a default that moves in a later release must not change what a
+    // rule means. (`Options` is non-exhaustive, hence the macro.)
+    let options = serde_saphyr::options! {
+        strict_booleans: true,
+        duplicate_keys: serde_saphyr::options::DuplicateKeyPolicy::Error,
+    };
+    serde_saphyr::from_str_with_options(content, options)
 }

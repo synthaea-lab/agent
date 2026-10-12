@@ -20,7 +20,9 @@ pub enum SigmaError {
     #[error("invalid YAML in {path}: {source}")]
     Yaml {
         path: String,
-        source: serde_yaml::Error,
+        // Boxed: the parser's error is over 130 bytes, which would make every `Result` in
+        // this crate that large (clippy::result_large_err).
+        source: Box<serde_saphyr::Error>,
     },
     #[error("unsupported Sigma construct in {path}: {what}")]
     Unsupported { path: String, what: String },

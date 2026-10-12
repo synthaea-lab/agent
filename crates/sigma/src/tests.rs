@@ -4,6 +4,7 @@
 use schema::{EventMeta, ExecEvent};
 
 use crate::{
+    engine::parse_rule_yaml,
     eval::{eval_rule_exec, glob_match},
     rule::SigmaRule,
     validate::validate,
@@ -23,7 +24,7 @@ fn exec(image: &str, cmdline: &str) -> ExecEvent {
 }
 
 fn parse(yaml: &str) -> SigmaRule {
-    let rule: SigmaRule = serde_yaml::from_str(yaml).unwrap();
+    let rule: SigmaRule = parse_rule_yaml(yaml).unwrap();
     // Under a platform segment so the metadata validator's directory check passes —
     // these fixtures test eval/selector behavior, not the platform check itself.
     validate(&rule, "<test>/linux/rule.yml").unwrap();
@@ -176,7 +177,7 @@ detection:
 fn empty_selection_is_rejected_not_match_everything() {
     // Review finding: `selection: {}` matched EVERY event (vacuous all()).
     let rule: SigmaRule =
-        serde_yaml::from_str("title: Empty\ndetection:\n  selection: {}\n  condition: selection\n")
+        parse_rule_yaml("title: Empty\ndetection:\n  selection: {}\n  condition: selection\n")
             .unwrap();
     let err = validate(&rule, "<t>").unwrap_err();
     assert!(err.to_string().contains("empty selection"), "{err}");
@@ -185,7 +186,7 @@ fn empty_selection_is_rejected_not_match_everything() {
 #[test]
 fn interior_wildcards_are_rejected_at_load() {
     // Review finding: `C:\*\cmd.exe` loaded fine and then never matched.
-    let rule: SigmaRule = serde_yaml::from_str(
+    let rule: SigmaRule = parse_rule_yaml(
         "title: Interior\ndetection:\n  selection:\n    Image: 'C:\\*\\cmd.exe'\n  condition: selection\n",
     )
     .unwrap();
@@ -216,7 +217,7 @@ fn modifier_case_is_insensitive_at_eval() {
 
 #[test]
 fn unsupported_constructs_are_rejected_at_load() {
-    let complex_condition: SigmaRule = serde_yaml::from_str(
+    let complex_condition: SigmaRule = parse_rule_yaml(
         r#"
 title: Complex
 detection:
@@ -231,7 +232,7 @@ detection:
     let err = validate(&complex_condition, "<t>").unwrap_err();
     assert!(err.to_string().contains("condition"), "{err}");
 
-    let bad_field: SigmaRule = serde_yaml::from_str(
+    let bad_field: SigmaRule = parse_rule_yaml(
         r#"
 title: Bad field
 detection:
@@ -244,7 +245,7 @@ detection:
     let err = validate(&bad_field, "<t>").unwrap_err();
     assert!(err.to_string().contains("TargetFilename"), "{err}");
 
-    let bad_modifier: SigmaRule = serde_yaml::from_str(
+    let bad_modifier: SigmaRule = parse_rule_yaml(
         r#"
 title: Bad modifier
 detection:
@@ -294,4 +295,101 @@ fn glob_match_never_panics_on_hostile_inputs() {
 fn glob_match_interior_star_is_literal() {
     assert!(glob_match("a*b", "a*b"));
     assert!(!glob_match("axb", "a*b"));
+}
+
+// --- the YAML parser: serde-saphyr in place of serde_yaml (#790) -----------------------------
+
+const RULE_HEAD: &str =
+    "title: T\ndescription: d\ntags: [attack.t1059]\nlevel: medium\nfalsepositives: [x]\n";
+
+fn rule_with_detection(body: &str) -> String {
+    format!("{RULE_HEAD}detection:\n{body}")
+}
+
+#[test]
+fn a_duplicate_selection_key_is_refused_not_resolved_in_favour_of_the_last() {
+    // Under the parser this replaced, the second `selection:` silently won: a rule could be
+    // weakened (or a filter dropped) by an edit that left no visible trace.
+    let yaml = rule_with_detection(
+        "  selection:\n    Image|endswith: '\\cmd.exe'\n  selection:\n    Image|endswith: '\\never.exe'\n  condition: selection\n",
+    );
+    let error = parse_rule_yaml(&yaml).expect_err("a duplicate key must not load");
+    assert!(error.to_string().contains("duplicate"), "{error}");
+}
+
+#[test]
+fn a_duplicate_field_in_a_selection_and_a_duplicate_title_are_refused() {
+    let field =
+        rule_with_detection("  selection:\n    Image: a\n    Image: b\n  condition: selection\n");
+    assert!(parse_rule_yaml(&field).is_err());
+    let title = rule_with_detection("  selection:\n    Image: a\n  condition: selection\n")
+        .replacen("title: T\n", "title: T\ntitle: Other\n", 1);
+    assert!(parse_rule_yaml(&title).is_err());
+}
+
+#[test]
+fn only_true_and_false_are_booleans_so_an_unquoted_yes_or_no_stays_a_string() {
+    // The old parser read these as strings; saphyr's default reads them as YAML 1.1
+    // booleans and the rule would stop loading. `strict_booleans` keeps the behaviour.
+    for word in ["yes", "no", "on", "off", "y", "n", "Yes", "NO"] {
+        let yaml = rule_with_detection(&format!(
+            "  selection:\n    CommandLine: {word}\n  condition: selection\n"
+        ));
+        let rule = parse(&yaml);
+        let selection = rule.detection.selections.get("selection").unwrap();
+        let crate::rule::Selection::FieldMap(fields) = selection else {
+            panic!("expected a field map");
+        };
+        assert_eq!(fields["CommandLine"].as_slice(), [word], "{word}");
+    }
+    // A real boolean (or a number) is still not a string value: refused at load, as before.
+    for scalar in ["true", "false", "4688", "1.5", "null"] {
+        let yaml = rule_with_detection(&format!(
+            "  selection:\n    CommandLine: {scalar}\n  condition: selection\n"
+        ));
+        assert!(
+            parse_rule_yaml(&yaml).is_err(),
+            "{scalar} must not load as a string"
+        );
+    }
+}
+
+#[test]
+fn an_alias_bomb_is_refused_by_the_parser_budget() {
+    let mut yaml = String::from(RULE_HEAD);
+    yaml.push_str("lol: &a0 [x,x,x,x,x,x,x,x,x]\n");
+    for i in 1..9 {
+        let prev = format!("*a{}", i - 1);
+        yaml.push_str(&format!(
+            "l{i}: &a{i} [{p},{p},{p},{p},{p},{p},{p},{p},{p}]\n",
+            p = prev
+        ));
+    }
+    yaml.push_str("detection:\n  selection:\n    Image: a\n  condition: selection\n");
+    let error = parse_rule_yaml(&yaml).expect_err("an alias bomb must not be expanded");
+    assert!(error.to_string().contains("budget"), "{error}");
+}
+
+#[test]
+fn deeply_nested_input_is_an_error_not_a_stack_overflow() {
+    let yaml = rule_with_detection(&format!(
+        "  selection:\n    Image: {}x{}\n  condition: selection\n",
+        "[".repeat(5_000),
+        "]".repeat(5_000)
+    ));
+    assert!(parse_rule_yaml(&yaml).is_err());
+}
+
+#[test]
+fn malformed_and_empty_input_is_an_error_never_a_panic() {
+    for text in [
+        "",
+        "just text\n",
+        "- a\n- b\n",
+        "title: [unclosed\n",
+        "\u{0}\u{1}\u{2}",
+        "a: &x\n",
+    ] {
+        assert!(parse_rule_yaml(text).is_err(), "{text:?}");
+    }
 }
