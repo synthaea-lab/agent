@@ -339,6 +339,23 @@ mod tests {
     }
 
     #[test]
+    fn a_content_path_that_is_not_a_safe_relative_path_is_refused() {
+        for unsafe_path in [
+            "/etc/hostname",
+            "C:/Windows/x",
+            "rules/../../x",
+            "..",
+            "",
+            "rules\\x",
+            "rules/a.sigma:stream",
+            "rules/CON",
+        ] {
+            assert!(!is_safe_content_path(unsafe_path), "{unsafe_path:?}");
+        }
+        assert!(is_safe_content_path("rules/beacon.sigma"));
+    }
+
+    #[test]
     fn entries_the_manifest_no_longer_lists_are_reported_for_removal() {
         let manifest = signed_manifest(2); // lists only rules/beacon.sigma
         let have: BTreeMap<String, String> = [

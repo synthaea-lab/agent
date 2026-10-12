@@ -95,6 +95,10 @@ pub(crate) struct FetchPlan {
     /// Applied paths this manifest no longer lists: deleted once the new entries have
     /// landed, so that a release which drops a file actually withdraws it (#666).
     pub(crate) to_remove: Vec<String>,
+    /// Every path the manifest lists, so that removing a stale path can be refused when it
+    /// is the same file as a listed one under another spelling (a case-only rename on a
+    /// case-insensitive filesystem).
+    pub(crate) kept: Vec<String>,
 }
 
 /// Verifies `manifest` (signature + anti-rollback against `state`) and reports
@@ -118,18 +122,38 @@ pub(crate) fn plan(
 ) -> Result<FetchPlan, UpdaterError> {
     manifest.verify_signature()?;
     manifest.check_ring(ring)?;
-    manifest.check_release_version(state.release_version_for(ring))?;
+    // An offer of the *same* release is not ignored when the files on disk do not match it:
+    // the state holds one set of entries but a release version per ring, so applying another
+    // ring's manifest and coming back would otherwise leave this ring's files pruned or
+    // replaced and the equal version refused as "up to date". Older offers stay ignored.
+    let repair = match manifest.check_release_version(state.release_version_for(ring)) {
+        Ok(()) => false,
+        Err(UpdaterError::ReleaseNotNewer { offered, current }) if offered == current => true,
+        Err(e) => return Err(e),
+    };
     manifest.validate_entry_paths()?;
-    let to_fetch = manifest
+    if manifest.entries.is_empty() && !state.entries.is_empty() {
+        return Err(UpdaterError::EmptyContentManifest {
+            would_remove: state.entries.len(),
+        });
+    }
+    let to_fetch: Vec<ContentEntry> = manifest
         .entries_to_fetch(&state.entries)
         .into_iter()
         .cloned()
         .collect();
     let to_remove = manifest.entries_to_remove(&state.entries);
+    if repair && to_fetch.is_empty() && to_remove.is_empty() {
+        return Err(UpdaterError::ReleaseNotNewer {
+            offered: manifest.release_version,
+            current: manifest.release_version,
+        });
+    }
     Ok(FetchPlan {
         release_version: manifest.release_version,
         to_fetch,
         to_remove,
+        kept: manifest.entries.iter().map(|e| e.path.clone()).collect(),
     })
 }
 
@@ -255,7 +279,7 @@ fn download_and_apply(
     content_dir: &Path,
     state_path: &Path,
     mut state: ContentState,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<Applied> {
     std::fs::create_dir_all(content_dir)?;
     // The symlink check bounds itself to components under this root, not
     // the whole filesystem ancestry (see `updater::fsutil::reject_symlink_components`) — for
@@ -301,19 +325,28 @@ fn download_and_apply(
         write_atomically(state_root, state_path, &serde_json::to_vec(&state)?)?;
     }
 
-    let removed = prune_unlisted(
+    let pruned = prune_unlisted(
         content_dir,
         state_root,
         state_path,
         &mut state,
         &fetch_plan.to_remove,
+        &fetch_plan.kept,
     )?;
 
     state
         .release_version
         .insert(ring.to_string(), fetch_plan.release_version);
     write_atomically(state_root, state_path, &serde_json::to_vec(&state)?)?;
-    Ok(removed)
+    Ok(pruned)
+}
+
+/// What [`download_and_apply`] did beyond fetching: files removed, and files it could not
+/// remove (kept in the state, so the next run tries again).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Applied {
+    pub(crate) removed: usize,
+    pub(crate) failed: usize,
 }
 
 /// Deletes the files in `to_remove` from `content_dir` and forgets them in `state`,
@@ -323,35 +356,92 @@ fn download_and_apply(
 /// The list comes from the agent's own unsigned state file, so each path is checked again
 /// before it is joined onto the content root: one that is not a safe relative content path
 /// is dropped from the state without touching the disk (nothing this agent wrote can look
-/// like that), and a file whose path crosses a symlink is refused, like the download path.
+/// like that). A path that is the same file as a listed one under another spelling is not
+/// deleted either ([`is_alias_of_listed`]): the new release has just written it.
+///
+/// A file that cannot be removed (it crosses a symlink, a directory sits at its path, a
+/// permission error) is warned about and **kept in the state**, and the rest of the release
+/// still applies: one stuck file must not stop new rules from reaching the agent. The next
+/// run retries it ([`plan`] re-plans an equal release while something is left to do).
 ///
 /// # Errors
 ///
-/// Returns an error if a path crosses a symlink or a file cannot be deleted.
+/// Returns an error only if the state file cannot be written.
 fn prune_unlisted(
     content_dir: &Path,
     state_root: &Path,
     state_path: &Path,
     state: &mut ContentState,
     to_remove: &[String],
-) -> anyhow::Result<usize> {
-    let mut removed = 0;
+    kept: &[String],
+) -> anyhow::Result<Applied> {
+    let mut applied = Applied::default();
     for path in to_remove {
-        if is_safe_content_path(path) {
-            let dest = artifact_dest(content_dir, path);
-            let deleted = remove_file_under(content_dir, &dest)
-                .map_err(|e| anyhow::Error::from(e).context(format!("removing {path}")))?;
-            removed += usize::from(deleted);
-        } else {
+        if !is_safe_content_path(path) {
             tracing::warn!(
                 path = %path,
                 "content state lists an unsafe path; dropping it without deleting anything"
             );
+        } else if is_alias_of_listed(content_dir, path, kept) {
+            tracing::info!(
+                path = %path,
+                "not removing a path that is a listed file under another spelling"
+            );
+        } else {
+            let dest = artifact_dest(content_dir, path);
+            match remove_file_under(content_dir, &dest) {
+                Ok(deleted) => applied.removed += usize::from(deleted),
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path,
+                        %error,
+                        "could not remove content the manifest no longer lists; will retry"
+                    );
+                    applied.failed += 1;
+                    continue;
+                }
+            }
         }
         state.entries.remove(path);
         write_atomically(state_root, state_path, &serde_json::to_vec(&*state)?)?;
     }
-    Ok(removed)
+    Ok(applied)
+}
+
+/// True if `path` is spelled differently from a listed path only by case and the filesystem
+/// treats them as one file. Removing it then would delete the file the release has just
+/// written (NTFS and default APFS: `Foo.yml` and `foo.yml` are one entry; a rename of the
+/// case alone is exactly the change that makes the old spelling "unlisted").
+///
+/// The test is what the directory really holds: the two spellings are different files only
+/// if the directory lists *both* exact names, which a case-insensitive filesystem never does.
+/// A directory that cannot be read counts as an alias, the safe answer. Normalisation
+/// differences (NFC against NFD on APFS) are not detected.
+fn is_alias_of_listed(content_dir: &Path, path: &str, kept: &[String]) -> bool {
+    kept.iter()
+        .filter(|listed| listed.as_str() != path && listed.to_lowercase() == path.to_lowercase())
+        .any(|listed| !are_distinct_entries(content_dir, path, listed))
+}
+
+/// Whether `a` and `b` (same length, equal ignoring case, not equal) name two separate
+/// directory entries at the first component where they differ.
+fn are_distinct_entries(root: &Path, a: &str, b: &str) -> bool {
+    let mut dir = root.to_path_buf();
+    for (left, right) in a.split('/').zip(b.split('/')) {
+        if left == right {
+            dir.push(left);
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return false;
+        };
+        let names: Vec<String> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        return names.iter().any(|n| n == left) && names.iter().any(|n| n == right);
+    }
+    false
 }
 
 /// Resolves `path`'s furthest already-existing ancestor via
@@ -630,12 +720,20 @@ fn apply_content_manifest(
     };
 
     let fetched = fetch_plan.to_fetch.len();
-    let removed = download_and_apply(&client, &fetch_plan, ring, content_dir, state_path, state)?;
+    let applied = download_and_apply(&client, &fetch_plan, ring, content_dir, state_path, state)?;
     println!(
-        "ring {ring}: applied release {} ({fetched} entr{} fetched, {removed} removed)",
+        "ring {ring}: applied release {} ({fetched} entr{} fetched, {} removed)",
         fetch_plan.release_version,
-        if fetched == 1 { "y" } else { "ies" }
+        if fetched == 1 { "y" } else { "ies" },
+        applied.removed
     );
+    if applied.failed > 0 {
+        eprintln!(
+            "warning: {} file(s) the release no longer lists could not be removed and are \
+             still on disk; they stay in the state and the next run retries them (see the agent log)",
+            applied.failed
+        );
+    }
 
     match notify_running_agent(ipc_endpoint) {
         Ok(report) => {
@@ -889,11 +987,24 @@ mod tests {
         let manifest = signed_manifest_json(1, vec![entry("rules/a.sigma")]);
         let mut state = ContentState::default();
         state.release_version.insert("canary_0".to_string(), 1);
+        // The files already match the offer: up to date, nothing to repair.
+        state
+            .entries
+            .insert("rules/a.sigma".to_string(), "a".repeat(64));
         assert!(matches!(
             plan(&manifest, "canary_0", &state),
             Err(UpdaterError::ReleaseNotNewer {
                 offered: 1,
                 current: 1
+            })
+        ));
+        // An older offer is ignored whatever is on disk.
+        state.release_version.insert("canary_0".to_string(), 2);
+        assert!(matches!(
+            plan(&manifest, "canary_0", &state),
+            Err(UpdaterError::ReleaseNotNewer {
+                offered: 1,
+                current: 2
             })
         ));
     }
@@ -1122,6 +1233,7 @@ mod tests {
             release_version: 7,
             to_fetch: vec![e1.clone(), e2.clone()],
             to_remove: vec![],
+            kept: vec![],
         };
 
         download_and_apply(
@@ -1170,6 +1282,7 @@ mod tests {
             release_version: 1,
             to_fetch: vec![entry],
             to_remove: vec![],
+            kept: vec![],
         };
 
         let err = download_and_apply(
@@ -1201,6 +1314,7 @@ mod tests {
             release_version: 5,
             to_fetch: vec![e1.clone(), e2],
             to_remove: vec![],
+            kept: vec![],
         };
 
         download_and_apply(
@@ -1268,7 +1382,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(removed, 2);
+        assert_eq!(
+            removed,
+            Applied {
+                removed: 2,
+                failed: 0
+            }
+        );
         assert!(content_dir.join("rules/v2.sigma").exists());
         assert!(!content_dir.join("rules/v3.sigma").exists());
         assert!(!content_dir.join("rules/v4.sigma").exists());
@@ -1294,6 +1414,7 @@ mod tests {
             release_version: 5,
             to_fetch: vec![bad],
             to_remove: vec!["rules/old.sigma".to_string()],
+            kept: vec![],
         };
 
         download_and_apply(
@@ -1321,6 +1442,7 @@ mod tests {
             release_version: 5,
             to_fetch: vec![],
             to_remove: vec!["rules/b.sigma".to_string()],
+            kept: vec![],
         };
 
         let removed = download_and_apply(
@@ -1333,7 +1455,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(removed, 0, "nothing was left to delete");
+        assert_eq!(removed, Applied::default(), "nothing was left to delete");
         let state = ContentState::load(&state_path).unwrap();
         assert!(!state.entries.contains_key("rules/b.sigma"));
         assert!(state.entries.contains_key("rules/a.sigma"));
@@ -1347,15 +1469,23 @@ mod tests {
         let (content_dir, state_path, mut state) = applied(&dir, &["rules/a.sigma"]);
         let victim = dir.join("victim.txt");
         std::fs::write(&victim, b"keep me").unwrap();
+        // Joined segment by segment under `content/`, `/content-shadow.sigma` would land on
+        // this file if the absolute-path guard failed, which only a real file can show.
+        std::fs::write(content_dir.join("content-shadow.sigma"), b"keep me too").unwrap();
         let absolute = victim.to_string_lossy().into_owned();
-        for unsafe_path in ["../victim.txt", absolute.as_str(), "rules/../../victim.txt"] {
+        for unsafe_path in [
+            "../victim.txt",
+            absolute.as_str(),
+            "/content-shadow.sigma",
+            "rules/../../victim.txt",
+        ] {
             state
                 .entries
                 .insert(unsafe_path.to_string(), "a".repeat(64));
         }
         let manifest = signed_manifest_json(5, vec![entry("rules/a.sigma")]);
         let fetch_plan = plan(&manifest, "canary_0", &state).unwrap();
-        assert_eq!(fetch_plan.to_remove.len(), 3);
+        assert_eq!(fetch_plan.to_remove.len(), 4);
 
         let removed = download_and_apply(
             &offline_client(),
@@ -1367,10 +1497,208 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(removed, 0);
+        assert_eq!(removed, Applied::default());
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+        assert_eq!(
+            std::fs::read(content_dir.join("content-shadow.sigma")).unwrap(),
+            b"keep me too"
+        );
         let state = ContentState::load(&state_path).unwrap();
         assert_eq!(state.entries.keys().collect::<Vec<_>>(), ["rules/a.sigma"]);
+    }
+
+    #[test]
+    fn an_empty_manifest_would_wipe_every_applied_file_and_is_refused() {
+        let state = ContentState {
+            entries: [("rules/a.sigma".to_string(), "a".repeat(64))].into(),
+            ..ContentState::default()
+        };
+        let manifest = signed_manifest_json(5, vec![]);
+        assert!(matches!(
+            plan(&manifest, "canary_0", &state),
+            Err(UpdaterError::EmptyContentManifest { would_remove: 1 })
+        ));
+        // Nothing applied yet: an empty manifest deletes nothing and is harmless.
+        assert!(plan(&manifest, "canary_0", &ContentState::default()).is_ok());
+    }
+
+    #[test]
+    fn coming_back_to_a_ring_repairs_what_another_ring_pruned() {
+        // canary_0 applied r5 = {A, B}; one apply for canary_1 (r3 = {A, C}) pruned B and
+        // wrote C. Back on canary_0 the equal release must not be "up to date".
+        let mut state = ContentState::default();
+        state.entries.insert("rules/a.sigma".into(), "a".repeat(64));
+        state.entries.insert("rules/c.sigma".into(), "a".repeat(64));
+        state.release_version.insert("canary_0".into(), 5);
+        state.release_version.insert("canary_1".into(), 3);
+        let manifest =
+            signed_manifest_json(5, vec![entry("rules/a.sigma"), entry("rules/b.sigma")]);
+
+        let repair = plan(&manifest, "canary_0", &state).unwrap();
+        assert_eq!(repair.release_version, 5);
+        assert_eq!(repair.to_fetch.len(), 1);
+        assert_eq!(repair.to_fetch[0].path, "rules/b.sigma");
+        assert_eq!(repair.to_remove, ["rules/c.sigma"]);
+
+        // Once the files match, the same release is up to date again...
+        let mut converged = state.clone();
+        converged.entries.remove("rules/c.sigma");
+        converged
+            .entries
+            .insert("rules/b.sigma".into(), "a".repeat(64));
+        assert!(matches!(
+            plan(&manifest, "canary_0", &converged),
+            Err(UpdaterError::ReleaseNotNewer {
+                offered: 5,
+                current: 5
+            })
+        ));
+        // ...and an older offer is ignored whatever is on disk (a rollback is not followed).
+        let older = signed_manifest_json(4, vec![entry("rules/a.sigma")]);
+        assert!(matches!(
+            plan(&older, "canary_0", &state),
+            Err(UpdaterError::ReleaseNotNewer {
+                offered: 4,
+                current: 5
+            })
+        ));
+    }
+
+    /// Whether the filesystem under `dir` tells `a` from `A`.
+    fn is_case_sensitive(dir: &Path) -> bool {
+        let probe = dir.join("case-probe");
+        std::fs::write(&probe, b"x").unwrap();
+        let sensitive = !dir.join("CASE-PROBE").exists();
+        std::fs::remove_file(&probe).unwrap();
+        sensitive
+    }
+
+    #[test]
+    fn a_case_only_rename_removes_the_old_spelling_where_both_files_exist() {
+        let dir = tmp("prune-case-rename-sensitive");
+        if !is_case_sensitive(&dir) {
+            return; // there the two spellings are one file: the next test covers it
+        }
+        let (content_dir, state_path, mut state) = applied(&dir, &["rules/Foo.yml"]);
+        std::fs::write(content_dir.join("rules/foo.yml"), b"new").unwrap();
+        state.entries.insert("rules/foo.yml".into(), "b".repeat(64));
+        let to_remove = vec!["rules/Foo.yml".to_string()];
+        let kept = vec!["rules/foo.yml".to_string()];
+
+        let applied = prune_unlisted(
+            &content_dir,
+            &dir,
+            &state_path,
+            &mut state,
+            &to_remove,
+            &kept,
+        )
+        .unwrap();
+
+        assert_eq!(
+            applied,
+            Applied {
+                removed: 1,
+                failed: 0
+            }
+        );
+        assert!(!content_dir.join("rules/Foo.yml").exists());
+        assert!(content_dir.join("rules/foo.yml").exists());
+    }
+
+    #[test]
+    fn a_case_only_rename_never_deletes_the_file_the_release_just_wrote() {
+        // On NTFS and default APFS the fetch of `foo.yml` overwrote `Foo.yml`: the directory
+        // holds one entry, `foo.yml`, while the state still records the old spelling.
+        let dir = tmp("prune-case-rename-alias");
+        let (content_dir, state_path, mut state) = applied(&dir, &["rules/foo.yml"]);
+        state.entries.insert("rules/Foo.yml".into(), "a".repeat(64));
+        let to_remove = vec!["rules/Foo.yml".to_string()];
+        let kept = vec!["rules/foo.yml".to_string()];
+
+        let applied = prune_unlisted(
+            &content_dir,
+            &dir,
+            &state_path,
+            &mut state,
+            &to_remove,
+            &kept,
+        )
+        .unwrap();
+
+        assert_eq!(applied, Applied::default());
+        assert_eq!(
+            std::fs::read(content_dir.join("rules/foo.yml")).unwrap(),
+            b"rules/foo.yml"
+        );
+        let state = ContentState::load(&state_path).unwrap_or(state);
+        assert!(!state.entries.contains_key("rules/Foo.yml"));
+    }
+
+    #[test]
+    fn two_spellings_are_distinct_files_only_when_the_directory_lists_both() {
+        let dir = tmp("distinct-entries");
+        std::fs::create_dir_all(dir.join("rules")).unwrap();
+        std::fs::write(dir.join("rules/foo.yml"), b"x").unwrap();
+        assert!(!are_distinct_entries(
+            &dir,
+            "rules/Foo.yml",
+            "rules/foo.yml"
+        ));
+        if is_case_sensitive(&dir) {
+            std::fs::write(dir.join("rules/Foo.yml"), b"y").unwrap();
+            assert!(are_distinct_entries(&dir, "rules/Foo.yml", "rules/foo.yml"));
+        }
+        // A directory that cannot be read is treated as an alias, the safe answer.
+        assert!(!are_distinct_entries(&dir, "gone/Foo.yml", "gone/foo.yml"));
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_removed_does_not_stop_the_release() {
+        // A directory at a recorded path cannot be deleted as a file. It must not block the
+        // new rules, and it must stay in the state so the next run tries again.
+        let dir = tmp("prune-stuck-entry");
+        let (content_dir, state_path, mut state) =
+            applied(&dir, &["rules/old.sigma", "rules/keep.sigma"]);
+        std::fs::create_dir_all(content_dir.join("rules/stuck.sigma")).unwrap();
+        state
+            .entries
+            .insert("rules/stuck.sigma".into(), "a".repeat(64));
+        let manifest = signed_manifest_json(5, vec![entry("rules/keep.sigma")]);
+        let fetch_plan = plan(&manifest, "canary_0", &state).unwrap();
+        assert_eq!(
+            fetch_plan.to_remove,
+            ["rules/old.sigma", "rules/stuck.sigma"]
+        );
+
+        let applied = download_and_apply(
+            &offline_client(),
+            &fetch_plan,
+            "canary_0",
+            &content_dir,
+            &state_path,
+            state,
+        )
+        .expect("one stuck file must not fail the whole release");
+
+        assert_eq!(
+            applied,
+            Applied {
+                removed: 1,
+                failed: 1
+            }
+        );
+        assert!(!content_dir.join("rules/old.sigma").exists());
+        let state = ContentState::load(&state_path).unwrap();
+        assert_eq!(state.release_version.get("canary_0"), Some(&5));
+        assert!(
+            state.entries.contains_key("rules/stuck.sigma"),
+            "kept to retry"
+        );
+        assert!(!state.entries.contains_key("rules/old.sigma"));
+        // The same release is planned again while something is left to remove.
+        let retry = plan(&manifest, "canary_0", &state).unwrap();
+        assert_eq!(retry.to_remove, ["rules/stuck.sigma"]);
     }
 
     #[test]
@@ -1427,6 +1755,7 @@ mod tests {
             release_version: 1,
             to_fetch: vec![entry],
             to_remove: vec![],
+            kept: vec![],
         };
         // No server at all — if this reached `get_bytes` it would fail with
         // a connection error instead, so a config/network-shaped error here

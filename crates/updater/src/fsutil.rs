@@ -36,7 +36,7 @@ pub fn reject_symlink_components(root: &Path, dest: &Path) -> std::io::Result<()
             && meta.file_type().is_symlink()
         {
             return Err(std::io::Error::other(format!(
-                "refusing to write: {} is a symlink",
+                "refusing to follow: {} is a symlink",
                 probe.display()
             )));
         }
@@ -202,6 +202,29 @@ mod tests {
         std::fs::create_dir_all(dir.join("rules")).unwrap();
         assert!(remove_file_under(&dir, &dir.join("rules")).is_err());
         assert!(dir.join("rules").is_dir());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remove_file_under_refuses_a_path_through_a_directory_junction() {
+        let dir = tmp("remove-junction");
+        let outside = tmp("remove-junction-outside");
+        std::fs::write(outside.join("victim.sigma"), b"keep me").unwrap();
+        let root = dir.join("content");
+        std::fs::create_dir_all(&root).unwrap();
+        // Junctions need no privilege, unlike file symlinks.
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(root.join("rules"))
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "mklink /J failed");
+
+        let err = remove_file_under(&root, &root.join("rules").join("victim.sigma"))
+            .expect_err("a delete through a junction must be refused");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(outside.join("victim.sigma").exists());
     }
 
     #[cfg(unix)]
