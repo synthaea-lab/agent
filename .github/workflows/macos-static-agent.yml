@@ -89,9 +89,21 @@ jobs:
           path: ort-static
           key: ort-static-macos-${{ runner.arch }}-${{ matrix.os }}-${{ hashFiles('lab/provisioning/build-onnxruntime-static.sh') }}
 
+      # onnxruntime's CMake downloads its dependencies (protobuf's protoc, cpuinfo, abseil, ...)
+      # from GitHub while it configures, and a download that answers HTTP 504 stops the whole
+      # build (seen on both legs of the first manual run, 2026-10-12, a minute and a half in).
+      # A second attempt reuses the checkout and whatever was already fetched.
       - name: Build onnxruntime from source
         if: steps.ort-cache.outputs.cache-hit != 'true'
-        run: ./lab/provisioning/build-onnxruntime-static.sh --jobs "$(sysctl -n hw.ncpu)"
+        run: |
+          for attempt in 1 2 3; do
+            if ./lab/provisioning/build-onnxruntime-static.sh --jobs "$(sysctl -n hw.ncpu)"; then
+              exit 0
+            fi
+            echo "onnxruntime build attempt $attempt failed" >&2
+            sleep 60
+          done
+          exit 1
 
       # `ort-static/Release` mirrors `build/MacOS/Release`, so the link-flags script finds
       # the same tree a cached run does. The build tree is removed afterwards.
