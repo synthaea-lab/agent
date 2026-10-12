@@ -10,8 +10,8 @@ use std::{
 use schema::{
     AuthEvent, AuthOutcome, ConnectEvent, Event, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
     FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRenameEvent, FileWriteEvent,
-    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, SessionEvent, User,
-    detection::Severity,
+    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, PolicyDenialEvent, SessionEvent,
+    User, detection::Severity,
 };
 use store::BoundedMap;
 
@@ -159,6 +159,17 @@ pub struct RuleState {
     /// listener space is a few dozen, not unbounded, but a hostile loop binding
     /// many ports must not grow this without limit either.
     known_listeners: BoundedMap<(IpAddr, u16), ()>,
+    /// (mechanism, subject context, object context, object class) → seen, for
+    /// POLICY-DENIAL-DRIFT (issue #774, T1562-adjacent). Same "first new shape
+    /// wins, the routine repeat doesn't" principle as `known_listeners` above:
+    /// a `SELinux`-Enforcing or AppLocker/WDAC-managed host denies constantly as
+    /// part of normal operation, so alerting on every `PolicyDenial` would be
+    /// unusable — a *new* (subject, object, class) triple appearing is the
+    /// signal. No startup-baseline seeding (unlike listeners, there's no
+    /// enumerable "current state" of past denials to snapshot at agent start) —
+    /// the first run is cold by design. LRU-bounded like every other stateful
+    /// rule.
+    known_policy_denials: BoundedMap<PolicyDenialKey, ()>,
     /// (target user, source) → sliding failure counter for T1110 (AUTH-BURST).
     /// LRU-bounded like every other counter: a spray across many fabricated
     /// usernames must not grow this without limit.
@@ -264,6 +275,10 @@ const MEMFD_CREATES_PER_PID: usize = 8;
 const PID_COMM_CAP: usize = 65_536;
 /// Counter/write-history bounds — one logical entity per key, far fewer than pids.
 const COUNTER_CAP: usize = 16_384;
+/// `known_policy_denials`' key: (mechanism, subject context, object context,
+/// object class). Named so clippy's `type_complexity` lint doesn't flag the
+/// field declaration.
+type PolicyDenialKey = (String, Option<String>, Option<String>, Option<String>);
 const RECENT_WRITES_CAP: usize = 4_096;
 
 impl Default for RuleState {
@@ -287,6 +302,7 @@ impl RuleState {
             beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
             scan_spread: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
+            known_policy_denials: BoundedMap::new(COUNTER_CAP),
             auth_failures: BoundedMap::new(COUNTER_CAP),
             recent_creates: BoundedMap::new(CREATE_UNLINK_PID_CAP),
             pending_unlinks: BoundedMap::new(CREATE_UNLINK_PID_CAP),
@@ -934,6 +950,46 @@ impl RuleState {
     /// polling, issue #92) — see [`Self::check_listen_port_drift`].
     pub fn on_listen_port(&mut self, event: &ListenPortEvent) -> Vec<Alert> {
         self.check_listen_port_drift(event).into_iter().collect()
+    }
+
+    /// POLICY-DENIAL-DRIFT (issue #774, T1562-adjacent) — see
+    /// `known_policy_denials`'s doc for why this alerts on a new
+    /// (subject, object, class) triple rather than on every denial. Fires for
+    /// `PolicyDenialEvent::enforced` either way (`SELinux` permissive logs the
+    /// same fact a managed Enforcing host would act on) — the point is a new
+    /// *shape* of denial, not whether this particular one was blocked.
+    fn check_policy_denial_drift(&mut self, event: &PolicyDenialEvent) -> Option<Alert> {
+        let key: PolicyDenialKey = (
+            event.mechanism.clone(),
+            event.subject_context.clone(),
+            event.object_context.clone(),
+            event.object_class.clone(),
+        );
+        if self.known_policy_denials.get(&key).is_some() {
+            return None;
+        }
+        self.known_policy_denials.insert(key, ());
+        Some(Alert {
+            technique: "T1562",
+            severity: Severity::Medium,
+            message: format!(
+                "pid={} comm={} mechanism={} subject={} object={} class={} enforced={} — new denial shape, not seen this run",
+                event.meta.pid,
+                event.meta.comm,
+                event.mechanism,
+                event.subject_context.as_deref().unwrap_or("-"),
+                event.object_context.as_deref().unwrap_or("-"),
+                event.object_class.as_deref().unwrap_or("-"),
+                event.enforced,
+            ),
+        })
+    }
+
+    /// To be called for every `PolicyDenialEvent` in the stream (`SELinux` AVC
+    /// on Linux issue #297, AppLocker/WDAC on Windows issue #283) — see
+    /// [`Self::check_policy_denial_drift`].
+    pub fn on_policy_denial(&mut self, event: &PolicyDenialEvent) -> Vec<Alert> {
+        self.check_policy_denial_drift(event).into_iter().collect()
     }
 
     /// To be called for every `LdapSearchEvent` (Windows, #364): the

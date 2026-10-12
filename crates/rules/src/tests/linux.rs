@@ -1051,6 +1051,125 @@ fn listen_port_two_distinct_new_ports_each_alert() {
     assert_eq!(second.len(), 1);
 }
 
+// ── POLICY-DENIAL-DRIFT via SELinux AVC / AppLocker/WDAC (issue #774, PolicyDenialEvent) ──
+
+#[test]
+fn a_new_policy_denial_shape_alerts_once() {
+    let mut state = RuleState::new();
+    let alerts = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        Some("system_u:system_r:httpd_t:s0"),
+        Some("system_u:object_r:shadow_t:s0"),
+        Some("file"),
+        true,
+    ));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1562");
+}
+
+#[test]
+fn the_same_denial_shape_repeated_does_not_realert() {
+    // SELinux/AppLocker deny the same (subject, object, class) triple over and
+    // over as part of routine Enforcing/managed operation — the 2nd+ denial of
+    // the same shape is not a new finding.
+    let mut state = RuleState::new();
+    let first = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        Some("httpd_t"),
+        Some("shadow_t"),
+        Some("file"),
+        true,
+    ));
+    assert_eq!(first.len(), 1);
+    let second = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        Some("httpd_t"),
+        Some("shadow_t"),
+        Some("file"),
+        true,
+    ));
+    assert!(second.is_empty());
+}
+
+#[test]
+fn a_different_object_class_on_the_same_subject_object_pair_is_a_new_shape() {
+    // Same subject/object contexts, different tclass (file vs. process) — a
+    // genuinely different kind of denial, not a repeat of the first.
+    let mut state = RuleState::new();
+    let first = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        Some("httpd_t"),
+        Some("shadow_t"),
+        Some("file"),
+        true,
+    ));
+    let second = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        Some("httpd_t"),
+        Some("shadow_t"),
+        Some("process"),
+        true,
+    ));
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+}
+
+#[test]
+fn permissive_mode_still_alerts_on_a_new_shape() {
+    // A permissive-mode SELinux log still names a real new denial shape — the
+    // rule fires on the shape appearing, not on whether it was actually
+    // blocked (see check_policy_denial_drift's doc).
+    let mut state = RuleState::new();
+    let alerts = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        Some("unconfined_t"),
+        Some("user_home_t"),
+        Some("file"),
+        false,
+    ));
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn different_mechanisms_are_independent_shapes() {
+    // Windows AppLocker/WDAC and Linux SELinux share the event shape but not
+    // the state: the same subject/object/class strings under a different
+    // mechanism must count as a distinct first-seen triple.
+    let mut state = RuleState::new();
+    let selinux = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        Some("x"),
+        Some("y"),
+        Some("z"),
+        true,
+    ));
+    let applocker = state.on_policy_denial(&policy_denial_event_full(
+        "applocker",
+        Some("x"),
+        Some("y"),
+        Some("z"),
+        true,
+    ));
+    assert_eq!(selinux.len(), 1);
+    assert_eq!(applocker.len(), 1);
+}
+
+#[test]
+fn a_denial_missing_subject_or_object_context_still_alerts_once() {
+    // tclass values like `capability`/`tcp_socket` or an AppLocker verdict with
+    // no SELinux-style context carry None for subject/object — the rule must
+    // not panic or silently drop these, just key on whatever is present.
+    let mut state = RuleState::new();
+    let alerts = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        None,
+        None,
+        Some("capability"),
+        true,
+    ));
+    assert_eq!(alerts.len(), 1);
+}
+
 #[test]
 fn mass_rename_with_appended_suffix_triggers_at_threshold() {
     let mut state = RuleState::new();
