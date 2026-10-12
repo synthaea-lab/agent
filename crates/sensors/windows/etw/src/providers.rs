@@ -27,6 +27,26 @@ use crate::{
 const KERNEL_PROCESS_GUID: &str = "22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716";
 const KERNEL_NETWORK_GUID: &str = "7dd42a49-5329-4832-8dfd-43d979153a88";
 const KERNEL_FILE_GUID: &str = "edd08927-9cc4-4e65-b970-c2560fb5c289";
+/// Kernel-File manifest keyword bits for the event IDs handled below.
+const FILE_KEYWORD_CREATE: u64 = 0x80;
+const FILE_KEYWORD_DELETE_PATH: u64 = 0x400;
+const FILE_KEYWORD_CREATE_NEW_FILE: u64 = 0x1000;
+/// EID 12 Create, EID 26 `DeletePath`, and EID 30 `CreateNewFile` only.
+/// `FILE_EVENT_KEYWORDS` is the single source of truth for dispatched IDs.
+const FILE_KEYWORDS: u64 =
+    FILE_KEYWORD_CREATE | FILE_KEYWORD_DELETE_PATH | FILE_KEYWORD_CREATE_NEW_FILE;
+const FILE_EVENT_KEYWORDS: [(u16, u64); 3] = [
+    (12, FILE_KEYWORD_CREATE),
+    (26, FILE_KEYWORD_DELETE_PATH),
+    (30, FILE_KEYWORD_CREATE_NEW_FILE),
+];
+
+fn file_event_keyword(event_id: u16) -> Option<u64> {
+    FILE_EVENT_KEYWORDS
+        .iter()
+        .find_map(|(id, keyword)| (*id == event_id).then_some(*keyword))
+}
+
 /// Microsoft-Windows-DNS-Client
 const DNS_CLIENT_GUID: &str = "1C95126E-7EEA-49A9-A3FE-A378B03DDB4D";
 /// Microsoft-Windows-Kernel-Registry
@@ -60,6 +80,12 @@ pub(crate) const ALL_PROVIDERS: [(&str, &str); 11] = [
     ("LDAP-Client", LDAP_CLIENT_GUID),
 ];
 
+/// Kernel-Process keywords the sensor reads: `WINEVENT_KEYWORD_PROCESS` (0x10,
+/// EIDs 1/2) and `WINEVENT_KEYWORD_IMAGE` (0x40, EID 5). Left unset, ferrisetw
+/// enables every keyword, and every thread start on the host (EID 3, keyword
+/// 0x20) went through the callback for nothing (#726).
+const KERNEL_PROCESS_KEYWORDS: u64 = 0x10 | 0x40;
+
 /// `AssemblyFlags` bit indicating a dynamic (in-memory) assembly load.
 /// File-backed assemblies are high-volume noise; only dynamic loads are forwarded.
 const ASSEMBLY_FLAG_DYNAMIC: u32 = 0x2;
@@ -68,9 +94,10 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
         let eid = record.event_id();
         // 1=ProcessStart (new spawn → ExecEvent), 2=ProcessEnd (prune the store —
-        // PID recycling), 3=ProcessDCStart (rundown of already-running processes →
-        // store only, not a spawn), 5=ImageLoad (DLL/EXE mapped into a process).
-        if eid != 1 && eid != 2 && eid != 3 && eid != 5 {
+        // PID recycling), 5=ImageLoad (DLL/EXE mapped into a process). Processes
+        // already running come from the pid-store seed, not from a rundown (that
+        // would be EID 15; EID 3 is ThreadStart, #726).
+        if eid != 1 && eid != 2 && eid != 5 {
             return;
         }
         state.events_seen.fetch_add(1, Ordering::Relaxed);
@@ -124,10 +151,6 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         if image_path != "<unknown>" {
             state.pids.lock().unwrap().insert(pid, image_path.clone());
         }
-        if eid == 3 {
-            return; // rundown: store populated, nothing else to do
-        }
-
         // Lineage at exec time (schema parent fields): the parent is usually alive
         // and already in the store.
         let parent_image_path = state.pids.lock().unwrap().get(ppid).map(str::to_owned);
@@ -152,6 +175,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         }));
     };
     Provider::by_guid(KERNEL_PROCESS_GUID)
+        .any(KERNEL_PROCESS_KEYWORDS)
         .add_callback(callback)
         .build()
 }
@@ -250,10 +274,10 @@ pub(crate) fn network_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
 pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
         let eid = record.event_id();
-        // 12=NameCreate; 30=CreateNewFile; 26=DeletePath, for mark-of-the-web
+        // 12=Create; 30=CreateNewFile; 26=DeletePath, for mark-of-the-web
         // removal only (F-6 partial — general delete/rename semantics land with
         // #82/#39).
-        if eid != 12 && eid != 26 && eid != 30 {
+        if file_event_keyword(eid).is_none() {
             return;
         }
         state.events_seen.fetch_add(1, Ordering::Relaxed);
@@ -280,7 +304,7 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         let flags = if eid == 30 {
             0o101 // CreateNewFile: create+write by definition
         } else {
-            // NameCreate: disposition in the high byte of CreateOptions.
+            // Create: disposition in the high byte of CreateOptions.
             let create_options: u32 = parser.try_parse("CreateOptions").unwrap_or(0x0100_0000);
             normalize::disposition_to_flags((create_options >> 24) & 0xFF)
         };
@@ -310,6 +334,7 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         sink.on_event(Event::FileOpen(FileOpenEvent { meta, path, flags }));
     };
     Provider::by_guid(KERNEL_FILE_GUID)
+        .any(FILE_KEYWORDS)
         .add_callback(callback)
         .build()
 }
@@ -828,4 +853,46 @@ pub(crate) fn smb_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
     Provider::by_guid(SMB_CLIENT_GUID)
         .add_callback(callback)
         .build()
+}
+
+#[cfg(test)]
+mod process_keyword_tests {
+    use super::*;
+
+    /// Guards the constant; whether the provider really keeps ids 3 and 4 out under this
+    /// mask is checked against a real session by `tests/kernel_process_keyword_mask.rs`
+    /// (`#[ignore]`, elevated; lab phase G of `lab/validate-windows-admin.ps1`).
+    #[test]
+    fn kernel_process_reads_process_and_image_events_but_not_threads() {
+        const PROCESS: u64 = 0x10;
+        const THREAD: u64 = 0x20;
+        const IMAGE: u64 = 0x40;
+        assert_ne!(KERNEL_PROCESS_KEYWORDS & PROCESS, 0);
+        assert_ne!(KERNEL_PROCESS_KEYWORDS & IMAGE, 0);
+        assert_eq!(KERNEL_PROCESS_KEYWORDS & THREAD, 0);
+    }
+}
+
+#[cfg(test)]
+mod file_keyword_tests {
+    use super::*;
+
+    /// Guards the table's own arithmetic and that no dispatched id loses its keyword;
+    /// it compares the table with literals it also contains, so it cannot tell whether
+    /// the manifest really maps these ids to these keywords. That is checked against a
+    /// real session by `tests/kernel_file_keyword_mask.rs` (`#[ignore]`, elevated; lab
+    /// phase F of `lab/validate-windows-admin.ps1`).
+    #[test]
+    fn every_dispatched_file_event_is_enabled_by_its_keyword() {
+        for (event_id, keyword) in FILE_EVENT_KEYWORDS {
+            assert_ne!(
+                keyword & FILE_KEYWORDS,
+                0,
+                "Kernel-File EID {event_id} has no enabled keyword"
+            );
+            assert!(file_event_keyword(event_id).is_some());
+        }
+        assert_eq!(FILE_KEYWORDS, 0x80 | 0x400 | 0x1000);
+        assert_eq!(file_event_keyword(10), None, "NameCreate is not handled");
+    }
 }

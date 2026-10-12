@@ -238,6 +238,19 @@ assert struct.unpack_from('<II', data, directories + 13*8) == (0x1080, 96)
                 self.assertEqual(result.returncode, 2)
                 self.assertIn(message, result.stderr)
 
+    def test_truncated_pe_exits_two_without_a_traceback(self) -> None:
+        full = build_pe(("kernel32.dll", "directml.dll"), ("user32.dll",))
+        # Cut inside the DOS header, the PE header, the section table, the data
+        # directories and the import tables: none may reach exit 1 or a traceback. (At 0x1000
+        # the tables are whole, so that file is a valid PE and exits 1 for directml.dll.)
+        for size in (2, 0x30, 0x3C, 0x40, 0x100, 0x180, 0x1F0, 0x210, 0x400):
+            path = self.directory / f"cut-{size:#x}.exe"
+            path.write_bytes(full[:size])
+            with self.subTest(size=size):
+                result = self.run_checker(str(path))
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(result.returncode, 2, result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

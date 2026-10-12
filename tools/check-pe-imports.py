@@ -34,9 +34,21 @@ def read_cstr(data: bytes, offset: int) -> str:
 
 
 def imports(path: str) -> tuple[list[str], list[str]]:
-    """(regular imports, delay-load imports) as lower-case DLL names."""
+    """(regular imports, delay-load imports) as lower-case DLL names.
+
+    A truncated or malformed file raises `ValueError`, like any other file that is not
+    a usable 64-bit PE, so the caller reports it with exit code 2 (not as a traceback,
+    and not with exit code 1, which means "a forbidden DLL is imported").
+    """
     with open(path, "rb") as f:
         data = f.read()
+    try:
+        return _parse_imports(data)
+    except struct.error as error:
+        raise ValueError(f"truncated or malformed PE file ({error})") from error
+
+
+def _parse_imports(data: bytes) -> tuple[list[str], list[str]]:
     if data[:2] != b"MZ":
         raise ValueError("not a PE file (no MZ header)")
     pe = struct.unpack_from("<I", data, 0x3C)[0]

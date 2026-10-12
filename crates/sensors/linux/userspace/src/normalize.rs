@@ -174,7 +174,8 @@ pub fn exec(
         cmdline: argv.join(" "),
         argv,
         parent_comm: comm_opt(&event.pcomm),
-        // eBPF has the parent comm but not its full path — see #107.
+        // eBPF has the parent comm but not its full path: the sensor fills it from its
+        // pid-to-image cache (`parent_image`, #768).
         parent_image_path: None,
         sha256: None,
         signature: None,

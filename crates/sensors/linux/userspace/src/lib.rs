@@ -21,6 +21,8 @@ mod docker;
 #[cfg(target_os = "linux")]
 mod ebpf;
 #[cfg(target_os = "linux")]
+mod parent_image;
+#[cfg(target_os = "linux")]
 mod proc;
 #[cfg(target_os = "linux")]
 mod sensor;

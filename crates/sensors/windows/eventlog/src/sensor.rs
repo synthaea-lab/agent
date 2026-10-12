@@ -586,9 +586,17 @@ const APPLOCKER_EVENT_BLOCKED: u32 = 8004;
 /// `AppLocker` event id for "allowed, but would have been blocked" (audit
 /// mode). Same payload shape as 8004.
 const APPLOCKER_EVENT_AUDITED: u32 = 8003;
+const APPLOCKER_MSI_AUDITED: u32 = 8006;
+const APPLOCKER_MSI_BLOCKED: u32 = 8007;
+const APPLOCKER_PACKAGED_EXEC_AUDITED: u32 = 8021;
+const APPLOCKER_PACKAGED_EXEC_BLOCKED: u32 = 8022;
+const APPLOCKER_PACKAGED_DEPLOY_AUDITED: u32 = 8024;
+const APPLOCKER_PACKAGED_DEPLOY_BLOCKED: u32 = 8025;
 
-/// Normalizes an `AppLocker` 8003/8004 into a [`PolicyDenialEvent`] (#427):
-/// 8004 is an enforced denial, 8003 an audit-mode one (`enforced: false`) —
+/// Normalizes a blocked or audit-only `AppLocker` decision into a
+/// [`PolicyDenialEvent`] (#427):
+/// 8004/8007/8022/8025 are enforced denials, 8003/8006/8021/8024 are audit
+/// decisions (`enforced: false`) —
 /// the `SELinux` enforcing/permissive split, which is what lets a rule tell
 /// "stopped at the OS boundary" from "ran, and policy only noticed".
 ///
@@ -596,8 +604,8 @@ const APPLOCKER_EVENT_AUDITED: u32 = 8003;
 ///   original case); otherwise `FilePath`, expanded from `AppLocker`'s path
 ///   variables (`%OSDRIVE%\USERS\...` → `C:\USERS\...`) so path-based rules
 ///   can still match it.
-/// - `object_class`: the rule collection (`EXE`, `DLL`), as reported.
-/// - `action`: `execute` — the only operation these two collections gate.
+/// - `object_class`: the rule collection (`EXE`, `DLL`, `MSI`, `SCRIPT`, `APPX`), as reported.
+/// - `action`: `install` for packaged-app deployment decisions, `execute` otherwise.
 /// - `meta.pid`: `<Execution ProcessID>`, the process that tried to launch
 ///   the image — the actor. Not `TargetProcessId`, which names the process
 ///   being created for the image itself (lab-checked for 8003 and 8004, #529).
@@ -606,15 +614,22 @@ const APPLOCKER_EVENT_AUDITED: u32 = 8003;
 ///   name, and the image's leaf name — what the pre-#427 `FileOpenEvent` put
 ///   there — names the *object*, not the actor.
 ///
-/// Skipped (cursor still advances): a block without `FilePath` (nothing to
-/// attribute), and any event id other than 8003/8004 the `XPath` filter let
-/// through — don't guess a verdict for an event we haven't seen the shape of.
+/// Skipped (cursor still advances): a block without `FilePath` or a packaged
+/// app's `Package` identity (nothing to attribute), and any event id outside
+/// the audit/enforced allowlist that an `XPath` filter let through — don't guess
+/// a verdict for an event we haven't seen the shape of.
 fn normalize_applocker_block(block: &str) -> ParsedBlock {
     let ev = xml::parse_applocker_event(block)?;
     let record_id = ev.record_id;
     let enforced = match ev.event_id {
-        APPLOCKER_EVENT_BLOCKED => true,
-        APPLOCKER_EVENT_AUDITED => false,
+        APPLOCKER_EVENT_BLOCKED
+        | APPLOCKER_MSI_BLOCKED
+        | APPLOCKER_PACKAGED_EXEC_BLOCKED
+        | APPLOCKER_PACKAGED_DEPLOY_BLOCKED => true,
+        APPLOCKER_EVENT_AUDITED
+        | APPLOCKER_MSI_AUDITED
+        | APPLOCKER_PACKAGED_EXEC_AUDITED
+        | APPLOCKER_PACKAGED_DEPLOY_AUDITED => false,
         _ => return Some((record_id, None)),
     };
     if ev.file_path.is_empty() {
@@ -642,7 +657,17 @@ fn normalize_applocker_block(block: &str) -> ParsedBlock {
         subject_context: None,
         object_context: None,
         object_class: Some(ev.policy_name).filter(|p| !p.is_empty()),
-        action: Some("execute".into()),
+        action: Some(
+            if matches!(
+                ev.event_id,
+                APPLOCKER_PACKAGED_DEPLOY_AUDITED | APPLOCKER_PACKAGED_DEPLOY_BLOCKED
+            ) {
+                "install"
+            } else {
+                "execute"
+            }
+            .into(),
+        ),
         enforced,
         object_path: Some(path),
     });
@@ -661,6 +686,39 @@ static APPLOCKER_BLOCKS: PollTarget = PollTarget {
     // `wevtutil sl <channel> /e:true`, which is best done by the operator's
     // deployment (a disabled channel is a policy decision, not an oversight
     // the sensor should override on its own).
+    enable_audit: None,
+    enabled: |c| c.applocker_blocks_enabled,
+};
+
+static APPLOCKER_MSI_SCRIPT: PollTarget = PollTarget {
+    label: "applocker-msi-script",
+    heartbeat: "windows-eventlog:applocker-msi-script",
+    channel: "Microsoft-Windows-AppLocker/MSI and Script",
+    id_filter: "EventID=8006 or EventID=8007",
+    counter: |c| &c.applocker_blocks,
+    parse_block: normalize_applocker_block,
+    enable_audit: None,
+    enabled: |c| c.applocker_blocks_enabled,
+};
+
+static APPLOCKER_PACKAGED_EXECUTION: PollTarget = PollTarget {
+    label: "applocker-packaged-execution",
+    heartbeat: "windows-eventlog:applocker-packaged-execution",
+    channel: "Microsoft-Windows-AppLocker/Packaged app-Execution",
+    id_filter: "EventID=8021 or EventID=8022",
+    counter: |c| &c.applocker_blocks,
+    parse_block: normalize_applocker_block,
+    enable_audit: None,
+    enabled: |c| c.applocker_blocks_enabled,
+};
+
+static APPLOCKER_PACKAGED_DEPLOYMENT: PollTarget = PollTarget {
+    label: "applocker-packaged-deployment",
+    heartbeat: "windows-eventlog:applocker-packaged-deployment",
+    channel: "Microsoft-Windows-AppLocker/Packaged app-Deployment",
+    id_filter: "EventID=8024 or EventID=8025",
+    counter: |c| &c.applocker_blocks,
+    parse_block: normalize_applocker_block,
     enable_audit: None,
     enabled: |c| c.applocker_blocks_enabled,
 };
@@ -1167,9 +1225,9 @@ pub struct EventLogConfig {
     pub account_creations_enabled: bool,
     /// Events 4624/4625/4648/4672 (logon/session, #94).
     pub logon_events_enabled: bool,
-    /// Events 8004 (block) and 8003 (audit mode) — `AppLocker` EXE/DLL
-    /// verdicts, reported as `PolicyDenialEvent` (#427).
-    /// `Microsoft-Windows-AppLocker/EXE and DLL` operational channel.
+    /// Audit and enforced `AppLocker` decisions from EXE/DLL, MSI/Script,
+    /// Packaged app-Execution, and Packaged app-Deployment, reported as
+    /// `PolicyDenialEvent` (#427).
     pub applocker_blocks_enabled: bool,
     /// Event 106 (T1053.005 — scheduled task registered via the
     /// `Microsoft-Windows-TaskScheduler/Operational` channel; always-on
@@ -1196,6 +1254,9 @@ static TARGETS: &[&PollTarget] = &[
     &ACCOUNT_CREATIONS,
     &LOGON_EVENTS,
     &APPLOCKER_BLOCKS,
+    &APPLOCKER_MSI_SCRIPT,
+    &APPLOCKER_PACKAGED_EXECUTION,
+    &APPLOCKER_PACKAGED_DEPLOYMENT,
     &TASK_SCHEDULER_OP,
     &DEFENDER_OP,
     &WDAC_OP,
@@ -1591,6 +1652,9 @@ mod config_tests {
                 "windows-eventlog:account-creation",
                 "windows-eventlog:logon",
                 "windows-eventlog:applocker-block",
+                "windows-eventlog:applocker-msi-script",
+                "windows-eventlog:applocker-packaged-execution",
+                "windows-eventlog:applocker-packaged-deployment",
                 "windows-eventlog:task-scheduler-op",
                 "windows-eventlog:defender",
                 "windows-eventlog:wdac",
@@ -1863,6 +1927,123 @@ mod applocker_tests {
             panic!("expected a PolicyDenial event, got {event:?}");
         };
         denial
+    }
+
+    fn applocker_decision_xml(event_id: u32, channel: &str, policy_name: &str) -> String {
+        let object = if policy_name == "APPX" {
+            "<PackageLength>14</PackageLength><Package>Contoso.Reader</Package>"
+        } else if policy_name == "SCRIPT" {
+            "<FilePathLength>18</FilePathLength><FilePath>C:\\Users\\X\\RUN.PS1</FilePath>"
+        } else {
+            "<FilePathLength>22</FilePathLength><FilePath>C:\\Users\\X\\INSTALL.MSI</FilePath>"
+        };
+        let policy_length = policy_name.len();
+        format!(
+            "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-AppLocker' Guid='{{cbda4dbf-8d5d-4f69-9578-be14aa540d22}}'/><EventID Qualifiers='0'>{event_id}</EventID><Version>0</Version><Level>2</Level><TimeCreated SystemTime='2026-10-01T12:00:00.0000000Z'/><EventRecordID>991</EventRecordID><Correlation/><Execution ProcessID=\"4242\" ThreadID=\"8\"/><Channel>{channel}</Channel><Computer>HOST</Computer><Security UserID='S-1-5-21-1-2-3-1001'/></System><UserData><RuleAndFileData xmlns='http://schemas.microsoft.com/schemas/event/Microsoft.Windows/1.0.0.0'><PolicyNameLength>{policy_length}</PolicyNameLength><PolicyName>{policy_name}</PolicyName><RuleId>{{00000000-0000-0000-0000-000000000000}}</RuleId><RuleNameLength>4</RuleNameLength><RuleName>Rule</RuleName><RuleSddlLength>1</RuleSddlLength><RuleSddl>-</RuleSddl><TargetUser>S-1-5-21-1-2-3-1001</TargetUser><TargetProcessId>7777</TargetProcessId>{object}<FqbnLength>1</FqbnLength><Fqbn>-</Fqbn></RuleAndFileData></UserData></Event>"
+        )
+    }
+
+    #[test]
+    fn applocker_other_channels_reuse_policy_denial_and_ignore_localized_channel_text() {
+        for (event_id, channel, policy_name, enforced, action) in [
+            (
+                8006,
+                "Microsoft-Windows-AppLocker/MSI et Script",
+                "MSI",
+                false,
+                "execute",
+            ),
+            (
+                8007,
+                "Microsoft-Windows-AppLocker/MSI et Script",
+                "MSI",
+                true,
+                "execute",
+            ),
+            (
+                8006,
+                "Microsoft-Windows-AppLocker/MSI et Script",
+                "SCRIPT",
+                false,
+                "execute",
+            ),
+            (
+                8007,
+                "Microsoft-Windows-AppLocker/MSI et Script",
+                "SCRIPT",
+                true,
+                "execute",
+            ),
+            (
+                8021,
+                "Microsoft-Windows-AppLocker/Packaged app-Execution",
+                "APPX",
+                false,
+                "execute",
+            ),
+            (
+                8022,
+                "Microsoft-Windows-AppLocker/Packaged app-Execution",
+                "APPX",
+                true,
+                "execute",
+            ),
+            (
+                8024,
+                "Microsoft-Windows-AppLocker/Packaged app-Deployment",
+                "APPX",
+                false,
+                "install",
+            ),
+            (
+                8025,
+                "Microsoft-Windows-AppLocker/Packaged app-Deployment",
+                "APPX",
+                true,
+                "install",
+            ),
+        ] {
+            let block = applocker_decision_xml(event_id, channel, policy_name);
+            let (record_id, event) =
+                normalize_applocker_block(&block).expect("valid Event Log XML");
+            assert_eq!(record_id, 991, "event id {event_id}");
+            let Some(Event::PolicyDenial(denial)) = event else {
+                panic!("event {event_id} should reuse PolicyDenial");
+            };
+            assert_eq!(denial.mechanism, POLICY_MECHANISM_APPLOCKER);
+            assert_eq!(denial.enforced, enforced, "event id {event_id}");
+            assert_eq!(denial.object_class.as_deref(), Some(policy_name));
+            assert_eq!(
+                denial.action.as_deref(),
+                Some(action),
+                "event id {event_id}"
+            );
+            assert_eq!(denial.meta.pid, 4242, "event id {event_id}");
+            assert_eq!(
+                denial.object_path.as_deref(),
+                Some(if policy_name == "APPX" {
+                    "Contoso.Reader"
+                } else if policy_name == "SCRIPT" {
+                    "C:\\Users\\X\\RUN.PS1"
+                } else {
+                    "C:\\Users\\X\\INSTALL.MSI"
+                }),
+                "event id {event_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn applocker_allow_events_and_unrecognized_ids_are_skipped() {
+        for event_id in [8005, 8020, 8023, 8035, 8028, 8029, 8999] {
+            let (_, event) = normalize_applocker_block(&applocker_decision_xml(
+                event_id,
+                "localized channel name",
+                "APPX",
+            ))
+            .expect("the record id remains usable");
+            assert!(event.is_none(), "event id {event_id} is not a denial");
+        }
     }
 
     #[test]

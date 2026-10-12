@@ -77,7 +77,9 @@ struct KeySource {
     #[arg(long, value_name = "FILE")]
     key_file: Option<PathBuf>,
     /// The public, checked-in test key. Lab and dev releases only: anyone can sign
-    /// with it, and a build that embeds it must not be shipped.
+    /// with it, and a build that embeds it must not be shipped. Exists only in a
+    /// `test-key` build (the default).
+    #[cfg(feature = "test-key")]
     #[arg(long)]
     test_key: bool,
 }
@@ -87,10 +89,17 @@ impl KeySource {
         if let Some(path) = &self.key_file {
             return keyfile::load(path);
         }
-        eprintln!(
-            "warning: signing with the PUBLIC test key; this release is for a lab, not for production"
-        );
-        Ok(updater::key::test_key_pair())
+        #[cfg(feature = "test-key")]
+        {
+            eprintln!(
+                "warning: signing with the PUBLIC test key; this release is for a lab, not for production"
+            );
+            Ok(updater::key::test_key_pair())
+        }
+        #[cfg(not(feature = "test-key"))]
+        {
+            anyhow::bail!("this build has no test key: pass --key-file")
+        }
     }
 }
 

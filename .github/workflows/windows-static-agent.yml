@@ -1,0 +1,122 @@
+name: Windows static agent
+
+# The release posture of ADR-0002 on Windows (#337, #746): onnxruntime built from source
+# and linked statically, so the agent imports neither onnxruntime.dll nor the DirectML
+# DLLs the prebuilt download pulls in. The default `dynamic-onnx` build that ci.yml runs
+# never exercises this link, so without this job a forbidden import could come back
+# unnoticed. Same posture as the Linux static .deb job: on main and on the changes that
+# can break the link, not on every PR.
+on:
+  pull_request:
+    paths:
+      - "agent/Cargo.toml"
+      - "crates/ml/**"
+      - "lab/provisioning/build-onnxruntime-static.ps1"
+      - "lab/provisioning/ort-static-link-flags.ps1"
+      - "tools/check-pe-imports.py"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/config.toml"
+      - "rust-toolchain.toml"
+      - ".github/workflows/windows-static-agent.yml"
+  push:
+    branches: [main]
+    paths:
+      - "agent/Cargo.toml"
+      - "crates/ml/**"
+      - "lab/provisioning/build-onnxruntime-static.ps1"
+      - "lab/provisioning/ort-static-link-flags.ps1"
+      - "tools/check-pe-imports.py"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/config.toml"
+      - "rust-toolchain.toml"
+      - ".github/workflows/windows-static-agent.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-check-static-agent:
+    # Not windows-latest: the build script pins Visual Studio 2022 (17.x) and forces its
+    # CMake generator, so a runner image moving to a newer Visual Studio must be a
+    # deliberate change here, not a surprise failure.
+    runs-on: windows-2022
+    # A cold onnxruntime build took 48 minutes on a 12-thread laptop; the runner has 4
+    # cores. Once the libraries are cached the job is the agent link alone.
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Only the .lib files are cached (about 1.1 GB, against 3.4 GB for the whole build
+      # directory): the link needs nothing else. They are copied out of the build tree
+      # first, keeping their relative paths: a glob over the build tree makes the cache
+      # action stat a symlink in flatbuffers' sources (EPERM), and it then skips the save
+      # with a warning only (first run of #762). The onnxruntime version is pinned inside
+      # the build script, so hashing the script covers a version bump.
+      - name: Restore onnxruntime static libraries
+        id: ort-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ort-static
+          key: ort-static-windows-2022-${{ hashFiles('lab/provisioning/build-onnxruntime-static.ps1') }}
+
+      - name: Build onnxruntime from source
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        run: ./lab/provisioning/build-onnxruntime-static.ps1
+
+      # `ort-static\Release` mirrors `build\Windows\Release`, so ORT_LIB_LOCATION keeps the
+      # `Release\Release` shape the link-flags script expects. The build tree is removed
+      # afterwards: the link then reads the same files a cached run does.
+      - name: Stage the libraries for the cache
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        run: |
+          $from = (Resolve-Path onnxruntime\build\Windows\Release).Path
+          $to = Join-Path $PWD 'ort-static\Release'
+          $libs = @(Get-ChildItem $from -Recurse -Filter *.lib)
+          foreach ($lib in $libs) {
+            $dest = Join-Path $to $lib.FullName.Substring($from.Length + 1)
+            New-Item -ItemType Directory -Force (Split-Path $dest) | Out-Null
+            Copy-Item $lib.FullName $dest
+          }
+          if ($libs.Count -eq 0) { throw 'no .lib files to stage' }
+          "Staged $($libs.Count) libraries"
+          cmd /c rmdir /s /q onnxruntime
+
+      # Saved right after the build, not at the end of the job: a later link or import
+      # failure must not throw away an hour of onnxruntime build.
+      - name: Save onnxruntime static libraries
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ort-static
+          key: ${{ steps.ort-cache.outputs.cache-primary-key }}
+
+      - name: Generate the static link flags
+        run: |
+          $env:ORT_LIB_LOCATION = "$PWD\ort-static\Release\Release"
+          ./lab/provisioning/ort-static-link-flags.ps1 | Invoke-Expression
+          "ORT_LIB_LOCATION=$env:ORT_LIB_LOCATION" >> $env:GITHUB_ENV
+          "RUSTFLAGS=$env:RUSTFLAGS" >> $env:GITHUB_ENV
+
+      # The agent alone: it is the only binary that links `ml`. `-j 2` because every
+      # binary links all onnxruntime libraries, and several links at once exhausted
+      # the commit limit of a 16 GB machine (os error 1455).
+      - name: Build the agent with static onnxruntime
+        run: cargo build -j 2 --release --no-default-features -p agent
+
+      - name: Check the agent's DLL imports
+        run: python tools/check-pe-imports.py target/release/agent.exe
+
+      - name: Run the static agent
+        run: |
+          ./target/release/agent.exe --help
+          if ($LASTEXITCODE -ne 0) { throw "agent.exe --help exited $LASTEXITCODE" }
+          $size = (Get-Item target/release/agent.exe).Length / 1MB
+          "agent.exe (static onnxruntime): {0:N1} MB" -f $size >> $env:GITHUB_STEP_SUMMARY

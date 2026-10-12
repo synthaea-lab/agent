@@ -24,7 +24,8 @@ use crate::{
         write_signal_watch_pid,
     },
     normalize,
-    proc::{read_proc_cmdline, read_proc_environ_security},
+    parent_image::{IMAGE_CACHE_CAP, ParentImages},
+    proc::{read_proc_cmdline, read_proc_environ_security, read_proc_images},
 };
 
 /// See `sensor_linux_wire::boot_epoch_offset_ns` — computed once at startup.
@@ -214,6 +215,17 @@ impl LinuxSensor {
             ),
         }
 
+        // The same processes' image paths, so the first child of an already-running
+        // parent resolves `parent_image_path` too (#768).
+        let mut parent_images = ParentImages::new(IMAGE_CACHE_CAP);
+        for (pid, generation, image) in read_proc_images(IMAGE_CACHE_CAP) {
+            parent_images.prime(pid, generation, image);
+        }
+        tracing::info!(
+            primed = parent_images.len(),
+            "sensor-linux: primed process images for parent_image_path"
+        );
+
         for (program, name) in RAW_TRACEPOINTS {
             attach_raw_tracepoint(&mut ebpf, program, name)?;
         }
@@ -299,7 +311,11 @@ impl LinuxSensor {
                     // file family, same tradeoff). Container attribution no longer
                     // touches `/proc` at all — see `CgroupIdCache`.
                     drain!(guard, sensor_linux_wire::ExecEvent, sink, own_pid, |e: &sensor_linux_wire::ExecEvent| {
-                        normalize::exec(e, offset, read_proc_cmdline(e.meta.pid), read_proc_environ_security(e.meta.pid), container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        let mut event = normalize::exec(e, offset, read_proc_cmdline(e.meta.pid), read_proc_environ_security(e.meta.pid), container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache));
+                        if let schema::Event::Exec(exec) = &mut event {
+                            parent_images.annotate(exec);
+                        }
+                        event
                     });
                 }
                 guard = file_open_ring_buf.readable_mut() => {
