@@ -62,7 +62,7 @@ What the scripts do on macOS that they do not do on Linux:
 `otool -L` exists only with the command line tools. The checker reads the Mach-O load commands
 itself (thin and universal, 32 and 64 bit) and accepts a library only if its install name starts
 with `/usr/lib/` or `/System/Library/`; anything else fails (`@rpath/...`, `/opt/homebrew/...`),
-and a name containing `onnxruntime` fails even under an allowed prefix. `--allow PREFIX` adds a
+and a name containing `onnxruntime` fails even under an allowed prefix. A slice that loads no library at all is refused too (exit 2): every macOS program loads libSystem, so zero means the parser read the wrong thing. `--allow PREFIX` adds a
 prefix. Exit 1: a library is not accepted; exit 2: not a Mach-O file, truncated, or a pattern that
 matched nothing. `tools/tests/test_check_macho_imports.py` covers it with hand-built files; it was
 also run against real Mach-O files (a thin arm64 `.dylib` and universal x86_64+arm64 ones taken
