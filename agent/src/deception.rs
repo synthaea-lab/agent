@@ -830,19 +830,26 @@ mod tests {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let dir = tempfile::tempdir().unwrap();
-        let neighbour = dir.path().join("document.txt");
+        let majority_neighbour = dir.path().join("document-majority.txt");
+        let second_majority_neighbour = dir.path().join("document-majority-2.txt");
+        let minority_neighbour = dir.path().join("document-minority.txt");
         let canary = dir.path().join("canary.txt");
-        let link_target = dir.path().join("link-target.txt");
+        let link_dir = tempfile::tempdir().unwrap();
+        let link_target = link_dir.path().join("link-target.txt");
         let link = dir.path().join("linked-document.txt");
-        fs::write(&neighbour, "ordinary neighbour").unwrap();
-        fs::set_permissions(&neighbour, fs::Permissions::from_mode(0o640)).unwrap();
+        for neighbour in [&majority_neighbour, &second_majority_neighbour] {
+            fs::write(neighbour, "ordinary neighbour").unwrap();
+            fs::set_permissions(neighbour, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        fs::write(&minority_neighbour, "minority mode").unwrap();
+        fs::set_permissions(&minority_neighbour, fs::Permissions::from_mode(0o600)).unwrap();
         fs::write(&link_target, "must not be sampled").unwrap();
         fs::set_permissions(&link_target, fs::Permissions::from_mode(0o000)).unwrap();
         std::os::unix::fs::symlink(&link_target, &link).unwrap();
         fs::write(&canary, "canary contents").unwrap();
         fs::set_permissions(&canary, fs::Permissions::from_mode(0o600)).unwrap();
 
-        let target = fs::metadata(&neighbour).unwrap();
+        let target = fs::metadata(&majority_neighbour).unwrap();
         let outcome = match_canary_metadata(dir.path(), std::slice::from_ref(&canary)).unwrap();
         let actual = fs::metadata(&canary).unwrap();
 
