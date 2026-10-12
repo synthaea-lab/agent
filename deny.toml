@@ -36,6 +36,19 @@ ignore = [
     # yara-x 1.21.0, the latest, still requires wasmtime ^45.0.3 and the fixes are
     # 48.0.4/49.0.2: bump the moment yara-x's requirement allows one.
     "RUSTSEC-2026-0327",
+    # `unsafe-libyaml` (the c2rust translation of libyaml under `serde_yaml`, which is itself
+    # deprecated) is archived: bugs in it will not be fixed upstream. An "unmaintained"
+    # notice, not a known vulnerability. Its only user here is `sigma`, which parses the
+    # `.yml` rule files under the rules and content directories at load and reload
+    # (`crates/sigma/src/engine.rs`, `cargo tree -i unsafe-libyaml` on 2026-10-12: sigma ->
+    # agent only). Those files come from the repository's own rules or from content verified
+    # against a signed manifest before it is written (ADR-0016); a hostile YAML document
+    # would first need the signing key or a write into the agent's content directory, which
+    # is already full compromise. Published 2026-10-12 and failing CI on every PR, so ignored
+    # rather than fixed in a PR that does something else. REVISIT BY 2026-12-31 (tracked in
+    # #790): replace `serde_yaml` in `sigma` with a YAML parser in safe Rust (the advisory
+    # names saphyr / serde-saphyr and noyalib) and delete this entry.
+    "RUSTSEC-2024-0449",
 ]
 
 [licenses]
