@@ -29,6 +29,13 @@ pub enum UpdaterError {
     #[error("release {offered} is not newer than the installed release {current}")]
     ReleaseNotNewer { offered: u64, current: u64 },
 
+    /// A content manifest lists nothing while the agent has applied content: applying it
+    /// would delete every recorded file and leave the agent with no rules. A release that
+    /// really withdraws everything must be a deliberate, separate decision; an empty or
+    /// mis-globbed build must not be able to do it by accident.
+    #[error("the manifest lists no content but {would_remove} applied file(s) would be removed")]
+    EmptyContentManifest { would_remove: usize },
+
     /// A content manifest's `ring` does not match the ring the caller actually
     /// requested. A valid signature only proves "we signed this manifest", not
     /// "this is the manifest for the ring you asked for" — without this check a
