@@ -6,9 +6,9 @@ name: macOS static agent
 # could come back unnoticed. Same posture as the Windows and Linux static jobs: on main and on
 # the changes that can break the link, not on every PR.
 #
-# NEVER RUN YET. Written without a Mac to try it on: what it assumes about onnxruntime's macOS
-# build is listed in lab/provisioning/onnxruntime-static-build-macos.md ("What this assumes").
-# The first run is the experiment; expect to fix it from the log.
+# Written without a Mac, then run on a hosted Apple Silicon runner (macos-15, 2026-10-12): every
+# step passed on the first run. The measurements and what each assumption turned out to be are in
+# lab/provisioning/onnxruntime-static-build-macos.md.
 on:
   pull_request:
     paths:
@@ -153,6 +153,15 @@ jobs:
             echo "otool sees onnxruntime in the agent's imports" >&2
             exit 1
           fi
+
+      # The deployment target onnxruntime and the agent were meant to share (13.0), as the
+      # linker recorded it, and the size, in the log (a job summary is not kept with it).
+      - name: Deployment target and size
+        run: |
+          set -euo pipefail
+          otool -l target/release/agent | grep -A4 LC_BUILD_VERSION
+          ls -l target/release/agent
+          du -m target/release/agent
 
       - name: Run the static agent
         run: |
