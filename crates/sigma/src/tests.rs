@@ -4,6 +4,7 @@
 use schema::{EventMeta, ExecEvent};
 
 use crate::{
+    engine::parse_rule_yaml,
     eval::{eval_rule_exec, glob_match},
     rule::SigmaRule,
     validate::validate,
@@ -23,7 +24,7 @@ fn exec(image: &str, cmdline: &str) -> ExecEvent {
 }
 
 fn parse(yaml: &str) -> SigmaRule {
-    let rule: SigmaRule = serde_yaml::from_str(yaml).unwrap();
+    let rule: SigmaRule = parse_rule_yaml(yaml).unwrap();
     // Under a platform segment so the metadata validator's directory check passes —
     // these fixtures test eval/selector behavior, not the platform check itself.
     validate(&rule, "<test>/linux/rule.yml").unwrap();
@@ -176,7 +177,7 @@ detection:
 fn empty_selection_is_rejected_not_match_everything() {
     // Review finding: `selection: {}` matched EVERY event (vacuous all()).
     let rule: SigmaRule =
-        serde_yaml::from_str("title: Empty\ndetection:\n  selection: {}\n  condition: selection\n")
+        parse_rule_yaml("title: Empty\ndetection:\n  selection: {}\n  condition: selection\n")
             .unwrap();
     let err = validate(&rule, "<t>").unwrap_err();
     assert!(err.to_string().contains("empty selection"), "{err}");
@@ -185,7 +186,7 @@ fn empty_selection_is_rejected_not_match_everything() {
 #[test]
 fn interior_wildcards_are_rejected_at_load() {
     // Review finding: `C:\*\cmd.exe` loaded fine and then never matched.
-    let rule: SigmaRule = serde_yaml::from_str(
+    let rule: SigmaRule = parse_rule_yaml(
         "title: Interior\ndetection:\n  selection:\n    Image: 'C:\\*\\cmd.exe'\n  condition: selection\n",
     )
     .unwrap();
@@ -216,7 +217,7 @@ fn modifier_case_is_insensitive_at_eval() {
 
 #[test]
 fn unsupported_constructs_are_rejected_at_load() {
-    let complex_condition: SigmaRule = serde_yaml::from_str(
+    let complex_condition: SigmaRule = parse_rule_yaml(
         r#"
 title: Complex
 detection:
@@ -231,7 +232,7 @@ detection:
     let err = validate(&complex_condition, "<t>").unwrap_err();
     assert!(err.to_string().contains("condition"), "{err}");
 
-    let bad_field: SigmaRule = serde_yaml::from_str(
+    let bad_field: SigmaRule = parse_rule_yaml(
         r#"
 title: Bad field
 detection:
@@ -244,7 +245,7 @@ detection:
     let err = validate(&bad_field, "<t>").unwrap_err();
     assert!(err.to_string().contains("TargetFilename"), "{err}");
 
-    let bad_modifier: SigmaRule = serde_yaml::from_str(
+    let bad_modifier: SigmaRule = parse_rule_yaml(
         r#"
 title: Bad modifier
 detection:
@@ -294,4 +295,246 @@ fn glob_match_never_panics_on_hostile_inputs() {
 fn glob_match_interior_star_is_literal() {
     assert!(glob_match("a*b", "a*b"));
     assert!(!glob_match("axb", "a*b"));
+}
+
+// --- the YAML parser: serde-saphyr in place of serde_yaml (#790) -----------------------------
+//
+// Rule files ship as signed content to every agent, so what the parser accepts is part of what a
+// rule means: every option that could change it is set explicitly (`parse_rule_yaml`), and each
+// is pinned by a test that fails without it (the review of #792).
+
+const RULE_HEAD: &str =
+    "title: T\ndescription: d\ntags: [attack.t1059]\nlevel: medium\nfalsepositives: [x]\n";
+
+fn rule_with_detection(body: &str) -> String {
+    format!("{RULE_HEAD}detection:\n{body}")
+}
+
+fn refused_with(yaml: &str, needle: &str) {
+    let error = parse_rule_yaml(yaml).expect_err("this must not load");
+    let text = error.to_string().to_lowercase();
+    assert!(text.contains(needle), "expected {needle:?} in: {error}");
+}
+
+#[test]
+fn a_duplicate_selection_key_is_refused_not_resolved_in_favour_of_the_last() {
+    // Under the parser this replaced, the second `selection:` silently won: a rule could be
+    // weakened (or a filter dropped) by an edit that left no visible trace.
+    refused_with(
+        &rule_with_detection(
+            "  selection:\n    Image|endswith: '\\cmd.exe'\n  selection:\n    Image|endswith: '\\never.exe'\n  condition: selection\n",
+        ),
+        "duplicate",
+    );
+}
+
+#[test]
+fn a_duplicate_is_refused_in_a_selection_other_than_selection_and_in_flow_style() {
+    refused_with(
+        &rule_with_detection(
+            "  selection:\n    Image: a\n  filter:\n    Image: b\n  filter:\n    Image: c\n  condition: selection\n",
+        ),
+        "duplicate",
+    );
+    refused_with(
+        &rule_with_detection("  selection:\n    Image: a\n    Image: b\n  condition: selection\n"),
+        "duplicate",
+    );
+    refused_with(
+        &format!(
+            "{RULE_HEAD}detection: {{selection: {{Image: a, Image: b}}, condition: selection}}\n"
+        ),
+        "duplicate",
+    );
+}
+
+#[test]
+fn a_custom_tag_on_a_key_does_not_hide_a_duplicate_selection() {
+    // Without `reject_unsupported_tags` the tag is part of the key's identity for the
+    // duplicate check, and the flatten into a map then drops it: the last `selection` won.
+    refused_with(
+        &rule_with_detection(
+            "  selection:\n    Image: a\n  !x selection:\n    Image: b\n  condition: selection\n",
+        ),
+        "tag",
+    );
+}
+
+#[test]
+fn merge_keys_are_refused_so_a_merged_field_cannot_silently_override_or_vanish() {
+    // `<<` merged the anchor's fields, and `<<` plus an explicit key dropped the merged one
+    // without an error; the parser this replaced refused `<<`.
+    for body in [
+        "  base: &b\n    Image: a\n  selection:\n    <<: *b\n  condition: selection\n",
+        "  base: &b\n    Image: a\n  selection:\n    <<: *b\n    Image: b\n  condition: selection\n",
+        "  base: &d\n    selection:\n      Image: a\n  <<: *d\n  selection:\n    Image: b\n  condition: selection\n",
+    ] {
+        refused_with(&rule_with_detection(body), "merge");
+    }
+}
+
+#[test]
+fn a_binary_tagged_value_stays_the_text_it_shows_not_decoded_into_a_value_a_reviewer_cannot_read() {
+    // `!!binary aGVsbG8=` would match `hello` while the file shows base64; under the parser
+    // this replaced it stayed the literal.
+    let rule = parse(&rule_with_detection(
+        "  selection:\n    CommandLine: !!binary aGVsbG8=\n  condition: selection\n",
+    ));
+    let crate::rule::Selection::FieldMap(fields) = &rule.detection.selections["selection"] else {
+        panic!("expected a field map");
+    };
+    assert_eq!(fields["CommandLine"].as_slice(), ["aGVsbG8="]);
+}
+
+#[test]
+fn only_true_and_false_are_booleans_so_an_unquoted_yes_or_no_stays_a_string() {
+    // The old parser read these as strings; saphyr's default reads them as YAML 1.1
+    // booleans and the rule would stop loading. `strict_booleans` keeps the behaviour.
+    for word in ["yes", "no", "on", "off", "y", "n", "Yes", "NO"] {
+        let yaml = rule_with_detection(&format!(
+            "  selection:\n    CommandLine: {word}\n  condition: selection\n"
+        ));
+        let rule = parse(&yaml);
+        let selection = rule.detection.selections.get("selection").unwrap();
+        let crate::rule::Selection::FieldMap(fields) = selection else {
+            panic!("expected a field map");
+        };
+        assert_eq!(fields["CommandLine"].as_slice(), [word], "{word}");
+    }
+}
+
+#[test]
+fn numbers_that_were_strings_before_are_refused_at_load_not_misread() {
+    // Under serde_yaml `017`, `08` and `1_000` were strings; they are integers now, and an
+    // integer is not a Sigma value: the rule is refused loudly (quote the value).
+    for scalar in ["017", "08", "1_000", "4688", "1.5", "true", "null"] {
+        let yaml = rule_with_detection(&format!(
+            "  selection:\n    CommandLine: {scalar}\n  condition: selection\n"
+        ));
+        assert!(
+            parse_rule_yaml(&yaml).is_err(),
+            "{scalar} must not load as a string"
+        );
+    }
+}
+
+#[test]
+fn an_alias_bomb_is_refused_by_the_parser_budget() {
+    let mut yaml = String::from(RULE_HEAD);
+    yaml.push_str("lol: &a0 [x,x,x,x,x,x,x,x,x]\n");
+    for i in 1..9 {
+        let prev = format!("*a{}", i - 1);
+        yaml.push_str(&format!(
+            "l{i}: &a{i} [{p},{p},{p},{p},{p},{p},{p},{p},{p}]\n",
+            p = prev
+        ));
+    }
+    yaml.push_str("detection:\n  selection:\n    Image: a\n  condition: selection\n");
+    refused_with(&yaml, "budget");
+}
+
+#[test]
+fn a_rule_file_is_bounded_in_nodes_not_only_in_alias_replays() {
+    // The defaults allow 250,000 nodes; a rule is a few dozen. An unknown key is ignored by
+    // the deserializer, so only the budget can stop it.
+    let big = format!("[{}]", vec!["1"; 30_000].join(","));
+    refused_with(
+        &format!(
+            "{RULE_HEAD}ignored: {big}\ndetection:\n  selection:\n    Image: a\n  condition: selection\n"
+        ),
+        "budget",
+    );
+}
+
+#[test]
+fn nesting_inside_an_ignored_key_hits_the_depth_limit_not_the_stack() {
+    // In an ignored key nothing else can reject it: only the depth limit does.
+    let deep = format!("{}x{}", "[".repeat(300), "]".repeat(300));
+    let yaml = format!(
+        "{RULE_HEAD}ignored: {deep}\ndetection:\n  selection:\n    Image: a\n  condition: selection\n"
+    );
+    assert!(parse_rule_yaml(&yaml).is_err());
+}
+
+#[test]
+fn nesting_deeper_than_a_rule_needs_is_refused_by_the_depth_budget() {
+    // 30 levels of block mappings in an ignored key: far above what a rule uses (about 5) and
+    // below the parser's own default depth limit (64), so only our budget refuses it.
+    let mut nested = String::new();
+    for level in 0..30 {
+        nested.push_str(&format!("{}k{level}:\n", "  ".repeat(level + 1)));
+    }
+    nested.push_str(&format!("{}leaf: x\n", "  ".repeat(31)));
+    let yaml = format!(
+        "{RULE_HEAD}ignored:\n{nested}detection:\n  selection:\n    Image: a\n  condition: selection\n"
+    );
+    refused_with(&yaml, "depth");
+}
+
+#[test]
+fn a_yaml_error_is_one_line_with_no_snippet_and_no_hint_to_weaken_the_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("linux").join("dup.yml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        rule_with_detection("  selection:\n    Image: a\n    Image: b\n  condition: selection\n"),
+    )
+    .unwrap();
+    let text = crate::SigmaEngine::load_rule(&path)
+        .unwrap_err()
+        .to_string();
+    assert!(!text.contains('\n'), "{text}");
+    assert!(text.to_lowercase().contains("duplicate"), "{text}");
+    assert!(
+        !text.contains("DuplicateKeyPolicy") && !text.contains("if acceptable"),
+        "{text}"
+    );
+    assert!(text.contains("line 9"), "the location is kept: {text}");
+}
+
+#[test]
+fn malformed_and_empty_input_is_an_error_never_a_panic() {
+    for text in [
+        "",
+        "just text\n",
+        "- a\n- b\n",
+        "title: [unclosed\n",
+        "\u{0}\u{1}\u{2}",
+        "a: &x\n",
+    ] {
+        assert!(parse_rule_yaml(text).is_err(), "{text:?}");
+    }
+}
+
+#[test]
+fn field_names_and_modifiers_that_differ_only_by_case_are_refused() {
+    // Two parsers agree they are different keys and evaluation ANDs them, so a selection
+    // could be made never to fire (or a field silently doubled).
+    for body in [
+        "  selection:\n    Image: a\n    image: b\n  condition: selection\n",
+        "  selection:\n    Image|endswith: a\n    Image|EndsWith: b\n  condition: selection\n",
+    ] {
+        let rule = parse_rule_yaml(&rule_with_detection(body)).expect("two different keys parse");
+        let error = validate(&rule, "<test>/linux/rule.yml").expect_err("must be refused");
+        assert!(error.to_string().to_lowercase().contains("case"), "{error}");
+    }
+}
+
+#[test]
+fn a_rule_file_over_the_size_cap_is_refused_before_it_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("linux").join("big.yml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let padding = "# padding\n".repeat(200_000); // about 2 MB
+    std::fs::write(
+        &path,
+        rule_with_detection("  selection:\n    Image: a\n  condition: selection\n") + &padding,
+    )
+    .unwrap();
+    let error = crate::SigmaEngine::load_rule(&path).expect_err("too large");
+    assert!(
+        error.to_string().to_lowercase().contains("larger"),
+        "{error}"
+    );
 }

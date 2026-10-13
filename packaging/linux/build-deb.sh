@@ -93,6 +93,12 @@ for binary in agent watchdog cli; do
     fi
 done
 
+# The shipped artifacts, not a nearby build product: no public test signing key (ADR-0027).
+"$REPO_ROOT/tools/assert-no-test-key.sh" \
+    "$REPO_ROOT/target/$TARGET/release/agent" \
+    "$REPO_ROOT/target/$TARGET/release/watchdog" \
+    "$REPO_ROOT/target/$TARGET/release/cli"
+
 for crate in sensor-linux sensor-linux-uprobes; do
     probe="$(find "$REPO_ROOT/target/$TARGET/release/build" -type f -path "*/build/${crate}-*/out/sensor-linux-ebpf" -print -quit)"
     [ -n "$probe" ] || fail "$crate was built without embedded eBPF probes"

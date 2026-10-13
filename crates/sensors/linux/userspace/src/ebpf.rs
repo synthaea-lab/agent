@@ -6,7 +6,7 @@
 
 use schema::sensor::SensorError;
 
-use crate::proc::{parse_stat_ppid_comm, parse_stat_starttime};
+use crate::proc::{parse_stat_ppid_comm, primed_generation};
 
 /// The message-to-error helper every module in this crate shares.
 pub(crate) fn err(msg: String) -> SensorError {
@@ -297,8 +297,7 @@ pub(crate) fn prime_proc_lineage(ebpf: &mut aya::Ebpf) -> Result<u32, SensorErro
         // through our `sched_process_fork`, so its stamp is its own `starttime`,
         // tagged so it can never equal a live `bpf_ktime_get_ns()` stamp. `0` ("no
         // stamp") when `starttime` is unreadable: better unknown than wrong.
-        let generation = parse_stat_starttime(stat)
-            .map_or(0, |ticks| ticks | sensor_linux_wire::PRIMED_GENERATION_BIT);
+        let generation = primed_generation(stat);
         scanned.push((pid, ppid, comm.to_string(), generation));
     }
     let generation_of: std::collections::HashMap<u32, u64> =
