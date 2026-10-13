@@ -3,7 +3,7 @@
 
 use std::{collections::VecDeque, time::Duration};
 
-use schema::{Event, HttpRequestEvent, detection::Severity};
+use schema::{Event, ExecEvent, HttpRequestEvent, detection::Severity};
 use store::BoundedMap;
 
 use crate::{
@@ -115,6 +115,8 @@ pub struct CorrelationEngine {
     /// Recent access-log requests retained for request-before-shell delivery order.
     /// This avoids rebuilding/scanning the full telemetry bus when a shell arrives.
     recent_web_requests: VecDeque<HttpRequestEvent>,
+    /// What the bounded web-shell state had to drop (CLAUDE.md: bounded and observable).
+    web_shell_shedding: WebShellShedding,
     /// Bayesian beliefs per entity (ppid, comm), LRU-bounded (`store::BoundedMap`) —
     /// the old iteration's unbounded `HashMap` was a documented known limitation.
     /// Keyed by (ppid, comm), not pid: survives respawns.
@@ -147,8 +149,20 @@ const BELIEF_CAP: usize = 16_384;
 const MAX_PENDING_WEB_SHELLS: usize = 256;
 const MAX_RECENT_WEB_REQUESTS: usize = 512;
 
+/// Counts of what the bounded web-shell pairing state dropped since start, for the health
+/// surface next to the maps' eviction counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WebShellShedding {
+    /// Shells alerted generically at once because 256 were already pending.
+    pub pending_overflow: u64,
+    /// Access-log requests dropped from the 512-entry ring before a shell could use them.
+    pub requests_evicted: u64,
+    /// Pending shells whose late window closed with no access-log line.
+    pub late_window_expired: u64,
+}
+
 struct PendingWebShell {
-    event: Event,
+    event: ExecEvent,
     request: Option<HttpRequestEvent>,
     initial_deadline_ns: u64,
     late_deadline_ns: u64,
@@ -171,6 +185,7 @@ impl CorrelationEngine {
             web_shell_watermark_ns: 0,
             pending_web_shells: VecDeque::with_capacity(MAX_PENDING_WEB_SHELLS),
             recent_web_requests: VecDeque::with_capacity(MAX_RECENT_WEB_REQUESTS),
+            web_shell_shedding: WebShellShedding::default(),
             beliefs: BoundedMap::new(BELIEF_CAP),
             pid_entities: BoundedMap::new(ENTITY_CAP),
             fired: BoundedMap::new(BELIEF_CAP),
@@ -193,13 +208,14 @@ impl CorrelationEngine {
             self.bus.push(event.clone());
             if self.recent_web_requests.len() == MAX_RECENT_WEB_REQUESTS {
                 self.recent_web_requests.pop_front();
+                self.web_shell_shedding.requests_evicted += 1;
             }
             self.recent_web_requests.push_back(request.clone());
             self.observe_web_request(request);
             return self.flush_web_shells();
         }
         let web_shell_event = match &event {
-            Event::Exec(exec) if crate::rules::is_web_server_shell(exec) => Some(event.clone()),
+            Event::Exec(exec) if crate::rules::is_web_server_shell(exec) => Some(exec.clone()),
             _ => None,
         };
         let pid = event.meta().pid;
@@ -294,6 +310,12 @@ impl CorrelationEngine {
         alerts
     }
 
+    /// What the bounded web-shell pairing state has dropped since start.
+    #[must_use]
+    pub fn web_shell_shedding(&self) -> WebShellShedding {
+        self.web_shell_shedding
+    }
+
     /// Advances observation time without adding a telemetry event. Callers with an idle event
     /// stream can pass [`schema::time::now_ns`] from their timer to expire a web-shell grace
     /// period at its deadline.
@@ -310,11 +332,11 @@ impl CorrelationEngine {
         self.web_shell_watermark_ns = self.web_shell_watermark_ns.max(bounded_ns);
     }
 
-    fn queue_web_shell(&mut self, event: Event) -> Vec<CorrelationAlert> {
-        let meta = event.meta();
+    fn queue_web_shell(&mut self, event: ExecEvent) -> Vec<CorrelationAlert> {
+        let meta = &event.meta;
         let key = ("web_request_shell", meta.pid);
         if self.pending_web_shells.iter().any(|pending| {
-            let pending_meta = pending.event.meta();
+            let pending_meta = &pending.event.meta;
             pending_meta.pid == meta.pid
                 && pending_meta.process_generation == meta.process_generation
                 && pending_meta.timestamp_ns == meta.timestamp_ns
@@ -334,6 +356,7 @@ impl CorrelationEngine {
         let timestamp_ns = meta.timestamp_ns;
         let generation = meta.process_generation;
         if self.pending_web_shells.len() == MAX_PENDING_WEB_SHELLS {
+            self.web_shell_shedding.pending_overflow += 1;
             tracing::warn!(
                 pid = meta.pid,
                 "web-shell pending capacity reached; emitting generic alert immediately"
@@ -361,7 +384,7 @@ impl CorrelationEngine {
 
     fn observe_web_request(&mut self, request: &HttpRequestEvent) {
         for pending in &mut self.pending_web_shells {
-            let meta = pending.event.meta();
+            let meta = &pending.event.meta;
             if !web_request_is_after_shell(meta, request) {
                 continue;
             }
@@ -385,7 +408,7 @@ impl CorrelationEngine {
         let mut alerts = Vec::new();
         let mut retained = VecDeque::with_capacity(self.pending_web_shells.len());
         while let Some(mut pending) = self.pending_web_shells.pop_front() {
-            let meta = pending.event.meta();
+            let meta = &pending.event.meta;
             let shell_key = ("web_request_shell", meta.pid);
             if !pending.initial_emitted && now_ns >= pending.initial_deadline_ns {
                 let initial_request = pending
@@ -414,8 +437,14 @@ impl CorrelationEngine {
                 alerts.push(rule_web_request_shell(&pending.event, Some(request), true));
                 pending.completion_emitted = true;
             }
-            if !pending.completion_emitted && now_ns <= pending.late_deadline_ns {
-                retained.push_back(pending);
+            if !pending.completion_emitted {
+                if now_ns <= pending.late_deadline_ns {
+                    retained.push_back(pending);
+                } else {
+                    // The late window closed with no access-log line: the generic alert
+                    // stands alone. Counted, so a site whose lines never arrive is visible.
+                    self.web_shell_shedding.late_window_expired += 1;
+                }
             }
         }
         self.pending_web_shells = retained;

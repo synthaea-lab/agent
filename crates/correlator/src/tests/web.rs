@@ -236,8 +236,9 @@ fn a_request_after_the_grace_window_is_not_paired() {
     let web = web_alerts(&late);
     assert_eq!(web.len(), 2, "generic alert followed by completion");
     assert!(web[0].message.contains("no matching access-log request"));
-    assert!(web[1].message.contains("late access-log request observed"));
+    assert!(web[1].message.contains("late access-log request read"));
     assert!(web[1].message.contains("/up/s.php"));
+    assert!(web[1].message.contains("unverified"), "{}", web[1].message);
 }
 
 #[test]
@@ -251,7 +252,7 @@ fn a_late_access_log_completes_a_generic_alert_with_the_original_shell() {
     let completion = engine.on_event(request(100 * SEC + 90 * SEC));
     let web = web_alerts(&completion);
     assert_eq!(web.len(), 1);
-    assert!(web[0].message.contains("late access-log request observed"));
+    assert!(web[0].message.contains("late access-log request read"));
     assert!(web[0].message.contains("/up/s.php"));
     assert_eq!(web[0].trigger_event.as_ref().unwrap().meta().pid, 903);
 }
@@ -260,7 +261,7 @@ fn a_late_access_log_completes_a_generic_alert_with_the_original_shell() {
 fn a_request_at_the_late_completion_deadline_is_included() {
     let mut engine = CorrelationEngine::new();
     let now = schema::time::now_ns();
-    let shell_ns = now.saturating_sub(3_600 * SEC);
+    let shell_ns = now.saturating_sub(300 * SEC);
     engine.on_event(shell_under("nginx", 905, shell_ns));
     let generic = engine.advance_time(now);
     assert_eq!(web_alerts(&generic).len(), 1);
@@ -268,7 +269,7 @@ fn a_request_at_the_late_completion_deadline_is_included() {
     let completion = engine.on_event(request(now));
     let web = web_alerts(&completion);
     assert_eq!(web.len(), 1);
-    assert!(web[0].message.contains("late access-log request observed"));
+    assert!(web[0].message.contains("late access-log request read"));
 }
 
 #[test]
@@ -280,7 +281,7 @@ fn a_request_beyond_the_late_completion_deadline_is_ignored() {
     let generic = engine.advance_time(now);
     assert_eq!(web_alerts(&generic).len(), 1);
 
-    let too_late = engine.on_event(request(shell_ns + 3_600 * SEC + 1));
+    let too_late = engine.on_event(request(shell_ns + 300 * SEC + 1));
     assert!(web_alerts(&too_late).is_empty());
 }
 
@@ -301,8 +302,41 @@ fn pending_web_shell_state_is_bounded() {
     for i in 0..256 {
         engine.on_event(shell_under("nginx", 10_000 + i, now));
     }
+    assert_eq!(engine.web_shell_shedding().pending_overflow, 0);
     let overflow = engine.on_event(shell_under("nginx", 20_000, now));
     assert_eq!(web_alerts(&overflow).len(), 1);
+    assert_eq!(
+        engine.web_shell_shedding().pending_overflow,
+        1,
+        "the overflow is counted, not only logged"
+    );
+}
+
+#[test]
+fn a_late_window_that_closes_without_a_request_is_counted() {
+    let mut engine = CorrelationEngine::new();
+    let now = schema::time::now_ns();
+    let shell_ns = now.saturating_sub(400 * SEC);
+    engine.on_event(shell_under("nginx", 907, shell_ns));
+    assert_eq!(
+        web_alerts(&engine.advance_time(shell_ns + 10 * SEC)).len(),
+        1
+    );
+    assert_eq!(engine.web_shell_shedding().late_window_expired, 0);
+    assert!(web_alerts(&engine.advance_time(now)).is_empty());
+    assert_eq!(engine.web_shell_shedding().late_window_expired, 1);
+}
+
+#[test]
+fn requests_pushed_out_of_the_recent_ring_are_counted() {
+    let mut engine = CorrelationEngine::new();
+    let now = schema::time::now_ns();
+    for i in 0..512 {
+        engine.on_event(request(now - 1_000 * SEC + i));
+    }
+    assert_eq!(engine.web_shell_shedding().requests_evicted, 0);
+    engine.on_event(request(now - 1_000 * SEC + 600));
+    assert_eq!(engine.web_shell_shedding().requests_evicted, 1);
 }
 
 #[test]

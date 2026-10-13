@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use schema::{Event, EventMeta, HttpRequestEvent, detection::Severity};
+use schema::{Event, EventMeta, ExecEvent, HttpRequestEvent, detection::Severity};
 
 use crate::{bus::EventBus, event::is_file_write};
 
@@ -479,24 +479,24 @@ pub(crate) fn is_web_server_shell(exec: &schema::ExecEvent) -> bool {
 }
 
 /// The initial wait is short so shell execution is visible promptly. The generic case
-/// remains eligible for a late access-log completion for one hour; that retention is
-/// bounded by the engine's pending-shell capacity.
+/// remains eligible for a late access-log completion for five minutes, bounded by the
+/// engine's pending-shell capacity. Kept short on purpose: on an Internet-facing site
+/// signature-matching scanner requests arrive all the time, and the longer the window the
+/// more likely the "completion" names a probe that has nothing to do with the shell (#807
+/// review). The completion alert says it is unverified for the same reason.
 pub(crate) const WEB_SHELL_GRACE_NS: u64 = 3_000_000_000;
-pub(crate) const WEB_SHELL_LATE_REQUEST_NS: u64 = 3_600_000_000_000;
+pub(crate) const WEB_SHELL_LATE_REQUEST_NS: u64 = 300_000_000_000;
 
 /// Build either the initial request-paired/generic T1505.003 alert, or its late
 /// access-log completion. Application log records are stamped when read, so a long
 /// request can be observed well after its child shell starts. The matched parameter
 /// value is never included.
 pub(crate) fn rule_web_request_shell(
-    shell_event: &Event,
+    exec: &ExecEvent,
     request: Option<&HttpRequestEvent>,
     completion: bool,
 ) -> CorrelationAlert {
-    let Event::Exec(exec) = shell_event else {
-        unreachable!("web-shell alert must be anchored to its ExecEvent")
-    };
-    let meta = shell_event.meta();
+    let meta = &exec.meta;
     let message = if let Some(request) = request {
         let delta_s = request.meta.timestamp_ns.saturating_sub(meta.timestamp_ns) / 1_000_000_000;
         let client = request
@@ -507,7 +507,7 @@ pub(crate) fn rule_web_request_shell(
             .as_ref()
             .map_or_else(String::new, |ev| format!(" param={}", ev.param));
         let lead = if completion {
-            "late access-log request observed after the generic shell alert"
+            "late access-log request read after the generic shell alert (unverified: it may be              unrelated, scanner traffic arrives all the time), shell spawned by a web server"
         } else {
             "shell spawned by a web server"
         };
@@ -536,7 +536,7 @@ pub(crate) fn rule_web_request_shell(
         technique: "T1505.003",
         severity: Severity::High,
         message,
-        trigger_event: Some(Box::new(shell_event.clone())),
+        trigger_event: Some(Box::new(Event::Exec(exec.clone()))),
     }
 }
 

@@ -41,7 +41,7 @@ impl EventBus {
         self.evict();
     }
 
-    /// Every event currently in the window, oldest first.
+    /// Events of one process in the window, oldest first.
     /// Filters events by pid and process incarnation. Missing stamps preserve the
     /// previous pid-only behavior; two known, different stamps never mix.
     pub fn events_for_pid(
