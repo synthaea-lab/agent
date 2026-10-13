@@ -510,6 +510,9 @@ mod tests {
             spool_bytes: 1024,
             spool_dropped: 0,
             enrich_dropped: 3,
+            rarity_applied: 7,
+            rarity_withheld: 11,
+            rarity_unapplied: 2,
         };
         let body = serde_json::to_value(HeartbeatPayload {
             agent_id: None,
@@ -528,7 +531,10 @@ mod tests {
                     ],
                     "spool_bytes": 1024,
                     "spool_dropped": 0,
-                    "enrich_dropped": 3
+                    "enrich_dropped": 3,
+                    "rarity_applied": 7,
+                    "rarity_withheld": 11,
+                    "rarity_unapplied": 2
                 }
             })
         );
