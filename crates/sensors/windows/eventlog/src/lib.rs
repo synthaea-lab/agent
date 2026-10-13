@@ -105,10 +105,11 @@
 //!
 //! ## Additional detection channels (#283)
 //!
-//! Two extra operational channels supplement the Security-channel poll targets
-//! above, both **always-on** (no `auditpol` toggle) so they cover the same
-//! techniques even on a host where the audit subcategory for 4698 was left
-//! disabled:
+//! Extra operational channels supplement the Security-channel poll targets
+//! above. None needs an `auditpol` toggle, but each is only as on as the host
+//! makes it: `AppLocker`'s exists where `AppLocker` is configured, and Task
+//! Scheduler's is off by default (#786). A target whose channel is disabled is
+//! logged at start-up rather than polled in silence:
 //!
 //! - **`AppLocker` policy decisions** (EXE/DLL **8003/8004**, MSI/Script
 //!   **8006/8007**, Packaged app-Execution **8021/8022**, and Packaged
@@ -134,8 +135,9 @@
 //!   3033 is deliberately not subscribed (Chrome DLL-load noise).
 //! - **Task Scheduler Operational — task registered**
 //!   (`Microsoft-Windows-TaskScheduler/Operational` channel, event **106**):
-//!   the always-on complement to Security 4698. Emitted whenever any scheduled
-//!   task is registered on this host. The event carries no task XML, so the
+//!   the complement to Security 4698 where Task Scheduler history is enabled
+//!   (off by default, #786). Emitted whenever any scheduled task is registered
+//!   on this host. The event carries no task XML, so the
 //!   sensor reads the actions back from the task's definition file under
 //!   `%SystemRoot%\System32\Tasks` and reports the same shape as a 4698
 //!   (`schema::FLAG_PERSISTENCE_TASK_ARTIFACT`, action-unknown placeholder when
@@ -201,6 +203,10 @@
 
 pub mod xml;
 
+// Reads a channel's `Enabled` setting, so a disabled one is reported rather
+// than polled in silence (#786).
+#[cfg(windows)]
+mod channel;
 #[cfg(windows)]
 mod sensor;
 // The `EvtSubscribe` transport (issue #322) — enabled per-host via
