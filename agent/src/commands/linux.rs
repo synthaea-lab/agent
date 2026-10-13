@@ -222,6 +222,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         content_dir,
         log_sources,
         deception,
+        config_path,
     } = opts;
     // Kill-loudness (#71): must run before any other thread exists — the signal mask
     // set here is inherited by every thread spawned below, including `DetectionSink`'s
@@ -317,6 +318,11 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // one that was actually shipped).
     crate::integrity::spawn_monitor(storage.state_dir.clone(), sink.clone());
 
+    // Diffed package inventory (#87): periodic dpkg-status diff, turned into a
+    // real case-attachable Detection through the normal sink path (not a
+    // local-only alert like the two monitors above).
+    crate::inventory::spawn_monitor(storage.state_dir.clone(), sink.clone());
+
     // Health beacon (#134): periodic self-diagnostics to the control plane, over
     // the silence monitor above.
     let health = super::common::health_collector(&pipeline, silence_monitor);
@@ -350,7 +356,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // Protected-resource monitoring (#71): only the eBPF sensor produces `FileOpen`
     // events, so only its chain needs the guard — the netlink/journal sinks above
     // never see one.
-    let protected = crate::protected::protected_paths(alerts, events);
+    let protected = crate::protected::protected_paths(alerts, events, config_path);
     let guarded = ProtectedResourceGuard::new(sink.clone(), protected, sink.clone());
     let result = sensor.run(Box::new(PulsingSink::new(guarded, primary_heartbeat)));
 

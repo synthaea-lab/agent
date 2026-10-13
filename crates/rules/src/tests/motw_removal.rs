@@ -99,12 +99,18 @@ fn the_origin_url_is_quoted_when_the_mark_was_seen() {
         ..schema::fixtures::file_quarantine()
     });
     state.on_file_delete(&unblock(&stream(DOWNLOAD), 1));
-    let alerts = state.on_exec(&run(DOWNLOAD, 2));
-    // Marked, then unmarked, then run: both techniques, one alert each.
+    let exec = run(DOWNLOAD, 2);
+    let alerts = state.on_exec(&exec);
+    // Marked, then unmarked, then run: both techniques, one alert each. T1204.002
+    // waits for the image's signature (#441); T1553.005 does not.
+    let gated = state
+        .on_exec_signature_gated(&exec)
+        .map(crate::SignatureGatedAlert::unverified);
+    assert_eq!(gated.map(|a| a.technique), Some("T1204.002"));
     let techniques: Vec<_> = alerts.iter().map(|a| a.technique).collect();
-    assert_eq!(techniques, ["T1204.002", "T1553.005"]);
+    assert_eq!(techniques, ["T1553.005"]);
     assert!(
-        alerts[1]
+        alerts[0]
             .message
             .contains("origin: https://example.test/invoice.exe")
     );
