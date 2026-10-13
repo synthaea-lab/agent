@@ -108,6 +108,11 @@ impl PidFact {
     }
 }
 
+/// `known_policy_denials`' key: (mechanism, subject context, object context, object
+/// class). Named so clippy's `type_complexity` lint doesn't flag the field
+/// declaration.
+type PolicyDenialKey = (String, Option<String>, Option<String>, Option<String>);
+
 /// Sliding history needed by the correlation rules:
 /// - T1105 (Ingress Tool Transfer): a path recently written by `curl`/`wget` is
 ///   executed shortly after. Correlated by path + time window rather than by a strict
@@ -116,12 +121,6 @@ impl PidFact {
 ///   child of `curl`/`wget`).
 /// - T1059 (suspicious process lineage): a shell interpreter executed directly by a
 ///   web server process — classic indicator of a web shell / RCE.
-///
-/// `known_policy_denials`' key: (mechanism, subject context, object context, object
-/// class). Named so clippy's `type_complexity` lint doesn't flag the field
-/// declaration.
-type PolicyDenialKey = (String, Option<String>, Option<String>, Option<String>);
-
 pub struct RuleState {
     /// pid → comm of the last exec seen for this pid, to recover the parent's comm
     /// (T1059) with a simple `ppid` lookup without having to walk the process tree in
@@ -997,6 +996,11 @@ impl RuleState {
     /// Inert while the eBPF sensor is selected (#780): `SELinux` AVC denials
     /// only reach the agent through the audit sensor, so silence here does not
     /// mean no denials happened.
+    ///
+    /// The requested permission is not part of the key (#813): the audit
+    /// sensor does not parse it yet, so a routine `getattr` denial silences a
+    /// later, more interesting `read`/`write`/`open` on the same subject,
+    /// object and class.
     fn check_policy_denial_drift(&mut self, event: &PolicyDenialEvent) -> Option<Alert> {
         if event.mechanism != POLICY_MECHANISM_SELINUX {
             return None;
