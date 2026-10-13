@@ -42,7 +42,7 @@ struct ResponseHooks {
 /// if several sensors ever share one sink.
 pub(crate) struct DetectionSink {
     rule_state: Mutex<rules::RuleState>,
-    correlator: Mutex<correlator::CorrelationEngine>,
+    correlator: Arc<Mutex<correlator::CorrelationEngine>>,
     /// ML correlation scorer (issue #46 Phase 3, #47 Phase 2): scores behavior over
     /// the correlator window and feeds the Bayesian belief state. `None` when the
     /// model is unavailable (missing registry, load error) — the agent works without
@@ -60,7 +60,7 @@ pub(crate) struct DetectionSink {
     /// "not in the common set" evidence is withheld without one. Swapped whole on
     /// `reload_content`, like the engines above, so a reader never sees a half-loaded
     /// filter; nothing reads it on the capture path yet (the lookup is the next slice).
-    common_set: Mutex<Option<Arc<ml::features::common_set::CommonSetSnapshot>>>,
+    common_set: Arc<Mutex<Option<Arc<ml::features::common_set::CommonSetSnapshot>>>>,
     /// The single alert funnel (issue #388): alerts.ndjson + stderr + the
     /// in-memory recent-alerts buffer served to `cli detections`. Shared with
     /// the YARA scan worker and quarantine.
@@ -418,6 +418,13 @@ impl DetectionSink {
         let verdict = Arc::new(Mutex::new(verdict::VerdictEngine::new(
             VERDICT_DEDUP_WINDOW_NS,
         )));
+        // Shared with the enrichment worker, which learns an exec's hash after it was correlated
+        // and feeds the rarity evidence back (ADR-0020, #76).
+        let correlator = Arc::new(Mutex::new(correlator::CorrelationEngine::new()));
+        let common_set = Arc::new(Mutex::new(
+            load_common_set(&content_root).into_option().map(Arc::new),
+        ));
+        let (rarity_correlator, rarity_common_set) = (correlator.clone(), common_set.clone());
         let (gate_verdict, gate_alert_log) = (verdict.clone(), alert_log.clone());
         let (gate_spool, worker_spool) = (detection_spool.clone(), detection_spool.clone());
         let enrich_queue = EnrichQueue::start_with_detections(
@@ -429,6 +436,9 @@ impl DetectionSink {
                     let persist = |detection| spool_on_worker(gate_spool.as_deref(), detection);
                     let persist = gate_spool.as_ref().map(|_| &persist as &dyn Fn(_));
                     record_rule_alert(&gate_verdict, &gate_alert_log, &event, &alert, persist);
+                }
+                if let Event::Exec(exec) = &event {
+                    note_image_rarity(&rarity_correlator, &rarity_common_set, exec);
                 }
                 if let Some(events_log) = &events_log {
                     events_log.write(&event);
@@ -446,10 +456,10 @@ impl DetectionSink {
         let response: Arc<Mutex<Option<ResponseHooks>>> = Arc::new(Mutex::new(None));
         Ok(Self {
             rule_state: Mutex::new(rule_state),
-            correlator: Mutex::new(correlator::CorrelationEngine::new()),
+            correlator,
             ml_scorer: Mutex::new(Self::load_correlation_scorer(model_root)),
             sigma: Mutex::new(load_sigma_rules(&content_root).into_option()),
-            common_set: Mutex::new(load_common_set(&content_root).into_option().map(Arc::new)),
+            common_set,
             yara: Mutex::new(
                 start_yara(
                     &content_root,
@@ -1410,6 +1420,75 @@ fn load_sigma_rules(content_root: &Path) -> Load<sigma::SigmaEngine> {
             Load::Failed
         }
     }
+}
+
+/// How many hosts a snapshot must cover before "not in the common set" counts as evidence
+/// (ADR-0020): on a fleet that has just enrolled the snapshot is empty or thin, and every
+/// binary would look rare. **Provisional**: ADR-0020 leaves it to calibration on lab data
+/// (slice 6 of `docs/detection/fleet-prevalence-snapshot-plan.md`).
+const RARITY_MIN_HOSTS_COVERED: u64 = 10;
+
+/// What the fleet's common set says about one executed image.
+#[derive(Debug, PartialEq, Eq)]
+enum Rarity {
+    /// The snapshot covers enough hosts and does not contain the image's hash.
+    NotInCommonSet,
+    /// The snapshot covers enough hosts and contains the hash.
+    InCommonSet,
+    /// No basis to say: no snapshot, too few hosts covered, or no usable hash. Never read as
+    /// "rare" (the `rarity_known` of the ML feature, `ml::features::rarity`).
+    Withheld,
+}
+
+/// The rarity of an image given the snapshot in force, the exec's hash and the minimum
+/// coverage. A pure function over the same inputs as the ML rarity feature, so the two
+/// cannot disagree about what is known.
+fn rarity_evidence(
+    sha256: Option<&str>,
+    snapshot: Option<&ml::features::common_set::CommonSetSnapshot>,
+    min_hosts: u64,
+) -> Rarity {
+    use ml::features::rarity::{CommonSet, extract_features};
+
+    let [known, in_common_set] =
+        extract_features(sha256, snapshot.map(|s| s as &dyn CommonSet), min_hosts);
+    if known < 0.5 {
+        Rarity::Withheld
+    } else if in_common_set > 0.5 {
+        Rarity::InCommonSet
+    } else {
+        Rarity::NotInCommonSet
+    }
+}
+
+/// Feeds "this exec's image is not in the fleet's common set" to the correlator, when that is
+/// what the snapshot in force says. Runs on the enrichment worker, off the capture path,
+/// because only the worker knows the hash, and after the capture thread already correlated the
+/// exec (so the process has a belief to add to). The snapshot lock is released before the
+/// correlator lock is taken: no nested locking.
+fn note_image_rarity(
+    correlator: &Mutex<correlator::CorrelationEngine>,
+    common_set: &Mutex<Option<Arc<ml::features::common_set::CommonSetSnapshot>>>,
+    exec: &schema::ExecEvent,
+) {
+    let snapshot = common_set.lock().unwrap().clone();
+    if rarity_evidence(
+        exec.sha256.as_deref(),
+        snapshot.as_deref(),
+        RARITY_MIN_HOSTS_COVERED,
+    ) != Rarity::NotInCommonSet
+    {
+        return;
+    }
+    let applied = correlator
+        .lock()
+        .unwrap()
+        .apply_rarity_evidence(exec.meta.pid, exec.meta.process_generation);
+    tracing::debug!(
+        pid = exec.meta.pid,
+        applied,
+        "rarity: image not in the common set"
+    );
 }
 
 /// The largest snapshot file the agent reads. The content manifest allows an artifact of up to
@@ -3935,6 +4014,200 @@ rule reload_content_test_marker {
         std::fs::create_dir_all(dir.join("content/snapshots/common-set.bin")).unwrap();
         let sink = sink_in(&dir);
         assert!(sink.common_set().is_none());
+    }
+
+    // ── rarity evidence (ADR-0020, issue #76) ───────────────────────────────
+
+    /// A hash the snapshot built in a golden case does not contain.
+    fn golden_non_member(case: &str) -> String {
+        let doc: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../ml/tests/fixtures/common_set_snapshot_golden.json"
+        )))
+        .unwrap();
+        let case = doc["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == case)
+            .unwrap();
+        case["non_members"][0].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn rarity_evidence_follows_the_snapshot_the_hash_and_the_coverage() {
+        use ml::features::common_set::CommonSetSnapshot;
+        let load = |case: &str| CommonSetSnapshot::parse(&golden_common_set(case).0).unwrap();
+        let wide = load("fifty_hashes_one_percent"); // 12 hosts covered
+        let member = golden_common_set("fifty_hashes_one_percent").1[0].clone();
+        let absent = golden_non_member("fifty_hashes_one_percent");
+
+        assert_eq!(
+            super::rarity_evidence(Some(&member), Some(&wide), 10),
+            super::Rarity::InCommonSet
+        );
+        assert_eq!(
+            super::rarity_evidence(Some(&absent), Some(&wide), 10),
+            super::Rarity::NotInCommonSet
+        );
+        // Coverage exactly at the minimum counts, one below withholds.
+        assert_eq!(
+            super::rarity_evidence(Some(&absent), Some(&wide), 12),
+            super::Rarity::NotInCommonSet
+        );
+        assert_eq!(
+            super::rarity_evidence(Some(&absent), Some(&wide), 13),
+            super::Rarity::Withheld
+        );
+        // A snapshot built from 4 hosts is too thin to call anything rare.
+        let thin = load("one_hash");
+        assert_eq!(
+            super::rarity_evidence(Some(&absent), Some(&thin), 10),
+            super::Rarity::Withheld
+        );
+        // No snapshot, no hash, or something that is not a hash: nothing to say.
+        assert_eq!(
+            super::rarity_evidence(Some(&absent), None, 10),
+            super::Rarity::Withheld
+        );
+        assert_eq!(
+            super::rarity_evidence(None, Some(&wide), 10),
+            super::Rarity::Withheld
+        );
+        assert_eq!(
+            super::rarity_evidence(Some("not-a-hash"), Some(&wide), 10),
+            super::Rarity::Withheld
+        );
+    }
+
+    /// A version-1 snapshot built here (the layout in
+    /// `docs/detection/common-set-snapshot-format.md`): a fixed 4096-bit, 7-hash filter holding
+    /// `hashes`, claiming `hosts_covered` hosts.
+    fn snapshot_holding(hashes: &[&str], hosts_covered: u32) -> Vec<u8> {
+        const BITS: u32 = 4096;
+        const HASHES: u16 = 7;
+        let mut body = vec![0u8; (BITS / 8) as usize];
+        for hash in hashes {
+            let raw: Vec<u8> = (0..32)
+                .map(|i| u8::from_str_radix(&hash[i * 2..i * 2 + 2], 16).unwrap())
+                .collect();
+            let h1 = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+            let h2 = u64::from_le_bytes(raw[8..16].try_into().unwrap()) | 1;
+            for i in 0..u64::from(HASHES) {
+                let bit = h1.wrapping_add(i.wrapping_mul(h2)) % u64::from(BITS);
+                body[(bit >> 3) as usize] |= 1 << (bit & 7);
+            }
+        }
+        let mut out = b"SYCS".to_vec();
+        out.extend(1u16.to_le_bytes());
+        out.extend(HASHES.to_le_bytes());
+        out.extend(3u32.to_le_bytes());
+        out.extend(hosts_covered.to_le_bytes());
+        out.extend(u32::try_from(hashes.len()).unwrap().to_le_bytes());
+        out.extend(BITS.to_le_bytes());
+        out.extend(1_791_849_600u64.to_le_bytes());
+        out.extend(body);
+        out
+    }
+
+    /// What the snapshot holds, for [`belief_after_exec`].
+    enum Snapshot {
+        None,
+        /// Holds the executed image's own hash.
+        HoldingTheImage {
+            hosts_covered: u32,
+        },
+        /// Holds only an unrelated hash.
+        HoldingOthers {
+            hosts_covered: u32,
+        },
+    }
+
+    /// Runs one exec of a file through a sink, lets the enrichment worker finish, and returns
+    /// the belief the correlator holds for the process.
+    fn belief_after_exec(name: &str, snapshot: &Snapshot, image_exists: bool) -> f32 {
+        let dir = tmp(name);
+        let image = dir.join("image.bin");
+        if image_exists {
+            std::fs::write(&image, b"an executable nobody on the fleet has run").unwrap();
+        }
+        let image_hash = enrich::Enricher::new()
+            .enrich(&image)
+            .sha256
+            .unwrap_or_else(|| "cd".repeat(32));
+        let unrelated = "ab".repeat(32);
+        match snapshot {
+            Snapshot::None => {}
+            Snapshot::HoldingTheImage { hosts_covered } => {
+                write_common_set(&dir, &snapshot_holding(&[&image_hash], *hosts_covered));
+            }
+            Snapshot::HoldingOthers { hosts_covered } => {
+                write_common_set(&dir, &snapshot_holding(&[&unrelated], *hosts_covered));
+            }
+        }
+        let sink = sink_in(&dir);
+
+        sink.on_event(exec(9_100, "run", image.to_str().unwrap()));
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+
+        let engine = sink.correlator.lock().unwrap();
+        engine
+            .belief_for_pid(9_100)
+            .expect("the exec created a belief")
+            .log_odds
+    }
+
+    #[test]
+    fn an_image_the_fleet_has_not_seen_raises_the_belief_a_little() {
+        let baseline = belief_after_exec("rarity-baseline", &Snapshot::None, true);
+
+        let rare = belief_after_exec(
+            "rarity-rare",
+            &Snapshot::HoldingOthers { hosts_covered: 50 },
+            true,
+        );
+
+        let gained = rare - baseline;
+        assert!(gained > 0.0, "rarity evidence must apply, gained {gained}");
+        assert!(
+            gained <= 1.0,
+            "and stay within its allowance, gained {gained}"
+        );
+    }
+
+    #[test]
+    fn an_image_in_the_common_set_adds_nothing() {
+        let baseline = belief_after_exec("rarity-common-baseline", &Snapshot::None, true);
+        let common = belief_after_exec(
+            "rarity-common",
+            &Snapshot::HoldingTheImage { hosts_covered: 50 },
+            true,
+        );
+        assert!((common - baseline).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_snapshot_covering_too_few_hosts_adds_nothing() {
+        // A freshly enrolled fleet has a thin snapshot: without this every binary on it
+        // would look rare.
+        let baseline = belief_after_exec("rarity-thin-baseline", &Snapshot::None, true);
+        let thin = belief_after_exec(
+            "rarity-thin",
+            &Snapshot::HoldingOthers { hosts_covered: 3 },
+            true,
+        );
+        assert!((thin - baseline).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_exec_with_no_readable_image_adds_nothing() {
+        let baseline = belief_after_exec("rarity-nohash-baseline", &Snapshot::None, false);
+        let unreadable = belief_after_exec(
+            "rarity-nohash",
+            &Snapshot::HoldingOthers { hosts_covered: 50 },
+            false,
+        );
+        assert!((unreadable - baseline).abs() < 1e-6);
     }
 
     #[test]
