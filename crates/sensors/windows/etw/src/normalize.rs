@@ -885,7 +885,7 @@ mod tests {
             ntlm_dedup_key(
                 schema::NtlmDirection::Incoming,
                 eid,
-                r"LABlice",
+                r"LAB\alice",
                 "DC1",
                 ip,
                 "NTLMv2",
