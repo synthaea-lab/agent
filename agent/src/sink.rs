@@ -55,6 +55,12 @@ pub(crate) struct DetectionSink {
     /// freshly loaded engine while the agent keeps running, the same reason
     /// every other mutable field on this struct is a `Mutex`.
     sigma: Mutex<Option<sigma::SigmaEngine>>,
+    /// The fleet's common-set snapshot (ADR-0020, issue #76) from
+    /// `<content_root>/snapshots/common-set.bin`, or `None` while there is none: the
+    /// "not in the common set" evidence is withheld without one. Swapped whole on
+    /// `reload_content`, like the engines above, so a reader never sees a half-loaded
+    /// filter; nothing reads it on the capture path yet (the lookup is the next slice).
+    common_set: Mutex<Option<Arc<ml::features::common_set::CommonSetSnapshot>>>,
     /// The single alert funnel (issue #388): alerts.ndjson + stderr + the
     /// in-memory recent-alerts buffer served to `cli detections`. Shared with
     /// the YARA scan worker and quarantine.
@@ -443,6 +449,7 @@ impl DetectionSink {
             correlator: Mutex::new(correlator::CorrelationEngine::new()),
             ml_scorer: Mutex::new(Self::load_correlation_scorer(model_root)),
             sigma: Mutex::new(load_sigma_rules(&content_root).into_option()),
+            common_set: Mutex::new(load_common_set(&content_root).into_option().map(Arc::new)),
             yara: Mutex::new(
                 start_yara(
                     &content_root,
@@ -503,6 +510,8 @@ impl DetectionSink {
             self.verdict.clone(),
         );
 
+        let common_set_loaded = load_common_set(&self.content_root);
+
         // The replaced engines are dropped after the locks are released: a
         // `ScanQueue` joins its worker on drop, which must not stall capture.
         let mut sigma_slot = self.sigma.lock().unwrap();
@@ -524,6 +533,17 @@ impl DetectionSink {
         let yara_rule_count = yara_slot.as_ref().map(|(_, count)| *count);
         drop(yara_slot);
         drop(old_yara);
+
+        // Same posture for the snapshot: absent unloads (the evidence is withheld), broken
+        // keeps the previous one (its failure is logged by the loader).
+        let mut common_set_slot = self.common_set.lock().unwrap();
+        let old_common_set = match common_set_loaded {
+            Load::Loaded(snapshot) => common_set_slot.replace(Arc::new(snapshot)),
+            Load::Absent => common_set_slot.take(),
+            Load::Failed => None,
+        };
+        drop(common_set_slot);
+        drop(old_common_set);
 
         // Same rules, same posture as the file scanner: absent unloads, broken keeps
         // the previous queue (its failure is already reported through `yara`).
@@ -1307,6 +1327,13 @@ impl DetectionSink {
             .collect()
     }
 
+    /// The snapshot in force. Tests read it until the evidence lookup does (next slice of
+    /// #76), which is why it is not compiled otherwise.
+    #[cfg(test)]
+    fn common_set(&self) -> Option<Arc<ml::features::common_set::CommonSetSnapshot>> {
+        self.common_set.lock().unwrap().clone()
+    }
+
     /// Handle to the alert funnel, for the IPC handler's `recent_detections`
     /// endpoint (issue #388).
     pub(crate) fn alert_log(&self) -> Arc<AlertLog> {
@@ -1380,6 +1407,63 @@ fn load_sigma_rules(content_root: &Path) -> Load<sigma::SigmaEngine> {
         }
         Err(e) => {
             tracing::error!(error = %e, "sigma: load error");
+            Load::Failed
+        }
+    }
+}
+
+/// The largest snapshot file the agent reads. The content manifest allows an artifact of up to
+/// 100 MiB; a snapshot is a Bloom filter whose size the server caps when it builds it, so
+/// anything near this is a malformed or hostile file, refused before it is read.
+const MAX_COMMON_SET_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Loads `<content_root>/snapshots/common-set.bin`, the file the signed content manifest
+/// delivers (ADR-0020). Absent is "no snapshot yet", not an error; unreadable, too large or
+/// not a snapshot is [`Load::Failed`] (logged with the reason, never the bytes).
+fn load_common_set(content_root: &Path) -> Load<ml::features::common_set::CommonSetSnapshot> {
+    load_common_set_capped(content_root, MAX_COMMON_SET_BYTES)
+}
+
+fn load_common_set_capped(
+    content_root: &Path,
+    max_bytes: u64,
+) -> Load<ml::features::common_set::CommonSetSnapshot> {
+    use std::io::Read as _;
+
+    let path = content_root.join("snapshots").join("common-set.bin");
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Load::Absent,
+        Err(e) => {
+            tracing::error!(error = %e, "common set: cannot open the snapshot file");
+            return Load::Failed;
+        }
+    };
+    // Read at most one byte past the cap: a file that grows between a size check and the read
+    // still cannot make this allocate more than the cap.
+    let mut bytes = Vec::new();
+    if let Err(e) = file.take(max_bytes + 1).read_to_end(&mut bytes) {
+        tracing::error!(error = %e, "common set: cannot read the snapshot file");
+        return Load::Failed;
+    }
+    if bytes.len() as u64 > max_bytes {
+        tracing::error!(max_bytes, "common set: snapshot file is over the size cap");
+        return Load::Failed;
+    }
+    match ml::features::common_set::CommonSetSnapshot::parse(&bytes) {
+        Ok(snapshot) => {
+            let header = snapshot.header();
+            tracing::info!(
+                entries = header.entry_count,
+                hosts_covered = header.hosts_covered,
+                min_hosts = header.min_hosts,
+                built_at = header.built_at,
+                "common set: snapshot loaded"
+            );
+            Load::Loaded(snapshot)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "common set: not a usable snapshot");
             Load::Failed
         }
     }
@@ -3712,6 +3796,145 @@ rule reload_content_test_marker {
                 .flush(std::time::Duration::from_secs(30)),
             "the enrichment worker must drain"
         );
+    }
+
+    // ── the common-set snapshot (ADR-0020, issue #76) ───────────────────────
+
+    /// A reference snapshot from the shared golden file (the same bytes the server's builder
+    /// and the `ml` reader are tested against), with some hashes it contains.
+    fn golden_common_set(case: &str) -> (Vec<u8>, Vec<String>, u32) {
+        let doc: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../ml/tests/fixtures/common_set_snapshot_golden.json"
+        )))
+        .unwrap();
+        let case = doc["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == case)
+            .unwrap();
+        let hex = case["bytes_hex"].as_str().unwrap();
+        let bytes = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let members = case["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m.as_str().unwrap().to_owned())
+            .collect();
+        let hosts = u32::try_from(case["params"]["hosts_covered"].as_u64().unwrap()).unwrap();
+        (bytes, members, hosts)
+    }
+
+    fn write_common_set(dir: &std::path::Path, bytes: &[u8]) {
+        let snapshots = dir.join("content").join("snapshots");
+        std::fs::create_dir_all(&snapshots).unwrap();
+        std::fs::write(snapshots.join("common-set.bin"), bytes).unwrap();
+    }
+
+    #[test]
+    fn a_common_set_snapshot_in_the_content_dir_is_loaded_at_startup() {
+        use ml::features::rarity::CommonSet as _;
+        let dir = tmp("common-set-startup");
+        let (bytes, members, hosts) = golden_common_set("fifty_hashes_one_percent");
+        write_common_set(&dir, &bytes);
+
+        let sink = sink_in(&dir);
+
+        let loaded = sink.common_set().expect("the snapshot must be loaded");
+        assert_eq!(loaded.hosts_covered(), u64::from(hosts));
+        assert!(members.iter().all(|m| loaded.contains(m)));
+    }
+
+    #[test]
+    fn no_snapshot_file_means_no_common_set_and_no_failure() {
+        let dir = tmp("common-set-absent");
+        let sink = sink_in(&dir);
+        assert!(sink.common_set().is_none());
+        sink.reload_content();
+        assert!(sink.common_set().is_none());
+    }
+
+    #[test]
+    fn reload_content_picks_up_a_common_set_snapshot_added_after_construction() {
+        let dir = tmp("common-set-reload");
+        let sink = sink_in(&dir);
+        assert!(sink.common_set().is_none());
+        let (bytes, _, _) = golden_common_set("one_hash");
+        write_common_set(&dir, &bytes);
+
+        sink.reload_content();
+
+        assert!(sink.common_set().is_some());
+    }
+
+    #[test]
+    fn reload_content_unloads_the_common_set_when_its_file_is_removed() {
+        // Same posture as the rule directories: an absent file is "no content", not an error,
+        // and the evidence that depends on it is withheld rather than judged on a stale set.
+        let dir = tmp("common-set-removed");
+        let (bytes, _, _) = golden_common_set("one_hash");
+        write_common_set(&dir, &bytes);
+        let sink = sink_in(&dir);
+        assert!(sink.common_set().is_some());
+        std::fs::remove_file(dir.join("content/snapshots/common-set.bin")).unwrap();
+
+        sink.reload_content();
+
+        assert!(sink.common_set().is_none());
+    }
+
+    #[test]
+    fn reload_content_keeps_the_previous_common_set_when_the_new_file_is_corrupt() {
+        use ml::features::rarity::CommonSet as _;
+        let dir = tmp("common-set-corrupt");
+        let (bytes, members, _) = golden_common_set("fifty_hashes_one_percent");
+        write_common_set(&dir, &bytes);
+        let sink = sink_in(&dir);
+        let mut broken = bytes.clone();
+        broken.truncate(bytes.len() - 1);
+        write_common_set(&dir, &broken);
+
+        sink.reload_content();
+
+        let kept = sink.common_set().expect("a broken file must not unload it");
+        assert!(members.iter().all(|m| kept.contains(m)));
+    }
+
+    #[test]
+    fn a_corrupt_common_set_at_startup_leaves_it_unloaded_not_the_agent_down() {
+        let dir = tmp("common-set-corrupt-startup");
+        write_common_set(&dir, b"not a snapshot");
+        let sink = sink_in(&dir);
+        assert!(sink.common_set().is_none());
+    }
+
+    #[test]
+    fn a_common_set_file_over_the_size_cap_is_refused_unread() {
+        let dir = tmp("common-set-cap");
+        let (bytes, _, _) = golden_common_set("two_hundred_hashes_one_in_a_thousand");
+        write_common_set(&dir, &bytes);
+        let root = dir.join("content");
+
+        assert!(matches!(
+            super::load_common_set_capped(&root, u64::try_from(bytes.len()).unwrap()),
+            super::Load::Loaded(_)
+        ));
+        assert!(matches!(
+            super::load_common_set_capped(&root, u64::try_from(bytes.len()).unwrap() - 1),
+            super::Load::Failed
+        ));
+    }
+
+    #[test]
+    fn a_directory_where_the_common_set_file_belongs_is_a_failure_not_a_crash() {
+        let dir = tmp("common-set-dir");
+        std::fs::create_dir_all(dir.join("content/snapshots/common-set.bin")).unwrap();
+        let sink = sink_in(&dir);
+        assert!(sink.common_set().is_none());
     }
 
     #[test]
