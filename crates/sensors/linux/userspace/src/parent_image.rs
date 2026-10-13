@@ -14,7 +14,9 @@
 //! A process that forked and has not exec'd (a subshell: `$(...)`, a pipeline stage) was
 //! never recorded, but it runs the image of the process that forked it, so its children
 //! inherit that image (#784): the probe hands over the parent's own parent and its stamp,
-//! and the image recorded for it answers if, and only if, that image was already in place
+//! and whether the parent has exec'd, and the image recorded for the forker answers if, and
+//! only if, the parent never exec'd (a parent that did has an image of its own, unknown when
+//! the cache lost it, and is not given its forker's) and that image was already in place
 //! when the subshell forked. A forker that exec'd again after the fork has a different
 //! image now than its subshell still runs, and that answers `None`: the fork time is the
 //! subshell's own generation (`bpf_ktime_get_ns()` at the fork, the clock the exec events
@@ -56,6 +58,11 @@ pub(crate) struct ExecStamps {
     pub(crate) grandparent_pid: u32,
     /// Its stamp as the parent's fork recorded it, `0` when unknown.
     pub(crate) grandparent_generation: u64,
+    /// The probe saw the parent fork and has not seen it exec since (`PROC_LINEAGE`'s
+    /// `execd` flag). Only then may the parent be answered with its forker's image: a parent
+    /// that exec'd has an image of its own, and when the cache lost it the answer is
+    /// unknown. `false` is the default and the safe reading: no claim, no fallback.
+    pub(crate) parent_never_exec_ed: bool,
 }
 
 /// Whether `pid` is a live process (its `/proc/<pid>` exists).
@@ -151,12 +158,16 @@ impl ParentImages {
     }
 
     /// The image of the process that forked a parent which never exec'd (#784), when it
-    /// can be said to be the parent's. `None` unless: the parent's own stamp is known (its
-    /// fork time), the forker is known by pid and stamp, and the forker's current image was
-    /// already in place when the parent forked.
+    /// can be said to be the parent's. `None` unless: the probe saw the parent fork and
+    /// never exec, the parent's own stamp is known (its fork time), the forker is known by
+    /// pid and stamp, and the forker's current image was already in place when the parent
+    /// forked.
     fn forkers_image(&mut self, exec: &ExecEvent, stamps: ExecStamps) -> Option<String> {
         let fork_ns = exec.meta.parent_process_generation.filter(|g| *g != 0)?;
-        if stamps.grandparent_pid == 0 || stamps.grandparent_generation == 0 {
+        if !stamps.parent_never_exec_ed
+            || stamps.grandparent_pid == 0
+            || stamps.grandparent_generation == 0
+        {
             return None;
         }
         self.tick += 1;
@@ -399,6 +410,7 @@ mod tests {
                 ktime_ns: 40,
                 grandparent_pid: 100,
                 grandparent_generation: 7,
+                parent_never_exec_ed: true,
             },
         );
         (cache, child)
@@ -430,6 +442,7 @@ mod tests {
                 ktime_ns: 40,
                 grandparent_pid: 100,
                 grandparent_generation: 7, // the forker's stamp; pid 100 now holds generation 99
+                parent_never_exec_ed: true,
             },
         );
         assert_eq!(child.parent_image_path, None);
@@ -454,6 +467,7 @@ mod tests {
                     ktime_ns: 40,
                     grandparent_pid,
                     grandparent_generation,
+                    parent_never_exec_ed: true,
                 },
             );
             assert_eq!(
@@ -474,6 +488,7 @@ mod tests {
                 ktime_ns: 35,
                 grandparent_pid: 1,
                 grandparent_generation: 1,
+                parent_never_exec_ed: false,
             },
         );
         let mut grandchild = exec(300, 50, 150, 20, "/usr/bin/id");
@@ -483,6 +498,7 @@ mod tests {
                 ktime_ns: 60,
                 grandparent_pid: 100,
                 grandparent_generation: 7,
+                parent_never_exec_ed: false,
             },
         );
         assert_eq!(
@@ -506,6 +522,7 @@ mod tests {
                     ktime_ns: 40,
                     grandparent_pid: 100,
                     grandparent_generation: 7,
+                    parent_never_exec_ed: true,
                 },
             );
             assert!(child.parent_image_path.is_some());
@@ -519,9 +536,54 @@ mod tests {
                 ktime_ns: 40,
                 grandparent_pid: 100,
                 grandparent_generation: 7,
+                parent_never_exec_ed: true,
             },
         );
         assert_eq!(child.parent_image_path.as_deref(), Some("/usr/sbin/sshd"));
+    }
+
+    /// The stamps of a child whose parent (pid 150, generation 20) is gone from the cache and
+    /// whose forker is pid 100, generation 7, with the probe's word on whether it exec'd.
+    fn stamps_of_a_lost_parent(parent_never_exec_ed: bool) -> ExecStamps {
+        ExecStamps {
+            ktime_ns: 40,
+            grandparent_pid: 100,
+            grandparent_generation: 7,
+            parent_never_exec_ed,
+        }
+    }
+
+    #[test]
+    fn a_parent_that_exec_ed_and_was_evicted_is_unknown_not_its_forkers_image() {
+        // nginx (pid 100) forked a worker (pid 150) that exec'd; the cache lost the worker (LRU
+        // eviction, #783). The probe says the worker exec'd, so the worker's own image is
+        // unknown: answering with nginx's would report it as a child of its forker's image.
+        let mut cache = ParentImages::new(8);
+        note(&mut cache, &mut exec(100, 7, 1, 1, "/usr/sbin/nginx"));
+        let mut child = exec(200, 30, 150, 20, "/usr/bin/id");
+        cache.annotate(&mut child, stamps_of_a_lost_parent(false));
+        assert_eq!(child.parent_image_path, None);
+    }
+
+    #[test]
+    fn a_parent_whose_exec_image_was_unreadable_is_unknown_not_its_forkers_image() {
+        // The worker exec'd and the probe could not copy its filename: `record` forgets it (#769),
+        // and the fallback must not bring the forker's image back in its place.
+        let mut cache = ParentImages::new(8);
+        note(&mut cache, &mut exec(100, 7, 1, 1, "/usr/sbin/nginx"));
+        note(&mut cache, &mut exec(150, 20, 100, 7, ""));
+        let mut child = exec(200, 30, 150, 20, "/usr/bin/id");
+        cache.annotate(&mut child, stamps_of_a_lost_parent(false));
+        assert_eq!(child.parent_image_path, None);
+    }
+
+    #[test]
+    fn a_parent_the_probe_saw_fork_and_never_exec_gets_its_forkers_image() {
+        let mut cache = ParentImages::new(8);
+        note(&mut cache, &mut exec(100, 7, 1, 1, "/usr/bin/bash"));
+        let mut child = exec(200, 30, 150, 20, "/usr/bin/id");
+        cache.annotate(&mut child, stamps_of_a_lost_parent(true));
+        assert_eq!(child.parent_image_path.as_deref(), Some("/usr/bin/bash"));
     }
 
     // --- eviction: the processes that are gone go first (#783) -----------------------------

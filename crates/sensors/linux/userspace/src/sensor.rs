@@ -317,6 +317,7 @@ impl LinuxSensor {
                                 ktime_ns: e.meta.timestamp_ns,
                                 grandparent_pid: e.grandparent_pid,
                                 grandparent_generation: e.grandparent_generation,
+                                parent_never_exec_ed: e.parent_execd == 0,
                             });
                         }
                         event
