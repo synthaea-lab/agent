@@ -187,6 +187,7 @@ pub struct PlantReport {
 pub fn plant(canaries: &[Canary], inventory_path: &Path) -> Result<PlantReport, DeceptionError> {
     let mut inventory = Inventory::load(inventory_path)?;
     let mut report = PlantReport::default();
+    let modified_times = planned_mtimes(canaries, std::time::SystemTime::now());
     for canary in canaries {
         let sha256 = sha256_hex(canary.content.as_bytes());
         if let Some(known) = inventory.entries.iter().find(|e| e.path == canary.path) {
@@ -225,6 +226,9 @@ pub fn plant(canaries: &[Canary], inventory_path: &Path) -> Result<PlantReport, 
             Ok(mut file) => {
                 file.write_all(canary.content.as_bytes())
                     .map_err(io_at(&canary.path))?;
+                if let Some(modified) = modified_times.get(&canary.path) {
+                    file.set_modified(*modified).map_err(io_at(&canary.path))?;
+                }
                 report.planted.push(canary.path.clone());
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -279,6 +283,7 @@ pub fn refresh(
 ) -> Result<RefreshReport, DeceptionError> {
     let inventory = Inventory::load(inventory_path)?;
     let mut report = RefreshReport::default();
+    let modified_times = planned_mtimes(canaries, std::time::SystemTime::now());
     for canary in canaries {
         let Some(known) = inventory.entries.iter().find(|e| e.path == canary.path) else {
             continue;
@@ -306,6 +311,9 @@ pub fn refresh(
                     Ok(mut file) => {
                         file.write_all(canary.content.as_bytes())
                             .map_err(io_at(&canary.path))?;
+                        if let Some(modified) = modified_times.get(&canary.path) {
+                            file.set_modified(*modified).map_err(io_at(&canary.path))?;
+                        }
                         report.restored.push(canary.path.clone());
                     }
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -318,6 +326,87 @@ pub fn refresh(
         }
     }
     Ok(report)
+}
+
+/// Chooses distinct, seed-driven modification times per directory. Existing regular files
+/// provide the time range; an empty directory uses a seed-derived age of one to 365 days.
+/// A zero-width or too-narrow neighboring range cannot hold distinct timestamps, so it uses
+/// the same empty-directory fallback rather than assigning every canary one timestamp.
+fn planned_mtimes(
+    canaries: &[Canary],
+    now: std::time::SystemTime,
+) -> std::collections::HashMap<PathBuf, std::time::SystemTime> {
+    use std::{
+        collections::{HashMap, HashSet},
+        time::Duration,
+    };
+
+    const TIME_QUANTUM_SECS: u64 = 2;
+    const DAY_SECS: u64 = 24 * 60 * 60;
+    const FALLBACK_DAYS: u64 = 365;
+
+    let mut by_dir: HashMap<PathBuf, Vec<&Canary>> = HashMap::new();
+    for canary in canaries {
+        if let Some(dir) = canary.path.parent() {
+            by_dir.entry(dir.to_path_buf()).or_default().push(canary);
+        }
+    }
+
+    let mut modified_times = HashMap::with_capacity(canaries.len());
+    for (dir, mut group) in by_dir {
+        group.sort_by_key(|canary| canary.mtime_seed);
+        let neighbor_range = neighboring_mtime_range(&dir, &group);
+        let span_secs = neighbor_range
+            .as_ref()
+            .and_then(|(start, end)| end.duration_since(*start).ok().map(|span| span.as_secs()));
+        let slots = span_secs.map(|span| span / TIME_QUANTUM_SECS + 1);
+        let can_fit = slots.is_some_and(|slots| slots >= group.len() as u64);
+        let mut used_offsets = HashSet::new();
+
+        for canary in group {
+            let modified = if let (Some((start, _)), Some(slots)) = (neighbor_range, slots)
+                && can_fit
+            {
+                let mut offset = canary.mtime_seed % slots;
+                while !used_offsets.insert(offset) {
+                    offset = (offset + 1) % slots;
+                }
+                start + Duration::from_secs(offset * TIME_QUANTUM_SECS)
+            } else {
+                let mut age_days = 1 + canary.mtime_seed % FALLBACK_DAYS;
+                while !used_offsets.insert(age_days) {
+                    age_days = age_days % FALLBACK_DAYS + 1;
+                }
+                now.checked_sub(Duration::from_secs(age_days * DAY_SECS))
+                    .unwrap_or(std::time::UNIX_EPOCH)
+            };
+            modified_times.insert(canary.path.clone(), modified);
+        }
+    }
+    modified_times
+}
+
+/// Modification-time range of neighboring regular files, excluding this directory's planned
+/// canaries. A directory listing never opens a canary and is not a tripwire touch.
+fn neighboring_mtime_range(
+    dir: &Path,
+    canaries: &[&Canary],
+) -> Option<(std::time::SystemTime, std::time::SystemTime)> {
+    let canary_paths: std::collections::HashSet<_> =
+        canaries.iter().map(|canary| canary.path.clone()).collect();
+    let mut times = fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            if canary_paths.contains(&entry.path()) || !entry.file_type().ok()?.is_file() {
+                return None;
+            }
+            entry.metadata().ok()?.modified().ok()
+        });
+    let first = times.next()?;
+    Some(times.fold((first, first), |(min, max), time| {
+        (min.min(time), max.max(time))
+    }))
 }
 
 /// How an inventoried canary differs from what was planted.
@@ -538,6 +627,60 @@ mod tests {
         let saved = Inventory::load(&inventory).unwrap();
         assert_eq!(saved.entries.len(), 2);
         assert!(verify(&saved).is_empty());
+    }
+
+    #[test]
+    fn planted_canaries_get_distinct_seed_reproducible_past_mtimes() {
+        let (_dir, inventory, canaries) = setup();
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        let first_plan = planned_mtimes(&canaries, now);
+        let second_plan = planned_mtimes(&canaries, now);
+        assert_eq!(first_plan, second_plan);
+        assert_ne!(first_plan[&canaries[0].path], first_plan[&canaries[1].path]);
+
+        plant(&canaries, &inventory).unwrap();
+        let first_mtime = fs::metadata(&canaries[0].path).unwrap().modified().unwrap();
+        let second_mtime = fs::metadata(&canaries[1].path).unwrap().modified().unwrap();
+        assert_ne!(first_mtime, second_mtime);
+        assert!(first_mtime < std::time::SystemTime::now());
+        assert!(second_mtime < std::time::SystemTime::now());
+        assert!(verify(&Inventory::load(&inventory).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn canary_mtimes_fit_the_range_of_neighboring_files() {
+        let (_dir, inventory, canaries) = setup();
+        let dir = canaries[0].path.parent().unwrap();
+        let early = dir.join("neighbor-early.txt");
+        let late = dir.join("neighbor-late.txt");
+        fs::write(&early, "early").unwrap();
+        fs::write(&late, "late").unwrap();
+        let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        let end = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        OpenOptions::new()
+            .write(true)
+            .open(&early)
+            .unwrap()
+            .set_modified(start)
+            .unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&late)
+            .unwrap()
+            .set_modified(end)
+            .unwrap();
+
+        let planned = planned_mtimes(&canaries, end);
+        let times: Vec<_> = canaries.iter().map(|c| planned[&c.path]).collect();
+        assert_ne!(times[0], times[1]);
+        assert!(times.iter().all(|time| *time >= start && *time <= end));
+
+        plant(&canaries, &inventory).unwrap();
+        for canary in &canaries {
+            let actual = fs::metadata(&canary.path).unwrap().modified().unwrap();
+            assert!(actual >= start && actual <= end);
+        }
+        assert!(verify(&Inventory::load(&inventory).unwrap()).is_empty());
     }
 
     #[test]

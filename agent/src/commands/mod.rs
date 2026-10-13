@@ -59,6 +59,12 @@ pub(crate) struct RunOptions<'a> {
     pub(crate) log_sources: &'a [config::LogSourceConfig],
     /// Canary directories declared in `[deception]` (#81), planted by `common::plant_canaries`.
     pub(crate) deception: &'a config::DeceptionConfig,
+    /// The config path `config::discover` actually resolved at startup (issue #71):
+    /// watched by `protected::protected_paths` as one more of the agent's own
+    /// resources. Read only by `linux::cmd_run`, same posture as the other
+    /// Linux-only fields above.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) config_path: &'a std::path::Path,
 }
 
 #[cfg(target_os = "linux")]

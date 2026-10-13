@@ -507,7 +507,7 @@ fn to_auth_event(logon: &LogonEvent) -> Option<Event> {
             pid: logon.pid,
             ppid: 0,
             user,
-            timestamp_ns: now_ns(),
+            timestamp_ns: logon.time_created_ns.unwrap_or_else(now_ns),
             comm: LSASS_COMM.to_string(),
             container: None, // Windows: no container support
             process_generation: None,
@@ -579,7 +579,7 @@ static ACCOUNT_CREATIONS: PollTarget = PollTarget {
 // (`AppLocker` is a policy-configured feature, not an audit subcategory). If the
 // channel is disabled by group policy on a given host, `wevtutil qe` simply
 // returns nothing and this poll thread stays idle — the failure mode is a
-// coverage gap, not a crash.
+// coverage gap, not a crash, and the start-up channel check logs it (#786).
 
 /// `AppLocker` event id for "blocked" (enforce mode).
 const APPLOCKER_EVENT_BLOCKED: u32 = 8004;
@@ -725,10 +725,13 @@ static APPLOCKER_PACKAGED_DEPLOYMENT: PollTarget = PollTarget {
 
 // ── Event 106 — TaskScheduler Operational "task registered" ─────────────────
 //
-// The `Microsoft-Windows-TaskScheduler/Operational` channel is **enabled by
-// default** on all supported Windows SKUs (Task Scheduler being a core service)
-// — no `auditpol` interaction, complementing the Security 4698 path whose
-// `enable_scheduled_task_audit` may fail on a hardened host. When both channels
+// The `Microsoft-Windows-TaskScheduler/Operational` channel is Task Scheduler's
+// "history" switch, and it is **off by default**: disabled, with no log file, on a
+// Windows 11 25H2 client (lab, 2026-10-12, #786; Server not checked). Where an
+// operator turned it on, it needs no `auditpol` interaction and complements the
+// Security 4698 path whose `enable_scheduled_task_audit` may fail on a hardened
+// host. Where it is off, this target sees nothing and the start-up channel check
+// says so (`warn_about_disabled_channels`). When both channels
 // are up, one registration yields a 4698 and a 106 carrying the same task and
 // actions: both raw events are kept, and the rules layer reports the pair once
 // (`RuleState`'s scheduled-task registration dedup, #422).
@@ -792,7 +795,8 @@ static TASK_SCHEDULER_OP: PollTarget = PollTarget {
     id_filter: "EventID=106",
     counter: |c| &c.task_scheduler_op,
     parse_block: normalize_task_scheduler_op_registered,
-    // Operational channel, always on — nothing to enable.
+    // Off by default (Task Scheduler history). Not enabled here: like
+    // `AppLocker`'s channel, that is the operator's call (#786).
     enable_audit: None,
     enabled: |c| c.task_scheduler_op_enabled,
 };
@@ -1079,7 +1083,7 @@ fn session_event(ev: xml::TerminalSessionEvent, state: SessionState) -> Event {
             pid: ev.pid,
             ppid: 0,
             user: User::Unknown,
-            timestamp_ns: now_ns(),
+            timestamp_ns: ev.time_created_ns.unwrap_or_else(now_ns),
             comm: String::new(),
             container: None, // Windows: no container support
             process_generation: None,
@@ -1230,8 +1234,9 @@ pub struct EventLogConfig {
     /// `PolicyDenialEvent` (#427).
     pub applocker_blocks_enabled: bool,
     /// Event 106 (T1053.005 — scheduled task registered via the
-    /// `Microsoft-Windows-TaskScheduler/Operational` channel; always-on
-    /// complement to the 4698 path).
+    /// `Microsoft-Windows-TaskScheduler/Operational` channel; complements the
+    /// 4698 path where Task Scheduler history is enabled, which it is not by
+    /// default, #786).
     pub task_scheduler_op_enabled: bool,
     /// Defender Operational: 1116/1117 verdicts and the 5001/5007/5010/5012
     /// tamper traces, reported as `DefenderEvent` (#283).
@@ -1304,6 +1309,38 @@ pub struct EventLogCounters {
     pub wdac: AtomicU64,
     pub session_lifecycle: AtomicU64,
     pub rdp_connections: AtomicU64,
+    /// Channels found disabled at start-up for an enabled target (#786): each
+    /// is polled or subscribed like any other but cannot deliver an event.
+    pub disabled_channels: AtomicU64,
+}
+
+/// One warning per enabled target channel that is switched off (#786). A disabled
+/// channel answers `wevtutil qe` with exit 0 and no events, so without this the
+/// target looks like a quiet, healthy one and its liveness counter keeps moving.
+/// Checked once per channel (several targets share `Security`), at start-up only:
+/// a channel switched off while the agent runs is not caught here.
+fn warn_about_disabled_channels(config: &EventLogConfig, counters: &EventLogCounters) {
+    let mut checked: Vec<&str> = Vec::new();
+    for target in TARGETS {
+        if !(target.enabled)(config) || checked.contains(&target.channel) {
+            continue;
+        }
+        checked.push(target.channel);
+        if crate::channel::is_enabled(target.channel) != Some(false) {
+            continue;
+        }
+        counters.disabled_channels.fetch_add(1, Ordering::Relaxed);
+        let targets: Vec<&str> = TARGETS
+            .iter()
+            .filter(|t| t.channel == target.channel && (t.enabled)(config))
+            .map(|t| t.label)
+            .collect();
+        tracing::warn!(
+            channel = target.channel,
+            targets = ?targets,
+            "event log channel is disabled: these targets will see no events until an              operator enables it (wevtutil sl \"<channel>\" /e:true)"
+        );
+    }
 }
 
 // ── The sensor ────────────────────────────────────────────────────────────────
@@ -1423,6 +1460,7 @@ impl Sensor for EventLogSensor {
                 enable_audit();
             }
         }
+        warn_about_disabled_channels(&self.config, &self.counters);
 
         // Two kinds of "hold this alive while we run" objects, kept in
         // separate vectors so their types stay concrete and their drops fire
@@ -1751,6 +1789,45 @@ mod wevtutil_tests {
             last_known_record_id(target)
                 .unwrap_or_else(|e| panic!("{} on {}: {e}", target.label, target.channel));
         }
+    }
+
+    /// #786: what the start-up check reports does not depend on the host. Each
+    /// disabled channel counts once, however many targets read it.
+    #[test]
+    fn each_disabled_target_channel_is_counted_once() {
+        let config = EventLogConfig::default();
+        let mut channels: Vec<&str> = TARGETS
+            .iter()
+            .filter(|t| (t.enabled)(&config))
+            .map(|t| t.channel)
+            .collect();
+        channels.sort_unstable();
+        channels.dedup();
+        let disabled = channels
+            .iter()
+            .filter(|c| crate::channel::is_enabled(c) == Some(false))
+            .count() as u64;
+
+        let counters = EventLogCounters::default();
+        warn_about_disabled_channels(&config, &counters);
+        assert_eq!(counters.disabled_channels.load(Ordering::Relaxed), disabled);
+    }
+
+    /// #786: a disabled channel answers a query with exit 0 and no events, the
+    /// same as a quiet one. That is why the poll loop cannot tell them apart and
+    /// the start-up check above exists. Ignored: it needs a channel that is off
+    /// on this host (Task Scheduler history is, on a default client install).
+    #[test]
+    #[ignore = "needs Microsoft-Windows-TaskScheduler/Operational disabled on this host"]
+    fn a_disabled_channel_looks_like_a_quiet_one_to_wevtutil() {
+        assert_eq!(
+            crate::channel::is_enabled(TASK_SCHEDULER_OP.channel),
+            Some(false),
+            "precondition: Task Scheduler history is off here"
+        );
+        let out = wevtutil(&["qe", TASK_SCHEDULER_OP.channel, "/c:1", "/f:xml"])
+            .expect("a disabled channel is not a failing query");
+        assert!(out.trim().is_empty());
     }
 }
 

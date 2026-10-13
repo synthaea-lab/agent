@@ -54,6 +54,8 @@ jobs:
         # Unit tests always compile under cfg(test), where the test seed exists; the
         # integration test is the only thing that exercises the packaged variant.
         run: cargo test -p updater --no-default-features
+      - name: tools tests (PE and Mach-O import checkers)
+        run: python3 -m unittest discover -s tools/tests -v
       - name: docs build clean
         run: cargo doc --workspace --exclude sensor-linux-ebpf --no-deps
         env:
