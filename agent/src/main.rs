@@ -38,6 +38,13 @@ mod heartbeat;
 // cross-platform body here to keep alive with an `allow(dead_code)`.
 #[cfg(target_os = "linux")]
 mod integrity;
+// Linux-only: `dpkg` has no Windows/macOS equivalent to fall back to (unlike
+// `heartbeat`/`protected`, which compile everywhere and are just unwired
+// elsewhere) — there is nothing this module could do on another platform, so
+// it is gated out rather than kept as dead weight that always takes the
+// "file not found" skip path.
+#[cfg(target_os = "linux")]
+mod inventory;
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos", windows)),
     allow(dead_code)
