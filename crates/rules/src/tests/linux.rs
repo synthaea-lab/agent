@@ -1192,6 +1192,94 @@ fn a_denial_missing_subject_or_object_context_still_alerts_once() {
 }
 
 #[test]
+fn policy_denial_alert_cap_sheds_further_shapes_but_keeps_deduplicating() {
+    // `known_policy_denials` bounds the rule's memory, not its alert volume (#812): past
+    // POLICY_DENIAL_ALERT_CAP distinct shapes, further new ones must stop alerting
+    // without breaking the dedup itself.
+    let mut state = RuleState::new();
+    let mut alerted = 0usize;
+    for i in 0..=POLICY_DENIAL_ALERT_CAP {
+        let subject = format!("unconfined_u:unconfined_r:type_{i}_t:s0");
+        let alerts = state.on_policy_denial(&policy_denial_event_full(
+            "selinux",
+            Some(&subject),
+            Some("user_home_t"),
+            Some("file"),
+            true,
+        ));
+        alerted += alerts.len();
+    }
+    assert_eq!(
+        alerted, POLICY_DENIAL_ALERT_CAP as usize,
+        "the (cap + 1)th distinct shape must be shed, not alerted"
+    );
+
+    // The shed shape is still remembered: seeing it again still does not alert (dedup
+    // did not stop working once the cap was reached).
+    let last_subject = format!("unconfined_u:unconfined_r:type_{POLICY_DENIAL_ALERT_CAP}_t:s0");
+    let repeat = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        Some(&last_subject),
+        Some("user_home_t"),
+        Some("file"),
+        true,
+    ));
+    assert!(repeat.is_empty(), "dedup still works past the alert cap");
+}
+
+#[test]
+fn policy_denial_cache_eviction_is_logged() {
+    // `known_policy_denials` silently clearing at COUNTER_CAP must not be silent to an
+    // operator (#812, CLAUDE.md: counted, observable shedding) — logged once per rise,
+    // the same idiom as `agent::ransomware_join::report_evictions`.
+    use std::{
+        io,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        let mut state = RuleState::new();
+        for i in 0..=COUNTER_CAP {
+            let subject = format!("unconfined_u:unconfined_r:evict_{i}_t:s0");
+            state.on_policy_denial(&policy_denial_event_full(
+                "selinux",
+                Some(&subject),
+                Some("user_home_t"),
+                Some("file"),
+                true,
+            ));
+        }
+    });
+
+    let logs = String::from_utf8_lossy(&captured.0.lock().expect("capture lock")).into_owned();
+    assert!(
+        logs.contains("tracked denial shapes shed"),
+        "eviction past COUNTER_CAP must be logged, got: {logs}"
+    );
+}
+
+#[test]
 fn mass_rename_with_appended_suffix_triggers_at_threshold() {
     let mut state = RuleState::new();
     let mut alerts = Vec::new();
