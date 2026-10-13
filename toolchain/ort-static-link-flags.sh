@@ -28,7 +28,8 @@
 # papers over (ort-sys's incomplete list vs. onnxruntime's own CMake graph
 # never scheduling `re2`) and why neither is fixed upstream yet.
 #
-# Usage (from an onnxruntime checkout, after building):
+# Usage on Linux (from an onnxruntime checkout, after building; on macOS use
+# `build/MacOS/Release` and `sysctl -n hw.ncpu`, or just run build-onnxruntime-static.sh):
 #   ./build.sh --config Release --update --build --no_telemetry \
 #     --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF
 #   cmake --build build/Linux/Release --target re2 -j"$(nproc)"
@@ -36,9 +37,9 @@
 #   eval "$(./lab/provisioning/ort-static-link-flags.sh)"
 #   cargo test -p ml --release
 #
-# Linux only (`.a` extension, GNU ld/lld `-l`/`-L` syntax). Windows (`.lib`, MSVC)
-# has its own variant, ort-static-link-flags.ps1 (#337); macOS would need one too
-# and has no ADR-0002 static build attempted yet.
+# Linux and macOS (`.a` extension, `-l`/`-L` syntax; on macOS ORT_LIB_LOCATION is
+# `build/MacOS/Release`, see build-onnxruntime-static.sh and onnxruntime-static-build-macos.md,
+# #338). Windows (`.lib`, MSVC) has its own variant, ort-static-link-flags.ps1 (#337).
 set -euo pipefail
 
 : "${ORT_LIB_LOCATION:?set ORT_LIB_LOCATION to the onnxruntime build/Linux/Release directory}"
@@ -48,35 +49,47 @@ if [ ! -d "$ORT_LIB_LOCATION" ]; then
   exit 1
 fi
 
-mapfile -t libs < <(find "$ORT_LIB_LOCATION" -name 'lib*.a' | sort)
+# Written for bash 3.2 (the one macOS ships as /bin/bash): no `mapfile`, no associative
+# arrays. The output is the same as the bash-4 version it replaces, flag for flag.
+libs="$(find "$ORT_LIB_LOCATION" -name 'lib*.a' | sort)"
 
-if [ "${#libs[@]}" -eq 0 ]; then
+if [ -z "$libs" ]; then
   echo "no .a files found under $ORT_LIB_LOCATION — did the build actually run?" >&2
   exit 1
 fi
 
-declare -A seen_dirs=()
-declare -A seen_names=()
+seen_dirs=$'\n'
+seen_names=$'\n'
+n_dirs=0
+n_names=0
 flags=()
 
-for path in "${libs[@]}"; do
+while IFS= read -r path; do
   dir=$(dirname "$path")
   base=$(basename "$path")
   name=${base#lib}
   name=${name%.a}
 
-  if [ -z "${seen_dirs[$dir]:-}" ]; then
-    flags+=("-L" "native=$dir")
-    seen_dirs[$dir]=1
-  fi
-  if [ -z "${seen_names[$name]:-}" ]; then
-    flags+=("-l" "static=$name")
-    seen_names[$name]=1
-  fi
-done
+  case "$seen_dirs" in
+    *$'\n'"$dir"$'\n'*) ;;
+    *)
+      flags+=("-L" "native=$dir")
+      seen_dirs="$seen_dirs$dir"$'\n'
+      n_dirs=$((n_dirs + 1))
+      ;;
+  esac
+  case "$seen_names" in
+    *$'\n'"$name"$'\n'*) ;;
+    *)
+      flags+=("-l" "static=$name")
+      seen_names="$seen_names$name"$'\n'
+      n_names=$((n_names + 1))
+      ;;
+  esac
+done <<< "$libs"
 
 # RUSTFLAGS is whitespace-split, so this breaks if $ORT_LIB_LOCATION itself
 # contains a space — a real limitation of the mechanism, not just this
 # script; build onnxruntime under a space-free path.
 printf 'export RUSTFLAGS="%s"\n' "${flags[*]}"
-echo "# ${#seen_dirs[@]} directories, ${#seen_names[@]} libraries" >&2
+echo "# $n_dirs directories, $n_names libraries" >&2

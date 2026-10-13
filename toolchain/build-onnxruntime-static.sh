@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds onnxruntime v1.30.0 from source as static libraries for Linux,
+# Builds onnxruntime v1.30.0 from source as static libraries for Linux and macOS,
 # implementing ADR-0002 decision #2 (static linking for single-binary deployment).
 #
 # Issue #110 tracks the full static-linking integration; this script automates
@@ -9,9 +9,13 @@
 # Tested on:
 # - Ubuntu 24.04 (glibc) — ADR-0002 target platform
 # - Alpine 3.x (musl) — not a target, but confirms cross-libc viability
+# - macOS (#338): Apple Silicon and Intel (hosted runners macos-15 and macos-15-intel, 2026-10-12:
+#   built, linked, tested; see onnxruntime-static-build-macos.md for the measurements). The macOS
+#   branch was written without a Mac and first run by .github/workflows/macos-static-agent.yml.
 #
 # Prerequisites (Ubuntu):
 #   sudo apt-get install -y build-essential cmake git python3
+# Prerequisites (macOS): Xcode command line tools and `brew install cmake python@3.12 git`.
 #
 # Usage:
 #   ./lab/provisioning/build-onnxruntime-static.sh [--clean] [--jobs N]
@@ -21,8 +25,8 @@
 #   --jobs N   Parallel build jobs (default: nproc)
 #
 # Output:
-#   ./onnxruntime/build/Linux/Release/*.a — all static libraries
-#   Sets ORT_LIB_LOCATION for the next step (ort-static-link-flags.sh)
+#   ./onnxruntime/build/Linux/Release/*.a (macOS: build/MacOS/Release) — all static libraries
+#   Prints the ORT_LIB_LOCATION to set for the next step (ort-static-link-flags.sh)
 
 set -euo pipefail
 
@@ -30,8 +34,32 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ONNX_DIR="$REPO_ROOT/onnxruntime"
 ONNX_VERSION="v1.30.0"
+# The commit the tag pointed at when this was pinned (2026-10-12). A tag can be moved; a build
+# of something else than what was reviewed must fail, not run.
+ONNX_COMMIT="f2c39fe2f838cf35ce7da92824f5a5e3ee6e88a7"
 CLEAN=false
-JOBS=$(nproc)
+
+# The platform decides the build directory onnxruntime's build.py uses and how to count CPUs
+# (`nproc` is GNU coreutils; macOS has `sysctl -n hw.ncpu`).
+case "$(uname -s)" in
+  Linux)
+    PLATFORM_DIR="Linux"
+    JOBS=$(nproc)
+    ;;
+  Darwin)
+    PLATFORM_DIR="MacOS"
+    JOBS=$(sysctl -n hw.ncpu)
+    # One deployment target for onnxruntime and, through the same variable, for the cargo
+    # build that links it: a library built for a newer macOS than the agent links against
+    # produces "was built for newer macOS version" warnings and, worse, symbols the oldest
+    # supported system lacks.
+    export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
+    ;;
+  *)
+    echo "Unsupported platform: $(uname -s) (Linux and macOS only; Windows has build-onnxruntime-static.ps1)" >&2
+    exit 1
+    ;;
+esac
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -70,6 +98,13 @@ else
   echo "[onnxruntime] Using existing checkout: $ONNX_DIR"
 fi
 
+ACTUAL_COMMIT="$(git -C "$ONNX_DIR" rev-parse HEAD)"
+if [ "$ACTUAL_COMMIT" != "$ONNX_COMMIT" ]; then
+  echo "[onnxruntime] ERROR: $ONNX_DIR is at $ACTUAL_COMMIT, expected $ONNX_COMMIT ($ONNX_VERSION)." >&2
+  echo "  A moved tag or a stale checkout: rerun with --clean, or update ONNX_COMMIT on purpose." >&2
+  exit 1
+fi
+
 cd "$ONNX_DIR"
 
 # Build static libraries
@@ -94,14 +129,16 @@ ORT_BUILD_ARGS+=(--compile_no_warning_as_error)
   --parallel "$JOBS" \
   "${ORT_BUILD_ARGS[@]}"
 
-# Ubuntu-specific: re2 is an orphaned CMake target in static-only builds
+# Ubuntu-specific (assumed to apply on macOS too: same CMake graph, nothing there schedules
+# it either; if the target does not exist the build stops here and says so):
+# re2 is an orphaned CMake target in static-only builds
 # (onnxruntime_providers_cpu.cmake only does onnxruntime_add_include_to_target,
 # never target_link_libraries, so nothing in the build graph schedules it).
 # Build it explicitly before the ml crate tries to link against it.
 echo "[onnxruntime] Building re2 explicitly (Ubuntu/glibc requirement)"
-cmake --build build/Linux/Release --target re2 -j"$JOBS"
+cmake --build "build/$PLATFORM_DIR/Release" --target re2 -j"$JOBS"
 
-BUILD_DIR="$ONNX_DIR/build/Linux/Release"
+BUILD_DIR="$ONNX_DIR/build/$PLATFORM_DIR/Release"
 
 # Verify output
 LIB_COUNT=$(find "$BUILD_DIR" -name 'lib*.a' | wc -l)
@@ -109,6 +146,35 @@ if [ "$LIB_COUNT" -eq 0 ]; then
   echo "[onnxruntime] ERROR: No .a files found in $BUILD_DIR" >&2
   echo "  The build may have failed silently. Check build logs above." >&2
   exit 1
+fi
+
+# On macOS the libraries must be for the machine the agent is built on: a stray x86_64 build
+# under Rosetta, or a universal archive, would link or not depending on the Rust target.
+if [ "$(uname -s)" = "Darwin" ]; then
+  HOST_ARCH="$(uname -m)"
+  WRONG=0
+  DESCRIBED=0
+  while IFS= read -r archive; do
+    archs="$(lipo -archs "$archive" 2>/dev/null || true)"
+    # An archive lipo cannot describe (no object files) says nothing about the architecture.
+    [ -n "$archs" ] || continue
+    DESCRIBED=$((DESCRIBED + 1))
+    case " $archs " in
+      *" $HOST_ARCH "*) ;;
+      *)
+        echo "[onnxruntime] ERROR: $archive is built for '${archs:-unknown}', not for this machine ($HOST_ARCH)" >&2
+        WRONG=$((WRONG + 1))
+        ;;
+    esac
+  done < <(find "$BUILD_DIR" -name 'lib*.a')
+  if [ "$DESCRIBED" -eq 0 ]; then
+    echo "[onnxruntime] ERROR: lipo could not describe any of the $LIB_COUNT archives: the architecture check looked at nothing." >&2
+    exit 1
+  fi
+  if [ "$WRONG" -gt 0 ]; then
+    echo "[onnxruntime] $WRONG archive(s) for another architecture; is this shell running under Rosetta?" >&2
+    exit 1
+  fi
 fi
 
 echo "[onnxruntime] Build complete!"
@@ -126,5 +192,10 @@ echo "  3. Build and test the ml crate:"
 echo "       cargo test -p ml --release"
 echo ""
 echo "  4. Verify no runtime onnxruntime dependency:"
-echo "       ldd target/release/deps/ml-* | grep -i onnx"
-echo "     (should return nothing)"
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo "       python3 tools/check-macho-imports.py target/release/deps/ml-*"
+  echo "     (exit 0; otool -L is the same list)"
+else
+  echo "       ldd target/release/deps/ml-* | grep -i onnx"
+  echo "     (should return nothing)"
+fi
