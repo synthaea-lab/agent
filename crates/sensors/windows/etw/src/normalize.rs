@@ -322,6 +322,26 @@ pub fn ntlm_account(user: &str, domain: &str) -> String {
     }
 }
 
+/// The dedup key of an NTLM event (#364): two events with the same key within the
+/// window are one fact. The event id and the status are part of it, so an incoming
+/// failure and the success that follows it (same account, target, address and version)
+/// stay two events: the success is the one the success-after-failure rules need.
+#[must_use]
+pub fn ntlm_dedup_key(
+    direction: schema::NtlmDirection,
+    event_id: u16,
+    user: &str,
+    target: &str,
+    remote_address: Option<std::net::IpAddr>,
+    ntlm_version: &str,
+    status: Option<&str>,
+) -> String {
+    format!(
+        "{direction:?}|{event_id}|{user}|{target}|{remote_address:?}|{ntlm_version}|{}",
+        status.unwrap_or("")
+    )
+}
+
 /// LDAP-Client's `AttributeList` (EID 30, #364) split into attribute names.
 /// The provider joins the names with `;` (lab 2026-10-02, code points of
 /// `cn;ms-Mcs-AdmPwd`); a whitespace-only split had glued them together and
@@ -856,5 +876,44 @@ mod tests {
             text.contains("a (") && text.contains("c (") && !text.contains("d ("),
             "{text}"
         );
+    }
+
+    #[test]
+    fn an_incoming_failure_and_the_success_after_it_have_different_ntlm_keys() {
+        let ip = Some("203.0.113.7".parse().unwrap());
+        let key = |eid, status| {
+            ntlm_dedup_key(
+                schema::NtlmDirection::Incoming,
+                eid,
+                r"LABlice",
+                "DC1",
+                ip,
+                "NTLMv2",
+                status,
+            )
+        };
+        let failure = key(4022, Some("0xc000006d"));
+        let success = key(4022, Some("0x00000000"));
+        assert_ne!(failure, success);
+        assert_eq!(
+            failure,
+            key(4022, Some("0xc000006d")),
+            "a real duplicate still collapses"
+        );
+        assert_ne!(
+            key(4022, None),
+            key(4023, None),
+            "the event id is part of the key"
+        );
+
+        // Through the dedup itself: the failure and the success within one window are
+        // both reported (the #744 review case), a repeat of the failure is not.
+        let mut dedup = crate::budget::KeyDedup::new(60_000_000_000);
+        assert!(dedup.first(&failure, 1_000));
+        assert!(
+            dedup.first(&success, 2_000),
+            "the success must not be swallowed"
+        );
+        assert!(!dedup.first(&failure, 3_000));
     }
 }

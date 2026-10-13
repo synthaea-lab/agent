@@ -729,7 +729,27 @@ pub(crate) fn ntlm_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         let remote_address = text(ip_field).trim().parse::<std::net::IpAddr>().ok();
         let ntlm_version = text("NtlmVersion");
         let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
-        let key = format!("{direction:?}|{user}|{target}|{remote_address:?}|{ntlm_version}");
+        let status = match direction {
+            NtlmDirection::Incoming => parser
+                .try_parse::<u32>("Status")
+                .map(|s| format!("{s:#010x}"))
+                .ok()
+                .or_else(|| Some(text("Status")).filter(|s| s.starts_with("0x"))),
+            NtlmDirection::Outgoing => None,
+        };
+        // The status and the event id are part of the key: an incoming failure and the
+        // success that follows it within the window (same account, address, target and
+        // version) are two different facts, and the success is the one the rules need
+        // (#744 review: without them the success was swallowed as a duplicate).
+        let key = normalize::ntlm_dedup_key(
+            direction,
+            record.event_id(),
+            &user,
+            &target,
+            remote_address,
+            &ntlm_version,
+            status.as_deref(),
+        );
         if !state.ntlm.lock().unwrap().first(&key, timestamp_ns) {
             return;
         }
@@ -748,14 +768,6 @@ pub(crate) fn ntlm_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
             .ok()
             .or_else(|| normalize::parse_ntlm_pid(&text("ProcessPID")))
             .unwrap_or_else(|| record.process_id());
-        let status = match direction {
-            NtlmDirection::Incoming => parser
-                .try_parse::<u32>("Status")
-                .map(|s| format!("{s:#010x}"))
-                .ok()
-                .or_else(|| Some(text("Status")).filter(|s| s.starts_with("0x"))),
-            NtlmDirection::Outgoing => None,
-        };
         let comm = state.comm_for(pid).unwrap_or_else(|| text("ProcessName"));
         sink.on_event(Event::NtlmAuth(NtlmAuthEvent {
             meta: meta(pid, 0, comm, timestamp_ns),
