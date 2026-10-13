@@ -25,7 +25,7 @@ pub const RAW_TRACEPOINTS: &[(&str, &str)] = &[
 ];
 
 /// `sensor_linux_wire::LineageEntry` is `repr(C)` over two `u32`, a `[u8; 16]` and a `u64`,
-/// laid out with no implicit padding (`reserved` is explicit) — every bit pattern is
+/// laid out with no implicit padding (`execd` is explicit) — every bit pattern is
 /// valid, so it is plain-old-data. A transparent newtype carries the
 /// `aya::Pod` impl (the orphan rule forbids implementing it on the wire type directly).
 #[repr(transparent)]
@@ -308,7 +308,8 @@ pub(crate) fn prime_proc_lineage(ebpf: &mut aya::Ebpf) -> Result<u32, SensorErro
         let mut val = sensor_linux_wire::LineageEntry {
             ppid: *ppid,
             comm: [0u8; sensor_linux_wire::TASK_COMM_LEN],
-            reserved: 0,
+            // Predates the agent: nothing says it never exec'd (see `LineageEntry::execd`).
+            execd: 1,
             generation: *generation,
             parent_generation: generation_of.get(ppid).copied().unwrap_or(0),
         };
