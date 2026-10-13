@@ -38,6 +38,13 @@ mod heartbeat;
 // cross-platform body here to keep alive with an `allow(dead_code)`.
 #[cfg(target_os = "linux")]
 mod integrity;
+// Linux-only: `dpkg` has no Windows/macOS equivalent to fall back to (unlike
+// `heartbeat`/`protected`, which compile everywhere and are just unwired
+// elsewhere) — there is nothing this module could do on another platform, so
+// it is gated out rather than kept as dead weight that always takes the
+// "file not found" skip path.
+#[cfg(target_os = "linux")]
+mod inventory;
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos", windows)),
     allow(dead_code)
@@ -67,6 +74,7 @@ mod sink;
     not(any(target_os = "linux", target_os = "macos", windows)),
     allow(dead_code)
 )]
+mod trust;
 mod upload;
 
 use clap::{Parser, Subcommand};
@@ -249,6 +257,12 @@ enum Command {
         /// resolve under `storage.state_dir` or this agent refuses to run.
         #[arg(long)]
         state: Option<std::path::PathBuf>,
+        /// Acknowledge that this build verifies content against the public test key,
+        /// so anyone who can serve the content routes can weaken detection (ADR-0027).
+        /// Exists only in a `test-key` build, for lab and development use.
+        #[cfg(feature = "test-key")]
+        #[arg(long)]
+        allow_test_key: bool,
     },
     /// Fetches the signed binary release the server offers, verifies it, stages it
     /// under `<state_dir>/versions/vN`, repoints `current` at it, and restarts the
@@ -276,8 +290,9 @@ enum Command {
         no_restart: bool,
         /// Acknowledge that this build verifies releases against the public test
         /// key, so anyone who can serve the release routes can get code run as
-        /// root (ADR-0015 Deferred). Required until a production key is embedded;
-        /// for lab and development use only.
+        /// root (ADR-0015 Deferred). Exists only in a `test-key` build; for lab and
+        /// development use only.
+        #[cfg(feature = "test-key")]
         #[arg(long)]
         allow_test_key: bool,
     },
@@ -327,6 +342,14 @@ fn try_main() -> anyhow::Result<std::process::ExitCode> {
     // returns a `ConfigError` whose Display already lists the paths it
     // tried, so `anyhow` propagates a copy-pasteable error message.
     let cfg = config::load(cli.config.as_deref())?;
+    // Same discovery order `load` just used, re-derived rather than returned by it
+    // (a pure, side-effect-free recomputation — `config::discover`'s own doc) so
+    // `protected::protected_paths` (#71) watches the exact file that was actually
+    // read, not a guessed default that could disagree with `--config`/`SYNTHAEA_CONFIG`.
+    // `protected_paths` makes it (and `--alerts`/`--events`) absolute itself —
+    // see that function's doc for why a relative path here would otherwise end up
+    // silently unwatched.
+    let config_path = config::discover(cli.config.as_deref())?.path;
 
     // Init the logger with the level from the config file. `cfg.log.level` is
     // validated at load-time to be one of trace/debug/info/warn/error.
@@ -383,6 +406,7 @@ fn try_main() -> anyhow::Result<std::process::ExitCode> {
                 log_sources: &cfg.logs.sources,
                 deception: &cfg.deception,
                 content_dir: &content_dir,
+                config_path: &config_path,
             })
         }
         Command::CaptureBaseline { output } => commands::cmd_capture_baseline(&output),
@@ -410,7 +434,13 @@ fn try_main() -> anyhow::Result<std::process::ExitCode> {
             ca_cert,
             content_dir,
             state,
+            #[cfg(feature = "test-key")]
+            allow_test_key,
         } => {
+            #[cfg(not(feature = "test-key"))]
+            let allow_test_key = false;
+            // Before any path, config or network work, as for `apply-release`.
+            trust::ensure_content_key_trusted(allow_test_key)?;
             let (content_dir, state) =
                 content::resolve_content_paths(&cfg.storage.state_dir, content_dir, state)?;
             let ring = content::resolve_ring(ring, &cfg.updates)?;
@@ -447,6 +477,7 @@ fn try_main() -> anyhow::Result<std::process::ExitCode> {
             key,
             ca_cert,
             no_restart,
+            #[cfg(feature = "test-key")]
             allow_test_key,
         } => release::cmd_apply_release(
             &server,
@@ -455,7 +486,13 @@ fn try_main() -> anyhow::Result<std::process::ExitCode> {
             content::resolve_ca_cert(ca_cert, &cfg.server).as_deref(),
             &cfg.storage.state_dir,
             !no_restart,
-            allow_test_key,
+            {
+                #[cfg(feature = "test-key")]
+                let acknowledged = allow_test_key;
+                #[cfg(not(feature = "test-key"))]
+                let acknowledged = false;
+                acknowledged
+            },
         ),
     };
     result?;

@@ -16,7 +16,10 @@ echo "Version: $VERSION"
 
 # Build binaries
 echo "Building release binaries..."
-cargo build --release --workspace --bins --exclude sensor-linux-ebpf
+cargo build --release --bins -p agent -p watchdog -p cli --no-default-features --features agent/dynamic-onnx
+
+# The shipped artifacts: no public test signing key (ADR-0027).
+tools/assert-no-test-key.sh target/release/agent target/release/watchdog target/release/cli
 
 # Create source tarball
 echo "Creating source tarball..."

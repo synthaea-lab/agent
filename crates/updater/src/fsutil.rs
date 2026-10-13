@@ -36,7 +36,7 @@ pub fn reject_symlink_components(root: &Path, dest: &Path) -> std::io::Result<()
             && meta.file_type().is_symlink()
         {
             return Err(std::io::Error::other(format!(
-                "refusing to write: {} is a symlink",
+                "refusing to follow: {} is a symlink",
                 probe.display()
             )));
         }
@@ -135,6 +135,26 @@ fn write_with_mode(
     written
 }
 
+/// Deletes the file `dest` under `root`, refusing if `dest` or any existing component under
+/// `root` is a symlink ([`reject_symlink_components`]): a link planted in the content tree
+/// must not redirect a delete that runs with the agent's rights outside it. Returns whether
+/// a file was removed; one that is already gone is `Ok(false)`, so a retry after a crash
+/// between the delete and the bookkeeping is not an error. `dest` must be `root` or a
+/// descendant of it.
+///
+/// # Errors
+///
+/// Returns an error if a component under `root` is a symlink, or if the delete fails for any
+/// reason other than the file being absent (a directory at `dest`, a permission error).
+pub fn remove_file_under(root: &Path, dest: &Path) -> std::io::Result<bool> {
+    reject_symlink_components(root, dest)?;
+    match std::fs::remove_file(dest) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Unpredictable-enough temp-file suffix: PID, wall-clock nanoseconds and a
 /// process-wide counter. Uniqueness is not what protects against planted
 /// links (`create_new` is); it only keeps an attacker from pre-creating the
@@ -161,6 +181,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn remove_file_under_deletes_the_file_and_tolerates_one_already_gone() {
+        let dir = tmp("remove-happy-path");
+        let dest = dir.join("rules").join("old.sigma");
+        write_atomically(&dir, &dest, b"x").unwrap();
+        assert!(remove_file_under(&dir, &dest).unwrap());
+        assert!(!dest.exists());
+        assert!(
+            !remove_file_under(&dir, &dest).unwrap(),
+            "a file already gone is not an error"
+        );
+    }
+
+    #[test]
+    fn remove_file_under_does_not_remove_a_directory() {
+        let dir = tmp("remove-directory");
+        std::fs::create_dir_all(dir.join("rules")).unwrap();
+        assert!(remove_file_under(&dir, &dir.join("rules")).is_err());
+        assert!(dir.join("rules").is_dir());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remove_file_under_refuses_a_path_through_a_directory_junction() {
+        let dir = tmp("remove-junction");
+        let outside = tmp("remove-junction-outside");
+        std::fs::write(outside.join("victim.sigma"), b"keep me").unwrap();
+        let root = dir.join("content");
+        std::fs::create_dir_all(&root).unwrap();
+        // Junctions need no privilege, unlike file symlinks.
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(root.join("rules"))
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "mklink /J failed");
+
+        let err = remove_file_under(&root, &root.join("rules").join("victim.sigma"))
+            .expect_err("a delete through a junction must be refused");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(outside.join("victim.sigma").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_file_under_refuses_a_path_through_a_symlink_and_leaves_the_target() {
+        let dir = tmp("remove-symlink");
+        let outside = tmp("remove-symlink-outside");
+        std::fs::write(outside.join("victim.sigma"), b"keep me").unwrap();
+        let root = dir.join("content");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("rules")).unwrap();
+
+        let err = remove_file_under(&root, &root.join("rules").join("victim.sigma"))
+            .expect_err("a delete through a planted symlink must be refused");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(outside.join("victim.sigma").exists());
+
+        // The leaf itself being the link: refused too, and the link's target is untouched.
+        std::os::unix::fs::symlink(outside.join("victim.sigma"), root.join("leaf.sigma")).unwrap();
+        assert!(remove_file_under(&root, &root.join("leaf.sigma")).is_err());
+        assert!(outside.join("victim.sigma").exists());
     }
 
     #[test]

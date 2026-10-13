@@ -1,0 +1,4 @@
+# The content public key, 64 hex characters (Ed25519), included at compile time (ADR-0027).
+# Not provisioned yet (#753): until the real key is committed here, a build without the
+# `test-key` feature embeds no content key and verifies nothing signed for it.
+unprovisioned

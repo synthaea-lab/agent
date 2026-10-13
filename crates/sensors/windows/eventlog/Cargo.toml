@@ -20,12 +20,17 @@ tracing = { workspace = true }
 # `Win32_Foundation` gives us `ERROR_SUCCESS` / `GetLastError`; the
 # `Win32_System_EventLog` feature is what actually pulls in `EvtSubscribe`,
 # `EvtRender`, `EvtClose`, the `EVT_HANDLE` type, and the notify-action enum.
+# `Win32_Security` is what windows-sys gates `EVT_VARIANT` and
+# `EvtGetChannelConfigProperty` behind (the channel `Enabled` check, #786).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_System_EventLog",
 ] }
 
 [dev-dependencies]
 tempfile = "3"
 tracing-subscriber = { workspace = true }
+proptest = "1"
+time = "0.3"

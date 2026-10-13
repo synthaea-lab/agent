@@ -131,6 +131,48 @@ pub(crate) fn parse_stat_ppid_comm(stat: &str) -> Option<(u32, &str)> {
     Some((ppid, comm))
 }
 
+/// The generation stamp of a process that predates the agent: its `starttime`, tagged so
+/// it can never equal a live `bpf_ktime_get_ns()` stamp (issue #519). `0` ("no stamp")
+/// when `starttime` is unreadable: better unknown than wrong. One definition for the
+/// `PROC_LINEAGE` priming and the parent-image priming, which must agree.
+pub(crate) fn primed_generation(stat: &str) -> u64 {
+    parse_stat_starttime(stat).map_or(0, |ticks| ticks | sensor_linux_wire::PRIMED_GENERATION_BIT)
+}
+
+/// Every running process's `(pid, primed generation, executable path)`, read from
+/// `/proc`, for seeding the parent-image cache (#768). Best effort: a process that
+/// vanishes mid-scan, a kernel thread (no `exe`) or an unreadable link is skipped, and
+/// so is one whose stamp is unknown. Stops after `limit` entries.
+pub(crate) fn read_proc_images(limit: usize) -> Vec<(u32, u64, String)> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut images = Vec::new();
+    for entry in entries.flatten() {
+        if images.len() >= limit {
+            break;
+        }
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(exe) = std::fs::read_link(entry.path().join("exe")) else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let generation = primed_generation(&stat);
+        if generation != 0 {
+            images.push((pid, generation, exe.to_string_lossy().into_owned()));
+        }
+    }
+    images
+}
+
 /// `starttime` (field 22 of `/proc/<pid>/stat`: clock ticks since boot at which the
 /// process started), the identity stamp for a process that predates the agent
 /// (issue #519). Fields after the closing `)` are counted from the state (field 3):
@@ -148,7 +190,7 @@ pub(crate) fn parse_stat_starttime(stat: &str) -> Option<u64> {
 mod tests {
     use super::{
         is_proc_exit_race, parse_proc_cmdline, parse_proc_environ_security, parse_stat_ppid_comm,
-        parse_stat_starttime,
+        parse_stat_starttime, primed_generation, read_proc_images,
     };
 
     #[test]
@@ -295,6 +337,35 @@ mod tests {
         assert_eq!(
             parse_proc_environ_security(blob),
             [("LD_AUDIT".to_string(), "/tmp/b.so".to_string())]
+        );
+    }
+
+    #[test]
+    fn the_running_test_process_is_among_the_primed_images_with_a_primed_stamp() {
+        let images = read_proc_images(usize::MAX);
+        let (_, generation, image) = images
+            .iter()
+            .find(|(pid, _, _)| *pid == std::process::id())
+            .expect("this process is listed");
+        assert_ne!(generation & sensor_linux_wire::PRIMED_GENERATION_BIT, 0);
+        assert_eq!(
+            std::path::Path::new(image),
+            std::env::current_exe().unwrap().as_path()
+        );
+    }
+
+    #[test]
+    fn priming_images_stops_at_its_limit() {
+        assert!(read_proc_images(1).len() <= 1);
+    }
+
+    #[test]
+    fn a_primed_stamp_needs_a_readable_starttime() {
+        assert_eq!(primed_generation("1 (x) S 0 1 1"), 0);
+        let stat = "42 (bash) S 1 42 42 0 -1 4194560 100 0 0 0 1 1 0 0 20 0 1 0 98765 1 1 0";
+        assert_eq!(
+            primed_generation(stat),
+            98765 | sensor_linux_wire::PRIMED_GENERATION_BIT
         );
     }
 }
