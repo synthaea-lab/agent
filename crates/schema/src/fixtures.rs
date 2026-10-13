@@ -35,6 +35,7 @@ use crate::{
     FileWriteEvent, HttpRequestEvent, HttpSignature, HttpSummaryEvent, IdentityChangeEvent,
     IdentityChangeKind, ImageLoadEvent, KernelModuleAction, KernelModuleEvent, LdapSearchEvent,
     ListenPortEvent, MemfdCreateEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent,
+    PackageChangeEvent, PackageChangeKind,
     PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent,
     RegistrySetEvent, ScriptBlockEvent, SessionEvent, SessionState, ShellType, SmbConnectEvent,
     SocketAcceptEvent, SocketBindEvent, SocketCreateEvent, SocketListenEvent, TlsCaptureEvent,
@@ -445,6 +446,19 @@ pub fn socket_accept() -> SocketAcceptEvent {
         accepted_fd: 0,
         peer_addr: TEST_ADDR,
         peer_port: 0,
+    }
+}
+
+/// Neutral [`PackageChangeEvent`] (an upgrade; override `change`/`previous_version`/
+/// `version` via struct-update syntax for `Added`/`Removed`).
+#[must_use]
+pub fn package_change() -> PackageChangeEvent {
+    PackageChangeEvent {
+        meta: meta(),
+        package: "openssl".into(),
+        change: PackageChangeKind::Upgraded,
+        previous_version: Some("3.0.13-1".into()),
+        version: Some("3.0.15-1".into()),
     }
 }
 

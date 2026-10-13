@@ -249,10 +249,10 @@ changes that can break the link, not on every PR.
 - ✅ Windows 11 (MSVC, CPU only) - `cargo test -p ml` passes, no `onnxruntime.dll`, no
   `directml.dll`, no `d3d12.dll` (see above)
 
-**TODO:**
-- ⏳ macOS (similar `.a` workflow, but untested)
-
-macOS is an ADR-0002 target platform that has not been attempted yet.
+- ✅ macOS on Apple Silicon and Intel (hosted runners `macos-15` and `macos-15-intel`, 2026-10-12, issue #338): onnxruntime from
+  source in 20 minutes, `cargo test -p ml` and the agent linked statically, no
+  `libonnxruntime.dylib` (`tools/check-macho-imports.py`, same list as `otool -L`); see
+  `onnxruntime-static-build-macos.md`.
 
 ## References
 

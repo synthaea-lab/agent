@@ -225,6 +225,8 @@ pub struct Canary {
     pub kind: Kind,
     /// Its inert, machine-generated content.
     pub content: String,
+    /// Seed-derived value used to choose a plausible modification time at planting.
+    pub mtime_seed: u64,
 }
 
 /// The header every canary starts with, so an operator who opens one knows what it is.
@@ -238,6 +240,7 @@ pub fn plan(seed: &Seed, placements: &[Placement]) -> Vec<Canary> {
     for (p, placement) in placements.iter().enumerate() {
         for (k, kind) in placement.kinds.iter().enumerate() {
             let index = p * Kind::ALL.len() + k;
+            let mtime = seed.derive("mtime", index);
             let path = placement
                 .dir
                 .join(canary_name(*kind, &seed.derive("name", index)));
@@ -245,6 +248,9 @@ pub fn plan(seed: &Seed, placements: &[Placement]) -> Vec<Canary> {
                 path,
                 kind: *kind,
                 content: content(seed, index, *kind),
+                mtime_seed: u64::from_le_bytes([
+                    mtime[0], mtime[1], mtime[2], mtime[3], mtime[4], mtime[5], mtime[6], mtime[7],
+                ]),
             });
         }
     }
@@ -331,7 +337,10 @@ mod tests {
     #[test]
     fn the_same_seed_gives_the_same_plan() {
         let seed = Seed::from_bytes([7; 32]);
-        assert_eq!(plan(&seed, &placements()), plan(&seed, &placements()));
+        let first = plan(&seed, &placements());
+        let second = plan(&seed, &placements());
+        assert_eq!(first, second);
+        assert_ne!(first[0].mtime_seed, first[1].mtime_seed);
     }
 
     #[test]
@@ -548,6 +557,7 @@ mod tests {
             content: "syn_dk_short syn_dk_ZZZZ0123456789abcdef0123456789ab \
                       syn_dk_0123456789abcdef0123456789abcdef x"
                 .into(),
+            mtime_seed: 0,
         };
         assert_eq!(
             decoy_tokens(&[canary]),

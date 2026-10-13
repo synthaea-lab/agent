@@ -38,6 +38,13 @@ mod heartbeat;
 // cross-platform body here to keep alive with an `allow(dead_code)`.
 #[cfg(target_os = "linux")]
 mod integrity;
+// Linux-only: `dpkg` has no Windows/macOS equivalent to fall back to (unlike
+// `heartbeat`/`protected`, which compile everywhere and are just unwired
+// elsewhere) — there is nothing this module could do on another platform, so
+// it is gated out rather than kept as dead weight that always takes the
+// "file not found" skip path.
+#[cfg(target_os = "linux")]
+mod inventory;
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos", windows)),
     allow(dead_code)
@@ -335,6 +342,14 @@ fn try_main() -> anyhow::Result<std::process::ExitCode> {
     // returns a `ConfigError` whose Display already lists the paths it
     // tried, so `anyhow` propagates a copy-pasteable error message.
     let cfg = config::load(cli.config.as_deref())?;
+    // Same discovery order `load` just used, re-derived rather than returned by it
+    // (a pure, side-effect-free recomputation — `config::discover`'s own doc) so
+    // `protected::protected_paths` (#71) watches the exact file that was actually
+    // read, not a guessed default that could disagree with `--config`/`SYNTHAEA_CONFIG`.
+    // `protected_paths` makes it (and `--alerts`/`--events`) absolute itself —
+    // see that function's doc for why a relative path here would otherwise end up
+    // silently unwatched.
+    let config_path = config::discover(cli.config.as_deref())?.path;
 
     // Init the logger with the level from the config file. `cfg.log.level` is
     // validated at load-time to be one of trace/debug/info/warn/error.
@@ -391,6 +406,7 @@ fn try_main() -> anyhow::Result<std::process::ExitCode> {
                 log_sources: &cfg.logs.sources,
                 deception: &cfg.deception,
                 content_dir: &content_dir,
+                config_path: &config_path,
             })
         }
         Command::CaptureBaseline { output } => commands::cmd_capture_baseline(&output),

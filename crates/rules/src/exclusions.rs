@@ -61,9 +61,15 @@ pub(crate) const MEMFD_EXEC_WINDOW_NS: u64 = 5_000_000_000; // 5s
 /// xattr, Windows `Zone.Identifier`) and an exec of the marked file that still
 /// counts as "downloaded, then run" (T1204.002, #365). Wider than
 /// [`DOWNLOAD_EXEC_WINDOW_NS`]: a user opens a download minutes later, not
-/// within a script's seconds. Uncalibrated first cut (2026-09-23) — every
-/// legitimate installer run inside the window alerts too; revisit against
-/// fleet volume.
+/// within a script's seconds.
+///
+/// Justified, not calibrated (#441): there is no fleet telemetry to calibrate
+/// against yet. The window bounds how long a mark stays fresh, not the noise:
+/// the installer noise it used to let through is now removed by the signature
+/// gate on Windows (a chain-verified image does not alert), so widening it
+/// would mostly add unsigned tools run long after download, and narrowing it
+/// would lose the user who reads the mail, then runs the attachment. Ten
+/// minutes stays; macOS, without the gate, keeps the noise.
 pub(crate) const QUARANTINE_EXEC_WINDOW_NS: u64 = 600_000_000_000; // 10 min
 
 /// Window between a BITS job adding or completing a file and an exec of that
@@ -113,6 +119,15 @@ pub(crate) const SELF_SPAWN_SCRIPT_HOSTS: &[&str] = &[
 pub(crate) const AUTH_FAILURE_THRESHOLD: u32 = 5;
 /// Sliding window for [`AUTH_FAILURE_THRESHOLD`].
 pub(crate) const AUTH_FAILURE_WINDOW_NS: u64 = 60_000_000_000; // 60s
+/// T1021.001 — successful RDP authentication from a source after this many
+/// authentication failures from the same source, across all accounts.
+/// Five failures catches a credential guess/spray that eventually succeeds
+/// while tolerating ordinary one-off authentication errors.
+pub(crate) const RDP_SUCCESS_AFTER_FAILURES_THRESHOLD: u32 = 5;
+/// Sliding look-back window for [`RDP_SUCCESS_AFTER_FAILURES_THRESHOLD`]. A
+/// five-minute interval includes slower interactive guessing while limiting
+/// stale failures that are no longer meaningful evidence for a later success.
+pub(crate) const RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS: u64 = 300_000_000_000; // 300s
 pub(crate) const BEACON_THRESHOLD: u32 = 3;
 pub(crate) const BEACON_WINDOW_NS: u64 = 60_000_000_000; // 60s
 
