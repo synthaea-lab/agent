@@ -942,7 +942,6 @@ impl RuleState {
         let mut alerts = Vec::new();
         alerts.extend(self.check_web_server_spawns_shell(event));
         alerts.extend(self.check_download_then_exec(event));
-        alerts.extend(self.check_quarantined_exec(event));
         alerts.extend(self.check_bits_download_exec(event));
         alerts.extend(self.check_exec_after_motw_removal(event));
         alerts.extend(self.check_self_spawn(event));

@@ -35,11 +35,11 @@ use crate::{
     FileWriteEvent, HttpRequestEvent, HttpSignature, HttpSummaryEvent, IdentityChangeEvent,
     IdentityChangeKind, ImageLoadEvent, KernelModuleAction, KernelModuleEvent, LdapSearchEvent,
     ListenPortEvent, MemfdCreateEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent,
-    PackageChangeEvent, PackageChangeKind,
-    PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent,
-    RegistrySetEvent, ScriptBlockEvent, SessionEvent, SessionState, ShellType, SmbConnectEvent,
-    SocketAcceptEvent, SocketBindEvent, SocketCreateEvent, SocketListenEvent, TlsCaptureEvent,
-    TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
+    PackageChangeEvent, PackageChangeKind, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent,
+    PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent,
+    SessionState, ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
+    SocketCreateEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
+    UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
