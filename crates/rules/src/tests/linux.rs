@@ -1092,6 +1092,34 @@ fn the_same_denial_shape_repeated_does_not_realert() {
 }
 
 #[test]
+fn denials_differing_only_in_the_mcs_category_pair_are_the_same_shape() {
+    // Container runtimes give each container its own MCS category pair
+    // (rootless podman per `run`): two denials from the same domain/object/class
+    // but a different category pair must not look like two different shapes, or
+    // every fresh container re-alerts the same finding (#781 review).
+    let mut state = RuleState::new();
+    let first = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        Some("system_u:system_r:container_t:s0:c100,c200"),
+        Some("system_u:object_r:shadow_t:s0:c100,c200"),
+        Some("file"),
+        true,
+    ));
+    let second = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        Some("system_u:system_r:container_t:s0:c300,c400"),
+        Some("system_u:object_r:shadow_t:s0:c300,c400"),
+        Some("file"),
+        true,
+    ));
+    assert_eq!(first.len(), 1);
+    assert!(
+        second.is_empty(),
+        "same user:role:type, different category pair: not a new shape"
+    );
+}
+
+#[test]
 fn a_different_object_class_on_the_same_subject_object_pair_is_a_new_shape() {
     // Same subject/object contexts, different tclass (file vs. process) — a
     // genuinely different kind of denial, not a repeat of the first.

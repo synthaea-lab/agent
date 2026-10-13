@@ -117,6 +117,11 @@ impl PidFact {
 /// - T1059 (suspicious process lineage): a shell interpreter executed directly by a
 ///   web server process — classic indicator of a web shell / RCE.
 ///
+/// `known_policy_denials`' key: (mechanism, subject context, object context, object
+/// class). Named so clippy's `type_complexity` lint doesn't flag the field
+/// declaration.
+type PolicyDenialKey = (String, Option<String>, Option<String>, Option<String>);
+
 pub struct RuleState {
     /// pid → comm of the last exec seen for this pid, to recover the parent's comm
     /// (T1059) with a simple `ppid` lookup without having to walk the process tree in
@@ -291,10 +296,6 @@ const MEMFD_CREATES_PER_PID: usize = 8;
 const PID_COMM_CAP: usize = 65_536;
 /// Counter/write-history bounds — one logical entity per key, far fewer than pids.
 const COUNTER_CAP: usize = 16_384;
-/// `known_policy_denials`' key: (mechanism, subject context, object context,
-/// object class). Named so clippy's `type_complexity` lint doesn't flag the
-/// field declaration.
-type PolicyDenialKey = (String, Option<String>, Option<String>, Option<String>);
 const RECENT_WRITES_CAP: usize = 4_096;
 
 impl Default for RuleState {
@@ -992,14 +993,18 @@ impl RuleState {
     /// `SELinux` only for now — see `known_policy_denials`'s doc for why an
     /// AppLocker/WDAC `PolicyDenialEvent` would collapse to a far coarser
     /// shape with this same key.
+    ///
+    /// Inert while the eBPF sensor is selected (#780): `SELinux` AVC denials
+    /// only reach the agent through the audit sensor, so silence here does not
+    /// mean no denials happened.
     fn check_policy_denial_drift(&mut self, event: &PolicyDenialEvent) -> Option<Alert> {
         if event.mechanism != POLICY_MECHANISM_SELINUX {
             return None;
         }
         let key: PolicyDenialKey = (
             event.mechanism.clone(),
-            event.subject_context.clone(),
-            event.object_context.clone(),
+            Self::selinux_type_triple(event.subject_context.as_deref()),
+            Self::selinux_type_triple(event.object_context.as_deref()),
             event.object_class.clone(),
         );
         if self.known_policy_denials.get(&key).is_some() {
@@ -1010,16 +1015,28 @@ impl RuleState {
             technique: "T1562",
             severity: Severity::Medium,
             message: format!(
-                "pid={} comm={} mechanism={} subject={} object={} class={} enforced={} — new denial shape, not seen this run",
-                event.meta.pid,
+                "comm={} mechanism={} subject={} object={} class={} path={} enforced={} — new denial shape, not seen this run",
                 event.meta.comm,
                 event.mechanism,
                 event.subject_context.as_deref().unwrap_or("-"),
                 event.object_context.as_deref().unwrap_or("-"),
                 event.object_class.as_deref().unwrap_or("-"),
+                event.object_path.as_deref().unwrap_or("-"),
                 event.enforced,
             ),
         })
+    }
+
+    /// The `user:role:type` prefix of a `SELinux` security context
+    /// (`user:role:type:sensitivity[:categories]`), dropped from
+    /// [`PolicyDenialKey`] so a container's own MCS/MLS category pair does not
+    /// make every denial from it a "new" shape (#781 review: two denials
+    /// differing only in category gave two alerts). A bounded split, not a
+    /// split on the last colon: the MLS field itself can contain one
+    /// (`s0-s0:c0.c1023`). A bare type with no context at all (`httpd_t`)
+    /// passes through unchanged.
+    fn selinux_type_triple(context: Option<&str>) -> Option<String> {
+        context.map(|c| c.splitn(4, ':').take(3).collect::<Vec<_>>().join(":"))
     }
 
     /// To be called for every `PolicyDenialEvent` in the stream (`SELinux` AVC

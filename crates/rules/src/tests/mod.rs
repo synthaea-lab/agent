@@ -300,9 +300,8 @@ fn policy_denial_event_full(
         subject_context: subject_context.map(str::to_string),
         object_context: object_context.map(str::to_string),
         object_class: object_class.map(str::to_string),
-        action: None,
         enforced,
-        object_path: None,
+        ..schema::fixtures::policy_denial()
     }
 }
 
