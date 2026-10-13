@@ -88,6 +88,19 @@ impl Enricher {
     /// metadata stat; a changed or unknown file is one bounded hash + one signature
     /// verification.
     pub fn enrich(&mut self, path: &Path) -> FileEnrichment {
+        self.enrich_with(path, true)
+    }
+
+    /// [`Self::enrich`] without trusting a cache hit: always hashes and verifies,
+    /// then refreshes the entry. For a caller whose decision rests on the verdict
+    /// (#441: a `Valid` signature silences T1204.002). On Windows the cache key has
+    /// no file identity, so a same-size replacement with its mtime restored would
+    /// hit an entry describing the file it replaced.
+    pub fn enrich_uncached(&mut self, path: &Path) -> FileEnrichment {
+        self.enrich_with(path, false)
+    }
+
+    fn enrich_with(&mut self, path: &Path, trust_cache: bool) -> FileEnrichment {
         let Ok(meta) = std::fs::metadata(path) else {
             return FileEnrichment {
                 sha256: None,
@@ -112,7 +125,8 @@ impl Enricher {
         let size = meta.len();
 
         let id = file_id(&meta);
-        if let Some(entry) = self.cache.get(&path.to_path_buf())
+        if trust_cache
+            && let Some(entry) = self.cache.get(&path.to_path_buf())
             && entry.mtime_ns == mtime_ns
             && entry.size == size
             && entry.file_id == id
@@ -197,6 +211,28 @@ mod tests {
         std::fs::write(&p, b"two").unwrap();
         let second = e.enrich(&p).sha256;
         assert_ne!(first, second, "changed content must re-hash");
+    }
+
+    #[test]
+    fn enrich_uncached_sees_a_same_size_rewrite_with_its_mtime_restored() {
+        let p = tmp_file("respoof", b"one");
+        let mut e = Enricher::new();
+        let first = e.enrich(&p).sha256;
+        let mtime = std::fs::metadata(&p).unwrap().modified().unwrap();
+        std::fs::write(&p, b"two").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        // The attack the cached path cannot see: same path, size and mtime, and
+        // on Unix the same inode (rewritten in place).
+        assert_eq!(e.enrich(&p).sha256, first, "the cached path is fooled");
+        let fresh = e.enrich_uncached(&p).sha256;
+        assert_ne!(fresh, first, "an uncached enrichment must re-hash");
+        assert_eq!(e.enrich(&p).sha256, fresh, "and refresh the cache entry");
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]

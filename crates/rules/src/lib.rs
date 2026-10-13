@@ -17,6 +17,7 @@ mod ld_trust;
 mod ldap;
 mod rdp;
 mod session;
+mod signature_gate;
 mod sliding;
 mod state;
 mod stateless;
@@ -29,6 +30,7 @@ pub use defender::evaluate_defender_event;
 // `RuleState::on_ldap_search`.
 pub use ldap::evaluate_ldap_search;
 use schema::detection::Severity;
+pub use signature_gate::{ImageSignature, SignatureGatedAlert};
 pub use state::RuleState;
 #[cfg(test)]
 pub(crate) use stateless::{
