@@ -518,6 +518,118 @@ fn field_names_and_modifiers_that_differ_only_by_case_are_refused() {
         let rule = parse_rule_yaml(&rule_with_detection(body)).expect("two different keys parse");
         let error = validate(&rule, "<test>/linux/rule.yml").expect_err("must be refused");
         assert!(error.to_string().to_lowercase().contains("case"), "{error}");
+        for spec in body
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("Image") || line.starts_with("image"))
+        {
+            let spec = spec.split(':').next().unwrap();
+            assert!(
+                error.to_string().contains(spec),
+                "{error} should name `{spec}`"
+            );
+        }
+    }
+}
+
+fn field_rule(field: &str, values_yaml: &str) -> SigmaRule {
+    let yaml = format!(
+        "title: Modifier test\ntags: [attack.t1059]\nlevel: medium\nfalsepositives: [none]\ndetection:\n  selection:\n    {field}: {values_yaml}\n  condition: selection\n"
+    );
+    let rule: SigmaRule = parse_rule_yaml(&yaml).unwrap();
+    validate(&rule, "<test>/linux/rule.yml").unwrap();
+    rule
+}
+
+#[test]
+fn all_requires_every_value_for_each_matching_modifier_case_insensitively() {
+    let cases = [
+        ("contains", "WIN CMD", "win", "cmd"),
+        ("startswith", "C:\\Windows\\cmd.exe", "c:", "C:\\Windows"),
+        ("endswith", "C:\\Windows\\cmd.exe", "CMD.EXE", ".exe"),
+    ];
+    for (modifier, haystack, first, second) in cases {
+        let rule = field_rule(
+            &format!("CommandLine|{modifier}|ALL"),
+            &format!("['{first}', '{second}']"),
+        );
+        assert!(
+            eval_rule_exec(&rule, &exec("x.exe", haystack)).is_some(),
+            "{modifier}"
+        );
+        let missing = field_rule(
+            &format!("CommandLine|{modifier}|all"),
+            &format!("['{first}', 'not-present']"),
+        );
+        assert!(
+            eval_rule_exec(&missing, &exec("x.exe", haystack)).is_none(),
+            "{modifier}"
+        );
+    }
+}
+
+#[test]
+fn value_lists_keep_or_semantics_without_all() {
+    let rule = field_rule("CommandLine|contains", "[missing, cmd]");
+    assert!(eval_rule_exec(&rule, &exec("x.exe", "cmd.exe")).is_some());
+}
+
+#[test]
+fn plain_field_values_keep_their_exact_match_behavior() {
+    let rule = field_rule("CommandLine", "cmd.exe");
+    assert!(eval_rule_exec(&rule, &exec("x.exe", "cmd.exe")).is_some());
+    assert!(eval_rule_exec(&rule, &exec("x.exe", "other.exe")).is_none());
+}
+
+#[test]
+fn evaluator_defensively_rejects_multiple_match_modifiers() {
+    let rule: SigmaRule = parse_rule_yaml(
+        "title: Invalid modifier\ndetection:\n  selection:\n    CommandLine|contains|startswith: a\n  condition: selection\n",
+    )
+    .unwrap();
+    assert!(eval_rule_exec(&rule, &exec("x.exe", "a")).is_none());
+}
+
+#[test]
+fn all_must_be_last_and_only_one_matching_modifier_is_allowed() {
+    for spec in [
+        "CommandLine|contains|all|startswith",
+        "CommandLine|contains|startswith|all",
+        "CommandLine|all",
+    ] {
+        let yaml = format!(
+            "title: Bad\ndetection:\n  selection:\n    {spec}: [a, b]\n  condition: selection\n"
+        );
+        let rule: SigmaRule = parse_rule_yaml(&yaml).unwrap();
+        assert!(validate(&rule, "<test>/linux/test.yml").is_err(), "{spec}");
+    }
+}
+
+#[test]
+fn empty_all_value_list_is_refused() {
+    for spec in ["CommandLine|contains|all", "CommandLine|contains"] {
+        let yaml = format!(
+            "title: Empty\ndetection:\n  selection:\n    {spec}: []\n  condition: selection\n"
+        );
+        let rule: SigmaRule = parse_rule_yaml(&yaml).unwrap();
+        let error = validate(&rule, "<test>/linux/test.yml").unwrap_err();
+        assert!(error.to_string().contains("empty value list"), "{error}");
+    }
+}
+
+proptest::proptest! {
+    #[test]
+    fn all_equals_conjunction_of_single_value_rules(values in proptest::collection::vec("[a-z]{1,8}", 1..8)) {
+        let joined = values.join(" ");
+        let yaml_values = format!("[{}]", values.iter()
+            .map(|value| format!("'{value}'"))
+            .collect::<Vec<_>>().join(", "));
+        let all_rule = field_rule("CommandLine|contains|all", &yaml_values);
+        let conjunction = values.iter().all(|value| {
+            let single = field_rule("CommandLine|contains", &format!("'{value}'"));
+            eval_rule_exec(&single, &exec("x.exe", &joined)).is_some()
+        });
+        proptest::prop_assert_eq!(eval_rule_exec(&all_rule, &exec("x.exe", &joined)).is_some(), conjunction);
     }
 }
 

@@ -59,7 +59,23 @@ fn eval_keywords(keywords: &[String], cmdline: &str) -> bool {
 /// Evaluates one Sigma field. `ParentImage` matches only when the sensor provided
 /// lineage (see `schema::ExecEvent::parent_image_path`).
 fn eval_field(field_spec: &str, values: &ValueList, event: &ExecEvent) -> bool {
-    let (field, modifier) = parse_field_spec(field_spec);
+    let parsed = parse_field_spec(field_spec);
+    let mut modifiers = parsed.modifiers;
+    let mut modifier = None;
+    let mut all = false;
+    if let Some(first) = modifiers.next() {
+        if first.eq_ignore_ascii_case("all") {
+            return false;
+        }
+        modifier = Some(first);
+        if let Some(second) = modifiers.next() {
+            if !second.eq_ignore_ascii_case("all") || modifiers.next().is_some() {
+                return false;
+            }
+            all = true;
+        }
+    }
+    let field = parsed.field;
     let haystack: &str = match field.to_lowercase().as_str() {
         "image" => &event.image_path,
         "commandline" => &event.cmdline,
@@ -72,19 +88,33 @@ fn eval_field(field_spec: &str, values: &ValueList, event: &ExecEvent) -> bool {
         _ => return false,
     };
 
-    values
-        .as_slice()
-        .iter()
-        .any(|val| match_value(haystack, val, modifier))
+    match values {
+        ValueList::Single(value) => match_value(haystack, value, modifier),
+        ValueList::Many(values) if all => {
+            !values.is_empty()
+                && values
+                    .iter()
+                    .all(|value| match_value(haystack, value, modifier))
+        }
+        ValueList::Many(values) => values
+            .iter()
+            .any(|value| match_value(haystack, value, modifier)),
+    }
 }
 
-/// Parses `FieldName|modifier` → (`FieldName`, `Some("modifier")`) or (`FieldName`, `None`).
-pub(crate) fn parse_field_spec(spec: &str) -> (&str, Option<&str>) {
-    if let Some(idx) = spec.find('|') {
-        (&spec[..idx], Some(&spec[idx + 1..]))
-    } else {
-        (spec, None)
+/// Parses a field specification into its field name and modifiers without allocating.
+pub(crate) fn parse_field_spec(spec: &str) -> ParsedFieldSpec<'_> {
+    let mut parts = spec.split('|');
+    let field = parts.next().unwrap_or(spec);
+    ParsedFieldSpec {
+        field,
+        modifiers: parts,
     }
+}
+
+pub(crate) struct ParsedFieldSpec<'a> {
+    pub field: &'a str,
+    pub modifiers: std::str::Split<'a, char>,
 }
 
 /// Tests whether `haystack` matches `pattern` according to the Sigma modifier.
