@@ -1,5 +1,10 @@
 //! Event-boundary redaction wrappers for the agent.
 
+// Only the Windows and macOS sensors run behind `RedactingSink`; Linux has no
+// sensor-side producer of a URL-bearing event yet (ADR-0018), so the wrapper is
+// unused there.
+#![cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+
 use std::sync::Arc;
 
 pub(crate) use redact::{
