@@ -10,6 +10,8 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    thread,
+    time::Duration,
 };
 
 use policy::ResponsePolicy;
@@ -385,6 +387,63 @@ fn locate_model_dir(roots: &[&Path], family: &str) -> std::path::PathBuf {
 }
 
 impl DetectionSink {
+    /// Starts the one-second clock that expires pending web-shell correlations even
+    /// when the sensor has stopped producing events. The worker holds only a `Weak`
+    /// reference while sleeping, and releases the correlator mutex before log I/O.
+    pub(crate) fn start_correlator_ticker(self: &Arc<Self>) -> std::io::Result<()> {
+        let sink = Arc::downgrade(self);
+        thread::Builder::new()
+            .name("correlator-tick".into())
+            .spawn(move || {
+                loop {
+                    thread::sleep(Duration::from_secs(1));
+                    let Some(sink) = sink.upgrade() else {
+                        break;
+                    };
+                    sink.advance_correlation_time(schema::time::now_ns());
+                }
+            })?;
+        Ok(())
+    }
+
+    fn advance_correlation_time(&self, now_ns: u64) {
+        let alerts = {
+            let mut correlator = self.correlator.lock().unwrap();
+            correlator.advance_time(now_ns)
+        };
+        self.emit_correlator_alerts(&alerts, None);
+    }
+
+    fn emit_correlator_alerts(
+        &self,
+        alerts: &[correlator::CorrelationAlert],
+        default_event: Option<&Event>,
+    ) {
+        let mut high_confidence_pid = None;
+        for alert in alerts {
+            let Some(event) = alert.trigger_event.as_deref().or(default_event) else {
+                continue;
+            };
+            let entity = entity_key(event.meta());
+            let case_id = correlator_case_id(&entity);
+            let source = schema::detection::DetectionSource::Correlator { case_id };
+            self.record_and_emit(
+                &entity,
+                alert.technique,
+                &alert.message,
+                source,
+                alert.severity,
+                event,
+            );
+            if crosses_kill_gate(alert.technique) {
+                high_confidence_pid = Some(event.meta().pid);
+            }
+        }
+        if let Some(pid) = high_confidence_pid {
+            self.maybe_kill(pid);
+        }
+    }
+
     /// `rule_state` arrives already seeded by the caller (from /proc or the
     /// platform's process list — see `commands`). `spool` is the transport
     /// spool (`run --server`), `None` when the agent runs standalone.
@@ -1002,29 +1061,7 @@ impl DetectionSink {
         // condemn every later, unrelated sibling that merely shares the same
         // parent and `comm` (PR #502 review; pinned by
         // `a_siblings_weak_alert_never_triggers_kill_from_anothers_bayes_crossing`).
-        let meta = event.meta();
-        let entity = entity_key(meta);
-        let case_id = correlator_case_id(&entity);
-        let mut is_high_confidence = false;
-        for alert in &alerts {
-            let source = schema::detection::DetectionSource::Correlator {
-                case_id: case_id.clone(),
-            };
-            self.record_and_emit(
-                &entity,
-                alert.technique,
-                &alert.message,
-                source,
-                alert.severity,
-                event,
-            );
-            if crosses_kill_gate(alert.technique) {
-                is_high_confidence = true;
-            }
-        }
-        if is_high_confidence {
-            self.maybe_kill(pid);
-        }
+        self.emit_correlator_alerts(&alerts, Some(event));
     }
 
     /// Issue #25: policy-gates killing the process behind a high-confidence
@@ -1894,7 +1931,11 @@ impl EventSink for BaselineSink {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, atomic::Ordering};
+    use std::{
+        sync::{Arc, Mutex, atomic::Ordering},
+        thread,
+        time::Duration,
+    };
 
     use schema::{ConnectEvent, Event, EventMeta, ExecEvent, User, sensor::EventSink as _};
 
@@ -1944,6 +1985,59 @@ mod tests {
 
     fn alerts_in(dir: &std::path::Path) -> String {
         std::fs::read_to_string(dir.join("alerts.ndjson")).unwrap_or_default()
+    }
+
+    #[test]
+    fn advancing_the_correlator_clock_emits_a_silent_shell_alert() {
+        let dir = tmp("correlator-tick");
+        let sink = sink_in(&dir);
+        let now = schema::time::now_ns();
+        let mut meta = schema::fixtures::meta();
+        meta.pid = 9_031;
+        meta.ppid = 500;
+        meta.comm = "sh".into();
+        meta.timestamp_ns = now.saturating_sub(10_000_000_000);
+        let shell = Event::Exec(ExecEvent {
+            meta,
+            image_path: "/usr/bin/sh".into(),
+            parent_comm: Some("nginx".into()),
+            ..schema::fixtures::exec()
+        });
+
+        sink.on_event(shell);
+        assert!(!alerts_in(&dir).contains("T1505.003"));
+        sink.advance_correlation_time(now);
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("T1505.003"), "{alerts}");
+        assert!(alerts.contains("no matching"), "{alerts}");
+    }
+
+    #[test]
+    fn the_correlator_ticker_emits_without_a_following_event() {
+        let dir = tmp("correlator-ticker-thread");
+        let sink = sink_in(&dir);
+        let now = schema::time::now_ns();
+        let mut meta = schema::fixtures::meta();
+        meta.pid = 9_032;
+        meta.ppid = 500;
+        meta.comm = "sh".into();
+        meta.timestamp_ns = now.saturating_sub(10_000_000_000);
+        let shell = Event::Exec(ExecEvent {
+            meta,
+            image_path: "/usr/bin/sh".into(),
+            parent_comm: Some("nginx".into()),
+            ..schema::fixtures::exec()
+        });
+
+        sink.on_event(shell);
+        sink.start_correlator_ticker().unwrap();
+        for _ in 0..30 {
+            if alerts_in(&dir).contains("T1505.003") {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        panic!("the one-second ticker did not emit the idle shell alert");
     }
 
     /// Quarantine hooks + the alert log they audit into, over a real directory

@@ -643,8 +643,10 @@ name = "correlator"
 version = "0.1.0"
 dependencies = [
  "policy",
+ "proptest",
  "schema",
  "store",
+ "tracing",
 ]
 
 [[package]]
