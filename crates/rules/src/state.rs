@@ -197,8 +197,9 @@ pub struct RuleState {
     /// instead of silent (#812).
     policy_denial_alerts_shed: u64,
     /// `known_policy_denials.evicted()` last reported, so each rise is logged once
-    /// (#812): otherwise the cache clearing at `COUNTER_CAP` and a shape re-alerting is
-    /// silent loss (CLAUDE.md: counted, observable shedding).
+    /// (#812): otherwise `known_policy_denials` evicting its oldest eighth at
+    /// `COUNTER_CAP` (never a full clear — only the evicted entries can re-alert) and a
+    /// shape re-alerting is silent loss (CLAUDE.md: counted, observable shedding).
     policy_denial_evictions_reported: u64,
     /// (target user, source) → sliding failure counter for T1110 (AUTH-BURST).
     /// LRU-bounded like every other counter: a spray across many fabricated
@@ -1068,14 +1069,19 @@ impl RuleState {
     }
 
     /// Logs once per rise in `known_policy_denials`'s eviction count (#812): otherwise
-    /// the cache clearing at `COUNTER_CAP` and a shape re-alerting is silent loss
-    /// (CLAUDE.md: counted, observable shedding), the same idiom as
-    /// `agent::ransomware_join`'s `report_evictions`.
+    /// `known_policy_denials` evicting its oldest eighth at `COUNTER_CAP` and a shape
+    /// re-alerting is silent loss (CLAUDE.md: counted, observable shedding), the same
+    /// idiom as `agent::ransomware_join`'s `report_evictions`. Also carries the running
+    /// total of alerts shed by [`POLICY_DENIAL_ALERT_CAP`] (review of #823): this is the
+    /// only periodic signal the alert cap gets — once it is reached, the "alert cap
+    /// reached" warning fires exactly once, never again, so without this an operator
+    /// cannot tell 10 shed shapes from 100,000.
     fn report_policy_denial_evictions(&mut self) {
         let evicted = self.known_policy_denials.evicted();
         if evicted > self.policy_denial_evictions_reported {
             tracing::warn!(
                 evicted,
+                alerts_shed = self.policy_denial_alerts_shed,
                 "policy-denial-drift: tracked denial shapes shed (oldest first)"
             );
             self.policy_denial_evictions_reported = evicted;
