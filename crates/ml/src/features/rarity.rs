@@ -18,12 +18,12 @@
 //! `ml/tests/fixtures/rarity_golden.jsonl`, checked from Rust (`tests/rarity_golden.rs`) and
 //! Python (`ml/tests/test_rarity_golden.py`).
 //!
-//! The snapshot's wire format (a set, a Bloom or a cuckoo filter) is not decided here: the
-//! extractor takes a [`CommonSet`], a membership test plus the number of hosts the snapshot
-//! covered, so it does not depend on how the server ships it. K, the minimum coverage, the
-//! cadence and the filter's false-positive rate are left to calibration on lab data
-//! (ADR-0020). Nothing in the agent builds a [`CommonSet`] yet: this module only defines the
-//! feature, so that a model trained on it can later be loaded.
+//! The snapshot's wire format is not this module's concern: the extractor takes a [`CommonSet`],
+//! a membership test plus the number of hosts the snapshot covered, so it does not depend on how
+//! the server ships it. The Bloom-filter format the server publishes is read by
+//! [`super::common_set::CommonSetSnapshot`]; nothing in the agent loads one yet. K, the minimum
+//! coverage, the cadence and the filter's false-positive rate are left to calibration on lab
+//! data (ADR-0020).
 
 /// Feature names, in vector order. See `rarity.py::FEATURE_NAMES` -- keep in sync.
 pub const FEATURE_NAMES: [&str; 2] = ["rarity_known", "image_in_common_set"];

@@ -15,6 +15,18 @@ const DECAY_TAU_S: f32 = 300.0;
 /// Alert threshold: `log_odds` > 2.0 → P(compromised) ≈ 88%.
 pub(crate) const BAYES_THRESHOLD: f32 = 2.0;
 
+/// Weight of one "this image is not in the fleet's common set" observation (ADR-0020, #76).
+/// Deliberately weak: the weakest hand-calibrated feature above is ~0.1 and the strongest
+/// 3.6, and rarity alone says "new here", not "malicious". **Provisional**: slice 6 of the
+/// plan (`docs/detection/fleet-prevalence-snapshot-plan.md`) sets it on lab data, and the
+/// snapshot's false-positive rate bounds how much it can be worth.
+pub(crate) const RARITY_LLR: f32 = 0.35;
+/// The most rarity can contribute to one belief at a time, however many rare images the
+/// entity runs (a build host runs thousands of freshly compiled binaries, every one of them
+/// absent from the common set). Together with the prior it keeps rarity alone ~7 log-odds
+/// under [`BAYES_THRESHOLD`]: it can only ever tip a belief other evidence already raised.
+pub(crate) const RARITY_MAX_TOTAL_LLR: f32 = 1.0;
+
 /// Bayesian belief state for an entity (ppid, comm).
 /// Keyed by (ppid, comm) rather than pid so it survives respawns:
 /// fork+exec = new pid, same (ppid, comm) → belief preserved.
@@ -28,6 +40,9 @@ pub struct BeliefState {
     /// true if an alert has already been emitted for this threshold crossing.
     /// Reset to false when `log_odds` drops back below `BAYES_THRESHOLD` (decay).
     pub(crate) alerted: bool,
+    /// How much of `log_odds` is rarity evidence (<= [`RARITY_MAX_TOTAL_LLR`]), decayed with
+    /// the belief so the allowance returns as the evidence fades.
+    pub(crate) rarity_llr: f32,
 }
 
 impl BeliefState {
@@ -36,6 +51,7 @@ impl BeliefState {
             log_odds: PRIOR_LOG_ODDS,
             last_update_ns: now_ns,
             alerted: false,
+            rarity_llr: 0.0,
         }
     }
 
@@ -150,6 +166,7 @@ pub(crate) fn update_belief(
     let dt_s = (now_ns.saturating_sub(state.last_update_ns)) as f32 / 1e9;
     let decay = 1.0 - (-dt_s / DECAY_TAU_S).exp();
     state.log_odds += (PRIOR_LOG_ODDS - state.log_odds) * decay;
+    state.rarity_llr *= 1.0 - decay;
 
     // Naive Bayesian update: sum of the per-feature LLRs
     for (i, &value) in v.to_vec().iter().enumerate() {
@@ -178,4 +195,14 @@ pub(crate) fn update_belief(
 /// term the first update didn't have.
 pub(crate) fn apply_ml_llr(state: &mut BeliefState, llr: f32) {
     state.log_odds += llr;
+}
+
+/// Adds the "image not in the common set" term to a belief, within its allowance
+/// ([`RARITY_MAX_TOTAL_LLR`] less what is still counted). Like [`apply_ml_llr`], it adds one
+/// term on top of an already-updated belief and does not re-run the feature update.
+pub(crate) fn apply_rarity_llr(state: &mut BeliefState) {
+    let room = (RARITY_MAX_TOTAL_LLR - state.rarity_llr).max(0.0);
+    let added = RARITY_LLR.min(room);
+    state.log_odds += added;
+    state.rarity_llr += added;
 }

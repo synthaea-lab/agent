@@ -35,9 +35,9 @@ use crate::{
     HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent,
     KernelModuleAction, KernelModuleEvent, LdapSearchEvent, ListenPortEvent, MemfdCreateEvent,
     NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, NtlmAuthEvent, NtlmDirection,
-    PackageChangeEvent, PackageChangeKind, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent,
-    PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent,
-    SessionState, ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
+    PackageChangeEvent, PackageChangeKind, PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent,
+    ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
+    SessionEvent, SessionState, ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
     SocketCreateEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
     UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
 };
@@ -458,6 +458,21 @@ pub fn package_change() -> PackageChangeEvent {
         change: PackageChangeKind::Upgraded,
         previous_version: Some("3.0.13-1".into()),
         version: Some("3.0.15-1".into()),
+    }
+}
+
+/// Neutral [`PolicyDenialEvent`]: no mechanism, no contexts, not enforced.
+#[must_use]
+pub fn policy_denial() -> PolicyDenialEvent {
+    PolicyDenialEvent {
+        meta: meta(),
+        mechanism: String::new(),
+        subject_context: None,
+        object_context: None,
+        object_class: None,
+        action: None,
+        enforced: false,
+        object_path: None,
     }
 }
 

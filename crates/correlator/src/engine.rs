@@ -7,7 +7,7 @@ use schema::{Event, detection::Severity};
 use store::BoundedMap;
 
 use crate::{
-    bayes::{BAYES_THRESHOLD, BeliefState, apply_ml_llr, update_belief},
+    bayes::{BAYES_THRESHOLD, BeliefState, apply_ml_llr, apply_rarity_llr, update_belief},
     behavior::BehaviorVector,
     bus::{EventBus, same_generation},
     event::is_correlated,
@@ -353,23 +353,7 @@ impl CorrelationEngine {
             return Ok(());
         };
 
-        let comm = self
-            .bus
-            .events_for_pid(pid, generation)
-            .last()
-            .map(|e| e.meta().comm.clone())
-            .ok_or(())?;
-
-        let entity_key = self
-            .pid_entities
-            .get(&pid)
-            .filter(|entry| entry.current(generation))
-            .map(|entry| entry.value.clone())
-            .unwrap_or(EntityRef {
-                ppid: pid,
-                comm,
-                parent_generation: generation,
-            });
+        let entity_key = self.entity_of_pid(pid, generation).ok_or(())?;
 
         // `on_event` creates this entity's belief state in the same cycle whenever a
         // `BehaviorVector` is available; if it isn't there yet either, there is no
@@ -377,6 +361,53 @@ impl CorrelationEngine {
         let state = self.belief_mut(&entity_key).ok_or(())?;
         apply_ml_llr(state, llr);
         Ok(())
+    }
+
+    /// Adds the "this process's image is not in the fleet's common set" evidence to its
+    /// entity's belief (ADR-0020, issue #76). Weak and capped: it adds
+    /// [`crate::bayes::RARITY_LLR`] within an allowance of
+    /// [`crate::bayes::RARITY_MAX_TOTAL_LLR`] that decays with the belief, so on its own it can
+    /// never approach the alert threshold. It does not raise an alert itself: the belief is
+    /// judged at the entity's next event, like the ML term of [`Self::update_belief_with_ml`].
+    ///
+    /// The caller decides whether there is evidence at all (a snapshot exists, covers enough
+    /// hosts, and the event carries a hash); this only applies it. Called from the agent's
+    /// enrichment worker, which learns the hash after the exec was correlated.
+    ///
+    /// Returns whether it was applied: `false` when the correlator has no belief for this
+    /// incarnation of the pid (never seen, evicted, or a different incarnation), a normal
+    /// condition the caller counts and otherwise ignores.
+    pub fn apply_rarity_evidence(&mut self, pid: u32, generation: Option<u64>) -> bool {
+        let Some(entity_key) = self.entity_of_pid(pid, generation) else {
+            return false;
+        };
+        let Some(state) = self.belief_mut(&entity_key) else {
+            return false;
+        };
+        apply_rarity_llr(state);
+        true
+    }
+
+    /// The entity `(ppid, comm)` a pid's belief is kept under: the one recorded when the pid
+    /// was last correlated, else rebuilt from the bus. `None` when the bus holds no event
+    /// for this incarnation of the pid.
+    fn entity_of_pid(&mut self, pid: u32, generation: Option<u64>) -> Option<EntityRef> {
+        let comm = self
+            .bus
+            .events_for_pid(pid, generation)
+            .last()
+            .map(|e| e.meta().comm.clone())?;
+        Some(
+            self.pid_entities
+                .get(&pid)
+                .filter(|entry| entry.current(generation))
+                .map(|entry| entry.value.clone())
+                .unwrap_or(EntityRef {
+                    ppid: pid,
+                    comm,
+                    parent_generation: generation,
+                }),
+        )
     }
 
     /// The belief for `entity`, created if absent. A stored belief built for a
@@ -447,8 +478,9 @@ impl CorrelationEngine {
     /// with the fallback used in `on_event`.
     /// Test scaffolding only today (`src/tests/behavior.rs`) — promote back to
     /// `pub` when a real consumer appears.
-    #[cfg(test)]
-    pub(crate) fn belief_for_pid(&self, pid: u32) -> Option<&BeliefState> {
+    /// A read-only view of the belief kept for `pid`'s entity, `None` when there is none.
+    #[must_use]
+    pub fn belief_for_pid(&self, pid: u32) -> Option<&BeliefState> {
         let event = self.bus.events_for_pid(pid, None).last()?;
         let generation = event.meta().process_generation;
         if let Some(entry) = self.pid_entities.peek(&pid)

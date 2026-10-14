@@ -141,7 +141,7 @@ pub fn raw_sched_process_fork(ctx: RawTracePointContext) -> u32 {
     let entry = LineageEntry {
         ppid: parent_pid as u32,
         comm,
-        reserved: 0,
+        execd: 0,
         generation: unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() },
         parent_generation: match unsafe { PROC_LINEAGE.get(&(parent_pid as u32)) } {
             Some(parent) => parent.generation,
