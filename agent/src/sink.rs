@@ -231,15 +231,29 @@ fn record_detection(
     persist: Option<&dyn Fn(schema::detection::Detection)>,
 ) -> Option<verdict::Verdict> {
     let now_ns = event.meta().timestamp_ns;
+    // Rules and Sigma have already evaluated the raw event/message. Redact only
+    // the copy that enters the verdict, alert log, and durable detection spool.
+    let image = std::iter::once(event)
+        .chain(evidence.iter())
+        .find_map(|event| match event {
+            Event::Exec(exec) => Some(exec.image_path.as_str()),
+            _ => None,
+        })
+        .unwrap_or(event.meta().comm.as_str());
+    let safe_message = crate::redact::redact_command_line(image, finding.message).into_owned();
+    let mut safe_events: Vec<Event> = std::iter::once(event.clone()).chain(evidence).collect();
+    for event in &mut safe_events {
+        crate::redact::redact_event(event);
+    }
     let detection = schema::detection::Detection {
         timestamp_ns: now_ns,
         severity: finding.severity,
-        title: finding.message.to_string(),
+        title: safe_message.clone(),
         source: finding.source,
         score: None,
         attributions: Vec::new(),
         techniques: techniques_from(finding.technique),
-        events: std::iter::once(event.clone()).chain(evidence).collect(),
+        events: safe_events,
     };
     let spooled = persist.map(|_| detection.clone());
     let result = verdict.lock().unwrap().record(
@@ -248,7 +262,7 @@ fn record_detection(
         detection,
         now_ns,
     );
-    alert_log.record(finding.technique, finding.message.to_string());
+    alert_log.record(finding.technique, safe_message);
     if let Some(fused) = &result {
         escalate_if_warranted(alert_log, fused);
     }
@@ -440,11 +454,13 @@ impl DetectionSink {
                 if let Event::Exec(exec) = &event {
                     note_image_rarity(&rarity_correlator, &rarity_common_set, exec);
                 }
+                let mut safe_event = event.clone();
+                crate::redact::redact_event(&mut safe_event);
                 if let Some(events_log) = &events_log {
-                    events_log.write(&event);
+                    events_log.write(&safe_event);
                 }
                 if let Some(spool) = &spool
-                    && let Err(e) = spool.lock().unwrap().push(&event)
+                    && let Err(e) = spool.lock().unwrap().push(&safe_event)
                 {
                     // Spool full is handled inside push (shed-oldest, counted);
                     // reaching here is a real I/O failure — degrade to local-only.
@@ -1870,9 +1886,17 @@ impl EventSink for BaselineSink {
                 if !det_alerts.is_empty() || !state_alerts.is_empty() || gated.is_some() {
                     return;
                 }
+                // Baselines leave the process and are used as a training corpus;
+                // store the same redacted canonical argv that inference can derive.
+                let safe = e.clone();
+                let mut safe_event = Event::Exec(safe);
+                crate::redact::redact_event(&mut safe_event);
+                let Event::Exec(safe) = safe_event else {
+                    unreachable!()
+                };
                 self.out.write(&BaselineRecord {
-                    argv: &e.argv,
-                    cmdline: &e.cmdline,
+                    argv: &safe.argv,
+                    cmdline: &safe.cmdline,
                 });
                 let n = self
                     .count
@@ -1944,6 +1968,103 @@ mod tests {
 
     fn alerts_in(dir: &std::path::Path) -> String {
         std::fs::read_to_string(dir.join("alerts.ndjson")).unwrap_or_default()
+    }
+
+    #[test]
+    fn sigma_sees_raw_exec_but_alert_and_event_outputs_are_redacted() {
+        let dir = tmp("cmdline-redaction-e2e");
+        let sigma_dir = dir.join("content/rules/sigma/linux");
+        std::fs::create_dir_all(&sigma_dir).unwrap();
+        std::fs::write(
+            sigma_dir.join("raw-secret.yml"),
+            "title: Password flag on a command line\ndescription: test\ntags:\n  - attack.t1059\nlevel: high\nfalsepositives:\n  - none\ndetection:\n  selection:\n    CommandLine|contains: '--password='\n  condition: selection\n",
+        )
+        .unwrap();
+        let spool = Arc::new(Mutex::new(
+            store::EventSpool::open(&dir.join("detection-spool"), u64::MAX).unwrap(),
+        ));
+        let sink = Arc::new(
+            DetectionSink::new(
+                rules::RuleState::new(),
+                &dir.join("alerts.ndjson"),
+                Some(&dir.join("events.jsonl")),
+                None,
+                Some(Arc::clone(&spool)),
+                &dir.join("content"),
+                &dir.join("ml-registry"),
+            )
+            .unwrap(),
+        );
+        let mut exec = schema::fixtures::exec();
+        exec.image_path = "/usr/bin/base64".into();
+        exec.cmdline = "base64 -d --password=S3cret".into();
+        exec.argv = vec!["base64".into(), "-d".into(), "--password=S3cret".into()];
+        sink.on_event(Event::Exec(exec));
+        assert!(sink.enrich_queue.flush(std::time::Duration::from_secs(2)));
+
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("REDACTED"), "{alerts}");
+        assert!(!alerts.contains("S3cret"), "{alerts}");
+        let recent = sink.alert_log.latest(crate::alerts::RECENT_ALERTS_CAPACITY);
+        assert!(
+            recent
+                .iter()
+                .any(|alert| alert.message.contains("base64 -d --password=REDACTED")),
+            "{recent:?}"
+        );
+        assert!(
+            recent.iter().all(|alert| !alert.message.contains("S3cret")),
+            "{recent:?}"
+        );
+        let terminal_alert =
+            crate::alerts::format_alert_line(&recent[0].technique, &recent[0].message);
+        assert!(
+            terminal_alert.contains("[ALERT]") && terminal_alert.contains("REDACTED"),
+            "{terminal_alert}"
+        );
+        assert!(!terminal_alert.contains("S3cret"), "{terminal_alert}");
+        let events = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        assert!(events.contains("--password=REDACTED"), "{events}");
+        assert!(!events.contains("S3cret"), "{events}");
+        let detections: Vec<transport::QueuedDetection> =
+            spool.lock().unwrap().drain_oldest().unwrap();
+        assert!(
+            detections.len() >= 2,
+            "Sigma and base64 rule should both detect: {detections:?}"
+        );
+        assert!(
+            detections
+                .iter()
+                .any(|queued| queued.detection.title == "Password flag on a command line"),
+            "{detections:?}"
+        );
+        assert!(
+            detections.iter().any(|queued| queued
+                .detection
+                .title
+                .contains("base64 -d --password=REDACTED")),
+            "{detections:?}"
+        );
+        for queued in &detections {
+            let serialized = serde_json::to_string(&queued.detection).unwrap();
+            assert!(!serialized.contains("S3cret"), "{serialized}");
+        }
+    }
+
+    #[test]
+    fn baseline_corpus_stores_redacted_command_line_and_argv() {
+        let dir = tmp("baseline-cmdline-redaction");
+        let path = dir.join("baseline.jsonl");
+        let sink = super::BaselineSink::new(rules::RuleState::new(), &path).unwrap();
+        let mut exec = schema::fixtures::exec();
+        exec.image_path = "/usr/bin/mysql".into();
+        exec.cmdline = "mysql --password=S3cret".into();
+        exec.argv = vec!["mysql".into(), "--password=S3cret".into()];
+        sink.on_event(Event::Exec(exec));
+
+        let record = std::fs::read_to_string(path).unwrap();
+        assert!(record.contains("--password=REDACTED"), "{record}");
+        assert!(!record.contains("S3cret"), "{record}");
     }
 
     /// Quarantine hooks + the alert log they audit into, over a real directory

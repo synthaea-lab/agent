@@ -16,6 +16,7 @@ members = [
     "cli",
     "release-tool",
     "crates/schema",
+    "crates/redact",
     "crates/policy",
     "crates/config",
     "crates/store",

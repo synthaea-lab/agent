@@ -20,6 +20,7 @@ test-key = ["updater/test-key"]
 
 [dependencies]
 schema = { path = "../crates/schema" }
+redact = { path = "../crates/redact" }
 config = { path = "../crates/config" }
 policy = { path = "../crates/policy" }
 rules = { path = "../crates/rules" }
@@ -92,6 +93,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+proptest = "1"
 # Tests sign manifests with the public test key.
 updater = { path = "../crates/updater", features = ["test-key"] }
 schema = { path = "../crates/schema", features = ["test-fixtures"] }
