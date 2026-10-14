@@ -312,7 +312,8 @@ mod tests {
             (b"orig_ax", 44 * 8),
         );
         #[cfg(target_arch = "aarch64")]
-        let (registers, syscall_nr): RegisterFixture = (&[(b"regs", 0)], (b"syscallno", 31 * 8));
+        // pt_regs has regs[31], sp, pc, pstate and orig_x0 before syscallno.
+        let (registers, syscall_nr): RegisterFixture = (&[(b"regs", 0)], (b"syscallno", 280));
         let mut strings = b"\0task_struct\0pid\0comm\0linux_binprm\0filename\0pt_regs\0".to_vec();
         for (name, _) in registers {
             strings.extend_from_slice(name);
@@ -360,7 +361,12 @@ mod tests {
         push_u32(
             (BTF_KIND_STRUCT << 24) | (registers.len() as u32 + u32::from(include_syscall_nr)),
         );
+        #[cfg(target_arch = "x86_64")]
         push_u32(168);
+        #[cfg(target_arch = "x86")]
+        push_u32(48);
+        #[cfg(target_arch = "aarch64")]
+        push_u32(320);
         for (name, bit_offset) in registers
             .iter()
             .copied()
@@ -399,7 +405,7 @@ mod tests {
         #[cfg(target_arch = "x86")]
         let expected_syscall_nr = 44;
         #[cfg(target_arch = "aarch64")]
-        let expected_syscall_nr = 248;
+        let expected_syscall_nr = 280;
         assert_eq!(
             parse_scheduler_field_offsets(&minimal_btf(true)).unwrap(),
             SchedulerFieldOffsets {

@@ -43,6 +43,18 @@ pub const fn matching_pending_syscall_exit(
     }
 }
 
+/// Converts a signed syscall number from architectures that use a negative
+/// sentinel (arm64's `NO_SYSCALL`) into the non-negative syscall-id domain.
+#[inline(always)]
+#[must_use]
+pub const fn syscall_nr_from_i32(syscall_nr: i32) -> Option<u32> {
+    if syscall_nr < 0 {
+        None
+    } else {
+        Some(syscall_nr as u32)
+    }
+}
+
 /// Bumped on every layout-affecting change to the structs below. Not a wire header
 /// (ring-buffer items carry none) — a build-time tripwire: the userspace loader
 /// `const _`-asserts the value it was compiled against, so an ebpf/userspace version
@@ -975,6 +987,11 @@ mod pending_exit_tests {
         assert_eq!(matching_pending_syscall_exit(Some(pending), Some(59)), None);
         assert_eq!(matching_pending_syscall_exit(Some(pending), None), None);
         assert_eq!(matching_pending_syscall_exit(None, Some(45)), None);
+        assert_eq!(
+            matching_pending_syscall_exit(Some(pending), syscall_nr_from_i32(-1)),
+            None
+        );
+        assert_eq!(syscall_nr_from_i32(45), Some(45));
     }
 }
 

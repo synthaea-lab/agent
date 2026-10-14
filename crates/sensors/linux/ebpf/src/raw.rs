@@ -10,6 +10,8 @@ use aya_ebpf::{
     programs::{RawTracePointContext, TracePointContext},
 };
 use aya_log_ebpf::{info, warn};
+#[cfg(bpf_target_arch = "aarch64")]
+use sensor_linux_wire::syscall_nr_from_i32;
 use sensor_linux_wire::{
     LineageEntry, TASK_COMM_LEN, encode_pending_syscall_exit, matching_pending_syscall_exit,
 };
@@ -398,10 +400,18 @@ fn read_syscall_args(regs: *const u8) -> Option<[u64; 6]> {
 
 fn read_syscall_nr(regs: *const u8) -> Option<u32> {
     let offset = SYSCALL_NR_OFFSET.load() as usize;
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    #[cfg(bpf_target_arch = "x86_64")]
     {
         let value = unsafe { bpf_probe_read_kernel(regs.add(offset).cast::<u64>()) }.ok()?;
         u32::try_from(value).ok()
+    }
+    #[cfg(bpf_target_arch = "aarch64")]
+    {
+        // arm64's arch/arm64/include/asm/ptrace.h defines pt_regs.syscallno as
+        // s32, followed by the u32 GIC priority mask (pmr). Read only syscallno:
+        // a 64-bit read would accidentally include the neighbouring pmr field.
+        let value = unsafe { bpf_probe_read_kernel(regs.add(offset).cast::<i32>()) }.ok()?;
+        syscall_nr_from_i32(value)
     }
     #[cfg(bpf_target_arch = "x86")]
     {
