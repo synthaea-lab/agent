@@ -10,8 +10,8 @@ use std::{
 use schema::{
     AuthEvent, AuthOutcome, ConnectEvent, Event, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
     FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRenameEvent, FileWriteEvent,
-    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, SessionEvent, SessionState, User,
-    detection::Severity,
+    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, POLICY_MECHANISM_SELINUX,
+    PolicyDenialEvent, SessionEvent, SessionState, User, detection::Severity,
 };
 use store::BoundedMap;
 
@@ -108,6 +108,11 @@ impl PidFact {
     }
 }
 
+/// `known_policy_denials`' key: (mechanism, subject context, object context, object
+/// class). Named so clippy's `type_complexity` lint doesn't flag the field
+/// declaration.
+type PolicyDenialKey = (String, Option<String>, Option<String>, Option<String>);
+
 /// Sliding history needed by the correlation rules:
 /// - T1105 (Ingress Tool Transfer): a path recently written by `curl`/`wget` is
 ///   executed shortly after. Correlated by path + time window rather than by a strict
@@ -116,7 +121,6 @@ impl PidFact {
 ///   child of `curl`/`wget`).
 /// - T1059 (suspicious process lineage): a shell interpreter executed directly by a
 ///   web server process — classic indicator of a web shell / RCE.
-///
 pub struct RuleState {
     /// pid → comm of the last exec seen for this pid, to recover the parent's comm
     /// (T1059) with a simple `ppid` lookup without having to walk the process tree in
@@ -161,6 +165,28 @@ pub struct RuleState {
     /// listener space is a few dozen, not unbounded, but a hostile loop binding
     /// many ports must not grow this without limit either.
     known_listeners: BoundedMap<(IpAddr, u16), ()>,
+    /// (mechanism, subject context, object context, object class) → seen, for
+    /// POLICY-DENIAL-DRIFT (issue #774, T1562-adjacent). Same "first new shape
+    /// wins, the routine repeat doesn't" principle as `known_listeners` above:
+    /// a `SELinux`-Enforcing host denies constantly as part of normal
+    /// operation, so alerting on every `PolicyDenial` would be unusable — a
+    /// *new* (subject, object, class) triple appearing is the signal. No
+    /// startup-baseline seeding (unlike listeners, there's no enumerable
+    /// "current state" of past denials to snapshot at agent start) — the
+    /// first run is cold by design. LRU-bounded like every other stateful
+    /// rule.
+    ///
+    /// `SELinux` only (`check_policy_denial_drift` gates on
+    /// [`POLICY_MECHANISM_SELINUX`]): `scontext`/`tcontext` give each denial a
+    /// rich, domain-specific triple. AppLocker/WDAC `PolicyDenialEvent`s carry
+    /// no subject/object context at all (`None`/`None`), so their "shape"
+    /// would collapse to `object_class` alone — 5 values for `AppLocker`
+    /// (`EXE`/`DLL`/`MSI`/`SCRIPT`/`APPX`), 2 for WDAC — meaning the *first*
+    /// blocked `.exe` ever seen would alert and every distinct one after it,
+    /// forever, would not. Needs a richer per-mechanism key (likely
+    /// `object_path`) before it's worth extending; tracked as a follow-up,
+    /// not done here.
+    known_policy_denials: BoundedMap<PolicyDenialKey, ()>,
     /// (target user, source) → sliding failure counter for T1110 (AUTH-BURST).
     /// LRU-bounded like every other counter: a spray across many fabricated
     /// usernames must not grow this without limit.
@@ -292,6 +318,7 @@ impl RuleState {
             beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
             scan_spread: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
+            known_policy_denials: BoundedMap::new(COUNTER_CAP),
             auth_failures: BoundedMap::new(COUNTER_CAP),
             rdp_success: RdpSuccessAfterFailures::new(),
             recent_creates: BoundedMap::new(CREATE_UNLINK_PID_CAP),
@@ -953,6 +980,74 @@ impl RuleState {
     /// polling, issue #92) — see [`Self::check_listen_port_drift`].
     pub fn on_listen_port(&mut self, event: &ListenPortEvent) -> Vec<Alert> {
         self.check_listen_port_drift(event).into_iter().collect()
+    }
+
+    /// POLICY-DENIAL-DRIFT (issue #774, T1562-adjacent) — see
+    /// `known_policy_denials`'s doc for why this alerts on a new
+    /// (subject, object, class) triple rather than on every denial. Fires for
+    /// `PolicyDenialEvent::enforced` either way (`SELinux` permissive logs the
+    /// same fact a managed Enforcing host would act on) — the point is a new
+    /// *shape* of denial, not whether this particular one was blocked.
+    ///
+    /// `SELinux` only for now — see `known_policy_denials`'s doc for why an
+    /// AppLocker/WDAC `PolicyDenialEvent` would collapse to a far coarser
+    /// shape with this same key.
+    ///
+    /// Inert while the eBPF sensor is selected (#780): `SELinux` AVC denials
+    /// only reach the agent through the audit sensor, so silence here does not
+    /// mean no denials happened.
+    ///
+    /// The requested permission is not part of the key (#813): the audit
+    /// sensor does not parse it yet, so a routine `getattr` denial silences a
+    /// later, more interesting `read`/`write`/`open` on the same subject,
+    /// object and class.
+    fn check_policy_denial_drift(&mut self, event: &PolicyDenialEvent) -> Option<Alert> {
+        if event.mechanism != POLICY_MECHANISM_SELINUX {
+            return None;
+        }
+        let key: PolicyDenialKey = (
+            event.mechanism.clone(),
+            Self::selinux_type_triple(event.subject_context.as_deref()),
+            Self::selinux_type_triple(event.object_context.as_deref()),
+            event.object_class.clone(),
+        );
+        if self.known_policy_denials.get(&key).is_some() {
+            return None;
+        }
+        self.known_policy_denials.insert(key, ());
+        Some(Alert {
+            technique: "T1562",
+            severity: Severity::Medium,
+            message: format!(
+                "comm={} mechanism={} subject={} object={} class={} path={} enforced={} — new denial shape, not seen this run",
+                event.meta.comm,
+                event.mechanism,
+                event.subject_context.as_deref().unwrap_or("-"),
+                event.object_context.as_deref().unwrap_or("-"),
+                event.object_class.as_deref().unwrap_or("-"),
+                event.object_path.as_deref().unwrap_or("-"),
+                event.enforced,
+            ),
+        })
+    }
+
+    /// The `user:role:type` prefix of a `SELinux` security context
+    /// (`user:role:type:sensitivity[:categories]`), dropped from
+    /// [`PolicyDenialKey`] so a container's own MCS/MLS category pair does not
+    /// make every denial from it a "new" shape (#781 review: two denials
+    /// differing only in category gave two alerts). A bounded split, not a
+    /// split on the last colon: the MLS field itself can contain one
+    /// (`s0-s0:c0.c1023`). A bare type with no context at all (`httpd_t`)
+    /// passes through unchanged.
+    fn selinux_type_triple(context: Option<&str>) -> Option<String> {
+        context.map(|c| c.splitn(4, ':').take(3).collect::<Vec<_>>().join(":"))
+    }
+
+    /// To be called for every `PolicyDenialEvent` in the stream (`SELinux` AVC
+    /// on Linux issue #297, AppLocker/WDAC on Windows issue #283) — see
+    /// [`Self::check_policy_denial_drift`].
+    pub fn on_policy_denial(&mut self, event: &PolicyDenialEvent) -> Vec<Alert> {
+        self.check_policy_denial_drift(event).into_iter().collect()
     }
 
     /// To be called for every `LdapSearchEvent` (Windows, #364): the

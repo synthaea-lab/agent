@@ -1191,6 +1191,15 @@ impl DetectionSink {
         );
     }
 
+    /// `PolicyDenial` events (`SELinux` AVC #297, AppLocker/WDAC #283):
+    /// POLICY-DENIAL-DRIFT (issue #774).
+    fn detect_policy_denial(&self, wrapped: &Event, event: &schema::PolicyDenialEvent) {
+        self.record_rule_alerts(
+            wrapped,
+            self.rule_state.lock().unwrap().on_policy_denial(event),
+        );
+    }
+
     /// `Auth` events: brute-force/spray burst detection (T1110, pack #377).
     fn detect_auth(&self, wrapped: &Event, event: &schema::AuthEvent) {
         self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_auth(event));
@@ -1783,6 +1792,7 @@ impl EventSink for DetectionSink {
                 self.record_rule_alerts(&event, rules::evaluate_defender_event(e));
             }
             Event::LdapSearch(e) => self.detect_ldap_search(&event, e),
+            Event::PolicyDenial(e) => self.detect_policy_denial(&event, e),
             Event::PackageChange(e) => {
                 self.record_rule_alerts(&event, rules::evaluate_package_change(e));
             }
