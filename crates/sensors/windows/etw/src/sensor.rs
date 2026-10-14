@@ -510,7 +510,7 @@ impl Sensor for WindowsSensor {
                 LDAP_PER_PID_LIMIT,
                 LDAP_PER_PID_WINDOW_NS,
             )),
-            ntlm: Mutex::new(budget::KeyDedup::new(NTLM_DEDUP_WINDOW_NS)),
+            ntlm: Mutex::new(budget::KeyDedup::new("ntlm", NTLM_DEDUP_WINDOW_NS)),
             canary_path: canary_file
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())

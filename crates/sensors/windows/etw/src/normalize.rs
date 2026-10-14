@@ -908,7 +908,7 @@ mod tests {
 
         // Through the dedup itself: the failure and the success within one window are
         // both reported (the #744 review case), a repeat of the failure is not.
-        let mut dedup = crate::budget::KeyDedup::new(60_000_000_000);
+        let mut dedup = crate::budget::KeyDedup::new("ntlm", 60_000_000_000);
         assert!(dedup.first(&failure, 1_000));
         assert!(
             dedup.first(&success, 2_000),
