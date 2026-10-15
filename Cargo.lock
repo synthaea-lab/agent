@@ -2654,6 +2654,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sensor-windows-minifilter"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "sensor-windows-sockets"
 version = "0.1.0"
 dependencies = [
