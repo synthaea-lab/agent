@@ -24,7 +24,7 @@ use crate::{
         write_signal_watch_pid,
     },
     normalize,
-    parent_image::{IMAGE_CACHE_CAP, ParentImages},
+    parent_image::{ExecStamps, IMAGE_CACHE_CAP, ParentImages},
     proc::{read_proc_cmdline, read_proc_environ_security, read_proc_images},
 };
 
@@ -313,7 +313,12 @@ impl LinuxSensor {
                     drain!(guard, sensor_linux_wire::ExecEvent, sink, own_pid, |e: &sensor_linux_wire::ExecEvent| {
                         let mut event = normalize::exec(e, offset, read_proc_cmdline(e.meta.pid), read_proc_environ_security(e.meta.pid), container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache));
                         if let schema::Event::Exec(exec) = &mut event {
-                            parent_images.annotate(exec);
+                            parent_images.annotate(exec, ExecStamps {
+                                ktime_ns: e.meta.timestamp_ns,
+                                grandparent_pid: e.grandparent_pid,
+                                grandparent_generation: e.grandparent_generation,
+                                parent_never_exec_ed: e.parent_execd == 0,
+                            });
                         }
                         event
                     });

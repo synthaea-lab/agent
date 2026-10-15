@@ -29,7 +29,13 @@ pub(crate) struct SchedulerFieldOffsets {
     pub(crate) task_comm: u32,
     pub(crate) binprm_filename: u32,
     pub(crate) syscall_args: [u32; 6],
+    pub(crate) syscall_nr: u32,
 }
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+const SYSCALL_NR_FIELD: &[u8] = b"orig_ax";
+#[cfg(target_arch = "aarch64")]
+const SYSCALL_NR_FIELD: &[u8] = b"syscallno";
 
 /// Reads and parses `/sys/kernel/btf/vmlinux` for the scheduler probe fields.
 pub(crate) fn read_scheduler_field_offsets()
@@ -82,6 +88,7 @@ fn parse_scheduler_field_offsets(data: &[u8]) -> Result<SchedulerFieldOffsets, &
     let mut task_comm = None;
     let mut binprm_filename = None;
     let mut syscall_args = [None; 6];
+    let mut syscall_nr = None;
     let mut cursor = type_start;
     while cursor < type_end {
         if cursor.checked_add(12).is_none_or(|end| end > type_end) {
@@ -127,11 +134,15 @@ fn parse_scheduler_field_offsets(data: &[u8]) -> Result<SchedulerFieldOffsets, &
             }
         } else if kind == BTF_KIND_STRUCT
             && matches_string(strings, name_off, b"pt_regs")?
-            && syscall_args.iter().any(Option::is_none)
+            && (syscall_args.iter().any(Option::is_none) || syscall_nr.is_none())
         {
             for member_index in 0..vlen {
                 let member = extra_start + member_index * 12;
                 let member_name = read_u32(data, member, endianness)?;
+
+                if matches_string(strings, member_name, SYSCALL_NR_FIELD)? {
+                    syscall_nr = Some(member_byte_offset(data, member + 8, info, endianness)?);
+                }
 
                 #[cfg(target_arch = "x86_64")]
                 for (index, expected) in [
@@ -190,6 +201,7 @@ fn parse_scheduler_field_offsets(data: &[u8]) -> Result<SchedulerFieldOffsets, &
         task_comm: task_comm.ok_or("task_struct.comm is missing")?,
         binprm_filename: binprm_filename.ok_or("linux_binprm.filename is missing")?,
         syscall_args: syscall_arg_offsets(syscall_args)?,
+        syscall_nr: syscall_nr.ok_or("pt_regs syscall number field is missing")?,
     })
 }
 
@@ -272,9 +284,45 @@ fn read_u32(data: &[u8], offset: usize, endianness: Endianness) -> Result<u32, &
 mod tests {
     use super::*;
 
-    fn minimal_btf() -> Vec<u8> {
-        let strings =
-            b"\0task_struct\0pid\0comm\0linux_binprm\0filename\0pt_regs\0di\0si\0dx\0r10\0r8\0r9\0";
+    type RegisterFixture = (&'static [(&'static [u8], u32)], (&'static [u8], u32));
+
+    fn minimal_btf(include_syscall_nr: bool) -> Vec<u8> {
+        #[cfg(target_arch = "x86_64")]
+        let (registers, syscall_nr): RegisterFixture = (
+            &[
+                (b"di", 112 * 8),
+                (b"si", 104 * 8),
+                (b"dx", 96 * 8),
+                (b"r10", 56 * 8),
+                (b"r8", 72 * 8),
+                (b"r9", 64 * 8),
+            ],
+            (b"orig_ax", 120 * 8),
+        );
+        #[cfg(target_arch = "x86")]
+        let (registers, syscall_nr): RegisterFixture = (
+            &[
+                (b"bx", 0),
+                (b"cx", 4 * 8),
+                (b"dx", 8 * 8),
+                (b"si", 12 * 8),
+                (b"di", 16 * 8),
+                (b"bp", 20 * 8),
+            ],
+            (b"orig_ax", 44 * 8),
+        );
+        #[cfg(target_arch = "aarch64")]
+        // pt_regs has regs[31], sp, pc, pstate and orig_x0 before syscallno.
+        let (registers, syscall_nr): RegisterFixture = (&[(b"regs", 0)], (b"syscallno", 280));
+        let mut strings = b"\0task_struct\0pid\0comm\0linux_binprm\0filename\0pt_regs\0".to_vec();
+        for (name, _) in registers {
+            strings.extend_from_slice(name);
+            strings.push(0);
+        }
+        if include_syscall_nr {
+            strings.extend_from_slice(syscall_nr.0);
+            strings.push(0);
+        }
         let offset = |needle: &[u8]| {
             strings
                 .windows(needle.len() + 1)
@@ -310,16 +358,20 @@ mod tests {
 
         // struct pt_regs { syscall argument registers }
         push_u32(offset(b"pt_regs"));
-        push_u32((BTF_KIND_STRUCT << 24) | 6);
+        push_u32(
+            (BTF_KIND_STRUCT << 24) | (registers.len() as u32 + u32::from(include_syscall_nr)),
+        );
+        #[cfg(target_arch = "x86_64")]
         push_u32(168);
-        for (name, bit_offset) in [
-            (b"di".as_slice(), 112 * 8),
-            (b"si".as_slice(), 104 * 8),
-            (b"dx".as_slice(), 96 * 8),
-            (b"r10".as_slice(), 56 * 8),
-            (b"r8".as_slice(), 72 * 8),
-            (b"r9".as_slice(), 64 * 8),
-        ] {
+        #[cfg(target_arch = "x86")]
+        push_u32(48);
+        #[cfg(target_arch = "aarch64")]
+        push_u32(320);
+        for (name, bit_offset) in registers
+            .iter()
+            .copied()
+            .chain(include_syscall_nr.then_some(syscall_nr))
+        {
             push_u32(offset(name));
             push_u32(1);
             push_u32(bit_offset);
@@ -336,19 +388,32 @@ mod tests {
             btf.extend_from_slice(&value.to_le_bytes());
         }
         btf.extend(types);
-        btf.extend_from_slice(strings);
+        btf.extend_from_slice(&strings);
         btf
     }
 
     #[test]
     fn parses_scheduler_offsets_from_btf() {
+        #[cfg(target_arch = "x86_64")]
+        let expected_args = [112, 104, 96, 56, 72, 64];
+        #[cfg(target_arch = "x86")]
+        let expected_args = [0, 4, 8, 12, 16, 20];
+        #[cfg(target_arch = "aarch64")]
+        let expected_args = [0, 8, 16, 24, 32, 40];
+        #[cfg(target_arch = "x86_64")]
+        let expected_syscall_nr = 120;
+        #[cfg(target_arch = "x86")]
+        let expected_syscall_nr = 44;
+        #[cfg(target_arch = "aarch64")]
+        let expected_syscall_nr = 280;
         assert_eq!(
-            parse_scheduler_field_offsets(&minimal_btf()).unwrap(),
+            parse_scheduler_field_offsets(&minimal_btf(true)).unwrap(),
             SchedulerFieldOffsets {
                 task_pid: 3,
                 task_comm: 8,
                 binprm_filename: 10,
-                syscall_args: [112, 104, 96, 56, 72, 64],
+                syscall_args: expected_args,
+                syscall_nr: expected_syscall_nr,
             }
         );
     }
@@ -356,6 +421,14 @@ mod tests {
     #[test]
     fn rejects_truncated_btf() {
         assert!(parse_scheduler_field_offsets(&[0x9f, 0xeb, 1, 0]).is_err());
+    }
+
+    #[test]
+    fn rejects_btf_without_syscall_number_field() {
+        assert_eq!(
+            parse_scheduler_field_offsets(&minimal_btf(false)),
+            Err("pt_regs syscall number field is missing")
+        );
     }
 
     #[test]
@@ -367,6 +440,7 @@ mod tests {
             assert!(offsets.task_comm < 4096);
             assert!(offsets.binprm_filename < 4096);
             assert!(offsets.syscall_args.iter().all(|offset| *offset < 4096));
+            assert!(offsets.syscall_nr < 4096);
         }
     }
 }

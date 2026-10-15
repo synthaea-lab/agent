@@ -32,6 +32,23 @@ pub trait DroppedCounter: Send + Sync {
     fn dropped(&self) -> u64;
 }
 
+/// Cumulative counts of the rarity evidence (ADR-0020, issue #76): what the fleet's common set
+/// let the correlator learn about executed images, and what it could not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RarityCounts {
+    /// Evidence added to a process belief.
+    pub applied: u64,
+    /// Executions the evidence could not judge (no snapshot, too few hosts, no usable hash).
+    pub withheld: u64,
+    /// Rare images whose evidence found no belief to land on.
+    pub unapplied: u64,
+}
+
+/// Reads the rarity evidence counters. The sink implements it over its own atomics.
+pub trait RarityStatsSource: Send + Sync {
+    fn rarity_counts(&self) -> RarityCounts;
+}
+
 /// Reads sensor health snapshots. Implementations may wrap a `SilenceMonitor` or
 /// provide mock data for testing.
 pub trait SensorHealthSource: Send + Sync {
@@ -87,6 +104,7 @@ pub struct HealthCollector {
     sensors: Arc<dyn SensorHealthSource>,
     spool: Arc<dyn SpoolStatsSource>,
     enrich_dropped: Arc<dyn DroppedCounter>,
+    rarity: Arc<dyn RarityStatsSource>,
     emit: Box<dyn Fn(HealthBeacon) + Send>,
     stop: Arc<StopFlag>,
 }
@@ -140,6 +158,7 @@ impl HealthCollector {
         sensors: Arc<dyn SensorHealthSource>,
         spool: Arc<dyn SpoolStatsSource>,
         enrich_dropped: Arc<dyn DroppedCounter>,
+        rarity: Arc<dyn RarityStatsSource>,
         emit: impl Fn(HealthBeacon) + Send + 'static,
     ) -> Self {
         Self {
@@ -147,6 +166,7 @@ impl HealthCollector {
             sensors,
             spool,
             enrich_dropped,
+            rarity,
             emit: Box::new(emit),
             stop: Arc::new(StopFlag::new()),
         }
@@ -178,6 +198,7 @@ impl HealthCollector {
     }
 
     fn collect(&self) -> HealthBeacon {
+        let rarity = self.rarity.rarity_counts();
         HealthBeacon {
             timestamp_ns: schema::time::now_ns(),
             agent_version: self.config.agent_version.clone(),
@@ -185,6 +206,9 @@ impl HealthCollector {
             spool_bytes: self.spool.spool_bytes(),
             spool_dropped: self.spool.spool_dropped(),
             enrich_dropped: self.enrich_dropped.dropped(),
+            rarity_applied: rarity.applied,
+            rarity_withheld: rarity.withheld,
+            rarity_unapplied: rarity.unapplied,
         }
     }
 }
@@ -229,6 +253,14 @@ mod tests {
         }
     }
 
+    struct MockRarity(RarityCounts);
+
+    impl RarityStatsSource for MockRarity {
+        fn rarity_counts(&self) -> RarityCounts {
+            self.0
+        }
+    }
+
     struct MockDropped(u64);
 
     impl DroppedCounter for MockDropped {
@@ -249,6 +281,11 @@ mod tests {
             dropped: 10,
         });
         let enrich = Arc::new(MockDropped(5));
+        let rarity = Arc::new(MockRarity(RarityCounts {
+            applied: 7,
+            withheld: 11,
+            unapplied: 2,
+        }));
 
         let (tx, rx) = mpsc::channel();
 
@@ -260,6 +297,7 @@ mod tests {
             sensors,
             spool,
             enrich,
+            rarity,
             move |b| {
                 let _ = tx.send(b);
             },
@@ -284,6 +322,15 @@ mod tests {
         assert_eq!(beacon.spool_bytes, 5000);
         assert_eq!(beacon.spool_dropped, 10);
         assert_eq!(beacon.enrich_dropped, 5);
+        assert_eq!(
+            (
+                beacon.rarity_applied,
+                beacon.rarity_withheld,
+                beacon.rarity_unapplied
+            ),
+            (7, 11, 2),
+            "the rarity evidence counters ride the beacon (ADR-0020, #76)"
+        );
     }
 
     #[test]
@@ -291,6 +338,7 @@ mod tests {
         let sensors = Arc::new(MockSensors(Vec::new()));
         let spool = Arc::new(NoopSpoolStats);
         let enrich = Arc::new(MockDropped(0));
+        let rarity = Arc::new(MockRarity(RarityCounts::default()));
 
         let collector = HealthCollector::new(
             HealthCollectorConfig {
@@ -300,6 +348,7 @@ mod tests {
             sensors,
             spool,
             enrich,
+            rarity,
             |_| {},
         );
 

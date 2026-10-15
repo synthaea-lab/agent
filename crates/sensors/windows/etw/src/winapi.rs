@@ -360,6 +360,35 @@ pub(crate) fn snapshot_processes() -> Vec<(u32, String)> {
     out
 }
 
+/// `ProcessSequenceNumber`: a `ULONGLONG` (phnt `PROCESSINFOCLASS` 92).
+const PROCESS_SEQUENCE_NUMBER: u32 = 92;
+
+/// The kernel's sequence number of the process (#725): the same value
+/// Kernel-Process `ProcessStart` reports as `ProcessSequenceNumber`, read for
+/// processes that predate the trace. `None` when it cannot be opened or the
+/// build has no such class; 0 is treated as "no stamp".
+pub(crate) fn read_process_sequence_number(pid: u32) -> Option<u64> {
+    // SAFETY: the handle is null-checked and closed on every path;
+    // NtQueryInformationProcess writes at most the 8 bytes of the local u64.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let mut sequence = 0u64;
+        let mut ret_len = 0u32;
+        let status = NtQueryInformationProcess(
+            process,
+            PROCESS_SEQUENCE_NUMBER,
+            (&mut sequence as *mut u64).cast(),
+            size_of::<u64>() as u32,
+            &mut ret_len,
+        );
+        CloseHandle(process);
+        (status == 0 && sequence != 0).then_some(sequence)
+    }
+}
+
 /// Live pid → image name via Win32 — the fallback for the ETW race where a
 /// `ConnectEvent` arrives before the `ExecEvent` populated the store.
 /// `PROCESS_QUERY_LIMITED_INFORMATION` needs no admin privileges.
@@ -412,6 +441,13 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(expanded, long);
         assert!(expanded.unwrap().ends_with(r"\a long file name.exe"));
+    }
+
+    #[test]
+    fn this_process_has_a_stable_sequence_number() {
+        let first = read_process_sequence_number(std::process::id());
+        assert!(first.is_some());
+        assert_eq!(read_process_sequence_number(std::process::id()), first);
     }
 
     #[test]

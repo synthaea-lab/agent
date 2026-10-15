@@ -20,7 +20,7 @@ use schema::{
 
 use crate::{
     amsi, normalize,
-    sensor::{SharedState, basename, meta},
+    sensor::{SharedState, basename},
     winapi, zone_identifier,
 };
 
@@ -83,6 +83,12 @@ pub(crate) const ALL_PROVIDERS: [(&str, &str); 12] = [
     ("NTLM", NTLM_GUID),
 ];
 
+/// A Kernel-Process sequence number field, `None` when the event version has
+/// none or it is 0 (no stamp).
+fn sequence_number(parser: &Parser, field: &str) -> Option<u64> {
+    parser.try_parse::<u64>(field).ok().filter(|&n| n != 0)
+}
+
 /// Kernel-Process keywords the sensor reads: `WINEVENT_KEYWORD_PROCESS` (0x10,
 /// EIDs 1/2) and `WINEVENT_KEYWORD_IMAGE` (0x40, EID 5). Left unset, ferrisetw
 /// enables every keyword, and every thread start on the host (EID 3, keyword
@@ -137,7 +143,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             // yielded 0 anyway.
             let ppid = 0;
             sink.on_event(Event::ImageLoad(ImageLoadEvent {
-                meta: meta(pid, ppid, comm, timestamp_ns),
+                meta: state.meta(pid, ppid, comm, timestamp_ns),
                 image_path,
             }));
             return;
@@ -150,9 +156,18 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         let image_path = state.normalize_path(&raw_image);
         let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
 
+        // #725: ProcessStart v4+ carries both incarnation stamps; an older
+        // version leaves them unset rather than guessed.
+        let generation = sequence_number(&parser, "ProcessSequenceNumber");
+        let parent_generation = sequence_number(&parser, "ParentProcessSequenceNumber");
+
         // Never store "<unknown>": a cache hit on it would suppress live lookups.
         if image_path != "<unknown>" {
-            state.pids.lock().unwrap().insert(pid, image_path.clone());
+            state
+                .pids
+                .lock()
+                .unwrap()
+                .insert(pid, image_path.clone(), generation);
         }
         // Lineage at exec time (schema parent fields): the parent is usually alive
         // and already in the store.
@@ -165,8 +180,13 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         let cmdline = winapi::read_process_cmdline(pid).unwrap_or_else(|| image_path.clone());
 
         let comm = basename(&image_path);
+        let mut meta = state.meta(pid, ppid, comm, timestamp_ns);
+        // The parent's stamp as the kernel recorded it at this creation, not
+        // whatever holds `ppid` in the store by now.
+        meta.process_generation = generation.or(meta.process_generation);
+        meta.parent_process_generation = parent_generation.or(meta.parent_process_generation);
         sink.on_event(Event::Exec(ExecEvent {
-            meta: meta(pid, ppid, comm, timestamp_ns),
+            meta,
             image_path,
             cmdline,
             argv: vec![], // Windows has a flat command line; consumers fall back
@@ -209,7 +229,7 @@ pub(crate) fn network_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
                 return;
             };
             sink.on_event(Event::UdpSend(UdpSendEvent {
-                meta: meta(pid, 0, comm, timestamp_ns),
+                meta: state.meta(pid, 0, comm, timestamp_ns),
                 daddr,
                 dport,
                 size,
@@ -264,7 +284,7 @@ pub(crate) fn network_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             return;
         };
         sink.on_event(Event::Connect(ConnectEvent {
-            meta: meta(pid, 0, comm, timestamp_ns),
+            meta: state.meta(pid, 0, comm, timestamp_ns),
             daddr,
             dport,
         }));
@@ -299,7 +319,7 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         };
         if eid == 26 {
             forward_mark_removal(&parser, &state, sink.as_ref(), || {
-                meta(pid, 0, comm, timestamp_ns)
+                state.meta(pid, 0, comm, timestamp_ns)
             });
             return;
         }
@@ -326,7 +346,7 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         }
         // #365: a create/write on `host:Zone.Identifier` is the mark-of-the-web
         // being written. The stream is read back off this thread (#439).
-        let meta = meta(pid, 0, comm, timestamp_ns);
+        let meta = state.meta(pid, 0, comm, timestamp_ns);
         if let Some(host) = zone_identifier::stream_host_path(&path) {
             state.marks.offer(zone_identifier::MarkWrite {
                 stream_path: path.clone(),
@@ -413,7 +433,7 @@ pub(crate) fn dns_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
         let comm = state.comm_for(pid).unwrap_or_default();
 
         sink.on_event(Event::DnsQuery(DnsQueryEvent {
-            meta: meta(pid, 0, comm, timestamp_ns),
+            meta: state.meta(pid, 0, comm, timestamp_ns),
             query,
             qtype: u32::from(qtype),
             result: if result_raw.is_empty() {
@@ -498,7 +518,7 @@ pub(crate) fn registry_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState
         let comm = state.comm_for(pid).unwrap_or_default();
 
         sink.on_event(Event::RegistrySet(RegistrySetEvent {
-            meta: meta(pid, 0, comm, timestamp_ns),
+            meta: state.meta(pid, 0, comm, timestamp_ns),
             key,
             value_name,
             data_type,
@@ -562,7 +582,7 @@ pub(crate) fn powershell_provider(sink: Arc<dyn EventSink>, state: Arc<SharedSta
         let comm = state.comm_for(pid).unwrap_or_default();
 
         sink.on_event(Event::ScriptBlock(ScriptBlockEvent {
-            meta: meta(pid, 0, comm, timestamp_ns),
+            meta: state.meta(pid, 0, comm, timestamp_ns),
             script_block_id,
             path,
             text,
@@ -628,7 +648,7 @@ pub(crate) fn amsi_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         let comm = state.comm_for(pid).unwrap_or_default();
 
         sink.on_event(Event::AmsiContent(AmsiContentEvent {
-            meta: meta(pid, 0, comm, timestamp_ns),
+            meta: state.meta(pid, 0, comm, timestamp_ns),
             session,
             app_name: parser.try_parse("appname").unwrap_or_default(),
             content_name: (!content_name.is_empty()).then_some(content_name),
@@ -676,7 +696,7 @@ pub(crate) fn ldap_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         let attributes: String = parser.try_parse("AttributeList").unwrap_or_default();
         let comm = state.comm_for(pid).unwrap_or_default();
         sink.on_event(Event::LdapSearch(LdapSearchEvent {
-            meta: meta(pid, 0, comm, timestamp_ns),
+            meta: state.meta(pid, 0, comm, timestamp_ns),
             filter: parser.try_parse("SearchFilter").unwrap_or_default(),
             base_dn: parser.try_parse("DistinguishedName").unwrap_or_default(),
             scope: parser.try_parse("ScopeOfSearch").unwrap_or(0),
@@ -770,7 +790,7 @@ pub(crate) fn ntlm_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
             .unwrap_or_else(|| record.process_id());
         let comm = state.comm_for(pid).unwrap_or_else(|| text("ProcessName"));
         sink.on_event(Event::NtlmAuth(NtlmAuthEvent {
-            meta: meta(pid, 0, comm, timestamp_ns),
+            meta: state.meta(pid, 0, comm, timestamp_ns),
             direction,
             user,
             target,
@@ -836,7 +856,7 @@ pub(crate) fn wmi_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
         }
 
         sink.on_event(Event::WmiActivity(WmiActivityEvent {
-            meta: meta(pid, 0, comm, timestamp_ns),
+            meta: state.meta(pid, 0, comm, timestamp_ns),
             namespace,
             query,
             method,
@@ -894,7 +914,7 @@ pub(crate) fn dotnet_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>)
         let comm = state.comm_for(pid).unwrap_or_default();
 
         sink.on_event(Event::AssemblyLoad(AssemblyLoadEvent {
-            meta: meta(pid, 0, comm, timestamp_ns),
+            meta: state.meta(pid, 0, comm, timestamp_ns),
             assembly_name,
             flags,
         }));
@@ -942,7 +962,7 @@ pub(crate) fn smb_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
         let comm = state.comm_for(pid).unwrap_or_default();
 
         sink.on_event(Event::SmbConnect(SmbConnectEvent {
-            meta: meta(pid, 0, comm, timestamp_ns),
+            meta: state.meta(pid, 0, comm, timestamp_ns),
             server_name,
         }));
     };

@@ -494,8 +494,9 @@ pub struct EventMeta {
     /// that carry the same `pid`** means anything: it is not a timestamp, not
     /// comparable across pids, and not stable across agent restarts (the Linux
     /// sensor assigns it at `sched_process_fork`, or from `/proc` for a process
-    /// that predates the agent). `None` when the sensor has no such stamp
-    /// (Windows, macOS) or could not read it; a consumer must then treat the pid
+    /// that predates the agent; the Windows sensor reports the kernel's process
+    /// sequence number, #725). `None` when the sensor has no such stamp (macOS)
+    /// or could not read it; a consumer must then treat the pid
     /// as unchanged, never as new.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_generation: Option<u64>,
@@ -1531,6 +1532,19 @@ pub struct HealthBeacon {
     pub spool_dropped: u64,
     /// Cumulative events dropped from enrichment queue (backpressure).
     pub enrich_dropped: u64,
+    /// Cumulative executed images the fleet's common set called rare whose evidence reached
+    /// a process belief (ADR-0020, issue #76). Absent in a beacon from an older agent: zero.
+    #[serde(default)]
+    pub rarity_applied: u64,
+    /// Cumulative executions the rarity evidence could not judge: no snapshot, one covering
+    /// too few hosts, or no usable hash. A high count with no applied one says why rarity is
+    /// silent. Absent in a beacon from an older agent: zero.
+    #[serde(default)]
+    pub rarity_withheld: u64,
+    /// Cumulative rare images whose evidence found no belief to land on (the correlator had
+    /// evicted or never created it): the loss, counted. Absent in an older beacon: zero.
+    #[serde(default)]
+    pub rarity_unapplied: u64,
 }
 
 /// A logon/authentication outcome, or a privileged-session assignment — shared
