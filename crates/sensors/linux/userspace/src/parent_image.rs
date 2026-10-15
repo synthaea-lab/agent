@@ -24,13 +24,20 @@
 //! that did exec, if that event was lost, would be given its forker's image.
 //!
 //! Bounded like the other per-pid state, in batches, and the loss is counted and logged, never
-//! silent. There is no exit event on this path, so stale entries are only ever replaced (by the
-//! pid's next exec) or evicted, and the generation check is what keeps a stale one from being
-//! read. Eviction prefers the entries of processes that no longer exist (asked of `/proc`)
+//! silent. The count is split in two: an entry whose process had exited costs nothing (it can
+//! never be a parent again) and is a debug line; one whose process was still alive is the loss,
+//! and is the one that is warned about, at most once a minute (#783).
+//!
+//! There is no exit event on this path, so stale entries are only ever replaced (by the pid's
+//! next exec) or evicted, and the generation check is what keeps a stale one from being read.
+//! Eviction prefers the entries of processes that no longer exist (asked of `/proc`)
 //! before the least recently used live ones, so an idle long-lived parent is not pushed out by
 //! the short-lived processes that came after it (#783).
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use schema::ExecEvent;
 
@@ -65,6 +72,18 @@ pub(crate) struct ExecStamps {
     pub(crate) parent_never_exec_ed: bool,
 }
 
+/// What the cap dropped, by whether the process was still alive (#783).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EvictionCounts {
+    pub(crate) dead: u64,
+    pub(crate) live: u64,
+}
+
+/// The live-eviction warning is logged at most this often; its fields are cumulative totals, so
+/// a rate-limited line still carries the whole count.
+const LIVE_EVICTION_WARN_EVERY: Duration = Duration::from_secs(60);
+
 /// Whether `pid` is a live process (its `/proc/<pid>` exists).
 fn process_exists(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
@@ -74,7 +93,14 @@ pub(crate) struct ParentImages {
     entries: HashMap<u32, Entry>,
     cap: usize,
     tick: u64,
-    evicted: u64,
+    /// Entries dropped by the cap whose process no longer existed: nothing was lost, a child of
+    /// that process cannot be exec'd any more.
+    evicted_dead: u64,
+    /// Entries dropped by the cap whose process was still alive (the cache had no exited ones to
+    /// drop): the loss, a later child of such a process carries no `parent_image_path`.
+    evicted_live: u64,
+    /// When the live-eviction warning was last logged, to log it once a minute (#783).
+    last_live_warn: Option<Instant>,
     /// Whether a pid is a live process now; swapped in tests.
     is_alive: fn(u32) -> bool,
 }
@@ -99,7 +125,9 @@ impl ParentImages {
             entries: HashMap::new(),
             cap,
             tick: 0,
-            evicted: 0,
+            evicted_dead: 0,
+            evicted_live: 0,
+            last_live_warn: None,
             is_alive,
         }
     }
@@ -138,12 +166,19 @@ impl ParentImages {
         self.entries.contains_key(&pid)
     }
 
-    /// Entries dropped by the cap since creation (also in the warning each batch logs).
-    /// Non-zero means exits are not retiring entries fast enough for this host, or the
-    /// cap is too small.
+    /// Entries dropped by the cap since creation, split by whether the process was still alive.
+    #[cfg(test)]
+    pub(crate) fn eviction_counts(&self) -> EvictionCounts {
+        EvictionCounts {
+            dead: self.evicted_dead,
+            live: self.evicted_live,
+        }
+    }
+
+    /// All entries dropped by the cap since creation, dead and live.
     #[cfg(test)]
     pub(crate) fn evicted(&self) -> u64 {
-        self.evicted
+        self.evicted_dead + self.evicted_live
     }
 
     fn parent_of(&mut self, exec: &ExecEvent) -> Option<String> {
@@ -225,6 +260,7 @@ impl ParentImages {
             .filter(|pid| !(self.is_alive)(*pid))
             .take(batch)
             .collect();
+        let dead = victims.len();
         for (_, pid) in &by_age {
             if victims.len() >= batch {
                 break;
@@ -233,14 +269,38 @@ impl ParentImages {
                 victims.push(*pid);
             }
         }
+        let live = victims.len() - dead;
         for pid in victims {
             self.entries.remove(&pid);
-            self.evicted += 1;
         }
+        self.evicted_dead += dead as u64;
+        self.evicted_live += live as u64;
+        if live > 0 {
+            self.warn_live_eviction();
+        } else {
+            tracing::debug!(
+                size = self.entries.len(),
+                dead,
+                "parent image cache full: dropped entries of exited processes"
+            );
+        }
+    }
+
+    /// Says, at most once a minute, that live processes were evicted: the one case that costs a
+    /// `parent_image_path`. Evicting an exited process loses nothing and is only a debug line.
+    fn warn_live_eviction(&mut self) {
+        if self
+            .last_live_warn
+            .is_some_and(|at| at.elapsed() < LIVE_EVICTION_WARN_EVERY)
+        {
+            return;
+        }
+        self.last_live_warn = Some(Instant::now());
         tracing::warn!(
             size = self.entries.len(),
-            evicted_total = self.evicted,
-            "parent image cache hit its cap: some exec events will carry no parent_image_path"
+            live_evicted_total = self.evicted_live,
+            dead_evicted_total = self.evicted_dead,
+            "parent image cache evicted live processes: a later child of one carries no parent_image_path"
         );
     }
 }
@@ -640,6 +700,51 @@ mod tests {
         );
         assert!(cache.contains(108));
         assert!(cache.evicted() >= 1);
+    }
+
+    // --- what an eviction cost: an exited process is nothing, a live one is a lost parent (#783) ---
+
+    #[test]
+    fn evicting_exited_processes_is_counted_as_dead_never_as_live() {
+        let mut cache = ParentImages::with_liveness(8, only_pid_100_is_alive);
+        note(&mut cache, &mut exec(100, 7, 1, 1, "/usr/sbin/sshd"));
+        for pid in 1_000..1_100u32 {
+            note(&mut cache, &mut exec(pid, 1, 1, 1, "/usr/bin/true"));
+        }
+        let counts = cache.eviction_counts();
+        assert!(
+            counts.dead > 0,
+            "the flood must have evicted exited processes"
+        );
+        assert_eq!(counts.live, 0, "the idle live parent was never evicted");
+        assert!(cache.contains(100));
+    }
+
+    #[test]
+    fn evicting_a_live_process_is_counted_as_live() {
+        let mut cache = ParentImages::with_liveness(8, every_pid_is_alive);
+        for pid in 100..140u32 {
+            note(&mut cache, &mut exec(pid, 1, 1, 1, "/bin/x"));
+        }
+        let counts = cache.eviction_counts();
+        assert!(counts.live > 0, "nothing was dead, so live ones had to go");
+        assert_eq!(counts.dead, 0);
+    }
+
+    fn every_pid_but_300_is_alive(pid: u32) -> bool {
+        pid != 300
+    }
+
+    #[test]
+    fn a_batch_that_runs_out_of_dead_processes_counts_the_rest_as_live() {
+        // Cap 16 evicts 2 at a time: the oldest entry (pid 300) is dead and goes first, the second
+        // victim has to be the oldest live one.
+        let mut cache = ParentImages::with_liveness(16, every_pid_but_300_is_alive);
+        for pid in 300..317u32 {
+            note(&mut cache, &mut exec(pid, 1, 1, 1, "/bin/x"));
+        }
+        assert_eq!(cache.eviction_counts(), EvictionCounts { dead: 1, live: 1 });
+        assert!(!cache.contains(300) && !cache.contains(301));
     }
 
     #[test]
