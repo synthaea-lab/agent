@@ -263,7 +263,17 @@ pub mod time;
 /// Closes the last gap in #263's telemetry proposal besides the netlink
 /// socket-table baseline (a separate, periodic-snapshot source, not a
 /// discrete syscall trace like the rest of this file).
-pub const SCHEMA_VERSION: u32 = 42;
+///
+/// Bumped 42 → 43 for [`Event::PackageChange`] (#87): a package was added,
+/// removed, or changed version since the agent's last diffed inventory
+/// snapshot — the walking-skeleton slice of the asset inventory, packages
+/// only, Linux only.
+/// Bumped 43 → 44 for [`Event::NtlmAuth`] (#364): NTLM authentications from
+/// the Microsoft-Windows-NTLM provider (direction, account, target, remote
+/// address, NTLM version). Windows-only. It claimed 41 while #632 (`LdapSearch`)
+/// was open, then 43 after #263 (`SocketCreate`, 42) merged, then 44 after #772
+/// (`PackageChange`) took 43; same coordination note as above.
+pub const SCHEMA_VERSION: u32 = 44;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -484,8 +494,9 @@ pub struct EventMeta {
     /// that carry the same `pid`** means anything: it is not a timestamp, not
     /// comparable across pids, and not stable across agent restarts (the Linux
     /// sensor assigns it at `sched_process_fork`, or from `/proc` for a process
-    /// that predates the agent). `None` when the sensor has no such stamp
-    /// (Windows, macOS) or could not read it; a consumer must then treat the pid
+    /// that predates the agent; the Windows sensor reports the kernel's process
+    /// sequence number, #725). `None` when the sensor has no such stamp (macOS)
+    /// or could not read it; a consumer must then treat the pid
     /// as unchanged, never as new.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_generation: Option<u64>,
@@ -1075,6 +1086,49 @@ pub struct DefenderEvent {
     pub new_value: Option<String>,
 }
 
+/// Direction of an [`NtlmAuthEvent`], seen from this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NtlmDirection {
+    /// This host authenticated to a remote resource (EIDs 4020/4021/4026/4027).
+    Outgoing,
+    /// A remote client authenticated to this host (EIDs 4022/4023).
+    Incoming,
+}
+
+/// An NTLM authentication, from the Microsoft-Windows-NTLM provider (#364):
+/// who, to or from where, and with which NTLM version. Windows 11 24H2 emits
+/// these by default (lab, 2026-10-02, no audit setting).
+///
+/// `meta` is the process the provider reports, which in practice is often the
+/// kernel (`SYSTEM`, pid 4) for SMB: the requesting process is not reliably
+/// available, and rules must not depend on it. Failed incoming logons are
+/// deliberately **not** turned into [`AuthEvent`]s here: the Security log's
+/// 4625 already reports them, and counting them twice would skew the
+/// brute-force burst rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NtlmAuthEvent {
+    pub meta: EventMeta,
+    pub direction: NtlmDirection,
+    /// The account used (`Username`, plus `DomainName` as `DOMAIN\user` when
+    /// the provider reports one).
+    pub user: String,
+    /// What was authenticated to: the target service/SPN when present
+    /// (`cifs/host`), else the target machine.
+    pub target: String,
+    /// The remote end: the target IP for outgoing, the client IP for incoming,
+    /// when the provider reports a parseable one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_address: Option<core::net::IpAddr>,
+    /// The negotiated version as the provider names it (`NTLMv2`, `NTLMv1`,
+    /// `LM`, ...).
+    pub ntlm_version: String,
+    /// Incoming only: the NTSTATUS of the attempt, hex (`0xc000006d` = bad
+    /// user name or password). `None` when the provider gives none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
 /// An LDAP search a process sent, from EID 30 of the
 /// Microsoft-Windows-LDAP-Client provider (#364): the directory-reconnaissance
 /// fingerprint an endpoint can see. Kerberoasting / AS-REP roasting start with
@@ -1478,6 +1532,19 @@ pub struct HealthBeacon {
     pub spool_dropped: u64,
     /// Cumulative events dropped from enrichment queue (backpressure).
     pub enrich_dropped: u64,
+    /// Cumulative executed images the fleet's common set called rare whose evidence reached
+    /// a process belief (ADR-0020, issue #76). Absent in a beacon from an older agent: zero.
+    #[serde(default)]
+    pub rarity_applied: u64,
+    /// Cumulative executions the rarity evidence could not judge: no snapshot, one covering
+    /// too few hosts, or no usable hash. A high count with no applied one says why rarity is
+    /// silent. Absent in a beacon from an older agent: zero.
+    #[serde(default)]
+    pub rarity_withheld: u64,
+    /// Cumulative rare images whose evidence found no belief to land on (the correlator had
+    /// evicted or never created it): the loss, counted. Absent in an older beacon: zero.
+    #[serde(default)]
+    pub rarity_unapplied: u64,
 }
 
 /// A logon/authentication outcome, or a privileged-session assignment — shared
@@ -2031,6 +2098,34 @@ pub struct HttpSummaryEvent {
     pub top_clients: Vec<HttpClientCount>,
 }
 
+/// What happened to a package between two inventory snapshots (`crates/inventory`'s
+/// pure diff, issue #87). `Upgraded` carries both versions so a case shows the actual
+/// transition, not just "something changed".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageChangeKind {
+    Added,
+    Removed,
+    Upgraded,
+}
+
+/// A package was added, removed, or changed version since the agent's last inventory
+/// snapshot (issue #87). Not a kernel event: the diff runs periodically against the
+/// package manager's own database (`dpkg`/`rpm`/...), so `meta.pid`/`ppid` are 0 and
+/// `meta.comm` names the package manager, same convention as [`HttpRequestEvent`].
+/// `previous_version`/`version` are `None` exactly when [`Self::change`] is
+/// `Removed`/`Added` respectively — both `Some` only for `Upgraded`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageChangeEvent {
+    pub meta: EventMeta,
+    pub package: String,
+    pub change: PackageChangeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
 /// Which user/group identity syscall produced an [`IdentityChangeEvent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2133,6 +2228,7 @@ pub enum Event {
     AmsiContent(AmsiContentEvent),
     Defender(DefenderEvent),
     LdapSearch(LdapSearchEvent),
+    NtlmAuth(NtlmAuthEvent),
     WmiActivity(WmiActivityEvent),
     AssemblyLoad(AssemblyLoadEvent),
     SmbConnect(SmbConnectEvent),
@@ -2174,6 +2270,7 @@ pub enum Event {
     Prctl(PrctlEvent),
     HttpRequest(HttpRequestEvent),
     HttpSummary(HttpSummaryEvent),
+    PackageChange(PackageChangeEvent),
 }
 
 impl Event {
@@ -2195,6 +2292,7 @@ impl Event {
             Event::AmsiContent(e) => &e.meta,
             Event::Defender(e) => &e.meta,
             Event::LdapSearch(e) => &e.meta,
+            Event::NtlmAuth(e) => &e.meta,
             Event::WmiActivity(e) => &e.meta,
             Event::AssemblyLoad(e) => &e.meta,
             Event::SmbConnect(e) => &e.meta,
@@ -2236,6 +2334,7 @@ impl Event {
             Event::Prctl(e) => &e.meta,
             Event::HttpRequest(e) => &e.meta,
             Event::HttpSummary(e) => &e.meta,
+            Event::PackageChange(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.

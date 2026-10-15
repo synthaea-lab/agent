@@ -8,6 +8,8 @@
 //! ```text
 //! release-tool manifest --release-version 3 --dir dist/ --out manifest.json
 //! release-tool sign --kind release --key-file release.key manifest.json --out signed.json
+//! release-tool roll-forward --from v2.json --release-version 5 --released-at 2026-10-12T09:30:00Z --out v5.json
+//! release-tool sign --kind content --key-file release.key v5.json --out v5-signed.json
 //! release-tool public-key --key-file release.key
 //! ```
 //!
@@ -18,6 +20,7 @@
 
 mod keyfile;
 mod manifest_dir;
+mod roll_forward;
 mod sign;
 
 use std::{io::Write as _, path::PathBuf};
@@ -50,6 +53,28 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Rebuild an earlier content manifest as a newer, unsigned one: the corrective release that
+    /// withdraws content from agents that already applied a later release (ADR-0032).
+    RollForward {
+        /// The earlier content manifest to restore (its signature is dropped).
+        #[arg(long)]
+        from: PathBuf,
+        /// The corrective release's `release_version`: the next number the control plane will assign,
+        /// one above the highest release of the ring (rolled-back ones included).
+        #[arg(long)]
+        release_version: u64,
+        /// When it is released, UTC, `YYYY-MM-DDTHH:MM:SSZ`.
+        #[arg(long)]
+        released_at: String,
+        /// The manifest of the release the ring is on now (the one being withdrawn). Optional:
+        /// prints what the corrective release removes and which paths need their earlier
+        /// bytes put back in the artifact store first.
+        #[arg(long)]
+        current: Option<PathBuf>,
+        /// Write here instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Sign a manifest file.
     Sign {
         /// Which manifest shape the file holds.
@@ -77,7 +102,9 @@ struct KeySource {
     #[arg(long, value_name = "FILE")]
     key_file: Option<PathBuf>,
     /// The public, checked-in test key. Lab and dev releases only: anyone can sign
-    /// with it, and a build that embeds it must not be shipped.
+    /// with it, and a build that embeds it must not be shipped. Exists only in a
+    /// `test-key` build (the default).
+    #[cfg(feature = "test-key")]
     #[arg(long)]
     test_key: bool,
 }
@@ -87,10 +114,44 @@ impl KeySource {
         if let Some(path) = &self.key_file {
             return keyfile::load(path);
         }
+        #[cfg(feature = "test-key")]
+        {
+            eprintln!(
+                "warning: signing with the PUBLIC test key; this release is for a lab, not for production"
+            );
+            Ok(updater::key::test_key_pair())
+        }
+        #[cfg(not(feature = "test-key"))]
+        {
+            anyhow::bail!("this build has no test key: pass --key-file")
+        }
+    }
+}
+
+/// What the corrective release does against the release the ring is on, for the operator.
+fn report_change(change: &roll_forward::Change, current_version: u64) {
+    eprintln!(
+        "against release {current_version}: {} unchanged, {} removed from agents, {} brought back",
+        change.unchanged,
+        change.removed.len(),
+        change.brought_back.len()
+    );
+    for path in &change.removed {
+        eprintln!("  removed        {path}");
+    }
+    for path in &change.brought_back {
+        eprintln!("  brought back   {path} (its bytes must be in the artifact store)");
+    }
+    if !change.restored_bytes.is_empty() {
         eprintln!(
-            "warning: signing with the PUBLIC test key; this release is for a lab, not for production"
+            "WARNING: {} path(s) hold different bytes in the release being withdrawn. The artifact \
+             store keeps one file per path, so put the earlier bytes back at these paths BEFORE \
+             publishing, or the publish is refused and agents could not fetch them:",
+            change.restored_bytes.len()
         );
-        Ok(updater::key::test_key_pair())
+        for path in &change.restored_bytes {
+            eprintln!("  restore bytes  {path}");
+        }
     }
 }
 
@@ -117,6 +178,37 @@ fn main() -> anyhow::Result<()> {
                 "unsigned release manifest v{release_version}: {} entries",
                 manifest.entries.len()
             );
+            emit(&serde_json::to_string_pretty(&manifest)?, out.as_ref())
+        }
+        Command::RollForward {
+            from,
+            release_version,
+            released_at,
+            current,
+            out,
+        } => {
+            let text = std::fs::read_to_string(&from)
+                .with_context(|| format!("cannot read {}", from.display()))?;
+            let manifest = roll_forward::roll_forward(&text, release_version, &released_at)?;
+            eprintln!(
+                "unsigned corrective content manifest v{release_version} for ring {} ({} entries, \
+                 the content of v{}); sign it with `release-tool sign --kind content`",
+                manifest.ring,
+                manifest.entries.len(),
+                serde_json::from_str::<updater::ContentManifest>(&text)
+                    .map_or(0, |earlier| earlier.release_version)
+            );
+            if let Some(current) = current {
+                let text = std::fs::read_to_string(&current)
+                    .with_context(|| format!("cannot read {}", current.display()))?;
+                let now: updater::ContentManifest =
+                    serde_json::from_str(&text).context("--current is not a content manifest")?;
+                let earlier: updater::ContentManifest = serde_json::from_str(
+                    &std::fs::read_to_string(&from)
+                        .with_context(|| format!("cannot read {}", from.display()))?,
+                )?;
+                report_change(&roll_forward::compare(&earlier, &now), now.release_version);
+            }
             emit(&serde_json::to_string_pretty(&manifest)?, out.as_ref())
         }
         Command::Sign {

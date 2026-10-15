@@ -404,6 +404,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         content_dir,
         log_sources: _,
         deception,
+        config_path: _,
     } = opts;
     let pipeline = super::common::wire_run_pipeline(
         seeded_rule_state(),

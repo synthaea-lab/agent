@@ -1,7 +1,7 @@
 //! Python/Rust parity for the T1 behavior vector (issue #617).
 //!
 //! Consumes `ml/tests/fixtures/t1_events.jsonl` (the agent's wire format) and
-//! `ml/tests/fixtures/t1_golden.jsonl` (`{pid, process_generation, features[23]}` per
+//! `ml/tests/fixtures/t1_golden.jsonl` (`{pid, process_generation, features[17]}` per
 //! incarnation), both written by `ml/tests/fixtures/gen_t1_parity.py`. The Python
 //! counterpart is `ml/tests/test_t1_parity.py`.
 //!

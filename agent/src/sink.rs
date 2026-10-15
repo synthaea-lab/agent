@@ -10,6 +10,8 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    thread,
+    time::Duration,
 };
 
 use policy::ResponsePolicy;
@@ -42,7 +44,7 @@ struct ResponseHooks {
 /// if several sensors ever share one sink.
 pub(crate) struct DetectionSink {
     rule_state: Mutex<rules::RuleState>,
-    correlator: Mutex<correlator::CorrelationEngine>,
+    correlator: Arc<Mutex<correlator::CorrelationEngine>>,
     /// ML correlation scorer (issue #46 Phase 3, #47 Phase 2): scores behavior over
     /// the correlator window and feeds the Bayesian belief state. `None` when the
     /// model is unavailable (missing registry, load error) — the agent works without
@@ -55,6 +57,14 @@ pub(crate) struct DetectionSink {
     /// freshly loaded engine while the agent keeps running, the same reason
     /// every other mutable field on this struct is a `Mutex`.
     sigma: Mutex<Option<sigma::SigmaEngine>>,
+    /// The fleet's common-set snapshot (ADR-0020, issue #76) from
+    /// `<content_root>/snapshots/common-set.bin`, or `None` while there is none: the
+    /// "not in the common set" evidence is withheld without one. Swapped whole on
+    /// `reload_content`, like the engines above, so a reader never sees a half-loaded
+    /// filter; nothing reads it on the capture path yet (the lookup is the next slice).
+    common_set: Arc<Mutex<Option<Arc<ml::features::common_set::CommonSetSnapshot>>>>,
+    /// What became of the rarity judgements, for the health beacon.
+    rarity_stats: Arc<RarityStats>,
     /// The single alert funnel (issue #388): alerts.ndjson + stderr + the
     /// in-memory recent-alerts buffer served to `cli detections`. Shared with
     /// the YARA scan worker and quarantine.
@@ -185,7 +195,11 @@ const CANARY_RULE_ID: &str = "DECEPTION-CANARY";
 const DAMAGE_MANIFEST_MAX: usize = 100;
 
 /// The escalation decision (#612) as a free function so the YARA scan worker, which
-/// has no `DetectionSink`, raises the same alert as every other engine (#614).
+/// has no `DetectionSink`, raises the same alert as every other engine (#614). A new
+/// verdict snapshot (first sighting, a severity raise, or a recurrence outside the
+/// dedup window — never a silently absorbed duplicate) whose composed severity
+/// warrants it raises one `RESPONSE-ESCALATE` audit alert. Never kills or
+/// quarantines, and works with or without `enable_response`.
 fn escalate_if_warranted(alert_log: &AlertLog, fused: &verdict::Verdict) {
     if !response::should_escalate(fused.severity) {
         return;
@@ -199,6 +213,108 @@ fn escalate_if_warranted(alert_log: &AlertLog, fused: &verdict::Verdict) {
         fused.techniques.join(", ")
     );
     alert_log.record("RESPONSE-ESCALATE", message);
+}
+
+/// Records one finding: fused into the verdict, written to the alert log, and
+/// escalated when the fused severity warrants it, then handed to `persist` (the
+/// durable detection spool, when one is configured). A free function so the
+/// enrichment worker, which has no `DetectionSink`, records the signature-gated
+/// findings the same way (#441).
+///
+/// The worker records a gated finding when it reaches the event, so it can enter
+/// the verdict after findings the capture thread already recorded for later
+/// events of the same entity. Fusion keys on the event's own timestamp and its
+/// dedup check saturates, so a late arrival can at most be absorbed as a
+/// duplicate, never reopen a window; only the order of the evidence list differs.
+fn record_detection(
+    verdict: &Mutex<verdict::VerdictEngine>,
+    alert_log: &AlertLog,
+    finding: Finding<'_>,
+    event: &Event,
+    evidence: Vec<Event>,
+    persist: Option<&dyn Fn(schema::detection::Detection)>,
+) -> Option<verdict::Verdict> {
+    let now_ns = event.meta().timestamp_ns;
+    let detection = schema::detection::Detection {
+        timestamp_ns: now_ns,
+        severity: finding.severity,
+        title: finding.message.to_string(),
+        source: finding.source,
+        score: None,
+        attributions: Vec::new(),
+        techniques: techniques_from(finding.technique),
+        events: std::iter::once(event.clone()).chain(evidence).collect(),
+    };
+    let spooled = persist.map(|_| detection.clone());
+    let result = verdict.lock().unwrap().record(
+        finding.entity.clone(),
+        finding.technique,
+        detection,
+        now_ns,
+    );
+    alert_log.record(finding.technique, finding.message.to_string());
+    if let Some(fused) = &result {
+        escalate_if_warranted(alert_log, fused);
+    }
+    if let (Some(persist), Some(detection)) = (persist, spooled) {
+        persist(detection);
+    }
+    result
+}
+
+/// One engine's finding, as [`record_detection`] takes it.
+struct Finding<'a> {
+    entity: &'a verdict::EntityKey,
+    technique: &'a str,
+    message: &'a str,
+    source: schema::detection::DetectionSource,
+    severity: schema::detection::Severity,
+}
+
+/// [`record_detection`] for one `rules::Alert`.
+fn record_rule_alert(
+    verdict: &Mutex<verdict::VerdictEngine>,
+    alert_log: &AlertLog,
+    event: &Event,
+    alert: &rules::Alert,
+    persist: Option<&dyn Fn(schema::detection::Detection)>,
+) {
+    let finding = Finding {
+        entity: &entity_key(event.meta()),
+        technique: alert.technique,
+        message: &alert.message,
+        source: schema::detection::DetectionSource::Rule {
+            rule_id: alert.technique.to_string(),
+        },
+        severity: alert.severity,
+    };
+    record_detection(verdict, alert_log, finding, event, Vec::new(), persist);
+}
+
+/// The enrichment worker's append to the durable detection spool. A failure
+/// loses only the upload copy: the finding is already in the alert log.
+fn spool_on_worker(
+    spool: Option<&Mutex<store::EventSpool>>,
+    detection: schema::detection::Detection,
+) {
+    if let Some(spool) = spool
+        && let Err(e) = crate::upload::persist_detection(spool, detection)
+    {
+        tracing::warn!(error = %e, "detection spool append failed");
+    }
+}
+
+/// What the enrichment learnt about an exec's image. `chain_verified`: the
+/// verdict is Authenticode, whose `Valid` is a chain to a trusted root; macOS
+/// `codesign` and the ES flags call ad-hoc signatures valid too.
+fn image_signature(event: &Event) -> rules::ImageSignature {
+    rules::ImageSignature {
+        verdict: match event {
+            Event::Exec(e) => e.signature,
+            _ => None,
+        },
+        chain_verified: cfg!(windows),
+    }
 }
 
 /// The `case_id` of a correlator finding: `{ppid}:{comm}`, with `@{generation}` of the
@@ -273,6 +389,63 @@ fn locate_model_dir(roots: &[&Path], family: &str) -> std::path::PathBuf {
 }
 
 impl DetectionSink {
+    /// Starts the one-second clock that expires pending web-shell correlations even
+    /// when the sensor has stopped producing events. The worker holds only a `Weak`
+    /// reference while sleeping, and releases the correlator mutex before log I/O.
+    pub(crate) fn start_correlator_ticker(self: &Arc<Self>) -> std::io::Result<()> {
+        let sink = Arc::downgrade(self);
+        thread::Builder::new()
+            .name("correlator-tick".into())
+            .spawn(move || {
+                loop {
+                    thread::sleep(Duration::from_secs(1));
+                    let Some(sink) = sink.upgrade() else {
+                        break;
+                    };
+                    sink.advance_correlation_time(schema::time::now_ns());
+                }
+            })?;
+        Ok(())
+    }
+
+    fn advance_correlation_time(&self, now_ns: u64) {
+        let alerts = {
+            let mut correlator = self.correlator.lock().unwrap();
+            correlator.advance_time(now_ns)
+        };
+        self.emit_correlator_alerts(&alerts, None);
+    }
+
+    fn emit_correlator_alerts(
+        &self,
+        alerts: &[correlator::CorrelationAlert],
+        default_event: Option<&Event>,
+    ) {
+        let mut high_confidence_pid = None;
+        for alert in alerts {
+            let Some(event) = alert.trigger_event.as_deref().or(default_event) else {
+                continue;
+            };
+            let entity = entity_key(event.meta());
+            let case_id = correlator_case_id(&entity);
+            let source = schema::detection::DetectionSource::Correlator { case_id };
+            self.record_and_emit(
+                &entity,
+                alert.technique,
+                &alert.message,
+                source,
+                alert.severity,
+                event,
+            );
+            if crosses_kill_gate(alert.technique) {
+                high_confidence_pid = Some(event.meta().pid);
+            }
+        }
+        if let Some(pid) = high_confidence_pid {
+            self.maybe_kill(pid);
+        }
+    }
+
     /// `rule_state` arrives already seeded by the caller (from /proc or the
     /// platform's process list — see `commands`). `spool` is the transport
     /// spool (`run --server`), `None` when the agent runs standalone.
@@ -303,10 +476,38 @@ impl DetectionSink {
         let events_log = events_path
             .map(|path| JsonlWriter::open(path).map(Arc::new))
             .transpose()?;
-        let detection_spool_for_worker = detection_spool.clone();
+        let verdict = Arc::new(Mutex::new(verdict::VerdictEngine::new(
+            VERDICT_DEDUP_WINDOW_NS,
+        )));
+        // Shared with the enrichment worker, which learns an exec's hash after it was correlated
+        // and feeds the rarity evidence back (ADR-0020, #76).
+        let correlator = Arc::new(Mutex::new(correlator::CorrelationEngine::new()));
+        let common_set = Arc::new(Mutex::new(
+            load_common_set(&content_root).into_option().map(Arc::new),
+        ));
+        let rarity_stats = Arc::new(RarityStats::default());
+        let (rarity_correlator, rarity_common_set, worker_rarity_stats) =
+            (correlator.clone(), common_set.clone(), rarity_stats.clone());
+        let (gate_verdict, gate_alert_log) = (verdict.clone(), alert_log.clone());
+        let (gate_spool, worker_spool) = (detection_spool.clone(), detection_spool.clone());
         let enrich_queue = EnrichQueue::start_with_detections(
             enrich::Enricher::new(),
-            move |event| {
+            move |event, gated| {
+                if let Some(alert) = gated.and_then(|gated| gated.resolve(image_signature(&event)))
+                {
+                    // Already on the worker: append directly, no trip through the queue.
+                    let persist = |detection| spool_on_worker(gate_spool.as_deref(), detection);
+                    let persist = gate_spool.as_ref().map(|_| &persist as &dyn Fn(_));
+                    record_rule_alert(&gate_verdict, &gate_alert_log, &event, &alert, persist);
+                }
+                if let Event::Exec(exec) = &event {
+                    note_image_rarity(
+                        &rarity_correlator,
+                        &rarity_common_set,
+                        &worker_rarity_stats,
+                        exec,
+                    );
+                }
                 if let Some(events_log) = &events_log {
                     events_log.write(&event);
                 }
@@ -318,23 +519,16 @@ impl DetectionSink {
                     tracing::warn!(error = %e, "spool append failed — event stays local-only");
                 }
             },
-            move |detection| {
-                if let Some(spool) = &detection_spool_for_worker
-                    && let Err(e) = crate::upload::persist_detection(spool, detection)
-                {
-                    tracing::warn!(error = %e, "detection spool append failed");
-                }
-            },
+            move |detection| spool_on_worker(worker_spool.as_deref(), detection),
         );
         let response: Arc<Mutex<Option<ResponseHooks>>> = Arc::new(Mutex::new(None));
-        let verdict = Arc::new(Mutex::new(verdict::VerdictEngine::new(
-            VERDICT_DEDUP_WINDOW_NS,
-        )));
         Ok(Self {
             rule_state: Mutex::new(rule_state),
-            correlator: Mutex::new(correlator::CorrelationEngine::new()),
+            correlator,
             ml_scorer: Mutex::new(Self::load_correlation_scorer(model_root)),
             sigma: Mutex::new(load_sigma_rules(&content_root).into_option()),
+            common_set,
+            rarity_stats,
             yara: Mutex::new(
                 start_yara(
                     &content_root,
@@ -395,6 +589,8 @@ impl DetectionSink {
             self.verdict.clone(),
         );
 
+        let common_set_loaded = load_common_set(&self.content_root);
+
         // The replaced engines are dropped after the locks are released: a
         // `ScanQueue` joins its worker on drop, which must not stall capture.
         let mut sigma_slot = self.sigma.lock().unwrap();
@@ -416,6 +612,17 @@ impl DetectionSink {
         let yara_rule_count = yara_slot.as_ref().map(|(_, count)| *count);
         drop(yara_slot);
         drop(old_yara);
+
+        // Same posture for the snapshot: absent unloads (the evidence is withheld), broken
+        // keeps the previous one (its failure is logged by the loader).
+        let mut common_set_slot = self.common_set.lock().unwrap();
+        let old_common_set = match common_set_loaded {
+            Load::Loaded(snapshot) => common_set_slot.replace(Arc::new(snapshot)),
+            Load::Absent => common_set_slot.take(),
+            Load::Failed => None,
+        };
+        drop(common_set_slot);
+        drop(old_common_set);
 
         // Same rules, same posture as the file scanner: absent unloads, broken keeps
         // the previous queue (its failure is already reported through `yara`).
@@ -573,49 +780,42 @@ impl DetectionSink {
         event: &Event,
         evidence: Vec<Event>,
     ) -> Option<verdict::Verdict> {
-        let now_ns = event.meta().timestamp_ns;
-        let detection = schema::detection::Detection {
-            timestamp_ns: now_ns,
-            severity,
-            title: message.to_string(),
+        let finding = Finding {
+            entity,
+            technique,
+            message,
             source,
-            score: None,
-            attributions: Vec::new(),
-            techniques: techniques_from(technique),
-            events: std::iter::once(event.clone()).chain(evidence).collect(),
+            severity,
         };
-        let spooled = self.detection_spool.as_ref().map(|_| detection.clone());
-        let result =
-            self.verdict
-                .lock()
-                .unwrap()
-                .record(entity.clone(), technique, detection, now_ns);
-        self.emit(technique, message);
-        if let Some(fused) = &result {
-            self.maybe_escalate(fused);
-        }
-        if let (Some(spool), Some(detection)) = (&self.detection_spool, spooled)
-            && let Err(detection) = self.enrich_queue.enqueue_detection(detection)
-        {
+        let persist = |detection| self.spool_detection(detection);
+        let persist = self
+            .detection_spool
+            .as_ref()
+            .map(|_| &persist as &dyn Fn(_));
+        record_detection(
+            &self.verdict,
+            &self.alert_log,
+            finding,
+            event,
+            evidence,
+            persist,
+        )
+    }
+
+    /// Hands a finding to the worker for the durable detection spool.
+    fn spool_detection(&self, detection: schema::detection::Detection) {
+        if let Err(detection) = self.enrich_queue.enqueue_detection(detection) {
             // The queue is full, so the capture thread does this file append
             // itself, which the #126 design otherwise keeps off it. Under sustained
             // overload every finding takes this path; accepted on purpose (a finding
             // is never lost), and only reached once the queue is already shedding.
             tracing::warn!("detection queue full; persisting on capture thread");
-            if let Err(e) = crate::upload::persist_detection(spool, *detection) {
+            if let Some(spool) = &self.detection_spool
+                && let Err(e) = crate::upload::persist_detection(spool, *detection)
+            {
                 tracing::error!(error = %e, "detection spool append failed on fallback");
             }
         }
-        result
-    }
-
-    /// Issue #612: the first response decision to read the fused verdict. A new
-    /// verdict snapshot (first sighting, a severity raise, or a recurrence outside
-    /// the dedup window — never a silently absorbed duplicate) whose composed
-    /// severity warrants it raises one `RESPONSE-ESCALATE` audit alert. Never
-    /// kills or quarantines, and works with or without `enable_response`.
-    fn maybe_escalate(&self, fused: &verdict::Verdict) {
-        escalate_if_warranted(&self.alert_log, fused);
     }
 
     /// Asks for a budgeted YARA scan of the memory of the process behind `event` (#85):
@@ -750,8 +950,7 @@ impl DetectionSink {
     /// correlator-specific `DetectionSource` needed) — the common case for every
     /// `rule_state`/`rules::evaluate_*` call site.
     fn record_rule_alerts(&self, event: &Event, alerts: impl IntoIterator<Item = rules::Alert>) {
-        let meta = event.meta();
-        let entity = entity_key(meta);
+        let entity = entity_key(event.meta());
         for alert in alerts {
             if alert.technique == MEMFD_EXEC_TECHNIQUE {
                 self.request_memory_scan(event);
@@ -872,29 +1071,7 @@ impl DetectionSink {
         // condemn every later, unrelated sibling that merely shares the same
         // parent and `comm` (PR #502 review; pinned by
         // `a_siblings_weak_alert_never_triggers_kill_from_anothers_bayes_crossing`).
-        let meta = event.meta();
-        let entity = entity_key(meta);
-        let case_id = correlator_case_id(&entity);
-        let mut is_high_confidence = false;
-        for alert in &alerts {
-            let source = schema::detection::DetectionSource::Correlator {
-                case_id: case_id.clone(),
-            };
-            self.record_and_emit(
-                &entity,
-                alert.technique,
-                &alert.message,
-                source,
-                alert.severity,
-                event,
-            );
-            if crosses_kill_gate(alert.technique) {
-                is_high_confidence = true;
-            }
-        }
-        if is_high_confidence {
-            self.maybe_kill(pid);
-        }
+        self.emit_correlator_alerts(&alerts, Some(event));
     }
 
     /// Issue #25: policy-gates killing the process behind a high-confidence
@@ -1061,6 +1238,15 @@ impl DetectionSink {
         );
     }
 
+    /// `PolicyDenial` events (`SELinux` AVC #297, AppLocker/WDAC #283):
+    /// POLICY-DENIAL-DRIFT (issue #774).
+    fn detect_policy_denial(&self, wrapped: &Event, event: &schema::PolicyDenialEvent) {
+        self.record_rule_alerts(
+            wrapped,
+            self.rule_state.lock().unwrap().on_policy_denial(event),
+        );
+    }
+
     /// `Auth` events: brute-force/spray burst detection (T1110, pack #377).
     fn detect_auth(&self, wrapped: &Event, event: &schema::AuthEvent) {
         self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_auth(event));
@@ -1207,6 +1393,18 @@ impl DetectionSink {
             .collect()
     }
 
+    /// The snapshot in force. Tests read it until the evidence lookup does (next slice of
+    /// #76), which is why it is not compiled otherwise.
+    #[cfg(test)]
+    fn common_set(&self) -> Option<Arc<ml::features::common_set::CommonSetSnapshot>> {
+        self.common_set.lock().unwrap().clone()
+    }
+
+    /// The rarity evidence counters, for the health beacon (ADR-0020, #76).
+    pub(crate) fn rarity_stats(&self) -> Arc<RarityStats> {
+        Arc::clone(&self.rarity_stats)
+    }
+
     /// Handle to the alert funnel, for the IPC handler's `recent_detections`
     /// endpoint (issue #388).
     pub(crate) fn alert_log(&self) -> Arc<AlertLog> {
@@ -1280,6 +1478,162 @@ fn load_sigma_rules(content_root: &Path) -> Load<sigma::SigmaEngine> {
         }
         Err(e) => {
             tracing::error!(error = %e, "sigma: load error");
+            Load::Failed
+        }
+    }
+}
+
+/// How many hosts a snapshot must cover before "not in the common set" counts as evidence
+/// (ADR-0020): on a fleet that has just enrolled the snapshot is empty or thin, and every
+/// binary would look rare. **Provisional**: ADR-0020 leaves it to calibration on lab data
+/// (slice 6 of `docs/detection/fleet-prevalence-snapshot-plan.md`).
+const RARITY_MIN_HOSTS_COVERED: u64 = 10;
+
+/// What became of the rarity judgements since start, for the health beacon (ADR-0020, #76).
+/// Plain atomics: bumped on the enrichment worker, read by the beacon thread.
+#[derive(Default)]
+pub(crate) struct RarityStats {
+    applied: AtomicU64,
+    withheld: AtomicU64,
+    unapplied: AtomicU64,
+}
+
+impl crate::health::RarityStatsSource for RarityStats {
+    fn rarity_counts(&self) -> crate::health::RarityCounts {
+        crate::health::RarityCounts {
+            applied: self.applied.load(Ordering::Relaxed),
+            withheld: self.withheld.load(Ordering::Relaxed),
+            unapplied: self.unapplied.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// What the fleet's common set says about one executed image.
+#[derive(Debug, PartialEq, Eq)]
+enum Rarity {
+    /// The snapshot covers enough hosts and does not contain the image's hash.
+    NotInCommonSet,
+    /// The snapshot covers enough hosts and contains the hash.
+    InCommonSet,
+    /// No basis to say: no snapshot, too few hosts covered, or no usable hash. Never read as
+    /// "rare" (the `rarity_known` of the ML feature, `ml::features::rarity`).
+    Withheld,
+}
+
+/// The rarity of an image given the snapshot in force, the exec's hash and the minimum
+/// coverage. A pure function over the same inputs as the ML rarity feature, so the two
+/// cannot disagree about what is known.
+fn rarity_evidence(
+    sha256: Option<&str>,
+    snapshot: Option<&ml::features::common_set::CommonSetSnapshot>,
+    min_hosts: u64,
+) -> Rarity {
+    use ml::features::rarity::{CommonSet, extract_features};
+
+    let [known, in_common_set] =
+        extract_features(sha256, snapshot.map(|s| s as &dyn CommonSet), min_hosts);
+    if known < 0.5 {
+        Rarity::Withheld
+    } else if in_common_set > 0.5 {
+        Rarity::InCommonSet
+    } else {
+        Rarity::NotInCommonSet
+    }
+}
+
+/// Feeds "this exec's image is not in the fleet's common set" to the correlator, when that is
+/// what the snapshot in force says. Runs on the enrichment worker, off the capture path,
+/// because only the worker knows the hash, and after the capture thread already correlated the
+/// exec (so the process has a belief to add to). The snapshot lock is released before the
+/// correlator lock is taken: no nested locking.
+fn note_image_rarity(
+    correlator: &Mutex<correlator::CorrelationEngine>,
+    common_set: &Mutex<Option<Arc<ml::features::common_set::CommonSetSnapshot>>>,
+    stats: &RarityStats,
+    exec: &schema::ExecEvent,
+) {
+    let snapshot = common_set.lock().unwrap().clone();
+    match rarity_evidence(
+        exec.sha256.as_deref(),
+        snapshot.as_deref(),
+        RARITY_MIN_HOSTS_COVERED,
+    ) {
+        Rarity::InCommonSet => {}
+        Rarity::Withheld => {
+            stats.withheld.fetch_add(1, Ordering::Relaxed);
+        }
+        Rarity::NotInCommonSet => {
+            let applied = correlator
+                .lock()
+                .unwrap()
+                .apply_rarity_evidence(exec.meta.pid, exec.meta.process_generation);
+            let counter = if applied {
+                &stats.applied
+            } else {
+                &stats.unapplied
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                pid = exec.meta.pid,
+                applied,
+                "rarity: image not in the common set"
+            );
+        }
+    }
+}
+
+/// The largest snapshot file the agent reads. The content manifest allows an artifact of up to
+/// 100 MiB; a snapshot is a Bloom filter whose size the server caps when it builds it, so
+/// anything near this is a malformed or hostile file, refused before it is read.
+const MAX_COMMON_SET_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Loads `<content_root>/snapshots/common-set.bin`, the file the signed content manifest
+/// delivers (ADR-0020). Absent is "no snapshot yet", not an error; unreadable, too large or
+/// not a snapshot is [`Load::Failed`] (logged with the reason, never the bytes).
+fn load_common_set(content_root: &Path) -> Load<ml::features::common_set::CommonSetSnapshot> {
+    load_common_set_capped(content_root, MAX_COMMON_SET_BYTES)
+}
+
+fn load_common_set_capped(
+    content_root: &Path,
+    max_bytes: u64,
+) -> Load<ml::features::common_set::CommonSetSnapshot> {
+    use std::io::Read as _;
+
+    let path = content_root.join("snapshots").join("common-set.bin");
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Load::Absent,
+        Err(e) => {
+            tracing::error!(error = %e, "common set: cannot open the snapshot file");
+            return Load::Failed;
+        }
+    };
+    // Read at most one byte past the cap: a file that grows between a size check and the read
+    // still cannot make this allocate more than the cap.
+    let mut bytes = Vec::new();
+    if let Err(e) = file.take(max_bytes + 1).read_to_end(&mut bytes) {
+        tracing::error!(error = %e, "common set: cannot read the snapshot file");
+        return Load::Failed;
+    }
+    if bytes.len() as u64 > max_bytes {
+        tracing::error!(max_bytes, "common set: snapshot file is over the size cap");
+        return Load::Failed;
+    }
+    match ml::features::common_set::CommonSetSnapshot::parse(&bytes) {
+        Ok(snapshot) => {
+            let header = snapshot.header();
+            tracing::info!(
+                entries = header.entry_count,
+                hosts_covered = header.hosts_covered,
+                min_hosts = header.min_hosts,
+                built_at = header.built_at,
+                "common set: snapshot loaded"
+            );
+            Load::Loaded(snapshot)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "common set: not a usable snapshot");
             Load::Failed
         }
     }
@@ -1520,12 +1874,24 @@ impl EventSink for DetectionSink {
                 self.record_rule_alerts(&event, rules::evaluate_defender_event(e));
             }
             Event::LdapSearch(e) => self.detect_ldap_search(&event, e),
+            Event::NtlmAuth(e) => self.record_rule_alerts(&event, rules::evaluate_ntlm_auth(e)),
+            Event::PolicyDenial(e) => self.detect_policy_denial(&event, e),
+            Event::PackageChange(e) => {
+                self.record_rule_alerts(&event, rules::evaluate_package_change(e));
+            }
             // New telemetry categories reach the engines as they land; until a rule
             // consumes them, logging below is the whole treatment.
             _ => {}
         }
-        // Enrichment + the high-volume raw-event write happen off this thread.
-        self.enrich_queue.enqueue(event);
+        // Enrichment + the high-volume raw-event write happen off this thread, and
+        // with them the findings that wait for the image's signature (#441).
+        let gated = match &event {
+            Event::Exec(e) => self.rule_state.lock().unwrap().on_exec_signature_gated(e),
+            _ => None,
+        };
+        if let Some((event, gated)) = self.enrich_queue.enqueue(event, gated) {
+            self.record_rule_alerts(&event, [gated.unverified()]);
+        }
         // Last: only counts as "progress" once everything above has actually
         // completed for this event (#102) — a hang anywhere above (a poisoned
         // lock, a wedged Sigma/YARA call) stops the heartbeat from advancing.
@@ -1578,8 +1944,13 @@ impl EventSink for BaselineSink {
                 // from the baseline (they are exactly what the model must not learn
                 // as normal).
                 let det_alerts = rules::evaluate_exec(e);
-                let state_alerts = self.rule_state.lock().unwrap().on_exec(e);
-                if !det_alerts.is_empty() || !state_alerts.is_empty() {
+                let mut rule_state = self.rule_state.lock().unwrap();
+                // Conservative: a gated finding excludes the cmdline whatever the
+                // signature would have said.
+                let gated = rule_state.on_exec_signature_gated(e);
+                let state_alerts = rule_state.on_exec(e);
+                drop(rule_state);
+                if !det_alerts.is_empty() || !state_alerts.is_empty() || gated.is_some() {
                     return;
                 }
                 self.out.write(&BaselineRecord {
@@ -1606,7 +1977,11 @@ impl EventSink for BaselineSink {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, atomic::Ordering};
+    use std::{
+        sync::{Arc, Mutex, atomic::Ordering},
+        thread,
+        time::Duration,
+    };
 
     use schema::{ConnectEvent, Event, EventMeta, ExecEvent, User, sensor::EventSink as _};
 
@@ -1656,6 +2031,59 @@ mod tests {
 
     fn alerts_in(dir: &std::path::Path) -> String {
         std::fs::read_to_string(dir.join("alerts.ndjson")).unwrap_or_default()
+    }
+
+    #[test]
+    fn advancing_the_correlator_clock_emits_a_silent_shell_alert() {
+        let dir = tmp("correlator-tick");
+        let sink = sink_in(&dir);
+        let now = schema::time::now_ns();
+        let mut meta = schema::fixtures::meta();
+        meta.pid = 9_031;
+        meta.ppid = 500;
+        meta.comm = "sh".into();
+        meta.timestamp_ns = now.saturating_sub(10_000_000_000);
+        let shell = Event::Exec(ExecEvent {
+            meta,
+            image_path: "/usr/bin/sh".into(),
+            parent_comm: Some("nginx".into()),
+            ..schema::fixtures::exec()
+        });
+
+        sink.on_event(shell);
+        assert!(!alerts_in(&dir).contains("T1505.003"));
+        sink.advance_correlation_time(now);
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("T1505.003"), "{alerts}");
+        assert!(alerts.contains("no matching"), "{alerts}");
+    }
+
+    #[test]
+    fn the_correlator_ticker_emits_without_a_following_event() {
+        let dir = tmp("correlator-ticker-thread");
+        let sink = sink_in(&dir);
+        let now = schema::time::now_ns();
+        let mut meta = schema::fixtures::meta();
+        meta.pid = 9_032;
+        meta.ppid = 500;
+        meta.comm = "sh".into();
+        meta.timestamp_ns = now.saturating_sub(10_000_000_000);
+        let shell = Event::Exec(ExecEvent {
+            meta,
+            image_path: "/usr/bin/sh".into(),
+            parent_comm: Some("nginx".into()),
+            ..schema::fixtures::exec()
+        });
+
+        sink.on_event(shell);
+        sink.start_correlator_ticker().unwrap();
+        for _ in 0..30 {
+            if alerts_in(&dir).contains("T1505.003") {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        panic!("the one-second ticker did not emit the idle shell alert");
     }
 
     /// Quarantine hooks + the alert log they audit into, over a real directory
@@ -2048,11 +2476,17 @@ rule response_marker {
     }
 
     #[test]
-    fn the_agents_own_pid_touching_a_canary_is_not_a_detection() {
+    fn planting_canary_mtime_does_not_trip_the_agent_or_hide_a_real_touch() {
         let dir = tmp("canary-own-pid");
         let (sink, canary) = sink_watching_canary(&dir);
+        let modified = std::fs::metadata(&canary).unwrap().modified().unwrap();
+        assert!(modified < std::time::SystemTime::now());
+
         sink.on_event(open_event(&canary, std::process::id()));
         assert!(!alerts_in(&dir).contains("canary file touched"));
+
+        sink.on_event(open_event(&canary, std::process::id() + 1));
+        assert!(alerts_in(&dir).contains("canary file touched"));
     }
 
     #[test]
@@ -3573,5 +4007,536 @@ rule reload_content_test_marker {
             !alerts_in(&dir).contains("reload-content test marker rule"),
             "the removed rule must no longer fire"
         );
+    }
+
+    /// A download-provenance mark on `image`, then `image` run inside the
+    /// window, then the enrichment worker drained (#441).
+    fn mark_then_run(sink: &DetectionSink, image: &str) {
+        sink.on_event(Event::FileQuarantine(schema::FileQuarantineEvent {
+            path: image.into(),
+            ..schema::fixtures::file_quarantine()
+        }));
+        sink.on_event(Event::Exec(schema::ExecEvent {
+            image_path: image.into(),
+            ..schema::fixtures::exec()
+        }));
+        assert!(
+            sink.enrich_queue()
+                .flush(std::time::Duration::from_secs(30)),
+            "the enrichment worker must drain"
+        );
+    }
+
+    // ── the common-set snapshot (ADR-0020, issue #76) ───────────────────────
+
+    /// A reference snapshot from the shared golden file (the same bytes the server's builder
+    /// and the `ml` reader are tested against), with some hashes it contains.
+    fn golden_common_set(case: &str) -> (Vec<u8>, Vec<String>, u32) {
+        let doc: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../ml/tests/fixtures/common_set_snapshot_golden.json"
+        )))
+        .unwrap();
+        let case = doc["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == case)
+            .unwrap();
+        let hex = case["bytes_hex"].as_str().unwrap();
+        let bytes = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let members = case["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m.as_str().unwrap().to_owned())
+            .collect();
+        let hosts = u32::try_from(case["params"]["hosts_covered"].as_u64().unwrap()).unwrap();
+        (bytes, members, hosts)
+    }
+
+    fn write_common_set(dir: &std::path::Path, bytes: &[u8]) {
+        let snapshots = dir.join("content").join("snapshots");
+        std::fs::create_dir_all(&snapshots).unwrap();
+        std::fs::write(snapshots.join("common-set.bin"), bytes).unwrap();
+    }
+
+    #[test]
+    fn a_common_set_snapshot_in_the_content_dir_is_loaded_at_startup() {
+        use ml::features::rarity::CommonSet as _;
+        let dir = tmp("common-set-startup");
+        let (bytes, members, hosts) = golden_common_set("fifty_hashes_one_percent");
+        write_common_set(&dir, &bytes);
+
+        let sink = sink_in(&dir);
+
+        let loaded = sink.common_set().expect("the snapshot must be loaded");
+        assert_eq!(loaded.hosts_covered(), u64::from(hosts));
+        assert!(members.iter().all(|m| loaded.contains(m)));
+    }
+
+    #[test]
+    fn no_snapshot_file_means_no_common_set_and_no_failure() {
+        let dir = tmp("common-set-absent");
+        let sink = sink_in(&dir);
+        assert!(sink.common_set().is_none());
+        sink.reload_content();
+        assert!(sink.common_set().is_none());
+    }
+
+    #[test]
+    fn reload_content_picks_up_a_common_set_snapshot_added_after_construction() {
+        let dir = tmp("common-set-reload");
+        let sink = sink_in(&dir);
+        assert!(sink.common_set().is_none());
+        let (bytes, _, _) = golden_common_set("one_hash");
+        write_common_set(&dir, &bytes);
+
+        sink.reload_content();
+
+        assert!(sink.common_set().is_some());
+    }
+
+    #[test]
+    fn reload_content_unloads_the_common_set_when_its_file_is_removed() {
+        // Same posture as the rule directories: an absent file is "no content", not an error,
+        // and the evidence that depends on it is withheld rather than judged on a stale set.
+        let dir = tmp("common-set-removed");
+        let (bytes, _, _) = golden_common_set("one_hash");
+        write_common_set(&dir, &bytes);
+        let sink = sink_in(&dir);
+        assert!(sink.common_set().is_some());
+        std::fs::remove_file(dir.join("content/snapshots/common-set.bin")).unwrap();
+
+        sink.reload_content();
+
+        assert!(sink.common_set().is_none());
+    }
+
+    #[test]
+    fn reload_content_keeps_the_previous_common_set_when_the_new_file_is_corrupt() {
+        use ml::features::rarity::CommonSet as _;
+        let dir = tmp("common-set-corrupt");
+        let (bytes, members, _) = golden_common_set("fifty_hashes_one_percent");
+        write_common_set(&dir, &bytes);
+        let sink = sink_in(&dir);
+        let mut broken = bytes.clone();
+        broken.truncate(bytes.len() - 1);
+        write_common_set(&dir, &broken);
+
+        sink.reload_content();
+
+        let kept = sink.common_set().expect("a broken file must not unload it");
+        assert!(members.iter().all(|m| kept.contains(m)));
+    }
+
+    #[test]
+    fn a_corrupt_common_set_at_startup_leaves_it_unloaded_not_the_agent_down() {
+        let dir = tmp("common-set-corrupt-startup");
+        write_common_set(&dir, b"not a snapshot");
+        let sink = sink_in(&dir);
+        assert!(sink.common_set().is_none());
+    }
+
+    #[test]
+    fn a_common_set_file_over_the_size_cap_is_refused_unread() {
+        let dir = tmp("common-set-cap");
+        let (bytes, _, _) = golden_common_set("two_hundred_hashes_one_in_a_thousand");
+        write_common_set(&dir, &bytes);
+        let root = dir.join("content");
+
+        assert!(matches!(
+            super::load_common_set_capped(&root, u64::try_from(bytes.len()).unwrap()),
+            super::Load::Loaded(_)
+        ));
+        assert!(matches!(
+            super::load_common_set_capped(&root, u64::try_from(bytes.len()).unwrap() - 1),
+            super::Load::Failed
+        ));
+    }
+
+    #[test]
+    fn a_directory_where_the_common_set_file_belongs_is_a_failure_not_a_crash() {
+        let dir = tmp("common-set-dir");
+        std::fs::create_dir_all(dir.join("content/snapshots/common-set.bin")).unwrap();
+        let sink = sink_in(&dir);
+        assert!(sink.common_set().is_none());
+    }
+
+    // ── rarity evidence (ADR-0020, issue #76) ───────────────────────────────
+
+    /// A hash the snapshot built in a golden case does not contain.
+    fn golden_non_member(case: &str) -> String {
+        let doc: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../ml/tests/fixtures/common_set_snapshot_golden.json"
+        )))
+        .unwrap();
+        let case = doc["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == case)
+            .unwrap();
+        case["non_members"][0].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn rarity_evidence_follows_the_snapshot_the_hash_and_the_coverage() {
+        use ml::features::common_set::CommonSetSnapshot;
+        let load = |case: &str| CommonSetSnapshot::parse(&golden_common_set(case).0).unwrap();
+        let wide = load("fifty_hashes_one_percent"); // 12 hosts covered
+        let member = golden_common_set("fifty_hashes_one_percent").1[0].clone();
+        let absent = golden_non_member("fifty_hashes_one_percent");
+
+        assert_eq!(
+            super::rarity_evidence(Some(&member), Some(&wide), 10),
+            super::Rarity::InCommonSet
+        );
+        assert_eq!(
+            super::rarity_evidence(Some(&absent), Some(&wide), 10),
+            super::Rarity::NotInCommonSet
+        );
+        // Coverage exactly at the minimum counts, one below withholds.
+        assert_eq!(
+            super::rarity_evidence(Some(&absent), Some(&wide), 12),
+            super::Rarity::NotInCommonSet
+        );
+        assert_eq!(
+            super::rarity_evidence(Some(&absent), Some(&wide), 13),
+            super::Rarity::Withheld
+        );
+        // A snapshot built from 4 hosts is too thin to call anything rare.
+        let thin = load("one_hash");
+        assert_eq!(
+            super::rarity_evidence(Some(&absent), Some(&thin), 10),
+            super::Rarity::Withheld
+        );
+        // No snapshot, no hash, or something that is not a hash: nothing to say.
+        assert_eq!(
+            super::rarity_evidence(Some(&absent), None, 10),
+            super::Rarity::Withheld
+        );
+        assert_eq!(
+            super::rarity_evidence(None, Some(&wide), 10),
+            super::Rarity::Withheld
+        );
+        assert_eq!(
+            super::rarity_evidence(Some("not-a-hash"), Some(&wide), 10),
+            super::Rarity::Withheld
+        );
+    }
+
+    /// An exec whose hash is `sha256`, for [`note_image_rarity`].
+    fn exec_hashed(pid: u32, sha256: Option<&str>) -> ExecEvent {
+        ExecEvent {
+            meta: EventMeta {
+                pid,
+                ..schema::fixtures::meta()
+            },
+            sha256: sha256.map(str::to_owned),
+            ..schema::fixtures::exec()
+        }
+    }
+
+    /// The counts after one exec, against an engine that has (or has not) correlated it.
+    fn rarity_counts_after(
+        case: &str,
+        sha256: Option<String>,
+        correlated: bool,
+    ) -> crate::health::RarityCounts {
+        use ml::features::common_set::CommonSetSnapshot;
+
+        use crate::health::RarityStatsSource as _;
+
+        let snapshot = CommonSetSnapshot::parse(&golden_common_set(case).0).unwrap();
+        let exec = exec_hashed(7_001, sha256.as_deref());
+        let mut engine = correlator::CorrelationEngine::new();
+        if correlated {
+            engine.on_event(Event::Exec(exec.clone()));
+        }
+        let stats = super::RarityStats::default();
+        super::note_image_rarity(
+            &Mutex::new(engine),
+            &Mutex::new(Some(Arc::new(snapshot))),
+            &stats,
+            &exec,
+        );
+        stats.rarity_counts()
+    }
+
+    #[test]
+    fn rarity_counts_an_applied_evidence() {
+        let absent = golden_non_member("fifty_hashes_one_percent");
+        let counts = rarity_counts_after("fifty_hashes_one_percent", Some(absent), true);
+        assert_eq!(
+            (counts.applied, counts.withheld, counts.unapplied),
+            (1, 0, 0)
+        );
+    }
+
+    #[test]
+    fn rarity_counts_evidence_that_found_no_belief_to_land_on() {
+        // The correlator evicted (or never created) the process's belief: the loss is
+        // counted, not silent.
+        let absent = golden_non_member("fifty_hashes_one_percent");
+        let counts = rarity_counts_after("fifty_hashes_one_percent", Some(absent), false);
+        assert_eq!(
+            (counts.applied, counts.withheld, counts.unapplied),
+            (0, 0, 1)
+        );
+    }
+
+    #[test]
+    fn rarity_counts_a_withheld_judgement_whatever_the_reason() {
+        let absent = golden_non_member("fifty_hashes_one_percent");
+        // A snapshot too thin to judge by, then an exec with no hash.
+        let thin = rarity_counts_after("one_hash", Some(absent), true);
+        let no_hash = rarity_counts_after("fifty_hashes_one_percent", None, true);
+        assert_eq!((thin.applied, thin.withheld, thin.unapplied), (0, 1, 0));
+        assert_eq!(
+            (no_hash.applied, no_hash.withheld, no_hash.unapplied),
+            (0, 1, 0)
+        );
+    }
+
+    #[test]
+    fn rarity_counts_nothing_for_an_image_the_fleet_knows() {
+        let member = golden_common_set("fifty_hashes_one_percent").1[0].clone();
+        let counts = rarity_counts_after("fifty_hashes_one_percent", Some(member), true);
+        assert_eq!(
+            (counts.applied, counts.withheld, counts.unapplied),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn rarity_counts_withheld_with_no_snapshot_at_all() {
+        use crate::health::RarityStatsSource as _;
+        let stats = super::RarityStats::default();
+        super::note_image_rarity(
+            &Mutex::new(correlator::CorrelationEngine::new()),
+            &Mutex::new(None),
+            &stats,
+            &exec_hashed(7_002, Some(&"ab".repeat(32))),
+        );
+        assert_eq!(stats.rarity_counts().withheld, 1);
+    }
+
+    /// A version-1 snapshot built here (the layout in
+    /// `docs/detection/common-set-snapshot-format.md`): a fixed 4096-bit, 7-hash filter holding
+    /// `hashes`, claiming `hosts_covered` hosts.
+    fn snapshot_holding(hashes: &[&str], hosts_covered: u32) -> Vec<u8> {
+        const BITS: u32 = 4096;
+        const HASHES: u16 = 7;
+        let mut body = vec![0u8; (BITS / 8) as usize];
+        for hash in hashes {
+            let raw: Vec<u8> = (0..32)
+                .map(|i| u8::from_str_radix(&hash[i * 2..i * 2 + 2], 16).unwrap())
+                .collect();
+            let h1 = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+            let h2 = u64::from_le_bytes(raw[8..16].try_into().unwrap()) | 1;
+            for i in 0..u64::from(HASHES) {
+                let bit = h1.wrapping_add(i.wrapping_mul(h2)) % u64::from(BITS);
+                body[(bit >> 3) as usize] |= 1 << (bit & 7);
+            }
+        }
+        let mut out = b"SYCS".to_vec();
+        out.extend(1u16.to_le_bytes());
+        out.extend(HASHES.to_le_bytes());
+        out.extend(3u32.to_le_bytes());
+        out.extend(hosts_covered.to_le_bytes());
+        out.extend(u32::try_from(hashes.len()).unwrap().to_le_bytes());
+        out.extend(BITS.to_le_bytes());
+        out.extend(1_791_849_600u64.to_le_bytes());
+        out.extend(body);
+        out
+    }
+
+    /// What the snapshot holds, for [`belief_after_exec`].
+    enum Snapshot {
+        None,
+        /// Holds the executed image's own hash.
+        HoldingTheImage {
+            hosts_covered: u32,
+        },
+        /// Holds only an unrelated hash.
+        HoldingOthers {
+            hosts_covered: u32,
+        },
+    }
+
+    /// Runs one exec of a file through a sink, lets the enrichment worker finish, and returns
+    /// the belief the correlator holds for the process.
+    fn belief_after_exec(name: &str, snapshot: &Snapshot, image_exists: bool) -> f32 {
+        let dir = tmp(name);
+        let image = dir.join("image.bin");
+        if image_exists {
+            std::fs::write(&image, b"an executable nobody on the fleet has run").unwrap();
+        }
+        let image_hash = enrich::Enricher::new()
+            .enrich(&image)
+            .sha256
+            .unwrap_or_else(|| "cd".repeat(32));
+        let unrelated = "ab".repeat(32);
+        match snapshot {
+            Snapshot::None => {}
+            Snapshot::HoldingTheImage { hosts_covered } => {
+                write_common_set(&dir, &snapshot_holding(&[&image_hash], *hosts_covered));
+            }
+            Snapshot::HoldingOthers { hosts_covered } => {
+                write_common_set(&dir, &snapshot_holding(&[&unrelated], *hosts_covered));
+            }
+        }
+        let sink = sink_in(&dir);
+
+        sink.on_event(exec(9_100, "run", image.to_str().unwrap()));
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+
+        let engine = sink.correlator.lock().unwrap();
+        engine
+            .belief_for_pid(9_100)
+            .expect("the exec created a belief")
+            .log_odds
+    }
+
+    #[test]
+    fn an_image_the_fleet_has_not_seen_raises_the_belief_a_little() {
+        let baseline = belief_after_exec("rarity-baseline", &Snapshot::None, true);
+
+        let rare = belief_after_exec(
+            "rarity-rare",
+            &Snapshot::HoldingOthers { hosts_covered: 50 },
+            true,
+        );
+
+        let gained = rare - baseline;
+        assert!(gained > 0.0, "rarity evidence must apply, gained {gained}");
+        assert!(
+            gained <= 1.0,
+            "and stay within its allowance, gained {gained}"
+        );
+    }
+
+    #[test]
+    fn an_image_in_the_common_set_adds_nothing() {
+        let baseline = belief_after_exec("rarity-common-baseline", &Snapshot::None, true);
+        let common = belief_after_exec(
+            "rarity-common",
+            &Snapshot::HoldingTheImage { hosts_covered: 50 },
+            true,
+        );
+        assert!((common - baseline).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_snapshot_covering_too_few_hosts_adds_nothing() {
+        // A freshly enrolled fleet has a thin snapshot: without this every binary on it
+        // would look rare.
+        let baseline = belief_after_exec("rarity-thin-baseline", &Snapshot::None, true);
+        let thin = belief_after_exec(
+            "rarity-thin",
+            &Snapshot::HoldingOthers { hosts_covered: 3 },
+            true,
+        );
+        assert!((thin - baseline).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_exec_with_no_readable_image_adds_nothing() {
+        let baseline = belief_after_exec("rarity-nohash-baseline", &Snapshot::None, false);
+        let unreadable = belief_after_exec(
+            "rarity-nohash",
+            &Snapshot::HoldingOthers { hosts_covered: 50 },
+            false,
+        );
+        assert!((unreadable - baseline).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_marked_unsigned_file_run_alerts_after_enrichment() {
+        let dir = tmp("gate-unsigned");
+        let image = dir.join("invoice.exe");
+        // A real unsigned PE: this test binary. Bytes that are not a PE verify
+        // as `Unsupported` on Windows, not `Unsigned`.
+        std::fs::copy(std::env::current_exe().unwrap(), &image).unwrap();
+        let sink = sink_in(&dir);
+        mark_then_run(&sink, &image.to_string_lossy());
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("T1204.002"), "{alerts}");
+        #[cfg(windows)]
+        assert!(alerts.contains("[unsigned]"), "{alerts}");
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The issue's done-when: a signed installer run does not alert. notepad.exe
+    /// is catalog-signed, so it verifies `Valid` (the enrich crate's own test).
+    #[cfg(windows)]
+    #[test]
+    fn a_marked_signed_file_run_does_not_alert() {
+        let image = r"C:\Windows\System32\notepad.exe";
+        if !std::path::Path::new(image).exists() {
+            eprintln!("skipping: {image} not present on this host");
+            return;
+        }
+        let dir = tmp("gate-signed");
+        let sink = sink_in(&dir);
+        mark_then_run(&sink, image);
+        let alerts = alerts_in(&dir);
+        assert!(!alerts.contains("T1204.002"), "{alerts}");
+    }
+
+    /// #655 review: a signed file runs once (its `Valid` verdict cached), then an
+    /// unsigned file of the same size takes its path with the mtime restored. The
+    /// Windows cache key has no file identity, so only an uncached verification
+    /// keeps the gate from reading the old file's verdict.
+    #[cfg(windows)]
+    #[test]
+    fn a_cached_valid_verdict_for_a_replaced_file_does_not_silence_t1204_002() {
+        let signed = std::path::Path::new(r"C:\Windows\System32\notepad.exe");
+        let Ok(bytes) = std::fs::read(signed) else {
+            eprintln!("skipping: {} not readable on this host", signed.display());
+            return;
+        };
+        let dir = tmp("gate-replaced");
+        let image = dir.join("setup.exe");
+        std::fs::write(&image, &bytes).unwrap();
+        // Catalog-signed: a copy verifies by its hash, so it is `Valid` too.
+        if enrich::Enricher::new().enrich(&image).signature != schema::Signature::Valid {
+            eprintln!("skipping: the notepad.exe copy does not verify on this host");
+            return;
+        }
+        let sink = sink_in(&dir);
+        let path = image.to_string_lossy().into_owned();
+        sink.on_event(Event::Exec(schema::ExecEvent {
+            image_path: path.clone(),
+            ..schema::fixtures::exec()
+        }));
+        assert!(
+            sink.enrich_queue()
+                .flush(std::time::Duration::from_secs(30))
+        );
+
+        let mtime = std::fs::metadata(&image).unwrap().modified().unwrap();
+        let mut tampered = bytes;
+        let mid = tampered.len() / 2;
+        tampered[mid] ^= 0xFF;
+        std::fs::write(&image, &tampered).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&image)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+
+        mark_then_run(&sink, &path);
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("T1204.002"), "{alerts}");
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

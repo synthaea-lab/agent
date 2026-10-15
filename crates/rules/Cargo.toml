@@ -16,3 +16,4 @@ store = { path = "../store" }
 
 [dev-dependencies]
 schema = { path = "../schema", features = ["test-fixtures"] }
+proptest = "1"

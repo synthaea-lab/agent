@@ -10,7 +10,11 @@ use aya_ebpf::{
     programs::{RawTracePointContext, TracePointContext},
 };
 use aya_log_ebpf::{info, warn};
-use sensor_linux_wire::{LineageEntry, TASK_COMM_LEN};
+#[cfg(bpf_target_arch = "aarch64")]
+use sensor_linux_wire::syscall_nr_from_i32;
+use sensor_linux_wire::{
+    LineageEntry, TASK_COMM_LEN, encode_pending_syscall_exit, matching_pending_syscall_exit,
+};
 
 use crate::{
     PROC_LINEAGE, sys_enter_accept, sys_enter_accept4, sys_enter_bind, sys_enter_bpf,
@@ -37,14 +41,12 @@ const EXIT_SOCKET: u32 = 5;
 #[map]
 static SYSCALL_DISPATCH: Array<u32> = Array::with_max_entries(MAX_SYSCALL_ID, 0);
 
-/// syscall id of an in-flight call whose event needs its return value. A thread
-/// blocked forever in `accept`, `accept4`, `memfd_create` or `recvfrom` keeps its
-/// entry; an LRU evicts the stalest one when full so that blocked thread cannot
-/// blind the other three syscalls host-wide (#672, the idea of #668's
-/// `ACCEPT_ARGS`). Insert overwrites by key, so a later `sys_enter_*` on the same
-/// `pid_tgid` always replaces a stale tag before `sys_exit` can misroute into it.
+/// Handler tag and syscall number of an in-flight call whose event needs its
+/// return value. Five syscalls use this path: accept, accept4, memfd_create,
+/// recvfrom and socket. An LRU bounds blocked entries; sys_exit checks the actual
+/// syscall number before dispatch so stale tags cannot route unrelated exits.
 #[map]
-static PENDING_SYSCALL_EXIT: LruHashMap<u64, u32> = LruHashMap::with_max_entries(4096, 0);
+static PENDING_SYSCALL_EXIT: LruHashMap<u64, u64> = LruHashMap::with_max_entries(4096, 0);
 
 /// Counts a `PENDING_SYSCALL_EXIT` insert that still failed — shed, not silently
 /// lost (the LRU's own eviction keeps steady-state inserts succeeding; this is
@@ -53,10 +55,16 @@ static PENDING_SYSCALL_EXIT: LruHashMap<u64, u32> = LruHashMap::with_max_entries
 #[map]
 static PENDING_SYSCALL_EXIT_DROPPED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
+/// Counts pending entries removed because the exiting syscall number could not
+/// be read or did not match the syscall recorded at entry.
+#[map]
+static PENDING_EXIT_MISMATCH_DROPPED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
 /// [`PENDING_SYSCALL_EXIT`]'s insert, with the drop counted instead of discarded.
 #[inline(always)]
-fn stash_pending_syscall_exit(pid_tgid: u64, action: u32) {
-    if PENDING_SYSCALL_EXIT.insert(&pid_tgid, &action, 0).is_err()
+fn stash_pending_syscall_exit(pid_tgid: u64, action: u32, syscall_nr: u32) {
+    let packed = encode_pending_syscall_exit(action, syscall_nr);
+    if PENDING_SYSCALL_EXIT.insert(&pid_tgid, &packed, 0).is_err()
         && let Some(count) = PENDING_SYSCALL_EXIT_DROPPED.get_ptr_mut(0)
     {
         // SAFETY: `count` is a valid per-CPU slot pointer from `get_ptr_mut`; no
@@ -75,6 +83,8 @@ static TASK_COMM_OFFSET: Global<u32> = Global::new(0);
 static BINPRM_FILENAME_OFFSET: Global<u32> = Global::new(0);
 #[unsafe(no_mangle)]
 static SYSCALL_ARG_OFFSETS: Global<[u32; 6]> = Global::new([0; 6]);
+#[unsafe(no_mangle)]
+static SYSCALL_NR_OFFSET: Global<u32> = Global::new(0);
 
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 #[repr(C)]
@@ -141,7 +151,7 @@ pub fn raw_sched_process_fork(ctx: RawTracePointContext) -> u32 {
     let entry = LineageEntry {
         ppid: parent_pid as u32,
         comm,
-        reserved: 0,
+        execd: 0,
         generation: unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() },
         parent_generation: match unsafe { PROC_LINEAGE.get(&(parent_pid as u32)) } {
             Some(parent) => parent.generation,
@@ -261,11 +271,11 @@ pub fn raw_sys_enter(ctx: RawTracePointContext) -> u32 {
         16 => sys_enter_sendto(trace_ctx),
         17 => sys_enter_listen(trace_ctx),
         18 => {
-            stash_pending_syscall_exit(pid_tgid, EXIT_ACCEPT);
+            stash_pending_syscall_exit(pid_tgid, EXIT_ACCEPT, syscall_id as u32);
             sys_enter_accept(trace_ctx)
         }
         19 => {
-            stash_pending_syscall_exit(pid_tgid, EXIT_ACCEPT4);
+            stash_pending_syscall_exit(pid_tgid, EXIT_ACCEPT4, syscall_id as u32);
             sys_enter_accept4(trace_ctx)
         }
         20 => sys_enter_setxattr(trace_ctx),
@@ -283,7 +293,7 @@ pub fn raw_sys_enter(ctx: RawTracePointContext) -> u32 {
         32 => sys_enter_process_vm_readv(trace_ctx),
         33 => sys_enter_process_vm_writev(trace_ctx),
         34 => {
-            stash_pending_syscall_exit(pid_tgid, EXIT_MEMFD_CREATE);
+            stash_pending_syscall_exit(pid_tgid, EXIT_MEMFD_CREATE, syscall_id as u32);
             sys_enter_memfd_create(trace_ctx)
         }
         35 => sys_enter_setuid(trace_ctx),
@@ -296,11 +306,11 @@ pub fn raw_sys_enter(ctx: RawTracePointContext) -> u32 {
         42 => sys_enter_setns(trace_ctx),
         43 => sys_enter_unshare(trace_ctx),
         44 => {
-            stash_pending_syscall_exit(pid_tgid, EXIT_RECVFROM);
+            stash_pending_syscall_exit(pid_tgid, EXIT_RECVFROM, syscall_id as u32);
             sys_enter_recvfrom(trace_ctx)
         }
         45 => {
-            stash_pending_syscall_exit(pid_tgid, EXIT_SOCKET);
+            stash_pending_syscall_exit(pid_tgid, EXIT_SOCKET, syscall_id as u32);
             sys_enter_socket(trace_ctx)
         }
         _ => 0,
@@ -310,10 +320,19 @@ pub fn raw_sys_enter(ctx: RawTracePointContext) -> u32 {
 #[raw_tracepoint(tracepoint = "sys_exit")]
 pub fn raw_sys_exit(ctx: RawTracePointContext) -> u32 {
     let pid_tgid = aya_ebpf::helpers::bpf_get_current_pid_tgid();
-    let Some(action) = (unsafe { PENDING_SYSCALL_EXIT.get(&pid_tgid) }).copied() else {
+    let Some(pending) = (unsafe { PENDING_SYSCALL_EXIT.get(&pid_tgid) }).copied() else {
         return 0;
     };
     let _ = PENDING_SYSCALL_EXIT.remove(&pid_tgid);
+    let regs = ctx.arg::<*const u8>(0);
+    let action = matching_pending_syscall_exit(Some(pending), read_syscall_nr(regs));
+    let Some(action) = action else {
+        if let Some(count) = PENDING_EXIT_MISMATCH_DROPPED.get_ptr_mut(0) {
+            // SAFETY: the counter slot is owned by the current CPU.
+            unsafe { *count = (*count).wrapping_add(1) };
+        }
+        return 0;
+    };
     let return_value = ctx.arg::<i64>(1);
 
     let Some(record) = SYSCALL_EXIT_SCRATCH.get_ptr_mut(0) else {
@@ -376,5 +395,26 @@ fn read_syscall_args(regs: *const u8) -> Option<[u64; 6]> {
             unsafe { bpf_probe_read_kernel(regs.add(offsets[5] as usize).cast::<u32>()) }.ok()?
                 as u64,
         ])
+    }
+}
+
+fn read_syscall_nr(regs: *const u8) -> Option<u32> {
+    let offset = SYSCALL_NR_OFFSET.load() as usize;
+    #[cfg(bpf_target_arch = "x86_64")]
+    {
+        let value = unsafe { bpf_probe_read_kernel(regs.add(offset).cast::<u64>()) }.ok()?;
+        u32::try_from(value).ok()
+    }
+    #[cfg(bpf_target_arch = "aarch64")]
+    {
+        // arm64's arch/arm64/include/asm/ptrace.h defines pt_regs.syscallno as
+        // s32, followed by the u32 GIC priority mask (pmr). Read only syscallno:
+        // a 64-bit read would accidentally include the neighbouring pmr field.
+        let value = unsafe { bpf_probe_read_kernel(regs.add(offset).cast::<i32>()) }.ok()?;
+        syscall_nr_from_i32(value)
+    }
+    #[cfg(bpf_target_arch = "x86")]
+    {
+        unsafe { bpf_probe_read_kernel(regs.add(offset).cast::<u32>()) }.ok()
     }
 }

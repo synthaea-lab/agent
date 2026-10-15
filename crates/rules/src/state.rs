@@ -10,8 +10,8 @@ use std::{
 use schema::{
     AuthEvent, AuthOutcome, ConnectEvent, Event, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
     FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRenameEvent, FileWriteEvent,
-    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, SessionEvent, User,
-    detection::Severity,
+    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, POLICY_MECHANISM_SELINUX,
+    PolicyDenialEvent, SessionEvent, SessionState, User, detection::Severity,
 };
 use store::BoundedMap;
 
@@ -34,7 +34,9 @@ use crate::{
         TOUCHED_FILES_PID_CAP,
     },
     has_write_intent,
+    rdp::RdpSuccessAfterFailures,
     session::SessionHijack,
+    signature_gate::SignatureGatedAlert,
     sliding::{FlowPortDedup, SlidingCounter, SlidingDistinct, SlidingSum},
 };
 
@@ -78,7 +80,7 @@ struct ReportedTaskRegistration {
 /// the fact was recorded for ([`schema::EventMeta::process_generation`]); a lookup
 /// that names a different one misses. `None` on either side means "cannot tell" and
 /// reads as a match: an entry seeded at startup, or an event from a platform with no
-/// stamp (Windows, macOS), behaves exactly as before.
+/// stamp (macOS), behaves exactly as before.
 #[derive(Debug, Clone)]
 pub(crate) struct PidFact {
     generation: Option<u64>,
@@ -106,6 +108,11 @@ impl PidFact {
     }
 }
 
+/// `known_policy_denials`' key: (mechanism, subject context, object context, object
+/// class). Named so clippy's `type_complexity` lint doesn't flag the field
+/// declaration.
+type PolicyDenialKey = (String, Option<String>, Option<String>, Option<String>);
+
 /// Sliding history needed by the correlation rules:
 /// - T1105 (Ingress Tool Transfer): a path recently written by `curl`/`wget` is
 ///   executed shortly after. Correlated by path + time window rather than by a strict
@@ -114,7 +121,6 @@ impl PidFact {
 ///   child of `curl`/`wget`).
 /// - T1059 (suspicious process lineage): a shell interpreter executed directly by a
 ///   web server process — classic indicator of a web shell / RCE.
-///
 pub struct RuleState {
     /// pid → comm of the last exec seen for this pid, to recover the parent's comm
     /// (T1059) with a simple `ppid` lookup without having to walk the process tree in
@@ -159,10 +165,35 @@ pub struct RuleState {
     /// listener space is a few dozen, not unbounded, but a hostile loop binding
     /// many ports must not grow this without limit either.
     known_listeners: BoundedMap<(IpAddr, u16), ()>,
+    /// (mechanism, subject context, object context, object class) → seen, for
+    /// POLICY-DENIAL-DRIFT (issue #774, T1562-adjacent). Same "first new shape
+    /// wins, the routine repeat doesn't" principle as `known_listeners` above:
+    /// a `SELinux`-Enforcing host denies constantly as part of normal
+    /// operation, so alerting on every `PolicyDenial` would be unusable — a
+    /// *new* (subject, object, class) triple appearing is the signal. No
+    /// startup-baseline seeding (unlike listeners, there's no enumerable
+    /// "current state" of past denials to snapshot at agent start) — the
+    /// first run is cold by design. LRU-bounded like every other stateful
+    /// rule.
+    ///
+    /// `SELinux` only (`check_policy_denial_drift` gates on
+    /// [`POLICY_MECHANISM_SELINUX`]): `scontext`/`tcontext` give each denial a
+    /// rich, domain-specific triple. AppLocker/WDAC `PolicyDenialEvent`s carry
+    /// no subject/object context at all (`None`/`None`), so their "shape"
+    /// would collapse to `object_class` alone — 5 values for `AppLocker`
+    /// (`EXE`/`DLL`/`MSI`/`SCRIPT`/`APPX`), 2 for WDAC — meaning the *first*
+    /// blocked `.exe` ever seen would alert and every distinct one after it,
+    /// forever, would not. Needs a richer per-mechanism key (likely
+    /// `object_path`) before it's worth extending; tracked as a follow-up,
+    /// not done here.
+    known_policy_denials: BoundedMap<PolicyDenialKey, ()>,
     /// (target user, source) → sliding failure counter for T1110 (AUTH-BURST).
     /// LRU-bounded like every other counter: a spray across many fabricated
     /// usernames must not grow this without limit.
     auth_failures: BoundedMap<(String, String), SlidingCounter>,
+    /// RDP authentication successes joined to the failures from the same address,
+    /// by event time (T1021.001, #285); see the `rdp` module.
+    rdp_success: RdpSuccessAfterFailures,
     /// pid → sliding counter for RANSOMWARE-RENAME (T1486, issue #262): renames by
     /// this pid where `new_path` is `old_path` plus an appended suffix. LRU-bounded:
     /// a hostile process renaming under many different pids (unusual, but not
@@ -287,7 +318,9 @@ impl RuleState {
             beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
             scan_spread: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
+            known_policy_denials: BoundedMap::new(COUNTER_CAP),
             auth_failures: BoundedMap::new(COUNTER_CAP),
+            rdp_success: RdpSuccessAfterFailures::new(),
             recent_creates: BoundedMap::new(CREATE_UNLINK_PID_CAP),
             pending_unlinks: BoundedMap::new(CREATE_UNLINK_PID_CAP),
             touched_files: BoundedMap::new(TOUCHED_FILES_PID_CAP),
@@ -501,7 +534,12 @@ impl RuleState {
     /// (`powershell -File x.ps1`, `sh x.sh`) has the interpreter as its image
     /// path and does not join; T1105's comm-based match has the same shape of
     /// limit on Linux.
-    fn check_quarantined_exec(&mut self, event: &ExecEvent) -> Option<Alert> {
+    ///
+    /// Gated on the image's signature (#441): every installer a user downloads
+    /// and runs matches the join, and almost all of them are signed. The
+    /// signature is only known after enrichment, off the capture thread, so this
+    /// returns a [`SignatureGatedAlert`] (see [`Self::on_exec_signature_gated`]).
+    fn check_quarantined_exec(&mut self, event: &ExecEvent) -> Option<SignatureGatedAlert> {
         let now = event.meta.timestamp_ns;
         let mark = self
             .recent_quarantines
@@ -511,7 +549,7 @@ impl RuleState {
             return None;
         }
         mark.alerted = true;
-        Some(Alert {
+        Some(SignatureGatedAlert::new(Alert {
             technique: "T1204.002",
             severity: Severity::High,
             message: format!(
@@ -523,7 +561,7 @@ impl RuleState {
                 mark.origin_url.as_deref().unwrap_or("unrecorded"),
                 mark.agent.as_deref().unwrap_or("unknown"),
             ),
-        })
+        }))
     }
 
     // ── Windows rules ────────────────────────────────────────────────────────
@@ -865,7 +903,6 @@ impl RuleState {
         let mut alerts = Vec::new();
         alerts.extend(self.check_web_server_spawns_shell(event));
         alerts.extend(self.check_download_then_exec(event));
-        alerts.extend(self.check_quarantined_exec(event));
         alerts.extend(self.check_exec_after_motw_removal(event));
         alerts.extend(self.check_self_spawn(event));
         alerts.extend(self.check_parent_suspect(event));
@@ -886,6 +923,15 @@ impl RuleState {
             PidFact::new(generation, event.image_path.clone()),
         );
         alerts
+    }
+
+    /// The exec findings that wait for the image's signature (#441): today
+    /// T1204.002, a downloaded file run within the mark window. To be called
+    /// for every `ExecEvent`, beside [`Self::on_exec`]. The
+    /// caller resolves each with the enrichment's verdict, or calls
+    /// [`SignatureGatedAlert::unverified`] when it cannot wait for one.
+    pub fn on_exec_signature_gated(&mut self, event: &ExecEvent) -> Option<SignatureGatedAlert> {
+        self.check_quarantined_exec(event)
     }
 
     /// To be called for every `ConnectEvent` in the stream (mainly Windows ETW).
@@ -936,6 +982,74 @@ impl RuleState {
         self.check_listen_port_drift(event).into_iter().collect()
     }
 
+    /// POLICY-DENIAL-DRIFT (issue #774, T1562-adjacent) — see
+    /// `known_policy_denials`'s doc for why this alerts on a new
+    /// (subject, object, class) triple rather than on every denial. Fires for
+    /// `PolicyDenialEvent::enforced` either way (`SELinux` permissive logs the
+    /// same fact a managed Enforcing host would act on) — the point is a new
+    /// *shape* of denial, not whether this particular one was blocked.
+    ///
+    /// `SELinux` only for now — see `known_policy_denials`'s doc for why an
+    /// AppLocker/WDAC `PolicyDenialEvent` would collapse to a far coarser
+    /// shape with this same key.
+    ///
+    /// Inert while the eBPF sensor is selected (#780): `SELinux` AVC denials
+    /// only reach the agent through the audit sensor, so silence here does not
+    /// mean no denials happened.
+    ///
+    /// The requested permission is not part of the key (#813): the audit
+    /// sensor does not parse it yet, so a routine `getattr` denial silences a
+    /// later, more interesting `read`/`write`/`open` on the same subject,
+    /// object and class.
+    fn check_policy_denial_drift(&mut self, event: &PolicyDenialEvent) -> Option<Alert> {
+        if event.mechanism != POLICY_MECHANISM_SELINUX {
+            return None;
+        }
+        let key: PolicyDenialKey = (
+            event.mechanism.clone(),
+            Self::selinux_type_triple(event.subject_context.as_deref()),
+            Self::selinux_type_triple(event.object_context.as_deref()),
+            event.object_class.clone(),
+        );
+        if self.known_policy_denials.get(&key).is_some() {
+            return None;
+        }
+        self.known_policy_denials.insert(key, ());
+        Some(Alert {
+            technique: "T1562",
+            severity: Severity::Medium,
+            message: format!(
+                "comm={} mechanism={} subject={} object={} class={} path={} enforced={} — new denial shape, not seen this run",
+                event.meta.comm,
+                event.mechanism,
+                event.subject_context.as_deref().unwrap_or("-"),
+                event.object_context.as_deref().unwrap_or("-"),
+                event.object_class.as_deref().unwrap_or("-"),
+                event.object_path.as_deref().unwrap_or("-"),
+                event.enforced,
+            ),
+        })
+    }
+
+    /// The `user:role:type` prefix of a `SELinux` security context
+    /// (`user:role:type:sensitivity[:categories]`), dropped from
+    /// [`PolicyDenialKey`] so a container's own MCS/MLS category pair does not
+    /// make every denial from it a "new" shape (#781 review: two denials
+    /// differing only in category gave two alerts). A bounded split, not a
+    /// split on the last colon: the MLS field itself can contain one
+    /// (`s0-s0:c0.c1023`). A bare type with no context at all (`httpd_t`)
+    /// passes through unchanged.
+    fn selinux_type_triple(context: Option<&str>) -> Option<String> {
+        context.map(|c| c.splitn(4, ':').take(3).collect::<Vec<_>>().join(":"))
+    }
+
+    /// To be called for every `PolicyDenialEvent` in the stream (`SELinux` AVC
+    /// on Linux issue #297, AppLocker/WDAC on Windows issue #283) — see
+    /// [`Self::check_policy_denial_drift`].
+    pub fn on_policy_denial(&mut self, event: &PolicyDenialEvent) -> Vec<Alert> {
+        self.check_policy_denial_drift(event).into_iter().collect()
+    }
+
     /// To be called for every `LdapSearchEvent` (Windows, #364): the
     /// directory-enumeration sweep, many distinct searches from one process
     /// in a short window. The single-search rules are
@@ -963,12 +1077,24 @@ impl RuleState {
             .map_or_else(|| "local".to_string(), |a| a.to_string());
         let key = (event.target_user.clone(), source.clone());
         let ts = event.meta.timestamp_ns;
+        // A success can reach the rules before the last failures that precede
+        // it (two channels, two poll threads): this failure may complete it.
+        // Only failures from the Windows Security log feed the join: they carry a
+        // Windows identity and are stamped with the event's own time, like the 1149.
+        // Application-log failures (`[logs]` sources) are stamped when the line is
+        // read, so a restart replaying a backlog would make hours-old failures look
+        // current: other clock, not joined.
+        let mut alerts: Vec<Alert> = event
+            .source_address
+            .filter(|_| matches!(event.meta.user, User::Windows { .. }))
+            .map(|address| self.rdp_success.on_failure(address, ts))
+            .unwrap_or_default();
         let entry = self
             .auth_failures
             .get_or_insert_with(key, SlidingCounter::default);
         let count = entry.record(ts, AUTH_FAILURE_WINDOW_NS);
         if count >= AUTH_FAILURE_THRESHOLD && entry.try_alert(ts, AUTH_FAILURE_WINDOW_NS) {
-            return vec![Alert {
+            alerts.push(Alert {
                 technique: "T1110",
                 severity: Severity::Medium,
                 message: format!(
@@ -976,16 +1102,29 @@ impl RuleState {
                     event.target_user,
                     AUTH_FAILURE_WINDOW_NS / 1_000_000_000,
                 ),
-            }];
+            });
         }
-        Vec::new()
+        alerts
     }
 
     /// To be called for every `SessionEvent` in the stream (Windows Terminal
     /// Services, #285): a disconnected session reconnected from another
-    /// client, T1563.002 (see the `session` module).
+    /// client, T1563.002 (see the `session` module), or a successful RDP listener
+    /// authentication after failures from that source, T1021.001.
     pub fn on_session(&mut self, event: &SessionEvent) -> Vec<Alert> {
-        self.session_hijack.on_session(event).into_iter().collect()
+        let mut alerts: Vec<Alert> = self.session_hijack.on_session(event).into_iter().collect();
+
+        if event.state != SessionState::Connect || event.console {
+            return alerts;
+        }
+        if let Some(address) = event.source_address {
+            alerts.extend(self.rdp_success.on_success(
+                address,
+                event.meta.timestamp_ns,
+                &event.target_user,
+            ));
+        }
+        alerts
     }
 
     /// To be called for every `MemfdCreateEvent` in the stream (Linux, issue

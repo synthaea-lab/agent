@@ -5,7 +5,7 @@
 
 use schema::{
     ConnectEvent, ContainerContext, EventMeta, ExecEvent, FileOpenEvent, ListenPortEvent,
-    NetworkFlowEvent, User,
+    NetworkFlowEvent, PolicyDenialEvent, User,
 };
 
 use crate::{
@@ -287,11 +287,30 @@ fn listen_port_event_full(
     }
 }
 
+fn policy_denial_event_full(
+    mechanism: &str,
+    subject_context: Option<&str>,
+    object_context: Option<&str>,
+    object_class: Option<&str>,
+    enforced: bool,
+) -> PolicyDenialEvent {
+    PolicyDenialEvent {
+        meta: meta(),
+        mechanism: mechanism.to_string(),
+        subject_context: subject_context.map(str::to_string),
+        object_context: object_context.map(str::to_string),
+        object_class: object_class.map(str::to_string),
+        enforced,
+        ..schema::fixtures::policy_denial()
+    }
+}
+
 mod coverage;
 mod linux;
 mod motw_removal;
 mod persistence;
 mod quarantine;
+mod rdp;
 mod session;
 mod tamper;
 mod windows;

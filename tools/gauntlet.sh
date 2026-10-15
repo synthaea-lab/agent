@@ -33,6 +33,9 @@ cargo clippy --workspace --exclude sensor-linux-ebpf --all-targets -- -D warning
 step "tests"
 cargo test --workspace --exclude sensor-linux-ebpf
 
+step "updater trust set without the test key (production code path, ADR-0027)"
+cargo test -p updater --no-default-features
+
 step "cargo deny (licenses, advisories, bans, sources)"
 cargo deny check
 

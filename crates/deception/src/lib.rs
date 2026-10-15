@@ -34,6 +34,12 @@
 //!   canary's place is never followed).
 //! - [`Tripwires`] matches the existing file events (open, delete, rename) against the
 //!   inventory and says which canary, how it was touched and by which pid.
+//! - Planting gives each canary a deterministic, seed-derived modification time. When
+//!   neighboring regular files provide a wide enough range, canary times are chosen inside
+//!   it; otherwise they use distinct times one to 365 days in the past. On Unix, the agent
+//!   layer also matches ownership and permission bits to regular neighbours when allowed;
+//!   fields it cannot match are logged, and owner-read is retained so the agent can verify the
+//!   canary.
 //!
 //! - [`refresh`] puts back a canary that was deleted, with the content it had, and nothing
 //!   else.

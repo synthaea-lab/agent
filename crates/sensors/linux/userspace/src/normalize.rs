@@ -106,7 +106,11 @@ use sensor_linux_wire as wire;
 /// v23 (#263) added `SocketCreateEvent` — new `socket_create` mapping function
 /// below, maps `domain`/`socket_type`/`protocol`/`fd` one-to-one; no existing
 /// mapping changed shape.
-const _: () = assert!(wire::WIRE_VERSION == 23);
+///
+/// v24 (#784) added `grandparent_pid`/`parent_execd`/`grandparent_generation` to `ExecEvent`
+/// and `execd` to `LineageEntry`; `exec` maps none of them (the parent-image cache reads them
+/// from the wire event, see `parent_image`), so no mapping changed shape.
+const _: () = assert!(wire::WIRE_VERSION == 24);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
@@ -174,7 +178,8 @@ pub fn exec(
         cmdline: argv.join(" "),
         argv,
         parent_comm: comm_opt(&event.pcomm),
-        // eBPF has the parent comm but not its full path — see #107.
+        // eBPF has the parent comm but not its full path: the sensor fills it from its
+        // pid-to-image cache (`parent_image`, #768).
         parent_image_path: None,
         sha256: None,
         signature: None,
@@ -781,6 +786,9 @@ mod tests {
             image: image_buf,
             image_len: image.len() as u16,
             pcomm: pcomm_buf,
+            grandparent_pid: 0,
+            parent_execd: 0,
+            grandparent_generation: 0,
         }
     }
 

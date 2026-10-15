@@ -1,7 +1,7 @@
-{"pid": 100, "process_generation": 1, "score": -0.012346982955932617}
-{"pid": 100, "process_generation": 2, "score": 0.1230752170085907}
-{"pid": 200, "process_generation": null, "score": 0.11084741353988647}
-{"pid": 300, "process_generation": null, "score": 0.10042911767959595}
-{"pid": 400, "process_generation": null, "score": -0.005487024784088135}
-{"pid": 500, "process_generation": null, "score": -0.04510772228240967}
+{"pid": 100, "process_generation": 1, "score": -0.02686941623687744}
+{"pid": 100, "process_generation": 2, "score": 0.15846651792526245}
+{"pid": 200, "process_generation": null, "score": 0.13287362456321716}
+{"pid": 300, "process_generation": null, "score": 0.12464958429336548}
+{"pid": 400, "process_generation": null, "score": -0.04180455207824707}
+{"pid": 500, "process_generation": null, "score": -0.05705183744430542}
 {"pid": 9999, "process_generation": null, "score": null}

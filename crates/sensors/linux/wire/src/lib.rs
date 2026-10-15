@@ -21,6 +21,40 @@ extern crate std;
 mod path_filter;
 pub use path_filter::is_filtered_path;
 
+/// Packs the handler tag and syscall number for a pending raw `sys_exit` event.
+/// The syscall number is kept with the tag so a later exit from another syscall
+/// in the same thread cannot consume stale state.
+#[inline(always)]
+#[must_use]
+pub const fn encode_pending_syscall_exit(action: u32, syscall_nr: u32) -> u64 {
+    ((syscall_nr as u64) << 32) | action as u64
+}
+
+/// Returns the pending handler only when the exiting syscall matches its entry.
+#[inline(always)]
+#[must_use]
+pub const fn matching_pending_syscall_exit(
+    packed: Option<u64>,
+    exiting_syscall_nr: Option<u32>,
+) -> Option<u32> {
+    match (packed, exiting_syscall_nr) {
+        (Some(value), Some(syscall_nr)) if (value >> 32) as u32 == syscall_nr => Some(value as u32),
+        _ => None,
+    }
+}
+
+/// Converts a signed syscall number from architectures that use a negative
+/// sentinel (arm64's `NO_SYSCALL`) into the non-negative syscall-id domain.
+#[inline(always)]
+#[must_use]
+pub const fn syscall_nr_from_i32(syscall_nr: i32) -> Option<u32> {
+    if syscall_nr < 0 {
+        None
+    } else {
+        Some(syscall_nr as u32)
+    }
+}
+
 /// Bumped on every layout-affecting change to the structs below. Not a wire header
 /// (ring-buffer items carry none) — a build-time tripwire: the userspace loader
 /// `const _`-asserts the value it was compiled against, so an ebpf/userspace version
@@ -230,7 +264,16 @@ pub use path_filter::is_filtered_path;
 ///   address filtering happens here (unlike `connect`/`bind`, `socket(2)` isn't
 ///   necessarily `AF_INET`/`AF_INET6` — `AF_PACKET`/`AF_NETLINK`/raw sockets are
 ///   exactly the kind of creation this event exists to surface).
-pub const WIRE_VERSION: u32 = 23;
+/// - v24: `ExecEvent` gains `grandparent_pid`, `parent_execd` and `grandparent_generation`
+///   (issue #784), and `LineageEntry`'s `reserved` becomes `execd`. A process that forked
+///   and never exec'd (a subshell) runs its forker's image, so the exec probe reports the
+///   parent's own parent and that stamp, taken from the parent's `PROC_LINEAGE` entry only
+///   when the entry's `generation` equals the child's `parent_generation` (a reused parent
+///   pid must not lend its new forker). `execd` is set by the exec probe on the process's
+///   own entry and copied to `parent_execd`, so userspace can tell a parent that never
+///   exec'd from one that did and whose image the cache lost. Both layouts are unchanged
+///   in size: `parent_execd` and `execd` take the place of explicit padding.
+pub const WIRE_VERSION: u32 = 24;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
@@ -308,6 +351,18 @@ pub struct ExecEvent {
     /// Parent short name at exec time, from the `PROC_LINEAGE` map. Empty when the
     /// parent forked before the probe attached and `/proc` priming missed it.
     pub pcomm: [u8; TASK_COMM_LEN],
+    /// The parent's own parent (`PROC_LINEAGE[ppid].ppid`), `0` when unknown. A parent
+    /// that forked and never exec'd (a subshell: `$(...)`, a pipeline stage) runs the image
+    /// of the process that forked it, so this is how userspace answers for it (#784).
+    pub grandparent_pid: u32,
+    /// `1` when the parent's `PROC_LINEAGE` entry says it has exec'd since it forked (the
+    /// entry's `execd`), `0` when it has not (or when `grandparent_pid` is `0`, no parent
+    /// entry). Userspace answers for a parent with its forker's image only when this is `0`
+    /// (#784). Also keeps `grandparent_generation` 8-aligned with no implicit padding.
+    pub parent_execd: u32,
+    /// The stamp of `grandparent_pid` as the parent's fork recorded it
+    /// (`PROC_LINEAGE[ppid].parent_generation`), `0` when unknown.
+    pub grandparent_generation: u64,
 }
 
 /// Value of the `PROC_LINEAGE` fork-tracking map: a pid's parent identity, captured
@@ -320,9 +375,12 @@ pub struct ExecEvent {
 pub struct LineageEntry {
     pub ppid: u32,
     pub comm: [u8; TASK_COMM_LEN],
-    /// Explicit padding so `generation` is 8-aligned without implicit padding bytes.
-    /// Always zero.
-    pub reserved: u32,
+    /// `1` once this process has exec'd since the fork that created the entry (set by the exec
+    /// probe), `0` for a process that forked and has not exec'd: a subshell, which runs its
+    /// forker's image (#784). A process primed from `/proc` is `1`: it predates the agent and
+    /// nothing says it never exec'd, which is the safe reading. Also keeps `generation`
+    /// 8-aligned without implicit padding bytes.
+    pub execd: u32,
     /// Stamp of this incarnation of the pid (issue #519): `bpf_ktime_get_ns()` at the
     /// fork, or `PRIMED_GENERATION_BIT | starttime` for a process primed from `/proc`.
     pub generation: u64,
@@ -913,6 +971,28 @@ pub fn boot_epoch_offset_ns() -> u64 {
         .saturating_mul(1_000_000_000)
         .saturating_add(ts.tv_nsec as u64);
     epoch_ns.saturating_sub(monotonic_ns)
+}
+
+#[cfg(test)]
+mod pending_exit_tests {
+    use super::*;
+
+    #[test]
+    fn pending_exit_dispatch_requires_the_same_syscall_number() {
+        let pending = encode_pending_syscall_exit(4, 45);
+        assert_eq!(
+            matching_pending_syscall_exit(Some(pending), Some(45)),
+            Some(4)
+        );
+        assert_eq!(matching_pending_syscall_exit(Some(pending), Some(59)), None);
+        assert_eq!(matching_pending_syscall_exit(Some(pending), None), None);
+        assert_eq!(matching_pending_syscall_exit(None, Some(45)), None);
+        assert_eq!(
+            matching_pending_syscall_exit(Some(pending), syscall_nr_from_i32(-1)),
+            None
+        );
+        assert_eq!(syscall_nr_from_i32(45), Some(45));
+    }
 }
 
 #[cfg(all(test, feature = "user"))]

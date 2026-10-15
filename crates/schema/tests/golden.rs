@@ -16,12 +16,13 @@ use schema::{
     GatekeeperVerdictEvent, HttpClientCount, HttpEvidence, HttpRequestEvent, HttpSignature,
     HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent, KernelModuleAction,
     KernelModuleEvent, LdapSearchEvent, ListenPortEvent, MemfdCreateEvent, MountEvent,
-    NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, POLICY_MECHANISM_SELINUX,
-    PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
-    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent, SessionState, ShellType,
-    SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketCreateEvent,
-    SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
-    UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
+    NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, NtlmAuthEvent, NtlmDirection,
+    POLICY_MECHANISM_SELINUX, PackageChangeEvent, PackageChangeKind, PolicyDenialEvent, PrctlEvent,
+    ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent,
+    ScriptBlockEvent, SessionEvent, SessionState, ShellType, SignalEvent, SmbConnectEvent,
+    SocketAcceptEvent, SocketBindEvent, SocketCreateEvent, SocketListenEvent, TccDecisionEvent,
+    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, User,
+    WmiActivityEvent, XpcConnectEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -448,6 +449,31 @@ fn wmi_activity_golden() {
             method: Some("Win32_Process.Create".into()),
         }),
         "wmi_activity",
+    );
+}
+
+#[test]
+fn ntlm_auth_golden() {
+    assert_golden(
+        &Event::NtlmAuth(NtlmAuthEvent {
+            meta: EventMeta {
+                pid: 4,
+                ppid: 0,
+                user: User::Unknown,
+                timestamp_ns: 1_759_405_827_000_000_000,
+                comm: "System".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            direction: NtlmDirection::Outgoing,
+            user: "synlabnobody".into(),
+            target: "cifs/127.0.0.1".into(),
+            remote_address: Some("127.0.0.1".parse().unwrap()),
+            ntlm_version: "NTLMv2".into(),
+            status: None,
+        }),
+        "ntlm_auth",
     );
 }
 
@@ -1508,6 +1534,31 @@ fn socket_create_golden() {
 }
 
 #[test]
+fn package_change_upgraded_golden() {
+    // v43 (#87): a diffed inventory snapshot, not a kernel event — pid/ppid 0 and
+    // comm names the package manager, same convention as `HttpRequestEvent`.
+    assert_golden(
+        &Event::PackageChange(PackageChangeEvent {
+            meta: EventMeta {
+                pid: 0,
+                ppid: 0,
+                user: User::Unknown,
+                timestamp_ns: 1_756_900_020_000_000_000,
+                comm: "dpkg".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            package: "openssl".into(),
+            change: PackageChangeKind::Upgraded,
+            previous_version: Some("3.0.13-1".into()),
+            version: Some("3.0.15-1".into()),
+        }),
+        "package_change_upgraded",
+    );
+}
+
+#[test]
 fn policy_denial_golden() {
     // v23 (#297): a SELinux AVC denial — httpd blocked (enforcing mode) from
     // reading a file labeled for a user's home directory, the classic
@@ -2071,6 +2122,15 @@ fn meta_accessor_covers_all_variants() {
             query: None,
             method: None,
         }),
+        Event::NtlmAuth(NtlmAuthEvent {
+            meta: meta.clone(),
+            direction: NtlmDirection::Incoming,
+            user: String::new(),
+            target: String::new(),
+            remote_address: None,
+            ntlm_version: String::new(),
+            status: None,
+        }),
         Event::LdapSearch(LdapSearchEvent {
             meta: meta.clone(),
             filter: String::new(),
@@ -2313,6 +2373,13 @@ fn meta_accessor_covers_all_variants() {
             socket_type: 1,
             protocol: 6,
             fd: 0,
+        }),
+        Event::PackageChange(PackageChangeEvent {
+            meta: meta.clone(),
+            package: "x".into(),
+            change: PackageChangeKind::Added,
+            previous_version: None,
+            version: Some("1".into()),
         }),
     ];
     for e in &events {

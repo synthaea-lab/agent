@@ -24,8 +24,8 @@ use crate::{
     pid_cache::PidCache,
     providers::{
         ALL_PROVIDERS, amsi_provider, dns_provider, dotnet_provider, file_provider, ldap_provider,
-        network_provider, powershell_provider, process_provider, registry_provider, smb_provider,
-        wmi_provider,
+        network_provider, ntlm_provider, powershell_provider, process_provider, registry_provider,
+        smb_provider, wmi_provider,
     },
     winapi,
     zone_identifier::{self, MarkQueue, QuarantineDedup},
@@ -57,6 +57,10 @@ const MARK_QUEUE_CAPACITY: usize = 256;
 /// this to fire, the cap only bounds a runaway client.
 const LDAP_PER_PID_LIMIT: u32 = 128;
 const LDAP_PER_PID_WINDOW_NS: u64 = 10_000_000_000;
+/// An identical NTLM authentication (direction, account, target, address, version) is
+/// reported once per this window (#364): most come from pid 4, so there is no per-process
+/// budget.
+const NTLM_DEDUP_WINDOW_NS: u64 = 60_000_000_000;
 
 /// Stops an orphaned ETW session. Named sessions are kernel objects that outlive
 /// the creating process: after a `taskkill /f` or crash the session stays Running
@@ -290,6 +294,9 @@ pub(crate) struct SharedState {
     /// LDAP search budget (#364): per process, no dedup (the burst rule
     /// counts distinct searches).
     pub(crate) ldap: Mutex<budget::PidBudget>,
+    /// NTLM dedup (#364): one event per (direction, account, target,
+    /// address, version) per minute.
+    pub(crate) ntlm: Mutex<budget::KeyDedup>,
     /// The liveness canary file: the run loop touches it every heartbeat, which
     /// MUST produce a Kernel-File event (our pid is tracked) — so sensor liveness
     /// is deterministic instead of traffic-dependent (a quiet host produces no
@@ -299,6 +306,32 @@ pub(crate) struct SharedState {
 }
 
 impl SharedState {
+    /// The identity of the process an event is about: its token user (F-3) and
+    /// the incarnation stamps of it and its parent (#725), as the pid store
+    /// recorded them. `ppid` 0 (an event that names no parent) has no stamp.
+    pub(crate) fn meta(&self, pid: u32, ppid: u32, comm: String, timestamp_ns: u64) -> EventMeta {
+        let (process_generation, parent_process_generation) = {
+            let pids = self.pids.lock().unwrap();
+            let parent = if ppid == 0 {
+                None
+            } else {
+                pids.generation(ppid)
+            };
+            (pids.generation(pid), parent)
+        };
+        EventMeta {
+            pid,
+            ppid,
+            // F-3: real token identity; Unknown when the process is gone/protected.
+            user: winapi::read_process_user(pid),
+            timestamp_ns,
+            comm,
+            container: None,
+            process_generation,
+            parent_process_generation,
+        }
+    }
+
     pub(crate) fn normalize_path(&self, raw: &str) -> String {
         let dos = self.to_dos_path(raw);
         long_path::expand(&dos, &self.long_paths, winapi::long_path_name)
@@ -326,7 +359,11 @@ impl SharedState {
             None => {
                 // ETW race: ConnectEvent before the ExecEvent populated the store.
                 let resolved = winapi::resolve_pid_live(pid)?;
-                self.pids.lock().unwrap().insert(pid, resolved.clone());
+                let generation = winapi::read_process_sequence_number(pid);
+                self.pids
+                    .lock()
+                    .unwrap()
+                    .insert(pid, resolved.clone(), generation);
                 resolved
             }
         };
@@ -359,26 +396,12 @@ fn spawn_mark_reader(
         .map_err(|e| -> SensorError { format!("Zone.Identifier reader thread: {e}").into() })
 }
 
-pub(crate) fn meta(pid: u32, ppid: u32, comm: String, timestamp_ns: u64) -> EventMeta {
-    EventMeta {
-        pid,
-        ppid,
-        // F-3: real token identity; Unknown when the process is gone/protected.
-        user: winapi::read_process_user(pid),
-        timestamp_ns,
-        comm,
-        container: None,
-        process_generation: None,
-        parent_process_generation: None,
-    }
-}
-
 /// Seeds the pid store before the trace: already-running processes resolve from
 /// the very first `ConnectEvent`, and parent lineage/exclusions apply to them.
 fn seed_pid_store(state: &SharedState) {
     let mut pids = state.pids.lock().unwrap();
     for (pid, name) in winapi::snapshot_processes() {
-        pids.insert(pid, name);
+        pids.insert(pid, name, winapi::read_process_sequence_number(pid));
     }
     tracing::info!(processes = pids.len(), "pid store seeded");
 }
@@ -503,6 +526,7 @@ impl Sensor for WindowsSensor {
                 LDAP_PER_PID_LIMIT,
                 LDAP_PER_PID_WINDOW_NS,
             )),
+            ntlm: Mutex::new(budget::KeyDedup::new(NTLM_DEDUP_WINDOW_NS)),
             canary_path: canary_file
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -526,7 +550,8 @@ impl Sensor for WindowsSensor {
             .enable(dotnet_provider(sink.clone(), state.clone()))
             .enable(smb_provider(sink.clone(), state.clone()))
             .enable(amsi_provider(sink.clone(), state.clone()))
-            .enable(ldap_provider(sink, state.clone()));
+            .enable(ldap_provider(sink.clone(), state.clone()))
+            .enable(ntlm_provider(sink, state.clone()));
         let trace = normalize::start_or_stop_session(
             &session,
             || builder.start_and_process(),
