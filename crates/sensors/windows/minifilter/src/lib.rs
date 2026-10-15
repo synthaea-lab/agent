@@ -5,13 +5,16 @@
 //! connection context; the driver accepts exactly one client, and only one
 //! running as the agent (`NT SERVICE\SynthaEDR` in its token, guardrail 5).
 //!
-//! Milestone 2b: connecting only. The driver sends nothing yet (the event
-//! channel is milestone 2c), so there is no receive loop here.
+//! Milestone 2c: the event channel. The driver sends one message per delete
+//! or rename, and an idle heartbeat ([`wire`]); [`channel::run`] receives,
+//! decodes and forwards them as `FileDelete`/`FileRename` ([`events`]), with
+//! the loss visible from both sides ([`stats`]). The design is
+//! `docs/architecture/minifilter-event-channel.md`.
 //!
 //! The protocol constants mirror `driver/minifilter/SynthaeaFilter.c`: a
 //! change on one side is a change on the other. This crate sits next to
-//! `driver/` and depends on no workspace crate (ADR-0012 guardrail 8; it will
-//! depend on `schema` once it decodes events).
+//! `driver/` and depends only on `schema` among the workspace crates
+//! (ADR-0012 guardrail 8, `tools/check-deps.py`).
 
 /// Name of the driver's communication port.
 pub const PORT_NAME: &str = r"\SynthaeaPort";
@@ -20,7 +23,7 @@ pub const PORT_NAME: &str = r"\SynthaeaPort";
 pub const CONNECT_MAGIC: u32 = 0x544E_5953;
 
 /// Second field of the connection context. The driver refuses any other value.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The service SID the driver requires in the connecting process's token:
 /// `NT SERVICE\SynthaEDR`, the watchdog service that spawns the agent
@@ -79,20 +82,27 @@ impl ConnectError {
     }
 }
 
+pub mod events;
+pub mod stats;
 pub mod wire;
 
 #[cfg(windows)]
+pub mod channel;
+#[cfg(windows)]
 mod port;
 #[cfg(windows)]
-pub use port::DriverPort;
+pub use port::{DriverPort, ReceiveBuffer, ReceiveError};
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn the_connection_context_spells_synt_then_version_one() {
-        assert_eq!(connect_context(), *b"SYNT\x01\x00\x00\x00");
+    fn the_connection_context_spells_synt_then_version_two() {
+        // Version 2 is the event channel (2c): a driver still at 1 refuses this client with
+        // `Refused`, and a 2c driver refuses a 2b client, so neither side reads a format it
+        // does not know.
+        assert_eq!(connect_context(), *b"SYNT\x02\x00\x00\x00");
     }
 
     #[test]

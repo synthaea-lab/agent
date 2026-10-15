@@ -21,6 +21,9 @@ use crate::silence::PulsingSink;
 /// in-sensor canary (audit F-2) already fails the trace after 30s of total
 /// silence; this is the agent-level, alerting counterpart.
 const ETW_SILENCE_DEADLINE_NS: u64 = 120_000_000_000; // 120s
+/// The minifilter sends an idle heartbeat every 5 s (milestone 2c, #136), so 30 s of
+/// nothing, not even a heartbeat, means the driver or its sender thread is gone.
+const MINIFILTER_SILENCE_DEADLINE_NS: u64 = 30_000_000_000;
 
 /// Silence deadline for each Event Log poll target. These pulse on every
 /// *successful* poll tick (`POLL_INTERVAL` = 2s in the sensor), not per event,
@@ -280,6 +283,8 @@ fn run_windows_sensors(
             }
         };
 
+    let minifilter_thread = spawn_minifilter(Arc::clone(&sink), silence, Arc::clone(&shutdown));
+
     let eventlog_thread = {
         let sink = Arc::clone(&sink);
         std::thread::spawn(move || eventlog_sensor.run(Box::new(SharedSink(sink))))
@@ -308,6 +313,11 @@ fn run_windows_sensors(
     {
         eprintln!("[!] Socket poller thread panicked (LISTENER-DRIFT degraded)");
     }
+    if let Some(handle) = minifilter_thread
+        && handle.join().is_err()
+    {
+        eprintln!("[!] Minifilter receive thread panicked (driver file telemetry lost)");
+    }
 
     match eventlog_thread.join() {
         Ok(Ok(())) => {}
@@ -322,6 +332,56 @@ fn run_windows_sensors(
     }
 
     etw_result
+}
+
+/// Starts the minifilter's receive thread (milestone 2c, #136) when the driver is loaded and
+/// lets the agent in, and registers its `windows-minifilter` heartbeat.
+///
+/// A host without the driver is the normal case today, so a missing driver is not a silence
+/// alert: the probe connect decides whether the channel runs at all, and only then is the
+/// heartbeat registered (the #828 lesson: a heartbeat for something that never started is a
+/// false alarm). Once running, an unloaded driver *is* worth an alert, and the never-pulsed
+/// heartbeat raises it while the thread retries the connection.
+fn spawn_minifilter(
+    sink: Arc<dyn EventSink>,
+    silence: Option<&Mutex<SilenceMonitor>>,
+    shutdown: Arc<AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    use sensor_windows_minifilter::{ConnectError, DriverPort, channel, stats::ChannelStats};
+
+    match DriverPort::connect() {
+        // Dropped at once: the probe frees the driver's single slot for the thread below.
+        Ok(probe) => drop(probe),
+        Err(ConnectError::NotLoaded) => {
+            tracing::info!("minifilter not loaded: no driver file telemetry on this host");
+            return None;
+        }
+        Err(error) => {
+            eprintln!(
+                "[!] Minifilter loaded but the agent cannot connect ({error}): driver file telemetry off"
+            );
+            return None;
+        }
+    }
+    let heartbeat = SensorHeartbeat::new("windows-minifilter");
+    if let Some(monitor) = silence {
+        monitor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .register(
+                heartbeat.clone(),
+                MINIFILTER_SILENCE_DEADLINE_NS,
+                schema::time::now_ns(),
+            );
+    }
+    let stats = Arc::new(Mutex::new(ChannelStats::default()));
+    std::thread::Builder::new()
+        .name("minifilter".into())
+        .spawn(move || {
+            channel::run(sink.as_ref(), &shutdown, &|| heartbeat.pulse(), &stats);
+        })
+        .map_err(|e| eprintln!("[!] Minifilter receive thread failed to start: {e}"))
+        .ok()
 }
 
 /// The heartbeats [`register_heartbeats`] hands back for the caller to pulse.

@@ -53,6 +53,7 @@ dependencies = [
  "sensor-macos-unifiedlog",
  "sensor-windows",
  "sensor-windows-eventlog",
+ "sensor-windows-minifilter",
  "sensor-windows-sockets",
  "serde",
  "serde_json",
@@ -2658,7 +2659,9 @@ name = "sensor-windows-minifilter"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "schema",
  "thiserror 2.0.21",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 
