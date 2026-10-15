@@ -10,8 +10,8 @@ use tamper::heartbeat::SilenceMonitor;
 
 use crate::{
     health::{
-        DroppedCounter, HealthCollector, HealthCollectorConfig, NoopSpoolStats, SensorHealthSource,
-        SpoolStatsSource,
+        DroppedCounter, HealthCollector, HealthCollectorConfig, NoopSpoolStats, RarityStatsSource,
+        SensorHealthSource, SpoolStatsSource,
     },
     ipc_handler::{AgentHandler, SensorHealthSlot},
     silence::SilenceHealthSource,
@@ -179,11 +179,15 @@ pub(crate) fn health_collector(
         silence_health,
         spool_stats,
         Arc::new(pipeline.sink.enrich_queue().clone()) as Arc<dyn DroppedCounter>,
+        pipeline.sink.rarity_stats() as Arc<dyn RarityStatsSource>,
         move |beacon| {
             tracing::info!(
                 sensors = beacon.sensors.len(),
                 spool_bytes = beacon.spool_bytes,
                 enrich_dropped = beacon.enrich_dropped,
+                rarity_applied = beacon.rarity_applied,
+                rarity_withheld = beacon.rarity_withheld,
+                rarity_unapplied = beacon.rarity_unapplied,
                 "health beacon"
             );
             // #24/#134: the dedicated health channel — best-effort, an
