@@ -268,7 +268,12 @@ pub mod time;
 /// removed, or changed version since the agent's last diffed inventory
 /// snapshot — the walking-skeleton slice of the asset inventory, packages
 /// only, Linux only.
-pub const SCHEMA_VERSION: u32 = 43;
+/// Bumped 43 → 44 for [`Event::NtlmAuth`] (#364): NTLM authentications from
+/// the Microsoft-Windows-NTLM provider (direction, account, target, remote
+/// address, NTLM version). Windows-only. It claimed 41 while #632 (`LdapSearch`)
+/// was open, then 43 after #263 (`SocketCreate`, 42) merged, then 44 after #772
+/// (`PackageChange`) took 43; same coordination note as above.
+pub const SCHEMA_VERSION: u32 = 44;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -1079,6 +1084,49 @@ pub struct DefenderEvent {
     /// `ConfigChanged`: the value after. Empty after a removal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_value: Option<String>,
+}
+
+/// Direction of an [`NtlmAuthEvent`], seen from this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NtlmDirection {
+    /// This host authenticated to a remote resource (EIDs 4020/4021/4026/4027).
+    Outgoing,
+    /// A remote client authenticated to this host (EIDs 4022/4023).
+    Incoming,
+}
+
+/// An NTLM authentication, from the Microsoft-Windows-NTLM provider (#364):
+/// who, to or from where, and with which NTLM version. Windows 11 24H2 emits
+/// these by default (lab, 2026-10-02, no audit setting).
+///
+/// `meta` is the process the provider reports, which in practice is often the
+/// kernel (`SYSTEM`, pid 4) for SMB: the requesting process is not reliably
+/// available, and rules must not depend on it. Failed incoming logons are
+/// deliberately **not** turned into [`AuthEvent`]s here: the Security log's
+/// 4625 already reports them, and counting them twice would skew the
+/// brute-force burst rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NtlmAuthEvent {
+    pub meta: EventMeta,
+    pub direction: NtlmDirection,
+    /// The account used (`Username`, plus `DomainName` as `DOMAIN\user` when
+    /// the provider reports one).
+    pub user: String,
+    /// What was authenticated to: the target service/SPN when present
+    /// (`cifs/host`), else the target machine.
+    pub target: String,
+    /// The remote end: the target IP for outgoing, the client IP for incoming,
+    /// when the provider reports a parseable one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_address: Option<core::net::IpAddr>,
+    /// The negotiated version as the provider names it (`NTLMv2`, `NTLMv1`,
+    /// `LM`, ...).
+    pub ntlm_version: String,
+    /// Incoming only: the NTSTATUS of the attempt, hex (`0xc000006d` = bad
+    /// user name or password). `None` when the provider gives none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 /// An LDAP search a process sent, from EID 30 of the
@@ -2180,6 +2228,7 @@ pub enum Event {
     AmsiContent(AmsiContentEvent),
     Defender(DefenderEvent),
     LdapSearch(LdapSearchEvent),
+    NtlmAuth(NtlmAuthEvent),
     WmiActivity(WmiActivityEvent),
     AssemblyLoad(AssemblyLoadEvent),
     SmbConnect(SmbConnectEvent),
@@ -2243,6 +2292,7 @@ impl Event {
             Event::AmsiContent(e) => &e.meta,
             Event::Defender(e) => &e.meta,
             Event::LdapSearch(e) => &e.meta,
+            Event::NtlmAuth(e) => &e.meta,
             Event::WmiActivity(e) => &e.meta,
             Event::AssemblyLoad(e) => &e.meta,
             Event::SmbConnect(e) => &e.meta,
