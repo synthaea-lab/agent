@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 8422d9a98a94b69cf5e7f8baeb8fc8c8c08c9f9881bd4a1d9e51688f0c42be48 # shrinks to noise = ['"']
 cc 1646493c93024f1e174c3d6bbdc0245c769d5fc53c65de2a47c7fa3b7a273237 # shrinks to noise = ['\u{2003}', '¡', '\u{a0}', '¡', '¡']
+cc 7d95a0ddbae3bb2831adb73e5289819a0db576980352cd5bfd3510b412b4c4e0 # CI #843 run 38712027897: idempotence failure, unbalanced quotes before a URL

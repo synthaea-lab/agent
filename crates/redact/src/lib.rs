@@ -100,7 +100,7 @@ pub fn redact_command_line<'a>(image: &str, cmdline: &'a str) -> Cow<'a, str> {
         if original.contains("://") {
             out.push_str(&redact_url_secrets(original));
         } else {
-            out.push_str(REDACTED);
+            out.push_str(&redacted_keeping_quotes(original));
         }
         cursor = end;
     }
@@ -556,7 +556,7 @@ pub fn redact_url_secrets(url: &str) -> String {
     if let Some(fragment) = fragment {
         out.push('#');
         if !fragment.is_empty() {
-            out.push_str(REDACTED);
+            out.push_str(&redacted_keeping_quotes(fragment));
         }
     }
     out
@@ -577,7 +577,9 @@ fn push_without_userinfo(out: &mut String, base: &str) {
     match base[authority_start..authority_end].rfind('@') {
         Some(at) => {
             out.push_str(&base[..authority_start]);
-            out.push_str(REDACTED);
+            out.push_str(&redacted_keeping_quotes(
+                &base[authority_start..authority_start + at],
+            ));
             out.push_str(&base[authority_start + at..]);
         }
         None => out.push_str(base),
@@ -587,6 +589,25 @@ fn push_without_userinfo(out: &mut String, base: &str) {
 /// Pushes `query` with the value of every secret-named parameter replaced by
 /// [`REDACTED`]. Separators, order, valueless and empty parameters are kept
 /// as they were.
+/// [`REDACTED`] in place of `value`, keeping every quote character the value held:
+/// the leading ones before the token, the rest after it. On a command line those
+/// quotes belong to the shell's quoting; dropping one (`token="A"` →
+/// `token=REDACTED"`) flips the line's quote parity, so a second pass tokenises
+/// differently and redaction stops being idempotent (#843, found by the proptest
+/// on CI). A value made only of quotes holds no secret and is kept as is.
+fn redacted_keeping_quotes(value: &str) -> String {
+    let is_quote = |c: char| c == '"' || c == '\'';
+    if value.chars().all(is_quote) {
+        return value.to_owned();
+    }
+    let rest = value.trim_start_matches(is_quote);
+    let mut out = String::with_capacity(REDACTED.len() + value.len() - rest.len() + 2);
+    out.push_str(&value[..value.len() - rest.len()]);
+    out.push_str(REDACTED);
+    out.extend(rest.chars().filter(|&c| is_quote(c)));
+    out
+}
+
 fn push_redacted_query(out: &mut String, query: &str) {
     for (i, param) in query.split('&').enumerate() {
         if i > 0 {
@@ -596,7 +617,7 @@ fn push_redacted_query(out: &mut String, query: &str) {
             Some((key, value)) if !value.is_empty() && is_secret_key(key) => {
                 out.push_str(key);
                 out.push('=');
-                out.push_str(REDACTED);
+                out.push_str(&redacted_keeping_quotes(value));
             }
             _ => out.push_str(param),
         }
@@ -853,6 +874,24 @@ mod tests {
             "--url=https://REDACTED@example.test/path?token=REDACTED"
         );
         assert_eq!(argv.len(), 2);
+    }
+
+    #[test]
+    fn a_quoted_query_value_keeps_its_quotes_so_redaction_stays_idempotent() {
+        // #843 CI: `token="A"` lost its opening quote, which changed the line's quote
+        // parity and made a second pass redact differently.
+        let line = "net use \"A\"	 https://u:p@example.test/?token=\"A\"	 -p\"A\"";
+        let once = redact_command_line("tool.exe", line).into_owned();
+        assert!(once.contains("token=\"REDACTED\""), "{once}");
+        assert_eq!(redact_command_line("tool.exe", &once), once);
+        assert_eq!(
+            redact_url_secrets("https://h/?token='abc'"),
+            "https://h/?token='REDACTED'"
+        );
+        assert_eq!(
+            redact_url_secrets("https://h/?token=\"\""),
+            "https://h/?token=\"\""
+        );
     }
 
     proptest! {
