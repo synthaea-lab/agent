@@ -10,10 +10,11 @@ use schema::{
 
 use crate::{
     O_CREAT, O_WRONLY, RuleState, check_account_creation_persistence, check_base64_decode,
-    check_btm_launch_item_persistence, check_encoded_powershell, check_ld_preload_hijack,
-    check_persistence_write, check_proc_root_escape, check_scheduled_task_persistence,
-    check_scheduled_task_update_persistence, check_service_install_persistence,
-    check_service_unusual_outbound, check_systemd_service_persistence,
+    check_btm_launch_item_persistence, check_encoded_powershell, check_kerberos_from_non_lsass,
+    check_ld_preload_hijack, check_persistence_write, check_proc_root_escape,
+    check_scheduled_task_persistence, check_scheduled_task_update_persistence,
+    check_service_install_persistence, check_service_unusual_outbound,
+    check_systemd_service_persistence,
     exclusions::{
         AUTH_FAILURE_THRESHOLD, BEACON_THRESHOLD, BURST_WRITE_BYTES_THRESHOLD,
         MEMFD_EXEC_WINDOW_NS, RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS,
