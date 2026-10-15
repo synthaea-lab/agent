@@ -517,15 +517,22 @@ fn spawn_journal_tail(
                 tracing::warn!("journal tail: journalctl spawned without a piped stdout");
                 return;
             };
+            // Pulse on every line `journalctl` delivers, allowlisted or not (#71, #83):
+            // `ClassifiedJournal` only yields allowlisted records, so a pulse in the
+            // loop below would fire on auth and unit events alone and an idle host
+            // would read as a silent sensor.
+            let hook_heartbeat = heartbeat.clone();
             let journal =
-                sensor_linux_journal::ClassifiedJournal::new(std::io::BufReader::new(stdout));
+                sensor_linux_journal::ClassifiedJournal::new(std::io::BufReader::new(stdout))
+                    .with_line_hook(move || hook_heartbeat.pulse());
+            // Our own line into journald at a fixed interval, so there is always
+            // something to read back: the pulse then proves journald -> journalctl
+            // -> agent delivery on a host with nothing else to log.
+            spawn_journal_canary();
             let mut unit_persistence = sensor_linux_journal::UnitPersistenceTracker::new();
             for item in journal {
-                // Pulsed on every line the stream yields, matched or not (#71):
-                // proof journalctl is still delivering, same idle-host caveat as
-                // the eBPF sensor (see `silence::PulsingSink`'s doc) since journald
-                // itself has no forced canary tick.
-                heartbeat.pulse();
+                // The heartbeat is pulsed per line by the hook above, not here: this
+                // loop only sees the allowlisted records.
                 match item {
                     Ok((record, event)) => {
                         crate::journal_cursor::write(&cursor_path, &record.cursor);
@@ -547,6 +554,39 @@ fn spawn_journal_tail(
             }
         })
         .expect("spawning the journal tail thread");
+}
+
+/// How often the agent writes its liveness line into journald. Four of these fit in
+/// [`NO_CANARY_SILENCE_DEADLINE_NS`], so a missed write or two is not a silent
+/// sensor, but a journald that stays gone is.
+const JOURNAL_CANARY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Spawns the thread that writes `sensor_linux_journal`'s canary line into journald
+/// every [`JOURNAL_CANARY_INTERVAL`] (see that crate's `canary` module for why).
+/// A failed write is logged once per failure streak and retried; it is the
+/// signal itself when journald is down, so it never stops the thread.
+fn spawn_journal_canary() {
+    std::thread::Builder::new()
+        .name("journal-canary".into())
+        .spawn(|| {
+            let socket = std::path::Path::new(sensor_linux_journal::JOURNAL_SOCKET);
+            let mut warned = false;
+            loop {
+                match sensor_linux_journal::send_canary(socket) {
+                    Ok(()) => warned = false,
+                    Err(e) if !warned => {
+                        warned = true;
+                        tracing::warn!(
+                            error = %e,
+                            "journal canary: cannot write to journald; the journal sensor will read as silent until it can"
+                        );
+                    }
+                    Err(_) => {}
+                }
+                std::thread::sleep(JOURNAL_CANARY_INTERVAL);
+            }
+        })
+        .expect("spawning the journal canary thread");
 }
 
 /// Spawns the background thread running the uprobes sensor (issue #90: TLS
