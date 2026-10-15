@@ -6,7 +6,7 @@
 //! running as the agent (`NT SERVICE\SynthaEDR` in its token, guardrail 5).
 //!
 //! Milestone 2c: the event channel. The driver sends one message per delete
-//! or rename, and an idle heartbeat ([`wire`]); [`channel::run`] receives,
+//! or rename, and an idle heartbeat ([`wire`]); `channel::run` (Windows only) receives,
 //! decodes and forwards them as `FileDelete`/`FileRename` ([`events`]), with
 //! the loss visible from both sides ([`stats`]). The design is
 //! `docs/architecture/minifilter-event-channel.md`.
