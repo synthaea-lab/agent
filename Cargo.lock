@@ -2324,6 +2324,8 @@ dependencies = [
  "proptest",
  "schema",
  "store",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

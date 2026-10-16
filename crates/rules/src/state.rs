@@ -24,14 +24,14 @@ use crate::{
         COMPRESSOR_COMMS, CREATE_UNLINK_HISTORY_PER_PID, CREATE_UNLINK_PAIR_WINDOW_NS,
         CREATE_UNLINK_PID_CAP, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS, IN_PLACE_EDIT_COMMS,
         LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS, MEMFD_EXEC_WINDOW_NS,
-        PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES, QUARANTINE_EXEC_WINDOW_NS,
-        RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD,
-        RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
-        SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS,
-        SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS,
-        SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN,
-        SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS, TOUCHED_FILES_PER_PID,
-        TOUCHED_FILES_PID_CAP,
+        PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES, POLICY_DENIAL_ALERT_CAP,
+        QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX,
+        RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD,
+        SCAN_SPREAD_WINDOW_NS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
+        SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD,
+        SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STANDARD_PORTS,
+        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
+        TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
     },
     has_write_intent,
     rdp::RdpSuccessAfterFailures,
@@ -187,6 +187,20 @@ pub struct RuleState {
     /// `object_path`) before it's worth extending; tracked as a follow-up,
     /// not done here.
     known_policy_denials: BoundedMap<PolicyDenialKey, ()>,
+    /// New-shape alerts `check_policy_denial_drift` has raised, against
+    /// [`POLICY_DENIAL_ALERT_CAP`] (#812): `known_policy_denials` bounds what the rule
+    /// remembers, not what it alerts, so a flood of distinct shapes (varying the
+    /// subject/object type faster than a real host ever would) could otherwise emit one
+    /// alert per shape, unbounded.
+    policy_denial_alerts: u64,
+    /// New shapes shed by [`POLICY_DENIAL_ALERT_CAP`] once it was reached — counted
+    /// instead of silent (#812).
+    policy_denial_alerts_shed: u64,
+    /// `known_policy_denials.evicted()` last reported, so each rise is logged once
+    /// (#812): otherwise `known_policy_denials` evicting its oldest eighth at
+    /// `COUNTER_CAP` (never a full clear — only the evicted entries can re-alert) and a
+    /// shape re-alerting is silent loss (CLAUDE.md: counted, observable shedding).
+    policy_denial_evictions_reported: u64,
     /// (target user, source) → sliding failure counter for T1110 (AUTH-BURST).
     /// LRU-bounded like every other counter: a spray across many fabricated
     /// usernames must not grow this without limit.
@@ -294,7 +308,7 @@ const MEMFD_CREATES_PER_PID: usize = 8;
 /// Same bound as the correlator's entity table: the realistic live-pid space.
 const PID_COMM_CAP: usize = 65_536;
 /// Counter/write-history bounds — one logical entity per key, far fewer than pids.
-const COUNTER_CAP: usize = 16_384;
+pub(crate) const COUNTER_CAP: usize = 16_384;
 const RECENT_WRITES_CAP: usize = 4_096;
 
 impl Default for RuleState {
@@ -319,6 +333,9 @@ impl RuleState {
             scan_spread: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
             known_policy_denials: BoundedMap::new(COUNTER_CAP),
+            policy_denial_alerts: 0,
+            policy_denial_alerts_shed: 0,
+            policy_denial_evictions_reported: 0,
             auth_failures: BoundedMap::new(COUNTER_CAP),
             rdp_success: RdpSuccessAfterFailures::new(),
             recent_creates: BoundedMap::new(CREATE_UNLINK_PID_CAP),
@@ -1001,6 +1018,11 @@ impl RuleState {
     /// sensor does not parse it yet, so a routine `getattr` denial silences a
     /// later, more interesting `read`/`write`/`open` on the same subject,
     /// object and class.
+    ///
+    /// Capped at [`POLICY_DENIAL_ALERT_CAP`] distinct-shape alerts (#812): a flood of
+    /// shapes past the cap is counted (`policy_denial_alerts_shed`) rather than
+    /// alerted. `known_policy_denials` keeps deduplicating regardless — the cap bounds
+    /// alert volume, not the rule's memory of what it has already seen.
     fn check_policy_denial_drift(&mut self, event: &PolicyDenialEvent) -> Option<Alert> {
         if event.mechanism != POLICY_MECHANISM_SELINUX {
             return None;
@@ -1011,10 +1033,25 @@ impl RuleState {
             Self::selinux_type_triple(event.object_context.as_deref()),
             event.object_class.clone(),
         );
-        if self.known_policy_denials.get(&key).is_some() {
+        let seen_before = self.known_policy_denials.get(&key).is_some();
+        if !seen_before {
+            self.known_policy_denials.insert(key, ());
+        }
+        self.report_policy_denial_evictions();
+        if seen_before {
             return None;
         }
-        self.known_policy_denials.insert(key, ());
+        if self.policy_denial_alerts >= POLICY_DENIAL_ALERT_CAP {
+            if self.policy_denial_alerts_shed == 0 {
+                tracing::warn!(
+                    cap = POLICY_DENIAL_ALERT_CAP,
+                    "policy-denial-drift: alert cap reached, further new shapes are counted but not alerted"
+                );
+            }
+            self.policy_denial_alerts_shed += 1;
+            return None;
+        }
+        self.policy_denial_alerts += 1;
         Some(Alert {
             technique: "T1562",
             severity: Severity::Medium,
@@ -1029,6 +1066,26 @@ impl RuleState {
                 event.enforced,
             ),
         })
+    }
+
+    /// Logs once per rise in `known_policy_denials`'s eviction count (#812): otherwise
+    /// `known_policy_denials` evicting its oldest eighth at `COUNTER_CAP` and a shape
+    /// re-alerting is silent loss (CLAUDE.md: counted, observable shedding), the same
+    /// idiom as `agent::ransomware_join`'s `report_evictions`. Also carries the running
+    /// total of alerts shed by [`POLICY_DENIAL_ALERT_CAP`] (review of #823): this is the
+    /// only periodic signal the alert cap gets — once it is reached, the "alert cap
+    /// reached" warning fires exactly once, never again, so without this an operator
+    /// cannot tell 10 shed shapes from 100,000.
+    fn report_policy_denial_evictions(&mut self) {
+        let evicted = self.known_policy_denials.evicted();
+        if evicted > self.policy_denial_evictions_reported {
+            tracing::warn!(
+                evicted,
+                alerts_shed = self.policy_denial_alerts_shed,
+                "policy-denial-drift: tracked denial shapes shed (oldest first)"
+            );
+            self.policy_denial_evictions_reported = evicted;
+        }
     }
 
     /// The `user:role:type` prefix of a `SELinux` security context
