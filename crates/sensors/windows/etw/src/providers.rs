@@ -70,7 +70,7 @@ const BITS_CLIENT_GUID: &str = "EF1CC15B-46C1-414E-BB95-E76B077BD51E";
 
 /// Every provider the sensor enables, by short name — for the blind-session
 /// attribution (#408), which asks the OS who else enables them.
-pub(crate) const ALL_PROVIDERS: [(&str, &str); 12] = [
+pub(crate) const ALL_PROVIDERS: [(&str, &str); 13] = [
     ("Kernel-Process", KERNEL_PROCESS_GUID),
     ("Kernel-Network", KERNEL_NETWORK_GUID),
     ("Kernel-File", KERNEL_FILE_GUID),
@@ -1100,7 +1100,7 @@ fn client_meta(
 ) -> Option<EventMeta> {
     let pid: u32 = parser.try_parse("processId").ok().filter(|&pid| pid != 0)?;
     let comm = state.comm_for(pid).unwrap_or_default();
-    Some(meta(pid, 0, comm, timestamp_ns))
+    Some(state.meta(pid, 0, comm, timestamp_ns))
 }
 
 /// `{c40080ab-6fe4-418a-8ba6-c271c5298f18}`: the braced, lowercase form the
