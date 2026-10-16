@@ -247,7 +247,19 @@ fn record_detection(
             _ => None,
         })
         .unwrap_or(event.meta().comm.as_str());
-    let safe_message = crate::redact::redact_command_line(image, finding.message).into_owned();
+    let safe_message = if let Some(Event::Exec(exec)) = std::iter::once(event)
+        .chain(evidence.iter())
+        .find(|e| matches!(e, Event::Exec(_)))
+    {
+        let mut safe_exec = Event::Exec(exec.clone());
+        crate::redact::redact_event(&mut safe_exec);
+        let Event::Exec(safe_exec) = safe_exec else {
+            unreachable!()
+        };
+        redact_detection_message(image, &exec.cmdline, &safe_exec.cmdline, finding.message)
+    } else {
+        crate::redact::redact_command_line(image, finding.message).into_owned()
+    };
     let mut safe_events: Vec<Event> = std::iter::once(event.clone()).chain(evidence).collect();
     for event in &mut safe_events {
         crate::redact::redact_event(event);
@@ -277,6 +289,20 @@ fn record_detection(
         persist(detection);
     }
     result
+}
+
+fn redact_detection_message(
+    image: &str,
+    raw_cmdline: &str,
+    safe_cmdline: &str,
+    message: &str,
+) -> String {
+    let message = if raw_cmdline.is_empty() {
+        message.to_owned()
+    } else {
+        message.replace(raw_cmdline, safe_cmdline)
+    };
+    crate::redact::redact_command_line(image, &message).into_owned()
 }
 
 /// One engine's finding, as [`record_detection`] takes it.
@@ -2099,11 +2125,15 @@ mod tests {
             )
             .unwrap(),
         );
-        let mut exec = schema::fixtures::exec();
-        exec.image_path = "/usr/bin/base64".into();
-        exec.cmdline = "base64 -d --password=S3cret".into();
-        exec.argv = vec!["base64".into(), "-d".into(), "--password=S3cret".into()];
-        sink.on_event(Event::Exec(exec));
+        for (pid, comm) in [(101, "it's"), (102, "a\"b")] {
+            let mut exec = schema::fixtures::exec();
+            exec.meta.pid = pid;
+            exec.meta.comm = comm.into();
+            exec.image_path = "/usr/bin/base64".into();
+            exec.cmdline = "curl -u a:S3cret h; base64 -d --password=S3cret".into();
+            exec.argv = Vec::new();
+            sink.on_event(Event::Exec(exec));
+        }
         assert!(sink.enrich_queue.flush(std::time::Duration::from_secs(2)));
 
         let alerts = alerts_in(&dir);
@@ -2153,6 +2183,14 @@ mod tests {
             let serialized = serde_json::to_string(&queued.detection).unwrap();
             assert!(!serialized.contains("S3cret"), "{serialized}");
         }
+    }
+
+    #[test]
+    fn redacted_detection_message_keeps_messages_with_an_empty_command_line_intact() {
+        assert_eq!(
+            super::redact_detection_message("curl", "", "", "process comm=it's"),
+            "process comm=it's"
+        );
     }
 
     #[test]
