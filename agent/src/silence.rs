@@ -72,6 +72,15 @@ impl SensorHealthSource for SilenceHealthSource {
     }
 }
 
+/// One poll of the monitor: every newly confirmed silence becomes a tamper alert, which the health
+/// beacon counts (#863).
+fn poll_and_emit(monitor: &Mutex<SilenceMonitor>, sink: &DetectionSink, now_ns: u64) {
+    let verdicts = monitor.lock().unwrap().poll(now_ns);
+    for verdict in verdicts {
+        sink.emit_tamper("T1562", &verdict.message());
+    }
+}
+
 /// Spawns the thread that polls `monitor` on [`POLL_INTERVAL`] and turns every
 /// newly confirmed [`tamper::heartbeat::SilenceVerdict`] into a real alert through
 /// `sink.emit` — the same `alerts.ndjson` line shape as any rule/correlator/Sigma
@@ -84,10 +93,7 @@ pub(crate) fn spawn_monitor(monitor: Arc<Mutex<SilenceMonitor>>, sink: Arc<Detec
         .spawn(move || {
             loop {
                 std::thread::sleep(POLL_INTERVAL);
-                let verdicts = monitor.lock().unwrap().poll(schema::time::now_ns());
-                for verdict in verdicts {
-                    sink.emit("T1562", &verdict.message());
-                }
+                poll_and_emit(&monitor, &sink, schema::time::now_ns());
             }
         })
         .expect("spawning the sensor-silence monitor thread");
@@ -98,6 +104,53 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    fn alert_sink(dir: &std::path::Path) -> DetectionSink {
+        DetectionSink::new(
+            rules::RuleState::new(),
+            &dir.join("alerts.ndjson"),
+            None,
+            None,
+            None,
+            &dir.join("content"),
+            &dir.join("ml-registry"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_sensor_confirmed_silent_is_a_tamper_alert_that_is_counted() {
+        let dir = std::env::temp_dir().join(format!("silence-tamper-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let sink = alert_sink(&dir);
+        let mut monitor = SilenceMonitor::new();
+        monitor.register(SensorHeartbeat::new("test-sensor"), 1_000, 0);
+        let monitor = Mutex::new(monitor);
+
+        poll_and_emit(&monitor, &sink, 500);
+        assert_eq!(
+            sink.tamper_events(),
+            0,
+            "before the deadline there is nothing to report"
+        );
+
+        poll_and_emit(&monitor, &sink, 2_000_000);
+        assert_eq!(sink.tamper_events(), 1);
+        let alerts = std::fs::read_to_string(dir.join("alerts.ndjson")).unwrap();
+        assert!(
+            alerts.contains("T1562") && alerts.contains("test-sensor"),
+            "alerts: {alerts}"
+        );
+
+        poll_and_emit(&monitor, &sink, 4_000_000);
+        assert_eq!(
+            sink.tamper_events(),
+            1,
+            "a silence already reported is not reported again"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     struct CountingSink(Arc<AtomicUsize>);
 

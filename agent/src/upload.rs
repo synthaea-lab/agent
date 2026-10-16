@@ -70,7 +70,7 @@ pub(crate) fn persist_detection(
     detection: schema::detection::Detection,
 ) -> std::io::Result<()> {
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
+    getrandom::fill(&mut bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let mut hex = String::with_capacity(32);

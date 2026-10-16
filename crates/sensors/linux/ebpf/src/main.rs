@@ -2956,6 +2956,12 @@ fn try_sys_enter_umount(ctx: TracePointContext) -> Result<u32, u32> {
 /// Shared by `sys_enter_mount` and `sys_enter_umount` above. `source_ptr`/
 /// `fstype_ptr` are `0` on an unmount (`umount2(2)` has neither argument) — left
 /// zero-length on the wire event, which `normalize::mount` maps to `None`.
+///
+/// Always inlined, on purpose: with six parameters LLVM 23 can emit this as a real
+/// BPF-to-BPF call that passes the sixth on the stack, and the 7.2 kernel's verifier
+/// rejects that ("callee expects 6 args, stack arg1 is not initialized"), so
+/// `raw_sys_enter` fails to load and the agent exits seconds after it starts.
+#[inline(always)]
 fn emit_mount_event(
     ctx: &TracePointContext,
     mount_point_ptr: u64,

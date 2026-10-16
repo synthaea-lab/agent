@@ -36,6 +36,33 @@ default_build="$(tree -p agent -p watchdog -p cli)"
 grep -q 'feature "test-key"' <<<"$default_build" \
     || fail "the default build no longer enables updater/test-key: this check lost its positive control"
 
+# Windows and macOS: the same question for the flags their packaging uses. The agent's other
+# default feature (`dynamic-onnx`) is put back explicitly so the build keeps its ML runtime;
+# only `test-key` is off. `cargo tree --target` resolves features without the target's
+# toolchain installed, so this runs on the Linux CI runner.
+for target in x86_64-pc-windows-msvc aarch64-apple-darwin; do
+    other="$(tree --target "$target" -p agent -p watchdog --no-default-features --features agent/dynamic-onnx)"
+    grep -q '^updater ' <<<"$other" \
+        || fail "the $target packaged build's cargo tree does not list the updater: the check is blind"
+    if grep -q 'feature "test-key"' <<<"$other"; then
+        fail "a packaged $target build (--no-default-features --features agent/dynamic-onnx) enables updater/test-key"
+    fi
+    default_other="$(tree --target "$target" -p agent -p watchdog)"
+    grep -q 'feature "test-key"' <<<"$default_other" \
+        || fail "the default $target build no longer enables updater/test-key: this check lost its positive control"
+done
+
+# The Windows packaging builds from the README's command and refuses a build that has the key;
+# the two static-agent workflows scan the agent they build. Assert they still do.
+grep -q -- '--no-default-features --features agent/dynamic-onnx -p agent -p watchdog' packaging/windows/README.md \
+    || fail "packaging/windows/README.md no longer builds the MSI binaries without default features (test key)"
+grep -q 'SYNTHAEA-PUBLIC-TEST-KEY-SET-V1' packaging/windows/build.ps1 \
+    || fail "packaging/windows/build.ps1 no longer scans agent.exe and watchdog.exe for the test key marker"
+for workflow in windows-static-agent macos-static-agent; do
+    grep -q 'assert-no-test-key.sh' ".github/workflows/$workflow.yml" \
+        || fail ".github/workflows/$workflow.yml does not scan the agent it builds with tools/assert-no-test-key.sh"
+done
+
 # The packaging scripts hold the real flags; this script's own copy above must not drift from
 # them, so assert that each still builds the same package set without default features.
 for script in packaging/linux/build-deb.sh packaging/linux/build-rpm.sh; do

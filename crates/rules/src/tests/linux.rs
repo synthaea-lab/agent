@@ -1192,6 +1192,165 @@ fn a_denial_missing_subject_or_object_context_still_alerts_once() {
 }
 
 #[test]
+fn policy_denial_alert_cap_sheds_further_shapes_but_keeps_deduplicating() {
+    // `known_policy_denials` bounds the rule's memory, not its alert volume (#812): past
+    // POLICY_DENIAL_ALERT_CAP distinct shapes, further new ones must stop alerting
+    // without breaking the dedup itself.
+    let mut state = RuleState::new();
+    let mut alerted = 0usize;
+    for i in 0..=POLICY_DENIAL_ALERT_CAP {
+        let subject = format!("unconfined_u:unconfined_r:type_{i}_t:s0");
+        let alerts = state.on_policy_denial(&policy_denial_event_full(
+            "selinux",
+            Some(&subject),
+            Some("user_home_t"),
+            Some("file"),
+            true,
+        ));
+        alerted += alerts.len();
+    }
+    assert_eq!(
+        alerted, POLICY_DENIAL_ALERT_CAP as usize,
+        "the (cap + 1)th distinct shape must be shed, not alerted"
+    );
+
+    // The shed shape is still remembered: seeing it again still does not alert (dedup
+    // did not stop working once the cap was reached).
+    let last_subject = format!("unconfined_u:unconfined_r:type_{POLICY_DENIAL_ALERT_CAP}_t:s0");
+    let repeat = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        Some(&last_subject),
+        Some("user_home_t"),
+        Some("file"),
+        true,
+    ));
+    assert!(repeat.is_empty(), "dedup still works past the alert cap");
+}
+
+#[test]
+fn policy_denial_cache_eviction_is_logged() {
+    // `known_policy_denials` silently clearing at COUNTER_CAP must not be silent to an
+    // operator (#812, CLAUDE.md: counted, observable shedding) — logged once per rise,
+    // the same idiom as `agent::ransomware_join::report_evictions`.
+    use std::{
+        io,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        let mut state = RuleState::new();
+        for i in 0..=COUNTER_CAP {
+            let subject = format!("unconfined_u:unconfined_r:evict_{i}_t:s0");
+            state.on_policy_denial(&policy_denial_event_full(
+                "selinux",
+                Some(&subject),
+                Some("user_home_t"),
+                Some("file"),
+                true,
+            ));
+        }
+    });
+
+    let logs = String::from_utf8_lossy(&captured.0.lock().expect("capture lock")).into_owned();
+    // Exactly one rise happens: COUNTER_CAP + 1 inserts crosses the cap exactly once,
+    // evicting one batch (COUNTER_CAP / 8). A bare substring check (review of #823)
+    // cannot tell "logged once, correctly" from two real bugs that both still contain
+    // the phrase: `>` weakened to `>=` logs on every one of these COUNTER_CAP + 1 calls
+    // (a line per event, the flood "once per rise" exists to avoid), and `>` flipped to
+    // `==` logs on every call *before* the real rise (evicted stays 0 == reported's
+    // initial 0) and then falls silent exactly when the real eviction happens. Asserting
+    // the exact line count and the real evicted value catches both.
+    let shed_lines = logs.matches("tracked denial shapes shed").count();
+    assert_eq!(
+        shed_lines, 1,
+        "exactly one eviction rise must be logged, not zero or one per event: {logs}"
+    );
+    assert!(
+        logs.contains(&format!("evicted={}", COUNTER_CAP / 8)),
+        "the logged count must be the real evicted total, not 0: {logs}"
+    );
+}
+
+#[test]
+fn policy_denial_alert_cap_reached_is_logged_exactly_once() {
+    // The "alert cap reached" warning is gated on `policy_denial_alerts_shed == 0`
+    // (the very first shed) so it fires once, not once per shed shape — otherwise a
+    // sustained flood past the cap would spam one warning per new shape instead of
+    // one notice that the cap was hit (review of #823: `== 0` flipped to `!= 0`, or
+    // the counter's own `+= 1` flipped to `*= 1`, both leave the existing tests
+    // green because nothing before this asserted on this message's own line count).
+    use std::{
+        io,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        let mut state = RuleState::new();
+        // Well past POLICY_DENIAL_ALERT_CAP (512): enough further shapes that a
+        // once-per-shed bug would produce many lines, not just a second one.
+        for i in 0..POLICY_DENIAL_ALERT_CAP * 3 {
+            let subject = format!("unconfined_u:unconfined_r:cap_{i}_t:s0");
+            state.on_policy_denial(&policy_denial_event_full(
+                "selinux",
+                Some(&subject),
+                Some("user_home_t"),
+                Some("file"),
+                true,
+            ));
+        }
+    });
+
+    let logs = String::from_utf8_lossy(&captured.0.lock().expect("capture lock")).into_owned();
+    let cap_lines = logs.matches("alert cap reached").count();
+    assert_eq!(
+        cap_lines, 1,
+        "the cap-reached warning must fire exactly once, not once per shed shape: {logs}"
+    );
+}
+
+#[test]
 fn mass_rename_with_appended_suffix_triggers_at_threshold() {
     let mut state = RuleState::new();
     let mut alerts = Vec::new();

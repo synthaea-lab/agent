@@ -9,7 +9,8 @@
 //! ## Latency budget
 //!
 //! Enrichment runs on the agent's event path, so it is budgeted, not best-effort:
-//! - Cache hit (same path, mtime, size): a metadata stat — microseconds.
+//! - Cache hit (same path, mtime, size, file identity): a stat, an open and a
+//!   metadata query on the handle — microseconds.
 //! - Cache miss: one streaming SHA-256 read, refused above [`MAX_HASH_BYTES`]
 //!   (result: hash absent, reason logged) so a multi-GB binary can never stall the
 //!   pipeline.
@@ -21,7 +22,11 @@
 
 mod sig;
 
-use std::{io::Read as _, path::Path};
+use std::{
+    fs::File,
+    io::{Read as _, Seek as _},
+    path::Path,
+};
 
 use schema::Signature;
 use sha2::{Digest, Sha256};
@@ -45,23 +50,33 @@ pub struct FileEnrichment {
 struct CacheEntry {
     mtime_ns: u128,
     size: u64,
-    /// Unix: (dev, inode) — an attacker can set mtime and size at will
-    /// (`touch -r`), but cannot keep them while swapping the underlying inode
-    /// without the pair changing (review finding: mtime+size alone made the
-    /// cached verdict spoofable). Windows: 0 (no cheap stable id via metadata).
-    file_id: (u64, u64),
+    /// Unix: (dev, inode). Windows: (volume serial, 128-bit file id). An attacker
+    /// can set mtime and size at will (`touch -r`, `SetFileTime`), but cannot keep
+    /// them while swapping the underlying file without the identity changing
+    /// (review finding: mtime+size alone made the cached verdict spoofable; #688
+    /// for Windows, where it was a constant until then). `None`: the file system
+    /// gave no identity, and the entry is never trusted.
+    file_id: Option<FileId>,
     enrichment: FileEnrichment,
 }
 
+/// Which file object an entry describes: (volume or device, file id or inode).
+type FileId = (u64, u128);
+
 #[cfg(unix)]
-fn file_id(meta: &std::fs::Metadata) -> (u64, u64) {
+fn file_id(_file: &File, meta: &std::fs::Metadata) -> Option<FileId> {
     use std::os::unix::fs::MetadataExt;
-    (meta.dev(), meta.ino())
+    Some((meta.dev(), u128::from(meta.ino())))
 }
 
-#[cfg(not(unix))]
-fn file_id(_meta: &std::fs::Metadata) -> (u64, u64) {
-    (0, 0)
+#[cfg(windows)]
+fn file_id(file: &File, _meta: &std::fs::Metadata) -> Option<FileId> {
+    sig::file_identity(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_id(_file: &File, _meta: &std::fs::Metadata) -> Option<FileId> {
+    None
 }
 
 /// The enrichment engine: owns the cache. One instance per agent, behind whatever
@@ -84,9 +99,14 @@ impl Enricher {
         }
     }
 
-    /// Enriches one file. Cached by (path, mtime, size): an unchanged file is a
-    /// metadata stat; a changed or unknown file is one bounded hash + one signature
-    /// verification.
+    /// Enriches one file. Cached by (path, mtime, size, file identity): an unchanged
+    /// file is a stat and an open; a changed or unknown file is one bounded hash + one
+    /// signature verification.
+    ///
+    /// The file is opened once, and its metadata, identity, signature and hash all come
+    /// from that handle (#688). Whatever the path points at after the open (a rename,
+    /// a replacement), the verdict and the hash describe the same file object, and the
+    /// cache key is that object's identity.
     pub fn enrich(&mut self, path: &Path) -> FileEnrichment {
         self.enrich_with(path, true)
     }
@@ -101,20 +121,25 @@ impl Enricher {
     }
 
     fn enrich_with(&mut self, path: &Path, trust_cache: bool) -> FileEnrichment {
-        let Ok(meta) = std::fs::metadata(path) else {
-            return FileEnrichment {
-                sha256: None,
-                signature: Signature::Unsupported,
-            };
+        let unsupported = FileEnrichment {
+            sha256: None,
+            signature: Signature::Unsupported,
         };
         // FIFOs, device nodes, sockets: opening one can block forever (a named
         // pipe with no writer) or read an endless stream — the event path must
-        // never touch them (review finding).
+        // never touch them (review finding). Checked by path before the open.
+        if !std::fs::metadata(path).is_ok_and(|meta| meta.is_file()) {
+            return unsupported;
+        }
+        let Ok(mut file) = File::open(path) else {
+            return unsupported;
+        };
+        // Checked again on the handle: the path may have been swapped since.
+        let Ok(meta) = file.metadata() else {
+            return unsupported;
+        };
         if !meta.is_file() {
-            return FileEnrichment {
-                sha256: None,
-                signature: Signature::Unsupported,
-            };
+            return unsupported;
         }
         let mtime_ns = meta
             .modified()
@@ -124,26 +149,27 @@ impl Enricher {
             .unwrap_or(0);
         let size = meta.len();
 
-        let id = file_id(&meta);
+        let id = file_id(&file, &meta);
         if trust_cache
+            && let Some(id) = id
             && let Some(entry) = self.cache.get(&path.to_path_buf())
             && entry.mtime_ns == mtime_ns
             && entry.size == size
-            && entry.file_id == id
+            && entry.file_id == Some(id)
         {
             return entry.enrichment.clone();
         }
 
+        // Verified before hashing: the verifier reads the handle itself, and the
+        // hash then starts again from offset 0.
+        let signature = sig::verify(path, &file);
         let sha256 = if size <= MAX_HASH_BYTES {
-            hash_file(path)
+            file.rewind().ok().and_then(|()| hash_file(&mut file))
         } else {
             tracing::debug!(path = %path.display(), size, "enrich: over hash budget, skipping");
             None
         };
-        let enrichment = FileEnrichment {
-            sha256,
-            signature: sig::verify(path),
-        };
+        let enrichment = FileEnrichment { sha256, signature };
         self.cache.insert(
             path.to_path_buf(),
             CacheEntry {
@@ -157,8 +183,7 @@ impl Enricher {
     }
 }
 
-fn hash_file(path: &Path) -> Option<String> {
-    let mut file = std::fs::File::open(path).ok()?;
+fn hash_file(file: &mut File) -> Option<String> {
     let mut hasher = Sha256::new();
     // `sha2` 0.11 dropped `impl Write for Sha256` (it never guaranteed the
     // infallible-write contract `io::Write` implies), so `io::copy` no longer
@@ -211,6 +236,59 @@ mod tests {
         std::fs::write(&p, b"two").unwrap();
         let second = e.enrich(&p).sha256;
         assert_ne!(first, second, "changed content must re-hash");
+    }
+
+    /// #688: before it, Windows keyed the cache on (path, mtime, size) only, the file
+    /// identity being a constant. A same-size file renamed over the original, with
+    /// the original's mtime set on it, then hit the old entry and reported the old
+    /// hash. Unix caught it by inode already.
+    #[test]
+    fn a_same_size_replacement_with_the_mtime_restored_is_rehashed() {
+        let p = tmp_file("swap-target", b"one");
+        let decoy = tmp_file("swap-decoy", b"two");
+        let mut e = Enricher::new();
+        let first = e.enrich(&p).sha256;
+        let mtime = std::fs::metadata(&p).unwrap().modified().unwrap();
+        File::options()
+            .write(true)
+            .open(&decoy)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        std::fs::rename(&decoy, &p).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().modified().unwrap(), mtime);
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), 3);
+
+        let second = e.enrich(&p).sha256;
+        assert_ne!(second, first, "a replaced file must not hit the old entry");
+        assert_eq!(
+            second.as_deref(),
+            // SHA-256("two").
+            Some("3fc4ccfe745870e2c0d99f71f30ff0656c8dedd41cc1d7d3d376b0dbe685e2f3")
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn file_identity_is_stable_for_one_file_and_differs_between_two() {
+        let a = tmp_file("id-a", b"a");
+        let b = tmp_file("id-b", b"b");
+        let id = |p: &Path| {
+            let file = File::open(p).unwrap();
+            let meta = file.metadata().unwrap();
+            file_id(&file, &meta)
+        };
+        #[cfg(any(unix, windows))]
+        {
+            assert!(
+                id(&a).is_some(),
+                "a local NTFS/ext4/APFS file has an identity"
+            );
+            assert_eq!(id(&a), id(&a));
+            assert_ne!(id(&a), id(&b));
+        }
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
     }
 
     #[test]
