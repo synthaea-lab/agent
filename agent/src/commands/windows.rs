@@ -334,14 +334,18 @@ fn run_windows_sensors(
     etw_result
 }
 
-/// Starts the minifilter's receive thread (milestone 2c, #136) when the driver is loaded and
-/// lets the agent in, and registers its `windows-minifilter` heartbeat.
+/// Starts the minifilter's receive thread (milestone 2c, #136) and registers its
+/// `windows-minifilter` heartbeat.
 ///
-/// A host without the driver is the normal case today, so a missing driver is not a silence
-/// alert: the probe connect decides whether the channel runs at all, and only then is the
-/// heartbeat registered (the #828 lesson: a heartbeat for something that never started is a
-/// false alarm). Once running, an unloaded driver *is* worth an alert, and the never-pulsed
-/// heartbeat raises it while the thread retries the connection.
+/// A host without the driver is the normal case today, so a driver that is **not loaded** is
+/// not a silence alert: the probe connect finds no port and nothing starts (the #828 lesson: a
+/// heartbeat for something that never started is a false alarm). Any other connect failure
+/// means the driver is there but not reachable right now: the single connection slot still held
+/// by the previous agent process after a restart, an access or protocol problem. Those do not
+/// disable the channel: the thread starts and retries with a capped backoff, and the heartbeat
+/// is registered, so a driver that stays unreachable becomes a silence alert after
+/// `MINIFILTER_SILENCE_DEADLINE_NS` instead of file telemetry silently staying off for the
+/// whole run.
 fn spawn_minifilter(
     sink: Arc<dyn EventSink>,
     silence: Option<&Mutex<SilenceMonitor>>,
@@ -350,17 +354,19 @@ fn spawn_minifilter(
     use sensor_windows_minifilter::{ConnectError, DriverPort, channel, stats::ChannelStats};
 
     match DriverPort::connect() {
-        // Dropped at once: the probe frees the driver's single slot for the thread below.
+        // Dropped at once: the probe frees the driver's single slot for the thread below (the
+        // thread retries if the driver has not released it yet).
         Ok(probe) => drop(probe),
         Err(ConnectError::NotLoaded) => {
-            tracing::info!("minifilter not loaded: no driver file telemetry on this host");
+            tracing::info!(
+                "minifilter not loaded: no driver file telemetry on this host (a driver loaded later is picked up at the next agent start)"
+            );
             return None;
         }
         Err(error) => {
             eprintln!(
-                "[!] Minifilter loaded but the agent cannot connect ({error}): driver file telemetry off"
+                "[!] Minifilter loaded but the agent cannot connect yet ({error}): retrying in the background, a silence alert follows if it stays unreachable"
             );
-            return None;
         }
     }
     let heartbeat = SensorHeartbeat::new("windows-minifilter");

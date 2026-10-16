@@ -3,9 +3,14 @@
 //! One thread runs [`run`] for the agent's lifetime. It connects to the driver, forwards each
 //! delete and rename to the sink as `FileDelete`/`FileRename`, calls `on_alive` for every
 //! message (heartbeats included, so a wedged driver or sender thread becomes a silence alert,
-//! #71), and keeps [`ChannelStats`] current. When the connection breaks (driver unloaded or
-//! reloaded) it reconnects with a capped backoff; while the driver is absent nothing is
-//! forwarded and `on_alive` is not called, which is exactly the silence the monitor is for.
+//! #71), and keeps [`ChannelStats`] current. Loss that the driver's counters or a sequence
+//! gap reveal is logged at most once a minute ([`LOSS_REPORT_INTERVAL`]).
+//!
+//! When a connection cannot be made, or breaks, the loop waits and retries with a capped
+//! backoff (1 s doubling to 30 s). The backoff is reset only once a connection has delivered a
+//! message, so a driver that accepts the connection but fails every read is retried at the
+//! capped rate, never in a tight loop. While the driver is absent nothing is forwarded and
+//! `on_alive` is not called, which is exactly the silence the monitor is for.
 
 use std::{
     sync::{
@@ -34,6 +39,9 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const VOLUME_REFRESH: Duration = Duration::from_secs(30);
 /// Granularity of the stop check while waiting to reconnect.
 const STOP_SLICE: Duration = Duration::from_millis(250);
+/// Shortest interval between two reports of lost events (a flood is one line a minute, not one
+/// line per message).
+const LOSS_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Runs until `stop` is set. See the module doc.
 pub fn run(
@@ -45,6 +53,7 @@ pub fn run(
     let mut backoff = MIN_BACKOFF;
     let mut failures: u64 = 0;
     let mut buffer = ReceiveBuffer::new();
+    let mut loss = LossReport::new();
     while !stop.load(Ordering::Relaxed) {
         let port = match DriverPort::connect() {
             Ok(port) => port,
@@ -62,47 +71,110 @@ pub fn run(
             after_attempts = failures + 1,
             "minifilter: connected to the driver"
         );
-        failures = 0;
-        backoff = MIN_BACKOFF;
         lock(stats).on_connect();
         let mut volumes = VolumeMap::from_system();
         let mut last_refresh = Instant::now();
+        // The backoff and the failure count are reset by the first message of a connection, not
+        // by the connect: a connection that never delivers anything is still a failed attempt.
+        let mut delivered = false;
         loop {
             match port.receive(&mut buffer, stop) {
                 Ok(None) => return,
-                Ok(Some(payload)) => match wire::decode(payload) {
-                    Ok(message) => {
-                        on_alive();
-                        let lost = lock(stats).on_message(&message);
-                        if lost > 0 {
-                            tracing::warn!(
-                                lost,
-                                seq = message.seq,
-                                "minifilter: records missing before this one"
-                            );
+                Ok(Some(payload)) => {
+                    if !delivered {
+                        delivered = true;
+                        failures = 0;
+                        backoff = MIN_BACKOFF;
+                    }
+                    match wire::decode(payload) {
+                        Ok(message) => {
+                            on_alive();
+                            let lost = lock(stats).on_message(&message);
+                            if lost > 0 {
+                                tracing::warn!(
+                                    lost,
+                                    seq = message.seq,
+                                    "minifilter: records missing before this one"
+                                );
+                            }
+                            if needs_refresh(&message)
+                                && last_refresh.elapsed() >= VOLUME_REFRESH
+                            {
+                                volumes = VolumeMap::from_system();
+                                last_refresh = Instant::now();
+                            }
+                            if let Some(event) = to_event(&message, &volumes) {
+                                sink.on_event(event);
+                            }
                         }
-                        if needs_refresh(&message) && last_refresh.elapsed() >= VOLUME_REFRESH {
-                            volumes = VolumeMap::from_system();
-                            last_refresh = Instant::now();
-                        }
-                        if let Some(event) = to_event(&message, &volumes) {
-                            sink.on_event(event);
+                        Err(error) => {
+                            let mut stats = lock(stats);
+                            stats.on_decode_error();
+                            if stats.decode_errors.is_power_of_two() {
+                                tracing::warn!(%error, refused = stats.decode_errors, "minifilter: message refused by the decoder");
+                            }
                         }
                     }
-                    Err(error) => {
-                        let mut stats = lock(stats);
-                        stats.on_decode_error();
-                        if stats.decode_errors.is_power_of_two() {
-                            tracing::warn!(%error, refused = stats.decode_errors, "minifilter: message refused by the decoder");
-                        }
-                    }
-                },
+                    loss.report_if_due(&lock(stats));
+                }
                 Err(error) => {
                     tracing::warn!(%error, "minifilter: connection lost, reconnecting");
                     break;
                 }
             }
         }
+        // The connection broke. Wait before the next attempt in every case: a driver that
+        // accepts the connection and then fails every read must not be retried in a tight loop.
+        // A connection that delivered something restarts the schedule at the shortest wait; one
+        // that did not keeps doubling it.
+        failures += u64::from(!delivered);
+        sleep_unless_stopped(backoff, stop);
+        if !delivered {
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+        }
+    }
+}
+
+/// Reports lost events at most once per [`LOSS_REPORT_INTERVAL`], and only when the figures
+/// rose since the previous report: the loss is counted by the driver and by the sequence
+/// numbers, and this is where an operator reads it (the health beacon does not carry it yet).
+struct LossReport {
+    last: Instant,
+    lost: u64,
+    decode_errors: u64,
+}
+
+impl LossReport {
+    fn new() -> Self {
+        Self {
+            last: Instant::now(),
+            lost: 0,
+            decode_errors: 0,
+        }
+    }
+
+    fn report_if_due(&mut self, stats: &ChannelStats) {
+        if self.last.elapsed() < LOSS_REPORT_INTERVAL {
+            return;
+        }
+        self.last = Instant::now();
+        let lost = stats.total_lost();
+        if lost <= self.lost && stats.decode_errors <= self.decode_errors {
+            return;
+        }
+        tracing::warn!(
+            lost_total = lost,
+            lost_since_last_report = lost.saturating_sub(self.lost),
+            sequence_gaps = stats.lost_by_sequence,
+            queue_full = stats.driver.dropped_queue_full,
+            send_failed = stats.driver.dropped_send_failed,
+            not_connected = stats.driver.not_connected,
+            capture_failed = stats.driver.dropped_capture_failed,
+            decode_errors = stats.decode_errors,
+            "minifilter: file events were lost (driver counters and sequence gaps)"
+        );
+        self.lost = lost;
+        self.decode_errors = stats.decode_errors;
     }
 }
 

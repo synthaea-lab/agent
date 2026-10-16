@@ -31,7 +31,12 @@ pub struct ChannelStats {
 }
 
 impl ChannelStats {
-    /// A new connection: sequence numbers restart at 1 on the driver's side.
+    /// A new connection: the driver restarts its sequence numbers at 1 (it resets the counter
+    /// when a client connects), so the next message is checked against 1, not against the last
+    /// number of the previous connection. Records the driver numbered and failed to send before
+    /// the agent's first read are real losses and show up as a gap from 1: the driver also
+    /// takes back the number of a heartbeat it could not send, so a quiet period with no read
+    /// pending leaves no gap.
     pub fn on_connect(&mut self) {
         self.connections += 1;
         self.last_seq = 0;
@@ -130,7 +135,9 @@ mod tests {
     fn a_reconnect_restarts_the_sequence_without_counting_loss() {
         let mut s = ChannelStats::default();
         s.on_connect();
-        s.on_message(&msg(40, delete(), Counters::default()));
+        for seq in 1..=40 {
+            assert_eq!(s.on_message(&msg(seq, delete(), Counters::default())), 0);
+        }
         s.on_connect();
         assert_eq!(
             s.on_message(&msg(1, Body::Heartbeat, Counters::default())),
@@ -138,7 +145,8 @@ mod tests {
         );
         assert_eq!(s.connections, 2);
         assert_eq!(s.heartbeats, 1);
-        assert_eq!(s.lost_by_sequence, 39);
+        // Nothing was lost: the second connection starts again at 1 after a clean first one.
+        assert_eq!(s.lost_by_sequence, 0);
     }
 
     #[test]

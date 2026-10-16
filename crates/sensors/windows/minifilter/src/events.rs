@@ -91,9 +91,11 @@ impl VolumeMap {
 /// The schema event for one driver message, or `None` for a heartbeat (it proves the driver
 /// is alive and carries counters, but describes no file).
 ///
-/// The driver knows the pid and the thread, not the image or the user: `comm` is left empty
-/// and `user` unknown, the way other kernel-sourced Windows events arrive before the agent's
-/// process cache enriches them. A pid above `u32::MAX` cannot come from Windows (pids are
+/// The driver knows the pid and the thread, not the image, the parent or the user: `comm` is
+/// left empty, `ppid` 0 and `user` unknown. Nothing in the agent fills them in for these events
+/// today (the enrichment queue only handles exec images), so a rule on a minifilter event must
+/// key on `pid`, and cannot match on the process name or the account; resolving them from the
+/// process table is a follow-up. A pid above `u32::MAX` cannot come from Windows (pids are
 /// 32-bit in practice); it is clamped to 0, "unknown", rather than truncated to a real pid.
 #[must_use]
 pub fn to_event(message: &Message, volumes: &VolumeMap) -> Option<Event> {
