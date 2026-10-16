@@ -41,7 +41,7 @@ Environment:
 
 #define SYNTHAEA_PORT_NAME          L"\\SynthaeaPort"
 #define SYNTHAEA_CONNECT_MAGIC      0x544E5953UL    // 'SYNT', little-endian
-#define SYNTHAEA_PROTOCOL_VERSION   2UL
+#define SYNTHAEA_PROTOCOL_VERSION   3UL
 
 #define SYNTHAEA_EVENT_HEARTBEAT            0
 #define SYNTHAEA_EVENT_DELETE               1
@@ -71,6 +71,7 @@ typedef struct _SYNTHAEA_EVENT_HEADER {
     ULONGLONG NotConnected;
     USHORT OldPathLength;
     USHORT NewPathLength;
+    ULONGLONG DroppedCaptureFailed;
 } SYNTHAEA_EVENT_HEADER, *PSYNTHAEA_EVENT_HEADER;
 #pragma pack(pop)
 
@@ -85,7 +86,8 @@ C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, DroppedSendFailed) == 44);
 C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, NotConnected) == 52);
 C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, OldPathLength) == 60);
 C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, NewPathLength) == 62);
-C_ASSERT(sizeof(SYNTHAEA_EVENT_HEADER) == 64);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, DroppedCaptureFailed) == 64);
+C_ASSERT(sizeof(SYNTHAEA_EVENT_HEADER) == 72);
 
 typedef struct _SYNTHAEA_QUEUED_EVENT {
     LIST_ENTRY Link;
@@ -203,6 +205,7 @@ typedef struct _SYNTHAEA_FILTER_DATA {
     volatile LONG64 DroppedQueueFull;
     volatile LONG64 DroppedSendFailed;
     volatile LONG64 NotConnected;
+    volatile LONG64 DroppedCaptureFailed;
 
 } SYNTHAEA_FILTER_DATA, *PSYNTHAEA_FILTER_DATA;
 
@@ -361,6 +364,8 @@ SynthaeaDeactivateClient (
 //
 
 SYNTHAEA_FILTER_DATA SynthaeaFilterData;
+static UCHAR SynthaeaQueueFullSentinel;
+static UCHAR SynthaeaCaptureFailedSentinel;
 
 //
 //  Assign text sections for each routine.
@@ -669,9 +674,6 @@ SynthaeaReserveQueue (
     }
     KeReleaseSpinLock( &SynthaeaFilterData.QueueLock, oldIrql );
 
-    if (!reserved) {
-        InterlockedIncrement64( &SynthaeaFilterData.DroppedQueueFull );
-    }
     return reserved;
 }
 
@@ -754,23 +756,20 @@ SynthaeaAllocateEvent (
     // and the static analyzer; each wire path is limited to 4096 WCHARs.
     if (oldChars > SYNTHAEA_MAX_PATH_CHARS ||
         newChars > SYNTHAEA_MAX_PATH_CHARS) {
-        InterlockedIncrement64( &SynthaeaFilterData.DroppedQueueFull );
-        return NULL;
+        return (PSYNTHAEA_QUEUED_EVENT)&SynthaeaQueueFullSentinel;
     }
 
     oldPathBytes = (SIZE_T)oldChars * sizeof(WCHAR);
     newPathBytes = (SIZE_T)newChars * sizeof(WCHAR);
     if (oldPathBytes > (SIZE_T)(SYNTHAEA_MAX_PATH_CHARS * sizeof(WCHAR)) ||
         newPathBytes > (SIZE_T)(SYNTHAEA_MAX_PATH_CHARS * sizeof(WCHAR))) {
-        InterlockedIncrement64( &SynthaeaFilterData.DroppedQueueFull );
-        return NULL;
+        return (PSYNTHAEA_QUEUED_EVENT)&SynthaeaQueueFullSentinel;
     }
 
     sizeStatus = RtlSizeTAdd( oldPathBytes, newPathBytes, &pathBytes );
     if (!NT_SUCCESS( sizeStatus ) ||
         pathBytes > (SIZE_T)(2 * SYNTHAEA_MAX_PATH_CHARS * sizeof(WCHAR))) {
-        InterlockedIncrement64( &SynthaeaFilterData.DroppedQueueFull );
-        return NULL;
+        return (PSYNTHAEA_QUEUED_EVENT)&SynthaeaQueueFullSentinel;
     }
 
     // Include the declared one-WCHAR tail in sizeof; a zero-path event still
@@ -779,12 +778,11 @@ SynthaeaAllocateEvent (
     sizeStatus = RtlSizeTAdd( allocationSize, pathBytes, &allocationSize );
     if (!NT_SUCCESS( sizeStatus ) ||
         allocationSize < sizeof( SYNTHAEA_QUEUED_EVENT )) {
-        InterlockedIncrement64( &SynthaeaFilterData.DroppedQueueFull );
-        return NULL;
+        return (PSYNTHAEA_QUEUED_EVENT)&SynthaeaQueueFullSentinel;
     }
 
     if (!SynthaeaReserveQueue( allocationSize )) {
-        return NULL;
+        return (PSYNTHAEA_QUEUED_EVENT)&SynthaeaQueueFullSentinel;
     }
 
     event = (PSYNTHAEA_QUEUED_EVENT)ExAllocatePool2(
@@ -797,8 +795,7 @@ SynthaeaAllocateEvent (
         SynthaeaFilterData.QueueRecords--;
         SynthaeaFilterData.QueueBytes -= allocationSize;
         KeReleaseSpinLock( &SynthaeaFilterData.QueueLock, oldIrql );
-        InterlockedIncrement64( &SynthaeaFilterData.DroppedQueueFull );
-        return NULL;
+        return (PSYNTHAEA_QUEUED_EVENT)&SynthaeaQueueFullSentinel;
     }
 
     RtlZeroMemory( event, sizeof( SYNTHAEA_QUEUED_EVENT ) );
@@ -852,7 +849,8 @@ SynthaeaPreCreate (
     status = FltGetFileNameInformation(
         Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &nameInfo );
     if (!NT_SUCCESS( status )) {
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        *CompletionContext = &SynthaeaCaptureFailedSentinel;
+        return FLT_PREOP_SUCCESS_WITH_CALLBACK;
     }
 
     event = SynthaeaAllocateEvent( SYNTHAEA_EVENT_DELETE,
@@ -931,7 +929,8 @@ SynthaeaPreSetInformation (
         status = FltGetFileNameInformation(
             Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &oldName );
         if (!NT_SUCCESS( status )) {
-            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+            *CompletionContext = &SynthaeaCaptureFailedSentinel;
+            return FLT_PREOP_SUCCESS_WITH_CALLBACK;
         }
 
         status = FltGetDestinationFileNameInformation(
@@ -941,7 +940,8 @@ SynthaeaPreSetInformation (
             FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &newName );
         if (!NT_SUCCESS( status )) {
             FltReleaseFileNameInformation( oldName );
-            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+            *CompletionContext = &SynthaeaCaptureFailedSentinel;
+            return FLT_PREOP_SUCCESS_WITH_CALLBACK;
         }
     } else {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -951,7 +951,8 @@ SynthaeaPreSetInformation (
         status = FltGetFileNameInformation(
             Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &oldName );
         if (!NT_SUCCESS( status )) {
-            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+            *CompletionContext = &SynthaeaCaptureFailedSentinel;
+            return FLT_PREOP_SUCCESS_WITH_CALLBACK;
         }
     }
 
@@ -984,6 +985,20 @@ SynthaeaPostOperation (
     KIRQL oldIrql;
 
     UNREFERENCED_PARAMETER( FltObjects );
+    // The sentinels let pre-op defer loss accounting until this operation's
+    // result is known; failed file operations were never expected telemetry.
+    if (CompletionContext == &SynthaeaCaptureFailedSentinel) {
+        if (NT_SUCCESS( Data->IoStatus.Status )) {
+            InterlockedIncrement64( &SynthaeaFilterData.DroppedCaptureFailed );
+        }
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+    if (CompletionContext == &SynthaeaQueueFullSentinel) {
+        if (NT_SUCCESS( Data->IoStatus.Status )) {
+            InterlockedIncrement64( &SynthaeaFilterData.DroppedQueueFull );
+        }
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
     if (event == NULL) {
         return FLT_POSTOP_FINISHED_PROCESSING;
     }
@@ -1026,6 +1041,8 @@ SynthaeaSetEventCounters (
         &SynthaeaFilterData.DroppedSendFailed, 0, 0 );
     Header->NotConnected = (ULONGLONG)InterlockedCompareExchange64(
         &SynthaeaFilterData.NotConnected, 0, 0 );
+    Header->DroppedCaptureFailed = (ULONGLONG)InterlockedCompareExchange64(
+        &SynthaeaFilterData.DroppedCaptureFailed, 0, 0 );
 }
 
 NTSTATUS

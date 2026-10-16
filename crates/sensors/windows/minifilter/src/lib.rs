@@ -5,8 +5,8 @@
 //! connection context; the driver accepts exactly one client, and only one
 //! running as the agent (`NT SERVICE\SynthaEDR` in its token, guardrail 5).
 //!
-//! Milestone 2b: connecting only. The driver sends nothing yet (the event
-//! channel is milestone 2c), so there is no receive loop here.
+//! This branch carries the connection client and protocol-v3 handshake. The
+//! driver event receiver/decoder is maintained with the agent-side work (#853).
 //!
 //! The protocol constants mirror `driver/minifilter/SynthaeaFilter.c`: a
 //! change on one side is a change on the other. This crate sits next to
@@ -19,8 +19,9 @@ pub const PORT_NAME: &str = r"\SynthaeaPort";
 /// First field of the connection context: `SYNT` in little-endian byte order.
 pub const CONNECT_MAGIC: u32 = 0x544E_5953;
 
-/// Second field of the connection context. The driver refuses any other value.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Second field of the connection context. Version 3 adds the cumulative
+/// capture-failure counter to the event header; the driver refuses older clients.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The service SID the driver requires in the connecting process's token:
 /// `NT SERVICE\SynthaEDR`, the watchdog service that spawns the agent
@@ -89,8 +90,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_connection_context_spells_synt_then_version_one() {
-        assert_eq!(connect_context(), *b"SYNT\x01\x00\x00\x00");
+    fn the_connection_context_spells_synt_then_version_three() {
+        assert_eq!(connect_context(), *b"SYNT\x03\x00\x00\x00");
     }
 
     #[test]

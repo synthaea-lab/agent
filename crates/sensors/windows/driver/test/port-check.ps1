@@ -55,7 +55,7 @@ function New-Context([uint32]$Magic, [uint32]$Version) {
 }
 
 $Magic = [uint32]0x544E5953   # 'SYNT'
-$good  = New-Context $Magic 1
+$good  = New-Context $Magic 3
 
 # Each check expects one exact HRESULT, not just "failed": a refusal for the
 # wrong reason (port missing, driver not loaded) must not read as a pass.
@@ -117,7 +117,8 @@ $bad = @(
     @{ Name = '3b. short context refused';     Ctx = [BitConverter]::GetBytes($Magic) },
     @{ Name = '3c. long context refused';      Ctx = $good + [byte[]](0,0,0,0) },
     @{ Name = '3d. wrong magic refused';       Ctx = New-Context 0x41414141 1 },
-    @{ Name = '3e. wrong version refused';     Ctx = New-Context $Magic 2 }
+    @{ Name = '3e. wrong version refused';     Ctx = New-Context $Magic 2 },
+    @{ Name = '3f. future version refused';    Ctx = New-Context $Magic 4 }
 )
 foreach ($case in $bad) {
     $h = [IntPtr]::Zero
