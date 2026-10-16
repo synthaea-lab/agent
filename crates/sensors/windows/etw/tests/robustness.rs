@@ -2,13 +2,18 @@
 //! stream, which any process can write with any bytes — attacker-controlled
 //! input consumed on the ETW callback thread, where a panic takes the whole
 //! sensor down. Garbage must yield empty fields; only a panic is a bug.
+//! Same for `bits::is_microsoft_update_url`, which reads the URL any BITS
+//! client chooses (#284).
 //!
 //! Deterministic pseudo-random bytes (seeded LCG, no dependency) rather than a
 //! fuzzer, same as the Linux audit/netlink suites: reproducible in CI, and the
 //! interesting failures for this format are structural (odd UTF-16 lengths,
 //! lone surrogates, missing `=`/`]`, huge values), all covered explicitly.
 
-use sensor_windows::zone_identifier::{parse, stream_host_path};
+use sensor_windows::{
+    bits::{is_microsoft_update_url, local_path_for_join, url_host},
+    zone_identifier::{parse, stream_host_path},
+};
 
 /// Minimal deterministic PRNG (Knuth LCG) — reproducible corpus, no deps.
 fn lcg(state: &mut u64) -> u64 {
@@ -146,4 +151,46 @@ fn host_path_never_panics_on_multibyte_boundaries() {
         stream_host_path("C:\\d\\éa.exe:Zone.Identifier"),
         Some("C:\\d\\éa.exe")
     );
+}
+
+#[test]
+fn bits_url_checks_never_panic_on_arbitrary_urls() {
+    // URL-structural characters plus multi-byte ones, so every slice the
+    // host check takes lands next to a char boundary at some point.
+    const ALPHABET: &[&str] = &[
+        "http",
+        "https",
+        "://",
+        ":",
+        "/",
+        "\\",
+        "?",
+        "#",
+        "@",
+        "[",
+        "]",
+        ".",
+        "-",
+        "%2e",
+        "microsoft.com",
+        "UNC",
+        "a",
+        "0",
+        "é",
+        "о",
+        "😀",
+        "\0",
+        " ",
+    ];
+    let mut state = 0xB175_2026_u64;
+    for _ in 0..5_000 {
+        let parts = (lcg(&mut state) % 12) as usize;
+        let url: String = (0..parts)
+            .map(|_| ALPHABET[(lcg(&mut state) >> 33) as usize % ALPHABET.len()])
+            .collect();
+        let _ = url_host(&url);
+        let _ = is_microsoft_update_url(&url);
+        // `LocalName` is the client's choice too.
+        let _ = local_path_for_join(&url);
+    }
 }

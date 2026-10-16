@@ -307,6 +307,7 @@ fn policy_denial_event_full(
     }
 }
 
+mod bits;
 mod coverage;
 mod linux;
 mod motw_removal;
