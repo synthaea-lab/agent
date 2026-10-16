@@ -49,6 +49,25 @@ pub trait RarityStatsSource: Send + Sync {
     fn rarity_counts(&self) -> RarityCounts;
 }
 
+/// Cumulative counters the beacon takes from outside the sink's rarity statistics, the spool and
+/// the silence monitor (#863): see `crate::host_counters` for what each one counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HostCounters {
+    /// Times the watchdog restarted the agent since the watchdog started.
+    pub watchdog_restarts: u64,
+    /// Tamper-class alerts raised since the agent started, plus the watchdog's own events.
+    pub tamper_events: u64,
+    /// Parent-image cache entries the cap dropped while their process was alive (the loss).
+    pub parent_image_evicted_live: u64,
+    /// Entries the cap dropped whose process had already exited (nothing lost).
+    pub parent_image_evicted_dead: u64,
+}
+
+/// Reads the [`HostCounters`].
+pub trait HostCountersSource: Send + Sync {
+    fn host_counters(&self) -> HostCounters;
+}
+
 /// Reads sensor health snapshots. Implementations may wrap a `SilenceMonitor` or
 /// provide mock data for testing.
 pub trait SensorHealthSource: Send + Sync {
@@ -105,6 +124,7 @@ pub struct HealthCollector {
     spool: Arc<dyn SpoolStatsSource>,
     enrich_dropped: Arc<dyn DroppedCounter>,
     rarity: Arc<dyn RarityStatsSource>,
+    host: Arc<dyn HostCountersSource>,
     emit: Box<dyn Fn(HealthBeacon) + Send>,
     stop: Arc<StopFlag>,
 }
@@ -159,6 +179,7 @@ impl HealthCollector {
         spool: Arc<dyn SpoolStatsSource>,
         enrich_dropped: Arc<dyn DroppedCounter>,
         rarity: Arc<dyn RarityStatsSource>,
+        host: Arc<dyn HostCountersSource>,
         emit: impl Fn(HealthBeacon) + Send + 'static,
     ) -> Self {
         Self {
@@ -167,6 +188,7 @@ impl HealthCollector {
             spool,
             enrich_dropped,
             rarity,
+            host,
             emit: Box::new(emit),
             stop: Arc::new(StopFlag::new()),
         }
@@ -199,6 +221,7 @@ impl HealthCollector {
 
     fn collect(&self) -> HealthBeacon {
         let rarity = self.rarity.rarity_counts();
+        let host = self.host.host_counters();
         HealthBeacon {
             timestamp_ns: schema::time::now_ns(),
             agent_version: self.config.agent_version.clone(),
@@ -209,6 +232,10 @@ impl HealthCollector {
             rarity_applied: rarity.applied,
             rarity_withheld: rarity.withheld,
             rarity_unapplied: rarity.unapplied,
+            watchdog_restarts: host.watchdog_restarts,
+            tamper_events: host.tamper_events,
+            parent_image_evicted_live: host.parent_image_evicted_live,
+            parent_image_evicted_dead: host.parent_image_evicted_dead,
         }
     }
 }
@@ -261,6 +288,14 @@ mod tests {
         }
     }
 
+    struct MockHost(HostCounters);
+
+    impl HostCountersSource for MockHost {
+        fn host_counters(&self) -> HostCounters {
+            self.0
+        }
+    }
+
     struct MockDropped(u64);
 
     impl DroppedCounter for MockDropped {
@@ -287,6 +322,13 @@ mod tests {
             unapplied: 2,
         }));
 
+        let host = Arc::new(MockHost(HostCounters {
+            watchdog_restarts: 3,
+            tamper_events: 5,
+            parent_image_evicted_live: 13,
+            parent_image_evicted_dead: 209_000,
+        }));
+
         let (tx, rx) = mpsc::channel();
 
         let collector = HealthCollector::new(
@@ -298,6 +340,7 @@ mod tests {
             spool,
             enrich,
             rarity,
+            host,
             move |b| {
                 let _ = tx.send(b);
             },
@@ -331,6 +374,16 @@ mod tests {
             (7, 11, 2),
             "the rarity evidence counters ride the beacon (ADR-0020, #76)"
         );
+        assert_eq!(
+            (
+                beacon.watchdog_restarts,
+                beacon.tamper_events,
+                beacon.parent_image_evicted_live,
+                beacon.parent_image_evicted_dead
+            ),
+            (3, 5, 13, 209_000),
+            "the watchdog, tamper and eviction counters ride the beacon (#863)"
+        );
     }
 
     #[test]
@@ -339,6 +392,7 @@ mod tests {
         let spool = Arc::new(NoopSpoolStats);
         let enrich = Arc::new(MockDropped(0));
         let rarity = Arc::new(MockRarity(RarityCounts::default()));
+        let host = Arc::new(MockHost(HostCounters::default()));
 
         let collector = HealthCollector::new(
             HealthCollectorConfig {
@@ -349,6 +403,7 @@ mod tests {
             spool,
             enrich,
             rarity,
+            host,
             |_| {},
         );
 

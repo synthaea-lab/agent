@@ -42,3 +42,47 @@ fn the_rarity_counters_round_trip() {
         serde_json::from_str(&serde_json::to_string(&beacon).unwrap()).unwrap();
     assert_eq!(back, beacon);
 }
+
+// The self-protection and eviction counters (issue #863) are additive in the same way.
+
+#[test]
+fn a_beacon_from_an_agent_without_the_self_protection_counters_parses_with_zeros() {
+    let beacon: HealthBeacon = serde_json::from_str(&beacon_json(
+        r#","rarity_applied":7,"rarity_withheld":11,"rarity_unapplied":2"#,
+    ))
+    .unwrap();
+    assert_eq!(
+        (
+            beacon.watchdog_restarts,
+            beacon.tamper_events,
+            beacon.parent_image_evicted_live,
+            beacon.parent_image_evicted_dead
+        ),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(
+        beacon.rarity_applied, 7,
+        "the counters already there are untouched"
+    );
+}
+
+#[test]
+fn the_self_protection_and_eviction_counters_round_trip() {
+    let beacon: HealthBeacon = serde_json::from_str(&beacon_json(
+        r#","watchdog_restarts":3,"tamper_events":5,
+        "parent_image_evicted_live":13,"parent_image_evicted_dead":209000"#,
+    ))
+    .unwrap();
+    assert_eq!(
+        (
+            beacon.watchdog_restarts,
+            beacon.tamper_events,
+            beacon.parent_image_evicted_live,
+            beacon.parent_image_evicted_dead
+        ),
+        (3, 5, 13, 209_000)
+    );
+    let back: HealthBeacon =
+        serde_json::from_str(&serde_json::to_string(&beacon).unwrap()).unwrap();
+    assert_eq!(back, beacon);
+}

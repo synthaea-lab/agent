@@ -31,6 +31,7 @@ mod health;
     allow(dead_code)
 )]
 mod heartbeat;
+mod host_counters;
 // Linux-only: the module itself calls raw POSIX signal APIs
 // (sigemptyset/pthread_sigmask/sigwaitinfo) that don't exist in the `libc` crate on
 // Windows, and `agent/Cargo.toml` only pulls `libc` in under
