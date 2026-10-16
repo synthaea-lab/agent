@@ -88,8 +88,8 @@ fn main() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     println!(
         "done: deletes={} renames={} messages={} heartbeats={} connections={} \
-         lost_by_sequence={} decode_errors={} driver(queue_full={} send_failed={} not_connected={}) \
-         total_lost={}",
+         lost_by_sequence={} decode_errors={} driver(queue_full={} send_failed={} not_connected={} \
+         capture_failed={}) total_lost={}",
         printer.deletes.load(Ordering::Relaxed),
         printer.renames.load(Ordering::Relaxed),
         s.received,
@@ -100,6 +100,7 @@ fn main() {
         s.driver.dropped_queue_full,
         s.driver.dropped_send_failed,
         s.driver.not_connected,
+        s.driver.dropped_capture_failed,
         s.total_lost(),
     );
     if alive.load(Ordering::Relaxed) == 0 {

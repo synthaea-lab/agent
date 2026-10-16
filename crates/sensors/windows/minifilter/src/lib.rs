@@ -23,7 +23,7 @@ pub const PORT_NAME: &str = r"\SynthaeaPort";
 pub const CONNECT_MAGIC: u32 = 0x544E_5953;
 
 /// Second field of the connection context. The driver refuses any other value.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The service SID the driver requires in the connecting process's token:
 /// `NT SERVICE\SynthaEDR`, the watchdog service that spawns the agent
@@ -98,11 +98,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_connection_context_spells_synt_then_version_two() {
-        // Version 2 is the event channel (2c): a driver still at 1 refuses this client with
-        // `Refused`, and a 2c driver refuses a 2b client, so neither side reads a format it
-        // does not know.
-        assert_eq!(connect_context(), *b"SYNT\x02\x00\x00\x00");
+    fn the_connection_context_spells_synt_then_version_three() {
+        // Version 3 is the event channel with its fourth counter (the 72-byte header). A driver
+        // at any other version refuses this client with `Refused`, and the reverse, so neither
+        // side reads a format it does not know.
+        assert_eq!(connect_context(), *b"SYNT\x03\x00\x00\x00");
     }
 
     #[test]

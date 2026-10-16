@@ -1,7 +1,7 @@
 //! Decoder for the messages `SynthaeaFilter` sends on its port (milestone 2c, #136).
 //!
-//! The format is the one in `docs/architecture/minifilter-event-channel.md`: a fixed 64-byte
-//! little-endian header, then the paths in UTF-16LE, `old_path` then `new_path`, not
+//! The format is the one in `docs/architecture/minifilter-event-channel.md` (protocol v3): a
+//! fixed 72-byte little-endian header, then the paths in UTF-16LE, `old_path` then `new_path`, not
 //! NUL-terminated. This module sees only the payload: the `FILTER_MESSAGE_HEADER` that
 //! `FilterGetMessage` puts in front of it is stripped by the caller.
 //!
@@ -11,7 +11,7 @@
 //! Platform-independent on purpose, so the decoder is tested and fuzzed on every OS.
 
 /// Bytes before the paths.
-pub const HEADER_LEN: usize = 64;
+pub const HEADER_LEN: usize = 72;
 
 /// Longest path, in UTF-16 code units, the driver puts in a record (a longer one is truncated
 /// and flagged). The decoder refuses a length above it.
@@ -42,6 +42,10 @@ pub struct Counters {
     pub dropped_send_failed: u64,
     /// Operations not queued because no agent was connected.
     pub not_connected: u64,
+    /// Operations of a reported kind that succeeded but could not be captured (protocol v3,
+    /// found by the low-resources lab run of #857): their names or their record could not be
+    /// obtained, so nothing was queued. Without it, those losses were silent.
+    pub dropped_capture_failed: u64,
 }
 
 /// What a message reports.
@@ -128,9 +132,15 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
         dropped_queue_full: r.u64(),
         dropped_send_failed: r.u64(),
         not_connected: r.u64(),
+        dropped_capture_failed: 0,
     };
     let old_len = r.u16();
     let new_len = r.u16();
+    // v3 appends the fourth counter after the path lengths, at byte 64.
+    let counters = Counters {
+        dropped_capture_failed: r.u64(),
+        ..counters
+    };
     debug_assert_eq!(r.at, HEADER_LEN);
 
     if flags & !KNOWN_FLAGS != 0 {
@@ -295,6 +305,7 @@ pub(crate) fn encode(message: &Message, raw_timestamp: i64) -> Vec<u8> {
     out.extend_from_slice(&message.counters.not_connected.to_le_bytes());
     out.extend_from_slice(&u16::try_from(old.len()).unwrap().to_le_bytes());
     out.extend_from_slice(&u16::try_from(new.len()).unwrap().to_le_bytes());
+    out.extend_from_slice(&message.counters.dropped_capture_failed.to_le_bytes());
     for unit in old.iter().chain(&new) {
         out.extend_from_slice(&unit.to_le_bytes());
     }
@@ -321,6 +332,7 @@ mod tests {
                 dropped_queue_full: 1,
                 dropped_send_failed: 2,
                 not_connected: 3,
+                dropped_capture_failed: 4,
             },
             body,
         }
@@ -480,10 +492,26 @@ mod tests {
     }
 
     #[test]
+    fn the_capture_failed_counter_sits_at_byte_64_and_paths_start_at_72() {
+        // Pins the v3 layout byte by byte, independently of `encode`: the driver's C_ASSERTs
+        // put the fourth counter after the two path lengths (60 and 62).
+        let mut bytes = encode(&delete(), RAW_TS);
+        bytes[64..72].copy_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        let message = decode(&bytes).unwrap();
+        assert_eq!(
+            message.counters.dropped_capture_failed,
+            0x0102_0304_0506_0708
+        );
+        assert_eq!(HEADER_LEN, 72);
+        let path_units = u16::from_le_bytes([bytes[60], bytes[61]]);
+        assert_eq!(bytes.len(), 72 + 2 * usize::from(path_units));
+    }
+
+    #[test]
     fn an_unpaired_surrogate_is_replaced_not_refused() {
         let mut bytes = encode(&delete(), RAW_TS);
         // Overwrite the first path unit with a lone high surrogate.
-        bytes[64..66].copy_from_slice(&0xD800u16.to_le_bytes());
+        bytes[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&0xD800u16.to_le_bytes());
         let Body::Delete { path, .. } = decode(&bytes).unwrap().body else {
             panic!("not a delete");
         };

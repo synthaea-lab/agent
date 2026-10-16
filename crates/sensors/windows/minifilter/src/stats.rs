@@ -58,14 +58,19 @@ impl ChannelStats {
         self.decode_errors += 1;
     }
 
-    /// Everything known to be lost so far: the driver's three counters plus the gaps the agent
-    /// saw. The two do not overlap: a record the driver dropped never got a sequence number.
+    /// Everything known to be lost so far, each loss counted once.
+    ///
+    /// The sender numbers a record when it takes it off the queue, so a record whose send then
+    /// fails leaves a sequence gap **and** raises `dropped_send_failed`: the gap already counts
+    /// it (the #857 lab run saw `send_failed=16` with a gap of exactly 16). Records dropped
+    /// before the sender (queue full, no agent connected, capture failed) never get a number,
+    /// so their counters add to the gaps without overlap.
     #[must_use]
     pub fn total_lost(&self) -> u64 {
         self.lost_by_sequence
             + self.driver.dropped_queue_full
-            + self.driver.dropped_send_failed
             + self.driver.not_connected
+            + self.driver.dropped_capture_failed
     }
 }
 
@@ -148,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn total_lost_adds_the_driver_counters_and_the_gaps() {
+    fn total_lost_counts_each_loss_once() {
         let mut s = ChannelStats::default();
         s.on_connect();
         s.on_message(&msg(1, delete(), Counters::default()));
@@ -159,10 +164,12 @@ mod tests {
                 dropped_queue_full: 10,
                 dropped_send_failed: 1,
                 not_connected: 100,
+                dropped_capture_failed: 7,
             },
         ));
         s.on_decode_error();
-        assert_eq!(s.total_lost(), 2 + 10 + 1 + 100);
+        // The gap of 2 already includes the one failed send: it is not counted twice.
+        assert_eq!(s.total_lost(), 2 + 10 + 100 + 7);
         assert_eq!(s.decode_errors, 1);
     }
 }
