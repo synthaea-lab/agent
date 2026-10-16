@@ -230,10 +230,11 @@ fn etw_failure_hint(error: &str) -> &'static str {
 fn run_windows_sensors(
     sink: Box<dyn EventSink>,
     silence: Option<&Mutex<SilenceMonitor>>,
+    redact_exec: bool,
 ) -> anyhow::Result<()> {
     // Run and both capture commands funnel through here, so this is the one
     // place credential redaction has to sit in front of (#440).
-    let sink = crate::redact::redacting(sink);
+    let sink = crate::redact::redacting(sink, redact_exec);
 
     let mut etw_sensor = sensor_windows::WindowsSensor::new();
     let etw_stop = etw_sensor.stop_handle();
@@ -443,21 +444,25 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     );
     let (_health_handle, _health_stop) = health.spawn();
 
-    run_windows_sensors(Box::new(SharedSink(pipeline.sink)), Some(&silence_monitor))
+    run_windows_sensors(
+        Box::new(SharedSink(pipeline.sink)),
+        Some(&silence_monitor),
+        false,
+    )
 }
 
 pub(crate) fn cmd_capture_events(output: &std::path::Path) -> anyhow::Result<()> {
     let sink = sinks::JsonlEventSink::open(output)?;
     eprintln!("Synthaea — raw event capture (Ctrl-C to stop)");
     eprintln!("Output: {}", output.display());
-    run_windows_sensors(Box::new(sink), None)
+    run_windows_sensors(Box::new(sink), None, true)
 }
 
 pub(crate) fn cmd_capture_baseline(output: &std::path::Path) -> anyhow::Result<()> {
     let sink = crate::sink::BaselineSink::new(seeded_rule_state(), output)?;
     eprintln!("Synthaea — baseline capture (Ctrl-C to stop)");
     eprintln!("Output: {}", output.display());
-    run_windows_sensors(Box::new(sink), None)
+    run_windows_sensors(Box::new(sink), None, true)
 }
 
 #[cfg(test)]
