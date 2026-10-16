@@ -35,6 +35,11 @@
 //! doc for why this is an approximation ("first start seen by this agent
 //! process"), not a true install signal.
 //!
+//! **Liveness (#71, #83):** the iterator yields allowlisted records only, so the agent's
+//! silence heartbeat hangs on [`ClassifiedJournal::with_line_hook`], which sees every
+//! non-blank line, and the canary line (`CANARY_IDENTIFIER`) the agent writes into
+//! journald every 30 s guarantees there is one to see on an idle host.
+//!
 //! Deliberately **not** here yet:
 //! - No [`schema::sensor::Sensor`] implementation — like `sensor-linux-netlink`
 //!   (issue #92), this is a supplementary poll/tail source wired directly into
@@ -52,12 +57,16 @@
 //!   cursor now being persisted.
 
 mod auth;
+mod canary;
 mod classify;
 mod persistence;
 mod record;
 mod tail;
 
 pub use auth::to_auth_event;
+pub use canary::{CANARY_IDENTIFIER, canary_payload};
+#[cfg(target_os = "linux")]
+pub use canary::{JOURNAL_SOCKET, send_canary};
 pub use classify::{JournalEvent, classify};
 pub use persistence::UnitPersistenceTracker;
 pub use record::{JournalRecord, parse_record};

@@ -1,4 +1,4 @@
-//! Inference parity seam for T1 (issue #617): `ml::BehaviorScorer` (Rust 23-feature vector
+//! Inference parity seam for T1 (issue #617): `ml::BehaviorScorer` (Rust 17-feature vector
 //! from an `EventBus`, then `ort`) must reproduce the score the training-side runtime
 //! computes (Python vector through onnxruntime), pinned by
 //! `crates/ml/tests/fixtures/t1_scorer_golden.jsonl` and its generator

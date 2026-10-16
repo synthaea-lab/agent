@@ -1,0 +1,18 @@
+{
+  "type": "gatekeeper_verdict",
+  "meta": {
+    "pid": 672,
+    "ppid": 1,
+    "user": {
+      "os": "unix",
+      "uid": 0,
+      "gid": 0
+    },
+    "timestamp_ns": 1756900000123456789,
+    "comm": "syspolicyd"
+  },
+  "target": "com.evil.dropper",
+  "team_id": "ABCDE12345",
+  "signing_id": "com.evil.dropper",
+  "result_code": 2
+}

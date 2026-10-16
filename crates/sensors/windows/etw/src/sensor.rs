@@ -24,8 +24,8 @@ use crate::{
     pid_cache::PidCache,
     providers::{
         ALL_PROVIDERS, amsi_provider, dns_provider, dotnet_provider, file_provider, ldap_provider,
-        network_provider, powershell_provider, process_provider, registry_provider, smb_provider,
-        wmi_provider,
+        network_provider, ntlm_provider, powershell_provider, process_provider, registry_provider,
+        smb_provider, wmi_provider,
     },
     winapi,
     zone_identifier::{self, MarkQueue, QuarantineDedup},
@@ -57,6 +57,10 @@ const MARK_QUEUE_CAPACITY: usize = 256;
 /// this to fire, the cap only bounds a runaway client.
 const LDAP_PER_PID_LIMIT: u32 = 128;
 const LDAP_PER_PID_WINDOW_NS: u64 = 10_000_000_000;
+/// An identical NTLM authentication (direction, account, target, address, version) is
+/// reported once per this window (#364): most come from pid 4, so there is no per-process
+/// budget.
+const NTLM_DEDUP_WINDOW_NS: u64 = 60_000_000_000;
 
 /// Stops an orphaned ETW session. Named sessions are kernel objects that outlive
 /// the creating process: after a `taskkill /f` or crash the session stays Running
@@ -290,6 +294,9 @@ pub(crate) struct SharedState {
     /// LDAP search budget (#364): per process, no dedup (the burst rule
     /// counts distinct searches).
     pub(crate) ldap: Mutex<budget::PidBudget>,
+    /// NTLM dedup (#364): one event per (direction, account, target,
+    /// address, version) per minute.
+    pub(crate) ntlm: Mutex<budget::KeyDedup>,
     /// The liveness canary file: the run loop touches it every heartbeat, which
     /// MUST produce a Kernel-File event (our pid is tracked) — so sensor liveness
     /// is deterministic instead of traffic-dependent (a quiet host produces no
@@ -519,6 +526,7 @@ impl Sensor for WindowsSensor {
                 LDAP_PER_PID_LIMIT,
                 LDAP_PER_PID_WINDOW_NS,
             )),
+            ntlm: Mutex::new(budget::KeyDedup::new("ntlm", NTLM_DEDUP_WINDOW_NS)),
             canary_path: canary_file
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -542,7 +550,8 @@ impl Sensor for WindowsSensor {
             .enable(dotnet_provider(sink.clone(), state.clone()))
             .enable(smb_provider(sink.clone(), state.clone()))
             .enable(amsi_provider(sink.clone(), state.clone()))
-            .enable(ldap_provider(sink, state.clone()));
+            .enable(ldap_provider(sink.clone(), state.clone()))
+            .enable(ntlm_provider(sink, state.clone()));
         let trace = normalize::start_or_stop_session(
             &session,
             || builder.start_and_process(),

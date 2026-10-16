@@ -21,6 +21,40 @@ extern crate std;
 mod path_filter;
 pub use path_filter::is_filtered_path;
 
+/// Packs the handler tag and syscall number for a pending raw `sys_exit` event.
+/// The syscall number is kept with the tag so a later exit from another syscall
+/// in the same thread cannot consume stale state.
+#[inline(always)]
+#[must_use]
+pub const fn encode_pending_syscall_exit(action: u32, syscall_nr: u32) -> u64 {
+    ((syscall_nr as u64) << 32) | action as u64
+}
+
+/// Returns the pending handler only when the exiting syscall matches its entry.
+#[inline(always)]
+#[must_use]
+pub const fn matching_pending_syscall_exit(
+    packed: Option<u64>,
+    exiting_syscall_nr: Option<u32>,
+) -> Option<u32> {
+    match (packed, exiting_syscall_nr) {
+        (Some(value), Some(syscall_nr)) if (value >> 32) as u32 == syscall_nr => Some(value as u32),
+        _ => None,
+    }
+}
+
+/// Converts a signed syscall number from architectures that use a negative
+/// sentinel (arm64's `NO_SYSCALL`) into the non-negative syscall-id domain.
+#[inline(always)]
+#[must_use]
+pub const fn syscall_nr_from_i32(syscall_nr: i32) -> Option<u32> {
+    if syscall_nr < 0 {
+        None
+    } else {
+        Some(syscall_nr as u32)
+    }
+}
+
 /// Bumped on every layout-affecting change to the structs below. Not a wire header
 /// (ring-buffer items carry none) — a build-time tripwire: the userspace loader
 /// `const _`-asserts the value it was compiled against, so an ebpf/userspace version
@@ -937,6 +971,28 @@ pub fn boot_epoch_offset_ns() -> u64 {
         .saturating_mul(1_000_000_000)
         .saturating_add(ts.tv_nsec as u64);
     epoch_ns.saturating_sub(monotonic_ns)
+}
+
+#[cfg(test)]
+mod pending_exit_tests {
+    use super::*;
+
+    #[test]
+    fn pending_exit_dispatch_requires_the_same_syscall_number() {
+        let pending = encode_pending_syscall_exit(4, 45);
+        assert_eq!(
+            matching_pending_syscall_exit(Some(pending), Some(45)),
+            Some(4)
+        );
+        assert_eq!(matching_pending_syscall_exit(Some(pending), Some(59)), None);
+        assert_eq!(matching_pending_syscall_exit(Some(pending), None), None);
+        assert_eq!(matching_pending_syscall_exit(None, Some(45)), None);
+        assert_eq!(
+            matching_pending_syscall_exit(Some(pending), syscall_nr_from_i32(-1)),
+            None
+        );
+        assert_eq!(syscall_nr_from_i32(45), Some(45));
+    }
 }
 
 #[cfg(all(test, feature = "user"))]

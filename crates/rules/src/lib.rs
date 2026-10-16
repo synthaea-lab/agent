@@ -16,6 +16,7 @@ mod exclusions;
 mod inventory;
 mod ld_trust;
 mod ldap;
+mod ntlm;
 mod rdp;
 mod session;
 mod signature_gate;
@@ -32,6 +33,8 @@ pub use inventory::{PACKAGE_CHANGE, evaluate_package_change};
 // LDAP search rules (#364): the single-search dispatcher; the burst rule is
 // `RuleState::on_ldap_search`.
 pub use ldap::evaluate_ldap_search;
+// NTLM rules (#364): Internet-bound authentication and weak versions.
+pub use ntlm::evaluate_ntlm_auth;
 use schema::detection::Severity;
 pub use signature_gate::{ImageSignature, SignatureGatedAlert};
 pub use state::RuleState;

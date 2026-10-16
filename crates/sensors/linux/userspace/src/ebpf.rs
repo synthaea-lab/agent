@@ -74,7 +74,8 @@ fn load_embedded(tamper_pin: Option<&std::path::Path>) -> Result<aya::Ebpf, Sens
         .override_global("TASK_PID_OFFSET", &offsets.task_pid, true)
         .override_global("TASK_COMM_OFFSET", &offsets.task_comm, true)
         .override_global("BINPRM_FILENAME_OFFSET", &offsets.binprm_filename, true)
-        .override_global("SYSCALL_ARG_OFFSETS", &offsets.syscall_args, true);
+        .override_global("SYSCALL_ARG_OFFSETS", &offsets.syscall_args, true)
+        .override_global("SYSCALL_NR_OFFSET", &offsets.syscall_nr, true);
     if let Some(path) = tamper_pin {
         loader.map_pin_path("SIGNAL_TAMPER_LAST", path);
     }

@@ -36,6 +36,35 @@ ignore = [
     # yara-x 1.21.0, the latest, still requires wasmtime ^45.0.3 and the fixes are
     # 48.0.4/49.0.2: bump the moment yara-x's requirement allows one.
     "RUSTSEC-2026-0327",
+    # Component-model handle tables are capped only per instance, not charged to any
+    # host-wide limit — a DoS reachable only through the component-model API. Same
+    # blast radius as 0316/0327: our graph never enables wasmtime's `component-model`
+    # feature, even with --all-features (checked 2026-10-15 with `cargo tree
+    # --all-features -e features`: cranelift, once_cell, runtime, std,
+    # jit-icache-coherence, unwinder), so the vulnerable code isn't compiled.
+    # yara-x 1.21.0, the latest, still requires wasmtime ^45.0.3 and the fixes are
+    # 36.0.18/48.0.6/49.0.3: bump the moment yara-x's requirement allows one.
+    "RUSTSEC-2026-0363",
+    # Wasmtime may not properly enforce its async-entrypoint requirement. Same blast
+    # radius as 0327/0363: our graph never enables wasmtime's `async` feature, even
+    # with --all-features (checked 2026-10-15 with `cargo tree --all-features -e
+    # features`: cranelift, once_cell, runtime, std, jit-icache-coherence, unwinder),
+    # so the vulnerable code isn't compiled.
+    # yara-x 1.21.0, the latest, still requires wasmtime ^45.0.3 and the fixes are
+    # 48.0.6/49.0.3: bump the moment yara-x's requirement allows one.
+    "RUSTSEC-2026-0362",
+    # Stack overflow when a guest module's type registry drops a long chain of types
+    # (recursion was accidentally reintroduced into what used to be an iterative drop
+    # in 45.0.3's lineage). Unlike the component-model/async entries above, this one
+    # isn't feature-gated — but the "guest" here is the module yara-x's own compiler
+    # emits from OUR rule content (`crates/yara/src/lib.rs`'s `.yar`/`.yara` files
+    # under the content dir, delivered and signed by the control plane — see
+    # RUSTSEC-2025-0141's bincode exception above for the same boundary). A file
+    # SCANNED by a rule never influences the rule's own compiled type chain; only
+    # the rule source does, and that's content we author and release, not attacker
+    # input. yara-x 1.21.0, the latest, still requires wasmtime ^45.0.3 and the fixes
+    # are 48.0.6/49.0.3: bump the moment yara-x's requirement allows one.
+    "RUSTSEC-2026-0359",
 ]
 
 [licenses]
