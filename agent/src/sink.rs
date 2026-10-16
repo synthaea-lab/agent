@@ -65,6 +65,9 @@ pub(crate) struct DetectionSink {
     common_set: Arc<Mutex<Option<Arc<ml::features::common_set::CommonSetSnapshot>>>>,
     /// What became of the rarity judgements, for the health beacon.
     rarity_stats: Arc<RarityStats>,
+    /// Tamper-class alerts raised since the agent started (a sensor confirmed silent, a shipped
+    /// binary or its manifest that no longer verifies), for the health beacon (#863).
+    tamper_events: AtomicU64,
     /// The single alert funnel (issue #388): alerts.ndjson + stderr + the
     /// in-memory recent-alerts buffer served to `cli detections`. Shared with
     /// the YARA scan worker and quarantine.
@@ -529,6 +532,7 @@ impl DetectionSink {
             sigma: Mutex::new(load_sigma_rules(&content_root).into_option()),
             common_set,
             rarity_stats,
+            tamper_events: AtomicU64::new(0),
             yara: Mutex::new(
                 start_yara(
                     &content_root,
@@ -1323,6 +1327,19 @@ impl DetectionSink {
     /// one alert shape, whatever detected it.
     pub(crate) fn emit(&self, technique: &str, message: &str) {
         self.alert_log.record(technique, message.to_string());
+    }
+
+    /// [`Self::emit`] for an alert that says the agent itself is being impaired or no longer
+    /// matches what was shipped (a silent sensor, a failed integrity or signature check), which
+    /// the health beacon counts so the control plane can show a host where that happened (#863).
+    pub(crate) fn emit_tamper(&self, technique: &str, message: &str) {
+        self.tamper_events.fetch_add(1, Ordering::Relaxed);
+        self.emit(technique, message);
+    }
+
+    /// Tamper-class alerts raised since the agent started, for the health beacon.
+    pub(crate) fn tamper_events(&self) -> u64 {
+        self.tamper_events.load(Ordering::Relaxed)
     }
 
     /// Issue #613: an operator's request to silence `technique` on the entity
@@ -2934,6 +2951,46 @@ rule response_marker {
             events_log.contains("/bin/ls"),
             "raw event log written off-thread"
         );
+    }
+
+    // --- tamper-class alerts are counted for the health beacon (#863) ---
+
+    fn sink_for_counting(dir: &std::path::Path) -> DetectionSink {
+        DetectionSink::new(
+            rules::RuleState::new(),
+            &dir.join("alerts.ndjson"),
+            None,
+            None,
+            None,
+            &dir.join("content"),
+            &dir.join("ml-registry"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_tamper_alert_is_recorded_like_any_alert_and_counted() {
+        let dir = tmp("tamper-count");
+        let sink = sink_for_counting(&dir);
+        assert_eq!(sink.tamper_events(), 0);
+
+        sink.emit_tamper("T1562", "sensor linux-journal went silent");
+        sink.emit_tamper("T1601", "binary swapped");
+
+        assert_eq!(sink.tamper_events(), 2);
+        let alerts = std::fs::read_to_string(dir.join("alerts.ndjson")).unwrap();
+        assert!(alerts.contains("T1562") && alerts.contains("sensor linux-journal went silent"));
+        assert!(alerts.contains("T1601") && alerts.contains("binary swapped"));
+    }
+
+    #[test]
+    fn an_ordinary_alert_is_not_a_tamper_event() {
+        let dir = tmp("tamper-not-counted");
+        let sink = sink_for_counting(&dir);
+
+        sink.emit("T1059", "command line contains a base64 decode");
+
+        assert_eq!(sink.tamper_events(), 0);
     }
 
     #[test]

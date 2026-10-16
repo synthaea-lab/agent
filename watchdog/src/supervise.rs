@@ -36,7 +36,7 @@ use std::{
     process::Child,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -401,9 +401,32 @@ fn settle_probation(
     }
 }
 
-/// Spawns one agent run. On Windows its output goes to the child log file; on Unix
-/// it inherits the watchdog's streams, which under systemd are the journal (#559).
-fn spawn_agent(agent: &Path, alerts: &Path) -> std::io::Result<Child> {
+/// How many times this watchdog process has started the agent, and how many self-protection
+/// events it has reported. The agent is told both when it is spawned (the two variables below)
+/// and reports them in its health beacon, so the control plane can show a host whose agent
+/// keeps being restarted or whose binary or service definition changed (#863). Both restart from
+/// zero when the watchdog itself is restarted: they say what happened since it started.
+static AGENT_SPAWNS: AtomicU64 = AtomicU64::new(0);
+static SELF_PROTECTION_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+/// The variables the agent reads (`agent/src/host_counters.rs`; a test there checks that this
+/// file still spells them the same, since the watchdog has no dependency on the agent's crates).
+const RESTARTS_ENV: &str = "SYNTHAEA_WATCHDOG_RESTARTS";
+const TAMPER_EVENTS_ENV: &str = "SYNTHAEA_WATCHDOG_TAMPER_EVENTS";
+
+/// Self-protection events this watchdog has reported since it started.
+fn self_protection_events() -> u64 {
+    SELF_PROTECTION_EVENTS.load(Ordering::Relaxed)
+}
+
+/// The command that starts the agent, with the working directory and the counters it reports.
+/// `restarts` is how many times the agent was started before this one (0 for the first).
+fn agent_command(
+    agent: &Path,
+    alerts: &Path,
+    restarts: u64,
+    tamper_events: u64,
+) -> std::process::Command {
     // Force the working directory to the agent binary's folder. In a service
     // session (session 0 on Windows), the default working dir is System32 — the
     // agent would not find rules content nor write alerts.ndjson in the right
@@ -413,7 +436,27 @@ fn spawn_agent(agent: &Path, alerts: &Path) -> std::io::Result<Child> {
     cmd.arg("run")
         .arg("--alerts")
         .arg(alerts)
-        .current_dir(work_dir);
+        .current_dir(work_dir)
+        .env(RESTARTS_ENV, restarts.to_string())
+        .env(TAMPER_EVENTS_ENV, tamper_events.to_string());
+    cmd
+}
+
+/// Spawns one agent run. On Windows its output goes to the child log file; on Unix
+/// it inherits the watchdog's streams, which under systemd are the journal (#559).
+fn spawn_agent(agent: &Path, alerts: &Path) -> std::io::Result<Child> {
+    spawn_counted(agent, alerts, &AGENT_SPAWNS)
+}
+
+/// [`spawn_agent`] counting into `spawns`, so a test can count into a counter of its own: the
+/// supervision tests run the loop in parallel and would add to the process-wide one.
+fn spawn_counted(agent: &Path, alerts: &Path, spawns: &AtomicU64) -> std::io::Result<Child> {
+    let mut cmd = agent_command(
+        agent,
+        alerts,
+        spawns.load(Ordering::Relaxed),
+        self_protection_events(),
+    );
     // Windows service sessions give the inherited streams nowhere to go, so the
     // output is captured to a file there. On Unix the file was `/var/tmp/...`,
     // which the unit's `PrivateTmp=true` hides from the host, so a crash left no
@@ -436,7 +479,10 @@ fn spawn_agent(agent: &Path, alerts: &Path) -> std::io::Result<Child> {
     }
     #[cfg(target_os = "linux")]
     die_with_parent(&mut cmd);
-    cmd.spawn()
+    let child = cmd.spawn()?;
+    // Counted once it started: a spawn that failed is retried by the loop and is not a restart.
+    spawns.fetch_add(1, Ordering::Relaxed);
+    Ok(child)
 }
 
 /// Makes the agent die on its own the instant the watchdog does, even a SIGKILL
@@ -555,6 +601,7 @@ fn watch_child(
 /// nothing else in common with the agent's detection pipeline, and this is one
 /// fixed-shape line, not a general-purpose sink.
 fn report_self_protection_event(alerts: &Path, message: &str) {
+    SELF_PROTECTION_EVENTS.fetch_add(1, Ordering::Relaxed);
     eprintln!("[watchdog] SELF-PROTECTION: {message}");
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -786,8 +833,104 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    // --- what the agent learns at spawn and reports in its health beacon (#863) ---
+
+    /// `report_self_protection_event` bumps a process-wide counter: the tests that call it, or read
+    /// the counter, take this lock so a parallel test cannot add to the difference being checked.
+    static COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_of(cmd: &std::process::Command, name: &str) -> Option<String> {
+        cmd.get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+            .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    #[test]
+    fn the_agent_is_told_how_many_times_it_was_restarted_and_how_many_self_protection_events_there_were()
+     {
+        let cmd = agent_command(
+            Path::new("/opt/synthaea/agent"),
+            Path::new("/var/alerts.ndjson"),
+            3,
+            5,
+        );
+
+        assert_eq!(
+            env_of(&cmd, "SYNTHAEA_WATCHDOG_RESTARTS").as_deref(),
+            Some("3")
+        );
+        assert_eq!(
+            env_of(&cmd, "SYNTHAEA_WATCHDOG_TAMPER_EVENTS").as_deref(),
+            Some("5")
+        );
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            ["run", "--alerts", "/var/alerts.ndjson"],
+            "the command line is as before"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_spawn_that_started_counts_as_a_restart() {
+        let alerts =
+            std::env::temp_dir().join(format!("spawn-count-{}.ndjson", std::process::id()));
+        let spawns = AtomicU64::new(0);
+
+        // `true` ignores its arguments and exits 0: a stand-in for an agent that starts. An
+        // absolute path (`agent_command` takes its working directory from the path's parent),
+        // and not always `/bin/true`: macOS has it at `/usr/bin/true`.
+        let true_bin = ["/bin/true", "/usr/bin/true"]
+            .into_iter()
+            .map(Path::new)
+            .find(|p| p.exists())
+            .expect("a true binary");
+        let mut child = spawn_counted(true_bin, &alerts, &spawns).expect("spawns");
+        child.wait().unwrap();
+        assert_eq!(spawns.load(Ordering::Relaxed), 1);
+
+        assert!(spawn_counted(Path::new("/nonexistent/agent"), &alerts, &spawns).is_err());
+        assert_eq!(
+            spawns.load(Ordering::Relaxed),
+            1,
+            "a spawn that failed is retried by the loop and is not a restart"
+        );
+
+        let mut again = spawn_counted(true_bin, &alerts, &spawns).expect("spawns");
+        again.wait().unwrap();
+        assert_eq!(spawns.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn each_self_protection_report_is_counted() {
+        let _serial = COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = std::env::temp_dir().join(format!(
+            "self-protection-count-{}.ndjson",
+            std::process::id()
+        ));
+        std::fs::remove_file(&path).ok();
+        let before = self_protection_events();
+
+        report_self_protection_event(&path, "service definition changed");
+        report_self_protection_event(&path, "agent binary no longer matches its pinned hash");
+
+        // At least: the supervision tests run the loop in parallel and may report events of their
+        // own meanwhile, which only adds to the process-wide counter.
+        assert!(self_protection_events() - before >= 2);
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn self_protection_event_is_a_well_shaped_json_line() {
+        let _serial = COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = std::env::temp_dir().join(format!(
             "self-protection-event-test-{}.ndjson",
             std::process::id()

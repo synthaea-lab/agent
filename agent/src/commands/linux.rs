@@ -150,16 +150,30 @@ fn has_bpf_capabilities() -> bool {
 
 /// Selects sensor: eBPF if available, audit fallback otherwise.
 /// Returns (sensor, `sensor_name`) for correct telemetry.
-fn select_sensor() -> (Box<dyn schema::sensor::Sensor>, &'static str) {
+///
+/// The third value reads what the eBPF sensor's parent-image cache has dropped, for the health
+/// beacon (#863); the audit fallback has no such cache.
+fn select_sensor() -> (
+    Box<dyn schema::sensor::Sensor>,
+    &'static str,
+    Option<crate::host_counters::EvictionReader>,
+) {
     if can_use_ebpf() {
         tracing::info!("Using eBPF sensor (primary)");
-        return (Box::new(sensor_linux::LinuxSensor::new()), "linux-ebpf");
+        let sensor = sensor_linux::LinuxSensor::new();
+        let evictions = sensor.parent_image_evictions();
+        return (
+            Box::new(sensor),
+            "linux-ebpf",
+            Some(Box::new(move || (evictions.live(), evictions.dead()))),
+        );
     }
 
     tracing::warn!("eBPF unavailable — using audit fallback (reduced fidelity)");
     (
         Box::new(sensor_linux_audit::AuditSensor::new()),
         "linux-audit",
+        None,
     )
 }
 
@@ -254,7 +268,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
 
     // Select the primary sensor (eBPF or audit fallback) before creating heartbeats
     // so telemetry reports the correct sensor type.
-    let (mut sensor, sensor_name) = select_sensor();
+    let (mut sensor, sensor_name, evictions) = select_sensor();
 
     // Automated response (#25): policy off by default (observe-only), opted into
     // per flag. Quarantine lands next to alerts.ndjson, the same "derived, no
@@ -325,7 +339,15 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
 
     // Health beacon (#134): periodic self-diagnostics to the control plane, over
     // the silence monitor above.
-    let health = super::common::health_collector(&pipeline, silence_monitor);
+    let health = super::common::health_collector(
+        &pipeline,
+        silence_monitor,
+        Arc::new(crate::host_counters::AgentHostCounters::new(
+            Arc::clone(&pipeline.sink),
+            crate::host_counters::WatchdogReport::from_env(),
+            evictions,
+        )),
+    );
     // Workers wound down after `sensor.run` returns (#316).
     let mut shutdown = ShutdownPlan::default();
     let (health_handle, health_stop) = health.spawn();

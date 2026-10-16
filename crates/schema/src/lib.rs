@@ -1545,6 +1545,26 @@ pub struct HealthBeacon {
     /// evicted or never created it): the loss, counted. Absent in an older beacon: zero.
     #[serde(default)]
     pub rarity_unapplied: u64,
+    /// How many times the watchdog has respawned the agent since the watchdog started (the
+    /// watchdog tells the agent at spawn). Zero when the agent is not run under a watchdog, and
+    /// in a beacon from an older agent (issue #863).
+    #[serde(default)]
+    pub watchdog_restarts: u64,
+    /// Cumulative tamper-class alerts raised since the agent started: a sensor confirmed silent,
+    /// a shipped binary or its signed manifest that no longer verifies, plus the self-protection
+    /// events the watchdog reported (service definition drift, a binary that no longer matches its
+    /// pinned hash). Absent in a beacon from an older agent: zero (issue #863).
+    #[serde(default)]
+    pub tamper_events: u64,
+    /// Cumulative entries of the Linux parent-image cache the cap dropped while their process was
+    /// still alive: the loss, a later child of such a process carries no `parent_image_path`
+    /// (issue #783). Zero on other platforms and in a beacon from an older agent (issue #863).
+    #[serde(default)]
+    pub parent_image_evicted_live: u64,
+    /// Cumulative entries the cap dropped whose process had already exited: nothing lost, counted
+    /// to show how full the cache runs. Zero on other platforms and in an older beacon.
+    #[serde(default)]
+    pub parent_image_evicted_dead: u64,
 }
 
 /// A logon/authentication outcome, or a privileged-session assignment — shared
