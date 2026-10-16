@@ -739,7 +739,7 @@ fn credential_option(tool: &str, token: &str) -> Option<Option<(usize, usize)>> 
         return Some(None);
     }
     if tool == "smbclient"
-        && value.starts_with("-U")
+        && lower.starts_with("-u")
         && let Some(percent) = value.find('%')
     {
         return Some(Some((base + percent + 1, end)));
@@ -811,15 +811,6 @@ fn credential_option(tool: &str, token: &str) -> Option<Option<(usize, usize)>> 
     if tool == "docker-login" && value.starts_with("-p") && value.len() > 2 {
         return Some(Some((base + 2, end)));
     }
-    if tool == "smbclient"
-        && lower.starts_with("-u")
-        && let Some(percent) = value.find('%')
-    {
-        return Some(Some((base + percent + 1, end)));
-    }
-    if tool == "openssl" && matches!(lower.as_str(), "-pass" | "-passin" | "-passout") {
-        return Some(None);
-    }
     if attached_password && value.starts_with("-p") && value.len() > 2 {
         return Some(Some((base + 2, end)));
     }
@@ -831,12 +822,6 @@ fn credential_option(tool: &str, token: &str) -> Option<Option<(usize, usize)>> 
         && value.len() > 2
     {
         return Some(Some((base + 2, end)));
-    }
-    if tool == "smbclient"
-        && value.starts_with("-U")
-        && let Some(percent) = value.find('%')
-    {
-        return Some(Some((base + percent + 1, end)));
     }
     if tool == "curl" || tool == "wget" {
         if lower == "-u" || lower == "--user" {
@@ -1615,6 +1600,11 @@ mod tests {
                 "smbclient //h/share -U user%REDACTED",
             ),
             (
+                "smbclient",
+                "smbclient //h/share -Uuser%S3cret",
+                "smbclient //h/share -Uuser%REDACTED",
+            ),
+            (
                 "curl",
                 "curl --proxy-user=a:S3cret h",
                 "curl --proxy-user=REDACTED h",
@@ -1629,6 +1619,49 @@ mod tests {
                 "curl",
                 "curl -dpassword=S3cret h",
                 "curl -dpassword=REDACTED h",
+            ),
+            ("curl", "curl -sLuadmin:S3cret h", "curl -sLuREDACTED h"),
+            ("curl", "curl -sLu admin:S3cret h", "curl -sLu REDACTED h"),
+            ("mysql", "mysql -pS3cret", "mysql -pREDACTED"),
+            ("mysqladmin", "mysqladmin -pS3cret", "mysqladmin -pREDACTED"),
+            (
+                "mysqlimport",
+                "mysqlimport -pS3cret",
+                "mysqlimport -pREDACTED",
+            ),
+            ("docker", "docker login -pS3cret", "docker login -pREDACTED"),
+            (
+                "docker",
+                "docker login -p S3cret",
+                "docker login -p REDACTED",
+            ),
+            (
+                "docker",
+                "docker login --password=S3cret",
+                "docker login --password=REDACTED",
+            ),
+            (
+                "docker",
+                "docker login --password S3cret",
+                "docker login --password REDACTED",
+            ),
+            ("redis-cli", "redis-cli -aS3cret", "redis-cli -aREDACTED"),
+            ("ldapsearch", "ldapsearch -wS3cret", "ldapsearch -wREDACTED"),
+            ("7z", "7z a -pS3cret archive", "7z a -pREDACTED archive"),
+            (
+                "zip",
+                "zip -P S3cret archive file",
+                "zip -P REDACTED archive file",
+            ),
+            (
+                "zip",
+                "zip -PS3cret archive file",
+                "zip -PREDACTED archive file",
+            ),
+            (
+                "wget",
+                "wget --http-password=S3cret h",
+                "wget --http-password=REDACTED h",
             ),
         ] {
             assert_eq!(redact_command_line(image, input), expected, "{input}");
