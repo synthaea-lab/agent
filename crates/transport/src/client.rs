@@ -510,6 +510,13 @@ mod tests {
             spool_bytes: 1024,
             spool_dropped: 0,
             enrich_dropped: 3,
+            rarity_applied: 7,
+            rarity_withheld: 11,
+            rarity_unapplied: 2,
+            watchdog_restarts: 3,
+            tamper_events: 5,
+            parent_image_evicted_live: 13,
+            parent_image_evicted_dead: 209_000,
         };
         let body = serde_json::to_value(HeartbeatPayload {
             agent_id: None,
@@ -528,7 +535,14 @@ mod tests {
                     ],
                     "spool_bytes": 1024,
                     "spool_dropped": 0,
-                    "enrich_dropped": 3
+                    "enrich_dropped": 3,
+                    "rarity_applied": 7,
+                    "rarity_withheld": 11,
+                    "rarity_unapplied": 2,
+                    "watchdog_restarts": 3,
+                    "tamper_events": 5,
+                    "parent_image_evicted_live": 13,
+                    "parent_image_evicted_dead": 209000
                 }
             })
         );

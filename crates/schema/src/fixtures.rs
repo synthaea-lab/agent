@@ -34,11 +34,12 @@ use crate::{
     FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent, HttpRequestEvent,
     HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent,
     KernelModuleAction, KernelModuleEvent, LdapSearchEvent, ListenPortEvent, MemfdCreateEvent,
-    NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, PackageChangeEvent, PackageChangeKind,
-    PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent,
-    RegistrySetEvent, ScriptBlockEvent, SessionEvent, SessionState, ShellType, SmbConnectEvent,
-    SocketAcceptEvent, SocketBindEvent, SocketCreateEvent, SocketListenEvent, TlsCaptureEvent,
-    TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
+    NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, NtlmAuthEvent, NtlmDirection,
+    PackageChangeEvent, PackageChangeKind, PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent,
+    ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
+    SessionEvent, SessionState, ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
+    SocketCreateEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
+    UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -125,6 +126,20 @@ pub fn image_load() -> ImageLoadEvent {
     ImageLoadEvent {
         meta: meta(),
         image_path: String::new(),
+    }
+}
+
+/// Neutral [`NtlmAuthEvent`].
+#[must_use]
+pub fn ntlm_auth() -> NtlmAuthEvent {
+    NtlmAuthEvent {
+        meta: meta(),
+        direction: NtlmDirection::Outgoing,
+        user: String::new(),
+        target: String::new(),
+        remote_address: None,
+        ntlm_version: String::new(),
+        status: None,
     }
 }
 
@@ -443,6 +458,21 @@ pub fn package_change() -> PackageChangeEvent {
         change: PackageChangeKind::Upgraded,
         previous_version: Some("3.0.13-1".into()),
         version: Some("3.0.15-1".into()),
+    }
+}
+
+/// Neutral [`PolicyDenialEvent`]: no mechanism, no contexts, not enforced.
+#[must_use]
+pub fn policy_denial() -> PolicyDenialEvent {
+    PolicyDenialEvent {
+        meta: meta(),
+        mechanism: String::new(),
+        subject_context: None,
+        object_context: None,
+        object_class: None,
+        action: None,
+        enforced: false,
+        object_path: None,
     }
 }
 

@@ -1051,6 +1051,305 @@ fn listen_port_two_distinct_new_ports_each_alert() {
     assert_eq!(second.len(), 1);
 }
 
+// ── POLICY-DENIAL-DRIFT via SELinux AVC (issue #774, PolicyDenialEvent) ──
+
+#[test]
+fn a_new_policy_denial_shape_alerts_once() {
+    let mut state = RuleState::new();
+    let alerts = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        Some("system_u:system_r:httpd_t:s0"),
+        Some("system_u:object_r:shadow_t:s0"),
+        Some("file"),
+        true,
+    ));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1562");
+}
+
+#[test]
+fn the_same_denial_shape_repeated_does_not_realert() {
+    // SELinux/AppLocker deny the same (subject, object, class) triple over and
+    // over as part of routine Enforcing/managed operation — the 2nd+ denial of
+    // the same shape is not a new finding.
+    let mut state = RuleState::new();
+    let first = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        Some("httpd_t"),
+        Some("shadow_t"),
+        Some("file"),
+        true,
+    ));
+    assert_eq!(first.len(), 1);
+    let second = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        Some("httpd_t"),
+        Some("shadow_t"),
+        Some("file"),
+        true,
+    ));
+    assert!(second.is_empty());
+}
+
+#[test]
+fn denials_differing_only_in_the_mcs_category_pair_are_the_same_shape() {
+    // Container runtimes give each container its own MCS category pair
+    // (rootless podman per `run`): two denials from the same domain/object/class
+    // but a different category pair must not look like two different shapes, or
+    // every fresh container re-alerts the same finding (#781 review).
+    let mut state = RuleState::new();
+    let first = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        Some("system_u:system_r:container_t:s0:c100,c200"),
+        Some("system_u:object_r:shadow_t:s0:c100,c200"),
+        Some("file"),
+        true,
+    ));
+    let second = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        Some("system_u:system_r:container_t:s0:c300,c400"),
+        Some("system_u:object_r:shadow_t:s0:c300,c400"),
+        Some("file"),
+        true,
+    ));
+    assert_eq!(first.len(), 1);
+    assert!(
+        second.is_empty(),
+        "same user:role:type, different category pair: not a new shape"
+    );
+}
+
+#[test]
+fn a_different_object_class_on_the_same_subject_object_pair_is_a_new_shape() {
+    // Same subject/object contexts, different tclass (file vs. process) — a
+    // genuinely different kind of denial, not a repeat of the first.
+    let mut state = RuleState::new();
+    let first = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        Some("httpd_t"),
+        Some("shadow_t"),
+        Some("file"),
+        true,
+    ));
+    let second = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        Some("httpd_t"),
+        Some("shadow_t"),
+        Some("process"),
+        true,
+    ));
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+}
+
+#[test]
+fn permissive_mode_still_alerts_on_a_new_shape() {
+    // A permissive-mode SELinux log still names a real new denial shape — the
+    // rule fires on the shape appearing, not on whether it was actually
+    // blocked (see check_policy_denial_drift's doc).
+    let mut state = RuleState::new();
+    let alerts = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        Some("unconfined_t"),
+        Some("user_home_t"),
+        Some("file"),
+        false,
+    ));
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn only_selinux_denials_alert_for_now() {
+    // AppLocker/WDAC PolicyDenialEvents carry no subject/object context
+    // (always None), so this rule's shape would collapse to object_class
+    // alone — far too coarse (see known_policy_denials' doc) — gated off
+    // until a richer per-mechanism key exists.
+    let mut state = RuleState::new();
+    let applocker = state.on_policy_denial(&policy_denial_event_full(
+        "applocker",
+        None,
+        None,
+        Some("EXE"),
+        true,
+    ));
+    assert!(applocker.is_empty());
+}
+
+#[test]
+fn a_denial_missing_subject_or_object_context_still_alerts_once() {
+    // tclass values like `capability`/`tcp_socket` or an AppLocker verdict with
+    // no SELinux-style context carry None for subject/object — the rule must
+    // not panic or silently drop these, just key on whatever is present.
+    let mut state = RuleState::new();
+    let alerts = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        None,
+        None,
+        Some("capability"),
+        true,
+    ));
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn policy_denial_alert_cap_sheds_further_shapes_but_keeps_deduplicating() {
+    // `known_policy_denials` bounds the rule's memory, not its alert volume (#812): past
+    // POLICY_DENIAL_ALERT_CAP distinct shapes, further new ones must stop alerting
+    // without breaking the dedup itself.
+    let mut state = RuleState::new();
+    let mut alerted = 0usize;
+    for i in 0..=POLICY_DENIAL_ALERT_CAP {
+        let subject = format!("unconfined_u:unconfined_r:type_{i}_t:s0");
+        let alerts = state.on_policy_denial(&policy_denial_event_full(
+            "selinux",
+            Some(&subject),
+            Some("user_home_t"),
+            Some("file"),
+            true,
+        ));
+        alerted += alerts.len();
+    }
+    assert_eq!(
+        alerted, POLICY_DENIAL_ALERT_CAP as usize,
+        "the (cap + 1)th distinct shape must be shed, not alerted"
+    );
+
+    // The shed shape is still remembered: seeing it again still does not alert (dedup
+    // did not stop working once the cap was reached).
+    let last_subject = format!("unconfined_u:unconfined_r:type_{POLICY_DENIAL_ALERT_CAP}_t:s0");
+    let repeat = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        Some(&last_subject),
+        Some("user_home_t"),
+        Some("file"),
+        true,
+    ));
+    assert!(repeat.is_empty(), "dedup still works past the alert cap");
+}
+
+#[test]
+fn policy_denial_cache_eviction_is_logged() {
+    // `known_policy_denials` silently clearing at COUNTER_CAP must not be silent to an
+    // operator (#812, CLAUDE.md: counted, observable shedding) — logged once per rise,
+    // the same idiom as `agent::ransomware_join::report_evictions`.
+    use std::{
+        io,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        let mut state = RuleState::new();
+        for i in 0..=COUNTER_CAP {
+            let subject = format!("unconfined_u:unconfined_r:evict_{i}_t:s0");
+            state.on_policy_denial(&policy_denial_event_full(
+                "selinux",
+                Some(&subject),
+                Some("user_home_t"),
+                Some("file"),
+                true,
+            ));
+        }
+    });
+
+    let logs = String::from_utf8_lossy(&captured.0.lock().expect("capture lock")).into_owned();
+    // Exactly one rise happens: COUNTER_CAP + 1 inserts crosses the cap exactly once,
+    // evicting one batch (COUNTER_CAP / 8). A bare substring check (review of #823)
+    // cannot tell "logged once, correctly" from two real bugs that both still contain
+    // the phrase: `>` weakened to `>=` logs on every one of these COUNTER_CAP + 1 calls
+    // (a line per event, the flood "once per rise" exists to avoid), and `>` flipped to
+    // `==` logs on every call *before* the real rise (evicted stays 0 == reported's
+    // initial 0) and then falls silent exactly when the real eviction happens. Asserting
+    // the exact line count and the real evicted value catches both.
+    let shed_lines = logs.matches("tracked denial shapes shed").count();
+    assert_eq!(
+        shed_lines, 1,
+        "exactly one eviction rise must be logged, not zero or one per event: {logs}"
+    );
+    assert!(
+        logs.contains(&format!("evicted={}", COUNTER_CAP / 8)),
+        "the logged count must be the real evicted total, not 0: {logs}"
+    );
+}
+
+#[test]
+fn policy_denial_alert_cap_reached_is_logged_exactly_once() {
+    // The "alert cap reached" warning is gated on `policy_denial_alerts_shed == 0`
+    // (the very first shed) so it fires once, not once per shed shape — otherwise a
+    // sustained flood past the cap would spam one warning per new shape instead of
+    // one notice that the cap was hit (review of #823: `== 0` flipped to `!= 0`, or
+    // the counter's own `+= 1` flipped to `*= 1`, both leave the existing tests
+    // green because nothing before this asserted on this message's own line count).
+    use std::{
+        io,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        let mut state = RuleState::new();
+        // Well past POLICY_DENIAL_ALERT_CAP (512): enough further shapes that a
+        // once-per-shed bug would produce many lines, not just a second one.
+        for i in 0..POLICY_DENIAL_ALERT_CAP * 3 {
+            let subject = format!("unconfined_u:unconfined_r:cap_{i}_t:s0");
+            state.on_policy_denial(&policy_denial_event_full(
+                "selinux",
+                Some(&subject),
+                Some("user_home_t"),
+                Some("file"),
+                true,
+            ));
+        }
+    });
+
+    let logs = String::from_utf8_lossy(&captured.0.lock().expect("capture lock")).into_owned();
+    let cap_lines = logs.matches("alert cap reached").count();
+    assert_eq!(
+        cap_lines, 1,
+        "the cap-reached warning must fire exactly once, not once per shed shape: {logs}"
+    );
+}
+
 #[test]
 fn mass_rename_with_appended_suffix_triggers_at_threshold() {
     let mut state = RuleState::new();

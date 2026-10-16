@@ -68,7 +68,10 @@ use crate::redact;
 /// v22 (#263) added `UdpRecvEvent` — not imported here, same reasoning.
 ///
 /// v23 (#263) added `SocketCreateEvent` — not imported here, same reasoning.
-const _: () = assert!(wire::WIRE_VERSION == 23);
+///
+/// v24 (#784) added parent-lineage fields to `ExecEvent` and `LineageEntry` — `ExecEvent` is
+/// not imported here, same reasoning.
+const _: () = assert!(wire::WIRE_VERSION == 24);
 
 /// `container` is resolved by the caller (`crate::container::container_context`,
 /// issue #312) from `EventMeta::cgroup_id` against cgroupfs, with image/name filled

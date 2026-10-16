@@ -420,3 +420,11 @@ pub(crate) const BROWSERS: &[&str] = &[
     "iexplore.exe",
     "vivaldi.exe",
 ];
+
+/// Distinct-shape alerts POLICY-DENIAL-DRIFT raises before it stops (#812):
+/// `known_policy_denials` bounds the rule's memory of what it has seen, not its alert
+/// volume, so a flood of distinct shapes (varying the subject/object type faster than a
+/// real host ever would) could otherwise emit one alert per shape, unbounded. Generous:
+/// a real host has at most a few hundred distinct (type, type, class) triples over its
+/// lifetime; anything past this is a flood, not more coverage.
+pub(crate) const POLICY_DENIAL_ALERT_CAP: u64 = 512;

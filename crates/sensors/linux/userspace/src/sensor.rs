@@ -24,7 +24,7 @@ use crate::{
         write_signal_watch_pid,
     },
     normalize,
-    parent_image::{IMAGE_CACHE_CAP, ParentImages},
+    parent_image::{ExecStamps, IMAGE_CACHE_CAP, ParentImageEvictions, ParentImages},
     proc::{read_proc_cmdline, read_proc_environ_security, read_proc_images},
 };
 
@@ -85,6 +85,7 @@ fn sweep_survived_sigkill(slot: &mut TamperSlot, own_pid: u32, boot_epoch_offset
 /// Linux sensor (eBPF). `run` blocks until Ctrl-C or [`Sensor::stop`].
 pub struct LinuxSensor {
     stop: Arc<Notify>,
+    evictions: Arc<ParentImageEvictions>,
 }
 
 impl Default for LinuxSensor {
@@ -154,7 +155,16 @@ impl LinuxSensor {
     pub fn new() -> Self {
         Self {
             stop: Arc::new(Notify::new()),
+            evictions: Arc::new(ParentImageEvictions::default()),
         }
+    }
+
+    /// The running totals of what the parent-image cache's cap drops, for the agent's health
+    /// beacon (#863). The same handle for the life of the sensor, so it can be taken before the
+    /// sensor is moved onto its thread.
+    #[must_use]
+    pub fn parent_image_evictions(&self) -> Arc<ParentImageEvictions> {
+        Arc::clone(&self.evictions)
     }
 
     async fn run_async(&mut self, sink: Box<dyn EventSink>) -> Result<(), SensorError> {
@@ -217,7 +227,8 @@ impl LinuxSensor {
 
         // The same processes' image paths, so the first child of an already-running
         // parent resolves `parent_image_path` too (#768).
-        let mut parent_images = ParentImages::new(IMAGE_CACHE_CAP);
+        let mut parent_images =
+            ParentImages::new(IMAGE_CACHE_CAP).with_totals(Arc::clone(&self.evictions));
         for (pid, generation, image) in read_proc_images(IMAGE_CACHE_CAP) {
             parent_images.prime(pid, generation, image);
         }
@@ -313,7 +324,12 @@ impl LinuxSensor {
                     drain!(guard, sensor_linux_wire::ExecEvent, sink, own_pid, |e: &sensor_linux_wire::ExecEvent| {
                         let mut event = normalize::exec(e, offset, read_proc_cmdline(e.meta.pid), read_proc_environ_security(e.meta.pid), container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache));
                         if let schema::Event::Exec(exec) = &mut event {
-                            parent_images.annotate(exec);
+                            parent_images.annotate(exec, ExecStamps {
+                                ktime_ns: e.meta.timestamp_ns,
+                                grandparent_pid: e.grandparent_pid,
+                                grandparent_generation: e.grandparent_generation,
+                                parent_never_exec_ed: e.parent_execd == 0,
+                            });
                         }
                         event
                     });
@@ -524,5 +540,29 @@ impl Sensor for LinuxSensor {
     /// orchestrating shutdown); the CLI path still relies on Ctrl-C.
     fn stop(&mut self) {
         self.stop.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod evictions_handle_tests {
+    use std::sync::Arc;
+
+    use super::LinuxSensor;
+
+    #[test]
+    fn the_eviction_totals_are_one_shared_handle_that_starts_at_zero() {
+        let sensor = LinuxSensor::new();
+        let first = sensor.parent_image_evictions();
+        let second = sensor.parent_image_evictions();
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "taken before the sensor moves to its thread, read after"
+        );
+        assert_eq!((first.dead(), first.live()), (0, 0));
+        assert!(
+            !Arc::ptr_eq(&first, &LinuxSensor::new().parent_image_evictions()),
+            "each sensor has its own"
+        );
     }
 }

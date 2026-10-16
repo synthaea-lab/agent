@@ -107,6 +107,23 @@ pub(crate) fn record_sched_process_exec(pid: u32, filename_ptr: *const u8) -> u3
                 (*e).pcomm[i] = l.comm[i];
                 i += 1;
             }
+            // The parent's own parent and its stamp, and whether the parent has exec'd, for
+            // a parent that forked and never exec'd (#784): one more lookup, the parent's
+            // entry. Only when that entry is the incarnation this child was forked from: if
+            // the parent exited and its pid was reused, the entry describes someone else
+            // and its forker would be lent to the child. Left zero otherwise.
+            if let Some(parent) = PROC_LINEAGE.get(&l.ppid) {
+                if parent.generation == l.parent_generation {
+                    (*e).grandparent_pid = parent.ppid;
+                    (*e).grandparent_generation = parent.parent_generation;
+                    (*e).parent_execd = parent.execd;
+                }
+            }
+        }
+        // This process has exec'd: its children can no longer be told it runs its forker's
+        // image. After the reads above, so the event describes the state before this exec.
+        if let Some(own) = PROC_LINEAGE.get_ptr_mut(&tgid) {
+            (*own).execd = 1;
         }
 
         // Authoritative image path: the tracepoint's own `filename` field (the
@@ -2939,6 +2956,12 @@ fn try_sys_enter_umount(ctx: TracePointContext) -> Result<u32, u32> {
 /// Shared by `sys_enter_mount` and `sys_enter_umount` above. `source_ptr`/
 /// `fstype_ptr` are `0` on an unmount (`umount2(2)` has neither argument) — left
 /// zero-length on the wire event, which `normalize::mount` maps to `None`.
+///
+/// Always inlined, on purpose: with six parameters LLVM 23 can emit this as a real
+/// BPF-to-BPF call that passes the sixth on the stack, and the 7.2 kernel's verifier
+/// rejects that ("callee expects 6 args, stack arg1 is not initialized"), so
+/// `raw_sys_enter` fails to load and the agent exits seconds after it starts.
+#[inline(always)]
 fn emit_mount_event(
     ctx: &TracePointContext,
     mount_point_ptr: u64,

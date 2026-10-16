@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use schema::{Event, detection::Severity};
+use schema::{Event, EventMeta, ExecEvent, HttpRequestEvent, detection::Severity};
 
 use crate::{bus::EventBus, event::is_file_write};
 
@@ -14,6 +14,8 @@ pub struct CorrelationAlert {
     /// and fuses the finding; never a response trigger (see `rules::Alert`).
     pub severity: Severity,
     pub message: String,
+    /// Event that owns the finding when it is emitted later by a timer.
+    pub trigger_event: Option<Box<Event>>,
 }
 
 /// The "network" leg of the co-occurrence rules: a `ConnectEvent`, except sshd's
@@ -47,6 +49,7 @@ pub(crate) fn rule_spawn_connect(
         Some(CorrelationAlert {
             technique: "T1059/T1071",
             severity: Severity::Medium,
+            trigger_event: None,
             message: format!("pid={pid}: spawn + network connection in the same time window"),
         })
     } else {
@@ -114,6 +117,7 @@ pub(crate) fn rule_connect_filewrite(
         Some(CorrelationAlert {
             technique: "T1105",
             severity: Severity::Medium,
+            trigger_event: None,
             message: format!(
                 "pid={pid}: network connection + file write in the same window — suspected staging"
             ),
@@ -141,6 +145,7 @@ pub(crate) fn rule_spawn_connect_filewrite(
         Some(CorrelationAlert {
             technique: "T1105/T1059/T1071",
             severity: Severity::High,
+            trigger_event: None,
             message: format!(
                 "pid={pid}: spawn + network connection + file write — complete dropper chain"
             ),
@@ -190,6 +195,7 @@ pub(crate) fn rule_respawn_connect(
         Some(CorrelationAlert {
             technique: "T1059/T1071",
             severity: Severity::Medium,
+            trigger_event: None,
             message: format!(
                 "ppid={ppid} comm={comm}: {spawn_count} spawns + network connection — automatic respawn with suspected beaconing"
             ),
@@ -256,6 +262,7 @@ pub(crate) fn rule_assembly_connect(
         Some(CorrelationAlert {
             technique: "T1055/T1620",
             severity: Severity::High,
+            trigger_event: None,
             message: format!(
                 "pid={pid}: in-memory .NET assembly + network connection — suspected execute-assembly C2{}",
                 assembly_name
@@ -295,6 +302,7 @@ pub(crate) fn rule_exec_smb(
         Some(CorrelationAlert {
             technique: "T1021.002",
             severity: Severity::Medium,
+            trigger_event: None,
             message: format!(
                 "pid={pid}: process spawn + SMB connection — suspected lateral movement{}",
                 server
@@ -344,6 +352,7 @@ pub(crate) fn rule_assembly_smb(
         Some(CorrelationAlert {
             technique: "T1021.002/T1055",
             severity: Severity::High,
+            trigger_event: None,
             message: format!(
                 "pid={pid}: in-memory .NET assembly + SMB connection — suspected fileless lateral movement{}{}",
                 assembly_name
@@ -431,6 +440,7 @@ pub(crate) fn rule_dns_exfil(
         Some(CorrelationAlert {
             technique: "T1048.003/T1071.004",
             severity: Severity::Medium,
+            trigger_event: None,
             message: format!(
                 "pid={pid} comm={comm}: {count} distinct high-entropy subdomains of {parent} \
                  within the window — suspected DNS tunnelling / exfiltration"
@@ -468,85 +478,90 @@ pub(crate) fn is_web_server_shell(exec: &schema::ExecEvent) -> bool {
     parent_is_web && SHELL_NAMES.contains(&name)
 }
 
-/// One satisfied [`rule_web_request_shell`] pairing, with the identity of the shell
-/// it concerns so the engine can alert once per shell.
-pub(crate) struct WebShellCase {
-    pub(crate) pid: u32,
-    pub(crate) generation: Option<u64>,
-    /// The shell exec's timestamp.
-    pub(crate) timestamp_ns: u64,
-    pub(crate) alert: CorrelationAlert,
+/// The initial wait is short so shell execution is visible promptly. The generic case
+/// remains eligible for a late access-log completion for five minutes, bounded by the
+/// engine's pending-shell capacity. Kept short on purpose: on an Internet-facing site
+/// signature-matching scanner requests arrive all the time, and the longer the window the
+/// more likely the "completion" names a probe that has nothing to do with the shell (#807
+/// review). The completion alert says it is unverified for the same reason.
+pub(crate) const WEB_SHELL_GRACE_NS: u64 = 3_000_000_000;
+pub(crate) const WEB_SHELL_LATE_REQUEST_NS: u64 = 300_000_000_000;
+
+/// Build either the initial request-paired/generic T1505.003 alert, or its late
+/// access-log completion. Application log records are stamped when read, so a long
+/// request can be observed well after its child shell starts. The matched parameter
+/// value is never included.
+pub(crate) fn rule_web_request_shell(
+    exec: &ExecEvent,
+    request: Option<&HttpRequestEvent>,
+    completion: bool,
+) -> CorrelationAlert {
+    let meta = &exec.meta;
+    let message = if let Some(request) = request {
+        let delta_s = request.meta.timestamp_ns.saturating_sub(meta.timestamp_ns) / 1_000_000_000;
+        let client = request
+            .client
+            .map_or_else(|| "unknown".to_owned(), |c| c.to_string());
+        let param = request
+            .evidence
+            .as_ref()
+            .map_or_else(String::new, |ev| format!(" param={}", ev.param));
+        let lead = if completion {
+            "late access-log request read after the generic shell alert (unverified: it may be              unrelated, scanner traffic arrives all the time), shell spawned by a web server"
+        } else {
+            "shell spawned by a web server"
+        };
+        format!(
+            "pid={} comm={} parent={}: {lead} {delta_s}s after a {:?} request \
+             ({} {}{param}, status {}, client {client}) - suspected web shell or \
+             exploited web application",
+            meta.pid,
+            meta.comm,
+            exec.parent_comm.as_deref().unwrap_or("?"),
+            request.signature,
+            request.method.as_deref().unwrap_or("?"),
+            request.path,
+            request.status,
+        )
+    } else {
+        format!(
+            "pid={} comm={} parent={}: shell spawned by a web server; no matching \
+             access-log request has been read yet",
+            meta.pid,
+            meta.comm,
+            exec.parent_comm.as_deref().unwrap_or("?"),
+        )
+    };
+    CorrelationAlert {
+        technique: "T1505.003",
+        severity: Severity::High,
+        message,
+        trigger_event: Some(Box::new(Event::Exec(exec.clone()))),
+    }
 }
 
-/// T1505.003 / T1190 — a web server spawns a shell within the window of a request that
-/// matched a detection signature (`Event::HttpRequest`, from the access log). Either
-/// can arrive first: the log line is written when the request ends, after the shell
-/// the request caused, and the agent reads it a moment later.
-///
-/// This is temporal co-occurrence on one host, not proof the request caused the shell
-/// (a log line names no process): on a busy site a probe and an unrelated cron job
-/// under php-fpm can land in the same minute. For each qualifying shell the closest
-/// request is named. The message carries the request's signature, path, client and
-/// the matched parameter's *name*, never its value: the value is only redacted at the
-/// agent's sink (ADR-0018), downstream of this crate.
-pub(crate) fn rule_web_request_shell(bus: &EventBus) -> Vec<WebShellCase> {
-    let events: Vec<&Event> = bus.events().collect();
-    let requests: Vec<&schema::HttpRequestEvent> = events
-        .iter()
-        .filter_map(|e| match e {
-            Event::HttpRequest(r) => Some(r),
-            _ => None,
-        })
-        .collect();
-    if requests.is_empty() {
-        return Vec::new();
-    }
-    events
-        .iter()
-        .filter_map(|e| match e {
-            Event::Exec(exec) if is_web_server_shell(exec) => Some((e.meta(), exec)),
-            _ => None,
-        })
-        .filter_map(|(meta, exec)| {
-            // The nearest request in time. On a tie in distance, the one before the shell:
-            // a request answered after the shell started cannot have started it. Then the
-            // one read last: the agent stamps a request with the moment it read the line,
-            // so a burst read in one poll shares a timestamp, and arrival order (the log's
-            // order) is the only tie-break left, the request just before the shell being
-            // the one that matters.
-            let request = requests.iter().rev().min_by_key(|r| {
-                let ts = r.meta.timestamp_ns;
-                (ts.abs_diff(meta.timestamp_ns), ts > meta.timestamp_ns)
-            })?;
-            let delta_s = request.meta.timestamp_ns.abs_diff(meta.timestamp_ns) / 1_000_000_000;
-            let client = request
-                .client
-                .map_or_else(|| "unknown".to_owned(), |c| c.to_string());
-            let param = request
-                .evidence
-                .as_ref()
-                .map_or_else(String::new, |ev| format!(" param={}", ev.param));
-            Some(WebShellCase {
-                pid: meta.pid,
-                generation: meta.process_generation,
-                timestamp_ns: meta.timestamp_ns,
-                alert: CorrelationAlert {
-                    technique: "T1505.003",
-                    severity: Severity::High,
-                    message: format!(
-                        "pid={} comm={} parent={}: shell spawned by a web server {delta_s}s \
-                         from a {:?} request ({} {}{param}, status {}, client {client}) — \
-                         suspected web shell or exploited web application",
-                        meta.pid,
-                        meta.comm,
-                        exec.parent_comm.as_deref().unwrap_or("?"),
-                        request.signature,
-                        request.method.as_deref().unwrap_or("?"),
-                        request.path,
-                        request.status,
-                    ),
-                },
-            })
-        })
-        .collect()
+/// Whether a line read from the access log falls after the shell and within the
+/// bounded late-completion retention.
+pub(crate) fn web_request_is_after_shell(
+    shell_meta: &EventMeta,
+    request: &HttpRequestEvent,
+) -> bool {
+    request.meta.timestamp_ns >= shell_meta.timestamp_ns
+        && request.meta.timestamp_ns - shell_meta.timestamp_ns <= WEB_SHELL_LATE_REQUEST_NS
+}
+
+/// Stable ordering for requests observed at the same instant; no arrival-order dependence.
+pub(crate) fn web_request_key(
+    request: &HttpRequestEvent,
+) -> (u64, &str, u16, &str, String, String) {
+    (
+        request.meta.timestamp_ns,
+        request.path.as_str(),
+        request.status,
+        request.method.as_deref().unwrap_or(""),
+        format!("{:?}", request.signature),
+        request
+            .client
+            .map_or_else(|| "unknown".to_owned(), |c| c.to_string()),
+    )
 }

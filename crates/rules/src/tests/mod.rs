@@ -5,7 +5,7 @@
 
 use schema::{
     ConnectEvent, ContainerContext, EventMeta, ExecEvent, FileOpenEvent, ListenPortEvent,
-    NetworkFlowEvent, User,
+    NetworkFlowEvent, PolicyDenialEvent, User,
 };
 
 use crate::{
@@ -16,10 +16,12 @@ use crate::{
     check_service_unusual_outbound, check_systemd_service_persistence,
     exclusions::{
         AUTH_FAILURE_THRESHOLD, BEACON_THRESHOLD, BURST_WRITE_BYTES_THRESHOLD,
-        MEMFD_EXEC_WINDOW_NS, RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS,
-        SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS, SELF_SPAWN_THRESHOLD,
-        SELF_SPAWN_TRUSTED_THRESHOLD, TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
+        MEMFD_EXEC_WINDOW_NS, POLICY_DENIAL_ALERT_CAP, RANSOMWARE_RENAME_THRESHOLD,
+        RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
+        SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD, TOUCHED_FILES_PER_PID,
+        TOUCHED_FILES_PID_CAP,
     },
+    state::COUNTER_CAP,
 };
 
 const O_RDONLY: u32 = 0;
@@ -284,6 +286,24 @@ fn listen_port_event_full(
         meta,
         local_addr: std::net::IpAddr::V4(local_addr_v4.into()),
         local_port,
+    }
+}
+
+fn policy_denial_event_full(
+    mechanism: &str,
+    subject_context: Option<&str>,
+    object_context: Option<&str>,
+    object_class: Option<&str>,
+    enforced: bool,
+) -> PolicyDenialEvent {
+    PolicyDenialEvent {
+        meta: meta(),
+        mechanism: mechanism.to_string(),
+        subject_context: subject_context.map(str::to_string),
+        object_context: object_context.map(str::to_string),
+        object_class: object_class.map(str::to_string),
+        enforced,
+        ..schema::fixtures::policy_denial()
     }
 }
 
