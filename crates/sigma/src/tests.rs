@@ -619,17 +619,65 @@ fn empty_all_value_list_is_refused() {
 
 proptest::proptest! {
     #[test]
-    fn all_equals_conjunction_of_single_value_rules(values in proptest::collection::vec("[a-z]{1,8}", 1..8)) {
-        let joined = values.join(" ");
+    fn all_equals_conjunction_of_single_value_rules(
+        values in proptest::collection::vec("[a-z]{1,8}", 1..8),
+        present in proptest::collection::vec(proptest::bool::ANY, 8),
+    ) {
+        // Only the values flagged `present` are in the haystack: with every value in it the
+        // property holds trivially, so a missing value is what reaches the false branch.
+        let haystack = values
+            .iter()
+            .zip(&present)
+            .filter(|(_, keep)| **keep)
+            .map(|(value, _)| value.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
         let yaml_values = format!("[{}]", values.iter()
             .map(|value| format!("'{value}'"))
             .collect::<Vec<_>>().join(", "));
         let all_rule = field_rule("CommandLine|contains|all", &yaml_values);
         let conjunction = values.iter().all(|value| {
             let single = field_rule("CommandLine|contains", &format!("'{value}'"));
-            eval_rule_exec(&single, &exec("x.exe", &joined)).is_some()
+            eval_rule_exec(&single, &exec("x.exe", &haystack)).is_some()
         });
-        proptest::prop_assert_eq!(eval_rule_exec(&all_rule, &exec("x.exe", &joined)).is_some(), conjunction);
+        proptest::prop_assert_eq!(
+            eval_rule_exec(&all_rule, &exec("x.exe", &haystack)).is_some(),
+            conjunction
+        );
+    }
+}
+
+#[test]
+fn all_is_false_when_one_value_is_absent_and_true_when_every_value_is_present() {
+    // The cases the property above samples, pinned: it cannot pass if `|all` behaves as `any`.
+    let rule = field_rule("CommandLine|contains|all", "['alpha', 'beta', 'gamma']");
+    assert!(eval_rule_exec(&rule, &exec("x.exe", "alpha beta gamma")).is_some());
+    assert!(eval_rule_exec(&rule, &exec("x.exe", "alpha beta")).is_none());
+    assert!(eval_rule_exec(&rule, &exec("x.exe", "gamma")).is_none());
+    assert!(eval_rule_exec(&rule, &exec("x.exe", "")).is_none());
+}
+
+#[test]
+fn the_validator_and_the_evaluator_agree_on_modifier_shapes() {
+    for (spec, accepted) in [
+        ("CommandLine", true),
+        ("CommandLine|contains", true),
+        ("CommandLine|contains|all", true),
+        ("CommandLine|CONTAINS|ALL", true),
+        ("CommandLine|all", false),
+        ("CommandLine|contains|startswith", false),
+        ("CommandLine|contains|all|startswith", false),
+        ("CommandLine|contains|startswith|all", false),
+        ("CommandLine|contains|all|all", false),
+    ] {
+        let yaml = format!(
+            "title: Shape\ndetection:\n  selection:\n    {spec}: [a, b]\n  condition: selection\n"
+        );
+        let rule: SigmaRule = parse_rule_yaml(&yaml).unwrap();
+        let validated = validate(&rule, "<test>/linux/test.yml").is_ok();
+        let evaluated = crate::eval::parse_modifiers(spec.split('|').skip(1)).is_some();
+        assert_eq!(validated, accepted, "validator: {spec}");
+        assert_eq!(evaluated, accepted, "evaluator: {spec}");
     }
 }
 
