@@ -115,6 +115,11 @@ enum Command {
         /// been killed without acting. See `policy::ResponsePolicy`.
         #[arg(long)]
         enable_kill: bool,
+        /// Prints each alert's whole message on stderr, command line included
+        /// (#319). Off by default: stderr gets the technique, pid and comm, and the
+        /// full message goes to the alerts file and `cli detections` either way.
+        #[arg(long)]
+        alert_details: bool,
         /// Enables automated quarantine of a payload a scan confirms malicious
         /// (issue #25). Off by default: observe-only. See `policy::ResponsePolicy`.
         #[arg(long)]
@@ -378,6 +383,7 @@ fn try_main() -> anyhow::Result<std::process::ExitCode> {
             alerts,
             events,
             enable_kill,
+            alert_details,
             enable_quarantine,
             enable_tls_capture,
             enable_readline_capture,
@@ -397,6 +403,7 @@ fn try_main() -> anyhow::Result<std::process::ExitCode> {
                 alerts: &alerts,
                 events: events.as_deref(),
                 storage: &cfg.storage,
+                alert_details,
                 enable_kill,
                 enable_quarantine,
                 enable_tls_capture,

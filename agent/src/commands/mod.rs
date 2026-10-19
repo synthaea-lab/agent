@@ -34,6 +34,9 @@ pub(crate) struct RunOptions<'a> {
     // cap (`spool_max_mb`, #604) travels with it. Every platform reads it for the
     // spool; only Linux also reads `state_dir` for the integrity monitor.
     pub(crate) storage: &'a config::StorageConfig,
+    /// `run --alert-details` (#319): the whole alert message on stderr, not just
+    /// its summary. Every platform reads it.
+    pub(crate) alert_details: bool,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) enable_kill: bool,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

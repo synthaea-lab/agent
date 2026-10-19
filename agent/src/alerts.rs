@@ -9,7 +9,13 @@
 //! [`AlertLog::record`] makes it impossible for an alert to reach the log file
 //! but miss the CLI view (or the reverse).
 
-use std::{collections::VecDeque, sync::Mutex};
+use std::{
+    collections::VecDeque,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use sinks::{AlertRecord, JsonlWriter};
 
@@ -75,6 +81,8 @@ impl RecentAlerts {
 pub(crate) struct AlertLog {
     file: JsonlWriter,
     recent: RecentAlerts,
+    /// Whether the stderr line carries the whole message (`run --alert-details`, #319).
+    stderr_details: AtomicBool,
 }
 
 impl AlertLog {
@@ -82,16 +90,26 @@ impl AlertLog {
         Ok(Self {
             file: JsonlWriter::open(path)?,
             recent: RecentAlerts::new(recent_capacity),
+            stderr_details: AtomicBool::new(false),
         })
+    }
+
+    /// Prints the whole message on stderr from now on, not just its summary
+    /// (`run --alert-details`). The file and the recent buffer always get it.
+    pub(crate) fn set_stderr_details(&self, details: bool) {
+        self.stderr_details.store(details, Ordering::Relaxed);
     }
 
     /// Records one alert everywhere it must appear. Highlighted on stderr
     /// (stdout carries nothing in run mode) so an alert is not lost in
-    /// terminal noise.
+    /// terminal noise. `alerts.ndjson` and `cli detections` get the full
+    /// message; stderr gets [`stderr_alert_line`], which by default leaves out
+    /// the message body (#319: a rule message embeds the command line).
     pub(crate) fn record(&self, technique: &str, message: String) {
+        let details = self.stderr_details.load(Ordering::Relaxed);
         eprintln!(
             "\x1b[1;31m{}\x1b[0m",
-            format_alert_line(technique, &message)
+            stderr_alert_line(technique, &message, details)
         );
         let emitted_at_ns = schema::time::now_ns();
         self.file.write(&AlertRecord {
@@ -113,6 +131,42 @@ impl AlertLog {
 
 pub(crate) fn format_alert_line(technique: &str, message: &str) -> String {
     format!("[ALERT] {technique} — {message}")
+}
+
+/// The stderr form of an alert. With `details`, the whole message, as in the
+/// file. Without (the default), the technique and, when the message starts the
+/// way rule messages do (`pid=<n> comm=<name>: …`), that pid and comm: an event's
+/// payload never reaches the terminal at default verbosity (CLAUDE.md, #319),
+/// and the message body is where rules put the command line.
+pub(crate) fn stderr_alert_line(technique: &str, message: &str, details: bool) -> String {
+    if details {
+        return format_alert_line(technique, message);
+    }
+    match process_identity(message) {
+        Some(identity) => format!("[ALERT] {technique} — {identity} (details in alerts.ndjson)"),
+        None => format!("[ALERT] {technique} (details in alerts.ndjson)"),
+    }
+}
+
+/// `pid=<n> comm=<name>` from the head of a rule message, or `None` when the
+/// message does not start that way. `comm` is what the process named itself, so
+/// it ends at the first `": "` (a `comm` containing one is cut there, which shows
+/// less, never more) and control characters are replaced, so a crafted name
+/// cannot drive the terminal.
+fn process_identity(message: &str) -> Option<String> {
+    let rest = message.strip_prefix("pid=")?;
+    let digits = rest.find(|c: char| !c.is_ascii_digit())?;
+    if digits == 0 {
+        return None;
+    }
+    let (pid, rest) = rest.split_at(digits);
+    let rest = rest.strip_prefix(" comm=")?;
+    let comm = &rest[..rest.find(": ")?];
+    let comm: String = comm
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    Some(format!("pid={pid} comm={comm}"))
 }
 
 #[cfg(test)]
@@ -178,5 +232,91 @@ mod tests {
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert!(on_disk.contains("T1543.003"));
         assert!(on_disk.contains("service installed"));
+    }
+
+    /// A real rule message, so the summary is pinned to the format rules
+    /// actually produce, not to a hand-written copy of it.
+    fn base64_alert_message() -> String {
+        let mut exec = schema::fixtures::exec();
+        exec.meta.pid = 4242;
+        exec.meta.comm = "bash".into();
+        exec.cmdline = "base64 -d payload.b64 --token=S3cret".into();
+        let alerts = rules::evaluate_exec(&exec);
+        let alert = alerts
+            .iter()
+            .find(|a| a.technique == "T1059.004")
+            .expect("the base64 rule fires on this command line");
+        alert.message.clone()
+    }
+
+    #[test]
+    fn the_default_stderr_line_names_the_process_but_not_the_command_line() {
+        let message = base64_alert_message();
+        let line = stderr_alert_line("T1059.004", &message, false);
+        assert_eq!(
+            line,
+            "[ALERT] T1059.004 — pid=4242 comm=bash (details in alerts.ndjson)"
+        );
+    }
+
+    #[test]
+    fn alert_details_prints_the_whole_message() {
+        let message = base64_alert_message();
+        assert_eq!(
+            stderr_alert_line("T1059.004", &message, true),
+            format_alert_line("T1059.004", &message)
+        );
+        assert!(stderr_alert_line("T1059.004", &message, true).contains("base64 -d"));
+    }
+
+    #[test]
+    fn a_message_without_a_process_prefix_prints_the_technique_only() {
+        for message in [
+            "service installed",
+            "pid= comm=x: no digits",
+            "pid=12comm=x: no space",
+            "pid=12 comm=no-separator",
+            "",
+        ] {
+            assert_eq!(
+                stderr_alert_line("T1543.003", message, false),
+                "[ALERT] T1543.003 (details in alerts.ndjson)",
+                "{message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_crafted_comm_cannot_drive_the_terminal_or_smuggle_text() {
+        let line = stderr_alert_line("T1059", "pid=7 comm=a\x1b[2Jb: curl -u a:S3cret h", false);
+        assert_eq!(
+            line,
+            "[ALERT] T1059 — pid=7 comm=a?[2Jb (details in alerts.ndjson)"
+        );
+        // A comm that itself contains ": " is cut at the first one: less shown, never more.
+        let line = stderr_alert_line("T1059", "pid=7 comm=x: y: curl -u a:S3cret h", false);
+        assert_eq!(
+            line,
+            "[ALERT] T1059 — pid=7 comm=x (details in alerts.ndjson)"
+        );
+    }
+
+    #[test]
+    fn the_file_keeps_the_whole_message_whatever_the_stderr_setting() {
+        let dir =
+            std::env::temp_dir().join(format!("synthaea-alerts-details-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("alerts.ndjson");
+        let _ = std::fs::remove_file(&path);
+        let log = AlertLog::open(&path, 8).unwrap();
+        let message = base64_alert_message();
+        log.record("T1059.004", message.clone());
+        log.set_stderr_details(true);
+        log.record("T1059.004", message.clone());
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk.matches("base64 -d payload.b64").count(), 2);
+        assert!(log.latest(8).iter().all(|alert| alert.message == message));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
