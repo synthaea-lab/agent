@@ -85,3 +85,61 @@ jobs:
               "$image" \
               /package/var/lib/synthaea/bootstrap/agent --help
           done
+
+      # `agent --help` above proves the binaries run, not that the package installs: the
+      # maintainer scripts, the first start and the dpkg metadata were only ever checked
+      # by hand (#675). Two cases, because postinst takes a different path in each.
+      - name: Install the package on a host with no systemd (containers)
+        run: |
+          deb="$(ls "$GITHUB_WORKSPACE"/target/debian/*.deb)"
+          for image in ubuntu:22.04 debian:12; do
+            echo "Installing the package in $image (no systemd)"
+            for i in 1 2 3 4 5; do
+              docker pull "$image" && break
+              echo "::warning::docker pull $image failed (attempt $i/5)"
+              [ "$i" -lt 5 ] && sleep $((i * 10))
+            done
+            docker run --rm -v "$deb:/pkg/synthaea-agent.deb:ro" "$image" sh -euc '
+              dpkg -i /pkg/synthaea-agent.deb 2>&1 | tee /tmp/dpkg.log
+              # Unpacked and configured, with the explanation postinst prints instead of failing.
+              dpkg -s synthaea-agent | grep -q "^Status: install ok installed"
+              grep -q "no systemd detected" /tmp/dpkg.log
+              if grep -qi "warning" /tmp/dpkg.log; then
+                echo "dpkg warned:"; grep -i "warning" /tmp/dpkg.log; exit 1
+              fi
+              test -x /var/lib/synthaea/bootstrap/agent
+              test -f /etc/synthaea/agent.toml
+            '
+          done
+
+      - name: Install the package on a systemd host and check the first start
+        run: |
+          deb="$(ls "$GITHUB_WORKSPACE"/target/debian/*.deb)"
+          # The Maintainer field is what `dpkg` warned about when it was missing.
+          [ -n "$(dpkg-deb -f "$deb" Maintainer)" ]
+          sudo dpkg -i "$deb" 2>&1 | tee "$RUNNER_TEMP/dpkg.log"
+          if grep -qi "warning" "$RUNNER_TEMP/dpkg.log"; then
+            echo "dpkg warned:"; grep -i "warning" "$RUNNER_TEMP/dpkg.log"; exit 1
+          fi
+          # What postinst sets up, which the unit needs before it can start.
+          test -d /run/synthaea
+          test -L /usr/bin/synthaea-ctl
+          test "$(stat -c %U /var/lib/synthaea)" = synthaea
+          test -f /etc/synthaea/agent.toml
+          # The first start: not the 226/NAMESPACE loop of #675. `active` for a few seconds in
+          # a row, not just once, so a crash loop that is momentarily "activating" is caught.
+          sleep 5
+          ok=0
+          for i in $(seq 1 10); do
+            if systemctl is-active --quiet synthaea-agent; then ok=$((ok + 1)); else ok=0; fi
+            [ "$ok" -ge 5 ] && break
+            sleep 2
+          done
+          if [ "$ok" -lt 5 ]; then
+            systemctl status synthaea-agent --no-pager || true
+            sudo journalctl -u synthaea-agent --no-pager -n 80 || true
+            exit 1
+          fi
+          if sudo journalctl -u synthaea-agent --no-pager | grep -q "226/NAMESPACE"; then
+            echo "the unit hit the mount-namespace failure of #675"; exit 1
+          fi
