@@ -1568,6 +1568,7 @@ mod tests {
             "mysql -sLuadmin:S3cret",
             "sqlcmd -Sserver",
             "bcp -Sserver",
+            "net user bob /active:no",
             "sudo -u alice ls",
             "foo --password --verbose S3cret",
         ] {
