@@ -240,13 +240,6 @@ fn record_detection(
     let now_ns = event.meta().timestamp_ns;
     // Rules and Sigma have already evaluated the raw event/message. Redact only
     // the copy that enters the verdict, alert log, and durable detection spool.
-    let image = std::iter::once(event)
-        .chain(evidence.iter())
-        .find_map(|event| match event {
-            Event::Exec(exec) => Some(exec.image_path.as_str()),
-            _ => None,
-        })
-        .unwrap_or(event.meta().comm.as_str());
     let safe_message = if let Some(Event::Exec(exec)) = std::iter::once(event)
         .chain(evidence.iter())
         .find(|e| matches!(e, Event::Exec(_)))
@@ -256,9 +249,9 @@ fn record_detection(
         let Event::Exec(safe_exec) = safe_exec else {
             unreachable!()
         };
-        redact_detection_message(image, &exec.cmdline, &safe_exec.cmdline, finding.message)
+        redact_detection_message(&exec.cmdline, &safe_exec.cmdline, finding.message)
     } else {
-        crate::redact::redact_command_line(image, finding.message).into_owned()
+        finding.message.to_owned()
     };
     let mut safe_events: Vec<Event> = std::iter::once(event.clone()).chain(evidence).collect();
     for event in &mut safe_events {
@@ -291,18 +284,12 @@ fn record_detection(
     result
 }
 
-fn redact_detection_message(
-    image: &str,
-    raw_cmdline: &str,
-    safe_cmdline: &str,
-    message: &str,
-) -> String {
-    let message = if raw_cmdline.is_empty() {
+fn redact_detection_message(raw_cmdline: &str, safe_cmdline: &str, message: &str) -> String {
+    if raw_cmdline.is_empty() {
         message.to_owned()
     } else {
         message.replace(raw_cmdline, safe_cmdline)
-    };
-    crate::redact::redact_command_line(image, &message).into_owned()
+    }
 }
 
 /// One engine's finding, as [`record_detection`] takes it.
@@ -2129,7 +2116,7 @@ mod tests {
             let mut exec = schema::fixtures::exec();
             exec.meta.pid = pid;
             exec.meta.comm = comm.into();
-            exec.image_path = "/usr/bin/base64".into();
+            exec.image_path = "/usr/bin/curl".into();
             exec.cmdline = "curl -u a:S3cret h; base64 -d --password=S3cret".into();
             exec.argv = Vec::new();
             sink.on_event(Event::Exec(exec));
@@ -2188,7 +2175,7 @@ mod tests {
     #[test]
     fn redacted_detection_message_keeps_messages_with_an_empty_command_line_intact() {
         assert_eq!(
-            super::redact_detection_message("curl", "", "", "process comm=it's"),
+            super::redact_detection_message("", "", "process comm=it's"),
             "process comm=it's"
         );
     }

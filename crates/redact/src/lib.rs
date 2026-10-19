@@ -750,9 +750,6 @@ fn credential_option(tool: &str, token: &str) -> Option<Option<(usize, usize)>> 
     if tool == "curl" && lower.starts_with("--proxy-user=") {
         return Some(Some((base + 13, end)));
     }
-    if tool == "curl" && (lower == "-d" || lower.starts_with("--data")) {
-        return Some(None);
-    }
     if tool == "zip" && value == "-p" {
         return None;
     }
@@ -802,12 +799,6 @@ fn credential_option(tool: &str, token: &str) -> Option<Option<(usize, usize)>> 
     if tool == "zip" && value.starts_with("-P") && value.len() > 2 {
         return Some(Some((base + 2, end)));
     }
-    if tool == "docker-login" && lower.starts_with("--password=") {
-        return Some(Some((base + 11, end)));
-    }
-    if tool == "docker-login" && lower == "--password" {
-        return Some(None);
-    }
     if tool == "docker-login" && value.starts_with("-p") && value.len() > 2 {
         return Some(Some((base + 2, end)));
     }
@@ -834,7 +825,7 @@ fn credential_option(tool: &str, token: &str) -> Option<Option<(usize, usize)>> 
             && !v.is_empty()
             && v.contains(':')
         {
-            let offset = token.len() - value.len() + 2;
+            let offset = base + 2;
             return Some(Some((offset, end)));
         }
         if tool == "curl" && value.starts_with('-') && !value.starts_with("--") {
@@ -1564,11 +1555,19 @@ mod tests {
             "mysql -P 3306",
             "mysql -p",
             "zip -p",
+            "ssh -p2222 host",
+            "ssh -w0:0 host",
+            "curl -aS3cret h",
+            "curl -pass value h",
             "docker run -p 8080:80 img",
             "redis-cli -h host",
             "openssl -in f -out g",
             "curl -d name=bob h",
             "curl --data name=bob h",
+            "ssh -PS3cret host",
+            "mysql -sLuadmin:S3cret",
+            "sqlcmd -Sserver",
+            "bcp -Sserver",
             "sudo -u alice ls",
             "foo --password --verbose S3cret",
         ] {
@@ -1587,6 +1586,10 @@ mod tests {
         assert_eq!(
             redact_command_line("net", "net use \\\\h\\c$ /persistent:yes /user:a S3cret"),
             "net use \\\\h\\c$ /persistent:yes /user:a REDACTED"
+        );
+        assert_eq!(
+            redact_command_line("net", "net use \\\\h\\c$ S3cret extra"),
+            "net use \\\\h\\c$ REDACTED extra"
         );
         assert_eq!(
             redact_command_line("openssl", "openssl enc -pass pass:S3cret"),
@@ -1611,6 +1614,21 @@ mod tests {
             ),
             ("curl", "curl -U a:S3cret h", "curl -U REDACTED h"),
             (
+                "wget",
+                "wget --http-password=S3cret h",
+                "wget --http-password=REDACTED h",
+            ),
+            (
+                "wget",
+                "wget --ftp-password=S3cret h",
+                "wget --ftp-password=REDACTED h",
+            ),
+            (
+                "wget",
+                "wget --password=S3cret h",
+                "wget --password=REDACTED h",
+            ),
+            (
                 "curl",
                 "curl --data='username=bob&password=S3cret' h",
                 "curl --data='username=bob&password=REDACTED' h",
@@ -1621,8 +1639,20 @@ mod tests {
                 "curl -dpassword=REDACTED h",
             ),
             ("curl", "curl -sLuadmin:S3cret h", "curl -sLuREDACTED h"),
+            ("curl", "curl -Luadmin:S3cret h", "curl -LuREDACTED h"),
+            ("curl", "curl -suadmin:S3cret h", "curl -suREDACTED h"),
+            ("curl", "curl -uadmin:S3cret h", "curl -uREDACTED h"),
+            ("curl", "curl '-uadmin:S3cret' h", "curl '-uREDACTED' h"),
             ("curl", "curl -sLu admin:S3cret h", "curl -sLu REDACTED h"),
             ("mysql", "mysql -pS3cret", "mysql -pREDACTED"),
+            (
+                "zip",
+                "zip -PS3cret archive file",
+                "zip -PREDACTED archive file",
+            ),
+            ("redis-cli", "redis-cli -aS3cret", "redis-cli -aREDACTED"),
+            ("sqlcmd", "sqlcmd -PS3cret", "sqlcmd -PREDACTED"),
+            ("bcp", "bcp -PS3cret", "bcp -PREDACTED"),
             ("mysqladmin", "mysqladmin -pS3cret", "mysqladmin -pREDACTED"),
             (
                 "mysqlimport",
