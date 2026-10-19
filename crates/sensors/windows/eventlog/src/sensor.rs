@@ -2561,8 +2561,9 @@ mod session_tests {
 #[cfg(test)]
 mod subscribe_tests {
     use std::{
+        cell::RefCell,
         io,
-        sync::{Arc, Mutex, atomic::AtomicBool},
+        sync::{Arc, Once, atomic::AtomicBool},
     };
 
     use super::*;
@@ -2573,13 +2574,21 @@ mod subscribe_tests {
         fn on_event(&self, _event: Event) {}
     }
 
-    /// `tracing` output captured in memory, for asserting on log lines.
-    #[derive(Clone, Default)]
-    struct Captured(Arc<Mutex<Vec<u8>>>);
+    std::thread_local! {
+        static CAPTURED_LOGS: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    }
 
-    impl io::Write for Captured {
+    /// Writes into the calling thread's [`captured_logs`] buffer, or nowhere when
+    /// that thread is not capturing.
+    struct ThreadCapture;
+
+    impl io::Write for ThreadCapture {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            CAPTURED_LOGS.with_borrow_mut(|captured| {
+                if let Some(captured) = captured {
+                    captured.extend_from_slice(buf);
+                }
+            });
             Ok(buf.len())
         }
 
@@ -2588,16 +2597,38 @@ mod subscribe_tests {
         }
     }
 
+    /// Runs `f` and returns what it logged through `tracing` on the calling thread.
+    ///
+    /// One process-wide subscriber, installed once, that routes each thread's output
+    /// to that thread's own buffer — not `tracing::subscriber::with_default` (the
+    /// `rules` tests' #876/#885 flake): while a scoped subscriber is the only live
+    /// dispatcher, `tracing-core` (0.1.36) computes a callsite's cached interest from
+    /// the default of whichever thread registers it, so a parallel test reaching the
+    /// same log line first, with no subscriber of its own, caches it as "never" for
+    /// the whole process and the capturing test reads nothing. A global default is
+    /// every thread's default, so no registration order can disable a callsite.
+    fn captured_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(|| ThreadCapture)
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other test in this binary sets a global subscriber");
+        });
+        CAPTURED_LOGS.with_borrow_mut(|captured| *captured = Some(Vec::new()));
+        let result = f();
+        let captured = CAPTURED_LOGS
+            .with_borrow_mut(Option::take)
+            .unwrap_or_default();
+        (result, String::from_utf8_lossy(&captured).into_owned())
+    }
+
     /// Subscribes to `target` with `tracing` captured; returns whether the
     /// subscription registered and every line logged meanwhile.
     fn subscribe_capturing_logs(target: &'static PollTarget) -> (bool, String) {
-        let captured = Captured::default();
-        let writer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
-        let handle = tracing::subscriber::with_default(subscriber, || {
+        let (handle, logs) = captured_logs(|| {
             crate::subscribe::subscribe(
                 target,
                 Arc::new(NullSink),
@@ -2605,8 +2636,26 @@ mod subscribe_tests {
                 Arc::new(AtomicBool::new(false)),
             )
         });
-        let logs = String::from_utf8_lossy(&captured.0.lock().expect("capture lock")).into_owned();
         (handle.is_some(), logs)
+    }
+
+    #[test]
+    fn captured_logs_sees_a_callsite_another_thread_registered_first() {
+        // The #876/#885 race made deterministic: under `with_default`, the spawned
+        // thread (no subscriber of its own) registers the callsite as "never" and the
+        // capturing thread's own call is then filtered out before dispatch.
+        fn probe() {
+            tracing::warn!("captured-logs probe");
+        }
+        let ((), logs) = captured_logs(|| {
+            std::thread::spawn(probe).join().expect("probe thread");
+            probe();
+        });
+        assert_eq!(
+            logs.matches("captured-logs probe").count(),
+            1,
+            "exactly this thread's line, not zero and not the other thread's too: {logs}"
+        );
     }
 
     fn target_on(channel: &'static str) -> PollTarget {

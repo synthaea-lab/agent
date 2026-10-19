@@ -1370,33 +1370,7 @@ fn policy_denial_cache_eviction_is_logged() {
     // `known_policy_denials` silently clearing at COUNTER_CAP must not be silent to an
     // operator (#812, CLAUDE.md: counted, observable shedding) — logged once per rise,
     // the same idiom as `agent::ransomware_join::report_evictions`.
-    use std::{
-        io,
-        sync::{Arc, Mutex},
-    };
-
-    #[derive(Clone, Default)]
-    struct Captured(Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for Captured {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().expect("capture lock").extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let captured = Captured::default();
-    let writer = captured.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .finish();
-
-    tracing::subscriber::with_default(subscriber, || {
+    let logs = captured_logs(|| {
         let mut state = RuleState::new();
         let t0 = meta().timestamp_ns;
         for i in 0..=COUNTER_CAP {
@@ -1421,7 +1395,6 @@ fn policy_denial_cache_eviction_is_logged() {
         }
     });
 
-    let logs = String::from_utf8_lossy(&captured.0.lock().expect("capture lock")).into_owned();
     // Exactly one rise happens: COUNTER_CAP + 1 inserts crosses the cap exactly once,
     // evicting one batch (COUNTER_CAP / 8). A bare substring check (review of #823)
     // cannot tell "logged once, correctly" from two real bugs that both still contain
@@ -1449,33 +1422,7 @@ fn policy_denial_alert_cap_reached_is_logged_exactly_once() {
     // one notice that the cap was hit (review of #823: `== 0` flipped to `!= 0`, or
     // the counter's own `+= 1` flipped to `*= 1`, both leave the existing tests
     // green because nothing before this asserted on this message's own line count).
-    use std::{
-        io,
-        sync::{Arc, Mutex},
-    };
-
-    #[derive(Clone, Default)]
-    struct Captured(Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for Captured {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().expect("capture lock").extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let captured = Captured::default();
-    let writer = captured.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .finish();
-
-    tracing::subscriber::with_default(subscriber, || {
+    let logs = captured_logs(|| {
         let mut state = RuleState::new();
         // Well past POLICY_DENIAL_ALERT_CAP (2048): enough further shapes that a
         // once-per-shed bug would produce many lines, not just a second one.
@@ -1491,7 +1438,6 @@ fn policy_denial_alert_cap_reached_is_logged_exactly_once() {
         }
     });
 
-    let logs = String::from_utf8_lossy(&captured.0.lock().expect("capture lock")).into_owned();
     let cap_lines = logs.matches("alert cap reached").count();
     assert_eq!(
         cap_lines, 1,
