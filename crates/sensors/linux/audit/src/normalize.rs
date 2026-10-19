@@ -104,6 +104,7 @@ pub fn policy_denial_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
         scontext,
         tcontext,
         tclass,
+        action,
         permissive,
         object_path,
     } = evt
@@ -126,7 +127,7 @@ pub fn policy_denial_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
         subject_context: scontext.clone(),
         object_context: tcontext.clone(),
         object_class: tclass.clone(),
-        action: None, // Not yet parsed — see PolicyDenialEvent's doc
+        action: action.clone(),
         enforced: !permissive,
         object_path: object_path.clone(),
     })
@@ -193,6 +194,7 @@ mod tests {
             scontext: Some("system_u:system_r:httpd_t:s0".to_string()),
             tcontext: Some("system_u:object_r:user_home_t:s0".to_string()),
             tclass: Some("file".to_string()),
+            action: Some("read".to_string()),
             permissive: false,
             object_path: Some("/home/alice/.ssh/id_rsa".to_string()),
         };
@@ -212,7 +214,7 @@ mod tests {
                     Some("system_u:object_r:user_home_t:s0")
                 );
                 assert_eq!(e.object_class.as_deref(), Some("file"));
-                assert_eq!(e.action, None);
+                assert_eq!(e.action.as_deref(), Some("read"));
                 assert!(e.enforced);
                 assert_eq!(e.object_path.as_deref(), Some("/home/alice/.ssh/id_rsa"));
             }
@@ -227,6 +229,7 @@ mod tests {
             scontext: Some("unconfined_u:unconfined_r:unconfined_t:s0".to_string()),
             tcontext: None,
             tclass: Some("process".to_string()),
+            action: None,
             permissive: true,
             object_path: None,
         };

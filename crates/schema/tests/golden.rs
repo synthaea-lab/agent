@@ -1562,8 +1562,10 @@ fn package_change_upgraded_golden() {
 fn policy_denial_golden() {
     // v23 (#297): a SELinux AVC denial — httpd blocked (enforcing mode) from
     // reading a file labeled for a user's home directory, the classic
-    // web-shell-reading-secrets shape. `action` is absent: the AVC parser
-    // doesn't yet recover the requested permission set, see the type's doc.
+    // web-shell-reading-secrets shape. `action` is absent: this fixture
+    // predates #813, which taught the AVC parser to recover the requested
+    // permission set — see the type's doc. Frozen as-is; a v23 fixture must
+    // keep producing what v23 actually produced.
     // v30 (#427): `object_path` from the AVC record's `path=`/`name=`.
     assert_golden(
         &Event::PolicyDenial(PolicyDenialEvent {
@@ -1586,6 +1588,36 @@ fn policy_denial_golden() {
             object_path: Some("/home/alice/.ssh/id_rsa".into()),
         }),
         "policy_denial",
+    );
+}
+
+#[test]
+fn policy_denial_with_action_golden() {
+    // The #813 shape: the AVC parser recovered the requested permission set, which is
+    // carried as written (space-joined, `{ read write }` -> "read write"). The
+    // `policy_denial` fixture above stays action-less, as v23 produced it; this one pins
+    // the field the SELinux denial-drift rule's dedup key now depends on.
+    assert_golden(
+        &Event::PolicyDenial(PolicyDenialEvent {
+            meta: EventMeta {
+                pid: 4242,
+                ppid: 1337,
+                user: User::Unix { uid: 48, gid: 48 },
+                timestamp_ns: 1_756_900_100_000_000_000,
+                comm: "httpd".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            mechanism: POLICY_MECHANISM_SELINUX.into(),
+            subject_context: Some("system_u:system_r:httpd_t:s0".into()),
+            object_context: Some("system_u:object_r:user_home_t:s0".into()),
+            object_class: Some("file".into()),
+            action: Some("read write".into()),
+            enforced: true,
+            object_path: Some("/home/alice/.ssh/id_rsa".into()),
+        }),
+        "policy_denial_with_action",
     );
 }
 

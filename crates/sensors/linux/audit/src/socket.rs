@@ -110,6 +110,17 @@ impl AsRawFd for AuditSocket {
     }
 }
 
+#[cfg(test)]
+impl AuditSocket {
+    /// Wraps an already-open fd (e.g. one end of a `socketpair`) instead of a real
+    /// `NETLINK_AUDIT` socket, so `AvcReader`'s poll/drain loop can be exercised in
+    /// a test without `CAP_AUDIT_READ` (#780 review). `recv`/`poll` work on any
+    /// socket fd, netlink or not — only `open`'s bind is netlink-specific.
+    pub(crate) fn from_raw_fd_for_test(fd: RawFd) -> Self {
+        Self { fd }
+    }
+}
+
 impl Drop for AuditSocket {
     fn drop(&mut self) {
         // SAFETY: fd owned by this struct, closed exactly once on drop.

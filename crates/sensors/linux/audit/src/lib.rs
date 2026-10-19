@@ -12,16 +12,26 @@
 //! execve/connect. Normalized to `schema::Event::PolicyDenial` (#297) — see
 //! [`classify::AuditEvent::PolicyDenial`]'s doc for what the AVC wire shape
 //! does and doesn't carry.
+//!
+//! [`AvcReader`] (#780) is a second, independent subscription to that same
+//! multicast group, filtered to `PolicyDenial` only — for the agent binary to run
+//! alongside eBPF when eBPF is the chosen primary sensor, so AVC denials stay
+//! reachable even though exec/connect come from eBPF instead of `AuditSensor` on
+//! that host. See its module doc for why a second socket doesn't lose records.
 
 mod classify;
 mod normalize;
 mod parse;
 
 #[cfg(target_os = "linux")]
+mod avc;
+#[cfg(target_os = "linux")]
 mod sensor;
 #[cfg(target_os = "linux")]
 mod socket;
 
+#[cfg(target_os = "linux")]
+pub use avc::AvcReader;
 pub use classify::{AuditEvent, classify};
 pub use normalize::{connect_event, exec_event, policy_denial_event};
 pub use parse::{AuditRecord, parse_audit_message};

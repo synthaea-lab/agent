@@ -307,6 +307,28 @@ fn policy_denial_event_full(
     }
 }
 
+/// Like [`policy_denial_event_full`], with an explicit `action` (#813): the other
+/// helper's many callers don't care about it (it defaults to `None` via
+/// `schema::fixtures::policy_denial()`), so it stays a 5-argument helper and this one
+/// is reached for only the few tests that do.
+fn policy_denial_event_with_action(
+    subject_context: Option<&str>,
+    object_context: Option<&str>,
+    object_class: Option<&str>,
+    action: Option<&str>,
+) -> PolicyDenialEvent {
+    PolicyDenialEvent {
+        action: action.map(str::to_string),
+        ..policy_denial_event_full(
+            "selinux",
+            subject_context,
+            object_context,
+            object_class,
+            true,
+        )
+    }
+}
+
 mod coverage;
 mod linux;
 mod motw_removal;
