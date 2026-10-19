@@ -670,9 +670,11 @@ fn the_validator_and_the_evaluator_agree_on_modifier_shapes() {
         ("CommandLine|contains|startswith|all", false),
         ("CommandLine|contains|all|all", false),
     ] {
-        let yaml = format!(
-            "title: Shape\ndetection:\n  selection:\n    {spec}: [a, b]\n  condition: selection\n"
-        );
+        // A complete rule: without `level` and an ATT&CK tag the validator refuses it for its
+        // metadata, whatever the modifiers, and the comparison would test nothing.
+        let yaml = rule_with_detection(&format!(
+            "  selection:\n    {spec}: [a, b]\n  condition: selection\n"
+        ));
         let rule: SigmaRule = parse_rule_yaml(&yaml).unwrap();
         let validated = validate(&rule, "<test>/linux/test.yml").is_ok();
         let evaluated = crate::eval::parse_modifiers(spec.split('|').skip(1)).is_some();
