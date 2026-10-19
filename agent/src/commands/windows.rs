@@ -435,6 +435,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     let health = super::common::health_collector(
         &pipeline,
         Arc::clone(&silence_monitor),
+        Vec::new(),
         Arc::new(crate::host_counters::AgentHostCounters::new(
             Arc::clone(&pipeline.sink),
             crate::host_counters::WatchdogReport::from_env(),
