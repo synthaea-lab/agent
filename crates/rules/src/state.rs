@@ -24,14 +24,14 @@ use crate::{
         COMPRESSOR_COMMS, CREATE_UNLINK_HISTORY_PER_PID, CREATE_UNLINK_PAIR_WINDOW_NS,
         CREATE_UNLINK_PID_CAP, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS, IN_PLACE_EDIT_COMMS,
         LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS, MEMFD_EXEC_WINDOW_NS,
-        PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES, QUARANTINE_EXEC_WINDOW_NS,
-        RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD,
-        RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
-        SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS,
-        SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS,
-        SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN,
-        SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS, TOUCHED_FILES_PER_PID,
-        TOUCHED_FILES_PID_CAP,
+        PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES, POLICY_DENIAL_ALERT_CAP,
+        QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX,
+        RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD,
+        SCAN_SPREAD_WINDOW_NS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
+        SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD,
+        SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STANDARD_PORTS,
+        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
+        TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
     },
     has_write_intent,
     rdp::RdpSuccessAfterFailures,
@@ -109,9 +109,25 @@ impl PidFact {
 }
 
 /// `known_policy_denials`' key: (mechanism, subject context, object context, object
-/// class). Named so clippy's `type_complexity` lint doesn't flag the field
+/// class, action). Named so clippy's `type_complexity` lint doesn't flag the field
 /// declaration.
-type PolicyDenialKey = (String, Option<String>, Option<String>, Option<String>);
+type PolicyDenialKey = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// The permission set of an AVC denial in canonical form for the dedup key: whitespace-separated
+/// permissions, sorted and deduplicated, so `read write`, `write read` and `read  write` are one
+/// shape. The wire value (`PolicyDenialEvent::action`) stays as the kernel wrote it.
+fn normalized_permissions(action: &str) -> String {
+    let mut permissions: Vec<&str> = action.split_whitespace().collect();
+    permissions.sort_unstable();
+    permissions.dedup();
+    permissions.join(" ")
+}
 
 /// Sliding history needed by the correlation rules:
 /// - T1105 (Ingress Tool Transfer): a path recently written by `curl`/`wget` is
@@ -176,6 +192,13 @@ pub struct RuleState {
     /// first run is cold by design. LRU-bounded like every other stateful
     /// rule.
     ///
+    /// Includes the requested permission (`action`, #813, recovered by
+    /// `sensor-linux-audit`'s AVC parser): without it, a routine `getattr` denial on a
+    /// subject/object/class triple would silence a later, more interesting
+    /// `read`/`write`/`open` denial on that exact same triple. The set is normalised in
+    /// the key ([`normalized_permissions`]: sorted, deduplicated), so only a different
+    /// set is a new shape, not a different order.
+    ///
     /// `SELinux` only (`check_policy_denial_drift` gates on
     /// [`POLICY_MECHANISM_SELINUX`]): `scontext`/`tcontext` give each denial a
     /// rich, domain-specific triple. AppLocker/WDAC `PolicyDenialEvent`s carry
@@ -187,6 +210,27 @@ pub struct RuleState {
     /// `object_path`) before it's worth extending; tracked as a follow-up,
     /// not done here.
     known_policy_denials: BoundedMap<PolicyDenialKey, ()>,
+    /// New-shape alerts `check_policy_denial_drift` has raised in the current budget
+    /// window, against [`POLICY_DENIAL_ALERT_CAP`] (#812): `known_policy_denials` bounds
+    /// what the rule remembers, not what it alerts, so a flood of distinct shapes
+    /// (varying the subject/object type faster than a real host ever would) could
+    /// otherwise emit one alert per shape, unbounded. Reset when a new shape arrives
+    /// [`crate::exclusions::POLICY_DENIAL_ALERT_WINDOW_NS`] after `policy_denial_window_start_ns`.
+    policy_denial_alerts: u64,
+    /// Event time (`meta.timestamp_ns`) at which the current alert-budget window began;
+    /// 0 until the first new shape.
+    policy_denial_window_start_ns: u64,
+    /// New-shape events shed by [`POLICY_DENIAL_ALERT_CAP`] over the whole run — counted
+    /// instead of silent (#812). A shed shape is *not* remembered in
+    /// `known_policy_denials`, so it is still new when it comes back: it can alert in a
+    /// later budget window, and every event for it while the budget is spent counts
+    /// again (this counts events, not distinct shapes).
+    policy_denial_alerts_shed: u64,
+    /// `known_policy_denials.evicted()` last reported, so each rise is logged once
+    /// (#812): otherwise `known_policy_denials` evicting its oldest eighth at
+    /// `COUNTER_CAP` (never a full clear — only the evicted entries can re-alert) and a
+    /// shape re-alerting is silent loss (CLAUDE.md: counted, observable shedding).
+    policy_denial_evictions_reported: u64,
     /// (target user, source) → sliding failure counter for T1110 (AUTH-BURST).
     /// LRU-bounded like every other counter: a spray across many fabricated
     /// usernames must not grow this without limit.
@@ -294,7 +338,7 @@ const MEMFD_CREATES_PER_PID: usize = 8;
 /// Same bound as the correlator's entity table: the realistic live-pid space.
 const PID_COMM_CAP: usize = 65_536;
 /// Counter/write-history bounds — one logical entity per key, far fewer than pids.
-const COUNTER_CAP: usize = 16_384;
+pub(crate) const COUNTER_CAP: usize = 16_384;
 const RECENT_WRITES_CAP: usize = 4_096;
 
 impl Default for RuleState {
@@ -319,6 +363,10 @@ impl RuleState {
             scan_spread: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
             known_policy_denials: BoundedMap::new(COUNTER_CAP),
+            policy_denial_alerts: 0,
+            policy_denial_window_start_ns: 0,
+            policy_denial_alerts_shed: 0,
+            policy_denial_evictions_reported: 0,
             auth_failures: BoundedMap::new(COUNTER_CAP),
             rdp_success: RdpSuccessAfterFailures::new(),
             recent_creates: BoundedMap::new(CREATE_UNLINK_PID_CAP),
@@ -997,10 +1045,22 @@ impl RuleState {
     /// only reach the agent through the audit sensor, so silence here does not
     /// mean no denials happened.
     ///
-    /// The requested permission is not part of the key (#813): the audit
-    /// sensor does not parse it yet, so a routine `getattr` denial silences a
-    /// later, more interesting `read`/`write`/`open` on the same subject,
-    /// object and class.
+    /// The requested permission is part of the key (#813, recovered by
+    /// `sensor-linux-audit`'s AVC parser): a routine `getattr` denial no longer
+    /// silences a later, more interesting `read`/`write`/`open` on the same subject,
+    /// object and class. `None` (an AppLocker/WDAC denial, or an AVC variant the
+    /// parser doesn't recognize) is its own value, same as every other field here.
+    ///
+    /// Capped at [`POLICY_DENIAL_ALERT_CAP`] new-shape alerts per
+    /// [`crate::exclusions::POLICY_DENIAL_ALERT_WINDOW_NS`] (#812): a flood of shapes past the cap is counted
+    /// (`policy_denial_alerts_shed`) rather than alerted, and a shed shape is not
+    /// recorded in `known_policy_denials`, so it is still new — it can alert once the
+    /// budget refills in a later window instead of being silenced for the rest of the
+    /// run. The cap bounds alert volume; `known_policy_denials` keeps deduplicating
+    /// the shapes that did alert.
+    ///
+    /// The permission set in the key is normalised ([`normalized_permissions`]): `read
+    /// write` and `write read` are one shape.
     fn check_policy_denial_drift(&mut self, event: &PolicyDenialEvent) -> Option<Alert> {
         if event.mechanism != POLICY_MECHANISM_SELINUX {
             return None;
@@ -1010,25 +1070,65 @@ impl RuleState {
             Self::selinux_type_triple(event.subject_context.as_deref()),
             Self::selinux_type_triple(event.object_context.as_deref()),
             event.object_class.clone(),
+            event.action.as_deref().map(normalized_permissions),
         );
         if self.known_policy_denials.get(&key).is_some() {
             return None;
         }
+        let now = event.meta.timestamp_ns;
+        let window_age = now.saturating_sub(self.policy_denial_window_start_ns);
+        if window_age >= crate::exclusions::POLICY_DENIAL_ALERT_WINDOW_NS {
+            self.policy_denial_window_start_ns = now;
+            self.policy_denial_alerts = 0;
+        }
+        if self.policy_denial_alerts >= POLICY_DENIAL_ALERT_CAP {
+            if self.policy_denial_alerts_shed == 0 {
+                tracing::warn!(
+                    cap = POLICY_DENIAL_ALERT_CAP,
+                    "policy-denial-drift: alert cap reached, further new shapes are counted but not alerted until the budget refills"
+                );
+            }
+            self.policy_denial_alerts_shed += 1;
+            return None;
+        }
         self.known_policy_denials.insert(key, ());
+        self.report_policy_denial_evictions();
+        self.policy_denial_alerts += 1;
         Some(Alert {
             technique: "T1562",
             severity: Severity::Medium,
             message: format!(
-                "comm={} mechanism={} subject={} object={} class={} path={} enforced={} — new denial shape, not seen this run",
+                "comm={} mechanism={} subject={} object={} class={} action={} path={} enforced={} — new denial shape, not seen this run",
                 event.meta.comm,
                 event.mechanism,
                 event.subject_context.as_deref().unwrap_or("-"),
                 event.object_context.as_deref().unwrap_or("-"),
                 event.object_class.as_deref().unwrap_or("-"),
+                event.action.as_deref().unwrap_or("-"),
                 event.object_path.as_deref().unwrap_or("-"),
                 event.enforced,
             ),
         })
+    }
+
+    /// Logs once per rise in `known_policy_denials`'s eviction count (#812): otherwise
+    /// `known_policy_denials` evicting its oldest eighth at `COUNTER_CAP` and a shape
+    /// re-alerting is silent loss (CLAUDE.md: counted, observable shedding), the same
+    /// idiom as `agent::ransomware_join`'s `report_evictions`. Also carries the running
+    /// total of alerts shed by [`POLICY_DENIAL_ALERT_CAP`] (review of #823): this is the
+    /// only periodic signal the alert cap gets — once it is reached, the "alert cap
+    /// reached" warning fires exactly once, never again, so without this an operator
+    /// cannot tell 10 shed shapes from 100,000.
+    fn report_policy_denial_evictions(&mut self) {
+        let evicted = self.known_policy_denials.evicted();
+        if evicted > self.policy_denial_evictions_reported {
+            tracing::warn!(
+                evicted,
+                alerts_shed = self.policy_denial_alerts_shed,
+                "policy-denial-drift: tracked denial shapes shed (oldest first)"
+            );
+            self.policy_denial_evictions_reported = evicted;
+        }
     }
 
     /// The `user:role:type` prefix of a `SELinux` security context

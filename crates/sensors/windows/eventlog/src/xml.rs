@@ -1758,9 +1758,11 @@ mod tests {
 
     /// A user (`SANDBOX\solka`) registering a scheduled task named `\atomic-r`
     /// via `schtasks.exe /Create ...`. Emitted by the Task Scheduler service on
-    /// the always-on `Microsoft-Windows-TaskScheduler/Operational` channel, no
-    /// audit subcategory required — the complement to Security 4698 whose audit
-    /// enablement may fail on a hardened host.
+    /// the `Microsoft-Windows-TaskScheduler/Operational` channel, no audit
+    /// subcategory required — the complement to Security 4698 whose audit
+    /// enablement may fail on a hardened host. The channel is Task Scheduler
+    /// history, off by default on client SKUs: only hosts where an operator
+    /// enabled it produce this event (#786).
     const TASK_SCHEDULER_OP_106_XML: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-TaskScheduler' Guid='{de7b24ea-73c8-4a09-985d-5bdadcfa9017}'/><EventID>106</EventID><Version>0</Version><Level>4</Level><Task>106</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime='2026-09-22T08:21:11.7752210Z'/><EventRecordID>18432</EventRecordID><Correlation/><Execution ProcessID='2124' ThreadID='2892'/><Channel>Microsoft-Windows-TaskScheduler/Operational</Channel><Computer>Sandbox</Computer><Security UserID='S-1-5-21-1663667890-2519037288-962558911-1001'/></System><EventData><Data Name='TaskName'>\atomic-r</Data><Data Name='UserContext'>SANDBOX\solka</Data></EventData></Event>"#;
 
     #[test]

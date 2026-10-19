@@ -1143,6 +1143,95 @@ fn a_different_object_class_on_the_same_subject_object_pair_is_a_new_shape() {
 }
 
 #[test]
+fn a_different_requested_permission_on_the_same_triple_is_a_new_shape() {
+    // #813: before the audit sensor recovered `action`, a routine `getattr` denial
+    // and a later `read`/`write`/`open` denial on the exact same subject/object/class
+    // collapsed to one shape — the more interesting second denial was silenced.
+    let mut state = RuleState::new();
+    let getattr = state.on_policy_denial(&policy_denial_event_with_action(
+        Some("httpd_t"),
+        Some("shadow_t"),
+        Some("file"),
+        Some("getattr"),
+    ));
+    let read = state.on_policy_denial(&policy_denial_event_with_action(
+        Some("httpd_t"),
+        Some("shadow_t"),
+        Some("file"),
+        Some("read"),
+    ));
+    assert_eq!(getattr.len(), 1);
+    assert_eq!(
+        read.len(),
+        1,
+        "a different requested permission is a new shape, not silenced by the getattr"
+    );
+}
+
+#[test]
+fn the_alert_message_names_the_requested_permission() {
+    // #813 recovered `action` into the key so a getattr and a later read/write/open
+    // are told apart (the test above); the message itself must also say which
+    // permission was denied, not just dedup on it silently (review of #872).
+    let mut state = RuleState::new();
+    let alerts = state.on_policy_denial(&policy_denial_event_with_action(
+        Some("httpd_t"),
+        Some("shadow_t"),
+        Some("file"),
+        Some("read write"),
+    ));
+    assert_eq!(alerts.len(), 1);
+    assert!(
+        alerts[0].message.contains("action=read write"),
+        "message does not name the requested permission: {}",
+        alerts[0].message
+    );
+}
+
+#[test]
+fn the_alert_message_says_dash_for_a_denial_with_no_recovered_action() {
+    // The AppLocker/WDAC side and an AVC variant the parser doesn't recognize both
+    // leave `action: None` (`policy_denial_event_full`'s default) — the message's
+    // own `-` placeholder for "no permission recovered" must still show up, not an
+    // empty field or a panic.
+    let mut state = RuleState::new();
+    let alerts = state.on_policy_denial(&policy_denial_event_full(
+        "selinux",
+        Some("httpd_t"),
+        Some("shadow_t"),
+        Some("file"),
+        true,
+    ));
+    assert_eq!(alerts.len(), 1);
+    assert!(
+        alerts[0].message.contains("action=-"),
+        "message does not fall back to '-' for a denial with no recovered action: {}",
+        alerts[0].message
+    );
+}
+
+#[test]
+fn a_repeated_denial_with_the_same_permission_is_still_the_same_shape() {
+    // The dedup itself must still work once `action` joins the key: the exact same
+    // denial seen twice is one alert, not two.
+    let mut state = RuleState::new();
+    let first = state.on_policy_denial(&policy_denial_event_with_action(
+        Some("httpd_t"),
+        Some("shadow_t"),
+        Some("file"),
+        Some("read"),
+    ));
+    let second = state.on_policy_denial(&policy_denial_event_with_action(
+        Some("httpd_t"),
+        Some("shadow_t"),
+        Some("file"),
+        Some("read"),
+    ));
+    assert_eq!(first.len(), 1);
+    assert!(second.is_empty());
+}
+
+#[test]
 fn permissive_mode_still_alerts_on_a_new_shape() {
     // A permissive-mode SELinux log still names a real new denial shape — the
     // rule fires on the shape appearing, not on whether it was actually
@@ -1189,6 +1278,225 @@ fn a_denial_missing_subject_or_object_context_still_alerts_once() {
         true,
     ));
     assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn policy_denial_alert_cap_sheds_further_shapes_and_refills_in_the_next_window() {
+    // `known_policy_denials` bounds the rule's memory, not its alert volume (#812): past
+    // POLICY_DENIAL_ALERT_CAP new shapes in a window, further new ones must stop alerting.
+    // A shed shape is not remembered, so it alerts once the budget refills, and the shapes
+    // that did alert stay deduplicated.
+    let t0 = meta().timestamp_ns;
+    let at = |subject: &str, timestamp_ns: u64| PolicyDenialEvent {
+        meta: schema::EventMeta {
+            timestamp_ns,
+            ..meta()
+        },
+        ..policy_denial_event_full(
+            "selinux",
+            Some(subject),
+            Some("user_home_t"),
+            Some("file"),
+            true,
+        )
+    };
+    let mut state = RuleState::new();
+    let mut alerted = 0usize;
+    for i in 0..=POLICY_DENIAL_ALERT_CAP {
+        let subject = format!("unconfined_u:unconfined_r:type_{i}_t:s0");
+        alerted += state.on_policy_denial(&at(&subject, t0)).len();
+    }
+    assert_eq!(
+        alerted, POLICY_DENIAL_ALERT_CAP as usize,
+        "the (cap + 1)th distinct shape must be shed, not alerted"
+    );
+
+    // Same window: the shed shape is still new, and still shed.
+    let shed_subject = format!("unconfined_u:unconfined_r:type_{POLICY_DENIAL_ALERT_CAP}_t:s0");
+    assert!(
+        state.on_policy_denial(&at(&shed_subject, t0)).is_empty(),
+        "the budget is spent for this window"
+    );
+    // A shape that did alert stays deduplicated, now and in the next window.
+    let first_subject = "unconfined_u:unconfined_r:type_0_t:s0";
+    let next_window = t0 + crate::exclusions::POLICY_DENIAL_ALERT_WINDOW_NS;
+    assert!(
+        state
+            .on_policy_denial(&at(first_subject, next_window))
+            .is_empty(),
+        "dedup keeps working across windows"
+    );
+    // Next window: the budget refilled, so the shed shape alerts.
+    assert_eq!(
+        state
+            .on_policy_denial(&at(&shed_subject, next_window))
+            .len(),
+        1,
+        "a shape shed in one window alerts when the budget refills"
+    );
+}
+
+#[test]
+fn policy_denial_permission_order_does_not_make_a_new_shape() {
+    // The permission set is normalised in the dedup key: the kernel emits the bits in a
+    // fixed order, but a differently ordered or spaced set is the same denial, not a new one.
+    let mut state = RuleState::new();
+    let alerts = |state: &mut RuleState, action: &str| {
+        state
+            .on_policy_denial(&policy_denial_event_with_action(
+                Some("system_u:system_r:httpd_t:s0"),
+                Some("system_u:object_r:user_home_t:s0"),
+                Some("file"),
+                Some(action),
+            ))
+            .len()
+    };
+    assert_eq!(alerts(&mut state, "read write"), 1);
+    assert_eq!(alerts(&mut state, "write read"), 0, "same set, other order");
+    assert_eq!(
+        alerts(&mut state, "read  write"),
+        0,
+        "same set, doubled space"
+    );
+    assert_eq!(
+        alerts(&mut state, "read write open"),
+        1,
+        "a different set is a new shape"
+    );
+}
+
+#[test]
+fn policy_denial_cache_eviction_is_logged() {
+    // `known_policy_denials` silently clearing at COUNTER_CAP must not be silent to an
+    // operator (#812, CLAUDE.md: counted, observable shedding) — logged once per rise,
+    // the same idiom as `agent::ransomware_join::report_evictions`.
+    use std::{
+        io,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        let mut state = RuleState::new();
+        let t0 = meta().timestamp_ns;
+        for i in 0..=COUNTER_CAP {
+            let subject = format!("unconfined_u:unconfined_r:evict_{i}_t:s0");
+            // The alert budget is per window and a shape shed by it is not remembered: step
+            // the clock one window per POLICY_DENIAL_ALERT_CAP shapes so every shape is
+            // remembered and the cache fills.
+            let window = u64::try_from(i).expect("fits") / POLICY_DENIAL_ALERT_CAP;
+            state.on_policy_denial(&PolicyDenialEvent {
+                meta: schema::EventMeta {
+                    timestamp_ns: t0 + window * crate::exclusions::POLICY_DENIAL_ALERT_WINDOW_NS,
+                    ..meta()
+                },
+                ..policy_denial_event_full(
+                    "selinux",
+                    Some(&subject),
+                    Some("user_home_t"),
+                    Some("file"),
+                    true,
+                )
+            });
+        }
+    });
+
+    let logs = String::from_utf8_lossy(&captured.0.lock().expect("capture lock")).into_owned();
+    // Exactly one rise happens: COUNTER_CAP + 1 inserts crosses the cap exactly once,
+    // evicting one batch (COUNTER_CAP / 8). A bare substring check (review of #823)
+    // cannot tell "logged once, correctly" from two real bugs that both still contain
+    // the phrase: `>` weakened to `>=` logs on every one of these COUNTER_CAP + 1 calls
+    // (a line per event, the flood "once per rise" exists to avoid), and `>` flipped to
+    // `==` logs on every call *before* the real rise (evicted stays 0 == reported's
+    // initial 0) and then falls silent exactly when the real eviction happens. Asserting
+    // the exact line count and the real evicted value catches both.
+    let shed_lines = logs.matches("tracked denial shapes shed").count();
+    assert_eq!(
+        shed_lines, 1,
+        "exactly one eviction rise must be logged, not zero or one per event: {logs}"
+    );
+    assert!(
+        logs.contains(&format!("evicted={}", COUNTER_CAP / 8)),
+        "the logged count must be the real evicted total, not 0: {logs}"
+    );
+}
+
+#[test]
+fn policy_denial_alert_cap_reached_is_logged_exactly_once() {
+    // The "alert cap reached" warning is gated on `policy_denial_alerts_shed == 0`
+    // (the very first shed) so it fires once, not once per shed shape — otherwise a
+    // sustained flood past the cap would spam one warning per new shape instead of
+    // one notice that the cap was hit (review of #823: `== 0` flipped to `!= 0`, or
+    // the counter's own `+= 1` flipped to `*= 1`, both leave the existing tests
+    // green because nothing before this asserted on this message's own line count).
+    use std::{
+        io,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        let mut state = RuleState::new();
+        // Well past POLICY_DENIAL_ALERT_CAP (2048): enough further shapes that a
+        // once-per-shed bug would produce many lines, not just a second one.
+        for i in 0..POLICY_DENIAL_ALERT_CAP * 3 {
+            let subject = format!("unconfined_u:unconfined_r:cap_{i}_t:s0");
+            state.on_policy_denial(&policy_denial_event_full(
+                "selinux",
+                Some(&subject),
+                Some("user_home_t"),
+                Some("file"),
+                true,
+            ));
+        }
+    });
+
+    let logs = String::from_utf8_lossy(&captured.0.lock().expect("capture lock")).into_owned();
+    let cap_lines = logs.matches("alert cap reached").count();
+    assert_eq!(
+        cap_lines, 1,
+        "the cap-reached warning must fire exactly once, not once per shed shape: {logs}"
+    );
 }
 
 #[test]

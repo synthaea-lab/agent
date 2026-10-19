@@ -36,6 +36,10 @@
 
 use std::{
     collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -72,6 +76,38 @@ pub(crate) struct ExecStamps {
     pub(crate) parent_never_exec_ed: bool,
 }
 
+/// Totals of what the parent-image cache's cap has dropped, readable from another thread: the
+/// agent reports them in its health beacon (#863), where the log line of #783 was the only
+/// place an operator could see them.
+///
+/// Cumulative since the sensor started, as the counters in the cache are. `live` is the loss
+/// (a later child of such a process carries no `parent_image_path`); `dead` is entries of exited
+/// processes, which cost nothing and say how full the cache runs.
+#[derive(Debug, Default)]
+pub struct ParentImageEvictions {
+    dead: AtomicU64,
+    live: AtomicU64,
+}
+
+impl ParentImageEvictions {
+    /// Entries dropped whose process had already exited.
+    #[must_use]
+    pub fn dead(&self) -> u64 {
+        self.dead.load(Ordering::Relaxed)
+    }
+
+    /// Entries dropped whose process was still alive.
+    #[must_use]
+    pub fn live(&self) -> u64 {
+        self.live.load(Ordering::Relaxed)
+    }
+
+    fn publish(&self, dead: u64, live: u64) {
+        self.dead.store(dead, Ordering::Relaxed);
+        self.live.store(live, Ordering::Relaxed);
+    }
+}
+
 /// What the cap dropped, by whether the process was still alive (#783).
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +137,8 @@ pub(crate) struct ParentImages {
     evicted_live: u64,
     /// When the live-eviction warning was last logged, to log it once a minute (#783).
     last_live_warn: Option<Instant>,
+    /// Where the totals are published for another thread to read (#863), when someone asked.
+    totals: Option<Arc<ParentImageEvictions>>,
     /// Whether a pid is a live process now; swapped in tests.
     is_alive: fn(u32) -> bool,
 }
@@ -128,8 +166,15 @@ impl ParentImages {
             evicted_dead: 0,
             evicted_live: 0,
             last_live_warn: None,
+            totals: None,
             is_alive,
         }
+    }
+
+    /// Publishes the eviction totals to `totals` after every batch the cap drops.
+    pub(crate) fn with_totals(mut self, totals: Arc<ParentImageEvictions>) -> Self {
+        self.totals = Some(totals);
+        self
     }
 
     /// Fills `exec.parent_image_path` from what the parent last exec'd (or, for a parent
@@ -275,6 +320,9 @@ impl ParentImages {
         }
         self.evicted_dead += dead as u64;
         self.evicted_live += live as u64;
+        if let Some(totals) = &self.totals {
+            totals.publish(self.evicted_dead, self.evicted_live);
+        }
         if live > 0 {
             self.warn_live_eviction();
         } else {
@@ -745,6 +793,46 @@ mod tests {
         }
         assert_eq!(cache.eviction_counts(), EvictionCounts { dead: 1, live: 1 });
         assert!(!cache.contains(300) && !cache.contains(301));
+    }
+
+    // --- the totals the agent reports in its health beacon (#863) ---
+
+    #[test]
+    fn the_shared_totals_equal_the_caches_own_after_every_eviction() {
+        let totals = Arc::new(ParentImageEvictions::default());
+        let mut cache =
+            ParentImages::with_liveness(16, every_pid_but_300_is_alive).with_totals(totals.clone());
+        for pid in 300..400u32 {
+            note(&mut cache, &mut exec(pid, 1, 1, 1, "/bin/x"));
+            let counts = cache.eviction_counts();
+            assert_eq!((totals.dead(), totals.live()), (counts.dead, counts.live));
+        }
+        assert!(
+            totals.dead() >= 1 && totals.live() >= 1,
+            "both kinds were evicted"
+        );
+    }
+
+    #[test]
+    fn exited_processes_are_reported_dead_and_never_live() {
+        let totals = Arc::new(ParentImageEvictions::default());
+        let mut cache =
+            ParentImages::with_liveness(8, only_pid_100_is_alive).with_totals(totals.clone());
+        note(&mut cache, &mut exec(100, 7, 1, 1, "/usr/sbin/sshd"));
+        for pid in 1_000..1_100u32 {
+            note(&mut cache, &mut exec(pid, 1, 1, 1, "/usr/bin/true"));
+        }
+        assert!(totals.dead() > 0);
+        assert_eq!(totals.live(), 0);
+    }
+
+    #[test]
+    fn a_cache_without_totals_still_counts_for_itself() {
+        let mut cache = ParentImages::with_liveness(8, every_pid_is_alive);
+        for pid in 100..140u32 {
+            note(&mut cache, &mut exec(pid, 1, 1, 1, "/bin/x"));
+        }
+        assert!(cache.eviction_counts().live > 0);
     }
 
     #[test]

@@ -44,7 +44,7 @@ fn load_or_create_seed(state_dir: &Path) -> io::Result<Seed> {
     }
     fs::create_dir_all(deception_dir(state_dir))?;
     let mut bytes = [0u8; SEED_LEN];
-    getrandom::getrandom(&mut bytes).map_err(|e| io::Error::other(e.to_string()))?;
+    getrandom::fill(&mut bytes).map_err(|e| io::Error::other(e.to_string()))?;
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

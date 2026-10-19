@@ -17,10 +17,12 @@ use crate::{
     check_systemd_service_persistence,
     exclusions::{
         AUTH_FAILURE_THRESHOLD, BEACON_THRESHOLD, BURST_WRITE_BYTES_THRESHOLD,
-        MEMFD_EXEC_WINDOW_NS, RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS,
-        SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS, SELF_SPAWN_THRESHOLD,
-        SELF_SPAWN_TRUSTED_THRESHOLD, TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
+        MEMFD_EXEC_WINDOW_NS, POLICY_DENIAL_ALERT_CAP, RANSOMWARE_RENAME_THRESHOLD,
+        RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
+        SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD, TOUCHED_FILES_PER_PID,
+        TOUCHED_FILES_PID_CAP,
     },
+    state::COUNTER_CAP,
 };
 
 const O_RDONLY: u32 = 0;
@@ -303,6 +305,28 @@ fn policy_denial_event_full(
         object_class: object_class.map(str::to_string),
         enforced,
         ..schema::fixtures::policy_denial()
+    }
+}
+
+/// Like [`policy_denial_event_full`], with an explicit `action` (#813): the other
+/// helper's many callers don't care about it (it defaults to `None` via
+/// `schema::fixtures::policy_denial()`), so it stays a 5-argument helper and this one
+/// is reached for only the few tests that do.
+fn policy_denial_event_with_action(
+    subject_context: Option<&str>,
+    object_context: Option<&str>,
+    object_class: Option<&str>,
+    action: Option<&str>,
+) -> PolicyDenialEvent {
+    PolicyDenialEvent {
+        action: action.map(str::to_string),
+        ..policy_denial_event_full(
+            "selinux",
+            subject_context,
+            object_context,
+            object_class,
+            true,
+        )
     }
 }
 

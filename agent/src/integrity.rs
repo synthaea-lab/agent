@@ -94,7 +94,7 @@ fn check_once(layout: &updater::layout::Layout, sink: &DetectionSink) {
             release_version,
             "self-integrity: persisted manifest failed signature verification"
         );
-        sink.emit(
+        sink.emit_tamper(
             TAMPER_TECHNIQUE,
             &format!(
                 "release {release_version}'s persisted manifest failed signature \
@@ -112,7 +112,7 @@ fn check_once(layout: &updater::layout::Layout, sink: &DetectionSink) {
             .map(|(rel_path, hash)| (active_dir.join(rel_path), hash)),
     );
     for violation in integrity_manifest.verify() {
-        sink.emit(TAMPER_TECHNIQUE, &violation.message());
+        sink.emit_tamper(TAMPER_TECHNIQUE, &violation.message());
     }
 }
 
@@ -207,6 +207,11 @@ mod tests {
         check_once(&layout, &sink);
 
         assert_eq!(alerts_of(&dir), "");
+        assert_eq!(
+            sink.tamper_events(),
+            0,
+            "a clean check is not a tamper event"
+        );
     }
 
     #[test]
@@ -231,6 +236,7 @@ mod tests {
             alerts.contains("neutered-build swap"),
             "expected the integrity violation's own message, got: {alerts}"
         );
+        assert_eq!(sink.tamper_events(), 1, "one violation, one tamper event");
     }
 
     #[test]
@@ -261,6 +267,11 @@ mod tests {
         assert!(
             alerts.contains("signature verification"),
             "expected the signature-failure message, got: {alerts}"
+        );
+        assert_eq!(
+            sink.tamper_events(),
+            1,
+            "one failed signature, one tamper event"
         );
     }
 }
