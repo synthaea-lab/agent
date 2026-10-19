@@ -97,9 +97,7 @@ pub fn run(
                                     "minifilter: records missing before this one"
                                 );
                             }
-                            if needs_refresh(&message)
-                                && last_refresh.elapsed() >= VOLUME_REFRESH
-                            {
+                            if needs_refresh(&message) && last_refresh.elapsed() >= VOLUME_REFRESH {
                                 volumes = VolumeMap::from_system();
                                 last_refresh = Instant::now();
                             }
