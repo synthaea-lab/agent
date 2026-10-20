@@ -3289,3 +3289,54 @@ fn unrelated_process_unusual_outbound_does_not_match_service_rule() {
     let event = connect_event_full(303, "curl", [93, 184, 216, 34], 4444, 0);
     assert!(check_service_unusual_outbound(&event).is_none());
 }
+
+// ── T1071.004 DoH/DoT from a non-browser, non-resolver process (issue #458) ─
+
+#[test]
+fn arbitrary_process_to_dot_port_alerts() {
+    // Port 853 alone is already unusual — any destination, since it's reserved.
+    let event = connect_event_full(400, "curl", [93, 184, 216, 34], 853, 0);
+    let alert = check_doh_dot_connection(&event).unwrap();
+    assert_eq!(alert.technique, "T1071.004");
+    assert!(alert.message.contains("DNS-over-TLS"));
+}
+
+#[test]
+fn arbitrary_process_to_known_doh_resolver_on_443_alerts() {
+    let event = connect_event_full(401, "curl", [1, 1, 1, 1], 443, 0);
+    let alert = check_doh_dot_connection(&event).unwrap();
+    assert_eq!(alert.technique, "T1071.004");
+    assert!(alert.message.contains("DNS-over-HTTPS"));
+}
+
+#[test]
+fn arbitrary_process_to_known_doh_resolver_ipv6_on_443_alerts() {
+    let mut event = connect_event_full(402, "curl", [0, 0, 0, 0], 443, 0);
+    event.daddr = "2606:4700:4700::1111".parse().unwrap();
+    assert!(check_doh_dot_connection(&event).is_some());
+}
+
+#[test]
+fn arbitrary_process_to_443_on_an_unlisted_address_does_not_alert() {
+    // Ordinary HTTPS — not one of the known public DoH resolvers.
+    let event = connect_event_full(403, "curl", [93, 184, 216, 34], 443, 0);
+    assert!(check_doh_dot_connection(&event).is_none());
+}
+
+#[test]
+fn systemd_resolved_to_dot_port_does_not_alert() {
+    // The host's own stub resolver may legitimately speak DoT upstream.
+    let event = connect_event_full(404, "systemd-resolved", [1, 1, 1, 1], 853, 0);
+    assert!(check_doh_dot_connection(&event).is_none());
+}
+
+#[test]
+fn browser_to_known_doh_resolver_does_not_alert() {
+    // Browsers increasingly dial DoH themselves rather than through the OS
+    // resolver — routine, not a signal. Checked case-insensitively against the
+    // Windows .exe form too.
+    let firefox = connect_event_full(405, "firefox", [8, 8, 8, 8], 443, 0);
+    assert!(check_doh_dot_connection(&firefox).is_none());
+    let chrome_exe = connect_event_full(406, "Chrome.exe", [8, 8, 8, 8], 443, 0);
+    assert!(check_doh_dot_connection(&chrome_exe).is_none());
+}
