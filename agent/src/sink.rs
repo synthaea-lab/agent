@@ -2141,6 +2141,9 @@ impl EventSink for DetectionSink {
             }
             Event::LdapSearch(e) => self.detect_ldap_search(&event, e),
             Event::NtlmAuth(e) => self.record_rule_alerts(&event, rules::evaluate_ntlm_auth(e)),
+            Event::LogCleared(e) => {
+                self.record_rule_alerts(&event, rules::evaluate_log_cleared(e));
+            }
             Event::PolicyDenial(e) => self.detect_policy_denial(&event, e),
             Event::PackageChange(e) => {
                 self.record_rule_alerts(&event, rules::evaluate_package_change(e));

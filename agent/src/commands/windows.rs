@@ -165,6 +165,7 @@ fn eventlog_config(policy: &policy::EventLogPolicy) -> sensor_windows_eventlog::
         defender_enabled: true,
         wdac_enabled: true,
         terminal_sessions_enabled: true,
+        log_clears_enabled: true,
     }
 }
 

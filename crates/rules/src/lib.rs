@@ -51,7 +51,8 @@ pub(crate) use stateless::{
 // through them. The individual checks are implementation detail, re-exported
 // crate-internally for the tests under `src/tests/`.
 pub use stateless::{
-    evaluate_connect, evaluate_exec, evaluate_file_delete, evaluate_file_open, evaluate_signal,
+    evaluate_connect, evaluate_exec, evaluate_file_delete, evaluate_file_open,
+    evaluate_log_cleared, evaluate_signal,
 };
 
 #[derive(Debug, Clone)]

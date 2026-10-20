@@ -273,7 +273,13 @@ pub mod time;
 /// address, NTLM version). Windows-only. It claimed 41 while #632 (`LdapSearch`)
 /// was open, then 43 after #263 (`SocketCreate`, 42) merged, then 44 after #772
 /// (`PackageChange`) took 43; same coordination note as above.
-pub const SCHEMA_VERSION: u32 = 44;
+///
+/// Bumped 44 → 45 for [`Event::LogCleared`] (#799): a Windows event log
+/// cleared, from the record the Event Log service writes into the fresh log
+/// (Security 1102, System 104), whatever did the clearing. Windows-only.
+/// #577 (`BitsJob`) was open at the same time; whichever merges second
+/// renumbers, same coordination note as above.
+pub const SCHEMA_VERSION: u32 = 45;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -1127,6 +1133,37 @@ pub struct NtlmAuthEvent {
     /// user name or password). `None` when the provider gives none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+}
+
+/// A Windows event log was cleared (#799), from the record the Event Log
+/// service itself writes as the first entry of the fresh log: Security **1102**
+/// ("The audit log was cleared") or System **104** ("The log file was
+/// cleared", naming the channel). Windows writes it whatever did the clearing
+/// (`wevtutil cl`, the `EvtClearLog` API, .NET `EventLogSession.ClearLog`, a
+/// renamed tool), and no audit subcategory gates it.
+///
+/// `meta.pid` is the process that asked for the clear (`ClientProcessId`,
+/// written by Windows 11 26200, lab 2026-10-15), or the Event Log service when
+/// an older build leaves it out; `comm` is empty either way. `meta.user` is the
+/// account that cleared the log (`SubjectUserSid` for 1102, the event's
+/// `Security UserID` for 104), [`User::Unknown`] when the event names none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogClearedEvent {
+    pub meta: EventMeta,
+    /// The channel cleared, as Windows names it (`Security`, `System`,
+    /// `Microsoft-Windows-PowerShell/Operational`, ...).
+    pub channel: String,
+    /// The clearing account as `DOMAIN\user`, or `user` alone when the event
+    /// gives no domain. Empty when it names none.
+    pub subject_user: String,
+    /// 1102 only: the clearing account's logon session (`0x3e7`), to join with
+    /// that session's 4624. `None` for 104, which does not carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_logon_id: Option<String>,
+    /// 104 only: where the log was saved before it was cleared, when the
+    /// clearer asked for a backup (`wevtutil cl <channel> /bu:<file>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_path: Option<String>,
 }
 
 /// An LDAP search a process sent, from EID 30 of the
@@ -2251,6 +2288,7 @@ pub enum Event {
     Defender(DefenderEvent),
     LdapSearch(LdapSearchEvent),
     NtlmAuth(NtlmAuthEvent),
+    LogCleared(LogClearedEvent),
     WmiActivity(WmiActivityEvent),
     AssemblyLoad(AssemblyLoadEvent),
     SmbConnect(SmbConnectEvent),
@@ -2315,6 +2353,7 @@ impl Event {
             Event::Defender(e) => &e.meta,
             Event::LdapSearch(e) => &e.meta,
             Event::NtlmAuth(e) => &e.meta,
+            Event::LogCleared(e) => &e.meta,
             Event::WmiActivity(e) => &e.meta,
             Event::AssemblyLoad(e) => &e.meta,
             Event::SmbConnect(e) => &e.meta,

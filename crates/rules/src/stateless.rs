@@ -799,6 +799,44 @@ pub fn evaluate_file_delete(event: &schema::FileDeleteEvent) -> Vec<Alert> {
     check_log_file_delete(event).into_iter().collect()
 }
 
+/// T1070.001 — the OS-record half (#799): Windows says a log was cleared
+/// (Security 1102, System 104), however it was done. [`check_log_clear_exec`]
+/// only sees the clears whose command line spells them; this sees the API and
+/// .NET ones too. A `wevtutil cl` raises both, a duplicate accepted for now.
+///
+/// High, one alert per clear, with no exclusion: a legitimate clear is rare and
+/// an administrator emptying a log is worth seeing anyway. A backup taken first
+/// is named in the message but does not lower the severity, since an attacker
+/// can ask for one as easily.
+#[must_use]
+pub fn evaluate_log_cleared(event: &schema::LogClearedEvent) -> Vec<Alert> {
+    let who = if event.subject_user.is_empty() {
+        "-"
+    } else {
+        &event.subject_user
+    };
+    let sid = match &event.meta.user {
+        schema::User::Windows { sid, .. } => sid.as_str(),
+        _ => "-",
+    };
+    let logon = event
+        .subject_logon_id
+        .as_ref()
+        .map_or_else(String::new, |id| format!(" logon={id}"));
+    let backup = event
+        .backup_path
+        .as_ref()
+        .map_or_else(String::new, |path| format!(", backed up to {path}"));
+    vec![Alert {
+        technique: CLEAR_WINDOWS_EVENT_LOGS,
+        severity: Severity::High,
+        message: format!(
+            "event log cleared: channel={} by={who} (sid={sid}{logon}){backup}",
+            event.channel
+        ),
+    }]
+}
+
 /// `SIGSTOP`'s platform-native number: the one signal of
 /// [`tamper_signal_name`]'s set that differs between Linux and macOS. Signal
 /// events carry the sending host's numbering, and rules run on that same host.

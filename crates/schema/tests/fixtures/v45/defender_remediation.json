@@ -1,0 +1,18 @@
+{
+  "type": "defender",
+  "meta": {
+    "pid": 0,
+    "ppid": 0,
+    "user": { "os": "unknown" },
+    "timestamp_ns": 1759400000000000000,
+    "comm": ""
+  },
+  "kind": "remediation",
+  "detection_id": "{3F813A68-3FA3-456D-8818-54AB191C87B3}",
+  "threat_name": "HackTool:Win32/Mimikatz.I",
+  "severity_id": 4,
+  "category_id": 34,
+  "action_id": 3,
+  "path": "file:_C:\\Users\\Public\\tool.exe",
+  "user": "LAB\\alice"
+}
