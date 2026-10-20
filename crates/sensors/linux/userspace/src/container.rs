@@ -22,7 +22,9 @@ use crate::docker::DockerContainerInfo;
 ///
 /// - cgroup v1 / cgroupfs naming: a path segment that is exactly the 64 hex-char id
 ///   (`/docker/<id>`, `/docker/<id>/init`).
-/// - cgroup v2 / systemd unit naming: `docker-<id>.scope` or `cri-containerd-<id>.scope`
+/// - cgroup v2 / systemd unit naming: `docker-<id>.scope`, `cri-containerd-<id>.scope` or, for
+///   podman, `libpod-<id>.scope` (podman puts the container's processes in a `container` child
+///   cgroup of that scope, so the id is a segment above the leaf).
 ///   (containerd without Docker in front — still relevant since #80 mentions the
 ///   containerd socket alongside Docker's).
 ///
@@ -40,6 +42,7 @@ fn extract_container_id(cgroup_path: &str) -> Option<String> {
             .and_then(|s| {
                 s.strip_prefix("docker-")
                     .or_else(|| s.strip_prefix("cri-containerd-"))
+                    .or_else(|| s.strip_prefix("libpod-"))
             })
             .unwrap_or(segment);
         is_hex_id(candidate).then(|| candidate.to_string())
@@ -283,6 +286,38 @@ mod tests {
         );
     }
 
+    /// A real podman 5.8.8 container on Fedora 43 (rootful, cgroup v2, systemd cgroup manager,
+    /// 2026-10-19): `podman inspect` gives the scope, and the container's processes sit in its
+    /// `container` child cgroup. Neither carries `docker-` or `cri-containerd-` (#894).
+    #[test]
+    fn cgroup_v2_podman_libpod_scope() {
+        const LIBPOD_ID: &str = "4229de746683173b7dd7e1db7acdb02958e3d477f25339a5f7a5f1d4922d298f";
+        assert_eq!(
+            extract_container_id(&format!("/machine.slice/libpod-{LIBPOD_ID}.scope")),
+            Some(LIBPOD_ID.to_string())
+        );
+        assert_eq!(
+            extract_container_id(&format!(
+                "/machine.slice/libpod-{LIBPOD_ID}.scope/container"
+            )),
+            Some(LIBPOD_ID.to_string())
+        );
+    }
+
+    #[test]
+    fn libpod_prefix_with_a_short_id_does_not_match() {
+        // `libpod-` followed by something that is not a 64 hex-char id (podman also names
+        // `libpod-conmon-<id>.scope` for the monitor process): no false positive.
+        assert_eq!(
+            extract_container_id("/machine.slice/libpod-abc123.scope"),
+            None
+        );
+        assert_eq!(
+            extract_container_id("/machine.slice/libpod-conmon-abc123.scope"),
+            None
+        );
+    }
+
     #[test]
     fn cgroup_kubepods_nesting_still_matches() {
         // Pod/namespace context is out of scope (#80); the id inside the nesting is not.
@@ -336,6 +371,26 @@ mod tests {
         assert_eq!(
             container_id_from_cgroupfs(&root, target_ino),
             Some(DOCKER_ID.to_string())
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cgroupfs_walk_finds_a_podman_container_child_cgroup_by_inode() {
+        const LIBPOD_ID: &str = "4229de746683173b7dd7e1db7acdb02958e3d477f25339a5f7a5f1d4922d298f";
+        let root = temp_cgroupfs_root("podman-child");
+        // The cgroup id the probe captures is the inode of the process's own cgroup: the
+        // `container` child of the libpod scope.
+        let target_ino = make_cgroup_dir(
+            &root,
+            &format!("machine.slice/libpod-{LIBPOD_ID}.scope/container"),
+        );
+        make_cgroup_dir(&root, "machine.slice/libpod-conmon-0123.scope");
+
+        assert_eq!(
+            container_id_from_cgroupfs(&root, target_ino),
+            Some(LIBPOD_ID.to_string())
         );
 
         std::fs::remove_dir_all(&root).ok();
