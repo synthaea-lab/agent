@@ -123,7 +123,13 @@ jobs:
           fi
           # What postinst sets up, which the unit needs before it can start.
           test -d /run/synthaea
-          test -L /usr/bin/synthaea-ctl
+          # A root-owned package asset (#897), not a symlink into
+          # /var/lib/synthaea/current — that directory is owned by the
+          # synthaea service user, so a symlink there let a compromised
+          # agent get root the next time someone ran `sudo synthaea-ctl`.
+          test -f /usr/bin/synthaea-ctl
+          test ! -L /usr/bin/synthaea-ctl
+          test "$(stat -c %U:%a /usr/bin/synthaea-ctl)" = "root:755"
           test "$(stat -c %U /var/lib/synthaea)" = synthaea
           test -f /etc/synthaea/agent.toml
           # The first start: not the 226/NAMESPACE loop of #675. `active` for a few seconds in

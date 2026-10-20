@@ -1,10 +1,12 @@
 #!/bin/sh
 # Mirrors the .deb postinst (packaging/linux/debian/maintainer-scripts/postinst)
 # and the .rpm spec's %post, OpenRC-shaped: no systemd-sysusers/tmpfiles here
-# (the user already exists from pre-install), but the same symlink, directory
-# and ownership steps. Capabilities are granted by supervise-daemon's own
-# `capabilities=` directive (synthaea-agent.initd) at service start, not here
-# — see that file's comment for why file capabilities (setcap) were dropped.
+# (the user already exists from pre-install), but the same directory and
+# ownership steps. synthaea-ctl itself is a root-owned package asset
+# (APKBUILD's package(), #897), not a symlink created here. Capabilities are
+# granted by supervise-daemon's own `capabilities=` directive
+# (synthaea-agent.initd) at service start, not here — see that file's comment
+# for why file capabilities (setcap) were dropped.
 set -e
 
 if [ ! -e /var/lib/synthaea/current ]; then
@@ -14,8 +16,6 @@ fi
 mkdir -p /var/lib/synthaea/versions /var/log/synthaea /run/synthaea
 chown -R synthaea:synthaea /var/lib/synthaea /var/log/synthaea
 chmod 0750 /var/lib/synthaea /var/lib/synthaea/versions /var/log/synthaea
-
-ln -sf /var/lib/synthaea/current/cli /usr/bin/synthaea-ctl
 
 cat <<'EOF'
 synthaea-agent: edit /etc/synthaea/agent.toml, then:

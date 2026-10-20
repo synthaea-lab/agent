@@ -42,8 +42,9 @@ case "$1" in
             # versions/ just created above).
             chown -R synthaea:synthaea /var/lib/synthaea /var/log/synthaea
 
-            # Create CLI symlink
-            ln -sf /var/lib/synthaea/current/cli /usr/bin/synthaea-ctl
+            # synthaea-ctl is its own root-owned package asset (#897), not a
+            # symlink into the synthaea-user-owned current/ tree — nothing to
+            # do here any more.
 
             # The shipped config starts and runs (offline_fallback = true,
             # #675), so systemctl status alone does not tell an operator it

@@ -168,12 +168,16 @@ package() {
 	install -d -m750 "$pkgdir/var/lib/synthaea/versions"
 	install -d -m750 "$pkgdir/var/log/synthaea"
 
-	# /usr is read-only while the service runs under its hardening (same
-	# reasoning as the systemd unit's ProtectSystem=strict and the .deb
-	# postinst's identical symlink), so this is created at package-install
-	# time, not by the service itself.
-	install -d "$pkgdir/usr/bin"
-	ln -s /var/lib/synthaea/current/cli "$pkgdir/usr/bin/synthaea-ctl"
+	# synthaea-ctl: a second, root-owned copy of the cli binary, not a symlink
+	# into /var/lib/synthaea/current (#897) — that directory belongs to the
+	# unprivileged synthaea service user, so a compromised agent could
+	# repoint it and have `sudo synthaea-ctl` run arbitrary code as root.
+	# apk now owns this file's lifecycle like any other package asset
+	# (installed/removed with the package, no separate symlink step), and it
+	# goes stale only across a self-update that bumps crates/ipc's
+	# PROTOCOL_VERSION — a clean, disclosed version-mismatch error until the
+	# next `apk upgrade` ships a matching CLI, not a silent one.
+	install -D -m755 "$bin/cli" "$pkgdir/usr/bin/synthaea-ctl"
 }
 
 # Empty, not missing: builddir is this monorepo checkout (see builddir=
