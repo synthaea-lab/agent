@@ -24,7 +24,12 @@
 //! per-unit read ACL) — a non-issue for this sensor in practice since the agent
 //! already needs root for eBPF, but worth remembering if testing this crate
 //! standalone. `su`/`sshd` login-failure mapping is implemented and unit-tested
-//! but still unverified against a real prompt/failed attempt.
+//! but still unverified against a real prompt/failed attempt. Same caveat for
+//! `sudo`/`su`'s own wrong-password case (`JournalEvent::PamAuthFailure`, #381,
+//! T1548.003): implemented and unit-tested against the documented `pam_unix(...
+//! :auth): authentication failure; ...` format, not yet confirmed against a
+//! real failed attempt (this crate's Hyper-V lab host has no interactive TTY
+//! for one, same limitation as the pre-existing `su`/`sshd` case above).
 //!
 //! Also done: [`persistence::UnitPersistenceTracker`] maps a unit's first
 //! observed start into `schema::FileOpenEvent`/`FLAG_PERSISTENCE_SYSTEMD_ARTIFACT`

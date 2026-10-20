@@ -1012,6 +1012,101 @@ pub(crate) fn cmd_capture_events(output: &std::path::Path) -> anyhow::Result<()>
         .map_err(|e| anyhow::anyhow!("sensor failed: {e}"))
 }
 
+/// The journal → `AuthEvent` → rules path for the sudo/su join (T1548.003, #838):
+/// the classifier, the mapping and `RuleState::on_auth` each have unit tests, but
+/// only this crosses all three on journald-shaped lines.
+#[cfg(test)]
+mod sudo_join_tests {
+    use std::io::Cursor;
+
+    const FAILURE: &str = "pam_unix(sudo:auth): authentication failure; logname=omss uid=1000 \
+                           euid=0 tty=/dev/pts/2 ruser=omss rhost=  user=omss";
+    const SUCCESS: &str = "     omss : TTY=pts/2 ; PWD=/home/omss ; USER=root ; \
+                           COMMAND=/bin/whoami";
+
+    /// One `journalctl -o json` line, `second` seconds into the journal.
+    fn line(second: u64, comm: &str, message: &str) -> String {
+        serde_json::json!({
+            "__CURSOR": format!("c{second}"),
+            "__REALTIME_TIMESTAMP": (second * 1_000_000).to_string(),
+            "SYSLOG_IDENTIFIER": "sudo",
+            "_COMM": comm,
+            "_PID": "4242",
+            "_UID": "0",
+            "_GID": "0",
+            "MESSAGE": message,
+        })
+        .to_string()
+    }
+
+    /// The techniques of the alerts the rules raise over `lines`, in order.
+    fn techniques(lines: &[String]) -> Vec<&'static str> {
+        let journal = sensor_linux_journal::ClassifiedJournal::new(Cursor::new(lines.join("\n")));
+        let mut state = rules::RuleState::new();
+        let mut techniques = Vec::new();
+        for item in journal {
+            let (record, event) = item.expect("a well-formed journal line");
+            if let Some(auth) = sensor_linux_journal::to_auth_event(&record, &event) {
+                techniques.extend(state.on_auth(&auth).iter().map(|alert| alert.technique));
+            }
+        }
+        techniques
+    }
+
+    fn five_failures(comm: &str) -> Vec<String> {
+        (1..=5).map(|second| line(second, comm, FAILURE)).collect()
+    }
+
+    fn escalations(techniques: &[&str]) -> usize {
+        techniques.iter().filter(|t| **t == "T1548.003").count()
+    }
+
+    #[test]
+    fn five_failed_sudo_passwords_then_a_success_alert_once() {
+        let mut lines = five_failures("sudo");
+        lines.push(line(10, "sudo", SUCCESS));
+        assert_eq!(escalations(&techniques(&lines)), 1);
+    }
+
+    #[test]
+    fn a_failed_attempt_logging_command_is_not_a_success() {
+        let mut lines = five_failures("sudo");
+        lines.push(line(
+            10,
+            "sudo",
+            "     omss : 3 incorrect password attempts ; TTY=pts/2 ; PWD=/home/omss ; \
+             USER=root ; COMMAND=/bin/whoami",
+        ));
+        assert_eq!(escalations(&techniques(&lines)), 0);
+    }
+
+    #[test]
+    fn a_marker_in_the_command_does_not_hide_a_real_success() {
+        let mut lines = five_failures("sudo");
+        lines.push(line(
+            10,
+            "sudo",
+            "     omss : TTY=pts/2 ; PWD=/home/omss ; USER=root ; \
+             COMMAND=/bin/echo a password is required",
+        ));
+        assert_eq!(escalations(&techniques(&lines)), 1);
+    }
+
+    #[test]
+    fn lines_logged_by_another_program_under_the_sudo_identifier_are_ignored() {
+        // `logger -t sudo ...`: the identifier says sudo, the trusted `_COMM` does
+        // not. Fabricated failures must not set up a join for a real success, and a
+        // fabricated success must not complete one from real failures.
+        let mut forged_failures = five_failures("logger");
+        forged_failures.push(line(10, "sudo", SUCCESS));
+        assert_eq!(escalations(&techniques(&forged_failures)), 0);
+
+        let mut forged_success = five_failures("sudo");
+        forged_success.push(line(10, "logger", SUCCESS));
+        assert_eq!(escalations(&techniques(&forged_success)), 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{

@@ -23,6 +23,7 @@ mod signature_gate;
 mod sliding;
 mod state;
 mod stateless;
+mod sudo;
 
 // AMSI content rules (#282): the dispatcher for `AmsiContent` events.
 pub use amsi::evaluate_amsi_content;

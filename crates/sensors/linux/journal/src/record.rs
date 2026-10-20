@@ -30,6 +30,17 @@ pub struct JournalRecord {
     /// `SYSLOG_IDENTIFIER` — the program name as it identified itself to the log
     /// (`"sshd"`, `"sudo"`, `"su"`, ...). Absent on structured-only sources.
     pub syslog_identifier: Option<String>,
+    /// `_COMM` — the emitting process's own name, stamped by journald from the
+    /// kernel's view of the sender, which is `/proc/<pid>/comm` — unlike
+    /// `SYSLOG_IDENTIFIER`, the logging client cannot pick this through the log
+    /// *content* (`logger -t sudo ...` still gets `_COMM=logger`). It is **not**
+    /// a full identity guarantee, though: a client still controls what
+    /// `/proc/<pid>/comm` says by what it execs as (`cp /usr/bin/logger
+    /// /tmp/sudo` gets `_COMM=sudo` with no `prctl` needed) — see
+    /// `auth::emitted_by`'s doc and `rules::sudo`'s for where that gap actually
+    /// matters and how it's closed (review of #838, Sollykhan 2026-10-19,
+    /// point 1 — a correction to this comment's own prior overclaim).
+    pub comm: Option<String>,
     /// `_UID` — numeric UID of the process that emitted the record (the logger, not
     /// necessarily the account being authenticated — that's parsed from `message`
     /// by [`classify`](crate::classify) instead).
@@ -86,6 +97,7 @@ pub fn parse_record(line: &str) -> Result<JournalRecord, JournalError> {
         realtime_us,
         boot_id: get_str("_BOOT_ID"),
         syslog_identifier: get_str("SYSLOG_IDENTIFIER"),
+        comm: get_str("_COMM"),
         uid: get_str("_UID"),
         pid: get_str("_PID"),
         gid: get_str("_GID"),
@@ -110,9 +122,18 @@ mod tests {
         let record = parse_record(REAL_SUDO_COMMAND_LINE).unwrap();
         assert_eq!(record.syslog_identifier.as_deref(), Some("sudo"));
         assert_eq!(record.uid.as_deref(), Some("1001"));
+        assert_eq!(record.comm, None, "the capture predates `_COMM`");
         assert!(record.message.contains("COMMAND=/bin/echo hi"));
         assert_eq!(record.realtime_us, 1_789_125_702_949_307);
         assert!(record.job_type.is_none());
+    }
+
+    #[test]
+    fn parses_the_trusted_comm_field() {
+        let line = r#"{"__CURSOR":"c","__REALTIME_TIMESTAMP":"1","SYSLOG_IDENTIFIER":"sudo","_COMM":"logger","MESSAGE":"hi"}"#;
+        let record = parse_record(line).unwrap();
+        assert_eq!(record.syslog_identifier.as_deref(), Some("sudo"));
+        assert_eq!(record.comm.as_deref(), Some("logger"));
     }
 
     #[test]

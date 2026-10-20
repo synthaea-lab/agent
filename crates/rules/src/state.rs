@@ -8,10 +8,11 @@ use std::{
 };
 
 use schema::{
-    AuthEvent, AuthOutcome, ConnectEvent, Event, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
-    FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRenameEvent, FileWriteEvent,
-    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, POLICY_MECHANISM_SELINUX,
-    PolicyDenialEvent, SessionEvent, SessionState, User, detection::Severity,
+    AuthEvent, AuthKind, AuthOutcome, ConnectEvent, Event, ExecEvent,
+    FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FileDeleteEvent, FileOpenEvent, FileQuarantineEvent,
+    FileRenameEvent, FileWriteEvent, ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT,
+    POLICY_MECHANISM_SELINUX, PolicyDenialEvent, SessionEvent, SessionState, User,
+    detection::Severity,
 };
 use store::BoundedMap;
 
@@ -38,6 +39,7 @@ use crate::{
     session::SessionHijack,
     signature_gate::SignatureGatedAlert,
     sliding::{FlowPortDedup, SlidingCounter, SlidingDistinct, SlidingSum},
+    sudo::SudoSuccessAfterFailures,
 };
 
 struct RecentWrite {
@@ -238,6 +240,12 @@ pub struct RuleState {
     /// RDP authentication successes joined to the failures from the same address,
     /// by event time (T1021.001, #285); see the `rdp` module.
     rdp_success: RdpSuccessAfterFailures,
+    /// Local privilege-escalation successes (`sudo`/`su`) joined to the
+    /// authentication failures for the same account, by event time (#381,
+    /// T1548.003 for `sudo` / T1110.001 for `su`) — "same account" means the
+    /// same invoker uid for `sudo`, the same target name for `su`; see the
+    /// `sudo` module's own doc for why they differ.
+    sudo_success: SudoSuccessAfterFailures,
     /// pid → sliding counter for RANSOMWARE-RENAME (T1486, issue #262): renames by
     /// this pid where `new_path` is `old_path` plus an appended suffix. LRU-bounded:
     /// a hostile process renaming under many different pids (unusual, but not
@@ -369,6 +377,7 @@ impl RuleState {
             policy_denial_evictions_reported: 0,
             auth_failures: BoundedMap::new(COUNTER_CAP),
             rdp_success: RdpSuccessAfterFailures::new(),
+            sudo_success: SudoSuccessAfterFailures::new(),
             recent_creates: BoundedMap::new(CREATE_UNLINK_PID_CAP),
             pending_unlinks: BoundedMap::new(CREATE_UNLINK_PID_CAP),
             touched_files: BoundedMap::new(TOUCHED_FILES_PID_CAP),
@@ -1160,14 +1169,46 @@ impl RuleState {
 
     /// To be called for every `AuthEvent` in the stream (issue #377, T1110):
     /// counts failures per (target user, source) on a sliding window and
-    /// alerts once per window when the burst threshold is crossed. Successes
-    /// deliberately don't reset the counter — a success right after a burst
-    /// is the *stronger* signal, not an all-clear (success-after-burst gets
-    /// its own alert shape in a follow-up; today the burst itself already
-    /// fired).
+    /// alerts once per window when the burst threshold is crossed. A success
+    /// deliberately doesn't reset the counter — a success right after a burst
+    /// is the *stronger* signal, not an all-clear. For a Windows RDP success
+    /// that signal is [`Self::rdp_success`] (T1021.001, joined from a separate
+    /// `SessionEvent`); for a local `sudo`/`su` success it is
+    /// [`Self::sudo_success`] (#381, T1548.003 for `sudo` / T1110.001 for `su`
+    /// — see `crate::sudo`'s module doc) below, joined from this same
+    /// `AuthEvent` stream. A local `sudo`/`su` failure also counts into the burst
+    /// counter below (key: target account, source `"local"`, `sudo` and `su` sharing
+    /// one key), so five wrong passwords in the window raise T1110 by themselves,
+    /// before and independently of any success (#838).
     pub fn on_auth(&mut self, event: &AuthEvent) -> Vec<Alert> {
-        if event.outcome != AuthOutcome::Failure {
-            return Vec::new();
+        let ts = event.meta.timestamp_ns;
+        if event.outcome == AuthOutcome::Success {
+            // Only a local (Unix) privilege-escalation success joins the sudo/su
+            // burst history — a Windows logon success is [`Self::rdp_success`]'s
+            // job, fed from the Terminal Services session event instead, not
+            // this one (see that field's doc). `PrivilegedSession`/
+            // `ExplicitCredentials` are only ever produced for `sudo`/`su`
+            // (`auth::to_auth_event`), so `event.meta.comm` is already one of
+            // the two here; the explicit match is defense in depth, not a new
+            // restriction. `sudo` joins on the trusted uid, not a name, and
+            // `su` still joins on the target `AuthEvent::target_user` names —
+            // see `crate::sudo`'s module doc for why they differ (review of
+            // #838, Sollykhan 2026-10-19, point 1).
+            let User::Unix { uid, .. } = event.meta.user else {
+                return Vec::new();
+            };
+            return if matches!(
+                event.kind,
+                AuthKind::PrivilegedSession | AuthKind::ExplicitCredentials
+            ) {
+                match event.meta.comm.as_str() {
+                    "sudo" => self.sudo_success.on_sudo_success(uid, ts),
+                    "su" => self.sudo_success.on_su_success(&event.target_user, ts),
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
         }
         // "local" for console/service logons that legitimately carry no
         // source address (see `AuthEvent::source_address`'s doc) — a distinct
@@ -1176,19 +1217,36 @@ impl RuleState {
             .source_address
             .map_or_else(|| "local".to_string(), |a| a.to_string());
         let key = (event.target_user.clone(), source.clone());
-        let ts = event.meta.timestamp_ns;
         // A success can reach the rules before the last failures that precede
-        // it (two channels, two poll threads): this failure may complete it.
-        // Only failures from the Windows Security log feed the join: they carry a
-        // Windows identity and are stamped with the event's own time, like the 1149.
-        // Application-log failures (`[logs]` sources) are stamped when the line is
-        // read, so a restart replaying a backlog would make hours-old failures look
-        // current: other clock, not joined.
+        // it (two channels, two poll threads, for RDP's own join): this failure
+        // may complete it. Only failures from the Windows Security log feed that
+        // join: they carry a Windows identity and are stamped with the event's
+        // own time, like the 1149. Application-log failures (`[logs]` sources)
+        // are stamped when the line is read, so a restart replaying a backlog
+        // would make hours-old failures look current: other clock, not joined.
         let mut alerts: Vec<Alert> = event
             .source_address
             .filter(|_| matches!(event.meta.user, User::Windows { .. }))
             .map(|address| self.rdp_success.on_failure(address, ts))
             .unwrap_or_default();
+        // The sudo/su join has no such cross-channel concern (one journal
+        // stream feeds both sides of it), but still joins by event time, not
+        // arrival order — see the `sudo` module's doc. Gated on `comm`, not
+        // just `User::Unix`: an sshd failure (`LogonFailure` from `SshFailed`)
+        // is also a Unix identity, and must never reach this join at all —
+        // unchanged by the point below. What changed (review of #838,
+        // Sollykhan 2026-10-19, point 1): once an event *does* pass this
+        // gate, `sudo`'s own side of the join now keys on the trusted uid
+        // below, not on anything parsed from the message; `su`'s still keys
+        // on the target name, which has its own, narrower residual exposure
+        // — see `crate::sudo`'s doc for why the two differ.
+        if let User::Unix { uid, .. } = event.meta.user {
+            match event.meta.comm.as_str() {
+                "sudo" => alerts.extend(self.sudo_success.on_sudo_failure(uid, ts)),
+                "su" => alerts.extend(self.sudo_success.on_su_failure(&event.target_user, ts)),
+                _ => {}
+            }
+        }
         let entry = self
             .auth_failures
             .get_or_insert_with(key, SlidingCounter::default);
