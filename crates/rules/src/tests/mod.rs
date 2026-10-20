@@ -10,10 +10,11 @@ use schema::{
 
 use crate::{
     O_CREAT, O_WRONLY, RuleState, check_account_creation_persistence, check_base64_decode,
-    check_btm_launch_item_persistence, check_encoded_powershell, check_ld_preload_hijack,
-    check_persistence_write, check_proc_root_escape, check_scheduled_task_persistence,
-    check_scheduled_task_update_persistence, check_service_install_persistence,
-    check_service_unusual_outbound, check_systemd_service_persistence,
+    check_btm_launch_item_persistence, check_doh_dot_connection, check_encoded_powershell,
+    check_ld_preload_hijack, check_persistence_write, check_proc_root_escape,
+    check_scheduled_task_persistence, check_scheduled_task_update_persistence,
+    check_service_install_persistence, check_service_unusual_outbound,
+    check_systemd_service_persistence,
     exclusions::{
         AUTH_FAILURE_THRESHOLD, BEACON_THRESHOLD, BURST_WRITE_BYTES_THRESHOLD,
         MEMFD_EXEC_WINDOW_NS, POLICY_DENIAL_ALERT_CAP, RANSOMWARE_RENAME_THRESHOLD,
@@ -308,6 +309,100 @@ fn policy_denial_event_full(
 }
 
 mod bits;
+
+/// Like [`policy_denial_event_full`], with an explicit `action` (#813): the other
+/// helper's many callers don't care about it (it defaults to `None` via
+/// `schema::fixtures::policy_denial()`), so it stays a 5-argument helper and this one
+/// is reached for only the few tests that do.
+fn policy_denial_event_with_action(
+    subject_context: Option<&str>,
+    object_context: Option<&str>,
+    object_class: Option<&str>,
+    action: Option<&str>,
+) -> PolicyDenialEvent {
+    PolicyDenialEvent {
+        action: action.map(str::to_string),
+        ..policy_denial_event_full(
+            "selinux",
+            subject_context,
+            object_context,
+            object_class,
+            true,
+        )
+    }
+}
+
+std::thread_local! {
+    static CAPTURED_LOGS: std::cell::RefCell<Option<Vec<u8>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Writes into the calling thread's [`captured_logs`] buffer, or nowhere when that
+/// thread is not capturing.
+struct ThreadCapture;
+
+impl std::io::Write for ThreadCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        CAPTURED_LOGS.with_borrow_mut(|captured| {
+            if let Some(captured) = captured {
+                captured.extend_from_slice(buf);
+            }
+        });
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Runs `f` and returns what it logged through `tracing` on the calling thread.
+///
+/// One process-wide subscriber, installed once, that routes each thread's output to
+/// that thread's own buffer — not `tracing::subscriber::with_default` (#876, #885).
+/// While a scoped subscriber is the only live dispatcher, `tracing-core` (0.1.36)
+/// computes a callsite's cached interest from the default of whichever thread
+/// registers it, so a parallel test hitting the same `warn!` first, with no
+/// subscriber of its own, caches it as "never" for the whole process and the
+/// capturing test reads nothing. A global default is every thread's default, so no
+/// registration order can disable a callsite under it.
+fn captured_logs(f: impl FnOnce()) -> String {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(|| ThreadCapture)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("no other test in this binary sets a global subscriber");
+    });
+    CAPTURED_LOGS.with_borrow_mut(|captured| *captured = Some(Vec::new()));
+    f();
+    let captured = CAPTURED_LOGS
+        .with_borrow_mut(Option::take)
+        .unwrap_or_default();
+    String::from_utf8_lossy(&captured).into_owned()
+}
+
+#[test]
+fn captured_logs_sees_a_callsite_another_thread_registered_first() {
+    // The #876/#885 race made deterministic: under `with_default`, the spawned thread
+    // (no subscriber of its own) registers the callsite as "never" and the capturing
+    // thread's own call is then filtered out before dispatch, so this read 0.
+    fn probe() {
+        tracing::warn!("captured-logs probe");
+    }
+    let logs = captured_logs(|| {
+        std::thread::spawn(probe).join().expect("probe thread");
+        probe();
+    });
+    assert_eq!(
+        logs.matches("captured-logs probe").count(),
+        1,
+        "exactly this thread's line, not zero and not the other thread's too: {logs}"
+    );
+}
+
 mod coverage;
 mod linux;
 mod motw_removal;

@@ -429,10 +429,22 @@ pub(crate) const BROWSERS: &[&str] = &[
     "vivaldi.exe",
 ];
 
-/// Distinct-shape alerts POLICY-DENIAL-DRIFT raises before it stops (#812):
+/// New-shape alerts POLICY-DENIAL-DRIFT raises per [`POLICY_DENIAL_ALERT_WINDOW_NS`] (#812):
 /// `known_policy_denials` bounds the rule's memory of what it has seen, not its alert
 /// volume, so a flood of distinct shapes (varying the subject/object type faster than a
-/// real host ever would) could otherwise emit one alert per shape, unbounded. Generous:
-/// a real host has at most a few hundred distinct (type, type, class) triples over its
-/// lifetime; anything past this is a flood, not more coverage.
-pub(crate) const POLICY_DENIAL_ALERT_CAP: u64 = 512;
+/// real host ever would) could otherwise emit one alert per shape, unbounded. The key is
+/// (mechanism, subject context, object context, object class, action); since #813 added
+/// the requested permission set to it, one (type, type, class) triple produces one shape
+/// per permission set the kernel denies for it, not one shape overall.
+///
+/// 2048 is a reasoned bound, **not a measured one**: a few hundred distinct triples times a
+/// handful of permission sets each was the estimate when it was chosen, and nobody has
+/// compared it with the denial volume of a real `SELinux`-enforcing fleet. Shapes past it are
+/// counted (`policy_denial_alerts_shed`) and, not being remembered, can alert in a later
+/// window. Revisit with real denial data.
+pub(crate) const POLICY_DENIAL_ALERT_CAP: u64 = 2048;
+
+/// How long [`POLICY_DENIAL_ALERT_CAP`] lasts before the budget refills: one hour of event time
+/// (`meta.timestamp_ns`). Long enough that a flood stays bounded to the cap per hour, short
+/// enough that a genuinely new denial after a noisy period is not silenced for the whole run.
+pub(crate) const POLICY_DENIAL_ALERT_WINDOW_NS: u64 = 3_600_000_000_000;

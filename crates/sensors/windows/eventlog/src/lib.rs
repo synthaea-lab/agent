@@ -167,6 +167,16 @@
 //! rule (`rules`' `session` module) flags a disconnected session reconnected
 //! from another client, T1563.002.
 //!
+//! ## Log clearing (#799)
+//!
+//! The Event Log service writes the first record of a log it has just emptied
+//! itself: Security **1102** for the audit log, System **104** (provider
+//! `Microsoft-Windows-Eventlog`) naming any other channel. Both become
+//! `schema::LogClearedEvent`, whatever did the clearing: the command-line rule
+//! sees `wevtutil cl` and `Clear-EventLog`, these also see `EvtClearLog` and
+//! .NET's `EventLogSession.ClearLog`. No audit subcategory gates them; one
+//! switch, `EventLogConfig::log_clears_enabled`, gates the pair.
+//!
 //! ## Transport: polling (default) vs. `EvtSubscribe` (#322)
 //!
 //! The two transports coexist and are selected per host via

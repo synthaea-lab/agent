@@ -34,12 +34,13 @@ use crate::{
     FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
     FileWriteEvent, HttpRequestEvent, HttpSignature, HttpSummaryEvent, IdentityChangeEvent,
     IdentityChangeKind, ImageLoadEvent, KernelModuleAction, KernelModuleEvent, LdapSearchEvent,
-    ListenPortEvent, MemfdCreateEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent,
-    NtlmAuthEvent, NtlmDirection, PackageChangeEvent, PackageChangeKind, PolicyDenialEvent,
-    PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent,
-    RegistrySetEvent, ScriptBlockEvent, SessionEvent, SessionState, ShellType, SmbConnectEvent,
-    SocketAcceptEvent, SocketBindEvent, SocketCreateEvent, SocketListenEvent, TlsCaptureEvent,
-    TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
+    ListenPortEvent, LogClearedEvent, MemfdCreateEvent, NamespaceEvent, NamespaceSyscall,
+    NetworkFlowEvent, NtlmAuthEvent, NtlmDirection, PackageChangeEvent, PackageChangeKind,
+    PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
+    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent, SessionState, ShellType,
+    SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketCreateEvent, SocketListenEvent,
+    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, User,
+    WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -140,6 +141,18 @@ pub fn ntlm_auth() -> NtlmAuthEvent {
         remote_address: None,
         ntlm_version: String::new(),
         status: None,
+    }
+}
+
+/// Neutral [`LogClearedEvent`]: the System log, no account named.
+#[must_use]
+pub fn log_cleared() -> LogClearedEvent {
+    LogClearedEvent {
+        meta: meta(),
+        channel: "System".into(),
+        subject_user: String::new(),
+        subject_logon_id: None,
+        backup_path: None,
     }
 }
 

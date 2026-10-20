@@ -14,7 +14,7 @@ use crate::{
         RarityStatsSource, SensorHealthSource, SpoolStatsSource,
     },
     ipc_handler::{AgentHandler, SensorHealthSlot},
-    silence::SilenceHealthSource,
+    silence::{SilenceHealthSource, SourceStatus},
     sink::DetectionSink,
 };
 
@@ -162,6 +162,7 @@ pub(crate) fn wire_run_pipeline(
 pub(crate) fn health_collector(
     pipeline: &RunPipeline,
     silence_monitor: Arc<Mutex<SilenceMonitor>>,
+    best_effort_sources: Vec<SourceStatus>,
     host_counters: Arc<dyn HostCountersSource>,
 ) -> HealthCollector {
     let spool_stats: Arc<dyn SpoolStatsSource> = match &pipeline.transport {
@@ -172,8 +173,10 @@ pub(crate) fn health_collector(
         None => Arc::new(NoopSpoolStats),
     };
     let heartbeat_client = pipeline.transport.as_ref().map(|t| Arc::clone(&t.client));
-    let silence_health: Arc<dyn SensorHealthSource> =
-        Arc::new(SilenceHealthSource::new(silence_monitor));
+    let silence_health: Arc<dyn SensorHealthSource> = Arc::new(SilenceHealthSource::new(
+        silence_monitor,
+        best_effort_sources,
+    ));
     let _ = pipeline.sensor_health.set(Arc::clone(&silence_health));
     HealthCollector::new(
         HealthCollectorConfig::default(),
@@ -245,6 +248,7 @@ mod tests {
         let _collector = health_collector(
             &pipeline,
             Arc::clone(&monitor),
+            Vec::new(),
             Arc::new(crate::host_counters::AgentHostCounters::new(
                 Arc::clone(&pipeline.sink),
                 crate::host_counters::WatchdogReport::default(),

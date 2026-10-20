@@ -15,14 +15,14 @@ use schema::{
     FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
     FileWriteEvent, GatekeeperVerdictEvent, HttpClientCount, HttpEvidence, HttpRequestEvent,
     HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent,
-    KernelModuleAction, KernelModuleEvent, LdapSearchEvent, ListenPortEvent, MemfdCreateEvent,
-    MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, NtlmAuthEvent, NtlmDirection,
-    POLICY_MECHANISM_SELINUX, PackageChangeEvent, PackageChangeKind, PolicyDenialEvent, PrctlEvent,
-    ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent,
-    ScriptBlockEvent, SessionEvent, SessionState, ShellType, SignalEvent, SmbConnectEvent,
-    SocketAcceptEvent, SocketBindEvent, SocketCreateEvent, SocketListenEvent, TccDecisionEvent,
-    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, User,
-    WmiActivityEvent, XpcConnectEvent,
+    KernelModuleAction, KernelModuleEvent, LdapSearchEvent, ListenPortEvent, LogClearedEvent,
+    MemfdCreateEvent, MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent,
+    NtlmAuthEvent, NtlmDirection, POLICY_MECHANISM_SELINUX, PackageChangeEvent, PackageChangeKind,
+    PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
+    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent, SessionState, ShellType,
+    SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketCreateEvent,
+    SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
+    UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -474,6 +474,58 @@ fn ntlm_auth_golden() {
             status: None,
         }),
         "ntlm_auth",
+    );
+}
+
+#[test]
+fn log_cleared_golden() {
+    assert_golden(
+        &Event::LogCleared(LogClearedEvent {
+            meta: EventMeta {
+                pid: 1612,
+                ppid: 0,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-1001".into(),
+                    integrity_level: None,
+                },
+                timestamp_ns: 1_760_520_000_000_000_000,
+                comm: String::new(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            channel: "Security".into(),
+            subject_user: r"LAB\analyst".into(),
+            subject_logon_id: Some("0x4d2c1".into()),
+            backup_path: None,
+        }),
+        "log_cleared",
+    );
+}
+
+#[test]
+fn log_cleared_with_backup_golden() {
+    assert_golden(
+        &Event::LogCleared(LogClearedEvent {
+            meta: EventMeta {
+                pid: 1612,
+                ppid: 0,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-1001".into(),
+                    integrity_level: None,
+                },
+                timestamp_ns: 1_760_520_001_000_000_000,
+                comm: String::new(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            channel: "Microsoft-Windows-PowerShell/Operational".into(),
+            subject_user: r"LAB\analyst".into(),
+            subject_logon_id: None,
+            backup_path: Some(r"C:\Users\analyst\ps.evtx".into()),
+        }),
+        "log_cleared_backup",
     );
 }
 
@@ -1562,8 +1614,10 @@ fn package_change_upgraded_golden() {
 fn policy_denial_golden() {
     // v23 (#297): a SELinux AVC denial — httpd blocked (enforcing mode) from
     // reading a file labeled for a user's home directory, the classic
-    // web-shell-reading-secrets shape. `action` is absent: the AVC parser
-    // doesn't yet recover the requested permission set, see the type's doc.
+    // web-shell-reading-secrets shape. `action` is absent: this fixture
+    // predates #813, which taught the AVC parser to recover the requested
+    // permission set — see the type's doc. Frozen as-is; a v23 fixture must
+    // keep producing what v23 actually produced.
     // v30 (#427): `object_path` from the AVC record's `path=`/`name=`.
     assert_golden(
         &Event::PolicyDenial(PolicyDenialEvent {
@@ -1586,6 +1640,36 @@ fn policy_denial_golden() {
             object_path: Some("/home/alice/.ssh/id_rsa".into()),
         }),
         "policy_denial",
+    );
+}
+
+#[test]
+fn policy_denial_with_action_golden() {
+    // The #813 shape: the AVC parser recovered the requested permission set, which is
+    // carried as written (space-joined, `{ read write }` -> "read write"). The
+    // `policy_denial` fixture above stays action-less, as v23 produced it; this one pins
+    // the field the SELinux denial-drift rule's dedup key now depends on.
+    assert_golden(
+        &Event::PolicyDenial(PolicyDenialEvent {
+            meta: EventMeta {
+                pid: 4242,
+                ppid: 1337,
+                user: User::Unix { uid: 48, gid: 48 },
+                timestamp_ns: 1_756_900_100_000_000_000,
+                comm: "httpd".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            mechanism: POLICY_MECHANISM_SELINUX.into(),
+            subject_context: Some("system_u:system_r:httpd_t:s0".into()),
+            object_context: Some("system_u:object_r:user_home_t:s0".into()),
+            object_class: Some("file".into()),
+            action: Some("read write".into()),
+            enforced: true,
+            object_path: Some("/home/alice/.ssh/id_rsa".into()),
+        }),
+        "policy_denial_with_action",
     );
 }
 
@@ -1843,7 +1927,7 @@ fn namespace_golden() {
 
 #[test]
 fn bits_job_golden() {
-    // v43 (#284): `bitsadmin /transfer` adding a file to a BITS job. The
+    // v46 (#284): `bitsadmin /transfer` adding a file to a BITS job. The
     // service does the download; this record names the client that asked.
     assert_golden(
         &Event::BitsJob(BitsJobEvent {
@@ -1874,7 +1958,7 @@ fn bits_job_golden() {
 
 #[test]
 fn bits_job_transfer_error_golden() {
-    // v43 (#284): the same job failing mid-transfer, reported by the BITS
+    // v46 (#284): the same job failing mid-transfer, reported by the BITS
     // service and attributed to the client that added the file.
     assert_golden(
         &Event::BitsJob(BitsJobEvent {
@@ -2183,6 +2267,13 @@ fn meta_accessor_covers_all_variants() {
             namespace: String::new(),
             query: None,
             method: None,
+        }),
+        Event::LogCleared(LogClearedEvent {
+            meta: meta.clone(),
+            channel: String::new(),
+            subject_user: String::new(),
+            subject_logon_id: None,
+            backup_path: None,
         }),
         Event::NtlmAuth(NtlmAuthEvent {
             meta: meta.clone(),
