@@ -99,7 +99,10 @@ fn a_late_completion_record_does_not_rearm_an_alerted_download() {
 }
 
 #[test]
-fn a_new_job_for_the_same_path_rearms_it() {
+fn the_same_job_adding_the_path_again_rearms_it() {
+    // Another job's `FileAdded` over a completed download does not: only its
+    // completion re-arms the path, see
+    // `another_jobs_completion_over_an_alerted_download_alerts_again`.
     let mut state = RuleState::new();
     state.on_bits_job(&job(BitsJobState::Completed, 0));
     assert_eq!(state.on_exec(&run(PAYLOAD, 1)).len(), 1);
