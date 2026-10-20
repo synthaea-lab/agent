@@ -1,0 +1,185 @@
+# Contributor: Synthaea Security <security@synthaea.io>
+# Maintainer: Synthaea Security <security@synthaea.io>
+pkgname=synthaea-agent
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="Synthaea EDR Agent - on-device eBPF detection and response"
+url="https://github.com/synthaea-lab/edr"
+# Static-musl build, same constraint as packaging/linux/build-deb.sh (the
+# ONNX Runtime static-link flag discovery is written against that host).
+arch="x86_64"
+license="Apache-2.0"
+# Fully static (musl, +crt-static): no runtime library dependency at all,
+# same property the .deb build on Alpine proves (CI: linux-deb-portability.yml).
+# openrc>=0.45: synthaea-agent.initd's `capabilities=` directive (ambient
+# capabilities via supervise-daemon, the OpenRC equivalent of the systemd
+# unit's AmbientCapabilities=) needs that version or later. Every Alpine
+# release this package targets (3.19+, see lab/MATRIX.md) ships well above
+# it — this is a floor, not expected to bind — but it documents the
+# assumption instead of failing silently on an ancient host. No
+# libcap-utils/setcap: dropped in favor of that directive (review finding —
+# file capabilities broke both self-update and the watchdog's die-with-
+# parent protection, see the initd's own comment).
+depends="openrc>=0.45"
+# No "cargo"/"rust" here: build() uses its own rustup-managed toolchain (the
+# exact channel rust-toolchain.toml pins, plus the ebpf-toolchain.txt nightly
+# with rust-src), not Alpine's system Rust — see lab/provisioning/alpine-toolchain.sh.
+# These cover the C/C++ side cargo's own build scripts and onnxruntime's CMake
+# need, same list as that provisioning script.
+makedepends="findutils tar zstd curl python3 python3-dev py3-pip
+	cmake clang llvm-dev binutils git bash elfutils-dev openssl-dev xz-dev
+	xz-static zstd-dev samurai"
+# samurai: abuild's own default.conf exports CMAKE_GENERATOR=Ninja for every
+# Alpine package (review finding, same leak category as the four
+# CARGO_PROFILE_RELEASE_* ones above, just not Rust-specific), which reaches
+# the ONNX Runtime CMake build in build() below. Declared explicitly rather
+# than unset: unlike the Cargo profile leak, this one isn't a correctness
+# bug on its own — it just means a builder without samurai fails at
+# configure with no indication why.
+install="$pkgname.pre-install $pkgname.post-install $pkgname.pre-deinstall $pkgname.post-deinstall"
+subpackages=""
+# cargo build needs crates.io + the onnxruntime source clone; abuild's
+# default sandbox has no network.
+# !check: no check() is defined. build-deb.sh's equivalent build runs
+# `cargo test -p ml` (the ORT static-link smoke test) and a readelf
+# static-link check before packaging (review finding — this recipe has
+# neither, and no CI job builds the APKBUILD at all yet); left as a
+# follow-up rather than threading build()'s local target/env setup through a
+# second abuild hook under review-driven time pressure, same gap old-dov's
+# review flagged for #891's test plan (no `apk upgrade` cycle either).
+options="net !check"
+
+# Built directly from the monorepo checkout this APKBUILD ships in — not an
+# upstream tarball (same reasoning as build-deb.sh/build-rpm.sh: these are
+# packaging recipes for this repo, not a standalone release artifact).
+builddir="$startdir/../../.."
+
+build() {
+	cd "$builddir"
+	# abuild sandboxes CARGO_HOME to its own tmp/cargo per run (confirmed
+	# live via /proc/<pid>/environ) — pinned back to the real one so this
+	# reuses the already-provisioned toolchain/registry cache instead of a
+	# fresh, empty one every run.
+	export CARGO_HOME="$HOME/.cargo"
+
+	# abuild's own /usr/share/abuild/default.conf exports these four for
+	# every Alpine package, size/footprint-first (same spirit as its
+	# CFLAGS="-Os ..."): OPT_LEVEL=s, PANIC=abort, LTO=true,
+	# CODEGEN_UNITS=1. They override Cargo.toml and leak straight into
+	# aya-build's nested eBPF cross-build. Confirmed live on alpine-vm this
+	# is exactly where the eBPF probes' "-Os" came from — not bpf-linker,
+	# not aya-build, both innocent (bpf-linker 0.11.1's bundled LLVM has
+	# genuinely dropped "Os" as a preset, see its own `-O` help text
+	# default of "2", but that only bites when something still asks for
+	# "s"). The dangerous one is CARGO_PROFILE_RELEASE_PANIC=abort: the
+	# agent relies on unwind to degrade a single sensor whose thread
+	# panics instead of taking the whole process down with it (and for the
+	# graceful-shutdown path) — built with abort, a sensor panic kills the
+	# agent outright and watchdog loops forever restarting it. Unset all
+	# four so this package gets the exact same Cargo-resolved profile as
+	# build-deb.sh/build-rpm.sh and CI, which never run under abuild and
+	# never had this leak.
+	unset CARGO_PROFILE_RELEASE_OPT_LEVEL CARGO_PROFILE_RELEASE_PANIC \
+		CARGO_PROFILE_RELEASE_LTO CARGO_PROFILE_RELEASE_CODEGEN_UNITS
+	local target=x86_64-unknown-linux-musl
+	# CARGO_TARGET_DIR, not a bare "target/": honours a caller override (a
+	# small root disk may need this redirected, e.g. CARGO_TARGET_DIR=/mnt/
+	# build-cache/...) the same way build-deb.sh's own cargo invocation does,
+	# defaulting to the usual in-tree location. package() resolves the same
+	# way, from the same variable.
+	local target_dir="${CARGO_TARGET_DIR:-$builddir/target}"
+
+	# $HOME/.cargo/bin ahead of /usr/local/bin's own bpf-linker copy
+	# (alpine-toolchain.sh symlinks one there too, and it can go stale —
+	# confirmed live: a refreshed ~/.cargo/bin/bpf-linker left the
+	# /usr/local/bin one behind, same binary size/version string, different
+	# bytes, and cargo picked the stale one via PATH order).
+	export PATH="$HOME/.cargo/bin:$PATH"
+	if ! command -v bpf-linker >/dev/null 2>&1; then
+		error "bpf-linker not found — run lab/provisioning/alpine-toolchain.sh first"
+		return 1
+	fi
+	rustup target add "$target" 2>/dev/null || true
+
+	# Same stale-build-cache bust as alpine-toolchain.sh's own
+	# bust_stale_sensor_linux_build: build.rs's rerun-if-env-changed=PATH
+	# does not fire when ~/.cargo/bin was already on PATH and only the
+	# bpf-linker binary underneath it changed, so a target dir reused across
+	# a toolchain/linker refresh (a long-lived dev host, not CI's always-
+	# fresh container) keeps retrying a link that already failed once. No
+	# depth limit (confirmed live: the real stale state sits several levels
+	# down, under <target-triple>/release/build/sensor-linux-*/out/aya-build/...,
+	# past what a shallow maxdepth reaches) — -prune stops each match from
+	# being descended into once found, so this doesn't walk what it deletes.
+	find "$target_dir" -type d \( -iname "sensor-linux-*" -o -iname "sensor_linux_*" \) \
+		-prune -exec rm -rf {} + 2>/dev/null || true
+
+	local ort_lib_location="${ORT_LIB_LOCATION:-}"
+	if [ -z "$ort_lib_location" ]; then
+		msg "Building static ONNX Runtime from source (lab/provisioning/build-onnxruntime-static.sh)..."
+		"$builddir/lab/provisioning/build-onnxruntime-static.sh"
+		ort_lib_location="$builddir/onnxruntime/build/Linux/Release"
+	fi
+
+	export ORT_LIB_LOCATION="$ort_lib_location"
+	local ort_flags
+	ort_flags="$(bash "$builddir/lab/provisioning/ort-static-link-flags.sh")" \
+		|| die "ort-static-link-flags.sh failed: ONNX Runtime cannot be linked statically"
+	case "$ort_flags" in
+		*"-l static="*) ;;
+		*) die "ort-static-link-flags.sh produced no link flags" ;;
+	esac
+	# ort_flags is itself `export RUSTFLAGS="..."` (meant to be eval'd), not a
+	# bare flag string — matches build-deb.sh's own usage of this script.
+	eval "$ort_flags"
+	export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-feature=+crt-static"
+	CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" \
+		CARGO_TARGET_DIR="$target_dir" \
+		CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUNNER=env \
+		cargo build --locked --release --target "$target" \
+		--no-default-features -p agent -p watchdog -p cli
+
+	# The shipped artifacts: no public test signing key (ADR-0027).
+	"$builddir/tools/assert-no-test-key.sh" \
+		"$target_dir/$target/release/agent" \
+		"$target_dir/$target/release/watchdog" \
+		"$target_dir/$target/release/cli"
+}
+
+package() {
+	cd "$builddir"
+	local target=x86_64-unknown-linux-musl
+	local target_dir="${CARGO_TARGET_DIR:-$builddir/target}"
+	local bin="$target_dir/$target/release"
+
+	install -D -m755 "$bin/agent" "$pkgdir/var/lib/synthaea/bootstrap/agent"
+	install -D -m755 "$bin/watchdog" "$pkgdir/var/lib/synthaea/bootstrap/watchdog"
+	install -D -m755 "$bin/cli" "$pkgdir/var/lib/synthaea/bootstrap/cli"
+
+	install -D -m755 "$startdir/synthaea-agent.initd" \
+		"$pkgdir/etc/init.d/synthaea-agent"
+
+	# The same default-agent.toml template `cli config init` writes (#675's
+	# .deb precedent): every control-plane field is a `# CHANGE ME`, but
+	# offline_fallback = true lets the agent start and run on it as shipped.
+	install -D -m644 "$builddir/crates/config/data/default-agent.toml" \
+		"$pkgdir/etc/synthaea/agent.toml"
+
+	install -d -m750 "$pkgdir/var/lib/synthaea/versions"
+	install -d -m750 "$pkgdir/var/log/synthaea"
+
+	# /usr is read-only while the service runs under its hardening (same
+	# reasoning as the systemd unit's ProtectSystem=strict and the .deb
+	# postinst's identical symlink), so this is created at package-install
+	# time, not by the service itself.
+	install -d "$pkgdir/usr/bin"
+	ln -s /var/lib/synthaea/current/cli "$pkgdir/usr/bin/synthaea-ctl"
+}
+
+# Empty, not missing: builddir is this monorepo checkout (see builddir=
+# above), not a fetched/verified source tarball, so there is nothing for
+# abuild to checksum here — same as build-deb.sh/build-rpm.sh's own trust
+# boundary (the checkout itself, via normal git/CI provenance). Do not add
+# a source= entry and "fix" this to silence abuild's warning.
+sha512sums="
+"
