@@ -527,6 +527,62 @@ pub(crate) fn check_service_write_outside_datadir(
     })
 }
 
+/// T1564.004 (#136, ADS slice 1) — Hide Artifacts: NTFS File Attributes. A
+/// write-intent open on an NTFS alternate data stream: the final path
+/// component carries a `:streamname` suffix, which only exists as a way to
+/// attach a second, normally-invisible data fork to a file (`dir`/Explorer
+/// show only the unnamed stream's size; the named one does not appear in a
+/// directory listing). Malware uses this to stash a payload, a dropped tool,
+/// or staged exfil data on a file that still looks ordinary.
+///
+/// Windows only: the colon-suffixed stream syntax is NTFS-specific. The
+/// sensor already restricts `FileOpenEvent` to write-intent opens
+/// ([`has_write_intent`]; a pure read never reaches this far), so every event
+/// here already represents something being written into the stream, not
+/// merely read back.
+///
+/// **The one documented, high-volume exception is `Zone.Identifier`**: every
+/// browser, mail client, and Explorer's own "download from the internet"
+/// marking writes one on nearly every downloaded file (`#365`/`#439`
+/// already track this stream specifically for the mark-of-the-web). Excluding
+/// it by name is the same evidence-gated-exclusion bar the rest of this crate
+/// holds everything else to (`CLAUDE.md`) — it is the only stream name with
+/// that evidence today. Other legitimate stream producers (backup tools,
+/// some antivirus quarantine formats, older Office OLE property sets) are a
+/// known, accepted gap until one is actually observed and named, the same
+/// unbounded-tail trade-off ADR-0028 documents for `policy`'s interpreter
+/// blocklist. Severity is Medium, not High, for the same reason: a named
+/// stream alone is a weak, easily-legitimate signal without more context.
+#[must_use]
+pub(crate) fn check_alternate_data_stream_write(event: &FileOpenEvent) -> Option<Alert> {
+    if !has_write_intent(event.flags) {
+        return None;
+    }
+    let name = event.path.rsplit(['\\', '/']).next().unwrap_or("");
+    // The drive-letter colon (`C:`) never appears after the last separator;
+    // only a real stream suffix does. A bare `name:` with nothing after it,
+    // or a name starting with `:` (no base file name), is not a real stream.
+    let (base, rest) = name.split_once(':')?;
+    if base.is_empty() || rest.is_empty() {
+        return None;
+    }
+    // A type tag (`:$DATA`, `:$INDEX_ALLOCATION`, ...) can follow the stream
+    // name; strip it the same way Windows's own `dir /r` output does.
+    let stream = rest.split_once(':').map_or(rest, |(stream, _tag)| stream);
+    if stream.eq_ignore_ascii_case("Zone.Identifier") {
+        return None;
+    }
+    Some(Alert {
+        technique: "T1564.004",
+        severity: Severity::Medium,
+        message: format!(
+            "pid={} comm={}: wrote to alternate data stream {stream:?} of {base} — \
+             data hidden outside the file's visible contents",
+            event.meta.pid, event.meta.comm,
+        ),
+    })
+}
+
 /// Evaluates all stateless rules applicable to a `FileOpenEvent`. T1053.005
 /// creation ([`check_scheduled_task_persistence`]) is not among them: one
 /// registration arrives twice (4698 and 106), so `RuleState::on_file_open`
@@ -543,6 +599,7 @@ pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
         .chain(check_account_creation_persistence(event))
         .chain(check_systemd_service_persistence(event))
         .chain(check_btm_launch_item_persistence(event))
+        .chain(check_alternate_data_stream_write(event))
         .collect()
 }
 
