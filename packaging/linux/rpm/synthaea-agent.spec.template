@@ -37,6 +37,15 @@ install -D -m 0755 "$T/agent" %{buildroot}/var/lib/synthaea/bootstrap/agent
 install -D -m 0755 "$T/watchdog" %{buildroot}/var/lib/synthaea/bootstrap/watchdog
 install -D -m 0755 "$T/cli" %{buildroot}/var/lib/synthaea/bootstrap/cli
 
+# synthaea-ctl: a second, root-owned copy of the same cli binary, not a
+# symlink into /var/lib/synthaea/current (#897) — that directory belongs to
+# the unprivileged synthaea service user, so a compromised agent could
+# repoint it and have `sudo synthaea-ctl` run arbitrary code as root. This
+# copy goes stale only across a self-update that bumps crates/ipc's
+# PROTOCOL_VERSION, which is a clean, disclosed version-mismatch error until
+# the next package upgrade, not a silent one.
+install -D -m 0755 "$T/cli" %{buildroot}%{_bindir}/synthaea-ctl
+
 # systemd integration
 install -D -m 0644 packaging/linux/systemd/synthaea-agent.service \
     %{buildroot}%{_unitdir}/synthaea-agent.service
@@ -51,11 +60,6 @@ install -d -m 0750 %{buildroot}/var/log/synthaea
 
 # Config directory (placeholder)
 install -d -m 0755 %{buildroot}/etc/synthaea
-
-# CLI symlink, as the .deb postinst creates it. The unit cannot: it runs as the
-# unprivileged synthaea user under ProtectSystem=strict, so /usr is read-only.
-install -d -m 0755 %{buildroot}%{_bindir}
-ln -s /var/lib/synthaea/current/cli %{buildroot}%{_bindir}/synthaea-ctl
 
 %pre
 %sysusers_create_compat packaging/linux/systemd/synthaea.sysusers

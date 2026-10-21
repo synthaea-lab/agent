@@ -140,17 +140,19 @@ fn report_change(change: &roll_forward::Change, current_version: u64) {
         eprintln!("  removed        {path}");
     }
     for path in &change.brought_back {
-        eprintln!("  brought back   {path} (its bytes must be in the artifact store)");
-    }
-    if !change.restored_bytes.is_empty() {
         eprintln!(
-            "WARNING: {} path(s) hold different bytes in the release being withdrawn. The artifact \
-             store keeps one file per path, so put the earlier bytes back at these paths BEFORE \
-             publishing, or the publish is refused and agents could not fetch them:",
-            change.restored_bytes.len()
+            "  brought back   {path} (its bytes must be in the artifact store under their hash)"
         );
-        for path in &change.restored_bytes {
-            eprintln!("  restore bytes  {path}");
+    }
+    if !change.different_bytes.is_empty() {
+        eprintln!(
+            "{} path(s) hold different bytes in the release being withdrawn — nothing to \
+             restore (artifacts are hash-keyed, #804); if publishing below is refused (422, \
+             \"not in the store\"), see docs/operations/content.md.",
+            change.different_bytes.len()
+        );
+        for path in &change.different_bytes {
+            eprintln!("  different      {path}");
         }
     }
 }

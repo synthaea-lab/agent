@@ -3599,27 +3599,40 @@ const SINGLE_ID_OFFSET: usize = 16;
 #[cfg(bpf_target_arch = "x86")]
 const SINGLE_ID_OFFSET: usize = 12;
 
-/// Offsets of `setresuid(2)`/`setresgid(2)`'s three `uid_t`/`gid_t`
-/// arguments (real, effective, saved) — identical shape for both, assumed
-/// standard layout, same posture as `SINGLE_ID_OFFSET`.
+/// Offset of `setresuid(2)`/`setresgid(2)`'s first `uid_t`/`gid_t` argument
+/// (real) — identical shape for both, assumed standard layout, same posture
+/// as `SINGLE_ID_OFFSET`. effective and saved sit immediately after it, one
+/// register width apart each, and `try_sys_enter_setres` reads all three in
+/// a single `read_at::<[_; 3]>` instead of three separate reads at three
+/// separate offsets: three reads, each with its own early-return `?`, was
+/// enough extra verifier state to fail this function with "R2 !read_ok" at
+/// its call sites under a forced `-O2` build (abuild's default.conf was
+/// overriding Cargo's resolved opt-level for the Alpine package — see
+/// packaging/linux/alpine/APKBUILD; the real fix was unsetting that
+/// override, not this). Kept anyway as cheap hardening, same spirit as
+/// `emit_mount_event`'s own note: `raw_sys_enter` (ebpf/src/raw.rs) is one
+/// shared verifier unit across every `sys_enter_*` branch, so a rejection
+/// anywhere in it loses all syscall telemetry, not just this probe. The
+/// function is also `#[inline(always)]` now — confirmed live that this
+/// alone (still with the original three reads) was already enough to pass
+/// the verifier: the real mechanism is the BPF-to-BPF call/return, not the
+/// read count. Both are kept: one less thing to re-diagnose if a future
+/// change makes LLVM decide not to inline it anyway.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const RES_ID_REAL_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const RES_ID_EFFECTIVE_OFFSET: usize = 24;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const RES_ID_SAVED_OFFSET: usize = 32;
 /// i686: inferred, not independently verified.
 #[cfg(bpf_target_arch = "x86")]
 const RES_ID_REAL_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-const RES_ID_EFFECTIVE_OFFSET: usize = 16;
-#[cfg(bpf_target_arch = "x86")]
-const RES_ID_SAVED_OFFSET: usize = 20;
 
 /// Shared by all six probes below: fills `EventMeta` and the kind-specific id
 /// fields into `IDENTITY_CHANGE_SCRATCH`, then emits. Mirrors
 /// `emit_kernel_module_event`'s shape (#264) — one assembly helper for a
 /// family of syscalls that share almost all of their event fields.
+///
+/// Always inlined, same reasoning as `emit_mount_event`: a real BPF-to-BPF
+/// call hands the verifier a return/argument path it can't always prove,
+/// and this has several call sites (one per probe below).
+#[inline(always)]
 fn emit_identity_change_event(
     ctx: &TracePointContext,
     kind: u8,
@@ -3667,6 +3680,11 @@ fn emit_identity_change_event(
 /// Reads a single 32-bit `uid_t`/`gid_t` syscall argument at `SINGLE_ID_OFFSET`,
 /// shared by `setuid`/`setgid`/`setfsuid`/`setfsgid` — the four probes below
 /// differ only in which `IDENTITY_KIND_*` they pass through.
+///
+/// Always inlined, same reasoning as `emit_mount_event`: four call sites,
+/// and a real BPF-to-BPF call here would hand the verifier a return path
+/// it can't always prove.
+#[inline(always)]
 fn read_single_id(ctx: &TracePointContext) -> Result<u32, u32> {
     #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     let id: u64 = unsafe { ctx.read_at(SINGLE_ID_OFFSET).map_err(|_| 1u32)? };
@@ -3735,26 +3753,23 @@ pub fn sys_enter_setresgid(ctx: TracePointContext) -> u32 {
     }
 }
 
+#[inline(always)]
 fn try_sys_enter_setres(ctx: &TracePointContext) -> Result<(u32, u32, u32), u32> {
+    // One `bpf_probe_read_kernel` over all three contiguous arguments, not
+    // three separate reads with three early returns — see the
+    // `RES_ID_REAL_OFFSET` doc comment for why.
     #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let real: u64 = unsafe { ctx.read_at(RES_ID_REAL_OFFSET).map_err(|_| 1u32)? };
+    {
+        let [real, effective, saved]: [u64; 3] =
+            unsafe { ctx.read_at(RES_ID_REAL_OFFSET).map_err(|_| 1u32)? };
+        Ok((real as u32, effective as u32, saved as u32))
+    }
     #[cfg(bpf_target_arch = "x86")]
-    let real: u64 = unsafe { ctx.read_at::<u32>(RES_ID_REAL_OFFSET).map_err(|_| 1u32)? as u64 };
-
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let effective: u64 = unsafe { ctx.read_at(RES_ID_EFFECTIVE_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let effective: u64 = unsafe {
-        ctx.read_at::<u32>(RES_ID_EFFECTIVE_OFFSET)
-            .map_err(|_| 1u32)? as u64
-    };
-
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let saved: u64 = unsafe { ctx.read_at(RES_ID_SAVED_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let saved: u64 = unsafe { ctx.read_at::<u32>(RES_ID_SAVED_OFFSET).map_err(|_| 1u32)? as u64 };
-
-    Ok((real as u32, effective as u32, saved as u32))
+    {
+        let [real, effective, saved]: [u32; 3] =
+            unsafe { ctx.read_at(RES_ID_REAL_OFFSET).map_err(|_| 1u32)? };
+        Ok((real, effective, saved))
+    }
 }
 
 // --- Capability set change (issue #266) ---------------------------------------

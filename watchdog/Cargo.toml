@@ -46,6 +46,18 @@ assets = [
     ["target/release/agent", "var/lib/synthaea/bootstrap/", "755"],
     ["target/release/cli", "var/lib/synthaea/bootstrap/", "755"],
 
+    # The operator-facing CLI, installed as its own root-owned copy of the same
+    # binary (#897): postinst used to `ln -sf` this path to
+    # /var/lib/synthaea/current/cli, but that symlink's target directory is
+    # owned by the unprivileged synthaea service user, so a compromised agent
+    # could repoint `current` (or drop a binary into a versions/ directory) and
+    # get root the next time an operator ran `sudo synthaea-ctl`. dpkg now owns
+    # this file's lifecycle like any other package asset, so it goes stale only
+    # across a self-update that bumps crates/ipc's PROTOCOL_VERSION — a clean,
+    # disclosed version-mismatch error until the next package upgrade ships a
+    # matching CLI, not a silent one.
+    ["target/release/cli", "usr/bin/synthaea-ctl", "755"],
+
     # systemd integration
     ["../packaging/linux/systemd/synthaea-agent.service", "usr/lib/systemd/system/", "644"],
     ["../packaging/linux/systemd/synthaea.sysusers", "usr/lib/sysusers.d/synthaea.conf", "644"],

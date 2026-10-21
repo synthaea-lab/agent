@@ -153,7 +153,7 @@ fn forward(record: &parse::AuditRecord, sink: &dyn EventSink) {
     sink.on_event(schema_event);
 }
 
-fn audit_ts_to_epoch_ns(sec: u64, ms: u32) -> u64 {
+pub(crate) fn audit_ts_to_epoch_ns(sec: u64, ms: u32) -> u64 {
     sec * 1_000_000_000 + (ms as u64) * 1_000_000
 }
 
