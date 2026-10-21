@@ -107,6 +107,8 @@ pub enum WireError {
     ZeroSequence,
     #[error("timestamp {0} is before 1970")]
     TimestampBeforeEpoch(i64),
+    #[error("timestamp {0} does not fit in a 64-bit nanosecond count")]
+    TimestampOverflow(i64),
 }
 
 /// Decodes one message payload.
@@ -216,8 +218,14 @@ fn filetime_to_unix_ns(filetime: i64) -> Result<u64, WireError> {
         .checked_sub(FILETIME_UNIX_EPOCH)
         .filter(|t| *t >= 0)
         .ok_or(WireError::TimestampBeforeEpoch(filetime))?;
-    // A non-negative i64 of 100 ns units times 100 fits in u64 (i64::MAX * 100 < u64::MAX * 1).
-    Ok(u64::try_from(since_epoch).unwrap_or(0).saturating_mul(100))
+    // A non-negative i64 of 100 ns units times 100 can overflow u64 (i64::MAX * 100 is
+    // roughly 50x u64::MAX): reject rather than silently clamp to u64::MAX, which would
+    // make an attacker-controlled or corrupted far-future timestamp indistinguishable
+    // from a genuinely maximal one (#853 review).
+    u64::try_from(since_epoch)
+        .ok()
+        .and_then(|units| units.checked_mul(100))
+        .ok_or(WireError::TimestampOverflow(filetime))
 }
 
 /// Little-endian reads over a buffer whose length the caller has already checked; every read
@@ -356,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn the_header_is_sixty_four_bytes() {
+    fn the_header_is_seventy_two_bytes() {
         assert_eq!(encode(&message(Body::Heartbeat), RAW_TS).len(), HEADER_LEN);
     }
 
@@ -407,7 +415,12 @@ mod tests {
             decode(&encode(&delete(), i64::MIN)),
             Err(WireError::TimestampBeforeEpoch(i64::MIN))
         );
-        assert!(decode(&encode(&delete(), i64::MAX)).is_ok());
+        // A far-future timestamp whose nanosecond count would overflow u64 is refused,
+        // not silently clamped to u64::MAX (#853 review).
+        assert_eq!(
+            decode(&encode(&delete(), i64::MAX)),
+            Err(WireError::TimestampOverflow(i64::MAX))
+        );
     }
 
     #[test]

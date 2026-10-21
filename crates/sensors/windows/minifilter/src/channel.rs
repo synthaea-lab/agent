@@ -78,6 +78,13 @@ pub fn run(
         // by the connect: a connection that never delivers anything is still a failed attempt.
         let mut delivered = false;
         loop {
+            // `port.receive` only notices `stop` on a wait timeout; while messages keep
+            // arriving before the timeout elapses (a delete/rename storm), it never times
+            // out and `stop` is never read there. Check it here too, so a continuous
+            // stream of messages cannot delay shutdown (#853 review).
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
             match port.receive(&mut buffer, stop) {
                 Ok(None) => return,
                 Ok(Some(payload)) => {
