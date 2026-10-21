@@ -71,6 +71,7 @@ mod silence;
     allow(dead_code)
 )]
 mod sink;
+mod snapshot_fetch;
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos", windows)),
     allow(dead_code)

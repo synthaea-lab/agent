@@ -74,6 +74,25 @@ pub enum UpdaterError {
         actual: String,
     },
 
+    /// A snapshot manifest's `kind` is not one this build knows (ADR-0033: only `common-set`).
+    #[error("snapshot manifest kind `{found}` is not supported")]
+    SnapshotKindUnsupported { found: String },
+
+    /// A snapshot manifest's `built_at` is not later than the snapshot in force: a replay or a
+    /// rollback of the server's own state. The snapshot in force stays (ADR-0033 decision 3).
+    #[error("snapshot built at {offered} is not newer than the one in force ({current})")]
+    SnapshotNotNewer { offered: u64, current: u64 },
+
+    /// A snapshot manifest claims to be built further in the future than the clock-skew
+    /// tolerance allows: a wrong server clock, or a manifest made to outlive its maximum age.
+    #[error("snapshot built at {built_at} is dated beyond now ({now}) plus the tolerance")]
+    SnapshotFromFuture { built_at: u64, now: u64 },
+
+    /// The artifact does not match the signed manifest that names it (size, hash, or a header
+    /// that disagrees with the manifest).
+    #[error("snapshot artifact does not match its manifest: {0}")]
+    SnapshotArtifactMismatch(String),
+
     /// Filesystem I/O failed — the underlying [`std::io::Error`] carries the
     /// specifics (missing permissions, disk full, etc).
     #[error("I/O error on {path}: {source}")]

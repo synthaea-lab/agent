@@ -103,7 +103,19 @@ impl EnrichQueue {
                             enrich_event(&mut enricher, &mut event, gated.is_some());
                             on_enriched(*event, gated);
                         }
-                        QueueItem::Detection(detection) => on_detection(*detection),
+                        QueueItem::Detection(mut detection) => {
+                            // The rules ran before the event itself was queued, so the detection
+                            // was built from an exec with no hash yet. Give it the hash here,
+                            // where hashing already happens: the event that follows in the queue
+                            // is then a cache hit, and the detection the control plane receives
+                            // carries the `sha256` it can join hosts on (#62). A file that
+                            // cannot be read leaves the event as it was: a finding is never
+                            // dropped for want of a hash.
+                            for event in &mut detection.events {
+                                enrich_event(&mut enricher, event, false);
+                            }
+                            on_detection(*detection);
+                        }
                         // Nothing to do but signal back — arriving here at all means
                         // every `Event` sent before it has already been enriched and
                         // handed to `on_enriched`, since this is a single-consumer
@@ -281,6 +293,78 @@ mod tests {
         );
         assert!(e.signature.is_some());
         std::fs::remove_file(&path).ok();
+    }
+
+    fn detection_over(event: Event) -> Detection {
+        Detection {
+            timestamp_ns: 1,
+            severity: schema::detection::Severity::High,
+            title: "t".into(),
+            source: schema::detection::DetectionSource::Rule {
+                rule_id: "T1059".into(),
+            },
+            score: None,
+            attributions: Vec::new(),
+            techniques: Vec::new(),
+            events: vec![event],
+        }
+    }
+
+    /// The detection is queued before its own event (the rules run first), so the worker meets
+    /// it with no hash yet. Without this the uploaded detection carries an exec with no
+    /// `sha256`, and the control plane has nothing to join detections of two hosts on (#62).
+    #[test]
+    fn a_detection_reaches_its_callback_with_the_hash_of_its_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload");
+        std::fs::write(&path, b"abc").unwrap();
+
+        let seen: Arc<Mutex<Vec<Detection>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_w = seen.clone();
+        let queue = EnrichQueue::start_with_detections(
+            Enricher::new(),
+            |_, _| {},
+            move |d| seen_w.lock().unwrap().push(d),
+        );
+        queue
+            .enqueue_detection(detection_over(exec(&path.to_string_lossy())))
+            .unwrap();
+        assert!(queue.flush(Duration::from_secs(5)));
+
+        let seen = seen.lock().unwrap();
+        let Event::Exec(e) = &seen[0].events[0] else {
+            panic!("expected exec")
+        };
+        assert_eq!(
+            e.sha256.as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+    }
+
+    #[test]
+    fn a_detection_over_a_file_that_cannot_be_read_is_still_delivered_unchanged() {
+        let seen: Arc<Mutex<Vec<Detection>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_w = seen.clone();
+        let queue = EnrichQueue::start_with_detections(
+            Enricher::new(),
+            |_, _| {},
+            move |d| seen_w.lock().unwrap().push(d),
+        );
+        queue
+            .enqueue_detection(detection_over(exec("/nonexistent/payload")))
+            .unwrap();
+        assert!(queue.flush(Duration::from_secs(5)));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            1,
+            "a finding is never dropped for want of a hash"
+        );
+        let Event::Exec(e) = &seen[0].events[0] else {
+            panic!("expected exec")
+        };
+        assert_eq!(e.sha256, None);
     }
 
     #[test]
