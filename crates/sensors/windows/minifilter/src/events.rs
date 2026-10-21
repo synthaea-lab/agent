@@ -212,6 +212,44 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_qualified_delete_keeps_its_stream_name() {
+        // #136 ADS slice 2: confirmed against the driver's actual name-capture
+        // (FLT_FILE_NAME_NORMALIZED's `Name` already includes `:streamname`)
+        // that nothing between the driver and here strips or re-parses the
+        // colon; only the volume prefix is rewritten.
+        let event = to_event(
+            &message(Body::Delete {
+                path: r"\Device\HarddiskVolume1\Users\x.docx:hidden".into(),
+                on_close: false,
+                truncated: false,
+            }),
+            &volumes(),
+        );
+        let Some(Event::FileDelete(delete)) = event else {
+            panic!("{event:?}");
+        };
+        assert_eq!(delete.path, r"C:\Users\x.docx:hidden");
+    }
+
+    #[test]
+    fn a_stream_qualified_rename_keeps_both_stream_names() {
+        let event = to_event(
+            &message(Body::Rename {
+                old_path: r"\Device\HarddiskVolume1\d\a.docx:hidden".into(),
+                new_path: r"\Device\HarddiskVolume1\d\a.docx:renamed".into(),
+                old_truncated: false,
+                new_truncated: false,
+            }),
+            &volumes(),
+        );
+        let Some(Event::FileRename(rename)) = event else {
+            panic!("{event:?}");
+        };
+        assert_eq!(rename.old_path, r"C:\d\a.docx:hidden");
+        assert_eq!(rename.new_path, r"C:\d\a.docx:renamed");
+    }
+
+    #[test]
     fn a_heartbeat_is_no_event() {
         assert!(to_event(&message(Body::Heartbeat), &volumes()).is_none());
     }

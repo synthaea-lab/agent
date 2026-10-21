@@ -365,6 +365,24 @@ mod tests {
         for m in [message(Body::Heartbeat), delete(), rename()] {
             assert_eq!(decode(&encode(&m, RAW_TS)), Ok(m));
         }
+        // #136 ADS slice 2: a named stream's `:streamname` suffix is an
+        // ordinary part of the path string on the wire — nothing strips or
+        // escapes a colon, so a delete or a rename of a stream round-trips
+        // exactly like any other path. The property test below excludes `:`
+        // from its generated paths, so this is the only coverage for it.
+        let stream_delete = message(Body::Delete {
+            path: r"\Device\HarddiskVolume3\Users\alice\report.docx:hidden".into(),
+            on_close: false,
+            truncated: false,
+        });
+        assert_eq!(decode(&encode(&stream_delete, RAW_TS)), Ok(stream_delete));
+        let stream_rename = message(Body::Rename {
+            old_path: r"\Device\HarddiskVolume3\data\x.docx:hidden".into(),
+            new_path: r"\Device\HarddiskVolume3\data\x.docx:renamed".into(),
+            old_truncated: false,
+            new_truncated: false,
+        });
+        assert_eq!(decode(&encode(&stream_rename, RAW_TS)), Ok(stream_rename));
         let on_close = message(Body::Delete {
             path: "x".into(),
             on_close: true,
