@@ -270,25 +270,25 @@ fn wrapped_command_range(line: &str, tokens: &[(usize, usize)]) -> Option<(usize
                 Some("/c" | "/k")
             ) {
                 i += 1;
-                return tokens.get(i).copied();
+            } else {
+                return None;
             }
-            return None;
         }
         "sh" | "bash" | "zsh" | "dash" => {
             if arg(i) == Some("-c") {
                 i += 1;
-                return tokens.get(i).copied();
+            } else {
+                return None;
             }
-            return None;
         }
         "powershell" | "pwsh" | "powershell.exe" | "pwsh.exe" => {
             if arg(i)
                 .is_some_and(|s| s.eq_ignore_ascii_case("-command") || s.eq_ignore_ascii_case("-c"))
             {
                 i += 1;
-                return tokens.get(i).copied();
+            } else {
+                return None;
             }
-            return None;
         }
         _ => return None,
     }
@@ -1499,10 +1499,12 @@ mod tests {
             "nice -n 3 mysql -pS3cret",
             "cmd /c \"net user bob S3cret /add\"",
             "cmd.exe /k \"net1 user bob S3cret /add\"",
+            "cmd.exe /c net user bob S3cret /add",
             "sh -c \"curl -u a:S3cret h\"",
             "bash -c \"curl -u a:S3cret h\"",
             "zsh -c \"curl -u a:S3cret h\"",
             "dash -c \"curl -u a:S3cret h\"",
+            "sh -c curl -u a:S3cret h",
             "powershell -Command \"curl -u a:S3cret h\"",
             "pwsh -Command \"curl -u a:S3cret h\"",
             "net1 user bob S3cret /add",
