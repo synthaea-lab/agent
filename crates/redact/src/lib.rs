@@ -292,7 +292,19 @@ fn wrapped_command_range(line: &str, tokens: &[(usize, usize)]) -> Option<(usize
         }
         _ => return None,
     }
-    tokens.get(i).map(|&(start, _)| (start, line.len()))
+    let &(start, end) = tokens.get(i)?;
+    // A quoted wrapped command (`cmd /c "net user bob S3cret /add" && echo
+    // done`) is already one token with its own matching closing quote;
+    // spanning to the end of the line would swallow `&& echo done` too and
+    // leave `trim_quotes` looking for a closing quote at the very end of the
+    // line, which isn't there, so nothing downstream gets redacted (#843
+    // review). Only an unquoted wrapped command, where the rest of the line
+    // really is the command, needs the wider span.
+    if matches!(line.as_bytes()[start], b'"' | b'\'') {
+        Some((start, end))
+    } else {
+        Some((start, line.len()))
+    }
 }
 
 /// Redacts recognized secrets in argv in place while retaining its number and order
@@ -1500,11 +1512,13 @@ mod tests {
             "cmd /c \"net user bob S3cret /add\"",
             "cmd.exe /k \"net1 user bob S3cret /add\"",
             "cmd.exe /c net user bob S3cret /add",
+            "cmd /c \"net user bob S3cret /add\" && echo done",
             "sh -c \"curl -u a:S3cret h\"",
             "bash -c \"curl -u a:S3cret h\"",
             "zsh -c \"curl -u a:S3cret h\"",
             "dash -c \"curl -u a:S3cret h\"",
             "sh -c curl -u a:S3cret h",
+            "sh -c \"curl -u a:S3cret h\" && echo done",
             "powershell -Command \"curl -u a:S3cret h\"",
             "pwsh -Command \"curl -u a:S3cret h\"",
             "net1 user bob S3cret /add",
