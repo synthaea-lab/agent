@@ -555,7 +555,10 @@ pub(crate) fn check_service_write_outside_datadir(
 /// stream alone is a weak, easily-legitimate signal without more context.
 #[must_use]
 pub(crate) fn check_alternate_data_stream_write(event: &FileOpenEvent) -> Option<Alert> {
-    if !has_write_intent(event.flags) {
+    // The colon-suffixed stream syntax is NTFS-specific; a colon is ordinary
+    // in a Linux or macOS file name (a timestamp, a log name) and must not be
+    // read as a stream there (#943 review).
+    if !matches!(event.meta.user, schema::User::Windows { .. }) || !has_write_intent(event.flags) {
         return None;
     }
     let name = event.path.rsplit(['\\', '/']).next().unwrap_or("");
@@ -568,8 +571,11 @@ pub(crate) fn check_alternate_data_stream_write(event: &FileOpenEvent) -> Option
     }
     // A type tag (`:$DATA`, `:$INDEX_ALLOCATION`, ...) can follow the stream
     // name; strip it the same way Windows's own `dir /r` output does.
+    // `file.txt::$DATA` (an explicit, unremarkable open of the file's own
+    // unnamed stream) leaves `stream` empty rather than a real name — not a
+    // hidden stream, so it must not alert either (#943 review).
     let stream = rest.split_once(':').map_or(rest, |(stream, _tag)| stream);
-    if stream.eq_ignore_ascii_case("Zone.Identifier") {
+    if stream.is_empty() || stream.eq_ignore_ascii_case("Zone.Identifier") {
         return None;
     }
     Some(Alert {

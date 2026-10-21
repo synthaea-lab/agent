@@ -1,15 +1,34 @@
 //! T1564.004 — Hide Artifacts: NTFS File Attributes. A write-intent open on an
 //! alternate data stream (#136 ADS slice 1).
 
-use schema::{FileOpenEvent, O_CREAT, O_WRONLY};
+use schema::{EventMeta, FileOpenEvent, O_CREAT, O_WRONLY, User};
 
 use crate::check_alternate_data_stream_write;
 
 fn open(path: &str, flags: u32) -> FileOpenEvent {
-    FileOpenEvent {
+    let mut event = FileOpenEvent {
         path: path.into(),
         flags,
         ..schema::fixtures::file_open()
+    };
+    event.meta.user = User::Windows {
+        sid: "S-1-5-21-0-0-0-1000".into(),
+        integrity_level: None,
+    };
+    event
+}
+
+fn unix_open(path: &str, flags: u32) -> FileOpenEvent {
+    FileOpenEvent {
+        meta: EventMeta {
+            user: User::Unix {
+                uid: 1000,
+                gid: 1000,
+            },
+            ..schema::fixtures::file_open().meta
+        },
+        path: path.into(),
+        flags,
     }
 }
 
@@ -55,6 +74,33 @@ fn the_zone_identifier_exclusion_is_case_insensitive_and_ignores_the_type_tag() 
             O_WRONLY,
         ))
         .is_none()
+    );
+}
+
+#[test]
+fn a_unix_colon_in_a_file_name_does_not_alert() {
+    // A colon is ordinary in a Linux/macOS file name (a timestamp, a log
+    // name) and must not be read as an NTFS stream on a host that has none
+    // (#943 review).
+    for path in [
+        "/tmp/backup-2026-10-21T10:30:00.tar.gz",
+        "/tmp/build:cache",
+        "/var/log/app:error.log",
+    ] {
+        assert!(
+            check_alternate_data_stream_write(&unix_open(path, O_WRONLY | O_CREAT)).is_none(),
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn the_files_own_unnamed_stream_opened_explicitly_does_not_alert() {
+    // `file.txt::$DATA` names the file's own default stream, not a hidden
+    // one — the colon here is a type-tag separator with an empty stream
+    // name, not a real stream (#943 review).
+    assert!(
+        check_alternate_data_stream_write(&open(r"C:\Temp\file.txt::$DATA", O_WRONLY)).is_none()
     );
 }
 
