@@ -143,7 +143,7 @@ fn log_likelihood_ratio(idx: usize, value: f32) -> f32 {
 ///
 /// - `state`: The belief state to update
 /// - `v`: The behavior vector extracted from the correlator's event bus
-/// - `ml_llr`: Optional ML contribution from `ml::correlation::score_to_llr` (issue #46 Phase 3)
+/// - `ml_llr`: Optional ML contribution from `ml::score_to_llr` (issue #46 Phase 3)
 /// - `now_ns`: Current timestamp for decay calculation
 ///
 /// # ML LLR Semantics

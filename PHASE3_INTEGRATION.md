@@ -1,8 +1,12 @@
 # Phase 3 Integration Guide (Issue #46)
 
-**Status:** Blocked by #13 (ML scorer integration), #14 (cmdline scorer), #47 (agent integration)
+**Status:** The correlator-side wiring below shipped with #345: `update_belief`'s
+`ml_llr` parameter, the `engine.rs` call sites, `update_belief_with_ml`, and its unit
+tests. What remains is a trained correlation model (#132) and the end-to-end
+verification that needs one — not an architecture or wiring question.
 
-This document describes how to complete Phase 3 of issue #46 (correlator no-score handling) once the ML scorer is integrated into the agent.
+This document describes how Phase 3 of issue #46 (correlator no-score handling) was
+completed once the ML scorer was integrated into the agent.
 
 ## Current State
 
@@ -72,39 +76,56 @@ Find all calls to `update_belief` and add the `ml_llr` parameter:
 update_belief(&mut belief, bv, now_ns);
 
 // NEW:
-update_belief(&mut belief, bv, None, now_ns);  // Temporarily pass None until agent wiring
+update_belief(&mut belief, bv, None, now_ns);
 ```
 
-Once agent integration (#47) is complete, the agent sink will compute `ml_llr` and pass it through the correlator's public API.
+This `None` is not a placeholder waiting on agent wiring — it is permanent:
+`on_event` always calls `update_belief` with `None` (`engine.rs:286`), and the
+ML term is added separately, after `on_event` returns, by
+`update_belief_with_ml` (point 3 below). Computing the ML score needs the
+belief state `on_event` just built, so it cannot happen inside the same call
+without restructuring the belief update itself — adding it as a second,
+optional call keeps `on_event` usable with no ML scorer loaded at all. See
+`update_belief_with_ml`'s own doc (`engine.rs:470-479`): calling
+`update_belief` a second time here, instead, used to double-count the
+hand-calibrated feature evidence (PR #345 review).
 
-#### 3. Agent Integration Point (Pending #47)
+#### 3. Agent Integration Point (shipped, #345)
 
-**File:** `agent/src/sink.rs` (future work)
+**File:** `agent/src/sink.rs`'s `correlate()`, right after `engine.on_event(event)`.
 
-Wiring pattern:
+Wiring pattern, matching what is actually there:
 
 ```rust
-// After engine.on_event(event)
-if let Some(bv) = engine.behavior_vector_for_pid(pid) {
-    // Try to get ML score
-    let ml_llr = match ml_scorer.score(&engine.bus, pid) {
-        Ok(Some(score)) => Some(ml::correlation::score_to_llr(score)),
+let pid = event.meta().pid;
+let generation = event.meta().process_generation;
+if let Some(ref mut scorer) = *self.ml_scorer.lock().unwrap() {
+    let ml_llr = match scorer.score(engine.bus(), pid, generation) {
+        Ok(Some(score)) => Some(ml::score_to_llr(score)),
         Ok(None) => None,  // Gated (< MIN_EVENT_COUNT)
-        Err(ScorerError::FeatureOutOfBounds { .. }) => {
+        Err(ml::ScorerError::FeatureOutOfBounds { .. }) => {
             // Log OOD rejection for telemetry
-            tracing::warn!("ML scorer rejected OOD vector for pid {pid}");
+            tracing::warn!(pid = pid, "ML scorer OOD rejection");
             None  // Treat OOD as no score
         }
         Err(e) => {
-            tracing::error!("ML scorer error: {e}");
+            tracing::error!(pid = pid, error = %e, "ML scorer error");
             None  // Fail open: skip ML contribution
         }
     };
 
     // Update belief with optional ML LLR
-    engine.update_belief_with_ml(entity_key, bv, ml_llr)?;
+    if let Err(()) = engine.update_belief_with_ml(pid, generation, ml_llr) {
+        // No behavior vector yet for this pid — normal for its first events.
+    }
 }
 ```
+
+This whole block is skipped when `self.ml_scorer` holds no scorer — which is the
+case on every deployment today, since no trained correlation model ships (#132).
+The wiring is real and runs in production, not just in tests, but it currently has
+nothing to score: every event's belief update is still T1-only until a model is
+loaded.
 
 **Error handling policy:**
 - `FeatureOutOfBounds` → log warning, treat as `None`
@@ -139,7 +160,7 @@ fn test_update_belief_ml_none_skipped() {
 }
 ```
 
-#### End-to-End Verification (After #47)
+#### End-to-End Verification
 
 1. **Run agent with ML scorer on benign baseline**
    - Check telemetry: no OOD rejections on training-distribution data
@@ -158,24 +179,27 @@ fn test_update_belief_ml_none_skipped() {
 ## Backward Compatibility
 
 - Legacy models (no `model_metadata.json`) → `bounds = None` → no OOD validation
-- Existing correlator code → pass `ml_llr = None` until agent wiring is complete
+- `on_event` always calls `update_belief` with `ml_llr = None` — permanent, not transitional
+  (see "Changes Required", point 2, above); the ML term is added afterward by
+  `update_belief_with_ml`
 - Graceful degradation: system works without ML scorer, just missing that evidence term
 
 ## Migration Checklist
 
-- [ ] Update `bayes::update_belief` signature (add `ml_llr` parameter)
-- [ ] Update all `update_belief` call sites in `engine.rs` (pass `None` initially)
-- [ ] Expose `update_belief_with_ml` or similar in correlator public API (for agent)
-- [ ] Implement agent sink wiring (#47)
-- [ ] Add unit tests for `ml_llr = Some(...)` and `ml_llr = None`
+- [x] Update `bayes::update_belief` signature (add `ml_llr` parameter)
+- [x] Update all `update_belief` call sites in `engine.rs` (pass `None` initially)
+- [x] Expose `update_belief_with_ml` or similar in correlator public API (for agent)
+- [x] Implement agent sink wiring (shipped, #345)
+- [x] Add unit tests for `ml_llr = Some(...)` and `ml_llr = None`
+  (`crates/correlator/src/tests/behavior.rs`, "update_belief_with_ml")
 - [ ] End-to-end test: benign baseline (no OOD), OOD injection, low event count
-- [ ] Update `docs/detection/ml.md` with Phase 3 semantics
+  — needs a trained model (#132); nothing to run against without one
+- [ ] Update `docs/detection/ml.md` with Phase 3 semantics — landed instead in
+  `docs/detection/correlation.md`'s "Wiring seam" section
 
 ## Timeline
 
-Phase 3 can proceed once:
-1. ML scorer is integrated into agent (#13, #14)
-2. Agent has access to `CorrelationScorer` (#47)
-3. Correlator exposes an API to pass `ml_llr` from agent sink
-
-Estimated effort: 1-2 hours for correlator changes + agent wiring, 1-2 hours for tests.
+Everything above is done except the two boxes left unchecked, both of which wait on
+the same thing: a trained correlation model. That is #132's own remaining scope, not
+a new issue — see `docs/detection/correlation.md`'s "Calibration status" for what the
+training step still needs.
