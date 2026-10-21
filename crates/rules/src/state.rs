@@ -237,6 +237,12 @@ pub struct RuleState {
     /// [`FlowPortDedup`]'s doc); `on_connect`'s discrete syscall trace needs no
     /// dedup, each `ConnectEvent` already is one real connection attempt.
     beacon_flow_dedup: BoundedMap<(String, String, u16), FlowPortDedup>,
+    /// Lineage → the discovery commands it ran inside the window, for RECON-BURST
+    /// (T1057/T1082/T1016/T1087, #378). LRU-bounded.
+    recon_burst: BoundedMap<crate::recon::Lineage, crate::recon::ReconWindow>,
+    /// pid → the lineage its children belong to, for each one-shot shell wrapper
+    /// (`sh -c`, `cmd /c`) seen running. LRU-bounded.
+    recon_wrappers: BoundedMap<u32, crate::recon::Wrapper>,
     /// (comm, daddr, dport, `local_port`) → the `bytes_sent` of the last poll of that
     /// flow, for EGRESS-VOLUME (T1041/T1048, #380). Conntrack counters are cumulative
     /// per flow, so only the difference between two polls is new volume. LRU-bounded.
@@ -460,6 +466,8 @@ impl RuleState {
             staged_archives: BoundedMap::new(COUNTER_CAP),
             archive_readers: BoundedMap::new(COUNTER_CAP),
             scan_spread: BoundedMap::new(COUNTER_CAP),
+            recon_burst: BoundedMap::new(COUNTER_CAP),
+            recon_wrappers: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
             known_policy_denials: BoundedMap::new(COUNTER_CAP),
             policy_denial_alerts: 0,
@@ -1045,6 +1053,49 @@ impl RuleState {
         )
     }
 
+    /// RECON-BURST (T1057/T1082/T1016/T1087, #378): six distinct discovery commands
+    /// across three categories from one lineage in 30 s. See [`crate::recon`] for what
+    /// counts, what a lineage is, and the false positives accepted.
+    fn check_recon_burst(&mut self, event: &ExecEvent) -> Option<Alert> {
+        use crate::recon::{self, Wrapper};
+
+        let ppid = event.meta.ppid;
+        let lineage = Wrapper::lineage_for(
+            self.recon_wrappers.peek(&ppid),
+            event.meta.parent_process_generation,
+        )
+        .unwrap_or((ppid, event.meta.parent_process_generation));
+        if recon::is_one_shot_wrapper(event) {
+            self.recon_wrappers.insert(
+                event.meta.pid,
+                Wrapper {
+                    generation: event.meta.process_generation,
+                    lineage,
+                },
+            );
+        }
+        let (command, category) = recon::discovery(event)?;
+        let burst = self
+            .recon_burst
+            .get_or_insert_with(lineage, recon::ReconWindow::default)
+            .record(command, category, event.meta.timestamp_ns)?;
+        Some(Alert {
+            technique: recon::RECON_BURST_TECHNIQUE,
+            severity: Severity::Low,
+            message: format!(
+                "pid={} comm={}: lineage of pid={} ran {} distinct discovery commands ({}) \
+                 across {} categories in {}s — reconnaissance, by hand or by script",
+                event.meta.pid,
+                event.meta.comm,
+                lineage.0,
+                burst.commands.len(),
+                burst.commands.join(", "),
+                burst.categories,
+                recon::RECON_BURST_WINDOW_NS / 1_000_000_000,
+            ),
+        })
+    }
+
     /// To be called for every `ExecEvent` in the stream, in chronological order.
     /// Updates the state (pid→comm table) after evaluation, so a process cannot match
     /// itself.
@@ -1057,6 +1108,7 @@ impl RuleState {
         alerts.extend(self.check_parent_suspect(event));
         alerts.extend(self.check_lolbin(event));
         alerts.extend(self.check_memfd_exec(event));
+        alerts.extend(self.check_recon_burst(event));
         alerts.extend(crate::stateless::check_ld_preload_hijack(
             event,
             &self.ld_trust_extra,

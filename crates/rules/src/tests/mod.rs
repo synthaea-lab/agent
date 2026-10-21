@@ -408,6 +408,7 @@ mod motw_removal;
 mod persistence;
 mod quarantine;
 mod rdp;
+mod recon;
 mod session;
 mod sudo;
 mod tamper;
