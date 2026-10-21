@@ -15,6 +15,11 @@
 //! change on one side is a change on the other. This crate sits next to
 //! `driver/` and depends only on `schema` among the workspace crates
 //! (ADR-0012 guardrail 8, `tools/check-deps.py`).
+//!
+//! Merge the v3 driver change (#857) before this receive loop (#853). The older v1 driver's
+//! port refuses this client's v3 connection context, so file telemetry is unavailable until
+//! the v3 driver is deployed. If #853 merges first, rebase #857 onto that main and verify
+//! both sides still use v3 and the 72-byte header.
 
 /// Name of the driver's communication port.
 pub const PORT_NAME: &str = r"\SynthaeaPort";
