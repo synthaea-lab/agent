@@ -19,7 +19,8 @@ use store::BoundedMap;
 use crate::{
     Alert,
     exclusions::{
-        AGENT_CHILD_EXCLUSIONS, APK_STAGING_FILE_PREFIX, AUTH_FAILURE_THRESHOLD,
+        AGENT_CHILD_EXCLUSIONS, APK_STAGING_FILE_PREFIX, ARCHIVE_EGRESS_WINDOW_NS,
+        ARCHIVE_READ_WINDOW_NS, ARCHIVE_STAGED_BYTES, ARCHIVE_SUFFIXES, AUTH_FAILURE_THRESHOLD,
         AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD, BEACON_WINDOW_NS, BROWSERS,
         BURST_WRITE_BYTES_THRESHOLD, COMPRESSION_DRIVER_COMMS, COMPRESSION_SUFFIXES,
         COMPRESSOR_COMMS, CREATE_UNLINK_HISTORY_PER_PID, CREATE_UNLINK_PAIR_WINDOW_NS,
@@ -48,6 +49,35 @@ use crate::{
 struct EgressVolume {
     sum: SlidingSum,
     last_alert_ns: Option<u64>,
+}
+
+/// The archive a pid has open for writing (ARCHIVE-EXFIL).
+struct ArchiveWriter {
+    generation: Option<u64>,
+    path: String,
+    bytes: u64,
+}
+
+/// A staged archive a pid has read (ARCHIVE-EXFIL).
+struct ArchiveReader {
+    generation: Option<u64>,
+    path: String,
+    read_ns: u64,
+    alerted: bool,
+}
+
+/// False only when both generation stamps exist and differ: the same rule as
+/// [`PidFact::current`], a pid reused by another process must not inherit a fact.
+fn same_incarnation(recorded: Option<u64>, wanted: Option<u64>) -> bool {
+    !matches!((recorded, wanted), (Some(a), Some(b)) if a != b)
+}
+
+/// True when `path` ends in one of [`ARCHIVE_SUFFIXES`] (case-insensitive).
+fn is_archive_name(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    ARCHIVE_SUFFIXES
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
 }
 
 /// True for an address a remote party can be at: not loopback, private, link-local,
@@ -213,6 +243,15 @@ pub struct RuleState {
     /// key leaves the port out on purpose: an exfiltration split over many connections
     /// to one host is the shape to catch. LRU-bounded.
     egress_volume: BoundedMap<(String, IpAddr), EgressVolume>,
+    /// pid → the archive it opened for writing and the bytes it has written since, for
+    /// ARCHIVE-EXFIL (T1560/T1041, #380). `FileWriteEvent` carries no path, so the bytes
+    /// are everything the pid writes (any fd): an archiver's output dominates them, a
+    /// chatty process that also opens a `.gz` would overcount (a stated gap). LRU-bounded.
+    archive_writers: BoundedMap<u32, ArchiveWriter>,
+    /// Path of a staged archive → when it crossed [`ARCHIVE_STAGED_BYTES`]. LRU-bounded.
+    staged_archives: BoundedMap<String, u64>,
+    /// pid → the staged archive it read, until it connects out. LRU-bounded.
+    archive_readers: BoundedMap<u32, ArchiveReader>,
     /// (pid, dport) → sliding distinct-destination counter for SCAN-SPREAD
     /// (T1046/T1210, issue #465). LRU-bounded.
     scan_spread: BoundedMap<(u32, u16), SlidingDistinct<IpAddr>>,
@@ -411,6 +450,9 @@ impl RuleState {
             beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
             egress_flow_last: BoundedMap::new(COUNTER_CAP),
             egress_volume: BoundedMap::new(COUNTER_CAP),
+            archive_writers: BoundedMap::new(COUNTER_CAP),
+            staged_archives: BoundedMap::new(COUNTER_CAP),
+            archive_readers: BoundedMap::new(COUNTER_CAP),
             scan_spread: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
             known_policy_denials: BoundedMap::new(COUNTER_CAP),
@@ -1038,6 +1080,7 @@ impl RuleState {
     pub fn on_connect(&mut self, event: &ConnectEvent) -> Vec<Alert> {
         let mut alerts: Vec<Alert> = self.check_beacon(event).into_iter().collect();
         alerts.extend(self.check_scan_spread(event));
+        alerts.extend(self.check_archive_egress(&event.meta, event.daddr));
         alerts
     }
 
@@ -1046,7 +1089,112 @@ impl RuleState {
     pub fn on_network_flow(&mut self, event: &NetworkFlowEvent) -> Vec<Alert> {
         let mut alerts: Vec<Alert> = self.check_beacon_flow(event).into_iter().collect();
         alerts.extend(self.check_egress_volume(event));
+        alerts.extend(self.check_archive_egress(&event.meta, event.daddr));
         alerts
+    }
+
+    /// ARCHIVE-EXFIL, first link: a pid that opens an archive-named file for writing starts
+    /// counting its written bytes; a pid that opens a **staged** archive (see
+    /// [`Self::record_archive_write`]) without write intent, within [`ARCHIVE_READ_WINDOW_NS`]
+    /// of its staging, becomes a reader waiting for a connection. The writer itself is not a
+    /// reader: extracting what it just wrote is not a hand-off.
+    fn record_archive_open(&mut self, event: &FileOpenEvent) {
+        let pid = event.meta.pid;
+        let ts = event.meta.timestamp_ns;
+        if has_write_intent(event.flags) {
+            if is_archive_name(&event.path) {
+                // A new write open of the path starts a new archive: a staging from an
+                // earlier run (a nightly job rewriting `home.tar.gz`) must not outlive it,
+                // or the read window would be measured from the first night forever.
+                self.staged_archives.remove(&event.path);
+                self.archive_writers.insert(
+                    pid,
+                    ArchiveWriter {
+                        generation: event.meta.process_generation,
+                        path: event.path.clone(),
+                        bytes: 0,
+                    },
+                );
+            }
+            return;
+        }
+        let Some(&staged_ns) = self.staged_archives.peek(&event.path) else {
+            return;
+        };
+        if ts.saturating_sub(staged_ns) > ARCHIVE_READ_WINDOW_NS {
+            return;
+        }
+        if self.archive_writers.peek(&pid).is_some_and(|w| {
+            w.path == event.path && same_incarnation(w.generation, event.meta.process_generation)
+        }) {
+            return;
+        }
+        self.archive_readers.insert(
+            pid,
+            ArchiveReader {
+                generation: event.meta.process_generation,
+                path: event.path.clone(),
+                read_ns: ts,
+                alerted: false,
+            },
+        );
+    }
+
+    /// ARCHIVE-EXFIL, second link: the bytes the writer pid writes after opening the archive.
+    /// Crossing [`ARCHIVE_STAGED_BYTES`] stages it, once.
+    fn record_archive_write(&mut self, event: &FileWriteEvent) {
+        let Some(writer) = self.archive_writers.get_mut(&event.meta.pid) else {
+            return;
+        };
+        if !same_incarnation(writer.generation, event.meta.process_generation) {
+            return;
+        }
+        writer.bytes = writer.bytes.saturating_add(event.bytes_requested);
+        if writer.bytes >= ARCHIVE_STAGED_BYTES {
+            // The staging time is the last write past the threshold, not the first: a job
+            // that keeps writing for hours is finished when it stops, and the read window
+            // counts from there.
+            let path = writer.path.clone();
+            self.staged_archives.insert(path, event.meta.timestamp_ns);
+        }
+    }
+
+    /// ARCHIVE-EXFIL (T1560/T1041, #380) — the chain: a pid wrote an archive of at least
+    /// [`ARCHIVE_STAGED_BYTES`], **another** pid read that file, and that reader then
+    /// connected to a public address within [`ARCHIVE_EGRESS_WINDOW_NS`]. One alert per
+    /// reader. Medium, not higher: a backup job that archives and then uploads to an object
+    /// store is exactly this shape, and no allowlist of such jobs exists yet (it needs a
+    /// lab capture of the host's own backups). Gaps, stated: a stream that never touches a
+    /// file (`tar | ssh`), an archive named without one of [`ARCHIVE_SUFFIXES`], and a
+    /// sender that is not the reader (a file handed over by a pipe or a copy).
+    ///
+    /// False positives beyond the backup job, from the shape itself: the reader is any
+    /// process that opens the file without write intent, and any public connection from that
+    /// pid inside the window completes the chain, with no link between the bytes read and the
+    /// destination. A long-lived daemon (an antivirus scanner, an indexer, a sync client) that
+    /// touches the archive and later makes an unrelated connection alerts. Open, connect and
+    /// flow events arrive from separate rings, so a connection stamped just before the open
+    /// can be ordered after it; the window absorbs that.
+    fn check_archive_egress(&mut self, meta: &schema::EventMeta, daddr: IpAddr) -> Option<Alert> {
+        if !is_public_address(daddr) {
+            return None;
+        }
+        let reader = self.archive_readers.get_mut(&meta.pid)?;
+        if reader.alerted
+            || !same_incarnation(reader.generation, meta.process_generation)
+            || meta.timestamp_ns.saturating_sub(reader.read_ns) > ARCHIVE_EGRESS_WINDOW_NS
+        {
+            return None;
+        }
+        reader.alerted = true;
+        Some(Alert {
+            technique: "T1560/T1041",
+            severity: Severity::Medium,
+            message: format!(
+                "pid={} comm={} read the staged archive {} and connected to {}",
+                meta.pid, meta.comm, reader.path, daddr,
+            ),
+        })
     }
 
     /// EGRESS-VOLUME (T1041/T1048, #380) — a process name that sends more than
@@ -1577,6 +1725,7 @@ impl RuleState {
         ));
         alerts.extend(self.record_create(event));
         self.record_downloader_write(event);
+        self.record_archive_open(event);
         alerts
     }
 
@@ -2043,6 +2192,7 @@ impl RuleState {
     /// alerts directly — tracks write volume per pid (issue #82), consumed by
     /// `check_burst_write_volume` on the next `FileRenameEvent`.
     pub fn on_file_write(&mut self, event: &FileWriteEvent) {
+        self.record_archive_write(event);
         self.write_volume
             .get_or_insert_with(event.meta.pid, SlidingSum::default)
             .add(
