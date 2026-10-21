@@ -1,6 +1,7 @@
-//! The updater's embedded trust set: three Ed25519 public keys, each with one job
-//! (ADR-0027). `release` verifies binary release manifests, `content` verifies content
-//! manifests, `recovery` is held offline and reserved for a key-rotation release (its
+//! The updater's embedded trust set: four Ed25519 public keys, each with one job
+//! (ADR-0027, ADR-0033). `release` verifies binary release manifests, `content` verifies content
+//! manifests, `snapshot` verifies the common-set snapshot manifest and nothing else (its custody
+//! is not decided, #753), `recovery` is held offline and reserved for a key-rotation release (its
 //! manifest shape is a later slice, so nothing verifies against it yet).
 //!
 //! A production build embeds the keys in `crates/updater/keys/*.pub` (hex). Until the real
@@ -10,7 +11,8 @@
 //! The public test set (a seed checked into the repository) exists only under the
 //! `test-key` cargo feature or `cfg(test)`, so a build without either cannot ship it by
 //! omission. In that set `release` and `content` are one key (ADR-0016's development
-//! shortcut) and `recovery` is a second one.
+//! shortcut), `recovery` is a second one and `snapshot` a third, so a snapshot manifest never
+//! verifies as a content or release manifest or the other way round.
 
 use std::sync::LazyLock;
 
@@ -36,6 +38,24 @@ const TEST_KEY_SEED: [u8; 32] = [0x42; 32];
 /// Seed of the bundled test `recovery` key.
 #[cfg(any(test, feature = "test-key"))]
 const TEST_RECOVERY_SEED: [u8; 32] = [0x43; 32];
+
+/// Seed of the bundled test `snapshot` key. The server's public test signer
+/// (`server/lib/snapshot-manifest.ts`, `TEST_SNAPSHOT_SEED`) derives the same key from the same
+/// constant, and `server/tests/fixtures/snapshot-manifest-golden.json` is signed by it.
+#[cfg(any(test, feature = "test-key"))]
+const TEST_SNAPSHOT_SEED: [u8; 32] = [0x44; 32];
+
+/// The test keypair that signs snapshot manifests in tests and lab builds.
+///
+/// # Panics
+///
+/// Never: [`TEST_SNAPSHOT_SEED`] is a fixed, valid 32-byte Ed25519 seed.
+#[cfg(any(test, feature = "test-key"))]
+#[must_use]
+pub fn test_snapshot_key_pair() -> Ed25519KeyPair {
+    Ed25519KeyPair::from_seed_unchecked(&TEST_SNAPSHOT_SEED)
+        .expect("TEST_SNAPSHOT_SEED is a fixed, valid 32-byte Ed25519 seed")
+}
 
 /// The test keypair that signs releases and content in tests and lab builds.
 ///
@@ -75,6 +95,7 @@ fn parse_key_file(text: &str) -> Option<[u8; 32]> {
 enum Role {
     Release,
     Content,
+    Snapshot,
     Recovery,
 }
 
@@ -86,6 +107,7 @@ fn embedded(role: Role, _file: &str) -> Option<[u8; 32]> {
     std::hint::black_box(TEST_KEY_MARKER);
     public_of(match role {
         Role::Release | Role::Content => &TEST_KEY_SEED,
+        Role::Snapshot => &TEST_SNAPSHOT_SEED,
         Role::Recovery => &TEST_RECOVERY_SEED,
     })
 }
@@ -105,6 +127,12 @@ pub static RELEASE_PUBLIC_KEY: LazyLock<Option<[u8; 32]>> =
 pub static CONTENT_PUBLIC_KEY: LazyLock<Option<[u8; 32]>> =
     LazyLock::new(|| embedded(Role::Content, include_str!("../keys/content.pub")));
 
+/// Verifies the common-set snapshot manifest (ADR-0033) and nothing else. `None` when no key is
+/// provisioned, which also keeps the agent's snapshot fetch loop off (fail closed). Its custody is
+/// the open question of #753; until then only the test set provides one.
+pub static SNAPSHOT_PUBLIC_KEY: LazyLock<Option<[u8; 32]>> =
+    LazyLock::new(|| embedded(Role::Snapshot, include_str!("../keys/snapshot.pub")));
+
 /// The offline key that will sign key rotations (ADR-0027). Nothing verifies against it yet.
 pub static RECOVERY_PUBLIC_KEY: LazyLock<Option<[u8; 32]>> =
     LazyLock::new(|| embedded(Role::Recovery, include_str!("../keys/recovery.pub")));
@@ -121,6 +149,19 @@ mod tests {
     }
 
     #[test]
+    fn the_test_snapshot_key_is_its_own_key_not_the_release_or_recovery_one() {
+        let derived: [u8; 32] = test_snapshot_key_pair()
+            .public_key()
+            .as_ref()
+            .try_into()
+            .unwrap();
+        assert_eq!(*SNAPSHOT_PUBLIC_KEY, Some(derived));
+        assert_ne!(*SNAPSHOT_PUBLIC_KEY, *RELEASE_PUBLIC_KEY);
+        assert_ne!(*SNAPSHOT_PUBLIC_KEY, *CONTENT_PUBLIC_KEY);
+        assert_ne!(*SNAPSHOT_PUBLIC_KEY, *RECOVERY_PUBLIC_KEY);
+    }
+
+    #[test]
     fn the_test_recovery_key_is_not_the_release_key() {
         assert!(RECOVERY_PUBLIC_KEY.is_some());
         assert_ne!(*RECOVERY_PUBLIC_KEY, *RELEASE_PUBLIC_KEY);
@@ -128,7 +169,7 @@ mod tests {
 
     #[test]
     fn an_unprovisioned_key_file_embeds_no_key() {
-        for file in ["release", "content", "recovery"] {
+        for file in ["release", "content", "snapshot", "recovery"] {
             let text =
                 std::fs::read_to_string(format!("{}/keys/{file}.pub", env!("CARGO_MANIFEST_DIR")))
                     .unwrap();
@@ -161,7 +202,7 @@ mod tests {
     fn every_committed_key_file_is_unprovisioned_or_a_valid_key() {
         // A typo or a truncated key parses to `None`, which at run time reads as "no
         // production key" and hides the real cause. Catch it where the file is committed.
-        for file in ["release", "content", "recovery"] {
+        for file in ["release", "content", "snapshot", "recovery"] {
             let text =
                 std::fs::read_to_string(format!("{}/keys/{file}.pub", env!("CARGO_MANIFEST_DIR")))
                     .unwrap();
@@ -182,7 +223,7 @@ mod tests {
         // Identical files would silently collapse the role separation (ADR-0027): a
         // content signer could then sign releases. Vacuous while the files are
         // `unprovisioned`, and the day real keys land it starts to bite.
-        let keys: Vec<(&str, [u8; 32])> = ["release", "content", "recovery"]
+        let keys: Vec<(&str, [u8; 32])> = ["release", "content", "snapshot", "recovery"]
             .into_iter()
             .filter_map(|file| {
                 let text = std::fs::read_to_string(format!(
