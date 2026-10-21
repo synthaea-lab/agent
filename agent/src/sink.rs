@@ -3601,8 +3601,32 @@ rule response_marker {
             spool.lock().unwrap().drain_oldest().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].detection.title, "test finding");
-        assert_eq!(records[0].detection.events, vec![event]);
+        assert_eq!(
+            records[0].detection.events,
+            vec![with_its_enrichment(&event, &records[0].detection.events)]
+        );
         assert_eq!(records[0].key.len(), 36);
+    }
+
+    /// `event` as the spooled detection carries it: the enrichment worker adds the image's hash and
+    /// signature before the detection is stored (#62), so that the control plane can join hosts
+    /// on the hash. Everything else of the event must be as it was captured. The hash is asserted
+    /// present for an image that exists on this machine, and compared as given otherwise.
+    fn with_its_enrichment(event: &Event, spooled: &[Event]) -> Event {
+        let (Event::Exec(captured), Some(Event::Exec(stored))) = (event, spooled.first()) else {
+            return event.clone();
+        };
+        assert!(
+            captured.sha256.is_some()
+                || stored.sha256.is_some()
+                || !std::path::Path::new(&captured.image_path).is_file(),
+            "the detection's exec should carry the hash of {}",
+            captured.image_path
+        );
+        let mut expected = captured.clone();
+        expected.sha256.clone_from(&stored.sha256);
+        expected.signature = stored.signature;
+        Event::Exec(expected)
     }
 
     fn rename_of(pid: u32, i: u64, to: &str) -> Event {
@@ -3898,7 +3922,10 @@ rule response_marker {
         assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
         let records: Vec<transport::QueuedDetection> =
             spool.lock().unwrap().drain_oldest().unwrap();
-        assert_eq!(records[0].detection.events, vec![event]);
+        assert_eq!(
+            records[0].detection.events,
+            vec![with_its_enrichment(&event, &records[0].detection.events)]
+        );
     }
 
     #[test]
