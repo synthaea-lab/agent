@@ -28,6 +28,7 @@ Environment:
 
 --*/
 
+#define POOL_ZERO_DOWN_LEVEL_SUPPORT
 #include <fltKernel.h>
 #include <dontuse.h>
 #include <ntintsafe.h>
@@ -461,6 +462,9 @@ Return Value:
 
     UNREFERENCED_PARAMETER( RegistryPath );
 
+    // ExAllocatePoolZero's down-level path needs its runtime capability initialized first.
+    ExInitializeDriverRuntime( 0 );
+
     KeInitializeSpinLock( &SynthaeaFilterData.QueueLock );
     InitializeListHead( &SynthaeaFilterData.Queue );
     KeInitializeEvent( &SynthaeaFilterData.QueueEvent, NotificationEvent, FALSE );
@@ -789,8 +793,8 @@ SynthaeaAllocateEvent (
         return (PSYNTHAEA_QUEUED_EVENT)&SynthaeaQueueFullSentinel;
     }
 
-    event = (PSYNTHAEA_QUEUED_EVENT)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED, allocationSize, SYNTHAEA_POOL_TAG );
+    event = (PSYNTHAEA_QUEUED_EVENT)ExAllocatePoolZero(
+        NonPagedPoolNx, allocationSize, SYNTHAEA_POOL_TAG );
     if (event == NULL) {
         KIRQL oldIrql;
         KeAcquireSpinLock( &SynthaeaFilterData.QueueLock, &oldIrql );
@@ -802,7 +806,6 @@ SynthaeaAllocateEvent (
         return (PSYNTHAEA_QUEUED_EVENT)&SynthaeaQueueFullSentinel;
     }
 
-    RtlZeroMemory( event, sizeof( SYNTHAEA_QUEUED_EVENT ) );
     event->AllocationSize = allocationSize;
     event->ReservationHeld = TRUE;
     event->Header.Kind = Kind;
