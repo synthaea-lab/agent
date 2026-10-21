@@ -26,7 +26,7 @@ echo "Creating source tarball..."
 tar czf "$RPMBUILD_DIR/SOURCES/synthaea-agent-$VERSION.tar.gz" \
   --transform "s,^,synthaea-agent-$VERSION/," \
   --exclude-vcs --exclude target \
-  agent/ watchdog/ cli/ crates/ Cargo.* rust-toolchain.toml ebpf-toolchain.txt LICENSE README.md \
+  agent/ watchdog/ cli/ release-tool/ crates/ Cargo.* rust-toolchain.toml ebpf-toolchain.txt LICENSE README.md \
   packaging/linux/systemd/
 
 # Copy spec file
@@ -40,7 +40,7 @@ rpmbuild -bb \
   --define "_version $VERSION" \
   "$RPMBUILD_DIR/SPECS/synthaea-agent.spec"
 
-RPM_PATH=$(find "$RPMBUILD_DIR/RPMS" -name "synthaea-agent-*.rpm" -print -quit)
+RPM_PATH=$(find "$RPMBUILD_DIR/RPMS" -name "synthaea-agent-[0-9]*.rpm" -print -quit)
 echo ""
 echo "==> RPM built: $RPM_PATH"
 

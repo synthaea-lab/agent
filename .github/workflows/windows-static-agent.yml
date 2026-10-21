@@ -111,6 +111,11 @@ jobs:
       - name: Build the agent with static onnxruntime
         run: cargo build -j 2 --release --no-default-features -p agent
 
+      # The packaged build must not carry the public test signing key (ADR-0027, #753).
+      - name: Check the agent carries no test signing key
+        shell: bash
+        run: bash tools/assert-no-test-key.sh target/release/agent.exe
+
       - name: Check the agent's DLL imports
         run: python tools/check-pe-imports.py target/release/agent.exe
 

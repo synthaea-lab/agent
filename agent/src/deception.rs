@@ -44,7 +44,7 @@ fn load_or_create_seed(state_dir: &Path) -> io::Result<Seed> {
     }
     fs::create_dir_all(deception_dir(state_dir))?;
     let mut bytes = [0u8; SEED_LEN];
-    getrandom::getrandom(&mut bytes).map_err(|e| io::Error::other(e.to_string()))?;
+    getrandom::fill(&mut bytes).map_err(|e| io::Error::other(e.to_string()))?;
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -62,6 +62,29 @@ pub(crate) struct ExecImage {
     /// The process incarnation (`process_generation`) that exec'd it, when the sensor stamps one.
     generation: Option<u64>,
     in_container: bool,
+    /// Sensor time of the `exec`, ns. An exec that happened after a touch says nothing about
+    /// who made the touch (#81 review): only one at or before it may excuse it.
+    timestamp_ns: u64,
+}
+
+impl ExecImage {
+    pub(crate) fn from_exec(exec: &schema::ExecEvent) -> Self {
+        Self {
+            path: exec.image_path.clone(),
+            generation: exec.meta.process_generation,
+            in_container: exec.meta.container.is_some(),
+            timestamp_ns: exec.meta.timestamp_ns,
+        }
+    }
+
+    pub(crate) fn timestamp_ns(&self) -> u64 {
+        self.timestamp_ns
+    }
+
+    /// Whether this is the image of an exec that happened at or before `not_after_ns`.
+    pub(crate) fn precedes(&self, not_after_ns: u64) -> bool {
+        self.timestamp_ns <= not_after_ns
+    }
 }
 
 /// Bounded `pid -> image` table fed by `Exec` events. Newest wins (a process that execs again
@@ -89,14 +112,7 @@ impl ExecImages {
 
     /// Records the image a process executed.
     pub(crate) fn record(&mut self, exec: &schema::ExecEvent) {
-        self.seen.insert(
-            exec.meta.pid,
-            ExecImage {
-                path: exec.image_path.clone(),
-                generation: exec.meta.process_generation,
-                in_container: exec.meta.container.is_some(),
-            },
-        );
+        self.seen.insert(exec.meta.pid, ExecImage::from_exec(exec));
     }
 
     /// The image `pid` was seen to execute, if it was and the entry is of this incarnation:
@@ -104,10 +120,23 @@ impl ExecImages {
     /// is not trusted (the caller falls back to `/proc`). A lookup refreshes the entry's
     /// recency: an allowed process that keeps touching canaries must not be evicted by the
     /// execs of everything else, which would make it look unknown again.
+    #[cfg(test)]
     pub(crate) fn image_of(&mut self, pid: u32, generation: Option<u64>) -> Option<ExecImage> {
+        self.image_of_not_after(pid, generation, u64::MAX)
+    }
+
+    /// The image `pid` was seen to execute, but only an exec at or before `not_after_ns` (the time of the touch
+    /// being judged) counts: the newest entry of a process that exec'd again *after* the touch
+    /// is not what made it, and its earlier image was replaced, so nothing is known.
+    pub(crate) fn image_of_not_after(
+        &mut self,
+        pid: u32,
+        generation: Option<u64>,
+        not_after_ns: u64,
+    ) -> Option<ExecImage> {
         let seen = self.seen.get(&pid)?;
         match (seen.generation, generation) {
-            (Some(a), Some(b)) if a == b => Some(seen.clone()),
+            (Some(a), Some(b)) if a == b && seen.precedes(not_after_ns) => Some(seen.clone()),
             _ => None,
         }
     }
@@ -195,13 +224,19 @@ impl CanaryAllow {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn in_foreign_mount_ns_for_test(mut self) -> Self {
+        self.foreign_mount_ns = |_| true;
+        self
+    }
+
     /// Whether nothing is allowed: the exec table has no use then, and the sink does not fill it.
     pub(crate) fn is_empty(&self) -> bool {
         self.exes.is_empty()
     }
 
     /// Whether the process `pid` runs an allowed executable. `seen` is what the agent recorded
-    /// when this incarnation of the pid executed ([`ExecImages::image_of`], already checked
+    /// when this incarnation of the pid executed ([`ExecImages::image_of_not_after`], already checked
     /// against the pid's incarnation), if anything; with none, the `/proc` route decides.
     /// The caller passes a clone and holds no lock: the `/proc` read below can be slow.
     pub(crate) fn allows(&self, pid: u32, seen: Option<&ExecImage>) -> bool {
@@ -221,7 +256,10 @@ impl CanaryAllow {
             // exec'd again and that event was shed or arrived late. `/proc`, where the agent can
             // read it, shows the image now: if it names something else the entry is stale and
             // the process is not allowed. Where `/proc` says nothing (no ptrace access) the
-            // table decides alone, and that residue is documented.
+            // table decides alone, and that residue is documented. The same weakness applies to a
+            // touch held for its `exec` and judged with no image: `/proc` is read when the hold
+            // ends, so a pid recycled inside the 500 ms by a process running an allowed image
+            // would excuse it (narrow: it needs a pid reuse inside the hold).
             // The string checks go first. A name the table does not list is not a refusal: the
             // exec may have gone through a link (`/bin/updatedb` under usrmerge, a `PATH` lookup)
             // that `/proc` canonicalises, so that process takes the `/proc` route below.
@@ -235,6 +273,20 @@ impl CanaryAllow {
             }
         }
         (self.resolve)(pid).is_some_and(|exe| self.exes.contains(&exe))
+    }
+
+    /// Whether `/proc` names an executable for `pid`: false for a process that already exited, a
+    /// container's or another user's the agent may not read. Lets the sink tell "not allowed"
+    /// from "nothing known yet".
+    pub(crate) fn proc_names_an_exe(&self, pid: u32) -> bool {
+        (self.resolve)(pid).is_some()
+    }
+
+    /// Whether `allows` refuses this process whatever arrives later: it runs in a container, or
+    /// positively in another mount namespace, so no image can excuse it. A touch by such a
+    /// process is not worth waiting for an `exec` (`allows` above, the same two conditions).
+    pub(crate) fn refuses_outright(&self, pid: u32, seen: Option<&ExecImage>) -> bool {
+        seen.is_some_and(|image| image.in_container) || (self.foreign_mount_ns)(pid)
     }
 
     /// An absolute image equal to an entry, resolved or as written. A relative exec

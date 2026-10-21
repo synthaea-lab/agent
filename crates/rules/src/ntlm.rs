@@ -89,7 +89,8 @@ fn is_weak_version(version: &str) -> bool {
 
 /// An address that routes over the Internet: not loopback, private,
 /// link-local, carrier-grade NAT, multicast, documentation or unspecified.
-/// (`IpAddr::is_global` is still unstable.)
+/// An IPv6 address that embeds an IPv4 one (v4-mapped, NAT64, 6to4) is judged
+/// by that IPv4 address. (`IpAddr::is_global` is still unstable.)
 fn is_internet_address(addr: IpAddr) -> bool {
     match addr {
         IpAddr::V4(v4) => is_internet_v4(v4),
@@ -121,16 +122,38 @@ fn is_internet_v4(v4: Ipv4Addr) -> bool {
 }
 
 fn is_internet_v6(v6: Ipv6Addr) -> bool {
-    let first = v6.segments()[0];
-    let unique_local = first & 0xfe00 == 0xfc00;
-    let link_local = first & 0xffc0 == 0xfe80;
-    let documentation = first == 0x2001 && v6.segments()[1] == 0x0db8;
+    let s = v6.segments();
+    // Prefixes that carry an IPv4 address: the IPv6 address routes wherever that
+    // one does, so it is judged as v4 (NAT64 to 8.8.8.8 is Internet traffic).
+    // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052): the last 32 bits.
+    if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return is_internet_v4(embedded_v4(s[6], s[7]));
+    }
+    // 6to4 2002::/16 (RFC 3056): the 6to4 router's address, bits 16..48.
+    if s[0] == 0x2002 {
+        return is_internet_v4(embedded_v4(s[1], s[2]));
+    }
+    let local_use_nat64 = s[..3] == [0x64, 0xff9b, 0x0001]; // 64:ff9b:1::/48, RFC 8215
+    let unique_local = s[0] & 0xfe00 == 0xfc00;
+    let link_local = s[0] & 0xffc0 == 0xfe80;
+    let site_local = s[0] & 0xffc0 == 0xfec0; // fec0::/10, deprecated by RFC 3879
+    let discard = s[..4] == [0x0100, 0, 0, 0]; // 100::/64, RFC 6666
+    let benchmarking = s[..3] == [0x2001, 0x0002, 0]; // 2001:2::/48, RFC 5180
+    let documentation = s[0] == 0x2001 && s[1] == 0x0db8;
     !(v6.is_loopback()
         || v6.is_unspecified()
         || v6.is_multicast()
+        || local_use_nat64
         || unique_local
         || link_local
+        || site_local
+        || discard
+        || benchmarking
         || documentation)
+}
+
+fn embedded_v4(high: u16, low: u16) -> Ipv4Addr {
+    Ipv4Addr::from((u32::from(high) << 16) | u32::from(low))
 }
 
 #[cfg(test)]
@@ -196,9 +219,36 @@ mod tests {
             "::1",
             "fe80::1",
             "fd12:3456::1",
+            // #744 review: site-local, local-use NAT64, discard, benchmarking.
+            "fec0::1",
+            "64:ff9b:1::a00:5",
+            "100::1",
+            "2001:2::1",
+            // An embedded private IPv4: NAT64 to 10.0.0.5, 6to4 behind 192.168.1.1.
+            "64:ff9b::a00:5",
+            "2002:c0a8:101::1",
         ] {
             assert!(
                 techniques(&ntlm(NtlmDirection::Outgoing, remote, "NTLMv2")).is_empty(),
+                "{remote}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_ipv4_and_neighbours_of_special_ranges_are_judged_correctly() {
+        // NAT64 to 8.8.8.8 and 6to4 through the router at 8.8.8.8 both leave over
+        // the Internet; the same prefixes around a private IPv4 do not (above).
+        for remote in [
+            "64:ff9b::808:808",
+            "2002:808:808::1",
+            // Only 2001:db8::/32 is documentation: its neighbours are global.
+            "2001:4860:4860::8888",
+            "2a00:db8::1",
+        ] {
+            assert_eq!(
+                techniques(&ntlm(NtlmDirection::Outgoing, remote, "NTLMv2")),
+                [NTLM_TO_INTERNET],
                 "{remote}"
             );
         }

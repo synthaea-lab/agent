@@ -24,20 +24,26 @@ ExecStart=/var/lib/synthaea/current/watchdog run \
 Restart=always
 RestartSec=5s
 
-# Capabilities (#559, ADR-0014): the agent runs as the unprivileged `synthaea` user and is
-# granted only these, as ambient capabilities so the watchdog's agent child inherits them
-# across exec. Everything else is dropped from the bounding set, so a bug in a sensor is
-# not a root bug. Granted, each for a feature checked against the code:
+# Capabilities (#559, ADR-0014, amended for CAP_AUDIT_READ #780): the agent runs as the
+# unprivileged `synthaea` user and is granted only these, as ambient capabilities so the
+# watchdog's agent child inherits them across exec. Everything else is dropped from the
+# bounding set, so a bug in a sensor is not a root bug. Granted, each for a feature
+# checked against the code:
 #   CAP_BPF CAP_PERFMON      load programs, attach tracepoints/kprobes (eBPF sensor)
 #   CAP_SYS_RESOURCE         raise RLIMIT_MEMLOCK for the BPF maps
 #   CAP_DAC_READ_SEARCH      read /proc/<pid>/* and files of other users (hashing, cmdline)
 #   CAP_NET_ADMIN            conntrack netlink (network flows)
 #   CAP_KILL                 signal other users' processes (response action, off by default)
+#   CAP_AUDIT_READ           multicast-subscribe NETLINK_AUDIT for SELinux AVC denials
+#                            (sensor-linux-audit::avc, run when eBPF is the primary sensor);
+#                            without it AvcReader::open() fails EPERM and that source is
+#                            lost — #780's own fix keeps that failure from raising a false
+#                            T1562 silence alert, but AVC telemetry itself needs this.
 # Deliberately not granted until a feature check on a real host shows the need:
 #   CAP_SYS_PTRACE (`/proc/<pid>/exe` of other users), CAP_CHOWN/CAP_FOWNER/CAP_DAC_OVERRIDE
-#   (quarantine of files the agent does not own), CAP_AUDIT_* (audit fallback sensor).
-CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_DAC_READ_SEARCH CAP_NET_ADMIN CAP_KILL
-AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_DAC_READ_SEARCH CAP_NET_ADMIN CAP_KILL
+#   (quarantine of files the agent does not own).
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_DAC_READ_SEARCH CAP_NET_ADMIN CAP_KILL CAP_AUDIT_READ
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_DAC_READ_SEARCH CAP_NET_ADMIN CAP_KILL CAP_AUDIT_READ
 
 # Security hardening
 NoNewPrivileges=true

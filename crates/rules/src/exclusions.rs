@@ -120,6 +120,30 @@ pub(crate) const RDP_SUCCESS_AFTER_FAILURES_THRESHOLD: u32 = 5;
 /// five-minute interval includes slower interactive guessing while limiting
 /// stale failures that are no longer meaningful evidence for a later success.
 pub(crate) const RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS: u64 = 300_000_000_000; // 300s
+/// A local privilege-escalation success (`sudo`/`su`) after this many
+/// authentication failures joined to it (`crates/rules/src/sudo.rs`'s module
+/// doc: `sudo` joins on the trusted invoker uid, `su` on the real target
+/// name — not necessarily "the account escalated to" in either case).
+/// Reported as T1548.003 for `sudo`, T1110.001 for `su` (review of #838,
+/// Sollykhan 2026-10-19, non-blocking: `su` is not sudo caching).
+/// Same reasoning as [`RDP_SUCCESS_AFTER_FAILURES_THRESHOLD`]: tolerates a
+/// human mistyping their password a couple of times before getting it right,
+/// catches a scripted or sustained guess that eventually succeeds.
+///
+/// The opposite of a noise source, confirmed live (Fedora 43, sudo 1.9.17p2,
+/// review of #838, Sollykhan 2026-10-19): `pam_unix` logs exactly **one**
+/// `authentication failure` line per sudo *invocation*, however many of the
+/// (default `passwd_tries=3`) password prompts within it were wrong — three
+/// wrong passwords at one prompt is one failure here, not three. So this
+/// counts per invocation, the opposite of what a prior version of this
+/// comment claimed, and the real effect is lower sensitivity, not alert
+/// noise: an attacker needs 5 separate sudo invocations (up to 15 wrong
+/// passwords) to cross this threshold, not 5 wrong passwords. Not re-tuned
+/// here; lowering the threshold would be the fix if this proves insensitive
+/// in practice.
+pub(crate) const SUDO_SUCCESS_AFTER_FAILURES_THRESHOLD: u32 = 5;
+/// Sliding look-back window for [`SUDO_SUCCESS_AFTER_FAILURES_THRESHOLD`].
+pub(crate) const SUDO_SUCCESS_AFTER_FAILURES_WINDOW_NS: u64 = 300_000_000_000; // 300s
 pub(crate) const BEACON_THRESHOLD: u32 = 3;
 pub(crate) const BEACON_WINDOW_NS: u64 = 60_000_000_000; // 60s
 
@@ -420,3 +444,23 @@ pub(crate) const BROWSERS: &[&str] = &[
     "iexplore.exe",
     "vivaldi.exe",
 ];
+
+/// New-shape alerts POLICY-DENIAL-DRIFT raises per [`POLICY_DENIAL_ALERT_WINDOW_NS`] (#812):
+/// `known_policy_denials` bounds the rule's memory of what it has seen, not its alert
+/// volume, so a flood of distinct shapes (varying the subject/object type faster than a
+/// real host ever would) could otherwise emit one alert per shape, unbounded. The key is
+/// (mechanism, subject context, object context, object class, action); since #813 added
+/// the requested permission set to it, one (type, type, class) triple produces one shape
+/// per permission set the kernel denies for it, not one shape overall.
+///
+/// 2048 is a reasoned bound, **not a measured one**: a few hundred distinct triples times a
+/// handful of permission sets each was the estimate when it was chosen, and nobody has
+/// compared it with the denial volume of a real `SELinux`-enforcing fleet. Shapes past it are
+/// counted (`policy_denial_alerts_shed`) and, not being remembered, can alert in a later
+/// window. Revisit with real denial data.
+pub(crate) const POLICY_DENIAL_ALERT_CAP: u64 = 2048;
+
+/// How long [`POLICY_DENIAL_ALERT_CAP`] lasts before the budget refills: one hour of event time
+/// (`meta.timestamp_ns`). Long enough that a flood stays bounded to the cap per hour, short
+/// enough that a genuinely new denial after a noisy period is not silenced for the whole run.
+pub(crate) const POLICY_DENIAL_ALERT_WINDOW_NS: u64 = 3_600_000_000_000;

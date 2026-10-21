@@ -27,13 +27,27 @@ use crate::{JournalError, JournalEvent, JournalRecord, classify, parse_record};
 /// does end it.
 pub struct ClassifiedJournal<R> {
     lines: std::io::Lines<R>,
+    on_line: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl<R: BufRead> ClassifiedJournal<R> {
     pub fn new(reader: R) -> Self {
         Self {
             lines: reader.lines(),
+            on_line: None,
         }
+    }
+
+    /// Calls `hook` once for every non-blank line read from the source, **before**
+    /// the line is parsed or classified, so it also fires for the lines the
+    /// allowlist drops and for the ones that fail to parse. Those are the vast
+    /// majority of a journal and the only proof an idle host gives that
+    /// `journalctl` is still delivering; the iterator itself yields allowlisted
+    /// records only. The agent hangs its sensor-silence heartbeat here (#71, #83).
+    #[must_use]
+    pub fn with_line_hook(mut self, hook: impl FnMut() + Send + 'static) -> Self {
+        self.on_line = Some(Box::new(hook));
+        self
     }
 }
 
@@ -48,6 +62,9 @@ impl<R: BufRead> Iterator for ClassifiedJournal<R> {
             };
             if line.trim().is_empty() {
                 continue;
+            }
+            if let Some(hook) = self.on_line.as_mut() {
+                hook();
             }
             let record = match parse_record(&line) {
                 Ok(record) => record,
@@ -182,6 +199,50 @@ mod tests {
     #[test]
     fn blank_lines_are_skipped() {
         let input = "\n\n\n";
+        let mut it = ClassifiedJournal::new(Cursor::new(input));
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn the_line_hook_fires_for_every_non_blank_line_not_only_allowlisted_ones() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let input = [
+            // allowlist miss
+            r#"{"__CURSOR":"c1","__REALTIME_TIMESTAMP":"1","SYSLOG_IDENTIFIER":"kernel","MESSAGE":"eth0 up"}"#,
+            "",
+            // unparseable in the recoverable way (binary MESSAGE)
+            r#"{"__CURSOR":"c2","__REALTIME_TIMESTAMP":"2","MESSAGE":[1,2,3]}"#,
+            // allowlisted
+            r#"{"__CURSOR":"c3","__REALTIME_TIMESTAMP":"3","SYSLOG_IDENTIFIER":"sudo","MESSAGE":"     lab : TTY=pts/0 ; USER=root ; COMMAND=/bin/true"}"#,
+            "   ",
+            // the agent's own liveness canary
+            r#"{"__CURSOR":"c4","__REALTIME_TIMESTAMP":"4","SYSLOG_IDENTIFIER":"synthaea-agent-canary","MESSAGE":"sensor liveness canary"}"#,
+        ]
+        .join("\n");
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let hook_seen = seen.clone();
+        let mut it = ClassifiedJournal::new(Cursor::new(input)).with_line_hook(move || {
+            hook_seen.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let (record, _) = it.next().unwrap().unwrap();
+        assert_eq!(record.cursor, "c3", "only the allowlisted line is yielded");
+        assert!(it.next().is_none(), "the canary is not an event");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            4,
+            "four non-blank lines, whether classified, skipped or unparseable"
+        );
+    }
+
+    #[test]
+    fn without_a_hook_nothing_changes() {
+        let input = r#"{"__CURSOR":"c1","__REALTIME_TIMESTAMP":"1","SYSLOG_IDENTIFIER":"kernel","MESSAGE":"eth0 up"}"#;
         let mut it = ClassifiedJournal::new(Cursor::new(input));
         assert!(it.next().is_none());
     }

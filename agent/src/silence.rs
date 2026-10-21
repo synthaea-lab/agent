@@ -14,7 +14,10 @@
 #![cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -56,19 +59,76 @@ impl<S: EventSink> EventSink for PulsingSink<S> {
     }
 }
 
+/// Whether a best-effort source is down right now (#878, #879): its socket failed, or it
+/// could not be opened at all. This is not silence. A [`SensorHeartbeat`] going quiet is
+/// read as tampering (T1562); a source that is down for a reason the agent knows is reported
+/// through the health beacon instead, as a sensor that is `silent`, so the fleet page shows
+/// the host as degraded without an alert that says someone killed the source.
+#[derive(Clone)]
+pub(crate) struct SourceStatus {
+    name: &'static str,
+    down: Arc<AtomicBool>,
+}
+
+// Only the Linux AVC reader marks a source down (#878, #879); the Windows build never calls these.
+impl SourceStatus {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            down: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn set_down(&self, down: bool) {
+        self.down.store(down, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_down(&self) -> bool {
+        self.down.load(Ordering::SeqCst)
+    }
+}
+
 /// Feeds a shared [`SilenceMonitor`]'s current snapshot to the health beacon
-/// (#134) — a real replacement for `health::NoopSensorHealth`.
-pub(crate) struct SilenceHealthSource(Arc<Mutex<SilenceMonitor>>);
+/// (#134) — a real replacement for `health::NoopSensorHealth` — plus any best-effort source
+/// that is down ([`SourceStatus`]).
+pub(crate) struct SilenceHealthSource {
+    monitor: Arc<Mutex<SilenceMonitor>>,
+    sources: Vec<SourceStatus>,
+}
 
 impl SilenceHealthSource {
-    pub(crate) fn new(monitor: Arc<Mutex<SilenceMonitor>>) -> Self {
-        Self(monitor)
+    pub(crate) fn new(monitor: Arc<Mutex<SilenceMonitor>>, sources: Vec<SourceStatus>) -> Self {
+        Self { monitor, sources }
     }
 }
 
 impl SensorHealthSource for SilenceHealthSource {
     fn sensor_health(&self) -> Vec<schema::SensorHealth> {
-        self.0.lock().unwrap().sensor_health()
+        let mut health = self.monitor.lock().unwrap().sensor_health();
+        for source in self.sources.iter().filter(|s| s.is_down()) {
+            // A source that is registered with the monitor too (its thread is alive, working to
+            // recover) keeps its one entry, now silent; one never started gets an entry of its own.
+            match health.iter_mut().find(|h| h.name == source.name) {
+                Some(entry) => entry.silent = true,
+                None => health.push(schema::SensorHealth {
+                    name: source.name.to_owned(),
+                    pulse_count: 0,
+                    silent: true,
+                }),
+            }
+        }
+        health
+    }
+}
+
+/// One poll of the monitor: every newly confirmed silence becomes a tamper alert, which the health
+/// beacon counts (#863).
+fn poll_and_emit(monitor: &Mutex<SilenceMonitor>, sink: &DetectionSink, now_ns: u64) {
+    let verdicts = monitor.lock().unwrap().poll(now_ns);
+    for verdict in verdicts {
+        sink.emit_tamper("T1562", &verdict.message());
     }
 }
 
@@ -84,10 +144,7 @@ pub(crate) fn spawn_monitor(monitor: Arc<Mutex<SilenceMonitor>>, sink: Arc<Detec
         .spawn(move || {
             loop {
                 std::thread::sleep(POLL_INTERVAL);
-                let verdicts = monitor.lock().unwrap().poll(schema::time::now_ns());
-                for verdict in verdicts {
-                    sink.emit("T1562", &verdict.message());
-                }
+                poll_and_emit(&monitor, &sink, schema::time::now_ns());
             }
         })
         .expect("spawning the sensor-silence monitor thread");
@@ -98,6 +155,53 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    fn alert_sink(dir: &std::path::Path) -> DetectionSink {
+        DetectionSink::new(
+            rules::RuleState::new(),
+            &dir.join("alerts.ndjson"),
+            None,
+            None,
+            None,
+            &dir.join("content"),
+            &dir.join("ml-registry"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_sensor_confirmed_silent_is_a_tamper_alert_that_is_counted() {
+        let dir = std::env::temp_dir().join(format!("silence-tamper-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let sink = alert_sink(&dir);
+        let mut monitor = SilenceMonitor::new();
+        monitor.register(SensorHeartbeat::new("test-sensor"), 1_000, 0);
+        let monitor = Mutex::new(monitor);
+
+        poll_and_emit(&monitor, &sink, 500);
+        assert_eq!(
+            sink.tamper_events(),
+            0,
+            "before the deadline there is nothing to report"
+        );
+
+        poll_and_emit(&monitor, &sink, 2_000_000);
+        assert_eq!(sink.tamper_events(), 1);
+        let alerts = std::fs::read_to_string(dir.join("alerts.ndjson")).unwrap();
+        assert!(
+            alerts.contains("T1562") && alerts.contains("test-sensor"),
+            "alerts: {alerts}"
+        );
+
+        poll_and_emit(&monitor, &sink, 4_000_000);
+        assert_eq!(
+            sink.tamper_events(),
+            1,
+            "a silence already reported is not reported again"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     struct CountingSink(Arc<AtomicUsize>);
 
@@ -145,10 +249,57 @@ mod tests {
         monitor.lock().unwrap().register(hb.clone(), 1, 0);
         hb.pulse();
 
-        let source = SilenceHealthSource::new(monitor);
+        let source = SilenceHealthSource::new(monitor, Vec::new());
         let health = source.sensor_health();
         assert_eq!(health.len(), 1);
         assert_eq!(health[0].name, "linux-ebpf");
         assert_eq!(health[0].pulse_count, 1);
+    }
+
+    #[test]
+    fn a_source_that_is_up_adds_nothing_to_the_beacon() {
+        let monitor = Arc::new(Mutex::new(SilenceMonitor::new()));
+        let status = SourceStatus::new("linux-avc");
+        let source = SilenceHealthSource::new(monitor, vec![status]);
+        assert!(source.sensor_health().is_empty());
+    }
+
+    #[test]
+    fn a_source_that_never_started_is_reported_silent_under_its_own_name() {
+        // #879: AvcReader::open failed, so no heartbeat was ever registered for it.
+        let monitor = Arc::new(Mutex::new(SilenceMonitor::new()));
+        let status = SourceStatus::new("linux-avc");
+        status.set_down(true);
+        let source = SilenceHealthSource::new(monitor, vec![status]);
+        let health = source.sensor_health();
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].name, "linux-avc");
+        assert_eq!(health[0].pulse_count, 0);
+        assert!(health[0].silent);
+    }
+
+    #[test]
+    fn a_registered_source_that_is_down_stays_one_entry_and_turns_silent() {
+        // #878: the reader's thread is alive and pulsing while it reopens, so the monitor
+        // does not call it silent; the beacon still must.
+        let monitor = Arc::new(Mutex::new(SilenceMonitor::new()));
+        let hb = SensorHeartbeat::new("linux-avc");
+        monitor
+            .lock()
+            .unwrap()
+            .register(hb.clone(), u64::MAX / 2, 0);
+        hb.pulse();
+        let status = SourceStatus::new("linux-avc");
+        let source = SilenceHealthSource::new(monitor, vec![status.clone()]);
+
+        assert!(!source.sensor_health()[0].silent);
+        status.set_down(true);
+        let health = source.sensor_health();
+        assert_eq!(health.len(), 1, "no second entry under the same name");
+        assert!(health[0].silent);
+        assert_eq!(health[0].pulse_count, 1);
+
+        status.set_down(false);
+        assert!(!source.sensor_health()[0].silent, "recovery clears it");
     }
 }
