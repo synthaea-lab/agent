@@ -103,6 +103,15 @@ pub(crate) fn wire_run_pipeline(
     )?);
     sink.start_correlator_ticker()?;
 
+    // The fleet common-set snapshot (ADR-0033): off unless this build embeds a `snapshot` key.
+    if let Some(handle) = &transport {
+        crate::snapshot_fetch::spawn_if_enabled(
+            Arc::clone(&handle.client),
+            content_dir.to_path_buf(),
+            Arc::clone(&sink),
+        );
+    }
+
     // Said where the operator reads it (the journal) and in the alert log, where `cli` and
     // the console look: detection runs, upload does not (`offline_fallback`).
     if let Some(reason) = &upload_disabled {
