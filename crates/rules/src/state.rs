@@ -18,22 +18,24 @@ use store::BoundedMap;
 
 use crate::{
     Alert,
+    credfiles::{self, CredFile},
     exclusions::{
         AGENT_CHILD_EXCLUSIONS, APK_STAGING_FILE_PREFIX, ARCHIVE_EGRESS_WINDOW_NS,
         ARCHIVE_READ_WINDOW_NS, ARCHIVE_STAGED_BYTES, ARCHIVE_SUFFIXES, AUTH_FAILURE_THRESHOLD,
         AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD, BEACON_WINDOW_NS, BROWSERS,
         BURST_WRITE_BYTES_THRESHOLD, COMPRESSION_DRIVER_COMMS, COMPRESSION_SUFFIXES,
         COMPRESSOR_COMMS, CREATE_UNLINK_HISTORY_PER_PID, CREATE_UNLINK_PAIR_WINDOW_NS,
-        CREATE_UNLINK_PID_CAP, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS, EGRESS_BYTES_THRESHOLD,
-        EGRESS_WINDOW_NS, IN_PLACE_EDIT_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS,
-        MEMFD_EXEC_WINDOW_NS, PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES,
-        POLICY_DENIAL_ALERT_CAP, QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES,
-        RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS,
-        SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS, SELF_SPAWN_EXCLUSIONS,
-        SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD,
-        SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS,
-        SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN,
-        TASK_REGISTRATION_DEDUP_WINDOW_NS, TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
+        CREATE_UNLINK_PID_CAP, CREDENTIAL_READ_ALERT_WINDOW_NS, DOWNLOAD_EXEC_WINDOW_NS,
+        DOWNLOADER_COMMS, EGRESS_BYTES_THRESHOLD, EGRESS_WINDOW_NS, IN_PLACE_EDIT_COMMS,
+        LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS, MEMFD_EXEC_WINDOW_NS,
+        PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES, POLICY_DENIAL_ALERT_CAP,
+        QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX,
+        RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD,
+        SCAN_SPREAD_WINDOW_NS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
+        SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD,
+        SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STANDARD_PORTS,
+        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
+        TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
     },
     has_write_intent,
     rdp::RdpSuccessAfterFailures,
@@ -326,6 +328,10 @@ pub struct RuleState {
     /// same invoker uid for `sudo`, the same target name for `su`; see the
     /// `sudo` module's own doc for why they differ.
     sudo_success: SudoSuccessAfterFailures,
+    /// (pid, kind of credential file) → the last alert, for CREDENTIAL-READ (T1003.008,
+    /// T1552, #377): one alert per window, not one per open. LRU-bounded like every other
+    /// counter.
+    credential_reads: BoundedMap<(u32, CredFile), SlidingCounter>,
     /// pid → sliding counter for RANSOMWARE-RENAME (T1486, issue #262): renames by
     /// this pid where `new_path` is `old_path` plus an appended suffix. LRU-bounded:
     /// a hostile process renaming under many different pids (unusual, but not
@@ -467,6 +473,7 @@ impl RuleState {
             pending_unlinks: BoundedMap::new(CREATE_UNLINK_PID_CAP),
             touched_files: BoundedMap::new(TOUCHED_FILES_PID_CAP),
             ransomware_unlink: BoundedMap::new(COUNTER_CAP),
+            credential_reads: BoundedMap::new(COUNTER_CAP),
             ransomware_rename: BoundedMap::new(COUNTER_CAP),
             ransomware_rename_by_ppid: BoundedMap::new(COUNTER_CAP),
             write_volume: BoundedMap::new(COUNTER_CAP),
@@ -1723,10 +1730,104 @@ impl RuleState {
             event,
             |pid, generation| self.resolve_comm(pid, generation),
         ));
+        alerts.extend(self.check_credential_file_read(event));
         alerts.extend(self.record_create(event));
         self.record_downloader_write(event);
         self.record_archive_open(event);
         alerts
+    }
+
+    /// The image the pid was exec'd from, else its parent's: a child that forked and never
+    /// exec'd (an older `sshd`'s privilege-separated child) is the same binary as its parent,
+    /// and is in no exec table of its own.
+    fn reader_image(&self, meta: &schema::EventMeta) -> Option<&str> {
+        PidFact::current(&self.pid_image_path, meta.pid, meta.process_generation).or_else(|| {
+            PidFact::current(
+                &self.pid_image_path,
+                meta.ppid,
+                meta.parent_process_generation,
+            )
+        })
+    }
+
+    /// Whether `pid`'s own name, or its parent's, is a web or database service: a daemon with
+    /// no business in a user's credential files, and the process a webshell runs under. The
+    /// name comes from the exec table, not from the event's `comm`, which is the thread's
+    /// (`one_connection` for a `mysqld` worker).
+    fn reader_under_service(&self, meta: &schema::EventMeta) -> bool {
+        let is_service = |comm: &str| {
+            SERVICE_COMMS.contains(&comm)
+                || SERVICE_COMM_PREFIXES
+                    .iter()
+                    .any(|prefix| comm.starts_with(prefix))
+        };
+        [
+            PidFact::current(&self.pid_comm, meta.pid, meta.process_generation),
+            PidFact::current(&self.pid_comm, meta.ppid, meta.parent_process_generation),
+        ]
+        .into_iter()
+        .flatten()
+        .any(is_service)
+    }
+
+    /// CREDENTIAL-READ (#377), on the file opens of a Unix host: T1003.008 for the shadow files,
+    /// T1552.004 for an SSH private key, T1552.001 for the other credential files of a home
+    /// directory (see `credfiles` for the paths and what the sensor cannot see).
+    ///
+    /// Only a read counts: a write-only open (`ssh-keygen` writing a key, `passwd` rewriting
+    /// the file) is not one. Who may read differs by file, because who legitimately does
+    /// differs:
+    /// - The **shadow files** have a short, fixed list of readers (the authentication stack,
+    ///   `credfiles::AUTH_STACK`); anything else that opens them alerts. Medium, not High:
+    ///   an administrator's `cat`, a backup or integrity tool (`tar`, `rsync`, `rpm -V`,
+    ///   AIDE) and a PAM service the list lacks look the same, and none is excluded here
+    ///   because each is also what an attacker runs.
+    /// - A **home credential file** has no fixed list: `python3` with `boto3`, `terraform`,
+    ///   `kubectl`, `git` and `ssh` all read their own, from `/usr/bin`. So a read alerts only
+    ///   when the reader is *unexpected* in a way the telemetry can show: a web or database
+    ///   service (or a child of one), or a binary run from outside the system directories
+    ///   (`/tmp`, a home directory, `/dev/shm`). Not caught: a system binary (`cat`, `tar`) run
+    ///   by an intruder, and a tool a developer installed under their home (`~/.local/bin`,
+    ///   `~/go/bin`) alerts although it is theirs, its own credentials read by its own
+    ///   binary. Both are the price of not alerting on every `aws` call.
+    ///
+    /// One alert per (pid, kind) per [`CREDENTIAL_READ_ALERT_WINDOW_NS`]. No file content and
+    /// no command line goes into the message, only the path the process asked for.
+    fn check_credential_file_read(&mut self, event: &FileOpenEvent) -> Option<Alert> {
+        if !credfiles::can_read(event.flags) {
+            return None;
+        }
+        let kind = credfiles::classify(&event.path)?;
+        let image = self.reader_image(&event.meta);
+        let comm = event.meta.comm.as_str();
+        let why = match kind {
+            CredFile::Shadow if credfiles::is_auth_stack(comm, image) => return None,
+            CredFile::Shadow => "outside the authentication stack",
+            CredFile::PrivateKey | CredFile::HomeCredentials => {
+                if self.reader_under_service(&event.meta) {
+                    "a web or database service or its child"
+                } else if credfiles::image_outside_system_dirs(image) {
+                    "a binary outside the system directories"
+                } else {
+                    return None;
+                }
+            }
+        };
+        let ts = event.meta.timestamp_ns;
+        let counter = self
+            .credential_reads
+            .get_or_insert_with((event.meta.pid, kind), SlidingCounter::default);
+        if !counter.try_alert(ts, CREDENTIAL_READ_ALERT_WINDOW_NS) {
+            return None;
+        }
+        Some(Alert {
+            technique: kind.technique(),
+            severity: Severity::Medium,
+            message: format!(
+                "pid={} comm={comm}: opened {} for reading from {why}",
+                event.meta.pid, event.path,
+            ),
+        })
     }
 
     /// T1053.005 creation (`check_scheduled_task_persistence`), reported once per

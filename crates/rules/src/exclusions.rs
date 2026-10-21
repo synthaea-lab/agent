@@ -490,3 +490,8 @@ pub(crate) const POLICY_DENIAL_ALERT_CAP: u64 = 2048;
 /// (`meta.timestamp_ns`). Long enough that a flood stays bounded to the cap per hour, short
 /// enough that a genuinely new denial after a noisy period is not silenced for the whole run.
 pub(crate) const POLICY_DENIAL_ALERT_WINDOW_NS: u64 = 3_600_000_000_000;
+
+/// One alert per (pid, kind of credential file) per this window. A scanner or a `grep -r` over
+/// `/home` opens the same credential files again and again, and the first open is the finding.
+/// Sliding (timestamp-based), never a reset bucket. Uncalibrated (first cut, 2026-10-21).
+pub(crate) const CREDENTIAL_READ_ALERT_WINDOW_NS: u64 = 300_000_000_000; // 5 min
