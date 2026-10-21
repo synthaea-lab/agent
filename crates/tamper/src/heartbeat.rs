@@ -165,6 +165,18 @@ impl SilenceMonitor {
         });
     }
 
+    /// Stops watching the heartbeats named `name`; returns whether any was registered.
+    ///
+    /// For a sensor that is switched off on purpose (a capture that a posture overlay
+    /// widened and that has expired): a watched sensor that no longer runs would read as
+    /// silence, and silence is reported as tampering. Registering it again later seeds a
+    /// fresh stall clock.
+    pub fn unregister(&mut self, name: &str) -> bool {
+        let before = self.watched.len();
+        self.watched.retain(|w| w.heartbeat.name() != name);
+        self.watched.len() != before
+    }
+
     /// Polls every watched sensor and returns a verdict for each one newly confirmed
     /// silent. A sensor whose counter advanced since the last poll resets its clock
     /// (and clears any prior alert); one that has been static past its deadline
@@ -236,6 +248,68 @@ mod tests {
         assert!(mon.poll(40 * SEC).is_empty(), "the increment is a pulse");
         assert_eq!(hb.pulse_count(), 1);
         assert_eq!(mon.poll(80 * SEC).len(), 1, "no further increment: silent");
+    }
+
+    #[test]
+    fn an_unregistered_sensor_is_never_reported_silent() {
+        let hb = SensorHeartbeat::new("linux-uprobes");
+        let mut mon = SilenceMonitor::new();
+        mon.register(hb.clone(), 30 * SEC, 0);
+
+        assert!(mon.unregister("linux-uprobes"));
+
+        assert!(mon.poll(500 * SEC).is_empty(), "no longer watched");
+        assert!(mon.sensor_health().is_empty());
+        assert!(!mon.any_silent());
+    }
+
+    #[test]
+    fn unregistering_a_sensor_that_was_never_registered_changes_nothing() {
+        let other = SensorHeartbeat::new("linux-netlink");
+        let mut mon = SilenceMonitor::new();
+        mon.register(other, 30 * SEC, 0);
+
+        assert!(!mon.unregister("linux-uprobes"));
+
+        assert_eq!(
+            mon.sensor_health().len(),
+            1,
+            "the other sensor is still watched"
+        );
+        assert_eq!(mon.poll(40 * SEC).len(), 1);
+    }
+
+    #[test]
+    fn unregistering_one_sensor_leaves_the_others_watched() {
+        let mut mon = SilenceMonitor::new();
+        mon.register(SensorHeartbeat::new("linux-uprobes"), 30 * SEC, 0);
+        mon.register(SensorHeartbeat::new("linux-netlink"), 30 * SEC, 0);
+
+        mon.unregister("linux-uprobes");
+
+        let verdicts = mon.poll(40 * SEC);
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].sensor, "linux-netlink");
+    }
+
+    #[test]
+    fn a_sensor_registered_again_gets_a_fresh_stall_clock() {
+        let hb = SensorHeartbeat::new("linux-uprobes");
+        let mut mon = SilenceMonitor::new();
+        mon.register(hb.clone(), 30 * SEC, 0);
+        mon.unregister("linux-uprobes");
+
+        mon.register(hb, 30 * SEC, 1_000 * SEC);
+
+        assert!(
+            mon.poll(1_020 * SEC).is_empty(),
+            "20 s after the new registration"
+        );
+        assert_eq!(
+            mon.poll(1_031 * SEC).len(),
+            1,
+            "past the deadline of the new one"
+        );
     }
 
     #[test]

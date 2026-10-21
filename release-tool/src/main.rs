@@ -13,21 +13,31 @@
 //! release-tool public-key --key-file release.key
 //! ```
 //!
-//! The key is a file of 64 hex characters (a 32-byte Ed25519 seed). Where the
-//! production key lives, who may use it and how it rotates are the open questions
-//! of ADR-0015, not decisions this tool makes. `--test-key` signs with the public,
-//! checked-in test key for lab and dev releases only.
+//! Production keys sign from a PKCS#11 token (ADR-0027 decision 2): the private key never
+//! leaves the device and the tool only sends it the bytes to sign.
+//!
+//! ```text
+//! RELEASE_TOOL_PKCS11_PIN=... release-tool sign --kind release \
+//!     --pkcs11 /usr/lib64/pkcs11/opensc-pkcs11.so --pkcs11-token release --pkcs11-key release \
+//!     manifest.json --out signed.json
+//! ```
+//!
+//! `--key-file` (a file of 64 hex characters, a 32-byte Ed25519 seed) and `--test-key` (the
+//! public, checked-in test key) are for lab and dev releases: a key that can be read from a
+//! file is not a production key. Who holds the token and who approves a release are decisions
+//! of the owner (ADR-0027), not of this tool.
 
 mod keyfile;
 mod manifest_dir;
+mod pkcs11;
 mod roll_forward;
 mod sign;
+mod signer;
 
 use std::{io::Write as _, path::PathBuf};
 
 use anyhow::Context as _;
 use clap::{Args, Parser, Subcommand};
-use ring::signature::Ed25519KeyPair;
 
 #[derive(Parser)]
 #[command(
@@ -82,25 +92,40 @@ enum Command {
         kind: sign::Kind,
         #[command(flatten)]
         key: KeySource,
+        #[command(flatten)]
+        token: Pkcs11Options,
         /// The manifest to sign.
         manifest: PathBuf,
         /// Write here instead of stdout.
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Print the public key (hex) of a signing key: the value to embed in `updater::key`.
+    /// Print the public key (hex) of a signing key: the value to commit under `crates/updater/keys/`.
     PublicKey {
         #[command(flatten)]
         key: KeySource,
+        #[command(flatten)]
+        token: Pkcs11Options,
     },
 }
 
 #[derive(Args)]
 #[group(required = true, multiple = false)]
 struct KeySource {
-    /// File holding the 32-byte Ed25519 seed as 64 hex characters (mode 0600).
+    /// File holding the 32-byte Ed25519 seed as 64 hex characters (mode 0600). Lab and dev
+    /// releases: a key in a file is not a production key.
     #[arg(long, value_name = "FILE")]
     key_file: Option<PathBuf>,
+    /// The PKCS#11 module (shared library) of the token holding the key: the production way
+    /// to sign. Needs `--pkcs11-token` and `--pkcs11-key`; the PIN is read from
+    /// `RELEASE_TOOL_PKCS11_PIN` or `--pkcs11-pin-file`.
+    #[arg(
+        long,
+        value_name = "MODULE",
+        requires = "pkcs11_token",
+        requires = "pkcs11_key"
+    )]
+    pkcs11: Option<PathBuf>,
     /// The public, checked-in test key. Lab and dev releases only: anyone can sign
     /// with it, and a build that embeds it must not be shipped. Exists only in a
     /// `test-key` build (the default).
@@ -109,21 +134,48 @@ struct KeySource {
     test_key: bool,
 }
 
+/// Where the key is on the token, with `--pkcs11`.
+#[derive(Args)]
+struct Pkcs11Options {
+    /// Label of the token (not the slot number, which changes).
+    #[arg(long, value_name = "LABEL", requires = "pkcs11")]
+    pkcs11_token: Option<String>,
+    /// Label shared by the key's private and public objects on the token.
+    #[arg(long, value_name = "LABEL", requires = "pkcs11")]
+    pkcs11_key: Option<String>,
+    /// File holding the token's user PIN (mode 0600), instead of `RELEASE_TOOL_PKCS11_PIN`.
+    #[arg(long, value_name = "FILE", requires = "pkcs11")]
+    pkcs11_pin_file: Option<PathBuf>,
+}
+
 impl KeySource {
-    fn load(&self) -> anyhow::Result<Ed25519KeyPair> {
+    fn load(&self, token: &Pkcs11Options) -> anyhow::Result<Box<dyn signer::Signer>> {
         if let Some(path) = &self.key_file {
-            return keyfile::load(path);
+            return Ok(Box::new(signer::FileKey::new(keyfile::load(path)?)));
+        }
+        if let (Some(module), Some(token_label), Some(key)) =
+            (&self.pkcs11, &token.pkcs11_token, &token.pkcs11_key)
+        {
+            let pin = pkcs11::read_pin(token.pkcs11_pin_file.as_deref())?;
+            let location = pkcs11::Location {
+                module: module.clone(),
+                token: token_label.clone(),
+                key: key.clone(),
+            };
+            return Ok(Box::new(pkcs11::Pkcs11Signer::open(&location, &pin)?));
         }
         #[cfg(feature = "test-key")]
         {
             eprintln!(
                 "warning: signing with the PUBLIC test key; this release is for a lab, not for production"
             );
-            Ok(updater::key::test_key_pair())
+            Ok(Box::new(
+                signer::FileKey::new(updater::key::test_key_pair()),
+            ))
         }
         #[cfg(not(feature = "test-key"))]
         {
-            anyhow::bail!("this build has no test key: pass --key-file")
+            anyhow::bail!("this build has no test key: pass --pkcs11 or --key-file")
         }
     }
 }
@@ -216,15 +268,16 @@ fn main() -> anyhow::Result<()> {
         Command::Sign {
             kind,
             key,
+            token,
             manifest,
             out,
         } => {
-            let key_pair = key.load()?;
+            let signer = key.load(&token)?;
             let text = std::fs::read_to_string(&manifest)
                 .with_context(|| format!("cannot read {}", manifest.display()))?;
-            let signed = sign::sign(kind, &text, &key_pair)?;
+            let signed = sign::sign(kind, &text, signer.as_ref())?;
             eprintln!("signed {}", signed.summary);
-            eprintln!("public key: {}", keyfile::public_key_hex(&key_pair));
+            eprintln!("public key: {}", signer::public_key_hex(signer.as_ref()));
             if signed.accepted_by_embedded_key {
                 eprintln!("the key embedded in this build of the updater accepts this signature");
             } else {
@@ -235,6 +288,8 @@ fn main() -> anyhow::Result<()> {
             }
             emit(&signed.json, out.as_ref())
         }
-        Command::PublicKey { key } => emit(&keyfile::public_key_hex(&key.load()?), None),
+        Command::PublicKey { key, token } => {
+            emit(&signer::public_key_hex(key.load(&token)?.as_ref()), None)
+        }
     }
 }

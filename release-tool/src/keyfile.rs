@@ -8,8 +8,8 @@
 use std::path::Path;
 
 use anyhow::Context as _;
-use ring::signature::{Ed25519KeyPair, KeyPair as _};
-use updater::hash::{hex_decode, hex_encode};
+use ring::signature::Ed25519KeyPair;
+use updater::hash::hex_decode;
 
 /// Parses a seed file's text: 64 hex characters, surrounding whitespace ignored.
 pub(crate) fn parse_seed(text: &str) -> anyhow::Result<Ed25519KeyPair> {
@@ -46,11 +46,6 @@ pub(crate) fn load(path: &Path) -> anyhow::Result<Ed25519KeyPair> {
     parse_seed(&text)
 }
 
-/// The public half as lowercase hex, the form to embed in `updater::key`.
-pub(crate) fn public_key_hex(key_pair: &Ed25519KeyPair) -> String {
-    hex_encode(key_pair.public_key().as_ref())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,8 +56,8 @@ mod tests {
     fn a_seed_with_surrounding_whitespace_parses_to_the_matching_public_key() {
         let key = parse_seed(&format!("  {SEED}\n")).unwrap();
         assert_eq!(
-            public_key_hex(&key),
-            hex_encode(
+            crate::signer::public_key_hex(&crate::signer::FileKey::new(key)),
+            updater::hash::hex_encode(
                 updater::key::RELEASE_PUBLIC_KEY
                     .as_ref()
                     .expect("the test set is embedded in tests")
