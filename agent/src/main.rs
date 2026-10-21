@@ -21,6 +21,8 @@
     allow(dead_code)
 )]
 mod alerts;
+#[cfg(target_os = "linux")]
+mod captures;
 mod commands;
 mod content;
 mod deception;
