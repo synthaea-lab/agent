@@ -1,0 +1,106 @@
+#!/sbin/openrc-run
+# Mirrors packaging/linux/systemd/synthaea-agent.service's intent (same
+# bootstrap-then-current layout, same unprivileged user, same hardened log
+# path). Capabilities: OpenRC's supervise-daemon has granted ambient
+# capabilities via its own `capabilities=` directive since 0.45 (this host's
+# 0.63.2 confirmed live) — the direct equivalent of the systemd unit's
+# AmbientCapabilities=, not file capabilities on the binary. That matters
+# for two reasons found in review: a file-capability binary triggers the
+# kernel's `secureexec`, which clears `PR_SET_PDEATHSIG`
+# (security/commoncap.c, fs/exec.c) — exactly the signal the watchdog
+# depends on to die with its parent (#216) — and a release the updater
+# promotes into versions/vN/ is a fresh file copy, so `setcap` on the
+# bootstrap binary would not survive the first self-update either. Ambient
+# capabilities are granted by supervise-daemon at process start and
+# inherited across exec regardless of which binary path is current, so
+# neither problem applies here.
+
+description="Synthaea Endpoint Detection & Response"
+
+supervisor=supervise-daemon
+command="/var/lib/synthaea/current/watchdog"
+command_args="run --agent-bin /var/lib/synthaea/current/agent --alerts /var/log/synthaea/alerts.ndjson"
+command_user="synthaea:synthaea"
+pidfile="/run/${RC_SVCNAME}.pid"
+
+# Same set, same reasoning as the systemd unit's CapabilityBoundingSet/
+# AmbientCapabilities (ADR-0014, amended for CAP_AUDIT_READ #780):
+#   cap_bpf cap_perfmon      load programs, attach tracepoints/kprobes (eBPF sensor)
+#   cap_sys_resource         raise RLIMIT_MEMLOCK for the BPF maps
+#   cap_dac_read_search      read /proc/<pid>/* and files of other users (hashing, cmdline)
+#   cap_net_admin            conntrack netlink (network flows)
+#   cap_kill                 signal other users' processes (response action, off by default)
+#   cap_audit_read           multicast-subscribe NETLINK_AUDIT for SELinux AVC denials
+# "^name" grants (keeps) that capability; without the "^" the service would
+# start with none. no_new_privs mirrors the unit's NoNewPrivileges=true.
+capabilities="^cap_bpf,^cap_perfmon,^cap_sys_resource,^cap_dac_read_search,^cap_net_admin,^cap_kill,^cap_audit_read"
+no_new_privs="yes"
+
+# "0" is explicit, not relied on as OpenRC's own default (#213 lab finding:
+# /etc/rc.conf's site-wide SUPERVISE DAEMON CONFIGURATION VARIABLES block
+# otherwise applies respawn_max="5"/respawn_period="1800" to every
+# supervise-daemon service that doesn't override them — not Restart=always).
+respawn_max="0"
+# Same backoff as the systemd unit's RestartSec=5s — without it a watchdog
+# that fails immediately on start (e.g. a bad agent.toml) respawns in a tight
+# loop against respawn_max="0"'s unlimited retries, flooding watchdog.log.
+respawn_delay="5"
+
+output_log="/var/log/synthaea/watchdog.log"
+error_log="/var/log/synthaea/watchdog.log"
+
+depend() {
+	# "use", not "need": the systemd unit's own net dependency
+	# (Wants=network-online.target) is soft too — offline_fallback lets the
+	# agent start and run without network, and "need net" would keep this
+	# service down for that whole window whenever networking fails at boot
+	# (e.g. DHCP unreachable), which is exactly when host visibility matters
+	# most.
+	use net
+	after net
+}
+
+start_pre() {
+	# Same bootstrap-then-current layout as the systemd unit's ExecStartPre
+	# lines (issue #36): first start has no "current" yet, and the updater
+	# only ever promotes into it, never creates it.
+	if [ ! -e /var/lib/synthaea/current ]; then
+		ln -s bootstrap /var/lib/synthaea/current
+	fi
+	checkpath -d -m 0750 -o synthaea:synthaea /var/lib/synthaea/versions
+	checkpath -d -m 0750 -o synthaea:synthaea /var/log/synthaea
+	# synthaea:synthaea, not root:root (review finding): the IPC socket this
+	# directory holds (/run/synthaea/agent.sock, crates/config's
+	# default-agent.toml) is bound by the agent running as synthaea, and a
+	# root-owned parent directory would not stop that bind from an
+	# ownership/permission perspective by itself, but matching the systemd
+	# tmpfiles entry (packaging/linux/systemd/synthaea.tmpfiles) keeps the
+	# two packages' behavior identical and avoids relying on the directory's
+	# mode bits alone.
+	checkpath -d -m 0755 -o synthaea:synthaea /run/synthaea
+	# bpffs pin directory for the sensor (#559, same as the systemd unit's
+	# tmpfiles entry) — without it the sensor falls back to an unpinned load
+	# and the #362 cross-restart attribution is lost. Best-effort: a host
+	# without bpf support (or a kernel where it's already mounted elsewhere)
+	# must not fail the service start over this, same spirit as the unit's
+	# ReadWritePaths="-/sys/fs/bpf/synthaea" leading dash.
+	if ! mountpoint -q /sys/fs/bpf; then
+		mount -t bpf bpffs /sys/fs/bpf 2>/dev/null || true
+	fi
+	checkpath -d -m 0750 -o synthaea:synthaea /sys/fs/bpf/synthaea 2>/dev/null || true
+	# Recovers a release that cannot exec, same as the systemd unit's own
+	# ExecStartPre into the package-installed bootstrap watchdog. Run as
+	# the service user, not root (review finding): start_pre() itself runs
+	# as root under OpenRC (command_user only applies to the supervised
+	# daemon), and this binary lives under a path the synthaea user — the
+	# same user the agent runs as — can replace (bootstrap/'s parent,
+	# /var/lib/synthaea, is synthaea-owned and has no sticky bit). A
+	# compromised agent could otherwise plant its own "watchdog" there and
+	# get root code execution on the next restart. The recover probe itself
+	# also executes agent-controlled code (watchdog/src/recovery.rs runs
+	# the candidate release's own `watchdog --help`), so it needs the same
+	# unprivileged context the systemd unit gets for free from its unit-wide
+	# User=synthaea. "-s /bin/sh": the synthaea user's shell is /sbin/nologin.
+	su -s /bin/sh synthaea -c \
+		'/var/lib/synthaea/bootstrap/watchdog recover --base-dir /var/lib/synthaea'
+}

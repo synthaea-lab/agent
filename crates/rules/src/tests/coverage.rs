@@ -1,12 +1,14 @@
 //! Coverage-pack wave 1 (issues #377/#379/#381): masquerading, recovery
 //! inhibit, log clearing (exec + file halves), and the auth-failure burst.
 
-use schema::{AuthEvent, AuthKind, AuthOutcome, FileDeleteEvent};
+use schema::{
+    AuthEvent, AuthKind, AuthOutcome, FileDeleteEvent, LogClearedEvent, detection::Severity,
+};
 
 use super::*;
 use crate::{
     check_log_clear_exec, check_log_file_delete, check_masquerading, check_recovery_inhibit,
-    evaluate_file_delete,
+    evaluate_file_delete, evaluate_log_cleared,
 };
 
 fn exec_with_path(image_path: &str, comm: &str) -> ExecEvent {
@@ -128,6 +130,52 @@ fn journald_vacuum_alerts_but_status_queries_do_not() {
     let alert = check_log_clear_exec(&exec_event("journalctl --vacuum-time=1s")).expect("alert");
     assert_eq!(alert.technique, "T1070.002");
     assert!(check_log_clear_exec(&exec_event("journalctl -u sshd -f")).is_none());
+}
+
+// --- T1070.001 log clearing (OS-record half, #799) -------------------------
+
+#[test]
+fn a_cleared_security_log_is_one_high_t1070_001_alert_naming_who() {
+    let event = LogClearedEvent {
+        meta: EventMeta {
+            user: User::Windows {
+                sid: "S-1-5-21-1-2-3-1001".into(),
+                integrity_level: None,
+            },
+            ..schema::fixtures::meta()
+        },
+        channel: "Security".into(),
+        subject_user: r"LAB\analyst".into(),
+        subject_logon_id: Some("0x4d2c1".into()),
+        ..schema::fixtures::log_cleared()
+    };
+    let alerts = evaluate_log_cleared(&event);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1070.001");
+    assert_eq!(alerts[0].severity, Severity::High);
+    assert_eq!(
+        alerts[0].message,
+        r"event log cleared: channel=Security by=LAB\analyst (sid=S-1-5-21-1-2-3-1001 logon=0x4d2c1)"
+    );
+}
+
+#[test]
+fn a_cleared_log_still_alerts_high_when_it_was_backed_up_first() {
+    let event = LogClearedEvent {
+        channel: "Microsoft-Windows-PowerShell/Operational".into(),
+        backup_path: Some(r"C:\Users\Public\ps.evtx".into()),
+        ..schema::fixtures::log_cleared()
+    };
+    let alerts = evaluate_log_cleared(&event);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].severity, Severity::High);
+    assert!(
+        alerts[0]
+            .message
+            .ends_with(r"by=- (sid=-), backed up to C:\Users\Public\ps.evtx"),
+        "{}",
+        alerts[0].message
+    );
 }
 
 // --- T1070.001/.002 log clearing (file-deletion half) ----------------------
