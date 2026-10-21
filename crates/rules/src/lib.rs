@@ -23,6 +23,7 @@ mod signature_gate;
 mod sliding;
 mod state;
 mod stateless;
+mod sudo;
 
 // AMSI content rules (#282): the dispatcher for `AmsiContent` events.
 pub use amsi::evaluate_amsi_content;
@@ -41,7 +42,8 @@ pub use state::RuleState;
 #[cfg(test)]
 pub(crate) use stateless::{
     check_account_creation_persistence, check_base64_decode, check_btm_launch_item_persistence,
-    check_encoded_powershell, check_kerberos_from_non_lsass, check_ld_preload_hijack,
+    check_doh_dot_connection, check_encoded_powershell, check_kerberos_from_non_lsass,
+    check_ld_preload_hijack,
     check_log_clear_exec, check_log_file_delete, check_masquerading, check_persistence_write,
     check_proc_root_escape, check_recovery_inhibit, check_scheduled_task_persistence,
     check_scheduled_task_update_persistence, check_security_process_signal,
@@ -52,7 +54,8 @@ pub(crate) use stateless::{
 // through them. The individual checks are implementation detail, re-exported
 // crate-internally for the tests under `src/tests/`.
 pub use stateless::{
-    evaluate_connect, evaluate_exec, evaluate_file_delete, evaluate_file_open, evaluate_signal,
+    evaluate_connect, evaluate_exec, evaluate_file_delete, evaluate_file_open,
+    evaluate_log_cleared, evaluate_signal,
 };
 
 #[derive(Debug, Clone)]

@@ -1,0 +1,14 @@
+#!/bin/sh
+# Same order dependency as the .deb/.rpm postinst (#675, #594): the user/group
+# must exist before anything under /var/lib/synthaea or /var/log/synthaea is
+# chowned to it in post-install.
+set -e
+
+if ! getent group synthaea >/dev/null 2>&1; then
+    addgroup -S synthaea
+fi
+if ! getent passwd synthaea >/dev/null 2>&1; then
+    adduser -S -D -H -h /var/lib/synthaea -s /sbin/nologin -G synthaea synthaea
+fi
+
+exit 0

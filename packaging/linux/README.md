@@ -45,7 +45,10 @@ This separation ensures that package managers (apt/dnf) and the updater never co
                          # lets the agent run as shipped
 
 /usr/bin/
-└── synthaea-ctl -> /var/lib/synthaea/current/cli   # CLI symlink
+└── synthaea-ctl        # Root-owned package asset, a copy of cli (#897) —
+                         # NOT a symlink into current/, which the unprivileged
+                         # synthaea user owns and could otherwise repoint to
+                         # get root via `sudo synthaea-ctl`
 ```
 
 ---

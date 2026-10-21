@@ -42,8 +42,9 @@ case "$1" in
             # versions/ just created above).
             chown -R synthaea:synthaea /var/lib/synthaea /var/log/synthaea
 
-            # Create CLI symlink
-            ln -sf /var/lib/synthaea/current/cli /usr/bin/synthaea-ctl
+            # synthaea-ctl is its own root-owned package asset (#897), not a
+            # symlink into the synthaea-user-owned current/ tree — nothing to
+            # do here any more.
 
             # The shipped config starts and runs (offline_fallback = true,
             # #675), so systemctl status alone does not tell an operator it
@@ -64,5 +65,16 @@ esac
 # comment explaining this token by name) gets replaced too, splitting that
 # comment around injected shell code. Never spell this token a second time
 # in this file, in a comment or otherwise.
+# The block cargo-deb injects at the token below calls `systemd-sysusers` with no guard
+# of its own (cargo-deb 3.8.0, its sysusers autoscript), so on a host that does not have
+# it - a debian:12 or ubuntu:22.04 container, a chroot with no systemd - `dpkg -i` died
+# there with exit status 127 and left the package half-configured (found by the install
+# check in .github/workflows/linux-deb-portability.yml, #675). Run the injected block only
+# where the tool exists: a chroot that has systemd installed still gets the sysusers entry
+# and the enable symlink, and the start part is guarded on a running systemd by cargo-deb.
+if command -v systemd-sysusers >/dev/null 2>&1; then
+    # An empty `then` body is a syntax error before the token is substituted.
+    :
 #DEBHELPER#
+fi
 exit 0

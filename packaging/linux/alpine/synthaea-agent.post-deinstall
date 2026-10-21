@@ -1,0 +1,33 @@
+#!/bin/sh
+# Only called on a real removal, not an upgrade (apk calls pre-upgrade/
+# post-upgrade for those — this package defines neither, so an upgrade skips
+# straight past this file).
+#
+# Deliberately NOT the same as the .rpm spec's %postun "$1 -eq 0" branch,
+# which (like the .deb's "purge" case) deletes /var/log/synthaea too: apk has
+# no purge/remove split (review finding, #861 — on a security product,
+# `apk del` silently erasing the alert log the agent just raised is worse
+# than leaving it behind), so this keeps /var/log/synthaea and only removes
+# the runtime/versioned state and the account. An operator who wants the logs
+# gone too can still `rm -rf /var/log/synthaea` by hand.
+set -e
+
+rm -rf /var/lib/synthaea /run/synthaea
+# Before dropping the account, not after (review finding): /var/log/synthaea
+# is kept for its contents, not for the synthaea uid/gid — once deluser runs
+# that uid has no name, and a later system account could be assigned the
+# same one and silently inherit ownership of the kept alert log.
+# Guard only the missing-directory case (review finding): a bare chown
+# would fail the whole script under `set -e` if an operator already removed
+# /var/log/synthaea by hand or a prior apk del left none. But `... || true`
+# on the whole line also swallowed a real chown failure, which would then
+# let deluser drop the account anyway and orphan the kept log's uid/gid
+# (second review finding) — so only the existence check is optional; a
+# chown that actually fails still aborts before the account is touched.
+if [ -d /var/log/synthaea ]; then
+    chown -R root:root /var/log/synthaea
+fi
+deluser synthaea 2>/dev/null || true
+delgroup synthaea 2>/dev/null || true
+
+exit 0

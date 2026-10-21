@@ -1,5 +1,7 @@
 //! Stateless rules: a single event is enough to decide — no history, no state.
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
 use schema::{
     ConnectEvent, ExecEvent, FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT,
     FLAG_PERSISTENCE_BTM_ARTIFACT, FLAG_PERSISTENCE_SYSTEMD_ARTIFACT,
@@ -799,6 +801,44 @@ pub fn evaluate_file_delete(event: &schema::FileDeleteEvent) -> Vec<Alert> {
     check_log_file_delete(event).into_iter().collect()
 }
 
+/// T1070.001 — the OS-record half (#799): Windows says a log was cleared
+/// (Security 1102, System 104), however it was done. [`check_log_clear_exec`]
+/// only sees the clears whose command line spells them; this sees the API and
+/// .NET ones too. A `wevtutil cl` raises both, a duplicate accepted for now.
+///
+/// High, one alert per clear, with no exclusion: a legitimate clear is rare and
+/// an administrator emptying a log is worth seeing anyway. A backup taken first
+/// is named in the message but does not lower the severity, since an attacker
+/// can ask for one as easily.
+#[must_use]
+pub fn evaluate_log_cleared(event: &schema::LogClearedEvent) -> Vec<Alert> {
+    let who = if event.subject_user.is_empty() {
+        "-"
+    } else {
+        &event.subject_user
+    };
+    let sid = match &event.meta.user {
+        schema::User::Windows { sid, .. } => sid.as_str(),
+        _ => "-",
+    };
+    let logon = event
+        .subject_logon_id
+        .as_ref()
+        .map_or_else(String::new, |id| format!(" logon={id}"));
+    let backup = event
+        .backup_path
+        .as_ref()
+        .map_or_else(String::new, |path| format!(", backed up to {path}"));
+    vec![Alert {
+        technique: CLEAR_WINDOWS_EVENT_LOGS,
+        severity: Severity::High,
+        message: format!(
+            "event log cleared: channel={} by={who} (sid={sid}{logon}){backup}",
+            event.channel
+        ),
+    }]
+}
+
 /// `SIGSTOP`'s platform-native number: the one signal of
 /// [`tamper_signal_name`]'s set that differs between Linux and macOS. Signal
 /// events carry the sending host's numbering, and rules run on that same host.
@@ -914,6 +954,111 @@ pub(crate) fn check_service_unusual_outbound(event: &ConnectEvent) -> Option<Ale
     })
 }
 
+/// DNS-over-TLS's reserved port (RFC 7858) — essentially no other common traffic
+/// uses it, so any connection here is already unusual regardless of destination.
+const DOT_PORT: u16 = 853;
+
+/// HTTPS's port, which DNS-over-HTTPS (`DoH`) rides on indistinguishably from
+/// ordinary traffic at the connection level — this rule only treats it as `DoH`
+/// when the destination is also one of [`KNOWN_DOH_RESOLVERS`].
+const HTTPS_PORT: u16 = 443;
+
+/// Processes expected to speak encrypted DNS directly, so a connection from one
+/// of them to [`DOT_PORT`] or a [`KNOWN_DOH_RESOLVERS`] address is routine, not a
+/// signal: the host's own stub resolver (which may speak `DoT` upstream), and
+/// browsers (several ship `DoH` on by default and dial it themselves rather than
+/// through the OS resolver). Comparing against `comm` case-insensitively covers
+/// both the bare Linux/macOS name and the Windows `.exe` form.
+const DOH_DOT_EXPECTED_COMMS: &[&str] = &[
+    "systemd-resolved",
+    "mDNSResponder",
+    "firefox",
+    "firefox-esr",
+    "firefox.exe",
+    "chrome",
+    "chrome.exe",
+    "chromium",
+    "chromium-browser",
+    "brave",
+    "brave.exe",
+    "opera",
+    "opera.exe",
+    "msedge",
+    "msedge.exe",
+];
+
+/// Known public `DoH` resolver addresses: Cloudflare, Google, Quad9, OpenDNS/Cisco
+/// — the handful of providers the pre-built resolver profiles in Firefox/Chrome
+/// ship with, so also the ones a C2 implant reusing a well-known endpoint (to
+/// blend into "normal" `DoH` traffic rather than running its own) is most likely
+/// to pick. Deliberately short and not exhaustive: a private/enterprise `DoH`
+/// endpoint, a self-hosted one, or a public provider not on this list is a real
+/// gap this rule accepts, the same unbounded-tail trade-off ADR-0028 documents
+/// for `policy`'s interpreter blocklist — this is detection content, meant to be
+/// widened as real `DoH` C2 traffic is observed, not a complete inventory.
+const KNOWN_DOH_RESOLVERS: &[IpAddr] = &[
+    // Cloudflare (1.1.1.1)
+    IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+    IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
+    IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+    IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1001)),
+    // Google Public DNS
+    IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+    IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)),
+    IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
+    IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8844)),
+    // Quad9
+    IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+    IpAddr::V4(Ipv4Addr::new(149, 112, 112, 112)),
+    IpAddr::V6(Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x00fe)),
+    IpAddr::V6(Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x0009)),
+    // OpenDNS / Cisco
+    IpAddr::V4(Ipv4Addr::new(208, 67, 222, 222)),
+    IpAddr::V4(Ipv4Addr::new(208, 67, 220, 220)),
+];
+
+/// T1071.004 — Application Layer Protocol: DNS, the encrypted-transport case
+/// (issue #458 Phase 2, point 5): a non-browser, non-resolver process connecting
+/// to DNS-over-TLS's reserved port, or to a well-known public `DoH` resolver on
+/// 443. Both are legitimate ways to resolve names, but neither is something an
+/// arbitrary process has an ordinary reason to do directly — the OS resolver
+/// (`systemd-resolved`, `mDNSResponder`) or the browser already does it for
+/// everything else on the host. A process doing its own encrypted DNS is doing
+/// so specifically to keep its queries out of plaintext UDP/53 — the same
+/// visibility gap a C2 implant or exfil tool wants, whether or not this
+/// particular connection turns out to be one.
+///
+/// Correlator content over the existing `ConnectEvent`, not new telemetry, per
+/// the issue's own note — `DnsQuery`'s `getaddrinfo` uprobe (#397) cannot see
+/// resolution a process does inside its own TLS session instead of calling libc.
+#[must_use]
+pub(crate) fn check_doh_dot_connection(event: &ConnectEvent) -> Option<Alert> {
+    let comm = event.meta.comm.as_str();
+    if DOH_DOT_EXPECTED_COMMS
+        .iter()
+        .any(|&n| comm.eq_ignore_ascii_case(n))
+    {
+        return None;
+    }
+    let (protocol, port) = if event.dport == DOT_PORT {
+        ("DNS-over-TLS", DOT_PORT)
+    } else if event.dport == HTTPS_PORT && KNOWN_DOH_RESOLVERS.contains(&event.daddr) {
+        ("DNS-over-HTTPS", HTTPS_PORT)
+    } else {
+        return None;
+    };
+    Some(Alert {
+        technique: "T1071.004",
+        severity: Severity::Low,
+        message: format!(
+            "pid={} comm={comm}: connection to {}:{port} — {protocol} from a process that \
+             is not the system resolver or a browser, possibly DNS queries kept off plaintext \
+             UDP/53 to evade monitoring",
+            event.meta.pid, event.daddr,
+        ),
+    })
+}
+
 /// The Kerberos KDC port (TCP and UDP).
 const KERBEROS_PORT: u16 = 88;
 
@@ -968,6 +1113,7 @@ pub(crate) fn check_kerberos_from_non_lsass(event: &ConnectEvent) -> Option<Aler
 pub fn evaluate_connect(event: &ConnectEvent) -> Vec<Alert> {
     check_service_unusual_outbound(event)
         .into_iter()
+        .chain(check_doh_dot_connection(event))
         .chain(check_kerberos_from_non_lsass(event))
         .collect()
 }

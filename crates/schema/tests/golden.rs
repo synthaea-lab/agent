@@ -15,8 +15,8 @@ use schema::{
     FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent,
     GatekeeperVerdictEvent, HttpClientCount, HttpEvidence, HttpRequestEvent, HttpSignature,
     HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent, KernelModuleAction,
-    KernelModuleEvent, LdapSearchEvent, ListenPortEvent, MemfdCreateEvent, MountEvent,
-    NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, NtlmAuthEvent, NtlmDirection,
+    KernelModuleEvent, LdapSearchEvent, ListenPortEvent, LogClearedEvent, MemfdCreateEvent,
+    MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, NtlmAuthEvent, NtlmDirection,
     POLICY_MECHANISM_SELINUX, PackageChangeEvent, PackageChangeKind, PolicyDenialEvent, PrctlEvent,
     ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent,
     ScriptBlockEvent, SessionEvent, SessionState, ShellType, SignalEvent, SmbConnectEvent,
@@ -474,6 +474,58 @@ fn ntlm_auth_golden() {
             status: None,
         }),
         "ntlm_auth",
+    );
+}
+
+#[test]
+fn log_cleared_golden() {
+    assert_golden(
+        &Event::LogCleared(LogClearedEvent {
+            meta: EventMeta {
+                pid: 1612,
+                ppid: 0,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-1001".into(),
+                    integrity_level: None,
+                },
+                timestamp_ns: 1_760_520_000_000_000_000,
+                comm: String::new(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            channel: "Security".into(),
+            subject_user: r"LAB\analyst".into(),
+            subject_logon_id: Some("0x4d2c1".into()),
+            backup_path: None,
+        }),
+        "log_cleared",
+    );
+}
+
+#[test]
+fn log_cleared_with_backup_golden() {
+    assert_golden(
+        &Event::LogCleared(LogClearedEvent {
+            meta: EventMeta {
+                pid: 1612,
+                ppid: 0,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-1001".into(),
+                    integrity_level: None,
+                },
+                timestamp_ns: 1_760_520_001_000_000_000,
+                comm: String::new(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            channel: "Microsoft-Windows-PowerShell/Operational".into(),
+            subject_user: r"LAB\analyst".into(),
+            subject_logon_id: None,
+            backup_path: Some(r"C:\Users\analyst\ps.evtx".into()),
+        }),
+        "log_cleared_backup",
     );
 }
 
@@ -2153,6 +2205,13 @@ fn meta_accessor_covers_all_variants() {
             namespace: String::new(),
             query: None,
             method: None,
+        }),
+        Event::LogCleared(LogClearedEvent {
+            meta: meta.clone(),
+            channel: String::new(),
+            subject_user: String::new(),
+            subject_logon_id: None,
+            backup_path: None,
         }),
         Event::NtlmAuth(NtlmAuthEvent {
             meta: meta.clone(),
