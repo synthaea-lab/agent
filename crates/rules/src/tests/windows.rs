@@ -3,6 +3,82 @@
 
 use super::*;
 
+// ── T1558: Kerberos from a process other than LSASS (#364) ─────────────────────────
+
+fn windows_connect(comm: &str, daddr: [u8; 4], dport: u16) -> ConnectEvent {
+    let mut event = connect_event_full(4_321, comm, daddr, dport, 1);
+    event.meta.user = schema::User::Windows {
+        sid: "S-1-5-21-1-2-3-1001".into(),
+        integrity_level: Some(0x2000),
+    };
+    event
+}
+
+#[test]
+fn a_tool_talking_to_the_kdc_itself_is_flagged() {
+    let alert =
+        check_kerberos_from_non_lsass(&windows_connect("Rubeus.exe", [192, 168, 137, 10], 88))
+            .expect("a non-LSASS process on port 88 must alert");
+    assert_eq!(alert.technique, "T1558");
+    assert_eq!(alert.severity, crate::Severity::Medium);
+    assert!(alert.message.contains("Rubeus.exe"), "{}", alert.message);
+    assert!(
+        alert.message.contains("192.168.137.10:88"),
+        "{}",
+        alert.message
+    );
+    assert_eq!(
+        crate::stateless::evaluate_connect(&windows_connect("python.exe", [10, 0, 0, 1], 88)).len(),
+        1
+    );
+}
+
+#[test]
+fn lsass_talking_to_the_kdc_is_routine() {
+    assert!(
+        check_kerberos_from_non_lsass(&windows_connect("lsass.exe", [10, 0, 0, 1], 88)).is_none()
+    );
+    assert!(
+        check_kerberos_from_non_lsass(&windows_connect("LSASS.EXE", [10, 0, 0, 1], 88)).is_none()
+    );
+}
+
+#[test]
+fn other_ports_and_local_destinations_are_not_kerberos_to_a_kdc() {
+    assert!(
+        check_kerberos_from_non_lsass(&windows_connect("Rubeus.exe", [10, 0, 0, 1], 389)).is_none()
+    );
+    assert!(
+        check_kerberos_from_non_lsass(&windows_connect("Rubeus.exe", [10, 0, 0, 1], 8_888))
+            .is_none()
+    );
+    assert!(
+        check_kerberos_from_non_lsass(&windows_connect("Rubeus.exe", [127, 0, 0, 1], 88)).is_none()
+    );
+    assert!(
+        check_kerberos_from_non_lsass(&windows_connect("Rubeus.exe", [0, 0, 0, 0], 88)).is_none()
+    );
+}
+
+#[test]
+fn a_protected_process_without_a_token_user_is_still_recognised_by_its_exe_name() {
+    // The sensor reports `User::Unknown` when the token cannot be read; the `.exe` image
+    // name still marks the event as Windows.
+    let mut event = windows_connect("tool.EXE", [10, 0, 0, 1], 88);
+    event.meta.user = schema::User::Unknown;
+    assert!(check_kerberos_from_non_lsass(&event).is_some());
+}
+
+#[test]
+fn linux_kerberos_clients_are_routine() {
+    // kinit, sssd and sshd with GSSAPI all talk to the KDC themselves on Linux.
+    for comm in ["kinit", "sssd_be", "sshd", "curl", "e"] {
+        let mut event = connect_event_full(77, comm, [10, 0, 0, 1], 88, 1);
+        event.meta.user = schema::User::Unix { uid: 0, gid: 0 };
+        assert!(check_kerberos_from_non_lsass(&event).is_none(), "{comm}");
+    }
+}
+
 // ── SELF-SPAWN (T1059) ────────────────────────────────────────────────────
 // Windows-only (the rule is gated on `User::Windows` — #159), so these build
 // events with `exec_event_win`.

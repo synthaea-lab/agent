@@ -1116,11 +1116,61 @@ pub(crate) fn check_doh_dot_connection(event: &ConnectEvent) -> Option<Alert> {
     })
 }
 
+/// The Kerberos KDC port (TCP and UDP).
+const KERBEROS_PORT: u16 = 88;
+
+/// T1558 (#364): a Windows process other than LSASS talking to a KDC.
+///
+/// On Windows every Kerberos exchange the OS makes, logon, TGT and service tickets
+/// alike, goes through `lsass.exe`: no other process has a reason to open port 88 to a
+/// domain controller. Tools that request tickets themselves (Rubeus `asktgs`/`kerberoast`,
+/// Impacket's `GetUserSPNs.py`/`GetNPUsers.py` run on Windows, kekeo) open that connection
+/// from their own process, so this is the endpoint-side shadow of Kerberoasting,
+/// AS-REP roasting and ticket forging. The DC-side events (4768/4769) are not visible here
+/// (#364's framing).
+///
+/// Medium, not High: Java applications bring their own Kerberos client (JGSS), so a
+/// `java.exe` single-sign-on or a build tool talking to the KDC is legitimate. No name
+/// exclusion is made for it: a name-keyed exclusion needs evidence gating (CLAUDE.md), and
+/// a renamed tool is the attack. Kerberos through LSASS (`Invoke-Kerberoast`,
+/// .NET `KerberosRequestorSecurityToken`) is not seen here: that needs the Kerberos ETW
+/// provider, captured first in the lab.
+///
+/// Windows only. On Linux every Kerberos-aware program (`kinit`, `sssd`, `sshd` with
+/// GSSAPI, `curl --negotiate`) talks to the KDC itself, so the same connection is routine.
+/// A Windows event is recognised by its token user or, for a process whose token could
+/// not be read, by the `.exe` image name the Windows sensor reports.
+#[must_use]
+pub(crate) fn check_kerberos_from_non_lsass(event: &ConnectEvent) -> Option<Alert> {
+    if event.dport != KERBEROS_PORT || event.daddr.is_loopback() || event.daddr.is_unspecified() {
+        return None;
+    }
+    let comm = event.meta.comm.as_str();
+    let is_windows = matches!(event.meta.user, schema::User::Windows { .. })
+        || comm
+            .get(comm.len().saturating_sub(4)..)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(".exe"));
+    if !is_windows || comm.eq_ignore_ascii_case("lsass.exe") {
+        return None;
+    }
+    Some(Alert {
+        technique: "T1558",
+        severity: Severity::Medium,
+        message: format!(
+            "pid={} comm={comm}: Kerberos connection to {}:{KERBEROS_PORT} from a process \
+             other than LSASS: a tool requesting tickets itself (Kerberoasting, AS-REP \
+             roasting, ticket forging) unless it is a Java application with its own Kerberos",
+            event.meta.pid, event.daddr,
+        ),
+    })
+}
+
 /// Evaluates all stateless rules applicable to a `ConnectEvent`.
 #[must_use]
 pub fn evaluate_connect(event: &ConnectEvent) -> Vec<Alert> {
     check_service_unusual_outbound(event)
         .into_iter()
         .chain(check_doh_dot_connection(event))
+        .chain(check_kerberos_from_non_lsass(event))
         .collect()
 }
