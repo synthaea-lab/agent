@@ -481,7 +481,7 @@ impl CorrelationEngine {
     /// # Parameters
     ///
     /// - `pid`: Process ID to update
-    /// - `ml_llr`: Optional ML log-likelihood ratio from `ml::correlation::score_to_llr`
+    /// - `ml_llr`: Optional ML log-likelihood ratio from `ml::score_to_llr`
     ///   - `Some(llr)`: ML scorer produced a score, add it to belief
     ///   - `None`: No score (gated, OOD, or error) — nothing to add, not "benign"
     ///
@@ -497,8 +497,8 @@ impl CorrelationEngine {
     ///
     /// ```ignore
     /// // In agent sink after ML scoring, right after `engine.on_event(event)`:
-    /// let ml_llr = match scorer.score(&engine.bus(), pid) {
-    ///     Ok(Some(score)) => Some(ml::correlation::score_to_llr(score)),
+    /// let ml_llr = match scorer.score(engine.bus(), pid, generation) {
+    ///     Ok(Some(score)) => Some(ml::score_to_llr(score)),
     ///     Ok(None) => None,  // Gated
     ///     Err(ScorerError::FeatureOutOfBounds { .. }) => None,  // OOD
     ///     Err(e) => { error!("ML scorer: {e}"); None }  // Fail open
