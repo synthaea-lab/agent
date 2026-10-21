@@ -3340,3 +3340,170 @@ fn browser_to_known_doh_resolver_does_not_alert() {
     let chrome_exe = connect_event_full(406, "Chrome.exe", [8, 8, 8, 8], 443, 0);
     assert!(check_doh_dot_connection(&chrome_exe).is_none());
 }
+
+// ── EGRESS-VOLUME via conntrack polling (#380, T1041/T1048) ─────────────────────
+
+const MIB: u64 = 1024 * 1024;
+const SEC: u64 = 1_000_000_000;
+
+fn flow_sent(
+    comm: &str,
+    local_port: u16,
+    daddr: [u8; 4],
+    bytes_sent: Option<u64>,
+    timestamp_ns: u64,
+) -> NetworkFlowEvent {
+    NetworkFlowEvent {
+        bytes_sent,
+        ..network_flow_event_full(300, comm, local_port, daddr, 8443, timestamp_ns)
+    }
+}
+
+#[test]
+fn egress_volume_crossing_the_threshold_alerts_once() {
+    let mut state = RuleState::new();
+    let dst = [203, 0, 113, 9];
+    // First poll: baseline only, however large the counter is.
+    assert!(
+        state
+            .on_network_flow(&flow_sent("rsyncish", 50000, dst, Some(900 * MIB), 0))
+            .is_empty()
+    );
+    // 300 MiB since the baseline: below the 512 MiB threshold.
+    assert!(
+        state
+            .on_network_flow(&flow_sent(
+                "rsyncish",
+                50000,
+                dst,
+                Some(1200 * MIB),
+                5 * SEC
+            ))
+            .is_empty()
+    );
+    // 300 MiB more: 600 MiB in the window, over it.
+    let alerts = state.on_network_flow(&flow_sent(
+        "rsyncish",
+        50000,
+        dst,
+        Some(1500 * MIB),
+        10 * SEC,
+    ));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1041/T1048");
+    assert!(alerts[0].message.contains("600MB"), "{}", alerts[0].message);
+    // One alert per window.
+    assert!(
+        state
+            .on_network_flow(&flow_sent(
+                "rsyncish",
+                50000,
+                dst,
+                Some(1800 * MIB),
+                15 * SEC
+            ))
+            .is_empty()
+    );
+}
+
+#[test]
+fn egress_volume_sums_several_connections_to_one_address() {
+    let mut state = RuleState::new();
+    let dst = [203, 0, 113, 9];
+    for port in [50000, 50001, 50002] {
+        state.on_network_flow(&flow_sent("uploader", port, dst, Some(0), 0));
+    }
+    let mut last = Vec::new();
+    for (i, port) in [50000, 50001, 50002].into_iter().enumerate() {
+        last = state.on_network_flow(&flow_sent(
+            "uploader",
+            port,
+            dst,
+            Some(200 * MIB),
+            (i as u64 + 1) * SEC,
+        ));
+    }
+    // 3 x 200 MiB = 600 MiB, no single flow reached 512 MiB.
+    assert_eq!(last.len(), 1);
+}
+
+#[test]
+fn egress_volume_spread_over_more_than_the_window_does_not_alert() {
+    let mut state = RuleState::new();
+    let dst = [203, 0, 113, 9];
+    state.on_network_flow(&flow_sent("backup", 50000, dst, Some(0), 0));
+    // 100 MiB every 5 minutes: the window (10 min) never holds 512 MiB.
+    for i in 1..=12u64 {
+        let alerts = state.on_network_flow(&flow_sent(
+            "backup",
+            50000,
+            dst,
+            Some(i * 100 * MIB),
+            i * 300 * SEC,
+        ));
+        assert!(alerts.is_empty(), "poll {i}: {alerts:?}");
+    }
+}
+
+#[test]
+fn egress_volume_ignores_a_flow_that_was_already_big_when_first_seen() {
+    let mut state = RuleState::new();
+    let dst = [203, 0, 113, 9];
+    // A long session open before the agent started, with a huge counter: baseline only.
+    assert!(
+        state
+            .on_network_flow(&flow_sent("ssh", 50000, dst, Some(4096 * MIB), 0))
+            .is_empty()
+    );
+    assert!(
+        state
+            .on_network_flow(&flow_sent(
+                "ssh",
+                50000,
+                dst,
+                Some(4096 * MIB + MIB),
+                5 * SEC
+            ))
+            .is_empty()
+    );
+}
+
+#[test]
+fn egress_volume_ignores_private_loopback_and_overlay_peers() {
+    for dst in [
+        [10, 0, 0, 5],
+        [192, 168, 1, 20],
+        [127, 0, 0, 1],
+        [100, 100, 1, 1],
+    ] {
+        let mut state = RuleState::new();
+        state.on_network_flow(&flow_sent("backup", 50000, dst, Some(0), 0));
+        let alerts =
+            state.on_network_flow(&flow_sent("backup", 50000, dst, Some(2048 * MIB), 5 * SEC));
+        assert!(alerts.is_empty(), "{dst:?}: {alerts:?}");
+    }
+}
+
+#[test]
+fn egress_volume_is_inert_without_conntrack_accounting() {
+    let mut state = RuleState::new();
+    let dst = [203, 0, 113, 9];
+    for t in 0..4 {
+        assert!(
+            state
+                .on_network_flow(&flow_sent("uploader", 50000, dst, None, t * 5 * SEC))
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn egress_volume_counts_a_reused_local_port_as_a_new_flow() {
+    let mut state = RuleState::new();
+    let dst = [203, 0, 113, 9];
+    state.on_network_flow(&flow_sent("uploader", 50000, dst, Some(10 * MIB), 0));
+    // The counter went down: a new flow on the same local port, its whole value is new.
+    let alerts =
+        state.on_network_flow(&flow_sent("uploader", 50000, dst, Some(600 * MIB), 5 * SEC));
+    assert_eq!(alerts.len(), 1);
+}

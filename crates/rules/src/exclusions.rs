@@ -147,6 +147,16 @@ pub(crate) const SUDO_SUCCESS_AFTER_FAILURES_WINDOW_NS: u64 = 300_000_000_000; /
 pub(crate) const BEACON_THRESHOLD: u32 = 3;
 pub(crate) const BEACON_WINDOW_NS: u64 = 60_000_000_000; // 60s
 
+/// EGRESS-VOLUME threshold and window (T1041/T1048, #380): this many bytes sent by one
+/// process name to one public address inside the window. **Provisional**: 512 MiB in 10
+/// minutes is far above an interactive session and below a bulk exfiltration of a
+/// home directory, but no lab capture of ordinary uploads (backups, `rsync` to a remote
+/// host, a container registry push, a video call) exists to calibrate it, so those
+/// are the false positives to watch for live. Raise it before lowering it.
+pub(crate) const EGRESS_BYTES_THRESHOLD: u64 = 512 * 1024 * 1024;
+/// Sliding look-back window for [`EGRESS_BYTES_THRESHOLD`].
+pub(crate) const EGRESS_WINDOW_NS: u64 = 600_000_000_000; // 10 min
+
 /// SCAN-SPREAD threshold and window (T1046/T1210, issue #465): N distinct
 /// destinations on the same (pid, dport) in X seconds. Calibrated against
 /// the live Mirai detonation that surfaced this gap (309 connections to

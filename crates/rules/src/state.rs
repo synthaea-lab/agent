@@ -23,16 +23,16 @@ use crate::{
         AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD, BEACON_WINDOW_NS, BROWSERS,
         BURST_WRITE_BYTES_THRESHOLD, COMPRESSION_DRIVER_COMMS, COMPRESSION_SUFFIXES,
         COMPRESSOR_COMMS, CREATE_UNLINK_HISTORY_PER_PID, CREATE_UNLINK_PAIR_WINDOW_NS,
-        CREATE_UNLINK_PID_CAP, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS, IN_PLACE_EDIT_COMMS,
-        LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS, MEMFD_EXEC_WINDOW_NS,
-        PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES, POLICY_DENIAL_ALERT_CAP,
-        QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX,
-        RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD,
-        SCAN_SPREAD_WINDOW_NS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
-        SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD,
-        SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STANDARD_PORTS,
-        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
-        TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
+        CREATE_UNLINK_PID_CAP, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS, EGRESS_BYTES_THRESHOLD,
+        EGRESS_WINDOW_NS, IN_PLACE_EDIT_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS,
+        MEMFD_EXEC_WINDOW_NS, PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES,
+        POLICY_DENIAL_ALERT_CAP, QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES,
+        RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS,
+        SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS, SELF_SPAWN_EXCLUSIONS,
+        SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD,
+        SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS,
+        SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN,
+        TASK_REGISTRATION_DEDUP_WINDOW_NS, TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
     },
     has_write_intent,
     rdp::RdpSuccessAfterFailures,
@@ -41,6 +41,39 @@ use crate::{
     sliding::{FlowPortDedup, SlidingCounter, SlidingDistinct, SlidingSum},
     sudo::SudoSuccessAfterFailures,
 };
+
+/// One (comm, daddr) EGRESS-VOLUME entry: the bytes sent inside the window and when
+/// the last alert fired (one alert per window, as `SlidingCounter::try_alert`).
+#[derive(Default)]
+struct EgressVolume {
+    sum: SlidingSum,
+    last_alert_ns: Option<u64>,
+}
+
+/// True for an address a remote party can be at: not loopback, private, link-local,
+/// multicast, unspecified, or an IPv4 broadcast/unique-local equivalent.
+fn is_public_address(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                // 100.64.0.0/10, carrier-grade NAT (also Tailscale): an overlay, not the internet
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64))
+        }
+        IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_multicast()
+                || v6.is_unspecified()
+                // fc00::/7 unique-local, fe80::/10 link-local
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80)
+        }
+    }
+}
 
 struct RecentWrite {
     pid: u32,
@@ -172,6 +205,14 @@ pub struct RuleState {
     /// [`FlowPortDedup`]'s doc); `on_connect`'s discrete syscall trace needs no
     /// dedup, each `ConnectEvent` already is one real connection attempt.
     beacon_flow_dedup: BoundedMap<(String, String, u16), FlowPortDedup>,
+    /// (comm, daddr, dport, `local_port`) → the `bytes_sent` of the last poll of that
+    /// flow, for EGRESS-VOLUME (T1041/T1048, #380). Conntrack counters are cumulative
+    /// per flow, so only the difference between two polls is new volume. LRU-bounded.
+    egress_flow_last: BoundedMap<(String, IpAddr, u16, u16), u64>,
+    /// (comm, daddr) → bytes sent inside the sliding window, for EGRESS-VOLUME. The
+    /// key leaves the port out on purpose: an exfiltration split over many connections
+    /// to one host is the shape to catch. LRU-bounded.
+    egress_volume: BoundedMap<(String, IpAddr), EgressVolume>,
     /// (pid, dport) → sliding distinct-destination counter for SCAN-SPREAD
     /// (T1046/T1210, issue #465). LRU-bounded.
     scan_spread: BoundedMap<(u32, u16), SlidingDistinct<IpAddr>>,
@@ -368,6 +409,8 @@ impl RuleState {
             ldap_burst: crate::ldap::LdapBurst::new(),
             beacon: BoundedMap::new(COUNTER_CAP),
             beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
+            egress_flow_last: BoundedMap::new(COUNTER_CAP),
+            egress_volume: BoundedMap::new(COUNTER_CAP),
             scan_spread: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
             known_policy_denials: BoundedMap::new(COUNTER_CAP),
@@ -1001,7 +1044,79 @@ impl RuleState {
     /// To be called for every `NetworkFlowEvent` in the stream (Linux conntrack
     /// polling, issue #92) — see [`Self::check_beacon_flow`].
     pub fn on_network_flow(&mut self, event: &NetworkFlowEvent) -> Vec<Alert> {
-        self.check_beacon_flow(event).into_iter().collect()
+        let mut alerts: Vec<Alert> = self.check_beacon_flow(event).into_iter().collect();
+        alerts.extend(self.check_egress_volume(event));
+        alerts
+    }
+
+    /// EGRESS-VOLUME (T1041/T1048, #380) — a process name that sends more than
+    /// [`EGRESS_BYTES_THRESHOLD`] to one public address inside
+    /// [`EGRESS_WINDOW_NS`], summed over all its connections to that address.
+    ///
+    /// Conntrack counters are cumulative per flow and a poll-based source re-reports
+    /// a live flow every cycle, so the volume of one poll is the difference with the
+    /// previous poll of the same flow. **The first poll of a flow only sets its
+    /// baseline** and adds nothing: a flow already open when the agent started carries
+    /// the history of its whole life, and counting it would alert on any long SSH or
+    /// backup session at startup. The cost is named: a transfer that starts and ends
+    /// between two polls of a brand-new flow is not counted; a sustained one is, from
+    /// its second poll.
+    ///
+    /// Inert without volume data: `bytes_sent` is `None` unless the host enabled
+    /// `net.netfilter.nf_conntrack_acct` (off by default, see [`NetworkFlowEvent`]), so
+    /// silence here does not mean nothing was sent. Private, loopback, link-local,
+    /// multicast and unspecified peers are excluded: a backup to the local network is
+    /// not the signal this rule looks for. No name exclusion list yet, for the reason
+    /// given at [`EGRESS_BYTES_THRESHOLD`].
+    fn check_egress_volume(&mut self, event: &NetworkFlowEvent) -> Option<Alert> {
+        let sent = event.bytes_sent?;
+        if !is_public_address(event.daddr) {
+            return None;
+        }
+        let flow = (
+            event.meta.comm.clone(),
+            event.daddr,
+            event.dport,
+            event.local_port,
+        );
+        let previous = self.egress_flow_last.get(&flow).copied();
+        self.egress_flow_last.insert(flow, sent);
+        // First poll of the flow: baseline only. A counter that went down is a new
+        // flow on a reused local port: its whole value is new volume.
+        let delta = match previous {
+            None => return None,
+            Some(last) if sent >= last => sent - last,
+            Some(_) => sent,
+        };
+        if delta == 0 {
+            return None;
+        }
+        let ts = event.meta.timestamp_ns;
+        let entry = self.egress_volume.get_or_insert_with(
+            (event.meta.comm.clone(), event.daddr),
+            EgressVolume::default,
+        );
+        let total = entry.sum.add(ts, delta, EGRESS_WINDOW_NS);
+        let alerted_recently = entry
+            .last_alert_ns
+            .is_some_and(|t| ts.saturating_sub(t) < EGRESS_WINDOW_NS);
+        if total >= EGRESS_BYTES_THRESHOLD && !alerted_recently {
+            entry.last_alert_ns = Some(ts);
+            return Some(Alert {
+                technique: "T1041/T1048",
+                severity: Severity::Medium,
+                message: format!(
+                    "pid={} comm={} sent {}MB to {} in {}s — possible exfiltration over the \
+                     network",
+                    event.meta.pid,
+                    event.meta.comm,
+                    total / (1024 * 1024),
+                    event.daddr,
+                    EGRESS_WINDOW_NS / 1_000_000_000,
+                ),
+            });
+        }
+        None
     }
 
     /// LISTENER-DRIFT (issue #92, T1571 — non-standard port is the closest
