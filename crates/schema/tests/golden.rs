@@ -419,11 +419,24 @@ fn dns_query_golden() {
             },
             query: "beacon.example.test".into(),
             qtype: 1,
-            result: Some("type:1 172.67.143.127;".into()),
+            result: Some("172.67.143.127".into()),
+            results: vec!["172.67.143.127".into(), "2001:db8::1".into()],
+            results_truncated: true,
             status: 0,
         }),
         "dns_query",
     );
+}
+
+#[test]
+fn dns_query_v44_fixture_deserializes_with_empty_answer_set() {
+    let old_event: Event = serde_json::from_str(include_str!("fixtures/v44/dns_query.json"))
+        .expect("v44 DNS fixture remains readable");
+    let Event::DnsQuery(event) = old_event else {
+        panic!("fixture must deserialize as a DNS query")
+    };
+    assert!(event.results.is_empty());
+    assert!(!event.results_truncated);
 }
 
 #[test]
@@ -1927,7 +1940,7 @@ fn namespace_golden() {
 
 #[test]
 fn bits_job_golden() {
-    // v46 (#284): `bitsadmin /transfer` adding a file to a BITS job. The
+    // v48 (#284): `bitsadmin /transfer` adding a file to a BITS job. The
     // service does the download; this record names the client that asked.
     assert_golden(
         &Event::BitsJob(BitsJobEvent {
@@ -1958,7 +1971,7 @@ fn bits_job_golden() {
 
 #[test]
 fn bits_job_transfer_error_golden() {
-    // v46 (#284): the same job failing mid-transfer, reported by the BITS
+    // v48 (#284): the same job failing mid-transfer, reported by the BITS
     // service and attributed to the client that added the file.
     assert_golden(
         &Event::BitsJob(BitsJobEvent {
@@ -2241,6 +2254,8 @@ fn meta_accessor_covers_all_variants() {
             query: String::new(),
             qtype: 1,
             result: None,
+            results: Vec::new(),
+            results_truncated: false,
             status: 0,
         }),
         Event::RegistrySet(RegistrySetEvent {

@@ -401,6 +401,14 @@ fn crosses_kill_gate(technique: &str) -> bool {
     technique == "BAYES"
 }
 
+/// Why the kill gate refuses a system service's main process (#652, ADR-0028).
+// Review of #755 (SherlockOmss, 2026-10-19): the old wording ("package-owned
+// binary") claimed more than `service_main_path_is_trusted` checks — nothing
+// here asks whether a package actually owns the file, only where it lives and
+// who started it. An analyst reading `alerts.ndjson` would otherwise take
+// "package-owned" as verified.
+const SERVICE_MAIN_REFUSAL: &str = "main process of a system service (image under a system path, started by init); escalated, not killed";
+
 /// ATT&CK technique ids folded into a [`schema::detection::Detection`] from the
 /// `technique` string this crate already uses as the dedup/alert-log key.
 /// Same convention `tools/attack-coverage.py` uses to build the coverage doc:
@@ -465,13 +473,25 @@ impl DetectionSink {
             let mut correlator = self.correlator.lock().unwrap();
             correlator.advance_time(now_ns)
         };
-        self.emit_correlator_alerts(&alerts, None);
+        // BAYES is the only technique `crosses_kill_gate` recognizes, and it is raised
+        // only from the per-event path below (`CorrelationEngine::bayes_alert`'s one call
+        // site), never from `advance_time`'s window-expiry alerts — so `service_main`
+        // is never read on this path, and `false` is a placeholder, not a real claim
+        // about any pid here (issue #652).
+        self.emit_correlator_alerts(&alerts, None, false);
     }
 
+    /// `service_main` is the correlator's provenance verdict for the event this batch of
+    /// alerts was produced from (issue #652) — meaningful only when a `BAYES` alert is
+    /// among them, since that is the only technique [`crosses_kill_gate`] recognizes, and
+    /// `CorrelationAlert::trigger_event` is always `None` for it (so it always resolves to
+    /// `default_event`, never to a different pid than the one `service_main` was computed
+    /// for).
     fn emit_correlator_alerts(
         &self,
         alerts: &[correlator::CorrelationAlert],
         default_event: Option<&Event>,
+        service_main: bool,
     ) {
         let mut high_confidence_pid = None;
         for alert in alerts {
@@ -494,7 +514,7 @@ impl DetectionSink {
             }
         }
         if let Some(pid) = high_confidence_pid {
-            self.maybe_kill(pid);
+            self.maybe_kill(pid, service_main);
         }
     }
 
@@ -558,6 +578,7 @@ impl DetectionSink {
                         &rarity_common_set,
                         &worker_rarity_stats,
                         exec,
+                        unix_now_secs(),
                     );
                 }
                 if let Some(events_log) = &events_log {
@@ -670,16 +691,7 @@ impl DetectionSink {
         drop(yara_slot);
         drop(old_yara);
 
-        // Same posture for the snapshot: absent unloads (the evidence is withheld), broken
-        // keeps the previous one (its failure is logged by the loader).
-        let mut common_set_slot = self.common_set.lock().unwrap();
-        let old_common_set = match common_set_loaded {
-            Load::Loaded(snapshot) => common_set_slot.replace(Arc::new(snapshot)),
-            Load::Absent => common_set_slot.take(),
-            Load::Failed => None,
-        };
-        drop(common_set_slot);
-        drop(old_common_set);
+        self.swap_common_set(common_set_loaded);
 
         // Same rules, same posture as the file scanner: absent unloads, broken keeps
         // the previous queue (its failure is already reported through `yara`).
@@ -1284,6 +1296,7 @@ impl DetectionSink {
             }
         }
 
+        let service_main = engine.is_service_main_process(pid, generation);
         drop(engine); // Unlock correlator before alert emission (log I/O).
 
         // Fold co-occurrence rules and Bayesian belief into the entity's fused
@@ -1296,23 +1309,40 @@ impl DetectionSink {
         // condemn every later, unrelated sibling that merely shares the same
         // parent and `comm` (PR #502 review; pinned by
         // `a_siblings_weak_alert_never_triggers_kill_from_anothers_bayes_crossing`).
-        self.emit_correlator_alerts(&alerts, Some(event));
+        self.emit_correlator_alerts(&alerts, Some(event), service_main);
     }
 
     /// Issue #25: policy-gates killing the process behind a high-confidence
     /// correlated verdict. A no-op whenever `enable_response` was never called.
-    fn maybe_kill(&self, pid: u32) {
-        self.kill_for(pid, "a high-confidence correlated verdict");
+    ///
+    /// Issue #652: `service_main` is the correlator's provenance verdict for `pid` (its
+    /// image under a system path, started by init — see the comment above
+    /// `SERVICE_MAIN_REFUSAL`'s definition for why this is not phrased as "package-owned").
+    /// A Bayesian crossing alone does not
+    /// justify killing a system service, so it is refused, in observe mode too, and the
+    /// verdict still escalates. Corroborating evidence does not lift it: the refusal is
+    /// about what the process is, not how much evidence there is (ADR-0028).
+    fn maybe_kill(&self, pid: u32, service_main: bool) {
+        self.kill_for(pid, "a high-confidence correlated verdict", service_main);
     }
 
     /// The policy-gated kill behind every automated trigger; `reason` names which one, in
-    /// the audit line (`RESPONSE-KILL`).
-    fn kill_for(&self, pid: u32, reason: &str) {
+    /// the audit line (`RESPONSE-KILL`). `service_main` makes it refuse (ADR-0028); only the
+    /// correlator's verdict sets it, a trigger with its own evidence (the ransomware reflex)
+    /// passes `false`.
+    fn kill_for(&self, pid: u32, reason: &str, service_main: bool) {
         let guard = self.response.lock().unwrap();
         let Some(hooks) = guard.as_ref() else {
             return;
         };
-        let outcome = response::kill_process(pid, &hooks.policy, |p| (hooks.terminate)(p));
+        let outcome = if service_main {
+            response::KillOutcome::Refused {
+                pid,
+                reason: SERVICE_MAIN_REFUSAL,
+            }
+        } else {
+            response::kill_process(pid, &hooks.policy, |p| (hooks.terminate)(p))
+        };
         drop(guard);
         let message = match outcome {
             response::KillOutcome::Killed { pid } => format!("killed pid {pid} on {reason}"),
@@ -1344,7 +1374,7 @@ impl DetectionSink {
     /// The reflex: the policy-gated kill of the corroborated process. Observe-only unless
     /// kill is enabled, like every other automated kill.
     fn ransomware_reflex(&self, pid: u32) {
-        self.kill_for(pid, RANSOMWARE_REFLEX_REASON);
+        self.kill_for(pid, RANSOMWARE_REFLEX_REASON, false);
     }
 
     /// Exec events: stateless rules, stateful rules, then Sigma.
@@ -1638,6 +1668,26 @@ impl DetectionSink {
             .collect()
     }
 
+    /// Same posture as the rule directories for the snapshot: absent unloads (the evidence is
+    /// withheld), broken keeps the previous one (its failure is logged by the loader).
+    fn swap_common_set(&self, loaded: Load<ml::features::common_set::CommonSetSnapshot>) {
+        let mut slot = self.common_set.lock().unwrap();
+        let old = match loaded {
+            Load::Loaded(snapshot) => slot.replace(Arc::new(snapshot)),
+            Load::Absent => slot.take(),
+            Load::Failed => None,
+        };
+        drop(slot);
+        drop(old);
+    }
+
+    /// Re-reads only the snapshot file, after the fetch loop wrote a new one (ADR-0033): the
+    /// rule directories and models are untouched, so a daily snapshot does not rebuild the
+    /// detection engines.
+    pub(crate) fn reload_common_set(&self) {
+        self.swap_common_set(load_common_set(&self.content_root));
+    }
+
     /// The snapshot in force. Tests read it until the evidence lookup does (next slice of
     /// #76), which is why it is not compiled otherwise.
     #[cfg(test)]
@@ -1734,6 +1784,16 @@ fn load_sigma_rules(content_root: &Path) -> Load<sigma::SigmaEngine> {
 /// (slice 6 of `docs/detection/fleet-prevalence-snapshot-plan.md`).
 const RARITY_MIN_HOSTS_COVERED: u64 = 10;
 
+/// How old a snapshot may be before it is treated as absent. **Provisional**, see
+/// [`updater::snapshot::DEFAULT_MAX_AGE_SECS`].
+const MAX_SNAPSHOT_AGE_SECS: u64 = updater::snapshot::DEFAULT_MAX_AGE_SECS;
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// What became of the rarity judgements since start, for the health beacon (ADR-0020, #76).
 /// Plain atomics: bumped on the enrichment worker, read by the beacon thread.
 #[derive(Default)]
@@ -1796,8 +1856,13 @@ fn note_image_rarity(
     common_set: &Mutex<Option<Arc<ml::features::common_set::CommonSetSnapshot>>>,
     stats: &RarityStats,
     exec: &schema::ExecEvent,
+    now_secs: u64,
 ) {
-    let snapshot = common_set.lock().unwrap().clone();
+    // A snapshot past its maximum age counts as absent: the evidence is withheld, so a server
+    // that stopped publishing cannot keep a stale set in force (ADR-0033 decision 3).
+    let snapshot = common_set.lock().unwrap().clone().filter(|s| {
+        !updater::snapshot::is_expired(s.header().built_at, now_secs, MAX_SNAPSHOT_AGE_SECS)
+    });
     match rarity_evidence(
         exec.sha256.as_deref(),
         snapshot.as_deref(),
@@ -1830,7 +1895,7 @@ fn note_image_rarity(
 /// The largest snapshot file the agent reads. The content manifest allows an artifact of up to
 /// 100 MiB; a snapshot is a Bloom filter whose size the server caps when it builds it, so
 /// anything near this is a malformed or hostile file, refused before it is read.
-const MAX_COMMON_SET_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_COMMON_SET_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Loads `<content_root>/snapshots/common-set.bin`, the file the signed content manifest
 /// delivers (ADR-0020). Absent is "no snapshot yet", not an error; unreadable, too large or
@@ -2132,6 +2197,7 @@ impl EventSink for DetectionSink {
             Event::FileOpen(e) => self.detect_file_open(&event, e),
             Event::Connect(e) => self.detect_connect(&event, e),
             Event::NetworkFlow(e) => self.detect_network_flow(&event, e),
+            Event::DnsQuery(e) => self.rule_state.lock().unwrap().on_dns_query(e),
             Event::ListenPort(e) => self.detect_listen_port(&event, e),
             Event::Auth(e) => self.detect_auth(&event, e),
             Event::Session(e) => self.detect_session(&event, e),
@@ -3250,11 +3316,13 @@ rule response_marker {
     /// The BAYES recipe from `correlator`'s own tests: a suspicious-path exec
     /// plus repeated connects to a public address crosses the belief threshold.
     fn drive_bayes_crossing(sink: &DetectionSink, pid: u32) {
-        sink.on_event(exec(
-            pid,
-            "malware.exe",
-            "C:\\Users\\solka\\AppData\\Roaming\\malware.exe",
-        ));
+        drive_bayes_crossing_from(sink, pid, "C:\\Users\\solka\\AppData\\Roaming\\malware.exe");
+    }
+
+    /// [`drive_bayes_crossing`] for an exec of `image_path`: the same connects to a
+    /// public address, so what differs between two runs is only where the binary lives.
+    fn drive_bayes_crossing_from(sink: &DetectionSink, pid: u32, image_path: &str) {
+        sink.on_event(exec(pid, "malware.exe", image_path));
         for i in 0..25u64 {
             sink.on_event(Event::Connect(ConnectEvent {
                 meta: EventMeta {
@@ -3266,6 +3334,44 @@ rule response_marker {
                 dport: 4444,
             }));
         }
+    }
+
+    /// EGRESS-DOMAIN (#380) crosses two event kinds: the lookup is a `DnsQuery`, which the sink
+    /// must hand to the rule state (it did not before), and the volume is a `NetworkFlow`.
+    #[test]
+    fn a_dns_lookup_and_the_flow_that_follows_raise_egress_domain_in_the_alert_log() {
+        let dir = tmp("egress-domain");
+        let sink = sink_in(&dir);
+        let pid = 4242;
+        let meta_at = |ns: u64| EventMeta {
+            pid,
+            comm: "curl".to_string(),
+            timestamp_ns: ns,
+            ..schema::fixtures::meta()
+        };
+        sink.on_event(Event::DnsQuery(schema::DnsQueryEvent {
+            meta: meta_at(0),
+            query: "pastebin.com".to_string(),
+            result: Some("203.0.113.9".to_string()),
+            status: 0,
+            ..schema::fixtures::dns_query()
+        }));
+        for (i, sent) in [0u64, 30 * 1024 * 1024].into_iter().enumerate() {
+            sink.on_event(Event::NetworkFlow(schema::NetworkFlowEvent {
+                meta: meta_at((i as u64 + 1) * 1_000_000_000),
+                local_port: 50000,
+                daddr: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9)),
+                dport: 443,
+                protocol: 6,
+                bytes_sent: Some(sent),
+                ..schema::fixtures::network_flow()
+            }));
+        }
+        let alerts = alerts_in(&dir);
+        assert!(
+            alerts.contains("T1567.003"),
+            "the lookup must reach the rule state and join the flow, got: {alerts}"
+        );
     }
 
     #[test]
@@ -3434,6 +3540,78 @@ rule response_marker {
             vec![4244],
             "the injected terminate runs, exactly once"
         );
+    }
+
+    fn enable_recording_kill(sink: &DetectionSink, dir: &std::path::Path) -> Arc<Mutex<Vec<u32>>> {
+        let killed = Arc::new(Mutex::new(Vec::new()));
+        let killed_rec = Arc::clone(&killed);
+        sink.enable_response(
+            policy::ResponsePolicy {
+                kill_enabled: true,
+                quarantine_enabled: false,
+            },
+            move |pid| {
+                killed_rec.lock().unwrap().push(pid);
+                Ok(())
+            },
+            dir.join("quarantine"),
+        );
+        killed
+    }
+
+    /// Issue #652: `NetworkManager` crossed `BAYES` on a stock Fedora host with no rule or
+    /// YARA hit and was killed. A package binary started by init is a system service's
+    /// main process: the crossing still raises its alert, but the kill is refused.
+    #[test]
+    fn a_system_service_crossing_bayes_is_refused_not_killed() {
+        let dir = tmp("bayes-service");
+        let sink = sink_in(&dir);
+        let killed = enable_recording_kill(&sink, &dir);
+        drive_bayes_crossing_from(&sink, 6001, "/usr/sbin/NetworkManager");
+        let alerts = alerts_in(&dir);
+        assert!(
+            alerts.contains("BAYES"),
+            "the recipe must still cross the belief threshold: {alerts}"
+        );
+        assert!(
+            alerts.contains("refused to kill pid 6001"),
+            "the refusal must be audited: {alerts}"
+        );
+        assert!(
+            killed.lock().unwrap().is_empty(),
+            "a service's main process must never reach terminate on BAYES alone"
+        );
+    }
+
+    /// The control for the test above: identical behaviour from a binary in `/tmp`
+    /// (the implant's provenance) is killed, as before.
+    #[test]
+    fn the_same_crossing_from_a_tmp_binary_is_still_killed() {
+        let dir = tmp("bayes-tmp");
+        let sink = sink_in(&dir);
+        let killed = enable_recording_kill(&sink, &dir);
+        drive_bayes_crossing_from(&sink, 6002, "/tmp/NetworkManager");
+        assert_eq!(*killed.lock().unwrap(), vec![6002]);
+    }
+
+    /// Observe-only mode says the truth too: a service is "refused", not "would have
+    /// been killed" (the line the issue's reporter saw on the Fedora VM).
+    #[test]
+    fn observe_mode_reports_a_service_as_refused_not_as_would_be_killed() {
+        let dir = tmp("bayes-service-observe");
+        let sink = sink_in(&dir);
+        sink.enable_response(
+            policy::ResponsePolicy {
+                kill_enabled: false,
+                quarantine_enabled: false,
+            },
+            |_| panic!("terminate must not be called in observe mode"),
+            dir.join("quarantine"),
+        );
+        drive_bayes_crossing_from(&sink, 6003, "/usr/sbin/NetworkManager");
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("refused to kill pid 6003"), "{alerts}");
+        assert!(!alerts.contains("would have been killed"), "{alerts}");
     }
 
     /// PR #502 review: `maybe_kill`'s gate must read *this event's own*
@@ -3608,8 +3786,32 @@ rule response_marker {
             spool.lock().unwrap().drain_oldest().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].detection.title, "test finding");
-        assert_eq!(records[0].detection.events, vec![event]);
+        assert_eq!(
+            records[0].detection.events,
+            vec![with_its_enrichment(&event, &records[0].detection.events)]
+        );
         assert_eq!(records[0].key.len(), 36);
+    }
+
+    /// `event` as the spooled detection carries it: the enrichment worker adds the image's hash and
+    /// signature before the detection is stored (#62), so that the control plane can join hosts
+    /// on the hash. Everything else of the event must be as it was captured. The hash is asserted
+    /// present for an image that exists on this machine, and compared as given otherwise.
+    fn with_its_enrichment(event: &Event, spooled: &[Event]) -> Event {
+        let (Event::Exec(captured), Some(Event::Exec(stored))) = (event, spooled.first()) else {
+            return event.clone();
+        };
+        assert!(
+            captured.sha256.is_some()
+                || stored.sha256.is_some()
+                || !std::path::Path::new(&captured.image_path).is_file(),
+            "the detection's exec should carry the hash of {}",
+            captured.image_path
+        );
+        let mut expected = captured.clone();
+        expected.sha256.clone_from(&stored.sha256);
+        expected.signature = stored.signature;
+        Event::Exec(expected)
     }
 
     fn rename_of(pid: u32, i: u64, to: &str) -> Event {
@@ -3905,7 +4107,10 @@ rule response_marker {
         assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
         let records: Vec<transport::QueuedDetection> =
             spool.lock().unwrap().drain_oldest().unwrap();
-        assert_eq!(records[0].detection.events, vec![event]);
+        assert_eq!(
+            records[0].detection.events,
+            vec![with_its_enrichment(&event, &records[0].detection.events)]
+        );
     }
 
     #[test]
@@ -4893,6 +5098,8 @@ rule reload_content_test_marker {
         use crate::health::RarityStatsSource as _;
 
         let snapshot = CommonSetSnapshot::parse(&golden_common_set(case).0).unwrap();
+        // "Now" is the instant the snapshot was built: its age is not what these cases are about.
+        let now = snapshot.header().built_at;
         let exec = exec_hashed(7_001, sha256.as_deref());
         let mut engine = correlator::CorrelationEngine::new();
         if correlated {
@@ -4904,6 +5111,7 @@ rule reload_content_test_marker {
             &Mutex::new(Some(Arc::new(snapshot))),
             &stats,
             &exec,
+            now,
         );
         stats.rarity_counts()
     }
@@ -4962,8 +5170,48 @@ rule reload_content_test_marker {
             &Mutex::new(None),
             &stats,
             &exec_hashed(7_002, Some(&"ab".repeat(32))),
+            0,
         );
         assert_eq!(stats.rarity_counts().withheld, 1);
+    }
+
+    /// The same non-member judged at two instants: inside the maximum age it is evidence, past
+    /// it the snapshot counts as absent and the judgement is withheld (ADR-0033 decision 3).
+    #[test]
+    fn a_snapshot_past_its_maximum_age_withholds_the_evidence() {
+        use crate::health::RarityStatsSource as _;
+        let case = "fifty_hashes_one_percent";
+        let absent = golden_non_member(case);
+        let built_at =
+            ml::features::common_set::CommonSetSnapshot::parse(&golden_common_set(case).0)
+                .unwrap()
+                .header()
+                .built_at;
+        let counts_at = |now: u64| {
+            let mut engine = correlator::CorrelationEngine::new();
+            let exec = exec_hashed(7_003, Some(&absent));
+            engine.on_event(Event::Exec(exec.clone()));
+            let stats = super::RarityStats::default();
+            super::note_image_rarity(
+                &Mutex::new(engine),
+                &Mutex::new(Some(Arc::new(
+                    ml::features::common_set::CommonSetSnapshot::parse(&golden_common_set(case).0)
+                        .unwrap(),
+                ))),
+                &stats,
+                &exec,
+                now,
+            );
+            stats.rarity_counts()
+        };
+        let max = super::MAX_SNAPSHOT_AGE_SECS;
+        assert_eq!(
+            counts_at(built_at + max).applied,
+            1,
+            "at the maximum age it is still in force"
+        );
+        let past = counts_at(built_at + max + 1);
+        assert_eq!((past.applied, past.withheld), (0, 1));
     }
 
     /// A version-1 snapshot built here (the layout in
@@ -4991,7 +5239,9 @@ rule reload_content_test_marker {
         out.extend(hosts_covered.to_le_bytes());
         out.extend(u32::try_from(hashes.len()).unwrap().to_le_bytes());
         out.extend(BITS.to_le_bytes());
-        out.extend(1_791_849_600u64.to_le_bytes());
+        // Built just now: the worker judges against the real clock, and a snapshot past its
+        // maximum age is withheld (ADR-0033).
+        out.extend(super::unix_now_secs().to_le_bytes());
         out.extend(body);
         out
     }

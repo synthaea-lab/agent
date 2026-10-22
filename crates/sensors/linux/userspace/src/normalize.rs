@@ -110,7 +110,7 @@ use sensor_linux_wire as wire;
 /// v24 (#784) added `grandparent_pid`/`parent_execd`/`grandparent_generation` to `ExecEvent`
 /// and `execd` to `LineageEntry`; `exec` maps none of them (the parent-image cache reads them
 /// from the wire event, see `parent_image`), so no mapping changed shape.
-const _: () = assert!(wire::WIRE_VERSION == 24);
+const _: () = assert!(wire::WIRE_VERSION == 25);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.

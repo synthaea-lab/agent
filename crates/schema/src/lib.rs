@@ -280,13 +280,19 @@ pub mod time;
 /// #577 (`BitsJob`) was open at the same time; whichever merges second
 /// renumbers, same coordination note as above.
 ///
-/// Bumped 45 → 46 for [`Event::BitsJob`] (#284): BITS jobs from
+/// Bumped 45 → 47 for [`Event::DnsQuery`] (#458): Linux glibc `getaddrinfo`
+/// telemetry now includes an ordered address set and an explicit truncation flag.
+/// 46 was claimed by #577 (`BitsJob`, open at the time); it landed second and
+/// renumbers below, same coordination note as above.
+///
+/// Bumped 47 → 48 for [`Event::BitsJob`] (#284): BITS jobs from
 /// `Microsoft-Windows-Bits-Client`, the only record that ties a BITS download
 /// (whose network I/O the service does itself) back to the process that asked
 /// for it. Windows-only. It claimed 35, then 40, then 42, then 43, then 44,
-/// then 45, while #519, #654, #632, #263, #87, #364 and #799 merged first with
-/// 35, 40, 41, 42, 43, 44 and 45; same coordination note as above.
-pub const SCHEMA_VERSION: u32 = 46;
+/// then 45, then 46, while #519, #654, #632, #263, #87, #364, #799 and #458
+/// merged first with 35, 40, 41, 42, 43, 44, 45 and 47; same coordination
+/// note as above.
+pub const SCHEMA_VERSION: u32 = 48;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -1005,13 +1011,25 @@ pub struct DnsQueryEvent {
     pub query: String,
     /// DNS record type (1 = A, 28 = AAAA, 5 = CNAME, ...).
     pub qtype: u32,
-    /// Resolved addresses / CNAME chain, semicolon-separated as the provider
-    /// emits them (e.g. `"type:1 172.67.143.127;"`). `None` on NXDOMAIN or when
-    /// the provider returns an empty string.
+    /// Existing provider result kept for compatibility; Linux `getaddrinfo`
+    /// sets it to the first resolved address. `None` on lookup failure or when
+    /// the provider returns no result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
+    /// Resolved IP addresses in resolver order. Empty for producers that do not
+    /// expose an answer set and for failed lookups. Repeated addresses are removed
+    /// while preserving their first appearance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub results: Vec<String>,
+    /// True when the producer's bounded answer collection omitted further entries.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub results_truncated: bool,
     /// Win32 status code (0 = success, 9003 = NXDOMAIN, ...).
     pub status: u32,
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// What a [`DefenderEvent`] reports.

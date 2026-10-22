@@ -81,6 +81,24 @@ impl ReleaseManifest {
         self.signature = hex_encode(sig.as_ref());
     }
 
+    /// Signs this manifest in place with `sign`, which receives the canonical bytes
+    /// [`Self::verify_signature`] checks and returns the 64-byte Ed25519 signature over them. For
+    /// a key that cannot leave its device (a PKCS#11 token, ADR-0027 decision 2): the caller
+    /// never holds the private half. `signature` is left empty if `sign` fails.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `sign` returns.
+    pub fn sign_with<E>(
+        &mut self,
+        sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, E>,
+    ) -> Result<(), E> {
+        self.signature.clear();
+        let sig = sign(&self.canonical_bytes())?;
+        self.signature = hex_encode(&sig);
+        Ok(())
+    }
+
     /// Verifies this manifest's `schema_version` and Ed25519 signature against
     /// [`RELEASE_PUBLIC_KEY`]. Does not check `release_version` monotonicity or
     /// per-file hashes — see [`Self::check_release_version`] and
@@ -93,6 +111,17 @@ impl ReleaseManifest {
     /// the signature is malformed or does not verify;
     /// [`UpdaterError::SigningKeyUnprovisioned`] if this build embeds no `release` key.
     pub fn verify_signature(&self) -> Result<(), UpdaterError> {
+        self.verify_signature_with(RELEASE_PUBLIC_KEY.as_ref())
+    }
+
+    /// [`Self::verify_signature`] against `key`: the `release` key in force on this install, which
+    /// is the embedded one until a key rotation replaced it ([`crate::trust_state`]). `None` is a
+    /// build with no key to verify against.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::verify_signature`].
+    pub fn verify_signature_with(&self, key: Option<&[u8; 32]>) -> Result<(), UpdaterError> {
         if self.schema_version != MANIFEST_SCHEMA_VERSION {
             return Err(UpdaterError::SchemaVersionUnsupported {
                 found: self.schema_version,
@@ -103,10 +132,7 @@ impl ReleaseManifest {
         let msg = self.canonical_bytes();
         let public_key = UnparsedPublicKey::new(
             &signature::ED25519,
-            RELEASE_PUBLIC_KEY
-                .as_ref()
-                .ok_or(UpdaterError::SigningKeyUnprovisioned)?
-                .as_slice(),
+            key.ok_or(UpdaterError::SigningKeyUnprovisioned)?.as_slice(),
         );
         public_key
             .verify(&msg, &sig_bytes)
@@ -171,6 +197,23 @@ mod tests {
         let mut m = ReleaseManifest::new(release_version, entries);
         m.sign(&test_key_pair());
         m
+    }
+
+    #[test]
+    fn signing_through_a_closure_gives_the_signature_sign_gives_and_a_failure_leaves_none() {
+        let key = test_key_pair();
+        let direct = signed_manifest(3);
+        let mut through = direct.clone();
+        through.signature = "stale".into();
+        through
+            .sign_with(|message| Ok::<_, ()>(key.sign(message).as_ref().to_vec()))
+            .unwrap();
+        assert_eq!(through.signature, direct.signature);
+        assert!(through.verify_signature().is_ok());
+
+        let mut refused = direct;
+        assert!(refused.sign_with(|_| Err("token removed")).is_err());
+        assert!(refused.signature.is_empty());
     }
 
     #[test]

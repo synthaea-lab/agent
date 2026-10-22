@@ -154,6 +154,7 @@ pub fn evaluate_exec(event: &ExecEvent) -> Vec<Alert> {
         .chain(check_masquerading(event))
         .chain(check_recovery_inhibit(event))
         .chain(check_log_clear_exec(event))
+        .chain(crate::securitytool::check_security_tool_stop(event))
         .collect()
 }
 
@@ -527,6 +528,68 @@ pub(crate) fn check_service_write_outside_datadir(
     })
 }
 
+/// T1564.004 (#136, ADS slice 1) — Hide Artifacts: NTFS File Attributes. A
+/// write-intent open on an NTFS alternate data stream: the final path
+/// component carries a `:streamname` suffix, which only exists as a way to
+/// attach a second, normally-invisible data fork to a file (`dir`/Explorer
+/// show only the unnamed stream's size; the named one does not appear in a
+/// directory listing). Malware uses this to stash a payload, a dropped tool,
+/// or staged exfil data on a file that still looks ordinary.
+///
+/// Windows only: the colon-suffixed stream syntax is NTFS-specific. The
+/// sensor already restricts `FileOpenEvent` to write-intent opens
+/// ([`has_write_intent`]; a pure read never reaches this far), so every event
+/// here already represents something being written into the stream, not
+/// merely read back.
+///
+/// **The one documented, high-volume exception is `Zone.Identifier`**: every
+/// browser, mail client, and Explorer's own "download from the internet"
+/// marking writes one on nearly every downloaded file (`#365`/`#439`
+/// already track this stream specifically for the mark-of-the-web). Excluding
+/// it by name is the same evidence-gated-exclusion bar the rest of this crate
+/// holds everything else to (`CLAUDE.md`) — it is the only stream name with
+/// that evidence today. Other legitimate stream producers (backup tools,
+/// some antivirus quarantine formats, older Office OLE property sets) are a
+/// known, accepted gap until one is actually observed and named, the same
+/// unbounded-tail trade-off ADR-0028 documents for `policy`'s interpreter
+/// blocklist. Severity is Medium, not High, for the same reason: a named
+/// stream alone is a weak, easily-legitimate signal without more context.
+#[must_use]
+pub(crate) fn check_alternate_data_stream_write(event: &FileOpenEvent) -> Option<Alert> {
+    // The colon-suffixed stream syntax is NTFS-specific; a colon is ordinary
+    // in a Linux or macOS file name (a timestamp, a log name) and must not be
+    // read as a stream there (#943 review).
+    if !matches!(event.meta.user, schema::User::Windows { .. }) || !has_write_intent(event.flags) {
+        return None;
+    }
+    let name = event.path.rsplit(['\\', '/']).next().unwrap_or("");
+    // The drive-letter colon (`C:`) never appears after the last separator;
+    // only a real stream suffix does. A bare `name:` with nothing after it,
+    // or a name starting with `:` (no base file name), is not a real stream.
+    let (base, rest) = name.split_once(':')?;
+    if base.is_empty() || rest.is_empty() {
+        return None;
+    }
+    // A type tag (`:$DATA`, `:$INDEX_ALLOCATION`, ...) can follow the stream
+    // name; strip it the same way Windows's own `dir /r` output does.
+    // `file.txt::$DATA` (an explicit, unremarkable open of the file's own
+    // unnamed stream) leaves `stream` empty rather than a real name — not a
+    // hidden stream, so it must not alert either (#943 review).
+    let stream = rest.split_once(':').map_or(rest, |(stream, _tag)| stream);
+    if stream.is_empty() || stream.eq_ignore_ascii_case("Zone.Identifier") {
+        return None;
+    }
+    Some(Alert {
+        technique: "T1564.004",
+        severity: Severity::Medium,
+        message: format!(
+            "pid={} comm={}: wrote to alternate data stream {stream:?} of {base} — \
+             data hidden outside the file's visible contents",
+            event.meta.pid, event.meta.comm,
+        ),
+    })
+}
+
 /// Evaluates all stateless rules applicable to a `FileOpenEvent`. T1053.005
 /// creation ([`check_scheduled_task_persistence`]) is not among them: one
 /// registration arrives twice (4698 and 106), so `RuleState::on_file_open`
@@ -543,6 +606,7 @@ pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
         .chain(check_account_creation_persistence(event))
         .chain(check_systemd_service_persistence(event))
         .chain(check_btm_launch_item_persistence(event))
+        .chain(check_alternate_data_stream_write(event))
         .collect()
 }
 
@@ -1059,11 +1123,61 @@ pub(crate) fn check_doh_dot_connection(event: &ConnectEvent) -> Option<Alert> {
     })
 }
 
+/// The Kerberos KDC port (TCP and UDP).
+const KERBEROS_PORT: u16 = 88;
+
+/// T1558 (#364): a Windows process other than LSASS talking to a KDC.
+///
+/// On Windows every Kerberos exchange the OS makes, logon, TGT and service tickets
+/// alike, goes through `lsass.exe`: no other process has a reason to open port 88 to a
+/// domain controller. Tools that request tickets themselves (Rubeus `asktgs`/`kerberoast`,
+/// Impacket's `GetUserSPNs.py`/`GetNPUsers.py` run on Windows, kekeo) open that connection
+/// from their own process, so this is the endpoint-side shadow of Kerberoasting,
+/// AS-REP roasting and ticket forging. The DC-side events (4768/4769) are not visible here
+/// (#364's framing).
+///
+/// Medium, not High: Java applications bring their own Kerberos client (JGSS), so a
+/// `java.exe` single-sign-on or a build tool talking to the KDC is legitimate. No name
+/// exclusion is made for it: a name-keyed exclusion needs evidence gating (CLAUDE.md), and
+/// a renamed tool is the attack. Kerberos through LSASS (`Invoke-Kerberoast`,
+/// .NET `KerberosRequestorSecurityToken`) is not seen here: that needs the Kerberos ETW
+/// provider, captured first in the lab.
+///
+/// Windows only. On Linux every Kerberos-aware program (`kinit`, `sssd`, `sshd` with
+/// GSSAPI, `curl --negotiate`) talks to the KDC itself, so the same connection is routine.
+/// A Windows event is recognised by its token user or, for a process whose token could
+/// not be read, by the `.exe` image name the Windows sensor reports.
+#[must_use]
+pub(crate) fn check_kerberos_from_non_lsass(event: &ConnectEvent) -> Option<Alert> {
+    if event.dport != KERBEROS_PORT || event.daddr.is_loopback() || event.daddr.is_unspecified() {
+        return None;
+    }
+    let comm = event.meta.comm.as_str();
+    let is_windows = matches!(event.meta.user, schema::User::Windows { .. })
+        || comm
+            .get(comm.len().saturating_sub(4)..)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(".exe"));
+    if !is_windows || comm.eq_ignore_ascii_case("lsass.exe") {
+        return None;
+    }
+    Some(Alert {
+        technique: "T1558",
+        severity: Severity::Medium,
+        message: format!(
+            "pid={} comm={comm}: Kerberos connection to {}:{KERBEROS_PORT} from a process \
+             other than LSASS: a tool requesting tickets itself (Kerberoasting, AS-REP \
+             roasting, ticket forging) unless it is a Java application with its own Kerberos",
+            event.meta.pid, event.daddr,
+        ),
+    })
+}
+
 /// Evaluates all stateless rules applicable to a `ConnectEvent`.
 #[must_use]
 pub fn evaluate_connect(event: &ConnectEvent) -> Vec<Alert> {
     check_service_unusual_outbound(event)
         .into_iter()
         .chain(check_doh_dot_connection(event))
+        .chain(check_kerberos_from_non_lsass(event))
         .collect()
 }

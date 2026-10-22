@@ -444,6 +444,8 @@ pub(crate) fn dns_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
             } else {
                 Some(result_raw)
             },
+            results: Vec::new(),
+            results_truncated: false,
             status,
         }));
     };

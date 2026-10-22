@@ -1280,14 +1280,9 @@ fn a_denial_missing_subject_or_object_context_still_alerts_once() {
     assert_eq!(alerts.len(), 1);
 }
 
-#[test]
-fn policy_denial_alert_cap_sheds_further_shapes_and_refills_in_the_next_window() {
-    // `known_policy_denials` bounds the rule's memory, not its alert volume (#812): past
-    // POLICY_DENIAL_ALERT_CAP new shapes in a window, further new ones must stop alerting.
-    // A shed shape is not remembered, so it alerts once the budget refills, and the shapes
-    // that did alert stay deduplicated.
-    let t0 = meta().timestamp_ns;
-    let at = |subject: &str, timestamp_ns: u64| PolicyDenialEvent {
+/// A denial of `subject` on `object_type`, at `timestamp_ns`: one shape per distinct pair.
+fn denial_at(subject: &str, object_type: &str, timestamp_ns: u64) -> PolicyDenialEvent {
+    PolicyDenialEvent {
         meta: schema::EventMeta {
             timestamp_ns,
             ..meta()
@@ -1295,16 +1290,30 @@ fn policy_denial_alert_cap_sheds_further_shapes_and_refills_in_the_next_window()
         ..policy_denial_event_full(
             "selinux",
             Some(subject),
-            Some("user_home_t"),
+            Some(&format!("system_u:object_r:{object_type}:s0")),
             Some("file"),
             true,
         )
-    };
+    }
+}
+
+const HTTPD: &str = "system_u:system_r:httpd_t:s0";
+const SSHD: &str = "system_u:system_r:sshd_t:s0";
+
+#[test]
+fn policy_denial_alert_cap_sheds_further_shapes_and_refills_in_the_next_window() {
+    // `known_policy_denials` bounds the rule's memory, not its alert volume (#812): past
+    // POLICY_DENIAL_ALERT_CAP new shapes of one subject in a window, further new ones of that
+    // subject must stop alerting. A shed shape is not remembered, so it alerts once the
+    // subject's budget refills, and the shapes that did alert stay deduplicated. One noisy
+    // subject probing many object types is the shape (the budget is per subject, #840).
+    let t0 = meta().timestamp_ns;
     let mut state = RuleState::new();
     let mut alerted = 0usize;
     for i in 0..=POLICY_DENIAL_ALERT_CAP {
-        let subject = format!("unconfined_u:unconfined_r:type_{i}_t:s0");
-        alerted += state.on_policy_denial(&at(&subject, t0)).len();
+        alerted += state
+            .on_policy_denial(&denial_at(HTTPD, &format!("type_{i}_t"), t0))
+            .len();
     }
     assert_eq!(
         alerted, POLICY_DENIAL_ALERT_CAP as usize,
@@ -1312,27 +1321,194 @@ fn policy_denial_alert_cap_sheds_further_shapes_and_refills_in_the_next_window()
     );
 
     // Same window: the shed shape is still new, and still shed.
-    let shed_subject = format!("unconfined_u:unconfined_r:type_{POLICY_DENIAL_ALERT_CAP}_t:s0");
+    let shed_object = format!("type_{POLICY_DENIAL_ALERT_CAP}_t");
     assert!(
-        state.on_policy_denial(&at(&shed_subject, t0)).is_empty(),
+        state
+            .on_policy_denial(&denial_at(HTTPD, &shed_object, t0))
+            .is_empty(),
         "the budget is spent for this window"
     );
     // A shape that did alert stays deduplicated, now and in the next window.
-    let first_subject = "unconfined_u:unconfined_r:type_0_t:s0";
     let next_window = t0 + crate::exclusions::POLICY_DENIAL_ALERT_WINDOW_NS;
     assert!(
         state
-            .on_policy_denial(&at(first_subject, next_window))
+            .on_policy_denial(&denial_at(HTTPD, "type_0_t", next_window))
             .is_empty(),
         "dedup keeps working across windows"
     );
     // Next window: the budget refilled, so the shed shape alerts.
     assert_eq!(
         state
-            .on_policy_denial(&at(&shed_subject, next_window))
+            .on_policy_denial(&denial_at(HTTPD, &shed_object, next_window))
             .len(),
         1,
         "a shape shed in one window alerts when the budget refills"
+    );
+}
+
+#[test]
+fn a_noisy_domain_does_not_stop_another_domains_denials_from_alerting() {
+    // #840: the budget used to be one counter for the whole host, so `httpd_t` probing
+    // thousands of object types silenced `sshd_t` on `shadow_t` for the rest of the run.
+    let t0 = meta().timestamp_ns;
+    let mut state = RuleState::new();
+    let noisy = (0..POLICY_DENIAL_ALERT_CAP + 100)
+        .map(|i| {
+            state
+                .on_policy_denial(&denial_at(HTTPD, &format!("type_{i}_t"), t0))
+                .len()
+        })
+        .sum::<usize>();
+    assert_eq!(
+        noisy, POLICY_DENIAL_ALERT_CAP as usize,
+        "httpd_t spent its own budget"
+    );
+
+    // Same window, same host: another domain's first shape, and its next ones, still alert.
+    for (i, object) in ["shadow_t", "etc_t", "user_home_t"].iter().enumerate() {
+        let alerts = state.on_policy_denial(&denial_at(SSHD, object, t0 + i as u64));
+        assert_eq!(alerts.len(), 1, "sshd_t on {object} must alert: {alerts:?}");
+        assert_eq!(alerts[0].technique, "T1562");
+        assert!(
+            alerts[0].message.contains("sshd_t"),
+            "{}",
+            alerts[0].message
+        );
+    }
+    // And httpd_t is still shed.
+    assert!(
+        state
+            .on_policy_denial(&denial_at(HTTPD, "brand_new_t", t0 + 10))
+            .is_empty()
+    );
+}
+
+#[test]
+fn each_subjects_budget_refills_on_its_own_window() {
+    // A spends its budget at t0, B half a window later: when A's window ends, A alerts again
+    // and B, still inside its own, does not.
+    let t0 = meta().timestamp_ns;
+    let window = crate::exclusions::POLICY_DENIAL_ALERT_WINDOW_NS;
+    let mut state = RuleState::new();
+    for i in 0..=POLICY_DENIAL_ALERT_CAP {
+        state.on_policy_denial(&denial_at(HTTPD, &format!("a_{i}_t"), t0));
+        state.on_policy_denial(&denial_at(SSHD, &format!("b_{i}_t"), t0 + window / 2));
+    }
+    let at_a_refill = t0 + window;
+    assert_eq!(
+        state
+            .on_policy_denial(&denial_at(HTTPD, "after_refill_t", at_a_refill))
+            .len(),
+        1,
+        "A's window ended"
+    );
+    assert!(
+        state
+            .on_policy_denial(&denial_at(SSHD, "after_refill_t", at_a_refill))
+            .is_empty(),
+        "B's window has not ended"
+    );
+    assert_eq!(
+        state
+            .on_policy_denial(&denial_at(SSHD, "later_t", t0 + window / 2 + window))
+            .len(),
+        1,
+        "B's own window ended"
+    );
+}
+
+#[test]
+fn a_subject_is_its_type_not_its_category_pair() {
+    // Two contexts of one type that differ only in MCS categories are one subject (the key
+    // already drops them, #781): they share a budget, so categories cannot buy a fresh one.
+    let t0 = meta().timestamp_ns;
+    let mut state = RuleState::new();
+    for i in 0..POLICY_DENIAL_ALERT_CAP {
+        let subject = if i % 2 == 0 {
+            "system_u:system_r:container_t:s0:c1,c2"
+        } else {
+            "system_u:system_r:container_t:s0:c3,c4"
+        };
+        state.on_policy_denial(&denial_at(subject, &format!("type_{i}_t"), t0));
+    }
+    assert!(
+        state
+            .on_policy_denial(&denial_at(
+                "system_u:system_r:container_t:s0:c5,c6",
+                "one_more_t",
+                t0
+            ))
+            .is_empty(),
+        "the budget of container_t is spent whatever its categories"
+    );
+}
+
+#[test]
+fn a_denial_with_no_subject_context_has_a_budget_of_its_own() {
+    let t0 = meta().timestamp_ns;
+    let mut state = RuleState::new();
+    let no_subject = |object: &str| PolicyDenialEvent {
+        meta: schema::EventMeta {
+            timestamp_ns: t0,
+            ..meta()
+        },
+        ..policy_denial_event_full(
+            "selinux",
+            None,
+            Some(&format!("system_u:object_r:{object}:s0")),
+            Some("file"),
+            true,
+        )
+    };
+    let mut state_alerts = 0usize;
+    for i in 0..=POLICY_DENIAL_ALERT_CAP {
+        state_alerts += state
+            .on_policy_denial(&no_subject(&format!("type_{i}_t")))
+            .len();
+    }
+    assert_eq!(state_alerts, POLICY_DENIAL_ALERT_CAP as usize);
+    assert_eq!(
+        state.on_policy_denial(&denial_at(HTTPD, "etc_t", t0)).len(),
+        1,
+        "a subject-less flood does not touch a named domain"
+    );
+}
+
+#[test]
+fn a_subject_forgotten_by_the_bounded_budget_map_starts_a_fresh_budget_and_it_is_logged() {
+    // The budget map is LRU-bounded (POLICY_DENIAL_SUBJECT_CAP). A noisy domain that is then
+    // pushed out by more other subjects than the map holds loses its spent budget: a bounded
+    // loss, counted and logged, never unbounded growth.
+    let t0 = meta().timestamp_ns;
+    let logs = captured_logs(|| {
+        let mut state = RuleState::new();
+        for i in 0..=POLICY_DENIAL_ALERT_CAP {
+            state.on_policy_denial(&denial_at(HTTPD, &format!("type_{i}_t"), t0));
+        }
+        assert!(
+            state
+                .on_policy_denial(&denial_at(HTTPD, "still_shed_t", t0))
+                .is_empty(),
+            "httpd_t is spent before the push"
+        );
+        for i in 0..=POLICY_DENIAL_SUBJECT_CAP {
+            state.on_policy_denial(&denial_at(
+                &format!("system_u:system_r:other_{i}_t:s0"),
+                "etc_t",
+                t0,
+            ));
+        }
+        assert_eq!(
+            state
+                .on_policy_denial(&denial_at(HTTPD, "fresh_budget_t", t0))
+                .len(),
+            1,
+            "the forgotten subject starts over"
+        );
+    });
+    assert!(
+        logs.contains("subject alert budgets forgotten"),
+        "the loss must be logged: {logs}"
     );
 }
 
@@ -1375,23 +1551,9 @@ fn policy_denial_cache_eviction_is_logged() {
         let t0 = meta().timestamp_ns;
         for i in 0..=COUNTER_CAP {
             let subject = format!("unconfined_u:unconfined_r:evict_{i}_t:s0");
-            // The alert budget is per window and a shape shed by it is not remembered: step
-            // the clock one window per POLICY_DENIAL_ALERT_CAP shapes so every shape is
-            // remembered and the cache fills.
-            let window = u64::try_from(i).expect("fits") / POLICY_DENIAL_ALERT_CAP;
-            state.on_policy_denial(&PolicyDenialEvent {
-                meta: schema::EventMeta {
-                    timestamp_ns: t0 + window * crate::exclusions::POLICY_DENIAL_ALERT_WINDOW_NS,
-                    ..meta()
-                },
-                ..policy_denial_event_full(
-                    "selinux",
-                    Some(&subject),
-                    Some("user_home_t"),
-                    Some("file"),
-                    true,
-                )
-            });
+            // Every shape is its own subject, so each has a budget of its own and none is shed:
+            // the cache fills (and the bounded budget map evicts, with a log line of its own).
+            state.on_policy_denial(&denial_at(&subject, "user_home_t", t0));
         }
     });
 
@@ -1408,41 +1570,69 @@ fn policy_denial_cache_eviction_is_logged() {
         shed_lines, 1,
         "exactly one eviction rise must be logged, not zero or one per event: {logs}"
     );
+    // On the line of that message, not anywhere in the log: the budget map logs its own
+    // evictions with a field of a different name, which must not satisfy this check.
+    let shed_line = logs
+        .lines()
+        .find(|l| l.contains("tracked denial shapes shed"))
+        .expect("the line was counted above");
     assert!(
-        logs.contains(&format!("evicted={}", COUNTER_CAP / 8)),
-        "the logged count must be the real evicted total, not 0: {logs}"
+        shed_line.contains(&format!("evicted={}", COUNTER_CAP / 8)),
+        "the logged count must be the real evicted total, not 0: {shed_line}"
     );
 }
 
 #[test]
-fn policy_denial_alert_cap_reached_is_logged_exactly_once() {
-    // The "alert cap reached" warning is gated on `policy_denial_alerts_shed == 0`
-    // (the very first shed) so it fires once, not once per shed shape — otherwise a
-    // sustained flood past the cap would spam one warning per new shape instead of
-    // one notice that the cap was hit (review of #823: `== 0` flipped to `!= 0`, or
-    // the counter's own `+= 1` flipped to `*= 1`, both leave the existing tests
-    // green because nothing before this asserted on this message's own line count).
+fn policy_denial_alert_cap_reached_is_logged_exactly_once_per_subject() {
+    // The "alert cap reached" warning is gated on the subject's own `shed == 0` (its very first
+    // shed in the window) so it fires once per subject, not once per shed shape — otherwise a
+    // sustained flood past the cap would spam one warning per new shape instead of one notice
+    // that the cap was hit (review of #823: `== 0` flipped to `!= 0`, or the counter's own `+= 1`
+    // flipped to `*= 1`, both leave the other tests green because nothing asserted on this
+    // message's own line count).
+    let t0 = meta().timestamp_ns;
     let logs = captured_logs(|| {
         let mut state = RuleState::new();
-        // Well past POLICY_DENIAL_ALERT_CAP (2048): enough further shapes that a
+        // Well past POLICY_DENIAL_ALERT_CAP (2048) for two subjects: enough further shapes that a
         // once-per-shed bug would produce many lines, not just a second one.
         for i in 0..POLICY_DENIAL_ALERT_CAP * 3 {
-            let subject = format!("unconfined_u:unconfined_r:cap_{i}_t:s0");
-            state.on_policy_denial(&policy_denial_event_full(
-                "selinux",
-                Some(&subject),
-                Some("user_home_t"),
-                Some("file"),
-                true,
-            ));
+            state.on_policy_denial(&denial_at(HTTPD, &format!("cap_{i}_t"), t0));
+            state.on_policy_denial(&denial_at(SSHD, &format!("cap_{i}_t"), t0));
         }
     });
 
-    let cap_lines = logs.matches("alert cap reached").count();
+    let cap_lines: Vec<&str> = logs
+        .lines()
+        .filter(|l| l.contains("alert cap reached"))
+        .collect();
     assert_eq!(
-        cap_lines, 1,
-        "the cap-reached warning must fire exactly once, not once per shed shape: {logs}"
+        cap_lines.len(),
+        2,
+        "the cap-reached warning must fire once per noisy subject, not once per shed shape: {logs}"
     );
+    assert!(cap_lines.iter().any(|l| l.contains("httpd_t")), "{logs}");
+    assert!(cap_lines.iter().any(|l| l.contains("sshd_t")), "{logs}");
+}
+
+#[test]
+fn the_cap_warning_comes_again_when_a_subject_hits_its_cap_in_a_later_window() {
+    // Once per subject per window: a subject that is noisy again after its budget refilled is a
+    // new notice, not a silent continuation of the old one.
+    let t0 = meta().timestamp_ns;
+    let window = crate::exclusions::POLICY_DENIAL_ALERT_WINDOW_NS;
+    let logs = captured_logs(|| {
+        let mut state = RuleState::new();
+        for round in 0..2u64 {
+            for i in 0..=POLICY_DENIAL_ALERT_CAP {
+                state.on_policy_denial(&denial_at(
+                    HTTPD,
+                    &format!("round_{round}_{i}_t"),
+                    t0 + round * window,
+                ));
+            }
+        }
+    });
+    assert_eq!(logs.matches("alert cap reached").count(), 2, "{logs}");
 }
 
 #[test]
@@ -3339,4 +3529,403 @@ fn browser_to_known_doh_resolver_does_not_alert() {
     assert!(check_doh_dot_connection(&firefox).is_none());
     let chrome_exe = connect_event_full(406, "Chrome.exe", [8, 8, 8, 8], 443, 0);
     assert!(check_doh_dot_connection(&chrome_exe).is_none());
+}
+
+// ── EGRESS-VOLUME via conntrack polling (#380, T1041/T1048) ─────────────────────
+
+const MIB: u64 = 1024 * 1024;
+const SEC: u64 = 1_000_000_000;
+
+fn flow_sent(
+    comm: &str,
+    local_port: u16,
+    daddr: [u8; 4],
+    bytes_sent: Option<u64>,
+    timestamp_ns: u64,
+) -> NetworkFlowEvent {
+    NetworkFlowEvent {
+        bytes_sent,
+        ..network_flow_event_full(300, comm, local_port, daddr, 8443, timestamp_ns)
+    }
+}
+
+#[test]
+fn egress_volume_crossing_the_threshold_alerts_once() {
+    let mut state = RuleState::new();
+    let dst = [203, 0, 113, 9];
+    // First poll: baseline only, however large the counter is.
+    assert!(
+        state
+            .on_network_flow(&flow_sent("rsyncish", 50000, dst, Some(900 * MIB), 0))
+            .is_empty()
+    );
+    // 300 MiB since the baseline: below the 512 MiB threshold.
+    assert!(
+        state
+            .on_network_flow(&flow_sent(
+                "rsyncish",
+                50000,
+                dst,
+                Some(1200 * MIB),
+                5 * SEC
+            ))
+            .is_empty()
+    );
+    // 300 MiB more: 600 MiB in the window, over it.
+    let alerts = state.on_network_flow(&flow_sent(
+        "rsyncish",
+        50000,
+        dst,
+        Some(1500 * MIB),
+        10 * SEC,
+    ));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1041/T1048");
+    assert!(alerts[0].message.contains("600MB"), "{}", alerts[0].message);
+    // One alert per window.
+    assert!(
+        state
+            .on_network_flow(&flow_sent(
+                "rsyncish",
+                50000,
+                dst,
+                Some(1800 * MIB),
+                15 * SEC
+            ))
+            .is_empty()
+    );
+}
+
+#[test]
+fn egress_volume_sums_several_connections_to_one_address() {
+    let mut state = RuleState::new();
+    let dst = [203, 0, 113, 9];
+    for port in [50000, 50001, 50002] {
+        state.on_network_flow(&flow_sent("uploader", port, dst, Some(0), 0));
+    }
+    let mut last = Vec::new();
+    for (i, port) in [50000, 50001, 50002].into_iter().enumerate() {
+        last = state.on_network_flow(&flow_sent(
+            "uploader",
+            port,
+            dst,
+            Some(200 * MIB),
+            (i as u64 + 1) * SEC,
+        ));
+    }
+    // 3 x 200 MiB = 600 MiB, no single flow reached 512 MiB.
+    assert_eq!(last.len(), 1);
+}
+
+#[test]
+fn egress_volume_spread_over_more_than_the_window_does_not_alert() {
+    let mut state = RuleState::new();
+    let dst = [203, 0, 113, 9];
+    state.on_network_flow(&flow_sent("backup", 50000, dst, Some(0), 0));
+    // 100 MiB every 5 minutes: the window (10 min) never holds 512 MiB.
+    for i in 1..=12u64 {
+        let alerts = state.on_network_flow(&flow_sent(
+            "backup",
+            50000,
+            dst,
+            Some(i * 100 * MIB),
+            i * 300 * SEC,
+        ));
+        assert!(alerts.is_empty(), "poll {i}: {alerts:?}");
+    }
+}
+
+#[test]
+fn egress_volume_ignores_a_flow_that_was_already_big_when_first_seen() {
+    let mut state = RuleState::new();
+    let dst = [203, 0, 113, 9];
+    // A long session open before the agent started, with a huge counter: baseline only.
+    assert!(
+        state
+            .on_network_flow(&flow_sent("ssh", 50000, dst, Some(4096 * MIB), 0))
+            .is_empty()
+    );
+    assert!(
+        state
+            .on_network_flow(&flow_sent(
+                "ssh",
+                50000,
+                dst,
+                Some(4096 * MIB + MIB),
+                5 * SEC
+            ))
+            .is_empty()
+    );
+}
+
+#[test]
+fn egress_volume_ignores_private_loopback_and_overlay_peers() {
+    for dst in [
+        [10, 0, 0, 5],
+        [192, 168, 1, 20],
+        [127, 0, 0, 1],
+        [100, 100, 1, 1],
+    ] {
+        let mut state = RuleState::new();
+        state.on_network_flow(&flow_sent("backup", 50000, dst, Some(0), 0));
+        let alerts =
+            state.on_network_flow(&flow_sent("backup", 50000, dst, Some(2048 * MIB), 5 * SEC));
+        assert!(alerts.is_empty(), "{dst:?}: {alerts:?}");
+    }
+}
+
+#[test]
+fn egress_volume_is_inert_without_conntrack_accounting() {
+    let mut state = RuleState::new();
+    let dst = [203, 0, 113, 9];
+    for t in 0..4 {
+        assert!(
+            state
+                .on_network_flow(&flow_sent("uploader", 50000, dst, None, t * 5 * SEC))
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn egress_volume_counts_a_reused_local_port_as_a_new_flow() {
+    let mut state = RuleState::new();
+    let dst = [203, 0, 113, 9];
+    state.on_network_flow(&flow_sent("uploader", 50000, dst, Some(10 * MIB), 0));
+    // The counter went down: a new flow on the same local port, its whole value is new.
+    let alerts =
+        state.on_network_flow(&flow_sent("uploader", 50000, dst, Some(600 * MIB), 5 * SEC));
+    assert_eq!(alerts.len(), 1);
+}
+
+// ── ARCHIVE-EXFIL: an archive is staged, another pid reads it, then connects out (#380) ──
+
+const ARCHIVE_PATH: &str = "/var/tmp/home-backup.tar.gz";
+const WRITE_FLAGS: u32 = 0o1; // O_WRONLY on Linux
+
+fn open_event(pid: u32, comm: &str, path: &str, flags: u32, ts: u64) -> FileOpenEvent {
+    let mut event = schema::fixtures::file_open();
+    event.meta.pid = pid;
+    event.meta.comm = comm.to_string();
+    event.meta.timestamp_ns = ts;
+    event.path = path.to_string();
+    event.flags = flags;
+    event
+}
+
+fn write_event(pid: u32, bytes: u64, ts: u64) -> schema::FileWriteEvent {
+    let mut event = schema::fixtures::file_write();
+    event.meta.pid = pid;
+    event.meta.timestamp_ns = ts;
+    event.bytes_requested = bytes;
+    event
+}
+
+fn connect_to(pid: u32, comm: &str, daddr: [u8; 4], ts: u64) -> ConnectEvent {
+    connect_event_full(pid, comm, daddr, 443, ts)
+}
+
+/// Stages `ARCHIVE_PATH` by pid 100 (200 MiB written) at t = 0..2 s.
+fn stage_archive(state: &mut RuleState) {
+    state.on_file_open(&open_event(100, "tar", ARCHIVE_PATH, WRITE_FLAGS, 0));
+    state.on_file_write(&write_event(100, 100 * MIB, SEC));
+    state.on_file_write(&write_event(100, 100 * MIB, 2 * SEC));
+}
+
+#[test]
+fn archive_exfil_staged_archive_read_then_connect_alerts_once() {
+    let mut state = RuleState::new();
+    stage_archive(&mut state);
+    state.on_file_open(&open_event(200, "rclone", ARCHIVE_PATH, 0, 60 * SEC));
+    let alerts = state.on_connect(&connect_to(200, "rclone", [203, 0, 113, 9], 62 * SEC));
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(alerts[0].technique, "T1560/T1041");
+    assert!(alerts[0].message.contains(ARCHIVE_PATH));
+    // One alert per reader.
+    let again = state.on_connect(&connect_to(200, "rclone", [203, 0, 113, 10], 63 * SEC));
+    assert!(again.is_empty());
+}
+
+#[test]
+fn archive_exfil_a_small_archive_is_not_staged() {
+    let mut state = RuleState::new();
+    state.on_file_open(&open_event(100, "tar", ARCHIVE_PATH, WRITE_FLAGS, 0));
+    state.on_file_write(&write_event(100, 10 * MIB, SEC));
+    state.on_file_open(&open_event(200, "curl", ARCHIVE_PATH, 0, 60 * SEC));
+    assert!(
+        state
+            .on_connect(&connect_to(200, "curl", [203, 0, 113, 9], 62 * SEC))
+            .is_empty()
+    );
+}
+
+#[test]
+fn archive_exfil_the_writer_extracting_its_own_archive_is_not_a_hand_off() {
+    let mut state = RuleState::new();
+    stage_archive(&mut state);
+    // The same pid opens the file again to read it, then connects.
+    state.on_file_open(&open_event(100, "tar", ARCHIVE_PATH, 0, 10 * SEC));
+    assert!(
+        state
+            .on_connect(&connect_to(100, "tar", [203, 0, 113, 9], 11 * SEC))
+            .is_empty()
+    );
+}
+
+#[test]
+fn archive_exfil_a_connection_to_a_private_address_does_not_complete_it() {
+    let mut state = RuleState::new();
+    stage_archive(&mut state);
+    state.on_file_open(&open_event(200, "rsync", ARCHIVE_PATH, 0, 60 * SEC));
+    assert!(
+        state
+            .on_connect(&connect_to(200, "rsync", [192, 168, 1, 20], 62 * SEC))
+            .is_empty()
+    );
+}
+
+#[test]
+fn archive_exfil_a_late_read_or_a_late_connection_does_not_count() {
+    let mut late_read = RuleState::new();
+    stage_archive(&mut late_read);
+    // Read two hours after staging: outside the one-hour read window.
+    late_read.on_file_open(&open_event(200, "curl", ARCHIVE_PATH, 0, 7200 * SEC));
+    assert!(
+        late_read
+            .on_connect(&connect_to(200, "curl", [203, 0, 113, 9], 7201 * SEC))
+            .is_empty()
+    );
+    let mut late_connect = RuleState::new();
+    stage_archive(&mut late_connect);
+    late_connect.on_file_open(&open_event(200, "curl", ARCHIVE_PATH, 0, 60 * SEC));
+    // Connects 11 minutes after the read: outside the 10-minute window.
+    assert!(
+        late_connect
+            .on_connect(&connect_to(200, "curl", [203, 0, 113, 9], 720 * SEC))
+            .is_empty()
+    );
+}
+
+#[test]
+fn archive_exfil_another_pid_connecting_does_not_complete_it() {
+    let mut state = RuleState::new();
+    stage_archive(&mut state);
+    state.on_file_open(&open_event(200, "cat", ARCHIVE_PATH, 0, 60 * SEC));
+    assert!(
+        state
+            .on_connect(&connect_to(300, "curl", [203, 0, 113, 9], 62 * SEC))
+            .is_empty()
+    );
+}
+
+#[test]
+fn archive_exfil_a_file_without_an_archive_name_is_not_tracked() {
+    let mut state = RuleState::new();
+    state.on_file_open(&open_event(
+        100,
+        "tar",
+        "/var/tmp/home-backup.dat",
+        WRITE_FLAGS,
+        0,
+    ));
+    state.on_file_write(&write_event(100, 200 * MIB, SEC));
+    state.on_file_open(&open_event(
+        200,
+        "curl",
+        "/var/tmp/home-backup.dat",
+        0,
+        60 * SEC,
+    ));
+    assert!(
+        state
+            .on_connect(&connect_to(200, "curl", [203, 0, 113, 9], 62 * SEC))
+            .is_empty()
+    );
+}
+
+#[test]
+fn archive_exfil_a_flow_event_completes_it_as_well() {
+    let mut state = RuleState::new();
+    stage_archive(&mut state);
+    state.on_file_open(&open_event(200, "scp", ARCHIVE_PATH, 0, 60 * SEC));
+    let alerts = state.on_network_flow(&flow_sent("scp", 50000, [203, 0, 113, 9], None, 62 * SEC));
+    // `flow_sent` builds pid 300; align it with the reader.
+    assert!(alerts.is_empty());
+    let mut flow = flow_sent("scp", 50000, [203, 0, 113, 9], None, 63 * SEC);
+    flow.meta.pid = 200;
+    assert_eq!(state.on_network_flow(&flow).len(), 1);
+}
+
+#[test]
+fn archive_exfil_a_rewritten_archive_is_staged_again_the_next_night() {
+    let mut state = RuleState::new();
+    // Night 1: staged, never read.
+    stage_archive(&mut state);
+    // Night 2, a day later, the same job rewrites the same name.
+    let day = 86_400 * SEC;
+    state.on_file_open(&open_event(101, "tar", ARCHIVE_PATH, WRITE_FLAGS, day));
+    state.on_file_write(&write_event(101, 100 * MIB, day + SEC));
+    state.on_file_write(&write_event(101, 100 * MIB, day + 2 * SEC));
+    state.on_file_open(&open_event(200, "rclone", ARCHIVE_PATH, 0, day + 60 * SEC));
+    let alerts = state.on_connect(&connect_to(200, "rclone", [203, 0, 113, 9], day + 62 * SEC));
+    assert_eq!(alerts.len(), 1, "the second night must alert: {alerts:?}");
+}
+
+#[test]
+fn archive_exfil_the_read_window_counts_from_the_last_write_of_a_long_job() {
+    let mut state = RuleState::new();
+    state.on_file_open(&open_event(100, "tar", ARCHIVE_PATH, WRITE_FLAGS, 0));
+    state.on_file_write(&write_event(100, 200 * MIB, SEC));
+    // The job keeps writing for three hours, then a reader comes 30 minutes after it stopped.
+    let end = 3 * 3600 * SEC;
+    state.on_file_write(&write_event(100, MIB, end));
+    state.on_file_open(&open_event(200, "curl", ARCHIVE_PATH, 0, end + 1800 * SEC));
+    let alerts = state.on_connect(&connect_to(200, "curl", [203, 0, 113, 9], end + 1802 * SEC));
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+}
+
+#[test]
+fn archive_exfil_a_recycled_pid_reading_the_archive_is_still_a_reader() {
+    let mut state = RuleState::new();
+    let mut writer_open = open_event(100, "tar", ARCHIVE_PATH, WRITE_FLAGS, 0);
+    writer_open.meta.process_generation = Some(1);
+    state.on_file_open(&writer_open);
+    for t in [SEC, 2 * SEC] {
+        let mut write = write_event(100, 100 * MIB, t);
+        write.meta.process_generation = Some(1);
+        state.on_file_write(&write);
+    }
+    // The same pid number, another process (generation 2), reads the archive and connects.
+    let mut read = open_event(100, "curl", ARCHIVE_PATH, 0, 60 * SEC);
+    read.meta.process_generation = Some(2);
+    state.on_file_open(&read);
+    let mut connect = connect_to(100, "curl", [203, 0, 113, 9], 62 * SEC);
+    connect.meta.process_generation = Some(2);
+    assert_eq!(state.on_connect(&connect).len(), 1);
+    // And a reader of generation 2 does not inherit another incarnation's connection.
+    let mut other = connect_to(100, "curl", [203, 0, 113, 10], 63 * SEC);
+    other.meta.process_generation = Some(3);
+    assert!(state.on_connect(&other).is_empty());
+}
+
+#[test]
+fn archive_exfil_a_small_rewrite_does_not_inherit_the_earlier_staging() {
+    let mut state = RuleState::new();
+    stage_archive(&mut state); // staged at ~2 s
+    // Ten minutes later the same name is reopened for writing and only 10 MiB are written:
+    // the earlier 200 MiB staging describes a file that no longer exists.
+    state.on_file_open(&open_event(
+        101,
+        "tar",
+        ARCHIVE_PATH,
+        WRITE_FLAGS,
+        600 * SEC,
+    ));
+    state.on_file_write(&write_event(101, 10 * MIB, 601 * SEC));
+    state.on_file_open(&open_event(200, "curl", ARCHIVE_PATH, 0, 1200 * SEC));
+    assert!(
+        state
+            .on_connect(&connect_to(200, "curl", [203, 0, 113, 9], 1202 * SEC))
+            .is_empty()
+    );
 }

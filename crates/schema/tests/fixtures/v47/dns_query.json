@@ -9,6 +9,11 @@
   },
   "query": "beacon.example.test",
   "qtype": 1,
-  "result": "type:1 172.67.143.127;",
+  "result": "172.67.143.127",
+  "results": [
+    "172.67.143.127",
+    "2001:db8::1"
+  ],
+  "results_truncated": true,
   "status": 0
 }

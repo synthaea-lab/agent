@@ -16,9 +16,10 @@
 //!
 //! The correlator cannot call this crate (`ml` already depends on `correlator` for
 //! [`EventBus`]; the reverse edge would be a cycle). The wiring is therefore
-//! "compute here, inject there": the agent runs the scorer against the engine's bus
-//! and hands the LLR back through the correlator's public API. That seam is not in
-//! this crate yet — see `docs/detection/correlation.md`.
+//! "compute here, inject there" (#132, #345): `agent::DetectionSink` runs
+//! [`CorrelationScorer::score`] against the engine's bus and hands the LLR back
+//! through `CorrelationEngine::update_belief_with_ml` — see
+//! `docs/detection/correlation.md`.
 
 use correlator::EventBus;
 use ort::{session::Session, value::Tensor};
