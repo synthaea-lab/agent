@@ -15,6 +15,7 @@ mod credfiles;
 mod defender;
 mod egressdomain;
 mod exclusions;
+mod failure_join;
 mod inventory;
 mod ld_trust;
 mod ldap;

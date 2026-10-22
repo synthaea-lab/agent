@@ -20,14 +20,18 @@
 //! application-log failures are stamped when the line is read, not with event time),
 //! from any logon type, not only RDP ones.
 
-use std::{collections::VecDeque, net::IpAddr};
+use std::net::IpAddr;
 
 use schema::detection::Severity;
 use store::BoundedMap;
 
+// The tests of this module read the cap the shared join enforces.
+#[cfg(test)]
+use crate::failure_join::ALERTED_WINDOWS_CAP;
 use crate::{
     Alert,
     exclusions::{RDP_SUCCESS_AFTER_FAILURES_THRESHOLD, RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS},
+    failure_join::{History, JoinParams},
 };
 
 /// Distinct source addresses tracked; the least recently seen goes first, so a
@@ -39,27 +43,16 @@ const FAILURES_PER_SOURCE_CAP: usize = 256;
 /// Successes kept per address until a failure can still complete their join.
 const SUCCESSES_PER_SOURCE_CAP: usize = 8;
 
-struct Success {
-    timestamp_ns: u64,
-    user: String,
-    alerted: bool,
-}
+/// What the shared join ([`crate::failure_join`]) is given for RDP.
+const PARAMS: JoinParams = JoinParams {
+    window_ns: RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS,
+    threshold: RDP_SUCCESS_AFTER_FAILURES_THRESHOLD as usize,
+    failures_cap: FAILURES_PER_SOURCE_CAP,
+    successes_cap: SUCCESSES_PER_SOURCE_CAP,
+};
 
-#[derive(Default)]
-struct Source {
-    /// Failure timestamps, oldest first.
-    failures: VecDeque<u64>,
-    /// Successes, oldest first.
-    successes: VecDeque<Success>,
-    /// The fixed windows (`timestamp / window`) an alert already fired for: one alert
-    /// per window per address. Fixed slots, not "within a window of the last alert":
-    /// the latter moves with the order alerts are emitted in, so the number of alerts
-    /// would depend on delivery order again (a success at 0, 400 and 700 s gave 2 or 3).
-    alerted_windows: VecDeque<u64>,
-}
-
-/// Alerted windows remembered per address. Far more than the successes kept.
-const ALERTED_WINDOWS_CAP: usize = 16;
+/// One address's history; a success carries the user it authenticated as.
+type Source = History<String>;
 
 /// Per-address history that joins an RDP success to the failures before it.
 pub(crate) struct RdpSuccessAfterFailures {
@@ -78,8 +71,8 @@ impl RdpSuccessAfterFailures {
     pub(crate) fn on_failure(&mut self, address: IpAddr, timestamp_ns: u64) -> Vec<Alert> {
         let address = address.to_canonical();
         let source = self.sources.get_or_insert_with(address, Source::default);
-        insert_sorted(&mut source.failures, timestamp_ns, FAILURES_PER_SOURCE_CAP);
-        source.join(address)
+        source.record_failure(timestamp_ns, &PARAMS);
+        join(source, address)
     }
 
     /// An RDP authentication from `address` succeeded at `timestamp_ns`.
@@ -91,75 +84,24 @@ impl RdpSuccessAfterFailures {
     ) -> Vec<Alert> {
         let address = address.to_canonical();
         let source = self.sources.get_or_insert_with(address, Source::default);
-        let at = source
-            .successes
-            .partition_point(|s| s.timestamp_ns <= timestamp_ns);
-        source.successes.insert(
-            at,
-            Success {
-                timestamp_ns,
-                user: user.to_string(),
-                alerted: false,
-            },
-        );
-        if source.successes.len() > SUCCESSES_PER_SOURCE_CAP {
-            source.successes.pop_front();
-        }
-        source.join(address)
+        source.record_success(timestamp_ns, user.to_string(), &PARAMS);
+        join(source, address)
     }
 }
 
-/// Inserts `value` keeping `deque` sorted, dropping the oldest past `cap`.
-fn insert_sorted(deque: &mut VecDeque<u64>, value: u64, cap: usize) {
-    let at = deque.partition_point(|&t| t <= value);
-    deque.insert(at, value);
-    if deque.len() > cap {
-        deque.pop_front();
-    }
-}
-
-impl Source {
-    /// Every remembered success that now has enough failures in the window ending
-    /// at it, once per window. One arrival can complete several successes (a single
-    /// late failure that falls in the windows of two of them), so this returns all
-    /// of them, not the first.
-    fn join(&mut self, address: IpAddr) -> Vec<Alert> {
-        let mut alerts = Vec::new();
-        for success in &mut self.successes {
-            if success.alerted {
-                continue;
-            }
-            let from = success
-                .timestamp_ns
-                .saturating_sub(RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS);
-            let count = self
-                .failures
-                .iter()
-                .filter(|&&t| t >= from && t <= success.timestamp_ns)
-                .count();
-            let window = success.timestamp_ns / RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS;
-            let recent = self.alerted_windows.contains(&window);
-            if count >= RDP_SUCCESS_AFTER_FAILURES_THRESHOLD as usize && !recent {
-                success.alerted = true;
-                self.alerted_windows.push_back(window);
-                if self.alerted_windows.len() > ALERTED_WINDOWS_CAP {
-                    self.alerted_windows.pop_front();
-                }
-                alerts.push(Alert {
-                    technique: "T1021.001",
-                    severity: Severity::Medium,
-                    message: format!(
-                        "user={} source={address}: RDP authentication succeeded after {count} \
-                         failed authentications from that address in {}s: guessed or sprayed \
-                         credentials worked, or a shared address (NAT, RD Gateway)",
-                        success.user,
-                        RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS / 1_000_000_000,
-                    ),
-                });
-            }
-        }
-        alerts
-    }
+/// The RDP alert of every success the shared join completes.
+fn join(source: &mut Source, address: IpAddr) -> Vec<Alert> {
+    source.join(&PARAMS, |success, count| Alert {
+        technique: "T1021.001",
+        severity: Severity::Medium,
+        message: format!(
+            "user={} source={address}: RDP authentication succeeded after {count} \
+             failed authentications from that address in {}s: guessed or sprayed \
+             credentials worked, or a shared address (NAT, RD Gateway)",
+            success.detail,
+            RDP_SUCCESS_AFTER_FAILURES_WINDOW_NS / 1_000_000_000,
+        ),
+    })
 }
 
 #[cfg(test)]
