@@ -127,6 +127,7 @@ TECHNIQUE_TACTIC = {
     "T1037.004": "Persistence",
     "T1041": "Exfiltration",
     "T1048.003": "Exfiltration",
+    "T1074.001": "Collection",
     "T1053.003": "Persistence",
     "T1053.005": "Persistence",
     "T1055": "Defense Evasion",

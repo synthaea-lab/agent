@@ -416,6 +416,7 @@ mod security_discovery;
 mod service_stop;
 mod session;
 mod ssh_fanout;
+mod staging;
 mod sudo;
 mod tamper;
 mod windows;

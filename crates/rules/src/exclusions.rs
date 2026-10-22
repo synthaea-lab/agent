@@ -508,6 +508,44 @@ pub(crate) const POLICY_DENIAL_ALERT_WINDOW_NS: u64 = 3_600_000_000_000;
 /// Sliding (timestamp-based), never a reset bucket. Uncalibrated (first cut, 2026-10-21).
 pub(crate) const CREDENTIAL_READ_ALERT_WINDOW_NS: u64 = 300_000_000_000; // 5 min
 
+/// STAGING-DIR (T1074.001, #380): distinct user-data files one pid must open for reading
+/// inside [`STAGING_WINDOW_NS`] ...
+///
+/// **All four numbers are provisional**: there is no lab capture of an ordinary copy, build
+/// or backup to calibrate against, so they are set above what a person does by hand
+/// (copying a folder of a few dozen files) and below a sweep. A `SlidingDistinct` holds 256
+/// values, so no threshold may exceed that.
+pub(crate) const STAGING_READ_FILES: u32 = 100;
+/// ... spread over at least this many distinct directories (a build of one source tree reads
+/// many files from few directories; a collection walks trees) ...
+pub(crate) const STAGING_READ_DIRS: usize = 10;
+/// ... and the same pid must have created this many distinct files in one staging directory.
+pub(crate) const STAGING_WRITE_FILES: u32 = 50;
+/// The window of all three counts.
+pub(crate) const STAGING_WINDOW_NS: u64 = 600_000_000_000; // 10 min
+/// Pids tracked by STAGING-DIR, for the reads and for the staging directories alike. Each
+/// entry holds up to 256 paths, so 256 pids stay near ten MB at the worst; a pid pushed out
+/// by 256 busier ones loses its history (counted in the map's eviction counter).
+pub(crate) const STAGING_PID_CAP: usize = 256;
+/// Temp roots whose subdirectories are staging places, as lowercase `/`-joined segments
+/// from the filesystem root (the drive of a Windows path left out). macOS per-user temp
+/// (`/var/folders/.../T/`) is a stated gap.
+pub(crate) const STAGING_TEMP_ROOTS: &[&str] = &[
+    "tmp",
+    "var/tmp",
+    "dev/shm",
+    "private/tmp",
+    "private/var/tmp",
+    "windows/temp",
+];
+/// Temp roots inside a profile, from the profile directory (`C:\Users\<u>\`).
+pub(crate) const STAGING_PROFILE_TEMP_ROOTS: &[&str] = &["appdata/local/temp"];
+/// Directory names that are never a staging place however hidden: a version-control store
+/// (`git add` of a large tree writes thousands of objects) and a program's cache. Path-based,
+/// not name-keyed on the process, so no evidence gate is needed. Stated gap: `~/.cache` is a
+/// place an attacker can stage in as well.
+pub(crate) const STAGING_EXCLUDED_DIR_NAMES: &[&str] = &[".git", ".cache", ".trash"];
+
 /// EGRESS-DOMAIN (T1567, #380): bytes one process sends to an address that its own DNS lookup
 /// resolved from a storage or paste service, inside [`EGRESS_WINDOW_NS`]. Far below
 /// [`EGRESS_BYTES_THRESHOLD`] because the destination is already what an exfiltration picks.

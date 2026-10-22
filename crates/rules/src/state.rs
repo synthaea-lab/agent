@@ -36,15 +36,17 @@ use crate::{
         SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS, SCAN_VERTICAL_THRESHOLD,
         SCAN_VERTICAL_WINDOW_NS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
         SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD,
-        SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STANDARD_PORTS,
-        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
-        TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
+        SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STAGING_PID_CAP,
+        STAGING_READ_DIRS, STAGING_READ_FILES, STAGING_WINDOW_NS, STAGING_WRITE_FILES,
+        STANDARD_PORTS, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN,
+        TASK_REGISTRATION_DEDUP_WINDOW_NS, TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
     },
     has_write_intent,
     rdp::RdpSuccessAfterFailures,
     session::SessionHijack,
     signature_gate::SignatureGatedAlert,
     sliding::{FlowPortDedup, SlidingCounter, SlidingDistinct, SlidingSum},
+    staging::{self, StagingDir, StagingReads},
     sudo::SudoSuccessAfterFailures,
 };
 
@@ -283,6 +285,13 @@ pub struct RuleState {
     staged_archives: BoundedMap<String, u64>,
     /// pid → the staged archive it read, until it connects out. LRU-bounded.
     archive_readers: BoundedMap<u32, ArchiveReader>,
+    /// pid → the distinct user-data files it opened for reading, for STAGING-DIR (T1074.001,
+    /// #380). LRU-bounded by [`STAGING_PID_CAP`].
+    staging_reads: BoundedMap<u32, StagingReads>,
+    /// (pid, directory) → the distinct files the pid created there, for STAGING-DIR. Only
+    /// staging directories are recorded (see [`staging::staging_dir`]). LRU-bounded by
+    /// [`STAGING_PID_CAP`].
+    staging_dirs: BoundedMap<(u32, String), StagingDir>,
     /// pid → the lineage it was exec'd under, for the rules that see a process later
     /// (SSH-FANOUT reads it on the process's connects). LRU-bounded.
     exec_lineage: BoundedMap<u32, crate::recon::ExecLineage>,
@@ -500,6 +509,8 @@ impl RuleState {
             archive_writers: BoundedMap::new(COUNTER_CAP),
             staged_archives: BoundedMap::new(COUNTER_CAP),
             archive_readers: BoundedMap::new(COUNTER_CAP),
+            staging_reads: BoundedMap::new(STAGING_PID_CAP),
+            staging_dirs: BoundedMap::new(STAGING_PID_CAP),
             scan_spread: BoundedMap::new(COUNTER_CAP),
             scan_vertical: BoundedMap::new(COUNTER_CAP),
             recon_burst: BoundedMap::new(COUNTER_CAP),
@@ -2097,7 +2108,106 @@ impl RuleState {
         alerts.extend(self.record_create(event));
         self.record_downloader_write(event);
         self.record_archive_open(event);
+        alerts.extend(self.check_staging_dir(event));
         alerts
+    }
+
+    /// STAGING-DIR (T1074.001, #380) — one pid reads at least [`STAGING_READ_FILES`] distinct
+    /// user-data files spread over [`STAGING_READ_DIRS`] directories and creates at least
+    /// [`STAGING_WRITE_FILES`] distinct files in one staging directory (a subdirectory of a
+    /// temp root or a hidden directory, see [`staging::staging_dir`]), all inside
+    /// [`STAGING_WINDOW_NS`]. One alert per directory and window. Medium: the shape is also a
+    /// folder copy, a backup tool and an indexer, and no allowlist of those exists yet (it
+    /// needs a lab capture of the host's ordinary copies and builds).
+    ///
+    /// The evaluation runs on a create, so the last read must precede the last create it
+    /// counts: a copy loop that interleaves reads and creates qualifies, a sweep that reads
+    /// everything and then creates fewer than the threshold does not. `FileWriteEvent`
+    /// carries no path, so the creating `open` is the signal, never a byte count: a staging
+    /// file written to by another pid, or opened without `O_CREAT`, is a stated gap, and so
+    /// is a collection that stages in `~/.cache` or a macOS per-user temp directory. The
+    /// reader and the creator must be the same pid: `tar | gzip` style pipelines spread the
+    /// two over processes and are not seen.
+    fn check_staging_dir(&mut self, event: &FileOpenEvent) -> Option<Alert> {
+        let meta = &event.meta;
+        let ts = meta.timestamp_ns;
+        if !has_write_intent(event.flags) {
+            self.record_staging_read(meta, ts, &event.path);
+            return None;
+        }
+        if event.flags & O_CREAT == 0 {
+            return None;
+        }
+        let dir = staging::staging_dir(&event.path)?;
+        let key = (meta.pid, dir.clone());
+        if self
+            .staging_dirs
+            .peek(&key)
+            .is_some_and(|d| !same_incarnation(d.generation, meta.process_generation))
+        {
+            self.staging_dirs.remove(&key);
+        }
+        let entry = self.staging_dirs.get_or_insert_with(key, || StagingDir {
+            generation: meta.process_generation,
+            files: SlidingDistinct::default(),
+        });
+        let created = entry
+            .files
+            .record(event.path.clone(), ts, STAGING_WINDOW_NS);
+        if created < STAGING_WRITE_FILES {
+            return None;
+        }
+        let (read_files, read_dirs) = self.staging_read_summary(meta, ts)?;
+        let entry = self.staging_dirs.get_mut(&(meta.pid, dir.clone()))?;
+        if !entry.files.try_alert(ts, STAGING_WINDOW_NS) {
+            return None;
+        }
+        Some(Alert {
+            technique: "T1074.001",
+            severity: Severity::Medium,
+            message: format!(
+                "pid={} comm={} read {read_files} user files from {read_dirs} directories and created {created} files in the staging directory /{dir}",
+                meta.pid, meta.comm,
+            ),
+        })
+    }
+
+    /// STAGING-DIR, read half: remembers a user-data file the pid opened without write intent.
+    fn record_staging_read(&mut self, meta: &schema::EventMeta, ts: u64, path: &str) {
+        let Some((file, _)) = staging::user_data_file(path) else {
+            return;
+        };
+        if self
+            .staging_reads
+            .peek(&meta.pid)
+            .is_some_and(|r| !same_incarnation(r.generation, meta.process_generation))
+        {
+            self.staging_reads.remove(&meta.pid);
+        }
+        self.staging_reads
+            .get_or_insert_with(meta.pid, || StagingReads {
+                generation: meta.process_generation,
+                files: SlidingDistinct::default(),
+            })
+            .files
+            .record(file, ts, STAGING_WINDOW_NS);
+    }
+
+    /// STAGING-DIR: how many distinct user files, over how many directories, the pid read in
+    /// the window — `None` when that is below the read thresholds.
+    fn staging_read_summary(&mut self, meta: &schema::EventMeta, ts: u64) -> Option<(u32, usize)> {
+        let reads = self.staging_reads.get_mut(&meta.pid)?;
+        if !same_incarnation(reads.generation, meta.process_generation) {
+            return None;
+        }
+        let files = reads.files.count(ts, STAGING_WINDOW_NS);
+        let dirs: std::collections::HashSet<&str> = reads
+            .files
+            .values()
+            .filter_map(|f| f.rsplit_once('/').map(|(dir, _)| dir))
+            .collect();
+        (files >= STAGING_READ_FILES && dirs.len() >= STAGING_READ_DIRS)
+            .then_some((files, dirs.len()))
     }
 
     /// The image the pid was exec'd from, else its parent's: a child that forked and never
