@@ -38,9 +38,15 @@
 //! [`zone_identifier`].
 //! Deleting that stream (the mark removed, T1553.005) is reported as a
 //! `schema::FileDeleteEvent` of the stream path (#442).
+//!
+//! BITS jobs (#284): `Microsoft-Windows-Bits-Client` records, reported as
+//! `schema::BitsJobEvent` with the job's client process as the actor (BITS
+//! does the network I/O from its own service), Microsoft update jobs dropped
+//! — see [`bits`].
 
 #[cfg(any(windows, test))]
 mod amsi;
+pub mod bits;
 #[cfg(any(windows, test))]
 mod budget;
 #[cfg(windows)]

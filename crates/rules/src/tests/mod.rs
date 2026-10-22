@@ -308,6 +308,8 @@ fn policy_denial_event_full(
     }
 }
 
+mod bits;
+
 /// Like [`policy_denial_event_full`], with an explicit `action` (#813): the other
 /// helper's many callers don't care about it (it defaults to `None` via
 /// `schema::fixtures::policy_denial()`), so it stays a 5-argument helper and this one
