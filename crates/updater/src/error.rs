@@ -116,6 +116,18 @@ pub enum UpdaterError {
     )]
     RotationNotYetValid { issued_at: u64, now: u64 },
 
+    /// The file that records the applied key rotations exists but cannot be trusted: it does not
+    /// parse, one of its rotations does not verify under the embedded `recovery` key, they are not
+    /// in increasing `release_version` order, or they do not lead from this build's embedded keys.
+    /// Refused rather than ignored: a file that exists proves a rotation happened, and falling
+    /// back to the embedded keys could re-trust a key that was rotated away from.
+    #[error("the key-rotation record is not trustworthy: {reason}")]
+    TrustStateCorrupt { reason: String },
+
+    /// The install already holds [`crate::trust_state::MAX_ROTATIONS`] rotations.
+    #[error("this install already holds the maximum of {0} recorded key rotations")]
+    TrustStateFull(usize),
+
     /// Filesystem I/O failed — the underlying [`std::io::Error`] carries the
     /// specifics (missing permissions, disk full, etc).
     #[error("I/O error on {path}: {source}")]

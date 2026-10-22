@@ -36,6 +36,7 @@ dependencies = [
  "ml",
  "policy",
  "response",
+ "ring",
  "rules",
  "schema",
  "sensor-linux",

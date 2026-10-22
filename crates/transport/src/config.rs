@@ -190,6 +190,14 @@ impl TransportConfig {
         format!("{}/api/release/manifest", self.server_url)
     }
 
+    /// Returns the full URL of the key-rotation manifest the control plane offers this agent
+    /// (ADR-0027): a manifest signed by the offline `recovery` key, or 404 when none is pending.
+    /// The control-plane side is a separate slice; the agent verifies whatever it is given.
+    #[must_use]
+    pub fn key_rotation_url(&self) -> String {
+        format!("{}/api/release/key-rotation", self.server_url)
+    }
+
     /// Returns the base URL for the release artifact download endpoint. The
     /// `release_version`, `path` and `sha256` query parameters are added by the
     /// caller through [`crate::TransportClient::get_bytes`], which percent-encodes

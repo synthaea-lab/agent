@@ -48,6 +48,18 @@ pub struct TrustedKeys {
     pub content: [u8; 32],
 }
 
+impl TrustedKeys {
+    /// The keys this build embeds, `None` unless both are provisioned: a rotation replaces a key
+    /// it can name, so nothing rotates from a half-provisioned trust set.
+    #[must_use]
+    pub fn embedded() -> Option<Self> {
+        Some(Self {
+            release: (*crate::key::RELEASE_PUBLIC_KEY)?,
+            content: (*crate::key::CONTENT_PUBLIC_KEY)?,
+        })
+    }
+}
+
 /// A signed key-rotation manifest. Field order is alphabetical and fixed by declaration:
 /// canonicalization depends on it, exactly like [`crate::ReleaseManifest`]. A role is rotated when
 /// its `new_*_key` and `retired_*_key` are both present, and both must be, so the manifest always
@@ -118,7 +130,7 @@ impl KeyRotationManifest {
         self.signature = hex_encode(sig.as_ref());
     }
 
-    fn release_change(&self) -> Result<RoleChange, UpdaterError> {
+    pub(crate) fn release_change(&self) -> Result<RoleChange, UpdaterError> {
         role_change(
             &self.retired_release_key,
             &self.new_release_key,
@@ -126,7 +138,7 @@ impl KeyRotationManifest {
         )
     }
 
-    fn content_change(&self) -> Result<RoleChange, UpdaterError> {
+    pub(crate) fn content_change(&self) -> Result<RoleChange, UpdaterError> {
         role_change(
             &self.retired_content_key,
             &self.new_content_key,
@@ -190,7 +202,10 @@ impl KeyRotationManifest {
         self.verify_signature_with(RECOVERY_PUBLIC_KEY.as_ref())
     }
 
-    fn verify_signature_with(&self, recovery: Option<&[u8; 32]>) -> Result<(), UpdaterError> {
+    pub(crate) fn verify_signature_with(
+        &self,
+        recovery: Option<&[u8; 32]>,
+    ) -> Result<(), UpdaterError> {
         self.validate()?;
         let recovery = recovery.ok_or(UpdaterError::SigningKeyUnprovisioned)?;
         let signature = hex_decode(&self.signature).ok_or(UpdaterError::SignatureInvalid)?;
@@ -269,7 +284,7 @@ impl KeyRotationManifest {
         )
     }
 
-    fn verify_with(
+    pub(crate) fn verify_with(
         &self,
         recovery: Option<&[u8; 32]>,
         current: &TrustedKeys,

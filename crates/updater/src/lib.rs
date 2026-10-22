@@ -35,6 +35,7 @@ pub mod layout;
 pub mod manifest;
 pub mod rotation;
 pub mod snapshot;
+pub mod trust_state;
 
 pub use content::{ContentEntry, ContentManifest};
 pub use error::UpdaterError;
