@@ -233,6 +233,11 @@ impl<T: PartialEq> SlidingDistinct<T> {
         self.entries.len() as u32
     }
 
+    /// The values currently in the window, oldest first.
+    pub(crate) fn values(&self) -> impl Iterator<Item = &T> {
+        self.entries.iter().map(|(value, _)| value)
+    }
+
     /// One alert per window: true (and remembers) unless one already fired within
     /// the window. Same contract as `SlidingCounter::try_alert`.
     pub(crate) fn try_alert(&mut self, ts: u64, window_ns: u64) -> bool {

@@ -5,9 +5,10 @@
 //! - `Image`, `CommandLine`, and `ParentImage` fields mapped onto [`schema::ExecEvent`]
 //!   (`ParentImage` uses the lineage field sensors fill when they can — a rule using it
 //!   simply never matches events without lineage)
-//! - Simple `selection` conditions (implicit AND between fields, OR between values),
-//!   keyword lists
-//! - `contains`/`startswith`/`endswith` modifiers and `*` wildcards at start/end
+//! - Simple `selection` conditions (implicit AND between fields, OR between values by default;
+//!   `|all` requires every listed value to match), keyword lists
+//! - `contains`/`startswith`/`endswith` modifiers, optionally followed by `|all`, and `*`
+//!   wildcards at start/end; case-only duplicate field specs are refused
 //! - `condition: selection` only
 //!
 //! Anything outside the subset is rejected **loudly at load time** — a rule with an

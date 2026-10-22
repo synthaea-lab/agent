@@ -20,3 +20,4 @@ tracing = { workspace = true }
 schema = { path = "../schema", features = ["test-fixtures"] }
 serde_json = { workspace = true }
 tempfile = "3"
+proptest = "1"
