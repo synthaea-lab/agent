@@ -232,3 +232,46 @@ fn a_samples_file_with_an_unknown_field_or_a_missing_half_is_refused() {
     );
     assert!(load_samples(&rule).is_ok());
 }
+
+#[test]
+fn the_local_and_remote_shell_service_rules_split_on_the_unc_argument() {
+    const LOCAL: &str = "Service created with a command-shell binary path";
+    const REMOTE: &str = "Remote service created with a command-shell binary path";
+    let engine = SigmaEngine::load_dir(&content_dir()).unwrap();
+    let titles = |cmdline: &str| -> Vec<String> {
+        let sample = Sample {
+            image: "C:\\Windows\\System32\\sc.exe".into(),
+            cmdline: cmdline.into(),
+            parentimage: None,
+            note: None,
+        };
+        engine
+            .eval_exec(&exec(&sample))
+            .into_iter()
+            .map(|alert| alert.title)
+            .collect()
+    };
+    // Every covered launcher form: a local create with a drive path raises the local rule
+    // only (`C:\` has one backslash, the remote test needs two); the same create against
+    // `\\lab` raises both.
+    for launcher in [
+        "cmd.exe /c",
+        "cmd /c",
+        "cmd.exe /k",
+        "cmd /k",
+        "powershell.exe -c",
+        "pwsh.exe -c",
+        "%COMSPEC% /c",
+    ] {
+        let local = titles(&format!(
+            r#"sc.exe create L binPath= "{launcher} C:\ProgramData\x.cmd""#
+        ));
+        assert!(local.iter().any(|t| t == LOCAL), "{launcher}: {local:?}");
+        assert!(!local.iter().any(|t| t == REMOTE), "{launcher}: {local:?}");
+        let remote = titles(&format!(
+            r#"sc.exe \\lab create L binPath= "{launcher} C:\ProgramData\x.cmd""#
+        ));
+        assert!(remote.iter().any(|t| t == LOCAL), "{launcher}: {remote:?}");
+        assert!(remote.iter().any(|t| t == REMOTE), "{launcher}: {remote:?}");
+    }
+}
