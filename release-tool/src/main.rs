@@ -13,6 +13,14 @@
 //! release-tool public-key --key-file release.key
 //! ```
 //!
+//! A key rotation (ADR-0027) is signed by the offline `recovery` key and by nothing else:
+//!
+//! ```text
+//! release-tool rotation --release-version 9 --reason "scheduled" \
+//!     --new-release-key <hex> --retire-release-key <hex> --out rotation.json
+//! release-tool sign --kind rotation --pkcs11 ... rotation.json --out rotation-signed.json
+//! ```
+//!
 //! Production keys sign from a PKCS#11 token (ADR-0027 decision 2): the private key never
 //! leaves the device and the tool only sends it the bytes to sign.
 //!
@@ -31,6 +39,7 @@ mod keyfile;
 mod manifest_dir;
 mod pkcs11;
 mod roll_forward;
+mod rotation;
 mod sign;
 mod signer;
 
@@ -85,6 +94,37 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Build an unsigned key-rotation manifest: a new `release` and/or `content` key and the key
+    /// each replaces, to be signed with the `recovery` key (`sign --kind rotation`).
+    Rotation {
+        /// Like any release: strictly greater than the highest release or rotation applied.
+        #[arg(long)]
+        release_version: u64,
+        /// The new `release` key, 64 lowercase hex characters.
+        #[arg(long, requires = "retire_release_key")]
+        new_release_key: Option<String>,
+        /// The `release` key the agents trust now and this replaces.
+        #[arg(long, requires = "new_release_key")]
+        retire_release_key: Option<String>,
+        /// The new `content` key, 64 lowercase hex characters.
+        #[arg(long, requires = "retire_content_key")]
+        new_content_key: Option<String>,
+        /// The `content` key the agents trust now and this replaces.
+        #[arg(long, requires = "new_content_key")]
+        retire_content_key: Option<String>,
+        /// Why, for the audit trail (`scheduled`, `suspected exposure of the release key`, ...).
+        #[arg(long)]
+        reason: String,
+        /// How long the rotation stays applicable after it is issued, in days (at most 30).
+        #[arg(long, default_value_t = 7)]
+        valid_for_days: u64,
+        /// Unix seconds when it is issued; now when absent. Fixed for a reproducible manifest.
+        #[arg(long)]
+        issued_at: Option<u64>,
+        /// Write here instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Sign a manifest file.
     Sign {
         /// Which manifest shape the file holds.
@@ -132,6 +172,11 @@ struct KeySource {
     #[cfg(feature = "test-key")]
     #[arg(long)]
     test_key: bool,
+    /// The public, checked-in test `recovery` key, for `sign --kind rotation` in a lab. Same
+    /// warning as `--test-key`.
+    #[cfg(feature = "test-key")]
+    #[arg(long)]
+    test_recovery_key: bool,
 }
 
 /// Where the key is on the token, with `--pkcs11`.
@@ -169,9 +214,12 @@ impl KeySource {
             eprintln!(
                 "warning: signing with the PUBLIC test key; this release is for a lab, not for production"
             );
-            Ok(Box::new(
-                signer::FileKey::new(updater::key::test_key_pair()),
-            ))
+            let key_pair = if self.test_recovery_key {
+                updater::key::test_recovery_key_pair()
+            } else {
+                updater::key::test_key_pair()
+            };
+            Ok(Box::new(signer::FileKey::new(key_pair)))
         }
         #[cfg(not(feature = "test-key"))]
         {
@@ -262,6 +310,55 @@ fn main() -> anyhow::Result<()> {
                         .with_context(|| format!("cannot read {}", from.display()))?,
                 )?;
                 report_change(&roll_forward::compare(&earlier, &now), now.release_version);
+            }
+            emit(&serde_json::to_string_pretty(&manifest)?, out.as_ref())
+        }
+        Command::Rotation {
+            release_version,
+            new_release_key,
+            retire_release_key,
+            new_content_key,
+            retire_content_key,
+            reason,
+            valid_for_days,
+            issued_at,
+            out,
+        } => {
+            let issued_at = match issued_at {
+                Some(at) => at,
+                None => std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .context("the clock is before 1970")?
+                    .as_secs(),
+            };
+            let manifest = rotation::build(rotation::Request {
+                release_version,
+                release: new_release_key.zip(retire_release_key),
+                content: new_content_key.zip(retire_content_key),
+                reason,
+                issued_at,
+                valid_for_secs: valid_for_days.saturating_mul(24 * 60 * 60),
+            })?;
+            eprintln!(
+                "unsigned key rotation v{release_version}, valid until {}; sign it with the \
+                 recovery key: `release-tool sign --kind rotation`",
+                manifest.expires_at
+            );
+            for (role, retired, new) in [
+                (
+                    "release",
+                    &manifest.retired_release_key,
+                    &manifest.new_release_key,
+                ),
+                (
+                    "content",
+                    &manifest.retired_content_key,
+                    &manifest.new_content_key,
+                ),
+            ] {
+                if let (Some(retired), Some(new)) = (retired, new) {
+                    eprintln!("  {role}: {retired} (retired) -> {new} (new)");
+                }
             }
             emit(&serde_json::to_string_pretty(&manifest)?, out.as_ref())
         }

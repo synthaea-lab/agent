@@ -93,6 +93,29 @@ pub enum UpdaterError {
     #[error("snapshot artifact does not match its manifest: {0}")]
     SnapshotArtifactMismatch(String),
 
+    /// A key-rotation manifest is not well formed (ADR-0027): it names no key, half a pair, a key
+    /// that is not canonical hex, a window that is empty or too long, or its result would break
+    /// the split between roles. Checked before its signature is trusted for anything.
+    #[error("key-rotation manifest is malformed: {0}")]
+    RotationMalformed(&'static str),
+
+    /// A key-rotation manifest retires a key that is not the one this install trusts for `role`:
+    /// a replay, or a manifest written for another key state.
+    #[error(
+        "key-rotation manifest does not apply: it retires a {role} key this install does not trust"
+    )]
+    RotationDoesNotApply { role: &'static str },
+
+    /// A key-rotation manifest is past its `expires_at`.
+    #[error("key-rotation manifest expired at {expires_at} (now {now})")]
+    RotationExpired { expires_at: u64, now: u64 },
+
+    /// A key-rotation manifest is dated beyond now plus the clock-skew tolerance.
+    #[error(
+        "key-rotation manifest issued at {issued_at} is dated beyond now ({now}) plus the tolerance"
+    )]
+    RotationNotYetValid { issued_at: u64, now: u64 },
+
     /// Filesystem I/O failed — the underlying [`std::io::Error`] carries the
     /// specifics (missing permissions, disk full, etc).
     #[error("I/O error on {path}: {source}")]
