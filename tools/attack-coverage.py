@@ -156,6 +156,8 @@ TECHNIQUE_TACTIC = {
     "T1552.001": "Credential Access",
     "T1552.004": "Credential Access",
     "T1553.005": "Defense Evasion",
+    "T1555.001": "Credential Access",
+    "T1555.003": "Credential Access",
     "T1562.001": "Defense Evasion",
     "T1562.004": "Defense Evasion",
     "T1571": "Command and Control",

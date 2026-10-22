@@ -1861,7 +1861,9 @@ impl RuleState {
 
     /// CREDENTIAL-READ (#377), on the file opens of a Unix host: T1003.008 for the shadow files,
     /// T1552.004 for an SSH private key, T1552.001 for the other credential files of a home
-    /// directory (see `credfiles` for the paths and what the sensor cannot see).
+    /// directory, and on macOS T1555.001 for a keychain database and T1555.003 for a browser's
+    /// saved-login and cookie stores (see `credfiles` for the paths and what the sensor cannot
+    /// see).
     ///
     /// Only a read counts: a write-only open (`ssh-keygen` writing a key, `passwd` rewriting
     /// the file) is not one. Who may read differs by file, because who legitimately does
@@ -1871,14 +1873,17 @@ impl RuleState {
     ///   an administrator's `cat`, a backup or integrity tool (`tar`, `rsync`, `rpm -V`,
     ///   AIDE) and a PAM service the list lacks look the same, and none is excluded here
     ///   because each is also what an attacker runs.
-    /// - A **home credential file** has no fixed list: `python3` with `boto3`, `terraform`,
+    /// - A **home credential file, keychain or browser store** has no fixed list: `python3` with `boto3`, `terraform`,
     ///   `kubectl`, `git` and `ssh` all read their own, from `/usr/bin`. So a read alerts only
     ///   when the reader is *unexpected* in a way the telemetry can show: a web or database
     ///   service (or a child of one), or a binary run from outside the system directories
     ///   (`/tmp`, a home directory, `/dev/shm`). Not caught: a system binary (`cat`, `tar`) run
     ///   by an intruder, and a tool a developer installed under their home (`~/.local/bin`,
     ///   `~/go/bin`) alerts although it is theirs, its own credentials read by its own
-    ///   binary. Both are the price of not alerting on every `aws` call.
+    ///   binary. Both are the price of not alerting on every `aws` call. On macOS the Apple
+    ///   daemons that read a keychain and the browsers installed in `/Applications` run from
+    ///   the system directories, so they should stay quiet (not observed on a Mac); a browser
+    ///   installed under `~/Applications` alerts on its own store.
     ///
     /// One alert per (pid, kind) per [`CREDENTIAL_READ_ALERT_WINDOW_NS`]. No file content and
     /// no command line goes into the message, only the path the process asked for.
@@ -1892,7 +1897,10 @@ impl RuleState {
         let why = match kind {
             CredFile::Shadow if credfiles::is_auth_stack(comm, image) => return None,
             CredFile::Shadow => "outside the authentication stack",
-            CredFile::PrivateKey | CredFile::HomeCredentials => {
+            CredFile::PrivateKey
+            | CredFile::HomeCredentials
+            | CredFile::Keychain
+            | CredFile::BrowserStore => {
                 if self.reader_under_service(&event.meta) {
                     "a web or database service or its child"
                 } else if credfiles::image_outside_system_dirs(image) {

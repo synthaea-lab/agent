@@ -18,6 +18,10 @@ pub(crate) enum CredFile {
     PrivateKey,
     /// Cloud, registry, VCS and database credentials kept in a home directory: T1552.001.
     HomeCredentials,
+    /// A macOS keychain database: T1555.001.
+    Keychain,
+    /// A macOS browser's saved logins, cookies or autofill store: T1555.003.
+    BrowserStore,
 }
 
 /// Named constants, not literals inside a `match`: `tools/attack-coverage.py` reads a
@@ -25,6 +29,8 @@ pub(crate) enum CredFile {
 const SHADOW_TECHNIQUE: &str = "T1003.008";
 const PRIVATE_KEY_TECHNIQUE: &str = "T1552.004";
 const HOME_CREDENTIALS_TECHNIQUE: &str = "T1552.001";
+const KEYCHAIN_TECHNIQUE: &str = "T1555.001";
+const BROWSER_STORE_TECHNIQUE: &str = "T1555.003";
 
 impl CredFile {
     pub(crate) fn technique(self) -> &'static str {
@@ -32,6 +38,8 @@ impl CredFile {
             Self::Shadow => SHADOW_TECHNIQUE,
             Self::PrivateKey => PRIVATE_KEY_TECHNIQUE,
             Self::HomeCredentials => HOME_CREDENTIALS_TECHNIQUE,
+            Self::Keychain => KEYCHAIN_TECHNIQUE,
+            Self::BrowserStore => BROWSER_STORE_TECHNIQUE,
         }
     }
 }
@@ -59,6 +67,152 @@ const HOME_CREDENTIAL_FILES: &[&[&str]] = &[
     &[".config", "gcloud", "credentials.db"],
     &[".config", "gcloud", "application_default_credentials.json"],
 ];
+
+/// A macOS keychain database, below `/Users/<user>` as segments (`*` is any one segment):
+/// the login keychain in both of its formats, and the data-protection keychain, which lives in
+/// a per-device directory.
+const MACOS_KEYCHAIN_FILES: &[&[&str]] = &[
+    &["Library", "Keychains", "login.keychain-db"],
+    &["Library", "Keychains", "login.keychain"],
+    &["Library", "Keychains", "*", "keychain-2.db"],
+];
+
+/// A macOS browser's store of saved logins, cookies and autofill data, below `/Users/<user>`
+/// (`*` is any one segment: the profile). The Chromium family shares the file names; Firefox
+/// keeps the logins and the key that decrypts them apart.
+const MACOS_BROWSER_STORES: &[&[&str]] = &[
+    &[
+        "Library",
+        "Application Support",
+        "Google",
+        "Chrome",
+        "*",
+        "Login Data",
+    ],
+    &[
+        "Library",
+        "Application Support",
+        "Google",
+        "Chrome",
+        "*",
+        "Login Data For Account",
+    ],
+    &[
+        "Library",
+        "Application Support",
+        "Google",
+        "Chrome",
+        "*",
+        "Cookies",
+    ],
+    &[
+        "Library",
+        "Application Support",
+        "Google",
+        "Chrome",
+        "*",
+        "Network",
+        "Cookies",
+    ],
+    &[
+        "Library",
+        "Application Support",
+        "Google",
+        "Chrome",
+        "*",
+        "Web Data",
+    ],
+    &[
+        "Library",
+        "Application Support",
+        "Microsoft Edge",
+        "*",
+        "Login Data",
+    ],
+    &[
+        "Library",
+        "Application Support",
+        "Microsoft Edge",
+        "*",
+        "Cookies",
+    ],
+    &[
+        "Library",
+        "Application Support",
+        "Microsoft Edge",
+        "*",
+        "Network",
+        "Cookies",
+    ],
+    &[
+        "Library",
+        "Application Support",
+        "BraveSoftware",
+        "Brave-Browser",
+        "*",
+        "Login Data",
+    ],
+    &[
+        "Library",
+        "Application Support",
+        "BraveSoftware",
+        "Brave-Browser",
+        "*",
+        "Cookies",
+    ],
+    &[
+        "Library",
+        "Application Support",
+        "BraveSoftware",
+        "Brave-Browser",
+        "*",
+        "Network",
+        "Cookies",
+    ],
+    &[
+        "Library",
+        "Application Support",
+        "Chromium",
+        "*",
+        "Login Data",
+    ],
+    &["Library", "Application Support", "Chromium", "*", "Cookies"],
+    &[
+        "Library",
+        "Application Support",
+        "Firefox",
+        "Profiles",
+        "*",
+        "logins.json",
+    ],
+    &[
+        "Library",
+        "Application Support",
+        "Firefox",
+        "Profiles",
+        "*",
+        "key4.db",
+    ],
+    &[
+        "Library",
+        "Application Support",
+        "Firefox",
+        "Profiles",
+        "*",
+        "cookies.sqlite",
+    ],
+];
+
+/// Whether `rest` is one of `patterns`, where a `*` pattern segment matches any one segment.
+fn matches_any(patterns: &[&[&str]], rest: &[&str]) -> bool {
+    patterns.iter().any(|pattern| {
+        pattern.len() == rest.len()
+            && pattern
+                .iter()
+                .zip(rest)
+                .all(|(p, segment)| *p == "*" || p == segment)
+    })
+}
 
 /// The path as the kernel resolves it for the cheap aliases, or `None` for a relative one.
 fn normalize(path: &str) -> Option<Vec<&str>> {
@@ -90,6 +244,7 @@ pub(crate) fn classify(path: &str) -> Option<CredFile> {
     let segments = normalize(path)?;
     match segments.as_slice() {
         ["etc", "shadow" | "gshadow" | "shadow-" | "gshadow-"] => Some(CredFile::Shadow),
+        ["Library", "Keychains", "System.keychain"] => Some(CredFile::Keychain),
         ["root", rest @ ..] => classify_in_home(rest),
         ["home" | "Users", user, rest @ ..] if !user.is_empty() => classify_in_home(rest),
         _ => None,
@@ -101,6 +256,12 @@ fn classify_in_home(rest: &[&str]) -> Option<CredFile> {
         && PRIVATE_KEY_NAMES.contains(name)
     {
         return Some(CredFile::PrivateKey);
+    }
+    if matches_any(MACOS_KEYCHAIN_FILES, rest) {
+        return Some(CredFile::Keychain);
+    }
+    if matches_any(MACOS_BROWSER_STORES, rest) {
+        return Some(CredFile::BrowserStore);
     }
     HOME_CREDENTIAL_FILES
         .contains(&rest)
@@ -273,6 +434,43 @@ mod tests {
             classify("/home/alice//.aws/./credentials"),
             Some(CredFile::HomeCredentials)
         );
+    }
+
+    #[test]
+    fn macos_keychains_and_browser_stores_classify_by_kind() {
+        for path in [
+            "/Users/bob/Library/Keychains/login.keychain-db",
+            "/Users/bob/Library/Keychains/login.keychain",
+            "/Users/bob/Library/Keychains/6F1B2C3D-0000-4000-8000-000000000001/keychain-2.db",
+            "/Library/Keychains/System.keychain",
+        ] {
+            assert_eq!(classify(path), Some(CredFile::Keychain), "{path}");
+        }
+        for path in [
+            "/Users/bob/Library/Application Support/Google/Chrome/Default/Login Data",
+            "/Users/bob/Library/Application Support/Google/Chrome/Profile 2/Network/Cookies",
+            "/Users/bob/Library/Application Support/Microsoft Edge/Default/Login Data",
+            "/Users/bob/Library/Application Support/BraveSoftware/Brave-Browser/Default/Cookies",
+            "/Users/bob/Library/Application Support/Firefox/Profiles/ab12.default/key4.db",
+            "/Users/bob/Library/Application Support/Firefox/Profiles/ab12.default/logins.json",
+        ] {
+            assert_eq!(classify(path), Some(CredFile::BrowserStore), "{path}");
+        }
+    }
+
+    #[test]
+    fn macos_neighbours_of_the_keychain_and_browser_stores_do_not_classify() {
+        for path in [
+            "/Users/bob/Library/Keychains/login.keychain-db.bak",
+            "/Users/bob/Library/Keychains",
+            "/Users/bob/Library/Keychains/x/y/keychain-2.db",
+            "/Users/bob/Library/Application Support/Google/Chrome/Default/Bookmarks",
+            "/Users/bob/Library/Application Support/Google/Chrome/Default/History",
+            "/Users/bob/Library/Application Support/Firefox/Profiles/ab12.default/places.sqlite",
+            "/Users/bob/Library/Application Support/Google/Chrome/Login Data",
+        ] {
+            assert_eq!(classify(path), None, "{path}");
+        }
     }
 
     #[test]
