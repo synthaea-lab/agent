@@ -161,7 +161,7 @@ ring = "0.17"
 # Workspace config: default-features = false (no auto-download).
 # The ml crate's default "dynamic-onnx" feature re-enables download-binaries for dev builds.
 # Production builds: cargo build --no-default-features (static linking per ADR-0002).
-ort = { version = "=2.0.0-rc.13", default-features = false }
+ort = { version = "=2.0.0-rc.15", default-features = false }
 
 [workspace.metadata.deb]
 # Shared .deb packaging configuration (issue #36)
