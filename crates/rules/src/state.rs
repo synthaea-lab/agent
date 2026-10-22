@@ -9,11 +9,10 @@ use std::{
 
 use schema::{
     AuthEvent, AuthKind, AuthOutcome, BitsJobEvent, BitsJobState, ConnectEvent, DnsQueryEvent,
-    Event, ExecEvent,
-    FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FileDeleteEvent, FileOpenEvent, FileQuarantineEvent,
-    FileRenameEvent, FileWriteEvent, ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT,
-    POLICY_MECHANISM_SELINUX, PolicyDenialEvent, SessionEvent, SessionState, User,
-    detection::Severity,
+    Event, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FileDeleteEvent, FileOpenEvent,
+    FileQuarantineEvent, FileRenameEvent, FileWriteEvent, ListenPortEvent, MemfdCreateEvent,
+    NetworkFlowEvent, O_CREAT, POLICY_MECHANISM_SELINUX, PolicyDenialEvent, SessionEvent,
+    SessionState, User, detection::Severity,
 };
 use store::BoundedMap;
 
