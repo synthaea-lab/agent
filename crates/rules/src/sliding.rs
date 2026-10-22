@@ -233,6 +233,13 @@ impl<T: PartialEq> SlidingDistinct<T> {
         self.entries.len() as u32
     }
 
+    /// Prunes expired entries and returns how many distinct values remain, without
+    /// recording anything.
+    pub(crate) fn count(&mut self, ts: u64, window_ns: u64) -> u32 {
+        self.prune(ts, window_ns);
+        self.entries.len() as u32
+    }
+
     /// The values currently in the window, oldest first.
     pub(crate) fn values(&self) -> impl Iterator<Item = &T> {
         self.entries.iter().map(|(value, _)| value)
@@ -277,6 +284,20 @@ mod tests {
         // Past the window relative to "a" and "b" — both should be pruned,
         // leaving only the new value.
         assert_eq!(counter.record("c", 20_000_000_000, 10_000_000_000), 1);
+    }
+
+    #[test]
+    fn count_prunes_without_recording() {
+        let mut counter = SlidingDistinct::default();
+        counter.record("a", 0, 10_000_000_000);
+        counter.record("b", 6_000_000_000, 10_000_000_000);
+        assert_eq!(counter.count(9_000_000_000, 10_000_000_000), 2);
+        assert_eq!(
+            counter.count(12_000_000_000, 10_000_000_000),
+            1,
+            "\"a\" is 12 s old and leaves the window; counting adds nothing"
+        );
+        assert_eq!(counter.count(20_000_000_000, 10_000_000_000), 0);
     }
 
     const WINDOW_NS: u64 = 5_000_000_000; // matches RANSOMWARE_RENAME_WINDOW_NS

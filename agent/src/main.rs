@@ -66,6 +66,7 @@ mod quarantine_cmd;
 mod ransomware_join;
 mod redact;
 mod release;
+mod rotation;
 mod shutdown;
 mod silence;
 #[cfg_attr(
@@ -133,9 +134,9 @@ enum Command {
         #[arg(long)]
         enable_readline_capture: bool,
         /// Enables DNS resolution capture via a `getaddrinfo(3)` uprobe (issue
-        /// #267 Phase 1): query name + first resolved address, for DNS-based
-        /// C2/tunneling/exfiltration visibility. Off by default, sensitive TLDs
-        /// redacted. Linux only.
+        /// #267 Phase 1/#458): query name + up to eight ordered resolved addresses
+        /// (truncation is marked), for DNS-based C2/tunneling/exfiltration visibility.
+        /// Off by default, sensitive TLDs redacted. Linux only.
         #[arg(long)]
         enable_dns_capture: bool,
         /// Control-plane base URL, overriding `server.control_plane_url` from
@@ -300,6 +301,38 @@ enum Command {
         #[arg(long)]
         allow_test_key: bool,
     },
+    /// Fetches the key rotation the control plane offers (or reads one with `--file`), verifies
+    /// it against the embedded `recovery` key and the keys this install trusts now, and records
+    /// it under `storage.state_dir`: from then on `apply-release`, `apply-content-manifest` and
+    /// the integrity check verify against the rotated keys (ADR-0027). Nothing is recorded unless
+    /// every check passes.
+    ApplyKeyRotation {
+        /// A rotation manifest file, instead of asking the control plane (offline and lab
+        /// installs).
+        #[arg(long, conflicts_with_all = ["server", "cert", "key"])]
+        file: Option<std::path::PathBuf>,
+        /// Control-plane base URL. Left unset (and without `--file`), the command uses
+        /// `server.control_plane_url` and the `server.mtls_cert`/`mtls_key` pair from `agent.toml`.
+        #[arg(long)]
+        server: Option<String>,
+        /// Path to the client mTLS certificate (PEM), overriding the config's.
+        #[arg(long)]
+        cert: Option<std::path::PathBuf>,
+        /// Path to the client mTLS private key (PEM). Required alongside `--cert`.
+        #[arg(long)]
+        key: Option<std::path::PathBuf>,
+        /// PEM bundle of the CA(s) that signed the server's certificate, for a control plane on
+        /// a private CA.
+        #[arg(long)]
+        ca_cert: Option<std::path::PathBuf>,
+        /// Acknowledge that this build verifies rotations against the public test `recovery`
+        /// key, so anyone who can serve the rotation route could replace the keys releases are
+        /// verified against (ADR-0027). Exists only in a `test-key` build, for lab and
+        /// development use.
+        #[cfg(feature = "test-key")]
+        #[arg(long)]
+        allow_test_key: bool,
+    },
     /// Lists or restores payloads automated quarantine moved aside (issue #25).
     /// The quarantine directory is derived from `--alerts` exactly as `run`
     /// derives it, so pass the same path the running agent was given.
@@ -428,6 +461,7 @@ fn try_main() -> anyhow::Result<std::process::ExitCode> {
             cert.as_deref(),
             key.as_deref(),
             content::resolve_ca_cert(ca_cert, &cfg.server).as_deref(),
+            &cfg.storage.state_dir,
             &state,
         ),
         Command::ApplyContentManifest {
@@ -444,7 +478,7 @@ fn try_main() -> anyhow::Result<std::process::ExitCode> {
             #[cfg(not(feature = "test-key"))]
             let allow_test_key = false;
             // Before any path, config or network work, as for `apply-release`.
-            trust::ensure_content_key_trusted(allow_test_key)?;
+            trust::ensure_content_key_trusted(&cfg.storage.state_dir, allow_test_key)?;
             let (content_dir, state) =
                 content::resolve_content_paths(&cfg.storage.state_dir, content_dir, state)?;
             let ring = content::resolve_ring(ring, &cfg.updates)?;
@@ -459,6 +493,7 @@ fn try_main() -> anyhow::Result<std::process::ExitCode> {
                 &endpoint,
                 &ring,
                 &content_dir,
+                &cfg.storage.state_dir,
                 &state,
                 &cfg.ipc.endpoint,
             )?;
@@ -466,6 +501,31 @@ fn try_main() -> anyhow::Result<std::process::ExitCode> {
                 exit_code = std::process::ExitCode::from(apply_exit_status(outcome) as u8);
             }
             Ok(())
+        }
+        Command::ApplyKeyRotation {
+            file,
+            server,
+            cert,
+            key,
+            ca_cert,
+            #[cfg(feature = "test-key")]
+            allow_test_key,
+        } => {
+            #[cfg(not(feature = "test-key"))]
+            let allow_test_key = false;
+            let endpoint = content::resolve_endpoint(
+                server,
+                cert,
+                key,
+                content::resolve_ca_cert(ca_cert, &cfg.server),
+                &cfg.server,
+            );
+            let source = match &file {
+                Some(path) => rotation::Source::File(path),
+                None => rotation::Source::Server(&endpoint),
+            };
+            rotation::cmd_apply_key_rotation(&source, &cfg.storage.state_dir, allow_test_key)
+                .map(|_| ())
         }
         Command::Quarantine { alerts, action } => match action {
             QuarantineAction::List => {

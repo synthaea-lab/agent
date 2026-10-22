@@ -49,14 +49,16 @@
 //! `sudo`'s — they're separate maps for exactly that reason, not just because
 //! they key on different things.
 
-use std::collections::VecDeque;
-
 use schema::detection::Severity;
 use store::BoundedMap;
 
+// The tests of this module read the cap the shared join enforces.
+#[cfg(test)]
+use crate::failure_join::ALERTED_WINDOWS_CAP;
 use crate::{
     Alert,
     exclusions::{SUDO_SUCCESS_AFTER_FAILURES_THRESHOLD, SUDO_SUCCESS_AFTER_FAILURES_WINDOW_NS},
+    failure_join::{History, JoinParams},
 };
 
 /// Distinct accounts tracked per map; the least recently seen goes first.
@@ -65,25 +67,18 @@ const TARGETS_CAP: usize = 4_096;
 const FAILURES_PER_TARGET_CAP: usize = 256;
 /// Successes kept per account until a failure can still complete their join.
 const SUCCESSES_PER_TARGET_CAP: usize = 8;
-/// Alerted windows remembered per account.
-const ALERTED_WINDOWS_CAP: usize = 16;
 
-struct Success {
-    timestamp_ns: u64,
-    alerted: bool,
-}
+/// What the shared join ([`crate::failure_join`]) is given for `sudo` and `su`: the same for
+/// both, which differ only in their key and their technique.
+const PARAMS: JoinParams = JoinParams {
+    window_ns: SUDO_SUCCESS_AFTER_FAILURES_WINDOW_NS,
+    threshold: SUDO_SUCCESS_AFTER_FAILURES_THRESHOLD as usize,
+    failures_cap: FAILURES_PER_TARGET_CAP,
+    successes_cap: SUCCESSES_PER_TARGET_CAP,
+};
 
-#[derive(Default)]
-struct Target {
-    /// Failure timestamps, oldest first.
-    failures: VecDeque<u64>,
-    /// Successes, oldest first.
-    successes: VecDeque<Success>,
-    /// The fixed windows (`timestamp / window`) an alert already fired for — see
-    /// [`crate::rdp::Source::alerted_windows`]'s doc for why these are fixed
-    /// slots, not "within a window of the last alert".
-    alerted_windows: VecDeque<u64>,
-}
+/// One account's history; a success carries nothing the alert needs.
+type Target = History<()>;
 
 /// Per-account history that joins a privilege-escalation success to the
 /// authentication failures before it. See the module doc for why `sudo` and
@@ -109,8 +104,12 @@ impl SudoSuccessAfterFailures {
         let target = self
             .targets
             .get_or_insert_with(invoker_uid, Target::default);
-        insert_sorted(&mut target.failures, timestamp_ns, FAILURES_PER_TARGET_CAP);
-        target.join(&format!("sudo invoker_uid={invoker_uid}"), SUDO_TECHNIQUE)
+        target.record_failure(timestamp_ns, &PARAMS);
+        join(
+            target,
+            &format!("sudo invoker_uid={invoker_uid}"),
+            SUDO_TECHNIQUE,
+        )
     }
 
     /// A `sudo` privilege-escalation success by `invoker_uid` at `timestamp_ns`.
@@ -118,8 +117,12 @@ impl SudoSuccessAfterFailures {
         let target = self
             .targets
             .get_or_insert_with(invoker_uid, Target::default);
-        target.record_success(timestamp_ns);
-        target.join(&format!("sudo invoker_uid={invoker_uid}"), SUDO_TECHNIQUE)
+        target.record_success(timestamp_ns, (), &PARAMS);
+        join(
+            target,
+            &format!("sudo invoker_uid={invoker_uid}"),
+            SUDO_TECHNIQUE,
+        )
     }
 
     /// An `su` authentication failure against `target_name` at `timestamp_ns`.
@@ -128,8 +131,8 @@ impl SudoSuccessAfterFailures {
         let target = self
             .su_targets
             .get_or_insert_with(target_name.to_string(), Target::default);
-        insert_sorted(&mut target.failures, timestamp_ns, FAILURES_PER_TARGET_CAP);
-        target.join(&format!("su target={target_name}"), SU_TECHNIQUE)
+        target.record_failure(timestamp_ns, &PARAMS);
+        join(target, &format!("su target={target_name}"), SU_TECHNIQUE)
     }
 
     /// An `su` privilege-escalation success into `target_name` at `timestamp_ns`.
@@ -137,8 +140,8 @@ impl SudoSuccessAfterFailures {
         let target = self
             .su_targets
             .get_or_insert_with(target_name.to_string(), Target::default);
-        target.record_success(timestamp_ns);
-        target.join(&format!("su target={target_name}"), SU_TECHNIQUE)
+        target.record_success(timestamp_ns, (), &PARAMS);
+        join(target, &format!("su target={target_name}"), SU_TECHNIQUE)
     }
 }
 
@@ -150,78 +153,22 @@ const SUDO_TECHNIQUE: &str = "T1548.003";
 /// repeated failures is password guessing, not sudo caching.
 const SU_TECHNIQUE: &str = "T1110.001";
 
-/// Inserts `value` keeping `deque` sorted, dropping the oldest past `cap`.
-fn insert_sorted(deque: &mut VecDeque<u64>, value: u64, cap: usize) {
-    let at = deque.partition_point(|&t| t <= value);
-    deque.insert(at, value);
-    if deque.len() > cap {
-        deque.pop_front();
-    }
-}
-
-impl Target {
-    /// Records a not-yet-alerted success at `timestamp_ns`, oldest first,
-    /// dropping the oldest past the cap.
-    fn record_success(&mut self, timestamp_ns: u64) {
-        let at = self
-            .successes
-            .partition_point(|s| s.timestamp_ns <= timestamp_ns);
-        self.successes.insert(
-            at,
-            Success {
-                timestamp_ns,
-                alerted: false,
-            },
-        );
-        if self.successes.len() > SUCCESSES_PER_TARGET_CAP {
-            self.successes.pop_front();
-        }
-    }
-
-    /// Every remembered success that now has enough failures in the window
-    /// ending at it, once per window — see [`crate::rdp::Source::join`]'s doc,
-    /// this is the same join, keyed differently. `account` is the precomputed,
-    /// analyst-facing label for the alert (e.g. `"sudo invoker_uid=1001"` or
-    /// `"su target=root"` — see the callers above); `technique` is
-    /// [`SUDO_TECHNIQUE`] or [`SU_TECHNIQUE`] depending on which called. This
-    /// method has no opinion on what either means, same as before.
-    fn join(&mut self, account: &str, technique: &'static str) -> Vec<Alert> {
-        let mut alerts = Vec::new();
-        for success in &mut self.successes {
-            if success.alerted {
-                continue;
-            }
-            let from = success
-                .timestamp_ns
-                .saturating_sub(SUDO_SUCCESS_AFTER_FAILURES_WINDOW_NS);
-            let count = self
-                .failures
-                .iter()
-                .filter(|&&t| t >= from && t <= success.timestamp_ns)
-                .count();
-            let window = success.timestamp_ns / SUDO_SUCCESS_AFTER_FAILURES_WINDOW_NS;
-            let recent = self.alerted_windows.contains(&window);
-            if count >= SUDO_SUCCESS_AFTER_FAILURES_THRESHOLD as usize && !recent {
-                success.alerted = true;
-                self.alerted_windows.push_back(window);
-                if self.alerted_windows.len() > ALERTED_WINDOWS_CAP {
-                    self.alerted_windows.pop_front();
-                }
-                alerts.push(Alert {
-                    technique,
-                    severity: Severity::Medium,
-                    message: format!(
-                        "{account}: a local privilege escalation succeeded after {count} \
-                         failed authentications for that account in {}s: guessed or \
-                         sprayed credentials worked, or a shared account under sustained \
-                         attempts",
-                        SUDO_SUCCESS_AFTER_FAILURES_WINDOW_NS / 1_000_000_000,
-                    ),
-                });
-            }
-        }
-        alerts
-    }
+/// The alert of every success the shared join completes. `account` is the precomputed,
+/// analyst-facing label (e.g. `"sudo invoker_uid=1001"` or `"su target=root"`); `technique` is
+/// [`SUDO_TECHNIQUE`] or [`SU_TECHNIQUE`] depending on which called. The join has no opinion on
+/// what either means.
+fn join(target: &mut Target, account: &str, technique: &'static str) -> Vec<Alert> {
+    target.join(&PARAMS, |_, count| Alert {
+        technique,
+        severity: Severity::Medium,
+        message: format!(
+            "{account}: a local privilege escalation succeeded after {count} \
+             failed authentications for that account in {}s: guessed or \
+             sprayed credentials worked, or a shared account under sustained \
+             attempts",
+            SUDO_SUCCESS_AFTER_FAILURES_WINDOW_NS / 1_000_000_000,
+        ),
+    })
 }
 
 #[cfg(test)]

@@ -4,6 +4,13 @@
 //! production key yet cannot verify anything, so it says so instead of failing at the
 //! signature.
 
+use std::path::{Path, PathBuf};
+
+use updater::{
+    key::{CONTENT_PUBLIC_KEY, RECOVERY_PUBLIC_KEY, RELEASE_PUBLIC_KEY, SYNTHAEA_UPDATER_TEST_KEY},
+    trust_state::{TRUST_STATE_FILE, TrustState},
+};
+
 /// What a manifest is verified for, to word the refusal.
 #[derive(Clone, Copy)]
 pub(crate) enum Manifest {
@@ -11,6 +18,65 @@ pub(crate) enum Manifest {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Release,
     Content,
+    /// A key rotation, verified against the `recovery` key.
+    Rotation,
+}
+
+/// The keys this install trusts now (ADR-0027): the embedded ones, then the key rotations it
+/// applied, replayed and re-verified from the record under the state directory
+/// ([`updater::trust_state`]). Loaded where the verification happens, never cached across
+/// commands, so a rotation applied by another process is in force at the next check.
+// The release key, the shared counter and the lineage are read by `apply-release` and the
+// integrity check, which are Linux-only (ADR-0015 Deferred).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Keys {
+    /// Verifies binary release manifests; `None` when no `release` key is provisioned.
+    pub(crate) release: Option<[u8; 32]>,
+    /// Verifies content manifests; `None` when no `content` key is provisioned.
+    pub(crate) content: Option<[u8; 32]>,
+    /// The highest `release_version` of a rotation applied here: releases share its counter.
+    pub(crate) applied_release_version: Option<u64>,
+    /// Every `release` key this install has trusted, for re-checking a manifest that was
+    /// promoted under an earlier one.
+    pub(crate) release_lineage: Vec<[u8; 32]>,
+    release_rotated: bool,
+    content_rotated: bool,
+}
+
+/// Where the record of applied rotations lives for a given state directory.
+pub(crate) fn record_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(TRUST_STATE_FILE)
+}
+
+/// The keys in force under `state_dir`. No record is a fresh install: the embedded keys.
+///
+/// # Errors
+///
+/// A record that exists and cannot be trusted ([`updater::UpdaterError::TrustStateCorrupt`]) or
+/// read: refused rather than answered with the embedded keys, which may have been rotated away
+/// from. The operator removes the file on purpose, knowing what that re-trusts.
+pub(crate) fn load(state_dir: &Path) -> anyhow::Result<Keys> {
+    let record = TrustState::load(&record_path(state_dir))?;
+    if record.is_empty() {
+        return Ok(Keys {
+            release: *RELEASE_PUBLIC_KEY,
+            content: *CONTENT_PUBLIC_KEY,
+            applied_release_version: None,
+            release_lineage: RELEASE_PUBLIC_KEY.iter().copied().collect(),
+            release_rotated: false,
+            content_rotated: false,
+        });
+    }
+    let resolved = record.resolve()?;
+    Ok(Keys {
+        release: Some(resolved.keys.release),
+        content: Some(resolved.keys.content),
+        applied_release_version: resolved.applied_release_version,
+        release_lineage: resolved.release_lineage,
+        release_rotated: resolved.release_rotated,
+        content_rotated: resolved.content_rotated,
+    })
 }
 
 impl Manifest {
@@ -20,6 +86,10 @@ impl Manifest {
             Self::Content => {
                 "anyone who can serve the content routes could weaken detection with forged rules"
             }
+            Self::Rotation => {
+                "anyone who can serve the rotation route could replace the keys releases are \
+                 verified against, and then get code run as root"
+            }
         }
     }
 
@@ -27,6 +97,7 @@ impl Manifest {
         match self {
             Self::Release => "releases",
             Self::Content => "content",
+            Self::Rotation => "key rotations",
         }
     }
 }
@@ -77,32 +148,58 @@ pub(crate) fn ensure_key_trusted(
     Ok(())
 }
 
-/// [`ensure_key_trusted`] for this build's release key. Used by `apply-release`, which is
-/// Linux-only (ADR-0015 Deferred).
+/// [`ensure_key_trusted`] for the release key in force under `state_dir`. Used by
+/// `apply-release`, which is Linux-only (ADR-0015 Deferred). Returns the keys it checked.
 ///
 /// # Errors
 ///
-/// As [`ensure_key_trusted`].
+/// As [`ensure_key_trusted`], or the record of rotations cannot be trusted ([`load`]).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn ensure_release_key_trusted(allow_test_key: bool) -> anyhow::Result<()> {
+pub(crate) fn ensure_release_key_trusted(
+    state_dir: &Path,
+    allow_test_key: bool,
+) -> anyhow::Result<Keys> {
+    let keys = load(state_dir)?;
     ensure_key_trusted(
         Manifest::Release,
-        updater::key::SYNTHAEA_UPDATER_TEST_KEY,
-        updater::key::RELEASE_PUBLIC_KEY.is_some(),
+        SYNTHAEA_UPDATER_TEST_KEY && !keys.release_rotated,
+        keys.release.is_some(),
         allow_test_key,
-    )
+    )?;
+    Ok(keys)
 }
 
-/// [`ensure_key_trusted`] for this build's content key.
+/// [`ensure_key_trusted`] for the content key in force under `state_dir`. Returns the keys it
+/// checked.
+///
+/// # Errors
+///
+/// As [`ensure_key_trusted`], or the record of rotations cannot be trusted ([`load`]).
+pub(crate) fn ensure_content_key_trusted(
+    state_dir: &Path,
+    allow_test_key: bool,
+) -> anyhow::Result<Keys> {
+    let keys = load(state_dir)?;
+    ensure_key_trusted(
+        Manifest::Content,
+        SYNTHAEA_UPDATER_TEST_KEY && !keys.content_rotated,
+        keys.content.is_some(),
+        allow_test_key,
+    )?;
+    Ok(keys)
+}
+
+/// [`ensure_key_trusted`] for the `recovery` key, which signs key rotations. It is never
+/// rotated, so it is the embedded one.
 ///
 /// # Errors
 ///
 /// As [`ensure_key_trusted`].
-pub(crate) fn ensure_content_key_trusted(allow_test_key: bool) -> anyhow::Result<()> {
+pub(crate) fn ensure_recovery_key_trusted(allow_test_key: bool) -> anyhow::Result<()> {
     ensure_key_trusted(
-        Manifest::Content,
-        updater::key::SYNTHAEA_UPDATER_TEST_KEY,
-        updater::key::CONTENT_PUBLIC_KEY.is_some(),
+        Manifest::Rotation,
+        SYNTHAEA_UPDATER_TEST_KEY,
+        RECOVERY_PUBLIC_KEY.is_some(),
         allow_test_key,
     )
 }
@@ -113,7 +210,7 @@ mod tests {
 
     #[test]
     fn the_public_test_key_is_refused_without_the_acknowledgement() {
-        for manifest in [Manifest::Release, Manifest::Content] {
+        for manifest in [Manifest::Release, Manifest::Content, Manifest::Rotation] {
             let err = ensure_key_trusted(manifest, true, true, false)
                 .unwrap_err()
                 .to_string();

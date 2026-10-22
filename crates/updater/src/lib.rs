@@ -33,11 +33,14 @@ pub mod key;
 #[cfg(target_os = "linux")]
 pub mod layout;
 pub mod manifest;
+pub mod rotation;
 pub mod snapshot;
+pub mod trust_state;
 
 pub use content::{ContentEntry, ContentManifest};
 pub use error::UpdaterError;
 pub use manifest::ReleaseManifest;
+pub use rotation::KeyRotationManifest;
 pub use snapshot::SnapshotManifest;
 
 /// Rolls back from a release that failed its health check (ADR-0015 Decision 6):

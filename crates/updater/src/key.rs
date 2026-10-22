@@ -1,8 +1,8 @@
 //! The updater's embedded trust set: four Ed25519 public keys, each with one job
 //! (ADR-0027, ADR-0033). `release` verifies binary release manifests, `content` verifies content
 //! manifests, `snapshot` verifies the common-set snapshot manifest and nothing else (its custody
-//! is not decided, #753), `recovery` is held offline and reserved for a key-rotation release (its
-//! manifest shape is a later slice, so nothing verifies against it yet).
+//! is not decided, #753), `recovery` is held offline and reserved for a key-rotation release
+//! ([`crate::rotation`]).
 //!
 //! A production build embeds the keys in `crates/updater/keys/*.pub` (hex). Until the real
 //! keys are committed there those files say `unprovisioned`, the statics below are `None`,
@@ -55,6 +55,18 @@ const TEST_SNAPSHOT_SEED: [u8; 32] = [0x44; 32];
 pub fn test_snapshot_key_pair() -> Ed25519KeyPair {
     Ed25519KeyPair::from_seed_unchecked(&TEST_SNAPSHOT_SEED)
         .expect("TEST_SNAPSHOT_SEED is a fixed, valid 32-byte Ed25519 seed")
+}
+
+/// The test keypair that signs key rotations in tests and lab builds.
+///
+/// # Panics
+///
+/// Never: [`TEST_RECOVERY_SEED`] is a fixed, valid 32-byte Ed25519 seed.
+#[cfg(any(test, feature = "test-key"))]
+#[must_use]
+pub fn test_recovery_key_pair() -> Ed25519KeyPair {
+    Ed25519KeyPair::from_seed_unchecked(&TEST_RECOVERY_SEED)
+        .expect("TEST_RECOVERY_SEED is a fixed, valid 32-byte Ed25519 seed")
 }
 
 /// The test keypair that signs releases and content in tests and lab builds.
@@ -133,7 +145,8 @@ pub static CONTENT_PUBLIC_KEY: LazyLock<Option<[u8; 32]>> =
 pub static SNAPSHOT_PUBLIC_KEY: LazyLock<Option<[u8; 32]>> =
     LazyLock::new(|| embedded(Role::Snapshot, include_str!("../keys/snapshot.pub")));
 
-/// The offline key that will sign key rotations (ADR-0027). Nothing verifies against it yet.
+/// The offline key that signs key rotations (ADR-0027) and nothing else:
+/// [`crate::rotation::KeyRotationManifest`] verifies against it. `None` when no key is provisioned.
 pub static RECOVERY_PUBLIC_KEY: LazyLock<Option<[u8; 32]>> =
     LazyLock::new(|| embedded(Role::Recovery, include_str!("../keys/recovery.pub")));
 

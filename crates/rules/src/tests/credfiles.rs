@@ -333,6 +333,77 @@ fn a_macos_home_credential_file_is_classified_too() {
     );
 }
 
+// ── macOS: keychains and browser stores (T1555) ─────────────────────────────
+
+#[test]
+fn a_binary_outside_the_system_directories_reading_a_keychain_alerts() {
+    // One state each: a pid alerts once per kind of file per window.
+    for path in [
+        "/Users/bob/Library/Keychains/login.keychain-db",
+        "/Library/Keychains/System.keychain",
+    ] {
+        let mut state = state_with(&[(200, 1, "dump", "/private/tmp/dump")]);
+        assert_eq!(
+            techniques(&read(&mut state, 200, "dump", path)),
+            ["T1555.001"],
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn the_apple_daemon_reading_a_keychain_does_not_alert() {
+    let mut state = state_with(&[(200, 1, "securityd", "/usr/libexec/securityd")]);
+    let path = "/Users/bob/Library/Keychains/login.keychain-db";
+    assert!(read(&mut state, 200, "securityd", path).is_empty());
+}
+
+#[test]
+fn a_binary_outside_the_system_directories_reading_a_browser_store_alerts() {
+    for path in [
+        "/Users/bob/Library/Application Support/Google/Chrome/Default/Login Data",
+        "/Users/bob/Library/Application Support/Firefox/Profiles/ab12.default/key4.db",
+    ] {
+        let mut state = state_with(&[(200, 1, "stealer", "/Users/bob/Downloads/stealer")]);
+        assert_eq!(
+            techniques(&read(&mut state, 200, "stealer", path)),
+            ["T1555.003"],
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn the_browser_reading_its_own_store_from_applications_does_not_alert() {
+    let mut state = state_with(&[(
+        200,
+        1,
+        "Google Chrome",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    )]);
+    let path = "/Users/bob/Library/Application Support/Google/Chrome/Default/Login Data";
+    assert!(read(&mut state, 200, "Google Chrome", path).is_empty());
+}
+
+#[test]
+fn a_browser_history_or_bookmarks_read_does_not_alert() {
+    let mut state = state_with(&[(200, 1, "tool", "/private/tmp/tool")]);
+    for path in [
+        "/Users/bob/Library/Application Support/Google/Chrome/Default/History",
+        "/Users/bob/Library/Application Support/Google/Chrome/Default/Bookmarks",
+        "/Users/bob/Library/Keychains/login.keychain-db.bak",
+    ] {
+        assert!(read(&mut state, 200, "tool", path).is_empty(), "{path}");
+    }
+}
+
+#[test]
+fn opening_a_keychain_write_only_is_not_a_read() {
+    let mut state = state_with(&[(200, 1, "dump", "/private/tmp/dump")]);
+    let path = "/Users/bob/Library/Keychains/login.keychain-db";
+    assert!(open(&mut state, 200, 1, "dump", path, O_WRONLY, 0).is_empty());
+}
+
 // ── bounded state ──────────────────────────────────────────────────────────
 
 #[test]

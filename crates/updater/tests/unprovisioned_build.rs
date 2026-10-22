@@ -63,3 +63,29 @@ fn a_content_manifest_is_refused_as_unprovisioned_when_no_key_is_embedded() {
         Err(UpdaterError::SigningKeyUnprovisioned)
     ));
 }
+
+#[test]
+fn a_key_rotation_is_refused_as_unprovisioned_when_no_recovery_key_is_embedded() {
+    use updater::{KeyRotationManifest, rotation::ROTATION_SCHEMA_VERSION};
+
+    let mut rotation = KeyRotationManifest {
+        expires_at: 1_760_000_000 + 3600,
+        issued_at: 1_760_000_000,
+        new_content_key: None,
+        new_release_key: Some("aa".repeat(32)),
+        reason: "scheduled".into(),
+        release_version: 9,
+        retired_content_key: None,
+        retired_release_key: Some("bb".repeat(32)),
+        schema_version: ROTATION_SCHEMA_VERSION,
+        signature: String::new(),
+    };
+    let key = some_key_pair();
+    rotation
+        .sign_with(|message| Ok::<_, ()>(key.sign(message).as_ref().to_vec()))
+        .unwrap();
+    assert!(matches!(
+        rotation.verify_signature(),
+        Err(UpdaterError::SigningKeyUnprovisioned)
+    ));
+}

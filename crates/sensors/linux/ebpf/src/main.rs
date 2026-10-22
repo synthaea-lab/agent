@@ -17,10 +17,10 @@ use sensor_linux_wire::{
     BpfEvent, CapSetEvent, ConnectEvent, ExecEvent, FileChmodEvent, FileChownEvent,
     FileDeleteEvent, FileOpenEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
     FileWriteEvent, GetAddrInfoEvent, IdentityChangeEvent, KernelModuleEvent, LineageEntry,
-    MAX_TLS_CAPTURE, MemfdCreateEvent, MountEvent, NamespaceEvent, PrctlEvent, ProcessVmReadEvent,
-    ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, SignalEvent, SocketAcceptEvent,
-    SocketBindEvent, SocketCreateEvent, SocketListenEvent, TASK_COMM_LEN, TlsCaptureEvent,
-    UdpRecvEvent, UdpSendEvent, is_filtered_path,
+    MAX_DNS_ANSWERS, MAX_TLS_CAPTURE, MemfdCreateEvent, MountEvent, NamespaceEvent, PrctlEvent,
+    ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, SignalEvent,
+    SocketAcceptEvent, SocketBindEvent, SocketCreateEvent, SocketListenEvent, TASK_COMM_LEN,
+    TlsCaptureEvent, UdpRecvEvent, UdpSendEvent, is_filtered_path,
 };
 
 // Raw scheduler tracepoints expose task pointers instead of formatted event records.
@@ -4374,6 +4374,7 @@ static GETADDRINFO_ARGS: HashMap<u64, (u64, u64)> = HashMap::with_max_entries(10
 /// this sensor doesn't target 32-bit userspace processes.
 const ADDRINFO_FAMILY_OFFSET: u64 = 4;
 const ADDRINFO_ADDR_PTR_OFFSET: u64 = 24;
+const ADDRINFO_NEXT_OFFSET: u64 = 40;
 
 /// `sockaddr_in`/`sockaddr_in6` field offsets: the address bytes start right
 /// after `sin_family`+`sin_port` (4 bytes) for IPv4, and after
@@ -4397,8 +4398,8 @@ pub fn getaddrinfo_entry(ctx: ProbeContext) -> u32 {
     0
 }
 
-/// Uretprobe on `getaddrinfo(3)` return: emits the query, the status, and —
-/// on success — the first resolved address.
+/// Uretprobe on `getaddrinfo(3)` return: emits the query, status, and a bounded
+/// answer set on success.
 #[uretprobe]
 pub fn getaddrinfo_exit(ctx: RetProbeContext) -> u32 {
     match try_getaddrinfo_exit(ctx) {
@@ -4417,55 +4418,131 @@ fn try_getaddrinfo_exit(ctx: RetProbeContext) -> Result<u32, u32> {
     };
     let _ = GETADDRINFO_ARGS.remove(&pid_tgid);
 
-    // Only the FIRST addrinfo entry is decoded — see this crate's
-    // WIRE_VERSION v12 changelog for why walking `ai_next` is deferred.
-    let mut addr_resolved = false;
-    let mut is_ipv6 = false;
-    let mut addr_v4 = [0u8; 4];
-    let mut addr_v6 = [0u8; 16];
-    if status == 0 && res_ptr_ptr != 0 {
-        let addrinfo_ptr = unsafe { bpf_probe_read_user(res_ptr_ptr as *const u64) }.unwrap_or(0);
-        if addrinfo_ptr != 0 {
-            let family = unsafe {
-                bpf_probe_read_user((addrinfo_ptr + ADDRINFO_FAMILY_OFFSET) as *const i32)
-            }
-            .unwrap_or(0);
-            let sockaddr_ptr = unsafe {
-                bpf_probe_read_user((addrinfo_ptr + ADDRINFO_ADDR_PTR_OFFSET) as *const u64)
-            }
-            .unwrap_or(0);
-            if sockaddr_ptr != 0 {
-                if family == i32::from(AF_INET) {
-                    if let Ok(addr) = unsafe {
-                        bpf_probe_read_user(
-                            (sockaddr_ptr + SOCKADDR_IN_ADDR_OFFSET) as *const [u8; 4],
-                        )
-                    } {
-                        addr_v4 = addr;
-                        addr_resolved = true;
-                    }
-                } else if family == i32::from(AF_INET6)
-                    && let Ok(addr) = unsafe {
-                        bpf_probe_read_user(
-                            (sockaddr_ptr + SOCKADDR_IN6_ADDR_OFFSET) as *const [u8; 16],
-                        )
-                    }
-                {
-                    addr_v6 = addr;
-                    is_ipv6 = true;
-                    addr_resolved = true;
+    // Build directly in per-CPU scratch: an answer array on the BPF stack made
+    // LLVM emit a 136-byte memset inside the bounded list walk, which the 6.6
+    // verifier expanded once per path until it exceeded its instruction limit.
+    let e = DNS_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
+    // SAFETY: `e` is the writable value for this CPU in a one-entry PerCpuArray.
+    // Clear it once before the walk so unused answers and query tail bytes cannot
+    // retain data from an earlier invocation on this CPU.
+    unsafe { core::ptr::write_bytes(e, 0, 1) };
+
+    let mut answer_count = 0usize;
+    let mut answers_truncated = false;
+
+    // Each match arm gives LLVM a constant destination slot. Assigning a
+    // `DnsAnswer` at a runtime index caused the BPF target to synthesize a
+    // per-answer memset; write into the existing map value instead.
+    macro_rules! copy_dns_answer {
+        ($slot:literal, $family:ident, $address_ptr:ident) => {{
+            // SAFETY: `e` points to this CPU's writable scratch map value and
+            // `$slot` is a compile-time index within the fixed [`MAX_DNS_ANSWERS`]-slot array.
+            unsafe { (*e).answers[$slot].family = $family as u8 };
+            if $family == i32::from(AF_INET) {
+                // SAFETY: `sockaddr_ptr` came from a user-memory read. The BPF
+                // helper validates the source and writes only four bytes to the
+                // statically indexed scratch address.
+                unsafe {
+                    bpf_probe_read_user_buf(
+                        $address_ptr as *const u8,
+                        &mut (&mut (*e).answers[$slot].address)[..4],
+                    )
+                }
+            } else {
+                // SAFETY: same user-pointer validation; destination is the full
+                // 16-byte field at a statically known map-value offset.
+                unsafe {
+                    bpf_probe_read_user_buf(
+                        $address_ptr as *const u8,
+                        &mut (*e).answers[$slot].address,
+                    )
                 }
             }
+        }};
+    }
+
+    if status == 0 && res_ptr_ptr != 0 {
+        let mut current = unsafe { bpf_probe_read_user(res_ptr_ptr as *const u64) }.unwrap_or(0);
+        // Keep this loop statically bounded. #429 showed that seemingly simple
+        // iterator/loop code can multiply verifier work or exceed its instruction
+        // budget across attached programs; no traversal runs beyond this cap.
+        for index in 0..MAX_DNS_ANSWERS {
+            if current == 0 {
+                break;
+            }
+
+            let Ok(family) =
+                (unsafe { bpf_probe_read_user((current + ADDRINFO_FAMILY_OFFSET) as *const i32) })
+            else {
+                break;
+            };
+            let Ok(sockaddr_ptr) = (unsafe {
+                bpf_probe_read_user((current + ADDRINFO_ADDR_PTR_OFFSET) as *const u64)
+            }) else {
+                break;
+            };
+            let Ok(next) =
+                (unsafe { bpf_probe_read_user((current + ADDRINFO_NEXT_OFFSET) as *const u64) })
+            else {
+                break;
+            };
+
+            if sockaddr_ptr != 0 && (family == i32::from(AF_INET) || family == i32::from(AF_INET6))
+            {
+                let address_offset = if family == i32::from(AF_INET) {
+                    SOCKADDR_IN_ADDR_OFFSET
+                } else {
+                    SOCKADDR_IN6_ADDR_OFFSET
+                };
+                let Some(address_ptr) = sockaddr_ptr.checked_add(address_offset) else {
+                    break;
+                };
+
+                let copied = match answer_count {
+                    0 => copy_dns_answer!(0, family, address_ptr),
+                    1 => copy_dns_answer!(1, family, address_ptr),
+                    2 => copy_dns_answer!(2, family, address_ptr),
+                    3 => copy_dns_answer!(3, family, address_ptr),
+                    4 => copy_dns_answer!(4, family, address_ptr),
+                    5 => copy_dns_answer!(5, family, address_ptr),
+                    6 => copy_dns_answer!(6, family, address_ptr),
+                    7 => copy_dns_answer!(7, family, address_ptr),
+                    8 => copy_dns_answer!(8, family, address_ptr),
+                    9 => copy_dns_answer!(9, family, address_ptr),
+                    10 => copy_dns_answer!(10, family, address_ptr),
+                    11 => copy_dns_answer!(11, family, address_ptr),
+                    12 => copy_dns_answer!(12, family, address_ptr),
+                    13 => copy_dns_answer!(13, family, address_ptr),
+                    14 => copy_dns_answer!(14, family, address_ptr),
+                    15 => copy_dns_answer!(15, family, address_ptr),
+                    16 => copy_dns_answer!(16, family, address_ptr),
+                    17 => copy_dns_answer!(17, family, address_ptr),
+                    18 => copy_dns_answer!(18, family, address_ptr),
+                    19 => copy_dns_answer!(19, family, address_ptr),
+                    20 => copy_dns_answer!(20, family, address_ptr),
+                    21 => copy_dns_answer!(21, family, address_ptr),
+                    22 => copy_dns_answer!(22, family, address_ptr),
+                    23 => copy_dns_answer!(23, family, address_ptr),
+                    _ => break,
+                };
+                if copied.is_err() {
+                    break;
+                }
+                answer_count += 1;
+            }
+
+            if index + 1 == MAX_DNS_ANSWERS {
+                answers_truncated = next != 0;
+                break;
+            }
+            current = next;
         }
     }
 
     let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
     let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
 
-    let e = DNS_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
     unsafe {
-        core::ptr::write_bytes(e, 0, 1);
-
         (*e).meta.pid = (pid_tgid >> 32) as u32;
         fill_lineage(&mut (*e).meta);
         (*e).meta.uid = uid_gid as u32;
@@ -4481,10 +4558,8 @@ fn try_getaddrinfo_exit(ctx: RetProbeContext) -> Result<u32, u32> {
             (*e).query_len = query.len() as u16;
         }
         (*e).status = status;
-        (*e).addr_resolved = addr_resolved;
-        (*e).is_ipv6 = is_ipv6;
-        (*e).addr_v4 = addr_v4;
-        (*e).addr_v6 = addr_v6;
+        (*e).answer_count = answer_count as u8;
+        (*e).answers_truncated = answers_truncated;
 
         if DNS_QUERY_EVENTS.output::<GetAddrInfoEvent>(&*e, 0).is_err() {
             warn!(

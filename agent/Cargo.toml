@@ -95,4 +95,5 @@ libc = "0.2"
 tempfile = "3"
 # Tests sign manifests with the public test key.
 updater = { path = "../crates/updater", features = ["test-key"] }
+ring = "0.17"
 schema = { path = "../crates/schema", features = ["test-fixtures"] }

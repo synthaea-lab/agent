@@ -104,6 +104,8 @@ pub fn dns_query() -> DnsQueryEvent {
         query: String::new(),
         qtype: 0,
         result: None,
+        results: Vec::new(),
+        results_truncated: false,
         status: 0,
     }
 }
