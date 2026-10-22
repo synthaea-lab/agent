@@ -188,6 +188,18 @@ pub(crate) const SCAN_SPREAD_THRESHOLD: u32 = 20;
 /// Sliding window for [`SCAN_SPREAD_THRESHOLD`].
 pub(crate) const SCAN_SPREAD_WINDOW_NS: u64 = 10_000_000_000; // 10s
 
+/// SCAN-VERTICAL threshold and window (T1046, #378): N distinct destination ports on one
+/// (pid, daddr) in X seconds — the vertical mirror of SCAN-SPREAD (one host, many ports,
+/// where SCAN-SPREAD is many hosts, one port). Same 20-in-10s as SCAN-SPREAD: a TCP connect
+/// scan covers hundreds of ports a second, and an ordinary client talks to a host on a
+/// handful of ports (a service and its dependencies, FTP data connections). Loopback
+/// destinations are not counted: a single-host stack (compose files, local exporters,
+/// IDE debuggers) connects to many local ports by design, and scanning localhost is a weak
+/// lateral signal. Calibration choice, not a measurement.
+pub(crate) const SCAN_VERTICAL_THRESHOLD: u32 = 20;
+/// Sliding window for [`SCAN_VERTICAL_THRESHOLD`].
+pub(crate) const SCAN_VERTICAL_WINDOW_NS: u64 = 10_000_000_000; // 10s
+
 /// RANSOMWARE-RENAME threshold and window (T1486): N renames by the same pid, each
 /// adding a new suffix onto its own old path (`document.docx` →
 /// `document.docx.locked`), in X seconds. 20-in-5s clears any plausible benign bulk

@@ -410,6 +410,7 @@ mod persistence;
 mod quarantine;
 mod rdp;
 mod recon;
+mod scan_vertical;
 mod session;
 mod sudo;
 mod tamper;

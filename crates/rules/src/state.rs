@@ -31,11 +31,12 @@ use crate::{
         PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES, POLICY_DENIAL_ALERT_CAP,
         QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX,
         RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD,
-        SCAN_SPREAD_WINDOW_NS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
-        SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD,
-        SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STANDARD_PORTS,
-        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
-        TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
+        SCAN_SPREAD_WINDOW_NS, SCAN_VERTICAL_THRESHOLD, SCAN_VERTICAL_WINDOW_NS,
+        SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS,
+        SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS,
+        SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN,
+        SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS, TOUCHED_FILES_PER_PID,
+        TOUCHED_FILES_PID_CAP,
     },
     has_write_intent,
     rdp::RdpSuccessAfterFailures,
@@ -237,6 +238,9 @@ pub struct RuleState {
     /// [`FlowPortDedup`]'s doc); `on_connect`'s discrete syscall trace needs no
     /// dedup, each `ConnectEvent` already is one real connection attempt.
     beacon_flow_dedup: BoundedMap<(String, String, u16), FlowPortDedup>,
+    /// (pid, daddr) → distinct destination ports, for SCAN-VERTICAL (T1046, #378).
+    /// LRU-bounded.
+    scan_vertical: BoundedMap<(u32, IpAddr), SlidingDistinct<u16>>,
     /// Lineage → the discovery commands it ran inside the window, for RECON-BURST
     /// (T1057/T1082/T1016/T1087, #378). LRU-bounded.
     recon_burst: BoundedMap<crate::recon::Lineage, crate::recon::ReconWindow>,
@@ -466,6 +470,7 @@ impl RuleState {
             staged_archives: BoundedMap::new(COUNTER_CAP),
             archive_readers: BoundedMap::new(COUNTER_CAP),
             scan_spread: BoundedMap::new(COUNTER_CAP),
+            scan_vertical: BoundedMap::new(COUNTER_CAP),
             recon_burst: BoundedMap::new(COUNTER_CAP),
             recon_wrappers: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
@@ -1014,6 +1019,37 @@ impl RuleState {
         None
     }
 
+    /// SCAN-VERTICAL (T1046, #378): many distinct ports on one host from one pid in a short
+    /// window, the vertical mirror of [`Self::check_scan_spread`] (many hosts, one port). A
+    /// TCP connect scan of a target; the horizontal rule cannot see it, as it keys on the
+    /// port. Loopback destinations are not counted (see [`SCAN_VERTICAL_THRESHOLD`]). Only
+    /// pid 4 (Windows System) is excluded, as in SCAN-SPREAD.
+    fn check_scan_vertical(&mut self, event: &ConnectEvent) -> Option<Alert> {
+        if event.meta.pid == 4 || event.daddr.is_loopback() || event.daddr.is_unspecified() {
+            return None;
+        }
+        let ts = event.meta.timestamp_ns;
+        let entry = self
+            .scan_vertical
+            .get_or_insert_with((event.meta.pid, event.daddr), SlidingDistinct::default);
+        let distinct = entry.record(event.dport, ts, SCAN_VERTICAL_WINDOW_NS);
+        if distinct >= SCAN_VERTICAL_THRESHOLD && entry.try_alert(ts, SCAN_VERTICAL_WINDOW_NS) {
+            return Some(Alert {
+                technique: "T1046",
+                severity: Severity::Medium,
+                message: format!(
+                    "pid={} comm={} contacted {distinct} distinct ports on {} in {}s — \
+                     suspected port scan",
+                    event.meta.pid,
+                    event.meta.comm,
+                    event.daddr,
+                    SCAN_VERTICAL_WINDOW_NS / 1_000_000_000,
+                ),
+            });
+        }
+        None
+    }
+
     /// T1071/T1041 via conntrack polling (issue #92) — same rule as
     /// [`Self::check_beacon`], fed by a periodic flow snapshot instead of a discrete
     /// `connect()` trace. This is the "probe-free" source `sensor-linux-netlink`
@@ -1139,6 +1175,7 @@ impl RuleState {
     pub fn on_connect(&mut self, event: &ConnectEvent) -> Vec<Alert> {
         let mut alerts: Vec<Alert> = self.check_beacon(event).into_iter().collect();
         alerts.extend(self.check_scan_spread(event));
+        alerts.extend(self.check_scan_vertical(event));
         alerts.extend(self.check_archive_egress(&event.meta, event.daddr));
         alerts
     }
