@@ -846,7 +846,7 @@ SynthaeaPreCreate (
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
-    // This records a successful delete-on-close request, not the later final
+    // The post-op reports an accepted delete-on-close request, not the later
     // removal that occurs when the last handle is closed.
     if (InterlockedCompareExchange( &SynthaeaFilterData.Connected, 0, 0 ) == 0) {
         InterlockedIncrement64( &SynthaeaFilterData.NotConnected );
@@ -866,10 +866,6 @@ SynthaeaPreCreate (
                                    FltGetRequestorProcessId( Data ),
                                    (ULONGLONG)(ULONG_PTR)PsGetCurrentThreadId() );
     FltReleaseFileNameInformation( nameInfo );
-    if (event == NULL) {
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
-    }
-
     *CompletionContext = event;
     return FLT_PREOP_SUCCESS_WITH_CALLBACK;
 }
@@ -984,10 +980,6 @@ SynthaeaPreSetInformation (
     if (oldName != NULL) {
         FltReleaseFileNameInformation( oldName );
     }
-    if (event == NULL) {
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
-    }
-
     *CompletionContext = event;
     return FLT_PREOP_SUCCESS_WITH_CALLBACK;
 }
