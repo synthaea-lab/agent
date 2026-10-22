@@ -483,25 +483,45 @@ pub(crate) const BROWSERS: &[&str] = &[
     "vivaldi.exe",
 ];
 
-/// New-shape alerts POLICY-DENIAL-DRIFT raises per [`POLICY_DENIAL_ALERT_WINDOW_NS`] (#812):
+/// New-shape alerts POLICY-DENIAL-DRIFT raises **per subject type** per
+/// [`POLICY_DENIAL_ALERT_WINDOW_NS`] (#812, per subject since #840):
 /// `known_policy_denials` bounds the rule's memory of what it has seen, not its alert
-/// volume, so a flood of distinct shapes (varying the subject/object type faster than a
-/// real host ever would) could otherwise emit one alert per shape, unbounded. The key is
-/// (mechanism, subject context, object context, object class, action); since #813 added
-/// the requested permission set to it, one (type, type, class) triple produces one shape
-/// per permission set the kernel denies for it, not one shape overall.
+/// volume, so a flood of distinct shapes (one domain probing thousands of object types)
+/// could otherwise emit one alert per shape, unbounded. The key is (mechanism, subject
+/// context, object context, object class, action); since #813 added the requested
+/// permission set to it, one (type, type, class) triple produces one shape per permission set
+/// the kernel denies for it, not one shape overall.
+///
+/// The budget belongs to the subject's type (`user:role:type`, see
+/// [`POLICY_DENIAL_SUBJECT_CAP`]): one noisy domain (`httpd_t` probing 512 types) spends its own
+/// budget and nobody else's, so the first new shape of an untouched domain still alerts
+/// (#840; it used to be one counter for the whole host).
 ///
 /// 2048 is a reasoned bound, **not a measured one**: a few hundred distinct triples times a
 /// handful of permission sets each was the estimate when it was chosen, and nobody has
-/// compared it with the denial volume of a real `SELinux`-enforcing fleet. Shapes past it are
+/// compared it with the denial volume of a real `SELinux`-enforcing fleet. It was a host-wide
+/// figure and is now a per-subject one, unchanged for lack of data. Shapes past it are
 /// counted (`policy_denial_alerts_shed`) and, not being remembered, can alert in a later
 /// window. Revisit with real denial data.
 pub(crate) const POLICY_DENIAL_ALERT_CAP: u64 = 2048;
 
-/// How long [`POLICY_DENIAL_ALERT_CAP`] lasts before the budget refills: one hour of event time
-/// (`meta.timestamp_ns`). Long enough that a flood stays bounded to the cap per hour, short
-/// enough that a genuinely new denial after a noisy period is not silenced for the whole run.
+/// How long [`POLICY_DENIAL_ALERT_CAP`] lasts before a subject's budget refills: one hour of
+/// event time (`meta.timestamp_ns`). Long enough that a flood stays bounded to the cap per hour,
+/// short enough that a genuinely new denial after a noisy period is not silenced for the whole
+/// run.
 pub(crate) const POLICY_DENIAL_ALERT_WINDOW_NS: u64 = 3_600_000_000_000;
+
+/// Subject types whose alert budget POLICY-DENIAL-DRIFT tracks at once (#840), least recently
+/// seen out first like every other map of the rule state. A subject type is a type of the loaded
+/// policy, assigned by the kernel and not written by a process, so a host has a few hundred to
+/// a few thousand of them; 2048 holds a stock policy's confined domains. Past it the least recently
+/// seen subject's budget is forgotten (counted and logged), so a domain that was noisy and then
+/// quiet can alert again sooner than its window: bounded loss, never unbounded growth.
+///
+/// What this gives up, named: the alert volume is bounded per subject
+/// ([`POLICY_DENIAL_ALERT_CAP`]) and the number of subjects is bounded by the policy, so the
+/// worst case is `cap x subjects`, not one host-wide ceiling any more.
+pub(crate) const POLICY_DENIAL_SUBJECT_CAP: usize = 2048;
 
 /// One alert per (pid, kind of credential file) per this window. A scanner or a `grep -r` over
 /// `/home` opens the same credential files again and again, and the first open is the finding.

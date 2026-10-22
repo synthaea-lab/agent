@@ -31,14 +31,14 @@ use crate::{
         EGRESS_CLASSED_BYTES_THRESHOLD, EGRESS_DOMAIN_BROWSER_COMMS, EGRESS_WINDOW_NS,
         IN_PLACE_EDIT_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS,
         MEMFD_EXEC_WINDOW_NS, PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES,
-        POLICY_DENIAL_ALERT_CAP, QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES,
-        RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS,
-        SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS, SCAN_VERTICAL_THRESHOLD,
-        SCAN_VERTICAL_WINDOW_NS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
-        SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD,
-        SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STAGING_PID_CAP,
-        STAGING_READ_DIRS, STAGING_READ_FILES, STAGING_WINDOW_NS, STAGING_WRITE_FILES,
-        STANDARD_PORTS, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN,
+        POLICY_DENIAL_ALERT_CAP, POLICY_DENIAL_SUBJECT_CAP, QUARANTINE_EXEC_WINDOW_NS,
+        RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD,
+        RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
+        SCAN_VERTICAL_THRESHOLD, SCAN_VERTICAL_WINDOW_NS, SELF_SPAWN_EXCLUSIONS,
+        SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD,
+        SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS,
+        SHELL_COMMS, STAGING_PID_CAP, STAGING_READ_DIRS, STAGING_READ_FILES, STAGING_WINDOW_NS,
+        STAGING_WRITE_FILES, STANDARD_PORTS, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN,
         TASK_REGISTRATION_DEDUP_WINDOW_NS, TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
     },
     has_write_intent,
@@ -204,6 +204,18 @@ type PolicyDenialKey = (
     Option<String>,
 );
 
+/// One subject type's alert budget for `check_policy_denial_drift` (#840).
+#[derive(Default)]
+struct PolicyDenialBudget {
+    /// Event time (`meta.timestamp_ns`) at which this subject's current window began; `None` until
+    /// its first new shape, so the window is anchored on that shape and not on the epoch.
+    window_start_ns: Option<u64>,
+    /// New-shape alerts raised in the window.
+    alerts: u64,
+    /// New shapes shed in the window: the warning that the cap was hit is logged when this is 0.
+    shed: u64,
+}
+
 /// The permission set of an AVC denial in canonical form for the dedup key: whitespace-separated
 /// permissions, sorted and deduplicated, so `read write`, `write read` and `read  write` are one
 /// shape. The wire value (`PolicyDenialEvent::action`) stays as the kernel wrote it.
@@ -343,17 +355,17 @@ pub struct RuleState {
     /// `object_path`) before it's worth extending; tracked as a follow-up,
     /// not done here.
     known_policy_denials: BoundedMap<PolicyDenialKey, ()>,
-    /// New-shape alerts `check_policy_denial_drift` has raised in the current budget
-    /// window, against [`POLICY_DENIAL_ALERT_CAP`] (#812): `known_policy_denials` bounds
-    /// what the rule remembers, not what it alerts, so a flood of distinct shapes
-    /// (varying the subject/object type faster than a real host ever would) could
-    /// otherwise emit one alert per shape, unbounded. Reset when a new shape arrives
-    /// [`crate::exclusions::POLICY_DENIAL_ALERT_WINDOW_NS`] after `policy_denial_window_start_ns`.
-    policy_denial_alerts: u64,
-    /// Event time (`meta.timestamp_ns`) at which the current alert-budget window began;
-    /// 0 until the first new shape.
-    policy_denial_window_start_ns: u64,
-    /// New-shape events shed by [`POLICY_DENIAL_ALERT_CAP`] over the whole run — counted
+    /// Subject type (`user:role:type`, `None` for a denial with no subject context) → the new-shape
+    /// alerts `check_policy_denial_drift` has raised for it in its current budget window, against
+    /// [`POLICY_DENIAL_ALERT_CAP`] (#812, per subject since #840): `known_policy_denials` bounds
+    /// what the rule remembers, not what it alerts, so a flood of distinct shapes could otherwise
+    /// emit one alert per shape. One budget per subject, so a noisy domain (`httpd_t` probing 512
+    /// types) cannot spend another's. LRU-bounded by [`POLICY_DENIAL_SUBJECT_CAP`]; a subject
+    /// forgotten by eviction starts a fresh budget (counted, logged).
+    policy_denial_budgets: BoundedMap<Option<String>, PolicyDenialBudget>,
+    /// `policy_denial_budgets.evicted()` last reported, so each rise is logged once.
+    policy_denial_budget_evictions_reported: u64,
+    /// New-shape events shed by [`POLICY_DENIAL_ALERT_CAP`] over the whole run, all subjects — counted
     /// instead of silent (#812). A shed shape is *not* remembered in
     /// `known_policy_denials`, so it is still new when it comes back: it can alert in a
     /// later budget window, and every event for it while the budget is spent counts
@@ -521,8 +533,8 @@ impl RuleState {
             service_stop: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
             known_policy_denials: BoundedMap::new(COUNTER_CAP),
-            policy_denial_alerts: 0,
-            policy_denial_window_start_ns: 0,
+            policy_denial_budgets: BoundedMap::new(POLICY_DENIAL_SUBJECT_CAP),
+            policy_denial_budget_evictions_reported: 0,
             policy_denial_alerts_shed: 0,
             policy_denial_evictions_reported: 0,
             auth_failures: BoundedMap::new(COUNTER_CAP),
@@ -1704,11 +1716,12 @@ impl RuleState {
     /// object and class. `None` (an AppLocker/WDAC denial, or an AVC variant the
     /// parser doesn't recognize) is its own value, same as every other field here.
     ///
-    /// Capped at [`POLICY_DENIAL_ALERT_CAP`] new-shape alerts per
-    /// [`crate::exclusions::POLICY_DENIAL_ALERT_WINDOW_NS`] (#812): a flood of shapes past the cap is counted
-    /// (`policy_denial_alerts_shed`) rather than alerted, and a shed shape is not
-    /// recorded in `known_policy_denials`, so it is still new — it can alert once the
-    /// budget refills in a later window instead of being silenced for the rest of the
+    /// Capped at [`POLICY_DENIAL_ALERT_CAP`] new-shape alerts per subject type per
+    /// [`crate::exclusions::POLICY_DENIAL_ALERT_WINDOW_NS`] (#812, per subject since #840): a
+    /// flood of shapes from one domain past its cap is counted (`policy_denial_alerts_shed`)
+    /// rather than alerted, and never touches another domain's budget. A shed shape is not
+    /// recorded in `known_policy_denials`, so it is still new — it can alert once its
+    /// subject's budget refills in a later window instead of being silenced for the rest of the
     /// run. The cap bounds alert volume; `known_policy_denials` keeps deduplicating
     /// the shapes that did alert.
     ///
@@ -1729,24 +1742,35 @@ impl RuleState {
             return None;
         }
         let now = event.meta.timestamp_ns;
-        let window_age = now.saturating_sub(self.policy_denial_window_start_ns);
-        if window_age >= crate::exclusions::POLICY_DENIAL_ALERT_WINDOW_NS {
-            self.policy_denial_window_start_ns = now;
-            self.policy_denial_alerts = 0;
+        // The budget is the subject type's (`key.1`, the context without its MLS part), so a noisy
+        // domain spends its own and nobody else's.
+        let budget = self
+            .policy_denial_budgets
+            .get_or_insert_with(key.1.clone(), PolicyDenialBudget::default);
+        if budget.window_start_ns.is_none_or(|start| {
+            now.saturating_sub(start) >= crate::exclusions::POLICY_DENIAL_ALERT_WINDOW_NS
+        }) {
+            *budget = PolicyDenialBudget {
+                window_start_ns: Some(now),
+                ..PolicyDenialBudget::default()
+            };
         }
-        if self.policy_denial_alerts >= POLICY_DENIAL_ALERT_CAP {
-            if self.policy_denial_alerts_shed == 0 {
+        if budget.alerts >= POLICY_DENIAL_ALERT_CAP {
+            if budget.shed == 0 {
                 tracing::warn!(
                     cap = POLICY_DENIAL_ALERT_CAP,
-                    "policy-denial-drift: alert cap reached, further new shapes are counted but not alerted until the budget refills"
+                    subject = key.1.as_deref().unwrap_or("-"),
+                    "policy-denial-drift: alert cap reached for this subject, its further new shapes are counted but not alerted until its budget refills"
                 );
             }
+            budget.shed += 1;
             self.policy_denial_alerts_shed += 1;
+            self.report_policy_denial_evictions();
             return None;
         }
+        budget.alerts += 1;
         self.known_policy_denials.insert(key, ());
         self.report_policy_denial_evictions();
-        self.policy_denial_alerts += 1;
         Some(Alert {
             technique: "T1562",
             severity: Severity::Medium,
@@ -1773,6 +1797,14 @@ impl RuleState {
     /// reached" warning fires exactly once, never again, so without this an operator
     /// cannot tell 10 shed shapes from 100,000.
     fn report_policy_denial_evictions(&mut self) {
+        let budgets_evicted = self.policy_denial_budgets.evicted();
+        if budgets_evicted > self.policy_denial_budget_evictions_reported {
+            tracing::warn!(
+                budgets_evicted,
+                "policy-denial-drift: subject alert budgets forgotten (least recently seen first); those subjects start a fresh budget"
+            );
+            self.policy_denial_budget_evictions_reported = budgets_evicted;
+        }
         let evicted = self.known_policy_denials.evicted();
         if evicted > self.policy_denial_evictions_reported {
             tracing::warn!(
