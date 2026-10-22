@@ -154,6 +154,7 @@ pub fn evaluate_exec(event: &ExecEvent) -> Vec<Alert> {
         .chain(check_masquerading(event))
         .chain(check_recovery_inhibit(event))
         .chain(check_log_clear_exec(event))
+        .chain(crate::securitytool::check_security_tool_stop(event))
         .collect()
 }
 

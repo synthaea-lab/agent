@@ -413,6 +413,7 @@ mod rdp;
 mod recon;
 mod scan_vertical;
 mod security_discovery;
+mod securitytool;
 mod service_stop;
 mod session;
 mod ssh_fanout;
