@@ -12,6 +12,57 @@ use crate::{
     validate::validate,
 };
 
+/// The platform of a host, and so which directories of `rules/sigma/` it runs (issue #73, #980).
+/// The engine does not evaluate rules by platform on its own; [`SigmaEngine::load_dir_for`] is
+/// what keeps a host from loading the rules of the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    Linux,
+    Windows,
+    MacOs,
+}
+
+impl Platform {
+    /// The platform this binary is built for, or `None` on an OS the content has no
+    /// directory for.
+    #[must_use]
+    pub const fn host() -> Option<Self> {
+        if cfg!(target_os = "linux") {
+            Some(Self::Linux)
+        } else if cfg!(target_os = "windows") {
+            Some(Self::Windows)
+        } else if cfg!(target_os = "macos") {
+            Some(Self::MacOs)
+        } else {
+            None
+        }
+    }
+
+    /// The name of the platform's own directory under `rules/sigma/`.
+    #[must_use]
+    pub const fn dir_name(self) -> &'static str {
+        match self {
+            Self::Linux => "linux",
+            Self::Windows => "windows",
+            Self::MacOs => "macos",
+        }
+    }
+
+    /// The directories under `rules/sigma/` a host of this platform loads, in load order.
+    /// **macOS loads `macos/` and `linux/`**: the Unix-family command-line rules of `linux/`
+    /// (shells, `curl`, `base64`) apply to macOS too, and every macOS host has run them since
+    /// the agent loaded the whole tree. That is a choice, not a rule of nature (#980): a shared
+    /// `unix/` directory is the alternative. Linux and Windows load only their own.
+    #[must_use]
+    pub const fn rule_dirs(self) -> &'static [&'static str] {
+        match self {
+            Self::Linux => &["linux"],
+            Self::Windows => &["windows"],
+            Self::MacOs => &["macos", "linux"],
+        }
+    }
+}
+
 /// Sigma engine: set of loaded, validated rules, ready to evaluate.
 pub struct SigmaEngine {
     rules: Vec<SigmaRule>,
@@ -19,9 +70,10 @@ pub struct SigmaEngine {
 
 impl SigmaEngine {
     /// Loads all `.yml` / `.yaml` rules from a directory tree (recursive — content
-    /// convention is `rules/sigma/<platform>/...`). Rules that fail to parse or use
-    /// unsupported constructs are skipped with a warning naming the reason; the
-    /// engine loads the rest.
+    /// convention is `rules/sigma/<platform>/...`), **every platform's** included: the content
+    /// tests and tools want the whole tree, a host wants [`Self::load_dir_for`]. Rules that
+    /// fail to parse or use unsupported constructs are skipped with a warning naming the
+    /// reason; the engine loads the rest.
     ///
     /// # Errors
     ///
@@ -45,6 +97,38 @@ impl SigmaEngine {
                         Err(e) => tracing::warn!(error = %e, "sigma rule skipped"),
                     }
                 }
+            }
+        }
+        Ok(Self { rules })
+    }
+
+    /// Loads the rules a host of `platform` runs: the trees `<dir>/<d>/` for each `d` in
+    /// [`Platform::rule_dirs`] (the platform's own directory; macOS also `linux/`), nothing
+    /// else. Rules of the other platforms, and any file outside those directories, are never
+    /// read. The agent calls this with [`Platform::host`], so a macOS rule does not run on a
+    /// Linux host (#980). Skipping bad rules, and the error cases, are as [`Self::load_dir`].
+    ///
+    /// The platform comes from where a directory sits **under `dir`**, by construction: only
+    /// those subdirectories are walked. It is never read from the full path of a rule, so a
+    /// content root such as `/home/linux/content/rules/sigma` does not turn `windows/x.yml`
+    /// into a Linux rule. A directory that does not exist contributes no rules (a content tree
+    /// may ship without a platform's rules); a `dir` that cannot be read is an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SigmaError::Io`] when `dir`, or one of the directories that exists, cannot be
+    /// read.
+    pub fn load_dir_for(dir: &Path, platform: Platform) -> Result<Self, SigmaError> {
+        // Fails on an unreadable root even when no platform directory exists.
+        std::fs::read_dir(dir).map_err(|source| SigmaError::Io {
+            path: dir.display().to_string(),
+            source,
+        })?;
+        let mut rules = Vec::new();
+        for name in platform.rule_dirs() {
+            let platform_dir = dir.join(name);
+            if platform_dir.is_dir() {
+                rules.extend(Self::load_dir(&platform_dir)?.rules);
             }
         }
         Ok(Self { rules })

@@ -1754,15 +1754,25 @@ fn resolve_content_root(content_dir: &Path) -> PathBuf {
     content_dir.to_path_buf()
 }
 
-/// Loads the Sigma content directory if present, under `content_root`.
+/// Loads the Sigma content of the platform this agent is built for, if the content directory
+/// is present under `content_root`: only `rules/sigma/<platform>/`, so a rule written for
+/// another platform never runs on this host (#980).
 fn load_sigma_rules(content_root: &Path) -> Load<sigma::SigmaEngine> {
     let rules_dir = content_root.join("rules/sigma");
     if !rules_dir.is_dir() {
         return Load::Absent;
     }
-    match sigma::SigmaEngine::load_dir(&rules_dir) {
+    let Some(platform) = sigma::Platform::host() else {
+        tracing::warn!("sigma: no rules directory for this operating system, none loaded");
+        return Load::Absent;
+    };
+    match sigma::SigmaEngine::load_dir_for(&rules_dir, platform) {
         Ok(engine) => {
-            tracing::info!(rules = engine.rule_count(), "sigma: rules loaded");
+            tracing::info!(
+                rules = engine.rule_count(),
+                platform = platform.dir_name(),
+                "sigma: rules loaded"
+            );
             Load::Loaded(engine)
         }
         Err(e) => {
@@ -2321,8 +2331,73 @@ mod tests {
     use schema::{ConnectEvent, Event, EventMeta, ExecEvent, User, sensor::EventSink as _};
 
     use super::{
-        CANARY_EXEC_HOLD_NS, DetectionSink, MAX_HELD_CANARY_TOUCHES, correlator_case_id, entity_key,
+        CANARY_EXEC_HOLD_NS, DetectionSink, Load, MAX_HELD_CANARY_TOUCHES, correlator_case_id,
+        entity_key, load_sigma_rules,
     };
+
+    /// A content root with one Sigma rule per platform directory, each titled after it.
+    fn sigma_content_root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for platform in ["linux", "windows", "macos"] {
+            let dir = root.path().join("rules/sigma").join(platform);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("rule.yml"),
+                format!(
+                    "title: {platform}-rule\ndescription: d\ntags:\n  - attack.t1059\nlevel: low\n\
+                     falsepositives:\n  - none\ndetection:\n  selection:\n    Image|endswith: '/x'\n  \
+                     condition: selection\n"
+                ),
+            )
+            .unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn the_agent_loads_only_the_sigma_rules_of_its_own_platform() {
+        let root = sigma_content_root();
+        let Load::Loaded(engine) = load_sigma_rules(root.path()) else {
+            panic!("the content directory is present and readable");
+        };
+        // macOS also runs the Unix-family rules of `linux/` (#980); the others only their own.
+        let mut titles = engine.rule_titles();
+        titles.sort_unstable();
+        let expected: &[&str] = if cfg!(target_os = "linux") {
+            &["linux-rule"]
+        } else if cfg!(target_os = "windows") {
+            &["windows-rule"]
+        } else {
+            &["linux-rule", "macos-rule"]
+        };
+        assert_eq!(titles, expected);
+    }
+
+    #[test]
+    fn a_content_root_named_after_another_platform_does_not_change_which_rules_load() {
+        // `<tmp>/windows/linux/...`: read from the full path, every rule would look like
+        // every platform's.
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("windows").join("linux");
+        std::fs::create_dir_all(&root).unwrap();
+        let inner = sigma_content_root();
+        let from = inner.path().join("rules");
+        let to = root.join("rules");
+        std::fs::create_dir_all(to.join("sigma")).unwrap();
+        for platform in ["linux", "windows", "macos"] {
+            std::fs::create_dir_all(to.join("sigma").join(platform)).unwrap();
+            std::fs::copy(
+                from.join("sigma").join(platform).join("rule.yml"),
+                to.join("sigma").join(platform).join("rule.yml"),
+            )
+            .unwrap();
+        }
+        let Load::Loaded(engine) = load_sigma_rules(&root) else {
+            panic!("the content directory is present and readable");
+        };
+        let expected = if cfg!(target_os = "macos") { 2 } else { 1 };
+        assert_eq!(engine.rule_count(), expected, "{:?}", engine.rule_titles());
+    }
 
     #[test]
     fn the_verdict_entity_carries_the_parents_incarnation_when_stamped() {
@@ -4196,6 +4271,19 @@ rule response_marker {
     /// not just any temp dir) matching on an image path no other rule in
     /// this crate's tests, or `crates/rules`' deterministic checks, would
     /// ever incidentally match.
+    /// The directory a test writes its Sigma rule to: the one the agent reads on the host it
+    /// runs on (`Platform::rule_dirs`, #980), not a fixed `linux/`: a Windows host loads only
+    /// `windows/`, so a rule written elsewhere is never loaded. The rule below matches the
+    /// image path of a synthetic exec event (`/opt/reload-content-marker`), so it fires on
+    /// any host once it is loaded.
+    fn host_sigma_dir(dir: &std::path::Path) -> std::path::PathBuf {
+        let platform = sigma::Platform::host().expect("tests run on a platform with rules");
+        dir.join("content")
+            .join("rules")
+            .join("sigma")
+            .join(platform.rule_dirs()[0])
+    }
+
     const RELOAD_TEST_SIGMA_RULE: &str = r#"
 title: reload-content test marker rule
 tags:
@@ -4223,11 +4311,7 @@ detection:
             "no sigma engine should be loaded before the first reload"
         );
 
-        let sigma_dir = dir
-            .join("content")
-            .join("rules")
-            .join("sigma")
-            .join("linux");
+        let sigma_dir = host_sigma_dir(&dir);
         std::fs::create_dir_all(&sigma_dir).unwrap();
         std::fs::write(sigma_dir.join("marker.yml"), RELOAD_TEST_SIGMA_RULE).unwrap();
 
@@ -4254,11 +4338,7 @@ detection:
     /// (#131): the rule below is `critical` and must still never terminate anything.
     fn critical_sigma_sink(name: &str) -> (std::path::PathBuf, Arc<DetectionSink>) {
         let dir = tmp(name);
-        let sigma_dir = dir
-            .join("content")
-            .join("rules")
-            .join("sigma")
-            .join("linux");
+        let sigma_dir = host_sigma_dir(&dir);
         std::fs::create_dir_all(&sigma_dir).unwrap();
         std::fs::write(
             sigma_dir.join("critical.yml"),
@@ -4824,11 +4904,7 @@ rule reload_content_test_marker {
     fn reload_content_drops_a_rule_whose_file_was_removed() {
         let dir = tmp("reload-remove");
         let sink = sink_in(&dir);
-        let sigma_dir = dir
-            .join("content")
-            .join("rules")
-            .join("sigma")
-            .join("linux");
+        let sigma_dir = host_sigma_dir(&dir);
         std::fs::create_dir_all(&sigma_dir).unwrap();
         std::fs::write(sigma_dir.join("marker.yml"), RELOAD_TEST_SIGMA_RULE).unwrap();
         assert_eq!(sink.reload_content().sigma_rule_count, Some(1));
