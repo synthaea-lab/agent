@@ -130,7 +130,7 @@ impl ReconWindow {
 
 /// The program's lowercase basename without `.exe`: `C:\Windows\System32\NET.exe` → `net`.
 /// Falls back to `comm` when the sensor reports no image path.
-fn program(event: &ExecEvent) -> String {
+pub(crate) fn program(event: &ExecEvent) -> String {
     let path = if event.image_path.is_empty() {
         event.meta.comm.as_str()
     } else {
@@ -145,7 +145,7 @@ fn program(event: &ExecEvent) -> String {
 
 /// The arguments after the program, lowercase: `argv[1..]` where the platform gives one,
 /// the whitespace-split command line otherwise (Windows). Quotes are dropped.
-fn args(event: &ExecEvent) -> Vec<String> {
+pub(crate) fn args(event: &ExecEvent) -> Vec<String> {
     let lower = |s: &str| s.trim_matches('"').to_ascii_lowercase();
     if event.argv.is_empty() {
         event

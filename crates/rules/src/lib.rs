@@ -21,6 +21,7 @@ mod ldap;
 mod ntlm;
 mod rdp;
 mod recon;
+mod servicestop;
 mod session;
 mod signature_gate;
 mod sliding;

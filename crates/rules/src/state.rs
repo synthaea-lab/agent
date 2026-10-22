@@ -291,6 +291,9 @@ pub struct RuleState {
     /// Lineage → distinct security-software discovery commands, for SECURITY-DISCOVERY
     /// (T1518.001, #378). LRU-bounded.
     security_discovery: BoundedMap<crate::recon::Lineage, SlidingDistinct<&'static str>>,
+    /// Lineage → distinct services it stopped, for SERVICE-STOP-BURST (T1489, #381).
+    /// LRU-bounded.
+    service_stop: BoundedMap<crate::recon::Lineage, SlidingDistinct<String>>,
     /// (pid, dport) → sliding distinct-destination counter for SCAN-SPREAD
     /// (T1046/T1210, issue #465). LRU-bounded.
     scan_spread: BoundedMap<(u32, u16), SlidingDistinct<IpAddr>>,
@@ -504,6 +507,7 @@ impl RuleState {
             exec_lineage: BoundedMap::new(PID_COMM_CAP),
             ssh_fanout: BoundedMap::new(COUNTER_CAP),
             security_discovery: BoundedMap::new(COUNTER_CAP),
+            service_stop: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
             known_policy_denials: BoundedMap::new(COUNTER_CAP),
             policy_denial_alerts: 0,
@@ -1223,6 +1227,54 @@ impl RuleState {
         None
     }
 
+    /// SERVICE-STOP-BURST (T1489, #381): five distinct services stopped from one lineage in
+    /// 60 s, the pre-ransomware tell. An exec that names several services (`systemctl stop a
+    /// b c`, `Stop-Service a,b,c`) counts each. See [`crate::servicestop`] for what counts and
+    /// the false positives accepted. Medium. Not joined to the ransomware reflex or the
+    /// damage manifest, which consume T1486 alerts only.
+    fn check_service_stop_burst(
+        &mut self,
+        event: &ExecEvent,
+        lineage: crate::recon::Lineage,
+    ) -> Option<Alert> {
+        use crate::servicestop::{SERVICE_STOP_THRESHOLD, SERVICE_STOP_WINDOW_NS};
+
+        let stopped = crate::servicestop::services_stopped(event);
+        if stopped.is_empty() {
+            return None;
+        }
+        let ts = event.meta.timestamp_ns;
+        let entry = self
+            .service_stop
+            .get_or_insert_with(lineage, SlidingDistinct::default);
+        let mut distinct = 0;
+        for name in stopped {
+            distinct = entry.record(name, ts, SERVICE_STOP_WINDOW_NS);
+        }
+        if distinct >= SERVICE_STOP_THRESHOLD && entry.try_alert(ts, SERVICE_STOP_WINDOW_NS) {
+            let seen: Vec<&str> = entry.values().map(String::as_str).take(12).collect();
+            return Some(Alert {
+                technique: "T1489",
+                severity: Severity::Medium,
+                message: format!(
+                    "pid={} comm={}: lineage of pid={} stopped {distinct} distinct services ({}{}) \
+                     in {}s — the services a ransomware run stops first, or a maintenance window",
+                    event.meta.pid,
+                    event.meta.comm,
+                    lineage.0,
+                    seen.join(", "),
+                    if distinct as usize > seen.len() {
+                        ", ..."
+                    } else {
+                        ""
+                    },
+                    SERVICE_STOP_WINDOW_NS / 1_000_000_000,
+                ),
+            });
+        }
+        None
+    }
+
     /// SSH-FANOUT (T1021.004, #378): outbound SSH to eight distinct hosts from one lineage in
     /// 60 s. The lineage is the one the connecting process was exec'd under, so a loop that
     /// runs `ssh host cmd` per host (one process, one connect each) adds up where a per-pid
@@ -1279,6 +1331,7 @@ impl RuleState {
         let lineage = self.record_lineage(event);
         alerts.extend(self.check_recon_burst(event, lineage));
         alerts.extend(self.check_security_discovery(event, lineage));
+        alerts.extend(self.check_service_stop_burst(event, lineage));
         alerts.extend(crate::stateless::check_ld_preload_hijack(
             event,
             &self.ld_trust_extra,

@@ -170,6 +170,7 @@ TECHNIQUE_TACTIC = {
     "T1563.002": "Lateral Movement",
     "T1021.004": "Lateral Movement",
     "T1518.001": "Discovery",
+    "T1489": "Impact",
     "T1016": "Discovery",
     "T1057": "Discovery",
     "T1082": "Discovery",
