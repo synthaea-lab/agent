@@ -147,6 +147,32 @@ pub(crate) const SUDO_SUCCESS_AFTER_FAILURES_WINDOW_NS: u64 = 300_000_000_000; /
 pub(crate) const BEACON_THRESHOLD: u32 = 3;
 pub(crate) const BEACON_WINDOW_NS: u64 = 60_000_000_000; // 60s
 
+/// EGRESS-VOLUME threshold and window (T1041/T1048, #380): this many bytes sent by one
+/// process name to one public address inside the window. **Provisional**: 512 MiB in 10
+/// minutes is far above an interactive session and below a bulk exfiltration of a
+/// home directory, but no lab capture of ordinary uploads (backups, `rsync` to a remote
+/// host, a container registry push, a video call) exists to calibrate it, so those
+/// are the false positives to watch for live. Raise it before lowering it.
+pub(crate) const EGRESS_BYTES_THRESHOLD: u64 = 512 * 1024 * 1024;
+/// Sliding look-back window for [`EGRESS_BYTES_THRESHOLD`].
+pub(crate) const EGRESS_WINDOW_NS: u64 = 600_000_000_000; // 10 min
+
+/// ARCHIVE-EXFIL (T1560/T1041, #380): a file whose name ends in an archive or compression
+/// extension, opened for writing by a pid that then writes at least this many bytes, is a
+/// **staged archive**. **Provisional**: 100 MiB is the size at which an archive stops being a
+/// config bundle and starts being a collection, with no lab measurement behind it.
+pub(crate) const ARCHIVE_STAGED_BYTES: u64 = 100 * 1024 * 1024;
+/// How long after it was staged an archive can be read by another process and still count.
+pub(crate) const ARCHIVE_READ_WINDOW_NS: u64 = 3_600_000_000_000; // 1 h
+/// How long after reading a staged archive a process can connect to a public address and
+/// still complete the chain.
+pub(crate) const ARCHIVE_EGRESS_WINDOW_NS: u64 = 600_000_000_000; // 10 min
+/// Name endings of an archive or a compressed stream, compared in lowercase. A name is a
+/// choice of the writer (`.dat` evades it) and is the stated gap of the rule, not a claim.
+pub(crate) const ARCHIVE_SUFFIXES: &[&str] = &[
+    ".zip", ".tar", ".tgz", ".7z", ".rar", ".gz", ".bz2", ".xz", ".zst", ".tbz2", ".txz",
+];
+
 /// SCAN-SPREAD threshold and window (T1046/T1210, issue #465): N distinct
 /// destinations on the same (pid, dport) in X seconds. Calibrated against
 /// the live Mirai detonation that surfaced this gap (309 connections to
@@ -464,3 +490,8 @@ pub(crate) const POLICY_DENIAL_ALERT_CAP: u64 = 2048;
 /// (`meta.timestamp_ns`). Long enough that a flood stays bounded to the cap per hour, short
 /// enough that a genuinely new denial after a noisy period is not silenced for the whole run.
 pub(crate) const POLICY_DENIAL_ALERT_WINDOW_NS: u64 = 3_600_000_000_000;
+
+/// One alert per (pid, kind of credential file) per this window. A scanner or a `grep -r` over
+/// `/home` opens the same credential files again and again, and the first open is the finding.
+/// Sliding (timestamp-based), never a reset bucket. Uncalibrated (first cut, 2026-10-21).
+pub(crate) const CREDENTIAL_READ_ALERT_WINDOW_NS: u64 = 300_000_000_000; // 5 min

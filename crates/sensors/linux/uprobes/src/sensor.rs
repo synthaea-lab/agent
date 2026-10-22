@@ -571,6 +571,18 @@ fn attach_dns_uprobes(
     Ok(())
 }
 
+/// Stops a running [`UprobesSensor`] from another thread: `run` holds the sensor mutably for
+/// as long as it runs, so `Sensor::stop` cannot be called on it from there. A stop sent before
+/// `run` reaches its loop is kept and ends it at once.
+#[derive(Clone)]
+pub struct UprobesStopHandle(Arc<Notify>);
+
+impl UprobesStopHandle {
+    pub fn stop(&self) {
+        self.0.notify_one();
+    }
+}
+
 /// Uprobe sensor. `run` blocks until Ctrl-C or [`Sensor::stop`].
 pub struct UprobesSensor {
     stop: Arc<Notify>,
@@ -591,6 +603,12 @@ impl UprobesSensor {
             stop: Arc::new(Notify::new()),
             config: UprobesConfig::new(),
         }
+    }
+
+    /// A handle that stops this sensor from another thread, whether or not `run` has started.
+    #[must_use]
+    pub fn stop_handle(&self) -> UprobesStopHandle {
+        UprobesStopHandle(Arc::clone(&self.stop))
     }
 
     /// Creates a new uprobe sensor with the given configuration.

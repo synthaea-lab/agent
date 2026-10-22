@@ -176,7 +176,7 @@ mod tests {
         let signed = sign(
             Kind::Content,
             &serde_json::to_string(&corrective).unwrap(),
-            &test_key_pair(),
+            &crate::signer::FileKey::new(test_key_pair()),
         )
         .unwrap();
         assert!(signed.accepted_by_embedded_key);
