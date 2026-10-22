@@ -134,9 +134,9 @@ enum Command {
         #[arg(long)]
         enable_readline_capture: bool,
         /// Enables DNS resolution capture via a `getaddrinfo(3)` uprobe (issue
-        /// #267 Phase 1): query name + first resolved address, for DNS-based
-        /// C2/tunneling/exfiltration visibility. Off by default, sensitive TLDs
-        /// redacted. Linux only.
+        /// #267 Phase 1/#458): query name + up to eight ordered resolved addresses
+        /// (truncation is marked), for DNS-based C2/tunneling/exfiltration visibility.
+        /// Off by default, sensitive TLDs redacted. Linux only.
         #[arg(long)]
         enable_dns_capture: bool,
         /// Control-plane base URL, overriding `server.control_plane_url` from

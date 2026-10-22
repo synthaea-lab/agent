@@ -30,3 +30,6 @@ serde_json = { workspace = true }
 anyhow = "1.0"
 aya-build = "0.2"
 which = { version = "8.0.6", default-features = false }
+
+[dev-dependencies]
+proptest = "1.11"

@@ -2572,7 +2572,6 @@ dependencies = [
  "aya-ebpf",
  "aya-log-ebpf",
  "sensor-linux-wire",
- "which",
 ]
 
 [[package]]
@@ -2631,6 +2630,7 @@ dependencies = [
  "aya-log",
  "goblin",
  "libc",
+ "proptest",
  "regex",
  "schema",
  "sensor-linux-wire",

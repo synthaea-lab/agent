@@ -279,7 +279,12 @@ pub mod time;
 /// (Security 1102, System 104), whatever did the clearing. Windows-only.
 /// #577 (`BitsJob`) was open at the same time; whichever merges second
 /// renumbers, same coordination note as above.
-pub const SCHEMA_VERSION: u32 = 45;
+///
+/// Bumped 45 → 47 for [`Event::DnsQuery`] (#458): Linux glibc `getaddrinfo`
+/// telemetry now includes an ordered address set and an explicit truncation flag.
+/// 46 is claimed by #577 (`BitsJob`, open); renumber this change if it lands
+/// first.
+pub const SCHEMA_VERSION: u32 = 47;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -998,13 +1003,25 @@ pub struct DnsQueryEvent {
     pub query: String,
     /// DNS record type (1 = A, 28 = AAAA, 5 = CNAME, ...).
     pub qtype: u32,
-    /// Resolved addresses / CNAME chain, semicolon-separated as the provider
-    /// emits them (e.g. `"type:1 172.67.143.127;"`). `None` on NXDOMAIN or when
-    /// the provider returns an empty string.
+    /// Existing provider result kept for compatibility; Linux `getaddrinfo`
+    /// sets it to the first resolved address. `None` on lookup failure or when
+    /// the provider returns no result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
+    /// Resolved IP addresses in resolver order. Empty for producers that do not
+    /// expose an answer set and for failed lookups. Repeated addresses are removed
+    /// while preserving their first appearance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub results: Vec<String>,
+    /// True when the producer's bounded answer collection omitted further entries.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub results_truncated: bool,
     /// Win32 status code (0 = success, 9003 = NXDOMAIN, ...).
     pub status: u32,
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// What a [`DefenderEvent`] reports.
