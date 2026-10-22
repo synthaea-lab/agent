@@ -2191,6 +2191,7 @@ impl EventSink for DetectionSink {
             Event::FileOpen(e) => self.detect_file_open(&event, e),
             Event::Connect(e) => self.detect_connect(&event, e),
             Event::NetworkFlow(e) => self.detect_network_flow(&event, e),
+            Event::DnsQuery(e) => self.rule_state.lock().unwrap().on_dns_query(e),
             Event::ListenPort(e) => self.detect_listen_port(&event, e),
             Event::Auth(e) => self.detect_auth(&event, e),
             Event::Session(e) => self.detect_session(&event, e),
@@ -3326,6 +3327,44 @@ rule response_marker {
                 dport: 4444,
             }));
         }
+    }
+
+    /// EGRESS-DOMAIN (#380) crosses two event kinds: the lookup is a `DnsQuery`, which the sink
+    /// must hand to the rule state (it did not before), and the volume is a `NetworkFlow`.
+    #[test]
+    fn a_dns_lookup_and_the_flow_that_follows_raise_egress_domain_in_the_alert_log() {
+        let dir = tmp("egress-domain");
+        let sink = sink_in(&dir);
+        let pid = 4242;
+        let meta_at = |ns: u64| EventMeta {
+            pid,
+            comm: "curl".to_string(),
+            timestamp_ns: ns,
+            ..schema::fixtures::meta()
+        };
+        sink.on_event(Event::DnsQuery(schema::DnsQueryEvent {
+            meta: meta_at(0),
+            query: "pastebin.com".to_string(),
+            result: Some("203.0.113.9".to_string()),
+            status: 0,
+            ..schema::fixtures::dns_query()
+        }));
+        for (i, sent) in [0u64, 30 * 1024 * 1024].into_iter().enumerate() {
+            sink.on_event(Event::NetworkFlow(schema::NetworkFlowEvent {
+                meta: meta_at((i as u64 + 1) * 1_000_000_000),
+                local_port: 50000,
+                daddr: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9)),
+                dport: 443,
+                protocol: 6,
+                bytes_sent: Some(sent),
+                ..schema::fixtures::network_flow()
+            }));
+        }
+        let alerts = alerts_in(&dir);
+        assert!(
+            alerts.contains("T1567.003"),
+            "the lookup must reach the rule state and join the flow, got: {alerts}"
+        );
     }
 
     #[test]

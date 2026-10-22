@@ -507,3 +507,31 @@ pub(crate) const POLICY_DENIAL_ALERT_WINDOW_NS: u64 = 3_600_000_000_000;
 /// `/home` opens the same credential files again and again, and the first open is the finding.
 /// Sliding (timestamp-based), never a reset bucket. Uncalibrated (first cut, 2026-10-21).
 pub(crate) const CREDENTIAL_READ_ALERT_WINDOW_NS: u64 = 300_000_000_000; // 5 min
+
+/// EGRESS-DOMAIN (T1567, #380): bytes one process sends to an address that its own DNS lookup
+/// resolved from a storage or paste service, inside [`EGRESS_WINDOW_NS`]. Far below
+/// [`EGRESS_BYTES_THRESHOLD`] because the destination is already what an exfiltration picks.
+/// **Provisional**: 25 MiB in 10 minutes is above what a script or an API client sends to a
+/// storage service and below a home directory, but no capture of ordinary uploads exists to
+/// calibrate it. A sync client (Dropbox, `rclone`, `rsync` to a bucket) or a backup tool crosses it
+/// by design, and is the false positive to expect. Raise it before narrowing the domain list.
+pub(crate) const EGRESS_CLASSED_BYTES_THRESHOLD: u64 = 25 * 1024 * 1024;
+/// How long after a process resolved a listed service the address it got still names that service
+/// for EGRESS-DOMAIN. A connection outlives its lookup, so this is long; a new lookup renews it.
+/// Provisional.
+pub(crate) const DNS_CLASS_WINDOW_NS: u64 = 3_600_000_000_000; // 1 h
+/// Linux browsers whose uploads to a storage service are a user's own action, excluded from
+/// EGRESS-DOMAIN. Only on evidence: the exclusion applies through
+/// `policy::name_exclusion_applies`, so a `chrome` run from `/tmp` is not excluded. A browser
+/// installed outside the system directories (Snap, Flatpak) is therefore not excluded either, and
+/// alerts on its own uploads: a known false positive.
+pub(crate) const EGRESS_DOMAIN_BROWSER_COMMS: &[&str] = &[
+    "chrome",
+    "chromium",
+    "firefox",
+    "firefox-bin",
+    "brave",
+    "msedge",
+    "opera",
+    "vivaldi",
+];

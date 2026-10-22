@@ -13,6 +13,7 @@
 mod amsi;
 mod credfiles;
 mod defender;
+mod egressdomain;
 mod exclusions;
 mod inventory;
 mod ld_trust;

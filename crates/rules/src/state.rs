@@ -8,7 +8,7 @@ use std::{
 };
 
 use schema::{
-    AuthEvent, AuthKind, AuthOutcome, ConnectEvent, Event, ExecEvent,
+    AuthEvent, AuthKind, AuthOutcome, ConnectEvent, DnsQueryEvent, Event, ExecEvent,
     FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FileDeleteEvent, FileOpenEvent, FileQuarantineEvent,
     FileRenameEvent, FileWriteEvent, ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT,
     POLICY_MECHANISM_SELINUX, PolicyDenialEvent, SessionEvent, SessionState, User,
@@ -19,24 +19,26 @@ use store::BoundedMap;
 use crate::{
     Alert,
     credfiles::{self, CredFile},
+    egressdomain::{self, DomainClass},
     exclusions::{
         AGENT_CHILD_EXCLUSIONS, APK_STAGING_FILE_PREFIX, ARCHIVE_EGRESS_WINDOW_NS,
         ARCHIVE_READ_WINDOW_NS, ARCHIVE_STAGED_BYTES, ARCHIVE_SUFFIXES, AUTH_FAILURE_THRESHOLD,
         AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD, BEACON_WINDOW_NS, BROWSERS,
         BURST_WRITE_BYTES_THRESHOLD, COMPRESSION_DRIVER_COMMS, COMPRESSION_SUFFIXES,
         COMPRESSOR_COMMS, CREATE_UNLINK_HISTORY_PER_PID, CREATE_UNLINK_PAIR_WINDOW_NS,
-        CREATE_UNLINK_PID_CAP, CREDENTIAL_READ_ALERT_WINDOW_NS, DOWNLOAD_EXEC_WINDOW_NS,
-        DOWNLOADER_COMMS, EGRESS_BYTES_THRESHOLD, EGRESS_WINDOW_NS, IN_PLACE_EDIT_COMMS,
-        LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS, MEMFD_EXEC_WINDOW_NS,
-        PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES, POLICY_DENIAL_ALERT_CAP,
-        QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX,
-        RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD,
-        SCAN_SPREAD_WINDOW_NS, SCAN_VERTICAL_THRESHOLD, SCAN_VERTICAL_WINDOW_NS,
-        SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS,
-        SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS,
-        SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN,
-        SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS, TOUCHED_FILES_PER_PID,
-        TOUCHED_FILES_PID_CAP,
+        CREATE_UNLINK_PID_CAP, CREDENTIAL_READ_ALERT_WINDOW_NS, DNS_CLASS_WINDOW_NS,
+        DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS, EGRESS_BYTES_THRESHOLD,
+        EGRESS_CLASSED_BYTES_THRESHOLD, EGRESS_DOMAIN_BROWSER_COMMS, EGRESS_WINDOW_NS,
+        IN_PLACE_EDIT_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS,
+        MEMFD_EXEC_WINDOW_NS, PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES,
+        POLICY_DENIAL_ALERT_CAP, QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES,
+        RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS,
+        SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS, SCAN_VERTICAL_THRESHOLD,
+        SCAN_VERTICAL_WINDOW_NS, SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS,
+        SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD,
+        SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STANDARD_PORTS,
+        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
+        TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
     },
     has_write_intent,
     rdp::RdpSuccessAfterFailures,
@@ -52,6 +54,19 @@ use crate::{
 struct EgressVolume {
     sum: SlidingSum,
     last_alert_ns: Option<u64>,
+    /// The last EGRESS-DOMAIN alert for this entry, kept apart from `last_alert_ns` so that
+    /// one finding does not hide the other.
+    last_class_alert_ns: Option<u64>,
+}
+
+/// A storage or paste service a pid resolved, and the address its lookup returned
+/// (EGRESS-DOMAIN). Keyed by (pid, address) in `RuleState::dns_class`.
+struct DnsClassSighting {
+    generation: Option<u64>,
+    class: DomainClass,
+    /// The name the process asked for, kept for the alert message.
+    domain: String,
+    timestamp_ns: u64,
 }
 
 /// The archive a pid has open for writing (ARCHIVE-EXFIL).
@@ -255,6 +270,10 @@ pub struct RuleState {
     /// key leaves the port out on purpose: an exfiltration split over many connections
     /// to one host is the shape to catch. LRU-bounded.
     egress_volume: BoundedMap<(String, IpAddr), EgressVolume>,
+    /// (pid, address) → the storage or paste service that pid resolved to that address, for
+    /// EGRESS-DOMAIN (T1567, #380). Only a lookup of a listed service is recorded, so the
+    /// history grows with those, not with all DNS; LRU-bounded like every other table.
+    dns_class: BoundedMap<(u32, IpAddr), DnsClassSighting>,
     /// pid → the archive it opened for writing and the bytes it has written since, for
     /// ARCHIVE-EXFIL (T1560/T1041, #380). `FileWriteEvent` carries no path, so the bytes
     /// are everything the pid writes (any fd): an archiver's output dominates them, a
@@ -474,6 +493,7 @@ impl RuleState {
             beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
             egress_flow_last: BoundedMap::new(COUNTER_CAP),
             egress_volume: BoundedMap::new(COUNTER_CAP),
+            dns_class: BoundedMap::new(COUNTER_CAP),
             archive_writers: BoundedMap::new(COUNTER_CAP),
             staged_archives: BoundedMap::new(COUNTER_CAP),
             archive_readers: BoundedMap::new(COUNTER_CAP),
@@ -1304,6 +1324,33 @@ impl RuleState {
         alerts
     }
 
+    /// To be called for every `DnsQueryEvent` in the stream (the Linux `getaddrinfo` probe,
+    /// opt-in; the Windows DNS-Client provider; the macOS network extension). Never alerts: it
+    /// remembers that this pid resolved a listed storage or paste service to these addresses, for
+    /// [`Self::check_egress_volume`] to join with the volume it later sends there.
+    pub fn on_dns_query(&mut self, event: &DnsQueryEvent) {
+        let Some(class) = egressdomain::classify_domain(&event.query) else {
+            return;
+        };
+        if event.status != 0 {
+            return;
+        }
+        let Some(result) = event.result.as_deref() else {
+            return;
+        };
+        for address in egressdomain::resolved_addresses(result) {
+            self.dns_class.insert(
+                (event.meta.pid, address),
+                DnsClassSighting {
+                    generation: event.meta.process_generation,
+                    class,
+                    domain: event.query.to_ascii_lowercase(),
+                    timestamp_ns: event.meta.timestamp_ns,
+                },
+            );
+        }
+    }
+
     /// ARCHIVE-EXFIL, first link: a pid that opens an archive-named file for writing starts
     /// counting its written bytes; a pid that opens a **staged** archive (see
     /// [`Self::record_archive_write`]) without write intent, within [`ARCHIVE_READ_WINDOW_NS`]
@@ -1427,10 +1474,22 @@ impl RuleState {
     /// multicast and unspecified peers are excluded: a backup to the local network is
     /// not the signal this rule looks for. No name exclusion list yet, for the reason
     /// given at [`EGRESS_BYTES_THRESHOLD`].
-    fn check_egress_volume(&mut self, event: &NetworkFlowEvent) -> Option<Alert> {
-        let sent = event.bytes_sent?;
+    ///
+    /// **EGRESS-DOMAIN (T1567, #380)** reads the same sum. When the pid itself resolved a listed
+    /// storage or paste service to this address ([`Self::on_dns_query`],
+    /// [`Self::resolved_service`]), the lower [`EGRESS_CLASSED_BYTES_THRESHOLD`] applies and the
+    /// alert names the technique of the class (T1567.002 or T1567.003) and the domain. It is
+    /// **dormant on a default host**: it needs `nf_conntrack_acct` for the volume *and* a DNS
+    /// source for the lookup (the Linux `getaddrinfo` probe is opt-in, `UprobesConfig::with_dns_enabled`).
+    /// Without the lookup the generic threshold above is all there is. Only the first address of a
+    /// Linux lookup is recorded, so a connection to another address of the same answer is not
+    /// joined (the Windows provider lists them all).
+    fn check_egress_volume(&mut self, event: &NetworkFlowEvent) -> Vec<Alert> {
+        let Some(sent) = event.bytes_sent else {
+            return Vec::new();
+        };
         if !is_public_address(event.daddr) {
-            return None;
+            return Vec::new();
         }
         let flow = (
             event.meta.comm.clone(),
@@ -1443,25 +1502,46 @@ impl RuleState {
         // First poll of the flow: baseline only. A counter that went down is a new
         // flow on a reused local port: its whole value is new volume.
         let delta = match previous {
-            None => return None,
+            None => return Vec::new(),
             Some(last) if sent >= last => sent - last,
             Some(_) => sent,
         };
         if delta == 0 {
-            return None;
+            return Vec::new();
         }
         let ts = event.meta.timestamp_ns;
+        let class = self.resolved_service(event);
         let entry = self.egress_volume.get_or_insert_with(
             (event.meta.comm.clone(), event.daddr),
             EgressVolume::default,
         );
         let total = entry.sum.add(ts, delta, EGRESS_WINDOW_NS);
-        let alerted_recently = entry
-            .last_alert_ns
-            .is_some_and(|t| ts.saturating_sub(t) < EGRESS_WINDOW_NS);
-        if total >= EGRESS_BYTES_THRESHOLD && !alerted_recently {
+        let mut alerts = Vec::new();
+        let recently =
+            |last: Option<u64>| last.is_some_and(|t| ts.saturating_sub(t) < EGRESS_WINDOW_NS);
+        if let Some((class, domain)) = class
+            && total >= EGRESS_CLASSED_BYTES_THRESHOLD
+            && !recently(entry.last_class_alert_ns)
+        {
+            entry.last_class_alert_ns = Some(ts);
+            alerts.push(Alert {
+                technique: class.technique(),
+                severity: Severity::Medium,
+                message: format!(
+                    "pid={} comm={} sent {}MB to {} ({domain}, a {} service) in {}s — possible \
+                     exfiltration to a web service",
+                    event.meta.pid,
+                    event.meta.comm,
+                    total / (1024 * 1024),
+                    event.daddr,
+                    class.label(),
+                    EGRESS_WINDOW_NS / 1_000_000_000,
+                ),
+            });
+        }
+        if total >= EGRESS_BYTES_THRESHOLD && !recently(entry.last_alert_ns) {
             entry.last_alert_ns = Some(ts);
-            return Some(Alert {
+            alerts.push(Alert {
                 technique: "T1041/T1048",
                 severity: Severity::Medium,
                 message: format!(
@@ -1475,7 +1555,33 @@ impl RuleState {
                 ),
             });
         }
-        None
+        alerts
+    }
+
+    /// EGRESS-DOMAIN's join key: the storage or paste service this very pid resolved to the
+    /// flow's address, within [`DNS_CLASS_WINDOW_NS`], unless the pid is a browser (see
+    /// [`EGRESS_DOMAIN_BROWSER_COMMS`]). The class comes from the process's own lookup because
+    /// the address alone is shared with every other site behind the same CDN. A sighting
+    /// recorded for another incarnation of the pid (a recycled number) is not an answer.
+    fn resolved_service(&self, event: &NetworkFlowEvent) -> Option<(DomainClass, String)> {
+        let sighting = self.dns_class.peek(&(event.meta.pid, event.daddr))?;
+        let ts = event.meta.timestamp_ns;
+        if ts.saturating_sub(sighting.timestamp_ns) > DNS_CLASS_WINDOW_NS
+            || matches!(
+                (sighting.generation, event.meta.process_generation),
+                (Some(recorded), Some(current)) if recorded != current
+            )
+        {
+            return None;
+        }
+        let image = PidFact::current(
+            &self.pid_image_path,
+            event.meta.pid,
+            event.meta.process_generation,
+        );
+        let is_browser = EGRESS_DOMAIN_BROWSER_COMMS.contains(&event.meta.comm.as_str())
+            && policy::name_exclusion_applies(image);
+        (!is_browser).then(|| (sighting.class, sighting.domain.clone()))
     }
 
     /// LISTENER-DRIFT (issue #92, T1571 — non-standard port is the closest

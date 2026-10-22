@@ -404,6 +404,7 @@ fn captured_logs_sees_a_callsite_another_thread_registered_first() {
 mod ads;
 mod coverage;
 mod credfiles;
+mod egressdomain;
 mod linux;
 mod motw_removal;
 mod persistence;
