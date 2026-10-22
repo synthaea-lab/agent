@@ -374,3 +374,97 @@ fn the_local_and_remote_shell_service_rules_split_on_the_unc_argument() {
         assert!(remote.iter().any(|t| t == REMOTE), "{launcher}: {remote:?}");
     }
 }
+
+/// Titles raised for an exec of `image` under `parent` (`None` = the sensor gave no lineage).
+fn titles_for(engine: &SigmaEngine, parent: Option<&str>, image: &str) -> Vec<String> {
+    let sample = Sample {
+        image: image.into(),
+        cmdline: "x".into(),
+        parentimage: parent.map(Into::into),
+        note: None,
+    };
+    engine
+        .eval_exec(&exec(&sample))
+        .into_iter()
+        .map(|alert| alert.title)
+        .collect()
+}
+
+#[test]
+fn the_web_server_lineage_rules_cover_every_listed_parent_and_interpreter() {
+    const WINDOWS: &str = "Web server or application server spawned a command interpreter";
+    const MACOS: &str = "Web server spawned a shell on macOS";
+    let engine = SigmaEngine::load_dir(&content_dir()).unwrap();
+    for parent in [
+        "httpd.exe",
+        "nginx.exe",
+        "php-cgi.exe",
+        "tomcat8.exe",
+        "tomcat9.exe",
+        "tomcat10.exe",
+        "tomcat11.exe",
+    ] {
+        for interpreter in [
+            "cmd.exe",
+            "powershell.exe",
+            "pwsh.exe",
+            "wscript.exe",
+            "cscript.exe",
+        ] {
+            let hits = titles_for(
+                &engine,
+                Some(&format!(r"C:\srv\bin\{parent}")),
+                &format!(r"C:\Windows\System32\{interpreter}"),
+            );
+            assert!(
+                hits.iter().any(|t| t == WINDOWS),
+                "{parent} -> {interpreter}"
+            );
+        }
+    }
+    for parent in ["httpd", "nginx", "php-fpm"] {
+        for shell in ["sh", "bash", "zsh", "dash"] {
+            let hits = titles_for(
+                &engine,
+                Some(&format!("/usr/local/sbin/{parent}")),
+                &format!("/bin/{shell}"),
+            );
+            assert!(hits.iter().any(|t| t == MACOS), "{parent} -> {shell}");
+        }
+    }
+}
+
+#[test]
+fn the_web_server_lineage_rules_ignore_lookalikes_and_a_missing_lineage() {
+    const WINDOWS: &str = "Web server or application server spawned a command interpreter";
+    const MACOS: &str = "Web server spawned a shell on macOS";
+    let engine = SigmaEngine::load_dir(&content_dir()).unwrap();
+    let silent = |parent: Option<&str>, image: &str| {
+        let hits = titles_for(&engine, parent, image);
+        assert!(
+            !hits.iter().any(|t| t == WINDOWS || t == MACOS),
+            "{parent:?} -> {image}: {hits:?}"
+        );
+    };
+    // The parent is the condition: a name that only ends like a server's does not count.
+    silent(
+        Some(r"C:\tools\myhttpd.exe"),
+        r"C:\Windows\System32\cmd.exe",
+    );
+    silent(
+        Some(r"C:\srv\httpd.exe.bak"),
+        r"C:\Windows\System32\cmd.exe",
+    );
+    silent(Some("/opt/bin/myhttpd"), "/bin/sh");
+    silent(Some("/opt/bin/nginx-helper"), "/bin/sh");
+    // No lineage from the sensor: the rule cannot match, it never guesses.
+    silent(None, r"C:\Windows\System32\cmd.exe");
+    silent(None, "/bin/sh");
+    // A server starting something that is not an interpreter or a shell (a worker, a script
+    // interpreter run on purpose is the Linux rule's business, not these).
+    silent(Some(r"C:\srv\httpd.exe"), r"C:\srv\httpd.exe");
+    silent(Some("/usr/sbin/httpd"), "/usr/sbin/httpd");
+    // An interpreter whose name only ends like one.
+    silent(Some(r"C:\srv\httpd.exe"), r"C:\tools\mycmd.exe");
+    silent(Some("/usr/sbin/httpd"), "/usr/bin/ssh");
+}
