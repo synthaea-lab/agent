@@ -137,36 +137,80 @@ fn validate_field_map(
         ));
     }
     // Two keys that differ only by case are different keys to the parser, and evaluation ANDs
-    // them: a selection could be made never to fire, or a field silently doubled.
-    let mut seen = std::collections::HashSet::new();
+    // them. Keep the original spelling so the error can name both keys.
+    let mut seen = std::collections::HashMap::new();
     for spec in fields.keys() {
-        if !seen.insert(spec.to_lowercase()) {
+        if let Some(previous) = seen.insert(spec.to_lowercase(), spec) {
             return Err(unsupported(
                 path,
-                format!("field `{spec}` appears twice, differing only by case"),
+                format!("field specs `{previous}` and `{spec}` differ only by case"),
             ));
         }
     }
     for (spec, values) in fields {
-        let (field, modifier) = parse_field_spec(spec);
+        let parsed = parse_field_spec(spec);
+        let field = parsed.field;
         if !SUPPORTED_FIELDS.contains(&field.to_lowercase().as_str()) {
             return Err(unsupported(
                 path,
                 format!("field `{field}` (supported: Image, CommandLine, ParentImage)"),
             ));
         }
-        if let Some(m) = modifier
-            && !SUPPORTED_MODIFIERS.contains(&m.to_lowercase().as_str())
+        let mut match_modifier = None;
+        let mut seen_all = false;
+        for modifier in parsed.modifiers.clone() {
+            if modifier.eq_ignore_ascii_case("all") {
+                if seen_all {
+                    return Err(unsupported(
+                        path,
+                        format!("duplicate `all` modifier in `{spec}`"),
+                    ));
+                }
+                seen_all = true;
+            } else {
+                if !SUPPORTED_MODIFIERS.contains(&modifier.to_lowercase().as_str()) {
+                    return Err(unsupported(
+                        path,
+                        format!(
+                            "modifier `{modifier}` (supported: contains, startswith, endswith, all)"
+                        ),
+                    ));
+                }
+                if match_modifier.replace(modifier).is_some() {
+                    return Err(unsupported(
+                        path,
+                        format!(
+                            "multiple matching modifiers in `{spec}`; only one of contains, startswith, endswith is supported"
+                        ),
+                    ));
+                }
+            }
+        }
+        if seen_all
+            && parsed
+                .modifiers
+                .clone()
+                .next_back()
+                .is_some_and(|modifier| !modifier.eq_ignore_ascii_case("all"))
         {
             return Err(unsupported(
                 path,
-                format!("modifier `{m}` (supported: contains, startswith, endswith)"),
+                format!("modifier `all` must be last in `{spec}`"),
             ));
+        }
+        if seen_all && match_modifier.is_none() {
+            return Err(unsupported(
+                path,
+                format!("modifier `all` in `{spec}` must follow one matching modifier"),
+            ));
+        }
+        if values.as_slice().is_empty() {
+            return Err(unsupported(path, format!("empty value list for `{spec}`")));
         }
         // Interior wildcards are standard Sigma but outside the edge-only
         // subset — an accepted-but-never-matching rule is the silent-death
         // failure mode this validator exists to kill.
-        if modifier.is_none() {
+        if match_modifier.is_none() {
             for value in values.as_slice() {
                 validate_edge_only_wildcard(value, path, "")?;
             }

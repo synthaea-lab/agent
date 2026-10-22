@@ -59,46 +59,95 @@ fn eval_keywords(keywords: &[String], cmdline: &str) -> bool {
 /// Evaluates one Sigma field. `ParentImage` matches only when the sensor provided
 /// lineage (see `schema::ExecEvent::parent_image_path`).
 fn eval_field(field_spec: &str, values: &ValueList, event: &ExecEvent) -> bool {
-    let (field, modifier) = parse_field_spec(field_spec);
-    let haystack: &str = match field.to_lowercase().as_str() {
-        "image" => &event.image_path,
-        "commandline" => &event.cmdline,
-        "parentimage" => match &event.parent_image_path {
+    let parsed = parse_field_spec(field_spec);
+    let Some((modifier, all)) = parse_modifiers(parsed.modifiers) else {
+        return false;
+    };
+    let field = parsed.field;
+    let haystack: &str = if field.eq_ignore_ascii_case("image") {
+        &event.image_path
+    } else if field.eq_ignore_ascii_case("commandline") {
+        &event.cmdline
+    } else if field.eq_ignore_ascii_case("parentimage") {
+        match &event.parent_image_path {
             Some(p) => p,
             None => return false,
-        },
+        }
+    } else {
         // Unreachable for validated rules; defensive for direct eval of a
         // hand-constructed rule.
-        _ => return false,
+        return false;
     };
+    // Lowercased once per field, not once per listed value.
+    let haystack = haystack.to_lowercase();
+    let modifier = modifier.map(str::to_lowercase);
+    let modifier = modifier.as_deref();
 
-    values
-        .as_slice()
-        .iter()
-        .any(|val| match_value(haystack, val, modifier))
-}
-
-/// Parses `FieldName|modifier` → (`FieldName`, `Some("modifier")`) or (`FieldName`, `None`).
-pub(crate) fn parse_field_spec(spec: &str) -> (&str, Option<&str>) {
-    if let Some(idx) = spec.find('|') {
-        (&spec[..idx], Some(&spec[idx + 1..]))
-    } else {
-        (spec, None)
+    match values {
+        ValueList::Single(value) => match_value(&haystack, value, modifier),
+        ValueList::Many(values) if all => {
+            !values.is_empty()
+                && values
+                    .iter()
+                    .all(|value| match_value(&haystack, value, modifier))
+        }
+        ValueList::Many(values) => values
+            .iter()
+            .any(|value| match_value(&haystack, value, modifier)),
     }
 }
 
-/// Tests whether `haystack` matches `pattern` according to the Sigma modifier.
+/// The matching modifier and the `|all` flag of a field specification's modifiers: at most
+/// one matching modifier, optionally followed by `all`. `None` for any other shape, which
+/// evaluation treats as never matching. [`crate::validate`] refuses the same shapes with a
+/// specific message; a test keeps the two in agreement.
+pub(crate) fn parse_modifiers<'a>(
+    mut modifiers: impl Iterator<Item = &'a str>,
+) -> Option<(Option<&'a str>, bool)> {
+    let mut matching = None;
+    let mut all = false;
+    if let Some(first) = modifiers.next() {
+        if first.eq_ignore_ascii_case("all") {
+            return None;
+        }
+        matching = Some(first);
+        if let Some(second) = modifiers.next() {
+            if !second.eq_ignore_ascii_case("all") || modifiers.next().is_some() {
+                return None;
+            }
+            all = true;
+        }
+    }
+    Some((matching, all))
+}
+
+/// Parses a field specification into its field name and modifiers without allocating.
+pub(crate) fn parse_field_spec(spec: &str) -> ParsedFieldSpec<'_> {
+    let mut parts = spec.split('|');
+    let field = parts.next().unwrap_or(spec);
+    ParsedFieldSpec {
+        field,
+        modifiers: parts,
+    }
+}
+
+pub(crate) struct ParsedFieldSpec<'a> {
+    pub field: &'a str,
+    pub modifiers: std::str::Split<'a, char>,
+}
+
+/// Tests whether `haystack` matches `pattern` according to the Sigma modifier. The haystack
+/// and the modifier arrive already lowercased (see `eval_field`): validation accepts
+/// modifiers case-insensitively and evaluation must agree (`Image|EndsWith` loaded fine but
+/// silently glob-matched before that was fixed).
 fn match_value(haystack: &str, pattern: &str, modifier: Option<&str>) -> bool {
-    let h = haystack.to_lowercase();
     let p = pattern.to_lowercase();
-    // Validation accepts modifiers case-insensitively; evaluation must agree
-    // (`Image|EndsWith` loaded fine but silently glob-matched before this).
-    match modifier.map(str::to_lowercase).as_deref() {
-        None => glob_match(&h, &p),
-        Some("contains") => h.contains(&p),
-        Some("startswith") => h.starts_with(&p),
-        Some("endswith") => h.ends_with(&p),
-        _ => glob_match(&h, &p),
+    match modifier {
+        None => glob_match(haystack, &p),
+        Some("contains") => haystack.contains(&p),
+        Some("startswith") => haystack.starts_with(&p),
+        Some("endswith") => haystack.ends_with(&p),
+        _ => glob_match(haystack, &p),
     }
 }
 

@@ -139,6 +139,12 @@ pub struct CorrelationEngine {
     /// exclusion is name-keyed and would otherwise be a trivial bypass (user
     /// finding); these pids keep full rule evaluation.
     masquerading: BoundedMap<u32, Option<u64>>,
+    /// Pids whose `ExecEvent` showed an image under a system path, started directly
+    /// by init (a system service's main process, #652 — nothing here checks package
+    /// ownership, see the comment above `agent::sink::SERVICE_MAIN_REFUSAL`'s definition).
+    /// Only read by the kill gate ([`Self::is_service_main_process`]); detection and
+    /// belief never look at it.
+    service_mains: BoundedMap<u32, Option<u64>>,
 }
 
 /// Bounds for a long-lived agent: entities cover the realistic live-pid space with
@@ -190,6 +196,7 @@ impl CorrelationEngine {
             pid_entities: BoundedMap::new(ENTITY_CAP),
             fired: BoundedMap::new(BELIEF_CAP),
             masquerading: BoundedMap::new(ENTITY_CAP),
+            service_mains: BoundedMap::new(ENTITY_CAP),
         }
     }
 
@@ -254,6 +261,25 @@ impl CorrelationEngine {
                     || !policy::parent_exclusion_applies(&comm, exec.parent_comm.as_deref()))
             {
                 self.masquerading.insert(pid, generation);
+            }
+        }
+
+        if let Event::Exec(exec) = &event {
+            if ppid == 1
+                && !exec.image_path.is_empty()
+                && policy::service_main_path_is_trusted(exec.image_path.as_str())
+            {
+                self.service_mains.insert(pid, generation);
+            } else {
+                // Re-exec clears a stale entry (#755 review, Sollykhan 2026-10-19):
+                // `service_mains` was insert-only, so a pid once recorded as a
+                // service main (e.g. NetworkManager) kept that status on `self`
+                // forever, even after an `Exec` to an image that no longer
+                // qualifies — a compromised daemon's `execve("/tmp/x")` stayed
+                // immune to the BAYES kill on its new image. Any exec that does
+                // not (re-)qualify drops the pid's entry; a no-op when it was
+                // never a service main (`BoundedMap::remove` on an absent key).
+                self.service_mains.remove(&pid);
             }
         }
 
@@ -453,6 +479,21 @@ impl CorrelationEngine {
 
     fn is_masquerading(&self, pid: u32, generation: Option<u64>) -> bool {
         self.masquerading
+            .peek(&pid)
+            .is_some_and(|&recorded| same_generation(recorded, generation))
+    }
+
+    /// Whether `pid` is the main process of a system service: its exec showed an image
+    /// under a trusted system path, started directly by init (`ppid == 1`) (#652).
+    ///
+    /// Provenance, not evidence: the kill gate uses it to refuse to terminate such a
+    /// process on a Bayesian crossing alone (`NetworkManager` crossed on a stock host).
+    /// A child of that service (a shell spawned by a compromised daemon) is not the
+    /// main process and stays killable. An exec with no image path, or never seen, is
+    /// not a service main: the sensor not knowing is not a reason to protect.
+    #[must_use]
+    pub fn is_service_main_process(&self, pid: u32, generation: Option<u64>) -> bool {
+        self.service_mains
             .peek(&pid)
             .is_some_and(|&recorded| same_generation(recorded, generation))
     }

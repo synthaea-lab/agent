@@ -287,6 +287,192 @@ fn update_belief_with_ml_before_any_belief_state_is_silent_err() {
     assert!(engine.update_belief_with_ml(9999, None, Some(1.0)).is_err());
 }
 
+// ── Service main process provenance (issue #652) ───────────────────────────
+
+#[test]
+fn a_package_binary_started_by_init_is_a_service_main_process() {
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(exec_with_meta(
+        meta_full(800, 1, "NetworkManager", 0),
+        "/usr/sbin/NetworkManager",
+    ));
+    assert!(engine.is_service_main_process(800, None));
+}
+
+#[test]
+fn only_the_services_own_process_counts_not_what_it_spawns() {
+    // A shell spawned by a compromised daemon runs a trusted binary too, but its
+    // parent is the daemon, not init: it stays killable.
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(exec_with_meta(meta_full(801, 800, "sh", 0), "/usr/bin/sh"));
+    assert!(!engine.is_service_main_process(801, None));
+}
+
+#[test]
+fn an_untrusted_path_or_an_unknown_one_is_never_a_service_main_process() {
+    let mut engine = CorrelationEngine::new();
+    // A payload renamed after a service, started by init from /tmp.
+    engine.on_event(exec_with_meta(
+        meta_full(802, 1, "NetworkManager", 0),
+        "/tmp/NetworkManager",
+    ));
+    // The sensor did not report an image path: not evidence of a service.
+    engine.on_event(exec_with_meta(meta_full(803, 1, "chronyd", 0), ""));
+    assert!(!engine.is_service_main_process(802, None));
+    assert!(!engine.is_service_main_process(803, None));
+    assert!(
+        !engine.is_service_main_process(804, None),
+        "a pid whose exec was never seen is not a service main process"
+    );
+}
+
+#[test]
+fn a_recycled_pid_does_not_inherit_the_service_provenance() {
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(stamped(
+        exec_with_meta(meta_full(805, 1, "crond", 0), "/usr/sbin/crond"),
+        1,
+    ));
+    assert!(engine.is_service_main_process(805, Some(1)));
+    assert!(!engine.is_service_main_process(805, Some(2)));
+}
+
+#[test]
+fn a_reexec_to_an_untrusted_image_clears_the_service_main_entry() {
+    // Review of #755 (Sollykhan, 2026-10-19): `service_mains` was insert-only, so a
+    // service main later compromised and `exec`'d into something else (same pid,
+    // same generation — this is not a fork) kept the kill-gate refusal on its new
+    // image forever. A pid stays a service main only as of its most recent exec.
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(stamped(
+        exec_with_meta(meta_full(806, 1, "crond", 0), "/usr/sbin/crond"),
+        1,
+    ));
+    assert!(engine.is_service_main_process(806, Some(1)));
+
+    engine.on_event(stamped(
+        exec_with_meta(meta_full(806, 1, "crond", 1), "/tmp/payload"),
+        1,
+    ));
+    assert!(
+        !engine.is_service_main_process(806, Some(1)),
+        "an exec to an untrusted image on the same pid/generation must drop the \
+         service-main entry, not keep protecting the new image"
+    );
+}
+
+#[test]
+fn a_shell_or_interpreter_started_by_init_is_not_a_service_main_process() {
+    // Review of #755 (Sollykhan, 2026-10-19): a systemd unit's `ExecStart` can be a
+    // shell or interpreter (`ExecStart=/usr/bin/python3 /var/tmp/x.py`) just as
+    // easily as a real daemon's own binary. The interpreter, not the script, is
+    // what execs with ppid 1 — without this exclusion every payload run that way
+    // would be permanently immune to the BAYES kill gate.
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(exec_with_meta(
+        meta_full(807, 1, "python3", 0),
+        "/usr/bin/python3",
+    ));
+    engine.on_event(exec_with_meta(
+        meta_full(808, 1, "bash", 0),
+        "/usr/bin/bash",
+    ));
+    assert!(!engine.is_service_main_process(807, None));
+    assert!(!engine.is_service_main_process(808, None));
+}
+
+#[test]
+fn opt_and_usr_local_are_not_service_main_paths() {
+    // Review of #755 (Sollykhan, 2026-10-19): /opt/ and /usr/local/ host
+    // third-party and admin-installed software as easily as a root attacker's own
+    // unit — being under either is not evidence of being the kind of system-
+    // installed service the broader name-exclusion check was designed to rule out a
+    // masquerade for.
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(exec_with_meta(
+        meta_full(809, 1, "kworkerd", 0),
+        "/usr/local/bin/kworkerd",
+    ));
+    engine.on_event(exec_with_meta(meta_full(810, 1, "x", 0), "/opt/x/x"));
+    assert!(!engine.is_service_main_process(809, None));
+    assert!(!engine.is_service_main_process(810, None));
+}
+
+#[test]
+fn a_daemon_that_shares_an_interpreter_family_prefix_still_qualifies() {
+    // Review of #755 (old-dov, 2026-10-19): a bare `starts_with` on the family
+    // list over-matches a real daemon that happens to share a prefix with an
+    // interpreter name — php-fpm (the PHP-FPM master, #478's web host context)
+    // is not a script runner, and losing its service-main status would make it
+    // killable on a BAYES crossing again, the opposite of what this guard is
+    // for. Only a bare family name or a version suffix (digits and `.`) counts
+    // as the interpreter itself.
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(exec_with_meta(
+        meta_full(811, 1, "php-fpm8.4", 0),
+        "/usr/sbin/php-fpm8.4",
+    ));
+    engine.on_event(exec_with_meta(
+        meta_full(812, 1, "nodm", 0),
+        "/usr/bin/nodm",
+    ));
+    assert!(engine.is_service_main_process(811, None));
+    assert!(engine.is_service_main_process(812, None));
+
+    // The actual interpreter, with or without a version suffix, still does not.
+    engine.on_event(exec_with_meta(
+        meta_full(813, 1, "php8.4", 0),
+        "/usr/bin/php8.4",
+    ));
+    assert!(!engine.is_service_main_process(813, None));
+}
+
+#[test]
+fn interpreters_the_blocklist_used_to_miss_are_now_excluded() {
+    // Review of #755 (old-dov and SherlockOmss, 2026-10-19): a handful of real
+    // script runners had no version-suffix convention `FAMILIES` could already
+    // tolerate (`nodejs`, the only Node.js binary name some Debian/Ubuntu
+    // packages ship) or weren't in either list at all (`php-cgi`, which runs
+    // scripts, unlike the `php-fpm` daemon the previous test pins as protected).
+    // Each used to let a unit `ExecStart=`ing it through as a "service main",
+    // making any payload run through it permanently immune to the BAYES kill
+    // gate — the same class of hole #652 exists to close.
+    let mut engine = CorrelationEngine::new();
+    for (pid, name, path) in [
+        (814, "nodejs", "/usr/bin/nodejs"),
+        (815, "php-cgi8.4", "/usr/bin/php-cgi8.4"),
+        (816, "lua5.4", "/usr/bin/lua5.4"),
+        (817, "tclsh8.6", "/usr/bin/tclsh8.6"),
+        (818, "pypy3", "/usr/bin/pypy3"),
+    ] {
+        engine.on_event(exec_with_meta(meta_full(pid, 1, name, 0), path));
+        assert!(
+            !engine.is_service_main_process(pid, None),
+            "{name} must not be classed as a service main"
+        );
+    }
+
+    // `php-fpm` (the daemon) does not share the `php-cgi` family prefix, so it
+    // is unaffected by giving `php-cgi` its own entry.
+    engine.on_event(exec_with_meta(
+        meta_full(819, 1, "php-fpm8.4", 0),
+        "/usr/sbin/php-fpm8.4",
+    ));
+    assert!(engine.is_service_main_process(819, None));
+
+    // Documented, not fixed by this PR (ADR-0028 Consequences): a network tool
+    // run directly by a unit is not a known shell/interpreter/daemon name, so
+    // it still passes as a "service main". Pinning this is deliberate — it is
+    // the unbounded-tail gap the ADR now names explicitly, not a regression to
+    // catch, and a future narrowing of the blocklist should not close it by
+    // accident without updating that documentation.
+    engine.on_event(exec_with_meta(
+        meta_full(820, 1, "socat", 0),
+        "/usr/bin/socat",
+    ));
+    assert!(engine.is_service_main_process(820, None));
+}
+
 // ── BAYES_NAME_EXCLUSIONS (issue #212) ──────────────────────────────────────
 
 #[test]

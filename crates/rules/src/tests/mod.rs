@@ -401,12 +401,15 @@ fn captured_logs_sees_a_callsite_another_thread_registered_first() {
     );
 }
 
+mod ads;
 mod coverage;
+mod credfiles;
 mod linux;
 mod motw_removal;
 mod persistence;
 mod quarantine;
 mod rdp;
+mod recon;
 mod session;
 mod sudo;
 mod tamper;

@@ -152,6 +152,9 @@ TECHNIQUE_TACTIC = {
     "T1546.004": "Persistence",
     "T1547.015": "Persistence",
     "T1548": "Privilege Escalation",
+    "T1552": "Credential Access",
+    "T1552.001": "Credential Access",
+    "T1552.004": "Credential Access",
     "T1553.005": "Defense Evasion",
     "T1562.001": "Defense Evasion",
     "T1562.004": "Defense Evasion",
@@ -161,6 +164,10 @@ TECHNIQUE_TACTIC = {
     "T1620": "Defense Evasion",
     "T1021.002": "Lateral Movement",
     "T1563.002": "Lateral Movement",
+    "T1016": "Discovery",
+    "T1057": "Discovery",
+    "T1082": "Discovery",
+    "T1087": "Discovery",
 }
 
 UNMAPPED_TACTIC = "Unmapped — add to TECHNIQUE_TACTIC"
