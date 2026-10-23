@@ -9,6 +9,12 @@ all-features = true
 version = 2
 yanked = "deny"
 # Scoped, justified exceptions — each names its blast radius and revisit condition.
+# Nothing here expires on its own (#919): CI's `-D unknown-advisory -D
+# advisory-not-detected` (see .github/workflows/ci.yml) is what actually enforces
+# "revisit when yara-x moves off bincode" / "bump the moment yara-x's requirement
+# allows one" below — the day a dependency bump makes one of these ids stop
+# matching anything in the tree, the build fails instead of the ignore going
+# silently stale.
 ignore = [
     # bincode team ceased development; yara-x uses it only for (de)serializing OUR
     # compiled rule sets, a format we produce and consume ourselves. Revisit when
