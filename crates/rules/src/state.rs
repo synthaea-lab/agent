@@ -8,11 +8,11 @@ use std::{
 };
 
 use schema::{
-    AuthEvent, AuthKind, AuthOutcome, ConnectEvent, DnsQueryEvent, Event, ExecEvent,
-    FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FileDeleteEvent, FileOpenEvent, FileQuarantineEvent,
-    FileRenameEvent, FileWriteEvent, ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT,
-    POLICY_MECHANISM_SELINUX, PolicyDenialEvent, SessionEvent, SessionState, User,
-    detection::Severity,
+    AuthEvent, AuthKind, AuthOutcome, BitsJobEvent, BitsJobState, ConnectEvent, DnsQueryEvent,
+    Event, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FileDeleteEvent, FileOpenEvent,
+    FileQuarantineEvent, FileRenameEvent, FileWriteEvent, ListenPortEvent, MemfdCreateEvent,
+    NetworkFlowEvent, O_CREAT, POLICY_MECHANISM_SELINUX, PolicyDenialEvent, SessionEvent,
+    SessionState, User, detection::Severity,
 };
 use store::BoundedMap;
 
@@ -23,7 +23,7 @@ use crate::{
     exclusions::{
         AGENT_CHILD_EXCLUSIONS, APK_STAGING_FILE_PREFIX, ARCHIVE_EGRESS_WINDOW_NS,
         ARCHIVE_READ_WINDOW_NS, ARCHIVE_STAGED_BYTES, ARCHIVE_SUFFIXES, AUTH_FAILURE_THRESHOLD,
-        AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD, BEACON_WINDOW_NS, BROWSERS,
+        AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD, BEACON_WINDOW_NS, BITS_EXEC_WINDOW_NS, BROWSERS,
         BURST_WRITE_BYTES_THRESHOLD, COMPRESSION_DRIVER_COMMS, COMPRESSION_SUFFIXES,
         COMPRESSOR_COMMS, CREATE_UNLINK_HISTORY_PER_PID, CREATE_UNLINK_PAIR_WINDOW_NS,
         CREATE_UNLINK_PID_CAP, CREDENTIAL_READ_ALERT_WINDOW_NS, DNS_CLASS_WINDOW_NS,
@@ -137,6 +137,24 @@ struct RecentQuarantine {
     agent: Option<String>,
     origin_url: Option<String>,
     /// Set by the first exec that alerted: one alert per mark, not per run.
+    alerted: bool,
+}
+
+/// A file a BITS job downloads, as [`RuleState::on_bits_job`] saw it.
+struct RecentBitsDownload {
+    /// The job's latest file-added or completion time: the exec window runs
+    /// from when the file is actually there.
+    timestamp_ns: u64,
+    /// The job that armed this path.
+    job_id: String,
+    /// That job completed: the file is on disk, and no cancellation of
+    /// another job (or a late one of this job) removes it.
+    on_disk: bool,
+    client_pid: u32,
+    client_comm: String,
+    job_title: String,
+    url: String,
+    /// Set by the first exec that alerted: one alert per download, not per run.
     alerted: bool,
 }
 
@@ -254,6 +272,9 @@ pub struct RuleState {
     /// #365). LRU-bounded like `recent_writes`: a burst of downloads, or a
     /// hostile loop writing marks, must not grow agent memory.
     recent_quarantines: BoundedMap<String, RecentQuarantine>,
+    /// case-folded local path → the BITS job downloading it (T1197, #284).
+    /// LRU-bounded like `recent_quarantines`.
+    recent_bits_downloads: BoundedMap<String, RecentBitsDownload>,
     /// case-folded host path → its latest mark-of-the-web removal (T1553.005,
     /// #442). LRU-bounded: `Unblock-File` over a whole module tree removes
     /// hundreds of marks at once.
@@ -510,6 +531,7 @@ impl RuleState {
             pid_image_path: BoundedMap::new(PID_COMM_CAP),
             recent_writes: BoundedMap::new(RECENT_WRITES_CAP),
             recent_quarantines: BoundedMap::new(RECENT_WRITES_CAP),
+            recent_bits_downloads: BoundedMap::new(RECENT_WRITES_CAP),
             recent_motw_removals: BoundedMap::new(RECENT_WRITES_CAP),
             self_spawn: BoundedMap::new(COUNTER_CAP),
             ldap_burst: crate::ldap::LdapBurst::new(),
@@ -782,6 +804,50 @@ impl RuleState {
                 mark.agent.as_deref().unwrap_or("unknown"),
             ),
         }))
+    }
+
+    /// T1197 — BITS Jobs. A file a BITS job downloaded is executed within
+    /// [`BITS_EXEC_WINDOW_NS`] of the job adding it or completing (#284). BITS
+    /// does the download from its own service, so neither the T1105 joins
+    /// (keyed on the downloading comm) nor the correlator's connect+write
+    /// rule (keyed on one pid) can see it; the job record is what names the
+    /// client.
+    ///
+    /// One alert per download (`alerted`), case-folded paths. Files fetched
+    /// from Microsoft update hosts are filtered at the sensor and never reach
+    /// this table; the job's owner is not a filter.
+    ///
+    /// Not covered: notify-command persistence (`bitsadmin /SetNotifyCmdLine`)
+    /// is no job state the provider reports, so its set-up shows only as the
+    /// `bitsadmin` command line. The file it runs, when BITS downloaded it,
+    /// still joins here.
+    fn check_bits_download_exec(&mut self, event: &ExecEvent) -> Option<Alert> {
+        let now = event.meta.timestamp_ns;
+        let download = self
+            .recent_bits_downloads
+            .get_mut(&event.image_path.to_lowercase())?;
+        let age = now.saturating_sub(download.timestamp_ns);
+        if download.alerted || age > BITS_EXEC_WINDOW_NS {
+            return None;
+        }
+        download.alerted = true;
+        Some(Alert {
+            technique: "T1197",
+            // Below T1105/T1204.002: non-Microsoft updaters (Google Omaha,
+            // OneDrive) download through BITS and run what they fetched.
+            severity: Severity::Medium,
+            message: format!(
+                "pid={} comm={} executes {}, downloaded {} earlier by BITS job \"{}\" of pid={} comm={} (url: {})",
+                event.meta.pid,
+                event.meta.comm,
+                event.image_path,
+                format_delta(age),
+                download.job_title,
+                download.client_pid,
+                download.client_comm,
+                download.url,
+            ),
+        })
     }
 
     // ── Windows rules ────────────────────────────────────────────────────────
@@ -1346,6 +1412,7 @@ impl RuleState {
         let mut alerts = Vec::new();
         alerts.extend(self.check_web_server_spawns_shell(event));
         alerts.extend(self.check_download_then_exec(event));
+        alerts.extend(self.check_bits_download_exec(event));
         alerts.extend(self.check_exec_after_motw_removal(event));
         alerts.extend(self.check_self_spawn(event));
         alerts.extend(self.check_parent_suspect(event));
@@ -2122,6 +2189,66 @@ impl RuleState {
                 agent: event.agent.clone(),
                 origin_url: event.origin_url.clone(),
                 alerted: false,
+            },
+        );
+    }
+
+    /// To be called for every `BitsJobEvent` in the stream: records the job's
+    /// file for the T1197 download→exec join
+    /// ([`Self::check_bits_download_exec`]). No alert on its own: BITS is
+    /// also how browsers and updaters fetch their components.
+    pub fn on_bits_job(&mut self, event: &BitsJobEvent) {
+        let key = event.local_path.to_lowercase();
+        let previous = self.recent_bits_downloads.peek(&key);
+        let same_job = previous.is_some_and(|d| d.job_id == event.job_id);
+        match event.state {
+            BitsJobState::FileAdded => {
+                // Another job's completed download is what sits at the path:
+                // its window and attribution stand until a completion
+                // replaces the file (#577 review).
+                if previous.is_some_and(|d| d.on_disk && !same_job) {
+                    return;
+                }
+                self.arm_bits_download(key, event, false, false);
+            }
+            BitsJobState::Completed => {
+                // A late completion of the download that already alerted is not
+                // a new download; another job's completion is.
+                let alerted = same_job && previous.is_some_and(|d| d.alerted);
+                self.arm_bits_download(key, event, true, alerted);
+            }
+            // A cancelled job deletes its own partial file: nothing of it left
+            // to run. Only its own, and only a partial one: cancelling job B,
+            // which targeted the path job A already downloaded, leaves A's
+            // payload in place (#577 review).
+            BitsJobState::Cancelled => {
+                if same_job && previous.is_some_and(|d| !d.on_disk) {
+                    self.recent_bits_downloads.remove(&key);
+                }
+            }
+            // BITS retries a failed transfer on its own; keep the entry.
+            BitsJobState::TransferError => {}
+        }
+    }
+
+    fn arm_bits_download(
+        &mut self,
+        key: String,
+        event: &BitsJobEvent,
+        on_disk: bool,
+        alerted: bool,
+    ) {
+        self.recent_bits_downloads.insert(
+            key,
+            RecentBitsDownload {
+                timestamp_ns: event.meta.timestamp_ns,
+                job_id: event.job_id.clone(),
+                on_disk,
+                client_pid: event.meta.pid,
+                client_comm: event.meta.comm.clone(),
+                job_title: event.job_title.clone(),
+                url: event.url.clone(),
+                alerted,
             },
         );
     }
