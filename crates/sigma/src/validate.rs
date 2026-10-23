@@ -37,13 +37,29 @@ const KNOWN_PLATFORMS: &[&str] = &["linux", "windows", "macos"];
 /// rule missing the required metadata (issue #73: severity, ATT&CK technique,
 /// false-positive notes, platform).
 pub(crate) fn validate(rule: &SigmaRule, path: &str) -> Result<(), SigmaError> {
-    validate_condition(rule, path)?;
-    let Some(selection) = rule.detection.selections.get("selection") else {
-        return Err(unsupported(path, "missing `selection` block".to_string()));
-    };
-    match selection {
-        Selection::FieldMap(fields) => validate_field_map(fields, path)?,
-        Selection::Keywords(keywords) => validate_keywords(keywords, path)?,
+    let compiled = validate_condition(rule, path)?;
+    // Every block the condition refers to is checked as strictly as `selection` always was. A
+    // block it does not refer to is never evaluated and stays unchecked, as before.
+    for name in &compiled.blocks {
+        // `compile` resolved every name against the rule's blocks.
+        let Some(block) = rule.detection.selections.get(name) else {
+            return Err(unsupported(path, format!("missing `{name}` block")));
+        };
+        let checked = match block {
+            Selection::FieldMap(fields) => validate_field_map(fields, path),
+            Selection::Keywords(keywords) => validate_keywords(keywords, path),
+        };
+        // The message of the one block every rule used to have is unchanged; the others say
+        // which block they are about.
+        checked.map_err(|error| match error {
+            SigmaError::Unsupported { path, what } if name != "selection" => {
+                SigmaError::Unsupported {
+                    path,
+                    what: format!("{what} (in block `{name}`)"),
+                }
+            }
+            other => other,
+        })?;
     }
     validate_metadata(rule, path)
 }
@@ -112,16 +128,31 @@ fn missing_metadata(path: &str, what: String) -> SigmaError {
     }
 }
 
-fn validate_condition(rule: &SigmaRule, path: &str) -> Result<(), SigmaError> {
+/// Parses the condition (see [`crate::condition`]) and refuses a `timeframe`, which only an
+/// aggregation gives a meaning to.
+fn validate_condition<'a>(
+    rule: &'a SigmaRule,
+    path: &str,
+) -> Result<&'a crate::condition::Compiled, SigmaError> {
     let condition = rule.detection.condition.trim();
-    if condition == "selection" {
-        Ok(())
-    } else {
-        Err(unsupported(
+    let compiled = rule.compiled().as_ref().map_err(|reason| {
+        unsupported(
             path,
-            format!("condition `{condition}` (only `condition: selection` is supported)"),
-        ))
+            format!(
+                "condition `{condition}`: {reason} (supported: and, or, not, parentheses, \
+                 `1 of` / `all of` a block, a `prefix*` pattern or `them`)"
+            ),
+        )
+    })?;
+    if let Some(timeframe) = &rule.detection.timeframe {
+        return Err(unsupported(
+            path,
+            format!(
+                "`timeframe: {timeframe}` (only meaningful with an aggregation, which is not supported)"
+            ),
+        ));
     }
+    Ok(compiled)
 }
 
 fn validate_field_map(

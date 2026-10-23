@@ -225,7 +225,7 @@ detection:
     Image: 'x'
   filter:
     Image: 'y'
-  condition: selection and not filter
+  condition: selection | count() > 5
 "#,
     )
     .unwrap();
