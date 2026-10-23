@@ -96,12 +96,38 @@ pub fn run(
                     match wire::decode(payload) {
                         Ok(message) => {
                             on_alive();
-                            let lost = lock(stats).on_message(&message);
+                            let (lost, truncated_count, baseline) = {
+                                let mut stats = lock(stats);
+                                let first_message = stats.received == 0;
+                                let lost = stats.on_message(&message);
+                                let truncated_count = if message.body.has_truncated_path() {
+                                    stats.on_truncated_path();
+                                    Some(stats.truncated_paths)
+                                } else {
+                                    None
+                                };
+                                (lost, truncated_count, first_message.then_some(stats.driver))
+                            };
+                            if let Some(counters) = baseline {
+                                tracing::info!(
+                                    queue_full = counters.dropped_queue_full,
+                                    send_failed = counters.dropped_send_failed,
+                                    not_connected = counters.not_connected,
+                                    capture_failed = counters.dropped_capture_failed,
+                                    "minifilter: driver counters at first message (may predate this agent)"
+                                );
+                            }
                             if lost > 0 {
                                 tracing::warn!(
                                     lost,
                                     seq = message.seq,
                                     "minifilter: records missing before this one"
+                                );
+                            }
+                            if let Some(count) = truncated_count.filter(|n| n.is_power_of_two()) {
+                                tracing::warn!(
+                                    truncated_paths = count,
+                                    "minifilter: event with a cut path was not forwarded"
                                 );
                             }
                             if needs_refresh(&message) && last_refresh.elapsed() >= VOLUME_REFRESH {
@@ -176,7 +202,8 @@ impl LossReport {
             not_connected = stats.driver.not_connected,
             capture_failed = stats.driver.dropped_capture_failed,
             decode_errors = stats.decode_errors,
-            "minifilter: file events were lost (driver counters and sequence gaps)"
+            truncated_paths = stats.truncated_paths,
+            "minifilter: file event loss indicators increased"
         );
         self.lost = lost;
         self.decode_errors = stats.decode_errors;

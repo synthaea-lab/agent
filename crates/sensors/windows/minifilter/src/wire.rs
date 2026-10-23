@@ -40,7 +40,8 @@ pub struct Counters {
     pub dropped_queue_full: u64,
     /// Records dropped because `FltSendMessage` failed or timed out.
     pub dropped_send_failed: u64,
-    /// Operations not queued because no agent was connected.
+    /// Qualifying attempts observed while no agent was connected; pre-operation increments
+    /// may precede a failed operation, so this is an upper bound on lost file events.
     pub not_connected: u64,
     /// Operations of a reported kind that succeeded but could not be captured (protocol v3,
     /// found by the low-resources lab run of #857): their names or their record could not be
@@ -68,6 +69,21 @@ pub enum Body {
         old_truncated: bool,
         new_truncated: bool,
     },
+}
+
+impl Body {
+    /// A cut path cannot be matched safely as a complete file name.
+    pub(crate) fn has_truncated_path(&self) -> bool {
+        match self {
+            Self::Heartbeat => false,
+            Self::Delete { truncated, .. } => *truncated,
+            Self::Rename {
+                old_truncated,
+                new_truncated,
+                ..
+            } => *old_truncated || *new_truncated,
+        }
+    }
 }
 
 /// One decoded message.

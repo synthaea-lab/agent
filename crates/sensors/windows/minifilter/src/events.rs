@@ -88,8 +88,8 @@ impl VolumeMap {
     }
 }
 
-/// The schema event for one driver message, or `None` for a heartbeat (it proves the driver
-/// is alive and carries counters, but describes no file).
+/// The schema event for one driver message, or `None` for a heartbeat or a cut path. A partial
+/// path must not masquerade as a complete name in the rules; the receive loop counts it.
 ///
 /// The driver knows the pid and the thread, not the image, the parent or the user: `comm` is
 /// left empty, `ppid` 0 and `user` unknown. Nothing in the agent fills them in for these events
@@ -99,6 +99,9 @@ impl VolumeMap {
 /// 32-bit in practice); it is clamped to 0, "unknown", rather than truncated to a real pid.
 #[must_use]
 pub fn to_event(message: &Message, volumes: &VolumeMap) -> Option<Event> {
+    if message.body.has_truncated_path() {
+        return None;
+    }
     let meta = EventMeta {
         pid: u32::try_from(message.pid).unwrap_or(0),
         ppid: 0,
@@ -129,7 +132,7 @@ pub fn to_event(message: &Message, volumes: &VolumeMap) -> Option<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::Counters;
+    use crate::wire::{self, Counters};
 
     fn volumes() -> VolumeMap {
         VolumeMap::from_pairs([
@@ -146,6 +149,40 @@ mod tests {
             tid: 17,
             counters: Counters::default(),
             body,
+        }
+    }
+
+    #[test]
+    fn truncated_wire_paths_are_not_emitted_as_complete_file_events() {
+        let cases = [
+            Body::Delete {
+                path: r"\Device\HarddiskVolume1\d\file.doc".into(),
+                on_close: false,
+                truncated: true,
+            },
+            Body::Rename {
+                old_path: r"\Device\HarddiskVolume1\d\old.doc".into(),
+                new_path: r"\Device\HarddiskVolume1\d\new.doc".into(),
+                old_truncated: true,
+                new_truncated: false,
+            },
+            Body::Rename {
+                old_path: r"\Device\HarddiskVolume1\d\old.doc".into(),
+                new_path: r"\Device\HarddiskVolume1\d\new.doc".into(),
+                old_truncated: false,
+                new_truncated: true,
+            },
+            Body::Rename {
+                old_path: r"\Device\HarddiskVolume1\d\old.doc".into(),
+                new_path: r"\Device\HarddiskVolume1\d\new.doc".into(),
+                old_truncated: true,
+                new_truncated: true,
+            },
+        ];
+        for body in cases {
+            let bytes = wire::encode(&message(body), 133_000_000_000_000_000);
+            let decoded = wire::decode(&bytes).unwrap();
+            assert!(to_event(&decoded, &volumes()).is_none());
         }
     }
 
