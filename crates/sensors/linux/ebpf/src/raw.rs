@@ -13,18 +13,20 @@ use aya_log_ebpf::{info, warn};
 #[cfg(bpf_target_arch = "aarch64")]
 use sensor_linux_wire::syscall_nr_from_i32;
 use sensor_linux_wire::{
-    LineageEntry, TASK_COMM_LEN, encode_pending_syscall_exit, matching_pending_syscall_exit,
+    DISPATCH_CONNECT, DISPATCH_SENDTO, DISPATCH_WRITE, LineageEntry, TASK_COMM_LEN,
+    encode_pending_syscall_exit, matching_pending_syscall_exit,
 };
 
 use crate::{
-    PROC_LINEAGE, sys_enter_accept, sys_enter_accept4, sys_enter_bind, sys_enter_bpf,
-    sys_enter_capset, sys_enter_chmod, sys_enter_chown, sys_enter_connect, sys_enter_delete_module,
-    sys_enter_fchmodat, sys_enter_fchownat, sys_enter_finit_module, sys_enter_init_module,
-    sys_enter_kill, sys_enter_lchown, sys_enter_listen, sys_enter_memfd_create, sys_enter_mount,
-    sys_enter_open, sys_enter_openat, sys_enter_prctl, sys_enter_process_vm_readv,
-    sys_enter_process_vm_writev, sys_enter_ptrace, sys_enter_recvfrom, sys_enter_removexattr,
-    sys_enter_rename, sys_enter_renameat, sys_enter_renameat2, sys_enter_sendto,
-    sys_enter_setfsgid, sys_enter_setfsuid, sys_enter_setgid, sys_enter_setns, sys_enter_setresgid,
+    PROC_LINEAGE, dns_udp_connect, dns_udp_sendto, dns_udp_write, sys_enter_accept,
+    sys_enter_accept4, sys_enter_bind, sys_enter_bpf, sys_enter_capset, sys_enter_chmod,
+    sys_enter_chown, sys_enter_connect, sys_enter_delete_module, sys_enter_fchmodat,
+    sys_enter_fchownat, sys_enter_finit_module, sys_enter_init_module, sys_enter_kill,
+    sys_enter_lchown, sys_enter_listen, sys_enter_memfd_create, sys_enter_mount, sys_enter_open,
+    sys_enter_openat, sys_enter_prctl, sys_enter_process_vm_readv, sys_enter_process_vm_writev,
+    sys_enter_ptrace, sys_enter_recvfrom, sys_enter_removexattr, sys_enter_rename,
+    sys_enter_renameat, sys_enter_renameat2, sys_enter_sendto, sys_enter_setfsgid,
+    sys_enter_setfsuid, sys_enter_setgid, sys_enter_setns, sys_enter_setresgid,
     sys_enter_setresuid, sys_enter_setuid, sys_enter_setxattr, sys_enter_socket, sys_enter_tgkill,
     sys_enter_umount, sys_enter_unlink, sys_enter_unlinkat, sys_enter_unshare, sys_enter_write,
     sys_exit_accept, sys_exit_accept4, sys_exit_memfd_create, sys_exit_recvfrom, sys_exit_socket,
@@ -255,8 +257,8 @@ pub fn raw_sys_enter(ctx: RawTracePointContext) -> u32 {
     match *action {
         1 => sys_enter_openat(trace_ctx),
         2 => sys_enter_open(trace_ctx),
-        3 => sys_enter_connect(trace_ctx),
-        4 => sys_enter_write(trace_ctx),
+        DISPATCH_CONNECT => sys_enter_connect(trace_ctx),
+        DISPATCH_WRITE => sys_enter_write(trace_ctx),
         5 => sys_enter_unlink(trace_ctx),
         6 => sys_enter_unlinkat(trace_ctx),
         7 => sys_enter_rename(trace_ctx),
@@ -268,7 +270,7 @@ pub fn raw_sys_enter(ctx: RawTracePointContext) -> u32 {
         13 => sys_enter_chown(trace_ctx),
         14 => sys_enter_lchown(trace_ctx),
         15 => sys_enter_fchownat(trace_ctx),
-        16 => sys_enter_sendto(trace_ctx),
+        DISPATCH_SENDTO => sys_enter_sendto(trace_ctx),
         17 => sys_enter_listen(trace_ctx),
         18 => {
             stash_pending_syscall_exit(pid_tgid, EXIT_ACCEPT, syscall_id as u32);
@@ -314,6 +316,63 @@ pub fn raw_sys_enter(ctx: RawTracePointContext) -> u32 {
             sys_enter_socket(trace_ctx)
         }
         _ => 0,
+    }
+}
+
+/// DNS over UDP/53 capture (#458 part 3), a program of its own next to `raw_sys_enter` and
+/// attached only with `--enable-dns-capture`. It looks at the same dispatch table, acts on
+/// `connect`, `write` and `sendto` and ignores every other syscall. Not part of `raw_sys_enter`:
+/// the verifier of the 5.15 kernel rejects that program once the DNS maps and code are in it
+/// (`E2BIG`), and a verifier unit of its own also keeps the capture's cost off a host that did not
+/// ask for it. The two programs run one after the other on a CPU, so they may share the
+/// per-CPU record.
+#[raw_tracepoint(tracepoint = "sys_enter")]
+pub fn raw_dns_udp_enter(ctx: RawTracePointContext) -> u32 {
+    let syscall_id = ctx.arg::<i64>(1);
+    if syscall_id < 0 || syscall_id >= MAX_SYSCALL_ID as i64 {
+        return 0;
+    }
+    let Some(action) = SYSCALL_DISPATCH.get(syscall_id as u32) else {
+        return 0;
+    };
+    // The handler ids of `connect`, `write` and `sendto`, shared with `raw_sys_enter` and userspace.
+    let action = *action;
+    if action != DISPATCH_CONNECT && action != DISPATCH_WRITE && action != DISPATCH_SENDTO {
+        return 0;
+    }
+
+    let regs = ctx.arg::<*const u8>(0);
+    let Some(args) = read_syscall_args(regs) else {
+        return 0;
+    };
+    let Some(record) = SYSCALL_ENTER_SCRATCH.get_ptr_mut(0) else {
+        return 0;
+    };
+    // SAFETY: as in `raw_sys_enter`: a per-CPU value on a non-preemptible path, written whole
+    // before the handlers read it through `TracePointContext`.
+    unsafe {
+        core::ptr::write_bytes(
+            record.cast::<u8>(),
+            0,
+            core::mem::size_of::<SysEnterRecord>(),
+        );
+    }
+    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
+    unsafe {
+        (*record).id = syscall_id;
+        (*record).args = args;
+    }
+    #[cfg(bpf_target_arch = "x86")]
+    unsafe {
+        (*record).id = syscall_id as i32;
+        (*record).args = args.map(|arg| arg as u32);
+    }
+
+    let trace_ctx = TracePointContext::new(record.cast());
+    match action {
+        DISPATCH_CONNECT => dns_udp_connect(trace_ctx),
+        DISPATCH_WRITE => dns_udp_write(trace_ctx),
+        _ => dns_udp_sendto(trace_ctx),
     }
 }
 
@@ -366,6 +425,10 @@ pub fn raw_sys_exit(ctx: RawTracePointContext) -> u32 {
     }
 }
 
+/// Always inlined: `raw_sys_enter` and `raw_dns_udp_enter` both call it, and with two callers
+/// LLVM compiles it as a real BPF-to-BPF call, which pushes `raw_sys_enter`'s combined stack past
+/// the 512 bytes the verifier allows ("combined stack size of 3 calls is 544", kernel 5.15).
+#[inline(always)]
 fn read_syscall_args(regs: *const u8) -> Option<[u64; 6]> {
     let offsets = SYSCALL_ARG_OFFSETS.load();
     #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]

@@ -71,7 +71,10 @@ use crate::redact;
 ///
 /// v24 (#784) added parent-lineage fields to `ExecEvent` and `LineageEntry` — `ExecEvent` is
 /// not imported here, same reasoning.
-const _: () = assert!(wire::WIRE_VERSION == 25);
+///
+/// v26 (#458 part 3) added `DnsUdpQueryEvent` — not imported here either: the socket-level DNS
+/// query path maps it in `sensor-linux`'s `normalize`, not in this crate.
+const _: () = assert!(wire::WIRE_VERSION == 26);
 
 /// `container` is resolved by the caller (`crate::container::container_context`,
 /// issue #312) from `EventMeta::cgroup_id` against cgroupfs, with image/name filled

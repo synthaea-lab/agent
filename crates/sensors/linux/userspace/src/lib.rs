@@ -10,6 +10,7 @@
 //! schema is now unbounded/owned, so [`normalize`] converts (and is unit-tested on
 //! every platform — only the sensor itself is Linux-only).
 
+mod dns_udp;
 pub mod normalize;
 
 #[cfg(all(target_os = "linux", any(ebpf_embedded, test)))]

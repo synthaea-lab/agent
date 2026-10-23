@@ -8,17 +8,19 @@
 use aya::maps::Array;
 #[cfg(ebpf_embedded)]
 use schema::sensor::SensorError;
+use sensor_linux_wire::{DISPATCH_CONNECT, DISPATCH_SENDTO, DISPATCH_WRITE};
 
 #[cfg(ebpf_embedded)]
 use crate::ebpf::err;
 
-/// Handler numbers must match the `raw_sys_enter` match in `ebpf/src/raw.rs`.
+/// Handler numbers must match the `raw_sys_enter` match in `ebpf/src/raw.rs`. The three that the
+/// UDP/53 capture reacts to are shared constants from the wire crate.
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 const DISPATCH_ENTRIES: &[(libc::c_long, u32)] = &[
     (libc::SYS_openat, 1),
     (libc::SYS_open, 2),
-    (libc::SYS_connect, 3),
-    (libc::SYS_write, 4),
+    (libc::SYS_connect, DISPATCH_CONNECT),
+    (libc::SYS_write, DISPATCH_WRITE),
     (libc::SYS_unlink, 5),
     (libc::SYS_unlinkat, 6),
     (libc::SYS_rename, 7),
@@ -30,7 +32,7 @@ const DISPATCH_ENTRIES: &[(libc::c_long, u32)] = &[
     (libc::SYS_chown, 13),
     (libc::SYS_lchown, 14),
     (libc::SYS_fchownat, 15),
-    (libc::SYS_sendto, 16),
+    (libc::SYS_sendto, DISPATCH_SENDTO),
     (libc::SYS_listen, 17),
     (libc::SYS_accept, 18),
     (libc::SYS_accept4, 19),
@@ -67,45 +69,45 @@ const DISPATCH_ENTRIES: &[(libc::c_long, u32)] = &[
 /// their `*at` equivalents remain routed to the existing handlers.
 #[cfg(target_arch = "aarch64")]
 const DISPATCH_ENTRIES: &[(libc::c_long, u32)] = &[
-    (56, 1),   // openat
-    (203, 3),  // connect
-    (64, 4),   // write
-    (35, 6),   // unlinkat
-    (38, 8),   // renameat
-    (276, 9),  // renameat2
-    (200, 10), // bind
-    (53, 12),  // fchmodat
-    (54, 15),  // fchownat
-    (206, 16), // sendto
-    (201, 17), // listen
-    (202, 18), // accept
-    (242, 19), // accept4
-    (5, 20),   // setxattr
-    (14, 21),  // removexattr
-    (40, 22),  // mount
-    (39, 23),  // umount2
-    (129, 24), // kill
-    (131, 25), // tgkill
-    (105, 26), // init_module
-    (273, 27), // finit_module
-    (106, 28), // delete_module
-    (280, 29), // bpf
-    (167, 30), // prctl
-    (117, 31), // ptrace
-    (270, 32), // process_vm_readv
-    (271, 33), // process_vm_writev
-    (279, 34), // memfd_create
-    (146, 35), // setuid
-    (144, 36), // setgid
-    (147, 37), // setresuid
-    (149, 38), // setresgid
-    (151, 39), // setfsuid
-    (152, 40), // setfsgid
-    (91, 41),  // capset
-    (268, 42), // setns
-    (97, 43),  // unshare
-    (207, 44), // recvfrom
-    (198, 45), // socket
+    (56, 1),                 // openat
+    (203, DISPATCH_CONNECT), // connect
+    (64, DISPATCH_WRITE),    // write
+    (35, 6),                 // unlinkat
+    (38, 8),                 // renameat
+    (276, 9),                // renameat2
+    (200, 10),               // bind
+    (53, 12),                // fchmodat
+    (54, 15),                // fchownat
+    (206, DISPATCH_SENDTO),  // sendto
+    (201, 17),               // listen
+    (202, 18),               // accept
+    (242, 19),               // accept4
+    (5, 20),                 // setxattr
+    (14, 21),                // removexattr
+    (40, 22),                // mount
+    (39, 23),                // umount2
+    (129, 24),               // kill
+    (131, 25),               // tgkill
+    (105, 26),               // init_module
+    (273, 27),               // finit_module
+    (106, 28),               // delete_module
+    (280, 29),               // bpf
+    (167, 30),               // prctl
+    (117, 31),               // ptrace
+    (270, 32),               // process_vm_readv
+    (271, 33),               // process_vm_writev
+    (279, 34),               // memfd_create
+    (146, 35),               // setuid
+    (144, 36),               // setgid
+    (147, 37),               // setresuid
+    (149, 38),               // setresgid
+    (151, 39),               // setfsuid
+    (152, 40),               // setfsgid
+    (91, 41),                // capset
+    (268, 42),               // setns
+    (97, 43),                // unshare
+    (207, 44),               // recvfrom
+    (198, 45),               // socket
 ];
 
 #[cfg(ebpf_embedded)]
