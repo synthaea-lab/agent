@@ -13,7 +13,8 @@ use aya_log_ebpf::{info, warn};
 #[cfg(bpf_target_arch = "aarch64")]
 use sensor_linux_wire::syscall_nr_from_i32;
 use sensor_linux_wire::{
-    LineageEntry, TASK_COMM_LEN, encode_pending_syscall_exit, matching_pending_syscall_exit,
+    DISPATCH_CONNECT, DISPATCH_SENDTO, DISPATCH_WRITE, LineageEntry, TASK_COMM_LEN,
+    encode_pending_syscall_exit, matching_pending_syscall_exit,
 };
 
 use crate::{
@@ -256,8 +257,8 @@ pub fn raw_sys_enter(ctx: RawTracePointContext) -> u32 {
     match *action {
         1 => sys_enter_openat(trace_ctx),
         2 => sys_enter_open(trace_ctx),
-        3 => sys_enter_connect(trace_ctx),
-        4 => sys_enter_write(trace_ctx),
+        DISPATCH_CONNECT => sys_enter_connect(trace_ctx),
+        DISPATCH_WRITE => sys_enter_write(trace_ctx),
         5 => sys_enter_unlink(trace_ctx),
         6 => sys_enter_unlinkat(trace_ctx),
         7 => sys_enter_rename(trace_ctx),
@@ -269,7 +270,7 @@ pub fn raw_sys_enter(ctx: RawTracePointContext) -> u32 {
         13 => sys_enter_chown(trace_ctx),
         14 => sys_enter_lchown(trace_ctx),
         15 => sys_enter_fchownat(trace_ctx),
-        16 => sys_enter_sendto(trace_ctx),
+        DISPATCH_SENDTO => sys_enter_sendto(trace_ctx),
         17 => sys_enter_listen(trace_ctx),
         18 => {
             stash_pending_syscall_exit(pid_tgid, EXIT_ACCEPT, syscall_id as u32);
@@ -334,9 +335,9 @@ pub fn raw_dns_udp_enter(ctx: RawTracePointContext) -> u32 {
     let Some(action) = SYSCALL_DISPATCH.get(syscall_id as u32) else {
         return 0;
     };
-    // The handler ids of `connect`, `write` and `sendto` in `raw_sys_enter`'s table.
+    // The handler ids of `connect`, `write` and `sendto`, shared with `raw_sys_enter` and userspace.
     let action = *action;
-    if action != 3 && action != 4 && action != 16 {
+    if action != DISPATCH_CONNECT && action != DISPATCH_WRITE && action != DISPATCH_SENDTO {
         return 0;
     }
 
@@ -369,8 +370,8 @@ pub fn raw_dns_udp_enter(ctx: RawTracePointContext) -> u32 {
 
     let trace_ctx = TracePointContext::new(record.cast());
     match action {
-        3 => dns_udp_connect(trace_ctx),
-        4 => dns_udp_write(trace_ctx),
+        DISPATCH_CONNECT => dns_udp_connect(trace_ctx),
+        DISPATCH_WRITE => dns_udp_write(trace_ctx),
         _ => dns_udp_sendto(trace_ctx),
     }
 }

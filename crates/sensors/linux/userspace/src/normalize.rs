@@ -1852,10 +1852,7 @@ mod tests {
     #[test]
     fn a_payload_that_is_not_a_dns_query_maps_to_nothing() {
         for junk in [
-            b"#!/bin/sh
-echo hello world, a script written to a reused descriptor
-"
-            .as_slice(),
+            b"#!/bin/sh\necho hello world, a script written to a reused descriptor\n".as_slice(),
             &[0u8; 40],
         ] {
             assert!(dns_udp_query(&dns_udp_event(junk), 0, None).is_none());

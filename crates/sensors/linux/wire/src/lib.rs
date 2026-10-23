@@ -315,6 +315,16 @@ pub const MAX_DNS_ANSWERS: usize = 24;
 /// the size of a whole question, not a short prefix. The copy is one bounded
 /// `bpf_probe_read_user_buf`, not a loop.
 pub const MAX_DNS_UDP_PAYLOAD: usize = 272;
+
+/// Handler ids in the `SYSCALL_DISPATCH` table that the UDP/53 capture reacts to. The router
+/// (`raw_sys_enter`) and the capture program (`raw_dns_udp_enter`) in the eBPF crate, and the
+/// table userspace fills from the host syscall ABI, all use these names, so renumbering a handler
+/// is a compile error and not a capture that silently stops.
+pub const DISPATCH_CONNECT: u32 = 3;
+/// See [`DISPATCH_CONNECT`].
+pub const DISPATCH_WRITE: u32 = 4;
+/// See [`DISPATCH_CONNECT`].
+pub const DISPATCH_SENDTO: u32 = 16;
 /// Budget for TLS plaintext capture (first N bytes). Chosen to fit comfortably
 /// in a ring-buffer event with metadata while staying under 512 bytes total.
 pub const MAX_TLS_CAPTURE: usize = 256;

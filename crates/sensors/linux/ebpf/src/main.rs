@@ -1965,6 +1965,10 @@ fn read_inet_dest(addr_ptr: u64) -> Option<(DnsFdEntry, u16)> {
 /// `connect(2)`: remembers a socket connected to port 53, so that a later `write(2)`/`send(2)`
 /// without an address is recognised as a DNS query; a connect of the same descriptor to anything
 /// else forgets it (a reused descriptor number).
+///
+/// Recorded at syscall entry, before the kernel has said whether the `connect` worked: one that
+/// fails leaves an entry behind. It is bounded (the map is an LRU) and harmless, because userspace
+/// drops any payload that is not a DNS query.
 pub fn dns_udp_connect(ctx: TracePointContext) -> u32 {
     #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
     let Ok(fd) = (unsafe { ctx.read_at::<u64>(CONNECT_FD_OFFSET) }) else {
