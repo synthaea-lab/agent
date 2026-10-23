@@ -146,6 +146,114 @@ detection:
     assert!(eval_rule_exec(&rule, &ev2).is_none());
 }
 
+/// Issue #982: a selection written as a YAML list of maps is OR between the maps, with each
+/// map keeping the usual implicit AND between its own fields.
+#[test]
+fn eval_rule_selection_as_list_of_maps_is_or_between_maps_and_between_them() {
+    let rule = parse(
+        r#"
+title: cmd or encoded powershell
+description: test
+tags:
+  - attack.t1059
+level: high
+falsepositives:
+  - none known
+detection:
+  selection:
+    - Image|endswith: '\cmd.exe'
+    - Image|endswith: '\powershell.exe'
+      CommandLine|contains: 'encodedcommand'
+  condition: selection
+"#,
+    );
+    // First map alone matches: plain cmd.exe, regardless of its command line.
+    let via_first_map = exec("C:\\Windows\\System32\\cmd.exe", "cmd.exe /c whoami");
+    assert!(eval_rule_exec(&rule, &via_first_map).is_some());
+
+    // Second map matches only when BOTH of its fields match (implicit AND survives inside a
+    // list element) — powershell.exe alone, without the encoded command line, must not match.
+    let powershell_plain = exec(
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        "powershell.exe -NoProfile",
+    );
+    assert!(eval_rule_exec(&rule, &powershell_plain).is_none());
+
+    // Second map matches when both of its fields do (OR across maps survives too).
+    let powershell_encoded = exec(
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        "powershell.exe -EncodedCommand ZWNobyBoZWxsbw==",
+    );
+    assert!(eval_rule_exec(&rule, &powershell_encoded).is_some());
+
+    // Neither map matches: no alert.
+    let neither = exec("C:\\Windows\\System32\\notepad.exe", "notepad.exe");
+    assert!(eval_rule_exec(&rule, &neither).is_none());
+}
+
+/// Issue #982: an empty list (`selection: []`) would OR over zero maps — vacuously false, i.e.
+/// matches nothing — and a rule that can never fire is as much a load-time error as one that
+/// matches everything.
+#[test]
+fn an_empty_list_of_maps_is_rejected_not_silently_never_matching() {
+    let rule: SigmaRule =
+        parse_rule_yaml("title: Empty list\ndetection:\n  selection: []\n  condition: selection\n")
+            .unwrap();
+    let err = validate(&rule, "<t>").unwrap_err();
+    assert!(err.to_string().contains("empty"), "{err}");
+}
+
+/// Issue #982: an empty map *inside* the list is the same vacuous-AND footgun
+/// `empty_selection_is_rejected_not_match_everything` covers for a lone map — a list-of-maps
+/// selection must refuse it with the same message, not treat the list wrapper as a free pass.
+#[test]
+fn an_empty_map_inside_a_list_of_maps_is_rejected_not_match_everything() {
+    let rule: SigmaRule = parse_rule_yaml(
+        "title: Empty element\ndetection:\n  selection:\n    - {}\n  condition: selection\n",
+    )
+    .unwrap();
+    let err = validate(&rule, "<t>").unwrap_err();
+    assert!(err.to_string().contains("empty selection"), "{err}");
+}
+
+/// Issue #982: a list of maps is still checked field-by-field as strictly as a lone map — an
+/// unsupported field inside one element of the list must be named, not waved through because
+/// it's wrapped in a list.
+#[test]
+fn an_unsupported_field_inside_a_list_of_maps_is_rejected_by_name() {
+    let rule: SigmaRule = parse_rule_yaml(
+        "title: Bad field in list\ndetection:\n  selection:\n    - Image: a\n    - TargetFilename: b\n  condition: selection\n",
+    )
+    .unwrap();
+    let err = validate(&rule, "<t>").unwrap_err();
+    assert!(err.to_string().contains("TargetFilename"), "{err}");
+}
+
+/// Issue #982: the keyword-list form (a list of plain strings) must keep working once lists of
+/// maps are also accepted — the two forms are distinguished by shape, not confused.
+#[test]
+fn a_plain_keyword_list_still_works_once_lists_of_maps_are_accepted() {
+    let rule = parse(
+        "title: KW\ntags:\n  - attack.t1003\nlevel: high\nfalsepositives:\n  - none known\ndetection:\n  selection:\n    - mimikatz\n    - sekurlsa\n  condition: selection\n",
+    );
+    let ev = exec("C:\\temp\\mimikatz.exe", "C:\\temp\\mimikatz.exe");
+    assert!(eval_rule_exec(&rule, &ev).is_some());
+}
+
+/// Issue #982 explicitly calls for this to be a load error: a list mixing a map and a plain
+/// string matches neither the "list of maps" nor the "list of keywords" shape, so it must be
+/// refused — not have the string silently dropped or misread as a one-field map.
+#[test]
+fn a_selection_list_mixing_a_map_and_a_keyword_is_refused_not_guessed_at() {
+    assert!(
+        parse_rule_yaml(&rule_with_detection(
+            "  selection:\n    - mimikatz\n    - Image: a\n  condition: selection\n"
+        ))
+        .is_err(),
+        "a list mixing a keyword and a map must not load"
+    );
+}
+
 #[test]
 fn parent_image_matches_only_with_lineage() {
     let rule = parse(
