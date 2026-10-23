@@ -601,3 +601,10 @@ pub(crate) const EGRESS_DOMAIN_BROWSER_COMMS: &[&str] = &[
     "opera",
     "vivaldi",
 ];
+
+/// FIRST-SEEN-LOGON (T1078, #376): how long after its first successful logon the rule state
+/// only learns accounts. **Provisional**: 24 hours is one working day, long enough for the
+/// accounts that log on to a host in an ordinary day to be in the baseline, with no
+/// measurement behind it. The baseline is in memory only, so an agent restart begins a new
+/// learning window.
+pub(crate) const LOGON_LEARNING_NS: u64 = 86_400_000_000_000; // 24 h

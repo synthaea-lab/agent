@@ -408,6 +408,7 @@ mod coverage;
 mod credfiles;
 mod egressdomain;
 mod linux;
+mod logon;
 mod motw_removal;
 mod persistence;
 mod quarantine;

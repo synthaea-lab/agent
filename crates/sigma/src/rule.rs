@@ -33,6 +33,19 @@ pub struct SigmaRule {
     #[serde(default)]
     pub falsepositives: Vec<String>,
     pub detection: Detection,
+    /// The condition, parsed once (at validation, or on first evaluation of a rule that was
+    /// never validated): what evaluation runs, so the text is never re-parsed per event.
+    #[serde(skip)]
+    compiled: std::sync::OnceLock<Result<crate::condition::Compiled, String>>,
+}
+
+impl SigmaRule {
+    /// The parsed condition, or the reason it is outside the grammar.
+    pub(crate) fn compiled(&self) -> &Result<crate::condition::Compiled, String> {
+        self.compiled.get_or_init(|| {
+            crate::condition::compile(&self.detection.condition, &self.detection.selections)
+        })
+    }
 }
 
 /// Maps upstream Sigma's `level` string onto `schema::detection::Severity`.
@@ -65,8 +78,13 @@ pub struct Detection {
     /// Named selections: selection, selection1, filter, etc.
     #[serde(flatten)]
     pub selections: HashMap<String, Selection>,
-    /// Condition expression: "selection", "selection1 and selection2", etc.
+    /// Condition expression over the named blocks above: see [`crate::condition`] for the
+    /// grammar (`and`/`or`/`not`, parentheses, `1 of`/`all of`).
     pub condition: String,
+    /// Sigma's `timeframe`: only meaningful with an aggregation, which is not supported. Read so
+    /// that the loader can refuse it by name instead of failing to parse it as a block.
+    #[serde(default)]
+    pub timeframe: Option<String>,
 }
 
 /// A selection = map of field → list of values (OR between values).

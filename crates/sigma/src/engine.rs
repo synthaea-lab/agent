@@ -9,7 +9,7 @@ pub use crate::validate::SigmaError;
 use crate::{
     eval::eval_rule_exec,
     rule::{SigmaAlert, SigmaRule},
-    validate::validate,
+    validate::{validate, validate_under},
 };
 
 /// The platform of a host, and so which directories of `rules/sigma/` it runs (issue #73, #980).
@@ -80,8 +80,15 @@ impl SigmaEngine {
     /// Returns [`SigmaError::Io`] when the directory tree itself cannot be read —
     /// individual bad rules are skipped, not errors.
     pub fn load_dir(dir: &Path) -> Result<Self, SigmaError> {
+        Self::load_tree(dir, dir)
+    }
+
+    /// Walks `walk` (`dir` itself, or one of its platform directories) and loads every rule in
+    /// it, validated against its path **relative to the rules root `root`**, so that only a
+    /// directory under the root can make a rule belong to a platform.
+    fn load_tree(root: &Path, walk: &Path) -> Result<Self, SigmaError> {
         let mut rules = Vec::new();
-        let mut stack = vec![dir.to_path_buf()];
+        let mut stack = vec![walk.to_path_buf()];
         while let Some(d) = stack.pop() {
             let entries = std::fs::read_dir(&d).map_err(|source| SigmaError::Io {
                 path: d.display().to_string(),
@@ -92,7 +99,7 @@ impl SigmaEngine {
                 if path.is_dir() {
                     stack.push(path);
                 } else if path.extension().is_some_and(|e| e == "yml" || e == "yaml") {
-                    match Self::load_rule(&path) {
+                    match Self::load_rule_in(&path, Some(root)) {
                         Ok(rule) => rules.push(rule),
                         Err(e) => tracing::warn!(error = %e, "sigma rule skipped"),
                     }
@@ -128,7 +135,7 @@ impl SigmaEngine {
         for name in platform.rule_dirs() {
             let platform_dir = dir.join(name);
             if platform_dir.is_dir() {
-                rules.extend(Self::load_dir(&platform_dir)?.rules);
+                rules.extend(Self::load_tree(dir, &platform_dir)?.rules);
             }
         }
         Ok(Self { rules })
@@ -141,7 +148,15 @@ impl SigmaEngine {
     /// Returns [`SigmaError::Io`] when the file cannot be read, [`SigmaError::Yaml`]
     /// on invalid YAML, and [`SigmaError::Unsupported`] when the rule uses
     /// constructs this engine rejects at validation.
+    ///
+    /// Without a rules root to measure from, the platform directory is looked for in the whole
+    /// of `path`; [`Self::load_dir`] and [`Self::load_dir_for`] measure from their root instead.
     pub fn load_rule(path: &Path) -> Result<SigmaRule, SigmaError> {
+        Self::load_rule_in(path, None)
+    }
+
+    /// [`Self::load_rule`] for a rule found under the rules directory `root`, when known.
+    fn load_rule_in(path: &Path, root: Option<&Path>) -> Result<SigmaRule, SigmaError> {
         let display = path.display().to_string();
         let too_large = std::fs::metadata(path)
             .map(|meta| meta.len() > MAX_RULE_FILE_BYTES)
@@ -163,7 +178,10 @@ impl SigmaEngine {
             path: display.clone(),
             message: describe_yaml_error(&error),
         })?;
-        validate(&rule, &display)?;
+        match root.and_then(|root| path.strip_prefix(root).ok()) {
+            Some(relative) => validate_under(&rule, &display, &relative.display().to_string())?,
+            None => validate(&rule, &display)?,
+        }
         Ok(rule)
     }
 

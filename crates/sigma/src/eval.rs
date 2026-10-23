@@ -2,6 +2,8 @@
 //! passed [`crate::validate`] — the defensive `false` arms exist only for direct
 //! evaluation of hand-constructed rules in tests.
 
+use std::cell::OnceCell;
+
 use schema::{ExecEvent, detection::Severity};
 
 use crate::{
@@ -9,10 +11,20 @@ use crate::{
     validate::technique_id,
 };
 
-/// Evaluates a validated rule against an `ExecEvent`.
+/// Evaluates a validated rule against an `ExecEvent`: its condition over its blocks. A rule
+/// whose condition is outside the grammar (never validated) matches nothing.
 pub(crate) fn eval_rule_exec(rule: &SigmaRule, event: &ExecEvent) -> Option<SigmaAlert> {
-    let selection = rule.detection.selections.get("selection")?;
-    if eval_selection_exec(selection, event) {
+    let Ok(compiled) = rule.compiled() else {
+        return None;
+    };
+    let haystacks = Haystacks::new(event);
+    let matched = compiled.eval(|index| {
+        rule.detection
+            .selections
+            .get(&compiled.blocks[index])
+            .is_some_and(|selection| eval_selection_exec(selection, event, &haystacks))
+    });
+    if matched {
         Some(SigmaAlert {
             title: rule.title.clone(),
             tags: rule.tags.clone(),
@@ -28,14 +40,66 @@ pub(crate) fn eval_rule_exec(rule: &SigmaRule, event: &ExecEvent) -> Option<Sigm
     }
 }
 
+/// The lowercased fields of one event, each made at most once however many blocks and field
+/// specifications read it: a condition over many blocks costs three allocations, not one per
+/// field specification.
+struct Haystacks<'a> {
+    event: &'a ExecEvent,
+    image: OnceCell<String>,
+    cmdline: OnceCell<String>,
+    parent_image: OnceCell<Option<String>>,
+}
+
+impl<'a> Haystacks<'a> {
+    fn new(event: &'a ExecEvent) -> Self {
+        Self {
+            event,
+            image: OnceCell::new(),
+            cmdline: OnceCell::new(),
+            parent_image: OnceCell::new(),
+        }
+    }
+
+    /// The lowercased value of a supported field; `None` for `ParentImage` when the sensor
+    /// provided no lineage, and for a field no validated rule uses.
+    fn get(&self, field: &str) -> Option<&str> {
+        if field.eq_ignore_ascii_case("image") {
+            Some(
+                self.image
+                    .get_or_init(|| self.event.image_path.to_lowercase()),
+            )
+        } else if field.eq_ignore_ascii_case("commandline") {
+            Some(
+                self.cmdline
+                    .get_or_init(|| self.event.cmdline.to_lowercase()),
+            )
+        } else if field.eq_ignore_ascii_case("parentimage") {
+            self.parent_image
+                .get_or_init(|| {
+                    self.event
+                        .parent_image_path
+                        .as_deref()
+                        .map(str::to_lowercase)
+                })
+                .as_deref()
+        } else {
+            None
+        }
+    }
+}
+
 /// Evaluates a selection against an `ExecEvent`.
-fn eval_selection_exec(selection: &Selection, event: &ExecEvent) -> bool {
+fn eval_selection_exec(
+    selection: &Selection,
+    event: &ExecEvent,
+    haystacks: &Haystacks<'_>,
+) -> bool {
     match selection {
         Selection::FieldMap(fields) => {
             // Implicit AND between fields
             fields
                 .iter()
-                .all(|(field_spec, values)| eval_field(field_spec, values, event))
+                .all(|(field_spec, values)| eval_field(field_spec, values, haystacks))
         }
         Selection::Keywords(keywords) => eval_keywords(keywords, &event.cmdline),
     }
@@ -58,42 +122,30 @@ fn eval_keywords(keywords: &[String], cmdline: &str) -> bool {
 
 /// Evaluates one Sigma field. `ParentImage` matches only when the sensor provided
 /// lineage (see `schema::ExecEvent::parent_image_path`).
-fn eval_field(field_spec: &str, values: &ValueList, event: &ExecEvent) -> bool {
+fn eval_field(field_spec: &str, values: &ValueList, haystacks: &Haystacks<'_>) -> bool {
     let parsed = parse_field_spec(field_spec);
     let Some((modifier, all)) = parse_modifiers(parsed.modifiers) else {
         return false;
     };
-    let field = parsed.field;
-    let haystack: &str = if field.eq_ignore_ascii_case("image") {
-        &event.image_path
-    } else if field.eq_ignore_ascii_case("commandline") {
-        &event.cmdline
-    } else if field.eq_ignore_ascii_case("parentimage") {
-        match &event.parent_image_path {
-            Some(p) => p,
-            None => return false,
-        }
-    } else {
-        // Unreachable for validated rules; defensive for direct eval of a
-        // hand-constructed rule.
+    // `None`: no lineage, or (unreachable for validated rules; defensive for direct eval of a
+    // hand-constructed rule) a field this engine does not know.
+    let Some(haystack) = haystacks.get(parsed.field) else {
         return false;
     };
-    // Lowercased once per field, not once per listed value.
-    let haystack = haystack.to_lowercase();
     let modifier = modifier.map(str::to_lowercase);
     let modifier = modifier.as_deref();
 
     match values {
-        ValueList::Single(value) => match_value(&haystack, value, modifier),
+        ValueList::Single(value) => match_value(haystack, value, modifier),
         ValueList::Many(values) if all => {
             !values.is_empty()
                 && values
                     .iter()
-                    .all(|value| match_value(&haystack, value, modifier))
+                    .all(|value| match_value(haystack, value, modifier))
         }
         ValueList::Many(values) => values
             .iter()
-            .any(|value| match_value(&haystack, value, modifier)),
+            .any(|value| match_value(haystack, value, modifier)),
     }
 }
 
