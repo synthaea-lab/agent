@@ -36,7 +36,34 @@ const KNOWN_PLATFORMS: &[&str] = &["linux", "windows", "macos"];
 /// Rejects any construct outside the supported subset, naming it precisely, and any
 /// rule missing the required metadata (issue #73: severity, ATT&CK technique,
 /// false-positive notes, platform).
+///
+/// The platform directory is looked for in the whole of `path`: use [`validate_under`] when the
+/// rules root is known, so a word in the content root's own path cannot pass for a platform.
 pub(crate) fn validate(rule: &SigmaRule, path: &str) -> Result<(), SigmaError> {
+    let normalized = path.replace('\\', "/");
+    let under_platform = KNOWN_PLATFORMS
+        .iter()
+        .any(|p| normalized.contains(&format!("/{p}/")));
+    validate_with(rule, path, under_platform)
+}
+
+/// [`validate`] for a rule found at `relative` (`/` or `\` separated) under the rules root: the
+/// platform is the first directory of that relative path, nothing in the root's own path (#980).
+pub(crate) fn validate_under(
+    rule: &SigmaRule,
+    path: &str,
+    relative: &str,
+) -> Result<(), SigmaError> {
+    let normalized = relative.replace('\\', "/");
+    let mut parts = normalized.split('/');
+    // The file name is not a directory: a rule directly under the root has no platform.
+    let under_platform = parts
+        .next()
+        .is_some_and(|first| parts.next().is_some() && KNOWN_PLATFORMS.contains(&first));
+    validate_with(rule, path, under_platform)
+}
+
+fn validate_with(rule: &SigmaRule, path: &str, under_platform: bool) -> Result<(), SigmaError> {
     let compiled = validate_condition(rule, path)?;
     // Every block the condition refers to is checked as strictly as `selection` always was. A
     // block it does not refer to is never evaluated and stays unchecked, as before.
@@ -61,13 +88,13 @@ pub(crate) fn validate(rule: &SigmaRule, path: &str) -> Result<(), SigmaError> {
             other => other,
         })?;
     }
-    validate_metadata(rule, path)
+    validate_metadata(rule, path, under_platform)
 }
 
 /// Checks the required rule metadata: severity (`level`, upstream Sigma's field
 /// name), at least one ATT&CK technique tag, non-empty false-positive notes, and
 /// a recognized platform directory.
-fn validate_metadata(rule: &SigmaRule, path: &str) -> Result<(), SigmaError> {
+fn validate_metadata(rule: &SigmaRule, path: &str, under_platform: bool) -> Result<(), SigmaError> {
     if rule.severity.is_none() {
         return Err(missing_metadata(path, "missing `level`".to_string()));
     }
@@ -83,11 +110,7 @@ fn validate_metadata(rule: &SigmaRule, path: &str) -> Result<(), SigmaError> {
             "no ATT&CK technique tag in `tags` (expected e.g. `attack.t1059.004`)".to_string(),
         ));
     }
-    let normalized = path.replace('\\', "/");
-    if !KNOWN_PLATFORMS
-        .iter()
-        .any(|p| normalized.contains(&format!("/{p}/")))
-    {
+    if !under_platform {
         return Err(missing_metadata(
             path,
             format!(

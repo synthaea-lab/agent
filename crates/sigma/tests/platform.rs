@@ -276,3 +276,21 @@ fn the_macos_web_server_rule_does_not_fire_on_a_linux_host() {
             .any(|a| a.title == MACOS_RULE)
     );
 }
+
+/// #980: a rules root with a platform word in its own path does not make a rule outside the
+/// platform directories valid. `load_rule` alone has no root and keeps reading the whole path.
+#[test]
+fn a_platform_word_in_the_root_path_is_not_a_platform_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("linux").join("sigma");
+    write(&root, "stray/a.yml", "stray-rule");
+    write(&root, "b.yml", "root-rule");
+    write(&root, "windows/a.yml", "windows-rule");
+    let engine = SigmaEngine::load_dir(&root).unwrap();
+    assert_eq!(titles(&engine), ["windows-rule"]);
+    // The same holds for the host loader's own walk.
+    let host = SigmaEngine::load_dir_for(&root, Platform::Windows).unwrap();
+    assert_eq!(titles(&host), ["windows-rule"]);
+    // Without a root, `load_rule` can only look at the path it is given.
+    assert!(SigmaEngine::load_rule(&root.join("stray/a.yml")).is_ok());
+}
