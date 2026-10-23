@@ -47,6 +47,7 @@ pub(crate) fn validate(rule: &SigmaRule, path: &str) -> Result<(), SigmaError> {
         };
         let checked = match block {
             Selection::FieldMap(fields) => validate_field_map(fields, path),
+            Selection::OrOfMaps(maps) => validate_or_of_maps(maps, path),
             Selection::Keywords(keywords) => validate_keywords(keywords, path),
         };
         // The message of the one block every rule used to have is unchanged; the others say
@@ -246,6 +247,27 @@ fn validate_field_map(
                 validate_edge_only_wildcard(value, path, "")?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Validates a selection written as a list of maps (issue #982): OR between the maps, so an
+/// empty list matches nothing (the dual of the empty-map check in `validate_field_map`, which
+/// matches everything) — both are load errors, never a silent always/never-match. Each map gets
+/// exactly `validate_field_map`'s checks, so a list-of-maps selection is refused as loudly as a
+/// lone map for an unsupported field, modifier, or interior wildcard.
+fn validate_or_of_maps(
+    maps: &[std::collections::HashMap<String, ValueList>],
+    path: &str,
+) -> Result<(), SigmaError> {
+    if maps.is_empty() {
+        return Err(unsupported(
+            path,
+            "empty selection list (would match nothing)".into(),
+        ));
+    }
+    for fields in maps {
+        validate_field_map(fields, path)?;
     }
     Ok(())
 }

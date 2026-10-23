@@ -95,14 +95,22 @@ fn eval_selection_exec(
     haystacks: &Haystacks<'_>,
 ) -> bool {
     match selection {
-        Selection::FieldMap(fields) => {
-            // Implicit AND between fields
-            fields
-                .iter()
-                .all(|(field_spec, values)| eval_field(field_spec, values, haystacks))
-        }
+        Selection::FieldMap(fields) => eval_field_map(fields, haystacks),
+        // OR between the maps; each one keeps `FieldMap`'s implicit AND between fields.
+        Selection::OrOfMaps(maps) => maps.iter().any(|fields| eval_field_map(fields, haystacks)),
         Selection::Keywords(keywords) => eval_keywords(keywords, &event.cmdline),
     }
+}
+
+/// Implicit AND between a map's fields — the body shared by `FieldMap` and every element of
+/// `OrOfMaps`.
+fn eval_field_map(
+    fields: &std::collections::HashMap<String, ValueList>,
+    haystacks: &Haystacks<'_>,
+) -> bool {
+    fields
+        .iter()
+        .all(|(field_spec, values)| eval_field(field_spec, values, haystacks))
 }
 
 /// OR over the full command line; keywords share the field values' wildcard

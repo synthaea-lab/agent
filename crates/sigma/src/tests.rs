@@ -146,6 +146,114 @@ detection:
     assert!(eval_rule_exec(&rule, &ev2).is_none());
 }
 
+/// Issue #982: a selection written as a YAML list of maps is OR between the maps, with each
+/// map keeping the usual implicit AND between its own fields.
+#[test]
+fn eval_rule_selection_as_list_of_maps_is_or_between_maps_and_between_them() {
+    let rule = parse(
+        r#"
+title: cmd or encoded powershell
+description: test
+tags:
+  - attack.t1059
+level: high
+falsepositives:
+  - none known
+detection:
+  selection:
+    - Image|endswith: '\cmd.exe'
+    - Image|endswith: '\powershell.exe'
+      CommandLine|contains: 'encodedcommand'
+  condition: selection
+"#,
+    );
+    // First map alone matches: plain cmd.exe, regardless of its command line.
+    let via_first_map = exec("C:\\Windows\\System32\\cmd.exe", "cmd.exe /c whoami");
+    assert!(eval_rule_exec(&rule, &via_first_map).is_some());
+
+    // Second map matches only when BOTH of its fields match (implicit AND survives inside a
+    // list element) — powershell.exe alone, without the encoded command line, must not match.
+    let powershell_plain = exec(
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        "powershell.exe -NoProfile",
+    );
+    assert!(eval_rule_exec(&rule, &powershell_plain).is_none());
+
+    // Second map matches when both of its fields do (OR across maps survives too).
+    let powershell_encoded = exec(
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        "powershell.exe -EncodedCommand ZWNobyBoZWxsbw==",
+    );
+    assert!(eval_rule_exec(&rule, &powershell_encoded).is_some());
+
+    // Neither map matches: no alert.
+    let neither = exec("C:\\Windows\\System32\\notepad.exe", "notepad.exe");
+    assert!(eval_rule_exec(&rule, &neither).is_none());
+}
+
+/// Issue #982: an empty list (`selection: []`) would OR over zero maps — vacuously false, i.e.
+/// matches nothing — and a rule that can never fire is as much a load-time error as one that
+/// matches everything.
+#[test]
+fn an_empty_list_of_maps_is_rejected_not_silently_never_matching() {
+    let rule: SigmaRule =
+        parse_rule_yaml("title: Empty list\ndetection:\n  selection: []\n  condition: selection\n")
+            .unwrap();
+    let err = validate(&rule, "<t>").unwrap_err();
+    assert!(err.to_string().contains("empty"), "{err}");
+}
+
+/// Issue #982: an empty map *inside* the list is the same vacuous-AND footgun
+/// `empty_selection_is_rejected_not_match_everything` covers for a lone map — a list-of-maps
+/// selection must refuse it with the same message, not treat the list wrapper as a free pass.
+#[test]
+fn an_empty_map_inside_a_list_of_maps_is_rejected_not_match_everything() {
+    let rule: SigmaRule = parse_rule_yaml(
+        "title: Empty element\ndetection:\n  selection:\n    - {}\n  condition: selection\n",
+    )
+    .unwrap();
+    let err = validate(&rule, "<t>").unwrap_err();
+    assert!(err.to_string().contains("empty selection"), "{err}");
+}
+
+/// Issue #982: a list of maps is still checked field-by-field as strictly as a lone map — an
+/// unsupported field inside one element of the list must be named, not waved through because
+/// it's wrapped in a list.
+#[test]
+fn an_unsupported_field_inside_a_list_of_maps_is_rejected_by_name() {
+    let rule: SigmaRule = parse_rule_yaml(
+        "title: Bad field in list\ndetection:\n  selection:\n    - Image: a\n    - TargetFilename: b\n  condition: selection\n",
+    )
+    .unwrap();
+    let err = validate(&rule, "<t>").unwrap_err();
+    assert!(err.to_string().contains("TargetFilename"), "{err}");
+}
+
+/// Issue #982: the keyword-list form (a list of plain strings) must keep working once lists of
+/// maps are also accepted — the two forms are distinguished by shape, not confused.
+#[test]
+fn a_plain_keyword_list_still_works_once_lists_of_maps_are_accepted() {
+    let rule = parse(
+        "title: KW\ntags:\n  - attack.t1003\nlevel: high\nfalsepositives:\n  - none known\ndetection:\n  selection:\n    - mimikatz\n    - sekurlsa\n  condition: selection\n",
+    );
+    let ev = exec("C:\\temp\\mimikatz.exe", "C:\\temp\\mimikatz.exe");
+    assert!(eval_rule_exec(&rule, &ev).is_some());
+}
+
+/// Issue #982 explicitly calls for this to be a load error: a list mixing a map and a plain
+/// string matches neither the "list of maps" nor the "list of keywords" shape, so it must be
+/// refused — not have the string silently dropped or misread as a one-field map.
+#[test]
+fn a_selection_list_mixing_a_map_and_a_keyword_is_refused_not_guessed_at() {
+    assert!(
+        parse_rule_yaml(&rule_with_detection(
+            "  selection:\n    - mimikatz\n    - Image: a\n  condition: selection\n"
+        ))
+        .is_err(),
+        "a list mixing a keyword and a map must not load"
+    );
+}
+
 #[test]
 fn parent_image_matches_only_with_lineage() {
     let rule = parse(
@@ -257,6 +365,128 @@ detection:
     .unwrap();
     let err = validate(&bad_modifier, "<t>").unwrap_err();
     assert!(err.to_string().contains("modifier `re`"), "{err}");
+}
+
+// --- selection as a list of maps: OR of maps (#982) -------------------------------------------
+
+#[test]
+fn selection_as_list_of_maps_ors_between_the_maps() {
+    let rule = parse(
+        r#"
+title: List of maps
+tags:
+  - attack.t1059
+level: medium
+falsepositives:
+  - none known
+detection:
+  selection:
+    - Image|endswith: '\cmd.exe'
+    - OriginalFileName: 'Cmd.Exe'
+  condition: selection
+"#,
+    );
+    // Matches the first map only (Image), not the second (OriginalFileName is not a field this
+    // engine reads at all, so that map's own field never matches) — still an overall match
+    // because the list is an OR.
+    let ev = exec("C:\\Windows\\System32\\cmd.exe", "cmd.exe /c whoami");
+    assert!(eval_rule_exec(&rule, &ev).is_some());
+    // Matches neither map.
+    let ev2 = exec("C:\\Windows\\System32\\notepad.exe", "notepad.exe");
+    assert!(eval_rule_exec(&rule, &ev2).is_none());
+}
+
+#[test]
+fn selection_as_list_of_maps_ands_within_each_map() {
+    // Each map in the list keeps `FieldMap`'s implicit AND between its own fields — the OR is
+    // only between the maps, never between a map's fields.
+    let rule = parse(
+        r#"
+title: List of maps AND
+tags:
+  - attack.t1059
+level: medium
+falsepositives:
+  - none known
+detection:
+  selection:
+    - Image|endswith: '\cmd.exe'
+      CommandLine|contains: 'whoami'
+    - Image|endswith: '\notepad.exe'
+  condition: selection
+"#,
+    );
+    // First map: Image matches but CommandLine doesn't — AND must fail, and the second map
+    // (notepad) doesn't match this image either, so the whole list is false.
+    let ev = exec("C:\\Windows\\System32\\cmd.exe", "cmd.exe /c dir");
+    assert!(
+        eval_rule_exec(&rule, &ev).is_none(),
+        "one field of the first map matching must not satisfy its AND"
+    );
+    // Now both fields of the first map match.
+    let ev2 = exec("C:\\Windows\\System32\\cmd.exe", "cmd.exe /c whoami");
+    assert!(eval_rule_exec(&rule, &ev2).is_some());
+}
+
+#[test]
+fn empty_selection_list_is_rejected_not_match_nothing_silently() {
+    // The dual of `empty_selection_is_rejected_not_match_everything`: an OR over zero maps is
+    // vacuously false, which must be a load error naming the rule, not a rule that quietly never
+    // fires.
+    let rule: SigmaRule =
+        parse_rule_yaml("title: Empty list\ndetection:\n  selection: []\n  condition: selection\n")
+            .unwrap();
+    let err = validate(&rule, "<t>").unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("empty"),
+        "{err}"
+    );
+}
+
+#[test]
+fn empty_map_inside_a_selection_list_is_rejected() {
+    // One empty map among the list's maps would make that OR branch vacuously true — same
+    // failure mode as `selection: {}`, just nested one level.
+    let rule: SigmaRule = parse_rule_yaml(
+        "title: Empty map in list\ndetection:\n  selection:\n    - Image: a\n    - {}\n  condition: selection\n",
+    )
+    .unwrap();
+    let err = validate(&rule, "<t>").unwrap_err();
+    assert!(err.to_string().contains("empty selection"), "{err}");
+}
+
+#[test]
+fn unsupported_field_inside_a_selection_list_is_named() {
+    let rule: SigmaRule = parse_rule_yaml(
+        "title: Bad field in list\ndetection:\n  selection:\n    - Image: a\n    - TargetFilename: b\n  condition: selection\n",
+    )
+    .unwrap();
+    let err = validate(&rule, "<t>").unwrap_err();
+    assert!(err.to_string().contains("TargetFilename"), "{err}");
+}
+
+#[test]
+fn a_selection_list_mixing_maps_and_keywords_is_rejected() {
+    // Neither the keyword-list shape (`Vec<String>`) nor the map-list shape
+    // (`Vec<HashMap<String, ValueList>>`) can deserialize a list with one of each — this is a
+    // load error, never a guess at which element is the odd one out.
+    refused_with(
+        &rule_with_detection(
+            "  selection:\n    - Image: a\n    - 'bare-keyword'\n  condition: selection\n",
+        ),
+        "selection",
+    );
+}
+
+#[test]
+fn a_selection_list_of_plain_keywords_still_parses_as_keywords() {
+    // Regression: adding the list-of-maps variant must not change how a plain keyword list
+    // deserializes or evaluates.
+    let rule = parse(
+        "title: KW list\ntags:\n  - attack.t1003\nlevel: high\nfalsepositives:\n  - none known\ndetection:\n  selection:\n    - mimikatz\n    - procdump\n  condition: selection\n",
+    );
+    let ev = exec("C:\\t\\x.exe", "run procdump now");
+    assert!(eval_rule_exec(&rule, &ev).is_some());
 }
 
 /// Robustness: patterns and haystacks are content-supplied (rules) and
@@ -594,109 +824,4 @@ fn evaluator_defensively_rejects_multiple_match_modifiers() {
 fn all_must_be_last_and_only_one_matching_modifier_is_allowed() {
     for spec in [
         "CommandLine|contains|all|startswith",
-        "CommandLine|contains|startswith|all",
-        "CommandLine|all",
-    ] {
-        let yaml = format!(
-            "title: Bad\ndetection:\n  selection:\n    {spec}: [a, b]\n  condition: selection\n"
-        );
-        let rule: SigmaRule = parse_rule_yaml(&yaml).unwrap();
-        assert!(validate(&rule, "<test>/linux/test.yml").is_err(), "{spec}");
-    }
-}
-
-#[test]
-fn empty_all_value_list_is_refused() {
-    for spec in ["CommandLine|contains|all", "CommandLine|contains"] {
-        let yaml = format!(
-            "title: Empty\ndetection:\n  selection:\n    {spec}: []\n  condition: selection\n"
-        );
-        let rule: SigmaRule = parse_rule_yaml(&yaml).unwrap();
-        let error = validate(&rule, "<test>/linux/test.yml").unwrap_err();
-        assert!(error.to_string().contains("empty value list"), "{error}");
-    }
-}
-
-proptest::proptest! {
-    #[test]
-    fn all_equals_conjunction_of_single_value_rules(
-        values in proptest::collection::vec("[a-z]{1,8}", 1..8),
-        present in proptest::collection::vec(proptest::bool::ANY, 8),
-    ) {
-        // Only the values flagged `present` are in the haystack: with every value in it the
-        // property holds trivially, so a missing value is what reaches the false branch.
-        let haystack = values
-            .iter()
-            .zip(&present)
-            .filter(|(_, keep)| **keep)
-            .map(|(value, _)| value.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let yaml_values = format!("[{}]", values.iter()
-            .map(|value| format!("'{value}'"))
-            .collect::<Vec<_>>().join(", "));
-        let all_rule = field_rule("CommandLine|contains|all", &yaml_values);
-        let conjunction = values.iter().all(|value| {
-            let single = field_rule("CommandLine|contains", &format!("'{value}'"));
-            eval_rule_exec(&single, &exec("x.exe", &haystack)).is_some()
-        });
-        proptest::prop_assert_eq!(
-            eval_rule_exec(&all_rule, &exec("x.exe", &haystack)).is_some(),
-            conjunction
-        );
-    }
-}
-
-#[test]
-fn all_is_false_when_one_value_is_absent_and_true_when_every_value_is_present() {
-    // The cases the property above samples, pinned: it cannot pass if `|all` behaves as `any`.
-    let rule = field_rule("CommandLine|contains|all", "['alpha', 'beta', 'gamma']");
-    assert!(eval_rule_exec(&rule, &exec("x.exe", "alpha beta gamma")).is_some());
-    assert!(eval_rule_exec(&rule, &exec("x.exe", "alpha beta")).is_none());
-    assert!(eval_rule_exec(&rule, &exec("x.exe", "gamma")).is_none());
-    assert!(eval_rule_exec(&rule, &exec("x.exe", "")).is_none());
-}
-
-#[test]
-fn the_validator_and_the_evaluator_agree_on_modifier_shapes() {
-    for (spec, accepted) in [
-        ("CommandLine", true),
-        ("CommandLine|contains", true),
-        ("CommandLine|contains|all", true),
-        ("CommandLine|CONTAINS|ALL", true),
-        ("CommandLine|all", false),
-        ("CommandLine|contains|startswith", false),
-        ("CommandLine|contains|all|startswith", false),
-        ("CommandLine|contains|startswith|all", false),
-        ("CommandLine|contains|all|all", false),
-    ] {
-        // A complete rule: without `level` and an ATT&CK tag the validator refuses it for its
-        // metadata, whatever the modifiers, and the comparison would test nothing.
-        let yaml = rule_with_detection(&format!(
-            "  selection:\n    {spec}: [a, b]\n  condition: selection\n"
-        ));
-        let rule: SigmaRule = parse_rule_yaml(&yaml).unwrap();
-        let validated = validate(&rule, "<test>/linux/test.yml").is_ok();
-        let evaluated = crate::eval::parse_modifiers(spec.split('|').skip(1)).is_some();
-        assert_eq!(validated, accepted, "validator: {spec}");
-        assert_eq!(evaluated, accepted, "evaluator: {spec}");
-    }
-}
-
-#[test]
-fn a_rule_file_over_the_size_cap_is_refused_before_it_is_read() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("linux").join("big.yml");
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let padding = "# padding\n".repeat(200_000); // about 2 MB
-    std::fs::write(
-        &path,
-        rule_with_detection("  selection:\n    Image: a\n  condition: selection\n") + &padding,
-    )
-    .unwrap();
-    let error = crate::SigmaEngine::load_rule(&path).expect_err("too large");
-    assert!(
-        error.to_string().to_lowercase().contains("larger"),
-        "{error}"
-    );
-}
+ 

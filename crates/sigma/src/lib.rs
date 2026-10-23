@@ -6,7 +6,8 @@
 //!   (`ParentImage` uses the lineage field sensors fill when they can — a rule using it
 //!   simply never matches events without lineage)
 //! - Simple `selection` conditions (implicit AND between fields, OR between values by default;
-//!   `|all` requires every listed value to match), keyword lists
+//!   `|all` requires every listed value to match), a selection written as a list of maps (OR
+//!   between the maps, issue #982), keyword lists
 //! - `contains`/`startswith`/`endswith` modifiers, optionally followed by `|all`, and `*`
 //!   wildcards at start/end; case-only duplicate field specs are refused
 //! - conditions over any number of named blocks: `and`, `or`, `not` (that precedence),

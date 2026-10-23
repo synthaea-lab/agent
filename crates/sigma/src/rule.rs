@@ -94,11 +94,24 @@ pub struct Detection {
 ///   Image|endswith: '\cmd.exe'
 ///   CommandLine|contains: 'payload'
 /// ```
+///
+/// A selection can also be written as a **list** of such maps — OR between the maps, implicit
+/// AND inside each one, same as a lone map (issue #982):
+/// ```yaml
+/// selection:
+///   - Image|endswith: '\cmd.exe'
+///   - OriginalFileName: 'Cmd.Exe'
+/// ```
+/// A list of plain strings is still the keyword form below; `serde`'s untagged matching picks
+/// the variant by shape, so a list mixing a map and a plain string matches neither and is
+/// refused at load (`SigmaError::Yaml`) rather than guessed at.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum Selection {
     /// Map of field → values
     FieldMap(HashMap<String, ValueList>),
+    /// List of maps: OR between the maps, each one an implicit AND like `FieldMap`
+    OrOfMaps(Vec<HashMap<String, ValueList>>),
     /// List of keywords
     Keywords(Vec<String>),
 }
