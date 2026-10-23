@@ -42,6 +42,7 @@ use crate::{
         TASK_REGISTRATION_DEDUP_WINDOW_NS, TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
     },
     has_write_intent,
+    logon::{LogonBaseline, Observation},
     rdp::RdpSuccessAfterFailures,
     session::SessionHijack,
     signature_gate::SignatureGatedAlert,
@@ -401,6 +402,8 @@ pub struct RuleState {
     /// LRU-bounded like every other counter: a spray across many fabricated
     /// usernames must not grow this without limit.
     auth_failures: BoundedMap<(String, String), SlidingCounter>,
+    /// The accounts seen logging on, for FIRST-SEEN-LOGON (T1078, #376). LRU-bounded.
+    logon_baseline: LogonBaseline,
     /// RDP authentication successes joined to the failures from the same address,
     /// by event time (T1021.001, #285); see the `rdp` module.
     rdp_success: RdpSuccessAfterFailures,
@@ -560,6 +563,7 @@ impl RuleState {
             policy_denial_alerts_shed: 0,
             policy_denial_evictions_reported: 0,
             auth_failures: BoundedMap::new(COUNTER_CAP),
+            logon_baseline: LogonBaseline::new(),
             rdp_success: RdpSuccessAfterFailures::new(),
             sudo_success: SudoSuccessAfterFailures::new(),
             recent_creates: BoundedMap::new(CREATE_UNLINK_PID_CAP),
@@ -1923,7 +1927,64 @@ impl RuleState {
     /// counter below (key: target account, source `"local"`, `sudo` and `su` sharing
     /// one key), so five wrong passwords in the window raise T1110 by themselves,
     /// before and independently of any success (#838).
+    ///
+    /// A **successful** [`AuthKind::Logon`] also goes through FIRST-SEEN-LOGON
+    /// ([`Self::check_first_seen_logon`], T1078); it is the one rule on `main` that fires
+    /// on a successful logon.
     pub fn on_auth(&mut self, event: &AuthEvent) -> Vec<Alert> {
+        let mut alerts: Vec<Alert> = self.check_first_seen_logon(event).into_iter().collect();
+        alerts.extend(self.on_auth_failures_and_escalations(event));
+        alerts
+    }
+
+    /// FIRST-SEEN-LOGON (T1078, #376) — a successful logon ([`AuthKind::Logon`], never a
+    /// failure, never `su`/`sudo`'s [`AuthKind::ExplicitCredentials`] or
+    /// [`AuthKind::PrivilegedSession`]) of an account that did not log on to this host during
+    /// the first [`LOGON_LEARNING_NS`](crate::exclusions::LOGON_LEARNING_NS) after the first
+    /// one the state saw. One alert per account: it is in the baseline afterwards. Low: a new
+    /// colleague, a new service account and a reinstalled host look the same, and nothing
+    /// here separates them.
+    ///
+    /// **This makes the control plane's identity join live** (`server/lib/fleet-case.ts`,
+    /// #62, #940): the join reads the event a detection stores, and until this rule no rule
+    /// on `main` fired on a successful logon. The limits of that join are this rule's: the
+    /// generic accounts are excluded (see `crate::logon`), `vagrant` deliberately is not,
+    /// and a `LogonFailure` never counts because its user name is chosen by whoever tries
+    /// it.
+    ///
+    /// The baseline is **in memory**: an agent restart, an update included, begins a new
+    /// learning window, and an account that logs on during the window is learned without an
+    /// alert, an intruder's included. Expected false positives: a domain controller or file
+    /// server, which sees every user's first logon; a new hire; a service account first
+    /// used after an install. **Not built, and why: odd hours.** The event carries a UTC
+    /// timestamp and no timezone, and no part of the agent knows the host's local time, so
+    /// "outside working hours" cannot be said honestly yet.
+    fn check_first_seen_logon(&mut self, event: &AuthEvent) -> Option<Alert> {
+        if event.outcome != AuthOutcome::Success || event.kind != AuthKind::Logon {
+            return None;
+        }
+        match self
+            .logon_baseline
+            .observe(&event.target_user, event.meta.timestamp_ns)
+        {
+            Observation::FirstSeen => {}
+            Observation::Quiet | Observation::Known => return None,
+        }
+        let source = event
+            .source_address
+            .map_or_else(String::new, |address| format!(" from {address}"));
+        Some(Alert {
+            technique: "T1078",
+            severity: Severity::Low,
+            message: format!(
+                "first successful logon of account {}{source} on this host since the baseline began",
+                event.target_user,
+            ),
+        })
+    }
+
+    /// The failure-burst and `sudo`/`su` joins of [`Self::on_auth`].
+    fn on_auth_failures_and_escalations(&mut self, event: &AuthEvent) -> Vec<Alert> {
         let ts = event.meta.timestamp_ns;
         if event.outcome == AuthOutcome::Success {
             // Only a local (Unix) privilege-escalation success joins the sudo/su

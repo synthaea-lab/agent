@@ -19,6 +19,7 @@ mod failure_join;
 mod inventory;
 mod ld_trust;
 mod ldap;
+mod logon;
 mod ntlm;
 mod rdp;
 mod recon;
