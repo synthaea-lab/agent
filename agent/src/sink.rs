@@ -2284,6 +2284,7 @@ impl EventSink for DetectionSink {
                 | Event::FileDelete(_)
                 | Event::FileRename(_)
                 | Event::FileSetTime(_)
+                | Event::RawVolumeOpen(_)
         ) {
             self.expire_held_canary(event.meta().timestamp_ns);
         }
@@ -2304,6 +2305,9 @@ impl EventSink for DetectionSink {
             Event::FileRename(e) => self.detect_file_rename(&event, e),
             Event::FileSetTime(e) => {
                 self.record_rule_alerts(&event, rules::evaluate_file_set_time(e));
+            }
+            Event::RawVolumeOpen(e) => {
+                self.record_rule_alerts(&event, rules::evaluate_raw_volume_open(e));
             }
             Event::FileWrite(e) => self.detect_file_write(e),
             Event::MemfdCreate(e) => self.detect_memfd_create(e),
@@ -2566,6 +2570,36 @@ mod tests {
         let alerts = alerts_in(&dir);
         assert!(alerts.contains("T1070.006"), "{alerts}");
         assert!(alerts.contains("invoice.docx"), "{alerts}");
+    }
+
+    #[test]
+    fn write_capable_volume_open_reaches_t1006_through_the_real_sink() {
+        let dir = tmp("raw-volume-open-route");
+        let sink = sink_in(&dir);
+        sink.on_event(Event::RawVolumeOpen(schema::RawVolumeOpenEvent {
+            meta: schema::fixtures::meta(),
+            volume: r"\Device\HarddiskVolume3".into(),
+            desired_access: 0x4000_0000,
+        }));
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("T1006"), "{alerts}");
+        assert!(alerts.contains("HarddiskVolume3"), "{alerts}");
+    }
+
+    #[test]
+    fn ordinary_read_open_does_not_enter_the_medium_raw_volume_route() {
+        let dir = tmp("read-only-volume-open-route");
+        let sink = sink_in(&dir);
+        sink.on_event(Event::RawVolumeOpen(schema::RawVolumeOpenEvent {
+            meta: schema::fixtures::meta(),
+            volume: r"\Device\HarddiskVolume3".into(),
+            desired_access: 0x8000_0000,
+        }));
+        let alerts = alerts_in(&dir);
+        assert!(
+            !alerts.contains("T1006"),
+            "read-only opens are Low and the sink writes only Medium+ alerts: {alerts}"
+        );
     }
 
     #[test]

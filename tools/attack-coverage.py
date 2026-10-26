@@ -138,6 +138,7 @@ TECHNIQUE_TACTIC = {
     "T1070.001": "Defense Evasion",
     "T1070.002": "Defense Evasion",
     "T1070.006": "Defense Evasion",
+    "T1006": "Defense Evasion",
     "T1071": "Command and Control",
     "T1071.004": "Command and Control",
     "T1098.004": "Persistence",

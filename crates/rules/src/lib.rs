@@ -63,7 +63,7 @@ pub(crate) use stateless::{
 // crate-internally for the tests under `src/tests/`.
 pub use stateless::{
     evaluate_connect, evaluate_exec, evaluate_file_delete, evaluate_file_open,
-    evaluate_file_set_time, evaluate_log_cleared, evaluate_signal,
+    evaluate_file_set_time, evaluate_log_cleared, evaluate_raw_volume_open, evaluate_signal,
 };
 
 #[derive(Debug, Clone)]
