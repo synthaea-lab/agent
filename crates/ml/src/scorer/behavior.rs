@@ -55,7 +55,7 @@ impl BehaviorScorer {
         model: &[u8],
         metadata: Option<&[u8]>,
     ) -> Result<Self, ScorerError> {
-        let session = Session::builder()?.commit_from_memory(model)?;
+        let session = super::session_builder()?.commit_from_memory(model)?;
         let forest = Forest::from_onnx_bytes(model)?;
 
         if forest.n_features() != FEATURE_COUNT {
