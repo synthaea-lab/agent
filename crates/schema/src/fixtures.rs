@@ -37,8 +37,8 @@ use crate::{
     LdapSearchEvent, ListenPortEvent, LogClearedEvent, MemfdCreateEvent, NamespaceEvent,
     NamespaceSyscall, NetworkFlowEvent, NtlmAuthEvent, NtlmDirection, PackageChangeEvent,
     PackageChangeKind, PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent,
-    PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent,
-    SessionState, ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
+    PtraceEvent, RawVolumeOpenEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
+    SessionEvent, SessionState, ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
     SocketCreateEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
     UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
 };
@@ -417,6 +417,16 @@ pub fn file_set_time() -> FileSetTimeEvent {
         last_access_time: None,
         last_write_time: None,
         change_time: None,
+    }
+}
+
+/// Neutral [`RawVolumeOpenEvent`].
+#[must_use]
+pub fn raw_volume_open() -> RawVolumeOpenEvent {
+    RawVolumeOpenEvent {
+        meta: meta(),
+        volume: String::new(),
+        desired_access: 0,
     }
 }
 

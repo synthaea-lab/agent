@@ -310,9 +310,11 @@ pub mod time;
 /// Bumped 53 → 56 for Windows minifilter explicit timestamp requests (#136).
 /// #995 (`ListenPortEvent::protocol`, 54) and #994 (`Event::KerberosDelegationFailure`,
 /// 55) are open and merge first, so this takes the slot after them; same coordination
-/// note as above. #1007 (raw-volume access, stacked on this branch) renumbers again on
-/// top of this when it next merges main.
-pub const SCHEMA_VERSION: u32 = 56;
+/// note as above. #1007 (raw-volume access) is stacked on this branch and takes 57.
+///
+/// Bumped 56 → 57 for mounted raw-volume open telemetry (#136 slice 4), stacked on
+/// the timestomp slice above.
+pub const SCHEMA_VERSION: u32 = 57;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -849,6 +851,17 @@ pub struct FileSetTimeEvent {
     pub last_write_time: Option<i64>,
     /// Requested change time in raw signed 100-ns FILETIME units; `None` means unchanged.
     pub change_time: Option<i64>,
+}
+
+/// Successful open of a mounted logical volume through the Windows minifilter.
+/// `desired_access` is the caller's requested `ACCESS_MASK`, not the rights granted or later used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawVolumeOpenEvent {
+    pub meta: EventMeta,
+    /// Kernel device name captured from the attached volume (for example `\\Device\\HarddiskVolume3`).
+    pub volume: String,
+    /// Raw Windows `ACCESS_MASK` requested by the caller.
+    pub desired_access: u32,
 }
 
 /// File permission change (issue #262 Phase 2): `chmod(2)`/`fchmodat(2)`. `fchmod(2)`
@@ -2441,6 +2454,7 @@ pub enum Event {
     FileDelete(FileDeleteEvent),
     FileRename(FileRenameEvent),
     FileSetTime(FileSetTimeEvent),
+    RawVolumeOpen(RawVolumeOpenEvent),
     SocketBind(SocketBindEvent),
     FileChmod(FileChmodEvent),
     FileChown(FileChownEvent),
@@ -2508,6 +2522,7 @@ impl Event {
             Event::FileDelete(e) => &e.meta,
             Event::FileRename(e) => &e.meta,
             Event::FileSetTime(e) => &e.meta,
+            Event::RawVolumeOpen(e) => &e.meta,
             Event::SocketBind(e) => &e.meta,
             Event::FileChmod(e) => &e.meta,
             Event::FileChown(e) => &e.meta,
