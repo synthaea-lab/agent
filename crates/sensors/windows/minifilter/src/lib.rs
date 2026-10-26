@@ -5,13 +5,21 @@
 //! connection context; the driver accepts exactly one client, and only one
 //! running as the agent (`NT SERVICE\SynthaEDR` in its token, guardrail 5).
 //!
-//! Milestone 2b: connecting only. The driver sends nothing yet (the event
-//! channel is milestone 2c), so there is no receive loop here.
+//! Milestone 2c: the event channel. The driver sends one message per delete
+//! or rename, and an idle heartbeat ([`wire`]); `channel::run` (Windows only) receives,
+//! decodes and forwards them as `FileDelete`/`FileRename` ([`events`]), with
+//! the loss visible from both sides ([`stats`]). The design is
+//! `docs/architecture/minifilter-event-channel.md`.
 //!
 //! The protocol constants mirror `driver/minifilter/SynthaeaFilter.c`: a
 //! change on one side is a change on the other. This crate sits next to
-//! `driver/` and depends on no workspace crate (ADR-0012 guardrail 8; it will
-//! depend on `schema` once it decodes events).
+//! `driver/` and depends only on `schema` among the workspace crates
+//! (ADR-0012 guardrail 8, `tools/check-deps.py`).
+//!
+//! Merge the v3 driver change (#857) before this receive loop (#853). The older v1 driver's
+//! port refuses this client's v3 connection context, so file telemetry is unavailable until
+//! the v3 driver is deployed. If #853 merges first, rebase #857 onto that main and verify
+//! both sides still use v3 and the 72-byte header.
 
 /// Name of the driver's communication port.
 pub const PORT_NAME: &str = r"\SynthaeaPort";
@@ -79,10 +87,16 @@ impl ConnectError {
     }
 }
 
+pub mod events;
+pub mod stats;
+pub mod wire;
+
+#[cfg(windows)]
+pub mod channel;
 #[cfg(windows)]
 mod port;
 #[cfg(windows)]
-pub use port::DriverPort;
+pub use port::{DriverPort, ReceiveBuffer, ReceiveError};
 
 #[cfg(test)]
 mod tests {

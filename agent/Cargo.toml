@@ -59,6 +59,7 @@ getrandom = "0.4"
 [target.'cfg(windows)'.dependencies]
 sensor-windows = { path = "../crates/sensors/windows/etw" }
 sensor-windows-eventlog = { path = "../crates/sensors/windows/eventlog" }
+sensor-windows-minifilter = { path = "../crates/sensors/windows/minifilter" }
 sensor-windows-sockets = { path = "../crates/sensors/windows/sockets" }
 ctrlc = "3"
 
