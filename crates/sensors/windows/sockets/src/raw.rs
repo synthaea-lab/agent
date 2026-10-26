@@ -4,10 +4,10 @@
 
 use std::net::SocketAddr;
 
-/// One listening TCP socket from a snapshot. The IP Helper table attributes the
-/// socket to its owning pid; `ppid` and `process_name` come from the process
-/// snapshot taken alongside it and are `None` when that process was not found
-/// there (exited mid-poll, or the snapshot failed).
+/// One listening TCP or bound UDP socket from a snapshot. The IP Helper table
+/// attributes the socket to its owning pid; `ppid` and `process_name` come from
+/// the process snapshot taken alongside it and are `None` when that process was
+/// not found there (exited mid-poll, or the snapshot failed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenerEntry {
     pub pid: u32,
@@ -16,6 +16,9 @@ pub struct ListenerEntry {
     /// the full path.
     pub process_name: Option<String>,
     pub local: SocketAddr,
+    /// `IPPROTO_TCP` (6) or `IPPROTO_UDP` (17) — which IP Helper table this
+    /// entry came from (issue #676).
+    pub protocol: u8,
 }
 
 /// `dwLocalAddr` holds the IPv4 address in network byte order, as stored in

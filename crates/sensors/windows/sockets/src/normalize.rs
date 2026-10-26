@@ -27,7 +27,7 @@ pub fn listen_port_event(entry: &ListenerEntry, timestamp_ns: u64) -> Event {
         },
         local_addr: entry.local.ip(),
         local_port: entry.local.port(),
-        protocol: 6, // IPPROTO_TCP — GetExtendedTcpTable (issue #676)
+        protocol: entry.protocol,
     })
 }
 
@@ -41,7 +41,18 @@ mod tests {
             ppid: Some(700),
             process_name: Some("svchost.exe".to_string()),
             local: "0.0.0.0:135".parse().unwrap(),
+            protocol: 6, // IPPROTO_TCP
         }
+    }
+
+    #[test]
+    fn a_udp_entry_carries_its_own_protocol_through() {
+        let mut e = entry();
+        e.protocol = 17; // IPPROTO_UDP
+        let Event::ListenPort(listen) = listen_port_event(&e, 0) else {
+            panic!("must map");
+        };
+        assert_eq!(listen.protocol, 17);
     }
 
     #[test]

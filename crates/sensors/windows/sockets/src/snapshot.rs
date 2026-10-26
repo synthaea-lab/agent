@@ -10,8 +10,10 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, INVALID_HANDLE_VALUE, NO_ERROR},
     NetworkManagement::IpHelper::{
-        GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID, MIB_TCPROW_OWNER_PID,
-        MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
+        GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
+        MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID,
+        MIB_UDP6TABLE_OWNER_PID, MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID,
+        TCP_TABLE_OWNER_PID_LISTENER, UDP_TABLE_OWNER_PID,
     },
     Networking::WinSock::{AF_INET, AF_INET6},
     System::Diagnostics::ToolHelp::{
@@ -59,14 +61,65 @@ fn fetch_table(family: u16, label: &'static str) -> Result<Vec<u8>, SocketsError
             }
             ERROR_INSUFFICIENT_BUFFER => {}
             code => {
-                return Err(SocketsError::TcpTable {
+                return Err(SocketsError::Table {
+                    protocol: "Tcp",
                     family: label,
                     code,
                 });
             }
         }
     }
-    Err(SocketsError::TcpTable {
+    Err(SocketsError::Table {
+        protocol: "Tcp",
+        family: label,
+        code: ERROR_INSUFFICIENT_BUFFER,
+    })
+}
+
+/// Fetches one `GetExtendedUdpTable` table into an owned byte buffer. Unlike
+/// the TCP table there is no "listener" filter — `UDP_TABLE_OWNER_PID` returns
+/// every bound UDP endpoint, server and client alike (issue #676's noise
+/// problem, left to a follow-up filter calibrated on a real capture rather
+/// than guessed here).
+fn fetch_udp_table(family: u16, label: &'static str) -> Result<Vec<u8>, SocketsError> {
+    let mut size: u32 = 0;
+    let mut buf: Vec<u8> = Vec::new();
+    for _ in 0..TABLE_FETCH_ATTEMPTS {
+        buf.resize(size as usize, 0);
+        let ptr = if buf.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            buf.as_mut_ptr().cast()
+        };
+        // SAFETY: `ptr` is null (sizing call) or points to `size` writable bytes
+        // owned by `buf`; `size` is a valid in/out pointer for the call.
+        let rc = unsafe {
+            GetExtendedUdpTable(
+                ptr,
+                &raw mut size,
+                0,
+                u32::from(family),
+                UDP_TABLE_OWNER_PID,
+                0,
+            )
+        };
+        match rc {
+            NO_ERROR => {
+                buf.truncate(size as usize);
+                return Ok(buf);
+            }
+            ERROR_INSUFFICIENT_BUFFER => {}
+            code => {
+                return Err(SocketsError::Table {
+                    protocol: "Udp",
+                    family: label,
+                    code,
+                });
+            }
+        }
+    }
+    Err(SocketsError::Table {
+        protocol: "Udp",
         family: label,
         code: ERROR_INSUFFICIENT_BUFFER,
     })
@@ -130,6 +183,40 @@ fn ipv6_listeners() -> Result<Vec<(u32, SocketAddr)>, SocketsError> {
     )
 }
 
+/// Every bound IPv4 UDP endpoint (not just "servers" — see [`fetch_udp_table`]).
+fn ipv4_udp_sockets() -> Result<Vec<(u32, SocketAddr)>, SocketsError> {
+    let buf = fetch_udp_table(AF_INET, "IPv4")?;
+    Ok(
+        rows::<MIB_UDPROW_OWNER_PID>(&buf, offset_of!(MIB_UDPTABLE_OWNER_PID, table))
+            .into_iter()
+            .map(|row| {
+                let addr = SocketAddr::new(
+                    IpAddr::V4(ipv4_from_row(row.dwLocalAddr)),
+                    port_from_row(row.dwLocalPort),
+                );
+                (row.dwOwningPid, addr)
+            })
+            .collect(),
+    )
+}
+
+/// Every bound IPv6 UDP endpoint (not just "servers" — see [`fetch_udp_table`]).
+fn ipv6_udp_sockets() -> Result<Vec<(u32, SocketAddr)>, SocketsError> {
+    let buf = fetch_udp_table(AF_INET6, "IPv6")?;
+    Ok(
+        rows::<MIB_UDP6ROW_OWNER_PID>(&buf, offset_of!(MIB_UDP6TABLE_OWNER_PID, table))
+            .into_iter()
+            .map(|row| {
+                let addr = SocketAddr::new(
+                    IpAddr::V6(Ipv6Addr::from(row.ucLocalAddr)),
+                    port_from_row(row.dwLocalPort),
+                );
+                (row.dwOwningPid, addr)
+            })
+            .collect(),
+    )
+}
+
 /// pid → (ppid, executable name) from one `Toolhelp32` snapshot. Empty on
 /// failure: listeners then keep their pid and lose only the enrichment.
 fn process_table() -> HashMap<u32, (u32, String)> {
@@ -169,31 +256,43 @@ fn process_table() -> HashMap<u32, (u32, String)> {
     out
 }
 
-/// Takes one snapshot of every listening TCP socket, IPv4 and IPv6.
+/// Takes one snapshot of every listening TCP socket and every bound UDP
+/// socket, IPv4 and IPv6.
 ///
 /// A socket bound to both families appears once per family — they are distinct
-/// kernel objects, and LISTENER-DRIFT keys on the address anyway.
+/// kernel objects, and LISTENER-DRIFT keys on the address (and now protocol,
+/// issue #676) anyway.
+///
+/// Unlike the TCP half, the UDP table has no "listener" filter: every bound
+/// UDP endpoint comes back, including DNS client sockets, QUIC/browser and
+/// media sockets on ephemeral ports. Issue #676 names this the noise problem
+/// and asks for a filter calibrated on a real capture — deliberately not
+/// invented here; this snapshot is the honest, unfiltered mechanism the filter
+/// will sit in front of.
 ///
 /// # Errors
 ///
-/// [`SocketsError::TcpTable`] when either family's table cannot be read. The
+/// [`SocketsError::Table`] when any of the four tables cannot be read. The
 /// process snapshot failing is not an error (see [`ListenerEntry`]).
 pub fn snapshot() -> Result<Vec<ListenerEntry>, SocketsError> {
-    let mut sockets = ipv4_listeners()?;
-    sockets.extend(ipv6_listeners()?);
+    let mut tcp = ipv4_listeners()?;
+    tcp.extend(ipv6_listeners()?);
+    let mut udp = ipv4_udp_sockets()?;
+    udp.extend(ipv6_udp_sockets()?);
     let processes = process_table();
-    Ok(sockets
-        .into_iter()
-        .map(|(pid, local)| {
-            let owner = processes.get(&pid);
-            ListenerEntry {
-                pid,
-                ppid: owner.map(|(ppid, _)| *ppid),
-                process_name: owner.map(|(_, name)| name.clone()),
-                local,
-            }
-        })
-        .collect())
+    let attribute = |(pid, local): (u32, SocketAddr), protocol: u8| {
+        let owner = processes.get(&pid);
+        ListenerEntry {
+            pid,
+            ppid: owner.map(|(ppid, _)| *ppid),
+            process_name: owner.map(|(_, name)| name.clone()),
+            local,
+            protocol,
+        }
+    };
+    let mut entries: Vec<ListenerEntry> = tcp.into_iter().map(|e| attribute(e, 6)).collect(); // IPPROTO_TCP
+    entries.extend(udp.into_iter().map(|e| attribute(e, 17))); // IPPROTO_UDP
+    Ok(entries)
 }
 
 /// One [`snapshot`] mapped to [`schema::Event::ListenPort`] events, stamped

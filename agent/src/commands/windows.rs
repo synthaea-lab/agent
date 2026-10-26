@@ -59,13 +59,16 @@ fn seeded_rule_state() -> rules::RuleState {
     let mut rule_state = rules::RuleState::new();
     rule_state.seed_pid_comm(map);
     // LISTENER-DRIFT baseline (#366), same reasoning as the Linux/macOS
-    // seeding: every listener already up when the agent starts (RPC 135, SMB
-    // 445, vendor services) is the baseline, not a finding. Best-effort — a
-    // snapshot failure leaves the baseline empty rather than failing startup.
+    // seeding: every listener/bound socket already up when the agent starts
+    // (RPC 135, SMB 445, vendor services, DNS client sockets) is the
+    // baseline, not a finding. Best-effort — a snapshot failure leaves the
+    // baseline empty rather than failing startup.
     match sensor_windows_sockets::snapshot() {
         Ok(entries) => {
             rule_state.seed_listen_ports(
-                entries.iter().map(|e| (e.local.ip(), e.local.port(), 6)), // IPPROTO_TCP — TCP-only snapshot today (issue #676)
+                entries
+                    .iter()
+                    .map(|e| (e.local.ip(), e.local.port(), e.protocol)),
             );
         }
         Err(e) => tracing::warn!(error = %e, "socket snapshot for listener baseline failed"),
