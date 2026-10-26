@@ -454,9 +454,18 @@ fn spawn_ebpf_log_drain(ebpf: &mut aya::Ebpf) -> Result<(), SensorError> {
             warn!(error = %e, "sensor-linux-uprobes: failed to initialize eBPF logger");
         }
         Ok(logger) => {
-            let mut logger =
-                tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)
-                    .map_err(|e| err(format!("eBPF logger fd: {e}")))?;
+            // SAFETY: `logger` owns its `RingBuf<MapData>`, whose fd is the `OwnedFd`
+            // aya holds in the map; it is valid and open, and aya offers no way to close,
+            // replace or take it out of the logger — it is closed only when the logger
+            // drops, which now happens when this `AsyncFd` drops. The fd stays open and
+            // the same one for the `AsyncFd`'s whole life, and `as_raw_fd` returns it.
+            let mut logger = unsafe {
+                tokio::io::unix::AsyncFd::register_with_interest(
+                    logger,
+                    tokio::io::Interest::READABLE,
+                )
+            }
+            .map_err(|e| err(format!("eBPF logger fd: {e}")))?;
             tokio::task::spawn(async move {
                 loop {
                     // No unwrap: nothing holds this task's JoinHandle, so a
@@ -674,8 +683,16 @@ impl UprobesSensor {
                 .ok_or_else(|| err(format!("map {map} not found in eBPF object")))?;
             let rb = RingBuf::try_from(m)
                 .map_err(|e| err(format!("map {map} is not a ring buffer: {e}")))?;
-            tokio::io::unix::AsyncFd::with_interest(rb, tokio::io::Interest::READABLE)
-                .map_err(|e| err(format!("ring buffer fd for {map}: {e}")))
+            // SAFETY: `rb` is a `RingBuf<MapData>` taken out of the loaded `ebpf`; its
+            // fd is the `OwnedFd` aya holds in the map, valid and open. aya offers no
+            // way to close, replace or take that fd out of the ring buffer — it is
+            // closed only when the `RingBuf` drops, which now happens when this
+            // `AsyncFd` drops. The fd stays open and the same one for the `AsyncFd`'s
+            // whole life, and `as_raw_fd` returns it.
+            unsafe {
+                tokio::io::unix::AsyncFd::register_with_interest(rb, tokio::io::Interest::READABLE)
+            }
+            .map_err(|e| err(format!("ring buffer fd for {map}: {e}")))
         };
 
         let mut tls_ring_buf = if self.config.tls.enabled {
