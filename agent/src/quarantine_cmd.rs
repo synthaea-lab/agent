@@ -106,6 +106,7 @@ mod tests {
         let policy = policy::ResponsePolicy {
             kill_enabled: false,
             quarantine_enabled: true,
+            isolate_enabled: false,
         };
         match response::quarantine_file(&payload, &quarantine_dir_for(&alerts), &policy) {
             QuarantineOutcome::Quarantined { sha256_hex, .. } => (alerts, payload, sha256_hex),
