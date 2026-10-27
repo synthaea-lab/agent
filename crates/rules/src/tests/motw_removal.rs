@@ -205,3 +205,112 @@ fn a_unix_delete_named_like_a_stream_is_ignored() {
             .is_empty()
     );
 }
+
+// ── the stream renamed instead of deleted (the minifilter reports it, #136) ─────
+
+fn rename_stream(old_path: &str, new_path: &str, timestamp_ns: u64) -> schema::FileRenameEvent {
+    schema::FileRenameEvent {
+        meta: EventMeta {
+            // The minifilter knows the pid and nothing else.
+            pid: 779,
+            timestamp_ns,
+            comm: String::new(),
+            user: User::Unknown,
+            ..meta()
+        },
+        old_path: old_path.into(),
+        new_path: new_path.into(),
+        executable_path: None,
+    }
+}
+
+#[test]
+fn executing_a_file_after_its_mark_stream_was_renamed_away_alerts() {
+    let mut state = RuleState::new();
+    state.on_file_rename(&rename_stream(
+        &stream(DOWNLOAD),
+        &format!("{DOWNLOAD}:hidden"),
+        0,
+    ));
+    let alerts = state.on_exec(&run(DOWNLOAD, 30_000_000_000));
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(alerts[0].technique, "T1553.005");
+    assert!(
+        alerts[0].message.contains("removed by pid=779"),
+        "{}",
+        alerts[0].message
+    );
+}
+
+#[test]
+fn a_stream_renamed_onto_another_file_still_strips_the_first_one() {
+    let mut state = RuleState::new();
+    state.on_file_rename(&rename_stream(
+        &stream(DOWNLOAD),
+        &stream(r"C:\Users\u\Downloads\other.exe"),
+        0,
+    ));
+    assert_eq!(state.on_exec(&run(DOWNLOAD, 1)).len(), 1);
+}
+
+#[test]
+fn a_stream_renamed_in_place_with_a_case_change_removed_nothing() {
+    let mut state = RuleState::new();
+    state.on_file_rename(&rename_stream(
+        &stream(DOWNLOAD),
+        &format!("{}:zone.identifier:$DATA", DOWNLOAD.to_uppercase()),
+        0,
+    ));
+    assert!(state.on_exec(&run(DOWNLOAD, 1)).is_empty());
+}
+
+#[test]
+fn renaming_a_file_or_another_stream_is_not_a_mark_removal() {
+    let mut state = RuleState::new();
+    state.on_file_rename(&rename_stream(
+        DOWNLOAD,
+        r"C:\Users\u\Downloads\renamed.exe",
+        0,
+    ));
+    state.on_file_rename(&rename_stream(
+        &format!("{DOWNLOAD}:hidden"),
+        &format!("{DOWNLOAD}:other"),
+        0,
+    ));
+    assert!(state.on_exec(&run(DOWNLOAD, 1)).is_empty());
+}
+
+#[test]
+fn renaming_a_mark_stream_alone_does_not_alert_or_exceed_the_window() {
+    let mut state = RuleState::new();
+    let alerts = state.on_file_rename(&rename_stream(
+        &stream(DOWNLOAD),
+        &format!("{DOWNLOAD}:hidden"),
+        0,
+    ));
+    assert!(alerts.is_empty(), "{alerts:?}");
+    assert!(
+        state
+            .on_exec(&run(DOWNLOAD, QUARANTINE_EXEC_WINDOW_NS + 1))
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_unix_rename_named_like_a_stream_is_ignored() {
+    let mut state = RuleState::new();
+    let mut event = rename_stream("/tmp/x:Zone.Identifier", "/tmp/y", 0);
+    event.meta.user = User::Unix {
+        uid: 1000,
+        gid: 1000,
+    };
+    state.on_file_rename(&event);
+    assert!(
+        state
+            .on_exec(&ExecEvent {
+                image_path: "/tmp/x".into(),
+                ..schema::fixtures::exec()
+            })
+            .is_empty()
+    );
+}
