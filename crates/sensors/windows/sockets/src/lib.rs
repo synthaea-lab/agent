@@ -36,6 +36,24 @@ pub use raw::ListenerEntry;
 #[cfg(windows)]
 pub use snapshot::{listen_port_events, snapshot};
 
+/// Which IP Helper table a [`SocketsError::Table`] failure came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    /// `GetExtendedTcpTable`.
+    Tcp,
+    /// `GetExtendedUdpTable`.
+    Udp,
+}
+
+impl std::fmt::Display for Protocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Protocol::Tcp => "Tcp",
+            Protocol::Udp => "Udp",
+        })
+    }
+}
+
 /// Errors from the snapshot path.
 #[derive(Debug, thiserror::Error)]
 pub enum SocketsError {
@@ -44,8 +62,8 @@ pub enum SocketsError {
     /// entries then carry no attribution beyond the pid.
     #[error("GetExtended{protocol}Table failed for {family} (win32 error {code})")]
     Table {
-        /// `"Tcp"` or `"Udp"`.
-        protocol: &'static str,
+        /// Which table — `GetExtendedTcpTable` or `GetExtendedUdpTable`.
+        protocol: Protocol,
         /// `"IPv4"` or `"IPv6"`.
         family: &'static str,
         /// The Win32 error code returned.

@@ -23,8 +23,8 @@ use windows_sys::Win32::{
 };
 
 use crate::{
-    SocketsError,
-    raw::{ListenerEntry, ipv4_from_row, port_from_row},
+    Protocol, SocketsError,
+    raw::{IPPROTO_TCP, IPPROTO_UDP, ListenerEntry, ipv4_from_row, port_from_row},
 };
 
 /// The table can grow between the sizing call and the fill call (a service
@@ -62,7 +62,7 @@ fn fetch_table(family: u16, label: &'static str) -> Result<Vec<u8>, SocketsError
             ERROR_INSUFFICIENT_BUFFER => {}
             code => {
                 return Err(SocketsError::Table {
-                    protocol: "Tcp",
+                    protocol: Protocol::Tcp,
                     family: label,
                     code,
                 });
@@ -70,7 +70,7 @@ fn fetch_table(family: u16, label: &'static str) -> Result<Vec<u8>, SocketsError
         }
     }
     Err(SocketsError::Table {
-        protocol: "Tcp",
+        protocol: Protocol::Tcp,
         family: label,
         code: ERROR_INSUFFICIENT_BUFFER,
     })
@@ -111,7 +111,7 @@ fn fetch_udp_table(family: u16, label: &'static str) -> Result<Vec<u8>, SocketsE
             ERROR_INSUFFICIENT_BUFFER => {}
             code => {
                 return Err(SocketsError::Table {
-                    protocol: "Udp",
+                    protocol: Protocol::Udp,
                     family: label,
                     code,
                 });
@@ -119,7 +119,7 @@ fn fetch_udp_table(family: u16, label: &'static str) -> Result<Vec<u8>, SocketsE
         }
     }
     Err(SocketsError::Table {
-        protocol: "Udp",
+        protocol: Protocol::Udp,
         family: label,
         code: ERROR_INSUFFICIENT_BUFFER,
     })
@@ -272,13 +272,26 @@ fn process_table() -> HashMap<u32, (u32, String)> {
 ///
 /// # Errors
 ///
-/// [`SocketsError::Table`] when any of the four tables cannot be read. The
-/// process snapshot failing is not an error (see [`ListenerEntry`]).
+/// [`SocketsError::Table`] when either TCP table (IPv4 or IPv6) cannot be
+/// read. A UDP table failure is logged and treated as no UDP entries instead,
+/// so it never discards the TCP listeners already read (see this function's
+/// own `unwrap_or_else` calls) — the process snapshot failing is the same
+/// best-effort posture (see [`ListenerEntry`]).
 pub fn snapshot() -> Result<Vec<ListenerEntry>, SocketsError> {
     let mut tcp = ipv4_listeners()?;
     tcp.extend(ipv6_listeners()?);
-    let mut udp = ipv4_udp_sockets()?;
-    udp.extend(ipv6_udp_sockets()?);
+    // UDP is best-effort: unlike the TCP tables above, a UDP fetch failure
+    // must not drop the TCP listeners already read (review of #1008 — the
+    // startup baseline going empty because IPv6 UDP errored would alert on
+    // every pre-existing TCP listener on the first poll).
+    let mut udp = ipv4_udp_sockets().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "IPv4 UDP socket table unavailable, continuing without it");
+        Vec::new()
+    });
+    udp.extend(ipv6_udp_sockets().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "IPv6 UDP socket table unavailable, continuing without it");
+        Vec::new()
+    }));
     let processes = process_table();
     let attribute = |(pid, local): (u32, SocketAddr), protocol: u8| {
         let owner = processes.get(&pid);
@@ -290,8 +303,9 @@ pub fn snapshot() -> Result<Vec<ListenerEntry>, SocketsError> {
             protocol,
         }
     };
-    let mut entries: Vec<ListenerEntry> = tcp.into_iter().map(|e| attribute(e, 6)).collect(); // IPPROTO_TCP
-    entries.extend(udp.into_iter().map(|e| attribute(e, 17))); // IPPROTO_UDP
+    let mut entries: Vec<ListenerEntry> =
+        tcp.into_iter().map(|e| attribute(e, IPPROTO_TCP)).collect();
+    entries.extend(udp.into_iter().map(|e| attribute(e, IPPROTO_UDP)));
     Ok(entries)
 }
 

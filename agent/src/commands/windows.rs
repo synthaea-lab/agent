@@ -63,11 +63,19 @@ fn seeded_rule_state() -> rules::RuleState {
     // (RPC 135, SMB 445, vendor services, DNS client sockets) is the
     // baseline, not a finding. Best-effort — a snapshot failure leaves the
     // baseline empty rather than failing startup.
+    //
+    // TCP only, for now: `GetExtendedUdpTable` has no "listener" filter (every
+    // bound UDP endpoint comes back — DNS client sockets, QUIC, mDNS,
+    // ephemeral ports), and #676's noise filter for that is not calibrated
+    // yet (review of #1008). Forwarding UDP unfiltered would drown the TCP
+    // signal, so it stays out of the rule path until that filter lands —
+    // `sensor_windows_sockets::snapshot` still collects it for when it does.
     match sensor_windows_sockets::snapshot() {
         Ok(entries) => {
             rule_state.seed_listen_ports(
                 entries
                     .iter()
+                    .filter(|e| e.protocol == 6) // IPPROTO_TCP
                     .map(|e| (e.local.ip(), e.local.port(), e.protocol)),
             );
         }
@@ -97,11 +105,19 @@ fn spawn_socket_poller(
         .name("socket-poller".into())
         .spawn(move || {
             while !stop.load(Ordering::SeqCst) {
-                forward_socket_snapshot(
-                    sensor_windows_sockets::listen_port_events(schema::time::now_ns()),
-                    sink.as_ref(),
-                    heartbeat.as_ref(),
-                );
+                // TCP only for now — same #676 noise-filter gap as the
+                // baseline seed above (`seeded_rule_state`); drop UDP here
+                // too until that filter exists.
+                let events = sensor_windows_sockets::listen_port_events(schema::time::now_ns())
+                    .map(|events| {
+                        events
+                            .into_iter()
+                            .filter(|e| {
+                                matches!(e, Event::ListenPort(l) if l.protocol == 6) // IPPROTO_TCP
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                forward_socket_snapshot(events, sink.as_ref(), heartbeat.as_ref());
                 // Sleep in short slices so Ctrl-C never waits a full interval.
                 let deadline = std::time::Instant::now() + SOCKET_POLL_INTERVAL;
                 while std::time::Instant::now() < deadline && !stop.load(Ordering::SeqCst) {

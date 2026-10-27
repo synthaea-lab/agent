@@ -93,9 +93,15 @@ fn own_tcp_listener_is_still_distinguished_from_udp() {
     let entries = snapshot().expect("snapshot");
     let mine = entries
         .iter()
-        .find(|e| e.pid == me && e.local.port() == port)
+        .find(|e| e.pid == me && e.local.port() == port && e.protocol == 6)
         .expect("own TCP listener must appear");
     assert_eq!(mine.protocol, 6, "IPPROTO_TCP");
+    assert!(
+        !entries
+            .iter()
+            .any(|e| e.pid == me && e.local.port() == port && e.protocol == 17),
+        "a UDP socket in this process must not share the TCP listener's port"
+    );
     drop(listener);
 }
 
