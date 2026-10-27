@@ -279,8 +279,10 @@ impl Reader<'_> {
         let raw = self.bytes.get(self.at..end).unwrap_or(&[]);
         self.at = end;
         let code_units = raw
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair));
         char::decode_utf16(code_units)
             .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
             .collect()

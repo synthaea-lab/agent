@@ -261,13 +261,12 @@ pub(crate) fn discovery(event: &ExecEvent) -> Option<(&'static str, Category)> {
                 return None;
             }
         }
-        "cat" | "less" | "more" | "head" | "tail" => {
-            if args.iter().any(|a| a == "/etc/passwd" || a == "/etc/group") {
-                ("read /etc/passwd", Category::Account)
-            } else {
-                return None;
-            }
+        "cat" | "less" | "more" | "head" | "tail"
+            if args.iter().any(|a| a == "/etc/passwd" || a == "/etc/group") =>
+        {
+            ("read /etc/passwd", Category::Account)
         }
+        "cat" | "less" | "more" | "head" | "tail" => return None,
         _ => return None,
     };
     Some(found)

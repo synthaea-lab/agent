@@ -148,8 +148,10 @@ fn parse_int64_initializer(tensor: &[u8]) -> Result<Option<Int64Initializer<'_>>
             return Err(ParseError::Malformed("INT64 raw_data not 8-aligned"));
         }
         values.extend(
-            raw.chunks_exact(8)
-                .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])),
+            raw.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| i64::from_le_bytes(*c)),
         );
     }
     Ok(Some((name, values)))
