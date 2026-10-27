@@ -37,7 +37,8 @@ use crate::{
         RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
         SCAN_VERTICAL_THRESHOLD, SCAN_VERTICAL_WINDOW_NS, SELF_SPAWN_EXCLUSIONS,
         SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD,
-        SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS,
+        SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS, SELINUX_POLICY_TOOL_COMMS,
+        SERVICE_COMM_PREFIXES, SERVICE_COMMS,
         SHELL_COMMS, STAGING_PID_CAP, STAGING_READ_DIRS, STAGING_READ_FILES, STAGING_WINDOW_NS,
         STAGING_WRITE_FILES, STANDARD_PORTS, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN,
         TASK_REGISTRATION_DEDUP_WINDOW_NS, TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
@@ -2860,7 +2861,10 @@ impl RuleState {
     /// `compress` opens the `.gz` and unlinks the input itself (gzip only writes to an
     /// inherited fd), so it is excluded as a compression *driver*
     /// ([`Self::is_compression_driver`]): trusted binary named `logrotate` **and** a
-    /// compression extension, both required (found live by Jihair on Alpine, #527). Nothing else measured
+    /// compression extension, both required (found live by Jihair on Alpine, #527). A third
+    /// benign producer, `semodule -B`/`-DB` rebuilding the `SELinux` policy store, is excluded
+    /// the same way as the compressors ([`Self::is_selinux_policy_tool`]): no suffix
+    /// convention to also require (found live on Fedora, #1013). Nothing else measured
     /// (`zip -m`, `rsync --remove-source-files`, `git gc`, atomic writers, `apt`)
     /// exceeded 2. Restricted to Unix events: the Windows and macOS producers of this
     /// shape (Explorer, `ditto`, installers) were not measured.
@@ -2935,7 +2939,10 @@ impl RuleState {
         deleted: &str,
         created: &str,
     ) -> Option<Alert> {
-        if self.is_compressor(meta) || self.is_compression_driver(meta, deleted, created) {
+        if self.is_compressor(meta)
+            || self.is_compression_driver(meta, deleted, created)
+            || self.is_selinux_policy_tool(meta)
+        {
             return None;
         }
         let pid_entry = self
@@ -2980,6 +2987,16 @@ impl RuleState {
     /// runs the trusted binary of that name: see [`Self::runs_trusted_binary_named`].
     fn is_compressor(&self, meta: &schema::EventMeta) -> bool {
         COMPRESSOR_COMMS.contains(&meta.comm.as_str()) && self.runs_trusted_binary_named(meta)
+    }
+
+    /// True when `comm` is a `SELinux` policy-store tool ([`SELINUX_POLICY_TOOL_COMMS`]) and
+    /// the pid really runs the trusted binary of that name (#1013): `semodule -B`'s
+    /// create-then-replace of every module in the targeted policy base set matches this
+    /// shape with no `comm`-independent suffix convention to additionally require, unlike
+    /// [`Self::is_compression_driver`].
+    fn is_selinux_policy_tool(&self, meta: &schema::EventMeta) -> bool {
+        SELINUX_POLICY_TOOL_COMMS.contains(&meta.comm.as_str())
+            && self.runs_trusted_binary_named(meta)
     }
 
     /// True when this pid's exec-time `image_path` is known, sits at a trusted system
