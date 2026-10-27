@@ -5,9 +5,13 @@
 use std::net::SocketAddr;
 
 /// `IPPROTO_TCP`, mirroring `sensor-linux-netlink::wire::IPPROTO_TCP` — no
-/// shared `schema` constant yet (#676 part 2 review).
+/// shared `schema` constant yet (#676 part 2 review). Only `snapshot` (Windows
+/// only) uses these; on other targets they are dead code, not merely unused —
+/// the module that would use them does not compile there at all.
+#[cfg(windows)]
 pub(crate) const IPPROTO_TCP: u8 = 6;
 /// `IPPROTO_UDP`.
+#[cfg(windows)]
 pub(crate) const IPPROTO_UDP: u8 = 17;
 
 /// One listening TCP or bound UDP socket from a snapshot. The IP Helper table
