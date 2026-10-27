@@ -201,6 +201,63 @@ fn a_manifest_is_signed_by_the_token_and_the_wrong_token_pin_or_key_is_refused()
     let all = format!("{}{}", text(&out.stdout), text(&out.stderr));
     assert!(!all.contains(PIN));
 
+    // A key rotation is signed on the token too (here the token's key stands in for `recovery`):
+    // `rotation` builds the unsigned manifest, `sign --kind rotation` has the token sign it, and
+    // the signature verifies under the token's public key over the rotation's canonical bytes.
+    let rotation_path = dir.path().join("rotation.json");
+    let (rotation_arg, rotation_signed_path) = (
+        path(&rotation_path),
+        dir.path().join("rotation-signed.json"),
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_release-tool"))
+        .args([
+            "rotation",
+            "--release-version",
+            "9",
+            "--new-release-key",
+            &"aa".repeat(32),
+            "--retire-release-key",
+            &"bb".repeat(32),
+            "--reason",
+            "softhsm test",
+            "--issued-at",
+            "1760000000",
+            "--out",
+            &rotation_arg,
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let rotation_signed_arg = path(&rotation_signed_path);
+    let args = [
+        &[
+            "sign",
+            "--kind",
+            "rotation",
+            &rotation_arg,
+            "--out",
+            &rotation_signed_arg,
+        ][..],
+        &token[..],
+    ]
+    .concat();
+    let out = release_tool(&module, &args, Some(PIN));
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let mut rotation: updater::KeyRotationManifest =
+        serde_json::from_str(&std::fs::read_to_string(&rotation_signed_path).unwrap()).unwrap();
+    let signature = updater_hex(&rotation.signature);
+    assert_eq!(signature.len(), 64);
+    rotation.signature.clear();
+    UnparsedPublicKey::new(&ED25519, public)
+        .verify(&serde_json::to_vec_pretty(&rotation).unwrap(), &signature)
+        .expect("the token's signature over the rotation verifies under its public key");
+    // The token is not the build's embedded `recovery` key, and the tool says so.
+    assert!(
+        text(&out.stderr).contains("does NOT accept"),
+        "{}",
+        text(&out.stderr)
+    );
+
     // A wrong PIN, a wrong token label and a wrong key label are refused, and nothing is written.
     std::fs::remove_file(&signed_path).unwrap();
     for (what, pin, token_args) in [

@@ -9,20 +9,20 @@
 use std::net::IpAddr;
 
 use schema::{
-    AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, CapSetEvent,
-    ConnectEvent, DefenderEvent, DefenderEventKind, DnsQueryEvent, Event, EventMeta, ExecEvent,
-    FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent, FileQuarantineEvent,
-    FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent,
-    GatekeeperVerdictEvent, HttpClientCount, HttpEvidence, HttpRequestEvent, HttpSignature,
-    HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent, KernelModuleAction,
-    KernelModuleEvent, LdapSearchEvent, ListenPortEvent, LogClearedEvent, MemfdCreateEvent,
-    MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, NtlmAuthEvent, NtlmDirection,
-    POLICY_MECHANISM_SELINUX, PackageChangeEvent, PackageChangeKind, PolicyDenialEvent, PrctlEvent,
-    ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent,
-    ScriptBlockEvent, SessionEvent, SessionState, ShellType, SignalEvent, SmbConnectEvent,
-    SocketAcceptEvent, SocketBindEvent, SocketCreateEvent, SocketListenEvent, TccDecisionEvent,
-    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, User,
-    WmiActivityEvent, XpcConnectEvent,
+    AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BitsJobEvent,
+    BitsJobState, BpfEvent, CapSetEvent, ConnectEvent, DefenderEvent, DefenderEventKind,
+    DnsQueryEvent, Event, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent,
+    FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
+    FileWriteEvent, GatekeeperVerdictEvent, HttpClientCount, HttpEvidence, HttpRequestEvent,
+    HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent,
+    KernelModuleAction, KernelModuleEvent, LdapSearchEvent, ListenPortEvent, LogClearedEvent,
+    MemfdCreateEvent, MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent,
+    NtlmAuthEvent, NtlmDirection, POLICY_MECHANISM_SELINUX, PackageChangeEvent, PackageChangeKind,
+    PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
+    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent, SessionState, ShellType,
+    SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketCreateEvent,
+    SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
+    UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
     detection::{Detection, DetectionSource, ScoreAttribution, Severity},
 };
 
@@ -419,11 +419,24 @@ fn dns_query_golden() {
             },
             query: "beacon.example.test".into(),
             qtype: 1,
-            result: Some("type:1 172.67.143.127;".into()),
+            result: Some("172.67.143.127".into()),
+            results: vec!["172.67.143.127".into(), "2001:db8::1".into()],
+            results_truncated: true,
             status: 0,
         }),
         "dns_query",
     );
+}
+
+#[test]
+fn dns_query_v44_fixture_deserializes_with_empty_answer_set() {
+    let old_event: Event = serde_json::from_str(include_str!("fixtures/v44/dns_query.json"))
+        .expect("v44 DNS fixture remains readable");
+    let Event::DnsQuery(event) = old_event else {
+        panic!("fixture must deserialize as a DNS query")
+    };
+    assert!(event.results.is_empty());
+    assert!(!event.results_truncated);
 }
 
 #[test]
@@ -1926,6 +1939,68 @@ fn namespace_golden() {
 }
 
 #[test]
+fn bits_job_golden() {
+    // v48 (#284): `bitsadmin /transfer` adding a file to a BITS job. The
+    // service does the download; this record names the client that asked.
+    assert_golden(
+        &Event::BitsJob(BitsJobEvent {
+            meta: EventMeta {
+                pid: 6412,
+                ppid: 5120,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-1001".into(),
+                    integrity_level: Some(0x2000),
+                },
+                timestamp_ns: 1_756_900_029_000_000_000,
+                comm: "bitsadmin.exe".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            job_id: "{c40080ab-6fe4-418a-8ba6-c271c5298f18}".into(),
+            job_title: "update".into(),
+            state: BitsJobState::FileAdded,
+            url: "https://example.test/payload.exe".into(),
+            local_path: r"C:\Users\u\AppData\Local\Temp\p.exe".into(),
+            bytes_transferred: None,
+            hresult: None,
+        }),
+        "bits_job",
+    );
+}
+
+#[test]
+fn bits_job_transfer_error_golden() {
+    // v48 (#284): the same job failing mid-transfer, reported by the BITS
+    // service and attributed to the client that added the file.
+    assert_golden(
+        &Event::BitsJob(BitsJobEvent {
+            meta: EventMeta {
+                pid: 6412,
+                ppid: 5120,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-1001".into(),
+                    integrity_level: Some(0x2000),
+                },
+                timestamp_ns: 1_756_900_030_000_000_000,
+                comm: "bitsadmin.exe".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            job_id: "{c40080ab-6fe4-418a-8ba6-c271c5298f18}".into(),
+            job_title: "update".into(),
+            state: BitsJobState::TransferError,
+            url: "https://example.test/payload.exe".into(),
+            local_path: r"C:\Users\u\AppData\Local\Temp\p.exe".into(),
+            bytes_transferred: Some(1917),
+            hresult: Some(0x8019_0194), // BG_E_HTTP_ERROR_404
+        }),
+        "bits_job_transfer_error",
+    );
+}
+
+#[test]
 fn prctl_securebits_golden() {
     // v34 (#457): PR_SET_SECUREBITS locking SECBIT_NOROOT (bit 0) and its
     // LOCKED twin (bit 1) — the process tree can never regain root's implicit
@@ -2179,6 +2254,8 @@ fn meta_accessor_covers_all_variants() {
             query: String::new(),
             qtype: 1,
             result: None,
+            results: Vec::new(),
+            results_truncated: false,
             status: 0,
         }),
         Event::RegistrySet(RegistrySetEvent {

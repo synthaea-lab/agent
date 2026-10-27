@@ -71,7 +71,10 @@ use crate::redact;
 ///
 /// v24 (#784) added parent-lineage fields to `ExecEvent` and `LineageEntry` — `ExecEvent` is
 /// not imported here, same reasoning.
-const _: () = assert!(wire::WIRE_VERSION == 24);
+///
+/// v26 (#458 part 3) added `DnsUdpQueryEvent` — not imported here either: the socket-level DNS
+/// query path maps it in `sensor-linux`'s `normalize`, not in this crate.
+const _: () = assert!(wire::WIRE_VERSION == 26);
 
 /// `container` is resolved by the caller (`crate::container::container_context`,
 /// issue #312) from `EventMeta::cgroup_id` against cgroupfs, with image/name filled
@@ -176,7 +179,7 @@ pub fn readline_input(
 /// reusing `schema::DnsQueryEvent` (issue #267 Phase 1, platform-neutral,
 /// already shared with the Windows DNS-Client ETW producer).
 ///
-/// `qtype` reflects the *first resolved answer's* address family (1 = A,
+/// `qtype` reflects the *first unique resolved answer's* address family (1 = A,
 /// 28 = AAAA) — `getaddrinfo` can be called with `AF_UNSPEC`, so what the
 /// caller actually requested isn't visible at this probe's information
 /// level; on a failed lookup (no address resolved) it defaults to `1` as a
@@ -198,22 +201,42 @@ pub fn dns_query(
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
     let query = redact::redact_dns_query(String::from_utf8_lossy(&raw[..end]).into_owned());
 
-    let (qtype, result) = if event.addr_resolved {
-        let addr = if event.is_ipv6 {
-            std::net::IpAddr::V6(event.addr_v6.into())
+    let answer_count = event.answer_count.min(wire::MAX_DNS_ANSWERS as u8) as usize;
+    let mut results = Vec::with_capacity(answer_count);
+    let mut qtype = 1;
+    for answer in event.answers.iter().take(answer_count) {
+        let (answer_qtype, address) = if answer.family == libc::AF_INET as u8 {
+            (
+                1,
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    answer.address[0],
+                    answer.address[1],
+                    answer.address[2],
+                    answer.address[3],
+                )),
+            )
+        } else if answer.family == libc::AF_INET6 as u8 {
+            (28, std::net::IpAddr::V6(answer.address.into()))
         } else {
-            std::net::IpAddr::V4(event.addr_v4.into())
+            continue;
         };
-        (if event.is_ipv6 { 28 } else { 1 }, Some(addr.to_string()))
-    } else {
-        (1, None)
-    };
+        let address = address.to_string();
+        if !results.contains(&address) {
+            if results.is_empty() {
+                qtype = answer_qtype;
+            }
+            results.push(address);
+        }
+    }
+    let result = results.first().cloned();
 
     Event::DnsQuery(DnsQueryEvent {
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
         query,
         qtype,
         result,
+        results,
+        results_truncated: event.answers_truncated,
         status: if event.status == 0 {
             0
         } else {
@@ -224,6 +247,8 @@ pub fn dns_query(
 
 #[cfg(test)]
 mod tests {
+    use proptest::{prop_assert, prop_assert_eq};
+
     use super::*;
 
     fn wire_meta(comm: &[u8]) -> wire::EventMeta {
@@ -466,18 +491,147 @@ mod tests {
             query: query_buf,
             query_len: query.len() as u16,
             status: 0,
-            addr_resolved: false,
-            is_ipv6: false,
-            addr_v4: [0; 4],
-            addr_v6: [0; 16],
+            answer_count: 0,
+            answers_truncated: false,
+            answers: [wire::DnsAnswer {
+                family: 0,
+                address: [0; 16],
+            }; wire::MAX_DNS_ANSWERS],
+        }
+    }
+
+    fn fake_addrinfo_chain(entries: &[Option<std::net::IpAddr>]) -> wire::GetAddrInfoEvent {
+        let mut event = wire_dns(b"multi.example");
+        let inspected = entries.len().min(wire::MAX_DNS_ANSWERS);
+        event.answers_truncated = entries.len() > wire::MAX_DNS_ANSWERS;
+        for address in entries.iter().take(inspected).flatten() {
+            let answer = match address {
+                std::net::IpAddr::V4(ip) => wire::DnsAnswer {
+                    family: libc::AF_INET as u8,
+                    address: [
+                        ip.octets()[0],
+                        ip.octets()[1],
+                        ip.octets()[2],
+                        ip.octets()[3],
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                },
+                std::net::IpAddr::V6(ip) => wire::DnsAnswer {
+                    family: libc::AF_INET6 as u8,
+                    address: ip.octets(),
+                },
+            };
+            event.answers[usize::from(event.answer_count)] = answer;
+            event.answer_count += 1;
+        }
+        event
+    }
+
+    #[test]
+    fn dns_answer_walk_caps_fake_chains_at_max_dns_answers_entries() {
+        for (length, expected, truncated) in [
+            (1, 1, false),
+            (3, 3, false),
+            (wire::MAX_DNS_ANSWERS, wire::MAX_DNS_ANSWERS, false),
+            (wire::MAX_DNS_ANSWERS + 4, wire::MAX_DNS_ANSWERS, true),
+        ] {
+            let entries = (1..=length)
+                .map(|octet| {
+                    Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                        192,
+                        0,
+                        2,
+                        octet as u8,
+                    )))
+                })
+                .collect::<Vec<_>>();
+            let event = fake_addrinfo_chain(&entries);
+            let Event::DnsQuery(normalized) = dns_query(&event, 0, None) else {
+                panic!("wrong variant")
+            };
+            assert_eq!(normalized.results.len(), expected);
+            assert_eq!(normalized.results_truncated, truncated);
+            assert_eq!(normalized.result, normalized.results.first().cloned());
+        }
+    }
+
+    #[test]
+    fn dns_answers_skip_null_addresses_and_deduplicate_in_first_seen_order() {
+        let entries = [
+            Some("192.0.2.1".parse().unwrap()),
+            Some("192.0.2.1".parse().unwrap()),
+            None,
+            Some("2001:db8::1".parse().unwrap()),
+            Some("192.0.2.2".parse().unwrap()),
+            Some("2001:db8::1".parse().unwrap()),
+            Some("192.0.2.3".parse().unwrap()),
+            Some("2001:db8::2".parse().unwrap()),
+        ];
+        let event = fake_addrinfo_chain(&entries);
+        let Event::DnsQuery(normalized) = dns_query(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(
+            normalized.results,
+            [
+                "192.0.2.1",
+                "2001:db8::1",
+                "192.0.2.2",
+                "192.0.2.3",
+                "2001:db8::2"
+            ]
+        );
+        assert_eq!(normalized.result.as_deref(), Some("192.0.2.1"));
+        assert_eq!(normalized.qtype, 1);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn dns_normalization_keeps_answer_invariants(
+            answers in proptest::collection::vec((proptest::prelude::any::<u8>(), proptest::prelude::any::<[u8; 16]>()), 0..=wire::MAX_DNS_ANSWERS),
+            reported_count in proptest::prelude::any::<u8>(),
+            truncated in proptest::prelude::any::<bool>(),
+        ) {
+            let mut event = wire_dns(b"property.example");
+            event.answer_count = reported_count;
+            event.answers_truncated = truncated;
+            for (slot, (family, address)) in answers.into_iter().enumerate() {
+                event.answers[slot] = wire::DnsAnswer { family, address };
+            }
+
+            let Event::DnsQuery(normalized) = dns_query(&event, 0, None) else {
+                prop_assert!(false, "wrong event variant");
+                return Ok(());
+            };
+            prop_assert!(normalized.results.len() <= wire::MAX_DNS_ANSWERS);
+            prop_assert_eq!(normalized.results_truncated, truncated);
+            prop_assert_eq!(normalized.result, normalized.results.first().cloned());
+            let mut sorted = normalized.results.clone();
+            sorted.sort();
+            sorted.dedup();
+            prop_assert_eq!(sorted.len(), normalized.results.len());
         }
     }
 
     #[test]
     fn dns_query_resolved_ipv4_carries_the_address() {
         let mut event = wire_dns(b"example.com");
-        event.addr_resolved = true;
-        event.addr_v4 = [93, 184, 216, 34];
+        event.answer_count = 1;
+        event.answers[0] = wire::DnsAnswer {
+            family: libc::AF_INET as u8,
+            address: [93, 184, 216, 34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        };
 
         let Event::DnsQuery(e) = dns_query(&event, 0, None) else {
             panic!("wrong variant")
@@ -485,15 +639,18 @@ mod tests {
         assert_eq!(e.query, "example.com");
         assert_eq!(e.qtype, 1);
         assert_eq!(e.result.as_deref(), Some("93.184.216.34"));
+        assert_eq!(e.results, vec!["93.184.216.34"]);
         assert_eq!(e.status, 0);
     }
 
     #[test]
     fn dns_query_resolved_ipv6_sets_qtype_aaaa() {
         let mut event = wire_dns(b"example.com");
-        event.addr_resolved = true;
-        event.is_ipv6 = true;
-        event.addr_v6 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        event.answer_count = 1;
+        event.answers[0] = wire::DnsAnswer {
+            family: libc::AF_INET6 as u8,
+            address: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        };
 
         let Event::DnsQuery(e) = dns_query(&event, 0, None) else {
             panic!("wrong variant")

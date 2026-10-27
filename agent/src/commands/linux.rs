@@ -165,14 +165,17 @@ fn has_bpf_capabilities() -> bool {
 ///
 /// The third value reads what the eBPF sensor's parent-image cache has dropped, for the health
 /// beacon (#863); the audit fallback has no such cache.
-fn select_sensor() -> (
+fn select_sensor(
+    enable_dns_capture: bool,
+) -> (
     Box<dyn schema::sensor::Sensor>,
     &'static str,
     Option<crate::host_counters::EvictionReader>,
 ) {
     if can_use_ebpf() {
         tracing::info!("Using eBPF sensor (primary)");
-        let sensor = sensor_linux::LinuxSensor::new();
+        // `--enable-dns-capture` also turns on the socket-level query capture (#458 part 3).
+        let sensor = sensor_linux::LinuxSensor::new().with_dns_udp_capture(enable_dns_capture);
         let evictions = sensor.parent_image_evictions();
         return (
             Box::new(sensor),
@@ -280,7 +283,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
 
     // Select the primary sensor (eBPF or audit fallback) before creating heartbeats
     // so telemetry reports the correct sensor type.
-    let (mut sensor, sensor_name, evictions) = select_sensor();
+    let (mut sensor, sensor_name, evictions) = select_sensor(enable_dns_capture);
 
     // Automated response (#25): policy off by default (observe-only), opted into
     // per flag. Quarantine lands next to alerts.ndjson, the same "derived, no

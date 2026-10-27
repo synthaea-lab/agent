@@ -48,6 +48,26 @@ pub(crate) enum Category {
 /// The process whose children are counted together: its pid and generation stamp.
 pub(crate) type Lineage = (u32, Option<u64>);
 
+/// The lineage of a process, as recorded when it was exec'd, with the generation stamp of
+/// that incarnation of the pid.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExecLineage {
+    pub(crate) generation: Option<u64>,
+    pub(crate) lineage: Lineage,
+}
+
+impl ExecLineage {
+    /// The lineage recorded for the process `pid` of generation `generation`, unless the pid
+    /// was recorded for another incarnation.
+    pub(crate) fn current(recorded: Option<&Self>, generation: Option<u64>) -> Option<Lineage> {
+        let recorded = recorded?;
+        match (recorded.generation, generation) {
+            (Some(was), Some(is)) if was != is => None,
+            _ => Some(recorded.lineage),
+        }
+    }
+}
+
 /// A one-shot shell wrapper seen running, and the lineage its children belong to.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Wrapper {
@@ -110,7 +130,7 @@ impl ReconWindow {
 
 /// The program's lowercase basename without `.exe`: `C:\Windows\System32\NET.exe` → `net`.
 /// Falls back to `comm` when the sensor reports no image path.
-fn program(event: &ExecEvent) -> String {
+pub(crate) fn program(event: &ExecEvent) -> String {
     let path = if event.image_path.is_empty() {
         event.meta.comm.as_str()
     } else {
@@ -125,7 +145,7 @@ fn program(event: &ExecEvent) -> String {
 
 /// The arguments after the program, lowercase: `argv[1..]` where the platform gives one,
 /// the whitespace-split command line otherwise (Windows). Quotes are dropped.
-fn args(event: &ExecEvent) -> Vec<String> {
+pub(crate) fn args(event: &ExecEvent) -> Vec<String> {
     let lower = |s: &str| s.trim_matches('"').to_ascii_lowercase();
     if event.argv.is_empty() {
         event
@@ -251,4 +271,136 @@ pub(crate) fn discovery(event: &ExecEvent) -> Option<(&'static str, Category)> {
         _ => return None,
     };
     Some(found)
+}
+
+/// T1021.004 (#378): outbound SSH connections to this many distinct hosts from one lineage
+/// inside [`SSH_FANOUT_WINDOW_NS`].
+pub(crate) const SSH_FANOUT_THRESHOLD: u32 = 8;
+/// Sliding window of [`SSH_FANOUT_THRESHOLD`].
+pub(crate) const SSH_FANOUT_WINDOW_NS: u64 = 60_000_000_000; // 60s
+/// The SSH port.
+pub(crate) const SSH_PORT: u16 = 22;
+
+/// T1518.001 (#378): distinct security-software discovery commands from one lineage inside
+/// [`SECURITY_DISCOVERY_WINDOW_NS`].
+pub(crate) const SECURITY_DISCOVERY_THRESHOLD: u32 = 3;
+/// Sliding window of [`SECURITY_DISCOVERY_THRESHOLD`].
+pub(crate) const SECURITY_DISCOVERY_WINDOW_NS: u64 = 60_000_000_000; // 60s
+
+/// Programs that look a product up by name: process lists, service managers, package
+/// queries, file search, the registry.
+const LOOKUP_PROGRAMS: &[&str] = &[
+    "ps",
+    "pgrep",
+    "tasklist",
+    "grep",
+    "egrep",
+    "fgrep",
+    "findstr",
+    "systemctl",
+    "service",
+    "launchctl",
+    "ls",
+    "find",
+    "where",
+    "which",
+    "rpm",
+    "dpkg",
+    "pkgutil",
+    "reg",
+    "sc",
+    "wmic",
+    "get-process",
+    "get-service",
+];
+
+/// Names that identify a security product in a process, service, package or path, each
+/// with the label the alert shows. Lowercase substrings.
+const SECURITY_PRODUCTS: &[(&str, &str)] = &[
+    ("falcon-sensor", "lookup: crowdstrike"),
+    ("falcond", "lookup: crowdstrike"),
+    ("crowdstrike", "lookup: crowdstrike"),
+    ("csagent", "lookup: crowdstrike"),
+    ("sentinelone", "lookup: sentinelone"),
+    ("sentinelagent", "lookup: sentinelone"),
+    ("sentinelctl", "lookup: sentinelone"),
+    ("carbonblack", "lookup: carbon black"),
+    ("cbagentd", "lookup: carbon black"),
+    ("cbdefense", "lookup: carbon black"),
+    ("cylance", "lookup: cylance"),
+    ("sophos", "lookup: sophos"),
+    ("symantec", "lookup: symantec"),
+    ("sepagent", "lookup: symantec"),
+    ("mcafee", "lookup: mcafee/trellix"),
+    ("trellix", "lookup: mcafee/trellix"),
+    ("mfetp", "lookup: mcafee/trellix"),
+    ("windefend", "lookup: defender"),
+    ("wdnissvc", "lookup: defender"),
+    ("mssense", "lookup: defender"),
+    ("mdatp", "lookup: defender"),
+    ("ossec", "lookup: wazuh/ossec"),
+    ("wazuh", "lookup: wazuh/ossec"),
+    ("clamd", "lookup: clamav"),
+    ("clamav", "lookup: clamav"),
+    ("freshclam", "lookup: clamav"),
+    ("osqueryd", "lookup: osquery"),
+    ("auditd", "lookup: auditd"),
+    ("elastic-agent", "lookup: elastic"),
+    ("elastic-endpoint", "lookup: elastic"),
+    ("synthaea", "lookup: synthaea"),
+];
+
+/// The security-software discovery command this exec is, as the label that counts toward
+/// the set; `None` for anything else. Two kinds: commands that ask about the host's
+/// security posture (`SELinux`, `AppArmor`, audit rules, SIP, Defender, the firewall, loaded
+/// filter drivers), and a lookup of a named security product through a program that looks
+/// things up (`ps | grep falcon`, `systemctl status sentinelone`, `sc query windefend`).
+/// One lookup per product: two commands about the same product are one label.
+pub(crate) fn security_discovery(event: &ExecEvent) -> Option<&'static str> {
+    let program = program(event);
+    let args = args(event);
+    let joined = args.join(" ");
+    let first = args.first().map(String::as_str);
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+    let posture = match program.as_str() {
+        "getenforce" => Some("getenforce"),
+        "sestatus" => Some("sestatus"),
+        "aa-status" | "apparmor_status" => Some("aa-status"),
+        "auditctl" if has("-l") || has("-s") => Some("auditctl"),
+        "csrutil" if first == Some("status") => Some("csrutil"),
+        "spctl" if has("--status") => Some("spctl"),
+        "systemextensionsctl" if first == Some("list") => Some("systemextensionsctl"),
+        "mdatp" if first == Some("health") => Some("mdatp health"),
+        "fltmc" => Some("fltmc"),
+        "driverquery" => Some("driverquery"),
+        "netsh" if joined.contains("advfirewall show") || joined.contains("firewall show") => {
+            Some("netsh firewall")
+        }
+        "wmic" if joined.contains("securitycenter2") => Some("wmic SecurityCenter2"),
+        "powershell" | "pwsh" => {
+            let line = event.cmdline.to_ascii_lowercase();
+            if line.contains("get-mpcomputerstatus")
+                || line.contains("get-mppreference")
+                || line.contains("get-mpthreat")
+            {
+                Some("Get-Mp*")
+            } else if line.contains("securitycenter2") {
+                Some("SecurityCenter2 query")
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if posture.is_some() {
+        return posture;
+    }
+    if !LOOKUP_PROGRAMS.contains(&program.as_str()) {
+        return None;
+    }
+    let line = joined;
+    SECURITY_PRODUCTS
+        .iter()
+        .find(|(name, _)| line.contains(name))
+        .map(|(_, label)| *label)
 }

@@ -2,8 +2,11 @@
 //! characters (`openssl rand -hex 32 > release.key`).
 //!
 //! The tool never generates, stores or transports a key; where the production key
-//! lives and who may use it is ADR-0015's open question, not this tool's. It only
-//! refuses the obvious mistake of a key file other users can read.
+//! lives and who may use it is ADR-0015's open question, not this tool's. It refuses the
+//! obvious mistake of a key file other users can read, and, per ADR-0027, a key file that does
+//! not hold one of the public test keys: a key that can be read from a file is not a production
+//! key, so the file path signs the test set and nothing else (production signs from a PKCS#11
+//! token).
 
 use std::path::Path;
 
@@ -43,7 +46,42 @@ pub(crate) fn load(path: &Path) -> anyhow::Result<Ed25519KeyPair> {
     }
     let text =
         std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-    parse_seed(&text)
+    let key = parse_seed(&text)?;
+    ensure_test_key(&key, path)?;
+    Ok(key)
+}
+
+/// ADR-0027 decision 2: `--key-file` stays reserved to the public test keys. Anything else is a
+/// key that sat in a file, which is what custody exists to prevent, and a lab that wants a
+/// throwaway key of its own generates it on a `SoftHSM` token and signs with `--pkcs11`.
+#[cfg(feature = "test-key")]
+fn ensure_test_key(key: &Ed25519KeyPair, path: &Path) -> anyhow::Result<()> {
+    use ring::signature::KeyPair as _;
+    let public = key.public_key().as_ref();
+    let is_test_key = [
+        updater::key::test_key_pair(),
+        updater::key::test_recovery_key_pair(),
+        updater::key::test_snapshot_key_pair(),
+    ]
+    .iter()
+    .any(|test| test.public_key().as_ref() == public);
+    anyhow::ensure!(
+        is_test_key,
+        "{} does not hold one of the public test keys: --key-file is reserved to them \
+         (ADR-0027); sign from a PKCS#11 token with --pkcs11 (a SoftHSM token for a lab)",
+        path.display()
+    );
+    Ok(())
+}
+
+/// A build without the `test-key` feature has no test key to allow: no key file at all.
+#[cfg(not(feature = "test-key"))]
+fn ensure_test_key(_key: &Ed25519KeyPair, path: &Path) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "{}: this build has no test key, so --key-file is not accepted (ADR-0027); sign from a \
+         PKCS#11 token with --pkcs11",
+        path.display()
+    )
 }
 
 #[cfg(test)]
@@ -92,5 +130,29 @@ mod tests {
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(load(&path).is_ok());
+    }
+
+    #[cfg(all(unix, feature = "test-key"))]
+    #[test]
+    fn a_key_file_holds_a_public_test_key_or_it_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        let write = |seed: &str| {
+            std::fs::write(&path, seed).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        // The release/content, recovery and snapshot test seeds.
+        for byte in ["42", "43", "44"] {
+            write(&byte.repeat(32));
+            assert!(load(&path).is_ok(), "test seed {byte}");
+        }
+        // Any other seed is a key that sat in a file.
+        for byte in ["07", "41", "ff"] {
+            write(&byte.repeat(32));
+            let err = load(&path).unwrap_err().to_string();
+            assert!(err.contains("reserved to them"), "{err}");
+            assert!(err.contains("--pkcs11"), "{err}");
+        }
     }
 }

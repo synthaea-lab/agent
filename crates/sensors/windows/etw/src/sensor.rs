@@ -18,14 +18,16 @@ use schema::{
 };
 
 use crate::{
-    amsi, budget, etw_sessions,
+    amsi,
+    bits::BitsJobs,
+    budget, etw_sessions,
     long_path::{self, LongPathCache},
     normalize,
     pid_cache::PidCache,
     providers::{
-        ALL_PROVIDERS, amsi_provider, dns_provider, dotnet_provider, file_provider, ldap_provider,
-        network_provider, ntlm_provider, powershell_provider, process_provider, registry_provider,
-        smb_provider, wmi_provider,
+        ALL_PROVIDERS, amsi_provider, bits_provider, dns_provider, dotnet_provider, file_provider,
+        ldap_provider, network_provider, ntlm_provider, powershell_provider, process_provider,
+        registry_provider, smb_provider, wmi_provider,
     },
     winapi,
     zone_identifier::{self, MarkQueue, QuarantineDedup},
@@ -287,6 +289,9 @@ pub(crate) struct SharedState {
     /// #365/#439: `Zone.Identifier` writes, queued for the read-back worker
     /// (which owns the one-`FileQuarantine`-per-write dedup).
     pub(crate) marks: MarkQueue,
+    /// #284: BITS jobs in flight, between their file-added record and their
+    /// last one.
+    pub(crate) bits: Mutex<BitsJobs>,
     /// F-2: events observed — the silence watchdog reads this.
     pub(crate) events_seen: AtomicU64,
     /// AMSI volume gate (#282): dedup + per-process budget.
@@ -519,6 +524,7 @@ impl Sensor for WindowsSensor {
             long_paths: Mutex::new(LongPathCache::new(LONG_PATH_CACHE_CAP)),
             dedup: Mutex::new(normalize::ConnectDedup::new(60_000_000_000)),
             marks,
+            bits: Mutex::new(BitsJobs::default()),
             events_seen: AtomicU64::new(0),
             amsi: Mutex::new(amsi::AmsiGate::default()),
             ldap: Mutex::new(budget::PidBudget::new(
@@ -550,6 +556,7 @@ impl Sensor for WindowsSensor {
             .enable(dotnet_provider(sink.clone(), state.clone()))
             .enable(smb_provider(sink.clone(), state.clone()))
             .enable(amsi_provider(sink.clone(), state.clone()))
+            .enable(bits_provider(sink.clone(), state.clone()))
             .enable(ldap_provider(sink.clone(), state.clone()))
             .enable(ntlm_provider(sink, state.clone()));
         let trace = normalize::start_or_stop_session(

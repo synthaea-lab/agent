@@ -1,4 +1,12 @@
 //! Event-boundary redaction wrappers for the agent.
+//!
+//! `FileQuarantine`'s `origin_url`/`referrer_url`, a `BitsJob`'s `url` (#284), and an
+//! `HttpRequest`'s evidence value (#478, ADR-0022 §4) are redacted here before any
+//! consumer sees the event — see [`redact_event`]'s doc for exactly what each path
+//! covers. `Exec` command lines/argv (#705, ADR-0034) go through the same boundary,
+//! via the pure functions in `crates/redact`; [`RedactingSink::redact_exec`] controls
+//! whether a given sink sees them raw (live detection pipelines) or redacted
+//! (capture/output paths).
 
 // The shared sink wrapper is used by all platform run and capture commands.
 
@@ -65,6 +73,7 @@ pub(crate) fn redact_event(event: &mut Event) {
                 *url = redact_url_secrets(url);
             }
         }
+        Event::BitsJob(job) => job.url = redact_url_secrets(&job.url),
         Event::HttpRequest(request) => {
             if let Some(evidence) = &mut request.evidence
                 && is_secret_key(&evidence.param)
@@ -128,6 +137,36 @@ mod tests {
             Some("https://h/x.exe?token=REDACTED")
         );
         assert_eq!(q.referrer_url.as_deref(), Some("https://REDACTED@h/page"));
+    }
+
+    #[test]
+    fn the_sink_redacts_a_bits_job_url_and_keeps_the_rest_of_the_job() {
+        let job = schema::BitsJobEvent {
+            job_id: "{c40080ab-6fe4-418a-8ba6-c271c5298f18}".into(),
+            url: "https://u:p@cdn.example/f.exe?X-Amz-Signature=abc&v=2#frag".into(),
+            local_path: r"C:\Users\a\f.exe".into(),
+            ..schema::fixtures::bits_job()
+        };
+        let sink = RedactingSink {
+            inner: Recorder::default(),
+            redact_exec: true,
+        };
+        sink.on_event(Event::BitsJob(job.clone()));
+        let events = sink.inner.0.lock().unwrap();
+        let [Event::BitsJob(redacted)] = events.as_slice() else {
+            panic!("expected one BitsJob, got {events:?}");
+        };
+        assert_eq!(
+            redacted.url,
+            "https://REDACTED@cdn.example/f.exe?X-Amz-Signature=REDACTED&v=2#REDACTED"
+        );
+        assert_eq!(
+            *redacted,
+            schema::BitsJobEvent {
+                url: redacted.url.clone(),
+                ..job
+            }
+        );
     }
 
     #[test]

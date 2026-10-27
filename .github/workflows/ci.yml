@@ -71,6 +71,14 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
+          # Escalate just the two lints that catch a stale advisories.ignore entry
+          # (#919): one whose RUSTSEC id doesn't exist in the advisory db at all,
+          # and one that no longer matches anything in our dependency tree (e.g.
+          # yara-x finally raising its wasmtime requirement past the ignored
+          # advisories). Scoped narrowly on purpose — `-D warnings` would also
+          # fail on the `duplicate`/`license-exception-not-encountered` warnings
+          # this repo already runs with deliberately non-blocking.
+          command-arguments: -D unknown-advisory -D advisory-not-detected
 
   # Core rule: every workspace crate compiles and passes tests on all three platforms.
   # Platform-specific code lives only in crates/sensors/* behind cfg, so this job is

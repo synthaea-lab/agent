@@ -17,10 +17,10 @@ use crate::{
     check_service_unusual_outbound, check_systemd_service_persistence,
     exclusions::{
         AUTH_FAILURE_THRESHOLD, BEACON_THRESHOLD, BURST_WRITE_BYTES_THRESHOLD,
-        MEMFD_EXEC_WINDOW_NS, POLICY_DENIAL_ALERT_CAP, RANSOMWARE_RENAME_THRESHOLD,
-        RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
-        SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD, TOUCHED_FILES_PER_PID,
-        TOUCHED_FILES_PID_CAP,
+        MEMFD_EXEC_WINDOW_NS, POLICY_DENIAL_ALERT_CAP, POLICY_DENIAL_SUBJECT_CAP,
+        RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD,
+        SCAN_SPREAD_WINDOW_NS, SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD,
+        TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
     },
     state::COUNTER_CAP,
 };
@@ -308,6 +308,8 @@ fn policy_denial_event_full(
     }
 }
 
+mod bits;
+
 /// Like [`policy_denial_event_full`], with an explicit `action` (#813): the other
 /// helper's many callers don't care about it (it defaults to `None` via
 /// `schema::fixtures::policy_denial()`), so it stays a 5-argument helper and this one
@@ -404,13 +406,22 @@ fn captured_logs_sees_a_callsite_another_thread_registered_first() {
 mod ads;
 mod coverage;
 mod credfiles;
+mod egressdomain;
 mod linux;
+mod logon;
 mod motw_removal;
 mod persistence;
+mod policy_denial_windows;
 mod quarantine;
 mod rdp;
 mod recon;
+mod scan_vertical;
+mod security_discovery;
+mod securitytool;
+mod service_stop;
 mod session;
+mod ssh_fanout;
+mod staging;
 mod sudo;
 mod tamper;
 mod windows;

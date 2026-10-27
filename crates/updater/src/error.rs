@@ -93,6 +93,41 @@ pub enum UpdaterError {
     #[error("snapshot artifact does not match its manifest: {0}")]
     SnapshotArtifactMismatch(String),
 
+    /// A key-rotation manifest is not well formed (ADR-0027): it names no key, half a pair, a key
+    /// that is not canonical hex, a window that is empty or too long, or its result would break
+    /// the split between roles. Checked before its signature is trusted for anything.
+    #[error("key-rotation manifest is malformed: {0}")]
+    RotationMalformed(&'static str),
+
+    /// A key-rotation manifest retires a key that is not the one this install trusts for `role`:
+    /// a replay, or a manifest written for another key state.
+    #[error(
+        "key-rotation manifest does not apply: it retires a {role} key this install does not trust"
+    )]
+    RotationDoesNotApply { role: &'static str },
+
+    /// A key-rotation manifest is past its `expires_at`.
+    #[error("key-rotation manifest expired at {expires_at} (now {now})")]
+    RotationExpired { expires_at: u64, now: u64 },
+
+    /// A key-rotation manifest is dated beyond now plus the clock-skew tolerance.
+    #[error(
+        "key-rotation manifest issued at {issued_at} is dated beyond now ({now}) plus the tolerance"
+    )]
+    RotationNotYetValid { issued_at: u64, now: u64 },
+
+    /// The file that records the applied key rotations exists but cannot be trusted: it does not
+    /// parse, one of its rotations does not verify under the embedded `recovery` key, they are not
+    /// in increasing `release_version` order, or they do not lead from this build's embedded keys.
+    /// Refused rather than ignored: a file that exists proves a rotation happened, and falling
+    /// back to the embedded keys could re-trust a key that was rotated away from.
+    #[error("the key-rotation record is not trustworthy: {reason}")]
+    TrustStateCorrupt { reason: String },
+
+    /// The install already holds [`crate::trust_state::MAX_ROTATIONS`] rotations.
+    #[error("this install already holds the maximum of {0} recorded key rotations")]
+    TrustStateFull(usize),
+
     /// Filesystem I/O failed — the underlying [`std::io::Error`] carries the
     /// specifics (missing permissions, disk full, etc).
     #[error("I/O error on {path}: {source}")]

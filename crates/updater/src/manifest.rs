@@ -111,6 +111,17 @@ impl ReleaseManifest {
     /// the signature is malformed or does not verify;
     /// [`UpdaterError::SigningKeyUnprovisioned`] if this build embeds no `release` key.
     pub fn verify_signature(&self) -> Result<(), UpdaterError> {
+        self.verify_signature_with(RELEASE_PUBLIC_KEY.as_ref())
+    }
+
+    /// [`Self::verify_signature`] against `key`: the `release` key in force on this install, which
+    /// is the embedded one until a key rotation replaced it ([`crate::trust_state`]). `None` is a
+    /// build with no key to verify against.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::verify_signature`].
+    pub fn verify_signature_with(&self, key: Option<&[u8; 32]>) -> Result<(), UpdaterError> {
         if self.schema_version != MANIFEST_SCHEMA_VERSION {
             return Err(UpdaterError::SchemaVersionUnsupported {
                 found: self.schema_version,
@@ -121,10 +132,7 @@ impl ReleaseManifest {
         let msg = self.canonical_bytes();
         let public_key = UnparsedPublicKey::new(
             &signature::ED25519,
-            RELEASE_PUBLIC_KEY
-                .as_ref()
-                .ok_or(UpdaterError::SigningKeyUnprovisioned)?
-                .as_slice(),
+            key.ok_or(UpdaterError::SigningKeyUnprovisioned)?.as_slice(),
         );
         public_key
             .verify(&msg, &sig_bytes)

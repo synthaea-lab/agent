@@ -273,7 +273,14 @@ pub const fn syscall_nr_from_i32(syscall_nr: i32) -> Option<u32> {
 ///   own entry and copied to `parent_execd`, so userspace can tell a parent that never
 ///   exec'd from one that did and whose image the cache lost. Both layouts are unchanged
 ///   in size: `parent_execd` and `execd` take the place of explicit padding.
-pub const WIRE_VERSION: u32 = 24;
+/// - v25: `GetAddrInfoEvent` carries up to [`MAX_DNS_ANSWERS`] results from a
+///   bounded glibc `addrinfo.ai_next` walk and marks a result truncated when a
+///   ninth list entry exists.
+/// - v26: `DnsUdpQueryEvent` added (#458 part 3): the first 272 bytes of a DNS query sent to port
+///   53, from `sendto(2)` with an address and from `write(2)`/`sendto(2)` on a socket connected
+///   to port 53. The question is parsed in userspace and reported as `schema::DnsQueryEvent`
+///   (query and type only, no answer: the response is not captured). No existing struct changed.
+pub const WIRE_VERSION: u32 = 26;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
@@ -298,6 +305,26 @@ pub const MAX_MODULE_NAME_LEN: usize = 64;
 /// limit fits comfortably; matches `MAX_PATH_LEN`'s existing budget rather
 /// than inventing a new number.
 pub const MAX_DNS_QUERY_LEN: usize = 256;
+/// Maximum `addrinfo` list entries inspected by the DNS uretprobe. This constant
+/// bound keeps the verifier's loop analysis finite; a following entry is visible
+/// through `answers_truncated`.
+pub const MAX_DNS_ANSWERS: usize = 24;
+/// Bytes of an outgoing DNS datagram [`DnsUdpQueryEvent`] carries: the 12-byte header, a
+/// question name of up to 255 bytes and its 4-byte type and class (271), plus one byte of slack.
+/// A name is the signal the DNS-tunnelling rule reads (long, high-entropy labels), so the bound is
+/// the size of a whole question, not a short prefix. The copy is one bounded
+/// `bpf_probe_read_user_buf`, not a loop.
+pub const MAX_DNS_UDP_PAYLOAD: usize = 272;
+
+/// Handler ids in the `SYSCALL_DISPATCH` table that the UDP/53 capture reacts to. The router
+/// (`raw_sys_enter`) and the capture program (`raw_dns_udp_enter`) in the eBPF crate, and the
+/// table userspace fills from the host syscall ABI, all use these names, so renumbering a handler
+/// is a compile error and not a capture that silently stops.
+pub const DISPATCH_CONNECT: u32 = 3;
+/// See [`DISPATCH_CONNECT`].
+pub const DISPATCH_WRITE: u32 = 4;
+/// See [`DISPATCH_CONNECT`].
+pub const DISPATCH_SENDTO: u32 = 16;
 /// Budget for TLS plaintext capture (first N bytes). Chosen to fit comfortably
 /// in a ring-buffer event with metadata while staying under 512 bytes total.
 pub const MAX_TLS_CAPTURE: usize = 256;
@@ -908,10 +935,20 @@ pub struct MemfdCreateEvent {
     pub fd: i32,
 }
 
-/// DNS resolution via glibc's `getaddrinfo(3)` (issue #267 Phase 1): the
-/// DNS-based C2/tunneling/exfiltration visibility primitive. See this file's
-/// `WIRE_VERSION` v16 changelog for the uprobe/uretprobe correlation shape and
-/// the "first `addrinfo` entry only" tradeoff.
+/// One IP address returned in a glibc `addrinfo` list.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DnsAnswer {
+    /// `AF_INET` or `AF_INET6`; other families are not emitted.
+    pub family: u8,
+    /// Network-order address bytes; IPv4 uses only the first four bytes.
+    pub address: [u8; 16],
+}
+
+/// DNS resolution via glibc's `getaddrinfo(3)` (issue #267): the DNS-based
+/// C2/tunneling/exfiltration visibility primitive. See this file's
+/// `WIRE_VERSION` v16/v25 changelog entries for the uprobe/uretprobe correlation
+/// and bounded answer-list capture.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct GetAddrInfoEvent {
@@ -923,13 +960,43 @@ pub struct GetAddrInfoEvent {
     /// a name here, same "sensor reports, detection interprets" split as
     /// every other raw syscall/libc return value in this crate.
     pub status: i32,
-    /// `true` if `addr_v4`/`addr_v6`/`is_ipv6` were populated from the
-    /// first resolved `addrinfo` entry. `false` on failure (`status != 0`)
-    /// or an unrecognized `ai_family`.
-    pub addr_resolved: bool,
+    /// Number of valid IPv4/IPv6 answers in `answers` (at most
+    /// [`MAX_DNS_ANSWERS`]); entries with null addresses or unknown families are
+    /// skipped.
+    pub answer_count: u8,
+    /// True when `ai_next` was non-null after the [`MAX_DNS_ANSWERS`]th inspected
+    /// `addrinfo` **node**, not address: without `hints.ai_socktype`, glibc
+    /// returns one node per address per socktype (STREAM/DGRAM/RAW), so this can
+    /// be set well before `MAX_DNS_ANSWERS` distinct addresses have been seen
+    /// (review of #458, old-dov 2026-10-21: a null-hints `getaddrinfo("debian.org")`
+    /// measured 8 addresses as 24 nodes). Read it as "more resolver nodes existed
+    /// past this point", not "more addresses existed".
+    pub answers_truncated: bool,
+    /// The first [`MAX_DNS_ANSWERS`] valid IPv4/IPv6 answers in resolver order.
+    pub answers: [DnsAnswer; MAX_DNS_ANSWERS],
+}
+
+/// A DNS **query** on its way out over a socket to port 53 (issue #458 part 3): the first
+/// [`MAX_DNS_UDP_PAYLOAD`] bytes of the datagram, read at syscall entry from `sendto(2)` (an
+/// address given, `AF_INET`/`AF_INET6`, port 53) or from `write(2)`/`sendto(2)` with no address
+/// on a socket the process `connect(2)`ed to port 53 earlier (what Go's resolver and `send(2)`
+/// do). Nothing is parsed in the kernel: userspace reads the question out of `payload`.
+///
+/// Only emitted while the DNS capture program is attached (`--enable-dns-capture`). `payload_len` is the number of valid bytes, at most
+/// [`MAX_DNS_UDP_PAYLOAD`]; a datagram longer than that is cut, which only loses the tail of a
+/// message whose question already fits (a name is at most 255 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DnsUdpQueryEvent {
+    pub meta: EventMeta,
+    /// Destination of the datagram: the `sendto` address, or the address the socket was
+    /// connected to. Raw bytes in memory order, like [`ConnectEvent::daddr_v4`].
+    pub daddr_v4: [u8; 4],
+    pub daddr_v6: [u8; 16],
+    pub dport: u16,
+    pub payload_len: u16,
     pub is_ipv6: bool,
-    pub addr_v4: [u8; 4],
-    pub addr_v6: [u8; 16],
+    pub payload: [u8; MAX_DNS_UDP_PAYLOAD],
 }
 
 /// Decodes a fixed comm buffer: NUL-terminated, kernel-truncated to 15 bytes — a
