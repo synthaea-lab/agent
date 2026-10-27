@@ -413,6 +413,7 @@ mod motw_removal;
 mod persistence;
 mod policy_denial_windows;
 mod quarantine;
+mod ransomware_windows;
 mod rdp;
 mod recon;
 mod scan_vertical;
