@@ -75,6 +75,10 @@ fn exec_unix_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         }),
         "exec",
@@ -109,6 +113,10 @@ fn exec_process_generation_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         }),
         "exec_process_generation",
@@ -139,6 +147,10 @@ fn exec_ld_preload_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: vec![("LD_PRELOAD".into(), "/tmp/evil.so".into())],
         }),
         "exec_ld_preload",
@@ -169,6 +181,10 @@ fn exec_windows_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         }),
         "exec_windows",
@@ -203,6 +219,10 @@ fn exec_lineage_golden() {
             ),
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         }),
         "exec_lineage",
@@ -257,6 +277,10 @@ fn detection_ml_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         })],
     };
@@ -292,6 +316,10 @@ fn sample_exec_event() -> Event {
         parent_image_path: None,
         sha256: None,
         signature: None,
+        original_file_name: None,
+        company_name: None,
+        file_description: None,
+        product_name: None,
         env_security: Vec::new(),
     })
 }
@@ -987,9 +1015,47 @@ fn exec_enriched_golden() {
             parent_image_path: None,
             sha256: Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into()),
             signature: Some(schema::Signature::Unsigned),
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         }),
         "exec_enriched",
+    );
+}
+
+/// #983: a renamed Windows binary still carries its real name in the PE version
+/// resource. `cmd.exe` copied to `svchost.exe` evaluated against a Sigma rule on
+/// `OriginalFileName` is the whole point of this field.
+#[test]
+fn exec_windows_pe_info_golden() {
+    assert_golden(
+        &Event::Exec(ExecEvent {
+            meta: EventMeta {
+                pid: 7700,
+                ppid: 512,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_007_000_000_000,
+                comm: "svchost.exe".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            image_path: "C:\\Users\\Public\\svchost.exe".into(),
+            cmdline: "C:\\Users\\Public\\svchost.exe /c whoami".into(),
+            argv: Vec::new(),
+            parent_comm: None,
+            parent_image_path: None,
+            sha256: Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into()),
+            signature: Some(schema::Signature::Unsigned),
+            original_file_name: Some("Cmd.Exe".into()),
+            company_name: Some("Microsoft Corporation".into()),
+            file_description: Some("Windows Command Processor".into()),
+            product_name: Some("Microsoft® Windows® Operating System".into()),
+            env_security: Vec::new(),
+        }),
+        "exec_pe_info",
     );
 }
 
@@ -1020,6 +1086,10 @@ fn exec_container_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         }),
         "exec_container",
@@ -2196,6 +2266,10 @@ fn unbounded_cmdline_survives() {
         parent_image_path: None,
         sha256: None,
         signature: None,
+        original_file_name: None,
+        company_name: None,
+        file_description: None,
+        product_name: None,
         env_security: Vec::new(),
     });
     let back: Event = serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
@@ -2229,6 +2303,10 @@ fn ml_cmdline_is_the_canonical_nul_joined_form() {
         parent_image_path: None,
         sha256: None,
         signature: None,
+        original_file_name: None,
+        company_name: None,
+        file_description: None,
+        product_name: None,
         env_security: Vec::new(),
     };
 
@@ -2286,6 +2364,10 @@ fn meta_accessor_covers_all_variants() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         }),
         Event::FileOpen(FileOpenEvent {

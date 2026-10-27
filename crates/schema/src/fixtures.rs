@@ -73,6 +73,10 @@ pub fn exec() -> ExecEvent {
         parent_image_path: None,
         sha256: None,
         signature: None,
+        original_file_name: None,
+        company_name: None,
+        file_description: None,
+        product_name: None,
         env_security: Vec::new(),
     }
 }

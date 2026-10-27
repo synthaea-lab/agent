@@ -47,6 +47,10 @@ fn event_from_json(value: &Value) -> ExecEvent {
         parent_image_path,
         sha256: None,
         signature: None,
+        original_file_name: None,
+        company_name: None,
+        file_description: None,
+        product_name: None,
         env_security: vec![],
     }
 }

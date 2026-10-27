@@ -7,8 +7,19 @@ use crate::{
     rule::{Selection, SigmaRule, ValueList},
 };
 
-const SUPPORTED_FIELDS: &[&str] = &["image", "commandline", "parentimage"];
+const SUPPORTED_FIELDS: &[&str] = &["image", "commandline", "parentimage", "originalfilename"];
 const SUPPORTED_MODIFIERS: &[&str] = &["contains", "startswith", "endswith"];
+
+/// `OriginalFileName` is PE version-resource metadata (issue #983): a Windows/PE
+/// concept with no Mach-O or ELF equivalent. A `linux/` or `macos/` rule using it
+/// would never match on the platforms that load it — the exact silent-death
+/// failure mode this module exists to kill (its own module doc) — so it is
+/// refused at load time there, the same way `validate_metadata` already refuses
+/// a rule outside any known platform directory. A Windows-platform rule using it
+/// is accepted even though a *particular* event may still lack the value (PE
+/// parse failure, no version resource): that per-event gap is the same posture
+/// as `ParentImage`, not a load-time refusal (see `eval::Haystacks::get`'s doc).
+const WINDOWS_ONLY_FIELDS: &[&str] = &["originalfilename"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum SigmaError {
@@ -145,6 +156,15 @@ pub(crate) fn technique_id(tag: &str) -> Option<String> {
     }
 }
 
+/// Whether `path` sits under a `windows/` directory of `rules/sigma/`, the same
+/// string-containment check [`validate_metadata`] already uses for the platform
+/// directory itself — not a parse of [`crate::engine::Platform`], since this
+/// runs on a rule's source path at load time, before any engine has decided
+/// which host loads it.
+fn is_windows_rule(path: &str) -> bool {
+    path.replace('\\', "/").contains("/windows/")
+}
+
 fn missing_metadata(path: &str, what: String) -> SigmaError {
     SigmaError::MissingMetadata {
         path: path.to_string(),
@@ -205,10 +225,22 @@ fn validate_field_map(
     for (spec, values) in fields {
         let parsed = parse_field_spec(spec);
         let field = parsed.field;
-        if !SUPPORTED_FIELDS.contains(&field.to_lowercase().as_str()) {
+        let field_lower = field.to_lowercase();
+        if !SUPPORTED_FIELDS.contains(&field_lower.as_str()) {
             return Err(unsupported(
                 path,
-                format!("field `{field}` (supported: Image, CommandLine, ParentImage)"),
+                format!(
+                    "field `{field}` (supported: Image, CommandLine, ParentImage, OriginalFileName)"
+                ),
+            ));
+        }
+        if WINDOWS_ONLY_FIELDS.contains(&field_lower.as_str()) && !is_windows_rule(path) {
+            return Err(unsupported(
+                path,
+                format!(
+                    "field `{field}` is Windows-only (PE version-resource metadata, issue #983); \
+                     this rule is not under a `windows/` directory and would never match there"
+                ),
             ));
         }
         let mut match_modifier = None;

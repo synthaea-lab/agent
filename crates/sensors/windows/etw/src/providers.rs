@@ -198,6 +198,10 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             parent_image_path,
             sha256: None, // filled by the agent's enrichment stage
             signature: None,
+            original_file_name: None, // filled by the agent's enrichment stage (#983)
+            company_name: None,
+            file_description: None,
+            product_name: None,
         }));
     };
     Provider::by_guid(KERNEL_PROCESS_GUID)
