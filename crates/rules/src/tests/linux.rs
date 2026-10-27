@@ -1248,23 +1248,6 @@ fn permissive_mode_still_alerts_on_a_new_shape() {
 }
 
 #[test]
-fn only_selinux_denials_alert_for_now() {
-    // AppLocker/WDAC PolicyDenialEvents carry no subject/object context
-    // (always None), so this rule's shape would collapse to object_class
-    // alone — far too coarse (see known_policy_denials' doc) — gated off
-    // until a richer per-mechanism key exists.
-    let mut state = RuleState::new();
-    let applocker = state.on_policy_denial(&policy_denial_event_full(
-        "applocker",
-        None,
-        None,
-        Some("EXE"),
-        true,
-    ));
-    assert!(applocker.is_empty());
-}
-
-#[test]
 fn a_denial_missing_subject_or_object_context_still_alerts_once() {
     // tclass values like `capability`/`tcp_socket` or an AppLocker verdict with
     // no SELinux-style context carry None for subject/object — the rule must

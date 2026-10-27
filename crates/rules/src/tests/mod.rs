@@ -411,6 +411,7 @@ mod linux;
 mod logon;
 mod motw_removal;
 mod persistence;
+mod policy_denial_windows;
 mod quarantine;
 mod rdp;
 mod recon;

@@ -11,8 +11,9 @@ use schema::{
     AuthEvent, AuthKind, AuthOutcome, BitsJobEvent, BitsJobState, ConnectEvent, DnsQueryEvent,
     Event, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FileDeleteEvent, FileOpenEvent,
     FileQuarantineEvent, FileRenameEvent, FileWriteEvent, ListenPortEvent, MemfdCreateEvent,
-    NetworkFlowEvent, O_CREAT, POLICY_MECHANISM_SELINUX, PolicyDenialEvent, SessionEvent,
-    SessionState, User, detection::Severity,
+    NetworkFlowEvent, O_CREAT, POLICY_MECHANISM_APPLOCKER, POLICY_MECHANISM_SELINUX,
+    POLICY_MECHANISM_WDAC, PolicyDenialEvent, SessionEvent, SessionState, User,
+    detection::Severity,
 };
 use store::BoundedMap;
 
@@ -366,16 +367,15 @@ pub struct RuleState {
     /// the key ([`normalized_permissions`]: sorted, deduplicated), so only a different
     /// set is a new shape, not a different order.
     ///
-    /// `SELinux` only (`check_policy_denial_drift` gates on
-    /// [`POLICY_MECHANISM_SELINUX`]): `scontext`/`tcontext` give each denial a
-    /// rich, domain-specific triple. AppLocker/WDAC `PolicyDenialEvent`s carry
-    /// no subject/object context at all (`None`/`None`), so their "shape"
-    /// would collapse to `object_class` alone — 5 values for `AppLocker`
-    /// (`EXE`/`DLL`/`MSI`/`SCRIPT`/`APPX`), 2 for WDAC — meaning the *first*
-    /// blocked `.exe` ever seen would alert and every distinct one after it,
-    /// forever, would not. Needs a richer per-mechanism key (likely
-    /// `object_path`) before it's worth extending; tracked as a follow-up,
-    /// not done here.
+    /// The key is per mechanism (#796). `SELinux`: `scontext`/`tcontext` give each denial a
+    /// rich, domain-specific triple. AppLocker/WDAC `PolicyDenialEvent`s carry no object
+    /// context, and `AppLocker` no subject either, so keying them like `SELinux` would collapse
+    /// to `object_class` (5 collections for `AppLocker`, 2 signing scenarios for WDAC): the first
+    /// blocked `.exe` would alert and every other one after it would not. They key on the
+    /// file instead: `AppLocker` (collection, path), WDAC (loading process, path, scenario),
+    /// with paths and process lowercased because Windows paths are case-insensitive and
+    /// `AppLocker` reports one file as `C:\Users\x\EVIL.EXE` (`FullFilePath`) or
+    /// `C:\USERS\X\EVIL.EXE` (an expanded `FilePath`).
     known_policy_denials: BoundedMap<PolicyDenialKey, ()>,
     /// Subject type (`user:role:type`, `None` for a denial with no subject context) → the new-shape
     /// alerts `check_policy_denial_drift` has raised for it in its current budget window, against
@@ -1773,9 +1773,11 @@ impl RuleState {
     /// same fact a managed Enforcing host would act on) — the point is a new
     /// *shape* of denial, not whether this particular one was blocked.
     ///
-    /// `SELinux` only for now — see `known_policy_denials`'s doc for why an
-    /// AppLocker/WDAC `PolicyDenialEvent` would collapse to a far coarser
-    /// shape with this same key.
+    /// The key depends on the mechanism (#796), see `known_policy_denials`'s doc. A mechanism
+    /// other than `SELinux`, `AppLocker` or WDAC never alerts. Severity is Medium, except Low
+    /// for an `AppLocker` or WDAC denial in audit mode (`enforced: false`): a rollout in audit
+    /// mode logs every unlisted binary once, and that is routine. `SELinux` stays Medium
+    /// either way.
     ///
     /// Inert while the eBPF sensor is selected (#780): `SELinux` AVC denials
     /// only reach the agent through the audit sensor, so silence here does not
@@ -1799,16 +1801,33 @@ impl RuleState {
     /// The permission set in the key is normalised ([`normalized_permissions`]): `read
     /// write` and `write read` are one shape.
     fn check_policy_denial_drift(&mut self, event: &PolicyDenialEvent) -> Option<Alert> {
-        if event.mechanism != POLICY_MECHANISM_SELINUX {
-            return None;
-        }
-        let key: PolicyDenialKey = (
-            event.mechanism.clone(),
-            Self::selinux_type_triple(event.subject_context.as_deref()),
-            Self::selinux_type_triple(event.object_context.as_deref()),
-            event.object_class.clone(),
-            event.action.as_deref().map(normalized_permissions),
-        );
+        let key: PolicyDenialKey = match event.mechanism.as_str() {
+            POLICY_MECHANISM_SELINUX => (
+                event.mechanism.clone(),
+                Self::selinux_type_triple(event.subject_context.as_deref()),
+                Self::selinux_type_triple(event.object_context.as_deref()),
+                event.object_class.clone(),
+                event.action.as_deref().map(normalized_permissions),
+            ),
+            // AppLocker: (rule collection, file). The sensor leaves both contexts `None`, so
+            // the budget below is one shared by every AppLocker denial.
+            POLICY_MECHANISM_APPLOCKER => (
+                event.mechanism.clone(),
+                None,
+                event.object_path.as_deref().map(str::to_lowercase),
+                event.object_class.clone(),
+                None,
+            ),
+            // WDAC: (loading process, file, signing scenario), so the budget is per process.
+            POLICY_MECHANISM_WDAC => (
+                event.mechanism.clone(),
+                event.subject_context.as_deref().map(str::to_lowercase),
+                event.object_path.as_deref().map(str::to_lowercase),
+                event.object_class.clone(),
+                None,
+            ),
+            _ => return None,
+        };
         if self.known_policy_denials.get(&key).is_some() {
             return None;
         }
@@ -1844,7 +1863,13 @@ impl RuleState {
         self.report_policy_denial_evictions();
         Some(Alert {
             technique: "T1562",
-            severity: Severity::Medium,
+            // A Windows policy in audit mode logs every unlisted binary once during a rollout:
+            // routine, not an incident. SELinux keeps Medium either way (see the doc above).
+            severity: if event.mechanism != POLICY_MECHANISM_SELINUX && !event.enforced {
+                Severity::Low
+            } else {
+                Severity::Medium
+            },
             message: format!(
                 "comm={} mechanism={} subject={} object={} class={} action={} path={} enforced={} — new denial shape, not seen this run",
                 event.meta.comm,
