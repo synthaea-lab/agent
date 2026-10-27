@@ -28,6 +28,7 @@ verdict = { path = "../crates/verdict" }
 ml = { path = "../crates/ml", default-features = false }
 sigma = { path = "../crates/sigma" }
 enrich = { path = "../crates/enrich" }
+intel = { path = "../crates/intel" }
 yara = { path = "../crates/yara" }
 deception = { path = "../crates/deception" }
 sinks = { path = "../crates/sinks" }

@@ -30,6 +30,7 @@ dependencies = [
  "deception",
  "enrich",
  "getrandom 0.4.3",
+ "intel",
  "inventory 0.1.0",
  "ipc",
  "libc",

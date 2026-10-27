@@ -64,6 +64,10 @@ pub(crate) struct DetectionSink {
     /// `reload_content`, like the engines above, so a reader never sees a half-loaded
     /// filter; nothing reads it on the capture path yet (the lookup is the next slice).
     common_set: Arc<Mutex<Option<Arc<ml::features::common_set::CommonSetSnapshot>>>>,
+    /// On-device IOC matching (#60, ADR-0038) over `<content_root>/ioc/`: exec image hashes on the
+    /// enrichment worker, connect destinations on the capture thread. Shared with the worker,
+    /// which is the only place an exec's hash is known.
+    ioc: Arc<crate::ioc::IocMatcher>,
     /// What became of the rarity judgements, for the health beacon.
     rarity_stats: Arc<RarityStats>,
     /// Tamper-class alerts raised since the agent started (a sensor confirmed silent, a shipped
@@ -343,6 +347,37 @@ fn record_rule_alert(
     record_detection(verdict, alert_log, finding, event, Vec::new(), persist);
 }
 
+/// [`record_detection`] for one IOC match (#60). The worker records it for an exec image, the
+/// capture thread through [`DetectionSink::record_ioc`] for a connect.
+fn record_ioc_hit(
+    verdict: &Mutex<verdict::VerdictEngine>,
+    alert_log: &AlertLog,
+    event: &Event,
+    hit: crate::ioc::IocHit,
+    persist: Option<&dyn Fn(schema::detection::Detection)>,
+) {
+    let message = hit.message(&event.meta().comm);
+    let severity = hit.severity();
+    let finding = Finding {
+        entity: &entity_key(event.meta()),
+        technique: crate::ioc::IOC_TECHNIQUE,
+        message: &message,
+        source: ioc_source(hit),
+        severity,
+    };
+    record_detection(verdict, alert_log, finding, event, Vec::new(), persist);
+}
+
+fn ioc_source(hit: crate::ioc::IocHit) -> schema::detection::DetectionSource {
+    schema::detection::DetectionSource::Ioc {
+        kind: hit.kind,
+        indicator: hit.indicator,
+        feed: hit.feed,
+        feed_version: hit.feed_version,
+        reference: None,
+    }
+}
+
 /// The enrichment worker's append to the durable detection spool. A failure
 /// loses only the upload copy: the finding is already in the alert log.
 fn spool_on_worker(
@@ -419,7 +454,7 @@ const SERVICE_MAIN_REFUSAL: &str = "main process of a system service (image unde
 /// real ATT&CK ids and fold to an empty list, same as
 /// `tools/attack-coverage.py`'s own `BAYES_SENTINEL` skip.
 fn techniques_from(technique: &str) -> Vec<String> {
-    if technique == "BAYES" || technique == "Sigma" {
+    if technique == "BAYES" || technique == "Sigma" || technique == crate::ioc::IOC_TECHNIQUE {
         Vec::new()
     } else {
         technique.split('/').map(str::to_string).collect()
@@ -560,6 +595,8 @@ impl DetectionSink {
         let rarity_stats = Arc::new(RarityStats::default());
         let (rarity_correlator, rarity_common_set, worker_rarity_stats) =
             (correlator.clone(), common_set.clone(), rarity_stats.clone());
+        let ioc = Arc::new(crate::ioc::IocMatcher::new(&content_root));
+        let worker_ioc = ioc.clone();
         let (gate_verdict, gate_alert_log) = (verdict.clone(), alert_log.clone());
         let (gate_spool, worker_spool) = (detection_spool.clone(), detection_spool.clone());
         let enrich_queue = EnrichQueue::start_with_detections(
@@ -571,6 +608,14 @@ impl DetectionSink {
                     let persist = |detection| spool_on_worker(gate_spool.as_deref(), detection);
                     let persist = gate_spool.as_ref().map(|_| &persist as &dyn Fn(_));
                     record_rule_alert(&gate_verdict, &gate_alert_log, &event, &alert, persist);
+                }
+                if let Event::Exec(exec) = &event
+                    && let Some(hit) =
+                        worker_ioc.check_exec_image(exec.sha256.as_deref(), exec.meta.timestamp_ns)
+                {
+                    let persist = |detection| spool_on_worker(gate_spool.as_deref(), detection);
+                    let persist = gate_spool.as_ref().map(|_| &persist as &dyn Fn(_));
+                    record_ioc_hit(&gate_verdict, &gate_alert_log, &event, hit, persist);
                 }
                 if let Event::Exec(exec) = &event {
                     note_image_rarity(
@@ -601,6 +646,7 @@ impl DetectionSink {
             ml_scorer: Mutex::new(Self::load_correlation_scorer(model_root)),
             sigma: Mutex::new(load_sigma_rules(&content_root).into_option()),
             common_set,
+            ioc,
             rarity_stats,
             tamper_events: AtomicU64::new(0),
             yara: Mutex::new(
@@ -692,6 +738,7 @@ impl DetectionSink {
         drop(old_yara);
 
         self.swap_common_set(common_set_loaded);
+        self.ioc.reload(&self.content_root);
 
         // Same rules, same posture as the file scanner: absent unloads, broken keeps
         // the previous queue (its failure is already reported through `yara`).
@@ -1183,6 +1230,21 @@ impl DetectionSink {
         false
     }
 
+    /// An IOC match found on the capture thread (a connect's destination, #60).
+    fn record_ioc(&self, event: &Event, hit: crate::ioc::IocHit) {
+        let message = hit.message(&event.meta().comm);
+        let severity = hit.severity();
+        self.record_and_emit_with(
+            &entity_key(event.meta()),
+            crate::ioc::IOC_TECHNIQUE,
+            &message,
+            ioc_source(hit),
+            severity,
+            event,
+            Vec::new(),
+        );
+    }
+
     /// [`Self::record_and_emit`] for a batch of plain `rules::Alert`s (no Sigma/
     /// correlator-specific `DetectionSource` needed) — the common case for every
     /// `rule_state`/`rules::evaluate_*` call site.
@@ -1478,8 +1540,23 @@ impl DetectionSink {
     /// Connect events: stateless rules (unusual outbound from a web/DB
     /// service, issue #478), then beacon detection.
     fn detect_connect(&self, wrapped: &Event, event: &schema::ConnectEvent) {
+        if let Some(hit) = self.ioc.check_connect(event.daddr, event.meta.timestamp_ns) {
+            self.record_ioc(wrapped, hit);
+        }
         self.record_rule_alerts(wrapped, rules::evaluate_connect(event));
         self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_connect(event));
+    }
+
+    /// `DnsQuery` events: the egress-domain join (it never alerts) and, on a listed domain or
+    /// one of its subdomains, an IOC finding (#60).
+    fn detect_dns_query(&self, wrapped: &Event, event: &schema::DnsQueryEvent) {
+        if let Some(hit) = self
+            .ioc
+            .check_dns_query(&event.query, event.meta.timestamp_ns)
+        {
+            self.record_ioc(wrapped, hit);
+        }
+        self.rule_state.lock().unwrap().on_dns_query(event);
     }
 
     /// `NetworkFlow` events (conntrack polling, issue #92): same beacon detection as
@@ -2207,7 +2284,7 @@ impl EventSink for DetectionSink {
             Event::FileOpen(e) => self.detect_file_open(&event, e),
             Event::Connect(e) => self.detect_connect(&event, e),
             Event::NetworkFlow(e) => self.detect_network_flow(&event, e),
-            Event::DnsQuery(e) => self.rule_state.lock().unwrap().on_dns_query(e),
+            Event::DnsQuery(e) => self.detect_dns_query(&event, e),
             Event::ListenPort(e) => self.detect_listen_port(&event, e),
             Event::Auth(e) => self.detect_auth(&event, e),
             Event::Session(e) => self.detect_session(&event, e),
@@ -5502,6 +5579,231 @@ rule reload_content_test_marker {
         mark_then_run(&sink, &path);
         let alerts = alerts_in(&dir);
         assert!(alerts.contains("T1204.002"), "{alerts}");
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    const IOC_HASH: &str = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f";
+
+    fn write_ioc_feed(dir: &std::path::Path, text: &str) {
+        let feeds = dir.join("content").join("ioc");
+        std::fs::create_dir_all(&feeds).unwrap();
+        std::fs::write(feeds.join("test-feed.txt"), text).unwrap();
+        std::fs::write(feeds.join("VERSION"), "2026-10-26.1\n").unwrap();
+    }
+
+    fn connect_to(addr: &str, timestamp_ns: u64) -> Event {
+        Event::Connect(schema::ConnectEvent {
+            meta: EventMeta {
+                timestamp_ns,
+                ..schema::fixtures::meta()
+            },
+            daddr: addr.parse().unwrap(),
+            dport: 443,
+        })
+    }
+
+    #[test]
+    fn a_connect_to_a_listed_address_raises_one_ioc_finding_and_the_repeat_is_absorbed() {
+        let dir = tmp("ioc-connect");
+        write_ioc_feed(&dir, "ip:203.0.113.9\n");
+        let spool = Arc::new(Mutex::new(
+            store::EventSpool::open(&dir.join("detection-spool"), u64::MAX).unwrap(),
+        ));
+        let sink = DetectionSink::new(
+            rules::RuleState::new(),
+            &dir.join("alerts.ndjson"),
+            Some(&dir.join("events.jsonl")),
+            None,
+            Some(Arc::clone(&spool)),
+            &dir.join("content"),
+            &dir.join("ml-registry"),
+        )
+        .unwrap();
+
+        sink.on_event(connect_to("203.0.113.10", 1_000));
+        assert!(
+            !alerts_in(&dir).contains("IOC"),
+            "an unlisted address is silent"
+        );
+        sink.on_event(connect_to("203.0.113.9", 2_000));
+        sink.on_event(connect_to("203.0.113.9", 3_000));
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+
+        let alerts = alerts_in(&dir);
+        assert_eq!(alerts.matches("203.0.113.9").count(), 1, "{alerts}");
+        assert!(
+            alerts.contains("test-feed") && alerts.contains("2026-10-26.1"),
+            "{alerts}"
+        );
+        // The repeated connects may also move the correlator's belief; only IOC findings count.
+        let drained: Vec<transport::QueuedDetection> =
+            spool.lock().unwrap().drain_oldest().unwrap();
+        let records: Vec<_> = drained
+            .into_iter()
+            .filter(|r| {
+                matches!(
+                    r.detection.source,
+                    schema::detection::DetectionSource::Ioc { .. }
+                )
+            })
+            .collect();
+        assert_eq!(records.len(), 1);
+        let detection = &records[0].detection;
+        assert_eq!(detection.severity, schema::detection::Severity::Medium);
+        assert!(
+            detection.techniques.is_empty(),
+            "IOC is not an ATT&CK technique"
+        );
+        assert_eq!(
+            detection.source,
+            schema::detection::DetectionSource::Ioc {
+                kind: schema::detection::IocKind::Ip,
+                indicator: "203.0.113.9".into(),
+                feed: "test-feed".into(),
+                feed_version: "2026-10-26.1".into(),
+                reference: None,
+            }
+        );
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_exec_whose_image_hash_is_listed_raises_a_high_ioc_finding_from_the_worker() {
+        let dir = tmp("ioc-exec");
+        write_ioc_feed(&dir, &format!("sha256:{IOC_HASH}\n"));
+        let spool = Arc::new(Mutex::new(
+            store::EventSpool::open(&dir.join("detection-spool"), u64::MAX).unwrap(),
+        ));
+        let sink = DetectionSink::new(
+            rules::RuleState::new(),
+            &dir.join("alerts.ndjson"),
+            Some(&dir.join("events.jsonl")),
+            None,
+            Some(Arc::clone(&spool)),
+            &dir.join("content"),
+            &dir.join("ml-registry"),
+        )
+        .unwrap();
+        // The hash is set on the event, as enrichment leaves it: the worker looks it up.
+        let listed = Event::Exec(ExecEvent {
+            sha256: Some(IOC_HASH.to_uppercase()),
+            image_path: String::new(),
+            ..schema::fixtures::exec()
+        });
+        let other = Event::Exec(ExecEvent {
+            sha256: Some("0".repeat(64)),
+            image_path: String::new(),
+            ..schema::fixtures::exec()
+        });
+
+        sink.on_event(other);
+        sink.on_event(listed);
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains(IOC_HASH), "{alerts}");
+        let records: Vec<transport::QueuedDetection> =
+            spool.lock().unwrap().drain_oldest().unwrap();
+        let [record] = records.as_slice() else {
+            panic!("exactly one IOC detection expected, got {}", records.len());
+        };
+        assert_eq!(record.detection.severity, schema::detection::Severity::High);
+        assert!(matches!(
+            record.detection.source,
+            schema::detection::DetectionSource::Ioc {
+                kind: schema::detection::IocKind::Sha256,
+                ..
+            }
+        ));
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reload_content_picks_up_a_feed_added_after_construction_and_unloads_a_removed_one() {
+        let dir = tmp("ioc-reload");
+        let sink = sink_in(&dir);
+        sink.on_event(connect_to("203.0.113.9", 1_000));
+        assert!(!alerts_in(&dir).contains("IOC"));
+
+        write_ioc_feed(&dir, "ip:203.0.113.9\n");
+        sink.reload_content();
+        sink.on_event(connect_to("203.0.113.9", 2_000));
+        assert!(alerts_in(&dir).contains("203.0.113.9"));
+
+        std::fs::remove_dir_all(dir.join("content").join("ioc")).unwrap();
+        sink.reload_content();
+        let before = alerts_in(&dir).matches("203.0.113.9").count();
+        sink.on_event(connect_to("203.0.113.9", 2 * 60 * 60 * 1_000_000_000));
+        assert_eq!(alerts_in(&dir).matches("203.0.113.9").count(), before);
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn dns_query_of(name: &str, timestamp_ns: u64) -> Event {
+        Event::DnsQuery(schema::DnsQueryEvent {
+            meta: EventMeta {
+                timestamp_ns,
+                ..schema::fixtures::meta()
+            },
+            query: name.into(),
+            ..schema::fixtures::dns_query()
+        })
+    }
+
+    #[test]
+    fn a_dns_query_under_a_listed_domain_names_the_listed_domain_not_the_subdomain() {
+        let dir = tmp("ioc-dns");
+        write_ioc_feed(&dir, "domain:evil.example\n");
+        let spool = Arc::new(Mutex::new(
+            store::EventSpool::open(&dir.join("detection-spool"), u64::MAX).unwrap(),
+        ));
+        let sink = DetectionSink::new(
+            rules::RuleState::new(),
+            &dir.join("alerts.ndjson"),
+            Some(&dir.join("events.jsonl")),
+            None,
+            Some(Arc::clone(&spool)),
+            &dir.join("content"),
+            &dir.join("ml-registry"),
+        )
+        .unwrap();
+
+        sink.on_event(dns_query_of("good.example", 1_000));
+        sink.on_event(dns_query_of("notevil.example", 2_000));
+        sink.on_event(dns_query_of("Cdn.Evil.Example.", 3_000));
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+
+        let drained: Vec<transport::QueuedDetection> =
+            spool.lock().unwrap().drain_oldest().unwrap();
+        let records: Vec<_> = drained
+            .into_iter()
+            .filter(|r| {
+                matches!(
+                    r.detection.source,
+                    schema::detection::DetectionSource::Ioc { .. }
+                )
+            })
+            .collect();
+        let [record] = records.as_slice() else {
+            panic!("exactly one IOC detection expected, got {}", records.len());
+        };
+        assert_eq!(
+            record.detection.severity,
+            schema::detection::Severity::Medium
+        );
+        assert_eq!(
+            record.detection.source,
+            schema::detection::DetectionSource::Ioc {
+                kind: schema::detection::IocKind::Domain,
+                indicator: "evil.example".into(),
+                feed: "test-feed".into(),
+                feed_version: "2026-10-26.1".into(),
+                reference: None,
+            }
+        );
         drop(sink);
         std::fs::remove_dir_all(&dir).ok();
     }
