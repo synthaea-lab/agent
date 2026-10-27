@@ -91,3 +91,14 @@ pub(crate) fn address_key(address: u128) -> (u64, u64) {
     let hi = (address >> 64) as u64;
     (mix(lo ^ mix(hi)), mix(hi ^ 0x9e37_79b9_7f4a_7c15))
 }
+
+/// Filter key of a normalised domain name: FNV-1a, then the mixer. Only the filter sees it, and
+/// a collision there costs one search, never a match.
+pub(crate) fn domain_key(name: &str) -> (u64, u64) {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in name.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    (mix(hash), mix(hash ^ 0x9e37_79b9_7f4a_7c15))
+}

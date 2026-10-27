@@ -50,6 +50,12 @@ impl Intel {
         self.snapshot().lookup_sha256_hex(hex)
     }
 
+    /// Matches a DNS name against the current set: a listed domain or a name beneath it.
+    #[must_use]
+    pub fn lookup_domain(&self, name: &str) -> Option<Match> {
+        self.snapshot().lookup_domain(name)
+    }
+
     /// Matches an address against the current set.
     #[must_use]
     pub fn lookup_ip(&self, address: IpAddr) -> Option<Match> {
