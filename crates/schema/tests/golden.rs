@@ -23,7 +23,7 @@ use schema::{
     SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketCreateEvent,
     SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
     UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
-    detection::{Detection, DetectionSource, ScoreAttribution, Severity},
+    detection::{Detection, DetectionSource, IocKind, ScoreAttribution, Severity},
 };
 
 fn fixture(name: &str) -> serde_json::Value {
@@ -334,6 +334,55 @@ fn detection_sigma_golden() {
     };
     let serialized = serde_json::to_value(&detection).unwrap();
     assert_eq!(serialized, fixture("detection_sigma"), "fixture mismatch");
+    let back: Detection = serde_json::from_value(serialized).unwrap();
+    assert_eq!(back, detection, "round trip mismatch");
+}
+
+#[test]
+fn detection_ioc_golden() {
+    // v52 (#60): a SHA-256 indicator from a signed feed matched on exec.
+    let detection = Detection {
+        timestamp_ns: 1_756_900_006_000_000_000,
+        severity: Severity::High,
+        title: "Known-bad file hash".into(),
+        source: DetectionSource::Ioc {
+            kind: IocKind::Sha256,
+            indicator: "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f".into(),
+            feed: "abuse.ch-malwarebazaar".into(),
+            feed_version: "2026.10.26-1".into(),
+            reference: Some("https://bazaar.abuse.ch/sample/275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f/".into()),
+        },
+        score: None,
+        techniques: vec!["T1204.002".into()],
+        attributions: Vec::new(),
+        events: vec![sample_exec_event()],
+    };
+    let serialized = serde_json::to_value(&detection).unwrap();
+    assert_eq!(serialized, fixture("detection_ioc"), "fixture mismatch");
+    let back: Detection = serde_json::from_value(serialized).unwrap();
+    assert_eq!(back, detection, "round trip mismatch");
+}
+
+#[test]
+fn detection_ioc_without_reference_omits_the_field() {
+    let detection = Detection {
+        timestamp_ns: 1_756_900_007_000_000_000,
+        severity: Severity::High,
+        title: "Known-bad address".into(),
+        source: DetectionSource::Ioc {
+            kind: IocKind::Ip,
+            indicator: "203.0.113.7".into(),
+            feed: "internal-blocklist".into(),
+            feed_version: "7".into(),
+            reference: None,
+        },
+        score: None,
+        techniques: vec!["T1071".into()],
+        attributions: Vec::new(),
+        events: vec![sample_exec_event()],
+    };
+    let serialized = serde_json::to_value(&detection).unwrap();
+    assert_eq!(serialized, fixture("detection_ioc_ip"), "fixture mismatch");
     let back: Detection = serde_json::from_value(serialized).unwrap();
     assert_eq!(back, detection, "round trip mismatch");
 }

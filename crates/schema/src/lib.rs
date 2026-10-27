@@ -292,7 +292,13 @@ pub mod time;
 /// then 45, then 46, while #519, #654, #632, #263, #87, #364, #799 and #458
 /// merged first with 35, 40, 41, 42, 43, 44, 45 and 47; same coordination
 /// note as above.
-pub const SCHEMA_VERSION: u32 = 48;
+///
+/// Bumped 48 → 52 for [`detection::DetectionSource::Ioc`] (#60): an on-device
+/// indicator match (hash, IP or domain) carrying the indicator, its
+/// [`detection::IocKind`] and the feed provenance. #993, #994 and #995 were open
+/// at the time and each claim 49; 50 and 51 are left for the two that renumber.
+/// Whichever of these merges later renumbers, same coordination note as above.
+pub const SCHEMA_VERSION: u32 = 52;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
