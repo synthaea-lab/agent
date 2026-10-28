@@ -243,7 +243,7 @@ pub fn parse_sha256(hex: &str) -> Result<[u8; 32], ParseError> {
         _ => Err(ParseError::BadHashDigit),
     };
     let mut digest = [0u8; 32];
-    for (byte, pair) in digest.iter_mut().zip(hex.chunks_exact(2)) {
+    for (byte, pair) in digest.iter_mut().zip(hex.as_chunks::<2>().0.iter()) {
         *byte = (nibble(pair[0])? << 4) | nibble(pair[1])?;
     }
     Ok(digest)
