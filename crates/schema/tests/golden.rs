@@ -12,18 +12,18 @@ use schema::{
     AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BitsJobEvent,
     BitsJobState, BpfEvent, CapSetEvent, ConnectEvent, DefenderEvent, DefenderEventKind,
     DnsQueryEvent, Event, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent,
-    FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
-    FileWriteEvent, GatekeeperVerdictEvent, HttpClientCount, HttpEvidence, HttpRequestEvent,
-    HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent,
-    KerberosDelegationFailureEvent, KerberosDelegationFailureKind, KernelModuleAction,
-    KernelModuleEvent, LdapSearchEvent, ListenPortEvent, LogClearedEvent, MemfdCreateEvent,
-    MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, NtlmAuthEvent, NtlmDirection,
-    POLICY_MECHANISM_SELINUX, PackageChangeEvent, PackageChangeKind, PolicyDenialEvent, PrctlEvent,
-    ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent,
-    ScriptBlockEvent, SessionEvent, SessionState, ShellType, SignalEvent, SmbConnectEvent,
-    SocketAcceptEvent, SocketBindEvent, SocketCreateEvent, SocketListenEvent, TccDecisionEvent,
-    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, User,
-    WmiActivityEvent, XpcConnectEvent,
+    FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetTimeEvent,
+    FileSetxattrEvent, FileWriteEvent, GatekeeperVerdictEvent, HttpClientCount, HttpEvidence,
+    HttpRequestEvent, HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind,
+    ImageLoadEvent, KerberosDelegationFailureEvent, KerberosDelegationFailureKind,
+    KernelModuleAction, KernelModuleEvent, LdapSearchEvent, ListenPortEvent, LogClearedEvent,
+    MemfdCreateEvent, MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent,
+    NtlmAuthEvent, NtlmDirection, POLICY_MECHANISM_SELINUX, PackageChangeEvent, PackageChangeKind,
+    PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
+    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent, SessionState, ShellType,
+    SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketCreateEvent,
+    SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
+    UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
     detection::{Detection, DetectionSource, IocKind, ScoreAttribution, Severity},
 };
 
@@ -1385,6 +1385,30 @@ fn file_rename_golden() {
 }
 
 #[test]
+fn file_set_time_golden() {
+    assert_golden(
+        &Event::FileSetTime(FileSetTimeEvent {
+            meta: EventMeta {
+                pid: 7004,
+                ppid: 0,
+                user: User::Unknown,
+                timestamp_ns: 1_760_000_000_000_000_000,
+                comm: String::new(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            path: r"C:\Users\alice\invoice.docx".into(),
+            creation_time: None,
+            last_access_time: None,
+            last_write_time: Some(132_537_600_000_000_000),
+            change_time: None,
+        }),
+        "file_set_time",
+    );
+}
+
+#[test]
 fn socket_bind_golden() {
     // v16 (#263): discrete real-time bind(2) trace — distinct from ListenPort's
     // periodic-poll semantics, see SocketBindEvent's doc.
@@ -2581,6 +2605,14 @@ fn meta_accessor_covers_all_variants() {
             old_path: String::new(),
             new_path: String::new(),
             executable_path: None,
+        }),
+        Event::FileSetTime(FileSetTimeEvent {
+            meta: meta.clone(),
+            path: String::new(),
+            creation_time: None,
+            last_access_time: None,
+            last_write_time: None,
+            change_time: None,
         }),
         Event::SocketBind(SocketBindEvent {
             meta: meta.clone(),

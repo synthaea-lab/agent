@@ -222,6 +222,7 @@ fn needs_refresh(message: &wire::Message) -> bool {
         wire::Body::Rename {
             old_path, new_path, ..
         } => unmapped(old_path) || unmapped(new_path),
+        wire::Body::SetTime { path, .. } => unmapped(path),
         wire::Body::Heartbeat => false,
     }
 }

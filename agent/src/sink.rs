@@ -2319,7 +2319,11 @@ impl EventSink for DetectionSink {
         // clocks: letting them expire the hold would end it before the exec had a chance to come.
         if matches!(
             event,
-            Event::Exec(_) | Event::FileOpen(_) | Event::FileDelete(_) | Event::FileRename(_)
+            Event::Exec(_)
+                | Event::FileOpen(_)
+                | Event::FileDelete(_)
+                | Event::FileRename(_)
+                | Event::FileSetTime(_)
         ) {
             self.expire_held_canary(event.meta().timestamp_ns);
         }
@@ -2338,6 +2342,9 @@ impl EventSink for DetectionSink {
             Event::FileQuarantine(e) => self.detect_file_quarantine(e),
             Event::BitsJob(e) => self.detect_bits_job(e),
             Event::FileRename(e) => self.detect_file_rename(&event, e),
+            Event::FileSetTime(e) => {
+                self.record_rule_alerts(&event, rules::evaluate_file_set_time(e));
+            }
             Event::FileWrite(e) => self.detect_file_write(e),
             Event::MemfdCreate(e) => self.detect_memfd_create(e),
             Event::AmsiContent(e) => self.detect_amsi_content(&event, e),
@@ -2583,6 +2590,33 @@ mod tests {
 
     fn alerts_in(dir: &std::path::Path) -> String {
         std::fs::read_to_string(dir.join("alerts.ndjson")).unwrap_or_default()
+    }
+
+    #[test]
+    fn ordinary_file_write_does_not_enter_the_timestomp_rule_route() {
+        let dir = tmp("file-write-not-timestomp");
+        let sink = sink_in(&dir);
+        sink.on_event(Event::FileWrite(schema::FileWriteEvent {
+            meta: schema::fixtures::meta(),
+            fd: 12,
+            bytes_requested: 4096,
+        }));
+        assert!(!alerts_in(&dir).contains("T1070.006"));
+    }
+
+    #[test]
+    fn set_time_event_reaches_the_timestomp_rule_through_the_real_sink() {
+        let dir = tmp("file-set-time-route");
+        let sink = sink_in(&dir);
+        sink.on_event(Event::FileSetTime(schema::FileSetTimeEvent {
+            meta: schema::fixtures::meta(),
+            path: r"C:\Users\u\invoice.docx".into(),
+            last_write_time: Some(132_537_600_000_000_000),
+            ..schema::fixtures::file_set_time()
+        }));
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("T1070.006"), "{alerts}");
+        assert!(alerts.contains("invoice.docx"), "{alerts}");
     }
 
     #[test]

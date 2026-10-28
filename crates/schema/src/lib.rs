@@ -313,7 +313,12 @@ pub mod time;
 /// Windows-only. Originally claimed 49; renumbered past #60's 52 and #983's 53.
 /// #995 (`ListenPortEvent::protocol`) holds 54 and merges first, so this takes the
 /// slot after it; same coordination note as above.
-pub const SCHEMA_VERSION: u32 = 55;
+///
+/// Bumped 55 → 56 for Windows minifilter explicit timestamp requests (#136). #995
+/// (`ListenPortEvent::protocol`, 54) is still open and merges first, so this takes
+/// the slot after it and after #994 (55, landed above). #1007 (raw-volume access,
+/// stacked on this branch) renumbers again on top of this when it next merges main.
+pub const SCHEMA_VERSION: u32 = 56;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -832,6 +837,29 @@ pub struct FileRenameEvent {
     /// of trusting `comm` alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_path: Option<String>,
+}
+
+/// Explicit `FileBasicInformation` timestamp request observed by the Windows minifilter.
+/// Values are raw signed 100-ns Windows FILETIME units requested by the caller; `None` means
+/// that field was unchanged. Windows' own -1 (don't change) and -2 (don't change, don't update
+/// on next write either) sentinels still survive as `Some(-1)`/`Some(-2)`, not `None` — the
+/// field being set at all is what `None` tracks, distinct from the caller asking it stay as-is;
+/// `rules::evaluate_file_set_time` is what filters those two sentinel values out of the ones
+/// that count as a real requested time. This reports a successful request, not proof of
+/// malicious intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSetTimeEvent {
+    pub meta: EventMeta,
+    /// Normalized path captured by the minifilter before the operation.
+    pub path: String,
+    /// Requested creation time in raw signed 100-ns FILETIME units; `None` means unchanged.
+    pub creation_time: Option<i64>,
+    /// Requested last-access time in raw signed 100-ns FILETIME units; `None` means unchanged.
+    pub last_access_time: Option<i64>,
+    /// Requested last-write time in raw signed 100-ns FILETIME units; `None` means unchanged.
+    pub last_write_time: Option<i64>,
+    /// Requested change time in raw signed 100-ns FILETIME units; `None` means unchanged.
+    pub change_time: Option<i64>,
 }
 
 /// File permission change (issue #262 Phase 2): `chmod(2)`/`fchmodat(2)`. `fchmod(2)`
@@ -2499,6 +2527,7 @@ pub enum Event {
     FileWrite(FileWriteEvent),
     FileDelete(FileDeleteEvent),
     FileRename(FileRenameEvent),
+    FileSetTime(FileSetTimeEvent),
     SocketBind(SocketBindEvent),
     FileChmod(FileChmodEvent),
     FileChown(FileChownEvent),
@@ -2566,6 +2595,7 @@ impl Event {
             Event::FileWrite(e) => &e.meta,
             Event::FileDelete(e) => &e.meta,
             Event::FileRename(e) => &e.meta,
+            Event::FileSetTime(e) => &e.meta,
             Event::SocketBind(e) => &e.meta,
             Event::FileChmod(e) => &e.meta,
             Event::FileChown(e) => &e.meta,

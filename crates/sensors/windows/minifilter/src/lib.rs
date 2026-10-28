@@ -16,10 +16,7 @@
 //! `driver/` and depends only on `schema` among the workspace crates
 //! (ADR-0012 guardrail 8, `tools/check-deps.py`).
 //!
-//! Merge the v3 driver change (#857) before this receive loop (#853). The older v1 driver's
-//! port refuses this client's v3 connection context, so file telemetry is unavailable until
-//! the v3 driver is deployed. If #853 merges first, rebase #857 onto that main and verify
-//! both sides still use v3 and the 72-byte header.
+//! Protocol v4 adds explicit file timestamp requests to the v3 delete/rename event channel.
 
 /// Name of the driver's communication port.
 pub const PORT_NAME: &str = r"\SynthaeaPort";
@@ -28,7 +25,7 @@ pub const PORT_NAME: &str = r"\SynthaeaPort";
 pub const CONNECT_MAGIC: u32 = 0x544E_5953;
 
 /// Second field of the connection context. The driver refuses any other value.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The service SID the driver requires in the connecting process's token:
 /// `NT SERVICE\SynthaEDR`, the watchdog service that spawns the agent
@@ -103,11 +100,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_connection_context_spells_synt_then_version_three() {
-        // Version 3 is the event channel with its fourth counter (the 72-byte header). A driver
+    fn the_connection_context_spells_synt_then_version_four() {
+        // Version 4 appends requested timestamp fields (the 104-byte header). A driver
         // at any other version refuses this client with `Refused`, and the reverse, so neither
         // side reads a format it does not know.
-        assert_eq!(connect_context(), *b"SYNT\x03\x00\x00\x00");
+        assert_eq!(connect_context(), *b"SYNT\x04\x00\x00\x00");
     }
 
     #[test]

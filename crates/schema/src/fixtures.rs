@@ -31,9 +31,9 @@ use crate::{
     AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BitsJobEvent,
     BitsJobState, BpfEvent, CapSetEvent, ConnectEvent, DefenderEvent, DefenderEventKind,
     DnsQueryEvent, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent,
-    FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
-    FileWriteEvent, HttpRequestEvent, HttpSignature, HttpSummaryEvent, IdentityChangeEvent,
-    IdentityChangeKind, ImageLoadEvent, KerberosDelegationFailureEvent,
+    FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetTimeEvent,
+    FileSetxattrEvent, FileWriteEvent, HttpRequestEvent, HttpSignature, HttpSummaryEvent,
+    IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent, KerberosDelegationFailureEvent,
     KerberosDelegationFailureKind, KernelModuleAction, KernelModuleEvent, LdapSearchEvent,
     ListenPortEvent, LogClearedEvent, MemfdCreateEvent, NamespaceEvent, NamespaceSyscall,
     NetworkFlowEvent, NtlmAuthEvent, NtlmDirection, PackageChangeEvent, PackageChangeKind,
@@ -419,6 +419,19 @@ pub fn file_rename() -> FileRenameEvent {
         old_path: String::new(),
         new_path: String::new(),
         executable_path: None,
+    }
+}
+
+/// Neutral [`FileSetTimeEvent`].
+#[must_use]
+pub fn file_set_time() -> FileSetTimeEvent {
+    FileSetTimeEvent {
+        meta: meta(),
+        path: String::new(),
+        creation_time: None,
+        last_access_time: None,
+        last_write_time: None,
+        change_time: None,
     }
 }
 
