@@ -314,13 +314,16 @@ pub mod time;
 /// #994 merged first, ahead of the 54 it had reserved for #995, so main went
 /// straight from 53 to 55 and left 54 unused.
 ///
-/// Bumped 55 → 58 for [`ListenPortEvent::protocol`] (#676 part 1, carried here from the
-/// shared ancestor this branch and #995 both started from): #1006 (timestomp, 56) and
-/// #995 (57, itself renumbered past the 54 that #994 skipped) are both open and closer
-/// to merging, so this takes the next free slot after both instead of colliding with
-/// either. Whichever of #995/#1008 merges second still needs to drop this duplicate
-/// `ListenPortEvent::protocol` definition in favor of the other's, same as any
-/// stacked-PR content overlap.
+/// Bumped 55 → 57 for [`ListenPortEvent::protocol`] (#676 part 1, #995): the 54
+/// reserved above was skipped when #994 merged first, so #995 takes the next free
+/// number instead of the skipped one. #1006 (timestomp) claimed 56 first (approved
+/// 2026-10-28) and is closer to merging, so #995 takes the slot after it instead
+/// of colliding.
+///
+/// Bumped 57 → 58 for the Windows UDP collector (#676 part 2, this PR): stacked
+/// directly on #995's branch, so this just takes the next slot above it. No new
+/// field here — #995 already defined `ListenPortEvent::protocol`; this PR only
+/// populates it with the real value (6 or 17) instead of #995's TCP-only `6`.
 pub const SCHEMA_VERSION: u32 = 58;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
