@@ -837,7 +837,12 @@ pub struct FileRenameEvent {
 
 /// Explicit `FileBasicInformation` timestamp request observed by the Windows minifilter.
 /// Values are raw signed 100-ns Windows FILETIME units requested by the caller; `None` means
-/// that field was unchanged. This reports a successful request, not proof of malicious intent.
+/// that field was unchanged. Windows' own -1 (don't change) and -2 (don't change, don't update
+/// on next write either) sentinels still survive as `Some(-1)`/`Some(-2)`, not `None` — the
+/// field being set at all is what `None` tracks, distinct from the caller asking it stay as-is;
+/// `rules::evaluate_file_set_time` is what filters those two sentinel values out of the ones
+/// that count as a real requested time. This reports a successful request, not proof of
+/// malicious intent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileSetTimeEvent {
     pub meta: EventMeta,

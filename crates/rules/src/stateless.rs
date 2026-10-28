@@ -593,8 +593,19 @@ pub(crate) fn check_alternate_data_stream_write(event: &FileOpenEvent) -> Option
 }
 
 /// T1070.006 — Indicator Removal: Timestomp. The minifilter reports a successful explicit
-/// `FileBasicInformation` request; `comm` is intentionally not used because that sensor has no
-/// trustworthy process image. Windows -1/-2 values request automatic updates, not chosen times.
+/// `FileBasicInformation` request; `comm` is intentionally not used (and not printed) because
+/// that sensor has no trustworthy process image. Windows -1/-2 values request automatic
+/// updates, not chosen times.
+///
+/// Low, not Medium (`SherlockOmss`'s/`SoFrexs`'s #1006 review): this is unmeasured, and several
+/// ordinary tools explicitly set destination timestamps on every file they touch —
+/// `CopyFileEx` (Explorer, `copy`, `Copy-Item`), robocopy's default `/COPY:DAT`, 7-Zip/tar/
+/// Explorer zip extraction, OneDrive/Dropbox sync. Each minifilter event also carries `ppid 0`
+/// and an empty `comm`, folding every one of these into a single verdict entity with no way to
+/// tell a benign bulk copy from a targeted stomp. Escalating back to Medium needs either a live
+/// volume measurement (a copy/extraction of a few thousand files) or a per-pid/parent-directory
+/// aggregation the driver's wire format does not yet carry — tracked as a follow-up, not solved
+/// here by guessing a threshold.
 #[must_use]
 pub fn evaluate_file_set_time(event: &FileSetTimeEvent) -> Vec<Alert> {
     let requested = [
@@ -612,10 +623,10 @@ pub fn evaluate_file_set_time(event: &FileSetTimeEvent) -> Vec<Alert> {
     }
     vec![Alert {
         technique: "T1070.006",
-        severity: Severity::Medium,
+        severity: Severity::Low,
         message: format!(
-            "pid={} comm={}: explicit timestamp change requested for {}",
-            event.meta.pid, event.meta.comm, event.path,
+            "pid={}: explicit timestamp change requested for {}",
+            event.meta.pid, event.path,
         ),
     }]
 }
