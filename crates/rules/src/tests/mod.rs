@@ -287,6 +287,7 @@ fn listen_port_event_full(
         meta,
         local_addr: std::net::IpAddr::V4(local_addr_v4.into()),
         local_port,
+        protocol: 6, // IPPROTO_TCP
     }
 }
 

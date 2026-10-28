@@ -141,7 +141,7 @@ pub use proc_events::ProcEvent;
 pub use proc_socket::ProcEventSubscription;
 #[cfg(target_os = "linux")]
 pub use socket::NetlinkError;
-pub use wire::{DiagMsg, TCP_ESTABLISHED, TCP_LISTEN};
+pub use wire::{DiagMsg, IPPROTO_TCP, TCP_ESTABLISHED, TCP_LISTEN};
 
 /// A TCP socket's state, as reported by `sock_diag`. This crate only ever
 /// requests [`TCP_ESTABLISHED`]/[`TCP_LISTEN`] (see the crate doc), so `Other` is

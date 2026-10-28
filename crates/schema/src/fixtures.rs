@@ -337,6 +337,7 @@ pub fn listen_port() -> ListenPortEvent {
         meta: meta(),
         local_addr: TEST_ADDR,
         local_port: 0,
+        protocol: 6, // IPPROTO_TCP
     }
 }
 

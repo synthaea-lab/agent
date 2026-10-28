@@ -54,7 +54,7 @@ fn seeded_rule_state() -> rules::RuleState {
             entries
                 .iter()
                 .filter(|e| e.state == sensor_macos_sockets::SocketState::Listen)
-                .map(|e| (e.local.ip(), e.local.port())),
+                .map(|e| (e.local.ip(), e.local.port(), 6)), // IPPROTO_TCP — libproc TCP snapshot only, today (issue #676)
         ),
         Err(e) => tracing::warn!(error = %e, "socket snapshot for listener baseline failed"),
     }

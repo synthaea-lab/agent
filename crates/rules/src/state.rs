@@ -341,14 +341,18 @@ pub struct RuleState {
     /// (pid, dport) → sliding distinct-destination counter for SCAN-SPREAD
     /// (T1046/T1210, issue #465). LRU-bounded.
     scan_spread: BoundedMap<(u32, u16), SlidingDistinct<IpAddr>>,
-    /// (`local_addr`, `local_port`) → seen, for LISTENER-DRIFT (issue #92, T1571).
-    /// [`Self::seed_listen_ports`] pre-fills this from one startup snapshot so
-    /// every service already listening when the agent attaches is the baseline,
-    /// not noise — the same "seed from the world as it already is" principle as
-    /// [`Self::seed_from_proc`]/`seed_pid_comm`. LRU-bounded: the realistic
-    /// listener space is a few dozen, not unbounded, but a hostile loop binding
-    /// many ports must not grow this without limit either.
-    known_listeners: BoundedMap<(IpAddr, u16), ()>,
+    /// (`local_addr`, `local_port`, `protocol`) → seen, for LISTENER-DRIFT (issue
+    /// #92, T1571). `protocol` is the IP protocol number, same convention as
+    /// [`schema::ListenPortEvent::protocol`] — a UDP listener and a TCP listener
+    /// on the same port are different shapes, not a collision (issue #676): without
+    /// it, a new UDP listener on a port already baselined as TCP (or vice versa)
+    /// would be silently treated as already seen. [`Self::seed_listen_ports`]
+    /// pre-fills this from one startup snapshot so every service already listening
+    /// when the agent attaches is the baseline, not noise — the same "seed from the
+    /// world as it already is" principle as [`Self::seed_from_proc`]/`seed_pid_comm`.
+    /// LRU-bounded: the realistic listener space is a few dozen, not unbounded, but
+    /// a hostile loop binding many ports must not grow this without limit either.
+    known_listeners: BoundedMap<(IpAddr, u16, u8), ()>,
     /// (mechanism, subject context, object context, object class) → seen, for
     /// POLICY-DENIAL-DRIFT (issue #774, T1562-adjacent). Same "first new shape
     /// wins, the routine repeat doesn't" principle as `known_listeners` above:
@@ -621,7 +625,7 @@ impl RuleState {
     /// attaches (sshd, nginx started by systemd at boot) would look exactly like
     /// a freshly planted backdoor listener on the very first poll after startup.
     /// Same principle, same caller responsibility, as [`Self::seed_from_proc`].
-    pub fn seed_listen_ports(&mut self, ports: impl IntoIterator<Item = (IpAddr, u16)>) {
+    pub fn seed_listen_ports(&mut self, ports: impl IntoIterator<Item = (IpAddr, u16, u8)>) {
         for key in ports {
             self.known_listeners.insert(key, ());
         }
@@ -1745,7 +1749,7 @@ impl RuleState {
     /// against (a dev server or `docker-proxy` binding a fresh port after
     /// startup will alert; a documented, known noise source, not a bug).
     fn check_listen_port_drift(&mut self, event: &ListenPortEvent) -> Option<Alert> {
-        let key = (event.local_addr, event.local_port);
+        let key = (event.local_addr, event.local_port, event.protocol);
         if self.known_listeners.get(&key).is_some() {
             return None;
         }
@@ -1754,8 +1758,12 @@ impl RuleState {
             technique: "T1571",
             severity: Severity::Medium,
             message: format!(
-                "pid={} comm={} new listener on {}:{} — not seen at agent startup",
-                event.meta.pid, event.meta.comm, event.local_addr, event.local_port,
+                "pid={} comm={} new {} listener on {}:{} — not seen at agent startup",
+                event.meta.pid,
+                event.meta.comm,
+                protocol_label(event.protocol),
+                event.local_addr,
+                event.local_port,
             ),
         })
     }
@@ -3158,6 +3166,17 @@ fn is_rotation_suffix(suffix: &str) -> bool {
 
 fn is_all_digits(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `event.protocol`'s IP protocol number, as a word for the LISTENER-DRIFT alert
+/// (issue #676) — `tcp`/`udp` for the two values every snapshot source reports
+/// today, the bare number for anything else rather than guessing a name.
+fn protocol_label(protocol: u8) -> std::borrow::Cow<'static, str> {
+    match protocol {
+        6 => "tcp".into(),
+        17 => "udp".into(),
+        other => other.to_string().into(),
+    }
 }
 
 /// Matches `/dev/fd/<n>` — `execveat(fd, "", AT_EMPTY_PATH)`'s `bprm->filename`

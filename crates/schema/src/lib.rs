@@ -306,7 +306,13 @@ pub mod time;
 /// first and took 52, leaving 50/51 reserved for #994/#995 (also renumbering from
 /// their own 49 claims) — this PR took the next free number above all three
 /// instead of guessing which of 50/51 would still be open by the time it merged.
-pub const SCHEMA_VERSION: u32 = 53;
+///
+/// Bumped 53 → 54 for [`ListenPortEvent::protocol`] (#676): the reserved 50/51
+/// slots above are no longer reachable now that main sits at 53, so this
+/// renumbers past them instead of into them. #994 and #136 (timestomp) were
+/// still open at the time and renumber past 54 in that order; same coordination
+/// note as above.
+pub const SCHEMA_VERSION: u32 = 54;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -1508,10 +1514,10 @@ pub struct UdpRecvEvent {
     pub size: u32,
 }
 
-/// A TCP socket found listening, from a periodic socket-table snapshot rather than a
-/// discrete `bind`/`listen()` syscall trace (Linux: `NETLINK_SOCK_DIAG`, issue #92 —
-/// a probe-free source that runs where eBPF/ETW cannot, or as a redundant cross-check
-/// alongside them).
+/// A TCP or UDP socket found bound/listening, from a periodic socket-table snapshot
+/// rather than a discrete `bind`/`listen()` syscall trace (Linux: `NETLINK_SOCK_DIAG`,
+/// issue #92 — a probe-free source that runs where eBPF/ETW cannot, or as a redundant
+/// cross-check alongside them).
 ///
 /// `meta.timestamp_ns` is when the snapshot was taken, not when the socket actually
 /// started listening — a snapshot can only observe "listening as of now", so a
@@ -1519,11 +1525,28 @@ pub struct UdpRecvEvent {
 /// cadence is a caller decision, not a schema concern). Detection value is in the
 /// series across snapshots (listen-port drift: a new port appearing that wasn't there
 /// last poll), not any single event in isolation.
+///
+/// `protocol` is the IP protocol number, same convention as [`NetworkFlowEvent::protocol`]
+/// (`IPPROTO_TCP` = 6, `IPPROTO_UDP` = 17, issue #676), and is part of every consumer's
+/// dedup/baseline key: a UDP listener and a TCP listener on the same port are different
+/// shapes, not a collision — `udp/53` and `tcp/53` are two different services with no
+/// reason to share a baseline entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenPortEvent {
     pub meta: EventMeta,
     pub local_addr: core::net::IpAddr,
     pub local_port: u16,
+    /// Defaults to `IPPROTO_TCP` on a record that predates this field (spooled
+    /// events, server storage, the ML corpus): every collector was TCP-only
+    /// before issue #676, so that's what an un-stamped record actually was.
+    #[serde(default = "default_listen_port_protocol")]
+    pub protocol: u8,
+}
+
+/// `IPPROTO_TCP` — the default for `ListenPortEvent::protocol` on a record from
+/// before this field existed.
+fn default_listen_port_protocol() -> u8 {
+    6
 }
 
 /// Direction of TLS data flow.

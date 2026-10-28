@@ -78,7 +78,13 @@ fn seeded_rule_state() -> rules::RuleState {
                 entries
                     .iter()
                     .filter(|entry| entry.state == sensor_linux_netlink::SocketState::Listen)
-                    .map(|entry| (entry.local.ip(), entry.local.port())),
+                    .map(|entry| {
+                        (
+                            entry.local.ip(),
+                            entry.local.port(),
+                            sensor_linux_netlink::IPPROTO_TCP,
+                        )
+                    }), // sock_diag TCP dump only, today (issue #676)
             );
         }
         Err(e) => tracing::warn!(error = %e, "listen-port baseline: sock_diag snapshot failed"),

@@ -959,9 +959,35 @@ fn listen_port_golden() {
             },
             local_addr: "0.0.0.0".parse::<IpAddr>().unwrap(),
             local_port: 31337,
+            protocol: 6, // IPPROTO_TCP
         }),
         "listen_port",
     );
+}
+
+#[test]
+fn listen_port_without_protocol_defaults_to_tcp() {
+    // A record from before issue #676 (spooled events, server storage, the ML
+    // corpus, every fixture under v40-v48) has no `protocol` field at all —
+    // every collector was TCP-only back then, so that is what it actually was.
+    let path = format!(
+        "{}/tests/fixtures/v48/listen_port.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let raw = std::fs::read_to_string(&path).expect(&path);
+    assert!(
+        !raw.contains("protocol"),
+        "v48's listen_port fixture now has a protocol field — this test no longer exercises the default"
+    );
+    let event: Event =
+        serde_json::from_str(&raw).expect("pre-#676 listen_port must still deserialize");
+    match event {
+        Event::ListenPort(e) => assert_eq!(
+            e.protocol, 6,
+            "missing protocol must default to IPPROTO_TCP"
+        ),
+        other => panic!("expected ListenPort, got {other:?}"),
+    }
 }
 
 #[test]
@@ -2506,6 +2532,7 @@ fn meta_accessor_covers_all_variants() {
             meta: meta.clone(),
             local_addr: "0.0.0.0".parse::<IpAddr>().unwrap(),
             local_port: 0,
+            protocol: 6,
         }),
         Event::NetworkFlow(NetworkFlowEvent {
             meta: meta.clone(),

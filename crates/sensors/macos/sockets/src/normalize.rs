@@ -42,6 +42,7 @@ pub fn listen_port_event(entry: &SocketSnapshotEntry, timestamp_ns: u64) -> Opti
         },
         local_addr: entry.local.ip(),
         local_port: entry.local.port(),
+        protocol: 6, // IPPROTO_TCP — libproc TCP snapshot only, today (issue #676)
     }))
 }
 
@@ -77,6 +78,7 @@ mod tests {
         assert_eq!(listen.meta.comm, "sshd");
         assert_eq!(listen.meta.user, User::Unix { uid: 501, gid: 20 });
         assert_eq!(listen.meta.timestamp_ns, 7);
+        assert_eq!(listen.protocol, 6);
     }
 
     #[test]

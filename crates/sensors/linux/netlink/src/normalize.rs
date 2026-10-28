@@ -55,6 +55,7 @@ pub fn listen_port_event(
         },
         local_addr: entry.local.ip(),
         local_port: entry.local.port(),
+        protocol: IPPROTO_TCP, // sock_diag TCP dump only, today (issue #676)
     }))
 }
 
@@ -203,6 +204,7 @@ mod tests {
         assert_eq!(listen.meta.comm, "sshd-backdoor");
         assert_eq!(listen.meta.user, User::Unix { uid: 0, gid: 0 });
         assert_eq!(listen.local_port, 31337);
+        assert_eq!(listen.protocol, IPPROTO_TCP);
     }
 
     #[test]

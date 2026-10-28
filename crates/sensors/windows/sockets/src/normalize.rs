@@ -27,6 +27,7 @@ pub fn listen_port_event(entry: &ListenerEntry, timestamp_ns: u64) -> Event {
         },
         local_addr: entry.local.ip(),
         local_port: entry.local.port(),
+        protocol: 6, // IPPROTO_TCP — GetExtendedTcpTable (issue #676)
     })
 }
 
@@ -49,6 +50,7 @@ mod tests {
             panic!("a listener must map to Event::ListenPort");
         };
         assert_eq!(listen.local_port, 135);
+        assert_eq!(listen.protocol, 6);
         assert_eq!(listen.meta.pid, 1234);
         assert_eq!(listen.meta.ppid, 700);
         assert_eq!(listen.meta.comm, "svchost.exe");
