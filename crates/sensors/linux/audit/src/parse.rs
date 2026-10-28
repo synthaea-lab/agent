@@ -183,29 +183,33 @@ fn parse_fields(msg: &str) -> Result<(HashMap<String, String>, HashSet<String>),
     Ok((fields, unquoted_fields))
 }
 
+/// Builds a wire-format message (16-byte nlmsghdr + text payload) for a test to feed
+/// to [`parse_audit_message`] — `pub(crate)` so other modules' tests (`avc.rs`) can
+/// exercise their own code through the real parser instead of a hand-built
+/// `AuditRecord`, the same reasoning `avc.rs`'s tests document.
+#[cfg(test)]
+pub(crate) fn build_wire_message(record_type: u16, payload: &str) -> Vec<u8> {
+    let payload_bytes = payload.as_bytes();
+    let total_len = (NLMSGHDR_SIZE + payload_bytes.len()) as u32;
+
+    let mut buf = Vec::with_capacity(total_len as usize);
+
+    // nlmsghdr (16 bytes, little-endian)
+    buf.extend_from_slice(&total_len.to_ne_bytes()); // nlmsg_len
+    buf.extend_from_slice(&record_type.to_ne_bytes()); // nlmsg_type
+    buf.extend_from_slice(&0u16.to_ne_bytes()); // nlmsg_flags
+    buf.extend_from_slice(&0u32.to_ne_bytes()); // nlmsg_seq
+    buf.extend_from_slice(&0u32.to_ne_bytes()); // nlmsg_pid
+
+    // Payload (text)
+    buf.extend_from_slice(payload_bytes);
+
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Helper to build a wire-format message: 16-byte nlmsghdr + text payload
-    fn build_wire_message(record_type: u16, payload: &str) -> Vec<u8> {
-        let payload_bytes = payload.as_bytes();
-        let total_len = (NLMSGHDR_SIZE + payload_bytes.len()) as u32;
-
-        let mut buf = Vec::with_capacity(total_len as usize);
-
-        // nlmsghdr (16 bytes, little-endian)
-        buf.extend_from_slice(&total_len.to_ne_bytes()); // nlmsg_len
-        buf.extend_from_slice(&record_type.to_ne_bytes()); // nlmsg_type
-        buf.extend_from_slice(&0u16.to_ne_bytes()); // nlmsg_flags
-        buf.extend_from_slice(&0u32.to_ne_bytes()); // nlmsg_seq
-        buf.extend_from_slice(&0u32.to_ne_bytes()); // nlmsg_pid
-
-        // Payload (text)
-        buf.extend_from_slice(payload_bytes);
-
-        buf
-    }
 
     #[test]
     fn parse_execve_message() {

@@ -100,6 +100,8 @@ pub fn normalize(record: &NeRecord) -> Option<Event> {
             query: query.clone(),
             qtype: *qtype,
             result: result.clone().filter(|r| !r.is_empty()),
+            results: Vec::new(),
+            results_truncated: false,
             // DnsQueryEvent::status is the platform's status word; on macOS
             // this sensor reports the DNS RCODE (0 = NOERROR, 3 = NXDOMAIN).
             status: *rcode,

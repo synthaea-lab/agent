@@ -141,6 +141,10 @@ pub fn normalize(raw: &RawEsEvent) -> Option<Event> {
             parent_image_path: parent_path.clone(),
             sha256: None,
             signature: Some(signature_from_cs_flags(*cs_flags)),
+            original_file_name: None, // Filled by enrichment (#983); Mach-O has no PE resource
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         })),
         RawEsEvent::Open { meta, path, fflag } => Some(Event::FileOpen(FileOpenEvent {

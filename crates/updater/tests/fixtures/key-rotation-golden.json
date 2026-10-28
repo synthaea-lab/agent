@@ -1,0 +1,19 @@
+{
+  "recovery_public_key": "22fc297792f0b6ffc0bfcfdb7edb0c0aa14e025a365ec0e342e86e3829cb74b6",
+  "current_release_key": "1111111111111111111111111111111111111111111111111111111111111111",
+  "current_content_key": "2222222222222222222222222222222222222222222222222222222222222222",
+  "applied_release_version": 8,
+  "now": 1760000060,
+  "manifest": {
+    "expires_at": 1760604800,
+    "issued_at": 1760000000,
+    "new_content_key": "abababababababababababababababababababababababababababababababab",
+    "new_release_key": "c050c5637a44fa8629fff3cccce2300cb362a63d99d95fc54145266f4332445a",
+    "reason": "suspected exposure of the release key",
+    "release_version": 9,
+    "retired_content_key": "2222222222222222222222222222222222222222222222222222222222222222",
+    "retired_release_key": "1111111111111111111111111111111111111111111111111111111111111111",
+    "schema_version": 1,
+    "signature": "c9fe406ad60c7f48f8a5eb038d153c452d35c43183d4fa46a7b1162745f48b0855912ac959bbbd8014df3337e2b3580a48788b3ea80af625965f70861cc3c90d"
+  }
+}

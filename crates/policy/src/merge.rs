@@ -190,6 +190,7 @@ mod tests {
                 response: Some(ResponseSection {
                     kill_enabled: false,
                     quarantine_enabled: false,
+                    isolate_enabled: false,
                 }),
                 compliance_mode: Some(ComplianceMode::None),
                 rules: None,
@@ -239,6 +240,7 @@ mod tests {
         ov.payload.response = Some(ResponseSection {
             kill_enabled: true,
             quarantine_enabled: true,
+            isolate_enabled: false,
         });
         let merged = apply_overrides(&base, &ov);
         // Whole-section replace: both flags now true, matching the override.

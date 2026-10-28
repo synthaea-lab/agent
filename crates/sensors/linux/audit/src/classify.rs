@@ -44,6 +44,16 @@ pub enum AuditEvent {
         scontext: Option<String>,
         tcontext: Option<String>,
         tclass: Option<String>,
+        /// The requested permission(s) (`SELinux` `{ read }`, or `{ read write }` for
+        /// more than one — space-joined as the kernel wrote them). Recovered from the
+        /// very preamble that corrupts `pid` above: `avc:  denied  { read } for
+        /// pid=1234` folds everything before the first real `key=value` token into
+        /// one corrupted field, but that field's *key* is the only place the
+        /// permission set appears on the wire, so it has to be read from there
+        /// rather than its value (see `avc_action`). `None` when no key on the
+        /// record carries a `{ ... }` pair — an AVC variant this scan doesn't
+        /// recognize, not a normal case (#813).
+        action: Option<String>,
         permissive: bool,
         /// The object's path, from `path=` (rare, only when the kernel
         /// resolved a full path) or `name=` (the common case — often just a
@@ -162,6 +172,7 @@ fn classify_avc(record: &AuditRecord) -> Option<AuditEvent> {
         scontext,
         tcontext: record.fields.get("tcontext").cloned(),
         tclass,
+        action: avc_action(record),
         permissive: record.fields.get("permissive").is_some_and(|v| v == "1"),
         // Same hex-decoding as argv (#297 review, Nikolas): the kernel hex-encodes
         // `path=`/`name=` too whenever the value contains a space or a quote (e.g.
@@ -170,6 +181,28 @@ fn classify_avc(record: &AuditRecord) -> Option<AuditEvent> {
         // it — a free evasion.
         object_path: decoded_field(record, "path").or_else(|| decoded_field(record, "name")),
     })
+}
+
+/// The requested permission set an AVC line carries in the key of its one corrupted
+/// field, not its value (issue #813): `avc:  denied  { read } for  pid=1234` parses as
+/// a field whose key is `"avc:  denied  { read } for  pid"` and whose value is `1234`
+/// (see `AuditEvent::PolicyDenial`'s doc). Scans every field's *key* (not value) for a
+/// `{ ... }` pair rather than assuming which field it landed on, since the corruption
+/// is defined by text position, not a fixed key name. `{ read write }` becomes
+/// `"read write"`, trimmed as written; an empty `{ }` (never seen on a real kernel, but
+/// not reachable code to assume otherwise) is treated as absent. `fields` is a `HashMap`
+/// with a per-process hash seed, so when more than one key carries a `{ ... }` pair the
+/// smallest candidate wins: the result is the same on every run and restart, which
+/// matters because the permission set is part of the rule's dedup key.
+fn avc_action(record: &AuditRecord) -> Option<String> {
+    record
+        .fields
+        .keys()
+        .filter_map(|key| {
+            let permissions = key.split_once('{')?.1.split_once('}')?.0.trim();
+            (!permissions.is_empty()).then(|| permissions.to_string())
+        })
+        .min()
 }
 
 /// Reads a field and decodes it only if the kernel actually emitted it
@@ -464,6 +497,7 @@ mod tests {
                 scontext,
                 tcontext,
                 tclass,
+                action,
                 permissive,
                 object_path,
             } => {
@@ -474,10 +508,77 @@ mod tests {
                     Some("system_u:object_r:user_home_t:s0")
                 );
                 assert_eq!(tclass.as_deref(), Some("file"));
+                assert_eq!(action.as_deref(), Some("read"));
                 assert!(!permissive);
                 assert_eq!(object_path.as_deref(), Some("id_rsa"));
             }
             _ => panic!("expected PolicyDenial event"),
+        }
+    }
+
+    #[test]
+    fn classify_wire_avc_record_recovers_the_requested_permission_set() {
+        // Same shape as `classify_avc_record`, but through the real wire parser
+        // (#813 review): the hand-built `AuditRecord` above assumes `parse_fields`
+        // folds the `avc:  denied  { read write } for  pid` preamble into one
+        // corrupted key, which is exactly what `avc_action`'s fix depends on.
+        // This pins that assumption against the parser itself, not against a
+        // test author's mental model of it.
+        let event = classify_wire(
+            AUDIT_AVC,
+            r#"avc:  denied  { read write } for  pid=1234 comm="httpd" name="id_rsa" scontext=system_u:system_r:httpd_t:s0 tcontext=system_u:object_r:user_home_t:s0 tclass=file permissive=0"#,
+        );
+
+        let AuditEvent::PolicyDenial {
+            comm,
+            scontext,
+            tcontext,
+            tclass,
+            action,
+            permissive,
+            object_path,
+        } = event
+        else {
+            panic!("expected PolicyDenial event");
+        };
+        assert_eq!(comm.as_deref(), Some("httpd"));
+        assert_eq!(scontext.as_deref(), Some("system_u:system_r:httpd_t:s0"));
+        assert_eq!(
+            tcontext.as_deref(),
+            Some("system_u:object_r:user_home_t:s0")
+        );
+        assert_eq!(tclass.as_deref(), Some("file"));
+        assert_eq!(action.as_deref(), Some("read write"));
+        assert!(!permissive);
+        assert_eq!(object_path.as_deref(), Some("id_rsa"));
+    }
+
+    #[test]
+    fn classify_avc_action_is_the_same_whichever_key_the_map_yields_first() {
+        // `fields` is a HashMap: with two keys carrying a `{ ... }` pair, "the first match"
+        // would depend on its per-process hash seed. Fresh maps get fresh seeds, so many
+        // of them would flip a first-match implementation at least once.
+        for _ in 0..64 {
+            let mut fields = std::collections::HashMap::new();
+            fields.insert(
+                "avc:  denied  { write } for  pid".to_string(),
+                "1234".to_string(),
+            );
+            fields.insert("comm { read } x".to_string(), "httpd".to_string());
+            fields.insert("scontext".to_string(), "httpd_t".to_string());
+            fields.insert("tclass".to_string(), "file".to_string());
+            let record = AuditRecord {
+                record_type: AUDIT_AVC,
+                timestamp_sec: 0,
+                timestamp_ms: 0,
+                seq: 0,
+                fields,
+                unquoted_fields: std::collections::HashSet::new(),
+            };
+            let AuditEvent::PolicyDenial { action, .. } = classify(&record).unwrap() else {
+                panic!("expected PolicyDenial event");
+            };
+            assert_eq!(action.as_deref(), Some("read"));
         }
     }
 
@@ -626,5 +727,62 @@ mod tests {
         };
 
         assert!(classify(&record).is_none());
+    }
+
+    #[test]
+    fn classify_avc_records_more_than_one_requested_permission() {
+        // `{ read write }`: both permissions, space-joined as the kernel wrote them,
+        // not just the first (#813).
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "avc:  denied  { read write } for  pid".to_string(),
+            "1234".to_string(),
+        );
+        fields.insert("scontext".to_string(), "httpd_t".to_string());
+        fields.insert("tclass".to_string(), "file".to_string());
+
+        let record = AuditRecord {
+            record_type: AUDIT_AVC,
+            timestamp_sec: 0,
+            timestamp_ms: 0,
+            seq: 0,
+            fields,
+            unquoted_fields: std::collections::HashSet::new(),
+        };
+
+        let AuditEvent::PolicyDenial { action, .. } = classify(&record).unwrap() else {
+            panic!("expected PolicyDenial event");
+        };
+        assert_eq!(action.as_deref(), Some("read write"));
+    }
+
+    #[test]
+    fn classify_avc_without_a_bracketed_permission_set_leaves_action_none() {
+        // An AVC variant whose corrupted preamble carries no `{ ... }` at all (not
+        // seen on a real kernel, but the scan must not assume it's always there):
+        // action is withheld, not guessed, and classification of the rest still
+        // succeeds (#813).
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("pid".to_string(), "1234".to_string());
+        fields.insert("scontext".to_string(), "httpd_t".to_string());
+        fields.insert("tclass".to_string(), "file".to_string());
+
+        let record = AuditRecord {
+            record_type: AUDIT_AVC,
+            timestamp_sec: 0,
+            timestamp_ms: 0,
+            seq: 0,
+            fields,
+            unquoted_fields: std::collections::HashSet::new(),
+        };
+
+        let AuditEvent::PolicyDenial {
+            action, scontext, ..
+        } = classify(&record).unwrap()
+        else {
+            panic!("expected PolicyDenial event");
+        };
+        assert_eq!(action, None);
+        assert_eq!(scontext.as_deref(), Some("httpd_t"));
     }
 }

@@ -7,15 +7,15 @@
 use std::sync::{Arc, atomic::Ordering};
 
 use ferrisetw::{
-    EventRecord,
+    EventRecord, GUID,
     parser::{Parser, Pointer},
     provider::Provider,
     schema_locator::SchemaLocator,
 };
 use schema::{
     AmsiContentEvent, AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent,
-    FileOpenEvent, ImageLoadEvent, LdapSearchEvent, RegistrySetEvent, ScriptBlockEvent,
-    SmbConnectEvent, UdpSendEvent, WmiActivityEvent, sensor::EventSink,
+    FileOpenEvent, ImageLoadEvent, LdapSearchEvent, NtlmAuthEvent, NtlmDirection, RegistrySetEvent,
+    ScriptBlockEvent, SmbConnectEvent, UdpSendEvent, WmiActivityEvent, sensor::EventSink,
 };
 
 use crate::{
@@ -61,12 +61,16 @@ const DOTNET_RUNTIME_GUID: &str = "e13c0d23-ccbc-4e12-931b-d9cc2eee27e4";
 const AMSI_GUID: &str = "2A576B87-09A7-520E-C21A-4942F0271D67";
 /// Microsoft-Windows-LDAP-Client (EID 30, the search request, #364)
 const LDAP_CLIENT_GUID: &str = "099614a5-5dd7-4788-8bc9-e29f43db28fc";
+/// Microsoft-Windows-NTLM (EIDs 4020-4023/4026/4027, NTLM usage, #364)
+const NTLM_GUID: &str = "ac43300d-5fcc-4800-8e99-1bd3f85f0320";
 /// Microsoft-Windows-SMBClient (EID 30704 — TCP connection established to SMB server)
 const SMB_CLIENT_GUID: &str = "988C59C5-0A1C-45B6-A555-0C62276E327D";
+/// Microsoft-Windows-Bits-Client (EIDs 16403/4/5/61 — BITS jobs, #284)
+const BITS_CLIENT_GUID: &str = "EF1CC15B-46C1-414E-BB95-E76B077BD51E";
 
 /// Every provider the sensor enables, by short name — for the blind-session
 /// attribution (#408), which asks the OS who else enables them.
-pub(crate) const ALL_PROVIDERS: [(&str, &str); 11] = [
+pub(crate) const ALL_PROVIDERS: [(&str, &str); 13] = [
     ("Kernel-Process", KERNEL_PROCESS_GUID),
     ("Kernel-Network", KERNEL_NETWORK_GUID),
     ("Kernel-File", KERNEL_FILE_GUID),
@@ -77,8 +81,16 @@ pub(crate) const ALL_PROVIDERS: [(&str, &str); 11] = [
     ("DotNETRuntime", DOTNET_RUNTIME_GUID),
     ("SMBClient", SMB_CLIENT_GUID),
     ("AMSI", AMSI_GUID),
+    ("Bits-Client", BITS_CLIENT_GUID),
     ("LDAP-Client", LDAP_CLIENT_GUID),
+    ("NTLM", NTLM_GUID),
 ];
+
+/// A Kernel-Process sequence number field, `None` when the event version has
+/// none or it is 0 (no stamp).
+fn sequence_number(parser: &Parser, field: &str) -> Option<u64> {
+    parser.try_parse::<u64>(field).ok().filter(|&n| n != 0)
+}
 
 /// Kernel-Process keywords the sensor reads: `WINEVENT_KEYWORD_PROCESS` (0x10,
 /// EIDs 1/2), `WINEVENT_KEYWORD_IMAGE` (0x40, EID 5) and
@@ -158,6 +170,11 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         let image_path = state.normalize_path(&raw_image);
         let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
 
+        // #725: ProcessStart v4+ carries both incarnation stamps; an older
+        // version leaves them unset rather than guessed.
+        let generation = sequence_number(&parser, "ProcessSequenceNumber");
+        let parent_generation = sequence_number(&parser, "ParentProcessSequenceNumber");
+
         // Never store "<unknown>": a cache hit on it would suppress live lookups.
         if image_path != "<unknown>" {
             // #371: read while the process most likely still runs; one already
@@ -168,7 +185,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
                 .pids
                 .lock()
                 .unwrap()
-                .insert(pid, image_path.clone(), silo);
+                .insert(pid, image_path.clone(), generation, silo);
         }
         // Lineage at exec time (schema parent fields): the parent is usually alive
         // and already in the store.
@@ -181,8 +198,13 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         let cmdline = winapi::read_process_cmdline(pid).unwrap_or_else(|| image_path.clone());
 
         let comm = basename(&image_path);
+        let mut meta = state.meta(pid, ppid, comm, timestamp_ns);
+        // The parent's stamp as the kernel recorded it at this creation, not
+        // whatever holds `ppid` in the store by now.
+        meta.process_generation = generation.or(meta.process_generation);
+        meta.parent_process_generation = parent_generation.or(meta.parent_process_generation);
         sink.on_event(Event::Exec(ExecEvent {
-            meta: state.meta(pid, ppid, comm, timestamp_ns),
+            meta,
             image_path,
             cmdline,
             argv: vec![], // Windows has a flat command line; consumers fall back
@@ -191,6 +213,10 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             parent_image_path,
             sha256: None, // filled by the agent's enrichment stage
             signature: None,
+            original_file_name: None, // filled by the agent's enrichment stage (#983)
+            company_name: None,
+            file_description: None,
+            product_name: None,
         }));
     };
     Provider::by_guid(KERNEL_PROCESS_GUID)
@@ -437,6 +463,8 @@ pub(crate) fn dns_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
             } else {
                 Some(result_raw)
             },
+            results: Vec::new(),
+            results_truncated: false,
             status,
         }));
     };
@@ -453,8 +481,10 @@ fn decode_reg_string(bytes: Vec<u8>) -> Option<String> {
         return None;
     }
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     let s = String::from_utf16_lossy(&units);
     let trimmed = s.trim_end_matches('\0');
@@ -705,6 +735,100 @@ pub(crate) fn ldap_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         .build()
 }
 
+/// NTLM usage (#364): 4020/4021/4026/4027 = this host authenticated out,
+/// 4022/4023 = a client authenticated in. Emitted by default on Windows 11
+/// 24H2 (lab, 2026-10-02, no audit setting). Deduplicated per (direction,
+/// account, target, remote address, version) for a minute: no per-process
+/// budget, most of these come from pid 4.
+///
+/// # Field notes (manifest + lab)
+///
+/// Outgoing: `ProcessName`, `ProcessPID` (hex string, `0x4`), `Username`,
+/// `DomainName`, `TargetService` (`cifs/127.0.0.1`), `TargetMachine`,
+/// `TargetIP`, `NtlmVersion` (`NTLMv2`). Incoming adds `ClientIP` and
+/// `Status` (`0xc000006d`); "no value" is spelled `Null`/`(NULL)`/`-`. For
+/// SMB the process is the kernel (`SYSTEM`, pid 4).
+pub(crate) fn ntlm_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
+    let callback = move |record: &EventRecord, locator: &SchemaLocator| {
+        let direction = match record.event_id() {
+            4020 | 4021 | 4026 | 4027 => NtlmDirection::Outgoing,
+            4022 | 4023 => NtlmDirection::Incoming,
+            _ => return,
+        };
+        state.events_seen.fetch_add(1, Ordering::Relaxed);
+        let Ok(schema_def) = locator.event_schema(record) else {
+            return;
+        };
+        let parser = Parser::create(record, &schema_def);
+        let text = |name: &str| parser.try_parse::<String>(name).unwrap_or_default();
+        let user = normalize::ntlm_account(&text("Username"), &text("DomainName"));
+        let service = text("TargetService");
+        let target = if matches!(service.trim(), "" | "-" | "Null" | "(NULL)") {
+            text("TargetMachine")
+        } else {
+            service
+        };
+        let ip_field = match direction {
+            NtlmDirection::Outgoing => "TargetIP",
+            NtlmDirection::Incoming => "ClientIP",
+        };
+        let remote_address = text(ip_field).trim().parse::<std::net::IpAddr>().ok();
+        let ntlm_version = text("NtlmVersion");
+        let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
+        let status = match direction {
+            NtlmDirection::Incoming => parser
+                .try_parse::<u32>("Status")
+                .map(|s| format!("{s:#010x}"))
+                .ok()
+                .or_else(|| Some(text("Status")).filter(|s| s.starts_with("0x"))),
+            NtlmDirection::Outgoing => None,
+        };
+        // The status and the event id are part of the key: an incoming failure and the
+        // success that follows it within the window (same account, address, target and
+        // version) are two different facts, and the success is the one the rules need
+        // (#744 review: without them the success was swallowed as a duplicate).
+        let key = normalize::ntlm_dedup_key(
+            direction,
+            record.event_id(),
+            &user,
+            &target,
+            remote_address,
+            &ntlm_version,
+            status.as_deref(),
+        );
+        if !state.ntlm.lock().unwrap().first(&key, timestamp_ns) {
+            return;
+        }
+        // Only `NTLMv2` was ever observed; the weak-version rule matches the other
+        // spellings loosely. Log any version that is not `NTLMv2` (once per dedup key) so
+        // the first real sample of `NTLMv1`/`LM` shows how the provider writes it.
+        if !ntlm_version.trim().eq_ignore_ascii_case("NTLMv2") {
+            tracing::debug!(version = %ntlm_version, "NTLM version other than NTLMv2");
+        }
+        // `ProcessPID` and `Status` are integers the event viewer *displays*
+        // in hex (`0x4`, `0xc000006d`): a string parse fails on them (lab:
+        // the header pid, lsass, and an empty status came out). Integer
+        // first, the string forms as a fallback.
+        let pid = parser
+            .try_parse::<u32>("ProcessPID")
+            .ok()
+            .or_else(|| normalize::parse_ntlm_pid(&text("ProcessPID")))
+            .unwrap_or_else(|| record.process_id());
+        let comm = state.comm_for(pid).unwrap_or_else(|| text("ProcessName"));
+        sink.on_event(Event::NtlmAuth(NtlmAuthEvent {
+            meta: state.meta(pid, 0, comm, timestamp_ns),
+            direction,
+            user,
+            target,
+            remote_address,
+            ntlm_version,
+            status,
+        }));
+    };
+
+    Provider::by_guid(NTLM_GUID).add_callback(callback).build()
+}
+
 /// WMI activity events (EID 23 — `ExecQuery`, EID 24 — `ExecMethod`).
 ///
 /// EID 23 captures WQL queries (reconnaissance, event subscriptions).
@@ -872,6 +996,144 @@ pub(crate) fn smb_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) ->
     Provider::by_guid(SMB_CLIENT_GUID)
         .add_callback(callback)
         .build()
+}
+
+/// BITS jobs (#284, T1197) from `Microsoft-Windows-Bits-Client`: 16403 (file
+/// added), 4 (completed), 5 (cancelled), 61 (transfer error), each turned into
+/// `BitsJobEvent`s by [`crate::bits::BitsJobs`], which also drops Microsoft
+/// update files (see [`crate::bits::MICROSOFT_UPDATE_HOSTS`]). The record
+/// header's pid is the BITS service's; the client comes from the record's
+/// `processId` (16403, 5) or, for the service's own records, from the job's
+/// file-added records. Field layout per EID in the [`crate::bits`] module docs.
+///
+/// Enabled with no keyword or level mask: the provider writes a handful of
+/// records per job and the callback drops every id but these four before
+/// parsing, which keeps it the cheapest provider on the shared session
+/// (#408 counts every provider there).
+pub(crate) fn bits_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
+    let callback = move |record: &EventRecord, locator: &SchemaLocator| {
+        let eid = record.event_id();
+        if !matches!(eid, 4 | 5 | 61 | 16403) {
+            return;
+        }
+        state.events_seen.fetch_add(1, Ordering::Relaxed);
+        let Ok(schema_def) = locator.event_schema(record) else {
+            return;
+        };
+        let parser = Parser::create(record, &schema_def);
+        // 61 names its job `Id`; the job-level records, `jobId`.
+        let Ok(job_guid) = parser.try_parse::<GUID>(if eid == 61 { "Id" } else { "jobId" }) else {
+            return;
+        };
+        let job_id = format_guid(&job_guid);
+        let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
+        let bytes_transferred: Option<u64> = parser.try_parse("bytesTransferred").ok();
+        let events = match eid {
+            16403 => bits_file_added(&parser, &state, job_id, timestamp_ns)
+                .into_iter()
+                .collect(),
+            4 => state
+                .bits
+                .lock()
+                .unwrap()
+                .completed(&job_id, timestamp_ns, bytes_transferred),
+            5 => match client_meta(&parser, &state, timestamp_ns) {
+                Some(canceller) => state.bits.lock().unwrap().cancelled(&job_id, &canceller),
+                None => {
+                    state.bits.lock().unwrap().record_missing_client();
+                    Vec::new()
+                }
+            },
+            _ => {
+                let hresult: u32 = parser.try_parse("hr").unwrap_or(0);
+                let url: Option<String> = parser.try_parse("url").ok();
+                state
+                    .bits
+                    .lock()
+                    .unwrap()
+                    .transfer_error(
+                        &job_id,
+                        url.as_deref(),
+                        timestamp_ns,
+                        bytes_transferred,
+                        hresult,
+                    )
+                    .into_iter()
+                    .collect()
+            }
+        };
+        // The lock is released: the sink may take its own.
+        for event in events {
+            sink.on_event(Event::BitsJob(event));
+        }
+    };
+
+    Provider::by_guid(BITS_CLIENT_GUID)
+        .add_callback(callback)
+        .build()
+}
+
+/// EID 16403 through the job table, with its drops logged at debug and
+/// counted in the table.
+fn bits_file_added(
+    parser: &Parser<'_, '_>,
+    state: &SharedState,
+    job_id: String,
+    timestamp_ns: u64,
+) -> Option<schema::BitsJobEvent> {
+    let Some(client) = client_meta(parser, state, timestamp_ns) else {
+        let mut jobs = state.bits.lock().unwrap();
+        jobs.record_missing_client();
+        tracing::debug!(
+            missing_client = jobs.missing_client(),
+            "BITS file-added record without a client pid dropped"
+        );
+        return None;
+    };
+    let job_title: String = parser.try_parse("jobTitle").unwrap_or_default();
+    let url: String = parser.try_parse("RemoteName").unwrap_or_default();
+    let local_name: String = parser.try_parse("LocalName").unwrap_or_default();
+    let local_path = state.normalize_path(&crate::bits::local_path_for_join(&local_name));
+    let mut jobs = state.bits.lock().unwrap();
+    let (filtered, evicted) = (jobs.filtered(), jobs.evicted());
+    let event = jobs.file_added(client, job_id, job_title, url, local_path);
+    if jobs.filtered() > filtered {
+        tracing::debug!(
+            filtered = jobs.filtered(),
+            "BITS file from a Microsoft update host dropped"
+        );
+    }
+    if jobs.evicted() > evicted {
+        tracing::debug!(
+            evicted = jobs.evicted(),
+            "BITS job table full, oldest job or file forgotten"
+        );
+    }
+    event
+}
+
+/// The client a record names in `processId`; `None` when it names none, which
+/// the caller drops and counts rather than forwarding pid 0 with no name. A
+/// client that already exited (a fire-and-forget `Start-BitsTransfer`) keeps
+/// its pid with an empty name.
+fn client_meta(
+    parser: &Parser<'_, '_>,
+    state: &SharedState,
+    timestamp_ns: u64,
+) -> Option<EventMeta> {
+    let pid: u32 = parser.try_parse("processId").ok().filter(|&pid| pid != 0)?;
+    let comm = state.comm_for(pid).unwrap_or_default();
+    Some(state.meta(pid, 0, comm, timestamp_ns))
+}
+
+/// `{c40080ab-6fe4-418a-8ba6-c271c5298f18}`: the braced, lowercase form the
+/// BITS event log writes, so a job id greps the same in both.
+fn format_guid(guid: &GUID) -> String {
+    let d = guid.data4;
+    format!(
+        "{{{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}}}",
+        guid.data1, guid.data2, guid.data3, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+    )
 }
 
 #[cfg(test)]

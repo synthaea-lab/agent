@@ -54,6 +54,8 @@ jobs:
         # Unit tests always compile under cfg(test), where the test seed exists; the
         # integration test is the only thing that exercises the packaged variant.
         run: cargo test -p updater --no-default-features
+      - name: tools tests (PE and Mach-O import checkers)
+        run: python3 -m unittest discover -s tools/tests -v
       - name: docs build clean
         run: cargo doc --workspace --exclude sensor-linux-ebpf --no-deps
         env:
@@ -69,6 +71,14 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
+          # Escalate just the two lints that catch a stale advisories.ignore entry
+          # (#919): one whose RUSTSEC id doesn't exist in the advisory db at all,
+          # and one that no longer matches anything in our dependency tree (e.g.
+          # yara-x finally raising its wasmtime requirement past the ignored
+          # advisories). Scoped narrowly on purpose — `-D warnings` would also
+          # fail on the `duplicate`/`license-exception-not-encountered` warnings
+          # this repo already runs with deliberately non-blocking.
+          command-arguments: -D unknown-advisory -D advisory-not-detected
 
   # Core rule: every workspace crate compiles and passes tests on all three platforms.
   # Platform-specific code lives only in crates/sensors/* behind cfg, so this job is
@@ -92,6 +102,13 @@ jobs:
         run: cargo clippy --workspace --exclude sensor-linux-ebpf --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace --exclude sensor-linux-ebpf
+      # release-tool signs from a PKCS#11 token (ADR-0027): the test needs a software token, and
+      # `cargo test` above skips it without one. The script makes a skip fatal.
+      - name: release-tool PKCS#11 signing, against SoftHSM (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y --no-install-recommends softhsm2 jq
+          tools/test-pkcs11.sh
       # The ipc end-to-end test needs root / an elevated process to pass peer-auth, and
       # skips itself otherwise: `cargo test` hides that message, so the step above
       # reports `ok` on the unprivileged ubuntu/macos runners without ever running the

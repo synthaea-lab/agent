@@ -13,6 +13,9 @@ workspace = true
 policy = { path = "../policy" }
 schema = { path = "../schema" }
 store = { path = "../store" }
+tracing = { workspace = true }
 
 [dev-dependencies]
 schema = { path = "../schema", features = ["test-fixtures"] }
+proptest = "1"
+tracing-subscriber = { workspace = true }

@@ -24,17 +24,18 @@
 //! - **Linux**: no standard userland code-signing scheme (IMA is a kernel/policy
 //!   concern) — always [`Signature::Unsupported`].
 
-use std::path::Path;
+use std::{fs::File, path::Path};
 
 use schema::Signature;
 
 #[cfg(target_os = "linux")]
-pub(crate) fn verify(_path: &Path) -> Signature {
+pub(crate) fn verify(_path: &Path, _file: &File) -> Signature {
     Signature::Unsupported
 }
 
+/// `codesign` only takes a path, so the opened `file` is not used here.
 #[cfg(target_os = "macos")]
-pub(crate) fn verify(path: &Path) -> Signature {
+pub(crate) fn verify(path: &Path, _file: &File) -> Signature {
     use std::process::Command;
     // --verify: exit 0 = signed and valid.
     let verify = Command::new("codesign").arg("--verify").arg(path).output();
@@ -53,26 +54,81 @@ pub(crate) fn verify(path: &Path) -> Signature {
     }
 }
 
+/// `file` is `path` opened by the caller: Windows verifies through that handle, so
+/// the verdict describes the file the caller hashes and identifies, not whatever the
+/// path points at by the time `WinVerifyTrust` opens it (#688). `path` still picks
+/// the SIP (by extension) and names the member in catalog mode.
 #[cfg(windows)]
-pub(crate) fn verify(path: &Path) -> Signature {
-    use std::os::windows::ffi::OsStrExt as _;
+pub(crate) fn verify(path: &Path, file: &File) -> Signature {
+    use std::os::windows::{ffi::OsStrExt as _, io::AsRawHandle as _};
     let path_utf16: Vec<u16> = path
         .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
-    let embedded = windows_impl::verify_wide(&path_utf16);
+    let h_file = file.as_raw_handle();
+    let embedded = windows_impl::verify_wide(&path_utf16, h_file);
     if embedded != Signature::Unsigned {
         return embedded;
     }
     // No embedded signature: most System32 binaries are catalog-signed instead
     // (#21, P7) — check the catalog chain before concluding Unsigned.
-    windows_impl::catalog_verify(path, &path_utf16)
+    windows_impl::catalog_verify(&path_utf16, h_file)
+}
+
+/// The opened file's identity: volume serial number and 128-bit file id
+/// (`FileIdInfo`, so `ReFS` ids are not truncated to the 64-bit `nFileIndex`).
+/// `None` when the file system does not report one; the caller then never trusts a
+/// cached entry for the file.
+#[cfg(windows)]
+pub(crate) fn file_identity(file: &File) -> Option<(u64, u128)> {
+    use std::os::windows::io::AsRawHandle as _;
+    windows_impl::file_id_info(file.as_raw_handle())
 }
 
 #[cfg(windows)]
 mod windows_impl {
     use schema::Signature;
+
+    /// `FILE_INFO_BY_HANDLE_CLASS::FileIdInfo`.
+    const FILE_ID_INFO_CLASS: u32 = 18;
+
+    /// `FILE_ID_INFO`: the volume serial number and the file's 128-bit id
+    /// (`FILE_ID_128`, an opaque byte array).
+    #[repr(C)]
+    struct FileIdInfo {
+        volume_serial_number: u64,
+        file_id: [u8; 16],
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandleEx(
+            file: *mut core::ffi::c_void,
+            class: u32,
+            info: *mut core::ffi::c_void,
+            info_len: u32,
+        ) -> i32;
+    }
+
+    pub(super) fn file_id_info(h_file: *mut core::ffi::c_void) -> Option<(u64, u128)> {
+        let mut info = FileIdInfo {
+            volume_serial_number: 0,
+            file_id: [0; 16],
+        };
+        // SAFETY: `h_file` is the live handle of a `File` the caller holds for the
+        // duration of the call; `info` is a writable `FILE_ID_INFO` and its size is
+        // passed with it.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                h_file,
+                FILE_ID_INFO_CLASS,
+                (&mut info as *mut FileIdInfo).cast(),
+                size_of::<FileIdInfo>() as u32,
+            )
+        };
+        (ok != 0).then(|| (info.volume_serial_number, u128::from_le_bytes(info.file_id)))
+    }
 
     #[repr(C)]
     struct Guid {
@@ -207,11 +263,11 @@ mod windows_impl {
         fn CryptCATAdminReleaseContext(cat_admin: *mut core::ffi::c_void, flags: u32) -> i32;
     }
 
-    pub(super) fn verify_wide(path_utf16: &[u16]) -> Signature {
+    pub(super) fn verify_wide(path_utf16: &[u16], h_file: *mut core::ffi::c_void) -> Signature {
         let mut file_info = WintrustFileInfo {
             cb_struct: size_of::<WintrustFileInfo>() as u32,
             file_path: path_utf16.as_ptr(),
-            h_file: core::ptr::null_mut(),
+            h_file,
             known_subject: core::ptr::null(),
         };
         let mut data = WintrustData {
@@ -230,7 +286,8 @@ mod windows_impl {
             signature_settings: core::ptr::null_mut(),
         };
         // SAFETY: `data` and `file_info` are fully initialized above and outlive
-        // the call; the struct layout matches the manual WINTRUST_DATA binding.
+        // the call; `h_file` is a live handle the caller holds open past it; the
+        // struct layout matches the manual WINTRUST_DATA binding.
         let status = unsafe {
             WinVerifyTrust(
                 0,
@@ -262,15 +319,7 @@ mod windows_impl {
     /// Catalog-membership fallback: only called when [`verify_wide`] already
     /// reported [`Signature::Unsigned`]. Every early return is `Unsigned` too —
     /// a tooling failure here must never read as `Valid` or `Invalid`.
-    pub(super) fn catalog_verify(path: &std::path::Path, path_utf16: &[u16]) -> Signature {
-        use std::os::windows::io::AsRawHandle as _;
-
-        // Only a real, readable file can be hashed for a catalog lookup.
-        let Ok(file) = std::fs::File::open(path) else {
-            return Signature::Unsigned;
-        };
-        let h_file = file.as_raw_handle();
-
+    pub(super) fn catalog_verify(path_utf16: &[u16], h_file: *mut core::ffi::c_void) -> Signature {
         let mut cat_admin: *mut core::ffi::c_void = core::ptr::null_mut();
         // Null-terminated wide "SHA256" — the modern algorithm; this whole API
         // requires Windows 8+ regardless, so there is no legacy-SHA1 case to
@@ -396,8 +445,8 @@ mod windows_impl {
                 signature_settings: core::ptr::null_mut(),
             };
             // SAFETY: `data` and `catalog_file_info` are fully initialized above
-            // and outlive the call; `file` (the still-open handle backing
-            // `h_file`) is not dropped until this function returns; the struct
+            // and outlive the call; `h_file` is the caller's open handle, held
+            // past this function's return; the struct
             // layout matches the manual WINTRUST_DATA/WINTRUST_CATALOG_INFO
             // bindings in catalog mode (`union_choice = WTD_CHOICE_CATALOG`).
             let status = unsafe {
@@ -427,9 +476,8 @@ mod windows_impl {
 
         // SAFETY: `cat_info` and `cat_admin` were acquired above and are each
         // released exactly once here, in the documented catalog-then-admin
-        // order; `file` (backing `h_file`, used by the WinVerifyTrust call
-        // above) is still alive at this point and is dropped by the caller's
-        // scope after this function returns.
+        // order; `h_file` (used by the WinVerifyTrust call above) belongs to
+        // the caller and stays open.
         unsafe {
             CryptCATAdminReleaseCatalogContext(cat_admin, cat_info, 0);
             CryptCATAdminReleaseContext(cat_admin, 0);

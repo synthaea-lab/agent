@@ -9,20 +9,21 @@
 use std::net::IpAddr;
 
 use schema::{
-    AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, CapSetEvent,
-    ConnectEvent, DefenderEvent, DefenderEventKind, DnsQueryEvent, Event, EventMeta, ExecEvent,
-    FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent, FileQuarantineEvent,
-    FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent,
-    GatekeeperVerdictEvent, HttpClientCount, HttpEvidence, HttpRequestEvent, HttpSignature,
-    HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent, KernelModuleAction,
-    KernelModuleEvent, LdapSearchEvent, ListenPortEvent, MemfdCreateEvent, MountEvent,
-    NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, POLICY_MECHANISM_SELINUX,
+    AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BitsJobEvent,
+    BitsJobState, BpfEvent, CapSetEvent, ConnectEvent, DefenderEvent, DefenderEventKind,
+    DnsQueryEvent, Event, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent,
+    FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
+    FileWriteEvent, GatekeeperVerdictEvent, HttpClientCount, HttpEvidence, HttpRequestEvent,
+    HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent,
+    KernelModuleAction, KernelModuleEvent, LdapSearchEvent, ListenPortEvent, LogClearedEvent,
+    MemfdCreateEvent, MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent,
+    NtlmAuthEvent, NtlmDirection, POLICY_MECHANISM_SELINUX, PackageChangeEvent, PackageChangeKind,
     PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
     ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent, SessionState, ShellType,
     SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketCreateEvent,
     SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
     UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
-    detection::{Detection, DetectionSource, ScoreAttribution, Severity},
+    detection::{Detection, DetectionSource, IocKind, ScoreAttribution, Severity},
 };
 
 fn fixture(name: &str) -> serde_json::Value {
@@ -74,6 +75,10 @@ fn exec_unix_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         }),
         "exec",
@@ -108,6 +113,10 @@ fn exec_process_generation_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         }),
         "exec_process_generation",
@@ -138,6 +147,10 @@ fn exec_ld_preload_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: vec![("LD_PRELOAD".into(), "/tmp/evil.so".into())],
         }),
         "exec_ld_preload",
@@ -168,6 +181,10 @@ fn exec_windows_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         }),
         "exec_windows",
@@ -202,6 +219,10 @@ fn exec_lineage_golden() {
             ),
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         }),
         "exec_lineage",
@@ -256,6 +277,10 @@ fn detection_ml_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         })],
     };
@@ -291,6 +316,10 @@ fn sample_exec_event() -> Event {
         parent_image_path: None,
         sha256: None,
         signature: None,
+        original_file_name: None,
+        company_name: None,
+        file_description: None,
+        product_name: None,
         env_security: Vec::new(),
     })
 }
@@ -333,6 +362,55 @@ fn detection_sigma_golden() {
     };
     let serialized = serde_json::to_value(&detection).unwrap();
     assert_eq!(serialized, fixture("detection_sigma"), "fixture mismatch");
+    let back: Detection = serde_json::from_value(serialized).unwrap();
+    assert_eq!(back, detection, "round trip mismatch");
+}
+
+#[test]
+fn detection_ioc_golden() {
+    // v52 (#60): a SHA-256 indicator from a signed feed matched on exec.
+    let detection = Detection {
+        timestamp_ns: 1_756_900_006_000_000_000,
+        severity: Severity::High,
+        title: "Known-bad file hash".into(),
+        source: DetectionSource::Ioc {
+            kind: IocKind::Sha256,
+            indicator: "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f".into(),
+            feed: "abuse.ch-malwarebazaar".into(),
+            feed_version: "2026.10.26-1".into(),
+            reference: Some("https://bazaar.abuse.ch/sample/275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f/".into()),
+        },
+        score: None,
+        techniques: vec!["T1204.002".into()],
+        attributions: Vec::new(),
+        events: vec![sample_exec_event()],
+    };
+    let serialized = serde_json::to_value(&detection).unwrap();
+    assert_eq!(serialized, fixture("detection_ioc"), "fixture mismatch");
+    let back: Detection = serde_json::from_value(serialized).unwrap();
+    assert_eq!(back, detection, "round trip mismatch");
+}
+
+#[test]
+fn detection_ioc_without_reference_omits_the_field() {
+    let detection = Detection {
+        timestamp_ns: 1_756_900_007_000_000_000,
+        severity: Severity::High,
+        title: "Known-bad address".into(),
+        source: DetectionSource::Ioc {
+            kind: IocKind::Ip,
+            indicator: "203.0.113.7".into(),
+            feed: "internal-blocklist".into(),
+            feed_version: "7".into(),
+            reference: None,
+        },
+        score: None,
+        techniques: vec!["T1071".into()],
+        attributions: Vec::new(),
+        events: vec![sample_exec_event()],
+    };
+    let serialized = serde_json::to_value(&detection).unwrap();
+    assert_eq!(serialized, fixture("detection_ioc_ip"), "fixture mismatch");
     let back: Detection = serde_json::from_value(serialized).unwrap();
     assert_eq!(back, detection, "round trip mismatch");
 }
@@ -418,11 +496,24 @@ fn dns_query_golden() {
             },
             query: "beacon.example.test".into(),
             qtype: 1,
-            result: Some("type:1 172.67.143.127;".into()),
+            result: Some("172.67.143.127".into()),
+            results: vec!["172.67.143.127".into(), "2001:db8::1".into()],
+            results_truncated: true,
             status: 0,
         }),
         "dns_query",
     );
+}
+
+#[test]
+fn dns_query_v44_fixture_deserializes_with_empty_answer_set() {
+    let old_event: Event = serde_json::from_str(include_str!("fixtures/v44/dns_query.json"))
+        .expect("v44 DNS fixture remains readable");
+    let Event::DnsQuery(event) = old_event else {
+        panic!("fixture must deserialize as a DNS query")
+    };
+    assert!(event.results.is_empty());
+    assert!(!event.results_truncated);
 }
 
 #[test]
@@ -448,6 +539,83 @@ fn wmi_activity_golden() {
             method: Some("Win32_Process.Create".into()),
         }),
         "wmi_activity",
+    );
+}
+
+#[test]
+fn ntlm_auth_golden() {
+    assert_golden(
+        &Event::NtlmAuth(NtlmAuthEvent {
+            meta: EventMeta {
+                pid: 4,
+                ppid: 0,
+                user: User::Unknown,
+                timestamp_ns: 1_759_405_827_000_000_000,
+                comm: "System".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            direction: NtlmDirection::Outgoing,
+            user: "synlabnobody".into(),
+            target: "cifs/127.0.0.1".into(),
+            remote_address: Some("127.0.0.1".parse().unwrap()),
+            ntlm_version: "NTLMv2".into(),
+            status: None,
+        }),
+        "ntlm_auth",
+    );
+}
+
+#[test]
+fn log_cleared_golden() {
+    assert_golden(
+        &Event::LogCleared(LogClearedEvent {
+            meta: EventMeta {
+                pid: 1612,
+                ppid: 0,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-1001".into(),
+                    integrity_level: None,
+                },
+                timestamp_ns: 1_760_520_000_000_000_000,
+                comm: String::new(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            channel: "Security".into(),
+            subject_user: r"LAB\analyst".into(),
+            subject_logon_id: Some("0x4d2c1".into()),
+            backup_path: None,
+        }),
+        "log_cleared",
+    );
+}
+
+#[test]
+fn log_cleared_with_backup_golden() {
+    assert_golden(
+        &Event::LogCleared(LogClearedEvent {
+            meta: EventMeta {
+                pid: 1612,
+                ppid: 0,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-1001".into(),
+                    integrity_level: None,
+                },
+                timestamp_ns: 1_760_520_001_000_000_000,
+                comm: String::new(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            channel: "Microsoft-Windows-PowerShell/Operational".into(),
+            subject_user: r"LAB\analyst".into(),
+            subject_logon_id: None,
+            backup_path: Some(r"C:\Users\analyst\ps.evtx".into()),
+        }),
+        "log_cleared_backup",
     );
 }
 
@@ -847,9 +1015,47 @@ fn exec_enriched_golden() {
             parent_image_path: None,
             sha256: Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into()),
             signature: Some(schema::Signature::Unsigned),
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         }),
         "exec_enriched",
+    );
+}
+
+/// #983: a renamed Windows binary still carries its real name in the PE version
+/// resource. `cmd.exe` copied to `svchost.exe` evaluated against a Sigma rule on
+/// `OriginalFileName` is the whole point of this field.
+#[test]
+fn exec_windows_pe_info_golden() {
+    assert_golden(
+        &Event::Exec(ExecEvent {
+            meta: EventMeta {
+                pid: 7700,
+                ppid: 512,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_007_000_000_000,
+                comm: "svchost.exe".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            image_path: "C:\\Users\\Public\\svchost.exe".into(),
+            cmdline: "C:\\Users\\Public\\svchost.exe /c whoami".into(),
+            argv: Vec::new(),
+            parent_comm: None,
+            parent_image_path: None,
+            sha256: Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into()),
+            signature: Some(schema::Signature::Unsigned),
+            original_file_name: Some("Cmd.Exe".into()),
+            company_name: Some("Microsoft Corporation".into()),
+            file_description: Some("Windows Command Processor".into()),
+            product_name: Some("Microsoft® Windows® Operating System".into()),
+            env_security: Vec::new(),
+        }),
+        "exec_pe_info",
     );
 }
 
@@ -880,6 +1086,10 @@ fn exec_container_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         }),
         "exec_container",
@@ -1508,11 +1718,38 @@ fn socket_create_golden() {
 }
 
 #[test]
+fn package_change_upgraded_golden() {
+    // v43 (#87): a diffed inventory snapshot, not a kernel event — pid/ppid 0 and
+    // comm names the package manager, same convention as `HttpRequestEvent`.
+    assert_golden(
+        &Event::PackageChange(PackageChangeEvent {
+            meta: EventMeta {
+                pid: 0,
+                ppid: 0,
+                user: User::Unknown,
+                timestamp_ns: 1_756_900_020_000_000_000,
+                comm: "dpkg".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            package: "openssl".into(),
+            change: PackageChangeKind::Upgraded,
+            previous_version: Some("3.0.13-1".into()),
+            version: Some("3.0.15-1".into()),
+        }),
+        "package_change_upgraded",
+    );
+}
+
+#[test]
 fn policy_denial_golden() {
     // v23 (#297): a SELinux AVC denial — httpd blocked (enforcing mode) from
     // reading a file labeled for a user's home directory, the classic
-    // web-shell-reading-secrets shape. `action` is absent: the AVC parser
-    // doesn't yet recover the requested permission set, see the type's doc.
+    // web-shell-reading-secrets shape. `action` is absent: this fixture
+    // predates #813, which taught the AVC parser to recover the requested
+    // permission set — see the type's doc. Frozen as-is; a v23 fixture must
+    // keep producing what v23 actually produced.
     // v30 (#427): `object_path` from the AVC record's `path=`/`name=`.
     assert_golden(
         &Event::PolicyDenial(PolicyDenialEvent {
@@ -1535,6 +1772,36 @@ fn policy_denial_golden() {
             object_path: Some("/home/alice/.ssh/id_rsa".into()),
         }),
         "policy_denial",
+    );
+}
+
+#[test]
+fn policy_denial_with_action_golden() {
+    // The #813 shape: the AVC parser recovered the requested permission set, which is
+    // carried as written (space-joined, `{ read write }` -> "read write"). The
+    // `policy_denial` fixture above stays action-less, as v23 produced it; this one pins
+    // the field the SELinux denial-drift rule's dedup key now depends on.
+    assert_golden(
+        &Event::PolicyDenial(PolicyDenialEvent {
+            meta: EventMeta {
+                pid: 4242,
+                ppid: 1337,
+                user: User::Unix { uid: 48, gid: 48 },
+                timestamp_ns: 1_756_900_100_000_000_000,
+                comm: "httpd".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            mechanism: POLICY_MECHANISM_SELINUX.into(),
+            subject_context: Some("system_u:system_r:httpd_t:s0".into()),
+            object_context: Some("system_u:object_r:user_home_t:s0".into()),
+            object_class: Some("file".into()),
+            action: Some("read write".into()),
+            enforced: true,
+            object_path: Some("/home/alice/.ssh/id_rsa".into()),
+        }),
+        "policy_denial_with_action",
     );
 }
 
@@ -1791,6 +2058,68 @@ fn namespace_golden() {
 }
 
 #[test]
+fn bits_job_golden() {
+    // v48 (#284): `bitsadmin /transfer` adding a file to a BITS job. The
+    // service does the download; this record names the client that asked.
+    assert_golden(
+        &Event::BitsJob(BitsJobEvent {
+            meta: EventMeta {
+                pid: 6412,
+                ppid: 5120,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-1001".into(),
+                    integrity_level: Some(0x2000),
+                },
+                timestamp_ns: 1_756_900_029_000_000_000,
+                comm: "bitsadmin.exe".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            job_id: "{c40080ab-6fe4-418a-8ba6-c271c5298f18}".into(),
+            job_title: "update".into(),
+            state: BitsJobState::FileAdded,
+            url: "https://example.test/payload.exe".into(),
+            local_path: r"C:\Users\u\AppData\Local\Temp\p.exe".into(),
+            bytes_transferred: None,
+            hresult: None,
+        }),
+        "bits_job",
+    );
+}
+
+#[test]
+fn bits_job_transfer_error_golden() {
+    // v48 (#284): the same job failing mid-transfer, reported by the BITS
+    // service and attributed to the client that added the file.
+    assert_golden(
+        &Event::BitsJob(BitsJobEvent {
+            meta: EventMeta {
+                pid: 6412,
+                ppid: 5120,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-1001".into(),
+                    integrity_level: Some(0x2000),
+                },
+                timestamp_ns: 1_756_900_030_000_000_000,
+                comm: "bitsadmin.exe".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            job_id: "{c40080ab-6fe4-418a-8ba6-c271c5298f18}".into(),
+            job_title: "update".into(),
+            state: BitsJobState::TransferError,
+            url: "https://example.test/payload.exe".into(),
+            local_path: r"C:\Users\u\AppData\Local\Temp\p.exe".into(),
+            bytes_transferred: Some(1917),
+            hresult: Some(0x8019_0194), // BG_E_HTTP_ERROR_404
+        }),
+        "bits_job_transfer_error",
+    );
+}
+
+#[test]
 fn prctl_securebits_golden() {
     // v34 (#457): PR_SET_SECUREBITS locking SECBIT_NOROOT (bit 0) and its
     // LOCKED twin (bit 1) — the process tree can never regain root's implicit
@@ -1937,6 +2266,10 @@ fn unbounded_cmdline_survives() {
         parent_image_path: None,
         sha256: None,
         signature: None,
+        original_file_name: None,
+        company_name: None,
+        file_description: None,
+        product_name: None,
         env_security: Vec::new(),
     });
     let back: Event = serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
@@ -1970,6 +2303,10 @@ fn ml_cmdline_is_the_canonical_nul_joined_form() {
         parent_image_path: None,
         sha256: None,
         signature: None,
+        original_file_name: None,
+        company_name: None,
+        file_description: None,
+        product_name: None,
         env_security: Vec::new(),
     };
 
@@ -2027,6 +2364,10 @@ fn meta_accessor_covers_all_variants() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         }),
         Event::FileOpen(FileOpenEvent {
@@ -2044,6 +2385,8 @@ fn meta_accessor_covers_all_variants() {
             query: String::new(),
             qtype: 1,
             result: None,
+            results: Vec::new(),
+            results_truncated: false,
             status: 0,
         }),
         Event::RegistrySet(RegistrySetEvent {
@@ -2070,6 +2413,22 @@ fn meta_accessor_covers_all_variants() {
             namespace: String::new(),
             query: None,
             method: None,
+        }),
+        Event::LogCleared(LogClearedEvent {
+            meta: meta.clone(),
+            channel: String::new(),
+            subject_user: String::new(),
+            subject_logon_id: None,
+            backup_path: None,
+        }),
+        Event::NtlmAuth(NtlmAuthEvent {
+            meta: meta.clone(),
+            direction: NtlmDirection::Incoming,
+            user: String::new(),
+            target: String::new(),
+            remote_address: None,
+            ntlm_version: String::new(),
+            status: None,
         }),
         Event::LdapSearch(LdapSearchEvent {
             meta: meta.clone(),
@@ -2313,6 +2672,13 @@ fn meta_accessor_covers_all_variants() {
             socket_type: 1,
             protocol: 6,
             fd: 0,
+        }),
+        Event::PackageChange(PackageChangeEvent {
+            meta: meta.clone(),
+            package: "x".into(),
+            change: PackageChangeKind::Added,
+            previous_version: None,
+            version: Some("1".into()),
         }),
     ];
     for e in &events {

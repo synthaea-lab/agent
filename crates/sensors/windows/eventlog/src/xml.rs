@@ -352,6 +352,8 @@ pub struct LogonEvent {
     /// into `schema::AuthEvent::status_code`.
     pub status: Option<String>,
     pub sub_status: Option<String>,
+    /// When the event happened (`<TimeCreated SystemTime>`), not when it was read.
+    pub time_created_ns: Option<u64>,
 }
 
 /// Text of a `<Data Name='{name}'>...</Data>` element, or `None` if the field is
@@ -391,6 +393,7 @@ pub fn parse_logon_block(block: &str) -> Option<LogonEvent> {
         ip_address: opt_data(block, "IpAddress"),
         status: opt_data(block, "Status"),
         sub_status: opt_data(block, "SubStatus"),
+        time_created_ns: time_created_ns(block),
     })
 }
 
@@ -790,6 +793,8 @@ pub struct TerminalSessionEvent {
     /// The client as written: an IP address, `LOCAL` for the console, or
     /// whatever else Windows put there. Interpreted by `sensor.rs`.
     pub address: Option<String>,
+    /// When the event happened (`<TimeCreated SystemTime>`), not when it was read.
+    pub time_created_ns: Option<u64>,
 }
 
 /// `<tag>value</tag>` inside the event's `<UserData>`: trimmed, entities
@@ -817,6 +822,101 @@ fn system_header(block: &str) -> Option<(u64, u32, u32)> {
     Some((record_id, event_id, pid))
 }
 
+/// The event's own time, `<TimeCreated SystemTime='2026-09-21T13:29:23.0286360Z'/>`,
+/// as nanoseconds since the Unix epoch (the unit of `EventMeta::timestamp_ns`).
+/// `None` when the attribute is absent or not exactly `YYYY-MM-DDTHH:MM:SS[.f]Z`
+/// with a fraction of one to nine digits and a real calendar date from 1970 on.
+///
+/// The pollers read each channel on its own thread, so an event is *processed*
+/// some seconds after it happened, and two channels do not agree on that delay.
+/// A rule that joins events from two channels needs when they happened, not when
+/// they arrived (the RDP success-after-failures join, #285).
+#[must_use]
+pub fn time_created_ns(block: &str) -> Option<u64> {
+    let text = extract_between(block, "<TimeCreated SystemTime='", "'")
+        .or_else(|| extract_between(block, "<TimeCreated SystemTime=\"", "\""))?;
+    system_time_ns(text.trim())
+}
+
+fn digits(text: &str, from: usize, to: usize) -> Option<u32> {
+    let part = text.get(from..to)?;
+    if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    part.parse().ok()
+}
+
+fn is_leap(year: u32) -> bool {
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ if is_leap(year) => 29,
+        _ => 28,
+    }
+}
+
+/// Days from 1970-01-01 to the given civil date (proleptic Gregorian; the
+/// standard "days from civil" computation, valid for every date from 1970).
+fn days_from_civil(year: u32, month: u32, day: u32) -> u64 {
+    let year = i64::from(year) - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let month_from_march = i64::from((month + 9) % 12);
+    let day_of_year = (153 * month_from_march + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    u64::try_from(era * 146_097 + day_of_era - 719_468).unwrap_or(0)
+}
+
+fn system_time_ns(text: &str) -> Option<u64> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || *bytes.last()? != b'Z'
+    {
+        return None;
+    }
+    let year = digits(text, 0, 4)?;
+    let month = digits(text, 5, 7)?;
+    let day = digits(text, 8, 10)?;
+    let hour = digits(text, 11, 13)?;
+    let minute = digits(text, 14, 16)?;
+    let second = digits(text, 17, 19)?;
+    if year < 1970
+        || !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let fraction_ns = if bytes.len() == 20 {
+        0
+    } else {
+        // `.` then one to nine digits, then `Z`.
+        let fraction_len = bytes.len() - 21;
+        if bytes[19] != b'.' || !(1..=9).contains(&fraction_len) {
+            return None;
+        }
+        let value = u64::from(digits(text, 20, bytes.len() - 1)?);
+        value * 10_u64.pow(u32::try_from(9 - fraction_len).ok()?)
+    };
+    let seconds = days_from_civil(year, month, day) * 86_400
+        + u64::from(hour) * 3_600
+        + u64::from(minute) * 60
+        + u64::from(second);
+    seconds.checked_mul(1_000_000_000)?.checked_add(fraction_ns)
+}
+
 /// Parses one `LocalSessionManager` 21/23/24/25 `<Event>` block. `None`
 /// without an `EventRecordID`, same convention as the other parsers here.
 #[must_use]
@@ -829,6 +929,7 @@ pub fn parse_local_session_event(block: &str) -> Option<TerminalSessionEvent> {
         user: user_data_field(block, "User"),
         session_id: user_data_field(block, "SessionID").and_then(|s| s.parse().ok()),
         address: user_data_field(block, "Address"),
+        time_created_ns: time_created_ns(block),
     })
 }
 
@@ -849,6 +950,69 @@ pub fn parse_remote_connection_event(block: &str) -> Option<TerminalSessionEvent
         user,
         session_id: None,
         address: user_data_field(block, "Param3"),
+        time_created_ns: time_created_ns(block),
+    })
+}
+
+/// Fields of a "log cleared" record the Event Log service writes into a log it
+/// has just emptied (#799): Security **1102** or System **104**, both from the
+/// `Microsoft-Windows-Eventlog` provider, both carrying a `<UserData>`
+/// `<LogFileCleared>` element. Raw as written; `sensor.rs` decides what a
+/// missing field means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogClearedRecord {
+    pub record_id: u64,
+    pub event_id: u32,
+    /// `<Execution ProcessID>`: the Event Log service, not the clearer.
+    pub pid: u32,
+    /// `ClientProcessId`: the process that asked for the clear. Present in
+    /// both events on Windows 11 26200 (lab, 2026-10-15); older builds may
+    /// not write it.
+    pub client_pid: Option<u32>,
+    /// 104: the channel that was cleared (`UserData`'s `<Channel>`, not the
+    /// header's, which is always `System`). 1102 does not carry one: it is
+    /// always about the Security log it is written into.
+    pub cleared_channel: Option<String>,
+    /// 1102: `SubjectUserSid`. 104 has no such field; its header's
+    /// `<Security UserID>` names the same account and is read instead.
+    pub subject_sid: Option<String>,
+    pub subject_user_name: Option<String>,
+    pub subject_domain_name: Option<String>,
+    /// 1102 only.
+    pub subject_logon_id: Option<String>,
+    /// 104 only, and empty unless the clear asked for a backup.
+    pub backup_path: Option<String>,
+    /// When the log was cleared (`<TimeCreated SystemTime>`).
+    pub time_created_ns: Option<u64>,
+}
+
+/// The header's `<Security UserID='...'/>`, in either quote style.
+fn security_user_id(block: &str) -> Option<String> {
+    let header = extract_between(block, "<System>", "</System>")?;
+    extract_between(header, "<Security UserID='", "'")
+        .or_else(|| extract_between(header, "<Security UserID=\"", "\""))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(unescape_xml_entities)
+}
+
+/// Parses one Security 1102 or System 104 `<Event>` block. `None` without an
+/// `EventRecordID`, same convention as the other parsers here.
+#[must_use]
+pub fn parse_log_cleared_event(block: &str) -> Option<LogClearedRecord> {
+    let (record_id, event_id, pid) = system_header(block)?;
+    Some(LogClearedRecord {
+        record_id,
+        event_id,
+        pid,
+        client_pid: user_data_field(block, "ClientProcessId").and_then(|s| s.parse().ok()),
+        cleared_channel: user_data_field(block, "Channel"),
+        subject_sid: user_data_field(block, "SubjectUserSid").or_else(|| security_user_id(block)),
+        subject_user_name: user_data_field(block, "SubjectUserName"),
+        subject_domain_name: user_data_field(block, "SubjectDomainName"),
+        subject_logon_id: user_data_field(block, "SubjectLogonId"),
+        backup_path: user_data_field(block, "BackupPath"),
+        time_created_ns: time_created_ns(block),
     })
 }
 
@@ -947,8 +1111,10 @@ pub fn task_definition_relative_path(task_name: &str) -> Option<String> {
 pub fn decode_task_definition(bytes: &[u8]) -> String {
     if let Some(utf16) = bytes.strip_prefix(&[0xFF, 0xFE]) {
         let units: Vec<u16> = utf16
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect();
         return String::from_utf16_lossy(&units);
     }
@@ -980,6 +1146,8 @@ pub fn parse_task_scheduler_op_registered_block(
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     /// Field names and general shape observed on `wevtutil qe System /f:xml` for a
@@ -1654,9 +1822,11 @@ mod tests {
 
     /// A user (`SANDBOX\solka`) registering a scheduled task named `\atomic-r`
     /// via `schtasks.exe /Create ...`. Emitted by the Task Scheduler service on
-    /// the always-on `Microsoft-Windows-TaskScheduler/Operational` channel, no
-    /// audit subcategory required — the complement to Security 4698 whose audit
-    /// enablement may fail on a hardened host.
+    /// the `Microsoft-Windows-TaskScheduler/Operational` channel, no audit
+    /// subcategory required — the complement to Security 4698 whose audit
+    /// enablement may fail on a hardened host. The channel is Task Scheduler
+    /// history, off by default on client SKUs: only hosts where an operator
+    /// enabled it produce this event (#786).
     const TASK_SCHEDULER_OP_106_XML: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-TaskScheduler' Guid='{de7b24ea-73c8-4a09-985d-5bdadcfa9017}'/><EventID>106</EventID><Version>0</Version><Level>4</Level><Task>106</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime='2026-09-22T08:21:11.7752210Z'/><EventRecordID>18432</EventRecordID><Correlation/><Execution ProcessID='2124' ThreadID='2892'/><Channel>Microsoft-Windows-TaskScheduler/Operational</Channel><Computer>Sandbox</Computer><Security UserID='S-1-5-21-1663667890-2519037288-962558911-1001'/></System><EventData><Data Name='TaskName'>\atomic-r</Data><Data Name='UserContext'>SANDBOX\solka</Data></EventData></Event>"#;
 
     #[test]
@@ -1760,7 +1930,160 @@ mod tests {
                 user: Some(r"SANDBOX\alice".into()),
                 session_id: Some(1),
                 address: Some("LOCAL".into()),
+                time_created_ns: Some(1791200769808873500),
             }
+        );
+    }
+
+    #[test]
+    fn time_created_reads_wevtutil_timestamps_exactly() {
+        let at = |t: &str| time_created_ns(&format!("<TimeCreated SystemTime='{t}'/>"));
+        assert_eq!(at("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            at("2026-09-21T13:29:23.0286360Z"),
+            Some(1789997363028636000)
+        );
+        assert_eq!(
+            at("2024-02-29T23:59:59.999999999Z"),
+            Some(1709251199999999999)
+        );
+        assert_eq!(
+            at("2000-03-01T00:00:00.000000000Z"),
+            Some(951868800000000000)
+        );
+    }
+
+    #[test]
+    fn time_created_rejects_what_is_not_a_real_timestamp() {
+        let at = |t: &str| time_created_ns(&format!("<TimeCreated SystemTime='{t}'/>"));
+        assert_eq!(time_created_ns("<Event/>"), None, "no attribute");
+        for bad in [
+            "",
+            "2026-09-21",
+            "2026-09-21T13:29:23",
+            "2026-09-21 13:29:23Z",
+            "2026-13-01T00:00:00Z",
+            "2026-00-10T00:00:00Z",
+            "2026-02-30T00:00:00Z",
+            "2023-02-29T00:00:00Z",
+            "2026-09-21T24:00:00Z",
+            "2026-09-21T13:60:00Z",
+            "2026-09-21T13:29:60Z",
+            "1969-12-31T23:59:59Z",
+            "2026-09-21T13:29:23.Z",
+            "2026-09-21T13:29:23.1234567891Z",
+            "2026-09-21T13:29:23,5Z",
+            "2026-09-21T13:29:23+01:00",
+            "20x6-09-21T13:29:23Z",
+        ] {
+            assert_eq!(at(bad), None, "{bad:?}");
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn time_created_round_trips_against_time_crate(
+            // `time_created_ns` returns u64 nanoseconds, so cap the reference
+            // generator below u64::MAX / 1e9; a separate boundary case covers
+            // the overflow edge.
+            seconds in 0_u64..18_446_744_073,
+            nanos in 0_u32..1_000_000_000,
+        ) {
+            let reference = time::OffsetDateTime::from_unix_timestamp(seconds as i64)
+                .unwrap()
+                .replace_nanosecond(nanos)
+                .unwrap();
+            let date = reference.date();
+            let clock = reference.time();
+            let timestamp = format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}Z",
+                date.year(),
+                u8::from(date.month()),
+                date.day(),
+                clock.hour(),
+                clock.minute(),
+                clock.second(),
+                clock.nanosecond(),
+            );
+            let event = format!("<TimeCreated SystemTime='{timestamp}'/>");
+            prop_assert_eq!(
+                time_created_ns(&event),
+                Some(reference.unix_timestamp_nanos() as u64),
+            );
+        }
+    }
+
+    #[test]
+    fn time_created_handles_gregorian_century_leap_years() {
+        let at = |text: &str| time_created_ns(&format!("<TimeCreated SystemTime='{text}'/>"));
+        assert_eq!(at("2000-02-29T00:00:00Z"), Some(951_782_400_000_000_000));
+        assert_eq!(at("1900-02-29T00:00:00Z"), None);
+        assert_eq!(at("2100-02-29T00:00:00Z"), None);
+        assert_eq!(at("2100-03-01T00:00:00Z"), Some(4_107_542_400_000_000_000));
+    }
+
+    #[test]
+    fn time_created_rejects_nanoseconds_beyond_u64() {
+        assert_eq!(
+            time_created_ns("<TimeCreated SystemTime='2554-07-21T23:34:33.709551616Z'/>"),
+            None,
+        );
+    }
+
+    #[test]
+    fn time_created_accepts_both_attribute_quote_styles_and_rejects_hostile_text() {
+        assert_eq!(
+            time_created_ns("<TimeCreated SystemTime=\"2026-01-02T03:04:05.000000006Z\"/>"),
+            Some(1_767_323_045_000_000_006),
+        );
+        assert_eq!(
+            time_created_ns("<TimeCreated SystemTime='2026-01-02T03:04:05.000000006Z'/>"),
+            Some(1_767_323_045_000_000_006),
+        );
+        for hostile in [
+            "2026-0é-02T03:04:05Z",
+            "2026-01-02T03:04:é5Z",
+            "2026-01-02T03:04:05\"Z",
+            "2026-01-02T03:04:05'Z",
+        ] {
+            let event = format!("<TimeCreated SystemTime='{hostile}'/>");
+            assert_eq!(time_created_ns(&event), None, "{hostile:?}");
+        }
+        let million_digits = format!(
+            "<TimeCreated SystemTime='2026-01-02T03:04:05.{}Z'/>",
+            "7".repeat(1_000_000),
+        );
+        assert_eq!(time_created_ns(&million_digits), None);
+    }
+
+    #[test]
+    fn time_created_rejects_each_required_delimiter_when_only_it_is_wrong() {
+        for malformed in [
+            "2026/01-02T03:04:05Z",
+            "2026-01/02T03:04:05Z",
+            "2026-01-02t03:04:05Z",
+            "2026-01-02T03.04:05Z",
+            "2026-01-02T03:04.05Z",
+            "2026-01-02T03:04:05X",
+        ] {
+            let event = format!("<TimeCreated SystemTime='{malformed}'/>");
+            assert_eq!(time_created_ns(&event), None, "{malformed}");
+        }
+    }
+
+    #[test]
+    fn logon_and_session_events_carry_the_time_they_happened() {
+        assert_eq!(
+            parse_logon_block(LOGON_FAILURE_XML).and_then(|e| e.time_created_ns),
+            Some(1789997363236729800)
+        );
+        assert_eq!(
+            parse_local_session_event(LSM_21_CONSOLE).and_then(|e| e.time_created_ns),
+            Some(1791200769808873500)
+        );
+        assert_eq!(
+            parse_remote_connection_event(RCM_1149).and_then(|e| e.time_created_ns),
+            Some(1791201600000000000)
         );
     }
 
@@ -1809,5 +2132,57 @@ mod tests {
                 .session_id,
             None
         );
+    }
+
+    /// A real System 104, captured on Windows 11 26200 (2026-10-15, #799):
+    /// `OpenSSH/Operational` cleared through .NET's
+    /// `EventLogSession.GlobalSession.ClearLog(channel, backupPath)`, not
+    /// `wevtutil`. Verbatim `wevtutil qe` output, computer and account renamed.
+    const LOG_FILE_CLEARED_104: &str = r"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Eventlog' Guid='{fc65ddd8-d6ef-4962-83d5-6e5cfe9ce148}'/><EventID>104</EventID><Version>1</Version><Level>4</Level><Task>104</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime='2026-10-15T12:50:01.7166040Z'/><EventRecordID>78381</EventRecordID><Correlation/><Execution ProcessID='3792' ThreadID='44592'/><Channel>System</Channel><Computer>LAB-W11</Computer><Security UserID='S-1-5-21-61980266-902198588-2058873832-1001'/></System><UserData><LogFileCleared xmlns='http://manifests.microsoft.com/win/2004/08/windows/eventlog'><SubjectUserName>analyst</SubjectUserName><SubjectDomainName>LAB-W11</SubjectDomainName><Channel>OpenSSH/Operational</Channel><BackupPath>C:\Users\analyst\Documents\OpenSSH-backup-799.evtx</BackupPath><ClientProcessId>41684</ClientProcessId><ClientProcessStartKey>84161018036490963</ClientProcessStartKey></LogFileCleared></UserData></Event>";
+
+    /// The real Security 1102 from the same `ClearLog` run, 17 ms later.
+    const SECURITY_LOG_CLEARED_1102: &str = r"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Eventlog' Guid='{fc65ddd8-d6ef-4962-83d5-6e5cfe9ce148}'/><EventID>1102</EventID><Version>1</Version><Level>4</Level><Task>104</Task><Opcode>0</Opcode><Keywords>0x4020000000000000</Keywords><TimeCreated SystemTime='2026-10-15T12:50:01.7339239Z'/><EventRecordID>1399119</EventRecordID><Correlation/><Execution ProcessID='3792' ThreadID='47044'/><Channel>Security</Channel><Computer>LAB-W11</Computer><Security/></System><UserData><LogFileCleared xmlns='http://manifests.microsoft.com/win/2004/08/windows/eventlog'><SubjectUserSid>S-1-5-21-61980266-902198588-2058873832-1001</SubjectUserSid><SubjectUserName>analyst</SubjectUserName><SubjectDomainName>LAB-W11</SubjectDomainName><SubjectLogonId>0x37b4d</SubjectLogonId><ClientProcessId>41684</ClientProcessId><ClientProcessStartKey>84161018036490963</ClientProcessStartKey></LogFileCleared></UserData></Event>";
+
+    #[test]
+    fn a_real_104_names_the_cleared_channel_not_the_system_log() {
+        let block = split_event_blocks(LOG_FILE_CLEARED_104)[0];
+        let parsed = parse_log_cleared_event(block).expect("should parse");
+        assert_eq!(parsed.record_id, 78381);
+        assert_eq!(parsed.event_id, 104);
+        assert_eq!(parsed.pid, 3792);
+        assert_eq!(parsed.client_pid, Some(41684));
+        assert_eq!(
+            parsed.cleared_channel.as_deref(),
+            Some("OpenSSH/Operational")
+        );
+        // 104 has no SubjectUserSid: the header's Security UserID stands in.
+        assert_eq!(
+            parsed.subject_sid.as_deref(),
+            Some("S-1-5-21-61980266-902198588-2058873832-1001")
+        );
+        assert_eq!(parsed.subject_user_name.as_deref(), Some("analyst"));
+        assert_eq!(parsed.subject_domain_name.as_deref(), Some("LAB-W11"));
+        assert_eq!(parsed.subject_logon_id, None);
+        assert_eq!(
+            parsed.backup_path.as_deref(),
+            Some(r"C:\Users\analyst\Documents\OpenSSH-backup-799.evtx")
+        );
+        assert!(parsed.time_created_ns.is_some());
+    }
+
+    #[test]
+    fn a_real_1102_carries_the_clearing_sid_and_logon_session() {
+        let block = split_event_blocks(SECURITY_LOG_CLEARED_1102)[0];
+        let parsed = parse_log_cleared_event(block).expect("should parse");
+        assert_eq!(parsed.record_id, 1_399_119);
+        assert_eq!(parsed.event_id, 1102);
+        assert_eq!(parsed.client_pid, Some(41684));
+        assert_eq!(parsed.cleared_channel, None);
+        assert_eq!(
+            parsed.subject_sid.as_deref(),
+            Some("S-1-5-21-61980266-902198588-2058873832-1001")
+        );
+        assert_eq!(parsed.subject_logon_id.as_deref(), Some("0x37b4d"));
+        assert_eq!(parsed.backup_path, None);
     }
 }

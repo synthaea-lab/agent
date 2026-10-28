@@ -51,7 +51,10 @@ pub struct TransportConfig {
     /// Request timeout.
     pub request_timeout: Duration,
 
-    /// Interval between heartbeats.
+    /// Interval between heartbeats. **Not wired**: nothing in the agent reads this field. The
+    /// beacon's cadence is `agent::health::BeaconInterval` (30 s by default, shortened at run time
+    /// by a posture overlay, ADR-0035); changing this value changes nothing. Left in place rather
+    /// than removed so that no existing configuration that sets it is refused (#62).
     pub heartbeat_interval: Duration,
 
     /// Consecutive server-side rejections (5xx) on the same in-flight segment
@@ -164,6 +167,20 @@ impl TransportConfig {
         format!("{}/api/content/artifact", self.server_url)
     }
 
+    /// Returns the full URL for the signed common-set snapshot manifest (ADR-0033). Like the
+    /// release manifest it carries no path parameter: the tenant is the agent's mTLS identity's.
+    #[must_use]
+    pub fn snapshot_manifest_url(&self) -> String {
+        format!("{}/api/snapshot/manifest", self.server_url)
+    }
+
+    /// Returns the base URL for the common-set snapshot artifact (ADR-0033); a caller adds the
+    /// expected `sha256` as a query parameter via [`crate::TransportClient::get_bytes`].
+    #[must_use]
+    pub fn snapshot_artifact_url(&self) -> String {
+        format!("{}/api/snapshot/artifact", self.server_url)
+    }
+
     /// Returns the full URL for the signed binary-release manifest endpoint
     /// (ADR-0015, issue #30's update trigger). Unlike the content manifest it
     /// carries no ring in the path: which release an agent is offered is the
@@ -171,6 +188,14 @@ impl TransportConfig {
     #[must_use]
     pub fn release_manifest_url(&self) -> String {
         format!("{}/api/release/manifest", self.server_url)
+    }
+
+    /// Returns the full URL of the key-rotation manifest the control plane offers this agent
+    /// (ADR-0027): a manifest signed by the offline `recovery` key, or 404 when none is pending.
+    /// The control-plane side is a separate slice; the agent verifies whatever it is given.
+    #[must_use]
+    pub fn key_rotation_url(&self) -> String {
+        format!("{}/api/release/key-rotation", self.server_url)
     }
 
     /// Returns the base URL for the release artifact download endpoint. The
@@ -203,6 +228,19 @@ mod tests {
         assert_eq!(
             config.release_artifact_url(),
             "https://edr.example.com/api/release/artifact"
+        );
+    }
+
+    #[test]
+    fn the_snapshot_urls_carry_no_tenant_and_no_ring() {
+        let config = TransportConfig::new("https://edr.example.com");
+        assert_eq!(
+            config.snapshot_manifest_url(),
+            "https://edr.example.com/api/snapshot/manifest"
+        );
+        assert_eq!(
+            config.snapshot_artifact_url(),
+            "https://edr.example.com/api/snapshot/artifact"
         );
     }
 }

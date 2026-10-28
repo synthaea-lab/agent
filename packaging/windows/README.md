@@ -40,9 +40,19 @@ looks for it there.
 From the repo root, with a release build already on disk:
 
 ```powershell
-cargo build --release -p agent -p watchdog
+cargo build --release --no-default-features --features agent/dynamic-onnx -p agent -p watchdog
 .\packaging\windows\build.ps1
 ```
+
+`--no-default-features` is what keeps the public test signing key out of the MSI
+(ADR-0027, #753): the agent's default features include `test-key`, which embeds a key whose
+seed is in the repository, so anyone who can serve the release routes could sign for it.
+`--features agent/dynamic-onnx` puts back the one other default feature, so the MSI keeps
+the onnxruntime it ships with today. `build.ps1` scans `agent.exe` and `watchdog.exe` for the
+test-key marker and refuses to build the MSI if it finds it, so a plain
+`cargo build --release -p agent -p watchdog` (which has the test key) cannot be packaged by
+mistake. A lab that applies releases with a package needs its own build with the feature
+(`docs/operations/binary-releases.md`).
 
 Produces `packaging\windows\out\SynthaeaAgent.msi`.
 

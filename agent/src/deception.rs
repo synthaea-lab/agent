@@ -44,7 +44,7 @@ fn load_or_create_seed(state_dir: &Path) -> io::Result<Seed> {
     }
     fs::create_dir_all(deception_dir(state_dir))?;
     let mut bytes = [0u8; SEED_LEN];
-    getrandom::getrandom(&mut bytes).map_err(|e| io::Error::other(e.to_string()))?;
+    getrandom::fill(&mut bytes).map_err(|e| io::Error::other(e.to_string()))?;
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -62,6 +62,29 @@ pub(crate) struct ExecImage {
     /// The process incarnation (`process_generation`) that exec'd it, when the sensor stamps one.
     generation: Option<u64>,
     in_container: bool,
+    /// Sensor time of the `exec`, ns. An exec that happened after a touch says nothing about
+    /// who made the touch (#81 review): only one at or before it may excuse it.
+    timestamp_ns: u64,
+}
+
+impl ExecImage {
+    pub(crate) fn from_exec(exec: &schema::ExecEvent) -> Self {
+        Self {
+            path: exec.image_path.clone(),
+            generation: exec.meta.process_generation,
+            in_container: exec.meta.container.is_some(),
+            timestamp_ns: exec.meta.timestamp_ns,
+        }
+    }
+
+    pub(crate) fn timestamp_ns(&self) -> u64 {
+        self.timestamp_ns
+    }
+
+    /// Whether this is the image of an exec that happened at or before `not_after_ns`.
+    pub(crate) fn precedes(&self, not_after_ns: u64) -> bool {
+        self.timestamp_ns <= not_after_ns
+    }
 }
 
 /// Bounded `pid -> image` table fed by `Exec` events. Newest wins (a process that execs again
@@ -89,14 +112,7 @@ impl ExecImages {
 
     /// Records the image a process executed.
     pub(crate) fn record(&mut self, exec: &schema::ExecEvent) {
-        self.seen.insert(
-            exec.meta.pid,
-            ExecImage {
-                path: exec.image_path.clone(),
-                generation: exec.meta.process_generation,
-                in_container: exec.meta.container.is_some(),
-            },
-        );
+        self.seen.insert(exec.meta.pid, ExecImage::from_exec(exec));
     }
 
     /// The image `pid` was seen to execute, if it was and the entry is of this incarnation:
@@ -104,10 +120,23 @@ impl ExecImages {
     /// is not trusted (the caller falls back to `/proc`). A lookup refreshes the entry's
     /// recency: an allowed process that keeps touching canaries must not be evicted by the
     /// execs of everything else, which would make it look unknown again.
+    #[cfg(test)]
     pub(crate) fn image_of(&mut self, pid: u32, generation: Option<u64>) -> Option<ExecImage> {
+        self.image_of_not_after(pid, generation, u64::MAX)
+    }
+
+    /// The image `pid` was seen to execute, but only an exec at or before `not_after_ns` (the time of the touch
+    /// being judged) counts: the newest entry of a process that exec'd again *after* the touch
+    /// is not what made it, and its earlier image was replaced, so nothing is known.
+    pub(crate) fn image_of_not_after(
+        &mut self,
+        pid: u32,
+        generation: Option<u64>,
+        not_after_ns: u64,
+    ) -> Option<ExecImage> {
         let seen = self.seen.get(&pid)?;
         match (seen.generation, generation) {
-            (Some(a), Some(b)) if a == b => Some(seen.clone()),
+            (Some(a), Some(b)) if a == b && seen.precedes(not_after_ns) => Some(seen.clone()),
             _ => None,
         }
     }
@@ -195,13 +224,19 @@ impl CanaryAllow {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn in_foreign_mount_ns_for_test(mut self) -> Self {
+        self.foreign_mount_ns = |_| true;
+        self
+    }
+
     /// Whether nothing is allowed: the exec table has no use then, and the sink does not fill it.
     pub(crate) fn is_empty(&self) -> bool {
         self.exes.is_empty()
     }
 
     /// Whether the process `pid` runs an allowed executable. `seen` is what the agent recorded
-    /// when this incarnation of the pid executed ([`ExecImages::image_of`], already checked
+    /// when this incarnation of the pid executed ([`ExecImages::image_of_not_after`], already checked
     /// against the pid's incarnation), if anything; with none, the `/proc` route decides.
     /// The caller passes a clone and holds no lock: the `/proc` read below can be slow.
     pub(crate) fn allows(&self, pid: u32, seen: Option<&ExecImage>) -> bool {
@@ -221,7 +256,10 @@ impl CanaryAllow {
             // exec'd again and that event was shed or arrived late. `/proc`, where the agent can
             // read it, shows the image now: if it names something else the entry is stale and
             // the process is not allowed. Where `/proc` says nothing (no ptrace access) the
-            // table decides alone, and that residue is documented.
+            // table decides alone, and that residue is documented. The same weakness applies to a
+            // touch held for its `exec` and judged with no image: `/proc` is read when the hold
+            // ends, so a pid recycled inside the 500 ms by a process running an allowed image
+            // would excuse it (narrow: it needs a pid reuse inside the hold).
             // The string checks go first. A name the table does not list is not a refusal: the
             // exec may have gone through a link (`/bin/updatedb` under usrmerge, a `PATH` lookup)
             // that `/proc` canonicalises, so that process takes the `/proc` route below.
@@ -235,6 +273,20 @@ impl CanaryAllow {
             }
         }
         (self.resolve)(pid).is_some_and(|exe| self.exes.contains(&exe))
+    }
+
+    /// Whether `/proc` names an executable for `pid`: false for a process that already exited, a
+    /// container's or another user's the agent may not read. Lets the sink tell "not allowed"
+    /// from "nothing known yet".
+    pub(crate) fn proc_names_an_exe(&self, pid: u32) -> bool {
+        (self.resolve)(pid).is_some()
+    }
+
+    /// Whether `allows` refuses this process whatever arrives later: it runs in a container, or
+    /// positively in another mount namespace, so no image can excuse it. A touch by such a
+    /// process is not worth waiting for an `exec` (`allows` above, the same two conditions).
+    pub(crate) fn refuses_outright(&self, pid: u32, seen: Option<&ExecImage>) -> bool {
+        seen.is_some_and(|image| image.in_container) || (self.foreign_mount_ns)(pid)
     }
 
     /// An absolute image equal to an entry, resolved or as written. A relative exec
@@ -527,6 +579,7 @@ fn decoy_hashes_on_disk(canaries: &[deception::Canary], present: &[PathBuf]) -> 
                 path: canary.path.clone(),
                 kind: canary.kind,
                 content,
+                mtime_seed: canary.mtime_seed,
             })
         })
         .collect();
@@ -655,6 +708,31 @@ fn plant_each_directory(canaries: &[deception::Canary], inventory: &Path) -> Vec
                     skipped = report.skipped.len(),
                     "deception: canaries planted"
                 );
+                #[cfg(unix)]
+                if !report.planted.is_empty() || !report.unchanged.is_empty() {
+                    let canary_paths: Vec<PathBuf> = report
+                        .planted
+                        .iter()
+                        .chain(&report.unchanged)
+                        .cloned()
+                        .collect();
+                    if let Some(outcome) = match_canary_metadata(dir, &canary_paths) {
+                        let mut unmatched = Vec::new();
+                        if !outcome.owner_matched {
+                            unmatched.push("owner");
+                        }
+                        if !outcome.mode_matched {
+                            unmatched.push("mode");
+                        }
+                        if !unmatched.is_empty() {
+                            tracing::warn!(
+                                dir = %dir.display(),
+                                unmatched = %unmatched.join(", "),
+                                "deception: could not match canary metadata to neighboring files"
+                            );
+                        }
+                    }
+                }
                 present.extend(report.planted);
                 present.extend(report.unchanged);
             }
@@ -667,6 +745,75 @@ fn plant_each_directory(canaries: &[deception::Canary], inventory: &Path) -> Vec
         }
     }
     present
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CanaryMetadataOutcome {
+    owner_matched: bool,
+    mode_matched: bool,
+}
+
+/// Copies the directory's common ownership and permissions to its canaries. This is in the
+/// agent because the lifecycle crate stays platform-neutral. No regular neighbours means the
+/// canary defaults are left alone.
+#[cfg(unix)]
+fn match_canary_metadata(dir: &Path, canary_paths: &[PathBuf]) -> Option<CanaryMetadataOutcome> {
+    use std::{
+        collections::BTreeMap,
+        os::unix::fs::{MetadataExt as _, PermissionsExt as _},
+    };
+
+    let canaries: std::collections::HashSet<&Path> =
+        canary_paths.iter().map(PathBuf::as_path).collect();
+    let mut owners = BTreeMap::<(u32, u32), usize>::new();
+    let mut modes = BTreeMap::<u32, usize>::new();
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if canaries.contains(path.as_path()) || !entry.file_type().is_ok_and(|kind| kind.is_file())
+        {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        *owners.entry((metadata.uid(), metadata.gid())).or_default() += 1;
+        *modes.entry(metadata.mode() & 0o777).or_default() += 1;
+    }
+
+    let owner = owners.into_iter().max_by_key(|(_, count)| *count)?.0;
+    let mode = modes.into_iter().max_by_key(|(_, count)| *count)?.0;
+    let mut owner_matched = true;
+    let mut mode_matched = true;
+    for path in canary_paths {
+        let Ok(file) = fs::File::open(path) else {
+            owner_matched = false;
+            mode_matched = false;
+            continue;
+        };
+        if std::os::unix::fs::fchown(&file, Some(owner.0), Some(owner.1)).is_err() {
+            owner_matched = false;
+        }
+        // The agent verifies the canary contents after planting. Retain owner-read if the
+        // neighbours' common mode would otherwise make that verification impossible.
+        let readable_mode = mode | 0o400;
+        if readable_mode != mode {
+            mode_matched = false;
+        }
+        if file
+            .set_permissions(fs::Permissions::from_mode(readable_mode))
+            .is_err()
+        {
+            mode_matched = false;
+        }
+    }
+    Some(CanaryMetadataOutcome {
+        owner_matched,
+        mode_matched,
+    })
 }
 
 /// Removes canaries a previous run planted, when the operator no longer configures any.
@@ -727,6 +874,86 @@ mod tests {
         let tripwires = start(&config_for(&[dir.path()]), state.path()).unwrap();
         assert_eq!(tripwires.len(), Kind::ALL.len());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), Kind::ALL.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canary_metadata_uses_regular_neighbour_majorities_and_skips_links() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let majority_neighbour = dir.path().join("document-majority.txt");
+        let second_majority_neighbour = dir.path().join("document-majority-2.txt");
+        let minority_neighbour = dir.path().join("document-minority.txt");
+        let canary = dir.path().join("canary.txt");
+        let link_dir = tempfile::tempdir().unwrap();
+        let link_target = link_dir.path().join("link-target.txt");
+        let link = dir.path().join("linked-document.txt");
+        for neighbour in [&majority_neighbour, &second_majority_neighbour] {
+            fs::write(neighbour, "ordinary neighbour").unwrap();
+            fs::set_permissions(neighbour, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        fs::write(&minority_neighbour, "minority mode").unwrap();
+        fs::set_permissions(&minority_neighbour, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&link_target, "must not be sampled").unwrap();
+        fs::set_permissions(&link_target, fs::Permissions::from_mode(0o000)).unwrap();
+        std::os::unix::fs::symlink(&link_target, &link).unwrap();
+        fs::write(&canary, "canary contents").unwrap();
+        fs::set_permissions(&canary, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let target = fs::metadata(&majority_neighbour).unwrap();
+        let outcome = match_canary_metadata(dir.path(), std::slice::from_ref(&canary)).unwrap();
+        let actual = fs::metadata(&canary).unwrap();
+
+        assert_eq!(actual.uid(), target.uid());
+        assert_eq!(actual.gid(), target.gid());
+        assert_eq!(actual.mode() & 0o777, 0o640);
+        assert!(outcome.owner_matched);
+        assert!(outcome.mode_matched);
+        assert_eq!(fs::read_to_string(&canary).unwrap(), "canary contents");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canary_keeps_owner_read_when_neighbour_mode_would_hide_it_from_verification() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let neighbour = dir.path().join("private.txt");
+        let canary = dir.path().join("canary.txt");
+        fs::write(&neighbour, "private").unwrap();
+        fs::set_permissions(&neighbour, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::write(&canary, "still readable").unwrap();
+
+        let outcome = match_canary_metadata(dir.path(), std::slice::from_ref(&canary)).unwrap();
+
+        assert!(outcome.owner_matched);
+        assert!(
+            !outcome.mode_matched,
+            "the added owner-read bit is reported"
+        );
+        assert_eq!(
+            fs::metadata(&canary).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        assert_eq!(fs::read_to_string(&canary).unwrap(), "still readable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_regular_neighbours_leave_canary_metadata_unchanged() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let canary = dir.path().join("canary.txt");
+        fs::write(&canary, "defaults").unwrap();
+        fs::set_permissions(&canary, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(match_canary_metadata(dir.path(), std::slice::from_ref(&canary)).is_none());
+        assert_eq!(
+            fs::metadata(&canary).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

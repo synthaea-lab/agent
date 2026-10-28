@@ -8,35 +8,124 @@ use std::{
 };
 
 use schema::{
-    AuthEvent, AuthOutcome, ConnectEvent, Event, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
-    FileDeleteEvent, FileOpenEvent, FileQuarantineEvent, FileRenameEvent, FileWriteEvent,
-    ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT, SessionEvent, User,
+    AuthEvent, AuthKind, AuthOutcome, BitsJobEvent, BitsJobState, ConnectEvent, DnsQueryEvent,
+    Event, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FileDeleteEvent, FileOpenEvent,
+    FileQuarantineEvent, FileRenameEvent, FileWriteEvent, ListenPortEvent, MemfdCreateEvent,
+    NetworkFlowEvent, O_CREAT, POLICY_MECHANISM_APPLOCKER, POLICY_MECHANISM_SELINUX,
+    POLICY_MECHANISM_WDAC, PolicyDenialEvent, SessionEvent, SessionState, User,
     detection::Severity,
 };
 use store::BoundedMap;
 
 use crate::{
     Alert,
+    credfiles::{self, CredFile},
+    egressdomain::{self, DomainClass},
     exclusions::{
-        AGENT_CHILD_EXCLUSIONS, APK_STAGING_FILE_PREFIX, AUTH_FAILURE_THRESHOLD,
-        AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD, BEACON_WINDOW_NS, BROWSERS,
+        AGENT_CHILD_EXCLUSIONS, APK_STAGING_FILE_PREFIX, ARCHIVE_EGRESS_WINDOW_NS,
+        ARCHIVE_READ_WINDOW_NS, ARCHIVE_STAGED_BYTES, ARCHIVE_SUFFIXES, AUTH_FAILURE_THRESHOLD,
+        AUTH_FAILURE_WINDOW_NS, BEACON_THRESHOLD, BEACON_WINDOW_NS, BITS_EXEC_WINDOW_NS, BROWSERS,
         BURST_WRITE_BYTES_THRESHOLD, COMPRESSION_DRIVER_COMMS, COMPRESSION_SUFFIXES,
         COMPRESSOR_COMMS, CREATE_UNLINK_HISTORY_PER_PID, CREATE_UNLINK_PAIR_WINDOW_NS,
-        CREATE_UNLINK_PID_CAP, DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS, IN_PLACE_EDIT_COMMS,
-        LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS, MEMFD_EXEC_WINDOW_NS,
-        PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES, QUARANTINE_EXEC_WINDOW_NS,
+        CREATE_UNLINK_PID_CAP, CREDENTIAL_READ_ALERT_WINDOW_NS, DNS_CLASS_WINDOW_NS,
+        DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS, EGRESS_BYTES_THRESHOLD,
+        EGRESS_CLASSED_BYTES_THRESHOLD, EGRESS_DOMAIN_BROWSER_COMMS, EGRESS_WINDOW_NS,
+        IN_PLACE_EDIT_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS,
+        MEMFD_EXEC_WINDOW_NS, PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES,
+        POLICY_DENIAL_ALERT_CAP, POLICY_DENIAL_SUBJECT_CAP, QUARANTINE_EXEC_WINDOW_NS,
         RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD,
         RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
-        SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS,
-        SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS,
-        SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STANDARD_PORTS, SUSPECT_CHILDREN_WIN,
-        SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS, TOUCHED_FILES_PER_PID,
-        TOUCHED_FILES_PID_CAP,
+        SCAN_VERTICAL_THRESHOLD, SCAN_VERTICAL_WINDOW_NS, SELF_SPAWN_EXCLUSIONS,
+        SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD,
+        SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS,
+        SHELL_COMMS, STAGING_PID_CAP, STAGING_READ_DIRS, STAGING_READ_FILES, STAGING_WINDOW_NS,
+        STAGING_WRITE_FILES, STANDARD_PORTS, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN,
+        TASK_REGISTRATION_DEDUP_WINDOW_NS, TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
     },
     has_write_intent,
+    logon::{LogonBaseline, Observation},
+    rdp::RdpSuccessAfterFailures,
     session::SessionHijack,
+    signature_gate::SignatureGatedAlert,
     sliding::{FlowPortDedup, SlidingCounter, SlidingDistinct, SlidingSum},
+    staging::{self, StagingDir, StagingReads},
+    sudo::SudoSuccessAfterFailures,
 };
+
+/// One (comm, daddr) EGRESS-VOLUME entry: the bytes sent inside the window and when
+/// the last alert fired (one alert per window, as `SlidingCounter::try_alert`).
+#[derive(Default)]
+struct EgressVolume {
+    sum: SlidingSum,
+    last_alert_ns: Option<u64>,
+    /// The last EGRESS-DOMAIN alert for this entry, kept apart from `last_alert_ns` so that
+    /// one finding does not hide the other.
+    last_class_alert_ns: Option<u64>,
+}
+
+/// A storage or paste service a pid resolved, and the address its lookup returned
+/// (EGRESS-DOMAIN). Keyed by (pid, address) in `RuleState::dns_class`.
+struct DnsClassSighting {
+    generation: Option<u64>,
+    class: DomainClass,
+    /// The name the process asked for, kept for the alert message.
+    domain: String,
+    timestamp_ns: u64,
+}
+
+/// The archive a pid has open for writing (ARCHIVE-EXFIL).
+struct ArchiveWriter {
+    generation: Option<u64>,
+    path: String,
+    bytes: u64,
+}
+
+/// A staged archive a pid has read (ARCHIVE-EXFIL).
+struct ArchiveReader {
+    generation: Option<u64>,
+    path: String,
+    read_ns: u64,
+    alerted: bool,
+}
+
+/// False only when both generation stamps exist and differ: the same rule as
+/// [`PidFact::current`], a pid reused by another process must not inherit a fact.
+fn same_incarnation(recorded: Option<u64>, wanted: Option<u64>) -> bool {
+    !matches!((recorded, wanted), (Some(a), Some(b)) if a != b)
+}
+
+/// True when `path` ends in one of [`ARCHIVE_SUFFIXES`] (case-insensitive).
+fn is_archive_name(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    ARCHIVE_SUFFIXES
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+}
+
+/// True for an address a remote party can be at: not loopback, private, link-local,
+/// multicast, unspecified, or an IPv4 broadcast/unique-local equivalent.
+fn is_public_address(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                // 100.64.0.0/10, carrier-grade NAT (also Tailscale): an overlay, not the internet
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64))
+        }
+        IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_multicast()
+                || v6.is_unspecified()
+                // fc00::/7 unique-local, fe80::/10 link-local
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80)
+        }
+    }
+}
 
 struct RecentWrite {
     pid: u32,
@@ -50,6 +139,24 @@ struct RecentQuarantine {
     agent: Option<String>,
     origin_url: Option<String>,
     /// Set by the first exec that alerted: one alert per mark, not per run.
+    alerted: bool,
+}
+
+/// A file a BITS job downloads, as [`RuleState::on_bits_job`] saw it.
+struct RecentBitsDownload {
+    /// The job's latest file-added or completion time: the exec window runs
+    /// from when the file is actually there.
+    timestamp_ns: u64,
+    /// The job that armed this path.
+    job_id: String,
+    /// That job completed: the file is on disk, and no cancellation of
+    /// another job (or a late one of this job) removes it.
+    on_disk: bool,
+    client_pid: u32,
+    client_comm: String,
+    job_title: String,
+    url: String,
+    /// Set by the first exec that alerted: one alert per download, not per run.
     alerted: bool,
 }
 
@@ -78,7 +185,7 @@ struct ReportedTaskRegistration {
 /// the fact was recorded for ([`schema::EventMeta::process_generation`]); a lookup
 /// that names a different one misses. `None` on either side means "cannot tell" and
 /// reads as a match: an entry seeded at startup, or an event from a platform with no
-/// stamp (Windows, macOS), behaves exactly as before.
+/// stamp (macOS), behaves exactly as before.
 #[derive(Debug, Clone)]
 pub(crate) struct PidFact {
     generation: Option<u64>,
@@ -106,6 +213,39 @@ impl PidFact {
     }
 }
 
+/// `known_policy_denials`' key: (mechanism, subject context, object context, object
+/// class, action). Named so clippy's `type_complexity` lint doesn't flag the field
+/// declaration.
+type PolicyDenialKey = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// One subject type's alert budget for `check_policy_denial_drift` (#840).
+#[derive(Default)]
+struct PolicyDenialBudget {
+    /// Event time (`meta.timestamp_ns`) at which this subject's current window began; `None` until
+    /// its first new shape, so the window is anchored on that shape and not on the epoch.
+    window_start_ns: Option<u64>,
+    /// New-shape alerts raised in the window.
+    alerts: u64,
+    /// New shapes shed in the window: the warning that the cap was hit is logged when this is 0.
+    shed: u64,
+}
+
+/// The permission set of an AVC denial in canonical form for the dedup key: whitespace-separated
+/// permissions, sorted and deduplicated, so `read write`, `write read` and `read  write` are one
+/// shape. The wire value (`PolicyDenialEvent::action`) stays as the kernel wrote it.
+fn normalized_permissions(action: &str) -> String {
+    let mut permissions: Vec<&str> = action.split_whitespace().collect();
+    permissions.sort_unstable();
+    permissions.dedup();
+    permissions.join(" ")
+}
+
 /// Sliding history needed by the correlation rules:
 /// - T1105 (Ingress Tool Transfer): a path recently written by `curl`/`wget` is
 ///   executed shortly after. Correlated by path + time window rather than by a strict
@@ -114,7 +254,6 @@ impl PidFact {
 ///   child of `curl`/`wget`).
 /// - T1059 (suspicious process lineage): a shell interpreter executed directly by a
 ///   web server process — classic indicator of a web shell / RCE.
-///
 pub struct RuleState {
     /// pid → comm of the last exec seen for this pid, to recover the parent's comm
     /// (T1059) with a simple `ppid` lookup without having to walk the process tree in
@@ -135,6 +274,9 @@ pub struct RuleState {
     /// #365). LRU-bounded like `recent_writes`: a burst of downloads, or a
     /// hostile loop writing marks, must not grow agent memory.
     recent_quarantines: BoundedMap<String, RecentQuarantine>,
+    /// case-folded local path → the BITS job downloading it (T1197, #284).
+    /// LRU-bounded like `recent_quarantines`.
+    recent_bits_downloads: BoundedMap<String, RecentBitsDownload>,
     /// case-folded host path → its latest mark-of-the-web removal (T1553.005,
     /// #442). LRU-bounded: `Unblock-File` over a whole module tree removes
     /// hundreds of marks at once.
@@ -148,6 +290,54 @@ pub struct RuleState {
     /// [`FlowPortDedup`]'s doc); `on_connect`'s discrete syscall trace needs no
     /// dedup, each `ConnectEvent` already is one real connection attempt.
     beacon_flow_dedup: BoundedMap<(String, String, u16), FlowPortDedup>,
+    /// (pid, daddr) → distinct destination ports, for SCAN-VERTICAL (T1046, #378).
+    /// LRU-bounded.
+    scan_vertical: BoundedMap<(u32, IpAddr), SlidingDistinct<u16>>,
+    /// Lineage → the discovery commands it ran inside the window, for RECON-BURST
+    /// (T1057/T1082/T1016/T1087, #378). LRU-bounded.
+    recon_burst: BoundedMap<crate::recon::Lineage, crate::recon::ReconWindow>,
+    /// pid → the lineage its children belong to, for each one-shot shell wrapper
+    /// (`sh -c`, `cmd /c`) seen running. LRU-bounded.
+    recon_wrappers: BoundedMap<u32, crate::recon::Wrapper>,
+    /// (comm, daddr, dport, `local_port`) → the `bytes_sent` of the last poll of that
+    /// flow, for EGRESS-VOLUME (T1041/T1048, #380). Conntrack counters are cumulative
+    /// per flow, so only the difference between two polls is new volume. LRU-bounded.
+    egress_flow_last: BoundedMap<(String, IpAddr, u16, u16), u64>,
+    /// (comm, daddr) → bytes sent inside the sliding window, for EGRESS-VOLUME. The
+    /// key leaves the port out on purpose: an exfiltration split over many connections
+    /// to one host is the shape to catch. LRU-bounded.
+    egress_volume: BoundedMap<(String, IpAddr), EgressVolume>,
+    /// (pid, address) → the storage or paste service that pid resolved to that address, for
+    /// EGRESS-DOMAIN (T1567, #380). Only a lookup of a listed service is recorded, so the
+    /// history grows with those, not with all DNS; LRU-bounded like every other table.
+    dns_class: BoundedMap<(u32, IpAddr), DnsClassSighting>,
+    /// pid → the archive it opened for writing and the bytes it has written since, for
+    /// ARCHIVE-EXFIL (T1560/T1041, #380). `FileWriteEvent` carries no path, so the bytes
+    /// are everything the pid writes (any fd): an archiver's output dominates them, a
+    /// chatty process that also opens a `.gz` would overcount (a stated gap). LRU-bounded.
+    archive_writers: BoundedMap<u32, ArchiveWriter>,
+    /// Path of a staged archive → when it crossed [`ARCHIVE_STAGED_BYTES`]. LRU-bounded.
+    staged_archives: BoundedMap<String, u64>,
+    /// pid → the staged archive it read, until it connects out. LRU-bounded.
+    archive_readers: BoundedMap<u32, ArchiveReader>,
+    /// pid → the distinct user-data files it opened for reading, for STAGING-DIR (T1074.001,
+    /// #380). LRU-bounded by [`STAGING_PID_CAP`].
+    staging_reads: BoundedMap<u32, StagingReads>,
+    /// (pid, directory) → the distinct files the pid created there, for STAGING-DIR. Only
+    /// staging directories are recorded (see [`staging::staging_dir`]). LRU-bounded by
+    /// [`STAGING_PID_CAP`].
+    staging_dirs: BoundedMap<(u32, String), StagingDir>,
+    /// pid → the lineage it was exec'd under, for the rules that see a process later
+    /// (SSH-FANOUT reads it on the process's connects). LRU-bounded.
+    exec_lineage: BoundedMap<u32, crate::recon::ExecLineage>,
+    /// Lineage → distinct SSH destinations, for SSH-FANOUT (T1021.004, #378). LRU-bounded.
+    ssh_fanout: BoundedMap<crate::recon::Lineage, SlidingDistinct<IpAddr>>,
+    /// Lineage → distinct security-software discovery commands, for SECURITY-DISCOVERY
+    /// (T1518.001, #378). LRU-bounded.
+    security_discovery: BoundedMap<crate::recon::Lineage, SlidingDistinct<&'static str>>,
+    /// Lineage → distinct services it stopped, for SERVICE-STOP-BURST (T1489, #381).
+    /// LRU-bounded.
+    service_stop: BoundedMap<crate::recon::Lineage, SlidingDistinct<String>>,
     /// (pid, dport) → sliding distinct-destination counter for SCAN-SPREAD
     /// (T1046/T1210, issue #465). LRU-bounded.
     scan_spread: BoundedMap<(u32, u16), SlidingDistinct<IpAddr>>,
@@ -159,10 +349,74 @@ pub struct RuleState {
     /// listener space is a few dozen, not unbounded, but a hostile loop binding
     /// many ports must not grow this without limit either.
     known_listeners: BoundedMap<(IpAddr, u16), ()>,
+    /// (mechanism, subject context, object context, object class) → seen, for
+    /// POLICY-DENIAL-DRIFT (issue #774, T1562-adjacent). Same "first new shape
+    /// wins, the routine repeat doesn't" principle as `known_listeners` above:
+    /// a `SELinux`-Enforcing host denies constantly as part of normal
+    /// operation, so alerting on every `PolicyDenial` would be unusable — a
+    /// *new* (subject, object, class) triple appearing is the signal. No
+    /// startup-baseline seeding (unlike listeners, there's no enumerable
+    /// "current state" of past denials to snapshot at agent start) — the
+    /// first run is cold by design. LRU-bounded like every other stateful
+    /// rule.
+    ///
+    /// Includes the requested permission (`action`, #813, recovered by
+    /// `sensor-linux-audit`'s AVC parser): without it, a routine `getattr` denial on a
+    /// subject/object/class triple would silence a later, more interesting
+    /// `read`/`write`/`open` denial on that exact same triple. The set is normalised in
+    /// the key ([`normalized_permissions`]: sorted, deduplicated), so only a different
+    /// set is a new shape, not a different order.
+    ///
+    /// The key is per mechanism (#796). `SELinux`: `scontext`/`tcontext` give each denial a
+    /// rich, domain-specific triple. AppLocker/WDAC `PolicyDenialEvent`s carry no object
+    /// context, and `AppLocker` no subject either, so keying them like `SELinux` would collapse
+    /// to `object_class` (5 collections for `AppLocker`, 2 signing scenarios for WDAC): the first
+    /// blocked `.exe` would alert and every other one after it would not. They key on the
+    /// file instead: `AppLocker` (collection, path), WDAC (loading process, path, scenario),
+    /// with paths and process lowercased because Windows paths are case-insensitive and
+    /// `AppLocker` reports one file as `C:\Users\x\EVIL.EXE` (`FullFilePath`) or
+    /// `C:\USERS\X\EVIL.EXE` (an expanded `FilePath`).
+    known_policy_denials: BoundedMap<PolicyDenialKey, ()>,
+    /// Subject type (`user:role:type`, `None` for a denial with no subject context) → the new-shape
+    /// alerts `check_policy_denial_drift` has raised for it in its current budget window, against
+    /// [`POLICY_DENIAL_ALERT_CAP`] (#812, per subject since #840): `known_policy_denials` bounds
+    /// what the rule remembers, not what it alerts, so a flood of distinct shapes could otherwise
+    /// emit one alert per shape. One budget per subject, so a noisy domain (`httpd_t` probing 512
+    /// types) cannot spend another's. LRU-bounded by [`POLICY_DENIAL_SUBJECT_CAP`]; a subject
+    /// forgotten by eviction starts a fresh budget (counted, logged).
+    policy_denial_budgets: BoundedMap<Option<String>, PolicyDenialBudget>,
+    /// `policy_denial_budgets.evicted()` last reported, so each rise is logged once.
+    policy_denial_budget_evictions_reported: u64,
+    /// New-shape events shed by [`POLICY_DENIAL_ALERT_CAP`] over the whole run, all subjects — counted
+    /// instead of silent (#812). A shed shape is *not* remembered in
+    /// `known_policy_denials`, so it is still new when it comes back: it can alert in a
+    /// later budget window, and every event for it while the budget is spent counts
+    /// again (this counts events, not distinct shapes).
+    policy_denial_alerts_shed: u64,
+    /// `known_policy_denials.evicted()` last reported, so each rise is logged once
+    /// (#812): otherwise `known_policy_denials` evicting its oldest eighth at
+    /// `COUNTER_CAP` (never a full clear — only the evicted entries can re-alert) and a
+    /// shape re-alerting is silent loss (CLAUDE.md: counted, observable shedding).
+    policy_denial_evictions_reported: u64,
     /// (target user, source) → sliding failure counter for T1110 (AUTH-BURST).
     /// LRU-bounded like every other counter: a spray across many fabricated
     /// usernames must not grow this without limit.
     auth_failures: BoundedMap<(String, String), SlidingCounter>,
+    /// The accounts seen logging on, for FIRST-SEEN-LOGON (T1078, #376). LRU-bounded.
+    logon_baseline: LogonBaseline,
+    /// RDP authentication successes joined to the failures from the same address,
+    /// by event time (T1021.001, #285); see the `rdp` module.
+    rdp_success: RdpSuccessAfterFailures,
+    /// Local privilege-escalation successes (`sudo`/`su`) joined to the
+    /// authentication failures for the same account, by event time (#381,
+    /// T1548.003 for `sudo` / T1110.001 for `su`) — "same account" means the
+    /// same invoker uid for `sudo`, the same target name for `su`; see the
+    /// `sudo` module's own doc for why they differ.
+    sudo_success: SudoSuccessAfterFailures,
+    /// (pid, kind of credential file) → the last alert, for CREDENTIAL-READ (T1003.008,
+    /// T1552, #377): one alert per window, not one per open. LRU-bounded like every other
+    /// counter.
+    credential_reads: BoundedMap<(u32, CredFile), SlidingCounter>,
     /// pid → sliding counter for RANSOMWARE-RENAME (T1486, issue #262): renames by
     /// this pid where `new_path` is `old_path` plus an appended suffix. LRU-bounded:
     /// a hostile process renaming under many different pids (unusual, but not
@@ -263,7 +517,7 @@ const MEMFD_CREATES_PER_PID: usize = 8;
 /// Same bound as the correlator's entity table: the realistic live-pid space.
 const PID_COMM_CAP: usize = 65_536;
 /// Counter/write-history bounds — one logical entity per key, far fewer than pids.
-const COUNTER_CAP: usize = 16_384;
+pub(crate) const COUNTER_CAP: usize = 16_384;
 const RECENT_WRITES_CAP: usize = 4_096;
 
 impl Default for RuleState {
@@ -280,18 +534,43 @@ impl RuleState {
             pid_image_path: BoundedMap::new(PID_COMM_CAP),
             recent_writes: BoundedMap::new(RECENT_WRITES_CAP),
             recent_quarantines: BoundedMap::new(RECENT_WRITES_CAP),
+            recent_bits_downloads: BoundedMap::new(RECENT_WRITES_CAP),
             recent_motw_removals: BoundedMap::new(RECENT_WRITES_CAP),
             self_spawn: BoundedMap::new(COUNTER_CAP),
             ldap_burst: crate::ldap::LdapBurst::new(),
             beacon: BoundedMap::new(COUNTER_CAP),
             beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
+            egress_flow_last: BoundedMap::new(COUNTER_CAP),
+            egress_volume: BoundedMap::new(COUNTER_CAP),
+            dns_class: BoundedMap::new(COUNTER_CAP),
+            archive_writers: BoundedMap::new(COUNTER_CAP),
+            staged_archives: BoundedMap::new(COUNTER_CAP),
+            archive_readers: BoundedMap::new(COUNTER_CAP),
+            staging_reads: BoundedMap::new(STAGING_PID_CAP),
+            staging_dirs: BoundedMap::new(STAGING_PID_CAP),
             scan_spread: BoundedMap::new(COUNTER_CAP),
+            scan_vertical: BoundedMap::new(COUNTER_CAP),
+            recon_burst: BoundedMap::new(COUNTER_CAP),
+            recon_wrappers: BoundedMap::new(COUNTER_CAP),
+            exec_lineage: BoundedMap::new(PID_COMM_CAP),
+            ssh_fanout: BoundedMap::new(COUNTER_CAP),
+            security_discovery: BoundedMap::new(COUNTER_CAP),
+            service_stop: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
+            known_policy_denials: BoundedMap::new(COUNTER_CAP),
+            policy_denial_budgets: BoundedMap::new(POLICY_DENIAL_SUBJECT_CAP),
+            policy_denial_budget_evictions_reported: 0,
+            policy_denial_alerts_shed: 0,
+            policy_denial_evictions_reported: 0,
             auth_failures: BoundedMap::new(COUNTER_CAP),
+            logon_baseline: LogonBaseline::new(),
+            rdp_success: RdpSuccessAfterFailures::new(),
+            sudo_success: SudoSuccessAfterFailures::new(),
             recent_creates: BoundedMap::new(CREATE_UNLINK_PID_CAP),
             pending_unlinks: BoundedMap::new(CREATE_UNLINK_PID_CAP),
             touched_files: BoundedMap::new(TOUCHED_FILES_PID_CAP),
             ransomware_unlink: BoundedMap::new(COUNTER_CAP),
+            credential_reads: BoundedMap::new(COUNTER_CAP),
             ransomware_rename: BoundedMap::new(COUNTER_CAP),
             ransomware_rename_by_ppid: BoundedMap::new(COUNTER_CAP),
             write_volume: BoundedMap::new(COUNTER_CAP),
@@ -501,7 +780,12 @@ impl RuleState {
     /// (`powershell -File x.ps1`, `sh x.sh`) has the interpreter as its image
     /// path and does not join; T1105's comm-based match has the same shape of
     /// limit on Linux.
-    fn check_quarantined_exec(&mut self, event: &ExecEvent) -> Option<Alert> {
+    ///
+    /// Gated on the image's signature (#441): every installer a user downloads
+    /// and runs matches the join, and almost all of them are signed. The
+    /// signature is only known after enrichment, off the capture thread, so this
+    /// returns a [`SignatureGatedAlert`] (see [`Self::on_exec_signature_gated`]).
+    fn check_quarantined_exec(&mut self, event: &ExecEvent) -> Option<SignatureGatedAlert> {
         let now = event.meta.timestamp_ns;
         let mark = self
             .recent_quarantines
@@ -511,7 +795,7 @@ impl RuleState {
             return None;
         }
         mark.alerted = true;
-        Some(Alert {
+        Some(SignatureGatedAlert::new(Alert {
             technique: "T1204.002",
             severity: Severity::High,
             message: format!(
@@ -522,6 +806,50 @@ impl RuleState {
                 format_delta(age),
                 mark.origin_url.as_deref().unwrap_or("unrecorded"),
                 mark.agent.as_deref().unwrap_or("unknown"),
+            ),
+        }))
+    }
+
+    /// T1197 — BITS Jobs. A file a BITS job downloaded is executed within
+    /// [`BITS_EXEC_WINDOW_NS`] of the job adding it or completing (#284). BITS
+    /// does the download from its own service, so neither the T1105 joins
+    /// (keyed on the downloading comm) nor the correlator's connect+write
+    /// rule (keyed on one pid) can see it; the job record is what names the
+    /// client.
+    ///
+    /// One alert per download (`alerted`), case-folded paths. Files fetched
+    /// from Microsoft update hosts are filtered at the sensor and never reach
+    /// this table; the job's owner is not a filter.
+    ///
+    /// Not covered: notify-command persistence (`bitsadmin /SetNotifyCmdLine`)
+    /// is no job state the provider reports, so its set-up shows only as the
+    /// `bitsadmin` command line. The file it runs, when BITS downloaded it,
+    /// still joins here.
+    fn check_bits_download_exec(&mut self, event: &ExecEvent) -> Option<Alert> {
+        let now = event.meta.timestamp_ns;
+        let download = self
+            .recent_bits_downloads
+            .get_mut(&event.image_path.to_lowercase())?;
+        let age = now.saturating_sub(download.timestamp_ns);
+        if download.alerted || age > BITS_EXEC_WINDOW_NS {
+            return None;
+        }
+        download.alerted = true;
+        Some(Alert {
+            technique: "T1197",
+            // Below T1105/T1204.002: non-Microsoft updaters (Google Omaha,
+            // OneDrive) download through BITS and run what they fetched.
+            severity: Severity::Medium,
+            message: format!(
+                "pid={} comm={} executes {}, downloaded {} earlier by BITS job \"{}\" of pid={} comm={} (url: {})",
+                event.meta.pid,
+                event.meta.comm,
+                event.image_path,
+                format_delta(age),
+                download.job_title,
+                download.client_pid,
+                download.client_comm,
+                download.url,
             ),
         })
     }
@@ -819,6 +1147,37 @@ impl RuleState {
         None
     }
 
+    /// SCAN-VERTICAL (T1046, #378): many distinct ports on one host from one pid in a short
+    /// window, the vertical mirror of [`Self::check_scan_spread`] (many hosts, one port). A
+    /// TCP connect scan of a target; the horizontal rule cannot see it, as it keys on the
+    /// port. Loopback destinations are not counted (see [`SCAN_VERTICAL_THRESHOLD`]). Only
+    /// pid 4 (Windows System) is excluded, as in SCAN-SPREAD.
+    fn check_scan_vertical(&mut self, event: &ConnectEvent) -> Option<Alert> {
+        if event.meta.pid == 4 || event.daddr.is_loopback() || event.daddr.is_unspecified() {
+            return None;
+        }
+        let ts = event.meta.timestamp_ns;
+        let entry = self
+            .scan_vertical
+            .get_or_insert_with((event.meta.pid, event.daddr), SlidingDistinct::default);
+        let distinct = entry.record(event.dport, ts, SCAN_VERTICAL_WINDOW_NS);
+        if distinct >= SCAN_VERTICAL_THRESHOLD && entry.try_alert(ts, SCAN_VERTICAL_WINDOW_NS) {
+            return Some(Alert {
+                technique: "T1046",
+                severity: Severity::Medium,
+                message: format!(
+                    "pid={} comm={} contacted {distinct} distinct ports on {} in {}s — \
+                     suspected port scan",
+                    event.meta.pid,
+                    event.meta.comm,
+                    event.daddr,
+                    SCAN_VERTICAL_WINDOW_NS / 1_000_000_000,
+                ),
+            });
+        }
+        None
+    }
+
     /// T1071/T1041 via conntrack polling (issue #92) — same rule as
     /// [`Self::check_beacon`], fed by a periodic flow snapshot instead of a discrete
     /// `connect()` trace. This is the "probe-free" source `sensor-linux-netlink`
@@ -858,6 +1217,198 @@ impl RuleState {
         )
     }
 
+    /// The lineage this exec belongs to (see [`crate::recon`]): the parent, or the parent of a
+    /// one-shot wrapper the parent is. Records a wrapper's own lineage for its children and
+    /// this process's lineage for the rules that see it later.
+    fn record_lineage(&mut self, event: &ExecEvent) -> crate::recon::Lineage {
+        use crate::recon::{self, ExecLineage, Wrapper};
+
+        let ppid = event.meta.ppid;
+        let lineage = Wrapper::lineage_for(
+            self.recon_wrappers.peek(&ppid),
+            event.meta.parent_process_generation,
+        )
+        .unwrap_or((ppid, event.meta.parent_process_generation));
+        if recon::is_one_shot_wrapper(event) {
+            self.recon_wrappers.insert(
+                event.meta.pid,
+                Wrapper {
+                    generation: event.meta.process_generation,
+                    lineage,
+                },
+            );
+        }
+        self.exec_lineage.insert(
+            event.meta.pid,
+            ExecLineage {
+                generation: event.meta.process_generation,
+                lineage,
+            },
+        );
+        lineage
+    }
+
+    /// RECON-BURST (T1057/T1082/T1016/T1087, #378): six distinct discovery commands
+    /// across three categories from one lineage in 30 s. See [`crate::recon`] for what
+    /// counts, what a lineage is, and the false positives accepted.
+    fn check_recon_burst(
+        &mut self,
+        event: &ExecEvent,
+        lineage: crate::recon::Lineage,
+    ) -> Option<Alert> {
+        use crate::recon;
+
+        let (command, category) = recon::discovery(event)?;
+        let burst = self
+            .recon_burst
+            .get_or_insert_with(lineage, recon::ReconWindow::default)
+            .record(command, category, event.meta.timestamp_ns)?;
+        Some(Alert {
+            technique: recon::RECON_BURST_TECHNIQUE,
+            severity: Severity::Low,
+            message: format!(
+                "pid={} comm={}: lineage of pid={} ran {} distinct discovery commands ({}) \
+                 across {} categories in {}s — reconnaissance, by hand or by script",
+                event.meta.pid,
+                event.meta.comm,
+                lineage.0,
+                burst.commands.len(),
+                burst.commands.join(", "),
+                burst.categories,
+                recon::RECON_BURST_WINDOW_NS / 1_000_000_000,
+            ),
+        })
+    }
+
+    /// SECURITY-DISCOVERY (T1518.001, #378): three distinct security-software discovery
+    /// commands from one lineage in 60 s: the posture questions (`getenforce`, `csrutil
+    /// status`, `Get-MpComputerStatus`, `netsh advfirewall show`, `fltmc`) and lookups of a
+    /// named security product (`ps | grep falcon`, `sc query windefend`). One command is
+    /// what a hardening check does; three different ones in a minute is a host being sized
+    /// up. Low: compliance scanners (`OpenSCAP`, lynis, Qualys-style audits) run the same set.
+    fn check_security_discovery(
+        &mut self,
+        event: &ExecEvent,
+        lineage: crate::recon::Lineage,
+    ) -> Option<Alert> {
+        use crate::recon::{SECURITY_DISCOVERY_THRESHOLD, SECURITY_DISCOVERY_WINDOW_NS};
+
+        let label = crate::recon::security_discovery(event)?;
+        let ts = event.meta.timestamp_ns;
+        let entry = self
+            .security_discovery
+            .get_or_insert_with(lineage, SlidingDistinct::default);
+        let distinct = entry.record(label, ts, SECURITY_DISCOVERY_WINDOW_NS);
+        if distinct >= SECURITY_DISCOVERY_THRESHOLD
+            && entry.try_alert(ts, SECURITY_DISCOVERY_WINDOW_NS)
+        {
+            let seen: Vec<&str> = entry.values().copied().collect();
+            return Some(Alert {
+                technique: "T1518.001",
+                severity: Severity::Low,
+                message: format!(
+                    "pid={} comm={}: lineage of pid={} ran {distinct} distinct security-software \
+                     discovery commands ({}) in {}s — the host's defences being sized up",
+                    event.meta.pid,
+                    event.meta.comm,
+                    lineage.0,
+                    seen.join(", "),
+                    SECURITY_DISCOVERY_WINDOW_NS / 1_000_000_000,
+                ),
+            });
+        }
+        None
+    }
+
+    /// SERVICE-STOP-BURST (T1489, #381): five distinct services stopped from one lineage in
+    /// 60 s, the pre-ransomware tell. An exec that names several services (`systemctl stop a
+    /// b c`, `Stop-Service a,b,c`) counts each. See [`crate::servicestop`] for what counts and
+    /// the false positives accepted. Medium. Not joined to the ransomware reflex or the
+    /// damage manifest, which consume T1486 alerts only.
+    fn check_service_stop_burst(
+        &mut self,
+        event: &ExecEvent,
+        lineage: crate::recon::Lineage,
+    ) -> Option<Alert> {
+        use crate::servicestop::{SERVICE_STOP_THRESHOLD, SERVICE_STOP_WINDOW_NS};
+
+        let stopped = crate::servicestop::services_stopped(event);
+        if stopped.is_empty() {
+            return None;
+        }
+        let ts = event.meta.timestamp_ns;
+        let entry = self
+            .service_stop
+            .get_or_insert_with(lineage, SlidingDistinct::default);
+        let mut distinct = 0;
+        for name in stopped {
+            distinct = entry.record(name, ts, SERVICE_STOP_WINDOW_NS);
+        }
+        if distinct >= SERVICE_STOP_THRESHOLD && entry.try_alert(ts, SERVICE_STOP_WINDOW_NS) {
+            let seen: Vec<&str> = entry.values().map(String::as_str).take(12).collect();
+            return Some(Alert {
+                technique: "T1489",
+                severity: Severity::Medium,
+                message: format!(
+                    "pid={} comm={}: lineage of pid={} stopped {distinct} distinct services ({}{}) \
+                     in {}s — the services a ransomware run stops first, or a maintenance window",
+                    event.meta.pid,
+                    event.meta.comm,
+                    lineage.0,
+                    seen.join(", "),
+                    if distinct as usize > seen.len() {
+                        ", ..."
+                    } else {
+                        ""
+                    },
+                    SERVICE_STOP_WINDOW_NS / 1_000_000_000,
+                ),
+            });
+        }
+        None
+    }
+
+    /// SSH-FANOUT (T1021.004, #378): outbound SSH to eight distinct hosts from one lineage in
+    /// 60 s. The lineage is the one the connecting process was exec'd under, so a loop that
+    /// runs `ssh host cmd` per host (one process, one connect each) adds up where a per-pid
+    /// counter such as SCAN-SPREAD sees one connection per process. Whether the lineage is
+    /// interactive is not observable here, so a human typing eight `ssh` commands in a
+    /// minute is indistinguishable from a script; what fires in practice is `pssh` and
+    /// similar fleet tools run from one shell, the accepted cost. Loopback is not counted.
+    /// A process the rules never saw exec'd (started before the agent) has no lineage and is
+    /// not counted.
+    fn check_ssh_fanout(&mut self, event: &ConnectEvent) -> Option<Alert> {
+        use crate::recon::{ExecLineage, SSH_FANOUT_THRESHOLD, SSH_FANOUT_WINDOW_NS, SSH_PORT};
+
+        if event.dport != SSH_PORT || event.daddr.is_loopback() || event.daddr.is_unspecified() {
+            return None;
+        }
+        let lineage = ExecLineage::current(
+            self.exec_lineage.peek(&event.meta.pid),
+            event.meta.process_generation,
+        )?;
+        let ts = event.meta.timestamp_ns;
+        let entry = self
+            .ssh_fanout
+            .get_or_insert_with(lineage, SlidingDistinct::default);
+        let distinct = entry.record(event.daddr, ts, SSH_FANOUT_WINDOW_NS);
+        if distinct >= SSH_FANOUT_THRESHOLD && entry.try_alert(ts, SSH_FANOUT_WINDOW_NS) {
+            return Some(Alert {
+                technique: "T1021.004",
+                severity: Severity::Medium,
+                message: format!(
+                    "pid={} comm={}: lineage of pid={} opened SSH sessions to {distinct} distinct \
+                     hosts in {}s — lateral movement by script, or a fleet tool run from one shell",
+                    event.meta.pid,
+                    event.meta.comm,
+                    lineage.0,
+                    SSH_FANOUT_WINDOW_NS / 1_000_000_000,
+                ),
+            });
+        }
+        None
+    }
+
     /// To be called for every `ExecEvent` in the stream, in chronological order.
     /// Updates the state (pid→comm table) after evaluation, so a process cannot match
     /// itself.
@@ -865,12 +1416,16 @@ impl RuleState {
         let mut alerts = Vec::new();
         alerts.extend(self.check_web_server_spawns_shell(event));
         alerts.extend(self.check_download_then_exec(event));
-        alerts.extend(self.check_quarantined_exec(event));
+        alerts.extend(self.check_bits_download_exec(event));
         alerts.extend(self.check_exec_after_motw_removal(event));
         alerts.extend(self.check_self_spawn(event));
         alerts.extend(self.check_parent_suspect(event));
         alerts.extend(self.check_lolbin(event));
         alerts.extend(self.check_memfd_exec(event));
+        let lineage = self.record_lineage(event);
+        alerts.extend(self.check_recon_burst(event, lineage));
+        alerts.extend(self.check_security_discovery(event, lineage));
+        alerts.extend(self.check_service_stop_burst(event, lineage));
         alerts.extend(crate::stateless::check_ld_preload_hijack(
             event,
             &self.ld_trust_extra,
@@ -888,17 +1443,292 @@ impl RuleState {
         alerts
     }
 
+    /// The exec findings that wait for the image's signature (#441): today
+    /// T1204.002, a downloaded file run within the mark window. To be called
+    /// for every `ExecEvent`, beside [`Self::on_exec`]. The
+    /// caller resolves each with the enrichment's verdict, or calls
+    /// [`SignatureGatedAlert::unverified`] when it cannot wait for one.
+    pub fn on_exec_signature_gated(&mut self, event: &ExecEvent) -> Option<SignatureGatedAlert> {
+        self.check_quarantined_exec(event)
+    }
+
     /// To be called for every `ConnectEvent` in the stream (mainly Windows ETW).
     pub fn on_connect(&mut self, event: &ConnectEvent) -> Vec<Alert> {
         let mut alerts: Vec<Alert> = self.check_beacon(event).into_iter().collect();
         alerts.extend(self.check_scan_spread(event));
+        alerts.extend(self.check_scan_vertical(event));
+        alerts.extend(self.check_archive_egress(&event.meta, event.daddr));
+        alerts.extend(self.check_ssh_fanout(event));
         alerts
     }
 
     /// To be called for every `NetworkFlowEvent` in the stream (Linux conntrack
     /// polling, issue #92) — see [`Self::check_beacon_flow`].
     pub fn on_network_flow(&mut self, event: &NetworkFlowEvent) -> Vec<Alert> {
-        self.check_beacon_flow(event).into_iter().collect()
+        let mut alerts: Vec<Alert> = self.check_beacon_flow(event).into_iter().collect();
+        alerts.extend(self.check_egress_volume(event));
+        alerts.extend(self.check_archive_egress(&event.meta, event.daddr));
+        alerts
+    }
+
+    /// To be called for every `DnsQueryEvent` in the stream (the Linux `getaddrinfo` probe,
+    /// opt-in; the Windows DNS-Client provider; the macOS network extension). Never alerts: it
+    /// remembers that this pid resolved a listed storage or paste service to these addresses, for
+    /// [`Self::check_egress_volume`] to join with the volume it later sends there.
+    pub fn on_dns_query(&mut self, event: &DnsQueryEvent) {
+        let Some(class) = egressdomain::classify_domain(&event.query) else {
+            return;
+        };
+        if event.status != 0 {
+            return;
+        }
+        let Some(result) = event.result.as_deref() else {
+            return;
+        };
+        for address in egressdomain::resolved_addresses(result) {
+            self.dns_class.insert(
+                (event.meta.pid, address),
+                DnsClassSighting {
+                    generation: event.meta.process_generation,
+                    class,
+                    domain: event.query.to_ascii_lowercase(),
+                    timestamp_ns: event.meta.timestamp_ns,
+                },
+            );
+        }
+    }
+
+    /// ARCHIVE-EXFIL, first link: a pid that opens an archive-named file for writing starts
+    /// counting its written bytes; a pid that opens a **staged** archive (see
+    /// [`Self::record_archive_write`]) without write intent, within [`ARCHIVE_READ_WINDOW_NS`]
+    /// of its staging, becomes a reader waiting for a connection. The writer itself is not a
+    /// reader: extracting what it just wrote is not a hand-off.
+    fn record_archive_open(&mut self, event: &FileOpenEvent) {
+        let pid = event.meta.pid;
+        let ts = event.meta.timestamp_ns;
+        if has_write_intent(event.flags) {
+            if is_archive_name(&event.path) {
+                // A new write open of the path starts a new archive: a staging from an
+                // earlier run (a nightly job rewriting `home.tar.gz`) must not outlive it,
+                // or the read window would be measured from the first night forever.
+                self.staged_archives.remove(&event.path);
+                self.archive_writers.insert(
+                    pid,
+                    ArchiveWriter {
+                        generation: event.meta.process_generation,
+                        path: event.path.clone(),
+                        bytes: 0,
+                    },
+                );
+            }
+            return;
+        }
+        let Some(&staged_ns) = self.staged_archives.peek(&event.path) else {
+            return;
+        };
+        if ts.saturating_sub(staged_ns) > ARCHIVE_READ_WINDOW_NS {
+            return;
+        }
+        if self.archive_writers.peek(&pid).is_some_and(|w| {
+            w.path == event.path && same_incarnation(w.generation, event.meta.process_generation)
+        }) {
+            return;
+        }
+        self.archive_readers.insert(
+            pid,
+            ArchiveReader {
+                generation: event.meta.process_generation,
+                path: event.path.clone(),
+                read_ns: ts,
+                alerted: false,
+            },
+        );
+    }
+
+    /// ARCHIVE-EXFIL, second link: the bytes the writer pid writes after opening the archive.
+    /// Crossing [`ARCHIVE_STAGED_BYTES`] stages it, once.
+    fn record_archive_write(&mut self, event: &FileWriteEvent) {
+        let Some(writer) = self.archive_writers.get_mut(&event.meta.pid) else {
+            return;
+        };
+        if !same_incarnation(writer.generation, event.meta.process_generation) {
+            return;
+        }
+        writer.bytes = writer.bytes.saturating_add(event.bytes_requested);
+        if writer.bytes >= ARCHIVE_STAGED_BYTES {
+            // The staging time is the last write past the threshold, not the first: a job
+            // that keeps writing for hours is finished when it stops, and the read window
+            // counts from there.
+            let path = writer.path.clone();
+            self.staged_archives.insert(path, event.meta.timestamp_ns);
+        }
+    }
+
+    /// ARCHIVE-EXFIL (T1560/T1041, #380) — the chain: a pid wrote an archive of at least
+    /// [`ARCHIVE_STAGED_BYTES`], **another** pid read that file, and that reader then
+    /// connected to a public address within [`ARCHIVE_EGRESS_WINDOW_NS`]. One alert per
+    /// reader. Medium, not higher: a backup job that archives and then uploads to an object
+    /// store is exactly this shape, and no allowlist of such jobs exists yet (it needs a
+    /// lab capture of the host's own backups). Gaps, stated: a stream that never touches a
+    /// file (`tar | ssh`), an archive named without one of [`ARCHIVE_SUFFIXES`], and a
+    /// sender that is not the reader (a file handed over by a pipe or a copy).
+    ///
+    /// False positives beyond the backup job, from the shape itself: the reader is any
+    /// process that opens the file without write intent, and any public connection from that
+    /// pid inside the window completes the chain, with no link between the bytes read and the
+    /// destination. A long-lived daemon (an antivirus scanner, an indexer, a sync client) that
+    /// touches the archive and later makes an unrelated connection alerts. Open, connect and
+    /// flow events arrive from separate rings, so a connection stamped just before the open
+    /// can be ordered after it; the window absorbs that.
+    fn check_archive_egress(&mut self, meta: &schema::EventMeta, daddr: IpAddr) -> Option<Alert> {
+        if !is_public_address(daddr) {
+            return None;
+        }
+        let reader = self.archive_readers.get_mut(&meta.pid)?;
+        if reader.alerted
+            || !same_incarnation(reader.generation, meta.process_generation)
+            || meta.timestamp_ns.saturating_sub(reader.read_ns) > ARCHIVE_EGRESS_WINDOW_NS
+        {
+            return None;
+        }
+        reader.alerted = true;
+        Some(Alert {
+            technique: "T1560/T1041",
+            severity: Severity::Medium,
+            message: format!(
+                "pid={} comm={} read the staged archive {} and connected to {}",
+                meta.pid, meta.comm, reader.path, daddr,
+            ),
+        })
+    }
+
+    /// EGRESS-VOLUME (T1041/T1048, #380) — a process name that sends more than
+    /// [`EGRESS_BYTES_THRESHOLD`] to one public address inside
+    /// [`EGRESS_WINDOW_NS`], summed over all its connections to that address.
+    ///
+    /// Conntrack counters are cumulative per flow and a poll-based source re-reports
+    /// a live flow every cycle, so the volume of one poll is the difference with the
+    /// previous poll of the same flow. **The first poll of a flow only sets its
+    /// baseline** and adds nothing: a flow already open when the agent started carries
+    /// the history of its whole life, and counting it would alert on any long SSH or
+    /// backup session at startup. The cost is named: a transfer that starts and ends
+    /// between two polls of a brand-new flow is not counted; a sustained one is, from
+    /// its second poll.
+    ///
+    /// Inert without volume data: `bytes_sent` is `None` unless the host enabled
+    /// `net.netfilter.nf_conntrack_acct` (off by default, see [`NetworkFlowEvent`]), so
+    /// silence here does not mean nothing was sent. Private, loopback, link-local,
+    /// multicast and unspecified peers are excluded: a backup to the local network is
+    /// not the signal this rule looks for. No name exclusion list yet, for the reason
+    /// given at [`EGRESS_BYTES_THRESHOLD`].
+    ///
+    /// **EGRESS-DOMAIN (T1567, #380)** reads the same sum. When the pid itself resolved a listed
+    /// storage or paste service to this address ([`Self::on_dns_query`],
+    /// [`Self::resolved_service`]), the lower [`EGRESS_CLASSED_BYTES_THRESHOLD`] applies and the
+    /// alert names the technique of the class (T1567.002 or T1567.003) and the domain. It is
+    /// **dormant on a default host**: it needs `nf_conntrack_acct` for the volume *and* a DNS
+    /// source for the lookup (the Linux `getaddrinfo` probe is opt-in, `UprobesConfig::with_dns_enabled`).
+    /// Without the lookup the generic threshold above is all there is. Only the first address of a
+    /// Linux lookup is recorded, so a connection to another address of the same answer is not
+    /// joined (the Windows provider lists them all).
+    fn check_egress_volume(&mut self, event: &NetworkFlowEvent) -> Vec<Alert> {
+        let Some(sent) = event.bytes_sent else {
+            return Vec::new();
+        };
+        if !is_public_address(event.daddr) {
+            return Vec::new();
+        }
+        let flow = (
+            event.meta.comm.clone(),
+            event.daddr,
+            event.dport,
+            event.local_port,
+        );
+        let previous = self.egress_flow_last.get(&flow).copied();
+        self.egress_flow_last.insert(flow, sent);
+        // First poll of the flow: baseline only. A counter that went down is a new
+        // flow on a reused local port: its whole value is new volume.
+        let delta = match previous {
+            None => return Vec::new(),
+            Some(last) if sent >= last => sent - last,
+            Some(_) => sent,
+        };
+        if delta == 0 {
+            return Vec::new();
+        }
+        let ts = event.meta.timestamp_ns;
+        let class = self.resolved_service(event);
+        let entry = self.egress_volume.get_or_insert_with(
+            (event.meta.comm.clone(), event.daddr),
+            EgressVolume::default,
+        );
+        let total = entry.sum.add(ts, delta, EGRESS_WINDOW_NS);
+        let mut alerts = Vec::new();
+        let recently =
+            |last: Option<u64>| last.is_some_and(|t| ts.saturating_sub(t) < EGRESS_WINDOW_NS);
+        if let Some((class, domain)) = class
+            && total >= EGRESS_CLASSED_BYTES_THRESHOLD
+            && !recently(entry.last_class_alert_ns)
+        {
+            entry.last_class_alert_ns = Some(ts);
+            alerts.push(Alert {
+                technique: class.technique(),
+                severity: Severity::Medium,
+                message: format!(
+                    "pid={} comm={} sent {}MB to {} ({domain}, a {} service) in {}s — possible \
+                     exfiltration to a web service",
+                    event.meta.pid,
+                    event.meta.comm,
+                    total / (1024 * 1024),
+                    event.daddr,
+                    class.label(),
+                    EGRESS_WINDOW_NS / 1_000_000_000,
+                ),
+            });
+        }
+        if total >= EGRESS_BYTES_THRESHOLD && !recently(entry.last_alert_ns) {
+            entry.last_alert_ns = Some(ts);
+            alerts.push(Alert {
+                technique: "T1041/T1048",
+                severity: Severity::Medium,
+                message: format!(
+                    "pid={} comm={} sent {}MB to {} in {}s — possible exfiltration over the \
+                     network",
+                    event.meta.pid,
+                    event.meta.comm,
+                    total / (1024 * 1024),
+                    event.daddr,
+                    EGRESS_WINDOW_NS / 1_000_000_000,
+                ),
+            });
+        }
+        alerts
+    }
+
+    /// EGRESS-DOMAIN's join key: the storage or paste service this very pid resolved to the
+    /// flow's address, within [`DNS_CLASS_WINDOW_NS`], unless the pid is a browser (see
+    /// [`EGRESS_DOMAIN_BROWSER_COMMS`]). The class comes from the process's own lookup because
+    /// the address alone is shared with every other site behind the same CDN. A sighting
+    /// recorded for another incarnation of the pid (a recycled number) is not an answer.
+    fn resolved_service(&self, event: &NetworkFlowEvent) -> Option<(DomainClass, String)> {
+        let sighting = self.dns_class.peek(&(event.meta.pid, event.daddr))?;
+        let ts = event.meta.timestamp_ns;
+        if ts.saturating_sub(sighting.timestamp_ns) > DNS_CLASS_WINDOW_NS
+            || matches!(
+                (sighting.generation, event.meta.process_generation),
+                (Some(recorded), Some(current)) if recorded != current
+            )
+        {
+            return None;
+        }
+        let image = PidFact::current(
+            &self.pid_image_path,
+            event.meta.pid,
+            event.meta.process_generation,
+        );
+        let is_browser = EGRESS_DOMAIN_BROWSER_COMMS.contains(&event.meta.comm.as_str())
+            && policy::name_exclusion_applies(image);
+        (!is_browser).then(|| (sighting.class, sighting.domain.clone()))
     }
 
     /// LISTENER-DRIFT (issue #92, T1571 — non-standard port is the closest
@@ -936,6 +1766,171 @@ impl RuleState {
         self.check_listen_port_drift(event).into_iter().collect()
     }
 
+    /// POLICY-DENIAL-DRIFT (issue #774, T1562-adjacent) — see
+    /// `known_policy_denials`'s doc for why this alerts on a new
+    /// (subject, object, class) triple rather than on every denial. Fires for
+    /// `PolicyDenialEvent::enforced` either way (`SELinux` permissive logs the
+    /// same fact a managed Enforcing host would act on) — the point is a new
+    /// *shape* of denial, not whether this particular one was blocked.
+    ///
+    /// The key depends on the mechanism (#796), see `known_policy_denials`'s doc. A mechanism
+    /// other than `SELinux`, `AppLocker` or WDAC never alerts. Severity is Medium, except Low
+    /// for an `AppLocker` or WDAC denial in audit mode (`enforced: false`): a rollout in audit
+    /// mode logs every unlisted binary once, and that is routine. `SELinux` stays Medium
+    /// either way.
+    ///
+    /// Inert while the eBPF sensor is selected (#780): `SELinux` AVC denials
+    /// only reach the agent through the audit sensor, so silence here does not
+    /// mean no denials happened.
+    ///
+    /// The requested permission is part of the key (#813, recovered by
+    /// `sensor-linux-audit`'s AVC parser): a routine `getattr` denial no longer
+    /// silences a later, more interesting `read`/`write`/`open` on the same subject,
+    /// object and class. `None` (an AppLocker/WDAC denial, or an AVC variant the
+    /// parser doesn't recognize) is its own value, same as every other field here.
+    ///
+    /// Capped at [`POLICY_DENIAL_ALERT_CAP`] new-shape alerts per subject type per
+    /// [`crate::exclusions::POLICY_DENIAL_ALERT_WINDOW_NS`] (#812, per subject since #840): a
+    /// flood of shapes from one domain past its cap is counted (`policy_denial_alerts_shed`)
+    /// rather than alerted, and never touches another domain's budget. A shed shape is not
+    /// recorded in `known_policy_denials`, so it is still new — it can alert once its
+    /// subject's budget refills in a later window instead of being silenced for the rest of the
+    /// run. The cap bounds alert volume; `known_policy_denials` keeps deduplicating
+    /// the shapes that did alert.
+    ///
+    /// The permission set in the key is normalised ([`normalized_permissions`]): `read
+    /// write` and `write read` are one shape.
+    fn check_policy_denial_drift(&mut self, event: &PolicyDenialEvent) -> Option<Alert> {
+        let key: PolicyDenialKey = match event.mechanism.as_str() {
+            POLICY_MECHANISM_SELINUX => (
+                event.mechanism.clone(),
+                Self::selinux_type_triple(event.subject_context.as_deref()),
+                Self::selinux_type_triple(event.object_context.as_deref()),
+                event.object_class.clone(),
+                event.action.as_deref().map(normalized_permissions),
+            ),
+            // AppLocker: (rule collection, file). The sensor leaves both contexts `None`, so
+            // the budget below is one shared by every AppLocker denial.
+            POLICY_MECHANISM_APPLOCKER => (
+                event.mechanism.clone(),
+                None,
+                event.object_path.as_deref().map(str::to_lowercase),
+                event.object_class.clone(),
+                None,
+            ),
+            // WDAC: (loading process, file, signing scenario), so the budget is per process.
+            POLICY_MECHANISM_WDAC => (
+                event.mechanism.clone(),
+                event.subject_context.as_deref().map(str::to_lowercase),
+                event.object_path.as_deref().map(str::to_lowercase),
+                event.object_class.clone(),
+                None,
+            ),
+            _ => return None,
+        };
+        if self.known_policy_denials.get(&key).is_some() {
+            return None;
+        }
+        let now = event.meta.timestamp_ns;
+        // The budget is the subject type's (`key.1`, the context without its MLS part), so a noisy
+        // domain spends its own and nobody else's.
+        let budget = self
+            .policy_denial_budgets
+            .get_or_insert_with(key.1.clone(), PolicyDenialBudget::default);
+        if budget.window_start_ns.is_none_or(|start| {
+            now.saturating_sub(start) >= crate::exclusions::POLICY_DENIAL_ALERT_WINDOW_NS
+        }) {
+            *budget = PolicyDenialBudget {
+                window_start_ns: Some(now),
+                ..PolicyDenialBudget::default()
+            };
+        }
+        if budget.alerts >= POLICY_DENIAL_ALERT_CAP {
+            if budget.shed == 0 {
+                tracing::warn!(
+                    cap = POLICY_DENIAL_ALERT_CAP,
+                    subject = key.1.as_deref().unwrap_or("-"),
+                    "policy-denial-drift: alert cap reached for this subject, its further new shapes are counted but not alerted until its budget refills"
+                );
+            }
+            budget.shed += 1;
+            self.policy_denial_alerts_shed += 1;
+            self.report_policy_denial_evictions();
+            return None;
+        }
+        budget.alerts += 1;
+        self.known_policy_denials.insert(key, ());
+        self.report_policy_denial_evictions();
+        Some(Alert {
+            technique: "T1562",
+            // A Windows policy in audit mode logs every unlisted binary once during a rollout:
+            // routine, not an incident. SELinux keeps Medium either way (see the doc above).
+            severity: if event.mechanism != POLICY_MECHANISM_SELINUX && !event.enforced {
+                Severity::Low
+            } else {
+                Severity::Medium
+            },
+            message: format!(
+                "comm={} mechanism={} subject={} object={} class={} action={} path={} enforced={} — new denial shape, not seen this run",
+                event.meta.comm,
+                event.mechanism,
+                event.subject_context.as_deref().unwrap_or("-"),
+                event.object_context.as_deref().unwrap_or("-"),
+                event.object_class.as_deref().unwrap_or("-"),
+                event.action.as_deref().unwrap_or("-"),
+                event.object_path.as_deref().unwrap_or("-"),
+                event.enforced,
+            ),
+        })
+    }
+
+    /// Logs once per rise in `known_policy_denials`'s eviction count (#812): otherwise
+    /// `known_policy_denials` evicting its oldest eighth at `COUNTER_CAP` and a shape
+    /// re-alerting is silent loss (CLAUDE.md: counted, observable shedding), the same
+    /// idiom as `agent::ransomware_join`'s `report_evictions`. Also carries the running
+    /// total of alerts shed by [`POLICY_DENIAL_ALERT_CAP`] (review of #823): this is the
+    /// only periodic signal the alert cap gets — once it is reached, the "alert cap
+    /// reached" warning fires exactly once, never again, so without this an operator
+    /// cannot tell 10 shed shapes from 100,000.
+    fn report_policy_denial_evictions(&mut self) {
+        let budgets_evicted = self.policy_denial_budgets.evicted();
+        if budgets_evicted > self.policy_denial_budget_evictions_reported {
+            tracing::warn!(
+                budgets_evicted,
+                "policy-denial-drift: subject alert budgets forgotten (least recently seen first); those subjects start a fresh budget"
+            );
+            self.policy_denial_budget_evictions_reported = budgets_evicted;
+        }
+        let evicted = self.known_policy_denials.evicted();
+        if evicted > self.policy_denial_evictions_reported {
+            tracing::warn!(
+                evicted,
+                alerts_shed = self.policy_denial_alerts_shed,
+                "policy-denial-drift: tracked denial shapes shed (oldest first)"
+            );
+            self.policy_denial_evictions_reported = evicted;
+        }
+    }
+
+    /// The `user:role:type` prefix of a `SELinux` security context
+    /// (`user:role:type:sensitivity[:categories]`), dropped from
+    /// [`PolicyDenialKey`] so a container's own MCS/MLS category pair does not
+    /// make every denial from it a "new" shape (#781 review: two denials
+    /// differing only in category gave two alerts). A bounded split, not a
+    /// split on the last colon: the MLS field itself can contain one
+    /// (`s0-s0:c0.c1023`). A bare type with no context at all (`httpd_t`)
+    /// passes through unchanged.
+    fn selinux_type_triple(context: Option<&str>) -> Option<String> {
+        context.map(|c| c.splitn(4, ':').take(3).collect::<Vec<_>>().join(":"))
+    }
+
+    /// To be called for every `PolicyDenialEvent` in the stream (`SELinux` AVC
+    /// on Linux issue #297, AppLocker/WDAC on Windows issue #283) — see
+    /// [`Self::check_policy_denial_drift`].
+    pub fn on_policy_denial(&mut self, event: &PolicyDenialEvent) -> Vec<Alert> {
+        self.check_policy_denial_drift(event).into_iter().collect()
+    }
+
     /// To be called for every `LdapSearchEvent` (Windows, #364): the
     /// directory-enumeration sweep, many distinct searches from one process
     /// in a short window. The single-search rules are
@@ -946,14 +1941,103 @@ impl RuleState {
 
     /// To be called for every `AuthEvent` in the stream (issue #377, T1110):
     /// counts failures per (target user, source) on a sliding window and
-    /// alerts once per window when the burst threshold is crossed. Successes
-    /// deliberately don't reset the counter — a success right after a burst
-    /// is the *stronger* signal, not an all-clear (success-after-burst gets
-    /// its own alert shape in a follow-up; today the burst itself already
-    /// fired).
+    /// alerts once per window when the burst threshold is crossed. A success
+    /// deliberately doesn't reset the counter — a success right after a burst
+    /// is the *stronger* signal, not an all-clear. For a Windows RDP success
+    /// that signal is [`Self::rdp_success`] (T1021.001, joined from a separate
+    /// `SessionEvent`); for a local `sudo`/`su` success it is
+    /// [`Self::sudo_success`] (#381, T1548.003 for `sudo` / T1110.001 for `su`
+    /// — see `crate::sudo`'s module doc) below, joined from this same
+    /// `AuthEvent` stream. A local `sudo`/`su` failure also counts into the burst
+    /// counter below (key: target account, source `"local"`, `sudo` and `su` sharing
+    /// one key), so five wrong passwords in the window raise T1110 by themselves,
+    /// before and independently of any success (#838).
+    ///
+    /// A **successful** [`AuthKind::Logon`] also goes through FIRST-SEEN-LOGON
+    /// ([`Self::check_first_seen_logon`], T1078); it is the one rule on `main` that fires
+    /// on a successful logon.
     pub fn on_auth(&mut self, event: &AuthEvent) -> Vec<Alert> {
-        if event.outcome != AuthOutcome::Failure {
-            return Vec::new();
+        let mut alerts: Vec<Alert> = self.check_first_seen_logon(event).into_iter().collect();
+        alerts.extend(self.on_auth_failures_and_escalations(event));
+        alerts
+    }
+
+    /// FIRST-SEEN-LOGON (T1078, #376) — a successful logon ([`AuthKind::Logon`], never a
+    /// failure, never `su`/`sudo`'s [`AuthKind::ExplicitCredentials`] or
+    /// [`AuthKind::PrivilegedSession`]) of an account that did not log on to this host during
+    /// the first [`LOGON_LEARNING_NS`](crate::exclusions::LOGON_LEARNING_NS) after the first
+    /// one the state saw. One alert per account: it is in the baseline afterwards. Low: a new
+    /// colleague, a new service account and a reinstalled host look the same, and nothing
+    /// here separates them.
+    ///
+    /// **This makes the control plane's identity join live** (`server/lib/fleet-case.ts`,
+    /// #62, #940): the join reads the event a detection stores, and until this rule no rule
+    /// on `main` fired on a successful logon. The limits of that join are this rule's: the
+    /// generic accounts are excluded (see `crate::logon`), `vagrant` deliberately is not,
+    /// and a `LogonFailure` never counts because its user name is chosen by whoever tries
+    /// it.
+    ///
+    /// The baseline is **in memory**: an agent restart, an update included, begins a new
+    /// learning window, and an account that logs on during the window is learned without an
+    /// alert, an intruder's included. Expected false positives: a domain controller or file
+    /// server, which sees every user's first logon; a new hire; a service account first
+    /// used after an install. **Not built, and why: odd hours.** The event carries a UTC
+    /// timestamp and no timezone, and no part of the agent knows the host's local time, so
+    /// "outside working hours" cannot be said honestly yet.
+    fn check_first_seen_logon(&mut self, event: &AuthEvent) -> Option<Alert> {
+        if event.outcome != AuthOutcome::Success || event.kind != AuthKind::Logon {
+            return None;
+        }
+        match self
+            .logon_baseline
+            .observe(&event.target_user, event.meta.timestamp_ns)
+        {
+            Observation::FirstSeen => {}
+            Observation::Quiet | Observation::Known => return None,
+        }
+        let source = event
+            .source_address
+            .map_or_else(String::new, |address| format!(" from {address}"));
+        Some(Alert {
+            technique: "T1078",
+            severity: Severity::Low,
+            message: format!(
+                "first successful logon of account {}{source} on this host since the baseline began",
+                event.target_user,
+            ),
+        })
+    }
+
+    /// The failure-burst and `sudo`/`su` joins of [`Self::on_auth`].
+    fn on_auth_failures_and_escalations(&mut self, event: &AuthEvent) -> Vec<Alert> {
+        let ts = event.meta.timestamp_ns;
+        if event.outcome == AuthOutcome::Success {
+            // Only a local (Unix) privilege-escalation success joins the sudo/su
+            // burst history — a Windows logon success is [`Self::rdp_success`]'s
+            // job, fed from the Terminal Services session event instead, not
+            // this one (see that field's doc). `PrivilegedSession`/
+            // `ExplicitCredentials` are only ever produced for `sudo`/`su`
+            // (`auth::to_auth_event`), so `event.meta.comm` is already one of
+            // the two here; the explicit match is defense in depth, not a new
+            // restriction. `sudo` joins on the trusted uid, not a name, and
+            // `su` still joins on the target `AuthEvent::target_user` names —
+            // see `crate::sudo`'s module doc for why they differ (review of
+            // #838, Sollykhan 2026-10-19, point 1).
+            let User::Unix { uid, .. } = event.meta.user else {
+                return Vec::new();
+            };
+            return if matches!(
+                event.kind,
+                AuthKind::PrivilegedSession | AuthKind::ExplicitCredentials
+            ) {
+                match event.meta.comm.as_str() {
+                    "sudo" => self.sudo_success.on_sudo_success(uid, ts),
+                    "su" => self.sudo_success.on_su_success(&event.target_user, ts),
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
         }
         // "local" for console/service logons that legitimately carry no
         // source address (see `AuthEvent::source_address`'s doc) — a distinct
@@ -962,13 +2046,42 @@ impl RuleState {
             .source_address
             .map_or_else(|| "local".to_string(), |a| a.to_string());
         let key = (event.target_user.clone(), source.clone());
-        let ts = event.meta.timestamp_ns;
+        // A success can reach the rules before the last failures that precede
+        // it (two channels, two poll threads, for RDP's own join): this failure
+        // may complete it. Only failures from the Windows Security log feed that
+        // join: they carry a Windows identity and are stamped with the event's
+        // own time, like the 1149. Application-log failures (`[logs]` sources)
+        // are stamped when the line is read, so a restart replaying a backlog
+        // would make hours-old failures look current: other clock, not joined.
+        let mut alerts: Vec<Alert> = event
+            .source_address
+            .filter(|_| matches!(event.meta.user, User::Windows { .. }))
+            .map(|address| self.rdp_success.on_failure(address, ts))
+            .unwrap_or_default();
+        // The sudo/su join has no such cross-channel concern (one journal
+        // stream feeds both sides of it), but still joins by event time, not
+        // arrival order — see the `sudo` module's doc. Gated on `comm`, not
+        // just `User::Unix`: an sshd failure (`LogonFailure` from `SshFailed`)
+        // is also a Unix identity, and must never reach this join at all —
+        // unchanged by the point below. What changed (review of #838,
+        // Sollykhan 2026-10-19, point 1): once an event *does* pass this
+        // gate, `sudo`'s own side of the join now keys on the trusted uid
+        // below, not on anything parsed from the message; `su`'s still keys
+        // on the target name, which has its own, narrower residual exposure
+        // — see `crate::sudo`'s doc for why the two differ.
+        if let User::Unix { uid, .. } = event.meta.user {
+            match event.meta.comm.as_str() {
+                "sudo" => alerts.extend(self.sudo_success.on_sudo_failure(uid, ts)),
+                "su" => alerts.extend(self.sudo_success.on_su_failure(&event.target_user, ts)),
+                _ => {}
+            }
+        }
         let entry = self
             .auth_failures
             .get_or_insert_with(key, SlidingCounter::default);
         let count = entry.record(ts, AUTH_FAILURE_WINDOW_NS);
         if count >= AUTH_FAILURE_THRESHOLD && entry.try_alert(ts, AUTH_FAILURE_WINDOW_NS) {
-            return vec![Alert {
+            alerts.push(Alert {
                 technique: "T1110",
                 severity: Severity::Medium,
                 message: format!(
@@ -976,16 +2089,29 @@ impl RuleState {
                     event.target_user,
                     AUTH_FAILURE_WINDOW_NS / 1_000_000_000,
                 ),
-            }];
+            });
         }
-        Vec::new()
+        alerts
     }
 
     /// To be called for every `SessionEvent` in the stream (Windows Terminal
     /// Services, #285): a disconnected session reconnected from another
-    /// client, T1563.002 (see the `session` module).
+    /// client, T1563.002 (see the `session` module), or a successful RDP listener
+    /// authentication after failures from that source, T1021.001.
     pub fn on_session(&mut self, event: &SessionEvent) -> Vec<Alert> {
-        self.session_hijack.on_session(event).into_iter().collect()
+        let mut alerts: Vec<Alert> = self.session_hijack.on_session(event).into_iter().collect();
+
+        if event.state != SessionState::Connect || event.console {
+            return alerts;
+        }
+        if let Some(address) = event.source_address {
+            alerts.extend(self.rdp_success.on_success(
+                address,
+                event.meta.timestamp_ns,
+                &event.target_user,
+            ));
+        }
+        alerts
     }
 
     /// To be called for every `MemfdCreateEvent` in the stream (Linux, issue
@@ -1153,6 +2279,66 @@ impl RuleState {
         );
     }
 
+    /// To be called for every `BitsJobEvent` in the stream: records the job's
+    /// file for the T1197 download→exec join
+    /// ([`Self::check_bits_download_exec`]). No alert on its own: BITS is
+    /// also how browsers and updaters fetch their components.
+    pub fn on_bits_job(&mut self, event: &BitsJobEvent) {
+        let key = event.local_path.to_lowercase();
+        let previous = self.recent_bits_downloads.peek(&key);
+        let same_job = previous.is_some_and(|d| d.job_id == event.job_id);
+        match event.state {
+            BitsJobState::FileAdded => {
+                // Another job's completed download is what sits at the path:
+                // its window and attribution stand until a completion
+                // replaces the file (#577 review).
+                if previous.is_some_and(|d| d.on_disk && !same_job) {
+                    return;
+                }
+                self.arm_bits_download(key, event, false, false);
+            }
+            BitsJobState::Completed => {
+                // A late completion of the download that already alerted is not
+                // a new download; another job's completion is.
+                let alerted = same_job && previous.is_some_and(|d| d.alerted);
+                self.arm_bits_download(key, event, true, alerted);
+            }
+            // A cancelled job deletes its own partial file: nothing of it left
+            // to run. Only its own, and only a partial one: cancelling job B,
+            // which targeted the path job A already downloaded, leaves A's
+            // payload in place (#577 review).
+            BitsJobState::Cancelled => {
+                if same_job && previous.is_some_and(|d| !d.on_disk) {
+                    self.recent_bits_downloads.remove(&key);
+                }
+            }
+            // BITS retries a failed transfer on its own; keep the entry.
+            BitsJobState::TransferError => {}
+        }
+    }
+
+    fn arm_bits_download(
+        &mut self,
+        key: String,
+        event: &BitsJobEvent,
+        on_disk: bool,
+        alerted: bool,
+    ) {
+        self.recent_bits_downloads.insert(
+            key,
+            RecentBitsDownload {
+                timestamp_ns: event.meta.timestamp_ns,
+                job_id: event.job_id.clone(),
+                on_disk,
+                client_pid: event.meta.pid,
+                client_comm: event.meta.comm.clone(),
+                job_title: event.job_title.clone(),
+                url: event.url.clone(),
+                alerted,
+            },
+        );
+    }
+
     /// To be called for every `FileOpenEvent` in the stream. Reports T1053.005
     /// scheduled-task creation (deduplicated, see
     /// [`Self::check_task_registration`]) and updates the history of downloader
@@ -1163,9 +2349,211 @@ impl RuleState {
             event,
             |pid, generation| self.resolve_comm(pid, generation),
         ));
+        alerts.extend(self.check_credential_file_read(event));
         alerts.extend(self.record_create(event));
         self.record_downloader_write(event);
+        self.record_archive_open(event);
+        alerts.extend(self.check_staging_dir(event));
         alerts
+    }
+
+    /// STAGING-DIR (T1074.001, #380) — one pid reads at least [`STAGING_READ_FILES`] distinct
+    /// user-data files spread over [`STAGING_READ_DIRS`] directories and creates at least
+    /// [`STAGING_WRITE_FILES`] distinct files in one staging directory (a subdirectory of a
+    /// temp root or a hidden directory, see [`staging::staging_dir`]), all inside
+    /// [`STAGING_WINDOW_NS`]. One alert per directory and window. Medium: the shape is also a
+    /// folder copy, a backup tool and an indexer, and no allowlist of those exists yet (it
+    /// needs a lab capture of the host's ordinary copies and builds).
+    ///
+    /// The evaluation runs on a create, so the last read must precede the last create it
+    /// counts: a copy loop that interleaves reads and creates qualifies, a sweep that reads
+    /// everything and then creates fewer than the threshold does not. `FileWriteEvent`
+    /// carries no path, so the creating `open` is the signal, never a byte count: a staging
+    /// file written to by another pid, or opened without `O_CREAT`, is a stated gap, and so
+    /// is a collection that stages in `~/.cache` or a macOS per-user temp directory. The
+    /// reader and the creator must be the same pid: `tar | gzip` style pipelines spread the
+    /// two over processes and are not seen.
+    fn check_staging_dir(&mut self, event: &FileOpenEvent) -> Option<Alert> {
+        let meta = &event.meta;
+        let ts = meta.timestamp_ns;
+        if !has_write_intent(event.flags) {
+            self.record_staging_read(meta, ts, &event.path);
+            return None;
+        }
+        if event.flags & O_CREAT == 0 {
+            return None;
+        }
+        let dir = staging::staging_dir(&event.path)?;
+        let key = (meta.pid, dir.clone());
+        if self
+            .staging_dirs
+            .peek(&key)
+            .is_some_and(|d| !same_incarnation(d.generation, meta.process_generation))
+        {
+            self.staging_dirs.remove(&key);
+        }
+        let entry = self.staging_dirs.get_or_insert_with(key, || StagingDir {
+            generation: meta.process_generation,
+            files: SlidingDistinct::default(),
+        });
+        let created = entry
+            .files
+            .record(event.path.clone(), ts, STAGING_WINDOW_NS);
+        if created < STAGING_WRITE_FILES {
+            return None;
+        }
+        let (read_files, read_dirs) = self.staging_read_summary(meta, ts)?;
+        let entry = self.staging_dirs.get_mut(&(meta.pid, dir.clone()))?;
+        if !entry.files.try_alert(ts, STAGING_WINDOW_NS) {
+            return None;
+        }
+        Some(Alert {
+            technique: "T1074.001",
+            severity: Severity::Medium,
+            message: format!(
+                "pid={} comm={} read {read_files} user files from {read_dirs} directories and created {created} files in the staging directory /{dir}",
+                meta.pid, meta.comm,
+            ),
+        })
+    }
+
+    /// STAGING-DIR, read half: remembers a user-data file the pid opened without write intent.
+    fn record_staging_read(&mut self, meta: &schema::EventMeta, ts: u64, path: &str) {
+        let Some((file, _)) = staging::user_data_file(path) else {
+            return;
+        };
+        if self
+            .staging_reads
+            .peek(&meta.pid)
+            .is_some_and(|r| !same_incarnation(r.generation, meta.process_generation))
+        {
+            self.staging_reads.remove(&meta.pid);
+        }
+        self.staging_reads
+            .get_or_insert_with(meta.pid, || StagingReads {
+                generation: meta.process_generation,
+                files: SlidingDistinct::default(),
+            })
+            .files
+            .record(file, ts, STAGING_WINDOW_NS);
+    }
+
+    /// STAGING-DIR: how many distinct user files, over how many directories, the pid read in
+    /// the window — `None` when that is below the read thresholds.
+    fn staging_read_summary(&mut self, meta: &schema::EventMeta, ts: u64) -> Option<(u32, usize)> {
+        let reads = self.staging_reads.get_mut(&meta.pid)?;
+        if !same_incarnation(reads.generation, meta.process_generation) {
+            return None;
+        }
+        let files = reads.files.count(ts, STAGING_WINDOW_NS);
+        let dirs: std::collections::HashSet<&str> = reads
+            .files
+            .values()
+            .filter_map(|f| f.rsplit_once('/').map(|(dir, _)| dir))
+            .collect();
+        (files >= STAGING_READ_FILES && dirs.len() >= STAGING_READ_DIRS)
+            .then_some((files, dirs.len()))
+    }
+
+    /// The image the pid was exec'd from, else its parent's: a child that forked and never
+    /// exec'd (an older `sshd`'s privilege-separated child) is the same binary as its parent,
+    /// and is in no exec table of its own.
+    fn reader_image(&self, meta: &schema::EventMeta) -> Option<&str> {
+        PidFact::current(&self.pid_image_path, meta.pid, meta.process_generation).or_else(|| {
+            PidFact::current(
+                &self.pid_image_path,
+                meta.ppid,
+                meta.parent_process_generation,
+            )
+        })
+    }
+
+    /// Whether `pid`'s own name, or its parent's, is a web or database service: a daemon with
+    /// no business in a user's credential files, and the process a webshell runs under. The
+    /// name comes from the exec table, not from the event's `comm`, which is the thread's
+    /// (`one_connection` for a `mysqld` worker).
+    fn reader_under_service(&self, meta: &schema::EventMeta) -> bool {
+        let is_service = |comm: &str| {
+            SERVICE_COMMS.contains(&comm)
+                || SERVICE_COMM_PREFIXES
+                    .iter()
+                    .any(|prefix| comm.starts_with(prefix))
+        };
+        [
+            PidFact::current(&self.pid_comm, meta.pid, meta.process_generation),
+            PidFact::current(&self.pid_comm, meta.ppid, meta.parent_process_generation),
+        ]
+        .into_iter()
+        .flatten()
+        .any(is_service)
+    }
+
+    /// CREDENTIAL-READ (#377), on the file opens of a Unix host: T1003.008 for the shadow files,
+    /// T1552.004 for an SSH private key, T1552.001 for the other credential files of a home
+    /// directory, and on macOS T1555.001 for a keychain database and T1555.003 for a browser's
+    /// saved-login and cookie stores (see `credfiles` for the paths and what the sensor cannot
+    /// see).
+    ///
+    /// Only a read counts: a write-only open (`ssh-keygen` writing a key, `passwd` rewriting
+    /// the file) is not one. Who may read differs by file, because who legitimately does
+    /// differs:
+    /// - The **shadow files** have a short, fixed list of readers (the authentication stack,
+    ///   `credfiles::AUTH_STACK`); anything else that opens them alerts. Medium, not High:
+    ///   an administrator's `cat`, a backup or integrity tool (`tar`, `rsync`, `rpm -V`,
+    ///   AIDE) and a PAM service the list lacks look the same, and none is excluded here
+    ///   because each is also what an attacker runs.
+    /// - A **home credential file, keychain or browser store** has no fixed list: `python3` with `boto3`, `terraform`,
+    ///   `kubectl`, `git` and `ssh` all read their own, from `/usr/bin`. So a read alerts only
+    ///   when the reader is *unexpected* in a way the telemetry can show: a web or database
+    ///   service (or a child of one), or a binary run from outside the system directories
+    ///   (`/tmp`, a home directory, `/dev/shm`). Not caught: a system binary (`cat`, `tar`) run
+    ///   by an intruder, and a tool a developer installed under their home (`~/.local/bin`,
+    ///   `~/go/bin`) alerts although it is theirs, its own credentials read by its own
+    ///   binary. Both are the price of not alerting on every `aws` call. On macOS the Apple
+    ///   daemons that read a keychain and the browsers installed in `/Applications` run from
+    ///   the system directories, so they should stay quiet (not observed on a Mac); a browser
+    ///   installed under `~/Applications` alerts on its own store.
+    ///
+    /// One alert per (pid, kind) per [`CREDENTIAL_READ_ALERT_WINDOW_NS`]. No file content and
+    /// no command line goes into the message, only the path the process asked for.
+    fn check_credential_file_read(&mut self, event: &FileOpenEvent) -> Option<Alert> {
+        if !credfiles::can_read(event.flags) {
+            return None;
+        }
+        let kind = credfiles::classify(&event.path)?;
+        let image = self.reader_image(&event.meta);
+        let comm = event.meta.comm.as_str();
+        let why = match kind {
+            CredFile::Shadow if credfiles::is_auth_stack(comm, image) => return None,
+            CredFile::Shadow => "outside the authentication stack",
+            CredFile::PrivateKey
+            | CredFile::HomeCredentials
+            | CredFile::Keychain
+            | CredFile::BrowserStore => {
+                if self.reader_under_service(&event.meta) {
+                    "a web or database service or its child"
+                } else if credfiles::image_outside_system_dirs(image) {
+                    "a binary outside the system directories"
+                } else {
+                    return None;
+                }
+            }
+        };
+        let ts = event.meta.timestamp_ns;
+        let counter = self
+            .credential_reads
+            .get_or_insert_with((event.meta.pid, kind), SlidingCounter::default);
+        if !counter.try_alert(ts, CREDENTIAL_READ_ALERT_WINDOW_NS) {
+            return None;
+        }
+        Some(Alert {
+            technique: kind.technique(),
+            severity: Severity::Medium,
+            message: format!(
+                "pid={} comm={comm}: opened {} for reading from {why}",
+                event.meta.pid, event.path,
+            ),
+        })
     }
 
     /// T1053.005 creation (`check_scheduled_task_persistence`), reported once per
@@ -1365,18 +2753,39 @@ impl RuleState {
     /// What rules out a Unix file merely named `x:Zone.Identifier` is a Unix
     /// user or a POSIX path, the evidence that it is not a Windows stream.
     fn record_motw_removal(&mut self, event: &FileDeleteEvent) {
-        if matches!(event.meta.user, User::Unix { .. }) {
+        self.record_motw_gone(&event.path, &event.meta);
+    }
+
+    /// The same fact from a `FileRename` of the stream: `Rename-Item -Stream` or a
+    /// `SetInformation` rename on the stream handle takes the mark off its host
+    /// without deleting anything. Only the minifilter reports it (#136, #853: the
+    /// Kernel-File rename, event 27, is not consumed). A rename that leaves the
+    /// stream on the same host (a case change) removed nothing; one that moves the
+    /// mark to another file still strips it from this one.
+    fn record_motw_stream_rename(&mut self, event: &FileRenameEvent) {
+        let still_marked = motw_stream_host(&event.new_path)
+            .zip(motw_stream_host(&event.old_path))
+            .is_some_and(|(new_host, old_host)| new_host.eq_ignore_ascii_case(old_host));
+        if !still_marked {
+            self.record_motw_gone(&event.old_path, &event.meta);
+        }
+    }
+
+    /// `stream_path` is a `:Zone.Identifier` stream that no longer carries its mark,
+    /// by `meta`'s process.
+    fn record_motw_gone(&mut self, stream_path: &str, meta: &schema::EventMeta) {
+        if matches!(meta.user, User::Unix { .. }) {
             return;
         }
-        let Some(host) = motw_stream_host(&event.path).filter(|host| !host.starts_with('/')) else {
+        let Some(host) = motw_stream_host(stream_path).filter(|host| !host.starts_with('/')) else {
             return;
         };
         self.recent_motw_removals.insert(
             host.to_lowercase(),
             MotwRemoval {
-                timestamp_ns: event.meta.timestamp_ns,
-                pid: event.meta.pid,
-                comm: event.meta.comm.clone(),
+                timestamp_ns: meta.timestamp_ns,
+                pid: meta.pid,
+                comm: meta.comm.clone(),
                 alerted: false,
             },
         );
@@ -1396,7 +2805,8 @@ impl RuleState {
     /// Not covered: a download that never got a mark (curl, certutil, most
     /// droppers, see `DOWNLOADER_COMMS`) and an archive extractor that drops it
     /// — there is no removal to see; a mark rewritten in place to `ZoneId=0`,
-    /// or its stream renamed (Kernel-File 27) rather than deleted. The full
+    /// or its stream renamed through the Kernel-File path (event 27; the
+    /// minifilter's rename is consumed, [`Self::record_motw_stream_rename`]). The full
     /// list is in `docs/detection/download-provenance.md`.
     fn check_exec_after_motw_removal(&mut self, event: &ExecEvent) -> Option<Alert> {
         let key = event.image_path.to_lowercase();
@@ -1591,6 +3001,7 @@ impl RuleState {
     /// To be called for every `FileRenameEvent` in the stream (T1486, issue #262 +
     /// #82's write-volume corroboration).
     pub fn on_file_rename(&mut self, event: &FileRenameEvent) -> Vec<Alert> {
+        self.record_motw_stream_rename(event);
         self.record_touched(event.meta.pid, Event::FileRename(event.clone()));
         let mut alerts: Vec<Alert> = self.check_mass_rename_pattern(event).into_iter().collect();
         alerts.extend(self.check_burst_write_volume(event));
@@ -1631,6 +3042,7 @@ impl RuleState {
     /// alerts directly — tracks write volume per pid (issue #82), consumed by
     /// `check_burst_write_volume` on the next `FileRenameEvent`.
     pub fn on_file_write(&mut self, event: &FileWriteEvent) {
+        self.record_archive_write(event);
         self.write_volume
             .get_or_insert_with(event.meta.pid, SlidingSum::default)
             .add(

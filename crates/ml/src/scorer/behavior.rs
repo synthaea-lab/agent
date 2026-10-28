@@ -1,10 +1,10 @@
-//! On-device T1 behavior scoring: runs the 23-feature Isolation Forest (ONNX) over one
-//! process incarnation's [`crate::features::t1`] vector (cmdline 9 + correlation 8 +
-//! lineage 6), issue #617.
+//! On-device T1 behavior scoring: runs the 17-feature Isolation Forest (ONNX) over one
+//! process incarnation's [`crate::features::t1`] vector (cmdline 9 + correlation 8,
+//! no lineage: ADR-0034), issue #617.
 //!
 //! Where [`super::CmdlineScorer`] (T0) reads one command line and
 //! [`super::correlation::CorrelationScorer`] (T2) reads one window of counts, this scores
-//! what the two share with the parent lineage: it needs the incarnation's exec in the
+//! what the two share: it needs the incarnation's exec in the
 //! bus window and nothing more, so there is no event-count gate (the correlation block
 //! of a young process is simply small, and the model trained on such windows:
 //! `train_behavior.py` windows end at the incarnation's last event).
@@ -46,7 +46,7 @@ impl BehaviorScorer {
     /// # Errors
     ///
     /// Returns [`ScorerError`] when the ONNX session cannot be built, the tree
-    /// structure cannot be parsed, the model is not 23 features wide (a T0 or T2 model
+    /// structure cannot be parsed, the model is not 17 features wide (a T0 or T2 model
     /// shipped to this scorer), the metadata JSON is malformed or lacks the threshold or
     /// the feature bounds, or its feature bounds are not for exactly the T1 features, in
     /// this order (bounds for fewer features would skip the out-of-distribution guard on
@@ -55,7 +55,7 @@ impl BehaviorScorer {
         model: &[u8],
         metadata: Option<&[u8]>,
     ) -> Result<Self, ScorerError> {
-        let session = Session::builder()?.commit_from_memory(model)?;
+        let session = super::session_builder()?.commit_from_memory(model)?;
         let forest = Forest::from_onnx_bytes(model)?;
 
         if forest.n_features() != FEATURE_COUNT {
@@ -138,8 +138,8 @@ impl BehaviorScorer {
     }
 
     /// The anomaly score of the incarnation `(pid, generation)` over the bus's current
-    /// window, or `None` when the window holds no exec for it (no command line and no
-    /// lineage to score), or when the score reaches the conformal threshold (normal
+    /// window, or `None` when the window holds no exec for it (no command line to
+    /// score), or when the score reaches the conformal threshold (normal
     /// behavior: the false-positive budget is enforced here, not by the caller).
     ///
     /// `IsolationForest.decision_function`: negative = anomalous, positive = normal.

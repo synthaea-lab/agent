@@ -101,7 +101,23 @@ pub(crate) struct FetchPlan {
     pub(crate) kept: Vec<String>,
 }
 
-/// Verifies `manifest` (signature + anti-rollback against `state`) and reports
+/// [`plan_with_key`] against the embedded `content` key, for the tests that do not rotate it.
+#[cfg(test)]
+pub(crate) fn plan(
+    manifest: &ContentManifest,
+    ring: &str,
+    state: &ContentState,
+) -> Result<FetchPlan, UpdaterError> {
+    plan_with_key(
+        manifest,
+        ring,
+        state,
+        updater::key::CONTENT_PUBLIC_KEY.as_ref(),
+    )
+}
+
+/// Verifies `manifest` (signature against `content_key`, the `content` key in force, and
+/// anti-rollback against `state`) and reports
 /// which entries this agent still needs to fetch. Pure — no I/O, no network —
 /// so it's unit-testable without a live server; `cmd_check_content_manifest`
 /// is the thin composition that actually fetches and calls this.
@@ -115,12 +131,13 @@ pub(crate) struct FetchPlan {
 /// [`UpdaterError::ReleaseNotNewer`] — the same checks a binary self-update
 /// manifest gets, applied to content — or [`UpdaterError::UnsafeContentPath`]
 /// if any entry's path would escape a local content root.
-pub(crate) fn plan(
+pub(crate) fn plan_with_key(
     manifest: &ContentManifest,
     ring: &str,
     state: &ContentState,
+    content_key: Option<&[u8; 32]>,
 ) -> Result<FetchPlan, UpdaterError> {
-    manifest.verify_signature()?;
+    manifest.verify_signature_with(content_key)?;
     manifest.check_ring(ring)?;
     // An offer of the *same* release is not ignored when the files on disk do not match it:
     // the state holds one set of entries but a release version per ring, so applying another
@@ -176,14 +193,16 @@ pub(crate) fn cmd_check_content_manifest(
     cert: Option<&Path>,
     key: Option<&Path>,
     ca_cert: Option<&Path>,
+    state_dir: &Path,
     state_path: &Path,
 ) -> anyhow::Result<()> {
+    let keys = crate::trust::load(state_dir)?;
     let client = build_client(server, cert, key, ca_cert)?;
     let url = client.config().content_manifest_url(ring);
     let manifest: ContentManifest = client.get_json(&url)?;
 
     let state = ContentState::load(state_path)?;
-    match plan(&manifest, ring, &state) {
+    match plan_with_key(&manifest, ring, &state, keys.content.as_ref()) {
         Ok(plan) => {
             println!(
                 "ring {ring}: release {} available, {} entr{} to fetch, {} to remove",
@@ -203,11 +222,31 @@ pub(crate) fn cmd_check_content_manifest(
             }
         }
         Err(UpdaterError::ReleaseNotNewer { offered, current }) => {
-            println!("ring {ring}: up to date (release {current}, server offers {offered})");
+            println!("{}", describe_unchanged_offer(ring, offered, current));
         }
         Err(e) => return Err(e.into()),
     }
     Ok(())
+}
+
+/// The line for an offer that is not newer than what this agent has applied (#665). Two
+/// different situations used to read the same, "up to date": an offer of the release already
+/// applied (nothing to do), and an **older** one, which is what the server offers after it
+/// rolled a release back. The agent never goes to a lower release number (anti-replay,
+/// ADR-0016), so an agent that already applied the rolled-back release stays on it, and the
+/// operator must be told that, not that all is well. ADR-0032: such content is withdrawn by a
+/// corrective release with a higher number.
+fn describe_unchanged_offer(ring: &str, offered: u64, current: u64) -> String {
+    if offered < current {
+        format!(
+            "ring {ring}: the server offers release {offered}, OLDER than release {current}, which \
+             this agent has applied. An older offer is never applied (anti-rollback), so this agent \
+             stays on release {current}. To withdraw content from agents that already have it, \
+             publish a corrective release numbered above {current} (docs/operations/content.md)"
+        )
+    } else {
+        format!("ring {ring}: up to date (release {current}, server offers {offered})")
+    }
 }
 
 /// Builds a [`transport::TransportClient`] for `server`, with mTLS if both
@@ -218,7 +257,7 @@ pub(crate) fn cmd_check_content_manifest(
 /// # Errors
 ///
 /// Returns an error if mTLS certificates are configured but cannot be loaded.
-fn build_client(
+pub(crate) fn build_client(
     server: &str,
     cert: Option<&Path>,
     key: Option<&Path>,
@@ -235,7 +274,7 @@ fn build_client(
 }
 
 /// Resolves `entry_path` (already checked safe by
-/// [`ContentManifest::validate_entry_paths`], called from [`plan`]) onto
+/// [`ContentManifest::validate_entry_paths`], called from [`plan_with_key`]) onto
 /// `root`, one path segment at a time — content paths are forward-slash-only
 /// by contract (the field's own doc comment) regardless of the host's path
 /// separator, so segments are joined individually rather than handing the
@@ -362,7 +401,7 @@ pub(crate) struct Applied {
 /// A file that cannot be removed (it crosses a symlink, a directory sits at its path, a
 /// permission error) is warned about and **kept in the state**, and the rest of the release
 /// still applies: one stuck file must not stop new rules from reaching the agent. The next
-/// run retries it ([`plan`] re-plans an equal release while something is left to do).
+/// run retries it ([`plan_with_key`] re-plans an equal release while something is left to do).
 ///
 /// # Errors
 ///
@@ -660,7 +699,8 @@ fn halted_message(ring: &str, reason: &str) -> String {
 /// Fetches the content manifest for `ring`, verifies it exactly like
 /// [`cmd_check_content_manifest`], and — unlike that command — actually
 /// downloads and writes every entry that's missing or stale under
-/// `content_dir`, then records what was applied in `state_path`. On
+/// `content_dir`, then records what was applied in `state_path`. `state_dir` is where the
+/// record of applied key rotations lives: the `content` key in force is read from it. On
 /// success, best-effort notifies an already-running `agent run` at
 /// `ipc_endpoint` to reload the content it just applied (issue #30) — see
 /// [`notify_running_agent`] for why a failed notification is not a hard
@@ -678,10 +718,18 @@ pub(crate) fn cmd_apply_content_manifest(
     endpoint: &Endpoint,
     ring: &str,
     content_dir: &Path,
+    state_dir: &Path,
     state_path: &Path,
     ipc_endpoint: &str,
 ) -> anyhow::Result<ApplyOutcome> {
-    match apply_content_manifest(endpoint, ring, content_dir, state_path, ipc_endpoint) {
+    match apply_content_manifest(
+        endpoint,
+        ring,
+        content_dir,
+        state_dir,
+        state_path,
+        ipc_endpoint,
+    ) {
         Err(e) => match halted_reason(&e) {
             Some(reason) => {
                 println!("{}", halted_message(ring, reason));
@@ -697,9 +745,11 @@ fn apply_content_manifest(
     endpoint: &Endpoint,
     ring: &str,
     content_dir: &Path,
+    state_dir: &Path,
     state_path: &Path,
     ipc_endpoint: &str,
 ) -> anyhow::Result<ApplyOutcome> {
+    let keys = crate::trust::load(state_dir)?;
     let client = build_client(
         &endpoint.server,
         endpoint.cert.as_deref(),
@@ -710,10 +760,18 @@ fn apply_content_manifest(
     let manifest: ContentManifest = client.get_json(&url)?;
 
     let state = ContentState::load(state_path)?;
-    let fetch_plan = match plan(&manifest, ring, &state) {
+    let fetch_plan = match plan_with_key(&manifest, ring, &state, keys.content.as_ref()) {
         Ok(fetch_plan) => fetch_plan,
         Err(UpdaterError::ReleaseNotNewer { offered, current }) => {
-            println!("ring {ring}: up to date (release {current}, server offers {offered})");
+            println!("{}", describe_unchanged_offer(ring, offered, current));
+            if offered < current {
+                tracing::warn!(
+                    ring,
+                    offered,
+                    current,
+                    "the server offers an older content release than the one applied; ignored"
+                );
+            }
             return Ok(ApplyOutcome::Done);
         }
         Err(e) => return Err(e.into()),
@@ -963,6 +1021,65 @@ mod tests {
     }
 
     #[test]
+    fn a_content_manifest_is_verified_against_the_content_key_in_force_not_the_embedded_one() {
+        let manifest = signed_manifest_json(2, vec![entry("rules/v2.sigma")]);
+        let state = ContentState::default();
+        let embedded = updater::key::CONTENT_PUBLIC_KEY.unwrap();
+        assert!(plan_with_key(&manifest, "canary_0", &state, Some(&embedded)).is_ok());
+        // After a rotation of `content`, the retired key's signature no longer counts.
+        assert!(matches!(
+            plan_with_key(&manifest, "canary_0", &state, Some(&[0x61; 32])),
+            Err(UpdaterError::SignatureInvalid)
+        ));
+        assert!(matches!(
+            plan_with_key(&manifest, "canary_0", &state, None),
+            Err(UpdaterError::SigningKeyUnprovisioned)
+        ));
+    }
+
+    #[test]
+    fn an_older_offer_is_reported_as_such_not_as_up_to_date() {
+        // #665: the server rolled release 4 back and offers 2 to an agent that applied 4.
+        let older = describe_unchanged_offer("canary_0", 2, 4);
+        assert!(older.contains("OLDER than release 4"), "{older}");
+        assert!(older.contains("stays on release 4"), "{older}");
+        assert!(
+            older.contains("corrective release numbered above 4"),
+            "{older}"
+        );
+        assert!(!older.contains("up to date"), "{older}");
+        // The release already applied is still plainly up to date, wording unchanged.
+        assert_eq!(
+            describe_unchanged_offer("canary_0", 4, 4),
+            "ring canary_0: up to date (release 4, server offers 4)"
+        );
+    }
+
+    #[test]
+    fn an_agent_on_release_n_ignores_the_servers_n_minus_1_after_a_rollback() {
+        let mut state = ContentState::default();
+        state
+            .entries
+            .insert("rules/v4.sigma".into(), "a".repeat(64));
+        state.release_version.insert("canary_0".into(), 4);
+        let rolled_back_to = signed_manifest_json(2, vec![entry("rules/v2.sigma")]);
+        assert!(matches!(
+            plan(&rolled_back_to, "canary_0", &state),
+            Err(UpdaterError::ReleaseNotNewer {
+                offered: 2,
+                current: 4
+            })
+        ));
+        // And a corrective release numbered above the applied one *is* applied: it carries the
+        // older content, so the agent converges on it.
+        let corrective = signed_manifest_json(5, vec![entry("rules/v2.sigma")]);
+        let fetch_plan = plan(&corrective, "canary_0", &state).unwrap();
+        assert_eq!(fetch_plan.release_version, 5);
+        assert_eq!(fetch_plan.to_fetch.len(), 1);
+        assert_eq!(fetch_plan.to_remove, ["rules/v4.sigma"]);
+    }
+
+    #[test]
     fn a_fresh_install_needs_every_entry() {
         let manifest = signed_manifest_json(1, vec![entry("rules/a.sigma")]);
         let state = ContentState::default();
@@ -1172,6 +1289,7 @@ mod tests {
             &endpoint_at(&url),
             "canary_0",
             &content_dir,
+            &dir,
             &state_path,
             "unused-ipc-endpoint",
         )
@@ -1198,6 +1316,7 @@ mod tests {
             &endpoint_at(&url),
             "canary_0",
             &dir.join("content"),
+            &dir,
             &dir.join("content-state.json"),
             "unused-ipc-endpoint",
         )
@@ -1724,6 +1843,7 @@ mod tests {
             &endpoint_at(&url),
             "canary_0",
             &content_dir,
+            &dir,
             &state_path,
             "unused-ipc-endpoint",
         )

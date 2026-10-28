@@ -3,14 +3,11 @@ set -e
 
 case "$1" in
     purge)
-        # Clean uninstall: remove all state
+        # Clean uninstall: remove all state. synthaea-ctl itself is a regular
+        # package asset now (#897), not a symlink dpkg never knew about — it
+        # already removed /usr/bin/synthaea-ctl before this script ran.
         rm -rf /var/lib/synthaea /var/log/synthaea /run/synthaea
-        rm -f /usr/bin/synthaea-ctl
         # Keep user for forensics (commented): deluser --system synthaea || true
-        ;;
-    remove)
-        # Remove symlink but preserve data
-        rm -f /usr/bin/synthaea-ctl
         ;;
 esac
 

@@ -28,17 +28,19 @@
 use core::net::{IpAddr, Ipv4Addr};
 
 use crate::{
-    AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, CapSetEvent,
-    ConnectEvent, DefenderEvent, DefenderEventKind, DnsQueryEvent, EventMeta, ExecEvent,
-    FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent, FileQuarantineEvent,
-    FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent, HttpRequestEvent,
-    HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent,
-    KernelModuleAction, KernelModuleEvent, LdapSearchEvent, ListenPortEvent, MemfdCreateEvent,
-    NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, PrctlEvent, ProcessVmReadEvent,
-    ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
-    SessionEvent, SessionState, ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
-    SocketCreateEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
-    UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
+    AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BitsJobEvent,
+    BitsJobState, BpfEvent, CapSetEvent, ConnectEvent, DefenderEvent, DefenderEventKind,
+    DnsQueryEvent, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent,
+    FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
+    FileWriteEvent, HttpRequestEvent, HttpSignature, HttpSummaryEvent, IdentityChangeEvent,
+    IdentityChangeKind, ImageLoadEvent, KernelModuleAction, KernelModuleEvent, LdapSearchEvent,
+    ListenPortEvent, LogClearedEvent, MemfdCreateEvent, NamespaceEvent, NamespaceSyscall,
+    NetworkFlowEvent, NtlmAuthEvent, NtlmDirection, PackageChangeEvent, PackageChangeKind,
+    PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
+    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent, SessionState, ShellType,
+    SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketCreateEvent, SocketListenEvent,
+    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, User,
+    WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -71,6 +73,10 @@ pub fn exec() -> ExecEvent {
         parent_image_path: None,
         sha256: None,
         signature: None,
+        original_file_name: None,
+        company_name: None,
+        file_description: None,
+        product_name: None,
         env_security: Vec::new(),
     }
 }
@@ -103,6 +109,8 @@ pub fn dns_query() -> DnsQueryEvent {
         query: String::new(),
         qtype: 0,
         result: None,
+        results: Vec::new(),
+        results_truncated: false,
         status: 0,
     }
 }
@@ -125,6 +133,32 @@ pub fn image_load() -> ImageLoadEvent {
     ImageLoadEvent {
         meta: meta(),
         image_path: String::new(),
+    }
+}
+
+/// Neutral [`NtlmAuthEvent`].
+#[must_use]
+pub fn ntlm_auth() -> NtlmAuthEvent {
+    NtlmAuthEvent {
+        meta: meta(),
+        direction: NtlmDirection::Outgoing,
+        user: String::new(),
+        target: String::new(),
+        remote_address: None,
+        ntlm_version: String::new(),
+        status: None,
+    }
+}
+
+/// Neutral [`LogClearedEvent`]: the System log, no account named.
+#[must_use]
+pub fn log_cleared() -> LogClearedEvent {
+    LogClearedEvent {
+        meta: meta(),
+        channel: "System".into(),
+        subject_user: String::new(),
+        subject_logon_id: None,
+        backup_path: None,
     }
 }
 
@@ -281,6 +315,21 @@ pub fn file_quarantine() -> FileQuarantineEvent {
     }
 }
 
+/// Neutral [`BitsJobEvent`]: a file added to an untitled job, empty URL and path.
+#[must_use]
+pub fn bits_job() -> BitsJobEvent {
+    BitsJobEvent {
+        meta: meta(),
+        job_id: String::new(),
+        job_title: String::new(),
+        state: BitsJobState::FileAdded,
+        url: String::new(),
+        local_path: String::new(),
+        bytes_transferred: None,
+        hresult: None,
+    }
+}
+
 /// Neutral [`ListenPortEvent`] on [`TEST_ADDR`].
 #[must_use]
 pub fn listen_port() -> ListenPortEvent {
@@ -430,6 +479,34 @@ pub fn socket_accept() -> SocketAcceptEvent {
         accepted_fd: 0,
         peer_addr: TEST_ADDR,
         peer_port: 0,
+    }
+}
+
+/// Neutral [`PackageChangeEvent`] (an upgrade; override `change`/`previous_version`/
+/// `version` via struct-update syntax for `Added`/`Removed`).
+#[must_use]
+pub fn package_change() -> PackageChangeEvent {
+    PackageChangeEvent {
+        meta: meta(),
+        package: "openssl".into(),
+        change: PackageChangeKind::Upgraded,
+        previous_version: Some("3.0.13-1".into()),
+        version: Some("3.0.15-1".into()),
+    }
+}
+
+/// Neutral [`PolicyDenialEvent`]: no mechanism, no contexts, not enforced.
+#[must_use]
+pub fn policy_denial() -> PolicyDenialEvent {
+    PolicyDenialEvent {
+        meta: meta(),
+        mechanism: String::new(),
+        subject_context: None,
+        object_context: None,
+        object_class: None,
+        action: None,
+        enforced: false,
+        object_path: None,
     }
 }
 

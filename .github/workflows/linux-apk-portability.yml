@@ -1,0 +1,165 @@
+name: Linux static .apk portability
+
+on:
+  pull_request:
+    paths:
+      - "agent/**"
+      - "watchdog/**"
+      - "crates/ml/**"
+      - "crates/sensors/linux/**"
+      - "crates/updater/**"
+      - "packaging/linux/**"
+      - "lab/provisioning/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/config.toml"
+      - "rust-toolchain.toml"
+      - "ebpf-toolchain.txt"
+      - ".github/workflows/linux-apk-portability.yml"
+  push:
+    branches: [main]
+    paths:
+      - "agent/**"
+      - "watchdog/**"
+      - "crates/ml/**"
+      - "crates/sensors/linux/**"
+      - "crates/updater/**"
+      - "packaging/linux/**"
+      - "lab/provisioning/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/config.toml"
+      - "rust-toolchain.toml"
+      - "ebpf-toolchain.txt"
+      - ".github/workflows/linux-apk-portability.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-upgrade-apk:
+    runs-on: ubuntu-latest
+    # Two full abuild runs (a fresh install build, then a bumped-pkgrel
+    # rebuild for the upgrade check) plus one from-source ONNX Runtime build
+    # shared across both — linux-deb-portability.yml's single build already
+    # needs most of its 90-minute budget for the ONNX Runtime step alone.
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build, install, upgrade and remove the .apk on Alpine/musl
+        run: |
+          # Same Docker Hub anonymous-pull backoff as linux-deb-portability.yml
+          # (shared rate limit across every GitHub-hosted runner, nothing to
+          # do with this repo's own pull volume).
+          for i in 1 2 3 4 5; do
+            docker pull alpine:3.24 && break
+            echo "::warning::docker pull alpine:3.24 failed (attempt $i/5)"
+            [ "$i" -lt 5 ] && sleep $((i * 10))
+          done
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -v /sys/kernel/btf:/sys/kernel/btf:ro \
+            -w /work alpine:3.24 sh -lc '
+              set -eux
+              apk add --no-cache sudo bash alpine-sdk
+
+              # abuild refuses to run as root; a throwaway signing key is
+              # enough to let it produce and index a package in this
+              # ephemeral container (not the ADR-0027 agent-update key,
+              # which this never touches, and not meant to be trusted
+              # beyond this one job). NOPASSWD for everything, not just
+              # apk: alpine-toolchain.sh also uses sudo to symlink
+              # bpf-linker into /usr/local/bin, and abuild itself shells
+              # out to sudo apk to install makedepends — restricting the
+              # rule to one binary just means the next sudo call in either
+              # script hangs on a password prompt that cannot be answered.
+              adduser -D builder
+              addgroup builder abuild
+              echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
+              chmod 0440 /etc/sudoers.d/builder
+              chown -R builder:builder /work
+
+              su builder -c "
+                set -eux
+                export HOME=/home/builder
+                export SYNTHAEA_SRC=/work
+                cd /work
+                bash ./lab/provisioning/alpine-toolchain.sh
+                abuild-keygen -a -i -n
+
+                # Built once, outside both abuild runs below: the APKBUILD
+                # only builds ONNX Runtime itself when ORT_LIB_LOCATION is
+                # unset, and the two runs (install build, then the bumped-
+                # pkgrel rebuild for the upgrade check) have no reason to
+                # pay for it twice.
+                bash ./lab/provisioning/build-onnxruntime-static.sh
+                export ORT_LIB_LOCATION=/work/onnxruntime/build/Linux/Release
+                export CARGO_TARGET_DIR=/work/target
+
+                cd packaging/linux/alpine
+                abuild -r
+                APK1=\$(find \$HOME/packages -name \"synthaea-agent-*.apk\" -print -quit)
+                [ -n \"\$APK1\" ] || { echo \"no .apk produced by the first build\" >&2; exit 1; }
+                echo \"APK1=\$APK1\" >> /tmp/apk-paths
+
+                sed -i \"s/^pkgrel=0/pkgrel=1/\" APKBUILD
+                abuild -r
+                APK2=\$(find \$HOME/packages -name \"synthaea-agent-0.1.0-r1.apk\" -print -quit)
+                [ -n \"\$APK2\" ] || { echo \"no .apk produced by the upgrade rebuild (pkgrel bump did not take)\" >&2; exit 1; }
+                echo \"APK2=\$APK2\" >> /tmp/apk-paths
+              "
+
+              # Both .apk files live under /home/builder inside this
+              # container, not under the /work bind mount — copy the
+              # upgraded one out so the next step (a separate container)
+              # can still reach it after this one exits.
+              . /tmp/apk-paths
+              cp "$APK1" "$APK2" /work/
+
+              # Install, upgrade and remove as root (apk itself, not abuild):
+              # a plain user installing packages needs the same privilege a
+              # real `apk add`/`apk upgrade` on a host would.
+              fail() { echo "error: $*" >&2; exit 1; }
+
+              echo "== install (pkgrel 0) =="
+              apk add --allow-untrusted "$APK1"
+              sh -n /etc/init.d/synthaea-agent || fail "installed openrc-run script is not valid shell"
+              /var/lib/synthaea/bootstrap/agent --help >/dev/null || fail "freshly installed agent --help failed"
+              caps_before="$(grep "^capabilities=" /etc/init.d/synthaea-agent)"
+              [ -n "$caps_before" ] || fail "no capabilities= line in the freshly installed openrc-run script"
+
+              echo "== upgrade to pkgrel 1 =="
+              apk add --allow-untrusted --upgrade "$APK2"
+              sh -n /etc/init.d/synthaea-agent || fail "upgraded openrc-run script is not valid shell"
+              /var/lib/synthaea/bootstrap/agent --help >/dev/null || fail "agent --help failed after upgrade"
+              caps_after="$(grep "^capabilities=" /etc/init.d/synthaea-agent)"
+              [ "$caps_before" = "$caps_after" ] || fail "capabilities= directive changed across the upgrade ($caps_before -> $caps_after)"
+
+              echo "== remove =="
+              apk del synthaea-agent || fail "apk del did not run cleanly"
+
+              chown -R "$(stat -c %u /work)":"$(stat -c %g /work)" /work/target /work/onnxruntime
+            '
+
+      - name: Run packaged agent on supported glibc userlands
+        run: |
+          APK="$(find "$GITHUB_WORKSPACE" -maxdepth 6 -name 'synthaea-agent-0.1.0-r1.apk' -print -quit)"
+          [ -n "$APK" ] || { echo "could not find the upgraded .apk to extract" >&2; exit 1; }
+          mkdir -p "$RUNNER_TEMP/synthaea-package"
+          tar -xz -f "$APK" -C "$RUNNER_TEMP/synthaea-package"
+          for image in ubuntu:22.04 debian:12 rockylinux:9; do
+            echo "Checking agent in $image"
+            for i in 1 2 3 4 5; do
+              docker pull "$image" && break
+              echo "::warning::docker pull $image failed (attempt $i/5)"
+              [ "$i" -lt 5 ] && sleep $((i * 10))
+            done
+            docker run --rm \
+              -v "$RUNNER_TEMP/synthaea-package:/package:ro" \
+              "$image" \
+              /package/var/lib/synthaea/bootstrap/agent --help
+          done

@@ -19,14 +19,16 @@ use schema::{
 };
 
 use crate::{
-    amsi, budget, etw_sessions, hcs,
+    amsi,
+    bits::BitsJobs,
+    budget, etw_sessions, hcs,
     long_path::{self, LongPathCache},
     normalize,
     pid_cache::PidCache,
     providers::{
-        ALL_PROVIDERS, amsi_provider, dns_provider, dotnet_provider, file_provider, ldap_provider,
-        network_provider, powershell_provider, process_provider, registry_provider, smb_provider,
-        wmi_provider,
+        ALL_PROVIDERS, amsi_provider, bits_provider, dns_provider, dotnet_provider, file_provider,
+        ldap_provider, network_provider, ntlm_provider, powershell_provider, process_provider,
+        registry_provider, smb_provider, wmi_provider,
     },
     silo::{self, SiloDirectory},
     winapi,
@@ -62,6 +64,10 @@ const LDAP_PER_PID_WINDOW_NS: u64 = 10_000_000_000;
 /// Silos waiting for a container lookup (#371). A full queue loses nothing:
 /// the pass already queued probes every container not yet mapped.
 const SILO_REQUEST_CAPACITY: usize = 16;
+/// An identical NTLM authentication (direction, account, target, address, version) is
+/// reported once per this window (#364): most come from pid 4, so there is no per-process
+/// budget.
+const NTLM_DEDUP_WINDOW_NS: u64 = 60_000_000_000;
 
 /// Stops an orphaned ETW session. Named sessions are kernel objects that outlive
 /// the creating process: after a `taskkill /f` or crash the session stays Running
@@ -288,6 +294,9 @@ pub(crate) struct SharedState {
     /// #365/#439: `Zone.Identifier` writes, queued for the read-back worker
     /// (which owns the one-`FileQuarantine`-per-write dedup).
     pub(crate) marks: MarkQueue,
+    /// #284: BITS jobs in flight, between their file-added record and their
+    /// last one.
+    pub(crate) bits: Mutex<BitsJobs>,
     /// F-2: events observed — the silence watchdog reads this.
     pub(crate) events_seen: AtomicU64,
     /// AMSI volume gate (#282): dedup + per-process budget.
@@ -299,6 +308,9 @@ pub(crate) struct SharedState {
     pub(crate) silos: Arc<Mutex<SiloDirectory>>,
     /// Silos the lookup thread should name.
     silo_requests: SyncSender<u32>,
+    /// NTLM dedup (#364): one event per (direction, account, target,
+    /// address, version) per minute.
+    pub(crate) ntlm: Mutex<budget::KeyDedup>,
     /// The liveness canary file: the run loop touches it every heartbeat, which
     /// MUST produce a Kernel-File event (our pid is tracked) — so sensor liveness
     /// is deterministic instead of traffic-dependent (a quiet host produces no
@@ -308,9 +320,19 @@ pub(crate) struct SharedState {
 }
 
 impl SharedState {
-    /// The identity of the process an event is about: its token user (F-3)
-    /// and its container (#371).
+    /// The identity of the process an event is about: its token user (F-3),
+    /// its container (#371) and the incarnation stamps of it and its parent
+    /// (#725), as the pid store recorded them. `ppid` 0 (an event that names no parent) has no stamp.
     pub(crate) fn meta(&self, pid: u32, ppid: u32, comm: String, timestamp_ns: u64) -> EventMeta {
+        let (process_generation, parent_process_generation) = {
+            let pids = self.pids.lock().unwrap();
+            let parent = if ppid == 0 {
+                None
+            } else {
+                pids.generation(ppid)
+            };
+            (pids.generation(pid), parent)
+        };
         EventMeta {
             pid,
             ppid,
@@ -319,8 +341,8 @@ impl SharedState {
             timestamp_ns,
             comm,
             container: self.container_of(pid, timestamp_ns),
-            process_generation: None,
-            parent_process_generation: None,
+            process_generation,
+            parent_process_generation,
         }
     }
 
@@ -366,11 +388,12 @@ impl SharedState {
             None => {
                 // ETW race: ConnectEvent before the ExecEvent populated the store.
                 let resolved = winapi::resolve_pid_live(pid)?;
+                let generation = winapi::read_process_sequence_number(pid);
                 let silo = winapi::read_server_silo_id(pid);
                 self.pids
                     .lock()
                     .unwrap()
-                    .insert(pid, resolved.clone(), silo);
+                    .insert(pid, resolved.clone(), generation, silo);
                 resolved
             }
         };
@@ -434,7 +457,12 @@ fn probe_silo(pid: u32, image: &str) -> Option<u32> {
 fn seed_pid_store(state: &SharedState) {
     let mut pids = state.pids.lock().unwrap();
     for (pid, name) in winapi::snapshot_processes() {
-        pids.insert(pid, name, winapi::read_server_silo_id(pid));
+        pids.insert(
+            pid,
+            name,
+            winapi::read_process_sequence_number(pid),
+            winapi::read_server_silo_id(pid),
+        );
     }
     tracing::info!(processes = pids.len(), "pid store seeded");
 }
@@ -555,6 +583,7 @@ impl Sensor for WindowsSensor {
             long_paths: Mutex::new(LongPathCache::new(LONG_PATH_CACHE_CAP)),
             dedup: Mutex::new(normalize::ConnectDedup::new(60_000_000_000)),
             marks,
+            bits: Mutex::new(BitsJobs::default()),
             events_seen: AtomicU64::new(0),
             amsi: Mutex::new(amsi::AmsiGate::default()),
             ldap: Mutex::new(budget::PidBudget::new(
@@ -564,6 +593,7 @@ impl Sensor for WindowsSensor {
             )),
             silos,
             silo_requests,
+            ntlm: Mutex::new(budget::KeyDedup::new("ntlm", NTLM_DEDUP_WINDOW_NS)),
             canary_path: canary_file
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -587,7 +617,9 @@ impl Sensor for WindowsSensor {
             .enable(dotnet_provider(sink.clone(), state.clone()))
             .enable(smb_provider(sink.clone(), state.clone()))
             .enable(amsi_provider(sink.clone(), state.clone()))
-            .enable(ldap_provider(sink, state.clone()));
+            .enable(bits_provider(sink.clone(), state.clone()))
+            .enable(ldap_provider(sink.clone(), state.clone()))
+            .enable(ntlm_provider(sink, state.clone()));
         let trace = normalize::start_or_stop_session(
             &session,
             || builder.start_and_process(),

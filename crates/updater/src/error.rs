@@ -74,6 +74,60 @@ pub enum UpdaterError {
         actual: String,
     },
 
+    /// A snapshot manifest's `kind` is not one this build knows (ADR-0033: only `common-set`).
+    #[error("snapshot manifest kind `{found}` is not supported")]
+    SnapshotKindUnsupported { found: String },
+
+    /// A snapshot manifest's `built_at` is not later than the snapshot in force: a replay or a
+    /// rollback of the server's own state. The snapshot in force stays (ADR-0033 decision 3).
+    #[error("snapshot built at {offered} is not newer than the one in force ({current})")]
+    SnapshotNotNewer { offered: u64, current: u64 },
+
+    /// A snapshot manifest claims to be built further in the future than the clock-skew
+    /// tolerance allows: a wrong server clock, or a manifest made to outlive its maximum age.
+    #[error("snapshot built at {built_at} is dated beyond now ({now}) plus the tolerance")]
+    SnapshotFromFuture { built_at: u64, now: u64 },
+
+    /// The artifact does not match the signed manifest that names it (size, hash, or a header
+    /// that disagrees with the manifest).
+    #[error("snapshot artifact does not match its manifest: {0}")]
+    SnapshotArtifactMismatch(String),
+
+    /// A key-rotation manifest is not well formed (ADR-0027): it names no key, half a pair, a key
+    /// that is not canonical hex, a window that is empty or too long, or its result would break
+    /// the split between roles. Checked before its signature is trusted for anything.
+    #[error("key-rotation manifest is malformed: {0}")]
+    RotationMalformed(&'static str),
+
+    /// A key-rotation manifest retires a key that is not the one this install trusts for `role`:
+    /// a replay, or a manifest written for another key state.
+    #[error(
+        "key-rotation manifest does not apply: it retires a {role} key this install does not trust"
+    )]
+    RotationDoesNotApply { role: &'static str },
+
+    /// A key-rotation manifest is past its `expires_at`.
+    #[error("key-rotation manifest expired at {expires_at} (now {now})")]
+    RotationExpired { expires_at: u64, now: u64 },
+
+    /// A key-rotation manifest is dated beyond now plus the clock-skew tolerance.
+    #[error(
+        "key-rotation manifest issued at {issued_at} is dated beyond now ({now}) plus the tolerance"
+    )]
+    RotationNotYetValid { issued_at: u64, now: u64 },
+
+    /// The file that records the applied key rotations exists but cannot be trusted: it does not
+    /// parse, one of its rotations does not verify under the embedded `recovery` key, they are not
+    /// in increasing `release_version` order, or they do not lead from this build's embedded keys.
+    /// Refused rather than ignored: a file that exists proves a rotation happened, and falling
+    /// back to the embedded keys could re-trust a key that was rotated away from.
+    #[error("the key-rotation record is not trustworthy: {reason}")]
+    TrustStateCorrupt { reason: String },
+
+    /// The install already holds [`crate::trust_state::MAX_ROTATIONS`] rotations.
+    #[error("this install already holds the maximum of {0} recorded key rotations")]
+    TrustStateFull(usize),
+
     /// Filesystem I/O failed — the underlying [`std::io::Error`] carries the
     /// specifics (missing permissions, disk full, etc).
     #[error("I/O error on {path}: {source}")]

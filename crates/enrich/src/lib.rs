@@ -9,7 +9,8 @@
 //! ## Latency budget
 //!
 //! Enrichment runs on the agent's event path, so it is budgeted, not best-effort:
-//! - Cache hit (same path, mtime, size): a metadata stat — microseconds.
+//! - Cache hit (same path, mtime, size, file identity): a stat, an open and a
+//!   metadata query on the handle — microseconds.
 //! - Cache miss: one streaming SHA-256 read, refused above [`MAX_HASH_BYTES`]
 //!   (result: hash absent, reason logged) so a multi-GB binary can never stall the
 //!   pipeline.
@@ -19,10 +20,16 @@
 //!   lookup (see `sig.rs`) before settling on `Unsigned` — a handful of extra Win32
 //!   calls, but only on that one path, and only once per cache miss.
 
+mod pe_info;
 mod sig;
 
-use std::{io::Read as _, path::Path};
+use std::{
+    fs::File,
+    io::{Read as _, Seek as _},
+    path::Path,
+};
 
+pub use pe_info::PeInfo;
 use schema::Signature;
 use sha2::{Digest, Sha256};
 use store::BoundedMap;
@@ -39,29 +46,45 @@ pub struct FileEnrichment {
     /// Lowercase hex SHA-256; `None` when the file was unreadable or over budget.
     pub sha256: Option<String>,
     pub signature: Signature,
+    /// PE version-resource metadata (issue #983): empty (every field `None`) on
+    /// every platform but Windows, and on Windows too when the image has none,
+    /// enrichment could not read it, or the image was over [`MAX_HASH_BYTES`] —
+    /// same budget as the hash, see `pe_info`'s module doc for why reading it
+    /// costs comparably little once the file is already open for the other two.
+    pub pe_info: PeInfo,
 }
 
 #[derive(Clone, PartialEq, Eq)]
 struct CacheEntry {
     mtime_ns: u128,
     size: u64,
-    /// Unix: (dev, inode) — an attacker can set mtime and size at will
-    /// (`touch -r`), but cannot keep them while swapping the underlying inode
-    /// without the pair changing (review finding: mtime+size alone made the
-    /// cached verdict spoofable). Windows: 0 (no cheap stable id via metadata).
-    file_id: (u64, u64),
+    /// Unix: (dev, inode). Windows: (volume serial, 128-bit file id). An attacker
+    /// can set mtime and size at will (`touch -r`, `SetFileTime`), but cannot keep
+    /// them while swapping the underlying file without the identity changing
+    /// (review finding: mtime+size alone made the cached verdict spoofable; #688
+    /// for Windows, where it was a constant until then). `None`: the file system
+    /// gave no identity, and the entry is never trusted.
+    file_id: Option<FileId>,
     enrichment: FileEnrichment,
 }
 
+/// Which file object an entry describes: (volume or device, file id or inode).
+type FileId = (u64, u128);
+
 #[cfg(unix)]
-fn file_id(meta: &std::fs::Metadata) -> (u64, u64) {
+fn file_id(_file: &File, meta: &std::fs::Metadata) -> Option<FileId> {
     use std::os::unix::fs::MetadataExt;
-    (meta.dev(), meta.ino())
+    Some((meta.dev(), u128::from(meta.ino())))
 }
 
-#[cfg(not(unix))]
-fn file_id(_meta: &std::fs::Metadata) -> (u64, u64) {
-    (0, 0)
+#[cfg(windows)]
+fn file_id(file: &File, _meta: &std::fs::Metadata) -> Option<FileId> {
+    sig::file_identity(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_id(_file: &File, _meta: &std::fs::Metadata) -> Option<FileId> {
+    None
 }
 
 /// The enrichment engine: owns the cache. One instance per agent, behind whatever
@@ -84,24 +107,48 @@ impl Enricher {
         }
     }
 
-    /// Enriches one file. Cached by (path, mtime, size): an unchanged file is a
-    /// metadata stat; a changed or unknown file is one bounded hash + one signature
-    /// verification.
+    /// Enriches one file. Cached by (path, mtime, size, file identity): an unchanged
+    /// file is a stat and an open; a changed or unknown file is one bounded hash + one
+    /// signature verification.
+    ///
+    /// The file is opened once, and its metadata, identity, signature and hash all come
+    /// from that handle (#688). Whatever the path points at after the open (a rename,
+    /// a replacement), the verdict and the hash describe the same file object, and the
+    /// cache key is that object's identity.
     pub fn enrich(&mut self, path: &Path) -> FileEnrichment {
-        let Ok(meta) = std::fs::metadata(path) else {
-            return FileEnrichment {
-                sha256: None,
-                signature: Signature::Unsupported,
-            };
+        self.enrich_with(path, true)
+    }
+
+    /// [`Self::enrich`] without trusting a cache hit: always hashes and verifies,
+    /// then refreshes the entry. For a caller whose decision rests on the verdict
+    /// (#441: a `Valid` signature silences T1204.002). On Windows the cache key has
+    /// no file identity, so a same-size replacement with its mtime restored would
+    /// hit an entry describing the file it replaced.
+    pub fn enrich_uncached(&mut self, path: &Path) -> FileEnrichment {
+        self.enrich_with(path, false)
+    }
+
+    fn enrich_with(&mut self, path: &Path, trust_cache: bool) -> FileEnrichment {
+        let unsupported = FileEnrichment {
+            sha256: None,
+            signature: Signature::Unsupported,
+            pe_info: PeInfo::default(),
         };
         // FIFOs, device nodes, sockets: opening one can block forever (a named
         // pipe with no writer) or read an endless stream — the event path must
-        // never touch them (review finding).
+        // never touch them (review finding). Checked by path before the open.
+        if !std::fs::metadata(path).is_ok_and(|meta| meta.is_file()) {
+            return unsupported;
+        }
+        let Ok(mut file) = File::open(path) else {
+            return unsupported;
+        };
+        // Checked again on the handle: the path may have been swapped since.
+        let Ok(meta) = file.metadata() else {
+            return unsupported;
+        };
         if !meta.is_file() {
-            return FileEnrichment {
-                sha256: None,
-                signature: Signature::Unsupported,
-            };
+            return unsupported;
         }
         let mtime_ns = meta
             .modified()
@@ -111,24 +158,39 @@ impl Enricher {
             .unwrap_or(0);
         let size = meta.len();
 
-        let id = file_id(&meta);
-        if let Some(entry) = self.cache.get(&path.to_path_buf())
+        let id = file_id(&file, &meta);
+        if trust_cache
+            && let Some(id) = id
+            && let Some(entry) = self.cache.get(&path.to_path_buf())
             && entry.mtime_ns == mtime_ns
             && entry.size == size
-            && entry.file_id == id
+            && entry.file_id == Some(id)
         {
             return entry.enrichment.clone();
         }
 
+        // Verified before hashing: the verifier reads the handle itself, and the
+        // hash then starts again from offset 0.
+        let signature = sig::verify(path, &file);
         let sha256 = if size <= MAX_HASH_BYTES {
-            hash_file(path)
+            file.rewind().ok().and_then(|()| hash_file(&mut file))
         } else {
             tracing::debug!(path = %path.display(), size, "enrich: over hash budget, skipping");
             None
         };
+        // Same budget as the hash (#983): a multi-GB binary must never stall this
+        // path for four cosmetic strings either. `pe_info::read` is a no-op on
+        // every platform but Windows regardless (see its module doc), so this
+        // check only ever skips real work there.
+        let pe_info = if size <= MAX_HASH_BYTES {
+            pe_info::read(path)
+        } else {
+            PeInfo::default()
+        };
         let enrichment = FileEnrichment {
             sha256,
-            signature: sig::verify(path),
+            signature,
+            pe_info,
         };
         self.cache.insert(
             path.to_path_buf(),
@@ -143,8 +205,7 @@ impl Enricher {
     }
 }
 
-fn hash_file(path: &Path) -> Option<String> {
-    let mut file = std::fs::File::open(path).ok()?;
+fn hash_file(file: &mut File) -> Option<String> {
     let mut hasher = Sha256::new();
     // `sha2` 0.11 dropped `impl Write for Sha256` (it never guaranteed the
     // infallible-write contract `io::Write` implies), so `io::copy` no longer
@@ -199,12 +260,124 @@ mod tests {
         assert_ne!(first, second, "changed content must re-hash");
     }
 
+    /// #688: before it, Windows keyed the cache on (path, mtime, size) only, the file
+    /// identity being a constant. A same-size file renamed over the original, with
+    /// the original's mtime set on it, then hit the old entry and reported the old
+    /// hash. Unix caught it by inode already.
+    #[test]
+    fn a_same_size_replacement_with_the_mtime_restored_is_rehashed() {
+        let p = tmp_file("swap-target", b"one");
+        let decoy = tmp_file("swap-decoy", b"two");
+        let mut e = Enricher::new();
+        let first = e.enrich(&p).sha256;
+        let mtime = std::fs::metadata(&p).unwrap().modified().unwrap();
+        File::options()
+            .write(true)
+            .open(&decoy)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        std::fs::rename(&decoy, &p).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().modified().unwrap(), mtime);
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), 3);
+
+        let second = e.enrich(&p).sha256;
+        assert_ne!(second, first, "a replaced file must not hit the old entry");
+        assert_eq!(
+            second.as_deref(),
+            // SHA-256("two").
+            Some("3fc4ccfe745870e2c0d99f71f30ff0656c8dedd41cc1d7d3d376b0dbe685e2f3")
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn file_identity_is_stable_for_one_file_and_differs_between_two() {
+        let a = tmp_file("id-a", b"a");
+        let b = tmp_file("id-b", b"b");
+        let id = |p: &Path| {
+            let file = File::open(p).unwrap();
+            let meta = file.metadata().unwrap();
+            file_id(&file, &meta)
+        };
+        #[cfg(any(unix, windows))]
+        {
+            assert!(
+                id(&a).is_some(),
+                "a local NTFS/ext4/APFS file has an identity"
+            );
+            assert_eq!(id(&a), id(&a));
+            assert_ne!(id(&a), id(&b));
+        }
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    #[test]
+    fn enrich_uncached_sees_a_same_size_rewrite_with_its_mtime_restored() {
+        let p = tmp_file("respoof", b"one");
+        let mut e = Enricher::new();
+        let first = e.enrich(&p).sha256;
+        let mtime = std::fs::metadata(&p).unwrap().modified().unwrap();
+        std::fs::write(&p, b"two").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        // The attack the cached path cannot see: same path, size and mtime, and
+        // on Unix the same inode (rewritten in place).
+        assert_eq!(e.enrich(&p).sha256, first, "the cached path is fooled");
+        let fresh = e.enrich_uncached(&p).sha256;
+        assert_ne!(fresh, first, "an uncached enrichment must re-hash");
+        assert_eq!(e.enrich(&p).sha256, fresh, "and refresh the cache entry");
+        std::fs::remove_file(&p).ok();
+    }
+
     #[test]
     fn missing_file_is_not_fatal() {
         let mut e = Enricher::new();
         let got = e.enrich(Path::new("/nonexistent/enrich-test"));
         assert_eq!(got.sha256, None);
         assert_eq!(got.signature, Signature::Unsupported);
+        assert!(got.pe_info.is_empty());
+    }
+
+    /// #983: `Enricher::enrich` wires `pe_info::read` through the same cache as the
+    /// hash and signature — a plain data file (no PE version resource, any platform)
+    /// must come back with every field `None` rather than erroring.
+    #[test]
+    fn non_pe_file_has_empty_pe_info() {
+        let p = tmp_file("pe-info-plain", b"not a PE file");
+        let mut e = Enricher::new();
+        assert!(e.enrich(&p).pe_info.is_empty());
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// Real platform coverage in CI, like `platform_signature_of_system_binary`:
+    /// `cmd.exe`'s `OriginalFilename` must come back through the full cache path,
+    /// not just `pe_info::read` in isolation (see `pe_info`'s own test, including
+    /// why the exact string is only checked loosely: it is build/locale-dependent).
+    #[cfg(windows)]
+    #[test]
+    fn enrich_fills_pe_info_for_a_windows_system_binary() {
+        let path = Path::new(r"C:\Windows\System32\cmd.exe");
+        if !path.exists() {
+            eprintln!("skipping: {} not present on this host", path.display());
+            return;
+        }
+        let mut e = Enricher::new();
+        let info = e.enrich(path).pe_info;
+        assert!(
+            info.original_file_name
+                .as_deref()
+                .is_some_and(|n| n.to_lowercase().starts_with("cmd.exe")),
+            "{info:?}"
+        );
+        // A second, cached call must return the same value, not re-derive it from a
+        // stale or absent cache entry.
+        assert_eq!(e.enrich(path).pe_info, info);
     }
 
     /// Real platform coverage in CI: a known system binary must verify as signed on

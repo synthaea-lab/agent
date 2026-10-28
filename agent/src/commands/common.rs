@@ -10,11 +10,11 @@ use tamper::heartbeat::SilenceMonitor;
 
 use crate::{
     health::{
-        DroppedCounter, HealthCollector, HealthCollectorConfig, NoopSpoolStats, SensorHealthSource,
-        SpoolStatsSource,
+        DroppedCounter, HealthCollector, HealthCollectorConfig, HostCountersSource, NoopSpoolStats,
+        RarityStatsSource, SensorHealthSource, SpoolStatsSource,
     },
     ipc_handler::{AgentHandler, SensorHealthSlot},
-    silence::SilenceHealthSource,
+    silence::{SilenceHealthSource, SourceStatus},
     sink::DetectionSink,
 };
 
@@ -101,6 +101,16 @@ pub(crate) fn wire_run_pipeline(
         content_dir,
         &crate::sink::model_root(&storage.state_dir),
     )?);
+    sink.start_correlator_ticker()?;
+
+    // The fleet common-set snapshot (ADR-0033): off unless this build embeds a `snapshot` key.
+    if let Some(handle) = &transport {
+        crate::snapshot_fetch::spawn_if_enabled(
+            Arc::clone(&handle.client),
+            content_dir.to_path_buf(),
+            Arc::clone(&sink),
+        );
+    }
 
     // Said where the operator reads it (the journal) and in the alert log, where `cli` and
     // the console look: detection runs, upload does not (`offline_fallback`).
@@ -161,6 +171,8 @@ pub(crate) fn wire_run_pipeline(
 pub(crate) fn health_collector(
     pipeline: &RunPipeline,
     silence_monitor: Arc<Mutex<SilenceMonitor>>,
+    best_effort_sources: Vec<SourceStatus>,
+    host_counters: Arc<dyn HostCountersSource>,
 ) -> HealthCollector {
     let spool_stats: Arc<dyn SpoolStatsSource> = match &pipeline.transport {
         Some(t) => Arc::new(crate::upload::SpoolHealth {
@@ -170,19 +182,30 @@ pub(crate) fn health_collector(
         None => Arc::new(NoopSpoolStats),
     };
     let heartbeat_client = pipeline.transport.as_ref().map(|t| Arc::clone(&t.client));
-    let silence_health: Arc<dyn SensorHealthSource> =
-        Arc::new(SilenceHealthSource::new(silence_monitor));
+    let silence_health: Arc<dyn SensorHealthSource> = Arc::new(SilenceHealthSource::new(
+        silence_monitor,
+        best_effort_sources,
+    ));
     let _ = pipeline.sensor_health.set(Arc::clone(&silence_health));
     HealthCollector::new(
         HealthCollectorConfig::default(),
         silence_health,
         spool_stats,
         Arc::new(pipeline.sink.enrich_queue().clone()) as Arc<dyn DroppedCounter>,
+        pipeline.sink.rarity_stats() as Arc<dyn RarityStatsSource>,
+        host_counters,
         move |beacon| {
             tracing::info!(
                 sensors = beacon.sensors.len(),
                 spool_bytes = beacon.spool_bytes,
                 enrich_dropped = beacon.enrich_dropped,
+                rarity_applied = beacon.rarity_applied,
+                rarity_withheld = beacon.rarity_withheld,
+                rarity_unapplied = beacon.rarity_unapplied,
+                watchdog_restarts = beacon.watchdog_restarts,
+                tamper_events = beacon.tamper_events,
+                parent_image_evicted_live = beacon.parent_image_evicted_live,
+                parent_image_evicted_dead = beacon.parent_image_evicted_dead,
                 "health beacon"
             );
             // #24/#134: the dedicated health channel — best-effort, an
@@ -231,7 +254,16 @@ mod tests {
         };
         let monitor = Arc::new(Mutex::new(SilenceMonitor::new()));
 
-        let _collector = health_collector(&pipeline, Arc::clone(&monitor));
+        let _collector = health_collector(
+            &pipeline,
+            Arc::clone(&monitor),
+            Vec::new(),
+            Arc::new(crate::host_counters::AgentHostCounters::new(
+                Arc::clone(&pipeline.sink),
+                crate::host_counters::WatchdogReport::default(),
+                None,
+            )),
+        );
         monitor
             .lock()
             .unwrap()

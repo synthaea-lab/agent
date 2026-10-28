@@ -3,6 +3,7 @@
 //! fixture (drift is a CI failure on both sides).
 
 pub mod cmdline;
+pub mod common_set;
 pub mod correlation;
 pub mod lineage;
 pub mod rarity;

@@ -21,8 +21,9 @@ use std::{
 use schema::{
     AuthEvent, AuthKind, AuthOutcome, DefenderEvent, DefenderEventKind, Event, EventMeta,
     FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT, FLAG_PERSISTENCE_TASK_ARTIFACT,
-    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, POLICY_MECHANISM_APPLOCKER,
-    POLICY_MECHANISM_WDAC, PolicyDenialEvent, SessionEvent, SessionState, User,
+    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, LogClearedEvent,
+    POLICY_MECHANISM_APPLOCKER, POLICY_MECHANISM_WDAC, PolicyDenialEvent, SessionEvent,
+    SessionState, User,
     sensor::{Capabilities, EventSink, Sensor, SensorError},
     time::now_ns,
 };
@@ -507,7 +508,7 @@ fn to_auth_event(logon: &LogonEvent) -> Option<Event> {
             pid: logon.pid,
             ppid: 0,
             user,
-            timestamp_ns: now_ns(),
+            timestamp_ns: logon.time_created_ns.unwrap_or_else(now_ns),
             comm: LSASS_COMM.to_string(),
             container: None, // attributed by the ETW sensor only (#371)
             process_generation: None,
@@ -579,7 +580,7 @@ static ACCOUNT_CREATIONS: PollTarget = PollTarget {
 // (`AppLocker` is a policy-configured feature, not an audit subcategory). If the
 // channel is disabled by group policy on a given host, `wevtutil qe` simply
 // returns nothing and this poll thread stays idle — the failure mode is a
-// coverage gap, not a crash.
+// coverage gap, not a crash, and the start-up channel check logs it (#786).
 
 /// `AppLocker` event id for "blocked" (enforce mode).
 const APPLOCKER_EVENT_BLOCKED: u32 = 8004;
@@ -725,10 +726,13 @@ static APPLOCKER_PACKAGED_DEPLOYMENT: PollTarget = PollTarget {
 
 // ── Event 106 — TaskScheduler Operational "task registered" ─────────────────
 //
-// The `Microsoft-Windows-TaskScheduler/Operational` channel is **enabled by
-// default** on all supported Windows SKUs (Task Scheduler being a core service)
-// — no `auditpol` interaction, complementing the Security 4698 path whose
-// `enable_scheduled_task_audit` may fail on a hardened host. When both channels
+// The `Microsoft-Windows-TaskScheduler/Operational` channel is Task Scheduler's
+// "history" switch, and it is **off by default**: disabled, with no log file, on a
+// Windows 11 25H2 client (lab, 2026-10-12, #786; Server not checked). Where an
+// operator turned it on, it needs no `auditpol` interaction and complements the
+// Security 4698 path whose `enable_scheduled_task_audit` may fail on a hardened
+// host. Where it is off, this target sees nothing and the start-up channel check
+// says so (`warn_about_disabled_channels`). When both channels
 // are up, one registration yields a 4698 and a 106 carrying the same task and
 // actions: both raw events are kept, and the rules layer reports the pair once
 // (`RuleState`'s scheduled-task registration dedup, #422).
@@ -792,7 +796,8 @@ static TASK_SCHEDULER_OP: PollTarget = PollTarget {
     id_filter: "EventID=106",
     counter: |c| &c.task_scheduler_op,
     parse_block: normalize_task_scheduler_op_registered,
-    // Operational channel, always on — nothing to enable.
+    // Off by default (Task Scheduler history). Not enabled here: like
+    // `AppLocker`'s channel, that is the operator's call (#786).
     enable_audit: None,
     enabled: |c| c.task_scheduler_op_enabled,
 };
@@ -1079,7 +1084,7 @@ fn session_event(ev: xml::TerminalSessionEvent, state: SessionState) -> Event {
             pid: ev.pid,
             ppid: 0,
             user: User::Unknown,
-            timestamp_ns: now_ns(),
+            timestamp_ns: ev.time_created_ns.unwrap_or_else(now_ns),
             comm: String::new(),
             container: None, // attributed by the ETW sensor only (#371)
             process_generation: None,
@@ -1156,6 +1161,86 @@ static RDP_CONNECTIONS: PollTarget = PollTarget {
     enabled: |c| c.terminal_sessions_enabled,
 };
 
+// ── Security 1102 / System 104 — an event log cleared (T1070.001, #799) ──────
+//
+// The Event Log service writes these itself as the first record of the log it
+// has just emptied, whatever asked for the clear (`wevtutil`, `EvtClearLog`,
+// .NET, a renamed copy of a tool), and no audit subcategory gates them: the
+// command-line rule cannot see the API paths, these can.
+
+const SECURITY_LOG_CLEARED: u32 = 1102;
+const LOG_FILE_CLEARED: u32 = 104;
+
+/// Normalizes a 1102 or a 104 into a [`LogClearedEvent`].
+///
+/// Skipped (cursor still advances): any other id the filter let through, and
+/// a 104 that does not name the channel it cleared — an alert that cannot say
+/// which log is gone is not worth guessing at.
+fn normalize_log_cleared_block(block: &str) -> ParsedBlock {
+    let record = xml::parse_log_cleared_event(block)?;
+    let record_id = record.record_id;
+    let channel = match record.event_id {
+        SECURITY_LOG_CLEARED => "Security".to_string(),
+        LOG_FILE_CLEARED => match record.cleared_channel {
+            Some(channel) => channel,
+            None => return Some((record_id, None)),
+        },
+        _ => return Some((record_id, None)),
+    };
+    let subject_user = match (record.subject_domain_name, record.subject_user_name) {
+        (Some(domain), Some(name)) => format!("{domain}\\{name}"),
+        (None, Some(name)) => name,
+        (_, None) => String::new(),
+    };
+    let user = record
+        .subject_sid
+        .map_or(User::Unknown, |sid| User::Windows {
+            sid,
+            integrity_level: None,
+        });
+    let event = Event::LogCleared(LogClearedEvent {
+        meta: EventMeta {
+            pid: record.client_pid.unwrap_or(record.pid),
+            ppid: 0,
+            user,
+            timestamp_ns: record.time_created_ns.unwrap_or_else(now_ns),
+            comm: String::new(),
+            container: None, // Windows: no container support
+            process_generation: None,
+            parent_process_generation: None,
+        },
+        channel,
+        subject_user,
+        subject_logon_id: record.subject_logon_id,
+        backup_path: record.backup_path,
+    });
+    Some((record_id, Some(event)))
+}
+
+static SECURITY_LOG_CLEARS: PollTarget = PollTarget {
+    label: "security-log-cleared",
+    heartbeat: "windows-eventlog:security-log-cleared",
+    channel: "Security",
+    id_filter: "EventID=1102",
+    counter: |c| &c.log_clears,
+    parse_block: normalize_log_cleared_block,
+    enable_audit: None,
+    enabled: |c| c.log_clears_enabled,
+};
+
+/// Event ids are per provider and the System log mixes dozens of them, so the
+/// filter names the Event Log service's own.
+static LOG_FILE_CLEARS: PollTarget = PollTarget {
+    label: "log-file-cleared",
+    heartbeat: "windows-eventlog:log-file-cleared",
+    channel: "System",
+    id_filter: "Provider[@Name='Microsoft-Windows-Eventlog'] and EventID=104",
+    counter: |c| &c.log_clears,
+    parse_block: normalize_log_cleared_block,
+    enable_audit: None,
+    enabled: |c| c.log_clears_enabled,
+};
+
 // ── Policy-configurable allowlist and volume counters (#94) ─────────────────
 //
 // `sensor-*` crates may depend only on `schema` (`tools/check-deps.py`), so
@@ -1230,8 +1315,9 @@ pub struct EventLogConfig {
     /// `PolicyDenialEvent` (#427).
     pub applocker_blocks_enabled: bool,
     /// Event 106 (T1053.005 — scheduled task registered via the
-    /// `Microsoft-Windows-TaskScheduler/Operational` channel; always-on
-    /// complement to the 4698 path).
+    /// `Microsoft-Windows-TaskScheduler/Operational` channel; complements the
+    /// 4698 path where Task Scheduler history is enabled, which it is not by
+    /// default, #786).
     pub task_scheduler_op_enabled: bool,
     /// Defender Operational: 1116/1117 verdicts and the 5001/5007/5010/5012
     /// tamper traces, reported as `DefenderEvent` (#283).
@@ -1243,6 +1329,9 @@ pub struct EventLogConfig {
     /// and RDP authentications (`RemoteConnectionManager` 1149), reported as
     /// `SessionEvent` (#285). Console sessions included.
     pub terminal_sessions_enabled: bool,
+    /// Security 1102 and System 104, an event log cleared by any means,
+    /// reported as `LogClearedEvent` (#799). Both channels are always on.
+    pub log_clears_enabled: bool,
 }
 
 /// Every poll target. Adding one = one entry here: its switch, heartbeat name
@@ -1262,6 +1351,8 @@ static TARGETS: &[&PollTarget] = &[
     &WDAC_OP,
     &SESSION_LIFECYCLE,
     &RDP_CONNECTIONS,
+    &SECURITY_LOG_CLEARS,
+    &LOG_FILE_CLEARS,
 ];
 
 impl Default for EventLogConfig {
@@ -1279,6 +1370,7 @@ impl Default for EventLogConfig {
             defender_enabled: true,
             wdac_enabled: true,
             terminal_sessions_enabled: true,
+            log_clears_enabled: true,
         }
     }
 }
@@ -1304,6 +1396,40 @@ pub struct EventLogCounters {
     pub wdac: AtomicU64,
     pub session_lifecycle: AtomicU64,
     pub rdp_connections: AtomicU64,
+    /// Security 1102 and System 104 together.
+    pub log_clears: AtomicU64,
+    /// Channels found disabled at start-up for an enabled target (#786): each
+    /// is polled or subscribed like any other but cannot deliver an event.
+    pub disabled_channels: AtomicU64,
+}
+
+/// One warning per enabled target channel that is switched off (#786). A disabled
+/// channel answers `wevtutil qe` with exit 0 and no events, so without this the
+/// target looks like a quiet, healthy one and its liveness counter keeps moving.
+/// Checked once per channel (several targets share `Security`), at start-up only:
+/// a channel switched off while the agent runs is not caught here.
+fn warn_about_disabled_channels(config: &EventLogConfig, counters: &EventLogCounters) {
+    let mut checked: Vec<&str> = Vec::new();
+    for target in TARGETS {
+        if !(target.enabled)(config) || checked.contains(&target.channel) {
+            continue;
+        }
+        checked.push(target.channel);
+        if crate::channel::is_enabled(target.channel) != Some(false) {
+            continue;
+        }
+        counters.disabled_channels.fetch_add(1, Ordering::Relaxed);
+        let targets: Vec<&str> = TARGETS
+            .iter()
+            .filter(|t| t.channel == target.channel && (t.enabled)(config))
+            .map(|t| t.label)
+            .collect();
+        tracing::warn!(
+            channel = target.channel,
+            targets = ?targets,
+            "event log channel is disabled: these targets will see no events until an              operator enables it (wevtutil sl \"<channel>\" /e:true)"
+        );
+    }
 }
 
 // ── The sensor ────────────────────────────────────────────────────────────────
@@ -1423,6 +1549,7 @@ impl Sensor for EventLogSensor {
                 enable_audit();
             }
         }
+        warn_about_disabled_channels(&self.config, &self.counters);
 
         // Two kinds of "hold this alive while we run" objects, kept in
         // separate vectors so their types stay concrete and their drops fire
@@ -1521,6 +1648,7 @@ mod config_tests {
         assert!(config.defender_enabled);
         assert!(config.wdac_enabled);
         assert!(config.terminal_sessions_enabled);
+        assert!(config.log_clears_enabled);
     }
 
     #[test]
@@ -1560,6 +1688,7 @@ mod config_tests {
             defender_enabled: false,
             wdac_enabled: false,
             terminal_sessions_enabled: false,
+            log_clears_enabled: false,
         });
         let caps = sensor.capabilities();
         assert!(!caps.file_events);
@@ -1579,6 +1708,7 @@ mod config_tests {
             defender_enabled: false,
             wdac_enabled: false,
             terminal_sessions_enabled: false,
+            log_clears_enabled: false,
         });
         assert!(sensor.capabilities().file_events);
     }
@@ -1597,6 +1727,7 @@ mod config_tests {
             defender_enabled: false,
             wdac_enabled: false,
             terminal_sessions_enabled: false,
+            log_clears_enabled: false,
             transport: EventLogTransport::default(),
         });
         assert!(!sensor.capabilities().file_events);
@@ -1614,6 +1745,7 @@ mod config_tests {
             defender_enabled: false,
             wdac_enabled: false,
             terminal_sessions_enabled: false,
+            log_clears_enabled: false,
             transport: EventLogTransport::default(),
         });
         assert!(sensor.capabilities().file_events);
@@ -1634,6 +1766,7 @@ mod config_tests {
         assert_eq!(counters.wdac.load(Ordering::Relaxed), 0);
         assert_eq!(counters.session_lifecycle.load(Ordering::Relaxed), 0);
         assert_eq!(counters.rdp_connections.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.log_clears.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1660,6 +1793,8 @@ mod config_tests {
                 "windows-eventlog:wdac",
                 "windows-eventlog:session-lifecycle",
                 "windows-eventlog:rdp-connection",
+                "windows-eventlog:security-log-cleared",
+                "windows-eventlog:log-file-cleared",
             ]
         );
     }
@@ -1676,6 +1811,7 @@ mod config_tests {
             defender_enabled: false,
             wdac_enabled: false,
             terminal_sessions_enabled: false,
+            log_clears_enabled: false,
             transport: EventLogTransport::Polling,
         });
         let names: Vec<_> = sensor.liveness().into_iter().map(|(n, _)| n).collect();
@@ -1751,6 +1887,53 @@ mod wevtutil_tests {
             last_known_record_id(target)
                 .unwrap_or_else(|e| panic!("{} on {}: {e}", target.label, target.channel));
         }
+    }
+
+    /// The 104 filter is the only one naming a provider: a malformed `XPath`
+    /// there would fail every poll. System is readable unelevated; Security
+    /// (1102) is not, and its filter is a plain id.
+    #[test]
+    fn the_log_file_cleared_filter_is_accepted_on_the_system_log() {
+        last_known_record_id(&LOG_FILE_CLEARS).expect("System 104 query");
+    }
+
+    /// #786: what the start-up check reports does not depend on the host. Each
+    /// disabled channel counts once, however many targets read it.
+    #[test]
+    fn each_disabled_target_channel_is_counted_once() {
+        let config = EventLogConfig::default();
+        let mut channels: Vec<&str> = TARGETS
+            .iter()
+            .filter(|t| (t.enabled)(&config))
+            .map(|t| t.channel)
+            .collect();
+        channels.sort_unstable();
+        channels.dedup();
+        let disabled = channels
+            .iter()
+            .filter(|c| crate::channel::is_enabled(c) == Some(false))
+            .count() as u64;
+
+        let counters = EventLogCounters::default();
+        warn_about_disabled_channels(&config, &counters);
+        assert_eq!(counters.disabled_channels.load(Ordering::Relaxed), disabled);
+    }
+
+    /// #786: a disabled channel answers a query with exit 0 and no events, the
+    /// same as a quiet one. That is why the poll loop cannot tell them apart and
+    /// the start-up check above exists. Ignored: it needs a channel that is off
+    /// on this host (Task Scheduler history is, on a default client install).
+    #[test]
+    #[ignore = "needs Microsoft-Windows-TaskScheduler/Operational disabled on this host"]
+    fn a_disabled_channel_looks_like_a_quiet_one_to_wevtutil() {
+        assert_eq!(
+            crate::channel::is_enabled(TASK_SCHEDULER_OP.channel),
+            Some(false),
+            "precondition: Task Scheduler history is off here"
+        );
+        let out = wevtutil(&["qe", TASK_SCHEDULER_OP.channel, "/c:1", "/f:xml"])
+            .expect("a disabled channel is not a failing query");
+        assert!(out.trim().is_empty());
     }
 }
 
@@ -2482,10 +2665,102 @@ mod session_tests {
 }
 
 #[cfg(test)]
+mod log_cleared_tests {
+    use super::*;
+
+    // Trimmed from the real 104 and 1102 captured in the lab (#799, see xml.rs).
+    const BLOCK_104: &str = "<Event><System><EventID>104</EventID>\
+        <TimeCreated SystemTime='2026-10-15T12:50:01.7166040Z'/><EventRecordID>78381</EventRecordID>\
+        <Execution ProcessID='3792' ThreadID='44592'/><Channel>System</Channel>\
+        <Security UserID='S-1-5-21-1-2-3-1001'/></System><UserData><LogFileCleared>\
+        <SubjectUserName>analyst</SubjectUserName><SubjectDomainName>LAB-W11</SubjectDomainName>\
+        <Channel>OpenSSH/Operational</Channel><BackupPath>C:\\Users\\analyst\\ssh.evtx</BackupPath>\
+        <ClientProcessId>41684</ClientProcessId></LogFileCleared></UserData></Event>";
+    const BLOCK_1102: &str = "<Event><System><EventID>1102</EventID>\
+        <EventRecordID>1399119</EventRecordID><Execution ProcessID='3792' ThreadID='47044'/>\
+        <Channel>Security</Channel><Security/></System><UserData><LogFileCleared>\
+        <SubjectUserSid>S-1-5-21-1-2-3-1001</SubjectUserSid><SubjectUserName>analyst</SubjectUserName>\
+        <SubjectDomainName>LAB-W11</SubjectDomainName><SubjectLogonId>0x37b4d</SubjectLogonId>\
+        <ClientProcessId>41684</ClientProcessId></LogFileCleared></UserData></Event>";
+
+    fn log_cleared(block: &str) -> LogClearedEvent {
+        match normalize_log_cleared_block(block) {
+            Some((_, Some(Event::LogCleared(e)))) => e,
+            other => panic!("expected a LogCleared event, got {other:?}"),
+        }
+    }
+
+    fn windows_user(sid: &str) -> User {
+        User::Windows {
+            sid: sid.into(),
+            integrity_level: None,
+        }
+    }
+
+    #[test]
+    fn a_104_reports_the_cleared_channel_and_the_clearing_process() {
+        let event = log_cleared(BLOCK_104);
+        assert_eq!(event.channel, "OpenSSH/Operational");
+        assert_eq!(event.subject_user, r"LAB-W11\analyst");
+        assert_eq!(event.meta.user, windows_user("S-1-5-21-1-2-3-1001"));
+        // The clearing process, not the Event Log service (3792).
+        assert_eq!(event.meta.pid, 41684);
+        assert_eq!(event.meta.timestamp_ns, 1_792_068_601_716_604_000);
+        assert_eq!(event.subject_logon_id, None);
+        assert_eq!(
+            event.backup_path.as_deref(),
+            Some(r"C:\Users\analyst\ssh.evtx")
+        );
+    }
+
+    #[test]
+    fn a_1102_is_the_security_log_with_its_logon_session() {
+        let event = log_cleared(BLOCK_1102);
+        assert_eq!(event.channel, "Security");
+        assert_eq!(event.subject_user, r"LAB-W11\analyst");
+        assert_eq!(event.meta.user, windows_user("S-1-5-21-1-2-3-1001"));
+        assert_eq!(event.meta.pid, 41684);
+        assert_eq!(event.subject_logon_id.as_deref(), Some("0x37b4d"));
+        assert_eq!(event.backup_path, None);
+    }
+
+    #[test]
+    fn without_a_client_pid_the_event_log_service_stands_in() {
+        let block = BLOCK_1102.replace("<ClientProcessId>41684</ClientProcessId>", "");
+        assert_eq!(log_cleared(&block).meta.pid, 3792);
+    }
+
+    #[test]
+    fn without_a_subject_the_account_is_unknown_not_guessed() {
+        let block = BLOCK_1102
+            .replace("<SubjectUserSid>S-1-5-21-1-2-3-1001</SubjectUserSid>", "")
+            .replace("<SubjectUserName>analyst</SubjectUserName>", "");
+        let event = log_cleared(&block);
+        assert_eq!(event.meta.user, User::Unknown);
+        assert_eq!(event.subject_user, "");
+    }
+
+    #[test]
+    fn a_104_without_a_channel_and_other_ids_are_skipped_but_advance_the_cursor() {
+        let no_channel = BLOCK_104.replace("<Channel>OpenSSH/Operational</Channel>", "");
+        assert!(matches!(
+            normalize_log_cleared_block(&no_channel),
+            Some((78381, None))
+        ));
+        let other_id = BLOCK_1102.replace("<EventID>1102</EventID>", "<EventID>1100</EventID>");
+        assert!(matches!(
+            normalize_log_cleared_block(&other_id),
+            Some((1_399_119, None))
+        ));
+    }
+}
+
+#[cfg(test)]
 mod subscribe_tests {
     use std::{
+        cell::RefCell,
         io,
-        sync::{Arc, Mutex, atomic::AtomicBool},
+        sync::{Arc, Once, atomic::AtomicBool},
     };
 
     use super::*;
@@ -2496,13 +2771,21 @@ mod subscribe_tests {
         fn on_event(&self, _event: Event) {}
     }
 
-    /// `tracing` output captured in memory, for asserting on log lines.
-    #[derive(Clone, Default)]
-    struct Captured(Arc<Mutex<Vec<u8>>>);
+    std::thread_local! {
+        static CAPTURED_LOGS: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    }
 
-    impl io::Write for Captured {
+    /// Writes into the calling thread's [`captured_logs`] buffer, or nowhere when
+    /// that thread is not capturing.
+    struct ThreadCapture;
+
+    impl io::Write for ThreadCapture {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            CAPTURED_LOGS.with_borrow_mut(|captured| {
+                if let Some(captured) = captured {
+                    captured.extend_from_slice(buf);
+                }
+            });
             Ok(buf.len())
         }
 
@@ -2511,16 +2794,38 @@ mod subscribe_tests {
         }
     }
 
+    /// Runs `f` and returns what it logged through `tracing` on the calling thread.
+    ///
+    /// One process-wide subscriber, installed once, that routes each thread's output
+    /// to that thread's own buffer — not `tracing::subscriber::with_default` (the
+    /// `rules` tests' #876/#885 flake): while a scoped subscriber is the only live
+    /// dispatcher, `tracing-core` (0.1.36) computes a callsite's cached interest from
+    /// the default of whichever thread registers it, so a parallel test reaching the
+    /// same log line first, with no subscriber of its own, caches it as "never" for
+    /// the whole process and the capturing test reads nothing. A global default is
+    /// every thread's default, so no registration order can disable a callsite.
+    fn captured_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(|| ThreadCapture)
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other test in this binary sets a global subscriber");
+        });
+        CAPTURED_LOGS.with_borrow_mut(|captured| *captured = Some(Vec::new()));
+        let result = f();
+        let captured = CAPTURED_LOGS
+            .with_borrow_mut(Option::take)
+            .unwrap_or_default();
+        (result, String::from_utf8_lossy(&captured).into_owned())
+    }
+
     /// Subscribes to `target` with `tracing` captured; returns whether the
     /// subscription registered and every line logged meanwhile.
     fn subscribe_capturing_logs(target: &'static PollTarget) -> (bool, String) {
-        let captured = Captured::default();
-        let writer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
-        let handle = tracing::subscriber::with_default(subscriber, || {
+        let (handle, logs) = captured_logs(|| {
             crate::subscribe::subscribe(
                 target,
                 Arc::new(NullSink),
@@ -2528,8 +2833,26 @@ mod subscribe_tests {
                 Arc::new(AtomicBool::new(false)),
             )
         });
-        let logs = String::from_utf8_lossy(&captured.0.lock().expect("capture lock")).into_owned();
         (handle.is_some(), logs)
+    }
+
+    #[test]
+    fn captured_logs_sees_a_callsite_another_thread_registered_first() {
+        // The #876/#885 race made deterministic: under `with_default`, the spawned
+        // thread (no subscriber of its own) registers the callsite as "never" and the
+        // capturing thread's own call is then filtered out before dispatch.
+        fn probe() {
+            tracing::warn!("captured-logs probe");
+        }
+        let ((), logs) = captured_logs(|| {
+            std::thread::spawn(probe).join().expect("probe thread");
+            probe();
+        });
+        assert_eq!(
+            logs.matches("captured-logs probe").count(),
+            1,
+            "exactly this thread's line, not zero and not the other thread's too: {logs}"
+        );
     }
 
     fn target_on(channel: &'static str) -> PollTarget {

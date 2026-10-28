@@ -1,0 +1,13 @@
+{
+  "type": "file_chown",
+  "meta": {
+    "pid": 9002,
+    "ppid": 9000,
+    "user": { "os": "unix", "uid": 1000, "gid": 1000 },
+    "timestamp_ns": 1756900015000000000,
+    "comm": "chown"
+  },
+  "path": "/tmp/backdoor",
+  "uid": 0,
+  "gid": 0
+}

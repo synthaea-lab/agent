@@ -10,6 +10,7 @@
 //! schema is now unbounded/owned, so [`normalize`] converts (and is unit-tested on
 //! every platform — only the sensor itself is Linux-only).
 
+mod dns_udp;
 pub mod normalize;
 
 #[cfg(all(target_os = "linux", any(ebpf_embedded, test)))]
@@ -30,5 +31,7 @@ mod sensor;
 mod syscall;
 #[cfg(target_os = "linux")]
 pub use ebpf::{RAW_TRACEPOINTS, load_ebpf, load_program};
+#[cfg(target_os = "linux")]
+pub use parent_image::ParentImageEvictions;
 #[cfg(target_os = "linux")]
 pub use sensor::LinuxSensor;

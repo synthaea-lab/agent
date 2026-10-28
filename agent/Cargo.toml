@@ -28,10 +28,12 @@ verdict = { path = "../crates/verdict" }
 ml = { path = "../crates/ml", default-features = false }
 sigma = { path = "../crates/sigma" }
 enrich = { path = "../crates/enrich" }
+intel = { path = "../crates/intel" }
 yara = { path = "../crates/yara" }
 deception = { path = "../crates/deception" }
 sinks = { path = "../crates/sinks" }
 tamper = { path = "../crates/tamper" }
+inventory = { path = "../crates/inventory" }
 response = { path = "../crates/response" }
 store = { path = "../crates/store" }
 transport = { path = "../crates/transport" }
@@ -53,11 +55,12 @@ tracing = { workspace = true }
 # fmt + env-filter: RUST_LOG-style filtering; the default "tracing-log" feature
 # bridges `log` records (aya-log, dependencies) into the subscriber.
 tracing-subscriber = { workspace = true }
-getrandom = "0.2"
+getrandom = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 sensor-windows = { path = "../crates/sensors/windows/etw" }
 sensor-windows-eventlog = { path = "../crates/sensors/windows/eventlog" }
+sensor-windows-minifilter = { path = "../crates/sensors/windows/minifilter" }
 sensor-windows-sockets = { path = "../crates/sensors/windows/sockets" }
 ctrlc = "3"
 
@@ -93,4 +96,5 @@ libc = "0.2"
 tempfile = "3"
 # Tests sign manifests with the public test key.
 updater = { path = "../crates/updater", features = ["test-key"] }
+ring = "0.17"
 schema = { path = "../crates/schema", features = ["test-fixtures"] }

@@ -9,8 +9,59 @@ pub use crate::validate::SigmaError;
 use crate::{
     eval::eval_rule_exec,
     rule::{SigmaAlert, SigmaRule},
-    validate::validate,
+    validate::{validate, validate_under},
 };
+
+/// The platform of a host, and so which directories of `rules/sigma/` it runs (issue #73, #980).
+/// The engine does not evaluate rules by platform on its own; [`SigmaEngine::load_dir_for`] is
+/// what keeps a host from loading the rules of the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    Linux,
+    Windows,
+    MacOs,
+}
+
+impl Platform {
+    /// The platform this binary is built for, or `None` on an OS the content has no
+    /// directory for.
+    #[must_use]
+    pub const fn host() -> Option<Self> {
+        if cfg!(target_os = "linux") {
+            Some(Self::Linux)
+        } else if cfg!(target_os = "windows") {
+            Some(Self::Windows)
+        } else if cfg!(target_os = "macos") {
+            Some(Self::MacOs)
+        } else {
+            None
+        }
+    }
+
+    /// The name of the platform's own directory under `rules/sigma/`.
+    #[must_use]
+    pub const fn dir_name(self) -> &'static str {
+        match self {
+            Self::Linux => "linux",
+            Self::Windows => "windows",
+            Self::MacOs => "macos",
+        }
+    }
+
+    /// The directories under `rules/sigma/` a host of this platform loads, in load order.
+    /// **macOS loads `macos/` and `linux/`**: the Unix-family command-line rules of `linux/`
+    /// (shells, `curl`, `base64`) apply to macOS too, and every macOS host has run them since
+    /// the agent loaded the whole tree. That is a choice, not a rule of nature (#980): a shared
+    /// `unix/` directory is the alternative. Linux and Windows load only their own.
+    #[must_use]
+    pub const fn rule_dirs(self) -> &'static [&'static str] {
+        match self {
+            Self::Linux => &["linux"],
+            Self::Windows => &["windows"],
+            Self::MacOs => &["macos", "linux"],
+        }
+    }
+}
 
 /// Sigma engine: set of loaded, validated rules, ready to evaluate.
 pub struct SigmaEngine {
@@ -19,17 +70,25 @@ pub struct SigmaEngine {
 
 impl SigmaEngine {
     /// Loads all `.yml` / `.yaml` rules from a directory tree (recursive — content
-    /// convention is `rules/sigma/<platform>/...`). Rules that fail to parse or use
-    /// unsupported constructs are skipped with a warning naming the reason; the
-    /// engine loads the rest.
+    /// convention is `rules/sigma/<platform>/...`), **every platform's** included: the content
+    /// tests and tools want the whole tree, a host wants [`Self::load_dir_for`]. Rules that
+    /// fail to parse or use unsupported constructs are skipped with a warning naming the
+    /// reason; the engine loads the rest.
     ///
     /// # Errors
     ///
     /// Returns [`SigmaError::Io`] when the directory tree itself cannot be read —
     /// individual bad rules are skipped, not errors.
     pub fn load_dir(dir: &Path) -> Result<Self, SigmaError> {
+        Self::load_tree(dir, dir)
+    }
+
+    /// Walks `walk` (`dir` itself, or one of its platform directories) and loads every rule in
+    /// it, validated against its path **relative to the rules root `root`**, so that only a
+    /// directory under the root can make a rule belong to a platform.
+    fn load_tree(root: &Path, walk: &Path) -> Result<Self, SigmaError> {
         let mut rules = Vec::new();
-        let mut stack = vec![dir.to_path_buf()];
+        let mut stack = vec![walk.to_path_buf()];
         while let Some(d) = stack.pop() {
             let entries = std::fs::read_dir(&d).map_err(|source| SigmaError::Io {
                 path: d.display().to_string(),
@@ -40,11 +99,43 @@ impl SigmaEngine {
                 if path.is_dir() {
                     stack.push(path);
                 } else if path.extension().is_some_and(|e| e == "yml" || e == "yaml") {
-                    match Self::load_rule(&path) {
+                    match Self::load_rule_in(&path, Some(root)) {
                         Ok(rule) => rules.push(rule),
                         Err(e) => tracing::warn!(error = %e, "sigma rule skipped"),
                     }
                 }
+            }
+        }
+        Ok(Self { rules })
+    }
+
+    /// Loads the rules a host of `platform` runs: the trees `<dir>/<d>/` for each `d` in
+    /// [`Platform::rule_dirs`] (the platform's own directory; macOS also `linux/`), nothing
+    /// else. Rules of the other platforms, and any file outside those directories, are never
+    /// read. The agent calls this with [`Platform::host`], so a macOS rule does not run on a
+    /// Linux host (#980). Skipping bad rules, and the error cases, are as [`Self::load_dir`].
+    ///
+    /// The platform comes from where a directory sits **under `dir`**, by construction: only
+    /// those subdirectories are walked. It is never read from the full path of a rule, so a
+    /// content root such as `/home/linux/content/rules/sigma` does not turn `windows/x.yml`
+    /// into a Linux rule. A directory that does not exist contributes no rules (a content tree
+    /// may ship without a platform's rules); a `dir` that cannot be read is an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SigmaError::Io`] when `dir`, or one of the directories that exists, cannot be
+    /// read.
+    pub fn load_dir_for(dir: &Path, platform: Platform) -> Result<Self, SigmaError> {
+        // Fails on an unreadable root even when no platform directory exists.
+        std::fs::read_dir(dir).map_err(|source| SigmaError::Io {
+            path: dir.display().to_string(),
+            source,
+        })?;
+        let mut rules = Vec::new();
+        for name in platform.rule_dirs() {
+            let platform_dir = dir.join(name);
+            if platform_dir.is_dir() {
+                rules.extend(Self::load_tree(dir, &platform_dir)?.rules);
             }
         }
         Ok(Self { rules })
@@ -57,18 +148,40 @@ impl SigmaEngine {
     /// Returns [`SigmaError::Io`] when the file cannot be read, [`SigmaError::Yaml`]
     /// on invalid YAML, and [`SigmaError::Unsupported`] when the rule uses
     /// constructs this engine rejects at validation.
+    ///
+    /// Without a rules root to measure from, the platform directory is looked for in the whole
+    /// of `path`; [`Self::load_dir`] and [`Self::load_dir_for`] measure from their root instead.
     pub fn load_rule(path: &Path) -> Result<SigmaRule, SigmaError> {
+        Self::load_rule_in(path, None)
+    }
+
+    /// [`Self::load_rule`] for a rule found under the rules directory `root`, when known.
+    fn load_rule_in(path: &Path, root: Option<&Path>) -> Result<SigmaRule, SigmaError> {
         let display = path.display().to_string();
+        let too_large = std::fs::metadata(path)
+            .map(|meta| meta.len() > MAX_RULE_FILE_BYTES)
+            .unwrap_or(false);
+        if too_large {
+            return Err(SigmaError::Io {
+                path: display,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("rule file larger than {MAX_RULE_FILE_BYTES} bytes"),
+                ),
+            });
+        }
         let content = std::fs::read_to_string(path).map_err(|source| SigmaError::Io {
             path: display.clone(),
             source,
         })?;
-        let rule: SigmaRule =
-            serde_yaml::from_str(&content).map_err(|source| SigmaError::Yaml {
-                path: display.clone(),
-                source,
-            })?;
-        validate(&rule, &display)?;
+        let rule = parse_rule_yaml(&content).map_err(|error| SigmaError::Yaml {
+            path: display.clone(),
+            message: describe_yaml_error(&error),
+        })?;
+        match root.and_then(|root| path.strip_prefix(root).ok()) {
+            Some(relative) => validate_under(&rule, &display, &relative.display().to_string())?,
+            None => validate(&rule, &display)?,
+        }
         Ok(rule)
     }
 
@@ -94,5 +207,65 @@ impl SigmaEngine {
     #[must_use]
     pub fn rule_titles(&self) -> Vec<&str> {
         self.rules.iter().map(|r| r.title.as_str()).collect()
+    }
+}
+
+/// A rule is a few dozen lines; anything near this is not one. Checked before the file is read.
+const MAX_RULE_FILE_BYTES: u64 = 1024 * 1024;
+
+/// The one place a rule's YAML text becomes a [`SigmaRule`] (the loader and the tests both
+/// go through it, so a test exercises the parser settings the engine really runs with).
+///
+/// The parser is `serde-saphyr`, safe Rust, which replaced `serde_yaml` (and its
+/// `unsafe-libyaml`, archived: RUSTSEC-2024-0449, #790). Rule files ship as signed content to
+/// every agent and what the parser accepts is part of what a rule means, so **every option that
+/// could change it is set explicitly**: a default that moves in a later release must not change
+/// what a rule means. What they do, from a differential run over the shipped rules and a corpus
+/// of edge cases (every shipped rule parsed identically):
+/// - duplicate keys are an error (a second `selection:` used to win silently, which let a rule
+///   be weakened without a trace), and so are merge keys (`<<`) and any tag the parser does not
+///   recognise (a tag on a key is part of its identity for the duplicate check, so it could hide a
+///   duplicate `selection`);
+/// - a `!!binary` value stays the literal text it shows (`ignore_binary_tag_for_string`), as under
+///   the old parser, instead of being base64-decoded into a value a reviewer cannot read;
+/// - only the exact literals `true` and `false` are booleans (`strict_booleans`): an unquoted
+///   `yes`, `no`, `on`, `off` or `y` stays the string it looks like. (Numbers such as `017`, `08`
+///   or `1_000` were strings before and are integers now: such a rule is refused at load, loudly.)
+/// - the budget is sized for a rule, not for a configuration file: a few thousand nodes, a
+///   shallow depth and almost no aliases, with the parser's own defaults far looser;
+/// - errors carry no source snippet, so a log line stays one line and does not hint at weakening
+///   the duplicate-key policy.
+pub(crate) fn parse_rule_yaml(content: &str) -> Result<SigmaRule, serde_saphyr::Error> {
+    use serde_saphyr::options::{DuplicateKeyPolicy, MergeKeyPolicy};
+    // `Options` and `Budget` are non-exhaustive, hence the macros.
+    let options = serde_saphyr::options! {
+        strict_booleans: true,
+        duplicate_keys: DuplicateKeyPolicy::Error,
+        merge_keys: MergeKeyPolicy::Error,
+        reject_unsupported_tags: true,
+        ignore_binary_tag_for_string: true,
+        with_snippet: false,
+        budget: serde_saphyr::budget! {
+            max_events: 100_000,
+            max_nodes: 20_000,
+            max_depth: 16,
+            max_aliases: 100,
+            max_anchors: 100,
+            max_total_scalar_bytes: 1024 * 1024,
+        },
+    };
+    serde_saphyr::from_str_with_options(content, options)
+}
+
+/// The parser's message with the hints it adds for its own library users removed: a duplicate
+/// key error ends with "set `DuplicateKeyPolicy` in `Options` if acceptable", which in a log line
+/// next to a rule file reads as advice to weaken the policy. Kept on one line.
+fn describe_yaml_error(error: &serde_saphyr::Error) -> String {
+    let text = error.to_string().replace('\n', " ");
+    match (text.find(", set "), text.find(" at line")) {
+        (Some(hint), Some(end)) if hint < end && text[hint..end].contains("Options") => {
+            format!("{}{}", &text[..hint], &text[end..])
+        }
+        _ => text,
     }
 }

@@ -12,7 +12,11 @@ workspace = true
 [dependencies]
 policy = { path = "../policy" }
 schema = { path = "../schema" }
+serde = { workspace = true }
+serde_json = { workspace = true }
 sha2 = "0.11"
+thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # `linkat`, `O_NOFOLLOW`: the quarantine source is opened once and moved by descriptor (#689).

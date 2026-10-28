@@ -24,7 +24,12 @@
 //! per-unit read ACL) — a non-issue for this sensor in practice since the agent
 //! already needs root for eBPF, but worth remembering if testing this crate
 //! standalone. `su`/`sshd` login-failure mapping is implemented and unit-tested
-//! but still unverified against a real prompt/failed attempt.
+//! but still unverified against a real prompt/failed attempt. Same caveat for
+//! `sudo`/`su`'s own wrong-password case (`JournalEvent::PamAuthFailure`, #381,
+//! T1548.003): implemented and unit-tested against the documented `pam_unix(...
+//! :auth): authentication failure; ...` format, not yet confirmed against a
+//! real failed attempt (this crate's Hyper-V lab host has no interactive TTY
+//! for one, same limitation as the pre-existing `su`/`sshd` case above).
 //!
 //! Also done: [`persistence::UnitPersistenceTracker`] maps a unit's first
 //! observed start into `schema::FileOpenEvent`/`FLAG_PERSISTENCE_SYSTEMD_ARTIFACT`
@@ -34,6 +39,11 @@
 //! reuse `FileOpenEvent` + a flag, no new `Event` variant. See that module's
 //! doc for why this is an approximation ("first start seen by this agent
 //! process"), not a true install signal.
+//!
+//! **Liveness (#71, #83):** the iterator yields allowlisted records only, so the agent's
+//! silence heartbeat hangs on [`ClassifiedJournal::with_line_hook`], which sees every
+//! non-blank line, and the canary line (`CANARY_IDENTIFIER`) the agent writes into
+//! journald every 30 s guarantees there is one to see on an idle host.
 //!
 //! Deliberately **not** here yet:
 //! - No [`schema::sensor::Sensor`] implementation — like `sensor-linux-netlink`
@@ -52,12 +62,16 @@
 //!   cursor now being persisted.
 
 mod auth;
+mod canary;
 mod classify;
 mod persistence;
 mod record;
 mod tail;
 
 pub use auth::to_auth_event;
+pub use canary::{CANARY_IDENTIFIER, canary_payload};
+#[cfg(target_os = "linux")]
+pub use canary::{JOURNAL_SOCKET, send_canary};
 pub use classify::{JournalEvent, classify};
 pub use persistence::UnitPersistenceTracker;
 pub use record::{JournalRecord, parse_record};

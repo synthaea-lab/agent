@@ -1,0 +1,32 @@
+{
+  "timestamp_ns": 1756900005000000000,
+  "severity": "high",
+  "title": "T0 cmdline anomaly",
+  "source": {
+    "engine": "ml",
+    "tier": 0,
+    "model_id": "t0-cmdline-linux",
+    "model_version": "2026.09.0"
+  },
+  "score": 0.91,
+  "attributions": [
+    { "feature": "entropy", "value": 5.83, "contribution": 0.41 },
+    { "feature": "max_token_length", "value": 812.0, "contribution": 0.27 }
+  ],
+  "events": [
+    {
+      "type": "exec",
+      "meta": {
+        "pid": 4242,
+        "ppid": 1337,
+        "user": { "os": "unix", "uid": 1000, "gid": 1000 },
+        "timestamp_ns": 1756900004123456789,
+        "comm": "bash"
+      },
+      "image_path": "/usr/bin/python3",
+      "cmdline": "python3 -c print(1)",
+      "argv": ["python3", "-c", "print(1)"],
+      "parent_comm": "bash"
+    }
+  ]
+}

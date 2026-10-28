@@ -22,10 +22,16 @@ pub const RAW_TRACEPOINTS: &[(&str, &str)] = &[
     ("raw_sched_process_exec", "sched_process_exec"),
     ("raw_sys_enter", "sys_enter"),
     ("raw_sys_exit", "sys_exit"),
+    (DNS_UDP_PROGRAM, "sys_enter"),
 ];
 
+/// The UDP/53 DNS capture (#458 part 3): its own program on `sys_enter`, attached only when the
+/// sensor is built with [`crate::Sensor::with_dns_udp_capture`]. It is in [`RAW_TRACEPOINTS`] so
+/// the preflight loads it through the verifier like the others, and the sensor skips it otherwise.
+pub const DNS_UDP_PROGRAM: &str = "raw_dns_udp_enter";
+
 /// `sensor_linux_wire::LineageEntry` is `repr(C)` over two `u32`, a `[u8; 16]` and a `u64`,
-/// laid out with no implicit padding (`reserved` is explicit) — every bit pattern is
+/// laid out with no implicit padding (`execd` is explicit) — every bit pattern is
 /// valid, so it is plain-old-data. A transparent newtype carries the
 /// `aya::Pod` impl (the orphan rule forbids implementing it on the wire type directly).
 #[repr(transparent)]
@@ -74,7 +80,8 @@ fn load_embedded(tamper_pin: Option<&std::path::Path>) -> Result<aya::Ebpf, Sens
         .override_global("TASK_PID_OFFSET", &offsets.task_pid, true)
         .override_global("TASK_COMM_OFFSET", &offsets.task_comm, true)
         .override_global("BINPRM_FILENAME_OFFSET", &offsets.binprm_filename, true)
-        .override_global("SYSCALL_ARG_OFFSETS", &offsets.syscall_args, true);
+        .override_global("SYSCALL_ARG_OFFSETS", &offsets.syscall_args, true)
+        .override_global("SYSCALL_NR_OFFSET", &offsets.syscall_nr, true);
     if let Some(path) = tamper_pin {
         loader.map_pin_path("SIGNAL_TAMPER_LAST", path);
     }
@@ -308,7 +315,8 @@ pub(crate) fn prime_proc_lineage(ebpf: &mut aya::Ebpf) -> Result<u32, SensorErro
         let mut val = sensor_linux_wire::LineageEntry {
             ppid: *ppid,
             comm: [0u8; sensor_linux_wire::TASK_COMM_LEN],
-            reserved: 0,
+            // Predates the agent: nothing says it never exec'd (see `LineageEntry::execd`).
+            execd: 1,
             generation: *generation,
             parent_generation: generation_of.get(ppid).copied().unwrap_or(0),
         };

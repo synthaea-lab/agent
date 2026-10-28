@@ -243,6 +243,15 @@ pub struct ResponseSection {
     /// Automated quarantine of a payload a scan confirms malicious. Mirrors
     /// the pre-ADR-0010 [`crate::ResponsePolicy`] flat struct.
     pub quarantine_enabled: bool,
+    /// Host isolation (ADR-0037). Absent means `false`, and `false` is not serialized,
+    /// so the canonical bytes of a document written before this field are unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub isolate_enabled: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's `skip_serializing_if` passes `&T`
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 // ── compliance_mode section ──────────────────────────────────────────────
@@ -331,6 +340,7 @@ mod tests {
                 response: Some(ResponseSection {
                     kill_enabled: false,
                     quarantine_enabled: false,
+                    isolate_enabled: false,
                 }),
                 compliance_mode: Some(ComplianceMode::None),
                 rules: None,
@@ -360,6 +370,25 @@ mod tests {
         assert_eq!(
             p.payload.experimental.get("my_flag"),
             Some(&serde_json::json!(42))
+        );
+    }
+
+    #[test]
+    fn a_response_section_written_before_isolation_reads_as_isolation_off_and_keeps_its_bytes() {
+        let before = r#"{"kill_enabled":true,"quarantine_enabled":false}"#;
+        let section: ResponseSection = serde_json::from_str(before).unwrap();
+        assert!(!section.isolate_enabled);
+        assert_eq!(serde_json::to_string(&section).unwrap(), before);
+
+        let enabled = ResponseSection {
+            isolate_enabled: true,
+            ..section
+        };
+        let json = serde_json::to_string(&enabled).unwrap();
+        assert!(json.contains(r#""isolate_enabled":true"#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<ResponseSection>(&json).unwrap(),
+            enabled
         );
     }
 }

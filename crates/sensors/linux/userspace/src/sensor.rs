@@ -19,12 +19,12 @@ use tracing::warn;
 use crate::{
     container::{CgroupIdCache, DockerInfoCache, container_context},
     ebpf::{
-        RAW_TRACEPOINTS, TamperSlot, attach_raw_tracepoint, clear_tamper_slot, err,
-        load_ebpf_for_run, prime_proc_lineage, read_tamper_slot, take_tamper_slot,
+        DNS_UDP_PROGRAM, RAW_TRACEPOINTS, TamperSlot, attach_raw_tracepoint, clear_tamper_slot,
+        err, load_ebpf_for_run, prime_proc_lineage, read_tamper_slot, take_tamper_slot,
         write_signal_watch_pid,
     },
     normalize,
-    parent_image::{IMAGE_CACHE_CAP, ParentImages},
+    parent_image::{ExecStamps, IMAGE_CACHE_CAP, ParentImageEvictions, ParentImages},
     proc::{read_proc_cmdline, read_proc_environ_security, read_proc_images},
 };
 
@@ -85,6 +85,10 @@ fn sweep_survived_sigkill(slot: &mut TamperSlot, own_pid: u32, boot_epoch_offset
 /// Linux sensor (eBPF). `run` blocks until Ctrl-C or [`Sensor::stop`].
 pub struct LinuxSensor {
     stop: Arc<Notify>,
+    evictions: Arc<ParentImageEvictions>,
+    /// Whether the UDP/53 DNS capture program is attached (#458 part 3). Fixed for the life of the
+    /// sensor.
+    dns_udp: bool,
 }
 
 impl Default for LinuxSensor {
@@ -125,7 +129,11 @@ macro_rules! drain {
                 // the wire types are repr(C) plain-old-data, and read_unaligned
                 // handles the ring buffer's arbitrary alignment.
                 let event = unsafe { core::ptr::read_unaligned(item.as_ptr() as *const $wire_ty) };
-                let schema_event = $to_event(&event);
+                // `$to_event` gives an `Event`, or an `Option<Event>` when the payload may turn
+                // out not to be an event at all (the DNS query capture); `None` is skipped.
+                let Some(schema_event) = Option::<schema::Event>::from($to_event(&event)) else {
+                    continue;
+                };
                 // Self-exclusion (issue #340): the agent's own activity — most
                 // visibly its own `write(2)` calls appending to `events.jsonl` —
                 // is itself observed by this same sensor, re-triggering the very
@@ -154,7 +162,27 @@ impl LinuxSensor {
     pub fn new() -> Self {
         Self {
             stop: Arc::new(Notify::new()),
+            evictions: Arc::new(ParentImageEvictions::default()),
+            dns_udp: false,
         }
+    }
+
+    /// Attaches the UDP/53 DNS capture program (#458 part 3): the first bytes of a
+    /// datagram sent to port 53, from `sendto(2)` and from `write(2)` on a socket connected to
+    /// port 53, reported as `DnsQuery` events with no answer. Off by default, like the
+    /// `getaddrinfo` capture it completes (`--enable-dns-capture` turns on both). Fixed at start.
+    #[must_use]
+    pub fn with_dns_udp_capture(mut self, enabled: bool) -> Self {
+        self.dns_udp = enabled;
+        self
+    }
+
+    /// The running totals of what the parent-image cache's cap drops, for the agent's health
+    /// beacon (#863). The same handle for the life of the sensor, so it can be taken before the
+    /// sensor is moved onto its thread.
+    #[must_use]
+    pub fn parent_image_evictions(&self) -> Arc<ParentImageEvictions> {
+        Arc::clone(&self.evictions)
     }
 
     async fn run_async(&mut self, sink: Box<dyn EventSink>) -> Result<(), SensorError> {
@@ -180,9 +208,18 @@ impl LinuxSensor {
                 warn!(error = %e, "failed to initialize eBPF logger");
             }
             Ok(logger) => {
-                let mut logger =
-                    tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)
-                        .map_err(|e| err(format!("eBPF logger fd: {e}")))?;
+                // SAFETY: `logger` owns its `RingBuf<MapData>`, whose fd is the `OwnedFd`
+                // aya holds in the map; it is valid and open, and aya offers no way to close,
+                // replace or take it out of the logger — it is closed only when the logger
+                // drops, which now happens when this `AsyncFd` drops. The fd stays open and
+                // the same one for the `AsyncFd`'s whole life, and `as_raw_fd` returns it.
+                let mut logger = unsafe {
+                    tokio::io::unix::AsyncFd::register_with_interest(
+                        logger,
+                        tokio::io::Interest::READABLE,
+                    )
+                }
+                .map_err(|e| err(format!("eBPF logger fd: {e}")))?;
                 tokio::task::spawn(async move {
                     loop {
                         // No unwrap: nothing holds this task's JoinHandle, so a
@@ -217,7 +254,8 @@ impl LinuxSensor {
 
         // The same processes' image paths, so the first child of an already-running
         // parent resolves `parent_image_path` too (#768).
-        let mut parent_images = ParentImages::new(IMAGE_CACHE_CAP);
+        let mut parent_images =
+            ParentImages::new(IMAGE_CACHE_CAP).with_totals(Arc::clone(&self.evictions));
         for (pid, generation, image) in read_proc_images(IMAGE_CACHE_CAP) {
             parent_images.prime(pid, generation, image);
         }
@@ -227,6 +265,10 @@ impl LinuxSensor {
         );
 
         for (program, name) in RAW_TRACEPOINTS {
+            // The UDP/53 capture is a program of its own, attached only when asked for.
+            if *program == DNS_UDP_PROGRAM && !self.dns_udp {
+                continue;
+            }
             attach_raw_tracepoint(&mut ebpf, program, name)?;
         }
 
@@ -236,8 +278,16 @@ impl LinuxSensor {
                 .ok_or_else(|| err(format!("map {map} not found in eBPF object")))?;
             let rb = aya::maps::RingBuf::try_from(m)
                 .map_err(|e| err(format!("map {map} is not a ring buffer: {e}")))?;
-            tokio::io::unix::AsyncFd::with_interest(rb, tokio::io::Interest::READABLE)
-                .map_err(|e| err(format!("ring buffer fd for {map}: {e}")))
+            // SAFETY: `rb` is a `RingBuf<MapData>` taken out of the loaded `ebpf`; its
+            // fd is the `OwnedFd` aya holds in the map, valid and open. aya offers no
+            // way to close, replace or take that fd out of the ring buffer — it is
+            // closed only when the `RingBuf` drops, which now happens when this
+            // `AsyncFd` drops. The fd stays open and the same one for the `AsyncFd`'s
+            // whole life, and `as_raw_fd` returns it.
+            unsafe {
+                tokio::io::unix::AsyncFd::register_with_interest(rb, tokio::io::Interest::READABLE)
+            }
+            .map_err(|e| err(format!("ring buffer fd for {map}: {e}")))
         };
         let mut exec_ring_buf = ring("EXEC_EVENTS")?;
         let mut file_open_ring_buf = ring("FILE_OPEN_EVENTS")?;
@@ -250,6 +300,7 @@ impl LinuxSensor {
         let mut file_chown_ring_buf = ring("FILE_CHOWN_EVENTS")?;
         let mut udp_send_ring_buf = ring("UDP_SEND_EVENTS")?;
         let mut udp_recv_ring_buf = ring("UDP_RECV_EVENTS")?;
+        let mut dns_udp_ring_buf = ring("DNS_UDP_EVENTS")?;
         let mut socket_listen_ring_buf = ring("SOCKET_LISTEN_EVENTS")?;
         let mut socket_accept_ring_buf = ring("SOCKET_ACCEPT_EVENTS")?;
         let mut socket_create_ring_buf = ring("SOCKET_CREATE_EVENTS")?;
@@ -269,7 +320,7 @@ impl LinuxSensor {
         let mut namespace_ring_buf = ring("NAMESPACE_EVENTS")?;
 
         tracing::info!(
-            "sensor-linux: listening for exec/open/connect/write/delete/rename/bind/chmod/chown/udp_send/udp_recv/listen/accept/socket_create/setxattr/removexattr/mount/signal/kernel_module/bpf/prctl/ptrace/process_vm_readv/process_vm_writev/memfd_create/identity_change/capset/namespace events"
+            "sensor-linux: listening for exec/open/connect/write/delete/rename/bind/chmod/chown/udp_send/udp_recv/dns_udp/listen/accept/socket_create/setxattr/removexattr/mount/signal/kernel_module/bpf/prctl/ptrace/process_vm_readv/process_vm_writev/memfd_create/identity_change/capset/namespace events"
         );
 
         let mut container_ids = CgroupIdCache::new();
@@ -313,7 +364,12 @@ impl LinuxSensor {
                     drain!(guard, sensor_linux_wire::ExecEvent, sink, own_pid, |e: &sensor_linux_wire::ExecEvent| {
                         let mut event = normalize::exec(e, offset, read_proc_cmdline(e.meta.pid), read_proc_environ_security(e.meta.pid), container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache));
                         if let schema::Event::Exec(exec) = &mut event {
-                            parent_images.annotate(exec);
+                            parent_images.annotate(exec, ExecStamps {
+                                ktime_ns: e.meta.timestamp_ns,
+                                grandparent_pid: e.grandparent_pid,
+                                grandparent_generation: e.grandparent_generation,
+                                parent_never_exec_ed: e.parent_execd == 0,
+                            });
                         }
                         event
                     });
@@ -370,6 +426,14 @@ impl LinuxSensor {
                     drain!(guard, sensor_linux_wire::UdpSendEvent, sink, own_pid,
                         |e: &sensor_linux_wire::UdpSendEvent| {
                             normalize::udp_send(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = dns_udp_ring_buf.readable_mut() => {
+                    // `None` for a payload that is not a DNS query (a reused descriptor, a
+                    // stream that looked like one): dropped here, never reported.
+                    drain!(guard, sensor_linux_wire::DnsUdpQueryEvent, sink, own_pid,
+                        |e: &sensor_linux_wire::DnsUdpQueryEvent| {
+                            normalize::dns_udp_query(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
                 guard = udp_recv_ring_buf.readable_mut() => {
@@ -524,5 +588,29 @@ impl Sensor for LinuxSensor {
     /// orchestrating shutdown); the CLI path still relies on Ctrl-C.
     fn stop(&mut self) {
         self.stop.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod evictions_handle_tests {
+    use std::sync::Arc;
+
+    use super::LinuxSensor;
+
+    #[test]
+    fn the_eviction_totals_are_one_shared_handle_that_starts_at_zero() {
+        let sensor = LinuxSensor::new();
+        let first = sensor.parent_image_evictions();
+        let second = sensor.parent_image_evictions();
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "taken before the sensor moves to its thread, read after"
+        );
+        assert_eq!((first.dead(), first.live()), (0, 0));
+        assert!(
+            !Arc::ptr_eq(&first, &LinuxSensor::new().parent_image_evictions()),
+            "each sensor has its own"
+        );
     }
 }

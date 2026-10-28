@@ -7,6 +7,10 @@
 //! event, so the spool, `events.jsonl`, the server and the T1204.002 alert
 //! message only ever get the redacted form.
 //!
+//! A `BitsJob`'s `url` (#284) is the same kind of download URL, written by BITS
+//! clients such as the `OneDrive` updater, and gets the same treatment; the T1197
+//! alert message quotes it.
+//!
 //! On Linux the same [`redact_event`] also covers an `HttpRequest`'s evidence value
 //! (#478, ADR-0022 §4) when the matched parameter's name is a secret; see its doc.
 //!
@@ -67,7 +71,7 @@ const SECRET_KEY_PARTS: &[&str] = &[
 /// most common download source on a managed Windows fleet (#550 review).
 const SECRET_KEY_SUFFIXES: &[&str] = &["key", "keyid", "auth"];
 
-/// Wraps a sink, redacting credentials in every `FileQuarantine` URL before
+/// Wraps a sink, redacting credentials in every `FileQuarantine` and `BitsJob` URL before
 /// forwarding (see the module doc). Everything else passes through untouched.
 pub(crate) struct RedactingSink<S>(pub(crate) S);
 
@@ -104,6 +108,7 @@ pub(crate) fn redact_event(event: &mut Event) {
                 *url = redact_url_secrets(url);
             }
         }
+        Event::BitsJob(job) => job.url = redact_url_secrets(&job.url),
         Event::HttpRequest(request) => {
             if let Some(evidence) = &mut request.evidence
                 && is_secret_key(&evidence.param)
@@ -401,6 +406,33 @@ mod tests {
             Some("https://h/x.exe?token=REDACTED")
         );
         assert_eq!(q.referrer_url.as_deref(), Some("https://REDACTED@h/page"));
+    }
+
+    #[test]
+    fn the_sink_redacts_a_bits_job_url_and_keeps_the_rest_of_the_job() {
+        let job = schema::BitsJobEvent {
+            job_id: "{c40080ab-6fe4-418a-8ba6-c271c5298f18}".into(),
+            url: "https://u:p@cdn.example/f.exe?X-Amz-Signature=abc&v=2#frag".into(),
+            local_path: r"C:\Users\a\f.exe".into(),
+            ..schema::fixtures::bits_job()
+        };
+        let sink = RedactingSink(Recorder::default());
+        sink.on_event(Event::BitsJob(job.clone()));
+        let events = sink.0.0.lock().unwrap();
+        let [Event::BitsJob(redacted)] = events.as_slice() else {
+            panic!("expected one BitsJob, got {events:?}");
+        };
+        assert_eq!(
+            redacted.url,
+            "https://REDACTED@cdn.example/f.exe?X-Amz-Signature=REDACTED&v=2#REDACTED"
+        );
+        assert_eq!(
+            *redacted,
+            schema::BitsJobEvent {
+                url: redacted.url.clone(),
+                ..job
+            }
+        );
     }
 
     #[test]

@@ -21,6 +21,40 @@ extern crate std;
 mod path_filter;
 pub use path_filter::is_filtered_path;
 
+/// Packs the handler tag and syscall number for a pending raw `sys_exit` event.
+/// The syscall number is kept with the tag so a later exit from another syscall
+/// in the same thread cannot consume stale state.
+#[inline(always)]
+#[must_use]
+pub const fn encode_pending_syscall_exit(action: u32, syscall_nr: u32) -> u64 {
+    ((syscall_nr as u64) << 32) | action as u64
+}
+
+/// Returns the pending handler only when the exiting syscall matches its entry.
+#[inline(always)]
+#[must_use]
+pub const fn matching_pending_syscall_exit(
+    packed: Option<u64>,
+    exiting_syscall_nr: Option<u32>,
+) -> Option<u32> {
+    match (packed, exiting_syscall_nr) {
+        (Some(value), Some(syscall_nr)) if (value >> 32) as u32 == syscall_nr => Some(value as u32),
+        _ => None,
+    }
+}
+
+/// Converts a signed syscall number from architectures that use a negative
+/// sentinel (arm64's `NO_SYSCALL`) into the non-negative syscall-id domain.
+#[inline(always)]
+#[must_use]
+pub const fn syscall_nr_from_i32(syscall_nr: i32) -> Option<u32> {
+    if syscall_nr < 0 {
+        None
+    } else {
+        Some(syscall_nr as u32)
+    }
+}
+
 /// Bumped on every layout-affecting change to the structs below. Not a wire header
 /// (ring-buffer items carry none) — a build-time tripwire: the userspace loader
 /// `const _`-asserts the value it was compiled against, so an ebpf/userspace version
@@ -230,7 +264,23 @@ pub use path_filter::is_filtered_path;
 ///   address filtering happens here (unlike `connect`/`bind`, `socket(2)` isn't
 ///   necessarily `AF_INET`/`AF_INET6` — `AF_PACKET`/`AF_NETLINK`/raw sockets are
 ///   exactly the kind of creation this event exists to surface).
-pub const WIRE_VERSION: u32 = 23;
+/// - v24: `ExecEvent` gains `grandparent_pid`, `parent_execd` and `grandparent_generation`
+///   (issue #784), and `LineageEntry`'s `reserved` becomes `execd`. A process that forked
+///   and never exec'd (a subshell) runs its forker's image, so the exec probe reports the
+///   parent's own parent and that stamp, taken from the parent's `PROC_LINEAGE` entry only
+///   when the entry's `generation` equals the child's `parent_generation` (a reused parent
+///   pid must not lend its new forker). `execd` is set by the exec probe on the process's
+///   own entry and copied to `parent_execd`, so userspace can tell a parent that never
+///   exec'd from one that did and whose image the cache lost. Both layouts are unchanged
+///   in size: `parent_execd` and `execd` take the place of explicit padding.
+/// - v25: `GetAddrInfoEvent` carries up to [`MAX_DNS_ANSWERS`] results from a
+///   bounded glibc `addrinfo.ai_next` walk and marks a result truncated when a
+///   ninth list entry exists.
+/// - v26: `DnsUdpQueryEvent` added (#458 part 3): the first 272 bytes of a DNS query sent to port
+///   53, from `sendto(2)` with an address and from `write(2)`/`sendto(2)` on a socket connected
+///   to port 53. The question is parsed in userspace and reported as `schema::DnsQueryEvent`
+///   (query and type only, no answer: the response is not captured). No existing struct changed.
+pub const WIRE_VERSION: u32 = 26;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
@@ -255,6 +305,26 @@ pub const MAX_MODULE_NAME_LEN: usize = 64;
 /// limit fits comfortably; matches `MAX_PATH_LEN`'s existing budget rather
 /// than inventing a new number.
 pub const MAX_DNS_QUERY_LEN: usize = 256;
+/// Maximum `addrinfo` list entries inspected by the DNS uretprobe. This constant
+/// bound keeps the verifier's loop analysis finite; a following entry is visible
+/// through `answers_truncated`.
+pub const MAX_DNS_ANSWERS: usize = 24;
+/// Bytes of an outgoing DNS datagram [`DnsUdpQueryEvent`] carries: the 12-byte header, a
+/// question name of up to 255 bytes and its 4-byte type and class (271), plus one byte of slack.
+/// A name is the signal the DNS-tunnelling rule reads (long, high-entropy labels), so the bound is
+/// the size of a whole question, not a short prefix. The copy is one bounded
+/// `bpf_probe_read_user_buf`, not a loop.
+pub const MAX_DNS_UDP_PAYLOAD: usize = 272;
+
+/// Handler ids in the `SYSCALL_DISPATCH` table that the UDP/53 capture reacts to. The router
+/// (`raw_sys_enter`) and the capture program (`raw_dns_udp_enter`) in the eBPF crate, and the
+/// table userspace fills from the host syscall ABI, all use these names, so renumbering a handler
+/// is a compile error and not a capture that silently stops.
+pub const DISPATCH_CONNECT: u32 = 3;
+/// See [`DISPATCH_CONNECT`].
+pub const DISPATCH_WRITE: u32 = 4;
+/// See [`DISPATCH_CONNECT`].
+pub const DISPATCH_SENDTO: u32 = 16;
 /// Budget for TLS plaintext capture (first N bytes). Chosen to fit comfortably
 /// in a ring-buffer event with metadata while staying under 512 bytes total.
 pub const MAX_TLS_CAPTURE: usize = 256;
@@ -308,6 +378,18 @@ pub struct ExecEvent {
     /// Parent short name at exec time, from the `PROC_LINEAGE` map. Empty when the
     /// parent forked before the probe attached and `/proc` priming missed it.
     pub pcomm: [u8; TASK_COMM_LEN],
+    /// The parent's own parent (`PROC_LINEAGE[ppid].ppid`), `0` when unknown. A parent
+    /// that forked and never exec'd (a subshell: `$(...)`, a pipeline stage) runs the image
+    /// of the process that forked it, so this is how userspace answers for it (#784).
+    pub grandparent_pid: u32,
+    /// `1` when the parent's `PROC_LINEAGE` entry says it has exec'd since it forked (the
+    /// entry's `execd`), `0` when it has not (or when `grandparent_pid` is `0`, no parent
+    /// entry). Userspace answers for a parent with its forker's image only when this is `0`
+    /// (#784). Also keeps `grandparent_generation` 8-aligned with no implicit padding.
+    pub parent_execd: u32,
+    /// The stamp of `grandparent_pid` as the parent's fork recorded it
+    /// (`PROC_LINEAGE[ppid].parent_generation`), `0` when unknown.
+    pub grandparent_generation: u64,
 }
 
 /// Value of the `PROC_LINEAGE` fork-tracking map: a pid's parent identity, captured
@@ -320,9 +402,12 @@ pub struct ExecEvent {
 pub struct LineageEntry {
     pub ppid: u32,
     pub comm: [u8; TASK_COMM_LEN],
-    /// Explicit padding so `generation` is 8-aligned without implicit padding bytes.
-    /// Always zero.
-    pub reserved: u32,
+    /// `1` once this process has exec'd since the fork that created the entry (set by the exec
+    /// probe), `0` for a process that forked and has not exec'd: a subshell, which runs its
+    /// forker's image (#784). A process primed from `/proc` is `1`: it predates the agent and
+    /// nothing says it never exec'd, which is the safe reading. Also keeps `generation`
+    /// 8-aligned without implicit padding bytes.
+    pub execd: u32,
     /// Stamp of this incarnation of the pid (issue #519): `bpf_ktime_get_ns()` at the
     /// fork, or `PRIMED_GENERATION_BIT | starttime` for a process primed from `/proc`.
     pub generation: u64,
@@ -850,10 +935,20 @@ pub struct MemfdCreateEvent {
     pub fd: i32,
 }
 
-/// DNS resolution via glibc's `getaddrinfo(3)` (issue #267 Phase 1): the
-/// DNS-based C2/tunneling/exfiltration visibility primitive. See this file's
-/// `WIRE_VERSION` v16 changelog for the uprobe/uretprobe correlation shape and
-/// the "first `addrinfo` entry only" tradeoff.
+/// One IP address returned in a glibc `addrinfo` list.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DnsAnswer {
+    /// `AF_INET` or `AF_INET6`; other families are not emitted.
+    pub family: u8,
+    /// Network-order address bytes; IPv4 uses only the first four bytes.
+    pub address: [u8; 16],
+}
+
+/// DNS resolution via glibc's `getaddrinfo(3)` (issue #267): the DNS-based
+/// C2/tunneling/exfiltration visibility primitive. See this file's
+/// `WIRE_VERSION` v16/v25 changelog entries for the uprobe/uretprobe correlation
+/// and bounded answer-list capture.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct GetAddrInfoEvent {
@@ -865,13 +960,43 @@ pub struct GetAddrInfoEvent {
     /// a name here, same "sensor reports, detection interprets" split as
     /// every other raw syscall/libc return value in this crate.
     pub status: i32,
-    /// `true` if `addr_v4`/`addr_v6`/`is_ipv6` were populated from the
-    /// first resolved `addrinfo` entry. `false` on failure (`status != 0`)
-    /// or an unrecognized `ai_family`.
-    pub addr_resolved: bool,
+    /// Number of valid IPv4/IPv6 answers in `answers` (at most
+    /// [`MAX_DNS_ANSWERS`]); entries with null addresses or unknown families are
+    /// skipped.
+    pub answer_count: u8,
+    /// True when `ai_next` was non-null after the [`MAX_DNS_ANSWERS`]th inspected
+    /// `addrinfo` **node**, not address: without `hints.ai_socktype`, glibc
+    /// returns one node per address per socktype (STREAM/DGRAM/RAW), so this can
+    /// be set well before `MAX_DNS_ANSWERS` distinct addresses have been seen
+    /// (review of #458, old-dov 2026-10-21: a null-hints `getaddrinfo("debian.org")`
+    /// measured 8 addresses as 24 nodes). Read it as "more resolver nodes existed
+    /// past this point", not "more addresses existed".
+    pub answers_truncated: bool,
+    /// The first [`MAX_DNS_ANSWERS`] valid IPv4/IPv6 answers in resolver order.
+    pub answers: [DnsAnswer; MAX_DNS_ANSWERS],
+}
+
+/// A DNS **query** on its way out over a socket to port 53 (issue #458 part 3): the first
+/// [`MAX_DNS_UDP_PAYLOAD`] bytes of the datagram, read at syscall entry from `sendto(2)` (an
+/// address given, `AF_INET`/`AF_INET6`, port 53) or from `write(2)`/`sendto(2)` with no address
+/// on a socket the process `connect(2)`ed to port 53 earlier (what Go's resolver and `send(2)`
+/// do). Nothing is parsed in the kernel: userspace reads the question out of `payload`.
+///
+/// Only emitted while the DNS capture program is attached (`--enable-dns-capture`). `payload_len` is the number of valid bytes, at most
+/// [`MAX_DNS_UDP_PAYLOAD`]; a datagram longer than that is cut, which only loses the tail of a
+/// message whose question already fits (a name is at most 255 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DnsUdpQueryEvent {
+    pub meta: EventMeta,
+    /// Destination of the datagram: the `sendto` address, or the address the socket was
+    /// connected to. Raw bytes in memory order, like [`ConnectEvent::daddr_v4`].
+    pub daddr_v4: [u8; 4],
+    pub daddr_v6: [u8; 16],
+    pub dport: u16,
+    pub payload_len: u16,
     pub is_ipv6: bool,
-    pub addr_v4: [u8; 4],
-    pub addr_v6: [u8; 16],
+    pub payload: [u8; MAX_DNS_UDP_PAYLOAD],
 }
 
 /// Decodes a fixed comm buffer: NUL-terminated, kernel-truncated to 15 bytes — a
@@ -913,6 +1038,28 @@ pub fn boot_epoch_offset_ns() -> u64 {
         .saturating_mul(1_000_000_000)
         .saturating_add(ts.tv_nsec as u64);
     epoch_ns.saturating_sub(monotonic_ns)
+}
+
+#[cfg(test)]
+mod pending_exit_tests {
+    use super::*;
+
+    #[test]
+    fn pending_exit_dispatch_requires_the_same_syscall_number() {
+        let pending = encode_pending_syscall_exit(4, 45);
+        assert_eq!(
+            matching_pending_syscall_exit(Some(pending), Some(45)),
+            Some(4)
+        );
+        assert_eq!(matching_pending_syscall_exit(Some(pending), Some(59)), None);
+        assert_eq!(matching_pending_syscall_exit(Some(pending), None), None);
+        assert_eq!(matching_pending_syscall_exit(None, Some(45)), None);
+        assert_eq!(
+            matching_pending_syscall_exit(Some(pending), syscall_nr_from_i32(-1)),
+            None
+        );
+        assert_eq!(syscall_nr_from_i32(45), Some(45));
+    }
 }
 
 #[cfg(all(test, feature = "user"))]
