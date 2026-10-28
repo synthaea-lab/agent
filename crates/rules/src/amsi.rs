@@ -269,7 +269,11 @@ fn runtime(app_name: &str) -> &str {
     app_name.split('_').next().unwrap_or(app_name)
 }
 
-fn excerpt(text: Option<&str>) -> String {
+/// The one-line excerpt of an AMSI buffer that [`evaluate_amsi_content`] puts in its
+/// messages: control characters as spaces, cut at 200 characters. The agent uses it to
+/// swap the raw excerpt for the redacted one in what it writes (#895).
+#[must_use]
+pub fn excerpt(text: Option<&str>) -> String {
     match text {
         None => "(no text)".to_string(),
         Some(t) => {

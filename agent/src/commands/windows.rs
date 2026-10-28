@@ -234,11 +234,11 @@ fn etw_failure_hint(error: &str) -> &'static str {
 fn run_windows_sensors(
     sink: Box<dyn EventSink>,
     silence: Option<&Mutex<SilenceMonitor>>,
-    redact_exec: bool,
+    redact_commands: bool,
 ) -> anyhow::Result<()> {
     // Run and both capture commands funnel through here, so this is the one
     // place credential redaction has to sit in front of (#440).
-    let sink = crate::redact::redacting(sink, redact_exec);
+    let sink = crate::redact::redacting(sink, redact_commands);
 
     let mut etw_sensor = sensor_windows::WindowsSensor::new();
     let etw_stop = etw_sensor.stop_handle();
