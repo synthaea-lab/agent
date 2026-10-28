@@ -1752,6 +1752,18 @@ pub struct HealthBeacon {
     /// to show how full the cache runs. Zero on other platforms and in an older beacon.
     #[serde(default)]
     pub parent_image_evicted_dead: u64,
+    /// Indicators in force in the on-device IOC set right now (#60): a gauge, not a total. Zero
+    /// when no feed is loaded, and in a beacon from an older agent.
+    #[serde(default)]
+    pub ioc_indicators: u64,
+    /// Cumulative IOC matches that raised a finding since the agent started. Zero in a beacon
+    /// from an older agent.
+    #[serde(default)]
+    pub ioc_findings: u64,
+    /// Cumulative IOC matches the per-indicator cooldown absorbed: a high count against few
+    /// findings is one indicator seen again and again. Zero in an older beacon.
+    #[serde(default)]
+    pub ioc_cooled_down: u64,
 }
 
 /// A logon/authentication outcome, or a privileged-session assignment — shared
