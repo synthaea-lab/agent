@@ -1,0 +1,15 @@
+{
+  "type": "ntlm_auth",
+  "meta": {
+    "pid": 4,
+    "ppid": 0,
+    "user": { "os": "unknown" },
+    "timestamp_ns": 1759405827000000000,
+    "comm": "System"
+  },
+  "direction": "outgoing",
+  "user": "synlabnobody",
+  "target": "cifs/127.0.0.1",
+  "remote_address": "127.0.0.1",
+  "ntlm_version": "NTLMv2"
+}

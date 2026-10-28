@@ -768,3 +768,84 @@ fn a_linux_leaf_match_stays_case_sensitive() {
     ));
     assert!(alerts.iter().all(|a| a.technique != "T1105"), "{alerts:?}");
 }
+
+// ── T1558: Kerberos delegation/TGT-export refusals (#364) ──────────────────────────
+
+#[test]
+fn an_unconstrained_delegation_denial_alerts_high_naming_server_and_target() {
+    let event = schema::KerberosDelegationFailureEvent {
+        meta: EventMeta {
+            pid: 4120,
+            comm: "fileserver.exe".into(),
+            ..schema::fixtures::meta()
+        },
+        target_server: "cifs/dc01.lab.internal".into(),
+        target_user: "analyst".into(),
+        target_domain: "LAB".into(),
+        caller_user: "svc_fileserver".into(),
+        caller_domain: "LAB".into(),
+        ..schema::fixtures::kerberos_delegation_failure()
+    };
+    let alerts = crate::stateless::evaluate_kerberos_delegation_failure(&event);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1558");
+    assert_eq!(alerts[0].severity, crate::Severity::High);
+    assert!(
+        alerts[0].message.contains("unconstrained delegation"),
+        "{}",
+        alerts[0].message
+    );
+    assert!(
+        alerts[0]
+            .message
+            .contains("cifs/dc01.lab.internal for LAB\\analyst"),
+        "{}",
+        alerts[0].message
+    );
+    assert!(
+        alerts[0].message.contains(r"caller=LAB\svc_fileserver"),
+        "{}",
+        alerts[0].message
+    );
+}
+
+#[test]
+fn a_tgt_session_key_export_denial_names_the_right_operation() {
+    let event = schema::KerberosDelegationFailureEvent {
+        kind: schema::KerberosDelegationFailureKind::TgtSessionKeyExportDenied,
+        target_server: "HTTP/app01.lab.internal".into(),
+        ..schema::fixtures::kerberos_delegation_failure()
+    };
+    let alerts = crate::stateless::evaluate_kerberos_delegation_failure(&event);
+    assert_eq!(alerts.len(), 1);
+    assert!(
+        alerts[0]
+            .message
+            .contains("export this host's TGT session key"),
+        "{}",
+        alerts[0].message
+    );
+}
+
+#[test]
+fn with_no_target_account_only_the_server_is_named() {
+    let event = schema::KerberosDelegationFailureEvent {
+        target_server: "cifs/dc01.lab.internal".into(),
+        ..schema::fixtures::kerberos_delegation_failure()
+    };
+    let alerts = crate::stateless::evaluate_kerberos_delegation_failure(&event);
+    assert_eq!(
+        alerts[0].message.matches("cifs/dc01.lab.internal").count(),
+        1
+    );
+    assert!(
+        alerts[0].message.ends_with("target cifs/dc01.lab.internal"),
+        "{}",
+        alerts[0].message
+    );
+    assert!(
+        !alerts[0].message.contains("caller="),
+        "{}",
+        alerts[0].message
+    );
+}

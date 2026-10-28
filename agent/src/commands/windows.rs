@@ -169,6 +169,11 @@ fn eventlog_config(policy: &policy::EventLogPolicy) -> sensor_windows_eventlog::
         wdac_enabled: true,
         terminal_sessions_enabled: true,
         log_clears_enabled: true,
+        // Not yet policy-configurable, same reasoning as the two above (#364):
+        // always on when this crate is enabled. The channel itself is off by
+        // default on a clean install; this does not turn it on (see
+        // `KERBEROS_DELEGATION_FAILURES`'s doc in sensor.rs).
+        kerberos_delegation_failures_enabled: true,
     }
 }
 
