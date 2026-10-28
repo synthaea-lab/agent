@@ -798,12 +798,12 @@ fn an_unconstrained_delegation_denial_alerts_high_naming_server_and_target() {
     assert!(
         alerts[0]
             .message
-            .contains("cifs/dc01.lab.internal for LAB\\analyst"),
+            .contains(r"cifs/dc01.lab.internal, supplied credentials LAB\analyst"),
         "{}",
         alerts[0].message
     );
     assert!(
-        alerts[0].message.contains(r"caller=LAB\svc_fileserver"),
+        alerts[0].message.contains(r"owner=LAB\svc_fileserver"),
         "{}",
         alerts[0].message
     );
@@ -819,16 +819,14 @@ fn a_tgt_session_key_export_denial_names_the_right_operation() {
     let alerts = crate::stateless::evaluate_kerberos_delegation_failure(&event);
     assert_eq!(alerts.len(), 1);
     assert!(
-        alerts[0]
-            .message
-            .contains("export this host's TGT session key"),
+        alerts[0].message.contains("asked for its TGT session key"),
         "{}",
         alerts[0].message
     );
 }
 
 #[test]
-fn with_no_target_account_only_the_server_is_named() {
+fn with_no_supplied_credentials_or_owner_only_the_server_is_named() {
     let event = schema::KerberosDelegationFailureEvent {
         target_server: "cifs/dc01.lab.internal".into(),
         ..schema::fixtures::kerberos_delegation_failure()
@@ -839,12 +837,17 @@ fn with_no_target_account_only_the_server_is_named() {
         1
     );
     assert!(
-        alerts[0].message.ends_with("target cifs/dc01.lab.internal"),
+        alerts[0].message.ends_with("— denied"),
         "{}",
         alerts[0].message
     );
     assert!(
-        !alerts[0].message.contains("caller="),
+        !alerts[0].message.contains("supplied credentials"),
+        "{}",
+        alerts[0].message
+    );
+    assert!(
+        !alerts[0].message.contains("owner="),
         "{}",
         alerts[0].message
     );

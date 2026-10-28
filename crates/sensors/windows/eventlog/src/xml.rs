@@ -444,17 +444,18 @@ pub struct AccountCreatedEvent {
 pub struct KerberosDelegationFailureRecord {
     pub record_id: u64,
     pub event_id: u32,
-    /// `TargetName`/`Server` — the server the ticket was for.
+    pub time_created_ns: Option<u64>,
+    /// `TargetName`/`Server` — the server named in the local process's request.
     pub target_server: Option<String>,
-    /// `UserName` — the account whose ticket/key was requested.
+    /// `UserName` — credentials explicitly supplied to the call, usually empty.
     pub target_user: Option<String>,
-    /// `DomainName` — that account's domain.
+    /// `DomainName` — that supplied account's domain.
     pub target_domain: Option<String>,
-    /// `CallerPID` — this host's process that received the request.
+    /// `CallerPID` — the client process that made the request.
     pub caller_pid: Option<u32>,
     /// `ProcessName` — that process's image path.
     pub process_name: Option<String>,
-    /// `ClientUserName` — this host's own process-owner account.
+    /// `ClientUserName` — that process's own owner account.
     pub client_user_name: Option<String>,
     /// `ClientDomainName` — that account's domain.
     pub client_domain_name: Option<String>,
@@ -477,6 +478,7 @@ pub fn parse_kerberos_delegation_failure_block(
     Some(KerberosDelegationFailureRecord {
         record_id,
         event_id,
+        time_created_ns: time_created_ns(block),
         target_server: opt_data(block, "TargetName"),
         target_user: opt_data(block, "UserName"),
         target_domain: opt_data(block, "DomainName"),

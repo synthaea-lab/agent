@@ -1240,25 +1240,28 @@ pub struct LogClearedEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KerberosDelegationFailureKind {
-    /// EID 201: a server tried to use this client's ticket for unconstrained
-    /// delegation (impersonating the client to a third service), and the
-    /// client's own Kerberos stack refused — the client is not configured to
-    /// allow it for that server.
+    /// EID 201: this host's own process asked its local Kerberos client for a ticket it
+    /// could present for unconstrained delegation to `target_server` (impersonating
+    /// whatever user later authenticates through it to that server), and the client's
+    /// own Kerberos stack refused — this host is not on the allowlist that may ask for
+    /// that. The Rubeus `tgtdeleg`/delegation-collection shape.
     UnconstrainedDelegationDenied,
-    /// EID 202: an attempt to export this client's TGT session key was
-    /// refused — on a Credential Guard host, a TGT's key can never leave the
-    /// isolated LSA, by design (ADR: this is the client-side half of the same
-    /// protection PKINIT key-export denials, EID 203/204, also report).
+    /// EID 202: this host's own process asked to export its TGT's session key, and the
+    /// client's own Kerberos stack refused — on a Credential Guard host, a TGT's key can
+    /// never leave the isolated LSA, by design (ADR: this is the client-side half of the
+    /// same protection PKINIT key-export denials, EID 203/204, also report).
     TgtSessionKeyExportDenied,
 }
 
 /// A Kerberos client-side operation an attacker would want was denied, from the
 /// (off by default; see `docs/sensors/windows.md`) `Microsoft-Windows-Kerberos/Operational`
-/// channel's EID 201/202 (#364). Both name the server the ticket was for, the account whose
-/// ticket it was, and the process that made the request — the two cases where this agent's
-/// own host is the one being used as a stepping stone (someone else's service asked *this*
-/// client for its ticket, or asked to export its session key) rather than the one requesting
-/// against a KDC.
+/// channel's EID 201/202 (#364). **The local process is the actor**: both events report this
+/// host's own process asking its own Kerberos client for something (a delegable ticket for
+/// `target_server`, or its own TGT session key) and that client refusing — not a remote
+/// server using this host as a stepping stone. The provider manifest
+/// (`Get-WinEvent -ListProvider Microsoft-Windows-Security-Kerberos`) names `%4 CallerPID` as
+/// the *client* process id, and the message text is "unconstrained delegation is not allowed
+/// for this user" (fwlink 856824) — the refusal is about the local caller, not a third party.
 ///
 /// Framed as what it is: a **refusal**. Each event means an attempt was made and this host's
 /// own Kerberos stack said no — not that delegation succeeded, and not evidence the request
@@ -1267,26 +1270,28 @@ pub enum KerberosDelegationFailureKind {
 /// deliberate allowlist on a well-run host, so a request outside it is rare and worth a look;
 /// not Critical, since the client's own refusal is already the control working.
 ///
-/// `meta.pid`/`meta.comm` are this host's process that received the request (`CallerPID`/
-/// `ProcessName`, both 201 and 202 carry them, the same nine-field template). `meta.user` is
-/// [`User::Unknown`]: the template gives this host's own process owner only as a name and a
-/// domain (`ClientUserName`/`ClientDomainName`), never a SID, so it cannot become a
+/// `meta.pid`/`meta.comm` are the process that made the request (`CallerPID`/`ProcessName`,
+/// both 201 and 202 carry them, the same nine-field template). `meta.user` is
+/// [`User::Unknown`]: the template gives this process's owner only as a name and a domain
+/// (`ClientUserName`/`ClientDomainName`), never a SID, so it cannot become a
 /// [`User::Windows`] — [`caller_user`](Self::caller_user) carries it as text instead, the same
 /// choice [`LogClearedEvent::subject_user`] makes when a SID isn't the shape the data comes in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KerberosDelegationFailureEvent {
     pub meta: EventMeta,
     pub kind: KerberosDelegationFailureKind,
-    /// The server the ticket was for (`TargetName`/`Server`).
+    /// The server named in the request (`TargetName`/`Server`): for 201, the server the
+    /// requested delegable ticket was for.
     pub target_server: String,
-    /// The account whose ticket/key was requested (`UserName`).
+    /// Credentials explicitly supplied to the call (`UserName`), rather than the caller's own
+    /// — usually empty, since a call with default credentials supplies none.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub target_user: String,
-    /// That account's domain (`DomainName`).
+    /// That supplied account's domain (`DomainName`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub target_domain: String,
-    /// This host's own process-owner account (`ClientUserName`), as text — see the struct doc
-    /// for why it is not `meta.user`.
+    /// The calling process's own owner account (`ClientUserName`), as text — see the struct
+    /// doc for why it is not `meta.user`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub caller_user: String,
     /// That account's domain (`ClientDomainName`).

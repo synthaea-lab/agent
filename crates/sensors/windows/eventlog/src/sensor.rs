@@ -1270,7 +1270,7 @@ fn normalize_kerberos_delegation_failure_block(block: &str) -> ParsedBlock {
             pid: record.caller_pid.unwrap_or(0),
             ppid: 0,
             user: User::Unknown,
-            timestamp_ns: now_ns(),
+            timestamp_ns: record.time_created_ns.unwrap_or_else(now_ns),
             comm,
             container: None, // Windows: no container support
             process_generation: None,
@@ -2876,6 +2876,27 @@ mod kerberos_delegation_failure_tests {
         assert_eq!(event.caller_user, "svc_fileserver");
         assert_eq!(event.caller_domain, "LAB");
         assert_eq!(event.meta.user, User::Unknown);
+        assert_eq!(
+            event.meta.timestamp_ns,
+            xml::time_created_ns(BLOCK_201).unwrap(),
+            "timestamp should come from TimeCreated, not the time the agent happened to parse it"
+        );
+    }
+
+    #[test]
+    fn a_missing_time_created_falls_back_to_now_rather_than_zero() {
+        let block = BLOCK_201.replacen(
+            "<TimeCreated SystemTime='2026-10-23T09:15:30.0000000Z'/>",
+            "",
+            1,
+        );
+        let before = now_ns();
+        let event = kerberos_failure(&block);
+        assert!(
+            event.meta.timestamp_ns >= before,
+            "{}",
+            event.meta.timestamp_ns
+        );
     }
 
     #[test]
