@@ -425,4 +425,5 @@ mod ssh_fanout;
 mod staging;
 mod sudo;
 mod tamper;
+mod timestomp;
 mod windows;

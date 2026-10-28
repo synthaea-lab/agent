@@ -6,7 +6,7 @@ use schema::{
     ConnectEvent, ExecEvent, FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT,
     FLAG_PERSISTENCE_BTM_ARTIFACT, FLAG_PERSISTENCE_SYSTEMD_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FLAG_PERSISTENCE_TASK_ARTIFACT,
-    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, User, detection::Severity,
+    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, FileSetTimeEvent, User, detection::Severity,
 };
 
 use crate::{
@@ -589,6 +589,34 @@ pub(crate) fn check_alternate_data_stream_write(event: &FileOpenEvent) -> Option
             event.meta.pid, event.meta.comm,
         ),
     })
+}
+
+/// T1070.006 — Indicator Removal: Timestomp. The minifilter reports a successful explicit
+/// `FileBasicInformation` request; `comm` is intentionally not used because that sensor has no
+/// trustworthy process image. Windows -1/-2 values request automatic updates, not chosen times.
+#[must_use]
+pub fn evaluate_file_set_time(event: &FileSetTimeEvent) -> Vec<Alert> {
+    let requested = [
+        event.creation_time,
+        event.last_access_time,
+        event.last_write_time,
+        event.change_time,
+    ];
+    if !requested
+        .into_iter()
+        .flatten()
+        .any(|time| time != 0 && time != -1 && time != -2)
+    {
+        return Vec::new();
+    }
+    vec![Alert {
+        technique: "T1070.006",
+        severity: Severity::Medium,
+        message: format!(
+            "pid={} comm={}: explicit timestamp change requested for {}",
+            event.meta.pid, event.meta.comm, event.path,
+        ),
+    }]
 }
 
 /// Evaluates all stateless rules applicable to a `FileOpenEvent`. T1053.005
