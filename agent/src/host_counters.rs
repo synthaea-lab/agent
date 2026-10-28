@@ -79,6 +79,7 @@ impl AgentHostCounters {
 impl HostCountersSource for AgentHostCounters {
     fn host_counters(&self) -> HostCounters {
         let (live, dead) = self.evictions.as_ref().map_or((0, 0), |read| read());
+        let (ioc_indicators, ioc_findings, ioc_cooled_down) = self.sink.ioc_counts();
         HostCounters {
             watchdog_restarts: self.watchdog.restarts,
             tamper_events: self
@@ -87,6 +88,9 @@ impl HostCountersSource for AgentHostCounters {
                 .saturating_add(self.watchdog.tamper_events),
             parent_image_evicted_live: live,
             parent_image_evicted_dead: dead,
+            ioc_indicators,
+            ioc_findings,
+            ioc_cooled_down,
         }
     }
 }
@@ -197,6 +201,44 @@ mod tests {
             "2 raised here, 5 reported by the watchdog"
         );
         assert_eq!(counters.watchdog_restarts, 2);
+    }
+
+    #[test]
+    fn the_ioc_counters_follow_the_loaded_set_and_what_it_matched() {
+        let dir = std::env::temp_dir().join(format!("host-counters-ioc-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let feeds = dir.join("content").join("ioc");
+        std::fs::create_dir_all(&feeds).unwrap();
+        std::fs::write(feeds.join("f.txt"), "ip:203.0.113.9\nip:203.0.113.10\n").unwrap();
+        let sink = Arc::new(
+            DetectionSink::new(
+                rules::RuleState::new(),
+                &dir.join("alerts.ndjson"),
+                None,
+                None,
+                None,
+                &dir.join("content"),
+                &dir.join("ml-registry"),
+            )
+            .unwrap(),
+        );
+        use schema::sensor::EventSink as _;
+        let counters = AgentHostCounters::new(Arc::clone(&sink), WatchdogReport::default(), None);
+        let ioc = |c: HostCounters| (c.ioc_indicators, c.ioc_findings, c.ioc_cooled_down);
+        assert_eq!(ioc(counters.host_counters()), (2, 0, 0));
+
+        for ts in [1_000, 2_000] {
+            sink.on_event(schema::Event::Connect(schema::ConnectEvent {
+                meta: schema::EventMeta {
+                    timestamp_ns: ts,
+                    ..schema::fixtures::meta()
+                },
+                daddr: "203.0.113.9".parse().unwrap(),
+                dport: 443,
+            }));
+        }
+        assert_eq!(ioc(counters.host_counters()), (2, 1, 1));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

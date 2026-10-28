@@ -1682,6 +1682,17 @@ impl DetectionSink {
         self.tamper_events.load(Ordering::Relaxed)
     }
 
+    /// IOC engine figures for the health beacon: indicators in force, findings raised, matches
+    /// the cooldown absorbed (#60).
+    pub(crate) fn ioc_counts(&self) -> (u64, u64, u64) {
+        let stats = self.ioc.stats();
+        (
+            self.ioc.indicator_count() as u64,
+            stats.raised.load(Ordering::Relaxed),
+            stats.cooled_down.load(Ordering::Relaxed),
+        )
+    }
+
     /// Issue #613: an operator's request to silence `technique` on the entity
     /// `(ppid, comm)` in the fused verdict. Returns whether the mark is new.
     /// Audited as `VERDICT-SUPPRESS` in the alert log, which itself keeps every

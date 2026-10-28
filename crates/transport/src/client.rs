@@ -517,6 +517,9 @@ mod tests {
             tamper_events: 5,
             parent_image_evicted_live: 13,
             parent_image_evicted_dead: 209_000,
+            ioc_indicators: 12_000,
+            ioc_findings: 4,
+            ioc_cooled_down: 31,
         };
         let body = serde_json::to_value(HeartbeatPayload {
             agent_id: None,
@@ -542,7 +545,10 @@ mod tests {
                     "watchdog_restarts": 3,
                     "tamper_events": 5,
                     "parent_image_evicted_live": 13,
-                    "parent_image_evicted_dead": 209000
+                    "parent_image_evicted_dead": 209000,
+                    "ioc_indicators": 12000,
+                    "ioc_findings": 4,
+                    "ioc_cooled_down": 31
                 }
             })
         );
