@@ -48,6 +48,7 @@ struct Haystacks<'a> {
     image: OnceCell<String>,
     cmdline: OnceCell<String>,
     parent_image: OnceCell<Option<String>>,
+    original_file_name: OnceCell<Option<String>>,
 }
 
 impl<'a> Haystacks<'a> {
@@ -57,11 +58,14 @@ impl<'a> Haystacks<'a> {
             image: OnceCell::new(),
             cmdline: OnceCell::new(),
             parent_image: OnceCell::new(),
+            original_file_name: OnceCell::new(),
         }
     }
 
     /// The lowercased value of a supported field; `None` for `ParentImage` when the sensor
-    /// provided no lineage, and for a field no validated rule uses.
+    /// provided no lineage, for `OriginalFileName` when enrichment found none (no PE version
+    /// resource, parse failure, or the image was over `enrich`'s size budget — #983), and for
+    /// a field no validated rule uses.
     fn get(&self, field: &str) -> Option<&str> {
         if field.eq_ignore_ascii_case("image") {
             Some(
@@ -78,6 +82,15 @@ impl<'a> Haystacks<'a> {
                 .get_or_init(|| {
                     self.event
                         .parent_image_path
+                        .as_deref()
+                        .map(str::to_lowercase)
+                })
+                .as_deref()
+        } else if field.eq_ignore_ascii_case("originalfilename") {
+            self.original_file_name
+                .get_or_init(|| {
+                    self.event
+                        .original_file_name
                         .as_deref()
                         .map(str::to_lowercase)
                 })

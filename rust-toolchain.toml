@@ -2,5 +2,5 @@
 # Bump deliberately (and in its own commit) — a toolchain bump that sneaks into a
 # feature PR makes build breakage hard to bisect.
 [toolchain]
-channel = "1.94.1"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]

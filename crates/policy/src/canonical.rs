@@ -232,6 +232,7 @@ mod tests {
                 response: Some(ResponseSection {
                     kill_enabled: false,
                     quarantine_enabled: false,
+                    isolate_enabled: false,
                 }),
                 compliance_mode: Some(ComplianceMode::None),
                 rules: None,

@@ -6,7 +6,7 @@ use schema::{
     ConnectEvent, ExecEvent, FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT,
     FLAG_PERSISTENCE_BTM_ARTIFACT, FLAG_PERSISTENCE_SYSTEMD_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FLAG_PERSISTENCE_TASK_ARTIFACT,
-    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, detection::Severity,
+    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, User, detection::Severity,
 };
 
 use crate::{
@@ -154,6 +154,7 @@ pub fn evaluate_exec(event: &ExecEvent) -> Vec<Alert> {
         .chain(check_masquerading(event))
         .chain(check_recovery_inhibit(event))
         .chain(check_log_clear_exec(event))
+        .chain(check_event_logging_disable_exec(event))
         .chain(crate::securitytool::check_security_tool_stop(event))
         .collect()
 }
@@ -815,6 +816,217 @@ pub(crate) fn check_log_clear_exec(event: &ExecEvent) -> Option<Alert> {
             event.meta.pid, event.meta.comm, event.cmdline,
         ),
     })
+}
+
+/// T1562.002 — Impair Defenses: Disable Windows Event Logging. The exec-side
+/// counterpart of [`check_log_clear_exec`]: instead of wiping what was logged,
+/// stop anything new from being logged.
+///
+/// Windows events only (`User::Windows`). The command line is read as words, the way the
+/// tool reads it, and matched on the program it starts with (`wevtutil`, `auditpol`, `sc`,
+/// `net`/`net1`, `reg`, `powershell`/`pwsh`, with or without a path or `.exe`): a quoted
+/// `"eventlog"`, a tab, `/e:"false"` or the display name `"Windows Event Log"` are seen,
+/// and `dotnet app.dll stop eventlog-forwarder` is not `net stop eventlog`.
+///
+/// Only the disabling forms match: the agent itself runs
+/// `auditpol /set /subcategory:{guid} /success:enable /failure:enable` and
+/// `wevtutil qe` (`sensor-windows-eventlog`), and neither may alert; neither may
+/// read-only queries (`sc query`, `reg query`, `Get-EventLog`, `net start`).
+///
+/// A wrapper such as `cmd /c net stop eventlog` is not matched on its own line: `cmd.exe`
+/// starts `net.exe` as a child, and that child's exec (`net stop eventlog`) is the one that
+/// alerts, so the wrapper adds nothing to look for.
+///
+/// Known gaps: a channel disabled through the API or the registry rather than by one of
+/// these command lines is not seen here, and the sensor's start-up channel check (#786) only
+/// warns about a channel that is already disabled when the agent starts, so a channel
+/// switched off afterwards is not caught; a pipeline such as
+/// `Get-Service EventLog | Stop-Service`, an encoded command, and a renamed copy of a tool
+/// are not matched either.
+#[must_use]
+pub(crate) fn check_event_logging_disable_exec(event: &ExecEvent) -> Option<Alert> {
+    if !matches!(event.meta.user, User::Windows { .. }) {
+        return None;
+    }
+    let words = windows_words(&event.cmdline);
+    let (program, args) = words.split_first()?;
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let program = program.as_str();
+    let program = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let program = program.strip_suffix(".exe").unwrap_or(program);
+    let what = match program {
+        "wevtutil" => wevtutil_disables_a_channel(&args),
+        "auditpol" => auditpol_weakens_the_policy(&args),
+        "sc" => sc_stops_or_disables_eventlog(&args),
+        "net" | "net1" => net_stops_eventlog(&args),
+        "reg" => reg_disables_eventlog(&args),
+        "powershell" | "pwsh" => powershell_stops_or_disables_eventlog(&event.cmdline),
+        _ => None,
+    }?;
+    Some(Alert {
+        technique: "T1562.002",
+        severity: Severity::High,
+        message: format!(
+            "pid={} comm={}: {what}: {}",
+            event.meta.pid, event.meta.comm, event.cmdline,
+        ),
+    })
+}
+
+/// The words of a Windows command line, lowercased: whitespace outside double quotes
+/// separates them and the quote characters are dropped, so `/e:"false"` is `/e:false` and
+/// `"Windows Event Log"` is one word.
+fn windows_words(cmdline: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for c in cmdline.chars() {
+        if c == '"' {
+            quoted = !quoted;
+        } else if c.is_whitespace() && !quoted {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.extend(c.to_lowercase());
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+/// A switch without its prefix: `/e:false` and `-e:false` are both `e:false`.
+fn switch(word: &str) -> Option<&str> {
+    word.strip_prefix(['/', '-'])
+}
+
+/// `wevtutil sl <log> /e:false` or `wevtutil set-log <log> /enabled:false`.
+fn wevtutil_disables_a_channel(args: &[&str]) -> Option<&'static str> {
+    let sets_the_log = args.iter().any(|a| matches!(*a, "sl" | "set-log"));
+    let disables = args
+        .iter()
+        .filter_map(|a| switch(a))
+        .any(|s| matches!(s, "e:false" | "enabled:false"));
+    (sets_the_log && disables).then_some("event log channel disabled")
+}
+
+/// `auditpol /clear`, `auditpol /remove`, or `auditpol /set ... /success:disable` (or
+/// `/failure:disable`).
+fn auditpol_weakens_the_policy(args: &[&str]) -> Option<&'static str> {
+    let has = |name: &str| args.iter().filter_map(|a| switch(a)).any(|s| s == name);
+    let disables = args
+        .iter()
+        .filter_map(|a| switch(a))
+        .any(|s| matches!(s, "success:disable" | "failure:disable"));
+    if has("clear") {
+        Some("audit policy cleared")
+    } else if has("remove") {
+        Some("audit policy removed")
+    } else if has("set") && disables {
+        Some("audit subcategory disabled")
+    } else {
+        None
+    }
+}
+
+/// `sc [\\server] stop eventlog` and `sc [\\server] config eventlog start= disabled`.
+fn sc_stops_or_disables_eventlog(args: &[&str]) -> Option<&'static str> {
+    let mut rest = args.iter().copied().skip_while(|a| a.starts_with("\\\\"));
+    let verb = rest.next()?;
+    let service = rest.next()?;
+    if service != "eventlog" {
+        return None;
+    }
+    let rest: Vec<&str> = rest.collect();
+    match verb {
+        "stop" => Some("EventLog service stopped"),
+        "config" if sc_start_is_disabled(&rest) => Some("EventLog service disabled"),
+        _ => None,
+    }
+}
+
+/// `start= disabled` (two words) or `start=disabled`.
+fn sc_start_is_disabled(args: &[&str]) -> bool {
+    args.iter().enumerate().any(|(i, a)| match *a {
+        "start=" => args.get(i + 1) == Some(&"disabled"),
+        "start=disabled" => true,
+        _ => false,
+    })
+}
+
+/// `net stop eventlog` and `net stop "Windows Event Log"`: the service name runs up to the
+/// first switch (`/y`), and an unquoted display name is several words.
+fn net_stops_eventlog(args: &[&str]) -> Option<&'static str> {
+    let (verb, rest) = args.split_first()?;
+    if *verb != "stop" {
+        return None;
+    }
+    let service = rest
+        .iter()
+        .take_while(|a| !a.starts_with('/'))
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
+    matches!(service.as_str(), "eventlog" | "windows event log")
+        .then_some("EventLog service stopped")
+}
+
+/// `reg add <...>\Services\EventLog /v Start /d 4`: only the data that disables the service
+/// (`4`); `/d 2` sets it back to automatic. A subkey such as `...\EventLog\Security` is a
+/// channel's configuration, not the service.
+fn reg_disables_eventlog(args: &[&str]) -> Option<&'static str> {
+    if args.first() != Some(&"add") {
+        return None;
+    }
+    let key = args.get(1)?.trim_end_matches('\\');
+    if !key.ends_with("\\services\\eventlog") {
+        return None;
+    }
+    let value_of = |name: &str| {
+        args.iter()
+            .position(|a| switch(a) == Some(name))
+            .and_then(|i| args.get(i + 1))
+            .copied()
+    };
+    (value_of("v") == Some("start") && matches!(value_of("d"), Some("4" | "0x4")))
+        .then_some("EventLog service disabled")
+}
+
+/// `Stop-Service` of `EventLog`, or `Set-Service EventLog -StartupType Disabled`, within one
+/// statement of the command line: `Stop-Service -Name Spooler; Get-WinEvent -LogName
+/// EventLog` names `EventLog`, but not as the service being stopped.
+fn powershell_stops_or_disables_eventlog(cmdline: &str) -> Option<&'static str> {
+    let lower = cmdline.to_lowercase();
+    for statement in lower.split([';', '|', '&', '\n']) {
+        let words: Vec<&str> = statement
+            .split(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | '(' | ')' | '{' | '}' | ',' | '`')
+            })
+            .filter(|w| !w.is_empty())
+            .collect();
+        let names_eventlog = words
+            .iter()
+            .any(|w| matches!(*w, "eventlog" | "-name:eventlog"))
+            || words
+                .windows(3)
+                .any(|w| w[0] == "windows" && w[1] == "event" && w[2] == "log");
+        if !names_eventlog {
+            continue;
+        }
+        if words.contains(&"stop-service") {
+            return Some("EventLog service stopped");
+        }
+        let startup_disabled = words
+            .windows(2)
+            .any(|w| w[0] == "-startuptype" && w[1] == "disabled")
+            || words.contains(&"-startuptype:disabled");
+        if words.contains(&"set-service") && startup_disabled {
+            return Some("EventLog service disabled");
+        }
+    }
+    None
 }
 
 /// Unix log locations whose deletion is the anti-forensics signal

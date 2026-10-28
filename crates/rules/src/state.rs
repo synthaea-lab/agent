@@ -2753,18 +2753,39 @@ impl RuleState {
     /// What rules out a Unix file merely named `x:Zone.Identifier` is a Unix
     /// user or a POSIX path, the evidence that it is not a Windows stream.
     fn record_motw_removal(&mut self, event: &FileDeleteEvent) {
-        if matches!(event.meta.user, User::Unix { .. }) {
+        self.record_motw_gone(&event.path, &event.meta);
+    }
+
+    /// The same fact from a `FileRename` of the stream: `Rename-Item -Stream` or a
+    /// `SetInformation` rename on the stream handle takes the mark off its host
+    /// without deleting anything. Only the minifilter reports it (#136, #853: the
+    /// Kernel-File rename, event 27, is not consumed). A rename that leaves the
+    /// stream on the same host (a case change) removed nothing; one that moves the
+    /// mark to another file still strips it from this one.
+    fn record_motw_stream_rename(&mut self, event: &FileRenameEvent) {
+        let still_marked = motw_stream_host(&event.new_path)
+            .zip(motw_stream_host(&event.old_path))
+            .is_some_and(|(new_host, old_host)| new_host.eq_ignore_ascii_case(old_host));
+        if !still_marked {
+            self.record_motw_gone(&event.old_path, &event.meta);
+        }
+    }
+
+    /// `stream_path` is a `:Zone.Identifier` stream that no longer carries its mark,
+    /// by `meta`'s process.
+    fn record_motw_gone(&mut self, stream_path: &str, meta: &schema::EventMeta) {
+        if matches!(meta.user, User::Unix { .. }) {
             return;
         }
-        let Some(host) = motw_stream_host(&event.path).filter(|host| !host.starts_with('/')) else {
+        let Some(host) = motw_stream_host(stream_path).filter(|host| !host.starts_with('/')) else {
             return;
         };
         self.recent_motw_removals.insert(
             host.to_lowercase(),
             MotwRemoval {
-                timestamp_ns: event.meta.timestamp_ns,
-                pid: event.meta.pid,
-                comm: event.meta.comm.clone(),
+                timestamp_ns: meta.timestamp_ns,
+                pid: meta.pid,
+                comm: meta.comm.clone(),
                 alerted: false,
             },
         );
@@ -2784,7 +2805,8 @@ impl RuleState {
     /// Not covered: a download that never got a mark (curl, certutil, most
     /// droppers, see `DOWNLOADER_COMMS`) and an archive extractor that drops it
     /// — there is no removal to see; a mark rewritten in place to `ZoneId=0`,
-    /// or its stream renamed (Kernel-File 27) rather than deleted. The full
+    /// or its stream renamed through the Kernel-File path (event 27; the
+    /// minifilter's rename is consumed, [`Self::record_motw_stream_rename`]). The full
     /// list is in `docs/detection/download-provenance.md`.
     fn check_exec_after_motw_removal(&mut self, event: &ExecEvent) -> Option<Alert> {
         let key = event.image_path.to_lowercase();
@@ -2979,6 +3001,7 @@ impl RuleState {
     /// To be called for every `FileRenameEvent` in the stream (T1486, issue #262 +
     /// #82's write-volume corroboration).
     pub fn on_file_rename(&mut self, event: &FileRenameEvent) -> Vec<Alert> {
+        self.record_motw_stream_rename(event);
         self.record_touched(event.meta.pid, Event::FileRename(event.clone()));
         let mut alerts: Vec<Alert> = self.check_mass_rename_pattern(event).into_iter().collect();
         alerts.extend(self.check_burst_write_volume(event));

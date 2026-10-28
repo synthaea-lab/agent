@@ -46,6 +46,10 @@ pub fn exec_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
         parent_image_path: None,
         sha256: None, // Filled by enrichment
         signature: None,
+        original_file_name: None, // Filled by enrichment (#983); Linux has no PE resource anyway
+        company_name: None,
+        file_description: None,
+        product_name: None,
         env_security: Vec::new(), // Phase 1: no environment capture on this sensor
     })
 }

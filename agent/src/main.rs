@@ -48,6 +48,7 @@ mod integrity;
 // "file not found" skip path.
 #[cfg(target_os = "linux")]
 mod inventory;
+mod ioc;
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos", windows)),
     allow(dead_code)

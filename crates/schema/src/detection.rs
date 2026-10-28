@@ -1,5 +1,5 @@
-//! Detection output: what the engines (rules, Sigma, ML tiers, correlator, YARA)
-//! emit when something crosses a threshold.
+//! Detection output: what the engines (rules, Sigma, ML tiers, correlator, YARA, IOC
+//! matching) emit when something crosses a threshold.
 //!
 //! Lives in `schema` because detections traverse the same serialization boundary as
 //! events — sinks write them, transport ships them to the server, the case store
@@ -46,6 +46,47 @@ pub enum DetectionSource {
     Correlator { case_id: String },
     /// YARA-X scan hit.
     Yara { rule_name: String },
+    /// On-device indicator-of-compromise match (#60): an observed hash, IP or domain
+    /// found in a signed indicator set. Carries the matched indicator and where it
+    /// came from, so an analyst can tell *which feed* flagged it and the server can
+    /// expire or retract one feed without touching the others.
+    Ioc {
+        /// What kind of indicator matched; selects how `indicator` is normalized.
+        kind: IocKind,
+        /// The matched value in the feed's canonical form: lowercase hex for hashes,
+        /// the textual address for IPs, a lowercase dot-separated name without a
+        /// trailing dot for domains. The matching engine owns the normalization;
+        /// this is what it matched on, not what the event happened to contain.
+        indicator: String,
+        /// Stable identifier of the feed that supplied the indicator (e.g.
+        /// `"abuse.ch-malwarebazaar"`), as named in the indicator-set manifest.
+        feed: String,
+        /// Version of the signed indicator set that was loaded when the match fired,
+        /// as shipped through the canary rings; ties a detection to the exact content
+        /// that produced it.
+        feed_version: String,
+        /// The feed's own reference for the indicator (an upstream id or URL), where
+        /// the feed provides one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reference: Option<String>,
+    },
+}
+
+/// The kind of indicator an [`DetectionSource::Ioc`] detection matched.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IocKind {
+    /// SHA-256 file hash, matched against `enrich` output on exec and file write.
+    Sha256,
+    /// SHA-1 file hash.
+    Sha1,
+    /// MD5 file hash.
+    Md5,
+    /// IPv4 or IPv6 address, matched against connect events.
+    Ip,
+    /// DNS name, matched once DNS telemetry is available.
+    Domain,
 }
 
 /// One feature's contribution to an ML score — path attribution for tree ensembles,

@@ -20,6 +20,7 @@
 //!   lookup (see `sig.rs`) before settling on `Unsigned` — a handful of extra Win32
 //!   calls, but only on that one path, and only once per cache miss.
 
+mod pe_info;
 mod sig;
 
 use std::{
@@ -28,6 +29,7 @@ use std::{
     path::Path,
 };
 
+pub use pe_info::PeInfo;
 use schema::Signature;
 use sha2::{Digest, Sha256};
 use store::BoundedMap;
@@ -44,6 +46,12 @@ pub struct FileEnrichment {
     /// Lowercase hex SHA-256; `None` when the file was unreadable or over budget.
     pub sha256: Option<String>,
     pub signature: Signature,
+    /// PE version-resource metadata (issue #983): empty (every field `None`) on
+    /// every platform but Windows, and on Windows too when the image has none,
+    /// enrichment could not read it, or the image was over [`MAX_HASH_BYTES`] —
+    /// same budget as the hash, see `pe_info`'s module doc for why reading it
+    /// costs comparably little once the file is already open for the other two.
+    pub pe_info: PeInfo,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -124,6 +132,7 @@ impl Enricher {
         let unsupported = FileEnrichment {
             sha256: None,
             signature: Signature::Unsupported,
+            pe_info: PeInfo::default(),
         };
         // FIFOs, device nodes, sockets: opening one can block forever (a named
         // pipe with no writer) or read an endless stream — the event path must
@@ -169,7 +178,20 @@ impl Enricher {
             tracing::debug!(path = %path.display(), size, "enrich: over hash budget, skipping");
             None
         };
-        let enrichment = FileEnrichment { sha256, signature };
+        // Same budget as the hash (#983): a multi-GB binary must never stall this
+        // path for four cosmetic strings either. `pe_info::read` is a no-op on
+        // every platform but Windows regardless (see its module doc), so this
+        // check only ever skips real work there.
+        let pe_info = if size <= MAX_HASH_BYTES {
+            pe_info::read(path)
+        } else {
+            PeInfo::default()
+        };
+        let enrichment = FileEnrichment {
+            sha256,
+            signature,
+            pe_info,
+        };
         self.cache.insert(
             path.to_path_buf(),
             CacheEntry {
@@ -319,6 +341,43 @@ mod tests {
         let got = e.enrich(Path::new("/nonexistent/enrich-test"));
         assert_eq!(got.sha256, None);
         assert_eq!(got.signature, Signature::Unsupported);
+        assert!(got.pe_info.is_empty());
+    }
+
+    /// #983: `Enricher::enrich` wires `pe_info::read` through the same cache as the
+    /// hash and signature — a plain data file (no PE version resource, any platform)
+    /// must come back with every field `None` rather than erroring.
+    #[test]
+    fn non_pe_file_has_empty_pe_info() {
+        let p = tmp_file("pe-info-plain", b"not a PE file");
+        let mut e = Enricher::new();
+        assert!(e.enrich(&p).pe_info.is_empty());
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// Real platform coverage in CI, like `platform_signature_of_system_binary`:
+    /// `cmd.exe`'s `OriginalFilename` must come back through the full cache path,
+    /// not just `pe_info::read` in isolation (see `pe_info`'s own test, including
+    /// why the exact string is only checked loosely: it is build/locale-dependent).
+    #[cfg(windows)]
+    #[test]
+    fn enrich_fills_pe_info_for_a_windows_system_binary() {
+        let path = Path::new(r"C:\Windows\System32\cmd.exe");
+        if !path.exists() {
+            eprintln!("skipping: {} not present on this host", path.display());
+            return;
+        }
+        let mut e = Enricher::new();
+        let info = e.enrich(path).pe_info;
+        assert!(
+            info.original_file_name
+                .as_deref()
+                .is_some_and(|n| n.to_lowercase().starts_with("cmd.exe")),
+            "{info:?}"
+        );
+        // A second, cached call must return the same value, not re-derive it from a
+        // stale or absent cache entry.
+        assert_eq!(e.enrich(path).pe_info, info);
     }
 
     /// Real platform coverage in CI: a known system binary must verify as signed on

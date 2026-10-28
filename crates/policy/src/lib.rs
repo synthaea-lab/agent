@@ -349,6 +349,9 @@ pub struct ResponsePolicy {
     pub kill_enabled: bool,
     /// Automated quarantine of a payload a scan confirms malicious.
     pub quarantine_enabled: bool,
+    /// Host isolation, from any trigger (ADR-0037). Gates applying an isolation only:
+    /// lifting one is never refused.
+    pub isolate_enabled: bool,
 }
 
 #[cfg(test)]
@@ -360,6 +363,7 @@ mod response_policy_tests {
         let policy = ResponsePolicy::default();
         assert!(!policy.kill_enabled);
         assert!(!policy.quarantine_enabled);
+        assert!(!policy.isolate_enabled);
     }
 }
 

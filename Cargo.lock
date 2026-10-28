@@ -30,6 +30,7 @@ dependencies = [
  "deception",
  "enrich",
  "getrandom 0.4.3",
+ "intel",
  "inventory 0.1.0",
  "ipc",
  "libc",
@@ -1562,6 +1563,10 @@ checksum = "8eca9188c1b20836bb561bc09bb2f54e9ca99b271031b5f3ff183a00c08c98c8"
 [[package]]
 name = "intel"
 version = "0.1.0"
+dependencies = [
+ "proptest",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "inventory"
@@ -2348,7 +2353,10 @@ dependencies = [
  "libc",
  "policy",
  "schema",
+ "serde",
+ "serde_json",
  "sha2 0.11.1",
+ "thiserror 2.0.21",
  "tracing",
 ]
 

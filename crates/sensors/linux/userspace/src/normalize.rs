@@ -191,6 +191,10 @@ pub fn exec(
         parent_image_path: None,
         sha256: None,
         signature: None,
+        original_file_name: None, // filled by the agent's enrichment stage (#983); Linux has no PE resource anyway
+        company_name: None,
+        file_description: None,
+        product_name: None,
         env_security,
     })
 }

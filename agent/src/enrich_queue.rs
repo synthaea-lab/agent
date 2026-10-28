@@ -240,6 +240,12 @@ fn enrich_event(enricher: &mut Enricher, event: &mut Event, gated: bool) {
         };
         e.sha256 = enrichment.sha256;
         e.signature = Some(enrichment.signature);
+        // #983: PE version-resource metadata, empty (every field `None`) on every
+        // platform but Windows — see `enrich::pe_info`'s module doc.
+        e.original_file_name = enrichment.pe_info.original_file_name;
+        e.company_name = enrichment.pe_info.company_name;
+        e.file_description = enrichment.pe_info.file_description;
+        e.product_name = enrichment.pe_info.product_name;
     }
 }
 

@@ -23,7 +23,7 @@ use schema::{
     SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketCreateEvent,
     SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
     UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
-    detection::{Detection, DetectionSource, ScoreAttribution, Severity},
+    detection::{Detection, DetectionSource, IocKind, ScoreAttribution, Severity},
 };
 
 fn fixture(name: &str) -> serde_json::Value {
@@ -75,6 +75,10 @@ fn exec_unix_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         }),
         "exec",
@@ -109,6 +113,10 @@ fn exec_process_generation_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         }),
         "exec_process_generation",
@@ -139,6 +147,10 @@ fn exec_ld_preload_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: vec![("LD_PRELOAD".into(), "/tmp/evil.so".into())],
         }),
         "exec_ld_preload",
@@ -169,6 +181,10 @@ fn exec_windows_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         }),
         "exec_windows",
@@ -203,6 +219,10 @@ fn exec_lineage_golden() {
             ),
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         }),
         "exec_lineage",
@@ -257,6 +277,10 @@ fn detection_ml_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         })],
     };
@@ -292,6 +316,10 @@ fn sample_exec_event() -> Event {
         parent_image_path: None,
         sha256: None,
         signature: None,
+        original_file_name: None,
+        company_name: None,
+        file_description: None,
+        product_name: None,
         env_security: Vec::new(),
     })
 }
@@ -334,6 +362,55 @@ fn detection_sigma_golden() {
     };
     let serialized = serde_json::to_value(&detection).unwrap();
     assert_eq!(serialized, fixture("detection_sigma"), "fixture mismatch");
+    let back: Detection = serde_json::from_value(serialized).unwrap();
+    assert_eq!(back, detection, "round trip mismatch");
+}
+
+#[test]
+fn detection_ioc_golden() {
+    // v52 (#60): a SHA-256 indicator from a signed feed matched on exec.
+    let detection = Detection {
+        timestamp_ns: 1_756_900_006_000_000_000,
+        severity: Severity::High,
+        title: "Known-bad file hash".into(),
+        source: DetectionSource::Ioc {
+            kind: IocKind::Sha256,
+            indicator: "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f".into(),
+            feed: "abuse.ch-malwarebazaar".into(),
+            feed_version: "2026.10.26-1".into(),
+            reference: Some("https://bazaar.abuse.ch/sample/275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f/".into()),
+        },
+        score: None,
+        techniques: vec!["T1204.002".into()],
+        attributions: Vec::new(),
+        events: vec![sample_exec_event()],
+    };
+    let serialized = serde_json::to_value(&detection).unwrap();
+    assert_eq!(serialized, fixture("detection_ioc"), "fixture mismatch");
+    let back: Detection = serde_json::from_value(serialized).unwrap();
+    assert_eq!(back, detection, "round trip mismatch");
+}
+
+#[test]
+fn detection_ioc_without_reference_omits_the_field() {
+    let detection = Detection {
+        timestamp_ns: 1_756_900_007_000_000_000,
+        severity: Severity::High,
+        title: "Known-bad address".into(),
+        source: DetectionSource::Ioc {
+            kind: IocKind::Ip,
+            indicator: "203.0.113.7".into(),
+            feed: "internal-blocklist".into(),
+            feed_version: "7".into(),
+            reference: None,
+        },
+        score: None,
+        techniques: vec!["T1071".into()],
+        attributions: Vec::new(),
+        events: vec![sample_exec_event()],
+    };
+    let serialized = serde_json::to_value(&detection).unwrap();
+    assert_eq!(serialized, fixture("detection_ioc_ip"), "fixture mismatch");
     let back: Detection = serde_json::from_value(serialized).unwrap();
     assert_eq!(back, detection, "round trip mismatch");
 }
@@ -938,9 +1015,47 @@ fn exec_enriched_golden() {
             parent_image_path: None,
             sha256: Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into()),
             signature: Some(schema::Signature::Unsigned),
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         }),
         "exec_enriched",
+    );
+}
+
+/// #983: a renamed Windows binary still carries its real name in the PE version
+/// resource. `cmd.exe` copied to `svchost.exe` evaluated against a Sigma rule on
+/// `OriginalFileName` is the whole point of this field.
+#[test]
+fn exec_windows_pe_info_golden() {
+    assert_golden(
+        &Event::Exec(ExecEvent {
+            meta: EventMeta {
+                pid: 7700,
+                ppid: 512,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_007_000_000_000,
+                comm: "svchost.exe".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            image_path: "C:\\Users\\Public\\svchost.exe".into(),
+            cmdline: "C:\\Users\\Public\\svchost.exe /c whoami".into(),
+            argv: Vec::new(),
+            parent_comm: None,
+            parent_image_path: None,
+            sha256: Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into()),
+            signature: Some(schema::Signature::Unsigned),
+            original_file_name: Some("Cmd.Exe".into()),
+            company_name: Some("Microsoft Corporation".into()),
+            file_description: Some("Windows Command Processor".into()),
+            product_name: Some("Microsoft® Windows® Operating System".into()),
+            env_security: Vec::new(),
+        }),
+        "exec_pe_info",
     );
 }
 
@@ -971,6 +1086,10 @@ fn exec_container_golden() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         }),
         "exec_container",
@@ -2147,6 +2266,10 @@ fn unbounded_cmdline_survives() {
         parent_image_path: None,
         sha256: None,
         signature: None,
+        original_file_name: None,
+        company_name: None,
+        file_description: None,
+        product_name: None,
         env_security: Vec::new(),
     });
     let back: Event = serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
@@ -2180,6 +2303,10 @@ fn ml_cmdline_is_the_canonical_nul_joined_form() {
         parent_image_path: None,
         sha256: None,
         signature: None,
+        original_file_name: None,
+        company_name: None,
+        file_description: None,
+        product_name: None,
         env_security: Vec::new(),
     };
 
@@ -2237,6 +2364,10 @@ fn meta_accessor_covers_all_variants() {
             parent_image_path: None,
             sha256: None,
             signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
             env_security: Vec::new(),
         }),
         Event::FileOpen(FileOpenEvent {

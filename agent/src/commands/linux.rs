@@ -292,6 +292,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         policy::ResponsePolicy {
             kill_enabled: enable_kill,
             quarantine_enabled: enable_quarantine,
+            isolate_enabled: false,
         },
         terminate_process,
         crate::quarantine_cmd::quarantine_dir_for(alerts),
