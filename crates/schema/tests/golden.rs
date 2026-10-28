@@ -15,15 +15,15 @@ use schema::{
     FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetTimeEvent,
     FileSetxattrEvent, FileWriteEvent, GatekeeperVerdictEvent, HttpClientCount, HttpEvidence,
     HttpRequestEvent, HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind,
-    ImageLoadEvent, KernelModuleAction, KernelModuleEvent, LdapSearchEvent, ListenPortEvent,
-    LogClearedEvent, MemfdCreateEvent, MountEvent, NamespaceEvent, NamespaceSyscall,
-    NetworkFlowEvent, NtlmAuthEvent, NtlmDirection, POLICY_MECHANISM_SELINUX, PackageChangeEvent,
-    PackageChangeKind, PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent,
-    PtraceEvent, RawVolumeOpenEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
-    SessionEvent, SessionState, ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent,
-    SocketBindEvent, SocketCreateEvent, SocketListenEvent, TccDecisionEvent, TlsCaptureEvent,
-    TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
-    XpcConnectEvent,
+    ImageLoadEvent, KerberosDelegationFailureEvent, KerberosDelegationFailureKind,
+    KernelModuleAction, KernelModuleEvent, LdapSearchEvent, ListenPortEvent, LogClearedEvent,
+    MemfdCreateEvent, MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent,
+    NtlmAuthEvent, NtlmDirection, POLICY_MECHANISM_SELINUX, PackageChangeEvent, PackageChangeKind,
+    PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
+    RawVolumeOpenEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent,
+    SessionState, ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
+    SocketCreateEvent, SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection,
+    TlsLibraryType, UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
     detection::{Detection, DetectionSource, IocKind, ScoreAttribution, Severity},
 };
 
@@ -591,6 +591,34 @@ fn log_cleared_golden() {
             backup_path: None,
         }),
         "log_cleared",
+    );
+}
+
+#[test]
+fn kerberos_delegation_failure_golden() {
+    assert_golden(
+        &Event::KerberosDelegationFailure(KerberosDelegationFailureEvent {
+            meta: EventMeta {
+                pid: 4120,
+                ppid: 0,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-500".into(),
+                    integrity_level: None,
+                },
+                timestamp_ns: 1_761_220_000_000_000_000,
+                comm: "fileserver.exe".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            kind: KerberosDelegationFailureKind::UnconstrainedDelegationDenied,
+            target_server: "cifs/dc01.lab.internal".into(),
+            target_user: "analyst".into(),
+            target_domain: "LAB".into(),
+            caller_user: "svc_fileserver".into(),
+            caller_domain: "LAB".into(),
+        }),
+        "kerberos_delegation_failure",
     );
 }
 
@@ -2466,6 +2494,15 @@ fn meta_accessor_covers_all_variants() {
             subject_user: String::new(),
             subject_logon_id: None,
             backup_path: None,
+        }),
+        Event::KerberosDelegationFailure(KerberosDelegationFailureEvent {
+            meta: meta.clone(),
+            kind: KerberosDelegationFailureKind::UnconstrainedDelegationDenied,
+            target_server: String::new(),
+            target_user: String::new(),
+            target_domain: String::new(),
+            caller_user: String::new(),
+            caller_domain: String::new(),
         }),
         Event::NtlmAuth(NtlmAuthEvent {
             meta: meta.clone(),
