@@ -320,11 +320,11 @@ pub mod time;
 /// 2026-10-28) and is closer to merging, so #995 takes the slot after it instead
 /// of colliding.
 ///
-/// Bumped 57 → 58 for the Windows UDP collector (#676 part 2, this PR): stacked
-/// directly on #995's branch, so this just takes the next slot above it. No new
-/// field here — #995 already defined `ListenPortEvent::protocol`; this PR only
-/// populates it with the real value (6 or 17) instead of #995's TCP-only `6`.
-pub const SCHEMA_VERSION: u32 = 58;
+/// Not bumped for the Windows UDP collector (#676 part 2, stacked on #995): no
+/// wire change — #995 already defined `ListenPortEvent::protocol`; this PR only
+/// fills it with the real value (6 or 17) instead of #995's TCP-only `6` (review
+/// of #1008).
+pub const SCHEMA_VERSION: u32 = 57;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A

@@ -34,7 +34,7 @@ mod snapshot;
 pub use normalize::listen_port_event;
 pub use raw::ListenerEntry;
 #[cfg(windows)]
-pub use snapshot::{listen_port_events, snapshot};
+pub use snapshot::{listen_port_events, listen_port_events_tcp, snapshot, snapshot_tcp};
 
 /// Which IP Helper table a [`SocketsError::Table`] failure came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

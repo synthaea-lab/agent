@@ -8,7 +8,7 @@
 
 use std::net::{TcpListener, UdpSocket};
 
-use sensor_windows_sockets::{listen_port_events, snapshot};
+use sensor_windows_sockets::{listen_port_events, listen_port_events_tcp, snapshot, snapshot_tcp};
 
 #[test]
 fn own_ipv4_listener_appears_attributed_to_this_process() {
@@ -103,6 +103,59 @@ fn own_tcp_listener_is_still_distinguished_from_udp() {
         "a UDP socket in this process must not share the TCP listener's port"
     );
     drop(listener);
+}
+
+#[test]
+fn snapshot_tcp_finds_the_same_tcp_listener_as_snapshot_but_no_udp() {
+    // The agent's own entry point (review of #1008, #676 part 2): it must see
+    // what `snapshot` sees on the TCP side, and never fetch/report a UDP entry
+    // at all — not "reports it and relies on a filter downstream."
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral TCP listener");
+    let tcp_port = listener.local_addr().unwrap().port();
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind ephemeral UDP socket");
+    let udp_port = socket.local_addr().unwrap().port();
+    let me = std::process::id();
+
+    let entries = snapshot_tcp().expect("snapshot_tcp must succeed unprivileged");
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.pid == me && e.local.port() == tcp_port && e.protocol == 6),
+        "own TCP listener on port {tcp_port} not found"
+    );
+    assert!(
+        !entries.iter().any(|e| e.local.port() == udp_port),
+        "snapshot_tcp must never report a UDP-only port"
+    );
+    assert!(
+        entries.iter().all(|e| e.protocol == 6),
+        "every snapshot_tcp entry must be IPPROTO_TCP"
+    );
+    drop(listener);
+    drop(socket);
+}
+
+#[test]
+fn listen_port_events_tcp_carries_the_listener_but_not_a_udp_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral TCP listener");
+    let tcp_port = listener.local_addr().unwrap().port();
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind ephemeral UDP socket");
+    let udp_port = socket.local_addr().unwrap().port();
+    let me = std::process::id();
+
+    let events = listen_port_events_tcp(1_790_000_000_000_000_000).expect("events");
+    assert!(events.iter().any(|e| {
+        matches!(e, schema::Event::ListenPort(l)
+            if l.meta.pid == me && l.local_port == tcp_port && l.protocol == 6)
+    }));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, schema::Event::ListenPort(l) if l.local_port == udp_port)),
+        "listen_port_events_tcp must never carry a UDP-only port"
+    );
+    drop(listener);
+    drop(socket);
 }
 
 #[test]

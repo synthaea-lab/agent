@@ -256,6 +256,45 @@ fn process_table() -> HashMap<u32, (u32, String)> {
     out
 }
 
+/// Attributes `(pid, local)` to its owner from `processes`, a prior
+/// [`process_table`] call.
+fn attribute(
+    processes: &HashMap<u32, (u32, String)>,
+    (pid, local): (u32, SocketAddr),
+    protocol: u8,
+) -> ListenerEntry {
+    let owner = processes.get(&pid);
+    ListenerEntry {
+        pid,
+        ppid: owner.map(|(ppid, _)| *ppid),
+        process_name: owner.map(|(_, name)| name.clone()),
+        local,
+        protocol,
+    }
+}
+
+/// Takes one snapshot of every listening TCP socket, IPv4 and IPv6 — the half
+/// of [`snapshot`] the agent uses today (issue #676 part 2 review): the UDP
+/// table's own noise filter is not calibrated yet, so fetching and discarding
+/// `GetExtendedUdpTable` on every poll, and warning on every one of its
+/// failures, would be wasted work for a value nothing reads. [`snapshot`]
+/// stays the full, honest mechanism the filter will sit in front of once it
+/// exists; `GetExtendedUdpTable` is simply not called from this path.
+///
+/// # Errors
+///
+/// [`SocketsError::Table`] when either TCP table (IPv4 or IPv6) cannot be
+/// read.
+pub fn snapshot_tcp() -> Result<Vec<ListenerEntry>, SocketsError> {
+    let mut tcp = ipv4_listeners()?;
+    tcp.extend(ipv6_listeners()?);
+    let processes = process_table();
+    Ok(tcp
+        .into_iter()
+        .map(|e| attribute(&processes, e, IPPROTO_TCP))
+        .collect())
+}
+
 /// Takes one snapshot of every listening TCP socket and every bound UDP
 /// socket, IPv4 and IPv6.
 ///
@@ -268,7 +307,9 @@ fn process_table() -> HashMap<u32, (u32, String)> {
 /// media sockets on ephemeral ports. Issue #676 names this the noise problem
 /// and asks for a filter calibrated on a real capture — deliberately not
 /// invented here; this snapshot is the honest, unfiltered mechanism the filter
-/// will sit in front of.
+/// will sit in front of. The agent itself calls [`snapshot_tcp`] instead until
+/// that filter lands, so this full mechanism is exercised by this crate's own
+/// tests rather than production code for now.
 ///
 /// # Errors
 ///
@@ -278,8 +319,7 @@ fn process_table() -> HashMap<u32, (u32, String)> {
 /// own `unwrap_or_else` calls) — the process snapshot failing is the same
 /// best-effort posture (see [`ListenerEntry`]).
 pub fn snapshot() -> Result<Vec<ListenerEntry>, SocketsError> {
-    let mut tcp = ipv4_listeners()?;
-    tcp.extend(ipv6_listeners()?);
+    let mut entries = snapshot_tcp()?;
     // UDP is best-effort: unlike the TCP tables above, a UDP fetch failure
     // must not drop the TCP listeners already read (review of #1008 — the
     // startup baseline going empty because IPv6 UDP errored would alert on
@@ -293,20 +333,25 @@ pub fn snapshot() -> Result<Vec<ListenerEntry>, SocketsError> {
         Vec::new()
     }));
     let processes = process_table();
-    let attribute = |(pid, local): (u32, SocketAddr), protocol: u8| {
-        let owner = processes.get(&pid);
-        ListenerEntry {
-            pid,
-            ppid: owner.map(|(ppid, _)| *ppid),
-            process_name: owner.map(|(_, name)| name.clone()),
-            local,
-            protocol,
-        }
-    };
-    let mut entries: Vec<ListenerEntry> =
-        tcp.into_iter().map(|e| attribute(e, IPPROTO_TCP)).collect();
-    entries.extend(udp.into_iter().map(|e| attribute(e, IPPROTO_UDP)));
+    entries.extend(
+        udp.into_iter()
+            .map(|e| attribute(&processes, e, IPPROTO_UDP)),
+    );
     Ok(entries)
+}
+
+/// One [`snapshot_tcp`] mapped to [`schema::Event::ListenPort`] events,
+/// stamped with `timestamp_ns` as the snapshot time — what the agent polls
+/// with until the UDP noise filter lands (see [`snapshot_tcp`]).
+///
+/// # Errors
+///
+/// Same failure mode as [`snapshot_tcp`], which this wraps.
+pub fn listen_port_events_tcp(timestamp_ns: u64) -> Result<Vec<schema::Event>, SocketsError> {
+    Ok(snapshot_tcp()?
+        .iter()
+        .map(|entry| crate::normalize::listen_port_event(entry, timestamp_ns))
+        .collect())
 }
 
 /// One [`snapshot`] mapped to [`schema::Event::ListenPort`] events, stamped
