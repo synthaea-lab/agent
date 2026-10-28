@@ -89,7 +89,10 @@ impl AlertLog {
     /// (stdout carries nothing in run mode) so an alert is not lost in
     /// terminal noise.
     pub(crate) fn record(&self, technique: &str, message: String) {
-        eprintln!("\x1b[1;31m[ALERT] {technique} — {message}\x1b[0m");
+        eprintln!(
+            "\x1b[1;31m{}\x1b[0m",
+            format_alert_line(technique, &message)
+        );
         let emitted_at_ns = schema::time::now_ns();
         self.file.write(&AlertRecord {
             timestamp_ns: emitted_at_ns,
@@ -106,6 +109,10 @@ impl AlertLog {
     pub(crate) fn latest(&self, limit: usize) -> Vec<RecentAlert> {
         self.recent.latest(limit)
     }
+}
+
+pub(crate) fn format_alert_line(technique: &str, message: &str) -> String {
+    format!("[ALERT] {technique} — {message}")
 }
 
 #[cfg(test)]
