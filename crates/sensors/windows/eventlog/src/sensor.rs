@@ -1247,7 +1247,7 @@ static LOG_FILE_CLEARS: PollTarget = PollTarget {
 /// id the `XPath` filter let through that this function has no state for.
 ///
 /// This channel is off by default on a clean install (checked on this host,
-/// `docs/sensors/windows.md`); unlike the `auditpol` subcategories other targets in this file
+/// `docs/sensors/sources.md`); unlike the `auditpol` subcategories other targets in this file
 /// enable, nothing here turns it on — same open question as #786's point 1 for
 /// `TaskScheduler/Operational`, not duplicated here. A disabled channel is still reported, not
 /// silently idle, by this module's existing start-up check (`warn_about_disabled_channels`).

@@ -1254,7 +1254,7 @@ pub enum KerberosDelegationFailureKind {
 }
 
 /// A Kerberos client-side operation an attacker would want was denied, from the
-/// (off by default; see `docs/sensors/windows.md`) `Microsoft-Windows-Kerberos/Operational`
+/// (off by default; see `docs/sensors/sources.md`) `Microsoft-Windows-Kerberos/Operational`
 /// channel's EID 201/202 (#364). **The local process is the actor**: both events report this
 /// host's own process asking its own Kerberos client for something (a delegable ticket for
 /// `target_server`, or its own TGT session key) and that client refusing — not a remote
