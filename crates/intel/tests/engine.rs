@@ -22,7 +22,7 @@ fn digests(seed: u64, count: usize) -> Vec<[u8; 32]> {
     (0..count)
         .map(|_| {
             let mut digest = [0u8; 32];
-            for chunk in digest.chunks_exact_mut(8) {
+            for chunk in digest.as_chunks_mut::<8>().0.iter_mut() {
                 chunk.copy_from_slice(&next().to_le_bytes());
             }
             digest
