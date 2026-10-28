@@ -2349,6 +2349,9 @@ impl EventSink for DetectionSink {
             Event::LogCleared(e) => {
                 self.record_rule_alerts(&event, rules::evaluate_log_cleared(e));
             }
+            Event::KerberosDelegationFailure(e) => {
+                self.record_rule_alerts(&event, rules::evaluate_kerberos_delegation_failure(e));
+            }
             Event::PolicyDenial(e) => self.detect_policy_denial(&event, e),
             Event::PackageChange(e) => {
                 self.record_rule_alerts(&event, rules::evaluate_package_change(e));
