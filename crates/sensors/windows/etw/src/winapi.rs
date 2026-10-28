@@ -432,6 +432,23 @@ pub(crate) fn read_server_silo_id(pid: u32) -> Option<u32> {
     if SILO_QUERY_UNSUPPORTED.load(Ordering::Relaxed) {
         return None;
     }
+    match query_server_silo(pid)? {
+        Ok(silo) => Some(silo),
+        Err(STATUS_INVALID_INFO_CLASS) => {
+            if !SILO_QUERY_UNSUPPORTED.swap(true, Ordering::Relaxed) {
+                tracing::info!(
+                    "server silo query unsupported on this build: no container attribution"
+                );
+            }
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+/// The raw query: `None` when the process cannot be opened, else the silo or
+/// the failing `NTSTATUS`.
+fn query_server_silo(pid: u32) -> Option<Result<u32, i32>> {
     // SAFETY: the handle is null-checked and closed on every path;
     // NtQueryInformationProcess writes at most the 4 bytes of the local u32.
     unsafe {
@@ -449,18 +466,7 @@ pub(crate) fn read_server_silo_id(pid: u32) -> Option<u32> {
             &mut ret_len,
         );
         CloseHandle(process);
-        match status {
-            0 => Some(silo),
-            STATUS_INVALID_INFO_CLASS => {
-                if !SILO_QUERY_UNSUPPORTED.swap(true, Ordering::Relaxed) {
-                    tracing::info!(
-                        "server silo query unsupported on this build: no container attribution"
-                    );
-                }
-                None
-            }
-            _ => None,
-        }
+        Some(if status == 0 { Ok(silo) } else { Err(status) })
     }
 }
 
@@ -497,12 +503,13 @@ mod tests {
 
     #[test]
     fn a_host_process_is_in_no_server_silo() {
-        // Some(0) on Windows 11 22H2 / Server 2025 and later, None on an older
-        // build: either way, never a silo.
-        assert!(matches!(
-            read_server_silo_id(std::process::id()),
-            Some(0) | None
-        ));
+        // Silo 0 on Windows 11 22H2 / Server 2025 and later, "unknown class" on
+        // an older build. Any other status (a wrong buffer size, access denied
+        // on our own process) or a non-zero silo is a broken query.
+        match query_server_silo(std::process::id()) {
+            Some(Ok(0) | Err(STATUS_INVALID_INFO_CLASS)) => {}
+            other => panic!("unexpected server silo query result: {other:?}"),
+        }
     }
 
     #[test]

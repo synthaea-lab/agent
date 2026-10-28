@@ -195,9 +195,16 @@ mod tests {
     use super::*;
 
     /// Whatever the host (no Containers feature, no running service): the
-    /// lookup answers, it does not crash or hang past its timeout.
+    /// lookup answers within its timeout, with ids or a reason.
     #[test]
     fn listing_containers_answers_on_any_host() {
-        let _ = Hcs::default().container_ids();
+        let started = std::time::Instant::now();
+        let answer = Hcs::default().container_ids();
+        let bound = std::time::Duration::from_millis(u64::from(TIMEOUT_MS) + 2_000);
+        assert!(started.elapsed() < bound);
+        match answer {
+            Ok(ids) => assert!(ids.iter().all(|id| !id.is_empty())),
+            Err(reason) => assert!(!reason.is_empty()),
+        }
     }
 }

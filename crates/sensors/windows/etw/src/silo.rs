@@ -115,20 +115,43 @@ impl SiloDirectory {
         )
     }
 
-    /// The resolver named the container of `silo`.
-    pub(crate) fn resolved(&mut self, silo: u32, container_id: String) {
+    /// The request for `silo` never reached the resolver (its queue was
+    /// full): the next event in that silo asks again instead of waiting out
+    /// [`RETRY_NS`].
+    pub(crate) fn request_dropped(&mut self, silo: u32) {
+        if let Some(entry) = self.entries.get_mut(&silo) {
+            entry.requested_at_ns = None;
+        }
+    }
+
+    /// The silos events asked about that no container names yet: the only ones
+    /// a resolver pass may map.
+    pub(crate) fn pending(&self) -> HashSet<u32> {
+        self.entries
+            .iter()
+            .filter(|(_, e)| e.container_id.is_none() && e.requested_at_ns.is_some())
+            .map(|(silo, _)| *silo)
+            .collect()
+    }
+
+    /// The resolver named the container of `silo`. A mapping is never
+    /// overwritten and a silo no event asked about is not created, so a later
+    /// claimant (a Hyper-V-isolated container's guest pid that happens to name
+    /// a containerized host process) cannot relabel a container's events; only
+    /// [`Self::forget`], on the silo's teardown, frees it. Returns whether the
+    /// mapping was taken.
+    pub(crate) fn resolved(&mut self, silo: u32, container_id: String) -> bool {
         self.tick += 1;
         let tick = self.tick;
-        if !self.entries.contains_key(&silo) {
-            self.make_room();
+        let Some(entry) = self.entries.get_mut(&silo) else {
+            return false;
+        };
+        if entry.container_id.is_some() {
+            return false;
         }
-        let entry = self.entries.entry(silo).or_insert(SiloEntry {
-            container_id: None,
-            requested_at_ns: None,
-            last_used: tick,
-        });
         entry.container_id = Some(container_id);
         entry.last_used = tick;
+        true
     }
 
     /// The silo was created or torn down: whatever it was mapped to is stale.
@@ -296,7 +319,13 @@ fn resolve_pass(
     source: &impl ContainerSource,
     probe: &impl Fn(u32, &str) -> Option<u32>,
 ) {
-    let known = directory.lock().unwrap().resolved_ids();
+    let (known, pending) = {
+        let directory = directory.lock().unwrap();
+        (directory.resolved_ids(), directory.pending())
+    };
+    if pending.is_empty() {
+        return;
+    }
     let ids = match source.container_ids() {
         Ok(ids) => ids,
         Err(error) => {
@@ -323,7 +352,9 @@ fn resolve_pass(
     );
     let mut directory = directory.lock().unwrap();
     for (silo, id) in mapping {
-        directory.resolved(silo, id);
+        if pending.contains(&silo) && !directory.resolved(silo, id) {
+            tracing::debug!(silo, "container lookup: silo mapped meanwhile, kept");
+        }
     }
 }
 
@@ -383,8 +414,34 @@ mod tests {
     }
 
     #[test]
+    fn a_mapped_silo_is_never_relabelled_by_a_later_claimant() {
+        let mut dir = SiloDirectory::new();
+        dir.lookup(9, SEC);
+        assert!(dir.resolved(9, ID_A.to_string()));
+        assert!(!dir.resolved(9, ID_B.to_string()));
+        assert_eq!(dir.lookup(9, SEC).0.id, ID_A);
+    }
+
+    #[test]
+    fn a_silo_no_event_asked_about_is_not_mapped() {
+        let mut dir = SiloDirectory::new();
+        assert!(!dir.resolved(9, ID_A.to_string()));
+        assert!(dir.pending().is_empty());
+        assert_eq!(dir.lookup(9, SEC).0.id, "silo:9");
+    }
+
+    #[test]
+    fn a_dropped_request_is_asked_again_on_the_next_event() {
+        let mut dir = SiloDirectory::new();
+        assert!(dir.lookup(9, SEC).1);
+        dir.request_dropped(9);
+        assert!(dir.lookup(9, SEC + 1).1);
+    }
+
+    #[test]
     fn a_forgotten_silo_is_provisional_again() {
         let mut dir = SiloDirectory::new();
+        dir.lookup(9, SEC);
         dir.resolved(9, ID_A.to_string());
         dir.forget(9);
         let (ctx, ask) = dir.lookup(9, SEC);
@@ -506,7 +563,12 @@ mod tests {
     #[test]
     fn one_resolver_pass_names_every_queued_silo_and_skips_mapped_containers() {
         let directory = Mutex::new(SiloDirectory::new());
-        directory.lock().unwrap().resolved(5, ID_B.to_string());
+        {
+            let mut dir = directory.lock().unwrap();
+            dir.lookup(5, SEC);
+            dir.resolved(5, ID_B.to_string());
+            dir.lookup(41, SEC);
+        }
         let hcs = FakeHcs {
             containers: vec![
                 container(ID_A, &[(612, "cmd.exe")]),
@@ -537,13 +599,46 @@ mod tests {
         }
     }
 
+    /// Review of #709: a Hyper-V-isolated container is never mapped, so every
+    /// pass probes it, and one of its guest pids can name a process in
+    /// container A's silo. Once A holds the silo, that claim changes nothing.
+    #[test]
+    fn a_never_mapped_container_cannot_take_a_mapped_silo() {
+        let directory = Mutex::new(SiloDirectory::new());
+        {
+            let mut dir = directory.lock().unwrap();
+            dir.lookup(41, SEC);
+            dir.resolved(41, ID_A.to_string());
+            // Another container starting: its request runs a pass.
+            dir.lookup(77, SEC);
+        }
+        let hcs = FakeHcs {
+            containers: vec![
+                container(ID_A, &[(612, "cmd.exe")]),
+                container(ID_B, &[(612, "cmd.exe")]),
+            ],
+            listed: std::cell::RefCell::new(Vec::new()),
+        };
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(77).unwrap();
+        drop(tx);
+        run_resolver(&rx, &directory, &hcs, |pid, _| (pid == 612).then_some(41));
+
+        assert_eq!(*hcs.listed.borrow(), vec![ID_B.to_string()]);
+        let mut dir = directory.lock().unwrap();
+        assert_eq!(dir.lookup(41, SEC).0.id, ID_A);
+        assert_eq!(dir.lookup(77, SEC).0.id, "silo:77");
+    }
+
     #[test]
     fn an_unreachable_compute_service_leaves_silos_provisional() {
         let directory = Mutex::new(SiloDirectory::new());
+        directory.lock().unwrap().lookup(41, SEC);
         let (tx, rx) = mpsc::sync_channel(1);
         tx.send(41).unwrap();
         drop(tx);
         run_resolver(&rx, &directory, &DownHcs, |_, _| Some(41));
+        assert!(directory.lock().unwrap().pending().contains(&41));
         assert_eq!(directory.lock().unwrap().lookup(41, SEC).0.id, "silo:41");
     }
 }

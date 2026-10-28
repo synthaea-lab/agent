@@ -62,7 +62,8 @@ const MARK_QUEUE_CAPACITY: usize = 256;
 const LDAP_PER_PID_LIMIT: u32 = 128;
 const LDAP_PER_PID_WINDOW_NS: u64 = 10_000_000_000;
 /// Silos waiting for a container lookup (#371). A full queue loses nothing:
-/// the pass already queued probes every container not yet mapped.
+/// the pass already queued maps every pending silo, and a dropped request is
+/// asked again on that silo's next event.
 const SILO_REQUEST_CAPACITY: usize = 16;
 /// An identical NTLM authentication (direction, account, target, address, version) is
 /// reported once per this window (#364): most come from pid 4, so there is no per-process
@@ -354,9 +355,10 @@ impl SharedState {
             .unwrap()
             .silo(pid)
             .filter(|&silo| silo != 0)?;
-        let (context, ask) = self.silos.lock().unwrap().lookup(silo, now_ns);
-        if ask {
-            let _ = self.silo_requests.try_send(silo);
+        let mut silos = self.silos.lock().unwrap();
+        let (context, ask) = silos.lookup(silo, now_ns);
+        if ask && self.silo_requests.try_send(silo).is_err() {
+            silos.request_dropped(silo);
         }
         Some(context)
     }
