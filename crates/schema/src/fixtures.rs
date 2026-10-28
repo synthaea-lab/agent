@@ -33,7 +33,8 @@ use crate::{
     DnsQueryEvent, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent,
     FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
     FileWriteEvent, HttpRequestEvent, HttpSignature, HttpSummaryEvent, IdentityChangeEvent,
-    IdentityChangeKind, ImageLoadEvent, KernelModuleAction, KernelModuleEvent, LdapSearchEvent,
+    IdentityChangeKind, ImageLoadEvent, KerberosDelegationFailureEvent,
+    KerberosDelegationFailureKind, KernelModuleAction, KernelModuleEvent, LdapSearchEvent,
     ListenPortEvent, LogClearedEvent, MemfdCreateEvent, NamespaceEvent, NamespaceSyscall,
     NetworkFlowEvent, NtlmAuthEvent, NtlmDirection, PackageChangeEvent, PackageChangeKind,
     PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
@@ -159,6 +160,20 @@ pub fn log_cleared() -> LogClearedEvent {
         subject_user: String::new(),
         subject_logon_id: None,
         backup_path: None,
+    }
+}
+
+/// Neutral [`KerberosDelegationFailureEvent`].
+#[must_use]
+pub fn kerberos_delegation_failure() -> KerberosDelegationFailureEvent {
+    KerberosDelegationFailureEvent {
+        meta: meta(),
+        kind: KerberosDelegationFailureKind::UnconstrainedDelegationDenied,
+        target_server: String::new(),
+        target_user: String::new(),
+        target_domain: String::new(),
+        caller_user: String::new(),
+        caller_domain: String::new(),
     }
 }
 

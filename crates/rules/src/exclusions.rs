@@ -340,6 +340,20 @@ pub(crate) const COMPRESSION_DRIVER_COMMS: &[&str] = &["logrotate"];
 /// [`COMPRESSION_DRIVER_COMMS`]: on their own they are free for an encryptor to copy.
 pub(crate) const COMPRESSION_SUFFIXES: &[&str] = &[".gz", ".xz", ".bz2", ".zst", ".lz4", ".lzma"];
 
+/// `comm` values of `SELinux` policy-store tools whose normal operation matches the
+/// write-new-then-unlink shape: `semodule -B`/`-DB` (full policy-store rebuild, also run by
+/// `dnf`/`rpm` installing a `selinux-policy*` package) stages every one of the targeted
+/// policy base set's ~20 modules into `.../tmp/modules/<priority>/<name>/*` and renames the
+/// previous version at `.../previous/modules/<priority>/<name>/*` out of the way, all inside
+/// one pid, well within [`CREATE_UNLINK_PAIR_WINDOW_NS`] (measured live, Fedora Cloud Base 43
+/// `SELinux` Enforcing, #1013; alerted at Critical with `RESPONSE-ESCALATE`). Unlike the
+/// compression drivers there is no `comm`-independent output-suffix convention to also
+/// require: the staging path shape is internal to `libsepol`'s module store, not something an
+/// encryptor can spoof for free by naming its own output, so gating on `comm` + a trusted
+/// exec-time image named `comm` (the same pattern [`COMPRESSOR_COMMS`] uses) is enough,
+/// failing closed the same way.
+pub(crate) const SELINUX_POLICY_TOOL_COMMS: &[&str] = &["semodule"];
+
 /// How long a creation and the unlink of the file it replaced may be apart and still
 /// count as one write-new-then-unlink (#512 part B). Generous on purpose: an encryptor
 /// creates `f.locked` at the start of a file and unlinks `f` only once the whole

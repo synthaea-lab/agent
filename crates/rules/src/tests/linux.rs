@@ -2721,6 +2721,27 @@ fn a_compressor_comm_with_no_known_exec_path_fails_closed() {
 }
 
 #[test]
+fn semodule_rebuilding_the_selinux_policy_store_does_not_alert() {
+    // Measured live (Fedora Cloud Base 43, SELinux Enforcing, #1013): `semodule -B` staged
+    // and replaced 20 modules in one pid within 5s, the exact write-new-then-unlink shape,
+    // and alerted at Critical with RESPONSE-ESCALATE before this exclusion.
+    assert!(compressor_burst("semodule", Some("/usr/sbin/semodule")).is_empty());
+}
+
+#[test]
+fn a_semodule_comm_from_an_untrusted_path_still_alerts() {
+    let alerts = compressor_burst("semodule", Some("/tmp/semodule"));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+}
+
+#[test]
+fn a_semodule_comm_with_no_known_exec_path_fails_closed() {
+    let alerts = compressor_burst("semodule", None);
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
 fn an_encryptor_that_names_its_output_dot_gz_still_alerts() {
     // A suffix allowlist would be free to copy: the exclusion is on the process, not
     // on the `.gz` shape.

@@ -43,6 +43,11 @@ crates/**/tests/fixtures/**/*.json text eol=lf
 crates/**/tests/fixtures/**/*.jsonl text eol=lf
 server/tests/fixtures/**/*.json text eol=lf
 
+# The IOC feed fixtures are compared byte for byte (buildFeed joins with "\n" only), so a
+# Windows checkout with core.autocrlf=true must not turn them into CRLF.
+server/tests/fixtures/ioc-feed-golden.txt text eol=lf
+server/tests/fixtures/ioc-feed-input.txt text eol=lf
+
 # ONNX model files are binary (protobuf). Not currently relying on an incorrect
 # guess from Git's content-sniffing heuristic, just making it explicit.
 *.onnx binary

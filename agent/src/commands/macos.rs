@@ -193,10 +193,10 @@ fn spawn_network_extension_receiver(sink: Arc<dyn EventSink>) {
 /// Runs the ES sensor (blocking, on the calling thread), the unified-log
 /// tail, and the `NetworkExtension` receiver (background threads) against the
 /// same sink, with Ctrl-C wired to stop the lot.
-fn run_macos_sensors(sink: Box<dyn EventSink>) -> anyhow::Result<()> {
+fn run_macos_sensors(sink: Box<dyn EventSink>, redact_exec: bool) -> anyhow::Result<()> {
     // Run and both capture commands funnel through here, so this is the one
     // place credential redaction has to sit in front of (#440).
-    let sink = crate::redact::redacting(sink);
+    let sink = crate::redact::redacting(sink, redact_exec);
 
     let mut sensor = sensor_macos::MacosSensor::new();
     let stop = sensor.stop_handle();
@@ -274,19 +274,19 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         storage,
         pipeline.transport.as_ref(),
     );
-    run_macos_sensors(Box::new(SharedSink(pipeline.sink)))
+    run_macos_sensors(Box::new(SharedSink(pipeline.sink)), false)
 }
 
 pub(crate) fn cmd_capture_events(output: &std::path::Path) -> anyhow::Result<()> {
     let sink = sinks::JsonlEventSink::open(output)?;
     eprintln!("Synthaea — raw event capture (Ctrl-C to stop)");
     eprintln!("Output: {}", output.display());
-    run_macos_sensors(Box::new(sink))
+    run_macos_sensors(Box::new(sink), true)
 }
 
 pub(crate) fn cmd_capture_baseline(output: &std::path::Path) -> anyhow::Result<()> {
     let sink = crate::sink::BaselineSink::new(seeded_rule_state(), output)?;
     eprintln!("Synthaea — baseline capture (Ctrl-C to stop)");
     eprintln!("Output: {}", output.display());
-    run_macos_sensors(Box::new(sink))
+    run_macos_sensors(Box::new(sink), true)
 }
