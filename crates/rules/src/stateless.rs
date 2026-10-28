@@ -1424,6 +1424,57 @@ pub(crate) fn check_kerberos_from_non_lsass(event: &ConnectEvent) -> Option<Aler
     })
 }
 
+/// T1558 — Steal or Forge Kerberos Tickets. The local process named by `event.meta` asked its
+/// own Kerberos client for either a ticket usable for unconstrained delegation, or its TGT's
+/// session key, and the client refused (#364, `KerberosDelegationFailureEvent`, EID 201/202 of
+/// `Microsoft-Windows-Kerberos/Operational`). The local process is the actor in both cases —
+/// not a remote server reaching into this host, see the event's own struct doc.
+///
+/// A **refusal**, not a success: this host's Kerberos stack said no, so the request did not go
+/// through. Still worth an alert — the small, deliberate allowlist unconstrained delegation and
+/// TGT export live behind means a request outside it is rare on a well-run host, and both are
+/// textbook steps in domain-admin-ticket theft (a process collecting a delegable ticket to
+/// coerce a chain back to an attacker-controlled "service", or pulling a TGT's key straight out
+/// of a host that should never give it up — the Rubeus `tgtdeleg` shape). High, not Critical:
+/// the refusal is the control already working, and a misconfigured but legitimate caller asking
+/// for delegation it was never granted looks identical to this agent — the verdict, not this
+/// rule, decides what it adds to.
+#[must_use]
+pub fn evaluate_kerberos_delegation_failure(
+    event: &schema::KerberosDelegationFailureEvent,
+) -> Vec<Alert> {
+    use schema::KerberosDelegationFailureKind as Kind;
+    let what = match event.kind {
+        Kind::UnconstrainedDelegationDenied => "a ticket usable for unconstrained delegation",
+        Kind::TgtSessionKeyExportDenied => "its TGT session key",
+    };
+    let supplied = if event.target_user.is_empty() {
+        String::new()
+    } else if event.target_domain.is_empty() {
+        format!(", supplied credentials {}", event.target_user)
+    } else {
+        format!(
+            ", supplied credentials {}\\{}",
+            event.target_domain, event.target_user
+        )
+    };
+    let owner = if event.caller_user.is_empty() {
+        String::new()
+    } else if event.caller_domain.is_empty() {
+        format!(" owner={}", event.caller_user)
+    } else {
+        format!(" owner={}\\{}", event.caller_domain, event.caller_user)
+    };
+    vec![Alert {
+        technique: "T1558",
+        severity: Severity::High,
+        message: format!(
+            "pid={} comm={}: asked for {what} against {}{supplied} — denied{owner}",
+            event.meta.pid, event.meta.comm, event.target_server,
+        ),
+    }]
+}
+
 /// Evaluates all stateless rules applicable to a `ConnectEvent`.
 #[must_use]
 pub fn evaluate_connect(event: &ConnectEvent) -> Vec<Alert> {

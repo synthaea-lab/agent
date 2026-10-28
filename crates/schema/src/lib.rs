@@ -307,11 +307,17 @@ pub mod time;
 /// their own 49 claims) — this PR took the next free number above all three
 /// instead of guessing which of 50/51 would still be open by the time it merged.
 ///
-/// Bumped 53 → 56 for Windows minifilter explicit timestamp requests (#136).
-/// #995 (`ListenPortEvent::protocol`, 54) and #994 (`Event::KerberosDelegationFailure`,
-/// 55) are open and merge first, so this takes the slot after them; same coordination
-/// note as above. #1007 (raw-volume access, stacked on this branch) renumbers again on
-/// top of this when it next merges main.
+/// Bumped 53 → 55 for [`Event::KerberosDelegationFailure`] (#364): the Kerberos
+/// client's own unconstrained-delegation and TGT-session-key-export denials,
+/// from the (off by default) `Microsoft-Windows-Kerberos/Operational` channel.
+/// Windows-only. Originally claimed 49; renumbered past #60's 52 and #983's 53.
+/// #995 (`ListenPortEvent::protocol`) holds 54 and merges first, so this takes the
+/// slot after it; same coordination note as above.
+///
+/// Bumped 55 → 56 for Windows minifilter explicit timestamp requests (#136). #995
+/// (`ListenPortEvent::protocol`, 54) is still open and merges first, so this takes
+/// the slot after it and after #994 (55, landed above). #1007 (raw-volume access,
+/// stacked on this branch) renumbers again on top of this when it next merges main.
 pub const SCHEMA_VERSION: u32 = 56;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
@@ -1256,6 +1262,69 @@ pub struct LogClearedEvent {
     /// clearer asked for a backup (`wevtutil cl <channel> /bu:<file>`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_path: Option<String>,
+}
+
+/// Which Kerberos client operation was denied, in a [`KerberosDelegationFailureEvent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KerberosDelegationFailureKind {
+    /// EID 201: this host's own process asked its local Kerberos client for a ticket it
+    /// could present for unconstrained delegation to `target_server` (impersonating
+    /// whatever user later authenticates through it to that server), and the client's
+    /// own Kerberos stack refused — this host is not on the allowlist that may ask for
+    /// that. The Rubeus `tgtdeleg`/delegation-collection shape.
+    UnconstrainedDelegationDenied,
+    /// EID 202: this host's own process asked to export its TGT's session key, and the
+    /// client's own Kerberos stack refused — on a Credential Guard host, a TGT's key can
+    /// never leave the isolated LSA, by design (ADR: this is the client-side half of the
+    /// same protection PKINIT key-export denials, EID 203/204, also report).
+    TgtSessionKeyExportDenied,
+}
+
+/// A Kerberos client-side operation an attacker would want was denied, from the
+/// (off by default; see `docs/sensors/sources.md`) `Microsoft-Windows-Kerberos/Operational`
+/// channel's EID 201/202 (#364). **The local process is the actor**: both events report this
+/// host's own process asking its own Kerberos client for something (a delegable ticket for
+/// `target_server`, or its own TGT session key) and that client refusing — not a remote
+/// server using this host as a stepping stone. The provider manifest
+/// (`Get-WinEvent -ListProvider Microsoft-Windows-Security-Kerberos`) names `%4 CallerPID` as
+/// the *client* process id, and the message text is "unconstrained delegation is not allowed
+/// for this user" (fwlink 856824) — the refusal is about the local caller, not a third party.
+///
+/// Framed as what it is: a **refusal**. Each event means an attempt was made and this host's
+/// own Kerberos stack said no — not that delegation succeeded, and not evidence the request
+/// was malicious (a misconfigured but legitimate service asking for delegation it was never
+/// granted looks identical). High: unconstrained delegation and TGT export are both a small,
+/// deliberate allowlist on a well-run host, so a request outside it is rare and worth a look;
+/// not Critical, since the client's own refusal is already the control working.
+///
+/// `meta.pid`/`meta.comm` are the process that made the request (`CallerPID`/`ProcessName`,
+/// both 201 and 202 carry them, the same nine-field template). `meta.user` is
+/// [`User::Unknown`]: the template gives this process's owner only as a name and a domain
+/// (`ClientUserName`/`ClientDomainName`), never a SID, so it cannot become a
+/// [`User::Windows`] — [`caller_user`](Self::caller_user) carries it as text instead, the same
+/// choice [`LogClearedEvent::subject_user`] makes when a SID isn't the shape the data comes in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KerberosDelegationFailureEvent {
+    pub meta: EventMeta,
+    pub kind: KerberosDelegationFailureKind,
+    /// The server named in the request (`TargetName`/`Server`): for 201, the server the
+    /// requested delegable ticket was for.
+    pub target_server: String,
+    /// Credentials explicitly supplied to the call (`UserName`), rather than the caller's own
+    /// — usually empty, since a call with default credentials supplies none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub target_user: String,
+    /// That supplied account's domain (`DomainName`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub target_domain: String,
+    /// The calling process's own owner account (`ClientUserName`), as text — see the struct
+    /// doc for why it is not `meta.user`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub caller_user: String,
+    /// That account's domain (`ClientDomainName`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub caller_domain: String,
 }
 
 /// An LDAP search a process sent, from EID 30 of the
@@ -2443,6 +2512,7 @@ pub enum Event {
     LdapSearch(LdapSearchEvent),
     NtlmAuth(NtlmAuthEvent),
     LogCleared(LogClearedEvent),
+    KerberosDelegationFailure(KerberosDelegationFailureEvent),
     WmiActivity(WmiActivityEvent),
     AssemblyLoad(AssemblyLoadEvent),
     SmbConnect(SmbConnectEvent),
@@ -2510,6 +2580,7 @@ impl Event {
             Event::LdapSearch(e) => &e.meta,
             Event::NtlmAuth(e) => &e.meta,
             Event::LogCleared(e) => &e.meta,
+            Event::KerberosDelegationFailure(e) => &e.meta,
             Event::WmiActivity(e) => &e.meta,
             Event::AssemblyLoad(e) => &e.meta,
             Event::SmbConnect(e) => &e.meta,
