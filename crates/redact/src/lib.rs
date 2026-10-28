@@ -281,15 +281,14 @@ fn wrapped_command_range(line: &str, tokens: &[(usize, usize)]) -> Option<(usize
                 return None;
             }
         }
-        "powershell" | "pwsh" | "powershell.exe" | "pwsh.exe" => {
-            if arg(i)
-                .is_some_and(|s| s.eq_ignore_ascii_case("-command") || s.eq_ignore_ascii_case("-c"))
-            {
-                i += 1;
-            } else {
-                return None;
-            }
+        "powershell" | "pwsh" | "powershell.exe" | "pwsh.exe"
+            if arg(i).is_some_and(|s| {
+                s.eq_ignore_ascii_case("-command") || s.eq_ignore_ascii_case("-c")
+            }) =>
+        {
+            i += 1;
         }
+        "powershell" | "pwsh" | "powershell.exe" | "pwsh.exe" => return None,
         _ => return None,
     }
     let &(start, end) = tokens.get(i)?;
@@ -534,16 +533,14 @@ fn wrapped_command_argv_index(argv: &[String]) -> Option<usize> {
                 return None;
             }
         }
-        "powershell" | "pwsh" | "powershell.exe" | "pwsh.exe" => {
-            if argv
-                .get(i)
-                .is_some_and(|s| s.eq_ignore_ascii_case("-command") || s.eq_ignore_ascii_case("-c"))
-            {
-                i += 1;
-            } else {
-                return None;
-            }
+        "powershell" | "pwsh" | "powershell.exe" | "pwsh.exe"
+            if argv.get(i).is_some_and(|s| {
+                s.eq_ignore_ascii_case("-command") || s.eq_ignore_ascii_case("-c")
+            }) =>
+        {
+            i += 1;
         }
+        "powershell" | "pwsh" | "powershell.exe" | "pwsh.exe" => return None,
         _ => return None,
     }
     (i < argv.len()).then_some(i)
