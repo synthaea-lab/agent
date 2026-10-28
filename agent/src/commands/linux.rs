@@ -1063,8 +1063,9 @@ pub(crate) fn cmd_capture_baseline(output: &std::path::Path) -> anyhow::Result<(
     eprintln!("Output: {}", output.display());
     eprintln!("Perform normal activity on a CLEAN host for ~10 minutes.");
     let mut sensor = sensor_linux::LinuxSensor::new();
+    let sink = crate::redact::redacting(Box::new(sink), true);
     sensor
-        .run(Box::new(sink))
+        .run(Box::new(crate::redact::SharedSink(sink)))
         .map_err(|e| anyhow::anyhow!("sensor failed: {e}"))
 }
 
@@ -1075,8 +1076,9 @@ pub(crate) fn cmd_capture_events(output: &std::path::Path) -> anyhow::Result<()>
     eprintln!("Output: {}", output.display());
     eprintln!("Perform normal activity for ~10-15 minutes.");
     let mut sensor = sensor_linux::LinuxSensor::new();
+    let sink = crate::redact::redacting(Box::new(sink), true);
     sensor
-        .run(Box::new(sink))
+        .run(Box::new(crate::redact::SharedSink(sink)))
         .map_err(|e| anyhow::anyhow!("sensor failed: {e}"))
 }
 

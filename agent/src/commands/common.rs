@@ -206,6 +206,9 @@ pub(crate) fn health_collector(
                 tamper_events = beacon.tamper_events,
                 parent_image_evicted_live = beacon.parent_image_evicted_live,
                 parent_image_evicted_dead = beacon.parent_image_evicted_dead,
+                ioc_indicators = beacon.ioc_indicators,
+                ioc_findings = beacon.ioc_findings,
+                ioc_cooled_down = beacon.ioc_cooled_down,
                 "health beacon"
             );
             // #24/#134: the dedicated health channel — best-effort, an
