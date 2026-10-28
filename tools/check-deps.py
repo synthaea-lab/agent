@@ -25,7 +25,7 @@ BASE = {"schema", "policy"}
 DETECTION = {"rules", "sigma", "correlator", "verdict", "ml", "yara", "enrich",
              "intel", "deception"}
 LEAF = {"response", "transport", "ipc", "sinks", "updater", "config", "store",
-        "conformance", "tamper", "mesh", "device-control", "inventory"}
+        "conformance", "tamper", "mesh", "device-control", "inventory", "redact"}
 BINARIES = {"agent", "watchdog", "cli", "release-tool"}
 WIRE_CRATES = {"sensor-linux-wire"}
 
