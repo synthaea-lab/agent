@@ -298,7 +298,15 @@ pub mod time;
 /// [`detection::IocKind`] and the feed provenance. #993, #994 and #995 were open
 /// at the time and each claim 49; 50 and 51 are left for the two that renumber.
 /// Whichever of these merges later renumbers, same coordination note as above.
-pub const SCHEMA_VERSION: u32 = 52;
+///
+/// Bumped 52 → 53 for [`ExecEvent::original_file_name`], [`ExecEvent::company_name`],
+/// [`ExecEvent::file_description`] and [`ExecEvent::product_name`] (#983): PE
+/// version-resource metadata for the executed image, read by enrichment. Windows
+/// only (`None` elsewhere). Originally claimed 49, renumbered on merge: #60 landed
+/// first and took 52, leaving 50/51 reserved for #994/#995 (also renumbering from
+/// their own 49 claims) — this PR took the next free number above all three
+/// instead of guessing which of 50/51 would still be open by the time it merged.
+pub const SCHEMA_VERSION: u32 = 53;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -586,6 +594,30 @@ pub struct ExecEvent {
     /// Code-signature verdict for the executed image, filled by enrichment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Signature>,
+    /// `OriginalFilename` from the executed image's PE version resource, filled by
+    /// the agent's enrichment stage (issue #983) — the `SigmaHQ` `process_creation`
+    /// catalogue's primary renamed-binary signal (49% of its Windows rules use it:
+    /// `cmd.exe` renamed to `svchost.exe` still carries its real original name in the
+    /// resource). Windows only: PE version resources are a Windows concept, so this
+    /// is always `None` on Linux/macOS (no Mach-O/ELF equivalent). `None` on Windows
+    /// too when the image has no version resource, enrichment could not read it
+    /// (over [`crate`]'s size budget, or a malformed/absent resource), or the image
+    /// was never enriched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_file_name: Option<String>,
+    /// `CompanyName` from the same PE version resource as
+    /// [`Self::original_file_name`] — read in the same pass since the cost is
+    /// already paid once the resource is open. Same `None` rules, same posture
+    /// (19 rules in the catalogue's `process_creation` category use it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub company_name: Option<String>,
+    /// `FileDescription` from the same PE version resource. Same `None` rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_description: Option<String>,
+    /// `ProductName` from the same PE version resource. Same `None` rules (70 rules
+    /// in the catalogue's `process_creation` category use it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_name: Option<String>,
     /// Security-relevant environment variables present at exec time, `(name, value)`
     /// pairs (#363) — the dynamic-linker-hijack family: `LD_PRELOAD`,
     /// `LD_LIBRARY_PATH`, `LD_AUDIT` (the quieter sibling of `LD_PRELOAD`),

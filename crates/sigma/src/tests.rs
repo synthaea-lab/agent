@@ -281,6 +281,71 @@ detection:
     assert!(eval_rule_exec(&rule, &ev).is_some());
 }
 
+/// #983: the catalogue's primary renamed-binary signal — `cmd.exe` copied to
+/// `svchost.exe` still carries its real name in the PE version resource.
+#[test]
+fn original_file_name_matches_the_renamed_binary() {
+    let rule_yaml = r#"
+title: Renamed cmd.exe
+description: test
+tags:
+  - attack.t1036.003
+level: high
+falsepositives:
+  - none known
+detection:
+  selection:
+    Image|endswith: '\svchost.exe'
+    OriginalFileName: 'Cmd.Exe'
+  condition: selection
+"#;
+    let rule: SigmaRule = parse_rule_yaml(rule_yaml).unwrap();
+    validate(&rule, "<test>/windows/rule.yml").unwrap();
+
+    let mut ev = exec("C:\\Users\\Public\\svchost.exe", "svchost.exe");
+    assert!(
+        eval_rule_exec(&rule, &ev).is_none(),
+        "no PE info yet (enrichment hasn't run, or the image had none) — must not match"
+    );
+    ev.original_file_name = Some("Cmd.Exe".into());
+    assert!(eval_rule_exec(&rule, &ev).is_some());
+    // Case-insensitive, like every other field value (`match_value` lowercases both sides).
+    ev.original_file_name = Some("cmd.exe".into());
+    assert!(eval_rule_exec(&rule, &ev).is_some());
+    // A genuinely different original name must not match.
+    ev.original_file_name = Some("explorer.exe".into());
+    assert!(eval_rule_exec(&rule, &ev).is_none());
+}
+
+/// #983: a Windows/PE-only field on a rule outside `windows/` would never match on
+/// the platforms that load it (Linux loads only `linux/`; macOS loads `macos/` and
+/// `linux/` — `engine::Platform::rule_dirs`) — refused at load, not accepted as a
+/// rule that silently never fires.
+#[test]
+fn original_file_name_is_refused_outside_windows() {
+    let rule: SigmaRule = parse_rule_yaml(
+        r#"
+title: Should be Windows-only
+tags:
+  - attack.t1036.003
+level: high
+falsepositives:
+  - none known
+detection:
+  selection:
+    OriginalFileName: 'Cmd.Exe'
+  condition: selection
+"#,
+    )
+    .unwrap();
+    let err = validate(&rule, "<test>/linux/rule.yml").unwrap_err();
+    assert!(err.to_string().contains("OriginalFileName"), "{err}");
+    assert!(err.to_string().contains("Windows-only"), "{err}");
+    // A macOS-directory rule is refused the same way (macOS has no PE resource either).
+    let err2 = validate(&rule, "<test>/macos/rule.yml").unwrap_err();
+    assert!(err2.to_string().contains("Windows-only"), "{err2}");
+}
+
 #[test]
 fn empty_selection_is_rejected_not_match_everything() {
     // Review finding: `selection: {}` matched EVERY event (vacuous all()).

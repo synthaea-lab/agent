@@ -1561,8 +1561,13 @@ impl DetectionSink {
 
     /// `NetworkFlow` events (conntrack polling, issue #92): same beacon detection as
     /// `detect_connect`, deduped per-flow so a poll-based source doesn't
-    /// false-positive on one ordinary long-lived connection.
+    /// false-positive on one ordinary long-lived connection. The peer address is also checked
+    /// against the IOC set (#60); every poll of one live flow repeats it, which the per-indicator
+    /// cooldown absorbs.
     fn detect_network_flow(&self, wrapped: &Event, event: &schema::NetworkFlowEvent) {
+        if let Some(hit) = self.ioc.check_connect(event.daddr, event.meta.timestamp_ns) {
+            self.record_ioc(wrapped, hit);
+        }
         self.record_rule_alerts(
             wrapped,
             self.rule_state.lock().unwrap().on_network_flow(event),
@@ -2600,6 +2605,7 @@ mod tests {
             policy: policy::ResponsePolicy {
                 kill_enabled: false,
                 quarantine_enabled,
+                isolate_enabled: false,
             },
             terminate: Box::new(|_| panic!("quarantine never terminates")),
             quarantine_dir: dir.join("quarantine"),
@@ -3343,6 +3349,7 @@ rule response_marker {
             policy::ResponsePolicy {
                 kill_enabled: true,
                 quarantine_enabled: true,
+                isolate_enabled: false,
             },
         );
         let alerts = wait_for_alert(&dir, "RESPONSE-QUARANTINE");
@@ -3641,6 +3648,7 @@ rule response_marker {
             policy::ResponsePolicy {
                 kill_enabled: false,
                 quarantine_enabled: false,
+                isolate_enabled: false,
             },
             move |pid| {
                 killed_rec.lock().unwrap().push(pid);
@@ -3674,6 +3682,7 @@ rule response_marker {
             policy::ResponsePolicy {
                 kill_enabled: true,
                 quarantine_enabled: false,
+                isolate_enabled: false,
             },
             move |pid| {
                 killed_rec.lock().unwrap().push(pid);
@@ -3701,6 +3710,7 @@ rule response_marker {
             policy::ResponsePolicy {
                 kill_enabled: true,
                 quarantine_enabled: false,
+                isolate_enabled: false,
             },
             move |pid| {
                 killed_rec.lock().unwrap().push(pid);
@@ -3756,6 +3766,7 @@ rule response_marker {
             policy::ResponsePolicy {
                 kill_enabled: false,
                 quarantine_enabled: false,
+                isolate_enabled: false,
             },
             |_| panic!("terminate must not be called in observe mode"),
             dir.join("quarantine"),
@@ -3785,6 +3796,7 @@ rule response_marker {
             policy::ResponsePolicy {
                 kill_enabled: true,
                 quarantine_enabled: false,
+                isolate_enabled: false,
             },
             move |pid| {
                 killed_rec.lock().unwrap().push(pid);
@@ -4005,6 +4017,7 @@ rule response_marker {
             policy::ResponsePolicy {
                 kill_enabled,
                 quarantine_enabled: false,
+                isolate_enabled: false,
             },
             move |pid| {
                 recorder.lock().unwrap().push(pid);
@@ -4571,6 +4584,7 @@ detection:
             policy::ResponsePolicy {
                 kill_enabled: true,
                 quarantine_enabled: true,
+                isolate_enabled: false,
             },
             move |pid| {
                 killed_rec.lock().unwrap().push(pid);
@@ -4633,6 +4647,7 @@ detection:
             policy::ResponsePolicy {
                 kill_enabled: true,
                 quarantine_enabled: false,
+                isolate_enabled: false,
             },
             move |pid| {
                 killed_rec.lock().unwrap().push(pid);
@@ -4906,6 +4921,7 @@ detection:
             policy::ResponsePolicy {
                 kill_enabled: true,
                 quarantine_enabled: false,
+                isolate_enabled: false,
             },
             move |pid| {
                 killed_rec.lock().unwrap().push(pid);
@@ -5665,6 +5681,47 @@ rule reload_content_test_marker {
                 reference: None,
             }
         );
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_polled_flow_to_a_listed_address_raises_one_ioc_finding() {
+        let dir = tmp("ioc-flow");
+        write_ioc_feed(&dir, "ip:203.0.113.9\n");
+        let sink = DetectionSink::new(
+            rules::RuleState::new(),
+            &dir.join("alerts.ndjson"),
+            Some(&dir.join("events.jsonl")),
+            None,
+            None,
+            &dir.join("content"),
+            &dir.join("ml-registry"),
+        )
+        .unwrap();
+
+        let flow = |addr: &str, timestamp_ns: u64| {
+            Event::NetworkFlow(schema::NetworkFlowEvent {
+                meta: EventMeta {
+                    timestamp_ns,
+                    ..schema::fixtures::meta()
+                },
+                daddr: addr.parse().unwrap(),
+                ..schema::fixtures::network_flow()
+            })
+        };
+        sink.on_event(flow("203.0.113.10", 1_000));
+        assert!(
+            !alerts_in(&dir).contains("IOC"),
+            "an unlisted peer is silent"
+        );
+        for poll in 0..3 {
+            sink.on_event(flow("203.0.113.9", 2_000 + poll));
+        }
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+
+        let alerts = alerts_in(&dir);
+        assert_eq!(alerts.matches("203.0.113.9").count(), 1, "{alerts}");
         drop(sink);
         std::fs::remove_dir_all(&dir).ok();
     }

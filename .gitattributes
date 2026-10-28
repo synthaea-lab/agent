@@ -46,3 +46,6 @@ server/tests/fixtures/**/*.json text eol=lf
 # ONNX model files are binary (protobuf). Not currently relying on an incorrect
 # guess from Git's content-sniffing heuristic, just making it explicit.
 *.onnx binary
+
+# The draft IOC set is compared byte for byte to the exporter's output (#934).
+server/tests/fixtures/ioc-draft-golden.txt text eol=lf

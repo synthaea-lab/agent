@@ -51,9 +51,9 @@ pub use state::RuleState;
 pub(crate) use stateless::{
     check_account_creation_persistence, check_alternate_data_stream_write, check_base64_decode,
     check_btm_launch_item_persistence, check_doh_dot_connection, check_encoded_powershell,
-    check_kerberos_from_non_lsass, check_ld_preload_hijack, check_log_clear_exec,
-    check_log_file_delete, check_masquerading, check_persistence_write, check_proc_root_escape,
-    check_recovery_inhibit, check_scheduled_task_persistence,
+    check_event_logging_disable_exec, check_kerberos_from_non_lsass, check_ld_preload_hijack,
+    check_log_clear_exec, check_log_file_delete, check_masquerading, check_persistence_write,
+    check_proc_root_escape, check_recovery_inhibit, check_scheduled_task_persistence,
     check_scheduled_task_update_persistence, check_security_process_signal,
     check_service_install_persistence, check_service_unusual_outbound,
     check_systemd_service_persistence,

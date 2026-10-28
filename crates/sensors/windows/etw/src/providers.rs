@@ -198,6 +198,10 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             parent_image_path,
             sha256: None, // filled by the agent's enrichment stage
             signature: None,
+            original_file_name: None, // filled by the agent's enrichment stage (#983)
+            company_name: None,
+            file_description: None,
+            product_name: None,
         }));
     };
     Provider::by_guid(KERNEL_PROCESS_GUID)
@@ -462,8 +466,10 @@ fn decode_reg_string(bytes: Vec<u8>) -> Option<String> {
         return None;
     }
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     let s = String::from_utf16_lossy(&units);
     let trimmed = s.trim_end_matches('\0');

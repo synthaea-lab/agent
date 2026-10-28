@@ -122,7 +122,7 @@ fn decode_hex_lowercase(s: &str) -> Option<Vec<u8>> {
     }
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(s.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let hi = from_hex_nibble(pair[0])?;
         let lo = from_hex_nibble(pair[1])?;
         out.push((hi << 4) | lo);
