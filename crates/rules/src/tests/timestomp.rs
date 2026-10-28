@@ -22,14 +22,15 @@ fn event() -> FileSetTimeEvent {
 }
 
 #[test]
-fn explicit_time_set_is_medium_without_a_process_name_exclusion() {
+fn explicit_time_set_is_low_without_a_process_name_exclusion() {
     let mut event = event();
     event.meta.comm = "vssadmin.exe".into();
     let alerts = evaluate_file_set_time(&event);
     assert_eq!(alerts.len(), 1);
     assert_eq!(alerts[0].technique, "T1070.006");
-    assert_eq!(alerts[0].severity, Severity::Medium);
+    assert_eq!(alerts[0].severity, Severity::Low);
     assert!(alerts[0].message.contains(&event.path));
+    assert!(!alerts[0].message.contains("vssadmin"));
 }
 
 #[test]
