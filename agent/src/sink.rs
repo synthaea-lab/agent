@@ -2324,6 +2324,7 @@ impl EventSink for DetectionSink {
                 | Event::FileDelete(_)
                 | Event::FileRename(_)
                 | Event::FileSetTime(_)
+                | Event::RawVolumeOpen(_)
         ) {
             self.expire_held_canary(event.meta().timestamp_ns);
         }
@@ -2344,6 +2345,9 @@ impl EventSink for DetectionSink {
             Event::FileRename(e) => self.detect_file_rename(&event, e),
             Event::FileSetTime(e) => {
                 self.record_rule_alerts(&event, rules::evaluate_file_set_time(e));
+            }
+            Event::RawVolumeOpen(e) => {
+                self.record_rule_alerts(&event, rules::evaluate_raw_volume_open(e));
             }
             Event::FileWrite(e) => self.detect_file_write(e),
             Event::MemfdCreate(e) => self.detect_memfd_create(e),
@@ -2617,6 +2621,46 @@ mod tests {
         let alerts = alerts_in(&dir);
         assert!(alerts.contains("T1070.006"), "{alerts}");
         assert!(alerts.contains("invoice.docx"), "{alerts}");
+    }
+
+    #[test]
+    fn write_capable_volume_open_reaches_t1006_through_the_real_sink() {
+        let dir = tmp("raw-volume-open-route");
+        let sink = sink_in(&dir);
+        sink.on_event(Event::RawVolumeOpen(schema::RawVolumeOpenEvent {
+            meta: schema::fixtures::meta(),
+            volume: r"\Device\HarddiskVolume3".into(),
+            desired_access: 0x4000_0000,
+        }));
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("T1006"), "{alerts}");
+        assert!(alerts.contains("HarddiskVolume3"), "{alerts}");
+    }
+
+    #[test]
+    fn a_metadata_only_volume_open_does_not_enter_the_raw_volume_route() {
+        // `alerts.ndjson` (`AlertRecord` in `agent/src/alerts.rs`) carries only
+        // timestamp/technique/message — no severity field — so this sink-level test
+        // can only prove "produces no alert at all", not "produces Low rather than
+        // Medium". That distinction is already proven directly against the rule:
+        // `read_capability_and_maximum_allowed_are_low`
+        // (`crates/rules/tests/raw_volume.rs`) asserts `Severity::Low` for the same
+        // 0x8000_0000 (GENERIC_READ) mask this test used to send here. A bare,
+        // metadata-only open (`desired_access = 0`) is the one shape the rule maps
+        // to no alert (`evaluate_raw_volume_open`'s `None` branch), which is what
+        // this sink-level test actually exercises.
+        let dir = tmp("read-only-volume-open-route");
+        let sink = sink_in(&dir);
+        sink.on_event(Event::RawVolumeOpen(schema::RawVolumeOpenEvent {
+            meta: schema::fixtures::meta(),
+            volume: r"\Device\HarddiskVolume3".into(),
+            desired_access: 0,
+        }));
+        let alerts = alerts_in(&dir);
+        assert!(
+            !alerts.contains("T1006"),
+            "a metadata-only open must not alert: {alerts}"
+        );
     }
 
     #[test]

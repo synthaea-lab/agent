@@ -311,14 +311,16 @@ pub mod time;
 /// client's own unconstrained-delegation and TGT-session-key-export denials,
 /// from the (off by default) `Microsoft-Windows-Kerberos/Operational` channel.
 /// Windows-only. Originally claimed 49; renumbered past #60's 52 and #983's 53.
-/// #995 (`ListenPortEvent::protocol`) holds 54 and merges first, so this takes the
-/// slot after it; same coordination note as above.
+/// #994 merged first, ahead of the 54 it had reserved for #995, so main went
+/// straight from 53 to 55 and left 54 unused.
 ///
 /// Bumped 55 → 56 for Windows minifilter explicit timestamp requests (#136). #995
-/// (`ListenPortEvent::protocol`, 54) is still open and merges first, so this takes
-/// the slot after it and after #994 (55, landed above). #1007 (raw-volume access,
-/// stacked on this branch) renumbers again on top of this when it next merges main.
-pub const SCHEMA_VERSION: u32 = 56;
+/// (`ListenPortEvent::protocol`) renumbered past the skipped 54 to 57, closer to
+/// merging than this one, so no collision there.
+///
+/// Bumped 56 → 57 for mounted raw-volume open telemetry (#136 slice 4), stacked on
+/// the timestomp slice above.
+pub const SCHEMA_VERSION: u32 = 57;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -860,6 +862,17 @@ pub struct FileSetTimeEvent {
     pub last_write_time: Option<i64>,
     /// Requested change time in raw signed 100-ns FILETIME units; `None` means unchanged.
     pub change_time: Option<i64>,
+}
+
+/// Successful open of a mounted logical volume through the Windows minifilter.
+/// `desired_access` is the caller's requested `ACCESS_MASK`, not the rights granted or later used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawVolumeOpenEvent {
+    pub meta: EventMeta,
+    /// Kernel device name captured from the attached volume (for example `\\Device\\HarddiskVolume3`).
+    pub volume: String,
+    /// Raw Windows `ACCESS_MASK` requested by the caller.
+    pub desired_access: u32,
 }
 
 /// File permission change (issue #262 Phase 2): `chmod(2)`/`fchmodat(2)`. `fchmod(2)`
@@ -2528,6 +2541,7 @@ pub enum Event {
     FileDelete(FileDeleteEvent),
     FileRename(FileRenameEvent),
     FileSetTime(FileSetTimeEvent),
+    RawVolumeOpen(RawVolumeOpenEvent),
     SocketBind(SocketBindEvent),
     FileChmod(FileChmodEvent),
     FileChown(FileChownEvent),
@@ -2596,6 +2610,7 @@ impl Event {
             Event::FileDelete(e) => &e.meta,
             Event::FileRename(e) => &e.meta,
             Event::FileSetTime(e) => &e.meta,
+            Event::RawVolumeOpen(e) => &e.meta,
             Event::SocketBind(e) => &e.meta,
             Event::FileChmod(e) => &e.meta,
             Event::FileChown(e) => &e.meta,

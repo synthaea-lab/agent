@@ -20,10 +20,10 @@ use schema::{
     MemfdCreateEvent, MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent,
     NtlmAuthEvent, NtlmDirection, POLICY_MECHANISM_SELINUX, PackageChangeEvent, PackageChangeKind,
     PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
-    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent, SessionState, ShellType,
-    SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketCreateEvent,
-    SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
-    UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
+    RawVolumeOpenEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent,
+    SessionState, ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
+    SocketCreateEvent, SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection,
+    TlsLibraryType, UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
     detection::{Detection, DetectionSource, IocKind, ScoreAttribution, Severity},
 };
 
@@ -1405,6 +1405,27 @@ fn file_set_time_golden() {
             change_time: None,
         }),
         "file_set_time",
+    );
+}
+
+#[test]
+fn raw_volume_open_golden() {
+    assert_golden(
+        &Event::RawVolumeOpen(RawVolumeOpenEvent {
+            meta: EventMeta {
+                pid: 7004,
+                ppid: 0,
+                user: User::Unknown,
+                timestamp_ns: 1_760_000_000_000_000_000,
+                comm: String::new(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            volume: r"\Device\HarddiskVolume3".into(),
+            desired_access: 0x8000_0002,
+        }),
+        "raw_volume_open",
     );
 }
 

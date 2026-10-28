@@ -122,6 +122,7 @@ TECHNIQUE_TACTIC = {
     "T1078": "Initial Access",
     "T1189": "Initial Access",
     "T1190": "Initial Access",
+    "T1006": "Defense Evasion",
     "T1027": "Defense Evasion",
     "T1036": "Defense Evasion",
     "T1036.005": "Defense Evasion",

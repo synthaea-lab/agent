@@ -1,7 +1,7 @@
 //! Decoder for the messages `SynthaeaFilter` sends on its port (milestone 2c, #136).
 //!
-//! The format is the one in `docs/architecture/minifilter-event-channel.md` (protocol v4): a
-//! fixed 104-byte little-endian header, then the paths in UTF-16LE, `old_path` then `new_path`, not
+//! The format is the one in `docs/architecture/minifilter-event-channel.md` (protocol v5): a
+//! fixed 108-byte little-endian header, then the paths in UTF-16LE, `old_path` then `new_path`, not
 //! NUL-terminated. This module sees only the payload: the `FILTER_MESSAGE_HEADER` that
 //! `FilterGetMessage` puts in front of it is stripped by the caller.
 //!
@@ -11,7 +11,7 @@
 //! Platform-independent on purpose, so the decoder is tested and fuzzed on every OS.
 
 /// Bytes before the paths.
-pub const HEADER_LEN: usize = 104;
+pub const HEADER_LEN: usize = 108;
 
 /// Longest path, in UTF-16 code units, the driver puts in a record (a longer one is truncated
 /// and flagged). The decoder refuses a length above it.
@@ -24,6 +24,7 @@ const KIND_HEARTBEAT: u16 = 0;
 const KIND_DELETE: u16 = 1;
 const KIND_RENAME: u16 = 2;
 const KIND_SET_TIME: u16 = 3;
+const KIND_RAW_VOLUME_OPEN: u16 = 4;
 
 const FLAG_DELETE_ON_CLOSE: u16 = 1 << 0;
 const FLAG_OLD_PATH_TRUNCATED: u16 = 1 << 1;
@@ -81,6 +82,12 @@ pub enum Body {
         change_time: i64,
         truncated: bool,
     },
+    /// A successful open of a mounted logical volume, with the caller's requested access mask.
+    RawVolumeOpen {
+        volume: String,
+        desired_access: u32,
+        truncated: bool,
+    },
 }
 
 impl Body {
@@ -95,6 +102,7 @@ impl Body {
                 ..
             } => *old_truncated || *new_truncated,
             Self::SetTime { truncated, .. } => *truncated,
+            Self::RawVolumeOpen { truncated, .. } => *truncated,
         }
     }
 }
@@ -144,6 +152,8 @@ pub enum WireError {
     SetTimeFieldsForKind { kind: u16 },
     #[error("set-time field {0} is below the Windows -2 auto-update sentinel")]
     InvalidSetTime(i64),
+    #[error("message kind {kind} has nonzero desired-access field")]
+    DesiredAccessForKind { kind: u16 },
 }
 
 /// Decodes one message payload.
@@ -182,6 +192,7 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
     let last_access_time = r.i64();
     let last_write_time = r.i64();
     let change_time = r.i64();
+    let desired_access = r.u32();
     debug_assert_eq!(r.at, HEADER_LEN);
 
     if flags & !KNOWN_FLAGS != 0 {
@@ -192,6 +203,7 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
         KIND_DELETE => FLAG_DELETE_ON_CLOSE | FLAG_OLD_PATH_TRUNCATED,
         KIND_RENAME => FLAG_OLD_PATH_TRUNCATED | FLAG_NEW_PATH_TRUNCATED,
         KIND_SET_TIME => FLAG_OLD_PATH_TRUNCATED,
+        KIND_RAW_VOLUME_OPEN => FLAG_OLD_PATH_TRUNCATED,
         other => return Err(WireError::UnknownKind(other)),
     };
     if flags & !allowed_flags != 0 {
@@ -202,6 +214,7 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
         KIND_DELETE => old_len > 0 && new_len == 0,
         KIND_RENAME => old_len > 0 && new_len > 0,
         KIND_SET_TIME => old_len > 0 && new_len == 0,
+        KIND_RAW_VOLUME_OPEN => old_len > 0 && new_len == 0,
         _ => false,
     };
     if !lengths_fit {
@@ -242,6 +255,9 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
     } else if times.iter().any(|time| *time != 0) {
         return Err(WireError::SetTimeFieldsForKind { kind });
     }
+    if kind != KIND_RAW_VOLUME_OPEN && desired_access != 0 {
+        return Err(WireError::DesiredAccessForKind { kind });
+    }
     let timestamp_ns = filetime_to_unix_ns(timestamp)?;
 
     let old_path = r.utf16(old_len);
@@ -265,6 +281,11 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
             last_access_time,
             last_write_time,
             change_time,
+            truncated: flags & FLAG_OLD_PATH_TRUNCATED != 0,
+        },
+        KIND_RAW_VOLUME_OPEN => Body::RawVolumeOpen {
+            volume: old_path,
+            desired_access,
             truncated: flags & FLAG_OLD_PATH_TRUNCATED != 0,
         },
         _ => unreachable!("kind validated above"),
@@ -316,6 +337,10 @@ impl Reader<'_> {
         u16::from_le_bytes(self.take())
     }
 
+    fn u32(&mut self) -> u32 {
+        u32::from_le_bytes(self.take())
+    }
+
     fn u64(&mut self) -> u64 {
         u64::from_le_bytes(self.take())
     }
@@ -344,54 +369,75 @@ impl Reader<'_> {
 /// only; the agent never sends to the driver.
 #[cfg(test)]
 pub(crate) fn encode(message: &Message, raw_timestamp: i64) -> Vec<u8> {
-    let (kind, flags, old, new, times): (u16, u16, Vec<u16>, Vec<u16>, [i64; 4]) =
-        match &message.body {
-            Body::Heartbeat => (KIND_HEARTBEAT, 0, Vec::new(), Vec::new(), [0; 4]),
-            Body::Delete {
-                path,
-                on_close,
-                truncated,
-            } => (
-                KIND_DELETE,
-                (u16::from(*on_close) * FLAG_DELETE_ON_CLOSE)
-                    | (u16::from(*truncated) * FLAG_OLD_PATH_TRUNCATED),
-                path.encode_utf16().collect(),
-                Vec::new(),
-                [0; 4],
-            ),
-            Body::Rename {
-                old_path,
-                new_path,
-                old_truncated,
-                new_truncated,
-            } => (
-                KIND_RENAME,
-                (u16::from(*old_truncated) * FLAG_OLD_PATH_TRUNCATED)
-                    | (u16::from(*new_truncated) * FLAG_NEW_PATH_TRUNCATED),
-                old_path.encode_utf16().collect(),
-                new_path.encode_utf16().collect(),
-                [0; 4],
-            ),
-            Body::SetTime {
-                path,
-                creation_time,
-                last_access_time,
-                last_write_time,
-                change_time,
-                truncated,
-            } => (
-                KIND_SET_TIME,
-                u16::from(*truncated) * FLAG_OLD_PATH_TRUNCATED,
-                path.encode_utf16().collect(),
-                Vec::new(),
-                [
-                    *creation_time,
-                    *last_access_time,
-                    *last_write_time,
-                    *change_time,
-                ],
-            ),
-        };
+    let (kind, flags, old, new, times, desired_access): (
+        u16,
+        u16,
+        Vec<u16>,
+        Vec<u16>,
+        [i64; 4],
+        u32,
+    ) = match &message.body {
+        Body::Heartbeat => (KIND_HEARTBEAT, 0, Vec::new(), Vec::new(), [0; 4], 0),
+        Body::Delete {
+            path,
+            on_close,
+            truncated,
+        } => (
+            KIND_DELETE,
+            (u16::from(*on_close) * FLAG_DELETE_ON_CLOSE)
+                | (u16::from(*truncated) * FLAG_OLD_PATH_TRUNCATED),
+            path.encode_utf16().collect(),
+            Vec::new(),
+            [0; 4],
+            0,
+        ),
+        Body::Rename {
+            old_path,
+            new_path,
+            old_truncated,
+            new_truncated,
+        } => (
+            KIND_RENAME,
+            (u16::from(*old_truncated) * FLAG_OLD_PATH_TRUNCATED)
+                | (u16::from(*new_truncated) * FLAG_NEW_PATH_TRUNCATED),
+            old_path.encode_utf16().collect(),
+            new_path.encode_utf16().collect(),
+            [0; 4],
+            0,
+        ),
+        Body::SetTime {
+            path,
+            creation_time,
+            last_access_time,
+            last_write_time,
+            change_time,
+            truncated,
+        } => (
+            KIND_SET_TIME,
+            u16::from(*truncated) * FLAG_OLD_PATH_TRUNCATED,
+            path.encode_utf16().collect(),
+            Vec::new(),
+            [
+                *creation_time,
+                *last_access_time,
+                *last_write_time,
+                *change_time,
+            ],
+            0,
+        ),
+        Body::RawVolumeOpen {
+            volume,
+            desired_access,
+            truncated,
+        } => (
+            KIND_RAW_VOLUME_OPEN,
+            u16::from(*truncated) * FLAG_OLD_PATH_TRUNCATED,
+            volume.encode_utf16().collect(),
+            Vec::new(),
+            [0; 4],
+            *desired_access,
+        ),
+    };
     let mut out = Vec::with_capacity(HEADER_LEN + 2 * (old.len() + new.len()));
     out.extend_from_slice(&kind.to_le_bytes());
     out.extend_from_slice(&flags.to_le_bytes());
@@ -408,6 +454,7 @@ pub(crate) fn encode(message: &Message, raw_timestamp: i64) -> Vec<u8> {
     for time in times {
         out.extend_from_slice(&time.to_le_bytes());
     }
+    out.extend_from_slice(&desired_access.to_le_bytes());
     for unit in old.iter().chain(&new) {
         out.extend_from_slice(&unit.to_le_bytes());
     }
@@ -458,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn the_header_is_one_hundred_four_bytes() {
+    fn the_header_is_one_hundred_eight_bytes() {
         assert_eq!(encode(&message(Body::Heartbeat), RAW_TS).len(), HEADER_LEN);
     }
 
@@ -474,6 +521,11 @@ mod tests {
                 last_access_time: 0,
                 last_write_time: -1,
                 change_time: -2,
+                truncated: false,
+            }),
+            message(Body::RawVolumeOpen {
+                volume: r"\Device\HarddiskVolume3".into(),
+                desired_access: 0x8000_0002,
                 truncated: false,
             }),
         ] {
@@ -645,6 +697,50 @@ mod tests {
     }
 
     #[test]
+    fn raw_volume_rejects_wrong_layout_times_and_access_on_other_kinds() {
+        let valid = message(Body::RawVolumeOpen {
+            volume: r"\Device\HarddiskVolume3".into(),
+            desired_access: 0x8000_0002,
+            truncated: false,
+        });
+        let bytes = encode(&valid, RAW_TS);
+        let mut wrong_new_len = bytes.clone();
+        wrong_new_len[62..64].copy_from_slice(&1u16.to_le_bytes());
+        assert!(decode(&wrong_new_len).is_err());
+        let mut nonzero_time = bytes.clone();
+        nonzero_time[72..80].copy_from_slice(&1i64.to_le_bytes());
+        assert_eq!(
+            decode(&nonzero_time),
+            Err(WireError::SetTimeFieldsForKind {
+                kind: KIND_RAW_VOLUME_OPEN
+            })
+        );
+        let mut non_volume_access = encode(&delete(), RAW_TS);
+        non_volume_access[104..108].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            decode(&non_volume_access),
+            Err(WireError::DesiredAccessForKind { kind: KIND_DELETE })
+        );
+        let mut truncated = bytes;
+        truncated.truncate(HEADER_LEN - 1);
+        assert!(decode(&truncated).is_err());
+    }
+
+    #[test]
+    fn desired_access_is_little_endian_at_byte_104() {
+        let raw_access = 0xA1B2_C3D4u32;
+        let bytes = encode(
+            &message(Body::RawVolumeOpen {
+                volume: "C:".into(),
+                desired_access: raw_access,
+                truncated: false,
+            }),
+            RAW_TS,
+        );
+        assert_eq!(&bytes[104..108], &raw_access.to_le_bytes());
+    }
+
+    #[test]
     fn flags_that_do_not_apply_to_the_kind_are_refused() {
         // delete-on-close on a rename, a new-path truncation on a delete, anything on a heartbeat
         for (body, flags) in [
@@ -691,9 +787,9 @@ mod tests {
             message.counters.dropped_capture_failed,
             0x0102_0304_0506_0708
         );
-        assert_eq!(HEADER_LEN, 104);
+        assert_eq!(HEADER_LEN, 108);
         let path_units = u16::from_le_bytes([bytes[60], bytes[61]]);
-        assert_eq!(bytes.len(), 104 + 2 * usize::from(path_units));
+        assert_eq!(bytes.len(), 108 + 2 * usize::from(path_units));
     }
 
     #[test]

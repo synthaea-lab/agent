@@ -64,7 +64,7 @@ pub(crate) use stateless::{
 pub use stateless::{
     evaluate_connect, evaluate_exec, evaluate_file_delete, evaluate_file_open,
     evaluate_file_set_time, evaluate_kerberos_delegation_failure, evaluate_log_cleared,
-    evaluate_signal,
+    evaluate_raw_volume_open, evaluate_signal,
 };
 
 #[derive(Debug, Clone)]

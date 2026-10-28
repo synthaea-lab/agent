@@ -9,7 +9,9 @@
 //!
 //! Platform-independent, like [`crate::wire`]: tested on every OS.
 
-use schema::{Event, EventMeta, FileDeleteEvent, FileRenameEvent, FileSetTimeEvent, User};
+use schema::{
+    Event, EventMeta, FileDeleteEvent, FileRenameEvent, FileSetTimeEvent, RawVolumeOpenEvent, User,
+};
 
 use crate::wire::{Body, Message};
 
@@ -141,6 +143,15 @@ pub fn to_event(message: &Message, volumes: &VolumeMap) -> Option<Event> {
             last_write_time: (*last_write_time != 0).then_some(*last_write_time),
             change_time: (*change_time != 0).then_some(*change_time),
         })),
+        Body::RawVolumeOpen {
+            volume,
+            desired_access,
+            ..
+        } => Some(Event::RawVolumeOpen(RawVolumeOpenEvent {
+            meta,
+            volume: volumes.normalize(volume),
+            desired_access: *desired_access,
+        })),
     }
 }
 
@@ -180,6 +191,11 @@ mod tests {
                 new_path: r"\Device\HarddiskVolume1\d\new.doc".into(),
                 old_truncated: true,
                 new_truncated: false,
+            },
+            Body::RawVolumeOpen {
+                volume: r"\Device\HarddiskVolume1".into(),
+                desired_access: 1,
+                truncated: true,
             },
             Body::Rename {
                 old_path: r"\Device\HarddiskVolume1\d\old.doc".into(),
@@ -285,6 +301,23 @@ mod tests {
         assert_eq!(set_time.last_write_time, Some(132_537_600_000_000_000));
         assert_eq!(set_time.change_time, Some(-2));
         assert_eq!(set_time.meta.comm, "");
+    }
+
+    #[test]
+    fn a_raw_volume_open_normalizes_device_name_and_preserves_requested_access() {
+        let event = to_event(
+            &message(Body::RawVolumeOpen {
+                volume: r"\Device\HarddiskVolume1".into(),
+                desired_access: 0x8000_0002,
+                truncated: false,
+            }),
+            &volumes(),
+        );
+        let Some(Event::RawVolumeOpen(open)) = event else {
+            panic!("{event:?}");
+        };
+        assert_eq!(open.volume, "C:");
+        assert_eq!(open.desired_access, 0x8000_0002);
     }
 
     #[test]

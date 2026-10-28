@@ -414,6 +414,7 @@ mod persistence;
 mod policy_denial_windows;
 mod quarantine;
 mod ransomware_windows;
+mod raw_volume;
 mod rdp;
 mod recon;
 mod scan_vertical;

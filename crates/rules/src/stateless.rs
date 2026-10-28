@@ -6,8 +6,8 @@ use schema::{
     ConnectEvent, ExecEvent, FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT,
     FLAG_PERSISTENCE_BTM_ARTIFACT, FLAG_PERSISTENCE_SYSTEMD_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FLAG_PERSISTENCE_TASK_ARTIFACT,
-    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, FileSetTimeEvent, User,
-    detection::Severity,
+    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, FileSetTimeEvent, RawVolumeOpenEvent,
+    User, detection::Severity,
 };
 
 use crate::{
@@ -629,6 +629,61 @@ pub fn evaluate_file_set_time(event: &FileSetTimeEvent) -> Vec<Alert> {
             event.meta.pid, event.path,
         ),
     }]
+}
+
+/// T1006 — Direct Volume Access: mounted logical-volume open. This is requested
+/// access, not proof of granted rights or subsequent raw I/O; the event carries no trusted image.
+#[must_use]
+pub fn evaluate_raw_volume_open(event: &RawVolumeOpenEvent) -> Vec<Alert> {
+    const FILE_WRITE_DATA: u32 = 0x0000_0002;
+    const FILE_WRITE_EA: u32 = 0x0000_0010;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+    const FILE_APPEND_DATA: u32 = 0x0000_0004;
+    const DELETE: u32 = 0x0001_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+    const READ_CAPABILITIES: u32 = 0xA000_0029; // FILE_READ_DATA/EA, FILE_EXECUTE, GENERIC_READ/EXECUTE
+    // Every right that can modify the volume's data or its own protection, not just the
+    // narrower "write data" case (#1007 review, SherlockOmss): a caller with WRITE_DAC or
+    // WRITE_OWNER alone can reassign the volume's ACL/owner and grant itself write access
+    // in a second step, and DELETE/FILE_WRITE_EA/FILE_WRITE_ATTRIBUTES are real tamper
+    // capabilities a narrower mask would silently drop (e.g. `0x100` alone used to alert
+    // on nothing).
+    const WRITE_CAPABILITIES: u32 = FILE_WRITE_DATA
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | FILE_APPEND_DATA
+        | DELETE
+        | WRITE_DAC
+        | WRITE_OWNER
+        | GENERIC_WRITE
+        | GENERIC_ALL;
+
+    let severity = if event.desired_access & (WRITE_CAPABILITIES | MAXIMUM_ALLOWED) != 0 {
+        // MAXIMUM_ALLOWED resolves to whatever the caller's token grants; a caller able to
+        // open a raw volume at all already needs an elevated privilege (SeBackupPrivilege or
+        // administrator), so in practice this almost always includes write — bucketing it
+        // with read-only understates it (#1007 review).
+        Some(Severity::Medium)
+    } else if event.desired_access & READ_CAPABILITIES != 0 {
+        Some(Severity::Low)
+    } else {
+        None
+    };
+    severity
+        .into_iter()
+        .map(|severity| Alert {
+            technique: "T1006",
+            severity,
+            message: format!(
+                "pid={} comm={}: opened mounted volume {} with requested access {:#010x}",
+                event.meta.pid, event.meta.comm, event.volume, event.desired_access,
+            ),
+        })
+        .collect()
 }
 
 /// Evaluates all stateless rules applicable to a `FileOpenEvent`. T1053.005
