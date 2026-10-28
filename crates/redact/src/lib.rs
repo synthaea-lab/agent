@@ -417,6 +417,13 @@ fn redact_argv_inner(image: &str, argv: &mut [String], wrapper_depth: u8) {
                 argv[header_index].replace_range(start..end, REDACTED);
             }
         }
+        // Header-shaped argv elements can arrive through options other than
+        // curl's `-H`/`--header` (for example `--proxy-header`), or as ordinary
+        // arguments to tools such as httpie. Match the command-line path's
+        // generic header scan so these values cannot bypass redaction.
+        if let Some((start, end)) = header_secret_value(&argv[index], 0) {
+            argv[index].replace_range(start..end, REDACTED);
+        }
         if argv[index].contains("://")
             && let Some((start, end)) = url_range(&argv[index], 0)
         {
@@ -1796,6 +1803,46 @@ mod tests {
             .collect();
         redact_argv("curl", &mut argv2);
         assert_eq!(argv2[1], "-HX-Auth-Token: REDACTED");
+    }
+
+    #[test]
+    fn argv_header_redaction_matches_the_command_line_path_for_any_header_argument() {
+        let cases = [
+            (
+                "curl",
+                vec![
+                    "curl",
+                    "--proxy-header",
+                    "Proxy-Authorization: Basic S3cret",
+                    "h",
+                ],
+                "curl --proxy-header Proxy-Authorization: Basic S3cret h",
+            ),
+            (
+                "http",
+                vec!["http", "h", "Authorization:Bearer S3cret"],
+                "http h Authorization:Bearer S3cret",
+            ),
+            (
+                "python3",
+                vec!["python3", "x.py", "Authorization: Bearer S3cret"],
+                "python3 x.py Authorization: Bearer S3cret",
+            ),
+        ];
+
+        for (image, raw_argv, raw_cmdline) in cases {
+            let expected = redact_command_line(image, raw_cmdline).into_owned();
+            let mut argv = raw_argv.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            redact_argv(image, &mut argv);
+
+            assert!(!expected.contains("S3cret"), "{image}: {expected}");
+            assert_eq!(
+                argv.join(" "),
+                expected,
+                "argv/command-line mismatch for {image}"
+            );
+            assert!(argv.join(" ").contains("REDACTED"), "{image}: {argv:?}");
+        }
     }
 
     #[test]
