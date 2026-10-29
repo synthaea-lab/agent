@@ -7,19 +7,34 @@ use crate::{
     rule::{Selection, SigmaRule, ValueList},
 };
 
-const SUPPORTED_FIELDS: &[&str] = &["image", "commandline", "parentimage", "originalfilename"];
+const SUPPORTED_FIELDS: &[&str] = &[
+    "image",
+    "commandline",
+    "parentimage",
+    "originalfilename",
+    "company",
+    "description",
+    "product",
+];
+/// [`SUPPORTED_FIELDS`] as the error message spells them.
+const SUPPORTED_FIELD_NAMES: &str =
+    "Image, CommandLine, ParentImage, OriginalFileName, Company, Description, Product";
 const SUPPORTED_MODIFIERS: &[&str] = &["contains", "startswith", "endswith"];
 
-/// `OriginalFileName` is PE version-resource metadata (issue #983): a Windows/PE
-/// concept with no Mach-O or ELF equivalent. A `linux/` or `macos/` rule using it
-/// would never match on the platforms that load it — the exact silent-death
-/// failure mode this module exists to kill (its own module doc) — so it is
-/// refused at load time there, the same way `validate_metadata` already refuses
-/// a rule outside any known platform directory. A Windows-platform rule using it
-/// is accepted even though a *particular* event may still lack the value (PE
-/// parse failure, no version resource): that per-event gap is the same posture
-/// as `ParentImage`, not a load-time refusal (see `eval::Haystacks::get`'s doc).
-const WINDOWS_ONLY_FIELDS: &[&str] = &["originalfilename"];
+/// `OriginalFileName`, `Company`, `Description` and `Product` are PE version-resource
+/// metadata (issues #983, #719): a Windows/PE concept with no Mach-O or ELF equivalent.
+/// A `linux/` or `macos/` rule using one would never match on the platforms that load
+/// it — the exact silent-death failure mode this module exists to kill (its own module
+/// doc) — so it is refused at load time there, the same way `validate_metadata` already
+/// refuses a rule outside any known platform directory. A Windows-platform rule using
+/// one is accepted even though a *particular* event may still lack the value (PE parse
+/// failure, no version resource): that per-event gap is the same posture as
+/// `ParentImage`, not a load-time refusal (see `eval::Haystacks::get`'s doc).
+const WINDOWS_ONLY_FIELDS: &[&str] = &["originalfilename", "company", "description", "product"];
+
+/// The one `logsource` category the fields above are mapped for: every supported field is read
+/// from an `ExecEvent`.
+const SUPPORTED_CATEGORY: &str = "process_creation";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SigmaError {
@@ -52,10 +67,13 @@ const KNOWN_PLATFORMS: &[&str] = &["linux", "windows", "macos"];
 /// rules root is known, so a word in the content root's own path cannot pass for a platform.
 pub(crate) fn validate(rule: &SigmaRule, path: &str) -> Result<(), SigmaError> {
     let normalized = path.replace('\\', "/");
-    let under_platform = KNOWN_PLATFORMS
+    // The innermost platform directory: `.../windows/x/linux/rule.yml` is a Linux rule.
+    let platform = KNOWN_PLATFORMS
         .iter()
-        .any(|p| normalized.contains(&format!("/{p}/")));
-    validate_with(rule, path, under_platform)
+        .filter_map(|p| normalized.rfind(&format!("/{p}/")).map(|at| (at, *p)))
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, p)| p);
+    validate_with(rule, path, platform)
 }
 
 /// [`validate`] for a rule found at `relative` (`/` or `\` separated) under the rules root: the
@@ -68,13 +86,23 @@ pub(crate) fn validate_under(
     let normalized = relative.replace('\\', "/");
     let mut parts = normalized.split('/');
     // The file name is not a directory: a rule directly under the root has no platform.
-    let under_platform = parts
-        .next()
-        .is_some_and(|first| parts.next().is_some() && KNOWN_PLATFORMS.contains(&first));
-    validate_with(rule, path, under_platform)
+    let platform = parts.next().and_then(|first| {
+        parts.next()?;
+        KNOWN_PLATFORMS.iter().copied().find(|p| *p == first)
+    });
+    validate_with(rule, path, platform)
 }
 
-fn validate_with(rule: &SigmaRule, path: &str, under_platform: bool) -> Result<(), SigmaError> {
+/// `platform` is the rule's platform directory (one of [`KNOWN_PLATFORMS`]), `None` when it is
+/// under none.
+fn validate_with(
+    rule: &SigmaRule,
+    path: &str,
+    platform: Option<&'static str>,
+) -> Result<(), SigmaError> {
+    // First: a rule written for other telemetry is refused for that, not for the fields that
+    // telemetry has and an `ExecEvent` does not.
+    validate_logsource(rule, path, platform)?;
     let compiled = validate_condition(rule, path)?;
     // Every block the condition refers to is checked as strictly as `selection` always was. A
     // block it does not refer to is never evaluated and stays unchecked, as before.
@@ -84,8 +112,8 @@ fn validate_with(rule: &SigmaRule, path: &str, under_platform: bool) -> Result<(
             return Err(unsupported(path, format!("missing `{name}` block")));
         };
         let checked = match block {
-            Selection::FieldMap(fields) => validate_field_map(fields, path),
-            Selection::OrOfMaps(maps) => validate_or_of_maps(maps, path),
+            Selection::FieldMap(fields) => validate_field_map(fields, path, platform),
+            Selection::OrOfMaps(maps) => validate_or_of_maps(maps, path, platform),
             Selection::Keywords(keywords) => validate_keywords(keywords, path),
         };
         // The message of the one block every rule used to have is unchanged; the others say
@@ -100,7 +128,58 @@ fn validate_with(rule: &SigmaRule, path: &str, under_platform: bool) -> Result<(
             other => other,
         })?;
     }
-    validate_metadata(rule, path, under_platform)
+    validate_metadata(rule, path, platform.is_some())
+}
+
+/// Checks `logsource` (#719). Every supported field is read from an `ExecEvent`, so the engine
+/// evaluates every rule against process creations: a rule written for another category or a
+/// log channel would be evaluated against the wrong events, and is refused. An absent
+/// `logsource` is `process_creation`. A `product` must name the rule's own platform directory;
+/// with no platform directory, `validate_metadata` refuses the rule.
+fn validate_logsource(
+    rule: &SigmaRule,
+    path: &str,
+    platform: Option<&'static str>,
+) -> Result<(), SigmaError> {
+    let Some(logsource) = &rule.logsource else {
+        return Ok(());
+    };
+    if let Some(service) = &logsource.service {
+        return Err(unsupported(
+            path,
+            format!(
+                "logsource `service: {service}` (log channels are not mapped; only `category: \
+                 {SUPPORTED_CATEGORY}` is)"
+            ),
+        ));
+    }
+    match &logsource.category {
+        Some(category) if category.eq_ignore_ascii_case(SUPPORTED_CATEGORY) => {}
+        Some(category) => {
+            return Err(unsupported(
+                path,
+                format!("logsource `category: {category}` (only `{SUPPORTED_CATEGORY}` is mapped)"),
+            ));
+        }
+        None => {
+            return Err(unsupported(
+                path,
+                format!("logsource without a `category` (only `{SUPPORTED_CATEGORY}` is mapped)"),
+            ));
+        }
+    }
+    match (&logsource.product, platform) {
+        (Some(product), Some(platform)) if !product.eq_ignore_ascii_case(platform) => {
+            Err(unsupported(
+                path,
+                format!(
+                    "logsource `product: {product}` in a rule under `{platform}/` (the product \
+                     must be the rule's platform directory)"
+                ),
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Checks the required rule metadata: severity (`level`, upstream Sigma's field
@@ -156,15 +235,6 @@ pub(crate) fn technique_id(tag: &str) -> Option<String> {
     }
 }
 
-/// Whether `path` sits under a `windows/` directory of `rules/sigma/`, the same
-/// string-containment check [`validate_metadata`] already uses for the platform
-/// directory itself — not a parse of [`crate::engine::Platform`], since this
-/// runs on a rule's source path at load time, before any engine has decided
-/// which host loads it.
-fn is_windows_rule(path: &str) -> bool {
-    path.replace('\\', "/").contains("/windows/")
-}
-
 fn missing_metadata(path: &str, what: String) -> SigmaError {
     SigmaError::MissingMetadata {
         path: path.to_string(),
@@ -202,6 +272,7 @@ fn validate_condition<'a>(
 fn validate_field_map(
     fields: &std::collections::HashMap<String, ValueList>,
     path: &str,
+    platform: Option<&'static str>,
 ) -> Result<(), SigmaError> {
     // An empty map would vacuously match EVERY event (Iterator::all on
     // nothing) — a malformed rule must never become an alert flood.
@@ -229,12 +300,10 @@ fn validate_field_map(
         if !SUPPORTED_FIELDS.contains(&field_lower.as_str()) {
             return Err(unsupported(
                 path,
-                format!(
-                    "field `{field}` (supported: Image, CommandLine, ParentImage, OriginalFileName)"
-                ),
+                format!("field `{field}` (supported: {SUPPORTED_FIELD_NAMES})"),
             ));
         }
-        if WINDOWS_ONLY_FIELDS.contains(&field_lower.as_str()) && !is_windows_rule(path) {
+        if WINDOWS_ONLY_FIELDS.contains(&field_lower.as_str()) && platform != Some("windows") {
             return Err(unsupported(
                 path,
                 format!(
@@ -314,6 +383,7 @@ fn validate_field_map(
 fn validate_or_of_maps(
     maps: &[std::collections::HashMap<String, ValueList>],
     path: &str,
+    platform: Option<&'static str>,
 ) -> Result<(), SigmaError> {
     if maps.is_empty() {
         return Err(unsupported(
@@ -322,7 +392,7 @@ fn validate_or_of_maps(
         ));
     }
     for fields in maps {
-        validate_field_map(fields, path)?;
+        validate_field_map(fields, path, platform)?;
     }
     Ok(())
 }
