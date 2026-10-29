@@ -268,6 +268,10 @@ pub struct RuleState {
     /// `sed -i.bak`, or an encryptor that exits right after its renames) is already
     /// gone and it reads `None` (#513 review). LRU-bounded like `pid_comm`.
     pid_image_path: BoundedMap<u32, PidFact>,
+    /// pid → generation of the process that already raised SETUID-ROOT-REQUEST (T1548.001,
+    /// #1041): one alert per process, since a `PoC` calls `setuid`, `setresuid`, ... in a row.
+    /// LRU-bounded like `pid_comm`.
+    setuid_root_alerted: BoundedMap<u32, Option<u64>>,
     /// path → info about the last write by a known downloader (T1105). LRU-bounded:
     /// downloader writes are rare, but a hostile loop must not grow agent memory.
     recent_writes: BoundedMap<String, RecentWrite>,
@@ -533,6 +537,7 @@ impl RuleState {
         Self {
             pid_comm: BoundedMap::new(PID_COMM_CAP),
             pid_image_path: BoundedMap::new(PID_COMM_CAP),
+            setuid_root_alerted: BoundedMap::new(PID_COMM_CAP),
             recent_writes: BoundedMap::new(RECENT_WRITES_CAP),
             recent_quarantines: BoundedMap::new(RECENT_WRITES_CAP),
             recent_bits_downloads: BoundedMap::new(RECENT_WRITES_CAP),
@@ -2113,6 +2118,34 @@ impl RuleState {
             ));
         }
         alerts
+    }
+
+    /// To be called for every `IdentityChangeEvent` in the stream (Linux, issue #266):
+    /// SETUID-ROOT-REQUEST (T1548.001, #1041), see [`crate::privesc`]. The image is the
+    /// pid's exec-time path from [`Self::pid_image_path`], never `comm`; no image means no
+    /// alert.
+    pub fn on_identity_change(&mut self, event: &schema::IdentityChangeEvent) -> Vec<Alert> {
+        if !crate::privesc::requests_root_as_non_root(event) {
+            return Vec::new();
+        }
+        let generation = event.meta.process_generation;
+        let Some(image) =
+            PidFact::current(&self.pid_image_path, event.meta.pid, generation).map(str::to_owned)
+        else {
+            return Vec::new();
+        };
+        if image.is_empty() || crate::privesc::is_known_setuid_root_program(&image) {
+            return Vec::new();
+        }
+        if self
+            .setuid_root_alerted
+            .peek(&event.meta.pid)
+            .is_some_and(|recorded| *recorded == generation)
+        {
+            return Vec::new();
+        }
+        self.setuid_root_alerted.insert(event.meta.pid, generation);
+        vec![crate::privesc::alert(event, &image)]
     }
 
     /// To be called for every `MemfdCreateEvent` in the stream (Linux, issue

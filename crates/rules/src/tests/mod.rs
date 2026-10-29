@@ -412,6 +412,7 @@ mod logon;
 mod motw_removal;
 mod persistence;
 mod policy_denial_windows;
+mod privesc;
 mod quarantine;
 mod ransomware_windows;
 mod raw_volume;

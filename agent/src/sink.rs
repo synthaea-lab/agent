@@ -1655,6 +1655,13 @@ impl DetectionSink {
         self.record_rule_alerts(wrapped, rules::evaluate_signal(event));
     }
 
+    /// `IdentityChange` events (Linux, #266): SETUID-ROOT-REQUEST (T1548.001, #1041). Most
+    /// events are root's own calls and return before any state is touched.
+    fn detect_identity_change(&self, wrapped: &Event, event: &schema::IdentityChangeEvent) {
+        let alerts = self.rule_state.lock().unwrap().on_identity_change(event);
+        self.record_rule_alerts(wrapped, alerts);
+    }
+
     /// `FileRename` events: mass-rename ransomware detection (T1486, issue #262) +
     /// write-volume corroboration (issue #82).
     fn detect_file_rename(&self, wrapped: &Event, event: &schema::FileRenameEvent) {
@@ -2348,6 +2355,7 @@ impl EventSink for DetectionSink {
             Event::ListenPort(e) => self.detect_listen_port(&event, e),
             Event::Auth(e) => self.detect_auth(&event, e),
             Event::Session(e) => self.detect_session(&event, e),
+            Event::IdentityChange(e) => self.detect_identity_change(&event, e),
             Event::FileDelete(e) => self.detect_file_delete(&event, e),
             Event::Signal(e) => self.detect_signal(&event, e),
             Event::FileQuarantine(e) => self.detect_file_quarantine(e),

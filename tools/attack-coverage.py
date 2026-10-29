@@ -157,6 +157,7 @@ TECHNIQUE_TACTIC = {
     "T1546.004": "Persistence",
     "T1547.015": "Persistence",
     "T1548": "Privilege Escalation",
+    "T1548.001": "Privilege Escalation",
     "T1552": "Credential Access",
     "T1552.001": "Credential Access",
     "T1552.004": "Credential Access",
