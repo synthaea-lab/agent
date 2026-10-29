@@ -324,6 +324,11 @@ pub mod time;
 /// Bumped 57 → 58 for [`ListenPortEvent::protocol`] (#676 part 1): #136 slice 4
 /// merged first and took 57, which this had also claimed; 58 is the next free
 /// number above it.
+///
+/// Not bumped for the Windows UDP collector (#676 part 2, stacked on #995): no
+/// wire change — #995 already defined `ListenPortEvent::protocol`; this PR only
+/// fills it with the real value (6 or 17) instead of #995's TCP-only `6` (review
+/// of #1008).
 pub const SCHEMA_VERSION: u32 = 58;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it

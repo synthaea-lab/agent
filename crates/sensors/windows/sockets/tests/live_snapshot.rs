@@ -1,13 +1,14 @@
 //! Live validation against the real IP Helper table (Windows only): bind
-//! ephemeral listeners in this test process, snapshot, and require the walk to
-//! find them attributed to us. Runs in the default suite on Windows — no
-//! privileges needed, which is the point of this source.
+//! ephemeral TCP listeners and UDP sockets in this test process, snapshot,
+//! and require the walk to find them attributed to us with the right
+//! protocol. Runs in the default suite on Windows — no privileges needed,
+//! which is the point of this source.
 
 #![cfg(windows)]
 
-use std::net::TcpListener;
+use std::net::{TcpListener, UdpSocket};
 
-use sensor_windows_sockets::{listen_port_events, snapshot};
+use sensor_windows_sockets::{listen_port_events, listen_port_events_tcp, snapshot, snapshot_tcp};
 
 #[test]
 fn own_ipv4_listener_appears_attributed_to_this_process() {
@@ -55,6 +56,106 @@ fn own_ipv6_listener_appears_with_its_port_decoded() {
         "own IPv6 listener on port {port} not found"
     );
     drop(listener);
+}
+
+#[test]
+fn own_udp_socket_appears_attributed_with_udp_protocol() {
+    // A bound UDP socket is not a "listener", but GetExtendedUdpTable has no
+    // such filter — this is the real, unfiltered mechanism issue #676 asks
+    // for; the noise problem it also names (DNS client sockets, ephemeral
+    // ports) is a separate, deliberately deferred filter, not tested here.
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind ephemeral UDP socket");
+    let port = socket.local_addr().unwrap().port();
+    let me = std::process::id();
+
+    let entries = snapshot().expect("snapshot must succeed unprivileged");
+    let mine = entries
+        .iter()
+        .find(|e| e.pid == me && e.local.port() == port && e.protocol == 17)
+        .unwrap_or_else(|| {
+            panic!(
+                "own UDP socket on port {port} not found among {} entries",
+                entries.len()
+            )
+        });
+
+    assert_eq!(mine.local.ip().to_string(), "127.0.0.1");
+    assert_eq!(mine.protocol, 17, "IPPROTO_UDP");
+    drop(socket);
+}
+
+#[test]
+fn own_tcp_listener_is_still_distinguished_from_udp() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral listener");
+    let port = listener.local_addr().unwrap().port();
+    let me = std::process::id();
+
+    let entries = snapshot().expect("snapshot");
+    let mine = entries
+        .iter()
+        .find(|e| e.pid == me && e.local.port() == port && e.protocol == 6)
+        .expect("own TCP listener must appear");
+    assert_eq!(mine.protocol, 6, "IPPROTO_TCP");
+    assert!(
+        !entries
+            .iter()
+            .any(|e| e.pid == me && e.local.port() == port && e.protocol == 17),
+        "a UDP socket in this process must not share the TCP listener's port"
+    );
+    drop(listener);
+}
+
+#[test]
+fn snapshot_tcp_finds_the_same_tcp_listener_as_snapshot_but_no_udp() {
+    // The agent's own entry point (review of #1008, #676 part 2): it must see
+    // what `snapshot` sees on the TCP side, and never fetch/report a UDP entry
+    // at all — not "reports it and relies on a filter downstream."
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral TCP listener");
+    let tcp_port = listener.local_addr().unwrap().port();
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind ephemeral UDP socket");
+    let udp_port = socket.local_addr().unwrap().port();
+    let me = std::process::id();
+
+    let entries = snapshot_tcp().expect("snapshot_tcp must succeed unprivileged");
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.pid == me && e.local.port() == tcp_port && e.protocol == 6),
+        "own TCP listener on port {tcp_port} not found"
+    );
+    assert!(
+        !entries.iter().any(|e| e.local.port() == udp_port),
+        "snapshot_tcp must never report a UDP-only port"
+    );
+    assert!(
+        entries.iter().all(|e| e.protocol == 6),
+        "every snapshot_tcp entry must be IPPROTO_TCP"
+    );
+    drop(listener);
+    drop(socket);
+}
+
+#[test]
+fn listen_port_events_tcp_carries_the_listener_but_not_a_udp_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral TCP listener");
+    let tcp_port = listener.local_addr().unwrap().port();
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind ephemeral UDP socket");
+    let udp_port = socket.local_addr().unwrap().port();
+    let me = std::process::id();
+
+    let events = listen_port_events_tcp(1_790_000_000_000_000_000).expect("events");
+    assert!(events.iter().any(|e| {
+        matches!(e, schema::Event::ListenPort(l)
+            if l.meta.pid == me && l.local_port == tcp_port && l.protocol == 6)
+    }));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, schema::Event::ListenPort(l) if l.local_port == udp_port)),
+        "listen_port_events_tcp must never carry a UDP-only port"
+    );
+    drop(listener);
+    drop(socket);
 }
 
 #[test]
