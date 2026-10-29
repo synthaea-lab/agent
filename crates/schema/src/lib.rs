@@ -321,9 +321,9 @@ pub mod time;
 /// the timestomp slice above — it merged first and took the 57 #995 was planning
 /// on, without #995 having pushed its own renumbering commit yet.
 ///
-/// Bumped 57 → 58 for [`ListenPortEvent::protocol`] (#676 part 1, #995): collided
-/// with the above on 57 (both claimed it independently; #136 slice 4 merged first),
-/// so this takes the next free number instead.
+/// Bumped 57 → 58 for [`ListenPortEvent::protocol`] (#676 part 1): #136 slice 4
+/// merged first and took 57, which this had also claimed; 58 is the next free
+/// number above it.
 pub const SCHEMA_VERSION: u32 = 58;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
@@ -1623,6 +1623,17 @@ pub struct UdpRecvEvent {
     pub size: u32,
 }
 
+/// IP protocol number for TCP, the `IPPROTO_TCP` of `<netinet/in.h>` — shared so
+/// [`ListenPortEvent::protocol`]/[`NetworkFlowEvent::protocol`] callers across the
+/// agent and sensor crates stamp and compare the same value instead of each
+/// carrying its own `6` literal, where a typo would make a baseline key that
+/// silently never matches (issue #676 review).
+pub const IPPROTO_TCP: u8 = 6;
+
+/// IP protocol number for UDP, the `IPPROTO_UDP` of `<netinet/in.h>` — see
+/// [`IPPROTO_TCP`].
+pub const IPPROTO_UDP: u8 = 17;
+
 /// A TCP or UDP socket found bound/listening, from a periodic socket-table snapshot
 /// rather than a discrete `bind`/`listen()` syscall trace (Linux: `NETLINK_SOCK_DIAG`,
 /// issue #92 — a probe-free source that runs where eBPF/ETW cannot, or as a redundant
@@ -1655,7 +1666,7 @@ pub struct ListenPortEvent {
 /// `IPPROTO_TCP` — the default for `ListenPortEvent::protocol` on a record from
 /// before this field existed.
 fn default_listen_port_protocol() -> u8 {
-    6
+    IPPROTO_TCP
 }
 
 /// Direction of TLS data flow.

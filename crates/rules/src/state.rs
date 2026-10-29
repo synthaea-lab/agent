@@ -1740,10 +1740,11 @@ impl RuleState {
     /// existing tag in this crate; no better precedent for "a new listener
     /// appeared" exists here yet, calibratable later) — a listening socket that
     /// wasn't in the startup baseline ([`Self::seed_listen_ports`]) nor already
-    /// alerted on this run. One alert per (`local_addr`, `local_port`): the second
-    /// poll to see the same listener is expected (a poll-based source re-reports
+    /// alerted on this run. One alert per (`local_addr`, `local_port`, `protocol`): the
+    /// second poll to see the same listener is expected (a poll-based source re-reports
     /// it every cycle while it stays open, same reasoning as
-    /// [`Self::check_beacon_flow`]'s dedup), not a second finding.
+    /// [`Self::check_beacon_flow`]'s dedup), not a second finding — and a TCP and a UDP
+    /// listener sharing a port (#676) are different listeners, not one.
     ///
     /// No name/path exclusion list yet — unlike BEACON's `BROWSERS`/
     /// `STANDARD_PORTS`, there is no lab capture here to calibrate one honestly
@@ -3190,8 +3191,8 @@ fn is_all_digits(s: &str) -> bool {
 /// today, the bare number for anything else rather than guessing a name.
 fn protocol_label(protocol: u8) -> std::borrow::Cow<'static, str> {
     match protocol {
-        6 => "tcp".into(),
-        17 => "udp".into(),
+        schema::IPPROTO_TCP => "tcp".into(),
+        schema::IPPROTO_UDP => "udp".into(),
         other => other.to_string().into(),
     }
 }

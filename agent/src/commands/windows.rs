@@ -65,7 +65,9 @@ fn seeded_rule_state() -> rules::RuleState {
     match sensor_windows_sockets::snapshot() {
         Ok(entries) => {
             rule_state.seed_listen_ports(
-                entries.iter().map(|e| (e.local.ip(), e.local.port(), 6)), // IPPROTO_TCP — TCP-only snapshot today (issue #676)
+                entries
+                    .iter()
+                    .map(|e| (e.local.ip(), e.local.port(), schema::IPPROTO_TCP)), // TCP-only snapshot today (issue #676)
             );
         }
         Err(e) => tracing::warn!(error = %e, "socket snapshot for listener baseline failed"),

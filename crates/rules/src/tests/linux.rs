@@ -1008,7 +1008,11 @@ fn listen_port_seeded_at_startup_does_not_alert() {
     // before the agent attaches (sshd started by systemd at boot) must not look
     // like a freshly planted backdoor on the first poll.
     let mut state = RuleState::new();
-    state.seed_listen_ports([(std::net::IpAddr::V4([0, 0, 0, 0].into()), 22, 6)]); // IPPROTO_TCP
+    state.seed_listen_ports([(
+        std::net::IpAddr::V4([0, 0, 0, 0].into()),
+        22,
+        schema::IPPROTO_TCP,
+    )]);
     let alerts = state.on_listen_port(&listen_port_event_full(1, "sshd", [0, 0, 0, 0], 22, 0));
     assert!(alerts.is_empty());
 }
@@ -1057,14 +1061,18 @@ fn listen_port_udp_on_a_tcp_baselined_port_still_alerts() {
     // number, not one shape — a UDP listener must not look already-seen just
     // because the same (addr, port) was baselined as TCP.
     let mut state = RuleState::new();
-    state.seed_listen_ports([(std::net::IpAddr::V4([0, 0, 0, 0].into()), 53, 6)]); // IPPROTO_TCP
+    state.seed_listen_ports([(
+        std::net::IpAddr::V4([0, 0, 0, 0].into()),
+        53,
+        schema::IPPROTO_TCP,
+    )]);
     let tcp_again = state.on_listen_port(&listen_port_event_full(53, "named", [0, 0, 0, 0], 53, 0));
     assert!(
         tcp_again.is_empty(),
         "the TCP listener on :53 was already seeded, so it must not re-alert"
     );
     let udp = ListenPortEvent {
-        protocol: 17, // IPPROTO_UDP
+        protocol: schema::IPPROTO_UDP,
         ..listen_port_event_full(54, "dnsmasq", [0, 0, 0, 0], 53, 1_000_000_000)
     };
     let udp_alerts = state.on_listen_port(&udp);
