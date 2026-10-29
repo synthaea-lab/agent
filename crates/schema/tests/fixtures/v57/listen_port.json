@@ -8,6 +8,5 @@
     "comm": "sshd-backdoor"
   },
   "local_addr": "0.0.0.0",
-  "local_port": 31337,
-  "protocol": 6
+  "local_port": 31337
 }

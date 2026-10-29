@@ -1,7 +1,7 @@
 //! Decoder for the messages `SynthaeaFilter` sends on its port (milestone 2c, #136).
 //!
-//! The format is the one in `docs/architecture/minifilter-event-channel.md` (protocol v3): a
-//! fixed 72-byte little-endian header, then the paths in UTF-16LE, `old_path` then `new_path`, not
+//! The format is the one in `docs/architecture/minifilter-event-channel.md` (protocol v5): a
+//! fixed 108-byte little-endian header, then the paths in UTF-16LE, `old_path` then `new_path`, not
 //! NUL-terminated. This module sees only the payload: the `FILTER_MESSAGE_HEADER` that
 //! `FilterGetMessage` puts in front of it is stripped by the caller.
 //!
@@ -11,7 +11,7 @@
 //! Platform-independent on purpose, so the decoder is tested and fuzzed on every OS.
 
 /// Bytes before the paths.
-pub const HEADER_LEN: usize = 72;
+pub const HEADER_LEN: usize = 108;
 
 /// Longest path, in UTF-16 code units, the driver puts in a record (a longer one is truncated
 /// and flagged). The decoder refuses a length above it.
@@ -23,6 +23,8 @@ pub const MAX_MESSAGE_LEN: usize = HEADER_LEN + 2 * 2 * MAX_PATH_UNITS;
 const KIND_HEARTBEAT: u16 = 0;
 const KIND_DELETE: u16 = 1;
 const KIND_RENAME: u16 = 2;
+const KIND_SET_TIME: u16 = 3;
+const KIND_RAW_VOLUME_OPEN: u16 = 4;
 
 const FLAG_DELETE_ON_CLOSE: u16 = 1 << 0;
 const FLAG_OLD_PATH_TRUNCATED: u16 = 1 << 1;
@@ -69,6 +71,23 @@ pub enum Body {
         old_truncated: bool,
         new_truncated: bool,
     },
+    /// An accepted `FileBasicInformation` timestamp request. Values are the caller's raw
+    /// 100-ns FILETIME values since 1601; zero means unchanged, and -1/-2 are Windows
+    /// auto-update sentinels. The event does not claim the requested time was persisted.
+    SetTime {
+        path: String,
+        creation_time: i64,
+        last_access_time: i64,
+        last_write_time: i64,
+        change_time: i64,
+        truncated: bool,
+    },
+    /// A successful open of a mounted logical volume, with the caller's requested access mask.
+    RawVolumeOpen {
+        volume: String,
+        desired_access: u32,
+        truncated: bool,
+    },
 }
 
 impl Body {
@@ -82,6 +101,8 @@ impl Body {
                 new_truncated,
                 ..
             } => *old_truncated || *new_truncated,
+            Self::SetTime { truncated, .. } => *truncated,
+            Self::RawVolumeOpen { truncated, .. } => *truncated,
         }
     }
 }
@@ -125,6 +146,14 @@ pub enum WireError {
     TimestampBeforeEpoch(i64),
     #[error("timestamp {0} does not fit in a 64-bit nanosecond count")]
     TimestampOverflow(i64),
+    #[error("set-time event contains no requested timestamp")]
+    EmptySetTime,
+    #[error("message kind {kind} has nonzero set-time fields")]
+    SetTimeFieldsForKind { kind: u16 },
+    #[error("set-time field {0} is below the Windows -2 auto-update sentinel")]
+    InvalidSetTime(i64),
+    #[error("message kind {kind} has nonzero desired-access field")]
+    DesiredAccessForKind { kind: u16 },
 }
 
 /// Decodes one message payload.
@@ -159,6 +188,11 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
         dropped_capture_failed: r.u64(),
         ..counters
     };
+    let creation_time = r.i64();
+    let last_access_time = r.i64();
+    let last_write_time = r.i64();
+    let change_time = r.i64();
+    let desired_access = r.u32();
     debug_assert_eq!(r.at, HEADER_LEN);
 
     if flags & !KNOWN_FLAGS != 0 {
@@ -168,6 +202,8 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
         KIND_HEARTBEAT => 0,
         KIND_DELETE => FLAG_DELETE_ON_CLOSE | FLAG_OLD_PATH_TRUNCATED,
         KIND_RENAME => FLAG_OLD_PATH_TRUNCATED | FLAG_NEW_PATH_TRUNCATED,
+        KIND_SET_TIME => FLAG_OLD_PATH_TRUNCATED,
+        KIND_RAW_VOLUME_OPEN => FLAG_OLD_PATH_TRUNCATED,
         other => return Err(WireError::UnknownKind(other)),
     };
     if flags & !allowed_flags != 0 {
@@ -176,7 +212,10 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
     let lengths_fit = match kind {
         KIND_HEARTBEAT => old_len == 0 && new_len == 0,
         KIND_DELETE => old_len > 0 && new_len == 0,
-        _ => old_len > 0 && new_len > 0,
+        KIND_RENAME => old_len > 0 && new_len > 0,
+        KIND_SET_TIME => old_len > 0 && new_len == 0,
+        KIND_RAW_VOLUME_OPEN => old_len > 0 && new_len == 0,
+        _ => false,
     };
     if !lengths_fit {
         return Err(WireError::PathLengthsForKind {
@@ -200,6 +239,25 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
     if seq == 0 {
         return Err(WireError::ZeroSequence);
     }
+    let times = [
+        creation_time,
+        last_access_time,
+        last_write_time,
+        change_time,
+    ];
+    if kind == KIND_SET_TIME {
+        if times.iter().all(|time| *time == 0) {
+            return Err(WireError::EmptySetTime);
+        }
+        if let Some(value) = times.iter().copied().find(|time| *time < -2) {
+            return Err(WireError::InvalidSetTime(value));
+        }
+    } else if times.iter().any(|time| *time != 0) {
+        return Err(WireError::SetTimeFieldsForKind { kind });
+    }
+    if kind != KIND_RAW_VOLUME_OPEN && desired_access != 0 {
+        return Err(WireError::DesiredAccessForKind { kind });
+    }
     let timestamp_ns = filetime_to_unix_ns(timestamp)?;
 
     let old_path = r.utf16(old_len);
@@ -211,12 +269,26 @@ pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
             on_close: flags & FLAG_DELETE_ON_CLOSE != 0,
             truncated: flags & FLAG_OLD_PATH_TRUNCATED != 0,
         },
-        _ => Body::Rename {
+        KIND_RENAME => Body::Rename {
             old_path,
             new_path,
             old_truncated: flags & FLAG_OLD_PATH_TRUNCATED != 0,
             new_truncated: flags & FLAG_NEW_PATH_TRUNCATED != 0,
         },
+        KIND_SET_TIME => Body::SetTime {
+            path: old_path,
+            creation_time,
+            last_access_time,
+            last_write_time,
+            change_time,
+            truncated: flags & FLAG_OLD_PATH_TRUNCATED != 0,
+        },
+        KIND_RAW_VOLUME_OPEN => Body::RawVolumeOpen {
+            volume: old_path,
+            desired_access,
+            truncated: flags & FLAG_OLD_PATH_TRUNCATED != 0,
+        },
+        _ => unreachable!("kind validated above"),
     };
     Ok(Message {
         seq,
@@ -265,6 +337,10 @@ impl Reader<'_> {
         u16::from_le_bytes(self.take())
     }
 
+    fn u32(&mut self) -> u32 {
+        u32::from_le_bytes(self.take())
+    }
+
     fn u64(&mut self) -> u64 {
         u64::from_le_bytes(self.take())
     }
@@ -293,8 +369,15 @@ impl Reader<'_> {
 /// only; the agent never sends to the driver.
 #[cfg(test)]
 pub(crate) fn encode(message: &Message, raw_timestamp: i64) -> Vec<u8> {
-    let (kind, flags, old, new): (u16, u16, Vec<u16>, Vec<u16>) = match &message.body {
-        Body::Heartbeat => (KIND_HEARTBEAT, 0, Vec::new(), Vec::new()),
+    let (kind, flags, old, new, times, desired_access): (
+        u16,
+        u16,
+        Vec<u16>,
+        Vec<u16>,
+        [i64; 4],
+        u32,
+    ) = match &message.body {
+        Body::Heartbeat => (KIND_HEARTBEAT, 0, Vec::new(), Vec::new(), [0; 4], 0),
         Body::Delete {
             path,
             on_close,
@@ -305,6 +388,8 @@ pub(crate) fn encode(message: &Message, raw_timestamp: i64) -> Vec<u8> {
                 | (u16::from(*truncated) * FLAG_OLD_PATH_TRUNCATED),
             path.encode_utf16().collect(),
             Vec::new(),
+            [0; 4],
+            0,
         ),
         Body::Rename {
             old_path,
@@ -317,6 +402,40 @@ pub(crate) fn encode(message: &Message, raw_timestamp: i64) -> Vec<u8> {
                 | (u16::from(*new_truncated) * FLAG_NEW_PATH_TRUNCATED),
             old_path.encode_utf16().collect(),
             new_path.encode_utf16().collect(),
+            [0; 4],
+            0,
+        ),
+        Body::SetTime {
+            path,
+            creation_time,
+            last_access_time,
+            last_write_time,
+            change_time,
+            truncated,
+        } => (
+            KIND_SET_TIME,
+            u16::from(*truncated) * FLAG_OLD_PATH_TRUNCATED,
+            path.encode_utf16().collect(),
+            Vec::new(),
+            [
+                *creation_time,
+                *last_access_time,
+                *last_write_time,
+                *change_time,
+            ],
+            0,
+        ),
+        Body::RawVolumeOpen {
+            volume,
+            desired_access,
+            truncated,
+        } => (
+            KIND_RAW_VOLUME_OPEN,
+            u16::from(*truncated) * FLAG_OLD_PATH_TRUNCATED,
+            volume.encode_utf16().collect(),
+            Vec::new(),
+            [0; 4],
+            *desired_access,
         ),
     };
     let mut out = Vec::with_capacity(HEADER_LEN + 2 * (old.len() + new.len()));
@@ -332,6 +451,10 @@ pub(crate) fn encode(message: &Message, raw_timestamp: i64) -> Vec<u8> {
     out.extend_from_slice(&u16::try_from(old.len()).unwrap().to_le_bytes());
     out.extend_from_slice(&u16::try_from(new.len()).unwrap().to_le_bytes());
     out.extend_from_slice(&message.counters.dropped_capture_failed.to_le_bytes());
+    for time in times {
+        out.extend_from_slice(&time.to_le_bytes());
+    }
+    out.extend_from_slice(&desired_access.to_le_bytes());
     for unit in old.iter().chain(&new) {
         out.extend_from_slice(&unit.to_le_bytes());
     }
@@ -382,13 +505,30 @@ mod tests {
     }
 
     #[test]
-    fn the_header_is_seventy_two_bytes() {
+    fn the_header_is_one_hundred_eight_bytes() {
         assert_eq!(encode(&message(Body::Heartbeat), RAW_TS).len(), HEADER_LEN);
     }
 
     #[test]
     fn each_kind_round_trips() {
-        for m in [message(Body::Heartbeat), delete(), rename()] {
+        for m in [
+            message(Body::Heartbeat),
+            delete(),
+            rename(),
+            message(Body::SetTime {
+                path: r"\Device\HarddiskVolume3\data\x.docx".into(),
+                creation_time: 132_537_600_000_000_000,
+                last_access_time: 0,
+                last_write_time: -1,
+                change_time: -2,
+                truncated: false,
+            }),
+            message(Body::RawVolumeOpen {
+                volume: r"\Device\HarddiskVolume3".into(),
+                desired_access: 0x8000_0002,
+                truncated: false,
+            }),
+        ] {
             assert_eq!(decode(&encode(&m, RAW_TS)), Ok(m));
         }
         // #136 ADS slice 2: a named stream's `:streamname` suffix is an
@@ -495,6 +635,21 @@ mod tests {
             decode(&set_lengths(ren, 5, 0)),
             Err(WireError::PathLengthsForKind { .. })
         ));
+        let set_time = encode(
+            &message(Body::SetTime {
+                path: "x".into(),
+                creation_time: 1,
+                last_access_time: 0,
+                last_write_time: 0,
+                change_time: 0,
+                truncated: false,
+            }),
+            RAW_TS,
+        );
+        assert!(matches!(
+            decode(&set_lengths(set_time, 1, 1)),
+            Err(WireError::PathLengthsForKind { .. })
+        ));
     }
 
     #[test]
@@ -507,12 +662,82 @@ mod tests {
     #[test]
     fn unknown_kinds_and_flags_are_refused() {
         let mut bytes = encode(&delete(), RAW_TS);
-        bytes[0..2].copy_from_slice(&3u16.to_le_bytes());
-        assert_eq!(decode(&bytes), Err(WireError::UnknownKind(3)));
+        bytes[0..2].copy_from_slice(&99u16.to_le_bytes());
+        assert_eq!(decode(&bytes), Err(WireError::UnknownKind(99)));
 
         let mut bytes = encode(&delete(), RAW_TS);
         bytes[2..4].copy_from_slice(&0x0008u16.to_le_bytes());
         assert_eq!(decode(&bytes), Err(WireError::UnknownFlags(0x0008)));
+    }
+
+    #[test]
+    fn set_time_rejects_empty_and_invalid_payloads() {
+        let valid = message(Body::SetTime {
+            path: "x".into(),
+            creation_time: 1,
+            last_access_time: 0,
+            last_write_time: 0,
+            change_time: 0,
+            truncated: false,
+        });
+        let mut empty = encode(&valid, RAW_TS);
+        empty[72..104].fill(0);
+        assert_eq!(decode(&empty), Err(WireError::EmptySetTime));
+
+        let mut too_negative = encode(&valid, RAW_TS);
+        too_negative[72..80].copy_from_slice(&(-3i64).to_le_bytes());
+        assert_eq!(decode(&too_negative), Err(WireError::InvalidSetTime(-3)));
+
+        let mut wrong_kind = encode(&delete(), RAW_TS);
+        wrong_kind[72..80].copy_from_slice(&1i64.to_le_bytes());
+        assert_eq!(
+            decode(&wrong_kind),
+            Err(WireError::SetTimeFieldsForKind { kind: KIND_DELETE })
+        );
+    }
+
+    #[test]
+    fn raw_volume_rejects_wrong_layout_times_and_access_on_other_kinds() {
+        let valid = message(Body::RawVolumeOpen {
+            volume: r"\Device\HarddiskVolume3".into(),
+            desired_access: 0x8000_0002,
+            truncated: false,
+        });
+        let bytes = encode(&valid, RAW_TS);
+        let mut wrong_new_len = bytes.clone();
+        wrong_new_len[62..64].copy_from_slice(&1u16.to_le_bytes());
+        assert!(decode(&wrong_new_len).is_err());
+        let mut nonzero_time = bytes.clone();
+        nonzero_time[72..80].copy_from_slice(&1i64.to_le_bytes());
+        assert_eq!(
+            decode(&nonzero_time),
+            Err(WireError::SetTimeFieldsForKind {
+                kind: KIND_RAW_VOLUME_OPEN
+            })
+        );
+        let mut non_volume_access = encode(&delete(), RAW_TS);
+        non_volume_access[104..108].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            decode(&non_volume_access),
+            Err(WireError::DesiredAccessForKind { kind: KIND_DELETE })
+        );
+        let mut truncated = bytes;
+        truncated.truncate(HEADER_LEN - 1);
+        assert!(decode(&truncated).is_err());
+    }
+
+    #[test]
+    fn desired_access_is_little_endian_at_byte_104() {
+        let raw_access = 0xA1B2_C3D4u32;
+        let bytes = encode(
+            &message(Body::RawVolumeOpen {
+                volume: "C:".into(),
+                desired_access: raw_access,
+                truncated: false,
+            }),
+            RAW_TS,
+        );
+        assert_eq!(&bytes[104..108], &raw_access.to_le_bytes());
     }
 
     #[test]
@@ -522,6 +747,17 @@ mod tests {
             (rename(), FLAG_DELETE_ON_CLOSE),
             (delete(), FLAG_NEW_PATH_TRUNCATED),
             (message(Body::Heartbeat), FLAG_OLD_PATH_TRUNCATED),
+            (
+                message(Body::SetTime {
+                    path: "x".into(),
+                    creation_time: 1,
+                    last_access_time: 0,
+                    last_write_time: 0,
+                    change_time: 0,
+                    truncated: false,
+                }),
+                FLAG_NEW_PATH_TRUNCATED,
+            ),
         ] {
             let mut bytes = encode(&body, RAW_TS);
             bytes[2..4].copy_from_slice(&flags.to_le_bytes());
@@ -541,9 +777,9 @@ mod tests {
     }
 
     #[test]
-    fn the_capture_failed_counter_sits_at_byte_64_and_paths_start_at_72() {
-        // Pins the v3 layout byte by byte, independently of `encode`: the driver's C_ASSERTs
-        // put the fourth counter after the two path lengths (60 and 62).
+    fn the_capture_failed_counter_sits_at_byte_64_and_v4_fields_follow_the_v3_header() {
+        // Pins the legacy v3 fields byte by byte, independently of `encode`: the driver's
+        // C_ASSERTs put the fourth counter after the two path lengths (60 and 62).
         let mut bytes = encode(&delete(), RAW_TS);
         bytes[64..72].copy_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
         let message = decode(&bytes).unwrap();
@@ -551,9 +787,9 @@ mod tests {
             message.counters.dropped_capture_failed,
             0x0102_0304_0506_0708
         );
-        assert_eq!(HEADER_LEN, 72);
+        assert_eq!(HEADER_LEN, 108);
         let path_units = u16::from_le_bytes([bytes[60], bytes[61]]);
-        assert_eq!(bytes.len(), 72 + 2 * usize::from(path_units));
+        assert_eq!(bytes.len(), 108 + 2 * usize::from(path_units));
     }
 
     #[test]
