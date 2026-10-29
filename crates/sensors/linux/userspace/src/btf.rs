@@ -10,6 +10,7 @@ const BTF_KIND_ARRAY: u32 = 3;
 const BTF_KIND_STRUCT: u32 = 4;
 const BTF_KIND_UNION: u32 = 5;
 const BTF_KIND_ENUM: u32 = 6;
+const BTF_KIND_FUNC: u32 = 12;
 const BTF_KIND_FUNC_PROTO: u32 = 13;
 const BTF_KIND_VAR: u32 = 14;
 const BTF_KIND_DATASEC: u32 = 15;
@@ -337,11 +338,42 @@ impl TypeTable<'_> {
         for record in &self.records {
             if record.kind == BTF_KIND_STRUCT
                 && matches_string(self.strings, record.name_off, name)?
+                && let Some(offset) = self.find_member(record, member, 0)?
             {
-                if let Some(offset) = self.find_member(record, member, 0)? {
-                    return Ok(Some(offset));
-                }
+                return Ok(Some(offset));
             }
+        }
+        Ok(None)
+    }
+
+    /// Parameter names of the kernel function `name` (a `FUNC` record pointing at a
+    /// `FUNC_PROTO`), or `None` when BTF has no such function.
+    fn function_params(&self, name: &[u8]) -> Result<Option<Vec<Vec<u8>>>, &'static str> {
+        for record in &self.records {
+            if record.kind != BTF_KIND_FUNC || !matches_string(self.strings, record.name_off, name)?
+            {
+                continue;
+            }
+            let proto = (record.size_or_type as usize)
+                .checked_sub(1)
+                .and_then(|id| self.records.get(id))
+                .filter(|proto| proto.kind == BTF_KIND_FUNC_PROTO)
+                .ok_or("function type is not a prototype")?;
+            let mut params = Vec::new();
+            for index in 0..(proto.info & 0xffff) as usize {
+                let name_off = read_u32(self.data, proto.extra_start + index * 8, self.endianness)?;
+                let start = name_off as usize;
+                let tail = self
+                    .strings
+                    .get(start..)
+                    .ok_or("string offset is out of bounds")?;
+                let end = tail
+                    .iter()
+                    .position(|b| *b == 0)
+                    .ok_or("unterminated string")?;
+                params.push(tail[..end].to_vec());
+            }
+            return Ok(Some(params));
         }
         Ok(None)
     }
@@ -383,6 +415,15 @@ impl TypeTable<'_> {
 
 fn parse_inode_setattr_offsets(data: &[u8]) -> Result<InodeSetattrOffsets, &'static str> {
     let table = parse_type_table(data)?;
+    // The probe reads the hook's arguments by position, for `(idmap, dentry, attr)` (kernel
+    // 6.3 and later). Before that the first argument was the dentry: reading by this layout
+    // there would take the wrong pointers, so the hook stays disabled unless the kernel's own
+    // BTF says it has this shape.
+    match table.function_params(b"bpf_lsm_inode_setattr")? {
+        Some(params) if params == [b"idmap".to_vec(), b"dentry".to_vec(), b"attr".to_vec()] => {}
+        Some(_) => return Err("inode_setattr hook arguments are not (idmap, dentry, attr)"),
+        None => return Err("kernel has no BPF-LSM inode_setattr hook"),
+    }
     let field = |strukt: &[u8], member: &[u8], missing: &'static str| {
         table.member_offset(strukt, member)?.ok_or(missing)
     };
@@ -594,8 +635,8 @@ mod tests {
     /// `dentry { d_parent; union { qstr __d_name; const qstr d_name } }`, `qstr { union { ...
     /// hash_len }; name }` and `iattr`, as the kernel lays them out (the anonymous union is what
     /// the generic lookup exists for).
-    fn setattr_btf() -> Vec<u8> {
-        let strings = b"\0int\0iattr\0ia_valid\0ia_atime\0ia_mtime\0dentry\0d_parent\0d_name\0qstr\0name\0hash_len\0".to_vec();
+    fn setattr_btf(params: &[&str]) -> Vec<u8> {
+        let strings = b"\0int\0iattr\0ia_valid\0ia_atime\0ia_mtime\0dentry\0d_parent\0d_name\0qstr\0name\0hash_len\0bpf_lsm_inode_setattr\0idmap\0attr\0extra\0".to_vec();
         let offset = |needle: &[u8]| {
             strings
                 .windows(needle.len() + 1)
@@ -648,6 +689,17 @@ mod tests {
             push_u32(1);
             push_u32(byte * 8);
         }
+        // 6: the hook's prototype, 7: bpf_lsm_inode_setattr
+        push_u32(0);
+        push_u32((BTF_KIND_FUNC_PROTO << 24) | params.len() as u32);
+        push_u32(1);
+        for param in params {
+            push_u32(offset(param.as_bytes()));
+            push_u32(1);
+        }
+        push_u32(offset(b"bpf_lsm_inode_setattr"));
+        push_u32(BTF_KIND_FUNC << 24);
+        push_u32(6);
         let mut btf = vec![0x9f, 0xeb, 1, 0];
         for value in [
             BTF_HEADER_LEN as u32,
@@ -663,10 +715,26 @@ mod tests {
         btf
     }
 
+    const CURRENT_HOOK: [&str; 3] = ["idmap", "dentry", "attr"];
+
+    #[test]
+    fn inode_setattr_is_disabled_when_the_hook_has_another_shape() {
+        // Before kernel 6.3: no idmap, the dentry is the first argument.
+        assert_eq!(
+            parse_inode_setattr_offsets(&setattr_btf(&["dentry", "attr"])),
+            Err("inode_setattr hook arguments are not (idmap, dentry, attr)")
+        );
+        assert!(parse_inode_setattr_offsets(&setattr_btf(&["idmap", "dentry", "iattr"])).is_err());
+        assert!(
+            parse_inode_setattr_offsets(&setattr_btf(&["idmap", "dentry", "attr", "extra"]))
+                .is_err()
+        );
+    }
+
     #[test]
     fn parses_inode_setattr_offsets_through_the_anonymous_union() {
         assert_eq!(
-            parse_inode_setattr_offsets(&setattr_btf()).unwrap(),
+            parse_inode_setattr_offsets(&setattr_btf(&CURRENT_HOOK)).unwrap(),
             InodeSetattrOffsets {
                 ia_valid: 0,
                 ia_atime: 32,
