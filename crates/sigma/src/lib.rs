@@ -2,9 +2,12 @@
 //!
 //! Minimal Sigma evaluation engine (<https://sigmahq.io>), migrated from
 //! `old/crates/synthaea-sigma`. Supported subset:
+//! - `logsource` `category: process_creation` (or none), with a `product` matching the rule's
+//!   platform directory; other categories and log channels are refused (#719)
 //! - `Image`, `CommandLine`, and `ParentImage` fields mapped onto [`schema::ExecEvent`]
 //!   (`ParentImage` uses the lineage field sensors fill when they can — a rule using it
-//!   simply never matches events without lineage)
+//!   simply never matches events without lineage), and on Windows rules the PE
+//!   version-resource strings `OriginalFileName`, `Company`, `Description` and `Product`
 //! - Simple `selection` conditions (implicit AND between fields, OR between values by default;
 //!   `|all` requires every listed value to match), a selection written as a list of maps (OR
 //!   between the maps, issue #982), keyword lists

@@ -102,3 +102,74 @@ fn matching_is_case_insensitive_on_the_script_text() {
     );
     assert_eq!(prompt_alerts(&event).len(), 1);
 }
+
+fn with_parent_path(cmdline: &str, parent: &str, path: Option<&str>) -> ExecEvent {
+    let mut event = osascript(cmdline, parent);
+    event.parent_image_path = path.map(Into::into);
+    event
+}
+
+#[test]
+fn an_installer_name_outside_a_system_path_is_not_an_installer() {
+    // The sensor sets `parent_comm` to the basename of the parent's path: a binary dropped as
+    // `installd` in a temp directory must not buy the installer's silence or its Low.
+    for path in [
+        "/tmp/installd",
+        "/private/tmp/installd",
+        "/Users/u/Downloads/Installer",
+    ] {
+        let name = path.rsplit('/').next().unwrap();
+        let admin = prompt_alerts(&with_parent_path(ADMIN_ONLY, name, Some(path)));
+        assert_eq!(admin.len(), 1, "{path}");
+        assert_eq!(admin[0].severity, Severity::Low, "{path}");
+        let dialog = prompt_alerts(&with_parent_path(PHISH, name, Some(path)));
+        assert_eq!(dialog.len(), 1, "{path}");
+        assert_eq!(dialog[0].severity, Severity::Medium, "{path}");
+    }
+}
+
+#[test]
+fn the_real_installer_paths_keep_the_installer_treatment() {
+    for (name, path) in [
+        ("installd", "/usr/sbin/installd"),
+        (
+            "Installer",
+            "/System/Library/CoreServices/Installer.app/Contents/MacOS/Installer",
+        ),
+        (
+            "package_script_service",
+            "/System/Library/PrivateFrameworks/PackageKit.framework/Versions/A/Resources/package_script_service",
+        ),
+    ] {
+        assert!(
+            prompt_alerts(&with_parent_path(ADMIN_ONLY, name, Some(path))).is_empty(),
+            "{path}"
+        );
+        let dialog = prompt_alerts(&with_parent_path(PHISH, name, Some(path)));
+        assert_eq!(dialog[0].severity, Severity::Low, "{path}");
+    }
+}
+
+#[test]
+fn an_unknown_parent_path_keeps_the_name_exclusion() {
+    // A sensor that cannot report the path is a limitation, not evidence of a masquerade.
+    assert!(prompt_alerts(&with_parent_path(ADMIN_ONLY, "installd", None)).is_empty());
+}
+
+#[test]
+fn extra_whitespace_does_not_defeat_the_phrases() {
+    for cmdline in [
+        "osascript -e 'display  dialog \"x\" default answer \"\" with hidden answer'",
+        "osascript -e 'display dialog \"x\" default answer \"\" with hidden\tanswer'",
+        "osascript -e 'display\t\tdialog \"x\" default answer \"\" with  hidden   answer'",
+    ] {
+        let alerts = prompt_alerts(&osascript(cmdline, "zsh"));
+        assert_eq!(alerts.len(), 1, "{cmdline}");
+        assert_eq!(alerts[0].severity, Severity::Medium, "{cmdline}");
+    }
+    let admin = osascript(
+        "osascript -e 'do   shell script \"id\" with\tadministrator  privileges'",
+        "zsh",
+    );
+    assert_eq!(prompt_alerts(&admin)[0].technique, "T1059.002");
+}

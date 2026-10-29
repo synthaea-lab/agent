@@ -346,6 +346,149 @@ detection:
     assert!(err2.to_string().contains("Windows-only"), "{err2}");
 }
 
+/// A rule with `logsource:` (and the given lines under it) and a process-creation detection.
+fn with_logsource(logsource: &str) -> SigmaRule {
+    parse_rule_yaml(&format!(
+        "title: T\ntags: [attack.t1059]\nlevel: medium\nfalsepositives: [x]\n\
+         logsource:\n{logsource}\
+         detection:\n  selection:\n    Image|endswith: '/sh'\n  condition: selection\n"
+    ))
+    .unwrap()
+}
+
+/// #719: every supported field is read from an `ExecEvent`, so a rule written for other
+/// telemetry would be evaluated against process creations — refused at load instead.
+#[test]
+fn a_logsource_other_than_process_creation_is_refused_not_evaluated_on_exec_events() {
+    for (logsource, needle) in [
+        (
+            "  category: network_connection\n",
+            "category: network_connection",
+        ),
+        (
+            "  category: image_load\n  product: linux\n",
+            "category: image_load",
+        ),
+        ("  product: linux\n  service: auditd\n", "service: auditd"),
+        (
+            "  category: process_creation\n  service: sysmon\n",
+            "service: sysmon",
+        ),
+        ("  product: linux\n", "without a `category`"),
+    ] {
+        let error = validate(&with_logsource(logsource), "<test>/linux/rule.yml")
+            .expect_err(logsource)
+            .to_string();
+        assert!(error.contains(needle), "{logsource:?}: {error}");
+    }
+}
+
+/// #719: the upstream `process_creation` shape loads, with or without `product`, as does a rule
+/// with no `logsource` (every rule shipped in `rules/sigma/`). Unknown keys such as
+/// `definition` are ignored and the category is case-insensitive.
+#[test]
+fn process_creation_loads_with_the_rule_directory_as_product() {
+    for (logsource, path) in [
+        ("  category: process_creation\n", "<test>/linux/rule.yml"),
+        (
+            "  category: process_creation\n  product: linux\n",
+            "<test>/linux/rule.yml",
+        ),
+        (
+            "  category: Process_Creation\n  product: Windows\n  definition: 'Sysmon EID 1'\n",
+            "<test>/windows/rule.yml",
+        ),
+        (
+            "  category: process_creation\n  product: macos\n",
+            "<test>/macos/rule.yml",
+        ),
+    ] {
+        validate(&with_logsource(logsource), path).unwrap_or_else(|e| panic!("{logsource:?}: {e}"));
+    }
+    let rule = with_logsource("  category: process_creation\n");
+    assert!(eval_rule_exec(&rule, &exec("/bin/sh", "sh")).is_some());
+}
+
+/// #719: a `product` names the platform the rule was written for; under another platform's
+/// directory it would run on hosts it was not written for.
+#[test]
+fn a_product_other_than_the_rule_directory_is_refused() {
+    for (product, path) in [
+        ("windows", "<test>/linux/rule.yml"),
+        ("linux", "<test>/windows/rule.yml"),
+        ("aws", "<test>/linux/rule.yml"),
+    ] {
+        let rule = with_logsource(&format!(
+            "  category: process_creation\n  product: {product}\n"
+        ));
+        let error = validate(&rule, path).expect_err(product).to_string();
+        assert!(
+            error.contains(&format!("product: {product}")),
+            "{product}: {error}"
+        );
+    }
+}
+
+/// #719: `Company`, `Description` and `Product` come from the same PE version resource as
+/// `OriginalFileName` (#983 reads all four) and map onto their `ExecEvent` fields.
+#[test]
+fn pe_version_strings_map_onto_their_exec_fields() {
+    let rule: SigmaRule = parse_rule_yaml(
+        r#"
+title: Renamed Sysinternals tool
+tags: [attack.t1036.003]
+level: high
+falsepositives: [none known]
+detection:
+  selection:
+    Company: 'Sysinternals - www.sysinternals.com'
+    Description|contains: 'process dump'
+    Product|startswith: 'ProcDump'
+  condition: selection
+"#,
+    )
+    .unwrap();
+    validate(&rule, "<test>/windows/rule.yml").unwrap();
+
+    let mut ev = exec("C:\\Users\\Public\\svc.exe", "svc.exe -ma lsass.exe");
+    assert!(
+        eval_rule_exec(&rule, &ev).is_none(),
+        "no PE info: must not match"
+    );
+    ev.company_name = Some("Sysinternals - www.sysinternals.com".into());
+    ev.file_description = Some("Sysinternals process dump utility".into());
+    ev.product_name = Some("ProcDump".into());
+    assert!(eval_rule_exec(&rule, &ev).is_some());
+    // Each field is read from its own source: the AND fails when one of them is missing.
+    ev.file_description = None;
+    assert!(eval_rule_exec(&rule, &ev).is_none());
+}
+
+/// #719: like `OriginalFileName`, the other PE version strings would never match on Linux or
+/// macOS.
+#[test]
+fn pe_version_strings_are_refused_outside_windows() {
+    for field in ["Company", "Description", "Product"] {
+        let rule = unvalidated_field_rule(field, "'x'");
+        for path in ["<test>/linux/rule.yml", "<test>/macos/rule.yml"] {
+            let error = validate(&rule, path).expect_err(field).to_string();
+            assert!(error.contains("Windows-only"), "{field} {path}: {error}");
+        }
+    }
+}
+
+/// The Windows-only check reads the rule's platform directory, the innermost one, not any
+/// `windows` word in its path: a Linux rule kept under a `windows` checkout is a Linux rule.
+#[test]
+fn a_windows_word_above_the_platform_directory_does_not_make_a_rule_windows() {
+    let rule = unvalidated_field_rule("OriginalFileName", "'cmd.exe'");
+    let error = validate(&rule, "/srv/windows/rules/sigma/linux/rule.yml")
+        .expect_err("a Linux rule")
+        .to_string();
+    assert!(error.contains("Windows-only"), "{error}");
+    validate(&rule, "/srv/linux/rules/sigma/windows/rule.yml").unwrap();
+}
+
 #[test]
 fn empty_selection_is_rejected_not_match_everything() {
     // Review finding: `selection: {}` matched EVERY event (vacuous all()).
@@ -706,12 +849,16 @@ fn field_names_and_modifiers_that_differ_only_by_case_are_refused() {
 }
 
 fn field_rule(field: &str, values_yaml: &str) -> SigmaRule {
+    let rule = unvalidated_field_rule(field, values_yaml);
+    validate(&rule, "<test>/linux/rule.yml").unwrap();
+    rule
+}
+
+fn unvalidated_field_rule(field: &str, values_yaml: &str) -> SigmaRule {
     let yaml = format!(
         "title: Modifier test\ntags: [attack.t1059]\nlevel: medium\nfalsepositives: [none]\ndetection:\n  selection:\n    {field}: {values_yaml}\n  condition: selection\n"
     );
-    let rule: SigmaRule = parse_rule_yaml(&yaml).unwrap();
-    validate(&rule, "<test>/linux/rule.yml").unwrap();
-    rule
+    parse_rule_yaml(&yaml).unwrap()
 }
 
 #[test]

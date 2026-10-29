@@ -77,6 +77,24 @@ fn a_platform_word_in_the_content_root_does_not_change_a_rules_platform() {
     }
 }
 
+/// The Windows-only PE fields (`OriginalFileName`, #983) are checked against the same platform:
+/// a `windows` content root does not let a Linux rule use one, which would never match there.
+#[test]
+fn a_windows_content_root_does_not_let_a_linux_rule_use_a_windows_only_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("windows").join("rules").join("sigma");
+    let pe_rule = rule("pe-rule").replace("Image|endswith: '/x'", "OriginalFileName: 'cmd.exe'");
+    for relative in ["linux/pe.yml", "windows/pe.yml"] {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, &pe_rule).unwrap();
+    }
+    let linux = SigmaEngine::load_dir_for(&root, Platform::Linux).unwrap();
+    assert_eq!(linux.rule_count(), 0);
+    let windows = SigmaEngine::load_dir_for(&root, Platform::Windows).unwrap();
+    assert_eq!(titles(&windows), ["pe-rule"]);
+}
+
 #[test]
 fn rules_nested_below_the_platform_directory_load() {
     let dir = tempfile::tempdir().unwrap();

@@ -293,19 +293,7 @@ fn record_detection(
     let now_ns = event.meta().timestamp_ns;
     // Rules and Sigma have already evaluated the raw event/message. Redact only
     // the copy that enters the verdict, alert log, and durable detection spool.
-    let safe_message = if let Some(Event::Exec(exec)) = std::iter::once(event)
-        .chain(evidence.iter())
-        .find(|e| matches!(e, Event::Exec(_)))
-    {
-        let mut safe_exec = Event::Exec(exec.clone());
-        crate::redact::redact_event(&mut safe_exec);
-        let Event::Exec(safe_exec) = safe_exec else {
-            unreachable!()
-        };
-        redact_detection_message(&exec.cmdline, &safe_exec.cmdline, finding.message)
-    } else {
-        finding.message.to_owned()
-    };
+    let safe_message = safe_detection_message(event, &evidence, finding.message);
     let mut safe_events: Vec<Event> = std::iter::once(event.clone()).chain(evidence).collect();
     for event in &mut safe_events {
         crate::redact::redact_event(event);
@@ -335,6 +323,28 @@ fn record_detection(
         persist(detection);
     }
     result
+}
+
+/// A detection's message as it may leave the process: the command text a rule quoted from
+/// the event (an Exec command line, an AMSI excerpt, #895) swapped for its redacted copy.
+fn safe_detection_message(event: &Event, evidence: &[Event], message: &str) -> String {
+    let mut related = std::iter::once(event).chain(evidence.iter());
+    let Some(source) = related.find(|e| matches!(e, Event::Exec(_) | Event::AmsiContent(_))) else {
+        return message.to_owned();
+    };
+    let mut safe = source.clone();
+    crate::redact::redact_event(&mut safe);
+    match (source, &safe) {
+        (Event::Exec(raw), Event::Exec(safe)) => {
+            redact_detection_message(&raw.cmdline, &safe.cmdline, message)
+        }
+        (Event::AmsiContent(raw), Event::AmsiContent(safe)) => redact_detection_message(
+            &rules::amsi_excerpt(raw.text.as_deref()),
+            &rules::amsi_excerpt(safe.text.as_deref()),
+            message,
+        ),
+        _ => message.to_owned(),
+    }
 }
 
 fn redact_detection_message(raw_cmdline: &str, safe_cmdline: &str, message: &str) -> String {
@@ -2748,6 +2758,56 @@ mod tests {
                 .contains("base64 -d --password=REDACTED")),
             "{detections:?}"
         );
+        for queued in &detections {
+            let serialized = serde_json::to_string(&queued.detection).unwrap();
+            assert!(!serialized.contains("S3cret"), "{serialized}");
+        }
+    }
+
+    /// #895: the AMSI rule reads the raw buffer and quotes an excerpt of it in its message;
+    /// the alert log, the detection spool and `events.jsonl` get the redacted excerpt.
+    #[test]
+    fn amsi_rules_see_the_raw_buffer_but_alert_and_event_outputs_are_redacted() {
+        let dir = tmp("amsi-redaction-e2e");
+        let spool = Arc::new(Mutex::new(
+            store::EventSpool::open(&dir.join("detection-spool"), u64::MAX).unwrap(),
+        ));
+        let sink = Arc::new(
+            DetectionSink::new(
+                rules::RuleState::new(),
+                &dir.join("alerts.ndjson"),
+                Some(&dir.join("events.jsonl")),
+                None,
+                Some(Arc::clone(&spool)),
+                &dir.join("content"),
+                &dir.join("ml-registry"),
+            )
+            .unwrap(),
+        );
+        let amsi = schema::AmsiContentEvent {
+            app_name: "PowerShell_C:\\Windows\\powershell.exe_10.0".into(),
+            text: Some("New-LocalUser -Name svc -Password 'S3cret'".into()),
+            // AMSI_RESULT_DETECTED: the provider-verdict rule fires whatever the text says.
+            scan_result: 32768,
+            ..schema::fixtures::amsi_content()
+        };
+        let raw_alerts = rules::evaluate_amsi_content(&amsi);
+        assert!(
+            raw_alerts.iter().any(|a| a.message.contains("S3cret")),
+            "the rule quotes the raw buffer: {raw_alerts:?}"
+        );
+        sink.on_event(Event::AmsiContent(amsi));
+        assert!(sink.enrich_queue.flush(std::time::Duration::from_secs(2)));
+
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("-Password 'REDACTED'"), "{alerts}");
+        assert!(!alerts.contains("S3cret"), "{alerts}");
+        let events = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        assert!(events.contains("-Password 'REDACTED'"), "{events}");
+        assert!(!events.contains("S3cret"), "{events}");
+        let detections: Vec<transport::QueuedDetection> =
+            spool.lock().unwrap().drain_oldest().unwrap();
+        assert!(!detections.is_empty());
         for queued in &detections {
             let serialized = serde_json::to_string(&queued.detection).unwrap();
             assert!(!serialized.contains("S3cret"), "{serialized}");

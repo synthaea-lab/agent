@@ -239,11 +239,11 @@ fn etw_failure_hint(error: &str) -> &'static str {
 fn run_windows_sensors(
     sink: Box<dyn EventSink>,
     silence: Option<&Mutex<SilenceMonitor>>,
-    redact_exec: bool,
+    redact_commands: bool,
 ) -> anyhow::Result<()> {
     // Run and both capture commands funnel through here, so this is the one
     // place credential redaction has to sit in front of (#440).
-    let sink = crate::redact::redacting(sink, redact_exec);
+    let sink = crate::redact::redacting(sink, redact_commands);
 
     let mut etw_sensor = sensor_windows::WindowsSensor::new();
     let etw_stop = etw_sensor.stop_handle();
@@ -465,6 +465,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         alerts,
         events,
         storage,
+        alert_details,
         enable_kill: _,
         enable_quarantine: _,
         // uprobes are a Linux mechanism — the capture flags are accepted for CLI
@@ -488,6 +489,9 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         content_dir,
         storage,
     )?;
+    // #319. Set before any sensor starts; the one alert `wire_run_pipeline` can raise
+    // itself (UPLOAD-DISABLED) is the agent's own text, not an event's.
+    pipeline.sink.alert_log().set_stderr_details(alert_details);
     super::common::plant_canaries(
         &pipeline.sink,
         deception,

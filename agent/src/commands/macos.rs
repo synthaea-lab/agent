@@ -193,10 +193,10 @@ fn spawn_network_extension_receiver(sink: Arc<dyn EventSink>) {
 /// Runs the ES sensor (blocking, on the calling thread), the unified-log
 /// tail, and the `NetworkExtension` receiver (background threads) against the
 /// same sink, with Ctrl-C wired to stop the lot.
-fn run_macos_sensors(sink: Box<dyn EventSink>, redact_exec: bool) -> anyhow::Result<()> {
+fn run_macos_sensors(sink: Box<dyn EventSink>, redact_commands: bool) -> anyhow::Result<()> {
     // Run and both capture commands funnel through here, so this is the one
     // place credential redaction has to sit in front of (#440).
-    let sink = crate::redact::redacting(sink, redact_exec);
+    let sink = crate::redact::redacting(sink, redact_commands);
 
     let mut sensor = sensor_macos::MacosSensor::new();
     let stop = sensor.stop_handle();
@@ -247,6 +247,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         alerts,
         events,
         storage,
+        alert_details,
         enable_kill: _,
         enable_quarantine: _,
         enable_tls_capture: _,
@@ -268,6 +269,9 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         content_dir,
         storage,
     )?;
+    // #319. Set before any sensor starts; the one alert `wire_run_pipeline` can raise
+    // itself (UPLOAD-DISABLED) is the agent's own text, not an event's.
+    pipeline.sink.alert_log().set_stderr_details(alert_details);
     super::common::plant_canaries(
         &pipeline.sink,
         deception,

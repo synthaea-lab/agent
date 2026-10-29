@@ -49,6 +49,9 @@ struct Haystacks<'a> {
     cmdline: OnceCell<String>,
     parent_image: OnceCell<Option<String>>,
     original_file_name: OnceCell<Option<String>>,
+    company: OnceCell<Option<String>>,
+    description: OnceCell<Option<String>>,
+    product: OnceCell<Option<String>>,
 }
 
 impl<'a> Haystacks<'a> {
@@ -59,46 +62,45 @@ impl<'a> Haystacks<'a> {
             cmdline: OnceCell::new(),
             parent_image: OnceCell::new(),
             original_file_name: OnceCell::new(),
+            company: OnceCell::new(),
+            description: OnceCell::new(),
+            product: OnceCell::new(),
         }
     }
 
     /// The lowercased value of a supported field; `None` for `ParentImage` when the sensor
-    /// provided no lineage, for `OriginalFileName` when enrichment found none (no PE version
-    /// resource, parse failure, or the image was over `enrich`'s size budget — #983), and for
-    /// a field no validated rule uses.
+    /// provided no lineage, for the PE version-resource fields (`OriginalFileName`, `Company`,
+    /// `Description`, `Product`) when enrichment found none (no PE version resource, parse
+    /// failure, or the image was over `enrich`'s size budget — #983), and for a field no
+    /// validated rule uses.
     fn get(&self, field: &str) -> Option<&str> {
+        let event = self.event;
         if field.eq_ignore_ascii_case("image") {
-            Some(
-                self.image
-                    .get_or_init(|| self.event.image_path.to_lowercase()),
-            )
+            Some(self.image.get_or_init(|| event.image_path.to_lowercase()))
         } else if field.eq_ignore_ascii_case("commandline") {
-            Some(
-                self.cmdline
-                    .get_or_init(|| self.event.cmdline.to_lowercase()),
-            )
+            Some(self.cmdline.get_or_init(|| event.cmdline.to_lowercase()))
         } else if field.eq_ignore_ascii_case("parentimage") {
-            self.parent_image
-                .get_or_init(|| {
-                    self.event
-                        .parent_image_path
-                        .as_deref()
-                        .map(str::to_lowercase)
-                })
-                .as_deref()
+            lowered(&self.parent_image, event.parent_image_path.as_deref())
         } else if field.eq_ignore_ascii_case("originalfilename") {
-            self.original_file_name
-                .get_or_init(|| {
-                    self.event
-                        .original_file_name
-                        .as_deref()
-                        .map(str::to_lowercase)
-                })
-                .as_deref()
+            lowered(
+                &self.original_file_name,
+                event.original_file_name.as_deref(),
+            )
+        } else if field.eq_ignore_ascii_case("company") {
+            lowered(&self.company, event.company_name.as_deref())
+        } else if field.eq_ignore_ascii_case("description") {
+            lowered(&self.description, event.file_description.as_deref())
+        } else if field.eq_ignore_ascii_case("product") {
+            lowered(&self.product, event.product_name.as_deref())
         } else {
             None
         }
     }
+}
+
+/// `value` lowercased, made once into `cell`.
+fn lowered<'c>(cell: &'c OnceCell<Option<String>>, value: Option<&str>) -> Option<&'c str> {
+    cell.get_or_init(|| value.map(str::to_lowercase)).as_deref()
 }
 
 /// Evaluates a selection against an `ExecEvent`.

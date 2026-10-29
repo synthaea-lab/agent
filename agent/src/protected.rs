@@ -1,6 +1,8 @@
 //! Protected-resource monitoring (issue #71, capability 3): the agent watches its own
-//! on-disk footprint through the live event stream, and treats a write-intent open of
-//! one of those paths by any process other than itself as a high-severity detection.
+//! on-disk footprint through the live event stream, and treats a write-intent open, a
+//! delete, or a rename (on either side — the resource moved away, or something else
+//! moved onto its path) of one of those paths by any process other than itself as a
+//! high-severity detection.
 //!
 //! Scope is deliberately limited to paths this agent process can know for certain at
 //! its own runtime: its own executable (`std::env::current_exe`), its config file
@@ -12,9 +14,7 @@
 //! (`watchdog/src/service/linux.rs`), and naming them here would mean either guessing
 //! the packaging layout or a cross-binary dependency, neither of which this pass takes
 //! on; `watchdog::tamper` (#103) already covers that surface from the install/supervise
-//! side. True deletion is also out of scope: `FileOpenEvent` only observes `open(2)`,
-//! so this catches a foreign write, truncate, or overwrite, not a foreign `rm`/`rename`
-//! — both gaps stay tracked by issue #71 rather than being silently implied as covered.
+//! side.
 //!
 //! ## No `updater` allowlist (and why one line of #71 is stale)
 //!
@@ -85,9 +85,11 @@ fn absolute_or_given(path: &Path) -> PathBuf {
 }
 
 /// Wraps an inner [`EventSink`]: every event is forwarded unchanged, but a
-/// [`Event::FileOpen`] is first checked against `protected` — a write-intent open of
-/// one of those paths from any pid other than this process's own fires a real alert
-/// through `sink`, the same `alerts.ndjson` path a rule/correlator/Sigma finding uses.
+/// [`Event::FileOpen`], [`Event::FileDelete`], or [`Event::FileRename`] touching one
+/// of `protected`'s paths from any pid other than this process's own fires a real
+/// alert through `sink`, the same `alerts.ndjson` path a rule/correlator/Sigma
+/// finding uses — a write-intent open, an outright delete, or a rename on either
+/// side (the resource moved away, or some other file swapped in at its path).
 pub(crate) struct ProtectedResourceGuard<S> {
     inner: S,
     own_pid: u32,
@@ -121,6 +123,38 @@ impl<S: EventSink> EventSink for ProtectedResourceGuard<S> {
                 &format!(
                     "pid {} (`{}`) opened protected agent resource {} for write",
                     open.meta.pid, open.meta.comm, open.path
+                ),
+            );
+        } else if let Event::FileDelete(ref del) = event
+            && del.meta.pid != self.own_pid
+            && self
+                .protected
+                .iter()
+                .any(|p| matches_protected(p, &del.path))
+        {
+            self.sink.emit(
+                "T1562",
+                &format!(
+                    "pid {} (`{}`) deleted protected agent resource {}",
+                    del.meta.pid, del.meta.comm, del.path
+                ),
+            );
+        } else if let Event::FileRename(ref ren) = event
+            && ren.meta.pid != self.own_pid
+            && (self
+                .protected
+                .iter()
+                .any(|p| matches_protected(p, &ren.old_path))
+                || self
+                    .protected
+                    .iter()
+                    .any(|p| matches_protected(p, &ren.new_path)))
+        {
+            self.sink.emit(
+                "T1562",
+                &format!(
+                    "pid {} (`{}`) renamed protected agent resource {} -> {}",
+                    ren.meta.pid, ren.meta.comm, ren.old_path, ren.new_path
                 ),
             );
         }
@@ -161,6 +195,32 @@ mod tests {
             },
             path: path.to_string(),
             flags,
+        })
+    }
+
+    fn delete_event(pid: u32, comm: &str, path: &str) -> Event {
+        Event::FileDelete(schema::FileDeleteEvent {
+            meta: schema::EventMeta {
+                pid,
+                ppid: 1,
+                comm: comm.to_string(),
+                ..schema::fixtures::meta()
+            },
+            path: path.to_string(),
+        })
+    }
+
+    fn rename_event(pid: u32, comm: &str, old_path: &str, new_path: &str) -> Event {
+        Event::FileRename(schema::FileRenameEvent {
+            meta: schema::EventMeta {
+                pid,
+                ppid: 1,
+                comm: comm.to_string(),
+                ..schema::fixtures::meta()
+            },
+            old_path: old_path.to_string(),
+            new_path: new_path.to_string(),
+            executable_path: None,
         })
     }
 
@@ -327,6 +387,173 @@ mod tests {
         assert!(
             written.contains("T1562"),
             "expected a T1562 alert for the config write, got: {written}"
+        );
+
+        let _ = std::fs::remove_dir_all(&alerts_dir);
+    }
+
+    #[test]
+    fn a_foreign_delete_of_a_protected_path_fires_an_alert() {
+        // The other half of the gap `FileOpenEvent` alone left uncovered: `open(2)`
+        // never sees an outright `unlink`/`rm`, only a write/truncate/overwrite.
+        let forwarded = Arc::new(AtomicUsize::new(0));
+        let alerts_dir =
+            std::env::temp_dir().join(format!("protected-test-delete-{}", std::process::id()));
+        std::fs::create_dir_all(&alerts_dir).unwrap();
+        let alerts = alerts_dir.join("alerts.ndjson");
+        let events = alerts_dir.join("events.jsonl");
+        let sink = Arc::new(
+            DetectionSink::new(
+                rules::RuleState::new(),
+                &alerts,
+                Some(&events),
+                None,
+                None,
+                &alerts_dir.join("content"),
+                &alerts_dir.join("ml-registry"),
+            )
+            .unwrap(),
+        );
+
+        let guard = ProtectedResourceGuard::new(
+            CountingSink(forwarded.clone()),
+            protected_paths(&alerts, Some(&events), config()),
+            sink,
+        );
+
+        guard.on_event(delete_event(9999, "evil", "alerts.ndjson"));
+
+        assert_eq!(
+            forwarded.load(Ordering::Relaxed),
+            1,
+            "must still forward the event"
+        );
+        let written = std::fs::read_to_string(&alerts).unwrap();
+        assert!(
+            written.contains("T1562"),
+            "expected a T1562 alert for the delete, got: {written}"
+        );
+
+        let _ = std::fs::remove_dir_all(&alerts_dir);
+    }
+
+    #[test]
+    fn a_foreign_rename_away_from_a_protected_path_fires_an_alert() {
+        let forwarded = Arc::new(AtomicUsize::new(0));
+        let alerts_dir =
+            std::env::temp_dir().join(format!("protected-test-rename-away-{}", std::process::id()));
+        std::fs::create_dir_all(&alerts_dir).unwrap();
+        let alerts = alerts_dir.join("alerts.ndjson");
+        let events = alerts_dir.join("events.jsonl");
+        let sink = Arc::new(
+            DetectionSink::new(
+                rules::RuleState::new(),
+                &alerts,
+                Some(&events),
+                None,
+                None,
+                &alerts_dir.join("content"),
+                &alerts_dir.join("ml-registry"),
+            )
+            .unwrap(),
+        );
+
+        let guard = ProtectedResourceGuard::new(
+            CountingSink(forwarded.clone()),
+            protected_paths(&alerts, Some(&events), config()),
+            sink,
+        );
+
+        guard.on_event(rename_event(9999, "evil", "agent.toml", "agent.toml.bak"));
+
+        let written = std::fs::read_to_string(&alerts).unwrap();
+        assert!(
+            written.contains("T1562"),
+            "expected a T1562 alert for the config moved away, got: {written}"
+        );
+
+        let _ = std::fs::remove_dir_all(&alerts_dir);
+    }
+
+    #[test]
+    fn a_foreign_rename_onto_a_protected_path_fires_an_alert() {
+        // The other side of a rename: something else swapped in at the protected
+        // path's name, not the protected resource itself moving away.
+        let forwarded = Arc::new(AtomicUsize::new(0));
+        let alerts_dir =
+            std::env::temp_dir().join(format!("protected-test-rename-onto-{}", std::process::id()));
+        std::fs::create_dir_all(&alerts_dir).unwrap();
+        let alerts = alerts_dir.join("alerts.ndjson");
+        let events = alerts_dir.join("events.jsonl");
+        let sink = Arc::new(
+            DetectionSink::new(
+                rules::RuleState::new(),
+                &alerts,
+                Some(&events),
+                None,
+                None,
+                &alerts_dir.join("content"),
+                &alerts_dir.join("ml-registry"),
+            )
+            .unwrap(),
+        );
+
+        let guard = ProtectedResourceGuard::new(
+            CountingSink(forwarded.clone()),
+            protected_paths(&alerts, Some(&events), config()),
+            sink,
+        );
+
+        guard.on_event(rename_event(9999, "evil", "rogue.toml", "agent.toml"));
+
+        let written = std::fs::read_to_string(&alerts).unwrap();
+        assert!(
+            written.contains("T1562"),
+            "expected a T1562 alert for the swap onto the config path, got: {written}"
+        );
+
+        let _ = std::fs::remove_dir_all(&alerts_dir);
+    }
+
+    #[test]
+    fn own_deletes_and_renames_never_alert() {
+        let forwarded = Arc::new(AtomicUsize::new(0));
+        let alerts_dir =
+            std::env::temp_dir().join(format!("protected-test-self-dr-{}", std::process::id()));
+        std::fs::create_dir_all(&alerts_dir).unwrap();
+        let alerts = alerts_dir.join("alerts.ndjson");
+        let events = alerts_dir.join("events.jsonl");
+        let sink = Arc::new(
+            DetectionSink::new(
+                rules::RuleState::new(),
+                &alerts,
+                Some(&events),
+                None,
+                None,
+                &alerts_dir.join("content"),
+                &alerts_dir.join("ml-registry"),
+            )
+            .unwrap(),
+        );
+
+        let guard = ProtectedResourceGuard::new(
+            CountingSink(forwarded.clone()),
+            protected_paths(&alerts, Some(&events), config()),
+            sink,
+        );
+
+        guard.on_event(delete_event(std::process::id(), "agent", "alerts.ndjson"));
+        guard.on_event(rename_event(
+            std::process::id(),
+            "agent",
+            "agent.toml",
+            "agent.toml.bak",
+        ));
+
+        let written = std::fs::read_to_string(&alerts).unwrap();
+        assert!(
+            !written.contains("T1562"),
+            "must not alert on its own deletes/renames, got: {written}"
         );
 
         let _ = std::fs::remove_dir_all(&alerts_dir);

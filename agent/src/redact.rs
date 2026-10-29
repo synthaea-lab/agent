@@ -3,8 +3,9 @@
 //! `FileQuarantine`'s `origin_url`/`referrer_url`, a `BitsJob`'s `url` (#284), and an
 //! `HttpRequest`'s evidence value (#478, ADR-0022 §4) are redacted here before any
 //! consumer sees the event — see [`redact_event`]'s doc for exactly what each path
-//! covers. `Exec` command lines/argv (#705, ADR-0034) go through the same boundary,
-//! via the pure functions in `crates/redact`; [`RedactingSink::redact_exec`] controls
+//! covers. `Exec` command lines/argv (#705, ADR-0034) and the command text of `ReadlineInput`,
+//! `ScriptBlock`, `AmsiContent` and `WmiActivity` (#895) go through the same boundary,
+//! via the pure functions in `crates/redact`; [`RedactingSink::redact_commands`] controls
 //! whether a given sink sees them raw (live detection pipelines) or redacted
 //! (capture/output paths).
 
@@ -13,33 +14,48 @@
 use std::sync::Arc;
 
 pub(crate) use redact::{
-    REDACTED, is_secret_key, redact_argv, redact_command_line, redact_url_secrets,
+    CommandDialect, REDACTED, is_secret_key, redact_argv, redact_command_line, redact_command_text,
+    redact_url_secrets,
 };
 use schema::{Event, sensor::EventSink};
 
-/// Redacts output copies while allowing live detection pipelines to inspect raw Exec events.
+/// Redacts output copies while allowing live detection pipelines to inspect raw command
+/// events ([`carries_command_text`]).
 pub(crate) struct RedactingSink<S> {
     pub(crate) inner: S,
-    pub(crate) redact_exec: bool,
+    pub(crate) redact_commands: bool,
 }
 
 impl<S: EventSink> EventSink for RedactingSink<S> {
     fn on_event(&self, mut event: Event) {
-        // Exec command lines must remain raw until rules, Sigma and correlation
-        // have consumed them. Output copies are scrubbed at their own sink boundary.
-        if self.redact_exec || !matches!(event, Event::Exec(_)) {
+        // Command text must remain raw until rules, Sigma and correlation have
+        // consumed it. Output copies are scrubbed at their own sink boundary.
+        if self.redact_commands || !carries_command_text(&event) {
             redact_event(&mut event);
         }
         self.inner.on_event(event);
     }
 }
 
+/// Events whose command text detection reads raw (ADR-0034): a live pipeline must not
+/// redact them before the rules run, only the copies that leave the process.
+fn carries_command_text(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Exec(_)
+            | Event::ReadlineInput(_)
+            | Event::ScriptBlock(_)
+            | Event::AmsiContent(_)
+            | Event::WmiActivity(_)
+    )
+}
+
 /// Puts a [`RedactingSink`] in front of a sensor sink used by run or capture commands.
-/// Capture callers set `redact_exec`; live detection pipelines leave Exec events raw.
-pub(crate) fn redacting(sink: Box<dyn EventSink>, redact_exec: bool) -> Arc<dyn EventSink> {
+/// Capture callers set `redact_commands`; live detection pipelines leave command events raw.
+pub(crate) fn redacting(sink: Box<dyn EventSink>, redact_commands: bool) -> Arc<dyn EventSink> {
     Arc::new(RedactingSink {
         inner: Arc::<dyn EventSink>::from(sink),
-        redact_exec,
+        redact_commands,
     })
 }
 
@@ -89,7 +105,43 @@ pub(crate) fn redact_event(event: &mut Event) {
                 exec.cmdline = exec.argv.join(" ");
             }
         }
+        Event::ReadlineInput(readline) => {
+            readline.input =
+                redact_command_text(&readline.input, CommandDialect::Posix).into_owned();
+        }
+        Event::ScriptBlock(block) => {
+            block.text = redact_command_text(&block.text, CommandDialect::PowerShell).into_owned();
+        }
+        Event::AmsiContent(amsi) => {
+            if let Some(text) = &mut amsi.text {
+                *text = redact_command_text(text, amsi_dialect(&amsi.app_name)).into_owned();
+            }
+            if let Some(name) = &mut amsi.content_name
+                && name.contains("://")
+            {
+                *name = redact_url_secrets(name);
+            }
+        }
+        Event::WmiActivity(wmi) => {
+            if let Some(query) = &mut wmi.query {
+                *query = redact_command_text(query, CommandDialect::Opaque).into_owned();
+            }
+        }
         _ => {}
+    }
+}
+
+/// The language of an AMSI buffer, from the runtime that asked for the scan:
+/// `PowerShell_C:\…\powershell.exe_10.0…` is `PowerShell`; `VBScript`, `JScript`, VBA and
+/// .NET content is not parsed ([`CommandDialect::Opaque`]).
+fn amsi_dialect(app_name: &str) -> CommandDialect {
+    if app_name
+        .get(..10)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("powershell"))
+    {
+        CommandDialect::PowerShell
+    } else {
+        CommandDialect::Opaque
     }
 }
 
@@ -121,7 +173,7 @@ mod tests {
     fn the_sink_redacts_both_quarantine_urls_before_forwarding() {
         let sink = RedactingSink {
             inner: Recorder::default(),
-            redact_exec: true,
+            redact_commands: true,
         };
         sink.on_event(Event::FileQuarantine(schema::FileQuarantineEvent {
             origin_url: Some("https://h/x.exe?token=abc".into()),
@@ -149,7 +201,7 @@ mod tests {
         };
         let sink = RedactingSink {
             inner: Recorder::default(),
-            redact_exec: true,
+            redact_commands: true,
         };
         sink.on_event(Event::BitsJob(job.clone()));
         let events = sink.inner.0.lock().unwrap();
@@ -173,7 +225,7 @@ mod tests {
     fn the_sink_leaves_other_events_untouched() {
         let sink = RedactingSink {
             inner: Recorder::default(),
-            redact_exec: true,
+            redact_commands: true,
         };
         // Connect events carry no command-line field, so this boundary leaves them intact.
         let connect = Event::Connect(schema::fixtures::connect());
@@ -264,6 +316,120 @@ mod tests {
             };
             assert!(!header.cmdline.contains("S3cret"), "{}", header.cmdline);
         }
+    }
+
+    /// The four command-text events (#895), each holding `S3cret` in its command text.
+    fn command_text_events() -> Vec<Event> {
+        vec![
+            Event::ReadlineInput(schema::ReadlineInputEvent {
+                input: "export DB_PASSWORD=S3cret; mysql -pS3cret prod".into(),
+                ..schema::fixtures::readline_input()
+            }),
+            Event::ScriptBlock(schema::ScriptBlockEvent {
+                script_block_id: "{6f1d}".into(),
+                path: Some(r"C:\ops\deploy.ps1".into()),
+                text: "$pw = ConvertTo-SecureString 'S3cret' -AsPlainText -Force\nnet use \\\\fs\\c$ S3cret /user:ops".into(),
+                message_number: 1,
+                message_total: 1,
+                ..schema::fixtures::script_block()
+            }),
+            Event::AmsiContent(schema::AmsiContentEvent {
+                app_name: r"PowerShell_C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe_10.0".into(),
+                content_name: Some("https://u:S3cret@h/s.ps1?token=S3cret".into()),
+                text: Some("New-LocalUser -Name svc -Password 'S3cret'".into()),
+                content_hash: "ab".repeat(32),
+                ..schema::fixtures::amsi_content()
+            }),
+            Event::WmiActivity(schema::WmiActivityEvent {
+                namespace: r"ROOT\CIMv2".into(),
+                query: Some("SELECT * FROM X WHERE Url = 'https://u:S3cret@h/'".into()),
+                ..schema::fixtures::wmi_activity()
+            }),
+        ]
+    }
+
+    /// Everything but the command text, so a test can check nothing else moved.
+    fn without_command_text(event: &Event) -> Event {
+        let mut event = event.clone();
+        match &mut event {
+            Event::ReadlineInput(e) => e.input.clear(),
+            Event::ScriptBlock(e) => e.text.clear(),
+            Event::AmsiContent(e) => {
+                e.text = None;
+                e.content_name = None;
+            }
+            Event::WmiActivity(e) => e.query = None,
+            _ => {}
+        }
+        event
+    }
+
+    #[test]
+    fn the_output_wrapper_redacts_command_text_and_keeps_the_rest_of_the_evidence() {
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let sink = redacting(Box::new(SharedRecorder(Arc::clone(&records))), true);
+        let raw = command_text_events();
+        for event in raw.clone() {
+            sink.on_event(event);
+        }
+        let written = records.lock().unwrap();
+        assert_eq!(written.len(), raw.len());
+        for (raw, written) in raw.iter().zip(written.iter()) {
+            let json = serde_json::to_string(written).unwrap();
+            assert!(!json.contains("S3cret"), "{json}");
+            assert!(json.contains(REDACTED), "{json}");
+            assert_eq!(without_command_text(written), without_command_text(raw));
+        }
+        let [
+            Event::ReadlineInput(readline),
+            Event::ScriptBlock(block),
+            Event::AmsiContent(amsi),
+            _,
+        ] = written.as_slice()
+        else {
+            panic!("{written:?}");
+        };
+        assert_eq!(
+            readline.input,
+            "export DB_PASSWORD=REDACTED; mysql -pREDACTED prod"
+        );
+        assert!(
+            block.text.contains("net use \\\\fs\\c$ REDACTED /user:ops"),
+            "{}",
+            block.text
+        );
+        assert_eq!(
+            amsi.text.as_deref(),
+            Some("New-LocalUser -Name svc -Password 'REDACTED'")
+        );
+    }
+
+    #[test]
+    fn a_live_pipeline_hands_command_text_to_detection_raw() {
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let sink = redacting(Box::new(SharedRecorder(Arc::clone(&records))), false);
+        let raw = command_text_events();
+        for event in raw.clone() {
+            sink.on_event(event);
+        }
+        assert_eq!(*records.lock().unwrap(), raw);
+    }
+
+    #[test]
+    fn non_powershell_amsi_content_only_loses_tool_independent_secrets() {
+        let mut event = Event::AmsiContent(schema::AmsiContentEvent {
+            app_name: "JScript".into(),
+            text: Some("x.open('GET', 'https://u:S3cret@h/'); var Password = 'kept'".into()),
+            ..schema::fixtures::amsi_content()
+        });
+        redact_event(&mut event);
+        let Event::AmsiContent(amsi) = event else {
+            unreachable!()
+        };
+        assert_eq!(
+            amsi.text.as_deref(),
+            Some("x.open('GET', 'https://REDACTED@h/'); var Password = 'kept'")
+        );
     }
 
     fn http_request_with(param: &str, value: &str) -> Event {

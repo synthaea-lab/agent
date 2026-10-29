@@ -2,6 +2,10 @@
 
 use std::borrow::Cow;
 
+mod text;
+
+pub use text::{CommandDialect, redact_command_text};
+
 /// Replacement marker used for every recognized secret value.
 pub const REDACTED: &str = "REDACTED";
 
@@ -35,7 +39,17 @@ const SECRET_KEY_SUFFIXES: &[&str] = &["key", "keyid", "auth"];
 /// boundaries (ADR-0034). Unsupported positional/encoded forms are documented there.
 #[must_use]
 pub fn redact_command_line<'a>(image: &str, cmdline: &'a str) -> Cow<'a, str> {
-    redact_command_line_inner(image, cmdline, 0, 0)
+    redact_command_line_inner(image, cmdline, 0, 0, redacted_keeping_quotes)
+}
+
+/// [`redact_command_line`] with the function that writes a redacted value: free command
+/// text (`text`) also keeps escape characters, whose dialect a command line does not have.
+fn redact_command_line_with<'a>(
+    image: &str,
+    cmdline: &'a str,
+    redacted: fn(&str) -> String,
+) -> Cow<'a, str> {
+    redact_command_line_inner(image, cmdline, 0, 0, redacted)
 }
 
 fn redact_command_line_inner<'a>(
@@ -43,6 +57,7 @@ fn redact_command_line_inner<'a>(
     cmdline: &'a str,
     shell_depth: u8,
     wrapper_depth: u8,
+    redacted: fn(&str) -> String,
 ) -> Cow<'a, str> {
     let tool = image_name(image);
     let tokens = token_ranges(cmdline, uses_windows_quotes(image));
@@ -72,6 +87,7 @@ fn redact_command_line_inner<'a>(
                 inner,
                 shell_depth + u8::from(is_shell),
                 wrapper_depth + 1,
+                redacted,
             )
             .into_owned();
             if safe != inner {
@@ -190,7 +206,7 @@ fn redact_command_line_inner<'a>(
         if original.contains("://") {
             out.push_str(&redact_url_secrets(original));
         } else {
-            out.push_str(&redacted_keeping_quotes(original));
+            out.push_str(&redacted(original));
         }
         cursor = end;
     }

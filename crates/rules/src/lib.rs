@@ -35,7 +35,7 @@ mod stateless;
 mod sudo;
 
 // AMSI content rules (#282): the dispatcher for `AmsiContent` events.
-pub use amsi::evaluate_amsi_content;
+pub use amsi::{evaluate_amsi_content, excerpt as amsi_excerpt};
 // Defender tamper rules (#283): protection turned off, risky exclusions.
 pub use defender::evaluate_defender_event;
 // Diffed inventory records (#87): unconditional, see the module doc.
