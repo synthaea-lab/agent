@@ -988,9 +988,42 @@ fn listen_port_golden() {
             },
             local_addr: "0.0.0.0".parse::<IpAddr>().unwrap(),
             local_port: 31337,
+            protocol: schema::IPPROTO_TCP,
         }),
         "listen_port",
     );
+}
+
+#[test]
+fn listen_port_without_protocol_defaults_to_tcp() {
+    // A record from before issue #676 (spooled events, server storage, the ML
+    // corpus, every fixture under v40-v48) has no `protocol` field at all —
+    // every collector was TCP-only back then, so that is what it actually was.
+    // A literal here, not a read of `fixtures/v48/listen_port.json`: that file
+    // can be pruned or regenerated independently of this test, which exercises
+    // the default, not the fixture layout.
+    let raw = r#"{
+        "type": "listen_port",
+        "meta": {
+            "pid": 4242,
+            "ppid": 1,
+            "user": { "os": "unix", "uid": 0, "gid": 0 },
+            "timestamp_ns": 1756900090000000000,
+            "comm": "sshd-backdoor"
+        },
+        "local_addr": "0.0.0.0",
+        "local_port": 31337
+    }"#;
+    let event: Event =
+        serde_json::from_str(raw).expect("pre-#676 listen_port must still deserialize");
+    match event {
+        Event::ListenPort(e) => assert_eq!(
+            e.protocol,
+            schema::IPPROTO_TCP,
+            "missing protocol must default to IPPROTO_TCP"
+        ),
+        other => panic!("expected ListenPort, got {other:?}"),
+    }
 }
 
 #[test]
@@ -2589,6 +2622,7 @@ fn meta_accessor_covers_all_variants() {
             meta: meta.clone(),
             local_addr: "0.0.0.0".parse::<IpAddr>().unwrap(),
             local_port: 0,
+            protocol: 6,
         }),
         Event::NetworkFlow(NetworkFlowEvent {
             meta: meta.clone(),

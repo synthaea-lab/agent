@@ -352,6 +352,7 @@ pub fn listen_port() -> ListenPortEvent {
         meta: meta(),
         local_addr: TEST_ADDR,
         local_port: 0,
+        protocol: crate::IPPROTO_TCP,
     }
 }
 
@@ -555,7 +556,7 @@ pub fn socket_create() -> SocketCreateEvent {
         meta: meta(),
         domain: 2,
         socket_type: 1,
-        protocol: 6,
+        protocol: 6, // IPPROTO_TCP — socket(2)'s raw `int` argument, a different type than ListenPortEvent::protocol
         fd: 0,
     }
 }

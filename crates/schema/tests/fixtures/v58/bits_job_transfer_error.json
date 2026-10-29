@@ -1,0 +1,17 @@
+{
+  "type": "bits_job",
+  "meta": {
+    "pid": 6412,
+    "ppid": 5120,
+    "user": { "os": "windows", "sid": "S-1-5-21-1004336348-1177238915-682003330-1001", "integrity_level": 8192 },
+    "timestamp_ns": 1756900030000000000,
+    "comm": "bitsadmin.exe"
+  },
+  "job_id": "{c40080ab-6fe4-418a-8ba6-c271c5298f18}",
+  "job_title": "update",
+  "state": "transfer_error",
+  "url": "https://example.test/payload.exe",
+  "local_path": "C:\\Users\\u\\AppData\\Local\\Temp\\p.exe",
+  "bytes_transferred": 1917,
+  "hresult": 2149122452
+}
