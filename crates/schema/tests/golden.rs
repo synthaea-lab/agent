@@ -988,7 +988,7 @@ fn listen_port_golden() {
             },
             local_addr: "0.0.0.0".parse::<IpAddr>().unwrap(),
             local_port: 31337,
-            protocol: 6, // IPPROTO_TCP
+            protocol: schema::IPPROTO_TCP,
         }),
         "listen_port",
     );
@@ -999,20 +999,27 @@ fn listen_port_without_protocol_defaults_to_tcp() {
     // A record from before issue #676 (spooled events, server storage, the ML
     // corpus, every fixture under v40-v48) has no `protocol` field at all —
     // every collector was TCP-only back then, so that is what it actually was.
-    let path = format!(
-        "{}/tests/fixtures/v48/listen_port.json",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let raw = std::fs::read_to_string(&path).expect(&path);
-    assert!(
-        !raw.contains("protocol"),
-        "v48's listen_port fixture now has a protocol field — this test no longer exercises the default"
-    );
+    // A literal here, not a read of `fixtures/v48/listen_port.json`: that file
+    // can be pruned or regenerated independently of this test, which exercises
+    // the default, not the fixture layout.
+    let raw = r#"{
+        "type": "listen_port",
+        "meta": {
+            "pid": 4242,
+            "ppid": 1,
+            "user": { "os": "unix", "uid": 0, "gid": 0 },
+            "timestamp_ns": 1756900090000000000,
+            "comm": "sshd-backdoor"
+        },
+        "local_addr": "0.0.0.0",
+        "local_port": 31337
+    }"#;
     let event: Event =
-        serde_json::from_str(&raw).expect("pre-#676 listen_port must still deserialize");
+        serde_json::from_str(raw).expect("pre-#676 listen_port must still deserialize");
     match event {
         Event::ListenPort(e) => assert_eq!(
-            e.protocol, 6,
+            e.protocol,
+            schema::IPPROTO_TCP,
             "missing protocol must default to IPPROTO_TCP"
         ),
         other => panic!("expected ListenPort, got {other:?}"),

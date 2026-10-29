@@ -61,7 +61,7 @@ mod tests {
             panic!("a listener must map to Event::ListenPort");
         };
         assert_eq!(listen.local_port, 135);
-        assert_eq!(listen.protocol, 6);
+        assert_eq!(listen.protocol, schema::IPPROTO_TCP);
         assert_eq!(listen.meta.pid, 1234);
         assert_eq!(listen.meta.ppid, 700);
         assert_eq!(listen.meta.comm, "svchost.exe");
