@@ -280,7 +280,12 @@ pub const fn syscall_nr_from_i32(syscall_nr: i32) -> Option<u32> {
 ///   53, from `sendto(2)` with an address and from `write(2)`/`sendto(2)` on a socket connected
 ///   to port 53. The question is parsed in userspace and reported as `schema::DnsQueryEvent`
 ///   (query and type only, no answer: the response is not captured). No existing struct changed.
-pub const WIRE_VERSION: u32 = 26;
+/// - v27: `FileSetTimeEvent` added (#1036, sensor #1044): an explicit timestamp request seen by the
+///   BPF-LSM `inode_setattr` hook (`ia_valid` carrying `ATTR_ATIME_SET`/`ATTR_MTIME_SET`, i.e. a
+///   time the caller chose, not the kernel's own "now" update). Carries the raw `timespec64`
+///   (seconds and nanoseconds, so the probe does no arithmetic); userspace normalises it to
+///   `schema::FileSetTimeEvent`. No existing struct changed.
+pub const WIRE_VERSION: u32 = 27;
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_PATH_LEN: usize = 256;
@@ -509,6 +514,31 @@ pub struct FileChownEvent {
     pub path_len: u16,
     pub uid: u32,
     pub gid: u32,
+}
+
+/// [`FileSetTimeEvent::flags`]: the access time in this request is one the caller chose.
+pub const SET_TIME_ATIME: u16 = 1 << 0;
+/// [`FileSetTimeEvent::flags`]: the modification time in this request is one the caller chose.
+pub const SET_TIME_MTIME: u16 = 1 << 1;
+
+/// Explicit timestamp request (`inode_setattr` LSM hook, #1036/#1044). `path` is rebuilt by
+/// the probe from the dentry chain (see the sensor issue); the times are the raw `timespec64`
+/// of `struct iattr`, meaningful only for the fields named in `flags`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FileSetTimeEvent {
+    pub meta: EventMeta,
+    pub path: [u8; MAX_PATH_LEN],
+    pub path_len: u16,
+    /// [`SET_TIME_ATIME`] | [`SET_TIME_MTIME`].
+    pub flags: u16,
+    /// Explicit padding so the `i64`s below are 8-aligned without implicit padding
+    /// bytes. Always zero.
+    pub reserved: u32,
+    pub atime_sec: i64,
+    pub atime_nsec: i64,
+    pub mtime_sec: i64,
+    pub mtime_nsec: i64,
 }
 
 /// Extended attribute set (`syscalls:sys_enter_setxattr`, issue #262 Phase 3). `path`

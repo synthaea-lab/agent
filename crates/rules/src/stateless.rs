@@ -606,6 +606,13 @@ pub(crate) fn check_alternate_data_stream_write(event: &FileOpenEvent) -> Option
 /// volume measurement (a copy/extraction of a few thousand files) or a per-pid/parent-directory
 /// aggregation the driver's wire format does not yet carry — tracked as a follow-up, not solved
 /// here by guessing a threshold.
+///
+/// Linux (#1036): the BPF-LSM `inode_setattr` hook does know the process, so `comm` is printed
+/// and the package managers are skipped: `rpm`/`dpkg`/`pacman` and their frontends set the
+/// archive's stored mtime on every file they unpack. Everything else stays Low for the reason
+/// above (`touch -d`, `cp -p`, `tar x`, `rsync -t` are ordinary too). Telling a build tool's
+/// `touch` from a targeted stomp needs the parent or a per-process count, which the event does
+/// not carry: not guessed here.
 #[must_use]
 pub fn evaluate_file_set_time(event: &FileSetTimeEvent) -> Vec<Alert> {
     let requested = [
@@ -621,15 +628,44 @@ pub fn evaluate_file_set_time(event: &FileSetTimeEvent) -> Vec<Alert> {
     {
         return Vec::new();
     }
+    let unix = matches!(event.meta.user, User::Unix { .. });
+    if unix && PACKAGE_MANAGERS.contains(&event.meta.comm.as_str()) {
+        return Vec::new();
+    }
+    let message = if unix {
+        format!(
+            "pid={} comm={}: explicit timestamp change requested for {}",
+            event.meta.pid, event.meta.comm, event.path,
+        )
+    } else {
+        format!(
+            "pid={}: explicit timestamp change requested for {}",
+            event.meta.pid, event.path,
+        )
+    };
     vec![Alert {
         technique: "T1070.006",
         severity: Severity::Low,
-        message: format!(
-            "pid={}: explicit timestamp change requested for {}",
-            event.meta.pid, event.path,
-        ),
+        message,
     }]
 }
+
+/// Linux package managers and their back ends: they stamp every unpacked file with the
+/// archive's mtime. Exact `comm` values (15 bytes at most: `unattended-upgr` is the kernel's
+/// own truncation of `unattended-upgrade`).
+const PACKAGE_MANAGERS: &[&str] = &[
+    "rpm",
+    "dpkg",
+    "apt",
+    "apt-get",
+    "dnf",
+    "yum",
+    "zypper",
+    "pacman",
+    "apk",
+    "snapd",
+    "unattended-upgr",
+];
 
 /// T1006 — Direct Volume Access: mounted logical-volume open. This is requested
 /// access, not proof of granted rights or subsequent raw I/O; the event carries no trusted image.

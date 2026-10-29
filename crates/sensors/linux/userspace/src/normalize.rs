@@ -118,7 +118,11 @@ use crate::dns_udp;
 /// v26 (#458 part 3) added `DnsUdpQueryEvent` — new `dns_udp_query` mapping function below, which
 /// parses the question out of the datagram and reuses `schema::DnsQueryEvent`; no existing mapping
 /// changed shape.
-const _: () = assert!(wire::WIRE_VERSION == 26);
+///
+/// v27 (#1036) added `FileSetTimeEvent` — new `file_set_time` mapping function below, to the
+/// platform-neutral `schema::FileSetTimeEvent` (requested Unix times converted to `FILETIME`
+/// units, only the fields the caller chose set); no existing mapping changed shape.
+const _: () = assert!(wire::WIRE_VERSION == 27);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
@@ -351,6 +355,42 @@ pub fn file_chmod(
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
         path: String::from_utf8_lossy(&raw[..end]).into_owned(),
         mode: event.mode,
+    })
+}
+
+/// 100 ns intervals between 1601-01-01 (the `FILETIME` epoch) and 1970-01-01.
+const FILETIME_UNIX_EPOCH: i64 = 116_444_736_000_000_000;
+
+/// A requested Unix time as the raw `FILETIME` units `schema::FileSetTimeEvent` carries, so
+/// one rule serves both OSes (#1036). Saturates instead of wrapping, and never returns the
+/// 0/-1/-2 values the rule reads as "unchanged": a time before 1601 becomes 1, one past the
+/// `i64` range `i64::MAX`.
+fn unix_to_filetime(sec: i64, nsec: i64) -> i64 {
+    sec.saturating_mul(10_000_000)
+        .saturating_add(nsec.clamp(0, 999_999_999) / 100)
+        .saturating_add(FILETIME_UNIX_EPOCH)
+        .max(1)
+}
+
+/// `inode_setattr` explicit timestamp request → the platform-neutral `FileSetTimeEvent`
+/// (#1036). Only the fields the caller chose (`flags`) are `Some`.
+#[must_use]
+pub fn file_set_time(
+    event: &wire::FileSetTimeEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Event {
+    let raw = &event.path[..(event.path_len as usize).min(wire::MAX_PATH_LEN)];
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    Event::FileSetTime(schema::FileSetTimeEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        path: String::from_utf8_lossy(&raw[..end]).into_owned(),
+        creation_time: None,
+        last_access_time: (event.flags & wire::SET_TIME_ATIME != 0)
+            .then(|| unix_to_filetime(event.atime_sec, event.atime_nsec)),
+        last_write_time: (event.flags & wire::SET_TIME_MTIME != 0)
+            .then(|| unix_to_filetime(event.mtime_sec, event.mtime_nsec)),
+        change_time: None,
     })
 }
 
@@ -1130,6 +1170,45 @@ mod tests {
             e.executable_path.is_some_and(|p| p.starts_with('/')),
             "expected the test binary's own exe path"
         );
+    }
+
+    #[test]
+    fn file_set_time_reports_only_the_times_the_caller_chose_in_filetime_units() {
+        let mut path = [0u8; wire::MAX_PATH_LEN];
+        path[..9].copy_from_slice(b"/tmp/a.sh");
+        let event = wire::FileSetTimeEvent {
+            meta: wire_meta(b"touch"),
+            path,
+            path_len: 9,
+            flags: wire::SET_TIME_MTIME,
+            reserved: 0,
+            atime_sec: 123, // not chosen: must not surface
+            atime_nsec: 0,
+            mtime_sec: 1_262_304_000, // 2010-01-01T00:00:00Z
+            mtime_nsec: 500,
+        };
+        let Event::FileSetTime(e) = file_set_time(&event, 0, None) else {
+            panic!("expected FileSetTime")
+        };
+        assert_eq!(e.path, "/tmp/a.sh");
+        assert_eq!(e.last_access_time, None);
+        assert_eq!(e.creation_time, None);
+        assert_eq!(e.change_time, None);
+        // 2010-01-01 is 129_067_776_000_000_000 in FILETIME; 500 ns is five 100 ns ticks.
+        assert_eq!(e.last_write_time, Some(129_067_776_000_000_005));
+    }
+
+    #[test]
+    fn file_set_time_never_produces_an_unchanged_sentinel_or_wraps() {
+        assert_eq!(unix_to_filetime(i64::MIN, 0), 1, "before 1601");
+        assert_eq!(unix_to_filetime(i64::MAX, 0), i64::MAX, "past the range");
+        assert_eq!(unix_to_filetime(0, -5), FILETIME_UNIX_EPOCH, "bad nsec");
+        for t in [
+            unix_to_filetime(-11_644_473_600, 0),
+            unix_to_filetime(-20_000_000_000, 0),
+        ] {
+            assert!(t > 0, "{t}");
+        }
     }
 
     #[test]
