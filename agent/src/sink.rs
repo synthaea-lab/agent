@@ -5864,6 +5864,18 @@ rule reload_content_test_marker {
         assert!(!alerts.contains("T1204.002"), "{alerts}");
     }
 
+    /// #688: the identity the ETW sensor records and the one enrichment reads are the same
+    /// token for the same file; the gate compares them as strings, so a format drift between
+    /// the two crates (they share no code) would silently turn every gated alert on.
+    #[cfg(windows)]
+    #[test]
+    fn the_sensor_and_enrichment_agree_on_a_files_identity() {
+        let exe = std::env::current_exe().unwrap();
+        let sensor = sensor_windows::image_file_id(&exe);
+        assert!(sensor.is_some(), "an ordinary file has an identity");
+        assert_eq!(sensor, enrich::path_identity(&exe));
+    }
+
     /// #688: the image that ran was moved aside and a signed file took its path before the
     /// worker opened it. The verdict is `Valid`, for a file that is not the image that ran.
     #[cfg(windows)]

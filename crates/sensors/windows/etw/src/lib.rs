@@ -66,3 +66,33 @@ mod winapi;
 pub mod zone_identifier;
 #[cfg(windows)]
 pub use sensor::WindowsSensor;
+#[cfg(windows)]
+pub use winapi::image_file_id;
+
+/// The text form of a file identity, `"{volume serial:016x}:{file id:032x}"` (#688): what
+/// `schema::ExecEvent::image_file_id` carries and what the agent's enrichment compares with
+/// `enrich::path_identity` (the same format, written twice because sensor crates depend on
+/// `schema` only; the agent's Windows test pins the two together). `file_id` is the 16 bytes
+/// of `FILE_ID_128`, read as a little-endian integer.
+#[must_use]
+pub fn identity_token(volume_serial: u64, file_id: [u8; 16]) -> String {
+    format!("{volume_serial:016x}:{:032x}", u128::from_le_bytes(file_id))
+}
+
+#[cfg(test)]
+mod identity_token_tests {
+    use super::identity_token;
+
+    #[test]
+    fn the_token_is_volume_then_little_endian_file_id_in_fixed_width_hex() {
+        let mut id = [0u8; 16];
+        id[0] = 0xef;
+        id[1] = 0xbe;
+        id[4] = 0x03;
+        assert_eq!(
+            identity_token(0xa1b2_c3d4, id),
+            "00000000a1b2c3d4:0000000000000000000000030000beef"
+        );
+        assert_eq!(identity_token(0, [0; 16]), format!("{:016x}:{:032x}", 0, 0));
+    }
+}

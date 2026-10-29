@@ -188,7 +188,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         // file at its path in between. One open (shared for delete, so it cannot
         // block the rename) and one query, no read.
         let image_file_id = (image_path != "<unknown>")
-            .then(|| enrich::path_identity(std::path::Path::new(&image_path)))
+            .then(|| crate::winapi::image_file_id(std::path::Path::new(&image_path)))
             .flatten();
 
         let comm = basename(&image_path);
