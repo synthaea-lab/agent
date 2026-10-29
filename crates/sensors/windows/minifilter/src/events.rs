@@ -9,7 +9,9 @@
 //!
 //! Platform-independent, like [`crate::wire`]: tested on every OS.
 
-use schema::{Event, EventMeta, FileDeleteEvent, FileRenameEvent, User};
+use schema::{
+    Event, EventMeta, FileDeleteEvent, FileRenameEvent, FileSetTimeEvent, RawVolumeOpenEvent, User,
+};
 
 use crate::wire::{Body, Message};
 
@@ -126,6 +128,30 @@ pub fn to_event(message: &Message, volumes: &VolumeMap) -> Option<Event> {
             new_path: volumes.normalize(new_path),
             executable_path: None,
         })),
+        Body::SetTime {
+            path,
+            creation_time,
+            last_access_time,
+            last_write_time,
+            change_time,
+            ..
+        } => Some(Event::FileSetTime(FileSetTimeEvent {
+            meta,
+            path: volumes.normalize(path),
+            creation_time: (*creation_time != 0).then_some(*creation_time),
+            last_access_time: (*last_access_time != 0).then_some(*last_access_time),
+            last_write_time: (*last_write_time != 0).then_some(*last_write_time),
+            change_time: (*change_time != 0).then_some(*change_time),
+        })),
+        Body::RawVolumeOpen {
+            volume,
+            desired_access,
+            ..
+        } => Some(Event::RawVolumeOpen(RawVolumeOpenEvent {
+            meta,
+            volume: volumes.normalize(volume),
+            desired_access: *desired_access,
+        })),
     }
 }
 
@@ -165,6 +191,11 @@ mod tests {
                 new_path: r"\Device\HarddiskVolume1\d\new.doc".into(),
                 old_truncated: true,
                 new_truncated: false,
+            },
+            Body::RawVolumeOpen {
+                volume: r"\Device\HarddiskVolume1".into(),
+                desired_access: 1,
+                truncated: true,
             },
             Body::Rename {
                 old_path: r"\Device\HarddiskVolume1\d\old.doc".into(),
@@ -246,6 +277,47 @@ mod tests {
         };
         assert_eq!(rename.old_path, r"C:\d\a.docx");
         assert_eq!(rename.new_path, r"C:\d\a.docx.locked");
+    }
+
+    #[test]
+    fn a_set_time_becomes_a_normalized_event_with_only_requested_fields() {
+        let event = to_event(
+            &message(Body::SetTime {
+                path: r"\Device\HarddiskVolume1\Users\x.docx".into(),
+                creation_time: 0,
+                last_access_time: -1,
+                last_write_time: 132_537_600_000_000_000,
+                change_time: -2,
+                truncated: false,
+            }),
+            &volumes(),
+        );
+        let Some(Event::FileSetTime(set_time)) = event else {
+            panic!("{event:?}");
+        };
+        assert_eq!(set_time.path, r"C:\Users\x.docx");
+        assert_eq!(set_time.creation_time, None);
+        assert_eq!(set_time.last_access_time, Some(-1));
+        assert_eq!(set_time.last_write_time, Some(132_537_600_000_000_000));
+        assert_eq!(set_time.change_time, Some(-2));
+        assert_eq!(set_time.meta.comm, "");
+    }
+
+    #[test]
+    fn a_raw_volume_open_normalizes_device_name_and_preserves_requested_access() {
+        let event = to_event(
+            &message(Body::RawVolumeOpen {
+                volume: r"\Device\HarddiskVolume1".into(),
+                desired_access: 0x8000_0002,
+                truncated: false,
+            }),
+            &volumes(),
+        );
+        let Some(Event::RawVolumeOpen(open)) = event else {
+            panic!("{event:?}");
+        };
+        assert_eq!(open.volume, "C:");
+        assert_eq!(open.desired_access, 0x8000_0002);
     }
 
     #[test]

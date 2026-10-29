@@ -31,17 +31,17 @@ use crate::{
     AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BitsJobEvent,
     BitsJobState, BpfEvent, CapSetEvent, ConnectEvent, DefenderEvent, DefenderEventKind,
     DnsQueryEvent, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent,
-    FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
-    FileWriteEvent, HttpRequestEvent, HttpSignature, HttpSummaryEvent, IdentityChangeEvent,
-    IdentityChangeKind, ImageLoadEvent, KerberosDelegationFailureEvent,
+    FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetTimeEvent,
+    FileSetxattrEvent, FileWriteEvent, HttpRequestEvent, HttpSignature, HttpSummaryEvent,
+    IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent, KerberosDelegationFailureEvent,
     KerberosDelegationFailureKind, KernelModuleAction, KernelModuleEvent, LdapSearchEvent,
     ListenPortEvent, LogClearedEvent, MemfdCreateEvent, NamespaceEvent, NamespaceSyscall,
     NetworkFlowEvent, NtlmAuthEvent, NtlmDirection, PackageChangeEvent, PackageChangeKind,
     PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
-    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent, SessionState, ShellType,
-    SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketCreateEvent, SocketListenEvent,
-    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, User,
-    WmiActivityEvent,
+    RawVolumeOpenEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent,
+    SessionState, ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
+    SocketCreateEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
+    UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -420,6 +420,29 @@ pub fn file_rename() -> FileRenameEvent {
         old_path: String::new(),
         new_path: String::new(),
         executable_path: None,
+    }
+}
+
+/// Neutral [`FileSetTimeEvent`].
+#[must_use]
+pub fn file_set_time() -> FileSetTimeEvent {
+    FileSetTimeEvent {
+        meta: meta(),
+        path: String::new(),
+        creation_time: None,
+        last_access_time: None,
+        last_write_time: None,
+        change_time: None,
+    }
+}
+
+/// Neutral [`RawVolumeOpenEvent`].
+#[must_use]
+pub fn raw_volume_open() -> RawVolumeOpenEvent {
+    RawVolumeOpenEvent {
+        meta: meta(),
+        volume: String::new(),
+        desired_access: 0,
     }
 }
 

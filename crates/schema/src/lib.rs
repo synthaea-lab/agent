@@ -311,16 +311,20 @@ pub mod time;
 /// client's own unconstrained-delegation and TGT-session-key-export denials,
 /// from the (off by default) `Microsoft-Windows-Kerberos/Operational` channel.
 /// Windows-only. Originally claimed 49; renumbered past #60's 52 and #983's 53.
-/// #994 merged first, ahead of the 54 it had reserved for this PR, so main went
+/// #994 merged first, ahead of the 54 it had reserved for #995, so main went
 /// straight from 53 to 55 and left 54 unused.
 ///
-/// Bumped 55 → 57 for [`ListenPortEvent::protocol`] (#676): the 54 reserved above
-/// was skipped when #994 merged first, so this takes the next free number instead
-/// of the skipped one — reusing 54 here would make `SCHEMA_VERSION` regress below
-/// what #994 already shipped on main. #1006 (timestomp) claimed 56 first (approved
-/// 2026-10-28) and is closer to merging, so this takes the slot after it instead of
-/// colliding; same coordination note as above.
-pub const SCHEMA_VERSION: u32 = 57;
+/// Bumped 55 → 56 for Windows minifilter explicit timestamp requests (#136). #995
+/// (`ListenPortEvent::protocol`) had planned to renumber past the skipped 54 to 57.
+///
+/// Bumped 56 → 57 for mounted raw-volume open telemetry (#136 slice 4), stacked on
+/// the timestomp slice above — it merged first and took the 57 #995 was planning
+/// on, without #995 having pushed its own renumbering commit yet.
+///
+/// Bumped 57 → 58 for [`ListenPortEvent::protocol`] (#676 part 1, #995): collided
+/// with the above on 57 (both claimed it independently; #136 slice 4 merged first),
+/// so this takes the next free number instead.
+pub const SCHEMA_VERSION: u32 = 58;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -839,6 +843,40 @@ pub struct FileRenameEvent {
     /// of trusting `comm` alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_path: Option<String>,
+}
+
+/// Explicit `FileBasicInformation` timestamp request observed by the Windows minifilter.
+/// Values are raw signed 100-ns Windows FILETIME units requested by the caller; `None` means
+/// that field was unchanged. Windows' own -1 (don't change) and -2 (don't change, don't update
+/// on next write either) sentinels still survive as `Some(-1)`/`Some(-2)`, not `None` — the
+/// field being set at all is what `None` tracks, distinct from the caller asking it stay as-is;
+/// `rules::evaluate_file_set_time` is what filters those two sentinel values out of the ones
+/// that count as a real requested time. This reports a successful request, not proof of
+/// malicious intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSetTimeEvent {
+    pub meta: EventMeta,
+    /// Normalized path captured by the minifilter before the operation.
+    pub path: String,
+    /// Requested creation time in raw signed 100-ns FILETIME units; `None` means unchanged.
+    pub creation_time: Option<i64>,
+    /// Requested last-access time in raw signed 100-ns FILETIME units; `None` means unchanged.
+    pub last_access_time: Option<i64>,
+    /// Requested last-write time in raw signed 100-ns FILETIME units; `None` means unchanged.
+    pub last_write_time: Option<i64>,
+    /// Requested change time in raw signed 100-ns FILETIME units; `None` means unchanged.
+    pub change_time: Option<i64>,
+}
+
+/// Successful open of a mounted logical volume through the Windows minifilter.
+/// `desired_access` is the caller's requested `ACCESS_MASK`, not the rights granted or later used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawVolumeOpenEvent {
+    pub meta: EventMeta,
+    /// Kernel device name captured from the attached volume (for example `\\Device\\HarddiskVolume3`).
+    pub volume: String,
+    /// Raw Windows `ACCESS_MASK` requested by the caller.
+    pub desired_access: u32,
 }
 
 /// File permission change (issue #262 Phase 2): `chmod(2)`/`fchmodat(2)`. `fchmod(2)`
@@ -2523,6 +2561,8 @@ pub enum Event {
     FileWrite(FileWriteEvent),
     FileDelete(FileDeleteEvent),
     FileRename(FileRenameEvent),
+    FileSetTime(FileSetTimeEvent),
+    RawVolumeOpen(RawVolumeOpenEvent),
     SocketBind(SocketBindEvent),
     FileChmod(FileChmodEvent),
     FileChown(FileChownEvent),
@@ -2590,6 +2630,8 @@ impl Event {
             Event::FileWrite(e) => &e.meta,
             Event::FileDelete(e) => &e.meta,
             Event::FileRename(e) => &e.meta,
+            Event::FileSetTime(e) => &e.meta,
+            Event::RawVolumeOpen(e) => &e.meta,
             Event::SocketBind(e) => &e.meta,
             Event::FileChmod(e) => &e.meta,
             Event::FileChown(e) => &e.meta,
