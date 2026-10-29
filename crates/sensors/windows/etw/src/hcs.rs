@@ -138,8 +138,9 @@ unsafe fn run_operation(
     start: impl FnOnce(HcsOperation) -> HRESULT,
 ) -> Result<String, String> {
     // SAFETY: the operation is null-checked and closed on every path; the
-    // result document is owned by us once returned and freed with LocalFree,
-    // as computecore.h requires.
+    // result document is owned by us once returned and freed with LocalFree:
+    // "The caller is responsible for releasing the returned string using
+    // LocalFree" (learn.microsoft.com/virtualization/api/hcs/reference/hcswaitforoperationresult).
     unsafe {
         let op = (api.create_operation)(core::ptr::null(), core::ptr::null());
         if op.is_null() {
