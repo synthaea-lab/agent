@@ -304,9 +304,18 @@ mod tests {
     #[test]
     fn the_image_is_confirmed_only_by_the_same_file_identity() {
         assert!(image_confirmed(Some("a:1"), Some("a:1"), true));
-        assert!(!image_confirmed(Some("a:1"), Some("a:2"), true), "swapped file");
-        assert!(!image_confirmed(None, Some("a:1"), true), "sensor saw no identity");
-        assert!(!image_confirmed(Some("a:1"), None, true), "verified file has none");
+        assert!(
+            !image_confirmed(Some("a:1"), Some("a:2"), true),
+            "swapped file"
+        );
+        assert!(
+            !image_confirmed(None, Some("a:1"), true),
+            "sensor saw no identity"
+        );
+        assert!(
+            !image_confirmed(Some("a:1"), None, true),
+            "verified file has none"
+        );
         // Platforms that capture nothing keep the gate as it was.
         assert!(image_confirmed(None, None, false));
     }

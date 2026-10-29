@@ -5330,12 +5330,23 @@ rule reload_content_test_marker {
     /// A download-provenance mark on `image`, then `image` run inside the
     /// window, then the enrichment worker drained (#441).
     fn mark_then_run(sink: &DetectionSink, image: &str) {
+        // What the Windows sensor records at exec (#688): the file the image started from.
+        mark_then_run_as(
+            sink,
+            image,
+            enrich::path_identity(std::path::Path::new(image)),
+        );
+    }
+
+    /// [`mark_then_run`] with the identity the sensor recorded given explicitly.
+    fn mark_then_run_as(sink: &DetectionSink, image: &str, ran: Option<String>) {
         sink.on_event(Event::FileQuarantine(schema::FileQuarantineEvent {
             path: image.into(),
             ..schema::fixtures::file_quarantine()
         }));
         sink.on_event(Event::Exec(schema::ExecEvent {
             image_path: image.into(),
+            image_file_id: ran,
             ..schema::fixtures::exec()
         }));
         assert!(
@@ -5851,6 +5862,34 @@ rule reload_content_test_marker {
         mark_then_run(&sink, image);
         let alerts = alerts_in(&dir);
         assert!(!alerts.contains("T1204.002"), "{alerts}");
+    }
+
+    /// #688: the image that ran was moved aside and a signed file took its path before the
+    /// worker opened it. The verdict is `Valid`, for a file that is not the image that ran.
+    #[cfg(windows)]
+    #[test]
+    fn a_valid_signature_of_a_file_that_is_not_the_image_that_ran_still_alerts() {
+        let image = r"C:\Windows\System32\notepad.exe";
+        if !std::path::Path::new(image).exists() {
+            eprintln!("skipping: {image} not present on this host");
+            return;
+        }
+        let dir = tmp("gate-swapped");
+        let decoy_run = dir.join("dropper.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &decoy_run).unwrap();
+        let sink = sink_in(&dir);
+        // The sensor saw the dropper start; the path now holds notepad.exe.
+        let ran = enrich::path_identity(&decoy_run);
+        assert!(ran.is_some());
+        mark_then_run_as(&sink, image, ran);
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("T1204.002"), "{alerts}");
+        assert!(
+            alerts.contains("file differs from the image that ran"),
+            "{alerts}"
+        );
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// #655 review: a signed file runs once (its `Valid` verdict cached), then an
