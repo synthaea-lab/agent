@@ -193,10 +193,10 @@ fn spawn_network_extension_receiver(sink: Arc<dyn EventSink>) {
 /// Runs the ES sensor (blocking, on the calling thread), the unified-log
 /// tail, and the `NetworkExtension` receiver (background threads) against the
 /// same sink, with Ctrl-C wired to stop the lot.
-fn run_macos_sensors(sink: Box<dyn EventSink>, redact_exec: bool) -> anyhow::Result<()> {
+fn run_macos_sensors(sink: Box<dyn EventSink>, redact_commands: bool) -> anyhow::Result<()> {
     // Run and both capture commands funnel through here, so this is the one
     // place credential redaction has to sit in front of (#440).
-    let sink = crate::redact::redacting(sink, redact_exec);
+    let sink = crate::redact::redacting(sink, redact_commands);
 
     let mut sensor = sensor_macos::MacosSensor::new();
     let stop = sensor.stop_handle();
