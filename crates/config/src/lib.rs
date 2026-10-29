@@ -43,6 +43,7 @@
 
 mod discovery;
 mod error;
+pub mod identity;
 mod load;
 mod schema;
 mod secret;

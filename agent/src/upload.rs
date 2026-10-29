@@ -159,9 +159,20 @@ pub(crate) struct ControlPlane<'a> {
     pub(crate) offline_fallback: bool,
 }
 
+/// A transport config for `url` that names the agent in its `User-Agent` with
+/// the identity's product token (#596). Every client the agent builds starts
+/// here, so the name is set in one place.
+pub(crate) fn transport_config_for(url: &str) -> TransportConfig {
+    TransportConfig::new(url).with_user_agent(format!(
+        "{}/{}",
+        config::identity::PRODUCT_TOKEN,
+        env!("CARGO_PKG_VERSION")
+    ))
+}
+
 impl ControlPlane<'_> {
     fn transport_config(&self) -> TransportConfig {
-        let mut config = TransportConfig::new(self.url);
+        let mut config = transport_config_for(self.url);
         if let Some(ca_cert) = self.ca_cert {
             config = config.with_ca_cert(ca_cert.to_path_buf());
         }

@@ -308,9 +308,11 @@ struct DetectionUploadResponse {
 
 /// Builds a ureq agent with the configured TLS settings.
 fn build_agent(config: &TransportConfig) -> Result<ureq::Agent> {
-    let mut agent_builder = ureq::Agent::config_builder()
-        .timeout_global(Some(config.request_timeout))
-        .user_agent(format!("synthaea-agent/{}", env!("CARGO_PKG_VERSION")));
+    let mut agent_builder =
+        ureq::Agent::config_builder().timeout_global(Some(config.request_timeout));
+    if let Some(user_agent) = &config.user_agent {
+        agent_builder = agent_builder.user_agent(user_agent.as_str());
+    }
 
     // A custom TLS config is only needed for mTLS or a private CA; otherwise
     // ureq's defaults (built-in public roots) stand.

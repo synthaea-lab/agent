@@ -245,7 +245,10 @@ fn run_windows_sensors(
     // place credential redaction has to sit in front of (#440).
     let sink = crate::redact::redacting(sink, redact_exec);
 
-    let mut etw_sensor = sensor_windows::WindowsSensor::new();
+    let mut etw_sensor = sensor_windows::WindowsSensor::new(sensor_windows::EtwNames {
+        session_prefix: config::identity::ETW_SESSION_PREFIX.to_string(),
+        canary_prefix: config::identity::ETW_CANARY_PREFIX.to_string(),
+    });
     let etw_stop = etw_sensor.stop_handle();
 
     // No policy-loading/distribution mechanism exists in this workspace yet

@@ -142,7 +142,7 @@ fn spawn_unifiedlog_tail(sink: Arc<dyn EventSink>) -> Option<std::process::Child
 /// `sensor-macos-network-extension`'s crate doc and `packaging/macos` for the
 /// app-group placement this default stands in for until the packaged bundle
 /// exists.
-const NE_SOCKET_PATH: &str = "/var/run/synthaea-ne.sock";
+const NE_SOCKET_PATH: &str = config::identity::MACOS_NE_SOCKET;
 
 /// Spawns the background thread that accepts `NetworkExtension` connections
 /// and pumps normalized flow/DNS events into the shared sink. Supplementary

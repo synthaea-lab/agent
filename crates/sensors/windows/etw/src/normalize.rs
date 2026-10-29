@@ -79,15 +79,16 @@ pub fn normalize_registry_key(raw: &str) -> String {
 
 /// Session names are randomized per start (F-2): a fixed name documented its own
 /// kill command. Entropy source is deliberately boring (time ^ pid) — this is
-/// anti-fingerprinting of the session *name*, not cryptography.
+/// anti-fingerprinting of the session *name*, not cryptography. `prefix` is the
+/// agent's `EtwNames::session_prefix`.
 #[must_use]
-pub fn random_session_name(seed_ns: u128, pid: u32) -> String {
+pub fn random_session_name(prefix: &str, seed_ns: u128, pid: u32) -> String {
     let mix = (seed_ns as u64) ^ ((pid as u64) << 17) ^ 0x9E37_79B9_7F4A_7C15;
-    format!("wtrace-{:016x}", mix.wrapping_mul(0xBF58_476D_1CE4_E5B9))
+    format!("{prefix}{:016x}", mix.wrapping_mul(0xBF58_476D_1CE4_E5B9))
 }
 
 /// Parses `logman query -ets`' stdout and returns every session name matching
-/// our own `wtrace-` prefix (issue #408): every ETW session we could have
+/// our own session `prefix` (issue #408): every ETW session we could have
 /// orphaned, across any number of consecutive unclean shutdowns — not just the
 /// single most recent one a persisted-name file can track.
 ///
@@ -97,16 +98,16 @@ pub fn random_session_name(seed_ns: u128, pid: u32) -> String {
 /// each line's first whitespace-separated token is safe on any Windows display
 /// language.
 #[must_use]
-pub fn parse_orphaned_sessions(logman_query_ets_output: &str) -> Vec<String> {
+pub fn parse_orphaned_sessions(logman_query_ets_output: &str, prefix: &str) -> Vec<String> {
     logman_query_ets_output
         .lines()
         .filter_map(|line| line.split_whitespace().next())
-        .filter(|name| name.starts_with("wtrace-"))
+        .filter(|name| name.starts_with(prefix))
         .map(str::to_string)
         .collect()
 }
 
-/// Names `wtrace-` sessions from a native ETW enumeration and notes when the
+/// Names the sessions under our prefix from a native ETW enumeration and notes when the
 /// caller filled its fixed-size session buffer, so more sessions may be hidden.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrphanedSessionSelection {
@@ -119,13 +120,14 @@ pub struct OrphanedSessionSelection {
 #[must_use]
 pub fn select_orphaned_sessions(
     sessions: &[SessionStats],
+    prefix: &str,
     capacity: usize,
     api_reported_more: bool,
 ) -> OrphanedSessionSelection {
     OrphanedSessionSelection {
         names: sessions
             .iter()
-            .filter(|session| session.name.starts_with("wtrace-"))
+            .filter(|session| session.name.starts_with(prefix))
             .map(|session| session.name.clone())
             .collect(),
         possibly_truncated: api_reported_more || (capacity > 0 && sessions.len() >= capacity),
@@ -158,14 +160,18 @@ pub fn start_or_stop_session<T, E>(
 /// the liveness canary raises after 30 s of silence (#408). "Stopped from the
 /// outside" and "still running but blind" call for different investigations, and
 /// the old message ("trace stopped or tampered") didn't tell them apart. Other
-/// `wtrace-` sessions at that point are not orphans (startup stopped those): they
+/// sessions under our `prefix` at that point are not orphans (startup stopped those): they
 /// belong to another running instance. `None`: enumeration failed.
 #[must_use]
-pub fn describe_silent_session(session: &str, session_listing: Option<&str>) -> String {
+pub fn describe_silent_session(
+    session: &str,
+    prefix: &str,
+    session_listing: Option<&str>,
+) -> String {
     let Some(output) = session_listing else {
         return format!("session {session}: state unknown (ETW session enumeration failed)");
     };
-    let ours = parse_orphaned_sessions(output);
+    let ours = parse_orphaned_sessions(output, prefix);
     let running = ours.iter().any(|name| name == session);
     let others = ours.iter().filter(|name| *name != session).count();
     let state = if running {
@@ -173,7 +179,7 @@ pub fn describe_silent_session(session: &str, session_listing: Option<&str>) -> 
     } else {
         "is no longer running (stopped from outside the agent)"
     };
-    format!("session {session} {state}; other wtrace- sessions running: {others}")
+    format!("session {session} {state}; other {prefix} sessions running: {others}")
 }
 
 /// Whether a session listing can decide if `session` is running. A complete listing
@@ -403,6 +409,8 @@ mod tests {
 
     use super::*;
 
+    const PREFIX: &str = "wtrace-";
+
     #[test]
     fn ntlm_pids_and_accounts_parse_like_the_lab_events() {
         assert_eq!(parse_ntlm_pid("0x4"), Some(4));
@@ -460,7 +468,7 @@ mod tests {
              NtfsLog                                 Suivi                         En cours d'ex\u{e9}cution\n\
              wtrace-a01c88ef235690bd                  Suivi                         En cours d'ex\u{e9}cution\n\
              WiFiSession                             Suivi                         En cours d'ex\u{e9}cution\n";
-        let orphans = parse_orphaned_sessions(output);
+        let orphans = parse_orphaned_sessions(output, PREFIX);
         assert_eq!(
             orphans,
             vec!["wtrace-7f3a9c21b4e08d56", "wtrace-a01c88ef235690bd"]
@@ -473,7 +481,7 @@ mod tests {
              -------------------------------------------------------------------------------\n\
              EventLog-Security                       Trace                         Running\n\
              wtrace-deadbeefcafef00d                  Trace                         Running\n";
-        let orphans = parse_orphaned_sessions(output);
+        let orphans = parse_orphaned_sessions(output, PREFIX);
         assert_eq!(orphans, vec!["wtrace-deadbeefcafef00d"]);
     }
 
@@ -483,13 +491,13 @@ mod tests {
              -------------------------------------------------------------------------------\n\
              EventLog-Security                       Trace                         Running\n\
              NtfsLog                                 Trace                         Running\n";
-        assert!(parse_orphaned_sessions(output).is_empty());
+        assert!(parse_orphaned_sessions(output, PREFIX).is_empty());
     }
 
     #[test]
     fn empty_logman_output_is_empty() {
-        assert!(parse_orphaned_sessions("").is_empty());
-        assert!(parse_orphaned_sessions("\n\n").is_empty());
+        assert!(parse_orphaned_sessions("", PREFIX).is_empty());
+        assert!(parse_orphaned_sessions("\n\n", PREFIX).is_empty());
     }
 
     #[test]
@@ -502,7 +510,7 @@ mod tests {
                 "wtrace-{i:016x}                  Trace   Running\n"
             ));
         }
-        let orphans = parse_orphaned_sessions(&output);
+        let orphans = parse_orphaned_sessions(&output, PREFIX);
         assert_eq!(orphans.len(), 5);
         assert_eq!(orphans[0], "wtrace-0000000000000000");
         assert_eq!(orphans[4], "wtrace-0000000000000004");
@@ -516,7 +524,7 @@ mod tests {
         // be swept up as one of ours.
         let output = "Data Collector Set   Type    Status\n---\n\
              MyApp-wtrace-shim    Trace   Running\n";
-        assert!(parse_orphaned_sessions(output).is_empty());
+        assert!(parse_orphaned_sessions(output, PREFIX).is_empty());
     }
 
     #[test]
@@ -550,7 +558,7 @@ mod tests {
              EventLog-Security                       Trace                         Running\n\
              wtrace-aaaaaaaaaaaaaaaa                  Trace                         Running\n\
              wtrace-bbbbbbbbbbbbbbbb                  Trace                         Running\n";
-        let text = describe_silent_session("wtrace-aaaaaaaaaaaaaaaa", Some(output));
+        let text = describe_silent_session("wtrace-aaaaaaaaaaaaaaaa", PREFIX, Some(output));
         assert!(
             text.contains("still running but delivers no events"),
             "{text}"
@@ -565,7 +573,7 @@ mod tests {
     fn a_silent_session_gone_from_the_list_is_reported_stopped() {
         let output = "Data Collector Set   Type    Status\n---\n\
              EventLog-Security    Trace   Running\n";
-        let text = describe_silent_session("wtrace-aaaaaaaaaaaaaaaa", Some(output));
+        let text = describe_silent_session("wtrace-aaaaaaaaaaaaaaaa", PREFIX, Some(output));
         assert!(text.contains("no longer running"), "{text}");
         assert!(
             text.ends_with("other wtrace- sessions running: 0"),
@@ -575,7 +583,7 @@ mod tests {
 
     #[test]
     fn a_failed_session_enumeration_says_the_state_is_unknown() {
-        let text = describe_silent_session("wtrace-aaaaaaaaaaaaaaaa", None);
+        let text = describe_silent_session("wtrace-aaaaaaaaaaaaaaaa", PREFIX, None);
         assert!(text.contains("state unknown"), "{text}");
     }
 
@@ -626,8 +634,8 @@ mod tests {
 
     #[test]
     fn session_names_differ_across_starts() {
-        let a = random_session_name(1, 100);
-        let b = random_session_name(2, 100);
+        let a = random_session_name(PREFIX, 1, 100);
+        let b = random_session_name(PREFIX, 2, 100);
         assert_ne!(a, b);
         assert!(a.starts_with("wtrace-"));
     }
@@ -677,9 +685,36 @@ mod tests {
             stats("EventLog-System", true, 4),
             stats("wtrace-orphan-b", false, 3),
         ];
-        let selected = select_orphaned_sessions(&sessions, 64, false);
+        let selected = select_orphaned_sessions(&sessions, PREFIX, 64, false);
         assert_eq!(selected.names, ["wtrace-orphan-a", "wtrace-orphan-b"]);
         assert!(!selected.possibly_truncated);
+    }
+
+    #[test]
+    fn a_renamed_install_reaps_only_its_own_prefix() {
+        // #596: once the prefix is chosen per install, a second agent family on
+        // the host (or the old default) must not be mistaken for our orphans.
+        let prefix = "k7q2-";
+        let sessions = [
+            stats("wtrace-0123456789abcdef", true, 0),
+            stats("k7q2-fedcba9876543210", true, 0),
+        ];
+        let name = random_session_name(prefix, 1, 100);
+        assert!(name.starts_with(prefix));
+        assert_eq!(
+            select_orphaned_sessions(&sessions, prefix, 64, false).names,
+            ["k7q2-fedcba9876543210"]
+        );
+        let listing = "wtrace-0123456789abcdef Trace Running\n\
+                       k7q2-fedcba9876543210 Trace Running\n";
+        assert_eq!(
+            parse_orphaned_sessions(listing, prefix),
+            ["k7q2-fedcba9876543210"]
+        );
+        assert!(
+            describe_silent_session("k7q2-fedcba9876543210", prefix, Some(listing))
+                .ends_with("other k7q2- sessions running: 0")
+        );
     }
 
     #[test]
@@ -687,7 +722,7 @@ mod tests {
         let sessions: Vec<_> = (0..64)
             .map(|i| stats(&format!("session-{i}"), true, 1))
             .collect();
-        let selected = select_orphaned_sessions(&sessions, 64, false);
+        let selected = select_orphaned_sessions(&sessions, PREFIX, 64, false);
         assert!(selected.possibly_truncated);
     }
 
@@ -716,8 +751,8 @@ mod tests {
             permuted.sort_by_key(|(key, index, _)| (*key, *index));
             let permuted_sessions: Vec<_> = permuted.into_iter().map(|(_, _, session)| session).collect();
 
-            let original = select_orphaned_sessions(&sessions, usize::MAX, false);
-            let reordered = select_orphaned_sessions(&permuted_sessions, usize::MAX, false);
+            let original = select_orphaned_sessions(&sessions, PREFIX, usize::MAX, false);
+            let reordered = select_orphaned_sessions(&permuted_sessions, PREFIX, usize::MAX, false);
             let original_names: BTreeSet<_> = original.names.into_iter().collect();
             let reordered_names: BTreeSet<_> = reordered.names.into_iter().collect();
             prop_assert_eq!(original_names, reordered_names);
@@ -728,7 +763,7 @@ mod tests {
             names in prop::collection::vec(any::<String>(), 0..100)
         ) {
             let sessions: Vec<_> = names.iter().map(|name| stats(name, false, 0)).collect();
-            let selected = select_orphaned_sessions(&sessions, usize::MAX, false);
+            let selected = select_orphaned_sessions(&sessions, PREFIX, usize::MAX, false);
             prop_assert!(selected.names.iter().all(|name| name.starts_with("wtrace-")));
             for name in names.iter().filter(|name| !name.starts_with("wtrace-")) {
                 prop_assert!(!selected.names.contains(name));
@@ -759,7 +794,7 @@ mod tests {
                 output.push_str(&format!("wtrace-other-{index}\tTrace\tRunning\r\n"));
             }
             output.push_str("wtrace-target\tTrace\tRunning\r\n");
-            let diagnosis = describe_silent_session(session, Some(&output));
+            let diagnosis = describe_silent_session(session, PREFIX, Some(&output));
             let expected_suffix = format!("other wtrace- sessions running: {other_count}");
             prop_assert!(diagnosis.contains("still running but delivers no events"));
             prop_assert!(diagnosis.ends_with(&expected_suffix), "diagnosis: {}", diagnosis);
@@ -775,8 +810,8 @@ mod tests {
             .map(|index| stats(&format!("session-{index}"), true, 1))
             .collect();
 
-        assert!(!select_orphaned_sessions(&below_capacity, 64, false).possibly_truncated);
-        assert!(select_orphaned_sessions(&at_capacity, 64, false).possibly_truncated);
+        assert!(!select_orphaned_sessions(&below_capacity, PREFIX, 64, false).possibly_truncated);
+        assert!(select_orphaned_sessions(&at_capacity, PREFIX, 64, false).possibly_truncated);
     }
 
     #[test]
@@ -789,7 +824,7 @@ mod tests {
              wtrace-\u{7}alert\tSuivi\tEn cours d'ex\u{e9}cution\r\n\
              ordinary-wtrace-not-ours\tSuivi\tEn cours d'ex\u{e9}cution\r\n"
         );
-        let parsed = parse_orphaned_sessions(&output);
+        let parsed = parse_orphaned_sessions(&output, PREFIX);
 
         assert_eq!(
             parsed,
@@ -803,7 +838,7 @@ mod tests {
 
     #[test]
     fn silent_diagnosis_with_failed_enumeration_is_explicitly_unknown() {
-        let diagnosis = describe_silent_session("wtrace-target", None);
+        let diagnosis = describe_silent_session("wtrace-target", PREFIX, None);
         assert_eq!(
             diagnosis,
             "session wtrace-target: state unknown (ETW session enumeration failed)"

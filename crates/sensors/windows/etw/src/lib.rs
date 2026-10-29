@@ -7,7 +7,8 @@
 //! - **F-1**: the command line is the REAL command line, read from the target's PEB
 //!   (`NtQueryInformationProcess` + `ReadProcessMemory`), never the image path.
 //! - **F-2**: the session name is randomized per start, but under a fixed
-//!   `wtrace-` prefix — every session matching it is enumerated and stopped at
+//!   prefix the agent passes in (`EtwNames`, `wtrace-` today, #596) — every
+//!   session matching it is enumerated and stopped at
 //!   startup (issue #408 — catches every orphan left by any number of consecutive
 //!   unclean shutdowns, not just the most recent). That prefix is itself a
 //!   fingerprint: an attacker can enumerate our session exactly the way we do
@@ -65,4 +66,4 @@ mod sensor;
 mod winapi;
 pub mod zone_identifier;
 #[cfg(windows)]
-pub use sensor::WindowsSensor;
+pub use sensor::{EtwNames, WindowsSensor};
