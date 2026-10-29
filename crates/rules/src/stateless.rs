@@ -156,6 +156,7 @@ pub fn evaluate_exec(event: &ExecEvent) -> Vec<Alert> {
         .chain(check_recovery_inhibit(event))
         .chain(check_log_clear_exec(event))
         .chain(check_event_logging_disable_exec(event))
+        .chain(crate::osascript::check_osascript_password_prompt(event))
         .chain(crate::securitytool::check_security_tool_stop(event))
         .collect()
 }

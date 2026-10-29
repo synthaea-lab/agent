@@ -21,6 +21,7 @@ mod ld_trust;
 mod ldap;
 mod logon;
 mod ntlm;
+mod osascript;
 mod rdp;
 mod recon;
 mod securitytool;
