@@ -32,10 +32,36 @@
 //!   there; their real operation was **not measured**, so each may alert. That is why the rule is
 //!   **Low** and the list provisional.
 //! - One alert per process (a `PoC` calls `setuid`, `setresuid`, ... in a row).
+//!
+//! **The image is the one the pid had *at the event's time*, and the judgment waits for it.**
+//! The exec event reaches the rules later than the raw identity events of the same process (the
+//! sensor reads `/proc` for the exec before emitting it), so reading the pid's image on arrival
+//! saw the pid's *previous* exec (`bash -c '... sudo ...'` keeps its pid), its *next* one (sudo's
+//! forked child calls `setuid(0)` before it execs `unix_chkpwd`) or none (then the parent's: every
+//! `sudo` run from a shell alerted as `/usr/bin/bash` under an exec burst, live-tested by
+//! Jihair54 on #1054). So a request is queued (it is rare: the pre-filter runs first) and judged
+//! once the stream clock, the latest timestamp of any identity or exec event, is
+//! [`IDENTITY_DEFER_NS`] past it, against the latest exec of the pid (else of its parent) with a
+//! timestamp **at or before** the request. The delay is a bound on the exec's latency, **not
+//! measured**: an exec that arrives later than it is not seen and the request is silent. A quiet
+//! host where nothing else happens does not advance the clock, so the finding waits for the next
+//! event; a queue overflow drops the oldest request; requests still queued at shutdown are not
+//! judged.
 
 use schema::{IdentityChangeEvent, IdentityChangeKind, User, detection::Severity};
 
 use crate::Alert;
+
+/// How long past a request the stream clock must be before it is judged, so the exec of its
+/// process has had time to arrive (5 s). Provisional: the exec latency under load was not
+/// measured, only seen to exceed the identity events' by a few lines of a capture.
+pub(crate) const IDENTITY_DEFER_NS: u64 = 5_000_000_000;
+
+/// Requests waiting to be judged; the oldest is dropped past it.
+pub(crate) const IDENTITY_PENDING_CAP: usize = 1024;
+
+/// Execs remembered per pid (a shell that execs a command keeps its pid).
+pub(crate) const EXEC_HISTORY_PER_PID: usize = 4;
 
 /// The kernel's `(uid_t)-1`: "leave this id unchanged" in `setresuid`.
 const UNCHANGED: u32 = u32::MAX;
