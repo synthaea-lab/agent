@@ -2715,6 +2715,7 @@ dependencies = [
 name = "sensor-windows"
 version = "0.1.0"
 dependencies = [
+ "enrich",
  "ferrisetw",
  "proptest",
  "schema",

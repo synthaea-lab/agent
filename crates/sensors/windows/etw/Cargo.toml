@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 schema = { path = "../../../schema" }
+enrich = { path = "../../../enrich" }
 tracing = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]

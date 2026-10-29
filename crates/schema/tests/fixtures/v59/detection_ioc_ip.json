@@ -1,0 +1,39 @@
+{
+  "timestamp_ns": 1756900007000000000,
+  "severity": "high",
+  "title": "Known-bad address",
+  "source": {
+    "engine": "ioc",
+    "kind": "ip",
+    "indicator": "203.0.113.7",
+    "feed": "internal-blocklist",
+    "feed_version": "7"
+  },
+  "techniques": [
+    "T1071"
+  ],
+  "events": [
+    {
+      "type": "exec",
+      "meta": {
+        "pid": 4242,
+        "ppid": 1337,
+        "user": {
+          "os": "unix",
+          "uid": 1000,
+          "gid": 1000
+        },
+        "timestamp_ns": 1756900004123456789,
+        "comm": "bash"
+      },
+      "image_path": "/bin/bash",
+      "cmdline": "bash -c echo cGF5bG9hZAo= | base64 -d | sh",
+      "argv": [
+        "bash",
+        "-c",
+        "echo cGF5bG9hZAo= | base64 -d | sh"
+      ],
+      "parent_comm": "sshd"
+    }
+  ]
+}

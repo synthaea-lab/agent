@@ -329,7 +329,11 @@ pub mod time;
 /// wire change — #995 already defined `ListenPortEvent::protocol`; this PR only
 /// fills it with the real value (6 or 17) instead of #995's TCP-only `6` (review
 /// of #1008).
-pub const SCHEMA_VERSION: u32 = 58;
+///
+/// Bumped 58 → 59 for [`ExecEvent::image_file_id`] (#688): the identity of the
+/// image file at exec time, so the T1204.002 signature gate can distinguish the
+/// image that ran from whatever the path contains when it is later verified.
+pub const SCHEMA_VERSION: u32 = 59;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A

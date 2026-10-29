@@ -182,6 +182,15 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         // placeholder pretending to be arguments.
         let cmdline = winapi::read_process_cmdline(pid).unwrap_or_else(|| image_path.clone());
 
+        // #688: which file the image was started from, taken as early as this
+        // thread can: the T1204.002 gate compares it with the file the enrichment
+        // worker verifies later, and a dropper can rename itself and put another
+        // file at its path in between. One open (shared for delete, so it cannot
+        // block the rename) and one query, no read.
+        let image_file_id = (image_path != "<unknown>")
+            .then(|| enrich::path_identity(std::path::Path::new(&image_path)))
+            .flatten();
+
         let comm = basename(&image_path);
         let mut meta = state.meta(pid, ppid, comm, timestamp_ns);
         // The parent's stamp as the kernel recorded it at this creation, not
@@ -202,6 +211,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             company_name: None,
             file_description: None,
             product_name: None,
+            image_file_id,
         }));
     };
     Provider::by_guid(KERNEL_PROCESS_GUID)
