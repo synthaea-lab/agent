@@ -75,6 +75,16 @@ fn load_embedded(tamper_pin: Option<&std::path::Path>) -> Result<aya::Ebpf, Sens
         ))
     })?;
 
+    // The `inode_setattr` hook (#1044) is optional: a kernel whose `iattr`/`dentry` layout
+    // cannot be read leaves it disabled in the object, it never blocks the sensor. Bound
+    // before the loader, which keeps the references until `load`.
+    let setattr = crate::btf::read_inode_setattr_offsets()
+        .map_err(|e| {
+            tracing::warn!(error = %e, "inode_setattr offsets unavailable: timestamp hook disabled");
+        })
+        .ok();
+    let enabled = 1u32;
+
     let mut loader = aya::EbpfLoader::new();
     loader
         .override_global("TASK_PID_OFFSET", &offsets.task_pid, true)
@@ -82,21 +92,14 @@ fn load_embedded(tamper_pin: Option<&std::path::Path>) -> Result<aya::Ebpf, Sens
         .override_global("BINPRM_FILENAME_OFFSET", &offsets.binprm_filename, true)
         .override_global("SYSCALL_ARG_OFFSETS", &offsets.syscall_args, true)
         .override_global("SYSCALL_NR_OFFSET", &offsets.syscall_nr, true);
-    // The `inode_setattr` hook (#1044) is optional: a kernel whose `iattr`/`dentry` layout
-    // cannot be read leaves it disabled in the object, it never blocks the sensor.
-    match crate::btf::read_inode_setattr_offsets() {
-        Ok(o) => {
-            loader
-                .override_global("INODE_SETATTR_ENABLED", &1u32, true)
-                .override_global("IATTR_VALID_OFFSET", &o.ia_valid, true)
-                .override_global("IATTR_ATIME_OFFSET", &o.ia_atime, true)
-                .override_global("IATTR_MTIME_OFFSET", &o.ia_mtime, true)
-                .override_global("DENTRY_PARENT_OFFSET", &o.dentry_parent, true)
-                .override_global("DENTRY_NAME_PTR_OFFSET", &o.dentry_name_ptr, true);
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "inode_setattr offsets unavailable: timestamp hook disabled")
-        }
+    if let Some(o) = &setattr {
+        loader
+            .override_global("INODE_SETATTR_ENABLED", &enabled, true)
+            .override_global("IATTR_VALID_OFFSET", &o.ia_valid, true)
+            .override_global("IATTR_ATIME_OFFSET", &o.ia_atime, true)
+            .override_global("IATTR_MTIME_OFFSET", &o.ia_mtime, true)
+            .override_global("DENTRY_PARENT_OFFSET", &o.dentry_parent, true)
+            .override_global("DENTRY_NAME_PTR_OFFSET", &o.dentry_name_ptr, true);
     }
     if let Some(path) = tamper_pin {
         loader.map_pin_path("SIGNAL_TAMPER_LAST", path);
