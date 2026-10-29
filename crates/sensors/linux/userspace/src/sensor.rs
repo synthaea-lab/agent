@@ -19,9 +19,9 @@ use tracing::warn;
 use crate::{
     container::{CgroupIdCache, DockerInfoCache, container_context},
     ebpf::{
-        DNS_UDP_PROGRAM, RAW_TRACEPOINTS, TamperSlot, attach_raw_tracepoint, clear_tamper_slot,
-        err, load_ebpf_for_run, prime_proc_lineage, read_tamper_slot, take_tamper_slot,
-        write_signal_watch_pid,
+        DNS_UDP_PROGRAM, RAW_TRACEPOINTS, TamperSlot, attach_inode_setattr, attach_raw_tracepoint,
+        clear_tamper_slot, err, load_ebpf_for_run, prime_proc_lineage, read_tamper_slot,
+        take_tamper_slot, write_signal_watch_pid,
     },
     normalize,
     parent_image::{ExecStamps, IMAGE_CACHE_CAP, ParentImageEvictions, ParentImages},
@@ -116,6 +116,19 @@ const MAX_ITEMS_PER_DRAIN: usize = 256;
 /// against cgroupfs instead (see [`CgroupIdCache`]), specifically to avoid
 /// re-triggering `read_proc_cmdline`'s exact `spawn_blocking` tradeoff on every
 /// file-open/connect event, not just exec.
+/// The readiness of an optional ring buffer: never ready when the program that fills it is
+/// not attached, so a `select!` branch on it simply never fires.
+async fn readable_or_pending<'a>(
+    ring: &'a mut Option<tokio::io::unix::AsyncFd<aya::maps::RingBuf<aya::maps::MapData>>>,
+) -> std::io::Result<
+    tokio::io::unix::AsyncFdReadyMutGuard<'a, aya::maps::RingBuf<aya::maps::MapData>>,
+> {
+    match ring {
+        Some(ring) => ring.readable_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
 macro_rules! drain {
     ($guard:expr, $wire_ty:ty, $sink:expr, $own_pid:expr, $to_event:expr) => {{
         let mut guard = $guard.map_err(|e| err(format!("ring buffer poll failed: {e}")))?;
@@ -272,6 +285,20 @@ impl LinuxSensor {
             attach_raw_tracepoint(&mut ebpf, program, name)?;
         }
 
+        // Explicit timestamp requests (T1070.006, #1044): an LSM hook, so it depends on `bpf`
+        // being in the active `lsm=` list. Best-effort: without it the sensor runs as before
+        // and the ring buffer below is simply not read.
+        let set_time_live = match attach_inode_setattr(&mut ebpf) {
+            Ok(()) => {
+                tracing::info!("sensor-linux: inode_setattr LSM hook attached (timestamp changes)");
+                true
+            }
+            Err(e) => {
+                warn!(error = %e, "sensor-linux: inode_setattr hook not attached, timestamp changes are not observed");
+                false
+            }
+        };
+
         let mut ring = |map: &str| -> Result<_, SensorError> {
             let m = ebpf
                 .take_map(map)
@@ -297,6 +324,11 @@ impl LinuxSensor {
         let mut file_rename_ring_buf = ring("FILE_RENAME_EVENTS")?;
         let mut socket_bind_ring_buf = ring("SOCKET_BIND_EVENTS")?;
         let mut file_chmod_ring_buf = ring("FILE_CHMOD_EVENTS")?;
+        let mut file_set_time_ring_buf = if set_time_live {
+            Some(ring("FILE_SET_TIME_EVENTS")?)
+        } else {
+            None
+        };
         let mut file_chown_ring_buf = ring("FILE_CHOWN_EVENTS")?;
         let mut udp_send_ring_buf = ring("UDP_SEND_EVENTS")?;
         let mut udp_recv_ring_buf = ring("UDP_RECV_EVENTS")?;
@@ -414,6 +446,12 @@ impl LinuxSensor {
                     drain!(guard, sensor_linux_wire::FileChmodEvent, sink, own_pid,
                         |e: &sensor_linux_wire::FileChmodEvent| {
                             normalize::file_chmod(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                        });
+                }
+                guard = readable_or_pending(&mut file_set_time_ring_buf) => {
+                    drain!(guard, sensor_linux_wire::FileSetTimeEvent, sink, own_pid,
+                        |e: &sensor_linux_wire::FileSetTimeEvent| {
+                            normalize::file_set_time(e, offset, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
                 guard = file_chown_ring_buf.readable_mut() => {

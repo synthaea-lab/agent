@@ -520,21 +520,35 @@ pub struct FileChownEvent {
 pub const SET_TIME_ATIME: u16 = 1 << 0;
 /// [`FileSetTimeEvent::flags`]: the modification time in this request is one the caller chose.
 pub const SET_TIME_MTIME: u16 = 1 << 1;
+/// [`FileSetTimeEvent::flags`]: the path is incomplete, the dentry chain was deeper than
+/// [`SET_TIME_COMPONENTS`] or a name was longer than [`SET_TIME_COMPONENT_LEN`] - 1 bytes.
+pub const SET_TIME_TRUNCATED: u16 = 1 << 2;
+/// Dentry names [`FileSetTimeEvent`] carries, the file's own name first.
+pub const SET_TIME_COMPONENTS: usize = 8;
+/// Bytes of one name slot, NUL included.
+pub const SET_TIME_COMPONENT_LEN: usize = 32;
 
-/// Explicit timestamp request (`inode_setattr` LSM hook, #1036/#1044). `path` is rebuilt by
-/// the probe from the dentry chain (see the sensor issue); the times are the raw `timespec64`
-/// of `struct iattr`, meaningful only for the fields named in `flags`.
+/// Explicit timestamp request (`inode_setattr` LSM hook, #1036/#1044). The hook gets a dentry,
+/// not a path (`bpf_d_path` is not allowed on it), so the probe copies the names on the dentry
+/// chain into fixed slots (a constant-bound loop the verifier can follow) and userspace joins
+/// them: `components[0]` is the file's own name, the next its directory, and so on up to the
+/// filesystem root. A path on another mount than `/` therefore lacks its mount prefix. The
+/// times are the raw `timespec64` of `struct iattr`, meaningful only for the fields named in
+/// `flags`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FileSetTimeEvent {
     pub meta: EventMeta,
-    pub path: [u8; MAX_PATH_LEN],
-    pub path_len: u16,
-    /// [`SET_TIME_ATIME`] | [`SET_TIME_MTIME`].
+    pub components: [[u8; SET_TIME_COMPONENT_LEN]; SET_TIME_COMPONENTS],
+    /// How many slots of `components` are filled.
+    pub depth: u8,
+    /// Explicit padding. Always zero.
+    pub reserved0: u8,
+    /// [`SET_TIME_ATIME`] | [`SET_TIME_MTIME`] | [`SET_TIME_TRUNCATED`].
     pub flags: u16,
     /// Explicit padding so the `i64`s below are 8-aligned without implicit padding
     /// bytes. Always zero.
-    pub reserved: u32,
+    pub reserved1: u32,
     pub atime_sec: i64,
     pub atime_nsec: i64,
     pub mtime_sec: i64,

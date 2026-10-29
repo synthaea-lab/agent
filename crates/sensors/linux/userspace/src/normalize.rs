@@ -372,6 +372,25 @@ fn unix_to_filetime(sec: i64, nsec: i64) -> i64 {
         .max(1)
 }
 
+/// Joins the dentry names the probe copied (file first, root last) into a path. An incomplete
+/// chain gets a `/...` prefix rather than passing for an absolute path.
+fn set_time_path(event: &wire::FileSetTimeEvent) -> String {
+    let depth = usize::from(event.depth).min(wire::SET_TIME_COMPONENTS);
+    let mut path = String::new();
+    if event.flags & wire::SET_TIME_TRUNCATED != 0 {
+        path.push_str("/...");
+    }
+    for slot in event.components[..depth].iter().rev() {
+        let end = slot.iter().position(|&b| b == 0).unwrap_or(slot.len());
+        if end == 0 {
+            continue;
+        }
+        path.push('/');
+        path.push_str(&String::from_utf8_lossy(&slot[..end]));
+    }
+    if path.is_empty() { "/".into() } else { path }
+}
+
 /// `inode_setattr` explicit timestamp request → the platform-neutral `FileSetTimeEvent`
 /// (#1036). Only the fields the caller chose (`flags`) are `Some`.
 #[must_use]
@@ -380,11 +399,9 @@ pub fn file_set_time(
     boot_epoch_offset_ns: u64,
     container: Option<ContainerContext>,
 ) -> Event {
-    let raw = &event.path[..(event.path_len as usize).min(wire::MAX_PATH_LEN)];
-    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
     Event::FileSetTime(schema::FileSetTimeEvent {
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
-        path: String::from_utf8_lossy(&raw[..end]).into_owned(),
+        path: set_time_path(event),
         creation_time: None,
         last_access_time: (event.flags & wire::SET_TIME_ATIME != 0)
             .then(|| unix_to_filetime(event.atime_sec, event.atime_nsec)),
@@ -1172,21 +1189,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn file_set_time_reports_only_the_times_the_caller_chose_in_filetime_units() {
-        let mut path = [0u8; wire::MAX_PATH_LEN];
-        path[..9].copy_from_slice(b"/tmp/a.sh");
-        let event = wire::FileSetTimeEvent {
+    fn set_time_event(names: &[&str], flags: u16) -> wire::FileSetTimeEvent {
+        let mut components = [[0u8; wire::SET_TIME_COMPONENT_LEN]; wire::SET_TIME_COMPONENTS];
+        for (slot, name) in components.iter_mut().zip(names) {
+            slot[..name.len()].copy_from_slice(name.as_bytes());
+        }
+        wire::FileSetTimeEvent {
             meta: wire_meta(b"touch"),
-            path,
-            path_len: 9,
-            flags: wire::SET_TIME_MTIME,
-            reserved: 0,
-            atime_sec: 123, // not chosen: must not surface
+            components,
+            depth: names.len() as u8,
+            reserved0: 0,
+            flags,
+            reserved1: 0,
+            atime_sec: 123, // set only when the flag says so
             atime_nsec: 0,
             mtime_sec: 1_262_304_000, // 2010-01-01T00:00:00Z
             mtime_nsec: 500,
-        };
+        }
+    }
+
+    #[test]
+    fn file_set_time_reports_only_the_times_the_caller_chose_in_filetime_units() {
+        let event = set_time_event(&["a.sh", "tmp"], wire::SET_TIME_MTIME);
         let Event::FileSetTime(e) = file_set_time(&event, 0, None) else {
             panic!("expected FileSetTime")
         };
@@ -1196,6 +1220,23 @@ mod tests {
         assert_eq!(e.change_time, None);
         // 2010-01-01 is 129_067_776_000_000_000 in FILETIME; 500 ns is five 100 ns ticks.
         assert_eq!(e.last_write_time, Some(129_067_776_000_000_005));
+    }
+
+    #[test]
+    fn file_set_time_path_is_joined_root_first_and_marks_an_incomplete_chain() {
+        let whole = set_time_event(&["auth.log", "log", "var"], wire::SET_TIME_MTIME);
+        assert_eq!(set_time_path(&whole), "/var/log/auth.log");
+        let cut = set_time_event(
+            &["auth.log", "log"],
+            wire::SET_TIME_MTIME | wire::SET_TIME_TRUNCATED,
+        );
+        assert_eq!(set_time_path(&cut), "/.../log/auth.log");
+        // A file at the root, an empty slot and a depth past the array are all handled.
+        assert_eq!(set_time_path(&set_time_event(&["x"], 0)), "/x");
+        assert_eq!(set_time_path(&set_time_event(&[], 0)), "/");
+        let mut deep = set_time_event(&["a"], 0);
+        deep.depth = 200;
+        assert!(set_time_path(&deep).ends_with("/a") || set_time_path(&deep) == "/a");
     }
 
     #[test]
