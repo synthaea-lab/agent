@@ -175,17 +175,20 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         let generation = sequence_number(&parser, "ProcessSequenceNumber");
         let parent_generation = sequence_number(&parser, "ParentProcessSequenceNumber");
 
-        // Never store "<unknown>": a cache hit on it would suppress live lookups.
-        if image_path != "<unknown>" {
-            // #371: read while the process most likely still runs; one already
-            // gone is in its parent's silo.
-            let parent_silo = state.pids.lock().unwrap().silo(ppid);
-            let silo = silo::exec_silo(winapi::read_server_silo_id(pid), parent_silo);
-            state
-                .pids
-                .lock()
-                .unwrap()
-                .insert(pid, image_path.clone(), generation, silo);
+        // #371: read while the process most likely still runs; one already
+        // gone is in its parent's silo.
+        let parent_silo = state.pids.lock().unwrap().silo(ppid);
+        let silo = silo::exec_silo(winapi::read_server_silo_id(pid), parent_silo);
+        {
+            let mut pids = state.pids.lock().unwrap();
+            // Never cache "<unknown>" as the image: a hit on it would suppress
+            // live lookups. The silo is kept either way, or the process's
+            // events would read as the host's.
+            if image_path == "<unknown>" {
+                pids.insert_without_image(pid, generation, silo);
+            } else {
+                pids.insert(pid, image_path.clone(), generation, silo);
+            }
         }
         // Lineage at exec time (schema parent fields): the parent is usually alive
         // and already in the store.

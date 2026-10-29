@@ -21,7 +21,10 @@ pub(crate) struct PidCache {
 }
 
 struct Entry {
-    image_path: String,
+    /// `None` for a process whose image could not be resolved: its silo and
+    /// stamp are still worth keeping, but [`PidCache::get`] misses so callers
+    /// keep trying a live lookup.
+    image_path: Option<String>,
     /// The kernel's process sequence number: unique per process for the boot,
     /// so it tells a recycled pid from the process cached under it. `None` when
     /// it could not be read.
@@ -57,6 +60,28 @@ impl PidCache {
         generation: Option<u64>,
         silo: Option<u32>,
     ) {
+        self.put(pid, Some(image_path), generation, silo);
+    }
+
+    /// A process whose image could not be resolved: its incarnation and silo
+    /// are recorded, so its events keep their container (#709 review), while
+    /// [`Self::get`] still misses for it.
+    pub(crate) fn insert_without_image(
+        &mut self,
+        pid: u32,
+        generation: Option<u64>,
+        silo: Option<u32>,
+    ) {
+        self.put(pid, None, generation, silo);
+    }
+
+    fn put(
+        &mut self,
+        pid: u32,
+        image_path: Option<String>,
+        generation: Option<u64>,
+        silo: Option<u32>,
+    ) {
         let last_used = self.next_tick();
         self.entries.insert(
             pid,
@@ -77,7 +102,7 @@ impl PidCache {
         let tick = self.next_tick();
         let entry = self.entries.get_mut(&pid)?;
         entry.last_used = tick;
-        Some(entry.image_path.as_str())
+        entry.image_path.as_deref()
     }
 
     /// The process sequence number cached for `pid`, without refreshing recency.
@@ -168,6 +193,15 @@ mod tests {
         assert_eq!(cache.get(42), Some(r"C:\Users\Public\evil.exe"));
         assert_eq!(cache.generation(42), Some(9));
         assert_eq!(cache.silo(42), Some(7));
+    }
+
+    #[test]
+    fn a_process_without_a_known_image_keeps_its_silo_but_misses_on_get() {
+        let mut cache = PidCache::new(8);
+        cache.insert_without_image(42, Some(9), Some(7));
+        assert_eq!(cache.silo(42), Some(7));
+        assert_eq!(cache.generation(42), Some(9));
+        assert!(cache.get(42).is_none());
     }
 
     #[test]
