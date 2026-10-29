@@ -52,7 +52,7 @@ pub struct FileEnrichment {
     /// same budget as the hash, see `pe_info`'s module doc for why reading it
     /// costs comparably little once the file is already open for the other two.
     pub pe_info: PeInfo,
-    /// [`image_identity`] of the file the verdict and the hash were read from, taken
+    /// [`path_identity`] of the file the verdict and the hash were read from, taken
     /// from the same handle (#688); `None` when the file system gave no identity.
     pub file_id: Option<String>,
 }

@@ -484,6 +484,7 @@ unsafe extern "system" {
 /// The identity of the file at `path` as [`crate::identity_token`]: opened shared for delete
 /// (std's default on Windows, so it cannot block the rename a dropper is about to do), one
 /// query, no read. `None` when the file cannot be opened or the file system reports no id.
+#[must_use]
 pub fn image_file_id(path: &std::path::Path) -> Option<String> {
     use std::os::windows::io::AsRawHandle as _;
     let file = std::fs::File::open(path).ok()?;
