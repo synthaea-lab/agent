@@ -20,7 +20,11 @@
 //! - An exploit run *inside* a listed binary (a heap overflow in `sudo` itself) makes the same
 //!   request as the real one: silent.
 //! - A pid whose exec the agent did not see (it started before the agent) has no image: silent,
-//!   since "unknown" is not evidence against `sudo`.
+//!   since "unknown" is not evidence against `sudo`. A child that forked and never exec'd takes
+//!   its **parent's** image (`RuleState::reader_image`): the `fork()`ed winner of a race-window
+//!   exploit alerts as the exploit, and `sshd`'s privilege-separated children resolve to
+//!   `sshd-session`. Only **one** level is followed: a grandchild forked twice without an exec
+//!   has no image and is silent.
 //! - `setreuid` is not in [`schema::IdentityChangeKind`]: an exploit that finishes with it is
 //!   not seen. Group ids and `setfsuid` are not read.
 //! - Other setuid programs (`pkexec`, `newuidmap`, polkit helpers, `unix_chkpwd`, `fusermount`,

@@ -2122,16 +2122,14 @@ impl RuleState {
 
     /// To be called for every `IdentityChangeEvent` in the stream (Linux, issue #266):
     /// SETUID-ROOT-REQUEST (T1548.001, #1041), see [`crate::privesc`]. The image is the
-    /// pid's exec-time path from [`Self::pid_image_path`], never `comm`; no image means no
-    /// alert.
+    /// pid's exec-time path (its parent's for a child that forked and never exec'd, see
+    /// [`Self::reader_image`]), never `comm`; no image means no alert.
     pub fn on_identity_change(&mut self, event: &schema::IdentityChangeEvent) -> Vec<Alert> {
         if !crate::privesc::requests_root_as_non_root(event) {
             return Vec::new();
         }
         let generation = event.meta.process_generation;
-        let Some(image) =
-            PidFact::current(&self.pid_image_path, event.meta.pid, generation).map(str::to_owned)
-        else {
+        let Some(image) = self.reader_image(&event.meta).map(str::to_owned) else {
             return Vec::new();
         };
         if image.is_empty() || crate::privesc::is_known_setuid_root_program(&image) {

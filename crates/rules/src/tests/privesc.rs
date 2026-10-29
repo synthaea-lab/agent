@@ -2,11 +2,11 @@
 //! lab run of 2026-10-29 (`lab/captures/test-1041-20261029/`): `meta.user` is the caller's real
 //! uid, `4294967295` is `setresuid`'s "unchanged".
 
-use schema::{EventMeta, ExecEvent, IdentityChangeEvent, IdentityChangeKind, User};
+use schema::{
+    EventMeta, ExecEvent, IdentityChangeEvent, IdentityChangeKind, User, detection::Severity,
+};
 
 use super::meta;
-use schema::detection::Severity;
-
 use crate::RuleState;
 
 const NONE: u32 = u32::MAX;
@@ -240,4 +240,61 @@ fn a_system_path_alone_does_not_vouch_for_a_non_setuid_name() {
             .len(),
         1
     );
+}
+
+/// A call made by `pid`, a child (`ppid`, whose incarnation is `parent_generation`) that forked
+/// and never exec'd.
+fn forked_child_call(
+    pid: u32,
+    ppid: u32,
+    parent_generation: Option<u64>,
+    comm: &str,
+) -> IdentityChangeEvent {
+    let mut event = set_uid(pid, 1001, comm, 0);
+    event.meta.ppid = ppid;
+    event.meta.parent_process_generation = parent_generation;
+    event
+}
+
+#[test]
+fn a_forked_child_of_an_unknown_image_still_alerts() {
+    // The final `setuid(0); exec /bin/sh` of a race-window exploit often runs in a forked child:
+    // a new pid with no exec of its own, so it takes its parent's image.
+    let mut state = RuleState::new();
+    exec(&mut state, 100, Some(7), "/tmp/exploit", "exploit");
+    let alerts = state.on_identity_change(&forked_child_call(101, 100, Some(7), "exploit"));
+    assert_eq!(alerts.len(), 1);
+    assert!(alerts[0].message.contains("/tmp/exploit"));
+}
+
+#[test]
+fn a_forked_child_of_a_setuid_root_program_stays_silent() {
+    // sshd's privilege-separated children and sudo's own forks resolve to the listed program.
+    for (image, comm) in [
+        ("/usr/libexec/openssh/sshd-session", "sshd-session"),
+        ("/usr/bin/sudo", "sudo"),
+    ] {
+        let mut state = RuleState::new();
+        exec(&mut state, 110, Some(7), image, comm);
+        let call = forked_child_call(111, 110, Some(7), comm);
+        assert!(state.on_identity_change(&call).is_empty(), "{image}");
+    }
+}
+
+#[test]
+fn a_child_whose_parent_is_another_incarnation_is_unknown() {
+    // The parent pid now belongs to a different process: its image says nothing about the child.
+    let mut state = RuleState::new();
+    exec(&mut state, 120, Some(7), "/tmp/exploit", "exploit");
+    let call = forked_child_call(121, 120, Some(9), "exploit");
+    assert!(state.on_identity_change(&call).is_empty());
+}
+
+#[test]
+fn only_one_level_of_fork_is_followed() {
+    // Pins the documented limit: a grandchild forked twice without an exec has no image.
+    let mut state = RuleState::new();
+    exec(&mut state, 130, Some(7), "/tmp/exploit", "exploit");
+    let grandchild = forked_child_call(132, 131, Some(8), "exploit");
+    assert!(state.on_identity_change(&grandchild).is_empty());
 }
