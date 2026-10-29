@@ -18,16 +18,13 @@ use aya_log_ebpf::{info, warn};
 use sensor_linux_wire::{
     BpfEvent, CapSetEvent, ConnectEvent, DnsUdpQueryEvent, ExecEvent, FileChmodEvent,
     FileChownEvent, FileDeleteEvent, FileOpenEvent, FileRemovexattrEvent, FileRenameEvent,
-    FileSetxattrEvent, FileWriteEvent, GetAddrInfoEvent, IdentityChangeEvent, KernelModuleEvent,
-    LineageEntry, MAX_DNS_ANSWERS, MAX_DNS_UDP_PAYLOAD, MAX_TLS_CAPTURE, MemfdCreateEvent,
-    MountEvent, NamespaceEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
-    ReadlineInputEvent, SignalEvent, SocketAcceptEvent, SocketBindEvent, SocketCreateEvent,
-    SocketListenEvent, TASK_COMM_LEN, TlsCaptureEvent, UdpRecvEvent, UdpSendEvent,
-    is_filtered_path,
-};
-use sensor_linux_wire::{
-    FileSetTimeEvent, SET_TIME_ATIME, SET_TIME_COMPONENT_LEN, SET_TIME_COMPONENTS, SET_TIME_MTIME,
-    SET_TIME_TRUNCATED,
+    FileSetTimeEvent, FileSetxattrEvent, FileWriteEvent, GetAddrInfoEvent, IdentityChangeEvent,
+    KernelModuleEvent, LineageEntry, MAX_DNS_ANSWERS, MAX_DNS_UDP_PAYLOAD, MAX_TLS_CAPTURE,
+    MemfdCreateEvent, MountEvent, NamespaceEvent, PrctlEvent, ProcessVmReadEvent,
+    ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, SET_TIME_ATIME, SET_TIME_COMPONENT_LEN,
+    SET_TIME_COMPONENTS, SET_TIME_MTIME, SET_TIME_TRUNCATED, SignalEvent, SocketAcceptEvent,
+    SocketBindEvent, SocketCreateEvent, SocketListenEvent, TASK_COMM_LEN, TlsCaptureEvent,
+    UdpRecvEvent, UdpSendEvent, is_filtered_path,
 };
 
 // Raw scheduler tracepoints expose task pointers instead of formatted event records.
