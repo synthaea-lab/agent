@@ -121,3 +121,60 @@ fn linux_a_request_with_no_chosen_time_does_not_alert() {
     event.last_write_time = None;
     assert!(evaluate_file_set_time(&event).is_empty());
 }
+
+#[test]
+fn linux_one_alert_per_process_per_window_not_one_per_file() {
+    use crate::RuleState;
+    let mut state = RuleState::new();
+    let at = |pid: u32, ts: u64, path: &str| {
+        let mut e = linux_event("tar");
+        e.meta.pid = pid;
+        e.meta.timestamp_ns = ts;
+        e.path = path.into();
+        e
+    };
+    // A 3000-file unpack by one process: a single alert, for the first file.
+    let first = state.on_file_set_time(&at(7, 1_000, "/srv/a/f0"));
+    assert_eq!(first.len(), 1);
+    for i in 1..3000u64 {
+        assert!(
+            state
+                .on_file_set_time(&at(7, 1_000 + i * 1_000_000, &format!("/srv/a/f{i}")))
+                .is_empty()
+        );
+    }
+    // Another process (a stomping script's next `touch`) alerts on its own.
+    assert_eq!(state.on_file_set_time(&at(8, 5_000, "/srv/b")).len(), 1);
+    // The same process alerts again once the window has passed.
+    assert_eq!(
+        state
+            .on_file_set_time(&at(7, 1_000 + 61_000_000_000, "/srv/late"))
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn a_recycled_pid_is_another_process_for_the_dedup() {
+    use crate::RuleState;
+    let mut state = RuleState::new();
+    let mut a = linux_event("touch");
+    a.meta.process_generation = Some(1);
+    let mut b = linux_event("touch");
+    b.meta.process_generation = Some(2);
+    assert_eq!(state.on_file_set_time(&a).len(), 1);
+    assert_eq!(
+        state.on_file_set_time(&b).len(),
+        1,
+        "same pid, other incarnation"
+    );
+}
+
+#[test]
+fn windows_set_time_events_are_not_deduplicated_per_process() {
+    use crate::RuleState;
+    let mut state = RuleState::new();
+    for _ in 0..3 {
+        assert_eq!(state.on_file_set_time(&event()).len(), 1);
+    }
+}

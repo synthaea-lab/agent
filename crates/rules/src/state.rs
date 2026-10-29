@@ -284,6 +284,9 @@ pub struct RuleState {
     recent_motw_removals: BoundedMap<String, MotwRemoval>,
     /// (ppid, comm) → sliding counter for SELF-SPAWN (T1059 Windows). LRU-bounded.
     self_spawn: BoundedMap<(u32, String), SlidingCounter>,
+    /// Linux timestomp alerts already raised, per process incarnation `(pid, generation)`
+    /// (#1036): one alert per window per process, see [`Self::on_file_set_time`].
+    set_time_alerted: BoundedMap<(u32, u64), SlidingCounter>,
     /// (comm, daddr, dport) → sliding counter for BEACON (T1071 Windows). LRU-bounded.
     beacon: BoundedMap<(String, String, u16), SlidingCounter>,
     /// Same key as `beacon` → which local ports have already counted toward it —
@@ -520,6 +523,8 @@ const PID_COMM_CAP: usize = 65_536;
 /// Counter/write-history bounds — one logical entity per key, far fewer than pids.
 pub(crate) const COUNTER_CAP: usize = 16_384;
 const RECENT_WRITES_CAP: usize = 4_096;
+/// One Linux timestomp alert per process incarnation per this window (#1036).
+const SET_TIME_ALERT_WINDOW_NS: u64 = 60_000_000_000;
 
 impl Default for RuleState {
     fn default() -> Self {
@@ -538,6 +543,7 @@ impl RuleState {
             recent_bits_downloads: BoundedMap::new(RECENT_WRITES_CAP),
             recent_motw_removals: BoundedMap::new(RECENT_WRITES_CAP),
             self_spawn: BoundedMap::new(COUNTER_CAP),
+            set_time_alerted: BoundedMap::new(COUNTER_CAP),
             ldap_burst: crate::ldap::LdapBurst::new(),
             beacon: BoundedMap::new(COUNTER_CAP),
             beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
@@ -3022,6 +3028,29 @@ impl RuleState {
         self.record_touched(event.meta.pid, Event::FileRename(event.clone()));
         let mut alerts: Vec<Alert> = self.check_mass_rename_pattern(event).into_iter().collect();
         alerts.extend(self.check_burst_write_volume(event));
+        alerts
+    }
+
+    /// T1070.006, from `FileSetTimeEvent`s ([`crate::evaluate_file_set_time`]), deduplicated per
+    /// process on Linux (#1036): the `inode_setattr` hook reports every explicit time, and
+    /// `tar x`, `cp -a`, `rsync -a` and `cpio` set one per file, so a 3000-file unpack raised
+    /// about 1000 Low alerts in the lab (the rest were lost to the ring buffer). One alert per
+    /// process incarnation per [`SET_TIME_ALERT_WINDOW_NS`] says the same thing; every `touch -d`
+    /// of a stomping script is its own process and still alerts. Windows events carry no
+    /// trustworthy process (the minifilter's `comm` is empty), so they pass through as before.
+    pub fn on_file_set_time(&mut self, event: &schema::FileSetTimeEvent) -> Vec<Alert> {
+        let mut alerts = crate::evaluate_file_set_time(event);
+        if alerts.is_empty() || !matches!(event.meta.user, schema::User::Unix { .. }) {
+            return alerts;
+        }
+        let key = (event.meta.pid, event.meta.process_generation.unwrap_or(0));
+        let first = self
+            .set_time_alerted
+            .get_or_insert_with(key, SlidingCounter::default)
+            .try_alert(event.meta.timestamp_ns, SET_TIME_ALERT_WINDOW_NS);
+        if !first {
+            alerts.clear();
+        }
         alerts
     }
 

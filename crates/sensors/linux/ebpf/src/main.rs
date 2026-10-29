@@ -3171,9 +3171,11 @@ static DENTRY_NAME_PTR_OFFSET: Global<u32> = Global::new(0);
 const ATTR_ATIME_SET: u32 = 1 << 7;
 const ATTR_MTIME_SET: u32 = 1 << 8;
 
-/// Ring buffer shared with userspace for explicit timestamp requests.
+/// Ring buffer shared with userspace for explicit timestamp requests. One event is about
+/// 400 bytes and `tar x`/`cp -a` of a few thousand files emit one per file in a burst: 256 KiB
+/// lost two thirds of a 3000-file unpack in the lab (#1044), so this one has 1 MiB.
 #[map]
-static FILE_SET_TIME_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+static FILE_SET_TIME_EVENTS: RingBuf = RingBuf::with_byte_size(1024 * 1024, 0);
 
 /// Per-CPU scratch for building one `FileSetTimeEvent` (see `EXEC_SCRATCH`).
 #[map]
