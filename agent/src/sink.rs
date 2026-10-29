@@ -5,10 +5,11 @@
 //! and a few lines in `on_event`.
 
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
@@ -63,6 +64,10 @@ pub(crate) struct DetectionSink {
     /// `reload_content`, like the engines above, so a reader never sees a half-loaded
     /// filter; nothing reads it on the capture path yet (the lookup is the next slice).
     common_set: Arc<Mutex<Option<Arc<ml::features::common_set::CommonSetSnapshot>>>>,
+    /// On-device IOC matching (#60, ADR-0038) over `<content_root>/ioc/`: exec image hashes on the
+    /// enrichment worker, connect destinations on the capture thread. Shared with the worker,
+    /// which is the only place an exec's hash is known.
+    ioc: Arc<crate::ioc::IocMatcher>,
     /// What became of the rarity judgements, for the health beacon.
     rarity_stats: Arc<RarityStats>,
     /// Tamper-class alerts raised since the agent started (a sensor confirmed silent, a shipped
@@ -125,12 +130,22 @@ pub(crate) struct DetectionSink {
     canary_allow: std::sync::OnceLock<crate::deception::CanaryAllow>,
     /// The image each process was seen to execute, so `canary_allow` need not read `/proc`.
     exec_images: Mutex<crate::deception::ExecImages>,
+    /// Canary touches by a process whose `Exec` was not recorded yet, waiting for it (#81),
+    /// oldest first. Only filled when `canary_allow` lists an executable.
+    held_canary: Mutex<VecDeque<HeldTouch>>,
+    /// Length of `held_canary`, so the common empty case costs no lock per event.
+    held_canary_len: AtomicUsize,
     /// When each `(canary, pid, incarnation of pid)` last raised a detection (event time,
     /// ns), so a tool that reads the same canary again and again raises one finding per
     /// cooldown, not one per open. Only read opens are absorbed (see [`absorbable`]);
     /// bounded; the hits it absorbs are counted in `canary_hits_absorbed`.
     canary_last_hit: Mutex<store::BoundedMap<CanaryKey, u64>>,
     canary_hits_absorbed: AtomicU64,
+    /// Touches judged at once because the hold queue was full, and touches raised after a hold
+    /// that ended with no allowed exec: the two outcomes of the hold that bring the false
+    /// positive back, counted and logged like `canary_hits_absorbed` (#81 review).
+    canary_hold_overflow: AtomicU64,
+    canary_hold_expired: AtomicU64,
     /// The ransomware reflex's trigger (#82): a process that raised the burst rule and
     /// touched a canary inside one window. See [`crate::ransomware_join`].
     ransomware_join: Mutex<crate::ransomware_join::RansomwareJoin>,
@@ -177,6 +192,19 @@ fn absorbable(touch: &deception::Touch) -> bool {
 /// How long one process's repeat touches of one canary are absorbed after a detection.
 const CANARY_COOLDOWN_NS: u64 = 60 * 1_000_000_000;
 
+/// How long (event time) a canary touch by a process whose `Exec` the sink has not recorded
+/// waits for it before it is judged on what is known. The sensor stamps an `exec` before the
+/// open that follows it, but the merged stream can deliver the open first: on the lab VM the
+/// open of a cron-started `tar` came about 80 events before its own `exec`, and the process had
+/// already exited, so `/proc` said nothing and the allow list refused it (#81). Half a second
+/// is far longer than that lag and short for a detection that is not corroborated by anything.
+const CANARY_EXEC_HOLD_NS: u64 = 500_000_000;
+
+/// Most touches held at once. A host with an allow list under an open flood must not grow
+/// this without bound, and a flood must not be a way to delay findings: past the bound a
+/// touch is judged at once, as it was before the hold existed.
+const MAX_HELD_CANARY_TOUCHES: usize = 256;
+
 /// Most `(canary, pid)` pairs the cooldown remembers; the oldest are evicted first, which
 /// at worst lets one more detection through.
 const CANARY_COOLDOWN_KEYS: usize = 1024;
@@ -191,6 +219,31 @@ const RANSOMWARE_REFLEX_REASON: &str =
 /// semi-frozen schema, so deception provenance rides in the rule id until a dedicated
 /// variant is decided (#81).
 const CANARY_RULE_ID: &str = "DECEPTION-CANARY";
+
+/// What the allow list makes of a canary touch.
+enum CanaryVerdict {
+    /// The toucher runs an allowed executable.
+    Allowed,
+    /// Not allowed by what the sink knows, and `/proc` names no executable (the process already
+    /// exited): an `Exec` may still be on its way, either the first (none recorded) or the last of
+    /// several. A process `/proc` shows running something else is not unknown, it is not allowed:
+    /// `/proc` is read after the touch, so it shows the image the touch was made by or a later one.
+    Unknown,
+    /// Not allowed, and nothing more to wait for.
+    Raise,
+}
+
+/// A canary touch waiting for the `Exec` of its process (#81).
+struct HeldTouch {
+    event: Event,
+    /// Event time of the touch, ns: the hold runs from it, and only an `exec` at or before it
+    /// can excuse the touch.
+    since_ns: u64,
+    /// The latest image of this incarnation exec'd at or before the touch, as far as the sink has
+    /// seen one. The final verdict is taken on it, not on the table's newest entry, which a
+    /// later `exec` (one the touch cannot have been made by) may have replaced.
+    image: Option<crate::deception::ExecImage>,
+}
 
 /// Most renames and deletions a ransomware detection carries beyond its triggering event.
 /// A bound on the size of one detection: the correlator window is 60 s, and a fast
@@ -321,6 +374,37 @@ fn record_rule_alert(
     record_detection(verdict, alert_log, finding, event, Vec::new(), persist);
 }
 
+/// [`record_detection`] for one IOC match (#60). The worker records it for an exec image, the
+/// capture thread through [`DetectionSink::record_ioc`] for a connect.
+fn record_ioc_hit(
+    verdict: &Mutex<verdict::VerdictEngine>,
+    alert_log: &AlertLog,
+    event: &Event,
+    hit: crate::ioc::IocHit,
+    persist: Option<&dyn Fn(schema::detection::Detection)>,
+) {
+    let message = hit.message(&event.meta().comm);
+    let severity = hit.severity();
+    let finding = Finding {
+        entity: &entity_key(event.meta()),
+        technique: crate::ioc::IOC_TECHNIQUE,
+        message: &message,
+        source: ioc_source(hit),
+        severity,
+    };
+    record_detection(verdict, alert_log, finding, event, Vec::new(), persist);
+}
+
+fn ioc_source(hit: crate::ioc::IocHit) -> schema::detection::DetectionSource {
+    schema::detection::DetectionSource::Ioc {
+        kind: hit.kind,
+        indicator: hit.indicator,
+        feed: hit.feed,
+        feed_version: hit.feed_version,
+        reference: None,
+    }
+}
+
 /// The enrichment worker's append to the durable detection spool. A failure
 /// loses only the upload copy: the finding is already in the alert log.
 fn spool_on_worker(
@@ -379,6 +463,14 @@ fn crosses_kill_gate(technique: &str) -> bool {
     technique == "BAYES"
 }
 
+/// Why the kill gate refuses a system service's main process (#652, ADR-0028).
+// Review of #755 (SherlockOmss, 2026-10-19): the old wording ("package-owned
+// binary") claimed more than `service_main_path_is_trusted` checks — nothing
+// here asks whether a package actually owns the file, only where it lives and
+// who started it. An analyst reading `alerts.ndjson` would otherwise take
+// "package-owned" as verified.
+const SERVICE_MAIN_REFUSAL: &str = "main process of a system service (image under a system path, started by init); escalated, not killed";
+
 /// ATT&CK technique ids folded into a [`schema::detection::Detection`] from the
 /// `technique` string this crate already uses as the dedup/alert-log key.
 /// Same convention `tools/attack-coverage.py` uses to build the coverage doc:
@@ -389,7 +481,7 @@ fn crosses_kill_gate(technique: &str) -> bool {
 /// real ATT&CK ids and fold to an empty list, same as
 /// `tools/attack-coverage.py`'s own `BAYES_SENTINEL` skip.
 fn techniques_from(technique: &str) -> Vec<String> {
-    if technique == "BAYES" || technique == "Sigma" {
+    if technique == "BAYES" || technique == "Sigma" || technique == crate::ioc::IOC_TECHNIQUE {
         Vec::new()
     } else {
         technique.split('/').map(str::to_string).collect()
@@ -443,13 +535,25 @@ impl DetectionSink {
             let mut correlator = self.correlator.lock().unwrap();
             correlator.advance_time(now_ns)
         };
-        self.emit_correlator_alerts(&alerts, None);
+        // BAYES is the only technique `crosses_kill_gate` recognizes, and it is raised
+        // only from the per-event path below (`CorrelationEngine::bayes_alert`'s one call
+        // site), never from `advance_time`'s window-expiry alerts — so `service_main`
+        // is never read on this path, and `false` is a placeholder, not a real claim
+        // about any pid here (issue #652).
+        self.emit_correlator_alerts(&alerts, None, false);
     }
 
+    /// `service_main` is the correlator's provenance verdict for the event this batch of
+    /// alerts was produced from (issue #652) — meaningful only when a `BAYES` alert is
+    /// among them, since that is the only technique [`crosses_kill_gate`] recognizes, and
+    /// `CorrelationAlert::trigger_event` is always `None` for it (so it always resolves to
+    /// `default_event`, never to a different pid than the one `service_main` was computed
+    /// for).
     fn emit_correlator_alerts(
         &self,
         alerts: &[correlator::CorrelationAlert],
         default_event: Option<&Event>,
+        service_main: bool,
     ) {
         let mut high_confidence_pid = None;
         for alert in alerts {
@@ -472,7 +576,7 @@ impl DetectionSink {
             }
         }
         if let Some(pid) = high_confidence_pid {
-            self.maybe_kill(pid);
+            self.maybe_kill(pid, service_main);
         }
     }
 
@@ -518,6 +622,8 @@ impl DetectionSink {
         let rarity_stats = Arc::new(RarityStats::default());
         let (rarity_correlator, rarity_common_set, worker_rarity_stats) =
             (correlator.clone(), common_set.clone(), rarity_stats.clone());
+        let ioc = Arc::new(crate::ioc::IocMatcher::new(&content_root));
+        let worker_ioc = ioc.clone();
         let (gate_verdict, gate_alert_log) = (verdict.clone(), alert_log.clone());
         let (gate_spool, worker_spool) = (detection_spool.clone(), detection_spool.clone());
         let enrich_queue = EnrichQueue::start_with_detections(
@@ -530,12 +636,21 @@ impl DetectionSink {
                     let persist = gate_spool.as_ref().map(|_| &persist as &dyn Fn(_));
                     record_rule_alert(&gate_verdict, &gate_alert_log, &event, &alert, persist);
                 }
+                if let Event::Exec(exec) = &event
+                    && let Some(hit) =
+                        worker_ioc.check_exec_image(exec.sha256.as_deref(), exec.meta.timestamp_ns)
+                {
+                    let persist = |detection| spool_on_worker(gate_spool.as_deref(), detection);
+                    let persist = gate_spool.as_ref().map(|_| &persist as &dyn Fn(_));
+                    record_ioc_hit(&gate_verdict, &gate_alert_log, &event, hit, persist);
+                }
                 if let Event::Exec(exec) = &event {
                     note_image_rarity(
                         &rarity_correlator,
                         &rarity_common_set,
                         &worker_rarity_stats,
                         exec,
+                        unix_now_secs(),
                     );
                 }
                 let mut safe_event = event.clone();
@@ -560,6 +675,7 @@ impl DetectionSink {
             ml_scorer: Mutex::new(Self::load_correlation_scorer(model_root)),
             sigma: Mutex::new(load_sigma_rules(&content_root).into_option()),
             common_set,
+            ioc,
             rarity_stats,
             tamper_events: AtomicU64::new(0),
             yara: Mutex::new(
@@ -584,8 +700,12 @@ impl DetectionSink {
             tripwires: std::sync::OnceLock::new(),
             canary_allow: std::sync::OnceLock::new(),
             exec_images: Mutex::new(crate::deception::ExecImages::new()),
+            held_canary: Mutex::new(VecDeque::new()),
+            held_canary_len: AtomicUsize::new(0),
             canary_last_hit: Mutex::new(store::BoundedMap::new(CANARY_COOLDOWN_KEYS)),
             canary_hits_absorbed: AtomicU64::new(0),
+            canary_hold_overflow: AtomicU64::new(0),
+            canary_hold_expired: AtomicU64::new(0),
             ransomware_join: Mutex::new(crate::ransomware_join::RansomwareJoin::new()),
         })
     }
@@ -646,16 +766,8 @@ impl DetectionSink {
         drop(yara_slot);
         drop(old_yara);
 
-        // Same posture for the snapshot: absent unloads (the evidence is withheld), broken
-        // keeps the previous one (its failure is logged by the loader).
-        let mut common_set_slot = self.common_set.lock().unwrap();
-        let old_common_set = match common_set_loaded {
-            Load::Loaded(snapshot) => common_set_slot.replace(Arc::new(snapshot)),
-            Load::Absent => common_set_slot.take(),
-            Load::Failed => None,
-        };
-        drop(common_set_slot);
-        drop(old_common_set);
+        self.swap_common_set(common_set_loaded);
+        self.ioc.reload(&self.content_root);
 
         // Same rules, same posture as the file scanner: absent unloads, broken keeps
         // the previous queue (its failure is already reported through `yara`).
@@ -892,6 +1004,10 @@ impl DetectionSink {
     /// A touch of a planted canary by any process but the agent itself is a detection:
     /// nothing legitimate reads these files. The agent's own pid is skipped because it
     /// writes them at start and verifies them later.
+    ///
+    /// When the process is unknown (no `Exec` recorded for this incarnation) and an
+    /// executable is allowed, the decision waits up to [`CANARY_EXEC_HOLD_NS`] for its `Exec`
+    /// ([`Self::hold_canary`]): the stream can deliver the open before the exec it follows.
     fn detect_canary(&self, event: &Event) {
         let Some(tripwires) = self.tripwires.get() else {
             return;
@@ -902,22 +1018,181 @@ impl DetectionSink {
         if hit.pid == std::process::id() {
             return;
         }
-        if self.canary_allow.get().is_some_and(|allow| {
-            // Cloned out so the lock is not held across the `/proc` fallback inside `allows`:
-            // `detect_exec` takes it for every exec event.
-            let seen = self
-                .exec_images
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .image_of(hit.pid, event.meta().process_generation);
-            allow.allows(hit.pid, seen.as_ref())
-        }) {
-            tracing::debug!(
-                pid = hit.pid,
-                "deception: canary touch by an allowed executable"
-            );
+        let seen = self.image_before(hit.pid, event);
+        match self.canary_verdict(hit.pid, seen.as_ref()) {
+            CanaryVerdict::Allowed => {
+                tracing::debug!(
+                    pid = hit.pid,
+                    "deception: canary touch by an allowed executable"
+                );
+                return;
+            }
+            CanaryVerdict::Unknown if self.hold_canary(event, seen) => return,
+            CanaryVerdict::Unknown | CanaryVerdict::Raise => {}
+        }
+        self.raise_canary(event, false);
+    }
+
+    /// The image the table holds for the process that made `event`, when it exec'd at or before
+    /// the touch: a later `exec` of the same process (an allowed `tar` run after an open by
+    /// something else) must not excuse a touch it did not make.
+    fn image_before(&self, pid: u32, event: &Event) -> Option<crate::deception::ExecImage> {
+        let meta = event.meta();
+        // Cloned out so the lock is not held across the `/proc` fallback inside `allows`:
+        // `detect_exec` takes it for every exec event.
+        self.exec_images
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .image_of_not_after(pid, meta.process_generation, meta.timestamp_ns)
+    }
+
+    /// What the allow list says about the process `pid`, given the image it was seen to exec.
+    fn canary_verdict(
+        &self,
+        pid: u32,
+        seen: Option<&crate::deception::ExecImage>,
+    ) -> CanaryVerdict {
+        let Some(allow) = self.canary_allow.get() else {
+            return CanaryVerdict::Raise;
+        };
+        if allow.allows(pid, seen) {
+            CanaryVerdict::Allowed
+        } else if !allow.is_empty()
+            && !allow.refuses_outright(pid, seen)
+            && !allow.proc_names_an_exe(pid)
+        {
+            CanaryVerdict::Unknown
+        } else {
+            CanaryVerdict::Raise
+        }
+    }
+
+    /// Holds `event` until the hold runs out, for the `Exec` of its process to be recorded.
+    /// False when the queue is full: the caller then judges the touch at once, and the
+    /// overflow is counted (it brings the false positive back without a trace otherwise).
+    fn hold_canary(&self, event: &Event, image: Option<crate::deception::ExecImage>) -> bool {
+        let mut held = self
+            .held_canary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if held.len() >= MAX_HELD_CANARY_TOUCHES {
+            let overflowed = self.canary_hold_overflow.fetch_add(1, Ordering::Relaxed) + 1;
+            if overflowed.is_power_of_two() {
+                tracing::warn!(
+                    overflowed_total = overflowed,
+                    "deception: canary hold queue full, touch judged without waiting for its exec"
+                );
+            }
+            return false;
+        }
+        held.push_back(HeldTouch {
+            event: event.clone(),
+            since_ns: event.meta().timestamp_ns,
+            image,
+        });
+        self.held_canary_len.store(held.len(), Ordering::Relaxed);
+        true
+    }
+
+    /// Records, on the held touches of the incarnation that has just exec'd, the image of this
+    /// exec when it happened at or before the touch (the latest such one wins: a process may exec
+    /// more than once, `bash -c "tar ..."` is `bash`, then `tar` in one pid). An exec after the
+    /// touch says nothing about who made it and is ignored. The decision itself is taken when
+    /// the hold ends ([`Self::judge_held`]).
+    ///
+    /// An exec without a generation never counts: a pid reused within the hold would match the
+    /// touch of its previous life.
+    fn record_exec_on_held(&self, exec: &schema::ExecEvent) {
+        let generation = exec.meta.process_generation;
+        if generation.is_none() || self.held_canary_len.load(Ordering::Relaxed) == 0 {
             return;
         }
+        let image = crate::deception::ExecImage::from_exec(exec);
+        let mut held = self
+            .held_canary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for touch in held.iter_mut() {
+            let meta = touch.event.meta();
+            if meta.pid == exec.meta.pid
+                && meta.process_generation == generation
+                && image.precedes(touch.since_ns)
+                && touch
+                    .image
+                    .as_ref()
+                    .is_none_or(|previous| previous.precedes(image.timestamp_ns()))
+            {
+                touch.image = Some(image.clone());
+            }
+        }
+    }
+
+    /// Judges the held touches older than the hold, at event time `now_ns`.
+    fn expire_held_canary(&self, now_ns: u64) {
+        if self.held_canary_len.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let due =
+            self.take_held(|held| now_ns.saturating_sub(held.since_ns) >= CANARY_EXEC_HOLD_NS);
+        self.judge_held(due);
+    }
+
+    /// Removes and returns the held touches `pick` selects, oldest first.
+    fn take_held(&self, pick: impl Fn(&HeldTouch) -> bool) -> Vec<HeldTouch> {
+        let mut held = self
+            .held_canary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut taken = Vec::new();
+        let mut kept = VecDeque::new();
+        for touch in held.drain(..) {
+            if pick(&touch) {
+                taken.push(touch);
+            } else {
+                kept.push_back(touch);
+            }
+        }
+        *held = kept;
+        self.held_canary_len.store(held.len(), Ordering::Relaxed);
+        taken
+    }
+
+    /// The final decision on touches that waited: allowed ones are dropped, every other is
+    /// raised (and counted as expired), whether its exec arrived or not.
+    fn judge_held(&self, touches: Vec<HeldTouch>) {
+        for held in touches {
+            let pid = held.event.meta().pid;
+            if matches!(
+                self.canary_verdict(pid, held.image.as_ref()),
+                CanaryVerdict::Allowed
+            ) {
+                tracing::debug!(pid, "deception: held canary touch by an allowed executable");
+                continue;
+            }
+            let expired = self.canary_hold_expired.fetch_add(1, Ordering::Relaxed) + 1;
+            if expired.is_power_of_two() {
+                tracing::info!(
+                    expired_total = expired,
+                    "deception: held canary touch raised, no allowed exec before it"
+                );
+            }
+            self.raise_canary(&held.event, true);
+        }
+    }
+
+    /// Records the detection for a canary touch that no allow-list entry excuses, and the
+    /// ransomware reflex when the same process also burst.
+    ///
+    /// `late` is a touch that waited out the hold. The ransomware reflex does not kill from it:
+    /// `/proc` named nothing for the process when it was held, so by now it is gone or its pid
+    /// is someone else's, and the reflex kills by pid.
+    fn raise_canary(&self, event: &Event, late: bool) {
+        let Some(tripwires) = self.tripwires.get() else {
+            return;
+        };
+        let Some(hit) = tripwires.matches(event) else {
+            return;
+        };
         let meta = event.meta();
         let corroborated = self.ransomware_join.lock().unwrap().note_canary(
             hit.pid,
@@ -938,7 +1213,7 @@ impl DetectionSink {
             );
             // The finding was raised by the touch that started the cooldown; the reflex
             // does not wait for a new one.
-            if corroborated {
+            if corroborated && !late {
                 self.ransomware_reflex(hit.pid);
             }
             return;
@@ -961,8 +1236,13 @@ impl DetectionSink {
             event,
             Vec::new(),
         );
-        if corroborated {
+        if corroborated && !late {
             self.ransomware_reflex(hit.pid);
+        } else if corroborated {
+            tracing::info!(
+                pid = hit.pid,
+                "deception: ransomware reflex skipped for a canary touch judged after the hold"
+            );
         }
     }
 
@@ -977,6 +1257,21 @@ impl DetectionSink {
         }
         last.insert(key, now_ns);
         false
+    }
+
+    /// An IOC match found on the capture thread (a connect's destination, #60).
+    fn record_ioc(&self, event: &Event, hit: crate::ioc::IocHit) {
+        let message = hit.message(&event.meta().comm);
+        let severity = hit.severity();
+        self.record_and_emit_with(
+            &entity_key(event.meta()),
+            crate::ioc::IOC_TECHNIQUE,
+            &message,
+            ioc_source(hit),
+            severity,
+            event,
+            Vec::new(),
+        );
     }
 
     /// [`Self::record_and_emit`] for a batch of plain `rules::Alert`s (no Sigma/
@@ -1092,6 +1387,7 @@ impl DetectionSink {
             }
         }
 
+        let service_main = engine.is_service_main_process(pid, generation);
         drop(engine); // Unlock correlator before alert emission (log I/O).
 
         // Fold co-occurrence rules and Bayesian belief into the entity's fused
@@ -1104,23 +1400,40 @@ impl DetectionSink {
         // condemn every later, unrelated sibling that merely shares the same
         // parent and `comm` (PR #502 review; pinned by
         // `a_siblings_weak_alert_never_triggers_kill_from_anothers_bayes_crossing`).
-        self.emit_correlator_alerts(&alerts, Some(event));
+        self.emit_correlator_alerts(&alerts, Some(event), service_main);
     }
 
     /// Issue #25: policy-gates killing the process behind a high-confidence
     /// correlated verdict. A no-op whenever `enable_response` was never called.
-    fn maybe_kill(&self, pid: u32) {
-        self.kill_for(pid, "a high-confidence correlated verdict");
+    ///
+    /// Issue #652: `service_main` is the correlator's provenance verdict for `pid` (its
+    /// image under a system path, started by init — see the comment above
+    /// `SERVICE_MAIN_REFUSAL`'s definition for why this is not phrased as "package-owned").
+    /// A Bayesian crossing alone does not
+    /// justify killing a system service, so it is refused, in observe mode too, and the
+    /// verdict still escalates. Corroborating evidence does not lift it: the refusal is
+    /// about what the process is, not how much evidence there is (ADR-0028).
+    fn maybe_kill(&self, pid: u32, service_main: bool) {
+        self.kill_for(pid, "a high-confidence correlated verdict", service_main);
     }
 
     /// The policy-gated kill behind every automated trigger; `reason` names which one, in
-    /// the audit line (`RESPONSE-KILL`).
-    fn kill_for(&self, pid: u32, reason: &str) {
+    /// the audit line (`RESPONSE-KILL`). `service_main` makes it refuse (ADR-0028); only the
+    /// correlator's verdict sets it, a trigger with its own evidence (the ransomware reflex)
+    /// passes `false`.
+    fn kill_for(&self, pid: u32, reason: &str, service_main: bool) {
         let guard = self.response.lock().unwrap();
         let Some(hooks) = guard.as_ref() else {
             return;
         };
-        let outcome = response::kill_process(pid, &hooks.policy, |p| (hooks.terminate)(p));
+        let outcome = if service_main {
+            response::KillOutcome::Refused {
+                pid,
+                reason: SERVICE_MAIN_REFUSAL,
+            }
+        } else {
+            response::kill_process(pid, &hooks.policy, |p| (hooks.terminate)(p))
+        };
         drop(guard);
         let message = match outcome {
             response::KillOutcome::Killed { pid } => format!("killed pid {pid} on {reason}"),
@@ -1152,7 +1465,7 @@ impl DetectionSink {
     /// The reflex: the policy-gated kill of the corroborated process. Observe-only unless
     /// kill is enabled, like every other automated kill.
     fn ransomware_reflex(&self, pid: u32) {
-        self.kill_for(pid, RANSOMWARE_REFLEX_REASON);
+        self.kill_for(pid, RANSOMWARE_REFLEX_REASON, false);
     }
 
     /// Exec events: stateless rules, stateful rules, then Sigma.
@@ -1168,6 +1481,7 @@ impl DetectionSink {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .record(event);
+            self.record_exec_on_held(event);
         }
         self.record_rule_alerts(wrapped, rules::evaluate_exec(event));
         self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_exec(event));
@@ -1246,17 +1560,43 @@ impl DetectionSink {
         self.rule_state.lock().unwrap().on_file_quarantine(event);
     }
 
+    /// `BitsJob` events (Windows BITS-Client): recorded for the T1197
+    /// download→exec join, no alert on their own (#284).
+    fn detect_bits_job(&self, event: &schema::BitsJobEvent) {
+        self.rule_state.lock().unwrap().on_bits_job(event);
+    }
+
     /// Connect events: stateless rules (unusual outbound from a web/DB
     /// service, issue #478), then beacon detection.
     fn detect_connect(&self, wrapped: &Event, event: &schema::ConnectEvent) {
+        if let Some(hit) = self.ioc.check_connect(event.daddr, event.meta.timestamp_ns) {
+            self.record_ioc(wrapped, hit);
+        }
         self.record_rule_alerts(wrapped, rules::evaluate_connect(event));
         self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_connect(event));
     }
 
+    /// `DnsQuery` events: the egress-domain join (it never alerts) and, on a listed domain or
+    /// one of its subdomains, an IOC finding (#60).
+    fn detect_dns_query(&self, wrapped: &Event, event: &schema::DnsQueryEvent) {
+        if let Some(hit) = self
+            .ioc
+            .check_dns_query(&event.query, event.meta.timestamp_ns)
+        {
+            self.record_ioc(wrapped, hit);
+        }
+        self.rule_state.lock().unwrap().on_dns_query(event);
+    }
+
     /// `NetworkFlow` events (conntrack polling, issue #92): same beacon detection as
     /// `detect_connect`, deduped per-flow so a poll-based source doesn't
-    /// false-positive on one ordinary long-lived connection.
+    /// false-positive on one ordinary long-lived connection. The peer address is also checked
+    /// against the IOC set (#60); every poll of one live flow repeats it, which the per-indicator
+    /// cooldown absorbs.
     fn detect_network_flow(&self, wrapped: &Event, event: &schema::NetworkFlowEvent) {
+        if let Some(hit) = self.ioc.check_connect(event.daddr, event.meta.timestamp_ns) {
+            self.record_ioc(wrapped, hit);
+        }
         self.record_rule_alerts(
             wrapped,
             self.rule_state.lock().unwrap().on_network_flow(event),
@@ -1371,6 +1711,17 @@ impl DetectionSink {
         self.tamper_events.load(Ordering::Relaxed)
     }
 
+    /// IOC engine figures for the health beacon: indicators in force, findings raised, matches
+    /// the cooldown absorbed (#60).
+    pub(crate) fn ioc_counts(&self) -> (u64, u64, u64) {
+        let stats = self.ioc.stats();
+        (
+            self.ioc.indicator_count() as u64,
+            stats.raised.load(Ordering::Relaxed),
+            stats.cooled_down.load(Ordering::Relaxed),
+        )
+    }
+
     /// Issue #613: an operator's request to silence `technique` on the entity
     /// `(ppid, comm)` in the fused verdict. Returns whether the mark is new.
     /// Audited as `VERDICT-SUPPRESS` in the alert log, which itself keeps every
@@ -1437,6 +1788,26 @@ impl DetectionSink {
             .into_iter()
             .map(|(entity, technique)| (entity.ppid, entity.comm, technique))
             .collect()
+    }
+
+    /// Same posture as the rule directories for the snapshot: absent unloads (the evidence is
+    /// withheld), broken keeps the previous one (its failure is logged by the loader).
+    fn swap_common_set(&self, loaded: Load<ml::features::common_set::CommonSetSnapshot>) {
+        let mut slot = self.common_set.lock().unwrap();
+        let old = match loaded {
+            Load::Loaded(snapshot) => slot.replace(Arc::new(snapshot)),
+            Load::Absent => slot.take(),
+            Load::Failed => None,
+        };
+        drop(slot);
+        drop(old);
+    }
+
+    /// Re-reads only the snapshot file, after the fetch loop wrote a new one (ADR-0033): the
+    /// rule directories and models are untouched, so a daily snapshot does not rebuild the
+    /// detection engines.
+    pub(crate) fn reload_common_set(&self) {
+        self.swap_common_set(load_common_set(&self.content_root));
     }
 
     /// The snapshot in force. Tests read it until the evidence lookup does (next slice of
@@ -1511,15 +1882,25 @@ fn resolve_content_root(content_dir: &Path) -> PathBuf {
     content_dir.to_path_buf()
 }
 
-/// Loads the Sigma content directory if present, under `content_root`.
+/// Loads the Sigma content of the platform this agent is built for, if the content directory
+/// is present under `content_root`: only `rules/sigma/<platform>/`, so a rule written for
+/// another platform never runs on this host (#980).
 fn load_sigma_rules(content_root: &Path) -> Load<sigma::SigmaEngine> {
     let rules_dir = content_root.join("rules/sigma");
     if !rules_dir.is_dir() {
         return Load::Absent;
     }
-    match sigma::SigmaEngine::load_dir(&rules_dir) {
+    let Some(platform) = sigma::Platform::host() else {
+        tracing::warn!("sigma: no rules directory for this operating system, none loaded");
+        return Load::Absent;
+    };
+    match sigma::SigmaEngine::load_dir_for(&rules_dir, platform) {
         Ok(engine) => {
-            tracing::info!(rules = engine.rule_count(), "sigma: rules loaded");
+            tracing::info!(
+                rules = engine.rule_count(),
+                platform = platform.dir_name(),
+                "sigma: rules loaded"
+            );
             Load::Loaded(engine)
         }
         Err(e) => {
@@ -1534,6 +1915,16 @@ fn load_sigma_rules(content_root: &Path) -> Load<sigma::SigmaEngine> {
 /// binary would look rare. **Provisional**: ADR-0020 leaves it to calibration on lab data
 /// (slice 6 of `docs/detection/fleet-prevalence-snapshot-plan.md`).
 const RARITY_MIN_HOSTS_COVERED: u64 = 10;
+
+/// How old a snapshot may be before it is treated as absent. **Provisional**, see
+/// [`updater::snapshot::DEFAULT_MAX_AGE_SECS`].
+const MAX_SNAPSHOT_AGE_SECS: u64 = updater::snapshot::DEFAULT_MAX_AGE_SECS;
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
 
 /// What became of the rarity judgements since start, for the health beacon (ADR-0020, #76).
 /// Plain atomics: bumped on the enrichment worker, read by the beacon thread.
@@ -1597,8 +1988,13 @@ fn note_image_rarity(
     common_set: &Mutex<Option<Arc<ml::features::common_set::CommonSetSnapshot>>>,
     stats: &RarityStats,
     exec: &schema::ExecEvent,
+    now_secs: u64,
 ) {
-    let snapshot = common_set.lock().unwrap().clone();
+    // A snapshot past its maximum age counts as absent: the evidence is withheld, so a server
+    // that stopped publishing cannot keep a stale set in force (ADR-0033 decision 3).
+    let snapshot = common_set.lock().unwrap().clone().filter(|s| {
+        !updater::snapshot::is_expired(s.header().built_at, now_secs, MAX_SNAPSHOT_AGE_SECS)
+    });
     match rarity_evidence(
         exec.sha256.as_deref(),
         snapshot.as_deref(),
@@ -1631,7 +2027,7 @@ fn note_image_rarity(
 /// The largest snapshot file the agent reads. The content manifest allows an artifact of up to
 /// 100 MiB; a snapshot is a Bloom filter whose size the server caps when it builds it, so
 /// anything near this is a malformed or hostile file, refused before it is read.
-const MAX_COMMON_SET_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_COMMON_SET_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Loads `<content_root>/snapshots/common-set.bin`, the file the signed content manifest
 /// delivers (ADR-0020). Absent is "no snapshot yet", not an error; unreadable, too large or
@@ -1895,24 +2291,64 @@ fn quarantine_matched_payload(
     alert_log.record("RESPONSE-QUARANTINE", message);
 }
 
+impl Drop for DetectionSink {
+    /// Touches still held when the sink goes away are not judged (the hold runs on event time and
+    /// nothing flushes it); say how many, so the loss is not silent.
+    fn drop(&mut self) {
+        let held = self
+            .held_canary
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        if held > 0 {
+            tracing::warn!(
+                held,
+                "deception: canary touches still held at shutdown are not reported"
+            );
+        }
+    }
+}
+
 impl EventSink for DetectionSink {
     fn on_event(&self, event: Event) {
         // Detection runs in memory on the capture thread — no engine needs the hash
         // or signature synchronously (issue #126).
         self.correlate(&event);
+        // The hold runs on the clock of the stream that carries both the exec and the touch. The
+        // netlink poller, uprobes and log sources call this from their own threads with their own
+        // clocks: letting them expire the hold would end it before the exec had a chance to come.
+        if matches!(
+            event,
+            Event::Exec(_)
+                | Event::FileOpen(_)
+                | Event::FileDelete(_)
+                | Event::FileRename(_)
+                | Event::FileSetTime(_)
+                | Event::RawVolumeOpen(_)
+        ) {
+            self.expire_held_canary(event.meta().timestamp_ns);
+        }
         self.detect_canary(&event);
         match &event {
             Event::Exec(e) => self.detect_exec(&event, e),
             Event::FileOpen(e) => self.detect_file_open(&event, e),
             Event::Connect(e) => self.detect_connect(&event, e),
             Event::NetworkFlow(e) => self.detect_network_flow(&event, e),
+            Event::DnsQuery(e) => self.detect_dns_query(&event, e),
             Event::ListenPort(e) => self.detect_listen_port(&event, e),
             Event::Auth(e) => self.detect_auth(&event, e),
             Event::Session(e) => self.detect_session(&event, e),
             Event::FileDelete(e) => self.detect_file_delete(&event, e),
             Event::Signal(e) => self.detect_signal(&event, e),
             Event::FileQuarantine(e) => self.detect_file_quarantine(e),
+            Event::BitsJob(e) => self.detect_bits_job(e),
             Event::FileRename(e) => self.detect_file_rename(&event, e),
+            Event::FileSetTime(e) => {
+                self.record_rule_alerts(&event, rules::evaluate_file_set_time(e));
+            }
+            Event::RawVolumeOpen(e) => {
+                self.record_rule_alerts(&event, rules::evaluate_raw_volume_open(e));
+            }
             Event::FileWrite(e) => self.detect_file_write(e),
             Event::MemfdCreate(e) => self.detect_memfd_create(e),
             Event::AmsiContent(e) => self.detect_amsi_content(&event, e),
@@ -1921,6 +2357,12 @@ impl EventSink for DetectionSink {
             }
             Event::LdapSearch(e) => self.detect_ldap_search(&event, e),
             Event::NtlmAuth(e) => self.record_rule_alerts(&event, rules::evaluate_ntlm_auth(e)),
+            Event::LogCleared(e) => {
+                self.record_rule_alerts(&event, rules::evaluate_log_cleared(e));
+            }
+            Event::KerberosDelegationFailure(e) => {
+                self.record_rule_alerts(&event, rules::evaluate_kerberos_delegation_failure(e));
+            }
             Event::PolicyDenial(e) => self.detect_policy_denial(&event, e),
             Event::PackageChange(e) => {
                 self.record_rule_alerts(&event, rules::evaluate_package_change(e));
@@ -2039,7 +2481,74 @@ mod tests {
 
     use schema::{ConnectEvent, Event, EventMeta, ExecEvent, User, sensor::EventSink as _};
 
-    use super::{DetectionSink, correlator_case_id, entity_key};
+    use super::{
+        CANARY_EXEC_HOLD_NS, DetectionSink, Load, MAX_HELD_CANARY_TOUCHES, correlator_case_id,
+        entity_key, load_sigma_rules,
+    };
+
+    /// A content root with one Sigma rule per platform directory, each titled after it.
+    fn sigma_content_root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for platform in ["linux", "windows", "macos"] {
+            let dir = root.path().join("rules/sigma").join(platform);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("rule.yml"),
+                format!(
+                    "title: {platform}-rule\ndescription: d\ntags:\n  - attack.t1059\nlevel: low\n\
+                     falsepositives:\n  - none\ndetection:\n  selection:\n    Image|endswith: '/x'\n  \
+                     condition: selection\n"
+                ),
+            )
+            .unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn the_agent_loads_only_the_sigma_rules_of_its_own_platform() {
+        let root = sigma_content_root();
+        let Load::Loaded(engine) = load_sigma_rules(root.path()) else {
+            panic!("the content directory is present and readable");
+        };
+        // macOS also runs the Unix-family rules of `linux/` (#980); the others only their own.
+        let mut titles = engine.rule_titles();
+        titles.sort_unstable();
+        let expected: &[&str] = if cfg!(target_os = "linux") {
+            &["linux-rule"]
+        } else if cfg!(target_os = "windows") {
+            &["windows-rule"]
+        } else {
+            &["linux-rule", "macos-rule"]
+        };
+        assert_eq!(titles, expected);
+    }
+
+    #[test]
+    fn a_content_root_named_after_another_platform_does_not_change_which_rules_load() {
+        // `<tmp>/windows/linux/...`: read from the full path, every rule would look like
+        // every platform's.
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("windows").join("linux");
+        std::fs::create_dir_all(&root).unwrap();
+        let inner = sigma_content_root();
+        let from = inner.path().join("rules");
+        let to = root.join("rules");
+        std::fs::create_dir_all(to.join("sigma")).unwrap();
+        for platform in ["linux", "windows", "macos"] {
+            std::fs::create_dir_all(to.join("sigma").join(platform)).unwrap();
+            std::fs::copy(
+                from.join("sigma").join(platform).join("rule.yml"),
+                to.join("sigma").join(platform).join("rule.yml"),
+            )
+            .unwrap();
+        }
+        let Load::Loaded(engine) = load_sigma_rules(&root) else {
+            panic!("the content directory is present and readable");
+        };
+        let expected = if cfg!(target_os = "macos") { 2 } else { 1 };
+        assert_eq!(engine.rule_count(), expected, "{:?}", engine.rule_titles());
+    }
 
     #[test]
     fn the_verdict_entity_carries_the_parents_incarnation_when_stamped() {
@@ -2088,9 +2597,82 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_file_write_does_not_enter_the_timestomp_rule_route() {
+        let dir = tmp("file-write-not-timestomp");
+        let sink = sink_in(&dir);
+        sink.on_event(Event::FileWrite(schema::FileWriteEvent {
+            meta: schema::fixtures::meta(),
+            fd: 12,
+            bytes_requested: 4096,
+        }));
+        assert!(!alerts_in(&dir).contains("T1070.006"));
+    }
+
+    #[test]
+    fn set_time_event_reaches_the_timestomp_rule_through_the_real_sink() {
+        let dir = tmp("file-set-time-route");
+        let sink = sink_in(&dir);
+        sink.on_event(Event::FileSetTime(schema::FileSetTimeEvent {
+            meta: schema::fixtures::meta(),
+            path: r"C:\Users\u\invoice.docx".into(),
+            last_write_time: Some(132_537_600_000_000_000),
+            ..schema::fixtures::file_set_time()
+        }));
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("T1070.006"), "{alerts}");
+        assert!(alerts.contains("invoice.docx"), "{alerts}");
+    }
+
+    #[test]
+    fn write_capable_volume_open_reaches_t1006_through_the_real_sink() {
+        let dir = tmp("raw-volume-open-route");
+        let sink = sink_in(&dir);
+        sink.on_event(Event::RawVolumeOpen(schema::RawVolumeOpenEvent {
+            meta: schema::fixtures::meta(),
+            volume: r"\Device\HarddiskVolume3".into(),
+            desired_access: 0x4000_0000,
+        }));
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("T1006"), "{alerts}");
+        assert!(alerts.contains("HarddiskVolume3"), "{alerts}");
+    }
+
+    #[test]
+    fn a_metadata_only_volume_open_does_not_enter_the_raw_volume_route() {
+        // `alerts.ndjson` (`AlertRecord` in `agent/src/alerts.rs`) carries only
+        // timestamp/technique/message — no severity field — so this sink-level test
+        // can only prove "produces no alert at all", not "produces Low rather than
+        // Medium". That distinction is already proven directly against the rule:
+        // `read_capability_and_maximum_allowed_are_low`
+        // (`crates/rules/tests/raw_volume.rs`) asserts `Severity::Low` for the same
+        // 0x8000_0000 (GENERIC_READ) mask this test used to send here. A bare,
+        // metadata-only open (`desired_access = 0`) is the one shape the rule maps
+        // to no alert (`evaluate_raw_volume_open`'s `None` branch), which is what
+        // this sink-level test actually exercises.
+        let dir = tmp("read-only-volume-open-route");
+        let sink = sink_in(&dir);
+        sink.on_event(Event::RawVolumeOpen(schema::RawVolumeOpenEvent {
+            meta: schema::fixtures::meta(),
+            volume: r"\Device\HarddiskVolume3".into(),
+            desired_access: 0,
+        }));
+        let alerts = alerts_in(&dir);
+        assert!(
+            !alerts.contains("T1006"),
+            "a metadata-only open must not alert: {alerts}"
+        );
+    }
+
+    #[test]
     fn sigma_sees_raw_exec_but_alert_and_event_outputs_are_redacted() {
         let dir = tmp("cmdline-redaction-e2e");
-        let sigma_dir = dir.join("content/rules/sigma/linux");
+        // The engine only loads the running host's own platform directory (#980) -- write the
+        // rule there, not a hardcoded "linux", so this test exercises the real load path on
+        // whichever platform runs it instead of silently loading zero rules on Windows/macOS.
+        let platform_dir = sigma::Platform::host()
+            .expect("supported CI platform")
+            .dir_name();
+        let sigma_dir = dir.join("content/rules/sigma").join(platform_dir);
         std::fs::create_dir_all(&sigma_dir).unwrap();
         std::fs::write(
             sigma_dir.join("raw-secret.yml"),
@@ -2267,6 +2849,7 @@ mod tests {
             policy: policy::ResponsePolicy {
                 kill_enabled: false,
                 quarantine_enabled,
+                isolate_enabled: false,
             },
             terminate: Box::new(|_| panic!("quarantine never terminates")),
             quarantine_dir: dir.join("quarantine"),
@@ -2634,8 +3217,330 @@ rule response_marker {
         other.path = canary;
         other.meta.pid = pid;
         other.meta.process_generation = Some(4);
+        let other_ts = other.meta.timestamp_ns;
         sink.on_event(Event::FileOpen(other));
+        // No Exec was seen for this incarnation: the touch is held, then raised.
+        sink.on_event(tick_at(other_ts + CANARY_EXEC_HOLD_NS));
         assert_eq!(canary_alert_count(&dir), 1, "a recycled pid raises the hit");
+    }
+
+    /// A canary open by `pid` (incarnation `generation`) at event time `ts`.
+    fn canary_touch(canary: &str, pid: u32, generation: u64, ts: u64) -> Event {
+        let Event::FileOpen(mut e) = open_event_at(canary, pid, ts) else {
+            unreachable!()
+        };
+        e.meta.process_generation = Some(generation);
+        Event::FileOpen(e)
+    }
+
+    fn exec_of(image: &str, pid: u32, generation: u64, ts: u64) -> Event {
+        let mut exec = schema::fixtures::exec();
+        exec.meta.pid = pid;
+        exec.meta.process_generation = Some(generation);
+        exec.meta.timestamp_ns = ts;
+        exec.image_path = image.into();
+        Event::Exec(exec)
+    }
+
+    /// Any event that is not a canary touch, at event time `ts`: it moves the sink's clock.
+    fn tick_at(ts: u64) -> Event {
+        open_event_at("/not/a/canary", 1, ts)
+    }
+
+    fn sink_allowing_tar(name: &str) -> (Arc<DetectionSink>, String, std::path::PathBuf) {
+        let dir = tmp(name);
+        let (sink, canary) = sink_watching_canary(&dir);
+        // The `/proc` fallback resolves nothing, as for a process that already exited.
+        sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
+            "/usr/bin/tar",
+            |_| None,
+        ));
+        (sink, canary, dir)
+    }
+
+    #[test]
+    fn a_touch_that_arrives_before_the_exec_of_an_allowed_image_is_not_a_detection() {
+        // The sensor stamps the exec before the open, but the merged stream can deliver the
+        // open first (cron's `bash` then `tar`, #81): the decision waits for the exec.
+        let (sink, canary, dir) = sink_allowing_tar("canary-before-exec-allowed");
+        let pid = std::process::id() + 1;
+        sink.on_event(canary_touch(&canary, pid, 3, 10_000));
+        assert_eq!(canary_alert_count(&dir), 0, "held, not raised yet");
+        sink.on_event(exec_of("/usr/bin/tar", pid, 3, 9_000));
+        assert_eq!(
+            canary_alert_count(&dir),
+            0,
+            "the exec shows an allowed image"
+        );
+        sink.on_event(tick_at(10_000 + 2 * CANARY_EXEC_HOLD_NS));
+        assert_eq!(
+            canary_alert_count(&dir),
+            0,
+            "and it is not raised later either"
+        );
+    }
+
+    #[test]
+    fn a_touch_that_arrives_before_the_exec_of_another_image_is_raised_when_the_hold_ends() {
+        let (sink, canary, dir) = sink_allowing_tar("canary-before-exec-other");
+        let pid = std::process::id() + 1;
+        sink.on_event(canary_touch(&canary, pid, 3, 10_000));
+        sink.on_event(exec_of("/usr/bin/cat", pid, 3, 9_000));
+        assert_eq!(
+            canary_alert_count(&dir),
+            0,
+            "a later exec may still be the allowed one"
+        );
+        sink.on_event(tick_at(10_000 + CANARY_EXEC_HOLD_NS));
+        assert_eq!(
+            canary_alert_count(&dir),
+            1,
+            "a listed name on another image is no excuse"
+        );
+    }
+
+    #[test]
+    fn a_touch_before_a_two_step_exec_is_judged_by_the_last_image() {
+        // `bash -c "tar ..."` is one pid that execs `bash`, then `tar`: the first image must
+        // not settle the touch (the lab run of cron's job, #81).
+        let (sink, canary, dir) = sink_allowing_tar("canary-before-two-step-exec");
+        let pid = std::process::id() + 1;
+        sink.on_event(canary_touch(&canary, pid, 3, 10_000));
+        sink.on_event(exec_of("/usr/bin/bash", pid, 3, 8_000));
+        sink.on_event(exec_of("/usr/bin/tar", pid, 3, 9_000));
+        sink.on_event(tick_at(10_000 + 2 * CANARY_EXEC_HOLD_NS));
+        assert_eq!(canary_alert_count(&dir), 0);
+    }
+
+    #[test]
+    fn a_touch_between_the_two_execs_of_one_pid_is_judged_by_the_last_image() {
+        // The first exec is recorded when the touch arrives, the second is still on its way.
+        let (sink, canary, dir) = sink_allowing_tar("canary-between-two-execs");
+        let pid = std::process::id() + 1;
+        sink.on_event(exec_of("/usr/bin/bash", pid, 3, 8_000));
+        sink.on_event(canary_touch(&canary, pid, 3, 10_000));
+        assert_eq!(
+            canary_alert_count(&dir),
+            0,
+            "held, not raised on the first image"
+        );
+        sink.on_event(exec_of("/usr/bin/tar", pid, 3, 9_000));
+        sink.on_event(tick_at(10_000 + 2 * CANARY_EXEC_HOLD_NS));
+        assert_eq!(canary_alert_count(&dir), 0);
+    }
+
+    #[test]
+    fn a_touch_whose_exec_never_comes_is_raised_once_the_hold_has_passed() {
+        let (sink, canary, dir) = sink_allowing_tar("canary-hold-expires");
+        let pid = std::process::id() + 1;
+        sink.on_event(canary_touch(&canary, pid, 3, 10_000));
+        sink.on_event(tick_at(10_000 + CANARY_EXEC_HOLD_NS - 1));
+        assert_eq!(canary_alert_count(&dir), 0, "inside the hold");
+        sink.on_event(tick_at(10_000 + CANARY_EXEC_HOLD_NS));
+        assert_eq!(canary_alert_count(&dir), 1, "the hold is bounded");
+        assert_eq!(
+            sink.canary_hold_expired.load(Ordering::Relaxed),
+            1,
+            "a hold that ended with no exec is counted"
+        );
+        sink.on_event(tick_at(10_000 + 3 * CANARY_EXEC_HOLD_NS));
+        assert_eq!(canary_alert_count(&dir), 1, "raised once");
+    }
+
+    #[test]
+    fn an_exec_without_a_generation_does_not_resolve_a_held_touch() {
+        // A sensor that does not stamp the generation: the touch and the exec both carry
+        // `None`; `None == None` must not let the exec excuse the touch (a recycled pid).
+        let (sink, canary, dir) = sink_allowing_tar("canary-hold-no-generation");
+        let pid = std::process::id() + 1;
+        let Event::FileOpen(mut open) = canary_touch(&canary, pid, 3, 10_000) else {
+            unreachable!()
+        };
+        open.meta.process_generation = None;
+        sink.on_event(Event::FileOpen(open));
+        let Event::Exec(mut exec) = exec_of("/usr/bin/tar", pid, 3, 10_500) else {
+            unreachable!()
+        };
+        exec.meta.process_generation = None;
+        sink.on_event(Event::Exec(exec));
+        sink.on_event(tick_at(10_000 + CANARY_EXEC_HOLD_NS));
+        assert_eq!(
+            canary_alert_count(&dir),
+            1,
+            "no generation on the exec: the touch is judged when the hold ends"
+        );
+    }
+
+    #[test]
+    fn an_allowed_exec_after_the_touch_does_not_excuse_it() {
+        // `/tmp/evil` opens a canary, then execs an allowed `tar` that exits at once: the touch
+        // was made by the first image, not by `tar` (#81 review).
+        for prior in [None, Some("/usr/bin/cat")] {
+            let (sink, canary, dir) = sink_allowing_tar("canary-exec-after-touch");
+            let pid = std::process::id() + 1;
+            if let Some(image) = prior {
+                sink.on_event(exec_of(image, pid, 3, 8_000));
+            }
+            sink.on_event(canary_touch(&canary, pid, 3, 10_000));
+            sink.on_event(exec_of("/usr/bin/tar", pid, 3, 11_000));
+            sink.on_event(tick_at(10_000 + 2 * CANARY_EXEC_HOLD_NS));
+            assert_eq!(
+                canary_alert_count(&dir),
+                1,
+                "an exec after the touch excuses nothing (prior exec: {prior:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn an_allowed_exec_delivered_before_a_touch_it_follows_in_time_does_not_excuse_it() {
+        // The merged stream can deliver the exec first, too: its time is what counts.
+        let (sink, canary, dir) = sink_allowing_tar("canary-exec-after-touch-early");
+        let pid = std::process::id() + 1;
+        sink.on_event(exec_of("/usr/bin/tar", pid, 3, 11_000));
+        sink.on_event(canary_touch(&canary, pid, 3, 10_000));
+        sink.on_event(tick_at(10_000 + 2 * CANARY_EXEC_HOLD_NS));
+        assert_eq!(canary_alert_count(&dir), 1);
+    }
+
+    #[test]
+    fn an_exec_at_the_time_of_the_touch_may_excuse_it() {
+        let (sink, canary, dir) = sink_allowing_tar("canary-exec-same-time");
+        let pid = std::process::id() + 1;
+        sink.on_event(canary_touch(&canary, pid, 3, 10_000));
+        sink.on_event(exec_of("/usr/bin/tar", pid, 3, 10_000));
+        sink.on_event(tick_at(10_000 + 2 * CANARY_EXEC_HOLD_NS));
+        assert_eq!(canary_alert_count(&dir), 0);
+    }
+
+    #[test]
+    fn a_held_touch_is_judged_on_the_last_exec_before_it_not_on_a_later_one() {
+        // bash, then tar, both before the touch's time; a later `cat` is not what touched.
+        let (sink, canary, dir) = sink_allowing_tar("canary-hold-latest-qualifying");
+        let pid = std::process::id() + 1;
+        sink.on_event(canary_touch(&canary, pid, 3, 10_000));
+        sink.on_event(exec_of("/usr/bin/bash", pid, 3, 8_000));
+        sink.on_event(exec_of("/usr/bin/tar", pid, 3, 9_000));
+        sink.on_event(exec_of("/usr/bin/cat", pid, 3, 11_000));
+        sink.on_event(tick_at(10_000 + 2 * CANARY_EXEC_HOLD_NS));
+        assert_eq!(canary_alert_count(&dir), 0);
+    }
+
+    #[test]
+    fn an_empty_allow_list_raises_a_touch_at_once() {
+        let dir = tmp("canary-empty-allow");
+        let (sink, canary) = sink_watching_canary(&dir);
+        sink.set_canary_allow(crate::deception::CanaryAllow::new(
+            &config::DeceptionConfig::default(),
+        ));
+        sink.on_event(canary_touch(&canary, std::process::id() + 1, 3, 10_000));
+        assert_eq!(canary_alert_count(&dir), 1, "nothing to wait for");
+    }
+
+    #[test]
+    fn a_process_in_another_mount_namespace_is_raised_at_once() {
+        // `allows` refuses it whatever exec arrives, so holding it only delays the finding.
+        let dir = tmp("canary-foreign-ns");
+        let (sink, canary) = sink_watching_canary(&dir);
+        sink.set_canary_allow(
+            crate::deception::CanaryAllow::for_test("/usr/bin/tar", |_| None)
+                .in_foreign_mount_ns_for_test(),
+        );
+        sink.on_event(canary_touch(&canary, std::process::id() + 1, 3, 10_000));
+        assert_eq!(canary_alert_count(&dir), 1, "not held");
+    }
+
+    #[test]
+    fn only_the_touch_stream_expires_the_hold() {
+        // A poller on its own thread and clock must not end the hold before the exec can arrive.
+        let (sink, canary, dir) = sink_allowing_tar("canary-hold-other-streams");
+        let pid = std::process::id() + 1;
+        sink.on_event(canary_touch(&canary, pid, 3, 10_000));
+        let mut connect = schema::fixtures::connect();
+        connect.meta.timestamp_ns = 10_000 + 2 * CANARY_EXEC_HOLD_NS;
+        sink.on_event(Event::Connect(connect));
+        assert_eq!(canary_alert_count(&dir), 0, "still held");
+        sink.on_event(exec_of("/usr/bin/tar", pid, 3, 9_000));
+        sink.on_event(tick_at(10_000 + 2 * CANARY_EXEC_HOLD_NS));
+        assert_eq!(canary_alert_count(&dir), 0, "the exec arrived in time");
+    }
+
+    #[test]
+    fn the_reflex_does_not_kill_from_a_touch_judged_after_the_hold() {
+        // `/proc` was empty when the touch was held: by now the pid may be someone else's.
+        let dir = tmp("reflex-held-touch");
+        let (sink, canary, killed) = reflex_sink(&dir, true);
+        sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
+            "/usr/bin/tar",
+            |_| None,
+        ));
+        burst(&sink, 900);
+        let touch_at = BURST_END_NS + 1_000_000;
+        sink.on_event(canary_open_at(&canary, 900, touch_at));
+        sink.on_event(tick_at(touch_at + CANARY_EXEC_HOLD_NS));
+        assert!(
+            alerts_in(&dir).contains("canary file touched"),
+            "the touch is still a finding"
+        );
+        assert!(killed.lock().unwrap().is_empty(), "but nothing is killed");
+    }
+
+    #[test]
+    fn the_exec_of_another_incarnation_does_not_resolve_a_held_touch() {
+        let (sink, canary, dir) = sink_allowing_tar("canary-hold-other-incarnation");
+        let pid = std::process::id() + 1;
+        sink.on_event(canary_touch(&canary, pid, 3, 10_000));
+        // A recycled pid's later life exec'ing an allowed image says nothing about the toucher.
+        sink.on_event(exec_of("/usr/bin/tar", pid, 4, 10_500));
+        sink.on_event(tick_at(10_000 + CANARY_EXEC_HOLD_NS));
+        assert_eq!(canary_alert_count(&dir), 1);
+    }
+
+    #[test]
+    fn a_full_hold_queue_raises_the_touch_instead_of_holding_it() {
+        let (sink, canary, dir) = sink_allowing_tar("canary-hold-full");
+        let first = std::process::id() + 1;
+        for i in 0..MAX_HELD_CANARY_TOUCHES as u32 {
+            sink.on_event(canary_touch(&canary, first + i, 3, 10_000));
+        }
+        assert_eq!(
+            canary_alert_count(&dir),
+            0,
+            "every touch within the bound is held"
+        );
+        let overflow = first + MAX_HELD_CANARY_TOUCHES as u32;
+        sink.on_event(canary_touch(&canary, overflow, 3, 10_000));
+        assert_eq!(
+            canary_alert_count(&dir),
+            1,
+            "beyond the bound it is raised at once"
+        );
+        assert_eq!(
+            sink.canary_hold_overflow.load(Ordering::Relaxed),
+            1,
+            "and the overflow is counted"
+        );
+    }
+
+    #[test]
+    fn a_process_that_proc_shows_running_another_image_is_raised_at_once() {
+        // `/proc` is an answer, not a gap: nothing to wait for.
+        let dir = tmp("canary-proc-other-image");
+        let (sink, canary) = sink_watching_canary(&dir);
+        sink.set_canary_allow(crate::deception::CanaryAllow::for_test(
+            "/usr/bin/tar",
+            |_| Some("/usr/bin/cat".into()),
+        ));
+        sink.on_event(canary_touch(&canary, std::process::id() + 1, 3, 10_000));
+        assert_eq!(canary_alert_count(&dir), 1);
+    }
+
+    #[test]
+    fn without_an_allow_list_a_touch_is_raised_at_once() {
+        let dir = tmp("canary-no-allow-no-hold");
+        let (sink, canary) = sink_watching_canary(&dir);
+        sink.on_event(canary_touch(&canary, std::process::id() + 1, 3, 10_000));
+        assert_eq!(canary_alert_count(&dir), 1);
     }
 
     #[test]
@@ -2688,6 +3593,7 @@ rule response_marker {
             policy::ResponsePolicy {
                 kill_enabled: true,
                 quarantine_enabled: true,
+                isolate_enabled: false,
             },
         );
         let alerts = wait_for_alert(&dir, "RESPONSE-QUARANTINE");
@@ -2813,11 +3719,13 @@ rule response_marker {
     /// The BAYES recipe from `correlator`'s own tests: a suspicious-path exec
     /// plus repeated connects to a public address crosses the belief threshold.
     fn drive_bayes_crossing(sink: &DetectionSink, pid: u32) {
-        sink.on_event(exec(
-            pid,
-            "malware.exe",
-            "C:\\Users\\solka\\AppData\\Roaming\\malware.exe",
-        ));
+        drive_bayes_crossing_from(sink, pid, "C:\\Users\\solka\\AppData\\Roaming\\malware.exe");
+    }
+
+    /// [`drive_bayes_crossing`] for an exec of `image_path`: the same connects to a
+    /// public address, so what differs between two runs is only where the binary lives.
+    fn drive_bayes_crossing_from(sink: &DetectionSink, pid: u32, image_path: &str) {
+        sink.on_event(exec(pid, "malware.exe", image_path));
         for i in 0..25u64 {
             sink.on_event(Event::Connect(ConnectEvent {
                 meta: EventMeta {
@@ -2829,6 +3737,44 @@ rule response_marker {
                 dport: 4444,
             }));
         }
+    }
+
+    /// EGRESS-DOMAIN (#380) crosses two event kinds: the lookup is a `DnsQuery`, which the sink
+    /// must hand to the rule state (it did not before), and the volume is a `NetworkFlow`.
+    #[test]
+    fn a_dns_lookup_and_the_flow_that_follows_raise_egress_domain_in_the_alert_log() {
+        let dir = tmp("egress-domain");
+        let sink = sink_in(&dir);
+        let pid = 4242;
+        let meta_at = |ns: u64| EventMeta {
+            pid,
+            comm: "curl".to_string(),
+            timestamp_ns: ns,
+            ..schema::fixtures::meta()
+        };
+        sink.on_event(Event::DnsQuery(schema::DnsQueryEvent {
+            meta: meta_at(0),
+            query: "pastebin.com".to_string(),
+            result: Some("203.0.113.9".to_string()),
+            status: 0,
+            ..schema::fixtures::dns_query()
+        }));
+        for (i, sent) in [0u64, 30 * 1024 * 1024].into_iter().enumerate() {
+            sink.on_event(Event::NetworkFlow(schema::NetworkFlowEvent {
+                meta: meta_at((i as u64 + 1) * 1_000_000_000),
+                local_port: 50000,
+                daddr: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9)),
+                dport: 443,
+                protocol: 6,
+                bytes_sent: Some(sent),
+                ..schema::fixtures::network_flow()
+            }));
+        }
+        let alerts = alerts_in(&dir);
+        assert!(
+            alerts.contains("T1567.003"),
+            "the lookup must reach the rule state and join the flow, got: {alerts}"
+        );
     }
 
     #[test]
@@ -2946,6 +3892,7 @@ rule response_marker {
             policy::ResponsePolicy {
                 kill_enabled: false,
                 quarantine_enabled: false,
+                isolate_enabled: false,
             },
             move |pid| {
                 killed_rec.lock().unwrap().push(pid);
@@ -2979,6 +3926,7 @@ rule response_marker {
             policy::ResponsePolicy {
                 kill_enabled: true,
                 quarantine_enabled: false,
+                isolate_enabled: false,
             },
             move |pid| {
                 killed_rec.lock().unwrap().push(pid);
@@ -2997,6 +3945,80 @@ rule response_marker {
             vec![4244],
             "the injected terminate runs, exactly once"
         );
+    }
+
+    fn enable_recording_kill(sink: &DetectionSink, dir: &std::path::Path) -> Arc<Mutex<Vec<u32>>> {
+        let killed = Arc::new(Mutex::new(Vec::new()));
+        let killed_rec = Arc::clone(&killed);
+        sink.enable_response(
+            policy::ResponsePolicy {
+                kill_enabled: true,
+                quarantine_enabled: false,
+                isolate_enabled: false,
+            },
+            move |pid| {
+                killed_rec.lock().unwrap().push(pid);
+                Ok(())
+            },
+            dir.join("quarantine"),
+        );
+        killed
+    }
+
+    /// Issue #652: `NetworkManager` crossed `BAYES` on a stock Fedora host with no rule or
+    /// YARA hit and was killed. A package binary started by init is a system service's
+    /// main process: the crossing still raises its alert, but the kill is refused.
+    #[test]
+    fn a_system_service_crossing_bayes_is_refused_not_killed() {
+        let dir = tmp("bayes-service");
+        let sink = sink_in(&dir);
+        let killed = enable_recording_kill(&sink, &dir);
+        drive_bayes_crossing_from(&sink, 6001, "/usr/sbin/NetworkManager");
+        let alerts = alerts_in(&dir);
+        assert!(
+            alerts.contains("BAYES"),
+            "the recipe must still cross the belief threshold: {alerts}"
+        );
+        assert!(
+            alerts.contains("refused to kill pid 6001"),
+            "the refusal must be audited: {alerts}"
+        );
+        assert!(
+            killed.lock().unwrap().is_empty(),
+            "a service's main process must never reach terminate on BAYES alone"
+        );
+    }
+
+    /// The control for the test above: identical behaviour from a binary in `/tmp`
+    /// (the implant's provenance) is killed, as before.
+    #[test]
+    fn the_same_crossing_from_a_tmp_binary_is_still_killed() {
+        let dir = tmp("bayes-tmp");
+        let sink = sink_in(&dir);
+        let killed = enable_recording_kill(&sink, &dir);
+        drive_bayes_crossing_from(&sink, 6002, "/tmp/NetworkManager");
+        assert_eq!(*killed.lock().unwrap(), vec![6002]);
+    }
+
+    /// Observe-only mode says the truth too: a service is "refused", not "would have
+    /// been killed" (the line the issue's reporter saw on the Fedora VM).
+    #[test]
+    fn observe_mode_reports_a_service_as_refused_not_as_would_be_killed() {
+        let dir = tmp("bayes-service-observe");
+        let sink = sink_in(&dir);
+        sink.enable_response(
+            policy::ResponsePolicy {
+                kill_enabled: false,
+                quarantine_enabled: false,
+                isolate_enabled: false,
+            },
+            |_| panic!("terminate must not be called in observe mode"),
+            dir.join("quarantine"),
+        );
+        drive_bayes_crossing_from(&sink, 6003, "/usr/sbin/NetworkManager");
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("refused to kill pid 6003"), "{alerts}");
+        assert!(!alerts.contains("would have been killed"), "{alerts}");
     }
 
     /// PR #502 review: `maybe_kill`'s gate must read *this event's own*
@@ -3018,6 +4040,7 @@ rule response_marker {
             policy::ResponsePolicy {
                 kill_enabled: true,
                 quarantine_enabled: false,
+                isolate_enabled: false,
             },
             move |pid| {
                 killed_rec.lock().unwrap().push(pid);
@@ -3171,8 +4194,32 @@ rule response_marker {
             spool.lock().unwrap().drain_oldest().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].detection.title, "test finding");
-        assert_eq!(records[0].detection.events, vec![event]);
+        assert_eq!(
+            records[0].detection.events,
+            vec![with_its_enrichment(&event, &records[0].detection.events)]
+        );
         assert_eq!(records[0].key.len(), 36);
+    }
+
+    /// `event` as the spooled detection carries it: the enrichment worker adds the image's hash and
+    /// signature before the detection is stored (#62), so that the control plane can join hosts
+    /// on the hash. Everything else of the event must be as it was captured. The hash is asserted
+    /// present for an image that exists on this machine, and compared as given otherwise.
+    fn with_its_enrichment(event: &Event, spooled: &[Event]) -> Event {
+        let (Event::Exec(captured), Some(Event::Exec(stored))) = (event, spooled.first()) else {
+            return event.clone();
+        };
+        assert!(
+            captured.sha256.is_some()
+                || stored.sha256.is_some()
+                || !std::path::Path::new(&captured.image_path).is_file(),
+            "the detection's exec should carry the hash of {}",
+            captured.image_path
+        );
+        let mut expected = captured.clone();
+        expected.sha256.clone_from(&stored.sha256);
+        expected.signature = stored.signature;
+        Event::Exec(expected)
     }
 
     fn rename_of(pid: u32, i: u64, to: &str) -> Event {
@@ -3214,6 +4261,7 @@ rule response_marker {
             policy::ResponsePolicy {
                 kill_enabled,
                 quarantine_enabled: false,
+                isolate_enabled: false,
             },
             move |pid| {
                 recorder.lock().unwrap().push(pid);
@@ -3468,7 +4516,10 @@ rule response_marker {
         assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
         let records: Vec<transport::QueuedDetection> =
             spool.lock().unwrap().drain_oldest().unwrap();
-        assert_eq!(records[0].detection.events, vec![event]);
+        assert_eq!(
+            records[0].detection.events,
+            vec![with_its_enrichment(&event, &records[0].detection.events)]
+        );
     }
 
     #[test]
@@ -3561,6 +4612,19 @@ rule response_marker {
     /// not just any temp dir) matching on an image path no other rule in
     /// this crate's tests, or `crates/rules`' deterministic checks, would
     /// ever incidentally match.
+    /// The directory a test writes its Sigma rule to: the one the agent reads on the host it
+    /// runs on (`Platform::rule_dirs`, #980), not a fixed `linux/`: a Windows host loads only
+    /// `windows/`, so a rule written elsewhere is never loaded. The rule below matches the
+    /// image path of a synthetic exec event (`/opt/reload-content-marker`), so it fires on
+    /// any host once it is loaded.
+    fn host_sigma_dir(dir: &std::path::Path) -> std::path::PathBuf {
+        let platform = sigma::Platform::host().expect("tests run on a platform with rules");
+        dir.join("content")
+            .join("rules")
+            .join("sigma")
+            .join(platform.rule_dirs()[0])
+    }
+
     const RELOAD_TEST_SIGMA_RULE: &str = r#"
 title: reload-content test marker rule
 tags:
@@ -3588,11 +4652,7 @@ detection:
             "no sigma engine should be loaded before the first reload"
         );
 
-        let sigma_dir = dir
-            .join("content")
-            .join("rules")
-            .join("sigma")
-            .join("linux");
+        let sigma_dir = host_sigma_dir(&dir);
         std::fs::create_dir_all(&sigma_dir).unwrap();
         std::fs::write(sigma_dir.join("marker.yml"), RELOAD_TEST_SIGMA_RULE).unwrap();
 
@@ -3619,11 +4679,7 @@ detection:
     /// (#131): the rule below is `critical` and must still never terminate anything.
     fn critical_sigma_sink(name: &str) -> (std::path::PathBuf, Arc<DetectionSink>) {
         let dir = tmp(name);
-        let sigma_dir = dir
-            .join("content")
-            .join("rules")
-            .join("sigma")
-            .join("linux");
+        let sigma_dir = host_sigma_dir(&dir);
         std::fs::create_dir_all(&sigma_dir).unwrap();
         std::fs::write(
             sigma_dir.join("critical.yml"),
@@ -3772,6 +4828,7 @@ detection:
             policy::ResponsePolicy {
                 kill_enabled: true,
                 quarantine_enabled: true,
+                isolate_enabled: false,
             },
             move |pid| {
                 killed_rec.lock().unwrap().push(pid);
@@ -3834,6 +4891,7 @@ detection:
             policy::ResponsePolicy {
                 kill_enabled: true,
                 quarantine_enabled: false,
+                isolate_enabled: false,
             },
             move |pid| {
                 killed_rec.lock().unwrap().push(pid);
@@ -4107,6 +5165,7 @@ detection:
             policy::ResponsePolicy {
                 kill_enabled: true,
                 quarantine_enabled: false,
+                isolate_enabled: false,
             },
             move |pid| {
                 killed_rec.lock().unwrap().push(pid);
@@ -4189,11 +5248,7 @@ rule reload_content_test_marker {
     fn reload_content_drops_a_rule_whose_file_was_removed() {
         let dir = tmp("reload-remove");
         let sink = sink_in(&dir);
-        let sigma_dir = dir
-            .join("content")
-            .join("rules")
-            .join("sigma")
-            .join("linux");
+        let sigma_dir = host_sigma_dir(&dir);
         std::fs::create_dir_all(&sigma_dir).unwrap();
         std::fs::write(sigma_dir.join("marker.yml"), RELOAD_TEST_SIGMA_RULE).unwrap();
         assert_eq!(sink.reload_content().sigma_rule_count, Some(1));
@@ -4456,6 +5511,8 @@ rule reload_content_test_marker {
         use crate::health::RarityStatsSource as _;
 
         let snapshot = CommonSetSnapshot::parse(&golden_common_set(case).0).unwrap();
+        // "Now" is the instant the snapshot was built: its age is not what these cases are about.
+        let now = snapshot.header().built_at;
         let exec = exec_hashed(7_001, sha256.as_deref());
         let mut engine = correlator::CorrelationEngine::new();
         if correlated {
@@ -4467,6 +5524,7 @@ rule reload_content_test_marker {
             &Mutex::new(Some(Arc::new(snapshot))),
             &stats,
             &exec,
+            now,
         );
         stats.rarity_counts()
     }
@@ -4525,8 +5583,48 @@ rule reload_content_test_marker {
             &Mutex::new(None),
             &stats,
             &exec_hashed(7_002, Some(&"ab".repeat(32))),
+            0,
         );
         assert_eq!(stats.rarity_counts().withheld, 1);
+    }
+
+    /// The same non-member judged at two instants: inside the maximum age it is evidence, past
+    /// it the snapshot counts as absent and the judgement is withheld (ADR-0033 decision 3).
+    #[test]
+    fn a_snapshot_past_its_maximum_age_withholds_the_evidence() {
+        use crate::health::RarityStatsSource as _;
+        let case = "fifty_hashes_one_percent";
+        let absent = golden_non_member(case);
+        let built_at =
+            ml::features::common_set::CommonSetSnapshot::parse(&golden_common_set(case).0)
+                .unwrap()
+                .header()
+                .built_at;
+        let counts_at = |now: u64| {
+            let mut engine = correlator::CorrelationEngine::new();
+            let exec = exec_hashed(7_003, Some(&absent));
+            engine.on_event(Event::Exec(exec.clone()));
+            let stats = super::RarityStats::default();
+            super::note_image_rarity(
+                &Mutex::new(engine),
+                &Mutex::new(Some(Arc::new(
+                    ml::features::common_set::CommonSetSnapshot::parse(&golden_common_set(case).0)
+                        .unwrap(),
+                ))),
+                &stats,
+                &exec,
+                now,
+            );
+            stats.rarity_counts()
+        };
+        let max = super::MAX_SNAPSHOT_AGE_SECS;
+        assert_eq!(
+            counts_at(built_at + max).applied,
+            1,
+            "at the maximum age it is still in force"
+        );
+        let past = counts_at(built_at + max + 1);
+        assert_eq!((past.applied, past.withheld), (0, 1));
     }
 
     /// A version-1 snapshot built here (the layout in
@@ -4554,7 +5652,9 @@ rule reload_content_test_marker {
         out.extend(hosts_covered.to_le_bytes());
         out.extend(u32::try_from(hashes.len()).unwrap().to_le_bytes());
         out.extend(BITS.to_le_bytes());
-        out.extend(1_791_849_600u64.to_le_bytes());
+        // Built just now: the worker judges against the real clock, and a snapshot past its
+        // maximum age is withheld (ADR-0033).
+        out.extend(super::unix_now_secs().to_le_bytes());
         out.extend(body);
         out
     }
@@ -4739,6 +5839,272 @@ rule reload_content_test_marker {
         mark_then_run(&sink, &path);
         let alerts = alerts_in(&dir);
         assert!(alerts.contains("T1204.002"), "{alerts}");
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    const IOC_HASH: &str = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f";
+
+    fn write_ioc_feed(dir: &std::path::Path, text: &str) {
+        let feeds = dir.join("content").join("ioc");
+        std::fs::create_dir_all(&feeds).unwrap();
+        std::fs::write(feeds.join("test-feed.txt"), text).unwrap();
+        std::fs::write(feeds.join("VERSION"), "2026-10-26.1\n").unwrap();
+    }
+
+    fn connect_to(addr: &str, timestamp_ns: u64) -> Event {
+        Event::Connect(schema::ConnectEvent {
+            meta: EventMeta {
+                timestamp_ns,
+                ..schema::fixtures::meta()
+            },
+            daddr: addr.parse().unwrap(),
+            dport: 443,
+        })
+    }
+
+    #[test]
+    fn a_connect_to_a_listed_address_raises_one_ioc_finding_and_the_repeat_is_absorbed() {
+        let dir = tmp("ioc-connect");
+        write_ioc_feed(&dir, "ip:203.0.113.9\n");
+        let spool = Arc::new(Mutex::new(
+            store::EventSpool::open(&dir.join("detection-spool"), u64::MAX).unwrap(),
+        ));
+        let sink = DetectionSink::new(
+            rules::RuleState::new(),
+            &dir.join("alerts.ndjson"),
+            Some(&dir.join("events.jsonl")),
+            None,
+            Some(Arc::clone(&spool)),
+            &dir.join("content"),
+            &dir.join("ml-registry"),
+        )
+        .unwrap();
+
+        sink.on_event(connect_to("203.0.113.10", 1_000));
+        assert!(
+            !alerts_in(&dir).contains("IOC"),
+            "an unlisted address is silent"
+        );
+        sink.on_event(connect_to("203.0.113.9", 2_000));
+        sink.on_event(connect_to("203.0.113.9", 3_000));
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+
+        let alerts = alerts_in(&dir);
+        assert_eq!(alerts.matches("203.0.113.9").count(), 1, "{alerts}");
+        assert!(
+            alerts.contains("test-feed") && alerts.contains("2026-10-26.1"),
+            "{alerts}"
+        );
+        // The repeated connects may also move the correlator's belief; only IOC findings count.
+        let drained: Vec<transport::QueuedDetection> =
+            spool.lock().unwrap().drain_oldest().unwrap();
+        let records: Vec<_> = drained
+            .into_iter()
+            .filter(|r| {
+                matches!(
+                    r.detection.source,
+                    schema::detection::DetectionSource::Ioc { .. }
+                )
+            })
+            .collect();
+        assert_eq!(records.len(), 1);
+        let detection = &records[0].detection;
+        assert_eq!(detection.severity, schema::detection::Severity::Medium);
+        assert!(
+            detection.techniques.is_empty(),
+            "IOC is not an ATT&CK technique"
+        );
+        assert_eq!(
+            detection.source,
+            schema::detection::DetectionSource::Ioc {
+                kind: schema::detection::IocKind::Ip,
+                indicator: "203.0.113.9".into(),
+                feed: "test-feed".into(),
+                feed_version: "2026-10-26.1".into(),
+                reference: None,
+            }
+        );
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_polled_flow_to_a_listed_address_raises_one_ioc_finding() {
+        let dir = tmp("ioc-flow");
+        write_ioc_feed(&dir, "ip:203.0.113.9\n");
+        let sink = DetectionSink::new(
+            rules::RuleState::new(),
+            &dir.join("alerts.ndjson"),
+            Some(&dir.join("events.jsonl")),
+            None,
+            None,
+            &dir.join("content"),
+            &dir.join("ml-registry"),
+        )
+        .unwrap();
+
+        let flow = |addr: &str, timestamp_ns: u64| {
+            Event::NetworkFlow(schema::NetworkFlowEvent {
+                meta: EventMeta {
+                    timestamp_ns,
+                    ..schema::fixtures::meta()
+                },
+                daddr: addr.parse().unwrap(),
+                ..schema::fixtures::network_flow()
+            })
+        };
+        sink.on_event(flow("203.0.113.10", 1_000));
+        assert!(
+            !alerts_in(&dir).contains("IOC"),
+            "an unlisted peer is silent"
+        );
+        for poll in 0..3 {
+            sink.on_event(flow("203.0.113.9", 2_000 + poll));
+        }
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+
+        let alerts = alerts_in(&dir);
+        assert_eq!(alerts.matches("203.0.113.9").count(), 1, "{alerts}");
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_exec_whose_image_hash_is_listed_raises_a_high_ioc_finding_from_the_worker() {
+        let dir = tmp("ioc-exec");
+        write_ioc_feed(&dir, &format!("sha256:{IOC_HASH}\n"));
+        let spool = Arc::new(Mutex::new(
+            store::EventSpool::open(&dir.join("detection-spool"), u64::MAX).unwrap(),
+        ));
+        let sink = DetectionSink::new(
+            rules::RuleState::new(),
+            &dir.join("alerts.ndjson"),
+            Some(&dir.join("events.jsonl")),
+            None,
+            Some(Arc::clone(&spool)),
+            &dir.join("content"),
+            &dir.join("ml-registry"),
+        )
+        .unwrap();
+        // The hash is set on the event, as enrichment leaves it: the worker looks it up.
+        let listed = Event::Exec(ExecEvent {
+            sha256: Some(IOC_HASH.to_uppercase()),
+            image_path: String::new(),
+            ..schema::fixtures::exec()
+        });
+        let other = Event::Exec(ExecEvent {
+            sha256: Some("0".repeat(64)),
+            image_path: String::new(),
+            ..schema::fixtures::exec()
+        });
+
+        sink.on_event(other);
+        sink.on_event(listed);
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains(IOC_HASH), "{alerts}");
+        let records: Vec<transport::QueuedDetection> =
+            spool.lock().unwrap().drain_oldest().unwrap();
+        let [record] = records.as_slice() else {
+            panic!("exactly one IOC detection expected, got {}", records.len());
+        };
+        assert_eq!(record.detection.severity, schema::detection::Severity::High);
+        assert!(matches!(
+            record.detection.source,
+            schema::detection::DetectionSource::Ioc {
+                kind: schema::detection::IocKind::Sha256,
+                ..
+            }
+        ));
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reload_content_picks_up_a_feed_added_after_construction_and_unloads_a_removed_one() {
+        let dir = tmp("ioc-reload");
+        let sink = sink_in(&dir);
+        sink.on_event(connect_to("203.0.113.9", 1_000));
+        assert!(!alerts_in(&dir).contains("IOC"));
+
+        write_ioc_feed(&dir, "ip:203.0.113.9\n");
+        sink.reload_content();
+        sink.on_event(connect_to("203.0.113.9", 2_000));
+        assert!(alerts_in(&dir).contains("203.0.113.9"));
+
+        std::fs::remove_dir_all(dir.join("content").join("ioc")).unwrap();
+        sink.reload_content();
+        let before = alerts_in(&dir).matches("203.0.113.9").count();
+        sink.on_event(connect_to("203.0.113.9", 2 * 60 * 60 * 1_000_000_000));
+        assert_eq!(alerts_in(&dir).matches("203.0.113.9").count(), before);
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn dns_query_of(name: &str, timestamp_ns: u64) -> Event {
+        Event::DnsQuery(schema::DnsQueryEvent {
+            meta: EventMeta {
+                timestamp_ns,
+                ..schema::fixtures::meta()
+            },
+            query: name.into(),
+            ..schema::fixtures::dns_query()
+        })
+    }
+
+    #[test]
+    fn a_dns_query_under_a_listed_domain_names_the_listed_domain_not_the_subdomain() {
+        let dir = tmp("ioc-dns");
+        write_ioc_feed(&dir, "domain:evil.example\n");
+        let spool = Arc::new(Mutex::new(
+            store::EventSpool::open(&dir.join("detection-spool"), u64::MAX).unwrap(),
+        ));
+        let sink = DetectionSink::new(
+            rules::RuleState::new(),
+            &dir.join("alerts.ndjson"),
+            Some(&dir.join("events.jsonl")),
+            None,
+            Some(Arc::clone(&spool)),
+            &dir.join("content"),
+            &dir.join("ml-registry"),
+        )
+        .unwrap();
+
+        sink.on_event(dns_query_of("good.example", 1_000));
+        sink.on_event(dns_query_of("notevil.example", 2_000));
+        sink.on_event(dns_query_of("Cdn.Evil.Example.", 3_000));
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+
+        let drained: Vec<transport::QueuedDetection> =
+            spool.lock().unwrap().drain_oldest().unwrap();
+        let records: Vec<_> = drained
+            .into_iter()
+            .filter(|r| {
+                matches!(
+                    r.detection.source,
+                    schema::detection::DetectionSource::Ioc { .. }
+                )
+            })
+            .collect();
+        let [record] = records.as_slice() else {
+            panic!("exactly one IOC detection expected, got {}", records.len());
+        };
+        assert_eq!(
+            record.detection.severity,
+            schema::detection::Severity::Medium
+        );
+        assert_eq!(
+            record.detection.source,
+            schema::detection::DetectionSource::Ioc {
+                kind: schema::detection::IocKind::Domain,
+                indicator: "evil.example".into(),
+                feed: "test-feed".into(),
+                feed_version: "2026-10-26.1".into(),
+                reference: None,
+            }
+        );
         drop(sink);
         std::fs::remove_dir_all(&dir).ok();
     }

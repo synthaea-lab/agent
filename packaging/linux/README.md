@@ -45,7 +45,10 @@ This separation ensures that package managers (apt/dnf) and the updater never co
                          # lets the agent run as shipped
 
 /usr/bin/
-└── synthaea-ctl -> /var/lib/synthaea/current/cli   # CLI symlink
+└── synthaea-ctl        # Root-owned package asset, a copy of cli (#897) —
+                         # NOT a symlink into current/, which the unprivileged
+                         # synthaea user owns and could otherwise repoint to
+                         # get root via `sudo synthaea-ctl`
 ```
 
 ---
@@ -169,13 +172,20 @@ sudo apt-get purge synthaea-agent    # Full cleanup
 
 RHEL:
 ```bash
-sudo dnf remove synthaea-agent       # Full cleanup
+sudo dnf remove synthaea-agent       # Remove but preserve data (#861: used to be a full cleanup,
+                                      # deleting alerts.ndjson and orphaning deception's canaries -
+                                      # RPM has no separate purge trigger to hook, so it now matches
+                                      # the .deb's plain `remove` instead)
+sudo rm -rf /var/lib/synthaea /var/log/synthaea && sudo userdel synthaea  # Full cleanup, by hand
+sudo semanage fcontext -d '/var/lib/synthaea/bootstrap(/.*)?'            # Also drops the %post
+sudo semanage fcontext -d '/var/lib/synthaea/versions/[^/]+/.+'         # SELinux fcontext rules,
+                                                                          # which `dnf remove` leaves behind
 ```
 
 Verify:
 - [ ] Service stopped and disabled
 - [ ] Binaries removed
-- [ ] Directories removed (on purge/remove)
+- [ ] `/var/lib/synthaea` and `/var/log/synthaea` preserved on a plain remove, gone only after the manual full-cleanup command above
 - [ ] No residue: `systemctl list-unit-files | grep -v synthaea`
 
 **5. Lab Scenario Integration**

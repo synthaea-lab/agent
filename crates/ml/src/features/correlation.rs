@@ -244,6 +244,8 @@ mod tests {
             query: "c2.test".into(),
             qtype: 1,
             result: None,
+            results: Vec::new(),
+            results_truncated: false,
             status: 0,
         }));
 

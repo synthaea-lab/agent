@@ -14,7 +14,7 @@ use crate::{
         RarityStatsSource, SensorHealthSource, SpoolStatsSource,
     },
     ipc_handler::{AgentHandler, SensorHealthSlot},
-    silence::SilenceHealthSource,
+    silence::{SilenceHealthSource, SourceStatus},
     sink::DetectionSink,
 };
 
@@ -103,6 +103,15 @@ pub(crate) fn wire_run_pipeline(
     )?);
     sink.start_correlator_ticker()?;
 
+    // The fleet common-set snapshot (ADR-0033): off unless this build embeds a `snapshot` key.
+    if let Some(handle) = &transport {
+        crate::snapshot_fetch::spawn_if_enabled(
+            Arc::clone(&handle.client),
+            content_dir.to_path_buf(),
+            Arc::clone(&sink),
+        );
+    }
+
     // Said where the operator reads it (the journal) and in the alert log, where `cli` and
     // the console look: detection runs, upload does not (`offline_fallback`).
     if let Some(reason) = &upload_disabled {
@@ -162,6 +171,7 @@ pub(crate) fn wire_run_pipeline(
 pub(crate) fn health_collector(
     pipeline: &RunPipeline,
     silence_monitor: Arc<Mutex<SilenceMonitor>>,
+    best_effort_sources: Vec<SourceStatus>,
     host_counters: Arc<dyn HostCountersSource>,
 ) -> HealthCollector {
     let spool_stats: Arc<dyn SpoolStatsSource> = match &pipeline.transport {
@@ -172,8 +182,10 @@ pub(crate) fn health_collector(
         None => Arc::new(NoopSpoolStats),
     };
     let heartbeat_client = pipeline.transport.as_ref().map(|t| Arc::clone(&t.client));
-    let silence_health: Arc<dyn SensorHealthSource> =
-        Arc::new(SilenceHealthSource::new(silence_monitor));
+    let silence_health: Arc<dyn SensorHealthSource> = Arc::new(SilenceHealthSource::new(
+        silence_monitor,
+        best_effort_sources,
+    ));
     let _ = pipeline.sensor_health.set(Arc::clone(&silence_health));
     HealthCollector::new(
         HealthCollectorConfig::default(),
@@ -194,6 +206,9 @@ pub(crate) fn health_collector(
                 tamper_events = beacon.tamper_events,
                 parent_image_evicted_live = beacon.parent_image_evicted_live,
                 parent_image_evicted_dead = beacon.parent_image_evicted_dead,
+                ioc_indicators = beacon.ioc_indicators,
+                ioc_findings = beacon.ioc_findings,
+                ioc_cooled_down = beacon.ioc_cooled_down,
                 "health beacon"
             );
             // #24/#134: the dedicated health channel — best-effort, an
@@ -245,6 +260,7 @@ mod tests {
         let _collector = health_collector(
             &pipeline,
             Arc::clone(&monitor),
+            Vec::new(),
             Arc::new(crate::host_counters::AgentHostCounters::new(
                 Arc::clone(&pipeline.sink),
                 crate::host_counters::WatchdogReport::default(),

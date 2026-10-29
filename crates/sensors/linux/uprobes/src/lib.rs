@@ -39,4 +39,4 @@ mod redact;
 #[cfg(target_os = "linux")]
 pub use config::{ComplianceMode, UprobesConfig};
 #[cfg(target_os = "linux")]
-pub use sensor::UprobesSensor;
+pub use sensor::{UprobesSensor, UprobesStopHandle};

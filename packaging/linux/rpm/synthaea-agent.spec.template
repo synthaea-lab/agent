@@ -37,6 +37,15 @@ install -D -m 0755 "$T/agent" %{buildroot}/var/lib/synthaea/bootstrap/agent
 install -D -m 0755 "$T/watchdog" %{buildroot}/var/lib/synthaea/bootstrap/watchdog
 install -D -m 0755 "$T/cli" %{buildroot}/var/lib/synthaea/bootstrap/cli
 
+# synthaea-ctl: a second, root-owned copy of the same cli binary, not a
+# symlink into /var/lib/synthaea/current (#897) — that directory belongs to
+# the unprivileged synthaea service user, so a compromised agent could
+# repoint it and have `sudo synthaea-ctl` run arbitrary code as root. This
+# copy goes stale only across a self-update that bumps crates/ipc's
+# PROTOCOL_VERSION, which is a clean, disclosed version-mismatch error until
+# the next package upgrade, not a silent one.
+install -D -m 0755 "$T/cli" %{buildroot}%{_bindir}/synthaea-ctl
+
 # systemd integration
 install -D -m 0644 packaging/linux/systemd/synthaea-agent.service \
     %{buildroot}%{_unitdir}/synthaea-agent.service
@@ -49,13 +58,14 @@ install -D -m 0644 packaging/linux/systemd/synthaea.tmpfiles \
 install -d -m 0750 %{buildroot}/var/lib/synthaea/versions
 install -d -m 0750 %{buildroot}/var/log/synthaea
 
-# Config directory (placeholder)
+# Config directory + the same template `cli config init` writes (ADR-0013): the
+# agent fails fast without a valid agent.toml, and the RPM shipped none (#861,
+# the RPM side of #675's .deb fix). Every control-plane field is a `# CHANGE ME`
+# placeholder, but `offline_fallback = true` lets the agent start and run on it
+# as shipped rather than crash-looping until an operator intervenes.
 install -d -m 0755 %{buildroot}/etc/synthaea
-
-# CLI symlink, as the .deb postinst creates it. The unit cannot: it runs as the
-# unprivileged synthaea user under ProtectSystem=strict, so /usr is read-only.
-install -d -m 0755 %{buildroot}%{_bindir}
-ln -s /var/lib/synthaea/current/cli %{buildroot}%{_bindir}/synthaea-ctl
+install -D -m 0644 crates/config/data/default-agent.toml \
+    %{buildroot}/etc/synthaea/agent.toml
 
 %pre
 %sysusers_create_compat packaging/linux/systemd/synthaea.sysusers
@@ -91,15 +101,22 @@ systemd-tmpfiles --create synthaea.conf || :
 
 %postun
 %systemd_postun_with_restart synthaea-agent.service
-# Clean uninstall (not upgrade)
-if [ $1 -eq 0 ]; then
-    if command -v semanage >/dev/null 2>&1; then
-        semanage fcontext -d '/var/lib/synthaea/bootstrap(/.*)?' 2>/dev/null || :
-        semanage fcontext -d '/var/lib/synthaea/versions/[^/]+/.+' 2>/dev/null || :
-    fi
-    rm -rf /var/lib/synthaea /var/log/synthaea
-    userdel synthaea 2>/dev/null || :
-fi
+# Nothing left to do here on erase ($1 -eq 0): every packaged file (including
+# %{_bindir}/synthaea-ctl) is removed by rpm itself from %files, and rpm does
+# not rmdir a package-owned directory that still has untracked contents in it
+# -- which /var/lib/synthaea and /var/log/synthaea always do once the agent has
+# run (versions/, the spool, deception's inventory.json, alerts.ndjson). That
+# used to be undone by an explicit `rm -rf` below, making a plain removal
+# behave like the .deb's `apt purge` instead of its `apt remove`
+# (packaging/linux/debian/maintainer-scripts/postrm's two cases) on every
+# uninstall (#861): /var/log/synthaea/alerts.ndjson -- detections raised on the
+# host -- was deleted with the directory, and canary files configured under
+# `[deception]` were orphaned (the inventory that lets the agent remove them,
+# /var/lib/synthaea/deception/inventory.json, went with the state dir; see
+# docs/operations/deception.md for the supported way to remove them before
+# uninstalling). Data, the SELinux fcontext rules, and the `synthaea` user now
+# survive a plain removal, same as the .deb; an operator who wants a full wipe
+# runs `rm -rf /var/lib/synthaea /var/log/synthaea && userdel synthaea` by hand.
 
 %files
 %license LICENSE
@@ -115,6 +132,7 @@ fi
 %dir %attr(0750,synthaea,synthaea) /var/lib/synthaea/versions
 %dir %attr(0750,synthaea,synthaea) /var/log/synthaea
 %dir /etc/synthaea
+%config(noreplace) /etc/synthaea/agent.toml
 
 %changelog
 * Fri Sep 18 2026 Synthaea Team <noreply@synthaea.io> - 0.1.0-1

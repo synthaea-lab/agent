@@ -33,6 +33,19 @@ pub struct SigmaRule {
     #[serde(default)]
     pub falsepositives: Vec<String>,
     pub detection: Detection,
+    /// The condition, parsed once (at validation, or on first evaluation of a rule that was
+    /// never validated): what evaluation runs, so the text is never re-parsed per event.
+    #[serde(skip)]
+    compiled: std::sync::OnceLock<Result<crate::condition::Compiled, String>>,
+}
+
+impl SigmaRule {
+    /// The parsed condition, or the reason it is outside the grammar.
+    pub(crate) fn compiled(&self) -> &Result<crate::condition::Compiled, String> {
+        self.compiled.get_or_init(|| {
+            crate::condition::compile(&self.detection.condition, &self.detection.selections)
+        })
+    }
 }
 
 /// Maps upstream Sigma's `level` string onto `schema::detection::Severity`.
@@ -65,8 +78,13 @@ pub struct Detection {
     /// Named selections: selection, selection1, filter, etc.
     #[serde(flatten)]
     pub selections: HashMap<String, Selection>,
-    /// Condition expression: "selection", "selection1 and selection2", etc.
+    /// Condition expression over the named blocks above: see [`crate::condition`] for the
+    /// grammar (`and`/`or`/`not`, parentheses, `1 of`/`all of`).
     pub condition: String,
+    /// Sigma's `timeframe`: only meaningful with an aggregation, which is not supported. Read so
+    /// that the loader can refuse it by name instead of failing to parse it as a block.
+    #[serde(default)]
+    pub timeframe: Option<String>,
 }
 
 /// A selection = map of field → list of values (OR between values).
@@ -76,11 +94,24 @@ pub struct Detection {
 ///   Image|endswith: '\cmd.exe'
 ///   CommandLine|contains: 'payload'
 /// ```
+///
+/// A selection can also be written as a **list** of such maps — OR between the maps, implicit
+/// AND inside each one, same as a lone map (issue #982):
+/// ```yaml
+/// selection:
+///   - Image|endswith: '\cmd.exe'
+///   - OriginalFileName: 'Cmd.Exe'
+/// ```
+/// A list of plain strings is still the keyword form below; `serde`'s untagged matching picks
+/// the variant by shape, so a list mixing a map and a plain string matches neither and is
+/// refused at load (`SigmaError::Yaml`) rather than guessed at.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum Selection {
     /// Map of field → values
     FieldMap(HashMap<String, ValueList>),
+    /// List of maps: OR between the maps, each one an implicit AND like `FieldMap`
+    OrOfMaps(Vec<HashMap<String, ValueList>>),
     /// List of keywords
     Keywords(Vec<String>),
 }

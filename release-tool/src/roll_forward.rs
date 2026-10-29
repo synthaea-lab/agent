@@ -14,10 +14,14 @@ use updater::ContentManifest;
 pub(crate) struct Change {
     /// Paths the ring has now that the corrective release no longer lists: agents delete them.
     pub(crate) removed: Vec<String>,
-    /// Paths both list with different bytes: the artifact store keeps one file per path, so the
-    /// earlier bytes must be put back at these paths before the release is published.
-    pub(crate) restored_bytes: Vec<String>,
-    /// Paths only the earlier release lists: agents fetch them again (their bytes must be in the store).
+    /// Paths both list with different bytes: the artifact store is keyed by content hash
+    /// (#804), so the earlier bytes need nothing restored at any path — they are still under
+    /// their own hash, wherever they were first uploaded, unless that hash predates #804 and
+    /// the server was never migrated off the old path-keyed layout (see
+    /// `docs/operations/content.md`).
+    pub(crate) different_bytes: Vec<String>,
+    /// Paths only the earlier release lists: agents fetch them again (their bytes must be in the
+    /// store under their hash).
     pub(crate) brought_back: Vec<String>,
     pub(crate) unchanged: usize,
 }
@@ -37,13 +41,13 @@ pub(crate) fn compare(earlier: &ContentManifest, current: &ContentManifest) -> C
         match had(current, &entry.path) {
             None => change.brought_back.push(entry.path.clone()),
             Some(now) if now.sha256 != entry.sha256 => {
-                change.restored_bytes.push(entry.path.clone());
+                change.different_bytes.push(entry.path.clone());
             }
             Some(_) => change.unchanged += 1,
         }
     }
     change.removed.sort();
-    change.restored_bytes.sort();
+    change.different_bytes.sort();
     change.brought_back.sort();
     change
 }
@@ -172,7 +176,7 @@ mod tests {
         let signed = sign(
             Kind::Content,
             &serde_json::to_string(&corrective).unwrap(),
-            &test_key_pair(),
+            &crate::signer::FileKey::new(test_key_pair()),
         )
         .unwrap();
         assert!(signed.accepted_by_embedded_key);
@@ -278,7 +282,7 @@ mod tests {
         );
         let change = compare(&earlier, &current);
         assert_eq!(change.removed, ["rules/added-by-v4.yml"]);
-        assert_eq!(change.restored_bytes, ["rules/modified.yml"]);
+        assert_eq!(change.different_bytes, ["rules/modified.yml"]);
         assert_eq!(change.brought_back, ["rules/dropped-by-v4.yml"]);
         assert_eq!(change.unchanged, 1);
     }

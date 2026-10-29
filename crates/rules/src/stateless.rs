@@ -1,10 +1,13 @@
 //! Stateless rules: a single event is enough to decide — no history, no state.
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
 use schema::{
     ConnectEvent, ExecEvent, FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT,
     FLAG_PERSISTENCE_BTM_ARTIFACT, FLAG_PERSISTENCE_SYSTEMD_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FLAG_PERSISTENCE_TASK_ARTIFACT,
-    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, detection::Severity,
+    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, FileSetTimeEvent, RawVolumeOpenEvent,
+    User, detection::Severity,
 };
 
 use crate::{
@@ -152,6 +155,8 @@ pub fn evaluate_exec(event: &ExecEvent) -> Vec<Alert> {
         .chain(check_masquerading(event))
         .chain(check_recovery_inhibit(event))
         .chain(check_log_clear_exec(event))
+        .chain(check_event_logging_disable_exec(event))
+        .chain(crate::securitytool::check_security_tool_stop(event))
         .collect()
 }
 
@@ -525,6 +530,162 @@ pub(crate) fn check_service_write_outside_datadir(
     })
 }
 
+/// T1564.004 (#136, ADS slice 1) — Hide Artifacts: NTFS File Attributes. A
+/// write-intent open on an NTFS alternate data stream: the final path
+/// component carries a `:streamname` suffix, which only exists as a way to
+/// attach a second, normally-invisible data fork to a file (`dir`/Explorer
+/// show only the unnamed stream's size; the named one does not appear in a
+/// directory listing). Malware uses this to stash a payload, a dropped tool,
+/// or staged exfil data on a file that still looks ordinary.
+///
+/// Windows only: the colon-suffixed stream syntax is NTFS-specific. The
+/// sensor already restricts `FileOpenEvent` to write-intent opens
+/// ([`has_write_intent`]; a pure read never reaches this far), so every event
+/// here already represents something being written into the stream, not
+/// merely read back.
+///
+/// **The one documented, high-volume exception is `Zone.Identifier`**: every
+/// browser, mail client, and Explorer's own "download from the internet"
+/// marking writes one on nearly every downloaded file (`#365`/`#439`
+/// already track this stream specifically for the mark-of-the-web). Excluding
+/// it by name is the same evidence-gated-exclusion bar the rest of this crate
+/// holds everything else to (`CLAUDE.md`) — it is the only stream name with
+/// that evidence today. Other legitimate stream producers (backup tools,
+/// some antivirus quarantine formats, older Office OLE property sets) are a
+/// known, accepted gap until one is actually observed and named, the same
+/// unbounded-tail trade-off ADR-0028 documents for `policy`'s interpreter
+/// blocklist. Severity is Medium, not High, for the same reason: a named
+/// stream alone is a weak, easily-legitimate signal without more context.
+#[must_use]
+pub(crate) fn check_alternate_data_stream_write(event: &FileOpenEvent) -> Option<Alert> {
+    // The colon-suffixed stream syntax is NTFS-specific; a colon is ordinary
+    // in a Linux or macOS file name (a timestamp, a log name) and must not be
+    // read as a stream there (#943 review).
+    if !matches!(event.meta.user, schema::User::Windows { .. }) || !has_write_intent(event.flags) {
+        return None;
+    }
+    let name = event.path.rsplit(['\\', '/']).next().unwrap_or("");
+    // The drive-letter colon (`C:`) never appears after the last separator;
+    // only a real stream suffix does. A bare `name:` with nothing after it,
+    // or a name starting with `:` (no base file name), is not a real stream.
+    let (base, rest) = name.split_once(':')?;
+    if base.is_empty() || rest.is_empty() {
+        return None;
+    }
+    // A type tag (`:$DATA`, `:$INDEX_ALLOCATION`, ...) can follow the stream
+    // name; strip it the same way Windows's own `dir /r` output does.
+    // `file.txt::$DATA` (an explicit, unremarkable open of the file's own
+    // unnamed stream) leaves `stream` empty rather than a real name — not a
+    // hidden stream, so it must not alert either (#943 review).
+    let stream = rest.split_once(':').map_or(rest, |(stream, _tag)| stream);
+    if stream.is_empty() || stream.eq_ignore_ascii_case("Zone.Identifier") {
+        return None;
+    }
+    Some(Alert {
+        technique: "T1564.004",
+        severity: Severity::Medium,
+        message: format!(
+            "pid={} comm={}: wrote to alternate data stream {stream:?} of {base} — \
+             data hidden outside the file's visible contents",
+            event.meta.pid, event.meta.comm,
+        ),
+    })
+}
+
+/// T1070.006 — Indicator Removal: Timestomp. The minifilter reports a successful explicit
+/// `FileBasicInformation` request; `comm` is intentionally not used (and not printed) because
+/// that sensor has no trustworthy process image. Windows -1/-2 values request automatic
+/// updates, not chosen times.
+///
+/// Low, not Medium (`SherlockOmss`'s/`SoFrexs`'s #1006 review): this is unmeasured, and several
+/// ordinary tools explicitly set destination timestamps on every file they touch —
+/// `CopyFileEx` (Explorer, `copy`, `Copy-Item`), robocopy's default `/COPY:DAT`, 7-Zip/tar/
+/// Explorer zip extraction, OneDrive/Dropbox sync. Each minifilter event also carries `ppid 0`
+/// and an empty `comm`, folding every one of these into a single verdict entity with no way to
+/// tell a benign bulk copy from a targeted stomp. Escalating back to Medium needs either a live
+/// volume measurement (a copy/extraction of a few thousand files) or a per-pid/parent-directory
+/// aggregation the driver's wire format does not yet carry — tracked as a follow-up, not solved
+/// here by guessing a threshold.
+#[must_use]
+pub fn evaluate_file_set_time(event: &FileSetTimeEvent) -> Vec<Alert> {
+    let requested = [
+        event.creation_time,
+        event.last_access_time,
+        event.last_write_time,
+        event.change_time,
+    ];
+    if !requested
+        .into_iter()
+        .flatten()
+        .any(|time| time != 0 && time != -1 && time != -2)
+    {
+        return Vec::new();
+    }
+    vec![Alert {
+        technique: "T1070.006",
+        severity: Severity::Low,
+        message: format!(
+            "pid={}: explicit timestamp change requested for {}",
+            event.meta.pid, event.path,
+        ),
+    }]
+}
+
+/// T1006 — Direct Volume Access: mounted logical-volume open. This is requested
+/// access, not proof of granted rights or subsequent raw I/O; the event carries no trusted image.
+#[must_use]
+pub fn evaluate_raw_volume_open(event: &RawVolumeOpenEvent) -> Vec<Alert> {
+    const FILE_WRITE_DATA: u32 = 0x0000_0002;
+    const FILE_WRITE_EA: u32 = 0x0000_0010;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+    const FILE_APPEND_DATA: u32 = 0x0000_0004;
+    const DELETE: u32 = 0x0001_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+    const READ_CAPABILITIES: u32 = 0xA000_0029; // FILE_READ_DATA/EA, FILE_EXECUTE, GENERIC_READ/EXECUTE
+    // Every right that can modify the volume's data or its own protection, not just the
+    // narrower "write data" case (#1007 review, SherlockOmss): a caller with WRITE_DAC or
+    // WRITE_OWNER alone can reassign the volume's ACL/owner and grant itself write access
+    // in a second step, and DELETE/FILE_WRITE_EA/FILE_WRITE_ATTRIBUTES are real tamper
+    // capabilities a narrower mask would silently drop (e.g. `0x100` alone used to alert
+    // on nothing).
+    const WRITE_CAPABILITIES: u32 = FILE_WRITE_DATA
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | FILE_APPEND_DATA
+        | DELETE
+        | WRITE_DAC
+        | WRITE_OWNER
+        | GENERIC_WRITE
+        | GENERIC_ALL;
+
+    let severity = if event.desired_access & (WRITE_CAPABILITIES | MAXIMUM_ALLOWED) != 0 {
+        // MAXIMUM_ALLOWED resolves to whatever the caller's token grants; a caller able to
+        // open a raw volume at all already needs an elevated privilege (SeBackupPrivilege or
+        // administrator), so in practice this almost always includes write — bucketing it
+        // with read-only understates it (#1007 review).
+        Some(Severity::Medium)
+    } else if event.desired_access & READ_CAPABILITIES != 0 {
+        Some(Severity::Low)
+    } else {
+        None
+    };
+    severity
+        .into_iter()
+        .map(|severity| Alert {
+            technique: "T1006",
+            severity,
+            message: format!(
+                "pid={} comm={}: opened mounted volume {} with requested access {:#010x}",
+                event.meta.pid, event.meta.comm, event.volume, event.desired_access,
+            ),
+        })
+        .collect()
+}
+
 /// Evaluates all stateless rules applicable to a `FileOpenEvent`. T1053.005
 /// creation ([`check_scheduled_task_persistence`]) is not among them: one
 /// registration arrives twice (4698 and 106), so `RuleState::on_file_open`
@@ -541,6 +702,7 @@ pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
         .chain(check_account_creation_persistence(event))
         .chain(check_systemd_service_persistence(event))
         .chain(check_btm_launch_item_persistence(event))
+        .chain(check_alternate_data_stream_write(event))
         .collect()
 }
 
@@ -751,6 +913,217 @@ pub(crate) fn check_log_clear_exec(event: &ExecEvent) -> Option<Alert> {
     })
 }
 
+/// T1562.002 — Impair Defenses: Disable Windows Event Logging. The exec-side
+/// counterpart of [`check_log_clear_exec`]: instead of wiping what was logged,
+/// stop anything new from being logged.
+///
+/// Windows events only (`User::Windows`). The command line is read as words, the way the
+/// tool reads it, and matched on the program it starts with (`wevtutil`, `auditpol`, `sc`,
+/// `net`/`net1`, `reg`, `powershell`/`pwsh`, with or without a path or `.exe`): a quoted
+/// `"eventlog"`, a tab, `/e:"false"` or the display name `"Windows Event Log"` are seen,
+/// and `dotnet app.dll stop eventlog-forwarder` is not `net stop eventlog`.
+///
+/// Only the disabling forms match: the agent itself runs
+/// `auditpol /set /subcategory:{guid} /success:enable /failure:enable` and
+/// `wevtutil qe` (`sensor-windows-eventlog`), and neither may alert; neither may
+/// read-only queries (`sc query`, `reg query`, `Get-EventLog`, `net start`).
+///
+/// A wrapper such as `cmd /c net stop eventlog` is not matched on its own line: `cmd.exe`
+/// starts `net.exe` as a child, and that child's exec (`net stop eventlog`) is the one that
+/// alerts, so the wrapper adds nothing to look for.
+///
+/// Known gaps: a channel disabled through the API or the registry rather than by one of
+/// these command lines is not seen here, and the sensor's start-up channel check (#786) only
+/// warns about a channel that is already disabled when the agent starts, so a channel
+/// switched off afterwards is not caught; a pipeline such as
+/// `Get-Service EventLog | Stop-Service`, an encoded command, and a renamed copy of a tool
+/// are not matched either.
+#[must_use]
+pub(crate) fn check_event_logging_disable_exec(event: &ExecEvent) -> Option<Alert> {
+    if !matches!(event.meta.user, User::Windows { .. }) {
+        return None;
+    }
+    let words = windows_words(&event.cmdline);
+    let (program, args) = words.split_first()?;
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let program = program.as_str();
+    let program = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let program = program.strip_suffix(".exe").unwrap_or(program);
+    let what = match program {
+        "wevtutil" => wevtutil_disables_a_channel(&args),
+        "auditpol" => auditpol_weakens_the_policy(&args),
+        "sc" => sc_stops_or_disables_eventlog(&args),
+        "net" | "net1" => net_stops_eventlog(&args),
+        "reg" => reg_disables_eventlog(&args),
+        "powershell" | "pwsh" => powershell_stops_or_disables_eventlog(&event.cmdline),
+        _ => None,
+    }?;
+    Some(Alert {
+        technique: "T1562.002",
+        severity: Severity::High,
+        message: format!(
+            "pid={} comm={}: {what}: {}",
+            event.meta.pid, event.meta.comm, event.cmdline,
+        ),
+    })
+}
+
+/// The words of a Windows command line, lowercased: whitespace outside double quotes
+/// separates them and the quote characters are dropped, so `/e:"false"` is `/e:false` and
+/// `"Windows Event Log"` is one word.
+fn windows_words(cmdline: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for c in cmdline.chars() {
+        if c == '"' {
+            quoted = !quoted;
+        } else if c.is_whitespace() && !quoted {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.extend(c.to_lowercase());
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+/// A switch without its prefix: `/e:false` and `-e:false` are both `e:false`.
+fn switch(word: &str) -> Option<&str> {
+    word.strip_prefix(['/', '-'])
+}
+
+/// `wevtutil sl <log> /e:false` or `wevtutil set-log <log> /enabled:false`.
+fn wevtutil_disables_a_channel(args: &[&str]) -> Option<&'static str> {
+    let sets_the_log = args.iter().any(|a| matches!(*a, "sl" | "set-log"));
+    let disables = args
+        .iter()
+        .filter_map(|a| switch(a))
+        .any(|s| matches!(s, "e:false" | "enabled:false"));
+    (sets_the_log && disables).then_some("event log channel disabled")
+}
+
+/// `auditpol /clear`, `auditpol /remove`, or `auditpol /set ... /success:disable` (or
+/// `/failure:disable`).
+fn auditpol_weakens_the_policy(args: &[&str]) -> Option<&'static str> {
+    let has = |name: &str| args.iter().filter_map(|a| switch(a)).any(|s| s == name);
+    let disables = args
+        .iter()
+        .filter_map(|a| switch(a))
+        .any(|s| matches!(s, "success:disable" | "failure:disable"));
+    if has("clear") {
+        Some("audit policy cleared")
+    } else if has("remove") {
+        Some("audit policy removed")
+    } else if has("set") && disables {
+        Some("audit subcategory disabled")
+    } else {
+        None
+    }
+}
+
+/// `sc [\\server] stop eventlog` and `sc [\\server] config eventlog start= disabled`.
+fn sc_stops_or_disables_eventlog(args: &[&str]) -> Option<&'static str> {
+    let mut rest = args.iter().copied().skip_while(|a| a.starts_with("\\\\"));
+    let verb = rest.next()?;
+    let service = rest.next()?;
+    if service != "eventlog" {
+        return None;
+    }
+    let rest: Vec<&str> = rest.collect();
+    match verb {
+        "stop" => Some("EventLog service stopped"),
+        "config" if sc_start_is_disabled(&rest) => Some("EventLog service disabled"),
+        _ => None,
+    }
+}
+
+/// `start= disabled` (two words) or `start=disabled`.
+fn sc_start_is_disabled(args: &[&str]) -> bool {
+    args.iter().enumerate().any(|(i, a)| match *a {
+        "start=" => args.get(i + 1) == Some(&"disabled"),
+        "start=disabled" => true,
+        _ => false,
+    })
+}
+
+/// `net stop eventlog` and `net stop "Windows Event Log"`: the service name runs up to the
+/// first switch (`/y`), and an unquoted display name is several words.
+fn net_stops_eventlog(args: &[&str]) -> Option<&'static str> {
+    let (verb, rest) = args.split_first()?;
+    if *verb != "stop" {
+        return None;
+    }
+    let service = rest
+        .iter()
+        .take_while(|a| !a.starts_with('/'))
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
+    matches!(service.as_str(), "eventlog" | "windows event log")
+        .then_some("EventLog service stopped")
+}
+
+/// `reg add <...>\Services\EventLog /v Start /d 4`: only the data that disables the service
+/// (`4`); `/d 2` sets it back to automatic. A subkey such as `...\EventLog\Security` is a
+/// channel's configuration, not the service.
+fn reg_disables_eventlog(args: &[&str]) -> Option<&'static str> {
+    if args.first() != Some(&"add") {
+        return None;
+    }
+    let key = args.get(1)?.trim_end_matches('\\');
+    if !key.ends_with("\\services\\eventlog") {
+        return None;
+    }
+    let value_of = |name: &str| {
+        args.iter()
+            .position(|a| switch(a) == Some(name))
+            .and_then(|i| args.get(i + 1))
+            .copied()
+    };
+    (value_of("v") == Some("start") && matches!(value_of("d"), Some("4" | "0x4")))
+        .then_some("EventLog service disabled")
+}
+
+/// `Stop-Service` of `EventLog`, or `Set-Service EventLog -StartupType Disabled`, within one
+/// statement of the command line: `Stop-Service -Name Spooler; Get-WinEvent -LogName
+/// EventLog` names `EventLog`, but not as the service being stopped.
+fn powershell_stops_or_disables_eventlog(cmdline: &str) -> Option<&'static str> {
+    let lower = cmdline.to_lowercase();
+    for statement in lower.split([';', '|', '&', '\n']) {
+        let words: Vec<&str> = statement
+            .split(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | '(' | ')' | '{' | '}' | ',' | '`')
+            })
+            .filter(|w| !w.is_empty())
+            .collect();
+        let names_eventlog = words
+            .iter()
+            .any(|w| matches!(*w, "eventlog" | "-name:eventlog"))
+            || words
+                .windows(3)
+                .any(|w| w[0] == "windows" && w[1] == "event" && w[2] == "log");
+        if !names_eventlog {
+            continue;
+        }
+        if words.contains(&"stop-service") {
+            return Some("EventLog service stopped");
+        }
+        let startup_disabled = words
+            .windows(2)
+            .any(|w| w[0] == "-startuptype" && w[1] == "disabled")
+            || words.contains(&"-startuptype:disabled");
+        if words.contains(&"set-service") && startup_disabled {
+            return Some("EventLog service disabled");
+        }
+    }
+    None
+}
+
 /// Unix log locations whose deletion is the anti-forensics signal
 /// ([`check_log_file_delete`]). Substring/prefix matches, same tolerance as
 /// [`check_persistence_write`]'s patterns.
@@ -797,6 +1170,44 @@ pub(crate) fn check_log_file_delete(event: &schema::FileDeleteEvent) -> Option<A
 #[must_use]
 pub fn evaluate_file_delete(event: &schema::FileDeleteEvent) -> Vec<Alert> {
     check_log_file_delete(event).into_iter().collect()
+}
+
+/// T1070.001 — the OS-record half (#799): Windows says a log was cleared
+/// (Security 1102, System 104), however it was done. [`check_log_clear_exec`]
+/// only sees the clears whose command line spells them; this sees the API and
+/// .NET ones too. A `wevtutil cl` raises both, a duplicate accepted for now.
+///
+/// High, one alert per clear, with no exclusion: a legitimate clear is rare and
+/// an administrator emptying a log is worth seeing anyway. A backup taken first
+/// is named in the message but does not lower the severity, since an attacker
+/// can ask for one as easily.
+#[must_use]
+pub fn evaluate_log_cleared(event: &schema::LogClearedEvent) -> Vec<Alert> {
+    let who = if event.subject_user.is_empty() {
+        "-"
+    } else {
+        &event.subject_user
+    };
+    let sid = match &event.meta.user {
+        schema::User::Windows { sid, .. } => sid.as_str(),
+        _ => "-",
+    };
+    let logon = event
+        .subject_logon_id
+        .as_ref()
+        .map_or_else(String::new, |id| format!(" logon={id}"));
+    let backup = event
+        .backup_path
+        .as_ref()
+        .map_or_else(String::new, |path| format!(", backed up to {path}"));
+    vec![Alert {
+        technique: CLEAR_WINDOWS_EVENT_LOGS,
+        severity: Severity::High,
+        message: format!(
+            "event log cleared: channel={} by={who} (sid={sid}{logon}){backup}",
+            event.channel
+        ),
+    }]
 }
 
 /// `SIGSTOP`'s platform-native number: the one signal of
@@ -914,8 +1325,217 @@ pub(crate) fn check_service_unusual_outbound(event: &ConnectEvent) -> Option<Ale
     })
 }
 
+/// DNS-over-TLS's reserved port (RFC 7858) — essentially no other common traffic
+/// uses it, so any connection here is already unusual regardless of destination.
+const DOT_PORT: u16 = 853;
+
+/// HTTPS's port, which DNS-over-HTTPS (`DoH`) rides on indistinguishably from
+/// ordinary traffic at the connection level — this rule only treats it as `DoH`
+/// when the destination is also one of [`KNOWN_DOH_RESOLVERS`].
+const HTTPS_PORT: u16 = 443;
+
+/// Processes expected to speak encrypted DNS directly, so a connection from one
+/// of them to [`DOT_PORT`] or a [`KNOWN_DOH_RESOLVERS`] address is routine, not a
+/// signal: the host's own stub resolver (which may speak `DoT` upstream), and
+/// browsers (several ship `DoH` on by default and dial it themselves rather than
+/// through the OS resolver). Comparing against `comm` case-insensitively covers
+/// both the bare Linux/macOS name and the Windows `.exe` form.
+const DOH_DOT_EXPECTED_COMMS: &[&str] = &[
+    "systemd-resolved",
+    "mDNSResponder",
+    "firefox",
+    "firefox-esr",
+    "firefox.exe",
+    "chrome",
+    "chrome.exe",
+    "chromium",
+    "chromium-browser",
+    "brave",
+    "brave.exe",
+    "opera",
+    "opera.exe",
+    "msedge",
+    "msedge.exe",
+];
+
+/// Known public `DoH` resolver addresses: Cloudflare, Google, Quad9, OpenDNS/Cisco
+/// — the handful of providers the pre-built resolver profiles in Firefox/Chrome
+/// ship with, so also the ones a C2 implant reusing a well-known endpoint (to
+/// blend into "normal" `DoH` traffic rather than running its own) is most likely
+/// to pick. Deliberately short and not exhaustive: a private/enterprise `DoH`
+/// endpoint, a self-hosted one, or a public provider not on this list is a real
+/// gap this rule accepts, the same unbounded-tail trade-off ADR-0028 documents
+/// for `policy`'s interpreter blocklist — this is detection content, meant to be
+/// widened as real `DoH` C2 traffic is observed, not a complete inventory.
+const KNOWN_DOH_RESOLVERS: &[IpAddr] = &[
+    // Cloudflare (1.1.1.1)
+    IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+    IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
+    IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+    IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1001)),
+    // Google Public DNS
+    IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+    IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)),
+    IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
+    IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8844)),
+    // Quad9
+    IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+    IpAddr::V4(Ipv4Addr::new(149, 112, 112, 112)),
+    IpAddr::V6(Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x00fe)),
+    IpAddr::V6(Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x0009)),
+    // OpenDNS / Cisco
+    IpAddr::V4(Ipv4Addr::new(208, 67, 222, 222)),
+    IpAddr::V4(Ipv4Addr::new(208, 67, 220, 220)),
+];
+
+/// T1071.004 — Application Layer Protocol: DNS, the encrypted-transport case
+/// (issue #458 Phase 2, point 5): a non-browser, non-resolver process connecting
+/// to DNS-over-TLS's reserved port, or to a well-known public `DoH` resolver on
+/// 443. Both are legitimate ways to resolve names, but neither is something an
+/// arbitrary process has an ordinary reason to do directly — the OS resolver
+/// (`systemd-resolved`, `mDNSResponder`) or the browser already does it for
+/// everything else on the host. A process doing its own encrypted DNS is doing
+/// so specifically to keep its queries out of plaintext UDP/53 — the same
+/// visibility gap a C2 implant or exfil tool wants, whether or not this
+/// particular connection turns out to be one.
+///
+/// Correlator content over the existing `ConnectEvent`, not new telemetry, per
+/// the issue's own note — `DnsQuery`'s `getaddrinfo` uprobe (#397) cannot see
+/// resolution a process does inside its own TLS session instead of calling libc.
+#[must_use]
+pub(crate) fn check_doh_dot_connection(event: &ConnectEvent) -> Option<Alert> {
+    let comm = event.meta.comm.as_str();
+    if DOH_DOT_EXPECTED_COMMS
+        .iter()
+        .any(|&n| comm.eq_ignore_ascii_case(n))
+    {
+        return None;
+    }
+    let (protocol, port) = if event.dport == DOT_PORT {
+        ("DNS-over-TLS", DOT_PORT)
+    } else if event.dport == HTTPS_PORT && KNOWN_DOH_RESOLVERS.contains(&event.daddr) {
+        ("DNS-over-HTTPS", HTTPS_PORT)
+    } else {
+        return None;
+    };
+    Some(Alert {
+        technique: "T1071.004",
+        severity: Severity::Low,
+        message: format!(
+            "pid={} comm={comm}: connection to {}:{port} — {protocol} from a process that \
+             is not the system resolver or a browser, possibly DNS queries kept off plaintext \
+             UDP/53 to evade monitoring",
+            event.meta.pid, event.daddr,
+        ),
+    })
+}
+
+/// The Kerberos KDC port (TCP and UDP).
+const KERBEROS_PORT: u16 = 88;
+
+/// T1558 (#364): a Windows process other than LSASS talking to a KDC.
+///
+/// On Windows every Kerberos exchange the OS makes, logon, TGT and service tickets
+/// alike, goes through `lsass.exe`: no other process has a reason to open port 88 to a
+/// domain controller. Tools that request tickets themselves (Rubeus `asktgs`/`kerberoast`,
+/// Impacket's `GetUserSPNs.py`/`GetNPUsers.py` run on Windows, kekeo) open that connection
+/// from their own process, so this is the endpoint-side shadow of Kerberoasting,
+/// AS-REP roasting and ticket forging. The DC-side events (4768/4769) are not visible here
+/// (#364's framing).
+///
+/// Medium, not High: Java applications bring their own Kerberos client (JGSS), so a
+/// `java.exe` single-sign-on or a build tool talking to the KDC is legitimate. No name
+/// exclusion is made for it: a name-keyed exclusion needs evidence gating (CLAUDE.md), and
+/// a renamed tool is the attack. Kerberos through LSASS (`Invoke-Kerberoast`,
+/// .NET `KerberosRequestorSecurityToken`) is not seen here: that needs the Kerberos ETW
+/// provider, captured first in the lab.
+///
+/// Windows only. On Linux every Kerberos-aware program (`kinit`, `sssd`, `sshd` with
+/// GSSAPI, `curl --negotiate`) talks to the KDC itself, so the same connection is routine.
+/// A Windows event is recognised by its token user or, for a process whose token could
+/// not be read, by the `.exe` image name the Windows sensor reports.
+#[must_use]
+pub(crate) fn check_kerberos_from_non_lsass(event: &ConnectEvent) -> Option<Alert> {
+    if event.dport != KERBEROS_PORT || event.daddr.is_loopback() || event.daddr.is_unspecified() {
+        return None;
+    }
+    let comm = event.meta.comm.as_str();
+    let is_windows = matches!(event.meta.user, schema::User::Windows { .. })
+        || comm
+            .get(comm.len().saturating_sub(4)..)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(".exe"));
+    if !is_windows || comm.eq_ignore_ascii_case("lsass.exe") {
+        return None;
+    }
+    Some(Alert {
+        technique: "T1558",
+        severity: Severity::Medium,
+        message: format!(
+            "pid={} comm={comm}: Kerberos connection to {}:{KERBEROS_PORT} from a process \
+             other than LSASS: a tool requesting tickets itself (Kerberoasting, AS-REP \
+             roasting, ticket forging) unless it is a Java application with its own Kerberos",
+            event.meta.pid, event.daddr,
+        ),
+    })
+}
+
+/// T1558 — Steal or Forge Kerberos Tickets. The local process named by `event.meta` asked its
+/// own Kerberos client for either a ticket usable for unconstrained delegation, or its TGT's
+/// session key, and the client refused (#364, `KerberosDelegationFailureEvent`, EID 201/202 of
+/// `Microsoft-Windows-Kerberos/Operational`). The local process is the actor in both cases —
+/// not a remote server reaching into this host, see the event's own struct doc.
+///
+/// A **refusal**, not a success: this host's Kerberos stack said no, so the request did not go
+/// through. Still worth an alert — the small, deliberate allowlist unconstrained delegation and
+/// TGT export live behind means a request outside it is rare on a well-run host, and both are
+/// textbook steps in domain-admin-ticket theft (a process collecting a delegable ticket to
+/// coerce a chain back to an attacker-controlled "service", or pulling a TGT's key straight out
+/// of a host that should never give it up — the Rubeus `tgtdeleg` shape). High, not Critical:
+/// the refusal is the control already working, and a misconfigured but legitimate caller asking
+/// for delegation it was never granted looks identical to this agent — the verdict, not this
+/// rule, decides what it adds to.
+#[must_use]
+pub fn evaluate_kerberos_delegation_failure(
+    event: &schema::KerberosDelegationFailureEvent,
+) -> Vec<Alert> {
+    use schema::KerberosDelegationFailureKind as Kind;
+    let what = match event.kind {
+        Kind::UnconstrainedDelegationDenied => "a ticket usable for unconstrained delegation",
+        Kind::TgtSessionKeyExportDenied => "its TGT session key",
+    };
+    let supplied = if event.target_user.is_empty() {
+        String::new()
+    } else if event.target_domain.is_empty() {
+        format!(", supplied credentials {}", event.target_user)
+    } else {
+        format!(
+            ", supplied credentials {}\\{}",
+            event.target_domain, event.target_user
+        )
+    };
+    let owner = if event.caller_user.is_empty() {
+        String::new()
+    } else if event.caller_domain.is_empty() {
+        format!(" owner={}", event.caller_user)
+    } else {
+        format!(" owner={}\\{}", event.caller_domain, event.caller_user)
+    };
+    vec![Alert {
+        technique: "T1558",
+        severity: Severity::High,
+        message: format!(
+            "pid={} comm={}: asked for {what} against {}{supplied} — denied{owner}",
+            event.meta.pid, event.meta.comm, event.target_server,
+        ),
+    }]
+}
+
 /// Evaluates all stateless rules applicable to a `ConnectEvent`.
 #[must_use]
 pub fn evaluate_connect(event: &ConnectEvent) -> Vec<Alert> {
-    check_service_unusual_outbound(event).into_iter().collect()
+    check_service_unusual_outbound(event)
+        .into_iter()
+        .chain(check_doh_dot_connection(event))
+        .chain(check_kerberos_from_non_lsass(event))
+        .collect()
 }

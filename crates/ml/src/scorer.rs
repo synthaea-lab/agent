@@ -19,7 +19,13 @@
 pub mod behavior;
 pub mod correlation;
 
-use ort::{session::Session, value::Tensor};
+use std::sync::OnceLock;
+
+use ort::{
+    environment::Environment,
+    session::{Session, builder::SessionBuilder},
+    value::Tensor,
+};
 use serde::Deserialize;
 
 use crate::{
@@ -27,6 +33,17 @@ use crate::{
     features::cmdline::{self, FEATURE_NAMES},
     forest::{Forest, ParseError},
 };
+
+/// ort allows one environment per process and every session borrows it, so the three
+/// scorers share this one, created on first use.
+fn session_builder() -> Result<SessionBuilder, ort::Error> {
+    static ENV: OnceLock<Result<Environment, String>> = OnceLock::new();
+    let env = ENV.get_or_init(|| ort::init().build().map_err(|e| e.to_string()));
+    match env {
+        Ok(env) => Session::builder(env),
+        Err(msg) => Err(ort::Error::new(msg.clone())),
+    }
+}
 
 /// Model artifacts arrive from the update channel; loading and inference must surface
 /// errors, never panic.
@@ -108,7 +125,7 @@ impl CmdlineScorer {
         model: &[u8],
         metadata: Option<&[u8]>,
     ) -> Result<Self, ScorerError> {
-        let session = Session::builder()?.commit_from_memory(model)?;
+        let session = session_builder()?.commit_from_memory(model)?;
         let forest = Forest::from_onnx_bytes(model)?;
 
         if forest.n_features() != FEATURE_NAMES.len() {

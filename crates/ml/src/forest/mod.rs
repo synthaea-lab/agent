@@ -103,13 +103,12 @@ pub struct Attribution {
 /// sklearn's `_average_path_length`: expected path length of an unbuilt subtree
 /// holding `n` samples (Euler–Mascheroni constant, harmonic approximation).
 pub(crate) fn average_path_length(n: f64) -> f64 {
-    const EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
     if n <= 1.0 {
         0.0
     } else if n == 2.0 {
         1.0
     } else {
-        2.0 * ((n - 1.0).ln() + EULER_GAMMA) - 2.0 * (n - 1.0) / n
+        2.0 * ((n - 1.0).ln() + std::f64::consts::EULER_GAMMA) - 2.0 * (n - 1.0) / n
     }
 }
 

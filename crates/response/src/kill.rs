@@ -91,6 +91,7 @@ mod tests {
         let policy = ResponsePolicy {
             kill_enabled: false,
             quarantine_enabled: false,
+            isolate_enabled: false,
         };
         let outcome = kill_process(1234, &policy, |_| {
             panic!("terminate must not be called when kill is disabled")
@@ -103,6 +104,7 @@ mod tests {
         let policy = ResponsePolicy {
             kill_enabled: true,
             quarantine_enabled: false,
+            isolate_enabled: false,
         };
         let outcome = kill_process(1234, &policy, |pid| {
             assert_eq!(pid, 1234);
@@ -116,6 +118,7 @@ mod tests {
         let policy = ResponsePolicy {
             kill_enabled: true,
             quarantine_enabled: false,
+            isolate_enabled: false,
         };
         let outcome = kill_process(1234, &policy, |_| {
             Err(std::io::Error::new(
@@ -137,6 +140,7 @@ mod tests {
         let policy = ResponsePolicy {
             kill_enabled: true,
             quarantine_enabled: false,
+            isolate_enabled: false,
         };
         for pid in [
             0,
@@ -170,6 +174,7 @@ mod tests {
         let policy = ResponsePolicy {
             kill_enabled: true,
             quarantine_enabled: false,
+            isolate_enabled: false,
         };
         let pid = i32::MAX as u32;
         assert_eq!(

@@ -13,8 +13,8 @@ Module Name:
 Abstract:
 
     This is the main module of the SynthaeaFilter mini filter driver.
-    Milestone 2a (#136): it registers with FltMgr for no I/O callbacks yet
-    and exposes one communication port for the Synthaea agent. The port
+    Milestone 2c (#136): it reports successful deletes, renames, timestamp
+    requests, and mounted-volume opens over the agent communication port. The port
     follows ADR-0012 guardrails 2 and 5: SYSTEM/Administrators-only
     security descriptor, a single connection, and a connect callback that
     accepts only the agent (NT SERVICE\SynthaEDR in its token) and
@@ -28,11 +28,17 @@ Environment:
 
 --*/
 
+#define POOL_ZERO_DOWN_LEVEL_SUPPORT
 #include <fltKernel.h>
 #include <dontuse.h>
+#include <ntintsafe.h>
 #include <suppress.h>
 
 #pragma prefast(disable:__WARNING_ENCODE_MEMBER_FUNCTION_POINTER, "Not valid for kernel mode drivers")
+
+#ifndef __analysis_assume
+#define __analysis_assume(expr)
+#endif
 
 //---------------------------------------------------------------------------
 //      Port protocol (mirrored by the user-mode client, keep in sync)
@@ -40,7 +46,90 @@ Environment:
 
 #define SYNTHAEA_PORT_NAME          L"\\SynthaeaPort"
 #define SYNTHAEA_CONNECT_MAGIC      0x544E5953UL    // 'SYNT', little-endian
-#define SYNTHAEA_PROTOCOL_VERSION   1UL
+#define SYNTHAEA_PROTOCOL_VERSION   5UL
+
+#define SYNTHAEA_EVENT_HEARTBEAT            0
+#define SYNTHAEA_EVENT_DELETE               1
+#define SYNTHAEA_EVENT_RENAME               2
+#define SYNTHAEA_EVENT_SET_TIME             3
+#define SYNTHAEA_EVENT_RAW_VOLUME_OPEN      4
+#define SYNTHAEA_EVENT_FLAG_DELETE_ON_CLOSE 0x0001
+#define SYNTHAEA_EVENT_FLAG_OLD_TRUNCATED   0x0002
+#define SYNTHAEA_EVENT_FLAG_NEW_TRUNCATED   0x0004
+#define SYNTHAEA_MAX_PATH_CHARS             4096
+#define SYNTHAEA_MAX_QUEUE_RECORDS          8192
+#define SYNTHAEA_MAX_QUEUE_BYTES            (16 * 1024 * 1024)
+#define SYNTHAEA_SEND_TIMEOUT_100NS         (-1000000LL) // 100 ms
+#define SYNTHAEA_HEARTBEAT_TIMEOUT_100NS    (-50000000LL) // 5 s
+#define SYNTHAEA_POOL_TAG                   'aeyS'
+
+// The wire header is fixed-width little-endian. Do not change its layout
+// without changing the Rust decoder in lockstep.
+#pragma pack(push, 1)
+typedef struct _SYNTHAEA_EVENT_HEADER {
+    USHORT Kind;
+    USHORT Flags;
+    ULONGLONG Sequence;
+    LONGLONG Timestamp;
+    ULONGLONG ProcessId;
+    ULONGLONG ThreadId;
+    ULONGLONG DroppedQueueFull;
+    ULONGLONG DroppedSendFailed;
+    ULONGLONG NotConnected;
+    USHORT OldPathLength;
+    USHORT NewPathLength;
+    ULONGLONG DroppedCaptureFailed;
+    LONGLONG CreationTime;
+    LONGLONG LastAccessTime;
+    LONGLONG LastWriteTime;
+    LONGLONG ChangeTime;
+    ULONG DesiredAccess;
+} SYNTHAEA_EVENT_HEADER, *PSYNTHAEA_EVENT_HEADER;
+#pragma pack(pop)
+
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, Kind) == 0);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, Flags) == 2);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, Sequence) == 4);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, Timestamp) == 12);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, ProcessId) == 20);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, ThreadId) == 28);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, DroppedQueueFull) == 36);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, DroppedSendFailed) == 44);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, NotConnected) == 52);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, OldPathLength) == 60);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, NewPathLength) == 62);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, DroppedCaptureFailed) == 64);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, CreationTime) == 72);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, LastAccessTime) == 80);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, LastWriteTime) == 88);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, ChangeTime) == 96);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, DesiredAccess) == 104);
+C_ASSERT(sizeof(SYNTHAEA_EVENT_HEADER) == 108);
+
+typedef struct _SYNTHAEA_QUEUED_EVENT {
+    LIST_ENTRY Link;
+    SIZE_T AllocationSize;
+    BOOLEAN ReservationHeld;
+    UCHAR Reserved[3];
+    SYNTHAEA_EVENT_HEADER Header;
+    WCHAR Paths[ANYSIZE_ARRAY];
+} SYNTHAEA_QUEUED_EVENT, *PSYNTHAEA_QUEUED_EVENT;
+
+typedef struct _SYNTHAEA_RENAME_INFORMATION {
+    union {
+        BOOLEAN ReplaceIfExists;
+        ULONG Flags;
+    } RenameFlags;
+    HANDLE RootDirectory;
+    ULONG FileNameLength;
+    WCHAR FileName[ANYSIZE_ARRAY];
+} SYNTHAEA_RENAME_INFORMATION, *PSYNTHAEA_RENAME_INFORMATION;
+
+typedef struct _SYNTHAEA_DISPOSITION_INFORMATION_EX {
+    ULONG Flags;
+} SYNTHAEA_DISPOSITION_INFORMATION_EX, *PSYNTHAEA_DISPOSITION_INFORMATION_EX;
+
+#define SYNTHAEA_FILE_DISPOSITION_DELETE 0x00000001
 
 //
 //  What a client must pass as the connection context of
@@ -112,6 +201,37 @@ typedef struct _SYNTHAEA_FILTER_DATA {
     PFLT_PORT ServerPort;
     PFLT_PORT ClientPort;
 
+    //
+    //  Event channel state. QueueLock protects Queue, queue capacity,
+    //  connection wakeups, and each record's reservation ownership.
+    //
+
+    KSPIN_LOCK QueueLock;
+    LIST_ENTRY Queue;
+    ULONG QueueRecords;
+    SIZE_T QueueBytes;
+    KEVENT QueueEvent;
+    KEVENT StopEvent;
+    PETHREAD SenderThread;
+    volatile LONG Stopping;
+
+    EX_RUNDOWN_REF ClientRundown;
+
+    //
+    //  Set once the disconnect callback has run the rundown down. The rundown may only be
+    //  re-initialised after that: ExReInitializeRundownProtection on one that was never
+    //  run down (the first connection) is a misuse that checked builds assert on.
+    //
+
+    volatile LONG ClientRundownDrained;
+    volatile LONG Connected;
+    volatile LONG AgentProcessId;
+    volatile LONG64 Sequence;
+    volatile LONG64 DroppedQueueFull;
+    volatile LONG64 DroppedSendFailed;
+    volatile LONG64 NotConnected;
+    volatile LONG64 DroppedCaptureFailed;
+
 } SYNTHAEA_FILTER_DATA, *PSYNTHAEA_FILTER_DATA;
 
 
@@ -164,12 +284,116 @@ SynthaeaCallerIsAgent (
     VOID
     );
 
+FLT_PREOP_CALLBACK_STATUS
+SynthaeaPreCreate (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Outptr_result_maybenull_ PVOID *CompletionContext
+    );
+
+FLT_PREOP_CALLBACK_STATUS
+SynthaeaPreSetInformation (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Outptr_result_maybenull_ PVOID *CompletionContext
+    );
+
+FLT_POSTOP_CALLBACK_STATUS
+SynthaeaPostOperation (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_opt_ PVOID CompletionContext,
+    _In_ FLT_POST_OPERATION_FLAGS Flags
+    );
+
+VOID
+SynthaeaSenderThread (
+    _In_opt_ PVOID StartContext
+    );
+
+PSYNTHAEA_QUEUED_EVENT
+SynthaeaAllocateEvent (
+    _In_ USHORT Kind,
+    _In_ USHORT Flags,
+    _In_opt_ PFLT_FILE_NAME_INFORMATION OldName,
+    _In_opt_ PFLT_FILE_NAME_INFORMATION NewName,
+    _In_ ULONG ProcessId,
+    _In_ ULONGLONG ThreadId,
+    _In_opt_ PFILE_BASIC_INFORMATION BasicInformation,
+    _In_opt_ PUNICODE_STRING VolumeName,
+    _In_ ACCESS_MASK DesiredAccess
+    );
+
+VOID
+SynthaeaReleaseReservation (
+    _Inout_ PSYNTHAEA_QUEUED_EVENT Event
+    );
+
+VOID
+SynthaeaFreeEvent (
+    _In_opt_ PSYNTHAEA_QUEUED_EVENT Event
+    );
+
+BOOLEAN
+SynthaeaShouldSkip (
+    _In_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects
+    );
+
+VOID
+SynthaeaSetEventCounters (
+    _Inout_ PSYNTHAEA_EVENT_HEADER Header
+    );
+
+NTSTATUS
+SynthaeaSendBuffer (
+    _In_reads_bytes_(BufferLength) PVOID Buffer,
+    _In_ ULONG BufferLength
+    );
+
+VOID
+SynthaeaStopSender (
+    VOID
+    );
+
+BOOLEAN
+SynthaeaReserveQueue (
+    _In_ SIZE_T AllocationSize
+    );
+
+VOID
+SynthaeaReleaseReservationLocked (
+    _Inout_ PSYNTHAEA_QUEUED_EVENT Event
+    );
+
+NTSTATUS
+SynthaeaStartSender (
+    VOID
+    );
+
+VOID
+SynthaeaFreeQueuedEvents (
+    VOID
+    );
+
+VOID
+SynthaeaActivateClient (
+    _In_ PFLT_PORT ClientPort
+    );
+
+VOID
+SynthaeaDeactivateClient (
+    VOID
+    );
+
 //
 //  Structure that contains all the global data structures
 //  used throughout SynthaeaFilter.
 //
 
 SYNTHAEA_FILTER_DATA SynthaeaFilterData;
+static UCHAR SynthaeaQueueFullSentinel;
+static UCHAR SynthaeaCaptureFailedSentinel;
 
 //
 //  Assign text sections for each routine.
@@ -185,6 +409,12 @@ SYNTHAEA_FILTER_DATA SynthaeaFilterData;
 #pragma alloc_text(PAGE, SynthaeaCallerIsAgent)
 #endif
 
+CONST FLT_OPERATION_REGISTRATION SynthaeaCallbacks[] = {
+    { IRP_MJ_CREATE, 0, SynthaeaPreCreate, SynthaeaPostOperation },
+    { IRP_MJ_SET_INFORMATION, 0, SynthaeaPreSetInformation, SynthaeaPostOperation },
+    { IRP_MJ_OPERATION_END }
+};
+
 
 //
 //  This defines what we want to filter with FltMgr
@@ -197,7 +427,7 @@ CONST FLT_REGISTRATION FilterRegistration = {
     0,                                  //  Flags
 
     NULL,                               //  Context
-    NULL,                               //  Operation callbacks
+    SynthaeaCallbacks,                  //  Operation callbacks
 
     SynthaeaUnload,                         //  FilterUnload
 
@@ -247,6 +477,20 @@ Return Value:
 
     UNREFERENCED_PARAMETER( RegistryPath );
 
+    // ExAllocatePoolZero's down-level path needs its runtime capability initialized first.
+    ExInitializeDriverRuntime( 0 );
+
+    KeInitializeSpinLock( &SynthaeaFilterData.QueueLock );
+    InitializeListHead( &SynthaeaFilterData.Queue );
+    KeInitializeEvent( &SynthaeaFilterData.QueueEvent, NotificationEvent, FALSE );
+    KeInitializeEvent( &SynthaeaFilterData.StopEvent, NotificationEvent, FALSE );
+    ExInitializeRundownProtection( &SynthaeaFilterData.ClientRundown );
+
+    status = SynthaeaStartSender();
+    if (!NT_SUCCESS( status )) {
+        return status;
+    }
+
     //
     //  Register with FltMgr
     //
@@ -271,7 +515,9 @@ Return Value:
         status = SynthaeaCreatePort();
 
         if (!NT_SUCCESS( status )) {
+            SynthaeaStopSender();
             FltUnregisterFilter( SynthaeaFilterData.FilterHandle );
+            SynthaeaFreeQueuedEvents();
             return status;
         }
 
@@ -285,12 +531,16 @@ Return Value:
             DbgPrintEx( DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                         "SynthaeaFilter: FltStartFiltering failed 0x%08X\n", status );
             FltCloseCommunicationPort( SynthaeaFilterData.ServerPort );
+            SynthaeaFilterData.ServerPort = NULL;
+            SynthaeaStopSender();
             FltUnregisterFilter( SynthaeaFilterData.FilterHandle );
+            SynthaeaFreeQueuedEvents();
         } else {
             DbgPrintEx( DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                         "SynthaeaFilter: loaded, filtering started\n" );
         }
     } else {
+        SynthaeaStopSender();
         DbgPrintEx( DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                     "SynthaeaFilter: FltRegisterFilter failed 0x%08X\n", status );
     }
@@ -326,12 +576,20 @@ Return Value:
                 "SynthaeaFilter: unloading (flags 0x%08X)\n", Flags );
 
     //
-    //  Closing the server port refuses new connections; FltUnregisterFilter
-    //  then disconnects any remaining client (DisconnectNotify runs).
+    //  Closing the server port refuses new connections. Stop the sender
+    //  before unregistering, then let FltUnregisterFilter unregister callbacks
+    //  and tear down instances before freeing callback-visible queue state.
+    //  Filter Manager's "Unregistering the Minifilter" and
+    //  "Loading and Unloading a Minifilter" contracts make unregister the
+    //  synchronization point for callback/instance teardown and outstanding I/O.
     //
 
     FltCloseCommunicationPort( SynthaeaFilterData.ServerPort );
+    SynthaeaFilterData.ServerPort = NULL;
+    SynthaeaStopSender();
     FltUnregisterFilter( SynthaeaFilterData.FilterHandle );
+    SynthaeaFilterData.FilterHandle = NULL;
+    SynthaeaFreeQueuedEvents();
 
     return STATUS_SUCCESS;
 }
@@ -369,6 +627,735 @@ Return Value:
     PAGED_CODE();
 
     return STATUS_SUCCESS;
+}
+
+
+/*************************************************************************
+    Kernel-to-agent event channel (milestone 2c, issue #136).
+*************************************************************************/
+
+BOOLEAN
+SynthaeaShouldSkip (
+    _In_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects
+    )
+{
+    ULONG requestorPid;
+    LONG agentPid;
+
+    if (Data == NULL || FltObjects == NULL || FltObjects->FileObject == NULL ||
+        FlagOn( Data->Iopb->IrpFlags, IRP_PAGING_IO ) ||
+        InterlockedCompareExchange( &SynthaeaFilterData.Stopping, 0, 0 ) != 0) {
+        return TRUE;
+    }
+
+    requestorPid = FltGetRequestorProcessId( Data );
+    agentPid = InterlockedCompareExchange( &SynthaeaFilterData.AgentProcessId, 0, 0 );
+    return agentPid != 0 && requestorPid == (ULONG)agentPid;
+}
+
+VOID
+SynthaeaActivateClient (
+    _In_ PFLT_PORT ClientPort
+    )
+{
+    KIRQL oldIrql;
+
+    KeAcquireSpinLock( &SynthaeaFilterData.QueueLock, &oldIrql );
+    if (InterlockedExchange( &SynthaeaFilterData.ClientRundownDrained, 0 ) != 0) {
+        ExReInitializeRundownProtection( &SynthaeaFilterData.ClientRundown );
+    }
+    SynthaeaFilterData.ClientPort = ClientPort;
+    InterlockedExchange( &SynthaeaFilterData.AgentProcessId,
+                         (LONG)(ULONG_PTR)PsGetCurrentProcessId() );
+    InterlockedExchange64( &SynthaeaFilterData.Sequence, 0 );
+    InterlockedExchange( &SynthaeaFilterData.Connected, 1 );
+    KeSetEvent( &SynthaeaFilterData.QueueEvent, IO_NO_INCREMENT, FALSE );
+    KeReleaseSpinLock( &SynthaeaFilterData.QueueLock, oldIrql );
+}
+
+VOID
+SynthaeaDeactivateClient (
+    VOID
+    )
+{
+    KIRQL oldIrql;
+
+    KeAcquireSpinLock( &SynthaeaFilterData.QueueLock, &oldIrql );
+    InterlockedExchange( &SynthaeaFilterData.Connected, 0 );
+    InterlockedExchange( &SynthaeaFilterData.AgentProcessId, 0 );
+    KeResetEvent( &SynthaeaFilterData.QueueEvent );
+    KeReleaseSpinLock( &SynthaeaFilterData.QueueLock, oldIrql );
+}
+
+BOOLEAN
+SynthaeaReserveQueue (
+    _In_ SIZE_T AllocationSize
+    )
+{
+    KIRQL oldIrql;
+    BOOLEAN reserved = FALSE;
+
+    KeAcquireSpinLock( &SynthaeaFilterData.QueueLock, &oldIrql );
+    if (InterlockedCompareExchange( &SynthaeaFilterData.Stopping, 0, 0 ) == 0 &&
+        SynthaeaFilterData.QueueRecords < SYNTHAEA_MAX_QUEUE_RECORDS &&
+        AllocationSize <= (SIZE_T)SYNTHAEA_MAX_QUEUE_BYTES &&
+        SynthaeaFilterData.QueueBytes <= SYNTHAEA_MAX_QUEUE_BYTES - AllocationSize) {
+        SynthaeaFilterData.QueueRecords++;
+        SynthaeaFilterData.QueueBytes += AllocationSize;
+        reserved = TRUE;
+    }
+    KeReleaseSpinLock( &SynthaeaFilterData.QueueLock, oldIrql );
+
+    return reserved;
+}
+
+VOID
+SynthaeaReleaseReservationLocked (
+    _Inout_ PSYNTHAEA_QUEUED_EVENT Event
+    )
+{
+    if (Event->ReservationHeld) {
+        Event->ReservationHeld = FALSE;
+        if (SynthaeaFilterData.QueueRecords != 0) {
+            SynthaeaFilterData.QueueRecords--;
+        }
+        if (SynthaeaFilterData.QueueBytes >= Event->AllocationSize) {
+            SynthaeaFilterData.QueueBytes -= Event->AllocationSize;
+        } else {
+            SynthaeaFilterData.QueueBytes = 0;
+        }
+    }
+}
+
+VOID
+SynthaeaReleaseReservation (
+    _Inout_ PSYNTHAEA_QUEUED_EVENT Event
+    )
+{
+    KIRQL oldIrql;
+    KeAcquireSpinLock( &SynthaeaFilterData.QueueLock, &oldIrql );
+    SynthaeaReleaseReservationLocked( Event );
+    KeReleaseSpinLock( &SynthaeaFilterData.QueueLock, oldIrql );
+}
+
+VOID
+SynthaeaFreeEvent (
+    _In_opt_ PSYNTHAEA_QUEUED_EVENT Event
+    )
+{
+    if (Event != NULL) {
+        SynthaeaReleaseReservation( Event );
+        ExFreePoolWithTag( Event, SYNTHAEA_POOL_TAG );
+    }
+}
+
+PSYNTHAEA_QUEUED_EVENT
+SynthaeaAllocateEvent (
+    _In_ USHORT Kind,
+    _In_ USHORT Flags,
+    _In_opt_ PFLT_FILE_NAME_INFORMATION OldName,
+    _In_opt_ PFLT_FILE_NAME_INFORMATION NewName,
+    _In_ ULONG ProcessId,
+    _In_ ULONGLONG ThreadId,
+    _In_opt_ PFILE_BASIC_INFORMATION BasicInformation,
+    _In_opt_ PUNICODE_STRING VolumeName,
+    _In_ ACCESS_MASK DesiredAccess
+    )
+{
+    ULONG oldChars = 0;
+    ULONG newChars = 0;
+    SIZE_T pathBytes;
+    SIZE_T allocationSize;
+    SIZE_T oldPathBytes;
+    SIZE_T newPathBytes;
+    PSYNTHAEA_QUEUED_EVENT event;
+    LARGE_INTEGER timestamp;
+
+    if (VolumeName != NULL) {
+        oldChars = VolumeName->Length / sizeof(WCHAR);
+        if (oldChars > SYNTHAEA_MAX_PATH_CHARS) {
+            oldChars = SYNTHAEA_MAX_PATH_CHARS;
+            Flags |= SYNTHAEA_EVENT_FLAG_OLD_TRUNCATED;
+        }
+    } else if (OldName != NULL) {
+        oldChars = OldName->Name.Length / sizeof(WCHAR);
+        if (oldChars > SYNTHAEA_MAX_PATH_CHARS) {
+            oldChars = SYNTHAEA_MAX_PATH_CHARS;
+            Flags |= SYNTHAEA_EVENT_FLAG_OLD_TRUNCATED;
+        }
+    }
+    if (NewName != NULL) {
+        newChars = NewName->Name.Length / sizeof(WCHAR);
+        if (newChars > SYNTHAEA_MAX_PATH_CHARS) {
+            newChars = SYNTHAEA_MAX_PATH_CHARS;
+            Flags |= SYNTHAEA_EVENT_FLAG_NEW_TRUNCATED;
+        }
+    }
+
+    //
+    //  Both lengths were clamped to SYNTHAEA_MAX_PATH_CHARS above, so the arithmetic below
+    //  cannot overflow: two paths of at most 4096 WCHARs add up to 16 KiB. State it once, for
+    //  the checked build and the static analyzer, rather than carry error paths that can
+    //  never run (and that would be miscounted as a full queue if they ever did).
+    //
+
+    NT_ASSERT( oldChars <= SYNTHAEA_MAX_PATH_CHARS &&
+               newChars <= SYNTHAEA_MAX_PATH_CHARS );
+    __analysis_assume( oldChars <= SYNTHAEA_MAX_PATH_CHARS );
+    __analysis_assume( newChars <= SYNTHAEA_MAX_PATH_CHARS );
+
+    oldPathBytes = (SIZE_T)oldChars * sizeof(WCHAR);
+    newPathBytes = (SIZE_T)newChars * sizeof(WCHAR);
+    pathBytes = oldPathBytes + newPathBytes;
+
+    // Include the declared one-WCHAR tail in sizeof; a zero-path event still
+    // needs a complete SYNTHAEA_QUEUED_EVENT object.
+    allocationSize = sizeof( SYNTHAEA_QUEUED_EVENT ) + pathBytes;
+
+    if (!SynthaeaReserveQueue( allocationSize )) {
+        return (PSYNTHAEA_QUEUED_EVENT)&SynthaeaQueueFullSentinel;
+    }
+
+    event = (PSYNTHAEA_QUEUED_EVENT)ExAllocatePoolZero(
+        NonPagedPoolNx, allocationSize, SYNTHAEA_POOL_TAG );
+    if (event == NULL) {
+        KIRQL oldIrql;
+        KeAcquireSpinLock( &SynthaeaFilterData.QueueLock, &oldIrql );
+        // The reservation was made before allocation, so release it without
+        // requiring a partially initialized record.
+        SynthaeaFilterData.QueueRecords--;
+        SynthaeaFilterData.QueueBytes -= allocationSize;
+        KeReleaseSpinLock( &SynthaeaFilterData.QueueLock, oldIrql );
+        return (PSYNTHAEA_QUEUED_EVENT)&SynthaeaQueueFullSentinel;
+    }
+
+    event->AllocationSize = allocationSize;
+    event->ReservationHeld = TRUE;
+    event->Header.Kind = Kind;
+    event->Header.Flags = Flags;
+    event->Header.ProcessId = ProcessId;
+    event->Header.ThreadId = ThreadId;
+    event->Header.OldPathLength = (USHORT)oldChars;
+    event->Header.NewPathLength = (USHORT)newChars;
+    if (BasicInformation != NULL) {
+        event->Header.CreationTime = BasicInformation->CreationTime.QuadPart;
+        event->Header.LastAccessTime = BasicInformation->LastAccessTime.QuadPart;
+        event->Header.LastWriteTime = BasicInformation->LastWriteTime.QuadPart;
+        event->Header.ChangeTime = BasicInformation->ChangeTime.QuadPart;
+    }
+    event->Header.DesiredAccess = DesiredAccess;
+    KeQuerySystemTimePrecise( &timestamp );
+    event->Header.Timestamp = timestamp.QuadPart;
+
+    if (oldPathBytes != 0) {
+        RtlCopyMemory( event->Paths,
+                       VolumeName != NULL ? VolumeName->Buffer : OldName->Name.Buffer,
+                       oldPathBytes );
+    }
+    if (newPathBytes != 0) {
+        RtlCopyMemory( (PUCHAR)event->Paths + oldPathBytes,
+                       NewName->Name.Buffer, newPathBytes );
+    }
+    return event;
+}
+
+FLT_PREOP_CALLBACK_STATUS
+SynthaeaPreCreate (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Outptr_result_maybenull_ PVOID *CompletionContext
+    )
+{
+    PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
+    PSYNTHAEA_QUEUED_EVENT event;
+    NTSTATUS status;
+    PVOID volumeBuffer = NULL;
+    ULONG volumeBufferSize = 0;
+    UNICODE_STRING volumeName;
+
+    *CompletionContext = NULL;
+    if (SynthaeaShouldSkip( Data, FltObjects )) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+    if (FlagOn( FltObjects->FileObject->Flags, FO_VOLUME_OPEN )) {
+        if (InterlockedCompareExchange( &SynthaeaFilterData.Connected, 0, 0 ) == 0) {
+            InterlockedIncrement64( &SynthaeaFilterData.NotConnected );
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        }
+        status = FltGetVolumeName( FltObjects->Volume, NULL, &volumeBufferSize );
+        if (status != STATUS_BUFFER_TOO_SMALL || volumeBufferSize == 0 ||
+            volumeBufferSize > SYNTHAEA_MAX_PATH_CHARS * sizeof(WCHAR)) {
+            *CompletionContext = &SynthaeaCaptureFailedSentinel;
+            return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+        }
+        volumeBuffer = ExAllocatePoolZero( NonPagedPoolNx, volumeBufferSize,
+                                           SYNTHAEA_POOL_TAG );
+        if (volumeBuffer == NULL) {
+            *CompletionContext = &SynthaeaCaptureFailedSentinel;
+            return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+        }
+        RtlInitUnicodeString( &volumeName, NULL );
+        volumeName.Buffer = (PWCH)volumeBuffer;
+        volumeName.MaximumLength = (USHORT)volumeBufferSize;
+        status = FltGetVolumeName( FltObjects->Volume, &volumeName, NULL );
+        if (!NT_SUCCESS( status ) || volumeName.Length == 0 ||
+            (volumeName.Length % sizeof(WCHAR)) != 0) {
+            ExFreePoolWithTag( volumeBuffer, SYNTHAEA_POOL_TAG );
+            *CompletionContext = &SynthaeaCaptureFailedSentinel;
+            return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+        }
+        event = SynthaeaAllocateEvent( SYNTHAEA_EVENT_RAW_VOLUME_OPEN,
+                                       0, NULL, NULL,
+                                       FltGetRequestorProcessId( Data ),
+                                       (ULONGLONG)(ULONG_PTR)PsGetCurrentThreadId(),
+                                       NULL, &volumeName,
+                                       Data->Iopb->Parameters.Create.SecurityContext != NULL
+                                           ? Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess
+                                           : 0 );
+        ExFreePoolWithTag( volumeBuffer, SYNTHAEA_POOL_TAG );
+        *CompletionContext = event;
+        return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+    }
+    if (!FlagOn( Data->Iopb->Parameters.Create.Options, FILE_DELETE_ON_CLOSE )) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    // The post-op reports an accepted delete-on-close request, not the later
+    // removal that occurs when the last handle is closed.
+    if (InterlockedCompareExchange( &SynthaeaFilterData.Connected, 0, 0 ) == 0) {
+        InterlockedIncrement64( &SynthaeaFilterData.NotConnected );
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    status = FltGetFileNameInformation(
+        Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &nameInfo );
+    if (!NT_SUCCESS( status )) {
+        *CompletionContext = &SynthaeaCaptureFailedSentinel;
+        return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+    }
+
+    event = SynthaeaAllocateEvent( SYNTHAEA_EVENT_DELETE,
+                                   SYNTHAEA_EVENT_FLAG_DELETE_ON_CLOSE,
+                                   nameInfo, NULL,
+                                   FltGetRequestorProcessId( Data ),
+                                   (ULONGLONG)(ULONG_PTR)PsGetCurrentThreadId(), NULL,
+                                   NULL, 0 );
+    FltReleaseFileNameInformation( nameInfo );
+    *CompletionContext = event;
+    return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+}
+
+FLT_PREOP_CALLBACK_STATUS
+SynthaeaPreSetInformation (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Outptr_result_maybenull_ PVOID *CompletionContext
+    )
+{
+    FILE_INFORMATION_CLASS informationClass;
+    PVOID infoBuffer;
+    ULONG infoLength;
+    PSYNTHAEA_RENAME_INFORMATION renameInfo = NULL;
+    PFLT_FILE_NAME_INFORMATION oldName = NULL;
+    PFLT_FILE_NAME_INFORMATION newName = NULL;
+    PFILE_BASIC_INFORMATION basicInfo = NULL;
+    PSYNTHAEA_QUEUED_EVENT event = NULL;
+    USHORT kind = 0;
+    USHORT eventFlags = 0;
+    NTSTATUS status;
+
+    *CompletionContext = NULL;
+    if (SynthaeaShouldSkip( Data, FltObjects )) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    informationClass = Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
+    infoBuffer = Data->Iopb->Parameters.SetFileInformation.InfoBuffer;
+    infoLength = Data->Iopb->Parameters.SetFileInformation.Length;
+    if (infoBuffer == NULL) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    //
+    //  Decide first whether this is a request the driver reports at all. Most
+    //  IRP_MJ_SET_INFORMATION calls (end of file, basic information, allocation) are not,
+    //  and must neither cost a name query nor move the not-connected counter.
+    //
+    //  Renames: FileRenameInformation(Ex), and the ...BypassAccessCheck classes that kernel
+    //  callers use (the SMB server renames over a share with them). Hard links
+    //  (FileLinkInformation*) are not reported: creating a name is neither a delete nor a
+    //  rename, and removing the original name is a disposition, reported on its own.
+    //
+
+    if (informationClass == FileDispositionInformation) {
+        if (infoLength < sizeof( FILE_DISPOSITION_INFORMATION ) ||
+            !((PFILE_DISPOSITION_INFORMATION)infoBuffer)->DeleteFile) {
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        }
+        kind = SYNTHAEA_EVENT_DELETE;
+    } else if (informationClass == FileDispositionInformationEx) {
+        if (infoLength < sizeof( SYNTHAEA_DISPOSITION_INFORMATION_EX ) ||
+            !FlagOn( ((PSYNTHAEA_DISPOSITION_INFORMATION_EX)infoBuffer)->Flags,
+                     SYNTHAEA_FILE_DISPOSITION_DELETE )) {
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        }
+        kind = SYNTHAEA_EVENT_DELETE;
+    } else if (informationClass == FileRenameInformation ||
+               informationClass == FileRenameInformationEx ||
+               informationClass == FileRenameInformationBypassAccessCheck ||
+               informationClass == FileRenameInformationExBypassAccessCheck) {
+        ULONG headerLength = FIELD_OFFSET( SYNTHAEA_RENAME_INFORMATION, FileName );
+
+        renameInfo = (PSYNTHAEA_RENAME_INFORMATION)infoBuffer;
+        if (infoLength < headerLength || renameInfo->FileNameLength == 0 ||
+            (renameInfo->FileNameLength % sizeof(WCHAR)) != 0 ||
+            renameInfo->FileNameLength > infoLength - headerLength) {
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        }
+        kind = SYNTHAEA_EVENT_RENAME;
+    } else if (informationClass == FileBasicInformation) {
+        if (infoLength < sizeof( FILE_BASIC_INFORMATION )) {
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        }
+        basicInfo = (PFILE_BASIC_INFORMATION)infoBuffer;
+        if (basicInfo->CreationTime.QuadPart == 0 &&
+            basicInfo->LastAccessTime.QuadPart == 0 &&
+            basicInfo->LastWriteTime.QuadPart == 0 &&
+            basicInfo->ChangeTime.QuadPart == 0) {
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        }
+        kind = SYNTHAEA_EVENT_SET_TIME;
+    } else {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    //
+    //  Only now: a qualifying create, delete, rename, or timestamp request with nobody to report
+    //  it to, is "not connected".
+    //
+
+    if (InterlockedCompareExchange( &SynthaeaFilterData.Connected, 0, 0 ) == 0) {
+        InterlockedIncrement64( &SynthaeaFilterData.NotConnected );
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    status = FltGetFileNameInformation(
+        Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &oldName );
+    if (!NT_SUCCESS( status )) {
+        *CompletionContext = &SynthaeaCaptureFailedSentinel;
+        return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+    }
+
+    if (kind == SYNTHAEA_EVENT_RENAME) {
+        status = FltGetDestinationFileNameInformation(
+            FltObjects->Instance, FltObjects->FileObject,
+            renameInfo->RootDirectory, renameInfo->FileName,
+            renameInfo->FileNameLength,
+            FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &newName );
+        if (!NT_SUCCESS( status )) {
+            FltReleaseFileNameInformation( oldName );
+            *CompletionContext = &SynthaeaCaptureFailedSentinel;
+            return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+        }
+    }
+
+    event = SynthaeaAllocateEvent( kind, eventFlags, oldName, newName,
+                                   FltGetRequestorProcessId( Data ),
+                                   (ULONGLONG)(ULONG_PTR)PsGetCurrentThreadId(), basicInfo,
+                                   NULL, 0 );
+    if (newName != NULL) {
+        FltReleaseFileNameInformation( newName );
+    }
+    if (oldName != NULL) {
+        FltReleaseFileNameInformation( oldName );
+    }
+    *CompletionContext = event;
+    return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+}
+
+//
+//  Whether the operation this post-op follows really took effect. NT_SUCCESS alone also
+//  accepts STATUS_REPARSE (0x104), the status of a create that only redirects to a resolved
+//  path: the I/O manager re-issues it, and that second create is the one that opens the
+//  file. The first is neither an operation to report nor a loss to count, or one delete
+//  through a junction would be reported (and counted) twice.
+//
+
+static
+BOOLEAN
+SynthaeaOperationSucceeded (
+    _In_ PFLT_CALLBACK_DATA Data
+    )
+{
+    return NT_SUCCESS( Data->IoStatus.Status ) &&
+           Data->IoStatus.Status != STATUS_REPARSE;
+}
+
+FLT_POSTOP_CALLBACK_STATUS
+SynthaeaPostOperation (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_opt_ PVOID CompletionContext,
+    _In_ FLT_POST_OPERATION_FLAGS Flags
+    )
+{
+    PSYNTHAEA_QUEUED_EVENT event = (PSYNTHAEA_QUEUED_EVENT)CompletionContext;
+    KIRQL oldIrql;
+
+    UNREFERENCED_PARAMETER( FltObjects );
+    //
+    //  The sentinels let the pre-op defer loss accounting until this operation's result is
+    //  known: a failed or reparsed file operation was never expected telemetry. Nothing is
+    //  counted while the instance is draining (Data->IoStatus is not the operation's result
+    //  then, so it is not even read) or while the driver is unloading. An operation that
+    //  completes after the agent went away is "not connected", the same bucket the pre-ops
+    //  and the queue path use, and not a capture or queue failure.
+    //
+    if (CompletionContext == &SynthaeaCaptureFailedSentinel ||
+        CompletionContext == &SynthaeaQueueFullSentinel) {
+        if (!FlagOn( Flags, FLTFL_POST_OPERATION_DRAINING ) &&
+            InterlockedCompareExchange( &SynthaeaFilterData.Stopping, 0, 0 ) == 0 &&
+            SynthaeaOperationSucceeded( Data )) {
+            if (InterlockedCompareExchange( &SynthaeaFilterData.Connected, 0, 0 ) == 0) {
+                InterlockedIncrement64( &SynthaeaFilterData.NotConnected );
+            } else if (CompletionContext == &SynthaeaCaptureFailedSentinel) {
+                InterlockedIncrement64( &SynthaeaFilterData.DroppedCaptureFailed );
+            } else {
+                InterlockedIncrement64( &SynthaeaFilterData.DroppedQueueFull );
+            }
+        }
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+    if (event == NULL) {
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
+    // Post-op can run at DISPATCH_LEVEL: only spin-lock and nonpaged memory
+    // operations are allowed here. DRAINING owns cleanup, never delivery.
+    if (FlagOn( Flags, FLTFL_POST_OPERATION_DRAINING ) ||
+        InterlockedCompareExchange( &SynthaeaFilterData.Stopping, 0, 0 ) != 0 ||
+        !SynthaeaOperationSucceeded( Data )) {
+        SynthaeaFreeEvent( event );
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
+    KeAcquireSpinLock( &SynthaeaFilterData.QueueLock, &oldIrql );
+    if (InterlockedCompareExchange( &SynthaeaFilterData.Connected, 0, 0 ) != 0 &&
+        InterlockedCompareExchange( &SynthaeaFilterData.Stopping, 0, 0 ) == 0) {
+        InsertTailList( &SynthaeaFilterData.Queue, &event->Link );
+        KeSetEvent( &SynthaeaFilterData.QueueEvent, IO_NO_INCREMENT, FALSE );
+        event = NULL; // Queue owns the record and its reservation.
+    } else {
+        InterlockedIncrement64( &SynthaeaFilterData.NotConnected );
+    }
+    KeReleaseSpinLock( &SynthaeaFilterData.QueueLock, oldIrql );
+
+    if (event != NULL) {
+        SynthaeaFreeEvent( event );
+    }
+    return FLT_POSTOP_FINISHED_PROCESSING;
+}
+
+VOID
+SynthaeaSetEventCounters (
+    _Inout_ PSYNTHAEA_EVENT_HEADER Header
+    )
+{
+    Header->Sequence = (ULONGLONG)InterlockedIncrement64( &SynthaeaFilterData.Sequence );
+    Header->DroppedQueueFull = (ULONGLONG)InterlockedCompareExchange64(
+        &SynthaeaFilterData.DroppedQueueFull, 0, 0 );
+    Header->DroppedSendFailed = (ULONGLONG)InterlockedCompareExchange64(
+        &SynthaeaFilterData.DroppedSendFailed, 0, 0 );
+    Header->NotConnected = (ULONGLONG)InterlockedCompareExchange64(
+        &SynthaeaFilterData.NotConnected, 0, 0 );
+    Header->DroppedCaptureFailed = (ULONGLONG)InterlockedCompareExchange64(
+        &SynthaeaFilterData.DroppedCaptureFailed, 0, 0 );
+}
+
+NTSTATUS
+SynthaeaSendBuffer (
+    _In_reads_bytes_(BufferLength) PVOID Buffer,
+    _In_ ULONG BufferLength
+    )
+{
+    PFLT_PORT port;
+    LARGE_INTEGER timeout;
+    NTSTATUS status;
+
+    if (!ExAcquireRundownProtection( &SynthaeaFilterData.ClientRundown )) {
+        return STATUS_PORT_DISCONNECTED;
+    }
+
+    port = SynthaeaFilterData.ClientPort;
+    if (port == NULL || InterlockedCompareExchange(
+            &SynthaeaFilterData.Connected, 0, 0 ) == 0) {
+        ExReleaseRundownProtection( &SynthaeaFilterData.ClientRundown );
+        return STATUS_PORT_DISCONNECTED;
+    }
+
+    timeout.QuadPart = SYNTHAEA_SEND_TIMEOUT_100NS;
+    status = FltSendMessage( SynthaeaFilterData.FilterHandle, &port,
+                             Buffer, BufferLength, NULL, NULL, &timeout );
+    ExReleaseRundownProtection( &SynthaeaFilterData.ClientRundown );
+
+    // STATUS_TIMEOUT is informational in the DDI contract, but means this
+    // event was not delivered to a waiting FilterGetMessage caller.
+    return status == STATUS_TIMEOUT ? STATUS_UNSUCCESSFUL : status;
+}
+
+VOID
+SynthaeaSenderThread (
+    _In_opt_ PVOID StartContext
+    )
+{
+    PVOID waitObjects[2];
+    LARGE_INTEGER heartbeatTimeout;
+    NTSTATUS waitStatus;
+
+    UNREFERENCED_PARAMETER( StartContext );
+    waitObjects[0] = &SynthaeaFilterData.StopEvent;
+    waitObjects[1] = &SynthaeaFilterData.QueueEvent;
+    heartbeatTimeout.QuadPart = SYNTHAEA_HEARTBEAT_TIMEOUT_100NS;
+
+    for (;;) {
+        PSYNTHAEA_QUEUED_EVENT event = NULL;
+        KIRQL oldIrql;
+        BOOLEAN connected;
+
+        if (InterlockedCompareExchange( &SynthaeaFilterData.Stopping, 0, 0 ) != 0) {
+            break;
+        }
+
+        KeAcquireSpinLock( &SynthaeaFilterData.QueueLock, &oldIrql );
+        connected = InterlockedCompareExchange(
+            &SynthaeaFilterData.Connected, 0, 0 ) != 0;
+        if (connected && !IsListEmpty( &SynthaeaFilterData.Queue )) {
+            PLIST_ENTRY entry = RemoveHeadList( &SynthaeaFilterData.Queue );
+            event = CONTAINING_RECORD( entry, SYNTHAEA_QUEUED_EVENT, Link );
+            InitializeListHead( &event->Link );
+            SynthaeaReleaseReservationLocked( event );
+        } else {
+            KeResetEvent( &SynthaeaFilterData.QueueEvent );
+        }
+        KeReleaseSpinLock( &SynthaeaFilterData.QueueLock, oldIrql );
+
+        if (event != NULL) {
+            ULONG wireLength = sizeof( SYNTHAEA_EVENT_HEADER ) +
+                ((ULONG)event->Header.OldPathLength + event->Header.NewPathLength) * sizeof(WCHAR);
+            SynthaeaSetEventCounters( &event->Header );
+            if (!NT_SUCCESS( SynthaeaSendBuffer( &event->Header, wireLength ) )) {
+                InterlockedIncrement64( &SynthaeaFilterData.DroppedSendFailed );
+            }
+            ExFreePoolWithTag( event, SYNTHAEA_POOL_TAG );
+            continue;
+        }
+
+        waitStatus = KeWaitForMultipleObjects(
+            RTL_NUMBER_OF( waitObjects ), waitObjects, WaitAny, Executive,
+            KernelMode, FALSE, connected ? &heartbeatTimeout : NULL, NULL );
+        if (waitStatus == STATUS_WAIT_0) {
+            break;
+        }
+        if (waitStatus == STATUS_TIMEOUT && connected &&
+            InterlockedCompareExchange( &SynthaeaFilterData.Connected, 0, 0 ) != 0) {
+            SYNTHAEA_EVENT_HEADER heartbeat;
+            LARGE_INTEGER now;
+            RtlZeroMemory( &heartbeat, sizeof( heartbeat ) );
+            heartbeat.Kind = SYNTHAEA_EVENT_HEARTBEAT;
+            KeQuerySystemTimePrecise( &now );
+            heartbeat.Timestamp = now.QuadPart;
+            SynthaeaSetEventCounters( &heartbeat );
+            if (!NT_SUCCESS( SynthaeaSendBuffer( &heartbeat, sizeof( heartbeat ) ) )) {
+
+                //
+                //  Not a lost record: a heartbeat carries no event, and the agent may simply
+                //  not have a read pending. Count nothing, and take the sequence number back
+                //  so the agent sees no gap where no record went missing. Only this thread
+                //  numbers messages, and the compare-exchange leaves the counter alone if
+                //  a new client reset it meanwhile.
+                //
+
+                InterlockedCompareExchange64( &SynthaeaFilterData.Sequence,
+                                              (LONG64)heartbeat.Sequence - 1,
+                                              (LONG64)heartbeat.Sequence );
+            }
+        }
+    }
+
+    PsTerminateSystemThread( STATUS_SUCCESS );
+}
+
+NTSTATUS
+SynthaeaStartSender (
+    VOID
+    )
+{
+    NTSTATUS status;
+    HANDLE threadHandle = NULL;
+    PETHREAD threadObject = NULL;
+
+    status = PsCreateSystemThread( &threadHandle, THREAD_ALL_ACCESS, NULL,
+                                   NULL, NULL, SynthaeaSenderThread, NULL );
+    if (!NT_SUCCESS( status )) {
+        return status;
+    }
+
+    status = ObReferenceObjectByHandle( threadHandle, SYNCHRONIZE,
+                                        *PsThreadType, KernelMode,
+                                        (PVOID *)&threadObject, NULL );
+    if (!NT_SUCCESS( status )) {
+        KeSetEvent( &SynthaeaFilterData.StopEvent, IO_NO_INCREMENT, FALSE );
+        ZwWaitForSingleObject( threadHandle, FALSE, NULL );
+        ZwClose( threadHandle );
+        return status;
+    }
+
+    ZwClose( threadHandle );
+    SynthaeaFilterData.SenderThread = threadObject;
+    return STATUS_SUCCESS;
+}
+
+VOID
+SynthaeaStopSender (
+    VOID
+    )
+{
+    InterlockedExchange( &SynthaeaFilterData.Stopping, 1 );
+    KeSetEvent( &SynthaeaFilterData.StopEvent, IO_NO_INCREMENT, FALSE );
+    if (SynthaeaFilterData.SenderThread != NULL) {
+        KeWaitForSingleObject( SynthaeaFilterData.SenderThread, Executive,
+                               KernelMode, FALSE, NULL );
+        ObDereferenceObject( SynthaeaFilterData.SenderThread );
+        SynthaeaFilterData.SenderThread = NULL;
+    }
+}
+
+VOID
+SynthaeaFreeQueuedEvents (
+    VOID
+    )
+{
+    LIST_ENTRY localQueue;
+    KIRQL oldIrql;
+
+    InitializeListHead( &localQueue );
+    KeAcquireSpinLock( &SynthaeaFilterData.QueueLock, &oldIrql );
+    while (!IsListEmpty( &SynthaeaFilterData.Queue )) {
+        PLIST_ENTRY entry = RemoveHeadList( &SynthaeaFilterData.Queue );
+        PSYNTHAEA_QUEUED_EVENT event = CONTAINING_RECORD(
+            entry, SYNTHAEA_QUEUED_EVENT, Link );
+        SynthaeaReleaseReservationLocked( event );
+        InsertTailList( &localQueue, &event->Link );
+    }
+    KeReleaseSpinLock( &SynthaeaFilterData.QueueLock, oldIrql );
+
+    while (!IsListEmpty( &localQueue )) {
+        PLIST_ENTRY entry = RemoveHeadList( &localQueue );
+        PSYNTHAEA_QUEUED_EVENT event = CONTAINING_RECORD(
+            entry, SYNTHAEA_QUEUED_EVENT, Link );
+        ExFreePoolWithTag( event, SYNTHAEA_POOL_TAG );
+    }
 }
 
 
@@ -506,7 +1493,7 @@ Return Value:
         return STATUS_INVALID_PARAMETER;
     }
 
-    SynthaeaFilterData.ClientPort = ClientPort;
+    SynthaeaActivateClient( ClientPort );
 
     DbgPrintEx( DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                 "SynthaeaFilter: client connected, pid %p\n",
@@ -531,6 +1518,15 @@ Routine Description:
     UNREFERENCED_PARAMETER( ConnectionCookie );
 
     PAGED_CODE();
+
+    SynthaeaDeactivateClient();
+
+    // Keep queued records for a reconnect; only pending completions that race
+    // this disconnect are dropped and counted by the post-operation callback.
+    // Stop new sends and wait for the sender's bounded FltSendMessage call
+    // before FltCloseClientPort clears the shared port pointer.
+    ExWaitForRundownProtectionRelease( &SynthaeaFilterData.ClientRundown );
+    InterlockedExchange( &SynthaeaFilterData.ClientRundownDrained, 1 );
 
     DbgPrintEx( DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                 "SynthaeaFilter: client disconnected\n" );

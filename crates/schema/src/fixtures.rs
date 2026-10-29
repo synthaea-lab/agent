@@ -28,16 +28,18 @@
 use core::net::{IpAddr, Ipv4Addr};
 
 use crate::{
-    AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BpfEvent, CapSetEvent,
-    ConnectEvent, DefenderEvent, DefenderEventKind, DnsQueryEvent, EventMeta, ExecEvent,
-    FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent, FileQuarantineEvent,
-    FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent, HttpRequestEvent,
-    HttpSignature, HttpSummaryEvent, IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent,
-    KernelModuleAction, KernelModuleEvent, LdapSearchEvent, ListenPortEvent, MemfdCreateEvent,
-    NamespaceEvent, NamespaceSyscall, NetworkFlowEvent, NtlmAuthEvent, NtlmDirection,
-    PackageChangeEvent, PackageChangeKind, PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent,
-    ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent,
-    SessionEvent, SessionState, ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
+    AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BitsJobEvent,
+    BitsJobState, BpfEvent, CapSetEvent, ConnectEvent, DefenderEvent, DefenderEventKind,
+    DnsQueryEvent, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent,
+    FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetTimeEvent,
+    FileSetxattrEvent, FileWriteEvent, HttpRequestEvent, HttpSignature, HttpSummaryEvent,
+    IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent, KerberosDelegationFailureEvent,
+    KerberosDelegationFailureKind, KernelModuleAction, KernelModuleEvent, LdapSearchEvent,
+    ListenPortEvent, LogClearedEvent, MemfdCreateEvent, NamespaceEvent, NamespaceSyscall,
+    NetworkFlowEvent, NtlmAuthEvent, NtlmDirection, PackageChangeEvent, PackageChangeKind,
+    PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
+    RawVolumeOpenEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent,
+    SessionState, ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
     SocketCreateEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
     UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
 };
@@ -72,6 +74,10 @@ pub fn exec() -> ExecEvent {
         parent_image_path: None,
         sha256: None,
         signature: None,
+        original_file_name: None,
+        company_name: None,
+        file_description: None,
+        product_name: None,
         env_security: Vec::new(),
     }
 }
@@ -104,6 +110,8 @@ pub fn dns_query() -> DnsQueryEvent {
         query: String::new(),
         qtype: 0,
         result: None,
+        results: Vec::new(),
+        results_truncated: false,
         status: 0,
     }
 }
@@ -140,6 +148,32 @@ pub fn ntlm_auth() -> NtlmAuthEvent {
         remote_address: None,
         ntlm_version: String::new(),
         status: None,
+    }
+}
+
+/// Neutral [`LogClearedEvent`]: the System log, no account named.
+#[must_use]
+pub fn log_cleared() -> LogClearedEvent {
+    LogClearedEvent {
+        meta: meta(),
+        channel: "System".into(),
+        subject_user: String::new(),
+        subject_logon_id: None,
+        backup_path: None,
+    }
+}
+
+/// Neutral [`KerberosDelegationFailureEvent`].
+#[must_use]
+pub fn kerberos_delegation_failure() -> KerberosDelegationFailureEvent {
+    KerberosDelegationFailureEvent {
+        meta: meta(),
+        kind: KerberosDelegationFailureKind::UnconstrainedDelegationDenied,
+        target_server: String::new(),
+        target_user: String::new(),
+        target_domain: String::new(),
+        caller_user: String::new(),
+        caller_domain: String::new(),
     }
 }
 
@@ -296,6 +330,21 @@ pub fn file_quarantine() -> FileQuarantineEvent {
     }
 }
 
+/// Neutral [`BitsJobEvent`]: a file added to an untitled job, empty URL and path.
+#[must_use]
+pub fn bits_job() -> BitsJobEvent {
+    BitsJobEvent {
+        meta: meta(),
+        job_id: String::new(),
+        job_title: String::new(),
+        state: BitsJobState::FileAdded,
+        url: String::new(),
+        local_path: String::new(),
+        bytes_transferred: None,
+        hresult: None,
+    }
+}
+
 /// Neutral [`ListenPortEvent`] on [`TEST_ADDR`].
 #[must_use]
 pub fn listen_port() -> ListenPortEvent {
@@ -370,6 +419,29 @@ pub fn file_rename() -> FileRenameEvent {
         old_path: String::new(),
         new_path: String::new(),
         executable_path: None,
+    }
+}
+
+/// Neutral [`FileSetTimeEvent`].
+#[must_use]
+pub fn file_set_time() -> FileSetTimeEvent {
+    FileSetTimeEvent {
+        meta: meta(),
+        path: String::new(),
+        creation_time: None,
+        last_access_time: None,
+        last_write_time: None,
+        change_time: None,
+    }
+}
+
+/// Neutral [`RawVolumeOpenEvent`].
+#[must_use]
+pub fn raw_volume_open() -> RawVolumeOpenEvent {
+    RawVolumeOpenEvent {
+        meta: meta(),
+        volume: String::new(),
+        desired_access: 0,
     }
 }
 

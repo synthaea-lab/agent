@@ -57,6 +57,14 @@ pub(crate) fn spawn_monitor(state_dir: PathBuf, sink: Arc<DetectionSink>) {
         .expect("spawning the self-integrity monitor thread");
 }
 
+/// The layout's base directory: where the record of key rotations lives.
+fn state_dir(layout: &updater::layout::Layout) -> std::path::PathBuf {
+    layout
+        .versions_dir()
+        .parent()
+        .map_or_else(std::path::PathBuf::new, std::path::Path::to_path_buf)
+}
+
 /// One verification pass. `None` from [`updater::layout::Layout::current_release_version`]
 /// (bootstrap / day 0, ADR-0015 Decision 7 — nothing has ever been promoted) is the
 /// honest no-op case: the package-installed bootstrap binaries carry no
@@ -80,7 +88,36 @@ fn check_once(layout: &updater::layout::Layout, sink: &DetectionSink) {
     // re-verify the signature every pass rather than once at load time, so a
     // manifest swapped on disk *after* a clean earlier check still gets caught on
     // the next one.
-    if let Err(e) = manifest.verify_signature() {
+    // The manifest was verified under the `release` key in force when it was promoted, which a
+    // rotation since then may have replaced: accept any key this install has trusted. That is a
+    // re-check of a manifest already on disk, never an approval of anything new.
+    let keys = match crate::trust::load(&state_dir(layout)) {
+        Ok(keys) => keys,
+        Err(e) => {
+            tracing::warn!(error = %e, "self-integrity: the record of key rotations is not trustworthy");
+            sink.emit_tamper(
+                TAMPER_TECHNIQUE,
+                &format!(
+                    "the record of applied key rotations is not trustworthy ({e}); releases \
+                     and content are not verified until it is repaired"
+                ),
+            );
+            return;
+        }
+    };
+    let verified = if keys.release_lineage.is_empty() {
+        manifest.verify_signature_with(None)
+    } else {
+        let mut outcome = Err(updater::UpdaterError::SignatureInvalid);
+        for key in &keys.release_lineage {
+            outcome = manifest.verify_signature_with(Some(key));
+            if outcome.is_ok() {
+                break;
+            }
+        }
+        outcome
+    };
+    if let Err(e) = verified {
         if !signature_failure_is_tamper(&e) {
             tracing::warn!(
                 release_version,
@@ -237,6 +274,80 @@ mod tests {
             "expected the integrity violation's own message, got: {alerts}"
         );
         assert_eq!(sink.tamper_events(), 1, "one violation, one tamper event");
+    }
+
+    /// A rotation of `release` away from the embedded test key, signed by the test recovery key
+    /// and recorded under `dir` the way `apply-key-rotation` does.
+    fn record_release_rotation(dir: &std::path::Path) {
+        let embedded = updater::key::RELEASE_PUBLIC_KEY.unwrap();
+        let mut rotation = updater::KeyRotationManifest {
+            expires_at: 2_000_000_000,
+            issued_at: 1_999_990_000,
+            new_content_key: None,
+            new_release_key: Some(updater::hash::hex_encode(&[0x61; 32])),
+            reason: "test".into(),
+            release_version: 9,
+            retired_content_key: None,
+            retired_release_key: Some(updater::hash::hex_encode(&embedded)),
+            schema_version: updater::rotation::ROTATION_SCHEMA_VERSION,
+            signature: String::new(),
+        };
+        rotation.sign(&updater::key::test_recovery_key_pair());
+        crate::rotation::apply(&rotation, dir, None, 1_999_990_100).unwrap();
+    }
+
+    #[test]
+    fn a_release_promoted_before_a_key_rotation_still_checks_clean_after_it() {
+        let dir = tmp("rotated-after-promotion");
+        let layout = Layout::new(&dir);
+        std::fs::create_dir_all(layout.bootstrap_dir()).unwrap();
+        std::fs::create_dir_all(layout.versions_dir()).unwrap();
+        std::os::unix::fs::symlink(layout.bootstrap_dir(), layout.current_link()).unwrap();
+        promote_signed_release(&layout, b"the real agent binary");
+        record_release_rotation(&dir);
+
+        let sink = sink_in(&dir);
+        check_once(&layout, &sink);
+
+        assert_eq!(alerts_of(&dir), "", "signed by a key this install trusted");
+        assert_eq!(sink.tamper_events(), 0);
+    }
+
+    #[test]
+    fn a_manifest_signed_by_a_key_this_install_never_trusted_is_still_tamper_after_a_rotation() {
+        let dir = tmp("rotated-forged");
+        let layout = Layout::new(&dir);
+        std::fs::create_dir_all(layout.bootstrap_dir()).unwrap();
+        std::fs::create_dir_all(layout.versions_dir()).unwrap();
+        std::os::unix::fs::symlink(layout.bootstrap_dir(), layout.current_link()).unwrap();
+        promote_signed_release(&layout, b"the real agent binary");
+        record_release_rotation(&dir);
+        let mut forged = layout.read_manifest(1).unwrap();
+        forged.sign(&updater::key::test_recovery_key_pair());
+        layout.persist_manifest(&forged).unwrap();
+
+        let sink = sink_in(&dir);
+        check_once(&layout, &sink);
+
+        assert!(alerts_of(&dir).contains("T1601"));
+        assert_eq!(sink.tamper_events(), 1);
+    }
+
+    #[test]
+    fn a_corrupt_record_of_key_rotations_is_a_tamper_event() {
+        let dir = tmp("record-corrupt");
+        let layout = Layout::new(&dir);
+        std::fs::create_dir_all(layout.bootstrap_dir()).unwrap();
+        std::fs::create_dir_all(layout.versions_dir()).unwrap();
+        std::os::unix::fs::symlink(layout.bootstrap_dir(), layout.current_link()).unwrap();
+        promote_signed_release(&layout, b"the real agent binary");
+        std::fs::write(crate::trust::record_path(&dir), b"{ truncated").unwrap();
+
+        let sink = sink_in(&dir);
+        check_once(&layout, &sink);
+
+        assert!(alerts_of(&dir).contains("key rotations is not trustworthy"));
+        assert_eq!(sink.tamper_events(), 1);
     }
 
     #[test]

@@ -188,12 +188,19 @@ mod linux {
         );
         std::fs::create_dir_all(layout.versions_dir())?;
 
+        // The release key in force, which is the embedded one until a rotation replaced it, and
+        // the counter releases share with rotations (ADR-0027): a release numbered at or below
+        // an applied rotation is a rollback of it.
+        let keys = crate::trust::load(&state_dir(layout))?;
         let manifest: ReleaseManifest = client.get_json(&client.config().release_manifest_url())?;
-        manifest.verify_signature()?;
+        manifest.verify_signature_with(keys.release.as_ref())?;
         manifest.validate_entry_paths()?;
 
         BannedVersions::load(&ban_list_path(layout))?.check(manifest.release_version)?;
-        match manifest.check_release_version(layout.current_release_version()) {
+        let installed = layout
+            .current_release_version()
+            .max(keys.applied_release_version);
+        match manifest.check_release_version(installed) {
             Ok(()) => {}
             Err(UpdaterError::ReleaseNotNewer { offered, current }) => {
                 return Ok(Outcome::UpToDate { offered, current });
@@ -240,10 +247,15 @@ mod linux {
     }
 
     fn ban_list_path(layout: &Layout) -> PathBuf {
+        state_dir(layout).join(BAN_LIST)
+    }
+
+    /// The layout's base directory, where the ban list and the record of key rotations live.
+    fn state_dir(layout: &Layout) -> PathBuf {
         layout
             .versions_dir()
             .parent()
-            .map_or_else(|| PathBuf::from(BAN_LIST), |base| base.join(BAN_LIST))
+            .map_or_else(PathBuf::new, Path::to_path_buf)
     }
 
     /// Downloads every entry into `versions/.stage-N`, then renames it to
@@ -343,7 +355,7 @@ mod linux {
     ) -> anyhow::Result<()> {
         // Before any network or filesystem work: an unacknowledged test-key
         // build must not even contact the server.
-        crate::trust::ensure_release_key_trusted(allow_test_key)?;
+        crate::trust::ensure_release_key_trusted(base_dir, allow_test_key)?;
         let mut config = transport::TransportConfig::new(server);
         if let (Some(cert), Some(key)) = (cert, key) {
             config = config.with_client_cert(PathBuf::from(cert), PathBuf::from(key));
@@ -661,6 +673,95 @@ mod linux {
                     .iter()
                     .all(|r| !r.contains("/artifact"))
             );
+        }
+
+        /// Records a rotation of the `release` key from the embedded test key to the key of
+        /// seed `0x51`, numbered `version`, the way `apply-key-rotation` does.
+        fn rotate_release_key(base: &Path, version: u64) -> ring::signature::Ed25519KeyPair {
+            use ring::signature::KeyPair as _;
+            let new = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[0x51; 32]).unwrap();
+            let mut rotation = updater::KeyRotationManifest {
+                expires_at: 2_000_000_000,
+                issued_at: 1_999_990_000,
+                new_content_key: None,
+                new_release_key: Some(updater::hash::hex_encode(new.public_key().as_ref())),
+                reason: "test".into(),
+                release_version: version,
+                retired_content_key: None,
+                retired_release_key: Some(updater::hash::hex_encode(
+                    &updater::key::RELEASE_PUBLIC_KEY.unwrap(),
+                )),
+                schema_version: updater::rotation::ROTATION_SCHEMA_VERSION,
+                signature: String::new(),
+            };
+            rotation.sign(&updater::key::test_recovery_key_pair());
+            crate::rotation::apply(&rotation, base, None, 1_999_990_100).unwrap();
+            new
+        }
+
+        #[test]
+        fn after_a_rotation_a_release_signed_by_the_new_key_is_promoted_and_the_old_key_is_refused()
+        {
+            let (base, layout) = install("rotated", &[1]);
+            let new_key = rotate_release_key(&base, 2);
+            let files: [(&str, &[u8]); 1] = [("agent", b"agent v3")];
+
+            let by_old = signed(3, &files);
+            let server = serve(&by_old, vec![("agent", b"agent v3".to_vec())]);
+            let err = apply_release(&client(&server.url), &layout).unwrap_err();
+            assert!(
+                matches!(
+                    err.downcast_ref::<UpdaterError>(),
+                    Some(UpdaterError::SignatureInvalid)
+                ),
+                "the retired key must not sign a release: {err:#}"
+            );
+            assert_eq!(layout.current_release_version(), Some(1));
+
+            let mut by_new = signed(3, &files);
+            by_new.sign(&new_key);
+            let server = serve(&by_new, vec![("agent", b"agent v3".to_vec())]);
+            assert!(matches!(
+                apply_release(&client(&server.url), &layout).unwrap(),
+                Outcome::Promoted {
+                    release_version: 3,
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn a_release_numbered_at_or_below_an_applied_rotation_is_not_promoted() {
+            let (base, layout) = install("rotation-counter", &[1]);
+            let new_key = rotate_release_key(&base, 5);
+            let files: [(&str, &[u8]); 1] = [("agent", b"agent v4")];
+            let mut manifest = signed(4, &files);
+            manifest.sign(&new_key);
+            let server = serve(&manifest, vec![("agent", b"agent v4".to_vec())]);
+
+            let outcome = apply_release(&client(&server.url), &layout).unwrap();
+
+            assert_eq!(
+                outcome,
+                Outcome::UpToDate {
+                    offered: 4,
+                    current: 5
+                }
+            );
+            assert_eq!(layout.current_release_version(), Some(1));
+        }
+
+        #[test]
+        fn a_corrupt_record_of_rotations_stops_apply_release_before_the_network() {
+            let (base, layout) = install("record-corrupt", &[1]);
+            std::fs::write(crate::trust::record_path(&base), b"{ truncated").unwrap();
+            let manifest = signed(2, &[("agent", b"x")]);
+            let server = serve(&manifest, vec![("agent", b"x".to_vec())]);
+
+            let err = apply_release(&client(&server.url), &layout).unwrap_err();
+
+            assert!(format!("{err:#}").contains("not trustworthy"), "{err:#}");
+            assert!(server.requests.lock().unwrap().is_empty());
         }
 
         #[test]

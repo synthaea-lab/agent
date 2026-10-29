@@ -273,7 +273,54 @@ pub mod time;
 /// address, NTLM version). Windows-only. It claimed 41 while #632 (`LdapSearch`)
 /// was open, then 43 after #263 (`SocketCreate`, 42) merged, then 44 after #772
 /// (`PackageChange`) took 43; same coordination note as above.
-pub const SCHEMA_VERSION: u32 = 44;
+///
+/// Bumped 44 → 45 for [`Event::LogCleared`] (#799): a Windows event log
+/// cleared, from the record the Event Log service writes into the fresh log
+/// (Security 1102, System 104), whatever did the clearing. Windows-only.
+/// #577 (`BitsJob`) was open at the same time; whichever merges second
+/// renumbers, same coordination note as above.
+///
+/// Bumped 45 → 47 for [`Event::DnsQuery`] (#458): Linux glibc `getaddrinfo`
+/// telemetry now includes an ordered address set and an explicit truncation flag.
+/// 46 was claimed by #577 (`BitsJob`, open at the time); it landed second and
+/// renumbers below, same coordination note as above.
+///
+/// Bumped 47 → 48 for [`Event::BitsJob`] (#284): BITS jobs from
+/// `Microsoft-Windows-Bits-Client`, the only record that ties a BITS download
+/// (whose network I/O the service does itself) back to the process that asked
+/// for it. Windows-only. It claimed 35, then 40, then 42, then 43, then 44,
+/// then 45, then 46, while #519, #654, #632, #263, #87, #364, #799 and #458
+/// merged first with 35, 40, 41, 42, 43, 44, 45 and 47; same coordination
+/// note as above.
+///
+/// Bumped 48 → 52 for [`detection::DetectionSource::Ioc`] (#60): an on-device
+/// indicator match (hash, IP or domain) carrying the indicator, its
+/// [`detection::IocKind`] and the feed provenance. #993, #994 and #995 were open
+/// at the time and each claim 49; 50 and 51 are left for the two that renumber.
+/// Whichever of these merges later renumbers, same coordination note as above.
+///
+/// Bumped 52 → 53 for [`ExecEvent::original_file_name`], [`ExecEvent::company_name`],
+/// [`ExecEvent::file_description`] and [`ExecEvent::product_name`] (#983): PE
+/// version-resource metadata for the executed image, read by enrichment. Windows
+/// only (`None` elsewhere). Originally claimed 49, renumbered on merge: #60 landed
+/// first and took 52, leaving 50/51 reserved for #994/#995 (also renumbering from
+/// their own 49 claims) — this PR took the next free number above all three
+/// instead of guessing which of 50/51 would still be open by the time it merged.
+///
+/// Bumped 53 → 55 for [`Event::KerberosDelegationFailure`] (#364): the Kerberos
+/// client's own unconstrained-delegation and TGT-session-key-export denials,
+/// from the (off by default) `Microsoft-Windows-Kerberos/Operational` channel.
+/// Windows-only. Originally claimed 49; renumbered past #60's 52 and #983's 53.
+/// #994 merged first, ahead of the 54 it had reserved for #995, so main went
+/// straight from 53 to 55 and left 54 unused.
+///
+/// Bumped 55 → 56 for Windows minifilter explicit timestamp requests (#136). #995
+/// (`ListenPortEvent::protocol`) renumbered past the skipped 54 to 57, closer to
+/// merging than this one, so no collision there.
+///
+/// Bumped 56 → 57 for mounted raw-volume open telemetry (#136 slice 4), stacked on
+/// the timestomp slice above.
+pub const SCHEMA_VERSION: u32 = 57;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -561,6 +608,30 @@ pub struct ExecEvent {
     /// Code-signature verdict for the executed image, filled by enrichment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Signature>,
+    /// `OriginalFilename` from the executed image's PE version resource, filled by
+    /// the agent's enrichment stage (issue #983) — the `SigmaHQ` `process_creation`
+    /// catalogue's primary renamed-binary signal (49% of its Windows rules use it:
+    /// `cmd.exe` renamed to `svchost.exe` still carries its real original name in the
+    /// resource). Windows only: PE version resources are a Windows concept, so this
+    /// is always `None` on Linux/macOS (no Mach-O/ELF equivalent). `None` on Windows
+    /// too when the image has no version resource, enrichment could not read it
+    /// (over [`crate`]'s size budget, or a malformed/absent resource), or the image
+    /// was never enriched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_file_name: Option<String>,
+    /// `CompanyName` from the same PE version resource as
+    /// [`Self::original_file_name`] — read in the same pass since the cost is
+    /// already paid once the resource is open. Same `None` rules, same posture
+    /// (19 rules in the catalogue's `process_creation` category use it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub company_name: Option<String>,
+    /// `FileDescription` from the same PE version resource. Same `None` rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_description: Option<String>,
+    /// `ProductName` from the same PE version resource. Same `None` rules (70 rules
+    /// in the catalogue's `process_creation` category use it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_name: Option<String>,
     /// Security-relevant environment variables present at exec time, `(name, value)`
     /// pairs (#363) — the dynamic-linker-hijack family: `LD_PRELOAD`,
     /// `LD_LIBRARY_PATH`, `LD_AUDIT` (the quieter sibling of `LD_PRELOAD`),
@@ -768,6 +839,40 @@ pub struct FileRenameEvent {
     /// of trusting `comm` alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_path: Option<String>,
+}
+
+/// Explicit `FileBasicInformation` timestamp request observed by the Windows minifilter.
+/// Values are raw signed 100-ns Windows FILETIME units requested by the caller; `None` means
+/// that field was unchanged. Windows' own -1 (don't change) and -2 (don't change, don't update
+/// on next write either) sentinels still survive as `Some(-1)`/`Some(-2)`, not `None` — the
+/// field being set at all is what `None` tracks, distinct from the caller asking it stay as-is;
+/// `rules::evaluate_file_set_time` is what filters those two sentinel values out of the ones
+/// that count as a real requested time. This reports a successful request, not proof of
+/// malicious intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSetTimeEvent {
+    pub meta: EventMeta,
+    /// Normalized path captured by the minifilter before the operation.
+    pub path: String,
+    /// Requested creation time in raw signed 100-ns FILETIME units; `None` means unchanged.
+    pub creation_time: Option<i64>,
+    /// Requested last-access time in raw signed 100-ns FILETIME units; `None` means unchanged.
+    pub last_access_time: Option<i64>,
+    /// Requested last-write time in raw signed 100-ns FILETIME units; `None` means unchanged.
+    pub last_write_time: Option<i64>,
+    /// Requested change time in raw signed 100-ns FILETIME units; `None` means unchanged.
+    pub change_time: Option<i64>,
+}
+
+/// Successful open of a mounted logical volume through the Windows minifilter.
+/// `desired_access` is the caller's requested `ACCESS_MASK`, not the rights granted or later used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawVolumeOpenEvent {
+    pub meta: EventMeta,
+    /// Kernel device name captured from the attached volume (for example `\\Device\\HarddiskVolume3`).
+    pub volume: String,
+    /// Raw Windows `ACCESS_MASK` requested by the caller.
+    pub desired_access: u32,
 }
 
 /// File permission change (issue #262 Phase 2): `chmod(2)`/`fchmodat(2)`. `fchmod(2)`
@@ -992,13 +1097,25 @@ pub struct DnsQueryEvent {
     pub query: String,
     /// DNS record type (1 = A, 28 = AAAA, 5 = CNAME, ...).
     pub qtype: u32,
-    /// Resolved addresses / CNAME chain, semicolon-separated as the provider
-    /// emits them (e.g. `"type:1 172.67.143.127;"`). `None` on NXDOMAIN or when
-    /// the provider returns an empty string.
+    /// Existing provider result kept for compatibility; Linux `getaddrinfo`
+    /// sets it to the first resolved address. `None` on lookup failure or when
+    /// the provider returns no result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
+    /// Resolved IP addresses in resolver order. Empty for producers that do not
+    /// expose an answer set and for failed lookups. Repeated addresses are removed
+    /// while preserving their first appearance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub results: Vec<String>,
+    /// True when the producer's bounded answer collection omitted further entries.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub results_truncated: bool,
     /// Win32 status code (0 = success, 9003 = NXDOMAIN, ...).
     pub status: u32,
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// What a [`DefenderEvent`] reports.
@@ -1127,6 +1244,100 @@ pub struct NtlmAuthEvent {
     /// user name or password). `None` when the provider gives none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+}
+
+/// A Windows event log was cleared (#799), from the record the Event Log
+/// service itself writes as the first entry of the fresh log: Security **1102**
+/// ("The audit log was cleared") or System **104** ("The log file was
+/// cleared", naming the channel). Windows writes it whatever did the clearing
+/// (`wevtutil cl`, the `EvtClearLog` API, .NET `EventLogSession.ClearLog`, a
+/// renamed tool), and no audit subcategory gates it.
+///
+/// `meta.pid` is the process that asked for the clear (`ClientProcessId`,
+/// written by Windows 11 26200, lab 2026-10-15), or the Event Log service when
+/// an older build leaves it out; `comm` is empty either way. `meta.user` is the
+/// account that cleared the log (`SubjectUserSid` for 1102, the event's
+/// `Security UserID` for 104), [`User::Unknown`] when the event names none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogClearedEvent {
+    pub meta: EventMeta,
+    /// The channel cleared, as Windows names it (`Security`, `System`,
+    /// `Microsoft-Windows-PowerShell/Operational`, ...).
+    pub channel: String,
+    /// The clearing account as `DOMAIN\user`, or `user` alone when the event
+    /// gives no domain. Empty when it names none.
+    pub subject_user: String,
+    /// 1102 only: the clearing account's logon session (`0x3e7`), to join with
+    /// that session's 4624. `None` for 104, which does not carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_logon_id: Option<String>,
+    /// 104 only: where the log was saved before it was cleared, when the
+    /// clearer asked for a backup (`wevtutil cl <channel> /bu:<file>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_path: Option<String>,
+}
+
+/// Which Kerberos client operation was denied, in a [`KerberosDelegationFailureEvent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KerberosDelegationFailureKind {
+    /// EID 201: this host's own process asked its local Kerberos client for a ticket it
+    /// could present for unconstrained delegation to `target_server` (impersonating
+    /// whatever user later authenticates through it to that server), and the client's
+    /// own Kerberos stack refused — this host is not on the allowlist that may ask for
+    /// that. The Rubeus `tgtdeleg`/delegation-collection shape.
+    UnconstrainedDelegationDenied,
+    /// EID 202: this host's own process asked to export its TGT's session key, and the
+    /// client's own Kerberos stack refused — on a Credential Guard host, a TGT's key can
+    /// never leave the isolated LSA, by design (ADR: this is the client-side half of the
+    /// same protection PKINIT key-export denials, EID 203/204, also report).
+    TgtSessionKeyExportDenied,
+}
+
+/// A Kerberos client-side operation an attacker would want was denied, from the
+/// (off by default; see `docs/sensors/sources.md`) `Microsoft-Windows-Kerberos/Operational`
+/// channel's EID 201/202 (#364). **The local process is the actor**: both events report this
+/// host's own process asking its own Kerberos client for something (a delegable ticket for
+/// `target_server`, or its own TGT session key) and that client refusing — not a remote
+/// server using this host as a stepping stone. The provider manifest
+/// (`Get-WinEvent -ListProvider Microsoft-Windows-Security-Kerberos`) names `%4 CallerPID` as
+/// the *client* process id, and the message text is "unconstrained delegation is not allowed
+/// for this user" (fwlink 856824) — the refusal is about the local caller, not a third party.
+///
+/// Framed as what it is: a **refusal**. Each event means an attempt was made and this host's
+/// own Kerberos stack said no — not that delegation succeeded, and not evidence the request
+/// was malicious (a misconfigured but legitimate service asking for delegation it was never
+/// granted looks identical). High: unconstrained delegation and TGT export are both a small,
+/// deliberate allowlist on a well-run host, so a request outside it is rare and worth a look;
+/// not Critical, since the client's own refusal is already the control working.
+///
+/// `meta.pid`/`meta.comm` are the process that made the request (`CallerPID`/`ProcessName`,
+/// both 201 and 202 carry them, the same nine-field template). `meta.user` is
+/// [`User::Unknown`]: the template gives this process's owner only as a name and a domain
+/// (`ClientUserName`/`ClientDomainName`), never a SID, so it cannot become a
+/// [`User::Windows`] — [`caller_user`](Self::caller_user) carries it as text instead, the same
+/// choice [`LogClearedEvent::subject_user`] makes when a SID isn't the shape the data comes in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KerberosDelegationFailureEvent {
+    pub meta: EventMeta,
+    pub kind: KerberosDelegationFailureKind,
+    /// The server named in the request (`TargetName`/`Server`): for 201, the server the
+    /// requested delegable ticket was for.
+    pub target_server: String,
+    /// Credentials explicitly supplied to the call (`UserName`), rather than the caller's own
+    /// — usually empty, since a call with default credentials supplies none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub target_user: String,
+    /// That supplied account's domain (`DomainName`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub target_domain: String,
+    /// The calling process's own owner account (`ClientUserName`), as text — see the struct
+    /// doc for why it is not `meta.user`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub caller_user: String,
+    /// That account's domain (`ClientDomainName`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub caller_domain: String,
 }
 
 /// An LDAP search a process sent, from EID 30 of the
@@ -1322,6 +1533,56 @@ pub struct SmbConnectEvent {
     pub meta: EventMeta,
     /// Server name as the SMB client resolved it (e.g. `\\WIN-TARGET` or `\\192.168.1.10`).
     pub server_name: String,
+}
+
+/// What a [`BitsJobEvent`] reports about its job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BitsJobState {
+    /// A file (remote URL → local path) was added to the job: the download
+    /// is requested.
+    FileAdded,
+    /// The job transferred everything.
+    Completed,
+    /// The job was cancelled.
+    Cancelled,
+    /// A transfer stopped on an error; [`BitsJobEvent::hresult`] says which.
+    TransferError,
+}
+
+/// A Background Intelligent Transfer Service job (#284, T1197) from
+/// `Microsoft-Windows-Bits-Client`.
+///
+/// BITS does the network I/O from its own service (`svchost.exe`), so the
+/// connect and DNS events never name the process that asked for the download.
+/// This event does: `meta` is the job's client, the process that added the
+/// file (or cancelled the job). For a completion or a transfer error, which
+/// BITS reports from the service, it is the client that added the job's file.
+///
+/// One event per job state the sensor forwards, all sharing `job_id`; a
+/// completion or a cancellation is one event per file of the job. Files
+/// fetched from Microsoft update hosts are filtered at the sensor, see
+/// `sensor-windows`; the job's owner is not a filter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BitsJobEvent {
+    pub meta: EventMeta,
+    /// The job GUID, braces included, as BITS writes it.
+    pub job_id: String,
+    /// The job's display name, chosen by the client
+    /// (`bitsadmin /transfer <name>`, `Start-BitsTransfer -DisplayName`).
+    pub job_title: String,
+    pub state: BitsJobState,
+    /// The remote URL of the file this event is about.
+    pub url: String,
+    /// Where BITS writes that file.
+    pub local_path: String,
+    /// Bytes the job transferred so far, when the record reports it: a job
+    /// total, repeated on each file's event of a multi-file job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_transferred: Option<u64>,
+    /// The failing HRESULT of a [`BitsJobState::TransferError`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hresult: Option<u32>,
 }
 
 /// UDP datagram sent — the primary signal for DNS-tunneling and C2-over-UDP detection.
@@ -1565,6 +1826,18 @@ pub struct HealthBeacon {
     /// to show how full the cache runs. Zero on other platforms and in an older beacon.
     #[serde(default)]
     pub parent_image_evicted_dead: u64,
+    /// Indicators in force in the on-device IOC set right now (#60): a gauge, not a total. Zero
+    /// when no feed is loaded, and in a beacon from an older agent.
+    #[serde(default)]
+    pub ioc_indicators: u64,
+    /// Cumulative IOC matches that raised a finding since the agent started. Zero in a beacon
+    /// from an older agent.
+    #[serde(default)]
+    pub ioc_findings: u64,
+    /// Cumulative IOC matches the per-indicator cooldown absorbed: a high count against few
+    /// findings is one indicator seen again and again. Zero in an older beacon.
+    #[serde(default)]
+    pub ioc_cooled_down: u64,
 }
 
 /// A logon/authentication outcome, or a privileged-session assignment — shared
@@ -1889,13 +2162,12 @@ pub const POLICY_MECHANISM_WDAC: &str = "wdac";
 /// [`AuthKind`] stays coarse rather than growing a variant per OS event ID.
 ///
 /// First emitted by `sensor-linux-audit` from `SELinux` AVC records
-/// (`type=AVC`). `action` is `None` for now: the kernel's AVC message body
-/// (`avc: denied { read } for pid=...`) is text, not `key=value`, before the
-/// first real field, so the shared audit parser's byte scan doesn't yet
-/// recover the requested permission set — see
-/// `sensor_linux_audit::classify::AuditEvent::PolicyDenial`'s doc. Tracked
-/// separately; this event ships without it rather than block the schema on
-/// that parser fix.
+/// (`type=AVC`). The kernel's AVC message body (`avc: denied { read } for
+/// pid=...`) is text, not `key=value`, before the first real field; the
+/// shared audit parser's byte scan folds that preamble into its first
+/// `key=value` pair and recovers the requested permission set from it (#813)
+/// — see `sensor_linux_audit::classify::AuditEvent::PolicyDenial`'s doc.
+/// `action` is still `None` for an AVC variant the parser doesn't recognize.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyDenialEvent {
     pub meta: EventMeta,
@@ -1916,8 +2188,11 @@ pub struct PolicyDenialEvent {
     /// `process`, `tcp_socket`, `capability`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_class: Option<String>,
-    /// The permission that was requested (`SELinux` `{ read }` etc.). `None`
-    /// until the AVC parser recovers it — see this type's doc.
+    /// The permission or action that was requested. Mechanism-specific:
+    /// `SELinux` `{ read }`, or `{ read write }` space-joined for more than one
+    /// (recovered from the AVC record by `sensor-linux-audit`, #813); `AppLocker`/
+    /// `WDAC` a verb like `execute`/`load`. `None` for an AVC variant the parser
+    /// doesn't recognize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
     /// `true` when the mechanism actually blocked the action (`SELinux`
@@ -2249,6 +2524,8 @@ pub enum Event {
     Defender(DefenderEvent),
     LdapSearch(LdapSearchEvent),
     NtlmAuth(NtlmAuthEvent),
+    LogCleared(LogClearedEvent),
+    KerberosDelegationFailure(KerberosDelegationFailureEvent),
     WmiActivity(WmiActivityEvent),
     AssemblyLoad(AssemblyLoadEvent),
     SmbConnect(SmbConnectEvent),
@@ -2263,6 +2540,8 @@ pub enum Event {
     FileWrite(FileWriteEvent),
     FileDelete(FileDeleteEvent),
     FileRename(FileRenameEvent),
+    FileSetTime(FileSetTimeEvent),
+    RawVolumeOpen(RawVolumeOpenEvent),
     SocketBind(SocketBindEvent),
     FileChmod(FileChmodEvent),
     FileChown(FileChownEvent),
@@ -2291,6 +2570,7 @@ pub enum Event {
     HttpRequest(HttpRequestEvent),
     HttpSummary(HttpSummaryEvent),
     PackageChange(PackageChangeEvent),
+    BitsJob(BitsJobEvent),
 }
 
 impl Event {
@@ -2313,6 +2593,8 @@ impl Event {
             Event::Defender(e) => &e.meta,
             Event::LdapSearch(e) => &e.meta,
             Event::NtlmAuth(e) => &e.meta,
+            Event::LogCleared(e) => &e.meta,
+            Event::KerberosDelegationFailure(e) => &e.meta,
             Event::WmiActivity(e) => &e.meta,
             Event::AssemblyLoad(e) => &e.meta,
             Event::SmbConnect(e) => &e.meta,
@@ -2327,6 +2609,8 @@ impl Event {
             Event::FileWrite(e) => &e.meta,
             Event::FileDelete(e) => &e.meta,
             Event::FileRename(e) => &e.meta,
+            Event::FileSetTime(e) => &e.meta,
+            Event::RawVolumeOpen(e) => &e.meta,
             Event::SocketBind(e) => &e.meta,
             Event::FileChmod(e) => &e.meta,
             Event::FileChown(e) => &e.meta,
@@ -2355,6 +2639,7 @@ impl Event {
             Event::HttpRequest(e) => &e.meta,
             Event::HttpSummary(e) => &e.meta,
             Event::PackageChange(e) => &e.meta,
+            Event::BitsJob(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.

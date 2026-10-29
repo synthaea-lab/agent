@@ -6,15 +6,17 @@
 //! once at startup and passes it here so schema timestamps are epoch nanoseconds.
 
 use schema::{
-    BpfEvent, CapSetEvent, ConnectEvent, ContainerContext, Event, EventMeta, ExecEvent,
-    FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent, FileRemovexattrEvent,
-    FileRenameEvent, FileSetxattrEvent, FileWriteEvent, IdentityChangeEvent, IdentityChangeKind,
-    KernelModuleAction, KernelModuleEvent, MemfdCreateEvent, MountEvent, NamespaceEvent,
-    NamespaceSyscall, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
-    SignalEvent, SocketAcceptEvent, SocketBindEvent, SocketCreateEvent, SocketListenEvent,
-    UdpRecvEvent, UdpSendEvent, User,
+    BpfEvent, CapSetEvent, ConnectEvent, ContainerContext, DnsQueryEvent, Event, EventMeta,
+    ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent, FileOpenEvent,
+    FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent, FileWriteEvent, IdentityChangeEvent,
+    IdentityChangeKind, KernelModuleAction, KernelModuleEvent, MemfdCreateEvent, MountEvent,
+    NamespaceEvent, NamespaceSyscall, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent,
+    PtraceEvent, SignalEvent, SocketAcceptEvent, SocketBindEvent, SocketCreateEvent,
+    SocketListenEvent, UdpRecvEvent, UdpSendEvent, User,
 };
 use sensor_linux_wire as wire;
+
+use crate::dns_udp;
 
 /// Tripwire: bumping the wire ABI must come here to revisit the mappings below.
 ///
@@ -110,7 +112,13 @@ use sensor_linux_wire as wire;
 /// v24 (#784) added `grandparent_pid`/`parent_execd`/`grandparent_generation` to `ExecEvent`
 /// and `execd` to `LineageEntry`; `exec` maps none of them (the parent-image cache reads them
 /// from the wire event, see `parent_image`), so no mapping changed shape.
-const _: () = assert!(wire::WIRE_VERSION == 24);
+///
+/// v25 (#458) changed `GetAddrInfoEvent` — not imported here (the uprobes crate maps it).
+///
+/// v26 (#458 part 3) added `DnsUdpQueryEvent` — new `dns_udp_query` mapping function below, which
+/// parses the question out of the datagram and reuses `schema::DnsQueryEvent`; no existing mapping
+/// changed shape.
+const _: () = assert!(wire::WIRE_VERSION == 26);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
@@ -183,6 +191,10 @@ pub fn exec(
         parent_image_path: None,
         sha256: None,
         signature: None,
+        original_file_name: None, // filled by the agent's enrichment stage (#983); Linux has no PE resource anyway
+        company_name: None,
+        file_description: None,
+        product_name: None,
         env_security,
     })
 }
@@ -457,6 +469,33 @@ pub fn udp_send(
         dport: event.dport,
         size: event.size,
     })
+}
+
+/// A DNS query sent over a socket to port 53 (#458 part 3), as the platform-neutral
+/// [`DnsQueryEvent`] the `getaddrinfo` uprobe also produces. `None` when the bytes are not a DNS
+/// query: a descriptor number reused after its socket closed, or any other stream the kernel side
+/// could not tell from one (see [`crate::dns_udp`]).
+///
+/// Queries only. The response is not captured, so `result` is `None`, `results` is empty and
+/// `status` is `0`: that says "nothing failed that we saw", not "the lookup succeeded". The same
+/// private-TLD redaction as the uprobe path applies, to the name as the process wrote it.
+#[must_use]
+pub fn dns_udp_query(
+    event: &wire::DnsUdpQueryEvent,
+    boot_epoch_offset_ns: u64,
+    container: Option<ContainerContext>,
+) -> Option<Event> {
+    let captured = usize::from(event.payload_len).min(wire::MAX_DNS_UDP_PAYLOAD);
+    let question = dns_udp::parse_query(&event.payload[..captured])?;
+    Some(Event::DnsQuery(DnsQueryEvent {
+        meta: meta(&event.meta, boot_epoch_offset_ns, container),
+        query: dns_udp::redact_private_tld(question.name),
+        qtype: u32::from(question.qtype),
+        result: None,
+        results: Vec::new(),
+        results_truncated: false,
+        status: 0,
+    }))
 }
 
 #[must_use]
@@ -1759,5 +1798,81 @@ mod tests {
             join_resolved(std::path::Path::new("/tmp/"), "f").as_deref(),
             Some("/tmp/f")
         );
+    }
+    /// A `DnsUdpQueryEvent` carrying `message` as its payload, from `dig` to 8.8.8.8.
+    fn dns_udp_event(message: &[u8]) -> wire::DnsUdpQueryEvent {
+        let mut payload = [0u8; wire::MAX_DNS_UDP_PAYLOAD];
+        let kept = message.len().min(payload.len());
+        payload[..kept].copy_from_slice(&message[..kept]);
+        wire::DnsUdpQueryEvent {
+            meta: wire_meta(b"dig"),
+            daddr_v4: [8, 8, 8, 8],
+            daddr_v6: [0; 16],
+            dport: 53,
+            payload_len: kept as u16,
+            is_ipv6: false,
+            payload,
+        }
+    }
+
+    /// A standard recursive query for `name` (dotted), type `qtype`.
+    fn dns_message(name: &str, qtype: u16) -> Vec<u8> {
+        let mut m = vec![0xAB, 0xCD, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in name.split('.') {
+            m.push(label.len() as u8);
+            m.extend(label.bytes());
+        }
+        m.push(0);
+        m.extend(qtype.to_be_bytes());
+        m.extend([0, 1]);
+        m
+    }
+
+    #[test]
+    fn a_dns_udp_query_becomes_a_dns_query_event_with_no_answer() {
+        let event = dns_udp_event(&dns_message("www.example.com", 28));
+        let Some(Event::DnsQuery(e)) = dns_udp_query(&event, 0, None) else {
+            panic!("a query must map to Event::DnsQuery")
+        };
+        assert_eq!(e.query, "www.example.com");
+        assert_eq!(e.qtype, 28);
+        // The response is not captured: no result, and a status that claims nothing.
+        assert_eq!(e.result, None);
+        assert!(e.results.is_empty());
+        assert!(!e.results_truncated);
+        assert_eq!(e.status, 0);
+        assert_eq!(e.meta.comm, "dig");
+    }
+
+    #[test]
+    fn a_dns_udp_query_for_a_private_name_is_redacted_like_the_uprobe_path() {
+        let event = dns_udp_event(&dns_message("db01.prod.internal", 1));
+        let Some(Event::DnsQuery(e)) = dns_udp_query(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.query, "[REDACTED].internal");
+    }
+
+    #[test]
+    fn a_payload_that_is_not_a_dns_query_maps_to_nothing() {
+        for junk in [
+            b"#!/bin/sh\necho hello world, a script written to a reused descriptor\n".as_slice(),
+            &[0u8; 40],
+        ] {
+            assert!(dns_udp_query(&dns_udp_event(junk), 0, None).is_none());
+        }
+    }
+
+    #[test]
+    fn the_captured_length_bounds_what_is_read() {
+        // The message is complete in the buffer, but the kernel said fewer bytes were copied:
+        // the rest is zero fill, not data, and a cut question is refused.
+        let message = dns_message("www.example.com", 1);
+        let mut event = dns_udp_event(&message);
+        event.payload_len = 20;
+        assert!(dns_udp_query(&event, 0, None).is_none());
+        // A length past the buffer is clamped, not trusted.
+        event.payload_len = u16::MAX;
+        assert!(dns_udp_query(&event, 0, None).is_some());
     }
 }

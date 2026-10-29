@@ -11,18 +11,27 @@
 //! dated lab observations — treat them as data with provenance, not tunable noise.
 
 mod amsi;
+mod credfiles;
 mod defender;
+mod egressdomain;
 mod exclusions;
+mod failure_join;
 mod inventory;
 mod ld_trust;
 mod ldap;
+mod logon;
 mod ntlm;
 mod rdp;
+mod recon;
+mod securitytool;
+mod servicestop;
 mod session;
 mod signature_gate;
 mod sliding;
+mod staging;
 mod state;
 mod stateless;
+mod sudo;
 
 // AMSI content rules (#282): the dispatcher for `AmsiContent` events.
 pub use amsi::evaluate_amsi_content;
@@ -40,18 +49,22 @@ pub use signature_gate::{ImageSignature, SignatureGatedAlert};
 pub use state::RuleState;
 #[cfg(test)]
 pub(crate) use stateless::{
-    check_account_creation_persistence, check_base64_decode, check_btm_launch_item_persistence,
-    check_encoded_powershell, check_ld_preload_hijack, check_log_clear_exec, check_log_file_delete,
-    check_masquerading, check_persistence_write, check_proc_root_escape, check_recovery_inhibit,
-    check_scheduled_task_persistence, check_scheduled_task_update_persistence,
-    check_security_process_signal, check_service_install_persistence,
-    check_service_unusual_outbound, check_systemd_service_persistence,
+    check_account_creation_persistence, check_alternate_data_stream_write, check_base64_decode,
+    check_btm_launch_item_persistence, check_doh_dot_connection, check_encoded_powershell,
+    check_event_logging_disable_exec, check_kerberos_from_non_lsass, check_ld_preload_hijack,
+    check_log_clear_exec, check_log_file_delete, check_masquerading, check_persistence_write,
+    check_proc_root_escape, check_recovery_inhibit, check_scheduled_task_persistence,
+    check_scheduled_task_update_persistence, check_security_process_signal,
+    check_service_install_persistence, check_service_unusual_outbound,
+    check_systemd_service_persistence,
 };
 // The contract is the two dispatchers — callers (agent) route every event
 // through them. The individual checks are implementation detail, re-exported
 // crate-internally for the tests under `src/tests/`.
 pub use stateless::{
-    evaluate_connect, evaluate_exec, evaluate_file_delete, evaluate_file_open, evaluate_signal,
+    evaluate_connect, evaluate_exec, evaluate_file_delete, evaluate_file_open,
+    evaluate_file_set_time, evaluate_kerberos_delegation_failure, evaluate_log_cleared,
+    evaluate_raw_volume_open, evaluate_signal,
 };
 
 #[derive(Debug, Clone)]

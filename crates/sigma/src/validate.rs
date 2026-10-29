@@ -7,8 +7,19 @@ use crate::{
     rule::{Selection, SigmaRule, ValueList},
 };
 
-const SUPPORTED_FIELDS: &[&str] = &["image", "commandline", "parentimage"];
+const SUPPORTED_FIELDS: &[&str] = &["image", "commandline", "parentimage", "originalfilename"];
 const SUPPORTED_MODIFIERS: &[&str] = &["contains", "startswith", "endswith"];
+
+/// `OriginalFileName` is PE version-resource metadata (issue #983): a Windows/PE
+/// concept with no Mach-O or ELF equivalent. A `linux/` or `macos/` rule using it
+/// would never match on the platforms that load it — the exact silent-death
+/// failure mode this module exists to kill (its own module doc) — so it is
+/// refused at load time there, the same way `validate_metadata` already refuses
+/// a rule outside any known platform directory. A Windows-platform rule using it
+/// is accepted even though a *particular* event may still lack the value (PE
+/// parse failure, no version resource): that per-event gap is the same posture
+/// as `ParentImage`, not a load-time refusal (see `eval::Haystacks::get`'s doc).
+const WINDOWS_ONLY_FIELDS: &[&str] = &["originalfilename"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum SigmaError {
@@ -36,22 +47,66 @@ const KNOWN_PLATFORMS: &[&str] = &["linux", "windows", "macos"];
 /// Rejects any construct outside the supported subset, naming it precisely, and any
 /// rule missing the required metadata (issue #73: severity, ATT&CK technique,
 /// false-positive notes, platform).
+///
+/// The platform directory is looked for in the whole of `path`: use [`validate_under`] when the
+/// rules root is known, so a word in the content root's own path cannot pass for a platform.
 pub(crate) fn validate(rule: &SigmaRule, path: &str) -> Result<(), SigmaError> {
-    validate_condition(rule, path)?;
-    let Some(selection) = rule.detection.selections.get("selection") else {
-        return Err(unsupported(path, "missing `selection` block".to_string()));
-    };
-    match selection {
-        Selection::FieldMap(fields) => validate_field_map(fields, path)?,
-        Selection::Keywords(keywords) => validate_keywords(keywords, path)?,
+    let normalized = path.replace('\\', "/");
+    let under_platform = KNOWN_PLATFORMS
+        .iter()
+        .any(|p| normalized.contains(&format!("/{p}/")));
+    validate_with(rule, path, under_platform)
+}
+
+/// [`validate`] for a rule found at `relative` (`/` or `\` separated) under the rules root: the
+/// platform is the first directory of that relative path, nothing in the root's own path (#980).
+pub(crate) fn validate_under(
+    rule: &SigmaRule,
+    path: &str,
+    relative: &str,
+) -> Result<(), SigmaError> {
+    let normalized = relative.replace('\\', "/");
+    let mut parts = normalized.split('/');
+    // The file name is not a directory: a rule directly under the root has no platform.
+    let under_platform = parts
+        .next()
+        .is_some_and(|first| parts.next().is_some() && KNOWN_PLATFORMS.contains(&first));
+    validate_with(rule, path, under_platform)
+}
+
+fn validate_with(rule: &SigmaRule, path: &str, under_platform: bool) -> Result<(), SigmaError> {
+    let compiled = validate_condition(rule, path)?;
+    // Every block the condition refers to is checked as strictly as `selection` always was. A
+    // block it does not refer to is never evaluated and stays unchecked, as before.
+    for name in &compiled.blocks {
+        // `compile` resolved every name against the rule's blocks.
+        let Some(block) = rule.detection.selections.get(name) else {
+            return Err(unsupported(path, format!("missing `{name}` block")));
+        };
+        let checked = match block {
+            Selection::FieldMap(fields) => validate_field_map(fields, path),
+            Selection::OrOfMaps(maps) => validate_or_of_maps(maps, path),
+            Selection::Keywords(keywords) => validate_keywords(keywords, path),
+        };
+        // The message of the one block every rule used to have is unchanged; the others say
+        // which block they are about.
+        checked.map_err(|error| match error {
+            SigmaError::Unsupported { path, what } if name != "selection" => {
+                SigmaError::Unsupported {
+                    path,
+                    what: format!("{what} (in block `{name}`)"),
+                }
+            }
+            other => other,
+        })?;
     }
-    validate_metadata(rule, path)
+    validate_metadata(rule, path, under_platform)
 }
 
 /// Checks the required rule metadata: severity (`level`, upstream Sigma's field
 /// name), at least one ATT&CK technique tag, non-empty false-positive notes, and
 /// a recognized platform directory.
-fn validate_metadata(rule: &SigmaRule, path: &str) -> Result<(), SigmaError> {
+fn validate_metadata(rule: &SigmaRule, path: &str, under_platform: bool) -> Result<(), SigmaError> {
     if rule.severity.is_none() {
         return Err(missing_metadata(path, "missing `level`".to_string()));
     }
@@ -67,11 +122,7 @@ fn validate_metadata(rule: &SigmaRule, path: &str) -> Result<(), SigmaError> {
             "no ATT&CK technique tag in `tags` (expected e.g. `attack.t1059.004`)".to_string(),
         ));
     }
-    let normalized = path.replace('\\', "/");
-    if !KNOWN_PLATFORMS
-        .iter()
-        .any(|p| normalized.contains(&format!("/{p}/")))
-    {
+    if !under_platform {
         return Err(missing_metadata(
             path,
             format!(
@@ -105,6 +156,15 @@ pub(crate) fn technique_id(tag: &str) -> Option<String> {
     }
 }
 
+/// Whether `path` sits under a `windows/` directory of `rules/sigma/`, the same
+/// string-containment check [`validate_metadata`] already uses for the platform
+/// directory itself — not a parse of [`crate::engine::Platform`], since this
+/// runs on a rule's source path at load time, before any engine has decided
+/// which host loads it.
+fn is_windows_rule(path: &str) -> bool {
+    path.replace('\\', "/").contains("/windows/")
+}
+
 fn missing_metadata(path: &str, what: String) -> SigmaError {
     SigmaError::MissingMetadata {
         path: path.to_string(),
@@ -112,16 +172,31 @@ fn missing_metadata(path: &str, what: String) -> SigmaError {
     }
 }
 
-fn validate_condition(rule: &SigmaRule, path: &str) -> Result<(), SigmaError> {
+/// Parses the condition (see [`crate::condition`]) and refuses a `timeframe`, which only an
+/// aggregation gives a meaning to.
+fn validate_condition<'a>(
+    rule: &'a SigmaRule,
+    path: &str,
+) -> Result<&'a crate::condition::Compiled, SigmaError> {
     let condition = rule.detection.condition.trim();
-    if condition == "selection" {
-        Ok(())
-    } else {
-        Err(unsupported(
+    let compiled = rule.compiled().as_ref().map_err(|reason| {
+        unsupported(
             path,
-            format!("condition `{condition}` (only `condition: selection` is supported)"),
-        ))
+            format!(
+                "condition `{condition}`: {reason} (supported: and, or, not, parentheses, \
+                 `1 of` / `all of` a block, a `prefix*` pattern or `them`)"
+            ),
+        )
+    })?;
+    if let Some(timeframe) = &rule.detection.timeframe {
+        return Err(unsupported(
+            path,
+            format!(
+                "`timeframe: {timeframe}` (only meaningful with an aggregation, which is not supported)"
+            ),
+        ));
     }
+    Ok(compiled)
 }
 
 fn validate_field_map(
@@ -137,40 +212,117 @@ fn validate_field_map(
         ));
     }
     // Two keys that differ only by case are different keys to the parser, and evaluation ANDs
-    // them: a selection could be made never to fire, or a field silently doubled.
-    let mut seen = std::collections::HashSet::new();
+    // them. Keep the original spelling so the error can name both keys.
+    let mut seen = std::collections::HashMap::new();
     for spec in fields.keys() {
-        if !seen.insert(spec.to_lowercase()) {
+        if let Some(previous) = seen.insert(spec.to_lowercase(), spec) {
             return Err(unsupported(
                 path,
-                format!("field `{spec}` appears twice, differing only by case"),
+                format!("field specs `{previous}` and `{spec}` differ only by case"),
             ));
         }
     }
     for (spec, values) in fields {
-        let (field, modifier) = parse_field_spec(spec);
-        if !SUPPORTED_FIELDS.contains(&field.to_lowercase().as_str()) {
+        let parsed = parse_field_spec(spec);
+        let field = parsed.field;
+        let field_lower = field.to_lowercase();
+        if !SUPPORTED_FIELDS.contains(&field_lower.as_str()) {
             return Err(unsupported(
                 path,
-                format!("field `{field}` (supported: Image, CommandLine, ParentImage)"),
+                format!(
+                    "field `{field}` (supported: Image, CommandLine, ParentImage, OriginalFileName)"
+                ),
             ));
         }
-        if let Some(m) = modifier
-            && !SUPPORTED_MODIFIERS.contains(&m.to_lowercase().as_str())
+        if WINDOWS_ONLY_FIELDS.contains(&field_lower.as_str()) && !is_windows_rule(path) {
+            return Err(unsupported(
+                path,
+                format!(
+                    "field `{field}` is Windows-only (PE version-resource metadata, issue #983); \
+                     this rule is not under a `windows/` directory and would never match there"
+                ),
+            ));
+        }
+        let mut match_modifier = None;
+        let mut seen_all = false;
+        for modifier in parsed.modifiers.clone() {
+            if modifier.eq_ignore_ascii_case("all") {
+                if seen_all {
+                    return Err(unsupported(
+                        path,
+                        format!("duplicate `all` modifier in `{spec}`"),
+                    ));
+                }
+                seen_all = true;
+            } else {
+                if !SUPPORTED_MODIFIERS.contains(&modifier.to_lowercase().as_str()) {
+                    return Err(unsupported(
+                        path,
+                        format!(
+                            "modifier `{modifier}` (supported: contains, startswith, endswith, all)"
+                        ),
+                    ));
+                }
+                if match_modifier.replace(modifier).is_some() {
+                    return Err(unsupported(
+                        path,
+                        format!(
+                            "multiple matching modifiers in `{spec}`; only one of contains, startswith, endswith is supported"
+                        ),
+                    ));
+                }
+            }
+        }
+        if seen_all
+            && parsed
+                .modifiers
+                .clone()
+                .next_back()
+                .is_some_and(|modifier| !modifier.eq_ignore_ascii_case("all"))
         {
             return Err(unsupported(
                 path,
-                format!("modifier `{m}` (supported: contains, startswith, endswith)"),
+                format!("modifier `all` must be last in `{spec}`"),
             ));
+        }
+        if seen_all && match_modifier.is_none() {
+            return Err(unsupported(
+                path,
+                format!("modifier `all` in `{spec}` must follow one matching modifier"),
+            ));
+        }
+        if values.as_slice().is_empty() {
+            return Err(unsupported(path, format!("empty value list for `{spec}`")));
         }
         // Interior wildcards are standard Sigma but outside the edge-only
         // subset — an accepted-but-never-matching rule is the silent-death
         // failure mode this validator exists to kill.
-        if modifier.is_none() {
+        if match_modifier.is_none() {
             for value in values.as_slice() {
                 validate_edge_only_wildcard(value, path, "")?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Validates a selection written as a list of maps (issue #982): OR between the maps, so an
+/// empty list matches nothing (the dual of the empty-map check in `validate_field_map`, which
+/// matches everything) — both are load errors, never a silent always/never-match. Each map gets
+/// exactly `validate_field_map`'s checks, so a list-of-maps selection is refused as loudly as a
+/// lone map for an unsupported field, modifier, or interior wildcard.
+fn validate_or_of_maps(
+    maps: &[std::collections::HashMap<String, ValueList>],
+    path: &str,
+) -> Result<(), SigmaError> {
+    if maps.is_empty() {
+        return Err(unsupported(
+            path,
+            "empty selection list (would match nothing)".into(),
+        ));
+    }
+    for fields in maps {
+        validate_field_map(fields, path)?;
     }
     Ok(())
 }

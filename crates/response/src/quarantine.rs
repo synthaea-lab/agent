@@ -1336,6 +1336,7 @@ mod tests {
         let policy = ResponsePolicy {
             kill_enabled: false,
             quarantine_enabled: false,
+            isolate_enabled: false,
         };
 
         let outcome = quarantine_file(&payload, &dir.join("quarantine"), &policy);
@@ -1360,6 +1361,7 @@ mod tests {
         let policy = ResponsePolicy {
             kill_enabled: false,
             quarantine_enabled: true,
+            isolate_enabled: false,
         };
 
         let outcome = quarantine_file(&payload, &quarantine_dir, &policy);
@@ -1414,6 +1416,7 @@ mod tests {
         let policy = ResponsePolicy {
             kill_enabled: false,
             quarantine_enabled: true,
+            isolate_enabled: false,
         };
 
         let first_result = quarantine_file(&first, &quarantine_dir, &policy);
@@ -1555,6 +1558,7 @@ mod tests {
             &ResponsePolicy {
                 kill_enabled: false,
                 quarantine_enabled: true,
+                isolate_enabled: false,
             },
         );
         let (stored, digest) = match outcome {
@@ -1648,6 +1652,7 @@ mod tests {
                 &ResponsePolicy {
                     kill_enabled: false,
                     quarantine_enabled: true,
+                    isolate_enabled: false,
                 },
             );
             // SAFETY: restore the mask changed above before doing assertions or cleanup.
@@ -1720,6 +1725,7 @@ mod tests {
         let policy = ResponsePolicy {
             kill_enabled: false,
             quarantine_enabled: true,
+            isolate_enabled: false,
         };
 
         let outcome = quarantine_file(
@@ -1751,6 +1757,7 @@ mod tests {
             &ResponsePolicy {
                 kill_enabled: false,
                 quarantine_enabled: true,
+                isolate_enabled: false,
             },
         );
         assert!(matches!(outcome, QuarantineOutcome::Failed { .. }));
@@ -2318,6 +2325,7 @@ mod tests {
             &ResponsePolicy {
                 kill_enabled: false,
                 quarantine_enabled: true,
+                isolate_enabled: false,
             },
         );
         stop.store(true, Ordering::Relaxed);
@@ -2354,6 +2362,7 @@ mod tests {
             &ResponsePolicy {
                 kill_enabled: false,
                 quarantine_enabled: true,
+                isolate_enabled: false,
             },
         );
 
@@ -2378,6 +2387,7 @@ mod tests {
         let policy = ResponsePolicy {
             kill_enabled: false,
             quarantine_enabled: true,
+            isolate_enabled: false,
         };
         let QuarantineOutcome::Quarantined {
             sha256_hex: digest,
@@ -2458,6 +2468,7 @@ mod tests {
         let policy = ResponsePolicy {
             kill_enabled: false,
             quarantine_enabled: true,
+            isolate_enabled: false,
         };
         match quarantine_file(&payload, &quarantine_dir, &policy) {
             QuarantineOutcome::Quarantined { sha256_hex, .. } => {

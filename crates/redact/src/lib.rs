@@ -270,29 +270,40 @@ fn wrapped_command_range(line: &str, tokens: &[(usize, usize)]) -> Option<(usize
                 Some("/c" | "/k")
             ) {
                 i += 1;
-                return tokens.get(i).copied();
+            } else {
+                return None;
             }
-            return None;
         }
         "sh" | "bash" | "zsh" | "dash" => {
             if arg(i) == Some("-c") {
                 i += 1;
-                return tokens.get(i).copied();
+            } else {
+                return None;
             }
-            return None;
         }
-        "powershell" | "pwsh" | "powershell.exe" | "pwsh.exe" => {
-            if arg(i)
-                .is_some_and(|s| s.eq_ignore_ascii_case("-command") || s.eq_ignore_ascii_case("-c"))
-            {
-                i += 1;
-                return tokens.get(i).copied();
-            }
-            return None;
+        "powershell" | "pwsh" | "powershell.exe" | "pwsh.exe"
+            if arg(i).is_some_and(|s| {
+                s.eq_ignore_ascii_case("-command") || s.eq_ignore_ascii_case("-c")
+            }) =>
+        {
+            i += 1;
         }
+        "powershell" | "pwsh" | "powershell.exe" | "pwsh.exe" => return None,
         _ => return None,
     }
-    tokens.get(i).map(|&(start, _)| (start, line.len()))
+    let &(start, end) = tokens.get(i)?;
+    // A quoted wrapped command (`cmd /c "net user bob S3cret /add" && echo
+    // done`) is already one token with its own matching closing quote;
+    // spanning to the end of the line would swallow `&& echo done` too and
+    // leave `trim_quotes` looking for a closing quote at the very end of the
+    // line, which isn't there, so nothing downstream gets redacted (#843
+    // review). Only an unquoted wrapped command, where the rest of the line
+    // really is the command, needs the wider span.
+    if matches!(line.as_bytes()[start], b'"' | b'\'') {
+        Some((start, end))
+    } else {
+        Some((start, line.len()))
+    }
 }
 
 /// Redacts recognized secrets in argv in place while retaining its number and order
@@ -368,19 +379,16 @@ fn redact_argv_inner(image: &str, argv: &mut [String], wrapper_depth: u8) {
         }
         if effective_tool == "curl" {
             if token == "-d" || token.starts_with("--data") {
-                if token == "-d" {
-                    if let Some(next) = argv.get_mut(index + 1) {
-                        *next = redact_form_data(next);
-                    }
-                } else if let Some(eq) = token.find('=') {
+                if let Some(eq) = token.find('=') {
                     argv[index].replace_range(eq + 1.., &redact_form_data(&token[eq + 1..]));
+                } else if let Some(next) = argv.get_mut(index + 1) {
+                    // Bare `-d`/`--data`/`--data-raw`/`--data-binary`/`--data-urlencode`:
+                    // the value is the next argv element, not attached with `=`.
+                    *next = redact_form_data(next);
                 }
             } else if token.starts_with("-d") && token.len() > 2 {
                 argv[index].replace_range(2.., &redact_form_data(&token[2..]));
             }
-        }
-        if let Some((start, end)) = header_secret_value(&argv[index], 0) {
-            argv[index].replace_range(start..end, REDACTED);
         }
         let attached_header = token
             .strip_prefix("--header=")
@@ -407,6 +415,13 @@ fn redact_argv_inner(image: &str, argv: &mut [String], wrapper_depth: u8) {
             if let Some((start, end)) = header_secret_value(&header, 0) {
                 argv[header_index].replace_range(start..end, REDACTED);
             }
+        }
+        // Header-shaped argv elements can arrive through options other than
+        // curl's `-H`/`--header` (for example `--proxy-header`), or as ordinary
+        // arguments to tools such as httpie. Match the command-line path's
+        // generic header scan so these values cannot bypass redaction.
+        if let Some((start, end)) = header_secret_value(&argv[index], 0) {
+            argv[index].replace_range(start..end, REDACTED);
         }
         if argv[index].contains("://")
             && let Some((start, end)) = url_range(&argv[index], 0)
@@ -518,16 +533,14 @@ fn wrapped_command_argv_index(argv: &[String]) -> Option<usize> {
                 return None;
             }
         }
-        "powershell" | "pwsh" | "powershell.exe" | "pwsh.exe" => {
-            if argv
-                .get(i)
-                .is_some_and(|s| s.eq_ignore_ascii_case("-command") || s.eq_ignore_ascii_case("-c"))
-            {
-                i += 1;
-            } else {
-                return None;
-            }
+        "powershell" | "pwsh" | "powershell.exe" | "pwsh.exe"
+            if argv.get(i).is_some_and(|s| {
+                s.eq_ignore_ascii_case("-command") || s.eq_ignore_ascii_case("-c")
+            }) =>
+        {
+            i += 1;
         }
+        "powershell" | "pwsh" | "powershell.exe" | "pwsh.exe" => return None,
         _ => return None,
     }
     (i < argv.len()).then_some(i)
@@ -828,7 +841,11 @@ fn credential_option(tool: &str, token: &str) -> Option<Option<(usize, usize)>> 
             let offset = base + 2;
             return Some(Some((offset, end)));
         }
-        if tool == "curl" && value.starts_with('-') && !value.starts_with("--") {
+        if tool == "curl"
+            && value.starts_with('-')
+            && !value.starts_with("--")
+            && !value.starts_with("-H")
+        {
             let cluster = &lower[1..];
             if let Some(u) = cluster.find('u') {
                 let rest = &cluster[u + 1..];
@@ -1499,10 +1516,14 @@ mod tests {
             "nice -n 3 mysql -pS3cret",
             "cmd /c \"net user bob S3cret /add\"",
             "cmd.exe /k \"net1 user bob S3cret /add\"",
+            "cmd.exe /c net user bob S3cret /add",
+            "cmd /c \"net user bob S3cret /add\" && echo done",
             "sh -c \"curl -u a:S3cret h\"",
             "bash -c \"curl -u a:S3cret h\"",
             "zsh -c \"curl -u a:S3cret h\"",
             "dash -c \"curl -u a:S3cret h\"",
+            "sh -c curl -u a:S3cret h",
+            "sh -c \"curl -u a:S3cret h\" && echo done",
             "powershell -Command \"curl -u a:S3cret h\"",
             "pwsh -Command \"curl -u a:S3cret h\"",
             "net1 user bob S3cret /add",
@@ -1729,6 +1750,96 @@ mod tests {
             "--url=https://REDACTED@example.test/path?token=REDACTED"
         );
         assert_eq!(argv.len(), 2);
+    }
+
+    #[test]
+    fn a_bare_curl_data_flag_redacts_the_next_argv_element() {
+        // #843 CI (SherlockOmss, 2026-10-21): a bare `--data`/`--data-raw`/
+        // `--data-binary`/`--data-urlencode` with the value as the *next* argv
+        // element (not attached with `=`) fell through both arms and leaked —
+        // the string path (`redact_command_line`) already handled this shape,
+        // but Linux events arrive as argv, which real detections use.
+        for flag in [
+            "-d",
+            "--data",
+            "--data-raw",
+            "--data-binary",
+            "--data-urlencode",
+        ] {
+            let mut argv: Vec<String> = ["curl", flag, "password=S3cret", "h"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            redact_argv("curl", &mut argv);
+            assert_eq!(argv[2], "password=REDACTED", "flag {flag}");
+        }
+        let mut attached: Vec<String> = ["curl", "--data=password=S3cret", "h"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        redact_argv("curl", &mut attached);
+        assert_eq!(attached[1], "--data=password=REDACTED");
+    }
+
+    #[test]
+    fn an_attached_curl_header_flag_keeps_its_name_and_only_redacts_the_value() {
+        // #843 CI (SherlockOmss, 2026-10-21): the curl `-u user:pass` clustered
+        // short-flag scan matched the literal `u` inside "Authorization" (and
+        // any other header name containing `u`) on a `-H<header>` argv element,
+        // mangling the header name instead of just redacting the secret value.
+        let mut argv: Vec<String> = ["curl", "-HAuthorization: Bearer S3cret", "h"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        redact_argv("curl", &mut argv);
+        assert_eq!(argv[1], "-HAuthorization: Bearer REDACTED");
+
+        let mut argv2: Vec<String> = ["curl", "-HX-Auth-Token: S3cret", "h"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        redact_argv("curl", &mut argv2);
+        assert_eq!(argv2[1], "-HX-Auth-Token: REDACTED");
+    }
+
+    #[test]
+    fn argv_header_redaction_matches_the_command_line_path_for_any_header_argument() {
+        let cases = [
+            (
+                "curl",
+                vec![
+                    "curl",
+                    "--proxy-header",
+                    "Proxy-Authorization: Basic S3cret",
+                    "h",
+                ],
+                "curl --proxy-header Proxy-Authorization: Basic S3cret h",
+            ),
+            (
+                "http",
+                vec!["http", "h", "Authorization:Bearer S3cret"],
+                "http h Authorization:Bearer S3cret",
+            ),
+            (
+                "python3",
+                vec!["python3", "x.py", "Authorization: Bearer S3cret"],
+                "python3 x.py Authorization: Bearer S3cret",
+            ),
+        ];
+
+        for (image, raw_argv, raw_cmdline) in cases {
+            let expected = redact_command_line(image, raw_cmdline).into_owned();
+            let mut argv = raw_argv.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            redact_argv(image, &mut argv);
+
+            assert!(!expected.contains("S3cret"), "{image}: {expected}");
+            assert_eq!(
+                argv.join(" "),
+                expected,
+                "argv/command-line mismatch for {image}"
+            );
+            assert!(argv.join(" ").contains("REDACTED"), "{image}: {argv:?}");
+        }
     }
 
     #[test]

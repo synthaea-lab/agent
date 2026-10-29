@@ -146,6 +146,114 @@ detection:
     assert!(eval_rule_exec(&rule, &ev2).is_none());
 }
 
+/// Issue #982: a selection written as a YAML list of maps is OR between the maps, with each
+/// map keeping the usual implicit AND between its own fields.
+#[test]
+fn eval_rule_selection_as_list_of_maps_is_or_between_maps_and_between_them() {
+    let rule = parse(
+        r#"
+title: cmd or encoded powershell
+description: test
+tags:
+  - attack.t1059
+level: high
+falsepositives:
+  - none known
+detection:
+  selection:
+    - Image|endswith: '\cmd.exe'
+    - Image|endswith: '\powershell.exe'
+      CommandLine|contains: 'encodedcommand'
+  condition: selection
+"#,
+    );
+    // First map alone matches: plain cmd.exe, regardless of its command line.
+    let via_first_map = exec("C:\\Windows\\System32\\cmd.exe", "cmd.exe /c whoami");
+    assert!(eval_rule_exec(&rule, &via_first_map).is_some());
+
+    // Second map matches only when BOTH of its fields match (implicit AND survives inside a
+    // list element) — powershell.exe alone, without the encoded command line, must not match.
+    let powershell_plain = exec(
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        "powershell.exe -NoProfile",
+    );
+    assert!(eval_rule_exec(&rule, &powershell_plain).is_none());
+
+    // Second map matches when both of its fields do (OR across maps survives too).
+    let powershell_encoded = exec(
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        "powershell.exe -EncodedCommand ZWNobyBoZWxsbw==",
+    );
+    assert!(eval_rule_exec(&rule, &powershell_encoded).is_some());
+
+    // Neither map matches: no alert.
+    let neither = exec("C:\\Windows\\System32\\notepad.exe", "notepad.exe");
+    assert!(eval_rule_exec(&rule, &neither).is_none());
+}
+
+/// Issue #982: an empty list (`selection: []`) would OR over zero maps — vacuously false, i.e.
+/// matches nothing — and a rule that can never fire is as much a load-time error as one that
+/// matches everything.
+#[test]
+fn an_empty_list_of_maps_is_rejected_not_silently_never_matching() {
+    let rule: SigmaRule =
+        parse_rule_yaml("title: Empty list\ndetection:\n  selection: []\n  condition: selection\n")
+            .unwrap();
+    let err = validate(&rule, "<t>").unwrap_err();
+    assert!(err.to_string().contains("empty"), "{err}");
+}
+
+/// Issue #982: an empty map *inside* the list is the same vacuous-AND footgun
+/// `empty_selection_is_rejected_not_match_everything` covers for a lone map — a list-of-maps
+/// selection must refuse it with the same message, not treat the list wrapper as a free pass.
+#[test]
+fn an_empty_map_inside_a_list_of_maps_is_rejected_not_match_everything() {
+    let rule: SigmaRule = parse_rule_yaml(
+        "title: Empty element\ndetection:\n  selection:\n    - {}\n  condition: selection\n",
+    )
+    .unwrap();
+    let err = validate(&rule, "<t>").unwrap_err();
+    assert!(err.to_string().contains("empty selection"), "{err}");
+}
+
+/// Issue #982: a list of maps is still checked field-by-field as strictly as a lone map — an
+/// unsupported field inside one element of the list must be named, not waved through because
+/// it's wrapped in a list.
+#[test]
+fn an_unsupported_field_inside_a_list_of_maps_is_rejected_by_name() {
+    let rule: SigmaRule = parse_rule_yaml(
+        "title: Bad field in list\ndetection:\n  selection:\n    - Image: a\n    - TargetFilename: b\n  condition: selection\n",
+    )
+    .unwrap();
+    let err = validate(&rule, "<t>").unwrap_err();
+    assert!(err.to_string().contains("TargetFilename"), "{err}");
+}
+
+/// Issue #982: the keyword-list form (a list of plain strings) must keep working once lists of
+/// maps are also accepted — the two forms are distinguished by shape, not confused.
+#[test]
+fn a_plain_keyword_list_still_works_once_lists_of_maps_are_accepted() {
+    let rule = parse(
+        "title: KW\ntags:\n  - attack.t1003\nlevel: high\nfalsepositives:\n  - none known\ndetection:\n  selection:\n    - mimikatz\n    - sekurlsa\n  condition: selection\n",
+    );
+    let ev = exec("C:\\temp\\mimikatz.exe", "C:\\temp\\mimikatz.exe");
+    assert!(eval_rule_exec(&rule, &ev).is_some());
+}
+
+/// Issue #982 explicitly calls for this to be a load error: a list mixing a map and a plain
+/// string matches neither the "list of maps" nor the "list of keywords" shape, so it must be
+/// refused — not have the string silently dropped or misread as a one-field map.
+#[test]
+fn a_selection_list_mixing_a_map_and_a_keyword_is_refused_not_guessed_at() {
+    assert!(
+        parse_rule_yaml(&rule_with_detection(
+            "  selection:\n    - mimikatz\n    - Image: a\n  condition: selection\n"
+        ))
+        .is_err(),
+        "a list mixing a keyword and a map must not load"
+    );
+}
+
 #[test]
 fn parent_image_matches_only_with_lineage() {
     let rule = parse(
@@ -171,6 +279,71 @@ detection:
     );
     ev.parent_image_path = Some("C:\\Program Files\\Office\\winword.exe".into());
     assert!(eval_rule_exec(&rule, &ev).is_some());
+}
+
+/// #983: the catalogue's primary renamed-binary signal — `cmd.exe` copied to
+/// `svchost.exe` still carries its real name in the PE version resource.
+#[test]
+fn original_file_name_matches_the_renamed_binary() {
+    let rule_yaml = r#"
+title: Renamed cmd.exe
+description: test
+tags:
+  - attack.t1036.003
+level: high
+falsepositives:
+  - none known
+detection:
+  selection:
+    Image|endswith: '\svchost.exe'
+    OriginalFileName: 'Cmd.Exe'
+  condition: selection
+"#;
+    let rule: SigmaRule = parse_rule_yaml(rule_yaml).unwrap();
+    validate(&rule, "<test>/windows/rule.yml").unwrap();
+
+    let mut ev = exec("C:\\Users\\Public\\svchost.exe", "svchost.exe");
+    assert!(
+        eval_rule_exec(&rule, &ev).is_none(),
+        "no PE info yet (enrichment hasn't run, or the image had none) — must not match"
+    );
+    ev.original_file_name = Some("Cmd.Exe".into());
+    assert!(eval_rule_exec(&rule, &ev).is_some());
+    // Case-insensitive, like every other field value (`match_value` lowercases both sides).
+    ev.original_file_name = Some("cmd.exe".into());
+    assert!(eval_rule_exec(&rule, &ev).is_some());
+    // A genuinely different original name must not match.
+    ev.original_file_name = Some("explorer.exe".into());
+    assert!(eval_rule_exec(&rule, &ev).is_none());
+}
+
+/// #983: a Windows/PE-only field on a rule outside `windows/` would never match on
+/// the platforms that load it (Linux loads only `linux/`; macOS loads `macos/` and
+/// `linux/` — `engine::Platform::rule_dirs`) — refused at load, not accepted as a
+/// rule that silently never fires.
+#[test]
+fn original_file_name_is_refused_outside_windows() {
+    let rule: SigmaRule = parse_rule_yaml(
+        r#"
+title: Should be Windows-only
+tags:
+  - attack.t1036.003
+level: high
+falsepositives:
+  - none known
+detection:
+  selection:
+    OriginalFileName: 'Cmd.Exe'
+  condition: selection
+"#,
+    )
+    .unwrap();
+    let err = validate(&rule, "<test>/linux/rule.yml").unwrap_err();
+    assert!(err.to_string().contains("OriginalFileName"), "{err}");
+    assert!(err.to_string().contains("Windows-only"), "{err}");
+    // A macOS-directory rule is refused the same way (macOS has no PE resource either).
+    let err2 = validate(&rule, "<test>/macos/rule.yml").unwrap_err();
+    assert!(err2.to_string().contains("Windows-only"), "{err2}");
 }
 
 #[test]
@@ -225,7 +398,7 @@ detection:
     Image: 'x'
   filter:
     Image: 'y'
-  condition: selection and not filter
+  condition: selection | count() > 5
 "#,
     )
     .unwrap();
@@ -518,6 +691,168 @@ fn field_names_and_modifiers_that_differ_only_by_case_are_refused() {
         let rule = parse_rule_yaml(&rule_with_detection(body)).expect("two different keys parse");
         let error = validate(&rule, "<test>/linux/rule.yml").expect_err("must be refused");
         assert!(error.to_string().to_lowercase().contains("case"), "{error}");
+        for spec in body
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("Image") || line.starts_with("image"))
+        {
+            let spec = spec.split(':').next().unwrap();
+            assert!(
+                error.to_string().contains(spec),
+                "{error} should name `{spec}`"
+            );
+        }
+    }
+}
+
+fn field_rule(field: &str, values_yaml: &str) -> SigmaRule {
+    let yaml = format!(
+        "title: Modifier test\ntags: [attack.t1059]\nlevel: medium\nfalsepositives: [none]\ndetection:\n  selection:\n    {field}: {values_yaml}\n  condition: selection\n"
+    );
+    let rule: SigmaRule = parse_rule_yaml(&yaml).unwrap();
+    validate(&rule, "<test>/linux/rule.yml").unwrap();
+    rule
+}
+
+#[test]
+fn all_requires_every_value_for_each_matching_modifier_case_insensitively() {
+    let cases = [
+        ("contains", "WIN CMD", "win", "cmd"),
+        ("startswith", "C:\\Windows\\cmd.exe", "c:", "C:\\Windows"),
+        ("endswith", "C:\\Windows\\cmd.exe", "CMD.EXE", ".exe"),
+    ];
+    for (modifier, haystack, first, second) in cases {
+        let rule = field_rule(
+            &format!("CommandLine|{modifier}|ALL"),
+            &format!("['{first}', '{second}']"),
+        );
+        assert!(
+            eval_rule_exec(&rule, &exec("x.exe", haystack)).is_some(),
+            "{modifier}"
+        );
+        let missing = field_rule(
+            &format!("CommandLine|{modifier}|all"),
+            &format!("['{first}', 'not-present']"),
+        );
+        assert!(
+            eval_rule_exec(&missing, &exec("x.exe", haystack)).is_none(),
+            "{modifier}"
+        );
+    }
+}
+
+#[test]
+fn value_lists_keep_or_semantics_without_all() {
+    let rule = field_rule("CommandLine|contains", "[missing, cmd]");
+    assert!(eval_rule_exec(&rule, &exec("x.exe", "cmd.exe")).is_some());
+}
+
+#[test]
+fn plain_field_values_keep_their_exact_match_behavior() {
+    let rule = field_rule("CommandLine", "cmd.exe");
+    assert!(eval_rule_exec(&rule, &exec("x.exe", "cmd.exe")).is_some());
+    assert!(eval_rule_exec(&rule, &exec("x.exe", "other.exe")).is_none());
+}
+
+#[test]
+fn evaluator_defensively_rejects_multiple_match_modifiers() {
+    let rule: SigmaRule = parse_rule_yaml(
+        "title: Invalid modifier\ndetection:\n  selection:\n    CommandLine|contains|startswith: a\n  condition: selection\n",
+    )
+    .unwrap();
+    assert!(eval_rule_exec(&rule, &exec("x.exe", "a")).is_none());
+}
+
+#[test]
+fn all_must_be_last_and_only_one_matching_modifier_is_allowed() {
+    for spec in [
+        "CommandLine|contains|all|startswith",
+        "CommandLine|contains|startswith|all",
+        "CommandLine|all",
+    ] {
+        let yaml = format!(
+            "title: Bad\ndetection:\n  selection:\n    {spec}: [a, b]\n  condition: selection\n"
+        );
+        let rule: SigmaRule = parse_rule_yaml(&yaml).unwrap();
+        assert!(validate(&rule, "<test>/linux/test.yml").is_err(), "{spec}");
+    }
+}
+
+#[test]
+fn empty_all_value_list_is_refused() {
+    for spec in ["CommandLine|contains|all", "CommandLine|contains"] {
+        let yaml = format!(
+            "title: Empty\ndetection:\n  selection:\n    {spec}: []\n  condition: selection\n"
+        );
+        let rule: SigmaRule = parse_rule_yaml(&yaml).unwrap();
+        let error = validate(&rule, "<test>/linux/test.yml").unwrap_err();
+        assert!(error.to_string().contains("empty value list"), "{error}");
+    }
+}
+
+proptest::proptest! {
+    #[test]
+    fn all_equals_conjunction_of_single_value_rules(
+        values in proptest::collection::vec("[a-z]{1,8}", 1..8),
+        present in proptest::collection::vec(proptest::bool::ANY, 8),
+    ) {
+        // Only the values flagged `present` are in the haystack: with every value in it the
+        // property holds trivially, so a missing value is what reaches the false branch.
+        let haystack = values
+            .iter()
+            .zip(&present)
+            .filter(|(_, keep)| **keep)
+            .map(|(value, _)| value.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let yaml_values = format!("[{}]", values.iter()
+            .map(|value| format!("'{value}'"))
+            .collect::<Vec<_>>().join(", "));
+        let all_rule = field_rule("CommandLine|contains|all", &yaml_values);
+        let conjunction = values.iter().all(|value| {
+            let single = field_rule("CommandLine|contains", &format!("'{value}'"));
+            eval_rule_exec(&single, &exec("x.exe", &haystack)).is_some()
+        });
+        proptest::prop_assert_eq!(
+            eval_rule_exec(&all_rule, &exec("x.exe", &haystack)).is_some(),
+            conjunction
+        );
+    }
+}
+
+#[test]
+fn all_is_false_when_one_value_is_absent_and_true_when_every_value_is_present() {
+    // The cases the property above samples, pinned: it cannot pass if `|all` behaves as `any`.
+    let rule = field_rule("CommandLine|contains|all", "['alpha', 'beta', 'gamma']");
+    assert!(eval_rule_exec(&rule, &exec("x.exe", "alpha beta gamma")).is_some());
+    assert!(eval_rule_exec(&rule, &exec("x.exe", "alpha beta")).is_none());
+    assert!(eval_rule_exec(&rule, &exec("x.exe", "gamma")).is_none());
+    assert!(eval_rule_exec(&rule, &exec("x.exe", "")).is_none());
+}
+
+#[test]
+fn the_validator_and_the_evaluator_agree_on_modifier_shapes() {
+    for (spec, accepted) in [
+        ("CommandLine", true),
+        ("CommandLine|contains", true),
+        ("CommandLine|contains|all", true),
+        ("CommandLine|CONTAINS|ALL", true),
+        ("CommandLine|all", false),
+        ("CommandLine|contains|startswith", false),
+        ("CommandLine|contains|all|startswith", false),
+        ("CommandLine|contains|startswith|all", false),
+        ("CommandLine|contains|all|all", false),
+    ] {
+        // A complete rule: without `level` and an ATT&CK tag the validator refuses it for its
+        // metadata, whatever the modifiers, and the comparison would test nothing.
+        let yaml = rule_with_detection(&format!(
+            "  selection:\n    {spec}: [a, b]\n  condition: selection\n"
+        ));
+        let rule: SigmaRule = parse_rule_yaml(&yaml).unwrap();
+        let validated = validate(&rule, "<test>/linux/test.yml").is_ok();
+        let evaluated = crate::eval::parse_modifiers(spec.split('|').skip(1)).is_some();
+        assert_eq!(validated, accepted, "validator: {spec}");
+        assert_eq!(evaluated, accepted, "evaluator: {spec}");
     }
 }
 
