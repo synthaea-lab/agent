@@ -46,7 +46,7 @@ pub struct ContentEntry {
     pub sha256: String,
     /// Size in bytes — lets a caller budget a download before fetching it.
     pub size: u64,
-    /// `rule` | `model` | `policy` (ADR-0016 §1). Kept as a plain string, not a
+    /// `rule` | `model` | `policy` | `ioc` (ADR-0016 §1, ADR-0038). Kept as a plain string, not a
     /// Rust enum: this crate only ever forwards the value to a caller that
     /// decides what to do with each type, and a string can't fail to
     /// deserialize just because the server added a fourth type this build
