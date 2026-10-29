@@ -21,7 +21,7 @@
 //!    can be reused by a later container.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         Mutex,
         mpsc::{Receiver, TryRecvError},
@@ -33,6 +33,11 @@ use schema::ContainerContext;
 /// Silos remembered at once. A container host runs tens of containers; the cap
 /// only bounds a host that churns through far more than that.
 const SILO_CAP: usize = 256;
+
+/// Teardowns remembered so a resolver pass can tell that a silo was forgotten while it ran.
+/// A pass lasts seconds (HCS calls), so far more than the forgets of one pass; if the log
+/// overflowed anyway the pass discards everything it found (see [`SiloDirectory::resolved_since`]).
+const FORGET_LOG_CAP: usize = 1024;
 
 /// How long an unresolved silo waits before it asks the resolver again: a
 /// container's first processes start before the Host Compute Service lists them.
@@ -69,6 +74,10 @@ pub(crate) struct SiloDirectory {
     entries: HashMap<u32, SiloEntry>,
     tick: u64,
     evicted: u64,
+    /// Counts every [`SiloDirectory::forget`]; a resolver pass notes it when it starts.
+    epoch: u64,
+    /// The last forgets, `(epoch, silo)`, oldest first.
+    forgotten: VecDeque<(u64, u32)>,
 }
 
 impl SiloDirectory {
@@ -77,6 +86,8 @@ impl SiloDirectory {
             entries: HashMap::new(),
             tick: 0,
             evicted: 0,
+            epoch: 0,
+            forgotten: VecDeque::new(),
         }
     }
 
@@ -157,6 +168,36 @@ impl SiloDirectory {
     /// The silo was created or torn down: whatever it was mapped to is stale.
     pub(crate) fn forget(&mut self, silo: u32) {
         self.entries.remove(&silo);
+        self.epoch += 1;
+        self.forgotten.push_back((self.epoch, silo));
+        if self.forgotten.len() > FORGET_LOG_CAP {
+            self.forgotten.pop_front();
+        }
+    }
+
+    /// The forget count now: a resolver pass reads it before it looks at the containers.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Like [`SiloDirectory::resolved`], for an answer found by a pass that started at
+    /// `since` (the [`SiloDirectory::epoch`] it read first). The pass probes containers
+    /// without the lock, so `silo` may have been torn down and asked about again
+    /// meanwhile (a reused id); its fresh entry is unmapped too, and installing what the
+    /// pass saw would name the new container after the old one until the next teardown.
+    /// Returns whether it was installed. When the log no longer reaches back to `since`,
+    /// nothing can be proven and the answer is dropped: the silo stays provisional and is
+    /// asked again.
+    pub(crate) fn resolved_since(&mut self, silo: u32, container_id: String, since: u64) -> bool {
+        let log_covers_pass = self.epoch - since <= self.forgotten.len() as u64;
+        let forgotten_meanwhile = self
+            .forgotten
+            .iter()
+            .any(|&(at, forgotten)| at > since && forgotten == silo);
+        if !log_covers_pass || forgotten_meanwhile {
+            return false;
+        }
+        self.resolved(silo, container_id)
     }
 
     /// The container ids already mapped, which a resolver pass need not probe.
@@ -319,9 +360,13 @@ fn resolve_pass(
     source: &impl ContainerSource,
     probe: &impl Fn(u32, &str) -> Option<u32>,
 ) {
-    let (known, pending) = {
+    let (known, pending, since) = {
         let directory = directory.lock().unwrap();
-        (directory.resolved_ids(), directory.pending())
+        (
+            directory.resolved_ids(),
+            directory.pending(),
+            directory.epoch(),
+        )
     };
     if pending.is_empty() {
         return;
@@ -350,10 +395,16 @@ fn resolve_pass(
         mapped = mapping.len(),
         "container lookup pass"
     );
+    // The probes ran without the lock: a silo torn down and asked about again
+    // meanwhile (the Kernel-Process callback calls `forget`) is not named after
+    // what the pass saw.
     let mut directory = directory.lock().unwrap();
     for (silo, id) in mapping {
-        if pending.contains(&silo) && !directory.resolved(silo, id) {
-            tracing::debug!(silo, "container lookup: silo mapped meanwhile, kept");
+        if pending.contains(&silo) && !directory.resolved_since(silo, id, since) {
+            tracing::debug!(
+                silo,
+                "container lookup: silo mapped or recreated meanwhile, answer dropped"
+            );
         }
     }
 }
@@ -586,6 +637,100 @@ mod tests {
         let mut dir = directory.lock().unwrap();
         assert_eq!(dir.lookup(41, SEC).0.id, ID_A);
         assert_eq!(dir.lookup(5, SEC).0.id, ID_B);
+    }
+
+    /// A source whose process listing is the moment the silo is torn down and its id
+    /// reused by a new container an event already asked about, as the Kernel-Process
+    /// callback and the event thread would do it on other threads.
+    struct ReuseDuringPass<'a> {
+        directory: &'a Mutex<SiloDirectory>,
+        silo: u32,
+        inner: FakeHcs,
+    }
+
+    impl ContainerSource for ReuseDuringPass<'_> {
+        fn container_ids(&self) -> Result<Vec<String>, String> {
+            self.inner.container_ids()
+        }
+        fn processes(&self, container_id: &str) -> Result<Vec<(u32, String)>, String> {
+            let processes = self.inner.processes(container_id);
+            let mut dir = self.directory.lock().unwrap();
+            dir.forget(self.silo);
+            dir.lookup(self.silo, 2 * SEC);
+            processes
+        }
+    }
+
+    /// Review of #709 (regression of `e70fd25`): the reused silo's fresh entry is
+    /// unmapped and pending, which `resolved` alone accepts.
+    #[test]
+    fn a_silo_reused_during_a_pass_is_not_named_after_the_old_container() {
+        let directory = Mutex::new(SiloDirectory::new());
+        directory.lock().unwrap().lookup(41, SEC);
+        let hcs = ReuseDuringPass {
+            directory: &directory,
+            silo: 41,
+            inner: FakeHcs {
+                containers: vec![container(ID_A, &[(612, "cmd.exe")])],
+                listed: std::cell::RefCell::new(Vec::new()),
+            },
+        };
+        resolve_pass(&directory, &hcs, &|pid, _| (pid == 612).then_some(41));
+        let mut dir = directory.lock().unwrap();
+        assert!(dir.pending().contains(&41));
+        assert_eq!(dir.lookup(41, SEC).0.id, "silo:41");
+    }
+
+    #[test]
+    fn a_reused_silo_does_not_stop_the_other_silos_of_the_same_pass() {
+        let directory = Mutex::new(SiloDirectory::new());
+        {
+            let mut dir = directory.lock().unwrap();
+            dir.lookup(41, SEC);
+            dir.lookup(42, SEC);
+        }
+        let hcs = ReuseDuringPass {
+            directory: &directory,
+            silo: 41,
+            inner: FakeHcs {
+                containers: vec![
+                    container(ID_A, &[(612, "cmd.exe")]),
+                    container(ID_B, &[(900, "ping.exe")]),
+                ],
+                listed: std::cell::RefCell::new(Vec::new()),
+            },
+        };
+        resolve_pass(&directory, &hcs, &|pid, _| match pid {
+            612 => Some(41),
+            900 => Some(42),
+            _ => None,
+        });
+        let mut dir = directory.lock().unwrap();
+        assert_eq!(dir.lookup(41, SEC).0.id, "silo:41");
+        assert_eq!(dir.lookup(42, SEC).0.id, ID_B);
+    }
+
+    #[test]
+    fn a_forget_before_the_pass_started_does_not_block_its_answer() {
+        let mut dir = SiloDirectory::new();
+        dir.forget(41);
+        let since = dir.epoch();
+        dir.lookup(41, SEC);
+        assert!(dir.resolved_since(41, ID_A.to_string(), since));
+        assert_eq!(dir.lookup(41, SEC).0.id, ID_A);
+    }
+
+    #[test]
+    fn a_forget_log_that_no_longer_reaches_the_pass_drops_its_answers() {
+        let mut dir = SiloDirectory::new();
+        dir.lookup(41, SEC);
+        let since = dir.epoch();
+        for silo in 1000..1000 + FORGET_LOG_CAP as u32 + 1 {
+            dir.forget(silo);
+        }
+        // Silo 41 was never forgotten, but the log lost its oldest entries: unprovable.
+        assert!(!dir.resolved_since(41, ID_A.to_string(), since));
+        assert_eq!(dir.lookup(41, SEC).0.id, "silo:41");
     }
 
     struct DownHcs;
