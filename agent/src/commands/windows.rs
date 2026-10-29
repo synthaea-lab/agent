@@ -465,6 +465,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         alerts,
         events,
         storage,
+        alert_details,
         enable_kill: _,
         enable_quarantine: _,
         // uprobes are a Linux mechanism — the capture flags are accepted for CLI
@@ -488,6 +489,9 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         content_dir,
         storage,
     )?;
+    // #319. Set before any sensor starts; the one alert `wire_run_pipeline` can raise
+    // itself (UPLOAD-DISABLED) is the agent's own text, not an event's.
+    pipeline.sink.alert_log().set_stderr_details(alert_details);
     super::common::plant_canaries(
         &pipeline.sink,
         deception,
