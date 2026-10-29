@@ -286,7 +286,7 @@ pub struct RuleState {
     self_spawn: BoundedMap<(u32, String), SlidingCounter>,
     /// Linux timestomp alerts already raised, per process incarnation `(pid, generation)`
     /// (#1036): one alert per window per process, see [`Self::on_file_set_time`].
-    set_time_alerted: BoundedMap<(u32, u64), SlidingCounter>,
+    set_time_alerted: BoundedMap<(u32, u64), SetTimeWindow>,
     /// (comm, daddr, dport) → sliding counter for BEACON (T1071 Windows). LRU-bounded.
     beacon: BoundedMap<(String, String, u16), SlidingCounter>,
     /// Same key as `beacon` → which local ports have already counted toward it —
@@ -512,6 +512,30 @@ struct PendingProcFdExec {
     fd: i32,
     comm: String,
     timestamp_ns: u64,
+}
+
+/// One process incarnation's timestomp alert state (#1036): when it last alerted and how many
+/// requests the window has swallowed since, so the next alert can say how many there were.
+#[derive(Default)]
+struct SetTimeWindow {
+    last_alert_ns: Option<u64>,
+    folded: u32,
+}
+
+impl SetTimeWindow {
+    /// `Some(requests folded since the last alert)` when this request alerts, `None` when it is
+    /// folded into the alert of the window it falls in.
+    fn admit(&mut self, ts: u64, window_ns: u64) -> Option<u32> {
+        if self
+            .last_alert_ns
+            .is_some_and(|t| ts.saturating_sub(t) <= window_ns)
+        {
+            self.folded = self.folded.saturating_add(1);
+            return None;
+        }
+        self.last_alert_ns = Some(ts);
+        Some(std::mem::take(&mut self.folded))
+    }
 }
 
 /// Memfd creations remembered per pid (see `RuleState::recent_memfd_creates`). A real
@@ -3043,13 +3067,32 @@ impl RuleState {
         if alerts.is_empty() || !matches!(event.meta.user, schema::User::Unix { .. }) {
             return alerts;
         }
+        // A package manager unpacking an archive stamps every file with its stored mtime. The
+        // skip is keyed on the exec-time image, not on `comm` alone: `comm` is the basename of
+        // whatever was exec'd and any process can rewrite it (`prctl(PR_SET_NAME)`), so a copy of
+        // `touch` named `/tmp/rpm`, or `python3` renamed to `rpm`, would otherwise stomp silently
+        // (#1045 review). Fails closed: a package manager whose exec the sensor missed (started
+        // before the agent) alerts at Low until it exits.
+        if crate::stateless::is_package_manager_comm(&event.meta.comm)
+            && self.runs_trusted_binary_named(&event.meta)
+        {
+            return Vec::new();
+        }
         let key = (event.meta.pid, event.meta.process_generation.unwrap_or(0));
-        let first = self
+        let window = self
             .set_time_alerted
-            .get_or_insert_with(key, SlidingCounter::default)
-            .try_alert(event.meta.timestamp_ns, SET_TIME_ALERT_WINDOW_NS);
-        if !first {
-            alerts.clear();
+            .get_or_insert_with(key, SetTimeWindow::default);
+        match window.admit(event.meta.timestamp_ns, SET_TIME_ALERT_WINDOW_NS) {
+            None => alerts.clear(),
+            Some(folded) if folded > 0 => {
+                // The one alert per window hides how many requests there were: say so.
+                for alert in &mut alerts {
+                    alert.message.push_str(&format!(
+                        " ({folded} more request(s) from this process since its last alert were not reported)"
+                    ));
+                }
+            }
+            Some(_) => {}
         }
         alerts
     }
