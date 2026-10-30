@@ -80,6 +80,7 @@ fn exec_unix_golden() {
             company_name: None,
             file_description: None,
             product_name: None,
+            image_file_id: None,
             env_security: Vec::new(),
         }),
         "exec",
@@ -118,6 +119,7 @@ fn exec_process_generation_golden() {
             company_name: None,
             file_description: None,
             product_name: None,
+            image_file_id: None,
             env_security: Vec::new(),
         }),
         "exec_process_generation",
@@ -152,6 +154,7 @@ fn exec_ld_preload_golden() {
             company_name: None,
             file_description: None,
             product_name: None,
+            image_file_id: None,
             env_security: vec![("LD_PRELOAD".into(), "/tmp/evil.so".into())],
         }),
         "exec_ld_preload",
@@ -186,9 +189,45 @@ fn exec_windows_golden() {
             company_name: None,
             file_description: None,
             product_name: None,
+            image_file_id: None,
             env_security: Vec::new(),
         }),
         "exec_windows",
+    );
+}
+
+#[test]
+fn exec_windows_image_file_id_golden() {
+    assert_golden(
+        &Event::Exec(ExecEvent {
+            meta: EventMeta {
+                pid: 5120,
+                ppid: 620,
+                user: User::Windows {
+                    sid: "S-1-5-21-1004336348-1177238915-682003330-512".into(),
+                    integrity_level: Some(0x3000),
+                },
+                timestamp_ns: 1_756_900_001_000_000_000,
+                comm: "powershell.exe".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            image_path: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".into(),
+            cmdline: "powershell.exe -NoProfile -EncodedCommand JABzAD0ATgBlAHcALQBPAGIAagBlAGMAdAAgAE4AZQB0AC4AVwBlAGIAQwBsAGkAZQBuAHQA".into(),
+            argv: vec![],
+            parent_comm: None,
+            parent_image_path: None,
+            sha256: None,
+            signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
+            image_file_id: Some("00000000a1b2c3d4:0000000000000000000300000000beef".into()),
+            env_security: Vec::new(),
+        }),
+        "exec_image_file_id",
     );
 }
 
@@ -224,6 +263,7 @@ fn exec_lineage_golden() {
             company_name: None,
             file_description: None,
             product_name: None,
+            image_file_id: None,
             env_security: Vec::new(),
         }),
         "exec_lineage",
@@ -282,6 +322,7 @@ fn detection_ml_golden() {
             company_name: None,
             file_description: None,
             product_name: None,
+            image_file_id: None,
             env_security: Vec::new(),
         })],
     };
@@ -321,6 +362,7 @@ fn sample_exec_event() -> Event {
         company_name: None,
         file_description: None,
         product_name: None,
+        image_file_id: None,
         env_security: Vec::new(),
     })
 }
@@ -988,9 +1030,42 @@ fn listen_port_golden() {
             },
             local_addr: "0.0.0.0".parse::<IpAddr>().unwrap(),
             local_port: 31337,
+            protocol: schema::IPPROTO_TCP,
         }),
         "listen_port",
     );
+}
+
+#[test]
+fn listen_port_without_protocol_defaults_to_tcp() {
+    // A record from before issue #676 (spooled events, server storage, the ML
+    // corpus, every fixture under v40-v48) has no `protocol` field at all —
+    // every collector was TCP-only back then, so that is what it actually was.
+    // A literal here, not a read of `fixtures/v48/listen_port.json`: that file
+    // can be pruned or regenerated independently of this test, which exercises
+    // the default, not the fixture layout.
+    let raw = r#"{
+        "type": "listen_port",
+        "meta": {
+            "pid": 4242,
+            "ppid": 1,
+            "user": { "os": "unix", "uid": 0, "gid": 0 },
+            "timestamp_ns": 1756900090000000000,
+            "comm": "sshd-backdoor"
+        },
+        "local_addr": "0.0.0.0",
+        "local_port": 31337
+    }"#;
+    let event: Event =
+        serde_json::from_str(raw).expect("pre-#676 listen_port must still deserialize");
+    match event {
+        Event::ListenPort(e) => assert_eq!(
+            e.protocol,
+            schema::IPPROTO_TCP,
+            "missing protocol must default to IPPROTO_TCP"
+        ),
+        other => panic!("expected ListenPort, got {other:?}"),
+    }
 }
 
 #[test]
@@ -1048,6 +1123,7 @@ fn exec_enriched_golden() {
             company_name: None,
             file_description: None,
             product_name: None,
+            image_file_id: None,
             env_security: Vec::new(),
         }),
         "exec_enriched",
@@ -1083,6 +1159,7 @@ fn exec_windows_pe_info_golden() {
             file_description: Some("Windows Command Processor".into()),
             product_name: Some("Microsoft® Windows® Operating System".into()),
             env_security: Vec::new(),
+            image_file_id: None,
         }),
         "exec_pe_info",
     );
@@ -1119,6 +1196,7 @@ fn exec_container_golden() {
             company_name: None,
             file_description: None,
             product_name: None,
+            image_file_id: None,
             env_security: Vec::new(),
         }),
         "exec_container",
@@ -2344,6 +2422,7 @@ fn unbounded_cmdline_survives() {
         company_name: None,
         file_description: None,
         product_name: None,
+        image_file_id: None,
         env_security: Vec::new(),
     });
     let back: Event = serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
@@ -2381,6 +2460,7 @@ fn ml_cmdline_is_the_canonical_nul_joined_form() {
         company_name: None,
         file_description: None,
         product_name: None,
+        image_file_id: None,
         env_security: Vec::new(),
     };
 
@@ -2442,6 +2522,7 @@ fn meta_accessor_covers_all_variants() {
             company_name: None,
             file_description: None,
             product_name: None,
+            image_file_id: None,
             env_security: Vec::new(),
         }),
         Event::FileOpen(FileOpenEvent {
@@ -2589,6 +2670,7 @@ fn meta_accessor_covers_all_variants() {
             meta: meta.clone(),
             local_addr: "0.0.0.0".parse::<IpAddr>().unwrap(),
             local_port: 0,
+            protocol: 6,
         }),
         Event::NetworkFlow(NetworkFlowEvent {
             meta: meta.clone(),

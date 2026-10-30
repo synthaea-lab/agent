@@ -267,7 +267,7 @@ fn network_flow_event_full(
         local_port,
         daddr: std::net::IpAddr::V4(daddr_v4.into()),
         dport,
-        protocol: 6, // IPPROTO_TCP
+        protocol: schema::IPPROTO_TCP,
         ..schema::fixtures::network_flow()
     }
 }
@@ -287,6 +287,7 @@ fn listen_port_event_full(
         meta,
         local_addr: std::net::IpAddr::V4(local_addr_v4.into()),
         local_port,
+        protocol: schema::IPPROTO_TCP,
     }
 }
 
@@ -413,6 +414,7 @@ mod motw_removal;
 mod osascript;
 mod persistence;
 mod policy_denial_windows;
+mod privesc;
 mod quarantine;
 mod ransomware_windows;
 mod raw_volume;

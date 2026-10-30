@@ -27,6 +27,7 @@ pub fn listen_port_event(entry: &ListenerEntry, timestamp_ns: u64) -> Event {
         },
         local_addr: entry.local.ip(),
         local_port: entry.local.port(),
+        protocol: entry.protocol,
     })
 }
 
@@ -40,7 +41,18 @@ mod tests {
             ppid: Some(700),
             process_name: Some("svchost.exe".to_string()),
             local: "0.0.0.0:135".parse().unwrap(),
+            protocol: 6, // IPPROTO_TCP
         }
+    }
+
+    #[test]
+    fn a_udp_entry_carries_its_own_protocol_through() {
+        let mut e = entry();
+        e.protocol = 17; // IPPROTO_UDP
+        let Event::ListenPort(listen) = listen_port_event(&e, 0) else {
+            panic!("must map");
+        };
+        assert_eq!(listen.protocol, 17);
     }
 
     #[test]
@@ -49,6 +61,7 @@ mod tests {
             panic!("a listener must map to Event::ListenPort");
         };
         assert_eq!(listen.local_port, 135);
+        assert_eq!(listen.protocol, schema::IPPROTO_TCP);
         assert_eq!(listen.meta.pid, 1234);
         assert_eq!(listen.meta.ppid, 700);
         assert_eq!(listen.meta.comm, "svchost.exe");

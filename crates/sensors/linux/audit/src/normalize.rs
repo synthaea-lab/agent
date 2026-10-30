@@ -50,6 +50,7 @@ pub fn exec_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
         company_name: None,
         file_description: None,
         product_name: None,
+        image_file_id: None,
         env_security: Vec::new(), // Phase 1: no environment capture on this sensor
     })
 }

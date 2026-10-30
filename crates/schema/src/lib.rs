@@ -315,12 +315,25 @@ pub mod time;
 /// straight from 53 to 55 and left 54 unused.
 ///
 /// Bumped 55 → 56 for Windows minifilter explicit timestamp requests (#136). #995
-/// (`ListenPortEvent::protocol`) renumbered past the skipped 54 to 57, closer to
-/// merging than this one, so no collision there.
+/// (`ListenPortEvent::protocol`) had planned to renumber past the skipped 54 to 57.
 ///
 /// Bumped 56 → 57 for mounted raw-volume open telemetry (#136 slice 4), stacked on
-/// the timestomp slice above.
-pub const SCHEMA_VERSION: u32 = 57;
+/// the timestomp slice above — it merged first and took the 57 #995 was planning
+/// on, without #995 having pushed its own renumbering commit yet.
+///
+/// Bumped 57 → 58 for [`ListenPortEvent::protocol`] (#676 part 1): #136 slice 4
+/// merged first and took 57, which this had also claimed; 58 is the next free
+/// number above it.
+///
+/// Not bumped for the Windows UDP collector (#676 part 2, stacked on #995): no
+/// wire change — #995 already defined `ListenPortEvent::protocol`; this PR only
+/// fills it with the real value (6 or 17) instead of #995's TCP-only `6` (review
+/// of #1008).
+///
+/// Bumped 58 → 59 for [`ExecEvent::image_file_id`] (#688): the identity of the
+/// image file at exec time, so the T1204.002 signature gate can distinguish the
+/// image that ran from whatever the path contains when it is later verified.
+pub const SCHEMA_VERSION: u32 = 59;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -632,6 +645,15 @@ pub struct ExecEvent {
     /// in the catalogue's `process_creation` category use it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub product_name: Option<String>,
+    /// Identity of the file the image ran from, captured by the sensor *at exec
+    /// time* (#688): `"{volume serial:016x}:{file id:032x}"`, opaque to consumers.
+    /// The enrichment worker verifies the file at `image_path` some time later; a
+    /// verdict only speaks for the image that ran when the file it verified has
+    /// this identity (a running image can be renamed on Windows and a signed copy
+    /// put at its path). Windows only; `None` when the sensor could not open the
+    /// image, and on every other platform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_file_id: Option<String>,
     /// Security-relevant environment variables present at exec time, `(name, value)`
     /// pairs (#363) — the dynamic-linker-hijack family: `LD_PRELOAD`,
     /// `LD_LIBRARY_PATH`, `LD_AUDIT` (the quieter sibling of `LD_PRELOAD`),
@@ -1619,10 +1641,21 @@ pub struct UdpRecvEvent {
     pub size: u32,
 }
 
-/// A TCP socket found listening, from a periodic socket-table snapshot rather than a
-/// discrete `bind`/`listen()` syscall trace (Linux: `NETLINK_SOCK_DIAG`, issue #92 —
-/// a probe-free source that runs where eBPF/ETW cannot, or as a redundant cross-check
-/// alongside them).
+/// IP protocol number for TCP, the `IPPROTO_TCP` of `<netinet/in.h>` — shared so
+/// [`ListenPortEvent::protocol`]/[`NetworkFlowEvent::protocol`] callers across the
+/// agent and sensor crates stamp and compare the same value instead of each
+/// carrying its own `6` literal, where a typo would make a baseline key that
+/// silently never matches (issue #676 review).
+pub const IPPROTO_TCP: u8 = 6;
+
+/// IP protocol number for UDP, the `IPPROTO_UDP` of `<netinet/in.h>` — see
+/// [`IPPROTO_TCP`].
+pub const IPPROTO_UDP: u8 = 17;
+
+/// A TCP or UDP socket found bound/listening, from a periodic socket-table snapshot
+/// rather than a discrete `bind`/`listen()` syscall trace (Linux: `NETLINK_SOCK_DIAG`,
+/// issue #92 — a probe-free source that runs where eBPF/ETW cannot, or as a redundant
+/// cross-check alongside them).
 ///
 /// `meta.timestamp_ns` is when the snapshot was taken, not when the socket actually
 /// started listening — a snapshot can only observe "listening as of now", so a
@@ -1630,11 +1663,28 @@ pub struct UdpRecvEvent {
 /// cadence is a caller decision, not a schema concern). Detection value is in the
 /// series across snapshots (listen-port drift: a new port appearing that wasn't there
 /// last poll), not any single event in isolation.
+///
+/// `protocol` is the IP protocol number, same convention as [`NetworkFlowEvent::protocol`]
+/// (`IPPROTO_TCP` = 6, `IPPROTO_UDP` = 17, issue #676), and is part of every consumer's
+/// dedup/baseline key: a UDP listener and a TCP listener on the same port are different
+/// shapes, not a collision — `udp/53` and `tcp/53` are two different services with no
+/// reason to share a baseline entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenPortEvent {
     pub meta: EventMeta,
     pub local_addr: core::net::IpAddr,
     pub local_port: u16,
+    /// Defaults to `IPPROTO_TCP` on a record that predates this field (spooled
+    /// events, server storage, the ML corpus): every collector was TCP-only
+    /// before issue #676, so that's what an un-stamped record actually was.
+    #[serde(default = "default_listen_port_protocol")]
+    pub protocol: u8,
+}
+
+/// `IPPROTO_TCP` — the default for `ListenPortEvent::protocol` on a record from
+/// before this field existed.
+fn default_listen_port_protocol() -> u8 {
+    IPPROTO_TCP
 }
 
 /// Direction of TLS data flow.

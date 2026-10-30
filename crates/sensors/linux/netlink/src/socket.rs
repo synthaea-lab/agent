@@ -52,16 +52,25 @@ impl From<io::Error> for NetlinkError {
 /// [`NetlinkError::Io`] if the socket can't be created or a read/write fails;
 /// [`NetlinkError::Kernel`] if the kernel replies with a non-zero `NLMSG_ERROR`.
 pub fn query_tcp_sockets(states: u32) -> Result<Vec<DiagMsg>, NetlinkError> {
+    query_sockets(IPPROTO_TCP, states)
+}
+
+/// Same dump for any `IPPROTO_*` `sock_diag` serves (TCP and UDP here).
+///
+/// # Errors
+///
+/// See [`query_tcp_sockets`].
+pub fn query_sockets(protocol: u8, states: u32) -> Result<Vec<DiagMsg>, NetlinkError> {
     let mut all = Vec::new();
     for family in [AF_INET, AF_INET6] {
-        all.extend(dump_one_family(family, states)?);
+        all.extend(dump_one_family(family, protocol, states)?);
     }
     Ok(all)
 }
 
-fn dump_one_family(family: u8, states: u32) -> Result<Vec<DiagMsg>, NetlinkError> {
+fn dump_one_family(family: u8, protocol: u8, states: u32) -> Result<Vec<DiagMsg>, NetlinkError> {
     let fd = open_socket()?;
-    send_request(&fd, family, states)?;
+    send_request(&fd, family, protocol, states)?;
     read_dump(&fd)
 }
 
@@ -101,10 +110,10 @@ fn open_socket() -> Result<OwnedFd, NetlinkError> {
     Ok(fd)
 }
 
-fn send_request(fd: &OwnedFd, family: u8, states: u32) -> Result<(), NetlinkError> {
+fn send_request(fd: &OwnedFd, family: u8, protocol: u8, states: u32) -> Result<(), NetlinkError> {
     let req = DiagRequestV2 {
         family,
-        protocol: IPPROTO_TCP,
+        protocol,
         states,
     }
     .to_bytes();

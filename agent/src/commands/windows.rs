@@ -59,12 +59,26 @@ fn seeded_rule_state() -> rules::RuleState {
     let mut rule_state = rules::RuleState::new();
     rule_state.seed_pid_comm(map);
     // LISTENER-DRIFT baseline (#366), same reasoning as the Linux/macOS
-    // seeding: every listener already up when the agent starts (RPC 135, SMB
-    // 445, vendor services) is the baseline, not a finding. Best-effort — a
-    // snapshot failure leaves the baseline empty rather than failing startup.
-    match sensor_windows_sockets::snapshot() {
+    // seeding: every listener/bound socket already up when the agent starts
+    // (RPC 135, SMB 445, vendor services, DNS client sockets) is the
+    // baseline, not a finding. Best-effort — a snapshot failure leaves the
+    // baseline empty rather than failing startup.
+    //
+    // TCP only, for now: `GetExtendedUdpTable` has no "listener" filter (every
+    // bound UDP endpoint comes back — DNS client sockets, QUIC, mDNS,
+    // ephemeral ports), and #676's noise filter for that is not calibrated
+    // yet (review of #1008). Forwarding UDP unfiltered would drown the TCP
+    // signal, so it stays out of the rule path until that filter lands —
+    // `snapshot_tcp` does not call `GetExtendedUdpTable` at all, so there is
+    // no fetch to discard; `sensor_windows_sockets::snapshot` is the full
+    // mechanism for when the filter does land.
+    match sensor_windows_sockets::snapshot_tcp() {
         Ok(entries) => {
-            rule_state.seed_listen_ports(entries.iter().map(|e| (e.local.ip(), e.local.port())));
+            rule_state.seed_listen_ports(
+                entries
+                    .iter()
+                    .map(|e| (e.local.ip(), e.local.port(), e.protocol)),
+            );
         }
         Err(e) => tracing::warn!(error = %e, "socket snapshot for listener baseline failed"),
     }
@@ -92,11 +106,12 @@ fn spawn_socket_poller(
         .name("socket-poller".into())
         .spawn(move || {
             while !stop.load(Ordering::SeqCst) {
-                forward_socket_snapshot(
-                    sensor_windows_sockets::listen_port_events(schema::time::now_ns()),
-                    sink.as_ref(),
-                    heartbeat.as_ref(),
-                );
+                // TCP only for now — same #676 noise-filter gap as the
+                // baseline seed above (`seeded_rule_state`); `listen_port_events_tcp`
+                // never calls `GetExtendedUdpTable`, so there is nothing UDP to
+                // filter out or to warn about here.
+                let events = sensor_windows_sockets::listen_port_events_tcp(schema::time::now_ns());
+                forward_socket_snapshot(events, sink.as_ref(), heartbeat.as_ref());
                 // Sleep in short slices so Ctrl-C never waits a full interval.
                 let deadline = std::time::Instant::now() + SOCKET_POLL_INTERVAL;
                 while std::time::Instant::now() < deadline && !stop.load(Ordering::SeqCst) {

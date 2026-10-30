@@ -134,6 +134,13 @@ struct RecentWrite {
     timestamp_ns: u64,
 }
 
+/// One exec of a pid, for the as-of-time image lookup of SETUID-ROOT-REQUEST (#1041).
+struct ExecRecord {
+    timestamp_ns: u64,
+    generation: Option<u64>,
+    image: String,
+}
+
 /// A download-provenance mark, as [`RuleState::on_file_quarantine`] saw it.
 struct RecentQuarantine {
     timestamp_ns: u64,
@@ -268,6 +275,17 @@ pub struct RuleState {
     /// `sed -i.bak`, or an encryptor that exits right after its renames) is already
     /// gone and it reads `None` (#513 review). LRU-bounded like `pid_comm`.
     pid_image_path: BoundedMap<u32, PidFact>,
+    /// pid → generation of the process that already raised SETUID-ROOT-REQUEST (T1548.001,
+    /// #1041): one alert per process, since a `PoC` calls `setuid`, `setresuid`, ... in a row.
+    /// LRU-bounded like `pid_comm`.
+    setuid_root_alerted: BoundedMap<u32, Option<u64>>,
+    /// pid → its latest execs (image, time, incarnation): SETUID-ROOT-REQUEST reads the image
+    /// a pid had *as of* an event's time, which `pid_image_path` (latest only) cannot give.
+    exec_history: BoundedMap<u32, Vec<ExecRecord>>,
+    /// Identity requests for uid 0 waiting for their process's exec to arrive (#1041).
+    pending_identity: VecDeque<schema::IdentityChangeEvent>,
+    /// The latest timestamp of any identity or exec event seen: the stream's clock.
+    identity_clock_ns: u64,
     /// path → info about the last write by a known downloader (T1105). LRU-bounded:
     /// downloader writes are rare, but a hostile loop must not grow agent memory.
     recent_writes: BoundedMap<String, RecentWrite>,
@@ -284,6 +302,9 @@ pub struct RuleState {
     recent_motw_removals: BoundedMap<String, MotwRemoval>,
     /// (ppid, comm) → sliding counter for SELF-SPAWN (T1059 Windows). LRU-bounded.
     self_spawn: BoundedMap<(u32, String), SlidingCounter>,
+    /// Linux timestomp alerts already raised, per process incarnation `(pid, generation)`
+    /// (#1036): one alert per window per process, see [`Self::on_file_set_time`].
+    set_time_alerted: BoundedMap<(u32, u64), SetTimeWindow>,
     /// (comm, daddr, dport) → sliding counter for BEACON (T1071 Windows). LRU-bounded.
     beacon: BoundedMap<(String, String, u16), SlidingCounter>,
     /// Same key as `beacon` → which local ports have already counted toward it —
@@ -342,14 +363,18 @@ pub struct RuleState {
     /// (pid, dport) → sliding distinct-destination counter for SCAN-SPREAD
     /// (T1046/T1210, issue #465). LRU-bounded.
     scan_spread: BoundedMap<(u32, u16), SlidingDistinct<IpAddr>>,
-    /// (`local_addr`, `local_port`) → seen, for LISTENER-DRIFT (issue #92, T1571).
-    /// [`Self::seed_listen_ports`] pre-fills this from one startup snapshot so
-    /// every service already listening when the agent attaches is the baseline,
-    /// not noise — the same "seed from the world as it already is" principle as
-    /// [`Self::seed_from_proc`]/`seed_pid_comm`. LRU-bounded: the realistic
-    /// listener space is a few dozen, not unbounded, but a hostile loop binding
-    /// many ports must not grow this without limit either.
-    known_listeners: BoundedMap<(IpAddr, u16), ()>,
+    /// (`local_addr`, `local_port`, `protocol`) → seen, for LISTENER-DRIFT (issue
+    /// #92, T1571). `protocol` is the IP protocol number, same convention as
+    /// [`schema::ListenPortEvent::protocol`] — a UDP listener and a TCP listener
+    /// on the same port are different shapes, not a collision (issue #676): without
+    /// it, a new UDP listener on a port already baselined as TCP (or vice versa)
+    /// would be silently treated as already seen. [`Self::seed_listen_ports`]
+    /// pre-fills this from one startup snapshot so every service already listening
+    /// when the agent attaches is the baseline, not noise — the same "seed from the
+    /// world as it already is" principle as [`Self::seed_from_proc`]/`seed_pid_comm`.
+    /// LRU-bounded: the realistic listener space is a few dozen, not unbounded, but
+    /// a hostile loop binding many ports must not grow this without limit either.
+    known_listeners: BoundedMap<(IpAddr, u16, u8), ()>,
     /// (mechanism, subject context, object context, object class) → seen, for
     /// POLICY-DENIAL-DRIFT (issue #774, T1562-adjacent). Same "first new shape
     /// wins, the routine repeat doesn't" principle as `known_listeners` above:
@@ -511,6 +536,30 @@ struct PendingProcFdExec {
     timestamp_ns: u64,
 }
 
+/// One process incarnation's timestomp alert state (#1036): when it last alerted and how many
+/// requests the window has swallowed since, so the next alert can say how many there were.
+#[derive(Default)]
+struct SetTimeWindow {
+    last_alert_ns: Option<u64>,
+    folded: u32,
+}
+
+impl SetTimeWindow {
+    /// `Some(requests folded since the last alert)` when this request alerts, `None` when it is
+    /// folded into the alert of the window it falls in.
+    fn admit(&mut self, ts: u64, window_ns: u64) -> Option<u32> {
+        if self
+            .last_alert_ns
+            .is_some_and(|t| ts.saturating_sub(t) <= window_ns)
+        {
+            self.folded = self.folded.saturating_add(1);
+            return None;
+        }
+        self.last_alert_ns = Some(ts);
+        Some(std::mem::take(&mut self.folded))
+    }
+}
+
 /// Memfd creations remembered per pid (see `RuleState::recent_memfd_creates`). A real
 /// fileless-exec process creates one or two; a process making more than this inside
 /// the correlation window is not something a longer list would catch better.
@@ -520,6 +569,8 @@ const PID_COMM_CAP: usize = 65_536;
 /// Counter/write-history bounds — one logical entity per key, far fewer than pids.
 pub(crate) const COUNTER_CAP: usize = 16_384;
 const RECENT_WRITES_CAP: usize = 4_096;
+/// One Linux timestomp alert per process incarnation per this window (#1036).
+const SET_TIME_ALERT_WINDOW_NS: u64 = 60_000_000_000;
 
 impl Default for RuleState {
     fn default() -> Self {
@@ -533,11 +584,16 @@ impl RuleState {
         Self {
             pid_comm: BoundedMap::new(PID_COMM_CAP),
             pid_image_path: BoundedMap::new(PID_COMM_CAP),
+            setuid_root_alerted: BoundedMap::new(PID_COMM_CAP),
+            exec_history: BoundedMap::new(PID_COMM_CAP),
+            pending_identity: VecDeque::new(),
+            identity_clock_ns: 0,
             recent_writes: BoundedMap::new(RECENT_WRITES_CAP),
             recent_quarantines: BoundedMap::new(RECENT_WRITES_CAP),
             recent_bits_downloads: BoundedMap::new(RECENT_WRITES_CAP),
             recent_motw_removals: BoundedMap::new(RECENT_WRITES_CAP),
             self_spawn: BoundedMap::new(COUNTER_CAP),
+            set_time_alerted: BoundedMap::new(COUNTER_CAP),
             ldap_burst: crate::ldap::LdapBurst::new(),
             beacon: BoundedMap::new(COUNTER_CAP),
             beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
@@ -622,7 +678,7 @@ impl RuleState {
     /// attaches (sshd, nginx started by systemd at boot) would look exactly like
     /// a freshly planted backdoor listener on the very first poll after startup.
     /// Same principle, same caller responsibility, as [`Self::seed_from_proc`].
-    pub fn seed_listen_ports(&mut self, ports: impl IntoIterator<Item = (IpAddr, u16)>) {
+    pub fn seed_listen_ports(&mut self, ports: impl IntoIterator<Item = (IpAddr, u16, u8)>) {
         for key in ports {
             self.known_listeners.insert(key, ());
         }
@@ -1441,7 +1497,41 @@ impl RuleState {
             event.meta.pid,
             PidFact::new(generation, event.image_path.clone()),
         );
+        self.record_exec_history(event);
         alerts
+    }
+
+    /// Remembers this exec for [`Self::on_identity_change`], and moves the stream clock.
+    fn record_exec_history(&mut self, event: &ExecEvent) {
+        self.identity_clock_ns = self.identity_clock_ns.max(event.meta.timestamp_ns);
+        let history = self
+            .exec_history
+            .get_or_insert_with(event.meta.pid, Vec::new);
+        if history.len() >= crate::privesc::EXEC_HISTORY_PER_PID {
+            history.remove(0);
+        }
+        history.push(ExecRecord {
+            timestamp_ns: event.meta.timestamp_ns,
+            generation: event.meta.process_generation,
+            image: event.image_path.clone(),
+        });
+    }
+
+    /// The image `pid` (incarnation `generation`) had at `at_ns`: its latest exec at or before
+    /// that time. An exec of another incarnation of the pid does not count.
+    fn image_as_of(&self, pid: u32, generation: Option<u64>, at_ns: u64) -> Option<&str> {
+        self.exec_history
+            .peek(&pid)?
+            .iter()
+            .rev()
+            .find(|record| {
+                record.timestamp_ns <= at_ns
+                    && match (record.generation, generation) {
+                        (Some(recorded), Some(wanted)) => recorded == wanted,
+                        _ => true,
+                    }
+            })
+            .map(|record| record.image.as_str())
     }
 
     /// The exec findings that wait for the image's signature (#441): today
@@ -1736,17 +1826,18 @@ impl RuleState {
     /// existing tag in this crate; no better precedent for "a new listener
     /// appeared" exists here yet, calibratable later) — a listening socket that
     /// wasn't in the startup baseline ([`Self::seed_listen_ports`]) nor already
-    /// alerted on this run. One alert per (`local_addr`, `local_port`): the second
-    /// poll to see the same listener is expected (a poll-based source re-reports
+    /// alerted on this run. One alert per (`local_addr`, `local_port`, `protocol`): the
+    /// second poll to see the same listener is expected (a poll-based source re-reports
     /// it every cycle while it stays open, same reasoning as
-    /// [`Self::check_beacon_flow`]'s dedup), not a second finding.
+    /// [`Self::check_beacon_flow`]'s dedup), not a second finding — and a TCP and a UDP
+    /// listener sharing a port (#676) are different listeners, not one.
     ///
     /// No name/path exclusion list yet — unlike BEACON's `BROWSERS`/
     /// `STANDARD_PORTS`, there is no lab capture here to calibrate one honestly
     /// against (a dev server or `docker-proxy` binding a fresh port after
     /// startup will alert; a documented, known noise source, not a bug).
     fn check_listen_port_drift(&mut self, event: &ListenPortEvent) -> Option<Alert> {
-        let key = (event.local_addr, event.local_port);
+        let key = (event.local_addr, event.local_port, event.protocol);
         if self.known_listeners.get(&key).is_some() {
             return None;
         }
@@ -1755,8 +1846,12 @@ impl RuleState {
             technique: "T1571",
             severity: Severity::Medium,
             message: format!(
-                "pid={} comm={} new listener on {}:{} — not seen at agent startup",
-                event.meta.pid, event.meta.comm, event.local_addr, event.local_port,
+                "pid={} comm={} new {} listener on {}:{} — not seen at agent startup",
+                event.meta.pid,
+                event.meta.comm,
+                protocol_label(event.protocol),
+                event.local_addr,
+                event.local_port,
             ),
         })
     }
@@ -2113,6 +2208,72 @@ impl RuleState {
             ));
         }
         alerts
+    }
+
+    /// To be called for every `IdentityChangeEvent` in the stream (Linux, issue #266):
+    /// SETUID-ROOT-REQUEST (T1548.001, #1041), see [`crate::privesc`]. A request for uid 0 is
+    /// queued, not judged: its process's exec event arrives later than the request, so it is
+    /// judged once the stream clock is [`crate::privesc::IDENTITY_DEFER_NS`] past it, against the
+    /// image the pid (else its parent, for a child that forked and never exec'd) had **at the
+    /// request's time**, never `comm`. Returns the requests that are now due, each with its own
+    /// event so the alert is attributed to the right process; the sink also calls
+    /// [`Self::take_due_identity_alerts`] after every exec, which moves the clock too.
+    pub fn on_identity_change(
+        &mut self,
+        event: &schema::IdentityChangeEvent,
+    ) -> Vec<(schema::IdentityChangeEvent, Alert)> {
+        self.identity_clock_ns = self.identity_clock_ns.max(event.meta.timestamp_ns);
+        if crate::privesc::requests_root_as_non_root(event) {
+            if self.pending_identity.len() >= crate::privesc::IDENTITY_PENDING_CAP {
+                self.pending_identity.pop_front();
+            }
+            self.pending_identity.push_back(event.clone());
+        }
+        self.take_due_identity_alerts()
+    }
+
+    /// The queued identity requests whose wait is over, judged: see [`Self::on_identity_change`].
+    pub fn take_due_identity_alerts(&mut self) -> Vec<(schema::IdentityChangeEvent, Alert)> {
+        let mut due = Vec::new();
+        while let Some(front) = self.pending_identity.front() {
+            if front
+                .meta
+                .timestamp_ns
+                .saturating_add(crate::privesc::IDENTITY_DEFER_NS)
+                > self.identity_clock_ns
+            {
+                break;
+            }
+            let Some(event) = self.pending_identity.pop_front() else {
+                break;
+            };
+            if let Some(alert) = self.judge_identity_request(&event) {
+                due.push((event, alert));
+            }
+        }
+        due
+    }
+
+    fn judge_identity_request(&mut self, event: &schema::IdentityChangeEvent) -> Option<Alert> {
+        let meta = &event.meta;
+        let at = meta.timestamp_ns;
+        let image = self
+            .image_as_of(meta.pid, meta.process_generation, at)
+            .or_else(|| self.image_as_of(meta.ppid, meta.parent_process_generation, at))?
+            .to_owned();
+        if image.is_empty() || crate::privesc::is_known_setuid_root_program(&image) {
+            return None;
+        }
+        if self
+            .setuid_root_alerted
+            .peek(&meta.pid)
+            .is_some_and(|recorded| *recorded == meta.process_generation)
+        {
+            return None;
+        }
+        self.setuid_root_alerted
+            .insert(meta.pid, meta.process_generation);
+        Some(crate::privesc::alert(event, &image))
     }
 
     /// To be called for every `MemfdCreateEvent` in the stream (Linux, issue
@@ -3025,6 +3186,48 @@ impl RuleState {
         alerts
     }
 
+    /// T1070.006, from `FileSetTimeEvent`s ([`crate::evaluate_file_set_time`]), deduplicated per
+    /// process on Linux (#1036): the `inode_setattr` hook reports every explicit time, and
+    /// `tar x`, `cp -a`, `rsync -a` and `cpio` set one per file, so a 3000-file unpack raised
+    /// about 1000 Low alerts in the lab (the rest were lost to the ring buffer). One alert per
+    /// process incarnation per [`SET_TIME_ALERT_WINDOW_NS`] says the same thing; every `touch -d`
+    /// of a stomping script is its own process and still alerts. Windows events carry no
+    /// trustworthy process (the minifilter's `comm` is empty), so they pass through as before.
+    pub fn on_file_set_time(&mut self, event: &schema::FileSetTimeEvent) -> Vec<Alert> {
+        let mut alerts = crate::evaluate_file_set_time(event);
+        if alerts.is_empty() || !matches!(event.meta.user, schema::User::Unix { .. }) {
+            return alerts;
+        }
+        // A package manager unpacking an archive stamps every file with its stored mtime. The
+        // skip is keyed on the exec-time image, not on `comm` alone: `comm` is the basename of
+        // whatever was exec'd and any process can rewrite it (`prctl(PR_SET_NAME)`), so a copy of
+        // `touch` named `/tmp/rpm`, or `python3` renamed to `rpm`, would otherwise stomp silently
+        // (#1045 review). Fails closed: a package manager whose exec the sensor missed (started
+        // before the agent) alerts at Low until it exits.
+        if crate::stateless::is_package_manager_comm(&event.meta.comm)
+            && self.runs_trusted_binary_named(&event.meta)
+        {
+            return Vec::new();
+        }
+        let key = (event.meta.pid, event.meta.process_generation.unwrap_or(0));
+        let window = self
+            .set_time_alerted
+            .get_or_insert_with(key, SetTimeWindow::default);
+        match window.admit(event.meta.timestamp_ns, SET_TIME_ALERT_WINDOW_NS) {
+            None => alerts.clear(),
+            Some(folded) if folded > 0 => {
+                // The one alert per window hides how many requests there were: say so.
+                for alert in &mut alerts {
+                    alert.message.push_str(&format!(
+                        " ({folded} more request(s) from this process since its last alert were not reported)"
+                    ));
+                }
+            }
+            Some(_) => {}
+        }
+        alerts
+    }
+
     /// Remembers a rename or deletion for `pid`, dropping the oldest past the per-pid bound.
     fn record_touched(&mut self, pid: u32, event: Event) {
         let history = self.touched_files.get_or_insert_with(pid, VecDeque::new);
@@ -3175,6 +3378,17 @@ fn is_rotation_suffix(suffix: &str) -> bool {
 
 fn is_all_digits(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `event.protocol`'s IP protocol number, as a word for the LISTENER-DRIFT alert
+/// (issue #676) — `tcp`/`udp` for the two values every snapshot source reports
+/// today, the bare number for anything else rather than guessing a name.
+fn protocol_label(protocol: u8) -> std::borrow::Cow<'static, str> {
+    match protocol {
+        schema::IPPROTO_TCP => "tcp".into(),
+        schema::IPPROTO_UDP => "udp".into(),
+        other => other.to_string().into(),
+    }
 }
 
 /// Matches `/dev/fd/<n>` — `execveat(fd, "", AT_EMPTY_PATH)`'s `bprm->filename`

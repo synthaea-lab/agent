@@ -1495,6 +1495,8 @@ impl DetectionSink {
         }
         self.record_rule_alerts(wrapped, rules::evaluate_exec(event));
         self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_exec(event));
+        // This exec moved the stream clock: identity requests waiting for it may be due (#1041).
+        self.record_due_identity_alerts(self.rule_state.lock().unwrap().take_due_identity_alerts());
         let sigma_guard = self.sigma.lock().unwrap();
         if let Some(sigma) = sigma_guard.as_ref() {
             let entity = entity_key(&event.meta);
@@ -1653,6 +1655,21 @@ impl DetectionSink {
     /// `Signal` events: security-process tampering (T1562.001, issue #362).
     fn detect_signal(&self, wrapped: &Event, event: &schema::SignalEvent) {
         self.record_rule_alerts(wrapped, rules::evaluate_signal(event));
+    }
+
+    /// `IdentityChange` events (Linux, #266): SETUID-ROOT-REQUEST (T1548.001, #1041). A request
+    /// is judged once its process's exec has had time to arrive, so the alerts returned here are
+    /// those of earlier events, each attributed to its own.
+    fn detect_identity_change(&self, event: &schema::IdentityChangeEvent) {
+        let due = self.rule_state.lock().unwrap().on_identity_change(event);
+        self.record_due_identity_alerts(due);
+    }
+
+    /// Records the identity-request alerts that came due, each against the event it is about.
+    fn record_due_identity_alerts(&self, due: Vec<(schema::IdentityChangeEvent, rules::Alert)>) {
+        for (event, alert) in due {
+            self.record_rule_alerts(&Event::IdentityChange(event), [alert]);
+        }
     }
 
     /// `FileRename` events: mass-rename ransomware detection (T1486, issue #262) +
@@ -2348,13 +2365,16 @@ impl EventSink for DetectionSink {
             Event::ListenPort(e) => self.detect_listen_port(&event, e),
             Event::Auth(e) => self.detect_auth(&event, e),
             Event::Session(e) => self.detect_session(&event, e),
+            Event::IdentityChange(e) => self.detect_identity_change(e),
             Event::FileDelete(e) => self.detect_file_delete(&event, e),
             Event::Signal(e) => self.detect_signal(&event, e),
             Event::FileQuarantine(e) => self.detect_file_quarantine(e),
             Event::BitsJob(e) => self.detect_bits_job(e),
             Event::FileRename(e) => self.detect_file_rename(&event, e),
             Event::FileSetTime(e) => {
-                self.record_rule_alerts(&event, rules::evaluate_file_set_time(e));
+                // Bound first: `record_rule_alerts` takes the lock again.
+                let alerts = self.rule_state.lock().unwrap().on_file_set_time(e);
+                self.record_rule_alerts(&event, alerts);
             }
             Event::RawVolumeOpen(e) => {
                 self.record_rule_alerts(&event, rules::evaluate_raw_volume_open(e));
@@ -5330,12 +5350,23 @@ rule reload_content_test_marker {
     /// A download-provenance mark on `image`, then `image` run inside the
     /// window, then the enrichment worker drained (#441).
     fn mark_then_run(sink: &DetectionSink, image: &str) {
+        // What the Windows sensor records at exec (#688): the file the image started from.
+        mark_then_run_as(
+            sink,
+            image,
+            enrich::path_identity(std::path::Path::new(image)),
+        );
+    }
+
+    /// [`mark_then_run`] with the identity the sensor recorded given explicitly.
+    fn mark_then_run_as(sink: &DetectionSink, image: &str, ran: Option<String>) {
         sink.on_event(Event::FileQuarantine(schema::FileQuarantineEvent {
             path: image.into(),
             ..schema::fixtures::file_quarantine()
         }));
         sink.on_event(Event::Exec(schema::ExecEvent {
             image_path: image.into(),
+            image_file_id: ran,
             ..schema::fixtures::exec()
         }));
         assert!(
@@ -5851,6 +5882,46 @@ rule reload_content_test_marker {
         mark_then_run(&sink, image);
         let alerts = alerts_in(&dir);
         assert!(!alerts.contains("T1204.002"), "{alerts}");
+    }
+
+    /// #688: the identity the ETW sensor records and the one enrichment reads are the same
+    /// token for the same file; the gate compares them as strings, so a format drift between
+    /// the two crates (they share no code) would silently turn every gated alert on.
+    #[cfg(windows)]
+    #[test]
+    fn the_sensor_and_enrichment_agree_on_a_files_identity() {
+        let exe = std::env::current_exe().unwrap();
+        let sensor = sensor_windows::image_file_id(&exe);
+        assert!(sensor.is_some(), "an ordinary file has an identity");
+        assert_eq!(sensor, enrich::path_identity(&exe));
+    }
+
+    /// #688: the image that ran was moved aside and a signed file took its path before the
+    /// worker opened it. The verdict is `Valid`, for a file that is not the image that ran.
+    #[cfg(windows)]
+    #[test]
+    fn a_valid_signature_of_a_file_that_is_not_the_image_that_ran_still_alerts() {
+        let image = r"C:\Windows\System32\notepad.exe";
+        if !std::path::Path::new(image).exists() {
+            eprintln!("skipping: {image} not present on this host");
+            return;
+        }
+        let dir = tmp("gate-swapped");
+        let decoy_run = dir.join("dropper.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &decoy_run).unwrap();
+        let sink = sink_in(&dir);
+        // The sensor saw the dropper start; the path now holds notepad.exe.
+        let ran = enrich::path_identity(&decoy_run);
+        assert!(ran.is_some());
+        mark_then_run_as(&sink, image, ran);
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("T1204.002"), "{alerts}");
+        assert!(
+            alerts.contains("file differs from the image that ran"),
+            "{alerts}"
+        );
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// #655 review: a signed file runs once (its `Valid` verdict cached), then an
