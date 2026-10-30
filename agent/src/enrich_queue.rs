@@ -428,11 +428,19 @@ mod tests {
         let gate = Arc::new(Mutex::new(()));
         let held = gate.lock().unwrap();
         let gate_worker = gate.clone();
+        let (inside_tx, inside_rx) = mpsc::channel::<()>();
         let queue = EnrichQueue::start(Enricher::new(), move |_, _| {
+            let _ = inside_tx.send(());
             let _wait = gate_worker.lock().unwrap();
         });
-        for _ in 0..=QUEUE_CAP {
-            let _ = queue.enqueue(exec("/nonexistent/x"), None);
+        // Park the worker on its first item before filling, so the in-flight item is
+        // fixed: otherwise it can take one late and free a slot the gated alert fills.
+        assert!(queue.enqueue(exec("/nonexistent/x"), None).is_none());
+        inside_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the worker must pick up the first event");
+        for _ in 0..QUEUE_CAP {
+            assert!(queue.enqueue(exec("/nonexistent/x"), None).is_none());
         }
         let back = queue.enqueue(exec("/nonexistent/x"), Some(gated_alert()));
         let (_, gated) = back.expect("a full queue must hand the gated alert back");
