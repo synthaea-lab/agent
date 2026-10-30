@@ -199,6 +199,8 @@ impl From<DiagMsg> for SocketSnapshotEntry {
 }
 
 impl SocketSnapshotEntry {
+    /// An entry from one `sock_diag` dump message; `protocol` is the `IPPROTO_*` that
+    /// dump was for, since the message itself does not carry it.
     #[must_use]
     pub fn from_diag(msg: DiagMsg, protocol: u8) -> Self {
         Self {
@@ -375,39 +377,68 @@ mod tests {
         assert_eq!(SocketState::from(2), SocketState::Other(2));
     }
 
+    /// TCP and UDP bound on one address and port, so each path is checked against the
+    /// other's socket rather than against a port number another process may share
+    /// (#1057 fixed the same flake in the Windows collector). Retries when the UDP bind
+    /// finds the number taken.
+    fn tcp_and_udp_on_one_port() -> (
+        std::net::TcpListener,
+        std::net::UdpSocket,
+        std::net::SocketAddr,
+    ) {
+        for _ in 0..16 {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral listener");
+            let addr = listener.local_addr().expect("local addr");
+            if let Ok(socket) = std::net::UdpSocket::bind(addr) {
+                return (listener, socket, addr);
+            }
+        }
+        panic!("no 127.0.0.1 port free for both TCP and UDP after 16 tries");
+    }
+
+    /// The protocols of this process's listen-port events at `addr`.
+    fn protocols_at(events: &[schema::Event], addr: std::net::SocketAddr) -> Vec<u8> {
+        let me = std::process::id();
+        events
+            .iter()
+            .filter_map(|event| match event {
+                schema::Event::ListenPort(l)
+                    if l.local_addr == addr.ip()
+                        && l.local_port == addr.port()
+                        && l.meta.pid == me =>
+                {
+                    Some(l.protocol)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn a_bound_udp_socket_is_seen_as_a_udp_listener_owned_by_this_process() {
-        // The `ncat -u -l` done-when item, with this test process as the listener.
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a UDP socket");
-        let port = socket.local_addr().expect("local addr").port();
+        // The `ncat -u -l` done-when item, with this test process as the listener, and a
+        // TCP listener on the same address and port that only the TCP path may report.
+        let (_listener, _socket, addr) = tcp_and_udp_on_one_port();
         let me = std::process::id();
 
         let entries = snapshot_udp().expect("unprivileged UDP snapshot must succeed");
-        let ours = entries
-            .iter()
-            .find(|e| e.local.port() == port)
-            .expect("the bound UDP socket must appear in the snapshot");
-        assert_eq!(ours.protocol, IPPROTO_UDP);
-        assert_eq!(ours.state, SocketState::Unconnected);
+        let ours: Vec<_> = entries.iter().filter(|e| e.local == addr).collect();
+        assert_eq!(ours.len(), 1, "one UDP entry at {addr}: {ours:?}");
+        assert_eq!(ours[0].protocol, IPPROTO_UDP);
+        assert_eq!(ours[0].state, SocketState::Unconnected);
         assert!(
-            ours.pids.contains(&me),
+            ours[0].pids.contains(&me),
             "pids {:?} must include {me}",
-            ours.pids
+            ours[0].pids
         );
 
-        let events = listen_port_events_udp(42).expect("must succeed, same as snapshot_udp()");
-        let found = events.iter().any(|event| {
-            matches!(event, schema::Event::ListenPort(l)
-                if l.local_port == port && l.protocol == IPPROTO_UDP && l.meta.pid == me)
-        });
-        assert!(found, "no UDP ListenPort event for port {port}");
-
-        // The TCP path must not see it: that is the whole reason for the protocol field.
-        let tcp_events = listen_port_events(42).expect("TCP events");
-        assert!(!tcp_events.iter().any(|event| {
-            matches!(event, schema::Event::ListenPort(l) if l.local_port == port)
-        }));
-        drop(socket);
+        let udp = listen_port_events_udp(42).expect("must succeed, same as snapshot_udp()");
+        assert_eq!(protocols_at(&udp, addr), [IPPROTO_UDP]);
+        // The TCP path sees the TCP listener there and never the UDP socket: that is the
+        // whole reason for the protocol field.
+        let tcp = listen_port_events(42).expect("TCP events");
+        assert_eq!(protocols_at(&tcp, addr), [IPPROTO_TCP]);
     }
 
     #[test]
