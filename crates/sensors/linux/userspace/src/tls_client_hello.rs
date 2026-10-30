@@ -91,8 +91,8 @@ pub(crate) fn parse(payload: &[u8]) -> Option<ClientHello> {
     }
 
     Some(ClientHello {
-        sni: sni(&extensions),
-        ja4: ja4(legacy_version, &ciphers, &extensions),
+        sni: sni(&extensions)?,
+        ja4: ja4(legacy_version, &ciphers, &extensions)?,
     })
 }
 
@@ -103,22 +103,27 @@ fn find<'a>(extensions: &Extensions<'a>, kind: u16) -> Option<&'a [u8]> {
     extensions.iter().find(|(k, _)| *k == kind).map(|(_, v)| *v)
 }
 
-fn sni(extensions: &Extensions<'_>) -> Option<String> {
-    let mut reader = Reader::new(find(extensions, EXT_SERVER_NAME)?);
-    let list_len = usize::from(reader.u16()?);
-    let mut list = Reader::new(reader.take(list_len)?);
+/// `None` when the `server_name` extension is malformed. `Some(None)` when it is absent, has no
+/// host name, or its name is not UTF-8. The whole list is walked either way, so a malformed
+/// entry after the host name is still caught.
+fn sni(extensions: &Extensions<'_>) -> Option<Option<String>> {
+    let Some(data) = find(extensions, EXT_SERVER_NAME) else {
+        return Some(None);
+    };
+    let mut list = Reader::new(u16_vector(data)?);
+    let mut host = None;
     while !list.is_empty() {
         let name_type = list.u8()?;
         let len = usize::from(list.u16()?);
         let name = list.take(len)?;
-        if name_type == 0 {
-            return String::from_utf8(name.to_vec()).ok();
+        if name_type == 0 && host.is_none() {
+            host = Some(name);
         }
     }
-    None
+    Some(host.and_then(|name| String::from_utf8(name.to_vec()).ok()))
 }
 
-fn ja4(legacy_version: u16, ciphers: &[u16], extensions: &Extensions<'_>) -> String {
+fn ja4(legacy_version: u16, ciphers: &[u16], extensions: &Extensions<'_>) -> Option<String> {
     let ciphers: Vec<u16> = ciphers.iter().copied().filter(|c| !is_grease(*c)).collect();
     let kinds: Vec<u16> = extensions
         .iter()
@@ -126,13 +131,13 @@ fn ja4(legacy_version: u16, ciphers: &[u16], extensions: &Extensions<'_>) -> Str
         .filter(|kind| !is_grease(*kind))
         .collect();
 
-    let version = version(legacy_version, find(extensions, EXT_SUPPORTED_VERSIONS));
+    let version = version(legacy_version, find(extensions, EXT_SUPPORTED_VERSIONS))?;
     let sni = if find(extensions, EXT_SERVER_NAME).is_some() {
         'd'
     } else {
         'i'
     };
-    let alpn = alpn(find(extensions, EXT_ALPN));
+    let alpn = alpn(find(extensions, EXT_ALPN))?;
 
     let mut sorted_ciphers = ciphers.clone();
     sorted_ciphers.sort_unstable();
@@ -152,36 +157,32 @@ fn ja4(legacy_version: u16, ciphers: &[u16], extensions: &Extensions<'_>) -> Str
         if let Some(data) = find(extensions, EXT_SIGNATURE_ALGORITHMS) {
             // Kept in the order sent: the order of the algorithms is part of the fingerprint.
             hashed.push('_');
-            hashed.push_str(&hex_list(&signature_algorithms(data)));
+            hashed.push_str(&hex_list(&signature_algorithms(data)?));
         }
         hash12(&hashed)
     };
 
-    format!(
+    Some(format!(
         "t{version}{sni}{:02}{:02}{alpn}_{cipher_hash}_{extension_hash}",
         ciphers.len().min(COUNT_CAP),
         kinds.len().min(COUNT_CAP),
-    )
+    ))
 }
 
 /// Two characters: the highest version the client offers in `supported_versions`, else the
-/// version field of the hello.
+/// version field of the hello. `None` when `supported_versions` is malformed.
 ///
 /// A `supported_versions` with nothing but GREASE in it (the spec does not say) falls back to
 /// the hello's own field rather than to an invented value.
-fn version(legacy_version: u16, supported_versions: Option<&[u8]>) -> &'static str {
-    let highest = supported_versions.and_then(|data| {
-        let (len, versions) = data.split_first()?;
-        let versions = versions.get(..usize::from(*len))?;
-        versions
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|v| u16::from_be_bytes(*v))
+fn version(legacy_version: u16, supported_versions: Option<&[u8]>) -> Option<&'static str> {
+    let highest = match supported_versions {
+        Some(data) => u16_values(u8_vector(data)?)?
+            .into_iter()
             .filter(|v| !is_grease(*v))
-            .max()
-    });
-    match highest.unwrap_or(legacy_version) {
+            .max(),
+        None => None,
+    };
+    Some(match highest.unwrap_or(legacy_version) {
         0x0304 => "13",
         0x0303 => "12",
         0x0302 => "11",
@@ -192,22 +193,26 @@ fn version(legacy_version: u16, supported_versions: Option<&[u8]>) -> &'static s
         0xfefd => "d2",
         0xfefc => "d3",
         _ => "00",
-    }
+    })
 }
 
-/// The first and last character of the first ALPN protocol, `00` when there is none.
-fn alpn(data: Option<&[u8]>) -> String {
-    let first = data.and_then(|data| {
-        let mut reader = Reader::new(data);
-        let list_len = usize::from(reader.u16()?);
-        let mut list = Reader::new(reader.take(list_len)?);
+/// The first and last character of the first ALPN protocol, `00` when there is none. `None`
+/// when the extension is malformed; the whole list is walked, not only its first entry.
+fn alpn(data: Option<&[u8]>) -> Option<String> {
+    let Some(data) = data else {
+        return Some("00".to_string());
+    };
+    let mut list = Reader::new(u16_vector(data)?);
+    let mut first = None;
+    while !list.is_empty() {
         let len = usize::from(list.u8()?);
-        list.take(len)
-    });
-    match first {
+        let protocol = list.take(len)?;
+        first.get_or_insert(protocol);
+    }
+    Some(match first {
         Some(protocol) if !protocol.is_empty() => alpn_chars(protocol).iter().collect(),
         _ => "00".to_string(),
-    }
+    })
 }
 
 /// `protocol` is not empty. Its first and last bytes when both are ASCII letters or digits;
@@ -226,19 +231,36 @@ fn alpn_chars(protocol: &[u8]) -> [char; 2] {
     [first, chars.next_back().unwrap_or(first)]
 }
 
-fn signature_algorithms(data: &[u8]) -> Vec<u16> {
-    let Some((len, rest)) = data.split_first_chunk::<2>() else {
-        return Vec::new();
-    };
-    let len = usize::from(u16::from_be_bytes(*len));
-    rest.get(..len)
-        .unwrap_or_default()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|v| u16::from_be_bytes(*v))
-        .filter(|v| !is_grease(*v))
-        .collect()
+/// The algorithms in the order sent, GREASE dropped. `None` unless the length prefix covers
+/// the extension exactly and holds whole two-byte values.
+fn signature_algorithms(data: &[u8]) -> Option<Vec<u16>> {
+    Some(
+        u16_values(u16_vector(data)?)?
+            .into_iter()
+            .filter(|v| !is_grease(*v))
+            .collect(),
+    )
+}
+
+/// The contents of a vector with a two-byte length prefix, when the prefix covers `data`
+/// exactly: one that falls short leaves bytes nobody accounts for, one that overshoots lies
+/// about what follows. Either way the extension is malformed, and is not read for a prefix.
+fn u16_vector(data: &[u8]) -> Option<&[u8]> {
+    let (len, rest) = data.split_first_chunk::<2>()?;
+    (usize::from(u16::from_be_bytes(*len)) == rest.len()).then_some(rest)
+}
+
+/// [`u16_vector`] with a one-byte length prefix.
+fn u8_vector(data: &[u8]) -> Option<&[u8]> {
+    let (len, rest) = data.split_first()?;
+    (usize::from(*len) == rest.len()).then_some(rest)
+}
+
+/// The big-endian `u16`s that fill `bytes`, or `None` when a byte is left over.
+fn u16_values(bytes: &[u8]) -> Option<Vec<u16>> {
+    let (values, rest) = bytes.as_chunks::<2>();
+    rest.is_empty()
+        .then(|| values.iter().map(|v| u16::from_be_bytes(*v)).collect())
 }
 
 /// RFC 8701 GREASE values: `0x0a0a`, `0x1a1a`, ... `0xfafa`.
@@ -371,6 +393,15 @@ mod tests {
         sigalgs: &[u16],
         alpn: &[&[u8]],
     ) -> Vec<u8> {
+        let extensions: Vec<(u16, Vec<u8>)> = extensions
+            .iter()
+            .map(|&kind| (kind, extension_data(kind, sigalgs, alpn)))
+            .collect();
+        client_hello_raw(version, ciphers, &extensions)
+    }
+
+    /// A hello whose extensions carry exactly the payloads given, well formed or not.
+    fn client_hello_raw(version: u16, ciphers: &[u16], extensions: &[(u16, Vec<u8>)]) -> Vec<u8> {
         let mut body = version.to_be_bytes().to_vec();
         body.extend([0x42; 32]); // random
         body.push(32); // session id
@@ -379,8 +410,7 @@ mod tests {
         body.extend(u16s(ciphers));
         body.extend([1, 0]); // compression: null
         let mut ext = Vec::new();
-        for &kind in extensions {
-            let data = extension_data(kind, sigalgs, alpn);
+        for (kind, data) in extensions {
             ext.extend(kind.to_be_bytes());
             ext.extend((data.len() as u16).to_be_bytes());
             ext.extend(data);
@@ -524,9 +554,9 @@ mod tests {
         let hello = client_hello(0x0303, &[0x002f], &[EXT_SUPPORTED_VERSIONS], &[], &[]);
         assert!(parse(&hello).expect("parsed").ja4.starts_with("t13i"));
         // Only GREASE offered: fall back to the field.
-        assert_eq!(version(0x0303, Some(&[2, 0x0a, 0x0a])), "12");
-        assert_eq!(version(0x0301, None), "10");
-        assert_eq!(version(0x7a7a, None), "00");
+        assert_eq!(version(0x0303, Some(&[2, 0x0a, 0x0a])), Some("12"));
+        assert_eq!(version(0x0301, None), Some("10"));
+        assert_eq!(version(0x7a7a, None), Some("00"));
     }
 
     #[test]
@@ -544,9 +574,9 @@ mod tests {
 
     #[test]
     fn an_absent_or_empty_alpn_is_00() {
-        assert_eq!(alpn(None), "00");
-        assert_eq!(alpn(Some(&[0, 0])), "00"); // an empty protocol list
-        assert_eq!(alpn(Some(&[0, 1, 0])), "00"); // a first protocol of length 0
+        assert_eq!(alpn(None).as_deref(), Some("00"));
+        assert_eq!(alpn(Some(&[0, 0])).as_deref(), Some("00")); // an empty protocol list
+        assert_eq!(alpn(Some(&[0, 1, 0])).as_deref(), Some("00")); // a first protocol of length 0
     }
 
     #[test]
@@ -612,6 +642,86 @@ mod tests {
         let mut bytes = example();
         bytes[5 + 4 + 2 + 32 + 1 + 32] = 0xff; // cipher_suites length, high byte
         assert_eq!(parse(&bytes), None);
+    }
+
+    /// A hello with one extension whose payload is `data`, byte for byte.
+    fn with_extension(kind: u16, data: &[u8]) -> Vec<u8> {
+        client_hello_raw(0x0303, &[0x002f], &[(kind, data.to_vec())])
+    }
+
+    fn assert_rejects(kind: u16, well_formed: &[u8], malformed: &[&[u8]]) {
+        assert!(
+            parse(&with_extension(kind, well_formed)).is_some(),
+            "the well-formed payload must parse"
+        );
+        for data in malformed {
+            assert_eq!(
+                parse(&with_extension(kind, data)),
+                None,
+                "{kind:#06x} payload {data:02x?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_supported_versions_is_not_fingerprinted() {
+        assert_rejects(
+            EXT_SUPPORTED_VERSIONS,
+            &[2, 0x03, 0x04],
+            &[
+                &[3, 0x03, 0x04, 0x03], // odd: the last byte would be dropped
+                &[2, 0x03, 0x04, 0xff], // a byte after the declared vector
+                &[4, 0x03, 0x04],       // declares more than is there
+                &[0, 0x03, 0x04],       // declares less than is there
+                &[],                    // no length at all
+            ],
+        );
+    }
+
+    #[test]
+    fn a_malformed_signature_algorithms_is_not_fingerprinted() {
+        assert_rejects(
+            EXT_SIGNATURE_ALGORITHMS,
+            &[0, 2, 0x04, 0x03],
+            &[
+                &[0, 8, 0x04, 0x03],       // oversized: declares more than is there
+                &[0, 3, 0x04, 0x03, 0x05], // odd length
+                &[0, 2, 0x04, 0x03, 0x05], // a byte after the declared vector
+                &[0, 1, 0x04, 0x03],       // declares less than is there
+                &[0],                      // half a length
+            ],
+        );
+    }
+
+    #[test]
+    fn a_malformed_alpn_is_not_fingerprinted() {
+        assert_rejects(
+            EXT_ALPN,
+            &[0, 3, 2, b'h', b'2'],
+            &[
+                &[0, 9, 2, b'h', b'2'],          // list longer than the extension
+                &[0, 3, 2, b'h', b'2', 0xff],    // a byte after the list
+                &[0, 3, 5, b'h', b'2'],          // an entry that overruns the list
+                &[0, 5, 2, b'h', b'2', 3, b'x'], // a second entry that overruns
+                &[0],                            // half a length
+            ],
+        );
+    }
+
+    #[test]
+    fn a_malformed_server_name_is_not_fingerprinted() {
+        let mut well_formed = vec![0, 14, 0, 0, 11];
+        well_formed.extend(b"example.com");
+        assert_rejects(
+            EXT_SERVER_NAME,
+            &well_formed,
+            &[
+                &[0, 99, 0, 0, 1, b'a'],      // list longer than the extension
+                &[0, 4, 0, 0, 1, b'a', 0xff], // a byte after the list
+                &[0, 4, 0, 0, 9, b'a'],       // a name that overruns the list
+                &[0, 6, 0, 0, 1, b'a', 0, 0], // a second entry cut short
+            ],
+        );
     }
 
     #[test]
