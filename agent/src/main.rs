@@ -450,6 +450,7 @@ fn try_main() -> anyhow::Result<std::process::ExitCode> {
                 ipc_endpoint: &cfg.ipc.endpoint,
                 log_sources: &cfg.logs.sources,
                 deception: &cfg.deception,
+                detection: &cfg.detection,
                 content_dir: &content_dir,
                 config_path: &config_path,
             })

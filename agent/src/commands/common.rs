@@ -65,6 +65,26 @@ pub(crate) fn plant_canaries(
     }
 }
 
+/// Hands the rules the host facts the operator declared in `[detection]` (#376). The one today
+/// is the UTC offset that turns ODD-HOUR-LOGON on; an offset no timezone has is logged and the
+/// rule stays off rather than guessing.
+pub(crate) fn apply_detection(sink: &DetectionSink, detection: &config::DetectionConfig) {
+    let Some(minutes) = detection.utc_offset_minutes else {
+        return;
+    };
+    if sink.set_local_utc_offset_minutes(minutes) {
+        tracing::info!(
+            minutes,
+            "detection: host local time set, odd-hour logon rule on"
+        );
+    } else {
+        tracing::warn!(
+            minutes,
+            "detection: utc_offset_minutes is outside -720..=840, odd-hour logon rule stays off"
+        );
+    }
+}
+
 /// Builds the shared pipeline: optional transport (spool + upload thread),
 /// the detection sink (spooling into it when transport is on), the operator
 /// banner, the progress-backed liveness heartbeat (#102), and the local IPC

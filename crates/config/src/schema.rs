@@ -62,6 +62,24 @@ pub struct AgentConfig {
     /// `[deception]` table plants nothing, never a default location.
     #[serde(default)]
     pub deception: DeceptionConfig,
+    /// Facts about the host the detection rules cannot read from its events. Optional: an
+    /// absent `[detection]` table turns the rules that need them off.
+    #[serde(default)]
+    pub detection: DetectionConfig,
+}
+
+/// The `[detection]` table (#376): what the operator knows about this host that no event
+/// carries.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetectionConfig {
+    /// The host's local time as minutes east of UTC (`120` for UTC+2, `-300` for UTC-5),
+    /// between -720 and 840. Events carry UTC only, so the ODD-HOUR-LOGON rule (T1078) has no
+    /// notion of "outside working hours" without it and stays off. Fixed: it does not follow
+    /// daylight saving, so set the offset the host is on for most of the year, or change it
+    /// when the clocks do. Absent by default.
+    #[serde(default)]
+    pub utc_offset_minutes: Option<i32>,
 }
 
 /// Most directories one agent plants canaries in. Each directory gets one canary per

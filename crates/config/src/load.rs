@@ -289,6 +289,19 @@ fn validate_semantics(cfg: &AgentConfig, source_path: &Path) -> Result<(), Confi
         }
     }
 
+    // detection.utc_offset_minutes — a typo (`2` for `120`, seconds for minutes) would put every
+    // logon in the wrong hour, so it fails at boot instead of quietly mis-timing the rule.
+    if let Some(minutes) = cfg.detection.utc_offset_minutes
+        && !(-720..=840).contains(&minutes)
+    {
+        return Err(ConfigError::Invalid {
+            field: "detection.utc_offset_minutes".into(),
+            expected: "minutes east of UTC, between -720 and 840".into(),
+            value: minutes.to_string(),
+            origin: src.clone(),
+        });
+    }
+
     // deception.canary_dirs — each one gets files written into it by the agent, so a
     // typo must fail at boot rather than plant under a relative path of the cwd.
     if cfg.deception.canary_dirs.len() > crate::schema::MAX_CANARY_DIRS {
@@ -931,6 +944,37 @@ control_plane_url = "https://cp.example"
         match load_with_logs(&many).unwrap_err() {
             ConfigError::Invalid { field, .. } => assert_eq!(field, "logs.sources"),
             other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_detection_table_leaves_the_utc_offset_unset() {
+        assert_eq!(
+            load_with_logs("").unwrap().detection.utc_offset_minutes,
+            None
+        );
+    }
+
+    #[test]
+    fn a_declared_utc_offset_is_loaded() {
+        for (minutes, text) in [(120, "120"), (-300, "-300"), (840, "840"), (-720, "-720")] {
+            let cfg =
+                load_with_logs(&format!("[detection]\nutc_offset_minutes = {text}\n")).unwrap();
+            assert_eq!(cfg.detection.utc_offset_minutes, Some(minutes));
+        }
+    }
+
+    #[test]
+    fn a_utc_offset_no_timezone_has_is_rejected() {
+        for text in ["841", "-721", "7200"] {
+            match load_with_logs(&format!("[detection]\nutc_offset_minutes = {text}\n"))
+                .unwrap_err()
+            {
+                ConfigError::Invalid { field, .. } => {
+                    assert_eq!(field, "detection.utc_offset_minutes");
+                }
+                other => panic!("expected Invalid, got {other:?}"),
+            }
         }
     }
 

@@ -1005,6 +1005,14 @@ impl DetectionSink {
         let _ = self.tripwires.set(tripwires);
     }
 
+    /// Tells the rules the host's UTC offset in minutes (#376); false when it is not a real one.
+    pub(crate) fn set_local_utc_offset_minutes(&self, minutes: i32) -> bool {
+        self.rule_state
+            .lock()
+            .unwrap()
+            .set_local_utc_offset_minutes(minutes)
+    }
+
     /// Installs the executables allowed to touch a canary (#81). Called once, with the
     /// tripwires.
     pub(crate) fn set_canary_allow(&self, allow: crate::deception::CanaryAllow) {
