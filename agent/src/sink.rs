@@ -2372,7 +2372,9 @@ impl EventSink for DetectionSink {
             Event::BitsJob(e) => self.detect_bits_job(e),
             Event::FileRename(e) => self.detect_file_rename(&event, e),
             Event::FileSetTime(e) => {
-                self.record_rule_alerts(&event, rules::evaluate_file_set_time(e));
+                // Bound first: `record_rule_alerts` takes the lock again.
+                let alerts = self.rule_state.lock().unwrap().on_file_set_time(e);
+                self.record_rule_alerts(&event, alerts);
             }
             Event::RawVolumeOpen(e) => {
                 self.record_rule_alerts(&event, rules::evaluate_raw_volume_open(e));

@@ -606,6 +606,14 @@ pub(crate) fn check_alternate_data_stream_write(event: &FileOpenEvent) -> Option
 /// volume measurement (a copy/extraction of a few thousand files) or a per-pid/parent-directory
 /// aggregation the driver's wire format does not yet carry — tracked as a follow-up, not solved
 /// here by guessing a threshold.
+///
+/// Linux (#1036): the BPF-LSM `inode_setattr` hook does know the process, so `comm` is printed.
+/// The package managers (`rpm`/`dpkg`/`pacman` and their frontends set the archive's stored mtime
+/// on every file they unpack) are skipped by `RuleState::on_file_set_time`, not here: the skip
+/// needs the exec-time image, because `comm` alone is attacker-controlled. Everything else stays
+/// Low for the reason above (`touch -d`, `cp -p`, `tar x`, `rsync -t` are ordinary too). Telling a build tool's
+/// `touch` from a targeted stomp needs the parent or a per-process count, which the event does
+/// not carry: not guessed here.
 #[must_use]
 pub fn evaluate_file_set_time(event: &FileSetTimeEvent) -> Vec<Alert> {
     let requested = [
@@ -621,15 +629,48 @@ pub fn evaluate_file_set_time(event: &FileSetTimeEvent) -> Vec<Alert> {
     {
         return Vec::new();
     }
+    let unix = matches!(event.meta.user, User::Unix { .. });
+    let message = if unix {
+        format!(
+            "pid={} comm={}: explicit timestamp change requested for {}",
+            event.meta.pid, event.meta.comm, event.path,
+        )
+    } else {
+        format!(
+            "pid={}: explicit timestamp change requested for {}",
+            event.meta.pid, event.path,
+        )
+    };
     vec![Alert {
         technique: "T1070.006",
         severity: Severity::Low,
-        message: format!(
-            "pid={}: explicit timestamp change requested for {}",
-            event.meta.pid, event.path,
-        ),
+        message,
     }]
 }
+
+/// Whether `comm` names a Linux package manager or back end: they stamp every unpacked file with
+/// the archive's mtime. Only a name: the caller must also check what the process runs.
+#[must_use]
+pub(crate) fn is_package_manager_comm(comm: &str) -> bool {
+    PACKAGE_MANAGERS.contains(&comm)
+}
+
+/// Exact `comm` values (15 bytes at most: `unattended-upgr` is the kernel's own truncation of
+/// `unattended-upgrade`, a script run by an interpreter, so it never passes the image check and
+/// alerts at Low).
+const PACKAGE_MANAGERS: &[&str] = &[
+    "rpm",
+    "dpkg",
+    "apt",
+    "apt-get",
+    "dnf",
+    "yum",
+    "zypper",
+    "pacman",
+    "apk",
+    "snapd",
+    "unattended-upgr",
+];
 
 /// T1006 — Direct Volume Access: mounted logical-volume open. This is requested
 /// access, not proof of granted rights or subsequent raw I/O; the event carries no trusted image.

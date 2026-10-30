@@ -302,6 +302,9 @@ pub struct RuleState {
     recent_motw_removals: BoundedMap<String, MotwRemoval>,
     /// (ppid, comm) → sliding counter for SELF-SPAWN (T1059 Windows). LRU-bounded.
     self_spawn: BoundedMap<(u32, String), SlidingCounter>,
+    /// Linux timestomp alerts already raised, per process incarnation `(pid, generation)`
+    /// (#1036): one alert per window per process, see [`Self::on_file_set_time`].
+    set_time_alerted: BoundedMap<(u32, u64), SetTimeWindow>,
     /// (comm, daddr, dport) → sliding counter for BEACON (T1071 Windows). LRU-bounded.
     beacon: BoundedMap<(String, String, u16), SlidingCounter>,
     /// Same key as `beacon` → which local ports have already counted toward it —
@@ -533,6 +536,30 @@ struct PendingProcFdExec {
     timestamp_ns: u64,
 }
 
+/// One process incarnation's timestomp alert state (#1036): when it last alerted and how many
+/// requests the window has swallowed since, so the next alert can say how many there were.
+#[derive(Default)]
+struct SetTimeWindow {
+    last_alert_ns: Option<u64>,
+    folded: u32,
+}
+
+impl SetTimeWindow {
+    /// `Some(requests folded since the last alert)` when this request alerts, `None` when it is
+    /// folded into the alert of the window it falls in.
+    fn admit(&mut self, ts: u64, window_ns: u64) -> Option<u32> {
+        if self
+            .last_alert_ns
+            .is_some_and(|t| ts.saturating_sub(t) <= window_ns)
+        {
+            self.folded = self.folded.saturating_add(1);
+            return None;
+        }
+        self.last_alert_ns = Some(ts);
+        Some(std::mem::take(&mut self.folded))
+    }
+}
+
 /// Memfd creations remembered per pid (see `RuleState::recent_memfd_creates`). A real
 /// fileless-exec process creates one or two; a process making more than this inside
 /// the correlation window is not something a longer list would catch better.
@@ -542,6 +569,8 @@ const PID_COMM_CAP: usize = 65_536;
 /// Counter/write-history bounds — one logical entity per key, far fewer than pids.
 pub(crate) const COUNTER_CAP: usize = 16_384;
 const RECENT_WRITES_CAP: usize = 4_096;
+/// One Linux timestomp alert per process incarnation per this window (#1036).
+const SET_TIME_ALERT_WINDOW_NS: u64 = 60_000_000_000;
 
 impl Default for RuleState {
     fn default() -> Self {
@@ -564,6 +593,7 @@ impl RuleState {
             recent_bits_downloads: BoundedMap::new(RECENT_WRITES_CAP),
             recent_motw_removals: BoundedMap::new(RECENT_WRITES_CAP),
             self_spawn: BoundedMap::new(COUNTER_CAP),
+            set_time_alerted: BoundedMap::new(COUNTER_CAP),
             ldap_burst: crate::ldap::LdapBurst::new(),
             beacon: BoundedMap::new(COUNTER_CAP),
             beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
@@ -3153,6 +3183,48 @@ impl RuleState {
         self.record_touched(event.meta.pid, Event::FileRename(event.clone()));
         let mut alerts: Vec<Alert> = self.check_mass_rename_pattern(event).into_iter().collect();
         alerts.extend(self.check_burst_write_volume(event));
+        alerts
+    }
+
+    /// T1070.006, from `FileSetTimeEvent`s ([`crate::evaluate_file_set_time`]), deduplicated per
+    /// process on Linux (#1036): the `inode_setattr` hook reports every explicit time, and
+    /// `tar x`, `cp -a`, `rsync -a` and `cpio` set one per file, so a 3000-file unpack raised
+    /// about 1000 Low alerts in the lab (the rest were lost to the ring buffer). One alert per
+    /// process incarnation per [`SET_TIME_ALERT_WINDOW_NS`] says the same thing; every `touch -d`
+    /// of a stomping script is its own process and still alerts. Windows events carry no
+    /// trustworthy process (the minifilter's `comm` is empty), so they pass through as before.
+    pub fn on_file_set_time(&mut self, event: &schema::FileSetTimeEvent) -> Vec<Alert> {
+        let mut alerts = crate::evaluate_file_set_time(event);
+        if alerts.is_empty() || !matches!(event.meta.user, schema::User::Unix { .. }) {
+            return alerts;
+        }
+        // A package manager unpacking an archive stamps every file with its stored mtime. The
+        // skip is keyed on the exec-time image, not on `comm` alone: `comm` is the basename of
+        // whatever was exec'd and any process can rewrite it (`prctl(PR_SET_NAME)`), so a copy of
+        // `touch` named `/tmp/rpm`, or `python3` renamed to `rpm`, would otherwise stomp silently
+        // (#1045 review). Fails closed: a package manager whose exec the sensor missed (started
+        // before the agent) alerts at Low until it exits.
+        if crate::stateless::is_package_manager_comm(&event.meta.comm)
+            && self.runs_trusted_binary_named(&event.meta)
+        {
+            return Vec::new();
+        }
+        let key = (event.meta.pid, event.meta.process_generation.unwrap_or(0));
+        let window = self
+            .set_time_alerted
+            .get_or_insert_with(key, SetTimeWindow::default);
+        match window.admit(event.meta.timestamp_ns, SET_TIME_ALERT_WINDOW_NS) {
+            None => alerts.clear(),
+            Some(folded) if folded > 0 => {
+                // The one alert per window hides how many requests there were: say so.
+                for alert in &mut alerts {
+                    alert.message.push_str(&format!(
+                        " ({folded} more request(s) from this process since its last alert were not reported)"
+                    ));
+                }
+            }
+            Some(_) => {}
+        }
         alerts
     }
 

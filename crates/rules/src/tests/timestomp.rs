@@ -1,4 +1,4 @@
-//! T1070.006 — explicit Windows file timestamp requests.
+//! T1070.006 — explicit file timestamp requests (Windows minifilter, Linux `inode_setattr`).
 
 use schema::{EventMeta, FileSetTimeEvent, User, detection::Severity};
 
@@ -59,4 +59,185 @@ fn any_explicit_timestamp_field_alerts() {
         }
         assert_eq!(evaluate_file_set_time(&event).len(), 1, "field {field}");
     }
+}
+
+/// Linux (#1036): the `inode_setattr` hook reports a Unix process with a real `comm`, and
+/// only the times the caller chose are set.
+fn linux_event(comm: &str) -> FileSetTimeEvent {
+    FileSetTimeEvent {
+        meta: EventMeta {
+            pid: 4242,
+            user: User::Unix { uid: 0, gid: 0 },
+            comm: comm.into(),
+            ..schema::fixtures::meta()
+        },
+        path: "/var/log/auth.log".into(),
+        creation_time: None,
+        last_access_time: None,
+        last_write_time: Some(129_067_776_000_000_000),
+        change_time: None,
+    }
+}
+
+#[test]
+fn linux_explicit_mtime_alerts_low_and_names_the_process() {
+    let alerts = evaluate_file_set_time(&linux_event("touch"));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1070.006");
+    assert_eq!(alerts[0].severity, Severity::Low);
+    assert!(
+        alerts[0].message.contains("comm=touch"),
+        "{}",
+        alerts[0].message
+    );
+    assert!(alerts[0].message.contains("/var/log/auth.log"));
+}
+
+/// A state that saw `pid` exec `image` (what the sensor reports at exec time), then returns the
+/// alerts for one explicit mtime set by that process under `comm`.
+fn set_time_after_exec(comm: &str, image: Option<&str>) -> Vec<crate::Alert> {
+    use crate::RuleState;
+    let mut state = RuleState::new();
+    if let Some(image) = image {
+        let mut exec = super::exec_event_full(4242, 1, comm, "", 0);
+        exec.image_path = image.to_string();
+        state.on_exec(&exec);
+    }
+    state.on_file_set_time(&linux_event(comm))
+}
+
+#[test]
+fn linux_package_managers_unpacking_files_do_not_alert() {
+    for (comm, image) in [
+        ("rpm", "/usr/bin/rpm"),
+        ("dpkg", "/usr/bin/dpkg"),
+        ("dnf", "/usr/bin/dnf"),
+        ("apt-get", "/usr/bin/apt-get"),
+        ("pacman", "/usr/bin/pacman"),
+    ] {
+        assert!(set_time_after_exec(comm, Some(image)).is_empty(), "{comm}");
+    }
+}
+
+#[test]
+fn a_renamed_binary_named_like_a_package_manager_still_alerts() {
+    // Probe 1: a copy of `touch` exec'd as /tmp/rpm has comm `rpm`, but it is not at a
+    // trusted system path.
+    assert_eq!(set_time_after_exec("rpm", Some("/tmp/rpm")).len(), 1);
+    // Probe 2: the system python3 renamed to `rpm` with prctl(PR_SET_NAME): the exec-time path
+    // is trusted, but it is not a binary named `rpm`.
+    assert_eq!(
+        set_time_after_exec("rpm", Some("/usr/bin/python3")).len(),
+        1
+    );
+}
+
+#[test]
+fn a_package_manager_comm_with_no_known_exec_fails_closed() {
+    // The sensor never saw the exec (the process predates the agent): unknown is not evidence of
+    // /usr/bin/rpm, so it alerts at Low until the process ends.
+    let alerts = set_time_after_exec("rpm", None);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].severity, Severity::Low);
+}
+
+#[test]
+fn linux_a_process_that_only_looks_like_a_package_manager_still_alerts() {
+    // Exact `comm` match, not a prefix or substring, even from a trusted path.
+    for comm in ["rpmbuild-evil", "dnf.sh", "ndpkg", ""] {
+        let image = format!("/usr/bin/{comm}");
+        assert_eq!(set_time_after_exec(comm, Some(&image)).len(), 1, "{comm:?}");
+    }
+}
+
+#[test]
+fn linux_a_request_with_no_chosen_time_does_not_alert() {
+    let mut event = linux_event("touch");
+    event.last_write_time = None;
+    assert!(evaluate_file_set_time(&event).is_empty());
+}
+
+#[test]
+fn linux_one_alert_per_process_per_window_not_one_per_file() {
+    use crate::RuleState;
+    let mut state = RuleState::new();
+    let at = |pid: u32, ts: u64, path: &str| {
+        let mut e = linux_event("tar");
+        e.meta.pid = pid;
+        e.meta.timestamp_ns = ts;
+        e.path = path.into();
+        e
+    };
+    // A 3000-file unpack by one process: a single alert, for the first file.
+    let first = state.on_file_set_time(&at(7, 1_000, "/srv/a/f0"));
+    assert_eq!(first.len(), 1);
+    for i in 1..3000u64 {
+        assert!(
+            state
+                .on_file_set_time(&at(7, 1_000 + i * 1_000_000, &format!("/srv/a/f{i}")))
+                .is_empty()
+        );
+    }
+    // Another process (a stomping script's next `touch`) alerts on its own.
+    assert_eq!(state.on_file_set_time(&at(8, 5_000, "/srv/b")).len(), 1);
+    // The same process alerts again once the window has passed.
+    assert_eq!(
+        state
+            .on_file_set_time(&at(7, 1_000 + 61_000_000_000, "/srv/late"))
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn a_recycled_pid_is_another_process_for_the_dedup() {
+    use crate::RuleState;
+    let mut state = RuleState::new();
+    let mut a = linux_event("touch");
+    a.meta.process_generation = Some(1);
+    let mut b = linux_event("touch");
+    b.meta.process_generation = Some(2);
+    assert_eq!(state.on_file_set_time(&a).len(), 1);
+    assert_eq!(
+        state.on_file_set_time(&b).len(),
+        1,
+        "same pid, other incarnation"
+    );
+}
+
+#[test]
+fn windows_set_time_events_are_not_deduplicated_per_process() {
+    use crate::RuleState;
+    let mut state = RuleState::new();
+    for _ in 0..3 {
+        assert_eq!(state.on_file_set_time(&event()).len(), 1);
+    }
+}
+
+#[test]
+fn the_alert_after_a_window_says_how_many_requests_it_folded() {
+    use crate::RuleState;
+    let mut state = RuleState::new();
+    let at = |ts: u64| {
+        let mut e = linux_event("python3");
+        e.meta.timestamp_ns = ts;
+        e
+    };
+    let first = state.on_file_set_time(&at(1_000));
+    assert_eq!(first.len(), 1);
+    assert!(
+        !first[0].message.contains("not reported"),
+        "{}",
+        first[0].message
+    );
+    for i in 1..=499u64 {
+        assert!(state.on_file_set_time(&at(1_000 + i)).is_empty());
+    }
+    let next = state.on_file_set_time(&at(1_000 + 61_000_000_000));
+    assert_eq!(next.len(), 1);
+    assert!(
+        next[0].message.contains("499 more request(s)"),
+        "{}",
+        next[0].message
+    );
 }
