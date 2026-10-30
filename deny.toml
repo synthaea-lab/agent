@@ -11,102 +11,15 @@ yanked = "deny"
 # Scoped, justified exceptions — each names its blast radius and revisit condition.
 # Nothing here expires on its own (#919): CI's `-D unknown-advisory -D
 # advisory-not-detected` (see .github/workflows/ci.yml) is what actually enforces
-# "revisit when yara-x moves off bincode" / "bump the moment yara-x's requirement
-# allows one" below — the day a dependency bump makes one of these ids stop
-# matching anything in the tree, the build fails instead of the ignore going
-# silently stale.
+# "revisit when yara-x moves off bincode" below — the day a dependency bump makes
+# one of these ids stop matching anything in the tree, the build fails instead of
+# the ignore going silently stale. That is how the eight wasmtime exceptions were
+# caught when yara-x 1.22.1 (wasmtime 48.0.7) retired them.
 ignore = [
     # bincode team ceased development; yara-x uses it only for (de)serializing OUR
     # compiled rule sets, a format we produce and consume ourselves. Revisit when
     # yara-x moves off bincode.
     "RUSTSEC-2025-0141",
-    # Both wasmtime advisories require hostile/attacker-supplied WASM or WASI use.
-    # yara-x's wasmtime executes only the module its own compiler emits from our
-    # signed rule content and exposes no WASI to rules — attacker-controlled input
-    # reaches it as scanned DATA, not as code. Bump wasmtime the moment yara-x's
-    # requirement allows a fixed release.
-    "RUSTSEC-2026-0222",
-    "RUSTSEC-2026-0269",
-    # Host DoS through the component-model `wasmtime::component::Val` API only
-    # (statically-typed hosts unaffected). Our graph never enables wasmtime's
-    # `component-model` feature, even with --all-features (checked 2026-09-29:
-    # cranelift, runtime, std only), so the vulnerable code isn't compiled.
-    # yara-x 1.20.0, the latest, still requires wasmtime ^45.0.3 and the fixes
-    # are 48.0.3/49.0.1: bump the moment yara-x's requirement allows one.
-    "RUSTSEC-2026-0316",
-    # Stack buffer overflow in the component-model async-lifted callback path. Same
-    # blast radius as 0316: our graph never enables wasmtime's `component-model` or
-    # `async` features, even with --all-features (checked 2026-10-05 with
-    # `cargo tree -e features -i wasmtime`: cranelift, once_cell, runtime, std,
-    # jit-icache-coherence, unwinder), so the vulnerable code isn't compiled.
-    # yara-x 1.21.0, the latest, still requires wasmtime ^45.0.3 and the fixes are
-    # 48.0.4/49.0.2: bump the moment yara-x's requirement allows one.
-    "RUSTSEC-2026-0327",
-    # Component-model handle tables are capped only per instance, not charged to any
-    # host-wide limit — a DoS reachable only through the component-model API. Same
-    # blast radius as 0316/0327: our graph never enables wasmtime's `component-model`
-    # feature, even with --all-features (checked 2026-10-15 with `cargo tree
-    # --all-features -e features`: cranelift, once_cell, runtime, std,
-    # jit-icache-coherence, unwinder), so the vulnerable code isn't compiled.
-    # yara-x 1.21.0, the latest, still requires wasmtime ^45.0.3 and the fixes are
-    # 36.0.18/48.0.6/49.0.3: bump the moment yara-x's requirement allows one.
-    "RUSTSEC-2026-0363",
-    # Wasmtime may not properly enforce its async-entrypoint requirement. Same blast
-    # radius as 0327/0363: our graph never enables wasmtime's `async` feature, even
-    # with --all-features (checked 2026-10-15 with `cargo tree --all-features -e
-    # features`: cranelift, once_cell, runtime, std, jit-icache-coherence, unwinder),
-    # so the vulnerable code isn't compiled.
-    # yara-x 1.21.0, the latest, still requires wasmtime ^45.0.3 and the fixes are
-    # 48.0.6/49.0.3: bump the moment yara-x's requirement allows one.
-    "RUSTSEC-2026-0362",
-    # Stack overflow when a guest module's type registry drops a long chain of types
-    # (recursion was accidentally reintroduced into what used to be an iterative drop
-    # in 45.0.3's lineage). Unlike the component-model/async entries above, this one
-    # isn't feature-gated — but the "guest" here is the module yara-x's own compiler
-    # emits from OUR rule content (`crates/yara/src/lib.rs`'s `.yar`/`.yara` files
-    # under the content dir, delivered and signed by the control plane — see
-    # RUSTSEC-2025-0141's bincode exception above for the same boundary). A file
-    # SCANNED by a rule never influences the rule's own compiled type chain; only
-    # the rule source does, and that's content we author and release, not attacker
-    # input. yara-x 1.21.0, the latest, still requires wasmtime ^45.0.3 and the fixes
-    # are 48.0.6/49.0.3: bump the moment yara-x's requirement allows one.
-    "RUSTSEC-2026-0359",
-    # Cranelift's aarch64 backend can jump to the wrong target on a large Wasm
-    # br_table (GHSA-mghf-wjfp-p5xm) whose runtime selector lands outside its
-    # arm count — a *runtime index value*, not the module's static shape, so
-    # RUSTSEC-2026-0359's "attacker input reaches it as data, not as code"
-    # framing does not automatically transfer here (review of this PR,
-    # Sollykhan 2026-10-20): that argument covers a bug keyed on the module's
-    # fixed structure, not one keyed on a value computed at run time, which in
-    # principle a scanned file could influence.
-    #
-    # Checked directly (yara-x 1.21.0's vendored source,
-    # `src/compiler/emit.rs`): every call to `emit_switch` — the only producer
-    # of `br_table` in this codebase, `emit_switch`'s own doc comment names it
-    # explicitly — passes a selector that is a `for`-loop counter `i`
-    # (`emit_for`'s own comment: "The value of `i` is in the range 0..n-1",
-    # enforced every iteration by an `i64.lt_s`/`br_if` back-edge check), and
-    # `n` is the literal item count of a `for ... of (...)`/`for ... in (...)`
-    # set or tuple written in the rule's own source (`of.items.len()`,
-    # `for_of.pattern_set.len()`, `expressions.len()` at each of the four call
-    # sites). Neither the selector nor the arm count is ever computed from, or
-    # influenced by, bytes the scanned file supplies — both come only from how
-    # many items a rule author wrote in a set/tuple literal, the same content
-    # we author and sign (RUSTSEC-2025-0141's bincode exception above has the
-    # same boundary). A rule would need roughly a quarter million literal
-    # items in one `of`/`in` set to approach the vulnerable arm count, but
-    # that bound isn't needed for the argument: however large, it's still rule
-    # content, not scanned-file data.
-    #
-    # Also aarch64-only: x86_64, this project's only Linux packaging target,
-    # cannot hit this at all. macOS CI (`test (macos-latest)`) does run on
-    # aarch64, so this isn't purely theoretical the way an x86_64-only
-    # advisory would be elsewhere in this file — but per the above, the
-    # content-signing boundary is what actually closes it, not the
-    # architecture. yara-x 1.21.0, the latest, still requires wasmtime
-    # ^45.0.3 and the fixes are 36.0.19/48.0.7/49.0.4: bump the moment
-    # yara-x's requirement allows one.
-    "RUSTSEC-2026-0379",
 ]
 
 [licenses]
