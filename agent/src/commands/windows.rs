@@ -493,6 +493,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         content_dir,
         log_sources: _,
         deception,
+        detection,
         config_path: _,
     } = opts;
     let pipeline = super::common::wire_run_pipeline(
@@ -507,6 +508,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // #319. Set before any sensor starts; the one alert `wire_run_pipeline` can raise
     // itself (UPLOAD-DISABLED) is the agent's own text, not an event's.
     pipeline.sink.alert_log().set_stderr_details(alert_details);
+    super::common::apply_detection(&pipeline.sink, detection);
     super::common::plant_canaries(
         &pipeline.sink,
         deception,

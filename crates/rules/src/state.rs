@@ -430,6 +430,8 @@ pub struct RuleState {
     auth_failures: BoundedMap<(String, String), SlidingCounter>,
     /// The accounts seen logging on, for FIRST-SEEN-LOGON (T1078, #376). LRU-bounded.
     logon_baseline: LogonBaseline,
+    /// ODD-HOUR-LOGON's clock and quiet period; off until [`Self::set_local_utc_offset_minutes`].
+    odd_hours: crate::logon::OddHours,
     /// RDP authentication successes joined to the failures from the same address,
     /// by event time (T1021.001, #285); see the `rdp` module.
     rdp_success: RdpSuccessAfterFailures,
@@ -621,6 +623,7 @@ impl RuleState {
             policy_denial_evictions_reported: 0,
             auth_failures: BoundedMap::new(COUNTER_CAP),
             logon_baseline: LogonBaseline::new(),
+            odd_hours: crate::logon::OddHours::new(),
             rdp_success: RdpSuccessAfterFailures::new(),
             sudo_success: SudoSuccessAfterFailures::new(),
             recent_creates: BoundedMap::new(CREATE_UNLINK_PID_CAP),
@@ -2054,6 +2057,7 @@ impl RuleState {
     /// on a successful logon.
     pub fn on_auth(&mut self, event: &AuthEvent) -> Vec<Alert> {
         let mut alerts: Vec<Alert> = self.check_first_seen_logon(event).into_iter().collect();
+        alerts.extend(self.check_odd_hour_logon(event));
         alerts.extend(self.on_auth_failures_and_escalations(event));
         alerts
     }
@@ -2077,9 +2081,8 @@ impl RuleState {
     /// learning window, and an account that logs on during the window is learned without an
     /// alert, an intruder's included. Expected false positives: a domain controller or file
     /// server, which sees every user's first logon; a new hire; a service account first
-    /// used after an install. **Not built, and why: odd hours.** The event carries a UTC
-    /// timestamp and no timezone, and no part of the agent knows the host's local time, so
-    /// "outside working hours" cannot be said honestly yet.
+    /// used after an install. Odd hours are [`Self::check_odd_hour_logon`], which needs the
+    /// host's UTC offset: the event carries a UTC timestamp and nothing else knows the local time.
     fn check_first_seen_logon(&mut self, event: &AuthEvent) -> Option<Alert> {
         if event.outcome != AuthOutcome::Success || event.kind != AuthKind::Logon {
             return None;
@@ -2099,6 +2102,44 @@ impl RuleState {
             severity: Severity::Low,
             message: format!(
                 "first successful logon of account {}{source} on this host since the baseline began",
+                event.target_user,
+            ),
+        })
+    }
+
+    /// Tells the rules the host's local time as minutes east of UTC (`120` for UTC+2,
+    /// `-300` for UTC-5), which turns ODD-HOUR-LOGON on. False when the offset is outside
+    /// -720..=840, and the rule keeps what it had. A fixed offset: a host that changes its
+    /// offset with daylight saving is an hour out for half the year.
+    pub fn set_local_utc_offset_minutes(&mut self, minutes: i32) -> bool {
+        self.odd_hours.set_offset_minutes(minutes)
+    }
+
+    /// ODD-HOUR-LOGON (T1078, #376): a successful [`AuthKind::Logon`] of a non-generic
+    /// account whose host-local hour is outside [`WORK_HOURS_LOCAL`](crate::exclusions::WORK_HOURS_LOCAL).
+    /// Low, once per account per [`ODD_HOUR_QUIET_NS`](crate::exclusions::ODD_HOUR_QUIET_NS).
+    /// Same event gate and generic-account list as FIRST-SEEN-LOGON, so the two share the
+    /// identity join's limits; they are independent and a first logon at night raises both.
+    ///
+    /// **Off until the operator sets the host's UTC offset** (`[detection]` in `agent.toml`):
+    /// the event's timestamp is UTC and nothing else in the agent knows the local time.
+    /// Expected false positives: on-call staff, night shifts, a host in use around the clock,
+    /// and on Windows the service and batch logons (4624) of a named account.
+    fn check_odd_hour_logon(&mut self, event: &AuthEvent) -> Option<Alert> {
+        if event.outcome != AuthOutcome::Success || event.kind != AuthKind::Logon {
+            return None;
+        }
+        let hour = self
+            .odd_hours
+            .observe(&event.target_user, event.meta.timestamp_ns)?;
+        let source = event
+            .source_address
+            .map_or_else(String::new, |address| format!(" from {address}"));
+        Some(Alert {
+            technique: "T1078",
+            severity: Severity::Low,
+            message: format!(
+                "successful logon of account {}{source} at {hour:02}:00 host-local time, outside the working hours",
                 event.target_user,
             ),
         })

@@ -5,7 +5,10 @@
 
 use store::BoundedMap;
 
-use crate::{exclusions::LOGON_LEARNING_NS, state::COUNTER_CAP};
+use crate::{
+    exclusions::{LOGON_LEARNING_NS, ODD_HOUR_QUIET_NS, WORK_HOURS_LOCAL},
+    state::COUNTER_CAP,
+};
 
 /// Accounts every host has, whose logon says nothing about who is on the host. Lowercase.
 /// Kept in step with `server/lib/fleet-case.ts` (`GENERIC_IDENTITIES`), which draws the same
@@ -111,6 +114,67 @@ impl LogonBaseline {
         } else {
             Observation::FirstSeen
         }
+    }
+}
+
+/// Most minutes east of UTC a host's local time can be (UTC+14, Kiribati).
+const MAX_UTC_OFFSET_MINUTES: i32 = 14 * 60;
+/// Most minutes west of UTC (UTC-12).
+const MIN_UTC_OFFSET_MINUTES: i32 = -12 * 60;
+
+/// ODD-HOUR-LOGON's clock: the host's local time as a fixed offset from UTC, and the accounts
+/// already reported tonight. With no offset the rule is off: the event's timestamp is UTC
+/// and "outside working hours" means nothing without the host's own time.
+pub(crate) struct OddHours {
+    offset_minutes: Option<i32>,
+    /// Lowercased account → timestamp of its last alert.
+    last_alert_ns: BoundedMap<String, u64>,
+}
+
+impl OddHours {
+    pub(crate) fn new() -> Self {
+        Self {
+            offset_minutes: None,
+            last_alert_ns: BoundedMap::new(COUNTER_CAP),
+        }
+    }
+
+    /// Sets the host's offset from UTC, in minutes. False, and the rule stays as it was, when
+    /// the offset is not one a timezone has.
+    pub(crate) fn set_offset_minutes(&mut self, minutes: i32) -> bool {
+        if !(MIN_UTC_OFFSET_MINUTES..=MAX_UTC_OFFSET_MINUTES).contains(&minutes) {
+            return false;
+        }
+        self.offset_minutes = Some(minutes);
+        true
+    }
+
+    /// The local hour (0..24) at `ts`, or `None` while no offset is set.
+    fn local_hour(&self, ts: u64) -> Option<u32> {
+        let offset = i64::from(self.offset_minutes?);
+        let secs = i64::try_from(ts / 1_000_000_000).ok()?;
+        let local = (secs + offset * 60).rem_euclid(86_400);
+        u32::try_from(local / 3_600).ok()
+    }
+
+    /// The local hour of a logon of `user` at `ts` when it is outside the working hours and
+    /// this account has not been reported within [`ODD_HOUR_QUIET_NS`]; remembers it.
+    pub(crate) fn observe(&mut self, user: &str, ts: u64) -> Option<u32> {
+        let hour = self.local_hour(ts)?;
+        let (start, end) = WORK_HOURS_LOCAL;
+        if (start..end).contains(&hour) || user.is_empty() || is_generic_account(user) {
+            return None;
+        }
+        let key = user.to_lowercase();
+        if self
+            .last_alert_ns
+            .get(&key)
+            .is_some_and(|last| ts.saturating_sub(*last) < ODD_HOUR_QUIET_NS)
+        {
+            return None;
+        }
+        self.last_alert_ns.insert(key, ts);
+        Some(hour)
     }
 }
 

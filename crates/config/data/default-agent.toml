@@ -110,3 +110,11 @@ max_reconnect_backoff_ms = 60000
 # [[logs.sources]]
 # path = "/var/log/mysql/error.log"
 # kind = "mysql_error"
+
+# --- [detection] --------------------------------------------------------------------
+# Facts about this host that no event carries (#376). Off unless set.
+# The host's local time as minutes east of UTC (120 = UTC+2, -300 = UTC-5), between -720
+# and 840. Events carry UTC only: without this the ODD-HOUR-LOGON rule (T1078, a logon
+# outside 07:00-20:00 local, Low) stays off. Fixed, it does not follow daylight saving.
+# [detection]
+# utc_offset_minutes = 120
