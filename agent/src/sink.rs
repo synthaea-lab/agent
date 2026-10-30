@@ -1495,6 +1495,8 @@ impl DetectionSink {
         }
         self.record_rule_alerts(wrapped, rules::evaluate_exec(event));
         self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_exec(event));
+        // This exec moved the stream clock: identity requests waiting for it may be due (#1041).
+        self.record_due_identity_alerts(self.rule_state.lock().unwrap().take_due_identity_alerts());
         let sigma_guard = self.sigma.lock().unwrap();
         if let Some(sigma) = sigma_guard.as_ref() {
             let entity = entity_key(&event.meta);
@@ -1653,6 +1655,21 @@ impl DetectionSink {
     /// `Signal` events: security-process tampering (T1562.001, issue #362).
     fn detect_signal(&self, wrapped: &Event, event: &schema::SignalEvent) {
         self.record_rule_alerts(wrapped, rules::evaluate_signal(event));
+    }
+
+    /// `IdentityChange` events (Linux, #266): SETUID-ROOT-REQUEST (T1548.001, #1041). A request
+    /// is judged once its process's exec has had time to arrive, so the alerts returned here are
+    /// those of earlier events, each attributed to its own.
+    fn detect_identity_change(&self, event: &schema::IdentityChangeEvent) {
+        let due = self.rule_state.lock().unwrap().on_identity_change(event);
+        self.record_due_identity_alerts(due);
+    }
+
+    /// Records the identity-request alerts that came due, each against the event it is about.
+    fn record_due_identity_alerts(&self, due: Vec<(schema::IdentityChangeEvent, rules::Alert)>) {
+        for (event, alert) in due {
+            self.record_rule_alerts(&Event::IdentityChange(event), [alert]);
+        }
     }
 
     /// `FileRename` events: mass-rename ransomware detection (T1486, issue #262) +
@@ -2348,6 +2365,7 @@ impl EventSink for DetectionSink {
             Event::ListenPort(e) => self.detect_listen_port(&event, e),
             Event::Auth(e) => self.detect_auth(&event, e),
             Event::Session(e) => self.detect_session(&event, e),
+            Event::IdentityChange(e) => self.detect_identity_change(e),
             Event::FileDelete(e) => self.detect_file_delete(&event, e),
             Event::Signal(e) => self.detect_signal(&event, e),
             Event::FileQuarantine(e) => self.detect_file_quarantine(e),
