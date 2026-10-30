@@ -98,9 +98,12 @@
 //!   `correlator::EventBus` — that's the caller's job (the same one that would own
 //!   the polling cadence above), and no such caller exists yet for this crate's
 //!   data.
-//! - UDP sockets — `sock_diag` supports them, but "listen/established" (this
-//!   issue's own wording) is TCP-state terminology; UDP would need its own
-//!   category, not a states-mask filter.
+//! - UDP in the agent: [`snapshot_udp`]/[`listen_port_events_udp`] exist (a bound,
+//!   unconnected UDP socket is `TCP_CLOSE` in `sock_diag`, so it is its own
+//!   [`SocketState::Unconnected`], not a states-mask variant of `Listen`), but
+//!   they report every bound socket, ephemeral client ports included. The noise
+//!   filter issue #676 asks for needs a real capture; until it exists the agent
+//!   keeps calling the TCP-only [`listen_port_events`].
 //! - Periodic re-snapshotting / drift detection between snapshots — [`snapshot`]
 //!   is a one-shot query; a caller decides the cadence. No lab VM here to
 //!   validate the issue's "listening-port drift" done-when item against.
@@ -141,16 +144,19 @@ pub use proc_events::ProcEvent;
 pub use proc_socket::ProcEventSubscription;
 #[cfg(target_os = "linux")]
 pub use socket::NetlinkError;
-pub use wire::{DiagMsg, IPPROTO_TCP, TCP_ESTABLISHED, TCP_LISTEN};
+pub use wire::{DiagMsg, IPPROTO_TCP, IPPROTO_UDP, TCP_CLOSE, TCP_ESTABLISHED, TCP_LISTEN};
 
-/// A TCP socket's state, as reported by `sock_diag`. This crate only ever
-/// requests [`TCP_ESTABLISHED`]/[`TCP_LISTEN`] (see the crate doc), so `Other` is
-/// purely defensive — a kernel returning something outside the requested mask
+/// A socket's state, as reported by `sock_diag`. This crate only ever requests
+/// [`TCP_ESTABLISHED`]/[`TCP_LISTEN`] for TCP and [`TCP_CLOSE`] for UDP (see the
+/// crate doc), so `Other` is purely defensive — a kernel returning something outside the requested mask
 /// would be a bug worth seeing, not a panic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketState {
     Established,
     Listen,
+    /// A UDP socket bound to a local port and not `connect()`ed: the datagram
+    /// equivalent of [`Self::Listen`] (`sock_diag` reports it as `TCP_CLOSE`).
+    Unconnected,
     Other(u8),
 }
 
@@ -159,6 +165,7 @@ impl From<u8> for SocketState {
         match raw {
             TCP_ESTABLISHED => Self::Established,
             TCP_LISTEN => Self::Listen,
+            TCP_CLOSE => Self::Unconnected,
             other => Self::Other(other),
         }
     }
@@ -167,6 +174,8 @@ impl From<u8> for SocketState {
 /// One socket from a [`snapshot`], joined to the PID(s) holding it open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocketSnapshotEntry {
+    /// `IPPROTO_TCP` or `IPPROTO_UDP`: the dump this entry came from.
+    pub protocol: u8,
     pub local: SocketAddr,
     pub remote: SocketAddr,
     pub state: SocketState,
@@ -182,8 +191,18 @@ pub struct SocketSnapshotEntry {
 }
 
 impl From<DiagMsg> for SocketSnapshotEntry {
+    /// A TCP entry: [`snapshot`] is the TCP dump. [`snapshot_udp`] uses
+    /// [`SocketSnapshotEntry::from_diag`] with `IPPROTO_UDP`.
     fn from(msg: DiagMsg) -> Self {
+        Self::from_diag(msg, IPPROTO_TCP)
+    }
+}
+
+impl SocketSnapshotEntry {
+    #[must_use]
+    pub fn from_diag(msg: DiagMsg, protocol: u8) -> Self {
         Self {
+            protocol,
             local: SocketAddr::new(msg.local, msg.local_port),
             remote: SocketAddr::new(msg.remote, msg.remote_port),
             state: SocketState::from(msg.state),
@@ -216,6 +235,57 @@ pub fn snapshot() -> Result<Vec<SocketSnapshotEntry>, NetlinkError> {
                 .cloned()
                 .unwrap_or_default();
             entry
+        })
+        .collect())
+}
+
+/// Takes one snapshot of the bound, unconnected UDP sockets (IPv4 and IPv6),
+/// joined to their owning PID(s) like [`snapshot`].
+///
+/// This is every bound UDP socket, not only servers: DNS client sockets, QUIC and
+/// media sockets on ephemeral ports all appear. Issue #676 asks for a noise filter
+/// calibrated on a real capture, which does not exist yet, so nothing in the agent
+/// calls this; it is the unfiltered mechanism the filter will sit in front of, same
+/// split as `sensor-windows-sockets`.
+///
+/// # Errors
+///
+/// See [`NetlinkError`] — same failure mode as [`snapshot`].
+#[cfg(target_os = "linux")]
+pub fn snapshot_udp() -> Result<Vec<SocketSnapshotEntry>, NetlinkError> {
+    let msgs = socket::query_sockets(IPPROTO_UDP, 1u32 << TCP_CLOSE)?;
+    let inode_pids = proc_join::inode_to_pids();
+
+    Ok(msgs
+        .into_iter()
+        .map(|msg| {
+            let mut entry = SocketSnapshotEntry::from_diag(msg, IPPROTO_UDP);
+            entry.pids = inode_pids
+                .get(&u64::from(entry.inode))
+                .cloned()
+                .unwrap_or_default();
+            entry
+        })
+        .collect())
+}
+
+/// Takes one [`snapshot_udp`] and maps every bound UDP socket to a
+/// [`schema::Event::ListenPort`] with `protocol` `IPPROTO_UDP`, attributed like
+/// [`listen_port_events`]. Unfiltered, see [`snapshot_udp`].
+///
+/// # Errors
+///
+/// See [`NetlinkError`] — same failure mode as [`snapshot_udp`], which this wraps.
+#[cfg(target_os = "linux")]
+pub fn listen_port_events_udp(timestamp_ns: u64) -> Result<Vec<schema::Event>, NetlinkError> {
+    let entries = snapshot_udp()?;
+    Ok(entries
+        .iter()
+        .flat_map(|entry| {
+            entry.pids.iter().filter_map(move |&pid| {
+                let proc = proc_meta::resolve(pid)?;
+                normalize::listen_port_event(entry, pid, &proc, timestamp_ns)
+            })
         })
         .collect())
 }
@@ -301,7 +371,43 @@ mod tests {
     fn socket_state_from_u8_covers_the_requested_states_and_falls_back() {
         assert_eq!(SocketState::from(TCP_ESTABLISHED), SocketState::Established);
         assert_eq!(SocketState::from(TCP_LISTEN), SocketState::Listen);
-        assert_eq!(SocketState::from(7), SocketState::Other(7));
+        assert_eq!(SocketState::from(TCP_CLOSE), SocketState::Unconnected);
+        assert_eq!(SocketState::from(2), SocketState::Other(2));
+    }
+
+    #[test]
+    fn a_bound_udp_socket_is_seen_as_a_udp_listener_owned_by_this_process() {
+        // The `ncat -u -l` done-when item, with this test process as the listener.
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a UDP socket");
+        let port = socket.local_addr().expect("local addr").port();
+        let me = std::process::id();
+
+        let entries = snapshot_udp().expect("unprivileged UDP snapshot must succeed");
+        let ours = entries
+            .iter()
+            .find(|e| e.local.port() == port)
+            .expect("the bound UDP socket must appear in the snapshot");
+        assert_eq!(ours.protocol, IPPROTO_UDP);
+        assert_eq!(ours.state, SocketState::Unconnected);
+        assert!(
+            ours.pids.contains(&me),
+            "pids {:?} must include {me}",
+            ours.pids
+        );
+
+        let events = listen_port_events_udp(42).expect("must succeed, same as snapshot_udp()");
+        let found = events.iter().any(|event| {
+            matches!(event, schema::Event::ListenPort(l)
+                if l.local_port == port && l.protocol == IPPROTO_UDP && l.meta.pid == me)
+        });
+        assert!(found, "no UDP ListenPort event for port {port}");
+
+        // The TCP path must not see it: that is the whole reason for the protocol field.
+        let tcp_events = listen_port_events(42).expect("TCP events");
+        assert!(!tcp_events.iter().any(|event| {
+            matches!(event, schema::Event::ListenPort(l) if l.local_port == port)
+        }));
+        drop(socket);
     }
 
     #[test]
