@@ -199,6 +199,7 @@ pub fn exec(
         company_name: None,
         file_description: None,
         product_name: None,
+        image_file_id: None,
         env_security,
     })
 }

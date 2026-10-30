@@ -329,7 +329,11 @@ pub mod time;
 /// wire change — #995 already defined `ListenPortEvent::protocol`; this PR only
 /// fills it with the real value (6 or 17) instead of #995's TCP-only `6` (review
 /// of #1008).
-pub const SCHEMA_VERSION: u32 = 58;
+///
+/// Bumped 58 → 59 for [`ExecEvent::image_file_id`] (#688): the identity of the
+/// image file at exec time, so the T1204.002 signature gate can distinguish the
+/// image that ran from whatever the path contains when it is later verified.
+pub const SCHEMA_VERSION: u32 = 59;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -641,6 +645,15 @@ pub struct ExecEvent {
     /// in the catalogue's `process_creation` category use it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub product_name: Option<String>,
+    /// Identity of the file the image ran from, captured by the sensor *at exec
+    /// time* (#688): `"{volume serial:016x}:{file id:032x}"`, opaque to consumers.
+    /// The enrichment worker verifies the file at `image_path` some time later; a
+    /// verdict only speaks for the image that ran when the file it verified has
+    /// this identity (a running image can be renamed on Windows and a signed copy
+    /// put at its path). Windows only; `None` when the sensor could not open the
+    /// image, and on every other platform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_file_id: Option<String>,
     /// Security-relevant environment variables present at exec time, `(name, value)`
     /// pairs (#363) — the dynamic-linker-hijack family: `LD_PRELOAD`,
     /// `LD_LIBRARY_PATH`, `LD_AUDIT` (the quieter sibling of `LD_PRELOAD`),

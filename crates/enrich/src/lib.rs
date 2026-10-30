@@ -52,6 +52,24 @@ pub struct FileEnrichment {
     /// same budget as the hash, see `pe_info`'s module doc for why reading it
     /// costs comparably little once the file is already open for the other two.
     pub pe_info: PeInfo,
+    /// [`path_identity`] of the file the verdict and the hash were read from, taken
+    /// from the same handle (#688); `None` when the file system gave no identity.
+    pub file_id: Option<String>,
+}
+
+/// The identity of the file at `path` as a token: `"{volume:016x}:{id:032x}"`.
+/// Unix: (device, inode); Windows: (volume serial, 128-bit file id). Two opens of
+/// the same file give the same token; a different file at the same path gives a
+/// different one. `None` when the file cannot be opened or has no identity.
+#[must_use]
+pub fn path_identity(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    file_id(&file, &meta).map(identity_token)
+}
+
+fn identity_token((volume, id): FileId) -> String {
+    format!("{volume:016x}:{id:032x}")
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -133,6 +151,7 @@ impl Enricher {
             sha256: None,
             signature: Signature::Unsupported,
             pe_info: PeInfo::default(),
+            file_id: None,
         };
         // FIFOs, device nodes, sockets: opening one can block forever (a named
         // pipe with no writer) or read an endless stream — the event path must
@@ -191,6 +210,7 @@ impl Enricher {
             sha256,
             signature,
             pe_info,
+            file_id: id.map(identity_token),
         };
         self.cache.insert(
             path.to_path_buf(),
@@ -289,6 +309,32 @@ mod tests {
             Some("3fc4ccfe745870e2c0d99f71f30ff0656c8dedd41cc1d7d3d376b0dbe685e2f3")
         );
         std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn path_identity_follows_the_file_not_its_path() {
+        let dir = std::env::temp_dir().join(format!("enrich-identity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, moved, b) = (dir.join("a"), dir.join("moved"), dir.join("b"));
+        std::fs::write(&a, b"image").unwrap();
+        std::fs::write(&b, b"decoy").unwrap();
+        let ran = path_identity(&a).expect("a regular file has an identity");
+        // The dropper's move: the image goes aside, a decoy takes its path.
+        std::fs::rename(&a, &moved).unwrap();
+        std::fs::rename(&b, &a).unwrap();
+        assert_ne!(
+            path_identity(&a),
+            Some(ran.clone()),
+            "the path now holds another file"
+        );
+        assert_eq!(path_identity(&moved), Some(ran.clone()));
+        // And enrichment reports the identity of the file it read.
+        assert_eq!(
+            Enricher::new().enrich_uncached(&a).file_id,
+            path_identity(&a)
+        );
+        assert_eq!(path_identity(&dir.join("missing")), None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

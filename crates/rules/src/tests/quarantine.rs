@@ -212,3 +212,25 @@ fn on_exec_alone_no_longer_raises_the_download_join() {
     state.on_file_quarantine(&mark(DOWNLOAD, 0));
     assert!(state.on_exec(&run(DOWNLOAD, 1)).is_empty());
 }
+
+#[test]
+fn a_valid_signature_of_a_file_that_is_not_the_image_that_ran_does_not_silence_the_alert() {
+    let mut state = RuleState::new();
+    state.on_file_quarantine(&mark(DOWNLOAD, 0));
+    let valid = ImageSignature {
+        verdict: Some(Signature::Valid),
+        chain_verified: true,
+    };
+    let gated = state
+        .on_exec_signature_gated(&run(DOWNLOAD, 90_000_000_000))
+        .expect("a marked file run inside the window");
+    // Same verdict that silences the alert when the image is confirmed...
+    assert!(gated.clone().resolve(valid).is_none());
+    // ...cannot once the verified file is not provably the one that ran (#688).
+    let alert = gated
+        .unconfirmed_image()
+        .resolve(valid)
+        .expect("an unconfirmed image alerts");
+    assert_eq!(alert.technique, "T1204.002");
+    assert!(alert.message.contains("not verified"), "{}", alert.message);
+}
