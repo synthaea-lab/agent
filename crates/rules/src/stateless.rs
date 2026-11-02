@@ -1318,6 +1318,12 @@ pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Opti
         schema::User::Unix { uid, .. } => format!(" uid={uid}"),
         _ => String::new(),
     };
+    // The unit the source resolved (Linux, #1103): which tool it was, not only which image.
+    let unit = event
+        .target_unit
+        .as_deref()
+        .map(|unit| format!(" of unit {unit}"))
+        .unwrap_or_default();
     let from_manager = event.meta.pid == INIT_PID;
     Some(Alert {
         technique: "T1562.001",
@@ -1327,7 +1333,7 @@ pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Opti
             Severity::High
         },
         message: format!(
-            "pid={} comm={}{sender_uid}: sent {name} ({}) to security process pid={} ({target}){}",
+            "pid={} comm={}{sender_uid}: sent {name} ({}) to security process pid={} ({target}){unit}{}",
             event.meta.pid,
             event.meta.comm,
             event.signal,

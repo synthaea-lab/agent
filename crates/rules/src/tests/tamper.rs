@@ -15,6 +15,7 @@ fn signal_event(signal: u32) -> SignalEvent {
         signal,
         target_pid: 400,
         target_image_path: Some("/usr/local/bin/synthaea-agent".into()),
+        target_unit: None,
     }
 }
 
@@ -82,6 +83,7 @@ fn signal_from(sender_pid: u32, comm: &str, signal: u32, target_pid: u32) -> Sig
         signal,
         target_pid,
         target_image_path: Some("/usr/local/bin/synthaea-agent".into()),
+        target_unit: None,
     }
 }
 
@@ -148,4 +150,24 @@ fn a_sender_that_looks_like_the_agents_supervisor_is_not_exempt_for_lack_of_a_un
     event.meta.ppid = 1;
     let alert = check_security_process_signal(&event).unwrap();
     assert_eq!(alert.severity, crate::Severity::High);
+}
+
+#[test]
+fn a_signal_to_a_listed_unit_names_the_unit_and_a_signal_without_one_is_unchanged() {
+    let mut event = signal_from(4242, "pkill", 9, 612);
+    event.target_image_path = Some("/usr/sbin/auditd".into());
+    event.target_unit = Some("auditd".into());
+    let alert = check_security_process_signal(&event).expect("alerts");
+    assert_eq!(alert.technique, "T1562.001");
+    assert_eq!(alert.severity, crate::Severity::High);
+    assert!(
+        alert
+            .message
+            .contains("pid=612 (/usr/sbin/auditd) of unit auditd"),
+        "{}",
+        alert.message
+    );
+    event.target_unit = None;
+    let alert = check_security_process_signal(&event).expect("alerts");
+    assert!(!alert.message.contains("of unit"), "{}", alert.message);
 }

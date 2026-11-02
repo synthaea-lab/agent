@@ -284,6 +284,7 @@ pub fn normalize(raw: &RawEsEvent) -> Option<Event> {
             signal: *signal,
             target_pid: *target_pid,
             target_image_path: target_path.clone(),
+            target_unit: None,
         })),
         RawEsEvent::XpcConnect {
             meta,

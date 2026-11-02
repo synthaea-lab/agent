@@ -333,7 +333,10 @@ pub mod time;
 /// Bumped 58 → 59 for [`ExecEvent::image_file_id`] (#688): the identity of the
 /// image file at exec time, so the T1204.002 signature gate can distinguish the
 /// image that ran from whatever the path contains when it is later verified.
-pub const SCHEMA_VERSION: u32 = 59;
+///
+/// Bumped 59 → 60 for [`SignalEvent::target_unit`] (#1103): the systemd unit of the signalled
+/// process, so an alert on a signal to a security tool names the tool and not only an image path.
+pub const SCHEMA_VERSION: u32 = 60;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -2210,6 +2213,12 @@ pub struct SignalEvent {
     /// Image path of the targeted process, when the platform resolves it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_image_path: Option<String>,
+    /// The systemd unit the targeted process belongs to, as listed in
+    /// [`SECURITY_SERVICES`] (lowercase, no `.service`), when the source resolves it (Linux,
+    /// from the unit's cgroup, #1103). `None` where the platform has no unit, and for the
+    /// agent's own pid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_unit: Option<String>,
 }
 
 /// macOS XPC connection — a process connected to an XPC service by name.

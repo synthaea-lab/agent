@@ -1792,8 +1792,29 @@ fn signal_golden() {
             signal: 9,
             target_pid: 400,
             target_image_path: Some("/usr/local/bin/synthaea-agent".into()),
+            target_unit: None,
         }),
         "signal",
+    );
+    // v60 (#1103): a signal to a listed security tool names its systemd unit.
+    assert_golden(
+        &Event::Signal(SignalEvent {
+            meta: EventMeta {
+                pid: 7001,
+                ppid: 1,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_000_123_456_789,
+                comm: "pkill".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            signal: 9,
+            target_pid: 612,
+            target_image_path: Some("/usr/sbin/auditd".into()),
+            target_unit: Some("auditd".into()),
+        }),
+        "signal_unit",
     );
 }
 
@@ -2774,6 +2795,7 @@ fn meta_accessor_covers_all_variants() {
             signal: 0,
             target_pid: 0,
             target_image_path: None,
+            target_unit: None,
         }),
         Event::XpcConnect(XpcConnectEvent {
             meta: meta.clone(),

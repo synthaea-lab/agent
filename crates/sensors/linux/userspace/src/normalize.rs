@@ -676,6 +676,7 @@ pub fn signal(
         signal: event.signal,
         target_pid: event.target_pid,
         target_image_path,
+        target_unit: None,
     })
 }
 
