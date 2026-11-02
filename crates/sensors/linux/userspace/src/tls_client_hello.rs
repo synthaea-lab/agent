@@ -730,4 +730,64 @@ mod tests {
         bytes.extend(b"\x17\x03\x03\x00\x05hello");
         assert_eq!(parse(&bytes).expect("parsed").ja4, EXAMPLE_JA4);
     }
+
+    // --- Never-panic robustness -----------------------------------------------------------
+    //
+    // `parse` reads bytes an attacker chooses, and part 2 of #86 puts it on the capture path,
+    // where a panic kills the sensor. The contract is the one the other byte parsers are held
+    // to (`linux/netlink/tests/robustness.rs`, `fuzz_targets/netlink_parse.rs`): returning
+    // `None` is fine, panicking is a bug. These live here rather than in `tests/` because
+    // `parse` is `pub(crate)` in a private module; when part 2 makes it reachable they belong
+    // outside, next to a `tls_client_hello` fuzz target.
+    //
+    // The tests above pin the malformed shapes we thought of; these pin the ones we did not.
+
+    /// Deterministic LCG (Knuth), as in the netlink suite: a reproducible corpus with no
+    /// dependency and no flake.
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state
+    }
+
+    /// Truncation is the realistic corruption (a short capture, a split packet), and a single
+    /// changed byte is the cheapest thing an attacker tries: every length prefix in the record
+    /// becomes a lie in turn.
+    #[test]
+    fn every_truncation_and_single_byte_change_of_a_valid_hello_is_refused_not_a_panic() {
+        let valid = example();
+        for n in 0..=valid.len() {
+            let _ = parse(&valid[..n]);
+        }
+        for position in 0..valid.len() {
+            for byte in [0x00, 0x01, 0x7f, 0x80, 0xfe, 0xff] {
+                let mut mutated = valid.clone();
+                mutated[position] = byte;
+                let _ = parse(&mutated);
+            }
+        }
+    }
+
+    /// Random buffers reach the early rejections; random runs spliced into a valid hello reach
+    /// the extension walks, which the random buffers almost never get past the record header to
+    /// exercise.
+    #[test]
+    fn a_random_corpus_and_random_splices_into_a_valid_hello_never_panic() {
+        let valid = example();
+        let mut state = 0x5151_1234;
+        for _ in 0..20_000 {
+            let len = (lcg(&mut state) as usize) % 512;
+            let buffer: Vec<u8> = (0..len).map(|_| (lcg(&mut state) >> 24) as u8).collect();
+            let _ = parse(&buffer);
+
+            let mut spliced = valid.clone();
+            let at = (lcg(&mut state) as usize) % spliced.len();
+            let run = ((lcg(&mut state) as usize) % 24).min(spliced.len() - at);
+            for offset in 0..run {
+                spliced[at + offset] = (lcg(&mut state) >> 24) as u8;
+            }
+            let _ = parse(&spliced);
+        }
+    }
 }
