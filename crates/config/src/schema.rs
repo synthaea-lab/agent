@@ -74,10 +74,11 @@ pub struct AgentConfig {
 #[serde(deny_unknown_fields)]
 pub struct DetectionConfig {
     /// The host's local time as minutes east of UTC (`120` for UTC+2, `-300` for UTC-5),
-    /// between -720 and 840. Events carry UTC only, so the ODD-HOUR-LOGON rule (T1078) has no
-    /// notion of "outside working hours" without it and stays off. Fixed: it does not follow
-    /// daylight saving, so set the offset the host is on for most of the year, or change it
-    /// when the clocks do. Absent by default.
+    /// between -720 and 840. Events carry UTC only, so the ODD-HOUR-LOGON rule (T1078) needs the
+    /// host's local time: the agent asks the platform's time zone (daylight saving included,
+    /// #1088) and this setting **overrides** it, for a host whose zone is wrong or absent.
+    /// Fixed: it does not follow daylight saving, so set the offset the host is on for most of
+    /// the year, or change it when the clocks do. Absent by default.
     #[serde(default)]
     pub utc_offset_minutes: Option<i32>,
 }

@@ -9,6 +9,8 @@
 mod common;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+mod localzone;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(windows)]

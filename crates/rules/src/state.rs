@@ -2109,10 +2109,20 @@ impl RuleState {
 
     /// Tells the rules the host's local time as minutes east of UTC (`120` for UTC+2,
     /// `-300` for UTC-5), which turns ODD-HOUR-LOGON on. False when the offset is outside
-    /// -720..=840, and the rule keeps what it had. A fixed offset: a host that changes its
-    /// offset with daylight saving is an hour out for half the year.
+    /// -720..=840, and the rule keeps what it had. A fixed offset, and it overrides the
+    /// platform zone ([`Self::set_local_zone`]): a host that changes its offset with daylight
+    /// saving is an hour out for half the year under this one.
     pub fn set_local_utc_offset_minutes(&mut self, minutes: i32) -> bool {
         self.odd_hours.set_offset_minutes(minutes)
+    }
+
+    /// Gives the rules the host's platform time zone (#1088): `zone` maps an instant (seconds
+    /// since the Unix epoch) to minutes east of UTC at that instant, so a logon either side of a
+    /// daylight-saving change is judged by the hour the host's clock showed. Turns ODD-HOUR-LOGON
+    /// on. A fixed offset from [`Self::set_local_utc_offset_minutes`] overrides it whichever is
+    /// set first. False, and the rule keeps what it had, when `zone` has no answer for `now_secs`.
+    pub fn set_local_zone(&mut self, zone: crate::LocalOffsetAt, now_secs: i64) -> bool {
+        self.odd_hours.set_zone(zone, now_secs)
     }
 
     /// ODD-HOUR-LOGON (T1078, #376): a successful [`AuthKind::Logon`] of a non-generic
@@ -2121,8 +2131,10 @@ impl RuleState {
     /// Same event gate and generic-account list as FIRST-SEEN-LOGON, so the two share the
     /// identity join's limits; they are independent and a first logon at night raises both.
     ///
-    /// **Off until the operator sets the host's UTC offset** (`[detection]` in `agent.toml`):
-    /// the event's timestamp is UTC and nothing else in the agent knows the local time.
+    /// **Off until the host's local time is known**: the platform's zone (the agent asks it at
+    /// startup, [`Self::set_local_zone`]) or the operator's fixed UTC offset (`[detection]` in
+    /// `agent.toml`, which overrides the zone). The event's timestamp is UTC and nothing else
+    /// in the agent knows the local time.
     /// Expected false positives: on-call staff, night shifts, a host in use around the clock,
     /// and on Windows the service and batch logons (4624) of a named account.
     fn check_odd_hour_logon(&mut self, event: &AuthEvent) -> Option<Alert> {

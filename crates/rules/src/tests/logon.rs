@@ -379,3 +379,133 @@ fn a_first_logon_at_night_raises_both_findings_independently() {
     let alerts = state.on_auth(&logon("frank", night + HOUR));
     assert_eq!(alerts.len(), 2, "{alerts:?}");
 }
+
+// ODD-HOUR-LOGON, platform zone and daylight saving (#1088).
+
+/// Central Europe in 2026: CET (UTC+1), CEST (UTC+2) from 29 March 01:00 UTC to 25 October
+/// 01:00 UTC. A stand-in for the platform's conversion, which the rules receive as a function.
+fn central_europe(secs: i64) -> Option<i32> {
+    const SPRING: i64 = 1_774_746_000;
+    const AUTUMN: i64 = 1_792_890_000;
+    Some(if (SPRING..AUTUMN).contains(&secs) {
+        120
+    } else {
+        60
+    })
+}
+
+fn no_answer(_secs: i64) -> Option<i32> {
+    None
+}
+
+fn no_such_zone(_secs: i64) -> Option<i32> {
+    Some(900)
+}
+
+const NOW_SECS: i64 = 1_793_318_400;
+
+fn paris() -> RuleState {
+    let mut state = RuleState::new();
+    assert!(state.set_local_zone(central_europe, NOW_SECS));
+    state
+}
+
+// 2026-03-28 05:30 UTC and 2026-03-30 05:30 UTC: the same clock time in UTC, either side of
+// the spring change. 06:30 CET is before the working day, 07:30 CEST is inside it.
+const BEFORE_SPRING: u64 = 1_774_675_800_000_000_000;
+const AFTER_SPRING: u64 = 1_774_848_600_000_000_000;
+// 2026-10-24 18:30 UTC and 2026-10-26 18:30 UTC, either side of the autumn change:
+// 20:30 CEST is after the working day, 19:30 CET is inside it.
+const BEFORE_AUTUMN: u64 = 1_792_866_600_000_000_000;
+const AFTER_AUTUMN: u64 = 1_793_039_400_000_000_000;
+
+#[test]
+fn the_same_utc_time_is_judged_by_the_zones_rules_at_that_instant_in_spring() {
+    let mut state = paris();
+    let before = odd_hour(&mut state, "mallory", BEFORE_SPRING);
+    assert_eq!(before.len(), 1, "06:30 CET is before 07:00: {before:?}");
+    assert!(before[0].message.contains("06:00"), "{}", before[0].message);
+    assert!(
+        odd_hour(&mut state, "alice", AFTER_SPRING).is_empty(),
+        "07:30 CEST is inside the working hours"
+    );
+}
+
+#[test]
+fn the_same_utc_time_is_judged_by_the_zones_rules_at_that_instant_in_autumn() {
+    let mut state = paris();
+    let before = odd_hour(&mut state, "mallory", BEFORE_AUTUMN);
+    assert_eq!(before.len(), 1, "20:30 CEST is after 20:00: {before:?}");
+    assert!(before[0].message.contains("20:00"), "{}", before[0].message);
+    assert!(
+        odd_hour(&mut state, "alice", AFTER_AUTUMN).is_empty(),
+        "19:30 CET is inside the working hours"
+    );
+}
+
+#[test]
+fn a_fixed_offset_overrides_the_platform_zone_in_either_order() {
+    // 2026-10-30 08:00 UTC: 09:00 in Central Europe (inside the working hours), 03:00 at UTC-5.
+    let ts = MIDNIGHT_UTC + 8 * HOUR;
+    let mut zone_then_fixed = RuleState::new();
+    assert!(zone_then_fixed.set_local_zone(central_europe, NOW_SECS));
+    assert!(zone_then_fixed.set_local_utc_offset_minutes(-300));
+    assert_eq!(odd_hour(&mut zone_then_fixed, "mallory", ts).len(), 1);
+
+    let mut fixed_then_zone = RuleState::new();
+    assert!(fixed_then_zone.set_local_utc_offset_minutes(-300));
+    assert!(fixed_then_zone.set_local_zone(central_europe, NOW_SECS));
+    assert_eq!(odd_hour(&mut fixed_then_zone, "mallory", ts).len(), 1);
+
+    // The zone alone sees working hours at that instant.
+    assert!(odd_hour(&mut paris(), "mallory", ts).is_empty());
+}
+
+#[test]
+fn a_zone_with_no_answer_now_is_refused_and_the_rule_stays_off() {
+    let mut state = RuleState::new();
+    assert!(!state.set_local_zone(no_answer, NOW_SECS));
+    assert!(!state.set_local_zone(no_such_zone, NOW_SECS));
+    assert!(odd_hour(&mut state, "mallory", MIDNIGHT_UTC + 2 * HOUR).is_empty());
+}
+
+#[test]
+fn a_refused_zone_keeps_the_one_the_rule_had() {
+    let mut state = paris();
+    assert!(!state.set_local_zone(no_answer, NOW_SECS));
+    assert_eq!(odd_hour(&mut state, "mallory", BEFORE_SPRING).len(), 1);
+}
+
+#[test]
+fn an_instant_the_zone_cannot_convert_is_silent_not_utc() {
+    // The zone answered for "now" and not for this instant: no alert, no fallback to UTC.
+    fn only_recent(secs: i64) -> Option<i32> {
+        (secs >= 1_790_000_000).then_some(60)
+    }
+    let mut state = RuleState::new();
+    assert!(state.set_local_zone(only_recent, NOW_SECS));
+    // 01:00 UTC on 2026-03-30 would be night in UTC and in CEST alike.
+    assert!(odd_hour(&mut state, "mallory", 1_774_832_400_000_000_000).is_empty());
+    assert_eq!(
+        odd_hour(&mut state, "mallory", MIDNIGHT_UTC + 2 * HOUR).len(),
+        1
+    );
+}
+
+#[test]
+fn a_zone_answer_no_timezone_has_is_ignored_at_that_instant() {
+    fn wild_later(secs: i64) -> Option<i32> {
+        Some(if secs > NOW_SECS { 900 } else { 60 })
+    }
+    let mut state = RuleState::new();
+    assert!(state.set_local_zone(wild_later, NOW_SECS));
+    // 12:00 UTC: read as UTC+15 it would be 03:00, an alert; no timezone has that offset.
+    assert!(
+        odd_hour(
+            &mut state,
+            "mallory",
+            MIDNIGHT_UTC + 40 * 24 * HOUR + 12 * HOUR
+        )
+        .is_empty()
+    );
+}

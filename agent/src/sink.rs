@@ -1013,6 +1013,14 @@ impl DetectionSink {
             .set_local_utc_offset_minutes(minutes)
     }
 
+    /// Gives the rules the platform's time zone (#1088); false when it has no answer for `now_secs`.
+    pub(crate) fn set_local_zone(&self, zone: rules::LocalOffsetAt, now_secs: i64) -> bool {
+        self.rule_state
+            .lock()
+            .unwrap()
+            .set_local_zone(zone, now_secs)
+    }
+
     /// Installs the executables allowed to touch a canary (#81). Called once, with the
     /// tripwires.
     pub(crate) fn set_canary_allow(&self, allow: crate::deception::CanaryAllow) {
