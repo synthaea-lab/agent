@@ -18,7 +18,7 @@ use sensor_linux_wire::{
 };
 
 use crate::{
-    PROC_LINEAGE, dns_udp_connect, dns_udp_sendto, dns_udp_write, sys_enter_accept,
+    PROC_LINEAGE, emit_tool_signal_event, is_watched_tool, dns_udp_connect, dns_udp_sendto, dns_udp_write, sys_enter_accept,
     sys_enter_accept4, sys_enter_bind, sys_enter_bpf, sys_enter_capset, sys_enter_chmod,
     sys_enter_chown, sys_enter_connect, sys_enter_delete_module, sys_enter_fchmodat,
     sys_enter_fchownat, sys_enter_finit_module, sys_enter_init_module, sys_enter_kill,
@@ -87,6 +87,65 @@ static BINPRM_FILENAME_OFFSET: Global<u32> = Global::new(0);
 static SYSCALL_ARG_OFFSETS: Global<[u32; 6]> = Global::new([0; 6]);
 #[unsafe(no_mangle)]
 static SYSCALL_NR_OFFSET: Global<u32> = Global::new(0);
+/// `task_struct.tgid`, from the kernel's BTF (#1103): `signal_generate` hands over the target
+/// task, and a signal to a thread of a tool names the thread, not the process.
+#[unsafe(no_mangle)]
+static TASK_TGID_OFFSET: Global<u32> = Global::new(0);
+
+/// `kernel_siginfo.si_code`: `si_signo` and `si_errno` come first, 4 bytes each, on every
+/// architecture (the layout is userspace ABI).
+const SIGINFO_CODE_OFFSET: usize = 8;
+
+/// `SEND_SIG_PRIV`, the largest of the two special `siginfo` pointers (`SEND_SIG_NOINFO` is 0):
+/// a signal sent by the kernel itself, not by a process.
+const SEND_SIG_PRIV: usize = 1;
+
+/// A signal sent to a process of a listed security unit (`signal:signal_generate`, #1103): the
+/// path that sees `kill`, `tgkill`, `tkill`, `pidfd_send_signal` and `rt_sigqueueinfo` alike, in
+/// the **initial** pid namespace and once per target of a group kill, which the `sys_enter`
+/// probes above cannot do (the pid argument is in the sender's namespace, `tkill` takes a
+/// thread id and `pidfd_send_signal` a file descriptor). Arguments, in the kernel's order:
+/// `sig`, `info`, `task` (the target), `group`, `result`.
+///
+/// The common case, a signal to anything else, costs one read of `task->tgid` and one hash
+/// lookup. Permission is checked before this tracepoint fires, so a refused `kill` (`EPERM`)
+/// never reaches it: only a delivered, ignored or already-pending signal does.
+#[raw_tracepoint(tracepoint = "signal_generate")]
+pub fn raw_signal_generate(ctx: RawTracePointContext) -> u32 {
+    let sig = ctx.arg::<i64>(0) as u32;
+    let info = ctx.arg::<*const u8>(1);
+    let task = ctx.arg::<*const u8>(2);
+    // `kill -0` is a liveness probe, and a null or special `siginfo` is the kernel's own
+    // signal (`send_sig(.., SEND_SIG_PRIV)`): neither is a process acting on the tool.
+    if sig == 0 || (info as usize) <= SEND_SIG_PRIV {
+        return 0;
+    }
+    let Ok(target) = (unsafe {
+        bpf_probe_read_kernel(task.add(TASK_TGID_OFFSET.load() as usize).cast::<i32>())
+    }) else {
+        return 0;
+    };
+    let target = target as u32;
+    if !is_watched_tool(target) {
+        return 0;
+    }
+    // From a process: `SI_USER` (0), `SI_QUEUE` (-1), `SI_TKILL` (-6), `SI_TIMER`...; a positive
+    // code is the kernel's (`SI_KERNEL`, `CLD_*`, `SEGV_*`).
+    let Ok(code) = (unsafe { bpf_probe_read_kernel(info.add(SIGINFO_CODE_OFFSET).cast::<i32>()) })
+    else {
+        return 0;
+    };
+    if code > 0 {
+        return 0;
+    }
+    // A tool signalling itself (`abort()`, a worker thread): not a process acting on it.
+    if (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32 == target {
+        return 0;
+    }
+    match emit_tool_signal_event(&ctx, target, sig) {
+        Ok(ret) | Err(ret) => ret,
+    }
+}
 
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 #[repr(C)]

@@ -19,6 +19,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 /// Sub-cgroup levels read below a unit's own. A unit with `Delegate=` or a worker slice has a
@@ -139,6 +140,98 @@ pub(crate) fn changes(
         .copied()
         .collect();
     (added, removed)
+}
+
+/// The kernel-side set of watched tgids (`SIGNAL_WATCH_TOOLS`), as far as [`ToolWatch`] needs it:
+/// a trait so the refresh logic is tested without a kernel.
+pub(crate) trait WatchSet {
+    fn insert(&mut self, pid: u32) -> Result<(), String>;
+    fn remove(&mut self, pid: u32) -> Result<(), String>;
+}
+
+impl WatchSet for aya::maps::HashMap<aya::maps::MapData, u32, u8> {
+    fn insert(&mut self, pid: u32) -> Result<(), String> {
+        aya::maps::HashMap::insert(self, pid, 1, 0).map_err(|e| e.to_string())
+    }
+
+    fn remove(&mut self, pid: u32) -> Result<(), String> {
+        aya::maps::HashMap::remove(self, &pid).map_err(|e| e.to_string())
+    }
+}
+
+/// What the drain reads to name a target: tgid → unit and exe, as of the last scan.
+pub(crate) type ToolProcs = Arc<Mutex<BTreeMap<u32, UnitProc>>>;
+
+/// Keeps the kernel-side watch set equal to the listed units' processes, and the cache the drain
+/// enriches from.
+///
+/// The cache is replaced by each scan, so a tool that died is forgotten one scan later
+/// ([`crate::sensor`] rescans every few seconds): an event for it is drained within milliseconds
+/// of the signal, and keeping a dead tgid longer would hand its number to an unrelated process
+/// that reuses it.
+pub(crate) struct ToolWatch<S> {
+    resolver: UnitResolver,
+    set: S,
+    /// What the kernel-side set holds now: an insert that failed is absent, so the next scan
+    /// tries it again.
+    applied: BTreeMap<u32, UnitProc>,
+    procs: ToolProcs,
+}
+
+impl<S: WatchSet> ToolWatch<S> {
+    pub(crate) fn new(resolver: UnitResolver, set: S) -> Self {
+        Self {
+            resolver,
+            set,
+            applied: BTreeMap::new(),
+            procs: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    /// The cache to enrich from; the same one after every [`Self::refresh`].
+    pub(crate) fn procs(&self) -> ToolProcs {
+        Arc::clone(&self.procs)
+    }
+
+    /// Scans the units and brings the kernel-side set up to date. Returns how many processes are
+    /// watched. A failed edit is logged and retried by the next scan, never fatal: the probe
+    /// keeps working on what it has.
+    pub(crate) fn refresh(&mut self) -> usize {
+        let next = self.resolver.scan();
+        let (added, removed) = changes(&self.applied, &next);
+        for pid in removed {
+            match self.set.remove(pid) {
+                Ok(()) => {
+                    self.applied.remove(&pid);
+                }
+                // A tgid that is already gone from the map is what was wanted.
+                Err(e) => {
+                    tracing::debug!(pid, error = %e, "SIGNAL_WATCH_TOOLS: remove failed");
+                    self.applied.remove(&pid);
+                }
+            }
+        }
+        for pid in added {
+            match self.set.insert(pid) {
+                Ok(()) => {
+                    if let Some(proc) = next.get(&pid) {
+                        self.applied.insert(pid, proc.clone());
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    pid,
+                    error = %e,
+                    "SIGNAL_WATCH_TOOLS: could not watch a security tool process, retrying at the next scan"
+                ),
+            }
+        }
+        let watched = self.applied.len();
+        *self
+            .procs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+        watched
+    }
 }
 
 #[cfg(test)]
@@ -334,5 +427,82 @@ mod tests {
                 proc.unit
             );
         }
+    }
+
+    /// A kernel-side set that can be told to refuse an insert.
+    #[derive(Default)]
+    struct FakeSet {
+        pids: std::collections::BTreeSet<u32>,
+        refuse: std::collections::BTreeSet<u32>,
+    }
+
+    impl WatchSet for &mut FakeSet {
+        fn insert(&mut self, pid: u32) -> Result<(), String> {
+            if self.refuse.contains(&pid) {
+                return Err("full".to_owned());
+            }
+            self.pids.insert(pid);
+            Ok(())
+        }
+
+        fn remove(&mut self, pid: u32) -> Result<(), String> {
+            self.pids
+                .remove(&pid)
+                .then_some(())
+                .ok_or("absent".to_owned())
+        }
+    }
+
+    #[test]
+    fn a_refresh_follows_a_daemon_that_forks_and_restarts() {
+        let host = Host::new();
+        let mut set = FakeSet::default();
+        host.unit("system.slice", "auditd.service", &[612]);
+        host.exe(612, "/usr/sbin/auditd");
+        let mut watch = ToolWatch::new(host.resolver(&["auditd"]), &mut set);
+        assert_eq!(watch.refresh(), 1);
+        let procs = watch.procs();
+        assert_eq!(procs.lock().unwrap()[&612].unit, "auditd");
+
+        // It forks a worker.
+        host.unit("system.slice", "auditd.service", &[612, 613]);
+        assert_eq!(watch.refresh(), 2);
+        // It restarts: new pid, old one gone, and the same cache handle sees it.
+        host.unit("system.slice", "auditd.service", &[944]);
+        assert_eq!(watch.refresh(), 1);
+        assert_eq!(
+            procs.lock().unwrap().keys().copied().collect::<Vec<_>>(),
+            [944]
+        );
+        drop(watch);
+        assert_eq!(set.pids.iter().copied().collect::<Vec<_>>(), [944]);
+    }
+
+    #[test]
+    fn an_insert_that_fails_is_not_counted_and_is_retried_at_the_next_scan() {
+        let host = Host::new();
+        let mut set = FakeSet::default();
+        set.refuse.insert(612);
+        host.unit("system.slice", "auditd.service", &[612]);
+        let mut watch = ToolWatch::new(host.resolver(&["auditd"]), &mut set);
+        assert_eq!(watch.refresh(), 0, "not watched, so not counted");
+        drop(watch);
+        assert!(set.pids.is_empty());
+
+        set.refuse.clear();
+        let mut watch = ToolWatch::new(host.resolver(&["auditd"]), &mut set);
+        assert_eq!(watch.refresh(), 1);
+    }
+
+    #[test]
+    fn a_remove_of_a_pid_the_kernel_already_dropped_is_not_an_error() {
+        let host = Host::new();
+        let mut set = FakeSet::default();
+        host.unit("system.slice", "auditd.service", &[612]);
+        let mut watch = ToolWatch::new(host.resolver(&["auditd"]), &mut set);
+        assert_eq!(watch.refresh(), 1);
+        watch.set.pids.clear();
+        host.unit("system.slice", "auditd.service", &[]);
+        assert_eq!(watch.refresh(), 0);
     }
 }

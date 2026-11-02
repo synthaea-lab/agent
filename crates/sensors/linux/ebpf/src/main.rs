@@ -12,7 +12,7 @@ use aya_ebpf::{
     },
     macros::{lsm, map, uprobe, uretprobe},
     maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
-    programs::{LsmContext, ProbeContext, RetProbeContext, TracePointContext},
+    programs::{LsmContext, ProbeContext, RawTracePointContext, RetProbeContext, TracePointContext},
 };
 use aya_log_ebpf::{info, warn};
 use sensor_linux_wire::{
@@ -3641,27 +3641,9 @@ fn emit_signal_event(ctx: &TracePointContext, target_pid: u32, sig: u32) -> Resu
         return Ok(0);
     }
 
-    let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
-    let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
-
     let e = SIGNAL_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
     unsafe {
-        core::ptr::write_bytes(e, 0, 1);
-        // meta is the SENDER, not the target — same convention as macOS's
-        // `SignalToEsClient` (see `SignalEvent`'s doc comment in `sensor-linux-wire`).
-        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
-        (*e).signal = sig;
-        (*e).target_pid = target_pid;
+        fill_signal_event(e, target_pid, sig)?;
 
         // Written before the ring-buffer output, so the slot is recorded even
         // when the ring is full.
@@ -3680,6 +3662,71 @@ fn emit_signal_event(ctx: &TracePointContext, target_pid: u32, sig: u32) -> Resu
         }
     }
 
+    Ok(0)
+}
+
+/// Fills `e` with a signal event: `meta` is the SENDER (the current task), the target is
+/// `target_pid` — same convention as macOS's `SignalToEsClient` (see `SignalEvent`'s doc comment
+/// in `sensor-linux-wire`). Shared by the syscall probes above and [`emit_tool_signal_event`].
+///
+/// # Safety
+///
+/// `e` must point at a valid, writable `SignalEvent` (the per-CPU scratch slot).
+#[inline(always)]
+unsafe fn fill_signal_event(e: *mut SignalEvent, target_pid: u32, sig: u32) -> Result<(), u32> {
+    let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
+    let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
+    unsafe {
+        core::ptr::write_bytes(e, 0, 1);
+        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        fill_lineage(&mut (*e).meta);
+        (*e).meta.uid = uid_gid as u32;
+        (*e).meta.gid = (uid_gid >> 32) as u32;
+        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
+        let mut i = 0usize;
+        while i < TASK_COMM_LEN {
+            (*e).meta.comm[i] = comm[i];
+            i += 1;
+        }
+        (*e).signal = sig;
+        (*e).target_pid = target_pid;
+    }
+    Ok(())
+}
+
+/// Thread-group ids of the processes of the listed security units (`SECURITY_SERVICES`), filled
+/// and refreshed by userspace from each unit's cgroup (#1103). The value is unused. The bound is
+/// a flood guard: a host has a handful of tools, each a few dozen processes.
+#[map]
+static SIGNAL_WATCH_TOOLS: HashMap<u32, u8> = HashMap::with_max_entries(1024, 0);
+
+/// Whether `tgid` is a process of a listed security unit.
+#[inline(always)]
+pub(crate) fn is_watched_tool(tgid: u32) -> bool {
+    unsafe { SIGNAL_WATCH_TOOLS.get(&tgid) }.is_some()
+}
+
+/// Emits a signal sent to a process of a listed security unit, from the `signal_generate`
+/// raw tracepoint (#1103). The target is already known to be watched and the signal to come from
+/// a process (not the kernel): `raw_signal_generate` checked both. A kill of a tool does not take
+/// the agent down, so the ring buffer is enough: nothing goes to `SIGNAL_TAMPER_LAST`.
+#[inline(always)]
+pub(crate) fn emit_tool_signal_event(
+    ctx: &RawTracePointContext,
+    target_tgid: u32,
+    sig: u32,
+) -> Result<u32, u32> {
+    let e = SIGNAL_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
+    unsafe {
+        fill_signal_event(e, target_tgid, sig)?;
+        if SIGNAL_EVENTS.output::<SignalEvent>(&*e, 0).is_err() {
+            warn!(
+                ctx,
+                "sensor-linux-ebpf: ring buffer full, dropping signal event"
+            );
+        }
+    }
     Ok(0)
 }
 

@@ -663,12 +663,15 @@ pub fn mount(
 }
 
 /// `target_image_path` is the caller's, not the wire event's — see this module's
-/// `WIRE_VERSION` v12 changelog for why.
+/// `WIRE_VERSION` v12 changelog for why. So is `target_unit` (#1103): the wire event carries
+/// only the pid, and the unit is what the sensor resolved from the cgroup when it put the
+/// target on the watch list.
 #[must_use]
 pub fn signal(
     event: &wire::SignalEvent,
     boot_epoch_offset_ns: u64,
     target_image_path: Option<String>,
+    target_unit: Option<String>,
     container: Option<ContainerContext>,
 ) -> Event {
     Event::Signal(SignalEvent {
@@ -676,7 +679,7 @@ pub fn signal(
         signal: event.signal,
         target_pid: event.target_pid,
         target_image_path,
-        target_unit: None,
+        target_unit,
     })
 }
 
@@ -1602,16 +1605,40 @@ mod tests {
             0,
             Some("/usr/local/bin/synthaea-agent".to_string()),
             None,
+            None,
         ) else {
             panic!("wrong variant")
         };
         assert_eq!(e.signal, 9);
+        assert_eq!(e.target_unit, None);
         assert_eq!(e.target_pid, 400);
         assert_eq!(e.meta.comm, "bash", "meta must stay the sender");
         assert_eq!(
             e.target_image_path.as_deref(),
             Some("/usr/local/bin/synthaea-agent")
         );
+    }
+
+    #[test]
+    fn a_signal_to_a_security_tool_carries_its_unit_and_the_exe_read_at_scan_time() {
+        let event = wire::SignalEvent {
+            meta: wire_meta(b"pkill"),
+            signal: 9,
+            target_pid: 612,
+        };
+        let Event::Signal(e) = signal(
+            &event,
+            0,
+            Some("/usr/sbin/auditd".to_string()),
+            Some("auditd".to_string()),
+            None,
+        ) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.target_pid, 612);
+        assert_eq!(e.target_unit.as_deref(), Some("auditd"));
+        assert_eq!(e.target_image_path.as_deref(), Some("/usr/sbin/auditd"));
+        assert_eq!(e.meta.comm, "pkill", "meta must stay the sender");
     }
 
     fn wire_kernel_module(name: &[u8]) -> wire::KernelModuleEvent {

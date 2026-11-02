@@ -13,8 +13,8 @@ pub(crate) fn err(msg: String) -> SensorError {
     msg.into()
 }
 
-/// Raw tracepoints attached by the sensor: three scheduler hooks and shared
-/// syscall entry/exit routers. The routers preserve the syscall handlers,
+/// Raw tracepoints attached by the sensor: three scheduler hooks, shared
+/// syscall entry/exit routers and `signal_generate`. The routers preserve the syscall handlers,
 /// including the paired `accept`, `recvfrom`, and `memfd_create` exit events.
 pub const RAW_TRACEPOINTS: &[(&str, &str)] = &[
     ("raw_sched_process_fork", "sched_process_fork"),
@@ -23,6 +23,8 @@ pub const RAW_TRACEPOINTS: &[(&str, &str)] = &[
     ("raw_sys_enter", "sys_enter"),
     ("raw_sys_exit", "sys_exit"),
     (DNS_UDP_PROGRAM, "sys_enter"),
+    // Signals to the processes of the listed security units (#1103), through `SIGNAL_WATCH_TOOLS`.
+    ("raw_signal_generate", "signal_generate"),
 ];
 
 /// The UDP/53 DNS capture (#458 part 3): its own program on `sys_enter`, attached only when the
@@ -88,6 +90,7 @@ fn load_embedded(tamper_pin: Option<&std::path::Path>) -> Result<aya::Ebpf, Sens
     let mut loader = aya::EbpfLoader::new();
     loader
         .override_global("TASK_PID_OFFSET", &offsets.task_pid, true)
+        .override_global("TASK_TGID_OFFSET", &offsets.task_tgid, true)
         .override_global("TASK_COMM_OFFSET", &offsets.task_comm, true)
         .override_global("BINPRM_FILENAME_OFFSET", &offsets.binprm_filename, true)
         .override_global("SYSCALL_ARG_OFFSETS", &offsets.syscall_args, true)
@@ -392,6 +395,26 @@ pub(crate) fn write_signal_watch_pid(ebpf: &mut aya::Ebpf, pid: u32) -> Result<(
     watch
         .set(0, pid, 0)
         .map_err(|e| err(format!("failed to write SIGNAL_WATCH_PID: {e}")))
+}
+
+/// Takes `SIGNAL_WATCH_TOOLS` (#1103) out of `ebpf`: the tgids of the processes of the listed
+/// security units, which `raw_signal_generate` reads.
+///
+/// # Errors
+///
+/// Returns [`SensorError`] when the map is missing from the eBPF object or is not a hash map of
+/// `u32` to `u8`.
+pub(crate) fn take_signal_watch_tools(
+    ebpf: &mut aya::Ebpf,
+) -> Result<aya::maps::HashMap<aya::maps::MapData, u32, u8>, SensorError> {
+    let map = ebpf
+        .take_map("SIGNAL_WATCH_TOOLS")
+        .ok_or_else(|| err("map SIGNAL_WATCH_TOOLS not found in eBPF object".to_string()))?;
+    aya::maps::HashMap::try_from(map).map_err(|e| {
+        err(format!(
+            "SIGNAL_WATCH_TOOLS is not a u32 -> u8 hash map: {e}"
+        ))
+    })
 }
 
 /// `sensor_linux_wire::SignalEvent` is `repr(C)` over integers and byte arrays, so

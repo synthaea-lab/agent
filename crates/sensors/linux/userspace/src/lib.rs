@@ -30,7 +30,8 @@ mod sensor;
 // The unit -> pids resolver of #1103; the tracepoint slice wires it, until then only its tests run.
 #[cfg(all(target_os = "linux", any(ebpf_embedded, test)))]
 mod syscall;
-#[cfg(all(target_os = "linux", test))]
+// Which processes belong to a listed security unit, for the `signal_generate` probe (#1103).
+#[cfg(target_os = "linux")]
 mod unit_procs;
 #[cfg(target_os = "linux")]
 pub use ebpf::{RAW_TRACEPOINTS, load_ebpf, load_program};
