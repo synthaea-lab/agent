@@ -81,7 +81,23 @@ pub struct DetectionConfig {
     /// the year, or change it when the clocks do. Absent by default.
     #[serde(default)]
     pub utc_offset_minutes: Option<i32>,
+    /// The local hours `[start, end)` in which a logon is ordinary, for ODD-HOUR-LOGON (#1089):
+    /// `[7, 20]` is the default. `start` is 0 to 23, `end` 1 to 24, and they differ. `start`
+    /// greater than `end` is an overnight window (`[22, 6]` is a night shift: 22:00 to 06:00
+    /// is ordinary and the day is not). Absent by default.
+    #[serde(default)]
+    pub work_hours: Option<[u32; 2]>,
+    /// Accounts whose odd-hour logons are expected, for ODD-HOUR-LOGON (#1089): on-call staff,
+    /// and the service or batch account of a schedule. Matched without case; a name without a
+    /// domain also matches the account under any domain (`svc_backup` matches
+    /// `CORP\svc_backup`). Only the odd-hour rule skips them: FIRST-SEEN-LOGON still reads
+    /// them. Empty by default, on purpose: nothing is exempt until the operator says so.
+    #[serde(default)]
+    pub odd_hour_exempt_accounts: Vec<String>,
 }
+
+/// Most accounts `[detection] odd_hour_exempt_accounts` may list.
+pub const MAX_ODD_HOUR_EXEMPT_ACCOUNTS: usize = 64;
 
 /// Most directories one agent plants canaries in. Each directory gets one canary per
 /// kind, so the count of decoys on disk is bounded by this and nothing else.

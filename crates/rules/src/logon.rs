@@ -135,6 +135,11 @@ pub type LocalOffsetAt = fn(i64) -> Option<i32>;
 pub(crate) struct OddHours {
     offset_minutes: Option<i32>,
     zone: Option<LocalOffsetAt>,
+    /// The local hours `[start, end)` of an ordinary logon; `start` greater than `end` wraps
+    /// midnight. [`WORK_HOURS_LOCAL`] until the operator declares another.
+    work_hours: (u32, u32),
+    /// Lowercased accounts whose odd-hour logons the operator declared expected.
+    exempt: Vec<String>,
     /// Lowercased account → timestamp of its last alert.
     last_alert_ns: BoundedMap<String, u64>,
 }
@@ -144,6 +149,8 @@ impl OddHours {
         Self {
             offset_minutes: None,
             zone: None,
+            work_hours: WORK_HOURS_LOCAL,
+            exempt: Vec::new(),
             last_alert_ns: BoundedMap::new(COUNTER_CAP),
         }
     }
@@ -156,6 +163,43 @@ impl OddHours {
         }
         self.offset_minutes = Some(minutes);
         true
+    }
+
+    /// Sets the ordinary local hours `[start, end)`; `start > end` wraps midnight (`22, 6` is a
+    /// night shift). False, and nothing changes, unless `start` is 0 to 23, `end` is 1 to 24 and
+    /// they differ.
+    pub(crate) fn set_work_hours(&mut self, start: u32, end: u32) -> bool {
+        if start > 23 || end == 0 || end > 24 || start == end {
+            return false;
+        }
+        self.work_hours = (start, end);
+        true
+    }
+
+    /// Declares the accounts whose odd-hour logons are expected (on-call, a schedule's service
+    /// account). Compared without case; an entry without a domain also matches the account under
+    /// any domain, an entry with one matches only that. Replaces the previous list.
+    pub(crate) fn set_exempt_accounts(&mut self, accounts: &[String]) {
+        self.exempt = accounts
+            .iter()
+            .map(|a| a.trim().to_lowercase())
+            .filter(|a| !a.is_empty())
+            .collect();
+    }
+
+    fn is_exempt(&self, user: &str) -> bool {
+        let lower = user.to_lowercase();
+        let name = lower.rsplit('\\').next().unwrap_or(&lower);
+        self.exempt.iter().any(|e| *e == lower || *e == name)
+    }
+
+    fn in_work_hours(&self, hour: u32) -> bool {
+        let (start, end) = self.work_hours;
+        if start < end {
+            (start..end).contains(&hour)
+        } else {
+            hour >= start || hour < end
+        }
     }
 
     /// Sets the platform's zone, used where no fixed offset is set. False, and nothing changes,
@@ -195,8 +239,11 @@ impl OddHours {
     /// this account has not been reported within [`ODD_HOUR_QUIET_NS`]; remembers it.
     pub(crate) fn observe(&mut self, user: &str, ts: u64) -> Option<u32> {
         let hour = self.local_hour(ts)?;
-        let (start, end) = WORK_HOURS_LOCAL;
-        if (start..end).contains(&hour) || user.is_empty() || is_generic_account(user) {
+        if self.in_work_hours(hour)
+            || user.is_empty()
+            || is_generic_account(user)
+            || self.is_exempt(user)
+        {
             return None;
         }
         let key = user.to_lowercase();

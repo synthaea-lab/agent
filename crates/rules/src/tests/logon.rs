@@ -509,3 +509,160 @@ fn a_zone_answer_no_timezone_has_is_ignored_at_that_instant() {
         .is_empty()
     );
 }
+
+// ODD-HOUR-LOGON, the operator's window and exempt accounts (#1089).
+
+/// UTC+2, working hours `start..end` local; `MIDNIGHT_UTC + h * HOUR` is `h + 2` o'clock local.
+fn with_window(start: u32, end: u32) -> RuleState {
+    let mut state = utc_plus_two();
+    assert!(state.set_work_hours(start, end));
+    state
+}
+
+/// A logon at `local_hour` o'clock on the UTC+2 host, 30 minutes in.
+fn at_local(local_hour: u64) -> u64 {
+    MIDNIGHT_UTC + (local_hour + 22) % 24 * HOUR + HOUR / 2
+}
+
+#[test]
+fn a_night_shift_window_wraps_midnight() {
+    // [22, 6): 22:00 to 06:00 is ordinary, the day is not.
+    let mut state = with_window(22, 6);
+    assert!(
+        odd_hour(&mut state, "nina", at_local(22)).is_empty(),
+        "22:30 is in"
+    );
+    assert!(
+        odd_hour(&mut state, "nina", at_local(23)).is_empty(),
+        "23:30 is in"
+    );
+    assert!(
+        odd_hour(&mut state, "nina", at_local(3)).is_empty(),
+        "03:30 is in"
+    );
+    assert!(
+        odd_hour(&mut state, "nina", at_local(5)).is_empty(),
+        "05:30 is in"
+    );
+    // 06:30 is out (the end is excluded) and 21:30 is out (before the start).
+    assert_eq!(
+        odd_hour(&mut state, "mallory", at_local(6)).len(),
+        1,
+        "06:30"
+    );
+    assert_eq!(odd_hour(&mut state, "dave", at_local(21)).len(), 1, "21:30");
+    assert_eq!(odd_hour(&mut state, "erin", at_local(12)).len(), 1, "noon");
+}
+
+#[test]
+fn a_declared_window_replaces_the_default_in_both_directions() {
+    // 18:30 is outside [9, 17) but inside the default 07:00-20:00; 08:30 the other way round.
+    let mut narrow = with_window(9, 17);
+    assert_eq!(odd_hour(&mut narrow, "mallory", at_local(18)).len(), 1);
+    assert_eq!(odd_hour(&mut narrow, "dave", at_local(8)).len(), 1);
+    assert!(odd_hour(&mut narrow, "alice", at_local(9)).is_empty());
+    let mut wide = with_window(5, 23);
+    assert!(odd_hour(&mut wide, "alice", at_local(21)).is_empty());
+    assert!(odd_hour(&mut wide, "bob", at_local(5)).is_empty());
+    assert_eq!(odd_hour(&mut wide, "mallory", at_local(23)).len(), 1);
+}
+
+#[test]
+fn a_round_the_clock_window_never_alerts() {
+    let mut state = with_window(0, 24);
+    for hour in 0..24 {
+        assert!(
+            odd_hour(&mut state, &format!("u{hour}"), at_local(hour)).is_empty(),
+            "{hour}"
+        );
+    }
+}
+
+#[test]
+fn a_window_that_is_not_one_is_refused_and_the_default_stays() {
+    let mut state = utc_plus_two();
+    for (start, end) in [(24, 6), (7, 25), (7, 0), (8, 8), (0, 0), (u32::MAX, 1)] {
+        assert!(!state.set_work_hours(start, end), "{start}..{end}");
+    }
+    // The default 07:00-20:00 still applies: 12:30 silent, 03:30 an alert.
+    assert!(odd_hour(&mut state, "alice", at_local(12)).is_empty());
+    assert_eq!(odd_hour(&mut state, "mallory", at_local(3)).len(), 1);
+}
+
+fn exempt(accounts: &[&str]) -> RuleState {
+    let mut state = utc_plus_two();
+    state.set_odd_hour_exempt_accounts(
+        &accounts
+            .iter()
+            .map(|a| (*a).to_string())
+            .collect::<Vec<_>>(),
+    );
+    state
+}
+
+#[test]
+fn an_exempt_account_is_silent_at_night_and_another_account_still_alerts() {
+    let mut state = exempt(&["svc_backup"]);
+    assert!(odd_hour(&mut state, "svc_backup", at_local(3)).is_empty());
+    assert_eq!(odd_hour(&mut state, "mallory", at_local(3)).len(), 1);
+}
+
+#[test]
+fn nothing_is_exempt_until_the_operator_says_so() {
+    let mut state = utc_plus_two();
+    assert_eq!(odd_hour(&mut state, "svc_backup", at_local(3)).len(), 1);
+}
+
+#[test]
+fn exempt_accounts_match_without_case_and_a_bare_name_matches_under_any_domain() {
+    let mut state = exempt(&["SVC_Backup"]);
+    assert!(odd_hour(&mut state, "svc_backup", at_local(3)).is_empty());
+    assert!(odd_hour(&mut state, "CORP\\svc_backup", at_local(3)).is_empty());
+    assert!(odd_hour(&mut state, "OTHER\\SVC_BACKUP", at_local(3)).is_empty());
+    // A near miss is another account.
+    assert_eq!(odd_hour(&mut state, "svc_backup2", at_local(3)).len(), 1);
+    assert_eq!(odd_hour(&mut state, "xsvc_backup", at_local(3)).len(), 1);
+}
+
+#[test]
+fn a_domain_qualified_exemption_matches_only_that_domain() {
+    let mut state = exempt(&["CORP\\oncall"]);
+    assert!(odd_hour(&mut state, "corp\\ONCALL", at_local(3)).is_empty());
+    assert_eq!(odd_hour(&mut state, "OTHER\\oncall", at_local(3)).len(), 1);
+    assert_eq!(odd_hour(&mut state, "oncall", at_local(3)).len(), 1);
+}
+
+#[test]
+fn declaring_the_exempt_accounts_again_replaces_the_list_and_ignores_blanks() {
+    let mut state = exempt(&["alice"]);
+    state.set_odd_hour_exempt_accounts(&["bob".to_string(), String::new(), "  ".to_string()]);
+    assert_eq!(odd_hour(&mut state, "alice", at_local(3)).len(), 1);
+    assert!(odd_hour(&mut state, "bob", at_local(3)).is_empty());
+    // A blank entry exempts nobody: not an account whose name is empty after the domain.
+    assert_eq!(odd_hour(&mut state, "CORP\\", at_local(3)).len(), 1);
+    assert_eq!(odd_hour(&mut state, "carol", at_local(3)).len(), 1);
+}
+
+#[test]
+fn the_exemption_is_only_the_odd_hour_rules_first_seen_still_alerts() {
+    let mut state = exempt(&["svc_backup"]);
+    // Learning starts at the first logon (12:00 local) and ends 24 h later; then 03:00 local.
+    assert!(
+        state
+            .on_auth(&logon("alice", MIDNIGHT_UTC + 10 * HOUR))
+            .is_empty()
+    );
+    let alerts = state.on_auth(&logon("svc_backup", MIDNIGHT_UTC + 49 * HOUR));
+    assert!(
+        alerts
+            .iter()
+            .any(|a| a.technique == "T1078" && !a.message.contains("outside the working hours")),
+        "first-seen must still see the exempt account: {alerts:?}"
+    );
+    assert!(
+        alerts
+            .iter()
+            .all(|a| !a.message.contains("outside the working hours")),
+        "{alerts:?}"
+    );
+}

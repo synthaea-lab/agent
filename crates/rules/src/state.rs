@@ -2116,6 +2116,21 @@ impl RuleState {
         self.odd_hours.set_offset_minutes(minutes)
     }
 
+    /// Declares the local hours `[start, end)` in which a logon is ordinary for ODD-HOUR-LOGON
+    /// (#1089); `start > end` wraps midnight (`22, 6`, a night shift). False, and the window
+    /// keeps what it had, unless `start` is 0 to 23, `end` 1 to 24 and they differ. The default is
+    /// [`WORK_HOURS_LOCAL`](crate::exclusions::WORK_HOURS_LOCAL).
+    pub fn set_work_hours(&mut self, start: u32, end: u32) -> bool {
+        self.odd_hours.set_work_hours(start, end)
+    }
+
+    /// Declares the accounts whose odd-hour logons are expected (#1089): on-call staff, a
+    /// schedule's service or batch account. ODD-HOUR-LOGON skips them; FIRST-SEEN-LOGON does not.
+    /// Replaces the previous list; empty by default, so nothing is exempt until the operator says so.
+    pub fn set_odd_hour_exempt_accounts(&mut self, accounts: &[String]) {
+        self.odd_hours.set_exempt_accounts(accounts);
+    }
+
     /// Gives the rules the host's platform time zone (#1088): `zone` maps an instant (seconds
     /// since the Unix epoch) to minutes east of UTC at that instant, so a logon either side of a
     /// daylight-saving change is judged by the hour the host's clock showed. Turns ODD-HOUR-LOGON

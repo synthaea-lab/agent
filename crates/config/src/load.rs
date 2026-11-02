@@ -302,6 +302,35 @@ fn validate_semantics(cfg: &AgentConfig, source_path: &Path) -> Result<(), Confi
         });
     }
 
+    // detection.work_hours — a typo would move the window the rule judges every logon by.
+    if let Some([start, end]) = cfg.detection.work_hours
+        && (start > 23 || end == 0 || end > 24 || start == end)
+    {
+        return Err(ConfigError::Invalid {
+            field: "detection.work_hours".into(),
+            expected: "[start, end]: start 0 to 23, end 1 to 24, start different from end".into(),
+            value: format!("[{start}, {end}]"),
+            origin: src.clone(),
+        });
+    }
+
+    // detection.odd_hour_exempt_accounts — bounded, and a blank name would exempt nothing
+    // while looking like it exempted someone.
+    let exempt = &cfg.detection.odd_hour_exempt_accounts;
+    if exempt.len() > crate::schema::MAX_ODD_HOUR_EXEMPT_ACCOUNTS
+        || exempt.iter().any(|a| a.trim().is_empty() || a.len() > 256)
+    {
+        return Err(ConfigError::Invalid {
+            field: "detection.odd_hour_exempt_accounts".into(),
+            expected: format!(
+                "at most {} account names, none blank or over 256 bytes",
+                crate::schema::MAX_ODD_HOUR_EXEMPT_ACCOUNTS
+            ),
+            value: format!("{} entries", exempt.len()),
+            origin: src.clone(),
+        });
+    }
+
     // deception.canary_dirs — each one gets files written into it by the agent, so a
     // typo must fail at boot rather than plant under a relative path of the cwd.
     if cfg.deception.canary_dirs.len() > crate::schema::MAX_CANARY_DIRS {
@@ -972,6 +1001,56 @@ control_plane_url = "https://cp.example"
             {
                 ConfigError::Invalid { field, .. } => {
                     assert_eq!(field, "detection.utc_offset_minutes");
+                }
+                other => panic!("expected Invalid, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn work_hours_and_exempt_accounts_default_to_nothing() {
+        let cfg = load_with_logs("").unwrap();
+        assert_eq!(cfg.detection.work_hours, None);
+        assert!(cfg.detection.odd_hour_exempt_accounts.is_empty());
+    }
+
+    #[test]
+    fn declared_work_hours_and_exempt_accounts_are_loaded() {
+        let cfg = load_with_logs(
+            "[detection]\nwork_hours = [22, 6]\nodd_hour_exempt_accounts = [\"svc_backup\", \"CORP\\\\oncall\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.detection.work_hours, Some([22, 6]));
+        assert_eq!(
+            cfg.detection.odd_hour_exempt_accounts,
+            ["svc_backup", "CORP\\oncall"]
+        );
+        assert!(load_with_logs("[detection]\nwork_hours = [0, 24]\n").is_ok());
+    }
+
+    #[test]
+    fn work_hours_no_clock_has_are_rejected() {
+        for text in ["[24, 6]", "[7, 25]", "[7, 0]", "[8, 8]", "[0, 0]"] {
+            match load_with_logs(&format!("[detection]\nwork_hours = {text}\n")).unwrap_err() {
+                ConfigError::Invalid { field, .. } => assert_eq!(field, "detection.work_hours"),
+                other => panic!("expected Invalid for {text}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_blank_or_too_long_exempt_list_is_rejected() {
+        let many = vec!["\"a\""; 65].join(", ");
+        for list in [
+            "[\"\"]".to_string(),
+            "[\"  \"]".to_string(),
+            format!("[{many}]"),
+        ] {
+            match load_with_logs(&format!("[detection]\nodd_hour_exempt_accounts = {list}\n"))
+                .unwrap_err()
+            {
+                ConfigError::Invalid { field, .. } => {
+                    assert_eq!(field, "detection.odd_hour_exempt_accounts");
                 }
                 other => panic!("expected Invalid, got {other:?}"),
             }

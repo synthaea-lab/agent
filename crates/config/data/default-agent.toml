@@ -118,5 +118,11 @@ max_reconnect_backoff_ms = 60000
 # To override the zone, or where the host names none (a minimal container is UTC to the C
 # library), give the local time as minutes east of UTC (120 = UTC+2, -300 = UTC-5), between
 # -720 and 840. Fixed: it does not follow daylight saving.
+# Calibration (#1089), both optional and empty by default: the local hours in which a logon
+# is ordinary ([7, 20] when absent; [22, 6] is a night shift, start greater than end wraps
+# midnight), and the accounts whose odd-hour logons are expected (on-call, a schedule's service
+# account; matched without case, a bare name matches any domain).
 # [detection]
 # utc_offset_minutes = 120
+# work_hours = [22, 6]
+# odd_hour_exempt_accounts = ["svc_backup"]

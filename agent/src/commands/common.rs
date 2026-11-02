@@ -71,6 +71,7 @@ pub(crate) fn plant_canaries(
 /// ignored rather than guessed; with neither the rule stays off.
 pub(crate) fn apply_detection(sink: &DetectionSink, detection: &config::DetectionConfig) {
     apply_platform_zone(sink);
+    apply_odd_hour_calibration(sink, detection);
     let Some(minutes) = detection.utc_offset_minutes else {
         return;
     };
@@ -83,6 +84,29 @@ pub(crate) fn apply_detection(sink: &DetectionSink, detection: &config::Detectio
         tracing::warn!(
             minutes,
             "detection: utc_offset_minutes is outside -720..=840, odd-hour logon rule stays off"
+        );
+    }
+}
+
+/// The operator's declared ordinary hours and exempt accounts for ODD-HOUR-LOGON (#1089);
+/// nothing changes for a host that declared neither.
+fn apply_odd_hour_calibration(sink: &DetectionSink, detection: &config::DetectionConfig) {
+    if let Some([start, end]) = detection.work_hours {
+        if sink.set_work_hours(start, end) {
+            tracing::info!(start, end, "detection: odd-hour logon window declared");
+        } else {
+            tracing::warn!(
+                start,
+                end,
+                "detection: work_hours is not a window, the default 07:00-20:00 stays"
+            );
+        }
+    }
+    if !detection.odd_hour_exempt_accounts.is_empty() {
+        sink.set_odd_hour_exempt_accounts(&detection.odd_hour_exempt_accounts);
+        tracing::info!(
+            count = detection.odd_hour_exempt_accounts.len(),
+            "detection: accounts exempt from the odd-hour logon rule"
         );
     }
 }
