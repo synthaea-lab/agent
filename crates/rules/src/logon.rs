@@ -124,7 +124,7 @@ const MIN_UTC_OFFSET_MINUTES: i32 = -12 * 60;
 
 /// The host's zone as a function: minutes east of UTC at an instant (seconds since the Unix
 /// epoch), or `None` when it cannot say. Supplied by the agent from the platform
-/// (`enrich::localzone`), so a logon is converted with the zone's rules **at that instant**,
+/// (`agent/src/commands/localzone.rs`), so a logon is converted with the zone's rules **at that instant**,
 /// daylight saving included.
 pub type LocalOffsetAt = fn(i64) -> Option<i32>;
 

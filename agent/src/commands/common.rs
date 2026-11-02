@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use tamper::heartbeat::SilenceMonitor;
 
+use super::localzone;
 use crate::{
     health::{
         DroppedCounter, HealthCollector, HealthCollectorConfig, HostCountersSource, NoopSpoolStats,
@@ -115,7 +116,7 @@ fn apply_odd_hour_calibration(sink: &DetectionSink, detection: &config::Detectio
 /// host names no zone (a minimal Unix container is UTC to the C library by default, which is
 /// not a choice anyone made) or the platform cannot convert the present.
 fn apply_platform_zone(sink: &DetectionSink) {
-    if !enrich::localzone::configured() {
+    if !localzone::configured() {
         tracing::info!(
             "detection: the host names no time zone; odd-hour logon rule off unless utc_offset_minutes is set"
         );
@@ -126,7 +127,7 @@ fn apply_platform_zone(sink: &DetectionSink) {
         .ok()
         .and_then(|d| i64::try_from(d.as_secs()).ok())
         .unwrap_or_default();
-    if sink.set_local_zone(enrich::localzone::utc_offset_minutes_at, now_secs) {
+    if sink.set_local_zone(localzone::utc_offset_minutes_at, now_secs) {
         tracing::info!("detection: platform time zone in use, odd-hour logon rule on");
     } else {
         tracing::warn!(

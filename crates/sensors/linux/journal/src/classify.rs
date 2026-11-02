@@ -145,7 +145,27 @@ pub fn classify(record: &JournalRecord) -> Option<JournalEvent> {
     classify_pam(&record.message)
 }
 
+/// Whether `record` was written by a systemd manager and not by a client of journald.
+///
+/// `JOB_TYPE`, `JOB_RESULT`, `UNIT` and `USER_UNIT` are ordinary journal fields that any local
+/// process can send over the native protocol; only the underscore-prefixed ones are stamped by
+/// journald. So `logger`-style input can claim "`falco.service` stopped" unless the writer is
+/// checked (#1085). The system manager is PID 1, which an unprivileged process cannot be, so
+/// that is the check. A `systemd --user` manager has no fixed pid, so it is accepted by
+/// `_COMM=systemd` only: that name is spoofable (see `auth::emitted_by`), which is why nothing
+/// that needs a trusted stop (`unitstop`) accepts a user-manager record. A record with no `_PID`
+/// is not trusted.
+fn from_manager(record: &JournalRecord) -> bool {
+    if record.pid.as_deref() == Some("1") {
+        return !record.from_user_manager;
+    }
+    record.from_user_manager && record.comm.as_deref() == Some("systemd")
+}
+
 fn classify_unit_job(record: &JournalRecord) -> Option<JournalEvent> {
+    if !from_manager(record) {
+        return None;
+    }
     let job_type = record.job_type.as_deref()?;
     let job_result = record.job_result.as_deref()?;
     let unit = record.unit.clone();
@@ -399,6 +419,7 @@ mod tests {
     #[test]
     fn unit_start_done_is_unit_started() {
         let r = record_with(&[
+            ("_PID", "1"),
             ("JOB_TYPE", "start"),
             ("JOB_RESULT", "done"),
             ("UNIT", "sshd.service"),
@@ -415,6 +436,7 @@ mod tests {
     #[test]
     fn unit_start_failed_is_unit_failed() {
         let r = record_with(&[
+            ("_PID", "1"),
             ("JOB_TYPE", "start"),
             ("JOB_RESULT", "failed"),
             ("UNIT", "broken.service"),
@@ -431,6 +453,7 @@ mod tests {
     #[test]
     fn unit_stop_done_is_unit_stopped() {
         let r = record_with(&[
+            ("_PID", "1"),
             ("JOB_TYPE", "stop"),
             ("JOB_RESULT", "done"),
             ("UNIT", "cron.service"),
@@ -453,6 +476,83 @@ mod tests {
             ("MESSAGE", "Job canceled."),
         ]);
         assert_eq!(classify(&r), None);
+    }
+
+    // --- who wrote the job record (#1085) ----------------------------------------
+
+    fn stop_fields<'a>(extra: &[(&'a str, &'a str)]) -> JournalRecord {
+        let mut fields = vec![
+            ("JOB_TYPE", "stop"),
+            ("JOB_RESULT", "done"),
+            ("UNIT", "falco.service"),
+            ("MESSAGE", "Stopped falco.service."),
+        ];
+        fields.extend_from_slice(extra);
+        record_with(&fields)
+    }
+
+    #[test]
+    fn forged_unit_job_from_another_pid_and_comm_is_not_classified() {
+        // A client of journald sends the manager's fields itself (`logger`-style): its own
+        // pid and comm are stamped by journald, so it is not PID 1.
+        let r = stop_fields(&[("_PID", "4242"), ("_COMM", "logger"), ("_UID", "1001")]);
+        assert_eq!(classify(&r), None);
+    }
+
+    #[test]
+    fn forged_unit_job_claiming_comm_systemd_from_another_pid_is_not_classified() {
+        // `cp /usr/bin/logger /tmp/systemd`: the comm is spoofable, the pid is not.
+        let r = stop_fields(&[("_PID", "4242"), ("_COMM", "systemd")]);
+        assert_eq!(classify(&r), None);
+    }
+
+    #[test]
+    fn unit_job_without_a_pid_is_not_classified() {
+        assert_eq!(classify(&stop_fields(&[])), None);
+    }
+
+    #[test]
+    fn user_unit_from_pid_1_is_not_classified() {
+        // PID 1 is the system manager: it writes `UNIT=`, never `USER_UNIT=`.
+        let r = record_with(&[
+            ("_PID", "1"),
+            ("JOB_TYPE", "stop"),
+            ("JOB_RESULT", "done"),
+            ("USER_UNIT", "falco.service"),
+            ("MESSAGE", "Stopped."),
+        ]);
+        assert_eq!(classify(&r), None);
+    }
+
+    #[test]
+    fn forged_user_unit_job_from_another_comm_is_not_classified() {
+        let r = record_with(&[
+            ("_PID", "4242"),
+            ("_COMM", "logger"),
+            ("JOB_TYPE", "stop"),
+            ("JOB_RESULT", "done"),
+            ("USER_UNIT", "falco.service"),
+            ("MESSAGE", "Stopped."),
+        ]);
+        assert_eq!(classify(&r), None);
+    }
+
+    #[test]
+    fn user_manager_job_is_classified_by_comm() {
+        let r = record_with(&[
+            ("_PID", "2101"),
+            ("_COMM", "systemd"),
+            ("JOB_TYPE", "start"),
+            ("JOB_RESULT", "done"),
+            ("USER_UNIT", "default.target"),
+            ("MESSAGE", "Reached target default.target."),
+        ]);
+        assert_eq!(
+            classify(&r),
+            Some(JournalEvent::UnitStarted {
+                unit: Some("default.target".into())
+            })
+        );
     }
 
     // --- sshd (documented format, not lab-verified — see module doc) -----------

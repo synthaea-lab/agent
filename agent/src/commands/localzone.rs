@@ -22,7 +22,7 @@
 /// Whether the host names a time zone: `TZ` is set, or `/etc/localtime` exists (Unix); always
 /// true on Windows, which has a zone setting whether or not anyone changed it.
 #[must_use]
-pub fn configured() -> bool {
+pub(super) fn configured() -> bool {
     #[cfg(unix)]
     {
         std::env::var_os("TZ").is_some() || std::path::Path::new("/etc/localtime").exists()
@@ -41,7 +41,7 @@ pub fn configured() -> bool {
 /// `None` when the platform cannot convert that instant. Sub-minute offsets (historic local mean
 /// time) are truncated to the minute.
 #[must_use]
-pub fn utc_offset_minutes_at(utc_secs: i64) -> Option<i32> {
+pub(super) fn utc_offset_minutes_at(utc_secs: i64) -> Option<i32> {
     imp::utc_offset_seconds_at(utc_secs).map(|s| i32::try_from(s / 60).ok())?
 }
 
@@ -124,5 +124,65 @@ mod imp {
 mod imp {
     pub(super) fn utc_offset_seconds_at(_utc_secs: i64) -> Option<i64> {
         None
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{configured, utc_offset_minutes_at};
+
+    // POSIX `TZ` rules are used instead of zoneinfo names so the result does not depend on the
+    // host's tzdata. Windows reads the machine's zone setting, which a test cannot change.
+    // `TZ` is process-wide: this is the only test in the agent that reads or sets it.
+    // 2026 transitions. Europe (CET/CEST): UTC 01:00 on 29 March and on 25 October.
+    // US Eastern: 07:00 UTC on 8 March (02:00 local), 06:00 UTC on 1 November.
+    const EU_SPRING: i64 = 1_774_746_000;
+    const EU_AUTUMN: i64 = 1_792_890_000;
+    const US_SPRING: i64 = 1_772_953_200;
+
+    fn set_tz(rule: &str) {
+        // SAFETY: the only test in this binary that touches `TZ`, and no other test converts
+        // local time, so nothing reads or writes it concurrently.
+        unsafe { std::env::set_var("TZ", rule) };
+    }
+
+    #[test]
+    fn the_offset_follows_the_zones_daylight_saving_rules_at_each_instant() {
+        set_tz("CET-1CEST,M3.5.0,M10.5.0/3");
+        assert!(configured());
+        assert_eq!(
+            utc_offset_minutes_at(EU_SPRING - 1),
+            Some(60),
+            "last second of winter time"
+        );
+        assert_eq!(
+            utc_offset_minutes_at(EU_SPRING),
+            Some(120),
+            "first second of summer time"
+        );
+        assert_eq!(
+            utc_offset_minutes_at(EU_AUTUMN - 1),
+            Some(120),
+            "last second of summer time"
+        );
+        assert_eq!(
+            utc_offset_minutes_at(EU_AUTUMN),
+            Some(60),
+            "first second of winter time"
+        );
+        // A past instant is judged by that instant's rules, not today's.
+        assert_eq!(utc_offset_minutes_at(0), Some(60));
+
+        // The platform is re-read on every call: the zone changes under a running agent.
+        set_tz("EST5EDT,M3.2.0,M11.1.0");
+        assert_eq!(utc_offset_minutes_at(US_SPRING - 1), Some(-300));
+        assert_eq!(utc_offset_minutes_at(US_SPRING), Some(-240));
+
+        // A zone with no daylight saving and a half-hour offset (India).
+        set_tz("IST-5:30");
+        assert_eq!(utc_offset_minutes_at(EU_SPRING), Some(330));
+
+        set_tz("UTC0");
+        assert_eq!(utc_offset_minutes_at(EU_SPRING), Some(0));
     }
 }

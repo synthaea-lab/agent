@@ -805,7 +805,8 @@ fn run_avc_worker<R, E: std::fmt::Display>(
 /// `sensor_linux_journal::UnitPersistenceTracker` (issue #93's other half) over
 /// the same stream, so a unit's first observed start lands as a
 /// `FLAG_PERSISTENCE_SYSTEMD_ARTIFACT` `FileOpenEvent` too — one tail thread,
-/// two independent mappings off the same classified record/event pair.
+/// independent mappings off the same classified record/event pair; the stop of a unit of
+/// `schema::SECURITY_SERVICES` lands as a `FLAG_UNIT_STOPPED` `FileOpenEvent` the same way (#1085).
 ///
 /// Best-effort at startup: a non-systemd init (Alpine/OpenRC, see
 /// `watchdog::service::linux`'s own doc on this) has no `journalctl` at all —
@@ -865,6 +866,11 @@ fn spawn_journal_tail(
                         }
                         if let Some(persistence_event) = unit_persistence.observe(&record, &event) {
                             sink.on_event(persistence_event);
+                        }
+                        if let Some(stop_event) =
+                            sensor_linux_journal::to_unit_stop_event(&record, &event)
+                        {
+                            sink.on_event(stop_event);
                         }
                     }
                     Err(e) => {
