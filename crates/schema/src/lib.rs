@@ -2200,8 +2200,9 @@ pub struct MountEvent {
 /// `sensor-macos` (#96), filtered at the source to targets that are
 /// `EndpointSecurity` clients — i.e. this agent and other security tools:
 /// the tamper-attempt subset of the platform's full (and enormous) signal
-/// stream, per the sensor's volume discipline. Platform-neutral shape;
-/// a Linux kill-tracing source can reuse it with its own target filter.
+/// stream, per the sensor's volume discipline. Platform-neutral shape; Linux reuses it for the
+/// agent's own pid (the `kill`/`tgkill` probes, #362) and for the processes of the listed security
+/// units (the `signal_generate` tracepoint, #1103, which fills `target_unit`).
 ///
 /// `meta` is the *sender* — the interesting party in a tamper attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

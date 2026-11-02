@@ -734,10 +734,12 @@ pub struct MountEvent {
     pub mounted: bool,
 }
 
-/// A signal was sent to a watched target (`syscalls:sys_enter_kill`/
-/// `sys_enter_tgkill`, issue #362), filtered at the probe via `SIGNAL_WATCH_PID`
-/// (internal to the ebpf crate) to targets that are the agent's own pid — see this
-/// file's `WIRE_VERSION` v12 changelog. `meta` is the SENDER, not the target —
+/// A signal was sent to a watched target: the agent's own pid (`syscalls:sys_enter_kill`/
+/// `sys_enter_tgkill`, issue #362, filtered at the probe via `SIGNAL_WATCH_PID`, internal to the
+/// ebpf crate), or a process of a listed security unit (`signal:signal_generate`, #1103, filtered
+/// via `SIGNAL_WATCH_TOOLS`; `target_pid` is then the target's thread-group id and userspace adds
+/// the unit). For the agent's own pid, see this file's `WIRE_VERSION` v12 changelog.
+/// `meta` is the SENDER, not the target —
 /// same convention as macOS's `SignalToEsClient`.
 #[repr(C)]
 #[derive(Clone, Copy)]

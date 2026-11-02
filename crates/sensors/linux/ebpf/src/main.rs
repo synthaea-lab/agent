@@ -3592,7 +3592,9 @@ const TGKILL_SIG_OFFSET: usize = 20;
 // (`SIGNAL_WATCH_PID`) — there is no field in `tkill(2)`'s argument list
 // comparable to that identity. Superseded by `tgkill(2)` in practice (glibc's
 // `pthread_kill` uses `tgkill`, and a plain `kill(1)` uses `kill(2)`), so this
-// is a narrow, accepted gap rather than a missing common path.
+// is a narrow, accepted gap rather than a missing common path **for the agent's own pid**.
+// The other security tools do not have it: `raw_signal_generate` (#1103) sees `tkill`,
+// `pidfd_send_signal` and `rt_sigqueueinfo` too, and compares the target's `tgid`.
 
 pub fn sys_enter_kill(ctx: TracePointContext) -> u32 {
     match try_sys_enter_kill(ctx) {
