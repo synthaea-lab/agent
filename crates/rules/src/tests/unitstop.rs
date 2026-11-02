@@ -233,6 +233,10 @@ fn a_shutdown_just_before_explains_the_stops_of_every_unit() {
     for command in [
         "shutdown -h now",
         "shutdown -r now",
+        "shutdown now",
+        "shutdown -P +0",
+        "shutdown --no-wall now",
+        "shutdown -h now going down for maintenance",
         "reboot",
         "poweroff",
         "halt",
@@ -268,6 +272,11 @@ fn a_command_that_does_not_shut_the_host_down_is_not_a_shutdown() {
     for command in [
         "shutdown -k now",
         "shutdown -c",
+        "shutdown --cancel",
+        "shutdown --no-wall",
+        "shutdown -h",
+        "systemctl reboot --when=+1h",
+        "systemctl poweroff --when 23:00",
         "systemctl status reboot.target",
         "init 3",
         "systemctl stop nginx",
@@ -277,6 +286,51 @@ fn a_command_that_does_not_shut_the_host_down_is_not_a_shutdown() {
             "auditd",
         );
     }
+}
+
+/// A scheduled shutdown stops nothing now: it must not open the window (reviewer's repro).
+#[test]
+fn scheduled_shutdown_suppresses_a_stop() {
+    for command in [
+        "shutdown +60",
+        "shutdown +99",
+        "shutdown 23:00",
+        "shutdown -h +5 back soon",
+        "shutdown -r 04:30",
+    ] {
+        assert_alerts_once(&judged("falco", &[(command, T0 - 10 * SEC)]), "falco");
+    }
+}
+
+#[test]
+fn a_cancel_closes_the_window_a_shutdown_opened() {
+    for cancel in [
+        "shutdown -c",
+        "shutdown --cancel",
+        "shutdown -c done",
+        "systemctl reboot --when=cancel",
+    ] {
+        assert_alerts_once(
+            &judged(
+                "falco",
+                &[("shutdown now", T0 - 20 * SEC), (cancel, T0 - 10 * SEC)],
+            ),
+            "falco",
+        );
+    }
+    // The cancel is what closes it: the same shutdown without one still explains the stop.
+    assert!(judged("falco", &[("shutdown now", T0 - 20 * SEC)]).is_empty());
+    // A cancel before the shutdown closes nothing.
+    assert!(
+        judged(
+            "falco",
+            &[
+                ("shutdown -c", T0 - 20 * SEC),
+                ("shutdown now", T0 - 10 * SEC)
+            ]
+        )
+        .is_empty()
+    );
 }
 
 // --- what is not reached ----------------------------------------------------------------------

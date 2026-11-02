@@ -20,9 +20,12 @@
 //! **No shutdown signal exists** in the stream (the journal sensor reports unit stops of the
 //! listed services only, not `shutdown.target`), and the service-stop burst counts *execs*, not
 //! journal stops, so neither can stand for condition 3. It is read from the exec of `shutdown`,
-//! `reboot`, `poweroff`, `halt`, `systemctl reboot|poweroff|halt|kexec` and `init 0|6`. A shutdown
-//! asked another way (power button, logind from a desktop session, a hypervisor ACPI request) is a
-//! stated gap: its stops alert.
+//! `reboot`, `poweroff`, `halt`, `systemctl reboot|poweroff|halt|kexec` and `init 0|6`. Only an
+//! **immediate** shutdown (`shutdown now`, `+0`) opens the window: `shutdown +60` or `23:00`
+//! schedules one that stops nothing yet, and would otherwise cloak any stop in the next five
+//! minutes (`shutdown +99`, stop the tool, `shutdown -c`). `shutdown -c`/`--cancel` (and
+//! `systemctl --when=cancel`) closes a window already open. A shutdown asked another way (power button, logind from a
+//! desktop session, a hypervisor ACPI request) is a stated gap: its stops alert.
 //!
 //! Judging at the end of a wait, not on arrival, is what makes condition 2 possible and what makes
 //! the order the exec and the journal events arrive in irrelevant: the journal and the eBPF exec
@@ -54,7 +57,7 @@ pub(crate) const EXEC_LOOKBACK_NS: u64 = 120_000_000_000;
 
 /// How long after a shutdown was asked for its stops are expected: the units stop in dependency
 /// order, each bounded by `DefaultTimeoutStopSec` (90 s), so a shutdown's last stop can come
-/// minutes later. A delayed `shutdown +10` is outside the window and its stops alert.
+/// minutes later. A scheduled `shutdown +10` does not open it: its stops alert.
 pub(crate) const SHUTDOWN_WINDOW_NS: u64 = 300_000_000_000;
 
 /// Clock difference tolerated between the two sources: the journal's realtime timestamp and the
@@ -113,8 +116,10 @@ impl UnitStops {
     pub(crate) fn on_exec(&mut self, event: &ExecEvent) {
         let ts = event.meta.timestamp_ns;
         self.clock_ns = self.clock_ns.max(ts);
-        if is_shutdown(event) {
-            self.shutdown_ns = Some(ts);
+        match shutdown_effect(event) {
+            Some(Shutdown::Now) => self.shutdown_ns = Some(ts),
+            Some(Shutdown::Cancel) => self.shutdown_ns = None,
+            None => {}
         }
         for (touch, unit) in unit_touches(event) {
             let list = self.touches.get_or_insert_with(unit, Vec::new);
@@ -278,29 +283,63 @@ fn deb_systemd_invoke_starts(args: &[String]) -> Vec<(Touch, String)> {
     positional.map(|unit| (touch, unit.clone())).collect()
 }
 
-/// Whether this exec tells the host to shut down or reboot now: `shutdown` (not `-k`, which only
-/// warns, nor `-c`, which cancels), `reboot`, `poweroff`, `halt`, `systemctl reboot|poweroff|
-/// halt|kexec`, `init`/`telinit 0|6`.
-fn is_shutdown(event: &ExecEvent) -> bool {
+/// What an exec does to the host's shutdown state.
+#[derive(Debug, PartialEq, Eq)]
+enum Shutdown {
+    /// The host is told to go down now: the units stop in the next minutes.
+    Now,
+    /// A scheduled shutdown is cancelled: the window it opened is closed.
+    Cancel,
+}
+
+/// Whether this exec tells the host to shut down or reboot **now** (`Now`), or cancels one
+/// (`Cancel`). `shutdown` counts only with an immediate time (`now`, `+0`): `+N` and `HH:MM`
+/// schedule a shutdown that stops nothing yet, and a bare `shutdown` is `+1` for systemd. `-k`
+/// only warns. `reboot`, `poweroff`, `halt`, `systemctl reboot|poweroff|halt|kexec` and
+/// `init`/`telinit 0|6` are immediate, unless `systemctl` is given `--when=` (a schedule, or
+/// `--when=cancel`).
+fn shutdown_effect(event: &ExecEvent) -> Option<Shutdown> {
     let program = program(event);
     let args = args(event);
     match program.as_str() {
-        "reboot" | "poweroff" | "halt" => true,
-        "shutdown" => !args
-            .iter()
-            .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains(['c', 'k'])),
-        "systemctl" => args
-            .iter()
-            .find(|a| !a.starts_with('-'))
-            .is_some_and(|verb| {
-                matches!(
-                    verb.as_str(),
-                    "reboot" | "poweroff" | "halt" | "kexec" | "soft-reboot"
-                )
-            }),
+        "reboot" | "poweroff" | "halt" => Some(Shutdown::Now),
+        "shutdown" => {
+            let short = |flag: char| {
+                args.iter()
+                    .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains(flag))
+            };
+            if short('c') || args.iter().any(|a| a == "--cancel") {
+                return Some(Shutdown::Cancel);
+            }
+            if short('k') {
+                return None;
+            }
+            // The first argument that is not an option is the time; the rest is the wall message.
+            let time = args.iter().find(|a| !a.starts_with('-'))?;
+            (time == "now" || time == "+0").then_some(Shutdown::Now)
+        }
+        "systemctl" => {
+            let verb = args.iter().find(|a| !a.starts_with('-'))?;
+            if !matches!(
+                verb.as_str(),
+                "reboot" | "poweroff" | "halt" | "kexec" | "soft-reboot"
+            ) {
+                return None;
+            }
+            let when = args.iter().enumerate().find_map(|(i, a)| {
+                a.strip_prefix("--when=")
+                    .or_else(|| (a == "--when").then(|| args.get(i + 1).map_or("", String::as_str)))
+            });
+            match when {
+                None => Some(Shutdown::Now),
+                Some("cancel") => Some(Shutdown::Cancel),
+                Some(_) => None,
+            }
+        }
         "init" | "telinit" => args
             .first()
-            .is_some_and(|level| level == "0" || level == "6"),
-        _ => false,
+            .is_some_and(|level| level == "0" || level == "6")
+            .then_some(Shutdown::Now),
+        _ => None,
     }
 }
