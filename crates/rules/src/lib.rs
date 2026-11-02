@@ -45,6 +45,7 @@ pub use inventory::{PACKAGE_CHANGE, evaluate_package_change};
 // `RuleState::on_ldap_search`.
 pub use ldap::evaluate_ldap_search;
 // NTLM rules (#364): Internet-bound authentication and weak versions.
+pub use logon::LocalOffsetAt;
 pub use ntlm::evaluate_ntlm_auth;
 use schema::detection::Severity;
 pub use signature_gate::{ImageSignature, SignatureGatedAlert};

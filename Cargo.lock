@@ -1118,10 +1118,12 @@ dependencies = [
 name = "enrich"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "schema",
  "sha2 0.11.1",
  "store",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
