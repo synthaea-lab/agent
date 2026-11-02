@@ -325,7 +325,7 @@ mod tests {
         let input = [
             r#"{"__CURSOR":"c1","__REALTIME_TIMESTAMP":"1","SYSLOG_IDENTIFIER":"kernel","MESSAGE":"eth0 up"}"#,
             r#"{"__CURSOR":"c2","__REALTIME_TIMESTAMP":"2","SYSLOG_IDENTIFIER":"sudo","MESSAGE":"     lab : TTY=pts/0 ; USER=root ; COMMAND=/bin/true"}"#,
-            r#"{"__CURSOR":"c3","__REALTIME_TIMESTAMP":"3","JOB_TYPE":"start","JOB_RESULT":"done","UNIT":"cron.service","MESSAGE":"Started cron.service."}"#,
+            r#"{"__CURSOR":"c3","__REALTIME_TIMESTAMP":"3","_PID":"1","JOB_TYPE":"start","JOB_RESULT":"done","UNIT":"cron.service","MESSAGE":"Started cron.service."}"#,
         ]
         .join("\n");
 
@@ -346,7 +346,7 @@ mod tests {
     fn skips_a_binary_message_line_without_ending_the_stream() {
         let input = [
             r#"{"__CURSOR":"c1","__REALTIME_TIMESTAMP":"1","MESSAGE":[1,2,3]}"#,
-            r#"{"__CURSOR":"c2","__REALTIME_TIMESTAMP":"2","JOB_TYPE":"stop","JOB_RESULT":"done","UNIT":"x.service","MESSAGE":"Stopped x.service."}"#,
+            r#"{"__CURSOR":"c2","__REALTIME_TIMESTAMP":"2","_PID":"1","JOB_TYPE":"stop","JOB_RESULT":"done","UNIT":"x.service","MESSAGE":"Stopped x.service."}"#,
         ]
         .join("\n");
 

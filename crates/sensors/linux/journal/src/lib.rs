@@ -40,6 +40,16 @@
 //! doc for why this is an approximation ("first start seen by this agent
 //! process"), not a true install signal.
 //!
+//! Also done (#1085, T1562.001): [`unitstop::to_unit_stop_event`] maps the stop of a unit of
+//! `schema::SECURITY_SERVICES` into `schema::FileOpenEvent`/`FLAG_UNIT_STOPPED`, filtered here so
+//! the other units that stop at every reboot never leave the sensor. The journal names no actor:
+//! the event says a stop happened, not who asked. Unit job records are only trusted from a
+//! systemd manager (`_PID=1`, or `_COMM=systemd` for a `--user` manager): `JOB_TYPE`/`UNIT` are
+//! client-settable journal fields, so before this a `logger`-style record could claim a start or
+//! stop of any unit. A stop is only reported from the system manager (a user can name a user unit
+//! `falco.service`). Not lab-verified: a system-manager `JOB_TYPE=stop` record has not been
+//! captured on a real host (the only capture is a user manager's, see `record.rs`'s tests).
+//!
 //! **Liveness (#71, #83):** the iterator yields allowlisted records only, so the agent's
 //! silence heartbeat hangs on [`ClassifiedJournal::with_line_hook`], which sees every
 //! non-blank line, and the canary line (`CANARY_IDENTIFIER`) the agent writes into
@@ -67,6 +77,7 @@ mod classify;
 mod persistence;
 mod record;
 mod tail;
+mod unitstop;
 
 pub use auth::to_auth_event;
 pub use canary::{CANARY_IDENTIFIER, canary_payload};
@@ -78,6 +89,7 @@ pub use record::{JournalRecord, parse_record};
 pub use tail::ClassifiedJournal;
 #[cfg(target_os = "linux")]
 pub use tail::process::{current_cursor, spawn_follow};
+pub use unitstop::to_unit_stop_event;
 
 /// Errors from parsing a journal record or driving `journalctl`.
 #[derive(Debug, thiserror::Error)]
