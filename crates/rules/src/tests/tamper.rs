@@ -171,3 +171,61 @@ fn a_signal_to_a_listed_unit_names_the_unit_and_a_signal_without_one_is_unchange
     let alert = check_security_process_signal(&event).expect("alerts");
     assert!(!alert.message.contains("of unit"), "{}", alert.message);
 }
+
+/// A signal to a process of a listed security unit (Linux, #1103): the event names the unit.
+fn signal_to_tool(sender_pid: u32, comm: &str, signal: u32) -> SignalEvent {
+    let mut event = signal_from(sender_pid, comm, signal, 612);
+    event.target_image_path = Some("/usr/sbin/auditd".into());
+    event.target_unit = Some("auditd".into());
+    event
+}
+
+/// The benign case the issue asks a test for: logrotate's `postrotate`, `ExecReload=` and
+/// `systemctl reload` all send `SIGHUP`, which a daemon reads as "reload your configuration".
+#[test]
+fn a_sighup_to_a_security_tool_is_a_reload_and_does_not_alert() {
+    for (pid, comm) in [(4242, "kill"), (3100, "logrotate"), (1, "systemd")] {
+        assert!(
+            check_security_process_signal(&signal_to_tool(pid, comm, 1)).is_none(),
+            "{comm}"
+        );
+    }
+    // The agent does not reload on `SIGHUP`: it still alerts.
+    let alert = check_security_process_signal(&signal_from(4242, "bash", 1, 400)).unwrap();
+    assert_eq!(alert.severity, crate::Severity::High);
+}
+
+#[test]
+fn sigkill_and_sigstop_to_a_security_tool_are_high_and_name_the_unit() {
+    for signal in [9, 19] {
+        let alert = check_security_process_signal(&signal_to_tool(4242, "pkill", signal))
+            .expect("must alert");
+        assert_eq!(alert.severity, crate::Severity::High, "signal {signal}");
+        assert_eq!(alert.technique, "T1562.001");
+        assert!(
+            alert.message.contains("of unit auditd"),
+            "{}",
+            alert.message
+        );
+    }
+}
+
+/// An administrator's `kill <pid>` of auditd, and `service auditd stop` (its helper sends the
+/// `SIGTERM` itself, not pid 1), look like an attacker's: Medium, like the exec rule's stop.
+#[test]
+fn the_catchable_terminating_signals_to_a_security_tool_are_medium() {
+    for signal in [2, 3, 6, 15] {
+        let alert = check_security_process_signal(&signal_to_tool(10138, "auditctl", signal))
+            .expect("must alert");
+        assert_eq!(alert.severity, crate::Severity::Medium, "signal {signal}");
+    }
+}
+
+#[test]
+fn the_service_manager_stays_low_for_a_security_tool_and_a_tool_signalling_itself_is_silent() {
+    for signal in [2, 9, 15, 19] {
+        let alert = check_security_process_signal(&signal_to_tool(1, "systemd", signal)).unwrap();
+        assert_eq!(alert.severity, crate::Severity::Low, "signal {signal}");
+    }
+    assert!(check_security_process_signal(&signal_to_tool(612, "auditd", 9)).is_none());
+}

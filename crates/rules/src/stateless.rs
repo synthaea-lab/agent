@@ -1252,6 +1252,10 @@ pub fn evaluate_log_cleared(event: &schema::LogClearedEvent) -> Vec<Alert> {
     }]
 }
 
+/// `SIGHUP` and `SIGKILL`: the same on Linux and macOS.
+const SIGHUP: u32 = 1;
+const SIGKILL: u32 = 9;
+
 /// `SIGSTOP`'s platform-native number: the one signal of
 /// [`tamper_signal_name`]'s set that differs between Linux and macOS. Signal
 /// events carry the sending host's numbering, and rules run on that same host.
@@ -1296,7 +1300,17 @@ const INIT_PID: u32 = 1;
 ///   say who asked the manager. Who did is the exec rule's (`check_security_tool_stop`,
 ///   which parses `systemctl stop` and `systemctl kill`) and the journal's, not this rule's.
 ///   A D-Bus stop has no exec: only the journal sees it.
-/// - Anyone else: High, as before.
+/// - Anyone else: High, as before, **for the agent itself**. For a listed security tool (the
+///   event carries `target_unit`, Linux, #1103) the signal decides:
+///   - **`SIGHUP` is not an alert**: a daemon takes it as "reload your configuration"
+///     (logrotate's `postrotate`, `ExecReload=`, `systemctl reload`), the commonest benign signal
+///     a tool gets. The cost is a tool with no `SIGHUP` handler, which it ends; that kill is not
+///     seen here. The agent keeps `SIGHUP` as an alert, it does not reload on it.
+///   - `SIGKILL` and `SIGSTOP`, which cannot be handled, are **High**.
+///   - The catchable ones that end a daemon (`SIGTERM`, `SIGINT`, `SIGQUIT`, `SIGABRT`) are
+///     **Medium**: an administrator's `kill <pid>`, or `service auditd stop` (whose helper sends
+///     the `SIGTERM` itself, not pid 1), is indistinguishable from an attacker's, exactly as
+///     `systemctl stop auditd` is Medium in `check_security_tool_stop`.
 ///
 /// What it **cannot** tell: whether a sender other than pid 1 is the agent's own
 /// supervisor (the watchdog) or another process of the same unit, since the event has
@@ -1311,6 +1325,10 @@ const INIT_PID: u32 = 1;
 pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Option<Alert> {
     let name = tamper_signal_name(event.signal)?;
     if event.meta.pid == event.target_pid {
+        return None;
+    }
+    let tool = event.target_unit.is_some();
+    if tool && event.signal == SIGHUP {
         return None;
     }
     let target = event.target_image_path.as_deref().unwrap_or("?");
@@ -1329,6 +1347,8 @@ pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Opti
         technique: "T1562.001",
         severity: if from_manager {
             Severity::Low
+        } else if tool && event.signal != SIGKILL && event.signal != SIGSTOP {
+            Severity::Medium
         } else {
             Severity::High
         },

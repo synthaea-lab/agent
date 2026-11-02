@@ -42,8 +42,8 @@ fn is_security_tool(service: &str) -> bool {
 /// stop that is refused (a Defender service cannot be stopped from `sc` on a current
 /// Windows), a tool killed with `kill`, `pkill` or `taskkill` (`systemctl kill` is read, since the
 /// manager's signal from pid 1 is only Low in `check_security_process_signal`), or stopped over D-Bus or an
-/// API, is not seen here, and the stop's success is not observed. A `SIGKILL` of the agent
-/// itself is `check_security_process_signal`'s.
+/// API, is not seen here, and the stop's success is not observed. A signal to a tool, the
+/// agent's or (Linux, #1103) a listed tool's, is `check_security_process_signal`'s.
 #[must_use]
 pub(crate) fn check_security_tool_stop(event: &ExecEvent) -> Option<Alert> {
     let tool = services_stopped(event)
