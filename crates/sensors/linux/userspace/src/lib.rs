@@ -27,8 +27,11 @@ mod parent_image;
 mod proc;
 #[cfg(target_os = "linux")]
 mod sensor;
+// The unit -> pids resolver of #1103; the tracepoint slice wires it, until then only its tests run.
 #[cfg(all(target_os = "linux", any(ebpf_embedded, test)))]
 mod syscall;
+#[cfg(all(target_os = "linux", test))]
+mod unit_procs;
 #[cfg(target_os = "linux")]
 pub use ebpf::{RAW_TRACEPOINTS, load_ebpf, load_program};
 #[cfg(target_os = "linux")]
