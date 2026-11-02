@@ -1274,11 +1274,33 @@ fn tamper_signal_name(signal: u32) -> Option<&'static str> {
     }
 }
 
+/// The process id of the service manager: `systemd` on Linux, `launchd` on macOS. The Linux probe
+/// reports the sender's thread-group id from the **initial** pid namespace, so a container's own
+/// init is not 1 here, and only the host's manager is.
+const INIT_PID: u32 = 1;
+
 /// T1562.001 — Impair Defenses: Disable or Modify Tools, the process-termination
 /// half (issue #362). Every [`schema::SignalEvent`] already targets a protected
 /// security process: the sensors filter at the source (Linux: the eBPF
 /// `SIGNAL_WATCH_PID` gate on the agent's own pid; macOS: the Endpoint Security
-/// client gate). This rule only keeps the signals that end or freeze the target.
+/// client gate). This rule only keeps the signals that end or freeze the target, and
+/// then looks at the **sender** (#1103), which is all the event says about the actor:
+/// `meta` is the sender's pid, parent, comm, uid and container, with no cgroup or unit.
+///
+/// - A process signalling **itself** (`meta.pid == target_pid`: `abort()`, a fatal-error
+///   `raise(SIGTERM)`) is not tampering: no alert.
+/// - The service manager (**pid 1**) is **Low**, not High. It is what delivers `systemctl
+///   stop` (SIGTERM, then SIGKILL once the stop times out), `restart` and a package
+///   upgrade, so High on each would make every upgrade a High finding. It is not dropped:
+///   `systemctl kill -s KILL` and a D-Bus stop arrive from pid 1 too, and the event cannot
+///   say who asked the manager. Who did is the exec rule's (`check_security_tool_stop`)
+///   and the journal's, not this rule's.
+/// - Anyone else: High, as before.
+///
+/// What it **cannot** tell: whether a sender other than pid 1 is the agent's own
+/// supervisor (the watchdog) or another process of the same unit, since the event has
+/// no sender unit or cgroup. Such a signal still alerts High. Telling them apart needs
+/// the sender's unit in the event, which is a schema change and not made here.
 ///
 /// On Linux it is the only record of a `SIGKILL`'s sender: the agent's own
 /// `kill_loudness` can only attribute the catchable signals. The kernel-side
@@ -1287,17 +1309,34 @@ fn tamper_signal_name(signal: u32) -> Option<&'static str> {
 #[must_use]
 pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Option<Alert> {
     let name = tamper_signal_name(event.signal)?;
+    if event.meta.pid == event.target_pid {
+        return None;
+    }
     let target = event.target_image_path.as_deref().unwrap_or("?");
     let sender_uid = match &event.meta.user {
         schema::User::Unix { uid, .. } => format!(" uid={uid}"),
         _ => String::new(),
     };
+    let from_manager = event.meta.pid == INIT_PID;
     Some(Alert {
         technique: "T1562.001",
-        severity: Severity::High,
+        severity: if from_manager {
+            Severity::Low
+        } else {
+            Severity::High
+        },
         message: format!(
-            "pid={} comm={}{sender_uid}: sent {name} ({}) to security process pid={} ({target})",
-            event.meta.pid, event.meta.comm, event.signal, event.target_pid,
+            "pid={} comm={}{sender_uid}: sent {name} ({}) to security process pid={} ({target}){}",
+            event.meta.pid,
+            event.meta.comm,
+            event.signal,
+            event.target_pid,
+            if from_manager {
+                ": sent by the service manager, which does not say who asked it (a stop, \
+                 restart or upgrade, or `systemctl kill`)"
+            } else {
+                ""
+            },
         ),
     })
 }
