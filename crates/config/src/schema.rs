@@ -88,10 +88,13 @@ pub struct DetectionConfig {
     #[serde(default)]
     pub work_hours: Option<[u32; 2]>,
     /// Accounts whose odd-hour logons are expected, for ODD-HOUR-LOGON (#1089): on-call staff,
-    /// and the service or batch account of a schedule. Matched without case; a name without a
-    /// domain also matches the account under any domain (`svc_backup` matches
-    /// `CORP\svc_backup`). Only the odd-hour rule skips them: FIRST-SEEN-LOGON still reads
-    /// them. Empty by default, on purpose: nothing is exempt until the operator says so.
+    /// and the service or batch account of a schedule. Each entry must match the account **as
+    /// the logon reports it**, case aside: write `CORP\svc_backup`, not `svc_backup`, for a
+    /// domain account, because a bare entry exempts only an unqualified account (an intruder
+    /// with local admin picks the account name, and a bare entry matching any domain would
+    /// exempt a local `svc_backup` it created). Only the odd-hour rule skips them:
+    /// FIRST-SEEN-LOGON still reads them. Empty by default, on purpose: nothing is exempt
+    /// until the operator says so.
     #[serde(default)]
     pub odd_hour_exempt_accounts: Vec<String>,
 }
