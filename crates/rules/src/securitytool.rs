@@ -7,50 +7,13 @@
 //! falco` is what an intruder does to blind the host before acting, and it is below the
 //! burst's threshold by design.
 
-use schema::{ExecEvent, detection::Severity};
+use schema::{ExecEvent, SECURITY_SERVICES, detection::Severity};
 
 use crate::{Alert, servicestop::services_stopped};
 
-/// Services of security tooling, lowercase, compared without a `.service` suffix. Product
-/// names are as the vendors' documentation gives them and were **not checked on a host**: a
-/// name that is wrong costs a missed stop, never a false alert. `auditd` is here although
-/// two Sigma rules name two forms of its stop: those match `mask --now` and `auditctl -e 0`,
-/// this matches the rest, and `mask --now auditd` raises both.
-///
-/// Left out on purpose: the Windows `EventLog` service (T1562.002, #800), the firewall
-/// services (T1562.004) and this agent's own service (stopped by its own package scripts on
-/// every upgrade, and unable to alert on its own stop).
-const SECURITY_SERVICES: &[&str] = &[
-    // Linux
-    "auditd",
-    "apparmor",
-    "falco",
-    "falco-bpf",
-    "falco-modern-bpf",
-    "osqueryd",
-    "wazuh-agent",
-    "ossec",
-    "clamav-daemon",
-    "clamd",
-    "suricata",
-    "snort",
-    "sysmon",
-    "mdatp",
-    "falcon-sensor",
-    "sentinelone",
-    // Windows
-    "windefend",
-    "wdnissvc",
-    "sense",
-    "sysmon64",
-    "securityhealthservice",
-    "csfalconservice",
-    "sentinelagent",
-    "cbdefense",
-];
-
 /// launchd label prefixes of macOS security tooling: a vendor's namespace, so any daemon
-/// stopped under it is that vendor's tool. Same caveat on the names as above.
+/// stopped under it is that vendor's tool. Same caveat on the names as [`SECURITY_SERVICES`]
+/// (in `schema`, so the journal sensor filters on the same list).
 const SECURITY_LABEL_PREFIXES: &[&str] = &[
     "com.crowdstrike.",
     "com.sentinelone.",

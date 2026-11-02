@@ -68,6 +68,10 @@ pub struct JournalRecord {
     /// a user manager (this dev sandbox only ever produced the latter — see the
     /// crate doc's Status section).
     pub unit: Option<String>,
+    /// Whether `unit` came from `USER_UNIT` (a `systemd --user` manager) rather than `UNIT`
+    /// (the system manager). Only the system manager is PID 1; see
+    /// [`classify`](crate::classify)'s `classify_unit_job` for how that decides trust.
+    pub from_user_manager: bool,
 }
 
 /// Parses one `journalctl -o json` line.
@@ -105,6 +109,7 @@ pub fn parse_record(line: &str) -> Result<JournalRecord, JournalError> {
         job_type: get_str("JOB_TYPE"),
         job_result: get_str("JOB_RESULT"),
         unit: get_str("UNIT").or_else(|| get_str("USER_UNIT")),
+        from_user_manager: get_str("UNIT").is_none() && get_str("USER_UNIT").is_some(),
     })
 }
 
@@ -146,6 +151,7 @@ mod tests {
         assert_eq!(record.job_type.as_deref(), Some("start"));
         assert_eq!(record.job_result.as_deref(), Some("done"));
         assert_eq!(record.unit.as_deref(), Some("default.target"));
+        assert!(record.from_user_manager);
     }
 
     #[test]
