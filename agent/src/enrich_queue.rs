@@ -100,7 +100,21 @@ impl EnrichQueue {
                 while let Ok(item) = rx.recv() {
                     match item {
                         QueueItem::Event(mut event, gated) => {
-                            enrich_event(&mut enricher, &mut event, gated.is_some());
+                            let verified = enrich_event(&mut enricher, &mut event, gated.is_some());
+                            // #688: a `Valid` only silences the alert when the file verified is
+                            // the image that ran. No identity on either side (not Windows, or
+                            // the sensor could not open the image) never confirms it.
+                            let gated = gated.map(|gated| {
+                                let ran = match &*event {
+                                    Event::Exec(e) => e.image_file_id.as_deref(),
+                                    _ => None,
+                                };
+                                if image_confirmed(ran, verified.as_deref(), IDENTITY_CAPTURED) {
+                                    gated
+                                } else {
+                                    gated.unconfirmed_image()
+                                }
+                            });
                             on_enriched(*event, gated);
                         }
                         QueueItem::Detection(mut detection) => {
@@ -227,7 +241,10 @@ impl crate::health::DroppedCounter for EnrichQueue {
 /// cached `Valid` could describe a signed file that used to be at this path
 /// (#655 review). Gated execs are marked files run inside the join window, rare
 /// enough that skipping the cache costs nothing measurable.
-fn enrich_event(enricher: &mut Enricher, event: &mut Event, gated: bool) {
+///
+/// Returns the identity of the file the enrichment read (`FileEnrichment::file_id`),
+/// for the caller to compare with the image that ran (#688).
+fn enrich_event(enricher: &mut Enricher, event: &mut Event, gated: bool) -> Option<String> {
     if let Event::Exec(e) = event
         && !e.image_path.is_empty()
         && e.sha256.is_none()
@@ -246,7 +263,22 @@ fn enrich_event(enricher: &mut Enricher, event: &mut Event, gated: bool) {
         e.company_name = enrichment.pe_info.company_name;
         e.file_description = enrichment.pe_info.file_description;
         e.product_name = enrichment.pe_info.product_name;
+        return enrichment.file_id;
     }
+    None
+}
+
+/// Whether the platform's sensor records the image's identity at exec time. Only
+/// the Windows ETW sensor does (#688); elsewhere there is nothing to compare, and
+/// the gate behaves as it did before.
+const IDENTITY_CAPTURED: bool = cfg!(windows);
+
+/// Is the file that was verified the image that ran? `ran`: identity recorded at
+/// exec; `verified`: identity of the file the verdict was read from. Where
+/// identities are captured (`captured`), a missing one on either side is not a
+/// confirmation: an unreadable image must not vouch for itself.
+fn image_confirmed(ran: Option<&str>, verified: Option<&str>, captured: bool) -> bool {
+    !captured || matches!((ran, verified), (Some(ran), Some(verified)) if ran == verified)
 }
 
 #[cfg(test)]
@@ -267,6 +299,25 @@ mod tests {
             image_path: image_path.to_string(),
             ..schema::fixtures::exec()
         })
+    }
+
+    #[test]
+    fn the_image_is_confirmed_only_by_the_same_file_identity() {
+        assert!(image_confirmed(Some("a:1"), Some("a:1"), true));
+        assert!(
+            !image_confirmed(Some("a:1"), Some("a:2"), true),
+            "swapped file"
+        );
+        assert!(
+            !image_confirmed(None, Some("a:1"), true),
+            "sensor saw no identity"
+        );
+        assert!(
+            !image_confirmed(Some("a:1"), None, true),
+            "verified file has none"
+        );
+        // Platforms that capture nothing keep the gate as it was.
+        assert!(image_confirmed(None, None, false));
     }
 
     #[test]
@@ -428,11 +479,19 @@ mod tests {
         let gate = Arc::new(Mutex::new(()));
         let held = gate.lock().unwrap();
         let gate_worker = gate.clone();
+        let (inside_tx, inside_rx) = mpsc::channel::<()>();
         let queue = EnrichQueue::start(Enricher::new(), move |_, _| {
+            let _ = inside_tx.send(());
             let _wait = gate_worker.lock().unwrap();
         });
-        for _ in 0..=QUEUE_CAP {
-            let _ = queue.enqueue(exec("/nonexistent/x"), None);
+        // Park the worker on its first item before filling, so the in-flight item is
+        // fixed: otherwise it can take one late and free a slot the gated alert fills.
+        assert!(queue.enqueue(exec("/nonexistent/x"), None).is_none());
+        inside_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the worker must pick up the first event");
+        for _ in 0..QUEUE_CAP {
+            assert!(queue.enqueue(exec("/nonexistent/x"), None).is_none());
         }
         let back = queue.enqueue(exec("/nonexistent/x"), Some(gated_alert()));
         let (_, gated) = back.expect("a full queue must hand the gated alert back");

@@ -455,3 +455,52 @@ mod tests {
         assert_eq!(long_path_name(r"C:\definitely\not\here~1\x.exe"), None);
     }
 }
+
+// ── #688: identity of the image file at exec ─────────────────────────────────
+
+/// `FILE_INFO_BY_HANDLE_CLASS::FileIdInfo`.
+const FILE_ID_INFO_CLASS: u32 = 18;
+
+/// `FILE_ID_INFO`: the volume serial number and the file's 128-bit id (`FILE_ID_128`, an
+/// opaque byte array).
+#[repr(C)]
+struct FileIdInfo {
+    volume_serial_number: u64,
+    file_id: [u8; 16],
+}
+
+// The same manual binding as `enrich::sig`'s (the sensor crates may depend on `schema` only,
+// so the helper cannot be shared): one function, one struct.
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetFileInformationByHandleEx(
+        file: HANDLE,
+        class: u32,
+        info: *mut core::ffi::c_void,
+        info_len: u32,
+    ) -> i32;
+}
+
+/// The identity of the file at `path` as [`crate::identity_token`]: opened shared for delete
+/// (std's default on Windows, so it cannot block the rename a dropper is about to do), one
+/// query, no read. `None` when the file cannot be opened or the file system reports no id.
+#[must_use]
+pub fn image_file_id(path: &std::path::Path) -> Option<String> {
+    use std::os::windows::io::AsRawHandle as _;
+    let file = std::fs::File::open(path).ok()?;
+    let mut info = FileIdInfo {
+        volume_serial_number: 0,
+        file_id: [0; 16],
+    };
+    // SAFETY: the handle belongs to `file`, alive for the call; `info` is a writable
+    // `FILE_ID_INFO` and its size is passed with it.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle().cast(),
+            FILE_ID_INFO_CLASS,
+            (&mut info as *mut FileIdInfo).cast(),
+            size_of::<FileIdInfo>() as u32,
+        )
+    };
+    (ok != 0).then(|| crate::identity_token(info.volume_serial_number, info.file_id))
+}

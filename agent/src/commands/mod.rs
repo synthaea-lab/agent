@@ -9,6 +9,8 @@
 mod common;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+mod localzone;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(windows)]
@@ -62,6 +64,8 @@ pub(crate) struct RunOptions<'a> {
     pub(crate) log_sources: &'a [config::LogSourceConfig],
     /// Canary directories declared in `[deception]` (#81), planted by `common::plant_canaries`.
     pub(crate) deception: &'a config::DeceptionConfig,
+    /// Host facts from `[detection]` (#376), handed to the rules by `common::apply_detection`.
+    pub(crate) detection: &'a config::DetectionConfig,
     /// The config path `config::discover` actually resolved at startup (issue #71):
     /// watched by `protected::protected_paths` as one more of the agent's own
     /// resources. Read only by `linux::cmd_run`, same posture as the other

@@ -329,7 +329,11 @@ pub mod time;
 /// wire change — #995 already defined `ListenPortEvent::protocol`; this PR only
 /// fills it with the real value (6 or 17) instead of #995's TCP-only `6` (review
 /// of #1008).
-pub const SCHEMA_VERSION: u32 = 58;
+///
+/// Bumped 58 → 59 for [`ExecEvent::image_file_id`] (#688): the identity of the
+/// image file at exec time, so the T1204.002 signature gate can distinguish the
+/// image that ran from whatever the path contains when it is later verified.
+pub const SCHEMA_VERSION: u32 = 59;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -469,13 +473,60 @@ pub const FLAG_APPLICATION_BLOCKED: u32 = 0x0100_0000;
 /// reasoning as [`FLAG_PERSISTENCE_ARTIFACT`]).
 pub const FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT: u32 = 0x0080_0000;
 
+/// A systemd unit of [`SECURITY_SERVICES`] was stopped (journald `JOB_TYPE=stop`, #1085, T1562.001): a
+/// `FileOpenEvent` whose `path` and `meta.comm` carry the unit name, as for
+/// [`FLAG_PERSISTENCE_SYSTEMD_ARTIFACT`]. The journal names no actor, so this says a stop happened,
+/// not who asked for it.
+///
+/// The top bit, on purpose: `FileOpenEvent::flags` also carries the kernel's `open(2)` flags on
+/// Linux, and the bits below `0x0100_0000` are real ones (`0x0020_0000` is `O_PATH`).
+pub const FLAG_UNIT_STOPPED: u32 = 0x8000_0000;
+
+/// Services of security tooling, lowercase, compared without a `.service` suffix. Product
+/// names are as the vendors' documentation gives them and were **not checked on a host**: a
+/// name that is wrong costs a missed stop, never a false alert. `auditd` is here although
+/// two Sigma rules name two forms of its stop: those match `mask --now` and `auditctl -e 0`,
+/// this matches the rest, and `mask --now auditd` raises both.
+///
+/// Left out on purpose: the Windows `EventLog` service (T1562.002, #800), the firewall
+/// services (T1562.004) and this agent's own service (stopped by its own package scripts on
+/// every upgrade, and unable to alert on its own stop).
+pub const SECURITY_SERVICES: &[&str] = &[
+    // Linux
+    "auditd",
+    "apparmor",
+    "falco",
+    "falco-bpf",
+    "falco-modern-bpf",
+    "osqueryd",
+    "wazuh-agent",
+    "ossec",
+    "clamav-daemon",
+    "clamd",
+    "suricata",
+    "snort",
+    "sysmon",
+    "mdatp",
+    "falcon-sensor",
+    "sentinelone",
+    // Windows
+    "windefend",
+    "wdnissvc",
+    "sense",
+    "sysmon64",
+    "securityhealthservice",
+    "csfalconservice",
+    "sentinelagent",
+    "cbdefense",
+];
+
 /// Every synthetic `FLAG_*` bit above, checked pairwise-disjoint at compile time.
 /// A new flag goes here in the same edit (a unit test fails if a `pub const
 /// FLAG_*` is missing). Lives next to the constants, not in a
 /// consumer's test: the first cut of [`FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT`]
 /// took `0x0200_0000`, already [`FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN`], and the
 /// hardcoded list in `rules`' collision test missed it (#399 review).
-const SYNTHETIC_FLAGS: [u32; 8] = [
+const SYNTHETIC_FLAGS: [u32; 9] = [
     FLAG_PERSISTENCE_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
@@ -484,6 +535,7 @@ const SYNTHETIC_FLAGS: [u32; 8] = [
     FLAG_PERSISTENCE_BTM_ARTIFACT,
     FLAG_APPLICATION_BLOCKED,
     FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT,
+    FLAG_UNIT_STOPPED,
 ];
 
 const _: () = {
@@ -641,6 +693,15 @@ pub struct ExecEvent {
     /// in the catalogue's `process_creation` category use it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub product_name: Option<String>,
+    /// Identity of the file the image ran from, captured by the sensor *at exec
+    /// time* (#688): `"{volume serial:016x}:{file id:032x}"`, opaque to consumers.
+    /// The enrichment worker verifies the file at `image_path` some time later; a
+    /// verdict only speaks for the image that ran when the file it verified has
+    /// this identity (a running image can be renamed on Windows and a signed copy
+    /// put at its path). Windows only; `None` when the sensor could not open the
+    /// image, and on every other platform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_file_id: Option<String>,
     /// Security-relevant environment variables present at exec time, `(name, value)`
     /// pairs (#363) — the dynamic-linker-hijack family: `LD_PRELOAD`,
     /// `LD_LIBRARY_PATH`, `LD_AUDIT` (the quieter sibling of `LD_PRELOAD`),

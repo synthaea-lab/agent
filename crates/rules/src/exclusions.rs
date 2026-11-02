@@ -622,3 +622,14 @@ pub(crate) const EGRESS_DOMAIN_BROWSER_COMMS: &[&str] = &[
 /// measurement behind it. The baseline is in memory only, so an agent restart begins a new
 /// learning window.
 pub(crate) const LOGON_LEARNING_NS: u64 = 86_400_000_000_000; // 24 h
+
+/// ODD-HOUR-LOGON (T1078, #376): the local hours `[start, end)` in which a logon is ordinary.
+/// **Provisional**: 07:00 to 20:00 is a plain working day, with no measurement behind it and
+/// no notion of weekends, shifts or a host used around the clock. Only read when the
+/// operator has told the agent the host's UTC offset.
+pub(crate) const WORK_HOURS_LOCAL: (u32, u32) = (7, 20);
+
+/// ODD-HOUR-LOGON: one alert per account per this long, so a session that logs on several
+/// times in one night (reconnects, a second window) raises one finding. **Provisional**:
+/// 8 hours is one night.
+pub(crate) const ODD_HOUR_QUIET_NS: u64 = 28_800_000_000_000; // 8 h

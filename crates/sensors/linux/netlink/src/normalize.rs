@@ -13,7 +13,9 @@ use std::net::SocketAddr;
 use schema::{Event, EventMeta, ListenPortEvent, NetworkFlowEvent, User};
 
 use crate::{
-    ConntrackFlow, SocketSnapshotEntry, SocketState, proc_meta::ProcInfo, wire::IPPROTO_TCP,
+    ConntrackFlow, SocketSnapshotEntry, SocketState,
+    proc_meta::ProcInfo,
+    wire::{IPPROTO_TCP, IPPROTO_UDP},
 };
 
 /// Builds one [`schema::Event::ListenPort`] for `entry` attributed to `pid`, using
@@ -21,10 +23,10 @@ use crate::{
 /// `sock_diag` itself doesn't carry. `timestamp_ns` is the caller's snapshot time
 /// (see [`schema::ListenPortEvent`]'s doc on what that does and doesn't mean).
 ///
-/// Returns `None` when `entry.state` isn't [`SocketState::Listen`] — established
-/// sockets have no listen-port drift semantics, so a caller iterating a full
-/// snapshot can pass every entry through this function and simply skip `None`s
-/// rather than pre-filtering by state itself.
+/// Returns `None` unless `entry` is a TCP [`SocketState::Listen`] or a UDP
+/// [`SocketState::Unconnected`] — established sockets have no listen-port drift
+/// semantics, so a caller iterating a full snapshot can pass every entry through
+/// this function and simply skip `None`s rather than pre-filtering by state itself.
 #[must_use]
 pub fn listen_port_event(
     entry: &SocketSnapshotEntry,
@@ -32,7 +34,12 @@ pub fn listen_port_event(
     proc: &ProcInfo,
     timestamp_ns: u64,
 ) -> Option<Event> {
-    if entry.state != SocketState::Listen {
+    let listening = match entry.protocol {
+        IPPROTO_TCP => entry.state == SocketState::Listen,
+        IPPROTO_UDP => entry.state == SocketState::Unconnected,
+        _ => false,
+    };
+    if !listening {
         return None;
     }
     Some(Event::ListenPort(ListenPortEvent {
@@ -55,7 +62,7 @@ pub fn listen_port_event(
         },
         local_addr: entry.local.ip(),
         local_port: entry.local.port(),
-        protocol: IPPROTO_TCP, // sock_diag TCP dump only, today (issue #676)
+        protocol: entry.protocol,
     }))
 }
 
@@ -175,6 +182,7 @@ mod tests {
 
     fn listening_entry() -> SocketSnapshotEntry {
         SocketSnapshotEntry {
+            protocol: IPPROTO_TCP,
             local: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 31337),
             remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             state: SocketState::Listen,
@@ -210,6 +218,49 @@ mod tests {
     #[test]
     fn established_entries_produce_no_event() {
         let mut entry = listening_entry();
+        entry.state = SocketState::Established;
+        assert!(listen_port_event(&entry, 4242, &proc(), 0).is_none());
+    }
+
+    fn bound_udp_entry() -> SocketSnapshotEntry {
+        SocketSnapshotEntry {
+            protocol: IPPROTO_UDP,
+            local: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5353),
+            remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            state: SocketState::Unconnected,
+            uid: 0,
+            inode: 90001,
+            pids: vec![4242],
+        }
+    }
+
+    #[test]
+    fn a_bound_unconnected_udp_socket_produces_a_udp_listen_event() {
+        let event = listen_port_event(&bound_udp_entry(), 4242, &proc(), 0)
+            .expect("a bound UDP socket must produce an event");
+        let Event::ListenPort(listen) = &event else {
+            panic!("expected Event::ListenPort, got {event:?}");
+        };
+        assert_eq!(listen.local_port, 5353);
+        assert_eq!(listen.protocol, IPPROTO_UDP);
+    }
+
+    #[test]
+    fn the_state_and_protocol_must_agree() {
+        // A UDP entry in the TCP "Listen" state, or a TCP entry in the UDP
+        // "Unconnected" one, is not something the kernel reports; neither may
+        // be mistaken for a listener.
+        let mut udp_listen = bound_udp_entry();
+        udp_listen.state = SocketState::Listen;
+        assert!(listen_port_event(&udp_listen, 4242, &proc(), 0).is_none());
+        let mut tcp_unconnected = listening_entry();
+        tcp_unconnected.state = SocketState::Unconnected;
+        assert!(listen_port_event(&tcp_unconnected, 4242, &proc(), 0).is_none());
+    }
+
+    #[test]
+    fn a_connected_udp_socket_is_a_client_not_a_listener() {
+        let mut entry = bound_udp_entry();
         entry.state = SocketState::Established;
         assert!(listen_port_event(&entry, 4242, &proc(), 0).is_none());
     }
@@ -263,6 +314,7 @@ mod tests {
 
     fn established_socket(pid: u32) -> SocketSnapshotEntry {
         SocketSnapshotEntry {
+            protocol: IPPROTO_TCP,
             local: SocketAddr::new(v4([10, 0, 0, 5]), 51000),
             remote: SocketAddr::new(v4([203, 0, 113, 9]), 443),
             state: SocketState::Established,
@@ -302,6 +354,7 @@ mod tests {
         // orig therefore runs peer -> local, so bytes_sent must come from
         // counters_reply, not counters_orig.
         let sockets = [SocketSnapshotEntry {
+            protocol: IPPROTO_TCP,
             local: SocketAddr::new(v4([203, 0, 113, 9]), 443),
             remote: SocketAddr::new(v4([10, 0, 0, 5]), 51000),
             state: SocketState::Established,
