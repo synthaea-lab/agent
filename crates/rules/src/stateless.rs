@@ -1293,8 +1293,9 @@ const INIT_PID: u32 = 1;
 ///   stop` (SIGTERM, then SIGKILL once the stop times out), `restart` and a package
 ///   upgrade, so High on each would make every upgrade a High finding. It is not dropped:
 ///   `systemctl kill -s KILL` and a D-Bus stop arrive from pid 1 too, and the event cannot
-///   say who asked the manager. Who did is the exec rule's (`check_security_tool_stop`)
-///   and the journal's, not this rule's.
+///   say who asked the manager. Who did is the exec rule's (`check_security_tool_stop`,
+///   which parses `systemctl stop` and `systemctl kill`) and the journal's, not this rule's.
+///   A D-Bus stop has no exec: only the journal sees it.
 /// - Anyone else: High, as before.
 ///
 /// What it **cannot** tell: whether a sender other than pid 1 is the agent's own

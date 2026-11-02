@@ -450,3 +450,113 @@ fn an_sc_command_aimed_at_another_host_still_names_the_service() {
     let event = exec_event_full(2301, SHELL, "sc", "sc \\\\fileserver stop Veeam", 0);
     assert_eq!(crate::servicestop::services_stopped(&event), ["veeam"]);
 }
+
+// --- `systemctl kill` (#1103): the manager's SIGKILL of a unit is a stop ----------------------
+
+fn killed(command: &str) -> Vec<String> {
+    let event = exec_event_full(2000, SHELL, "systemctl", command, 0);
+    crate::servicestop::services_stopped(&event)
+}
+
+#[test]
+fn systemctl_kill_with_a_signal_that_ends_the_unit_is_a_stop_in_every_form() {
+    for command in [
+        "systemctl kill falco",
+        "systemctl kill falco.service",
+        "systemctl kill -s KILL falco",
+        "systemctl kill -s SIGKILL falco",
+        "systemctl kill -sKILL falco",
+        "systemctl kill -s 9 falco",
+        "systemctl kill --signal=KILL falco",
+        "systemctl kill --signal KILL falco",
+        "systemctl kill --signal=SIGTERM falco",
+        "systemctl kill -s TERM --kill-whom=main falco",
+        "systemctl kill --kill-whom=all -s KILL falco",
+        "systemctl kill --kill-who=main -s KILL falco",
+        "systemctl kill --no-block --kill-value=7 -s KILL falco",
+        "systemctl --user kill -s KILL falco",
+        "systemctl kill falco -s KILL",
+    ] {
+        assert_eq!(killed(command), ["falco"], "{command}");
+    }
+}
+
+#[test]
+fn the_signal_is_not_read_as_a_unit() {
+    assert_eq!(killed("systemctl kill -s KILL a b"), ["a", "b"]);
+    assert_eq!(killed("systemctl kill --signal KILL a b"), ["a", "b"]);
+    assert_eq!(killed("systemctl kill --kill-whom main a"), ["a"]);
+}
+
+#[test]
+fn systemctl_kill_that_does_not_end_the_unit_is_not_a_stop() {
+    for command in [
+        "systemctl kill -s HUP nginx",
+        "systemctl kill --signal=SIGUSR1 nginx",
+        "systemctl kill -s 10 nginx",
+        "systemctl kill -s 0 nginx",
+        "systemctl kill --kill-whom=control -s KILL nginx",
+        "systemctl kill --kill-whom control nginx",
+        "systemctl kill",
+    ] {
+        assert!(killed(command).is_empty(), "{command}");
+    }
+}
+
+#[test]
+fn a_kill_of_a_security_tool_alerts_the_exec_rule() {
+    for command in [
+        "systemctl kill -s KILL falco",
+        "systemctl kill auditd.service",
+        "systemctl kill --signal=SIGKILL osqueryd",
+    ] {
+        let comm = command.split_whitespace().next().unwrap();
+        let alerts: Vec<_> = crate::evaluate_exec(&exec_event_full(2000, 600, comm, command, 0))
+            .into_iter()
+            .filter(|a| a.technique == "T1562.001")
+            .collect();
+        assert_eq!(alerts.len(), 1, "{command}");
+        assert_eq!(alerts[0].severity, Severity::Medium);
+    }
+    // A reload signal or another service stays silent.
+    for command in [
+        "systemctl kill -s HUP falco",
+        "systemctl kill -s KILL nginx",
+    ] {
+        let comm = command.split_whitespace().next().unwrap();
+        assert!(
+            crate::evaluate_exec(&exec_event_full(2000, 600, comm, command, 0))
+                .iter()
+                .all(|a| a.technique != "T1562.001"),
+            "{command}"
+        );
+    }
+}
+
+/// A kill counts toward SERVICE-STOP-BURST like a stop: SIGKILL of a unit's processes is the same
+/// act (the unit is down, nothing restores it), an intruder uses it to skip the stop job's
+/// timeout and the stop verbs' logging, and `systemctl kill` of five distinct units in a minute
+/// is not maintenance. A reload signal is not counted.
+#[test]
+fn a_kill_of_n_units_counts_n_toward_the_burst() {
+    let alerts = run(
+        &["systemctl kill -s KILL mysqld postgresql veeam postfix nginx"],
+        1,
+    );
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    // Mixed with stops, distinct units add up.
+    let mixed = [
+        "systemctl stop mysqld",
+        "systemctl kill -s KILL postgresql",
+        "systemctl stop veeam",
+        "systemctl kill postfix",
+        "systemctl kill --signal=SIGKILL nginx",
+    ];
+    assert_eq!(run(&mixed, 1).len(), 1);
+    // Four are still not a burst, and reloads add nothing.
+    let reloads = [
+        "systemctl kill -s KILL mysqld postgresql veeam postfix",
+        "systemctl kill -s HUP nginx",
+    ];
+    assert!(run(&reloads, 1).is_empty());
+}

@@ -97,7 +97,8 @@ fn a_sender_that_is_not_the_service_manager_or_the_target_alerts_high() {
 
 #[test]
 fn the_service_manager_is_low_not_dropped_for_every_terminating_signal() {
-    // `systemctl stop` (SIGTERM), the SIGKILL after a stop timeout, `systemctl kill`.
+    // `systemctl stop` (SIGTERM), the SIGKILL after a stop timeout, `systemctl kill` (whose
+    // exec is read by `check_security_tool_stop`).
     for signal in [1, 2, 3, 6, 9, 15] {
         let alert = check_security_process_signal(&signal_from(1, "systemd", signal, 400))
             .expect("pid 1 stays visible");
