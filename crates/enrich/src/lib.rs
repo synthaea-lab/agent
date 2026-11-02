@@ -20,7 +20,6 @@
 //!   lookup (see `sig.rs`) before settling on `Unsigned` — a handful of extra Win32
 //!   calls, but only on that one path, and only once per cache miss.
 
-pub mod localzone;
 mod pe_info;
 mod sig;
 
