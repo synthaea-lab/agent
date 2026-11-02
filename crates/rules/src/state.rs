@@ -360,6 +360,9 @@ pub struct RuleState {
     /// Lineage → distinct services it stopped, for SERVICE-STOP-BURST (T1489, #381).
     /// LRU-bounded.
     service_stop: BoundedMap<crate::recon::Lineage, SlidingDistinct<String>>,
+    /// Security-unit stops waiting to be judged, and what execs did to those units, for
+    /// UNEXPLAINED-UNIT-STOP (T1562.001, #1085): see [`crate::unitstop`].
+    unit_stops: crate::unitstop::UnitStops,
     /// (pid, dport) → sliding distinct-destination counter for SCAN-SPREAD
     /// (T1046/T1210, issue #465). LRU-bounded.
     scan_spread: BoundedMap<(u32, u16), SlidingDistinct<IpAddr>>,
@@ -615,6 +618,7 @@ impl RuleState {
             ssh_fanout: BoundedMap::new(COUNTER_CAP),
             security_discovery: BoundedMap::new(COUNTER_CAP),
             service_stop: BoundedMap::new(COUNTER_CAP),
+            unit_stops: crate::unitstop::UnitStops::new(),
             known_listeners: BoundedMap::new(COUNTER_CAP),
             known_policy_denials: BoundedMap::new(COUNTER_CAP),
             policy_denial_budgets: BoundedMap::new(POLICY_DENIAL_SUBJECT_CAP),
@@ -1486,6 +1490,7 @@ impl RuleState {
         alerts.extend(self.check_recon_burst(event, lineage));
         alerts.extend(self.check_security_discovery(event, lineage));
         alerts.extend(self.check_service_stop_burst(event, lineage));
+        self.unit_stops.on_exec(event);
         alerts.extend(crate::stateless::check_ld_preload_hijack(
             event,
             &self.ld_trust_extra,
@@ -2285,6 +2290,15 @@ impl RuleState {
         self.take_due_identity_alerts()
     }
 
+    /// UNEXPLAINED-UNIT-STOP (T1562.001, #1085), see [`crate::unitstop`]: the security-unit stops
+    /// whose wait is over, judged, each with its own event so the alert is attributed to it. A
+    /// stop is queued by [`Self::on_file_open`] and judged once the stream clock is
+    /// [`crate::unitstop::START_WITHIN_NS`] past it; the sink calls this after every exec and
+    /// file-open event, which are what move the clock.
+    pub fn take_due_unit_stops(&mut self) -> Vec<(FileOpenEvent, Alert)> {
+        self.unit_stops.take_due()
+    }
+
     /// The queued identity requests whose wait is over, judged: see [`Self::on_identity_change`].
     pub fn take_due_identity_alerts(&mut self) -> Vec<(schema::IdentityChangeEvent, Alert)> {
         let mut due = Vec::new();
@@ -2559,6 +2573,7 @@ impl RuleState {
     /// [`Self::check_task_registration`]) and updates the history of downloader
     /// writes, consumed by `check_download_then_exec`.
     pub fn on_file_open(&mut self, event: &FileOpenEvent) -> Vec<Alert> {
+        self.unit_stops.on_file_open(event);
         let mut alerts: Vec<Alert> = self.check_task_registration(event).into_iter().collect();
         alerts.extend(crate::stateless::check_service_write_outside_datadir(
             event,

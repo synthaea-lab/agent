@@ -1513,6 +1513,7 @@ impl DetectionSink {
         self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_exec(event));
         // This exec moved the stream clock: identity requests waiting for it may be due (#1041).
         self.record_due_identity_alerts(self.rule_state.lock().unwrap().take_due_identity_alerts());
+        self.record_due_unit_stops();
         let sigma_guard = self.sigma.lock().unwrap();
         if let Some(sigma) = sigma_guard.as_ref() {
             let entity = entity_key(&event.meta);
@@ -1547,6 +1548,8 @@ impl DetectionSink {
                 .into_iter()
                 .chain(state_alerts),
         );
+        // A unit stop is queued by `on_file_open`; this event moved the clock (#1085).
+        self.record_due_unit_stops();
         if event.flags & 0o103 != 0
             && let Some((yara, _)) = self.yara.lock().unwrap().as_ref()
         {
@@ -1685,6 +1688,15 @@ impl DetectionSink {
     fn record_due_identity_alerts(&self, due: Vec<(schema::IdentityChangeEvent, rules::Alert)>) {
         for (event, alert) in due {
             self.record_rule_alerts(&Event::IdentityChange(event), [alert]);
+        }
+    }
+
+    /// Security-unit stops whose wait is over (UNEXPLAINED-UNIT-STOP, #1085), each attributed to
+    /// its own journal event.
+    fn record_due_unit_stops(&self) {
+        let due = self.rule_state.lock().unwrap().take_due_unit_stops();
+        for (event, alert) in due {
+            self.record_rule_alerts(&Event::FileOpen(event), [alert]);
         }
     }
 
