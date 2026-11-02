@@ -236,8 +236,9 @@ impl<S: WatchSet> ToolWatch<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
 
     /// A fake `/sys/fs/cgroup` and `/proc`, removed on drop.
     struct Host {

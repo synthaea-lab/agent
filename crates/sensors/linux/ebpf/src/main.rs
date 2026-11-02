@@ -12,7 +12,9 @@ use aya_ebpf::{
     },
     macros::{lsm, map, uprobe, uretprobe},
     maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
-    programs::{LsmContext, ProbeContext, RawTracePointContext, RetProbeContext, TracePointContext},
+    programs::{
+        LsmContext, ProbeContext, RawTracePointContext, RetProbeContext, TracePointContext,
+    },
 };
 use aya_log_ebpf::{info, warn};
 use sensor_linux_wire::{

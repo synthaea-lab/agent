@@ -16,7 +16,6 @@ use schema::sensor::{Capabilities, EventSink, Sensor, SensorError};
 use tokio::sync::Notify;
 use tracing::warn;
 
-use crate::unit_procs::{ToolWatch, UnitResolver};
 use crate::{
     container::{CgroupIdCache, DockerInfoCache, container_context},
     ebpf::{
@@ -27,6 +26,7 @@ use crate::{
     normalize,
     parent_image::{ExecStamps, IMAGE_CACHE_CAP, ParentImageEvictions, ParentImages},
     proc::{read_proc_cmdline, read_proc_environ_security, read_proc_images},
+    unit_procs::{ToolWatch, UnitResolver},
 };
 
 /// See `sensor_linux_wire::boot_epoch_offset_ns` — computed once at startup.
