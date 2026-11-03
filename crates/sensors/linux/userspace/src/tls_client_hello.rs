@@ -31,29 +31,44 @@ const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 const EMPTY_HASH: &str = "000000000000";
 /// JA4 prints both counts on two digits and stops counting at 99.
 const COUNT_CAP: usize = 99;
+/// The longest `server_name` kept, in bytes: the RFC 1035 limit for a host name, so a client
+/// cannot make the sensor carry 64 KiB of its choosing into every event.
+const MAX_SNI_LEN: usize = 255;
 
 /// What a `ClientHello` says about its sender.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ClientHello {
-    /// The first `host_name` of the `server_name` extension, as sent. `None` when there is no
-    /// such extension, no host name in it, or a name that is not valid UTF-8; the JA4 still
-    /// records that the extension existed.
+    /// The first `host_name` of the `server_name` extension, as sent: the case and a trailing
+    /// dot are kept, so compare case-insensitively and without the dot. It is evidence, and a
+    /// client chooses it, so it is made safe to carry rather than dropped: at most
+    /// [`MAX_SNI_LEN`] bytes are read, and every character that is not printable ASCII (a byte
+    /// that is not UTF-8, a control character, a space, a non-ASCII letter) becomes U+FFFD.
+    /// `None` when there is no such extension or its host name is empty; the JA4 still records
+    /// that the extension existed.
     pub(crate) sni: Option<String>,
-    /// The JA4 fingerprint, e.g. `t13d1516h2_8daaf6152771_e5627efa2ab1`.
-    pub(crate) ja4: String,
+    /// The JA4 fingerprint, e.g. `t13d1516h2_8daaf6152771_e5627efa2ab1`. `None` when an
+    /// extension it reads (`supported_versions`, `signature_algorithms`, ALPN) is malformed:
+    /// the fingerprint is never guessed, but that does not cost the SNI.
+    pub(crate) ja4: Option<String>,
 }
 
 /// The `ClientHello` that `payload` starts with, or `None` when `payload` is not a complete one.
 ///
 /// `payload` is the TCP payload from its first byte: a TLS record (type 22) carrying a
-/// handshake message of type 1. A hello split over several records is not reassembled and
-/// yields `None`; real clients send it in one record.
+/// handshake message of type 1 whose version fields are TLS's (a record major version of 3,
+/// a `legacy_version` from `0x0300` to `0x0304`), which keeps a reused descriptor or another
+/// protocol from passing as one by accident.
+///
+/// Known limit: a hello fragmented over several records (RFC 8446 section 5.1 allows it, and a
+/// client that wants to evade can use it) is not reassembled and yields `None`. Part 2 of #86
+/// has to count what the capture dropped as "looked like a hello", so that this is not silent.
 pub(crate) fn parse(payload: &[u8]) -> Option<ClientHello> {
     let mut record = Reader::new(payload);
-    // Content type 22 (handshake); the record version is 0x0301 or 0x0303 in practice and
-    // carries no information JA4 uses, so only its presence is required.
+    // Content type 22 (handshake). The record version is 0x0301 or 0x0303 in practice and JA4
+    // does not use it, but its major byte is 3 for every TLS version.
     (record.u8()? == 22).then_some(())?;
-    record.skip(2)?;
+    (record.u8()? == 3).then_some(())?;
+    record.skip(1)?;
     let record_len = usize::from(record.u16()?);
     let mut handshake = Reader::new(record.take(record_len)?);
 
@@ -63,6 +78,7 @@ pub(crate) fn parse(payload: &[u8]) -> Option<ClientHello> {
     let mut body = Reader::new(handshake.take(body_len)?);
 
     let legacy_version = body.u16()?;
+    (0x0300..=0x0304).contains(&legacy_version).then_some(())?;
     body.skip(32)?; // random
     let session_id_len = usize::from(body.u8()?);
     body.skip(session_id_len)?;
@@ -89,11 +105,14 @@ pub(crate) fn parse(payload: &[u8]) -> Option<ClientHello> {
             extensions.push((kind, reader.take(len)?));
         }
     }
+    // Every other field rejects bytes nobody accounts for; so does the end of the hello.
+    body.is_empty().then_some(())?;
 
-    Some(ClientHello {
-        sni: sni(&extensions)?,
-        ja4: ja4(legacy_version, &ciphers, &extensions)?,
-    })
+    // A malformed `server_name` makes the whole hello malformed. A malformed extension that only
+    // the fingerprint reads costs the fingerprint, not the SNI. With neither, nothing is reported.
+    let sni = sni(&extensions)?;
+    let ja4 = ja4(legacy_version, &ciphers, &extensions);
+    (sni.is_some() || ja4.is_some()).then_some(ClientHello { sni, ja4 })
 }
 
 /// Every extension of the hello, in the order sent, with its payload.
@@ -104,7 +123,7 @@ fn find<'a>(extensions: &Extensions<'a>, kind: u16) -> Option<&'a [u8]> {
 }
 
 /// `None` when the `server_name` extension is malformed. `Some(None)` when it is absent, has no
-/// host name, or its name is not UTF-8. The whole list is walked either way, so a malformed
+/// host name, or its host name is empty. The whole list is walked either way, so a malformed
 /// entry after the host name is still caught.
 fn sni(extensions: &Extensions<'_>) -> Option<Option<String>> {
     let Some(data) = find(extensions, EXT_SERVER_NAME) else {
@@ -120,7 +139,20 @@ fn sni(extensions: &Extensions<'_>) -> Option<Option<String>> {
             host = Some(name);
         }
     }
-    Some(host.and_then(|name| String::from_utf8(name.to_vec()).ok()))
+    Some(host.and_then(printable_name))
+}
+
+/// The host name made safe to put in an event, a log line or a rule match: see
+/// [`ClientHello::sni`]. Lossy on purpose: a name that is not valid UTF-8 must still leave a
+/// trace, or one bad byte would let a client erase its own destination from the record.
+fn printable_name(name: &[u8]) -> Option<String> {
+    let name = &name[..name.len().min(MAX_SNI_LEN)];
+    (!name.is_empty()).then(|| {
+        String::from_utf8_lossy(name)
+            .chars()
+            .map(|c| if c.is_ascii_graphic() { c } else { '\u{fffd}' })
+            .collect()
+    })
 }
 
 fn ja4(legacy_version: u16, ciphers: &[u16], extensions: &Extensions<'_>) -> Option<String> {
@@ -156,8 +188,13 @@ fn ja4(legacy_version: u16, ciphers: &[u16], extensions: &Extensions<'_>) -> Opt
         let mut hashed = hex_list(&sorted_kinds);
         if let Some(data) = find(extensions, EXT_SIGNATURE_ALGORITHMS) {
             // Kept in the order sent: the order of the algorithms is part of the fingerprint.
-            hashed.push('_');
-            hashed.push_str(&hex_list(&signature_algorithms(data)?));
+            let sigalgs = signature_algorithms(data)?;
+            // The specification: with no signature algorithms the string ends without an
+            // underscore. An empty list, or one holding only GREASE, counts as none.
+            if !sigalgs.is_empty() {
+                hashed.push('_');
+                hashed.push_str(&hex_list(&sigalgs));
+            }
         }
         hash12(&hashed)
     };
@@ -427,6 +464,11 @@ mod tests {
         record
     }
 
+    /// The fingerprint of a hello that must parse and be fingerprintable.
+    fn ja4_of(bytes: &[u8]) -> String {
+        parse(bytes).expect("parsed").ja4.expect("fingerprinted")
+    }
+
     fn example() -> Vec<u8> {
         client_hello(
             0x0303,
@@ -440,7 +482,7 @@ mod tests {
     #[test]
     fn the_specifications_worked_example_gives_its_fingerprint() {
         let hello = parse(&example()).expect("a complete ClientHello");
-        assert_eq!(hello.ja4, EXAMPLE_JA4);
+        assert_eq!(hello.ja4.as_deref(), Some(EXAMPLE_JA4));
         assert_eq!(hello.sni.as_deref(), Some("example.com"));
     }
 
@@ -470,7 +512,7 @@ mod tests {
         let mut sigalgs = vec![0x1a1a];
         sigalgs.extend(EXAMPLE_SIGALGS);
         let hello = client_hello(0x0303, &ciphers, &extensions, &sigalgs, &[b"h2"]);
-        assert_eq!(parse(&hello).expect("parsed").ja4, EXAMPLE_JA4);
+        assert_eq!(ja4_of(&hello), EXAMPLE_JA4);
     }
 
     #[test]
@@ -491,7 +533,7 @@ mod tests {
             &EXAMPLE_SIGALGS,
             &[b"h2"],
         );
-        assert_eq!(parse(&hello).expect("parsed").ja4, EXAMPLE_JA4);
+        assert_eq!(ja4_of(&hello), EXAMPLE_JA4);
     }
 
     #[test]
@@ -505,7 +547,7 @@ mod tests {
             &swapped,
             &[b"h2"],
         );
-        let ja4 = parse(&hello).expect("parsed").ja4;
+        let ja4 = ja4_of(&hello);
         assert_ne!(ja4, EXAMPLE_JA4);
         // Only the extension section changes.
         assert!(ja4.starts_with("t13d1516h2_8daaf6152771_"));
@@ -517,14 +559,17 @@ mod tests {
         let hello = client_hello(0x0303, &[], &[0x0039], &[], &[]);
         let parsed = parse(&hello).expect("parsed");
         assert_eq!(parsed.sni, None);
-        assert_eq!(parsed.ja4, "t12i000100_000000000000_2cfe23c976cf");
+        assert_eq!(
+            parsed.ja4.as_deref(),
+            Some("t12i000100_000000000000_2cfe23c976cf")
+        );
     }
 
     #[test]
     fn without_extensions_the_extension_hash_is_all_zero() {
         let hello = client_hello(0x0301, &[0x002f], &[], &[], &[]);
         assert_eq!(
-            parse(&hello).expect("parsed").ja4,
+            ja4_of(&hello),
             format!("t10i010000_{}_000000000000", hash12("002f"))
         );
     }
@@ -538,21 +583,21 @@ mod tests {
         hello[3..5].copy_from_slice(&handshake_len.to_be_bytes());
         let body_len = u32::from_be_bytes([0, hello[6], hello[7], hello[8]]) - 2;
         hello[6..9].copy_from_slice(&body_len.to_be_bytes()[1..]);
-        assert!(parse(&hello).expect("parsed").ja4.starts_with("ts3i0100"));
+        assert!(ja4_of(&hello).starts_with("ts3i0100"));
     }
 
     #[test]
     fn counts_stop_at_99() {
         let ciphers: Vec<u16> = (1..=120).collect();
         let hello = client_hello(0x0303, &ciphers, &[], &[], &[]);
-        assert!(parse(&hello).expect("parsed").ja4.starts_with("t12i9900"));
+        assert!(ja4_of(&hello).starts_with("t12i9900"));
     }
 
     #[test]
     fn the_version_is_the_highest_of_supported_versions_else_the_hello_field() {
         // TLS 1.2 in the hello field, 1.3 offered in supported_versions.
         let hello = client_hello(0x0303, &[0x002f], &[EXT_SUPPORTED_VERSIONS], &[], &[]);
-        assert!(parse(&hello).expect("parsed").ja4.starts_with("t13i"));
+        assert!(ja4_of(&hello).starts_with("t13i"));
         // Only GREASE offered: fall back to the field.
         assert_eq!(version(0x0303, Some(&[2, 0x0a, 0x0a])), Some("12"));
         assert_eq!(version(0x0301, None), Some("10"));
@@ -588,11 +633,11 @@ mod tests {
             &EXAMPLE_SIGALGS,
             &[b"h2", b"http/1.1"],
         );
-        assert_eq!(parse(&hello).expect("parsed").ja4, EXAMPLE_JA4);
+        assert_eq!(ja4_of(&hello), EXAMPLE_JA4);
     }
 
     #[test]
-    fn a_name_that_is_not_utf8_leaves_the_sni_empty_but_keeps_the_d() {
+    fn a_name_that_is_not_utf8_is_kept_with_a_replacement_character() {
         let mut hello = example();
         let at = hello
             .windows(11)
@@ -600,8 +645,123 @@ mod tests {
             .expect("the name");
         hello[at] = 0xff;
         let parsed = parse(&hello).expect("parsed");
-        assert_eq!(parsed.sni, None);
-        assert_eq!(parsed.ja4, EXAMPLE_JA4);
+        // One invalid byte must not erase the destination from the record.
+        assert_eq!(parsed.sni.as_deref(), Some("\u{fffd}xample.com"));
+        assert_eq!(parsed.ja4.as_deref(), Some(EXAMPLE_JA4));
+    }
+
+    /// The same hello with one byte added after its last extension, and every length above it
+    /// (handshake, record) raised to cover it, so only the hello's own body is out of shape.
+    fn with_a_byte_after_the_extensions() -> Vec<u8> {
+        let mut hello = example();
+        hello.push(0x00);
+        let record_len = u16::from_be_bytes([hello[3], hello[4]]) + 1;
+        hello[3..5].copy_from_slice(&record_len.to_be_bytes());
+        let handshake_len = u32::from_be_bytes([0, hello[6], hello[7], hello[8]]) + 1;
+        hello[6..9].copy_from_slice(&handshake_len.to_be_bytes()[1..]);
+        hello
+    }
+
+    #[test]
+    fn a_byte_after_the_extensions_is_not_a_hello() {
+        assert_eq!(parse(&with_a_byte_after_the_extensions()), None);
+        // Sanity: the untouched example still parses.
+        assert!(parse(&example()).is_some());
+    }
+
+    #[test]
+    fn no_signature_algorithms_left_means_no_underscore() {
+        // Present but empty, then present with nothing but GREASE: both are "none", and the
+        // hashed string is the sorted extensions alone (SNI and ALPN stay out of it).
+        let kinds: Vec<u16> = {
+            let mut k: Vec<u16> = EXAMPLE_EXTENSIONS
+                .iter()
+                .copied()
+                .filter(|k| *k != EXT_SERVER_NAME && *k != EXT_ALPN)
+                .collect();
+            k.sort_unstable();
+            k
+        };
+        let expected = format!("t13d1516h2_8daaf6152771_{}", hash12(&hex_list(&kinds)));
+        for sigalgs in [&[][..], &[0x0a0a][..], &[0x0a0a, 0x1a1a][..]] {
+            let hello = client_hello(
+                0x0303,
+                &EXAMPLE_CIPHERS,
+                &EXAMPLE_EXTENSIONS,
+                sigalgs,
+                &[b"h2"],
+            );
+            assert_eq!(ja4_of(&hello), expected, "{sigalgs:x?}");
+        }
+        // And a real list still adds its underscore.
+        assert_eq!(ja4_of(&example()), EXAMPLE_JA4);
+    }
+
+    /// A hello whose `server_name` extension holds exactly `name` as its host name.
+    fn hello_for_name(name: &[u8]) -> Vec<u8> {
+        let mut list = vec![0u8]; // host_name
+        list.extend((name.len() as u16).to_be_bytes());
+        list.extend(name);
+        let mut data = (list.len() as u16).to_be_bytes().to_vec();
+        data.extend(list);
+        client_hello_raw(0x0303, &[0x002f], &[(EXT_SERVER_NAME, data)])
+    }
+
+    #[test]
+    fn the_sni_is_made_safe_to_carry() {
+        let sni = |name: &[u8]| parse(&hello_for_name(name)).expect("parsed").sni;
+        // Kept as sent: the case and the trailing dot.
+        assert_eq!(sni(b"Example.COM.").as_deref(), Some("Example.COM."));
+        // An empty name is no name, though the JA4 still says the extension existed.
+        assert_eq!(sni(b""), None);
+        assert!(ja4_of(&hello_for_name(b"")).starts_with("t12d"));
+        // Control characters, spaces and non-ASCII letters are replaced, one for each character.
+        assert_eq!(
+            sni(b"a\r\nb c\x00.fr").as_deref(),
+            Some("a\u{fffd}\u{fffd}b\u{fffd}c\u{fffd}.fr")
+        );
+        assert_eq!(sni("café.fr".as_bytes()).as_deref(), Some("caf\u{fffd}.fr"));
+        // A name longer than a host name can be is cut, not carried whole.
+        let long = vec![b'a'; 5000];
+        assert_eq!(sni(&long).expect("kept").len(), MAX_SNI_LEN);
+    }
+
+    #[test]
+    fn a_malformed_fingerprint_input_costs_the_fingerprint_not_the_sni() {
+        // The example, with a byte after its ALPN list: the SNI parsed fine, the fingerprint
+        // cannot be trusted.
+        let mut extensions: Vec<(u16, Vec<u8>)> = EXAMPLE_EXTENSIONS
+            .iter()
+            .map(|&kind| (kind, extension_data(kind, &EXAMPLE_SIGALGS, &[b"h2"])))
+            .collect();
+        for (kind, data) in &mut extensions {
+            if *kind == EXT_ALPN {
+                data.push(0xff);
+            }
+        }
+        let hello = client_hello_raw(0x0303, &EXAMPLE_CIPHERS, &extensions);
+        let parsed = parse(&hello).expect("the SNI is still reported");
+        assert_eq!(parsed.sni.as_deref(), Some("example.com"));
+        assert_eq!(parsed.ja4, None);
+    }
+
+    #[test]
+    fn what_does_not_carry_tls_version_fields_is_not_a_hello() {
+        // Record major version: 3 for every TLS version, anything else is another protocol.
+        for major in [0u8, 1, 2, 4, 0x47] {
+            let mut bytes = example();
+            bytes[1] = major;
+            assert_eq!(parse(&bytes), None, "record major {major}");
+        }
+        // The hello's own version: SSL 3.0 to TLS 1.3.
+        for legacy in [0x0000u16, 0x0100, 0x0299, 0x0305, 0x7a7a, 0xffff] {
+            let hello = client_hello(legacy, &[0x002f], &[], &[], &[]);
+            assert_eq!(parse(&hello), None, "legacy_version {legacy:#06x}");
+        }
+        for legacy in [0x0300u16, 0x0301, 0x0302, 0x0303, 0x0304] {
+            let hello = client_hello(legacy, &[0x002f], &[], &[], &[]);
+            assert!(parse(&hello).is_some(), "legacy_version {legacy:#06x}");
+        }
     }
 
     #[test]
@@ -728,7 +888,7 @@ mod tests {
     fn trailing_bytes_after_the_record_are_ignored() {
         let mut bytes = example();
         bytes.extend(b"\x17\x03\x03\x00\x05hello");
-        assert_eq!(parse(&bytes).expect("parsed").ja4, EXAMPLE_JA4);
+        assert_eq!(ja4_of(&bytes), EXAMPLE_JA4);
     }
 
     // --- Never-panic robustness -----------------------------------------------------------
