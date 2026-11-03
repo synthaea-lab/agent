@@ -194,6 +194,8 @@ pub(crate) struct ToolWatch<S> {
     /// The cache of the scan before the last one: a tgid that left the units between two scans
     /// stays nameable for one more scan, since its last event is drained after the rescan can win.
     previous_scan: BTreeMap<u32, UnitProc>,
+    /// Moved-out tools already logged, so the warning comes once, not at every scan.
+    moved_logged: std::collections::BTreeSet<u32>,
     procs: ToolProcs,
 }
 
@@ -204,6 +206,7 @@ impl<S: WatchSet> ToolWatch<S> {
             set,
             applied: BTreeMap::new(),
             previous_scan: BTreeMap::new(),
+            moved_logged: std::collections::BTreeSet::new(),
             procs: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -222,11 +225,13 @@ impl<S: WatchSet> ToolWatch<S> {
         // `echo <pid> > cgroup.procs` to blind the probe): keep watching it until it exits.
         for (pid, known) in &self.applied {
             if !next.contains_key(pid) && self.resolver.still_is(*pid, known) {
-                tracing::warn!(
-                    pid,
-                    unit = %known.unit,
-                    "unit_procs: a security tool process left its unit's cgroup, still watched"
-                );
+                if self.moved_logged.insert(*pid) {
+                    tracing::warn!(
+                        pid,
+                        unit = %known.unit,
+                        "unit_procs: a security tool process left its unit's cgroup, still watched"
+                    );
+                }
                 next.insert(*pid, known.clone());
             }
         }
@@ -257,6 +262,7 @@ impl<S: WatchSet> ToolWatch<S> {
                 ),
             }
         }
+        self.moved_logged.retain(|pid| next.contains_key(pid));
         let watched = self.applied.len();
         let mut cache = next.clone();
         for (pid, known) in &self.previous_scan {

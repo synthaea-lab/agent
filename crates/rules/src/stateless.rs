@@ -1285,14 +1285,14 @@ const LINUX_BENIGN_SIGNALS: [u32; 4] = [17, 18, 23, 28];
 
 /// The label of `signal` when it is worth an alert for `tool_event`, an event naming a listed
 /// security tool (Linux, #1103): the listed signals by name, any other default-terminating one
-/// as `signal N`. A tool dies of any of them unless it handles it, and which ones each tool
+/// as `signal` with its number in parentheses. A tool dies of any of them unless it handles it, and which ones each tool
 /// handles is not known here.
 fn signal_label(signal: u32, tool_event: bool) -> Option<std::borrow::Cow<'static, str>> {
     if let Some(name) = tamper_signal_name(signal) {
         return Some(name.into());
     }
     (tool_event && (1..=64).contains(&signal) && !LINUX_BENIGN_SIGNALS.contains(&signal))
-        .then(|| format!("signal {signal}").into())
+        .then(|| "signal".into())
 }
 
 /// The process id of the service manager: `systemd` on Linux, `launchd` on macOS. The Linux probe

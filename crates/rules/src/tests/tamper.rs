@@ -242,9 +242,7 @@ fn a_default_terminating_signal_to_a_security_tool_alerts_medium() {
             .unwrap_or_else(|| panic!("signal {signal} must alert"));
         assert_eq!(alert.severity, crate::Severity::Medium, "signal {signal}");
         assert!(
-            alert
-                .message
-                .contains(&format!("signal {signal} ({signal})")),
+            alert.message.contains(&format!("sent signal ({signal})")),
             "{}",
             alert.message
         );
