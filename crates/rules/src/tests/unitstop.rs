@@ -171,6 +171,72 @@ fn a_start_within_the_wait_explains_the_stop() {
     }
 }
 
+/// A start that acts on a user manager, another host or a container starts no local unit.
+#[test]
+fn a_start_on_another_manager_does_not_explain_the_stop() {
+    for command in [
+        "systemctl --user start auditd",
+        "systemctl --host=other start auditd",
+        "systemctl -H other start auditd",
+        "systemctl --machine=c restart auditd",
+        "systemctl -M c start auditd",
+        "deb-systemd-invoke --user start auditd.service",
+    ] {
+        assert_alerts_once(
+            &judged("auditd.service", &[(command, T0 + 30 * SEC)]),
+            "auditd",
+        );
+    }
+}
+
+/// Image of the exec, for the tests that name it.
+fn judged_from(unit: &str, image_path: &str, command: &str, at: u64) -> Vec<Alert> {
+    let mut state = RuleState::new();
+    let mut event = exec(command, at);
+    event.image_path = image_path.to_owned();
+    state.on_exec(&event);
+    state.on_file_open(&stopped(unit, T0));
+    state.on_exec(&exec("true", T0 + START_WITHIN_NS + SEC));
+    state
+        .take_due_unit_stops()
+        .into_iter()
+        .map(|(_, alert)| alert)
+        .collect()
+}
+
+/// The shutdown and start explanations are keyed on the image's name: a renamed copy of any
+/// binary in a writable directory must explain nothing (#1102 review, reproduced).
+#[test]
+fn a_shutdown_or_start_from_a_writable_path_does_not_explain_the_stop() {
+    for (image, command, at) in [
+        ("/tmp/reboot", "reboot", T0 - 10 * SEC),
+        ("/dev/shm/shutdown", "shutdown now", T0 - 10 * SEC),
+        ("/tmp/systemctl", "systemctl start falco", T0 + 30 * SEC),
+        ("/home/u/systemctl", "systemctl restart falco", T0 - 5 * SEC),
+        ("/tmp/service", "service falco start", T0 + 30 * SEC),
+        ("/tmp/x/init.d/falco", "falco start", T0 + 30 * SEC),
+        ("/var/tmp/etc/init.d/falco", "falco start", T0 + 30 * SEC),
+    ] {
+        assert_alerts_once(&judged_from("falco", image, command, at), "falco");
+    }
+}
+
+#[test]
+fn a_shutdown_or_start_from_a_system_path_still_explains_the_stop() {
+    for (image, command, at) in [
+        ("/usr/sbin/reboot", "reboot", T0 - 10 * SEC),
+        ("/sbin/shutdown", "shutdown now", T0 - 10 * SEC),
+        ("/usr/bin/systemctl", "systemctl start falco", T0 + 30 * SEC),
+        ("/usr/sbin/service", "service falco start", T0 + 30 * SEC),
+        ("/etc/init.d/falco", "falco start", T0 + 30 * SEC),
+    ] {
+        assert!(
+            judged_from("falco", image, command, at).is_empty(),
+            "{image} {command}"
+        );
+    }
+}
+
 #[test]
 fn a_start_after_the_wait_does_not_explain_the_stop() {
     assert_alerts_once(
@@ -280,6 +346,13 @@ fn a_command_that_does_not_shut_the_host_down_is_not_a_shutdown() {
         "systemctl status reboot.target",
         "init 3",
         "systemctl stop nginx",
+        // Another manager or host: the local host does not go down (#1102 review).
+        "systemctl --host=other reboot",
+        "systemctl -H other reboot",
+        "systemctl -Hother reboot",
+        "systemctl --machine=c poweroff",
+        "systemctl -M c poweroff",
+        "systemctl --user reboot",
     ] {
         assert_alerts_once(
             &judged("auditd.service", &[(command, T0 - 5 * SEC)]),
@@ -290,7 +363,7 @@ fn a_command_that_does_not_shut_the_host_down_is_not_a_shutdown() {
 
 /// A scheduled shutdown stops nothing now: it must not open the window (reviewer's repro).
 #[test]
-fn scheduled_shutdown_suppresses_a_stop() {
+fn a_scheduled_shutdown_does_not_explain_a_stop() {
     for command in [
         "shutdown +60",
         "shutdown +99",

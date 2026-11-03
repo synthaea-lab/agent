@@ -116,12 +116,16 @@ impl UnitStops {
     pub(crate) fn on_exec(&mut self, event: &ExecEvent) {
         let ts = event.meta.timestamp_ns;
         self.clock_ns = self.clock_ns.max(ts);
-        match shutdown_effect(event) {
+        // The shutdown and start claims are name-keyed (the basename of the image), and each one
+        // suppresses an alert: they count only from a system image path, or an unknown one
+        // (`policy::name_exclusion_applies`), so a `/tmp/reboot` copy of `true` explains nothing.
+        let trusted = policy::name_exclusion_applies(Some(&event.image_path));
+        match shutdown_effect(event).filter(|_| trusted) {
             Some(Shutdown::Now) => self.shutdown_ns = Some(ts),
             Some(Shutdown::Cancel) => self.shutdown_ns = None,
             None => {}
         }
-        for (touch, unit) in unit_touches(event) {
+        for (touch, unit) in unit_touches(event, trusted) {
             let list = self.touches.get_or_insert_with(unit, Vec::new);
             if list.len() >= TOUCHES_PER_UNIT {
                 list.remove(0);
@@ -211,8 +215,10 @@ fn listed_unit(path: &str) -> Option<String> {
     SECURITY_SERVICES.contains(&name).then(|| name.to_owned())
 }
 
-/// What an exec does to listed units.
-fn unit_touches(event: &ExecEvent) -> Vec<(Touch, String)> {
+/// What an exec does to listed units. A stop is read whatever the image (the exec rule alerts
+/// on it); a start or restart is a claim that explains a stop, so it counts only when `trusted`
+/// (see [`UnitStops::on_exec`]) and, for an init script, only from `/etc/init.d/`.
+fn unit_touches(event: &ExecEvent, trusted: bool) -> Vec<(Touch, String)> {
     let mut touches: Vec<(Touch, String)> = services_stopped(event)
         .into_iter()
         .filter_map(|service| listed_unit(&service))
@@ -220,11 +226,13 @@ fn unit_touches(event: &ExecEvent) -> Vec<(Touch, String)> {
         .collect();
     let program = program(event);
     let args = args(event);
+    let image = event.image_path.to_ascii_lowercase();
     let named: Vec<(Touch, String)> = match program.as_str() {
-        "systemctl" => systemctl_starts(&args),
-        "service" | "rc-service" | "invoke-rc.d" => init_script_starts(&args),
-        "deb-systemd-invoke" => deb_systemd_invoke_starts(&args),
-        _ if event.image_path.contains("/init.d/") => args
+        _ if !trusted && !image.starts_with("/etc/init.d/") => Vec::new(),
+        "systemctl" if trusted => systemctl_starts(&args),
+        "service" | "rc-service" | "invoke-rc.d" if trusted => init_script_starts(&args),
+        "deb-systemd-invoke" if trusted => deb_systemd_invoke_starts(&args),
+        _ if image.starts_with("/etc/init.d/") => args
             .first()
             .and_then(|verb| verb_touch(verb))
             .map(|touch| vec![(touch, program.clone())])
@@ -248,8 +256,25 @@ fn verb_touch(verb: &str) -> Option<Touch> {
     }
 }
 
+/// Whether `systemctl`-style arguments act on a manager other than the host's system one:
+/// `--user` (a user manager has no system unit), `--host`/`-H`, `--machine`/`-M` (another host or
+/// a container). Such a call neither starts a local unit nor shuts the local host down.
+fn targets_another_manager(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        a == "--user"
+            || a.starts_with("--host")
+            || a.starts_with("--machine")
+            // `-H`/`-M`, lowercased by `recon::args` (`-h` is `--help`, which acts on nothing).
+            || a.starts_with("-h")
+            || a.starts_with("-m")
+    })
+}
+
 /// `systemctl start|restart|try-restart|reload-or-restart a b`, `systemctl enable --now a`.
 fn systemctl_starts(args: &[String]) -> Vec<(Touch, String)> {
+    if targets_another_manager(args) {
+        return Vec::new();
+    }
     let mut positional = args.iter().filter(|a| !a.starts_with('-'));
     let Some(verb) = positional.next() else {
         return Vec::new();
@@ -276,6 +301,9 @@ fn init_script_starts(args: &[String]) -> Vec<(Touch, String)> {
 
 /// `deb-systemd-invoke [--user] start|restart a b` (Debian maintainer scripts).
 fn deb_systemd_invoke_starts(args: &[String]) -> Vec<(Touch, String)> {
+    if targets_another_manager(args) {
+        return Vec::new();
+    }
     let mut positional = args.iter().filter(|a| !a.starts_with('-'));
     let Some(touch) = positional.next().and_then(|verb| verb_touch(verb)) else {
         return Vec::new();
@@ -319,6 +347,9 @@ fn shutdown_effect(event: &ExecEvent) -> Option<Shutdown> {
             (time == "now" || time == "+0").then_some(Shutdown::Now)
         }
         "systemctl" => {
+            if targets_another_manager(&args) {
+                return None;
+            }
             let verb = args.iter().find(|a| !a.starts_with('-'))?;
             if !matches!(
                 verb.as_str(),
