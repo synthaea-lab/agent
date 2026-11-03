@@ -444,7 +444,11 @@ fn a_record_the_server_refuses_for_good_does_not_stop_the_others_of_its_segment(
             queued(KEY_C, detection()),
         ],
     );
-    assert_eq!(uploader.upload_once().unwrap(), 2, "two were accepted");
+    assert_eq!(
+        uploader.upload_once().unwrap(),
+        3,
+        "three were handled: two accepted, one dropped"
+    );
     assert_eq!(
         acked.load(Ordering::SeqCst),
         1,
@@ -511,11 +515,15 @@ fn shortening_keeps_the_title_techniques_and_source_and_says_how_much_was_cut() 
     assert!(body.len() <= transport::MAX_DETECTION_BODY_BYTES);
     let back: Detection = serde_json::from_slice(&body).expect("still a valid detection");
     assert!(
-        back.title.starts_with("Unusual process chain"),
+        back.title.starts_with("[events shortened from "),
+        "the note comes first, so a title cut by the server keeps it: {}",
+        back.title
+    );
+    assert!(
+        back.title.ends_with("Unusual process chain"),
         "{}",
         back.title
     );
-    assert!(back.title.contains("shortened from"), "{}", back.title);
     assert_eq!(back.techniques, huge.techniques);
     assert_eq!(back.severity, huge.severity);
     assert_eq!(back.source, huge.source);
@@ -530,6 +538,103 @@ fn shortening_keeps_the_title_techniques_and_source_and_says_how_much_was_cut() 
     );
 }
 
+fn fits_and_parses(detection: &Detection) -> Detection {
+    let body = transport::fit_detection_to_limit(detection).unwrap();
+    assert!(
+        body.len() <= transport::MAX_DETECTION_BODY_BYTES,
+        "never over the limit: {}",
+        body.len()
+    );
+    serde_json::from_slice(&body).expect("still a valid detection")
+}
+
+#[test]
+fn a_title_over_the_limit_is_cut_to_the_servers_limit_and_keeps_its_note_first() {
+    let mut huge = detection();
+    huge.title = "T".repeat(transport::MAX_DETECTION_BODY_BYTES + 1);
+    let back = fits_and_parses(&huge);
+    assert!(back.title.len() <= 64 * 1024, "{}", back.title.len());
+    assert!(back.title.starts_with("[events shortened from "));
+}
+
+#[test]
+fn a_large_argv_array_is_cut_but_the_image_hash_and_path_stay_whole() {
+    let mut huge = detection();
+    let mut exec = ExecEvent {
+        argv: vec!["a".to_string(); 3_000_000],
+        cmdline: "x".repeat(1024),
+        ..schema::fixtures::exec()
+    };
+    exec.sha256 = Some("ab".repeat(32));
+    exec.image_path = "/usr/bin/python3".into();
+    huge.events = vec![Event::Exec(exec)];
+    let back = fits_and_parses(&huge);
+    let Event::Exec(kept) = &back.events[0] else {
+        panic!("the exec event is kept")
+    };
+    assert!(
+        kept.argv.len() <= 1024,
+        "the array is cut: {}",
+        kept.argv.len()
+    );
+    assert_eq!(kept.sha256.as_deref(), Some("ab".repeat(32).as_str()));
+    assert_eq!(kept.image_path, "/usr/bin/python3");
+}
+
+#[test]
+fn a_single_event_that_stays_too_big_is_reduced_to_its_identity_and_still_fits() {
+    // The image path is an identity field, never cut by the first step: a nine-megabyte one
+    // leaves no room for even one whole event, so the event is reduced to its identity.
+    let mut huge = detection();
+    let mut exec = schema::fixtures::exec();
+    exec.image_path = "p".repeat(transport::MAX_DETECTION_BODY_BYTES + 1);
+    huge.events = vec![Event::Exec(exec)];
+    let body = transport::fit_detection_to_limit(&huge).unwrap();
+    assert!(body.len() <= transport::MAX_DETECTION_BODY_BYTES);
+    // The stub keeps only identity keys, so it is not a whole `ExecEvent` any more: read it as
+    // JSON (the server takes an event as a free-form record).
+    let back: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let events = back["events"].as_array().expect("events");
+    assert_eq!(events.len(), 1, "one event, identity only");
+    assert_eq!(events[0]["type"], "exec");
+    assert!(events[0].get("cmdline").is_none(), "{}", events[0]);
+    assert!(
+        events[0]["image_path"].as_str().unwrap().len() <= 260,
+        "cut to the identity cap"
+    );
+}
+
+#[test]
+fn many_events_are_dropped_from_the_end_and_measured_once() {
+    let mut huge = detection();
+    // The image path is an identity field and is never cut, so these events stay big after the
+    // strings are shortened: the body only fits by dropping events.
+    huge.events = (0..40_000)
+        .map(|i| {
+            Event::Exec(ExecEvent {
+                cmdline: format!("cmd-{i}"),
+                argv: vec![format!("arg-{i}")],
+                image_path: "i".repeat(200),
+                ..schema::fixtures::exec()
+            })
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    let back = fits_and_parses(&huge);
+    assert!(!back.events.is_empty());
+    assert!(back.events.len() < 40_000, "{}", back.events.len());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "not quadratic: {:?}",
+        started.elapsed()
+    );
+    // The first event is kept, in order.
+    let Event::Exec(first) = &back.events[0] else {
+        panic!()
+    };
+    assert_eq!(first.cmdline, "cmd-0");
+}
+
 #[test]
 fn a_segment_of_refused_records_is_acknowledged_and_counted() {
     let (url, server) = sequence_server(vec![400, 413]);
@@ -537,7 +642,8 @@ fn a_segment_of_refused_records_is_acknowledged_and_counted() {
         &url,
         vec![queued(KEY_A, detection()), queued(KEY_B, detection())],
     );
-    assert_eq!(uploader.upload_once().unwrap(), 0);
+    // Handled, not accepted: `0` would read as an empty spool and make the upload loop sleep.
+    assert_eq!(uploader.upload_once().unwrap(), 2);
     assert_eq!(acked.load(Ordering::SeqCst), 1);
     assert_eq!(skipped.load(Ordering::SeqCst), 0);
     assert_eq!(dropped.load(Ordering::SeqCst), 2);
@@ -557,7 +663,7 @@ fn refused_records_are_counted_once_when_a_retry_follows_a_transient_failure() {
     assert!(uploader.upload_once().unwrap_err().is_retryable());
     assert_eq!(acked.load(Ordering::SeqCst), 0);
     assert_eq!(dropped.load(Ordering::SeqCst), 0, "nothing counted yet");
-    assert_eq!(uploader.upload_once().unwrap(), 1);
+    assert_eq!(uploader.upload_once().unwrap(), 2);
     assert_eq!(acked.load(Ordering::SeqCst), 1);
     assert_eq!(skipped.load(Ordering::SeqCst), 0);
     assert_eq!(dropped.load(Ordering::SeqCst), 1, "counted once");
@@ -565,8 +671,9 @@ fn refused_records_are_counted_once_when_a_retry_follows_a_transient_failure() {
 }
 
 #[test]
-fn a_rejection_that_is_not_about_one_record_still_skips_the_whole_segment() {
-    // 401 says the agent is not accepted, not that this record is bad: the old rule stands.
+fn an_error_that_is_not_about_one_record_keeps_the_segment_spooled_and_backs_off() {
+    // 401 says the agent is not accepted, not that this record is bad: skipping would erase the
+    // detection (and, one by one, every one behind it during a certificate rotation).
     let (url, server) = sequence_server(vec![401]);
     let (mut uploader, (acked, skipped, dropped)) = recording_uploader(
         &url,
@@ -574,9 +681,17 @@ fn a_rejection_that_is_not_about_one_record_still_skips_the_whole_segment() {
     );
     let err = uploader.upload_once().unwrap_err();
     assert!(!err.is_retryable());
-    assert_eq!(skipped.load(Ordering::SeqCst), 1);
-    assert_eq!(acked.load(Ordering::SeqCst), 0);
-    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    assert_eq!(skipped.load(Ordering::SeqCst), 0, "not skipped");
+    assert_eq!(acked.load(Ordering::SeqCst), 0, "not acknowledged");
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        0,
+        "not blamed on the records"
+    );
+    assert!(
+        !uploader.backoff_duration().is_zero(),
+        "the loop backs off before the next pass"
+    );
     server.join().unwrap();
 }
 
@@ -587,7 +702,7 @@ fn a_409_idempotency_conflict_is_about_one_record_and_does_not_skip_the_segment(
         &url,
         vec![queued(KEY_A, detection()), queued(KEY_B, detection())],
     );
-    assert_eq!(uploader.upload_once().unwrap(), 1);
+    assert_eq!(uploader.upload_once().unwrap(), 2);
     assert_eq!(acked.load(Ordering::SeqCst), 1);
     assert_eq!(skipped.load(Ordering::SeqCst), 0);
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
@@ -601,7 +716,7 @@ fn a_422_is_about_one_record() {
         &url,
         vec![queued(KEY_A, detection()), queued(KEY_B, detection())],
     );
-    assert_eq!(uploader.upload_once().unwrap(), 1);
+    assert_eq!(uploader.upload_once().unwrap(), 2);
     assert_eq!(
         (acked.load(Ordering::SeqCst), skipped.load(Ordering::SeqCst)),
         (1, 0)
@@ -613,8 +728,8 @@ fn a_422_is_about_one_record() {
 #[test]
 fn a_400_about_the_agents_certificate_is_not_about_the_record() {
     // `400 Invalid certificate subject` (route.ts) and a proxy's HTML 400 for a client
-    // certificate that does not verify describe the whole agent: the whole-segment rule stays,
-    // and the records are not blamed one by one.
+    // certificate that does not verify describe the whole agent: the segment stays spooled and
+    // the loop backs off; the records are not blamed one by one and nothing is erased.
     for body in [
         r#"{"error":"Invalid certificate subject"}"#,
         "<html><body>400 The SSL certificate error</body></html>",
@@ -626,9 +741,10 @@ fn a_400_about_the_agents_certificate_is_not_about_the_record() {
         );
         let err = uploader.upload_once().unwrap_err();
         assert!(!err.is_retryable(), "{body}");
-        assert_eq!(skipped.load(Ordering::SeqCst), 1, "{body}");
+        assert_eq!(skipped.load(Ordering::SeqCst), 0, "{body}");
         assert_eq!(acked.load(Ordering::SeqCst), 0, "{body}");
         assert_eq!(dropped.load(Ordering::SeqCst), 0, "{body}");
+        assert!(!uploader.backoff_duration().is_zero(), "{body}");
         server.join().unwrap();
     }
 }
@@ -642,7 +758,7 @@ fn a_refused_record_is_posted_once_per_pass_and_once_more_on_the_retry_only() {
         vec![queued(KEY_A, detection()), queued(KEY_B, detection())],
     );
     assert!(uploader.upload_once().is_err());
-    assert_eq!(uploader.upload_once().unwrap(), 1);
+    assert_eq!(uploader.upload_once().unwrap(), 2);
     let seen = server.join().unwrap();
     let posts_of_a = seen
         .iter()

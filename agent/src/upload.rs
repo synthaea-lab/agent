@@ -614,6 +614,9 @@ mod tests {
         drain.drain().unwrap();
         drain.ack().unwrap();
         assert_eq!(spool.lock().unwrap().stats().dropped_records, 2);
+        drop(drain);
+        drop(spool);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The at-least-once property the whole wiring exists for: a drain that is

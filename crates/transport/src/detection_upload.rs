@@ -23,7 +23,7 @@ pub const MAX_DETECTION_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// The `error` the detection route answers with a `400` when the payload (or the idempotency
 /// key) fails validation: `server/app/api/ingest/detection/route.ts`, the `ZodError` branch.
 /// Any other `400` (`Invalid certificate subject`, a proxy's HTML page for a client certificate
-/// that does not verify) is about the whole agent and keeps the whole-segment rule.
+/// that does not verify) is about the whole agent: the segment stays spooled and the loop backs off.
 const SERVER_INVALID_PAYLOAD: &str = "Invalid payload";
 
 /// The retry identity is persisted in the same spool record as its detection.
@@ -69,13 +69,14 @@ pub trait DetectionDrain: Send {
 /// was already used for a different detection), `413` (it is over the body limit), `422` (it
 /// cannot be processed), or a record that cannot be serialized. Retrying the record gives the
 /// same answer, and the other records of its segment are not affected. Every other permanent
-/// error says something that holds for the whole upload and keeps the whole-segment rule:
+/// error says something that holds for the whole upload, so the segment stays spooled and the loop backs off:
 /// `401`, `403`, `404`, `429`, a `400` that is not `Invalid payload` (a certificate or subject
 /// failure), a TLS or configuration error.
 ///
 /// A validation `400` after a rolling upgrade (a newer agent field an older server refuses)
 /// lands here too and clears when the server is upgraded: those detections are lost either way,
-/// as the old whole-segment skip lost them, and each one is logged with its key.
+/// as the old whole-segment skip lost them, and each one is logged with its key (the server's own
+/// error does not say which field a newer agent added, so the two cannot be told apart here).
 fn refuses_this_record(error: &TransportError) -> bool {
     match error {
         TransportError::ServerError { status, message } => match status {
@@ -88,41 +89,127 @@ fn refuses_this_record(error: &TransportError) -> bool {
     }
 }
 
-/// Recursively cuts every string longer than `cap` bytes to `cap` (on a character boundary) and
-/// marks the cut with `…`. Keys of objects are left alone.
-fn truncate_strings(value: &mut serde_json::Value, cap: usize) {
+/// The longest title the control plane keeps: `MAX_TITLE_BYTES` in
+/// `server/lib/detection-payload.ts`, which cuts the **end** of a longer title. A mirror, like
+/// [`MAX_DETECTION_BODY_BYTES`].
+const TITLE_MAX_BYTES: usize = 64 * 1024;
+
+/// Keys of an event that identify it and that a process does not pad: they are never cut when an
+/// oversize detection is shortened, so the alert keeps who ran what (the image hash and paths feed
+/// the control plane's SHA-256 check and its image prevalence, which a cut value would break).
+const PROTECTED_KEYS: &[&str] = &[
+    "type",
+    "meta",
+    "sha256",
+    "signature",
+    "image_path",
+    "parent_image_path",
+    "path",
+    "old_path",
+    "new_path",
+    "comm",
+    "pcomm",
+    "parent_comm",
+    "target_user",
+];
+
+/// How hard the process-controlled fields of the events are cut, one step after the other until the
+/// body fits: (longest string in bytes, longest array in items). The command line and its `argv`
+/// are what a process pads, so they go first.
+const SHORTEN_STEPS: [(usize, usize); 5] =
+    [(8192, 1024), (2048, 256), (512, 64), (128, 16), (32, 4)];
+
+/// Cuts a string to at most `cap` bytes, the `…` that marks the cut included, on a character
+/// boundary.
+fn cut_string(text: &mut String, cap: usize) {
+    if text.len() <= cap {
+        return;
+    }
+    let mut end = cap.saturating_sub('…'.len_utf8());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push('…');
+}
+
+/// Cuts the strings longer than `string_cap` bytes and the arrays longer than `array_cap` items of
+/// `value`, recursively, except under [`PROTECTED_KEYS`]. Keys of objects are left alone.
+fn shorten_events(value: &mut serde_json::Value, string_cap: usize, array_cap: usize) {
     match value {
-        serde_json::Value::String(text) if text.len() > cap => {
-            let mut end = cap;
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            text.truncate(end);
-            text.push('…');
-        }
+        serde_json::Value::String(text) => cut_string(text, string_cap),
         serde_json::Value::Array(items) => {
+            items.truncate(array_cap);
             for item in items {
-                truncate_strings(item, cap);
+                shorten_events(item, string_cap, array_cap);
             }
         }
         serde_json::Value::Object(fields) => {
-            for field in fields.values_mut() {
-                truncate_strings(field, cap);
+            for (key, field) in fields.iter_mut() {
+                if !PROTECTED_KEYS.contains(&key.as_str()) {
+                    shorten_events(field, string_cap, array_cap);
+                }
             }
         }
         _ => {}
     }
 }
 
-/// The detection serialized, shortened to [`MAX_DETECTION_BODY_BYTES`] when it is over.
+/// An event reduced to its identity: only its [`PROTECTED_KEYS`], each string cut to 256 bytes.
+fn identity_of(event: &serde_json::Value) -> serde_json::Value {
+    let mut stub = serde_json::Map::new();
+    if let Some(fields) = event.as_object() {
+        for (key, field) in fields {
+            if PROTECTED_KEYS.contains(&key.as_str()) {
+                let mut field = field.clone();
+                if let serde_json::Value::String(text) = &mut field {
+                    cut_string(text, 256);
+                }
+                stub.insert(key.clone(), field);
+            }
+        }
+    }
+    serde_json::Value::Object(stub)
+}
+
+/// Bounds the parts of a detection other than its events, so that the body they leave is small
+/// whatever a process did: at most 64 techniques and attributions, short strings in each.
+fn bound_small_parts(value: &mut serde_json::Value) {
+    for (key, item_cap, string_cap) in [("techniques", 64, 64), ("attributions", 64, 128)] {
+        if let Some(serde_json::Value::Array(items)) = value.get_mut(key) {
+            items.truncate(item_cap);
+            for item in items {
+                shorten_events(item, string_cap, item_cap);
+            }
+        }
+    }
+    if let Some(source) = value.get_mut("source") {
+        shorten_events(source, 2048, 64);
+    }
+}
+
+/// The length of `value` serialized.
+fn json_len(value: &serde_json::Value) -> std::result::Result<usize, serde_json::Error> {
+    Ok(serde_json::to_vec(value)?.len())
+}
+
+/// The detection serialized, shortened to [`MAX_DETECTION_BODY_BYTES`] when it is over. **The result
+/// is never over the limit.**
 ///
 /// A process controls fields of the events a detection carries (an argv it padded to megabytes),
 /// and a field a process controls is bounded by truncation, never by rejection: the detection is
-/// still sent. Only the `events` payload strings are cut (to 8 KiB, then 2 KiB, 512, 128 and 32
-/// bytes, until it fits, then events are dropped from the end, the first one kept); title,
-/// source, techniques, severity, score and the key are kept, and the title says the events were
-/// shortened and from how many bytes. The result is a pure function of the detection, so a retry
-/// of the same record sends the same bytes (the server hashes the body against the key).
+/// still sent. The steps, each only if the body is still too big:
+/// 1. the strings and arrays of the events are cut, by [`SHORTEN_STEPS`] down to 32 bytes and 4
+///    items, never under [`PROTECTED_KEYS`] (image hash and paths, pid, user);
+/// 2. events are dropped from the end, the first kept, each measured once;
+/// 3. the first event is replaced by its identity (the protected keys only);
+/// 4. the events are removed.
+///
+/// Title, source, techniques, severity, score and the key are kept (the title is cut to the
+/// server's own limit, and starts with a note of how many bytes the events had, so the note
+/// survives a title that is long; source, techniques and attributions are bounded, which is
+/// what makes step 4 enough). The result is a pure function of the detection, so a retry of the
+/// same record sends the same bytes (the server hashes the body against the key).
 ///
 /// # Errors
 /// Returns the serialization error of the detection.
@@ -134,36 +221,71 @@ pub fn fit_detection_to_limit(
         return Ok(body);
     }
     let original = body.len();
+    drop(body);
     let mut value = serde_json::to_value(detection)?;
-    let marker = format!(" [events shortened from {original} bytes]");
-    if let Some(title) = value
-        .get_mut("title")
-        .and_then(|t| t.as_str())
-        .map(str::to_owned)
+
+    let note = format!("[events shortened from {original} bytes] ");
+    if let Some(title) = value.get_mut("title")
+        && let Some(text) = title.as_str()
     {
-        value["title"] = serde_json::Value::String(format!("{title}{marker}"));
+        let mut text = text.to_owned();
+        cut_string(&mut text, TITLE_MAX_BYTES.saturating_sub(note.len()));
+        *title = serde_json::Value::String(format!("{note}{text}"));
     }
-    let mut best = body;
-    for cap in [8192, 2048, 512, 128, 32] {
-        if let Some(events) = value.get_mut("events") {
-            truncate_strings(events, cap);
+    bound_small_parts(&mut value);
+
+    let mut events = match value.get_mut("events").map(serde_json::Value::take) {
+        Some(serde_json::Value::Array(events)) => events,
+        _ => Vec::new(),
+    };
+    let finish = |value: &mut serde_json::Value,
+                  events: Vec<serde_json::Value>|
+     -> std::result::Result<Vec<u8>, serde_json::Error> {
+        value["events"] = serde_json::Value::Array(events);
+        serde_json::to_vec(value)
+    };
+
+    // 1. Cut what a process pads.
+    for (string_cap, array_cap) in SHORTEN_STEPS {
+        for event in &mut events {
+            shorten_events(event, string_cap, array_cap);
         }
-        best = serde_json::to_vec(&value)?;
-        if best.len() <= MAX_DETECTION_BODY_BYTES {
-            return Ok(best);
+        let body = finish(&mut value, events.clone())?;
+        if body.len() <= MAX_DETECTION_BODY_BYTES {
+            return Ok(body);
         }
     }
-    while best.len() > MAX_DETECTION_BODY_BYTES {
-        let Some(events) = value.get_mut("events").and_then(|e| e.as_array_mut()) else {
+
+    // 2. Drop events from the end, the first kept: measure every event once and keep the longest
+    // prefix that fits.
+    value["events"] = serde_json::Value::Array(Vec::new());
+    let fixed = json_len(&value)?;
+    let mut total = fixed;
+    let mut keep = 0usize;
+    for event in &events {
+        let size = json_len(event)? + usize::from(keep > 0);
+        if total + size > MAX_DETECTION_BODY_BYTES {
             break;
-        };
-        if events.len() <= 1 {
-            break;
         }
-        events.pop();
-        best = serde_json::to_vec(&value)?;
+        total += size;
+        keep += 1;
     }
-    Ok(best)
+    if keep > 0 {
+        events.truncate(keep);
+        return finish(&mut value, events);
+    }
+
+    // 3. Not even one event fits: the first one, reduced to its identity.
+    if let Some(first) = events.first() {
+        let stub = vec![identity_of(first)];
+        let body = finish(&mut value, stub)?;
+        if body.len() <= MAX_DETECTION_BODY_BYTES {
+            return Ok(body);
+        }
+    }
+
+    // 4. Without events: bounded by construction (title, source, techniques, attributions).
+    finish(&mut value, Vec::new())
 }
 
 /// Uploads detections one at a time, preserving each record's retry key.
@@ -195,10 +317,12 @@ impl<D: DetectionDrain> DetectionUploader<D> {
     /// dropped on its own, logged with its key, and the rest of the segment is uploaded: one bad
     /// record must not take with it the unrelated detections spooled in the same segment
     /// (#1119). The drops are counted once, when the segment is acknowledged, so a retry of the
-    /// segment does not count them again. Any other permanent 4xx skips the whole segment to
-    /// keep later detections moving; the spool counts the loss.
+    /// segment does not count them again. Any other error leaves the segment spooled and the loop
+    /// backs off: a failure that is not about this record (a certificate or authentication
+    /// error, a route or TLS problem) does not erase the detection.
     ///
-    /// Returns the number of records the server accepted.
+    /// Returns the number of records handled: accepted by the server, or dropped one by one. It is `0`
+    /// only for an empty spool.
     ///
     /// # Errors
     /// Returns an upload or spool error.
@@ -214,16 +338,7 @@ impl<D: DetectionDrain> DetectionUploader<D> {
         let mut dropped = 0u64;
         for record in &records {
             let body = match fit_detection_to_limit(&record.detection) {
-                Ok(body) => {
-                    if body.len() > MAX_DETECTION_BODY_BYTES {
-                        tracing::warn!(
-                            key = %record.key,
-                            bytes = body.len(),
-                            "detection still over the server body limit after shortening; sending it, the server will refuse it"
-                        );
-                    }
-                    body
-                }
+                Ok(body) => body,
                 Err(error) => {
                     tracing::warn!(
                         %error,
@@ -244,22 +359,28 @@ impl<D: DetectionDrain> DetectionUploader<D> {
                     );
                     dropped += 1;
                 }
-                Err(error) if !error.is_retryable() => {
-                    tracing::warn!(error = %error, dropped = records.len(), "server rejected detection segment permanently");
-                    self.drain.skip()?;
-                    self.consecutive_failures = 0;
-                    return Err(error);
-                }
                 Err(error) => {
+                    // Nothing here says the record is bad: either the failure is transient, or it
+                    // is about the whole agent (a certificate that does not verify, a rotated CA,
+                    // a `401`/`403`, a route or TLS problem). Skipping would erase the detection,
+                    // and every one behind it in turn, in seconds during a certificate rotation:
+                    // the segment stays spooled and the loop backs off. The spool's byte cap sheds
+                    // the oldest if this lasts.
                     self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-                    tracing::warn!(error = %error, "detection upload failed; segment remains spooled");
+                    if error.is_retryable() {
+                        tracing::warn!(error = %error, "detection upload failed; segment remains spooled");
+                    } else {
+                        tracing::warn!(error = %error, "server refused the upload for a reason that is not about this detection (certificate, authentication, route); segment remains spooled, retrying with backoff");
+                    }
                     return Err(error);
                 }
             }
         }
         self.drain.ack_dropping(dropped)?;
         self.consecutive_failures = 0;
-        Ok(uploaded)
+        // Records handled, the dropped ones included: `0` means an empty spool to the upload loop,
+        // which sleeps a poll interval, so a segment of refused records must not return it.
+        Ok(uploaded + usize::try_from(dropped).unwrap_or(usize::MAX))
     }
 
     /// Exponential retry delay, capped by the transport configuration.
