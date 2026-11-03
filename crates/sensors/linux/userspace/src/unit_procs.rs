@@ -30,6 +30,11 @@ const MAX_DEPTH: usize = 4;
 /// bomb in the unit, and the first ones are the tool's own.
 const MAX_PROCS_PER_UNIT: usize = 256;
 
+/// Cgroup directories read per unit and layout, the unit's own included. `MAX_DEPTH` bounds the
+/// depth, not the width: a delegated unit can hold thousands of sibling sub-cgroups, and the scan
+/// runs on the loop that drains the ring. Past this the rest are not read (logged).
+const MAX_CGROUPS_PER_UNIT: usize = 256;
+
 /// What the watch set knows about a watched process, taken at scan time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UnitProc {
@@ -41,6 +46,20 @@ pub(crate) struct UnitProc {
     /// time: with the pid it names one process, which the exe alone cannot (a pid reused by the
     /// same program, or a kernel thread with no exe).
     pub start: Option<u64>,
+    /// `SigCgt` of `/proc/<pid>/status` at scan time: the signals the process catches. A
+    /// `SIGHUP` it catches is a reload, one it does not catch ends it.
+    pub sig_cgt: Option<u64>,
+}
+
+impl UnitProc {
+    /// Whether the process had a handler for `signal` (1..=64) at scan time. Unknown (no
+    /// `SigCgt` read) counts as no handler, so the signal is reported, not hidden.
+    pub(crate) fn catches(&self, signal: u32) -> bool {
+        (1..=64).contains(&signal)
+            && self
+                .sig_cgt
+                .is_some_and(|set| set & (1u64 << (signal - 1)) != 0)
+    }
 }
 
 /// Resolves the listed units to their processes.
@@ -81,7 +100,15 @@ impl UnitResolver {
                     .cgroup_root
                     .join(layout)
                     .join(format!("{unit}.service"));
-                collect_procs(&dir, 0, &mut pids);
+                let mut budget = MAX_CGROUPS_PER_UNIT;
+                collect_procs(&dir, 0, &mut budget, &mut pids);
+                if budget == 0 {
+                    tracing::warn!(
+                        unit = %unit,
+                        cap = MAX_CGROUPS_PER_UNIT,
+                        "unit_procs: a security unit has more sub-cgroups than the cap, the rest are not read"
+                    );
+                }
             }
             if pids.len() > MAX_PROCS_PER_UNIT {
                 tracing::warn!(
@@ -97,6 +124,7 @@ impl UnitResolver {
                     unit: unit.clone(),
                     exe: self.exe_of(pid),
                     start: self.start_of(pid),
+                    sig_cgt: self.sig_cgt_of(pid),
                 });
             }
         }
@@ -109,6 +137,14 @@ impl UnitResolver {
     /// the answer is no.
     pub(crate) fn still_is(&self, pid: u32, known: &UnitProc) -> bool {
         known.start.is_some() && self.start_of(pid) == known.start
+    }
+
+    /// `SigCgt:` of `/proc/<pid>/status`, a hex mask with bit `sig - 1` per caught signal.
+    fn sig_cgt_of(&self, pid: u32) -> Option<u64> {
+        let status =
+            fs::read_to_string(self.proc_root.join(pid.to_string()).join("status")).ok()?;
+        let line = status.lines().find_map(|l| l.strip_prefix("SigCgt:"))?;
+        u64::from_str_radix(line.trim(), 16).ok()
     }
 
     /// Field 22 of `/proc/<pid>/stat`. The command name (field 2) may hold spaces and
@@ -127,7 +163,11 @@ impl UnitResolver {
 }
 
 /// The tgids of `dir/cgroup.procs` and of the cgroups below `dir`, in file order.
-fn collect_procs(dir: &Path, depth: usize, out: &mut Vec<u32>) {
+fn collect_procs(dir: &Path, depth: usize, budget: &mut usize, out: &mut Vec<u32>) {
+    if *budget == 0 {
+        return;
+    }
+    *budget -= 1;
     let Ok(procs) = fs::read_to_string(dir.join("cgroup.procs")) else {
         return;
     };
@@ -149,7 +189,7 @@ fn collect_procs(dir: &Path, depth: usize, out: &mut Vec<u32>) {
         .collect();
     children.sort();
     for child in children {
-        collect_procs(&child, depth + 1, out);
+        collect_procs(&child, depth + 1, budget, out);
     }
 }
 
@@ -341,6 +381,17 @@ mod tests {
             fs::write(dir.join("cgroup.procs"), lines.join("\n") + "\n").unwrap();
         }
 
+        /// `/proc/<pid>/status` with a `SigCgt` mask (hex).
+        fn caught(&self, pid: u32, mask: u64) {
+            let dir = self.root.join("proc").join(pid.to_string());
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("status"),
+                format!("Name:\ttool\nSigBlk:\t0000000000000000\nSigCgt:\t{mask:016x}\n"),
+            )
+            .unwrap();
+        }
+
         /// The process exits: its `/proc/<pid>` is gone.
         fn gone(&self, pid: u32) {
             let _ = fs::remove_dir_all(self.root.join("proc").join(pid.to_string()));
@@ -386,6 +437,7 @@ mod tests {
                 unit: "auditd".to_owned(),
                 exe: Some("/usr/sbin/auditd".to_owned()),
                 start: Some(1000),
+                sig_cgt: None,
             }
         );
     }
@@ -434,6 +486,7 @@ mod tests {
             unit: unit.to_owned(),
             exe: None,
             start: None,
+            sig_cgt: None,
         };
         let before = BTreeMap::from([(5, proc("falco"))]);
         let after = BTreeMap::from([(5, proc("osqueryd"))]);
@@ -704,5 +757,36 @@ mod tests {
         assert!(watch.procs().lock().unwrap().contains_key(&612));
         watch.refresh();
         assert!(!watch.procs().lock().unwrap().contains_key(&612));
+    }
+
+    #[test]
+    fn sigcgt_says_whether_a_tool_catches_sighup() {
+        let host = Host::new();
+        host.unit("system.slice", "auditd.service", &[612, 613, 614]);
+        // 612 catches SIGHUP and SIGTERM (bits 0 and 14), 613 catches only SIGTERM, 614 has no status.
+        host.caught(612, 1 | (1 << 14));
+        host.caught(613, 1 << 14);
+        let found = host.resolver(&["auditd"]).scan();
+        assert!(found[&612].catches(1));
+        assert!(found[&612].catches(15));
+        assert!(!found[&613].catches(1), "no handler: SIGHUP ends it");
+        assert!(!found[&614].catches(1), "unknown counts as no handler");
+        assert!(!found[&612].catches(0) && !found[&612].catches(65));
+    }
+
+    #[test]
+    fn the_number_of_cgroups_read_per_unit_is_bounded() {
+        let host = Host::new();
+        host.unit("system.slice", "auditd.service", &[1]);
+        for n in 0..(MAX_CGROUPS_PER_UNIT as u32 + 100) {
+            host.unit(
+                "system.slice",
+                &format!("auditd.service/sub{n:04}"),
+                &[10_000 + n],
+            );
+        }
+        let found = host.resolver(&["auditd"]).scan();
+        // The unit's own cgroup plus MAX_CGROUPS_PER_UNIT - 1 sub-cgroups, then the budget is spent.
+        assert_eq!(found.len(), MAX_CGROUPS_PER_UNIT.min(MAX_PROCS_PER_UNIT));
     }
 }

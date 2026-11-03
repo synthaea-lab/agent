@@ -99,15 +99,19 @@ static TASK_TGID_OFFSET: Global<u32> = Global::new(0);
 /// null, the sender the writing process).
 const SEND_SIG_PRIV: usize = 1;
 
+/// `kernel_siginfo.si_code`: `si_signo` and `si_errno` come first, 4 bytes each, on every
+/// architecture (the layout is userspace ABI).
+const SIGINFO_CODE_OFFSET: usize = 8;
+
 /// The signals worth reporting for a tool, as a bit set (bit `sig - 1`): every signal whose
-/// default action ends or stops a process, except `SIGHUP` (a reload, silent for a tool in the
-/// rule). Left out: `SIGCHLD`, `SIGCONT`, `SIGURG`, `SIGWINCH`, which neither end nor stop it,
-/// and `SIGHUP`. Real-time signals (32..=64) end a process with no handler, so they are kept.
+/// default action ends or stops a process, `SIGHUP` included: a tool that catches it takes it as a
+/// reload, and userspace drops it for such a tool (`SigCgt`), but one with no handler is ended
+/// by it. Left out: `SIGCHLD`, `SIGCONT`, `SIGURG`, `SIGWINCH`, which neither end nor stop it.
+/// Real-time signals (32..=64) end a process with no handler, so they are kept.
 /// Filtering here keeps the shared ring free of noise a sender could use to fill it before a
 /// `SIGKILL`.
 const TOOL_SIGNALS: u64 = {
     let mut set = u64::MAX;
-    set &= !(1 << (1 - 1)); // SIGHUP
     set &= !(1 << (17 - 1)); // SIGCHLD
     set &= !(1 << (18 - 1)); // SIGCONT
     set &= !(1 << (23 - 1)); // SIGURG
@@ -150,10 +154,26 @@ pub fn raw_signal_generate(ctx: RawTracePointContext) -> u32 {
     if !is_watched_tool(target) {
         return 0;
     }
-    // No filter on `si_code`: a positive code is not proof of the kernel. `fcntl(F_SETOWN)` with
+    // `SI_TIMER`, `SI_MESGQ` and `SI_ASYNCIO` come from interrupt or completion context, where
+    // `current` is whatever was running, and only the process's own timer, queue or I/O raises
+    // them: never another process acting on the tool, and the sender would be a bystander.
+    if info as usize != 0 {
+        // SAFETY: `info` is the kernel's `kernel_siginfo` pointer from the tracepoint (not
+        // null, not `SEND_SIG_PRIV`, checked above); the read goes through `bpf_probe_read_kernel`.
+        let Ok(code) =
+            (unsafe { bpf_probe_read_kernel(info.add(SIGINFO_CODE_OFFSET).cast::<i32>()) })
+        else {
+            return 0;
+        };
+        if (-4..=-2).contains(&code) {
+            return 0;
+        }
+    }
+    // No other filter on `si_code`: a positive code is not proof of the kernel. `fcntl(F_SETOWN)` with
     // `F_SETSIG=SIGKILL` and `O_ASYNC` kills a tool with `si_code` `POLL_IN` and the attacker as
     // `current`. The kernel's own signals with a real siginfo (`force_sig_fault`, `SIGSEGV` and
     // the like) are sent by the faulting task to itself, which the self-signal test drops.
+
     // A tool signalling itself (`abort()`, a worker thread): not a process acting on it.
     if (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32 == target {
         return 0;

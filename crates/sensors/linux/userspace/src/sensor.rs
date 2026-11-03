@@ -569,12 +569,18 @@ impl LinuxSensor {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .get(&e.target_pid)
                                 .cloned();
+                            // `SIGHUP` to a tool that catches it is a reload (logrotate,
+                            // `ExecReload=`): the probe lets it through, this is where it is
+                            // dropped. One it does not catch ends the tool and is reported.
+                            if e.signal == 1 && tool.as_ref().is_some_and(|t| t.catches(1)) {
+                                return None;
+                            }
                             let (image, unit) = match tool {
                                 Some(tool) => (tool.exe, Some(tool.unit)),
                                 None if e.target_pid == own_pid => (self_exe.clone(), None),
                                 None => (None, None),
                             };
-                            normalize::signal(e, offset, image, unit, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                            Some(normalize::signal(e, offset, image, unit, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache)))
                         });
                 }
                 guard = kernel_module_ring_buf.readable_mut() => {

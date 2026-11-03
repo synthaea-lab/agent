@@ -182,17 +182,19 @@ fn signal_to_tool(sender_pid: u32, comm: &str, signal: u32) -> SignalEvent {
     event
 }
 
-/// The benign case the issue asks a test for: logrotate's `postrotate`, `ExecReload=` and
-/// `systemctl reload` all send `SIGHUP`, which a daemon reads as "reload your configuration".
+/// A `SIGHUP` that reaches the rule is one the sensor did not drop as a reload (the tool catches
+/// it, see `sensor-linux`'s `catches`): the tool has no handler and the signal ends it.
 #[test]
-fn a_sighup_to_a_security_tool_is_a_reload_and_does_not_alert() {
-    for (pid, comm) in [(4242, "kill"), (3100, "logrotate"), (1, "systemd")] {
-        assert!(
-            check_security_process_signal(&signal_to_tool(pid, comm, 1)).is_none(),
-            "{comm}"
-        );
+fn a_sighup_to_a_tool_with_no_handler_alerts_medium_and_the_agent_stays_high() {
+    for (pid, comm) in [(4242, "kill"), (3100, "logrotate")] {
+        let alert = check_security_process_signal(&signal_to_tool(pid, comm, 1))
+            .unwrap_or_else(|| panic!("{comm}"));
+        assert_eq!(alert.severity, crate::Severity::Medium, "{comm}");
+        assert!(alert.message.contains("SIGHUP"), "{}", alert.message);
     }
-    // The agent does not reload on `SIGHUP`: it still alerts.
+    // From the service manager: Low, like every terminating signal.
+    let alert = check_security_process_signal(&signal_to_tool(1, "systemd", 1)).unwrap();
+    assert_eq!(alert.severity, crate::Severity::Low);
     let alert = check_security_process_signal(&signal_from(4242, "bash", 1, 400)).unwrap();
     assert_eq!(alert.severity, crate::Severity::High);
 }

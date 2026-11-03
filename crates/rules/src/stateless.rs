@@ -1252,8 +1252,7 @@ pub fn evaluate_log_cleared(event: &schema::LogClearedEvent) -> Vec<Alert> {
     }]
 }
 
-/// `SIGHUP` and `SIGKILL`: the same on Linux and macOS.
-const SIGHUP: u32 = 1;
+/// `SIGKILL`: the same on Linux and macOS.
 const SIGKILL: u32 = 9;
 
 /// `SIGSTOP`'s platform-native number: the one signal of
@@ -1322,10 +1321,12 @@ const INIT_PID: u32 = 1;
 ///   A D-Bus stop has no exec: only the journal sees it.
 /// - Anyone else: High, as before, **for the agent itself**. For a listed security tool (the
 ///   event carries `target_unit`, Linux, #1103) the signal decides:
-///   - **`SIGHUP` is not an alert**: a daemon takes it as "reload your configuration"
+///   - **`SIGHUP`**: a daemon that catches it takes it as "reload your configuration"
 ///     (logrotate's `postrotate`, `ExecReload=`, `systemctl reload`), the commonest benign signal
-///     a tool gets. The cost is a tool with no `SIGHUP` handler, which it ends; that kill is not
-///     seen here. The agent keeps `SIGHUP` as an alert, it does not reload on it.
+///     a tool gets. The Linux sensor drops it for such a tool (the process's `SigCgt` at scan
+///     time), so an event that reaches this rule is a `SIGHUP` to a tool with **no handler**,
+///     which ends it: Medium like the other catchable signals. The agent keeps `SIGHUP` as High,
+///     it does not reload on it.
 ///   - `SIGKILL` and `SIGSTOP`, which cannot be handled, are **High**.
 ///   - The catchable ones that end a daemon (`SIGTERM`, `SIGINT`, `SIGQUIT`, `SIGABRT`, and any
 ///     other signal whose default action terminates: `SIGUSR1`, `SIGPIPE`, `SIGALRM`, a
@@ -1347,9 +1348,6 @@ pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Opti
     let tool = event.target_unit.is_some();
     let name = signal_label(event.signal, tool)?;
     if event.meta.pid == event.target_pid {
-        return None;
-    }
-    if tool && event.signal == SIGHUP {
         return None;
     }
     let target = event.target_image_path.as_deref().unwrap_or("?");
