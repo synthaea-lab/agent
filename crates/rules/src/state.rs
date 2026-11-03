@@ -2133,9 +2133,11 @@ impl RuleState {
         self.odd_hours.set_exempt_accounts(accounts)
     }
 
-    /// Odd-hour logons the exempt list has suppressed since the agent started (#1089).
+    /// Odd-hour logons the exempt list has suppressed since the agent started (#1089); read by the
+    /// tests, and visible in production through the `skips` field of the info line of `OddHours`.
+    #[cfg(test)]
     #[must_use]
-    pub fn odd_hour_exempt_skips(&self) -> u64 {
+    pub(crate) fn odd_hour_exempt_skips(&self) -> u64 {
         self.odd_hours.exempt_skips()
     }
 

@@ -112,11 +112,22 @@ fn apply_odd_hour_calibration(sink: &DetectionSink, detection: &config::Detectio
         }
     }
     if !detection.odd_hour_exempt_accounts.is_empty() {
+        for (index, entry) in detection.odd_hour_exempt_accounts.iter().enumerate() {
+            if entry.contains('\\') {
+                tracing::warn!(
+                    index,
+                    "detection: an exempt entry contains a backslash; no sensor reports DOMAIN\\name for a logon today, so it exempts nothing (write the bare name, or NAME|SID)"
+                );
+            }
+        }
         let kept = sink.set_odd_hour_exempt_accounts(&detection.odd_hour_exempt_accounts);
         tracing::info!(
             count = kept,
             "detection: accounts exempt from the odd-hour logon rule"
         );
+        // A guard against drift only: `config::load` already refuses every entry the rules drop
+        // (blank, over-long, a malformed SID part, past the limit), so this does not fire after a
+        // normal load; both grammars are checked against one shared table of entries.
         if kept != detection.odd_hour_exempt_accounts.len() {
             tracing::warn!(
                 declared = detection.odd_hour_exempt_accounts.len(),

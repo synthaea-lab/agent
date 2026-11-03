@@ -624,7 +624,8 @@ fn exempt_accounts_match_without_case() {
 }
 
 /// An event that does report a domain is matched on the whole string, so a bare entry does not
-/// reach it. No sensor reports a domain for a logon today (see the next test), so this guards
+/// reach it. No sensor reports `DOMAIN\name` for a logon today (see the next test; an SSSD host
+/// logs `user@realm`, which is another string a bare entry does not match either), so this guards
 /// the matcher, not a threat the agent can meet yet.
 #[test]
 fn a_bare_exempt_entry_does_not_exempt_the_same_name_under_a_domain() {
@@ -824,6 +825,125 @@ fn an_exempt_skip_is_counted_and_an_ordinary_logon_is_not() {
         2,
         "an alerted logon is not a skip"
     );
+}
+
+/// An odd local minute: `h:m` local on the day of `at_local`.
+fn at_local_min(local_hour: u64, minute: u64) -> u64 {
+    MIDNIGHT_UTC + (local_hour + 22) % 24 * HOUR + minute * 60_000_000_000
+}
+
+#[test]
+fn a_declared_wrapping_window_is_exact_at_its_edges() {
+    // [22, 6): 22:00 is the first ordinary minute, 06:00 the first odd one.
+    let mut state = with_window(22, 6);
+    for (user, hour, minute, odd) in [
+        ("edge_a", 21, 59, true),
+        ("edge_b", 22, 0, false),
+        ("edge_c", 5, 59, false),
+        ("edge_d", 6, 0, true),
+    ] {
+        assert_eq!(
+            odd_hour(&mut state, user, at_local_min(hour, minute)).len(),
+            usize::from(odd),
+            "{hour:02}:{minute:02}"
+        );
+    }
+}
+
+#[test]
+fn the_exempt_entry_grammar_matches_the_vectors_the_config_load_uses() {
+    const VECTORS: &str = include_str!("../../../config/data/exempt-entry-vectors.txt");
+    let mut checked = 0;
+    for line in VECTORS
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        let (kind, entry) = line.split_once('\t').expect(line);
+        let mut state = utc_plus_two();
+        let kept = state.set_odd_hour_exempt_accounts(&[entry.to_string()]);
+        assert_eq!(kept, usize::from(kind == "ok"), "{line:?}");
+        checked += 1;
+    }
+    assert!(checked >= 10, "the table was read: {checked}");
+}
+
+/// A `tracing` writer into a buffer, to read what the rules log.
+#[derive(Clone, Default)]
+struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = LogCapture;
+    fn make_writer(&'a self) -> LogCapture {
+        self.clone()
+    }
+}
+
+fn logs_at(level: tracing::Level, run: impl FnOnce()) -> String {
+    let capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(capture.clone())
+        .with_max_level(level)
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, run);
+    let bytes = capture.0.lock().unwrap().clone();
+    String::from_utf8(bytes).unwrap()
+}
+
+fn suppressed_logons_under_one_exempt_name() {
+    let real = format!("{DOMAIN_SID}-1004");
+    let lookalike = "S-1-5-21-4444444444-5555555555-6666666666-1001";
+    let mut state = exempt(&["svc_backup"]);
+    // The real account, then a look-alike under another SID within its quiet period, then the real
+    // one again.
+    odd_hour_with_sid(&mut state, "svc_backup", Some(&real), at_local_min(3, 10));
+    odd_hour_with_sid(
+        &mut state,
+        "svc_backup",
+        Some(lookalike),
+        at_local_min(3, 20),
+    );
+    odd_hour_with_sid(&mut state, "svc_backup", Some(&real), at_local_min(3, 30));
+}
+
+#[test]
+fn a_lookalike_sid_under_an_exempt_name_leaves_its_own_line_within_the_quiet_period() {
+    let out = logs_at(
+        tracing::Level::DEBUG,
+        suppressed_logons_under_one_exempt_name,
+    );
+    let lines: Vec<&str> = out
+        .lines()
+        .filter(|l| l.contains("exempt account"))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "one per (name, SID), the repeat is throttled:\n{out}"
+    );
+    assert!(lines.iter().any(|l| l.contains("-1004")), "{out}");
+    assert!(lines.iter().any(|l| l.contains("-1001")), "{out}");
+}
+
+#[test]
+fn the_exempt_log_line_at_info_carries_no_account_and_no_sid() {
+    let out = logs_at(
+        tracing::Level::INFO,
+        suppressed_logons_under_one_exempt_name,
+    );
+    assert!(out.contains("skips="), "the count is at info:\n{out}");
+    assert!(!out.contains("svc_backup"), "no account at info:\n{out}");
+    assert!(!out.contains("S-1-5-21"), "no SID at info:\n{out}");
 }
 
 #[test]

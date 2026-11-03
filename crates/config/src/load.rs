@@ -1121,6 +1121,25 @@ control_plane_url = "https://cp.example"
         }
     }
 
+    #[test]
+    fn the_exempt_entry_grammar_matches_the_vectors_the_rules_use() {
+        const VECTORS: &str = include_str!("../data/exempt-entry-vectors.txt");
+        let mut checked = 0;
+        for line in VECTORS
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        {
+            let (kind, entry) = line.split_once('\t').expect(line);
+            assert_eq!(
+                exempt_entry_problem(entry).is_none(),
+                kind == "ok",
+                "{line:?}"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 10, "the table was read: {checked}");
+    }
+
     fn deception_table(dirs: &[String]) -> String {
         let list: Vec<String> = dirs.iter().map(|d| format!("\"{d}\"")).collect();
         format!("[deception]\ncanary_dirs = [{}]\n", list.join(", "))

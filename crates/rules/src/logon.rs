@@ -222,9 +222,9 @@ pub(crate) struct OddHours {
     exempt: Vec<ExemptEntry>,
     /// Lowercased account → timestamp of its last alert.
     last_alert_ns: BoundedMap<String, u64>,
-    /// Lowercased account → timestamp of the last odd-hour logon an exemption let through that
-    /// was logged (one line per account per [`ODD_HOUR_QUIET_NS`], so a service account that logs
-    /// on every minute does not flood the log).
+    /// (Lowercased account, uppercased SID) → timestamp of the last odd-hour logon an exemption
+    /// suppressed that was logged (one line per pair per [`ODD_HOUR_QUIET_NS`], so a service
+    /// account that logs on every minute does not flood the log).
     last_exempt_log_ns: BoundedMap<String, u64>,
     /// Odd-hour logons an exemption suppressed, since the agent started.
     exempt_skips: u64,
@@ -299,7 +299,10 @@ impl OddHours {
         })
     }
 
-    /// Odd-hour logons an exemption has suppressed since the agent started.
+    /// Odd-hour logons an exemption has suppressed since the agent started. It is observable
+    /// through the `skips` field of the info line each (name, SID) leaves once per quiet period;
+    /// no health beacon field carries it (that needs a schema and a server change for one counter).
+    #[cfg(test)]
     pub(crate) fn exempt_skips(&self) -> u64 {
         self.exempt_skips
     }
@@ -349,7 +352,7 @@ impl OddHours {
     /// The local hour of a logon of `user` (carrying `sid`, when the sensor reports one) at `ts`
     /// when it is outside the working hours and this account has not been reported within
     /// [`ODD_HOUR_QUIET_NS`]; remembers it. A logon an exemption suppresses is counted
-    /// ([`Self::exempt_skips`]) and logged once per account per quiet period, so a suppression
+    /// (`exempt_skips`) and logged once per (name, SID) per quiet period, so a suppression
     /// list leaves a trace.
     pub(crate) fn observe(&mut self, user: &str, sid: Option<&str>, ts: u64) -> Option<u32> {
         let hour = self.local_hour(ts)?;
@@ -358,19 +361,31 @@ impl OddHours {
         }
         if self.is_exempt(user, sid) {
             self.exempt_skips = self.exempt_skips.saturating_add(1);
-            let key = user.to_lowercase();
+            // Throttled per (name, SID), not per name: a look-alike account (the same bare name
+            // under another SID) is exactly what an exempt name lets through, and it must leave
+            // its own line even within the quiet period of the real one.
+            let identity = format!(
+                "{}\u{0}{}",
+                user.to_lowercase(),
+                sid.unwrap_or("").to_ascii_uppercase()
+            );
             if !self
                 .last_exempt_log_ns
-                .get(&key)
+                .get(&identity)
                 .is_some_and(|last| ts.saturating_sub(*last) < ODD_HOUR_QUIET_NS)
             {
+                // CLAUDE.md: never log event payload contents at info. The count is at info; the
+                // account and the SID, which come from the event, are at debug.
                 tracing::info!(
+                    skips = self.exempt_skips,
+                    "odd-hour logon not reported: the account is on the exempt list (account and SID at debug)"
+                );
+                tracing::debug!(
                     account = user,
                     sid = sid.unwrap_or("none"),
-                    skips = self.exempt_skips,
-                    "odd-hour logon not reported: the account is on the exempt list"
+                    "odd-hour logon not reported: exempt account"
                 );
-                self.last_exempt_log_ns.insert(key, ts);
+                self.last_exempt_log_ns.insert(identity, ts);
             }
             return None;
         }
