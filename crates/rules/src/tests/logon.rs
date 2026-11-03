@@ -614,14 +614,29 @@ fn nothing_is_exempt_until_the_operator_says_so() {
 }
 
 #[test]
-fn exempt_accounts_match_without_case_and_a_bare_name_matches_under_any_domain() {
+fn exempt_accounts_match_without_case() {
     let mut state = exempt(&["SVC_Backup"]);
     assert!(odd_hour(&mut state, "svc_backup", at_local(3)).is_empty());
-    assert!(odd_hour(&mut state, "CORP\\svc_backup", at_local(3)).is_empty());
-    assert!(odd_hour(&mut state, "OTHER\\SVC_BACKUP", at_local(3)).is_empty());
+    assert!(odd_hour(&mut state, "SVC_BACKUP", at_local(3)).is_empty());
     // A near miss is another account.
     assert_eq!(odd_hour(&mut state, "svc_backup2", at_local(3)).len(), 1);
     assert_eq!(odd_hour(&mut state, "xsvc_backup", at_local(3)).len(), 1);
+}
+
+/// An unqualified entry exempts only the unqualified account: an intruder with local admin
+/// chooses the account name, so a bare `svc_backup` must not exempt a local `DESKTOP-X\svc_backup`
+/// it just created. The domain is the only evidence the event carries, so it is not thrown away.
+#[test]
+fn a_bare_exempt_entry_does_not_exempt_the_same_name_under_a_domain() {
+    let mut state = exempt(&["svc_backup"]);
+    for user in [
+        "CORP\\svc_backup",
+        "WORKGROUP\\svc_backup",
+        "DESKTOP-X\\svc_backup",
+        "svc_backup@corp.com",
+    ] {
+        assert_eq!(odd_hour(&mut state, user, at_local(3)).len(), 1, "{user}");
+    }
 }
 
 #[test]

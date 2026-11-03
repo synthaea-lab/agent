@@ -177,8 +177,12 @@ impl OddHours {
     }
 
     /// Declares the accounts whose odd-hour logons are expected (on-call, a schedule's service
-    /// account). Compared without case; an entry without a domain also matches the account under
-    /// any domain, an entry with one matches only that. Replaces the previous list.
+    /// account). An entry matches the account **as the event reports it**, case aside: an entry
+    /// without a domain matches only an unqualified account, so `CORP\svc_backup` has to be
+    /// written out. Deliberate — the account name is what an intruder with local admin chooses,
+    /// and a bare entry that matched any domain would exempt a local `svc_backup` it created;
+    /// the domain is the only evidence the event carries, so the exemption keeps it. Replaces
+    /// the previous list.
     pub(crate) fn set_exempt_accounts(&mut self, accounts: &[String]) {
         self.exempt = accounts
             .iter()
@@ -189,8 +193,7 @@ impl OddHours {
 
     fn is_exempt(&self, user: &str) -> bool {
         let lower = user.to_lowercase();
-        let name = lower.rsplit('\\').next().unwrap_or(&lower);
-        self.exempt.iter().any(|e| *e == lower || *e == name)
+        self.exempt.contains(&lower)
     }
 
     fn in_work_hours(&self, hour: u32) -> bool {
