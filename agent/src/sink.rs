@@ -247,7 +247,9 @@ struct HeldTouch {
 
 /// Most renames and deletions a ransomware detection carries beyond its triggering event.
 /// A bound on the size of one detection: the correlator window is 60 s, and a fast
-/// encryptor renames far more than this in it.
+/// encryptor renames far more than this in it. The server keeps the first 128 events of a
+/// detection (`MAX_EVENTS`, server/lib/detection-payload.ts, #1060): raising this past 127
+/// means raising that too.
 const DAMAGE_MANIFEST_MAX: usize = 100;
 
 /// The escalation decision (#612) as a free function so the YARA scan worker, which
