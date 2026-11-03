@@ -231,3 +231,35 @@ fn the_service_manager_stays_low_for_a_security_tool_and_a_tool_signalling_itsel
     }
     assert!(check_security_process_signal(&signal_to_tool(612, "auditd", 9)).is_none());
 }
+
+/// A signal whose default action ends a process, outside the seven named ones, still ends a
+/// tool that does not handle it: it alerts Medium for an event with a unit, as `signal N`.
+#[test]
+fn a_default_terminating_signal_to_a_security_tool_alerts_medium() {
+    // SIGUSR1, SIGSEGV, SIGPIPE, SIGALRM, a real-time signal.
+    for signal in [10, 11, 13, 14, 34, 64] {
+        let alert = check_security_process_signal(&signal_to_tool(4242, "kill", signal))
+            .unwrap_or_else(|| panic!("signal {signal} must alert"));
+        assert_eq!(alert.severity, crate::Severity::Medium, "signal {signal}");
+        assert!(
+            alert
+                .message
+                .contains(&format!("signal {signal} ({signal})")),
+            "{}",
+            alert.message
+        );
+    }
+}
+
+/// `SIGCHLD`, `SIGCONT`, `SIGURG`, `SIGWINCH` and `0` do not end a process; nor does a signal
+/// number out of range. The agent's own pid keeps the old set (no unit, so no new signals).
+#[test]
+fn a_non_terminating_signal_to_a_security_tool_does_not_alert() {
+    for signal in [0, 17, 18, 23, 28, 65] {
+        assert!(
+            check_security_process_signal(&signal_to_tool(4242, "kill", signal)).is_none(),
+            "signal {signal}"
+        );
+    }
+    assert!(check_security_process_signal(&signal_from(4242, "bash", 10, 400)).is_none());
+}

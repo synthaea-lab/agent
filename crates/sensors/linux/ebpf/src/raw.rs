@@ -92,13 +92,28 @@ static SYSCALL_NR_OFFSET: Global<u32> = Global::new(0);
 #[unsafe(no_mangle)]
 static TASK_TGID_OFFSET: Global<u32> = Global::new(0);
 
-/// `kernel_siginfo.si_code`: `si_signo` and `si_errno` come first, 4 bytes each, on every
-/// architecture (the layout is userspace ABI).
-const SIGINFO_CODE_OFFSET: usize = 8;
-
-/// `SEND_SIG_PRIV`, the largest of the two special `siginfo` pointers (`SEND_SIG_NOINFO` is 0):
-/// a signal sent by the kernel itself, not by a process.
+/// `SEND_SIG_PRIV` (1): the special `siginfo` pointer of a signal the kernel sends on its own
+/// behalf (the OOM killer, `exit_group`, a CPU limit). `SEND_SIG_NOINFO` (0) is **not** one of
+/// those: the kernel then builds an `SI_USER` siginfo for `current`, so it is a process acting.
+/// `echo 1 > cgroup.kill` takes this path (`SIGKILL` to every process of the cgroup, `info`
+/// null, the sender the writing process).
 const SEND_SIG_PRIV: usize = 1;
+
+/// The signals worth reporting for a tool, as a bit set (bit `sig - 1`): every signal whose
+/// default action ends or stops a process, except `SIGHUP` (a reload, silent for a tool in the
+/// rule). Left out: `SIGCHLD`, `SIGCONT`, `SIGURG`, `SIGWINCH`, which neither end nor stop it,
+/// and `SIGHUP`. Real-time signals (32..=64) end a process with no handler, so they are kept.
+/// Filtering here keeps the shared ring free of noise a sender could use to fill it before a
+/// `SIGKILL`.
+const TOOL_SIGNALS: u64 = {
+    let mut set = u64::MAX;
+    set &= !(1 << (1 - 1)); // SIGHUP
+    set &= !(1 << (17 - 1)); // SIGCHLD
+    set &= !(1 << (18 - 1)); // SIGCONT
+    set &= !(1 << (23 - 1)); // SIGURG
+    set &= !(1 << (28 - 1)); // SIGWINCH
+    set
+};
 
 /// A signal sent to a process of a listed security unit (`signal:signal_generate`, #1103): the
 /// path that sees `kill`, `tgkill`, `tkill`, `pidfd_send_signal` and `rt_sigqueueinfo` alike, in
@@ -115,11 +130,17 @@ pub fn raw_signal_generate(ctx: RawTracePointContext) -> u32 {
     let sig = ctx.arg::<i64>(0) as u32;
     let info = ctx.arg::<*const u8>(1);
     let task = ctx.arg::<*const u8>(2);
-    // `kill -0` is a liveness probe, and a null or special `siginfo` is the kernel's own
-    // signal (`send_sig(.., SEND_SIG_PRIV)`): neither is a process acting on the tool.
-    if sig == 0 || (info as usize) <= SEND_SIG_PRIV {
+    // `kill -0` is a liveness probe, a signal outside `TOOL_SIGNALS` does not end the tool, and
+    // `SEND_SIG_PRIV` is the kernel's own signal: none is a process acting on the tool. A null
+    // `info` (`SEND_SIG_NOINFO`) is kept and attributed to `current`.
+    if sig == 0 || sig > 64 || TOOL_SIGNALS & (1u64 << (sig - 1)) == 0 {
         return 0;
     }
+    if info as usize == SEND_SIG_PRIV {
+        return 0;
+    }
+    // SAFETY: `task` is the kernel's `task_struct` pointer from the tracepoint; the read goes
+    // through `bpf_probe_read_kernel`, which fails (and is handled) on a bad address.
     let Ok(target) = (unsafe {
         bpf_probe_read_kernel(task.add(TASK_TGID_OFFSET.load() as usize).cast::<i32>())
     }) else {
@@ -129,15 +150,10 @@ pub fn raw_signal_generate(ctx: RawTracePointContext) -> u32 {
     if !is_watched_tool(target) {
         return 0;
     }
-    // From a process: `SI_USER` (0), `SI_QUEUE` (-1), `SI_TKILL` (-6), `SI_TIMER`...; a positive
-    // code is the kernel's (`SI_KERNEL`, `CLD_*`, `SEGV_*`).
-    let Ok(code) = (unsafe { bpf_probe_read_kernel(info.add(SIGINFO_CODE_OFFSET).cast::<i32>()) })
-    else {
-        return 0;
-    };
-    if code > 0 {
-        return 0;
-    }
+    // No filter on `si_code`: a positive code is not proof of the kernel. `fcntl(F_SETOWN)` with
+    // `F_SETSIG=SIGKILL` and `O_ASYNC` kills a tool with `si_code` `POLL_IN` and the attacker as
+    // `current`. The kernel's own signals with a real siginfo (`force_sig_fault`, `SIGSEGV` and
+    // the like) are sent by the faulting task to itself, which the self-signal test drops.
     // A tool signalling itself (`abort()`, a worker thread): not a process acting on it.
     if (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32 == target {
         return 0;

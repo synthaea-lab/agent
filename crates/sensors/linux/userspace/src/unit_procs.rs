@@ -79,7 +79,15 @@ impl UnitResolver {
                     .join(format!("{unit}.service"));
                 collect_procs(&dir, 0, &mut pids);
             }
-            pids.truncate(MAX_PROCS_PER_UNIT);
+            if pids.len() > MAX_PROCS_PER_UNIT {
+                tracing::warn!(
+                    unit = %unit,
+                    found = pids.len(),
+                    kept = MAX_PROCS_PER_UNIT,
+                    "unit_procs: a security unit has more processes than the cap, the rest are not watched"
+                );
+                pids.truncate(MAX_PROCS_PER_UNIT);
+            }
             for pid in pids {
                 found.entry(pid).or_insert_with(|| UnitProc {
                     unit: unit.clone(),
@@ -88,6 +96,13 @@ impl UnitResolver {
             }
         }
         found
+    }
+
+    /// Whether `pid` is still the process `known` described: alive, with the same executable.
+    /// A tool that was moved out of its unit's cgroup passes; an exited one, or a pid handed to
+    /// an unrelated process, does not.
+    pub(crate) fn still_is(&self, pid: u32, known: &UnitProc) -> bool {
+        self.proc_root.join(pid.to_string()).exists() && self.exe_of(pid) == known.exe
     }
 
     fn exe_of(&self, pid: u32) -> Option<String> {
@@ -165,16 +180,20 @@ pub(crate) type ToolProcs = Arc<Mutex<BTreeMap<u32, UnitProc>>>;
 /// Keeps the kernel-side watch set equal to the listed units' processes, and the cache the drain
 /// enriches from.
 ///
-/// The cache is replaced by each scan, so a tool that died is forgotten one scan later
-/// ([`crate::sensor`] rescans every few seconds): an event for it is drained within milliseconds
-/// of the signal, and keeping a dead tgid longer would hand its number to an unrelated process
-/// that reuses it.
+/// The cache is the last scan plus the one before it, so a tool that died is forgotten two scans
+/// later ([`crate::sensor`] rescans every few seconds): an event for it is drained within
+/// milliseconds of the signal, but possibly after a rescan, and keeping a dead tgid longer would
+/// hand its number to an unrelated process that reuses it. The kernel-side set drops it at the
+/// first scan, so no new event names it.
 pub(crate) struct ToolWatch<S> {
     resolver: UnitResolver,
     set: S,
     /// What the kernel-side set holds now: an insert that failed is absent, so the next scan
     /// tries it again.
     applied: BTreeMap<u32, UnitProc>,
+    /// The cache of the scan before the last one: a tgid that left the units between two scans
+    /// stays nameable for one more scan, since its last event is drained after the rescan can win.
+    previous_scan: BTreeMap<u32, UnitProc>,
     procs: ToolProcs,
 }
 
@@ -184,6 +203,7 @@ impl<S: WatchSet> ToolWatch<S> {
             resolver,
             set,
             applied: BTreeMap::new(),
+            previous_scan: BTreeMap::new(),
             procs: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -197,7 +217,19 @@ impl<S: WatchSet> ToolWatch<S> {
     /// watched. A failed edit is logged and retried by the next scan, never fatal: the probe
     /// keeps working on what it has.
     pub(crate) fn refresh(&mut self) -> usize {
-        let next = self.resolver.scan();
+        let mut next = self.resolver.scan();
+        // A watched process that left its unit's cgroup is still the tool (root can move it with
+        // `echo <pid> > cgroup.procs` to blind the probe): keep watching it until it exits.
+        for (pid, known) in &self.applied {
+            if !next.contains_key(pid) && self.resolver.still_is(*pid, known) {
+                tracing::warn!(
+                    pid,
+                    unit = %known.unit,
+                    "unit_procs: a security tool process left its unit's cgroup, still watched"
+                );
+                next.insert(*pid, known.clone());
+            }
+        }
         let (added, removed) = changes(&self.applied, &next);
         for pid in removed {
             match self.set.remove(pid) {
@@ -226,10 +258,15 @@ impl<S: WatchSet> ToolWatch<S> {
             }
         }
         let watched = self.applied.len();
+        let mut cache = next.clone();
+        for (pid, known) in &self.previous_scan {
+            cache.entry(*pid).or_insert_with(|| known.clone());
+        }
+        self.previous_scan = next;
         *self
             .procs
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = cache;
         watched
     }
 }
@@ -268,6 +305,11 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             let lines: Vec<String> = pids.iter().map(u32::to_string).collect();
             fs::write(dir.join("cgroup.procs"), lines.join("\n") + "\n").unwrap();
+        }
+
+        /// The process exits: its `/proc/<pid>` is gone.
+        fn gone(&self, pid: u32) {
+            let _ = fs::remove_dir_all(self.root.join("proc").join(pid.to_string()));
         }
 
         fn exe(&self, pid: u32, path: &str) {
@@ -468,8 +510,15 @@ mod tests {
         // It forks a worker.
         host.unit("system.slice", "auditd.service", &[612, 613]);
         assert_eq!(watch.refresh(), 2);
-        // It restarts: new pid, old one gone, and the same cache handle sees it.
+        // It restarts: new pid, old one gone, and the same cache handle sees it. The old pids
+        // stay nameable for one more scan (their last event may be drained after the rescan).
+        host.gone(612);
         host.unit("system.slice", "auditd.service", &[944]);
+        assert_eq!(watch.refresh(), 1);
+        assert_eq!(
+            procs.lock().unwrap().keys().copied().collect::<Vec<_>>(),
+            [612, 613, 944]
+        );
         assert_eq!(watch.refresh(), 1);
         assert_eq!(
             procs.lock().unwrap().keys().copied().collect::<Vec<_>>(),
@@ -505,5 +554,53 @@ mod tests {
         watch.set.pids.clear();
         host.unit("system.slice", "auditd.service", &[]);
         assert_eq!(watch.refresh(), 0);
+    }
+
+    #[test]
+    fn a_tool_moved_out_of_its_cgroup_stays_watched_until_it_exits() {
+        let host = Host::new();
+        let mut set = FakeSet::default();
+        host.unit("system.slice", "auditd.service", &[612]);
+        host.exe(612, "/usr/sbin/auditd");
+        let mut watch = ToolWatch::new(host.resolver(&["auditd"]), &mut set);
+        assert_eq!(watch.refresh(), 1);
+        // Root moves it to another cgroup: it is no longer in the unit's `cgroup.procs`.
+        host.unit("system.slice", "auditd.service", &[]);
+        assert_eq!(watch.refresh(), 1, "still watched");
+        assert_eq!(watch.procs().lock().unwrap()[&612].unit, "auditd");
+        // It exits: dropped from the set at the next scan.
+        host.gone(612);
+        assert_eq!(watch.refresh(), 0);
+        drop(watch);
+        assert!(set.pids.is_empty());
+    }
+
+    #[test]
+    fn a_pid_reused_by_another_program_is_not_kept() {
+        let host = Host::new();
+        let mut set = FakeSet::default();
+        host.unit("system.slice", "auditd.service", &[612]);
+        host.exe(612, "/usr/sbin/auditd");
+        let mut watch = ToolWatch::new(host.resolver(&["auditd"]), &mut set);
+        assert_eq!(watch.refresh(), 1);
+        host.unit("system.slice", "auditd.service", &[]);
+        host.gone(612);
+        host.exe(612, "/usr/bin/sleep");
+        assert_eq!(watch.refresh(), 0);
+    }
+
+    #[test]
+    fn a_tool_gone_between_two_scans_is_still_named_for_one_more_scan() {
+        let host = Host::new();
+        let mut set = FakeSet::default();
+        host.unit("system.slice", "auditd.service", &[612]);
+        let mut watch = ToolWatch::new(host.resolver(&["auditd"]), &mut set);
+        watch.refresh();
+        host.gone(612);
+        host.unit("system.slice", "auditd.service", &[]);
+        watch.refresh();
+        assert!(watch.procs().lock().unwrap().contains_key(&612));
+        watch.refresh();
+        assert!(!watch.procs().lock().unwrap().contains_key(&612));
     }
 }

@@ -417,6 +417,21 @@ pub(crate) fn take_signal_watch_tools(
     })
 }
 
+/// Takes the per-CPU counter of tool signals lost to a full `SIGNAL_EVENTS` ring (#1103).
+///
+/// # Errors
+///
+/// Returns [`SensorError`] when the map is missing or is not a per-CPU array of `u64`.
+pub(crate) fn take_signal_tool_drops(
+    ebpf: &mut aya::Ebpf,
+) -> Result<aya::maps::PerCpuArray<aya::maps::MapData, u64>, SensorError> {
+    let map = ebpf
+        .take_map("SIGNAL_TOOL_DROPS")
+        .ok_or_else(|| err("map SIGNAL_TOOL_DROPS not found in eBPF object".to_string()))?;
+    aya::maps::PerCpuArray::try_from(map)
+        .map_err(|e| err(format!("SIGNAL_TOOL_DROPS is not a per-CPU u64 array: {e}")))
+}
+
 /// `sensor_linux_wire::SignalEvent` is `repr(C)` over integers and byte arrays, so
 /// every bit pattern is valid. Same newtype reasoning as [`PodLineage`].
 #[repr(transparent)]

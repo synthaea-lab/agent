@@ -3701,13 +3701,19 @@ unsafe fn fill_signal_event(e: *mut SignalEvent, target_pid: u32, sig: u32) -> R
 
 /// Thread-group ids of the processes of the listed security units (`SECURITY_SERVICES`), filled
 /// and refreshed by userspace from each unit's cgroup (#1103). The value is unused. The bound is
-/// a flood guard: a host has a handful of tools, each a few dozen processes.
+/// the worst case userspace can feed it: 16 listed units times 256 processes per unit
+/// (`MAX_PROCS_PER_UNIT`), so an insert never fails for want of room.
 #[map]
-static SIGNAL_WATCH_TOOLS: HashMap<u32, u8> = HashMap::with_max_entries(1024, 0);
+static SIGNAL_WATCH_TOOLS: HashMap<u32, u8> = HashMap::with_max_entries(4096, 0);
+
+/// Tool signals lost because `SIGNAL_EVENTS` was full, per CPU: userspace sums and reports it.
+#[map]
+static SIGNAL_TOOL_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 /// Whether `tgid` is a process of a listed security unit.
 #[inline(always)]
 pub(crate) fn is_watched_tool(tgid: u32) -> bool {
+    // SAFETY: the map is only read here; the value reference is dropped by `is_some` at once.
     unsafe { SIGNAL_WATCH_TOOLS.get(&tgid) }.is_some()
 }
 
@@ -3722,9 +3728,15 @@ pub(crate) fn emit_tool_signal_event(
     sig: u32,
 ) -> Result<u32, u32> {
     let e = SIGNAL_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
+    // SAFETY: `e` is this CPU's scratch slot (one per CPU, and a probe does not nest on its
+    // own CPU), valid for a `SignalEvent`; `fill_signal_event` initialises it before `output`
+    // copies it, and the drop counter is this CPU's own slot.
     unsafe {
         fill_signal_event(e, target_tgid, sig)?;
         if SIGNAL_EVENTS.output::<SignalEvent>(&*e, 0).is_err() {
+            if let Some(drops) = SIGNAL_TOOL_DROPS.get_ptr_mut(0) {
+                *drops += 1;
+            }
             warn!(
                 ctx,
                 "sensor-linux-ebpf: ring buffer full, dropping signal event"

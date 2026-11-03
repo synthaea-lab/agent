@@ -1278,6 +1278,23 @@ fn tamper_signal_name(signal: u32) -> Option<&'static str> {
     }
 }
 
+/// Linux signals that neither end nor stop a process by default (`signal(7)`): `SIGCHLD`,
+/// `SIGCONT`, `SIGURG`, `SIGWINCH`. Every other number from 1 to 64 ends or stops one with no
+/// handler, `SIGUSR1`, `SIGSEGV`, `SIGPIPE` and the real-time signals included.
+const LINUX_BENIGN_SIGNALS: [u32; 4] = [17, 18, 23, 28];
+
+/// The label of `signal` when it is worth an alert for `tool_event`, an event naming a listed
+/// security tool (Linux, #1103): the listed signals by name, any other default-terminating one
+/// as `signal N`. A tool dies of any of them unless it handles it, and which ones each tool
+/// handles is not known here.
+fn signal_label(signal: u32, tool_event: bool) -> Option<std::borrow::Cow<'static, str>> {
+    if let Some(name) = tamper_signal_name(signal) {
+        return Some(name.into());
+    }
+    (tool_event && (1..=64).contains(&signal) && !LINUX_BENIGN_SIGNALS.contains(&signal))
+        .then(|| format!("signal {signal}").into())
+}
+
 /// The process id of the service manager: `systemd` on Linux, `launchd` on macOS. The Linux probe
 /// reports the sender's thread-group id from the **initial** pid namespace, so a container's own
 /// init is not 1 here, and only the host's manager is.
@@ -1307,8 +1324,9 @@ const INIT_PID: u32 = 1;
 ///     a tool gets. The cost is a tool with no `SIGHUP` handler, which it ends; that kill is not
 ///     seen here. The agent keeps `SIGHUP` as an alert, it does not reload on it.
 ///   - `SIGKILL` and `SIGSTOP`, which cannot be handled, are **High**.
-///   - The catchable ones that end a daemon (`SIGTERM`, `SIGINT`, `SIGQUIT`, `SIGABRT`) are
-///     **Medium**: an administrator's `kill <pid>`, or `service auditd stop` (whose helper sends
+///   - The catchable ones that end a daemon (`SIGTERM`, `SIGINT`, `SIGQUIT`, `SIGABRT`, and any
+///     other signal whose default action terminates: `SIGUSR1`, `SIGPIPE`, `SIGALRM`, a
+///     real-time signal, reported as `signal N`) are **Medium**: an administrator's `kill <pid>`, or `service auditd stop` (whose helper sends
 ///     the `SIGTERM` itself, not pid 1), is indistinguishable from an attacker's, exactly as
 ///     `systemctl stop auditd` is Medium in `check_security_tool_stop`.
 ///
@@ -1323,11 +1341,11 @@ const INIT_PID: u32 = 1;
 /// restarted agent, so that alert arrives one restart late.
 #[must_use]
 pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Option<Alert> {
-    let name = tamper_signal_name(event.signal)?;
+    let tool = event.target_unit.is_some();
+    let name = signal_label(event.signal, tool)?;
     if event.meta.pid == event.target_pid {
         return None;
     }
-    let tool = event.target_unit.is_some();
     if tool && event.signal == SIGHUP {
         return None;
     }

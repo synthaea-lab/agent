@@ -27,7 +27,6 @@ mod parent_image;
 mod proc;
 #[cfg(target_os = "linux")]
 mod sensor;
-// The unit -> pids resolver of #1103; the tracepoint slice wires it, until then only its tests run.
 #[cfg(all(target_os = "linux", any(ebpf_embedded, test)))]
 mod syscall;
 // Which processes belong to a listed security unit, for the `signal_generate` probe (#1103).

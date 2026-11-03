@@ -21,7 +21,7 @@ use crate::{
     ebpf::{
         DNS_UDP_PROGRAM, RAW_TRACEPOINTS, TamperSlot, attach_inode_setattr, attach_raw_tracepoint,
         clear_tamper_slot, err, load_ebpf_for_run, prime_proc_lineage, read_tamper_slot,
-        take_signal_watch_tools, take_tamper_slot, write_signal_watch_pid,
+        take_signal_tool_drops, take_signal_watch_tools, take_tamper_slot, write_signal_watch_pid,
     },
     normalize,
     parent_image::{ExecStamps, IMAGE_CACHE_CAP, ParentImageEvictions, ParentImages},
@@ -293,6 +293,8 @@ impl LinuxSensor {
             "sensor-linux: security tool processes on the signal watch list"
         );
         let tool_procs = tool_watch.procs();
+        let tool_drops = take_signal_tool_drops(&mut ebpf)?;
+        let mut tool_drops_seen = 0u64;
         let mut tool_rescan = tokio::time::interval(TOOL_RESCAN_INTERVAL);
 
         for (program, name) in RAW_TRACEPOINTS {
@@ -408,6 +410,18 @@ impl LinuxSensor {
                 }
                 _ = tool_rescan.tick() => {
                     tool_watch.refresh();
+                    // Tool signals lost to a full ring: counted in the kernel, reported when it grows.
+                    if let Ok(per_cpu) = tool_drops.get(&0, 0) {
+                        let total: u64 = per_cpu.iter().sum();
+                        if total > tool_drops_seen {
+                            tracing::warn!(
+                                dropped = total - tool_drops_seen,
+                                total,
+                                "sensor-linux: signals to security tools lost, signal ring buffer full"
+                            );
+                            tool_drops_seen = total;
+                        }
+                    }
                 }
                 guard = exec_ring_buf.readable_mut() => {
                     // Two synchronous procfs reads per exec event, on this task (see
@@ -547,7 +561,9 @@ impl LinuxSensor {
                         |e: &sensor_linux_wire::SignalEvent| {
                             // A target on the watch list is a security tool: its unit and the
                             // exe read at scan time (the process may be gone by now). Anything
-                            // else is the agent itself (`SIGNAL_WATCH_PID`).
+                            // else is the agent itself (`SIGNAL_WATCH_PID`). A target that is
+                            // neither (a tool gone from every scan) gets no image and no unit,
+                            // never the agent's: it must not read as a signal to the agent.
                             let tool = tool_procs
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -555,7 +571,8 @@ impl LinuxSensor {
                                 .cloned();
                             let (image, unit) = match tool {
                                 Some(tool) => (tool.exe, Some(tool.unit)),
-                                None => (self_exe.clone(), None),
+                                None if e.target_pid == own_pid => (self_exe.clone(), None),
+                                None => (None, None),
                             };
                             normalize::signal(e, offset, image, unit, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
