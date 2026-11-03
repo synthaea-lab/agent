@@ -288,6 +288,20 @@ pub const fn syscall_nr_from_i32(syscall_nr: i32) -> Option<u32> {
 pub const WIRE_VERSION: u32 = 27;
 
 pub const TASK_COMM_LEN: usize = 16;
+
+/// Entries of the eBPF map `SIGNAL_WATCH_TOOLS` (#1103): the tgids of the processes of the listed
+/// security units. The userspace loader checks at compile time that it holds every listed unit at
+/// its per-unit process cap, with headroom for processes kept after they left their cgroup and for
+/// removals that failed.
+pub const SIGNAL_WATCH_TOOLS_ENTRIES: u32 = 8192;
+
+/// Set in [`SignalEvent::signal`] by the `signal_generate` probe when the siginfo's `si_code` is
+/// `SI_TIMER`, `SI_MESGQ` or `SI_ASYNCIO` (-2..=-4): codes the kernel sets from interrupt or
+/// completion context, where `current` is a bystander. A process can also **forge** them with
+/// `rt_sigqueueinfo` / `pidfd_send_signal`, so the event is kept and only its sender is marked
+/// unreliable. Userspace strips the bit (`schema::SignalEvent::sender_unreliable`). Signal numbers
+/// are 1..=64, far below it.
+pub const SIGNAL_SENDER_UNRELIABLE: u32 = 0x8000_0000;
 pub const MAX_PATH_LEN: usize = 256;
 /// Maximum captured length of an xattr name (issue #262 Phase 3): the kernel's own
 /// `XATTR_NAME_MAX`. Real names (`security.capability`, `security.selinux`,

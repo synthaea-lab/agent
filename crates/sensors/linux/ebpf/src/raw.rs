@@ -13,14 +13,14 @@ use aya_log_ebpf::{info, warn};
 #[cfg(bpf_target_arch = "aarch64")]
 use sensor_linux_wire::syscall_nr_from_i32;
 use sensor_linux_wire::{
-    DISPATCH_CONNECT, DISPATCH_SENDTO, DISPATCH_WRITE, LineageEntry, TASK_COMM_LEN,
-    encode_pending_syscall_exit, matching_pending_syscall_exit,
+    DISPATCH_CONNECT, DISPATCH_SENDTO, DISPATCH_WRITE, LineageEntry, SIGNAL_SENDER_UNRELIABLE,
+    TASK_COMM_LEN, encode_pending_syscall_exit, matching_pending_syscall_exit,
 };
 
 use crate::{
     PROC_LINEAGE, dns_udp_connect, dns_udp_sendto, dns_udp_write, emit_tool_signal_event,
-    is_watched_tool, sys_enter_accept, sys_enter_accept4, sys_enter_bind, sys_enter_bpf,
-    sys_enter_capset, sys_enter_chmod, sys_enter_chown, sys_enter_connect, sys_enter_delete_module,
+    sys_enter_accept, sys_enter_accept4, sys_enter_bind, sys_enter_bpf, sys_enter_capset,
+    sys_enter_chmod, sys_enter_chown, sys_enter_connect, sys_enter_delete_module,
     sys_enter_fchmodat, sys_enter_fchownat, sys_enter_finit_module, sys_enter_init_module,
     sys_enter_kill, sys_enter_lchown, sys_enter_listen, sys_enter_memfd_create, sys_enter_mount,
     sys_enter_open, sys_enter_openat, sys_enter_prctl, sys_enter_process_vm_readv,
@@ -30,6 +30,7 @@ use crate::{
     sys_enter_setresuid, sys_enter_setuid, sys_enter_setxattr, sys_enter_socket, sys_enter_tgkill,
     sys_enter_umount, sys_enter_unlink, sys_enter_unlinkat, sys_enter_unshare, sys_enter_write,
     sys_exit_accept, sys_exit_accept4, sys_exit_memfd_create, sys_exit_recvfrom, sys_exit_socket,
+    watched_tool_sigcgt,
 };
 
 const MAX_SYSCALL_ID: u32 = 1024;
@@ -103,10 +104,25 @@ const SEND_SIG_PRIV: usize = 1;
 /// architecture (the layout is userspace ABI).
 const SIGINFO_CODE_OFFSET: usize = 8;
 
+/// The signals a daemon commonly catches to reload or rotate (`SIGHUP`, `SIGUSR1`, `SIGUSR2`,
+/// the real-time range 32..=64), as a bit set (bit `sig - 1`). For a tool whose `SigCgt` (the
+/// value of its `SIGNAL_WATCH_TOOLS` entry, taken at scan time) has the bit, the signal is a
+/// reload and is dropped here, so a storm of them cannot fill the shared ring ahead of a
+/// `SIGKILL`. `SIGTERM`, `SIGINT`, `SIGQUIT` and `SIGABRT` are never in this set: a handler for
+/// them is how a daemon shuts down.
+const RELOAD_SIGNALS: u64 = {
+    let mut set = (1u64 << (1 - 1)) | (1u64 << (10 - 1)) | (1u64 << (12 - 1));
+    let mut sig = 32;
+    while sig <= 64 {
+        set |= 1u64 << (sig - 1);
+        sig += 1;
+    }
+    set
+};
+
 /// The signals worth reporting for a tool, as a bit set (bit `sig - 1`): every signal whose
-/// default action ends or stops a process, `SIGHUP` included: a tool that catches it takes it as a
-/// reload, and userspace drops it for such a tool (`SigCgt`), but one with no handler is ended
-/// by it. Left out: `SIGCHLD`, `SIGCONT`, `SIGURG`, `SIGWINCH`, which neither end nor stop it.
+/// default action ends or stops a process, `SIGHUP` included: one that reaches userspace without
+/// being a caught reload (`RELOAD_SIGNALS`) is a signal that ends a tool with no handler. Left out: `SIGCHLD`, `SIGCONT`, `SIGURG`, `SIGWINCH`, which neither end nor stop it.
 /// Real-time signals (32..=64) end a process with no handler, so they are kept.
 /// Filtering here keeps the shared ring free of noise a sender could use to fill it before a
 /// `SIGKILL`.
@@ -151,12 +167,23 @@ pub fn raw_signal_generate(ctx: RawTracePointContext) -> u32 {
         return 0;
     };
     let target = target as u32;
-    if !is_watched_tool(target) {
+    let Some(caught) = watched_tool_sigcgt(target) else {
+        return 0;
+    };
+    // A reload the tool catches (`SIGHUP`, `SIGUSR1`, `SIGUSR2`, real-time): not an attack, and
+    // dropped here so a storm of them cannot fill the ring ahead of a `SIGKILL`.
+    let bit = 1u64 << (sig - 1);
+    if RELOAD_SIGNALS & bit != 0 && caught & bit != 0 {
         return 0;
     }
-    // `SI_TIMER`, `SI_MESGQ` and `SI_ASYNCIO` come from interrupt or completion context, where
-    // `current` is whatever was running, and only the process's own timer, queue or I/O raises
-    // them: never another process acting on the tool, and the sender would be a bystander.
+    // No filter on `si_code`. A positive code is not proof of the kernel (`fcntl(F_SETOWN)` with
+    // `F_SETSIG=SIGKILL` and `O_ASYNC` kills a tool with `POLL_IN`), and neither is a negative
+    // one: `rt_sigqueueinfo` and `pidfd_send_signal` let a process pick any `si_code` below 0
+    // (the kernel refuses a non-negative one, and `SI_TKILL`, toward another process), so
+    // `SIGKILL` with `SI_TIMER` is a kill a filter on the code would hide. The three codes the
+    // kernel raises from interrupt or completion context only mark the sender unreliable
+    // (`current` is a bystander there, or the code is forged): the event is still reported.
+    let mut sig = sig;
     if info as usize != 0 {
         // SAFETY: `info` is the kernel's `kernel_siginfo` pointer from the tracepoint (not
         // null, not `SEND_SIG_PRIV`, checked above); the read goes through `bpf_probe_read_kernel`.
@@ -166,14 +193,9 @@ pub fn raw_signal_generate(ctx: RawTracePointContext) -> u32 {
             return 0;
         };
         if (-4..=-2).contains(&code) {
-            return 0;
+            sig |= SIGNAL_SENDER_UNRELIABLE;
         }
     }
-    // No other filter on `si_code`: a positive code is not proof of the kernel. `fcntl(F_SETOWN)` with
-    // `F_SETSIG=SIGKILL` and `O_ASYNC` kills a tool with `si_code` `POLL_IN` and the attacker as
-    // `current`. The kernel's own signals with a real siginfo (`force_sig_fault`, `SIGSEGV` and
-    // the like) are sent by the faulting task to itself, which the self-signal test drops.
-
     // A tool signalling itself (`abort()`, a worker thread): not a process acting on it.
     if (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32 == target {
         return 0;

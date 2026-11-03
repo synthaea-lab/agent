@@ -745,6 +745,7 @@ pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
         .chain(check_systemd_service_persistence(event))
         .chain(check_btm_launch_item_persistence(event))
         .chain(check_alternate_data_stream_write(event))
+        .chain(check_signal_events_lost(event))
         .collect()
 }
 
@@ -1362,6 +1363,13 @@ pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Opti
         .map(|unit| format!(" of unit {unit}"))
         .unwrap_or_default();
     let from_manager = event.meta.pid == INIT_PID;
+    // `si_code` of interrupt or completion context (or forged): `meta` may be a bystander.
+    let unreliable = if event.sender_unreliable {
+        ": the sender is not reliable (the siginfo carries a code the kernel sets from interrupt \
+         context, which a process can also forge)"
+    } else {
+        ""
+    };
     Some(Alert {
         technique: "T1562.001",
         severity: if from_manager {
@@ -1383,6 +1391,24 @@ pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Opti
             } else {
                 ""
             },
+        ) + unreliable,
+    })
+}
+
+/// T1562.001: signals to security tools were lost to a full ring buffer (Linux, #1103). A flood
+/// of lethal signals ahead of a kill is how a tool is ended unseen, so the loss is a finding
+/// by itself; the event's `path` carries the count.
+#[must_use]
+pub(crate) fn check_signal_events_lost(event: &FileOpenEvent) -> Option<Alert> {
+    if event.flags & schema::FLAG_SIGNAL_EVENTS_LOST == 0 {
+        return None;
+    }
+    Some(Alert {
+        technique: "T1562.001",
+        severity: Severity::Medium,
+        message: format!(
+            "{}: a flood of signals to a security tool, or one too busy to read them, can hide a kill",
+            event.path
         ),
     })
 }

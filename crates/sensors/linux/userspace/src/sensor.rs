@@ -414,12 +414,19 @@ impl LinuxSensor {
                     if let Ok(per_cpu) = tool_drops.get(&0, 0) {
                         let total: u64 = per_cpu.iter().sum();
                         if total > tool_drops_seen {
+                            let lost = total - tool_drops_seen;
                             tracing::warn!(
-                                dropped = total - tool_drops_seen,
+                                dropped = lost,
                                 total,
                                 "sensor-linux: signals to security tools lost, signal ring buffer full"
                             );
                             tool_drops_seen = total;
+                            // A flood of lethal signals ahead of a kill is how a tool is ended
+                            // unseen: report the loss as an event the rules alert on.
+                            let now_ns = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+                            sink.on_event(normalize::signals_lost(lost, own_pid, now_ns));
                         }
                     }
                 }
@@ -569,18 +576,12 @@ impl LinuxSensor {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .get(&e.target_pid)
                                 .cloned();
-                            // `SIGHUP` to a tool that catches it is a reload (logrotate,
-                            // `ExecReload=`): the probe lets it through, this is where it is
-                            // dropped. One it does not catch ends the tool and is reported.
-                            if e.signal == 1 && tool.as_ref().is_some_and(|t| t.catches(1)) {
-                                return None;
-                            }
                             let (image, unit) = match tool {
                                 Some(tool) => (tool.exe, Some(tool.unit)),
                                 None if e.target_pid == own_pid => (self_exe.clone(), None),
                                 None => (None, None),
                             };
-                            Some(normalize::signal(e, offset, image, unit, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache)))
+                            normalize::signal(e, offset, image, unit, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
                 guard = kernel_module_ring_buf.readable_mut() => {

@@ -403,16 +403,16 @@ pub(crate) fn write_signal_watch_pid(ebpf: &mut aya::Ebpf, pid: u32) -> Result<(
 /// # Errors
 ///
 /// Returns [`SensorError`] when the map is missing from the eBPF object or is not a hash map of
-/// `u32` to `u8`.
+/// `u32` to `u64`.
 pub(crate) fn take_signal_watch_tools(
     ebpf: &mut aya::Ebpf,
-) -> Result<aya::maps::HashMap<aya::maps::MapData, u32, u8>, SensorError> {
+) -> Result<aya::maps::HashMap<aya::maps::MapData, u32, u64>, SensorError> {
     let map = ebpf
         .take_map("SIGNAL_WATCH_TOOLS")
         .ok_or_else(|| err("map SIGNAL_WATCH_TOOLS not found in eBPF object".to_string()))?;
     aya::maps::HashMap::try_from(map).map_err(|e| {
         err(format!(
-            "SIGNAL_WATCH_TOOLS is not a u32 -> u8 hash map: {e}"
+            "SIGNAL_WATCH_TOOLS is not a u32 -> u64 hash map: {e}"
         ))
     })
 }

@@ -1793,6 +1793,7 @@ fn signal_golden() {
             target_pid: 400,
             target_image_path: Some("/usr/local/bin/synthaea-agent".into()),
             target_unit: None,
+            sender_unreliable: false,
         }),
         "signal",
     );
@@ -1813,8 +1814,30 @@ fn signal_golden() {
             target_pid: 612,
             target_image_path: Some("/usr/sbin/auditd".into()),
             target_unit: Some("auditd".into()),
+            sender_unreliable: false,
         }),
         "signal_unit",
+    );
+    // v60 (#1103): the sender is marked unreliable (`si_code` of interrupt or completion context).
+    assert_golden(
+        &Event::Signal(SignalEvent {
+            meta: EventMeta {
+                pid: 7001,
+                ppid: 1,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_000_123_456_789,
+                comm: "python3".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            signal: 9,
+            target_pid: 612,
+            target_image_path: Some("/usr/sbin/auditd".into()),
+            target_unit: Some("auditd".into()),
+            sender_unreliable: true,
+        }),
+        "signal_unreliable",
     );
 }
 
@@ -2796,6 +2819,7 @@ fn meta_accessor_covers_all_variants() {
             target_pid: 0,
             target_image_path: None,
             target_unit: None,
+            sender_unreliable: false,
         }),
         Event::XpcConnect(XpcConnectEvent {
             meta: meta.clone(),

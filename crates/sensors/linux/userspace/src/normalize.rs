@@ -676,10 +676,32 @@ pub fn signal(
 ) -> Event {
     Event::Signal(SignalEvent {
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
-        signal: event.signal,
+        signal: event.signal & !wire::SIGNAL_SENDER_UNRELIABLE,
         target_pid: event.target_pid,
         target_image_path,
         target_unit,
+        sender_unreliable: event.signal & wire::SIGNAL_SENDER_UNRELIABLE != 0,
+    })
+}
+
+/// Signals to security tools the signal ring buffer had no room for, since the last report
+/// (`SIGNAL_TOOL_DROPS`, #1103): an event the rules turn into a finding, since a flood ahead of
+/// a kill is how a tool is ended unseen. `timestamp_ns` is wall-clock time.
+#[must_use]
+pub fn signals_lost(lost: u64, agent_pid: u32, timestamp_ns: u64) -> Event {
+    Event::FileOpen(schema::FileOpenEvent {
+        meta: schema::EventMeta {
+            pid: agent_pid,
+            ppid: 0,
+            user: schema::User::Unknown,
+            timestamp_ns,
+            comm: "signal_generate".to_owned(),
+            container: None,
+            process_generation: None,
+            parent_process_generation: None,
+        },
+        path: format!("signal_generate: {lost} signals to security tools lost, ring buffer full"),
+        flags: schema::FLAG_SIGNAL_EVENTS_LOST,
     })
 }
 
@@ -1617,6 +1639,35 @@ mod tests {
             e.target_image_path.as_deref(),
             Some("/usr/local/bin/synthaea-agent")
         );
+    }
+
+    #[test]
+    fn the_unreliable_sender_bit_is_stripped_from_the_signal_and_becomes_a_flag() {
+        let event = wire::SignalEvent {
+            meta: wire_meta(b"python3"),
+            signal: 9 | wire::SIGNAL_SENDER_UNRELIABLE,
+            target_pid: 612,
+        };
+        let Event::Signal(e) = signal(&event, 0, None, Some("auditd".to_string()), None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.signal, 9);
+        assert!(e.sender_unreliable);
+        let plain = wire::SignalEvent { signal: 9, ..event };
+        let Event::Signal(e) = signal(&plain, 0, None, None, None) else {
+            panic!("wrong variant")
+        };
+        assert!(!e.sender_unreliable);
+    }
+
+    #[test]
+    fn lost_signals_become_a_flagged_file_open_event_with_the_count() {
+        let Event::FileOpen(e) = signals_lost(40, 1234, 5) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.flags, schema::FLAG_SIGNAL_EVENTS_LOST);
+        assert!(e.path.contains("40 signals"), "{}", e.path);
+        assert_eq!((e.meta.pid, e.meta.timestamp_ns), (1234, 5));
     }
 
     #[test]

@@ -30,6 +30,14 @@ const MAX_DEPTH: usize = 4;
 /// bomb in the unit, and the first ones are the tool's own.
 const MAX_PROCS_PER_UNIT: usize = 256;
 
+// The kernel map holds every listed unit at the per-unit process cap, with headroom for processes
+// kept after they left their cgroup and for removals that failed (review of #1114).
+const _: () = assert!(
+    schema::SECURITY_SERVICES.len() * MAX_PROCS_PER_UNIT
+        < sensor_linux_wire::SIGNAL_WATCH_TOOLS_ENTRIES as usize,
+    "SIGNAL_WATCH_TOOLS_ENTRIES must exceed SECURITY_SERVICES.len() * MAX_PROCS_PER_UNIT"
+);
+
 /// Cgroup directories read per unit and layout, the unit's own included. `MAX_DEPTH` bounds the
 /// depth, not the width: a delegated unit can hold thousands of sibling sub-cgroups, and the scan
 /// runs on the loop that drains the ring. Past this the rest are not read (logged).
@@ -46,20 +54,11 @@ pub(crate) struct UnitProc {
     /// time: with the pid it names one process, which the exe alone cannot (a pid reused by the
     /// same program, or a kernel thread with no exe).
     pub start: Option<u64>,
-    /// `SigCgt` of `/proc/<pid>/status` at scan time: the signals the process catches. A
-    /// `SIGHUP` it catches is a reload, one it does not catch ends it.
+    /// `SigCgt` of `/proc/<pid>/status` at scan time: the signals the process catches, bit
+    /// `sig - 1`. It is the value of the process's `SIGNAL_WATCH_TOOLS` entry: the probe drops a
+    /// reload signal (`SIGHUP`, `SIGUSR1`, `SIGUSR2`, real-time) the process catches. Unknown
+    /// counts as nothing caught, so the signal is reported, not hidden.
     pub sig_cgt: Option<u64>,
-}
-
-impl UnitProc {
-    /// Whether the process had a handler for `signal` (1..=64) at scan time. Unknown (no
-    /// `SigCgt` read) counts as no handler, so the signal is reported, not hidden.
-    pub(crate) fn catches(&self, signal: u32) -> bool {
-        (1..=64).contains(&signal)
-            && self
-                .sig_cgt
-                .is_some_and(|set| set & (1u64 << (signal - 1)) != 0)
-    }
 }
 
 /// Resolves the listed units to their processes.
@@ -101,8 +100,11 @@ impl UnitResolver {
                     .join(layout)
                     .join(format!("{unit}.service"));
                 let mut budget = MAX_CGROUPS_PER_UNIT;
-                collect_procs(&dir, 0, &mut budget, &mut pids);
-                if budget == 0 {
+                let mut skipped = false;
+                collect_procs(&dir, 0, &mut budget, &mut skipped, &mut pids);
+                // Only when a directory was left unread: a unit with exactly the cap and none
+                // skipped is not truncated.
+                if skipped {
                     tracing::warn!(
                         unit = %unit,
                         cap = MAX_CGROUPS_PER_UNIT,
@@ -163,8 +165,15 @@ impl UnitResolver {
 }
 
 /// The tgids of `dir/cgroup.procs` and of the cgroups below `dir`, in file order.
-fn collect_procs(dir: &Path, depth: usize, budget: &mut usize, out: &mut Vec<u32>) {
+fn collect_procs(
+    dir: &Path,
+    depth: usize,
+    budget: &mut usize,
+    skipped: &mut bool,
+    out: &mut Vec<u32>,
+) {
     if *budget == 0 {
+        *skipped = true;
         return;
     }
     *budget -= 1;
@@ -189,7 +198,7 @@ fn collect_procs(dir: &Path, depth: usize, budget: &mut usize, out: &mut Vec<u32
         .collect();
     children.sort();
     for child in children {
-        collect_procs(&child, depth + 1, budget, out);
+        collect_procs(&child, depth + 1, budget, skipped, out);
     }
 }
 
@@ -215,15 +224,16 @@ pub(crate) fn changes(
 /// The kernel-side set of watched tgids (`SIGNAL_WATCH_TOOLS`), as far as [`ToolWatch`] needs it:
 /// a trait so the refresh logic is tested without a kernel.
 pub(crate) trait WatchSet {
-    fn insert(&mut self, pid: u32) -> Result<(), String>;
+    /// `sig_cgt` is the process's caught-signal mask, the value the probe reads.
+    fn insert(&mut self, pid: u32, sig_cgt: u64) -> Result<(), String>;
     /// `Ok(true)`: removed. `Ok(false)`: it was not in the set, which is what was wanted.
     /// `Err`: still in the set, to be retried.
     fn remove(&mut self, pid: u32) -> Result<bool, String>;
 }
 
-impl WatchSet for aya::maps::HashMap<aya::maps::MapData, u32, u8> {
-    fn insert(&mut self, pid: u32) -> Result<(), String> {
-        aya::maps::HashMap::insert(self, pid, 1, 0).map_err(|e| e.to_string())
+impl WatchSet for aya::maps::HashMap<aya::maps::MapData, u32, u64> {
+    fn insert(&mut self, pid: u32, sig_cgt: u64) -> Result<(), String> {
+        aya::maps::HashMap::insert(self, pid, sig_cgt, 0).map_err(|e| e.to_string())
     }
 
     fn remove(&mut self, pid: u32) -> Result<bool, String> {
@@ -317,7 +327,10 @@ impl<S: WatchSet> ToolWatch<S> {
             }
         }
         for pid in added {
-            match self.set.insert(pid) {
+            match self
+                .set
+                .insert(pid, next.get(&pid).and_then(|p| p.sig_cgt).unwrap_or(0))
+            {
                 Ok(()) => {
                     if let Some(proc) = next.get(&pid) {
                         self.applied.insert(pid, proc.clone());
@@ -585,7 +598,7 @@ mod tests {
     }
 
     impl WatchSet for &mut FakeSet {
-        fn insert(&mut self, pid: u32) -> Result<(), String> {
+        fn insert(&mut self, pid: u32, _sig_cgt: u64) -> Result<(), String> {
             if self.refuse.contains(&pid) {
                 return Err("full".to_owned());
             }
@@ -767,11 +780,9 @@ mod tests {
         host.caught(612, 1 | (1 << 14));
         host.caught(613, 1 << 14);
         let found = host.resolver(&["auditd"]).scan();
-        assert!(found[&612].catches(1));
-        assert!(found[&612].catches(15));
-        assert!(!found[&613].catches(1), "no handler: SIGHUP ends it");
-        assert!(!found[&614].catches(1), "unknown counts as no handler");
-        assert!(!found[&612].catches(0) && !found[&612].catches(65));
+        assert_eq!(found[&612].sig_cgt, Some(1 | (1 << 14)));
+        assert_eq!(found[&613].sig_cgt, Some(1 << 14));
+        assert_eq!(found[&614].sig_cgt, None, "unknown: reported, not hidden");
     }
 
     #[test]
@@ -788,5 +799,24 @@ mod tests {
         let found = host.resolver(&["auditd"]).scan();
         // The unit's own cgroup plus MAX_CGROUPS_PER_UNIT - 1 sub-cgroups, then the budget is spent.
         assert_eq!(found.len(), MAX_CGROUPS_PER_UNIT.min(MAX_PROCS_PER_UNIT));
+    }
+
+    #[test]
+    fn a_unit_with_exactly_the_cap_of_cgroups_is_not_truncated() {
+        let host = Host::new();
+        host.unit("system.slice", "auditd.service", &[1]);
+        for n in 0..(MAX_CGROUPS_PER_UNIT as u32 - 1) {
+            host.unit("system.slice", &format!("auditd.service/sub{n:04}"), &[]);
+        }
+        let dir = host.root.join("cgroup/system.slice/auditd.service");
+        let (mut budget, mut skipped, mut pids) = (MAX_CGROUPS_PER_UNIT, false, Vec::new());
+        collect_procs(&dir, 0, &mut budget, &mut skipped, &mut pids);
+        assert_eq!(budget, 0, "the budget is spent");
+        assert!(!skipped, "but nothing was left unread");
+
+        host.unit("system.slice", "auditd.service/one-more", &[]);
+        let (mut budget, mut skipped, mut pids) = (MAX_CGROUPS_PER_UNIT, false, Vec::new());
+        collect_procs(&dir, 0, &mut budget, &mut skipped, &mut pids);
+        assert!(skipped, "now one directory is left unread");
     }
 }

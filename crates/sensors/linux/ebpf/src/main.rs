@@ -3700,21 +3700,23 @@ unsafe fn fill_signal_event(e: *mut SignalEvent, target_pid: u32, sig: u32) -> R
 }
 
 /// Thread-group ids of the processes of the listed security units (`SECURITY_SERVICES`), filled
-/// and refreshed by userspace from each unit's cgroup (#1103). The value is unused. The bound is
-/// the worst case userspace can feed it: 16 listed units times 256 processes per unit
-/// (`MAX_PROCS_PER_UNIT`), so an insert never fails for want of room.
+/// and refreshed by userspace from each unit's cgroup (#1103). The value is the process's
+/// `SigCgt` (the signals it catches, bit `sig - 1`) at scan time: a caught reload signal is
+/// dropped in the probe. The size is `SIGNAL_WATCH_TOOLS_ENTRIES`, checked by the userspace
+/// loader against `SECURITY_SERVICES.len()` times the per-unit process cap, with headroom.
 #[map]
-static SIGNAL_WATCH_TOOLS: HashMap<u32, u8> = HashMap::with_max_entries(4096, 0);
+static SIGNAL_WATCH_TOOLS: HashMap<u32, u64> =
+    HashMap::with_max_entries(sensor_linux_wire::SIGNAL_WATCH_TOOLS_ENTRIES, 0);
 
 /// Tool signals lost because `SIGNAL_EVENTS` was full, per CPU: userspace sums and reports it.
 #[map]
 static SIGNAL_TOOL_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
-/// Whether `tgid` is a process of a listed security unit.
+/// The `SigCgt` of `tgid` when it is a process of a listed security unit, `None` otherwise.
 #[inline(always)]
-pub(crate) fn is_watched_tool(tgid: u32) -> bool {
-    // SAFETY: the map is only read here; the value reference is dropped by `is_some` at once.
-    unsafe { SIGNAL_WATCH_TOOLS.get(&tgid) }.is_some()
+pub(crate) fn watched_tool_sigcgt(tgid: u32) -> Option<u64> {
+    // SAFETY: the map is only read here; the value is copied out before the reference ends.
+    unsafe { SIGNAL_WATCH_TOOLS.get(&tgid) }.copied()
 }
 
 /// Emits a signal sent to a process of a listed security unit, from the `signal_generate`

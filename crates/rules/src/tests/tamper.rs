@@ -16,6 +16,7 @@ fn signal_event(signal: u32) -> SignalEvent {
         target_pid: 400,
         target_image_path: Some("/usr/local/bin/synthaea-agent".into()),
         target_unit: None,
+        sender_unreliable: false,
     }
 }
 
@@ -86,6 +87,7 @@ fn signal_from(sender_pid: u32, comm: &str, signal: u32, target_pid: u32) -> Sig
         target_pid,
         target_image_path: Some("/usr/local/bin/synthaea-agent".into()),
         target_unit: None,
+        sender_unreliable: false,
     }
 }
 
@@ -264,4 +266,40 @@ fn a_non_terminating_signal_to_a_security_tool_does_not_alert() {
         );
     }
     assert!(check_security_process_signal(&signal_from(4242, "bash", 10, 400)).is_none());
+}
+
+/// A forged `si_code` must not hide a kill: the event is reported, High for `SIGKILL`, and the
+/// message says the sender is not reliable (`rt_sigqueueinfo` lets a process pick `SI_TIMER`).
+#[test]
+fn a_kill_with_an_unreliable_sender_still_alerts_and_says_so() {
+    let mut event = signal_to_tool(4242, "python3", 9);
+    event.sender_unreliable = true;
+    let alert = check_security_process_signal(&event).expect("a forged code must not hide a kill");
+    assert_eq!(alert.severity, crate::Severity::High);
+    assert!(
+        alert.message.contains("sender is not reliable"),
+        "{}",
+        alert.message
+    );
+    event.sender_unreliable = false;
+    let alert = check_security_process_signal(&event).unwrap();
+    assert!(!alert.message.contains("not reliable"), "{}", alert.message);
+}
+
+#[test]
+fn lost_signals_to_security_tools_are_a_finding() {
+    let mut event = file_open_event("signal_generate: 40 signals to security tools lost", 0);
+    event.flags = schema::FLAG_SIGNAL_EVENTS_LOST;
+    let alerts = crate::evaluate_file_open(&event);
+    assert!(
+        alerts
+            .iter()
+            .any(|a| a.technique == "T1562.001" && a.severity == crate::Severity::Medium)
+    );
+    event.flags = 0;
+    assert!(
+        crate::evaluate_file_open(&event)
+            .iter()
+            .all(|a| a.technique != "T1562.001")
+    );
 }
