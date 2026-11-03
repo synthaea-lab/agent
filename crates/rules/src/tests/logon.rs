@@ -319,6 +319,40 @@ fn one_alert_per_account_per_night_then_again_the_next() {
     assert_eq!(odd_hour(&mut state, "mallory", night + 24 * HOUR).len(), 1);
 }
 
+/// A Windows logon whose account name is localized (the accented French name of SYSTEM on a French Windows, which arrives with the
+/// accented letter replaced by U+FFFD) is the local SYSTEM account by its SID alone: it must not alert, at night
+/// (found on a French Windows, #1091) nor as a first-seen account.
+#[test]
+fn a_localized_service_account_is_generic_by_its_sid() {
+    let localized = "Syst\u{FFFD}me";
+    let system = |user: &str, sid: Option<&str>, ts: u64| AuthEvent {
+        target_user_sid: sid.map(str::to_string),
+        ..logon(user, ts)
+    };
+    let mut state = utc_plus_two();
+    for sid in ["S-1-5-18", "S-1-5-19", "S-1-5-20"] {
+        let alerts = state.on_auth(&system(localized, Some(sid), MIDNIGHT_UTC + 22 * HOUR));
+        assert!(
+            alerts.iter().all(|a| a.technique != "T1078"),
+            "{sid}: {alerts:?}"
+        );
+    }
+    // The same name with a user's SID, or with none, is an ordinary account.
+    for sid in [Some("S-1-5-21-1-2-3-1001"), None] {
+        let alerts = state.on_auth(&system(localized, sid, MIDNIGHT_UTC + 22 * HOUR));
+        assert_eq!(
+            alerts.iter().filter(|a| a.technique == "T1078").count(),
+            1,
+            "{sid:?}"
+        );
+        state = utc_plus_two();
+    }
+    // As a first-seen account after the learning window.
+    let (mut state, later) = after_the_window();
+    let alerts = state.on_auth(&system(localized, Some("S-1-5-18"), later));
+    assert!(alerts.iter().all(|a| a.technique != "T1078"), "{alerts:?}");
+}
+
 #[test]
 fn generic_accounts_never_alert_at_night() {
     let mut state = utc_plus_two();

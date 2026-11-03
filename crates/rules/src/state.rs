@@ -2087,10 +2087,11 @@ impl RuleState {
         if event.outcome != AuthOutcome::Success || event.kind != AuthKind::Logon {
             return None;
         }
-        match self
-            .logon_baseline
-            .observe(&event.target_user, event.meta.timestamp_ns)
-        {
+        match self.logon_baseline.observe(
+            &event.target_user,
+            event.target_user_sid.as_deref(),
+            event.meta.timestamp_ns,
+        ) {
             Observation::FirstSeen => {}
             Observation::Quiet | Observation::Known => return None,
         }
@@ -2141,9 +2142,11 @@ impl RuleState {
         if event.outcome != AuthOutcome::Success || event.kind != AuthKind::Logon {
             return None;
         }
-        let hour = self
-            .odd_hours
-            .observe(&event.target_user, event.meta.timestamp_ns)?;
+        let hour = self.odd_hours.observe(
+            &event.target_user,
+            event.target_user_sid.as_deref(),
+            event.meta.timestamp_ns,
+        )?;
         let source = event
             .source_address
             .map_or_else(String::new, |address| format!(" from {address}"));
