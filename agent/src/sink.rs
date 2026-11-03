@@ -412,6 +412,23 @@ fn record_ioc_hit(
     record_detection(verdict, alert_log, finding, event, Vec::new(), persist);
 }
 
+/// Whether `pid` is the agent: this process, or another one running the agent's own executable
+/// (`agent apply-content-manifest`, started by an operator or a timer), for the IOC matcher's
+/// skip of the agent's own traffic (#1061). The executable is read from `/proc/<pid>/exe`, never
+/// taken from `comm`, which any process sets; where `/proc` names nothing (another platform, a
+/// process already gone, another mount namespace) only this process counts, so the residue
+/// fails toward raising.
+fn is_agent_process(pid: u32) -> bool {
+    static OWN_EXE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    if pid == std::process::id() {
+        return true;
+    }
+    OWN_EXE
+        .get_or_init(|| std::env::current_exe().ok())
+        .as_ref()
+        .is_some_and(|own| crate::deception::proc_exe(pid).as_ref() == Some(own))
+}
+
 fn ioc_source(hit: crate::ioc::IocHit) -> schema::detection::DetectionSource {
     schema::detection::DetectionSource::Ioc {
         kind: hit.kind,
@@ -1620,7 +1637,12 @@ impl DetectionSink {
     /// Connect events: stateless rules (unusual outbound from a web/DB
     /// service, issue #478), then beacon detection.
     fn detect_connect(&self, wrapped: &Event, event: &schema::ConnectEvent) {
-        if let Some(hit) = self.ioc.check_connect(event.daddr, event.meta.timestamp_ns) {
+        if let Some(hit) = self
+            .ioc
+            .check_connect(event.daddr, event.meta.timestamp_ns, || {
+                is_agent_process(event.meta.pid)
+            })
+        {
             self.record_ioc(wrapped, hit);
         }
         self.record_rule_alerts(wrapped, rules::evaluate_connect(event));
@@ -1632,7 +1654,9 @@ impl DetectionSink {
     fn detect_dns_query(&self, wrapped: &Event, event: &schema::DnsQueryEvent) {
         if let Some(hit) = self
             .ioc
-            .check_dns_query(&event.query, event.meta.timestamp_ns)
+            .check_dns_query(&event.query, event.meta.timestamp_ns, || {
+                is_agent_process(event.meta.pid)
+            })
         {
             self.record_ioc(wrapped, hit);
         }
@@ -1645,7 +1669,12 @@ impl DetectionSink {
     /// against the IOC set (#60); every poll of one live flow repeats it, which the per-indicator
     /// cooldown absorbs.
     fn detect_network_flow(&self, wrapped: &Event, event: &schema::NetworkFlowEvent) {
-        if let Some(hit) = self.ioc.check_connect(event.daddr, event.meta.timestamp_ns) {
+        if let Some(hit) = self
+            .ioc
+            .check_connect(event.daddr, event.meta.timestamp_ns, || {
+                is_agent_process(event.meta.pid)
+            })
+        {
             self.record_ioc(wrapped, hit);
         }
         self.record_rule_alerts(
@@ -6163,6 +6192,81 @@ rule reload_content_test_marker {
         assert_eq!(alerts.matches("203.0.113.9").count(), 1, "{alerts}");
         drop(sink);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_agents_own_connection_to_a_listed_address_neither_alerts_nor_hides_the_next_one() {
+        // #1061: the lab feed listed the control plane's address; the agent alerted on its own
+        // fetch, and that finding started the cooldown a real process would then fall inside.
+        let dir = tmp("ioc-own");
+        write_ioc_feed(&dir, "ip:203.0.113.9\n");
+        let sink = DetectionSink::new(
+            rules::RuleState::new(),
+            &dir.join("alerts.ndjson"),
+            Some(&dir.join("events.jsonl")),
+            None,
+            None,
+            &dir.join("content"),
+            &dir.join("ml-registry"),
+        )
+        .unwrap();
+
+        let mut own = connect_to("203.0.113.9", 1_000);
+        if let Event::Connect(connect) = &mut own {
+            connect.meta.pid = std::process::id();
+        }
+        sink.on_event(own);
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+        assert!(
+            !alerts_in(&dir).contains("IOC"),
+            "the agent's own connection is silent"
+        );
+
+        sink.on_event(connect_to("203.0.113.9", 2_000));
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+        let alerts = alerts_in(&dir);
+        assert_eq!(alerts.matches("203.0.113.9").count(), 1, "{alerts}");
+        assert_eq!(sink.ioc.stats().by_agent.load(Ordering::Relaxed), 1);
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Kept alive by [`another_process_running_the_agents_executable_is_the_agent`] as a child.
+    #[test]
+    #[ignore = "a helper process, run only as that test's child"]
+    fn ioc_own_exe_sleeper() {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn another_process_running_the_agents_executable_is_the_agent() {
+        // `agent apply-content-manifest` is a second process on the same binary (#1061).
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "sink::tests::ioc_own_exe_sleeper"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut is_agent = false;
+        for _ in 0..50 {
+            is_agent = super::is_agent_process(child.id());
+            if is_agent {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        child.kill().ok();
+        child.wait().ok();
+        assert!(is_agent);
+
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let other_is_agent = super::is_agent_process(other.id());
+        other.kill().ok();
+        other.wait().ok();
+        assert!(!other_is_agent, "another executable is not the agent");
     }
 
     #[test]
