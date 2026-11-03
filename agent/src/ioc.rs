@@ -101,6 +101,8 @@ pub(crate) struct IocStats {
     pub(crate) raised: AtomicU64,
     /// Matches absorbed by the per-indicator cooldown.
     pub(crate) cooled_down: AtomicU64,
+    /// Address and domain matches made by the agent itself, skipped (#1061).
+    pub(crate) by_agent: AtomicU64,
 }
 
 /// The agent's IOC matcher.
@@ -154,25 +156,43 @@ impl IocMatcher {
         let sha256 = sha256?.to_ascii_lowercase();
         let loaded = self.current.lock().unwrap().clone()?;
         let found = loaded.set.lookup_sha256_hex(&sha256)?;
-        self.hit(&loaded, found, IocKind::Sha256, sha256, now_ns)
+        self.hit(&loaded, found, IocKind::Sha256, sha256, now_ns, || false)
     }
 
     /// A queried name against the domain indicators. A listed domain covers its subdomains, so
     /// the finding names the listed domain that matched, not the name the host asked for.
-    pub(crate) fn check_dns_query(&self, name: &str, now_ns: u64) -> Option<IocHit> {
+    /// `by_agent` is asked on a match only (see [`Self::check_connect`]).
+    pub(crate) fn check_dns_query(
+        &self,
+        name: &str,
+        now_ns: u64,
+        by_agent: impl FnOnce() -> bool,
+    ) -> Option<IocHit> {
         let loaded = self.current.lock().unwrap().clone()?;
         // One lookup rejects almost every name; the suffix walk below runs on a hit only.
         loaded.set.lookup_domain(name)?;
         let (indicator, found) = listed_domain(&loaded.set, &intel::normalize_domain(name).ok()?)?;
-        self.hit(&loaded, found, IocKind::Domain, indicator, now_ns)
+        self.hit(&loaded, found, IocKind::Domain, indicator, now_ns, by_agent)
     }
 
     /// A connection's destination against the address indicators.
-    pub(crate) fn check_connect(&self, address: IpAddr, now_ns: u64) -> Option<IocHit> {
+    ///
+    /// `by_agent` says whether the agent itself made the connection, and is asked on a match
+    /// only (it may read `/proc`). The agent's own traffic goes to its control plane, so a feed
+    /// that lists that address (shared hosting, a CDN) would make every agent alert on itself
+    /// at each fetch and upload, and, worse, its connection would start the indicator's
+    /// cooldown and silence a real process reaching the same address within it (#1061). So
+    /// that match is skipped before the cooldown and counted.
+    pub(crate) fn check_connect(
+        &self,
+        address: IpAddr,
+        now_ns: u64,
+        by_agent: impl FnOnce() -> bool,
+    ) -> Option<IocHit> {
         let loaded = self.current.lock().unwrap().clone()?;
         let found = loaded.set.lookup_ip(address)?;
         let indicator = address.to_canonical().to_string();
-        self.hit(&loaded, found, IocKind::Ip, indicator, now_ns)
+        self.hit(&loaded, found, IocKind::Ip, indicator, now_ns, by_agent)
     }
 
     fn hit(
@@ -182,6 +202,7 @@ impl IocMatcher {
         kind: IocKind,
         indicator: String,
         now_ns: u64,
+        by_agent: impl FnOnce() -> bool,
     ) -> Option<IocHit> {
         debug_assert!(matches!(
             (found.kind, kind),
@@ -189,6 +210,10 @@ impl IocMatcher {
                 | (IndicatorKind::Ip, IocKind::Ip)
                 | (IndicatorKind::Domain, IocKind::Domain)
         ));
+        if by_agent() {
+            self.skip_agent_match(kind, &indicator);
+            return None;
+        }
         // One key space for every kind: `IocKind` is a schema enum without `Hash`.
         if self.in_cooldown(format!("{kind:?}:{indicator}"), now_ns) {
             self.stats.cooled_down.fetch_add(1, Ordering::Relaxed);
@@ -205,6 +230,18 @@ impl IocMatcher {
                 .unwrap_or_default(),
             feed_version: loaded.version.clone(),
         })
+    }
+
+    /// Counts a match made by the agent itself. The first one is a warning: a feed listing the
+    /// agent's own destination is a feed problem an operator should see once, not per fetch.
+    fn skip_agent_match(&self, kind: IocKind, indicator: &str) {
+        if self.stats.by_agent.fetch_add(1, Ordering::Relaxed) == 0 {
+            tracing::warn!(
+                ?kind,
+                indicator,
+                "ioc: the agent's own traffic matches an indicator; not raised for the agent,                  still raised for any other process"
+            );
+        }
     }
 
     /// True when `key` raised a finding within the cooldown; otherwise records this one.
@@ -404,7 +441,7 @@ mod tests {
         assert!(matcher.check_exec_image(Some(HASH), 0).is_none());
         assert!(
             matcher
-                .check_connect("203.0.113.9".parse().unwrap(), 0)
+                .check_connect("203.0.113.9".parse().unwrap(), 0, || false)
                 .is_none()
         );
     }
@@ -418,14 +455,16 @@ mod tests {
             ("bb-broad.txt", "domain:example.com\n"),
         ]);
         let matcher = IocMatcher::new(dir.path());
-        let overlap = matcher.check_dns_query("x.Evil.Example.com.", 0).unwrap();
+        let overlap = matcher
+            .check_dns_query("x.Evil.Example.com.", 0, || false)
+            .unwrap();
         assert_eq!(
             (overlap.indicator.as_str(), overlap.feed.as_str()),
             ("example.com", "bb-broad"),
             "the shortest listed suffix is the indicator, and its own feed the source"
         );
         let only_broad = matcher
-            .check_dns_query("www.example.com", COOLDOWN_NS)
+            .check_dns_query("www.example.com", COOLDOWN_NS, || false)
             .unwrap();
         assert_eq!(
             (only_broad.indicator.as_str(), only_broad.feed.as_str()),
@@ -440,7 +479,9 @@ mod tests {
             ("bb-narrow.txt", "domain:evil.example.com\n"),
         ]);
         let matcher = IocMatcher::new(dir.path());
-        let hit = matcher.check_dns_query("x.evil.example.com", 0).unwrap();
+        let hit = matcher
+            .check_dns_query("x.evil.example.com", 0, || false)
+            .unwrap();
         assert_eq!(
             (hit.indicator.as_str(), hit.feed.as_str()),
             ("evil.example.com", "bb-narrow")
@@ -487,7 +528,7 @@ mod tests {
         assert_eq!(hit.feed_version, "2026-10-26.3");
         assert_eq!(hit.severity(), Severity::High);
         let ip = matcher
-            .check_connect("::ffff:203.0.113.9".parse().unwrap(), 0)
+            .check_connect("::ffff:203.0.113.9".parse().unwrap(), 0, || false)
             .unwrap();
         assert_eq!(
             (ip.kind, ip.indicator.as_str(), ip.feed.as_str()),
@@ -504,7 +545,7 @@ mod tests {
         assert!(matcher.check_exec_image(None, 0).is_none());
         assert!(
             matcher
-                .check_connect("203.0.113.10".parse().unwrap(), 0)
+                .check_connect("203.0.113.10".parse().unwrap(), 0, || false)
                 .is_none()
         );
     }
@@ -537,6 +578,44 @@ mod tests {
         let matcher = IocMatcher::new(dir.path());
         assert!(matcher.check_exec_image(Some(HASH), 0).is_some());
         assert!(matcher.check_exec_image(Some(&other), 1).is_some());
+    }
+
+    #[test]
+    fn the_agents_own_match_is_skipped_and_counted_without_starting_the_cooldown() {
+        // #1061: the control plane's address was in the feed; the agent's own connection
+        // raised a finding and its cooldown would have hidden a real process behind it.
+        let dir = dir_with(&[("f.txt", "ip:203.0.113.9\ndomain:evil.example\n")]);
+        let matcher = IocMatcher::new(dir.path());
+        let address = "203.0.113.9".parse().unwrap();
+        assert!(matcher.check_connect(address, 0, || true).is_none());
+        assert!(
+            matcher
+                .check_dns_query("cp.evil.example", 0, || true)
+                .is_none()
+        );
+        assert_eq!(matcher.stats().by_agent.load(Ordering::Relaxed), 2);
+        assert!(
+            matcher.check_connect(address, SEC, || false).is_some(),
+            "another process right after the agent still raises"
+        );
+        assert!(
+            matcher
+                .check_dns_query("x.evil.example", SEC, || false)
+                .is_some()
+        );
+        assert_eq!(matcher.stats().cooled_down.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn by_agent_is_not_asked_without_a_match() {
+        let dir = dir_with(&[("f.txt", "ip:203.0.113.9\n")]);
+        let matcher = IocMatcher::new(dir.path());
+        let unlisted = "203.0.113.10".parse().unwrap();
+        assert!(
+            matcher
+                .check_connect(unlisted, 0, || panic!("asked on a miss"))
+                .is_none()
+        );
     }
 
     #[test]
