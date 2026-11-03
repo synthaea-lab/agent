@@ -177,12 +177,13 @@ impl OddHours {
     }
 
     /// Declares the accounts whose odd-hour logons are expected (on-call, a schedule's service
-    /// account). An entry matches the account **as the event reports it**, case aside: an entry
-    /// without a domain matches only an unqualified account, so `CORP\svc_backup` has to be
-    /// written out. Deliberate — the account name is what an intruder with local admin chooses,
-    /// and a bare entry that matched any domain would exempt a local `svc_backup` it created;
-    /// the domain is the only evidence the event carries, so the exemption keeps it. Replaces
-    /// the previous list.
+    /// account). An entry matches the account **as the event reports it**, case aside, and
+    /// nothing else of the event is read. The Windows logon reports the bare account name, so a
+    /// bare entry exempts any account of that name, including a local one an intruder with local
+    /// admin creates under it (checked live on a Windows 11 host, 2026-11-03). A `CORP\svc_backup`
+    /// entry matches only an event that reports exactly that string, which no sensor does for a
+    /// logon today. `AuthEvent::target_user_sid` is the evidence an intruder cannot choose and
+    /// the exemption does not use it yet. Replaces the previous list.
     pub(crate) fn set_exempt_accounts(&mut self, accounts: &[String]) {
         self.exempt = accounts
             .iter()

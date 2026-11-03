@@ -623,9 +623,9 @@ fn exempt_accounts_match_without_case() {
     assert_eq!(odd_hour(&mut state, "xsvc_backup", at_local(3)).len(), 1);
 }
 
-/// An unqualified entry exempts only the unqualified account: an intruder with local admin
-/// chooses the account name, so a bare `svc_backup` must not exempt a local `DESKTOP-X\svc_backup`
-/// it just created. The domain is the only evidence the event carries, so it is not thrown away.
+/// An event that does report a domain is matched on the whole string, so a bare entry does not
+/// reach it. No sensor reports a domain for a logon today (see the next test), so this guards
+/// the matcher, not a threat the agent can meet yet.
 #[test]
 fn a_bare_exempt_entry_does_not_exempt_the_same_name_under_a_domain() {
     let mut state = exempt(&["svc_backup"]);
@@ -637,6 +637,37 @@ fn a_bare_exempt_entry_does_not_exempt_the_same_name_under_a_domain() {
     ] {
         assert_eq!(odd_hour(&mut state, user, at_local(3)).len(), 1, "{user}");
     }
+}
+
+/// A Windows 4624 reaches the rule as the bare `TargetUserName` plus the account's SID (checked
+/// live, 2026-11-03). A local account an intruder creates under an exempt name looks the same
+/// to the rule apart from a SID it does not read, so it is exempted too. This pins that, so
+/// binding an entry to the SID shows up as a deliberate change to this test.
+#[test]
+fn a_bare_exempt_entry_exempts_a_local_account_of_that_name_whatever_its_sid() {
+    let mut state = exempt(&["svc_backup"]);
+    let sensor_shaped = |user: &str, sid: &str| AuthEvent {
+        target_user_sid: Some(sid.to_string()),
+        ..logon(user, at_local(3))
+    };
+    let odd_hour_alerts = |state: &mut RuleState, event: &AuthEvent| {
+        state
+            .on_auth(event)
+            .into_iter()
+            .filter(|a| a.message.contains("outside the working hours"))
+            .count()
+    };
+    // The account the operator meant, and a look-alike created under another authority.
+    for sid in [
+        "S-1-5-21-1111111111-2222222222-3333333333-1004",
+        "S-1-5-21-4444444444-5555555555-6666666666-1001",
+    ] {
+        let event = sensor_shaped("svc_backup", sid);
+        assert_eq!(odd_hour_alerts(&mut state, &event), 0, "{sid}");
+    }
+    // The control: the same event shape under a name that is not listed still alerts.
+    let control = sensor_shaped("mallory", "S-1-5-21-4444444444-5555555555-6666666666-1002");
+    assert_eq!(odd_hour_alerts(&mut state, &control), 1);
 }
 
 #[test]
