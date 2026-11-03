@@ -42,10 +42,12 @@ fn every_terminating_signal_alerts() {
     }
 }
 
+/// `SIGSTOP`'s number on the host: 17 on macOS, where 19 is `SIGCONT`, 19 elsewhere.
+const SIGSTOP: u32 = if cfg!(target_os = "macos") { 17 } else { 19 };
+
 #[test]
 fn sigstop_uses_the_host_numbering() {
-    let native = if cfg!(target_os = "macos") { 17 } else { 19 };
-    let alert = check_security_process_signal(&signal_event(native)).expect("SIGSTOP must alert");
+    let alert = check_security_process_signal(&signal_event(SIGSTOP)).expect("SIGSTOP must alert");
     assert!(alert.message.contains("SIGSTOP"));
 }
 
@@ -197,7 +199,7 @@ fn a_sighup_to_a_security_tool_is_a_reload_and_does_not_alert() {
 
 #[test]
 fn sigkill_and_sigstop_to_a_security_tool_are_high_and_name_the_unit() {
-    for signal in [9, 19] {
+    for signal in [9, SIGSTOP] {
         let alert = check_security_process_signal(&signal_to_tool(4242, "pkill", signal))
             .expect("must alert");
         assert_eq!(alert.severity, crate::Severity::High, "signal {signal}");
@@ -223,7 +225,7 @@ fn the_catchable_terminating_signals_to_a_security_tool_are_medium() {
 
 #[test]
 fn the_service_manager_stays_low_for_a_security_tool_and_a_tool_signalling_itself_is_silent() {
-    for signal in [2, 9, 15, 19] {
+    for signal in [2, 9, 15, SIGSTOP] {
         let alert = check_security_process_signal(&signal_to_tool(1, "systemd", signal)).unwrap();
         assert_eq!(alert.severity, crate::Severity::Low, "signal {signal}");
     }
