@@ -234,6 +234,7 @@ fn the_service_manager_stays_low_for_a_security_tool_and_a_tool_signalling_itsel
 
 /// A signal whose default action ends a process, outside the seven named ones, still ends a
 /// tool that does not handle it: it alerts Medium for an event with a unit, as `signal N`.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_default_terminating_signal_to_a_security_tool_alerts_medium() {
     // SIGUSR1, SIGSEGV, SIGPIPE, SIGALRM, a real-time signal.
@@ -251,6 +252,7 @@ fn a_default_terminating_signal_to_a_security_tool_alerts_medium() {
 
 /// `SIGCHLD`, `SIGCONT`, `SIGURG`, `SIGWINCH` and `0` do not end a process; nor does a signal
 /// number out of range. The agent's own pid keeps the old set (no unit, so no new signals).
+#[cfg(target_os = "linux")]
 #[test]
 fn a_non_terminating_signal_to_a_security_tool_does_not_alert() {
     for signal in [0, 17, 18, 23, 28, 65] {

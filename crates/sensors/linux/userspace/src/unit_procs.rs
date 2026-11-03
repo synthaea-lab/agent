@@ -37,6 +37,10 @@ pub(crate) struct UnitProc {
     pub unit: String,
     /// `/proc/<pid>/exe` when it could be read at scan time.
     pub exe: Option<String>,
+    /// The process start time (`/proc/<pid>/stat`, field 22, clock ticks since boot) at scan
+    /// time: with the pid it names one process, which the exe alone cannot (a pid reused by the
+    /// same program, or a kernel thread with no exe).
+    pub start: Option<u64>,
 }
 
 /// Resolves the listed units to their processes.
@@ -92,17 +96,28 @@ impl UnitResolver {
                 found.entry(pid).or_insert_with(|| UnitProc {
                     unit: unit.clone(),
                     exe: self.exe_of(pid),
+                    start: self.start_of(pid),
                 });
             }
         }
         found
     }
 
-    /// Whether `pid` is still the process `known` described: alive, with the same executable.
-    /// A tool that was moved out of its unit's cgroup passes; an exited one, or a pid handed to
-    /// an unrelated process, does not.
+    /// Whether `pid` is still the process `known` described: the same start time. A tool that
+    /// was moved out of its unit's cgroup passes; an exited one, or a pid handed to another
+    /// process, does not. Without a start time recorded at scan time nothing can be said, so
+    /// the answer is no.
     pub(crate) fn still_is(&self, pid: u32, known: &UnitProc) -> bool {
-        self.proc_root.join(pid.to_string()).exists() && self.exe_of(pid) == known.exe
+        known.start.is_some() && self.start_of(pid) == known.start
+    }
+
+    /// Field 22 of `/proc/<pid>/stat`. The command name (field 2) may hold spaces and
+    /// parentheses, so the fields are counted from the last `)`.
+    fn start_of(&self, pid: u32) -> Option<u64> {
+        let stat = fs::read_to_string(self.proc_root.join(pid.to_string()).join("stat")).ok()?;
+        let after_comm = stat.get(stat.rfind(')')? + 1..)?;
+        // `state` is field 3, so `starttime` (field 22) is the 20th token after the `)`.
+        after_comm.split_whitespace().nth(19)?.parse().ok()
     }
 
     fn exe_of(&self, pid: u32) -> Option<String> {
@@ -161,7 +176,9 @@ pub(crate) fn changes(
 /// a trait so the refresh logic is tested without a kernel.
 pub(crate) trait WatchSet {
     fn insert(&mut self, pid: u32) -> Result<(), String>;
-    fn remove(&mut self, pid: u32) -> Result<(), String>;
+    /// `Ok(true)`: removed. `Ok(false)`: it was not in the set, which is what was wanted.
+    /// `Err`: still in the set, to be retried.
+    fn remove(&mut self, pid: u32) -> Result<bool, String>;
 }
 
 impl WatchSet for aya::maps::HashMap<aya::maps::MapData, u32, u8> {
@@ -169,8 +186,12 @@ impl WatchSet for aya::maps::HashMap<aya::maps::MapData, u32, u8> {
         aya::maps::HashMap::insert(self, pid, 1, 0).map_err(|e| e.to_string())
     }
 
-    fn remove(&mut self, pid: u32) -> Result<(), String> {
-        aya::maps::HashMap::remove(self, &pid).map_err(|e| e.to_string())
+    fn remove(&mut self, pid: u32) -> Result<bool, String> {
+        match aya::maps::HashMap::remove(self, &pid) {
+            Ok(()) => Ok(true),
+            Err(aya::maps::MapError::KeyNotFound) => Ok(false),
+            Err(e) => Err(e.to_string()),
+        }
     }
 }
 
@@ -238,13 +259,20 @@ impl<S: WatchSet> ToolWatch<S> {
         let (added, removed) = changes(&self.applied, &next);
         for pid in removed {
             match self.set.remove(pid) {
-                Ok(()) => {
+                Ok(_) => {
                     self.applied.remove(&pid);
                 }
-                // A tgid that is already gone from the map is what was wanted.
+                // Still in the kernel set: keep it as applied so the next scan asks again, and
+                // keep it named, or a process reusing the tgid would be reported as the tool.
                 Err(e) => {
-                    tracing::debug!(pid, error = %e, "SIGNAL_WATCH_TOOLS: remove failed");
-                    self.applied.remove(&pid);
+                    tracing::warn!(
+                        pid,
+                        error = %e,
+                        "SIGNAL_WATCH_TOOLS: could not stop watching a process, retrying at the next scan"
+                    );
+                    if let Some(known) = self.applied.get(&pid) {
+                        next.insert(pid, known.clone());
+                    }
                 }
             }
         }
@@ -319,9 +347,23 @@ mod tests {
         }
 
         fn exe(&self, pid: u32, path: &str) {
+            self.exe_started(pid, path, 1000);
+        }
+
+        /// `/proc/<pid>` with an exe and a stat line: the command name holds a space and a
+        /// parenthesis on purpose, `start` is field 22.
+        fn exe_started(&self, pid: u32, path: &str, start: u64) {
             let dir = self.root.join("proc").join(pid.to_string());
             fs::create_dir_all(&dir).unwrap();
+            let _ = fs::remove_file(dir.join("exe"));
             std::os::unix::fs::symlink(path, dir.join("exe")).unwrap();
+            fs::write(
+                dir.join("stat"),
+                format!(
+                    "{pid} (my (tool) x) S 1 {pid} {pid} 0 -1 4194560 0 0 0 0 1 2 0 0 20 0 1 0 {start} 1000 100 18446744073709551615\n"
+                ),
+            )
+            .unwrap();
         }
     }
 
@@ -343,6 +385,7 @@ mod tests {
             UnitProc {
                 unit: "auditd".to_owned(),
                 exe: Some("/usr/sbin/auditd".to_owned()),
+                start: Some(1000),
             }
         );
     }
@@ -390,6 +433,7 @@ mod tests {
         let proc = |unit: &str| UnitProc {
             unit: unit.to_owned(),
             exe: None,
+            start: None,
         };
         let before = BTreeMap::from([(5, proc("falco"))]);
         let after = BTreeMap::from([(5, proc("osqueryd"))]);
@@ -483,6 +527,8 @@ mod tests {
     struct FakeSet {
         pids: std::collections::BTreeSet<u32>,
         refuse: std::collections::BTreeSet<u32>,
+        /// Every `remove` fails with an error other than "absent".
+        fail_remove: bool,
     }
 
     impl WatchSet for &mut FakeSet {
@@ -494,11 +540,11 @@ mod tests {
             Ok(())
         }
 
-        fn remove(&mut self, pid: u32) -> Result<(), String> {
-            self.pids
-                .remove(&pid)
-                .then_some(())
-                .ok_or("absent".to_owned())
+        fn remove(&mut self, pid: u32) -> Result<bool, String> {
+            if self.fail_remove {
+                return Err("busy".to_owned());
+            }
+            Ok(self.pids.remove(&pid))
         }
     }
 
@@ -551,6 +597,56 @@ mod tests {
     }
 
     #[test]
+    fn the_start_time_is_field_22_even_with_parentheses_in_the_command_name() {
+        let host = Host::new();
+        host.exe_started(612, "/usr/sbin/auditd", 4242);
+        assert_eq!(host.resolver(&["auditd"]).start_of(612), Some(4242));
+        assert_eq!(host.resolver(&["auditd"]).start_of(613), None);
+    }
+
+    #[test]
+    fn a_pid_reused_by_the_same_program_is_not_kept() {
+        let host = Host::new();
+        let mut set = FakeSet::default();
+        host.unit("system.slice", "auditd.service", &[612]);
+        host.exe(612, "/usr/sbin/auditd");
+        let mut watch = ToolWatch::new(host.resolver(&["auditd"]), &mut set);
+        assert_eq!(watch.refresh(), 1);
+        host.unit("system.slice", "auditd.service", &[]);
+        host.exe_started(612, "/usr/sbin/auditd", 9999);
+        assert_eq!(watch.refresh(), 0);
+    }
+
+    #[test]
+    fn a_process_with_no_recorded_start_time_is_not_kept_after_leaving_the_cgroup() {
+        let host = Host::new();
+        let mut set = FakeSet::default();
+        host.unit("system.slice", "auditd.service", &[612]);
+        fs::create_dir_all(host.root.join("proc/612")).unwrap();
+        let mut watch = ToolWatch::new(host.resolver(&["auditd"]), &mut set);
+        assert_eq!(watch.refresh(), 1);
+        host.unit("system.slice", "auditd.service", &[]);
+        assert_eq!(watch.refresh(), 0);
+    }
+
+    #[test]
+    fn a_remove_that_fails_is_retried_and_the_pid_stays_applied() {
+        let host = Host::new();
+        let mut set = FakeSet::default();
+        host.unit("system.slice", "auditd.service", &[612]);
+        let mut watch = ToolWatch::new(host.resolver(&["auditd"]), &mut set);
+        assert_eq!(watch.refresh(), 1);
+        host.unit("system.slice", "auditd.service", &[]);
+        watch.set.fail_remove = true;
+        assert_eq!(watch.refresh(), 1, "still in the kernel set, still applied");
+        assert!(watch.procs().lock().unwrap().contains_key(&612));
+        watch.set.fail_remove = false;
+        assert_eq!(watch.refresh(), 0);
+        drop(watch);
+        assert!(set.pids.is_empty());
+    }
+
+    #[test]
     fn a_remove_of_a_pid_the_kernel_already_dropped_is_not_an_error() {
         let host = Host::new();
         let mut set = FakeSet::default();
@@ -591,7 +687,7 @@ mod tests {
         assert_eq!(watch.refresh(), 1);
         host.unit("system.slice", "auditd.service", &[]);
         host.gone(612);
-        host.exe(612, "/usr/bin/sleep");
+        host.exe_started(612, "/usr/bin/sleep", 7777);
         assert_eq!(watch.refresh(), 0);
     }
 

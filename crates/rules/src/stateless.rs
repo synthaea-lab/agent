@@ -1291,8 +1291,11 @@ fn signal_label(signal: u32, tool_event: bool) -> Option<std::borrow::Cow<'stati
     if let Some(name) = tamper_signal_name(signal) {
         return Some(name.into());
     }
-    (tool_event && (1..=64).contains(&signal) && !LINUX_BENIGN_SIGNALS.contains(&signal))
-        .then(|| "signal".into())
+    (cfg!(target_os = "linux")
+        && tool_event
+        && (1..=64).contains(&signal)
+        && !LINUX_BENIGN_SIGNALS.contains(&signal))
+    .then(|| "signal".into())
 }
 
 /// The process id of the service manager: `systemd` on Linux, `launchd` on macOS. The Linux probe
@@ -1303,8 +1306,8 @@ const INIT_PID: u32 = 1;
 /// T1562.001 — Impair Defenses: Disable or Modify Tools, the process-termination
 /// half (issue #362). Every [`schema::SignalEvent`] already targets a protected
 /// security process: the sensors filter at the source (Linux: the eBPF
-/// `SIGNAL_WATCH_PID` gate on the agent's own pid; macOS: the Endpoint Security
-/// client gate). This rule only keeps the signals that end or freeze the target, and
+/// `SIGNAL_WATCH_PID` gate on the agent's own pid, and `SIGNAL_WATCH_TOOLS` for the processes of
+/// the listed security units (#1103); macOS: the Endpoint Security client gate). This rule only keeps the signals that end or freeze the target, and
 /// then looks at the **sender** (#1103), which is all the event says about the actor:
 /// `meta` is the sender's pid, parent, comm, uid and container, with no cgroup or unit.
 ///
