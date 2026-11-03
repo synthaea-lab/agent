@@ -25,7 +25,7 @@ use std::{
     net::{TcpListener, TcpStream},
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -318,6 +318,202 @@ fn detection_uploader_redelivers_the_same_keys_after_partial_failure() {
     for (headers, key) in seen.iter().zip([a, b, a, b]) {
         assert!(headers.contains(&format!("idempotency-key: {key}")));
     }
+}
+
+/// A drain that also records what `ack_dropping` was told, for the per-record drops (#1119).
+struct RecordingDetectionDrain {
+    records: Vec<QueuedDetection>,
+    acked: Arc<AtomicU32>,
+    skipped: Arc<AtomicU32>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl DetectionDrain for RecordingDetectionDrain {
+    fn drain(&mut self) -> std::io::Result<Vec<QueuedDetection>> {
+        Ok(self.records.clone())
+    }
+    fn ack(&mut self) -> std::io::Result<()> {
+        self.ack_dropping(0)
+    }
+    fn ack_dropping(&mut self, dropped: u64) -> std::io::Result<()> {
+        self.acked.fetch_add(1, Ordering::SeqCst);
+        self.dropped.fetch_add(dropped, Ordering::SeqCst);
+        self.records.clear();
+        Ok(())
+    }
+    fn skip(&mut self) -> std::io::Result<()> {
+        self.skipped.fetch_add(1, Ordering::SeqCst);
+        self.records.clear();
+        Ok(())
+    }
+}
+
+type DetectionCounters = (Arc<AtomicU32>, Arc<AtomicU32>, Arc<AtomicU64>);
+
+fn recording_uploader(
+    url: &str,
+    records: Vec<QueuedDetection>,
+) -> (
+    DetectionUploader<RecordingDetectionDrain>,
+    DetectionCounters,
+) {
+    let acked = Arc::new(AtomicU32::new(0));
+    let skipped = Arc::new(AtomicU32::new(0));
+    let dropped = Arc::new(AtomicU64::new(0));
+    let drain = RecordingDetectionDrain {
+        records,
+        acked: Arc::clone(&acked),
+        skipped: Arc::clone(&skipped),
+        dropped: Arc::clone(&dropped),
+    };
+    let client = TransportClient::new(TransportConfig::new(url)).unwrap();
+    (
+        DetectionUploader::new(client, drain),
+        (acked, skipped, dropped),
+    )
+}
+
+fn queued(key: &str, detection: Detection) -> QueuedDetection {
+    QueuedDetection {
+        key: key.into(),
+        detection,
+    }
+}
+
+const KEY_A: &str = "b9628fc1-2134-4d4d-bbe6-83fdd1929d7a";
+const KEY_B: &str = "b9628fc1-2134-4d4d-bbe6-83fdd1929d7b";
+const KEY_C: &str = "b9628fc1-2134-4d4d-bbe6-83fdd1929d7c";
+
+/// A server that answers the given statuses in order, one connection each, and returns the
+/// request headers it saw.
+fn sequence_server(statuses: Vec<u16>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for status in statuses {
+            let (mut stream, _) = listener.accept().unwrap();
+            seen.push(read_request(&mut stream).to_ascii_lowercase());
+            let body = if status == 200 {
+                r#"{"status":"accepted"}"#
+            } else {
+                r#"{"error":"refused"}"#
+            };
+            write_response(&mut stream, status, body);
+        }
+        seen
+    });
+    (url, server)
+}
+
+#[test]
+fn a_record_the_server_refuses_for_good_does_not_stop_the_others_of_its_segment() {
+    let (url, server) = sequence_server(vec![200, 400, 200]);
+    let (mut uploader, (acked, skipped, dropped)) = recording_uploader(
+        &url,
+        vec![
+            queued(KEY_A, detection()),
+            queued(KEY_B, detection()),
+            queued(KEY_C, detection()),
+        ],
+    );
+    assert_eq!(uploader.upload_once().unwrap(), 2, "two were accepted");
+    assert_eq!(
+        acked.load(Ordering::SeqCst),
+        1,
+        "the segment is acknowledged"
+    );
+    assert_eq!(
+        skipped.load(Ordering::SeqCst),
+        0,
+        "the segment is not skipped"
+    );
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "the refused one is counted"
+    );
+    let seen = server.join().unwrap();
+    for (headers, key) in seen.iter().zip([KEY_A, KEY_B, KEY_C]) {
+        assert!(
+            headers.contains(&format!("idempotency-key: {key}")),
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn a_record_over_the_server_body_limit_is_dropped_without_being_sent_and_the_others_upload() {
+    let (url, server) = sequence_server(vec![200, 200]);
+    let mut huge = detection();
+    huge.title = "x".repeat(transport::MAX_DETECTION_BODY_BYTES + 1);
+    let (mut uploader, (acked, skipped, dropped)) = recording_uploader(
+        &url,
+        vec![
+            queued(KEY_A, detection()),
+            queued(KEY_B, huge),
+            queued(KEY_C, detection()),
+        ],
+    );
+    assert_eq!(uploader.upload_once().unwrap(), 2);
+    assert_eq!(acked.load(Ordering::SeqCst), 1);
+    assert_eq!(skipped.load(Ordering::SeqCst), 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    // Only the two normal records reached the server: the oversized one never left the agent.
+    let seen = server.join().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0].contains(&format!("idempotency-key: {KEY_A}")));
+    assert!(seen[1].contains(&format!("idempotency-key: {KEY_C}")));
+}
+
+#[test]
+fn a_segment_of_refused_records_is_acknowledged_and_counted() {
+    let (url, server) = sequence_server(vec![400, 413]);
+    let (mut uploader, (acked, skipped, dropped)) = recording_uploader(
+        &url,
+        vec![queued(KEY_A, detection()), queued(KEY_B, detection())],
+    );
+    assert_eq!(uploader.upload_once().unwrap(), 0);
+    assert_eq!(acked.load(Ordering::SeqCst), 1);
+    assert_eq!(skipped.load(Ordering::SeqCst), 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    server.join().unwrap();
+}
+
+#[test]
+fn refused_records_are_counted_once_when_a_retry_follows_a_transient_failure() {
+    // First pass: A refused for good, B hits a 500, the segment stays spooled and nothing is
+    // counted. Second pass: A is refused again, B goes through, the segment is acknowledged
+    // and A is counted once.
+    let (url, server) = sequence_server(vec![400, 500, 400, 200]);
+    let (mut uploader, (acked, skipped, dropped)) = recording_uploader(
+        &url,
+        vec![queued(KEY_A, detection()), queued(KEY_B, detection())],
+    );
+    assert!(uploader.upload_once().unwrap_err().is_retryable());
+    assert_eq!(acked.load(Ordering::SeqCst), 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 0, "nothing counted yet");
+    assert_eq!(uploader.upload_once().unwrap(), 1);
+    assert_eq!(acked.load(Ordering::SeqCst), 1);
+    assert_eq!(skipped.load(Ordering::SeqCst), 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1, "counted once");
+    server.join().unwrap();
+}
+
+#[test]
+fn a_rejection_that_is_not_about_one_record_still_skips_the_whole_segment() {
+    // 401 says the agent is not accepted, not that this record is bad: the old rule stands.
+    let (url, server) = sequence_server(vec![401]);
+    let (mut uploader, (acked, skipped, dropped)) = recording_uploader(
+        &url,
+        vec![queued(KEY_A, detection()), queued(KEY_B, detection())],
+    );
+    let err = uploader.upload_once().unwrap_err();
+    assert!(!err.is_retryable());
+    assert_eq!(skipped.load(Ordering::SeqCst), 1);
+    assert_eq!(acked.load(Ordering::SeqCst), 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    server.join().unwrap();
 }
 
 #[test]

@@ -58,6 +58,14 @@ impl DetectionDrain for DetectionSpoolDrain {
         self.0.lock().unwrap().ack().map(|_| ())
     }
 
+    fn ack_dropping(&mut self, dropped: u64) -> std::io::Result<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .ack_counting_dropped(dropped)
+            .map(|_| ())
+    }
+
     fn skip(&mut self) -> std::io::Result<()> {
         self.0.lock().unwrap().skip().map(|_| ())
     }
