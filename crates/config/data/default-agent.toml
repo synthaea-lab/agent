@@ -121,9 +121,10 @@ max_reconnect_backoff_ms = 60000
 # Calibration (#1089), both optional and empty by default: the local hours in which a logon
 # is ordinary ([7, 20] when absent; [22, 6] is a night shift, start greater than end wraps
 # midnight), and the accounts whose odd-hour logons are expected (on-call, a schedule's service
-# account; matched without case against the account as the logon reports it, so a domain account
-# is written out — a bare name exempts only an unqualified account, never the same name under a
-# domain, which an intruder could create locally).
+# account; matched without case against the account as the logon reports it. A Windows logon
+# reports the bare name with no domain, so a bare entry exempts ANY account of that name on this
+# host, including a local one an intruder creates under it; a "CORP\\name" entry matches only an
+# event that reports exactly that string, which no sensor does for a logon today).
 # [detection]
 # utc_offset_minutes = 120
 # work_hours = [22, 6]
