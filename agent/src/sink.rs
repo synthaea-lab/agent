@@ -1019,11 +1019,11 @@ impl DetectionSink {
     }
 
     /// Declares the accounts whose odd-hour logons are expected (#1089).
-    pub(crate) fn set_odd_hour_exempt_accounts(&self, accounts: &[String]) {
+    pub(crate) fn set_odd_hour_exempt_accounts(&self, accounts: &[String]) -> usize {
         self.rule_state
             .lock()
             .unwrap()
-            .set_odd_hour_exempt_accounts(accounts);
+            .set_odd_hour_exempt_accounts(accounts)
     }
 
     /// Gives the rules the platform's time zone (#1088); false when it has no answer for `now_secs`.

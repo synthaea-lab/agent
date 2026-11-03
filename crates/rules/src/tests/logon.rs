@@ -670,6 +670,162 @@ fn a_bare_exempt_entry_exempts_a_local_account_of_that_name_whatever_its_sid() {
     assert_eq!(odd_hour_alerts(&mut state, &control), 1);
 }
 
+const DOMAIN_SID: &str = "S-1-5-21-1111111111-2222222222-3333333333";
+
+/// An `AuthEvent` shaped like the Windows sensor's output: the bare name plus the account's SID.
+fn odd_hour_with_sid(state: &mut RuleState, user: &str, sid: Option<&str>, ts: u64) -> usize {
+    let event = AuthEvent {
+        target_user_sid: sid.map(str::to_string),
+        ..logon(user, ts)
+    };
+    state
+        .on_auth(&event)
+        .into_iter()
+        .filter(|a| a.message.contains("outside the working hours"))
+        .count()
+}
+
+#[test]
+fn an_entry_bound_to_a_sid_exempts_only_the_account_with_that_sid() {
+    let own = format!("{DOMAIN_SID}-1004");
+    let mut state = exempt(&[&format!("svc_backup|{own}")]);
+    // The account the operator meant.
+    assert_eq!(
+        odd_hour_with_sid(&mut state, "svc_backup", Some(&own), at_local(3)),
+        0
+    );
+    // The same name under another authority: a local account an intruder created.
+    let other = "S-1-5-21-4444444444-5555555555-6666666666-1001";
+    assert_eq!(
+        odd_hour_with_sid(&mut state, "svc_backup", Some(other), at_local(3)),
+        1
+    );
+}
+
+#[test]
+fn an_entry_bound_to_a_sid_does_not_exempt_an_event_that_carries_none() {
+    let mut state = exempt(&[&format!("svc_backup|{DOMAIN_SID}-1004")]);
+    // Linux and macOS logons have no SID: a SID-bound entry never matches them.
+    assert_eq!(
+        odd_hour_with_sid(&mut state, "svc_backup", None, at_local(3)),
+        1
+    );
+}
+
+#[test]
+fn a_sid_prefix_entry_exempts_the_name_below_that_prefix_only() {
+    let mut state = exempt(&[&format!("svc_backup|{DOMAIN_SID}-*")]);
+    assert_eq!(
+        odd_hour_with_sid(
+            &mut state,
+            "svc_backup",
+            Some(&format!("{DOMAIN_SID}-1004")),
+            at_local(3)
+        ),
+        0
+    );
+    // Not an exact match of the prefix text, and not below it.
+    let mut state = exempt(&[&format!("svc_backup|{DOMAIN_SID}-*")]);
+    assert_eq!(
+        odd_hour_with_sid(
+            &mut state,
+            "svc_backup",
+            Some("S-1-5-21-9-9-9-1004"),
+            at_local(3)
+        ),
+        1
+    );
+    // A longer authority that merely starts with the same digits is not below the prefix.
+    let mut state = exempt(&[&format!("svc_backup|{DOMAIN_SID}-*")]);
+    assert_eq!(
+        odd_hour_with_sid(
+            &mut state,
+            "svc_backup",
+            Some(&format!("{DOMAIN_SID}9-1004")),
+            at_local(3)
+        ),
+        1
+    );
+}
+
+#[test]
+fn an_entry_with_a_malformed_sid_is_dropped_not_read_as_the_bare_name() {
+    for bad in [
+        "svc_backup|not-a-sid",
+        "svc_backup|S-1-",
+        "svc_backup|S-1-5--1",
+        "svc_backup|S-1-5-21-1*",
+        "|S-1-5-21-1-2-3-1004",
+    ] {
+        let mut state = utc_plus_two();
+        let kept = state.set_odd_hour_exempt_accounts(&[bad.to_string()]);
+        assert_eq!(kept, 0, "{bad}");
+        // Reading it as the bare name would have exempted more than the operator wrote.
+        assert_eq!(
+            odd_hour(&mut state, "svc_backup", at_local(3)).len(),
+            1,
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn a_bare_entry_does_not_match_a_upn_or_a_slash_form() {
+    let mut state = exempt(&["svc_backup"]);
+    assert_eq!(
+        odd_hour(&mut state, "svc_backup@corp.com", at_local(3)).len(),
+        1
+    );
+    assert_eq!(
+        odd_hour(&mut state, "corp/svc_backup", at_local(3)).len(),
+        1
+    );
+}
+
+#[test]
+fn the_exempt_list_is_bounded_in_the_rules_too() {
+    let mut state = utc_plus_two();
+    let mut accounts: Vec<String> = (0..70).map(|i| format!("svc{i}")).collect();
+    accounts.insert(3, "   ".into()); // blank: dropped, does not use a slot
+    accounts.insert(5, "x".repeat(257)); // over-long: dropped
+    let kept = state.set_odd_hour_exempt_accounts(&accounts);
+    assert_eq!(kept, 64, "truncated to the cap, not refused");
+    assert!(
+        odd_hour(&mut state, "svc0", at_local(3)).is_empty(),
+        "inside the cap"
+    );
+    assert!(
+        odd_hour(&mut state, "svc63", at_local(3)).is_empty(),
+        "the 64th entry"
+    );
+    assert_eq!(
+        odd_hour(&mut state, "svc64", at_local(3)).len(),
+        1,
+        "past the cap"
+    );
+}
+
+#[test]
+fn an_exempt_skip_is_counted_and_an_ordinary_logon_is_not() {
+    let mut state = exempt(&["svc_backup"]);
+    assert_eq!(state.odd_hour_exempt_skips(), 0);
+    assert!(odd_hour(&mut state, "svc_backup", at_local(12)).is_empty()); // inside the window
+    assert_eq!(
+        state.odd_hour_exempt_skips(),
+        0,
+        "an ordinary-hour logon is not a skip"
+    );
+    assert!(odd_hour(&mut state, "svc_backup", at_local(3)).is_empty());
+    assert!(odd_hour(&mut state, "svc_backup", at_local(4)).is_empty());
+    assert_eq!(state.odd_hour_exempt_skips(), 2);
+    assert_eq!(odd_hour(&mut state, "mallory", at_local(3)).len(), 1);
+    assert_eq!(
+        state.odd_hour_exempt_skips(),
+        2,
+        "an alerted logon is not a skip"
+    );
+}
+
 #[test]
 fn a_domain_qualified_exemption_matches_only_that_domain() {
     let mut state = exempt(&["CORP\\oncall"]);

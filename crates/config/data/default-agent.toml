@@ -113,19 +113,23 @@ max_reconnect_backoff_ms = 60000
 
 # --- [detection] --------------------------------------------------------------------
 # Facts about this host that no event carries (#376). Nothing is needed here when the host
-# names a time zone: the ODD-HOUR-LOGON rule (T1078, a logon outside 07:00-20:00 local, Low)
+# names a time zone: the ODD-HOUR-LOGON rule (T1078, a logon outside 07:00-20:00 local by default, Low)
 # then uses the platform's zone, daylight saving included (#1088).
 # To override the zone, or where the host names none (a minimal container is UTC to the C
 # library), give the local time as minutes east of UTC (120 = UTC+2, -300 = UTC-5), between
 # -720 and 840. Fixed: it does not follow daylight saving.
 # Calibration (#1089), both optional and empty by default: the local hours in which a logon
 # is ordinary ([7, 20] when absent; [22, 6] is a night shift, start greater than end wraps
-# midnight), and the accounts whose odd-hour logons are expected (on-call, a schedule's service
-# account; matched without case against the account as the logon reports it. A Windows logon
-# reports the bare name with no domain, so a bare entry exempts ANY account of that name on this
-# host, including a local one an intruder creates under it; a "CORP\\name" entry matches only an
-# event that reports exactly that string, which no sensor does for a logon today).
+# midnight; [0, 24] makes every hour ordinary, so the rule never alerts), and the accounts whose
+# odd-hour logons are expected (on-call, a schedule's service account). An entry is NAME or
+# NAME|SID. NAME is matched without case against the account as the logon reports it: a Windows
+# logon reports the bare name with no domain, so a bare entry exempts ANY account of that name on
+# this host, including a local one an intruder creates under it. A UPN (name@corp.com) or
+# corp/name is another string and a bare entry does not match it. NAME|SID binds the entry to the
+# account's SID, which an intruder cannot choose: "svc|S-1-5-21-1-2-3-1004" exempts that account
+# only, "svc|S-1-5-21-1-2-3-*" any account of that name below that domain or machine SID prefix;
+# an event with no SID (Linux, macOS) is not exempt under such an entry. At most 64 entries.
 # [detection]
 # utc_offset_minutes = 120
 # work_hours = [22, 6]
-# odd_hour_exempt_accounts = ["svc_backup", "CORP\\oncall"]
+# odd_hour_exempt_accounts = ["svc_backup|S-1-5-21-1111-2222-3333-1004", "oncall"]

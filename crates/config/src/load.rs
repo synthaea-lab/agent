@@ -314,19 +314,25 @@ fn validate_semantics(cfg: &AgentConfig, source_path: &Path) -> Result<(), Confi
         });
     }
 
-    // detection.odd_hour_exempt_accounts — bounded, and a blank name would exempt nothing
-    // while looking like it exempted someone.
+    // detection.odd_hour_exempt_accounts — bounded, and a blank or malformed entry would exempt
+    // nothing (or, for a malformed SID, more than was written) while looking like it exempted
+    // someone. The message names the first bad entry.
     let exempt = &cfg.detection.odd_hour_exempt_accounts;
-    if exempt.len() > crate::schema::MAX_ODD_HOUR_EXEMPT_ACCOUNTS
-        || exempt.iter().any(|a| a.trim().is_empty() || a.len() > 256)
-    {
+    let bad_entry = exempt
+        .iter()
+        .enumerate()
+        .find_map(|(i, entry)| exempt_entry_problem(entry).map(|problem| (i, problem)));
+    if exempt.len() > crate::schema::MAX_ODD_HOUR_EXEMPT_ACCOUNTS || bad_entry.is_some() {
         return Err(ConfigError::Invalid {
             field: "detection.odd_hour_exempt_accounts".into(),
             expected: format!(
-                "at most {} account names, none blank or over 256 bytes",
+                "at most {} entries, each `NAME` or `NAME|SID` (a SID `S-1-...` or a prefix ending in `-*`), none blank or over 256 bytes",
                 crate::schema::MAX_ODD_HOUR_EXEMPT_ACCOUNTS
             ),
-            value: format!("{} entries", exempt.len()),
+            value: match bad_entry {
+                Some((i, problem)) => format!("entry {i} ({:?}): {problem}", exempt[i]),
+                None => format!("{} entries", exempt.len()),
+            },
             origin: src.clone(),
         });
     }
@@ -574,6 +580,37 @@ fn parse_env_bool(env_var: &str, field: &str, raw: &str) -> Result<bool, ConfigE
             value: raw.to_string(),
         }),
     }
+}
+
+/// Why an `odd_hour_exempt_accounts` entry is not valid, or `None`: `NAME` or `NAME|SID`, where
+/// `SID` is `S-1-` then digits and dashes, or such a prefix ending in `-*`. The rules apply the
+/// same grammar and drop an entry that fails it; refusing it here means a typo fails the load
+/// instead of silently exempting nothing.
+fn exempt_entry_problem(entry: &str) -> Option<&'static str> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return Some("blank");
+    }
+    if entry.len() > 256 {
+        return Some("over 256 bytes");
+    }
+    let (name, sid) = entry.split_once('|')?;
+    if name.trim().is_empty() {
+        return Some("no account name before `|`");
+    }
+    let sid = sid.trim();
+    let body = sid.strip_suffix("-*").unwrap_or(sid);
+    let valid = body
+        .strip_prefix("S-1-")
+        .or_else(|| body.strip_prefix("s-1-"))
+        .is_some_and(|rest| {
+            !rest.is_empty()
+                && !rest.starts_with('-')
+                && !rest.ends_with('-')
+                && !rest.contains("--")
+                && rest.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+        });
+    (!valid).then_some("the part after `|` is not a SID (`S-1-...`) or a prefix ending in `-*`")
 }
 
 #[cfg(test)]
@@ -1051,6 +1088,33 @@ control_plane_url = "https://cp.example"
             {
                 ConfigError::Invalid { field, .. } => {
                     assert_eq!(field, "detection.odd_hour_exempt_accounts");
+                }
+                other => panic!("expected Invalid, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn exempt_entries_may_be_bound_to_a_sid_and_a_malformed_one_names_its_index() {
+        let cfg = load_with_logs(
+            "[detection]\nodd_hour_exempt_accounts = [\"svc_backup|S-1-5-21-1-2-3-1004\", \"oncall|S-1-5-21-1-2-3-*\", \"plain\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.detection.odd_hour_exempt_accounts.len(), 3);
+        for (list, index) in [
+            ("[\"ok\", \"svc|not-a-sid\"]", 1),
+            ("[\"svc|S-1-5--1\"]", 0),
+            ("[\"a\", \"b\", \"|S-1-5-21-1\"]", 2),
+            ("[\"a\", \"  \"]", 1),
+        ] {
+            match load_with_logs(&format!("[detection]\nodd_hour_exempt_accounts = {list}\n"))
+                .unwrap_err()
+            {
+                ConfigError::Invalid { value, .. } => {
+                    assert!(
+                        value.starts_with(&format!("entry {index} ")),
+                        "{list}: {value}"
+                    );
                 }
                 other => panic!("expected Invalid, got {other:?}"),
             }

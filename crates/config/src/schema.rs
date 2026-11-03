@@ -88,16 +88,20 @@ pub struct DetectionConfig {
     #[serde(default)]
     pub work_hours: Option<[u32; 2]>,
     /// Accounts whose odd-hour logons are expected, for ODD-HOUR-LOGON (#1089): on-call staff,
-    /// and the service or batch account of a schedule. Each entry must match the account **as
-    /// the logon reports it**, case aside. The Windows logon event (4624) reports the bare
-    /// `TargetUserName` with no domain, so a bare entry such as `svc_backup` exempts **any**
-    /// account of that name on that host, including a local one an intruder with local admin
-    /// creates under it; the name is the one thing the intruder chooses. A `CORP\svc_backup`
-    /// entry matches only an event that reports exactly that string, which no sensor does for
-    /// a logon today. Tying an entry to the account's SID, which the Windows event carries
-    /// and the rule does not read, is not done. Only the odd-hour rule skips them:
-    /// FIRST-SEEN-LOGON still reads them. Empty by default, on purpose: nothing is exempt
-    /// until the operator says so.
+    /// and the service or batch account of a schedule. Each entry is `NAME` or `NAME|SID`.
+    /// `NAME` is matched against the account **as the logon reports it**, case aside. The
+    /// Windows logon event (4624) reports the bare `TargetUserName` with no domain, so a bare
+    /// entry such as `svc_backup` exempts **any** account of that name on that host, including a
+    /// local one an intruder with local admin creates under it; the name is the one thing the
+    /// intruder chooses. A `CORP\svc_backup` entry matches only an event that reports exactly
+    /// that string, which no sensor does for a logon today, and a UPN (`svc_backup@corp.com`)
+    /// or `corp/svc_backup` is another string that a bare entry does not match.
+    /// `NAME|SID` binds the entry to the account's SID, which the Windows event carries and an
+    /// intruder cannot choose: `svc_backup|S-1-5-21-1111-2222-3333-1004` exempts that account
+    /// only, `svc_backup|S-1-5-21-1111-2222-3333-*` any account of that name under that domain
+    /// (or machine) SID prefix. An event with no SID (Linux and macOS logons) is not exempt
+    /// under such an entry. Only the odd-hour rule skips them: FIRST-SEEN-LOGON still reads
+    /// them. Empty by default, on purpose: nothing is exempt until the operator says so.
     #[serde(default)]
     pub odd_hour_exempt_accounts: Vec<String>,
 }

@@ -128,6 +128,86 @@ const MIN_UTC_OFFSET_MINUTES: i32 = -12 * 60;
 /// daylight saving included.
 pub type LocalOffsetAt = fn(i64) -> Option<i32>;
 
+/// Most entries the exempt list keeps, and the longest one: the bounds `config::load` enforces
+/// (`MAX_ODD_HOUR_EXEMPT_ACCOUNTS`, 256 bytes), repeated here so that any other caller of the
+/// rules API gets a bounded list too. Past them an entry is dropped, not refused.
+pub(crate) const MAX_EXEMPT_ACCOUNTS: usize = 64;
+pub(crate) const MAX_EXEMPT_ENTRY_BYTES: usize = 256;
+
+/// One entry of the exempt list: an account name, and optionally the SID the logon must carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExemptEntry {
+    /// Lowercased account name, exactly as the event reports it.
+    name: String,
+    /// `None`: the name alone decides. `Some`: the event must also carry a matching SID.
+    sid: Option<SidMatch>,
+}
+
+/// The SID an exempt entry is bound to: `S-1-5-21-...-1004` exactly, or a prefix written with a
+/// trailing `-*` (`S-1-5-21-111-222-333-*`, a domain or a machine) that any SID below it matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidMatch {
+    /// Uppercase. For a prefix it ends with `-`.
+    value: String,
+    prefix: bool,
+}
+
+impl SidMatch {
+    fn matches(&self, sid: &str) -> bool {
+        let sid = sid.to_ascii_uppercase();
+        if self.prefix {
+            sid.starts_with(&self.value)
+        } else {
+            sid == self.value
+        }
+    }
+}
+
+/// `NAME` or `NAME|SID`. `|` never occurs in a Windows account name, so it cannot be part of
+/// a name. `None` for a blank entry, an over-long one, or a `SID` part that is not a SID or a
+/// `-*` prefix: an entry whose SID part is malformed is dropped, never read as the bare name,
+/// which would exempt more than the operator wrote.
+fn parse_exempt_entry(entry: &str) -> Option<ExemptEntry> {
+    let entry = entry.trim();
+    if entry.is_empty() || entry.len() > MAX_EXEMPT_ENTRY_BYTES {
+        return None;
+    }
+    let Some((name, sid)) = entry.split_once('|') else {
+        return Some(ExemptEntry {
+            name: entry.to_lowercase(),
+            sid: None,
+        });
+    };
+    let (name, sid) = (name.trim(), sid.trim());
+    if name.is_empty() || !is_sid_pattern(sid) {
+        return None;
+    }
+    let (value, prefix) = match sid.strip_suffix('*') {
+        Some(head) => (head.to_ascii_uppercase(), true),
+        None => (sid.to_ascii_uppercase(), false),
+    };
+    Some(ExemptEntry {
+        name: name.to_lowercase(),
+        sid: Some(SidMatch { value, prefix }),
+    })
+}
+
+/// A SID (`S-1-` then digits and dashes) or such a prefix ending in `-*`.
+fn is_sid_pattern(text: &str) -> bool {
+    let body = text.strip_suffix("-*").unwrap_or(text);
+    let Some(rest) = body
+        .strip_prefix("S-1-")
+        .or_else(|| body.strip_prefix("s-1-"))
+    else {
+        return false;
+    };
+    !rest.is_empty()
+        && !rest.starts_with('-')
+        && !rest.ends_with('-')
+        && !rest.contains("--")
+        && rest.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+}
+
 /// ODD-HOUR-LOGON's clock: the host's local time, and the accounts already reported tonight.
 /// Two sources, the operator's fixed offset first: it is an override, so a host whose platform
 /// zone is wrong (or absent) can be corrected. With neither the rule is off: the event's
@@ -138,10 +218,16 @@ pub(crate) struct OddHours {
     /// The local hours `[start, end)` of an ordinary logon; `start` greater than `end` wraps
     /// midnight. [`WORK_HOURS_LOCAL`] until the operator declares another.
     work_hours: (u32, u32),
-    /// Lowercased accounts whose odd-hour logons the operator declared expected.
-    exempt: Vec<String>,
+    /// The accounts whose odd-hour logons the operator declared expected.
+    exempt: Vec<ExemptEntry>,
     /// Lowercased account → timestamp of its last alert.
     last_alert_ns: BoundedMap<String, u64>,
+    /// Lowercased account → timestamp of the last odd-hour logon an exemption let through that
+    /// was logged (one line per account per [`ODD_HOUR_QUIET_NS`], so a service account that logs
+    /// on every minute does not flood the log).
+    last_exempt_log_ns: BoundedMap<String, u64>,
+    /// Odd-hour logons an exemption suppressed, since the agent started.
+    exempt_skips: u64,
 }
 
 impl OddHours {
@@ -152,6 +238,8 @@ impl OddHours {
             work_hours: WORK_HOURS_LOCAL,
             exempt: Vec::new(),
             last_alert_ns: BoundedMap::new(COUNTER_CAP),
+            last_exempt_log_ns: BoundedMap::new(COUNTER_CAP),
+            exempt_skips: 0,
         }
     }
 
@@ -177,24 +265,43 @@ impl OddHours {
     }
 
     /// Declares the accounts whose odd-hour logons are expected (on-call, a schedule's service
-    /// account). An entry matches the account **as the event reports it**, case aside, and
-    /// nothing else of the event is read. The Windows logon reports the bare account name, so a
-    /// bare entry exempts any account of that name, including a local one an intruder with local
-    /// admin creates under it (checked live on a Windows 11 host, 2026-11-03). A `CORP\svc_backup`
+    /// account). An entry is `NAME`, or `NAME|SID` (a SID such as `S-1-5-21-111-222-333-1004`, or
+    /// a prefix ending in `-*` for a whole domain or machine). The name is matched **as the event
+    /// reports it**, case aside. The Windows logon reports the bare account name, so a bare entry
+    /// exempts any account of that name, including a local one an intruder with local admin
+    /// creates under it (checked live on a Windows 11 host, 2026-11-03); a `CORP\svc_backup`
     /// entry matches only an event that reports exactly that string, which no sensor does for a
-    /// logon today. `AuthEvent::target_user_sid` is the evidence an intruder cannot choose and
-    /// the exemption does not use it yet. Replaces the previous list.
-    pub(crate) fn set_exempt_accounts(&mut self, accounts: &[String]) {
+    /// logon today; a UPN (`svc_backup@corp.com`) or `corp/svc_backup` is another string and a
+    /// bare entry does not match it. The SID is the evidence an intruder cannot choose: with
+    /// `NAME|SID` the event must carry a matching `target_user_sid`, and an event with none (Linux
+    /// and macOS logons have no SID) is **not** exempt.
+    ///
+    /// Bounded: at most [`MAX_EXEMPT_ACCOUNTS`] entries are kept, and a blank, over-long or
+    /// malformed entry is dropped (truncated, not refused). Returns how many were kept. Replaces
+    /// the previous list.
+    pub(crate) fn set_exempt_accounts(&mut self, accounts: &[String]) -> usize {
         self.exempt = accounts
             .iter()
-            .map(|a| a.trim().to_lowercase())
-            .filter(|a| !a.is_empty())
+            .filter_map(|a| parse_exempt_entry(a))
+            .take(MAX_EXEMPT_ACCOUNTS)
             .collect();
+        self.exempt.len()
     }
 
-    fn is_exempt(&self, user: &str) -> bool {
+    fn is_exempt(&self, user: &str, sid: Option<&str>) -> bool {
         let lower = user.to_lowercase();
-        self.exempt.contains(&lower)
+        self.exempt.iter().any(|entry| {
+            entry.name == lower
+                && entry
+                    .sid
+                    .as_ref()
+                    .is_none_or(|want| sid.is_some_and(|got| want.matches(got)))
+        })
+    }
+
+    /// Odd-hour logons an exemption has suppressed since the agent started.
+    pub(crate) fn exempt_skips(&self) -> u64 {
+        self.exempt_skips
     }
 
     fn in_work_hours(&self, hour: u32) -> bool {
@@ -239,15 +346,32 @@ impl OddHours {
         u32::try_from(local / 3_600).ok()
     }
 
-    /// The local hour of a logon of `user` at `ts` when it is outside the working hours and
-    /// this account has not been reported within [`ODD_HOUR_QUIET_NS`]; remembers it.
-    pub(crate) fn observe(&mut self, user: &str, ts: u64) -> Option<u32> {
+    /// The local hour of a logon of `user` (carrying `sid`, when the sensor reports one) at `ts`
+    /// when it is outside the working hours and this account has not been reported within
+    /// [`ODD_HOUR_QUIET_NS`]; remembers it. A logon an exemption suppresses is counted
+    /// ([`Self::exempt_skips`]) and logged once per account per quiet period, so a suppression
+    /// list leaves a trace.
+    pub(crate) fn observe(&mut self, user: &str, sid: Option<&str>, ts: u64) -> Option<u32> {
         let hour = self.local_hour(ts)?;
-        if self.in_work_hours(hour)
-            || user.is_empty()
-            || is_generic_account(user)
-            || self.is_exempt(user)
-        {
+        if self.in_work_hours(hour) || user.is_empty() || is_generic_account(user) {
+            return None;
+        }
+        if self.is_exempt(user, sid) {
+            self.exempt_skips = self.exempt_skips.saturating_add(1);
+            let key = user.to_lowercase();
+            if !self
+                .last_exempt_log_ns
+                .get(&key)
+                .is_some_and(|last| ts.saturating_sub(*last) < ODD_HOUR_QUIET_NS)
+            {
+                tracing::info!(
+                    account = user,
+                    sid = sid.unwrap_or("none"),
+                    skips = self.exempt_skips,
+                    "odd-hour logon not reported: the account is on the exempt list"
+                );
+                self.last_exempt_log_ns.insert(key, ts);
+            }
             return None;
         }
         let key = user.to_lowercase();

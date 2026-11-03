@@ -624,9 +624,11 @@ pub(crate) const EGRESS_DOMAIN_BROWSER_COMMS: &[&str] = &[
 pub(crate) const LOGON_LEARNING_NS: u64 = 86_400_000_000_000; // 24 h
 
 /// ODD-HOUR-LOGON (T1078, #376): the local hours `[start, end)` in which a logon is ordinary.
-/// **Provisional**: 07:00 to 20:00 is a plain working day, with no measurement behind it and
-/// no notion of weekends, shifts or a host used around the clock. Only read when the
-/// operator has told the agent the host's UTC offset.
+/// The default window. **Provisional**: 07:00 to 20:00 is a plain working day, with no measurement
+/// behind it and no notion of weekends. An operator declares another window (`[detection]
+/// work_hours`, a night shift wraps midnight) and names accounts whose odd-hour logons are
+/// expected (`odd_hour_exempt_accounts`); the rule reads the host's local time from the platform's
+/// zone, or from the operator's UTC offset, which overrides it.
 pub(crate) const WORK_HOURS_LOCAL: (u32, u32) = (7, 20);
 
 /// ODD-HOUR-LOGON: one alert per account per this long, so a session that logs on several

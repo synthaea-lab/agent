@@ -94,7 +94,15 @@ pub(crate) fn apply_detection(sink: &DetectionSink, detection: &config::Detectio
 fn apply_odd_hour_calibration(sink: &DetectionSink, detection: &config::DetectionConfig) {
     if let Some([start, end]) = detection.work_hours {
         if sink.set_work_hours(start, end) {
-            tracing::info!(start, end, "detection: odd-hour logon window declared");
+            if start == 0 && end == 24 {
+                tracing::info!(
+                    start,
+                    end,
+                    "detection: odd-hour logon window declared; every hour is ordinary, so the rule will not alert"
+                );
+            } else {
+                tracing::info!(start, end, "detection: odd-hour logon window declared");
+            }
         } else {
             tracing::warn!(
                 start,
@@ -104,11 +112,18 @@ fn apply_odd_hour_calibration(sink: &DetectionSink, detection: &config::Detectio
         }
     }
     if !detection.odd_hour_exempt_accounts.is_empty() {
-        sink.set_odd_hour_exempt_accounts(&detection.odd_hour_exempt_accounts);
+        let kept = sink.set_odd_hour_exempt_accounts(&detection.odd_hour_exempt_accounts);
         tracing::info!(
-            count = detection.odd_hour_exempt_accounts.len(),
+            count = kept,
             "detection: accounts exempt from the odd-hour logon rule"
         );
+        if kept != detection.odd_hour_exempt_accounts.len() {
+            tracing::warn!(
+                declared = detection.odd_hour_exempt_accounts.len(),
+                kept,
+                "detection: some exempt entries were dropped (blank, over-long, malformed or past the limit)"
+            );
+        }
     }
 }
 
