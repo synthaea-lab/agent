@@ -204,6 +204,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             image_path,
             cmdline,
             argv: vec![], // Windows has a flat command line; consumers fall back
+            cmdline_truncated: false, // CreateProcess caps it at 32,766 UTF-16 units (#1112)
             env_security: Vec::new(), // no exec-environment capture on Windows yet (#363 is Linux-only)
             parent_comm,
             parent_image_path,

@@ -1,0 +1,14 @@
+{
+  "type": "identity_change",
+  "meta": {
+    "pid": 9007,
+    "ppid": 1,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900025000000000,
+    "comm": "su"
+  },
+  "kind": "set_res_uid",
+  "real": 1000,
+  "effective": 1000,
+  "saved": 0
+}

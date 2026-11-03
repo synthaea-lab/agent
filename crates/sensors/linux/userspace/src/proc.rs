@@ -42,8 +42,15 @@ pub(crate) fn parse_proc_cmdline(blob: &[u8]) -> Vec<String> {
 /// a live `sleep 60` with a confirmed parent — the `WSL` interop layer between the
 /// eBPF context and the agent's `/proc` view, not the drain race. `WSL2` is out of
 /// `lab/MATRIX.md`; recorded so it is not re-investigated (Nikolas, 2026-09-10, #155).
+///
+/// Reads at most one byte past [`schema::ARGV_CAPTURE_BUDGET`] (#1112): enough for
+/// `normalize::exec`'s cut to see the argv is over and flag it, without copying a
+/// padded exec's ~2 MiB on every drain.
 pub(crate) fn read_proc_cmdline(pid: u32) -> Vec<String> {
-    match std::fs::read(format!("/proc/{pid}/cmdline")) {
+    match read_capped(
+        &format!("/proc/{pid}/cmdline"),
+        schema::ARGV_CAPTURE_BUDGET + 1,
+    ) {
         Ok(blob) => parse_proc_cmdline(&blob),
         // The expected exit race (process already gone) is silent; anything else
         // (EACCES, EIO) is worth a line when tracing a capture gap on some kernel.
@@ -53,6 +60,16 @@ pub(crate) fn read_proc_cmdline(pid: u32) -> Vec<String> {
             Vec::new()
         }
     }
+}
+
+/// The first `limit` bytes of the file at `path`.
+fn read_capped(path: &str, limit: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut blob = Vec::new();
+    std::fs::File::open(path)?
+        .take(u64::try_from(limit).unwrap_or(u64::MAX))
+        .read_to_end(&mut blob)?;
+    Ok(blob)
 }
 
 /// Environment variable names the sensor captures at exec time (`ExecEvent::env_security`,
