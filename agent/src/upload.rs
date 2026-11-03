@@ -562,6 +562,60 @@ mod tests {
         assert!(empty.is_empty());
     }
 
+    /// The glue between the uploader's per-record drops and the health beacon's `spool_dropped`:
+    /// the drain the agent really uses must pass the count to the spool (#1119 review).
+    #[test]
+    fn the_detection_drain_counts_the_records_the_server_refused_in_the_spool_loss() {
+        let dir = std::env::temp_dir().join(format!("agent-detection-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let spool = Arc::new(Mutex::new(
+            EventSpool::open_with_segment_records(&dir, u64::MAX, 3).unwrap(),
+        ));
+        for title in ["a", "b", "c"] {
+            persist_detection(
+                &spool,
+                Detection {
+                    timestamp_ns: 1_700_000_000_000_000_000,
+                    severity: Severity::High,
+                    title: title.into(),
+                    source: DetectionSource::Rule {
+                        rule_id: "T1059".into(),
+                    },
+                    score: None,
+                    attributions: Vec::new(),
+                    techniques: vec!["T1059".into()],
+                    events: vec![exec("test")],
+                },
+            )
+            .unwrap();
+        }
+        let mut drain = DetectionSpoolDrain(Arc::clone(&spool));
+        assert_eq!(drain.drain().unwrap().len(), 3, "one segment of three");
+        drain.ack_dropping(2).unwrap();
+        assert_eq!(spool.lock().unwrap().stats().dropped_records, 2);
+        assert!(drain.drain().unwrap().is_empty(), "the segment is gone");
+        // A plain `ack` counts nothing.
+        persist_detection(
+            &spool,
+            Detection {
+                timestamp_ns: 1,
+                severity: Severity::Low,
+                title: "d".into(),
+                source: DetectionSource::Rule {
+                    rule_id: "T1059".into(),
+                },
+                score: None,
+                attributions: Vec::new(),
+                techniques: Vec::new(),
+                events: vec![exec("test")],
+            },
+        )
+        .unwrap();
+        drain.drain().unwrap();
+        drain.ack().unwrap();
+        assert_eq!(spool.lock().unwrap().stats().dropped_records, 2);
+    }
+
     /// The at-least-once property the whole wiring exists for: a drain that is
     /// never ack'd (crash, network outage) re-delivers the same events; only
     /// ack makes them gone.

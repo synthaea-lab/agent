@@ -267,6 +267,9 @@ impl DetectionDrain for CountingDetectionDrain {
         self.records.clear();
         Ok(())
     }
+    fn ack_dropping(&mut self, _dropped: u64) -> std::io::Result<()> {
+        self.ack()
+    }
     fn skip(&mut self) -> std::io::Result<()> {
         self.skipped.fetch_add(1, Ordering::SeqCst);
         self.records.clear();
@@ -385,25 +388,49 @@ const KEY_B: &str = "b9628fc1-2134-4d4d-bbe6-83fdd1929d7b";
 const KEY_C: &str = "b9628fc1-2134-4d4d-bbe6-83fdd1929d7c";
 
 /// A server that answers the given statuses in order, one connection each, and returns the
-/// request headers it saw.
+/// request headers it saw. A `400` carries the detection route's `Invalid payload` (a refusal
+/// of that record); other errors a generic reason.
 fn sequence_server(statuses: Vec<u16>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    sequence_server_with(
+        statuses
+            .into_iter()
+            .map(|status| {
+                let body = match status {
+                    200 => r#"{"status":"accepted"}"#,
+                    400 => r#"{"error":"Invalid payload"}"#,
+                    409 => r#"{"error":"Idempotency key reused for a different detection"}"#,
+                    _ => r#"{"error":"refused"}"#,
+                };
+                (status, body)
+            })
+            .collect(),
+    )
+}
+
+/// The same with the body of each answer chosen by the test.
+fn sequence_server_with(
+    responses: Vec<(u16, &'static str)>,
+) -> (String, std::thread::JoinHandle<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = std::thread::spawn(move || {
         let mut seen = Vec::new();
-        for status in statuses {
+        for (status, body) in responses {
             let (mut stream, _) = listener.accept().unwrap();
             seen.push(read_request(&mut stream).to_ascii_lowercase());
-            let body = if status == 200 {
-                r#"{"status":"accepted"}"#
-            } else {
-                r#"{"error":"refused"}"#
-            };
             write_response(&mut stream, status, body);
         }
         seen
     });
     (url, server)
+}
+
+fn content_length(headers: &str) -> usize {
+    headers
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap()
 }
 
 #[test]
@@ -443,10 +470,15 @@ fn a_record_the_server_refuses_for_good_does_not_stop_the_others_of_its_segment(
 }
 
 #[test]
-fn a_record_over_the_server_body_limit_is_dropped_without_being_sent_and_the_others_upload() {
-    let (url, server) = sequence_server(vec![200, 200]);
+fn a_record_over_the_server_body_limit_is_shortened_and_sent_not_dropped() {
+    // A process padded its own argv: the detection is megabytes. It must reach the server, cut
+    // down, with its key and its title; erasing it on the host would let the process do that.
+    let (url, server) = sequence_server(vec![200, 200, 200]);
     let mut huge = detection();
-    huge.title = "x".repeat(transport::MAX_DETECTION_BODY_BYTES + 1);
+    huge.events = vec![Event::Exec(ExecEvent {
+        cmdline: "A".repeat(transport::MAX_DETECTION_BODY_BYTES + 1),
+        ..schema::fixtures::exec()
+    })];
     let (mut uploader, (acked, skipped, dropped)) = recording_uploader(
         &url,
         vec![
@@ -455,15 +487,47 @@ fn a_record_over_the_server_body_limit_is_dropped_without_being_sent_and_the_oth
             queued(KEY_C, detection()),
         ],
     );
-    assert_eq!(uploader.upload_once().unwrap(), 2);
+    assert_eq!(uploader.upload_once().unwrap(), 3, "all three were sent");
     assert_eq!(acked.load(Ordering::SeqCst), 1);
     assert_eq!(skipped.load(Ordering::SeqCst), 0);
-    assert_eq!(dropped.load(Ordering::SeqCst), 1);
-    // Only the two normal records reached the server: the oversized one never left the agent.
+    assert_eq!(dropped.load(Ordering::SeqCst), 0, "nothing was dropped");
     let seen = server.join().unwrap();
-    assert_eq!(seen.len(), 2);
-    assert!(seen[0].contains(&format!("idempotency-key: {KEY_A}")));
-    assert!(seen[1].contains(&format!("idempotency-key: {KEY_C}")));
+    assert!(seen[1].contains(&format!("idempotency-key: {KEY_B}")));
+    assert!(
+        content_length(&seen[1]) <= transport::MAX_DETECTION_BODY_BYTES,
+        "shortened to fit: {}",
+        content_length(&seen[1])
+    );
+}
+
+#[test]
+fn shortening_keeps_the_title_techniques_and_source_and_says_how_much_was_cut() {
+    let mut huge = detection();
+    huge.events = vec![Event::Exec(ExecEvent {
+        cmdline: "A".repeat(transport::MAX_DETECTION_BODY_BYTES + 1),
+        ..schema::fixtures::exec()
+    })];
+    let body = transport::fit_detection_to_limit(&huge).unwrap();
+    assert!(body.len() <= transport::MAX_DETECTION_BODY_BYTES);
+    let back: Detection = serde_json::from_slice(&body).expect("still a valid detection");
+    assert!(
+        back.title.starts_with("Unusual process chain"),
+        "{}",
+        back.title
+    );
+    assert!(back.title.contains("shortened from"), "{}", back.title);
+    assert_eq!(back.techniques, huge.techniques);
+    assert_eq!(back.severity, huge.severity);
+    assert_eq!(back.source, huge.source);
+    assert_eq!(back.events.len(), 1);
+    // The same detection always gives the same bytes: a retry sends what the first try did.
+    assert_eq!(body, transport::fit_detection_to_limit(&huge).unwrap());
+    // A detection that fits is untouched.
+    let small = detection();
+    assert_eq!(
+        transport::fit_detection_to_limit(&small).unwrap(),
+        serde_json::to_vec(&small).unwrap()
+    );
 }
 
 #[test]
@@ -514,6 +578,77 @@ fn a_rejection_that_is_not_about_one_record_still_skips_the_whole_segment() {
     assert_eq!(acked.load(Ordering::SeqCst), 0);
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
     server.join().unwrap();
+}
+
+#[test]
+fn a_409_idempotency_conflict_is_about_one_record_and_does_not_skip_the_segment() {
+    let (url, server) = sequence_server(vec![409, 200]);
+    let (mut uploader, (acked, skipped, dropped)) = recording_uploader(
+        &url,
+        vec![queued(KEY_A, detection()), queued(KEY_B, detection())],
+    );
+    assert_eq!(uploader.upload_once().unwrap(), 1);
+    assert_eq!(acked.load(Ordering::SeqCst), 1);
+    assert_eq!(skipped.load(Ordering::SeqCst), 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    server.join().unwrap();
+}
+
+#[test]
+fn a_422_is_about_one_record() {
+    let (url, server) = sequence_server(vec![422, 200]);
+    let (mut uploader, (acked, skipped, dropped)) = recording_uploader(
+        &url,
+        vec![queued(KEY_A, detection()), queued(KEY_B, detection())],
+    );
+    assert_eq!(uploader.upload_once().unwrap(), 1);
+    assert_eq!(
+        (acked.load(Ordering::SeqCst), skipped.load(Ordering::SeqCst)),
+        (1, 0)
+    );
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    server.join().unwrap();
+}
+
+#[test]
+fn a_400_about_the_agents_certificate_is_not_about_the_record() {
+    // `400 Invalid certificate subject` (route.ts) and a proxy's HTML 400 for a client
+    // certificate that does not verify describe the whole agent: the whole-segment rule stays,
+    // and the records are not blamed one by one.
+    for body in [
+        r#"{"error":"Invalid certificate subject"}"#,
+        "<html><body>400 The SSL certificate error</body></html>",
+    ] {
+        let (url, server) = sequence_server_with(vec![(400, body)]);
+        let (mut uploader, (acked, skipped, dropped)) = recording_uploader(
+            &url,
+            vec![queued(KEY_A, detection()), queued(KEY_B, detection())],
+        );
+        let err = uploader.upload_once().unwrap_err();
+        assert!(!err.is_retryable(), "{body}");
+        assert_eq!(skipped.load(Ordering::SeqCst), 1, "{body}");
+        assert_eq!(acked.load(Ordering::SeqCst), 0, "{body}");
+        assert_eq!(dropped.load(Ordering::SeqCst), 0, "{body}");
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn a_refused_record_is_posted_once_per_pass_and_once_more_on_the_retry_only() {
+    // Pass one: A refused (400 Invalid payload), B hits a 500. Pass two re-posts A once and B.
+    let (url, server) = sequence_server(vec![400, 500, 400, 200]);
+    let (mut uploader, _) = recording_uploader(
+        &url,
+        vec![queued(KEY_A, detection()), queued(KEY_B, detection())],
+    );
+    assert!(uploader.upload_once().is_err());
+    assert_eq!(uploader.upload_once().unwrap(), 1);
+    let seen = server.join().unwrap();
+    let posts_of_a = seen
+        .iter()
+        .filter(|h| h.contains(&format!("idempotency-key: {KEY_A}")))
+        .count();
+    assert_eq!(posts_of_a, 2, "once per pass, never twice in one pass");
 }
 
 #[test]

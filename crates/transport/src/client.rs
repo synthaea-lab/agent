@@ -65,8 +65,42 @@ impl TransportClient {
     ///
     /// Returns an error if the server rejects the detection or cannot be reached.
     pub fn upload_detection_with_key(&self, detection: &Detection, key: &str) -> Result<()> {
-        let response: DetectionUploadResponse =
-            self.post_json_with_key(&self.config.detection_url(), detection, Some(key))?;
+        let body = serde_json::to_vec(detection).map_err(TransportError::Serialization)?;
+        self.upload_detection_bytes(&body, key)
+    }
+
+    /// Uploads a detection already serialized (so the caller serializes once and can bound the
+    /// size first), with its idempotency key. Unlike the other POSTs, an error status keeps the
+    /// server's explanation (`error` in the JSON body): the uploader tells a refusal of this
+    /// record (`400 Invalid payload`) from one about the whole agent (`400 Invalid certificate
+    /// subject`, or a proxy's HTML `400` for a client certificate that does not verify).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the detection or cannot be reached.
+    pub fn upload_detection_bytes(&self, body: &[u8], key: &str) -> Result<()> {
+        let response = self
+            .agent
+            .post(&self.config.detection_url())
+            .content_type("application/json")
+            .header("Idempotency-Key", key)
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .send(body)
+            .map_err(|e| TransportError::Network(e.to_string()))?;
+        let status = response.status().as_u16();
+        if status >= 400 {
+            let text = read_error_body(response.into_body().into_reader());
+            return Err(server_error(
+                status,
+                error_reason(&text).unwrap_or_else(|| format!("http status: {status}")),
+            ));
+        }
+        let response: DetectionUploadResponse = response
+            .into_body()
+            .read_json()
+            .map_err(|e| TransportError::InvalidResponse(e.to_string()))?;
         validate_detection_response(response)
     }
 
