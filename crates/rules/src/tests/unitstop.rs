@@ -15,6 +15,8 @@ const T0: u64 = 10_000 * SEC;
 fn stopped(unit: &str, at: u64) -> schema::FileOpenEvent {
     let mut event = file_open_event_full(0, unit, unit, schema::FLAG_UNIT_STOPPED, at);
     event.meta.ppid = 0;
+    // The journal sensor reports a unit stop as the manager, pid 1.
+    event.meta.pid = 1;
     event
 }
 
@@ -343,6 +345,13 @@ fn a_command_that_does_not_shut_the_host_down_is_not_a_shutdown() {
         "poweroff -w",
         "halt -w",
         "halt -fw",
+        "reboot --help",
+        "reboot --bogus-option",
+        "halt --version",
+        "systemctl --dry-run reboot",
+        "systemctl reboot --help",
+        "systemctl --version reboot",
+        "shutdown --help now",
         "shutdown -c",
         "shutdown --cancel",
         "shutdown --no-wall",
@@ -375,10 +384,47 @@ fn reboot_options_that_still_shut_down_explain_a_stop() {
         "reboot -f",
         "reboot --no-wtmp",
         "halt --force",
+        "reboot -n",
+        "reboot -fn",
+        "poweroff -p",
+        "reboot --no-wall",
     ] {
         assert!(
             judged("auditd.service", &[(command, T0 - 5 * SEC)]).is_empty(),
             "{command}"
+        );
+    }
+}
+
+/// The sensor reads argv at drain time; a process that already exited has none (#1118). The
+/// options are then unknown, so the command explains nothing (#1102 review 4).
+#[test]
+fn a_reboot_whose_argv_was_not_captured_explains_nothing() {
+    for image in ["/usr/sbin/reboot", "/usr/sbin/halt", "/usr/sbin/poweroff"] {
+        let mut event = exec(image.rsplit('/').next().unwrap(), T0 - 5 * SEC);
+        event.image_path = image.to_string();
+        event.argv.clear();
+        event.cmdline.clear();
+        let mut state = RuleState::new();
+        state.on_exec(&event);
+        state.on_file_open(&stopped("falco", T0));
+        state.on_exec(&exec("true", T0 + START_WITHIN_NS + SEC));
+        assert_eq!(state.take_due_unit_stops().len(), 1, "{image}");
+    }
+}
+
+/// `--help`, `--version` and `--dry-run` start nothing either.
+#[test]
+fn a_help_version_or_dry_run_invocation_explains_nothing() {
+    for command in [
+        "systemctl --help start auditd",
+        "systemctl start auditd --dry-run",
+        "systemctl --version restart auditd",
+        "deb-systemd-invoke --help start auditd",
+    ] {
+        assert_alerts_once(
+            &judged("auditd.service", &[(command, T0 + 5 * SEC)]),
+            "auditd",
         );
     }
 }
@@ -440,6 +486,18 @@ fn a_unit_that_is_not_listed_is_not_queued_or_judged() {
     ] {
         assert!(judged(unit, &[]).is_empty(), "{unit}");
     }
+}
+
+/// The flag is a raw `openat` bit any process can set on a path it names (#1102 review 4).
+#[test]
+fn an_open_carrying_the_unit_stopped_bit_from_a_process_is_not_a_stop() {
+    let mut state = RuleState::new();
+    let mut event = stopped("falco", T0);
+    event.meta.pid = 4242;
+    event.meta.comm = "python3".to_string();
+    state.on_file_open(&event);
+    state.on_exec(&exec("true", T0 + START_WITHIN_NS + SEC));
+    assert!(state.take_due_unit_stops().is_empty());
 }
 
 #[test]

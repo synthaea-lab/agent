@@ -2,7 +2,8 @@
 //! for.
 //!
 //! The journal sensor reports a stop of a unit of [`SECURITY_SERVICES`] as a `FileOpenEvent`
-//! carrying [`schema::FLAG_UNIT_STOPPED`]. The journal names no actor, so this rule asks the
+//! carrying [`schema::FLAG_UNIT_STOPPED`], from pid 1 only (the flag is also an `openat` bit any
+//! process can set, so the pid is the check). The journal names no actor, so this rule asks the
 //! other question: was the stop **explained**? `check_security_tool_stop` already alerts on a
 //! `systemctl stop falco`; what it cannot see is a stop over D-Bus, from a script's API call, or
 //! after the service was killed, and those are what is left once the explained stops are set
@@ -42,6 +43,9 @@ use crate::{
     recon::{args, program},
     servicestop::services_stopped,
 };
+
+/// The pid the journal sensor gives a unit stop it reports: the manager's.
+const JOURNAL_STOP_PID: u32 = 1;
 
 /// How long after a stop the unit may start again for the stop to count as a restart. A
 /// `systemctl restart` is back in seconds, but a package upgrade stops the service in its
@@ -137,7 +141,14 @@ impl UnitStops {
     /// A file-open event: a unit stop is queued, to be judged by [`Self::take_due`].
     pub(crate) fn on_file_open(&mut self, event: &FileOpenEvent) {
         self.clock_ns = self.clock_ns.max(event.meta.timestamp_ns);
-        if event.flags & schema::FLAG_UNIT_STOPPED == 0 || listed_unit(&event.path).is_none() {
+        // Only the journal sensor builds a unit stop, and it does so as pid 1 (`to_unit_stop_event`).
+        // The flag is also a bit of `openat`'s `flags` that any process can set on a file it
+        // names, so a flagged open from any other pid is a forgery, not a stop (#1102 review).
+        // Stopgap until #1127 gives the stop its own event.
+        if event.meta.pid != JOURNAL_STOP_PID
+            || event.flags & schema::FLAG_UNIT_STOPPED == 0
+            || listed_unit(&event.path).is_none()
+        {
             return;
         }
         if self.pending.len() >= PENDING_CAP
@@ -270,9 +281,16 @@ fn targets_another_manager(args: &[String]) -> bool {
     })
 }
 
+/// Whether the arguments only print or check something: `--help`, `--version`, `--dry-run`. Such
+/// a call starts nothing and shuts nothing down, so it explains no stop.
+fn does_nothing(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| matches!(a.as_str(), "--help" | "--version" | "--dry-run"))
+}
+
 /// `systemctl start|restart|try-restart|reload-or-restart a b`, `systemctl enable --now a`.
 fn systemctl_starts(args: &[String]) -> Vec<(Touch, String)> {
-    if targets_another_manager(args) {
+    if targets_another_manager(args) || does_nothing(args) {
         return Vec::new();
     }
     let mut positional = args.iter().filter(|a| !a.starts_with('-'));
@@ -301,7 +319,7 @@ fn init_script_starts(args: &[String]) -> Vec<(Touch, String)> {
 
 /// `deb-systemd-invoke [--user] start|restart a b` (Debian maintainer scripts).
 fn deb_systemd_invoke_starts(args: &[String]) -> Vec<(Touch, String)> {
-    if targets_another_manager(args) {
+    if targets_another_manager(args) || does_nothing(args) {
         return Vec::new();
     }
     let mut positional = args.iter().filter(|a| !a.starts_with('-'));
@@ -309,6 +327,21 @@ fn deb_systemd_invoke_starts(args: &[String]) -> Vec<(Touch, String)> {
         return Vec::new();
     };
     positional.map(|unit| (touch, unit.clone())).collect()
+}
+
+/// Whether a `reboot`/`poweroff`/`halt` option still brings the host down. An allowlist: an
+/// option not listed (`-w`, `--help`, `--version`, a typo) gives no window. Short options may be
+/// clustered (`-fn`); long ones must be spelled out.
+fn shuts_down_option(arg: &str) -> bool {
+    match arg.strip_prefix("--") {
+        Some(long) => matches!(
+            long,
+            "force" | "no-wtmp" | "no-sync" | "no-wall" | "poweroff" | "reboot" | "halt"
+        ),
+        None => arg
+            .strip_prefix('-')
+            .is_some_and(|short| !short.is_empty() && short.chars().all(|c| "fdnp".contains(c))),
+    }
 }
 
 /// What an exec does to the host's shutdown state.
@@ -323,7 +356,7 @@ enum Shutdown {
 /// Whether this exec tells the host to shut down or reboot **now** (`Now`), or cancels one
 /// (`Cancel`). `shutdown` counts only with an immediate time (`now`, `+0`): `+N` and `HH:MM`
 /// schedule a shutdown that stops nothing yet, and a bare `shutdown` is `+1` for systemd. `-k`
-/// only warns. `reboot`, `poweroff`, `halt` (not with `-w`/`--wtmp-only`), `systemctl reboot|poweroff|halt|kexec` and
+/// only warns. `reboot`, `poweroff`, `halt` (only with argv captured and every option one that still shuts down, see [`shuts_down_option`]), `systemctl reboot|poweroff|halt|kexec` and
 /// `init`/`telinit 0|6` are immediate, unless `systemctl` is given `--when=` (a schedule, or
 /// `--when=cancel`).
 fn shutdown_effect(event: &ExecEvent) -> Option<Shutdown> {
@@ -331,15 +364,21 @@ fn shutdown_effect(event: &ExecEvent) -> Option<Shutdown> {
     let args = args(event);
     match program.as_str() {
         "reboot" | "poweroff" | "halt" => {
-            // `-w`/`--wtmp-only` only writes the wtmp record and brings nothing down (-d and -f
-            // still do). Long options may be abbreviated.
-            let wtmp_only = args.iter().any(|a| match a.strip_prefix("--") {
-                Some(long) => !long.is_empty() && "wtmp-only".starts_with(long),
-                None => a.starts_with('-') && a.contains('w'),
-            });
-            (!wtmp_only).then_some(Shutdown::Now)
+            // Fail towards an alert: with no argv captured (the usual case for a short-lived
+            // process, #1118) the options are unknown, so `reboot -w` or `reboot --help` cannot
+            // be told from a real one. Count the command only when its options are all ones that
+            // still bring the host down; anything else (`-w`, `--help`, a bad option) does not.
+            if event.argv.is_empty() && event.cmdline.trim().is_empty() {
+                return None;
+            }
+            args.iter()
+                .all(|a| shuts_down_option(a))
+                .then_some(Shutdown::Now)
         }
         "shutdown" => {
+            if does_nothing(&args) {
+                return None;
+            }
             let short = |flag: char| {
                 args.iter()
                     .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains(flag))
@@ -355,7 +394,7 @@ fn shutdown_effect(event: &ExecEvent) -> Option<Shutdown> {
             (time == "now" || time == "+0").then_some(Shutdown::Now)
         }
         "systemctl" => {
-            if targets_another_manager(&args) {
+            if targets_another_manager(&args) || does_nothing(&args) {
                 return None;
             }
             let verb = args.iter().find(|a| !a.starts_with('-'))?;
