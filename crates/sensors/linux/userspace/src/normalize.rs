@@ -204,6 +204,39 @@ pub fn exec(
     })
 }
 
+/// The bits a Linux `open(2)` flag word can carry. Every `O_*` flag of the kernel's
+/// `VALID_OPEN_FLAGS` sits below `0x0080_0000` (the highest, `__O_TMPFILE`, is `0x0040_0000` in
+/// asm-generic `fcntl.h`, which `x86_64` and `aarch64` use). `open` and `openat` ignore any other bit
+/// without an error, and the probe records the argument as passed, so a process could set the
+/// synthetic `schema::FLAG_*` bits that other sources use to mark a persistence or tamper fact on
+/// a `FileOpenEvent`, and raise those alerts at will: measured from uid 1000, `0x4000_0000` raised
+/// T1543.002 and `0x1000_0000` T1543.003 (#1129).
+const OPEN_FLAGS_MASK: u32 = 0x007F_FFFF;
+
+// Every synthetic flag is outside the mask, so no open can carry one. A new `FLAG_*` must be
+// added here too.
+const _: () = {
+    let synthetic = [
+        schema::FLAG_PERSISTENCE_ARTIFACT,
+        schema::FLAG_PERSISTENCE_TASK_ARTIFACT,
+        schema::FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
+        schema::FLAG_PERSISTENCE_ACCOUNT_ARTIFACT,
+        schema::FLAG_PERSISTENCE_SYSTEMD_ARTIFACT,
+        schema::FLAG_PERSISTENCE_BTM_ARTIFACT,
+        schema::FLAG_APPLICATION_BLOCKED,
+        schema::FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT,
+        schema::FLAG_UNIT_STOPPED,
+    ];
+    let mut i = 0;
+    while i < synthetic.len() {
+        assert!(
+            synthetic[i] & OPEN_FLAGS_MASK == 0,
+            "a synthetic FLAG_* bit is inside the open(2) flag mask"
+        );
+        i += 1;
+    }
+};
+
 #[must_use]
 pub fn file_open(
     event: &wire::FileOpenEvent,
@@ -215,9 +248,7 @@ pub fn file_open(
     Event::FileOpen(FileOpenEvent {
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
         path: String::from_utf8_lossy(&raw[..end]).into_owned(),
-        // The kernel ignores unknown open(2) flag bits, so a local user can set any of them,
-        // including the synthetic FLAG_* bits that userspace sensors use as signals (#1129).
-        flags: event.flags & schema::VALID_OPEN_FLAGS,
+        flags: event.flags & OPEN_FLAGS_MASK,
     })
 }
 
@@ -1041,38 +1072,42 @@ mod tests {
         assert_eq!(e.meta.comm, "touch");
     }
 
-    fn probe_open(flags: u32) -> schema::FileOpenEvent {
-        let mut path = [0u8; wire::MAX_PATH_LEN];
-        let raw = b"/etc/hostname\0";
-        path[..raw.len()].copy_from_slice(raw);
-        let event = wire::FileOpenEvent {
-            meta: wire_meta(b"forge"),
-            path,
-            path_len: raw.len() as u16,
-            flags,
-        };
-        let Event::FileOpen(e) = file_open(&event, 0, None) else {
-            panic!("wrong variant")
-        };
-        e
-    }
-
+    /// #1129: `openat(.., 0x4000_0000 | O_RDONLY)` succeeds and the probe records the bit, so
+    /// an unprivileged process raised T1543.002 with a path of its choosing. The synthetic bits
+    /// are cleared; every real `open(2)` flag, `O_TMPFILE` included, is kept.
     #[test]
-    fn probe_open_never_carries_a_synthetic_flag() {
-        for flag in schema::SYNTHETIC_FLAGS {
-            let e = probe_open(flag | 0o101);
-            assert_eq!(e.flags & flag, 0, "{flag:#x} survived");
-            assert_eq!(e.flags, 0o101, "real flags must survive");
+    fn an_open_cannot_carry_a_synthetic_flag() {
+        let open = |flags: u32| {
+            let mut path = [0u8; wire::MAX_PATH_LEN];
+            path[..11].copy_from_slice(b"/etc/passwd");
+            let event = wire::FileOpenEvent {
+                meta: wire_meta(b"forge"),
+                path,
+                path_len: 11,
+                flags,
+            };
+            let Event::FileOpen(e) = file_open(&event, 0, None) else {
+                panic!("wrong variant")
+            };
+            e.flags
+        };
+        for synthetic in [
+            schema::FLAG_PERSISTENCE_ARTIFACT,
+            schema::FLAG_PERSISTENCE_TASK_ARTIFACT,
+            schema::FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
+            schema::FLAG_PERSISTENCE_ACCOUNT_ARTIFACT,
+            schema::FLAG_PERSISTENCE_SYSTEMD_ARTIFACT,
+            schema::FLAG_PERSISTENCE_BTM_ARTIFACT,
+            schema::FLAG_APPLICATION_BLOCKED,
+            schema::FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT,
+            schema::FLAG_UNIT_STOPPED,
+        ] {
+            assert_eq!(open(synthetic | 0o2), 0o2, "{synthetic:#010x}");
         }
-        let all = schema::SYNTHETIC_FLAGS.iter().fold(0, |a, f| a | f);
-        assert_eq!(probe_open(all | schema::O_WRONLY).flags, schema::O_WRONLY);
-    }
-
-    #[test]
-    fn probe_open_keeps_every_real_open_flag() {
-        // O_PATH, O_TMPFILE, O_CLOEXEC, O_DIRECTORY, O_NOFOLLOW, O_LARGEFILE (x86_64).
-        let real = 0x20_0000 | 0x41_0000 | 0x8_0000 | 0x1_0000 | 0x2_0000 | 0x8000 | 0o2002;
-        assert_eq!(probe_open(real).flags, real);
+        assert_eq!(open(u32::MAX), OPEN_FLAGS_MASK);
+        // O_TMPFILE | O_RDWR (with O_DIRECTORY) and O_PATH | O_CLOEXEC stay whole.
+        assert_eq!(open(0x0041_0002), 0x0041_0002);
+        assert_eq!(open(0x0020_0000 | 0o2_000_000), 0x0020_0000 | 0o2_000_000);
     }
 
     #[test]
