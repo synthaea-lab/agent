@@ -526,7 +526,7 @@ pub const SECURITY_SERVICES: &[&str] = &[
 /// consumer's test: the first cut of [`FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT`]
 /// took `0x0200_0000`, already [`FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN`], and the
 /// hardcoded list in `rules`' collision test missed it (#399 review).
-const SYNTHETIC_FLAGS: [u32; 9] = [
+pub const SYNTHETIC_FLAGS: [u32; 9] = [
     FLAG_PERSISTENCE_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
@@ -550,6 +550,10 @@ const _: () = {
             );
             j += 1;
         }
+        assert!(
+            SYNTHETIC_FLAGS[i] & VALID_OPEN_FLAGS == 0,
+            "a synthetic FLAG_* bit overlaps VALID_OPEN_FLAGS"
+        );
         i += 1;
     }
 };
@@ -774,6 +778,14 @@ pub const O_RDWR: u32 = 0o2;
 /// `open(2)` create-if-absent flag.
 pub const O_CREAT: u32 = 0o100;
 
+/// Every bit the kernel's `open(2)`/`openat(2)` flags can really use on Linux (`O_PATH` is
+/// `0x0020_0000`, `O_TMPFILE` `0x0041_0000`, nothing real above `0x0020_0000`; the lowest synthetic bit is `0x0080_0000`).
+/// The kernel silently ignores any other bit on `open`/`openat`, so an unprivileged process
+/// can set one at will. `sensor-linux`'s `normalize::file_open` masks the probe's raw flags
+/// with this, so a `FileOpenEvent` from the probe never carries a synthetic `FLAG_*` bit
+/// (#1129). A compile-time assert below keeps it disjoint from every synthetic flag.
+pub const VALID_OPEN_FLAGS: u32 = 0x007F_FFFF;
+
 /// Write intent on [`FileOpenEvent::flags`]: a write access mode, or creation
 /// (`O_CREAT` — creating a file is write intent even with `O_RDONLY`).
 ///
@@ -807,6 +819,11 @@ pub struct FileOpenEvent {
     /// Platform-native open/access flags (Linux `open(2)` flags, Windows create
     /// dispositions). Rules match primarily on `path`; flag interpretation is
     /// per-platform and documented by each sensor.
+    ///
+    /// The synthetic `FLAG_*` bits (see `SYNTHETIC_FLAGS`) are set only by userspace sensors
+    /// that build the event themselves. On Linux the probe's raw `open(2)` flags are masked
+    /// with [`VALID_OPEN_FLAGS`] before they get here, because the kernel ignores unknown
+    /// bits and any local user could otherwise forge a synthetic bit (#1129).
     pub flags: u32,
 }
 

@@ -2617,6 +2617,7 @@ dependencies = [
  "aya-build",
  "aya-log",
  "libc",
+ "rules",
  "schema",
  "sensor-linux-wire",
  "serde",
@@ -2650,6 +2651,7 @@ dependencies = [
 name = "sensor-linux-journal"
 version = "0.1.0"
 dependencies = [
+ "rules",
  "schema",
  "serde",
  "serde_json",

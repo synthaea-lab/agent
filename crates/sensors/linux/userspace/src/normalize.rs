@@ -215,7 +215,9 @@ pub fn file_open(
     Event::FileOpen(FileOpenEvent {
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
         path: String::from_utf8_lossy(&raw[..end]).into_owned(),
-        flags: event.flags,
+        // The kernel ignores unknown open(2) flag bits, so a local user can set any of them,
+        // including the synthetic FLAG_* bits that userspace sensors use as signals (#1129).
+        flags: event.flags & schema::VALID_OPEN_FLAGS,
     })
 }
 
@@ -1037,6 +1039,55 @@ mod tests {
         assert_eq!(e.path, "/etc/cron.d/job");
         assert_eq!(e.flags, 0o101);
         assert_eq!(e.meta.comm, "touch");
+    }
+
+    fn probe_open(flags: u32) -> schema::FileOpenEvent {
+        let mut path = [0u8; wire::MAX_PATH_LEN];
+        let raw = b"/etc/hostname\0";
+        path[..raw.len()].copy_from_slice(raw);
+        let event = wire::FileOpenEvent {
+            meta: wire_meta(b"forge"),
+            path,
+            path_len: raw.len() as u16,
+            flags,
+        };
+        let Event::FileOpen(e) = file_open(&event, 0, None) else {
+            panic!("wrong variant")
+        };
+        e
+    }
+
+    #[test]
+    fn probe_open_never_carries_a_synthetic_flag() {
+        for flag in schema::SYNTHETIC_FLAGS {
+            let e = probe_open(flag | 0o101);
+            assert_eq!(e.flags & flag, 0, "{flag:#x} survived");
+            assert_eq!(e.flags, 0o101, "real flags must survive");
+        }
+        let all = schema::SYNTHETIC_FLAGS.iter().fold(0, |a, f| a | f);
+        assert_eq!(probe_open(all | schema::O_WRONLY).flags, schema::O_WRONLY);
+    }
+
+    #[test]
+    fn probe_open_with_a_synthetic_bit_raises_no_alert() {
+        for flag in schema::SYNTHETIC_FLAGS {
+            for path in ["/etc/hostname", "/tmp/forge-persist"] {
+                let mut e = probe_open(flag | schema::O_RDWR);
+                e.path = path.into();
+                let alerts = rules::evaluate_file_open(&e);
+                assert!(
+                    alerts.is_empty(),
+                    "forged {flag:#x} on {path} raised {alerts:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn probe_open_keeps_every_real_open_flag() {
+        // O_PATH, O_TMPFILE, O_CLOEXEC, O_DIRECTORY, O_NOFOLLOW, O_LARGEFILE (x86_64).
+        let real = 0x20_0000 | 0x41_0000 | 0x8_0000 | 0x1_0000 | 0x2_0000 | 0x8000 | 0o2002;
+        assert_eq!(probe_open(real).flags, real);
     }
 
     #[test]

@@ -113,6 +113,25 @@ mod tests {
     }
 
     #[test]
+    fn the_sensors_own_synthetic_flag_still_raises_the_alert() {
+        // The probe path masks synthetic bits (#1129); this userspace sensor sets its own,
+        // and it must keep reaching the rule.
+        let record = record_with(&[]);
+        let event = JournalEvent::UnitStarted {
+            unit: Some("sshd.service".into()),
+        };
+        let mut tracker = UnitPersistenceTracker::new();
+        let Some(Event::FileOpen(file_open)) = tracker.observe(&record, &event) else {
+            panic!("first start of a unit must be reported");
+        };
+        let alerts = rules::evaluate_file_open(&file_open);
+        assert!(
+            alerts.iter().any(|a| a.technique == "T1543.002"),
+            "{alerts:?}"
+        );
+    }
+
+    #[test]
     fn second_start_of_the_same_unit_is_not_reported_again() {
         let record = record_with(&[]);
         let event = JournalEvent::UnitStarted {

@@ -32,6 +32,7 @@ tokio = { version = "1", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+rules = { path = "../../../rules" }
 schema = { path = "../../../schema", features = ["test-fixtures"] }
 
 [build-dependencies]
