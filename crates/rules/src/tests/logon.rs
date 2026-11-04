@@ -354,6 +354,32 @@ fn a_localized_service_account_is_generic_by_its_sid() {
     assert!(alerts.iter().all(|a| a.technique != "T1078"), "{alerts:?}");
 }
 
+/// The built-in Administrator is generic under its English name; on a French Windows it is
+/// `Administrateur`, which only its SID (relative id 500) identifies. It must not alert where
+/// `Administrator` does not: at night nor as a first-seen account.
+#[test]
+fn a_localized_builtin_administrator_is_generic_by_its_sid() {
+    const ADMIN_SID: &str = "S-1-5-21-1004336348-1177238915-682003330-500";
+    let admin = |sid: Option<&str>, ts: u64| AuthEvent {
+        target_user_sid: sid.map(str::to_string),
+        ..logon("PC-01\\Administrateur", ts)
+    };
+    let mut state = utc_plus_two();
+    let alerts = state.on_auth(&admin(Some(ADMIN_SID), MIDNIGHT_UTC + 22 * HOUR));
+    assert!(alerts.iter().all(|a| a.technique != "T1078"), "{alerts:?}");
+    // Without the SID the localized name is an ordinary account.
+    let mut state = utc_plus_two();
+    let alerts = state.on_auth(&admin(None, MIDNIGHT_UTC + 22 * HOUR));
+    assert_eq!(
+        alerts.iter().filter(|a| a.technique == "T1078").count(),
+        1,
+        "{alerts:?}"
+    );
+    let (mut state, later) = after_the_window();
+    let alerts = state.on_auth(&admin(Some(ADMIN_SID), later));
+    assert!(alerts.iter().all(|a| a.technique != "T1078"), "{alerts:?}");
+}
+
 #[test]
 fn generic_accounts_never_alert_at_night() {
     let mut state = utc_plus_two();
