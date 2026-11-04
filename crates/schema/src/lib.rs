@@ -335,7 +335,8 @@ pub mod time;
 /// image that ran from whatever the path contains when it is later verified.
 ///
 /// Bumped 59 → 60 for [`SignalEvent::target_unit`] (#1103): the systemd unit of the signalled
-/// process, so an alert on a signal to a security tool names the tool and not only an image path.
+/// process, so an alert on a signal to a security tool names the tool and not only an image path;
+/// and for [`SignalEvent::signals_lost`], the report of signals the sensor had no room for.
 pub const SCHEMA_VERSION: u32 = 60;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
@@ -485,13 +486,6 @@ pub const FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT: u32 = 0x0080_0000;
 /// Linux, and the bits below `0x0100_0000` are real ones (`0x0020_0000` is `O_PATH`).
 pub const FLAG_UNIT_STOPPED: u32 = 0x8000_0000;
 
-/// Signals to security tools were lost because the sensor's signal ring buffer was full (Linux,
-/// `signal_generate`, #1103, T1562.001): a `FileOpenEvent` whose `path` says how many were lost
-/// since the last report. A flood of lethal signals ahead of a kill is how a tool is ended
-/// unseen, so the loss is itself a finding. Same reasoning for the bit as [`FLAG_UNIT_STOPPED`]:
-/// a synthetic flag on an event that also carries `open(2)` flags, and `0x0040_0000` is not one.
-pub const FLAG_SIGNAL_EVENTS_LOST: u32 = 0x0040_0000;
-
 /// Services of security tooling, lowercase, compared without a `.service` suffix. Product
 /// names are as the vendors' documentation gives them and were **not checked on a host**: a
 /// name that is wrong costs a missed stop, never a false alert. `auditd` is here although
@@ -536,7 +530,7 @@ pub const SECURITY_SERVICES: &[&str] = &[
 /// consumer's test: the first cut of [`FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT`]
 /// took `0x0200_0000`, already [`FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN`], and the
 /// hardcoded list in `rules`' collision test missed it (#399 review).
-const SYNTHETIC_FLAGS: [u32; 10] = [
+const SYNTHETIC_FLAGS: [u32; 9] = [
     FLAG_PERSISTENCE_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
@@ -546,7 +540,6 @@ const SYNTHETIC_FLAGS: [u32; 10] = [
     FLAG_APPLICATION_BLOCKED,
     FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT,
     FLAG_UNIT_STOPPED,
-    FLAG_SIGNAL_EVENTS_LOST,
 ];
 
 const _: () = {
@@ -2235,6 +2228,20 @@ pub struct SignalEvent {
     /// and not dropped. Absent (false) elsewhere and in an older event.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sender_unreliable: bool,
+    /// Not a signal: the sensor's report that this many signals to security tools were lost
+    /// because the signal ring buffer was full (Linux, #1103, T1562.001). A flood of lethal
+    /// signals ahead of a kill is how a tool is ended unseen, so the loss is itself a finding.
+    /// Non-zero only on that report, which carries `signal: 0` and `target_pid: 0`. It is a field
+    /// of its own, not a flag on a `FileOpenEvent`: that event's `flags` are the raw `open(2)`
+    /// flags on Linux (unknown bits pass through `openat`), so any bit there can be set by an
+    /// unprivileged open, as `O_TMPFILE` set the first cut's bit. A kernel signal event never
+    /// has this field. Absent (0) elsewhere and in an older event.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub signals_lost: u64,
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
 }
 
 /// macOS XPC connection — a process connected to an XPC service by name.

@@ -681,15 +681,18 @@ pub fn signal(
         target_image_path,
         target_unit,
         sender_unreliable: event.signal & wire::SIGNAL_SENDER_UNRELIABLE != 0,
+        signals_lost: 0,
     })
 }
 
 /// Signals to security tools the signal ring buffer had no room for, since the last report
-/// (`SIGNAL_TOOL_DROPS`, #1103): an event the rules turn into a finding, since a flood ahead of
-/// a kill is how a tool is ended unseen. `timestamp_ns` is wall-clock time.
+/// (`SIGNAL_TOOL_DROPS`, #1103): a `SignalEvent` with `signals_lost` set, which the rules turn into
+/// a finding, since a flood ahead of a kill is how a tool is ended unseen. It has no signal and no
+/// target (`signal` and `target_pid` are 0, which no kernel event has). `timestamp_ns` is
+/// wall-clock time.
 #[must_use]
 pub fn signals_lost(lost: u64, agent_pid: u32, timestamp_ns: u64) -> Event {
-    Event::FileOpen(schema::FileOpenEvent {
+    Event::Signal(SignalEvent {
         meta: schema::EventMeta {
             pid: agent_pid,
             ppid: 0,
@@ -700,8 +703,12 @@ pub fn signals_lost(lost: u64, agent_pid: u32, timestamp_ns: u64) -> Event {
             process_generation: None,
             parent_process_generation: None,
         },
-        path: format!("signal_generate: {lost} signals to security tools lost, ring buffer full"),
-        flags: schema::FLAG_SIGNAL_EVENTS_LOST,
+        signal: 0,
+        target_pid: 0,
+        target_image_path: None,
+        target_unit: None,
+        sender_unreliable: false,
+        signals_lost: lost,
     })
 }
 
@@ -1661,12 +1668,11 @@ mod tests {
     }
 
     #[test]
-    fn lost_signals_become_a_flagged_file_open_event_with_the_count() {
-        let Event::FileOpen(e) = signals_lost(40, 1234, 5) else {
+    fn lost_signals_become_a_signal_event_carrying_the_count() {
+        let Event::Signal(e) = signals_lost(40, 1234, 5) else {
             panic!("wrong variant")
         };
-        assert_eq!(e.flags, schema::FLAG_SIGNAL_EVENTS_LOST);
-        assert!(e.path.contains("40 signals"), "{}", e.path);
+        assert_eq!((e.signals_lost, e.signal, e.target_pid), (40, 0, 0));
         assert_eq!((e.meta.pid, e.meta.timestamp_ns), (1234, 5));
     }
 

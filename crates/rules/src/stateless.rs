@@ -745,7 +745,6 @@ pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
         .chain(check_systemd_service_persistence(event))
         .chain(check_btm_launch_item_persistence(event))
         .chain(check_alternate_data_stream_write(event))
-        .chain(check_signal_events_lost(event))
         .collect()
 }
 
@@ -1322,12 +1321,13 @@ const INIT_PID: u32 = 1;
 ///   A D-Bus stop has no exec: only the journal sees it.
 /// - Anyone else: High, as before, **for the agent itself**. For a listed security tool (the
 ///   event carries `target_unit`, Linux, #1103) the signal decides:
-///   - **`SIGHUP`**: a daemon that catches it takes it as "reload your configuration"
-///     (logrotate's `postrotate`, `ExecReload=`, `systemctl reload`), the commonest benign signal
-///     a tool gets. The Linux sensor drops it for such a tool (the process's `SigCgt` at scan
-///     time), so an event that reaches this rule is a `SIGHUP` to a tool with **no handler**,
-///     which ends it: Medium like the other catchable signals. The agent keeps `SIGHUP` as High,
-///     it does not reload on it.
+///   - **Caught reload signals**: a daemon that catches `SIGHUP`, `SIGUSR1`, `SIGUSR2` or a
+///     real-time signal takes it as "reload" or "reopen your logs" (logrotate's `postrotate`,
+///     `ExecReload=`, `systemctl reload`), the commonest benign signals a tool gets. The Linux
+///     sensor drops them in the kernel for such a tool (the process's `SigCgt` at scan time), so
+///     one that reaches this rule was sent to a tool with **no handler** for it, which ends it:
+///     Medium like the other catchable signals. The agent keeps `SIGHUP` as High, it does not
+///     reload on it.
 ///   - `SIGKILL` and `SIGSTOP`, which cannot be handled, are **High**.
 ///   - The catchable ones that end a daemon (`SIGTERM`, `SIGINT`, `SIGQUIT`, `SIGABRT`, and any
 ///     other signal whose default action terminates: `SIGUSR1`, `SIGPIPE`, `SIGALRM`, a
@@ -1346,6 +1346,10 @@ const INIT_PID: u32 = 1;
 /// restarted agent, so that alert arrives one restart late.
 #[must_use]
 pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Option<Alert> {
+    if event.signals_lost != 0 {
+        // The sensor's loss report, not a signal: `check_signal_events_lost`.
+        return None;
+    }
     let tool = event.target_unit.is_some();
     let name = signal_label(event.signal, tool)?;
     if event.meta.pid == event.target_pid {
@@ -1362,7 +1366,8 @@ pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Opti
         .as_deref()
         .map(|unit| format!(" of unit {unit}"))
         .unwrap_or_default();
-    let from_manager = event.meta.pid == INIT_PID;
+    // With an unreliable sender, `meta` may be a bystander that happens to be pid 1.
+    let from_manager = event.meta.pid == INIT_PID && !event.sender_unreliable;
     // `si_code` of interrupt or completion context (or forged): `meta` may be a bystander.
     let unreliable = if event.sender_unreliable {
         ": the sender is not reliable (the siginfo carries a code the kernel sets from interrupt \
@@ -1396,19 +1401,24 @@ pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Opti
 }
 
 /// T1562.001: signals to security tools were lost to a full ring buffer (Linux, #1103). A flood
-/// of lethal signals ahead of a kill is how a tool is ended unseen, so the loss is a finding
-/// by itself; the event's `path` carries the count.
+/// of signals ahead of a kill is how a tool is ended unseen, so the loss is a finding by itself.
+/// **High**, like the `SIGKILL` it can hide: what was lost may be the kill, and nothing after the
+/// fact says which signals they were (measured: 20,000 ignored `SIGPIPE` ahead of a `kill -9`
+/// left no `SIGKILL` event, only this report).
+///
+/// The count is `SignalEvent::signals_lost`, a field only the sensor's own report sets: not a bit
+/// of `FileOpenEvent::flags`, which an unprivileged `open(2)` can set (`O_TMPFILE` did).
 #[must_use]
-pub(crate) fn check_signal_events_lost(event: &FileOpenEvent) -> Option<Alert> {
-    if event.flags & schema::FLAG_SIGNAL_EVENTS_LOST == 0 {
+pub(crate) fn check_signal_events_lost(event: &schema::SignalEvent) -> Option<Alert> {
+    if event.signals_lost == 0 {
         return None;
     }
     Some(Alert {
         technique: "T1562.001",
-        severity: Severity::Medium,
+        severity: Severity::High,
         message: format!(
-            "{}: a flood of signals to a security tool, or one too busy to read them, can hide a kill",
-            event.path
+            "{} signals to security tools lost, signal ring buffer full: a flood of signals to a              security tool, or one too busy to read them, can hide a kill, and the lost signals              may include the SIGKILL, so this is High",
+            event.signals_lost
         ),
     })
 }
@@ -1416,7 +1426,10 @@ pub(crate) fn check_signal_events_lost(event: &FileOpenEvent) -> Option<Alert> {
 /// Evaluates all stateless rules applicable to a `SignalEvent`.
 #[must_use]
 pub fn evaluate_signal(event: &schema::SignalEvent) -> Vec<Alert> {
-    check_security_process_signal(event).into_iter().collect()
+    check_security_process_signal(event)
+        .into_iter()
+        .chain(check_signal_events_lost(event))
+        .collect()
 }
 
 /// Outbound ports [`check_service_unusual_outbound`] (T1071, issue #478)

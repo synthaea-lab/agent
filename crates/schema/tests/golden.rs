@@ -1794,6 +1794,7 @@ fn signal_golden() {
             target_image_path: Some("/usr/local/bin/synthaea-agent".into()),
             target_unit: None,
             sender_unreliable: false,
+            signals_lost: 0,
         }),
         "signal",
     );
@@ -1815,6 +1816,7 @@ fn signal_golden() {
             target_image_path: Some("/usr/sbin/auditd".into()),
             target_unit: Some("auditd".into()),
             sender_unreliable: false,
+            signals_lost: 0,
         }),
         "signal_unit",
     );
@@ -1836,8 +1838,35 @@ fn signal_golden() {
             target_image_path: Some("/usr/sbin/auditd".into()),
             target_unit: Some("auditd".into()),
             sender_unreliable: true,
+            signals_lost: 0,
         }),
         "signal_unreliable",
+    );
+}
+
+#[test]
+fn signal_events_lost_golden() {
+    // v60 (#1103): the sensor's report of signals it had no room for, no signal and no target.
+    assert_golden(
+        &Event::Signal(SignalEvent {
+            meta: EventMeta {
+                pid: 900,
+                ppid: 0,
+                user: User::Unknown,
+                timestamp_ns: 1_756_900_000_123_456_789,
+                comm: "signal_generate".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            signal: 0,
+            target_pid: 0,
+            target_image_path: None,
+            target_unit: None,
+            sender_unreliable: false,
+            signals_lost: 19_182,
+        }),
+        "signal_events_lost",
     );
 }
 
@@ -2820,6 +2849,7 @@ fn meta_accessor_covers_all_variants() {
             target_image_path: None,
             target_unit: None,
             sender_unreliable: false,
+            signals_lost: 0,
         }),
         Event::XpcConnect(XpcConnectEvent {
             meta: meta.clone(),

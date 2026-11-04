@@ -17,6 +17,7 @@ fn signal_event(signal: u32) -> SignalEvent {
         target_image_path: Some("/usr/local/bin/synthaea-agent".into()),
         target_unit: None,
         sender_unreliable: false,
+        signals_lost: 0,
     }
 }
 
@@ -88,6 +89,7 @@ fn signal_from(sender_pid: u32, comm: &str, signal: u32, target_pid: u32) -> Sig
         target_image_path: Some("/usr/local/bin/synthaea-agent".into()),
         target_unit: None,
         sender_unreliable: false,
+        signals_lost: 0,
     }
 }
 
@@ -287,19 +289,55 @@ fn a_kill_with_an_unreliable_sender_still_alerts_and_says_so() {
 }
 
 #[test]
-fn lost_signals_to_security_tools_are_a_finding() {
-    let mut event = file_open_event("signal_generate: 40 signals to security tools lost", 0);
-    event.flags = schema::FLAG_SIGNAL_EVENTS_LOST;
-    let alerts = crate::evaluate_file_open(&event);
+fn lost_signals_to_security_tools_are_a_high_finding() {
+    let mut event = signal_event(0);
+    event.target_pid = 0;
+    event.target_image_path = None;
+    event.signals_lost = 40;
+    let alerts = evaluate_signal(&event);
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(alerts[0].technique, "T1562.001");
+    assert_eq!(alerts[0].severity, crate::Severity::High);
     assert!(
-        alerts
-            .iter()
-            .any(|a| a.technique == "T1562.001" && a.severity == crate::Severity::Medium)
+        alerts[0].message.contains("40 signals"),
+        "{}",
+        alerts[0].message
     );
-    event.flags = 0;
+    assert!(
+        alerts[0].message.contains("SIGKILL"),
+        "{}",
+        alerts[0].message
+    );
+    event.signals_lost = 0;
+    assert!(evaluate_signal(&event).is_empty());
+}
+
+/// `O_TMPFILE | O_RDWR` is `0x0049_0002`: it contains `0x0040_0000`, the bit the first cut used to
+/// carry the loss on a `FileOpenEvent`, and any process can open it (glibc `tmpfile()`, mariadbd).
+/// The loss no longer travels on `FileOpenEvent::flags`, so such an open must not alert.
+#[test]
+fn an_o_tmpfile_open_does_not_raise_the_signal_loss_alert() {
+    let event = file_open_event("/tmp", 0x0049_0002);
     assert!(
         crate::evaluate_file_open(&event)
             .iter()
             .all(|a| a.technique != "T1562.001")
+    );
+}
+
+/// With an unreliable sender (`SI_TIMER`) `meta` is a bystander: pid 1 there does not make the
+/// signal "sent by the service manager" (Low).
+#[test]
+fn a_bystander_pid_1_with_an_unreliable_sender_is_not_the_service_manager() {
+    let mut event = signal_to_tool(1, "systemd", 9);
+    let alert = check_security_process_signal(&event).unwrap();
+    assert_eq!(alert.severity, crate::Severity::Low);
+    event.sender_unreliable = true;
+    let alert = check_security_process_signal(&event).unwrap();
+    assert_eq!(alert.severity, crate::Severity::High);
+    assert!(
+        !alert.message.contains("service manager"),
+        "{}",
+        alert.message
     );
 }
