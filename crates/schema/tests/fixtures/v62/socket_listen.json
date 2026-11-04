@@ -1,0 +1,13 @@
+{
+  "type": "socket_listen",
+  "meta": {
+    "pid": 8002,
+    "ppid": 8000,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900016000000000,
+    "comm": "nc"
+  },
+  "local_addr": "0.0.0.0",
+  "local_port": 4444,
+  "backlog": 1
+}
