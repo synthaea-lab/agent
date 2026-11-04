@@ -284,8 +284,16 @@ pub fn fit_detection_to_limit(
         }
     }
 
-    // 4. Without events: bounded by construction (title, source, techniques, attributions).
-    finish(&mut value, Vec::new())
+    // 4. Without events: bounded by construction (title, source, techniques, attributions). Checked
+    // all the same: an oversize body is never returned, it is a serialization error the caller
+    // drops and counts like any record that cannot be sent.
+    let body = finish(&mut value, Vec::new())?;
+    if body.len() > MAX_DETECTION_BODY_BYTES {
+        return Err(serde::ser::Error::custom(
+            "detection over the body limit even without its events",
+        ));
+    }
+    Ok(body)
 }
 
 /// Uploads detections one at a time, preserving each record's retry key.
@@ -405,5 +413,44 @@ impl<D: DetectionDrain> UploadStep for DetectionUploader<D> {
 
     fn backoff_duration(&self) -> Duration {
         DetectionUploader::backoff_duration(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(status: u16, message: &str) -> TransportError {
+        TransportError::ServerError {
+            status,
+            message: message.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_serialization_error_is_about_the_record() {
+        let error = serde_json::from_str::<u8>("x").unwrap_err();
+        assert!(refuses_this_record(&TransportError::Serialization(error)));
+    }
+
+    #[test]
+    fn only_record_level_statuses_are_per_record() {
+        for (code, message, expected) in [
+            (400, "Invalid payload", true),
+            (400, "Invalid certificate subject", false),
+            (409, "", true),
+            (413, "", true),
+            (422, "", true),
+            (401, "", false),
+            (403, "", false),
+            (404, "", false),
+            (429, "", false),
+        ] {
+            assert_eq!(
+                refuses_this_record(&status(code, message)),
+                expected,
+                "{code} {message}"
+            );
+        }
     }
 }
