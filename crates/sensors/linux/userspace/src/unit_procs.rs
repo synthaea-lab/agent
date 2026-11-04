@@ -902,6 +902,34 @@ mod tests {
         assert!(watch.set.pids.contains(&9000), "the tool keeps its place");
     }
 
+    /// Residual, pinned as it is (review of #1114, not redesigned): processes kept at an earlier
+    /// scan keep their place, so root can fill the cap first and move the tool out after. The tool
+    /// is then evicted (and `refresh` warns, see the eviction branch).
+    #[test]
+    fn a_tool_moved_out_after_the_cap_is_full_is_evicted() {
+        let host = Host::new();
+        let mut set = FakeSet::default();
+        host.exe_started(9000, "/usr/sbin/auditd", 100);
+        let low: Vec<u32> = (1..=MAX_MOVED_OUT as u32).collect();
+        for pid in &low {
+            host.exe_started(*pid, "/usr/bin/sleep", 5000);
+        }
+        host.unit("system.slice", "auditd.service", &low);
+        let mut watch = ToolWatch::new(host.resolver(&["auditd"]), &mut set);
+        watch.refresh();
+        host.unit("system.slice", "auditd.service", &[9000]);
+        assert_eq!(
+            watch.refresh(),
+            MAX_MOVED_OUT + 1,
+            "256 moved out, tool in unit"
+        );
+        // The squatters stay kept; the tool leaves the unit after the cap is full.
+        host.unit("system.slice", "auditd.service", &[]);
+        assert_eq!(watch.refresh(), MAX_MOVED_OUT);
+        assert!(!watch.set.pids.contains(&9000), "the tool is evicted");
+        assert!(low.iter().all(|pid| watch.set.pids.contains(pid)));
+    }
+
     /// Moved out in the same scan, from two units (root can create the cgroup of a listed unit that
     /// is not installed): the cap is shared, and the oldest process is kept, whatever its pid.
     #[test]

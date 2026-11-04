@@ -94,7 +94,11 @@ static SYSCALL_NR_OFFSET: Global<u32> = Global::new(0);
 static TASK_TGID_OFFSET: Global<u32> = Global::new(0);
 
 /// `SEND_SIG_PRIV` (1): the special `siginfo` pointer of a signal the kernel sends on its own
-/// behalf (the OOM killer, `exit_group`, a CPU limit). `SEND_SIG_NOINFO` (0) is **not** one of
+/// behalf (the OOM killer, `exit_group`, a CPU limit). It is dropped here because the sender is
+/// not a process, but that does not mean no attacker is behind it: a process can make the kernel
+/// send it (`prlimit` of `RLIMIT_CPU` on the tool, a lowered `memory.max` of the tool's cgroup),
+/// and those kills are not seen (docs/detection/security-tool-stop.md, Known gaps).
+/// `SEND_SIG_NOINFO` (0) is **not** one of
 /// those: the kernel then builds an `SI_USER` siginfo for `current`, so it is a process acting.
 /// `echo 1 > cgroup.kill` takes this path (`SIGKILL` to every process of the cgroup, `info`
 /// null, the sender the writing process).
