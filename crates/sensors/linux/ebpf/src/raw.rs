@@ -120,6 +120,28 @@ const RELOAD_SIGNALS: u64 = {
     set
 };
 
+// `RELOAD_SIGNALS` must never hold a signal that ends a tool whatever its handlers: a later edit
+// that added one would silence a kill. Bits are `sig - 1`: SIGINT 2, SIGQUIT 3, SIGABRT 6,
+// SIGKILL 9, SIGTERM 15, SIGSTOP 19 (`SIGSTOP` is 19 and `SIGTSTP` 20 on x86_64 and aarch64).
+const _: () = assert!(
+    RELOAD_SIGNALS
+        & ((1 << (2 - 1))
+            | (1 << (3 - 1))
+            | (1 << (6 - 1))
+            | (1 << (9 - 1))
+            | (1 << (15 - 1))
+            | (1 << (19 - 1)))
+        == 0,
+    "RELOAD_SIGNALS holds a signal that ends or stops a tool"
+);
+
+/// `enum sig_result` of `signal_generate` (`include/trace/events/signal.h`): the signal was
+/// ignored by the target (`TRACE_SIGNAL_IGNORED`), or was already pending and not queued again
+/// (`TRACE_SIGNAL_ALREADY_PENDING`). Neither touches the tool, and a pending one was reported
+/// when it was first queued. `SIGKILL` and `SIGSTOP` can be neither.
+const TRACE_SIGNAL_IGNORED: u32 = 1;
+const TRACE_SIGNAL_ALREADY_PENDING: u32 = 2;
+
 /// The signals worth reporting for a tool, as a bit set (bit `sig - 1`): every signal whose
 /// default action ends or stops a process, `SIGHUP` included: one that reaches userspace without
 /// being a caught reload (`RELOAD_SIGNALS`) is a signal that ends a tool with no handler. Left out: `SIGCHLD`, `SIGCONT`, `SIGURG`, `SIGWINCH`, which neither end nor stop it.
@@ -140,11 +162,15 @@ const TOOL_SIGNALS: u64 = {
 /// the **initial** pid namespace and once per target of a group kill, which the `sys_enter`
 /// probes above cannot do (the pid argument is in the sender's namespace, `tkill` takes a
 /// thread id and `pidfd_send_signal` a file descriptor). Arguments, in the kernel's order:
-/// `sig`, `info`, `task` (the target), `group`, `result`.
+/// `sig`, `info`, `task` (the target), `group`, `result` (`enum sig_result`: 0 delivered, 1 ignored,
+/// 2 already pending, 3 overflow fail, 4 lose info; format not read on a host, the order is that
+/// of `TP_PROTO` in `include/trace/events/signal.h`). An ignored or already-pending signal is
+/// dropped (`TRACE_SIGNAL_IGNORED`, `TRACE_SIGNAL_ALREADY_PENDING`): a flood of a signal the tool
+/// ignores (`SIGPIPE` for `auditd`) would otherwise fill the ring ahead of a `SIGKILL`.
 ///
 /// The common case, a signal to anything else, costs one read of `task->tgid` and one hash
 /// lookup. Permission is checked before this tracepoint fires, so a refused `kill` (`EPERM`)
-/// never reaches it: only a delivered, ignored or already-pending signal does.
+/// never reaches it: a delivered, ignored or already-pending signal does, and the last two are dropped below.
 #[raw_tracepoint(tracepoint = "signal_generate")]
 pub fn raw_signal_generate(ctx: RawTracePointContext) -> u32 {
     let sig = ctx.arg::<i64>(0) as u32;
@@ -157,6 +183,11 @@ pub fn raw_signal_generate(ctx: RawTracePointContext) -> u32 {
         return 0;
     }
     if info as usize == SEND_SIG_PRIV {
+        return 0;
+    }
+    // The 5th tracepoint argument; an `int` widened to the register, so compare the low half.
+    let result = ctx.arg::<i64>(4) as u32;
+    if result == TRACE_SIGNAL_IGNORED || result == TRACE_SIGNAL_ALREADY_PENDING {
         return 0;
     }
     // SAFETY: `task` is the kernel's `task_struct` pointer from the tracepoint; the read goes
