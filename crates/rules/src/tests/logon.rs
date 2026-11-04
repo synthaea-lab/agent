@@ -319,9 +319,10 @@ fn one_alert_per_account_per_night_then_again_the_next() {
     assert_eq!(odd_hour(&mut state, "mallory", night + 24 * HOUR).len(), 1);
 }
 
-/// A Windows logon whose account name is localized (the accented French name of SYSTEM on a French Windows, which arrives with the
-/// accented letter replaced by U+FFFD) is the local SYSTEM account by its SID alone: it must not alert, at night
-/// (found on a French Windows, #1091) nor as a first-seen account.
+/// A Windows logon whose account name is localized (the accented French name of SYSTEM on a
+/// French Windows, which arrives with the accented letter replaced by U+FFFD) is the local
+/// SYSTEM account by its SID alone: it must not alert, at night (found on a French Windows,
+/// #1091) nor as a first-seen account.
 #[test]
 fn a_localized_service_account_is_generic_by_its_sid() {
     let localized = "Syst\u{FFFD}me";
