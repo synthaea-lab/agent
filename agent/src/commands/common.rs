@@ -89,6 +89,17 @@ pub(crate) fn apply_detection(sink: &DetectionSink, detection: &config::Detectio
     }
 }
 
+/// Indexes of the exempt entries that contain a backslash (`DOMAIN\name`): kept, not rejected,
+/// but they match nothing today.
+fn backslash_exempt_entries(entries: &[String]) -> Vec<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.contains('\\'))
+        .map(|(index, _)| index)
+        .collect()
+}
+
 /// The operator's declared ordinary hours and exempt accounts for ODD-HOUR-LOGON (#1089);
 /// nothing changes for a host that declared neither.
 fn apply_odd_hour_calibration(sink: &DetectionSink, detection: &config::DetectionConfig) {
@@ -112,13 +123,11 @@ fn apply_odd_hour_calibration(sink: &DetectionSink, detection: &config::Detectio
         }
     }
     if !detection.odd_hour_exempt_accounts.is_empty() {
-        for (index, entry) in detection.odd_hour_exempt_accounts.iter().enumerate() {
-            if entry.contains('\\') {
-                tracing::warn!(
-                    index,
-                    "detection: an exempt entry contains a backslash; no sensor reports DOMAIN\\name for a logon today, so it exempts nothing (write the bare name, or NAME|SID)"
-                );
-            }
+        for index in backslash_exempt_entries(&detection.odd_hour_exempt_accounts) {
+            tracing::warn!(
+                index,
+                "detection: an exempt entry contains a backslash; no sensor reports DOMAIN\\name for a logon today, so it exempts nothing (write the bare name, or NAME|SID)"
+            );
         }
         let kept = sink.set_odd_hour_exempt_accounts(&detection.odd_hour_exempt_accounts);
         tracing::info!(
@@ -322,6 +331,22 @@ pub(crate) fn health_collector(
 
 #[cfg(test)]
 mod tests {
+    use super::backslash_exempt_entries;
+
+    #[test]
+    fn an_exempt_entry_with_a_backslash_is_flagged_not_dropped() {
+        let entries: Vec<String> = [
+            "svc_backup",
+            "CORP\\oncall",
+            "ok|S-1-5-21-1-2-3-1004",
+            "A\\b|S-1-5-21-1-2-3-*",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(backslash_exempt_entries(&entries), vec![1, 3]);
+        assert!(backslash_exempt_entries(&[]).is_empty());
+    }
+
     use std::sync::OnceLock;
 
     use tamper::heartbeat::SensorHeartbeat;
