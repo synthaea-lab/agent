@@ -294,8 +294,23 @@ impl<S: WatchSet> ToolWatch<S> {
         let mut next = self.resolver.scan();
         // A watched process that left its unit's cgroup is still the tool (root can move it with
         // `echo <pid> > cgroup.procs` to blind the probe): keep watching it until it exits.
+        // Capped per unit like the scan: a process of any uid can be moved in by root, and each one
+        // would otherwise fill the map for as long as it lives (review of #1114).
+        let mut moved_kept: BTreeMap<&str, usize> = BTreeMap::new();
         for (pid, known) in &self.applied {
             if !next.contains_key(pid) && self.resolver.still_is(*pid, known) {
+                let kept = moved_kept.entry(known.unit.as_str()).or_default();
+                if *kept >= MAX_PROCS_PER_UNIT {
+                    if self.moved_logged.insert(*pid) {
+                        tracing::warn!(
+                            pid,
+                            unit = %known.unit,
+                            "unit_procs: too many processes moved out of a unit's cgroup, one is no longer watched"
+                        );
+                    }
+                    continue;
+                }
+                *kept += 1;
                 if self.moved_logged.insert(*pid) {
                     tracing::warn!(
                         pid,
@@ -592,17 +607,23 @@ mod tests {
     #[derive(Default)]
     struct FakeSet {
         pids: std::collections::BTreeSet<u32>,
+        /// The `SigCgt` mask each pid was last inserted with.
+        masks: std::collections::BTreeMap<u32, u64>,
+        /// Every successful insert, in order: `(pid, mask)`.
+        inserts: Vec<(u32, u64)>,
         refuse: std::collections::BTreeSet<u32>,
         /// Every `remove` fails with an error other than "absent".
         fail_remove: bool,
     }
 
     impl WatchSet for &mut FakeSet {
-        fn insert(&mut self, pid: u32, _sig_cgt: u64) -> Result<(), String> {
+        fn insert(&mut self, pid: u32, sig_cgt: u64) -> Result<(), String> {
             if self.refuse.contains(&pid) {
                 return Err("full".to_owned());
             }
             self.pids.insert(pid);
+            self.masks.insert(pid, sig_cgt);
+            self.inserts.push((pid, sig_cgt));
             Ok(())
         }
 
@@ -783,6 +804,58 @@ mod tests {
         assert_eq!(found[&612].sig_cgt, Some(1 | (1 << 14)));
         assert_eq!(found[&613].sig_cgt, Some(1 << 14));
         assert_eq!(found[&614].sig_cgt, None, "unknown: reported, not hidden");
+    }
+
+    /// The mask the probe reads is the one `refresh` scanned: written at insert, `0` when unknown,
+    /// and written again when it changes (a handler installed after the first scan), since both
+    /// reload fixes rest on that value.
+    #[test]
+    fn refresh_writes_the_scanned_sigcgt_to_the_kernel_set() {
+        let host = Host::new();
+        let mut set = FakeSet::default();
+        host.unit("system.slice", "auditd.service", &[612, 613]);
+        host.caught(612, 1 | (1 << 14));
+        // 613 has no status: unknown counts as nothing caught.
+        let mut watch = ToolWatch::new(host.resolver(&["auditd"]), &mut set);
+        assert_eq!(watch.refresh(), 2);
+        assert_eq!(watch.set.masks[&612], 1 | (1 << 14), "the scanned value");
+        assert_eq!(watch.set.masks[&613], 0, "an unknown mask is 0");
+
+        // Nothing changed: no second insert.
+        watch.refresh();
+        assert_eq!(watch.set.inserts.len(), 2);
+
+        // 612 installs a SIGUSR1 handler: the pid is inserted again with the new mask.
+        host.caught(612, 1 | (1 << 9) | (1 << 14));
+        assert_eq!(watch.refresh(), 2);
+        assert_eq!(watch.set.masks[&612], 1 | (1 << 9) | (1 << 14));
+        assert_eq!(watch.set.inserts.len(), 3);
+        assert_eq!(watch.set.inserts[2].0, 612);
+    }
+
+    #[test]
+    fn processes_moved_out_of_a_unit_are_kept_up_to_the_per_unit_cap() {
+        let host = Host::new();
+        let mut set = FakeSet::default();
+        let round =
+            |first: u32| -> Vec<u32> { (first..first + MAX_PROCS_PER_UNIT as u32).collect() };
+        let (a, b) = (round(1000), round(5000));
+        for pid in a.iter().chain(&b) {
+            host.exe(*pid, "/usr/sbin/auditd");
+        }
+        // Round 1: 256 processes in the unit, then moved out while round 2 moves in.
+        host.unit("system.slice", "auditd.service", &a);
+        let mut watch = ToolWatch::new(host.resolver(&["auditd"]), &mut set);
+        assert_eq!(watch.refresh(), MAX_PROCS_PER_UNIT);
+        host.unit("system.slice", "auditd.service", &b);
+        assert_eq!(
+            watch.refresh(),
+            2 * MAX_PROCS_PER_UNIT,
+            "256 in the unit plus 256 moved out"
+        );
+        // Round 2 moves out too: 512 moved-out candidates, kept up to the cap.
+        host.unit("system.slice", "auditd.service", &[]);
+        assert_eq!(watch.refresh(), MAX_PROCS_PER_UNIT);
     }
 
     #[test]
