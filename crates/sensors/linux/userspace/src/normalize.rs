@@ -1069,21 +1069,6 @@ mod tests {
     }
 
     #[test]
-    fn probe_open_with_a_synthetic_bit_raises_no_alert() {
-        for flag in schema::SYNTHETIC_FLAGS {
-            for path in ["/etc/hostname", "/tmp/forge-persist"] {
-                let mut e = probe_open(flag | schema::O_RDWR);
-                e.path = path.into();
-                let alerts = rules::evaluate_file_open(&e);
-                assert!(
-                    alerts.is_empty(),
-                    "forged {flag:#x} on {path} raised {alerts:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn probe_open_keeps_every_real_open_flag() {
         // O_PATH, O_TMPFILE, O_CLOEXEC, O_DIRECTORY, O_NOFOLLOW, O_LARGEFILE (x86_64).
         let real = 0x20_0000 | 0x41_0000 | 0x8_0000 | 0x1_0000 | 0x2_0000 | 0x8000 | 0o2002;

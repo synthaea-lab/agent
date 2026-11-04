@@ -6,9 +6,6 @@ license.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-[dev-dependencies]
-rules = { path = "../../../rules" }
-
 [lints]
 workspace = true
 
