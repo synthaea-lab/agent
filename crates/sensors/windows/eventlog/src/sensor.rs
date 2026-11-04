@@ -106,6 +106,12 @@ fn wevtutil(args: &[&str]) -> Result<String, String> {
 /// `0xE9`. Decoded as UTF-8, every non-ASCII account name lost its letters to U+FFFD, so two
 /// accounts could become one string and `Système` matched no generic-account name (#1126).
 /// A host whose ANSI code page is UTF-8 (65001) decodes the same way through `CP_ACP`.
+///
+/// Two limits. A character the ANSI code page cannot hold (Cyrillic on a 1252 host) is
+/// already `?` when `wevtutil` writes it: no decoding here gets it back, only the `Subscribe`
+/// transport (UTF-16 from `EvtRender`) keeps it. And `CP_ACP` is this process's code page: it
+/// matches `wevtutil`'s only while the agent binary has no manifest setting `activeCodePage`
+/// (none does on 2026-11-04).
 fn decode_ansi(bytes: &[u8]) -> String {
     decode_code_page(bytes, windows_sys::Win32::Globalization::CP_ACP)
         .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
