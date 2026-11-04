@@ -561,7 +561,7 @@ fn a_title_over_the_limit_is_cut_to_the_servers_limit_and_keeps_its_note_first()
 fn a_large_argv_array_is_cut_but_the_image_hash_and_path_stay_whole() {
     let mut huge = detection();
     let mut exec = ExecEvent {
-        argv: vec!["a".to_string(); 3_000_000],
+        argv: vec!["a".repeat(30); 300_000],
         cmdline: "x".repeat(1024),
         ..schema::fixtures::exec()
     };
@@ -765,6 +765,36 @@ fn a_refused_record_is_posted_once_per_pass_and_once_more_on_the_retry_only() {
         .filter(|h| h.contains(&format!("idempotency-key: {KEY_A}")))
         .count();
     assert_eq!(posts_of_a, 2, "once per pass, never twice in one pass");
+}
+
+#[test]
+fn a_validation_400_with_long_details_is_still_about_the_record() {
+    // The route answers `{"error":"Invalid payload","details":[...Zod issues...]}`; thirty issues
+    // pass the 2 KiB cap on the error body, so the JSON arrives cut and only its start can be read.
+    let details = format!(
+        r#"{{"error":"Invalid payload","details":[{}]}}"#,
+        vec![
+            r#"{"code":"invalid_string","validation":"regex","message":"Invalid","path":["attributions",0,"feature"]}"#;
+            30
+        ]
+        .join(",")
+    );
+    let body: &'static str = Box::leak(details.into_boxed_str());
+    assert!(body.len() > 2048);
+    let (url, server) = sequence_server_with(vec![(400, body), (200, r#"{"status":"accepted"}"#)]);
+    let (mut uploader, (acked, skipped, dropped)) = recording_uploader(
+        &url,
+        vec![queued(KEY_A, detection()), queued(KEY_B, detection())],
+    );
+    assert_eq!(uploader.upload_once().unwrap(), 2);
+    assert_eq!(acked.load(Ordering::SeqCst), 1);
+    assert_eq!(skipped.load(Ordering::SeqCst), 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        server.join().unwrap().len(),
+        2,
+        "the second record was posted"
+    );
 }
 
 #[test]

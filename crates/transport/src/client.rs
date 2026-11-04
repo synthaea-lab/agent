@@ -293,7 +293,23 @@ fn error_reason(body: &str) -> Option<String> {
             .map(str::to_string)
             .filter(|reason| !reason.is_empty());
     }
+    if let Some(reason) = leading_error_string(body) {
+        return Some(reason);
+    }
     (!body.is_empty()).then(|| body.to_string())
+}
+
+/// The `error` string of a JSON body that [`read_error_body`] cut short: the routes answer
+/// `{"error":"...", "details":[...]}` with the reason first, and a long `details` (a validation
+/// `400` with many Zod issues) pushes the body past the cap, so it no longer parses as a whole.
+/// Only a leading `{"error":"` is recognized, and only the string itself is read.
+fn leading_error_string(body: &str) -> Option<String> {
+    let rest = body.strip_prefix("{\"error\":")?.trim_start();
+    let reason = serde_json::Deserializer::from_str(rest)
+        .into_iter::<String>()
+        .next()?
+        .ok()?;
+    (!reason.is_empty()).then_some(reason)
 }
 
 fn validate_detection_response(response: DetectionUploadResponse) -> Result<()> {
@@ -436,6 +452,25 @@ fn load_ca_roots(path: &std::path::Path) -> Result<ureq::tls::RootCerts> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn error_reason_reads_the_error_of_a_body_cut_inside_its_details() {
+        let body = format!(
+            r#"{{"error":"Invalid payload","details":[{}"#,
+            "{\"a\":1},".repeat(400)
+        );
+        assert_eq!(
+            super::error_reason(&body).as_deref(),
+            Some("Invalid payload")
+        );
+        assert_eq!(
+            super::error_reason(r#"{"details":[1,2"#).as_deref(),
+            Some(r#"{"details":[1,2"#)
+        );
+        assert_eq!(
+            super::error_reason(r#"<html>{"error":"x"</html>"#).as_deref(),
+            Some(r#"<html>{"error":"x"</html>"#)
+        );
+    }
     use super::*;
     use crate::DEFAULT_HEARTBEAT_ENDPOINT;
 

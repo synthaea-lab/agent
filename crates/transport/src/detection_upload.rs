@@ -216,12 +216,28 @@ fn json_len(value: &serde_json::Value) -> std::result::Result<usize, serde_json:
 pub fn fit_detection_to_limit(
     detection: &Detection,
 ) -> std::result::Result<Vec<u8>, serde_json::Error> {
+    fit_detection_reporting(detection).map(|(body, _)| body)
+}
+
+/// [`fit_detection_to_limit`], and the size the detection had before it was shortened (`None`
+/// when it already fit), so the caller can leave a trace on the host (#1119).
+fn fit_detection_reporting(
+    detection: &Detection,
+) -> std::result::Result<(Vec<u8>, Option<usize>), serde_json::Error> {
     let body = serde_json::to_vec(detection)?;
     if body.len() <= MAX_DETECTION_BODY_BYTES {
-        return Ok(body);
+        return Ok((body, None));
     }
     let original = body.len();
     drop(body);
+    shorten_detection(detection, original).map(|body| (body, Some(original)))
+}
+
+/// The shortening steps of [`fit_detection_to_limit`], for a detection of `original` bytes.
+fn shorten_detection(
+    detection: &Detection,
+    original: usize,
+) -> std::result::Result<Vec<u8>, serde_json::Error> {
     let mut value = serde_json::to_value(detection)?;
 
     let note = format!("[events shortened from {original} bytes] ");
@@ -345,8 +361,20 @@ impl<D: DetectionDrain> DetectionUploader<D> {
         let mut uploaded = 0usize;
         let mut dropped = 0u64;
         for record in &records {
-            let body = match fit_detection_to_limit(&record.detection) {
-                Ok(body) => body,
+            let body = match fit_detection_reporting(&record.detection) {
+                Ok((body, shortened_from)) => {
+                    if let Some(original) = shortened_from {
+                        // The size is chosen by the process, so the host keeps a trace too: the
+                        // stored title carries the note, but only on the server.
+                        tracing::warn!(
+                            key = %record.key,
+                            original_bytes = original,
+                            sent_bytes = body.len(),
+                            "detection over the body limit; events shortened before sending"
+                        );
+                    }
+                    body
+                }
                 Err(error) => {
                     tracing::warn!(
                         %error,
