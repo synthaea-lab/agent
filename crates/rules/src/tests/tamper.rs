@@ -298,15 +298,13 @@ fn lost_signals_to_security_tools_are_a_high_finding() {
     assert_eq!(alerts.len(), 1, "{alerts:?}");
     assert_eq!(alerts[0].technique, "T1562.001");
     assert_eq!(alerts[0].severity, crate::Severity::High);
-    assert!(
-        alerts[0].message.contains("40 signals"),
-        "{}",
-        alerts[0].message
-    );
-    assert!(
-        alerts[0].message.contains("SIGKILL"),
-        "{}",
-        alerts[0].message
+    // The exact text: a literal that lost its `\` continuations carried runs of spaces into every
+    // loss alert, and `contains` checks did not see it (review of #1114).
+    assert_eq!(
+        alerts[0].message,
+        "40 signals to security tools lost, signal ring buffer full: a flood of signals to a \
+         security tool, or one too busy to read them, can hide a kill, and the lost signals may \
+         include the SIGKILL, so this is High"
     );
     event.signals_lost = 0;
     assert!(evaluate_signal(&event).is_empty());

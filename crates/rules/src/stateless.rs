@@ -1417,7 +1417,9 @@ pub(crate) fn check_signal_events_lost(event: &schema::SignalEvent) -> Option<Al
         technique: "T1562.001",
         severity: Severity::High,
         message: format!(
-            "{} signals to security tools lost, signal ring buffer full: a flood of signals to a              security tool, or one too busy to read them, can hide a kill, and the lost signals              may include the SIGKILL, so this is High",
+            "{} signals to security tools lost, signal ring buffer full: a flood of signals to a \
+             security tool, or one too busy to read them, can hide a kill, and the lost signals \
+             may include the SIGKILL, so this is High",
             event.signals_lost
         ),
     })

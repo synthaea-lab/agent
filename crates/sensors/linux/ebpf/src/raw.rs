@@ -138,7 +138,11 @@ const _: () = assert!(
 /// `enum sig_result` of `signal_generate` (`include/trace/events/signal.h`): the signal was
 /// ignored by the target (`TRACE_SIGNAL_IGNORED`), or was already pending and not queued again
 /// (`TRACE_SIGNAL_ALREADY_PENDING`). Neither touches the tool, and a pending one was reported
-/// when it was first queued. `SIGKILL` and `SIGSTOP` can be neither.
+/// (or counted as lost) when it was first queued. `SIGKILL` and `SIGSTOP` can be both: a second
+/// one while the first is pending (every signal below `SIGRTMIN` queues once), or a `SIGKILL` to a
+/// task already exiting; the first one is what counts. Except: when the pending `SIGSTOP` came
+/// from the kernel (`SEND_SIG_PRIV`, the stop `PTRACE_ATTACH` queues), dropped below, a process's
+/// `SIGSTOP` in that window is not seen; the `ptrace` is its own evidence.
 const TRACE_SIGNAL_IGNORED: u32 = 1;
 const TRACE_SIGNAL_ALREADY_PENDING: u32 = 2;
 

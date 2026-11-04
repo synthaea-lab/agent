@@ -30,12 +30,17 @@ const MAX_DEPTH: usize = 4;
 /// bomb in the unit, and the first ones are the tool's own.
 const MAX_PROCS_PER_UNIT: usize = 256;
 
-// The kernel map holds every listed unit at the per-unit process cap, with headroom for processes
-// kept after they left their cgroup and for removals that failed (review of #1114).
+/// Processes kept after they left their unit's cgroup, all units together. One cap for the whole
+/// set, not one per unit: root can create the cgroup of a listed unit that is not installed, so a
+/// per-unit cap would let the moved-out set double the map's worst case (review of #1114).
+const MAX_MOVED_OUT: usize = MAX_PROCS_PER_UNIT;
+
+// The kernel map holds every listed unit at the per-unit process cap plus the moved-out cap, with
+// headroom for removals that failed (review of #1114).
 const _: () = assert!(
-    schema::SECURITY_SERVICES.len() * MAX_PROCS_PER_UNIT
+    schema::SECURITY_SERVICES.len() * MAX_PROCS_PER_UNIT + MAX_MOVED_OUT
         < sensor_linux_wire::SIGNAL_WATCH_TOOLS_ENTRIES as usize,
-    "SIGNAL_WATCH_TOOLS_ENTRIES must exceed SECURITY_SERVICES.len() * MAX_PROCS_PER_UNIT"
+    "SIGNAL_WATCH_TOOLS_ENTRIES must exceed SECURITY_SERVICES.len() * MAX_PROCS_PER_UNIT + MAX_MOVED_OUT"
 );
 
 /// Cgroup directories read per unit and layout, the unit's own included. `MAX_DEPTH` bounds the
@@ -267,6 +272,9 @@ pub(crate) struct ToolWatch<S> {
     previous_scan: BTreeMap<u32, UnitProc>,
     /// Moved-out tools already logged, so the warning comes once, not at every scan.
     moved_logged: std::collections::BTreeSet<u32>,
+    /// The moved-out processes kept at the last scan: they keep their place under
+    /// [`MAX_MOVED_OUT`] before any newcomer.
+    moved_kept: std::collections::BTreeSet<u32>,
     procs: ToolProcs,
 }
 
@@ -278,6 +286,7 @@ impl<S: WatchSet> ToolWatch<S> {
             applied: BTreeMap::new(),
             previous_scan: BTreeMap::new(),
             moved_logged: std::collections::BTreeSet::new(),
+            moved_kept: std::collections::BTreeSet::new(),
             procs: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -294,33 +303,41 @@ impl<S: WatchSet> ToolWatch<S> {
         let mut next = self.resolver.scan();
         // A watched process that left its unit's cgroup is still the tool (root can move it with
         // `echo <pid> > cgroup.procs` to blind the probe): keep watching it until it exits.
-        // Capped per unit like the scan: a process of any uid can be moved in by root, and each one
-        // would otherwise fill the map for as long as it lives (review of #1114).
-        let mut moved_kept: BTreeMap<&str, usize> = BTreeMap::new();
-        for (pid, known) in &self.applied {
-            if !next.contains_key(pid) && self.resolver.still_is(*pid, known) {
-                let kept = moved_kept.entry(known.unit.as_str()).or_default();
-                if *kept >= MAX_PROCS_PER_UNIT {
-                    if self.moved_logged.insert(*pid) {
-                        tracing::warn!(
-                            pid,
-                            unit = %known.unit,
-                            "unit_procs: too many processes moved out of a unit's cgroup, one is no longer watched"
-                        );
-                    }
-                    continue;
-                }
-                *kept += 1;
-                if self.moved_logged.insert(*pid) {
-                    tracing::warn!(
-                        pid,
-                        unit = %known.unit,
-                        "unit_procs: a security tool process left its unit's cgroup, still watched"
-                    );
-                }
-                next.insert(*pid, known.clone());
+        // Capped (`MAX_MOVED_OUT`): a process of any uid can be moved in by root, and each one would
+        // otherwise fill the map for as long as it lives (review of #1114).
+        let mut moved: Vec<(u32, &UnitProc)> = self
+            .applied
+            .iter()
+            .filter(|(pid, known)| !next.contains_key(pid) && self.resolver.still_is(**pid, known))
+            .map(|(pid, known)| (*pid, known))
+            .collect();
+        // Kept at the last scan first, then the oldest: a process moved out later, or started
+        // later, never takes the place of one already watched. By pid order, root could evict a
+        // moved-out tool with 256 lower pids moved through the unit (review of #1114).
+        moved.sort_by_key(|(pid, known)| (!self.moved_kept.contains(pid), known.start, *pid));
+        let mut kept = std::collections::BTreeSet::new();
+        for (pid, known) in moved {
+            if kept.len() >= MAX_MOVED_OUT {
+                // Not gated on `moved_logged`: the pid was logged as "still watched" before, and an
+                // eviction must still be said. It leaves `applied`, so this is logged once.
+                tracing::warn!(
+                    pid,
+                    unit = %known.unit,
+                    "unit_procs: too many processes moved out of the units' cgroups, one is no longer watched"
+                );
+                continue;
             }
+            if self.moved_logged.insert(pid) {
+                tracing::warn!(
+                    pid,
+                    unit = %known.unit,
+                    "unit_procs: a security tool process left its unit's cgroup, still watched"
+                );
+            }
+            kept.insert(pid);
+            next.insert(pid, known.clone());
         }
+        self.moved_kept = kept;
         let (added, removed) = changes(&self.applied, &next);
         for pid in removed {
             match self.set.remove(pid) {
@@ -834,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn processes_moved_out_of_a_unit_are_kept_up_to_the_per_unit_cap() {
+    fn processes_moved_out_of_a_unit_are_kept_up_to_the_cap() {
         let host = Host::new();
         let mut set = FakeSet::default();
         let round =
@@ -855,7 +872,55 @@ mod tests {
         );
         // Round 2 moves out too: 512 moved-out candidates, kept up to the cap.
         host.unit("system.slice", "auditd.service", &[]);
-        assert_eq!(watch.refresh(), MAX_PROCS_PER_UNIT);
+        assert_eq!(watch.refresh(), MAX_MOVED_OUT);
+        // Round 1 was kept at the last scan: it keeps its place, round 2 is the one dropped.
+        assert!(a.iter().all(|pid| watch.set.pids.contains(pid)));
+        assert!(b.iter().all(|pid| !watch.set.pids.contains(pid)));
+    }
+
+    /// Review of #1114: root moves the tool out, then moves 256 processes with lower pids through
+    /// the unit and out. By pid order they took the tool's place, silently.
+    #[test]
+    fn a_moved_out_tool_is_not_displaced_by_lower_pids_moved_out_later() {
+        let host = Host::new();
+        let mut set = FakeSet::default();
+        host.exe_started(9000, "/usr/sbin/auditd", 100);
+        host.unit("system.slice", "auditd.service", &[9000]);
+        let mut watch = ToolWatch::new(host.resolver(&["auditd"]), &mut set);
+        assert_eq!(watch.refresh(), 1);
+        host.unit("system.slice", "auditd.service", &[]);
+        assert_eq!(watch.refresh(), 1, "moved out, still watched");
+
+        let low: Vec<u32> = (1..=MAX_MOVED_OUT as u32).collect();
+        for pid in &low {
+            host.exe_started(*pid, "/usr/bin/sleep", 5000);
+        }
+        host.unit("system.slice", "auditd.service", &low);
+        watch.refresh();
+        host.unit("system.slice", "auditd.service", &[]);
+        assert_eq!(watch.refresh(), MAX_MOVED_OUT);
+        assert!(watch.set.pids.contains(&9000), "the tool keeps its place");
+    }
+
+    /// Moved out in the same scan, from two units (root can create the cgroup of a listed unit that
+    /// is not installed): the cap is shared, and the oldest process is kept, whatever its pid.
+    #[test]
+    fn the_moved_out_cap_is_shared_by_all_units_and_keeps_the_oldest() {
+        let host = Host::new();
+        let mut set = FakeSet::default();
+        host.exe_started(9000, "/usr/sbin/auditd", 100);
+        let low: Vec<u32> = (1..=MAX_MOVED_OUT as u32).collect();
+        for pid in &low {
+            host.exe_started(*pid, "/usr/bin/sleep", 5000);
+        }
+        host.unit("system.slice", "auditd.service", &[9000]);
+        host.unit("system.slice", "falco.service", &low);
+        let mut watch = ToolWatch::new(host.resolver(&["auditd", "falco"]), &mut set);
+        assert_eq!(watch.refresh(), MAX_MOVED_OUT + 1);
+        host.unit("system.slice", "auditd.service", &[]);
+        host.unit("system.slice", "falco.service", &[]);
+        assert_eq!(watch.refresh(), MAX_MOVED_OUT, "one cap for all units");
+        assert!(watch.set.pids.contains(&9000), "the oldest is kept");
     }
 
     #[test]
