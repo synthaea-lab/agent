@@ -323,14 +323,22 @@ enum Shutdown {
 /// Whether this exec tells the host to shut down or reboot **now** (`Now`), or cancels one
 /// (`Cancel`). `shutdown` counts only with an immediate time (`now`, `+0`): `+N` and `HH:MM`
 /// schedule a shutdown that stops nothing yet, and a bare `shutdown` is `+1` for systemd. `-k`
-/// only warns. `reboot`, `poweroff`, `halt`, `systemctl reboot|poweroff|halt|kexec` and
+/// only warns. `reboot`, `poweroff`, `halt` (not with `-w`/`--wtmp-only`), `systemctl reboot|poweroff|halt|kexec` and
 /// `init`/`telinit 0|6` are immediate, unless `systemctl` is given `--when=` (a schedule, or
 /// `--when=cancel`).
 fn shutdown_effect(event: &ExecEvent) -> Option<Shutdown> {
     let program = program(event);
     let args = args(event);
     match program.as_str() {
-        "reboot" | "poweroff" | "halt" => Some(Shutdown::Now),
+        "reboot" | "poweroff" | "halt" => {
+            // `-w`/`--wtmp-only` only writes the wtmp record and brings nothing down (-d and -f
+            // still do). Long options may be abbreviated.
+            let wtmp_only = args.iter().any(|a| match a.strip_prefix("--") {
+                Some(long) => !long.is_empty() && "wtmp-only".starts_with(long),
+                None => a.starts_with('-') && a.contains('w'),
+            });
+            (!wtmp_only).then_some(Shutdown::Now)
+        }
         "shutdown" => {
             let short = |flag: char| {
                 args.iter()

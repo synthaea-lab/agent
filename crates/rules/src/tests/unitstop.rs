@@ -337,6 +337,12 @@ fn a_shutdown_outside_the_window_does_not_explain_the_stop() {
 fn a_command_that_does_not_shut_the_host_down_is_not_a_shutdown() {
     for command in [
         "shutdown -k now",
+        // wtmp record only: the host stays up (#1102 review 2).
+        "reboot -w",
+        "reboot --wtmp-only",
+        "poweroff -w",
+        "halt -w",
+        "halt -fw",
         "shutdown -c",
         "shutdown --cancel",
         "shutdown --no-wall",
@@ -357,6 +363,22 @@ fn a_command_that_does_not_shut_the_host_down_is_not_a_shutdown() {
         assert_alerts_once(
             &judged("auditd.service", &[(command, T0 - 5 * SEC)]),
             "auditd",
+        );
+    }
+}
+
+#[test]
+fn reboot_options_that_still_shut_down_explain_a_stop() {
+    for command in [
+        "reboot",
+        "reboot -d",
+        "reboot -f",
+        "reboot --no-wtmp",
+        "halt --force",
+    ] {
+        assert!(
+            judged("auditd.service", &[(command, T0 - 5 * SEC)]).is_empty(),
+            "{command}"
         );
     }
 }
