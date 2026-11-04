@@ -55,6 +55,21 @@ pub(crate) fn is_generic_account(user: &str) -> bool {
         )
 }
 
+/// Whether `sid` is one of the well-known identities a Windows host logs on by itself:
+/// `S-1-5-7` (anonymous), `S-1-5-18` (local system), `S-1-5-19` (local service) and `S-1-5-20`
+/// (network service). The account *name* of these is localized (SYSTEM has an accented
+/// name on a French Windows, and the event can carry it with a character already lost), so only
+/// the SID is the same on every host; a name list can never be complete.
+pub(crate) fn is_well_known_service_sid(sid: &str) -> bool {
+    matches!(sid, "S-1-5-7" | "S-1-5-18" | "S-1-5-19" | "S-1-5-20")
+}
+
+/// Whether the account of a logon is generic: by its name ([`is_generic_account`]) or by its SID
+/// when the event carries one ([`is_well_known_service_sid`]).
+fn is_generic_logon(user: &str, sid: Option<&str>) -> bool {
+    is_generic_account(user) || sid.is_some_and(is_well_known_service_sid)
+}
+
 /// `dwm-<n>` and `umfd-<n>`: the desktop-window-manager and font-driver accounts Windows
 /// creates per session.
 fn is_session_helper(name: &str) -> bool {
@@ -94,12 +109,12 @@ impl LogonBaseline {
     }
 
     /// Records a successful logon of `user` at `ts` and says what it is.
-    pub(crate) fn observe(&mut self, user: &str, ts: u64) -> Observation {
+    pub(crate) fn observe(&mut self, user: &str, sid: Option<&str>, ts: u64) -> Observation {
         // The clock starts at the first logon of any account, a generic one included: a host
         // only `root` logs on to for days must not leave an intruder's first account inside
         // a window that never began.
         let started = *self.started_ns.get_or_insert(ts);
-        if user.is_empty() || is_generic_account(user) {
+        if user.is_empty() || is_generic_logon(user, sid) {
             return Observation::Quiet;
         }
         let key = user.to_lowercase();
@@ -193,10 +208,10 @@ impl OddHours {
 
     /// The local hour of a logon of `user` at `ts` when it is outside the working hours and
     /// this account has not been reported within [`ODD_HOUR_QUIET_NS`]; remembers it.
-    pub(crate) fn observe(&mut self, user: &str, ts: u64) -> Option<u32> {
+    pub(crate) fn observe(&mut self, user: &str, sid: Option<&str>, ts: u64) -> Option<u32> {
         let hour = self.local_hour(ts)?;
         let (start, end) = WORK_HOURS_LOCAL;
-        if (start..end).contains(&hour) || user.is_empty() || is_generic_account(user) {
+        if (start..end).contains(&hour) || user.is_empty() || is_generic_logon(user, sid) {
             return None;
         }
         let key = user.to_lowercase();
@@ -214,7 +229,7 @@ impl OddHours {
 
 #[cfg(test)]
 mod tests {
-    use super::is_generic_account;
+    use super::{is_generic_account, is_well_known_service_sid};
 
     #[test]
     fn accounts_every_host_has_are_generic_in_any_case_and_with_a_domain() {
@@ -236,6 +251,24 @@ mod tests {
             "NT AUTHORITY\\NETWORK SERVICE",
         ] {
             assert!(is_generic_account(user), "{user}");
+        }
+    }
+
+    #[test]
+    fn the_well_known_service_sids_are_recognised_and_nothing_near_them() {
+        for sid in ["S-1-5-7", "S-1-5-18", "S-1-5-19", "S-1-5-20"] {
+            assert!(is_well_known_service_sid(sid), "{sid}");
+        }
+        // A user's SID, a prefix of a listed one, and an `Administrators` group SID are not.
+        for sid in [
+            "S-1-5-21-1-2-3-1001",
+            "S-1-5-1",
+            "S-1-5-180",
+            "S-1-5-32-544",
+            "s-1-5-18",
+            "",
+        ] {
+            assert!(!is_well_known_service_sid(sid), "{sid:?}");
         }
     }
 
