@@ -30,18 +30,18 @@ use crate::{
         CREATE_UNLINK_PID_CAP, CREDENTIAL_READ_ALERT_WINDOW_NS, DNS_CLASS_WINDOW_NS,
         DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS, EGRESS_BYTES_THRESHOLD,
         EGRESS_CLASSED_BYTES_THRESHOLD, EGRESS_DOMAIN_BROWSER_COMMS, EGRESS_WINDOW_NS,
-        IN_PLACE_EDIT_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS,
-        MEMFD_EXEC_WINDOW_NS, PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES,
-        POLICY_DENIAL_ALERT_CAP, POLICY_DENIAL_SUBJECT_CAP, QUARANTINE_EXEC_WINDOW_NS,
-        RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD,
-        RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
-        SCAN_VERTICAL_THRESHOLD, SCAN_VERTICAL_WINDOW_NS, SELF_SPAWN_EXCLUSIONS,
-        SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD,
-        SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS, SELINUX_POLICY_TOOL_COMMS,
-        SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STAGING_PID_CAP, STAGING_READ_DIRS,
-        STAGING_READ_FILES, STAGING_WINDOW_NS, STAGING_WRITE_FILES, STANDARD_PORTS,
-        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
-        TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
+        IN_PLACE_EDIT_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAIL_CLIENT_QUARANTINE_AGENTS,
+        MAILDIR_FLAG_LETTERS, MEMFD_EXEC_WINDOW_NS, PACKAGE_MANAGER_COMMS,
+        PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES, POLICY_DENIAL_ALERT_CAP, POLICY_DENIAL_SUBJECT_CAP,
+        QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX,
+        RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD,
+        SCAN_SPREAD_WINDOW_NS, SCAN_VERTICAL_THRESHOLD, SCAN_VERTICAL_WINDOW_NS,
+        SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS,
+        SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS,
+        SELINUX_POLICY_TOOL_COMMS, SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS,
+        STAGING_PID_CAP, STAGING_READ_DIRS, STAGING_READ_FILES, STAGING_WINDOW_NS,
+        STAGING_WRITE_FILES, STANDARD_PORTS, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN,
+        TASK_REGISTRATION_DEDUP_WINDOW_NS, TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
     },
     has_write_intent,
     logon::{LogonBaseline, Observation},
@@ -133,6 +133,11 @@ struct RecentWrite {
     comm: String,
     timestamp_ns: u64,
 }
+
+/// `check_quarantined_exec`'s tags: the plain join, and the one a mail client's
+/// mark gets (#376).
+const USER_EXECUTION_TECHNIQUE: &str = "T1204.002";
+const MAIL_ATTACHMENT_TECHNIQUE: &str = "T1566.001/T1204.002";
 
 /// One exec of a pid, for the as-of-time image lookup of SETUID-ROOT-REQUEST (#1041).
 struct ExecRecord {
@@ -855,8 +860,21 @@ impl RuleState {
             return None;
         }
         mark.alerted = true;
+        // A mail client's mark is the one thing that says how the file arrived:
+        // the finding names the attachment vector as well, and still only says
+        // "marked by", since a person who saved an attachment on purpose and
+        // ran it looks the same.
+        let by_mail_client = mark.agent.as_deref().is_some_and(|agent| {
+            MAIL_CLIENT_QUARANTINE_AGENTS
+                .iter()
+                .any(|client| agent.eq_ignore_ascii_case(client))
+        });
         Some(SignatureGatedAlert::new(Alert {
-            technique: "T1204.002",
+            technique: if by_mail_client {
+                MAIL_ATTACHMENT_TECHNIQUE
+            } else {
+                USER_EXECUTION_TECHNIQUE
+            },
             severity: Severity::High,
             message: format!(
                 "pid={} comm={} executes {}, downloaded {} earlier (origin: {}, marked by {})",
@@ -2087,10 +2105,11 @@ impl RuleState {
         if event.outcome != AuthOutcome::Success || event.kind != AuthKind::Logon {
             return None;
         }
-        match self
-            .logon_baseline
-            .observe(&event.target_user, event.meta.timestamp_ns)
-        {
+        match self.logon_baseline.observe(
+            &event.target_user,
+            event.target_user_sid.as_deref(),
+            event.meta.timestamp_ns,
+        ) {
             Observation::FirstSeen => {}
             Observation::Quiet | Observation::Known => return None,
         }

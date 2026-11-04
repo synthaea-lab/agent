@@ -99,7 +99,10 @@ pub struct DetectionConfig {
     /// `NAME|SID` binds the entry to the account's SID, which the Windows event carries and an
     /// intruder cannot choose: `svc_backup|S-1-5-21-1111-2222-3333-1004` exempts that account
     /// only, `svc_backup|S-1-5-21-1111-2222-3333-*` any account of that name under that domain
-    /// (or machine) SID prefix. An event with no SID (Linux and macOS logons) is not exempt
+    /// (or machine) SID prefix. A prefix entry exempts any account of that name that the
+    /// prefix's authority can create: a local admin can still create a look-alike under a
+    /// machine prefix, and anyone who can create domain accounts under a domain prefix. Prefer
+    /// the exact SID. An event with no SID (Linux and macOS logons) is not exempt
     /// under such an entry. Only the odd-hour rule skips them: FIRST-SEEN-LOGON still reads
     /// them. Empty by default, on purpose: nothing is exempt until the operator says so.
     #[serde(default)]

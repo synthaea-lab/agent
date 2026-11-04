@@ -2,7 +2,8 @@
 //! security tool.
 //!
 //! The parser is [`crate::servicestop::services_stopped`] (SERVICE-STOP-BURST, T1489): what an
-//! exec stops, from `systemctl`, `service`, `net`, `sc`, `launchctl` and `Stop-Service`. The
+//! exec stops, from `systemctl` (`stop`, `disable --now`, `mask --now` and `kill` with a signal
+//! that ends the unit), `service`, `net`, `sc`, `launchctl` and `Stop-Service`. The
 //! burst rule counts how many services; this one asks **which**: a single `systemctl stop
 //! falco` is what an intruder does to blind the host before acting, and it is below the
 //! burst's threshold by design.
@@ -39,7 +40,8 @@ fn is_security_tool(service: &str) -> bool {
 /// Medium: an administrator stopping `auditd` or `clamav-daemon` to debug or upgrade, a
 /// package script, and configuration management look the same. It reads the **command**: a
 /// stop that is refused (a Defender service cannot be stopped from `sc` on a current
-/// Windows), a tool killed with `kill`, `pkill` or `taskkill`, or stopped over D-Bus or an
+/// Windows), a tool killed with `kill`, `pkill` or `taskkill` (`systemctl kill` is read, since the
+/// manager's signal from pid 1 is only Low in `check_security_process_signal`), or stopped over D-Bus or an
 /// API, is not seen here, and the stop's success is not observed. A `SIGKILL` of the agent
 /// itself is `check_security_process_signal`'s.
 #[must_use]
