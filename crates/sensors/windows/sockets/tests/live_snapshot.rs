@@ -8,7 +8,9 @@
 
 use std::net::{SocketAddr, TcpListener, UdpSocket};
 
-use sensor_windows_sockets::{listen_port_events, listen_port_events_tcp, snapshot, snapshot_tcp};
+use sensor_windows_sockets::{
+    EPHEMERAL_UDP_PORTS, ListenerEntry, listen_port_events_for_drift, snapshot, snapshot_for_drift,
+};
 
 /// A TCP listener and a UDP socket bound to the **same** `127.0.0.1` port number. TCP and
 /// UDP ports are independent, so this is legal, and it is what makes the protocol tests
@@ -27,6 +29,28 @@ fn tcp_and_udp_on_one_port() -> (TcpListener, UdpSocket, SocketAddr) {
         }
     }
     panic!("no 127.0.0.1 port free for both TCP and UDP after 16 tries");
+}
+
+/// A UDP socket on `127.0.0.1` at a fixed port below [`EPHEMERAL_UDP_PORTS`], the way a
+/// service binds. Tries ports downward from the top of the fixed range until one is free.
+fn udp_on_a_fixed_port() -> UdpSocket {
+    let below = *EPHEMERAL_UDP_PORTS.start();
+    (below - 2000..below)
+        .rev()
+        .find_map(|port| UdpSocket::bind(("127.0.0.1", port)).ok())
+        .expect("a free 127.0.0.1 UDP port below the ephemeral range")
+}
+
+/// The protocols of this process's entries at `addr`, sorted.
+fn own_protocols_at(entries: &[ListenerEntry], addr: SocketAddr) -> Vec<u8> {
+    let me = std::process::id();
+    let mut protocols: Vec<u8> = entries
+        .iter()
+        .filter(|e| e.pid == me && e.local == addr)
+        .map(|e| e.protocol)
+        .collect();
+    protocols.sort_unstable();
+    protocols
 }
 
 #[test]
@@ -79,44 +103,25 @@ fn own_ipv6_listener_appears_with_its_port_decoded() {
 
 #[test]
 fn own_udp_socket_appears_attributed_with_udp_protocol() {
-    // A bound UDP socket is not a "listener", but GetExtendedUdpTable has no
-    // such filter — this is the real, unfiltered mechanism issue #676 asks
-    // for; the noise problem it also names (DNS client sockets, ephemeral
-    // ports) is a separate, deliberately deferred filter, not tested here.
     let socket = UdpSocket::bind("127.0.0.1:0").expect("bind ephemeral UDP socket");
-    let port = socket.local_addr().unwrap().port();
-    let me = std::process::id();
+    let addr = socket.local_addr().unwrap();
 
     let entries = snapshot().expect("snapshot must succeed unprivileged");
-    let mine = entries
-        .iter()
-        .find(|e| e.pid == me && e.local.port() == port && e.protocol == 17)
-        .unwrap_or_else(|| {
-            panic!(
-                "own UDP socket on port {port} not found among {} entries",
-                entries.len()
-            )
-        });
-
-    assert_eq!(mine.local.ip().to_string(), "127.0.0.1");
-    assert_eq!(mine.protocol, 17, "IPPROTO_UDP");
+    assert_eq!(
+        own_protocols_at(&entries, addr),
+        [17],
+        "own UDP socket at {addr} not found among {} entries",
+        entries.len()
+    );
     drop(socket);
 }
 
 #[test]
 fn own_tcp_listener_is_still_distinguished_from_udp() {
     let (listener, socket, addr) = tcp_and_udp_on_one_port();
-    let me = std::process::id();
-
     let entries = snapshot().expect("snapshot");
-    let mut protocols: Vec<u8> = entries
-        .iter()
-        .filter(|e| e.pid == me && e.local == addr)
-        .map(|e| e.protocol)
-        .collect();
-    protocols.sort_unstable();
     assert_eq!(
-        protocols,
+        own_protocols_at(&entries, addr),
         [6, 17],
         "one TCP and one UDP entry at {addr}, told apart by protocol"
     );
@@ -125,70 +130,41 @@ fn own_tcp_listener_is_still_distinguished_from_udp() {
 }
 
 #[test]
-fn snapshot_tcp_finds_the_same_tcp_listener_as_snapshot_but_no_udp() {
-    // The agent's own entry point (review of #1008, #676 part 2): it must see
-    // what `snapshot` sees on the TCP side, and never fetch/report a UDP entry
-    // at all — not "reports it and relies on a filter downstream."
+fn an_ephemeral_udp_socket_is_left_out_of_the_drift_snapshot_but_its_tcp_twin_is_not() {
+    // The OS hands a `:0` bind a port from the dynamic range, the way a client
+    // socket gets one, so the UDP side is what the #676 filter must drop.
     let (listener, socket, addr) = tcp_and_udp_on_one_port();
-    let me = std::process::id();
-
-    let entries = snapshot_tcp().expect("snapshot_tcp must succeed unprivileged");
-    let mine: Vec<u8> = entries
-        .iter()
-        .filter(|e| e.pid == me && e.local == addr)
-        .map(|e| e.protocol)
-        .collect();
-    assert_eq!(
-        mine,
-        [6],
-        "exactly the TCP listener at {addr}, not the UDP socket bound beside it"
-    );
     assert!(
-        entries.iter().all(|e| e.protocol == 6),
-        "every snapshot_tcp entry must be IPPROTO_TCP"
+        EPHEMERAL_UDP_PORTS.contains(&addr.port()),
+        "the OS assigned {addr} outside the default dynamic range; was the host's range changed?"
     );
-    drop(listener);
-    drop(socket);
-}
 
-#[test]
-fn listen_port_events_tcp_carries_the_listener_but_not_a_udp_socket() {
-    let (listener, socket, addr) = tcp_and_udp_on_one_port();
-    let me = std::process::id();
-
-    let events = listen_port_events_tcp(1_790_000_000_000_000_000).expect("events");
-    let mine: Vec<u8> = events
-        .iter()
-        .filter_map(|e| match e {
-            schema::Event::ListenPort(l)
-                if l.meta.pid == me && l.local_addr == addr.ip() && l.local_port == addr.port() =>
-            {
-                Some(l.protocol)
-            }
-            _ => None,
-        })
-        .collect();
+    let entries = snapshot_for_drift().expect("snapshot_for_drift must succeed unprivileged");
     assert_eq!(
-        mine,
+        own_protocols_at(&entries, addr),
         [6],
-        "exactly the TCP listener at {addr}, not the UDP socket bound beside it"
+        "the TCP listener only, at {addr}"
     );
     drop(listener);
     drop(socket);
 }
 
 #[test]
-fn listen_port_events_carry_the_listener_as_a_schema_event() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral listener");
-    let port = listener.local_addr().unwrap().port();
+fn a_udp_socket_on_a_fixed_port_reaches_the_drift_events() {
+    let socket = udp_on_a_fixed_port();
+    let addr = socket.local_addr().unwrap();
     let me = std::process::id();
 
-    let events = listen_port_events(1_790_000_000_000_000_000).expect("events");
+    let events = listen_port_events_for_drift(1_790_000_000_000_000_000).expect("events");
     let found = events.iter().any(|e| {
         matches!(e, schema::Event::ListenPort(l)
-            if l.meta.pid == me && l.local_port == port
+            if l.meta.pid == me && l.local_addr == addr.ip() && l.local_port == addr.port()
+               && l.protocol == schema::IPPROTO_UDP
                && l.meta.timestamp_ns == 1_790_000_000_000_000_000)
     });
-    assert!(found, "own listener must normalize into Event::ListenPort");
-    drop(listener);
+    assert!(
+        found,
+        "own UDP socket at {addr} must reach the drift events"
+    );
+    drop(socket);
 }

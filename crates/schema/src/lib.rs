@@ -334,11 +334,17 @@ pub mod time;
 /// image file at exec time, so the T1204.002 signature gate can distinguish the
 /// image that ran from whatever the path contains when it is later verified.
 ///
-/// Bumped 59 → 61 for [`ExecEvent::cmdline_truncated`] (#1112): a Linux sensor
-/// now bounds argv at capture and flags the cut. #1114 was open at the time and
-/// claims 60; whichever of the two merges later renumbers, same coordination
+/// Bumped 59 → 62 for [`Event::UnitStop`] (#1085): the stop of a security-tool systemd unit as an
+/// event of its own, replacing a `FileOpenEvent` carrying `FLAG_UNIT_STOPPED`. A raw `openat`
+/// flag can carry any bit, so an unprivileged open could set that one. 60 is claimed by #1114
+/// (`SignalEvent::signals_lost`) and 61 by #1116; whichever merges first renumbers the others.
+///
+/// Bumped 62 → 65 for [`ExecEvent::cmdline_truncated`] (#1112): a sensor now
+/// bounds argv at capture and flags the cut. First claimed 61 while #1114 held 60;
+/// #1085 landed first with 62, #1114 renumbered to 63 and #720 (#1150) claims 64,
+/// so this takes 65. Whichever of those merges later renumbers, same coordination
 /// note as above.
-pub const SCHEMA_VERSION: u32 = 61;
+pub const SCHEMA_VERSION: u32 = 65;
 
 /// Bytes of argv, one separator per token included, a sensor keeps for one exec
 /// ([`bound_argv`], #1112).
@@ -529,15 +535,6 @@ pub const FLAG_APPLICATION_BLOCKED: u32 = 0x0100_0000;
 /// reasoning as [`FLAG_PERSISTENCE_ARTIFACT`]).
 pub const FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT: u32 = 0x0080_0000;
 
-/// A systemd unit of [`SECURITY_SERVICES`] was stopped (journald `JOB_TYPE=stop`, #1085, T1562.001): a
-/// `FileOpenEvent` whose `path` and `meta.comm` carry the unit name, as for
-/// [`FLAG_PERSISTENCE_SYSTEMD_ARTIFACT`]. The journal names no actor, so this says a stop happened,
-/// not who asked for it.
-///
-/// The top bit, on purpose: `FileOpenEvent::flags` also carries the kernel's `open(2)` flags on
-/// Linux, and the bits below `0x0100_0000` are real ones (`0x0020_0000` is `O_PATH`).
-pub const FLAG_UNIT_STOPPED: u32 = 0x8000_0000;
-
 /// Services of security tooling, lowercase, compared without a `.service` suffix. Product
 /// names are as the vendors' documentation gives them and were **not checked on a host**: a
 /// name that is wrong costs a missed stop, never a false alert. `auditd` is here although
@@ -582,7 +579,7 @@ pub const SECURITY_SERVICES: &[&str] = &[
 /// consumer's test: the first cut of [`FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT`]
 /// took `0x0200_0000`, already [`FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN`], and the
 /// hardcoded list in `rules`' collision test missed it (#399 review).
-const SYNTHETIC_FLAGS: [u32; 9] = [
+pub const SYNTHETIC_FLAGS: [u32; 8] = [
     FLAG_PERSISTENCE_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
@@ -591,7 +588,6 @@ const SYNTHETIC_FLAGS: [u32; 9] = [
     FLAG_PERSISTENCE_BTM_ARTIFACT,
     FLAG_APPLICATION_BLOCKED,
     FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT,
-    FLAG_UNIT_STOPPED,
 ];
 
 const _: () = {
@@ -871,6 +867,11 @@ pub struct FileOpenEvent {
     /// Platform-native open/access flags (Linux `open(2)` flags, Windows create
     /// dispositions). Rules match primarily on `path`; flag interpretation is
     /// per-platform and documented by each sensor.
+    ///
+    /// The synthetic `FLAG_*` bits (see `SYNTHETIC_FLAGS`) are set only by userspace sensors
+    /// that build the event themselves. On Linux the probe's raw `open(2)` flags are masked
+    /// with `OPEN_FLAGS_MASK` (`sensor-linux`'s `normalize`) before they get here, because the kernel ignores unknown
+    /// bits and any local user could otherwise forge a synthetic bit (#1129).
     pub flags: u32,
 }
 
@@ -1717,6 +1718,22 @@ pub struct BitsJobEvent {
     /// The failing HRESULT of a [`BitsJobState::TransferError`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hresult: Option<u32>,
+}
+
+/// The stop of a systemd unit of [`SECURITY_SERVICES`] (Linux journald `JOB_TYPE=stop`, #1085,
+/// T1562.001). `meta.comm` also carries the unit name, as for the unit start. The journal names
+/// no actor, so this says a stop happened, not who asked for it.
+///
+/// An event of its own, not a flag on a [`FileOpenEvent`]: that event's `flags` are the raw
+/// `open(2)` flags on Linux (unknown bits pass through `openat`), so any bit there can be set
+/// by an unprivileged open, as `O_TMPFILE` set the first cut of the signal-loss bit (#1114).
+/// Only the journal sensor builds this variant, from a record whose writer is the system
+/// manager, and no probe produces it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitStopEvent {
+    pub meta: EventMeta,
+    /// The unit as the journal names it (`auditd.service`).
+    pub unit: String,
 }
 
 /// UDP datagram sent — the primary signal for DNS-tunneling and C2-over-UDP detection.
@@ -2733,6 +2750,7 @@ pub enum Event {
     HttpSummary(HttpSummaryEvent),
     PackageChange(PackageChangeEvent),
     BitsJob(BitsJobEvent),
+    UnitStop(UnitStopEvent),
 }
 
 impl Event {
@@ -2802,6 +2820,7 @@ impl Event {
             Event::HttpSummary(e) => &e.meta,
             Event::PackageChange(e) => &e.meta,
             Event::BitsJob(e) => &e.meta,
+            Event::UnitStop(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.

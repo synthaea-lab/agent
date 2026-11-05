@@ -1,4 +1,4 @@
-//! `wevtutil`-polling implementation of the persistence detections plus the
+//! Polling implementation (`EvtQuery`, `query.rs`) of the persistence detections plus the
 //! logon/session events (see the crate doc for why polling rather than
 //! `EvtSubscribe`/ETW). One independent poll thread per enabled
 //! [`PollTarget`] — the shared pipeline (cursor, query, normalize, count,
@@ -28,7 +28,10 @@ use schema::{
     time::now_ns,
 };
 
-use crate::xml::{self, LogonEvent};
+use crate::{
+    query::{Direction, query_events},
+    xml::{self, LogonEvent},
+};
 
 /// All channels are polled on the same cadence — persistence detection and
 /// logon-event normalization both have no sub-second stakes (the underlying
@@ -73,32 +76,6 @@ const USER_ACCOUNT_MGMT_AUDIT_SUBCATEGORY_GUID: &str = "{0CCE9235-69AE-11D9-BED3
 /// process rather than leaving it blank.
 const LSASS_COMM: &str = "lsass.exe";
 
-/// Runs `wevtutil` and returns its stdout, or why the call failed.
-///
-/// A non-zero exit is a failure even though stdout is empty either way:
-/// `wevtutil qe` exits 0 with empty output when nothing matches, and *also*
-/// prints nothing on stdout when it is refused — exit 5
-/// (`ERROR_ACCESS_DENIED`, e.g. reading Security without admin rights,
-/// observed on a dev host). Folding both into `""` made a blinded channel
-/// indistinguishable from a quiet one (#388).
-fn wevtutil(args: &[&str]) -> Result<String, String> {
-    let output = Command::new("wevtutil")
-        .args(args)
-        .output()
-        .map_err(|e| format!("wevtutil could not be spawned: {e}"))?;
-    if !output.status.success() {
-        let code = output
-            .status
-            .code()
-            .map_or_else(|| "no exit code".to_string(), |c| c.to_string());
-        return Err(format!(
-            "wevtutil exited with {code}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
 // ── The shared poll pipeline ─────────────────────────────────────────────────
 //
 // Every target below is the same machine: remember the newest `EventRecordID`
@@ -124,7 +101,7 @@ pub(crate) struct PollTarget {
     /// Names this target's silence heartbeat (`cli health`, T1562 alerts) —
     /// see [`EventLogSensor::liveness`].
     heartbeat: &'static str,
-    /// `wevtutil` channel (`System` / `Security`).
+    /// Event Log channel (`System` / `Security`).
     pub(crate) channel: &'static str,
     /// The `EventID=...` predicate, without the surrounding `*[System[...]]`.
     pub(crate) id_filter: &'static str,
@@ -146,16 +123,13 @@ pub(crate) struct PollTarget {
 
 /// `EventRecordID` of the newest matching event already in the channel.
 fn last_known_record_id(target: &PollTarget) -> Result<u64, String> {
-    let query = format!("/q:*[System[({})]]", target.id_filter);
-    let xml_out = wevtutil(&[
-        "qe",
+    let blocks = query_events(
         target.channel,
-        "/c:1",
-        "/rd:true",
-        "/f:xml",
-        query.as_str(),
-    ])?;
-    Ok(xml::split_event_blocks(&xml_out)
+        &target_xpath(target, None),
+        Direction::Reverse,
+        Some(1),
+    )?;
+    Ok(blocks
         .first()
         .and_then(|block| (target.parse_block)(block))
         .map_or(0, |(record_id, _)| record_id))
@@ -166,15 +140,28 @@ fn new_blocks(
     target: &PollTarget,
     since_record_id: u64,
 ) -> Result<Vec<(u64, Option<Event>)>, String> {
-    let query = format!(
-        "/q:*[System[({}) and (EventRecordID>{since_record_id})]]",
-        target.id_filter
-    );
-    let xml_out = wevtutil(&["qe", target.channel, "/rd:false", "/f:xml", query.as_str()])?;
-    Ok(xml::split_event_blocks(&xml_out)
-        .into_iter()
+    let blocks = query_events(
+        target.channel,
+        &target_xpath(target, Some(since_record_id)),
+        Direction::Forward,
+        None,
+    )?;
+    Ok(blocks
+        .iter()
         .filter_map(|block| (target.parse_block)(block))
         .collect())
+}
+
+/// The `XPath` query of `target`, restricted to records after `since_record_id` if given. The
+/// `Subscribe` transport wraps `id_filter` the same way.
+fn target_xpath(target: &PollTarget, since_record_id: Option<u64>) -> String {
+    match since_record_id {
+        Some(since) => format!(
+            "*[System[({}) and (EventRecordID>{since})]]",
+            target.id_filter
+        ),
+        None => format!("*[System[({})]]", target.id_filter),
+    }
 }
 
 /// One poll tick: establishes the startup cursor if there is none yet,
@@ -1307,7 +1294,7 @@ static KERBEROS_DELEGATION_FAILURES: PollTarget = PollTarget {
 
 /// Which of this sensor's three independent poll targets are active. A
 /// disabled group is never even queried — not filtered after the fact — so a
-/// host that, say, disables logon-event polling pays no `wevtutil` cost for it
+/// host that, say, disables logon-event polling pays no query cost for it
 /// either.
 /// Which transport the sensor uses to receive Event Log records from the OS
 /// (issue #322). Both transports produce identical normalized `Event`s
@@ -1315,12 +1302,11 @@ static KERBEROS_DELEGATION_FAILURES: PollTarget = PollTarget {
 /// [`EventLogCounters`] — only the delivery mechanism differs.
 ///
 /// - [`Polling`](EventLogTransport::Polling) — the default. One thread per
-///   enabled target runs a `wevtutil qe` loop on `POLL_INTERVAL` cadence,
-///   filters by `EventRecordID > last_seen`, and parses each returned XML
-///   block. Adds up to `POLL_INTERVAL` of latency and one child-process
-///   spawn per tick per channel, in exchange for zero Windows API surface
-///   beyond what `wevtutil` already exposes — the safe fallback if a host's
-///   `EvtSubscribe` behavior is ever in doubt.
+///   enabled target runs an `EvtQuery` loop on `POLL_INTERVAL` cadence
+///   (`wevtutil qe` before #1126), filters by `EventRecordID > last_seen`,
+///   and parses each returned XML block. Adds up to `POLL_INTERVAL` of
+///   latency, in exchange for no callback registered with the OS — the safe
+///   fallback if a host's `EvtSubscribe` behavior is ever in doubt.
 ///
 /// - [`Subscribe`](EventLogTransport::Subscribe) — one `EvtSubscribe` call
 ///   per enabled target, callback delivery from the OS the moment an event
@@ -1333,7 +1319,7 @@ static KERBEROS_DELEGATION_FAILURES: PollTarget = PollTarget {
 /// the original polling-vs-subscribe investigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventLogTransport {
-    /// Default `wevtutil`-based poll loop, one thread per enabled target.
+    /// Default `EvtQuery` poll loop, one thread per enabled target.
     Polling,
     /// `EvtSubscribe`-based push delivery via a Windows callback, one
     /// subscription per enabled target.
@@ -1441,7 +1427,7 @@ impl Default for EventLogConfig {
 }
 
 /// Per-group event counts, incremented once per event actually normalized and
-/// handed to the sink (not per raw `wevtutil` XML block — a block skipped for
+/// handed to the sink (not per raw XML block — a block skipped for
 /// missing/unusable fields is not "volume", it is noise this sensor already
 /// filtered out). Plain `Relaxed` atomics: independent monotonic counts, never
 /// used to synchronize anything else. A handle from
@@ -1471,7 +1457,7 @@ pub struct EventLogCounters {
 }
 
 /// One warning per enabled target channel that is switched off (#786). A disabled
-/// channel answers `wevtutil qe` with exit 0 and no events, so without this the
+/// channel answers a query with no events and no error, so without this the
 /// target looks like a quiet, healthy one and its liveness counter keeps moving.
 /// Checked once per channel (several targets share `Security`), at start-up only:
 /// a channel switched off while the agent runs is not caught here.
@@ -1501,7 +1487,7 @@ fn warn_about_disabled_channels(config: &EventLogConfig, counters: &EventLogCoun
 
 // ── The sensor ────────────────────────────────────────────────────────────────
 
-/// The Windows Event Log poller: spawns one `wevtutil`-based poll loop per
+/// The Windows Event Log poller: spawns one `EvtQuery` poll loop per
 /// enabled target (see the crate doc) and implements `schema::sensor::Sensor`.
 pub struct EventLogSensor {
     stop: Arc<AtomicBool>,
@@ -1548,7 +1534,7 @@ impl EventLogSensor {
 
     /// One liveness counter per **enabled** poll target, named for a silence
     /// monitor (`windows-eventlog:<target>`). Each is incremented once per poll
-    /// tick that actually succeeded (`wevtutil` exited 0), whether or not it
+    /// tick that actually succeeded (the channel query did not fail), whether or not it
     /// found events: a quiet channel stays live, a refused or broken one goes
     /// dark. Per target rather than per sensor, because one shared counter would
     /// let a healthy System poll mask a Security channel that stopped answering.
@@ -1929,27 +1915,155 @@ mod config_tests {
 }
 
 #[cfg(test)]
-mod wevtutil_tests {
+mod query_tests {
     use super::*;
 
+    /// Writes one Application event whose only insertion string is `text`, from an
+    /// unregistered source: no admin rights needed.
+    fn write_application_event(text: &str) {
+        use windows_sys::Win32::System::EventLog::{
+            DeregisterEventSource, EVENTLOG_INFORMATION_TYPE, RegisterEventSourceW, ReportEventW,
+        };
+        let source: Vec<u16> = TEST_SOURCE
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let strings = [wide.as_ptr()];
+        // SAFETY: `source` is a NUL-terminated UTF-16 string alive for the call; a null server
+        // name is the local host.
+        let log = unsafe { RegisterEventSourceW(std::ptr::null(), source.as_ptr()) };
+        assert!(!log.is_null(), "RegisterEventSourceW failed");
+        // SAFETY: `log` is the handle opened above; `strings` holds one pointer to a
+        // NUL-terminated UTF-16 string alive for the call; no SID, no raw data.
+        let ok = unsafe {
+            ReportEventW(
+                log,
+                EVENTLOG_INFORMATION_TYPE,
+                0,
+                1126,
+                std::ptr::null_mut(),
+                1,
+                0,
+                strings.as_ptr(),
+                std::ptr::null(),
+            )
+        };
+        // SAFETY: `log` was opened above and is closed once, here.
+        unsafe { DeregisterEventSource(log) };
+        assert_ne!(ok, 0, "ReportEventW failed");
+    }
+
+    const TEST_SOURCE: &str = "Synthaea-test-1126";
+
+    fn record_ids(blocks: &[String]) -> Vec<u64> {
+        blocks
+            .iter()
+            .filter_map(|b| {
+                xml::extract_between(b, "<EventRecordID>", "</EventRecordID>")?
+                    .parse()
+                    .ok()
+            })
+            .collect()
+    }
+
+    /// #1126: the polling transport read `wevtutil`'s stdout, which is in the ANSI code page,
+    /// so a name that page cannot hold (Cyrillic or CJK on a Windows-1252 host) reached the
+    /// rules as `?`s, and two such accounts as one string. Read through `EvtQuery`, the event's
+    /// text comes back as written, whatever the host's code page.
     #[test]
-    fn a_query_matching_nothing_is_a_success_with_empty_output() {
-        let out = wevtutil(&[
-            "qe",
-            "System",
-            "/c:1",
-            "/f:xml",
-            "/q:*[System[(EventID=99999)]]",
-        ])
-        .expect("an empty result is not a failure");
-        assert!(out.trim().is_empty());
+    fn a_non_ascii_name_is_read_back_from_the_channel_as_written() {
+        let text = format!("Système Дмитрий 山田太郎 andrè {}", std::process::id());
+        write_application_event(&text);
+        let query = format!("*[System[Provider[@Name='{TEST_SOURCE}'] and (EventID=1126)]]");
+        let blocks = query_events("Application", &query, Direction::Reverse, Some(20))
+            .expect("the Application channel is readable unelevated");
+        assert!(
+            blocks.iter().any(|block| block.contains(&text)),
+            "the event was not read back intact: {blocks:?}"
+        );
+        assert!(blocks.iter().all(|block| !block.contains('\u{FFFD}')));
+    }
+
+    /// The logon path from a block as `EvtRender` gives it: a non-ASCII account name reaches
+    /// the `AuthEvent` intact, and two names that differ by one accented letter stay two users
+    /// (both were `andr\u{FFFD}` before #1126).
+    #[test]
+    fn a_non_ascii_account_name_reaches_the_auth_event_intact() {
+        let user_of = |name: &str| {
+            let block = format!(
+                "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>\
+                 <EventID>4624</EventID><TimeCreated SystemTime='2026-11-05T10:00:00.0000000Z'/>\
+                 <EventRecordID>7</EventRecordID><Execution ProcessID='836' ThreadID='1'/>\
+                 </System><EventData><Data Name='TargetUserSid'>S-1-5-21-1-2-3-1001</Data>\
+                 <Data Name='TargetUserName'>{name}</Data><Data Name='LogonType'>2</Data>\
+                 </EventData></Event>"
+            );
+            match normalize_logon(&block) {
+                Some((7, Some(Event::Auth(auth)))) => auth.target_user,
+                other => panic!("{name}: {other:?}"),
+            }
+        };
+        for name in ["Système", "Дмитрий", "山田太郎"] {
+            assert_eq!(user_of(name), name);
+        }
+        assert_ne!(user_of("andré"), user_of("andrè"));
+    }
+
+    /// The `EvtQuery` read picks the records `wevtutil` picked, newest first with a limit and
+    /// oldest first after a cursor, so swapping the transport moves no poll cursor.
+    #[test]
+    fn the_query_reads_the_records_wevtutil_reads() {
+        let out = Command::new("wevtutil")
+            .args(["qe", "System", "/c:5", "/rd:true", "/f:xml"])
+            .output()
+            .expect("wevtutil runs");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let wevtutil_blocks: Vec<String> = xml::split_event_blocks(&text)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        let newest = query_events("System", "*", Direction::Reverse, Some(5)).expect("System");
+        let newest = record_ids(&newest);
+        assert_eq!(newest.len(), 5);
+        assert_eq!(newest, record_ids(&wevtutil_blocks));
+
+        let query = format!(
+            "*[System[(EventRecordID>{}) and (EventRecordID<={})]]",
+            newest[4], newest[0]
+        );
+        let forward = query_events("System", &query, Direction::Forward, None).expect("System");
+        let mut expected = newest[..4].to_vec();
+        expected.reverse();
+        assert_eq!(record_ids(&forward), expected);
     }
 
     #[test]
+    fn a_query_matching_nothing_is_a_success_with_no_events() {
+        let blocks = query_events(
+            "System",
+            "*[System[(EventID=99999)]]",
+            Direction::Reverse,
+            Some(1),
+        )
+        .expect("an empty result is not a failure");
+        assert!(blocks.is_empty());
+    }
+
+    /// #388: a refused or misspelt channel must not look like a quiet one.
+    #[test]
     fn a_failing_query_is_an_error_not_an_empty_result() {
-        let err = wevtutil(&["qe", "Synthaea-No-Such-Channel", "/c:1"])
+        let err = query_events("Synthaea-No-Such-Channel", "*", Direction::Reverse, Some(1))
             .expect_err("an unknown channel must not look like a quiet one");
-        assert!(err.contains("exited with"), "{err}");
+        assert!(err.contains("Win32 error"), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_query_is_an_error() {
+        let err = query_events("System", "*[System[(EventID=", Direction::Forward, None)
+            .expect_err("a malformed XPath fails every poll, so it must be an error");
+        assert!(err.contains("Win32 error"), "{err}");
     }
 
     #[test]
@@ -1998,15 +2112,15 @@ mod wevtutil_tests {
     /// on this host (Task Scheduler history is, on a default client install).
     #[test]
     #[ignore = "needs Microsoft-Windows-TaskScheduler/Operational disabled on this host"]
-    fn a_disabled_channel_looks_like_a_quiet_one_to_wevtutil() {
+    fn a_disabled_channel_looks_like_a_quiet_one_to_a_query() {
         assert_eq!(
             crate::channel::is_enabled(TASK_SCHEDULER_OP.channel),
             Some(false),
             "precondition: Task Scheduler history is off here"
         );
-        let out = wevtutil(&["qe", TASK_SCHEDULER_OP.channel, "/c:1", "/f:xml"])
+        let blocks = query_events(TASK_SCHEDULER_OP.channel, "*", Direction::Reverse, Some(1))
             .expect("a disabled channel is not a failing query");
-        assert!(out.trim().is_empty());
+        assert!(blocks.is_empty());
     }
 }
 

@@ -19,7 +19,8 @@ tracing = { workspace = true }
 # `sensor.rs` and `subscribe.rs` are already `#[cfg(windows)]`-gated).
 # `Win32_Foundation` gives us `ERROR_SUCCESS` / `GetLastError`; the
 # `Win32_System_EventLog` feature is what actually pulls in `EvtSubscribe`,
-# `EvtRender`, `EvtClose`, the `EVT_HANDLE` type, and the notify-action enum.
+# `EvtRender`, `EvtQuery`/`EvtNext` (the polling read, #1126), `EvtClose`, the
+# `EVT_HANDLE` type, and the notify-action enum.
 # `Win32_Security` is what windows-sys gates `EVT_VARIANT` and
 # `EvtGetChannelConfigProperty` behind (the channel `Enabled` check, #786).
 [target.'cfg(windows)'.dependencies]

@@ -23,7 +23,8 @@ use schema::{
     RawVolumeOpenEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent,
     SessionState, ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
     SocketCreateEvent, SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection,
-    TlsLibraryType, UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
+    TlsLibraryType, UdpRecvEvent, UdpSendEvent, UnitStopEvent, User, WmiActivityEvent,
+    XpcConnectEvent,
     detection::{Detection, DetectionSource, IocKind, ScoreAttribution, Severity},
 };
 
@@ -2259,6 +2260,27 @@ fn namespace_golden() {
 }
 
 #[test]
+fn unit_stop_golden() {
+    // v62 (#1085): the stop of a security-tool unit, an event of its own and not an open flag.
+    assert_golden(
+        &Event::UnitStop(UnitStopEvent {
+            meta: EventMeta {
+                pid: 1,
+                ppid: 0,
+                user: User::Unknown,
+                timestamp_ns: 1_756_900_000_123_456_789,
+                comm: "auditd.service".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            unit: "auditd.service".into(),
+        }),
+        "unit_stop",
+    );
+}
+
+#[test]
 fn bits_job_golden() {
     // v48 (#284): `bitsadmin /transfer` adding a file to a BITS job. The
     // service does the download; this record names the client that asked.
@@ -2904,6 +2926,10 @@ fn meta_accessor_covers_all_variants() {
             change: PackageChangeKind::Added,
             previous_version: None,
             version: Some("1".into()),
+        }),
+        Event::UnitStop(UnitStopEvent {
+            meta: meta.clone(),
+            unit: "auditd.service".into(),
         }),
     ];
     for e in &events {

@@ -1,0 +1,14 @@
+{
+  "type": "socket_create",
+  "meta": {
+    "pid": 8101,
+    "ppid": 1,
+    "user": { "os": "unix", "uid": 0, "gid": 0 },
+    "timestamp_ns": 1756900019000000000,
+    "comm": "tcpdump"
+  },
+  "domain": 17,
+  "socket_type": 3,
+  "protocol": 768,
+  "fd": 5
+}

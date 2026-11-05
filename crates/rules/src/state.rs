@@ -30,18 +30,18 @@ use crate::{
         CREATE_UNLINK_PID_CAP, CREDENTIAL_READ_ALERT_WINDOW_NS, DNS_CLASS_WINDOW_NS,
         DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS, EGRESS_BYTES_THRESHOLD,
         EGRESS_CLASSED_BYTES_THRESHOLD, EGRESS_DOMAIN_BROWSER_COMMS, EGRESS_WINDOW_NS,
-        IN_PLACE_EDIT_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS,
-        MEMFD_EXEC_WINDOW_NS, PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES,
-        POLICY_DENIAL_ALERT_CAP, POLICY_DENIAL_SUBJECT_CAP, QUARANTINE_EXEC_WINDOW_NS,
-        RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD,
-        RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
-        SCAN_VERTICAL_THRESHOLD, SCAN_VERTICAL_WINDOW_NS, SELF_SPAWN_EXCLUSIONS,
-        SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD,
-        SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS, SELINUX_POLICY_TOOL_COMMS,
-        SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STAGING_PID_CAP, STAGING_READ_DIRS,
-        STAGING_READ_FILES, STAGING_WINDOW_NS, STAGING_WRITE_FILES, STANDARD_PORTS,
-        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
-        TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
+        IN_PLACE_EDIT_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAIL_CLIENT_QUARANTINE_AGENTS,
+        MAILDIR_FLAG_LETTERS, MEMFD_EXEC_WINDOW_NS, PACKAGE_MANAGER_COMMS,
+        PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES, POLICY_DENIAL_ALERT_CAP, POLICY_DENIAL_SUBJECT_CAP,
+        QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX,
+        RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD,
+        SCAN_SPREAD_WINDOW_NS, SCAN_VERTICAL_THRESHOLD, SCAN_VERTICAL_WINDOW_NS,
+        SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS,
+        SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS,
+        SELINUX_POLICY_TOOL_COMMS, SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS,
+        STAGING_PID_CAP, STAGING_READ_DIRS, STAGING_READ_FILES, STAGING_WINDOW_NS,
+        STAGING_WRITE_FILES, STANDARD_PORTS, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN,
+        TASK_REGISTRATION_DEDUP_WINDOW_NS, TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
     },
     has_write_intent,
     logon::{LogonBaseline, Observation},
@@ -133,6 +133,11 @@ struct RecentWrite {
     comm: String,
     timestamp_ns: u64,
 }
+
+/// `check_quarantined_exec`'s tags: the plain join, and the one a mail client's
+/// mark gets (#376).
+const USER_EXECUTION_TECHNIQUE: &str = "T1204.002";
+const MAIL_ATTACHMENT_TECHNIQUE: &str = "T1566.001/T1204.002";
 
 /// One exec of a pid, for the as-of-time image lookup of SETUID-ROOT-REQUEST (#1041).
 struct ExecRecord {
@@ -360,6 +365,12 @@ pub struct RuleState {
     /// Lineage → distinct services it stopped, for SERVICE-STOP-BURST (T1489, #381).
     /// LRU-bounded.
     service_stop: BoundedMap<crate::recon::Lineage, SlidingDistinct<String>>,
+    /// Lineage → its last SERVICE-STOP-BURST finding, so a T1486 finding from the same lineage
+    /// can say it was preceded by one (#973). Read for the message only. LRU-bounded.
+    burst_marks: BoundedMap<crate::recon::Lineage, crate::impactctx::BurstMark>,
+    /// Lineage → its last T1486 or T1490 finding, so a shutdown from the same lineage can be
+    /// reported as context for it (T1529, #973). LRU-bounded.
+    impact_marks: BoundedMap<crate::recon::Lineage, crate::impactctx::ImpactMark>,
     /// (pid, dport) → sliding distinct-destination counter for SCAN-SPREAD
     /// (T1046/T1210, issue #465). LRU-bounded.
     scan_spread: BoundedMap<(u32, u16), SlidingDistinct<IpAddr>>,
@@ -615,6 +626,8 @@ impl RuleState {
             ssh_fanout: BoundedMap::new(COUNTER_CAP),
             security_discovery: BoundedMap::new(COUNTER_CAP),
             service_stop: BoundedMap::new(COUNTER_CAP),
+            burst_marks: BoundedMap::new(COUNTER_CAP),
+            impact_marks: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
             known_policy_denials: BoundedMap::new(COUNTER_CAP),
             policy_denial_budgets: BoundedMap::new(POLICY_DENIAL_SUBJECT_CAP),
@@ -855,8 +868,21 @@ impl RuleState {
             return None;
         }
         mark.alerted = true;
+        // A mail client's mark is the one thing that says how the file arrived:
+        // the finding names the attachment vector as well, and still only says
+        // "marked by", since a person who saved an attachment on purpose and
+        // ran it looks the same.
+        let by_mail_client = mark.agent.as_deref().is_some_and(|agent| {
+            MAIL_CLIENT_QUARANTINE_AGENTS
+                .iter()
+                .any(|client| agent.eq_ignore_ascii_case(client))
+        });
         Some(SignatureGatedAlert::new(Alert {
-            technique: "T1204.002",
+            technique: if by_mail_client {
+                MAIL_ATTACHMENT_TECHNIQUE
+            } else {
+                USER_EXECUTION_TECHNIQUE
+            },
             severity: Severity::High,
             message: format!(
                 "pid={} comm={} executes {}, downloaded {} earlier (origin: {}, marked by {})",
@@ -1404,6 +1430,17 @@ impl RuleState {
         for name in stopped {
             distinct = entry.record(name, ts, SERVICE_STOP_WINDOW_NS);
         }
+        if distinct >= SERVICE_STOP_THRESHOLD {
+            // Refreshed while the burst goes on, not only at the alert: a burst that runs
+            // past one window is still the burst a later mass rename follows.
+            self.burst_marks.insert(
+                lineage,
+                crate::impactctx::BurstMark {
+                    at_ns: ts,
+                    services: distinct,
+                },
+            );
+        }
         if distinct >= SERVICE_STOP_THRESHOLD && entry.try_alert(ts, SERVICE_STOP_WINDOW_NS) {
             let seen: Vec<&str> = entry.values().map(String::as_str).take(12).collect();
             return Some(Alert {
@@ -1426,6 +1463,101 @@ impl RuleState {
             });
         }
         None
+    }
+
+    /// T1529 as case context (#973): a shutdown or reboot command from a lineage that already
+    /// raised a T1486 or a T1490 finding within [`crate::impactctx::IMPACT_TO_SHUTDOWN_WINDOW_NS`].
+    /// Without such a finding it returns nothing and records nothing, so a reboot is never a
+    /// finding of its own. Also arms the lineages of a T1490 command. Low, once per finding.
+    /// See [`crate::impactctx`] for what counts as a shutdown and why.
+    fn check_shutdown_context(
+        &mut self,
+        event: &ExecEvent,
+        lineage: crate::recon::Lineage,
+    ) -> Option<Alert> {
+        use crate::impactctx::{IMPACT_TO_SHUTDOWN_WINDOW_NS, shutdown_command};
+
+        let ts = event.meta.timestamp_ns;
+        if crate::stateless::check_recovery_inhibit(event).is_some() {
+            self.mark_impact(
+                Some(lineage),
+                event.meta.pid,
+                event.meta.process_generation,
+                ts,
+                "T1490",
+            );
+            return None;
+        }
+        let command = shutdown_command(event)?;
+        let mark = self.impact_marks.get_mut(&lineage)?;
+        if ts < mark.at_ns || ts - mark.at_ns > IMPACT_TO_SHUTDOWN_WINDOW_NS || mark.reported {
+            return None;
+        }
+        mark.reported = true;
+        Some(Alert {
+            technique: "T1529",
+            severity: Severity::Low,
+            message: format!(
+                "pid={} comm={}: `{command}` run {}s after a {} finding from the lineage of \
+                 pid={} — context for that case, not a finding of its own (the command was \
+                 seen, the host going down is not confirmed)",
+                event.meta.pid,
+                event.meta.comm,
+                (ts - mark.at_ns) / 1_000_000_000,
+                mark.technique,
+                lineage.0,
+            ),
+        })
+    }
+
+    /// Remembers a T1486 or T1490 finding for the lineages that can own what follows it.
+    fn mark_impact(
+        &mut self,
+        exec_lineage: Option<crate::recon::Lineage>,
+        pid: u32,
+        generation: Option<u64>,
+        ts: u64,
+        technique: &'static str,
+    ) {
+        for lineage in crate::impactctx::armed_lineages(exec_lineage, pid, generation) {
+            self.impact_marks.insert(
+                lineage,
+                crate::impactctx::ImpactMark {
+                    at_ns: ts,
+                    technique,
+                    reported: false,
+                },
+            );
+        }
+    }
+
+    /// For the T1486 findings of one file event: tells each whether a SERVICE-STOP-BURST from
+    /// the same lineage preceded it (corroboration, message only: technique, severity and
+    /// thresholds are untouched, so the damage manifest and the reflex read what they always
+    /// read), and arms the lineages for [`Self::check_shutdown_context`].
+    fn note_t1486(&mut self, meta: &schema::EventMeta, alerts: &mut [Alert]) {
+        use crate::{impactctx::BURST_TO_RENAME_WINDOW_NS, recon::ExecLineage};
+
+        let ts = meta.timestamp_ns;
+        let exec_lineage =
+            ExecLineage::current(self.exec_lineage.peek(&meta.pid), meta.process_generation);
+        for alert in alerts.iter_mut().filter(|a| a.technique == "T1486") {
+            let burst =
+                crate::impactctx::armed_lineages(exec_lineage, meta.pid, meta.process_generation)
+                    .filter_map(|l| self.burst_marks.peek(&l).map(|m| (l, *m)))
+                    .filter(|(_, m)| ts >= m.at_ns && ts - m.at_ns <= BURST_TO_RENAME_WINDOW_NS)
+                    .max_by_key(|(_, m)| m.at_ns);
+            if let Some((l, m)) = burst {
+                alert.message.push_str(&format!(
+                    " — corroborated: the lineage of pid={} stopped {} distinct services \
+                     (SERVICE-STOP-BURST, T1489) {}s earlier",
+                    l.0,
+                    m.services,
+                    (ts - m.at_ns) / 1_000_000_000,
+                ));
+            }
+            self.mark_impact(exec_lineage, meta.pid, meta.process_generation, ts, "T1486");
+        }
     }
 
     /// SSH-FANOUT (T1021.004, #378): outbound SSH to eight distinct hosts from one lineage in
@@ -1486,6 +1618,7 @@ impl RuleState {
         alerts.extend(self.check_recon_burst(event, lineage));
         alerts.extend(self.check_security_discovery(event, lineage));
         alerts.extend(self.check_service_stop_burst(event, lineage));
+        alerts.extend(self.check_shutdown_context(event, lineage));
         alerts.extend(crate::stateless::check_ld_preload_hijack(
             event,
             &self.ld_trust_extra,
@@ -2087,10 +2220,11 @@ impl RuleState {
         if event.outcome != AuthOutcome::Success || event.kind != AuthKind::Logon {
             return None;
         }
-        match self
-            .logon_baseline
-            .observe(&event.target_user, event.meta.timestamp_ns)
-        {
+        match self.logon_baseline.observe(
+            &event.target_user,
+            event.target_user_sid.as_deref(),
+            event.meta.timestamp_ns,
+        ) {
             Observation::FirstSeen => {}
             Observation::Quiet | Observation::Known => return None,
         }
@@ -2116,6 +2250,31 @@ impl RuleState {
         self.odd_hours.set_offset_minutes(minutes)
     }
 
+    /// Declares the local hours `[start, end)` in which a logon is ordinary for ODD-HOUR-LOGON
+    /// (#1089); `start > end` wraps midnight (`22, 6`, a night shift). False, and the window
+    /// keeps what it had, unless `start` is 0 to 23, `end` 1 to 24 and they differ. The default is
+    /// [`WORK_HOURS_LOCAL`](crate::exclusions::WORK_HOURS_LOCAL).
+    pub fn set_work_hours(&mut self, start: u32, end: u32) -> bool {
+        self.odd_hours.set_work_hours(start, end)
+    }
+
+    /// Declares the accounts whose odd-hour logons are expected (#1089): on-call staff, a
+    /// schedule's service or batch account. ODD-HOUR-LOGON skips them; FIRST-SEEN-LOGON does not.
+    /// An entry is `NAME` or `NAME|SID` (see `OddHours::set_exempt_accounts`); at most 64 are
+    /// kept, a blank, over-long or malformed one is dropped, and the number kept is returned.
+    /// Replaces the previous list; empty by default, so nothing is exempt until the operator says so.
+    pub fn set_odd_hour_exempt_accounts(&mut self, accounts: &[String]) -> usize {
+        self.odd_hours.set_exempt_accounts(accounts)
+    }
+
+    /// Odd-hour logons the exempt list has suppressed since the agent started (#1089); read by the
+    /// tests, and visible in production through the `skips` field of the info line of `OddHours`.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn odd_hour_exempt_skips(&self) -> u64 {
+        self.odd_hours.exempt_skips()
+    }
+
     /// Gives the rules the host's platform time zone (#1088): `zone` maps an instant (seconds
     /// since the Unix epoch) to minutes east of UTC at that instant, so a logon either side of a
     /// daylight-saving change is judged by the hour the host's clock showed. Turns ODD-HOUR-LOGON
@@ -2126,7 +2285,8 @@ impl RuleState {
     }
 
     /// ODD-HOUR-LOGON (T1078, #376): a successful [`AuthKind::Logon`] of a non-generic
-    /// account whose host-local hour is outside [`WORK_HOURS_LOCAL`](crate::exclusions::WORK_HOURS_LOCAL).
+    /// account whose host-local hour is outside the working hours: [`WORK_HOURS_LOCAL`](crate::exclusions::WORK_HOURS_LOCAL)
+    /// unless the operator declared another window ([`Self::set_work_hours`]).
     /// Low, once per account per [`ODD_HOUR_QUIET_NS`](crate::exclusions::ODD_HOUR_QUIET_NS).
     /// Same event gate and generic-account list as FIRST-SEEN-LOGON, so the two share the
     /// identity join's limits; they are independent and a first logon at night raises both.
@@ -2136,14 +2296,18 @@ impl RuleState {
     /// `agent.toml`, which overrides the zone). The event's timestamp is UTC and nothing else
     /// in the agent knows the local time.
     /// Expected false positives: on-call staff, night shifts, a host in use around the clock,
-    /// and on Windows the service and batch logons (4624) of a named account.
+    /// and on Windows the service and batch logons (4624) of a named account; the operator
+    /// answers them with a declared window ([`Self::set_work_hours`]) and an exempt list
+    /// ([`Self::set_odd_hour_exempt_accounts`]).
     fn check_odd_hour_logon(&mut self, event: &AuthEvent) -> Option<Alert> {
         if event.outcome != AuthOutcome::Success || event.kind != AuthKind::Logon {
             return None;
         }
-        let hour = self
-            .odd_hours
-            .observe(&event.target_user, event.meta.timestamp_ns)?;
+        let hour = self.odd_hours.observe(
+            &event.target_user,
+            event.target_user_sid.as_deref(),
+            event.meta.timestamp_ns,
+        )?;
         let source = event
             .source_address
             .map_or_else(String::new, |address| format!(" from {address}"));
@@ -2952,9 +3116,12 @@ impl RuleState {
     pub fn on_file_delete(&mut self, event: &FileDeleteEvent) -> Vec<Alert> {
         self.record_motw_removal(event);
         self.record_touched(event.meta.pid, Event::FileDelete(event.clone()));
-        self.check_write_new_then_unlink(event)
+        let mut alerts: Vec<Alert> = self
+            .check_write_new_then_unlink(event)
             .into_iter()
-            .collect()
+            .collect();
+        self.note_t1486(&event.meta, &mut alerts);
+        alerts
     }
 
     /// Remembers a Windows `FileDelete` of a `:Zone.Identifier` stream: the
@@ -3236,6 +3403,7 @@ impl RuleState {
         self.record_touched(event.meta.pid, Event::FileRename(event.clone()));
         let mut alerts: Vec<Alert> = self.check_mass_rename_pattern(event).into_iter().collect();
         alerts.extend(self.check_burst_write_volume(event));
+        self.note_t1486(&event.meta, &mut alerts);
         alerts
     }
 
