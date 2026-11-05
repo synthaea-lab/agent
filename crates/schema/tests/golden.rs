@@ -23,7 +23,8 @@ use schema::{
     RawVolumeOpenEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent,
     SessionState, ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
     SocketCreateEvent, SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection,
-    TlsLibraryType, UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent, XpcConnectEvent,
+    TlsLibraryType, UdpRecvEvent, UdpSendEvent, UnitStopEvent, User, WmiActivityEvent,
+    XpcConnectEvent,
     detection::{Detection, DetectionSource, IocKind, ScoreAttribution, Severity},
 };
 
@@ -1798,7 +1799,7 @@ fn signal_golden() {
         }),
         "signal",
     );
-    // v60 (#1103): a signal to a listed security tool names its systemd unit.
+    // v63 (#1103): a signal to a listed security tool names its systemd unit.
     assert_golden(
         &Event::Signal(SignalEvent {
             meta: EventMeta {
@@ -1820,7 +1821,7 @@ fn signal_golden() {
         }),
         "signal_unit",
     );
-    // v60 (#1103): the sender is marked unreliable (`si_code` of interrupt or completion context).
+    // v63 (#1103): the sender is marked unreliable (`si_code` of interrupt or completion context).
     assert_golden(
         &Event::Signal(SignalEvent {
             meta: EventMeta {
@@ -1846,7 +1847,7 @@ fn signal_golden() {
 
 #[test]
 fn signal_events_lost_golden() {
-    // v60 (#1103): the sensor's report of signals it had no room for, no signal and no target.
+    // v63 (#1103): the sensor's report of signals it had no room for, no signal and no target.
     assert_golden(
         &Event::Signal(SignalEvent {
             meta: EventMeta {
@@ -2279,6 +2280,27 @@ fn namespace_golden() {
             flags: 0x4000_0000, // CLONE_NEWNET
         }),
         "namespace",
+    );
+}
+
+#[test]
+fn unit_stop_golden() {
+    // v62 (#1085): the stop of a security-tool unit, an event of its own and not an open flag.
+    assert_golden(
+        &Event::UnitStop(UnitStopEvent {
+            meta: EventMeta {
+                pid: 1,
+                ppid: 0,
+                user: User::Unknown,
+                timestamp_ns: 1_756_900_000_123_456_789,
+                comm: "auditd.service".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            unit: "auditd.service".into(),
+        }),
+        "unit_stop",
     );
 }
 
@@ -2928,6 +2950,10 @@ fn meta_accessor_covers_all_variants() {
             change: PackageChangeKind::Added,
             previous_version: None,
             version: Some("1".into()),
+        }),
+        Event::UnitStop(UnitStopEvent {
+            meta: meta.clone(),
+            unit: "auditd.service".into(),
         }),
     ];
     for e in &events {

@@ -41,7 +41,7 @@
 //! process"), not a true install signal.
 //!
 //! Also done (#1085, T1562.001): [`unitstop::to_unit_stop_event`] maps the stop of a unit of
-//! `schema::SECURITY_SERVICES` into `schema::FileOpenEvent`/`FLAG_UNIT_STOPPED`, filtered here so
+//! `schema::SECURITY_SERVICES` into `schema::UnitStopEvent` (an event of its own: a raw `openat` flag can carry any bit), filtered here so
 //! the other units that stop at every reboot never leave the sensor. The journal names no actor:
 //! the event says a stop happened, not who asked. Unit job records are only trusted from a
 //! systemd manager (`_PID=1`, or `_COMM=systemd` for a `--user` manager): `JOB_TYPE`/`UNIT` are

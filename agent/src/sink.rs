@@ -1013,6 +1013,19 @@ impl DetectionSink {
             .set_local_utc_offset_minutes(minutes)
     }
 
+    /// Declares the ordinary local hours (#1089); false when they are not a window.
+    pub(crate) fn set_work_hours(&self, start: u32, end: u32) -> bool {
+        self.rule_state.lock().unwrap().set_work_hours(start, end)
+    }
+
+    /// Declares the accounts whose odd-hour logons are expected (#1089).
+    pub(crate) fn set_odd_hour_exempt_accounts(&self, accounts: &[String]) -> usize {
+        self.rule_state
+            .lock()
+            .unwrap()
+            .set_odd_hour_exempt_accounts(accounts)
+    }
+
     /// Gives the rules the platform's time zone (#1088); false when it has no answer for `now_secs`.
     pub(crate) fn set_local_zone(&self, zone: rules::LocalOffsetAt, now_secs: i64) -> bool {
         self.rule_state
