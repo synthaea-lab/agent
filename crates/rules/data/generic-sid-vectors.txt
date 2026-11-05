@@ -1,0 +1,22 @@
+# One table of SIDs that make a Windows logon generic, run by both sides that decide it: the agent (crates/rules/src/logon.rs, is_well_known_service_sid and is_builtin_administrator_sid) and the control plane's identity join (server/lib/fleet-case.ts, isGenericIdentity). "generic" = the account is one every host has, whatever its localized name; "person" = the SID says nothing, the name decides. Tab separated. SIDs are compared as Windows renders them (upper-case "S-"); a lower-case spelling is not one.
+generic	S-1-5-7
+generic	S-1-5-18
+generic	S-1-5-19
+generic	S-1-5-20
+generic	S-1-5-21-1004336348-1177238915-682003330-500
+generic	S-1-5-21-1-2-3-500
+person	S-1-5-21-1004336348-1177238915-682003330-501
+person	S-1-5-21-1004336348-1177238915-682003330-1001
+person	S-1-5-21-1-2-3-5001
+person	S-1-5-21-1-2-500
+person	S-1-5-21-1-2-3-4-500
+person	S-1-5-21--2-3-500
+person	S-1-5-21-a-2-3-500
+person	S-1-5-1
+person	S-1-5-180
+person	S-1-5-32-544
+person	S-1-5-18-1
+person	s-1-5-18
+person	s-1-5-21-1-2-3-500
+person	 S-1-5-18
+person
