@@ -145,6 +145,7 @@ pub fn normalize(raw: &RawEsEvent) -> Option<Event> {
             company_name: None,
             file_description: None,
             product_name: None,
+            image_file_id: None,
             env_security: Vec::new(),
         })),
         RawEsEvent::Open { meta, path, fflag } => Some(Event::FileOpen(FileOpenEvent {

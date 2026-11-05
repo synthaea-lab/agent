@@ -6,7 +6,8 @@ use schema::{
     ConnectEvent, ExecEvent, FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT,
     FLAG_PERSISTENCE_BTM_ARTIFACT, FLAG_PERSISTENCE_SYSTEMD_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FLAG_PERSISTENCE_TASK_ARTIFACT,
-    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, User, detection::Severity,
+    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, FileSetTimeEvent, RawVolumeOpenEvent,
+    User, detection::Severity,
 };
 
 use crate::{
@@ -155,6 +156,7 @@ pub fn evaluate_exec(event: &ExecEvent) -> Vec<Alert> {
         .chain(check_recovery_inhibit(event))
         .chain(check_log_clear_exec(event))
         .chain(check_event_logging_disable_exec(event))
+        .chain(crate::osascript::check_osascript_password_prompt(event))
         .chain(crate::securitytool::check_security_tool_stop(event))
         .collect()
 }
@@ -589,6 +591,141 @@ pub(crate) fn check_alternate_data_stream_write(event: &FileOpenEvent) -> Option
             event.meta.pid, event.meta.comm,
         ),
     })
+}
+
+/// T1070.006 — Indicator Removal: Timestomp. The minifilter reports a successful explicit
+/// `FileBasicInformation` request; `comm` is intentionally not used (and not printed) because
+/// that sensor has no trustworthy process image. Windows -1/-2 values request automatic
+/// updates, not chosen times.
+///
+/// Low, not Medium (`SherlockOmss`'s/`SoFrexs`'s #1006 review): this is unmeasured, and several
+/// ordinary tools explicitly set destination timestamps on every file they touch —
+/// `CopyFileEx` (Explorer, `copy`, `Copy-Item`), robocopy's default `/COPY:DAT`, 7-Zip/tar/
+/// Explorer zip extraction, OneDrive/Dropbox sync. Each minifilter event also carries `ppid 0`
+/// and an empty `comm`, folding every one of these into a single verdict entity with no way to
+/// tell a benign bulk copy from a targeted stomp. Escalating back to Medium needs either a live
+/// volume measurement (a copy/extraction of a few thousand files) or a per-pid/parent-directory
+/// aggregation the driver's wire format does not yet carry — tracked as a follow-up, not solved
+/// here by guessing a threshold.
+///
+/// Linux (#1036): the BPF-LSM `inode_setattr` hook does know the process, so `comm` is printed.
+/// The package managers (`rpm`/`dpkg`/`pacman` and their frontends set the archive's stored mtime
+/// on every file they unpack) are skipped by `RuleState::on_file_set_time`, not here: the skip
+/// needs the exec-time image, because `comm` alone is attacker-controlled. Everything else stays
+/// Low for the reason above (`touch -d`, `cp -p`, `tar x`, `rsync -t` are ordinary too). Telling a build tool's
+/// `touch` from a targeted stomp needs the parent or a per-process count, which the event does
+/// not carry: not guessed here.
+#[must_use]
+pub fn evaluate_file_set_time(event: &FileSetTimeEvent) -> Vec<Alert> {
+    let requested = [
+        event.creation_time,
+        event.last_access_time,
+        event.last_write_time,
+        event.change_time,
+    ];
+    if !requested
+        .into_iter()
+        .flatten()
+        .any(|time| time != 0 && time != -1 && time != -2)
+    {
+        return Vec::new();
+    }
+    let unix = matches!(event.meta.user, User::Unix { .. });
+    let message = if unix {
+        format!(
+            "pid={} comm={}: explicit timestamp change requested for {}",
+            event.meta.pid, event.meta.comm, event.path,
+        )
+    } else {
+        format!(
+            "pid={}: explicit timestamp change requested for {}",
+            event.meta.pid, event.path,
+        )
+    };
+    vec![Alert {
+        technique: "T1070.006",
+        severity: Severity::Low,
+        message,
+    }]
+}
+
+/// Whether `comm` names a Linux package manager or back end: they stamp every unpacked file with
+/// the archive's mtime. Only a name: the caller must also check what the process runs.
+#[must_use]
+pub(crate) fn is_package_manager_comm(comm: &str) -> bool {
+    PACKAGE_MANAGERS.contains(&comm)
+}
+
+/// Exact `comm` values (15 bytes at most: `unattended-upgr` is the kernel's own truncation of
+/// `unattended-upgrade`, a script run by an interpreter, so it never passes the image check and
+/// alerts at Low).
+const PACKAGE_MANAGERS: &[&str] = &[
+    "rpm",
+    "dpkg",
+    "apt",
+    "apt-get",
+    "dnf",
+    "yum",
+    "zypper",
+    "pacman",
+    "apk",
+    "snapd",
+    "unattended-upgr",
+];
+
+/// T1006 — Direct Volume Access: mounted logical-volume open. This is requested
+/// access, not proof of granted rights or subsequent raw I/O; the event carries no trusted image.
+#[must_use]
+pub fn evaluate_raw_volume_open(event: &RawVolumeOpenEvent) -> Vec<Alert> {
+    const FILE_WRITE_DATA: u32 = 0x0000_0002;
+    const FILE_WRITE_EA: u32 = 0x0000_0010;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+    const FILE_APPEND_DATA: u32 = 0x0000_0004;
+    const DELETE: u32 = 0x0001_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+    const READ_CAPABILITIES: u32 = 0xA000_0029; // FILE_READ_DATA/EA, FILE_EXECUTE, GENERIC_READ/EXECUTE
+    // Every right that can modify the volume's data or its own protection, not just the
+    // narrower "write data" case (#1007 review, SherlockOmss): a caller with WRITE_DAC or
+    // WRITE_OWNER alone can reassign the volume's ACL/owner and grant itself write access
+    // in a second step, and DELETE/FILE_WRITE_EA/FILE_WRITE_ATTRIBUTES are real tamper
+    // capabilities a narrower mask would silently drop (e.g. `0x100` alone used to alert
+    // on nothing).
+    const WRITE_CAPABILITIES: u32 = FILE_WRITE_DATA
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | FILE_APPEND_DATA
+        | DELETE
+        | WRITE_DAC
+        | WRITE_OWNER
+        | GENERIC_WRITE
+        | GENERIC_ALL;
+
+    let severity = if event.desired_access & (WRITE_CAPABILITIES | MAXIMUM_ALLOWED) != 0 {
+        // MAXIMUM_ALLOWED resolves to whatever the caller's token grants; a caller able to
+        // open a raw volume at all already needs an elevated privilege (SeBackupPrivilege or
+        // administrator), so in practice this almost always includes write — bucketing it
+        // with read-only understates it (#1007 review).
+        Some(Severity::Medium)
+    } else if event.desired_access & READ_CAPABILITIES != 0 {
+        Some(Severity::Low)
+    } else {
+        None
+    };
+    severity
+        .into_iter()
+        .map(|severity| Alert {
+            technique: "T1006",
+            severity,
+            message: format!(
+                "pid={} comm={}: opened mounted volume {} with requested access {:#010x}",
+                event.meta.pid, event.meta.comm, event.volume, event.desired_access,
+            ),
+        })
+        .collect()
 }
 
 /// Evaluates all stateless rules applicable to a `FileOpenEvent`. T1053.005
@@ -1137,11 +1274,34 @@ fn tamper_signal_name(signal: u32) -> Option<&'static str> {
     }
 }
 
+/// The process id of the service manager: `systemd` on Linux, `launchd` on macOS. The Linux probe
+/// reports the sender's thread-group id from the **initial** pid namespace, so a container's own
+/// init is not 1 here, and only the host's manager is.
+const INIT_PID: u32 = 1;
+
 /// T1562.001 — Impair Defenses: Disable or Modify Tools, the process-termination
 /// half (issue #362). Every [`schema::SignalEvent`] already targets a protected
 /// security process: the sensors filter at the source (Linux: the eBPF
 /// `SIGNAL_WATCH_PID` gate on the agent's own pid; macOS: the Endpoint Security
-/// client gate). This rule only keeps the signals that end or freeze the target.
+/// client gate). This rule only keeps the signals that end or freeze the target, and
+/// then looks at the **sender** (#1103), which is all the event says about the actor:
+/// `meta` is the sender's pid, parent, comm, uid and container, with no cgroup or unit.
+///
+/// - A process signalling **itself** (`meta.pid == target_pid`: `abort()`, a fatal-error
+///   `raise(SIGTERM)`) is not tampering: no alert.
+/// - The service manager (**pid 1**) is **Low**, not High. It is what delivers `systemctl
+///   stop` (SIGTERM, then SIGKILL once the stop times out), `restart` and a package
+///   upgrade, so High on each would make every upgrade a High finding. It is not dropped:
+///   `systemctl kill -s KILL` and a D-Bus stop arrive from pid 1 too, and the event cannot
+///   say who asked the manager. Who did is the exec rule's (`check_security_tool_stop`,
+///   which parses `systemctl stop` and `systemctl kill`) and the journal's, not this rule's.
+///   A D-Bus stop has no exec: only the journal sees it.
+/// - Anyone else: High, as before.
+///
+/// What it **cannot** tell: whether a sender other than pid 1 is the agent's own
+/// supervisor (the watchdog) or another process of the same unit, since the event has
+/// no sender unit or cgroup. Such a signal still alerts High. Telling them apart needs
+/// the sender's unit in the event, which is a schema change and not made here.
 ///
 /// On Linux it is the only record of a `SIGKILL`'s sender: the agent's own
 /// `kill_loudness` can only attribute the catchable signals. The kernel-side
@@ -1150,17 +1310,34 @@ fn tamper_signal_name(signal: u32) -> Option<&'static str> {
 #[must_use]
 pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Option<Alert> {
     let name = tamper_signal_name(event.signal)?;
+    if event.meta.pid == event.target_pid {
+        return None;
+    }
     let target = event.target_image_path.as_deref().unwrap_or("?");
     let sender_uid = match &event.meta.user {
         schema::User::Unix { uid, .. } => format!(" uid={uid}"),
         _ => String::new(),
     };
+    let from_manager = event.meta.pid == INIT_PID;
     Some(Alert {
         technique: "T1562.001",
-        severity: Severity::High,
+        severity: if from_manager {
+            Severity::Low
+        } else {
+            Severity::High
+        },
         message: format!(
-            "pid={} comm={}{sender_uid}: sent {name} ({}) to security process pid={} ({target})",
-            event.meta.pid, event.meta.comm, event.signal, event.target_pid,
+            "pid={} comm={}{sender_uid}: sent {name} ({}) to security process pid={} ({target}){}",
+            event.meta.pid,
+            event.meta.comm,
+            event.signal,
+            event.target_pid,
+            if from_manager {
+                ": sent by the service manager, which does not say who asked it (a stop, \
+                 restart or upgrade, or `systemctl kill`)"
+            } else {
+                ""
+            },
         ),
     })
 }
@@ -1382,6 +1559,57 @@ pub(crate) fn check_kerberos_from_non_lsass(event: &ConnectEvent) -> Option<Aler
             event.meta.pid, event.daddr,
         ),
     })
+}
+
+/// T1558 — Steal or Forge Kerberos Tickets. The local process named by `event.meta` asked its
+/// own Kerberos client for either a ticket usable for unconstrained delegation, or its TGT's
+/// session key, and the client refused (#364, `KerberosDelegationFailureEvent`, EID 201/202 of
+/// `Microsoft-Windows-Kerberos/Operational`). The local process is the actor in both cases —
+/// not a remote server reaching into this host, see the event's own struct doc.
+///
+/// A **refusal**, not a success: this host's Kerberos stack said no, so the request did not go
+/// through. Still worth an alert — the small, deliberate allowlist unconstrained delegation and
+/// TGT export live behind means a request outside it is rare on a well-run host, and both are
+/// textbook steps in domain-admin-ticket theft (a process collecting a delegable ticket to
+/// coerce a chain back to an attacker-controlled "service", or pulling a TGT's key straight out
+/// of a host that should never give it up — the Rubeus `tgtdeleg` shape). High, not Critical:
+/// the refusal is the control already working, and a misconfigured but legitimate caller asking
+/// for delegation it was never granted looks identical to this agent — the verdict, not this
+/// rule, decides what it adds to.
+#[must_use]
+pub fn evaluate_kerberos_delegation_failure(
+    event: &schema::KerberosDelegationFailureEvent,
+) -> Vec<Alert> {
+    use schema::KerberosDelegationFailureKind as Kind;
+    let what = match event.kind {
+        Kind::UnconstrainedDelegationDenied => "a ticket usable for unconstrained delegation",
+        Kind::TgtSessionKeyExportDenied => "its TGT session key",
+    };
+    let supplied = if event.target_user.is_empty() {
+        String::new()
+    } else if event.target_domain.is_empty() {
+        format!(", supplied credentials {}", event.target_user)
+    } else {
+        format!(
+            ", supplied credentials {}\\{}",
+            event.target_domain, event.target_user
+        )
+    };
+    let owner = if event.caller_user.is_empty() {
+        String::new()
+    } else if event.caller_domain.is_empty() {
+        format!(" owner={}", event.caller_user)
+    } else {
+        format!(" owner={}\\{}", event.caller_domain, event.caller_user)
+    };
+    vec![Alert {
+        technique: "T1558",
+        severity: Severity::High,
+        message: format!(
+            "pid={} comm={}: asked for {what} against {}{supplied} — denied{owner}",
+            event.meta.pid, event.meta.comm, event.target_server,
+        ),
+    }]
 }
 
 /// Evaluates all stateless rules applicable to a `ConnectEvent`.

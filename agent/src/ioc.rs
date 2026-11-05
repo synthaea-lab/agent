@@ -136,7 +136,6 @@ impl IocMatcher {
     }
 
     /// Indicators in force, `0` while none is loaded.
-    #[cfg(test)]
     pub(crate) fn indicator_count(&self) -> usize {
         self.current
             .lock()
@@ -145,8 +144,7 @@ impl IocMatcher {
             .map_or(0, |loaded| loaded.set.len())
     }
 
-    /// The counters, read by the tests until the health beacon carries them.
-    #[cfg(test)]
+    /// The counters the health beacon reports.
     pub(crate) fn stats(&self) -> &IocStats {
         &self.stats
     }

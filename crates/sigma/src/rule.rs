@@ -32,6 +32,11 @@ pub struct SigmaRule {
     /// Upstream Sigma field name. Required non-empty by `validate()`.
     #[serde(default)]
     pub falsepositives: Vec<String>,
+    /// Upstream Sigma's `logsource` (#719). Absent means `process_creation`, the only category
+    /// this engine maps (every rule shipped in `rules/sigma/` omits it); when present,
+    /// `validate()` refuses anything this engine would evaluate against the wrong events.
+    #[serde(default)]
+    pub logsource: Option<LogSource>,
     pub detection: Detection,
     /// The condition, parsed once (at validation, or on first evaluation of a rule that was
     /// never validated): what evaluation runs, so the text is never re-parsed per event.
@@ -70,6 +75,21 @@ where
              informational/low/medium/high/critical)"
         ))),
     }
+}
+
+/// `logsource` block of a Sigma rule: which telemetry the rule was written against. Other keys
+/// (`definition`, a free-text note for the operator) are ignored.
+#[derive(Debug, Default, Deserialize)]
+pub struct LogSource {
+    /// Event family, such as `process_creation` or `network_connection`.
+    #[serde(default)]
+    pub category: Option<String>,
+    /// Operating system or product, such as `windows`, `linux` or `macos`.
+    #[serde(default)]
+    pub product: Option<String>,
+    /// A specific log channel, such as `security` or `sysmon`.
+    #[serde(default)]
+    pub service: Option<String>,
 }
 
 /// `detection` block of a Sigma rule.

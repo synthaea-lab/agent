@@ -16,6 +16,7 @@ members = [
     "cli",
     "release-tool",
     "crates/schema",
+    "crates/redact",
     "crates/policy",
     "crates/config",
     "crates/store",
@@ -143,6 +144,8 @@ serde_json = "1"
 # crate that reads a TOML-shaped input.
 toml = "1.1"
 thiserror = "2"
+# SHA-256, shared by the updater (manifest digests) and sensor-linux (JA4 hashes): one version.
+sha2 = "0.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Async runtime for the local IPC server (crates/ipc, issue #26). Features
@@ -150,7 +153,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # clients), `net` for named-pipe/UDS listeners, `io-util` for line-based
 # framing, `sync` for shutdown signaling, `macros` for `#[tokio::main]` /
 # `#[tokio::test]`.
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros"] }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "net", "io-util", "sync", "macros"] }
 # Ed25519 signature verification for signed policy documents (ADR-0010) and
 # updater manifests (ADR-0015). `ring` chosen over `ed25519-dalek` because it
 # is already a transitive dep via `rustls`, avoiding a second signature

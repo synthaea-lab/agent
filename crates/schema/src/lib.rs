@@ -306,7 +306,39 @@ pub mod time;
 /// first and took 52, leaving 50/51 reserved for #994/#995 (also renumbering from
 /// their own 49 claims) — this PR took the next free number above all three
 /// instead of guessing which of 50/51 would still be open by the time it merged.
-pub const SCHEMA_VERSION: u32 = 53;
+///
+/// Bumped 53 → 55 for [`Event::KerberosDelegationFailure`] (#364): the Kerberos
+/// client's own unconstrained-delegation and TGT-session-key-export denials,
+/// from the (off by default) `Microsoft-Windows-Kerberos/Operational` channel.
+/// Windows-only. Originally claimed 49; renumbered past #60's 52 and #983's 53.
+/// #994 merged first, ahead of the 54 it had reserved for #995, so main went
+/// straight from 53 to 55 and left 54 unused.
+///
+/// Bumped 55 → 56 for Windows minifilter explicit timestamp requests (#136). #995
+/// (`ListenPortEvent::protocol`) had planned to renumber past the skipped 54 to 57.
+///
+/// Bumped 56 → 57 for mounted raw-volume open telemetry (#136 slice 4), stacked on
+/// the timestomp slice above — it merged first and took the 57 #995 was planning
+/// on, without #995 having pushed its own renumbering commit yet.
+///
+/// Bumped 57 → 58 for [`ListenPortEvent::protocol`] (#676 part 1): #136 slice 4
+/// merged first and took 57, which this had also claimed; 58 is the next free
+/// number above it.
+///
+/// Not bumped for the Windows UDP collector (#676 part 2, stacked on #995): no
+/// wire change — #995 already defined `ListenPortEvent::protocol`; this PR only
+/// fills it with the real value (6 or 17) instead of #995's TCP-only `6` (review
+/// of #1008).
+///
+/// Bumped 58 → 59 for [`ExecEvent::image_file_id`] (#688): the identity of the
+/// image file at exec time, so the T1204.002 signature gate can distinguish the
+/// image that ran from whatever the path contains when it is later verified.
+///
+/// Bumped 59 → 62 for [`Event::UnitStop`] (#1085): the stop of a security-tool systemd unit as an
+/// event of its own, replacing a `FileOpenEvent` carrying `FLAG_UNIT_STOPPED`. A raw `openat`
+/// flag can carry any bit, so an unprivileged open could set that one. 60 is claimed by #1114
+/// (`SignalEvent::signals_lost`) and 61 by #1116; whichever merges first renumbers the others.
+pub const SCHEMA_VERSION: u32 = 62;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -446,13 +478,51 @@ pub const FLAG_APPLICATION_BLOCKED: u32 = 0x0100_0000;
 /// reasoning as [`FLAG_PERSISTENCE_ARTIFACT`]).
 pub const FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT: u32 = 0x0080_0000;
 
+/// Services of security tooling, lowercase, compared without a `.service` suffix. Product
+/// names are as the vendors' documentation gives them and were **not checked on a host**: a
+/// name that is wrong costs a missed stop, never a false alert. `auditd` is here although
+/// two Sigma rules name two forms of its stop: those match `mask --now` and `auditctl -e 0`,
+/// this matches the rest, and `mask --now auditd` raises both.
+///
+/// Left out on purpose: the Windows `EventLog` service (T1562.002, #800), the firewall
+/// services (T1562.004) and this agent's own service (stopped by its own package scripts on
+/// every upgrade, and unable to alert on its own stop).
+pub const SECURITY_SERVICES: &[&str] = &[
+    // Linux
+    "auditd",
+    "apparmor",
+    "falco",
+    "falco-bpf",
+    "falco-modern-bpf",
+    "osqueryd",
+    "wazuh-agent",
+    "ossec",
+    "clamav-daemon",
+    "clamd",
+    "suricata",
+    "snort",
+    "sysmon",
+    "mdatp",
+    "falcon-sensor",
+    "sentinelone",
+    // Windows
+    "windefend",
+    "wdnissvc",
+    "sense",
+    "sysmon64",
+    "securityhealthservice",
+    "csfalconservice",
+    "sentinelagent",
+    "cbdefense",
+];
+
 /// Every synthetic `FLAG_*` bit above, checked pairwise-disjoint at compile time.
 /// A new flag goes here in the same edit (a unit test fails if a `pub const
 /// FLAG_*` is missing). Lives next to the constants, not in a
 /// consumer's test: the first cut of [`FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT`]
 /// took `0x0200_0000`, already [`FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN`], and the
 /// hardcoded list in `rules`' collision test missed it (#399 review).
-const SYNTHETIC_FLAGS: [u32; 8] = [
+pub const SYNTHETIC_FLAGS: [u32; 8] = [
     FLAG_PERSISTENCE_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
@@ -623,6 +693,15 @@ pub struct ExecEvent {
     /// in the catalogue's `process_creation` category use it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub product_name: Option<String>,
+    /// Identity of the file the image ran from, captured by the sensor *at exec
+    /// time* (#688): `"{volume serial:016x}:{file id:032x}"`, opaque to consumers.
+    /// The enrichment worker verifies the file at `image_path` some time later; a
+    /// verdict only speaks for the image that ran when the file it verified has
+    /// this identity (a running image can be renamed on Windows and a signed copy
+    /// put at its path). Windows only; `None` when the sensor could not open the
+    /// image, and on every other platform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_file_id: Option<String>,
     /// Security-relevant environment variables present at exec time, `(name, value)`
     /// pairs (#363) — the dynamic-linker-hijack family: `LD_PRELOAD`,
     /// `LD_LIBRARY_PATH`, `LD_AUDIT` (the quieter sibling of `LD_PRELOAD`),
@@ -728,6 +807,11 @@ pub struct FileOpenEvent {
     /// Platform-native open/access flags (Linux `open(2)` flags, Windows create
     /// dispositions). Rules match primarily on `path`; flag interpretation is
     /// per-platform and documented by each sensor.
+    ///
+    /// The synthetic `FLAG_*` bits (see `SYNTHETIC_FLAGS`) are set only by userspace sensors
+    /// that build the event themselves. On Linux the probe's raw `open(2)` flags are masked
+    /// with `OPEN_FLAGS_MASK` (`sensor-linux`'s `normalize`) before they get here, because the kernel ignores unknown
+    /// bits and any local user could otherwise forge a synthetic bit (#1129).
     pub flags: u32,
 }
 
@@ -830,6 +914,40 @@ pub struct FileRenameEvent {
     /// of trusting `comm` alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_path: Option<String>,
+}
+
+/// Explicit `FileBasicInformation` timestamp request observed by the Windows minifilter.
+/// Values are raw signed 100-ns Windows FILETIME units requested by the caller; `None` means
+/// that field was unchanged. Windows' own -1 (don't change) and -2 (don't change, don't update
+/// on next write either) sentinels still survive as `Some(-1)`/`Some(-2)`, not `None` — the
+/// field being set at all is what `None` tracks, distinct from the caller asking it stay as-is;
+/// `rules::evaluate_file_set_time` is what filters those two sentinel values out of the ones
+/// that count as a real requested time. This reports a successful request, not proof of
+/// malicious intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSetTimeEvent {
+    pub meta: EventMeta,
+    /// Normalized path captured by the minifilter before the operation.
+    pub path: String,
+    /// Requested creation time in raw signed 100-ns FILETIME units; `None` means unchanged.
+    pub creation_time: Option<i64>,
+    /// Requested last-access time in raw signed 100-ns FILETIME units; `None` means unchanged.
+    pub last_access_time: Option<i64>,
+    /// Requested last-write time in raw signed 100-ns FILETIME units; `None` means unchanged.
+    pub last_write_time: Option<i64>,
+    /// Requested change time in raw signed 100-ns FILETIME units; `None` means unchanged.
+    pub change_time: Option<i64>,
+}
+
+/// Successful open of a mounted logical volume through the Windows minifilter.
+/// `desired_access` is the caller's requested `ACCESS_MASK`, not the rights granted or later used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawVolumeOpenEvent {
+    pub meta: EventMeta,
+    /// Kernel device name captured from the attached volume (for example `\\Device\\HarddiskVolume3`).
+    pub volume: String,
+    /// Raw Windows `ACCESS_MASK` requested by the caller.
+    pub desired_access: u32,
 }
 
 /// File permission change (issue #262 Phase 2): `chmod(2)`/`fchmodat(2)`. `fchmod(2)`
@@ -1234,6 +1352,69 @@ pub struct LogClearedEvent {
     pub backup_path: Option<String>,
 }
 
+/// Which Kerberos client operation was denied, in a [`KerberosDelegationFailureEvent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KerberosDelegationFailureKind {
+    /// EID 201: this host's own process asked its local Kerberos client for a ticket it
+    /// could present for unconstrained delegation to `target_server` (impersonating
+    /// whatever user later authenticates through it to that server), and the client's
+    /// own Kerberos stack refused — this host is not on the allowlist that may ask for
+    /// that. The Rubeus `tgtdeleg`/delegation-collection shape.
+    UnconstrainedDelegationDenied,
+    /// EID 202: this host's own process asked to export its TGT's session key, and the
+    /// client's own Kerberos stack refused — on a Credential Guard host, a TGT's key can
+    /// never leave the isolated LSA, by design (ADR: this is the client-side half of the
+    /// same protection PKINIT key-export denials, EID 203/204, also report).
+    TgtSessionKeyExportDenied,
+}
+
+/// A Kerberos client-side operation an attacker would want was denied, from the
+/// (off by default; see `docs/sensors/sources.md`) `Microsoft-Windows-Kerberos/Operational`
+/// channel's EID 201/202 (#364). **The local process is the actor**: both events report this
+/// host's own process asking its own Kerberos client for something (a delegable ticket for
+/// `target_server`, or its own TGT session key) and that client refusing — not a remote
+/// server using this host as a stepping stone. The provider manifest
+/// (`Get-WinEvent -ListProvider Microsoft-Windows-Security-Kerberos`) names `%4 CallerPID` as
+/// the *client* process id, and the message text is "unconstrained delegation is not allowed
+/// for this user" (fwlink 856824) — the refusal is about the local caller, not a third party.
+///
+/// Framed as what it is: a **refusal**. Each event means an attempt was made and this host's
+/// own Kerberos stack said no — not that delegation succeeded, and not evidence the request
+/// was malicious (a misconfigured but legitimate service asking for delegation it was never
+/// granted looks identical). High: unconstrained delegation and TGT export are both a small,
+/// deliberate allowlist on a well-run host, so a request outside it is rare and worth a look;
+/// not Critical, since the client's own refusal is already the control working.
+///
+/// `meta.pid`/`meta.comm` are the process that made the request (`CallerPID`/`ProcessName`,
+/// both 201 and 202 carry them, the same nine-field template). `meta.user` is
+/// [`User::Unknown`]: the template gives this process's owner only as a name and a domain
+/// (`ClientUserName`/`ClientDomainName`), never a SID, so it cannot become a
+/// [`User::Windows`] — [`caller_user`](Self::caller_user) carries it as text instead, the same
+/// choice [`LogClearedEvent::subject_user`] makes when a SID isn't the shape the data comes in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KerberosDelegationFailureEvent {
+    pub meta: EventMeta,
+    pub kind: KerberosDelegationFailureKind,
+    /// The server named in the request (`TargetName`/`Server`): for 201, the server the
+    /// requested delegable ticket was for.
+    pub target_server: String,
+    /// Credentials explicitly supplied to the call (`UserName`), rather than the caller's own
+    /// — usually empty, since a call with default credentials supplies none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub target_user: String,
+    /// That supplied account's domain (`DomainName`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub target_domain: String,
+    /// The calling process's own owner account (`ClientUserName`), as text — see the struct
+    /// doc for why it is not `meta.user`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub caller_user: String,
+    /// That account's domain (`ClientDomainName`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub caller_domain: String,
+}
+
 /// An LDAP search a process sent, from EID 30 of the
 /// Microsoft-Windows-LDAP-Client provider (#364): the directory-reconnaissance
 /// fingerprint an endpoint can see. Kerberoasting / AS-REP roasting start with
@@ -1479,6 +1660,22 @@ pub struct BitsJobEvent {
     pub hresult: Option<u32>,
 }
 
+/// The stop of a systemd unit of [`SECURITY_SERVICES`] (Linux journald `JOB_TYPE=stop`, #1085,
+/// T1562.001). `meta.comm` also carries the unit name, as for the unit start. The journal names
+/// no actor, so this says a stop happened, not who asked for it.
+///
+/// An event of its own, not a flag on a [`FileOpenEvent`]: that event's `flags` are the raw
+/// `open(2)` flags on Linux (unknown bits pass through `openat`), so any bit there can be set
+/// by an unprivileged open, as `O_TMPFILE` set the first cut of the signal-loss bit (#1114).
+/// Only the journal sensor builds this variant, from a record whose writer is the system
+/// manager, and no probe produces it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitStopEvent {
+    pub meta: EventMeta,
+    /// The unit as the journal names it (`auditd.service`).
+    pub unit: String,
+}
+
 /// UDP datagram sent — the primary signal for DNS-tunneling and C2-over-UDP detection.
 ///
 /// Emitted on EID 14 (`UDPSend` IPv4) of the Microsoft-Windows-Kernel-Network
@@ -1513,10 +1710,21 @@ pub struct UdpRecvEvent {
     pub size: u32,
 }
 
-/// A TCP socket found listening, from a periodic socket-table snapshot rather than a
-/// discrete `bind`/`listen()` syscall trace (Linux: `NETLINK_SOCK_DIAG`, issue #92 —
-/// a probe-free source that runs where eBPF/ETW cannot, or as a redundant cross-check
-/// alongside them).
+/// IP protocol number for TCP, the `IPPROTO_TCP` of `<netinet/in.h>` — shared so
+/// [`ListenPortEvent::protocol`]/[`NetworkFlowEvent::protocol`] callers across the
+/// agent and sensor crates stamp and compare the same value instead of each
+/// carrying its own `6` literal, where a typo would make a baseline key that
+/// silently never matches (issue #676 review).
+pub const IPPROTO_TCP: u8 = 6;
+
+/// IP protocol number for UDP, the `IPPROTO_UDP` of `<netinet/in.h>` — see
+/// [`IPPROTO_TCP`].
+pub const IPPROTO_UDP: u8 = 17;
+
+/// A TCP or UDP socket found bound/listening, from a periodic socket-table snapshot
+/// rather than a discrete `bind`/`listen()` syscall trace (Linux: `NETLINK_SOCK_DIAG`,
+/// issue #92 — a probe-free source that runs where eBPF/ETW cannot, or as a redundant
+/// cross-check alongside them).
 ///
 /// `meta.timestamp_ns` is when the snapshot was taken, not when the socket actually
 /// started listening — a snapshot can only observe "listening as of now", so a
@@ -1524,11 +1732,28 @@ pub struct UdpRecvEvent {
 /// cadence is a caller decision, not a schema concern). Detection value is in the
 /// series across snapshots (listen-port drift: a new port appearing that wasn't there
 /// last poll), not any single event in isolation.
+///
+/// `protocol` is the IP protocol number, same convention as [`NetworkFlowEvent::protocol`]
+/// (`IPPROTO_TCP` = 6, `IPPROTO_UDP` = 17, issue #676), and is part of every consumer's
+/// dedup/baseline key: a UDP listener and a TCP listener on the same port are different
+/// shapes, not a collision — `udp/53` and `tcp/53` are two different services with no
+/// reason to share a baseline entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenPortEvent {
     pub meta: EventMeta,
     pub local_addr: core::net::IpAddr,
     pub local_port: u16,
+    /// Defaults to `IPPROTO_TCP` on a record that predates this field (spooled
+    /// events, server storage, the ML corpus): every collector was TCP-only
+    /// before issue #676, so that's what an un-stamped record actually was.
+    #[serde(default = "default_listen_port_protocol")]
+    pub protocol: u8,
+}
+
+/// `IPPROTO_TCP` — the default for `ListenPortEvent::protocol` on a record from
+/// before this field existed.
+fn default_listen_port_protocol() -> u8 {
+    IPPROTO_TCP
 }
 
 /// Direction of TLS data flow.
@@ -1720,6 +1945,18 @@ pub struct HealthBeacon {
     /// to show how full the cache runs. Zero on other platforms and in an older beacon.
     #[serde(default)]
     pub parent_image_evicted_dead: u64,
+    /// Indicators in force in the on-device IOC set right now (#60): a gauge, not a total. Zero
+    /// when no feed is loaded, and in a beacon from an older agent.
+    #[serde(default)]
+    pub ioc_indicators: u64,
+    /// Cumulative IOC matches that raised a finding since the agent started. Zero in a beacon
+    /// from an older agent.
+    #[serde(default)]
+    pub ioc_findings: u64,
+    /// Cumulative IOC matches the per-indicator cooldown absorbed: a high count against few
+    /// findings is one indicator seen again and again. Zero in an older beacon.
+    #[serde(default)]
+    pub ioc_cooled_down: u64,
 }
 
 /// A logon/authentication outcome, or a privileged-session assignment — shared
@@ -2407,6 +2644,7 @@ pub enum Event {
     LdapSearch(LdapSearchEvent),
     NtlmAuth(NtlmAuthEvent),
     LogCleared(LogClearedEvent),
+    KerberosDelegationFailure(KerberosDelegationFailureEvent),
     WmiActivity(WmiActivityEvent),
     AssemblyLoad(AssemblyLoadEvent),
     SmbConnect(SmbConnectEvent),
@@ -2421,6 +2659,8 @@ pub enum Event {
     FileWrite(FileWriteEvent),
     FileDelete(FileDeleteEvent),
     FileRename(FileRenameEvent),
+    FileSetTime(FileSetTimeEvent),
+    RawVolumeOpen(RawVolumeOpenEvent),
     SocketBind(SocketBindEvent),
     FileChmod(FileChmodEvent),
     FileChown(FileChownEvent),
@@ -2450,6 +2690,7 @@ pub enum Event {
     HttpSummary(HttpSummaryEvent),
     PackageChange(PackageChangeEvent),
     BitsJob(BitsJobEvent),
+    UnitStop(UnitStopEvent),
 }
 
 impl Event {
@@ -2473,6 +2714,7 @@ impl Event {
             Event::LdapSearch(e) => &e.meta,
             Event::NtlmAuth(e) => &e.meta,
             Event::LogCleared(e) => &e.meta,
+            Event::KerberosDelegationFailure(e) => &e.meta,
             Event::WmiActivity(e) => &e.meta,
             Event::AssemblyLoad(e) => &e.meta,
             Event::SmbConnect(e) => &e.meta,
@@ -2487,6 +2729,8 @@ impl Event {
             Event::FileWrite(e) => &e.meta,
             Event::FileDelete(e) => &e.meta,
             Event::FileRename(e) => &e.meta,
+            Event::FileSetTime(e) => &e.meta,
+            Event::RawVolumeOpen(e) => &e.meta,
             Event::SocketBind(e) => &e.meta,
             Event::FileChmod(e) => &e.meta,
             Event::FileChown(e) => &e.meta,
@@ -2516,6 +2760,7 @@ impl Event {
             Event::HttpSummary(e) => &e.meta,
             Event::PackageChange(e) => &e.meta,
             Event::BitsJob(e) => &e.meta,
+            Event::UnitStop(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.

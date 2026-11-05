@@ -59,12 +59,26 @@ fn seeded_rule_state() -> rules::RuleState {
     let mut rule_state = rules::RuleState::new();
     rule_state.seed_pid_comm(map);
     // LISTENER-DRIFT baseline (#366), same reasoning as the Linux/macOS
-    // seeding: every listener already up when the agent starts (RPC 135, SMB
-    // 445, vendor services) is the baseline, not a finding. Best-effort — a
-    // snapshot failure leaves the baseline empty rather than failing startup.
-    match sensor_windows_sockets::snapshot() {
+    // seeding: every listener/bound socket already up when the agent starts
+    // (RPC 135, SMB 445, vendor services, DNS client sockets) is the
+    // baseline, not a finding. Best-effort — a snapshot failure leaves the
+    // baseline empty rather than failing startup.
+    //
+    // TCP only, for now: `GetExtendedUdpTable` has no "listener" filter (every
+    // bound UDP endpoint comes back — DNS client sockets, QUIC, mDNS,
+    // ephemeral ports), and #676's noise filter for that is not calibrated
+    // yet (review of #1008). Forwarding UDP unfiltered would drown the TCP
+    // signal, so it stays out of the rule path until that filter lands —
+    // `snapshot_tcp` does not call `GetExtendedUdpTable` at all, so there is
+    // no fetch to discard; `sensor_windows_sockets::snapshot` is the full
+    // mechanism for when the filter does land.
+    match sensor_windows_sockets::snapshot_tcp() {
         Ok(entries) => {
-            rule_state.seed_listen_ports(entries.iter().map(|e| (e.local.ip(), e.local.port())));
+            rule_state.seed_listen_ports(
+                entries
+                    .iter()
+                    .map(|e| (e.local.ip(), e.local.port(), e.protocol)),
+            );
         }
         Err(e) => tracing::warn!(error = %e, "socket snapshot for listener baseline failed"),
     }
@@ -92,11 +106,12 @@ fn spawn_socket_poller(
         .name("socket-poller".into())
         .spawn(move || {
             while !stop.load(Ordering::SeqCst) {
-                forward_socket_snapshot(
-                    sensor_windows_sockets::listen_port_events(schema::time::now_ns()),
-                    sink.as_ref(),
-                    heartbeat.as_ref(),
-                );
+                // TCP only for now — same #676 noise-filter gap as the
+                // baseline seed above (`seeded_rule_state`); `listen_port_events_tcp`
+                // never calls `GetExtendedUdpTable`, so there is nothing UDP to
+                // filter out or to warn about here.
+                let events = sensor_windows_sockets::listen_port_events_tcp(schema::time::now_ns());
+                forward_socket_snapshot(events, sink.as_ref(), heartbeat.as_ref());
                 // Sleep in short slices so Ctrl-C never waits a full interval.
                 let deadline = std::time::Instant::now() + SOCKET_POLL_INTERVAL;
                 while std::time::Instant::now() < deadline && !stop.load(Ordering::SeqCst) {
@@ -169,6 +184,11 @@ fn eventlog_config(policy: &policy::EventLogPolicy) -> sensor_windows_eventlog::
         wdac_enabled: true,
         terminal_sessions_enabled: true,
         log_clears_enabled: true,
+        // Not yet policy-configurable, same reasoning as the two above (#364):
+        // always on when this crate is enabled. The channel itself is off by
+        // default on a clean install; this does not turn it on (see
+        // `KERBEROS_DELEGATION_FAILURES`'s doc in sensor.rs).
+        kerberos_delegation_failures_enabled: true,
     }
 }
 
@@ -234,10 +254,11 @@ fn etw_failure_hint(error: &str) -> &'static str {
 fn run_windows_sensors(
     sink: Box<dyn EventSink>,
     silence: Option<&Mutex<SilenceMonitor>>,
+    redact_commands: bool,
 ) -> anyhow::Result<()> {
     // Run and both capture commands funnel through here, so this is the one
     // place credential redaction has to sit in front of (#440).
-    let sink = crate::redact::redacting(sink);
+    let sink = crate::redact::redacting(sink, redact_commands);
 
     let mut etw_sensor = sensor_windows::WindowsSensor::new();
     let etw_stop = etw_sensor.stop_handle();
@@ -459,6 +480,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         alerts,
         events,
         storage,
+        alert_details,
         enable_kill: _,
         enable_quarantine: _,
         // uprobes are a Linux mechanism — the capture flags are accepted for CLI
@@ -471,6 +493,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         content_dir,
         log_sources: _,
         deception,
+        detection,
         config_path: _,
     } = opts;
     let pipeline = super::common::wire_run_pipeline(
@@ -482,6 +505,10 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         content_dir,
         storage,
     )?;
+    // #319. Set before any sensor starts; the one alert `wire_run_pipeline` can raise
+    // itself (UPLOAD-DISABLED) is the agent's own text, not an event's.
+    pipeline.sink.alert_log().set_stderr_details(alert_details);
+    super::common::apply_detection(&pipeline.sink, detection);
     super::common::plant_canaries(
         &pipeline.sink,
         deception,
@@ -511,21 +538,25 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     );
     let (_health_handle, _health_stop) = health.spawn();
 
-    run_windows_sensors(Box::new(SharedSink(pipeline.sink)), Some(&silence_monitor))
+    run_windows_sensors(
+        Box::new(SharedSink(pipeline.sink)),
+        Some(&silence_monitor),
+        false,
+    )
 }
 
 pub(crate) fn cmd_capture_events(output: &std::path::Path) -> anyhow::Result<()> {
     let sink = sinks::JsonlEventSink::open(output)?;
     eprintln!("Synthaea — raw event capture (Ctrl-C to stop)");
     eprintln!("Output: {}", output.display());
-    run_windows_sensors(Box::new(sink), None)
+    run_windows_sensors(Box::new(sink), None, true)
 }
 
 pub(crate) fn cmd_capture_baseline(output: &std::path::Path) -> anyhow::Result<()> {
     let sink = crate::sink::BaselineSink::new(seeded_rule_state(), output)?;
     eprintln!("Synthaea — baseline capture (Ctrl-C to stop)");
     eprintln!("Output: {}", output.display());
-    run_windows_sensors(Box::new(sink), None)
+    run_windows_sensors(Box::new(sink), None, true)
 }
 
 #[cfg(test)]

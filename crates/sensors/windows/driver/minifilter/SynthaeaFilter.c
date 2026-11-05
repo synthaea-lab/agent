@@ -13,8 +13,8 @@ Module Name:
 Abstract:
 
     This is the main module of the SynthaeaFilter mini filter driver.
-    Milestone 2c (#136): it reports successful delete and rename requests
-    over the agent communication port. The port
+    Milestone 2c (#136): it reports successful deletes, renames, timestamp
+    requests, and mounted-volume opens over the agent communication port. The port
     follows ADR-0012 guardrails 2 and 5: SYSTEM/Administrators-only
     security descriptor, a single connection, and a connect callback that
     accepts only the agent (NT SERVICE\SynthaEDR in its token) and
@@ -46,11 +46,13 @@ Environment:
 
 #define SYNTHAEA_PORT_NAME          L"\\SynthaeaPort"
 #define SYNTHAEA_CONNECT_MAGIC      0x544E5953UL    // 'SYNT', little-endian
-#define SYNTHAEA_PROTOCOL_VERSION   3UL
+#define SYNTHAEA_PROTOCOL_VERSION   5UL
 
 #define SYNTHAEA_EVENT_HEARTBEAT            0
 #define SYNTHAEA_EVENT_DELETE               1
 #define SYNTHAEA_EVENT_RENAME               2
+#define SYNTHAEA_EVENT_SET_TIME             3
+#define SYNTHAEA_EVENT_RAW_VOLUME_OPEN      4
 #define SYNTHAEA_EVENT_FLAG_DELETE_ON_CLOSE 0x0001
 #define SYNTHAEA_EVENT_FLAG_OLD_TRUNCATED   0x0002
 #define SYNTHAEA_EVENT_FLAG_NEW_TRUNCATED   0x0004
@@ -77,6 +79,11 @@ typedef struct _SYNTHAEA_EVENT_HEADER {
     USHORT OldPathLength;
     USHORT NewPathLength;
     ULONGLONG DroppedCaptureFailed;
+    LONGLONG CreationTime;
+    LONGLONG LastAccessTime;
+    LONGLONG LastWriteTime;
+    LONGLONG ChangeTime;
+    ULONG DesiredAccess;
 } SYNTHAEA_EVENT_HEADER, *PSYNTHAEA_EVENT_HEADER;
 #pragma pack(pop)
 
@@ -92,7 +99,12 @@ C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, NotConnected) == 52);
 C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, OldPathLength) == 60);
 C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, NewPathLength) == 62);
 C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, DroppedCaptureFailed) == 64);
-C_ASSERT(sizeof(SYNTHAEA_EVENT_HEADER) == 72);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, CreationTime) == 72);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, LastAccessTime) == 80);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, LastWriteTime) == 88);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, ChangeTime) == 96);
+C_ASSERT(FIELD_OFFSET(SYNTHAEA_EVENT_HEADER, DesiredAccess) == 104);
+C_ASSERT(sizeof(SYNTHAEA_EVENT_HEADER) == 108);
 
 typedef struct _SYNTHAEA_QUEUED_EVENT {
     LIST_ENTRY Link;
@@ -306,7 +318,10 @@ SynthaeaAllocateEvent (
     _In_opt_ PFLT_FILE_NAME_INFORMATION OldName,
     _In_opt_ PFLT_FILE_NAME_INFORMATION NewName,
     _In_ ULONG ProcessId,
-    _In_ ULONGLONG ThreadId
+    _In_ ULONGLONG ThreadId,
+    _In_opt_ PFILE_BASIC_INFORMATION BasicInformation,
+    _In_opt_ PUNICODE_STRING VolumeName,
+    _In_ ACCESS_MASK DesiredAccess
     );
 
 VOID
@@ -742,7 +757,10 @@ SynthaeaAllocateEvent (
     _In_opt_ PFLT_FILE_NAME_INFORMATION OldName,
     _In_opt_ PFLT_FILE_NAME_INFORMATION NewName,
     _In_ ULONG ProcessId,
-    _In_ ULONGLONG ThreadId
+    _In_ ULONGLONG ThreadId,
+    _In_opt_ PFILE_BASIC_INFORMATION BasicInformation,
+    _In_opt_ PUNICODE_STRING VolumeName,
+    _In_ ACCESS_MASK DesiredAccess
     )
 {
     ULONG oldChars = 0;
@@ -754,7 +772,13 @@ SynthaeaAllocateEvent (
     PSYNTHAEA_QUEUED_EVENT event;
     LARGE_INTEGER timestamp;
 
-    if (OldName != NULL) {
+    if (VolumeName != NULL) {
+        oldChars = VolumeName->Length / sizeof(WCHAR);
+        if (oldChars > SYNTHAEA_MAX_PATH_CHARS) {
+            oldChars = SYNTHAEA_MAX_PATH_CHARS;
+            Flags |= SYNTHAEA_EVENT_FLAG_OLD_TRUNCATED;
+        }
+    } else if (OldName != NULL) {
         oldChars = OldName->Name.Length / sizeof(WCHAR);
         if (oldChars > SYNTHAEA_MAX_PATH_CHARS) {
             oldChars = SYNTHAEA_MAX_PATH_CHARS;
@@ -814,11 +838,20 @@ SynthaeaAllocateEvent (
     event->Header.ThreadId = ThreadId;
     event->Header.OldPathLength = (USHORT)oldChars;
     event->Header.NewPathLength = (USHORT)newChars;
+    if (BasicInformation != NULL) {
+        event->Header.CreationTime = BasicInformation->CreationTime.QuadPart;
+        event->Header.LastAccessTime = BasicInformation->LastAccessTime.QuadPart;
+        event->Header.LastWriteTime = BasicInformation->LastWriteTime.QuadPart;
+        event->Header.ChangeTime = BasicInformation->ChangeTime.QuadPart;
+    }
+    event->Header.DesiredAccess = DesiredAccess;
     KeQuerySystemTimePrecise( &timestamp );
     event->Header.Timestamp = timestamp.QuadPart;
 
     if (oldPathBytes != 0) {
-        RtlCopyMemory( event->Paths, OldName->Name.Buffer, oldPathBytes );
+        RtlCopyMemory( event->Paths,
+                       VolumeName != NULL ? VolumeName->Buffer : OldName->Name.Buffer,
+                       oldPathBytes );
     }
     if (newPathBytes != 0) {
         RtlCopyMemory( (PUCHAR)event->Paths + oldPathBytes,
@@ -837,10 +870,52 @@ SynthaeaPreCreate (
     PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
     PSYNTHAEA_QUEUED_EVENT event;
     NTSTATUS status;
+    PVOID volumeBuffer = NULL;
+    ULONG volumeBufferSize = 0;
+    UNICODE_STRING volumeName;
 
     *CompletionContext = NULL;
     if (SynthaeaShouldSkip( Data, FltObjects )) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+    if (FlagOn( FltObjects->FileObject->Flags, FO_VOLUME_OPEN )) {
+        if (InterlockedCompareExchange( &SynthaeaFilterData.Connected, 0, 0 ) == 0) {
+            InterlockedIncrement64( &SynthaeaFilterData.NotConnected );
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        }
+        status = FltGetVolumeName( FltObjects->Volume, NULL, &volumeBufferSize );
+        if (status != STATUS_BUFFER_TOO_SMALL || volumeBufferSize == 0 ||
+            volumeBufferSize > SYNTHAEA_MAX_PATH_CHARS * sizeof(WCHAR)) {
+            *CompletionContext = &SynthaeaCaptureFailedSentinel;
+            return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+        }
+        volumeBuffer = ExAllocatePoolZero( NonPagedPoolNx, volumeBufferSize,
+                                           SYNTHAEA_POOL_TAG );
+        if (volumeBuffer == NULL) {
+            *CompletionContext = &SynthaeaCaptureFailedSentinel;
+            return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+        }
+        RtlInitUnicodeString( &volumeName, NULL );
+        volumeName.Buffer = (PWCH)volumeBuffer;
+        volumeName.MaximumLength = (USHORT)volumeBufferSize;
+        status = FltGetVolumeName( FltObjects->Volume, &volumeName, NULL );
+        if (!NT_SUCCESS( status ) || volumeName.Length == 0 ||
+            (volumeName.Length % sizeof(WCHAR)) != 0) {
+            ExFreePoolWithTag( volumeBuffer, SYNTHAEA_POOL_TAG );
+            *CompletionContext = &SynthaeaCaptureFailedSentinel;
+            return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+        }
+        event = SynthaeaAllocateEvent( SYNTHAEA_EVENT_RAW_VOLUME_OPEN,
+                                       0, NULL, NULL,
+                                       FltGetRequestorProcessId( Data ),
+                                       (ULONGLONG)(ULONG_PTR)PsGetCurrentThreadId(),
+                                       NULL, &volumeName,
+                                       Data->Iopb->Parameters.Create.SecurityContext != NULL
+                                           ? Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess
+                                           : 0 );
+        ExFreePoolWithTag( volumeBuffer, SYNTHAEA_POOL_TAG );
+        *CompletionContext = event;
+        return FLT_PREOP_SUCCESS_WITH_CALLBACK;
     }
     if (!FlagOn( Data->Iopb->Parameters.Create.Options, FILE_DELETE_ON_CLOSE )) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -864,7 +939,8 @@ SynthaeaPreCreate (
                                    SYNTHAEA_EVENT_FLAG_DELETE_ON_CLOSE,
                                    nameInfo, NULL,
                                    FltGetRequestorProcessId( Data ),
-                                   (ULONGLONG)(ULONG_PTR)PsGetCurrentThreadId() );
+                                   (ULONGLONG)(ULONG_PTR)PsGetCurrentThreadId(), NULL,
+                                   NULL, 0 );
     FltReleaseFileNameInformation( nameInfo );
     *CompletionContext = event;
     return FLT_PREOP_SUCCESS_WITH_CALLBACK;
@@ -883,6 +959,7 @@ SynthaeaPreSetInformation (
     PSYNTHAEA_RENAME_INFORMATION renameInfo = NULL;
     PFLT_FILE_NAME_INFORMATION oldName = NULL;
     PFLT_FILE_NAME_INFORMATION newName = NULL;
+    PFILE_BASIC_INFORMATION basicInfo = NULL;
     PSYNTHAEA_QUEUED_EVENT event = NULL;
     USHORT kind = 0;
     USHORT eventFlags = 0;
@@ -937,12 +1014,24 @@ SynthaeaPreSetInformation (
             return FLT_PREOP_SUCCESS_NO_CALLBACK;
         }
         kind = SYNTHAEA_EVENT_RENAME;
+    } else if (informationClass == FileBasicInformation) {
+        if (infoLength < sizeof( FILE_BASIC_INFORMATION )) {
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        }
+        basicInfo = (PFILE_BASIC_INFORMATION)infoBuffer;
+        if (basicInfo->CreationTime.QuadPart == 0 &&
+            basicInfo->LastAccessTime.QuadPart == 0 &&
+            basicInfo->LastWriteTime.QuadPart == 0 &&
+            basicInfo->ChangeTime.QuadPart == 0) {
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        }
+        kind = SYNTHAEA_EVENT_SET_TIME;
     } else {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
     //
-    //  Only now: a delete or rename that would have been reported, with nobody to report
+    //  Only now: a qualifying create, delete, rename, or timestamp request with nobody to report
     //  it to, is "not connected".
     //
 
@@ -973,7 +1062,8 @@ SynthaeaPreSetInformation (
 
     event = SynthaeaAllocateEvent( kind, eventFlags, oldName, newName,
                                    FltGetRequestorProcessId( Data ),
-                                   (ULONGLONG)(ULONG_PTR)PsGetCurrentThreadId() );
+                                   (ULONGLONG)(ULONG_PTR)PsGetCurrentThreadId(), basicInfo,
+                                   NULL, 0 );
     if (newName != NULL) {
         FltReleaseFileNameInformation( newName );
     }

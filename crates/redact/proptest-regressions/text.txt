@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d77c499121934964d5533bba2a7f221b681a1967bd7e648d26faf7355383cc1f # shrinks to noise = ['`', '\'', 'a'], dialect = PowerShell
+cc b2c3a2144ceadec44ec473a814afe8b9bfa1339314908f2eda21ca36cfe6b7db # shrinks to noise = ['`', 'A', '\'', '"', '"', '\n', '`', '\\', 'a', '\''], dialect = PowerShell
+cc 94b081cf5d1a62328fd9c1834b217f97a656056da2479702d812b0485f4233d7 # shrinks to noise = ['\\', '`', '$', 'a', ';', '(', '('], dialect = PowerShell

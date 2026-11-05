@@ -21,9 +21,9 @@ use std::{
 use schema::{
     AuthEvent, AuthKind, AuthOutcome, DefenderEvent, DefenderEventKind, Event, EventMeta,
     FLAG_PERSISTENCE_ACCOUNT_ARTIFACT, FLAG_PERSISTENCE_ARTIFACT, FLAG_PERSISTENCE_TASK_ARTIFACT,
-    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, LogClearedEvent,
-    POLICY_MECHANISM_APPLOCKER, POLICY_MECHANISM_WDAC, PolicyDenialEvent, SessionEvent,
-    SessionState, User,
+    FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT, FileOpenEvent, KerberosDelegationFailureEvent,
+    KerberosDelegationFailureKind, LogClearedEvent, POLICY_MECHANISM_APPLOCKER,
+    POLICY_MECHANISM_WDAC, PolicyDenialEvent, SessionEvent, SessionState, User,
     sensor::{Capabilities, EventSink, Sensor, SensorError},
     time::now_ns,
 };
@@ -93,10 +93,80 @@ fn wevtutil(args: &[&str]) -> Result<String, String> {
             .map_or_else(|| "no exit code".to_string(), |c| c.to_string());
         return Err(format!(
             "wevtutil exited with {code}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            decode_ansi(&output.stderr).trim()
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(decode_ansi(&output.stdout))
+}
+
+/// `wevtutil`'s output, decoded from the system ANSI code page.
+///
+/// With its stdout redirected, `wevtutil` writes in the ANSI code page, not UTF-8 and not the
+/// OEM one: measured on a French Windows 11 (`ACP=1252`, `OEMCP=850`), `é` is the single byte
+/// `0xE9`. Decoded as UTF-8, every non-ASCII account name lost its letters to U+FFFD, so two
+/// accounts could become one string and `Système` matched no generic-account name (#1126).
+/// A host whose ANSI code page is UTF-8 (65001) decodes the same way through `CP_ACP`.
+///
+/// Two limits. A character the ANSI code page cannot hold (Cyrillic on a 1252 host) is
+/// already `?` when `wevtutil` writes it: no decoding here gets it back, only the `Subscribe`
+/// transport (UTF-16 from `EvtRender`) keeps it. And `CP_ACP` is this process's code page: it
+/// matches `wevtutil`'s only while the agent binary has no manifest setting `activeCodePage`
+/// (none does on 2026-11-04).
+///
+/// If the conversion fails, the output is decoded as lossy UTF-8, which is what this sensor did
+/// before #1126: accented names lose letters again. The first failure is logged with its Win32
+/// error code, once per process: the decode runs on every poll, and a failure that repeats would
+/// otherwise repeat its line every few seconds.
+fn decode_ansi(bytes: &[u8]) -> String {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+
+    decode_code_page(bytes, windows_sys::Win32::Globalization::CP_ACP).unwrap_or_else(|error| {
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                error,
+                bytes = bytes.len(),
+                "wevtutil output not decodable in the ANSI code page, decoded as lossy UTF-8 (logged once)"
+            );
+        }
+        String::from_utf8_lossy(bytes).into_owned()
+    })
+}
+
+/// `bytes` decoded from `code_page` through `MultiByteToWideChar`.
+///
+/// # Errors
+/// The Win32 error code of the failed call (`ERROR_INVALID_PARAMETER` for an unknown code page),
+/// or `ERROR_ARITHMETIC_OVERFLOW` for a buffer past `i32::MAX` bytes, which the call cannot take.
+fn decode_code_page(bytes: &[u8], code_page: u32) -> Result<String, u32> {
+    use windows_sys::Win32::{
+        Foundation::{ERROR_ARITHMETIC_OVERFLOW, GetLastError},
+        Globalization::MultiByteToWideChar,
+    };
+
+    if bytes.is_empty() {
+        return Ok(String::new());
+    }
+    let len = i32::try_from(bytes.len()).map_err(|_| ERROR_ARITHMETIC_OVERFLOW)?;
+    // SAFETY: `bytes` is a live slice of `len` bytes; a null output buffer with a size of 0 asks
+    // only for the number of UTF-16 units needed, and nothing is written.
+    let units =
+        unsafe { MultiByteToWideChar(code_page, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0) };
+    let Some(capacity) = usize::try_from(units).ok().filter(|n| *n > 0) else {
+        // SAFETY: no precondition; read right after the call that failed.
+        return Err(unsafe { GetLastError() });
+    };
+    let mut wide = vec![0u16; capacity];
+    // SAFETY: `wide` holds exactly `units` writable `u16`s, the size passed, and `bytes` is
+    // unchanged since the first call, so the conversion writes at most `units` units.
+    let written =
+        unsafe { MultiByteToWideChar(code_page, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), units) };
+    let Some(written) = usize::try_from(written).ok().filter(|n| *n > 0) else {
+        // SAFETY: no precondition; read right after the call that failed.
+        return Err(unsafe { GetLastError() });
+    };
+    wide.truncate(written);
+    Ok(String::from_utf16_lossy(&wide))
 }
 
 // ── The shared poll pipeline ─────────────────────────────────────────────────
@@ -1241,6 +1311,62 @@ static LOG_FILE_CLEARS: PollTarget = PollTarget {
     enabled: |c| c.log_clears_enabled,
 };
 
+/// `Microsoft-Windows-Kerberos/Operational` into a [`KerberosDelegationFailureEvent`] (#364):
+/// EID 201 (unconstrained delegation denied) or 202 (TGT session-key export denied). Skipped
+/// (cursor still advances): a block the `EventRecordID`/`EventID` extraction fails on, or any
+/// id the `XPath` filter let through that this function has no state for.
+///
+/// This channel is off by default on a clean install (checked on this host,
+/// `docs/sensors/sources.md`); unlike the `auditpol` subcategories other targets in this file
+/// enable, nothing here turns it on — same open question as #786's point 1 for
+/// `TaskScheduler/Operational`, not duplicated here. A disabled channel is still reported, not
+/// silently idle, by this module's existing start-up check (`warn_about_disabled_channels`).
+fn normalize_kerberos_delegation_failure_block(block: &str) -> ParsedBlock {
+    let record = xml::parse_kerberos_delegation_failure_block(block)?;
+    let record_id = record.record_id;
+    let kind = match record.event_id {
+        201 => KerberosDelegationFailureKind::UnconstrainedDelegationDenied,
+        202 => KerberosDelegationFailureKind::TgtSessionKeyExportDenied,
+        _ => return Some((record_id, None)),
+    };
+    let comm = record
+        .process_name
+        .as_deref()
+        .and_then(|path| path.rsplit(['/', '\\']).next())
+        .unwrap_or_default()
+        .to_string();
+    let event = Event::KerberosDelegationFailure(KerberosDelegationFailureEvent {
+        meta: EventMeta {
+            pid: record.caller_pid.unwrap_or(0),
+            ppid: 0,
+            user: User::Unknown,
+            timestamp_ns: record.time_created_ns.unwrap_or_else(now_ns),
+            comm,
+            container: None, // Windows: no container support
+            process_generation: None,
+            parent_process_generation: None,
+        },
+        kind,
+        target_server: record.target_server.unwrap_or_default(),
+        target_user: record.target_user.unwrap_or_default(),
+        target_domain: record.target_domain.unwrap_or_default(),
+        caller_user: record.client_user_name.unwrap_or_default(),
+        caller_domain: record.client_domain_name.unwrap_or_default(),
+    });
+    Some((record_id, Some(event)))
+}
+
+static KERBEROS_DELEGATION_FAILURES: PollTarget = PollTarget {
+    label: "kerberos-delegation-failure",
+    heartbeat: "windows-eventlog:kerberos-delegation-failure",
+    channel: "Microsoft-Windows-Kerberos/Operational",
+    id_filter: "EventID=201 or EventID=202",
+    counter: |c| &c.kerberos_delegation_failures,
+    parse_block: normalize_kerberos_delegation_failure_block,
+    enable_audit: None,
+    enabled: |c| c.kerberos_delegation_failures_enabled,
+};
+
 // ── Policy-configurable allowlist and volume counters (#94) ─────────────────
 //
 // `sensor-*` crates may depend only on `schema` (`tools/check-deps.py`), so
@@ -1332,6 +1458,13 @@ pub struct EventLogConfig {
     /// Security 1102 and System 104, an event log cleared by any means,
     /// reported as `LogClearedEvent` (#799). Both channels are always on.
     pub log_clears_enabled: bool,
+    /// Events 201/202 on `Microsoft-Windows-Kerberos/Operational` (unconstrained
+    /// delegation and TGT session-key-export denials), reported as
+    /// `KerberosDelegationFailureEvent` (#364). That channel is off by default
+    /// on a clean install (checked, this crate does not enable it — same open
+    /// question as #786's point 1 for `TaskScheduler/Operational`); a disabled
+    /// channel is still reported via [`warn_about_disabled_channels`].
+    pub kerberos_delegation_failures_enabled: bool,
 }
 
 /// Every poll target. Adding one = one entry here: its switch, heartbeat name
@@ -1353,6 +1486,7 @@ static TARGETS: &[&PollTarget] = &[
     &RDP_CONNECTIONS,
     &SECURITY_LOG_CLEARS,
     &LOG_FILE_CLEARS,
+    &KERBEROS_DELEGATION_FAILURES,
 ];
 
 impl Default for EventLogConfig {
@@ -1371,6 +1505,7 @@ impl Default for EventLogConfig {
             wdac_enabled: true,
             terminal_sessions_enabled: true,
             log_clears_enabled: true,
+            kerberos_delegation_failures_enabled: true,
         }
     }
 }
@@ -1398,6 +1533,8 @@ pub struct EventLogCounters {
     pub rdp_connections: AtomicU64,
     /// Security 1102 and System 104 together.
     pub log_clears: AtomicU64,
+    /// `Microsoft-Windows-Kerberos/Operational` 201 and 202 together.
+    pub kerberos_delegation_failures: AtomicU64,
     /// Channels found disabled at start-up for an enabled target (#786): each
     /// is polled or subscribed like any other but cannot deliver an event.
     pub disabled_channels: AtomicU64,
@@ -1689,6 +1826,7 @@ mod config_tests {
             wdac_enabled: false,
             terminal_sessions_enabled: false,
             log_clears_enabled: false,
+            kerberos_delegation_failures_enabled: false,
         });
         let caps = sensor.capabilities();
         assert!(!caps.file_events);
@@ -1709,6 +1847,7 @@ mod config_tests {
             wdac_enabled: false,
             terminal_sessions_enabled: false,
             log_clears_enabled: false,
+            kerberos_delegation_failures_enabled: false,
         });
         assert!(sensor.capabilities().file_events);
     }
@@ -1728,6 +1867,7 @@ mod config_tests {
             wdac_enabled: false,
             terminal_sessions_enabled: false,
             log_clears_enabled: false,
+            kerberos_delegation_failures_enabled: false,
             transport: EventLogTransport::default(),
         });
         assert!(!sensor.capabilities().file_events);
@@ -1746,6 +1886,7 @@ mod config_tests {
             wdac_enabled: false,
             terminal_sessions_enabled: false,
             log_clears_enabled: false,
+            kerberos_delegation_failures_enabled: false,
             transport: EventLogTransport::default(),
         });
         assert!(sensor.capabilities().file_events);
@@ -1795,6 +1936,7 @@ mod config_tests {
                 "windows-eventlog:rdp-connection",
                 "windows-eventlog:security-log-cleared",
                 "windows-eventlog:log-file-cleared",
+                "windows-eventlog:kerberos-delegation-failure",
             ]
         );
     }
@@ -1812,6 +1954,7 @@ mod config_tests {
             wdac_enabled: false,
             terminal_sessions_enabled: false,
             log_clears_enabled: false,
+            kerberos_delegation_failures_enabled: false,
             transport: EventLogTransport::Polling,
         });
         let names: Vec<_> = sensor.liveness().into_iter().map(|(n, _)| n).collect();
@@ -1858,6 +2001,53 @@ mod config_tests {
 #[cfg(test)]
 mod wevtutil_tests {
     use super::*;
+
+    /// The bytes a French Windows writes for the SYSTEM account's name, `Système`, in
+    /// Windows-1252 (#1126): decoded as UTF-8 they were `Syst\u{FFFD}me`.
+    #[test]
+    fn windows_1252_bytes_keep_their_accented_letters() {
+        let bytes = [0x53, 0x79, 0x73, 0x74, 0xE8, 0x6D, 0x65];
+        assert_eq!(decode_code_page(&bytes, 1252).as_deref(), Ok("Système"));
+        assert_eq!(
+            decode_code_page(
+                &[0x44, 0xE9, 0x6D, 0x61, 0x72, 0x72, 0x61, 0x67, 0x65],
+                1252
+            )
+            .as_deref(),
+            Ok("Démarrage")
+        );
+        assert_eq!(decode_code_page(&[], 1252).as_deref(), Ok(""));
+    }
+
+    /// A failed conversion reports why, so the fallback to lossy UTF-8 can be logged with it.
+    #[test]
+    fn an_unknown_code_page_fails_with_its_win32_error() {
+        assert_eq!(
+            decode_code_page(b"abc", 0xFFFF_FFF0),
+            Err(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn plain_ascii_is_unchanged_in_the_system_code_page() {
+        assert_eq!(
+            decode_ansi(b"<Event>S-1-5-18</Event>"),
+            "<Event>S-1-5-18</Event>"
+        );
+    }
+
+    /// On a host whose events carry non-ASCII text (a French or German Windows), the old UTF-8
+    /// decoding put U+FFFD in the output; the system code page never does for a real `wevtutil`
+    /// output. On an English host this passes either way.
+    #[test]
+    fn real_wevtutil_output_has_no_replacement_character() {
+        let out = wevtutil(&["qe", "System", "/c:300", "/rd:true", "/f:xml"])
+            .expect("the System channel is readable unelevated");
+        assert!(
+            !out.contains('\u{FFFD}'),
+            "a replacement character in wevtutil's output"
+        );
+    }
 
     #[test]
     fn a_query_matching_nothing_is_a_success_with_empty_output() {
@@ -2752,6 +2942,105 @@ mod log_cleared_tests {
             normalize_log_cleared_block(&other_id),
             Some((1_399_119, None))
         ));
+    }
+}
+
+#[cfg(test)]
+mod kerberos_delegation_failure_tests {
+    use super::*;
+
+    // Field names and order from the provider's own manifest
+    // (`Microsoft-Windows-Security-Kerberos`, `wevtutil gp ... /ge:true /gm:true`, checked on
+    // this host, #364): EID 201 and 202 share one nine-field template.
+    const BLOCK_201: &str = "<Event><System><EventID>201</EventID>\
+        <TimeCreated SystemTime='2026-10-23T09:15:30.0000000Z'/><EventRecordID>5201</EventRecordID>\
+        <Channel>Microsoft-Windows-Kerberos/Operational</Channel></System><EventData>\
+        <Data Name='TargetName'>cifs/dc01.lab.internal</Data><Data Name='UserName'>analyst</Data>\
+        <Data Name='DomainName'>LAB</Data><Data Name='CallerPID'>4120</Data>\
+        <Data Name='ProcessName'>C:\\Windows\\System32\\fileserver.exe</Data>\
+        <Data Name='ClientLUID'>0x3e7</Data><Data Name='ClientUserName'>svc_fileserver</Data>\
+        <Data Name='ClientDomainName'>LAB</Data><Data Name='MechanismOID'>1.2.840.113554.1.2.2</Data>\
+        </EventData></Event>";
+    const BLOCK_202: &str = "<Event><System><EventID>202</EventID>\
+        <TimeCreated SystemTime='2026-10-23T09:16:00.0000000Z'/><EventRecordID>5202</EventRecordID>\
+        <Channel>Microsoft-Windows-Kerberos/Operational</Channel></System><EventData>\
+        <Data Name='TargetName'>HTTP/app01.lab.internal</Data><Data Name='UserName'>svc_app</Data>\
+        <Data Name='DomainName'>LAB</Data><Data Name='CallerPID'>8800</Data>\
+        <Data Name='ProcessName'>C:\\inetpub\\w3wp.exe</Data>\
+        <Data Name='ClientLUID'>0x3e4</Data><Data Name='ClientUserName'>w3wp</Data>\
+        <Data Name='ClientDomainName'>LAB</Data><Data Name='MechanismOID'>1.2.840.113554.1.2.2</Data>\
+        </EventData></Event>";
+
+    fn kerberos_failure(block: &str) -> KerberosDelegationFailureEvent {
+        match normalize_kerberos_delegation_failure_block(block) {
+            Some((_, Some(Event::KerberosDelegationFailure(e)))) => e,
+            other => panic!("expected a KerberosDelegationFailure event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_201_is_unconstrained_delegation_denied_with_the_caller_process() {
+        let event = kerberos_failure(BLOCK_201);
+        assert_eq!(
+            event.kind,
+            KerberosDelegationFailureKind::UnconstrainedDelegationDenied
+        );
+        assert_eq!(event.target_server, "cifs/dc01.lab.internal");
+        assert_eq!(event.target_user, "analyst");
+        assert_eq!(event.target_domain, "LAB");
+        assert_eq!(event.meta.pid, 4120);
+        assert_eq!(event.meta.comm, "fileserver.exe");
+        assert_eq!(event.caller_user, "svc_fileserver");
+        assert_eq!(event.caller_domain, "LAB");
+        assert_eq!(event.meta.user, User::Unknown);
+        assert_eq!(
+            event.meta.timestamp_ns,
+            xml::time_created_ns(BLOCK_201).unwrap(),
+            "timestamp should come from TimeCreated, not the time the agent happened to parse it"
+        );
+    }
+
+    #[test]
+    fn a_missing_time_created_falls_back_to_now_rather_than_zero() {
+        let block = BLOCK_201.replacen(
+            "<TimeCreated SystemTime='2026-10-23T09:15:30.0000000Z'/>",
+            "",
+            1,
+        );
+        let before = now_ns();
+        let event = kerberos_failure(&block);
+        assert!(
+            event.meta.timestamp_ns >= before,
+            "{}",
+            event.meta.timestamp_ns
+        );
+    }
+
+    #[test]
+    fn a_202_is_tgt_session_key_export_denied() {
+        let event = kerberos_failure(BLOCK_202);
+        assert_eq!(
+            event.kind,
+            KerberosDelegationFailureKind::TgtSessionKeyExportDenied
+        );
+        assert_eq!(event.target_server, "HTTP/app01.lab.internal");
+        assert_eq!(event.meta.pid, 8800);
+        assert_eq!(event.meta.comm, "w3wp.exe");
+    }
+
+    #[test]
+    fn other_ids_are_skipped_but_advance_the_cursor() {
+        let other = BLOCK_201.replace("<EventID>201</EventID>", "<EventID>203</EventID>");
+        assert!(matches!(
+            normalize_kerberos_delegation_failure_block(&other),
+            Some((5201, None))
+        ));
+    }
+
+    #[test]
+    fn a_missing_caller_pid_is_zero_not_guessed() {
+        let block = BLOCK_201.replace("<Data Name='CallerPID'>4120</Data>", "");
+        assert_eq!(kerberos_failure(&block).meta.pid, 0);
     }
 }
 

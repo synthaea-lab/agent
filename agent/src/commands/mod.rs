@@ -9,6 +9,8 @@
 mod common;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+mod localzone;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(windows)]
@@ -34,6 +36,9 @@ pub(crate) struct RunOptions<'a> {
     // cap (`spool_max_mb`, #604) travels with it. Every platform reads it for the
     // spool; only Linux also reads `state_dir` for the integrity monitor.
     pub(crate) storage: &'a config::StorageConfig,
+    /// `run --alert-details` (#319): the whole alert message on stderr, not just
+    /// its summary. Every platform reads it.
+    pub(crate) alert_details: bool,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) enable_kill: bool,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -59,6 +64,8 @@ pub(crate) struct RunOptions<'a> {
     pub(crate) log_sources: &'a [config::LogSourceConfig],
     /// Canary directories declared in `[deception]` (#81), planted by `common::plant_canaries`.
     pub(crate) deception: &'a config::DeceptionConfig,
+    /// Host facts from `[detection]` (#376), handed to the rules by `common::apply_detection`.
+    pub(crate) detection: &'a config::DetectionConfig,
     /// The config path `config::discover` actually resolved at startup (issue #71):
     /// watched by `protected::protected_paths` as one more of the agent's own
     /// resources. Read only by `linux::cmd_run`, same posture as the other

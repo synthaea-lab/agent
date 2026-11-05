@@ -8,7 +8,9 @@
 //! counts each of them.
 //!
 //! What counts: `systemctl stop` / `disable --now` / `mask --now` and `service X stop` and
-//! `/etc/init.d/X stop` (Linux); `net stop`, `sc stop` and `Stop-Service` (Windows);
+//! `/etc/init.d/X stop` (Linux) and `systemctl kill` with a signal that ends or freezes the unit
+//! (the default SIGTERM, KILL, INT, QUIT, ABRT, STOP; not HUP or USR1, which reload, and not
+//! `--kill-whom=control`, which signals the stop script only); `net stop`, `sc stop` and `Stop-Service` (Windows);
 //! `launchctl bootout` / `unload` / `remove` / `stop` (macOS). A `Get-Service ... |
 //! Stop-Service` pipeline names no service and counts as one, labelled as such.
 //!
@@ -20,8 +22,9 @@
 //! excluded by name.
 //!
 //! The alert is a plain T1489 detection. It does not feed the ransomware reflex or the
-//! damage manifest of #82: both consume T1486 alerts only, and joining them is a decision
-//! of its own (a service-stop burst followed by mass renames would be the corroboration).
+//! damage manifest of #82: both consume T1486 alerts only. The one use made of it (#973) is
+//! that a later T1486 finding from the same lineage names the burst in its message, see
+//! [`crate::impactctx`]; nothing the manifest or the kill read changes.
 
 use schema::ExecEvent;
 
@@ -65,6 +68,14 @@ pub(crate) fn services_stopped(event: &ExecEvent) -> Vec<String> {
 /// `systemctl stop a b`, `systemctl disable --now a`, `systemctl mask --now a`: the first
 /// argument that is not a flag is the verb, the rest that are not flags are units.
 fn systemctl(args: &[String]) -> Vec<String> {
+    if args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .map(String::as_str)
+        == Some("kill")
+    {
+        return systemctl_kill(args);
+    }
     let mut positional = args.iter().filter(|a| !a.starts_with('-'));
     let Some(verb) = positional.next() else {
         return Vec::new();
@@ -75,6 +86,71 @@ fn systemctl(args: &[String]) -> Vec<String> {
         return Vec::new();
     }
     positional.map(|unit| unit_name(unit)).collect()
+}
+
+/// The signals of `systemctl kill` that end or freeze a unit, by name (without `SIG`) and by
+/// Linux number. `HUP` is left out on purpose: `systemctl kill -s HUP unit` is the reload
+/// idiom, and counting it would make every reload a stop. Same set as the signal rule's
+/// (`tamper_signal_name`) without `HUP`.
+fn kills_the_unit(signal: &str) -> bool {
+    let upper = signal.to_ascii_uppercase();
+    let name = upper.strip_prefix("SIG").unwrap_or(&upper);
+    matches!(
+        name,
+        "TERM" | "KILL" | "INT" | "QUIT" | "ABRT" | "STOP" | "2" | "3" | "6" | "9" | "15" | "19"
+    )
+}
+
+/// `systemctl kill [-s SIG | --signal=SIG] [--kill-whom=WHOM] [--kill-value=N] unit...`: the
+/// units, when the signal ends or freezes them. The signal defaults to SIGTERM. The values of
+/// the options that take one are skipped (`-s KILL` must not read `KILL` as a unit), in the
+/// forms `-s SIG`, `-sSIG`, `--signal SIG` and `--signal=SIG`. `--kill-whom=control` signals
+/// the stop script, not the service, and is not a stop.
+fn systemctl_kill(args: &[String]) -> Vec<String> {
+    let mut signal = "TERM";
+    let mut whom = "all";
+    let mut units = Vec::new();
+    let mut seen_verb = false;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        i += 1;
+        // The value of an option, in `--name=value` or `--name value` form.
+        let mut value_of = |name: &str| -> Option<&str> {
+            if let Some(v) = arg.strip_prefix(name).and_then(|r| r.strip_prefix('=')) {
+                Some(v)
+            } else if arg == name {
+                i += 1;
+                args.get(i - 1).map(String::as_str)
+            } else {
+                None
+            }
+        };
+        if let Some(v) = value_of("--signal") {
+            signal = v;
+        } else if let Some(v) = value_of("--kill-whom").or_else(|| value_of("--kill-who")) {
+            whom = v;
+        } else if value_of("--kill-value").is_some() {
+            // The queued value is not a unit.
+        } else if arg == "-s" {
+            i += 1;
+            if let Some(v) = args.get(i - 1) {
+                signal = v;
+            }
+        } else if let Some(v) = arg.strip_prefix("-s").filter(|v| !v.is_empty()) {
+            signal = v;
+        } else if arg.starts_with('-') {
+            // Another flag (`--no-block`, `--user`, ...).
+        } else if !seen_verb {
+            seen_verb = true;
+        } else {
+            units.push(unit_name(arg));
+        }
+    }
+    if whom == "control" || !kills_the_unit(signal) {
+        return Vec::new();
+    }
+    units
 }
 
 /// `service X stop`, `rc-service X stop`: the unit then the action.

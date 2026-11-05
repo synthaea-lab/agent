@@ -1008,7 +1008,11 @@ fn listen_port_seeded_at_startup_does_not_alert() {
     // before the agent attaches (sshd started by systemd at boot) must not look
     // like a freshly planted backdoor on the first poll.
     let mut state = RuleState::new();
-    state.seed_listen_ports([(std::net::IpAddr::V4([0, 0, 0, 0].into()), 22)]);
+    state.seed_listen_ports([(
+        std::net::IpAddr::V4([0, 0, 0, 0].into()),
+        22,
+        schema::IPPROTO_TCP,
+    )]);
     let alerts = state.on_listen_port(&listen_port_event_full(1, "sshd", [0, 0, 0, 0], 22, 0));
     assert!(alerts.is_empty());
 }
@@ -1049,6 +1053,34 @@ fn listen_port_two_distinct_new_ports_each_alert() {
     ));
     assert_eq!(first.len(), 1);
     assert_eq!(second.len(), 1);
+}
+
+#[test]
+fn listen_port_udp_on_a_tcp_baselined_port_still_alerts() {
+    // Issue #676: udp/53 and tcp/53 are two different services sharing a port
+    // number, not one shape — a UDP listener must not look already-seen just
+    // because the same (addr, port) was baselined as TCP.
+    let mut state = RuleState::new();
+    state.seed_listen_ports([(
+        std::net::IpAddr::V4([0, 0, 0, 0].into()),
+        53,
+        schema::IPPROTO_TCP,
+    )]);
+    let tcp_again = state.on_listen_port(&listen_port_event_full(53, "named", [0, 0, 0, 0], 53, 0));
+    assert!(
+        tcp_again.is_empty(),
+        "the TCP listener on :53 was already seeded, so it must not re-alert"
+    );
+    let udp = ListenPortEvent {
+        protocol: schema::IPPROTO_UDP,
+        ..listen_port_event_full(54, "dnsmasq", [0, 0, 0, 0], 53, 1_000_000_000)
+    };
+    let udp_alerts = state.on_listen_port(&udp);
+    assert_eq!(
+        udp_alerts.len(),
+        1,
+        "a UDP listener on the same port as an already-baselined TCP one is a new shape"
+    );
 }
 
 // ── POLICY-DENIAL-DRIFT via SELinux AVC (issue #774, PolicyDenialEvent) ──
@@ -2693,6 +2725,27 @@ fn a_compressor_comm_with_no_known_exec_path_fails_closed() {
     // of /usr/bin/gzip, and the process controls it. Unlike most name-keyed exclusions
     // this one alerts, same reasoning as the sed/perl exclusion.
     let alerts = compressor_burst("gzip", None);
+    assert_eq!(alerts.len(), 1);
+}
+
+#[test]
+fn semodule_rebuilding_the_selinux_policy_store_does_not_alert() {
+    // Measured live (Fedora Cloud Base 43, SELinux Enforcing, #1013): `semodule -B` staged
+    // and replaced 20 modules in one pid within 5s, the exact write-new-then-unlink shape,
+    // and alerted at Critical with RESPONSE-ESCALATE before this exclusion.
+    assert!(compressor_burst("semodule", Some("/usr/sbin/semodule")).is_empty());
+}
+
+#[test]
+fn a_semodule_comm_from_an_untrusted_path_still_alerts() {
+    let alerts = compressor_burst("semodule", Some("/tmp/semodule"));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1486");
+}
+
+#[test]
+fn a_semodule_comm_with_no_known_exec_path_fails_closed() {
+    let alerts = compressor_burst("semodule", None);
     assert_eq!(alerts.len(), 1);
 }
 

@@ -1411,7 +1411,10 @@ mod tests {
             !allow.allows(10, seen.image_of(10, Some(1)).as_ref()),
             "the link's own name is user-writable, so it cannot vouch for the process"
         );
-        let mut by_target = images(&[exec_of(11, Some(1), "/usr/bin/ls", false)]);
+        // The kernel reports an exec by its resolved path, and `/usr/bin/ls` may itself be a link:
+        // on Ubuntu 26.04 it points into the uutils multicall tree (`/usr/lib/cargo/bin/coreutils`).
+        let resolved = fs::canonicalize(target).unwrap();
+        let mut by_target = images(&[exec_of(11, Some(1), &resolved.to_string_lossy(), false)]);
         assert!(
             allow.allows(11, by_target.image_of(11, Some(1)).as_ref()),
             "the resolved path still matches"

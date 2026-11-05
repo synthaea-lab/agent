@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use tamper::heartbeat::SilenceMonitor;
 
+use super::localzone;
 use crate::{
     health::{
         DroppedCounter, HealthCollector, HealthCollectorConfig, HostCountersSource, NoopSpoolStats,
@@ -62,6 +63,111 @@ pub(crate) fn plant_canaries(
             "deception: no control plane, decoy credentials are planted but nothing will recognise them"
         ),
         None => {}
+    }
+}
+
+/// Hands the rules the host's local time, which turns ODD-HOUR-LOGON on (#376, #1088): the
+/// platform's time zone when the host names one (daylight saving followed), and the operator's
+/// `[detection] utc_offset_minutes` over it when set. An offset no timezone has is logged and
+/// ignored rather than guessed; with neither the rule stays off.
+pub(crate) fn apply_detection(sink: &DetectionSink, detection: &config::DetectionConfig) {
+    apply_platform_zone(sink);
+    apply_odd_hour_calibration(sink, detection);
+    let Some(minutes) = detection.utc_offset_minutes else {
+        return;
+    };
+    if sink.set_local_utc_offset_minutes(minutes) {
+        tracing::info!(
+            minutes,
+            "detection: host local time set, odd-hour logon rule on"
+        );
+    } else {
+        tracing::warn!(
+            minutes,
+            "detection: utc_offset_minutes is outside -720..=840, odd-hour logon rule stays off"
+        );
+    }
+}
+
+/// Indexes of the exempt entries that contain a backslash (`DOMAIN\name`): kept, not rejected,
+/// but they match nothing today.
+fn backslash_exempt_entries(entries: &[String]) -> Vec<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.contains('\\'))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// The operator's declared ordinary hours and exempt accounts for ODD-HOUR-LOGON (#1089);
+/// nothing changes for a host that declared neither.
+fn apply_odd_hour_calibration(sink: &DetectionSink, detection: &config::DetectionConfig) {
+    if let Some([start, end]) = detection.work_hours {
+        if sink.set_work_hours(start, end) {
+            if start == 0 && end == 24 {
+                tracing::info!(
+                    start,
+                    end,
+                    "detection: odd-hour logon window declared; every hour is ordinary, so the rule will not alert"
+                );
+            } else {
+                tracing::info!(start, end, "detection: odd-hour logon window declared");
+            }
+        } else {
+            tracing::warn!(
+                start,
+                end,
+                "detection: work_hours is not a window, the default 07:00-20:00 stays"
+            );
+        }
+    }
+    if !detection.odd_hour_exempt_accounts.is_empty() {
+        for index in backslash_exempt_entries(&detection.odd_hour_exempt_accounts) {
+            tracing::warn!(
+                index,
+                "detection: an exempt entry contains a backslash; no sensor reports DOMAIN\\name for a logon today, so it exempts nothing (write the bare name, or NAME|SID)"
+            );
+        }
+        let kept = sink.set_odd_hour_exempt_accounts(&detection.odd_hour_exempt_accounts);
+        tracing::info!(
+            count = kept,
+            "detection: accounts exempt from the odd-hour logon rule"
+        );
+        // A guard against drift only: `config::load` already refuses every entry the rules drop
+        // (blank, over-long, a malformed SID part, past the limit), so this does not fire after a
+        // normal load; both grammars are checked against one shared table of entries.
+        if kept != detection.odd_hour_exempt_accounts.len() {
+            tracing::warn!(
+                declared = detection.odd_hour_exempt_accounts.len(),
+                kept,
+                "detection: some exempt entries were dropped (blank, over-long, malformed or past the limit)"
+            );
+        }
+    }
+}
+
+/// Asks the platform for the host's time zone and gives it to the rules. Not given when the
+/// host names no zone (a minimal Unix container is UTC to the C library by default, which is
+/// not a choice anyone made) or the platform cannot convert the present.
+fn apply_platform_zone(sink: &DetectionSink) {
+    if !localzone::configured() {
+        tracing::info!(
+            "detection: the host names no time zone; odd-hour logon rule off unless utc_offset_minutes is set"
+        );
+        return;
+    }
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .unwrap_or_default();
+    if sink.set_local_zone(localzone::utc_offset_minutes_at, now_secs) {
+        tracing::info!("detection: platform time zone in use, odd-hour logon rule on");
+    } else {
+        tracing::warn!(
+            "detection: the platform gave no time zone offset; odd-hour logon rule off unless utc_offset_minutes is set"
+        );
     }
 }
 
@@ -206,6 +312,9 @@ pub(crate) fn health_collector(
                 tamper_events = beacon.tamper_events,
                 parent_image_evicted_live = beacon.parent_image_evicted_live,
                 parent_image_evicted_dead = beacon.parent_image_evicted_dead,
+                ioc_indicators = beacon.ioc_indicators,
+                ioc_findings = beacon.ioc_findings,
+                ioc_cooled_down = beacon.ioc_cooled_down,
                 "health beacon"
             );
             // #24/#134: the dedicated health channel — best-effort, an
@@ -222,6 +331,22 @@ pub(crate) fn health_collector(
 
 #[cfg(test)]
 mod tests {
+    use super::backslash_exempt_entries;
+
+    #[test]
+    fn an_exempt_entry_with_a_backslash_is_flagged_not_dropped() {
+        let entries: Vec<String> = [
+            "svc_backup",
+            "CORP\\oncall",
+            "ok|S-1-5-21-1-2-3-1004",
+            "A\\b|S-1-5-21-1-2-3-*",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(backslash_exempt_entries(&entries), vec![1, 3]);
+        assert!(backslash_exempt_entries(&[]).is_empty());
+    }
+
     use std::sync::OnceLock;
 
     use tamper::heartbeat::SensorHeartbeat;

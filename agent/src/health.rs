@@ -142,6 +142,12 @@ pub struct HostCounters {
     pub parent_image_evicted_live: u64,
     /// Entries the cap dropped whose process had already exited (nothing lost).
     pub parent_image_evicted_dead: u64,
+    /// Indicators in force in the on-device IOC set (a gauge, #60).
+    pub ioc_indicators: u64,
+    /// IOC matches that raised a finding.
+    pub ioc_findings: u64,
+    /// IOC matches the per-indicator cooldown absorbed.
+    pub ioc_cooled_down: u64,
 }
 
 /// Reads the [`HostCounters`].
@@ -346,6 +352,9 @@ impl HealthCollector {
             tamper_events: host.tamper_events,
             parent_image_evicted_live: host.parent_image_evicted_live,
             parent_image_evicted_dead: host.parent_image_evicted_dead,
+            ioc_indicators: host.ioc_indicators,
+            ioc_findings: host.ioc_findings,
+            ioc_cooled_down: host.ioc_cooled_down,
         }
     }
 }
@@ -437,6 +446,9 @@ mod tests {
             tamper_events: 5,
             parent_image_evicted_live: 13,
             parent_image_evicted_dead: 209_000,
+            ioc_indicators: 12_000,
+            ioc_findings: 4,
+            ioc_cooled_down: 31,
         }));
 
         let (tx, rx) = mpsc::channel();
@@ -493,6 +505,15 @@ mod tests {
             ),
             (3, 5, 13, 209_000),
             "the watchdog, tamper and eviction counters ride the beacon (#863)"
+        );
+        assert_eq!(
+            (
+                beacon.ioc_indicators,
+                beacon.ioc_findings,
+                beacon.ioc_cooled_down
+            ),
+            (12_000, 4, 31),
+            "the IOC engine counters ride the beacon (#60)"
         );
     }
 

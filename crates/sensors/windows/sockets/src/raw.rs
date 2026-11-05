@@ -4,10 +4,20 @@
 
 use std::net::SocketAddr;
 
-/// One listening TCP socket from a snapshot. The IP Helper table attributes the
-/// socket to its owning pid; `ppid` and `process_name` come from the process
-/// snapshot taken alongside it and are `None` when that process was not found
-/// there (exited mid-poll, or the snapshot failed).
+/// `IPPROTO_TCP`, mirroring `sensor-linux-netlink::wire::IPPROTO_TCP` — no
+/// shared `schema` constant yet (#676 part 2 review). Only `snapshot` (Windows
+/// only) uses these; on other targets they are dead code, not merely unused —
+/// the module that would use them does not compile there at all.
+#[cfg(windows)]
+pub(crate) const IPPROTO_TCP: u8 = 6;
+/// `IPPROTO_UDP`.
+#[cfg(windows)]
+pub(crate) const IPPROTO_UDP: u8 = 17;
+
+/// One listening TCP or bound UDP socket from a snapshot. The IP Helper table
+/// attributes the socket to its owning pid; `ppid` and `process_name` come from
+/// the process snapshot taken alongside it and are `None` when that process was
+/// not found there (exited mid-poll, or the snapshot failed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenerEntry {
     pub pid: u32,
@@ -16,6 +26,9 @@ pub struct ListenerEntry {
     /// the full path.
     pub process_name: Option<String>,
     pub local: SocketAddr,
+    /// `IPPROTO_TCP` (6) or `IPPROTO_UDP` (17) — which IP Helper table this
+    /// entry came from (issue #676).
+    pub protocol: u8,
 }
 
 /// `dwLocalAddr` holds the IPv4 address in network byte order, as stored in

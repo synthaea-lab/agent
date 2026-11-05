@@ -21,7 +21,7 @@ fn a_graduated_draft_loads_whole_and_every_line_matches() {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .count() as u64;
     assert_eq!(report.added, indicators);
-    assert_eq!(indicators, 4);
+    assert_eq!(indicators, 6);
 
     let set = builder.build().expect("the draft fits the budget");
     for hash in [
@@ -38,5 +38,10 @@ fn a_graduated_draft_loads_whole_and_every_line_matches() {
         let ip = address.parse().unwrap();
         let found = set.lookup_ip(ip).unwrap_or_else(|| panic!("{address}"));
         assert_eq!(found.kind, IndicatorKind::Ip);
+    }
+    for name in ["a.evil.example", "c2.evil.example", "www.a.evil.example"] {
+        let found = set.lookup_domain(name).unwrap_or_else(|| panic!("{name}"));
+        assert_eq!(found.kind, IndicatorKind::Domain);
+        assert_eq!(found.feed, FeedId(1));
     }
 }

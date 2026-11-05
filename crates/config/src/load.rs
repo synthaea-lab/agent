@@ -289,6 +289,54 @@ fn validate_semantics(cfg: &AgentConfig, source_path: &Path) -> Result<(), Confi
         }
     }
 
+    // detection.utc_offset_minutes — a typo (`2` for `120`, seconds for minutes) would put every
+    // logon in the wrong hour, so it fails at boot instead of quietly mis-timing the rule.
+    if let Some(minutes) = cfg.detection.utc_offset_minutes
+        && !(-720..=840).contains(&minutes)
+    {
+        return Err(ConfigError::Invalid {
+            field: "detection.utc_offset_minutes".into(),
+            expected: "minutes east of UTC, between -720 and 840".into(),
+            value: minutes.to_string(),
+            origin: src.clone(),
+        });
+    }
+
+    // detection.work_hours — a typo would move the window the rule judges every logon by.
+    if let Some([start, end]) = cfg.detection.work_hours
+        && (start > 23 || end == 0 || end > 24 || start == end)
+    {
+        return Err(ConfigError::Invalid {
+            field: "detection.work_hours".into(),
+            expected: "[start, end]: start 0 to 23, end 1 to 24, start different from end".into(),
+            value: format!("[{start}, {end}]"),
+            origin: src.clone(),
+        });
+    }
+
+    // detection.odd_hour_exempt_accounts — bounded, and a blank or malformed entry would exempt
+    // nothing (or, for a malformed SID, more than was written) while looking like it exempted
+    // someone. The message names the first bad entry.
+    let exempt = &cfg.detection.odd_hour_exempt_accounts;
+    let bad_entry = exempt
+        .iter()
+        .enumerate()
+        .find_map(|(i, entry)| exempt_entry_problem(entry).map(|problem| (i, problem)));
+    if exempt.len() > crate::schema::MAX_ODD_HOUR_EXEMPT_ACCOUNTS || bad_entry.is_some() {
+        return Err(ConfigError::Invalid {
+            field: "detection.odd_hour_exempt_accounts".into(),
+            expected: format!(
+                "at most {} entries, each `NAME` or `NAME|SID` (a SID `S-1-...` or a prefix ending in `-*`), none blank or over 256 bytes",
+                crate::schema::MAX_ODD_HOUR_EXEMPT_ACCOUNTS
+            ),
+            value: match bad_entry {
+                Some((i, problem)) => format!("entry {i} ({:?}): {problem}", exempt[i]),
+                None => format!("{} entries", exempt.len()),
+            },
+            origin: src.clone(),
+        });
+    }
+
     // deception.canary_dirs — each one gets files written into it by the agent, so a
     // typo must fail at boot rather than plant under a relative path of the cwd.
     if cfg.deception.canary_dirs.len() > crate::schema::MAX_CANARY_DIRS {
@@ -532,6 +580,37 @@ fn parse_env_bool(env_var: &str, field: &str, raw: &str) -> Result<bool, ConfigE
             value: raw.to_string(),
         }),
     }
+}
+
+/// Why an `odd_hour_exempt_accounts` entry is not valid, or `None`: `NAME` or `NAME|SID`, where
+/// `SID` is `S-1-` then digits and dashes, or such a prefix ending in `-*`. The rules apply the
+/// same grammar and drop an entry that fails it; refusing it here means a typo fails the load
+/// instead of silently exempting nothing.
+fn exempt_entry_problem(entry: &str) -> Option<&'static str> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return Some("blank");
+    }
+    if entry.len() > 256 {
+        return Some("over 256 bytes");
+    }
+    let (name, sid) = entry.split_once('|')?;
+    if name.trim().is_empty() {
+        return Some("no account name before `|`");
+    }
+    let sid = sid.trim();
+    let body = sid.strip_suffix("-*").unwrap_or(sid);
+    let valid = body
+        .strip_prefix("S-1-")
+        .or_else(|| body.strip_prefix("s-1-"))
+        .is_some_and(|rest| {
+            !rest.is_empty()
+                && !rest.starts_with('-')
+                && !rest.ends_with('-')
+                && !rest.contains("--")
+                && rest.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+        });
+    (!valid).then_some("the part after `|` is not a SID (`S-1-...`) or a prefix ending in `-*`")
 }
 
 #[cfg(test)]
@@ -932,6 +1011,133 @@ control_plane_url = "https://cp.example"
             ConfigError::Invalid { field, .. } => assert_eq!(field, "logs.sources"),
             other => panic!("expected Invalid, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn no_detection_table_leaves_the_utc_offset_unset() {
+        assert_eq!(
+            load_with_logs("").unwrap().detection.utc_offset_minutes,
+            None
+        );
+    }
+
+    #[test]
+    fn a_declared_utc_offset_is_loaded() {
+        for (minutes, text) in [(120, "120"), (-300, "-300"), (840, "840"), (-720, "-720")] {
+            let cfg =
+                load_with_logs(&format!("[detection]\nutc_offset_minutes = {text}\n")).unwrap();
+            assert_eq!(cfg.detection.utc_offset_minutes, Some(minutes));
+        }
+    }
+
+    #[test]
+    fn a_utc_offset_no_timezone_has_is_rejected() {
+        for text in ["841", "-721", "7200"] {
+            match load_with_logs(&format!("[detection]\nutc_offset_minutes = {text}\n"))
+                .unwrap_err()
+            {
+                ConfigError::Invalid { field, .. } => {
+                    assert_eq!(field, "detection.utc_offset_minutes");
+                }
+                other => panic!("expected Invalid, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn work_hours_and_exempt_accounts_default_to_nothing() {
+        let cfg = load_with_logs("").unwrap();
+        assert_eq!(cfg.detection.work_hours, None);
+        assert!(cfg.detection.odd_hour_exempt_accounts.is_empty());
+    }
+
+    #[test]
+    fn declared_work_hours_and_exempt_accounts_are_loaded() {
+        let cfg = load_with_logs(
+            "[detection]\nwork_hours = [22, 6]\nodd_hour_exempt_accounts = [\"svc_backup\", \"CORP\\\\oncall\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.detection.work_hours, Some([22, 6]));
+        assert_eq!(
+            cfg.detection.odd_hour_exempt_accounts,
+            ["svc_backup", "CORP\\oncall"]
+        );
+        assert!(load_with_logs("[detection]\nwork_hours = [0, 24]\n").is_ok());
+    }
+
+    #[test]
+    fn work_hours_no_clock_has_are_rejected() {
+        for text in ["[24, 6]", "[7, 25]", "[7, 0]", "[8, 8]", "[0, 0]"] {
+            match load_with_logs(&format!("[detection]\nwork_hours = {text}\n")).unwrap_err() {
+                ConfigError::Invalid { field, .. } => assert_eq!(field, "detection.work_hours"),
+                other => panic!("expected Invalid for {text}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_blank_or_too_long_exempt_list_is_rejected() {
+        let many = vec!["\"a\""; 65].join(", ");
+        for list in [
+            "[\"\"]".to_string(),
+            "[\"  \"]".to_string(),
+            format!("[{many}]"),
+        ] {
+            match load_with_logs(&format!("[detection]\nodd_hour_exempt_accounts = {list}\n"))
+                .unwrap_err()
+            {
+                ConfigError::Invalid { field, .. } => {
+                    assert_eq!(field, "detection.odd_hour_exempt_accounts");
+                }
+                other => panic!("expected Invalid, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn exempt_entries_may_be_bound_to_a_sid_and_a_malformed_one_names_its_index() {
+        let cfg = load_with_logs(
+            "[detection]\nodd_hour_exempt_accounts = [\"svc_backup|S-1-5-21-1-2-3-1004\", \"oncall|S-1-5-21-1-2-3-*\", \"plain\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.detection.odd_hour_exempt_accounts.len(), 3);
+        for (list, index) in [
+            ("[\"ok\", \"svc|not-a-sid\"]", 1),
+            ("[\"svc|S-1-5--1\"]", 0),
+            ("[\"a\", \"b\", \"|S-1-5-21-1\"]", 2),
+            ("[\"a\", \"  \"]", 1),
+        ] {
+            match load_with_logs(&format!("[detection]\nodd_hour_exempt_accounts = {list}\n"))
+                .unwrap_err()
+            {
+                ConfigError::Invalid { value, .. } => {
+                    assert!(
+                        value.starts_with(&format!("entry {index} ")),
+                        "{list}: {value}"
+                    );
+                }
+                other => panic!("expected Invalid, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_exempt_entry_grammar_matches_the_vectors_the_rules_use() {
+        const VECTORS: &str = include_str!("../data/exempt-entry-vectors.txt");
+        let mut checked = 0;
+        for line in VECTORS
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        {
+            let (kind, entry) = line.split_once('\t').expect(line);
+            assert_eq!(
+                exempt_entry_problem(entry).is_none(),
+                kind == "ok",
+                "{line:?}"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 10, "the table was read: {checked}");
     }
 
     fn deception_table(dirs: &[String]) -> String {

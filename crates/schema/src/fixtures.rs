@@ -31,16 +31,17 @@ use crate::{
     AmsiContentEvent, AssemblyLoadEvent, AuthEvent, AuthKind, AuthOutcome, BitsJobEvent,
     BitsJobState, BpfEvent, CapSetEvent, ConnectEvent, DefenderEvent, DefenderEventKind,
     DnsQueryEvent, EventMeta, ExecEvent, FileChmodEvent, FileChownEvent, FileDeleteEvent,
-    FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetxattrEvent,
-    FileWriteEvent, HttpRequestEvent, HttpSignature, HttpSummaryEvent, IdentityChangeEvent,
-    IdentityChangeKind, ImageLoadEvent, KernelModuleAction, KernelModuleEvent, LdapSearchEvent,
+    FileOpenEvent, FileQuarantineEvent, FileRemovexattrEvent, FileRenameEvent, FileSetTimeEvent,
+    FileSetxattrEvent, FileWriteEvent, HttpRequestEvent, HttpSignature, HttpSummaryEvent,
+    IdentityChangeEvent, IdentityChangeKind, ImageLoadEvent, KerberosDelegationFailureEvent,
+    KerberosDelegationFailureKind, KernelModuleAction, KernelModuleEvent, LdapSearchEvent,
     ListenPortEvent, LogClearedEvent, MemfdCreateEvent, NamespaceEvent, NamespaceSyscall,
     NetworkFlowEvent, NtlmAuthEvent, NtlmDirection, PackageChangeEvent, PackageChangeKind,
     PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
-    ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent, SessionState, ShellType,
-    SmbConnectEvent, SocketAcceptEvent, SocketBindEvent, SocketCreateEvent, SocketListenEvent,
-    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, User,
-    WmiActivityEvent,
+    RawVolumeOpenEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent,
+    SessionState, ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
+    SocketCreateEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
+    UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -77,6 +78,7 @@ pub fn exec() -> ExecEvent {
         company_name: None,
         file_description: None,
         product_name: None,
+        image_file_id: None,
         env_security: Vec::new(),
     }
 }
@@ -159,6 +161,20 @@ pub fn log_cleared() -> LogClearedEvent {
         subject_user: String::new(),
         subject_logon_id: None,
         backup_path: None,
+    }
+}
+
+/// Neutral [`KerberosDelegationFailureEvent`].
+#[must_use]
+pub fn kerberos_delegation_failure() -> KerberosDelegationFailureEvent {
+    KerberosDelegationFailureEvent {
+        meta: meta(),
+        kind: KerberosDelegationFailureKind::UnconstrainedDelegationDenied,
+        target_server: String::new(),
+        target_user: String::new(),
+        target_domain: String::new(),
+        caller_user: String::new(),
+        caller_domain: String::new(),
     }
 }
 
@@ -337,6 +353,7 @@ pub fn listen_port() -> ListenPortEvent {
         meta: meta(),
         local_addr: TEST_ADDR,
         local_port: 0,
+        protocol: crate::IPPROTO_TCP,
     }
 }
 
@@ -404,6 +421,29 @@ pub fn file_rename() -> FileRenameEvent {
         old_path: String::new(),
         new_path: String::new(),
         executable_path: None,
+    }
+}
+
+/// Neutral [`FileSetTimeEvent`].
+#[must_use]
+pub fn file_set_time() -> FileSetTimeEvent {
+    FileSetTimeEvent {
+        meta: meta(),
+        path: String::new(),
+        creation_time: None,
+        last_access_time: None,
+        last_write_time: None,
+        change_time: None,
+    }
+}
+
+/// Neutral [`RawVolumeOpenEvent`].
+#[must_use]
+pub fn raw_volume_open() -> RawVolumeOpenEvent {
+    RawVolumeOpenEvent {
+        meta: meta(),
+        volume: String::new(),
+        desired_access: 0,
     }
 }
 
@@ -517,7 +557,7 @@ pub fn socket_create() -> SocketCreateEvent {
         meta: meta(),
         domain: 2,
         socket_type: 1,
-        protocol: 6,
+        protocol: 6, // IPPROTO_TCP — socket(2)'s raw `int` argument, a different type than ListenPortEvent::protocol
         fd: 0,
     }
 }

@@ -1,0 +1,14 @@
+{
+  "type": "registry_set",
+  "meta": {
+    "pid": 4242,
+    "ppid": 1337,
+    "user": { "os": "windows", "sid": "S-1-5-18", "integrity_level": 16384 },
+    "timestamp_ns": 1756900020000000000,
+    "comm": "chrome-update.exe"
+  },
+  "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+  "value_name": "ChromeUpdate",
+  "data_type": 1,
+  "data": "C:\\Users\\Public\\chrome-update.exe"
+}

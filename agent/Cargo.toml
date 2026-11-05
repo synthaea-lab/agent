@@ -20,6 +20,7 @@ test-key = ["updater/test-key"]
 
 [dependencies]
 schema = { path = "../crates/schema" }
+redact = { path = "../crates/redact" }
 config = { path = "../crates/config" }
 policy = { path = "../crates/policy" }
 rules = { path = "../crates/rules" }
@@ -57,7 +58,13 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 getrandom = "0.4"
 
+# `commands::localzone` asks the platform for the host's time zone (#1088): platform code stays
+# in the binary, not in the detection crates.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Time"] }
 sensor-windows = { path = "../crates/sensors/windows/etw" }
 sensor-windows-eventlog = { path = "../crates/sensors/windows/eventlog" }
 sensor-windows-minifilter = { path = "../crates/sensors/windows/minifilter" }
@@ -90,10 +97,10 @@ sensor-linux-lsm = { path = "../crates/sensors/linux/lsm" }
 # `Ebpf` object that must outlive the hook) — same version sensor-linux-lsm
 # itself uses.
 aya = { version = "0.14", default-features = false }
-libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+proptest = "1"
 # Tests sign manifests with the public test key.
 updater = { path = "../crates/updater", features = ["test-key"] }
 ring = "0.17"

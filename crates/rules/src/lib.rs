@@ -16,11 +16,14 @@ mod defender;
 mod egressdomain;
 mod exclusions;
 mod failure_join;
+mod impactctx;
 mod inventory;
 mod ld_trust;
 mod ldap;
 mod logon;
 mod ntlm;
+mod osascript;
+mod privesc;
 mod rdp;
 mod recon;
 mod securitytool;
@@ -34,7 +37,7 @@ mod stateless;
 mod sudo;
 
 // AMSI content rules (#282): the dispatcher for `AmsiContent` events.
-pub use amsi::evaluate_amsi_content;
+pub use amsi::{evaluate_amsi_content, excerpt as amsi_excerpt};
 // Defender tamper rules (#283): protection turned off, risky exclusions.
 pub use defender::evaluate_defender_event;
 // Diffed inventory records (#87): unconditional, see the module doc.
@@ -43,6 +46,7 @@ pub use inventory::{PACKAGE_CHANGE, evaluate_package_change};
 // `RuleState::on_ldap_search`.
 pub use ldap::evaluate_ldap_search;
 // NTLM rules (#364): Internet-bound authentication and weak versions.
+pub use logon::LocalOffsetAt;
 pub use ntlm::evaluate_ntlm_auth;
 use schema::detection::Severity;
 pub use signature_gate::{ImageSignature, SignatureGatedAlert};
@@ -63,7 +67,8 @@ pub(crate) use stateless::{
 // crate-internally for the tests under `src/tests/`.
 pub use stateless::{
     evaluate_connect, evaluate_exec, evaluate_file_delete, evaluate_file_open,
-    evaluate_log_cleared, evaluate_signal,
+    evaluate_file_set_time, evaluate_kerberos_delegation_failure, evaluate_log_cleared,
+    evaluate_raw_volume_open, evaluate_signal,
 };
 
 #[derive(Debug, Clone)]
