@@ -336,8 +336,8 @@ pub mod time;
 ///
 /// Bumped 59 → 62 for [`Event::UnitStop`] (#1085): the stop of a security-tool systemd unit as an
 /// event of its own, replacing a `FileOpenEvent` carrying `FLAG_UNIT_STOPPED`. A raw `openat`
-/// flag can carry any bit, so an unprivileged open could set that one. 60 and 61 were claimed by
-/// #1114 and #1116; whichever merges first renumbers the others.
+/// flag can carry any bit, so an unprivileged open could set that one. 60 was first claimed by
+/// #1114 and is skipped (#1114 is 63 below); 61 is #1116.
 ///
 /// Bumped 62 → 63 for [`SignalEvent::target_unit`] (#1103): the systemd unit of the signalled
 /// process, so an alert on a signal to a security tool names the tool and not only an image path;
