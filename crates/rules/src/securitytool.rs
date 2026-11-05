@@ -7,6 +7,11 @@
 //! burst rule counts how many services; this one asks **which**: a single `systemctl stop
 //! falco` is what an intruder does to blind the host before acting, and it is below the
 //! burst's threshold by design.
+//!
+//! What no command line shows is [`crate::unitstop`]'s (#1085): a stop over D-Bus or an API, or a
+//! service that was killed, reaches the journal as a unit stop, and that rule alerts on the ones
+//! no exec, restart or host shutdown explains. A stop this rule alerted on is among the ones it
+//! treats as explained, so one `systemctl stop falco` is one finding.
 
 use schema::{ExecEvent, SECURITY_SERVICES, detection::Severity};
 
@@ -41,9 +46,11 @@ fn is_security_tool(service: &str) -> bool {
 /// package script, and configuration management look the same. It reads the **command**: a
 /// stop that is refused (a Defender service cannot be stopped from `sc` on a current
 /// Windows), a tool killed with `kill`, `pkill` or `taskkill` (`systemctl kill` is read, since the
-/// manager's signal from pid 1 is only Low in `check_security_process_signal`), or stopped over D-Bus or an
-/// API, is not seen here, and the stop's success is not observed. A `SIGKILL` of the agent
-/// itself is `check_security_process_signal`'s.
+/// manager's signal from pid 1 is only Low in `check_security_process_signal`), or stopped over
+/// D-Bus or an API, is not seen here, and the stop's success is not observed. A Linux unit
+/// stopped over D-Bus or an API is not seen here either, but [`crate::unitstop`] sees it in the
+/// journal, which names no actor. A `SIGKILL` of the agent itself is
+/// `check_security_process_signal`'s.
 #[must_use]
 pub(crate) fn check_security_tool_stop(event: &ExecEvent) -> Option<Alert> {
     let tool = services_stopped(event)

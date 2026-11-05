@@ -12,7 +12,7 @@ use schema::{
     Event, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FileDeleteEvent, FileOpenEvent,
     FileQuarantineEvent, FileRenameEvent, FileWriteEvent, ListenPortEvent, MemfdCreateEvent,
     NetworkFlowEvent, O_CREAT, POLICY_MECHANISM_APPLOCKER, POLICY_MECHANISM_SELINUX,
-    POLICY_MECHANISM_WDAC, PolicyDenialEvent, SessionEvent, SessionState, User,
+    POLICY_MECHANISM_WDAC, PolicyDenialEvent, SessionEvent, SessionState, UnitStopEvent, User,
     detection::Severity,
 };
 use store::BoundedMap;
@@ -365,6 +365,9 @@ pub struct RuleState {
     /// Lineage → distinct services it stopped, for SERVICE-STOP-BURST (T1489, #381).
     /// LRU-bounded.
     service_stop: BoundedMap<crate::recon::Lineage, SlidingDistinct<String>>,
+    /// Security-unit stops waiting to be judged, and what execs did to those units, for
+    /// UNEXPLAINED-UNIT-STOP (T1562.001, #1085): see [`crate::unitstop`].
+    unit_stops: crate::unitstop::UnitStops,
     /// Lineage → its last SERVICE-STOP-BURST finding, so a T1486 finding from the same lineage
     /// can say it was preceded by one (#973). Read for the message only. LRU-bounded.
     burst_marks: BoundedMap<crate::recon::Lineage, crate::impactctx::BurstMark>,
@@ -626,6 +629,7 @@ impl RuleState {
             ssh_fanout: BoundedMap::new(COUNTER_CAP),
             security_discovery: BoundedMap::new(COUNTER_CAP),
             service_stop: BoundedMap::new(COUNTER_CAP),
+            unit_stops: crate::unitstop::UnitStops::new(),
             burst_marks: BoundedMap::new(COUNTER_CAP),
             impact_marks: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
@@ -1618,6 +1622,7 @@ impl RuleState {
         alerts.extend(self.check_recon_burst(event, lineage));
         alerts.extend(self.check_security_discovery(event, lineage));
         alerts.extend(self.check_service_stop_burst(event, lineage));
+        self.unit_stops.on_exec(event);
         alerts.extend(self.check_shutdown_context(event, lineage));
         alerts.extend(crate::stateless::check_ld_preload_hijack(
             event,
@@ -2449,6 +2454,15 @@ impl RuleState {
         self.take_due_identity_alerts()
     }
 
+    /// UNEXPLAINED-UNIT-STOP (T1562.001, #1085), see [`crate::unitstop`]: the security-unit stops
+    /// whose wait is over, judged, each with its own event so the alert is attributed to it. A
+    /// stop is queued by [`Self::on_unit_stop`] and judged once the stream clock is
+    /// [`crate::unitstop::START_WITHIN_NS`] past it; the sink calls this after every exec and
+    /// unit stop, which are what move the clock.
+    pub fn take_due_unit_stops(&mut self) -> Vec<(UnitStopEvent, Alert)> {
+        self.unit_stops.take_due()
+    }
+
     /// The queued identity requests whose wait is over, judged: see [`Self::on_identity_change`].
     pub fn take_due_identity_alerts(&mut self) -> Vec<(schema::IdentityChangeEvent, Alert)> {
         let mut due = Vec::new();
@@ -2718,11 +2732,19 @@ impl RuleState {
         );
     }
 
+    /// To be called for every `UnitStopEvent` (the journal's report of a security unit stopping,
+    /// #1127). Queues it for UNEXPLAINED-UNIT-STOP (#1085); the alert comes from
+    /// [`Self::take_due_unit_stops`] once the wait is over.
+    pub fn on_unit_stop(&mut self, event: &UnitStopEvent) {
+        self.unit_stops.on_unit_stop(event);
+    }
+
     /// To be called for every `FileOpenEvent` in the stream. Reports T1053.005
     /// scheduled-task creation (deduplicated, see
     /// [`Self::check_task_registration`]) and updates the history of downloader
     /// writes, consumed by `check_download_then_exec`.
     pub fn on_file_open(&mut self, event: &FileOpenEvent) -> Vec<Alert> {
+        self.unit_stops.advance_clock(event.meta.timestamp_ns);
         let mut alerts: Vec<Alert> = self.check_task_registration(event).into_iter().collect();
         alerts.extend(crate::stateless::check_service_write_outside_datadir(
             event,

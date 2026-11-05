@@ -1526,6 +1526,7 @@ impl DetectionSink {
         self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_exec(event));
         // This exec moved the stream clock: identity requests waiting for it may be due (#1041).
         self.record_due_identity_alerts(self.rule_state.lock().unwrap().take_due_identity_alerts());
+        self.record_due_unit_stops();
         let sigma_guard = self.sigma.lock().unwrap();
         if let Some(sigma) = sigma_guard.as_ref() {
             let entity = entity_key(&event.meta);
@@ -1560,6 +1561,8 @@ impl DetectionSink {
                 .into_iter()
                 .chain(state_alerts),
         );
+        // This event moved the stream clock: a queued unit stop may be due (#1085).
+        self.record_due_unit_stops();
         if event.flags & 0o103 != 0
             && let Some((yara, _)) = self.yara.lock().unwrap().as_ref()
         {
@@ -1698,6 +1701,15 @@ impl DetectionSink {
     fn record_due_identity_alerts(&self, due: Vec<(schema::IdentityChangeEvent, rules::Alert)>) {
         for (event, alert) in due {
             self.record_rule_alerts(&Event::IdentityChange(event), [alert]);
+        }
+    }
+
+    /// Security-unit stops whose wait is over (UNEXPLAINED-UNIT-STOP, #1085), each attributed to
+    /// its own journal event.
+    fn record_due_unit_stops(&self) {
+        let due = self.rule_state.lock().unwrap().take_due_unit_stops();
+        for (event, alert) in due {
+            self.record_rule_alerts(&Event::UnitStop(event), [alert]);
         }
     }
 
@@ -2388,6 +2400,10 @@ impl EventSink for DetectionSink {
         match &event {
             Event::Exec(e) => self.detect_exec(&event, e),
             Event::FileOpen(e) => self.detect_file_open(&event, e),
+            Event::UnitStop(e) => {
+                self.rule_state.lock().unwrap().on_unit_stop(e);
+                self.record_due_unit_stops();
+            }
             Event::Connect(e) => self.detect_connect(&event, e),
             Event::NetworkFlow(e) => self.detect_network_flow(&event, e),
             Event::DnsQuery(e) => self.detect_dns_query(&event, e),
