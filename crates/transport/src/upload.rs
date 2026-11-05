@@ -12,7 +12,10 @@ use std::{
 use schema::Event;
 
 use crate::{
-    client::TransportClient, config::TransportConfig, error::Result, event_limit::fit_batches,
+    client::TransportClient,
+    config::TransportConfig,
+    error::Result,
+    event_limit::{MAX_EVENT_BYTES, fit_batches},
 };
 
 /// Trait for draining events from a spool.
@@ -79,6 +82,9 @@ pub struct EventUploader<D: EventDrain> {
     /// Subset of `consecutive_failures` that were pure connectivity failures
     /// — gates [`TransportConfig::max_network_drain_attempts`] on its own.
     consecutive_network_failures: u32,
+    /// The largest single event sent as is; a larger one is shortened (#1131). A field so a test
+    /// can make an event impossible to shorten.
+    event_limit: usize,
 }
 
 impl<D: EventDrain> EventUploader<D> {
@@ -92,6 +98,7 @@ impl<D: EventDrain> EventUploader<D> {
             consecutive_failures: 0,
             consecutive_server_failures: 0,
             consecutive_network_failures: 0,
+            event_limit: MAX_EVENT_BYTES,
         }
     }
 
@@ -135,11 +142,11 @@ impl<D: EventDrain> EventUploader<D> {
         // An event over the body limit is shortened, never dropped (#1131); the batches also
         // respect the limit in bytes. `count` stays the number the drain returned.
         let count = events.len();
-        let (batches, unsendable) = fit_batches(events, self.config.batch_size);
+        let (batches, unsendable) = fit_batches(events, self.config.batch_size, self.event_limit);
         if unsendable > 0 {
             tracing::warn!(
                 unsendable,
-                "events that cannot fit the body limit were left out of the upload"
+                "events that cannot fit the body limit were left out of this upload; the segment will not be acknowledged"
             );
         }
 
@@ -209,6 +216,26 @@ impl<D: EventDrain> EventUploader<D> {
                     return Err(e);
                 }
             }
+        }
+
+        // An event that could not be made to fit is not acknowledged as sent: the segment stays
+        // in flight and is delivered again, like after a 5xx, until the attempt budget skips it
+        // (with the loss logged). The batches above already went; the server tolerates the
+        // duplicates a redelivery makes (#1131).
+        if unsendable > 0 {
+            self.consecutive_failures += 1;
+            self.consecutive_server_failures += 1;
+            if self.consecutive_server_failures >= self.config.max_drain_attempts {
+                tracing::warn!(
+                    attempts = self.consecutive_server_failures,
+                    max_attempts = self.config.max_drain_attempts,
+                    dropped = unsendable,
+                    "events cannot fit the body limit after every attempt — skipping the segment"
+                );
+                self.drain.skip()?;
+                self.reset_failure_counters();
+            }
+            return Err(crate::TransportError::Unsendable { count: unsendable });
         }
 
         self.drain.ack()?;
@@ -448,6 +475,68 @@ mod tests {
             self.skipped += 1;
             Ok(())
         }
+    }
+
+    /// A drain that hands the same segment back until it is acknowledged or skipped, like the
+    /// spool does for a segment left in flight.
+    struct InFlightDrain {
+        events: Vec<Event>,
+        acked: u32,
+        skipped: u32,
+    }
+
+    impl EventDrain for InFlightDrain {
+        fn drain(&mut self) -> std::io::Result<Vec<Event>> {
+            if self.acked + self.skipped > 0 {
+                return Ok(Vec::new());
+            }
+            Ok(self.events.clone())
+        }
+
+        fn ack(&mut self) -> std::io::Result<()> {
+            self.acked += 1;
+            Ok(())
+        }
+
+        fn skip(&mut self) -> std::io::Result<()> {
+            self.skipped += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_segment_with_an_event_that_cannot_be_shortened_is_not_acknowledged() {
+        // #1131 review: an event no shortening can fit must not be acknowledged with the
+        // rest of its segment. Every attempt returns `Unsendable` and leaves the segment in
+        // flight; only the attempt budget skips it, and that skip is the only loss.
+        let mut config = TransportConfig::new("https://example.com");
+        config.max_drain_attempts = 3;
+        let client = TransportClient::new(config).unwrap();
+        let drain = InFlightDrain {
+            events: vec![Event::Exec(schema::fixtures::exec())],
+            acked: 0,
+            skipped: 0,
+        };
+        let mut uploader = EventUploader::new(client, drain);
+        uploader.event_limit = 10;
+
+        for attempt in 1..=2 {
+            let err = uploader.upload_once().unwrap_err();
+            assert!(
+                matches!(err, crate::TransportError::Unsendable { count: 1 }),
+                "{err:?}"
+            );
+            assert!(err.is_retryable());
+            assert_eq!(uploader.drain.acked, 0, "attempt {attempt}");
+            assert_eq!(uploader.drain.skipped, 0, "attempt {attempt}");
+        }
+        // The third attempt exhausts the budget: the segment is skipped, once, never acked.
+        assert!(uploader.upload_once().is_err());
+        assert_eq!(uploader.drain.acked, 0);
+        assert_eq!(uploader.drain.skipped, 1);
+        assert_eq!(uploader.consecutive_failures, 0);
+        // The next drain is empty again.
+        assert_eq!(uploader.upload_once().unwrap(), 0);
     }
 
     #[test]

@@ -40,9 +40,17 @@ const PROTECTED_KEYS: &[&str] = &[
 ];
 
 /// How hard the process-controlled fields are cut, one step after the other until the event fits:
-/// (longest string in bytes, longest array in items).
-const SHORTEN_STEPS: [(usize, usize); 5] =
-    [(8192, 1024), (2048, 256), (512, 64), (128, 16), (32, 4)];
+/// (longest string in bytes, longest array in items, longest string under a [`PROTECTED_KEYS`]
+/// key). The protected keys are cut only by the last step, so an event whose identifying field
+/// alone is over the limit is still sent, with that field cut to a prefix, not lost.
+const SHORTEN_STEPS: [(usize, usize, usize); 6] = [
+    (8192, 1024, usize::MAX),
+    (2048, 256, usize::MAX),
+    (512, 64, usize::MAX),
+    (128, 16, usize::MAX),
+    (32, 4, usize::MAX),
+    (32, 4, 4096),
+];
 
 /// Cuts a string to at most `cap` bytes, the `…` that marks the cut included, on a character
 /// boundary.
@@ -59,20 +67,28 @@ fn cut_string(text: &mut String, cap: usize) {
 }
 
 /// Cuts the strings over `string_cap` bytes and the arrays over `array_cap` items of `value`,
-/// recursively, except under [`PROTECTED_KEYS`].
-fn shorten(value: &mut serde_json::Value, string_cap: usize, array_cap: usize) {
+/// recursively. A field under one of [`PROTECTED_KEYS`] is cut to `protected_cap` bytes
+/// instead, and its arrays are left whole.
+fn shorten(
+    value: &mut serde_json::Value,
+    string_cap: usize,
+    array_cap: usize,
+    protected_cap: usize,
+) {
     match value {
         serde_json::Value::String(text) => cut_string(text, string_cap),
         serde_json::Value::Array(items) => {
             items.truncate(array_cap);
             for item in items {
-                shorten(item, string_cap, array_cap);
+                shorten(item, string_cap, array_cap, protected_cap);
             }
         }
         serde_json::Value::Object(fields) => {
             for (key, field) in fields.iter_mut() {
-                if !PROTECTED_KEYS.contains(&key.as_str()) {
-                    shorten(field, string_cap, array_cap);
+                if PROTECTED_KEYS.contains(&key.as_str()) {
+                    shorten(field, protected_cap, usize::MAX, protected_cap);
+                } else {
+                    shorten(field, string_cap, array_cap, protected_cap);
                 }
             }
         }
@@ -80,13 +96,13 @@ fn shorten(value: &mut serde_json::Value, string_cap: usize, array_cap: usize) {
     }
 }
 
-/// `event` shortened to at most `limit` bytes serialized, and its size before. `None` when it
-/// cannot be shortened that far (or not serialized): the caller drops and counts it. The result
-/// is a pure function of the event.
+/// `event` shortened to at most `limit` bytes serialized. `None` when it cannot be shortened that
+/// far or not serialized: the caller must not acknowledge it as sent. The result is a pure
+/// function of the event.
 fn shorten_event(event: &Event, limit: usize) -> Option<Event> {
     let mut value = serde_json::to_value(event).ok()?;
-    for (string_cap, array_cap) in SHORTEN_STEPS {
-        shorten(&mut value, string_cap, array_cap);
+    for (string_cap, array_cap, protected_cap) in SHORTEN_STEPS {
+        shorten(&mut value, string_cap, array_cap, protected_cap);
         if serde_json::to_vec(&value).ok()?.len() <= limit {
             return serde_json::from_value(value).ok();
         }
@@ -95,27 +111,32 @@ fn shorten_event(event: &Event, limit: usize) -> Option<Event> {
 }
 
 /// The batches to send for `events`: at most `batch_size` events each, and each body under
-/// [`MAX_EVENT_BODY_BYTES`]. An event over [`MAX_EVENT_BYTES`] is shortened first and logged
-/// with its original size; one that cannot be shortened enough is dropped and counted in the
-/// second value. Order is kept.
-pub(crate) fn fit_batches(events: Vec<Event>, batch_size: usize) -> (Vec<Vec<Event>>, usize) {
+/// [`MAX_EVENT_BODY_BYTES`]. An event over `event_limit` ([`MAX_EVENT_BYTES`] in production) is shortened first and logged
+/// with its original size; one that cannot be shortened enough (or not serialized) is left out
+/// and counted in the second value. The caller must then NOT acknowledge the segment as sent:
+/// see `EventUploader::upload_once`. Order is kept.
+pub(crate) fn fit_batches(
+    events: Vec<Event>,
+    batch_size: usize,
+    event_limit: usize,
+) -> (Vec<Vec<Event>>, usize) {
     let batch_size = batch_size.max(1);
     let budget = MAX_EVENT_BODY_BYTES - ENVELOPE_SLACK_BYTES;
     let mut batches: Vec<Vec<Event>> = Vec::new();
     let mut current: Vec<Event> = Vec::new();
     let mut current_bytes = 0usize;
-    let mut dropped = 0usize;
+    let mut unsendable = 0usize;
     for event in events {
         let Ok(mut size) = serde_json::to_vec(&event).map(|body| body.len()) else {
-            dropped += 1;
+            unsendable += 1;
             continue;
         };
         let mut event = event;
-        if size > MAX_EVENT_BYTES {
+        if size > event_limit {
             let original = size;
-            match shorten_event(&event, MAX_EVENT_BYTES) {
+            match shorten_event(&event, event_limit) {
                 Some(short) => {
-                    size = serde_json::to_vec(&short).map_or(MAX_EVENT_BYTES, |body| body.len());
+                    size = serde_json::to_vec(&short).map_or(event_limit, |body| body.len());
                     tracing::warn!(
                         original_bytes = original,
                         sent_bytes = size,
@@ -126,9 +147,9 @@ pub(crate) fn fit_batches(events: Vec<Event>, batch_size: usize) -> (Vec<Vec<Eve
                 None => {
                     tracing::warn!(
                         original_bytes = original,
-                        "event cannot be shortened to the body limit; dropped"
+                        "event cannot be shortened to the body limit; left out of the upload"
                     );
-                    dropped += 1;
+                    unsendable += 1;
                     continue;
                 }
             }
@@ -145,7 +166,7 @@ pub(crate) fn fit_batches(events: Vec<Event>, batch_size: usize) -> (Vec<Vec<Eve
     if !current.is_empty() {
         batches.push(current);
     }
-    (batches, dropped)
+    (batches, unsendable)
 }
 
 #[cfg(test)]
@@ -167,7 +188,7 @@ mod tests {
     fn an_event_padded_past_the_body_limit_is_shortened_and_keeps_who_ran_what() {
         // The #1060 padded exec: 12 arguments of 100,000 bytes, serialized well past 1 MiB.
         let event = padded_exec(12, 100_000);
-        let (batches, dropped) = fit_batches(vec![event], 100);
+        let (batches, dropped) = fit_batches(vec![event], 100, MAX_EVENT_BYTES);
         assert_eq!(dropped, 0);
         assert_eq!(batches.len(), 1);
         let body = serde_json::to_vec(&batches[0]).unwrap();
@@ -182,7 +203,7 @@ mod tests {
     #[test]
     fn an_event_under_the_limit_is_sent_untouched() {
         let event = padded_exec(2, 100);
-        let (batches, dropped) = fit_batches(vec![event.clone()], 100);
+        let (batches, dropped) = fit_batches(vec![event.clone()], 100, MAX_EVENT_BYTES);
         assert_eq!(dropped, 0);
         assert_eq!(batches, vec![vec![event]]);
     }
@@ -198,7 +219,7 @@ mod tests {
                 })
             })
             .collect();
-        let (batches, dropped) = fit_batches(events, 100);
+        let (batches, dropped) = fit_batches(events, 100, MAX_EVENT_BYTES);
         assert_eq!(dropped, 0);
         assert!(batches.len() >= 2);
         for batch in &batches {
@@ -215,8 +236,31 @@ mod tests {
         assert_eq!(order, vec!['0', '1', '2', '3', '4']);
 
         let small: Vec<Event> = (0..5).map(|_| padded_exec(1, 10)).collect();
-        let (batches, _) = fit_batches(small, 2);
+        let (batches, _) = fit_batches(small, 2, MAX_EVENT_BYTES);
         assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [2, 2, 1]);
+    }
+
+    #[test]
+    fn an_identifying_field_over_the_limit_is_cut_to_a_prefix_not_lost() {
+        // The reviewer's case: a protected field (the image path) that alone is over 1 MiB.
+        let event = Event::Exec(ExecEvent {
+            image_path: format!("/tmp/{}", "p".repeat(2 * MAX_EVENT_BYTES)),
+            ..schema::fixtures::exec()
+        });
+        let (batches, unsendable) = fit_batches(vec![event], 100, MAX_EVENT_BYTES);
+        assert_eq!(unsendable, 0);
+        let Event::Exec(exec) = &batches[0][0] else {
+            panic!("still an exec");
+        };
+        assert!(exec.image_path.starts_with("/tmp/ppp") && exec.image_path.ends_with('…'));
+        assert!(exec.image_path.len() <= 4096);
+    }
+
+    #[test]
+    fn an_event_that_cannot_fit_is_counted_unsendable_and_left_out() {
+        let (batches, unsendable) = fit_batches(vec![padded_exec(2, 100)], 100, 10);
+        assert!(batches.is_empty());
+        assert_eq!(unsendable, 1);
     }
 
     #[test]
