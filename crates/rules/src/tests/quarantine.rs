@@ -213,6 +213,72 @@ fn on_exec_alone_no_longer_raises_the_download_join() {
     assert!(state.on_exec(&run(DOWNLOAD, 1)).is_empty());
 }
 
+// T1566.001 (#376): the mark's writer is Apple Mail, on its expected quarantine string (not captured).
+
+const MAC_ATTACHMENT: &str =
+    "/Users/u/Library/Containers/com.apple.mail/Data/Library/Mail Downloads/invoice";
+
+fn mark_by(agent: &str, path: &str) -> FileQuarantineEvent {
+    FileQuarantineEvent {
+        agent: Some(agent.into()),
+        ..mark(path, 0)
+    }
+}
+
+#[test]
+fn a_file_marked_by_apple_mail_carries_the_attachment_technique() {
+    let mut state = RuleState::new();
+    state.on_file_quarantine(&mark_by("Mail", MAC_ATTACHMENT));
+    let alerts = exec(&mut state, &run(MAC_ATTACHMENT, 90_000_000_000));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1566.001/T1204.002");
+    assert!(alerts[0].message.contains("marked by Mail"));
+}
+
+#[test]
+fn the_mail_client_match_ignores_case_but_is_not_a_substring() {
+    for (agent, tagged) in [
+        ("mail", true),
+        ("Safari", false),
+        ("Mailspring", false),
+        ("Gmail Notifier", false),
+        ("", false),
+    ] {
+        let mut state = RuleState::new();
+        state.on_file_quarantine(&mark_by(agent, MAC_ATTACHMENT));
+        let alerts = exec(&mut state, &run(MAC_ATTACHMENT, 1));
+        assert_eq!(alerts.len(), 1, "{agent}");
+        let expected = if tagged {
+            "T1566.001/T1204.002"
+        } else {
+            "T1204.002"
+        };
+        assert_eq!(alerts[0].technique, expected, "{agent}");
+    }
+}
+
+#[test]
+fn outlook_and_thunderbird_marks_are_not_tagged_as_mail_until_observed() {
+    for agent in ["outlook.exe", "olk.exe", "thunderbird.exe"] {
+        let mut state = RuleState::new();
+        state.on_file_quarantine(&mark_by(agent, DOWNLOAD));
+        let alerts = exec(&mut state, &run(DOWNLOAD, 1));
+        assert_eq!(alerts.len(), 1, "{agent}");
+        assert_eq!(alerts[0].technique, "T1204.002", "{agent}");
+    }
+}
+
+#[test]
+fn a_mark_without_a_recorded_agent_stays_user_execution() {
+    let mut state = RuleState::new();
+    state.on_file_quarantine(&FileQuarantineEvent {
+        agent: None,
+        ..mark(MAC_ATTACHMENT, 0)
+    });
+    let alerts = exec(&mut state, &run(MAC_ATTACHMENT, 1));
+    assert_eq!(alerts[0].technique, "T1204.002");
+}
+
 #[test]
 fn a_valid_signature_of_a_file_that_is_not_the_image_that_ran_does_not_silence_the_alert() {
     let mut state = RuleState::new();
