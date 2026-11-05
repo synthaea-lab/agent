@@ -522,7 +522,7 @@ pub const SECURITY_SERVICES: &[&str] = &[
 /// consumer's test: the first cut of [`FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT`]
 /// took `0x0200_0000`, already [`FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN`], and the
 /// hardcoded list in `rules`' collision test missed it (#399 review).
-const SYNTHETIC_FLAGS: [u32; 8] = [
+pub const SYNTHETIC_FLAGS: [u32; 8] = [
     FLAG_PERSISTENCE_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
@@ -802,6 +802,11 @@ pub struct FileOpenEvent {
     /// Platform-native open/access flags (Linux `open(2)` flags, Windows create
     /// dispositions). Rules match primarily on `path`; flag interpretation is
     /// per-platform and documented by each sensor.
+    ///
+    /// The synthetic `FLAG_*` bits (see `SYNTHETIC_FLAGS`) are set only by userspace sensors
+    /// that build the event themselves. On Linux the probe's raw `open(2)` flags are masked
+    /// with `OPEN_FLAGS_MASK` (`sensor-linux`'s `normalize`) before they get here, because the kernel ignores unknown
+    /// bits and any local user could otherwise forge a synthetic bit (#1129).
     pub flags: u32,
 }
 
