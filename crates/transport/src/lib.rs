@@ -47,6 +47,7 @@ mod client;
 mod config;
 mod detection_upload;
 mod error;
+mod event_limit;
 mod upload;
 
 pub use client::TransportClient;
