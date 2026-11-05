@@ -12,7 +12,7 @@ use schema::{
     Event, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FileDeleteEvent, FileOpenEvent,
     FileQuarantineEvent, FileRenameEvent, FileWriteEvent, ListenPortEvent, MemfdCreateEvent,
     NetworkFlowEvent, O_CREAT, POLICY_MECHANISM_APPLOCKER, POLICY_MECHANISM_SELINUX,
-    POLICY_MECHANISM_WDAC, PolicyDenialEvent, SessionEvent, SessionState, User,
+    POLICY_MECHANISM_WDAC, PolicyDenialEvent, SessionEvent, SessionState, UnitStopEvent, User,
     detection::Severity,
 };
 use store::BoundedMap;
@@ -30,18 +30,18 @@ use crate::{
         CREATE_UNLINK_PID_CAP, CREDENTIAL_READ_ALERT_WINDOW_NS, DNS_CLASS_WINDOW_NS,
         DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS, EGRESS_BYTES_THRESHOLD,
         EGRESS_CLASSED_BYTES_THRESHOLD, EGRESS_DOMAIN_BROWSER_COMMS, EGRESS_WINDOW_NS,
-        IN_PLACE_EDIT_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS,
-        MEMFD_EXEC_WINDOW_NS, PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES,
-        POLICY_DENIAL_ALERT_CAP, POLICY_DENIAL_SUBJECT_CAP, QUARANTINE_EXEC_WINDOW_NS,
-        RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD,
-        RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
-        SCAN_VERTICAL_THRESHOLD, SCAN_VERTICAL_WINDOW_NS, SELF_SPAWN_EXCLUSIONS,
-        SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD,
-        SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS, SELINUX_POLICY_TOOL_COMMS,
-        SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STAGING_PID_CAP, STAGING_READ_DIRS,
-        STAGING_READ_FILES, STAGING_WINDOW_NS, STAGING_WRITE_FILES, STANDARD_PORTS,
-        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
-        TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
+        IN_PLACE_EDIT_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAIL_CLIENT_QUARANTINE_AGENTS,
+        MAILDIR_FLAG_LETTERS, MEMFD_EXEC_WINDOW_NS, PACKAGE_MANAGER_COMMS,
+        PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES, POLICY_DENIAL_ALERT_CAP, POLICY_DENIAL_SUBJECT_CAP,
+        QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX,
+        RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD,
+        SCAN_SPREAD_WINDOW_NS, SCAN_VERTICAL_THRESHOLD, SCAN_VERTICAL_WINDOW_NS,
+        SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS,
+        SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS,
+        SELINUX_POLICY_TOOL_COMMS, SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS,
+        STAGING_PID_CAP, STAGING_READ_DIRS, STAGING_READ_FILES, STAGING_WINDOW_NS,
+        STAGING_WRITE_FILES, STANDARD_PORTS, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN,
+        TASK_REGISTRATION_DEDUP_WINDOW_NS, TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
     },
     has_write_intent,
     logon::{LogonBaseline, Observation},
@@ -133,6 +133,11 @@ struct RecentWrite {
     comm: String,
     timestamp_ns: u64,
 }
+
+/// `check_quarantined_exec`'s tags: the plain join, and the one a mail client's
+/// mark gets (#376).
+const USER_EXECUTION_TECHNIQUE: &str = "T1204.002";
+const MAIL_ATTACHMENT_TECHNIQUE: &str = "T1566.001/T1204.002";
 
 /// One exec of a pid, for the as-of-time image lookup of SETUID-ROOT-REQUEST (#1041).
 struct ExecRecord {
@@ -859,8 +864,21 @@ impl RuleState {
             return None;
         }
         mark.alerted = true;
+        // A mail client's mark is the one thing that says how the file arrived:
+        // the finding names the attachment vector as well, and still only says
+        // "marked by", since a person who saved an attachment on purpose and
+        // ran it looks the same.
+        let by_mail_client = mark.agent.as_deref().is_some_and(|agent| {
+            MAIL_CLIENT_QUARANTINE_AGENTS
+                .iter()
+                .any(|client| agent.eq_ignore_ascii_case(client))
+        });
         Some(SignatureGatedAlert::new(Alert {
-            technique: "T1204.002",
+            technique: if by_mail_client {
+                MAIL_ATTACHMENT_TECHNIQUE
+            } else {
+                USER_EXECUTION_TECHNIQUE
+            },
             severity: Severity::High,
             message: format!(
                 "pid={} comm={} executes {}, downloaded {} earlier (origin: {}, marked by {})",
@@ -2092,10 +2110,11 @@ impl RuleState {
         if event.outcome != AuthOutcome::Success || event.kind != AuthKind::Logon {
             return None;
         }
-        match self
-            .logon_baseline
-            .observe(&event.target_user, event.meta.timestamp_ns)
-        {
+        match self.logon_baseline.observe(
+            &event.target_user,
+            event.target_user_sid.as_deref(),
+            event.meta.timestamp_ns,
+        ) {
             Observation::FirstSeen => {}
             Observation::Quiet | Observation::Known => return None,
         }
@@ -2121,6 +2140,31 @@ impl RuleState {
         self.odd_hours.set_offset_minutes(minutes)
     }
 
+    /// Declares the local hours `[start, end)` in which a logon is ordinary for ODD-HOUR-LOGON
+    /// (#1089); `start > end` wraps midnight (`22, 6`, a night shift). False, and the window
+    /// keeps what it had, unless `start` is 0 to 23, `end` 1 to 24 and they differ. The default is
+    /// [`WORK_HOURS_LOCAL`](crate::exclusions::WORK_HOURS_LOCAL).
+    pub fn set_work_hours(&mut self, start: u32, end: u32) -> bool {
+        self.odd_hours.set_work_hours(start, end)
+    }
+
+    /// Declares the accounts whose odd-hour logons are expected (#1089): on-call staff, a
+    /// schedule's service or batch account. ODD-HOUR-LOGON skips them; FIRST-SEEN-LOGON does not.
+    /// An entry is `NAME` or `NAME|SID` (see `OddHours::set_exempt_accounts`); at most 64 are
+    /// kept, a blank, over-long or malformed one is dropped, and the number kept is returned.
+    /// Replaces the previous list; empty by default, so nothing is exempt until the operator says so.
+    pub fn set_odd_hour_exempt_accounts(&mut self, accounts: &[String]) -> usize {
+        self.odd_hours.set_exempt_accounts(accounts)
+    }
+
+    /// Odd-hour logons the exempt list has suppressed since the agent started (#1089); read by the
+    /// tests, and visible in production through the `skips` field of the info line of `OddHours`.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn odd_hour_exempt_skips(&self) -> u64 {
+        self.odd_hours.exempt_skips()
+    }
+
     /// Gives the rules the host's platform time zone (#1088): `zone` maps an instant (seconds
     /// since the Unix epoch) to minutes east of UTC at that instant, so a logon either side of a
     /// daylight-saving change is judged by the hour the host's clock showed. Turns ODD-HOUR-LOGON
@@ -2131,7 +2175,8 @@ impl RuleState {
     }
 
     /// ODD-HOUR-LOGON (T1078, #376): a successful [`AuthKind::Logon`] of a non-generic
-    /// account whose host-local hour is outside [`WORK_HOURS_LOCAL`](crate::exclusions::WORK_HOURS_LOCAL).
+    /// account whose host-local hour is outside the working hours: [`WORK_HOURS_LOCAL`](crate::exclusions::WORK_HOURS_LOCAL)
+    /// unless the operator declared another window ([`Self::set_work_hours`]).
     /// Low, once per account per [`ODD_HOUR_QUIET_NS`](crate::exclusions::ODD_HOUR_QUIET_NS).
     /// Same event gate and generic-account list as FIRST-SEEN-LOGON, so the two share the
     /// identity join's limits; they are independent and a first logon at night raises both.
@@ -2141,14 +2186,18 @@ impl RuleState {
     /// `agent.toml`, which overrides the zone). The event's timestamp is UTC and nothing else
     /// in the agent knows the local time.
     /// Expected false positives: on-call staff, night shifts, a host in use around the clock,
-    /// and on Windows the service and batch logons (4624) of a named account.
+    /// and on Windows the service and batch logons (4624) of a named account; the operator
+    /// answers them with a declared window ([`Self::set_work_hours`]) and an exempt list
+    /// ([`Self::set_odd_hour_exempt_accounts`]).
     fn check_odd_hour_logon(&mut self, event: &AuthEvent) -> Option<Alert> {
         if event.outcome != AuthOutcome::Success || event.kind != AuthKind::Logon {
             return None;
         }
-        let hour = self
-            .odd_hours
-            .observe(&event.target_user, event.meta.timestamp_ns)?;
+        let hour = self.odd_hours.observe(
+            &event.target_user,
+            event.target_user_sid.as_deref(),
+            event.meta.timestamp_ns,
+        )?;
         let source = event
             .source_address
             .map_or_else(String::new, |address| format!(" from {address}"));
@@ -2292,10 +2341,10 @@ impl RuleState {
 
     /// UNEXPLAINED-UNIT-STOP (T1562.001, #1085), see [`crate::unitstop`]: the security-unit stops
     /// whose wait is over, judged, each with its own event so the alert is attributed to it. A
-    /// stop is queued by [`Self::on_file_open`] and judged once the stream clock is
+    /// stop is queued by [`Self::on_unit_stop`] and judged once the stream clock is
     /// [`crate::unitstop::START_WITHIN_NS`] past it; the sink calls this after every exec and
-    /// file-open event, which are what move the clock.
-    pub fn take_due_unit_stops(&mut self) -> Vec<(FileOpenEvent, Alert)> {
+    /// unit stop, which are what move the clock.
+    pub fn take_due_unit_stops(&mut self) -> Vec<(UnitStopEvent, Alert)> {
         self.unit_stops.take_due()
     }
 
@@ -2568,12 +2617,19 @@ impl RuleState {
         );
     }
 
+    /// To be called for every `UnitStopEvent` (the journal's report of a security unit stopping,
+    /// #1127). Queues it for UNEXPLAINED-UNIT-STOP (#1085); the alert comes from
+    /// [`Self::take_due_unit_stops`] once the wait is over.
+    pub fn on_unit_stop(&mut self, event: &UnitStopEvent) {
+        self.unit_stops.on_unit_stop(event);
+    }
+
     /// To be called for every `FileOpenEvent` in the stream. Reports T1053.005
     /// scheduled-task creation (deduplicated, see
     /// [`Self::check_task_registration`]) and updates the history of downloader
     /// writes, consumed by `check_download_then_exec`.
     pub fn on_file_open(&mut self, event: &FileOpenEvent) -> Vec<Alert> {
-        self.unit_stops.on_file_open(event);
+        self.unit_stops.advance_clock(event.meta.timestamp_ns);
         let mut alerts: Vec<Alert> = self.check_task_registration(event).into_iter().collect();
         alerts.extend(crate::stateless::check_service_write_outside_datadir(
             event,

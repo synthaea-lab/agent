@@ -12,12 +12,21 @@ const SEC: u64 = 1_000_000_000;
 /// A time well past the epoch, so `at - EXEC_LOOKBACK_NS` never saturates in these tests.
 const T0: u64 = 10_000 * SEC;
 
-fn stopped(unit: &str, at: u64) -> schema::FileOpenEvent {
-    let mut event = file_open_event_full(0, unit, unit, schema::FLAG_UNIT_STOPPED, at);
-    event.meta.ppid = 0;
+fn stopped(unit: &str, at: u64) -> schema::UnitStopEvent {
     // The journal sensor reports a unit stop as the manager, pid 1.
-    event.meta.pid = 1;
-    event
+    schema::UnitStopEvent {
+        meta: schema::EventMeta {
+            pid: 1,
+            ppid: 0,
+            user: schema::User::Unknown,
+            timestamp_ns: at,
+            comm: unit.to_string(),
+            container: None,
+            process_generation: None,
+            parent_process_generation: None,
+        },
+        unit: unit.to_string(),
+    }
 }
 
 fn exec(command: &str, at: u64) -> schema::ExecEvent {
@@ -33,7 +42,7 @@ fn judged(unit: &str, execs: &[(&str, u64)]) -> Vec<Alert> {
     for (command, at) in execs.iter().filter(|(_, at)| *at <= T0) {
         state.on_exec(&exec(command, *at));
     }
-    state.on_file_open(&stopped(unit, T0));
+    state.on_unit_stop(&stopped(unit, T0));
     // Execs after the stop (a start, a late arrival) come in before the wait ends.
     for (command, at) in execs.iter().filter(|(_, at)| *at > T0) {
         state.on_exec(&exec(command, *at));
@@ -69,7 +78,7 @@ fn a_stop_with_no_exec_start_or_shutdown_alerts_once_and_names_the_unit() {
 #[test]
 fn a_stop_waits_for_the_stream_clock_before_it_is_judged() {
     let mut state = RuleState::new();
-    state.on_file_open(&stopped("auditd.service", T0));
+    state.on_unit_stop(&stopped("auditd.service", T0));
     state.on_exec(&exec("true", T0 + START_WITHIN_NS - SEC));
     assert!(state.take_due_unit_stops().is_empty());
     state.on_exec(&exec("true", T0 + START_WITHIN_NS));
@@ -147,7 +156,7 @@ fn an_exec_stop_a_clock_skew_after_the_record_still_explains_it_but_not_much_lat
 fn the_order_the_exec_and_the_journal_event_arrive_in_does_not_matter() {
     // The exec is timestamped before the stop but drained after it: both inside the wait.
     let mut state = RuleState::new();
-    state.on_file_open(&stopped("auditd.service", T0));
+    state.on_unit_stop(&stopped("auditd.service", T0));
     state.on_exec(&exec("systemctl stop auditd", T0 - SEC));
     state.on_exec(&exec("true", T0 + START_WITHIN_NS + SEC));
     assert!(state.take_due_unit_stops().is_empty());
@@ -197,7 +206,7 @@ fn judged_from(unit: &str, image_path: &str, command: &str, at: u64) -> Vec<Aler
     let mut event = exec(command, at);
     event.image_path = image_path.to_owned();
     state.on_exec(&event);
-    state.on_file_open(&stopped(unit, T0));
+    state.on_unit_stop(&stopped(unit, T0));
     state.on_exec(&exec("true", T0 + START_WITHIN_NS + SEC));
     state
         .take_due_unit_stops()
@@ -407,7 +416,7 @@ fn a_reboot_whose_argv_was_not_captured_explains_nothing() {
         event.cmdline.clear();
         let mut state = RuleState::new();
         state.on_exec(&event);
-        state.on_file_open(&stopped("falco", T0));
+        state.on_unit_stop(&stopped("falco", T0));
         state.on_exec(&exec("true", T0 + START_WITHIN_NS + SEC));
         assert_eq!(state.take_due_unit_stops().len(), 1, "{image}");
     }
@@ -488,24 +497,21 @@ fn a_unit_that_is_not_listed_is_not_queued_or_judged() {
     }
 }
 
-/// The flag is a raw `openat` bit any process can set on a path it names (#1102 review 4).
+/// A raw open of a path named like a listed unit is not a stop (#1127: the stop is its own
+/// event, so no open can stand for one).
 #[test]
-fn an_open_carrying_the_unit_stopped_bit_from_a_process_is_not_a_stop() {
+fn a_file_open_of_a_listed_unit_name_is_not_a_stop() {
     let mut state = RuleState::new();
-    let mut event = stopped("falco", T0);
-    event.meta.pid = 4242;
-    event.meta.comm = "python3".to_string();
+    let event = file_open_event_full(0, "auditd.service", "auditd.service", 0x8000_0000, T0);
     state.on_file_open(&event);
     state.on_exec(&exec("true", T0 + START_WITHIN_NS + SEC));
     assert!(state.take_due_unit_stops().is_empty());
 }
 
 #[test]
-fn a_file_open_without_the_flag_is_not_a_stop() {
+fn a_stop_of_an_unlisted_unit_is_dropped() {
     let mut state = RuleState::new();
-    let mut event = stopped("auditd.service", T0);
-    event.flags = 0;
-    state.on_file_open(&event);
+    state.on_unit_stop(&stopped("nginx.service", T0));
     state.on_exec(&exec("true", T0 + START_WITHIN_NS + SEC));
     assert!(state.take_due_unit_stops().is_empty());
 }
@@ -515,7 +521,7 @@ fn a_flooded_queue_stays_bounded_and_every_unexplained_stop_still_alerts() {
     let mut state = RuleState::new();
     let n = 200;
     for i in 0..n {
-        state.on_file_open(&stopped("auditd.service", T0 + i));
+        state.on_unit_stop(&stopped("auditd.service", T0 + i));
     }
     state.on_exec(&exec("true", T0 + n + START_WITHIN_NS + SEC));
     assert_eq!(state.take_due_unit_stops().len(), n as usize);

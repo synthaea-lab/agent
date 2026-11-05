@@ -1013,6 +1013,19 @@ impl DetectionSink {
             .set_local_utc_offset_minutes(minutes)
     }
 
+    /// Declares the ordinary local hours (#1089); false when they are not a window.
+    pub(crate) fn set_work_hours(&self, start: u32, end: u32) -> bool {
+        self.rule_state.lock().unwrap().set_work_hours(start, end)
+    }
+
+    /// Declares the accounts whose odd-hour logons are expected (#1089).
+    pub(crate) fn set_odd_hour_exempt_accounts(&self, accounts: &[String]) -> usize {
+        self.rule_state
+            .lock()
+            .unwrap()
+            .set_odd_hour_exempt_accounts(accounts)
+    }
+
     /// Gives the rules the platform's time zone (#1088); false when it has no answer for `now_secs`.
     pub(crate) fn set_local_zone(&self, zone: rules::LocalOffsetAt, now_secs: i64) -> bool {
         self.rule_state
@@ -1548,7 +1561,7 @@ impl DetectionSink {
                 .into_iter()
                 .chain(state_alerts),
         );
-        // A unit stop is queued by `on_file_open`; this event moved the clock (#1085).
+        // This event moved the stream clock: a queued unit stop may be due (#1085).
         self.record_due_unit_stops();
         if event.flags & 0o103 != 0
             && let Some((yara, _)) = self.yara.lock().unwrap().as_ref()
@@ -1696,7 +1709,7 @@ impl DetectionSink {
     fn record_due_unit_stops(&self) {
         let due = self.rule_state.lock().unwrap().take_due_unit_stops();
         for (event, alert) in due {
-            self.record_rule_alerts(&Event::FileOpen(event), [alert]);
+            self.record_rule_alerts(&Event::UnitStop(event), [alert]);
         }
     }
 
@@ -2387,6 +2400,10 @@ impl EventSink for DetectionSink {
         match &event {
             Event::Exec(e) => self.detect_exec(&event, e),
             Event::FileOpen(e) => self.detect_file_open(&event, e),
+            Event::UnitStop(e) => {
+                self.rule_state.lock().unwrap().on_unit_stop(e);
+                self.record_due_unit_stops();
+            }
             Event::Connect(e) => self.detect_connect(&event, e),
             Event::NetworkFlow(e) => self.detect_network_flow(&event, e),
             Event::DnsQuery(e) => self.detect_dns_query(&event, e),

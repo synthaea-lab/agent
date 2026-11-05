@@ -35,7 +35,8 @@ pub const MAX_DRAIN_ATTEMPTS: u32 = 5;
 pub struct SpoolStats {
     /// Total bytes currently on disk across segments (including in-flight).
     pub bytes: u64,
-    /// Records dropped over the spool's lifetime because the byte cap was hit.
+    /// Records dropped over the spool's lifetime: the byte cap was hit, a poison segment was
+    /// skipped, or the server refused a record for good (#1119).
     pub dropped_records: u64,
 }
 
@@ -239,6 +240,27 @@ impl EventSpool {
         Ok(true)
     }
 
+    /// Acknowledges the in-flight segment like [`ack`](Self::ack) and counts `dropped` of its
+    /// records as lost: they were left out one by one (the server refused them for good) and
+    /// the rest of the segment was uploaded. Nothing is counted when no segment was in flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the in-flight file cannot be deleted; nothing is counted then.
+    pub fn ack_counting_dropped(&mut self, dropped: u64) -> std::io::Result<bool> {
+        let acked = self.ack()?;
+        if acked {
+            self.dropped_records += dropped;
+            if dropped > 0 {
+                tracing::warn!(
+                    dropped,
+                    "spool: acknowledged a segment with refused records"
+                );
+            }
+        }
+        Ok(acked)
+    }
+
     /// Skips (discards) the in-flight segment without uploading it.
     /// Use this after repeated upload failures to prevent a poison segment from
     /// blocking all telemetry indefinitely.
@@ -404,6 +426,30 @@ mod tests {
         let second: Vec<String> = spool.drain_oldest().unwrap();
         assert_eq!(second, vec!["good"]);
         assert_eq!(spool.stats().dropped_records, 1);
+    }
+
+    #[test]
+    fn ack_counting_dropped_acks_the_segment_and_adds_the_refused_records_to_the_loss() {
+        let dir = tmp("ack-dropped");
+        let mut spool = EventSpool::open(&dir, u64::MAX).unwrap();
+        for i in 0..3u32 {
+            spool.push(&i).unwrap();
+        }
+        let got: Vec<u32> = spool.drain_oldest().unwrap();
+        assert_eq!(got, vec![0, 1, 2]);
+        assert!(spool.ack_counting_dropped(1).unwrap());
+        assert_eq!(spool.stats().dropped_records, 1);
+        assert!(!spool.has_in_flight(), "the segment is gone");
+        let empty: Vec<u32> = spool.drain_oldest().unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn ack_counting_dropped_counts_nothing_when_no_segment_was_in_flight() {
+        let dir = tmp("ack-dropped-none");
+        let mut spool = EventSpool::open(&dir, u64::MAX).unwrap();
+        assert!(!spool.ack_counting_dropped(5).unwrap());
+        assert_eq!(spool.stats().dropped_records, 0);
     }
 
     #[test]

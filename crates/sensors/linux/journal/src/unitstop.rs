@@ -1,9 +1,10 @@
-//! Maps the stop of a security tool's systemd unit into `schema::FileOpenEvent` with
-//! [`schema::FLAG_UNIT_STOPPED`] (T1562.001, #1085): the journal's answer to "did the stop
+//! Maps the stop of a security tool's systemd unit into [`schema::UnitStopEvent`]
+//! (T1562.001, #1085): the journal's answer to "did the stop
 //! happen", which the exec rule (`check_security_tool_stop`, it reads the command line) cannot
 //! say, and which also sees a stop that never went through a command line (D-Bus, an API).
 //!
-//! Same shape as [`crate::persistence`]'s start: `path` and `meta.comm` carry the unit name.
+//! `unit` and `meta.comm` carry the unit name. It is an event of its own, not a flag on a
+//! `FileOpenEvent`: a raw `openat` flag can carry any bit, so an unprivileged open could set it.
 //! **The journal names no actor.** `_PID`/`_UID` on a job record are the manager's (PID 1, root)
 //! whoever asked for the stop, so the event says a stop happened, not who did it.
 //!
@@ -16,7 +17,7 @@
 //!   name a user unit `falco.service` and stop it, which is no security tool stopping;
 //! - the unit, lowercased and without `.service`, is in the list.
 
-use schema::{Event, EventMeta, FLAG_UNIT_STOPPED, FileOpenEvent, SECURITY_SERVICES, User};
+use schema::{Event, EventMeta, SECURITY_SERVICES, UnitStopEvent, User};
 
 use crate::{JournalEvent, JournalRecord};
 
@@ -35,7 +36,7 @@ pub fn to_unit_stop_event(record: &JournalRecord, event: &JournalEvent) -> Optio
     if !SECURITY_SERVICES.contains(&name) {
         return None;
     }
-    Some(Event::FileOpen(FileOpenEvent {
+    Some(Event::UnitStop(UnitStopEvent {
         meta: EventMeta {
             pid: 1,
             ppid: 0,
@@ -46,8 +47,7 @@ pub fn to_unit_stop_event(record: &JournalRecord, event: &JournalEvent) -> Optio
             process_generation: None,
             parent_process_generation: None,
         },
-        path: unit,
-        flags: FLAG_UNIT_STOPPED,
+        unit,
     }))
 }
 
@@ -76,15 +76,15 @@ mod tests {
     #[test]
     fn a_stop_of_a_listed_unit_is_reported() {
         let record = record_with(&[("_PID", "1"), ("UNIT", "auditd.service")]);
-        let Some(Event::FileOpen(file_open)) = to_unit_stop_event(&record, &stop("auditd.service"))
+        let Some(Event::UnitStop(stop_event)) =
+            to_unit_stop_event(&record, &stop("auditd.service"))
         else {
             panic!("a stop of auditd must be reported");
         };
-        assert_eq!(file_open.path, "auditd.service");
-        assert_eq!(file_open.meta.comm, "auditd.service");
-        assert_eq!(file_open.meta.pid, 1);
-        assert_eq!(file_open.meta.timestamp_ns, 2_000_000);
-        assert_eq!(file_open.flags, FLAG_UNIT_STOPPED);
+        assert_eq!(stop_event.unit, "auditd.service");
+        assert_eq!(stop_event.meta.comm, "auditd.service");
+        assert_eq!(stop_event.meta.pid, 1);
+        assert_eq!(stop_event.meta.timestamp_ns, 2_000_000);
     }
 
     #[test]

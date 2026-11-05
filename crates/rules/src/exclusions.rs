@@ -72,6 +72,22 @@ pub(crate) const MEMFD_EXEC_WINDOW_NS: u64 = 5_000_000_000; // 5s
 /// minutes stays; macOS, without the gate, keeps the noise.
 pub(crate) const QUARANTINE_EXEC_WINDOW_NS: u64 = 600_000_000_000; // 10 min
 
+/// Quarantine agents that are a mail client, for the T1566.001 tag on the
+/// provenance join ([`crate::RuleState`]'s `check_quarantined_exec`, #376).
+/// Apple Mail is listed on its expected quarantine string, **not on a capture**:
+/// it is expected to record itself as `Mail` in the `com.apple.quarantine`
+/// agent field, but no `xattr -p com.apple.quarantine` of a saved attachment
+/// is in the repo yet. If a Mac shows another string the tag never fires (a
+/// missed label, not a false one). Matched exactly (ASCII case-folded), not as a
+/// substring: `Mail` must not match a browser extension or `Mailspring`.
+///
+/// Deliberately absent: Outlook (`outlook.exe`, `olk.exe`) and Thunderbird.
+/// Nothing shows that they write a mark on an opened attachment, which
+/// process writes it, or where (Outlook's temporary copy is assumed to be
+/// under `Content.Outlook`). An entry is added once a lab capture shows the
+/// mark and its writer.
+pub(crate) const MAIL_CLIENT_QUARANTINE_AGENTS: &[&str] = &["Mail"];
+
 /// Window between a BITS job adding or completing a file and an exec of that
 /// file that still counts as "BITS-downloaded, then run" (T1197, #284). The
 /// same 10 min as [`QUARANTINE_EXEC_WINDOW_NS`]: the window runs from the
@@ -624,9 +640,11 @@ pub(crate) const EGRESS_DOMAIN_BROWSER_COMMS: &[&str] = &[
 pub(crate) const LOGON_LEARNING_NS: u64 = 86_400_000_000_000; // 24 h
 
 /// ODD-HOUR-LOGON (T1078, #376): the local hours `[start, end)` in which a logon is ordinary.
-/// **Provisional**: 07:00 to 20:00 is a plain working day, with no measurement behind it and
-/// no notion of weekends, shifts or a host used around the clock. Only read when the
-/// operator has told the agent the host's UTC offset.
+/// The default window. **Provisional**: 07:00 to 20:00 is a plain working day, with no measurement
+/// behind it and no notion of weekends. An operator declares another window (`[detection]
+/// work_hours`, a night shift wraps midnight) and names accounts whose odd-hour logons are
+/// expected (`odd_hour_exempt_accounts`); the rule reads the host's local time from the platform's
+/// zone, or from the operator's UTC offset, which overrides it.
 pub(crate) const WORK_HOURS_LOCAL: (u32, u32) = (7, 20);
 
 /// ODD-HOUR-LOGON: one alert per account per this long, so a session that logs on several

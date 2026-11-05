@@ -1,9 +1,9 @@
 //! UNEXPLAINED-UNIT-STOP (T1562.001, #1085): a security service stopped that nothing visible asked
 //! for.
 //!
-//! The journal sensor reports a stop of a unit of [`SECURITY_SERVICES`] as a `FileOpenEvent`
-//! carrying [`schema::FLAG_UNIT_STOPPED`], from pid 1 only (the flag is also an `openat` bit any
-//! process can set, so the pid is the check). The journal names no actor, so this rule asks the
+//! The journal sensor reports a stop of a unit of [`SECURITY_SERVICES`] as a
+//! [`schema::UnitStopEvent`], an event of its own that only that sensor builds, from a record
+//! whose writer is the system manager (#1127). The journal names no actor, so this rule asks the
 //! other question: was the stop **explained**? `check_security_tool_stop` already alerts on a
 //! `systemctl stop falco`; what it cannot see is a stop over D-Bus, from a script's API call, or
 //! after the service was killed, and those are what is left once the explained stops are set
@@ -35,7 +35,7 @@
 
 use std::collections::VecDeque;
 
-use schema::{ExecEvent, FileOpenEvent, SECURITY_SERVICES, detection::Severity};
+use schema::{ExecEvent, SECURITY_SERVICES, UnitStopEvent, detection::Severity};
 use store::BoundedMap;
 
 use crate::{
@@ -43,9 +43,6 @@ use crate::{
     recon::{args, program},
     servicestop::services_stopped,
 };
-
-/// The pid the journal sensor gives a unit stop it reports: the manager's.
-const JOURNAL_STOP_PID: u32 = 1;
 
 /// How long after a stop the unit may start again for the stop to count as a restart. A
 /// `systemctl restart` is back in seconds, but a package upgrade stops the service in its
@@ -98,9 +95,9 @@ pub(crate) struct UnitStops {
     /// When the host was last told to shut down.
     shutdown_ns: Option<u64>,
     /// Stops waiting to be judged, oldest first.
-    pending: VecDeque<FileOpenEvent>,
+    pending: VecDeque<UnitStopEvent>,
     /// Stops judged early because the queue overflowed, until the next [`Self::take_due`].
-    ready: Vec<(FileOpenEvent, Alert)>,
+    ready: Vec<(UnitStopEvent, Alert)>,
     /// The latest timestamp of any exec or unit stop seen: the stream's clock.
     clock_ns: u64,
 }
@@ -138,17 +135,16 @@ impl UnitStops {
         }
     }
 
-    /// A file-open event: a unit stop is queued, to be judged by [`Self::take_due`].
-    pub(crate) fn on_file_open(&mut self, event: &FileOpenEvent) {
+    /// A file-open event moved the stream clock: a stop may be due.
+    pub(crate) fn advance_clock(&mut self, timestamp_ns: u64) {
+        self.clock_ns = self.clock_ns.max(timestamp_ns);
+    }
+
+    /// A unit stop: queued, to be judged by [`Self::take_due`]. Only the journal sensor builds
+    /// the event, so there is no forgery to check; an unlisted unit is still dropped here.
+    pub(crate) fn on_unit_stop(&mut self, event: &UnitStopEvent) {
         self.clock_ns = self.clock_ns.max(event.meta.timestamp_ns);
-        // Only the journal sensor builds a unit stop, and it does so as pid 1 (`to_unit_stop_event`).
-        // The flag is also a bit of `openat`'s `flags` that any process can set on a file it
-        // names, so a flagged open from any other pid is a forgery, not a stop (#1102 review).
-        // Stopgap until #1127 gives the stop its own event.
-        if event.meta.pid != JOURNAL_STOP_PID
-            || event.flags & schema::FLAG_UNIT_STOPPED == 0
-            || listed_unit(&event.path).is_none()
-        {
+        if listed_unit(&event.unit).is_none() {
             return;
         }
         if self.pending.len() >= PENDING_CAP
@@ -161,8 +157,8 @@ impl UnitStops {
     }
 
     /// The queued stops whose wait is over, judged. The sink calls this after every exec and
-    /// file-open event, which are what move the clock.
-    pub(crate) fn take_due(&mut self) -> Vec<(FileOpenEvent, Alert)> {
+    /// unit stop, which are what move the clock.
+    pub(crate) fn take_due(&mut self) -> Vec<(UnitStopEvent, Alert)> {
         let mut due = std::mem::take(&mut self.ready);
         while let Some(front) = self.pending.front() {
             if front.meta.timestamp_ns.saturating_add(START_WITHIN_NS) > self.clock_ns {
@@ -179,8 +175,8 @@ impl UnitStops {
     }
 
     /// `None` when the stop is explained, else the alert.
-    fn judge(&self, event: &FileOpenEvent) -> Option<Alert> {
-        let unit = listed_unit(&event.path)?;
+    fn judge(&self, event: &UnitStopEvent) -> Option<Alert> {
+        let unit = listed_unit(&event.unit)?;
         let at = event.meta.timestamp_ns;
         // The window an exec asking for the stop may sit in, either side of the record.
         let asked_from = at.saturating_sub(EXEC_LOOKBACK_NS);

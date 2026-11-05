@@ -93,10 +93,80 @@ fn wevtutil(args: &[&str]) -> Result<String, String> {
             .map_or_else(|| "no exit code".to_string(), |c| c.to_string());
         return Err(format!(
             "wevtutil exited with {code}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            decode_ansi(&output.stderr).trim()
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(decode_ansi(&output.stdout))
+}
+
+/// `wevtutil`'s output, decoded from the system ANSI code page.
+///
+/// With its stdout redirected, `wevtutil` writes in the ANSI code page, not UTF-8 and not the
+/// OEM one: measured on a French Windows 11 (`ACP=1252`, `OEMCP=850`), `é` is the single byte
+/// `0xE9`. Decoded as UTF-8, every non-ASCII account name lost its letters to U+FFFD, so two
+/// accounts could become one string and `Système` matched no generic-account name (#1126).
+/// A host whose ANSI code page is UTF-8 (65001) decodes the same way through `CP_ACP`.
+///
+/// Two limits. A character the ANSI code page cannot hold (Cyrillic on a 1252 host) is
+/// already `?` when `wevtutil` writes it: no decoding here gets it back, only the `Subscribe`
+/// transport (UTF-16 from `EvtRender`) keeps it. And `CP_ACP` is this process's code page: it
+/// matches `wevtutil`'s only while the agent binary has no manifest setting `activeCodePage`
+/// (none does on 2026-11-04).
+///
+/// If the conversion fails, the output is decoded as lossy UTF-8, which is what this sensor did
+/// before #1126: accented names lose letters again. The first failure is logged with its Win32
+/// error code, once per process: the decode runs on every poll, and a failure that repeats would
+/// otherwise repeat its line every few seconds.
+fn decode_ansi(bytes: &[u8]) -> String {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+
+    decode_code_page(bytes, windows_sys::Win32::Globalization::CP_ACP).unwrap_or_else(|error| {
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                error,
+                bytes = bytes.len(),
+                "wevtutil output not decodable in the ANSI code page, decoded as lossy UTF-8 (logged once)"
+            );
+        }
+        String::from_utf8_lossy(bytes).into_owned()
+    })
+}
+
+/// `bytes` decoded from `code_page` through `MultiByteToWideChar`.
+///
+/// # Errors
+/// The Win32 error code of the failed call (`ERROR_INVALID_PARAMETER` for an unknown code page),
+/// or `ERROR_ARITHMETIC_OVERFLOW` for a buffer past `i32::MAX` bytes, which the call cannot take.
+fn decode_code_page(bytes: &[u8], code_page: u32) -> Result<String, u32> {
+    use windows_sys::Win32::{
+        Foundation::{ERROR_ARITHMETIC_OVERFLOW, GetLastError},
+        Globalization::MultiByteToWideChar,
+    };
+
+    if bytes.is_empty() {
+        return Ok(String::new());
+    }
+    let len = i32::try_from(bytes.len()).map_err(|_| ERROR_ARITHMETIC_OVERFLOW)?;
+    // SAFETY: `bytes` is a live slice of `len` bytes; a null output buffer with a size of 0 asks
+    // only for the number of UTF-16 units needed, and nothing is written.
+    let units =
+        unsafe { MultiByteToWideChar(code_page, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0) };
+    let Some(capacity) = usize::try_from(units).ok().filter(|n| *n > 0) else {
+        // SAFETY: no precondition; read right after the call that failed.
+        return Err(unsafe { GetLastError() });
+    };
+    let mut wide = vec![0u16; capacity];
+    // SAFETY: `wide` holds exactly `units` writable `u16`s, the size passed, and `bytes` is
+    // unchanged since the first call, so the conversion writes at most `units` units.
+    let written =
+        unsafe { MultiByteToWideChar(code_page, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), units) };
+    let Some(written) = usize::try_from(written).ok().filter(|n| *n > 0) else {
+        // SAFETY: no precondition; read right after the call that failed.
+        return Err(unsafe { GetLastError() });
+    };
+    wide.truncate(written);
+    Ok(String::from_utf16_lossy(&wide))
 }
 
 // ── The shared poll pipeline ─────────────────────────────────────────────────
@@ -1931,6 +2001,53 @@ mod config_tests {
 #[cfg(test)]
 mod wevtutil_tests {
     use super::*;
+
+    /// The bytes a French Windows writes for the SYSTEM account's name, `Système`, in
+    /// Windows-1252 (#1126): decoded as UTF-8 they were `Syst\u{FFFD}me`.
+    #[test]
+    fn windows_1252_bytes_keep_their_accented_letters() {
+        let bytes = [0x53, 0x79, 0x73, 0x74, 0xE8, 0x6D, 0x65];
+        assert_eq!(decode_code_page(&bytes, 1252).as_deref(), Ok("Système"));
+        assert_eq!(
+            decode_code_page(
+                &[0x44, 0xE9, 0x6D, 0x61, 0x72, 0x72, 0x61, 0x67, 0x65],
+                1252
+            )
+            .as_deref(),
+            Ok("Démarrage")
+        );
+        assert_eq!(decode_code_page(&[], 1252).as_deref(), Ok(""));
+    }
+
+    /// A failed conversion reports why, so the fallback to lossy UTF-8 can be logged with it.
+    #[test]
+    fn an_unknown_code_page_fails_with_its_win32_error() {
+        assert_eq!(
+            decode_code_page(b"abc", 0xFFFF_FFF0),
+            Err(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn plain_ascii_is_unchanged_in_the_system_code_page() {
+        assert_eq!(
+            decode_ansi(b"<Event>S-1-5-18</Event>"),
+            "<Event>S-1-5-18</Event>"
+        );
+    }
+
+    /// On a host whose events carry non-ASCII text (a French or German Windows), the old UTF-8
+    /// decoding put U+FFFD in the output; the system code page never does for a real `wevtutil`
+    /// output. On an English host this passes either way.
+    #[test]
+    fn real_wevtutil_output_has_no_replacement_character() {
+        let out = wevtutil(&["qe", "System", "/c:300", "/rd:true", "/f:xml"])
+            .expect("the System channel is readable unelevated");
+        assert!(
+            !out.contains('\u{FFFD}'),
+            "a replacement character in wevtutil's output"
+        );
+    }
 
     #[test]
     fn a_query_matching_nothing_is_a_success_with_empty_output() {
