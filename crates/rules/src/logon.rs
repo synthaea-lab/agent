@@ -64,10 +64,24 @@ pub(crate) fn is_well_known_service_sid(sid: &str) -> bool {
     matches!(sid, "S-1-5-7" | "S-1-5-18" | "S-1-5-19" | "S-1-5-20")
 }
 
+/// Whether `sid` is the built-in Administrator of a machine or a domain:
+/// `S-1-5-21-<a>-<b>-<c>-500`. Its name is localized (`Administrateur` on a French Windows), so
+/// the `administrator` entry of [`GENERIC_ACCOUNTS`] misses it there; relative id 500 does not.
+pub(crate) fn is_builtin_administrator_sid(sid: &str) -> bool {
+    let Some(rest) = sid.strip_prefix("S-1-5-21-") else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('-').collect();
+    matches!(parts.as_slice(), [a, b, c, "500"]
+        if [a, b, c].iter().all(|p| !p.is_empty() && p.bytes().all(|x| x.is_ascii_digit())))
+}
+
 /// Whether the account of a logon is generic: by its name ([`is_generic_account`]) or by its SID
-/// when the event carries one ([`is_well_known_service_sid`]).
+/// when the event carries one ([`is_well_known_service_sid`], [`is_builtin_administrator_sid`]).
 fn is_generic_logon(user: &str, sid: Option<&str>) -> bool {
-    is_generic_account(user) || sid.is_some_and(is_well_known_service_sid)
+    is_generic_account(user)
+        || sid
+            .is_some_and(|sid| is_well_known_service_sid(sid) || is_builtin_administrator_sid(sid))
 }
 
 /// `dwm-<n>` and `umfd-<n>`: the desktop-window-manager and font-driver accounts Windows
@@ -419,7 +433,34 @@ impl OddHours {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_generic_account, is_well_known_service_sid};
+    use super::{is_builtin_administrator_sid, is_generic_account, is_well_known_service_sid};
+
+    #[test]
+    fn the_builtin_administrator_sid_is_recognised_and_nothing_near_it() {
+        for sid in [
+            "S-1-5-21-1004336348-1177238915-682003330-500",
+            "S-1-5-21-1-2-3-500",
+        ] {
+            assert!(is_builtin_administrator_sid(sid), "{sid}");
+        }
+        // Guest (501), an ordinary user, RIDs that start or end with 500, a missing or extra
+        // sub-authority, the `Administrators` group, and lower case are not.
+        for sid in [
+            "S-1-5-21-1-2-3-501",
+            "S-1-5-21-1-2-3-1001",
+            "S-1-5-21-1-2-3-5001",
+            "S-1-5-21-1-2-3-1500",
+            "S-1-5-21-1-2-500",
+            "S-1-5-21-1-2-3-4-500",
+            "S-1-5-21--2-3-500",
+            "S-1-5-21-x-2-3-500",
+            "S-1-5-32-544",
+            "s-1-5-21-1-2-3-500",
+            "",
+        ] {
+            assert!(!is_builtin_administrator_sid(sid), "{sid:?}");
+        }
+    }
 
     #[test]
     fn accounts_every_host_has_are_generic_in_any_case_and_with_a_domain() {

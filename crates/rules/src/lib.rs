@@ -16,6 +16,7 @@ mod defender;
 mod egressdomain;
 mod exclusions;
 mod failure_join;
+mod impactctx;
 mod inventory;
 mod ld_trust;
 mod ldap;

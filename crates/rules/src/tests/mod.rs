@@ -408,6 +408,7 @@ mod ads;
 mod coverage;
 mod credfiles;
 mod egressdomain;
+mod impact_context;
 mod linux;
 mod logon;
 mod motw_removal;
