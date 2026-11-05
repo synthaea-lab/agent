@@ -147,7 +147,8 @@ unsafe extern "system" fn subscribe_callback(
     ERROR_SUCCESS
 }
 
-/// Renders one event handle to its `EvtRenderEventXml` string. Uses the
+/// Renders one event handle to its `EvtRenderEventXml` string (shared with the polling
+/// transport's `query` module). Uses the
 /// standard two-call `EvtRender` pattern: the first call probes the required
 /// buffer size (returns `FALSE` with `GetLastError() == ERROR_INSUFFICIENT_BUFFER`,
 /// and writes the needed size into `used`), the second call performs the
@@ -160,7 +161,7 @@ unsafe extern "system" fn subscribe_callback(
 ///
 /// `event_handle` must be a valid `EVT_HANDLE` for the duration of the call
 /// (guaranteed by the OS within the callback scope).
-unsafe fn render_event_xml(event_handle: EVT_HANDLE) -> Option<String> {
+pub(crate) unsafe fn render_event_xml(event_handle: EVT_HANDLE) -> Option<String> {
     let mut used: u32 = 0;
     let mut property_count: u32 = 0;
 
