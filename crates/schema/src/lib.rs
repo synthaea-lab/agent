@@ -337,6 +337,9 @@ pub mod time;
 /// Bumped 59 → 60 for [`SignalEvent::target_unit`] (#1103): the systemd unit of the signalled
 /// process, so an alert on a signal to a security tool names the tool and not only an image path;
 /// and for [`SignalEvent::signals_lost`], the report of signals the sensor had no room for.
+///
+/// If #1127 (a unit stop as its own event, schema 62) merges before #1103, renumber this bump to
+/// 63 and move `tests/fixtures/v60` to `tests/fixtures/v63`.
 pub const SCHEMA_VERSION: u32 = 60;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
