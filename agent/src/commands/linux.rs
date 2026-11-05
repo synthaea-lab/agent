@@ -806,7 +806,7 @@ fn run_avc_worker<R, E: std::fmt::Display>(
 /// the same stream, so a unit's first observed start lands as a
 /// `FLAG_PERSISTENCE_SYSTEMD_ARTIFACT` `FileOpenEvent` too — one tail thread,
 /// independent mappings off the same classified record/event pair; the stop of a unit of
-/// `schema::SECURITY_SERVICES` lands as a `FLAG_UNIT_STOPPED` `FileOpenEvent` the same way (#1085).
+/// `schema::SECURITY_SERVICES` lands as a `schema::UnitStopEvent` (#1085).
 ///
 /// Best-effort at startup: a non-systemd init (Alpine/OpenRC, see
 /// `watchdog::service::linux`'s own doc on this) has no `journalctl` at all —

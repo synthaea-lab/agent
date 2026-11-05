@@ -12,6 +12,9 @@
 
 mod dns_udp;
 pub mod normalize;
+// Read by nothing yet: the capture that feeds it is the next part of #86.
+#[cfg_attr(not(test), allow(dead_code))]
+mod tls_client_hello;
 
 #[cfg(all(target_os = "linux", any(ebpf_embedded, test)))]
 mod btf;

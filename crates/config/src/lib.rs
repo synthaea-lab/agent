@@ -57,7 +57,8 @@ pub use load::{apply_env_overrides, load, load_from};
 pub use schema::{
     AgentConfig, CONTENT_RINGS, DeceptionConfig, DetectionConfig, IpcConfig, LogConfig,
     LogSourceConfig, LogSourceKind, LogsConfig, MAX_CANARY_ALLOW_EXES, MAX_CANARY_DIRS,
-    MAX_LOG_SOURCES, ResourcesConfig, SCHEMA_VERSION, ServerConfig, StorageConfig, UpdatesConfig,
+    MAX_LOG_SOURCES, MAX_ODD_HOUR_EXEMPT_ACCOUNTS, ResourcesConfig, SCHEMA_VERSION, ServerConfig,
+    StorageConfig, UpdatesConfig,
 };
 pub use secret::SecretRef;
 pub use template::{DEFAULT_TEMPLATE, write_default_template};
