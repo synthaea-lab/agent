@@ -93,6 +93,11 @@ fn the_self_protection_and_eviction_counters_round_trip() {
 fn a_beacon_from_an_agent_without_the_ioc_counters_parses_with_zeros() {
     let beacon: HealthBeacon = serde_json::from_str(&beacon_json("")).unwrap();
     assert_eq!(
+        (beacon.ioc_own_skipped, beacon.ioc_sibling_skipped),
+        (0, 0),
+        "the own-traffic skips (#1061) are additive too"
+    );
+    assert_eq!(
         (
             beacon.ioc_indicators,
             beacon.ioc_findings,
@@ -105,7 +110,7 @@ fn a_beacon_from_an_agent_without_the_ioc_counters_parses_with_zeros() {
 #[test]
 fn the_ioc_counters_survive_a_round_trip() {
     let beacon: HealthBeacon = serde_json::from_str(&beacon_json(
-        r#","ioc_indicators":12000,"ioc_findings":4,"ioc_cooled_down":31"#,
+        r#","ioc_indicators":12000,"ioc_findings":4,"ioc_cooled_down":31,"ioc_own_skipped":6,"ioc_sibling_skipped":2"#,
     ))
     .unwrap();
     assert_eq!(
@@ -116,6 +121,7 @@ fn the_ioc_counters_survive_a_round_trip() {
         ),
         (12_000, 4, 31)
     );
+    assert_eq!((beacon.ioc_own_skipped, beacon.ioc_sibling_skipped), (6, 2));
     let back: HealthBeacon =
         serde_json::from_str(&serde_json::to_string(&beacon).unwrap()).unwrap();
     assert_eq!(back, beacon);

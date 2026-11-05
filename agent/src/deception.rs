@@ -386,7 +386,7 @@ fn in_foreign_mount_namespace(pid: u32) -> bool {
 /// the agent's namespace is the only one in which a path means what the allow-list says.
 /// Reading either namespace link of another user's process needs the same ptrace access as
 /// `/proc/<pid>/exe` does, so where the agent lacks it nothing resolves and the hit is raised.
-pub(crate) fn proc_exe(pid: u32) -> Option<PathBuf> {
+fn proc_exe(pid: u32) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
         if mount_namespace(pid)? != mount_namespace("self")? {
