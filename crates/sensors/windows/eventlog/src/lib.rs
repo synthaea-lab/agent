@@ -79,11 +79,17 @@
 //!   consumer created ad hoc, regardless of settings.
 //!
 //! `wevtutil` polling sidesteps both (it goes through the classic Event Log reader
-//! API, not ETW), at the cost of up to `POLL_INTERVAL` of detection latency and a
-//! child-process spawn per poll tick — an accepted trade-off for a persistence
-//! detection (the attacker already had to run `sc create` / `schtasks /create`
-//! before the event exists at all; a couple of seconds of latency does not change
-//! the outcome).
+//! API, not ETW), at the cost of up to `POLL_INTERVAL` of detection latency — an
+//! accepted trade-off for a persistence detection (the attacker already had to run
+//! `sc create` / `schtasks /create` before the event exists at all; a couple of
+//! seconds of latency does not change the outcome).
+//!
+//! Since #1126 the poll no longer spawns `wevtutil`: it calls the reader API that
+//! `wevtutil qe` wraps (`EvtQuery` + `EvtNext` + `EvtRender`, `query.rs`), with the
+//! same `XPath` queries, so the ETW walls above still do not apply. `wevtutil` wrote
+//! to its redirected stdout in the system ANSI code page, so an account name that
+//! page cannot hold (Cyrillic or CJK on a Windows-1252 host) reached the rules as
+//! `?`s; the API renders UTF-16 and keeps it, like the `Subscribe` transport.
 //!
 //! ## Schema fit
 //!
@@ -183,7 +189,7 @@
 //! `EventLogTransport` in `EventLogConfig`:
 //!
 //! - `EventLogTransport::Polling` — the default. One thread per
-//!   enabled target runs a `wevtutil` `qe` loop at the `POLL_INTERVAL`
+//!   enabled target runs an `EvtQuery` loop at the `POLL_INTERVAL`
 //!   cadence (2s), same shape as the pre-#322 implementation and same
 //!   trade-offs as documented in the section above.
 //! - `EventLogTransport::Subscribe` — one `EvtSubscribe`
@@ -217,6 +223,9 @@ pub mod xml;
 // than polled in silence (#786).
 #[cfg(windows)]
 mod channel;
+// The polling transport's channel read (`EvtQuery`, UTF-16), #1126.
+#[cfg(windows)]
+mod query;
 #[cfg(windows)]
 mod sensor;
 // The `EvtSubscribe` transport (issue #322) — enabled per-host via
