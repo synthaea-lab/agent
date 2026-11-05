@@ -11,7 +11,9 @@ use std::{
 
 use schema::Event;
 
-use crate::{client::TransportClient, config::TransportConfig, error::Result};
+use crate::{
+    client::TransportClient, config::TransportConfig, error::Result, event_limit::fit_batches,
+};
 
 /// Trait for draining events from a spool.
 ///
@@ -130,7 +132,16 @@ impl<D: EventDrain> EventUploader<D> {
             return Ok(0);
         }
 
+        // An event over the body limit is shortened, never dropped (#1131); the batches also
+        // respect the limit in bytes. `count` stays the number the drain returned.
         let count = events.len();
+        let (batches, unsendable) = fit_batches(events, self.config.batch_size);
+        if unsendable > 0 {
+            tracing::warn!(
+                unsendable,
+                "events that cannot fit the body limit were left out of the upload"
+            );
+        }
 
         // Upload in batches. `consecutive_failures` is NOT reset here on a
         // per-batch success (issue #315 regression, found in PR #349 review):
@@ -143,7 +154,7 @@ impl<D: EventDrain> EventUploader<D> {
         // batch. It resets exactly once, only when the whole call succeeds
         // (see the `ack()` call below) — that is the only point at which
         // this segment's attempt history should be forgotten.
-        for batch in events.chunks(self.config.batch_size) {
+        for batch in &batches {
             match self.client.upload_events(batch) {
                 Ok(response) => {
                     tracing::debug!(
