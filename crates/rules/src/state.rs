@@ -30,18 +30,18 @@ use crate::{
         CREATE_UNLINK_PID_CAP, CREDENTIAL_READ_ALERT_WINDOW_NS, DNS_CLASS_WINDOW_NS,
         DOWNLOAD_EXEC_WINDOW_NS, DOWNLOADER_COMMS, EGRESS_BYTES_THRESHOLD,
         EGRESS_CLASSED_BYTES_THRESHOLD, EGRESS_DOMAIN_BROWSER_COMMS, EGRESS_WINDOW_NS,
-        IN_PLACE_EDIT_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAILDIR_FLAG_LETTERS,
-        MEMFD_EXEC_WINDOW_NS, PACKAGE_MANAGER_COMMS, PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES,
-        POLICY_DENIAL_ALERT_CAP, POLICY_DENIAL_SUBJECT_CAP, QUARANTINE_EXEC_WINDOW_NS,
-        RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX, RANSOMWARE_RENAME_THRESHOLD,
-        RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD, SCAN_SPREAD_WINDOW_NS,
-        SCAN_VERTICAL_THRESHOLD, SCAN_VERTICAL_WINDOW_NS, SELF_SPAWN_EXCLUSIONS,
-        SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD,
-        SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS, SELINUX_POLICY_TOOL_COMMS,
-        SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STAGING_PID_CAP, STAGING_READ_DIRS,
-        STAGING_READ_FILES, STAGING_WINDOW_NS, STAGING_WRITE_FILES, STANDARD_PORTS,
-        SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
-        TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
+        IN_PLACE_EDIT_COMMS, LOLBIN_LEGIT_PARENTS, LOLBINS, MAIL_CLIENT_QUARANTINE_AGENTS,
+        MAILDIR_FLAG_LETTERS, MEMFD_EXEC_WINDOW_NS, PACKAGE_MANAGER_COMMS,
+        PACKAGE_MANAGER_TEMP_RENAME_SUFFIXES, POLICY_DENIAL_ALERT_CAP, POLICY_DENIAL_SUBJECT_CAP,
+        QUARANTINE_EXEC_WINDOW_NS, RANSOMWARE_EXCLUDED_PATH_PREFIXES, RANSOMWARE_LOOP_CHILD_MAX,
+        RANSOMWARE_RENAME_THRESHOLD, RANSOMWARE_RENAME_WINDOW_NS, SCAN_SPREAD_THRESHOLD,
+        SCAN_SPREAD_WINDOW_NS, SCAN_VERTICAL_THRESHOLD, SCAN_VERTICAL_WINDOW_NS,
+        SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS,
+        SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS,
+        SELINUX_POLICY_TOOL_COMMS, SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS,
+        STAGING_PID_CAP, STAGING_READ_DIRS, STAGING_READ_FILES, STAGING_WINDOW_NS,
+        STAGING_WRITE_FILES, STANDARD_PORTS, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN,
+        TASK_REGISTRATION_DEDUP_WINDOW_NS, TOUCHED_FILES_PER_PID, TOUCHED_FILES_PID_CAP,
     },
     has_write_intent,
     logon::{LogonBaseline, Observation},
@@ -132,6 +132,18 @@ struct RecentWrite {
     pid: u32,
     comm: String,
     timestamp_ns: u64,
+}
+
+/// `check_quarantined_exec`'s tags: the plain join, and the one a mail client's
+/// mark gets (#376).
+const USER_EXECUTION_TECHNIQUE: &str = "T1204.002";
+const MAIL_ATTACHMENT_TECHNIQUE: &str = "T1566.001/T1204.002";
+
+/// One exec of a pid, for the as-of-time image lookup of SETUID-ROOT-REQUEST (#1041).
+struct ExecRecord {
+    timestamp_ns: u64,
+    generation: Option<u64>,
+    image: String,
 }
 
 /// A download-provenance mark, as [`RuleState::on_file_quarantine`] saw it.
@@ -268,6 +280,17 @@ pub struct RuleState {
     /// `sed -i.bak`, or an encryptor that exits right after its renames) is already
     /// gone and it reads `None` (#513 review). LRU-bounded like `pid_comm`.
     pid_image_path: BoundedMap<u32, PidFact>,
+    /// pid → generation of the process that already raised SETUID-ROOT-REQUEST (T1548.001,
+    /// #1041): one alert per process, since a `PoC` calls `setuid`, `setresuid`, ... in a row.
+    /// LRU-bounded like `pid_comm`.
+    setuid_root_alerted: BoundedMap<u32, Option<u64>>,
+    /// pid → its latest execs (image, time, incarnation): SETUID-ROOT-REQUEST reads the image
+    /// a pid had *as of* an event's time, which `pid_image_path` (latest only) cannot give.
+    exec_history: BoundedMap<u32, Vec<ExecRecord>>,
+    /// Identity requests for uid 0 waiting for their process's exec to arrive (#1041).
+    pending_identity: VecDeque<schema::IdentityChangeEvent>,
+    /// The latest timestamp of any identity or exec event seen: the stream's clock.
+    identity_clock_ns: u64,
     /// path → info about the last write by a known downloader (T1105). LRU-bounded:
     /// downloader writes are rare, but a hostile loop must not grow agent memory.
     recent_writes: BoundedMap<String, RecentWrite>,
@@ -284,6 +307,9 @@ pub struct RuleState {
     recent_motw_removals: BoundedMap<String, MotwRemoval>,
     /// (ppid, comm) → sliding counter for SELF-SPAWN (T1059 Windows). LRU-bounded.
     self_spawn: BoundedMap<(u32, String), SlidingCounter>,
+    /// Linux timestomp alerts already raised, per process incarnation `(pid, generation)`
+    /// (#1036): one alert per window per process, see [`Self::on_file_set_time`].
+    set_time_alerted: BoundedMap<(u32, u64), SetTimeWindow>,
     /// (comm, daddr, dport) → sliding counter for BEACON (T1071 Windows). LRU-bounded.
     beacon: BoundedMap<(String, String, u16), SlidingCounter>,
     /// Same key as `beacon` → which local ports have already counted toward it —
@@ -339,17 +365,27 @@ pub struct RuleState {
     /// Lineage → distinct services it stopped, for SERVICE-STOP-BURST (T1489, #381).
     /// LRU-bounded.
     service_stop: BoundedMap<crate::recon::Lineage, SlidingDistinct<String>>,
+    /// Lineage → its last SERVICE-STOP-BURST finding, so a T1486 finding from the same lineage
+    /// can say it was preceded by one (#973). Read for the message only. LRU-bounded.
+    burst_marks: BoundedMap<crate::recon::Lineage, crate::impactctx::BurstMark>,
+    /// Lineage → its last T1486 or T1490 finding, so a shutdown from the same lineage can be
+    /// reported as context for it (T1529, #973). LRU-bounded.
+    impact_marks: BoundedMap<crate::recon::Lineage, crate::impactctx::ImpactMark>,
     /// (pid, dport) → sliding distinct-destination counter for SCAN-SPREAD
     /// (T1046/T1210, issue #465). LRU-bounded.
     scan_spread: BoundedMap<(u32, u16), SlidingDistinct<IpAddr>>,
-    /// (`local_addr`, `local_port`) → seen, for LISTENER-DRIFT (issue #92, T1571).
-    /// [`Self::seed_listen_ports`] pre-fills this from one startup snapshot so
-    /// every service already listening when the agent attaches is the baseline,
-    /// not noise — the same "seed from the world as it already is" principle as
-    /// [`Self::seed_from_proc`]/`seed_pid_comm`. LRU-bounded: the realistic
-    /// listener space is a few dozen, not unbounded, but a hostile loop binding
-    /// many ports must not grow this without limit either.
-    known_listeners: BoundedMap<(IpAddr, u16), ()>,
+    /// (`local_addr`, `local_port`, `protocol`) → seen, for LISTENER-DRIFT (issue
+    /// #92, T1571). `protocol` is the IP protocol number, same convention as
+    /// [`schema::ListenPortEvent::protocol`] — a UDP listener and a TCP listener
+    /// on the same port are different shapes, not a collision (issue #676): without
+    /// it, a new UDP listener on a port already baselined as TCP (or vice versa)
+    /// would be silently treated as already seen. [`Self::seed_listen_ports`]
+    /// pre-fills this from one startup snapshot so every service already listening
+    /// when the agent attaches is the baseline, not noise — the same "seed from the
+    /// world as it already is" principle as [`Self::seed_from_proc`]/`seed_pid_comm`.
+    /// LRU-bounded: the realistic listener space is a few dozen, not unbounded, but
+    /// a hostile loop binding many ports must not grow this without limit either.
+    known_listeners: BoundedMap<(IpAddr, u16, u8), ()>,
     /// (mechanism, subject context, object context, object class) → seen, for
     /// POLICY-DENIAL-DRIFT (issue #774, T1562-adjacent). Same "first new shape
     /// wins, the routine repeat doesn't" principle as `known_listeners` above:
@@ -405,6 +441,8 @@ pub struct RuleState {
     auth_failures: BoundedMap<(String, String), SlidingCounter>,
     /// The accounts seen logging on, for FIRST-SEEN-LOGON (T1078, #376). LRU-bounded.
     logon_baseline: LogonBaseline,
+    /// ODD-HOUR-LOGON's clock and quiet period; off until [`Self::set_local_utc_offset_minutes`].
+    odd_hours: crate::logon::OddHours,
     /// RDP authentication successes joined to the failures from the same address,
     /// by event time (T1021.001, #285); see the `rdp` module.
     rdp_success: RdpSuccessAfterFailures,
@@ -511,6 +549,30 @@ struct PendingProcFdExec {
     timestamp_ns: u64,
 }
 
+/// One process incarnation's timestomp alert state (#1036): when it last alerted and how many
+/// requests the window has swallowed since, so the next alert can say how many there were.
+#[derive(Default)]
+struct SetTimeWindow {
+    last_alert_ns: Option<u64>,
+    folded: u32,
+}
+
+impl SetTimeWindow {
+    /// `Some(requests folded since the last alert)` when this request alerts, `None` when it is
+    /// folded into the alert of the window it falls in.
+    fn admit(&mut self, ts: u64, window_ns: u64) -> Option<u32> {
+        if self
+            .last_alert_ns
+            .is_some_and(|t| ts.saturating_sub(t) <= window_ns)
+        {
+            self.folded = self.folded.saturating_add(1);
+            return None;
+        }
+        self.last_alert_ns = Some(ts);
+        Some(std::mem::take(&mut self.folded))
+    }
+}
+
 /// Memfd creations remembered per pid (see `RuleState::recent_memfd_creates`). A real
 /// fileless-exec process creates one or two; a process making more than this inside
 /// the correlation window is not something a longer list would catch better.
@@ -520,6 +582,8 @@ const PID_COMM_CAP: usize = 65_536;
 /// Counter/write-history bounds — one logical entity per key, far fewer than pids.
 pub(crate) const COUNTER_CAP: usize = 16_384;
 const RECENT_WRITES_CAP: usize = 4_096;
+/// One Linux timestomp alert per process incarnation per this window (#1036).
+const SET_TIME_ALERT_WINDOW_NS: u64 = 60_000_000_000;
 
 impl Default for RuleState {
     fn default() -> Self {
@@ -533,11 +597,16 @@ impl RuleState {
         Self {
             pid_comm: BoundedMap::new(PID_COMM_CAP),
             pid_image_path: BoundedMap::new(PID_COMM_CAP),
+            setuid_root_alerted: BoundedMap::new(PID_COMM_CAP),
+            exec_history: BoundedMap::new(PID_COMM_CAP),
+            pending_identity: VecDeque::new(),
+            identity_clock_ns: 0,
             recent_writes: BoundedMap::new(RECENT_WRITES_CAP),
             recent_quarantines: BoundedMap::new(RECENT_WRITES_CAP),
             recent_bits_downloads: BoundedMap::new(RECENT_WRITES_CAP),
             recent_motw_removals: BoundedMap::new(RECENT_WRITES_CAP),
             self_spawn: BoundedMap::new(COUNTER_CAP),
+            set_time_alerted: BoundedMap::new(COUNTER_CAP),
             ldap_burst: crate::ldap::LdapBurst::new(),
             beacon: BoundedMap::new(COUNTER_CAP),
             beacon_flow_dedup: BoundedMap::new(COUNTER_CAP),
@@ -557,6 +626,8 @@ impl RuleState {
             ssh_fanout: BoundedMap::new(COUNTER_CAP),
             security_discovery: BoundedMap::new(COUNTER_CAP),
             service_stop: BoundedMap::new(COUNTER_CAP),
+            burst_marks: BoundedMap::new(COUNTER_CAP),
+            impact_marks: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
             known_policy_denials: BoundedMap::new(COUNTER_CAP),
             policy_denial_budgets: BoundedMap::new(POLICY_DENIAL_SUBJECT_CAP),
@@ -565,6 +636,7 @@ impl RuleState {
             policy_denial_evictions_reported: 0,
             auth_failures: BoundedMap::new(COUNTER_CAP),
             logon_baseline: LogonBaseline::new(),
+            odd_hours: crate::logon::OddHours::new(),
             rdp_success: RdpSuccessAfterFailures::new(),
             sudo_success: SudoSuccessAfterFailures::new(),
             recent_creates: BoundedMap::new(CREATE_UNLINK_PID_CAP),
@@ -622,7 +694,7 @@ impl RuleState {
     /// attaches (sshd, nginx started by systemd at boot) would look exactly like
     /// a freshly planted backdoor listener on the very first poll after startup.
     /// Same principle, same caller responsibility, as [`Self::seed_from_proc`].
-    pub fn seed_listen_ports(&mut self, ports: impl IntoIterator<Item = (IpAddr, u16)>) {
+    pub fn seed_listen_ports(&mut self, ports: impl IntoIterator<Item = (IpAddr, u16, u8)>) {
         for key in ports {
             self.known_listeners.insert(key, ());
         }
@@ -796,8 +868,21 @@ impl RuleState {
             return None;
         }
         mark.alerted = true;
+        // A mail client's mark is the one thing that says how the file arrived:
+        // the finding names the attachment vector as well, and still only says
+        // "marked by", since a person who saved an attachment on purpose and
+        // ran it looks the same.
+        let by_mail_client = mark.agent.as_deref().is_some_and(|agent| {
+            MAIL_CLIENT_QUARANTINE_AGENTS
+                .iter()
+                .any(|client| agent.eq_ignore_ascii_case(client))
+        });
         Some(SignatureGatedAlert::new(Alert {
-            technique: "T1204.002",
+            technique: if by_mail_client {
+                MAIL_ATTACHMENT_TECHNIQUE
+            } else {
+                USER_EXECUTION_TECHNIQUE
+            },
             severity: Severity::High,
             message: format!(
                 "pid={} comm={} executes {}, downloaded {} earlier (origin: {}, marked by {})",
@@ -1345,6 +1430,17 @@ impl RuleState {
         for name in stopped {
             distinct = entry.record(name, ts, SERVICE_STOP_WINDOW_NS);
         }
+        if distinct >= SERVICE_STOP_THRESHOLD {
+            // Refreshed while the burst goes on, not only at the alert: a burst that runs
+            // past one window is still the burst a later mass rename follows.
+            self.burst_marks.insert(
+                lineage,
+                crate::impactctx::BurstMark {
+                    at_ns: ts,
+                    services: distinct,
+                },
+            );
+        }
         if distinct >= SERVICE_STOP_THRESHOLD && entry.try_alert(ts, SERVICE_STOP_WINDOW_NS) {
             let seen: Vec<&str> = entry.values().map(String::as_str).take(12).collect();
             return Some(Alert {
@@ -1367,6 +1463,101 @@ impl RuleState {
             });
         }
         None
+    }
+
+    /// T1529 as case context (#973): a shutdown or reboot command from a lineage that already
+    /// raised a T1486 or a T1490 finding within [`crate::impactctx::IMPACT_TO_SHUTDOWN_WINDOW_NS`].
+    /// Without such a finding it returns nothing and records nothing, so a reboot is never a
+    /// finding of its own. Also arms the lineages of a T1490 command. Low, once per finding.
+    /// See [`crate::impactctx`] for what counts as a shutdown and why.
+    fn check_shutdown_context(
+        &mut self,
+        event: &ExecEvent,
+        lineage: crate::recon::Lineage,
+    ) -> Option<Alert> {
+        use crate::impactctx::{IMPACT_TO_SHUTDOWN_WINDOW_NS, shutdown_command};
+
+        let ts = event.meta.timestamp_ns;
+        if crate::stateless::check_recovery_inhibit(event).is_some() {
+            self.mark_impact(
+                Some(lineage),
+                event.meta.pid,
+                event.meta.process_generation,
+                ts,
+                "T1490",
+            );
+            return None;
+        }
+        let command = shutdown_command(event)?;
+        let mark = self.impact_marks.get_mut(&lineage)?;
+        if ts < mark.at_ns || ts - mark.at_ns > IMPACT_TO_SHUTDOWN_WINDOW_NS || mark.reported {
+            return None;
+        }
+        mark.reported = true;
+        Some(Alert {
+            technique: "T1529",
+            severity: Severity::Low,
+            message: format!(
+                "pid={} comm={}: `{command}` run {}s after a {} finding from the lineage of \
+                 pid={} — context for that case, not a finding of its own (the command was \
+                 seen, the host going down is not confirmed)",
+                event.meta.pid,
+                event.meta.comm,
+                (ts - mark.at_ns) / 1_000_000_000,
+                mark.technique,
+                lineage.0,
+            ),
+        })
+    }
+
+    /// Remembers a T1486 or T1490 finding for the lineages that can own what follows it.
+    fn mark_impact(
+        &mut self,
+        exec_lineage: Option<crate::recon::Lineage>,
+        pid: u32,
+        generation: Option<u64>,
+        ts: u64,
+        technique: &'static str,
+    ) {
+        for lineage in crate::impactctx::armed_lineages(exec_lineage, pid, generation) {
+            self.impact_marks.insert(
+                lineage,
+                crate::impactctx::ImpactMark {
+                    at_ns: ts,
+                    technique,
+                    reported: false,
+                },
+            );
+        }
+    }
+
+    /// For the T1486 findings of one file event: tells each whether a SERVICE-STOP-BURST from
+    /// the same lineage preceded it (corroboration, message only: technique, severity and
+    /// thresholds are untouched, so the damage manifest and the reflex read what they always
+    /// read), and arms the lineages for [`Self::check_shutdown_context`].
+    fn note_t1486(&mut self, meta: &schema::EventMeta, alerts: &mut [Alert]) {
+        use crate::{impactctx::BURST_TO_RENAME_WINDOW_NS, recon::ExecLineage};
+
+        let ts = meta.timestamp_ns;
+        let exec_lineage =
+            ExecLineage::current(self.exec_lineage.peek(&meta.pid), meta.process_generation);
+        for alert in alerts.iter_mut().filter(|a| a.technique == "T1486") {
+            let burst =
+                crate::impactctx::armed_lineages(exec_lineage, meta.pid, meta.process_generation)
+                    .filter_map(|l| self.burst_marks.peek(&l).map(|m| (l, *m)))
+                    .filter(|(_, m)| ts >= m.at_ns && ts - m.at_ns <= BURST_TO_RENAME_WINDOW_NS)
+                    .max_by_key(|(_, m)| m.at_ns);
+            if let Some((l, m)) = burst {
+                alert.message.push_str(&format!(
+                    " — corroborated: the lineage of pid={} stopped {} distinct services \
+                     (SERVICE-STOP-BURST, T1489) {}s earlier",
+                    l.0,
+                    m.services,
+                    (ts - m.at_ns) / 1_000_000_000,
+                ));
+            }
+            self.mark_impact(exec_lineage, meta.pid, meta.process_generation, ts, "T1486");
+        }
     }
 
     /// SSH-FANOUT (T1021.004, #378): outbound SSH to eight distinct hosts from one lineage in
@@ -1427,6 +1618,7 @@ impl RuleState {
         alerts.extend(self.check_recon_burst(event, lineage));
         alerts.extend(self.check_security_discovery(event, lineage));
         alerts.extend(self.check_service_stop_burst(event, lineage));
+        alerts.extend(self.check_shutdown_context(event, lineage));
         alerts.extend(crate::stateless::check_ld_preload_hijack(
             event,
             &self.ld_trust_extra,
@@ -1441,7 +1633,41 @@ impl RuleState {
             event.meta.pid,
             PidFact::new(generation, event.image_path.clone()),
         );
+        self.record_exec_history(event);
         alerts
+    }
+
+    /// Remembers this exec for [`Self::on_identity_change`], and moves the stream clock.
+    fn record_exec_history(&mut self, event: &ExecEvent) {
+        self.identity_clock_ns = self.identity_clock_ns.max(event.meta.timestamp_ns);
+        let history = self
+            .exec_history
+            .get_or_insert_with(event.meta.pid, Vec::new);
+        if history.len() >= crate::privesc::EXEC_HISTORY_PER_PID {
+            history.remove(0);
+        }
+        history.push(ExecRecord {
+            timestamp_ns: event.meta.timestamp_ns,
+            generation: event.meta.process_generation,
+            image: event.image_path.clone(),
+        });
+    }
+
+    /// The image `pid` (incarnation `generation`) had at `at_ns`: its latest exec at or before
+    /// that time. An exec of another incarnation of the pid does not count.
+    fn image_as_of(&self, pid: u32, generation: Option<u64>, at_ns: u64) -> Option<&str> {
+        self.exec_history
+            .peek(&pid)?
+            .iter()
+            .rev()
+            .find(|record| {
+                record.timestamp_ns <= at_ns
+                    && match (record.generation, generation) {
+                        (Some(recorded), Some(wanted)) => recorded == wanted,
+                        _ => true,
+                    }
+            })
+            .map(|record| record.image.as_str())
     }
 
     /// The exec findings that wait for the image's signature (#441): today
@@ -1736,17 +1962,18 @@ impl RuleState {
     /// existing tag in this crate; no better precedent for "a new listener
     /// appeared" exists here yet, calibratable later) — a listening socket that
     /// wasn't in the startup baseline ([`Self::seed_listen_ports`]) nor already
-    /// alerted on this run. One alert per (`local_addr`, `local_port`): the second
-    /// poll to see the same listener is expected (a poll-based source re-reports
+    /// alerted on this run. One alert per (`local_addr`, `local_port`, `protocol`): the
+    /// second poll to see the same listener is expected (a poll-based source re-reports
     /// it every cycle while it stays open, same reasoning as
-    /// [`Self::check_beacon_flow`]'s dedup), not a second finding.
+    /// [`Self::check_beacon_flow`]'s dedup), not a second finding — and a TCP and a UDP
+    /// listener sharing a port (#676) are different listeners, not one.
     ///
     /// No name/path exclusion list yet — unlike BEACON's `BROWSERS`/
     /// `STANDARD_PORTS`, there is no lab capture here to calibrate one honestly
     /// against (a dev server or `docker-proxy` binding a fresh port after
     /// startup will alert; a documented, known noise source, not a bug).
     fn check_listen_port_drift(&mut self, event: &ListenPortEvent) -> Option<Alert> {
-        let key = (event.local_addr, event.local_port);
+        let key = (event.local_addr, event.local_port, event.protocol);
         if self.known_listeners.get(&key).is_some() {
             return None;
         }
@@ -1755,8 +1982,12 @@ impl RuleState {
             technique: "T1571",
             severity: Severity::Medium,
             message: format!(
-                "pid={} comm={} new listener on {}:{} — not seen at agent startup",
-                event.meta.pid, event.meta.comm, event.local_addr, event.local_port,
+                "pid={} comm={} new {} listener on {}:{} — not seen at agent startup",
+                event.meta.pid,
+                event.meta.comm,
+                protocol_label(event.protocol),
+                event.local_addr,
+                event.local_port,
             ),
         })
     }
@@ -1959,6 +2190,7 @@ impl RuleState {
     /// on a successful logon.
     pub fn on_auth(&mut self, event: &AuthEvent) -> Vec<Alert> {
         let mut alerts: Vec<Alert> = self.check_first_seen_logon(event).into_iter().collect();
+        alerts.extend(self.check_odd_hour_logon(event));
         alerts.extend(self.on_auth_failures_and_escalations(event));
         alerts
     }
@@ -1982,17 +2214,17 @@ impl RuleState {
     /// learning window, and an account that logs on during the window is learned without an
     /// alert, an intruder's included. Expected false positives: a domain controller or file
     /// server, which sees every user's first logon; a new hire; a service account first
-    /// used after an install. **Not built, and why: odd hours.** The event carries a UTC
-    /// timestamp and no timezone, and no part of the agent knows the host's local time, so
-    /// "outside working hours" cannot be said honestly yet.
+    /// used after an install. Odd hours are [`Self::check_odd_hour_logon`], which needs the
+    /// host's UTC offset: the event carries a UTC timestamp and nothing else knows the local time.
     fn check_first_seen_logon(&mut self, event: &AuthEvent) -> Option<Alert> {
         if event.outcome != AuthOutcome::Success || event.kind != AuthKind::Logon {
             return None;
         }
-        match self
-            .logon_baseline
-            .observe(&event.target_user, event.meta.timestamp_ns)
-        {
+        match self.logon_baseline.observe(
+            &event.target_user,
+            event.target_user_sid.as_deref(),
+            event.meta.timestamp_ns,
+        ) {
             Observation::FirstSeen => {}
             Observation::Quiet | Observation::Known => return None,
         }
@@ -2004,6 +2236,86 @@ impl RuleState {
             severity: Severity::Low,
             message: format!(
                 "first successful logon of account {}{source} on this host since the baseline began",
+                event.target_user,
+            ),
+        })
+    }
+
+    /// Tells the rules the host's local time as minutes east of UTC (`120` for UTC+2,
+    /// `-300` for UTC-5), which turns ODD-HOUR-LOGON on. False when the offset is outside
+    /// -720..=840, and the rule keeps what it had. A fixed offset, and it overrides the
+    /// platform zone ([`Self::set_local_zone`]): a host that changes its offset with daylight
+    /// saving is an hour out for half the year under this one.
+    pub fn set_local_utc_offset_minutes(&mut self, minutes: i32) -> bool {
+        self.odd_hours.set_offset_minutes(minutes)
+    }
+
+    /// Declares the local hours `[start, end)` in which a logon is ordinary for ODD-HOUR-LOGON
+    /// (#1089); `start > end` wraps midnight (`22, 6`, a night shift). False, and the window
+    /// keeps what it had, unless `start` is 0 to 23, `end` 1 to 24 and they differ. The default is
+    /// [`WORK_HOURS_LOCAL`](crate::exclusions::WORK_HOURS_LOCAL).
+    pub fn set_work_hours(&mut self, start: u32, end: u32) -> bool {
+        self.odd_hours.set_work_hours(start, end)
+    }
+
+    /// Declares the accounts whose odd-hour logons are expected (#1089): on-call staff, a
+    /// schedule's service or batch account. ODD-HOUR-LOGON skips them; FIRST-SEEN-LOGON does not.
+    /// An entry is `NAME` or `NAME|SID` (see `OddHours::set_exempt_accounts`); at most 64 are
+    /// kept, a blank, over-long or malformed one is dropped, and the number kept is returned.
+    /// Replaces the previous list; empty by default, so nothing is exempt until the operator says so.
+    pub fn set_odd_hour_exempt_accounts(&mut self, accounts: &[String]) -> usize {
+        self.odd_hours.set_exempt_accounts(accounts)
+    }
+
+    /// Odd-hour logons the exempt list has suppressed since the agent started (#1089); read by the
+    /// tests, and visible in production through the `skips` field of the info line of `OddHours`.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn odd_hour_exempt_skips(&self) -> u64 {
+        self.odd_hours.exempt_skips()
+    }
+
+    /// Gives the rules the host's platform time zone (#1088): `zone` maps an instant (seconds
+    /// since the Unix epoch) to minutes east of UTC at that instant, so a logon either side of a
+    /// daylight-saving change is judged by the hour the host's clock showed. Turns ODD-HOUR-LOGON
+    /// on. A fixed offset from [`Self::set_local_utc_offset_minutes`] overrides it whichever is
+    /// set first. False, and the rule keeps what it had, when `zone` has no answer for `now_secs`.
+    pub fn set_local_zone(&mut self, zone: crate::LocalOffsetAt, now_secs: i64) -> bool {
+        self.odd_hours.set_zone(zone, now_secs)
+    }
+
+    /// ODD-HOUR-LOGON (T1078, #376): a successful [`AuthKind::Logon`] of a non-generic
+    /// account whose host-local hour is outside the working hours: [`WORK_HOURS_LOCAL`](crate::exclusions::WORK_HOURS_LOCAL)
+    /// unless the operator declared another window ([`Self::set_work_hours`]).
+    /// Low, once per account per [`ODD_HOUR_QUIET_NS`](crate::exclusions::ODD_HOUR_QUIET_NS).
+    /// Same event gate and generic-account list as FIRST-SEEN-LOGON, so the two share the
+    /// identity join's limits; they are independent and a first logon at night raises both.
+    ///
+    /// **Off until the host's local time is known**: the platform's zone (the agent asks it at
+    /// startup, [`Self::set_local_zone`]) or the operator's fixed UTC offset (`[detection]` in
+    /// `agent.toml`, which overrides the zone). The event's timestamp is UTC and nothing else
+    /// in the agent knows the local time.
+    /// Expected false positives: on-call staff, night shifts, a host in use around the clock,
+    /// and on Windows the service and batch logons (4624) of a named account; the operator
+    /// answers them with a declared window ([`Self::set_work_hours`]) and an exempt list
+    /// ([`Self::set_odd_hour_exempt_accounts`]).
+    fn check_odd_hour_logon(&mut self, event: &AuthEvent) -> Option<Alert> {
+        if event.outcome != AuthOutcome::Success || event.kind != AuthKind::Logon {
+            return None;
+        }
+        let hour = self.odd_hours.observe(
+            &event.target_user,
+            event.target_user_sid.as_deref(),
+            event.meta.timestamp_ns,
+        )?;
+        let source = event
+            .source_address
+            .map_or_else(String::new, |address| format!(" from {address}"));
+        Some(Alert {
+            technique: "T1078",
+            severity: Severity::Low,
+            message: format!(
+                "successful logon of account {}{source} at {hour:02}:00 host-local time, outside the working hours",
                 event.target_user,
             ),
         })
@@ -2113,6 +2425,72 @@ impl RuleState {
             ));
         }
         alerts
+    }
+
+    /// To be called for every `IdentityChangeEvent` in the stream (Linux, issue #266):
+    /// SETUID-ROOT-REQUEST (T1548.001, #1041), see [`crate::privesc`]. A request for uid 0 is
+    /// queued, not judged: its process's exec event arrives later than the request, so it is
+    /// judged once the stream clock is [`crate::privesc::IDENTITY_DEFER_NS`] past it, against the
+    /// image the pid (else its parent, for a child that forked and never exec'd) had **at the
+    /// request's time**, never `comm`. Returns the requests that are now due, each with its own
+    /// event so the alert is attributed to the right process; the sink also calls
+    /// [`Self::take_due_identity_alerts`] after every exec, which moves the clock too.
+    pub fn on_identity_change(
+        &mut self,
+        event: &schema::IdentityChangeEvent,
+    ) -> Vec<(schema::IdentityChangeEvent, Alert)> {
+        self.identity_clock_ns = self.identity_clock_ns.max(event.meta.timestamp_ns);
+        if crate::privesc::requests_root_as_non_root(event) {
+            if self.pending_identity.len() >= crate::privesc::IDENTITY_PENDING_CAP {
+                self.pending_identity.pop_front();
+            }
+            self.pending_identity.push_back(event.clone());
+        }
+        self.take_due_identity_alerts()
+    }
+
+    /// The queued identity requests whose wait is over, judged: see [`Self::on_identity_change`].
+    pub fn take_due_identity_alerts(&mut self) -> Vec<(schema::IdentityChangeEvent, Alert)> {
+        let mut due = Vec::new();
+        while let Some(front) = self.pending_identity.front() {
+            if front
+                .meta
+                .timestamp_ns
+                .saturating_add(crate::privesc::IDENTITY_DEFER_NS)
+                > self.identity_clock_ns
+            {
+                break;
+            }
+            let Some(event) = self.pending_identity.pop_front() else {
+                break;
+            };
+            if let Some(alert) = self.judge_identity_request(&event) {
+                due.push((event, alert));
+            }
+        }
+        due
+    }
+
+    fn judge_identity_request(&mut self, event: &schema::IdentityChangeEvent) -> Option<Alert> {
+        let meta = &event.meta;
+        let at = meta.timestamp_ns;
+        let image = self
+            .image_as_of(meta.pid, meta.process_generation, at)
+            .or_else(|| self.image_as_of(meta.ppid, meta.parent_process_generation, at))?
+            .to_owned();
+        if image.is_empty() || crate::privesc::is_known_setuid_root_program(&image) {
+            return None;
+        }
+        if self
+            .setuid_root_alerted
+            .peek(&meta.pid)
+            .is_some_and(|recorded| *recorded == meta.process_generation)
+        {
+            return None;
+        }
+        self.setuid_root_alerted
+            .insert(meta.pid, meta.process_generation);
+        Some(crate::privesc::alert(event, &image))
     }
 
     /// To be called for every `MemfdCreateEvent` in the stream (Linux, issue
@@ -2738,9 +3116,12 @@ impl RuleState {
     pub fn on_file_delete(&mut self, event: &FileDeleteEvent) -> Vec<Alert> {
         self.record_motw_removal(event);
         self.record_touched(event.meta.pid, Event::FileDelete(event.clone()));
-        self.check_write_new_then_unlink(event)
+        let mut alerts: Vec<Alert> = self
+            .check_write_new_then_unlink(event)
             .into_iter()
-            .collect()
+            .collect();
+        self.note_t1486(&event.meta, &mut alerts);
+        alerts
     }
 
     /// Remembers a Windows `FileDelete` of a `:Zone.Identifier` stream: the
@@ -3022,6 +3403,49 @@ impl RuleState {
         self.record_touched(event.meta.pid, Event::FileRename(event.clone()));
         let mut alerts: Vec<Alert> = self.check_mass_rename_pattern(event).into_iter().collect();
         alerts.extend(self.check_burst_write_volume(event));
+        self.note_t1486(&event.meta, &mut alerts);
+        alerts
+    }
+
+    /// T1070.006, from `FileSetTimeEvent`s ([`crate::evaluate_file_set_time`]), deduplicated per
+    /// process on Linux (#1036): the `inode_setattr` hook reports every explicit time, and
+    /// `tar x`, `cp -a`, `rsync -a` and `cpio` set one per file, so a 3000-file unpack raised
+    /// about 1000 Low alerts in the lab (the rest were lost to the ring buffer). One alert per
+    /// process incarnation per [`SET_TIME_ALERT_WINDOW_NS`] says the same thing; every `touch -d`
+    /// of a stomping script is its own process and still alerts. Windows events carry no
+    /// trustworthy process (the minifilter's `comm` is empty), so they pass through as before.
+    pub fn on_file_set_time(&mut self, event: &schema::FileSetTimeEvent) -> Vec<Alert> {
+        let mut alerts = crate::evaluate_file_set_time(event);
+        if alerts.is_empty() || !matches!(event.meta.user, schema::User::Unix { .. }) {
+            return alerts;
+        }
+        // A package manager unpacking an archive stamps every file with its stored mtime. The
+        // skip is keyed on the exec-time image, not on `comm` alone: `comm` is the basename of
+        // whatever was exec'd and any process can rewrite it (`prctl(PR_SET_NAME)`), so a copy of
+        // `touch` named `/tmp/rpm`, or `python3` renamed to `rpm`, would otherwise stomp silently
+        // (#1045 review). Fails closed: a package manager whose exec the sensor missed (started
+        // before the agent) alerts at Low until it exits.
+        if crate::stateless::is_package_manager_comm(&event.meta.comm)
+            && self.runs_trusted_binary_named(&event.meta)
+        {
+            return Vec::new();
+        }
+        let key = (event.meta.pid, event.meta.process_generation.unwrap_or(0));
+        let window = self
+            .set_time_alerted
+            .get_or_insert_with(key, SetTimeWindow::default);
+        match window.admit(event.meta.timestamp_ns, SET_TIME_ALERT_WINDOW_NS) {
+            None => alerts.clear(),
+            Some(folded) if folded > 0 => {
+                // The one alert per window hides how many requests there were: say so.
+                for alert in &mut alerts {
+                    alert.message.push_str(&format!(
+                        " ({folded} more request(s) from this process since its last alert were not reported)"
+                    ));
+                }
+            }
+            Some(_) => {}
+        }
         alerts
     }
 
@@ -3175,6 +3599,17 @@ fn is_rotation_suffix(suffix: &str) -> bool {
 
 fn is_all_digits(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `event.protocol`'s IP protocol number, as a word for the LISTENER-DRIFT alert
+/// (issue #676) — `tcp`/`udp` for the two values every snapshot source reports
+/// today, the bare number for anything else rather than guessing a name.
+fn protocol_label(protocol: u8) -> std::borrow::Cow<'static, str> {
+    match protocol {
+        schema::IPPROTO_TCP => "tcp".into(),
+        schema::IPPROTO_UDP => "udp".into(),
+        other => other.to_string().into(),
+    }
 }
 
 /// Matches `/dev/fd/<n>` — `execveat(fd, "", AT_EMPTY_PATH)`'s `bprm->filename`

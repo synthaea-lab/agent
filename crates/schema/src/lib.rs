@@ -315,12 +315,30 @@ pub mod time;
 /// straight from 53 to 55 and left 54 unused.
 ///
 /// Bumped 55 → 56 for Windows minifilter explicit timestamp requests (#136). #995
-/// (`ListenPortEvent::protocol`) renumbered past the skipped 54 to 57, closer to
-/// merging than this one, so no collision there.
+/// (`ListenPortEvent::protocol`) had planned to renumber past the skipped 54 to 57.
 ///
 /// Bumped 56 → 57 for mounted raw-volume open telemetry (#136 slice 4), stacked on
-/// the timestomp slice above.
-pub const SCHEMA_VERSION: u32 = 57;
+/// the timestomp slice above — it merged first and took the 57 #995 was planning
+/// on, without #995 having pushed its own renumbering commit yet.
+///
+/// Bumped 57 → 58 for [`ListenPortEvent::protocol`] (#676 part 1): #136 slice 4
+/// merged first and took 57, which this had also claimed; 58 is the next free
+/// number above it.
+///
+/// Not bumped for the Windows UDP collector (#676 part 2, stacked on #995): no
+/// wire change — #995 already defined `ListenPortEvent::protocol`; this PR only
+/// fills it with the real value (6 or 17) instead of #995's TCP-only `6` (review
+/// of #1008).
+///
+/// Bumped 58 → 59 for [`ExecEvent::image_file_id`] (#688): the identity of the
+/// image file at exec time, so the T1204.002 signature gate can distinguish the
+/// image that ran from whatever the path contains when it is later verified.
+///
+/// Bumped 59 → 62 for [`Event::UnitStop`] (#1085): the stop of a security-tool systemd unit as an
+/// event of its own, replacing a `FileOpenEvent` carrying `FLAG_UNIT_STOPPED`. A raw `openat`
+/// flag can carry any bit, so an unprivileged open could set that one. 60 is claimed by #1114
+/// (`SignalEvent::signals_lost`) and 61 by #1116; whichever merges first renumbers the others.
+pub const SCHEMA_VERSION: u32 = 62;
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -460,13 +478,51 @@ pub const FLAG_APPLICATION_BLOCKED: u32 = 0x0100_0000;
 /// reasoning as [`FLAG_PERSISTENCE_ARTIFACT`]).
 pub const FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT: u32 = 0x0080_0000;
 
+/// Services of security tooling, lowercase, compared without a `.service` suffix. Product
+/// names are as the vendors' documentation gives them and were **not checked on a host**: a
+/// name that is wrong costs a missed stop, never a false alert. `auditd` is here although
+/// two Sigma rules name two forms of its stop: those match `mask --now` and `auditctl -e 0`,
+/// this matches the rest, and `mask --now auditd` raises both.
+///
+/// Left out on purpose: the Windows `EventLog` service (T1562.002, #800), the firewall
+/// services (T1562.004) and this agent's own service (stopped by its own package scripts on
+/// every upgrade, and unable to alert on its own stop).
+pub const SECURITY_SERVICES: &[&str] = &[
+    // Linux
+    "auditd",
+    "apparmor",
+    "falco",
+    "falco-bpf",
+    "falco-modern-bpf",
+    "osqueryd",
+    "wazuh-agent",
+    "ossec",
+    "clamav-daemon",
+    "clamd",
+    "suricata",
+    "snort",
+    "sysmon",
+    "mdatp",
+    "falcon-sensor",
+    "sentinelone",
+    // Windows
+    "windefend",
+    "wdnissvc",
+    "sense",
+    "sysmon64",
+    "securityhealthservice",
+    "csfalconservice",
+    "sentinelagent",
+    "cbdefense",
+];
+
 /// Every synthetic `FLAG_*` bit above, checked pairwise-disjoint at compile time.
 /// A new flag goes here in the same edit (a unit test fails if a `pub const
 /// FLAG_*` is missing). Lives next to the constants, not in a
 /// consumer's test: the first cut of [`FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT`]
 /// took `0x0200_0000`, already [`FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN`], and the
 /// hardcoded list in `rules`' collision test missed it (#399 review).
-const SYNTHETIC_FLAGS: [u32; 8] = [
+pub const SYNTHETIC_FLAGS: [u32; 8] = [
     FLAG_PERSISTENCE_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ARTIFACT,
     FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN,
@@ -632,6 +688,15 @@ pub struct ExecEvent {
     /// in the catalogue's `process_creation` category use it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub product_name: Option<String>,
+    /// Identity of the file the image ran from, captured by the sensor *at exec
+    /// time* (#688): `"{volume serial:016x}:{file id:032x}"`, opaque to consumers.
+    /// The enrichment worker verifies the file at `image_path` some time later; a
+    /// verdict only speaks for the image that ran when the file it verified has
+    /// this identity (a running image can be renamed on Windows and a signed copy
+    /// put at its path). Windows only; `None` when the sensor could not open the
+    /// image, and on every other platform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_file_id: Option<String>,
     /// Security-relevant environment variables present at exec time, `(name, value)`
     /// pairs (#363) — the dynamic-linker-hijack family: `LD_PRELOAD`,
     /// `LD_LIBRARY_PATH`, `LD_AUDIT` (the quieter sibling of `LD_PRELOAD`),
@@ -737,6 +802,11 @@ pub struct FileOpenEvent {
     /// Platform-native open/access flags (Linux `open(2)` flags, Windows create
     /// dispositions). Rules match primarily on `path`; flag interpretation is
     /// per-platform and documented by each sensor.
+    ///
+    /// The synthetic `FLAG_*` bits (see `SYNTHETIC_FLAGS`) are set only by userspace sensors
+    /// that build the event themselves. On Linux the probe's raw `open(2)` flags are masked
+    /// with `OPEN_FLAGS_MASK` (`sensor-linux`'s `normalize`) before they get here, because the kernel ignores unknown
+    /// bits and any local user could otherwise forge a synthetic bit (#1129).
     pub flags: u32,
 }
 
@@ -1585,6 +1655,22 @@ pub struct BitsJobEvent {
     pub hresult: Option<u32>,
 }
 
+/// The stop of a systemd unit of [`SECURITY_SERVICES`] (Linux journald `JOB_TYPE=stop`, #1085,
+/// T1562.001). `meta.comm` also carries the unit name, as for the unit start. The journal names
+/// no actor, so this says a stop happened, not who asked for it.
+///
+/// An event of its own, not a flag on a [`FileOpenEvent`]: that event's `flags` are the raw
+/// `open(2)` flags on Linux (unknown bits pass through `openat`), so any bit there can be set
+/// by an unprivileged open, as `O_TMPFILE` set the first cut of the signal-loss bit (#1114).
+/// Only the journal sensor builds this variant, from a record whose writer is the system
+/// manager, and no probe produces it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitStopEvent {
+    pub meta: EventMeta,
+    /// The unit as the journal names it (`auditd.service`).
+    pub unit: String,
+}
+
 /// UDP datagram sent — the primary signal for DNS-tunneling and C2-over-UDP detection.
 ///
 /// Emitted on EID 14 (`UDPSend` IPv4) of the Microsoft-Windows-Kernel-Network
@@ -1619,10 +1705,21 @@ pub struct UdpRecvEvent {
     pub size: u32,
 }
 
-/// A TCP socket found listening, from a periodic socket-table snapshot rather than a
-/// discrete `bind`/`listen()` syscall trace (Linux: `NETLINK_SOCK_DIAG`, issue #92 —
-/// a probe-free source that runs where eBPF/ETW cannot, or as a redundant cross-check
-/// alongside them).
+/// IP protocol number for TCP, the `IPPROTO_TCP` of `<netinet/in.h>` — shared so
+/// [`ListenPortEvent::protocol`]/[`NetworkFlowEvent::protocol`] callers across the
+/// agent and sensor crates stamp and compare the same value instead of each
+/// carrying its own `6` literal, where a typo would make a baseline key that
+/// silently never matches (issue #676 review).
+pub const IPPROTO_TCP: u8 = 6;
+
+/// IP protocol number for UDP, the `IPPROTO_UDP` of `<netinet/in.h>` — see
+/// [`IPPROTO_TCP`].
+pub const IPPROTO_UDP: u8 = 17;
+
+/// A TCP or UDP socket found bound/listening, from a periodic socket-table snapshot
+/// rather than a discrete `bind`/`listen()` syscall trace (Linux: `NETLINK_SOCK_DIAG`,
+/// issue #92 — a probe-free source that runs where eBPF/ETW cannot, or as a redundant
+/// cross-check alongside them).
 ///
 /// `meta.timestamp_ns` is when the snapshot was taken, not when the socket actually
 /// started listening — a snapshot can only observe "listening as of now", so a
@@ -1630,11 +1727,28 @@ pub struct UdpRecvEvent {
 /// cadence is a caller decision, not a schema concern). Detection value is in the
 /// series across snapshots (listen-port drift: a new port appearing that wasn't there
 /// last poll), not any single event in isolation.
+///
+/// `protocol` is the IP protocol number, same convention as [`NetworkFlowEvent::protocol`]
+/// (`IPPROTO_TCP` = 6, `IPPROTO_UDP` = 17, issue #676), and is part of every consumer's
+/// dedup/baseline key: a UDP listener and a TCP listener on the same port are different
+/// shapes, not a collision — `udp/53` and `tcp/53` are two different services with no
+/// reason to share a baseline entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenPortEvent {
     pub meta: EventMeta,
     pub local_addr: core::net::IpAddr,
     pub local_port: u16,
+    /// Defaults to `IPPROTO_TCP` on a record that predates this field (spooled
+    /// events, server storage, the ML corpus): every collector was TCP-only
+    /// before issue #676, so that's what an un-stamped record actually was.
+    #[serde(default = "default_listen_port_protocol")]
+    pub protocol: u8,
+}
+
+/// `IPPROTO_TCP` — the default for `ListenPortEvent::protocol` on a record from
+/// before this field existed.
+fn default_listen_port_protocol() -> u8 {
+    IPPROTO_TCP
 }
 
 /// Direction of TLS data flow.
@@ -2571,6 +2685,7 @@ pub enum Event {
     HttpSummary(HttpSummaryEvent),
     PackageChange(PackageChangeEvent),
     BitsJob(BitsJobEvent),
+    UnitStop(UnitStopEvent),
 }
 
 impl Event {
@@ -2640,6 +2755,7 @@ impl Event {
             Event::HttpSummary(e) => &e.meta,
             Event::PackageChange(e) => &e.meta,
             Event::BitsJob(e) => &e.meta,
+            Event::UnitStop(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.

@@ -78,7 +78,13 @@ fn seeded_rule_state() -> rules::RuleState {
                 entries
                     .iter()
                     .filter(|entry| entry.state == sensor_linux_netlink::SocketState::Listen)
-                    .map(|entry| (entry.local.ip(), entry.local.port())),
+                    .map(|entry| {
+                        (
+                            entry.local.ip(),
+                            entry.local.port(),
+                            sensor_linux_netlink::IPPROTO_TCP,
+                        )
+                    }), // sock_diag TCP dump only, today (issue #676)
             );
         }
         Err(e) => tracing::warn!(error = %e, "listen-port baseline: sock_diag snapshot failed"),
@@ -252,6 +258,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         content_dir,
         log_sources,
         deception,
+        detection,
         config_path,
     } = opts;
     // Kill-loudness (#71): must run before any other thread exists — the signal mask
@@ -271,6 +278,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // #319. Set before any sensor starts; the one alert `wire_run_pipeline` can raise
     // itself (UPLOAD-DISABLED) is the agent's own text, not an event's.
     pipeline.sink.alert_log().set_stderr_details(alert_details);
+    super::common::apply_detection(&pipeline.sink, detection);
     super::common::plant_canaries(
         &pipeline.sink,
         deception,
@@ -797,7 +805,8 @@ fn run_avc_worker<R, E: std::fmt::Display>(
 /// `sensor_linux_journal::UnitPersistenceTracker` (issue #93's other half) over
 /// the same stream, so a unit's first observed start lands as a
 /// `FLAG_PERSISTENCE_SYSTEMD_ARTIFACT` `FileOpenEvent` too — one tail thread,
-/// two independent mappings off the same classified record/event pair.
+/// independent mappings off the same classified record/event pair; the stop of a unit of
+/// `schema::SECURITY_SERVICES` lands as a `schema::UnitStopEvent` (#1085).
 ///
 /// Best-effort at startup: a non-systemd init (Alpine/OpenRC, see
 /// `watchdog::service::linux`'s own doc on this) has no `journalctl` at all —
@@ -857,6 +866,11 @@ fn spawn_journal_tail(
                         }
                         if let Some(persistence_event) = unit_persistence.observe(&record, &event) {
                             sink.on_event(persistence_event);
+                        }
+                        if let Some(stop_event) =
+                            sensor_linux_journal::to_unit_stop_event(&record, &event)
+                        {
+                            sink.on_event(stop_event);
                         }
                     }
                     Err(e) => {

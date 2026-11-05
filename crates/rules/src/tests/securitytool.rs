@@ -136,3 +136,33 @@ fn the_burst_rule_and_this_one_are_independent() {
     assert!(techniques.contains(&"T1562.001"), "{techniques:?}");
     assert!(techniques.contains(&"T1489"), "{techniques:?}");
 }
+
+#[test]
+fn an_open_carrying_the_old_unit_stopped_bit_raises_no_unit_stop_finding() {
+    // #1085: the unit stop used to travel as `FLAG_UNIT_STOPPED` (0x8000_0000) on a
+    // `FileOpenEvent`. A raw `openat` flag can carry any bit, so an unprivileged open could set
+    // it. The stop is now `Event::UnitStop`, and no open raises a T1562.001 finding, with the
+    // bit alone or on top of real `O_*` flags (`O_RDWR | O_CREAT | O_TMPFILE`).
+    const OLD_UNIT_STOPPED: u32 = 0x8000_0000;
+    const O_RDWR: u32 = 0x2;
+    const O_CREAT: u32 = 0x40;
+    const O_TMPFILE: u32 = 0x0041_0000;
+    let mut state = crate::RuleState::new();
+    for flags in [
+        OLD_UNIT_STOPPED,
+        OLD_UNIT_STOPPED | O_RDWR | O_CREAT | O_TMPFILE,
+    ] {
+        for path in ["auditd.service", "/tmp", "falco"] {
+            let event = file_open_event_full(4242, path, path, flags, 1_000);
+            let stateless = crate::evaluate_file_open(&event);
+            let stateful = state.on_file_open(&event);
+            assert!(
+                stateless
+                    .iter()
+                    .chain(stateful.iter())
+                    .all(|a| a.technique != "T1562.001"),
+                "open {path} flags {flags:#x} raised a T1562.001 finding",
+            );
+        }
+    }
+}

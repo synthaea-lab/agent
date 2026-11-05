@@ -59,12 +59,21 @@ fn seeded_rule_state() -> rules::RuleState {
     let mut rule_state = rules::RuleState::new();
     rule_state.seed_pid_comm(map);
     // LISTENER-DRIFT baseline (#366), same reasoning as the Linux/macOS
-    // seeding: every listener already up when the agent starts (RPC 135, SMB
-    // 445, vendor services) is the baseline, not a finding. Best-effort — a
-    // snapshot failure leaves the baseline empty rather than failing startup.
-    match sensor_windows_sockets::snapshot() {
+    // seeding: every listener/bound socket already up when the agent starts
+    // (RPC 135, SMB 445, vendor services, DNS client sockets) is the
+    // baseline, not a finding. Best-effort — a snapshot failure leaves the
+    // baseline empty rather than failing startup.
+    //
+    // TCP listeners and UDP sockets on a fixed port (#676): the UDP client
+    // sockets on ephemeral ports are left out by the sensor, the same filter
+    // the poller reads through, so the baseline and the polls agree.
+    match sensor_windows_sockets::snapshot_for_drift() {
         Ok(entries) => {
-            rule_state.seed_listen_ports(entries.iter().map(|e| (e.local.ip(), e.local.port())));
+            rule_state.seed_listen_ports(
+                entries
+                    .iter()
+                    .map(|e| (e.local.ip(), e.local.port(), e.protocol)),
+            );
         }
         Err(e) => tracing::warn!(error = %e, "socket snapshot for listener baseline failed"),
     }
@@ -92,11 +101,9 @@ fn spawn_socket_poller(
         .name("socket-poller".into())
         .spawn(move || {
             while !stop.load(Ordering::SeqCst) {
-                forward_socket_snapshot(
-                    sensor_windows_sockets::listen_port_events(schema::time::now_ns()),
-                    sink.as_ref(),
-                    heartbeat.as_ref(),
-                );
+                let events =
+                    sensor_windows_sockets::listen_port_events_for_drift(schema::time::now_ns());
+                forward_socket_snapshot(events, sink.as_ref(), heartbeat.as_ref());
                 // Sleep in short slices so Ctrl-C never waits a full interval.
                 let deadline = std::time::Instant::now() + SOCKET_POLL_INTERVAL;
                 while std::time::Instant::now() < deadline && !stop.load(Ordering::SeqCst) {
@@ -239,11 +246,11 @@ fn etw_failure_hint(error: &str) -> &'static str {
 fn run_windows_sensors(
     sink: Box<dyn EventSink>,
     silence: Option<&Mutex<SilenceMonitor>>,
-    redact_exec: bool,
+    redact_commands: bool,
 ) -> anyhow::Result<()> {
     // Run and both capture commands funnel through here, so this is the one
     // place credential redaction has to sit in front of (#440).
-    let sink = crate::redact::redacting(sink, redact_exec);
+    let sink = crate::redact::redacting(sink, redact_commands);
 
     let mut etw_sensor = sensor_windows::WindowsSensor::new(sensor_windows::EtwNames {
         session_prefix: config::identity::ETW_SESSION_PREFIX.to_string(),
@@ -481,6 +488,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
         content_dir,
         log_sources: _,
         deception,
+        detection,
         config_path: _,
     } = opts;
     let pipeline = super::common::wire_run_pipeline(
@@ -495,6 +503,7 @@ pub(crate) fn cmd_run(opts: super::RunOptions) -> anyhow::Result<()> {
     // #319. Set before any sensor starts; the one alert `wire_run_pipeline` can raise
     // itself (UPLOAD-DISABLED) is the agent's own text, not an event's.
     pipeline.sink.alert_log().set_stderr_details(alert_details);
+    super::common::apply_detection(&pipeline.sink, detection);
     super::common::plant_canaries(
         &pipeline.sink,
         deception,

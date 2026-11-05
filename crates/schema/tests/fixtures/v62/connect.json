@@ -1,0 +1,12 @@
+{
+  "type": "connect",
+  "meta": {
+    "pid": 4242,
+    "ppid": 1337,
+    "user": { "os": "unknown" },
+    "timestamp_ns": 1756900003000000000,
+    "comm": "beacon"
+  },
+  "daddr": "2001:db8::1337",
+  "dport": 8443
+}

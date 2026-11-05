@@ -1,0 +1,14 @@
+{
+  "type": "package_change",
+  "meta": {
+    "pid": 0,
+    "ppid": 0,
+    "user": { "os": "unknown" },
+    "timestamp_ns": 1756900020000000000,
+    "comm": "dpkg"
+  },
+  "package": "openssl",
+  "change": "upgraded",
+  "previous_version": "3.0.13-1",
+  "version": "3.0.15-1"
+}

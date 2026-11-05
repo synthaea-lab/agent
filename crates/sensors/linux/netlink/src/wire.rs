@@ -32,6 +32,7 @@ pub const NLM_F_DUMP: u16 = 0x100 | 0x200;
 pub const AF_INET: u8 = 2;
 pub const AF_INET6: u8 = 10;
 pub const IPPROTO_TCP: u8 = 6;
+pub const IPPROTO_UDP: u8 = 17;
 
 /// Bit position convention shared by the request's `states` mask and the
 /// response's `idiag_state` field: the TCP state's own numeric value (from
@@ -41,6 +42,10 @@ pub const IPPROTO_TCP: u8 = 6;
 /// that included it.
 pub const TCP_ESTABLISHED: u8 = 1;
 pub const TCP_LISTEN: u8 = 10;
+/// `TCP_CLOSE`: what `sock_diag` reports for an UDP socket that is bound but not
+/// `connect()`ed (a datagram server's usual shape); a connected UDP socket reports
+/// [`TCP_ESTABLISHED`]. The state numbering is TCP's even for UDP.
+pub const TCP_CLOSE: u8 = 7;
 
 /// Netlink message header, common to every message on the socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

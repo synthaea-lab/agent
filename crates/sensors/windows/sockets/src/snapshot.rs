@@ -7,11 +7,14 @@ use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
 };
 
+use schema::{IPPROTO_TCP, IPPROTO_UDP};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, INVALID_HANDLE_VALUE, NO_ERROR},
     NetworkManagement::IpHelper::{
-        GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID, MIB_TCPROW_OWNER_PID,
-        MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
+        GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
+        MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID,
+        MIB_UDP6TABLE_OWNER_PID, MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID,
+        TCP_TABLE_OWNER_PID_LISTENER, UDP_TABLE_OWNER_PID,
     },
     Networking::WinSock::{AF_INET, AF_INET6},
     System::Diagnostics::ToolHelp::{
@@ -21,8 +24,8 @@ use windows_sys::Win32::{
 };
 
 use crate::{
-    SocketsError,
-    raw::{ListenerEntry, ipv4_from_row, port_from_row},
+    Protocol, SocketsError,
+    raw::{ListenerEntry, ipv4_from_row, is_drift_relevant, port_from_row},
 };
 
 /// The table can grow between the sizing call and the fill call (a service
@@ -59,14 +62,64 @@ fn fetch_table(family: u16, label: &'static str) -> Result<Vec<u8>, SocketsError
             }
             ERROR_INSUFFICIENT_BUFFER => {}
             code => {
-                return Err(SocketsError::TcpTable {
+                return Err(SocketsError::Table {
+                    protocol: Protocol::Tcp,
                     family: label,
                     code,
                 });
             }
         }
     }
-    Err(SocketsError::TcpTable {
+    Err(SocketsError::Table {
+        protocol: Protocol::Tcp,
+        family: label,
+        code: ERROR_INSUFFICIENT_BUFFER,
+    })
+}
+
+/// Fetches one `GetExtendedUdpTable` table into an owned byte buffer. Unlike
+/// the TCP table there is no "listener" filter — `UDP_TABLE_OWNER_PID` returns
+/// every bound UDP endpoint, server and client alike (issue #676's noise
+/// problem; [`snapshot_for_drift`] is where the filter sits).
+fn fetch_udp_table(family: u16, label: &'static str) -> Result<Vec<u8>, SocketsError> {
+    let mut size: u32 = 0;
+    let mut buf: Vec<u8> = Vec::new();
+    for _ in 0..TABLE_FETCH_ATTEMPTS {
+        buf.resize(size as usize, 0);
+        let ptr = if buf.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            buf.as_mut_ptr().cast()
+        };
+        // SAFETY: `ptr` is null (sizing call) or points to `size` writable bytes
+        // owned by `buf`; `size` is a valid in/out pointer for the call.
+        let rc = unsafe {
+            GetExtendedUdpTable(
+                ptr,
+                &raw mut size,
+                0,
+                u32::from(family),
+                UDP_TABLE_OWNER_PID,
+                0,
+            )
+        };
+        match rc {
+            NO_ERROR => {
+                buf.truncate(size as usize);
+                return Ok(buf);
+            }
+            ERROR_INSUFFICIENT_BUFFER => {}
+            code => {
+                return Err(SocketsError::Table {
+                    protocol: Protocol::Udp,
+                    family: label,
+                    code,
+                });
+            }
+        }
+    }
+    Err(SocketsError::Table {
+        protocol: Protocol::Udp,
         family: label,
         code: ERROR_INSUFFICIENT_BUFFER,
     })
@@ -130,6 +183,40 @@ fn ipv6_listeners() -> Result<Vec<(u32, SocketAddr)>, SocketsError> {
     )
 }
 
+/// Every bound IPv4 UDP endpoint (not just "servers" — see [`fetch_udp_table`]).
+fn ipv4_udp_sockets() -> Result<Vec<(u32, SocketAddr)>, SocketsError> {
+    let buf = fetch_udp_table(AF_INET, "IPv4")?;
+    Ok(
+        rows::<MIB_UDPROW_OWNER_PID>(&buf, offset_of!(MIB_UDPTABLE_OWNER_PID, table))
+            .into_iter()
+            .map(|row| {
+                let addr = SocketAddr::new(
+                    IpAddr::V4(ipv4_from_row(row.dwLocalAddr)),
+                    port_from_row(row.dwLocalPort),
+                );
+                (row.dwOwningPid, addr)
+            })
+            .collect(),
+    )
+}
+
+/// Every bound IPv6 UDP endpoint (not just "servers" — see [`fetch_udp_table`]).
+fn ipv6_udp_sockets() -> Result<Vec<(u32, SocketAddr)>, SocketsError> {
+    let buf = fetch_udp_table(AF_INET6, "IPv6")?;
+    Ok(
+        rows::<MIB_UDP6ROW_OWNER_PID>(&buf, offset_of!(MIB_UDP6TABLE_OWNER_PID, table))
+            .into_iter()
+            .map(|row| {
+                let addr = SocketAddr::new(
+                    IpAddr::V6(Ipv6Addr::from(row.ucLocalAddr)),
+                    port_from_row(row.dwLocalPort),
+                );
+                (row.dwOwningPid, addr)
+            })
+            .collect(),
+    )
+}
+
 /// pid → (ppid, executable name) from one `Toolhelp32` snapshot. Empty on
 /// failure: listeners then keep their pid and lose only the enrichment.
 fn process_table() -> HashMap<u32, (u32, String)> {
@@ -169,41 +256,106 @@ fn process_table() -> HashMap<u32, (u32, String)> {
     out
 }
 
-/// Takes one snapshot of every listening TCP socket, IPv4 and IPv6.
-///
-/// A socket bound to both families appears once per family — they are distinct
-/// kernel objects, and LISTENER-DRIFT keys on the address anyway.
-///
-/// # Errors
-///
-/// [`SocketsError::TcpTable`] when either family's table cannot be read. The
-/// process snapshot failing is not an error (see [`ListenerEntry`]).
-pub fn snapshot() -> Result<Vec<ListenerEntry>, SocketsError> {
-    let mut sockets = ipv4_listeners()?;
-    sockets.extend(ipv6_listeners()?);
-    let processes = process_table();
-    Ok(sockets
+/// Attributes `(pid, local)` to its owner from `processes`, a prior
+/// [`process_table`] call.
+fn attribute(
+    processes: &HashMap<u32, (u32, String)>,
+    (pid, local): (u32, SocketAddr),
+    protocol: u8,
+) -> ListenerEntry {
+    let owner = processes.get(&pid);
+    ListenerEntry {
+        pid,
+        ppid: owner.map(|(ppid, _)| *ppid),
+        process_name: owner.map(|(_, name)| name.clone()),
+        local,
+        protocol,
+    }
+}
+
+/// Every listening TCP socket, IPv4 and IPv6, attributed to its owner.
+fn tcp_listeners(
+    processes: &HashMap<u32, (u32, String)>,
+) -> Result<Vec<ListenerEntry>, SocketsError> {
+    let mut tcp = ipv4_listeners()?;
+    tcp.extend(ipv6_listeners()?);
+    Ok(tcp
         .into_iter()
-        .map(|(pid, local)| {
-            let owner = processes.get(&pid);
-            ListenerEntry {
-                pid,
-                ppid: owner.map(|(ppid, _)| *ppid),
-                process_name: owner.map(|(_, name)| name.clone()),
-                local,
-            }
-        })
+        .map(|e| attribute(processes, e, IPPROTO_TCP))
         .collect())
 }
 
-/// One [`snapshot`] mapped to [`schema::Event::ListenPort`] events, stamped
-/// with `timestamp_ns` as the snapshot time.
+/// Every bound UDP socket, IPv4 and IPv6, attributed to its owner. Best-effort:
+/// a UDP table failure is logged and read as no UDP entries, so it never
+/// discards the TCP listeners of the same snapshot (review of #1008: the
+/// startup baseline going empty because IPv6 UDP errored would alert on every
+/// pre-existing TCP listener on the first poll).
+fn udp_sockets(processes: &HashMap<u32, (u32, String)>) -> Vec<ListenerEntry> {
+    let mut udp = ipv4_udp_sockets().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "IPv4 UDP socket table unavailable, continuing without it");
+        Vec::new()
+    });
+    udp.extend(ipv6_udp_sockets().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "IPv6 UDP socket table unavailable, continuing without it");
+        Vec::new()
+    }));
+    udp.into_iter()
+        .map(|e| attribute(processes, e, IPPROTO_UDP))
+        .collect()
+}
+
+/// Takes one snapshot of every listening TCP socket and every bound UDP
+/// socket, IPv4 and IPv6, unfiltered.
+///
+/// A socket bound to both families appears once per family: they are distinct
+/// kernel objects, and LISTENER-DRIFT keys on the address and protocol anyway.
+///
+/// The UDP table has no "listener" filter: every bound UDP endpoint comes back,
+/// DNS client sockets, QUIC/browser and media sockets on ephemeral ports
+/// included. The agent reads [`snapshot_for_drift`], which drops those; this
+/// is the raw table, for tests and diagnostics.
 ///
 /// # Errors
 ///
-/// Same failure mode as [`snapshot`], which this wraps.
-pub fn listen_port_events(timestamp_ns: u64) -> Result<Vec<schema::Event>, SocketsError> {
-    Ok(snapshot()?
+/// [`SocketsError::Table`] when either TCP table (IPv4 or IPv6) cannot be
+/// read. A UDP table failure is logged and read as no UDP entries instead,
+/// and a failed process snapshot leaves entries unattributed (see
+/// [`ListenerEntry`]).
+pub fn snapshot() -> Result<Vec<ListenerEntry>, SocketsError> {
+    let processes = process_table();
+    let mut entries = tcp_listeners(&processes)?;
+    entries.extend(udp_sockets(&processes));
+    Ok(entries)
+}
+
+/// [`snapshot`] with the client sockets taken out: every TCP listener, and
+/// the UDP sockets bound outside the ephemeral port range
+/// ([`crate::raw::is_drift_relevant`], issue #676). What the agent seeds the
+/// LISTENER-DRIFT baseline from and polls.
+///
+/// # Errors
+///
+/// Same failure mode as [`snapshot`].
+pub fn snapshot_for_drift() -> Result<Vec<ListenerEntry>, SocketsError> {
+    let mut entries = snapshot()?;
+    let before = entries.len();
+    entries.retain(is_drift_relevant);
+    tracing::debug!(
+        kept = entries.len(),
+        ephemeral_udp_dropped = before - entries.len(),
+        "socket snapshot filtered for listener drift"
+    );
+    Ok(entries)
+}
+
+/// One [`snapshot_for_drift`] mapped to [`schema::Event::ListenPort`] events,
+/// stamped with `timestamp_ns` as the snapshot time.
+///
+/// # Errors
+///
+/// Same failure mode as [`snapshot_for_drift`], which this wraps.
+pub fn listen_port_events_for_drift(timestamp_ns: u64) -> Result<Vec<schema::Event>, SocketsError> {
+    Ok(snapshot_for_drift()?
         .iter()
         .map(|entry| crate::normalize::listen_port_event(entry, timestamp_ns))
         .collect())

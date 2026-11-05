@@ -293,19 +293,7 @@ fn record_detection(
     let now_ns = event.meta().timestamp_ns;
     // Rules and Sigma have already evaluated the raw event/message. Redact only
     // the copy that enters the verdict, alert log, and durable detection spool.
-    let safe_message = if let Some(Event::Exec(exec)) = std::iter::once(event)
-        .chain(evidence.iter())
-        .find(|e| matches!(e, Event::Exec(_)))
-    {
-        let mut safe_exec = Event::Exec(exec.clone());
-        crate::redact::redact_event(&mut safe_exec);
-        let Event::Exec(safe_exec) = safe_exec else {
-            unreachable!()
-        };
-        redact_detection_message(&exec.cmdline, &safe_exec.cmdline, finding.message)
-    } else {
-        finding.message.to_owned()
-    };
+    let safe_message = safe_detection_message(event, &evidence, finding.message);
     let mut safe_events: Vec<Event> = std::iter::once(event.clone()).chain(evidence).collect();
     for event in &mut safe_events {
         crate::redact::redact_event(event);
@@ -335,6 +323,28 @@ fn record_detection(
         persist(detection);
     }
     result
+}
+
+/// A detection's message as it may leave the process: the command text a rule quoted from
+/// the event (an Exec command line, an AMSI excerpt, #895) swapped for its redacted copy.
+fn safe_detection_message(event: &Event, evidence: &[Event], message: &str) -> String {
+    let mut related = std::iter::once(event).chain(evidence.iter());
+    let Some(source) = related.find(|e| matches!(e, Event::Exec(_) | Event::AmsiContent(_))) else {
+        return message.to_owned();
+    };
+    let mut safe = source.clone();
+    crate::redact::redact_event(&mut safe);
+    match (source, &safe) {
+        (Event::Exec(raw), Event::Exec(safe)) => {
+            redact_detection_message(&raw.cmdline, &safe.cmdline, message)
+        }
+        (Event::AmsiContent(raw), Event::AmsiContent(safe)) => redact_detection_message(
+            &rules::amsi_excerpt(raw.text.as_deref()),
+            &rules::amsi_excerpt(safe.text.as_deref()),
+            message,
+        ),
+        _ => message.to_owned(),
+    }
 }
 
 fn redact_detection_message(raw_cmdline: &str, safe_cmdline: &str, message: &str) -> String {
@@ -995,6 +1005,35 @@ impl DetectionSink {
         let _ = self.tripwires.set(tripwires);
     }
 
+    /// Tells the rules the host's UTC offset in minutes (#376); false when it is not a real one.
+    pub(crate) fn set_local_utc_offset_minutes(&self, minutes: i32) -> bool {
+        self.rule_state
+            .lock()
+            .unwrap()
+            .set_local_utc_offset_minutes(minutes)
+    }
+
+    /// Declares the ordinary local hours (#1089); false when they are not a window.
+    pub(crate) fn set_work_hours(&self, start: u32, end: u32) -> bool {
+        self.rule_state.lock().unwrap().set_work_hours(start, end)
+    }
+
+    /// Declares the accounts whose odd-hour logons are expected (#1089).
+    pub(crate) fn set_odd_hour_exempt_accounts(&self, accounts: &[String]) -> usize {
+        self.rule_state
+            .lock()
+            .unwrap()
+            .set_odd_hour_exempt_accounts(accounts)
+    }
+
+    /// Gives the rules the platform's time zone (#1088); false when it has no answer for `now_secs`.
+    pub(crate) fn set_local_zone(&self, zone: rules::LocalOffsetAt, now_secs: i64) -> bool {
+        self.rule_state
+            .lock()
+            .unwrap()
+            .set_local_zone(zone, now_secs)
+    }
+
     /// Installs the executables allowed to touch a canary (#81). Called once, with the
     /// tripwires.
     pub(crate) fn set_canary_allow(&self, allow: crate::deception::CanaryAllow) {
@@ -1485,6 +1524,8 @@ impl DetectionSink {
         }
         self.record_rule_alerts(wrapped, rules::evaluate_exec(event));
         self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_exec(event));
+        // This exec moved the stream clock: identity requests waiting for it may be due (#1041).
+        self.record_due_identity_alerts(self.rule_state.lock().unwrap().take_due_identity_alerts());
         let sigma_guard = self.sigma.lock().unwrap();
         if let Some(sigma) = sigma_guard.as_ref() {
             let entity = entity_key(&event.meta);
@@ -1643,6 +1684,21 @@ impl DetectionSink {
     /// `Signal` events: security-process tampering (T1562.001, issue #362).
     fn detect_signal(&self, wrapped: &Event, event: &schema::SignalEvent) {
         self.record_rule_alerts(wrapped, rules::evaluate_signal(event));
+    }
+
+    /// `IdentityChange` events (Linux, #266): SETUID-ROOT-REQUEST (T1548.001, #1041). A request
+    /// is judged once its process's exec has had time to arrive, so the alerts returned here are
+    /// those of earlier events, each attributed to its own.
+    fn detect_identity_change(&self, event: &schema::IdentityChangeEvent) {
+        let due = self.rule_state.lock().unwrap().on_identity_change(event);
+        self.record_due_identity_alerts(due);
+    }
+
+    /// Records the identity-request alerts that came due, each against the event it is about.
+    fn record_due_identity_alerts(&self, due: Vec<(schema::IdentityChangeEvent, rules::Alert)>) {
+        for (event, alert) in due {
+            self.record_rule_alerts(&Event::IdentityChange(event), [alert]);
+        }
     }
 
     /// `FileRename` events: mass-rename ransomware detection (T1486, issue #262) +
@@ -2338,13 +2394,16 @@ impl EventSink for DetectionSink {
             Event::ListenPort(e) => self.detect_listen_port(&event, e),
             Event::Auth(e) => self.detect_auth(&event, e),
             Event::Session(e) => self.detect_session(&event, e),
+            Event::IdentityChange(e) => self.detect_identity_change(e),
             Event::FileDelete(e) => self.detect_file_delete(&event, e),
             Event::Signal(e) => self.detect_signal(&event, e),
             Event::FileQuarantine(e) => self.detect_file_quarantine(e),
             Event::BitsJob(e) => self.detect_bits_job(e),
             Event::FileRename(e) => self.detect_file_rename(&event, e),
             Event::FileSetTime(e) => {
-                self.record_rule_alerts(&event, rules::evaluate_file_set_time(e));
+                // Bound first: `record_rule_alerts` takes the lock again.
+                let alerts = self.rule_state.lock().unwrap().on_file_set_time(e);
+                self.record_rule_alerts(&event, alerts);
             }
             Event::RawVolumeOpen(e) => {
                 self.record_rule_alerts(&event, rules::evaluate_raw_volume_open(e));
@@ -2748,6 +2807,56 @@ mod tests {
                 .contains("base64 -d --password=REDACTED")),
             "{detections:?}"
         );
+        for queued in &detections {
+            let serialized = serde_json::to_string(&queued.detection).unwrap();
+            assert!(!serialized.contains("S3cret"), "{serialized}");
+        }
+    }
+
+    /// #895: the AMSI rule reads the raw buffer and quotes an excerpt of it in its message;
+    /// the alert log, the detection spool and `events.jsonl` get the redacted excerpt.
+    #[test]
+    fn amsi_rules_see_the_raw_buffer_but_alert_and_event_outputs_are_redacted() {
+        let dir = tmp("amsi-redaction-e2e");
+        let spool = Arc::new(Mutex::new(
+            store::EventSpool::open(&dir.join("detection-spool"), u64::MAX).unwrap(),
+        ));
+        let sink = Arc::new(
+            DetectionSink::new(
+                rules::RuleState::new(),
+                &dir.join("alerts.ndjson"),
+                Some(&dir.join("events.jsonl")),
+                None,
+                Some(Arc::clone(&spool)),
+                &dir.join("content"),
+                &dir.join("ml-registry"),
+            )
+            .unwrap(),
+        );
+        let amsi = schema::AmsiContentEvent {
+            app_name: "PowerShell_C:\\Windows\\powershell.exe_10.0".into(),
+            text: Some("New-LocalUser -Name svc -Password 'S3cret'".into()),
+            // AMSI_RESULT_DETECTED: the provider-verdict rule fires whatever the text says.
+            scan_result: 32768,
+            ..schema::fixtures::amsi_content()
+        };
+        let raw_alerts = rules::evaluate_amsi_content(&amsi);
+        assert!(
+            raw_alerts.iter().any(|a| a.message.contains("S3cret")),
+            "the rule quotes the raw buffer: {raw_alerts:?}"
+        );
+        sink.on_event(Event::AmsiContent(amsi));
+        assert!(sink.enrich_queue.flush(std::time::Duration::from_secs(2)));
+
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("-Password 'REDACTED'"), "{alerts}");
+        assert!(!alerts.contains("S3cret"), "{alerts}");
+        let events = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        assert!(events.contains("-Password 'REDACTED'"), "{events}");
+        assert!(!events.contains("S3cret"), "{events}");
+        let detections: Vec<transport::QueuedDetection> =
+            spool.lock().unwrap().drain_oldest().unwrap();
+        assert!(!detections.is_empty());
         for queued in &detections {
             let serialized = serde_json::to_string(&queued.detection).unwrap();
             assert!(!serialized.contains("S3cret"), "{serialized}");
@@ -5270,12 +5379,23 @@ rule reload_content_test_marker {
     /// A download-provenance mark on `image`, then `image` run inside the
     /// window, then the enrichment worker drained (#441).
     fn mark_then_run(sink: &DetectionSink, image: &str) {
+        // What the Windows sensor records at exec (#688): the file the image started from.
+        mark_then_run_as(
+            sink,
+            image,
+            enrich::path_identity(std::path::Path::new(image)),
+        );
+    }
+
+    /// [`mark_then_run`] with the identity the sensor recorded given explicitly.
+    fn mark_then_run_as(sink: &DetectionSink, image: &str, ran: Option<String>) {
         sink.on_event(Event::FileQuarantine(schema::FileQuarantineEvent {
             path: image.into(),
             ..schema::fixtures::file_quarantine()
         }));
         sink.on_event(Event::Exec(schema::ExecEvent {
             image_path: image.into(),
+            image_file_id: ran,
             ..schema::fixtures::exec()
         }));
         assert!(
@@ -5791,6 +5911,46 @@ rule reload_content_test_marker {
         mark_then_run(&sink, image);
         let alerts = alerts_in(&dir);
         assert!(!alerts.contains("T1204.002"), "{alerts}");
+    }
+
+    /// #688: the identity the ETW sensor records and the one enrichment reads are the same
+    /// token for the same file; the gate compares them as strings, so a format drift between
+    /// the two crates (they share no code) would silently turn every gated alert on.
+    #[cfg(windows)]
+    #[test]
+    fn the_sensor_and_enrichment_agree_on_a_files_identity() {
+        let exe = std::env::current_exe().unwrap();
+        let sensor = sensor_windows::image_file_id(&exe);
+        assert!(sensor.is_some(), "an ordinary file has an identity");
+        assert_eq!(sensor, enrich::path_identity(&exe));
+    }
+
+    /// #688: the image that ran was moved aside and a signed file took its path before the
+    /// worker opened it. The verdict is `Valid`, for a file that is not the image that ran.
+    #[cfg(windows)]
+    #[test]
+    fn a_valid_signature_of_a_file_that_is_not_the_image_that_ran_still_alerts() {
+        let image = r"C:\Windows\System32\notepad.exe";
+        if !std::path::Path::new(image).exists() {
+            eprintln!("skipping: {image} not present on this host");
+            return;
+        }
+        let dir = tmp("gate-swapped");
+        let decoy_run = dir.join("dropper.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &decoy_run).unwrap();
+        let sink = sink_in(&dir);
+        // The sensor saw the dropper start; the path now holds notepad.exe.
+        let ran = enrich::path_identity(&decoy_run);
+        assert!(ran.is_some());
+        mark_then_run_as(&sink, image, ran);
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("T1204.002"), "{alerts}");
+        assert!(
+            alerts.contains("file differs from the image that ran"),
+            "{alerts}"
+        );
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// #655 review: a signed file runs once (its `Valid` verdict cached), then an
