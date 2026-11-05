@@ -4,16 +4,6 @@
 
 use std::net::SocketAddr;
 
-/// `IPPROTO_TCP`, mirroring `sensor-linux-netlink::wire::IPPROTO_TCP` — no
-/// shared `schema` constant yet (#676 part 2 review). Only `snapshot` (Windows
-/// only) uses these; on other targets they are dead code, not merely unused —
-/// the module that would use them does not compile there at all.
-#[cfg(windows)]
-pub(crate) const IPPROTO_TCP: u8 = 6;
-/// `IPPROTO_UDP`.
-#[cfg(windows)]
-pub(crate) const IPPROTO_UDP: u8 = 17;
-
 /// One listening TCP or bound UDP socket from a snapshot. The IP Helper table
 /// attributes the socket to its owning pid; `ppid` and `process_name` come from
 /// the process snapshot taken alongside it and are `None` when that process was
@@ -29,6 +19,36 @@ pub struct ListenerEntry {
     /// `IPPROTO_TCP` (6) or `IPPROTO_UDP` (17) — which IP Helper table this
     /// entry came from (issue #676).
     pub protocol: u8,
+}
+
+/// The default Windows dynamic (ephemeral) port range, 49152-65535, the same for
+/// UDP and TCP on IPv4 and IPv6 since Vista (`netsh int ipv4 show dynamicport udp`
+/// prints `start 49152, 16384 ports` on an untouched host; measured on the
+/// Windows 11 dev host of the #676 capture).
+///
+/// Fixed rather than read from the host: no documented API returns the range,
+/// and getting it wrong only moves noise, never blindness. An administrator who
+/// moves the range down (say to 10000) makes client sockets in 10000-49151 look
+/// like services, so they reach LISTENER-DRIFT: noise. A socket at 49152 or above
+/// is dropped whatever the host's setting.
+pub const EPHEMERAL_UDP_PORTS: core::ops::RangeInclusive<u16> = 49152..=65535;
+
+/// Whether `entry` is a socket LISTENER-DRIFT should see (issue #676).
+///
+/// Every TCP entry is: the TCP table is already filtered to listeners. A UDP
+/// entry is kept only when its port is outside [`EPHEMERAL_UDP_PORTS`].
+/// `GetExtendedUdpTable` lists every bound UDP endpoint, client sockets
+/// included, and on the capture host the ephemeral ones were the bulk of the
+/// table. They were also long-lived (bound for the whole capture), so "still
+/// bound on the next poll" does not separate them from a service. A service
+/// a client must find has a fixed port, and fixed ports sit below the range.
+///
+/// The cost, stated in `docs/sensors/windows.md`: a UDP listener that binds
+/// a port in the ephemeral range on purpose is invisible to LISTENER-DRIFT. Its
+/// traffic still reaches the ETW network stream.
+#[must_use]
+pub fn is_drift_relevant(entry: &ListenerEntry) -> bool {
+    entry.protocol != schema::IPPROTO_UDP || !EPHEMERAL_UDP_PORTS.contains(&entry.local.port())
 }
 
 /// `dwLocalAddr` holds the IPv4 address in network byte order, as stored in
@@ -69,6 +89,37 @@ mod tests {
     fn port_decodes_from_network_order_low_bytes() {
         // 445 = 0x01BD, stored big-endian in the first two bytes.
         assert_eq!(port_from_row(row_u32([0x01, 0xBD, 0, 0])), 445);
+    }
+
+    fn udp(port: u16) -> ListenerEntry {
+        ListenerEntry {
+            pid: 4,
+            ppid: None,
+            process_name: None,
+            local: SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port),
+            protocol: schema::IPPROTO_UDP,
+        }
+    }
+
+    #[test]
+    fn a_udp_socket_on_a_fixed_port_reaches_listener_drift() {
+        for port in [53, 123, 5353, 49151] {
+            assert!(is_drift_relevant(&udp(port)), "udp/{port}");
+        }
+    }
+
+    #[test]
+    fn a_udp_socket_on_an_ephemeral_port_is_a_client_not_a_listener() {
+        for port in [49152, 56346, 65535] {
+            assert!(!is_drift_relevant(&udp(port)), "udp/{port}");
+        }
+    }
+
+    #[test]
+    fn a_tcp_listener_on_an_ephemeral_port_still_reaches_listener_drift() {
+        let mut entry = udp(56346);
+        entry.protocol = schema::IPPROTO_TCP;
+        assert!(is_drift_relevant(&entry));
     }
 
     #[test]
