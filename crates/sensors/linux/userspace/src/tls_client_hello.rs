@@ -43,8 +43,8 @@ pub(crate) struct ClientHello {
     /// client chooses it, so it is made safe to carry rather than dropped: at most
     /// [`MAX_SNI_LEN`] bytes are read, and every character that is not printable ASCII (a byte
     /// that is not UTF-8, a control character, a space, a non-ASCII letter) becomes U+FFFD.
-    /// `None` when there is no such extension or its host name is empty; the JA4 still records
-    /// that the extension existed.
+    /// `None` when there is no such extension, it is malformed, or its host name is empty; the
+    /// JA4 still records that the extension existed.
     pub(crate) sni: Option<String>,
     /// The JA4 fingerprint, e.g. `t13d1516h2_8daaf6152771_e5627efa2ab1`. `None` when an
     /// extension it reads (`supported_versions`, `signature_algorithms`, ALPN) is malformed:
@@ -53,6 +53,7 @@ pub(crate) struct ClientHello {
 }
 
 /// The `ClientHello` that `payload` starts with, or `None` when `payload` is not a complete one.
+/// A complete one is returned even when neither its SNI nor its JA4 could be read.
 ///
 /// `payload` is the TCP payload from its first byte: a TLS record (type 22) carrying a
 /// handshake message of type 1 whose version fields are TLS's (a record major version of 3,
@@ -108,11 +109,14 @@ pub(crate) fn parse(payload: &[u8]) -> Option<ClientHello> {
     // Every other field rejects bytes nobody accounts for; so does the end of the hello.
     body.is_empty().then_some(())?;
 
-    // A malformed `server_name` makes the whole hello malformed. A malformed extension that only
-    // the fingerprint reads costs the fingerprint, not the SNI. With neither, nothing is reported.
-    let sni = sni(&extensions)?;
+    // A malformed extension costs what reads it and nothing else. A malformed `server_name` costs
+    // the SNI, not the JA4, which only needs the extension to be there: a client that talks to its
+    // own server can send any `server_name` it likes, and must not leave no fingerprint by doing
+    // so. A malformed extension the fingerprint reads costs the JA4, not the SNI. A well-framed
+    // hello is reported even with neither, so the capture can count a hello it could not read.
+    let sni = sni(&extensions).flatten();
     let ja4 = ja4(legacy_version, &ciphers, &extensions);
-    (sni.is_some() || ja4.is_some()).then_some(ClientHello { sni, ja4 })
+    Some(ClientHello { sni, ja4 })
 }
 
 /// Every extension of the hello, in the order sent, with its payload.
@@ -252,10 +256,13 @@ fn alpn(data: Option<&[u8]>) -> Option<String> {
     })
 }
 
-/// `protocol` is not empty. Its first and last bytes when both are ASCII letters or digits;
-/// otherwise the first and last character of its lowercase hex form (`0xAB 0xCD` -> `ad`).
+/// The first and last bytes of `protocol` when both are ASCII letters or digits; otherwise the
+/// first and last character of its lowercase hex form (`0xAB 0xCD` -> `ad`). An empty protocol
+/// gives `00`, as an absent one does.
 fn alpn_chars(protocol: &[u8]) -> [char; 2] {
-    let (first, last) = (protocol[0], protocol[protocol.len() - 1]);
+    let (Some(&first), Some(&last)) = (protocol.first(), protocol.last()) else {
+        return ['0', '0'];
+    };
     if first.is_ascii_alphanumeric() && last.is_ascii_alphanumeric() {
         return [char::from(first), char::from(last)];
     }
@@ -809,15 +816,20 @@ mod tests {
         client_hello_raw(0x0303, &[0x002f], &[(kind, data.to_vec())])
     }
 
+    /// The well-formed payload gives a JA4; each malformed one gives none, and the hello is
+    /// still reported (it is well framed, only one extension is not).
     fn assert_rejects(kind: u16, well_formed: &[u8], malformed: &[&[u8]]) {
         assert!(
-            parse(&with_extension(kind, well_formed)).is_some(),
-            "the well-formed payload must parse"
+            parse(&with_extension(kind, well_formed)).is_some_and(|hello| hello.ja4.is_some()),
+            "the well-formed payload must be fingerprinted"
         );
         for data in malformed {
             assert_eq!(
                 parse(&with_extension(kind, data)),
-                None,
+                Some(ClientHello {
+                    sni: None,
+                    ja4: None
+                }),
                 "{kind:#06x} payload {data:02x?}"
             );
         }
@@ -868,20 +880,43 @@ mod tests {
         );
     }
 
+    /// A client talking to its own server can send a malformed `server_name` that server accepts:
+    /// it costs the SNI, never the fingerprint, which only records that the extension is there.
     #[test]
-    fn a_malformed_server_name_is_not_fingerprinted() {
+    fn a_malformed_server_name_costs_the_sni_not_the_fingerprint() {
         let mut well_formed = vec![0, 14, 0, 0, 11];
         well_formed.extend(b"example.com");
-        assert_rejects(
-            EXT_SERVER_NAME,
-            &well_formed,
-            &[
-                &[0, 99, 0, 0, 1, b'a'],      // list longer than the extension
-                &[0, 4, 0, 0, 1, b'a', 0xff], // a byte after the list
-                &[0, 4, 0, 0, 9, b'a'],       // a name that overruns the list
-                &[0, 6, 0, 0, 1, b'a', 0, 0], // a second entry cut short
-            ],
+        let reference = parse(&with_extension(EXT_SERVER_NAME, &well_formed))
+            .expect("the well-formed payload must parse");
+        assert_eq!(reference.sni.as_deref(), Some("example.com"));
+        assert!(
+            reference
+                .ja4
+                .as_deref()
+                .is_some_and(|ja4| ja4.starts_with("t12d"))
         );
+        let malformed: [&[u8]; 4] = [
+            &[0, 99, 0, 0, 1, b'a'],      // list longer than the extension
+            &[0, 4, 0, 0, 1, b'a', 0xff], // a byte after the list
+            &[0, 4, 0, 0, 9, b'a'],       // a name that overruns the list
+            &[0, 6, 0, 0, 1, b'a', 0, 0], // a second entry cut short
+        ];
+        for data in malformed {
+            assert_eq!(
+                parse(&with_extension(EXT_SERVER_NAME, data)),
+                Some(ClientHello {
+                    sni: None,
+                    ja4: reference.ja4.clone()
+                }),
+                "payload {data:02x?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_alpn_protocol_gives_00_on_its_own() {
+        assert_eq!(alpn_chars(&[]), ['0', '0']);
+        assert_eq!(alpn_chars(b"h2"), ['h', '2']);
     }
 
     #[test]
