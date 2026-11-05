@@ -225,7 +225,6 @@ const _: () = {
         schema::FLAG_PERSISTENCE_BTM_ARTIFACT,
         schema::FLAG_APPLICATION_BLOCKED,
         schema::FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT,
-        schema::FLAG_UNIT_STOPPED,
     ];
     let mut i = 0;
     while i < synthetic.len() {
@@ -1100,7 +1099,6 @@ mod tests {
             schema::FLAG_PERSISTENCE_BTM_ARTIFACT,
             schema::FLAG_APPLICATION_BLOCKED,
             schema::FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT,
-            schema::FLAG_UNIT_STOPPED,
         ] {
             assert_eq!(open(synthetic | 0o2), 0o2, "{synthetic:#010x}");
         }

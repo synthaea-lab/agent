@@ -144,6 +144,8 @@ serde_json = "1"
 # crate that reads a TOML-shaped input.
 toml = "1.1"
 thiserror = "2"
+# SHA-256, shared by the updater (manifest digests) and sensor-linux (JA4 hashes): one version.
+sha2 = "0.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Async runtime for the local IPC server (crates/ipc, issue #26). Features

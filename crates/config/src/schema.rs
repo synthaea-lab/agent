@@ -81,7 +81,36 @@ pub struct DetectionConfig {
     /// the year, or change it when the clocks do. Absent by default.
     #[serde(default)]
     pub utc_offset_minutes: Option<i32>,
+    /// The local hours `[start, end)` in which a logon is ordinary, for ODD-HOUR-LOGON (#1089):
+    /// `[7, 20]` is the default. `start` is 0 to 23, `end` 1 to 24, and they differ. `start`
+    /// greater than `end` is an overnight window (`[22, 6]` is a night shift: 22:00 to 06:00
+    /// is ordinary and the day is not). Absent by default.
+    #[serde(default)]
+    pub work_hours: Option<[u32; 2]>,
+    /// Accounts whose odd-hour logons are expected, for ODD-HOUR-LOGON (#1089): on-call staff,
+    /// and the service or batch account of a schedule. Each entry is `NAME` or `NAME|SID`.
+    /// `NAME` is matched against the account **as the logon reports it**, case aside. The
+    /// Windows logon event (4624) reports the bare `TargetUserName` with no domain, so a bare
+    /// entry such as `svc_backup` exempts **any** account of that name on that host, including a
+    /// local one an intruder with local admin creates under it; the name is the one thing the
+    /// intruder chooses. A `CORP\svc_backup` entry matches only an event that reports exactly
+    /// that string, which no sensor does for a logon today, and a UPN (`svc_backup@corp.com`)
+    /// or `corp/svc_backup` is another string that a bare entry does not match.
+    /// `NAME|SID` binds the entry to the account's SID, which the Windows event carries and an
+    /// intruder cannot choose: `svc_backup|S-1-5-21-1111-2222-3333-1004` exempts that account
+    /// only, `svc_backup|S-1-5-21-1111-2222-3333-*` any account of that name under that domain
+    /// (or machine) SID prefix. A prefix entry exempts any account of that name that the
+    /// prefix's authority can create: a local admin can still create a look-alike under a
+    /// machine prefix, and anyone who can create domain accounts under a domain prefix. Prefer
+    /// the exact SID. An event with no SID (Linux and macOS logons) is not exempt
+    /// under such an entry. Only the odd-hour rule skips them: FIRST-SEEN-LOGON still reads
+    /// them. Empty by default, on purpose: nothing is exempt until the operator says so.
+    #[serde(default)]
+    pub odd_hour_exempt_accounts: Vec<String>,
 }
+
+/// Most accounts `[detection] odd_hour_exempt_accounts` may list.
+pub const MAX_ODD_HOUR_EXEMPT_ACCOUNTS: usize = 64;
 
 /// Most directories one agent plants canaries in. Each directory gets one canary per
 /// kind, so the count of decoys on disk is bounded by this and nothing else.
