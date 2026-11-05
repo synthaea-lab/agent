@@ -20,6 +20,7 @@ mod inventory;
 mod ld_trust;
 mod ldap;
 mod logon;
+mod lsass;
 mod ntlm;
 mod osascript;
 mod privesc;
@@ -46,6 +47,9 @@ pub use inventory::{PACKAGE_CHANGE, evaluate_package_change};
 pub use ldap::evaluate_ldap_search;
 // NTLM rules (#364): Internet-bound authentication and weak versions.
 pub use logon::LocalOffsetAt;
+// LSASS rules (#960): a thread started inside LSASS; the access rule is
+// `RuleState::on_process_access`.
+pub use lsass::evaluate_remote_thread;
 pub use ntlm::evaluate_ntlm_auth;
 use schema::detection::Severity;
 pub use signature_gate::{ImageSignature, SignatureGatedAlert};

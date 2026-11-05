@@ -45,6 +45,7 @@ use crate::{
     },
     has_write_intent,
     logon::{LogonBaseline, Observation},
+    lsass::{self, LSASS_ACCESS_ALERT_WINDOW_NS},
     rdp::RdpSuccessAfterFailures,
     session::SessionHijack,
     signature_gate::SignatureGatedAlert,
@@ -450,6 +451,10 @@ pub struct RuleState {
     /// T1552, #377): one alert per window, not one per open. LRU-bounded like every other
     /// counter.
     credential_reads: BoundedMap<(u32, CredFile), SlidingCounter>,
+    /// (caller pid, granted) → the last alert, for LSASS-ACCESS (T1003.001, #960): one alert
+    /// per outcome per window, whatever masks the caller tries. LRU-bounded like every other
+    /// counter.
+    lsass_access: BoundedMap<(u32, bool), SlidingCounter>,
     /// pid → sliding counter for RANSOMWARE-RENAME (T1486, issue #262): renames by
     /// this pid where `new_path` is `old_path` plus an appended suffix. LRU-bounded:
     /// a hostile process renaming under many different pids (unusual, but not
@@ -636,6 +641,7 @@ impl RuleState {
             touched_files: BoundedMap::new(TOUCHED_FILES_PID_CAP),
             ransomware_unlink: BoundedMap::new(COUNTER_CAP),
             credential_reads: BoundedMap::new(COUNTER_CAP),
+            lsass_access: BoundedMap::new(COUNTER_CAP),
             ransomware_rename: BoundedMap::new(COUNTER_CAP),
             ransomware_rename_by_ppid: BoundedMap::new(COUNTER_CAP),
             write_volume: BoundedMap::new(COUNTER_CAP),
@@ -2573,6 +2579,29 @@ impl RuleState {
                 alerted,
             },
         );
+    }
+
+    /// To be called for every `ProcessAccessEvent` in the stream (Windows, #720): LSASS-ACCESS
+    /// (T1003.001, #960), see [`crate::lsass`]. The caller's expected-reader exclusion reads
+    /// its exec-time image, never `comm` alone when the image is known. A granted open alerts
+    /// High, a denied one Medium; one alert per (caller pid, outcome) per
+    /// [`LSASS_ACCESS_ALERT_WINDOW_NS`].
+    pub fn on_process_access(&mut self, event: &schema::ProcessAccessEvent) -> Vec<Alert> {
+        let image = PidFact::current(
+            &self.pid_image_path,
+            event.meta.pid,
+            event.meta.process_generation,
+        );
+        let Some(alert) = lsass::lsass_access_alert(event, image) else {
+            return Vec::new();
+        };
+        let counter = self
+            .lsass_access
+            .get_or_insert_with((event.meta.pid, event.status == 0), SlidingCounter::default);
+        if !counter.try_alert(event.meta.timestamp_ns, LSASS_ACCESS_ALERT_WINDOW_NS) {
+            return Vec::new();
+        }
+        vec![alert]
     }
 
     /// To be called for every `FileOpenEvent` in the stream. Reports T1053.005
