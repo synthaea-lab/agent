@@ -43,12 +43,20 @@
 //! `schema::BitsJobEvent` with the job's client process as the actor (BITS
 //! does the network I/O from its own service), Microsoft update jobs dropped
 //! — see [`bits`].
+//!
+//! Cross-process activity without a driver (#720, ADR-0026 follow-up 6): a thread started in
+//! another process (Kernel-Process `ThreadStart`) as `schema::RemoteThreadEvent`, and a
+//! memory-reading open of LSASS (Kernel-Audit-API-Calls `PsOpenProcess`) as
+//! `schema::ProcessAccessEvent` — the native equivalents of Sysmon 8 and 10. The filters
+//! live in `cross_process`.
 
 #[cfg(any(windows, test))]
 mod amsi;
 pub mod bits;
 #[cfg(any(windows, test))]
 mod budget;
+#[cfg(any(windows, test))]
+mod cross_process;
 #[cfg(windows)]
 mod etw_sessions;
 #[cfg(any(windows, test))]

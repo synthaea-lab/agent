@@ -2,12 +2,14 @@
 
 //! Real-session check of the Kernel-Process keyword mask (#726, #727).
 //!
-//! `process_provider` asks for the process and image keywords only (`0x50`), so that
-//! thread start/stop (EID 3/4, keyword THREAD `0x20`) never reach the callback. The unit
-//! test of the mask table compares it with literals it also contains; this test starts
-//! a real session with the requested mask and looks at which ids actually arrive for a
-//! workload it controls: a short-lived child process (process start, image loads,
-//! process stop) and a few threads of its own.
+//! Whether the provider honours a keyword mask: with the process and image keywords only
+//! (`0x50`, the default here), thread start/stop (EID 3/4, keyword THREAD `0x20`) must
+//! not arrive. `process_provider` itself asked for `0x50` from #726 until #720, which
+//! reads thread starts and asks for `0x70`; this test still pins the mechanism the
+//! mask relies on, and lab phase G runs it with both masks. It starts a real session
+//! with the requested mask and looks at which ids actually arrive for a workload it
+//! controls: a short-lived child process (process start, image loads, process stop) and
+//! a few threads of its own.
 
 use std::{
     collections::BTreeSet,

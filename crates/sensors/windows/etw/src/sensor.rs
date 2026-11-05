@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -20,14 +20,14 @@ use schema::{
 use crate::{
     amsi,
     bits::BitsJobs,
-    budget, etw_sessions,
+    budget, cross_process, etw_sessions,
     long_path::{self, LongPathCache},
     normalize,
     pid_cache::PidCache,
     providers::{
-        ALL_PROVIDERS, amsi_provider, bits_provider, dns_provider, dotnet_provider, file_provider,
-        ldap_provider, network_provider, ntlm_provider, powershell_provider, process_provider,
-        registry_provider, smb_provider, wmi_provider,
+        ALL_PROVIDERS, amsi_provider, audit_api_provider, bits_provider, dns_provider,
+        dotnet_provider, file_provider, ldap_provider, network_provider, ntlm_provider,
+        powershell_provider, process_provider, registry_provider, smb_provider, wmi_provider,
     },
     winapi,
     zone_identifier::{self, MarkQueue, QuarantineDedup},
@@ -63,6 +63,17 @@ const LDAP_PER_PID_WINDOW_NS: u64 = 10_000_000_000;
 /// reported once per this window (#364): most come from pid 4, so there is no per-process
 /// budget.
 const NTLM_DEDUP_WINDOW_NS: u64 = 60_000_000_000;
+/// One remote thread is reported per (creator, owner) pair per window (#720): an injector
+/// that starts many threads in one target is one fact, and #715 found no dominant pair on
+/// an idle host, so the window only bounds a repeat.
+const REMOTE_THREAD_DEDUP_WINDOW_NS: u64 = 60_000_000_000;
+/// Remote threads reported per creating process per window (#720): one process starting
+/// threads in many targets (a debugger attaching widely, a spray) is capped, counted.
+const REMOTE_THREAD_PER_PID_LIMIT: u32 = 32;
+const REMOTE_THREAD_PER_PID_WINDOW_NS: u64 = 10_000_000_000;
+/// An identical open of LSASS (caller, access mask, status) is reported once per window
+/// (#720): security products and the service host re-open it on a schedule.
+const LSASS_OPEN_DEDUP_WINDOW_NS: u64 = 60_000_000_000;
 
 /// Stops an orphaned ETW session. Named sessions are kernel objects that outlive
 /// the creating process: after a `taskkill /f` or crash the session stays Running
@@ -302,6 +313,19 @@ pub(crate) struct SharedState {
     /// NTLM dedup (#364): one event per (direction, account, target,
     /// address, version) per minute.
     pub(crate) ntlm: Mutex<budget::KeyDedup>,
+    /// #720: which cross-process thread starts are a new process's initial thread.
+    pub(crate) threads: Mutex<cross_process::ThreadOrigins>,
+    /// #720: remote threads, one per (creator, owner) per minute.
+    pub(crate) remote_threads: Mutex<budget::KeyDedup>,
+    /// #720: remote threads, per creating process.
+    pub(crate) remote_thread_budget: Mutex<budget::PidBudget>,
+    /// #720: LSASS's pid, 0 until found. Only ever a process whose image is
+    /// `cross_process::lsass_image(system_root)`.
+    pub(crate) lsass_pid: AtomicU32,
+    /// #720: opens of LSASS, one per (caller, mask, status) per minute.
+    pub(crate) lsass_opens: Mutex<budget::KeyDedup>,
+    /// `%SystemRoot%` (`C:\Windows`), where LSASS's image is looked for.
+    pub(crate) system_root: String,
     /// The liveness canary file: the run loop touches it every heartbeat, which
     /// MUST produce a Kernel-File event (our pid is tracked) — so sensor liveness
     /// is deterministic instead of traffic-dependent (a quiet host produces no
@@ -409,6 +433,30 @@ fn seed_pid_store(state: &SharedState) {
         pids.insert(pid, name, winapi::read_process_sequence_number(pid));
     }
     tracing::info!(processes = pids.len(), "pid store seeded");
+}
+
+/// #720: the pid of the system's LSASS among the seeded processes, found by name and
+/// confirmed by its full image path, so an `lsass.exe` started from elsewhere is not taken
+/// for it. 0 when none is found: opens of LSASS are then not reported until a
+/// `ProcessStart` of the real one (a reboot) sets it.
+fn find_lsass(state: &SharedState) -> u32 {
+    let candidates: Vec<u32> = winapi::snapshot_processes()
+        .into_iter()
+        .filter(|(_, name)| name.eq_ignore_ascii_case("lsass.exe"))
+        .map(|(pid, _)| pid)
+        .collect();
+    let found = candidates.into_iter().find(|&pid| {
+        winapi::resolve_pid_live(pid)
+            .is_some_and(|path| cross_process::is_lsass_image(&path, &state.system_root))
+    });
+    match found {
+        Some(pid) => tracing::info!(pid, "LSASS found: opens of it are watched"),
+        None => tracing::warn!(
+            system_root = %state.system_root,
+            "LSASS not found at its system path: opens of it are not reported"
+        ),
+    }
+    found.unwrap_or(0)
 }
 
 /// F-2: a freshly randomized session name for this run — anti-fingerprinting of
@@ -533,6 +581,22 @@ impl Sensor for WindowsSensor {
                 LDAP_PER_PID_WINDOW_NS,
             )),
             ntlm: Mutex::new(budget::KeyDedup::new("ntlm", NTLM_DEDUP_WINDOW_NS)),
+            threads: Mutex::new(cross_process::ThreadOrigins::default()),
+            remote_threads: Mutex::new(budget::KeyDedup::new(
+                "remote-thread",
+                REMOTE_THREAD_DEDUP_WINDOW_NS,
+            )),
+            remote_thread_budget: Mutex::new(budget::PidBudget::new(
+                "remote-thread",
+                REMOTE_THREAD_PER_PID_LIMIT,
+                REMOTE_THREAD_PER_PID_WINDOW_NS,
+            )),
+            lsass_pid: AtomicU32::new(0),
+            lsass_opens: Mutex::new(budget::KeyDedup::new(
+                "lsass-open",
+                LSASS_OPEN_DEDUP_WINDOW_NS,
+            )),
+            system_root: std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()),
             canary_path: canary_file
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -540,6 +604,7 @@ impl Sensor for WindowsSensor {
         });
 
         seed_pid_store(&state);
+        state.lsass_pid.store(find_lsass(&state), Ordering::Relaxed);
 
         stop_all_orphaned_sessions();
         let session = new_session_name();
@@ -558,7 +623,8 @@ impl Sensor for WindowsSensor {
             .enable(amsi_provider(sink.clone(), state.clone()))
             .enable(bits_provider(sink.clone(), state.clone()))
             .enable(ldap_provider(sink.clone(), state.clone()))
-            .enable(ntlm_provider(sink, state.clone()));
+            .enable(ntlm_provider(sink.clone(), state.clone()))
+            .enable(audit_api_provider(sink, state.clone()));
         let trace = normalize::start_or_stop_session(
             &session,
             || builder.start_and_process(),

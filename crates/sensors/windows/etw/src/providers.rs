@@ -14,12 +14,15 @@ use ferrisetw::{
 };
 use schema::{
     AmsiContentEvent, AssemblyLoadEvent, ConnectEvent, DnsQueryEvent, Event, EventMeta, ExecEvent,
-    FileOpenEvent, ImageLoadEvent, LdapSearchEvent, NtlmAuthEvent, NtlmDirection, RegistrySetEvent,
-    ScriptBlockEvent, SmbConnectEvent, UdpSendEvent, WmiActivityEvent, sensor::EventSink,
+    FileOpenEvent, ImageLoadEvent, LdapSearchEvent, NtlmAuthEvent, NtlmDirection,
+    ProcessAccessEvent, RegistrySetEvent, RemoteThreadEvent, ScriptBlockEvent, SmbConnectEvent,
+    UdpSendEvent, WmiActivityEvent, sensor::EventSink,
 };
 
 use crate::{
-    amsi, normalize,
+    amsi,
+    cross_process::{self, ThreadOrigin},
+    normalize,
     sensor::{SharedState, basename},
     winapi, zone_identifier,
 };
@@ -67,10 +70,16 @@ const NTLM_GUID: &str = "ac43300d-5fcc-4800-8e99-1bd3f85f0320";
 const SMB_CLIENT_GUID: &str = "988C59C5-0A1C-45B6-A555-0C62276E327D";
 /// Microsoft-Windows-Bits-Client (EIDs 16403/4/5/61 — BITS jobs, #284)
 const BITS_CLIENT_GUID: &str = "EF1CC15B-46C1-414E-BB95-E76B077BD51E";
+/// Microsoft-Windows-Kernel-Audit-API-Calls (EID 5 `PsOpenProcess`, #720). The manifest
+/// declares no keywords, so every id arrives and the callback keeps 5.
+const KERNEL_AUDIT_API_GUID: &str = "E02A841C-75A3-4FA7-AFC8-AE09CF9B7F23";
+/// Kernel-Audit-API-Calls `PsOpenProcess`: `TargetProcessId`, `DesiredAccess`,
+/// `ReturnCode`; the caller is the record header's pid.
+const AUDIT_OPEN_PROCESS: u16 = 5;
 
 /// Every provider the sensor enables, by short name — for the blind-session
 /// attribution (#408), which asks the OS who else enables them.
-pub(crate) const ALL_PROVIDERS: [(&str, &str); 13] = [
+pub(crate) const ALL_PROVIDERS: [(&str, &str); 14] = [
     ("Kernel-Process", KERNEL_PROCESS_GUID),
     ("Kernel-Network", KERNEL_NETWORK_GUID),
     ("Kernel-File", KERNEL_FILE_GUID),
@@ -84,6 +93,7 @@ pub(crate) const ALL_PROVIDERS: [(&str, &str); 13] = [
     ("Bits-Client", BITS_CLIENT_GUID),
     ("LDAP-Client", LDAP_CLIENT_GUID),
     ("NTLM", NTLM_GUID),
+    ("Kernel-Audit-API-Calls", KERNEL_AUDIT_API_GUID),
 ];
 
 /// A Kernel-Process sequence number field, `None` when the event version has
@@ -93,10 +103,14 @@ fn sequence_number(parser: &Parser, field: &str) -> Option<u64> {
 }
 
 /// Kernel-Process keywords the sensor reads: `WINEVENT_KEYWORD_PROCESS` (0x10,
-/// EIDs 1/2) and `WINEVENT_KEYWORD_IMAGE` (0x40, EID 5). Left unset, ferrisetw
-/// enables every keyword, and every thread start on the host (EID 3, keyword
-/// 0x20) went through the callback for nothing (#726).
-const KERNEL_PROCESS_KEYWORDS: u64 = 0x10 | 0x40;
+/// EIDs 1/2), `WINEVENT_KEYWORD_THREAD` (0x20, EID 3 for remote threads, #720) and
+/// `WINEVENT_KEYWORD_IMAGE` (0x40, EID 5). Left unset, ferrisetw enables every
+/// keyword. #726 had taken THREAD out when nothing read thread starts; #720 reads
+/// them, and the thread stops (EID 4) the keyword brings along are dropped on their
+/// id before any parsing (#715: 55 to 71 starts per second on an idle host).
+const KERNEL_PROCESS_KEYWORDS: u64 = 0x10 | 0x20 | 0x40;
+/// Kernel-Process `ThreadStart`.
+const THREAD_START: u16 = 3;
 
 /// `AssemblyFlags` bit indicating a dynamic (in-memory) assembly load.
 /// File-backed assemblies are high-volume noise; only dynamic loads are forwarded.
@@ -108,8 +122,9 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         // 1=ProcessStart (new spawn → ExecEvent), 2=ProcessEnd (prune the store —
         // PID recycling), 5=ImageLoad (DLL/EXE mapped into a process). Processes
         // already running come from the pid-store seed, not from a rundown (that
-        // would be EID 15; EID 3 is ThreadStart, #726).
-        if eid != 1 && eid != 2 && eid != 5 {
+        // would be EID 15). 3=ThreadStart, for a thread started in another process
+        // (#720); its sibling 4=ThreadStop is dropped here.
+        if eid != 1 && eid != 2 && eid != 5 && eid != THREAD_START {
             return;
         }
         state.events_seen.fetch_add(1, Ordering::Relaxed);
@@ -119,9 +134,20 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         let parser = Parser::create(record, &schema_def);
         let pid: u32 = parser.try_parse("ProcessID").unwrap_or(0);
 
+        if eid == THREAD_START {
+            forward_remote_thread(record, &parser, pid, &state, sink.as_ref());
+            return;
+        }
+
         if eid == 2 {
             if pid != 0 {
                 state.pids.lock().unwrap().remove(pid);
+                state.threads.lock().unwrap().process_ended(pid);
+                // LSASS does not end short of a reboot; a recycled pid is not it.
+                let _ =
+                    state
+                        .lsass_pid
+                        .compare_exchange(pid, 0, Ordering::Relaxed, Ordering::Relaxed);
             }
             return;
         }
@@ -158,6 +184,15 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             .unwrap_or_else(|_| String::from("<unknown>"));
         let image_path = state.normalize_path(&raw_image);
         let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
+        // #720: the initial thread of this process is not an injection.
+        state
+            .threads
+            .lock()
+            .unwrap()
+            .process_started(pid, timestamp_ns);
+        if cross_process::is_lsass_image(&image_path, &state.system_root) {
+            state.lsass_pid.store(pid, Ordering::Relaxed);
+        }
 
         // #725: ProcessStart v4+ carries both incarnation stamps; an older
         // version leaves them unset rather than guessed.
@@ -218,6 +253,127 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
     };
     Provider::by_guid(KERNEL_PROCESS_GUID)
         .any(KERNEL_PROCESS_KEYWORDS)
+        .add_callback(callback)
+        .build()
+}
+
+/// Kernel-Process 3 (`ThreadStart`): forwards a thread started in another user process
+/// as a [`RemoteThreadEvent`] (#720, the native Sysmon 8). `owner` is the record's
+/// `ProcessID`, the process the thread belongs to; the creator is the header pid.
+/// [`cross_process::ThreadOrigins`] drops the own-process, kernel and initial threads;
+/// what is left is deduplicated per (creator, owner) and budgeted per creator.
+///
+/// # Field notes (manifest, Windows 11 build 26300, 2026-11-05)
+///
+/// v0/v1: `ProcessID`, `ThreadID` (u32), `StackBase`, `StackLimit`, `UserStackBase`,
+/// `UserStackLimit`, `StartAddr`, `Win32StartAddr`, `TebBase` (pointers); v1 adds
+/// `SubProcessTag`.
+fn forward_remote_thread(
+    record: &EventRecord,
+    parser: &Parser<'_, '_>,
+    owner: u32,
+    state: &SharedState,
+    sink: &dyn EventSink,
+) {
+    let creator = record.process_id();
+    let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
+    let origin = state
+        .threads
+        .lock()
+        .unwrap()
+        .classify(creator, owner, timestamp_ns, || {
+            state.pids.lock().unwrap().contains(owner)
+        });
+    if origin != ThreadOrigin::Remote {
+        return;
+    }
+    let pair = format!("{creator}>{owner}");
+    if !state
+        .remote_threads
+        .lock()
+        .unwrap()
+        .first(&pair, timestamp_ns)
+    {
+        return;
+    }
+    if !state
+        .remote_thread_budget
+        .lock()
+        .unwrap()
+        .spend(creator, timestamp_ns)
+    {
+        return;
+    }
+    let pointer = |name: &str| {
+        parser
+            .try_parse::<Pointer>(name)
+            .map_or(0, |p| u64::try_from(*p).unwrap_or(0))
+    };
+    let start_address =
+        cross_process::start_address(pointer("Win32StartAddr"), pointer("StartAddr"));
+    let target_image_path = state.pids.lock().unwrap().get(owner).map(str::to_owned);
+    let comm = state.comm_for(creator).unwrap_or_default();
+    sink.on_event(Event::RemoteThread(RemoteThreadEvent {
+        meta: state.meta(creator, 0, comm, timestamp_ns),
+        target_pid: owner,
+        target_image_path,
+        thread_id: parser.try_parse("ThreadID").unwrap_or(0),
+        start_address,
+    }));
+}
+
+/// Opens of LSASS that can read its memory (#720, the native Sysmon 10, T1003.001), from
+/// Microsoft-Windows-Kernel-Audit-API-Calls EID 5 (`PsOpenProcess`). Every other id, and
+/// every open of another process, is dropped before anything else: #715 counted 280 to
+/// 330 opens per second on an idle host, about half of them with `PROCESS_VM_READ`, so
+/// the target is the filter. An identical open (caller, mask, status) is reported once
+/// per minute.
+///
+/// # Field notes (manifest, Windows 11 build 26300, 2026-11-05)
+///
+/// EID 5 v0: `TargetProcessId`, `DesiredAccess`, `ReturnCode` (u32). The caller is the
+/// record header's pid (#715 capture). No keyword is declared, so the provider is
+/// enabled whole and ids 1-8 all reach the callback.
+pub(crate) fn audit_api_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -> Provider {
+    let callback = move |record: &EventRecord, locator: &SchemaLocator| {
+        if record.event_id() != AUDIT_OPEN_PROCESS {
+            return;
+        }
+        state.events_seen.fetch_add(1, Ordering::Relaxed);
+        let lsass = state.lsass_pid.load(Ordering::Relaxed);
+        if lsass == 0 {
+            return;
+        }
+        let Ok(schema_def) = locator.event_schema(record) else {
+            return;
+        };
+        let parser = Parser::create(record, &schema_def);
+        if parser.try_parse::<u32>("TargetProcessId").ok() != Some(lsass) {
+            return;
+        }
+        let caller = record.process_id();
+        let desired_access: u32 = parser.try_parse("DesiredAccess").unwrap_or(0);
+        if !cross_process::lsass_open_is_reported(caller, lsass, desired_access) {
+            return;
+        }
+        let status: u32 = parser.try_parse("ReturnCode").unwrap_or(0);
+        let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
+        let key = format!("{caller}:{desired_access:x}:{status:x}");
+        if !state.lsass_opens.lock().unwrap().first(&key, timestamp_ns) {
+            return;
+        }
+        let comm = state.comm_for(caller).unwrap_or_default();
+        sink.on_event(Event::ProcessAccess(ProcessAccessEvent {
+            meta: state.meta(caller, 0, comm, timestamp_ns),
+            target_pid: lsass,
+            // `lsass_pid` is only ever set to a process whose image is this path.
+            target_image_path: Some(cross_process::lsass_image(&state.system_root)),
+            desired_access,
+            status,
+        }));
+    };
+
+    Provider::by_guid(KERNEL_AUDIT_API_GUID)
         .add_callback(callback)
         .build()
 }
@@ -1141,13 +1297,11 @@ mod process_keyword_tests {
     /// mask is checked against a real session by `tests/kernel_process_keyword_mask.rs`
     /// (`#[ignore]`, elevated; lab phase G of `lab/validate-windows-admin.ps1`).
     #[test]
-    fn kernel_process_reads_process_and_image_events_but_not_threads() {
+    fn kernel_process_reads_process_thread_and_image_events_only() {
         const PROCESS: u64 = 0x10;
         const THREAD: u64 = 0x20;
         const IMAGE: u64 = 0x40;
-        assert_ne!(KERNEL_PROCESS_KEYWORDS & PROCESS, 0);
-        assert_ne!(KERNEL_PROCESS_KEYWORDS & IMAGE, 0);
-        assert_eq!(KERNEL_PROCESS_KEYWORDS & THREAD, 0);
+        assert_eq!(KERNEL_PROCESS_KEYWORDS, PROCESS | THREAD | IMAGE);
     }
 }
 
