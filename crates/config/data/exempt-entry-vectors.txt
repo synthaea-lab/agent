@@ -1,0 +1,18 @@
+# One table of good and bad odd_hour_exempt_accounts entries, run through both grammars: config::load (crates/config/src/load.rs) and RuleState::set_odd_hour_exempt_accounts (crates/rules). "ok" = kept, "bad" = refused by the load and dropped by the rules. Tab separated.
+ok	svc_backup
+ok	CORP\oncall
+ok	svc|S-1-5-21-1-2-3-1004
+ok	svc|S-1-5-21-1-2-3-*
+ok	svc | S-1-5-32-544
+ok	a|s-1-5-18
+bad	
+bad	   
+bad	|S-1-5-21-1-2-3-1004
+bad	svc|
+bad	svc|not-a-sid
+bad	svc|S-1-
+bad	svc|S-1-5--1
+bad	svc|S-1-5-21-1*
+bad	svc|S-2-5-1
+bad	svc|S-1-5-21-1-2-
+bad	svc|S-1-5-21-1-2-3-1004-*x

@@ -2135,6 +2135,31 @@ impl RuleState {
         self.odd_hours.set_offset_minutes(minutes)
     }
 
+    /// Declares the local hours `[start, end)` in which a logon is ordinary for ODD-HOUR-LOGON
+    /// (#1089); `start > end` wraps midnight (`22, 6`, a night shift). False, and the window
+    /// keeps what it had, unless `start` is 0 to 23, `end` 1 to 24 and they differ. The default is
+    /// [`WORK_HOURS_LOCAL`](crate::exclusions::WORK_HOURS_LOCAL).
+    pub fn set_work_hours(&mut self, start: u32, end: u32) -> bool {
+        self.odd_hours.set_work_hours(start, end)
+    }
+
+    /// Declares the accounts whose odd-hour logons are expected (#1089): on-call staff, a
+    /// schedule's service or batch account. ODD-HOUR-LOGON skips them; FIRST-SEEN-LOGON does not.
+    /// An entry is `NAME` or `NAME|SID` (see `OddHours::set_exempt_accounts`); at most 64 are
+    /// kept, a blank, over-long or malformed one is dropped, and the number kept is returned.
+    /// Replaces the previous list; empty by default, so nothing is exempt until the operator says so.
+    pub fn set_odd_hour_exempt_accounts(&mut self, accounts: &[String]) -> usize {
+        self.odd_hours.set_exempt_accounts(accounts)
+    }
+
+    /// Odd-hour logons the exempt list has suppressed since the agent started (#1089); read by the
+    /// tests, and visible in production through the `skips` field of the info line of `OddHours`.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn odd_hour_exempt_skips(&self) -> u64 {
+        self.odd_hours.exempt_skips()
+    }
+
     /// Gives the rules the host's platform time zone (#1088): `zone` maps an instant (seconds
     /// since the Unix epoch) to minutes east of UTC at that instant, so a logon either side of a
     /// daylight-saving change is judged by the hour the host's clock showed. Turns ODD-HOUR-LOGON
@@ -2145,7 +2170,8 @@ impl RuleState {
     }
 
     /// ODD-HOUR-LOGON (T1078, #376): a successful [`AuthKind::Logon`] of a non-generic
-    /// account whose host-local hour is outside [`WORK_HOURS_LOCAL`](crate::exclusions::WORK_HOURS_LOCAL).
+    /// account whose host-local hour is outside the working hours: [`WORK_HOURS_LOCAL`](crate::exclusions::WORK_HOURS_LOCAL)
+    /// unless the operator declared another window ([`Self::set_work_hours`]).
     /// Low, once per account per [`ODD_HOUR_QUIET_NS`](crate::exclusions::ODD_HOUR_QUIET_NS).
     /// Same event gate and generic-account list as FIRST-SEEN-LOGON, so the two share the
     /// identity join's limits; they are independent and a first logon at night raises both.
@@ -2155,7 +2181,9 @@ impl RuleState {
     /// `agent.toml`, which overrides the zone). The event's timestamp is UTC and nothing else
     /// in the agent knows the local time.
     /// Expected false positives: on-call staff, night shifts, a host in use around the clock,
-    /// and on Windows the service and batch logons (4624) of a named account.
+    /// and on Windows the service and batch logons (4624) of a named account; the operator
+    /// answers them with a declared window ([`Self::set_work_hours`]) and an exempt list
+    /// ([`Self::set_odd_hour_exempt_accounts`]).
     fn check_odd_hour_logon(&mut self, event: &AuthEvent) -> Option<Alert> {
         if event.outcome != AuthOutcome::Success || event.kind != AuthKind::Logon {
             return None;
