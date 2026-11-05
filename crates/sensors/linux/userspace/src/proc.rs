@@ -47,11 +47,8 @@ pub(crate) fn parse_proc_cmdline(blob: &[u8]) -> Vec<String> {
 /// `normalize::exec`'s cut to see the argv is over and flag it, without copying a
 /// padded exec's ~2 MiB on every drain.
 pub(crate) fn read_proc_cmdline(pid: u32) -> Vec<String> {
-    match read_capped(
-        &format!("/proc/{pid}/cmdline"),
-        schema::ARGV_CAPTURE_BUDGET + 1,
-    ) {
-        Ok(blob) => parse_proc_cmdline(&blob),
+    match read_cmdline_file(&format!("/proc/{pid}/cmdline")) {
+        Ok(argv) => argv,
         // The expected exit race (process already gone) is silent; anything else
         // (EACCES, EIO) is worth a line when tracing a capture gap on some kernel.
         Err(e) if is_proc_exit_race(&e) => Vec::new(),
@@ -60,6 +57,13 @@ pub(crate) fn read_proc_cmdline(pid: u32) -> Vec<String> {
             Vec::new()
         }
     }
+}
+
+/// The argv in a `cmdline`-shaped file, read up to one byte past
+/// [`schema::ARGV_CAPTURE_BUDGET`] so the cut in `normalize::exec` can tell an
+/// argv that is over the budget from one that fits exactly.
+fn read_cmdline_file(path: &str) -> std::io::Result<Vec<String>> {
+    read_capped(path, schema::ARGV_CAPTURE_BUDGET + 1).map(|blob| parse_proc_cmdline(&blob))
 }
 
 /// The first `limit` bytes of the file at `path`.
@@ -207,8 +211,48 @@ pub(crate) fn parse_stat_starttime(stat: &str) -> Option<u64> {
 mod tests {
     use super::{
         is_proc_exit_race, parse_proc_cmdline, parse_proc_environ_security, parse_stat_ppid_comm,
-        parse_stat_starttime, primed_generation, read_proc_images,
+        parse_stat_starttime, primed_generation, read_cmdline_file, read_proc_images,
     };
+
+    /// Writes `blob` to a fresh file under the temp dir and returns its path.
+    fn cmdline_file(name: &str, blob: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "sensor-linux-cmdline-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::write(&path, blob).expect("write the test cmdline file");
+        path
+    }
+
+    fn read_and_bound(name: &str, blob: &[u8]) -> (Vec<String>, bool) {
+        let path = cmdline_file(name, blob);
+        let mut argv = read_cmdline_file(path.to_str().expect("utf-8 temp path"))
+            .expect("read the test cmdline file");
+        std::fs::remove_file(&path).ok();
+        let cut = schema::bound_argv(&mut argv);
+        (argv, cut)
+    }
+
+    #[test]
+    fn a_cmdline_one_short_token_past_an_exact_fit_is_read_far_enough_to_be_flagged() {
+        // `<BUDGET-1 bytes>\0x\0`: the first token alone costs exactly the budget.
+        // A read capped at BUDGET bytes (an off-by-one) would stop on its NUL, see an
+        // argv that fits and never flag the trailing `x`.
+        let mut blob = vec![b'a'; schema::ARGV_CAPTURE_BUDGET - 1];
+        blob.extend_from_slice(b"\0x\0");
+        let (argv, cut) = read_and_bound("over", &blob);
+        assert!(cut, "an argv one token past the budget must be flagged");
+        assert_eq!(argv.len(), 1);
+    }
+
+    #[test]
+    fn a_cmdline_that_fits_the_budget_exactly_is_read_whole_and_not_flagged() {
+        let mut blob = vec![b'a'; schema::ARGV_CAPTURE_BUDGET - 1];
+        blob.push(0);
+        let (argv, cut) = read_and_bound("exact", &blob);
+        assert!(!cut);
+        assert_eq!(argv[0].len(), schema::ARGV_CAPTURE_BUDGET - 1);
+    }
 
     #[test]
     fn stat_starttime_is_the_twentieth_field_after_the_comm() {
