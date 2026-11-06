@@ -96,7 +96,7 @@ sensor-linux-lsm = { path = "../crates/sensors/linux/lsm" }
 # Named directly in `commands::linux::attach_lsm_hooks`'s return type (the
 # `Ebpf` object that must outlive the hook) — same version sensor-linux-lsm
 # itself uses.
-aya = { version = "0.14", default-features = false }
+aya = { version = "0.16", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

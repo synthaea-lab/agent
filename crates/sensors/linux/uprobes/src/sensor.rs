@@ -259,7 +259,7 @@ fn attach_uprobe(
     // (can attach same program to multiple offsets)
     program
         .attach(
-            symbol.offset,
+            [symbol.offset],
             &symbol.library_path,
             UProbeScope::AllProcesses,
         )
