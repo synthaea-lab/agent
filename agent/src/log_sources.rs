@@ -87,7 +87,27 @@ pub(crate) fn write_position(path: &Path, position: &Position) {
 #[derive(Debug, Default)]
 struct Stats {
     parse_failures: u64,
+    /// Lines parsed as `combined` that carried fields after the user agent (#1143).
+    extra_field_lines: u64,
     watch: MisparseWatch,
+}
+
+/// Counts a `combined` line with fields after the user agent. Logged on the first
+/// one and every ten-thousandth, so an operator can tell the source logs more than
+/// the preset reads (nginx `main`: the skipped field is X-Forwarded-For).
+fn note_extra_fields(extra_fields: usize, stats: &mut Stats, path: &Path) {
+    if extra_fields == 0 {
+        return;
+    }
+    stats.extra_field_lines += 1;
+    if stats.extra_field_lines == 1 || stats.extra_field_lines.is_multiple_of(10_000) {
+        tracing::info!(
+            log = %path.display(),
+            lines = stats.extra_field_lines,
+            extra_fields,
+            "log source: fields after the user agent are skipped"
+        );
+    }
 }
 
 /// Counts a line that did not match its declared kind and samples it in the log.
@@ -170,6 +190,7 @@ fn access_line_to_event(
     match parse_access_line(line, access.format) {
         Ok(record) => {
             stats.watch.record(true, now_ns);
+            note_extra_fields(record.extra_fields, stats, path);
             access.summarizer.observe(&record, now_ns);
             let matched = match_request(&record)?;
             access.budget.allow(matched.signature, now_ns).then(|| {
