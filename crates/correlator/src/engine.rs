@@ -145,9 +145,9 @@ pub struct CorrelationEngine {
     /// Only read by the kill gate ([`Self::is_service_main_process`]); detection and
     /// belief never look at it.
     service_mains: BoundedMap<u32, Option<u64>>,
-    /// Pids whose `ExecEvent` showed a login-session image (`sshd-session`, see
-    /// `policy::is_login_session_image`) exec'd by a recorded service main (#1142).
-    /// Same lifecycle and same single reader (the kill gate) as `service_mains`.
+    /// Pids whose `ExecEvent` showed a login-session image exec'd by its listener
+    /// (`sshd-session` under `sshd`, see `policy::is_login_session`, #1142). Same
+    /// lifecycle and same single reader (the kill gate) as `service_mains`.
     login_sessions: BoundedMap<u32, Option<u64>>,
 }
 
@@ -298,11 +298,12 @@ impl CorrelationEngine {
                 // never a service main (`BoundedMap::remove` on an absent key).
                 self.service_mains.remove(&pid);
             }
-            // The parent must be the service main *now*: a user can exec the real
-            // `/usr/sbin/sshd-session` from their own shell, and that copy holds no
-            // login worth protecting. Re-exec clears, as for `service_mains`.
-            if policy::is_login_session_image(exec.image_path.as_str())
-                && self.is_service_main_process(ppid, parent_generation)
+            // The parent's image, not `service_mains`: the listener starts at boot,
+            // before the agent, so its exec is never seen (the 2026-11-05 e2e run:
+            // `parent_image_path` resolved from /proc, no exec for pid 2529). A copy
+            // of the real binary exec'd from a user's shell has that shell as parent
+            // and qualifies for nothing. Re-exec clears, as for `service_mains`.
+            if policy::is_login_session(exec.image_path.as_str(), exec.parent_image_path.as_deref())
             {
                 self.login_sessions.insert(pid, generation);
             } else {

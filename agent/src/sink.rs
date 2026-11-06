@@ -4152,14 +4152,15 @@ rule response_marker {
         assert_eq!(*killed.lock().unwrap(), vec![6002]);
     }
 
-    /// Execs the `sshd` listener (by init) and, under it, the `sshd-session` that holds
-    /// one login, as on Alpine (#1142).
+    /// Execs the `sshd-session` that holds one login under the `sshd` listener, as on
+    /// Alpine (#1142). The listener's own exec is not sent: it started at boot, before
+    /// the agent, so only its image (resolved by the sensor) is known.
     fn exec_ssh_login(sink: &DetectionSink, listener: u32, session: u32) {
-        sink.on_event(exec(listener, "sshd", "/usr/sbin/sshd"));
         let Event::Exec(mut e) = exec(session, "sshd-session", "/usr/lib/ssh/sshd-session") else {
             unreachable!("exec() builds an Exec event");
         };
         e.meta.ppid = listener;
+        e.parent_image_path = Some("/usr/sbin/sshd".into());
         sink.on_event(Event::Exec(e));
     }
 
