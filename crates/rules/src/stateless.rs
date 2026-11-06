@@ -144,6 +144,52 @@ pub(crate) fn check_persistence_write(event: &FileOpenEvent) -> Option<Alert> {
     })
 }
 
+/// Bytes of the kept command line quoted in a [`check_truncated_cmdline`] alert:
+/// enough to recognise the interpreter and the shape of the padding, without
+/// putting up to 32 KiB of attacker-chosen text into every alert message.
+const TRUNCATED_CMDLINE_QUOTE_BYTES: usize = 256;
+
+/// T1027.010 — Obfuscated Files or Information: Command Obfuscation, sub-case a
+/// command line padded past [`schema::ARGV_CAPTURE_BUDGET`] (#1112).
+///
+/// The sensor keeps only the head of such an argv, so every content rule (the
+/// `base64` decode, encoded `PowerShell`, the Sigma content) is blind to what
+/// follows the cut. Padding is attacker-controlled on both sides, so no fixed
+/// window (head, or head and tail) can guarantee the payload is kept; the cut
+/// itself is the signal. Benign data behind the threshold (#1112, one Alpine lab
+/// VM, 3,451 execs): p99.9 347 B, max 1,661 B, none over 4 KiB. Medium, not High:
+/// that sample is one host, and generated build lines or large `docker run`
+/// invocations elsewhere were not measured.
+///
+/// `cmdline_truncated == false` means "no cut seen", not "the whole command line
+/// was seen": a process gone before its argv was read has an empty argv and no
+/// flag (#1118), so this rule cannot see that case.
+#[must_use]
+pub(crate) fn check_truncated_cmdline(event: &ExecEvent) -> Option<Alert> {
+    if !event.cmdline_truncated {
+        return None;
+    }
+    let mut quote_end = event.cmdline.len().min(TRUNCATED_CMDLINE_QUOTE_BYTES);
+    while !event.cmdline.is_char_boundary(quote_end) {
+        quote_end -= 1;
+    }
+    Some(Alert {
+        technique: "T1027.010",
+        severity: Severity::Medium,
+        message: format!(
+            "pid={} comm={} image={}: command line over {} bytes, cut at capture; content \
+             rules did not see its tail ({} bytes kept, {} args): {}",
+            event.meta.pid,
+            event.meta.comm,
+            event.image_path,
+            schema::ARGV_CAPTURE_BUDGET,
+            event.cmdline.len(),
+            event.argv.len(),
+            &event.cmdline[..quote_end],
+        ),
+    })
+}
+
 /// Evaluates all stateless rules applicable to an `ExecEvent`. T1620 memfd-exec
 /// (`RuleState::check_memfd_exec`) is not among them: it now needs
 /// `MemfdCreateEvent` correlation state, see that method's doc (#497).
@@ -158,6 +204,7 @@ pub fn evaluate_exec(event: &ExecEvent) -> Vec<Alert> {
         .chain(check_event_logging_disable_exec(event))
         .chain(crate::osascript::check_osascript_password_prompt(event))
         .chain(crate::securitytool::check_security_tool_stop(event))
+        .chain(check_truncated_cmdline(event))
         .collect()
 }
 
