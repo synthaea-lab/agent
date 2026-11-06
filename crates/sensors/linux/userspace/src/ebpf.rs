@@ -363,7 +363,7 @@ pub(crate) fn prime_proc_lineage(ebpf: &mut aya::Ebpf) -> Result<u32, SensorErro
         let n = bytes.len().min(sensor_linux_wire::TASK_COMM_LEN);
         val.comm[..n].copy_from_slice(&bytes[..n]);
 
-        if lineage.insert(*pid, PodLineage(val), 0).is_ok() {
+        if lineage.insert(pid, &PodLineage(val), 0).is_ok() {
             primed += 1;
         }
     }
@@ -390,7 +390,7 @@ pub(crate) fn write_signal_watch_pid(ebpf: &mut aya::Ebpf, pid: u32) -> Result<(
     let mut watch: aya::maps::Array<_, u32> = aya::maps::Array::try_from(map)
         .map_err(|e| err(format!("SIGNAL_WATCH_PID is not an array map: {e}")))?;
     watch
-        .set(0, pid, 0)
+        .set(0, &pid, 0)
         .map_err(|e| err(format!("failed to write SIGNAL_WATCH_PID: {e}")))
 }
 
@@ -437,7 +437,7 @@ pub(crate) fn clear_tamper_slot(slot: &mut TamperSlot) -> Result<(), SensorError
     // SAFETY: `SignalEvent` is plain-old-data (see `PodSignal`), so all-zero is a
     // valid value.
     let zero: sensor_linux_wire::SignalEvent = unsafe { core::mem::zeroed() };
-    slot.set(0, PodSignal(zero), 0)
+    slot.set(0, &PodSignal(zero), 0)
         .map_err(|e| err(format!("failed to clear SIGNAL_TAMPER_LAST: {e}")))
 }
 
