@@ -55,7 +55,7 @@ mod linux {
 
     /// The service unit `packaging/linux/systemd` installs; restarting it starts
     /// the watchdog from the freshly promoted `current`.
-    const SERVICE_UNIT: &str = "synthaea-agent";
+    const SERVICE_UNIT: &str = config::identity::LINUX_SERVICE;
 
     /// Name of the ban list directly under the layout's base directory.
     const BAN_LIST: &str = "banned_versions.json";
@@ -356,7 +356,7 @@ mod linux {
         // Before any network or filesystem work: an unacknowledged test-key
         // build must not even contact the server.
         crate::trust::ensure_release_key_trusted(base_dir, allow_test_key)?;
-        let mut config = transport::TransportConfig::new(server);
+        let mut config = crate::upload::transport_config_for(server);
         if let (Some(cert), Some(key)) = (cert, key) {
             config = config.with_client_cert(PathBuf::from(cert), PathBuf::from(key));
         }

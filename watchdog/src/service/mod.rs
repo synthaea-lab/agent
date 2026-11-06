@@ -3,14 +3,6 @@
 //! per platform mechanism (SCM / systemd / launchd), each exporting the same
 //! `cmd_install` / `cmd_uninstall` pair.
 
-#[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) const SERVICE_NAME: &str = "SynthaEDR";
-#[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) const SERVICE_DISPLAY: &str = "Synthaea EDR Agent";
-#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
-pub(crate) const SERVICE_DESC: &str =
-    "Synthaea Endpoint Detection & Response — real-time behavioral monitoring";
-
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -51,9 +43,15 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
         let (program, args): (&str, &[&str]) = if cfg!(windows) {
-            ("sc", &["query", SERVICE_NAME])
+            ("sc", &["query", config::identity::WINDOWS_SERVICE_NAME])
         } else if cfg!(target_os = "macos") {
-            ("launchctl", &["print", "system/com.synthaea.agent"])
+            (
+                "launchctl",
+                &[
+                    "print",
+                    &format!("system/{}", config::identity::LAUNCHD_LABEL),
+                ],
+            )
         } else {
             anyhow::bail!("status is only supported on Windows, Linux, and macOS")
         };

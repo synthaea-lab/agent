@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::{Context as _, bail};
+use config::identity::{SERVICE_DESCRIPTION, WINDOWS_SERVICE_DISPLAY, WINDOWS_SERVICE_NAME};
 use windows_service::{
     define_windows_service,
     service::{
@@ -21,7 +22,6 @@ use windows_service::{
     service_dispatcher,
 };
 
-use super::{SERVICE_DESC, SERVICE_DISPLAY, SERVICE_NAME};
 use crate::{
     paths::{DEFAULT_ALERTS, resolve_agent_bin},
     supervise::watchdog_loop,
@@ -33,7 +33,7 @@ const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 define_windows_service!(ffi_service_main, service_main);
 
 pub(crate) fn run_as_service() -> windows_service::Result<()> {
-    service_dispatcher::start(SERVICE_NAME, ffi_service_main)
+    service_dispatcher::start(WINDOWS_SERVICE_NAME, ffi_service_main)
 }
 
 fn service_main(_args: Vec<std::ffi::OsString>) {
@@ -69,7 +69,7 @@ fn run_service_logic() -> anyhow::Result<()> {
         }
     };
 
-    let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)
+    let status_handle = service_control_handler::register(WINDOWS_SERVICE_NAME, event_handler)
         .context("registering SCM handler")?;
 
     // Report RUNNING
@@ -161,7 +161,7 @@ const PERMISSIVE_SERVICE_SDDL: &str =
 /// and functional, just without the extra ACL friction — worth a loud
 /// warning, not worth failing an otherwise-successful install over.
 fn harden_service_acl() {
-    if let Err(e) = run_sc(&["sdset", SERVICE_NAME, HARDENED_SERVICE_SDDL]) {
+    if let Err(e) = run_sc(&["sdset", WINDOWS_SERVICE_NAME, HARDENED_SERVICE_SDDL]) {
         eprintln!(
             "[watchdog] warning: could not harden service ACL ({e}) — \
              service is installed and running, but not protected against \
@@ -176,7 +176,7 @@ fn harden_service_acl() {
 /// (uninstall of a service that was never installed) — either is a normal,
 /// expected outcome here, not an error worth surfacing.
 fn reset_service_acl_best_effort() {
-    let _ = run_sc(&["sdset", SERVICE_NAME, PERMISSIVE_SERVICE_SDDL]);
+    let _ = run_sc(&["sdset", WINDOWS_SERVICE_NAME, PERMISSIVE_SERVICE_SDDL]);
 }
 
 pub(crate) fn cmd_install(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Result<()> {
@@ -223,33 +223,33 @@ pub(crate) fn cmd_install(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow
 
     run_sc(&[
         "create",
-        SERVICE_NAME,
+        WINDOWS_SERVICE_NAME,
         "binPath=",
         &bin_path,
         "start=",
         "auto",
         "DisplayName=",
-        SERVICE_DISPLAY,
+        WINDOWS_SERVICE_DISPLAY,
     ])?;
     // Puts the service SID `NT SERVICE\SynthaEDR` in the watchdog's token, and so
     // in the agent's (spawned with the watchdog's token): the minifilter's
     // communication port only accepts a client holding it (ADR-0012 guardrail 5,
     // #136). Without it the agent can't connect to the driver.
-    run_sc(&["sidtype", SERVICE_NAME, "unrestricted"])?;
-    run_sc(&["description", SERVICE_NAME, SERVICE_DESC])?;
+    run_sc(&["sidtype", WINDOWS_SERVICE_NAME, "unrestricted"])?;
+    run_sc(&["description", WINDOWS_SERVICE_NAME, SERVICE_DESCRIPTION])?;
     // Automatic restart if the watchdog itself is killed (2 layers of protection).
     run_sc(&[
         "failure",
-        SERVICE_NAME,
+        WINDOWS_SERVICE_NAME,
         "reset=",
         "0",
         "actions=",
         "restart/5000/restart/5000/restart/5000",
     ])?;
-    run_sc(&["start", SERVICE_NAME])?;
+    run_sc(&["start", WINDOWS_SERVICE_NAME])?;
     harden_service_acl();
 
-    println!("[watchdog] service \"{SERVICE_NAME}\" installed and started.");
+    println!("[watchdog] service \"{WINDOWS_SERVICE_NAME}\" installed and started.");
     println!("  Alerts: {}", alerts_abs.display());
     println!("  Check: watchdog status");
     println!("  Uninstall: watchdog uninstall");
@@ -278,9 +278,9 @@ pub(crate) fn cmd_uninstall() -> anyhow::Result<()> {
     // stop`/`sc delete` to anyone but SYSTEM. Best-effort — a service that
     // was never hardened, or never installed, just no-ops here.
     reset_service_acl_best_effort();
-    let _ = run_sc(&["stop", SERVICE_NAME]);
-    run_sc(&["delete", SERVICE_NAME])?;
-    println!("[watchdog] service \"{SERVICE_NAME}\" removed.");
+    let _ = run_sc(&["stop", WINDOWS_SERVICE_NAME]);
+    run_sc(&["delete", WINDOWS_SERVICE_NAME])?;
+    println!("[watchdog] service \"{WINDOWS_SERVICE_NAME}\" removed.");
     Ok(())
 }
 

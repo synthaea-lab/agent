@@ -92,14 +92,14 @@ fn stop_orphaned_session(name: &str) {
 /// session that keeps costing ETW resources and, per #408's lab observation,
 /// may leave a freshly started session receiving zero events).
 ///
-/// Enumerates `logman query -ets` and stops every session matching our fixed
-/// `wtrace-` prefix (`normalize::random_session_name`) — no persisted state
+/// Enumerates `logman query -ets` and stops every session matching our session
+/// prefix ([`EtwNames::session_prefix`], `normalize::random_session_name`) — no persisted state
 /// needed, and it catches every orphan regardless of how many unclean shutdowns
 /// preceded this start. See `normalize::parse_orphaned_sessions` for the pure,
 /// tested parsing logic.
 ///
 /// Single-instance assumption (Jean's #408 review, non-blocking): this stops
-/// every live `wtrace-` session, not just ones this install actually orphaned
+/// every live session under the prefix, not just ones this install actually orphaned
 /// — correct only as long as at most one agent runs per host. Two instances
 /// overlapping even briefly (a watchdog restart racing a slow shutdown, a
 /// future Windows self-update swap, a manual `agent run` while the service is
@@ -113,7 +113,7 @@ fn stop_orphaned_session(name: &str) {
 /// Also best-effort removes the pre-#408 state file (`synthaea-etw-session`,
 /// see the old `session_state_path`) so a host upgraded from that version
 /// doesn't keep it around forever — the new mechanism doesn't use it.
-fn stop_all_orphaned_sessions() {
+fn stop_all_orphaned_sessions(prefix: &str) {
     let _ = std::fs::remove_file(std::env::temp_dir().join("synthaea-etw-session"));
     match etw_sessions::running_sessions() {
         Ok(snapshot) => {
@@ -128,6 +128,7 @@ fn stop_all_orphaned_sessions() {
                 .collect();
             let selected = normalize::select_orphaned_sessions(
                 &sessions,
+                prefix,
                 etw_sessions::MAX_SESSIONS,
                 snapshot.possibly_truncated,
             );
@@ -139,7 +140,7 @@ fn stop_all_orphaned_sessions() {
                     limit = etw_sessions::MAX_SESSIONS,
                     "QueryAllTracesW returned a full session list; checking logman for orphans beyond it"
                 );
-                stop_orphans_via_logman();
+                stop_orphans_via_logman(prefix);
             }
         }
         Err(status) => {
@@ -147,15 +148,15 @@ fn stop_all_orphaned_sessions() {
                 status,
                 "QueryAllTracesW failed; falling back to logman for ETW orphan enumeration"
             );
-            stop_orphans_via_logman();
+            stop_orphans_via_logman(prefix);
         }
     }
 }
 
-/// Enumerates `logman query -ets` and stops every `wtrace-` session in it. Used when
+/// Enumerates `logman query -ets` and stops every session under `prefix` in it. Used when
 /// `QueryAllTracesW` fails, and when its list is full and may hide some (a session
 /// the native pass already stopped is "not found" here, which is nominal).
-fn stop_orphans_via_logman() {
+fn stop_orphans_via_logman(prefix: &str) {
     let out = std::process::Command::new("logman")
         .args(["query", "-ets"])
         .output();
@@ -166,7 +167,7 @@ fn stop_orphans_via_logman() {
                 "ETW orphan enumeration succeeded via fallback"
             );
             let stdout = String::from_utf8_lossy(&o.stdout);
-            for name in normalize::parse_orphaned_sessions(&stdout) {
+            for name in normalize::parse_orphaned_sessions(&stdout, prefix) {
                 stop_orphaned_session(&name);
             }
         }
@@ -211,7 +212,7 @@ fn stop_session_after_failed_start(session: &str) {
 /// which foreign sessions enable our providers: a real-time one nobody consumes
 /// blinds every real-time consumer on the host (lab, 2026-10-01), so naming it
 /// is what the operator needs to act.
-fn silent_session_diagnosis(session: &str) -> String {
+fn silent_session_diagnosis(session: &str, prefix: &str) -> String {
     let (sessions, state) = match etw_sessions::running_sessions() {
         Ok(snapshot) => {
             if snapshot.possibly_truncated {
@@ -231,12 +232,12 @@ fn silent_session_diagnosis(session: &str) -> String {
                 .collect();
             let state =
                 if normalize::listing_is_conclusive(snapshot.possibly_truncated, &names, session) {
-                    normalize::describe_silent_session(session, Some(&names.join("\n")))
+                    normalize::describe_silent_session(session, prefix, Some(&names.join("\n")))
                 } else {
                     // A full list without our session: it may be one of those not
                     // returned, so "stopped from outside" would be a guess. Ask logman;
                     // if that fails too, the state is unknown.
-                    normalize::describe_silent_session(session, logman_listing().as_deref())
+                    normalize::describe_silent_session(session, prefix, logman_listing().as_deref())
                 };
             (sessions, state)
         }
@@ -246,7 +247,7 @@ fn silent_session_diagnosis(session: &str) -> String {
                 "QueryAllTracesW failed during blind-session diagnosis; falling back to logman"
             );
             let output = logman_listing();
-            let state = normalize::describe_silent_session(session, output.as_deref());
+            let state = normalize::describe_silent_session(session, prefix, output.as_deref());
             (Vec::new(), state)
         }
     };
@@ -415,8 +416,9 @@ fn seed_pid_store(state: &SharedState) {
 /// the session *name*, see `normalize::random_session_name`. Caller is
 /// responsible for orphan cleanup first (`stop_all_orphaned_sessions`); no state
 /// is persisted between runs, unlike the old per-name file (issue #408).
-fn new_session_name() -> String {
+fn new_session_name(prefix: &str) -> String {
     normalize::random_session_name(
+        prefix,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -436,11 +438,12 @@ fn liveness_watch(
     state: &SharedState,
     canary_file: &std::path::Path,
     session: &str,
+    prefix: &str,
 ) -> Result<(), SensorError> {
     let mut last_seen = state.events_seen.load(Ordering::Relaxed);
     let mut silent_intervals = 0u32;
     while !stop.load(Ordering::SeqCst) {
-        let _ = std::fs::write(canary_file, b"synthaea liveness canary");
+        let _ = std::fs::write(canary_file, b"liveness canary");
         std::thread::sleep(std::time::Duration::from_millis(2_000));
         let seen = state.events_seen.load(Ordering::Relaxed);
         if seen == last_seen {
@@ -450,7 +453,7 @@ fn liveness_watch(
                 return Err(format!(
                     "sensor produced no events for 30s despite liveness canary \
                      writes: {}",
-                    silent_session_diagnosis(session)
+                    silent_session_diagnosis(session, prefix)
                 )
                 .into());
             }
@@ -464,17 +467,33 @@ fn liveness_watch(
 
 // ── The sensor ───────────────────────────────────────────────────────────────
 
+/// The names the sensor leaves on the host, chosen by the agent (#596): this
+/// crate depends only on `schema`, so it cannot read the agent's identity
+/// constants itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EtwNames {
+    /// Prefix of every session name; a random suffix follows it per start.
+    /// Startup stops every running session under it as an orphan (#408), so it
+    /// must stay the same from one start to the next on a host.
+    pub session_prefix: String,
+    /// Prefix of the liveness canary file in the temp directory; the process
+    /// id follows it.
+    pub canary_prefix: String,
+}
+
 /// The Windows ETW sensor: owns the trace session and consumer thread, and
 /// implements `schema::sensor::Sensor` (see the crate doc for provider coverage).
 pub struct WindowsSensor {
     stop: Arc<AtomicBool>,
+    names: EtwNames,
 }
 
 impl WindowsSensor {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(names: EtwNames) -> Self {
         Self {
             stop: Arc::new(AtomicBool::new(false)),
+            names,
         }
     }
 
@@ -482,12 +501,6 @@ impl WindowsSensor {
     #[must_use]
     pub fn stop_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.stop)
-    }
-}
-
-impl Default for WindowsSensor {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -514,8 +527,11 @@ impl Sensor for WindowsSensor {
         self.stop.store(false, Ordering::SeqCst);
         let sink: Arc<dyn EventSink> = Arc::from(sink);
 
-        let canary_file =
-            std::env::temp_dir().join(format!("synthaea-canary-{}", std::process::id()));
+        let canary_file = std::env::temp_dir().join(format!(
+            "{}{}",
+            self.names.canary_prefix,
+            std::process::id()
+        ));
         let (marks, mark_rx) = MarkQueue::bounded(MARK_QUEUE_CAPACITY);
         spawn_mark_reader(mark_rx, Arc::clone(&sink))?;
         let state = Arc::new(SharedState {
@@ -541,8 +557,9 @@ impl Sensor for WindowsSensor {
 
         seed_pid_store(&state);
 
-        stop_all_orphaned_sessions();
-        let session = new_session_name();
+        let prefix = self.names.session_prefix.as_str();
+        stop_all_orphaned_sessions(prefix);
+        let session = new_session_name(prefix);
 
         let builder = UserTrace::new()
             .named(session.clone())
@@ -566,7 +583,7 @@ impl Sensor for WindowsSensor {
         )
         .map_err(|e| -> SensorError { format!("ETW startup error: {e:?}").into() })?;
 
-        let result = liveness_watch(&self.stop, &state, &canary_file, &session);
+        let result = liveness_watch(&self.stop, &state, &canary_file, &session, prefix);
 
         let _ = trace.stop();
         let _ = std::fs::remove_file(&canary_file);
