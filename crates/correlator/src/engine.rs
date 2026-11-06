@@ -158,8 +158,9 @@ pub struct CorrelationEngine {
 pub enum KillShield {
     /// The main process of a system service, started by init (#652).
     ServiceMain,
-    /// The process holding an interactive login session, exec'd by a service main:
-    /// killing it cuts the operator's session (#1142). Its children are not shielded.
+    /// The process holding an interactive login session (`sshd-session` exec'd by
+    /// `sshd`, `policy::is_login_session`): killing it cuts the operator's session
+    /// (#1142). Its children are not shielded.
     LoginSession,
 }
 
