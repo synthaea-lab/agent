@@ -14,16 +14,12 @@
 
 use std::sync::Arc;
 
+use config::identity::{WATCHDOG_RESTARTS_ENV, WATCHDOG_TAMPER_EVENTS_ENV};
+
 use crate::{
     health::{HostCounters, HostCountersSource},
     sink::DetectionSink,
 };
-
-/// The variables the watchdog sets for the agent it spawns. The watchdog has no dependency on this
-/// crate, so `watchdog/src/supervise.rs` spells the same two names; a test below checks that it
-/// still does.
-pub(crate) const WATCHDOG_RESTARTS_ENV: &str = "SYNTHAEA_WATCHDOG_RESTARTS";
-pub(crate) const WATCHDOG_TAMPER_EVENTS_ENV: &str = "SYNTHAEA_WATCHDOG_TAMPER_EVENTS";
 
 /// What the watchdog told this agent at spawn. Zero when the agent runs without a watchdog, and
 /// for a variable that is missing or is not a number: a beacon must not fail over a bad variable.
@@ -146,18 +142,6 @@ mod tests {
                     tamper_events: 7
                 },
                 "{bad:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_watchdog_spells_the_same_two_variables() {
-        // The watchdog does not depend on this crate, so nothing else ties the two spellings.
-        let watchdog = include_str!("../../watchdog/src/supervise.rs");
-        for name in [WATCHDOG_RESTARTS_ENV, WATCHDOG_TAMPER_EVENTS_ENV] {
-            assert!(
-                watchdog.contains(&format!("\"{name}\"")),
-                "watchdog/src/supervise.rs no longer names {name}"
             );
         }
     }

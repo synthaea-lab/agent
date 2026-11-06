@@ -7,7 +7,8 @@
 //! - **F-1**: the command line is the REAL command line, read from the target's PEB
 //!   (`NtQueryInformationProcess` + `ReadProcessMemory`), never the image path.
 //! - **F-2**: the session name is randomized per start, but under a fixed
-//!   `wtrace-` prefix — every session matching it is enumerated and stopped at
+//!   prefix the agent passes in (`EtwNames`, `wtrace-` today, #596) — every
+//!   session matching it is enumerated and stopped at
 //!   startup (issue #408 — catches every orphan left by any number of consecutive
 //!   unclean shutdowns, not just the most recent). That prefix is itself a
 //!   fingerprint: an attacker can enumerate our session exactly the way we do
@@ -43,6 +44,11 @@
 //! `schema::BitsJobEvent` with the job's client process as the actor (BITS
 //! does the network I/O from its own service), Microsoft update jobs dropped
 //! — see [`bits`].
+//!
+//! Container attribution (#371): a process in a process-isolated container
+//! (a server silo) carries `EventMeta::container`, its id named by the Host
+//! Compute Service — see `silo`. Hyper-V-isolated containers run their own
+//! kernel and are invisible to this sensor by design.
 
 #[cfg(any(windows, test))]
 mod amsi;
@@ -51,6 +57,8 @@ pub mod bits;
 mod budget;
 #[cfg(windows)]
 mod etw_sessions;
+#[cfg(windows)]
+mod hcs;
 #[cfg(any(windows, test))]
 mod long_path;
 pub mod normalize;
@@ -61,11 +69,13 @@ mod providers;
 
 #[cfg(windows)]
 mod sensor;
+#[cfg(any(windows, test))]
+mod silo;
 #[cfg(windows)]
 mod winapi;
 pub mod zone_identifier;
 #[cfg(windows)]
-pub use sensor::WindowsSensor;
+pub use sensor::{EtwNames, WindowsSensor};
 #[cfg(windows)]
 pub use winapi::image_file_id;
 

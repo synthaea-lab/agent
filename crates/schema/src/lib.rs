@@ -336,13 +336,70 @@ pub mod time;
 ///
 /// Bumped 59 → 62 for [`Event::UnitStop`] (#1085): the stop of a security-tool systemd unit as an
 /// event of its own, replacing a `FileOpenEvent` carrying `FLAG_UNIT_STOPPED`. A raw `openat`
-/// flag can carry any bit, so an unprivileged open could set that one. 60 was first claimed by
-/// #1114 and is skipped (#1114 is 63 below); 61 is #1116.
+/// flag can carry any bit, so an unprivileged open could set that one.
 ///
-/// Bumped 62 → 63 for [`SignalEvent::target_unit`] (#1103): the systemd unit of the signalled
+/// Bumped 62 → 65 for [`ExecEvent::cmdline_truncated`] (#1112): a sensor now
+/// bounds argv at capture and flags the cut. First claimed 61 while #1114 held 60;
+/// #1085 landed first with 62, #1114 renumbered to 63 and #720 (#1150) claims 64,
+/// so this takes 65. Whichever of those merges later renumbers, same coordination
+/// note as above.
+///
+/// Bumped 65 → 66 for [`SignalEvent::target_unit`] (#1103): the systemd unit of the signalled
 /// process, so an alert on a signal to a security tool names the tool and not only an image path;
 /// and for [`SignalEvent::signals_lost`], the report of signals the sensor had no room for.
-pub const SCHEMA_VERSION: u32 = 63;
+/// First claimed 60, then 63; #1116 took 65, so this takes 66.
+pub const SCHEMA_VERSION: u32 = 66;
+
+/// Bytes of argv, one separator per token included, a sensor keeps for one exec
+/// ([`bound_argv`], #1112).
+///
+/// Without it, one unprivileged exec with a ~2 MiB padded argv (the Linux kernel's
+/// quarter-stack ceiling) is carried twice per [`ExecEvent`] (`cmdline` and
+/// `argv`), then expanded up to 6× by JSON escaping: a 21.6 MB detection the
+/// server's 8 MiB body limit refuses with a permanent 413, and the agent drops
+/// the whole spool segment it was batched in, every unrelated detection with it.
+///
+/// 32 KiB, from data (#1112, Alpine lab VM, 3,451 benign execs): p99.9 347 B,
+/// max 1,661 B, none over 4 KiB. It also matches the order of Windows' own
+/// `CreateProcess` ceiling (32,766 UTF-16 units), so the long encoded-PowerShell
+/// command lines F-1/F-4 protects are never near it. Worst case one exec then
+/// serializes to about 2 × 32 KiB × 6 = 384 KiB.
+pub const ARGV_CAPTURE_BUDGET: usize = 32 * 1024;
+
+/// Cuts `argv` to [`ARGV_CAPTURE_BUDGET`], keeping its head, and returns whether
+/// anything was cut — the value for [`ExecEvent::cmdline_truncated`].
+///
+/// Each token costs its length plus one separator (the space of
+/// [`ExecEvent::cmdline`], the NUL of [`ExecEvent::ml_cmdline`]), so a flood of
+/// empty arguments is bounded too. The token that crosses the budget is kept up
+/// to it, cut on a character boundary, rather than dropped: the head of a long
+/// encoded payload is what a rule matches on. Truncation, never rejection — a
+/// rejected event is a detection the attacker chose to erase.
+#[must_use]
+pub fn bound_argv(argv: &mut Vec<String>) -> bool {
+    let mut used = 0usize;
+    let mut crossing = None;
+    for (index, token) in argv.iter().enumerate() {
+        let cost = token.len().saturating_add(1);
+        if cost > ARGV_CAPTURE_BUDGET - used {
+            crossing = Some(index);
+            break;
+        }
+        used += cost;
+    }
+    let Some(index) = crossing else {
+        return false;
+    };
+    let mut keep = (ARGV_CAPTURE_BUDGET - used).saturating_sub(1);
+    let token = &mut argv[index];
+    while !token.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    token.truncate(keep);
+    let kept = if keep == 0 { index } else { index + 1 };
+    argv.truncate(kept);
+    true
+}
 
 /// Marker set on [`FileOpenEvent::flags`] by `sensor-windows-eventlog` when it
 /// reports a Windows **service install** as a persistence artifact (event 7045, "A
@@ -591,9 +648,10 @@ pub struct EventMeta {
     /// property reported by conformance, not a schema limit.
     pub comm: String,
     /// Container the emitting process runs in, when the sensor can attribute one.
-    /// `None` on every platform without container support (Windows, macOS) and on
-    /// bare-metal/VM Linux processes — this is not a Kubernetes pod/namespace context
-    /// (out of scope, issue #80), just the container runtime's own identity.
+    /// `None` on macOS, on bare-metal/VM Linux processes, and on Windows host
+    /// processes (Windows attributes process-isolated containers only, from the
+    /// ETW sensor, #371) — this is not a Kubernetes pod/namespace context (out of
+    /// scope, issue #80), just the container runtime's own identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<ContainerContext>,
     /// Opaque stamp of this incarnation of `pid`, for telling a recycled pid from
@@ -614,17 +672,21 @@ pub struct EventMeta {
     pub parent_process_generation: Option<u64>,
 }
 
-/// Identity of the container a process runs in, resolved from its cgroup (issue #80).
+/// Identity of the container a process runs in, resolved from its cgroup on Linux
+/// (issue #80) and from its server silo on Windows (#371).
 ///
-/// `id` is the only field a Linux sensor can fill today (cgroup path parsing alone,
-/// no daemon call). `image`/`name` need a cached lookup against the Docker/containerd
+/// `id` is the only field a sensor can fill today (cgroup path parsing alone on
+/// Linux, the Host Compute Service on Windows; no daemon call). `image`/`name` need a cached lookup against the Docker/containerd
 /// socket — deliberately left as a follow-up so this attribution foundation doesn't
 /// block on it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerContext {
     /// Full container id, as it appears in the cgroup path (64 hex chars for
     /// Docker/containerd) — not truncated to the 12-char short id, so it stays a
-    /// stable join key for a later Docker/containerd socket lookup.
+    /// stable join key for a later Docker/containerd socket lookup. On Windows,
+    /// the Host Compute Service's compute-system id (the same Docker/containerd
+    /// id), or `silo:<n>` (the server silo id) until the service has named the
+    /// container: still a container, just not yet a joinable one.
     pub id: String,
     /// Image reference (e.g. `nginx:1.27`). `None` until the socket lookup lands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -642,14 +704,22 @@ pub struct ExecEvent {
     /// Full path of the executed image, as the platform reports it (normalized to a
     /// drive-letter path on Windows — audit F-5).
     pub image_path: String,
-    /// The command line as one string, unbounded (audit F-1/F-4: this field is what
-    /// the base64 rule, encoded-PowerShell Sigma rules, and the ML cmdline features
-    /// evaluate — it must never be a truncated placeholder for the image path).
+    /// The command line as one string (audit F-1/F-4: this field is what the base64
+    /// rule, encoded-PowerShell Sigma rules, and the ML cmdline features evaluate —
+    /// it must never be a truncated placeholder for the image path). Not cut by the
+    /// schema; a Linux sensor bounds the argv it renders from at capture
+    /// ([`bound_argv`], #1112) and says so in [`Self::cmdline_truncated`].
     pub cmdline: String,
     /// Argument vector where the platform provides one (Unix execve). Empty on
     /// platforms that only have a flat command line (Windows); consumers fall back
     /// to [`ExecEvent::cmdline`].
     pub argv: Vec<String>,
+    /// `true` when the sensor cut [`Self::argv`] (and so [`Self::cmdline`]) to
+    /// [`ARGV_CAPTURE_BUDGET`] at capture. A rule that finds no match in a cut
+    /// command line has not seen all of it: the missing tail is where a padded
+    /// exec would hide its payload (#1112).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cmdline_truncated: bool,
     /// Parent process short name, captured by the sensor *at exec time*. Lineage is a
     /// first-class detection input (parent→child transition rarity, ancestry
     /// features — see "Behavior over time" in `docs/detection/ml.md`); sensors that
@@ -2847,5 +2917,65 @@ mod write_intent_tests {
             has_write_intent(0o3 | super::O_CREAT),
             "creation still counts"
         );
+    }
+}
+
+#[cfg(test)]
+mod bound_argv_tests {
+    use super::{ARGV_CAPTURE_BUDGET, bound_argv};
+
+    fn cost(argv: &[String]) -> usize {
+        argv.iter().map(|token| token.len() + 1).sum()
+    }
+
+    #[test]
+    fn an_argv_within_the_budget_is_left_alone() {
+        let mut argv = vec!["curl".to_string(), "-fsSL".into(), "https://x.test".into()];
+        let before = argv.clone();
+        assert!(!bound_argv(&mut argv));
+        assert_eq!(argv, before);
+    }
+
+    #[test]
+    fn an_argv_exactly_at_the_budget_is_not_truncated() {
+        let mut argv = vec!["a".repeat(ARGV_CAPTURE_BUDGET - 1)];
+        assert!(!bound_argv(&mut argv));
+        assert_eq!(argv[0].len(), ARGV_CAPTURE_BUDGET - 1);
+    }
+
+    #[test]
+    fn a_padded_argv_keeps_its_head_and_is_flagged() {
+        let payload = format!("echo {}", "Q".repeat(2 * 1024 * 1024));
+        let mut argv = vec!["sh".to_string(), "-c".into(), payload];
+        assert!(bound_argv(&mut argv));
+        assert_eq!(cost(&argv), ARGV_CAPTURE_BUDGET);
+        assert_eq!(argv[..2], ["sh", "-c"]);
+        assert!(
+            argv[2].starts_with("echo QQQ"),
+            "the crossing token keeps its head"
+        );
+    }
+
+    #[test]
+    fn a_flood_of_empty_arguments_is_bounded() {
+        let mut argv = vec![String::new(); 1_000_000];
+        assert!(bound_argv(&mut argv));
+        assert_eq!(argv.len(), ARGV_CAPTURE_BUDGET);
+    }
+
+    #[test]
+    fn the_cut_lands_on_a_character_boundary() {
+        // 'é' is two bytes: with an odd byte budget left, a byte cut would split it.
+        let mut argv = vec!["x".into(), "é".repeat(ARGV_CAPTURE_BUDGET)];
+        assert!(bound_argv(&mut argv));
+        assert!(cost(&argv) <= ARGV_CAPTURE_BUDGET);
+        assert!(argv[1].chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn no_room_left_drops_the_crossing_token_instead_of_keeping_it_empty() {
+        let mut argv = vec!["a".repeat(ARGV_CAPTURE_BUDGET - 1), "tail".into()];
+        assert!(bound_argv(&mut argv));
+        assert_eq!(argv.len(), 1);
     }
 }

@@ -168,12 +168,13 @@ fn meta(
 /// missed it. `env_security` is passed in by the caller the same way as `argv` — the
 /// Linux sensor reads it from `/proc/<pid>/environ` when it drains the event (issue
 /// #363; same drain-time-read tradeoffs as `argv`, see `read_proc_environ_security`),
-/// already filtered to the security-relevant allowlist.
+/// already filtered to the security-relevant allowlist. `argv` is cut to
+/// [`schema::ARGV_CAPTURE_BUDGET`] here, the one place every exec passes (#1112).
 #[must_use]
 pub fn exec(
     event: &wire::ExecEvent,
     boot_epoch_offset_ns: u64,
-    argv: Vec<String>,
+    mut argv: Vec<String>,
     env_security: Vec<(String, String)>,
     container: Option<ContainerContext>,
 ) -> Event {
@@ -183,12 +184,14 @@ pub fn exec(
         .position(|&b| b == 0)
         .unwrap_or(image_raw.len());
     let image_path = String::from_utf8_lossy(&image_raw[..image_end]).into_owned();
+    let cmdline_truncated = schema::bound_argv(&mut argv);
 
     Event::Exec(ExecEvent {
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
         image_path,
         cmdline: argv.join(" "),
         argv,
+        cmdline_truncated,
         parent_comm: comm_opt(&event.pcomm),
         // eBPF has the parent comm but not its full path: the sensor fills it from its
         // pid-to-image cache (`parent_image`, #768).
@@ -972,6 +975,7 @@ mod tests {
         };
         assert_eq!(e.argv, ["curl", "-o", "/tmp/x"]);
         assert_eq!(e.cmdline, "curl -o /tmp/x");
+        assert!(!e.cmdline_truncated);
         assert_eq!(e.image_path, "/usr/bin/curl");
         assert_eq!(e.parent_comm.as_deref(), Some("bash"));
         assert_eq!(e.meta.timestamp_ns, 1_500, "boot offset applied");
@@ -981,6 +985,28 @@ mod tests {
                 uid: 1000,
                 gid: 1000
             }
+        );
+    }
+
+    #[test]
+    fn exec_cuts_a_padded_argv_and_flags_it() {
+        // #1112: an unprivileged exec with ~2 MiB of control bytes once became a
+        // 21.6 MB detection, refused for good by the server, taking its whole spool
+        // segment with it. Control bytes are the worst case: 6 JSON bytes each.
+        let event = wire_exec(b"/bin/sh", b"bash");
+        let padding = "\u{1}".repeat(2 * 1024 * 1024);
+        let event = exec(&event, 0, argv(&["sh", "-c", &padding]), Vec::new(), None);
+        let Event::Exec(e) = &event else {
+            panic!("wrong variant")
+        };
+        assert!(e.cmdline_truncated);
+        assert_eq!(e.argv[..2], ["sh", "-c"], "the head is kept");
+        assert!(e.cmdline.len() < schema::ARGV_CAPTURE_BUDGET);
+        let serialized = serde_json::to_vec(&event).expect("an event serializes");
+        assert!(
+            serialized.len() < 512 * 1024,
+            "one exec serializes to {} bytes",
+            serialized.len()
         );
     }
 

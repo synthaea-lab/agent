@@ -1,7 +1,10 @@
 //! Stateless rules (base64, persistence writes) and the Linux stateful rules
 //! (web-server→shell lineage, download-then-exec).
 
+use schema::detection::Severity;
+
 use super::*;
+use crate::check_truncated_cmdline;
 
 #[test]
 fn base64_decode_matches() {
@@ -19,6 +22,74 @@ fn base64_without_decode_flag_does_not_match() {
 fn benign_curl_does_not_match_base64() {
     let event = exec_event("curl -f http://backend:8000/api/health/");
     assert!(check_base64_decode(&event).is_none());
+}
+
+// ── T1027.010 command line cut at capture (#1112, stateless) ──────────────
+
+/// The exec a sensor emits for `sh -c "<pad>; echo X | base64 -d | sh"` once the
+/// argv crossed the capture budget: the payload after the padding is gone.
+fn padded_exec_after_the_cut() -> ExecEvent {
+    let mut argv = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        format!(
+            "{}; echo cGF5bG9hZAo= | base64 -d | sh",
+            " ".repeat(40 * 1024)
+        ),
+    ];
+    let cut = schema::bound_argv(&mut argv);
+    assert!(cut, "40 KiB of padding must cross the budget");
+    ExecEvent {
+        cmdline: argv.join(" "),
+        argv,
+        cmdline_truncated: cut,
+        ..exec_event("")
+    }
+}
+
+#[test]
+fn a_padded_command_line_that_hides_its_payload_from_the_content_rules_still_alerts() {
+    let event = padded_exec_after_the_cut();
+    assert!(
+        check_base64_decode(&event).is_none(),
+        "the payload sits past the cut, so the content rule is blind to it"
+    );
+    let alerts = crate::evaluate_exec(&event);
+    let alert = alerts
+        .iter()
+        .find(|a| a.technique == "T1027.010")
+        .expect("the cut itself must raise an alert");
+    assert_eq!(alert.severity, Severity::Medium);
+    assert!(alert.message.contains("cut at capture"));
+}
+
+#[test]
+fn a_command_line_that_was_not_cut_raises_no_truncation_alert() {
+    let event = exec_event("bash -c echo hello");
+    assert!(check_truncated_cmdline(&event).is_none());
+}
+
+#[test]
+fn a_truncation_alert_quotes_only_the_head_of_the_kept_command_line() {
+    let event = padded_exec_after_the_cut();
+    let alert = check_truncated_cmdline(&event).expect("a cut command line alerts");
+    assert!(
+        alert.message.len() < 1024,
+        "the alert must not carry the 32 KiB kept command line: {} bytes",
+        alert.message.len()
+    );
+}
+
+#[test]
+fn a_truncation_alert_cuts_its_quote_on_a_character_boundary() {
+    // 'é' is two bytes: at an odd offset the 256-byte quote limit falls inside one.
+    let event = ExecEvent {
+        cmdline: format!("x{}", "é".repeat(200)),
+        cmdline_truncated: true,
+        ..exec_event("")
+    };
+    let alert = check_truncated_cmdline(&event).expect("a cut command line alerts");
+    assert!(alert.message.ends_with('é'));
 }
 
 // ── T1059.001 PowerShell EncodedCommand (stateless, platform-neutral) ──────

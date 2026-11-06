@@ -5,11 +5,13 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
+use config::identity::{LAUNCHD_LABEL, UNIX_WATCHDOG_LOG};
 
 use super::resolve_paths;
 
-const LAUNCHD_LABEL: &str = "com.synthaea.agent";
-const LAUNCHD_PLIST: &str = "/Library/LaunchDaemons/com.synthaea.agent.plist";
+fn plist_path() -> String {
+    format!("/Library/LaunchDaemons/{LAUNCHD_LABEL}.plist")
+}
 
 /// Minimal escaping for text nodes in the generated plist (paths may contain
 /// `&`, `<`, `>` — anything else is legal as-is inside an XML text node).
@@ -46,13 +48,14 @@ fn launchd_plist(watchdog: &Path, agent: &Path, alerts: &Path) -> String {
     <key>ThrottleInterval</key>
     <integer>5</integer>
     <key>StandardOutPath</key>
-    <string>/var/log/synthaea-watchdog.log</string>
+    <string>{log}</string>
     <key>StandardErrorPath</key>
-    <string>/var/log/synthaea-watchdog.log</string>
+    <string>{log}</string>
 </dict>
 </plist>
 "#,
         label = LAUNCHD_LABEL,
+        log = UNIX_WATCHDOG_LOG,
         watchdog = xml_escape(&watchdog.to_string_lossy()),
         agent = xml_escape(&agent.to_string_lossy()),
         alerts = xml_escape(&alerts.to_string_lossy()),
@@ -66,23 +69,24 @@ pub(crate) fn cmd_install(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow
     // Linux, so a macOS install from ~/Downloads passed unexamined).
     let paths = resolve_paths(agent_bin, alerts)?;
 
+    let plist = plist_path();
     std::fs::write(
-        LAUNCHD_PLIST,
+        &plist,
         launchd_plist(&paths.watchdog_abs, &paths.agent_abs, &paths.alerts_abs),
     )
-    .with_context(|| format!("writing {LAUNCHD_PLIST} (root required)"))?;
+    .with_context(|| format!("writing {plist} (root required)"))?;
     // #103: same treatment the systemd unit gets — don't rely on umask for a
     // root-owned service definition's permissions.
-    crate::tamper::harden_permissions(Path::new(LAUNCHD_PLIST), 0o644)
-        .with_context(|| format!("hardening permissions on {LAUNCHD_PLIST}"))?;
-    crate::tamper::harden_ownership(Path::new(LAUNCHD_PLIST))
-        .with_context(|| format!("hardening ownership on {LAUNCHD_PLIST}"))?;
-    run_launchctl(&["bootstrap", "system", LAUNCHD_PLIST])?;
+    crate::tamper::harden_permissions(Path::new(&plist), 0o644)
+        .with_context(|| format!("hardening permissions on {plist}"))?;
+    crate::tamper::harden_ownership(Path::new(&plist))
+        .with_context(|| format!("hardening ownership on {plist}"))?;
+    run_launchctl(&["bootstrap", "system", &plist])?;
 
     println!("[watchdog] launchd daemon installed and started.");
     println!("  Alerts: {}", paths.alerts_abs.display());
     println!("  Check: watchdog status");
-    println!("  Logs : /var/log/synthaea-watchdog.log (watchdog and agent output)");
+    println!("  Logs : {UNIX_WATCHDOG_LOG} (watchdog and agent output)");
     println!("  Uninstall: watchdog uninstall");
     Ok(())
 }
@@ -91,8 +95,9 @@ pub(crate) fn cmd_uninstall() -> anyhow::Result<()> {
     // bootout fails when the daemon is not loaded — like the systemd/SCM arms,
     // uninstall still removes the on-disk definition in that case.
     let _ = run_launchctl(&["bootout", &format!("system/{LAUNCHD_LABEL}")]);
-    if std::path::Path::new(LAUNCHD_PLIST).exists() {
-        std::fs::remove_file(LAUNCHD_PLIST).with_context(|| format!("removing {LAUNCHD_PLIST}"))?;
+    let plist = plist_path();
+    if Path::new(&plist).exists() {
+        std::fs::remove_file(&plist).with_context(|| format!("removing {plist}"))?;
     }
     println!("[watchdog] {LAUNCHD_LABEL} daemon uninstalled.");
     Ok(())
