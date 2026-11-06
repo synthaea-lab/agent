@@ -85,6 +85,13 @@ fn load_embedded(tamper_pin: Option<&std::path::Path>) -> Result<aya::Ebpf, Sens
             tracing::warn!(error = %e, "inode_setattr offsets unavailable: timestamp hook disabled");
         })
         .ok();
+    // argv at exec (#1118) is optional the same way: without the offsets the probe reads none
+    // and the drain falls back to `/proc/<pid>/cmdline`.
+    let argv = crate::btf::read_exec_argv_offsets()
+        .map_err(|e| {
+            tracing::warn!(error = %e, "exec argv offsets unavailable: argv read from /proc only");
+        })
+        .ok();
     let enabled = 1u32;
 
     let mut loader = aya::EbpfLoader::new();
@@ -103,6 +110,13 @@ fn load_embedded(tamper_pin: Option<&std::path::Path>) -> Result<aya::Ebpf, Sens
             .override_global("IATTR_MTIME_OFFSET", &o.ia_mtime, true)
             .override_global("DENTRY_PARENT_OFFSET", &o.dentry_parent, true)
             .override_global("DENTRY_NAME_PTR_OFFSET", &o.dentry_name_ptr, true);
+    }
+    if let Some(o) = &argv {
+        loader
+            .override_global("EXEC_ARGV_ENABLED", &enabled, true)
+            .override_global("TASK_MM_OFFSET", &o.task_mm, true)
+            .override_global("MM_ARG_START_OFFSET", &o.mm_arg_start, true)
+            .override_global("MM_ARG_END_OFFSET", &o.mm_arg_end, true);
     }
     if let Some(path) = tamper_pin {
         loader.map_pin_path("SIGNAL_TAMPER_LAST", path);

@@ -249,6 +249,35 @@ pub(crate) fn read_inode_setattr_offsets()
         .map_err(|e| format!("invalid kernel BTF: {e}").into())
 }
 
+/// Byte offsets the exec probe needs to copy argv at `sched_process_exec` (#1118): the task's
+/// `mm` pointer and the bounds of the argument strings in it (`mm_struct` keeps them inside an
+/// anonymous struct, which `member_offset` looks through).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExecArgvOffsets {
+    pub(crate) task_mm: u32,
+    pub(crate) mm_arg_start: u32,
+    pub(crate) mm_arg_end: u32,
+}
+
+/// Reads `/sys/kernel/btf/vmlinux` for the exec probe's argv fields.
+pub(crate) fn read_exec_argv_offsets()
+-> Result<ExecArgvOffsets, Box<dyn std::error::Error + Send + Sync>> {
+    parse_exec_argv_offsets(&fs::read(Path::new("/sys/kernel/btf/vmlinux"))?)
+        .map_err(|e| format!("invalid kernel BTF: {e}").into())
+}
+
+fn parse_exec_argv_offsets(data: &[u8]) -> Result<ExecArgvOffsets, &'static str> {
+    let table = parse_type_table(data)?;
+    let field = |strukt: &[u8], member: &[u8], missing: &'static str| {
+        table.member_offset(strukt, member)?.ok_or(missing)
+    };
+    Ok(ExecArgvOffsets {
+        task_mm: field(b"task_struct", b"mm", "task_struct.mm is missing")?,
+        mm_arg_start: field(b"mm_struct", b"arg_start", "mm_struct.arg_start is missing")?,
+        mm_arg_end: field(b"mm_struct", b"arg_end", "mm_struct.arg_end is missing")?,
+    })
+}
+
 /// One type record of the BTF type section.
 struct TypeRecord {
     kind: u32,
@@ -771,6 +800,16 @@ mod tests {
             assert_eq!(offsets.ia_valid, 0, "ia_valid leads struct iattr");
             assert!(offsets.ia_mtime > offsets.ia_atime);
             assert!(offsets.dentry_parent < 256 && offsets.dentry_name_ptr < 256);
+        }
+    }
+
+    #[test]
+    fn parses_running_kernel_exec_argv_offsets_when_available() {
+        if Path::new("/sys/kernel/btf/vmlinux").exists() {
+            let offsets = read_exec_argv_offsets().expect("running kernel BTF has them");
+            // `arg_end` follows `arg_start` (two `unsigned long`s side by side).
+            assert_eq!(offsets.mm_arg_end, offsets.mm_arg_start + 8);
+            assert!(offsets.task_mm < 8192);
         }
     }
 

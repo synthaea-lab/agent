@@ -71,6 +71,7 @@ pub fn exec() -> ExecEvent {
         cmdline: String::new(),
         argv: Vec::new(),
         cmdline_truncated: false,
+        argv_omitted_bytes: None,
         parent_comm: None,
         parent_image_path: None,
         sha256: None,

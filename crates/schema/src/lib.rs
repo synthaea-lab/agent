@@ -348,7 +348,11 @@ pub mod time;
 /// process, so an alert on a signal to a security tool names the tool and not only an image path;
 /// and for [`SignalEvent::signals_lost`], the report of signals the sensor had no room for.
 /// First claimed 60, then 63; #1116 took 65, so this takes 66.
-pub const SCHEMA_VERSION: u32 = 66;
+///
+/// Bumped 66 → 67 for [`ExecEvent::argv_omitted_bytes`] (#1118, ADR-0045): the
+/// Linux exec probe reads a head and a tail window of the argument block and says
+/// how much of it lies between them.
+pub const SCHEMA_VERSION: u32 = 67;
 
 /// Bytes of argv, one separator per token included, a sensor keeps for one exec
 /// ([`bound_argv`], #1112).
@@ -714,12 +718,21 @@ pub struct ExecEvent {
     /// platforms that only have a flat command line (Windows); consumers fall back
     /// to [`ExecEvent::cmdline`].
     pub argv: Vec<String>,
-    /// `true` when the sensor cut [`Self::argv`] (and so [`Self::cmdline`]) to
-    /// [`ARGV_CAPTURE_BUDGET`] at capture. A rule that finds no match in a cut
-    /// command line has not seen all of it: the missing tail is where a padded
-    /// exec would hide its payload (#1112).
+    /// `true` when the sensor knows some bytes of the argument block were not
+    /// captured: [`Self::argv_omitted_bytes`] is `Some(n)` with `n > 0`, or the
+    /// command line was cut to [`ARGV_CAPTURE_BUDGET`] (#1112). A rule that finds no
+    /// match in a cut command line has not seen all of it: the missing part is where
+    /// a padded exec would hide its payload. `false` means "no cut seen", not "the
+    /// whole command line was seen": see [`Self::argv_omitted_bytes`]'s `None`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cmdline_truncated: bool,
+    /// How many bytes of the argument block the sensor did not capture (ADR-0045,
+    /// #1118): `Some(0)` when it captured the whole block, `Some(n)` when `n` bytes
+    /// between a head and a tail window were not read, `None` when unknown (the
+    /// sensor saw nothing to measure against, or a cut whose size it did not
+    /// measure). A rule must never read `None` as "complete".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argv_omitted_bytes: Option<u32>,
     /// Parent process short name, captured by the sensor *at exec time*. Lineage is a
     /// first-class detection input (parent→child transition rarity, ancestry
     /// features — see "Behavior over time" in `docs/detection/ml.md`); sensors that

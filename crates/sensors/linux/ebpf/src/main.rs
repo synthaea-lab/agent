@@ -18,15 +18,16 @@ use aya_ebpf::{
 };
 use aya_log_ebpf::{info, warn};
 use sensor_linux_wire::{
-    BpfEvent, CapSetEvent, ConnectEvent, DnsUdpQueryEvent, ExecEvent, FileChmodEvent,
-    FileChownEvent, FileDeleteEvent, FileOpenEvent, FileRemovexattrEvent, FileRenameEvent,
-    FileSetTimeEvent, FileSetxattrEvent, FileWriteEvent, GetAddrInfoEvent, IdentityChangeEvent,
-    KernelModuleEvent, LineageEntry, MAX_DNS_ANSWERS, MAX_DNS_UDP_PAYLOAD, MAX_TLS_CAPTURE,
-    MemfdCreateEvent, MountEvent, NamespaceEvent, PrctlEvent, ProcessVmReadEvent,
-    ProcessVmWriteEvent, PtraceEvent, ReadlineInputEvent, SET_TIME_ATIME, SET_TIME_COMPONENT_LEN,
-    SET_TIME_COMPONENTS, SET_TIME_MTIME, SET_TIME_TRUNCATED, SignalEvent, SocketAcceptEvent,
-    SocketBindEvent, SocketCreateEvent, SocketListenEvent, TASK_COMM_LEN, TlsCaptureEvent,
-    UdpRecvEvent, UdpSendEvent, is_filtered_path,
+    ARGV_HEAD_BYTES, ARGV_TAIL_BYTES, ARGV_WINDOW_BYTES, BpfEvent, CapSetEvent, ConnectEvent,
+    DnsUdpQueryEvent, ExecEvent, ExecRecord, FileChmodEvent, FileChownEvent, FileDeleteEvent,
+    FileOpenEvent, FileRemovexattrEvent, FileRenameEvent, FileSetTimeEvent, FileSetxattrEvent,
+    FileWriteEvent, GetAddrInfoEvent, IdentityChangeEvent, KernelModuleEvent, LineageEntry,
+    MAX_DNS_ANSWERS, MAX_DNS_UDP_PAYLOAD, MAX_TLS_CAPTURE, MemfdCreateEvent, MountEvent,
+    NamespaceEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
+    ReadlineInputEvent, SET_TIME_ATIME, SET_TIME_COMPONENT_LEN, SET_TIME_COMPONENTS,
+    SET_TIME_MTIME, SET_TIME_TRUNCATED, SignalEvent, SocketAcceptEvent, SocketBindEvent,
+    SocketCreateEvent, SocketListenEvent, TASK_COMM_LEN, TlsCaptureEvent, UdpRecvEvent,
+    UdpSendEvent, is_filtered_path,
 };
 
 // Raw scheduler tracepoints expose task pointers instead of formatted event records.
@@ -39,12 +40,97 @@ use sensor_linux_wire::{
 /// "heap map" pattern. Filling a reserved ring-buffer slot field by field instead
 /// needs per-byte loops over MAX_PATH_LEN, which blow the verifier's 1M-instruction
 /// budget on pre-6.6 kernels (5.15, 6.1).
+///
+/// 512 KiB since a record carries the argv bytes it read (#1118, ADR-0045): a record is the
+/// fixed `ExecEvent` plus its command line, so this holds about as many as 256 KiB of fixed
+/// records did.
 #[map]
-static EXEC_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+static EXEC_EVENTS: RingBuf = RingBuf::with_byte_size(512 * 1024, 0);
 
-/// Per-CPU scratch for building one `ExecEvent` off the stack (see `EXEC_EVENTS`).
+/// Per-CPU scratch for building one `ExecRecord` off the stack (see `EXEC_EVENTS`).
 #[map]
-static EXEC_SCRATCH: PerCpuArray<ExecEvent> = PerCpuArray::with_max_entries(1, 0);
+static EXEC_SCRATCH: PerCpuArray<ExecRecord> = PerCpuArray::with_max_entries(1, 0);
+
+// argv at exec (#1118). Userspace sets these from the kernel's BTF (`btf.rs`,
+// `ExecArgvOffsets`) and `EXEC_ARGV_ENABLED` only when all three were found; left at zero
+// the probe reads no argv and userspace falls back to `/proc/<pid>/cmdline`.
+#[unsafe(no_mangle)]
+static EXEC_ARGV_ENABLED: Global<u32> = Global::new(0);
+#[unsafe(no_mangle)]
+static TASK_MM_OFFSET: Global<u32> = Global::new(0);
+#[unsafe(no_mangle)]
+static MM_ARG_START_OFFSET: Global<u32> = Global::new(0);
+#[unsafe(no_mangle)]
+static MM_ARG_END_OFFSET: Global<u32> = Global::new(0);
+
+/// Reads the current task's argument block into `rec.argv` (#1118, ADR-0045): all of it when it
+/// fits in `ARGV_WINDOW_BYTES`, else the first `ARGV_HEAD_BYTES` and the last `ARGV_TAIL_BYTES`.
+/// At `sched_process_exec` the new `mm` is installed and `execve` has just copied the strings
+/// onto the new stack, so `arg_start..arg_end` is this exec's argv. A failed head read leaves
+/// both lengths at zero (userspace falls back to `/proc`); a failed tail read keeps the head.
+/// Returns the number of argv bytes written after the fixed event, at most `ARGV_WINDOW_BYTES`.
+///
+/// # Safety
+/// `rec` points at the per-CPU scratch entry, whose `event` the caller zeroed.
+unsafe fn read_exec_argv(rec: *mut ExecRecord) -> usize {
+    if EXEC_ARGV_ENABLED.load() == 0 {
+        return 0;
+    }
+    // SAFETY: helper calls on the current task; every kernel pointer read goes through
+    // `bpf_probe_read_kernel` and every user read through `bpf_probe_read_user_buf`, both of
+    // which fail instead of faulting. `rec` is the caller's valid scratch entry.
+    unsafe {
+        let task = aya_ebpf::helpers::bpf_get_current_task() as *const u8;
+        let Ok(mm) =
+            bpf_probe_read_kernel(task.add(TASK_MM_OFFSET.load() as usize).cast::<*const u8>())
+        else {
+            return 0;
+        };
+        if mm.is_null() {
+            return 0;
+        }
+        let (Ok(start), Ok(end)) = (
+            bpf_probe_read_kernel(mm.add(MM_ARG_START_OFFSET.load() as usize).cast::<u64>()),
+            bpf_probe_read_kernel(mm.add(MM_ARG_END_OFFSET.load() as usize).cast::<u64>()),
+        ) else {
+            return 0;
+        };
+        if end <= start {
+            return 0;
+        }
+        let total = end - start;
+        let argv = &mut (*rec).argv;
+        // Lengths are clamped before each helper call so the verifier sees an upper bound,
+        // and each window is one helper call, not a byte loop (same as the DNS/TLS payloads).
+        let head = if total > ARGV_WINDOW_BYTES as u64 {
+            ARGV_HEAD_BYTES
+        } else {
+            total as usize
+        };
+        if head == 0
+            || head > ARGV_WINDOW_BYTES
+            || bpf_probe_read_user_buf(start as *const u8, &mut argv[..head]).is_err()
+        {
+            return 0;
+        }
+        (*rec).event.argv_total = if total > u64::from(u32::MAX) {
+            u32::MAX
+        } else {
+            total as u32
+        };
+        (*rec).event.argv_head_len = head as u16;
+        if total <= ARGV_WINDOW_BYTES as u64 {
+            return head;
+        }
+        let tail_src = (end - ARGV_TAIL_BYTES as u64) as *const u8;
+        if bpf_probe_read_user_buf(tail_src, &mut argv[ARGV_HEAD_BYTES..ARGV_WINDOW_BYTES]).is_err()
+        {
+            return head;
+        }
+        (*rec).event.argv_tail_len = ARGV_TAIL_BYTES as u16;
+        ARGV_WINDOW_BYTES
+    }
+}
 
 /// pid → parent identity (`real_parent->tgid` + its `comm`). Filled by
 /// `sched_process_fork` and by userspace `/proc` priming at startup; entries removed
@@ -84,12 +170,15 @@ pub(crate) fn record_sched_process_exec(pid: u32, filename_ptr: *const u8) -> u3
     // Assemble the event in per-CPU scratch, not on the stack and not field by
     // field in a reserved ring-buffer slot (that needs per-byte loops over
     // MAX_PATH_LEN, which blow the verifier's 1M-instruction budget on pre-6.6
-    // kernels). One `output` copy emits it. argv is not read here — the userspace
-    // loader reads `/proc/<pid>/cmdline` on receipt (issue #152).
-    let Some(e) = EXEC_SCRATCH.get_ptr_mut(0) else {
+    // kernels). One `output` copy emits it. argv is read here at exec time through
+    // BTF-derived offsets (#1118); without them userspace reads `/proc/<pid>/cmdline`.
+    let Some(rec) = EXEC_SCRATCH.get_ptr_mut(0) else {
         return 1;
     };
     unsafe {
+        // Only the fixed part is zeroed: argv bytes past the lengths read below are never
+        // emitted, so stale scratch bytes cannot reach userspace.
+        let e: *mut ExecEvent = &raw mut (*rec).event;
         core::ptr::write_bytes(e, 0, 1);
 
         (*e).meta.pid = tgid;
@@ -139,7 +228,21 @@ pub(crate) fn record_sched_process_exec(pid: u32, filename_ptr: *const u8) -> u3
             (*e).image_len = s.len() as u16;
         }
 
-        if EXEC_EVENTS.output::<ExecEvent>(&*e, 0).is_err() {
+        let argv_len = read_exec_argv(rec);
+        // A variable-length record (ADR-0045): the fixed event and the argv bytes read, no
+        // more. The bound is re-checked here so the verifier sees the emitted size is at most
+        // the scratch entry.
+        if argv_len > ARGV_WINDOW_BYTES {
+            return 1;
+        }
+        // SAFETY: `ExecRecord` is `repr(C)` with `event` first and `argv` right after it, so
+        // the first `size_of::<ExecEvent>() + argv_len` bytes (argv_len <= ARGV_WINDOW_BYTES,
+        // checked above) lie inside the scratch entry, and every one of them was written.
+        let bytes = core::slice::from_raw_parts(
+            rec.cast::<u8>(),
+            core::mem::size_of::<ExecEvent>() + argv_len,
+        );
+        if EXEC_EVENTS.output::<[u8]>(bytes, 0).is_err() {
             return 1;
         }
     }
