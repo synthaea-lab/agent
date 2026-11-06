@@ -49,8 +49,8 @@ fn is_security_tool(service: &str) -> bool {
 /// manager's signal from pid 1 is only Low in `check_security_process_signal`), or stopped over
 /// D-Bus or an API, is not seen here, and the stop's success is not observed. A Linux unit
 /// stopped over D-Bus or an API is not seen here either, but [`crate::unitstop`] sees it in the
-/// journal, which names no actor. A `SIGKILL` of the agent itself is
-/// `check_security_process_signal`'s.
+/// journal, which names no actor. A signal to a tool, the agent's or (Linux, #1103) a listed
+/// tool's, is `check_security_process_signal`'s.
 #[must_use]
 pub(crate) fn check_security_tool_stop(event: &ExecEvent) -> Option<Alert> {
     let tool = services_stopped(event)

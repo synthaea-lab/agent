@@ -336,15 +336,19 @@ pub mod time;
 ///
 /// Bumped 59 → 62 for [`Event::UnitStop`] (#1085): the stop of a security-tool systemd unit as an
 /// event of its own, replacing a `FileOpenEvent` carrying `FLAG_UNIT_STOPPED`. A raw `openat`
-/// flag can carry any bit, so an unprivileged open could set that one. 60 is claimed by #1114
-/// (`SignalEvent::signals_lost`) and 61 by #1116; whichever merges first renumbers the others.
+/// flag can carry any bit, so an unprivileged open could set that one.
 ///
 /// Bumped 62 → 65 for [`ExecEvent::cmdline_truncated`] (#1112): a sensor now
 /// bounds argv at capture and flags the cut. First claimed 61 while #1114 held 60;
 /// #1085 landed first with 62, #1114 renumbered to 63 and #720 (#1150) claims 64,
 /// so this takes 65. Whichever of those merges later renumbers, same coordination
 /// note as above.
-pub const SCHEMA_VERSION: u32 = 65;
+///
+/// Bumped 65 → 66 for [`SignalEvent::target_unit`] (#1103): the systemd unit of the signalled
+/// process, so an alert on a signal to a security tool names the tool and not only an image path;
+/// and for [`SignalEvent::signals_lost`], the report of signals the sensor had no room for.
+/// First claimed 60, then 63; #1116 took 65, so this takes 66.
+pub const SCHEMA_VERSION: u32 = 66;
 
 /// Bytes of argv, one separator per token included, a sensor keeps for one exec
 /// ([`bound_argv`], #1112).
@@ -2283,8 +2287,9 @@ pub struct MountEvent {
 /// `sensor-macos` (#96), filtered at the source to targets that are
 /// `EndpointSecurity` clients — i.e. this agent and other security tools:
 /// the tamper-attempt subset of the platform's full (and enormous) signal
-/// stream, per the sensor's volume discipline. Platform-neutral shape;
-/// a Linux kill-tracing source can reuse it with its own target filter.
+/// stream, per the sensor's volume discipline. Platform-neutral shape; Linux reuses it for the
+/// agent's own pid (the `kill`/`tgkill` probes, #362) and for the processes of the listed security
+/// units (the `signal_generate` tracepoint, #1103, which fills `target_unit`).
 ///
 /// `meta` is the *sender* — the interesting party in a tamper attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2296,6 +2301,33 @@ pub struct SignalEvent {
     /// Image path of the targeted process, when the platform resolves it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_image_path: Option<String>,
+    /// The systemd unit the targeted process belongs to, as listed in
+    /// [`SECURITY_SERVICES`] (lowercase, no `.service`), when the source resolves it (Linux,
+    /// from the unit's cgroup, #1103). `None` where the platform has no unit, and for the
+    /// agent's own pid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_unit: Option<String>,
+    /// The sender in `meta` may not be the process that sent the signal (Linux, #1103): the
+    /// siginfo's `si_code` was `SI_TIMER`, `SI_MESGQ` or `SI_ASYNCIO`, which the kernel sets from
+    /// interrupt or completion context, where the current task is a bystander. A process can also
+    /// forge those codes with `rt_sigqueueinfo` or `pidfd_send_signal`, so the event is reported
+    /// and not dropped. Absent (false) elsewhere and in an older event.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sender_unreliable: bool,
+    /// Not a signal: the sensor's report that this many signals to security tools were lost
+    /// because the signal ring buffer was full (Linux, #1103, T1562.001). A flood of lethal
+    /// signals ahead of a kill is how a tool is ended unseen, so the loss is itself a finding.
+    /// Non-zero only on that report, which carries `signal: 0` and `target_pid: 0`. It is a field
+    /// of its own, not a flag on a `FileOpenEvent`: that event's `flags` are the raw `open(2)`
+    /// flags on Linux (unknown bits pass through `openat`), so any bit there can be set by an
+    /// unprivileged open, as `O_TMPFILE` set the first cut's bit. A kernel signal event never
+    /// has this field. Absent (0) elsewhere and in an older event.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub signals_lost: u64,
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
 }
 
 /// macOS XPC connection — a process connected to an XPC service by name.

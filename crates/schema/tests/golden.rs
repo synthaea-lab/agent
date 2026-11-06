@@ -1842,8 +1842,81 @@ fn signal_golden() {
             signal: 9,
             target_pid: 400,
             target_image_path: Some("/usr/local/bin/synthaea-agent".into()),
+            target_unit: None,
+            sender_unreliable: false,
+            signals_lost: 0,
         }),
         "signal",
+    );
+    // v66 (#1103): a signal to a listed security tool names its systemd unit.
+    assert_golden(
+        &Event::Signal(SignalEvent {
+            meta: EventMeta {
+                pid: 7001,
+                ppid: 1,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_000_123_456_789,
+                comm: "pkill".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            signal: 9,
+            target_pid: 612,
+            target_image_path: Some("/usr/sbin/auditd".into()),
+            target_unit: Some("auditd".into()),
+            sender_unreliable: false,
+            signals_lost: 0,
+        }),
+        "signal_unit",
+    );
+    // v66 (#1103): the sender is marked unreliable (`si_code` of interrupt or completion context).
+    assert_golden(
+        &Event::Signal(SignalEvent {
+            meta: EventMeta {
+                pid: 7001,
+                ppid: 1,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_000_123_456_789,
+                comm: "python3".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            signal: 9,
+            target_pid: 612,
+            target_image_path: Some("/usr/sbin/auditd".into()),
+            target_unit: Some("auditd".into()),
+            sender_unreliable: true,
+            signals_lost: 0,
+        }),
+        "signal_unreliable",
+    );
+}
+
+#[test]
+fn signal_events_lost_golden() {
+    // v66 (#1103): the sensor's report of signals it had no room for, no signal and no target.
+    assert_golden(
+        &Event::Signal(SignalEvent {
+            meta: EventMeta {
+                pid: 900,
+                ppid: 0,
+                user: User::Unknown,
+                timestamp_ns: 1_756_900_000_123_456_789,
+                comm: "signal_generate".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            signal: 0,
+            target_pid: 0,
+            target_image_path: None,
+            target_unit: None,
+            sender_unreliable: false,
+            signals_lost: 19_182,
+        }),
+        "signal_events_lost",
     );
 }
 
@@ -2848,6 +2921,9 @@ fn meta_accessor_covers_all_variants() {
             signal: 0,
             target_pid: 0,
             target_image_path: None,
+            target_unit: None,
+            sender_unreliable: false,
+            signals_lost: 0,
         }),
         Event::XpcConnect(XpcConnectEvent {
             meta: meta.clone(),

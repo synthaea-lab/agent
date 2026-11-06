@@ -698,19 +698,52 @@ pub fn mount(
 }
 
 /// `target_image_path` is the caller's, not the wire event's — see this module's
-/// `WIRE_VERSION` v12 changelog for why.
+/// `WIRE_VERSION` v12 changelog for why. So is `target_unit` (#1103): the wire event carries
+/// only the pid, and the unit is what the sensor resolved from the cgroup when it put the
+/// target on the watch list.
 #[must_use]
 pub fn signal(
     event: &wire::SignalEvent,
     boot_epoch_offset_ns: u64,
     target_image_path: Option<String>,
+    target_unit: Option<String>,
     container: Option<ContainerContext>,
 ) -> Event {
     Event::Signal(SignalEvent {
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
-        signal: event.signal,
+        signal: event.signal & !wire::SIGNAL_SENDER_UNRELIABLE,
         target_pid: event.target_pid,
         target_image_path,
+        target_unit,
+        sender_unreliable: event.signal & wire::SIGNAL_SENDER_UNRELIABLE != 0,
+        signals_lost: 0,
+    })
+}
+
+/// Signals to security tools the signal ring buffer had no room for, since the last report
+/// (`SIGNAL_TOOL_DROPS`, #1103): a `SignalEvent` with `signals_lost` set, which the rules turn into
+/// a finding, since a flood ahead of a kill is how a tool is ended unseen. It has no signal and no
+/// target (`signal` and `target_pid` are 0, which no kernel event has). `timestamp_ns` is
+/// wall-clock time.
+#[must_use]
+pub fn signals_lost(lost: u64, agent_pid: u32, timestamp_ns: u64) -> Event {
+    Event::Signal(SignalEvent {
+        meta: schema::EventMeta {
+            pid: agent_pid,
+            ppid: 0,
+            user: schema::User::Unknown,
+            timestamp_ns,
+            comm: "signal_generate".to_owned(),
+            container: None,
+            process_generation: None,
+            parent_process_generation: None,
+        },
+        signal: 0,
+        target_pid: 0,
+        target_image_path: None,
+        target_unit: None,
+        sender_unreliable: false,
+        signals_lost: lost,
     })
 }
 
@@ -1696,16 +1729,68 @@ mod tests {
             0,
             Some("/usr/local/bin/synthaea-agent".to_string()),
             None,
+            None,
         ) else {
             panic!("wrong variant")
         };
         assert_eq!(e.signal, 9);
+        assert_eq!(e.target_unit, None);
         assert_eq!(e.target_pid, 400);
         assert_eq!(e.meta.comm, "bash", "meta must stay the sender");
         assert_eq!(
             e.target_image_path.as_deref(),
             Some("/usr/local/bin/synthaea-agent")
         );
+    }
+
+    #[test]
+    fn the_unreliable_sender_bit_is_stripped_from_the_signal_and_becomes_a_flag() {
+        let event = wire::SignalEvent {
+            meta: wire_meta(b"python3"),
+            signal: 9 | wire::SIGNAL_SENDER_UNRELIABLE,
+            target_pid: 612,
+        };
+        let Event::Signal(e) = signal(&event, 0, None, Some("auditd".to_string()), None) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.signal, 9);
+        assert!(e.sender_unreliable);
+        let plain = wire::SignalEvent { signal: 9, ..event };
+        let Event::Signal(e) = signal(&plain, 0, None, None, None) else {
+            panic!("wrong variant")
+        };
+        assert!(!e.sender_unreliable);
+    }
+
+    #[test]
+    fn lost_signals_become_a_signal_event_carrying_the_count() {
+        let Event::Signal(e) = signals_lost(40, 1234, 5) else {
+            panic!("wrong variant")
+        };
+        assert_eq!((e.signals_lost, e.signal, e.target_pid), (40, 0, 0));
+        assert_eq!((e.meta.pid, e.meta.timestamp_ns), (1234, 5));
+    }
+
+    #[test]
+    fn a_signal_to_a_security_tool_carries_its_unit_and_the_exe_read_at_scan_time() {
+        let event = wire::SignalEvent {
+            meta: wire_meta(b"pkill"),
+            signal: 9,
+            target_pid: 612,
+        };
+        let Event::Signal(e) = signal(
+            &event,
+            0,
+            Some("/usr/sbin/auditd".to_string()),
+            Some("auditd".to_string()),
+            None,
+        ) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(e.target_pid, 612);
+        assert_eq!(e.target_unit.as_deref(), Some("auditd"));
+        assert_eq!(e.target_image_path.as_deref(), Some("/usr/sbin/auditd"));
+        assert_eq!(e.meta.comm, "pkill", "meta must stay the sender");
     }
 
     fn wire_kernel_module(name: &[u8]) -> wire::KernelModuleEvent {

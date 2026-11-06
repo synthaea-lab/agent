@@ -91,7 +91,7 @@ fn systemctl(args: &[String]) -> Vec<String> {
 /// The signals of `systemctl kill` that end or freeze a unit, by name (without `SIG`) and by
 /// Linux number. `HUP` is left out on purpose: `systemctl kill -s HUP unit` is the reload
 /// idiom, and counting it would make every reload a stop. Same set as the signal rule's
-/// (`tamper_signal_name`) without `HUP`.
+/// (`tamper_signal_name`) without `HUP`: a reload through the manager has no `SigCgt` to check.
 fn kills_the_unit(signal: &str) -> bool {
     let upper = signal.to_ascii_uppercase();
     let name = upper.strip_prefix("SIG").unwrap_or(&upper);
