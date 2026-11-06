@@ -145,6 +145,22 @@ pub struct CorrelationEngine {
     /// Only read by the kill gate ([`Self::is_service_main_process`]); detection and
     /// belief never look at it.
     service_mains: BoundedMap<u32, Option<u64>>,
+    /// Pids whose `ExecEvent` showed a login-session image (`sshd-session`, see
+    /// `policy::is_login_session_image`) exec'd by a recorded service main (#1142).
+    /// Same lifecycle and same single reader (the kill gate) as `service_mains`.
+    login_sessions: BoundedMap<u32, Option<u64>>,
+}
+
+/// Why the kill gate must not terminate a process on a Bayesian crossing alone: what
+/// the process *is*, not how much evidence there is (ADR-0028). The verdict still
+/// escalates; only the kill is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillShield {
+    /// The main process of a system service, started by init (#652).
+    ServiceMain,
+    /// The process holding an interactive login session, exec'd by a service main:
+    /// killing it cuts the operator's session (#1142). Its children are not shielded.
+    LoginSession,
 }
 
 /// Bounds for a long-lived agent: entities cover the realistic live-pid space with
@@ -197,6 +213,7 @@ impl CorrelationEngine {
             fired: BoundedMap::new(BELIEF_CAP),
             masquerading: BoundedMap::new(ENTITY_CAP),
             service_mains: BoundedMap::new(ENTITY_CAP),
+            login_sessions: BoundedMap::new(ENTITY_CAP),
         }
     }
 
@@ -280,6 +297,16 @@ impl CorrelationEngine {
                 // not (re-)qualify drops the pid's entry; a no-op when it was
                 // never a service main (`BoundedMap::remove` on an absent key).
                 self.service_mains.remove(&pid);
+            }
+            // The parent must be the service main *now*: a user can exec the real
+            // `/usr/sbin/sshd-session` from their own shell, and that copy holds no
+            // login worth protecting. Re-exec clears, as for `service_mains`.
+            if policy::is_login_session_image(exec.image_path.as_str())
+                && self.is_service_main_process(ppid, parent_generation)
+            {
+                self.login_sessions.insert(pid, generation);
+            } else {
+                self.login_sessions.remove(&pid);
             }
         }
 
@@ -496,6 +523,21 @@ impl CorrelationEngine {
         self.service_mains
             .peek(&pid)
             .is_some_and(|&recorded| same_generation(recorded, generation))
+    }
+
+    /// What, if anything, shields `pid` from a kill on a Bayesian crossing alone: a
+    /// service main ([`Self::is_service_main_process`]) or the process holding a login
+    /// session (#1142). Same provenance-not-evidence rule as the service main: never
+    /// seen, or seen with an image that does not qualify, means no shield.
+    #[must_use]
+    pub fn kill_shield(&self, pid: u32, generation: Option<u64>) -> Option<KillShield> {
+        if self.is_service_main_process(pid, generation) {
+            return Some(KillShield::ServiceMain);
+        }
+        self.login_sessions
+            .peek(&pid)
+            .is_some_and(|&recorded| same_generation(recorded, generation))
+            .then_some(KillShield::LoginSession)
     }
 
     /// Returns a reference to the internal event bus (for ML scoring).

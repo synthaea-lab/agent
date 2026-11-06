@@ -488,6 +488,19 @@ fn crosses_kill_gate(technique: &str) -> bool {
 // "package-owned" as verified.
 const SERVICE_MAIN_REFUSAL: &str = "main process of a system service (image under a system path, started by init); escalated, not killed";
 
+/// Why the kill gate refuses the process holding a login session (#1142, ADR-0028).
+/// Same care as [`SERVICE_MAIN_REFUSAL`]: it states what was checked (the image and
+/// its parent), not that the session is legitimate.
+const LOGIN_SESSION_REFUSAL: &str = "holds a login session (sshd-session under a system path, exec'd by a system service); escalated, not killed";
+
+/// The refusal reason the kill gate records for `shield`.
+fn shield_refusal(shield: correlator::KillShield) -> &'static str {
+    match shield {
+        correlator::KillShield::ServiceMain => SERVICE_MAIN_REFUSAL,
+        correlator::KillShield::LoginSession => LOGIN_SESSION_REFUSAL,
+    }
+}
+
 /// ATT&CK technique ids folded into a [`schema::detection::Detection`] from the
 /// `technique` string this crate already uses as the dedup/alert-log key.
 /// Same convention `tools/attack-coverage.py` uses to build the coverage doc:
@@ -554,23 +567,23 @@ impl DetectionSink {
         };
         // BAYES is the only technique `crosses_kill_gate` recognizes, and it is raised
         // only from the per-event path below (`CorrelationEngine::bayes_alert`'s one call
-        // site), never from `advance_time`'s window-expiry alerts — so `service_main`
-        // is never read on this path, and `false` is a placeholder, not a real claim
-        // about any pid here (issue #652).
-        self.emit_correlator_alerts(&alerts, None, false);
+        // site), never from `advance_time`'s window-expiry alerts — so `shield`
+        // is never read on this path, and `None` is a placeholder, not a real claim
+        // about any pid here (issues #652, #1142).
+        self.emit_correlator_alerts(&alerts, None, None);
     }
 
-    /// `service_main` is the correlator's provenance verdict for the event this batch of
-    /// alerts was produced from (issue #652) — meaningful only when a `BAYES` alert is
+    /// `shield` is the correlator's provenance verdict for the event this batch of
+    /// alerts was produced from (issues #652, #1142) — meaningful only when a `BAYES` alert is
     /// among them, since that is the only technique [`crosses_kill_gate`] recognizes, and
     /// `CorrelationAlert::trigger_event` is always `None` for it (so it always resolves to
-    /// `default_event`, never to a different pid than the one `service_main` was computed
+    /// `default_event`, never to a different pid than the one `shield` was computed
     /// for).
     fn emit_correlator_alerts(
         &self,
         alerts: &[correlator::CorrelationAlert],
         default_event: Option<&Event>,
-        service_main: bool,
+        shield: Option<correlator::KillShield>,
     ) {
         let mut high_confidence_pid = None;
         for alert in alerts {
@@ -593,7 +606,7 @@ impl DetectionSink {
             }
         }
         if let Some(pid) = high_confidence_pid {
-            self.maybe_kill(pid, service_main);
+            self.maybe_kill(pid, shield);
         }
     }
 
@@ -1433,7 +1446,7 @@ impl DetectionSink {
             }
         }
 
-        let service_main = engine.is_service_main_process(pid, generation);
+        let shield = engine.kill_shield(pid, generation);
         drop(engine); // Unlock correlator before alert emission (log I/O).
 
         // Fold co-occurrence rules and Bayesian belief into the entity's fused
@@ -1446,36 +1459,37 @@ impl DetectionSink {
         // condemn every later, unrelated sibling that merely shares the same
         // parent and `comm` (PR #502 review; pinned by
         // `a_siblings_weak_alert_never_triggers_kill_from_anothers_bayes_crossing`).
-        self.emit_correlator_alerts(&alerts, Some(event), service_main);
+        self.emit_correlator_alerts(&alerts, Some(event), shield);
     }
 
     /// Issue #25: policy-gates killing the process behind a high-confidence
     /// correlated verdict. A no-op whenever `enable_response` was never called.
     ///
-    /// Issue #652: `service_main` is the correlator's provenance verdict for `pid` (its
-    /// image under a system path, started by init — see the comment above
-    /// `SERVICE_MAIN_REFUSAL`'s definition for why this is not phrased as "package-owned").
-    /// A Bayesian crossing alone does not
-    /// justify killing a system service, so it is refused, in observe mode too, and the
-    /// verdict still escalates. Corroborating evidence does not lift it: the refusal is
-    /// about what the process is, not how much evidence there is (ADR-0028).
-    fn maybe_kill(&self, pid: u32, service_main: bool) {
-        self.kill_for(pid, "a high-confidence correlated verdict", service_main);
+    /// `shield` is the correlator's provenance verdict for `pid` (issues #652, #1142): a
+    /// system service's main process (its image under a system path, started by init —
+    /// see the comment above `SERVICE_MAIN_REFUSAL`'s definition for why this is not
+    /// phrased as "package-owned"), or the `sshd-session` holding a login, exec'd by one.
+    /// A Bayesian crossing alone does not justify killing either, so it is refused, in
+    /// observe mode too, and the verdict still escalates. Corroborating evidence does
+    /// not lift it: the refusal is about what the process is, not how much evidence
+    /// there is (ADR-0028).
+    fn maybe_kill(&self, pid: u32, shield: Option<correlator::KillShield>) {
+        self.kill_for(pid, "a high-confidence correlated verdict", shield);
     }
 
     /// The policy-gated kill behind every automated trigger; `reason` names which one, in
-    /// the audit line (`RESPONSE-KILL`). `service_main` makes it refuse (ADR-0028); only the
+    /// the audit line (`RESPONSE-KILL`). `shield` makes it refuse (ADR-0028); only the
     /// correlator's verdict sets it, a trigger with its own evidence (the ransomware reflex)
-    /// passes `false`.
-    fn kill_for(&self, pid: u32, reason: &str, service_main: bool) {
+    /// passes `None`.
+    fn kill_for(&self, pid: u32, reason: &str, shield: Option<correlator::KillShield>) {
         let guard = self.response.lock().unwrap();
         let Some(hooks) = guard.as_ref() else {
             return;
         };
-        let outcome = if service_main {
+        let outcome = if let Some(shield) = shield {
             response::KillOutcome::Refused {
                 pid,
-                reason: SERVICE_MAIN_REFUSAL,
+                reason: shield_refusal(shield),
             }
         } else {
             response::kill_process(pid, &hooks.policy, |p| (hooks.terminate)(p))
@@ -1511,7 +1525,7 @@ impl DetectionSink {
     /// The reflex: the policy-gated kill of the corroborated process. Observe-only unless
     /// kill is enabled, like every other automated kill.
     fn ransomware_reflex(&self, pid: u32) {
-        self.kill_for(pid, RANSOMWARE_REFLEX_REASON, false);
+        self.kill_for(pid, RANSOMWARE_REFLEX_REASON, None);
     }
 
     /// Exec events: stateless rules, stateful rules, then Sigma.
@@ -3858,6 +3872,12 @@ rule response_marker {
     /// public address, so what differs between two runs is only where the binary lives.
     fn drive_bayes_crossing_from(sink: &DetectionSink, pid: u32, image_path: &str) {
         sink.on_event(exec(pid, "malware.exe", image_path));
+        drive_bayes_connects(sink, pid);
+    }
+
+    /// The connects of [`drive_bayes_crossing_from`], for a pid whose exec the test
+    /// sends itself.
+    fn drive_bayes_connects(sink: &DetectionSink, pid: u32) {
         for i in 0..25u64 {
             sink.on_event(Event::Connect(ConnectEvent {
                 meta: EventMeta {
@@ -4130,6 +4150,52 @@ rule response_marker {
         let killed = enable_recording_kill(&sink, &dir);
         drive_bayes_crossing_from(&sink, 6002, "/tmp/NetworkManager");
         assert_eq!(*killed.lock().unwrap(), vec![6002]);
+    }
+
+    /// Execs the `sshd` listener (by init) and, under it, the `sshd-session` that holds
+    /// one login, as on Alpine (#1142).
+    fn exec_ssh_login(sink: &DetectionSink, listener: u32, session: u32) {
+        sink.on_event(exec(listener, "sshd", "/usr/sbin/sshd"));
+        let Event::Exec(mut e) = exec(session, "sshd-session", "/usr/lib/ssh/sshd-session") else {
+            unreachable!("exec() builds an Exec event");
+        };
+        e.meta.ppid = listener;
+        sink.on_event(Event::Exec(e));
+    }
+
+    /// Issue #1142: on a stock Alpine VM, BAYES named the `sshd-session` of an
+    /// interactive SSH login as a kill target; with kill enabled the agent would cut
+    /// the operator's session. It is refused like a service main, and audited as such.
+    #[test]
+    fn an_ssh_login_session_crossing_bayes_is_refused_not_killed() {
+        let dir = tmp("bayes-sshd-session");
+        let sink = sink_in(&dir);
+        let killed = enable_recording_kill(&sink, &dir);
+        exec_ssh_login(&sink, 6100, 6101);
+        drive_bayes_connects(&sink, 6101);
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("BAYES"), "{alerts}");
+        assert!(
+            alerts.contains("refused to kill pid 6101") && alerts.contains("holds a login session"),
+            "the refusal must be audited with its reason: {alerts}"
+        );
+        assert!(killed.lock().unwrap().is_empty());
+    }
+
+    /// The control: a shell inside that login session crossing BAYES is still killed.
+    #[test]
+    fn a_shell_inside_an_ssh_login_crossing_bayes_is_still_killed() {
+        let dir = tmp("bayes-ssh-shell");
+        let sink = sink_in(&dir);
+        let killed = enable_recording_kill(&sink, &dir);
+        exec_ssh_login(&sink, 6110, 6111);
+        let Event::Exec(mut shell) = exec(6112, "sh", "/bin/sh") else {
+            unreachable!("exec() builds an Exec event");
+        };
+        shell.meta.ppid = 6111;
+        sink.on_event(Event::Exec(shell));
+        drive_bayes_connects(&sink, 6112);
+        assert_eq!(*killed.lock().unwrap(), vec![6112]);
     }
 
     /// Observe-only mode says the truth too: a service is "refused", not "would have

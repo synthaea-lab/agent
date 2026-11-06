@@ -1,6 +1,7 @@
 //! `BehaviorVector` feature extraction and the naive-Bayes belief tests.
 
 use super::*;
+use crate::KillShield;
 
 // ── BehaviorVector ─────────────────────────────────────────────────────────
 
@@ -359,6 +360,94 @@ fn a_reexec_to_an_untrusted_image_clears_the_service_main_entry() {
         "an exec to an untrusted image on the same pid/generation must drop the \
          service-main entry, not keep protecting the new image"
     );
+}
+
+// ── Login session provenance (issue #1142) ─────────────────────────────────
+
+/// The `sshd` listener started by init, as on Alpine (OpenSSH 10).
+fn sshd_listener(engine: &mut CorrelationEngine) {
+    engine.on_event(exec_with_meta(
+        meta_full(900, 1, "sshd", 0),
+        "/usr/sbin/sshd",
+    ));
+}
+
+/// The per-connection `[priv]` process the listener execs, at Alpine's path.
+fn sshd_session(pid: u32, ppid: u32) -> Event {
+    exec_with_meta(
+        meta_full(pid, ppid, "sshd-session", 0),
+        "/usr/lib/ssh/sshd-session",
+    )
+}
+
+#[test]
+fn the_sshd_session_holding_a_login_is_shielded_from_a_bayes_only_kill() {
+    // What #1142 observed: `sshd-session` pids under the listener crossed BAYES.
+    let mut engine = CorrelationEngine::new();
+    sshd_listener(&mut engine);
+    engine.on_event(sshd_session(901, 900));
+    assert_eq!(
+        engine.kill_shield(901, None),
+        Some(KillShield::LoginSession)
+    );
+    assert_eq!(engine.kill_shield(900, None), Some(KillShield::ServiceMain));
+}
+
+#[test]
+fn a_command_run_inside_the_login_session_stays_killable() {
+    let mut engine = CorrelationEngine::new();
+    sshd_listener(&mut engine);
+    engine.on_event(sshd_session(901, 900));
+    engine.on_event(exec_with_meta(meta_full(902, 901, "sh", 0), "/bin/sh"));
+    engine.on_event(exec_with_meta(
+        meta_full(903, 902, "python3", 0),
+        "/usr/bin/python3",
+    ));
+    assert_eq!(engine.kill_shield(902, None), None);
+    assert_eq!(engine.kill_shield(903, None), None);
+}
+
+#[test]
+fn an_sshd_session_not_execd_by_the_sshd_service_is_not_shielded() {
+    let mut engine = CorrelationEngine::new();
+    sshd_listener(&mut engine);
+    // The name from an untrusted path, under the real listener.
+    engine.on_event(exec_with_meta(
+        meta_full(910, 900, "sshd-session", 0),
+        "/tmp/sshd-session",
+    ));
+    // The real binary, exec'd from a user's own shell.
+    engine.on_event(exec_with_meta(meta_full(911, 900, "sh", 0), "/bin/sh"));
+    engine.on_event(sshd_session(912, 911));
+    // The real binary under a parent the engine never saw exec.
+    engine.on_event(sshd_session(913, 4242));
+    for pid in [910, 912, 913] {
+        assert_eq!(engine.kill_shield(pid, None), None, "pid {pid}");
+    }
+}
+
+#[test]
+fn a_reexec_of_the_session_process_drops_its_shield() {
+    let mut engine = CorrelationEngine::new();
+    sshd_listener(&mut engine);
+    engine.on_event(stamped(sshd_session(920, 900), 1));
+    assert_eq!(
+        engine.kill_shield(920, Some(1)),
+        Some(KillShield::LoginSession)
+    );
+    engine.on_event(stamped(
+        exec_with_meta(meta_full(920, 900, "sshd-session", 1), "/tmp/payload"),
+        1,
+    ));
+    assert_eq!(engine.kill_shield(920, Some(1)), None);
+}
+
+#[test]
+fn a_recycled_pid_does_not_inherit_the_login_session_shield() {
+    let mut engine = CorrelationEngine::new();
+    sshd_listener(&mut engine);
+    engine.on_event(stamped(sshd_session(930, 900), 1));
+    assert_eq!(engine.kill_shield(930, Some(2)), None);
 }
 
 #[test]

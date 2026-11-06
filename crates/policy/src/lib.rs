@@ -200,6 +200,25 @@ pub fn service_main_path_is_trusted(path: &str) -> bool {
     !(EXACT.contains(&name) || is_family_interpreter)
 }
 
+/// Whether `path` is the binary that holds one interactive login session: the
+/// per-connection `sshd-session` OpenSSH 9.8+ execs for each SSH login (#1142).
+/// Killing it cuts the operator's session; what an attacker runs lives in its
+/// children, which stay killable.
+///
+/// Name-keyed, so gated on [`service_main_path_is_trusted`]: a `/tmp/sshd-session`
+/// or `/usr/local/bin/sshd-session` is not one. This alone is not enough for the
+/// kill gate either: the correlator also requires the parent to be a recorded
+/// service main (the `sshd` listener started by init).
+///
+/// `login` is not listed: getty execs it in place, so it is already a service main
+/// itself (`ppid == 1`).
+#[must_use]
+pub fn is_login_session_image(path: &str) -> bool {
+    const LOGIN_SESSION_IMAGES: &[&str] = &["sshd-session"];
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    LOGIN_SESSION_IMAGES.contains(&name) && service_main_path_is_trusted(path)
+}
+
 /// The port of the address-selection probe `sshd-session`/`sshd-auth` run on every
 /// login: a `connect()` to the unspecified address (`0.0.0.0`, `::`) on this port
 /// reaches no remote peer (#525).
