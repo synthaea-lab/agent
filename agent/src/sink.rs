@@ -247,8 +247,15 @@ struct HeldTouch {
 
 /// Most renames and deletions a ransomware detection carries beyond its triggering event.
 /// A bound on the size of one detection: the correlator window is 60 s, and a fast
-/// encryptor renames far more than this in it.
+/// encryptor renames far more than this in it. The trigger plus the manifest must fit in
+/// [`SERVER_MAX_EVENTS`], or the server drops the tail of the manifest.
 const DAMAGE_MANIFEST_MAX: usize = 100;
+
+/// The events the server keeps per detection (`MAX_EVENTS`, server/lib/detection-payload.ts,
+/// #1060); a server unit test reads this line and fails when the two differ.
+const SERVER_MAX_EVENTS: usize = 128;
+// The trigger plus the manifest: `1 + DAMAGE_MANIFEST_MAX <= SERVER_MAX_EVENTS`.
+const _: () = assert!(DAMAGE_MANIFEST_MAX < SERVER_MAX_EVENTS);
 
 /// The escalation decision (#612) as a free function so the YARA scan worker, which
 /// has no `DetectionSink`, raises the same alert as every other engine (#614). A new
