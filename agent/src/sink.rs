@@ -490,8 +490,9 @@ const SERVICE_MAIN_REFUSAL: &str = "main process of a system service (image unde
 
 /// Why the kill gate refuses the process holding a login session (#1142, ADR-0028).
 /// Same care as [`SERVICE_MAIN_REFUSAL`]: it states what was checked (the image and
-/// its parent), not that the session is legitimate.
-const LOGIN_SESSION_REFUSAL: &str = "holds a login session (sshd-session under a system path, exec'd by a system service); escalated, not killed";
+/// its parent's image), not that the session is legitimate, nor that the parent was
+/// started by init: the listener's exec is usually never seen.
+const LOGIN_SESSION_REFUSAL: &str = "holds a login session (sshd-session exec'd by sshd, both images under a system path); escalated, not killed";
 
 /// The refusal reason the kill gate records for `shield`.
 fn shield_refusal(shield: correlator::KillShield) -> &'static str {
@@ -1468,7 +1469,7 @@ impl DetectionSink {
     /// `shield` is the correlator's provenance verdict for `pid` (issues #652, #1142): a
     /// system service's main process (its image under a system path, started by init —
     /// see the comment above `SERVICE_MAIN_REFUSAL`'s definition for why this is not
-    /// phrased as "package-owned"), or the `sshd-session` holding a login, exec'd by one.
+    /// phrased as "package-owned"), or the `sshd-session` holding a login, exec'd by `sshd`.
     /// A Bayesian crossing alone does not justify killing either, so it is refused, in
     /// observe mode too, and the verdict still escalates. Corroborating evidence does
     /// not lift it: the refusal is about what the process is, not how much evidence
