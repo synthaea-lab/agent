@@ -126,7 +126,7 @@ pub(crate) fn populate_dispatch(ebpf: &mut aya::Ebpf) -> Result<(), SensorError>
             )));
         }
         dispatch
-            .set(syscall_id as u32, action, 0)
+            .set(syscall_id as u32, &action, 0)
             .map_err(|e| err(format!("populate SYSCALL_DISPATCH[{syscall_id}]: {e}")))?;
     }
     Ok(())
