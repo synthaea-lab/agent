@@ -150,16 +150,21 @@ pub(crate) fn check_persistence_write(event: &FileOpenEvent) -> Option<Alert> {
 const TRUNCATED_CMDLINE_QUOTE_BYTES: usize = 256;
 
 /// T1027.010 — Obfuscated Files or Information: Command Obfuscation, sub-case a
-/// command line padded past [`schema::ARGV_CAPTURE_BUDGET`] (#1112).
+/// command line the sensor could not capture whole, so every content rule (the
+/// `base64` decode, encoded `PowerShell`, the Sigma content) is blind to part of it.
+/// Padding is attacker-controlled on both sides, so no fixed window (head, or head
+/// and tail) can guarantee the payload is kept; the cut itself is the signal. Two
+/// causes, graded and worded apart:
 ///
-/// The sensor keeps only the head of such an argv, so every content rule (the
-/// `base64` decode, encoded `PowerShell`, the Sigma content) is blind to what
-/// follows the cut. Padding is attacker-controlled on both sides, so no fixed
-/// window (head, or head and tail) can guarantee the payload is kept; the cut
-/// itself is the signal. Benign data behind the threshold (#1112, one Alpine lab
-/// VM, 3,451 execs): p99.9 347 B, max 1,661 B, none over 4 KiB. Medium, not High:
-/// that sample is one host, and generated build lines or large `docker run`
-/// invocations elsewhere were not measured.
+/// - **The bytes between the Linux probe's head and tail windows** (ADR-0045,
+///   `argv_omitted_bytes = Some(n > 0)`): any argument block over 1 KiB. **Low**, as
+///   ADR-0045 fixed it: in #1112's sample at most 3 of 3,451 execs exceed 1 KiB, and
+///   none of 1,592 lab execs did, but both samples are small and from lab hosts.
+/// - **Any other cut** (`argv_omitted_bytes = None`): the 32 KiB budget of #1112
+///   (Alpine sample: p99.9 347 B, max 1,661 B, none over 4 KiB), or a sensor that
+///   keeps a bounded number of arguments (macOS ES). **Medium**: none was benign in
+///   that sample. The size of such a cut is not measured, so the message does not
+///   claim one.
 ///
 /// `cmdline_truncated == false` means "no cut seen", not "the whole command line
 /// was seen": a process gone before its argv was read has an empty argv and no
@@ -173,16 +178,25 @@ pub(crate) fn check_truncated_cmdline(event: &ExecEvent) -> Option<Alert> {
     while !event.cmdline.is_char_boundary(quote_end) {
         quote_end -= 1;
     }
+    let (severity, cause) = match event.argv_omitted_bytes {
+        Some(omitted) if omitted > 0 => (
+            Severity::Low,
+            format!("{omitted} bytes between its head and its tail were not captured"),
+        ),
+        _ => (
+            Severity::Medium,
+            "it was cut at capture, by an amount the sensor did not measure".to_owned(),
+        ),
+    };
     Some(Alert {
         technique: "T1027.010",
-        severity: Severity::Medium,
+        severity,
         message: format!(
-            "pid={} comm={} image={}: command line over {} bytes, cut at capture; content \
-             rules did not see its tail ({} bytes kept, {} args): {}",
+            "pid={} comm={} image={}: command line not captured whole, {cause}; content \
+             rules did not see all of it ({} bytes kept, {} args): {}",
             event.meta.pid,
             event.meta.comm,
             event.image_path,
-            schema::ARGV_CAPTURE_BUDGET,
             event.cmdline.len(),
             event.argv.len(),
             &event.cmdline[..quote_end],

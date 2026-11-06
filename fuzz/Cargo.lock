@@ -161,6 +161,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sensor-linux-wire"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tracing",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -246,6 +254,7 @@ dependencies = [
  "sensor-linux-audit",
  "sensor-linux-logs",
  "sensor-linux-netlink",
+ "sensor-linux-wire",
 ]
 
 [[package]]

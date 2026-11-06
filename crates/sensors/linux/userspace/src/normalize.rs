@@ -122,7 +122,7 @@ use crate::dns_udp;
 /// v27 (#1036) added `FileSetTimeEvent` — new `file_set_time` mapping function below, to the
 /// platform-neutral `schema::FileSetTimeEvent` (requested Unix times converted to `FILETIME`
 /// units, only the fields the caller chose set); no existing mapping changed shape.
-const _: () = assert!(wire::WIRE_VERSION == 27);
+const _: () = assert!(wire::WIRE_VERSION == 28);
 
 /// Same, but an empty buffer means "not captured" rather than the empty string —
 /// the probe leaves `pcomm` zeroed when the fork-lineage map had no entry.
@@ -175,6 +175,7 @@ pub fn exec(
     event: &wire::ExecEvent,
     boot_epoch_offset_ns: u64,
     mut argv: Vec<String>,
+    argv_omitted_bytes: Option<u32>,
     env_security: Vec<(String, String)>,
     container: Option<ContainerContext>,
 ) -> Event {
@@ -184,7 +185,11 @@ pub fn exec(
         .position(|&b| b == 0)
         .unwrap_or(image_raw.len());
     let image_path = String::from_utf8_lossy(&image_raw[..image_end]).into_owned();
-    let cmdline_truncated = schema::bound_argv(&mut argv);
+    // ADR-0045's truth table: the flag is set exactly when bytes are known to be missing, from
+    // the probe's windows (`Some(n > 0)`) or from the budget cut, whose size is not measured.
+    let budget_cut = schema::bound_argv(&mut argv);
+    let argv_omitted_bytes = if budget_cut { None } else { argv_omitted_bytes };
+    let cmdline_truncated = budget_cut || argv_omitted_bytes.is_some_and(|n| n > 0);
 
     Event::Exec(ExecEvent {
         meta: meta(&event.meta, boot_epoch_offset_ns, container),
@@ -192,6 +197,7 @@ pub fn exec(
         cmdline: argv.join(" "),
         argv,
         cmdline_truncated,
+        argv_omitted_bytes,
         parent_comm: comm_opt(&event.pcomm),
         // eBPF has the parent comm but not its full path: the sensor fills it from its
         // pid-to-image cache (`parent_image`, #768).
@@ -954,6 +960,9 @@ mod tests {
             grandparent_pid: 0,
             parent_execd: 0,
             grandparent_generation: 0,
+            argv_total: 0,
+            argv_head_len: 0,
+            argv_tail_len: 0,
         }
     }
 
@@ -968,6 +977,7 @@ mod tests {
             &event,
             500,
             argv(&["curl", "-o", "/tmp/x"]),
+            Some(0),
             Vec::new(),
             None,
         ) else {
@@ -976,6 +986,7 @@ mod tests {
         assert_eq!(e.argv, ["curl", "-o", "/tmp/x"]);
         assert_eq!(e.cmdline, "curl -o /tmp/x");
         assert!(!e.cmdline_truncated);
+        assert_eq!(e.argv_omitted_bytes, Some(0));
         assert_eq!(e.image_path, "/usr/bin/curl");
         assert_eq!(e.parent_comm.as_deref(), Some("bash"));
         assert_eq!(e.meta.timestamp_ns, 1_500, "boot offset applied");
@@ -988,6 +999,27 @@ mod tests {
         );
     }
 
+    /// ADR-0045's truth table, the probe rows: bytes known to lie between the windows set the
+    /// flag; a whole block or an unknown count does not.
+    #[test]
+    fn omitted_argv_bytes_set_the_truncation_flag_only_when_known_to_be_missing() {
+        let event = wire_exec(b"/bin/sh", b"bash");
+        for (omitted, flagged) in [(Some(0), false), (Some(2048), true), (None, false)] {
+            let Event::Exec(e) = exec(
+                &event,
+                0,
+                argv(&["sh", "-c", "x"]),
+                omitted,
+                Vec::new(),
+                None,
+            ) else {
+                panic!("wrong variant")
+            };
+            assert_eq!(e.cmdline_truncated, flagged, "{omitted:?}");
+            assert_eq!(e.argv_omitted_bytes, omitted);
+        }
+    }
+
     #[test]
     fn exec_cuts_a_padded_argv_and_flags_it() {
         // #1112: an unprivileged exec with ~2 MiB of control bytes once became a
@@ -995,11 +1027,22 @@ mod tests {
         // segment with it. Control bytes are the worst case: 6 JSON bytes each.
         let event = wire_exec(b"/bin/sh", b"bash");
         let padding = "\u{1}".repeat(2 * 1024 * 1024);
-        let event = exec(&event, 0, argv(&["sh", "-c", &padding]), Vec::new(), None);
+        let event = exec(
+            &event,
+            0,
+            argv(&["sh", "-c", &padding]),
+            Some(0),
+            Vec::new(),
+            None,
+        );
         let Event::Exec(e) = &event else {
             panic!("wrong variant")
         };
         assert!(e.cmdline_truncated);
+        assert_eq!(
+            e.argv_omitted_bytes, None,
+            "a budget cut does not measure what it dropped (ADR-0045)"
+        );
         assert_eq!(e.argv[..2], ["sh", "-c"], "the head is kept");
         assert!(e.cmdline.len() < schema::ARGV_CAPTURE_BUDGET);
         let serialized = serde_json::to_vec(&event).expect("an event serializes");
@@ -1014,8 +1057,14 @@ mod tests {
     fn exec_image_path_ignores_spoofed_argv0() {
         // execve("/tmp/evil", {"/usr/sbin/sshd", ...}, ...)
         let event = wire_exec(b"/tmp/evil", b"bash");
-        let Event::Exec(e) = exec(&event, 0, argv(&["/usr/sbin/sshd", "-D"]), Vec::new(), None)
-        else {
+        let Event::Exec(e) = exec(
+            &event,
+            0,
+            argv(&["/usr/sbin/sshd", "-D"]),
+            None,
+            Vec::new(),
+            None,
+        ) else {
             panic!("wrong variant")
         };
         assert_eq!(
@@ -1032,7 +1081,7 @@ mod tests {
     fn exec_empty_argv_when_process_already_exited() {
         // /proc/<pid>/cmdline gone by drain time — image_path still authoritative.
         let event = wire_exec(b"/bin/sh", b"bash");
-        let Event::Exec(e) = exec(&event, 0, Vec::new(), Vec::new(), None) else {
+        let Event::Exec(e) = exec(&event, 0, Vec::new(), None, Vec::new(), None) else {
             panic!("wrong variant")
         };
         assert!(e.argv.is_empty());
@@ -1044,7 +1093,7 @@ mod tests {
     fn exec_carries_security_env_when_present() {
         let event = wire_exec(b"/usr/bin/ls", b"bash");
         let env = vec![("LD_PRELOAD".to_string(), "/tmp/evil.so".to_string())];
-        let Event::Exec(e) = exec(&event, 0, argv(&["ls"]), env.clone(), None) else {
+        let Event::Exec(e) = exec(&event, 0, argv(&["ls"]), None, env.clone(), None) else {
             panic!("wrong variant")
         };
         assert_eq!(e.env_security, env);
@@ -1053,7 +1102,7 @@ mod tests {
     #[test]
     fn exec_security_env_empty_for_plain_exec() {
         let event = wire_exec(b"/usr/bin/ls", b"bash");
-        let Event::Exec(e) = exec(&event, 0, argv(&["ls"]), Vec::new(), None) else {
+        let Event::Exec(e) = exec(&event, 0, argv(&["ls"]), None, Vec::new(), None) else {
             panic!("wrong variant")
         };
         assert!(e.env_security.is_empty());
@@ -1062,7 +1111,7 @@ mod tests {
     #[test]
     fn exec_parent_comm_absent_when_lineage_missed() {
         let event = wire_exec(b"/bin/sh", b"");
-        let Event::Exec(e) = exec(&event, 0, argv(&["sh"]), Vec::new(), None) else {
+        let Event::Exec(e) = exec(&event, 0, argv(&["sh"]), None, Vec::new(), None) else {
             panic!("wrong variant")
         };
         assert_eq!(e.parent_comm, None);
@@ -1077,7 +1126,7 @@ mod tests {
             image: None,
             name: None,
         };
-        let Event::Exec(e) = exec(&event, 0, argv(&["nginx"]), Vec::new(), Some(ctx)) else {
+        let Event::Exec(e) = exec(&event, 0, argv(&["nginx"]), None, Vec::new(), Some(ctx)) else {
             panic!("wrong variant")
         };
         let container = e.meta.container.expect("container attributed");
@@ -1094,7 +1143,7 @@ mod tests {
             image: Some("nginx:1.27".to_string()),
             name: Some("web1".to_string()),
         };
-        let Event::Exec(e) = exec(&event, 0, argv(&["nginx"]), Vec::new(), Some(ctx)) else {
+        let Event::Exec(e) = exec(&event, 0, argv(&["nginx"]), None, Vec::new(), Some(ctx)) else {
             panic!("wrong variant")
         };
         let container = e.meta.container.expect("container attributed");
@@ -1105,7 +1154,7 @@ mod tests {
     #[test]
     fn bare_metal_process_has_no_container() {
         let event = wire_exec(b"/usr/bin/curl", b"bash");
-        let Event::Exec(e) = exec(&event, 0, argv(&["curl"]), Vec::new(), None) else {
+        let Event::Exec(e) = exec(&event, 0, argv(&["curl"]), None, Vec::new(), None) else {
             panic!("wrong variant")
         };
         assert_eq!(e.meta.container, None);

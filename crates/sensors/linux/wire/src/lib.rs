@@ -285,7 +285,12 @@ pub const fn syscall_nr_from_i32(syscall_nr: i32) -> Option<u32> {
 ///   time the caller chose, not the kernel's own "now" update). Carries the raw `timespec64`
 ///   (seconds and nanoseconds, so the probe does no arithmetic); userspace normalises it to
 ///   `schema::FileSetTimeEvent`. No existing struct changed.
-pub const WIRE_VERSION: u32 = 27;
+/// - v28: the exec record is variable-length (#1118, ADR-0045). `ExecEvent` gains `argv_total`,
+///   `argv_head_len` and `argv_tail_len`, and the record carries that many bytes of the argument
+///   block after the fixed part: the head window, then the tail window. Exec-time, so a process
+///   that exits before the drain or rewrites its argv region afterwards keeps the argv it was
+///   started with. Read with [`parse_exec_record`], never with a bare `read_unaligned`.
+pub const WIRE_VERSION: u32 = 28;
 
 pub const TASK_COMM_LEN: usize = 16;
 
@@ -303,6 +308,15 @@ pub const SIGNAL_WATCH_TOOLS_ENTRIES: u32 = 8192;
 /// are 1..=64, far below it.
 pub const SIGNAL_SENDER_UNRELIABLE: u32 = 0x8000_0000;
 pub const MAX_PATH_LEN: usize = 256;
+/// Bytes of the argument block (`mm->arg_start .. mm->arg_end`) the exec probe captures at most
+/// (ADR-0045): the whole block when it fits, else [`ARGV_HEAD_BYTES`] from the start and
+/// [`ARGV_TAIL_BYTES`] from the end.
+pub const ARGV_WINDOW_BYTES: usize = 1024;
+/// The tail window of a block over [`ARGV_WINDOW_BYTES`]: padding put in front of a payload at the
+/// end of the block does not hide it.
+pub const ARGV_TAIL_BYTES: usize = 256;
+/// The head window of a block over [`ARGV_WINDOW_BYTES`].
+pub const ARGV_HEAD_BYTES: usize = ARGV_WINDOW_BYTES - ARGV_TAIL_BYTES;
 /// Maximum captured length of an xattr name (issue #262 Phase 3): the kernel's own
 /// `XATTR_NAME_MAX`. Real names (`security.capability`, `security.selinux`,
 /// `user.some_marker`, `trusted.overlay.origin`) are far shorter, but capturing the
@@ -409,6 +423,103 @@ pub struct ExecEvent {
     /// The stamp of `grandparent_pid` as the parent's fork recorded it
     /// (`PROC_LINEAGE[ppid].parent_generation`), `0` when unknown.
     pub grandparent_generation: u64,
+    /// `mm->arg_end - mm->arg_start` at the exec, saturated at `u32::MAX`; `0` when the probe did
+    /// not read the argument block (no BTF offsets, or the reads failed).
+    pub argv_total: u32,
+    /// Bytes of the head window that follow this struct in the record (see [`ExecRecord`]):
+    /// the whole block when it fits in [`ARGV_WINDOW_BYTES`], else [`ARGV_HEAD_BYTES`]; `0` when
+    /// the head read failed.
+    pub argv_head_len: u16,
+    /// Bytes of the tail window that follow the head: [`ARGV_TAIL_BYTES`] for a block over
+    /// [`ARGV_WINDOW_BYTES`] whose tail read succeeded, else `0`.
+    pub argv_tail_len: u16,
+}
+
+/// The exec probe's per-CPU scratch: the fixed [`ExecEvent`] and room for both argv windows. Only
+/// `size_of::<ExecEvent>() + argv_head_len + argv_tail_len` bytes of it are emitted, so a short
+/// command line costs the ring only its own bytes (ADR-0045, "Wire and ring").
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ExecRecord {
+    pub event: ExecEvent,
+    /// The head window, then the tail window, packed: `argv[..head]` then `argv[head..head + tail]`.
+    pub argv: [u8; ARGV_WINDOW_BYTES],
+}
+
+// The probe emits `size_of::<ExecEvent>() + n` bytes of an `ExecRecord` and the parser reads the
+// argv right after the fixed part: both rely on `argv` starting where `event` ends.
+const _: () = assert!(core::mem::offset_of!(ExecRecord, argv) == core::mem::size_of::<ExecEvent>());
+
+/// The argument bytes an exec record carried, as [`parse_exec_record`] validated them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecArgv<'a> {
+    /// `ExecEvent::argv_total`: the size of the whole block, `0` when it was not read.
+    pub total: u32,
+    /// The head window: the whole block when `tail` is empty and `head.len() == total`.
+    pub head: &'a [u8],
+    /// The tail window, the last bytes of the block; empty when the block fit or the read failed.
+    pub tail: &'a [u8],
+}
+
+/// Why an exec record was refused. The record comes from the kernel, but its lengths describe
+/// bytes a process chose, so every one is checked before any is used (ADR-0045).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecRecordError {
+    /// Shorter than the fixed [`ExecEvent`].
+    Short,
+    /// The head and tail lengths are not a shape the probe writes (over a window, a tail without
+    /// a full head, a head that does not match `argv_total`).
+    BadLengths,
+    /// Shorter than the fixed part plus the head and tail lengths it announces.
+    Truncated,
+}
+
+/// Reads one exec record from the ring: the fixed [`ExecEvent`] and the argv windows after it.
+///
+/// Accepts exactly the shapes the probe writes, so a record whose lengths disagree is refused,
+/// never read past its end:
+/// - nothing read: `head == 0` and `tail == 0`, any `total` (the `/proc` fallback);
+/// - a block that fits: `head == total <= ARGV_WINDOW_BYTES`, `tail == 0`;
+/// - a block over the window: `head == ARGV_HEAD_BYTES`, `tail` either `ARGV_TAIL_BYTES` or `0`
+///   (the tail read failed).
+///
+/// # Errors
+/// [`ExecRecordError`] when the record is short or its lengths are not one of those shapes.
+pub fn parse_exec_record(item: &[u8]) -> Result<(ExecEvent, ExecArgv<'_>), ExecRecordError> {
+    let fixed = core::mem::size_of::<ExecEvent>();
+    if item.len() < fixed {
+        return Err(ExecRecordError::Short);
+    }
+    // SAFETY: `item` holds at least `size_of::<ExecEvent>()` bytes (checked above), `ExecEvent`
+    // is `repr(C)` plain old data valid for any bit pattern, and `read_unaligned` makes no
+    // alignment assumption about the ring buffer's bytes.
+    let event = unsafe { core::ptr::read_unaligned(item.as_ptr().cast::<ExecEvent>()) };
+    let (total, head, tail) = (
+        event.argv_total as usize,
+        usize::from(event.argv_head_len),
+        usize::from(event.argv_tail_len),
+    );
+    let shape_ok = match (head, tail) {
+        (0, 0) => true,
+        (h, 0) if total <= ARGV_WINDOW_BYTES => h == total,
+        (ARGV_HEAD_BYTES, 0 | ARGV_TAIL_BYTES) => total > ARGV_WINDOW_BYTES,
+        _ => false,
+    };
+    if !shape_ok {
+        return Err(ExecRecordError::BadLengths);
+    }
+    let bytes = item
+        .get(fixed..fixed + head + tail)
+        .ok_or(ExecRecordError::Truncated)?;
+    let (head, tail) = bytes.split_at(head);
+    Ok((
+        event,
+        ExecArgv {
+            total: event.argv_total,
+            head,
+            tail,
+        },
+    ))
 }
 
 /// Value of the `PROC_LINEAGE` fork-tracking map: a pid's parent identity, captured

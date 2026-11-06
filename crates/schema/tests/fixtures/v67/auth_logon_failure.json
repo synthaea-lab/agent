@@ -1,0 +1,16 @@
+{
+  "type": "auth",
+  "meta": {
+    "pid": 604,
+    "ppid": 0,
+    "user": { "os": "windows", "sid": "S-1-5-18", "integrity_level": 16384 },
+    "timestamp_ns": 1756900007000000000,
+    "comm": "lsass.exe"
+  },
+  "outcome": "failure",
+  "kind": "logon_failure",
+  "target_user": "admin",
+  "target_user_sid": "S-1-0-0",
+  "source_address": "198.51.100.23",
+  "status_code": "0xC000006D/0xC000006A"
+}

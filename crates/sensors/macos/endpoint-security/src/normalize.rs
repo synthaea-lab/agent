@@ -133,6 +133,7 @@ fn exec(
         cmdline: argv.join(" "),
         argv,
         cmdline_truncated: shim_truncated || cut,
+        argv_omitted_bytes: None, // ES counts the arguments it dropped, not their bytes (ADR-0045)
         parent_comm: parent_path.map(basename),
         parent_image_path: parent_path.map(str::to_owned),
         sha256: None,
