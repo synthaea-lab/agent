@@ -8,19 +8,20 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{Receiver, SyncSender},
     },
 };
 
 use ferrisetw::trace::UserTrace;
 use schema::{
-    EventMeta,
+    ContainerContext, EventMeta,
     sensor::{Capabilities, EventSink, Sensor, SensorError},
 };
 
 use crate::{
     amsi,
     bits::BitsJobs,
-    budget, etw_sessions,
+    budget, etw_sessions, hcs,
     long_path::{self, LongPathCache},
     normalize,
     pid_cache::PidCache,
@@ -29,6 +30,7 @@ use crate::{
         ldap_provider, network_provider, ntlm_provider, powershell_provider, process_provider,
         registry_provider, smb_provider, wmi_provider,
     },
+    silo::{self, SiloDirectory},
     winapi,
     zone_identifier::{self, MarkQueue, QuarantineDedup},
 };
@@ -59,6 +61,10 @@ const MARK_QUEUE_CAPACITY: usize = 256;
 /// this to fire, the cap only bounds a runaway client.
 const LDAP_PER_PID_LIMIT: u32 = 128;
 const LDAP_PER_PID_WINDOW_NS: u64 = 10_000_000_000;
+/// Silos waiting for a container lookup (#371). A full queue loses nothing:
+/// the pass already queued maps every pending silo, and a dropped request is
+/// asked again on that silo's next event.
+const SILO_REQUEST_CAPACITY: usize = 16;
 /// An identical NTLM authentication (direction, account, target, address, version) is
 /// reported once per this window (#364): most come from pid 4, so there is no per-process
 /// budget.
@@ -300,6 +306,10 @@ pub(crate) struct SharedState {
     /// LDAP search budget (#364): per process, no dedup (the burst rule
     /// counts distinct searches).
     pub(crate) ldap: Mutex<budget::PidBudget>,
+    /// #371: server silo → container, shared with the lookup thread.
+    pub(crate) silos: Arc<Mutex<SiloDirectory>>,
+    /// Silos the lookup thread should name.
+    silo_requests: SyncSender<u32>,
     /// NTLM dedup (#364): one event per (direction, account, target,
     /// address, version) per minute.
     pub(crate) ntlm: Mutex<budget::KeyDedup>,
@@ -312,9 +322,9 @@ pub(crate) struct SharedState {
 }
 
 impl SharedState {
-    /// The identity of the process an event is about: its token user (F-3) and
-    /// the incarnation stamps of it and its parent (#725), as the pid store
-    /// recorded them. `ppid` 0 (an event that names no parent) has no stamp.
+    /// The identity of the process an event is about: its token user (F-3),
+    /// its container (#371) and the incarnation stamps of it and its parent
+    /// (#725), as the pid store recorded them. `ppid` 0 (an event that names no parent) has no stamp.
     pub(crate) fn meta(&self, pid: u32, ppid: u32, comm: String, timestamp_ns: u64) -> EventMeta {
         let (process_generation, parent_process_generation) = {
             let pids = self.pids.lock().unwrap();
@@ -332,10 +342,26 @@ impl SharedState {
             user: winapi::read_process_user(pid),
             timestamp_ns,
             comm,
-            container: None,
+            container: self.container_of(pid, timestamp_ns),
             process_generation,
             parent_process_generation,
         }
+    }
+
+    /// `None` for a host process and for a pid whose silo was never read.
+    fn container_of(&self, pid: u32, now_ns: u64) -> Option<ContainerContext> {
+        let silo = self
+            .pids
+            .lock()
+            .unwrap()
+            .silo(pid)
+            .filter(|&silo| silo != 0)?;
+        let mut silos = self.silos.lock().unwrap();
+        let (context, ask) = silos.lookup(silo, now_ns);
+        if ask && self.silo_requests.try_send(silo).is_err() {
+            silos.request_dropped(silo);
+        }
+        Some(context)
     }
 
     pub(crate) fn normalize_path(&self, raw: &str) -> String {
@@ -366,10 +392,11 @@ impl SharedState {
                 // ETW race: ConnectEvent before the ExecEvent populated the store.
                 let resolved = winapi::resolve_pid_live(pid)?;
                 let generation = winapi::read_process_sequence_number(pid);
+                let silo = winapi::read_server_silo_id(pid);
                 self.pids
                     .lock()
                     .unwrap()
-                    .insert(pid, resolved.clone(), generation);
+                    .insert(pid, resolved.clone(), generation, silo);
                 resolved
             }
         };
@@ -402,12 +429,43 @@ fn spawn_mark_reader(
         .map_err(|e| -> SensorError { format!("Zone.Identifier reader thread: {e}").into() })
 }
 
+/// Starts the container lookup worker (#371). Like the mark reader, it exits
+/// by itself once this run's [`SharedState`] (the only request sender) is
+/// dropped.
+fn spawn_silo_resolver(
+    requests: Receiver<u32>,
+    directory: Arc<Mutex<SiloDirectory>>,
+) -> Result<(), SensorError> {
+    std::thread::Builder::new()
+        .name("silo-resolver".into())
+        .spawn(move || {
+            silo::run_resolver(&requests, &directory, &hcs::Hcs::default(), probe_silo);
+        })
+        .map(drop)
+        .map_err(|e| -> SensorError { format!("silo resolver thread: {e}").into() })
+}
+
+/// The silo of `pid` if it still runs `image` (the Host Compute Service's view
+/// of it); see [`silo::match_containers`] for why the image is checked.
+fn probe_silo(pid: u32, image: &str) -> Option<u32> {
+    let live = winapi::resolve_pid_live(pid)?;
+    if !basename(&live).eq_ignore_ascii_case(&basename(image)) {
+        return None;
+    }
+    winapi::read_server_silo_id(pid)
+}
+
 /// Seeds the pid store before the trace: already-running processes resolve from
 /// the very first `ConnectEvent`, and parent lineage/exclusions apply to them.
 fn seed_pid_store(state: &SharedState) {
     let mut pids = state.pids.lock().unwrap();
     for (pid, name) in winapi::snapshot_processes() {
-        pids.insert(pid, name, winapi::read_process_sequence_number(pid));
+        pids.insert(
+            pid,
+            name,
+            winapi::read_process_sequence_number(pid),
+            winapi::read_server_silo_id(pid),
+        );
     }
     tracing::info!(processes = pids.len(), "pid store seeded");
 }
@@ -534,6 +592,9 @@ impl Sensor for WindowsSensor {
         ));
         let (marks, mark_rx) = MarkQueue::bounded(MARK_QUEUE_CAPACITY);
         spawn_mark_reader(mark_rx, Arc::clone(&sink))?;
+        let silos = Arc::new(Mutex::new(SiloDirectory::new()));
+        let (silo_requests, silo_rx) = std::sync::mpsc::sync_channel(SILO_REQUEST_CAPACITY);
+        spawn_silo_resolver(silo_rx, Arc::clone(&silos))?;
         let state = Arc::new(SharedState {
             pids: Mutex::new(PidCache::new(PID_CACHE_CAP)),
             volumes: Mutex::new(winapi::build_volume_map()),
@@ -548,6 +609,8 @@ impl Sensor for WindowsSensor {
                 LDAP_PER_PID_LIMIT,
                 LDAP_PER_PID_WINDOW_NS,
             )),
+            silos,
+            silo_requests,
             ntlm: Mutex::new(budget::KeyDedup::new("ntlm", NTLM_DEDUP_WINDOW_NS)),
             canary_path: canary_file
                 .file_name()

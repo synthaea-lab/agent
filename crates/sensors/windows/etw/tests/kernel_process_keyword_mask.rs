@@ -2,12 +2,13 @@
 
 //! Real-session check of the Kernel-Process keyword mask (#726, #727).
 //!
-//! `process_provider` asks for the process and image keywords only (`0x50`), so that
-//! thread start/stop (EID 3/4, keyword THREAD `0x20`) never reach the callback. The unit
-//! test of the mask table compares it with literals it also contains; this test starts
-//! a real session with the requested mask and looks at which ids actually arrive for a
-//! workload it controls: a short-lived child process (process start, image loads,
-//! process stop) and a few threads of its own.
+//! `process_provider` asks for the process, image and job-silo keywords only (`0x4050`;
+//! silo events 23-26 since #371), so that thread start/stop (EID 3/4, keyword THREAD
+//! `0x20`) never reach the callback. The unit test of the mask table compares it with
+//! literals it also contains; this test starts a real session with the requested mask
+//! and looks at which ids actually arrive for a workload it controls: a short-lived
+//! child process (process start, image loads, process stop) and a few threads of its
+//! own.
 
 use std::{
     collections::BTreeSet,
@@ -54,7 +55,7 @@ fn kernel_process_keyword_mask_respects_the_requested_event_ids() {
             u64::from_str_radix(value.trim().trim_start_matches("0x"), 16)
                 .expect("SYNTHAEA_KERNEL_PROCESS_MASK must be hexadecimal")
         })
-        .unwrap_or(0x50);
+        .unwrap_or(0x4050);
     let pid = std::process::id();
     let child_pid = Arc::new(AtomicU32::new(0));
     let unique = SystemTime::now()
