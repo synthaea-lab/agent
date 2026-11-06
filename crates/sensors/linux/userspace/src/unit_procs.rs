@@ -238,7 +238,7 @@ pub(crate) trait WatchSet {
 
 impl WatchSet for aya::maps::HashMap<aya::maps::MapData, u32, u64> {
     fn insert(&mut self, pid: u32, sig_cgt: u64) -> Result<(), String> {
-        aya::maps::HashMap::insert(self, pid, sig_cgt, 0).map_err(|e| e.to_string())
+        aya::maps::HashMap::insert(self, &pid, &sig_cgt, 0).map_err(|e| e.to_string())
     }
 
     fn remove(&mut self, pid: u32) -> Result<bool, String> {
