@@ -149,6 +149,33 @@ fn set_time_event_reaches_the_timestomp_rule_through_the_real_sink() {
 }
 
 #[test]
+fn a_panic_inside_rule_evaluation_does_not_stop_later_events_from_being_processed() {
+    let dir = tmp("poisoned-rule-state");
+    let sink = sink_in(&dir);
+    // A rule that panics mid-evaluation leaves `rule_state` poisoned, exactly like this.
+    thread::scope(|s| {
+        let _ = s
+            .spawn(|| {
+                let _guard = sink.rule_state.lock().unwrap();
+                panic!("a rule panicked while evaluating an event");
+            })
+            .join();
+    });
+    assert!(sink.rule_state.is_poisoned());
+
+    sink.on_event(Event::FileSetTime(schema::FileSetTimeEvent {
+        meta: schema::fixtures::meta(),
+        path: r"C:\Users\u\invoice.docx".into(),
+        last_write_time: Some(132_537_600_000_000_000),
+        ..schema::fixtures::file_set_time()
+    }));
+
+    let alerts = alerts_in(&dir);
+    assert!(alerts.contains("T1070.006"), "{alerts}");
+    assert!(!sink.rule_state.is_poisoned());
+}
+
+#[test]
 fn write_capable_volume_open_reaches_t1006_through_the_real_sink() {
     let dir = tmp("raw-volume-open-route");
     let sink = sink_in(&dir);
