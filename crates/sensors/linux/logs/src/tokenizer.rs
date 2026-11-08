@@ -56,6 +56,17 @@ impl<'a> Cursor<'a> {
         Ok(&inner[..end])
     }
 
+    /// Skips one field of either shape, a quoted string or a bare token, without
+    /// keeping it. For the fields a site appends after a preset's last one.
+    pub(crate) fn skip_field(&mut self, field: &'static str) -> Result<(), ParseError> {
+        self.skip_spaces();
+        if self.rest.starts_with('"') {
+            self.quoted(field).map(drop)
+        } else {
+            self.word(field).map(drop)
+        }
+    }
+
     /// `"..."` with `\"` and `\\` decoded.
     pub(crate) fn quoted(&mut self, field: &'static str) -> Result<String, ParseError> {
         let inner = self.expect_open('"', field)?;
