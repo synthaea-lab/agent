@@ -64,7 +64,7 @@ purpose.
 ### Licensing of your contribution
 
 Contributions are accepted under **Apache-2.0**, except contributions to the Linux eBPF probes,
-which must be **GPL-2.0** for the kernel verifier to accept them. See [`NOTICE`](NOTICE) and [`LICENSE`](LICENSE) — a
+which are dual-licensed **GPL-2.0-only OR MIT** because the kernel verifier requires a GPL-compatible license. See [`NOTICE`](NOTICE) and [`LICENSE`](LICENSE) — a
 deliberate, recorded decision carried over from the project's start.
 
 Because there is no CLA, **the project cannot relicense your contribution without your consent.**
