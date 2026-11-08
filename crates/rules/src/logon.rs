@@ -504,6 +504,23 @@ mod tests {
     }
 
     #[test]
+    fn the_generic_sid_vectors_shared_with_the_fleet_join_hold() {
+        const VECTORS: &str = include_str!("../data/generic-sid-vectors.txt");
+        let mut checked = 0;
+        for line in VECTORS.lines().filter(|l| !l.starts_with('#')) {
+            let (verdict, sid) = line.split_once('\t').unwrap_or((line, ""));
+            let generic = is_well_known_service_sid(sid) || is_builtin_administrator_sid(sid);
+            match verdict {
+                "generic" => assert!(generic, "{sid:?} should be generic"),
+                "person" => assert!(!generic, "{sid:?} should not be generic"),
+                other => panic!("unknown verdict {other:?} in generic-sid-vectors.txt"),
+            }
+            checked += 1;
+        }
+        assert!(checked > 10, "the vector file was read ({checked} lines)");
+    }
+
+    #[test]
     fn vagrant_and_ordinary_accounts_are_not_generic() {
         for user in [
             "vagrant",
