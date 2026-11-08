@@ -1,8 +1,9 @@
-//! The agent's concrete `EventSink`s: full detection (`DetectionSink`) and raw
-//! capture (re-using `sinks::JsonlEventSink` directly). Migrated from
-//! `old/agent/sinks.rs`, minus what isn't wired yet — the correlator, Sigma, and ML
-//! scorer plug in here as their crates are migrated (M2), each addition a new field
-//! and a few lines in `on_event`.
+//! The agent's own `EventSink`s: `DetectionSink`, which runs every event through the
+//! detection engines (rules, Sigma, IOC, YARA, deception canaries, the correlator and
+//! the ML correlation scorer), fuses verdicts and records alerts, detections and
+//! responses; and `BaselineSink`, which stores the redacted exec corpus used for ML
+//! training. Raw capture needs no sink of its own: it uses `sinks::JsonlEventSink`
+//! directly.
 
 use std::{
     collections::VecDeque,
