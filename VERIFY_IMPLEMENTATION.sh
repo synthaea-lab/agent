@@ -6,17 +6,21 @@ echo "Issue #46 Implementation Verification"
 echo "=========================================="
 echo ""
 
+# Phase 1 lives in the `ml` sibling repo: the umbrella's ml/, or $SYNTHAEA_ROOT/ml.
+cd "$(dirname "$0")"
+ML_DIR="${SYNTHAEA_ROOT:-..}/ml"
+
 echo "Phase 1: Python Conformal Calibration"
 echo "--------------------------------------"
 echo "✓ Calibration module:"
-ls -lh ml/synthaea_ml/calibration/calibrate_conformal.py 2>/dev/null && echo "  - calibrate_conformal.py exists" || echo "  ✗ MISSING"
+ls -lh "$ML_DIR"/synthaea_ml/calibration/calibrate_conformal.py 2>/dev/null && echo "  - calibrate_conformal.py exists" || echo "  ✗ MISSING"
 echo ""
 echo "✓ Training scripts updated:"
-grep -q "calibrate_threshold" ml/synthaea_ml/training/train_linux.py && echo "  - train_linux.py ✓" || echo "  ✗ train_linux.py missing"
-grep -q "calibrate_threshold" ml/synthaea_ml/training/train_windows.py && echo "  - train_windows.py ✓" || echo "  ✗ train_windows.py missing"
+grep -q "calibrate_threshold" "$ML_DIR"/synthaea_ml/training/train_linux.py && echo "  - train_linux.py ✓" || echo "  ✗ train_linux.py missing"
+grep -q "calibrate_threshold" "$ML_DIR"/synthaea_ml/training/train_windows.py && echo "  - train_windows.py ✓" || echo "  ✗ train_windows.py missing"
 echo ""
 echo "✓ Schema extended:"
-grep -q "SCHEMA_VERSION = 3" ml/synthaea_ml/registry/training_record.py && echo "  - TrainingRecord schema v3 ✓" || echo "  ✗ Schema not updated"
+grep -q "SCHEMA_VERSION = 3" "$ML_DIR"/synthaea_ml/registry/training_record.py && echo "  - TrainingRecord schema v3 ✓" || echo "  ✗ Schema not updated"
 echo ""
 
 echo "Phase 2: Rust OOD Guards"
@@ -37,8 +41,7 @@ echo ""
 echo "Tests"
 echo "-----"
 echo "Running Python tests..."
-cd ml && python -m pytest tests/test_calibrate_conformal.py -v --tb=short 2>&1 | tail -5
-cd ..
+(cd "$ML_DIR" && python -m pytest tests/test_calibrate_conformal.py -v --tb=short 2>&1 | tail -5)
 echo ""
 
 echo "Rust build..."

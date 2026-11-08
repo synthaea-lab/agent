@@ -15,20 +15,20 @@ use ml::{
 };
 use schema::Event;
 
-const EVENTS: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../ml/tests/fixtures/t1_events.jsonl"
-));
+/// In the `ml` sibling repo; read at run time, the test skips without it.
+const EVENTS_PATH: &str = "tests/fixtures/t1_events.jsonl";
 const GOLDEN: &str = include_str!("fixtures/t1_scorer_golden.jsonl");
 const MODEL: &[u8] = include_bytes!("fixtures/t1_scorer.onnx");
 
-fn bus() -> EventBus {
+/// The fixture events in one window, or `None` (the test skips) without the `ml` sibling.
+fn bus() -> Option<EventBus> {
+    let events = siblings::require!("ml", EVENTS_PATH, None);
     // One 60 s window: every fixture event fits, like `t1_golden.rs`.
     let mut bus = EventBus::new(Duration::from_secs(60));
-    for line in EVENTS.lines().filter(|l| !l.trim().is_empty()) {
+    for line in events.lines().filter(|l| !l.trim().is_empty()) {
         bus.push(serde_json::from_str::<Event>(line).expect("t1_events.jsonl is schema::Event"));
     }
-    bus
+    Some(bus)
 }
 
 struct Case {
@@ -67,7 +67,7 @@ fn metadata(threshold: f32, min: f32, max: f32) -> Vec<u8> {
 #[test]
 fn scores_match_onnxruntime_reference() {
     let mut scorer = BehaviorScorer::from_onnx_bytes(MODEL).expect("fixture model loads");
-    let bus = bus();
+    let Some(bus) = bus() else { return };
     let (mut scored, mut unscored) = (0, 0);
     for case in cases() {
         let got = scorer.score(&bus, case.pid, case.generation).unwrap();
@@ -103,7 +103,7 @@ fn scores_match_onnxruntime_reference() {
 #[test]
 fn a_recycled_pid_is_scored_as_its_own_incarnation() {
     let mut scorer = BehaviorScorer::from_onnx_bytes(MODEL).unwrap();
-    let bus = bus();
+    let Some(bus) = bus() else { return };
     let first = scorer.score(&bus, 100, Some(1)).unwrap().unwrap();
     let second = scorer.score(&bus, 100, Some(2)).unwrap().unwrap();
     assert!(
@@ -117,7 +117,7 @@ fn a_recycled_pid_is_scored_as_its_own_incarnation() {
 fn the_conformal_threshold_keeps_only_anomalous_scores() {
     let meta = metadata(0.0, f32::MIN, f32::MAX);
     let mut scorer = BehaviorScorer::from_onnx_bytes_with_metadata(MODEL, Some(&meta)).unwrap();
-    let bus = bus();
+    let Some(bus) = bus() else { return };
     assert!(
         scorer.score(&bus, 100, Some(1)).unwrap().is_some(),
         "anomalous: kept"
@@ -138,7 +138,8 @@ fn the_conformal_threshold_keeps_only_anomalous_scores() {
 fn an_out_of_bounds_vector_is_an_error_not_a_score() {
     let meta = metadata(0.0, -0.5, 0.5);
     let mut scorer = BehaviorScorer::from_onnx_bytes_with_metadata(MODEL, Some(&meta)).unwrap();
-    let err = scorer.score(&bus(), 100, Some(1)).unwrap_err();
+    let Some(bus) = bus() else { return };
+    let err = scorer.score(&bus, 100, Some(1)).unwrap_err();
     assert!(
         matches!(err, ScorerError::FeatureOutOfBounds { .. }),
         "{err}"
@@ -148,7 +149,7 @@ fn an_out_of_bounds_vector_is_an_error_not_a_score() {
 #[test]
 fn score_explained_agrees_with_score_and_attributes_t1_features() {
     let mut scorer = BehaviorScorer::from_onnx_bytes(MODEL).unwrap();
-    let bus = bus();
+    let Some(bus) = bus() else { return };
     for case in cases().into_iter().filter(|c| c.score.is_some()) {
         let bare = scorer
             .score(&bus, case.pid, case.generation)

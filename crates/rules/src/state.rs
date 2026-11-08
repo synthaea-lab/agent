@@ -12,7 +12,7 @@ use schema::{
     Event, ExecEvent, FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FileDeleteEvent, FileOpenEvent,
     FileQuarantineEvent, FileRenameEvent, FileWriteEvent, ListenPortEvent, MemfdCreateEvent,
     NetworkFlowEvent, O_CREAT, POLICY_MECHANISM_APPLOCKER, POLICY_MECHANISM_SELINUX,
-    POLICY_MECHANISM_WDAC, PolicyDenialEvent, SessionEvent, SessionState, User,
+    POLICY_MECHANISM_WDAC, PolicyDenialEvent, SessionEvent, SessionState, UnitStopEvent, User,
     detection::Severity,
 };
 use store::BoundedMap;
@@ -365,6 +365,15 @@ pub struct RuleState {
     /// Lineage → distinct services it stopped, for SERVICE-STOP-BURST (T1489, #381).
     /// LRU-bounded.
     service_stop: BoundedMap<crate::recon::Lineage, SlidingDistinct<String>>,
+    /// Security-unit stops waiting to be judged, and what execs did to those units, for
+    /// UNEXPLAINED-UNIT-STOP (T1562.001, #1085): see [`crate::unitstop`].
+    unit_stops: crate::unitstop::UnitStops,
+    /// Lineage → its last SERVICE-STOP-BURST finding, so a T1486 finding from the same lineage
+    /// can say it was preceded by one (#973). Read for the message only. LRU-bounded.
+    burst_marks: BoundedMap<crate::recon::Lineage, crate::impactctx::BurstMark>,
+    /// Lineage → its last T1486 or T1490 finding, so a shutdown from the same lineage can be
+    /// reported as context for it (T1529, #973). LRU-bounded.
+    impact_marks: BoundedMap<crate::recon::Lineage, crate::impactctx::ImpactMark>,
     /// (pid, dport) → sliding distinct-destination counter for SCAN-SPREAD
     /// (T1046/T1210, issue #465). LRU-bounded.
     scan_spread: BoundedMap<(u32, u16), SlidingDistinct<IpAddr>>,
@@ -620,6 +629,9 @@ impl RuleState {
             ssh_fanout: BoundedMap::new(COUNTER_CAP),
             security_discovery: BoundedMap::new(COUNTER_CAP),
             service_stop: BoundedMap::new(COUNTER_CAP),
+            unit_stops: crate::unitstop::UnitStops::new(),
+            burst_marks: BoundedMap::new(COUNTER_CAP),
+            impact_marks: BoundedMap::new(COUNTER_CAP),
             known_listeners: BoundedMap::new(COUNTER_CAP),
             known_policy_denials: BoundedMap::new(COUNTER_CAP),
             policy_denial_budgets: BoundedMap::new(POLICY_DENIAL_SUBJECT_CAP),
@@ -1422,6 +1434,17 @@ impl RuleState {
         for name in stopped {
             distinct = entry.record(name, ts, SERVICE_STOP_WINDOW_NS);
         }
+        if distinct >= SERVICE_STOP_THRESHOLD {
+            // Refreshed while the burst goes on, not only at the alert: a burst that runs
+            // past one window is still the burst a later mass rename follows.
+            self.burst_marks.insert(
+                lineage,
+                crate::impactctx::BurstMark {
+                    at_ns: ts,
+                    services: distinct,
+                },
+            );
+        }
         if distinct >= SERVICE_STOP_THRESHOLD && entry.try_alert(ts, SERVICE_STOP_WINDOW_NS) {
             let seen: Vec<&str> = entry.values().map(String::as_str).take(12).collect();
             return Some(Alert {
@@ -1444,6 +1467,101 @@ impl RuleState {
             });
         }
         None
+    }
+
+    /// T1529 as case context (#973): a shutdown or reboot command from a lineage that already
+    /// raised a T1486 or a T1490 finding within [`crate::impactctx::IMPACT_TO_SHUTDOWN_WINDOW_NS`].
+    /// Without such a finding it returns nothing and records nothing, so a reboot is never a
+    /// finding of its own. Also arms the lineages of a T1490 command. Low, once per finding.
+    /// See [`crate::impactctx`] for what counts as a shutdown and why.
+    fn check_shutdown_context(
+        &mut self,
+        event: &ExecEvent,
+        lineage: crate::recon::Lineage,
+    ) -> Option<Alert> {
+        use crate::impactctx::{IMPACT_TO_SHUTDOWN_WINDOW_NS, shutdown_command};
+
+        let ts = event.meta.timestamp_ns;
+        if crate::stateless::check_recovery_inhibit(event).is_some() {
+            self.mark_impact(
+                Some(lineage),
+                event.meta.pid,
+                event.meta.process_generation,
+                ts,
+                "T1490",
+            );
+            return None;
+        }
+        let command = shutdown_command(event)?;
+        let mark = self.impact_marks.get_mut(&lineage)?;
+        if ts < mark.at_ns || ts - mark.at_ns > IMPACT_TO_SHUTDOWN_WINDOW_NS || mark.reported {
+            return None;
+        }
+        mark.reported = true;
+        Some(Alert {
+            technique: "T1529",
+            severity: Severity::Low,
+            message: format!(
+                "pid={} comm={}: `{command}` run {}s after a {} finding from the lineage of \
+                 pid={} — context for that case, not a finding of its own (the command was \
+                 seen, the host going down is not confirmed)",
+                event.meta.pid,
+                event.meta.comm,
+                (ts - mark.at_ns) / 1_000_000_000,
+                mark.technique,
+                lineage.0,
+            ),
+        })
+    }
+
+    /// Remembers a T1486 or T1490 finding for the lineages that can own what follows it.
+    fn mark_impact(
+        &mut self,
+        exec_lineage: Option<crate::recon::Lineage>,
+        pid: u32,
+        generation: Option<u64>,
+        ts: u64,
+        technique: &'static str,
+    ) {
+        for lineage in crate::impactctx::armed_lineages(exec_lineage, pid, generation) {
+            self.impact_marks.insert(
+                lineage,
+                crate::impactctx::ImpactMark {
+                    at_ns: ts,
+                    technique,
+                    reported: false,
+                },
+            );
+        }
+    }
+
+    /// For the T1486 findings of one file event: tells each whether a SERVICE-STOP-BURST from
+    /// the same lineage preceded it (corroboration, message only: technique, severity and
+    /// thresholds are untouched, so the damage manifest and the reflex read what they always
+    /// read), and arms the lineages for [`Self::check_shutdown_context`].
+    fn note_t1486(&mut self, meta: &schema::EventMeta, alerts: &mut [Alert]) {
+        use crate::{impactctx::BURST_TO_RENAME_WINDOW_NS, recon::ExecLineage};
+
+        let ts = meta.timestamp_ns;
+        let exec_lineage =
+            ExecLineage::current(self.exec_lineage.peek(&meta.pid), meta.process_generation);
+        for alert in alerts.iter_mut().filter(|a| a.technique == "T1486") {
+            let burst =
+                crate::impactctx::armed_lineages(exec_lineage, meta.pid, meta.process_generation)
+                    .filter_map(|l| self.burst_marks.peek(&l).map(|m| (l, *m)))
+                    .filter(|(_, m)| ts >= m.at_ns && ts - m.at_ns <= BURST_TO_RENAME_WINDOW_NS)
+                    .max_by_key(|(_, m)| m.at_ns);
+            if let Some((l, m)) = burst {
+                alert.message.push_str(&format!(
+                    " — corroborated: the lineage of pid={} stopped {} distinct services \
+                     (SERVICE-STOP-BURST, T1489) {}s earlier",
+                    l.0,
+                    m.services,
+                    (ts - m.at_ns) / 1_000_000_000,
+                ));
+            }
+            self.mark_impact(exec_lineage, meta.pid, meta.process_generation, ts, "T1486");
+        }
     }
 
     /// SSH-FANOUT (T1021.004, #378): outbound SSH to eight distinct hosts from one lineage in
@@ -1504,6 +1622,8 @@ impl RuleState {
         alerts.extend(self.check_recon_burst(event, lineage));
         alerts.extend(self.check_security_discovery(event, lineage));
         alerts.extend(self.check_service_stop_burst(event, lineage));
+        self.unit_stops.on_exec(event);
+        alerts.extend(self.check_shutdown_context(event, lineage));
         alerts.extend(crate::stateless::check_ld_preload_hijack(
             event,
             &self.ld_trust_extra,
@@ -2135,6 +2255,31 @@ impl RuleState {
         self.odd_hours.set_offset_minutes(minutes)
     }
 
+    /// Declares the local hours `[start, end)` in which a logon is ordinary for ODD-HOUR-LOGON
+    /// (#1089); `start > end` wraps midnight (`22, 6`, a night shift). False, and the window
+    /// keeps what it had, unless `start` is 0 to 23, `end` 1 to 24 and they differ. The default is
+    /// [`WORK_HOURS_LOCAL`](crate::exclusions::WORK_HOURS_LOCAL).
+    pub fn set_work_hours(&mut self, start: u32, end: u32) -> bool {
+        self.odd_hours.set_work_hours(start, end)
+    }
+
+    /// Declares the accounts whose odd-hour logons are expected (#1089): on-call staff, a
+    /// schedule's service or batch account. ODD-HOUR-LOGON skips them; FIRST-SEEN-LOGON does not.
+    /// An entry is `NAME` or `NAME|SID` (see `OddHours::set_exempt_accounts`); at most 64 are
+    /// kept, a blank, over-long or malformed one is dropped, and the number kept is returned.
+    /// Replaces the previous list; empty by default, so nothing is exempt until the operator says so.
+    pub fn set_odd_hour_exempt_accounts(&mut self, accounts: &[String]) -> usize {
+        self.odd_hours.set_exempt_accounts(accounts)
+    }
+
+    /// Odd-hour logons the exempt list has suppressed since the agent started (#1089); read by the
+    /// tests, and visible in production through the `skips` field of the info line of `OddHours`.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn odd_hour_exempt_skips(&self) -> u64 {
+        self.odd_hours.exempt_skips()
+    }
+
     /// Gives the rules the host's platform time zone (#1088): `zone` maps an instant (seconds
     /// since the Unix epoch) to minutes east of UTC at that instant, so a logon either side of a
     /// daylight-saving change is judged by the hour the host's clock showed. Turns ODD-HOUR-LOGON
@@ -2145,7 +2290,8 @@ impl RuleState {
     }
 
     /// ODD-HOUR-LOGON (T1078, #376): a successful [`AuthKind::Logon`] of a non-generic
-    /// account whose host-local hour is outside [`WORK_HOURS_LOCAL`](crate::exclusions::WORK_HOURS_LOCAL).
+    /// account whose host-local hour is outside the working hours: [`WORK_HOURS_LOCAL`](crate::exclusions::WORK_HOURS_LOCAL)
+    /// unless the operator declared another window ([`Self::set_work_hours`]).
     /// Low, once per account per [`ODD_HOUR_QUIET_NS`](crate::exclusions::ODD_HOUR_QUIET_NS).
     /// Same event gate and generic-account list as FIRST-SEEN-LOGON, so the two share the
     /// identity join's limits; they are independent and a first logon at night raises both.
@@ -2155,7 +2301,9 @@ impl RuleState {
     /// `agent.toml`, which overrides the zone). The event's timestamp is UTC and nothing else
     /// in the agent knows the local time.
     /// Expected false positives: on-call staff, night shifts, a host in use around the clock,
-    /// and on Windows the service and batch logons (4624) of a named account.
+    /// and on Windows the service and batch logons (4624) of a named account; the operator
+    /// answers them with a declared window ([`Self::set_work_hours`]) and an exempt list
+    /// ([`Self::set_odd_hour_exempt_accounts`]).
     fn check_odd_hour_logon(&mut self, event: &AuthEvent) -> Option<Alert> {
         if event.outcome != AuthOutcome::Success || event.kind != AuthKind::Logon {
             return None;
@@ -2304,6 +2452,15 @@ impl RuleState {
             self.pending_identity.push_back(event.clone());
         }
         self.take_due_identity_alerts()
+    }
+
+    /// UNEXPLAINED-UNIT-STOP (T1562.001, #1085), see [`crate::unitstop`]: the security-unit stops
+    /// whose wait is over, judged, each with its own event so the alert is attributed to it. A
+    /// stop is queued by [`Self::on_unit_stop`] and judged once the stream clock is
+    /// [`crate::unitstop::START_WITHIN_NS`] past it; the sink calls this after every exec and
+    /// unit stop, which are what move the clock.
+    pub fn take_due_unit_stops(&mut self) -> Vec<(UnitStopEvent, Alert)> {
+        self.unit_stops.take_due()
     }
 
     /// The queued identity requests whose wait is over, judged: see [`Self::on_identity_change`].
@@ -2575,11 +2732,19 @@ impl RuleState {
         );
     }
 
+    /// To be called for every `UnitStopEvent` (the journal's report of a security unit stopping,
+    /// #1127). Queues it for UNEXPLAINED-UNIT-STOP (#1085); the alert comes from
+    /// [`Self::take_due_unit_stops`] once the wait is over.
+    pub fn on_unit_stop(&mut self, event: &UnitStopEvent) {
+        self.unit_stops.on_unit_stop(event);
+    }
+
     /// To be called for every `FileOpenEvent` in the stream. Reports T1053.005
     /// scheduled-task creation (deduplicated, see
     /// [`Self::check_task_registration`]) and updates the history of downloader
     /// writes, consumed by `check_download_then_exec`.
     pub fn on_file_open(&mut self, event: &FileOpenEvent) -> Vec<Alert> {
+        self.unit_stops.advance_clock(event.meta.timestamp_ns);
         let mut alerts: Vec<Alert> = self.check_task_registration(event).into_iter().collect();
         alerts.extend(crate::stateless::check_service_write_outside_datadir(
             event,
@@ -2973,9 +3138,12 @@ impl RuleState {
     pub fn on_file_delete(&mut self, event: &FileDeleteEvent) -> Vec<Alert> {
         self.record_motw_removal(event);
         self.record_touched(event.meta.pid, Event::FileDelete(event.clone()));
-        self.check_write_new_then_unlink(event)
+        let mut alerts: Vec<Alert> = self
+            .check_write_new_then_unlink(event)
             .into_iter()
-            .collect()
+            .collect();
+        self.note_t1486(&event.meta, &mut alerts);
+        alerts
     }
 
     /// Remembers a Windows `FileDelete` of a `:Zone.Identifier` stream: the
@@ -3257,6 +3425,7 @@ impl RuleState {
         self.record_touched(event.meta.pid, Event::FileRename(event.clone()));
         let mut alerts: Vec<Alert> = self.check_mass_rename_pattern(event).into_iter().collect();
         alerts.extend(self.check_burst_write_volume(event));
+        self.note_t1486(&event.meta, &mut alerts);
         alerts
     }
 

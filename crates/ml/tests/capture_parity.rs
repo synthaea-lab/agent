@@ -17,21 +17,19 @@ use correlator::EventBus;
 use ml::features::correlation::{FEATURE_NAMES, extract_features};
 use schema::Event;
 
-const EVENTS: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../ml/tests/fixtures/capture_events.jsonl"
-));
-const GOLDEN: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../ml/tests/fixtures/capture_correlation_golden.jsonl"
-));
+/// In the `ml` sibling repo; read at run time, the test skips without it.
+const EVENTS_PATH: &str = "tests/fixtures/capture_events.jsonl";
+/// In the `ml` sibling repo; read at run time, the test skips without it.
+const GOLDEN_PATH: &str = "tests/fixtures/capture_correlation_golden.jsonl";
 
 #[test]
 fn vectors_match_python_aggregator() {
+    let events = siblings::require!("ml", EVENTS_PATH);
+    let golden = siblings::require!("ml", GOLDEN_PATH);
     // One 60 s window (matches CorrelationEngine::new and the generator): every
     // fixture event fits inside it, so no eviction and the per-PID windows agree.
     let mut bus = EventBus::new(Duration::from_secs(60));
-    for line in EVENTS.lines().filter(|l| !l.trim().is_empty()) {
+    for line in events.lines().filter(|l| !l.trim().is_empty()) {
         // Deserializing straight into Event is half the point — it pins the wire
         // format (identity under `meta`, `daddr` a string, `file_open` tag).
         let event: Event =
@@ -40,7 +38,7 @@ fn vectors_match_python_aggregator() {
     }
 
     let mut checked = 0;
-    for line in GOLDEN.lines().filter(|l| !l.trim().is_empty()) {
+    for line in golden.lines().filter(|l| !l.trim().is_empty()) {
         let row: serde_json::Value = serde_json::from_str(line).unwrap();
         let pid = row["pid"].as_u64().unwrap() as u32;
         let expected: Vec<f64> = row["features"]

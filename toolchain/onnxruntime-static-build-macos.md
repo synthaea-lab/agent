@@ -25,11 +25,11 @@ could hijack in a privileged process. Linux (`onnxruntime-static-build.md`) and 
 
 ```bash
 # 1. onnxruntime v1.30.0 from source, static libraries only (cold: not measured on macOS)
-./lab/provisioning/build-onnxruntime-static.sh
+./toolchain/build-onnxruntime-static.sh
 
 # 2. the link flags (the .a files the build produced, discovered rather than listed)
 export ORT_LIB_LOCATION="$PWD/onnxruntime/build/MacOS/Release"
-eval "$(./lab/provisioning/ort-static-link-flags.sh)"
+eval "$(./toolchain/ort-static-link-flags.sh)"
 
 # 3. build and test without the dynamic download
 cargo test -p ml --release --no-default-features

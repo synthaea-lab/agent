@@ -2,9 +2,8 @@
 //! engine must take every line of it. A line it refuses is dropped silently on a device (the
 //! loader counts it and goes on), so this is where a bad line in shipped content is caught. The
 //! server's `tests/unit/ioc-content.test.ts` adds the public-suffix check the engine cannot make.
-//! Vacuous while the directory is absent or empty.
-
-use std::path::Path;
+//! Skipped (loudly, see the `siblings` crate) without the `rules` sibling repo; vacuous while
+//! it ships no feed.
 
 use intel::{DEFAULT_MEMORY_BUDGET_BYTES, FeedId, SetBuilder};
 
@@ -43,8 +42,12 @@ fn the_check_flags_a_rejected_line_and_an_empty_file() {
 
 #[test]
 fn every_shipped_ioc_feed_loads_whole() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rules/ioc");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    let Some(rules) = siblings::path("rules", "") else {
+        siblings::skip("rules", "ioc");
+        return;
+    };
+    // The repo ships no `ioc/` yet: an absent directory is no feed, not a missing sibling.
+    let Ok(entries) = std::fs::read_dir(rules.join("ioc")) else {
         return;
     };
     let mut found = Vec::new();

@@ -13,10 +13,8 @@
 
 use ml::features::cmdline::{FEATURE_NAMES, extract_features};
 
-const GOLDEN: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../ml/tests/fixtures/features_golden.jsonl"
-));
+/// In the `ml` sibling repo; read at run time, the test skips without it.
+const GOLDEN_PATH: &str = "tests/fixtures/features_golden.jsonl";
 
 /// The golden file is f64 (Python); the Rust side computes in f32. Tolerance is loose
 /// relative to f32 rounding (~1e-7) but strict relative to any real definition drift.
@@ -27,8 +25,9 @@ fn close(got: f32, expected: f64) -> bool {
 
 #[test]
 fn parity_with_cmdline_py() {
+    let golden = siblings::require!("ml", GOLDEN_PATH);
     let mut cases = 0;
-    for line in GOLDEN.lines().filter(|l| !l.trim().is_empty()) {
+    for line in golden.lines().filter(|l| !l.trim().is_empty()) {
         let row: serde_json::Value = serde_json::from_str(line).expect("invalid golden line");
         let cmdline = row["cmdline"].as_str().expect("cmdline field");
         let expected: Vec<f64> = row["features"]

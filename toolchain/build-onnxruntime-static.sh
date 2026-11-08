@@ -18,7 +18,7 @@
 # Prerequisites (macOS): Xcode command line tools and `brew install cmake python@3.12 git`.
 #
 # Usage:
-#   ./lab/provisioning/build-onnxruntime-static.sh [--clean] [--jobs N]
+#   ./toolchain/build-onnxruntime-static.sh [--clean] [--jobs N]
 #
 # Options:
 #   --clean    Remove existing onnxruntime checkout before cloning
@@ -31,7 +31,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ONNX_DIR="$REPO_ROOT/onnxruntime"
 ONNX_VERSION="v1.30.0"
 # The commit the tag pointed at when this was pinned (2026-10-12). A tag can be moved; a build
@@ -186,7 +186,7 @@ echo "  1. Set environment variable:"
 echo "       export ORT_LIB_LOCATION=\"$BUILD_DIR\""
 echo ""
 echo "  2. Generate RUSTFLAGS for static linking:"
-echo "       eval \"\$(./lab/provisioning/ort-static-link-flags.sh)\""
+echo "       eval \"\$(./toolchain/ort-static-link-flags.sh)\""
 echo ""
 echo "  3. Build and test the ml crate:"
 echo "       cargo test -p ml --release"
