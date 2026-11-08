@@ -117,6 +117,54 @@ Live status and ordering are on the [project board](https://github.com/orgs/synt
 
 - Published data-handling and privacy statement (what is collected, redacted, leaves the host) (planned, Redaction). See [redaction.md#where-redaction-happens](redaction.md#where-redaction-happens).
 
+### [#89](https://github.com/synthaea-lab/agent/issues/89) Loss accounting: count ring-buffer drops and spool losses in the health beacon
+
+- Spool byte cap with oldest-segment shedding and counted loss (partial, State and storage). See [state-and-storage.md#bounds-and-back-pressure](state-and-storage.md#bounds-and-back-pressure).
+- Ring-buffer loss accounting (partial, Userspace loader and process context). See [sensors/linux/userspace-loader.md#back-pressure-and-loss](sensors/linux/userspace-loader.md#back-pressure-and-loss).
+- Canary touches observed under open floods (partial, Deception). See [detection/deception.md#limits](detection/deception.md#limits).
+
+### [#92](https://github.com/synthaea-lab/agent/issues/92) Policy distribution and configuration follow-ups (signed policy loader, hot reload, unused knobs)
+
+- Committed default template and cli config init (partial, Local configuration). See [configuration.md#template](configuration.md#template).
+- Resource and logging knobs (log.dir, log.max_mb, worker_threads, max_reconnect_backoff_ms) (partial, Local configuration). See [configuration.md#gaps-and-discrepancies](configuration.md#gaps-and-discrepancies).
+- Configuration hot reload (planned, Local configuration). See [configuration.md#gaps-and-discrepancies](configuration.md#gaps-and-discrepancies).
+- Signed policy document: canonical JSON, Ed25519 verification, layered override merge with safety-critical completeness (partial, Policy). See [configuration.md#the-signed-policy-document](configuration.md#the-signed-policy-document).
+- Policy-controlled sensor PII scrubbing (RedactionPolicy) (planned, Redaction). See [redaction.md#known-limits](redaction.md#known-limits).
+- Retry/backoff and batch tuning from agent.toml (planned, Transport). See [transport.md#configuration](transport.md#configuration).
+
+### [#93](https://github.com/synthaea-lab/agent/issues/93) Support passphrase-protected mTLS client keys
+
+- Secret references (envvar:/file:) instead of cleartext (partial, Local configuration). See [configuration.md#secrets](configuration.md#secrets).
+- Passphrase-protected mTLS client key (planned, Security model). See [security-model.md#secret-handling](security-model.md#secret-handling).
+- Passphrase-protected client keys (partial, Transport). See [transport.md#tls-and-identity](transport.md#tls-and-identity).
+
+### [#94](https://github.com/synthaea-lab/agent/issues/94) On-device ML wiring: T0/T1 scorers, trained T2 model, attributions in detections, rarity calibration
+
+- T2 correlation scorer feeding the correlator's Bayesian belief in the agent (partial, On-device ML). See [detection/ml.md#t2-in-the-agent](detection/ml.md#t2-in-the-agent).
+- T0 command-line scorer on-device (partial, On-device ML). See [detection/ml.md#tiers](detection/ml.md#tiers).
+- T1 17-feature behaviour scorer on-device (partial, On-device ML). See [detection/ml.md#tiers](detection/ml.md#tiers).
+- Per-feature attribution of a score from the ONNX tree structure (partial, On-device ML). See [detection/ml.md#attribution](detection/ml.md#attribution).
+- Fleet common-set rarity as capped correlator evidence (partial, On-device ML). See [detection/ml.md#rarity-and-the-common-set](detection/ml.md#rarity-and-the-common-set).
+- ML correlation score as an extra LLR term on the belief (partial, Correlation). See [correlation.md#update-rule](correlation.md#update-rule).
+
+### [#97](https://github.com/synthaea-lab/agent/issues/97) Response and graceful-shutdown parity on Windows and macOS (kill, quarantine, final drain, kill loudness, protected files)
+
+- Bounded graceful shutdown with final upload drain (Linux SIGINT) (partial, Lifecycle). See [lifecycle.md#shutdown](lifecycle.md#shutdown).
+- Termination-signal attribution before exit (kill-loudness) (partial, Lifecycle). See [lifecycle.md#shutdown](lifecycle.md#shutdown).
+- Quarantine of a YARA-matched file (partial, YARA). See [detection/yara.md#what-a-match-does](detection/yara.md#what-a-match-does).
+- Automated process kill on a correlator BAYES crossing, observe-only by default, with protected-pid refusal (partial, Response). See [response.md#the-kill-gate](response.md#the-kill-gate).
+- Automated quarantine of a YARA-matched written file (digest-named, origin sidecar, 0400, symlink-safe, writer-safe snapshot) (partial, Response). See [response.md#quarantine](response.md#quarantine).
+- Protected-resource monitoring of the agent's own files (T1562) (partial, Self-protection). See [self-protection.md#protected-resources](self-protection.md#protected-resources).
+- Graceful shutdown with a bounded final spool drain (partial, Transport). See [transport.md#upload-loop-and-shutdown](transport.md#upload-loop-and-shutdown).
+
+### [#98](https://github.com/synthaea-lab/agent/issues/98) Local interface hardening and fuzzing coverage (IPC limits, cli tests, scheduled fuzz targets, Windows install-dir DACL)
+
+- Non-invasive eBPF preflight (agent status) with non-zero exit on verifier rejection (partial, Lifecycle). See [lifecycle.md#linux](lifecycle.md#linux).
+- Local IPC restricted to root/elevated peers with bounded framing (partial, Security model). See [security-model.md#local-ipc-cli-and-ui-to-agent](security-model.md#local-ipc-cli-and-ui-to-agent).
+- Coverage-guided fuzzing of parsers on a schedule (partial, Security model). See [security-model.md#never-panic-parsers-and-fuzzing](security-model.md#never-panic-parsers-and-fuzzing).
+- Windows install-directory permission (DACL) audit (planned, Security model). See [security-model.md#what-is-not-defended](security-model.md#what-is-not-defended).
+- Admin CLI: status, health, detections, policy, suppress/unsuppress, config init/check/path (partial, Admin CLI). See [local-interfaces.md#cli](local-interfaces.md#cli).
+
 ## Medium: later
 
 ### [#19](https://github.com/synthaea-lab/agent/issues/19) Impact/Priv-Esc remainder on Windows and macOS: T1548 joins, T1486 write-volume (deferred)
@@ -193,12 +241,6 @@ Live status and ordering are on the [project board](https://github.com/orgs/synt
 - aarch64 support (partial, eBPF probes). See [sensors/linux/README.md#requirements-and-platform-differences](sensors/linux/README.md#requirements-and-platform-differences).
 - arm64 builds (planned, Packaging). See [packaging.md#status-by-platform](packaging.md#status-by-platform).
 
-## Not yet prioritized
-
-### [#15](https://github.com/synthaea-lab/agent/issues/15) ODD-HOUR-LOGON: platform time zone verified per OS, and calibration of the working window
-
-- ODD-HOUR-LOGON with operator-configured offset, work hours and exempt accounts (partial, Rule engine). See [detection/rules.md#configuration](detection/rules.md#configuration).
-
 ### [#88](https://github.com/synthaea-lab/agent/issues/88) Linux sensor telemetry gaps (env at drain time, container context, unhooked syscalls, uprobe limits)
 
 - File mutation telemetry: delete, rename (relative paths resolved), chmod, chown, setxattr/removexattr (partial, eBPF probes). See [sensors/linux/ebpf-probes.md#what-each-syscall-route-captures](sensors/linux/ebpf-probes.md#what-each-syscall-route-captures).
@@ -210,12 +252,6 @@ Live status and ordering are on the [project board](https://github.com/orgs/synt
 - TLS plaintext capture (OpenSSL/GnuTLS SSL_read/SSL_write) with redaction and per-process budgets (partial, Uprobes and DNS). See [sensors/linux/uprobes.md#limits](sensors/linux/uprobes.md#limits).
 - Shell readline capture with redaction (partial, Uprobes and DNS). See [sensors/linux/uprobes.md#the-probes](sensors/linux/uprobes.md#the-probes).
 - Proc connector fork/exec/exit cross-check against the eBPF stream (partial, Netlink). See [sensors/linux/netlink.md#proc-connector](sensors/linux/netlink.md#proc-connector).
-
-### [#89](https://github.com/synthaea-lab/agent/issues/89) Loss accounting: count ring-buffer drops and spool losses in the health beacon
-
-- Spool byte cap with oldest-segment shedding and counted loss (partial, State and storage). See [state-and-storage.md#bounds-and-back-pressure](state-and-storage.md#bounds-and-back-pressure).
-- Ring-buffer loss accounting (partial, Userspace loader and process context). See [sensors/linux/userspace-loader.md#back-pressure-and-loss](sensors/linux/userspace-loader.md#back-pressure-and-loss).
-- Canary touches observed under open floods (partial, Deception). See [detection/deception.md#limits](detection/deception.md#limits).
 
 ### [#90](https://github.com/synthaea-lab/agent/issues/90) Inline prevention: BPF-LSM and Endpoint Security AUTH blocking
 
@@ -231,34 +267,12 @@ Live status and ordering are on the [project board](https://github.com/orgs/synt
 - Push transport via EvtSubscribe (partial, Event Log). See [sensors/windows/eventlog.md#subscribe](sensors/windows/eventlog.md#subscribe).
 - Per-channel toggles and transport driven by policy (partial, Event Log). See [sensors/windows/eventlog.md#configuration](sensors/windows/eventlog.md#configuration).
 
-### [#92](https://github.com/synthaea-lab/agent/issues/92) Policy distribution and configuration follow-ups (signed policy loader, hot reload, unused knobs)
-
-- Committed default template and cli config init (partial, Local configuration). See [configuration.md#template](configuration.md#template).
-- Resource and logging knobs (log.dir, log.max_mb, worker_threads, max_reconnect_backoff_ms) (partial, Local configuration). See [configuration.md#gaps-and-discrepancies](configuration.md#gaps-and-discrepancies).
-- Configuration hot reload (planned, Local configuration). See [configuration.md#gaps-and-discrepancies](configuration.md#gaps-and-discrepancies).
-- Signed policy document: canonical JSON, Ed25519 verification, layered override merge with safety-critical completeness (partial, Policy). See [configuration.md#the-signed-policy-document](configuration.md#the-signed-policy-document).
-- Policy-controlled sensor PII scrubbing (RedactionPolicy) (planned, Redaction). See [redaction.md#known-limits](redaction.md#known-limits).
-- Retry/backoff and batch tuning from agent.toml (planned, Transport). See [transport.md#configuration](transport.md#configuration).
-
-### [#93](https://github.com/synthaea-lab/agent/issues/93) Support passphrase-protected mTLS client keys
-
-- Secret references (envvar:/file:) instead of cleartext (partial, Local configuration). See [configuration.md#secrets](configuration.md#secrets).
-- Passphrase-protected mTLS client key (planned, Security model). See [security-model.md#secret-handling](security-model.md#secret-handling).
-- Passphrase-protected client keys (partial, Transport). See [transport.md#tls-and-identity](transport.md#tls-and-identity).
-
-### [#94](https://github.com/synthaea-lab/agent/issues/94) On-device ML wiring: T0/T1 scorers, trained T2 model, attributions in detections, rarity calibration
-
-- T2 correlation scorer feeding the correlator's Bayesian belief in the agent (partial, On-device ML). See [detection/ml.md#t2-in-the-agent](detection/ml.md#t2-in-the-agent).
-- T0 command-line scorer on-device (partial, On-device ML). See [detection/ml.md#tiers](detection/ml.md#tiers).
-- T1 17-feature behaviour scorer on-device (partial, On-device ML). See [detection/ml.md#tiers](detection/ml.md#tiers).
-- Per-feature attribution of a score from the ONNX tree structure (partial, On-device ML). See [detection/ml.md#attribution](detection/ml.md#attribution).
-- Fleet common-set rarity as capped correlator evidence (partial, On-device ML). See [detection/ml.md#rarity-and-the-common-set](detection/ml.md#rarity-and-the-common-set).
-- ML correlation score as an extra LLR term on the belief (partial, Correlation). See [correlation.md#update-rule](correlation.md#update-rule).
-
 ### [#95](https://github.com/synthaea-lab/agent/issues/95) Sigma: evaluate PE version-resource fields after enrichment
 
 - PE version-resource fields (OriginalFileName, Company, Description, Product) in windows/ rules (partial, Sigma). See [detection/sigma.md#fields](detection/sigma.md#fields).
 - PE version-resource strings on Windows (partial, Enrichment). See [detection/enrichment.md#pe-version-strings](detection/enrichment.md#pe-version-strings).
+
+## Low: later
 
 ### [#96](https://github.com/synthaea-lab/agent/issues/96) Detection and output scope extensions (Sigma log sources, IOC on written files, honeypots, Syslog/OCSF)
 
@@ -267,20 +281,8 @@ Live status and ordering are on the [project board](https://github.com/orgs/synt
 - Honeypot listeners (planned, Deception). See [detection/deception.md#limits](detection/deception.md#limits).
 - Syslog/CEF and OCSF/ECS local outputs (planned, Local outputs). See [local-interfaces.md#jsonl-outputs](local-interfaces.md#jsonl-outputs).
 
-### [#97](https://github.com/synthaea-lab/agent/issues/97) Response and graceful-shutdown parity on Windows and macOS (kill, quarantine, final drain, kill loudness, protected files)
+## Not yet prioritized
 
-- Bounded graceful shutdown with final upload drain (Linux SIGINT) (partial, Lifecycle). See [lifecycle.md#shutdown](lifecycle.md#shutdown).
-- Termination-signal attribution before exit (kill-loudness) (partial, Lifecycle). See [lifecycle.md#shutdown](lifecycle.md#shutdown).
-- Quarantine of a YARA-matched file (partial, YARA). See [detection/yara.md#what-a-match-does](detection/yara.md#what-a-match-does).
-- Automated process kill on a correlator BAYES crossing, observe-only by default, with protected-pid refusal (partial, Response). See [response.md#the-kill-gate](response.md#the-kill-gate).
-- Automated quarantine of a YARA-matched written file (digest-named, origin sidecar, 0400, symlink-safe, writer-safe snapshot) (partial, Response). See [response.md#quarantine](response.md#quarantine).
-- Protected-resource monitoring of the agent's own files (T1562) (partial, Self-protection). See [self-protection.md#protected-resources](self-protection.md#protected-resources).
-- Graceful shutdown with a bounded final spool drain (partial, Transport). See [transport.md#upload-loop-and-shutdown](transport.md#upload-loop-and-shutdown).
+### [#15](https://github.com/synthaea-lab/agent/issues/15) ODD-HOUR-LOGON: platform time zone verified per OS, and calibration of the working window
 
-### [#98](https://github.com/synthaea-lab/agent/issues/98) Local interface hardening and fuzzing coverage (IPC limits, cli tests, scheduled fuzz targets, Windows install-dir DACL)
-
-- Non-invasive eBPF preflight (agent status) with non-zero exit on verifier rejection (partial, Lifecycle). See [lifecycle.md#linux](lifecycle.md#linux).
-- Local IPC restricted to root/elevated peers with bounded framing (partial, Security model). See [security-model.md#local-ipc-cli-and-ui-to-agent](security-model.md#local-ipc-cli-and-ui-to-agent).
-- Coverage-guided fuzzing of parsers on a schedule (partial, Security model). See [security-model.md#never-panic-parsers-and-fuzzing](security-model.md#never-panic-parsers-and-fuzzing).
-- Windows install-directory permission (DACL) audit (planned, Security model). See [security-model.md#what-is-not-defended](security-model.md#what-is-not-defended).
-- Admin CLI: status, health, detections, policy, suppress/unsuppress, config init/check/path (partial, Admin CLI). See [local-interfaces.md#cli](local-interfaces.md#cli).
+- ODD-HOUR-LOGON with operator-configured offset, work hours and exempt accounts (partial, Rule engine). See [detection/rules.md#configuration](detection/rules.md#configuration).
