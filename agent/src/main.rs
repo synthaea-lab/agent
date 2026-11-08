@@ -62,6 +62,7 @@ mod kill_loudness;
 mod log_sources;
 #[cfg(target_os = "linux")]
 mod memscan;
+mod own_traffic;
 mod protected;
 mod quarantine_cmd;
 mod ransomware_join;
