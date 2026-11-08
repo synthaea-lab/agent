@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fails if any of the given built binaries carries the public test signing key set
-# (ADR-0027, #753): the marker the updater's `test-key` feature links in is looked up in the
+# (ADR-0027, https://github.com/synthaea-lab/edr-agent/issues/43): the marker the updater's `test-key` feature links in is looked up in the
 # artifact itself, not in a nearby build product. Used by the packaging scripts on the exact
 # binaries they ship, and self-tested by tools/check-no-test-key.sh.
 # usage: tools/assert-no-test-key.sh <binary>...

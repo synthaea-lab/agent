@@ -17,7 +17,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-# Cross-repo contract fixtures (the umbrella's sibling repos), skipped when absent.
+# Cross-repo contract fixtures (sibling checkouts of the other public repos), skipped when absent.
 siblings = { path = "../siblings" }
 schema = { path = "../schema", features = ["test-fixtures"] }
 serde_json = { workspace = true }

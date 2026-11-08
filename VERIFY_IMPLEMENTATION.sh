@@ -6,7 +6,7 @@ echo "Issue #46 Implementation Verification"
 echo "=========================================="
 echo ""
 
-# Phase 1 lives in the `ml` sibling repo: the umbrella's ml/, or $SYNTHAEA_ROOT/ml.
+# Phase 1 lives in the `ml` sibling (synthaea-lab/edr-ml): ../ml, or $SYNTHAEA_ROOT/ml.
 cd "$(dirname "$0")"
 ML_DIR="${SYNTHAEA_ROOT:-..}/ml"
 

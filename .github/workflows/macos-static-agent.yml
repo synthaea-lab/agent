@@ -177,7 +177,7 @@ jobs:
       - name: Build the agent with static onnxruntime
         run: cargo build -j 2 --release --no-default-features -p agent
 
-      # The packaged build must not carry the public test signing key (ADR-0027, #753).
+      # The packaged build must not carry the public test signing key (ADR-0027, https://github.com/synthaea-lab/edr-agent/issues/43).
       - name: Check the agent carries no test signing key
         run: bash tools/assert-no-test-key.sh target/release/agent
 

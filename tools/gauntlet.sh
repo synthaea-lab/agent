@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # The full local check matrix — everything CI enforces, runnable on one
 # machine before pushing. CI (.github/workflows/ci.yml) is the enforcement;
-# this script catches the same failures earlier (#318). It mirrors ci.yml's
-# jobs plus the cross-target sweep from
-# docs/development/code-style.md ("host-only clippy misses every cfg'd item").
+# this script catches the same failures earlier. It mirrors ci.yml's
+# jobs plus the cross-target sweep (host-only clippy misses every cfg'd item).
 #
 # Usage: tools/gauntlet.sh            # everything
 #        tools/gauntlet.sh --fast     # skip the cross-target and docs passes
@@ -24,6 +23,12 @@ cargo +nightly fmt --all --check
 step "dependency direction"
 python3 tools/check-deps.py
 
+# Needs the `rules` sibling; CI's `content` job makes its absence fatal.
+if [[ -d "${SYNTHAEA_ROOT:-..}/rules/sigma" ]]; then
+    step "ATT&CK coverage matrix up to date"
+    python3 tools/attack-coverage.py --check
+fi
+
 step "PowerShell scripts ASCII-only (Windows PowerShell 5.1 misreads anything else)"
 python3 tools/check-ps1-ascii.py
 
@@ -31,7 +36,7 @@ step "clippy, host, all targets, -D warnings"
 cargo clippy --workspace --exclude sensor-linux-ebpf --all-targets -- -D warnings
 
 step "tests"
-# Cross-repo contract tests read the umbrella's sibling repos (crates/siblings)
+# Cross-repo contract tests read the sibling checkouts (crates/siblings)
 # and skip with a `skipped:` line when one is absent; export
 # SYNTHAEA_REQUIRE_SIBLINGS=1 to make a missing sibling fail, as CI does.
 cargo test --workspace --exclude sensor-linux-ebpf
@@ -42,8 +47,8 @@ cargo test -p updater --no-default-features
 step "cargo deny (licenses, advisories, bans, sources)"
 cargo deny check
 
-# ML robustness check (issue #45) — only runs if the `ml` sibling repo (the
-# umbrella's ml/, or $SYNTHAEA_ROOT/ml) is checked out and has a latest model.
+# ML robustness check — only runs if the `ml` sibling (synthaea-lab/edr-ml,
+# checked out as ../ml or $SYNTHAEA_ROOT/ml) is present and has a latest model.
 # Verifies escape rate and degradation metrics stay within thresholds.
 ML_DIR="${SYNTHAEA_ROOT:-..}/ml"
 if [[ -d "$ML_DIR/registry/cmdline-iforest-linux/latest" ]]; then

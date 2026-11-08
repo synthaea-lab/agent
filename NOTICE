@@ -46,4 +46,4 @@ COPYRIGHT HOLDER
 project is to be held by a single legal entity, replace this designation
 consistently across LICENSE, NOTICE, and all source headers BEFORE accepting
 external contributions -- changing it afterwards requires the agreement of
-every contributor, as there is no CLA. See docs/adr/0003-apache-license-no-cla.md.
+every contributor, as there is no CLA (ADR-0003: Apache-2.0, no CLA).
