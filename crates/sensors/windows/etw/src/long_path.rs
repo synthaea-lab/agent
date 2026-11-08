@@ -18,6 +18,8 @@
 
 use std::{collections::HashMap, sync::Mutex};
 
+use crate::sync::LockExt;
+
 /// Short-form directory → its long form, never larger than its cap.
 ///
 /// Full, it is cleared rather than LRU-evicted: short-named directories are a
@@ -101,7 +103,7 @@ fn expand_dir(
     cache: &Mutex<LongPathCache>,
     resolve: &impl Fn(&str) -> Option<String>,
 ) -> String {
-    if let Some(long) = lock(cache).dirs.get(dir) {
+    if let Some(long) = cache.lock_or_recover().dirs.get(dir) {
         return long.clone();
     }
     // Resolved outside the lock: a slow lookup must not serialize other callers.
@@ -109,7 +111,7 @@ fn expand_dir(
     let Some(long) = resolve(dir) else {
         return dir.to_owned();
     };
-    lock(cache).insert(dir.to_owned(), long.clone());
+    cache.lock_or_recover().insert(dir.to_owned(), long.clone());
     long
 }
 
@@ -124,14 +126,6 @@ fn expand_leaf(long_parent: &str, leaf: &str, resolve: &impl Fn(&str) -> Option<
                 .map(|(_, name)| format!("{name}{stream}"))
         })
         .unwrap_or_else(|| leaf.to_owned())
-}
-
-/// A poisoned lock only means another callback panicked mid-insert; the map
-/// itself is still a valid cache.
-fn lock(cache: &Mutex<LongPathCache>) -> std::sync::MutexGuard<'_, LongPathCache> {
-    cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]

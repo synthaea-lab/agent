@@ -31,6 +31,7 @@ use crate::{
         powershell_provider, process_provider, registry_provider, smb_provider, wmi_provider,
     },
     silo::{self, SiloDirectory},
+    sync::LockExt,
     winapi,
     zone_identifier::{self, MarkQueue, QuarantineDedup},
 };
@@ -351,7 +352,7 @@ impl SharedState {
     /// (#725), as the pid store recorded them. `ppid` 0 (an event that names no parent) has no stamp.
     pub(crate) fn meta(&self, pid: u32, ppid: u32, comm: String, timestamp_ns: u64) -> EventMeta {
         let (process_generation, parent_process_generation) = {
-            let pids = self.pids.lock().unwrap();
+            let pids = self.pids.lock_or_recover();
             let parent = if ppid == 0 {
                 None
             } else {
@@ -376,11 +377,10 @@ impl SharedState {
     fn container_of(&self, pid: u32, now_ns: u64) -> Option<ContainerContext> {
         let silo = self
             .pids
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .silo(pid)
             .filter(|&silo| silo != 0)?;
-        let mut silos = self.silos.lock().unwrap();
+        let mut silos = self.silos.lock_or_recover();
         let (context, ask) = silos.lookup(silo, now_ns);
         if ask && self.silo_requests.try_send(silo).is_err() {
             silos.request_dropped(silo);
@@ -394,11 +394,11 @@ impl SharedState {
     }
 
     fn to_dos_path(&self, raw: &str) -> String {
-        let normalized = normalize::normalize_nt_path(raw, &self.volumes.lock().unwrap());
+        let normalized = normalize::normalize_nt_path(raw, &self.volumes.lock_or_recover());
         if normalized.starts_with(r"\Device\") {
             // Unknown device: refresh the map once (a newly mounted volume) and retry.
             let fresh = winapi::build_volume_map();
-            let mut volumes = self.volumes.lock().unwrap();
+            let mut volumes = self.volumes.lock_or_recover();
             *volumes = fresh;
             return normalize::normalize_nt_path(raw, &volumes);
         }
@@ -407,7 +407,7 @@ impl SharedState {
 
     pub(crate) fn comm_for(&self, pid: u32) -> Option<String> {
         let cached = {
-            let mut pids = self.pids.lock().unwrap();
+            let mut pids = self.pids.lock_or_recover();
             pids.get(pid).map(str::to_owned)
         };
         let path = match cached {
@@ -418,8 +418,7 @@ impl SharedState {
                 let generation = winapi::read_process_sequence_number(pid);
                 let silo = winapi::read_server_silo_id(pid);
                 self.pids
-                    .lock()
-                    .unwrap()
+                    .lock_or_recover()
                     .insert(pid, resolved.clone(), generation, silo);
                 resolved
             }
@@ -482,7 +481,7 @@ fn probe_silo(pid: u32, image: &str) -> Option<u32> {
 /// Seeds the pid store before the trace: already-running processes resolve from
 /// the very first `ConnectEvent`, and parent lineage/exclusions apply to them.
 fn seed_pid_store(state: &SharedState) {
-    let mut pids = state.pids.lock().unwrap();
+    let mut pids = state.pids.lock_or_recover();
     for winapi::ProcessEntry { pid, name, .. } in winapi::snapshot_processes() {
         pids.insert(
             pid,
