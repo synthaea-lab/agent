@@ -1,0 +1,42 @@
+name: DCO
+
+# Every commit in a pull request must carry a Developer Certificate of Origin sign-off
+# (`Signed-off-by: Name <email>`, added by `git commit -s`) whose email is the commit
+# author's. CONTRIBUTING.md explains why; ADR-0047 records the licensing it supports.
+# Merge commits and bot commits (Dependabot) are exempt.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  dco:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Every commit is signed off by its author
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          missing=0
+          for c in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            email=$(git log -1 --format=%ae "$c")
+            case "$email" in
+              *'[bot]@users.noreply.github.com') continue ;;
+            esac
+            if ! git log -1 --format=%B "$c" | grep -i '^Signed-off-by:' | grep -qiF "<$email>"; then
+              echo "::error::$(git log -1 --format='%h %s' "$c"): no 'Signed-off-by: ... <$email>' line"
+              missing=1
+            fi
+          done
+          if [ "$missing" = 1 ]; then
+            echo "Sign off your commits: 'git commit -s' for new ones, 'git rebase --signoff $BASE' for these, then force-push."
+            exit 1
+          fi
+          echo "All commits are signed off."
