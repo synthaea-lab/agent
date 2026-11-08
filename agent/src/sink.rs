@@ -2455,7 +2455,9 @@ impl EventSink for DetectionSink {
                 self.record_rule_alerts(&event, alerts);
             }
             Event::RemoteThread(e) => {
-                self.record_rule_alerts(&event, rules::evaluate_remote_thread(e));
+                // Bound first: `record_rule_alerts` takes the lock again.
+                let alerts = self.rule_state.lock().unwrap().on_remote_thread(e);
+                self.record_rule_alerts(&event, alerts);
             }
             // New telemetry categories reach the engines as they land; until a rule
             // consumes them, logging below is the whole treatment.
