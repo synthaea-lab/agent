@@ -218,6 +218,7 @@ pub fn evaluate_exec(event: &ExecEvent) -> Vec<Alert> {
         .chain(check_event_logging_disable_exec(event))
         .chain(crate::osascript::check_osascript_password_prompt(event))
         .chain(crate::securitytool::check_security_tool_stop(event))
+        .chain(crate::securitytool::check_security_tool_throttle(event))
         .chain(check_truncated_cmdline(event))
         .collect()
 }
@@ -806,6 +807,7 @@ pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
         .chain(check_systemd_service_persistence(event))
         .chain(check_btm_launch_item_persistence(event))
         .chain(check_alternate_data_stream_write(event))
+        .chain(crate::securitytool::check_security_tool_cgroup_write(event))
         .collect()
 }
 

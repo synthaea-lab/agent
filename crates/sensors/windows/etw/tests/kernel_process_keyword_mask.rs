@@ -2,13 +2,14 @@
 
 //! Real-session check of the Kernel-Process keyword mask (#726, #727).
 //!
-//! `process_provider` asks for the process, image and job-silo keywords only (`0x4050`;
-//! silo events 23-26 since #371), so that thread start/stop (EID 3/4, keyword THREAD
-//! `0x20`) never reach the callback. The unit test of the mask table compares it with
-//! literals it also contains; this test starts a real session with the requested mask
-//! and looks at which ids actually arrive for a workload it controls: a short-lived
-//! child process (process start, image loads, process stop) and a few threads of its
-//! own.
+//! Whether the provider honours a keyword mask: with the process, image and job-silo
+//! keywords only (`0x4050`, the default here; silo events 23-26 since #371), thread
+//! start/stop (EID 3/4, keyword THREAD `0x20`) must not arrive. `process_provider` itself
+//! asked for exactly that mask from #726 until #720, which reads thread starts and asks
+//! for `0x4070`; this test still pins the mechanism the mask relies on, and lab phase G
+//! runs it with both masks. It starts a real session with the requested mask and looks at
+//! which ids actually arrive for a workload it controls: a short-lived child process
+//! (process start, image loads, process stop) and a few threads of its own.
 
 use std::{
     collections::BTreeSet,
@@ -27,9 +28,10 @@ use ferrisetw::{
 };
 
 const KERNEL_PROCESS_GUID: &str = "22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716";
-/// `ProcessStart`, `ProcessStop`, `ImageLoad`: what the agent needs from this provider.
+/// `ProcessStart`, `ProcessStop`, `ImageLoad`: what every mask under test must deliver (the
+/// agent also reads `ThreadStart` since #720, but only with the THREAD keyword set).
 const REQUIRED_EVENT_IDS: [u16; 3] = [1, 2, 5];
-/// `ThreadStart`, `ThreadStop`: what the mask must keep out.
+/// `ThreadStart`, `ThreadStop`: what a mask without the THREAD keyword must keep out.
 const THREAD_EVENT_IDS: [u16; 2] = [3, 4];
 
 /// The process an event is about: the `ProcessID` field when the schema has one (the

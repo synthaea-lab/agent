@@ -5,9 +5,16 @@
 //! combined: %h %l %u %t "%r" %>s %b "%{Referer}i" "%{User-Agent}i"
 //! ```
 //!
-//! nginx's default `combined` is the same layout, so it shares the preset. A site
-//! with a custom `LogFormat` (a vhost prefix, JSON, extra fields) fails to parse and
-//! is reported by the caller as a misparsing source, never silently mis-read.
+//! nginx's default `combined` is the same layout, so it shares the preset. So does
+//! "combined plus fields at the end": the `main` format distro `nginx.conf` files
+//! ship (a trailing `"$http_x_forwarded_for"`), or an Apache `%D` after the user
+//! agent (#1143). Those fields are skipped, never read: X-Forwarded-For is
+//! whatever the client sent, so it must never stand in for the client address.
+//! Everything up to the user agent stays strict, so a site with a custom
+//! `LogFormat` (a vhost prefix, JSON, fields reordered) still fails to parse and is
+//! reported by the caller as a misparsing source, never silently mis-read.
+//! `common` keeps rejecting any trailing data: a `combined` line declared as
+//! `common` must surface as a misdeclared source.
 
 use crate::{ParseError, clamp, tokenizer::Cursor};
 
@@ -35,6 +42,9 @@ pub struct AccessRecord {
     pub user_agent: Option<String>,
     /// The line was longer than [`crate::MAX_LINE_BYTES`] and cut.
     pub truncated: bool,
+    /// Fields skipped after the user agent of a `combined` line (#1143); always 0
+    /// for `common`. Counted so the caller can report a source that logs them.
+    pub extra_fields: usize,
 }
 
 impl AccessRecord {
@@ -114,8 +124,24 @@ fn parse_clamped(
         }
     };
 
-    if !truncated && !c.at_end() {
-        return Err(ParseError::TrailingData);
+    let mut extra_fields = 0;
+    match format {
+        AccessFormat::Common if !truncated && !c.at_end() => {
+            return Err(ParseError::TrailingData);
+        }
+        AccessFormat::Common => {}
+        // The line is at most MAX_LINE_BYTES and each pass consumes at least one
+        // byte, so this loop is bounded. A cut line may end inside an extra field;
+        // what was read up to the user agent is still good, as before #1143.
+        AccessFormat::Combined => {
+            while !c.at_end() {
+                match c.skip_field("extra") {
+                    Ok(()) => extra_fields += 1,
+                    Err(_) if truncated => break,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
     }
 
     Ok(AccessRecord {
@@ -128,6 +154,7 @@ fn parse_clamped(
         referer,
         user_agent,
         truncated,
+        extra_fields,
     })
 }
 
@@ -203,6 +230,66 @@ mod tests {
             parse_access_line(common, AccessFormat::Combined),
             Err(ParseError::MissingField(_))
         ));
+    }
+
+    /// nginx `main`, as shipped in Alpine's `/etc/nginx/nginx.conf` (#1143).
+    const NGINX_MAIN: &str = r#"127.0.0.1 - - [05/Nov/2026:09:17:22 +0100] "GET / HTTP/1.1" 404 146 "-" "curl/8.22.0" "-""#;
+
+    #[test]
+    fn the_distro_nginx_main_format_parses_as_combined() {
+        let r = parse_access_line(NGINX_MAIN, AccessFormat::Combined).unwrap();
+        assert_eq!(r.client, "127.0.0.1");
+        assert_eq!((r.status, r.bytes), (404, Some(146)));
+        assert_eq!(r.user_agent.as_deref(), Some("curl/8.22.0"));
+        assert_eq!(r.extra_fields, 1);
+    }
+
+    #[test]
+    fn a_forwarded_for_value_never_becomes_the_client() {
+        // The client chose the X-Forwarded-For header; the connection came from 127.0.0.1.
+        let spoofed = r#"127.0.0.1 - - [05/Nov/2026:09:17:22 +0100] "GET / HTTP/1.1" 404 146 "-" "curl/8.22.0" "10.0.0.1, 192.0.2.66""#;
+        let r = parse_access_line(spoofed, AccessFormat::Combined).unwrap();
+        assert_eq!(r.client, "127.0.0.1");
+        assert_eq!(r.user_agent.as_deref(), Some("curl/8.22.0"));
+    }
+
+    #[test]
+    fn a_bare_field_after_the_user_agent_is_skipped() {
+        // Apache `combined` plus `%D` (request duration, microseconds).
+        let r = parse_access_line(&format!("{COMBINED} 5123"), AccessFormat::Combined).unwrap();
+        assert_eq!(r.user_agent.as_deref(), Some("Mozilla/5.0 (X11; Linux)"));
+        assert_eq!(r.extra_fields, 1);
+        assert_eq!(
+            parse_access_line(COMBINED, AccessFormat::Combined)
+                .unwrap()
+                .extra_fields,
+            0
+        );
+    }
+
+    #[test]
+    fn an_escaped_quote_in_the_user_agent_does_not_open_an_extra_field() {
+        let line = r#"1.2.3.4 - - [10/Oct/2026:13:55:36 +0000] "GET / HTTP/1.1" 200 10 "-" "evil\" \"x" "-""#;
+        let r = parse_access_line(line, AccessFormat::Combined).unwrap();
+        assert_eq!(r.user_agent.as_deref(), Some(r#"evil" "x"#));
+        assert_eq!(r.extra_fields, 1);
+    }
+
+    #[test]
+    fn an_unterminated_extra_field_is_still_an_error() {
+        let open = format!(r#"{COMBINED} "10.0.0.1"#);
+        assert_eq!(
+            parse_access_line(&open, AccessFormat::Combined),
+            Err(ParseError::Unterminated)
+        );
+    }
+
+    #[test]
+    fn a_cut_inside_an_extra_field_keeps_the_fields_before_it() {
+        let line = format!(r#"{COMBINED} "{}""#, "f".repeat(20_000));
+        let r = parse_access_line(&line, AccessFormat::Combined).unwrap();
+        assert!(r.truncated);
+        assert_eq!(r.user_agent.as_deref(), Some("Mozilla/5.0 (X11; Linux)"));
     }
 
     #[test]

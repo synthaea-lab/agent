@@ -105,6 +105,11 @@ impl PidCache {
         entry.image_path.as_deref()
     }
 
+    /// Whether `pid` is cached, without refreshing recency.
+    pub(crate) fn contains(&self, pid: u32) -> bool {
+        self.entries.contains_key(&pid)
+    }
+
     /// The process sequence number cached for `pid`, without refreshing recency.
     pub(crate) fn generation(&self, pid: u32) -> Option<u64> {
         self.entries.get(&pid)?.generation
@@ -168,6 +173,19 @@ mod tests {
         }
         assert!(cache.len() <= 64);
         assert!(cache.evicted() > 0);
+    }
+
+    #[test]
+    fn contains_does_not_refresh_recency() {
+        let mut cache = PidCache::new(8);
+        cache.insert(1, r"C:\a.exe".to_string(), None, None);
+        for pid in 2..=8 {
+            cache.insert(pid, format!(r"C:\p{pid}.exe"), None, None);
+        }
+        assert!(cache.contains(1));
+        cache.insert(9, r"C:\overflow.exe".to_string(), None, None);
+        assert!(!cache.contains(1), "still the oldest: evicted first");
+        assert!(!cache.contains(42));
     }
 
     #[test]

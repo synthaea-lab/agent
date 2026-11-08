@@ -208,6 +208,16 @@ pub(crate) fn wire_run_pipeline(
         &crate::sink::model_root(&storage.state_dir),
     )?);
     sink.start_correlator_ticker()?;
+    // The agent's own control-plane traffic is not an IOC finding (#1061), and only that
+    // destination is: the agent's binary pointed anywhere else still raises.
+    if let Some(control_plane) = &server
+        && !sink.set_control_plane(control_plane.url)
+    {
+        tracing::warn!(
+            url = control_plane.url,
+            "ioc: the control-plane URL names no host; the agent's own traffic to it will raise"
+        );
+    }
 
     // The fleet common-set snapshot (ADR-0033): off unless this build embeds a `snapshot` key.
     if let Some(handle) = &transport {
@@ -315,6 +325,8 @@ pub(crate) fn health_collector(
                 ioc_indicators = beacon.ioc_indicators,
                 ioc_findings = beacon.ioc_findings,
                 ioc_cooled_down = beacon.ioc_cooled_down,
+                ioc_own_skipped = beacon.ioc_own_skipped,
+                ioc_sibling_skipped = beacon.ioc_sibling_skipped,
                 "health beacon"
             );
             // #24/#134: the dedicated health channel — best-effort, an

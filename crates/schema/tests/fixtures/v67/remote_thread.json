@@ -1,0 +1,14 @@
+{
+  "type": "remote_thread",
+  "meta": {
+    "pid": 4242,
+    "ppid": 0,
+    "user": { "os": "windows", "sid": "S-1-5-21-1-2-3-1001", "integrity_level": 12288 },
+    "timestamp_ns": 1756900030000000000,
+    "comm": "injector.exe"
+  },
+  "target_pid": 5150,
+  "target_image_path": "C:\\Windows\\explorer.exe",
+  "thread_id": 9001,
+  "start_address": 140716486245952
+}
