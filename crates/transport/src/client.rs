@@ -518,14 +518,15 @@ mod tests {
 
     /// Regression (#317 review): the endpoint carried a `/v1` prefix no route
     /// served, and only a mock server that accepts any path was ever tested.
-    /// Next.js app router: the route for `<path>` is `server/app<path>/route.ts`.
+    /// Next.js app router: the route for `<path>` is `server/app<path>/route.ts`
+    /// (the `server` sibling repo; skipped without it).
     /// Under `/api/ingest/` is also what puts it behind nginx's mTLS location and
     /// past the middleware's login redirect.
     #[test]
     fn the_heartbeat_endpoint_is_a_real_server_route() {
         assert!(DEFAULT_HEARTBEAT_ENDPOINT.starts_with("/api/ingest/"));
-        let route = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../server/app")
+        let app = siblings::require_path!("server", "app");
+        let route = app
             .join(DEFAULT_HEARTBEAT_ENDPOINT.trim_start_matches('/'))
             .join("route.ts");
         assert!(route.is_file(), "no server route at {}", route.display());
@@ -539,8 +540,8 @@ mod tests {
             "https://api.example.com/api/ingest/decoy"
         );
         assert!(crate::DEFAULT_DECOY_ENDPOINT.starts_with("/api/ingest/"));
-        let route = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../server/app")
+        let app = siblings::require_path!("server", "app");
+        let route = app
             .join(crate::DEFAULT_DECOY_ENDPOINT.trim_start_matches('/'))
             .join("route.ts");
         assert!(route.is_file(), "no server route at {}", route.display());

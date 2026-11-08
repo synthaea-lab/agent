@@ -99,6 +99,8 @@ sensor-linux-lsm = { path = "../crates/sensors/linux/lsm" }
 aya = { version = "0.16", default-features = false }
 
 [dev-dependencies]
+# Cross-repo contract fixtures (the umbrella's sibling repos), skipped when absent.
+siblings = { path = "../crates/siblings" }
 tempfile = "3"
 proptest = "1"
 # Tests sign manifests with the public test key.
