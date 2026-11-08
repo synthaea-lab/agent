@@ -187,6 +187,38 @@ fn a_freeze_naming_several_units_alerts_when_any_is_a_listed_tool() {
 }
 
 #[test]
+fn a_freeze_by_unit_pattern_alerts_when_it_matches_a_listed_tool() {
+    // Codex review of edr-agent#12: `systemctl freeze PATTERN...` globs the loaded unit names,
+    // and the literal pattern was compared with the list.
+    for (command, tool) in [
+        ("systemctl freeze audit*", "auditd"),
+        ("systemctl freeze osquery?.service", "osqueryd"),
+        ("systemctl freeze [a]uditd.service", "auditd"),
+        ("systemctl freeze nginx falco.*", "falco"),
+        ("systemctl --runtime freeze *wazuh*", "wazuh-agent"),
+    ] {
+        let alerts = throttle_alerts(command);
+        assert_eq!(alerts.len(), 1, "{command}: {alerts:?}");
+        assert!(
+            alerts[0].message.contains(tool),
+            "{command}: {}",
+            alerts[0].message
+        );
+    }
+    for command in [
+        "systemctl freeze audit?",
+        // A glob is matched as written, with no `.service` appended: no unit is named `auditd`.
+        "systemctl freeze [a]uditd",
+        "systemctl freeze nginx*",
+        "systemctl freeze *.slice",
+        "systemctl freeze [!a]uditd*",
+        "systemctl freeze [",
+    ] {
+        assert!(throttle_alerts(command).is_empty(), "{command}");
+    }
+}
+
+#[test]
 fn an_ancestor_slice_is_left_silent_on_purpose() {
     // A pinned, documented gap (ADR-0046): a slice acts on every service of the host.
     for command in [
