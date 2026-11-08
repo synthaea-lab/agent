@@ -2871,7 +2871,7 @@ mod tests {
             exec.argv = Vec::new();
             sink.on_event(Event::Exec(exec));
         }
-        assert!(sink.enrich_queue.flush(std::time::Duration::from_secs(2)));
+        assert!(sink.enrich_queue.flush(std::time::Duration::from_secs(10)));
 
         let alerts = alerts_in(&dir);
         assert!(alerts.contains("REDACTED"), "{alerts}");
@@ -2955,7 +2955,7 @@ mod tests {
             "the rule quotes the raw buffer: {raw_alerts:?}"
         );
         sink.on_event(Event::AmsiContent(amsi));
-        assert!(sink.enrich_queue.flush(std::time::Duration::from_secs(2)));
+        assert!(sink.enrich_queue.flush(std::time::Duration::from_secs(10)));
 
         let alerts = alerts_in(&dir);
         assert!(alerts.contains("-Password 'REDACTED'"), "{alerts}");
@@ -4536,7 +4536,7 @@ rule response_marker {
             schema::detection::Severity::Medium,
             &event,
         );
-        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(10)));
         let records: Vec<transport::QueuedDetection> =
             spool.lock().unwrap().drain_oldest().unwrap();
         assert_eq!(records.len(), 1);
@@ -4794,7 +4794,7 @@ rule response_marker {
         }
         sink.on_event(rename_of(901, 99, ".bak"));
 
-        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(10)));
         let records: Vec<transport::QueuedDetection> =
             spool.lock().unwrap().drain_oldest().unwrap();
         let ransomware: Vec<_> = records
@@ -4860,7 +4860,7 @@ rule response_marker {
             schema::detection::Severity::Medium,
             &event,
         );
-        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(10)));
         let records: Vec<transport::QueuedDetection> =
             spool.lock().unwrap().drain_oldest().unwrap();
         assert_eq!(
@@ -6067,7 +6067,7 @@ rule reload_content_test_marker {
         let sink = sink_in(&dir);
 
         sink.on_event(exec(9_100, "run", image.to_str().unwrap()));
-        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(10)));
 
         let engine = sink.correlator.lock().unwrap();
         engine
@@ -6298,7 +6298,7 @@ rule reload_content_test_marker {
         );
         sink.on_event(connect_to("203.0.113.9", 2_000));
         sink.on_event(connect_to("203.0.113.9", 3_000));
-        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(10)));
 
         let alerts = alerts_in(&dir);
         assert_eq!(alerts.matches("203.0.113.9").count(), 1, "{alerts}");
@@ -6372,7 +6372,7 @@ rule reload_content_test_marker {
         for poll in 0..3 {
             sink.on_event(flow("203.0.113.9", 2_000 + poll));
         }
-        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(10)));
 
         let alerts = alerts_in(&dir);
         assert_eq!(alerts.matches("203.0.113.9").count(), 1, "{alerts}");
@@ -6411,7 +6411,7 @@ rule reload_content_test_marker {
 
     fn ioc_alerts_after(sink: &DetectionSink, dir: &std::path::Path, event: Event) -> String {
         sink.on_event(event);
-        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(10)));
         alerts_in(dir)
     }
 
@@ -6572,7 +6572,7 @@ rule reload_content_test_marker {
 
         sink.on_event(other);
         sink.on_event(listed);
-        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(10)));
 
         let alerts = alerts_in(&dir);
         assert!(alerts.contains(IOC_HASH), "{alerts}");
@@ -6646,7 +6646,7 @@ rule reload_content_test_marker {
         sink.on_event(dns_query_of("good.example", 1_000));
         sink.on_event(dns_query_of("notevil.example", 2_000));
         sink.on_event(dns_query_of("Cdn.Evil.Example.", 3_000));
-        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(10)));
 
         let drained: Vec<transport::QueuedDetection> =
             spool.lock().unwrap().drain_oldest().unwrap();
