@@ -43,6 +43,7 @@ use std::{
 
 #[cfg(unix)]
 use anyhow::Context as _;
+use sinks::AlertRecord;
 
 use crate::{
     paths::{heartbeat_path_for, resolve_agent_bin},
@@ -592,32 +593,49 @@ fn watch_child(
     }
 }
 
-/// Appends a self-protection finding to the alerts file as a single JSON-Lines
-/// entry, same shape (`timestamp_ns`/`technique`/`message`) as a rule/correlator
-/// alert (issue #103: "alerts on mismatch... instead of silently launching a
-/// swapped binary" / service-definition drift "reports it rather than accepting
-/// it silently"). No `schema`/`sinks` dependency on purpose — the watchdog has
-/// nothing else in common with the agent's detection pipeline, and this is one
-/// fixed-shape line, not a general-purpose sink.
+/// Appends a self-protection finding to the alerts file as one JSON-Lines
+/// [`AlertRecord`] — the agent's own alert shape — so it reads like any rule or
+/// correlator alert (issue #103: "alerts on mismatch... instead of silently
+/// launching a swapped binary" / service-definition drift "reports it rather than
+/// accepting it silently"). The message can quote attacker-controlled text (a
+/// drifted unit file line), so escaping is left to `serde_json`. Opened per event
+/// and written with a single `write_all` rather than through a shared
+/// `JsonlWriter`: the agent appends to the same file, and one small append on an
+/// `O_APPEND` descriptor cannot interleave with its lines.
 fn report_self_protection_event(alerts: &Path, message: &str) {
     SELF_PROTECTION_EVENTS.fetch_add(1, Ordering::Relaxed);
     eprintln!("[watchdog] SELF-PROTECTION: {message}");
-    let now_ns = std::time::SystemTime::now()
+    let alert = AlertRecord {
+        timestamp_ns: nanos_since_epoch(),
+        technique: "SELF-PROTECTION".to_owned(),
+        message: message.to_owned(),
+    };
+    if let Err(e) = append_json_line(alerts, &alert) {
+        eprintln!(
+            "[watchdog] could not append the self-protection alert to {}: {e}",
+            alerts.display()
+        );
+    }
+}
+
+/// Nanoseconds since the Unix epoch, saturating; 0 when the clock reads before it.
+fn nanos_since_epoch() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
-    let escaped = message.replace('\\', "\\\\").replace('"', "\\\"");
-    let line = format!(
-        "{{\"timestamp_ns\":{now_ns},\"technique\":\"SELF-PROTECTION\",\"message\":\"{escaped}\"}}\n"
-    );
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .unwrap_or(0)
+}
+
+/// Serializes `alert` and appends it, newline included, in one write.
+fn append_json_line(path: &Path, alert: &AlertRecord) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut line = serde_json::to_string(alert)?;
+    line.push('\n');
+    std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(alerts)
-    {
-        use std::io::Write as _;
-        let _ = f.write_all(line.as_bytes());
-    }
+        .open(path)?
+        .write_all(line.as_bytes())
 }
 
 /// Sleeps `secs` in interruptible steps; `false` when the stop flag rose mid-wait.
@@ -939,6 +957,30 @@ mod tests {
         // The message's own quotes and backslash must come back escaped, not
         // break the JSON shape.
         assert!(contents.contains(r#"binary at \"C:\\agent.exe\" was swapped"#));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_message_with_a_control_character_still_writes_one_valid_json_line() {
+        let _serial = COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = std::env::temp_dir().join(format!(
+            "self-protection-control-char-{}.ndjson",
+            std::process::id()
+        ));
+        std::fs::remove_file(&path).ok();
+        // A service-drift line quotes the installed unit file, which an attacker
+        // can edit: a raw newline or other control byte must not split or break
+        // the alert line, or consumers drop the tamper alert.
+        let message = "ExecStart changed to \"/tmp/x\nevil\"\t\u{1b}[0m\u{0}";
+        report_self_protection_event(&path, message);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 1, "expected exactly one line: {contents:?}");
+        let alert: sinks::AlertRecord = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(alert.technique, "SELF-PROTECTION");
+        assert_eq!(alert.message, message);
         std::fs::remove_file(&path).ok();
     }
 }
