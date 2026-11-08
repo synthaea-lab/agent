@@ -41,6 +41,21 @@ on:
         description: "Also build on an Intel runner (macos-15-intel; the label is an assumption)"
         type: boolean
         default: false
+  workflow_call:
+    # The release workflow (release.yml) runs this exact job and collects its package.
+    inputs:
+      ref:
+        description: "Git ref to build (empty: the caller's ref)"
+        type: string
+        default: ""
+      upload-artifact:
+        description: "Upload the built package as a workflow artifact for release.yml"
+        type: boolean
+        default: false
+      intel:
+        description: "Also build on an Intel runner (macos-15-intel; the label is an assumption)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -67,6 +82,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref }}
 
       # Part of the cache key below: libraries built with another Xcode or SDK, or for another
       # deployment target, must not be reused (the script's hash covers neither).
@@ -196,3 +212,22 @@ jobs:
           lipo -archs target/release/agent
           size="$(du -m target/release/agent | cut -f1)"
           echo "agent (static onnxruntime, $(uname -m)): ${size} MB" >> "$GITHUB_STEP_SUMMARY"
+
+      # Only when release.yml calls this workflow: the static agent checked above, as a
+      # tarball so the executable bit survives the artifact store. Not a .pkg (no package
+      # script yet, packaging/macos/README.md) and not signed or notarized.
+      - name: Package the agent for the release
+        if: inputs.upload-artifact
+        run: |
+          set -euo pipefail
+          mkdir -p release-out
+          tar -czf "release-out/synthaea-agent-macos-$(uname -m).tar.gz" -C target/release agent
+
+      - name: Upload the agent for the release
+        if: inputs.upload-artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-macos-agent-${{ matrix.os }}
+          path: release-out/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7

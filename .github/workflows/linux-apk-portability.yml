@@ -33,6 +33,17 @@ on:
       - "ebpf-toolchain.txt"
       - ".github/workflows/linux-apk-portability.yml"
   workflow_dispatch:
+  workflow_call:
+    # The release workflow (release.yml) runs this exact job and collects its package.
+    inputs:
+      ref:
+        description: "Git ref to build (empty: the caller's ref)"
+        type: string
+        default: ""
+      upload-artifact:
+        description: "Upload the built package as a workflow artifact for release.yml"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -49,6 +60,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref }}
 
       - name: Build, install, upgrade and remove the .apk on Alpine/musl
         run: |
@@ -163,3 +175,16 @@ jobs:
               "$image" \
               /package/var/lib/synthaea/bootstrap/agent --help
           done
+
+      # Only when release.yml calls this workflow. The pkgrel-0 package is the one built
+      # from the APKBUILD as committed (the r1 rebuild above exists only for the upgrade
+      # check). It is signed by the throwaway abuild key generated in the build container,
+      # not by a key anyone can trust, so it installs with `apk add --allow-untrusted`.
+      - name: Upload the .apk for the release
+        if: inputs.upload-artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-linux-apk
+          path: synthaea-agent-*-r0.apk
+          if-no-files-found: error
+          retention-days: 7

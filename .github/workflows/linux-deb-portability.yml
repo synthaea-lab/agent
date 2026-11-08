@@ -31,6 +31,17 @@ on:
       - "ebpf-toolchain.txt"
       - ".github/workflows/linux-deb-portability.yml"
   workflow_dispatch:
+  workflow_call:
+    # The release workflow (release.yml) runs this exact job and collects its package.
+    inputs:
+      ref:
+        description: "Git ref to build (empty: the caller's ref)"
+        type: string
+        default: ""
+      upload-artifact:
+        description: "Upload the built package as a workflow artifact for release.yml"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -43,6 +54,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref }}
 
       - name: Build and test the package on Alpine/musl
         run: |
@@ -149,3 +161,14 @@ jobs:
           if sudo journalctl -u synthaea-agent --no-pager | grep -q "226/NAMESPACE"; then
             echo "the unit hit the mount-namespace failure of #675"; exit 1
           fi
+
+      # Only when release.yml calls this workflow: the .deb that the steps above built,
+      # installed and started is the one that ships.
+      - name: Upload the .deb for the release
+        if: inputs.upload-artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-linux-deb
+          path: target/debian/*.deb
+          if-no-files-found: error
+          retention-days: 7
