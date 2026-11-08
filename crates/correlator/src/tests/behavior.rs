@@ -468,6 +468,72 @@ fn a_recycled_pid_does_not_inherit_the_login_session_shield() {
     assert_eq!(engine.kill_shield(930, Some(2)), None);
 }
 
+/// The per-connection process before OpenSSH 9.8 (Debian 12's 9.2, the 2026-11-08
+/// lab run): the `sshd` listener (pid 900) re-execs its own binary (`sshd -R`), so
+/// the session process is `sshd` under `sshd`. As with `sshd_session`, the
+/// listener's exec is never sent.
+fn reexecd_sshd(pid: u32) -> Event {
+    exec_under(pid, 900, "sshd", "/usr/sbin/sshd", Some("/usr/sbin/sshd"))
+}
+
+#[test]
+fn an_sshd_reexecd_by_the_listener_is_shielded_like_an_sshd_session() {
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(reexecd_sshd(941));
+    assert_eq!(
+        engine.kill_shield(941, None),
+        Some(KillShield::LoginSession)
+    );
+}
+
+#[test]
+fn the_sshd_listener_started_by_init_stays_a_service_main() {
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(exec_under(
+        900,
+        1,
+        "sshd",
+        "/usr/sbin/sshd",
+        Some("/usr/lib/systemd/systemd"),
+    ));
+    assert_eq!(engine.kill_shield(900, None), Some(KillShield::ServiceMain));
+}
+
+#[test]
+fn an_sshd_not_reexecd_by_the_listener_is_not_shielded() {
+    let mut engine = CorrelationEngine::new();
+    let real = "/usr/sbin/sshd";
+    // The real binary, started from a user's own shell.
+    engine.on_event(exec_under(950, 951, "sshd", real, Some("/bin/bash")));
+    // The real binary under a parent named sshd that lives in /tmp.
+    engine.on_event(exec_under(952, 953, "sshd", real, Some("/tmp/sshd")));
+    // A binary named sshd in /tmp, under the real listener.
+    engine.on_event(exec_under(954, 900, "sshd", "/tmp/sshd", Some(real)));
+    for pid in [950, 952, 954] {
+        assert_eq!(engine.kill_shield(pid, None), None, "pid {pid}");
+    }
+}
+
+#[test]
+fn a_reexec_of_the_reexecd_sshd_drops_its_shield() {
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(stamped(reexecd_sshd(960), 1));
+    assert_eq!(
+        engine.kill_shield(960, Some(1)),
+        Some(KillShield::LoginSession)
+    );
+    let payload = exec_under(960, 900, "sshd", "/tmp/payload", Some("/usr/sbin/sshd"));
+    engine.on_event(stamped(payload, 1));
+    assert_eq!(engine.kill_shield(960, Some(1)), None);
+}
+
+#[test]
+fn a_recycled_pid_does_not_inherit_the_reexecd_sshd_shield() {
+    let mut engine = CorrelationEngine::new();
+    engine.on_event(stamped(reexecd_sshd(970), 1));
+    assert_eq!(engine.kill_shield(970, Some(2)), None);
+}
+
 #[test]
 fn a_shell_or_interpreter_started_by_init_is_not_a_service_main_process() {
     // Review of #755 (Sollykhan, 2026-10-19): a systemd unit's `ExecStart` can be a
