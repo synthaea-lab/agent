@@ -68,6 +68,8 @@ pub(crate) struct DetectionSink {
     /// enrichment worker, connect destinations on the capture thread. Shared with the worker,
     /// which is the only place an exec's hash is known.
     ioc: Arc<crate::ioc::IocMatcher>,
+    /// What tells the agent's own control-plane traffic from everything else (#1061).
+    own_traffic: Arc<crate::own_traffic::OwnTraffic>,
     /// What became of the rarity judgements, for the health beacon.
     rarity_stats: Arc<RarityStats>,
     /// Tamper-class alerts raised since the agent started (a sensor confirmed silent, a shipped
@@ -693,6 +695,7 @@ impl DetectionSink {
             sigma: Mutex::new(load_sigma_rules(&content_root).into_option()),
             common_set,
             ioc,
+            own_traffic: Arc::new(crate::own_traffic::OwnTraffic::new()),
             rarity_stats,
             tamper_events: AtomicU64::new(0),
             yara: Mutex::new(
@@ -1516,6 +1519,7 @@ impl DetectionSink {
 
     /// Exec events: stateless rules, stateful rules, then Sigma.
     fn detect_exec(&self, wrapped: &Event, event: &schema::ExecEvent) {
+        self.own_traffic.record_exec(event);
         // The table is read only when an executable may be allowed: recording every exec of a
         // host that allows none would take a lock and clone a path for nothing.
         if self
@@ -1620,7 +1624,12 @@ impl DetectionSink {
     /// Connect events: stateless rules (unusual outbound from a web/DB
     /// service, issue #478), then beacon detection.
     fn detect_connect(&self, wrapped: &Event, event: &schema::ConnectEvent) {
-        if let Some(hit) = self.ioc.check_connect(event.daddr, event.meta.timestamp_ns) {
+        if let Some(hit) = self
+            .ioc
+            .check_connect(event.daddr, event.meta.timestamp_ns, || {
+                self.own_connect(&event.meta, event.daddr)
+            })
+        {
             self.record_ioc(wrapped, hit);
         }
         self.record_rule_alerts(wrapped, rules::evaluate_connect(event));
@@ -1632,7 +1641,9 @@ impl DetectionSink {
     fn detect_dns_query(&self, wrapped: &Event, event: &schema::DnsQueryEvent) {
         if let Some(hit) = self
             .ioc
-            .check_dns_query(&event.query, event.meta.timestamp_ns)
+            .check_dns_query(&event.query, event.meta.timestamp_ns, || {
+                self.own_dns_query(&event.meta, &event.query)
+            })
         {
             self.record_ioc(wrapped, hit);
         }
@@ -1645,7 +1656,12 @@ impl DetectionSink {
     /// against the IOC set (#60); every poll of one live flow repeats it, which the per-indicator
     /// cooldown absorbs.
     fn detect_network_flow(&self, wrapped: &Event, event: &schema::NetworkFlowEvent) {
-        if let Some(hit) = self.ioc.check_connect(event.daddr, event.meta.timestamp_ns) {
+        if let Some(hit) = self
+            .ioc
+            .check_connect(event.daddr, event.meta.timestamp_ns, || {
+                self.own_connect(&event.meta, event.daddr)
+            })
+        {
             self.record_ioc(wrapped, hit);
         }
         self.record_rule_alerts(
@@ -1795,6 +1811,50 @@ impl DetectionSink {
             stats.raised.load(Ordering::Relaxed),
             stats.cooled_down.load(Ordering::Relaxed),
         )
+    }
+
+    /// IOC matches skipped as the agent's own control-plane traffic: made by this process, and by
+    /// a second process on the agent's executable (#1061).
+    pub(crate) fn ioc_own_skips(&self) -> (u64, u64) {
+        let stats = self.ioc.stats();
+        (
+            stats.own_skipped.load(Ordering::Relaxed),
+            stats.sibling_skipped.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Names the control plane whose traffic, from the agent, an IOC match skips (#1061), and
+    /// starts following the addresses its host resolves to. `false` when the URL names no host.
+    pub(crate) fn set_control_plane(&self, url: &str) -> bool {
+        let set = self.own_traffic.set_control_plane(url);
+        if set {
+            self.own_traffic.spawn_refresh();
+        }
+        set
+    }
+
+    /// Whether a connection to `address` is the agent's own control-plane traffic.
+    fn own_connect(
+        &self,
+        meta: &schema::EventMeta,
+        address: std::net::IpAddr,
+    ) -> crate::ioc::OwnMatch {
+        if !self.own_traffic.is_control_plane_address(address) {
+            return None;
+        }
+        self.own_traffic
+            .origin(meta)
+            .map(|origin| (origin, meta.pid))
+    }
+
+    /// Whether a lookup of `name` is the agent's own control-plane traffic.
+    fn own_dns_query(&self, meta: &schema::EventMeta, name: &str) -> crate::ioc::OwnMatch {
+        if !self.own_traffic.is_control_plane_name(name) {
+            return None;
+        }
+        self.own_traffic
+            .origin(meta)
+            .map(|origin| (origin, meta.pid))
     }
 
     /// Issue #613: an operator's request to silence `technique` on the entity
@@ -6161,6 +6221,167 @@ rule reload_content_test_marker {
 
         let alerts = alerts_in(&dir);
         assert_eq!(alerts.matches("203.0.113.9").count(), 1, "{alerts}");
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn ioc_sink(dir: &std::path::Path, feed: &str) -> DetectionSink {
+        write_ioc_feed(dir, feed);
+        DetectionSink::new(
+            rules::RuleState::new(),
+            &dir.join("alerts.ndjson"),
+            Some(&dir.join("events.jsonl")),
+            None,
+            None,
+            &dir.join("content"),
+            &dir.join("ml-registry"),
+        )
+        .unwrap()
+    }
+
+    fn connect_from(pid: u32, generation: Option<u64>, addr: &str, timestamp_ns: u64) -> Event {
+        let mut event = connect_to(addr, timestamp_ns);
+        if let Event::Connect(connect) = &mut event {
+            connect.meta.pid = pid;
+            connect.meta.process_generation = generation;
+            #[cfg(unix)]
+            {
+                // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+                let uid = unsafe { libc::geteuid() };
+                connect.meta.user = schema::User::Unix { uid, gid: 0 };
+            }
+        }
+        event
+    }
+
+    fn ioc_alerts_after(sink: &DetectionSink, dir: &std::path::Path, event: Event) -> String {
+        sink.on_event(event);
+        assert!(sink.enrich_queue().flush(std::time::Duration::from_secs(2)));
+        alerts_in(dir)
+    }
+
+    #[test]
+    fn the_agents_own_connection_to_its_control_plane_neither_alerts_nor_hides_the_next_one() {
+        // #1061: the lab feed listed the control plane's address; the agent alerted on its own
+        // fetch, and that finding started the cooldown a real process would then fall inside.
+        let dir = tmp("ioc-own");
+        let sink = ioc_sink(&dir, "ip:203.0.113.9\n");
+        assert!(sink.set_control_plane("https://203.0.113.9/"));
+
+        let own = connect_from(std::process::id(), None, "203.0.113.9", 1_000);
+        assert!(
+            !ioc_alerts_after(&sink, &dir, own).contains("IOC"),
+            "the agent's own control-plane connection is silent"
+        );
+        let alerts = ioc_alerts_after(&sink, &dir, connect_to("203.0.113.9", 2_000));
+        assert_eq!(alerts.matches("203.0.113.9").count(), 1, "{alerts}");
+        assert_eq!(sink.ioc_own_skips(), (1, 0));
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_agents_own_connection_to_a_listed_address_that_is_not_its_control_plane_raises() {
+        // #1117 review: the skip is scoped to the destination, so code inside the agent reaching
+        // a listed C2 is not hidden by being the agent.
+        let dir = tmp("ioc-own-elsewhere");
+        let sink = ioc_sink(&dir, "ip:203.0.113.9\n");
+        assert!(sink.set_control_plane("https://198.51.100.1/"));
+        let own = connect_from(std::process::id(), None, "203.0.113.9", 1_000);
+        let alerts = ioc_alerts_after(&sink, &dir, own);
+        assert_eq!(alerts.matches("203.0.113.9").count(), 1, "{alerts}");
+        assert_eq!(sink.ioc_own_skips(), (0, 0));
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn without_a_configured_control_plane_the_agents_own_connection_raises() {
+        let dir = tmp("ioc-own-no-cp");
+        let sink = ioc_sink(&dir, "ip:203.0.113.9\n");
+        let own = connect_from(std::process::id(), None, "203.0.113.9", 1_000);
+        assert!(ioc_alerts_after(&sink, &dir, own).contains("203.0.113.9"));
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_second_agent_process_reaching_a_listed_address_other_than_the_control_plane_raises() {
+        // #1117 review: `agent apply-content-manifest --server https://<listed host>` runs the
+        // agent's executable but talks to whatever host the caller names.
+        let dir = tmp("ioc-sibling-elsewhere");
+        let sink = ioc_sink(&dir, "ip:203.0.113.9\n");
+        assert!(sink.set_control_plane("https://198.51.100.1/"));
+        sink.on_event(Event::Exec(schema::ExecEvent {
+            meta: EventMeta {
+                pid: 4242,
+                process_generation: Some(7),
+                timestamp_ns: 500,
+                ..schema::fixtures::meta()
+            },
+            image_path: std::env::current_exe().unwrap().display().to_string(),
+            ..schema::fixtures::exec()
+        }));
+        let sibling = connect_from(4242, Some(7), "203.0.113.9", 1_000);
+        let alerts = ioc_alerts_after(&sink, &dir, sibling);
+        assert_eq!(alerts.matches("203.0.113.9").count(), 1, "{alerts}");
+        assert_eq!(sink.ioc_own_skips(), (0, 0));
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_second_agent_process_reaching_the_control_plane_is_skipped_for_its_incarnation_only() {
+        let dir = tmp("ioc-sibling-cp");
+        let sink = ioc_sink(&dir, "ip:203.0.113.9\n");
+        assert!(sink.set_control_plane("https://203.0.113.9/"));
+        sink.on_event(Event::Exec(schema::ExecEvent {
+            meta: EventMeta {
+                pid: 4242,
+                process_generation: Some(7),
+                timestamp_ns: 500,
+                ..schema::fixtures::meta()
+            },
+            image_path: std::env::current_exe().unwrap().display().to_string(),
+            ..schema::fixtures::exec()
+        }));
+        let sibling = connect_from(4242, Some(7), "203.0.113.9", 1_000);
+        assert!(!ioc_alerts_after(&sink, &dir, sibling).contains("IOC"));
+        assert_eq!(sink.ioc_own_skips(), (0, 1));
+
+        // The pid recycled before the connection was judged: another incarnation raises.
+        let recycled = connect_from(4242, Some(8), "203.0.113.9", 2_000);
+        let alerts = ioc_alerts_after(&sink, &dir, recycled);
+        assert_eq!(alerts.matches("203.0.113.9").count(), 1, "{alerts}");
+        drop(sink);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_agents_lookup_of_its_control_plane_host_is_skipped_and_of_a_subdomain_raises() {
+        let dir = tmp("ioc-own-dns");
+        let sink = ioc_sink(&dir, "domain:cp.example\n");
+        // Set directly: `set_control_plane` would start resolving a name that does not exist.
+        assert!(sink.own_traffic.set_control_plane("https://cp.example/"));
+        let lookup = |query: &str, timestamp_ns: u64| {
+            Event::DnsQuery(schema::DnsQueryEvent {
+                meta: EventMeta {
+                    pid: std::process::id(),
+                    timestamp_ns,
+                    ..schema::fixtures::meta()
+                },
+                query: query.to_string(),
+                ..schema::fixtures::dns_query()
+            })
+        };
+        assert!(!ioc_alerts_after(&sink, &dir, lookup("cp.example.", 1_000)).contains("IOC"));
+        let alerts = ioc_alerts_after(&sink, &dir, lookup("data.cp.example", 2_000));
+        assert!(
+            alerts.contains("cp.example"),
+            "a subdomain is not the control plane, even from the agent: {alerts}"
+        );
+        assert_eq!(sink.ioc_own_skips(), (1, 0));
         drop(sink);
         std::fs::remove_dir_all(&dir).ok();
     }

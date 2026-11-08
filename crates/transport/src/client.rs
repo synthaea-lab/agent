@@ -592,6 +592,8 @@ mod tests {
             ioc_indicators: 12_000,
             ioc_findings: 4,
             ioc_cooled_down: 31,
+            ioc_own_skipped: 6,
+            ioc_sibling_skipped: 2,
         };
         let body = serde_json::to_value(HeartbeatPayload {
             agent_id: None,
@@ -620,7 +622,9 @@ mod tests {
                     "parent_image_evicted_dead": 209000,
                     "ioc_indicators": 12000,
                     "ioc_findings": 4,
-                    "ioc_cooled_down": 31
+                    "ioc_cooled_down": 31,
+                    "ioc_own_skipped": 6,
+                    "ioc_sibling_skipped": 2
                 }
             })
         );

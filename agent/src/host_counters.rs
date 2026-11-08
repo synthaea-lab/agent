@@ -76,6 +76,7 @@ impl HostCountersSource for AgentHostCounters {
     fn host_counters(&self) -> HostCounters {
         let (live, dead) = self.evictions.as_ref().map_or((0, 0), |read| read());
         let (ioc_indicators, ioc_findings, ioc_cooled_down) = self.sink.ioc_counts();
+        let (ioc_own_skipped, ioc_sibling_skipped) = self.sink.ioc_own_skips();
         HostCounters {
             watchdog_restarts: self.watchdog.restarts,
             tamper_events: self
@@ -87,6 +88,8 @@ impl HostCountersSource for AgentHostCounters {
             ioc_indicators,
             ioc_findings,
             ioc_cooled_down,
+            ioc_own_skipped,
+            ioc_sibling_skipped,
         }
     }
 }

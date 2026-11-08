@@ -2094,6 +2094,16 @@ pub struct HealthBeacon {
     /// findings is one indicator seen again and again. Zero in an older beacon.
     #[serde(default)]
     pub ioc_cooled_down: u64,
+    /// Cumulative IOC matches skipped as the agent's own traffic to its control plane, made by
+    /// the agent process itself (#1061): a non-zero count is a feed that lists the control
+    /// plane. Zero in an older beacon.
+    #[serde(default)]
+    pub ioc_own_skipped: u64,
+    /// The same, made by a second process on the agent's executable (`apply-content-manifest`)
+    /// to the control plane. Kept apart because it is the case worth a look. Zero in an older
+    /// beacon.
+    #[serde(default)]
+    pub ioc_sibling_skipped: u64,
 }
 
 /// A logon/authentication outcome, or a privileged-session assignment — shared

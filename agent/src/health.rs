@@ -148,6 +148,10 @@ pub struct HostCounters {
     pub ioc_findings: u64,
     /// IOC matches the per-indicator cooldown absorbed.
     pub ioc_cooled_down: u64,
+    /// IOC matches skipped as the agent's own control-plane traffic, by the agent (#1061).
+    pub ioc_own_skipped: u64,
+    /// The same, by a second process on the agent's executable.
+    pub ioc_sibling_skipped: u64,
 }
 
 /// Reads the [`HostCounters`].
@@ -355,6 +359,8 @@ impl HealthCollector {
             ioc_indicators: host.ioc_indicators,
             ioc_findings: host.ioc_findings,
             ioc_cooled_down: host.ioc_cooled_down,
+            ioc_own_skipped: host.ioc_own_skipped,
+            ioc_sibling_skipped: host.ioc_sibling_skipped,
         }
     }
 }
@@ -449,6 +455,8 @@ mod tests {
             ioc_indicators: 12_000,
             ioc_findings: 4,
             ioc_cooled_down: 31,
+            ioc_own_skipped: 6,
+            ioc_sibling_skipped: 2,
         }));
 
         let (tx, rx) = mpsc::channel();
@@ -514,6 +522,11 @@ mod tests {
             ),
             (12_000, 4, 31),
             "the IOC engine counters ride the beacon (#60)"
+        );
+        assert_eq!(
+            (beacon.ioc_own_skipped, beacon.ioc_sibling_skipped),
+            (6, 2),
+            "the own-traffic skips ride the beacon (#1061)"
         );
     }
 
