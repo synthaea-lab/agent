@@ -279,6 +279,7 @@ Live status and ordering are on the [project board](https://github.com/orgs/synt
 
 ### [#98](https://github.com/synthaea-lab/agent/issues/98) Local interface hardening and fuzzing coverage (IPC limits, cli tests, scheduled fuzz targets, Windows install-dir DACL)
 
+- Non-invasive eBPF preflight (agent status) with non-zero exit on verifier rejection (partial, Lifecycle). See [lifecycle.md#linux](lifecycle.md#linux).
 - Local IPC restricted to root/elevated peers with bounded framing (partial, Security model). See [security-model.md#local-ipc-cli-and-ui-to-agent](security-model.md#local-ipc-cli-and-ui-to-agent).
 - Coverage-guided fuzzing of parsers on a schedule (partial, Security model). See [security-model.md#never-panic-parsers-and-fuzzing](security-model.md#never-panic-parsers-and-fuzzing).
 - Windows install-directory permission (DACL) audit (planned, Security model). See [security-model.md#what-is-not-defended](security-model.md#what-is-not-defended).

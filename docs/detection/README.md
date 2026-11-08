@@ -116,7 +116,7 @@ has a hard cap. Reaching the cap sheds work, and the shedding is counted, never 
 | Enrichment cache | 16,384 files ([lib.rs](../../crates/enrich/src/lib.rs)) | LRU |
 | IOC set | 64 MiB budget ([set.rs](../../crates/intel/src/set.rs)) | the whole set is refused |
 | IOC cooldown | 4,096 indicators ([ioc.rs](../../agent/src/ioc.rs)) | LRU |
-| Canary hold | 256 touches ([sink.rs](../../agent/src/sink/mod.rs)) | judged at once, counted |
+| Canary hold | 256 touches ([sink/mod.rs](../../agent/src/sink/mod.rs)) | judged at once, counted |
 
 [`store::BoundedMap`](../../crates/store/src/bounded.rs) is the LRU used throughout. It is a
 `HashMap` with a use counter. Past the cap it evicts the least recently used eighth in one

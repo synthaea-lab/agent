@@ -17,7 +17,7 @@ and the local JSONL outputs are covered in [Local interfaces](local-interfaces.m
 | --- | --- |
 | [`TransportClient`](../crates/transport/src/client.rs) | One blocking `ureq` agent per instance: TLS setup, POST/GET helpers, error mapping. |
 | [`TransportConfig`](../crates/transport/src/config.rs) | Server URL, certificate paths, endpoints, batch size, retry and attempt budgets. |
-| [`EventUploader`](../crates/transport/src/upload.rs) / [`EventDrain`](../crates/transport/src/upload.rs) | Store-and-forward upload of raw events from a two-phase spool. |
+| [`EventUploader`](../crates/transport/src/upload.rs) / [`EventDrain`](../crates/transport/src/upload.rs) | Store-and-forward upload of redacted events from a two-phase spool. |
 | [`DetectionUploader`](../crates/transport/src/detection_upload.rs) / [`DetectionDrain`](../crates/transport/src/detection_upload.rs) | Store-and-forward upload of structured detections, one record at a time, with idempotency keys. |
 | [`fit_batches`](../crates/transport/src/event_limit.rs), [`fit_detection_to_limit`](../crates/transport/src/detection_upload.rs) | Keep every request body under the server's size limit by shortening, never by dropping. |
 | [`UploadLoop`](../crates/transport/src/upload.rs) | The blocking loop that drives either uploader, with backoff and a prompt, bounded stop. |
@@ -38,8 +38,8 @@ binary supplies the concrete spool and manifest types where it composes the crat
 flowchart LR
   S[Sensors] --> DS[DetectionSink]
   DS --> EW[enrichment worker]
-  EW -->|redacted event| ES[(event spool<br/>state: spool/)]
-  EW -->|Detection + key| DSP[(detection spool<br/>state: detection-spool/)]
+  EW -->|redacted event| ES[(event spool<br/>spool/ beside --alerts)]
+  EW -->|Detection + key| DSP[(detection spool<br/>detection-spool/ beside --alerts)]
   ES --> UL1[transport-upload thread<br/>UploadLoop + EventUploader]
   DSP --> UL2[detection-upload thread<br/>UploadLoop + DetectionUploader]
   UL1 -->|POST /api/v1/ingest/events| CP[(control plane)]
