@@ -64,7 +64,7 @@ pub(crate) struct RunOptions<'a> {
     pub(crate) log_sources: &'a [config::LogSourceConfig],
     /// Canary directories declared in `[deception]` (#81), planted by `common::plant_canaries`.
     pub(crate) deception: &'a config::DeceptionConfig,
-    /// Host facts from `[detection]` (#376), handed to the rules by `common::apply_detection`.
+    /// Host facts from `[detection]` (<https://github.com/synthaea-lab/edr-agent/issues/17>), handed to the rules by `common::apply_detection`.
     pub(crate) detection: &'a config::DetectionConfig,
     /// The config path `config::discover` actually resolved at startup (issue #71):
     /// watched by `protected::protected_paths` as one more of the agent's own

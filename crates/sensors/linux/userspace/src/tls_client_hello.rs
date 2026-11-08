@@ -1,4 +1,4 @@
-//! The SNI and the JA4 fingerprint of a TLS `ClientHello` (#86). Pure functions,
+//! The SNI and the JA4 fingerprint of a TLS `ClientHello` (<https://github.com/synthaea-lab/edr-agent/issues/22>). Pure functions,
 //! platform-independent, unit-tested on every CI leg.
 //!
 //! The kernel side (a later change) copies the first bytes a process writes on a TCP socket it
@@ -61,7 +61,7 @@ pub(crate) struct ClientHello {
 /// protocol from passing as one by accident.
 ///
 /// Known limit: a hello fragmented over several records (RFC 8446 section 5.1 allows it, and a
-/// client that wants to evade can use it) is not reassembled and yields `None`. Part 2 of #86
+/// client that wants to evade can use it) is not reassembled and yields `None`. Part 2 of <https://github.com/synthaea-lab/edr-agent/issues/22>
 /// has to count what the capture dropped as "looked like a hello", so that this is not silent.
 pub(crate) fn parse(payload: &[u8]) -> Option<ClientHello> {
     let mut record = Reader::new(payload);
@@ -928,7 +928,7 @@ mod tests {
 
     // --- Never-panic robustness -----------------------------------------------------------
     //
-    // `parse` reads bytes an attacker chooses, and part 2 of #86 puts it on the capture path,
+    // `parse` reads bytes an attacker chooses, and part 2 of https://github.com/synthaea-lab/edr-agent/issues/22 puts it on the capture path,
     // where a panic kills the sensor. The contract is the one the other byte parsers are held
     // to (`linux/netlink/tests/robustness.rs`, `fuzz_targets/netlink_parse.rs`): returning
     // `None` is fine, panicking is a bug. These live here rather than in `tests/` because

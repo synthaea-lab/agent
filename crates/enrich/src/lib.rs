@@ -484,8 +484,8 @@ mod tests {
     /// The exact regression #21's closing comment flagged: notepad.exe (like most
     /// System32 binaries) has no EMBEDDED Authenticode signature, only catalog
     /// membership — `verify_wide` alone reports Unsigned; the catalog-lookup
-    /// fallback (`sig.rs::windows_impl::catalog_verify`) must resolve it to Valid.
-    /// See `docs/adr/0007-windows-catalog-signed-binary-verification.md`.
+    /// fallback (`sig.rs::windows_impl::catalog_verify`) must resolve it to Valid
+    /// (ADR-0007).
     #[cfg(windows)]
     #[test]
     fn catalog_signed_system_binary_verifies() {

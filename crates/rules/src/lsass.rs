@@ -1,6 +1,6 @@
-//! LSASS-ACCESS and LSASS-REMOTE-THREAD (#960): credential dumping from LSASS memory
+//! LSASS-ACCESS and LSASS-REMOTE-THREAD (<https://github.com/synthaea-lab/edr-agent/issues/45>): credential dumping from LSASS memory
 //! (T1003.001) and a thread started inside LSASS by another process (T1055), over the
-//! driver-free Windows telemetry of #720 ([`schema::ProcessAccessEvent`],
+//! driver-free Windows telemetry of <https://github.com/synthaea-lab/edr-agent/issues/41> ([`schema::ProcessAccessEvent`],
 //! [`schema::RemoteThreadEvent`]).
 //!
 //! The sensor already narrows both: a `ProcessAccessEvent` is an open of the system's LSASS

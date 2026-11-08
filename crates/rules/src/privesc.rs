@@ -8,7 +8,7 @@
 //! cannot say whether the call succeeded, so a refused `setuid(0)` (EPERM, the unprivileged
 //! attempt) looks like a granted one.
 //!
-//! **What the lab measured (Fedora 43, 2026-10-29, `lab/captures/test-1041-20261029/`).** Over a
+//! **What the lab measured (Fedora 43, 2026-10-29).** Over a
 //! quiet host plus ssh logins, `sudo`, `su`, `crontab` and a root cron job, the callers that
 //! request uid 0 from a non-root real uid are `sudo`, `su`, `crontab`, `sshd-session` and
 //! `sshd-auth` ([`SETUID_ROOT_PROGRAMS`]). A copy of `python3` renamed `sudo` and placed in

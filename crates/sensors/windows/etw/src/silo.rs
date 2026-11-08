@@ -1,4 +1,4 @@
-//! Container attribution for process-isolated Windows containers (#371): which
+//! Container attribution for process-isolated Windows containers (<https://github.com/synthaea-lab/edr-agent/issues/39>): which
 //! server silo a process runs in, and which container that silo is.
 //!
 //! A process-isolated container shares the host kernel, so the ETW session

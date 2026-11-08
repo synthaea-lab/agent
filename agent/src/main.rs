@@ -89,10 +89,10 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "agent")]
 struct Cli {
-    /// Path to the agent configuration file (TOML). See ADR-0013 for the
-    /// discovery order (this flag, `SYNTHAEA_CONFIG` env, OS default).
+    /// Path to the agent configuration file (TOML). Discovery order: this
+    /// flag, then the `SYNTHAEA_CONFIG` env var, then the OS default path.
     /// The agent refuses to start without a valid config — this is
-    /// intentional; there is no in-memory default (ADR-0013 §5).
+    /// intentional; there is no in-memory default.
     #[arg(long, global = true, value_name = "PATH")]
     config: Option<std::path::PathBuf>,
 

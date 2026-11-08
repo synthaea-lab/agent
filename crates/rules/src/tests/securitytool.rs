@@ -137,7 +137,7 @@ fn the_burst_rule_and_this_one_are_independent() {
     assert!(techniques.contains(&"T1489"), "{techniques:?}");
 }
 
-// ---- Kernel-mediated stops (#1138) ----
+// ---- Kernel-mediated stops (https://github.com/synthaea-lab/edr-agent/issues/49) ----
 
 fn throttle_alerts(command: &str) -> Vec<crate::Alert> {
     stops(command)

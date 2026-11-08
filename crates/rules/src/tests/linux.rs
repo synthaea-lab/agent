@@ -815,7 +815,7 @@ fn beacon_ignores_the_unspecified_address_probe() {
 #[test]
 fn beacon_flow_three_distinct_ports_triggers_alert() {
     // 3 distinct short-lived connections (3 distinct local ports) to the same
-    // (comm, daddr, dport) — the real beaconing shape `lab/scenarios/beacon.sh`
+    // (comm, daddr, dport) — the real beaconing shape the lab's beacon scenario
     // exercises, observed here via conntrack polling instead of a discrete
     // ConnectEvent trace.
     let mut state = RuleState::new();
@@ -1175,7 +1175,7 @@ fn listen_port_two_distinct_new_ports_each_alert() {
 
 #[test]
 fn listen_port_udp_on_a_tcp_baselined_port_still_alerts() {
-    // Issue #676: udp/53 and tcp/53 are two different services sharing a port
+    // https://github.com/synthaea-lab/edr-agent/issues/40: udp/53 and tcp/53 are two different services sharing a port
     // number, not one shape — a UDP listener must not look already-seen just
     // because the same (addr, port) was baselined as TCP.
     let mut state = RuleState::new();

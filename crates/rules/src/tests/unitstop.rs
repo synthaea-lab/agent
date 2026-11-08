@@ -405,7 +405,7 @@ fn reboot_options_that_still_shut_down_explain_a_stop() {
     }
 }
 
-/// The sensor reads argv at drain time; a process that already exited has none (#1118). The
+/// The sensor reads argv at drain time; a process that already exited has none (<https://github.com/synthaea-lab/edr-agent/issues/48>). The
 /// options are then unknown, so the command explains nothing (#1102 review 4).
 #[test]
 fn a_reboot_whose_argv_was_not_captured_explains_nothing() {

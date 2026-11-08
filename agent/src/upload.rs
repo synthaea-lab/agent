@@ -480,8 +480,8 @@ mod tests {
     #[test]
     fn explicit_certificate_flags_win_for_either_server() {
         let flags = (
-            Some(PathBuf::from("/lab/c.crt")),
-            Some(PathBuf::from("/lab/c.key")),
+            Some(PathBuf::from("/pki/c.crt")),
+            Some(PathBuf::from("/pki/c.key")),
         );
         let named = resolve_run_target(
             Some("https://lab".into()),
@@ -492,9 +492,9 @@ mod tests {
             &configured(),
         )
         .unwrap();
-        assert_eq!(named.client_cert, pair("/lab/c.crt", "/lab/c.key"));
+        assert_eq!(named.client_cert, pair("/pki/c.crt", "/pki/c.key"));
         let own = resolve_run_target(None, false, flags.0, flags.1, None, &configured()).unwrap();
-        assert_eq!(own.client_cert, pair("/lab/c.crt", "/lab/c.key"));
+        assert_eq!(own.client_cert, pair("/pki/c.crt", "/pki/c.key"));
     }
 
     #[test]
@@ -504,11 +504,11 @@ mod tests {
             false,
             None,
             None,
-            Some(PathBuf::from("/lab/ca.pem")),
+            Some(PathBuf::from("/pki/ca.pem")),
             &configured(),
         )
         .unwrap();
-        assert_eq!(target.ca_cert, Some(PathBuf::from("/lab/ca.pem")));
+        assert_eq!(target.ca_cert, Some(PathBuf::from("/pki/ca.pem")));
     }
 
     #[test]

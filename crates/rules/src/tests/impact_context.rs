@@ -486,7 +486,7 @@ fn a_command_that_visibly_does_nothing_is_not_a_shutdown() {
 
 #[test]
 fn an_empty_argv_still_counts_by_program_name_but_never_for_argument_commands() {
-    // A short-lived process can reach the rules with no command line (ADR-0045, #1118).
+    // A short-lived process can reach the rules with no command line (ADR-0045, https://github.com/synthaea-lab/edr-agent/issues/48).
     for comm in ["reboot", "poweroff", "halt", "shutdown"] {
         assert!(
             shutdown_command(&exec_event_full(5, 1, comm, "", 0)).is_some(),

@@ -47,7 +47,7 @@
 //! Deliberately NOT here yet, and why:
 //! - **Inline blocking** (`-EPERM` on a policy verdict, issue #91's second `Done
 //!   when` item). `crates/response` and `crates/policy`'s verdict model don't
-//!   exist yet (issues #131, #133) — there is nothing for a block decision to
+//!   exist yet (issues #131, <https://github.com/synthaea-lab/edr-agent/issues/31>) — there is nothing for a block decision to
 //!   consult. Wiring blocking ahead of that would mean inventing the verdict
 //!   contract here first, unreviewed.
 //! - **`bprm_check`/`socket_connect` hooks** and a real `FileOpenEvent` emission from

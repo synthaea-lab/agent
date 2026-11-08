@@ -1,4 +1,4 @@
-//! FIRST-SEEN-LOGON (T1078, #376): the first successful logon of an account after the
+//! FIRST-SEEN-LOGON (T1078, <https://github.com/synthaea-lab/edr-agent/issues/17>): the first successful logon of an account after the
 //! learning window.
 
 use schema::{AuthEvent, AuthKind, AuthOutcome, User, detection::Severity};
@@ -214,7 +214,7 @@ fn the_outcome_gates_the_rule_on_its_own() {
     assert!(state.on_auth(&event).iter().all(|a| a.technique != "T1078"));
 }
 
-// ODD-HOUR-LOGON (T1078, #376): a logon outside the host-local working hours.
+// ODD-HOUR-LOGON (T1078, https://github.com/synthaea-lab/edr-agent/issues/17): a logon outside the host-local working hours.
 
 /// 2026-10-30 00:00:00 UTC, in nanoseconds.
 const MIDNIGHT_UTC: u64 = 1_793_318_400 * 1_000_000_000;
@@ -441,7 +441,7 @@ fn a_first_logon_at_night_raises_both_findings_independently() {
     assert_eq!(alerts.len(), 2, "{alerts:?}");
 }
 
-// ODD-HOUR-LOGON, platform zone and daylight saving (#1088).
+// ODD-HOUR-LOGON, platform zone and daylight saving (https://github.com/synthaea-lab/edr-agent/issues/15).
 
 /// Central Europe in 2026: CET (UTC+1), CEST (UTC+2) from 29 March 01:00 UTC to 25 October
 /// 01:00 UTC. A stand-in for the platform's conversion, which the rules receive as a function.
@@ -571,7 +571,7 @@ fn a_zone_answer_no_timezone_has_is_ignored_at_that_instant() {
     );
 }
 
-// ODD-HOUR-LOGON, the operator's window and exempt accounts (#1089).
+// ODD-HOUR-LOGON, the operator's window and exempt accounts (https://github.com/synthaea-lab/edr-agent/issues/64).
 
 /// UTC+2, working hours `start..end` local; `MIDNIGHT_UTC + h * HOUR` is `h + 2` o'clock local.
 fn with_window(start: u32, end: u32) -> RuleState {

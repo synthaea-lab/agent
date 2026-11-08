@@ -10,8 +10,7 @@
 //!      check (`WTD_CHOICE_CATALOG`, fed by the `CryptCATAdmin*` lookup chain) —
 //!      most System32 binaries are catalog-signed, not embedded-signed (discovered on
 //!      CI: notepad.exe read `Unsigned` under mode 1 alone). This is the P7 gap
-//!      flagged in issue #21's closing comment; see
-//!      `docs/adr/0007-windows-catalog-signed-binary-verification.md`. Every failure
+//!      flagged in issue #21's closing comment (ADR-0007). Every failure
 //!      path in the catalog chain (context acquisition, hashing, no catalog match,
 //!      catalog-info lookup) falls back to `Unsigned` — the same conservative
 //!      default as before this existed, never `Valid`/`Invalid` on a tooling hiccup.

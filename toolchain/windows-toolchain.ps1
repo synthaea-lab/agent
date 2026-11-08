@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-    Provisioning for the lab's Windows VMs (#22): Rust + MSVC linker/Windows SDK
+    Provisioning for Windows build/test machines: Rust + MSVC linker/Windows SDK
     toolchain for building `agent`/`watchdog` with the ETW and Windows Event
     Log sensors, and the Windows service (SCM) support the watchdog needs.
 
 .DESCRIPTION
-    Provider-neutral, like lab/MATRIX.md and toolchain/linux-toolchain.sh:
+    Provider-neutral, like toolchain/linux-toolchain.sh:
     a harness (Vagrant winrm provisioner, a plain `Invoke-Command` over
     WinRM/PSRemoting, a cloud-init-equivalent user-data script) is only
     responsible for running this inside the VM. Idempotent - safe to re-run

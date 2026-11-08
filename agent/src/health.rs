@@ -148,7 +148,7 @@ pub struct HostCounters {
     pub ioc_findings: u64,
     /// IOC matches the per-indicator cooldown absorbed.
     pub ioc_cooled_down: u64,
-    /// IOC matches skipped as the agent's own control-plane traffic, by the agent (#1061).
+    /// IOC matches skipped as the agent's own control-plane traffic, by the agent (<https://github.com/synthaea-lab/edr-agent/issues/47>).
     pub ioc_own_skipped: u64,
     /// The same, by a second process on the agent's executable.
     pub ioc_sibling_skipped: u64,

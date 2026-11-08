@@ -126,12 +126,10 @@ pub struct PolicyPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compliance_mode: Option<ComplianceMode>,
 
-    /// Placeholder for [ADR-0010]'s `rules` section — allowlist/denylist of
+    /// Placeholder for ADR-0010's `rules` section — allowlist/denylist of
     /// rule identifiers, per-rule overrides. No consumer yet; landing this
     /// today would ship a shape whose real consumer would change. Serialized
     /// only when non-empty.
-    ///
-    /// [ADR-0010]: ../../../docs/adr/0010-shared-policy-model.md
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<RulesSection>,
 

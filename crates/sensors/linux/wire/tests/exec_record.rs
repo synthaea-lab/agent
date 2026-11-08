@@ -1,4 +1,4 @@
-//! The variable-length exec record (#1118, ADR-0045). Its lengths describe bytes a process
+//! The variable-length exec record (<https://github.com/synthaea-lab/edr-agent/issues/48>, ADR-0045). Its lengths describe bytes a process
 //! chose, so `parse_exec_record` accepts exactly the shapes the probe writes and never reads past
 //! the record: a refused record is an `Err`, never a panic (a panic on the drain path kills the
 //! sensor).

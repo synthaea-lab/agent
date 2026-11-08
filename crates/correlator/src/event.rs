@@ -34,8 +34,8 @@ pub(crate) fn is_correlated(event: &Event) -> bool {
             // `NetworkFlow` (issue #92, conntrack polling) is pushed to the bus
             // without a dedicated co-occurrence rule: its beacon-detection value
             // already has a home in `crates/rules::check_beacon_flow` (the live
-            // engine `agent run` actually uses, validated against
-            // `lab/scenarios/beacon.sh`). Folding it into this crate's
+            // engine `agent run` actually uses, validated against the lab's
+            // beacon scenario). Folding it into this crate's
             // `Connect`-keyed rules (`rule_spawn_connect` and friends) or
             // `BehaviorVector`'s features would either double-alert when both a
             // discrete `Connect` and a polled `NetworkFlow` observe the same real

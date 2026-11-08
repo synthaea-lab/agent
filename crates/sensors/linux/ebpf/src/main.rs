@@ -41,7 +41,7 @@ use sensor_linux_wire::{
 /// needs per-byte loops over MAX_PATH_LEN, which blow the verifier's 1M-instruction
 /// budget on pre-6.6 kernels (5.15, 6.1).
 ///
-/// 512 KiB since a record carries the argv bytes it read (#1118, ADR-0045): a record is the
+/// 512 KiB since a record carries the argv bytes it read (<https://github.com/synthaea-lab/edr-agent/issues/48>, ADR-0045): a record is the
 /// fixed `ExecEvent` plus its command line, so this holds about as many as 256 KiB of fixed
 /// records did.
 #[map]
@@ -51,7 +51,7 @@ static EXEC_EVENTS: RingBuf = RingBuf::with_byte_size(512 * 1024, 0);
 #[map]
 static EXEC_SCRATCH: PerCpuArray<ExecRecord> = PerCpuArray::with_max_entries(1, 0);
 
-// argv at exec (#1118). Userspace sets these from the kernel's BTF (`btf.rs`,
+// argv at exec (https://github.com/synthaea-lab/edr-agent/issues/48). Userspace sets these from the kernel's BTF (`btf.rs`,
 // `ExecArgvOffsets`) and `EXEC_ARGV_ENABLED` only when all three were found; left at zero
 // the probe reads no argv and userspace falls back to `/proc/<pid>/cmdline`.
 #[unsafe(no_mangle)]
@@ -63,7 +63,7 @@ static MM_ARG_START_OFFSET: Global<u32> = Global::new(0);
 #[unsafe(no_mangle)]
 static MM_ARG_END_OFFSET: Global<u32> = Global::new(0);
 
-/// Reads the current task's argument block into `rec.argv` (#1118, ADR-0045): all of it when it
+/// Reads the current task's argument block into `rec.argv` (<https://github.com/synthaea-lab/edr-agent/issues/48>, ADR-0045): all of it when it
 /// fits in `ARGV_WINDOW_BYTES`, else the first `ARGV_HEAD_BYTES` and the last `ARGV_TAIL_BYTES`.
 /// At `sched_process_exec` the new `mm` is installed and `execve` has just copied the strings
 /// onto the new stack, so `arg_start..arg_end` is this exec's argv. A failed head read leaves
@@ -171,7 +171,7 @@ pub(crate) fn record_sched_process_exec(pid: u32, filename_ptr: *const u8) -> u3
     // field in a reserved ring-buffer slot (that needs per-byte loops over
     // MAX_PATH_LEN, which blow the verifier's 1M-instruction budget on pre-6.6
     // kernels). One `output` copy emits it. argv is read here at exec time through
-    // BTF-derived offsets (#1118); without them userspace reads `/proc/<pid>/cmdline`.
+    // BTF-derived offsets (https://github.com/synthaea-lab/edr-agent/issues/48); without them userspace reads `/proc/<pid>/cmdline`.
     let Some(rec) = EXEC_SCRATCH.get_ptr_mut(0) else {
         return 1;
     };
@@ -288,7 +288,7 @@ const OPENAT_FLAGS_OFFSET: usize = 20;
 /// (x86_64/aarch64) / 4 bytes (i686) earlier. Needed because musl — and every busybox applet
 /// linked against it, `cat` included — still issues `open(2)` directly; glibc has rewritten
 /// `open()` to call `openat(AT_FDCWD, ...)` internally since 2.26, which is why this gap did
-/// not show up on the glibc labs in `lab/MATRIX.md`. Attaching only `sys_enter_openat`
+/// not show up on the glibc lab machines. Attaching only `sys_enter_openat`
 /// therefore captured zero file-open events on Alpine — confirmed via
 /// `strace -e trace=open,openat cat /etc/hostname` showing a bare `open()`, then via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_open/format` on 2026-09-16 (same kernel as
@@ -3868,8 +3868,8 @@ const KERNEL_MODULE_ACTION_UNLOAD: u8 = 2;
 
 /// Offsets of the `syscalls:sys_enter_init_module` tracepoint (`umod`, `len`,
 /// `uargs`), assumed standard layout (16-byte header + 8 bytes/arg on
-/// x86_64/aarch64) — re-verify against `/format` on any kernel row added to
-/// `lab/MATRIX.md`, same posture as every other offset const in this file.
+/// x86_64/aarch64) — re-verify against `/format` on any newly supported kernel,
+/// same posture as every other offset const in this file.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const INIT_MODULE_LEN_OFFSET: usize = 24;
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
@@ -4234,7 +4234,7 @@ const IDENTITY_KIND_SETFSGID: u8 = 5;
 /// Offset of `setuid(2)`/`setgid(2)`/`setfsuid(2)`/`setfsgid(2)`'s single
 /// `uid_t`/`gid_t` argument — identical shape across all four, assumed
 /// standard layout (16-byte header + 8 bytes/arg on x86_64/aarch64);
-/// re-verify against `/format` on any kernel row added to `lab/MATRIX.md`,
+/// re-verify against `/format` on any newly supported kernel,
 /// same posture as every other offset const in this file.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const SINGLE_ID_OFFSET: usize = 16;

@@ -1,5 +1,5 @@
 //! SETUID-ROOT-REQUEST (T1548.001, #1041). The events carry the values the sensor reported in the
-//! lab run of 2026-10-29 (`lab/captures/test-1041-20261029/`): `meta.user` is the caller's real
+//! lab run of 2026-10-29: `meta.user` is the caller's real
 //! uid, `4294967295` is `setresuid`'s "unchanged". A request is judged once the stream clock is
 //! `IDENTITY_DEFER_NS` past it, against the image the pid had at its time, so these tests build
 //! the order the sensor really delivers (the identity events before the exec that explains them).

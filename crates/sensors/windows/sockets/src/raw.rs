@@ -17,14 +17,14 @@ pub struct ListenerEntry {
     pub process_name: Option<String>,
     pub local: SocketAddr,
     /// `IPPROTO_TCP` (6) or `IPPROTO_UDP` (17) — which IP Helper table this
-    /// entry came from (issue #676).
+    /// entry came from (<https://github.com/synthaea-lab/edr-agent/issues/40>).
     pub protocol: u8,
 }
 
 /// The default Windows dynamic (ephemeral) port range, 49152-65535, the same for
 /// UDP and TCP on IPv4 and IPv6 since Vista (`netsh int ipv4 show dynamicport udp`
 /// prints `start 49152, 16384 ports` on an untouched host; measured on the
-/// Windows 11 dev host of the #676 capture).
+/// Windows 11 dev host of the <https://github.com/synthaea-lab/edr-agent/issues/40> capture).
 ///
 /// Fixed rather than read from the host: no documented API returns the range,
 /// and getting it wrong only moves noise, never blindness. An administrator who
@@ -33,7 +33,7 @@ pub struct ListenerEntry {
 /// is dropped whatever the host's setting.
 pub const EPHEMERAL_UDP_PORTS: core::ops::RangeInclusive<u16> = 49152..=65535;
 
-/// Whether `entry` is a socket LISTENER-DRIFT should see (issue #676).
+/// Whether `entry` is a socket LISTENER-DRIFT should see (<https://github.com/synthaea-lab/edr-agent/issues/40>).
 ///
 /// Every TCP entry is: the TCP table is already filtered to listeners. A UDP
 /// entry is kept only when its port is outside [`EPHEMERAL_UDP_PORTS`].

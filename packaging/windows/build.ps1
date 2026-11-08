@@ -5,7 +5,7 @@
 .DESCRIPTION
     Requires a release build already on disk, WITHOUT the public test signing key
     (cargo build --release --no-default-features --features agent/dynamic-onnx
-    -p agent -p watchdog, from the repo root; ADR-0027, #753) and WiX v3 installed -
+    -p agent -p watchdog, from the repo root; ADR-0027, https://github.com/synthaea-lab/edr-agent/issues/43) and WiX v3 installed -
     see README.md in this directory for the install command. The script refuses
     to build the MSI from binaries that carry the test key. Not idempotent in a meaningful
     sense (each run just overwrites out\SynthaeaAgent.msi); safe to re-run.
@@ -26,7 +26,7 @@ foreach ($exe in @("agent.exe", "watchdog.exe")) {
     }
 }
 
-# The shipped artifacts must not carry the public test signing key (ADR-0027, #753): the
+# The shipped artifacts must not carry the public test signing key (ADR-0027, https://github.com/synthaea-lab/edr-agent/issues/43): the
 # marker the updater's `test-key` feature links in is looked up in the binaries themselves,
 # the same check tools/assert-no-test-key.sh makes for the Linux packages. Latin-1 (code
 # page 28591, available on Windows PowerShell 5.1 as well as PowerShell 7) maps each byte

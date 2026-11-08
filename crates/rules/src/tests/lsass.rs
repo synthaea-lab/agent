@@ -1,5 +1,5 @@
-//! LSASS-ACCESS (T1003.001) and LSASS-REMOTE-THREAD (T1055), #960: over the driver-free
-//! `ProcessAccessEvent` and `RemoteThreadEvent` of #720.
+//! LSASS-ACCESS (T1003.001) and LSASS-REMOTE-THREAD (T1055), <https://github.com/synthaea-lab/edr-agent/issues/45>: over the driver-free
+//! `ProcessAccessEvent` and `RemoteThreadEvent` of <https://github.com/synthaea-lab/edr-agent/issues/41>.
 
 use schema::{ProcessAccessEvent, RemoteThreadEvent, detection::Severity};
 

@@ -1,6 +1,6 @@
 //! Applying a per-host override document on top of a baseline policy.
 //!
-//! Implements the three merge granularities [ADR-0011] declares:
+//! Implements the three merge granularities ADR-0011 declares:
 //!
 //! 1. **Flat sections** (non-map: `response`, `compliance_mode`, `rules`,
 //!    `models`, `thresholds`) — whole-section replace: `overrides.section`
@@ -14,8 +14,6 @@
 //! 3. **Safety-critical sub-objects** — enforced by the schema types
 //!    themselves, not by a runtime walker in this module. See
 //!    "Safety-critical enforcement" below.
-//!
-//! [ADR-0011]: ../../../docs/adr/0011-policy-override-granularity.md
 //!
 //! ## Safety-critical enforcement — where it actually happens
 //!

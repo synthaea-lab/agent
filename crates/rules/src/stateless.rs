@@ -168,7 +168,7 @@ const TRUNCATED_CMDLINE_QUOTE_BYTES: usize = 256;
 ///
 /// `cmdline_truncated == false` means "no cut seen", not "the whole command line
 /// was seen": a process gone before its argv was read has an empty argv and no
-/// flag (#1118), so this rule cannot see that case.
+/// flag (<https://github.com/synthaea-lab/edr-agent/issues/48>), so this rule cannot see that case.
 #[must_use]
 pub(crate) fn check_truncated_cmdline(event: &ExecEvent) -> Option<Alert> {
     if !event.cmdline_truncated {
@@ -267,10 +267,10 @@ pub(crate) fn check_proc_root_escape(event: &FileOpenEvent) -> Option<Alert> {
 }
 
 /// T1053.005 — Scheduled Task/Job: Scheduled Task. A Windows scheduled task was
-/// just created (Security log event 4698, "A scheduled task was created") — see
-/// `docs/adr/0004-windows-persistence-detection-via-eventlog-polling.md` for why
-/// this flows through `FileOpenEvent` (`FLAG_PERSISTENCE_TASK_ARTIFACT`) rather
-/// than a dedicated `Event::Persistence` variant.
+/// just created (Security log event 4698, "A scheduled task was created"). It
+/// flows through `FileOpenEvent` (`FLAG_PERSISTENCE_TASK_ARTIFACT`) rather than a
+/// dedicated `Event::Persistence` variant so no `SCHEMA_VERSION` bump forces every
+/// consumer to grow a match arm (ADR-0004).
 ///
 /// The signal is deterministic: `sensor-windows-eventlog` pushes this exact
 /// `FileOpenEvent` iff Windows wrote a 4698, and 4698 is only emitted when a
@@ -380,8 +380,7 @@ pub(crate) fn check_scheduled_task_update_persistence(event: &FileOpenEvent) -> 
 
 /// T1543.003 — Create or Modify System Process: Windows Service. A Windows service
 /// was just installed (Security log event 7045, "A service was installed in the
-/// system") — same eventlog-polling pipeline as T1053.005, see
-/// `docs/adr/0004-windows-persistence-detection-via-eventlog-polling.md`. Flows
+/// system") — same eventlog-polling pipeline as T1053.005 (ADR-0004). Flows
 /// through `FileOpenEvent` with `FLAG_PERSISTENCE_ARTIFACT` (distinct bit from
 /// `FLAG_PERSISTENCE_TASK_ARTIFACT`, so the two techniques never cross-fire).
 ///
@@ -414,8 +413,7 @@ pub(crate) fn check_service_install_persistence(event: &FileOpenEvent) -> Option
 
 /// T1136.001 — Create Account: Local Account. A Windows local user account was
 /// just created (Security log event 4720, "A user account was created") — same
-/// eventlog-polling pipeline as T1053.005 and T1543.003, see
-/// `docs/adr/0004-windows-persistence-detection-via-eventlog-polling.md`. Flows
+/// eventlog-polling pipeline as T1053.005 and T1543.003 (ADR-0004). Flows
 /// through `FileOpenEvent` with `FLAG_PERSISTENCE_ACCOUNT_ARTIFACT` (distinct
 /// bit from the two other persistence flags, so the three techniques never
 /// cross-fire off a single event).

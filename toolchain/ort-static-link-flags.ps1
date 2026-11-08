@@ -27,7 +27,7 @@
 
 .EXAMPLE
     $env:ORT_LIB_LOCATION = "$PWD\onnxruntime\build\Windows\Release\Release"
-    .\lab\provisioning\ort-static-link-flags.ps1 | Invoke-Expression
+    .\toolchain\ort-static-link-flags.ps1 | Invoke-Expression
     cargo build -p ml --release --no-default-features
 #>
 

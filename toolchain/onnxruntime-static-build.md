@@ -163,11 +163,11 @@ Visual Studio generator.
 
 ```powershell
 # 1. Build onnxruntime v1.30.0 from source (CPU only), then re2 explicitly
-.\lab\provisioning\build-onnxruntime-static.ps1
+.\toolchain\build-onnxruntime-static.ps1
 
 # 2. Point ort-sys at the result and generate the link flags
 $env:ORT_LIB_LOCATION = "$PWD\onnxruntime\build\Windows\Release\Release"
-.\lab\provisioning\ort-static-link-flags.ps1 | Invoke-Expression
+.\toolchain\ort-static-link-flags.ps1 | Invoke-Expression
 
 # 3. Build and test with static linking (disables dynamic-onnx)
 cargo test -j 1 -p ml --release --no-default-features

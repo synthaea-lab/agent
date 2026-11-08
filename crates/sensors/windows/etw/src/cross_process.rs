@@ -1,4 +1,4 @@
-//! Cross-process telemetry from driver-free providers (#720, ADR-0026 follow-up 6): a thread
+//! Cross-process telemetry from driver-free providers (<https://github.com/synthaea-lab/edr-agent/issues/41>, ADR-0026 follow-up 6): a thread
 //! started in another process (Kernel-Process `ThreadStart`, the native Sysmon 8) and a
 //! memory-reading open of LSASS (Kernel-Audit-API-Calls `PsOpenProcess`, the native Sysmon 10).
 //!
@@ -340,7 +340,7 @@ pub(crate) fn is_system_lsass(claim: &LsassClaim<'_>, system_root: &str) -> bool
         })
 }
 
-/// The pid of the system's LSASS, 0 while unknown (#720).
+/// The pid of the system's LSASS, 0 while unknown (<https://github.com/synthaea-lab/edr-agent/issues/41>).
 ///
 /// Taken only by a process [`is_system_lsass`] confirms, and never over a live one: a
 /// second claimant, real or not, cannot move it. When the tracked LSASS ends (a crash,

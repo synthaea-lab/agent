@@ -4,7 +4,7 @@ Release:        1%{?dist}
 Summary:        Synthaea EDR Agent - Endpoint detection and response
 
 License:        Apache-2.0
-URL:            https://github.com/synthaea-lab/edr
+URL:            https://github.com/synthaea-lab/edr-agent
 Source0:        synthaea-agent-%{version}.tar.gz
 
 BuildRequires:  rust >= 1.70, cargo, systemd-rpm-macros

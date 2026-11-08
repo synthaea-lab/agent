@@ -162,8 +162,8 @@ pub(crate) fn rule_spawn_connect_filewrite(
 /// Correlated by (ppid, comm), not by literal pid: a real respawn (fork+exec, e.g.
 /// a listener restarted after each crash/connection) gets a new pid on every
 /// iteration — filtering by the `pid` of the single current event can therefore
-/// never accumulate several `Exec`s for a real scenario (see
-/// lab/scenarios/respawn-beacon.sh, which documented the hypothesis; confirmed by
+/// never accumulate several `Exec`s for a real scenario (the lab's respawn-beacon
+/// scenario documented the hypothesis; confirmed by
 /// rereading the original test, which artificially reused the same pid for the 3
 /// execs). Same principle as SELF-SPAWN in `rules`, which already correlates on
 /// (ppid, comm).

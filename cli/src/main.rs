@@ -33,8 +33,8 @@ use clap::{Parser, Subcommand};
     long_about = None,
 )]
 struct Cli {
-    /// Path to the agent configuration file (TOML). See ADR-0013 for the
-    /// discovery order (this flag, `SYNTHAEA_CONFIG` env, OS default).
+    /// Path to the agent configuration file (TOML). Discovery order: this
+    /// flag, then the `SYNTHAEA_CONFIG` env var, then the OS default path.
     #[arg(long, global = true, value_name = "PATH")]
     config: Option<PathBuf>,
 

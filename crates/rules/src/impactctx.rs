@@ -25,7 +25,7 @@
 //!
 //! **Which command counts as a shutdown** is read from the program name where that is enough
 //! (`shutdown`, `reboot`, `halt`, `poweroff`), because the argv of a short-lived process can
-//! be empty (ADR-0045, #1118). The commands whose meaning is in the arguments (`systemctl
+//! be empty (ADR-0045, <https://github.com/synthaea-lab/edr-agent/issues/48>). The commands whose meaning is in the arguments (`systemctl
 //! reboot`, `init 6`) count only when the arguments are there, which fails closed. A visible
 //! argument that says the command does nothing (`shutdown -c`, `-k`, `--help`, `--dry-run`,
 //! `reboot -w`, `shutdown /a`) is excluded. The better source for the fact itself is the

@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Provisioning for the lab's Arch Linux VM (rolling, glibc, x86_64): Rust +
-# eBPF toolchain for building the agent and probes, plus the packages the
-# lab/scenarios/ scripts need. Companion to linux-toolchain.sh (Debian/RPM)
-# and alpine-toolchain.sh (musl) — see issue #124. Idempotent: rerunnable via
+# Provisioning for an Arch Linux build/test machine (rolling, glibc, x86_64):
+# Rust + eBPF toolchain for building the agent and probes, plus the packages the
+# lab's attack scenarios need. Companion to linux-toolchain.sh (Debian/RPM)
+# and alpine-toolchain.sh (musl). Idempotent: rerunnable via
 # `vagrant provision <machine>` or a plain re-run.
 #
 # The point of this box is that it moves: rolling repos mean whatever kernel
 # and LLVM/clang are current the day someone runs `vagrant up` here, which is
 # exactly where #53's no-CO-RE fragility and the bpf-linker/rustc-nightly
 # LLVM-major alignment (see linux-toolchain.sh's comment on that) are most
-# likely to drift first. Record the versions actually seen in lab/MATRIX.md
-# after a run, don't hardcode them here.
+# likely to drift first. Record the versions actually seen after a run in
+# the test notes, don't hardcode them here.
 set -euo pipefail
 
 PACMAN="sudo pacman -S --needed --noconfirm"
@@ -141,13 +141,13 @@ for tool in bindgen aya-tool bpf-linker; do
 done
 
 echo "== Done =="
-echo "Source synced into /synthaea — see lab/vagrant-hyperv/README.md for the build."
+echo "Toolchain ready: build the agent from the source tree (cargo build --release)."
 echo
-echo "Known caveats not resolved by this script (see issue #124):"
-echo "  - ml/ (ONNX Runtime) is out of scope here, same as Alpine (#123): not"
+echo "Known caveats not resolved by this script:"
+echo "  - ml/ (ONNX Runtime) is out of scope here, same as Alpine: not"
 echo "    currently a dependency of the agent binary, so this doesn't block"
-echo "    the walking-skeleton scenario. See issue #110 (ADR-0002 static"
-echo "    linking) separately."
+echo "    the walking-skeleton scenario. Static ONNX Runtime linking is"
+echo "    documented in toolchain/onnxruntime-static-build.md."
 echo "  - This installs whatever kernel/LLVM/clang the rolling repos serve"
-echo "    today. Record the actual versions seen in lab/MATRIX.md after a"
+echo "    today. Record the actual versions seen after a"
 echo "    run — pinning them here would defeat the point of this box."

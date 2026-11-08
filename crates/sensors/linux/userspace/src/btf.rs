@@ -249,7 +249,7 @@ pub(crate) fn read_inode_setattr_offsets()
         .map_err(|e| format!("invalid kernel BTF: {e}").into())
 }
 
-/// Byte offsets the exec probe needs to copy argv at `sched_process_exec` (#1118): the task's
+/// Byte offsets the exec probe needs to copy argv at `sched_process_exec` (<https://github.com/synthaea-lab/edr-agent/issues/48>): the task's
 /// `mm` pointer and the bounds of the argument strings in it (`mm_struct` keeps them inside an
 /// anonymous struct, which `member_offset` looks through).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
