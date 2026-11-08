@@ -32,7 +32,7 @@ scope and why) the hand-written predecessor doc carried; that lives in the
 issue tracker instead.
 
 The scan spans repos: `crates/` is this one, while `rules/` is a sibling
-checkout of synthaea-lab/edr-rules next to this repo, found under $SYNTHAEA_ROOT
+checkout of synthaea-lab/rules next to this repo, found under $SYNTHAEA_ROOT
 when set and the parent of this repo otherwise (the same lookup as
 `crates/siblings`). A missing sibling is a hard error, never a partial matrix.
 Paths in the output stay relative to their own repo (`crates/...`, `rules/...`).
@@ -113,7 +113,7 @@ def require_siblings() -> None:
     if missing:
         print(
             f"error: sibling repo directories missing under {SIBLINGS_ROOT}: "
-            f"{', '.join(missing)} — check out synthaea-lab/edr-rules next to this "
+            f"{', '.join(missing)} — check out synthaea-lab/rules next to this "
             "repo as rules/, or set SYNTHAEA_ROOT to the directory holding it",
             file=sys.stderr,
         )
@@ -246,7 +246,7 @@ UNVERIFIED_NOTES = [
     "`Content.Outlook` folder; whether it carries a mark, and which process writes "
     "it, is still to be observed. Thunderbird is not verified. Neither is in the "
     "rule until a lab capture shows the mark and its writer "
-    "(https://github.com/synthaea-lab/edr-agent/issues/17).",
+    "(https://github.com/synthaea-lab/agent/issues/17).",
 ]
 
 

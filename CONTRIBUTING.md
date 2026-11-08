@@ -112,7 +112,7 @@ Documentation PRs are welcome immediately. Particularly wanted:
 ### Detection content
 
 Accepted — content is code here; the content itself lives in
-[synthaea-lab/edr-rules](https://github.com/synthaea-lab/edr-rules).
+[synthaea-lab/rules](https://github.com/synthaea-lab/rules).
 Every shipped rule must compile/validate in its engine AND fire on a crafted matching sample
 (CI-enforced by the content suites — add your sample with your rule). Coming requirements as the
 pipeline hardens: a MITRE ATT&CK technique mapping, negative (must-NOT-fire) samples, and a

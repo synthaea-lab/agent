@@ -285,7 +285,7 @@ pub const fn syscall_nr_from_i32(syscall_nr: i32) -> Option<u32> {
 ///   time the caller chose, not the kernel's own "now" update). Carries the raw `timespec64`
 ///   (seconds and nanoseconds, so the probe does no arithmetic); userspace normalises it to
 ///   `schema::FileSetTimeEvent`. No existing struct changed.
-/// - v28: the exec record is variable-length (<https://github.com/synthaea-lab/edr-agent/issues/48>, ADR-0045). `ExecEvent` gains `argv_total`,
+/// - v28: the exec record is variable-length (<https://github.com/synthaea-lab/agent/issues/48>, ADR-0045). `ExecEvent` gains `argv_total`,
 ///   `argv_head_len` and `argv_tail_len`, and the record carries that many bytes of the argument
 ///   block after the fixed part: the head window, then the tail window. Exec-time, so a process
 ///   that exits before the drain or rewrites its argv region afterwards keeps the argv it was

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# A packaged build must not carry the public test signing key (ADR-0027, https://github.com/synthaea-lab/edr-agent/issues/43).
+# A packaged build must not carry the public test signing key (ADR-0027, https://github.com/synthaea-lab/agent/issues/43).
 #
 # Two checks, cheap enough for every CI run:
 #   1. Feature resolution: for the packaged binaries built without default features, the

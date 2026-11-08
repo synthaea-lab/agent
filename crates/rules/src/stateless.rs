@@ -168,7 +168,7 @@ const TRUNCATED_CMDLINE_QUOTE_BYTES: usize = 256;
 ///
 /// `cmdline_truncated == false` means "no cut seen", not "the whole command line
 /// was seen": a process gone before its argv was read has an empty argv and no
-/// flag (<https://github.com/synthaea-lab/edr-agent/issues/48>), so this rule cannot see that case.
+/// flag (<https://github.com/synthaea-lab/agent/issues/48>), so this rule cannot see that case.
 #[must_use]
 pub(crate) fn check_truncated_cmdline(event: &ExecEvent) -> Option<Alert> {
     if !event.cmdline_truncated {

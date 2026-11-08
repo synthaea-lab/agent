@@ -2,7 +2,7 @@
 
 **Status:** The correlator-side wiring below shipped with #345: `update_belief`'s
 `ml_llr` parameter, the `engine.rs` call sites, `update_belief_with_ml`, and its unit
-tests. What remains is a trained correlation model (https://github.com/synthaea-lab/edr-ml/issues/3) and the end-to-end
+tests. What remains is a trained correlation model (https://github.com/synthaea-lab/ml/issues/3) and the end-to-end
 verification that needs one — not an architecture or wiring question.
 
 This document describes how Phase 3 of issue #46 (correlator no-score handling) was
@@ -122,7 +122,7 @@ if let Some(ref mut scorer) = *self.ml_scorer.lock().unwrap() {
 ```
 
 This whole block is skipped when `self.ml_scorer` holds no scorer — which is the
-case on every deployment today, since no trained correlation model ships (https://github.com/synthaea-lab/edr-ml/issues/3).
+case on every deployment today, since no trained correlation model ships (https://github.com/synthaea-lab/ml/issues/3).
 The wiring is real and runs in production, not just in tests, but it currently has
 nothing to score: every event's belief update is still T1-only until a model is
 loaded.
@@ -193,13 +193,13 @@ fn test_update_belief_ml_none_skipped() {
 - [x] Add unit tests for `ml_llr = Some(...)` and `ml_llr = None`
   (`crates/correlator/src/tests/behavior.rs`, "update_belief_with_ml")
 - [ ] End-to-end test: benign baseline (no OOD), OOD injection, low event count
-  — needs a trained model (https://github.com/synthaea-lab/edr-ml/issues/3); nothing to run against without one
+  — needs a trained model (https://github.com/synthaea-lab/ml/issues/3); nothing to run against without one
 - [ ] Update `docs/detection/ml.md` with Phase 3 semantics — landed instead in
   `docs/detection/correlation.md`'s "Wiring seam" section
 
 ## Timeline
 
 Everything above is done except the two boxes left unchecked, both of which wait on
-the same thing: a trained correlation model. That is https://github.com/synthaea-lab/edr-ml/issues/3's own remaining scope, not
+the same thing: a trained correlation model. That is https://github.com/synthaea-lab/ml/issues/3's own remaining scope, not
 a new issue — see `docs/detection/correlation.md`'s "Calibration status" for what the
 training step still needs.

@@ -102,7 +102,7 @@
 //!   unconnected UDP socket is `TCP_CLOSE` in `sock_diag`, so it is its own
 //!   [`SocketState::Unconnected`], not a states-mask variant of `Listen`), but
 //!   they report every bound socket, ephemeral client ports included. The noise
-//!   filter <https://github.com/synthaea-lab/edr-agent/issues/40> asks for needs a real capture; until it exists the agent
+//!   filter <https://github.com/synthaea-lab/agent/issues/40> asks for needs a real capture; until it exists the agent
 //!   keeps calling the TCP-only [`listen_port_events`].
 //! - Periodic re-snapshotting / drift detection between snapshots — [`snapshot`]
 //!   is a one-shot query; a caller decides the cadence. No lab VM here to
@@ -245,7 +245,7 @@ pub fn snapshot() -> Result<Vec<SocketSnapshotEntry>, NetlinkError> {
 /// joined to their owning PID(s) like [`snapshot`].
 ///
 /// This is every bound UDP socket, not only servers: DNS client sockets, QUIC and
-/// media sockets on ephemeral ports all appear. <https://github.com/synthaea-lab/edr-agent/issues/40> asks for a noise filter
+/// media sockets on ephemeral ports all appear. <https://github.com/synthaea-lab/agent/issues/40> asks for a noise filter
 /// calibrated on a real capture, which does not exist yet, so nothing in the agent
 /// calls this; it is the unfiltered mechanism the filter will sit in front of, same
 /// split as `sensor-windows-sockets`.

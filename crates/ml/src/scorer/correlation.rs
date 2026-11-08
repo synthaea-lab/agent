@@ -16,7 +16,7 @@
 //!
 //! The correlator cannot call this crate (`ml` already depends on `correlator` for
 //! [`EventBus`]; the reverse edge would be a cycle). The wiring is therefore
-//! "compute here, inject there" (<https://github.com/synthaea-lab/edr-ml/issues/3>, #345): `agent::DetectionSink` runs
+//! "compute here, inject there" (<https://github.com/synthaea-lab/ml/issues/3>, #345): `agent::DetectionSink` runs
 //! [`CorrelationScorer::score`] against the engine's bus and hands the LLR back
 //! through `CorrelationEngine::update_belief_with_ml` — see
 //! `docs/detection/correlation.md`.

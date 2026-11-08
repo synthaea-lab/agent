@@ -1,4 +1,4 @@
-//! The Host Compute Service client behind container attribution (<https://github.com/synthaea-lab/edr-agent/issues/39>): the
+//! The Host Compute Service client behind container attribution (<https://github.com/synthaea-lab/agent/issues/39>): the
 //! containers the service runs, and the processes in each.
 //!
 //! `computecore.dll` is loaded on first use, from System32 only, and first use

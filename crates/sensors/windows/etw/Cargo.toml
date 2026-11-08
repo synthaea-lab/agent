@@ -15,7 +15,7 @@ tracing = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 ferrisetw = "1"
-# The Host Compute Service answers in JSON (container attribution, https://github.com/synthaea-lab/edr-agent/issues/39).
+# The Host Compute Service answers in JSON (container attribution, https://github.com/synthaea-lab/agent/issues/39).
 serde_json = { workspace = true }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
@@ -23,7 +23,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_Etw",
     "Win32_System_LibraryLoader",
-    # ProcessIdToSessionId: confirming the system LSASS (https://github.com/synthaea-lab/edr-agent/issues/41).
+    # ProcessIdToSessionId: confirming the system LSASS (https://github.com/synthaea-lab/agent/issues/41).
     "Win32_System_RemoteDesktop",
     "Win32_System_Threading",
     "Win32_Security",

@@ -1,15 +1,16 @@
 //! Test support for cross-repo contract tests: find the sibling checkouts of the
 //! public Synthaea repos next to this workspace.
 //!
-//! The repos that test against each other (`synthaea-lab/edr-agent`, `edr-server`,
-//! `edr-ml`, `edr-rules`) are cloned side by side in one directory:
+//! The public repos that test against each other (`synthaea-lab/agent`, `server`,
+//! `ml`, `rules`, `scenarios`) are cloned side by side in one directory:
 //!
 //! ```text
 //! <SYNTHAEA_ROOT>/
-//!   agent/   this workspace (synthaea-lab/edr-agent)
-//!   server/  synthaea-lab/edr-server
-//!   ml/      synthaea-lab/edr-ml
-//!   rules/   synthaea-lab/edr-rules
+//!   agent/      this workspace (synthaea-lab/agent)
+//!   server/     synthaea-lab/server
+//!   ml/         synthaea-lab/ml
+//!   rules/      synthaea-lab/rules
+//!   scenarios/  synthaea-lab/scenarios (attack scenarios; no contract test reads it yet)
 //! ```
 //!
 //! A contract test whose other half lives in a sibling (a golden fixture the server
@@ -166,7 +167,7 @@ fn is_required(env: Option<OsString>) -> bool {
 
 fn skip_message(repo: &str, rel: &str) -> String {
     format!(
-        "skipped: needs sibling repo `{repo}` ({}); check out synthaea-lab/edr-{repo} next to \
+        "skipped: needs sibling repo `{repo}` ({}); check out synthaea-lab/{repo} next to \
          this repo as {repo}/ or set {ROOT_ENV}",
         expected_path(repo, rel).display()
     )
@@ -220,7 +221,7 @@ mod tests {
                     .join("x.jsonl")
             )
         );
-        assert!(message.contains("check out synthaea-lab/edr-ml next to this repo as ml/"));
+        assert!(message.contains("check out synthaea-lab/ml next to this repo as ml/"));
         assert!(message.ends_with("set SYNTHAEA_ROOT"));
     }
 }

@@ -114,13 +114,13 @@ max_reconnect_backoff_ms = 60000
 # kind = "mysql_error"
 
 # --- [detection] --------------------------------------------------------------------
-# Facts about this host that no event carries (https://github.com/synthaea-lab/edr-agent/issues/17). Nothing is needed here when the host
+# Facts about this host that no event carries (https://github.com/synthaea-lab/agent/issues/17). Nothing is needed here when the host
 # names a time zone: the ODD-HOUR-LOGON rule (T1078, a logon outside 07:00-20:00 local by default, Low)
-# then uses the platform's zone, daylight saving included (https://github.com/synthaea-lab/edr-agent/issues/15).
+# then uses the platform's zone, daylight saving included (https://github.com/synthaea-lab/agent/issues/15).
 # To override the zone, or where the host names none (a minimal container is UTC to the C
 # library), give the local time as minutes east of UTC (120 = UTC+2, -300 = UTC-5), between
 # -720 and 840. Fixed: it does not follow daylight saving.
-# Calibration (https://github.com/synthaea-lab/edr-agent/issues/64), both optional and empty by default: the local hours in which a logon
+# Calibration (https://github.com/synthaea-lab/agent/issues/64), both optional and empty by default: the local hours in which a logon
 # is ordinary ([7, 20] when absent; [22, 6] is a night shift, start greater than end wraps
 # midnight; [0, 24] makes every hour ordinary, so the rule never alerts), and the accounts whose
 # odd-hour logons are expected (on-call, a schedule's service account). An entry is NAME or

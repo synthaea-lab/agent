@@ -1,9 +1,10 @@
 # Synthaea
 
 > This repo is the Rust agent workspace. The control plane
-> ([synthaea-lab/edr-server](https://github.com/synthaea-lab/edr-server)), the ML pipeline
-> ([synthaea-lab/edr-ml](https://github.com/synthaea-lab/edr-ml)) and the detection content
-> ([synthaea-lab/edr-rules](https://github.com/synthaea-lab/edr-rules)) are separate public
+> ([synthaea-lab/server](https://github.com/synthaea-lab/server)), the ML pipeline
+> ([synthaea-lab/ml](https://github.com/synthaea-lab/ml)) and the detection content
+> ([synthaea-lab/rules](https://github.com/synthaea-lab/rules)) and the attack scenarios
+> ([synthaea-lab/scenarios](https://github.com/synthaea-lab/scenarios)) are separate public
 > repos. Contract tests that read one of them skip when it is not checked out next to this
 > repo (see [Sibling checkouts](#sibling-checkouts)).
 
@@ -125,10 +126,11 @@ directory:
 
 ```
 synthaea/
-  agent/   synthaea-lab/edr-agent (this repo)
-  server/  synthaea-lab/edr-server
-  ml/      synthaea-lab/edr-ml
-  rules/   synthaea-lab/edr-rules
+  agent/      synthaea-lab/agent (this repo)
+  server/     synthaea-lab/server
+  ml/         synthaea-lab/ml
+  rules/      synthaea-lab/rules
+  scenarios/  synthaea-lab/scenarios (attack scenarios, optional)
 ```
 
 Cross-repo contract tests (golden fixtures from `server/` and `ml/`, the shipped content

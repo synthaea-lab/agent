@@ -4,7 +4,7 @@
 //! `snapshots/common-set.bin` atomically and asks the sink to reload just that file.
 //!
 //! **Off unless a `snapshot` key is embedded** (`updater::key::SNAPSHOT_PUBLIC_KEY`): a build
-//! without the `test-key` feature has none until the custody decision of <https://github.com/synthaea-lab/edr-agent/issues/43> provisions one, so
+//! without the `test-key` feature has none until the custody decision of <https://github.com/synthaea-lab/agent/issues/43> provisions one, so
 //! the loop never starts there and nothing is fetched. A test-key build runs it in the lab.
 //!
 //! Failure posture, the rule directories': a manifest with a bad signature, a stale or
@@ -212,7 +212,7 @@ pub(crate) fn spawn_if_enabled(
 ) {
     if updater::key::SNAPSHOT_PUBLIC_KEY.is_none() {
         tracing::info!(
-            "snapshot fetch: off, this build embeds no snapshot key (ADR-0033; key custody: https://github.com/synthaea-lab/edr-agent/issues/43)"
+            "snapshot fetch: off, this build embeds no snapshot key (ADR-0033; key custody: https://github.com/synthaea-lab/agent/issues/43)"
         );
         return;
     }

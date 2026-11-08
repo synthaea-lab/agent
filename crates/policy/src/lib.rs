@@ -202,10 +202,10 @@ pub fn service_main_path_is_trusted(path: &str) -> bool {
 
 /// Whether an exec of `image_path` under a parent running `parent_image_path` is the
 /// process that holds one interactive login session: the per-connection process the
-/// `sshd` listener execs for each SSH login (<https://github.com/synthaea-lab/edr-agent/issues/50>). Killing it cuts the operator's
+/// `sshd` listener execs for each SSH login (<https://github.com/synthaea-lab/agent/issues/50>). Killing it cuts the operator's
 /// session; what an attacker runs lives in its children, which stay killable. Two
 /// shapes, depending on the OpenSSH version:
-/// - 9.8 and later: `sshd-session` exec'd by `sshd` (Alpine, where <https://github.com/synthaea-lab/edr-agent/issues/50> was seen).
+/// - 9.8 and later: `sshd-session` exec'd by `sshd` (Alpine, where <https://github.com/synthaea-lab/agent/issues/50> was seen).
 /// - before 9.8 (Debian 12, Ubuntu 22.04/24.04, Rocky 9): there is no
 ///   `sshd-session`; the listener re-execs its own binary (`sshd -R`), so the
 ///   pair is `sshd` exec'd by `sshd` (2026-11-08 lab run, OpenSSH 9.2: BAYES

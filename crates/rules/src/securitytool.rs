@@ -196,13 +196,13 @@ fn bracket_class(pattern: &[char], open: usize, c: char) -> Option<(bool, usize)
 }
 
 /// T1562.001 — a command that makes the kernel stop or freeze a listed security tool without a
-/// signal the probe can attribute (<https://github.com/synthaea-lab/edr-agent/issues/49>): `systemctl freeze <tool>` (the cgroup freezer) and
+/// signal the probe can attribute (<https://github.com/synthaea-lab/agent/issues/49>): `systemctl freeze <tool>` (the cgroup freezer) and
 /// `systemctl set-property <tool> MemoryMax=...|MemoryHigh=...|TasksMax=...` (a limit the memcg
 /// OOM killer then enforces with a `SEND_SIG_PRIV` `SIGKILL`, which the `signal_generate` probe
 /// drops). Every unit of a `freeze` is checked, not the first only, and a unit pattern
 /// (`systemctl freeze 'audit*'`) is matched against the listed units' names. Medium, like the stop
 /// verbs, and for the same reasons: it reads the command, an administrator can do the same,
-/// and an empty `argv` (<https://github.com/synthaea-lab/edr-agent/issues/48>) blinds it.
+/// and an empty `argv` (<https://github.com/synthaea-lab/agent/issues/48>) blinds it.
 ///
 /// Not covered, by choice (ADR-0046): the **ancestor slice** (`systemctl freeze system.slice`,
 /// `set-property system.slice MemoryMax=...`, a write to `system.slice/cgroup.freeze`), which
@@ -313,7 +313,7 @@ fn cgroup_unit_and_file(path: &str) -> Option<(&str, &str)> {
 /// T1562.001 — a write-intent open of `memory.max`, `memory.high`, `cgroup.freeze` or `pids.max`
 /// (or the cgroup v1 equivalents) in the cgroup of a listed unit: `echo 1M >
 /// /sys/fs/cgroup/system.slice/auditd.service/memory.max`. The kernel then OOM-kills or freezes
-/// the tool with no signal the probe reports (<https://github.com/synthaea-lab/edr-agent/issues/49>).
+/// the tool with no signal the probe reports (<https://github.com/synthaea-lab/agent/issues/49>).
 ///
 /// **The Linux probe does not deliver the canonical path yet**: `is_filtered_path` drops a path
 /// that *starts with* `/sys/`, so `/sys/fs/cgroup/...` never leaves the kernel, while a

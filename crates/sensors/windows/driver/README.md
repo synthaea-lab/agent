@@ -81,8 +81,8 @@ fltmc unload SynthaeaFilter
 ## Roadmap
 
 - Minifilter: file deletes/renames (ransomware signal), named pipes, quarantine (#136)
-- Kernel callbacks: process/thread/image notify, handle access (https://github.com/synthaea-lab/edr-agent/issues/32)
-- ELAM + PPL: Threat-Intelligence ETW provider and agent self-protection (https://github.com/synthaea-lab/edr-agent/issues/27,
+- Kernel callbacks: process/thread/image notify, handle access (https://github.com/synthaea-lab/agent/issues/32)
+- ELAM + PPL: Threat-Intelligence ETW provider and agent self-protection (https://github.com/synthaea-lab/agent/issues/27,
   gated on Microsoft Virus Initiative membership)
 
 ## License

@@ -136,7 +136,7 @@ struct RecentWrite {
 }
 
 /// `check_quarantined_exec`'s tags: the plain join, and the one a mail client's
-/// mark gets (<https://github.com/synthaea-lab/edr-agent/issues/17>).
+/// mark gets (<https://github.com/synthaea-lab/agent/issues/17>).
 const USER_EXECUTION_TECHNIQUE: &str = "T1204.002";
 const MAIL_ATTACHMENT_TECHNIQUE: &str = "T1566.001/T1204.002";
 
@@ -381,7 +381,7 @@ pub struct RuleState {
     /// (`local_addr`, `local_port`, `protocol`) → seen, for LISTENER-DRIFT (issue
     /// #92, T1571). `protocol` is the IP protocol number, same convention as
     /// [`schema::ListenPortEvent::protocol`] — a UDP listener and a TCP listener
-    /// on the same port are different shapes, not a collision (<https://github.com/synthaea-lab/edr-agent/issues/40>): without
+    /// on the same port are different shapes, not a collision (<https://github.com/synthaea-lab/agent/issues/40>): without
     /// it, a new UDP listener on a port already baselined as TCP (or vice versa)
     /// would be silently treated as already seen. [`Self::seed_listen_ports`]
     /// pre-fills this from one startup snapshot so every service already listening
@@ -443,7 +443,7 @@ pub struct RuleState {
     /// LRU-bounded like every other counter: a spray across many fabricated
     /// usernames must not grow this without limit.
     auth_failures: BoundedMap<(String, String), SlidingCounter>,
-    /// The accounts seen logging on, for FIRST-SEEN-LOGON (T1078, <https://github.com/synthaea-lab/edr-agent/issues/17>). LRU-bounded.
+    /// The accounts seen logging on, for FIRST-SEEN-LOGON (T1078, <https://github.com/synthaea-lab/agent/issues/17>). LRU-bounded.
     logon_baseline: LogonBaseline,
     /// ODD-HOUR-LOGON's clock and quiet period; off until [`Self::set_local_utc_offset_minutes`].
     odd_hours: crate::logon::OddHours,
@@ -461,12 +461,12 @@ pub struct RuleState {
     /// counter.
     credential_reads: BoundedMap<(u32, CredFile), SlidingCounter>,
     /// (caller pid, process generation, granted) → the last alert, for LSASS-ACCESS
-    /// (T1003.001, <https://github.com/synthaea-lab/edr-agent/issues/45>): one alert per outcome per window, whatever masks the caller tries;
+    /// (T1003.001, <https://github.com/synthaea-lab/agent/issues/45>): one alert per outcome per window, whatever masks the caller tries;
     /// the generation keeps a new process on a recycled pid from inheriting the window.
     /// LRU-bounded like every other counter.
     lsass_access: BoundedMap<(u32, Option<u64>, bool), SlidingCounter>,
     /// (creator pid, process generation) → the last alert, for LSASS-REMOTE-THREAD (T1055,
-    /// <https://github.com/synthaea-lab/edr-agent/issues/45>): one alert per injector per window. LRU-bounded like every other counter.
+    /// <https://github.com/synthaea-lab/agent/issues/45>): one alert per injector per window. LRU-bounded like every other counter.
     lsass_threads: BoundedMap<(u32, Option<u64>), SlidingCounter>,
     /// pid → sliding counter for RANSOMWARE-RENAME (T1486, issue #262): renames by
     /// this pid where `new_path` is `old_path` plus an appended suffix. LRU-bounded:
@@ -1982,7 +1982,7 @@ impl RuleState {
     /// second poll to see the same listener is expected (a poll-based source re-reports
     /// it every cycle while it stays open, same reasoning as
     /// [`Self::check_beacon_flow`]'s dedup), not a second finding — and a TCP and a UDP
-    /// listener sharing a port (<https://github.com/synthaea-lab/edr-agent/issues/40>) are different listeners, not one.
+    /// listener sharing a port (<https://github.com/synthaea-lab/agent/issues/40>) are different listeners, not one.
     ///
     /// No name/path exclusion list yet — unlike BEACON's `BROWSERS`/
     /// `STANDARD_PORTS`, there is no lab capture here to calibrate one honestly
@@ -2211,7 +2211,7 @@ impl RuleState {
         alerts
     }
 
-    /// FIRST-SEEN-LOGON (T1078, <https://github.com/synthaea-lab/edr-agent/issues/17>) — a successful logon ([`AuthKind::Logon`], never a
+    /// FIRST-SEEN-LOGON (T1078, <https://github.com/synthaea-lab/agent/issues/17>) — a successful logon ([`AuthKind::Logon`], never a
     /// failure, never `su`/`sudo`'s [`AuthKind::ExplicitCredentials`] or
     /// [`AuthKind::PrivilegedSession`]) of an account that did not log on to this host during
     /// the first [`LOGON_LEARNING_NS`](crate::exclusions::LOGON_LEARNING_NS) after the first
@@ -2267,14 +2267,14 @@ impl RuleState {
     }
 
     /// Declares the local hours `[start, end)` in which a logon is ordinary for ODD-HOUR-LOGON
-    /// (<https://github.com/synthaea-lab/edr-agent/issues/64>); `start > end` wraps midnight (`22, 6`, a night shift). False, and the window
+    /// (<https://github.com/synthaea-lab/agent/issues/64>); `start > end` wraps midnight (`22, 6`, a night shift). False, and the window
     /// keeps what it had, unless `start` is 0 to 23, `end` 1 to 24 and they differ. The default is
     /// [`WORK_HOURS_LOCAL`](crate::exclusions::WORK_HOURS_LOCAL).
     pub fn set_work_hours(&mut self, start: u32, end: u32) -> bool {
         self.odd_hours.set_work_hours(start, end)
     }
 
-    /// Declares the accounts whose odd-hour logons are expected (<https://github.com/synthaea-lab/edr-agent/issues/64>): on-call staff, a
+    /// Declares the accounts whose odd-hour logons are expected (<https://github.com/synthaea-lab/agent/issues/64>): on-call staff, a
     /// schedule's service or batch account. ODD-HOUR-LOGON skips them; FIRST-SEEN-LOGON does not.
     /// An entry is `NAME` or `NAME|SID` (see `OddHours::set_exempt_accounts`); at most 64 are
     /// kept, a blank, over-long or malformed one is dropped, and the number kept is returned.
@@ -2283,7 +2283,7 @@ impl RuleState {
         self.odd_hours.set_exempt_accounts(accounts)
     }
 
-    /// Odd-hour logons the exempt list has suppressed since the agent started (<https://github.com/synthaea-lab/edr-agent/issues/64>); read by the
+    /// Odd-hour logons the exempt list has suppressed since the agent started (<https://github.com/synthaea-lab/agent/issues/64>); read by the
     /// tests, and visible in production through the `skips` field of the info line of `OddHours`.
     #[cfg(test)]
     #[must_use]
@@ -2291,7 +2291,7 @@ impl RuleState {
         self.odd_hours.exempt_skips()
     }
 
-    /// Gives the rules the host's platform time zone (<https://github.com/synthaea-lab/edr-agent/issues/15>): `zone` maps an instant (seconds
+    /// Gives the rules the host's platform time zone (<https://github.com/synthaea-lab/agent/issues/15>): `zone` maps an instant (seconds
     /// since the Unix epoch) to minutes east of UTC at that instant, so a logon either side of a
     /// daylight-saving change is judged by the hour the host's clock showed. Turns ODD-HOUR-LOGON
     /// on. A fixed offset from [`Self::set_local_utc_offset_minutes`] overrides it whichever is
@@ -2300,7 +2300,7 @@ impl RuleState {
         self.odd_hours.set_zone(zone, now_secs)
     }
 
-    /// ODD-HOUR-LOGON (T1078, <https://github.com/synthaea-lab/edr-agent/issues/17>): a successful [`AuthKind::Logon`] of a non-generic
+    /// ODD-HOUR-LOGON (T1078, <https://github.com/synthaea-lab/agent/issues/17>): a successful [`AuthKind::Logon`] of a non-generic
     /// account whose host-local hour is outside the working hours: [`WORK_HOURS_LOCAL`](crate::exclusions::WORK_HOURS_LOCAL)
     /// unless the operator declared another window ([`Self::set_work_hours`]).
     /// Low, once per account per [`ODD_HOUR_QUIET_NS`](crate::exclusions::ODD_HOUR_QUIET_NS).
@@ -2743,8 +2743,8 @@ impl RuleState {
         );
     }
 
-    /// To be called for every `ProcessAccessEvent` in the stream (Windows, <https://github.com/synthaea-lab/edr-agent/issues/41>): LSASS-ACCESS
-    /// (T1003.001, <https://github.com/synthaea-lab/edr-agent/issues/45>), see [`crate::lsass`]. The caller's expected-reader exclusion reads
+    /// To be called for every `ProcessAccessEvent` in the stream (Windows, <https://github.com/synthaea-lab/agent/issues/41>): LSASS-ACCESS
+    /// (T1003.001, <https://github.com/synthaea-lab/agent/issues/45>), see [`crate::lsass`]. The caller's expected-reader exclusion reads
     /// its full image (exec-time, else the event's `caller_image_path`), never `comm`. One
     /// alert per (caller pid, process generation, outcome) per
     /// [`LSASS_ACCESS_ALERT_WINDOW_NS`].
@@ -2773,8 +2773,8 @@ impl RuleState {
         vec![alert]
     }
 
-    /// To be called for every `RemoteThreadEvent` in the stream (Windows, <https://github.com/synthaea-lab/edr-agent/issues/41>):
-    /// LSASS-REMOTE-THREAD (T1055, <https://github.com/synthaea-lab/edr-agent/issues/45>), see [`crate::lsass`]. Other remote threads stay
+    /// To be called for every `RemoteThreadEvent` in the stream (Windows, <https://github.com/synthaea-lab/agent/issues/41>):
+    /// LSASS-REMOTE-THREAD (T1055, <https://github.com/synthaea-lab/agent/issues/45>), see [`crate::lsass`]. Other remote threads stay
     /// telemetry until calibrated. One alert per (creator pid, process generation) per
     /// [`LSASS_THREAD_ALERT_WINDOW_NS`].
     pub fn on_remote_thread(&mut self, event: &schema::RemoteThreadEvent) -> Vec<Alert> {
@@ -3683,7 +3683,7 @@ fn is_all_digits(s: &str) -> bool {
 }
 
 /// `event.protocol`'s IP protocol number, as a word for the LISTENER-DRIFT alert
-/// (<https://github.com/synthaea-lab/edr-agent/issues/40>) — `tcp`/`udp` for the two values every snapshot source reports
+/// (<https://github.com/synthaea-lab/agent/issues/40>) — `tcp`/`udp` for the two values every snapshot source reports
 /// today, the bare number for anything else rather than guessing a name.
 fn protocol_label(protocol: u8) -> std::borrow::Cow<'static, str> {
     match protocol {

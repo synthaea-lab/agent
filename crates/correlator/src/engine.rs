@@ -147,7 +147,7 @@ pub struct CorrelationEngine {
     service_mains: BoundedMap<u32, Option<u64>>,
     /// Pids whose `ExecEvent` showed a login-session image exec'd by its listener
     /// (`sshd-session` under `sshd`, or `sshd` re-exec'd under `sshd` before OpenSSH
-    /// 9.8, see `policy::is_login_session`, <https://github.com/synthaea-lab/edr-agent/issues/50>). Same
+    /// 9.8, see `policy::is_login_session`, <https://github.com/synthaea-lab/agent/issues/50>). Same
     /// lifecycle and same single reader (the kill gate) as `service_mains`.
     login_sessions: BoundedMap<u32, Option<u64>>,
 }
@@ -161,7 +161,7 @@ pub enum KillShield {
     ServiceMain,
     /// The process holding an interactive login session (`sshd-session` exec'd by
     /// `sshd`, or `sshd` re-exec'd by `sshd` before OpenSSH 9.8,
-    /// `policy::is_login_session`): killing it cuts the operator's session (<https://github.com/synthaea-lab/edr-agent/issues/50>).
+    /// `policy::is_login_session`): killing it cuts the operator's session (<https://github.com/synthaea-lab/agent/issues/50>).
     /// Its children are not shielded.
     LoginSession,
 }
@@ -532,7 +532,7 @@ impl CorrelationEngine {
 
     /// What, if anything, shields `pid` from a kill on a Bayesian crossing alone: a
     /// service main ([`Self::is_service_main_process`]) or the process holding a login
-    /// session (<https://github.com/synthaea-lab/edr-agent/issues/50>). Same provenance-not-evidence rule as the service main: never
+    /// session (<https://github.com/synthaea-lab/agent/issues/50>). Same provenance-not-evidence rule as the service main: never
     /// seen, or seen with an image that does not qualify, means no shield.
     #[must_use]
     pub fn kill_shield(&self, pid: u32, generation: Option<u64>) -> Option<KillShield> {

@@ -41,7 +41,7 @@ use sensor_linux_wire::{
 /// needs per-byte loops over MAX_PATH_LEN, which blow the verifier's 1M-instruction
 /// budget on pre-6.6 kernels (5.15, 6.1).
 ///
-/// 512 KiB since a record carries the argv bytes it read (<https://github.com/synthaea-lab/edr-agent/issues/48>, ADR-0045): a record is the
+/// 512 KiB since a record carries the argv bytes it read (<https://github.com/synthaea-lab/agent/issues/48>, ADR-0045): a record is the
 /// fixed `ExecEvent` plus its command line, so this holds about as many as 256 KiB of fixed
 /// records did.
 #[map]
@@ -51,7 +51,7 @@ static EXEC_EVENTS: RingBuf = RingBuf::with_byte_size(512 * 1024, 0);
 #[map]
 static EXEC_SCRATCH: PerCpuArray<ExecRecord> = PerCpuArray::with_max_entries(1, 0);
 
-// argv at exec (https://github.com/synthaea-lab/edr-agent/issues/48). Userspace sets these from the kernel's BTF (`btf.rs`,
+// argv at exec (https://github.com/synthaea-lab/agent/issues/48). Userspace sets these from the kernel's BTF (`btf.rs`,
 // `ExecArgvOffsets`) and `EXEC_ARGV_ENABLED` only when all three were found; left at zero
 // the probe reads no argv and userspace falls back to `/proc/<pid>/cmdline`.
 #[unsafe(no_mangle)]
@@ -63,7 +63,7 @@ static MM_ARG_START_OFFSET: Global<u32> = Global::new(0);
 #[unsafe(no_mangle)]
 static MM_ARG_END_OFFSET: Global<u32> = Global::new(0);
 
-/// Reads the current task's argument block into `rec.argv` (<https://github.com/synthaea-lab/edr-agent/issues/48>, ADR-0045): all of it when it
+/// Reads the current task's argument block into `rec.argv` (<https://github.com/synthaea-lab/agent/issues/48>, ADR-0045): all of it when it
 /// fits in `ARGV_WINDOW_BYTES`, else the first `ARGV_HEAD_BYTES` and the last `ARGV_TAIL_BYTES`.
 /// At `sched_process_exec` the new `mm` is installed and `execve` has just copied the strings
 /// onto the new stack, so `arg_start..arg_end` is this exec's argv. A failed head read leaves
@@ -171,7 +171,7 @@ pub(crate) fn record_sched_process_exec(pid: u32, filename_ptr: *const u8) -> u3
     // field in a reserved ring-buffer slot (that needs per-byte loops over
     // MAX_PATH_LEN, which blow the verifier's 1M-instruction budget on pre-6.6
     // kernels). One `output` copy emits it. argv is read here at exec time through
-    // BTF-derived offsets (https://github.com/synthaea-lab/edr-agent/issues/48); without them userspace reads `/proc/<pid>/cmdline`.
+    // BTF-derived offsets (https://github.com/synthaea-lab/agent/issues/48); without them userspace reads `/proc/<pid>/cmdline`.
     let Some(rec) = EXEC_SCRATCH.get_ptr_mut(0) else {
         return 1;
     };

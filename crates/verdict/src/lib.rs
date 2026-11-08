@@ -19,7 +19,7 @@
 //! Scope for this pass: per-entity severity/score composition across sources,
 //! same-technique-across-engines dedup within a window, and an explicit
 //! suppression list above the per-engine dated FP exclusions. Deliberately
-//! **not** here: ML/T2 input (<https://github.com/synthaea-lab/edr-ml/issues/3> has no trained scorer yet), response's
+//! **not** here: ML/T2 input (<https://github.com/synthaea-lab/ml/issues/3> has no trained scorer yet), response's
 //! own kill/quarantine decision logic (unchanged — it now reads a better
 //! signal, but still decides the same way), and any inline-blocking/enforcement
 //! wiring (future issues).
@@ -137,7 +137,7 @@ pub struct Verdict {
     /// any source carried one. Simple max composition, not a weighted blend: a
     /// well-calibrated high-confidence engine must not be diluted by folding in
     /// an uncalibrated weak one. A principled weighted composition needs
-    /// calibration work of its own — tracked against <https://github.com/synthaea-lab/edr-ml/issues/3>'s T2 scorer,
+    /// calibration work of its own — tracked against <https://github.com/synthaea-lab/ml/issues/3>'s T2 scorer,
     /// out of scope here.
     pub score: Option<f64>,
     /// Every distinct technique folded into this entity so far, oldest first.

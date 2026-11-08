@@ -1,4 +1,4 @@
-//! The host's own time zone, as the platform's conversion gives it (<https://github.com/synthaea-lab/edr-agent/issues/15>): the offset from UTC
+//! The host's own time zone, as the platform's conversion gives it (<https://github.com/synthaea-lab/agent/issues/15>): the offset from UTC
 //! at a given instant, daylight saving included, so ODD-HOUR-LOGON judges a logon by the hour
 //! the host's clock showed.
 //!

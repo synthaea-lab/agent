@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 /// pid → full image path, process sequence number (#725) and server silo
-/// (<https://github.com/synthaea-lab/edr-agent/issues/39>), never larger than its cap. Explicit [`Self::remove`] on
+/// (<https://github.com/synthaea-lab/agent/issues/39>), never larger than its cap. Explicit [`Self::remove`] on
 /// `ProcessEnd` is the correctness path (PID recycling); LRU eviction is only the
 /// backstop for when that removal never arrives, and is counted so the loss is
 /// observable rather than silent.

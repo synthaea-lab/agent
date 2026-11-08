@@ -12,7 +12,7 @@
 
 mod dns_udp;
 pub mod normalize;
-// Read by nothing yet: the capture that feeds it is the next part of https://github.com/synthaea-lab/edr-agent/issues/22.
+// Read by nothing yet: the capture that feeds it is the next part of https://github.com/synthaea-lab/agent/issues/22.
 #[cfg_attr(not(test), allow(dead_code))]
 mod tls_client_hello;
 

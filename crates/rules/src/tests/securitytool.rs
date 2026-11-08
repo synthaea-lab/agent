@@ -137,7 +137,7 @@ fn the_burst_rule_and_this_one_are_independent() {
     assert!(techniques.contains(&"T1489"), "{techniques:?}");
 }
 
-// ---- Kernel-mediated stops (https://github.com/synthaea-lab/edr-agent/issues/49) ----
+// ---- Kernel-mediated stops (https://github.com/synthaea-lab/agent/issues/49) ----
 
 fn throttle_alerts(command: &str) -> Vec<crate::Alert> {
     stops(command)
@@ -188,7 +188,7 @@ fn a_freeze_naming_several_units_alerts_when_any_is_a_listed_tool() {
 
 #[test]
 fn a_freeze_by_unit_pattern_alerts_when_it_matches_a_listed_tool() {
-    // Codex review of edr-agent#12: `systemctl freeze PATTERN...` globs the loaded unit names,
+    // Codex review of agent#12: `systemctl freeze PATTERN...` globs the loaded unit names,
     // and the literal pattern was compared with the list.
     for (command, tool) in [
         ("systemctl freeze audit*", "auditd"),

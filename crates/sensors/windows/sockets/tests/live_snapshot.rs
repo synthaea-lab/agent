@@ -132,7 +132,7 @@ fn own_tcp_listener_is_still_distinguished_from_udp() {
 #[test]
 fn an_ephemeral_udp_socket_is_left_out_of_the_drift_snapshot_but_its_tcp_twin_is_not() {
     // The OS hands a `:0` bind a port from the dynamic range, the way a client
-    // socket gets one, so the UDP side is what the https://github.com/synthaea-lab/edr-agent/issues/40 filter must drop.
+    // socket gets one, so the UDP side is what the https://github.com/synthaea-lab/agent/issues/40 filter must drop.
     let (listener, socket, addr) = tcp_and_udp_on_one_port();
     assert!(
         EPHEMERAL_UDP_PORTS.contains(&addr.port()),

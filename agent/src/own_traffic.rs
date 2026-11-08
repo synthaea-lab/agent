@@ -1,4 +1,4 @@
-//! Which IOC address and domain matches are the agent's own control-plane traffic (<https://github.com/synthaea-lab/edr-agent/issues/47>).
+//! Which IOC address and domain matches are the agent's own control-plane traffic (<https://github.com/synthaea-lab/agent/issues/47>).
 //!
 //! A feed that lists the control plane's address (shared hosting, a CDN it sits behind) made
 //! the agent alert on its own fetch and upload, and that finding started the indicator's

@@ -108,7 +108,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: synthaea-lab/edr-server
+          repository: synthaea-lab/server
           ref: main
           path: server
           persist-credentials: false
@@ -117,14 +117,14 @@ jobs:
             tests/fixtures
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: synthaea-lab/edr-ml
+          repository: synthaea-lab/ml
           ref: main
           path: ml
           persist-credentials: false
           sparse-checkout: tests/fixtures
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: synthaea-lab/edr-rules
+          repository: synthaea-lab/rules
           ref: main
           path: rules
           persist-credentials: false
@@ -185,7 +185,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: synthaea-lab/edr-rules
+          repository: synthaea-lab/rules
           ref: main
           path: rules
           persist-credentials: false

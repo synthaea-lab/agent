@@ -64,7 +64,7 @@ fn seeded_rule_state() -> rules::RuleState {
     // baseline, not a finding. Best-effort — a snapshot failure leaves the
     // baseline empty rather than failing startup.
     //
-    // TCP listeners and UDP sockets on a fixed port (https://github.com/synthaea-lab/edr-agent/issues/40): the UDP client
+    // TCP listeners and UDP sockets on a fixed port (https://github.com/synthaea-lab/agent/issues/40): the UDP client
     // sockets on ephemeral ports are left out by the sensor, the same filter
     // the poller reads through, so the baseline and the polls agree.
     match sensor_windows_sockets::snapshot_for_drift() {

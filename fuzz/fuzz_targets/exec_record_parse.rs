@@ -1,4 +1,4 @@
-//! Coverage-guided fuzzing for the variable-length exec record (<https://github.com/synthaea-lab/edr-agent/issues/48>, ADR-0045): the lengths
+//! Coverage-guided fuzzing for the variable-length exec record (<https://github.com/synthaea-lab/agent/issues/48>, ADR-0045): the lengths
 //! it carries describe bytes a process chose. Same contract as the deterministic suite in
 //! `crates/sensors/linux/wire/tests/exec_record.rs`: an `Err` is fine, a panic is a bug, and an
 //! accepted record never reaches past its end.

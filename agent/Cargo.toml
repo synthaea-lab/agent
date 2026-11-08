@@ -58,7 +58,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 getrandom = "0.4"
 
-# `commands::localzone` asks the platform for the host's time zone (https://github.com/synthaea-lab/edr-agent/issues/15): platform code stays
+# `commands::localzone` asks the platform for the host's time zone (https://github.com/synthaea-lab/agent/issues/15): platform code stays
 # in the binary, not in the detection crates.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

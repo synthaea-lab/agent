@@ -12,7 +12,9 @@ never copied.
 
 This repo is the agent workspace. The public repos that test against each other are
 cloned side by side in one directory as sibling checkouts: `agent/` (this repo,
-synthaea-lab/edr-agent), `server/` (edr-server), `ml/` (edr-ml), `rules/` (edr-rules).
+synthaea-lab/agent), `server/` (synthaea-lab/server), `ml/` (synthaea-lab/ml),
+`rules/` (synthaea-lab/rules), and `scenarios/` (synthaea-lab/scenarios, the attack
+scenarios).
 This repo must never depend on anything outside those public repos. The ONNX Runtime
 and build-machine toolchain scripts live here under `toolchain/`.
 

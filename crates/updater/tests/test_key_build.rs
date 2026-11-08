@@ -1,4 +1,4 @@
-//! The lab variant of the trust set (ADR-0027, <https://github.com/synthaea-lab/edr-agent/issues/43>), seen without `cfg(test)`: what a build
+//! The lab variant of the trust set (ADR-0027, <https://github.com/synthaea-lab/agent/issues/43>), seen without `cfg(test)`: what a build
 //! with the `test-key` feature really embeds. The counterpart of `unprovisioned_build.rs`, and
 //! what replaces a unit test that asserted the flag under `cfg(test)`, where it is always true.
 #![cfg(feature = "test-key")]

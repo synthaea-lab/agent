@@ -320,4 +320,4 @@ packaging/linux/
 
 ---
 
-For questions or issues, file a GitHub issue at https://github.com/synthaea-lab/edr-agent/issues
+For questions or issues, file a GitHub issue at https://github.com/synthaea-lab/agent/issues

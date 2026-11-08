@@ -1175,7 +1175,7 @@ fn listen_port_two_distinct_new_ports_each_alert() {
 
 #[test]
 fn listen_port_udp_on_a_tcp_baselined_port_still_alerts() {
-    // https://github.com/synthaea-lab/edr-agent/issues/40: udp/53 and tcp/53 are two different services sharing a port
+    // https://github.com/synthaea-lab/agent/issues/40: udp/53 and tcp/53 are two different services sharing a port
     // number, not one shape — a UDP listener must not look already-seen just
     // because the same (addr, port) was baselined as TCP.
     let mut state = RuleState::new();

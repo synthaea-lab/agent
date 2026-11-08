@@ -7,7 +7,7 @@
 //! nothing says "this process is now accepting connections on port N".
 //!
 //! Mechanism: `GetExtendedTcpTable` with `TCP_TABLE_OWNER_PID_LISTENER`, and
-//! `GetExtendedUdpTable` with `UDP_TABLE_OWNER_PID` (<https://github.com/synthaea-lab/edr-agent/issues/40> — UDP has no
+//! `GetExtendedUdpTable` with `UDP_TABLE_OWNER_PID` (<https://github.com/synthaea-lab/agent/issues/40> — UDP has no
 //! "listener" filter, so every bound endpoint comes back; the agent's path
 //! drops the ones on an ephemeral port, see [`is_drift_relevant`]),
 //! each once for IPv4 and once for IPv6, joined to one `Toolhelp32`

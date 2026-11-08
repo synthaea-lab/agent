@@ -321,11 +321,11 @@ pub mod time;
 /// the timestomp slice above — it merged first and took the 57 #995 was planning
 /// on, without #995 having pushed its own renumbering commit yet.
 ///
-/// Bumped 57 → 58 for [`ListenPortEvent::protocol`] (<https://github.com/synthaea-lab/edr-agent/issues/40> part 1): #136 slice 4
+/// Bumped 57 → 58 for [`ListenPortEvent::protocol`] (<https://github.com/synthaea-lab/agent/issues/40> part 1): #136 slice 4
 /// merged first and took 57, which this had also claimed; 58 is the next free
 /// number above it.
 ///
-/// Not bumped for the Windows UDP collector (<https://github.com/synthaea-lab/edr-agent/issues/40> part 2, stacked on #995): no
+/// Not bumped for the Windows UDP collector (<https://github.com/synthaea-lab/agent/issues/40> part 2, stacked on #995): no
 /// wire change — #995 already defined `ListenPortEvent::protocol`; this PR only
 /// fills it with the real value (6 or 17) instead of #995's TCP-only `6` (review
 /// of #1008).
@@ -340,7 +340,7 @@ pub mod time;
 ///
 /// Bumped 62 → 65 for [`ExecEvent::cmdline_truncated`] (#1112): a sensor now
 /// bounds argv at capture and flags the cut. First claimed 61 while #1114 held 60;
-/// #1085 landed first with 62, #1114 renumbered to 63 and <https://github.com/synthaea-lab/edr-agent/issues/41> (#1150) claims 64,
+/// #1085 landed first with 62, #1114 renumbered to 63 and <https://github.com/synthaea-lab/agent/issues/41> (#1150) claims 64,
 /// so this takes 65. Whichever of those merges later renumbers, same coordination
 /// note as above.
 ///
@@ -349,17 +349,17 @@ pub mod time;
 /// and for [`SignalEvent::signals_lost`], the report of signals the sensor had no room for.
 /// First claimed 60, then 63; #1116 took 65, so this takes 66.
 ///
-/// Bumped 66 → 67 for [`Event::RemoteThread`] and [`Event::ProcessAccess`] (<https://github.com/synthaea-lab/edr-agent/issues/41>): a thread
+/// Bumped 66 → 67 for [`Event::RemoteThread`] and [`Event::ProcessAccess`] (<https://github.com/synthaea-lab/agent/issues/41>): a thread
 /// created in another process and a memory-reading open of LSASS, from the driver-free ETW
 /// providers ADR-0026's lab capture (#715) confirmed, as the native equivalents of Sysmon 8
 /// and 10. Windows only. [`ProcessAccessEvent::caller_image_path`] carries the caller's
-/// full image, for the LSASS rule's expected readers (<https://github.com/synthaea-lab/edr-agent/issues/45>). First claimed 63, then 64; #1112 and #1103 merged first and took 65
+/// full image, for the LSASS rule's expected readers (<https://github.com/synthaea-lab/agent/issues/45>). First claimed 63, then 64; #1112 and #1103 merged first and took 65
 /// and 66, so this takes 67.
 ///
-/// Bumped 67 → 68 for [`ExecEvent::argv_omitted_bytes`] (<https://github.com/synthaea-lab/edr-agent/issues/48>, ADR-0045): the
+/// Bumped 67 → 68 for [`ExecEvent::argv_omitted_bytes`] (<https://github.com/synthaea-lab/agent/issues/48>, ADR-0045): the
 /// Linux exec probe reads a head and a tail window of the argument block and says
 /// how much of it lies between them. First claimed 67;
-/// <https://github.com/synthaea-lab/edr-agent/issues/41> merged first and took it, so this takes 68.
+/// <https://github.com/synthaea-lab/agent/issues/41> merged first and took it, so this takes 68.
 pub const SCHEMA_VERSION: u32 = 68;
 
 /// Bytes of argv, one separator per token included, a sensor keeps for one exec
@@ -661,7 +661,7 @@ pub struct EventMeta {
     /// Container the emitting process runs in, when the sensor can attribute one.
     /// `None` on macOS, on bare-metal/VM Linux processes, and on Windows host
     /// processes (Windows attributes process-isolated containers only, from the
-    /// ETW sensor, <https://github.com/synthaea-lab/edr-agent/issues/39>) — this is not a Kubernetes pod/namespace context (out of
+    /// ETW sensor, <https://github.com/synthaea-lab/agent/issues/39>) — this is not a Kubernetes pod/namespace context (out of
     /// scope, issue #80), just the container runtime's own identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<ContainerContext>,
@@ -684,7 +684,7 @@ pub struct EventMeta {
 }
 
 /// Identity of the container a process runs in, resolved from its cgroup on Linux
-/// (issue #80) and from its server silo on Windows (<https://github.com/synthaea-lab/edr-agent/issues/39>).
+/// (issue #80) and from its server silo on Windows (<https://github.com/synthaea-lab/agent/issues/39>).
 ///
 /// `id` is the only field a sensor can fill today (cgroup path parsing alone on
 /// Linux, the Host Compute Service on Windows; no daemon call). `image`/`name` need a cached lookup against the Docker/containerd
@@ -734,7 +734,7 @@ pub struct ExecEvent {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cmdline_truncated: bool,
     /// How many bytes of the argument block the sensor did not capture (ADR-0045,
-    /// <https://github.com/synthaea-lab/edr-agent/issues/48>): `Some(0)` when it captured the whole block, `Some(n)` when `n` bytes
+    /// <https://github.com/synthaea-lab/agent/issues/48>): `Some(0)` when it captured the whole block, `Some(n)` when `n` bytes
     /// between a head and a tail window were not read, `None` when unknown (the
     /// sensor saw nothing to measure against, or a cut whose size it did not
     /// measure). A rule must never read `None` as "complete".
@@ -1642,7 +1642,7 @@ pub struct ImageLoadEvent {
     pub image_path: String,
 }
 
-/// A thread created in another process (<https://github.com/synthaea-lab/edr-agent/issues/41>): the native equivalent of Sysmon event 8
+/// A thread created in another process (<https://github.com/synthaea-lab/agent/issues/41>): the native equivalent of Sysmon event 8
 /// (`CreateRemoteThread`), the classic injection primitive (T1055).
 ///
 /// On Windows: a Microsoft-Windows-Kernel-Process `ThreadStart` (EID 3) whose creating
@@ -1673,7 +1673,7 @@ pub struct RemoteThreadEvent {
     pub start_address: u64,
 }
 
-/// One process opening another for access (<https://github.com/synthaea-lab/edr-agent/issues/41>): the native equivalent of Sysmon event 10
+/// One process opening another for access (<https://github.com/synthaea-lab/agent/issues/41>): the native equivalent of Sysmon event 10
 /// (`ProcessAccess`).
 ///
 /// On Windows: a Microsoft-Windows-Kernel-Audit-API-Calls `PsOpenProcess` (EID 5), whose
@@ -1688,7 +1688,7 @@ pub struct RemoteThreadEvent {
 pub struct ProcessAccessEvent {
     pub meta: EventMeta,
     /// The caller's full image path, when the sensor could resolve it: the evidence an
-    /// expected-reader exclusion decides on (<https://github.com/synthaea-lab/edr-agent/issues/45>), since `meta.comm` is only its file
+    /// expected-reader exclusion decides on (<https://github.com/synthaea-lab/agent/issues/45>), since `meta.comm` is only its file
     /// name, which a renamed tool chooses. `None` when unresolved; never a bare name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_image_path: Option<String>,
@@ -1864,7 +1864,7 @@ pub struct UdpRecvEvent {
 /// [`ListenPortEvent::protocol`]/[`NetworkFlowEvent::protocol`] callers across the
 /// agent and sensor crates stamp and compare the same value instead of each
 /// carrying its own `6` literal, where a typo would make a baseline key that
-/// silently never matches (<https://github.com/synthaea-lab/edr-agent/issues/40> review).
+/// silently never matches (<https://github.com/synthaea-lab/agent/issues/40> review).
 pub const IPPROTO_TCP: u8 = 6;
 
 /// IP protocol number for UDP, the `IPPROTO_UDP` of `<netinet/in.h>` — see
@@ -1884,7 +1884,7 @@ pub const IPPROTO_UDP: u8 = 17;
 /// last poll), not any single event in isolation.
 ///
 /// `protocol` is the IP protocol number, same convention as [`NetworkFlowEvent::protocol`]
-/// (`IPPROTO_TCP` = 6, `IPPROTO_UDP` = 17, <https://github.com/synthaea-lab/edr-agent/issues/40>), and is part of every consumer's
+/// (`IPPROTO_TCP` = 6, `IPPROTO_UDP` = 17, <https://github.com/synthaea-lab/agent/issues/40>), and is part of every consumer's
 /// dedup/baseline key: a UDP listener and a TCP listener on the same port are different
 /// shapes, not a collision — `udp/53` and `tcp/53` are two different services with no
 /// reason to share a baseline entry.
@@ -1895,7 +1895,7 @@ pub struct ListenPortEvent {
     pub local_port: u16,
     /// Defaults to `IPPROTO_TCP` on a record that predates this field (spooled
     /// events, server storage, the ML corpus): every collector was TCP-only
-    /// before <https://github.com/synthaea-lab/edr-agent/issues/40>, so that's what an un-stamped record actually was.
+    /// before <https://github.com/synthaea-lab/agent/issues/40>, so that's what an un-stamped record actually was.
     #[serde(default = "default_listen_port_protocol")]
     pub protocol: u8,
 }
@@ -2108,7 +2108,7 @@ pub struct HealthBeacon {
     #[serde(default)]
     pub ioc_cooled_down: u64,
     /// Cumulative IOC matches skipped as the agent's own traffic to its control plane, made by
-    /// the agent process itself (<https://github.com/synthaea-lab/edr-agent/issues/47>): a non-zero count is a feed that lists the control
+    /// the agent process itself (<https://github.com/synthaea-lab/agent/issues/47>): a non-zero count is a feed that lists the control
     /// plane. Zero in an older beacon.
     #[serde(default)]
     pub ioc_own_skipped: u64,

@@ -47,7 +47,7 @@ cargo test -p updater --no-default-features
 step "cargo deny (licenses, advisories, bans, sources)"
 cargo deny check
 
-# ML robustness check — only runs if the `ml` sibling (synthaea-lab/edr-ml,
+# ML robustness check — only runs if the `ml` sibling (synthaea-lab/ml,
 # checked out as ../ml or $SYNTHAEA_ROOT/ml) is present and has a latest model.
 # Verifies escape rate and degradation metrics stay within thresholds.
 ML_DIR="${SYNTHAEA_ROOT:-..}/ml"

@@ -1,4 +1,4 @@
-//! The production variant of the trust set (ADR-0027, <https://github.com/synthaea-lab/edr-agent/issues/43>), which no unit test can reach:
+//! The production variant of the trust set (ADR-0027, <https://github.com/synthaea-lab/agent/issues/43>), which no unit test can reach:
 //! those compile under `cfg(test)`, where the public test seed is always present. An
 //! integration test links the library without `cfg(test)`, so with `--no-default-features`
 //! it sees exactly what a packaged build embeds. CI runs it as
