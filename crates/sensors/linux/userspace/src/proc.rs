@@ -76,6 +76,64 @@ fn read_capped(path: &str, limit: usize) -> std::io::Result<Vec<u8>> {
     Ok(blob)
 }
 
+/// The argv of an exec event and how many bytes of its argument block were not captured
+/// (#1118, ADR-0045's truth table).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExecArgvCapture {
+    pub(crate) argv: Vec<String>,
+    /// `Some(0)`: the whole block. `Some(n)`: `n` bytes between the windows were not read.
+    /// `None`: unknown, the sensor saw nothing to measure against.
+    pub(crate) omitted_bytes: Option<u32>,
+}
+
+/// argv of an exec event (#1118): the probe's exec-time windows when it read them, else
+/// [`read_proc_cmdline`] now (the fallback rows of ADR-0045's table). A block over the window
+/// is never completed from `/proc`: that read is not exec-time, and a process can rewrite its
+/// argument region before it (ADR-0045, Consequences).
+pub(crate) fn exec_argv(
+    event: &sensor_linux_wire::ExecEvent,
+    windows: &sensor_linux_wire::ExecArgv<'_>,
+) -> ExecArgvCapture {
+    if windows.head.is_empty() {
+        let argv = read_proc_cmdline(event.meta.pid);
+        // A live process gave its whole argv (a cut past the 32 KiB budget is turned into
+        // `None` by `normalize::exec`); an empty read is a process already gone: unknown.
+        let omitted_bytes = (!argv.is_empty()).then_some(0);
+        return ExecArgvCapture {
+            argv,
+            omitted_bytes,
+        };
+    }
+    argv_from_windows(windows)
+}
+
+/// The pure half of [`exec_argv`], for windows the probe read (a non-empty head).
+///
+/// Tokens are split on NUL. A token cut by a window edge is kept with the bytes that were
+/// read: the last token of the head, and the first token of the tail (the tail is not known to
+/// start on a token boundary). The two windows stay separate tokens, never fused, and no marker
+/// is added: the loss is carried by `omitted_bytes`, which a process cannot forge by writing a
+/// marker into its own arguments.
+fn argv_from_windows(windows: &sensor_linux_wire::ExecArgv<'_>) -> ExecArgvCapture {
+    let mut argv = parse_proc_cmdline(windows.head);
+    let captured = windows.head.len() + windows.tail.len();
+    if !windows.tail.is_empty() {
+        let mut tail = parse_proc_cmdline(windows.tail);
+        // A tail that starts exactly on a separator begins with an empty piece: the end of a
+        // token the head already holds, not an empty argument of its own.
+        if windows.tail.first() == Some(&0) && tail.first().is_some_and(String::is_empty) {
+            tail.remove(0);
+        }
+        argv.extend(tail);
+    }
+    let total = windows.total as usize;
+    let omitted_bytes = u32::try_from(total.saturating_sub(captured)).unwrap_or(u32::MAX);
+    ExecArgvCapture {
+        argv,
+        omitted_bytes: Some(omitted_bytes),
+    }
+}
+
 /// Environment variable names the sensor captures at exec time (`ExecEvent::env_security`,
 /// issue #363) — the dynamic-linker-hijack family: `LD_PRELOAD`/`LD_LIBRARY_PATH` force a
 /// chosen shared object or search path onto every dynamically linked exec, `LD_AUDIT` is
@@ -209,9 +267,12 @@ pub(crate) fn parse_stat_starttime(stat: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use sensor_linux_wire::{ARGV_HEAD_BYTES, ARGV_TAIL_BYTES, ARGV_WINDOW_BYTES, ExecArgv};
+
     use super::{
-        is_proc_exit_race, parse_proc_cmdline, parse_proc_environ_security, parse_stat_ppid_comm,
-        parse_stat_starttime, primed_generation, read_cmdline_file, read_proc_images,
+        argv_from_windows, is_proc_exit_race, parse_proc_cmdline, parse_proc_environ_security,
+        parse_stat_ppid_comm, parse_stat_starttime, primed_generation, read_cmdline_file,
+        read_proc_images,
     };
 
     /// Writes `blob` to a fresh file under the temp dir and returns its path.
@@ -275,6 +336,73 @@ mod tests {
         assert_eq!(parse_stat_starttime("not a stat line"), None);
         let stat = "1 (x) S 0 1 1 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 notanumber 0 0";
         assert_eq!(parse_stat_starttime(stat), None);
+    }
+
+    fn windows<'a>(total: usize, head: &'a [u8], tail: &'a [u8]) -> ExecArgv<'a> {
+        ExecArgv {
+            total: u32::try_from(total).unwrap(),
+            head,
+            tail,
+        }
+    }
+
+    #[test]
+    fn a_block_that_fits_the_window_is_the_whole_argv_with_nothing_omitted() {
+        let block = b"systemctl\0stop\0osqueryd\0";
+        let got = argv_from_windows(&windows(block.len(), block, b""));
+        assert_eq!(got.argv, ["systemctl", "stop", "osqueryd"]);
+        assert_eq!(got.omitted_bytes, Some(0));
+    }
+
+    /// ADR-0045's padding case: a payload at the end of a long `sh -c` argument is still seen,
+    /// and the cut argument is kept as two partial tokens instead of being dropped.
+    #[test]
+    fn a_payload_after_padding_is_kept_in_the_tail_and_the_middle_is_counted() {
+        let mut block = b"sh\0-c\0".to_vec();
+        block.extend(std::iter::repeat_n(b'A', 3000));
+        block.extend_from_slice(b"; run-the-payload\0");
+        let (head, tail) = (
+            &block[..ARGV_HEAD_BYTES],
+            &block[block.len() - ARGV_TAIL_BYTES..],
+        );
+        let got = argv_from_windows(&windows(block.len(), head, tail));
+        assert_eq!(got.argv[..2], ["sh", "-c"]);
+        assert_eq!(
+            got.argv.len(),
+            4,
+            "head and tail stay separate tokens: {:?}",
+            got.argv
+        );
+        assert!(got.argv[2].bytes().all(|b| b == b'A'));
+        assert!(got.argv[3].ends_with("; run-the-payload"));
+        assert_eq!(
+            got.omitted_bytes,
+            Some(u32::try_from(block.len() - ARGV_WINDOW_BYTES).unwrap())
+        );
+    }
+
+    #[test]
+    fn a_tail_that_starts_on_a_separator_does_not_invent_an_empty_argument() {
+        let got = argv_from_windows(&windows(2000, b"a\0b", b"\0c\0"));
+        assert_eq!(got.argv, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn an_empty_argument_inside_a_window_is_kept() {
+        let block = b"printf\0\0x\0";
+        let got = argv_from_windows(&windows(block.len(), block, b""));
+        assert_eq!(got.argv, ["printf", "", "x"]);
+    }
+
+    #[test]
+    fn a_failed_tail_read_keeps_the_head_and_counts_everything_after_it() {
+        let head = b"python3\0-c\0impo";
+        let got = argv_from_windows(&windows(5000, head, b""));
+        assert_eq!(got.argv, ["python3", "-c", "impo"]);
+        assert_eq!(
+            got.omitted_bytes,
+            Some(u32::try_from(5000 - head.len()).unwrap())
+        );
     }
 
     #[test]

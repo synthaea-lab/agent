@@ -46,6 +46,9 @@ pub fn exec_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
         cmdline: argv.join(" "),
         argv,
         cmdline_truncated,
+        // The EXECVE record carries every argument (#1162: a split one drops the exec before
+        // this), so the block is whole unless the budget cut it, by an unmeasured amount.
+        argv_omitted_bytes: (!cmdline_truncated).then_some(0),
         parent_comm: None, // HONEST: audit doesn't track parent
         parent_image_path: None,
         sha256: None, // Filled by enrichment

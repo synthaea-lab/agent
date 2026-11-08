@@ -51,6 +51,7 @@ fn event_from_json(value: &Value) -> ExecEvent {
         product_name: None,
         image_file_id: None,
         cmdline_truncated: false,
+        argv_omitted_bytes: None,
         env_security: vec![],
     }
 }

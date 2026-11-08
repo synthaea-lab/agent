@@ -25,7 +25,7 @@ use crate::{
     },
     normalize,
     parent_image::{ExecStamps, IMAGE_CACHE_CAP, ParentImageEvictions, ParentImages},
-    proc::{read_proc_cmdline, read_proc_environ_security, read_proc_images},
+    proc::{exec_argv, read_proc_environ_security, read_proc_images},
     unit_procs::{ToolWatch, UnitResolver},
 };
 
@@ -136,34 +136,31 @@ async fn readable_or_pending<'a>(
     }
 }
 
-macro_rules! drain {
-    ($guard:expr, $wire_ty:ty, $sink:expr, $own_pid:expr, $to_event:expr) => {{
+/// [`drain!`] for a record whose size is not fixed (the exec record, ADR-0045): `$to_event` gets
+/// the item's bytes and parses them itself, giving `None` for a record it refuses.
+macro_rules! drain_bytes {
+    ($guard:expr, $sink:expr, $own_pid:expr, $to_event:expr) => {{
         let mut guard = $guard.map_err(|e| err(format!("ring buffer poll failed: {e}")))?;
         let rb = guard.get_inner_mut();
         let mut drained = 0usize;
         while drained < MAX_ITEMS_PER_DRAIN {
             let Some(item) = rb.next() else { break };
             drained += 1;
-            if item.len() >= core::mem::size_of::<$wire_ty>() {
-                // SAFETY: the length was checked against size_of::<$wire_ty>() above,
-                // the wire types are repr(C) plain-old-data, and read_unaligned
-                // handles the ring buffer's arbitrary alignment.
-                let event = unsafe { core::ptr::read_unaligned(item.as_ptr() as *const $wire_ty) };
-                // `$to_event` gives an `Event`, or an `Option<Event>` when the payload may turn
-                // out not to be an event at all (the DNS query capture); `None` is skipped.
-                let Some(schema_event) = Option::<schema::Event>::from($to_event(&event)) else {
-                    continue;
-                };
-                // Self-exclusion (issue #340): the agent's own activity — most
-                // visibly its own `write(2)` calls appending to `events.jsonl` —
-                // is itself observed by this same sensor, re-triggering the very
-                // write that produced it and amplifying without bound (capped
-                // from a full hang only by MAX_ITEMS_PER_DRAIN above, #326).
-                // Standard EDR practice: never feed the agent's own pid back
-                // into its own telemetry.
-                if schema_event.meta().pid != $own_pid {
-                    $sink.on_event(schema_event);
-                }
+            // `$to_event` gives an `Event`, or an `Option<Event>` when the payload may turn
+            // out not to be an event at all (the DNS query capture, a refused record); `None`
+            // is skipped.
+            let Some(schema_event) = Option::<schema::Event>::from($to_event(&item[..])) else {
+                continue;
+            };
+            // Self-exclusion (issue #340): the agent's own activity — most
+            // visibly its own `write(2)` calls appending to `events.jsonl` —
+            // is itself observed by this same sensor, re-triggering the very
+            // write that produced it and amplifying without bound (capped
+            // from a full hang only by MAX_ITEMS_PER_DRAIN above, #326).
+            // Standard EDR practice: never feed the agent's own pid back
+            // into its own telemetry.
+            if schema_event.meta().pid != $own_pid {
+                $sink.on_event(schema_event);
             }
         }
         // Only clear readiness once the buffer actually ran dry. If we stopped
@@ -175,6 +172,45 @@ macro_rules! drain {
             guard.clear_ready();
         }
     }};
+}
+
+/// Drains up to `MAX_ITEMS_PER_DRAIN` fixed-size `$wire_ty` records; a record shorter than the
+/// type is skipped.
+macro_rules! drain {
+    ($guard:expr, $wire_ty:ty, $sink:expr, $own_pid:expr, $to_event:expr) => {
+        drain_bytes!(
+            $guard,
+            $sink,
+            $own_pid,
+            |item: &[u8]| -> Option<schema::Event> {
+                if item.len() < core::mem::size_of::<$wire_ty>() {
+                    return None;
+                }
+                // SAFETY: the length was checked against size_of::<$wire_ty>() above,
+                // the wire types are repr(C) plain-old-data, and read_unaligned
+                // handles the ring buffer's arbitrary alignment.
+                let event = unsafe { core::ptr::read_unaligned(item.as_ptr() as *const $wire_ty) };
+                Option::<schema::Event>::from($to_event(&event))
+            }
+        )
+    };
+}
+
+/// Exec records the drain refused (ADR-0045): lengths that are not a shape the probe writes, or
+/// a record shorter than they announce. Counted, the first one and every thousandth logged; the
+/// record is dropped, never read past its end.
+static EXEC_RECORDS_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_refused_exec_record(error: sensor_linux_wire::ExecRecordError, len: usize) {
+    let n = EXEC_RECORDS_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(1000) {
+        tracing::warn!(
+            ?error,
+            len,
+            refused = n,
+            "sensor-linux: exec record refused"
+        );
+    }
 }
 
 impl LinuxSensor {
@@ -436,8 +472,17 @@ impl LinuxSensor {
                     // `spawn_blocking` yet — `read_proc_environ_security` is the same
                     // file family, same tradeoff). Container attribution no longer
                     // touches `/proc` at all — see `CgroupIdCache`.
-                    drain!(guard, sensor_linux_wire::ExecEvent, sink, own_pid, |e: &sensor_linux_wire::ExecEvent| {
-                        let mut event = normalize::exec(e, offset, read_proc_cmdline(e.meta.pid), read_proc_environ_security(e.meta.pid), container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache));
+                    drain_bytes!(guard, sink, own_pid, |item: &[u8]| -> Option<schema::Event> {
+                        let (e, windows) = match sensor_linux_wire::parse_exec_record(item) {
+                            Ok(parsed) => parsed,
+                            Err(error) => {
+                                note_refused_exec_record(error, item.len());
+                                return None;
+                            }
+                        };
+                        let e = &e;
+                        let captured = exec_argv(e, &windows);
+                        let mut event = normalize::exec(e, offset, captured.argv, captured.omitted_bytes, read_proc_environ_security(e.meta.pid), container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache));
                         if let schema::Event::Exec(exec) = &mut event {
                             parent_images.annotate(exec, ExecStamps {
                                 ktime_ns: e.meta.timestamp_ns,
@@ -446,7 +491,7 @@ impl LinuxSensor {
                                 parent_never_exec_ed: e.parent_execd == 0,
                             });
                         }
-                        event
+                        Some(event)
                     });
                 }
                 guard = file_open_ring_buf.readable_mut() => {
