@@ -13,7 +13,10 @@ workspace = true
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 config = { path = "../crates/config" }
+serde_json = { workspace = true }
 sha2 = "0.11"
+# Self-protection alerts are appended to the agent's alerts file in its own record shape.
+sinks = { path = "../crates/sinks" }
 # Post-promotion health gate (ADR-0015 Decision 6, issue #30): the watchdog rolls a
 # release that never proves itself back, via the updater's layout + ban list.
 updater = { path = "../crates/updater", default-features = false }
