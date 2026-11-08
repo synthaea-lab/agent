@@ -76,7 +76,7 @@ use crate::redact;
 /// query path maps it in `sensor-linux`'s `normalize`, not in this crate.
 ///
 /// v27 (#1036) added `FileSetTimeEvent` — not imported here either (`sensor-linux`'s `normalize`).
-const _: () = assert!(wire::WIRE_VERSION == 27);
+const _: () = assert!(wire::WIRE_VERSION == 28);
 
 /// `container` is resolved by the caller (`crate::container::container_context`,
 /// issue #312) from `EventMeta::cgroup_id` against cgroupfs, with image/name filled

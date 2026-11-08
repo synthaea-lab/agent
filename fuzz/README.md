@@ -11,6 +11,7 @@ because a panic on the drain path kills the sensor.
 | --- | --- |
 | `audit_parse` | `sensor_linux_audit::parse_audit_message` (audit netlink wire) |
 | `netlink_parse` | `DiagMsg` / `ProcEvent` / `ConntrackFlow` decoders (sock_diag, proc connector, conntrack attribute walks) |
+| `exec_record_parse` | `sensor_linux_wire::parse_exec_record`, the variable-length exec record and its argv windows (#1118, ADR-0045) |
 
 ## Running
 

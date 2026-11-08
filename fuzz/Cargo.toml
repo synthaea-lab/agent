@@ -15,6 +15,7 @@ libfuzzer-sys = "0.4"
 sensor-linux-audit = { path = "../crates/sensors/linux/audit" }
 sensor-linux-logs = { path = "../crates/sensors/linux/logs" }
 sensor-linux-netlink = { path = "../crates/sensors/linux/netlink" }
+sensor-linux-wire = { path = "../crates/sensors/linux/wire" }
 
 [[bin]]
 name = "audit_parse"
@@ -33,6 +34,13 @@ bench = false
 [[bin]]
 name = "logs_parse"
 path = "fuzz_targets/logs_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "exec_record_parse"
+path = "fuzz_targets/exec_record_parse.rs"
 test = false
 doc = false
 bench = false

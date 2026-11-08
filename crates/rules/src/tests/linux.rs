@@ -43,6 +43,7 @@ fn padded_exec_after_the_cut() -> ExecEvent {
         cmdline: argv.join(" "),
         argv,
         cmdline_truncated: cut,
+        argv_omitted_bytes: None,
         ..exec_event("")
     }
 }
@@ -61,6 +62,51 @@ fn a_padded_command_line_that_hides_its_payload_from_the_content_rules_still_ale
         .expect("the cut itself must raise an alert");
     assert_eq!(alert.severity, Severity::Medium);
     assert!(alert.message.contains("cut at capture"));
+}
+
+/// ADR-0045: a padded `sh -c` read by the Linux probe as a head and a tail window. The
+/// payload at the end is in the tail, so the content rule sees it, and the omitted middle
+/// raises T1027.010 at Low, worded by its cause.
+#[test]
+fn a_padded_command_line_read_as_head_and_tail_alerts_low_and_keeps_its_payload_visible() {
+    let argv: Vec<String> = [
+        "sh".to_string(),
+        "-c".to_string(),
+        "A".repeat(760),
+        format!("{}; echo cGF5bG9hZAo= | base64 -d | sh", "A".repeat(200)),
+    ]
+    .into();
+    let event = ExecEvent {
+        cmdline: argv.join(" "),
+        argv,
+        cmdline_truncated: true,
+        argv_omitted_bytes: Some(39 * 1024),
+        ..exec_event("")
+    };
+    assert!(
+        check_base64_decode(&event).is_some(),
+        "the tail window keeps a payload put after the padding"
+    );
+    let alert = check_truncated_cmdline(&event).expect("the omitted middle alerts");
+    assert_eq!(alert.severity, Severity::Low);
+    assert!(
+        alert
+            .message
+            .contains("39936 bytes between its head and its tail"),
+        "{}",
+        alert.message
+    );
+}
+
+#[test]
+fn a_whole_or_unknown_argv_without_the_flag_raises_no_truncation_alert() {
+    for omitted in [Some(0), None] {
+        let event = ExecEvent {
+            argv_omitted_bytes: omitted,
+            ..exec_event("sh -c true")
+        };
+        assert!(check_truncated_cmdline(&event).is_none(), "{omitted:?}");
+    }
 }
 
 #[test]
@@ -86,6 +132,7 @@ fn a_truncation_alert_cuts_its_quote_on_a_character_boundary() {
     let event = ExecEvent {
         cmdline: format!("x{}", "é".repeat(200)),
         cmdline_truncated: true,
+        argv_omitted_bytes: None,
         ..exec_event("")
     };
     let alert = check_truncated_cmdline(&event).expect("a cut command line alerts");
