@@ -23,7 +23,7 @@ license="Apache-2.0"
 depends="openrc>=0.45"
 # No "cargo"/"rust" here: build() uses its own rustup-managed toolchain (the
 # exact channel rust-toolchain.toml pins, plus the ebpf-toolchain.txt nightly
-# with rust-src), not Alpine's system Rust — see lab/provisioning/alpine-toolchain.sh.
+# with rust-src), not Alpine's system Rust — see toolchain/alpine-toolchain.sh.
 # These cover the C/C++ side cargo's own build scripts and onnxruntime's CMake
 # need, same list as that provisioning script.
 makedepends="findutils tar zstd curl python3 python3-dev py3-pip
@@ -96,7 +96,7 @@ build() {
 	# bytes, and cargo picked the stale one via PATH order).
 	export PATH="$HOME/.cargo/bin:$PATH"
 	if ! command -v bpf-linker >/dev/null 2>&1; then
-		error "bpf-linker not found — run lab/provisioning/alpine-toolchain.sh first"
+		error "bpf-linker not found — run toolchain/alpine-toolchain.sh first"
 		return 1
 	fi
 	rustup target add "$target" 2>/dev/null || true
@@ -116,14 +116,14 @@ build() {
 
 	local ort_lib_location="${ORT_LIB_LOCATION:-}"
 	if [ -z "$ort_lib_location" ]; then
-		msg "Building static ONNX Runtime from source (lab/provisioning/build-onnxruntime-static.sh)..."
-		"$builddir/lab/provisioning/build-onnxruntime-static.sh"
+		msg "Building static ONNX Runtime from source (toolchain/build-onnxruntime-static.sh)..."
+		"$builddir/toolchain/build-onnxruntime-static.sh"
 		ort_lib_location="$builddir/onnxruntime/build/Linux/Release"
 	fi
 
 	export ORT_LIB_LOCATION="$ort_lib_location"
 	local ort_flags
-	ort_flags="$(bash "$builddir/lab/provisioning/ort-static-link-flags.sh")" \
+	ort_flags="$(bash "$builddir/toolchain/ort-static-link-flags.sh")" \
 		|| die "ort-static-link-flags.sh failed: ONNX Runtime cannot be linked statically"
 	case "$ort_flags" in
 		*"-l static="*) ;;
@@ -180,7 +180,7 @@ package() {
 	install -D -m755 "$bin/cli" "$pkgdir/usr/bin/synthaea-ctl"
 }
 
-# Empty, not missing: builddir is this monorepo checkout (see builddir=
+# Empty, not missing: builddir is this repo checkout (see builddir=
 # above), not a fetched/verified source tarball, so there is nothing for
 # abuild to checksum here — same as build-deb.sh/build-rpm.sh's own trust
 # boundary (the checkout itself, via normal git/CI provenance). Do not add

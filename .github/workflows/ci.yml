@@ -42,8 +42,9 @@ jobs:
           cargo +nightly fmt --all --check
       - name: dependency direction
         run: python3 tools/check-deps.py
-      - name: attack coverage matrix up to date
-        run: python3 tools/attack-coverage.py --check
+      # tools/attack-coverage.py --check is not run here: it scans this repo and the
+      # `rules` sibling and checks a file in the umbrella's docs/, so it runs in the
+      # umbrella's CI, where all three are pinned together.
       - name: PowerShell scripts ASCII-only
         run: python3 tools/check-ps1-ascii.py
       - name: shell scripts with a shebang are executable in git
@@ -83,21 +84,58 @@ jobs:
   # Core rule: every workspace crate compiles and passes tests on all three platforms.
   # Platform-specific code lives only in crates/sensors/* behind cfg, so this job is
   # what enforces it.
+  #
+  # The cross-repo contract tests (golden fixtures from server/ and ml/, the shipped
+  # content in rules/; see crates/siblings) need the sibling repos beside this one,
+  # laid out as in the umbrella checkout. They skip without them locally; here
+  # SYNTHAEA_REQUIRE_SIBLINGS=1 makes a missing sibling a failure, so they cannot
+  # pass by not running. Siblings track their main branch: a change on either side
+  # of a contract that the other cannot read fails the next run here.
   test:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      SYNTHAEA_REQUIRE_SIBLINGS: "1"
+    defaults:
+      run:
+        working-directory: agent
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          path: agent
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: synthaea-lab/edr-server
+          ref: main
+          path: server
+          persist-credentials: false
+          sparse-checkout: |
+            app
+            tests/fixtures
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: synthaea-lab/edr-ml
+          ref: main
+          path: ml
+          persist-credentials: false
+          sparse-checkout: tests/fixtures
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: synthaea-lab/edr-rules
+          ref: main
+          path: rules
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
         with:
           toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: agent -> target
       - name: clippy
         run: cargo clippy --workspace --exclude sensor-linux-ebpf --all-targets -- -D warnings
       - name: test
@@ -129,11 +167,49 @@ jobs:
           SYNTHAEA_REQUIRE_PRIVILEGED_TESTS: "1"
         run: cargo test -p ipc --test e2e
 
+  # The shipped detection content (the `rules` sibling repo) through the real engines:
+  # every sigma/yara rule must compile/validate AND fire on its crafted matching
+  # sample, every rules/ioc feed line must load (crates/{sigma,yara,intel}/tests/
+  # content.rs). The `test` job runs these too, among everything else; this job is the
+  # fast, focused signal for a content or engine change.
+  content:
+    runs-on: ubuntu-latest
+    env:
+      SYNTHAEA_REQUIRE_SIBLINGS: "1"
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: agent
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: synthaea-lab/edr-rules
+          ref: main
+          path: rules
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: agent -> target
+      - name: sigma content suite
+        run: cargo test -p sigma --test content --test platform
+      - name: yara content suite
+        run: cargo test -p yara --test content
+      # The public-suffix half of the ioc check runs in the server repo's CI (it needs
+      # the server's list).
+      - name: ioc content suite
+        run: cargo test -p intel --test content
+
   # Linux with the eBPF probes embedded, the configuration we actually ship.
   # The `test` runner has no bpf-linker, so there build.rs skips the probes: the
   # eBPF crate itself never compiles, and clippy only sees the probe-less variant
   # of sensor-linux (#448: code that was dead only in that variant). This job
-  # installs the same toolchain as lab/provisioning/linux-toolchain.sh (the nightly
+  # installs the same toolchain as toolchain/linux-toolchain.sh (the nightly
   # pinned in ebpf-toolchain.txt + rust-src for aya-build, prebuilt bpf-linker at
   # the same pin) and fails if the
   # probes did not get embedded. No `cargo test` here: loading them needs a
@@ -141,7 +217,7 @@ jobs:
   linux-ebpf:
     runs-on: ubuntu-latest
     env:
-      # Keep both in sync with lab/provisioning/linux-toolchain.sh. The hash is the
+      # Keep both in sync with toolchain/linux-toolchain.sh. The hash is the
       # x86_64 musl tarball's: a replaced release asset must fail here, not run.
       BPF_LINKER_VERSION: v0.11.1
       BPF_LINKER_SHA256: e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8
@@ -167,7 +243,7 @@ jobs:
         with:
           # Never share a cache with the probe-less `test` job: a restored build
           # script output from there would skip the probes (see the stale-build
-          # note in lab/provisioning/linux-toolchain.sh).
+          # note in toolchain/linux-toolchain.sh).
           key: ebpf-embedded
       - name: clippy (embedded probes)
         run: cargo clippy -p sensor-linux -p sensor-linux-uprobes -p agent --all-targets -- -D warnings

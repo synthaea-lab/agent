@@ -30,13 +30,13 @@ This allows fast iteration without manual onnxruntime builds. The `dynamic-onnx`
 
 ```bash
 # 1. Build onnxruntime from source
-./lab/provisioning/build-onnxruntime-static.sh
+./toolchain/build-onnxruntime-static.sh
 
 # 2. Set environment variable
 export ORT_LIB_LOCATION="$PWD/onnxruntime/build/Linux/Release"
 
 # 3. Generate static link flags
-eval "$(./lab/provisioning/ort-static-link-flags.sh)"
+eval "$(./toolchain/ort-static-link-flags.sh)"
 
 # 4. Build with static linking (disables dynamic-onnx default feature)
 cargo build -p ml --release --no-default-features
@@ -60,11 +60,11 @@ python tools\check-pe-imports.py target\release\deps\ml-*.exe   # no onnxruntime
 
 The source build is CPU only, so unlike the prebuilt download the binary does not import
 `directml.dll` or `d3d12.dll`. Prerequisites, timings and the Windows-specific pitfalls
-(`re2`, `shell32`, memory while linking) are in `lab/provisioning/onnxruntime-static-build.md`.
+(`re2`, `shell32`, memory while linking) are in `toolchain/onnxruntime-static-build.md`.
 
 #### Detailed Documentation
 
-See `lab/provisioning/onnxruntime-static-build.md` for:
+See `toolchain/onnxruntime-static-build.md` for:
 - Prerequisites and platform support
 - Detailed build steps
 - Known issues and workarounds
@@ -74,7 +74,7 @@ See `lab/provisioning/onnxruntime-static-build.md` for:
 
 - ✅ **Linux (Ubuntu 24.04+)**: Fully tested, production-ready
 - ⏳ **Windows**: Not yet implemented (issue #110)
-- ✅ **macOS (Apple Silicon and Intel)**: validated on hosted runners (issue #338, PR #788): onnxruntime from source, `cargo test -p ml` and the agent linked statically, no `libonnxruntime.dylib`; see `lab/provisioning/onnxruntime-static-build-macos.md`
+- ✅ **macOS (Apple Silicon and Intel)**: validated on hosted runners (issue #338, PR #788): onnxruntime from source, `cargo test -p ml` and the agent linked statically, no `libonnxruntime.dylib`; see `toolchain/onnxruntime-static-build-macos.md`
 
 ## Features
 
@@ -164,4 +164,4 @@ Coordinate with ML workstream for model regeneration.
 
 - Issue #110: ML crate static linking tracking
 - ADR-0002: ML runtime decisions (static linking requirement)
-- `lab/provisioning/onnxruntime-static-build.md`: Detailed static build guide
+- `toolchain/onnxruntime-static-build.md`: Detailed static build guide

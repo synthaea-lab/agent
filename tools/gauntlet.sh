@@ -31,6 +31,9 @@ step "clippy, host, all targets, -D warnings"
 cargo clippy --workspace --exclude sensor-linux-ebpf --all-targets -- -D warnings
 
 step "tests"
+# Cross-repo contract tests read the umbrella's sibling repos (crates/siblings)
+# and skip with a `skipped:` line when one is absent; export
+# SYNTHAEA_REQUIRE_SIBLINGS=1 to make a missing sibling fail, as CI does.
 cargo test --workspace --exclude sensor-linux-ebpf
 
 step "updater trust set without the test key (production code path, ADR-0027)"
@@ -39,14 +42,16 @@ cargo test -p updater --no-default-features
 step "cargo deny (licenses, advisories, bans, sources)"
 cargo deny check
 
-# ML robustness check (issue #45) — only runs if a latest model exists.
+# ML robustness check (issue #45) — only runs if the `ml` sibling repo (the
+# umbrella's ml/, or $SYNTHAEA_ROOT/ml) is checked out and has a latest model.
 # Verifies escape rate and degradation metrics stay within thresholds.
-if [[ -d ml/registry/cmdline-iforest-linux/latest ]]; then
+ML_DIR="${SYNTHAEA_ROOT:-..}/ml"
+if [[ -d "$ML_DIR/registry/cmdline-iforest-linux/latest" ]]; then
     step "mutation robustness (T0 cmdline mutations)"
-    python3 -m synthaea_ml.evaluation.robustness_cli verify \
-        --model-dir ml/registry/cmdline-iforest-linux/latest/ \
+    (cd "$ML_DIR" && python3 -m synthaea_ml.evaluation.robustness_cli verify \
+        --model-dir registry/cmdline-iforest-linux/latest/ \
         --max-escape-rate 0.15 \
-        --max-median-degradation 0.20
+        --max-median-degradation 0.20)
 fi
 
 if [[ $FAST -eq 0 ]]; then

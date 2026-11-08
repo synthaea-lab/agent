@@ -58,7 +58,7 @@ This separation ensures that package managers (apt/dnf) and the updater never co
 ### Prerequisites
 
 **Static .deb:** build on an x86_64 Alpine/musl host with the toolchain provisioned by
-`lab/provisioning/alpine-toolchain.sh`. The build creates ONNX Runtime from source and
+`toolchain/alpine-toolchain.sh`. The build creates ONNX Runtime from source and
 needs several gigabytes of disk and build time on first run. The resulting binaries are
 static musl executables, so one `.deb` runs on glibc-based Debian and Ubuntu versions
 without inheriting the build host's glibc or libstdc++ baseline.
@@ -74,7 +74,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ### Build Debian Package
 
-On an x86_64 Alpine host with `lab/provisioning/alpine-toolchain.sh` already run:
+On an x86_64 Alpine host with `toolchain/alpine-toolchain.sh` already run:
 
 ```bash
 ./packaging/linux/build-deb.sh
@@ -190,8 +190,8 @@ Verify:
 
 **5. Lab Scenario Integration**
 ```bash
-# After package install, run walking-skeleton scenario
-cd lab/scenarios
+# After package install, run walking-skeleton scenario (the `lab` sibling repo)
+cd "${SYNTHAEA_ROOT:-..}/lab/scenarios"
 ./beacon.sh
 cat /var/log/synthaea/alerts.ndjson | grep T1071
 ```

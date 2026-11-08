@@ -234,7 +234,7 @@ pub(crate) fn load_ebpf_for_run() -> Result<aya::Ebpf, SensorError> {
 pub fn load_ebpf() -> Result<aya::Ebpf, SensorError> {
     Err(err(
         "sensor-linux was built without embedded eBPF probes (bpf-linker not on PATH \
-         at build time) — provision the eBPF toolchain (lab/provisioning/linux-toolchain.sh) \
+         at build time) — provision the eBPF toolchain (toolchain/linux-toolchain.sh) \
          and rebuild"
             .to_string(),
     ))
