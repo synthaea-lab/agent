@@ -56,9 +56,10 @@ pub enum ResolverError {
     Elf(#[from] goblin::error::Error),
 }
 
-/// Library directories searched on every distro layout we support, relative to the
-/// filesystem root: the classic and lib64 trees plus the Debian/Ubuntu multiarch trees.
-const MULTIARCH_LIBRARY_DIRS: &[&str] = &[
+/// Library directories searched for every library family, relative to the filesystem root:
+/// the classic and lib64 trees plus the Debian/Ubuntu multiarch trees. One list for all
+/// families so no search can drift (the TLS search once skipped the arm64 trees).
+const LIBRARY_DIRS: &[&str] = &[
     "lib",
     "usr/lib",
     "lib64",
@@ -67,17 +68,6 @@ const MULTIARCH_LIBRARY_DIRS: &[&str] = &[
     "usr/lib/x86_64-linux-gnu",
     "lib/aarch64-linux-gnu",
     "usr/lib/aarch64-linux-gnu",
-];
-
-/// The SSL search has historically skipped the arm64 multiarch trees; kept separate so
-/// this commit stays behavior-preserving.
-const SSL_LIBRARY_DIRS: &[&str] = &[
-    "lib",
-    "usr/lib",
-    "lib64",
-    "usr/lib64",
-    "lib/x86_64-linux-gnu",
-    "usr/lib/x86_64-linux-gnu",
 ];
 
 /// OpenSSL/BoringSSL (`libssl`) and `GnuTLS`.
@@ -90,12 +80,13 @@ const READLINE_LIBRARY_PREFIXES: &[&str] = &["libreadline.so", "libedit.so"];
 /// different symbol table shape; musl support is issue #267 Phase 2.
 const LIBC_LIBRARY_PREFIXES: &[&str] = &["libc.so", "libc-"];
 
-/// Lists the regular files under `root`/`dirs` whose name starts with one of `prefixes`,
-/// one path per inode so a library reached through several symlinks is resolved once.
+/// Lists the regular files under `root`/[`LIBRARY_DIRS`] whose name starts with one of
+/// `prefixes`, one path per inode so a library reached through several symlinks is resolved once.
 /// Missing or unreadable directories are skipped: not every layout exists on every distro.
-fn find_libraries(root: &Path, dirs: &[&str], prefixes: &[&str]) -> Vec<PathBuf> {
+fn find_libraries(root: &Path, prefixes: &[&str]) -> Vec<PathBuf> {
     let mut seen_inodes = HashSet::new();
-    dirs.iter()
+    LIBRARY_DIRS
+        .iter()
         .filter_map(|dir| fs::read_dir(root.join(dir)).ok())
         .flat_map(|entries| entries.flatten().map(|entry| entry.path()))
         .filter(|path| has_any_prefix(path, prefixes))
@@ -119,11 +110,7 @@ fn has_any_prefix(path: &Path, prefixes: &[&str]) -> bool {
 ///
 /// Returns [`ResolverError`] if library discovery or symbol parsing fails.
 pub fn resolve_dns_symbols() -> Result<Vec<SymbolInfo>, ResolverError> {
-    let libraries = find_libraries(
-        Path::new("/"),
-        MULTIARCH_LIBRARY_DIRS,
-        LIBC_LIBRARY_PREFIXES,
-    );
+    let libraries = find_libraries(Path::new("/"), LIBC_LIBRARY_PREFIXES);
     let target_symbols = ["getaddrinfo"];
 
     let mut all_symbols = Vec::new();
@@ -214,7 +201,7 @@ pub fn resolve_symbols(
 ///
 /// Returns [`ResolverError`] if library discovery or symbol parsing fails.
 pub fn resolve_tls_symbols() -> Result<Vec<SymbolInfo>, ResolverError> {
-    let libraries = find_libraries(Path::new("/"), SSL_LIBRARY_DIRS, SSL_LIBRARY_PREFIXES);
+    let libraries = find_libraries(Path::new("/"), SSL_LIBRARY_PREFIXES);
     // OpenSSL/BoringSSL: SSL_read, SSL_write, SSL_read_ex, SSL_write_ex
     // GnuTLS: gnutls_record_recv, gnutls_record_send
     let target_symbols = [
@@ -254,11 +241,7 @@ pub fn resolve_tls_symbols() -> Result<Vec<SymbolInfo>, ResolverError> {
 ///
 /// Returns [`ResolverError`] if library discovery or symbol parsing fails.
 pub fn resolve_readline_symbols() -> Result<Vec<SymbolInfo>, ResolverError> {
-    let libraries = find_libraries(
-        Path::new("/"),
-        MULTIARCH_LIBRARY_DIRS,
-        READLINE_LIBRARY_PREFIXES,
-    );
+    let libraries = find_libraries(Path::new("/"), READLINE_LIBRARY_PREFIXES);
     let target_symbols = ["readline"];
 
     let mut all_symbols = Vec::new();
@@ -310,8 +293,8 @@ mod tests {
         root
     }
 
-    fn found_names(root: &Path, dirs: &[&str], prefixes: &[&str]) -> Vec<String> {
-        let mut names: Vec<String> = find_libraries(root, dirs, prefixes)
+    fn found_names(root: &Path, prefixes: &[&str]) -> Vec<String> {
+        let mut names: Vec<String> = find_libraries(root, prefixes)
             .iter()
             .map(|path| {
                 path.strip_prefix(root)
@@ -334,7 +317,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            found_names(root.path(), &["usr/lib"], SSL_LIBRARY_PREFIXES),
+            found_names(root.path(), SSL_LIBRARY_PREFIXES),
             ["usr/lib/libgnutls.so.30", "usr/lib/libssl.so.3"]
         );
     }
@@ -349,7 +332,7 @@ mod tests {
         .expect("create symlink");
 
         assert_eq!(
-            find_libraries(root.path(), &["usr/lib"], READLINE_LIBRARY_PREFIXES).len(),
+            find_libraries(root.path(), READLINE_LIBRARY_PREFIXES).len(),
             1
         );
     }
@@ -358,7 +341,7 @@ mod tests {
     fn find_libraries_skips_directories_with_a_library_name() {
         let root = library_tree(&["lib/libc.so.6.d/placeholder"]);
 
-        assert!(find_libraries(root.path(), &["lib"], LIBC_LIBRARY_PREFIXES).is_empty());
+        assert!(find_libraries(root.path(), LIBC_LIBRARY_PREFIXES).is_empty());
     }
 
     #[test]
@@ -366,8 +349,24 @@ mod tests {
         let root = library_tree(&["lib64/libc.so.6"]);
 
         assert_eq!(
-            found_names(root.path(), MULTIARCH_LIBRARY_DIRS, LIBC_LIBRARY_PREFIXES),
+            found_names(root.path(), LIBC_LIBRARY_PREFIXES),
             ["lib64/libc.so.6"]
+        );
+    }
+
+    #[test]
+    fn tls_library_search_finds_libssl_in_arm64_multiarch_dirs() {
+        let root = library_tree(&[
+            "lib/aarch64-linux-gnu/libgnutls.so.30",
+            "usr/lib/aarch64-linux-gnu/libssl.so.3",
+        ]);
+
+        assert_eq!(
+            found_names(root.path(), SSL_LIBRARY_PREFIXES),
+            [
+                "lib/aarch64-linux-gnu/libgnutls.so.30",
+                "usr/lib/aarch64-linux-gnu/libssl.so.3"
+            ]
         );
     }
 
@@ -376,7 +375,7 @@ mod tests {
         let root = library_tree(&["lib/libc-2.31.so", "lib/libcap.so.2"]);
 
         assert_eq!(
-            found_names(root.path(), &["lib"], LIBC_LIBRARY_PREFIXES),
+            found_names(root.path(), LIBC_LIBRARY_PREFIXES),
             ["lib/libc-2.31.so"]
         );
     }
