@@ -99,6 +99,9 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
 - Functions stay at one level of abstraction — dispatchers dispatch, workers work.
 - Comments state what code can't (invariants, calibration dates, incident lessons),
   never what the next line does.
+- Explain mechanisms in `docs/`; keep code comments to the why/invariant in one or two
+  lines, linking the doc section. Update the page (and `docs/capabilities.md`) in the same
+  change; `tools/check-docs.py` checks the links in CI.
 - Detection state is bounded + observable (`store::BoundedMap`, counted shedding);
   time windows are sliding (timestamp deques), never reset buckets; name-keyed
   exclusions must be gated on evidence (`policy::name_exclusion_applies`).
@@ -133,6 +136,7 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
 - `cargo check` / `cargo test` (default members) — works on any OS; with `--workspace`, add `--exclude sensor-linux-ebpf` (bpfel target).
 - `cargo clippy --workspace --exclude sensor-linux-ebpf --all-targets -- -D warnings` — must stay clean.
 - `python3 tools/check-deps.py` — dependency direction check.
+- `python3 tools/check-docs.py` — docs links, anchors, and tracking issues on capability rows; `python3 tools/gen-roadmap.py` regenerates `docs/roadmap.md` (needs `gh`).
 - `python3 tools/attack-coverage.py [--check]` — regenerate / verify `docs/attack-coverage.md` (needs the `rules/` sibling).
 - `cargo +nightly fuzz run audit_parse` / `netlink_parse` — coverage-guided parser
   fuzzing (`fuzz/README.md`; workspace-excluded, needs `cargo-fuzz`).

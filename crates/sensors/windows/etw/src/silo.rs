@@ -30,6 +30,8 @@ use std::{
 
 use schema::ContainerContext;
 
+use crate::sync::LockExt;
+
 /// Silos remembered at once. A container host runs tens of containers; the cap
 /// only bounds a host that churns through far more than that.
 const SILO_CAP: usize = 256;
@@ -361,7 +363,7 @@ fn resolve_pass(
     probe: &impl Fn(u32, &str) -> Option<u32>,
 ) {
     let (known, pending, since) = {
-        let directory = directory.lock().unwrap();
+        let directory = directory.lock_or_recover();
         (
             directory.resolved_ids(),
             directory.pending(),
@@ -398,7 +400,7 @@ fn resolve_pass(
     // The probes ran without the lock: a silo torn down and asked about again
     // meanwhile (the Kernel-Process callback calls `forget`) is not named after
     // what the pass saw.
-    let mut directory = directory.lock().unwrap();
+    let mut directory = directory.lock_or_recover();
     for (silo, id) in mapping {
         if pending.contains(&silo) && !directory.resolved_since(silo, id, since) {
             tracing::debug!(
