@@ -82,6 +82,11 @@ What's real today: the full left column on Linux (sensors → enrich → store �
 engines → correlator → alerts, plus watchdog), validated live in the lab. The rest
 is skeletoned with its design recorded in place and an issue per component.
 
+**Technical documentation:** [docs/README.md](docs/README.md) explains every mechanism with
+links into the code, indexed for contributors, detection engineers and operators.
+What is built, partial or planned is in [docs/capabilities.md](docs/capabilities.md), and
+what comes next in [docs/roadmap.md](docs/roadmap.md).
+
 ## What makes it different
 
 - **The fleet-derived half** — prevalence, cross-endpoint correlation, adaptive
@@ -108,7 +113,7 @@ is skeletoned with its design recorded in place and an issue per component.
 | `ui/` | Endpoint tray/notifications (unprivileged ipc client) |
 | `packaging/` | MSI · notarized pkg · deb/rpm/apk + service integration |
 | `toolchain/` | Build-machine toolchain scripts (eBPF, ONNX Runtime) |
-| `docs/` | Generated [ATT&CK coverage matrix](docs/attack-coverage.md) |
+| `docs/` | [Technical documentation](docs/README.md), capabilities, roadmap, generated [ATT&CK coverage matrix](docs/attack-coverage.md) |
 | `tools/` | check-deps and developer tooling |
 
 ## Building
