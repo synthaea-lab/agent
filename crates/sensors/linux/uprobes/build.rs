@@ -15,7 +15,7 @@ fn main() -> anyhow::Result<()> {
     if which::which("bpf-linker").is_err() {
         println!(
             "cargo:warning=bpf-linker not found - building sensor-linux-uprobes WITHOUT embedded \
-             eBPF probes (load_ebpf() will error at runtime); see lab/provisioning/"
+             eBPF probes (load_ebpf() will error at runtime); see toolchain/"
         );
         return Ok(());
     }

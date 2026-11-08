@@ -6,8 +6,9 @@ use std::collections::BTreeSet;
 
 use yara::RuleSet;
 
-fn content_dir() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rules/yara")
+/// The shipped content in the `rules` sibling repo, or `None` (the test skips) without it.
+fn content_dir() -> Option<std::path::PathBuf> {
+    Some(siblings::require_path!("rules", "yara", None))
 }
 
 /// Asserts `samples` pairs exactly the compiled rule identifiers — a count-only
@@ -30,7 +31,8 @@ fn assert_samples_match_loaded_rules<T>(samples: &[(&str, T)], rules: &RuleSet) 
 
 #[test]
 fn every_shipped_rule_compiles() {
-    let rules = RuleSet::load_dir(&content_dir()).expect("shipped YARA content must compile");
+    let Some(dir) = content_dir() else { return };
+    let rules = RuleSet::load_dir(&dir).expect("shipped YARA content must compile");
     assert!(rules.rule_count() >= 1, "no compiled YARA rules found");
 }
 
@@ -52,6 +54,7 @@ fn concat_bytes(parts: &[&[u8]]) -> Vec<u8> {
 
 #[test]
 fn every_shipped_rule_fires_on_its_sample() {
+    let Some(dir) = content_dir() else { return };
     let lab_payload: &[u8] = b"#!/bin/sh\n# SYNTHAEA-LAB-PAYLOAD\necho hi\n";
     let php_webshell = concat_bytes(&[b"<?php\nsyst", b"em($_GET['x']);\n"]);
     let jsp_webshell = concat_bytes(&[
@@ -65,7 +68,7 @@ fn every_shipped_rule_fires_on_its_sample() {
         ("webshell_php_superglobal_exec", &php_webshell),
         ("webshell_jsp_runtime_exec", &jsp_webshell),
     ];
-    let rules = RuleSet::load_dir(&content_dir()).unwrap();
+    let rules = RuleSet::load_dir(&dir).unwrap();
     assert_samples_match_loaded_rules(samples, &rules);
     for (ident, bytes) in samples {
         let p = std::env::temp_dir().join(format!("yara-content-{}-{ident}", std::process::id()));
@@ -81,6 +84,7 @@ fn every_shipped_rule_fires_on_its_sample() {
 
 #[test]
 fn every_shipped_rule_ignores_its_negative_sample() {
+    let Some(dir) = content_dir() else { return };
     // One (rule identifier, benign bytes) pair per shipped rule — the content FP
     // regression suite (issue #73). Near miss (review, Jihair54/Sollykhan): the
     // marker string with its case changed — the rule's `$marker` string has no
@@ -107,7 +111,7 @@ fn every_shipped_rule_ignores_its_negative_sample() {
             b"<%\nString cmd = request.getParameter(\"x\");\nRuntime.getRuntime().exec(cmd);\n%>",
         ),
     ];
-    let rules = RuleSet::load_dir(&content_dir()).unwrap();
+    let rules = RuleSet::load_dir(&dir).unwrap();
     assert_samples_match_loaded_rules(samples, &rules);
     for (ident, bytes) in samples {
         let p =

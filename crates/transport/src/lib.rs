@@ -47,11 +47,15 @@ mod client;
 mod config;
 mod detection_upload;
 mod error;
+mod event_limit;
 mod upload;
 
 pub use client::TransportClient;
 pub use config::TransportConfig;
-pub use detection_upload::{DetectionDrain, DetectionUploader, QueuedDetection};
+pub use detection_upload::{
+    DetectionDrain, DetectionUploader, MAX_DETECTION_BODY_BYTES, QueuedDetection,
+    fit_detection_to_limit,
+};
 pub use error::{Result, TransportError};
 pub use upload::{EventDrain, EventUploader, UploadLoop, UploadStep};
 

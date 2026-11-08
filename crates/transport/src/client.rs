@@ -65,8 +65,42 @@ impl TransportClient {
     ///
     /// Returns an error if the server rejects the detection or cannot be reached.
     pub fn upload_detection_with_key(&self, detection: &Detection, key: &str) -> Result<()> {
-        let response: DetectionUploadResponse =
-            self.post_json_with_key(&self.config.detection_url(), detection, Some(key))?;
+        let body = serde_json::to_vec(detection).map_err(TransportError::Serialization)?;
+        self.upload_detection_bytes(&body, key)
+    }
+
+    /// Uploads a detection already serialized (so the caller serializes once and can bound the
+    /// size first), with its idempotency key. Unlike the other POSTs, an error status keeps the
+    /// server's explanation (`error` in the JSON body): the uploader tells a refusal of this
+    /// record (`400 Invalid payload`) from one about the whole agent (`400 Invalid certificate
+    /// subject`, or a proxy's HTML `400` for a client certificate that does not verify).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the detection or cannot be reached.
+    pub fn upload_detection_bytes(&self, body: &[u8], key: &str) -> Result<()> {
+        let response = self
+            .agent
+            .post(&self.config.detection_url())
+            .content_type("application/json")
+            .header("Idempotency-Key", key)
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .send(body)
+            .map_err(|e| TransportError::Network(e.to_string()))?;
+        let status = response.status().as_u16();
+        if status >= 400 {
+            let text = read_error_body(response.into_body().into_reader());
+            return Err(server_error(
+                status,
+                error_reason(&text).unwrap_or_else(|| format!("http status: {status}")),
+            ));
+        }
+        let response: DetectionUploadResponse = response
+            .into_body()
+            .read_json()
+            .map_err(|e| TransportError::InvalidResponse(e.to_string()))?;
         validate_detection_response(response)
     }
 
@@ -259,7 +293,23 @@ fn error_reason(body: &str) -> Option<String> {
             .map(str::to_string)
             .filter(|reason| !reason.is_empty());
     }
+    if let Some(reason) = leading_error_string(body) {
+        return Some(reason);
+    }
     (!body.is_empty()).then(|| body.to_string())
+}
+
+/// The `error` string of a JSON body that [`read_error_body`] cut short: the routes answer
+/// `{"error":"...", "details":[...]}` with the reason first, and a long `details` (a validation
+/// `400` with many Zod issues) pushes the body past the cap, so it no longer parses as a whole.
+/// Only a leading `{"error":"` is recognized, and only the string itself is read.
+fn leading_error_string(body: &str) -> Option<String> {
+    let rest = body.strip_prefix("{\"error\":")?.trim_start();
+    let reason = serde_json::Deserializer::from_str(rest)
+        .into_iter::<String>()
+        .next()?
+        .ok()?;
+    (!reason.is_empty()).then_some(reason)
 }
 
 fn validate_detection_response(response: DetectionUploadResponse) -> Result<()> {
@@ -308,9 +358,11 @@ struct DetectionUploadResponse {
 
 /// Builds a ureq agent with the configured TLS settings.
 fn build_agent(config: &TransportConfig) -> Result<ureq::Agent> {
-    let mut agent_builder = ureq::Agent::config_builder()
-        .timeout_global(Some(config.request_timeout))
-        .user_agent(format!("synthaea-agent/{}", env!("CARGO_PKG_VERSION")));
+    let mut agent_builder =
+        ureq::Agent::config_builder().timeout_global(Some(config.request_timeout));
+    if let Some(user_agent) = &config.user_agent {
+        agent_builder = agent_builder.user_agent(user_agent.as_str());
+    }
 
     // A custom TLS config is only needed for mTLS or a private CA; otherwise
     // ureq's defaults (built-in public roots) stand.
@@ -402,6 +454,25 @@ fn load_ca_roots(path: &std::path::Path) -> Result<ureq::tls::RootCerts> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn error_reason_reads_the_error_of_a_body_cut_inside_its_details() {
+        let body = format!(
+            r#"{{"error":"Invalid payload","details":[{}"#,
+            "{\"a\":1},".repeat(400)
+        );
+        assert_eq!(
+            super::error_reason(&body).as_deref(),
+            Some("Invalid payload")
+        );
+        assert_eq!(
+            super::error_reason(r#"{"details":[1,2"#).as_deref(),
+            Some(r#"{"details":[1,2"#)
+        );
+        assert_eq!(
+            super::error_reason(r#"<html>{"error":"x"</html>"#).as_deref(),
+            Some(r#"<html>{"error":"x"</html>"#)
+        );
+    }
     use super::*;
     use crate::DEFAULT_HEARTBEAT_ENDPOINT;
 
@@ -447,14 +518,15 @@ mod tests {
 
     /// Regression (#317 review): the endpoint carried a `/v1` prefix no route
     /// served, and only a mock server that accepts any path was ever tested.
-    /// Next.js app router: the route for `<path>` is `server/app<path>/route.ts`.
+    /// Next.js app router: the route for `<path>` is `server/app<path>/route.ts`
+    /// (the `server` sibling repo; skipped without it).
     /// Under `/api/ingest/` is also what puts it behind nginx's mTLS location and
     /// past the middleware's login redirect.
     #[test]
     fn the_heartbeat_endpoint_is_a_real_server_route() {
         assert!(DEFAULT_HEARTBEAT_ENDPOINT.starts_with("/api/ingest/"));
-        let route = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../server/app")
+        let app = siblings::require_path!("server", "app");
+        let route = app
             .join(DEFAULT_HEARTBEAT_ENDPOINT.trim_start_matches('/'))
             .join("route.ts");
         assert!(route.is_file(), "no server route at {}", route.display());
@@ -468,8 +540,8 @@ mod tests {
             "https://api.example.com/api/ingest/decoy"
         );
         assert!(crate::DEFAULT_DECOY_ENDPOINT.starts_with("/api/ingest/"));
-        let route = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../server/app")
+        let app = siblings::require_path!("server", "app");
+        let route = app
             .join(crate::DEFAULT_DECOY_ENDPOINT.trim_start_matches('/'))
             .join("route.ts");
         assert!(route.is_file(), "no server route at {}", route.display());

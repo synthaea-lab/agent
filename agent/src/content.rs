@@ -263,7 +263,7 @@ pub(crate) fn build_client(
     key: Option<&Path>,
     ca_cert: Option<&Path>,
 ) -> anyhow::Result<transport::TransportClient> {
-    let mut config = transport::TransportConfig::new(server);
+    let mut config = crate::upload::transport_config_for(server);
     if let (Some(cert), Some(key)) = (cert, key) {
         config = config.with_client_cert(PathBuf::from(cert), PathBuf::from(key));
     }

@@ -21,11 +21,12 @@ use crate::{
     ebpf::{
         DNS_UDP_PROGRAM, RAW_TRACEPOINTS, TamperSlot, attach_inode_setattr, attach_raw_tracepoint,
         clear_tamper_slot, err, load_ebpf_for_run, prime_proc_lineage, read_tamper_slot,
-        take_tamper_slot, write_signal_watch_pid,
+        take_signal_tool_drops, take_signal_watch_tools, take_tamper_slot, write_signal_watch_pid,
     },
     normalize,
     parent_image::{ExecStamps, IMAGE_CACHE_CAP, ParentImageEvictions, ParentImages},
     proc::{read_proc_cmdline, read_proc_environ_security, read_proc_images},
+    unit_procs::{ToolWatch, UnitResolver},
 };
 
 /// See `sensor_linux_wire::boot_epoch_offset_ns` — computed once at startup.
@@ -51,6 +52,12 @@ fn boot_epoch_offset_ns() -> u64 {
 
 /// How often [`sweep_survived_sigkill`] runs.
 const TAMPER_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How often the processes of the listed security units are scanned again (#1103). A restarted
+/// tool's new pid is unwatched until the next scan, so this is the window a kill of it can go
+/// unseen in (a few seconds, stated in `docs/detection/security-tool-stop.md`); a scan is a few
+/// small reads of the cgroup tree.
+const TOOL_RESCAN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Age past which a `SIGKILL` recorded against this very process is known not to
 /// have landed. Delivery happens within the sender's `kill(2)` call, microseconds
@@ -277,6 +284,19 @@ impl LinuxSensor {
             "sensor-linux: primed process images for parent_image_path"
         );
 
+        // The processes of the listed security units, before `raw_signal_generate` is attached so
+        // that a signal landing right after the attach already finds them (#1103).
+        let mut tool_watch =
+            ToolWatch::new(UnitResolver::system(), take_signal_watch_tools(&mut ebpf)?);
+        tracing::info!(
+            watched = tool_watch.refresh(),
+            "sensor-linux: security tool processes on the signal watch list"
+        );
+        let tool_procs = tool_watch.procs();
+        let tool_drops = take_signal_tool_drops(&mut ebpf)?;
+        let mut tool_drops_seen = 0u64;
+        let mut tool_rescan = tokio::time::interval(TOOL_RESCAN_INTERVAL);
+
         for (program, name) in RAW_TRACEPOINTS {
             // The UDP/53 capture is a program of its own, attached only when asked for.
             if *program == DNS_UDP_PROGRAM && !self.dns_udp {
@@ -373,6 +393,7 @@ impl LinuxSensor {
                 &previous,
                 offset,
                 self_exe.clone(),
+                None,
                 container_context(previous.meta.cgroup_id, &mut container_ids, &docker_cache),
             ));
             clear_tamper_slot(&mut tamper_slot)?;
@@ -386,6 +407,28 @@ impl LinuxSensor {
                 _ = self.stop.notified() => break,
                 _ = tamper_sweep.tick() => {
                     sweep_survived_sigkill(&mut tamper_slot, own_pid, offset);
+                }
+                _ = tool_rescan.tick() => {
+                    tool_watch.refresh();
+                    // Tool signals lost to a full ring: counted in the kernel, reported when it grows.
+                    if let Ok(per_cpu) = tool_drops.get(&0, 0) {
+                        let total: u64 = per_cpu.iter().sum();
+                        if total > tool_drops_seen {
+                            let lost = total - tool_drops_seen;
+                            tracing::warn!(
+                                dropped = lost,
+                                total,
+                                "sensor-linux: signals to security tools lost, signal ring buffer full"
+                            );
+                            tool_drops_seen = total;
+                            // A flood of lethal signals ahead of a kill is how a tool is ended
+                            // unseen: report the loss as an event the rules alert on.
+                            let now_ns = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+                            sink.on_event(normalize::signals_lost(lost, own_pid, now_ns));
+                        }
+                    }
                 }
                 guard = exec_ring_buf.readable_mut() => {
                     // Two synchronous procfs reads per exec event, on this task (see
@@ -523,7 +566,22 @@ impl LinuxSensor {
                     // to the container it came from.
                     drain!(guard, sensor_linux_wire::SignalEvent, sink, own_pid,
                         |e: &sensor_linux_wire::SignalEvent| {
-                            normalize::signal(e, offset, self_exe.clone(), container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
+                            // A target on the watch list is a security tool: its unit and the
+                            // exe read at scan time (the process may be gone by now). Anything
+                            // else is the agent itself (`SIGNAL_WATCH_PID`). A target that is
+                            // neither (a tool gone from every scan) gets no image and no unit,
+                            // never the agent's: it must not read as a signal to the agent.
+                            let tool = tool_procs
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .get(&e.target_pid)
+                                .cloned();
+                            let (image, unit) = match tool {
+                                Some(tool) => (tool.exe, Some(tool.unit)),
+                                None if e.target_pid == own_pid => (self_exe.clone(), None),
+                                None => (None, None),
+                            };
+                            normalize::signal(e, offset, image, unit, container_context(e.meta.cgroup_id, &mut container_ids, &docker_cache))
                         });
                 }
                 guard = kernel_module_ring_buf.readable_mut() => {

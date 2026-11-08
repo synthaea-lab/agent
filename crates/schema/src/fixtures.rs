@@ -70,6 +70,7 @@ pub fn exec() -> ExecEvent {
         image_path: String::new(),
         cmdline: String::new(),
         argv: Vec::new(),
+        cmdline_truncated: false,
         parent_comm: None,
         parent_image_path: None,
         sha256: None,
@@ -637,6 +638,7 @@ pub fn remote_thread() -> RemoteThreadEvent {
 pub fn process_access() -> ProcessAccessEvent {
     ProcessAccessEvent {
         meta: meta(),
+        caller_image_path: None,
         target_pid: 0,
         target_image_path: None,
         desired_access: 0,

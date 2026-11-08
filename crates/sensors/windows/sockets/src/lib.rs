@@ -8,9 +8,9 @@
 //!
 //! Mechanism: `GetExtendedTcpTable` with `TCP_TABLE_OWNER_PID_LISTENER`, and
 //! `GetExtendedUdpTable` with `UDP_TABLE_OWNER_PID` (issue #676 — UDP has no
-//! "listener" filter, so every bound endpoint comes back, noise included;
-//! see the `snapshot` function's own doc comment, Windows-only so not linked
-//! here), each once for IPv4 and once for IPv6, joined to one `Toolhelp32`
+//! "listener" filter, so every bound endpoint comes back; the agent's path
+//! drops the ones on an ephemeral port, see [`is_drift_relevant`]),
+//! each once for IPv4 and once for IPv6, joined to one `Toolhelp32`
 //! process snapshot for the parent pid and executable name. Unprivileged:
 //! both tables are world-readable; only the owner attribution of protected
 //! processes can come back empty, and it is then reported empty, never
@@ -32,9 +32,9 @@ pub mod raw;
 #[cfg(windows)]
 mod snapshot;
 pub use normalize::listen_port_event;
-pub use raw::ListenerEntry;
+pub use raw::{EPHEMERAL_UDP_PORTS, ListenerEntry, is_drift_relevant};
 #[cfg(windows)]
-pub use snapshot::{listen_port_events, listen_port_events_tcp, snapshot, snapshot_tcp};
+pub use snapshot::{listen_port_events_for_drift, snapshot, snapshot_for_drift};
 
 /// Which IP Helper table a [`SocketsError::Table`] failure came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

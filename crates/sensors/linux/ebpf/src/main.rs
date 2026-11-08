@@ -12,7 +12,9 @@ use aya_ebpf::{
     },
     macros::{lsm, map, uprobe, uretprobe},
     maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
-    programs::{LsmContext, ProbeContext, RetProbeContext, TracePointContext},
+    programs::{
+        LsmContext, ProbeContext, RawTracePointContext, RetProbeContext, TracePointContext,
+    },
 };
 use aya_log_ebpf::{info, warn};
 use sensor_linux_wire::{
@@ -3590,7 +3592,9 @@ const TGKILL_SIG_OFFSET: usize = 20;
 // (`SIGNAL_WATCH_PID`) — there is no field in `tkill(2)`'s argument list
 // comparable to that identity. Superseded by `tgkill(2)` in practice (glibc's
 // `pthread_kill` uses `tgkill`, and a plain `kill(1)` uses `kill(2)`), so this
-// is a narrow, accepted gap rather than a missing common path.
+// is a narrow, accepted gap rather than a missing common path **for the agent's own pid**.
+// The other security tools do not have it: `raw_signal_generate` (#1103) sees `tkill`,
+// `pidfd_send_signal` and `rt_sigqueueinfo` too, and compares the target's `tgid`.
 
 pub fn sys_enter_kill(ctx: TracePointContext) -> u32 {
     match try_sys_enter_kill(ctx) {
@@ -3641,27 +3645,9 @@ fn emit_signal_event(ctx: &TracePointContext, target_pid: u32, sig: u32) -> Resu
         return Ok(0);
     }
 
-    let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
-    let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
-
     let e = SIGNAL_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
     unsafe {
-        core::ptr::write_bytes(e, 0, 1);
-        // meta is the SENDER, not the target — same convention as macOS's
-        // `SignalToEsClient` (see `SignalEvent`'s doc comment in `sensor-linux-wire`).
-        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        fill_lineage(&mut (*e).meta);
-        (*e).meta.uid = uid_gid as u32;
-        (*e).meta.gid = (uid_gid >> 32) as u32;
-        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            (*e).meta.comm[i] = comm[i];
-            i += 1;
-        }
-        (*e).signal = sig;
-        (*e).target_pid = target_pid;
+        fill_signal_event(e, target_pid, sig)?;
 
         // Written before the ring-buffer output, so the slot is recorded even
         // when the ring is full.
@@ -3680,6 +3666,85 @@ fn emit_signal_event(ctx: &TracePointContext, target_pid: u32, sig: u32) -> Resu
         }
     }
 
+    Ok(0)
+}
+
+/// Fills `e` with a signal event: `meta` is the SENDER (the current task), the target is
+/// `target_pid` — same convention as macOS's `SignalToEsClient` (see `SignalEvent`'s doc comment
+/// in `sensor-linux-wire`). Shared by the syscall probes above and [`emit_tool_signal_event`].
+///
+/// # Safety
+///
+/// `e` must point at a valid, writable `SignalEvent` (the per-CPU scratch slot).
+#[inline(always)]
+unsafe fn fill_signal_event(e: *mut SignalEvent, target_pid: u32, sig: u32) -> Result<(), u32> {
+    let comm = bpf_get_current_comm().map_err(|_| 1u32)?;
+    let uid_gid = aya_ebpf::helpers::bpf_get_current_uid_gid();
+    unsafe {
+        core::ptr::write_bytes(e, 0, 1);
+        (*e).meta.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        fill_lineage(&mut (*e).meta);
+        (*e).meta.uid = uid_gid as u32;
+        (*e).meta.gid = (uid_gid >> 32) as u32;
+        (*e).meta.timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+        (*e).meta.cgroup_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
+        let mut i = 0usize;
+        while i < TASK_COMM_LEN {
+            (*e).meta.comm[i] = comm[i];
+            i += 1;
+        }
+        (*e).signal = sig;
+        (*e).target_pid = target_pid;
+    }
+    Ok(())
+}
+
+/// Thread-group ids of the processes of the listed security units (`SECURITY_SERVICES`), filled
+/// and refreshed by userspace from each unit's cgroup (#1103). The value is the process's
+/// `SigCgt` (the signals it catches, bit `sig - 1`) at scan time: a caught reload signal is
+/// dropped in the probe. The size is `SIGNAL_WATCH_TOOLS_ENTRIES`, checked by the userspace
+/// loader against `SECURITY_SERVICES.len()` times the per-unit process cap, with headroom.
+#[map]
+static SIGNAL_WATCH_TOOLS: HashMap<u32, u64> =
+    HashMap::with_max_entries(sensor_linux_wire::SIGNAL_WATCH_TOOLS_ENTRIES, 0);
+
+/// Tool signals lost because `SIGNAL_EVENTS` was full, per CPU: userspace sums and reports it.
+#[map]
+static SIGNAL_TOOL_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+/// The `SigCgt` of `tgid` when it is a process of a listed security unit, `None` otherwise.
+#[inline(always)]
+pub(crate) fn watched_tool_sigcgt(tgid: u32) -> Option<u64> {
+    // SAFETY: the map is only read here; the value is copied out before the reference ends.
+    unsafe { SIGNAL_WATCH_TOOLS.get(&tgid) }.copied()
+}
+
+/// Emits a signal sent to a process of a listed security unit, from the `signal_generate`
+/// raw tracepoint (#1103). The target is already known to be watched and the signal to come from
+/// a process (not the kernel): `raw_signal_generate` checked both. A kill of a tool does not take
+/// the agent down, so the ring buffer is enough: nothing goes to `SIGNAL_TAMPER_LAST`.
+#[inline(always)]
+pub(crate) fn emit_tool_signal_event(
+    ctx: &RawTracePointContext,
+    target_tgid: u32,
+    sig: u32,
+) -> Result<u32, u32> {
+    let e = SIGNAL_SCRATCH.get_ptr_mut(0).ok_or(1u32)?;
+    // SAFETY: `e` is this CPU's scratch slot (one per CPU, and a probe does not nest on its
+    // own CPU), valid for a `SignalEvent`; `fill_signal_event` initialises it before `output`
+    // copies it, and the drop counter is this CPU's own slot.
+    unsafe {
+        fill_signal_event(e, target_tgid, sig)?;
+        if SIGNAL_EVENTS.output::<SignalEvent>(&*e, 0).is_err() {
+            if let Some(drops) = SIGNAL_TOOL_DROPS.get_ptr_mut(0) {
+                *drops += 1;
+            }
+            warn!(
+                ctx,
+                "sensor-linux-ebpf: ring buffer full, dropping signal event"
+            );
+        }
+    }
     Ok(0)
 }
 

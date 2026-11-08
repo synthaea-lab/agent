@@ -5,18 +5,20 @@
 
 use intel::{DEFAULT_MEMORY_BUDGET_BYTES, FeedId, IndicatorKind, SetBuilder};
 
-const DRAFT: &str = include_str!("../../../server/tests/fixtures/ioc-draft-golden.txt");
+/// In the `server` sibling repo; read at run time, the test skips without it.
+const DRAFT_PATH: &str = "tests/fixtures/ioc-draft-golden.txt";
 
 #[test]
 fn a_graduated_draft_loads_whole_and_every_line_matches() {
+    let draft = siblings::require!("server", DRAFT_PATH);
     let mut builder = SetBuilder::new(DEFAULT_MEMORY_BUDGET_BYTES);
-    let report = builder.add_lines(FeedId(1), DRAFT);
+    let report = builder.add_lines(FeedId(1), &draft);
     assert_eq!(
         report.rejected, 0,
         "a line of the draft is not an indicator"
     );
     assert_eq!(report.over_budget, 0);
-    let indicators = DRAFT
+    let indicators = draft
         .lines()
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .count() as u64;

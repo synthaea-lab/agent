@@ -71,7 +71,7 @@ The `ort-sys` crate's hardcoded static library list is incomplete for onnxruntim
 Use the auto-discovery script to generate the necessary flags:
 
 ```bash
-eval "$(./lab/provisioning/ort-static-link-flags.sh)"
+eval "$(./toolchain/ort-static-link-flags.sh)"
 ```
 
 This walks `$ORT_LIB_LOCATION` for every `.a` file produced and emits `-L native=<dir> -l static=<name>` flags.
@@ -257,6 +257,6 @@ changes that can break the link, not on every PR.
 ## References
 
 - Issue #110: ML crate static linking tracking issue
-- Script #197: `lab/provisioning/ort-static-link-flags.sh`
+- Script #197: `toolchain/ort-static-link-flags.sh`
 - onnxruntime: https://github.com/microsoft/onnxruntime
 - ort crate: https://github.com/pykeio/ort

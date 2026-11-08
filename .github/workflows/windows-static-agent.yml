@@ -11,8 +11,8 @@ on:
     paths:
       - "agent/Cargo.toml"
       - "crates/ml/**"
-      - "lab/provisioning/build-onnxruntime-static.ps1"
-      - "lab/provisioning/ort-static-link-flags.ps1"
+      - "toolchain/build-onnxruntime-static.ps1"
+      - "toolchain/ort-static-link-flags.ps1"
       - "tools/check-pe-imports.py"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -24,8 +24,8 @@ on:
     paths:
       - "agent/Cargo.toml"
       - "crates/ml/**"
-      - "lab/provisioning/build-onnxruntime-static.ps1"
-      - "lab/provisioning/ort-static-link-flags.ps1"
+      - "toolchain/build-onnxruntime-static.ps1"
+      - "toolchain/ort-static-link-flags.ps1"
       - "tools/check-pe-imports.py"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -65,11 +65,11 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ort-static
-          key: ort-static-windows-2022-${{ hashFiles('lab/provisioning/build-onnxruntime-static.ps1') }}
+          key: ort-static-windows-2022-${{ hashFiles('toolchain/build-onnxruntime-static.ps1') }}
 
       - name: Build onnxruntime from source
         if: steps.ort-cache.outputs.cache-hit != 'true'
-        run: ./lab/provisioning/build-onnxruntime-static.ps1
+        run: ./toolchain/build-onnxruntime-static.ps1
 
       # `ort-static\Release` mirrors `build\Windows\Release`, so ORT_LIB_LOCATION keeps the
       # `Release\Release` shape the link-flags script expects. The build tree is removed
@@ -101,7 +101,7 @@ jobs:
       - name: Generate the static link flags
         run: |
           $env:ORT_LIB_LOCATION = "$PWD\ort-static\Release\Release"
-          ./lab/provisioning/ort-static-link-flags.ps1 | Invoke-Expression
+          ./toolchain/ort-static-link-flags.ps1 | Invoke-Expression
           "ORT_LIB_LOCATION=$env:ORT_LIB_LOCATION" >> $env:GITHUB_ENV
           "RUSTFLAGS=$env:RUSTFLAGS" >> $env:GITHUB_ENV
 

@@ -41,6 +41,12 @@ pub enum TransportError {
     #[error("configuration error: {0}")]
     Config(String),
 
+    /// Events of a drained segment could not be shortened to the body limit (#1131). Nothing is
+    /// lost silently: the segment is not acknowledged, so the next drain delivers it again, and
+    /// only the attempt budget skips it, with a warning that counts what was dropped.
+    #[error("{count} event(s) cannot be sent under the body limit")]
+    Unsendable { count: usize },
+
     /// Server is unreachable (for graceful degradation).
     #[error("server unreachable")]
     Unreachable,
@@ -52,7 +58,7 @@ impl TransportError {
     pub fn is_retryable(&self) -> bool {
         match self {
             TransportError::Network(_) | TransportError::Unreachable => true,
-            TransportError::InvalidResponse(_) => true,
+            TransportError::InvalidResponse(_) | TransportError::Unsendable { .. } => true,
             TransportError::ServerError { status, .. } => *status >= 500,
             _ => false,
         }

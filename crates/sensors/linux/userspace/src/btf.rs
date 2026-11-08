@@ -27,6 +27,8 @@ enum Endianness {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SchedulerFieldOffsets {
     pub(crate) task_pid: u32,
+    /// `task_struct.tgid`: the process id of a task (`pid` is its thread id), #1103.
+    pub(crate) task_tgid: u32,
     pub(crate) task_comm: u32,
     pub(crate) binprm_filename: u32,
     pub(crate) syscall_args: [u32; 6],
@@ -86,6 +88,7 @@ fn parse_scheduler_field_offsets(data: &[u8]) -> Result<SchedulerFieldOffsets, &
     let strings = &data[str_start..str_end];
 
     let mut task_pid = None;
+    let mut task_tgid = None;
     let mut task_comm = None;
     let mut binprm_filename = None;
     let mut syscall_args = [None; 6];
@@ -111,13 +114,15 @@ fn parse_scheduler_field_offsets(data: &[u8]) -> Result<SchedulerFieldOffsets, &
 
         if kind == BTF_KIND_STRUCT
             && matches_string(strings, name_off, b"task_struct")?
-            && (task_pid.is_none() || task_comm.is_none())
+            && (task_pid.is_none() || task_comm.is_none() || task_tgid.is_none())
         {
             for member_index in 0..vlen {
                 let member = extra_start + member_index * 12;
                 let member_name = read_u32(data, member, endianness)?;
                 if matches_string(strings, member_name, b"pid")? {
                     task_pid = Some(member_byte_offset(data, member + 8, info, endianness)?);
+                } else if matches_string(strings, member_name, b"tgid")? {
+                    task_tgid = Some(member_byte_offset(data, member + 8, info, endianness)?);
                 } else if matches_string(strings, member_name, b"comm")? {
                     task_comm = Some(member_byte_offset(data, member + 8, info, endianness)?);
                 }
@@ -199,6 +204,7 @@ fn parse_scheduler_field_offsets(data: &[u8]) -> Result<SchedulerFieldOffsets, &
 
     Ok(SchedulerFieldOffsets {
         task_pid: task_pid.ok_or("task_struct.pid is missing")?,
+        task_tgid: task_tgid.ok_or("task_struct.tgid is missing")?,
         task_comm: task_comm.ok_or("task_struct.comm is missing")?,
         binprm_filename: binprm_filename.ok_or("linux_binprm.filename is missing")?,
         syscall_args: syscall_arg_offsets(syscall_args)?,
@@ -528,7 +534,8 @@ mod tests {
         #[cfg(target_arch = "aarch64")]
         // pt_regs has regs[31], sp, pc, pstate and orig_x0 before syscallno.
         let (registers, syscall_nr): RegisterFixture = (&[(b"regs", 0)], (b"syscallno", 280));
-        let mut strings = b"\0task_struct\0pid\0comm\0linux_binprm\0filename\0pt_regs\0".to_vec();
+        let mut strings =
+            b"\0task_struct\0pid\0comm\0tgid\0linux_binprm\0filename\0pt_regs\0".to_vec();
         for (name, _) in registers {
             strings.extend_from_slice(name);
             strings.push(0);
@@ -552,11 +559,15 @@ mod tests {
         push_u32(4);
         push_u32(32);
 
-        // struct task_struct { int pid; int comm; }
+        // struct task_struct { int pid; int comm; int tgid; }
         push_u32(offset(b"task_struct"));
-        push_u32((BTF_KIND_STRUCT << 24) | 2);
+        push_u32((BTF_KIND_STRUCT << 24) | 3);
         push_u32(32);
-        for (name, bit_offset) in [(b"pid".as_slice(), 24), (b"comm".as_slice(), 64)] {
+        for (name, bit_offset) in [
+            (b"pid".as_slice(), 24),
+            (b"comm".as_slice(), 64),
+            (b"tgid".as_slice(), 96),
+        ] {
             push_u32(offset(name));
             push_u32(1);
             push_u32(bit_offset);
@@ -624,6 +635,7 @@ mod tests {
             parse_scheduler_field_offsets(&minimal_btf(true)).unwrap(),
             SchedulerFieldOffsets {
                 task_pid: 3,
+                task_tgid: 12,
                 task_comm: 8,
                 binprm_filename: 10,
                 syscall_args: expected_args,
@@ -781,6 +793,8 @@ mod tests {
         if path.exists() {
             let offsets = read_scheduler_field_offsets().expect("running kernel BTF parses");
             assert!(offsets.task_pid < 4096);
+            assert!(offsets.task_tgid < 4096);
+            assert_ne!(offsets.task_tgid, offsets.task_pid);
             assert!(offsets.task_comm < 4096);
             assert!(offsets.binprm_filename < 4096);
             assert!(offsets.syscall_args.iter().all(|offset| *offset < 4096));

@@ -269,7 +269,7 @@ async fn serve_one<H: Handler>(
         &mut write_half,
         &ServerHello {
             version: PROTOCOL_VERSION,
-            agent_version: format!("synthaea-agent-{}", crate_version()),
+            agent_version: crate_version(),
         },
     )
     .await

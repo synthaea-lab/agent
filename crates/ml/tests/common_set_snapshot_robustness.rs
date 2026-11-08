@@ -6,14 +6,14 @@
 use ml::features::{common_set::CommonSetSnapshot, rarity::CommonSet};
 use serde_json::Value;
 
-const GOLDEN: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../ml/tests/fixtures/common_set_snapshot_golden.json"
-));
+/// In the `ml` sibling repo; read at run time, the test skips without it.
+const GOLDEN_PATH: &str = "tests/fixtures/common_set_snapshot_golden.json";
 
-fn reference_blobs() -> Vec<Vec<u8>> {
-    let doc: Value = serde_json::from_str(GOLDEN).expect("fixture parses");
-    doc["cases"]
+/// The golden snapshots' bytes, or `None` (the test skips) without the `ml` sibling.
+fn reference_blobs() -> Option<Vec<Vec<u8>>> {
+    let golden = siblings::require!("ml", GOLDEN_PATH, None);
+    let doc: Value = serde_json::from_str(&golden).expect("fixture parses");
+    let blobs = doc["cases"]
         .as_array()
         .unwrap()
         .iter()
@@ -24,7 +24,8 @@ fn reference_blobs() -> Vec<Vec<u8>> {
                 .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
                 .collect()
         })
-        .collect()
+        .collect();
+    Some(blobs)
 }
 
 /// Parses, and when that works, queries too: a parse that succeeds must also be safe to use.
@@ -38,7 +39,10 @@ fn exercise(bytes: &[u8]) {
 
 #[test]
 fn every_prefix_of_a_valid_snapshot() {
-    for blob in reference_blobs() {
+    let Some(blobs) = reference_blobs() else {
+        return;
+    };
+    for blob in blobs {
         for len in 0..=blob.len() {
             exercise(&blob[..len]);
         }
@@ -47,7 +51,10 @@ fn every_prefix_of_a_valid_snapshot() {
 
 #[test]
 fn every_single_byte_changed_in_a_valid_snapshot() {
-    for blob in reference_blobs().iter().take(3) {
+    let Some(blobs) = reference_blobs() else {
+        return;
+    };
+    for blob in blobs.iter().take(3) {
         for i in 0..blob.len() {
             for value in [0x00, 0x01, 0x7f, 0x80, 0xff] {
                 let mut mutated = blob.clone();
@@ -60,7 +67,10 @@ fn every_single_byte_changed_in_a_valid_snapshot() {
 
 #[test]
 fn a_header_claiming_a_huge_filter_over_a_tiny_body_is_refused_without_allocating() {
-    let mut header = reference_blobs()[0][..32].to_vec();
+    let Some(blobs) = reference_blobs() else {
+        return;
+    };
+    let mut header = blobs[0][..32].to_vec();
     header[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(CommonSetSnapshot::parse(&header).is_err());
     header[20..24].copy_from_slice(&0xffff_fff8_u32.to_le_bytes());

@@ -662,22 +662,21 @@ mod tests {
 }
 
 /// Parity-seam golden fixture (CLAUDE.md): one real, signed manifest checked
-/// in once at `server/tests/fixtures/content-manifest-golden.json` and
-/// verified by both this crate's tests and the server's TS unit tests
+/// in once at `server/tests/fixtures/content-manifest-golden.json` (the
+/// `server` sibling repo; these tests skip without it) and verified by both
+/// this crate's tests and the server's TS unit tests
 /// (`server/tests/unit/content-manifest-golden.test.ts`), so a canonicalization
 /// mismatch between the two sides (PR #509 review) can't silently reappear.
 #[cfg(test)]
 mod golden_fixture {
     use super::*;
 
-    const GOLDEN_FIXTURE: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../server/tests/fixtures/content-manifest-golden.json"
-    ));
+    const GOLDEN_FIXTURE: &str = "tests/fixtures/content-manifest-golden.json";
 
     #[test]
     fn golden_fixture_verifies_against_the_embedded_key() {
-        let manifest: ContentManifest = serde_json::from_str(GOLDEN_FIXTURE).unwrap();
+        let golden = siblings::require!("server", GOLDEN_FIXTURE);
+        let manifest: ContentManifest = serde_json::from_str(&golden).unwrap();
         manifest.verify_signature().unwrap();
     }
 
@@ -692,10 +691,11 @@ mod golden_fixture {
         // checkout that reintroduces CRLF here should fail on real content
         // drift, not on line endings (this crate's own CI caught exactly that
         // once, before this normalization existed).
-        let manifest: ContentManifest = serde_json::from_str(GOLDEN_FIXTURE).unwrap();
+        let golden = siblings::require!("server", GOLDEN_FIXTURE);
+        let manifest: ContentManifest = serde_json::from_str(&golden).unwrap();
         let regenerated = serde_json::to_string_pretty(&manifest).unwrap();
         assert_eq!(
-            GOLDEN_FIXTURE.trim_end().replace("\r\n", "\n"),
+            golden.trim_end().replace("\r\n", "\n"),
             regenerated.trim_end().replace("\r\n", "\n")
         );
     }
