@@ -10,6 +10,8 @@ Rules (see CLAUDE.md):
   - Leaf crates (response, transport, ipc, sinks, updater, config, store, conformance)
     depend only on the base tier.
   - Only the binaries (`agent`, `watchdog`, `cli`) may depend on anything.
+  - Test-support crates (`siblings`) depend on no workspace crate and may be a
+    dev-dependency of anything — never a normal or build dependency.
   - No crate depends on a binary.
 
 Run from the workspace root: `python3 tools/check-deps.py`
@@ -28,13 +30,15 @@ LEAF = {"response", "transport", "ipc", "sinks", "updater", "config", "store",
         "conformance", "tamper", "mesh", "device-control", "inventory", "redact"}
 BINARIES = {"agent", "watchdog", "cli", "release-tool"}
 WIRE_CRATES = {"sensor-linux-wire"}
+# Dev-only helpers: leaves with no workspace deps, usable as a dev-dependency anywhere.
+TEST_SUPPORT = {"siblings"}
 
 
 def allowed(crate: str) -> set[str] | None:
     """Workspace crates `crate` may depend on; None means unrestricted."""
     if crate in BINARIES:
         return None
-    if crate == SCHEMA:
+    if crate == SCHEMA or crate in TEST_SUPPORT:
         return set()
     if crate == "policy":
         return {SCHEMA}
@@ -61,10 +65,16 @@ def main() -> None:
     violations = []
 
     for name, pkg in workspace.items():
+        for dep in pkg["dependencies"]:
+            if dep["name"] in TEST_SUPPORT and dep["kind"] != "dev":
+                violations.append(f"  {name} -> {dep['name']} (test-support crate: "
+                                  f"dev-dependencies only)")
         rules = allowed(name)
         if rules is None:
             continue
         for dep in pkg["dependencies"]:
+            if dep["name"] in TEST_SUPPORT:
+                continue
             if dep["name"] in workspace and dep["name"] not in rules:
                 violations.append(f"  {name} -> {dep['name']}")
         for dep in pkg["dependencies"]:
