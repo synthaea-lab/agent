@@ -5430,14 +5430,15 @@ rule reload_content_test_marker {
 
     // ── the common-set snapshot (ADR-0020, issue #76) ───────────────────────
 
-    /// A reference snapshot from the shared golden file (the same bytes the server's builder
-    /// and the `ml` reader are tested against), with some hashes it contains.
-    fn golden_common_set(case: &str) -> (Vec<u8>, Vec<String>, u32) {
-        let doc: serde_json::Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../ml/tests/fixtures/common_set_snapshot_golden.json"
-        )))
-        .unwrap();
+    /// The shared common-set golden file in the `ml` sibling repo (the same bytes the
+    /// server's builder and the `ml` reader are tested against). Tests that need it read it
+    /// first with `siblings::require!` and skip without it.
+    const COMMON_SET_GOLDEN: &str = "tests/fixtures/common_set_snapshot_golden.json";
+
+    /// A reference snapshot from `golden` (the text of [`COMMON_SET_GOLDEN`]), with some
+    /// hashes it contains.
+    fn golden_common_set(golden: &str, case: &str) -> (Vec<u8>, Vec<String>, u32) {
+        let doc: serde_json::Value = serde_json::from_str(golden).unwrap();
         let case = doc["cases"]
             .as_array()
             .unwrap()
@@ -5468,8 +5469,9 @@ rule reload_content_test_marker {
     #[test]
     fn a_common_set_snapshot_in_the_content_dir_is_loaded_at_startup() {
         use ml::features::rarity::CommonSet as _;
+        let golden = siblings::require!("ml", COMMON_SET_GOLDEN);
         let dir = tmp("common-set-startup");
-        let (bytes, members, hosts) = golden_common_set("fifty_hashes_one_percent");
+        let (bytes, members, hosts) = golden_common_set(&golden, "fifty_hashes_one_percent");
         write_common_set(&dir, &bytes);
 
         let sink = sink_in(&dir);
@@ -5490,10 +5492,11 @@ rule reload_content_test_marker {
 
     #[test]
     fn reload_content_picks_up_a_common_set_snapshot_added_after_construction() {
+        let golden = siblings::require!("ml", COMMON_SET_GOLDEN);
         let dir = tmp("common-set-reload");
         let sink = sink_in(&dir);
         assert!(sink.common_set().is_none());
-        let (bytes, _, _) = golden_common_set("one_hash");
+        let (bytes, _, _) = golden_common_set(&golden, "one_hash");
         write_common_set(&dir, &bytes);
 
         sink.reload_content();
@@ -5503,10 +5506,11 @@ rule reload_content_test_marker {
 
     #[test]
     fn reload_content_unloads_the_common_set_when_its_file_is_removed() {
+        let golden = siblings::require!("ml", COMMON_SET_GOLDEN);
         // Same posture as the rule directories: an absent file is "no content", not an error,
         // and the evidence that depends on it is withheld rather than judged on a stale set.
         let dir = tmp("common-set-removed");
-        let (bytes, _, _) = golden_common_set("one_hash");
+        let (bytes, _, _) = golden_common_set(&golden, "one_hash");
         write_common_set(&dir, &bytes);
         let sink = sink_in(&dir);
         assert!(sink.common_set().is_some());
@@ -5520,8 +5524,9 @@ rule reload_content_test_marker {
     #[test]
     fn reload_content_keeps_the_previous_common_set_when_the_new_file_is_corrupt() {
         use ml::features::rarity::CommonSet as _;
+        let golden = siblings::require!("ml", COMMON_SET_GOLDEN);
         let dir = tmp("common-set-corrupt");
-        let (bytes, members, _) = golden_common_set("fifty_hashes_one_percent");
+        let (bytes, members, _) = golden_common_set(&golden, "fifty_hashes_one_percent");
         write_common_set(&dir, &bytes);
         let sink = sink_in(&dir);
         let mut broken = bytes.clone();
@@ -5544,8 +5549,9 @@ rule reload_content_test_marker {
 
     #[test]
     fn a_common_set_file_over_the_size_cap_is_refused_unread() {
+        let golden = siblings::require!("ml", COMMON_SET_GOLDEN);
         let dir = tmp("common-set-cap");
-        let (bytes, _, _) = golden_common_set("two_hundred_hashes_one_in_a_thousand");
+        let (bytes, _, _) = golden_common_set(&golden, "two_hundred_hashes_one_in_a_thousand");
         write_common_set(&dir, &bytes);
         let root = dir.join("content");
 
@@ -5570,12 +5576,8 @@ rule reload_content_test_marker {
     // ── rarity evidence (ADR-0020, issue #76) ───────────────────────────────
 
     /// A hash the snapshot built in a golden case does not contain.
-    fn golden_non_member(case: &str) -> String {
-        let doc: serde_json::Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../ml/tests/fixtures/common_set_snapshot_golden.json"
-        )))
-        .unwrap();
+    fn golden_non_member(golden: &str, case: &str) -> String {
+        let doc: serde_json::Value = serde_json::from_str(golden).unwrap();
         let case = doc["cases"]
             .as_array()
             .unwrap()
@@ -5588,10 +5590,12 @@ rule reload_content_test_marker {
     #[test]
     fn rarity_evidence_follows_the_snapshot_the_hash_and_the_coverage() {
         use ml::features::common_set::CommonSetSnapshot;
-        let load = |case: &str| CommonSetSnapshot::parse(&golden_common_set(case).0).unwrap();
+        let golden = siblings::require!("ml", COMMON_SET_GOLDEN);
+        let load =
+            |case: &str| CommonSetSnapshot::parse(&golden_common_set(&golden, case).0).unwrap();
         let wide = load("fifty_hashes_one_percent"); // 12 hosts covered
-        let member = golden_common_set("fifty_hashes_one_percent").1[0].clone();
-        let absent = golden_non_member("fifty_hashes_one_percent");
+        let member = golden_common_set(&golden, "fifty_hashes_one_percent").1[0].clone();
+        let absent = golden_non_member(&golden, "fifty_hashes_one_percent");
 
         assert_eq!(
             super::rarity_evidence(Some(&member), Some(&wide), 10),
@@ -5645,6 +5649,7 @@ rule reload_content_test_marker {
 
     /// The counts after one exec, against an engine that has (or has not) correlated it.
     fn rarity_counts_after(
+        golden: &str,
         case: &str,
         sha256: Option<String>,
         correlated: bool,
@@ -5653,7 +5658,7 @@ rule reload_content_test_marker {
 
         use crate::health::RarityStatsSource as _;
 
-        let snapshot = CommonSetSnapshot::parse(&golden_common_set(case).0).unwrap();
+        let snapshot = CommonSetSnapshot::parse(&golden_common_set(golden, case).0).unwrap();
         // "Now" is the instant the snapshot was built: its age is not what these cases are about.
         let now = snapshot.header().built_at;
         let exec = exec_hashed(7_001, sha256.as_deref());
@@ -5674,8 +5679,9 @@ rule reload_content_test_marker {
 
     #[test]
     fn rarity_counts_an_applied_evidence() {
-        let absent = golden_non_member("fifty_hashes_one_percent");
-        let counts = rarity_counts_after("fifty_hashes_one_percent", Some(absent), true);
+        let golden = siblings::require!("ml", COMMON_SET_GOLDEN);
+        let absent = golden_non_member(&golden, "fifty_hashes_one_percent");
+        let counts = rarity_counts_after(&golden, "fifty_hashes_one_percent", Some(absent), true);
         assert_eq!(
             (counts.applied, counts.withheld, counts.unapplied),
             (1, 0, 0)
@@ -5684,10 +5690,11 @@ rule reload_content_test_marker {
 
     #[test]
     fn rarity_counts_evidence_that_found_no_belief_to_land_on() {
+        let golden = siblings::require!("ml", COMMON_SET_GOLDEN);
         // The correlator evicted (or never created) the process's belief: the loss is
         // counted, not silent.
-        let absent = golden_non_member("fifty_hashes_one_percent");
-        let counts = rarity_counts_after("fifty_hashes_one_percent", Some(absent), false);
+        let absent = golden_non_member(&golden, "fifty_hashes_one_percent");
+        let counts = rarity_counts_after(&golden, "fifty_hashes_one_percent", Some(absent), false);
         assert_eq!(
             (counts.applied, counts.withheld, counts.unapplied),
             (0, 0, 1)
@@ -5696,10 +5703,11 @@ rule reload_content_test_marker {
 
     #[test]
     fn rarity_counts_a_withheld_judgement_whatever_the_reason() {
-        let absent = golden_non_member("fifty_hashes_one_percent");
+        let golden = siblings::require!("ml", COMMON_SET_GOLDEN);
+        let absent = golden_non_member(&golden, "fifty_hashes_one_percent");
         // A snapshot too thin to judge by, then an exec with no hash.
-        let thin = rarity_counts_after("one_hash", Some(absent), true);
-        let no_hash = rarity_counts_after("fifty_hashes_one_percent", None, true);
+        let thin = rarity_counts_after(&golden, "one_hash", Some(absent), true);
+        let no_hash = rarity_counts_after(&golden, "fifty_hashes_one_percent", None, true);
         assert_eq!((thin.applied, thin.withheld, thin.unapplied), (0, 1, 0));
         assert_eq!(
             (no_hash.applied, no_hash.withheld, no_hash.unapplied),
@@ -5709,8 +5717,9 @@ rule reload_content_test_marker {
 
     #[test]
     fn rarity_counts_nothing_for_an_image_the_fleet_knows() {
-        let member = golden_common_set("fifty_hashes_one_percent").1[0].clone();
-        let counts = rarity_counts_after("fifty_hashes_one_percent", Some(member), true);
+        let golden = siblings::require!("ml", COMMON_SET_GOLDEN);
+        let member = golden_common_set(&golden, "fifty_hashes_one_percent").1[0].clone();
+        let counts = rarity_counts_after(&golden, "fifty_hashes_one_percent", Some(member), true);
         assert_eq!(
             (counts.applied, counts.withheld, counts.unapplied),
             (0, 0, 0)
@@ -5736,10 +5745,11 @@ rule reload_content_test_marker {
     #[test]
     fn a_snapshot_past_its_maximum_age_withholds_the_evidence() {
         use crate::health::RarityStatsSource as _;
+        let golden = siblings::require!("ml", COMMON_SET_GOLDEN);
         let case = "fifty_hashes_one_percent";
-        let absent = golden_non_member(case);
+        let absent = golden_non_member(&golden, case);
         let built_at =
-            ml::features::common_set::CommonSetSnapshot::parse(&golden_common_set(case).0)
+            ml::features::common_set::CommonSetSnapshot::parse(&golden_common_set(&golden, case).0)
                 .unwrap()
                 .header()
                 .built_at;
@@ -5751,8 +5761,10 @@ rule reload_content_test_marker {
             super::note_image_rarity(
                 &Mutex::new(engine),
                 &Mutex::new(Some(Arc::new(
-                    ml::features::common_set::CommonSetSnapshot::parse(&golden_common_set(case).0)
-                        .unwrap(),
+                    ml::features::common_set::CommonSetSnapshot::parse(
+                        &golden_common_set(&golden, case).0,
+                    )
+                    .unwrap(),
                 ))),
                 &stats,
                 &exec,

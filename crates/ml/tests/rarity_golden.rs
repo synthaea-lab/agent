@@ -14,10 +14,8 @@ use std::collections::HashSet;
 use ml::features::rarity::{CommonSet, FEATURE_COUNT, FEATURE_NAMES, extract_features};
 use serde_json::Value;
 
-const GOLDEN: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../ml/tests/fixtures/rarity_golden.jsonl"
-));
+/// In the `ml` sibling repo; read at run time, the test skips without it.
+const GOLDEN_PATH: &str = "tests/fixtures/rarity_golden.jsonl";
 
 /// A snapshot as a plain set: the extractor only needs a membership test and the coverage.
 struct Snapshot {
@@ -54,8 +52,9 @@ fn snapshot_from_json(value: &Value) -> Option<Snapshot> {
 
 #[test]
 fn parity_with_rarity_py() {
+    let golden = siblings::require!("ml", GOLDEN_PATH);
     let mut cases = 0;
-    for line in GOLDEN.lines().filter(|l| !l.trim().is_empty()) {
+    for line in golden.lines().filter(|l| !l.trim().is_empty()) {
         let row: Value = serde_json::from_str(line).expect("invalid golden line");
         let name = row["name"].as_str().expect("name field");
         let sha256 = row["sha256"].as_str();
