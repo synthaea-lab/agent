@@ -33,3 +33,4 @@ which = { version = "8.0.6", default-features = false }
 
 [dev-dependencies]
 proptest = "1.11"
+tempfile = "3"

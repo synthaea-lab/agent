@@ -9,6 +9,7 @@
 use std::{
     collections::HashSet,
     fs,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
@@ -46,13 +47,6 @@ impl LibraryType {
     }
 }
 
-/// Shell type for readline probes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShellType {
-    Bash,
-    Zsh,
-}
-
 /// Symbol resolution error.
 #[derive(Debug, thiserror::Error)]
 pub enum ResolverError {
@@ -62,227 +56,51 @@ pub enum ResolverError {
     Elf(#[from] goblin::error::Error),
 }
 
-/// Finds SSL libraries in common system paths, deduplicating symlinks.
-///
-/// # Errors
-///
-/// Returns [`ResolverError`] if directory traversal fails.
-pub fn find_ssl_libraries() -> Result<Vec<PathBuf>, ResolverError> {
-    let search_paths = [
-        "/lib",
-        "/usr/lib",
-        "/lib64",
-        "/usr/lib64",
-        "/lib/x86_64-linux-gnu",
-        "/usr/lib/x86_64-linux-gnu",
-    ];
+/// Library directories searched for every library family, relative to the filesystem root:
+/// the classic and lib64 trees plus the Debian/Ubuntu multiarch trees. One list for all
+/// families so no search can drift (the TLS search once skipped the arm64 trees).
+const LIBRARY_DIRS: &[&str] = &[
+    "lib",
+    "usr/lib",
+    "lib64",
+    "usr/lib64",
+    "lib/x86_64-linux-gnu",
+    "usr/lib/x86_64-linux-gnu",
+    "lib/aarch64-linux-gnu",
+    "usr/lib/aarch64-linux-gnu",
+];
 
-    let mut libraries = Vec::new();
+/// OpenSSL/BoringSSL (`libssl`) and `GnuTLS`.
+const SSL_LIBRARY_PREFIXES: &[&str] = &["libssl.so", "libgnutls.so"];
+
+/// Some bash builds link libedit instead of libreadline.
+const READLINE_LIBRARY_PREFIXES: &[&str] = &["libreadline.so", "libedit.so"];
+
+/// glibc only: musl names its libc `ld-musl-*.so.1` and lays out `getaddrinfo` in a
+/// different symbol table shape; musl support is issue #267 Phase 2.
+const LIBC_LIBRARY_PREFIXES: &[&str] = &["libc.so", "libc-"];
+
+/// Lists the regular files under `root`/[`LIBRARY_DIRS`] whose name starts with one of
+/// `prefixes`, one path per inode so a library reached through several symlinks is resolved once.
+/// Missing or unreadable directories are skipped: not every layout exists on every distro.
+fn find_libraries(root: &Path, prefixes: &[&str]) -> Vec<PathBuf> {
     let mut seen_inodes = HashSet::new();
-
-    for &search_path in &search_paths {
-        let path = Path::new(search_path);
-        if !path.exists() {
-            continue;
-        }
-
-        let entries = match fs::read_dir(path) {
-            Ok(e) => e,
-            Err(_) => continue, // Skip inaccessible dirs
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let filename = match path.file_name().and_then(|s| s.to_str()) {
-                Some(f) => f,
-                None => continue,
-            };
-
-            // Look for libssl.so* or libgnutls.so*
-            if !filename.starts_with("libssl.so") && !filename.starts_with("libgnutls.so") {
-                continue;
-            }
-
-            // Deduplicate symlinks by inode
-            if let Ok(metadata) = fs::metadata(&path) {
-                #[cfg(target_os = "linux")]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    let inode = metadata.ino();
-                    if metadata.is_file() && seen_inodes.insert(inode) {
-                        libraries.push(path);
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    if metadata.is_file() {
-                        libraries.push(path);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(libraries)
-}
-
-/// Finds shell binaries (bash, zsh) for readline probes.
-///
-/// # Errors
-///
-/// Returns [`ResolverError`] if filesystem access fails.
-pub fn find_shell_binaries() -> Result<Vec<(PathBuf, ShellType)>, ResolverError> {
-    let shells = [
-        ("/bin/bash", ShellType::Bash),
-        ("/usr/bin/bash", ShellType::Bash),
-        ("/bin/zsh", ShellType::Zsh),
-        ("/usr/bin/zsh", ShellType::Zsh),
-    ];
-
-    Ok(shells
+    LIBRARY_DIRS
         .iter()
-        .filter_map(|(path, shell_type)| {
-            let p = Path::new(path);
-            p.exists().then(|| (p.to_path_buf(), *shell_type))
+        .filter_map(|dir| fs::read_dir(root.join(dir)).ok())
+        .flat_map(|entries| entries.flatten().map(|entry| entry.path()))
+        .filter(|path| has_any_prefix(path, prefixes))
+        .filter(|path| {
+            fs::metadata(path)
+                .is_ok_and(|metadata| metadata.is_file() && seen_inodes.insert(metadata.ino()))
         })
-        .collect())
+        .collect()
 }
 
-/// Finds readline libraries in common system paths, deduplicating symlinks.
-///
-/// Searches for `libreadline.so*` and `libedit.so*` (some bash builds use libedit instead).
-///
-/// # Errors
-///
-/// Returns [`ResolverError`] if directory traversal fails.
-pub fn find_readline_libraries() -> Result<Vec<PathBuf>, ResolverError> {
-    let search_paths = [
-        "/lib",
-        "/usr/lib",
-        "/lib64",
-        "/usr/lib64",
-        "/lib/x86_64-linux-gnu",
-        "/usr/lib/x86_64-linux-gnu",
-        "/lib/aarch64-linux-gnu",
-        "/usr/lib/aarch64-linux-gnu",
-    ];
-
-    let mut libraries = Vec::new();
-    let mut seen_inodes = HashSet::new();
-
-    for &search_path in &search_paths {
-        let path = Path::new(search_path);
-        if !path.exists() {
-            continue;
-        }
-
-        let entries = match fs::read_dir(path) {
-            Ok(e) => e,
-            Err(_) => continue, // Skip inaccessible dirs
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let filename = match path.file_name().and_then(|s| s.to_str()) {
-                Some(f) => f,
-                None => continue,
-            };
-
-            // Look for libreadline.so* or libedit.so*
-            if !filename.starts_with("libreadline.so") && !filename.starts_with("libedit.so") {
-                continue;
-            }
-
-            // Deduplicate symlinks by inode
-            if let Ok(metadata) = fs::metadata(&path) {
-                #[cfg(target_os = "linux")]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    let inode = metadata.ino();
-                    if metadata.is_file() && seen_inodes.insert(inode) {
-                        libraries.push(path);
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    if metadata.is_file() {
-                        libraries.push(path);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(libraries)
-}
-
-/// Finds libc in common system paths, deduplicating symlinks. Every process on
-/// the box links against exactly one of these, so unlike the SSL/readline
-/// searches this always finds something on a working Linux system.
-///
-/// # Errors
-///
-/// Returns [`ResolverError`] if directory traversal fails.
-pub fn find_libc_libraries() -> Result<Vec<PathBuf>, ResolverError> {
-    let search_paths = [
-        "/lib",
-        "/usr/lib",
-        "/lib64",
-        "/usr/lib64",
-        "/lib/x86_64-linux-gnu",
-        "/usr/lib/x86_64-linux-gnu",
-        "/lib/aarch64-linux-gnu",
-        "/usr/lib/aarch64-linux-gnu",
-    ];
-
-    let mut libraries = Vec::new();
-    let mut seen_inodes = HashSet::new();
-
-    for &search_path in &search_paths {
-        let path = Path::new(search_path);
-        if !path.exists() {
-            continue;
-        }
-
-        let entries = match fs::read_dir(path) {
-            Ok(e) => e,
-            Err(_) => continue, // Skip inaccessible dirs
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let filename = match path.file_name().and_then(|s| s.to_str()) {
-                Some(f) => f,
-                None => continue,
-            };
-
-            // Look for libc.so* (glibc) — musl's libc.so has a different name
-            // pattern (ld-musl-*.so.1) and getaddrinfo lives in a different
-            // symbol table shape there; musl support is issue #267 Phase 2.
-            if !filename.starts_with("libc.so") && !filename.starts_with("libc-") {
-                continue;
-            }
-
-            if let Ok(metadata) = fs::metadata(&path) {
-                #[cfg(target_os = "linux")]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    let inode = metadata.ino();
-                    if metadata.is_file() && seen_inodes.insert(inode) {
-                        libraries.push(path);
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    if metadata.is_file() {
-                        libraries.push(path);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(libraries)
+fn has_any_prefix(path: &Path, prefixes: &[&str]) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| prefixes.iter().any(|prefix| name.starts_with(prefix)))
 }
 
 /// Resolves the `getaddrinfo(3)` symbol from system libc libraries (issue
@@ -292,7 +110,7 @@ pub fn find_libc_libraries() -> Result<Vec<PathBuf>, ResolverError> {
 ///
 /// Returns [`ResolverError`] if library discovery or symbol parsing fails.
 pub fn resolve_dns_symbols() -> Result<Vec<SymbolInfo>, ResolverError> {
-    let libraries = find_libc_libraries()?;
+    let libraries = find_libraries(Path::new("/"), LIBC_LIBRARY_PREFIXES);
     let target_symbols = ["getaddrinfo"];
 
     let mut all_symbols = Vec::new();
@@ -383,7 +201,7 @@ pub fn resolve_symbols(
 ///
 /// Returns [`ResolverError`] if library discovery or symbol parsing fails.
 pub fn resolve_tls_symbols() -> Result<Vec<SymbolInfo>, ResolverError> {
-    let libraries = find_ssl_libraries()?;
+    let libraries = find_libraries(Path::new("/"), SSL_LIBRARY_PREFIXES);
     // OpenSSL/BoringSSL: SSL_read, SSL_write, SSL_read_ex, SSL_write_ex
     // GnuTLS: gnutls_record_recv, gnutls_record_send
     let target_symbols = [
@@ -423,7 +241,7 @@ pub fn resolve_tls_symbols() -> Result<Vec<SymbolInfo>, ResolverError> {
 ///
 /// Returns [`ResolverError`] if library discovery or symbol parsing fails.
 pub fn resolve_readline_symbols() -> Result<Vec<SymbolInfo>, ResolverError> {
-    let libraries = find_readline_libraries()?;
+    let libraries = find_libraries(Path::new("/"), READLINE_LIBRARY_PREFIXES);
     let target_symbols = ["readline"];
 
     let mut all_symbols = Vec::new();
@@ -464,19 +282,101 @@ mod tests {
         );
     }
 
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn find_ssl_libraries_returns_deduplicated_paths() {
-        // This test runs against the real filesystem, so it is nondeterministic.
-        // The assertion: if any libraries are found, they should have distinct inodes.
-        if let Ok(libs) = find_ssl_libraries() {
-            let mut inodes = HashSet::new();
-            for lib in &libs {
-                if let Ok(metadata) = fs::metadata(lib) {
-                    use std::os::unix::fs::MetadataExt;
-                    assert!(inodes.insert(metadata.ino()), "duplicate inode for {lib:?}");
-                }
-            }
+    fn library_tree(files: &[&str]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("create temp root");
+        for file in files {
+            let path = root.path().join(file);
+            fs::create_dir_all(path.parent().expect("file has a parent dir"))
+                .expect("create library dir");
+            fs::write(&path, b"not really an ELF").expect("write library file");
         }
+        root
+    }
+
+    fn found_names(root: &Path, prefixes: &[&str]) -> Vec<String> {
+        let mut names: Vec<String> = find_libraries(root, prefixes)
+            .iter()
+            .map(|path| {
+                path.strip_prefix(root)
+                    .expect("found path is under root")
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn find_libraries_matches_only_the_requested_prefixes() {
+        let root = library_tree(&[
+            "usr/lib/libssl.so.3",
+            "usr/lib/libgnutls.so.30",
+            "usr/lib/libcrypto.so.3",
+            "usr/lib/notlibssl.so",
+        ]);
+
+        assert_eq!(
+            found_names(root.path(), SSL_LIBRARY_PREFIXES),
+            ["usr/lib/libgnutls.so.30", "usr/lib/libssl.so.3"]
+        );
+    }
+
+    #[test]
+    fn find_libraries_returns_one_path_per_inode_across_symlinks() {
+        let root = library_tree(&["usr/lib/libedit.so.2.0.70"]);
+        std::os::unix::fs::symlink(
+            "libedit.so.2.0.70",
+            root.path().join("usr/lib/libedit.so.2"),
+        )
+        .expect("create symlink");
+
+        assert_eq!(
+            find_libraries(root.path(), READLINE_LIBRARY_PREFIXES).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn find_libraries_skips_directories_with_a_library_name() {
+        let root = library_tree(&["lib/libc.so.6.d/placeholder"]);
+
+        assert!(find_libraries(root.path(), LIBC_LIBRARY_PREFIXES).is_empty());
+    }
+
+    #[test]
+    fn find_libraries_skips_missing_search_dirs() {
+        let root = library_tree(&["lib64/libc.so.6"]);
+
+        assert_eq!(
+            found_names(root.path(), LIBC_LIBRARY_PREFIXES),
+            ["lib64/libc.so.6"]
+        );
+    }
+
+    #[test]
+    fn tls_library_search_finds_libssl_in_arm64_multiarch_dirs() {
+        let root = library_tree(&[
+            "lib/aarch64-linux-gnu/libgnutls.so.30",
+            "usr/lib/aarch64-linux-gnu/libssl.so.3",
+        ]);
+
+        assert_eq!(
+            found_names(root.path(), SSL_LIBRARY_PREFIXES),
+            [
+                "lib/aarch64-linux-gnu/libgnutls.so.30",
+                "usr/lib/aarch64-linux-gnu/libssl.so.3"
+            ]
+        );
+    }
+
+    #[test]
+    fn find_libraries_matches_glibc_versioned_libc_names() {
+        let root = library_tree(&["lib/libc-2.31.so", "lib/libcap.so.2"]);
+
+        assert_eq!(
+            found_names(root.path(), LIBC_LIBRARY_PREFIXES),
+            ["lib/libc-2.31.so"]
+        );
     }
 }
