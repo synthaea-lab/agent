@@ -66,7 +66,7 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
   source by descriptor at the privileged response boundary; see ADR-0021.
   Platform deps must be target-gated: `[target.'cfg(windows)'.dependencies]`, never
   unconditional.
-- `crates/sensors/linux-ebpf` is excluded from the workspace (special toolchain, GPLv2);
+- `crates/sensors/linux-ebpf` is excluded from the workspace (special toolchain, dual-licensed GPL-2.0-only OR MIT);
   build it explicitly on Linux.
 
 ## Conventions

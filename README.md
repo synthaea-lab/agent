@@ -120,4 +120,4 @@ validation matrix.
 
 ## License
 
-Apache-2.0, except Linux eBPF probes (GPLv2, a kernel constraint).
+Apache-2.0, except the Linux eBPF probes, which are dual-licensed GPL-2.0-only OR MIT (the kernel verifier requires a GPL-compatible license). See NOTICE.
