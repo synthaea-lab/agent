@@ -7,6 +7,7 @@ use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
 };
 
+use schema::{IPPROTO_TCP, IPPROTO_UDP};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, INVALID_HANDLE_VALUE, NO_ERROR},
     NetworkManagement::IpHelper::{
@@ -24,7 +25,7 @@ use windows_sys::Win32::{
 
 use crate::{
     Protocol, SocketsError,
-    raw::{IPPROTO_TCP, IPPROTO_UDP, ListenerEntry, ipv4_from_row, port_from_row},
+    raw::{ListenerEntry, ipv4_from_row, is_drift_relevant, port_from_row},
 };
 
 /// The table can grow between the sizing call and the fill call (a service
@@ -79,8 +80,7 @@ fn fetch_table(family: u16, label: &'static str) -> Result<Vec<u8>, SocketsError
 /// Fetches one `GetExtendedUdpTable` table into an owned byte buffer. Unlike
 /// the TCP table there is no "listener" filter — `UDP_TABLE_OWNER_PID` returns
 /// every bound UDP endpoint, server and client alike (issue #676's noise
-/// problem, left to a follow-up filter calibrated on a real capture rather
-/// than guessed here).
+/// problem; [`snapshot_for_drift`] is where the filter sits).
 fn fetch_udp_table(family: u16, label: &'static str) -> Result<Vec<u8>, SocketsError> {
     let mut size: u32 = 0;
     let mut buf: Vec<u8> = Vec::new();
@@ -273,57 +273,24 @@ fn attribute(
     }
 }
 
-/// Takes one snapshot of every listening TCP socket, IPv4 and IPv6 — the half
-/// of [`snapshot`] the agent uses today (issue #676 part 2 review): the UDP
-/// table's own noise filter is not calibrated yet, so fetching and discarding
-/// `GetExtendedUdpTable` on every poll, and warning on every one of its
-/// failures, would be wasted work for a value nothing reads. [`snapshot`]
-/// stays the full, honest mechanism the filter will sit in front of once it
-/// exists; `GetExtendedUdpTable` is simply not called from this path.
-///
-/// # Errors
-///
-/// [`SocketsError::Table`] when either TCP table (IPv4 or IPv6) cannot be
-/// read.
-pub fn snapshot_tcp() -> Result<Vec<ListenerEntry>, SocketsError> {
+/// Every listening TCP socket, IPv4 and IPv6, attributed to its owner.
+fn tcp_listeners(
+    processes: &HashMap<u32, (u32, String)>,
+) -> Result<Vec<ListenerEntry>, SocketsError> {
     let mut tcp = ipv4_listeners()?;
     tcp.extend(ipv6_listeners()?);
-    let processes = process_table();
     Ok(tcp
         .into_iter()
-        .map(|e| attribute(&processes, e, IPPROTO_TCP))
+        .map(|e| attribute(processes, e, IPPROTO_TCP))
         .collect())
 }
 
-/// Takes one snapshot of every listening TCP socket and every bound UDP
-/// socket, IPv4 and IPv6.
-///
-/// A socket bound to both families appears once per family — they are distinct
-/// kernel objects, and LISTENER-DRIFT keys on the address (and now protocol,
-/// issue #676) anyway.
-///
-/// Unlike the TCP half, the UDP table has no "listener" filter: every bound
-/// UDP endpoint comes back, including DNS client sockets, QUIC/browser and
-/// media sockets on ephemeral ports. Issue #676 names this the noise problem
-/// and asks for a filter calibrated on a real capture — deliberately not
-/// invented here; this snapshot is the honest, unfiltered mechanism the filter
-/// will sit in front of. The agent itself calls [`snapshot_tcp`] instead until
-/// that filter lands, so this full mechanism is exercised by this crate's own
-/// tests rather than production code for now.
-///
-/// # Errors
-///
-/// [`SocketsError::Table`] when either TCP table (IPv4 or IPv6) cannot be
-/// read. A UDP table failure is logged and treated as no UDP entries instead,
-/// so it never discards the TCP listeners already read (see this function's
-/// own `unwrap_or_else` calls) — the process snapshot failing is the same
-/// best-effort posture (see [`ListenerEntry`]).
-pub fn snapshot() -> Result<Vec<ListenerEntry>, SocketsError> {
-    let mut entries = snapshot_tcp()?;
-    // UDP is best-effort: unlike the TCP tables above, a UDP fetch failure
-    // must not drop the TCP listeners already read (review of #1008 — the
-    // startup baseline going empty because IPv6 UDP errored would alert on
-    // every pre-existing TCP listener on the first poll).
+/// Every bound UDP socket, IPv4 and IPv6, attributed to its owner. Best-effort:
+/// a UDP table failure is logged and read as no UDP entries, so it never
+/// discards the TCP listeners of the same snapshot (review of #1008: the
+/// startup baseline going empty because IPv6 UDP errored would alert on every
+/// pre-existing TCP listener on the first poll).
+fn udp_sockets(processes: &HashMap<u32, (u32, String)>) -> Vec<ListenerEntry> {
     let mut udp = ipv4_udp_sockets().unwrap_or_else(|e| {
         tracing::warn!(error = %e, "IPv4 UDP socket table unavailable, continuing without it");
         Vec::new()
@@ -332,36 +299,63 @@ pub fn snapshot() -> Result<Vec<ListenerEntry>, SocketsError> {
         tracing::warn!(error = %e, "IPv6 UDP socket table unavailable, continuing without it");
         Vec::new()
     }));
+    udp.into_iter()
+        .map(|e| attribute(processes, e, IPPROTO_UDP))
+        .collect()
+}
+
+/// Takes one snapshot of every listening TCP socket and every bound UDP
+/// socket, IPv4 and IPv6, unfiltered.
+///
+/// A socket bound to both families appears once per family: they are distinct
+/// kernel objects, and LISTENER-DRIFT keys on the address and protocol anyway.
+///
+/// The UDP table has no "listener" filter: every bound UDP endpoint comes back,
+/// DNS client sockets, QUIC/browser and media sockets on ephemeral ports
+/// included. The agent reads [`snapshot_for_drift`], which drops those; this
+/// is the raw table, for tests and diagnostics.
+///
+/// # Errors
+///
+/// [`SocketsError::Table`] when either TCP table (IPv4 or IPv6) cannot be
+/// read. A UDP table failure is logged and read as no UDP entries instead,
+/// and a failed process snapshot leaves entries unattributed (see
+/// [`ListenerEntry`]).
+pub fn snapshot() -> Result<Vec<ListenerEntry>, SocketsError> {
     let processes = process_table();
-    entries.extend(
-        udp.into_iter()
-            .map(|e| attribute(&processes, e, IPPROTO_UDP)),
+    let mut entries = tcp_listeners(&processes)?;
+    entries.extend(udp_sockets(&processes));
+    Ok(entries)
+}
+
+/// [`snapshot`] with the client sockets taken out: every TCP listener, and
+/// the UDP sockets bound outside the ephemeral port range
+/// ([`crate::raw::is_drift_relevant`], issue #676). What the agent seeds the
+/// LISTENER-DRIFT baseline from and polls.
+///
+/// # Errors
+///
+/// Same failure mode as [`snapshot`].
+pub fn snapshot_for_drift() -> Result<Vec<ListenerEntry>, SocketsError> {
+    let mut entries = snapshot()?;
+    let before = entries.len();
+    entries.retain(is_drift_relevant);
+    tracing::debug!(
+        kept = entries.len(),
+        ephemeral_udp_dropped = before - entries.len(),
+        "socket snapshot filtered for listener drift"
     );
     Ok(entries)
 }
 
-/// One [`snapshot_tcp`] mapped to [`schema::Event::ListenPort`] events,
-/// stamped with `timestamp_ns` as the snapshot time — what the agent polls
-/// with until the UDP noise filter lands (see [`snapshot_tcp`]).
+/// One [`snapshot_for_drift`] mapped to [`schema::Event::ListenPort`] events,
+/// stamped with `timestamp_ns` as the snapshot time.
 ///
 /// # Errors
 ///
-/// Same failure mode as [`snapshot_tcp`], which this wraps.
-pub fn listen_port_events_tcp(timestamp_ns: u64) -> Result<Vec<schema::Event>, SocketsError> {
-    Ok(snapshot_tcp()?
-        .iter()
-        .map(|entry| crate::normalize::listen_port_event(entry, timestamp_ns))
-        .collect())
-}
-
-/// One [`snapshot`] mapped to [`schema::Event::ListenPort`] events, stamped
-/// with `timestamp_ns` as the snapshot time.
-///
-/// # Errors
-///
-/// Same failure mode as [`snapshot`], which this wraps.
-pub fn listen_port_events(timestamp_ns: u64) -> Result<Vec<schema::Event>, SocketsError> {
-    Ok(snapshot()?
+/// Same failure mode as [`snapshot_for_drift`], which this wraps.
+pub fn listen_port_events_for_drift(timestamp_ns: u64) -> Result<Vec<schema::Event>, SocketsError> {
+    Ok(snapshot_for_drift()?
         .iter()
         .map(|entry| crate::normalize::listen_port_event(entry, timestamp_ns))
         .collect())

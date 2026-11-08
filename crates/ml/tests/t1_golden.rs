@@ -16,14 +16,10 @@ use correlator::EventBus;
 use ml::features::t1::{FEATURE_COUNT, FEATURE_NAMES, extract_features};
 use schema::Event;
 
-const EVENTS: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../ml/tests/fixtures/t1_events.jsonl"
-));
-const GOLDEN: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../ml/tests/fixtures/t1_golden.jsonl"
-));
+/// In the `ml` sibling repo; read at run time, the test skips without it.
+const EVENTS_PATH: &str = "tests/fixtures/t1_events.jsonl";
+/// In the `ml` sibling repo; read at run time, the test skips without it.
+const GOLDEN_PATH: &str = "tests/fixtures/t1_golden.jsonl";
 
 /// The golden file is f64 (Python); Rust computes in f32.
 fn close(got: f32, expected: f64) -> bool {
@@ -33,17 +29,19 @@ fn close(got: f32, expected: f64) -> bool {
 
 #[test]
 fn vectors_match_the_python_t1_features() {
+    let events = siblings::require!("ml", EVENTS_PATH);
+    let golden = siblings::require!("ml", GOLDEN_PATH);
     // One 60 s window: every fixture event fits, so no eviction and the per-incarnation
     // windows agree with the Python dataset builder's.
     let mut bus = EventBus::new(Duration::from_secs(60));
-    for line in EVENTS.lines().filter(|l| !l.trim().is_empty()) {
+    for line in events.lines().filter(|l| !l.trim().is_empty()) {
         let event: Event =
             serde_json::from_str(line).expect("t1_events.jsonl line is a schema::Event");
         bus.push(event);
     }
 
     let mut checked = 0;
-    for line in GOLDEN.lines().filter(|l| !l.trim().is_empty()) {
+    for line in golden.lines().filter(|l| !l.trim().is_empty()) {
         let row: serde_json::Value = serde_json::from_str(line).unwrap();
         let pid = u32::try_from(row["pid"].as_u64().unwrap()).unwrap();
         let generation = row["process_generation"].as_u64();

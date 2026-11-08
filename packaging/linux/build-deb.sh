@@ -25,7 +25,7 @@ if [ ! -r /etc/alpine-release ] || [ ! -e /lib/ld-musl-x86_64.so.1 ]; then
 fi
 command -v dpkg-deb >/dev/null || fail "install dpkg-deb (on Alpine: apk add dpkg)"
 command -v readelf >/dev/null || fail "install readelf (on Alpine: apk add binutils)"
-command -v bpf-linker >/dev/null || fail "install bpf-linker with lab/provisioning/alpine-toolchain.sh"
+command -v bpf-linker >/dev/null || fail "install bpf-linker with toolchain/alpine-toolchain.sh"
 
 # cargo-deb only packages; build the exact musl artifacts ourselves so Cargo
 # cannot re-enable ml's default download-binaries feature.
@@ -56,7 +56,7 @@ fi
 
 if [ -z "${ORT_LIB_LOCATION:-}" ]; then
     echo "Building static ONNX Runtime libraries from source on this musl host..."
-    "$REPO_ROOT/lab/provisioning/build-onnxruntime-static.sh"
+    "$REPO_ROOT/toolchain/build-onnxruntime-static.sh"
     export ORT_LIB_LOCATION="$REPO_ROOT/onnxruntime/build/Linux/Release"
 fi
 [ -d "$ORT_LIB_LOCATION" ] || fail "ORT_LIB_LOCATION does not exist: $ORT_LIB_LOCATION"
@@ -68,7 +68,7 @@ fi
 # string and the build carried on without any flag, then failed at the link on
 # the very symbols this script adds (abseil Cord, utf8_range, ModelPackage*;
 # #647 CI, 2026-10-05).
-ort_flags="$(bash "$REPO_ROOT/lab/provisioning/ort-static-link-flags.sh")" \
+ort_flags="$(bash "$REPO_ROOT/toolchain/ort-static-link-flags.sh")" \
     || fail "ort-static-link-flags.sh failed: ONNX Runtime cannot be linked statically"
 case "$ort_flags" in
     *"-l static="*) ;;

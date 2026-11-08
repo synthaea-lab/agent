@@ -16,10 +16,8 @@ use ml::features::{
 };
 use serde_json::Value;
 
-const GOLDEN: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../ml/tests/fixtures/common_set_snapshot_golden.json"
-));
+/// In the `ml` sibling repo; read at run time, the test skips without it.
+const GOLDEN_PATH: &str = "tests/fixtures/common_set_snapshot_golden.json";
 
 fn unhex(s: &str) -> Vec<u8> {
     (0..s.len())
@@ -36,14 +34,17 @@ fn strings(v: &Value) -> Vec<String> {
         .collect()
 }
 
-fn cases() -> Vec<Value> {
-    let doc: Value = serde_json::from_str(GOLDEN).expect("fixture parses");
-    doc["cases"].as_array().expect("cases").clone()
+/// The golden cases, or `None` (the test skips) without the `ml` sibling.
+fn cases() -> Option<Vec<Value>> {
+    let golden = siblings::require!("ml", GOLDEN_PATH, None);
+    let doc: Value = serde_json::from_str(&golden).expect("fixture parses");
+    Some(doc["cases"].as_array().expect("cases").clone())
 }
 
 #[test]
 fn reads_the_header_the_reference_writer_wrote() {
-    for case in cases() {
+    let Some(cases) = cases() else { return };
+    for case in cases {
         let params = &case["params"];
         let snapshot = CommonSetSnapshot::parse(&unhex(case["bytes_hex"].as_str().unwrap()))
             .unwrap_or_else(|e| panic!("{}: {e}", case["name"]));
@@ -65,7 +66,8 @@ fn reads_the_header_the_reference_writer_wrote() {
 
 #[test]
 fn every_member_reads_as_a_member_and_pinned_non_members_do_not() {
-    for case in cases() {
+    let Some(cases) = cases() else { return };
+    for case in cases {
         let snapshot =
             CommonSetSnapshot::parse(&unhex(case["bytes_hex"].as_str().unwrap())).unwrap();
         for member in strings(&case["params"]["hashes"]) {
@@ -83,7 +85,8 @@ fn every_member_reads_as_a_member_and_pinned_non_members_do_not() {
 
 #[test]
 fn a_hash_that_is_not_a_normalized_sha256_is_never_a_member() {
-    let case = &cases()[2];
+    let Some(cases) = cases() else { return };
+    let case = &cases[2];
     let snapshot = CommonSetSnapshot::parse(&unhex(case["bytes_hex"].as_str().unwrap())).unwrap();
     let member = strings(&case["members"])[0].clone();
     assert!(snapshot.contains(&member));
@@ -99,7 +102,8 @@ fn a_hash_that_is_not_a_normalized_sha256_is_never_a_member() {
 
 #[test]
 fn rejects_what_it_does_not_understand() {
-    let good = unhex(cases()[2]["bytes_hex"].as_str().unwrap());
+    let Some(cases) = cases() else { return };
+    let good = unhex(cases[2]["bytes_hex"].as_str().unwrap());
     let with = |edit: &dyn Fn(&mut Vec<u8>)| {
         let mut b = good.clone();
         edit(&mut b);

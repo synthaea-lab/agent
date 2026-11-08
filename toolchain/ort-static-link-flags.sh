@@ -34,7 +34,7 @@
 #     --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF
 #   cmake --build build/Linux/Release --target re2 -j"$(nproc)"
 #   export ORT_LIB_LOCATION="$PWD/build/Linux/Release"
-#   eval "$(./lab/provisioning/ort-static-link-flags.sh)"
+#   eval "$(./toolchain/ort-static-link-flags.sh)"
 #   cargo test -p ml --release
 #
 # Linux and macOS (`.a` extension, `-l`/`-L` syntax; on macOS ORT_LIB_LOCATION is

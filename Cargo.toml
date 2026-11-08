@@ -57,6 +57,7 @@ members = [
     "crates/deception",
     "crates/device-control",
     "crates/inventory",
+    "crates/siblings",
 ]
 # The fuzz crate is fully excluded (not even a non-default member): it needs
 # nightly + libFuzzer instrumentation and is run explicitly —
@@ -102,6 +103,7 @@ default-members = [
     "crates/deception",
     "crates/device-control",
     "crates/inventory",
+    "crates/siblings",
 ]
 
 [workspace.package]

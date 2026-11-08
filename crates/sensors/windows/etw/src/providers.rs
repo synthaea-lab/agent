@@ -24,7 +24,7 @@ use crate::{
     cross_process::{self, ThreadOrigin},
     normalize,
     sensor::{SharedState, basename},
-    winapi, zone_identifier,
+    silo, winapi, zone_identifier,
 };
 
 const KERNEL_PROCESS_GUID: &str = "22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716";
@@ -103,12 +103,13 @@ fn sequence_number(parser: &Parser, field: &str) -> Option<u64> {
 }
 
 /// Kernel-Process keywords the sensor reads: `WINEVENT_KEYWORD_PROCESS` (0x10,
-/// EIDs 1/2), `WINEVENT_KEYWORD_THREAD` (0x20, EID 3 for remote threads, #720) and
-/// `WINEVENT_KEYWORD_IMAGE` (0x40, EID 5). Left unset, ferrisetw enables every
-/// keyword. #726 had taken THREAD out when nothing read thread starts; #720 reads
-/// them, and the thread stops (EID 4) the keyword brings along are dropped on their
-/// id before any parsing (#715: 55 to 71 starts per second on an idle host).
-const KERNEL_PROCESS_KEYWORDS: u64 = 0x10 | 0x20 | 0x40;
+/// EIDs 1/2), `WINEVENT_KEYWORD_THREAD` (0x20, EID 3 for remote threads, #720),
+/// `WINEVENT_KEYWORD_IMAGE` (0x40, EID 5) and `WINEVENT_KEYWORD_JOB_SILO` (0x4000, the
+/// server silo EIDs 23-26, #371). Left unset, ferrisetw enables every keyword. #726 had
+/// taken THREAD out when nothing read thread starts; #720 reads them, and the thread
+/// stops (EID 4) the keyword brings along are dropped on their id before any parsing
+/// (#715: 55 to 71 starts per second on an idle host).
+const KERNEL_PROCESS_KEYWORDS: u64 = 0x10 | 0x20 | 0x40 | 0x4000;
 /// Kernel-Process `ThreadStart`.
 const THREAD_START: u16 = 3;
 
@@ -120,11 +121,12 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
         let eid = record.event_id();
         // 1=ProcessStart (new spawn → ExecEvent), 2=ProcessEnd (prune the store —
-        // PID recycling), 5=ImageLoad (DLL/EXE mapped into a process). Processes
-        // already running come from the pid-store seed, not from a rundown (that
-        // would be EID 15). 3=ThreadStart, for a thread started in another process
-        // (#720); its sibling 4=ThreadStop is dropped here.
-        if eid != 1 && eid != 2 && eid != 5 && eid != THREAD_START {
+        // PID recycling), 5=ImageLoad (DLL/EXE mapped into a process), 23-26=server
+        // silo create/terminate callbacks (#371). Processes already running come from
+        // the pid-store seed, not from a rundown (that would be EID 15). 3=ThreadStart,
+        // for a thread started in another process (#720); its sibling 4=ThreadStop is
+        // dropped here.
+        if !matches!(eid, 1 | 2 | 5 | THREAD_START | 23..=26) {
             return;
         }
         state.events_seen.fetch_add(1, Ordering::Relaxed);
@@ -148,6 +150,15 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
                     state
                         .lsass_pid
                         .compare_exchange(pid, 0, Ordering::Relaxed, Ordering::Relaxed);
+            }
+            return;
+        }
+
+        if eid >= 23 {
+            // #371: a server silo is created or torn down, so whichever
+            // container its id named is stale.
+            if let Ok(silo) = parser.try_parse::<u32>("Job ID") {
+                state.silos.lock().unwrap().forget(silo);
             }
             return;
         }
@@ -199,13 +210,20 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         let generation = sequence_number(&parser, "ProcessSequenceNumber");
         let parent_generation = sequence_number(&parser, "ParentProcessSequenceNumber");
 
-        // Never store "<unknown>": a cache hit on it would suppress live lookups.
-        if image_path != "<unknown>" {
-            state
-                .pids
-                .lock()
-                .unwrap()
-                .insert(pid, image_path.clone(), generation);
+        // #371: read while the process most likely still runs; one already
+        // gone is in its parent's silo.
+        let parent_silo = state.pids.lock().unwrap().silo(ppid);
+        let silo = silo::exec_silo(winapi::read_server_silo_id(pid), parent_silo);
+        {
+            let mut pids = state.pids.lock().unwrap();
+            // Never cache "<unknown>" as the image: a hit on it would suppress
+            // live lookups. The silo is kept either way, or the process's
+            // events would read as the host's.
+            if image_path == "<unknown>" {
+                pids.insert_without_image(pid, generation, silo);
+            } else {
+                pids.insert(pid, image_path.clone(), generation, silo);
+            }
         }
         // Lineage at exec time (schema parent fields): the parent is usually alive
         // and already in the store.
@@ -239,6 +257,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             image_path,
             cmdline,
             argv: vec![], // Windows has a flat command line; consumers fall back
+            cmdline_truncated: false, // CreateProcess caps it at 32,766 UTF-16 units (#1112)
             env_security: Vec::new(), // no exec-environment capture on Windows yet (#363 is Linux-only)
             parent_comm,
             parent_image_path,
@@ -1297,11 +1316,12 @@ mod process_keyword_tests {
     /// mask is checked against a real session by `tests/kernel_process_keyword_mask.rs`
     /// (`#[ignore]`, elevated; lab phase G of `lab/validate-windows-admin.ps1`).
     #[test]
-    fn kernel_process_reads_process_thread_and_image_events_only() {
+    fn kernel_process_reads_process_thread_image_and_silo_events() {
         const PROCESS: u64 = 0x10;
         const THREAD: u64 = 0x20;
         const IMAGE: u64 = 0x40;
-        assert_eq!(KERNEL_PROCESS_KEYWORDS, PROCESS | THREAD | IMAGE);
+        const JOB_SILO: u64 = 0x4000;
+        assert_eq!(KERNEL_PROCESS_KEYWORDS, PROCESS | THREAD | IMAGE | JOB_SILO);
     }
 }
 

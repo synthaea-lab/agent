@@ -409,10 +409,9 @@ fn settle_probation(
 static AGENT_SPAWNS: AtomicU64 = AtomicU64::new(0);
 static SELF_PROTECTION_EVENTS: AtomicU64 = AtomicU64::new(0);
 
-/// The variables the agent reads (`agent/src/host_counters.rs`; a test there checks that this
-/// file still spells them the same, since the watchdog has no dependency on the agent's crates).
-const RESTARTS_ENV: &str = "SYNTHAEA_WATCHDOG_RESTARTS";
-const TAMPER_EVENTS_ENV: &str = "SYNTHAEA_WATCHDOG_TAMPER_EVENTS";
+/// The variables the agent reads (`agent/src/host_counters.rs`).
+const RESTARTS_ENV: &str = config::identity::WATCHDOG_RESTARTS_ENV;
+const TAMPER_EVENTS_ENV: &str = config::identity::WATCHDOG_TAMPER_EVENTS_ENV;
 
 /// Self-protection events this watchdog has reported since it started.
 fn self_protection_events() -> u64 {
@@ -855,14 +854,8 @@ mod tests {
             5,
         );
 
-        assert_eq!(
-            env_of(&cmd, "SYNTHAEA_WATCHDOG_RESTARTS").as_deref(),
-            Some("3")
-        );
-        assert_eq!(
-            env_of(&cmd, "SYNTHAEA_WATCHDOG_TAMPER_EVENTS").as_deref(),
-            Some("5")
-        );
+        assert_eq!(env_of(&cmd, RESTARTS_ENV).as_deref(), Some("3"));
+        assert_eq!(env_of(&cmd, TAMPER_EVENTS_ENV).as_deref(), Some("5"));
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
