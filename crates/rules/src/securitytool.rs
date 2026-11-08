@@ -87,7 +87,10 @@ fn cgroup_squeeze(args: &[String]) -> Option<(&'static str, Vec<String>)> {
     let mut positional = args.iter().filter(|a| !a.starts_with('-'));
     let verb = positional.next()?;
     match verb.as_str() {
-        "freeze" => Some(("freeze", positional.map(|u| unit_base(u)).collect())),
+        "freeze" => Some((
+            "freeze",
+            positional.flat_map(|unit| freeze_targets(unit)).collect(),
+        )),
         "set-property" => {
             let rest: Vec<&String> = positional.collect();
             let limits = rest.iter().any(|a| {
@@ -106,11 +109,98 @@ fn unit_base(unit: &str) -> String {
     unit.strip_suffix(".service").unwrap_or(unit).to_owned()
 }
 
+/// The units one `systemctl freeze` argument names. `freeze` takes `PATTERN...`: systemd matches
+/// a glob against the full names of the loaded units (`fnmatch(3)`, no `.service` appended), so
+/// `audit*` freezes `auditd.service`. A glob is resolved to every listed service whose unit
+/// name it matches (whether that unit is loaded on the host is not known here); a plain name is
+/// returned as is.
+fn freeze_targets(unit: &str) -> Vec<String> {
+    if !unit.contains(['*', '?', '[']) {
+        return vec![unit_base(unit)];
+    }
+    SECURITY_SERVICES
+        .iter()
+        .filter(|service| unit_pattern_matches(unit, &format!("{service}.service")))
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Whether `name` matches the unit pattern `pattern` as systemd's `fnmatch(3)` call reads it
+/// (`FNM_NOESCAPE`): `*`, `?` and a bracket class (`[a-z]`, `[!d]`, `[^d]`); an unterminated
+/// `[` is a literal. Iterative, with backtracking to the last `*` only, which is exact for
+/// these three operators.
+fn unit_pattern_matches(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    let (mut p, mut n) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while let Some(&c) = name.get(n) {
+        let next = match pattern.get(p) {
+            Some('*') => {
+                star = Some((p + 1, n));
+                p += 1;
+                continue;
+            }
+            Some('?') => Some(p + 1),
+            Some('[') => match bracket_class(&pattern, p, c) {
+                Some((true, past)) => Some(past),
+                Some((false, _)) => None,
+                None => (c == '[').then_some(p + 1),
+            },
+            Some(&literal) => (literal == c).then_some(p + 1),
+            None => None,
+        };
+        if let Some(past) = next {
+            p = past;
+            n += 1;
+        } else if let Some((resume, from)) = star {
+            p = resume;
+            n = from + 1;
+            star = Some((resume, from + 1));
+        } else {
+            return false;
+        }
+    }
+    pattern
+        .get(p..)
+        .is_some_and(|rest| rest.iter().all(|&c| c == '*'))
+}
+
+/// The bracket class opening at `pattern[open]`: whether `c` is in it, and the index past its
+/// closing `]`. `None` when the class is never closed. A `]` right after the `[` (or `[!`) is a
+/// member, as in `fnmatch(3)`.
+fn bracket_class(pattern: &[char], open: usize, c: char) -> Option<(bool, usize)> {
+    let mut i = open + 1;
+    let negated = matches!(pattern.get(i), Some('!' | '^'));
+    if negated {
+        i += 1;
+    }
+    let first = i;
+    let mut member = false;
+    loop {
+        let &low = pattern.get(i)?;
+        if low == ']' && i > first {
+            return Some((member != negated, i + 1));
+        }
+        match (pattern.get(i + 1), pattern.get(i + 2)) {
+            (Some('-'), Some(&high)) if high != ']' => {
+                member |= (low..=high).contains(&c);
+                i += 3;
+            }
+            _ => {
+                member |= low == c;
+                i += 1;
+            }
+        }
+    }
+}
+
 /// T1562.001 — a command that makes the kernel stop or freeze a listed security tool without a
 /// signal the probe can attribute (#1138): `systemctl freeze <tool>` (the cgroup freezer) and
 /// `systemctl set-property <tool> MemoryMax=...|MemoryHigh=...|TasksMax=...` (a limit the memcg
 /// OOM killer then enforces with a `SEND_SIG_PRIV` `SIGKILL`, which the `signal_generate` probe
-/// drops). Every unit of a `freeze` is checked, not the first only. Medium, like the stop
+/// drops). Every unit of a `freeze` is checked, not the first only, and a unit pattern
+/// (`systemctl freeze 'audit*'`) is matched against the listed units' names. Medium, like the stop
 /// verbs, and for the same reasons: it reads the command, an administrator can do the same,
 /// and an empty `argv` (#1118) blinds it.
 ///
@@ -252,7 +342,41 @@ pub(crate) fn check_security_tool_cgroup_write(event: &FileOpenEvent) -> Option<
 
 #[cfg(test)]
 mod tests {
-    use super::is_security_tool;
+    use super::{is_security_tool, unit_pattern_matches};
+
+    #[test]
+    fn unit_patterns_match_as_fnmatch_does() {
+        for (pattern, name) in [
+            ("audit*", "auditd.service"),
+            ("*", "auditd.service"),
+            ("*.service", "auditd.service"),
+            ("a*d*", "auditd.service"),
+            ("auditd.servic?", "auditd.service"),
+            ("[a]uditd.service", "auditd.service"),
+            ("[!b]uditd.service", "auditd.service"),
+            ("[^b]uditd.service", "auditd.service"),
+            ("[a-c]uditd.service", "auditd.service"),
+            ("[]a]uditd.service", "auditd.service"),
+            ("[x.service", "[x.service"),
+        ] {
+            assert!(unit_pattern_matches(pattern, name), "{pattern} {name}");
+        }
+        for (pattern, name) in [
+            ("audit?", "auditd.service"),
+            ("auditd", "auditd.service"),
+            ("*.slice", "auditd.service"),
+            ("[!a]uditd.service", "auditd.service"),
+            ("[b-z]uditd.service", "auditd.service"),
+            ("[", "auditd.service"),
+            ("[!", "auditd.service"),
+            ("[]", "auditd.service"),
+            ("*[", "auditd.service"),
+            ("auditd.service?", "auditd.service"),
+            ("", "auditd.service"),
+        ] {
+            assert!(!unit_pattern_matches(pattern, name), "{pattern} {name}");
+        }
+    }
 
     #[test]
     fn a_listed_service_matches_with_or_without_the_unit_suffix() {
