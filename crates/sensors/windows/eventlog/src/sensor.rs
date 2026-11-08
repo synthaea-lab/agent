@@ -1291,10 +1291,6 @@ static KERBEROS_DELEGATION_FAILURES: PollTarget = PollTarget {
 // (unrestricted deps) reads that type and converts it into this crate's own
 // `EventLogConfig` when constructing the sensor (ADR-0006).
 
-/// Which of this sensor's three independent poll targets are active. A
-/// disabled group is never even queried — not filtered after the fact — so a
-/// host that, say, disables logon-event polling pays no query cost for it
-/// either.
 /// Which transport the sensor uses to receive Event Log records from the OS
 /// (issue #322). Both transports produce identical normalized `Event`s
 /// through the same [`PollTarget`] parsers and update the same
@@ -1309,7 +1305,7 @@ static KERBEROS_DELEGATION_FAILURES: PollTarget = PollTarget {
 ///
 /// - [`Subscribe`](EventLogTransport::Subscribe) — one `EvtSubscribe` call
 ///   per enabled target, callback delivery from the OS the moment an event
-///   lands in the channel. No polling latency, no subprocess churn.
+///   lands in the channel. No polling latency.
 ///
 /// The default is [`Polling`](EventLogTransport::Polling): opt-in for
 /// `Subscribe` at the config layer, so a deployment picks it host-by-host
@@ -1333,6 +1329,10 @@ impl Default for EventLogTransport {
     }
 }
 
+/// Which of this sensor's independently toggled targets are active, and which
+/// transport delivers them. A disabled target is never even queried — not
+/// filtered after the fact — so a host that, say, disables logon-event
+/// polling pays no query cost for it either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventLogConfig {
     /// Which OS-facing transport the sensor uses to receive channel events.

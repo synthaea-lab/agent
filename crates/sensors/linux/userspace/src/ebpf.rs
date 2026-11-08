@@ -28,7 +28,7 @@ pub const RAW_TRACEPOINTS: &[(&str, &str)] = &[
 ];
 
 /// The UDP/53 DNS capture (#458 part 3): its own program on `sys_enter`, attached only when the
-/// sensor is built with [`crate::Sensor::with_dns_udp_capture`]. It is in [`RAW_TRACEPOINTS`] so
+/// sensor is built with [`crate::LinuxSensor::with_dns_udp_capture`]. It is in [`RAW_TRACEPOINTS`] so
 /// the preflight loads it through the verifier like the others, and the sensor skips it otherwise.
 pub const DNS_UDP_PROGRAM: &str = "raw_dns_udp_enter";
 
