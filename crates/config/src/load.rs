@@ -648,7 +648,7 @@ fn exempt_entry_problem(entry: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::{io::Write, path::PathBuf};
 
     use super::*;
     use crate::test_util::env_lock;
@@ -1347,5 +1347,325 @@ control_plane_url = "https://cp.example"
             ConfigError::Invalid { field, .. } => assert_eq!(field, "deception.allow_exe"),
             other => panic!("expected Invalid, got {other:?}"),
         }
+    }
+
+    /// A parsed valid config for [`validate_semantics`] pins: mutate one field, check the
+    /// exact rendered error.
+    fn valid_config() -> AgentConfig {
+        parse_and_validate(&valid_toml(), Path::new("pin.toml")).expect("valid config")
+    }
+
+    /// An absolute path on the host OS.
+    fn abs_path(name: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:\pin\{name}"))
+        } else {
+            PathBuf::from(format!("/pin/{name}"))
+        }
+    }
+
+    /// One change to a valid config that makes exactly one check fail.
+    type Mutation = Box<dyn FnOnce(&mut AgentConfig)>;
+
+    fn semantic_error(mutate: Mutation) -> String {
+        let mut cfg = valid_config();
+        mutate(&mut cfg);
+        match validate_semantics(&cfg, Path::new("pin.toml")) {
+            Err(err @ ConfigError::Invalid { .. }) => err.to_string(),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    /// Pins the exact text of every [`ConfigError::Invalid`] that
+    /// [`validate_semantics`] can return, so a restructuring of the checks cannot
+    /// change what an operator reads.
+    #[test]
+    fn every_semantic_error_keeps_its_exact_message() {
+        let msg = |field: &str, expected: &str, value: &str| {
+            format!(
+                "invalid value for `{field}` (expected {expected}, got `{value}`) in `pin.toml`."
+            )
+        };
+        let abs_a = abs_path("a");
+        let cases: Vec<(Mutation, String)> = vec![
+            (
+                Box::new(|c| c.server.control_plane_url = "http://cp".into()),
+                msg("server.control_plane_url", "an `https://` URL", "http://cp"),
+            ),
+            (
+                Box::new(|c| c.log.level = "Verbose".into()),
+                msg(
+                    "log.level",
+                    "one of `trace`, `debug`, `info`, `warn`, `error`",
+                    "Verbose",
+                ),
+            ),
+            (
+                Box::new(|c| c.log.max_mb = 0),
+                msg(
+                    "log.max_mb",
+                    "a positive integer (0 is not accepted; state the cap explicitly)",
+                    "0",
+                ),
+            ),
+            (
+                Box::new(|c| c.storage.spool_max_mb = 0),
+                msg("storage.spool_max_mb", "a positive integer", "0"),
+            ),
+            (
+                Box::new(|c| c.updates.ring = Some("beta".into())),
+                msg(
+                    "updates.ring",
+                    "one of canary_0, canary_1, canary_2, prod",
+                    "beta",
+                ),
+            ),
+            (
+                Box::new(|c| {
+                    c.logs.sources = (0..=crate::MAX_LOG_SOURCES)
+                        .map(|i| crate::LogSourceConfig {
+                            path: abs_path(&i.to_string()),
+                            kind: crate::LogSourceKind::AccessCommon,
+                        })
+                        .collect();
+                }),
+                msg("logs.sources", "at most 16 sources", "17 sources"),
+            ),
+            (
+                Box::new(|c| {
+                    c.logs.sources = vec![crate::LogSourceConfig {
+                        path: "rel.log".into(),
+                        kind: crate::LogSourceKind::AccessCommon,
+                    }];
+                }),
+                msg(
+                    "logs.sources[0].path",
+                    "an absolute filesystem path",
+                    "rel.log",
+                ),
+            ),
+            (
+                {
+                    let p = abs_a.clone();
+                    Box::new(move |c| {
+                        let source = crate::LogSourceConfig {
+                            path: p,
+                            kind: crate::LogSourceKind::AccessCommon,
+                        };
+                        c.logs.sources = vec![source.clone(), source];
+                    })
+                },
+                msg(
+                    "logs.sources[1].path",
+                    "a path declared once (two parsers on one file would read it twice)",
+                    &abs_a.display().to_string(),
+                ),
+            ),
+            (
+                Box::new(|c| c.detection.utc_offset_minutes = Some(900)),
+                msg(
+                    "detection.utc_offset_minutes",
+                    "minutes east of UTC, between -720 and 840",
+                    "900",
+                ),
+            ),
+            (
+                Box::new(|c| c.detection.work_hours = Some([9, 9])),
+                msg(
+                    "detection.work_hours",
+                    "[start, end]: start 0 to 23, end 1 to 24, start different from end",
+                    "[9, 9]",
+                ),
+            ),
+            (
+                Box::new(|c| c.detection.odd_hour_exempt_accounts = vec!["ok".into(), " ".into()]),
+                msg(
+                    "detection.odd_hour_exempt_accounts",
+                    "at most 64 entries, each `NAME` or `NAME|SID` (a SID `S-1-...` or a prefix ending in `-*`), none blank or over 256 bytes",
+                    "entry 1 (\" \"): blank",
+                ),
+            ),
+            (
+                Box::new(|c| {
+                    c.detection.odd_hour_exempt_accounts =
+                        vec!["svc".into(); crate::MAX_ODD_HOUR_EXEMPT_ACCOUNTS + 1];
+                }),
+                msg(
+                    "detection.odd_hour_exempt_accounts",
+                    "at most 64 entries, each `NAME` or `NAME|SID` (a SID `S-1-...` or a prefix ending in `-*`), none blank or over 256 bytes",
+                    "65 entries",
+                ),
+            ),
+            (
+                Box::new(|c| {
+                    c.deception.canary_dirs = (0..=crate::MAX_CANARY_DIRS)
+                        .map(|i| abs_path(&i.to_string()))
+                        .collect();
+                }),
+                msg(
+                    "deception.canary_dirs",
+                    "at most 16 directories",
+                    "17 directories",
+                ),
+            ),
+            (
+                Box::new(|c| c.deception.canary_dirs = vec!["srv/share".into()]),
+                msg(
+                    "deception.canary_dirs[0]",
+                    "an absolute directory path",
+                    "srv/share",
+                ),
+            ),
+            (
+                {
+                    let p = abs_a.clone();
+                    Box::new(move |c| c.deception.canary_dirs = vec![p.clone(), p])
+                },
+                msg(
+                    "deception.canary_dirs[1]",
+                    "a directory listed once",
+                    &abs_a.display().to_string(),
+                ),
+            ),
+            (
+                Box::new(|c| {
+                    c.deception.allow_exe = (0..=crate::MAX_CANARY_ALLOW_EXES)
+                        .map(|i| abs_path(&i.to_string()))
+                        .collect();
+                }),
+                msg(
+                    "deception.allow_exe",
+                    "at most 32 executables",
+                    "33 executables",
+                ),
+            ),
+            (
+                Box::new(|c| c.deception.allow_exe = vec!["bash".into()]),
+                msg(
+                    "deception.allow_exe[0]",
+                    "a specific indexer or backup binary, not a shell, interpreter or \
+                     launcher (every script it runs would be allowed to read the canaries)",
+                    "bash",
+                ),
+            ),
+            (
+                Box::new(|c| c.deception.allow_exe = vec!["updatedb".into()]),
+                msg(
+                    "deception.allow_exe[0]",
+                    "an absolute executable path",
+                    "updatedb",
+                ),
+            ),
+            (
+                Box::new(|c| c.ipc.endpoint = String::new()),
+                msg(
+                    "ipc.endpoint",
+                    "a non-empty pipe name (Windows) or absolute socket path (Unix)",
+                    "",
+                ),
+            ),
+            (
+                Box::new(|c| c.ipc.endpoint = "agent.sock".into()),
+                if cfg!(windows) {
+                    msg(
+                        "ipc.endpoint",
+                        r"a Windows named pipe (`\\.\pipe\...`)",
+                        "agent.sock",
+                    )
+                } else {
+                    msg(
+                        "ipc.endpoint",
+                        "an absolute filesystem path (Unix domain socket)",
+                        "agent.sock",
+                    )
+                },
+            ),
+            (
+                Box::new(|c| c.server.mtls_cert = "client.crt".into()),
+                msg(
+                    "server.mtls_cert",
+                    "an absolute filesystem path",
+                    "client.crt",
+                ),
+            ),
+            (
+                Box::new(|c| c.server.mtls_key = "client.key".into()),
+                msg(
+                    "server.mtls_key",
+                    "an absolute filesystem path",
+                    "client.key",
+                ),
+            ),
+            (
+                Box::new(|c| c.server.ca_cert = Some("ca.pem".into())),
+                msg("server.ca_cert", "an absolute filesystem path", "ca.pem"),
+            ),
+            (
+                Box::new(|c| c.storage.state_dir = "state".into()),
+                msg("storage.state_dir", "an absolute filesystem path", "state"),
+            ),
+            (
+                Box::new(|c| c.log.dir = "logs".into()),
+                msg("log.dir", "an absolute filesystem path", "logs"),
+            ),
+        ];
+        for (mutate, expected) in cases {
+            assert_eq!(semantic_error(mutate), expected);
+        }
+    }
+
+    /// When several fields are invalid, the one reported is fixed by the order of the
+    /// checks: the URL and value checks first, the absolute-path checks of `server`,
+    /// `storage` and `log` last.
+    #[test]
+    fn the_first_failing_check_in_order_is_the_one_reported() {
+        let field_of = |mutate: fn(&mut AgentConfig)| {
+            let mut cfg = valid_config();
+            mutate(&mut cfg);
+            match validate_semantics(&cfg, Path::new("pin.toml")) {
+                Err(ConfigError::Invalid { field, .. }) => field,
+                other => panic!("expected Invalid, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            field_of(|c| {
+                c.log.dir = "logs".into();
+                c.server.control_plane_url = "http://cp".into();
+            }),
+            "server.control_plane_url"
+        );
+        assert_eq!(
+            field_of(|c| {
+                c.server.mtls_cert = "client.crt".into();
+                c.log.level = "loud".into();
+            }),
+            "log.level"
+        );
+        assert_eq!(
+            field_of(|c| {
+                c.storage.state_dir = "state".into();
+                c.ipc.endpoint = String::new();
+            }),
+            "ipc.endpoint"
+        );
+        assert_eq!(
+            field_of(|c| {
+                c.log.dir = "logs".into();
+                c.storage.state_dir = "state".into();
+                c.server.ca_cert = Some("ca.pem".into());
+            }),
+            "server.ca_cert"
+        );
+        assert_eq!(
+            field_of(|c| {
+                c.deception.canary_dirs = vec!["rel".into()];
+                c.detection.work_hours = Some([30, 1]);
+                c.logs.sources = vec![crate::LogSourceConfig {
+                    path: "rel.log".into(),
+                    kind: crate::LogSourceKind::AccessCommon,
+                }];
+            }),
+            "logs.sources[0].path"
+        );
     }
 }
