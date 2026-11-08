@@ -1,17 +1,20 @@
 //! # sensor-windows-eventlog
 //!
-//! Windows Event Log channels as a supplementary, driverless sensor
-//! (`EvtSubscribe` push subscriptions on an allowlist):
-//! - Security: 4624/4625/4648 (logons — lateral movement), 4688 fallback, 4672
-//! - System: 7045 (service install — persistence)
-//! - Security: 4720 (local account creation — persistence)
+//! Windows Event Log channels as a supplementary, driverless sensor, read on
+//! an allowlist through one of two transports: an `EvtQuery` poll loop (the
+//! default) or `EvtSubscribe` push subscriptions (opt-in, see "Transport"
+//! below). The channels and events:
+//! - Security: 4624/4625/4648/4672 (logons — lateral movement), 4698/4702
+//!   (scheduled tasks), 4720 (local account creation), 1102 (audit log cleared)
+//! - System: 7045 (service install — persistence), 104 (log cleared)
 //! - Microsoft-Windows-AppLocker + WDAC, Defender operational, Task-Scheduler
 //! - Terminal Services: session lifecycle 21/23/24/25 and RDP authentication
 //!   1149 (#285, see the section below)
+//! - Kerberos operational: 201/202 delegation failures (#364)
 //!
-//! Implements three persistence detections, ported from a spike validated
-//! end-to-end on a real Windows VM (ADR-0004; summary below), plus logon/session-event
-//! normalization:
+//! Implements these persistence detections (7045 and 4698 ported from a spike
+//! validated end-to-end on a real Windows VM, ADR-0004; summary below), plus
+//! logon/session-event normalization:
 //!
 //! - **T1543.003** — Create or Modify System Process: Windows Service. System log,
 //!   event **7045** ("A service was installed in the system").
@@ -31,40 +34,19 @@
 //!   logon), **4625** (failed logon), **4648** (explicit-credential logon — a
 //!   classic RunAs/lateral-movement signal), and **4672** (special privileges
 //!   assigned to a new logon), normalized into `schema::Event::Auth` — the same
-//!   shape `sensor-linux-journal` (not yet implemented) is meant to emit its own
-//!   auth events as (ADR-0005).
-//!   Unlike the two persistence detections above, the field names this module
-//!   parses have not yet been reconciled against a real lab-VM capture — see
-//!   `xml::LogonEvent`'s doc before relying on this in production.
+//!   shape `sensor-linux-journal` emits for its sshd/sudo/PAM auth events
+//!   (ADR-0005). The parsed field names were reconciled against a real lab-VM
+//!   capture; see `xml::LogonEvent`'s doc.
 //!
-//! ## Why `wevtutil` polling, not `EvtSubscribe` (yet)
+//! ## Why the reader API, not a raw ETW subscription
 //!
-//! The rest of this crate's name and this module's original design intent point at
-//! `EvtSubscribe` — the native Windows Event Log push-subscription API — as the
-//! long-term mechanism for this crate (real-time, no polling latency, no shelling
-//! out). **That is still the right target.** What ships here instead is a
-//! `wevtutil`-polling implementation, for a narrower reason than "`EvtSubscribe`
-//! doesn't work": the investigation behind this code tested a **live ETW
-//! subscription** (`ferrisetw`/TDH, the same mechanism `sensor-windows` uses for the
-//! kernel providers) against the "Service Control Manager" and
-//! "Microsoft-Windows-Security-Auditing" providers, not the native Event Log
-//! `EvtSubscribe` API — a different Windows API, one layer up, specifically built
-//! for subscribing to channels (System/Security/...) rather than raw ETW providers,
-//! and the one real EDR/SIEM agents typically use for exactly this. It was not
-//! evaluated here, for lack of time in the original investigation window, and may
-//! well not hit either of the two walls documented below. Switching to it is the
-//! natural follow-up for whoever picks up #94 for real: it would remove the poll
-//! interval (currently 2s, see `POLL_INTERVAL` in `sensor.rs`), the process
-//! spawn per query, and the fragile substring XML parsing — none of which are
-//! fundamental to the detection logic, just to this stopgap plumbing. The
-//! logon-event poller added for #94 shares this same trade-off and the same
-//! target: it reads the Security channel through `wevtutil` today for
-//! consistency with the two detections already here, not because logon events
-//! were separately confirmed to have the same ETW problem.
-//!
-//! What *is* validated (in lab, on a real Windows VM, true positive + true negative
-//! for both techniques): consuming these two events via a raw ETW subscription does
-//! not work, for two unrelated reasons —
+//! Both transports go through the Windows Event Log reader API (`EvtQuery` +
+//! `EvtNext` + `EvtRender` in `query.rs`, or `EvtSubscribe` in `subscribe.rs`),
+//! never through a live ETW subscription (`ferrisetw`/TDH, the mechanism
+//! `sensor-windows` uses for the kernel providers). That choice is validated in
+//! lab, on a real Windows VM, true positive + true negative for both 7045 and
+//! 4698: consuming these events via a raw ETW subscription does not work, for
+//! two unrelated reasons —
 //! - **7045**: "Service Control Manager" is a classic/legacy ETW provider
 //!   (`Qualifiers='16384'` in `wevtutil`'s XML rendering); `ferrisetw`/TDH can only
 //!   resolve a schema for manifest-based providers, so `event_id()` always reports
@@ -76,22 +58,23 @@
 //!   Security log appears to not be subscribable in real time by a third-party ETW
 //!   consumer created ad hoc, regardless of settings.
 //!
-//! `wevtutil` polling sidesteps both (it goes through the classic Event Log reader
-//! API, not ETW), at the cost of up to `POLL_INTERVAL` of detection latency — an
-//! accepted trade-off for a persistence detection (the attacker already had to run
-//! `sc create` / `schtasks /create` before the event exists at all; a couple of
-//! seconds of latency does not change the outcome).
+//! The reader API sidesteps both. Polling it (the default transport) costs up to
+//! `POLL_INTERVAL` (2s, `sensor.rs`) of detection latency — an accepted trade-off
+//! for a persistence detection (the attacker already had to run `sc create` /
+//! `schtasks /create` before the event exists at all; a couple of seconds of
+//! latency does not change the outcome). `EvtSubscribe` removes that latency and
+//! is the long-term target; it stays opt-in until validated host by host.
 //!
-//! Since #1126 the poll no longer spawns `wevtutil`: it calls the reader API that
-//! `wevtutil qe` wraps (`EvtQuery` + `EvtNext` + `EvtRender`, `query.rs`), with the
-//! same `XPath` queries, so the ETW walls above still do not apply. `wevtutil` wrote
-//! to its redirected stdout in the system ANSI code page, so an account name that
-//! page cannot hold (Cyrillic or CJK on a Windows-1252 host) reached the rules as
-//! `?`s; the API renders UTF-16 and keeps it, like the `Subscribe` transport.
+//! Polling originally shelled out to `wevtutil qe` with the same `XPath`
+//! queries. Since #1126 it calls the reader API `wevtutil` wraps directly:
+//! `wevtutil` wrote to its redirected stdout in the system ANSI code page, so an
+//! account name that page cannot hold (Cyrillic or CJK on a Windows-1252 host)
+//! reached the rules as `?`s; the API renders UTF-16 and keeps it, like the
+//! `Subscribe` transport.
 //!
 //! ## Schema fit
 //!
-//! The two persistence detections are reported as `schema::FileOpenEvent` (not a
+//! The persistence detections are reported as `schema::FileOpenEvent` (not a
 //! new `Event` variant), marked with `schema::FLAG_PERSISTENCE_ARTIFACT` /
 //! `FLAG_PERSISTENCE_TASK_ARTIFACT` / `FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT` /
 //! `FLAG_PERSISTENCE_ACCOUNT_ARTIFACT` — see those constants' docs for why, and
@@ -188,11 +171,11 @@
 //! - `EventLogTransport::Polling` — the default. One thread per
 //!   enabled target runs an `EvtQuery` loop at the `POLL_INTERVAL`
 //!   cadence (2s), same shape as the pre-#322 implementation and same
-//!   trade-offs as documented in the section above.
+//!   trade-offs as documented in the reader-API section above.
 //! - `EventLogTransport::Subscribe` — one `EvtSubscribe`
 //!   subscription per enabled target, with a Windows callback delivering
 //!   events the moment they land in the channel. Removes the polling
-//!   latency and the subprocess churn. Available since #322; opt-in at the
+//!   latency. Available since #322; opt-in at the
 //!   config layer so hosts adopt it after validation rather than the whole
 //!   fleet flipping on a version bump.
 //!

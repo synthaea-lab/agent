@@ -1,9 +1,8 @@
 //! Push-based transport for the Event Log sensor via `EvtSubscribe` (issue
 //! #322). The default remains `Polling` (`sensor.rs`), see `EventLogTransport`
 //! for the switch; this module is the alternative that removes the 2s poll
-//! cadence, the `wevtutil` subprocess spawn per tick, and the "did we miss a
-//! rotation" edge case — the OS delivers each matching event directly to a
-//! callback the moment it lands in the channel.
+//! cadence and the "did we miss a rotation" edge case — the OS delivers each
+//! matching event directly to a callback the moment it lands in the channel.
 //!
 //! ## Shape
 //!

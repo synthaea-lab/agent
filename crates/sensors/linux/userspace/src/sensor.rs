@@ -29,10 +29,6 @@ use crate::{
     unit_procs::{ToolWatch, UnitResolver},
 };
 
-/// See `sensor_linux_wire::boot_epoch_offset_ns` — computed once at startup.
-/// (Consolidated there by #295; a parallel branch merge resurrected the old
-/// local copy once already — if you are reading a full implementation here
-/// again, the same thing happened again.)
 /// The file a `finit_module(2)` event's fd points at (#457), read from
 /// `/proc/<pid>/fd/<fd>` while the event is drained. Racy by nature: the
 /// loader may already have closed the fd or exited, and then this is `None`
@@ -46,6 +42,10 @@ fn finit_module_path(event: &sensor_linux_wire::KernelModuleEvent) -> Option<Str
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// See `sensor_linux_wire::boot_epoch_offset_ns` — computed once at startup.
+/// (Consolidated there by #295; a parallel branch merge resurrected the old
+/// local copy once already — if you are reading a full implementation here
+/// again, the same thing happened again.)
 fn boot_epoch_offset_ns() -> u64 {
     sensor_linux_wire::boot_epoch_offset_ns()
 }
@@ -115,14 +115,6 @@ impl Default for LinuxSensor {
 /// fairness between them.
 const MAX_ITEMS_PER_DRAIN: usize = 256;
 
-/// Drains up to [`MAX_ITEMS_PER_DRAIN`] ready items from one ring buffer, decoding
-/// `$wire_ty` and forwarding the event `$to_event` builds from it. `$to_event` is
-/// `Fn(&$wire_ty) -> Event` so each leg can enrich with its own reads: exec's
-/// `/proc/<pid>/cmdline`, and all three's container attribution (issue #80/#204) —
-/// the latter no longer touches `/proc` at all, resolving `$wire_ty::meta.cgroup_id`
-/// against cgroupfs instead (see [`CgroupIdCache`]), specifically to avoid
-/// re-triggering `read_proc_cmdline`'s exact `spawn_blocking` tradeoff on every
-/// file-open/connect event, not just exec.
 /// The readiness of an optional ring buffer: never ready when the program that fills it is
 /// not attached, so a `select!` branch on it simply never fires.
 async fn readable_or_pending<'a>(
@@ -136,7 +128,7 @@ async fn readable_or_pending<'a>(
     }
 }
 
-/// [`drain!`] for a record whose size is not fixed (the exec record, ADR-0045): `$to_event` gets
+/// `drain!` for a record whose size is not fixed (the exec record, ADR-0045): `$to_event` gets
 /// the item's bytes and parses them itself, giving `None` for a record it refuses.
 macro_rules! drain_bytes {
     ($guard:expr, $sink:expr, $own_pid:expr, $to_event:expr) => {{
@@ -174,8 +166,13 @@ macro_rules! drain_bytes {
     }};
 }
 
-/// Drains up to `MAX_ITEMS_PER_DRAIN` fixed-size `$wire_ty` records; a record shorter than the
-/// type is skipped.
+/// Drains up to `MAX_ITEMS_PER_DRAIN` fixed-size `$wire_ty` records from one ring buffer; a
+/// record shorter than the type is skipped.
+///
+/// `$to_event` is `Fn(&$wire_ty) -> Event`, so each leg can enrich the event with its own
+/// reads. Container attribution (issue #80/#204) does not touch `/proc` at all: it resolves
+/// `$wire_ty::meta.cgroup_id` against cgroupfs instead (see `CgroupIdCache`), so no leg pays a
+/// `spawn_blocking` `/proc` read per event just to learn its container.
 macro_rules! drain {
     ($guard:expr, $wire_ty:ty, $sink:expr, $own_pid:expr, $to_event:expr) => {
         drain_bytes!(

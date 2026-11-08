@@ -69,8 +69,9 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
   source by descriptor at the privileged response boundary; see ADR-0021.
   Platform deps must be target-gated: `[target.'cfg(windows)'.dependencies]`, never
   unconditional.
-- `crates/sensors/linux-ebpf` is excluded from the workspace (special toolchain, dual-licensed GPL-2.0-only OR MIT);
-  build it explicitly on Linux.
+- `crates/sensors/linux/ebpf` (`sensor-linux-ebpf`) is a workspace member but not a default member
+  (bpfel target, special toolchain, dual-licensed GPL-2.0-only OR MIT); it is built by `sensor-linux`'s
+  `build.rs` on Linux, and `--workspace` commands must `--exclude sensor-linux-ebpf`.
 
 ## Conventions
 
