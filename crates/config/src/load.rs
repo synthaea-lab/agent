@@ -9,12 +9,16 @@
 //! operators can call `SYNTHAEA_LOG_LEVEL=debug agent --dry-run` without
 //! editing the file to try a different value.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::{
     discovery::{DiscoverySource, discover},
     error::ConfigError,
-    schema::{AgentConfig, SCHEMA_VERSION},
+    schema::{
+        AgentConfig, CONTENT_RINGS, DeceptionConfig, DetectionConfig, IpcConfig, LogConfig,
+        LogsConfig, MAX_CANARY_ALLOW_EXES, MAX_CANARY_DIRS, MAX_LOG_SOURCES,
+        MAX_ODD_HOUR_EXEMPT_ACCOUNTS, SCHEMA_VERSION, ServerConfig, StorageConfig, UpdatesConfig,
+    },
 };
 
 /// Perform the full discovery-and-load flow, then apply env overrides.
@@ -160,10 +164,6 @@ struct SchemaProbe {
     schema_version: u32,
 }
 
-/// Checks that a fully-deserialized [`AgentConfig`] carries semantically
-/// valid values (URL shapes, non-zero budgets, log level enum).
-///
-/// Everything in here is a rule the type system alone can't enforce.
 /// Names that run whatever they are given: allowing one exempts every script and command
 /// line it executes, so an attacker needs only to start their tool through it. Matched on the
 /// file name, by exact name or by family prefix (`python3.12`, `perl5.38`). Not a complete
@@ -227,295 +227,332 @@ fn is_interpreter(path: &Path) -> bool {
     EXACT.contains(&name.as_str()) || FAMILIES.iter().any(|family| name.starts_with(family))
 }
 
+/// Checks that a fully-deserialized [`AgentConfig`] carries semantically
+/// valid values (URL shapes, non-zero budgets, log level enum).
+///
+/// Everything in here is a rule the type system alone can't enforce. The first
+/// failing check wins, so the call order below is the order an operator sees
+/// problems in: value checks section by section, then the absolute-path checks.
 fn validate_semantics(cfg: &AgentConfig, source_path: &Path) -> Result<(), ConfigError> {
-    let src = source_path.display().to_string();
+    let origin = source_path.display().to_string();
+    let origin = origin.as_str();
+    validate_server_url(&cfg.server, origin)?;
+    validate_log(&cfg.log, origin)?;
+    validate_storage(&cfg.storage, origin)?;
+    validate_updates(&cfg.updates, origin)?;
+    validate_logs(&cfg.logs, origin)?;
+    validate_detection(&cfg.detection, origin)?;
+    validate_deception(&cfg.deception, origin)?;
+    validate_ipc(&cfg.ipc, origin)?;
+    validate_absolute_paths(cfg, origin)
+}
 
-    // server.control_plane_url — non-empty https://…
-    if !cfg.server.control_plane_url.starts_with("https://") {
-        return Err(ConfigError::Invalid {
-            field: "server.control_plane_url".into(),
-            expected: "an `https://` URL".into(),
-            value: cfg.server.control_plane_url.clone(),
-            origin: src.clone(),
-        });
+/// The [`ConfigError::Invalid`] every semantic check returns.
+fn invalid(
+    field: impl Into<String>,
+    expected: impl Into<String>,
+    value: impl Into<String>,
+    origin: &str,
+) -> ConfigError {
+    ConfigError::Invalid {
+        field: field.into(),
+        expected: expected.into(),
+        value: value.into(),
+        origin: origin.to_string(),
     }
+}
 
+/// `server.control_plane_url` — non-empty `https://…`.
+fn validate_server_url(server: &ServerConfig, origin: &str) -> Result<(), ConfigError> {
+    if !server.control_plane_url.starts_with("https://") {
+        return Err(invalid(
+            "server.control_plane_url",
+            "an `https://` URL",
+            server.control_plane_url.as_str(),
+            origin,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_log(log: &LogConfig, origin: &str) -> Result<(), ConfigError> {
     // log.level — one of the accepted enum values.
-    let level_lower = cfg.log.level.to_ascii_lowercase();
+    let level_lower = log.level.to_ascii_lowercase();
     if !matches!(
         level_lower.as_str(),
         "trace" | "debug" | "info" | "warn" | "error"
     ) {
-        return Err(ConfigError::Invalid {
-            field: "log.level".into(),
-            expected: "one of `trace`, `debug`, `info`, `warn`, `error`".into(),
-            value: cfg.log.level.clone(),
-            origin: src.clone(),
-        });
+        return Err(invalid(
+            "log.level",
+            "one of `trace`, `debug`, `info`, `warn`, `error`",
+            log.level.as_str(),
+            origin,
+        ));
     }
 
     // log.max_mb — zero is "no cap", explicitly refused per the field's own
     // documentation. Operators who want unbounded logging document that
     // choice in the config file with an explicit large value, not a `0`.
-    if cfg.log.max_mb == 0 {
-        return Err(ConfigError::Invalid {
-            field: "log.max_mb".into(),
-            expected: "a positive integer (0 is not accepted; state the cap explicitly)".into(),
-            value: "0".into(),
-            origin: src.clone(),
-        });
+    if log.max_mb == 0 {
+        return Err(invalid(
+            "log.max_mb",
+            "a positive integer (0 is not accepted; state the cap explicitly)",
+            "0",
+            origin,
+        ));
     }
+    Ok(())
+}
 
-    // storage.spool_max_mb — zero can't reserve any spool at boot, so it's
-    // rejected. If disk spooling is genuinely unwanted, that's a future
-    // schema addition (e.g. `spool.enabled = false`), not a zero-sized cap.
-    if cfg.storage.spool_max_mb == 0 {
-        return Err(ConfigError::Invalid {
-            field: "storage.spool_max_mb".into(),
-            expected: "a positive integer".into(),
-            value: "0".into(),
-            origin: src.clone(),
-        });
+/// `storage.spool_max_mb` — zero can't reserve any spool at boot, so it's
+/// rejected. If disk spooling is genuinely unwanted, that's a future schema
+/// addition (e.g. `spool.enabled = false`), not a zero-sized cap.
+fn validate_storage(storage: &StorageConfig, origin: &str) -> Result<(), ConfigError> {
+    if storage.spool_max_mb == 0 {
+        return Err(invalid(
+            "storage.spool_max_mb",
+            "a positive integer",
+            "0",
+            origin,
+        ));
     }
+    Ok(())
+}
 
-    // updates.ring — a typo'd ring would otherwise surface as a server-side
-    // 404 (or worse, a valid but unintended ring) at the first fetch.
-    if let Some(ring) = &cfg.updates.ring
-        && !crate::schema::CONTENT_RINGS.contains(&ring.as_str())
+/// `updates.ring` — a typo'd ring would otherwise surface as a server-side
+/// 404 (or worse, a valid but unintended ring) at the first fetch.
+fn validate_updates(updates: &UpdatesConfig, origin: &str) -> Result<(), ConfigError> {
+    if let Some(ring) = &updates.ring
+        && !CONTENT_RINGS.contains(&ring.as_str())
     {
-        return Err(ConfigError::Invalid {
-            field: "updates.ring".into(),
-            expected: format!("one of {}", crate::schema::CONTENT_RINGS.join(", ")),
-            value: ring.clone(),
-            origin: src.clone(),
-        });
+        return Err(invalid(
+            "updates.ring",
+            format!("one of {}", CONTENT_RINGS.join(", ")),
+            ring.as_str(),
+            origin,
+        ));
     }
+    Ok(())
+}
 
-    // logs.sources — each one is a file the agent tails and a parser fed by
-    // attacker-controlled text (ADR-0022): a bounded, absolute, duplicate-free
-    // list, so a typo fails at boot instead of silently reading nothing.
-    if cfg.logs.sources.len() > crate::schema::MAX_LOG_SOURCES {
-        return Err(ConfigError::Invalid {
-            field: "logs.sources".into(),
-            expected: format!("at most {} sources", crate::schema::MAX_LOG_SOURCES),
-            value: format!("{} sources", cfg.logs.sources.len()),
-            origin: src.clone(),
-        });
+/// `logs.sources` — each one is a file the agent tails and a parser fed by
+/// attacker-controlled text (ADR-0022): a bounded, absolute, duplicate-free
+/// list, so a typo fails at boot instead of silently reading nothing.
+fn validate_logs(logs: &LogsConfig, origin: &str) -> Result<(), ConfigError> {
+    if logs.sources.len() > MAX_LOG_SOURCES {
+        return Err(invalid(
+            "logs.sources",
+            format!("at most {MAX_LOG_SOURCES} sources"),
+            format!("{} sources", logs.sources.len()),
+            origin,
+        ));
     }
-    for (i, source) in cfg.logs.sources.iter().enumerate() {
+    for (i, source) in logs.sources.iter().enumerate() {
         if !source.path.is_absolute() {
-            return Err(ConfigError::Invalid {
-                field: format!("logs.sources[{i}].path"),
-                expected: "an absolute filesystem path".into(),
-                value: source.path.display().to_string(),
-                origin: src.clone(),
-            });
+            return Err(invalid(
+                format!("logs.sources[{i}].path"),
+                "an absolute filesystem path",
+                source.path.display().to_string(),
+                origin,
+            ));
         }
-        if cfg.logs.sources[..i].iter().any(|s| s.path == source.path) {
-            return Err(ConfigError::Invalid {
-                field: format!("logs.sources[{i}].path"),
-                expected: "a path declared once (two parsers on one file would read it twice)"
-                    .into(),
-                value: source.path.display().to_string(),
-                origin: src.clone(),
-            });
+        if logs.sources[..i].iter().any(|s| s.path == source.path) {
+            return Err(invalid(
+                format!("logs.sources[{i}].path"),
+                "a path declared once (two parsers on one file would read it twice)",
+                source.path.display().to_string(),
+                origin,
+            ));
         }
     }
+    Ok(())
+}
 
+fn validate_detection(detection: &DetectionConfig, origin: &str) -> Result<(), ConfigError> {
     // detection.utc_offset_minutes — a typo (`2` for `120`, seconds for minutes) would put every
     // logon in the wrong hour, so it fails at boot instead of quietly mis-timing the rule.
-    if let Some(minutes) = cfg.detection.utc_offset_minutes
+    if let Some(minutes) = detection.utc_offset_minutes
         && !(-720..=840).contains(&minutes)
     {
-        return Err(ConfigError::Invalid {
-            field: "detection.utc_offset_minutes".into(),
-            expected: "minutes east of UTC, between -720 and 840".into(),
-            value: minutes.to_string(),
-            origin: src.clone(),
-        });
+        return Err(invalid(
+            "detection.utc_offset_minutes",
+            "minutes east of UTC, between -720 and 840",
+            minutes.to_string(),
+            origin,
+        ));
     }
 
     // detection.work_hours — a typo would move the window the rule judges every logon by.
-    if let Some([start, end]) = cfg.detection.work_hours
+    if let Some([start, end]) = detection.work_hours
         && (start > 23 || end == 0 || end > 24 || start == end)
     {
-        return Err(ConfigError::Invalid {
-            field: "detection.work_hours".into(),
-            expected: "[start, end]: start 0 to 23, end 1 to 24, start different from end".into(),
-            value: format!("[{start}, {end}]"),
-            origin: src.clone(),
-        });
+        return Err(invalid(
+            "detection.work_hours",
+            "[start, end]: start 0 to 23, end 1 to 24, start different from end",
+            format!("[{start}, {end}]"),
+            origin,
+        ));
     }
 
-    // detection.odd_hour_exempt_accounts — bounded, and a blank or malformed entry would exempt
-    // nothing (or, for a malformed SID, more than was written) while looking like it exempted
-    // someone. The message names the first bad entry.
-    let exempt = &cfg.detection.odd_hour_exempt_accounts;
+    validate_odd_hour_exempt_accounts(&detection.odd_hour_exempt_accounts, origin)
+}
+
+/// `detection.odd_hour_exempt_accounts` — bounded, and a blank or malformed entry would exempt
+/// nothing (or, for a malformed SID, more than was written) while looking like it exempted
+/// someone. The message names the first bad entry.
+fn validate_odd_hour_exempt_accounts(exempt: &[String], origin: &str) -> Result<(), ConfigError> {
     let bad_entry = exempt
         .iter()
         .enumerate()
         .find_map(|(i, entry)| exempt_entry_problem(entry).map(|problem| (i, problem)));
-    if exempt.len() > crate::schema::MAX_ODD_HOUR_EXEMPT_ACCOUNTS || bad_entry.is_some() {
-        return Err(ConfigError::Invalid {
-            field: "detection.odd_hour_exempt_accounts".into(),
-            expected: format!(
-                "at most {} entries, each `NAME` or `NAME|SID` (a SID `S-1-...` or a prefix ending in `-*`), none blank or over 256 bytes",
-                crate::schema::MAX_ODD_HOUR_EXEMPT_ACCOUNTS
+    if exempt.len() > MAX_ODD_HOUR_EXEMPT_ACCOUNTS || bad_entry.is_some() {
+        return Err(invalid(
+            "detection.odd_hour_exempt_accounts",
+            format!(
+                "at most {MAX_ODD_HOUR_EXEMPT_ACCOUNTS} entries, each `NAME` or `NAME|SID` (a SID `S-1-...` or a prefix ending in `-*`), none blank or over 256 bytes"
             ),
-            value: match bad_entry {
+            match bad_entry {
                 Some((i, problem)) => format!("entry {i} ({:?}): {problem}", exempt[i]),
                 None => format!("{} entries", exempt.len()),
             },
-            origin: src.clone(),
-        });
+            origin,
+        ));
     }
+    Ok(())
+}
 
-    // deception.canary_dirs — each one gets files written into it by the agent, so a
-    // typo must fail at boot rather than plant under a relative path of the cwd.
-    if cfg.deception.canary_dirs.len() > crate::schema::MAX_CANARY_DIRS {
-        return Err(ConfigError::Invalid {
-            field: "deception.canary_dirs".into(),
-            expected: format!("at most {} directories", crate::schema::MAX_CANARY_DIRS),
-            value: format!("{} directories", cfg.deception.canary_dirs.len()),
-            origin: src.clone(),
-        });
+fn validate_deception(deception: &DeceptionConfig, origin: &str) -> Result<(), ConfigError> {
+    validate_canary_dirs(&deception.canary_dirs, origin)?;
+    validate_canary_allow_exe(&deception.allow_exe, origin)
+}
+
+/// `deception.canary_dirs` — each one gets files written into it by the agent, so a
+/// typo must fail at boot rather than plant under a relative path of the cwd.
+fn validate_canary_dirs(canary_dirs: &[PathBuf], origin: &str) -> Result<(), ConfigError> {
+    if canary_dirs.len() > MAX_CANARY_DIRS {
+        return Err(invalid(
+            "deception.canary_dirs",
+            format!("at most {MAX_CANARY_DIRS} directories"),
+            format!("{} directories", canary_dirs.len()),
+            origin,
+        ));
     }
-    for (i, dir) in cfg.deception.canary_dirs.iter().enumerate() {
+    for (i, dir) in canary_dirs.iter().enumerate() {
         if !dir.is_absolute() {
-            return Err(ConfigError::Invalid {
-                field: format!("deception.canary_dirs[{i}]"),
-                expected: "an absolute directory path".into(),
-                value: dir.display().to_string(),
-                origin: src.clone(),
-            });
+            return Err(invalid(
+                format!("deception.canary_dirs[{i}]"),
+                "an absolute directory path",
+                dir.display().to_string(),
+                origin,
+            ));
         }
-        if cfg.deception.canary_dirs[..i].contains(dir) {
-            return Err(ConfigError::Invalid {
-                field: format!("deception.canary_dirs[{i}]"),
-                expected: "a directory listed once".into(),
-                value: dir.display().to_string(),
-                origin: src.clone(),
-            });
+        if canary_dirs[..i].contains(dir) {
+            return Err(invalid(
+                format!("deception.canary_dirs[{i}]"),
+                "a directory listed once",
+                dir.display().to_string(),
+                origin,
+            ));
         }
     }
+    Ok(())
+}
 
-    // deception.allow_exe — matched against a resolved executable path, so a relative
-    // entry could never match and would silently leave the canary noisy.
-    if cfg.deception.allow_exe.len() > crate::schema::MAX_CANARY_ALLOW_EXES {
-        return Err(ConfigError::Invalid {
-            field: "deception.allow_exe".into(),
-            expected: format!(
-                "at most {} executables",
-                crate::schema::MAX_CANARY_ALLOW_EXES
-            ),
-            value: format!("{} executables", cfg.deception.allow_exe.len()),
-            origin: src.clone(),
-        });
+/// `deception.allow_exe` — matched against a resolved executable path, so a relative
+/// entry could never match and would silently leave the canary noisy.
+fn validate_canary_allow_exe(allow_exe: &[PathBuf], origin: &str) -> Result<(), ConfigError> {
+    if allow_exe.len() > MAX_CANARY_ALLOW_EXES {
+        return Err(invalid(
+            "deception.allow_exe",
+            format!("at most {MAX_CANARY_ALLOW_EXES} executables"),
+            format!("{} executables", allow_exe.len()),
+            origin,
+        ));
     }
-    for (i, exe) in cfg.deception.allow_exe.iter().enumerate() {
+    for (i, exe) in allow_exe.iter().enumerate() {
         if is_interpreter(exe) {
-            return Err(ConfigError::Invalid {
-                field: format!("deception.allow_exe[{i}]"),
-                expected: "a specific indexer or backup binary, not a shell, interpreter or \
-                           launcher (every script it runs would be allowed to read the canaries)"
-                    .into(),
-                value: exe.display().to_string(),
-                origin: src.clone(),
-            });
+            return Err(invalid(
+                format!("deception.allow_exe[{i}]"),
+                "a specific indexer or backup binary, not a shell, interpreter or launcher \
+                 (every script it runs would be allowed to read the canaries)",
+                exe.display().to_string(),
+                origin,
+            ));
         }
         if !exe.is_absolute() {
-            return Err(ConfigError::Invalid {
-                field: format!("deception.allow_exe[{i}]"),
-                expected: "an absolute executable path".into(),
-                value: exe.display().to_string(),
-                origin: src.clone(),
-            });
+            return Err(invalid(
+                format!("deception.allow_exe[{i}]"),
+                "an absolute executable path",
+                exe.display().to_string(),
+                origin,
+            ));
         }
     }
+    Ok(())
+}
 
-    // ipc.endpoint — shape check per OS. On Windows the endpoint is a named
-    // pipe (`\\.\pipe\...`), everywhere else it's an absolute filesystem
-    // path (Unix domain socket).
-    if cfg.ipc.endpoint.is_empty() {
-        return Err(ConfigError::Invalid {
-            field: "ipc.endpoint".into(),
-            expected: "a non-empty pipe name (Windows) or absolute socket path (Unix)".into(),
-            value: cfg.ipc.endpoint.clone(),
-            origin: src.clone(),
-        });
+/// `ipc.endpoint` — shape check per OS. On Windows the endpoint is a named
+/// pipe (`\\.\pipe\...`), everywhere else it's an absolute filesystem path
+/// (Unix domain socket).
+fn validate_ipc(ipc: &IpcConfig, origin: &str) -> Result<(), ConfigError> {
+    if ipc.endpoint.is_empty() {
+        return Err(invalid(
+            "ipc.endpoint",
+            "a non-empty pipe name (Windows) or absolute socket path (Unix)",
+            ipc.endpoint.as_str(),
+            origin,
+        ));
     }
     #[cfg(target_os = "windows")]
     {
-        if !cfg.ipc.endpoint.starts_with(r"\\.\pipe\") {
-            return Err(ConfigError::Invalid {
-                field: "ipc.endpoint".into(),
-                expected: r"a Windows named pipe (`\\.\pipe\...`)".into(),
-                value: cfg.ipc.endpoint.clone(),
-                origin: src.clone(),
-            });
+        if !ipc.endpoint.starts_with(r"\\.\pipe\") {
+            return Err(invalid(
+                "ipc.endpoint",
+                r"a Windows named pipe (`\\.\pipe\...`)",
+                ipc.endpoint.as_str(),
+                origin,
+            ));
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        if !Path::new(&cfg.ipc.endpoint).is_absolute() {
-            return Err(ConfigError::Invalid {
-                field: "ipc.endpoint".into(),
-                expected: "an absolute filesystem path (Unix domain socket)".into(),
-                value: cfg.ipc.endpoint.clone(),
-                origin: src.clone(),
-            });
+        if !Path::new(&ipc.endpoint).is_absolute() {
+            return Err(invalid(
+                "ipc.endpoint",
+                "an absolute filesystem path (Unix domain socket)",
+                ipc.endpoint.as_str(),
+                origin,
+            ));
         }
     }
+    Ok(())
+}
 
-    // server.mtls_cert / server.mtls_key — absolute paths only. A relative
-    // path resolves from the working directory of whichever binary reads
-    // the config, which is different for `agent` (systemd) vs `cli` (user
-    // shell); an absolute path is the only shared meaning.
-    for (field, path) in [
-        ("server.mtls_cert", &cfg.server.mtls_cert),
-        ("server.mtls_key", &cfg.server.mtls_key),
-    ] {
-        if !path.is_absolute() {
-            return Err(ConfigError::Invalid {
-                field: field.into(),
-                expected: "an absolute filesystem path".into(),
-                value: path.display().to_string(),
-                origin: src.clone(),
-            });
+/// `server.mtls_cert`, `server.mtls_key`, `server.ca_cert` (when given),
+/// `storage.state_dir`, `log.dir` — absolute paths only. A relative path
+/// resolves from the working directory of whichever binary reads the config,
+/// which is different for `agent` (systemd) vs `cli` (user shell); an absolute
+/// path is the only shared meaning.
+fn validate_absolute_paths(cfg: &AgentConfig, origin: &str) -> Result<(), ConfigError> {
+    let paths = [
+        ("server.mtls_cert", Some(&cfg.server.mtls_cert)),
+        ("server.mtls_key", Some(&cfg.server.mtls_key)),
+        ("server.ca_cert", cfg.server.ca_cert.as_ref()),
+        ("storage.state_dir", Some(&cfg.storage.state_dir)),
+        ("log.dir", Some(&cfg.log.dir)),
+    ];
+    for (field, path) in paths {
+        if let Some(path) = path
+            && !path.is_absolute()
+        {
+            return Err(invalid(
+                field,
+                "an absolute filesystem path",
+                path.display().to_string(),
+                origin,
+            ));
         }
     }
-
-    // server.ca_cert — optional; when given, absolute for the same reason.
-    if let Some(ca_cert) = &cfg.server.ca_cert
-        && !ca_cert.is_absolute()
-    {
-        return Err(ConfigError::Invalid {
-            field: "server.ca_cert".into(),
-            expected: "an absolute filesystem path".into(),
-            value: ca_cert.display().to_string(),
-            origin: src.clone(),
-        });
-    }
-
-    // storage.state_dir — absolute, same rationale.
-    if !cfg.storage.state_dir.is_absolute() {
-        return Err(ConfigError::Invalid {
-            field: "storage.state_dir".into(),
-            expected: "an absolute filesystem path".into(),
-            value: cfg.storage.state_dir.display().to_string(),
-            origin: src.clone(),
-        });
-    }
-    // log.dir — same.
-    if !cfg.log.dir.is_absolute() {
-        return Err(ConfigError::Invalid {
-            field: "log.dir".into(),
-            expected: "an absolute filesystem path".into(),
-            value: cfg.log.dir.display().to_string(),
-            origin: src.clone(),
-        });
-    }
-
     Ok(())
 }
 
