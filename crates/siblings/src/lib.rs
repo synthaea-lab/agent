@@ -204,7 +204,18 @@ mod tests {
     fn the_skip_message_names_the_repo_the_path_and_the_fix() {
         let message = skip_message("ml", "tests/fixtures/x.jsonl");
         assert!(message.starts_with("skipped: needs sibling repo `ml` ("));
-        assert!(message.contains("tests/fixtures/x.jsonl"));
+        // Compared as a joined path, not a literal: on Windows the root is a verbatim
+        // `\\?\` path, and joining onto one normalizes `/` to `\`.
+        let expected = expected_path("ml", "tests/fixtures/x.jsonl");
+        assert!(message.contains(&expected.display().to_string()));
+        assert!(
+            expected.ends_with(
+                Path::new("ml")
+                    .join("tests")
+                    .join("fixtures")
+                    .join("x.jsonl")
+            )
+        );
         assert!(message.ends_with("set SYNTHAEA_ROOT"));
     }
 }
