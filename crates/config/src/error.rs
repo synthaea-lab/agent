@@ -131,20 +131,22 @@ pub enum ConfigError {
         origin: String,
     },
 
-    /// A field declared as a secret didn't start with a supported provider
-    /// prefix (`envvar:` or `file:`). Per ADR-0013 §7, the load fails rather
-    /// than accepting a literal cleartext secret with a "looks like a
-    /// literal" heuristic.
+    /// A field declared as a secret is not a supported provider reference
+    /// (`envvar:` or `file:`). Per ADR-0013 §7, the load fails rather than
+    /// accepting a literal cleartext secret with a "looks like a literal"
+    /// heuristic. The offending value is deliberately absent: it is most
+    /// likely the cleartext secret itself, and this message reaches stderr
+    /// and the service journal.
     #[error(
         "field `{field}` in `{origin}` is a secret but is not a supported \
- reference. Expected `envvar:NAME` or `file:/absolute/path`, got \
- `{value}`."
+ reference: {problem}. Expected `envvar:NAME` or `file:/absolute/path` \
+ (the value is not shown, as it may be the secret itself)."
     )]
     SecretInvalid {
         /// Dot-path of the offending secret field.
         field: String,
-        /// What was written in the file, stringified.
-        value: String,
+        /// Why the value was rejected, without any part of the value.
+        problem: crate::secret::SecretRefError,
         /// Where the value came from: a file path, or `env:SYNTHAEA_FOO`.
         /// Not named `source` because thiserror reserves that name for the
         /// `#[source]` auto-annotation.

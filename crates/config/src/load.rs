@@ -98,12 +98,58 @@ fn parse_and_validate(raw: &str, source_path: &Path) -> Result<AgentConfig, Conf
         });
     }
 
+    validate_secret_references(raw, source_path)?;
     let cfg: AgentConfig = toml::from_str(raw).map_err(|source| ConfigError::Parse {
         path: source_path.to_path_buf(),
         source: Box::new(source),
     })?;
     validate_semantics(&cfg, source_path)?;
     Ok(cfg)
+}
+
+/// Dot-paths of every [`crate::SecretRef`] field in [`AgentConfig`].
+const SECRET_FIELDS: &[&str] = &["server.mtls_passphrase"];
+
+/// Rejects a malformed secret reference with a field-path-carrying
+/// [`ConfigError::SecretInvalid`] before typed deserialization runs.
+///
+/// It runs on the raw TOML table rather than after deserialization because a
+/// serde error cannot carry the field path (issue #281), and because the
+/// `toml` crate's own error quotes the offending source line — which, for a
+/// secret field, is the cleartext secret. An absent field is left to typed
+/// deserialization, whose "missing field" error quotes nothing.
+fn validate_secret_references(raw: &str, source_path: &Path) -> Result<(), ConfigError> {
+    let document: toml::Table = toml::from_str(raw).map_err(|source| ConfigError::Parse {
+        path: source_path.to_path_buf(),
+        source: Box::new(source),
+    })?;
+    for field in SECRET_FIELDS {
+        let Some(value) = lookup(&document, field) else {
+            continue;
+        };
+        let parsed = value
+            .as_str()
+            .ok_or(crate::SecretRefError::NotAString)
+            .and_then(crate::SecretRef::parse);
+        if let Err(problem) = parsed {
+            return Err(ConfigError::SecretInvalid {
+                field: (*field).to_string(),
+                problem,
+                origin: source_path.display().to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The value at a dot-path in a TOML table, if every segment exists.
+fn lookup<'a>(document: &'a toml::Table, dot_path: &str) -> Option<&'a toml::Value> {
+    let mut segments = dot_path.split('.');
+    let mut value = document.get(segments.next()?)?;
+    for segment in segments {
+        value = value.as_table()?.get(segment)?;
+    }
+    Some(value)
 }
 
 /// Minimal probe to read `schema_version` without deserializing the full
@@ -183,19 +229,6 @@ fn is_interpreter(path: &Path) -> bool {
 
 fn validate_semantics(cfg: &AgentConfig, source_path: &Path) -> Result<(), ConfigError> {
     let src = source_path.display().to_string();
-
-    // Secret fields — reject `SecretRef::Invalid` (a bare literal in the TOML
-    // that didn't match any provider prefix). Deserialize is deliberately
-    // infallible on secrets so the field-path context can be produced here;
-    // see `SecretRef`'s docs and the module-level comment above its
-    // `Deserialize` impl. Fixes the dead-code defect from issue #281.
-    if let crate::secret::SecretRef::Invalid(raw) = &cfg.server.mtls_passphrase {
-        return Err(ConfigError::SecretInvalid {
-            field: "server.mtls_passphrase".into(),
-            value: raw.clone(),
-            origin: src.clone(),
-        });
-    }
 
     // server.control_plane_url — non-empty https://…
     if !cfg.server.control_plane_url.starts_with("https://") {
@@ -852,6 +885,13 @@ control_plane_url = "https://cp.example"
         }
     }
 
+    fn with_passphrase(literal: &str) -> String {
+        valid_toml().replace(
+            r#"mtls_passphrase = "envvar:SYNTHAEA_MTLS_PASSPHRASE""#,
+            &format!("mtls_passphrase = {literal}"),
+        )
+    }
+
     #[test]
     fn cleartext_secret_is_rejected_as_secret_invalid() {
         // A bare cleartext value in a secret field must produce
@@ -859,19 +899,90 @@ control_plane_url = "https://cp.example"
         // whole point of the `SecretInvalid` variant, and the fix for
         // issue #281 (before the fix, this test asserted `Parse` and the
         // dedicated variant was dead code).
-        let bad = valid_toml().replace(
-            r#"mtls_passphrase = "envvar:SYNTHAEA_MTLS_PASSPHRASE""#,
-            r#"mtls_passphrase = "hunter2""#,
-        );
-        let f = write_tmp(&bad);
+        let f = write_tmp(&with_passphrase(r#""hunter2""#));
         let err = load_from(f.path()).unwrap_err();
         match err {
-            ConfigError::SecretInvalid { field, value, .. } => {
+            ConfigError::SecretInvalid { field, problem, .. } => {
                 assert_eq!(field, "server.mtls_passphrase");
-                assert_eq!(value, "hunter2");
+                assert_eq!(problem, crate::SecretRefError::UnsupportedProvider);
             }
             other => panic!("expected SecretInvalid, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_invalid_secret_error_does_not_contain_the_value() {
+        let secret = "correct-horse-battery-staple";
+        for literal in [
+            format!(r#""{secret}""#),
+            format!(r#""vault:{secret}""#),
+            format!(r#"{{ value = "{secret}" }}"#),
+        ] {
+            let f = write_tmp(&with_passphrase(&literal));
+            let err = load_from(f.path()).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::SecretInvalid { .. }),
+                "{literal}: expected SecretInvalid, got {err:?}"
+            );
+            assert!(!format!("{err}").contains(secret), "{literal}: {err}");
+            assert!(!format!("{err:?}").contains(secret), "{literal}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn a_non_string_secret_is_rejected_as_secret_invalid() {
+        let f = write_tmp(&with_passphrase("12345"));
+        let err = load_from(f.path()).unwrap_err();
+        match err {
+            ConfigError::SecretInvalid { problem, .. } => {
+                assert_eq!(problem, crate::SecretRefError::NotAString);
+            }
+            other => panic!("expected SecretInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_secret_field_is_validated_before_typed_deserialization() {
+        // Replace each string leaf of a valid config with a bare literal: if
+        // typed deserialization rejects it as a secret, the field is a
+        // `SecretRef` missing from `SECRET_FIELDS`, and its error would quote
+        // the source line — the cleartext secret — instead of naming it.
+        let document: toml::Table = toml::from_str(&valid_toml()).unwrap();
+        for path in string_leaf_paths(&document, "") {
+            let mut tampered = document.clone();
+            set_leaf(&mut tampered, &path, toml::Value::String("hunter2".into()));
+            let err = parse_and_validate(&toml::to_string(&tampered).unwrap(), Path::new("t"))
+                .err()
+                .map(|e| format!("{e}"))
+                .unwrap_or_default();
+            assert!(
+                !err.contains(crate::secret::SECRET_REJECTED_PREFIX),
+                "`{path}` is a SecretRef field missing from SECRET_FIELDS: {err}"
+            );
+        }
+    }
+
+    fn string_leaf_paths(table: &toml::Table, prefix: &str) -> Vec<String> {
+        table
+            .iter()
+            .flat_map(|(key, value)| {
+                let path = format!("{prefix}{key}");
+                match value {
+                    toml::Value::String(_) => vec![path],
+                    toml::Value::Table(inner) => string_leaf_paths(inner, &format!("{path}.")),
+                    _ => Vec::new(),
+                }
+            })
+            .collect()
+    }
+
+    fn set_leaf(table: &mut toml::Table, dot_path: &str, leaf: toml::Value) {
+        let (parents, key) = dot_path.rsplit_once('.').unwrap_or(("", dot_path));
+        let mut current = table;
+        for segment in parents.split('.').filter(|s| !s.is_empty()) {
+            current = current[segment].as_table_mut().unwrap();
+        }
+        current.insert(key.to_string(), leaf);
     }
 
     #[test]

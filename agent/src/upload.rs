@@ -422,7 +422,7 @@ mod tests {
             control_plane_url: "https://cp.example".to_string(),
             mtls_cert: PathBuf::from("/etc/synthaea/certs/client.crt"),
             mtls_key: PathBuf::from("/etc/synthaea/certs/client.key"),
-            mtls_passphrase: config::SecretRef::Invalid(String::new()),
+            mtls_passphrase: config::SecretRef::EnvVar("SYNTHAEA_MTLS_PASSPHRASE".to_string()),
             ca_cert: Some(PathBuf::from("/etc/synthaea/certs/ca.pem")),
             offline_fallback: true,
         }

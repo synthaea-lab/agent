@@ -61,5 +61,5 @@ pub use schema::{
     MAX_LOG_SOURCES, MAX_ODD_HOUR_EXEMPT_ACCOUNTS, ResourcesConfig, SCHEMA_VERSION, ServerConfig,
     StorageConfig, UpdatesConfig,
 };
-pub use secret::SecretRef;
+pub use secret::{SecretRef, SecretRefError};
 pub use template::{DEFAULT_TEMPLATE, write_default_template};
