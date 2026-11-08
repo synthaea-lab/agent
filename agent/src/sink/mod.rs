@@ -5,6 +5,10 @@
 //! training. Raw capture needs no sink of its own: it uses `sinks::JsonlEventSink`
 //! directly.
 
+// Production locks go through `LockExt::lock_recovering` (the agent's poisoned-lock policy,
+// `crate::sync`); a bare `unwrap` here would bring the panic-on-poison back.
+#![cfg_attr(not(test), warn(clippy::unwrap_used))]
+
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
@@ -23,6 +27,7 @@ use sinks::JsonlWriter;
 use crate::{
     alerts::{AlertLog, RECENT_ALERTS_CAPACITY},
     enrich_queue::EnrichQueue,
+    sync::LockExt as _,
 };
 
 /// Wires issue #25's automated response into the sink once `enable_response` sets it
@@ -319,7 +324,7 @@ fn record_detection(
         events: safe_events,
     };
     let spooled = persist.map(|_| detection.clone());
-    let result = verdict.lock().unwrap().record(
+    let result = verdict.lock_recovering().record(
         finding.entity.clone(),
         finding.technique,
         detection,
@@ -566,7 +571,7 @@ impl DetectionSink {
 
     fn advance_correlation_time(&self, now_ns: u64) {
         let alerts = {
-            let mut correlator = self.correlator.lock().unwrap();
+            let mut correlator = self.correlator.lock_recovering();
             correlator.advance_time(now_ns)
         };
         // BAYES is the only technique `crosses_kill_gate` recognizes, and it is raised
@@ -693,7 +698,7 @@ impl DetectionSink {
                     events_log.write(&safe_event);
                 }
                 if let Some(spool) = &spool
-                    && let Err(e) = spool.lock().unwrap().push(&safe_event)
+                    && let Err(e) = spool.lock_recovering().push(&safe_event)
                 {
                     // Spool full is handled inside push (shed-oldest, counted);
                     // reaching here is a real I/O failure — degrade to local-only.
@@ -781,7 +786,7 @@ impl DetectionSink {
 
         // The replaced engines are dropped after the locks are released: a
         // `ScanQueue` joins its worker on drop, which must not stall capture.
-        let mut sigma_slot = self.sigma.lock().unwrap();
+        let mut sigma_slot = self.sigma.lock_recovering();
         let (sigma_reload_failed, old_sigma) = match sigma_loaded {
             Load::Loaded(engine) => (false, sigma_slot.replace(engine)),
             Load::Absent => (false, sigma_slot.take()),
@@ -791,7 +796,7 @@ impl DetectionSink {
         drop(sigma_slot);
         drop(old_sigma);
 
-        let mut yara_slot = self.yara.lock().unwrap();
+        let mut yara_slot = self.yara.lock_recovering();
         let (yara_reload_failed, old_yara) = match yara_loaded {
             Load::Loaded(loaded) => (false, yara_slot.replace(loaded)),
             Load::Absent => (false, yara_slot.take()),
@@ -806,7 +811,7 @@ impl DetectionSink {
 
         // Same rules, same posture as the file scanner: absent unloads, broken keeps
         // the previous queue (its failure is already reported through `yara`).
-        let mut memscan_slot = self.memscan.lock().unwrap();
+        let mut memscan_slot = self.memscan.lock_recovering();
         let old_memscan = match memscan_loaded {
             Load::Loaded(queue) => memscan_slot.replace(queue),
             Load::Absent => memscan_slot.take(),
@@ -891,7 +896,7 @@ impl DetectionSink {
         terminate: impl Fn(u32) -> std::io::Result<()> + Send + Sync + 'static,
         quarantine_dir: PathBuf,
     ) {
-        *self.response.lock().unwrap() = Some(ResponseHooks {
+        *self.response.lock_recovering() = Some(ResponseHooks {
             policy,
             terminate: Box::new(terminate),
             quarantine_dir,
@@ -1002,7 +1007,7 @@ impl DetectionSink {
     /// the payload of a fileless exec exists only there. The scan queue applies the
     /// cooldown, the global cap and the per-scan budget; a shed request is counted there.
     fn request_memory_scan(&self, event: &Event) {
-        let guard = self.memscan.lock().unwrap();
+        let guard = self.memscan.lock_recovering();
         let Some(queue) = guard.as_ref() else {
             return;
         };
@@ -1033,29 +1038,26 @@ impl DetectionSink {
     /// Tells the rules the host's UTC offset in minutes (<https://github.com/synthaea-lab/agent/issues/17>); false when it is not a real one.
     pub(crate) fn set_local_utc_offset_minutes(&self, minutes: i32) -> bool {
         self.rule_state
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .set_local_utc_offset_minutes(minutes)
     }
 
     /// Declares the ordinary local hours (<https://github.com/synthaea-lab/agent/issues/64>); false when they are not a window.
     pub(crate) fn set_work_hours(&self, start: u32, end: u32) -> bool {
-        self.rule_state.lock().unwrap().set_work_hours(start, end)
+        self.rule_state.lock_recovering().set_work_hours(start, end)
     }
 
     /// Declares the accounts whose odd-hour logons are expected (<https://github.com/synthaea-lab/agent/issues/64>).
     pub(crate) fn set_odd_hour_exempt_accounts(&self, accounts: &[String]) -> usize {
         self.rule_state
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .set_odd_hour_exempt_accounts(accounts)
     }
 
     /// Gives the rules the platform's time zone (<https://github.com/synthaea-lab/agent/issues/15>); false when it has no answer for `now_secs`.
     pub(crate) fn set_local_zone(&self, zone: rules::LocalOffsetAt, now_secs: i64) -> bool {
         self.rule_state
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .set_local_zone(zone, now_secs)
     }
 
@@ -1104,10 +1106,11 @@ impl DetectionSink {
         let meta = event.meta();
         // Cloned out so the lock is not held across the `/proc` fallback inside `allows`:
         // `detect_exec` takes it for every exec event.
-        self.exec_images
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .image_of_not_after(pid, meta.process_generation, meta.timestamp_ns)
+        self.exec_images.lock_recovering().image_of_not_after(
+            pid,
+            meta.process_generation,
+            meta.timestamp_ns,
+        )
     }
 
     /// What the allow list says about the process `pid`, given the image it was seen to exec.
@@ -1135,10 +1138,7 @@ impl DetectionSink {
     /// False when the queue is full: the caller then judges the touch at once, and the
     /// overflow is counted (it brings the false positive back without a trace otherwise).
     fn hold_canary(&self, event: &Event, image: Option<crate::deception::ExecImage>) -> bool {
-        let mut held = self
-            .held_canary
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut held = self.held_canary.lock_recovering();
         if held.len() >= MAX_HELD_CANARY_TOUCHES {
             let overflowed = self.canary_hold_overflow.fetch_add(1, Ordering::Relaxed) + 1;
             if overflowed.is_power_of_two() {
@@ -1172,10 +1172,7 @@ impl DetectionSink {
             return;
         }
         let image = crate::deception::ExecImage::from_exec(exec);
-        let mut held = self
-            .held_canary
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut held = self.held_canary.lock_recovering();
         for touch in held.iter_mut() {
             let meta = touch.event.meta();
             if meta.pid == exec.meta.pid
@@ -1203,10 +1200,7 @@ impl DetectionSink {
 
     /// Removes and returns the held touches `pick` selects, oldest first.
     fn take_held(&self, pick: impl Fn(&HeldTouch) -> bool) -> Vec<HeldTouch> {
-        let mut held = self
-            .held_canary
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut held = self.held_canary.lock_recovering();
         let mut taken = Vec::new();
         let mut kept = VecDeque::new();
         for touch in held.drain(..) {
@@ -1258,7 +1252,7 @@ impl DetectionSink {
             return;
         };
         let meta = event.meta();
-        let corroborated = self.ransomware_join.lock().unwrap().note_canary(
+        let corroborated = self.ransomware_join.lock_recovering().note_canary(
             hit.pid,
             meta.process_generation,
             meta.timestamp_ns,
@@ -1313,7 +1307,7 @@ impl DetectionSink {
     /// True when `key` already raised a detection within the cooldown; otherwise records
     /// this touch as the one that did.
     fn canary_in_cooldown(&self, key: CanaryKey, now_ns: u64) -> bool {
-        let mut last = self.canary_last_hit.lock().unwrap();
+        let mut last = self.canary_last_hit.lock_recovering();
         if let Some(&at) = last.peek(&key)
             && now_ns.saturating_sub(at) < CANARY_COOLDOWN_NS
         {
@@ -1384,8 +1378,7 @@ impl DetectionSink {
         let meta = trigger.meta();
         let mut touched = self
             .rule_state
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .touched_files(meta.pid, meta.process_generation);
         touched.retain(|e| e != trigger);
         let excess = touched.len().saturating_sub(DAMAGE_MANIFEST_MAX);
@@ -1400,7 +1393,7 @@ impl DetectionSink {
     /// the resulting log-likelihood ratio. Scoring happens in the correlator lock —
     /// ONNX inference is fast (~microseconds) and the capture thread is single-threaded.
     fn correlate(&self, event: &Event) {
-        let mut engine = self.correlator.lock().unwrap();
+        let mut engine = self.correlator.lock_recovering();
         let alerts = engine.on_event(event.clone());
 
         // ML scoring: score the pid's behavior and update belief with the LLR.
@@ -1409,7 +1402,7 @@ impl DetectionSink {
         // acceptable — inference is fast and this is the capture thread.
         let pid = event.meta().pid;
         let generation = event.meta().process_generation;
-        if let Some(ref mut scorer) = *self.ml_scorer.lock().unwrap() {
+        if let Some(ref mut scorer) = *self.ml_scorer.lock_recovering() {
             let ml_llr = match scorer.score(engine.bus(), pid, generation) {
                 Ok(Some(score)) => {
                     // Scored successfully: convert to log-likelihood ratio.
@@ -1488,7 +1481,7 @@ impl DetectionSink {
     /// correlator's verdict sets it, a trigger with its own evidence (the ransomware reflex)
     /// passes `None`.
     fn kill_for(&self, pid: u32, reason: &str, shield: Option<correlator::KillShield>) {
-        let guard = self.response.lock().unwrap();
+        let guard = self.response.lock_recovering();
         let Some(hooks) = guard.as_ref() else {
             return;
         };
@@ -1521,7 +1514,7 @@ impl DetectionSink {
     /// detection first and then calls [`Self::ransomware_reflex`].
     fn note_ransomware_burst(&self, event: &Event) -> bool {
         let meta = event.meta();
-        self.ransomware_join.lock().unwrap().note_burst(
+        self.ransomware_join.lock_recovering().note_burst(
             meta.pid,
             meta.process_generation,
             meta.timestamp_ns,
@@ -1544,18 +1537,17 @@ impl DetectionSink {
             .get()
             .is_some_and(|allow| !allow.is_empty())
         {
-            self.exec_images
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .record(event);
+            self.exec_images.lock_recovering().record(event);
             self.record_exec_on_held(event);
         }
         self.record_rule_alerts(wrapped, rules::evaluate_exec(event));
-        self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_exec(event));
+        self.record_rule_alerts(wrapped, self.rule_state.lock_recovering().on_exec(event));
         // This exec moved the stream clock: identity requests waiting for it may be due (#1041).
-        self.record_due_identity_alerts(self.rule_state.lock().unwrap().take_due_identity_alerts());
+        self.record_due_identity_alerts(
+            self.rule_state.lock_recovering().take_due_identity_alerts(),
+        );
         self.record_due_unit_stops();
-        let sigma_guard = self.sigma.lock().unwrap();
+        let sigma_guard = self.sigma.lock_recovering();
         if let Some(sigma) = sigma_guard.as_ref() {
             let entity = entity_key(&event.meta);
             for hit in sigma.eval_exec(event) {
@@ -1582,7 +1574,7 @@ impl DetectionSink {
     /// `FileOpen` events: stateless rules, downloader-write history, and the
     /// budgeted YARA queue on write intent (off the event path).
     fn detect_file_open(&self, wrapped: &Event, event: &schema::FileOpenEvent) {
-        let state_alerts = self.rule_state.lock().unwrap().on_file_open(event);
+        let state_alerts = self.rule_state.lock_recovering().on_file_open(event);
         self.record_rule_alerts(
             wrapped,
             rules::evaluate_file_open(event)
@@ -1592,7 +1584,7 @@ impl DetectionSink {
         // This event moved the stream clock: a queued unit stop may be due (#1085).
         self.record_due_unit_stops();
         if event.flags & 0o103 != 0
-            && let Some((yara, _)) = self.yara.lock().unwrap().as_ref()
+            && let Some((yara, _)) = self.yara.lock_recovering().as_ref()
         {
             let meta = wrapped.meta();
             let requester = match meta.user {
@@ -1629,13 +1621,13 @@ impl DetectionSink {
     /// `Zone.Identifier`): recorded for the T1204.002 download→exec join, no
     /// alert on their own (#365).
     fn detect_file_quarantine(&self, event: &schema::FileQuarantineEvent) {
-        self.rule_state.lock().unwrap().on_file_quarantine(event);
+        self.rule_state.lock_recovering().on_file_quarantine(event);
     }
 
     /// `BitsJob` events (Windows BITS-Client): recorded for the T1197
     /// download→exec join, no alert on their own (#284).
     fn detect_bits_job(&self, event: &schema::BitsJobEvent) {
-        self.rule_state.lock().unwrap().on_bits_job(event);
+        self.rule_state.lock_recovering().on_bits_job(event);
     }
 
     /// Connect events: stateless rules (unusual outbound from a web/DB
@@ -1650,7 +1642,7 @@ impl DetectionSink {
             self.record_ioc(wrapped, hit);
         }
         self.record_rule_alerts(wrapped, rules::evaluate_connect(event));
-        self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_connect(event));
+        self.record_rule_alerts(wrapped, self.rule_state.lock_recovering().on_connect(event));
     }
 
     /// `DnsQuery` events: the egress-domain join (it never alerts) and, on a listed domain or
@@ -1664,7 +1656,7 @@ impl DetectionSink {
         {
             self.record_ioc(wrapped, hit);
         }
-        self.rule_state.lock().unwrap().on_dns_query(event);
+        self.rule_state.lock_recovering().on_dns_query(event);
     }
 
     /// `NetworkFlow` events (conntrack polling, issue #92): same beacon detection as
@@ -1683,7 +1675,7 @@ impl DetectionSink {
         }
         self.record_rule_alerts(
             wrapped,
-            self.rule_state.lock().unwrap().on_network_flow(event),
+            self.rule_state.lock_recovering().on_network_flow(event),
         );
     }
 
@@ -1691,7 +1683,7 @@ impl DetectionSink {
     fn detect_listen_port(&self, wrapped: &Event, event: &schema::ListenPortEvent) {
         self.record_rule_alerts(
             wrapped,
-            self.rule_state.lock().unwrap().on_listen_port(event),
+            self.rule_state.lock_recovering().on_listen_port(event),
         );
     }
 
@@ -1700,19 +1692,19 @@ impl DetectionSink {
     fn detect_policy_denial(&self, wrapped: &Event, event: &schema::PolicyDenialEvent) {
         self.record_rule_alerts(
             wrapped,
-            self.rule_state.lock().unwrap().on_policy_denial(event),
+            self.rule_state.lock_recovering().on_policy_denial(event),
         );
     }
 
     /// `Auth` events: brute-force/spray burst detection (T1110, pack #377).
     fn detect_auth(&self, wrapped: &Event, event: &schema::AuthEvent) {
-        self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_auth(event));
+        self.record_rule_alerts(wrapped, self.rule_state.lock_recovering().on_auth(event));
     }
 
     /// `Session` events: a disconnected session reconnected from another client
     /// (T1563.002, #285).
     fn detect_session(&self, wrapped: &Event, event: &schema::SessionEvent) {
-        self.record_rule_alerts(wrapped, self.rule_state.lock().unwrap().on_session(event));
+        self.record_rule_alerts(wrapped, self.rule_state.lock_recovering().on_session(event));
     }
 
     /// `FileDelete` events: log-tamper detection (T1070.001/.002, pack #379), then the
@@ -1720,7 +1712,7 @@ impl DetectionSink {
     /// the creation history `on_file_open` keeps.
     fn detect_file_delete(&self, wrapped: &Event, event: &schema::FileDeleteEvent) {
         self.record_rule_alerts(wrapped, rules::evaluate_file_delete(event));
-        let alerts = self.rule_state.lock().unwrap().on_file_delete(event);
+        let alerts = self.rule_state.lock_recovering().on_file_delete(event);
         self.record_rule_alerts(wrapped, alerts);
     }
 
@@ -1733,7 +1725,7 @@ impl DetectionSink {
     /// is judged once its process's exec has had time to arrive, so the alerts returned here are
     /// those of earlier events, each attributed to its own.
     fn detect_identity_change(&self, event: &schema::IdentityChangeEvent) {
-        let due = self.rule_state.lock().unwrap().on_identity_change(event);
+        let due = self.rule_state.lock_recovering().on_identity_change(event);
         self.record_due_identity_alerts(due);
     }
 
@@ -1747,7 +1739,7 @@ impl DetectionSink {
     /// Security-unit stops whose wait is over (UNEXPLAINED-UNIT-STOP, #1085), each attributed to
     /// its own journal event.
     fn record_due_unit_stops(&self) {
-        let due = self.rule_state.lock().unwrap().take_due_unit_stops();
+        let due = self.rule_state.lock_recovering().take_due_unit_stops();
         for (event, alert) in due {
             self.record_rule_alerts(&Event::UnitStop(event), [alert]);
         }
@@ -1757,7 +1749,7 @@ impl DetectionSink {
     /// write-volume corroboration (issue #82).
     fn detect_file_rename(&self, wrapped: &Event, event: &schema::FileRenameEvent) {
         // Bound first: `record_rule_alerts` takes the lock again for the damage manifest.
-        let alerts = self.rule_state.lock().unwrap().on_file_rename(event);
+        let alerts = self.rule_state.lock_recovering().on_file_rename(event);
         self.record_rule_alerts(wrapped, alerts);
     }
 
@@ -1765,7 +1757,7 @@ impl DetectionSink {
     /// the ransomware write-volume corroboration signal (T1486, issue #82),
     /// consumed on the next `FileRename`.
     fn detect_file_write(&self, event: &schema::FileWriteEvent) {
-        self.rule_state.lock().unwrap().on_file_write(event);
+        self.rule_state.lock_recovering().on_file_write(event);
     }
 
     /// `MemfdCreate` events (Linux, issue #265): usually no alert on its own —
@@ -1776,7 +1768,7 @@ impl DetectionSink {
     /// buffers can deliver out of order even though the kernel always
     /// creates the memfd before executing it).
     fn detect_memfd_create(&self, event: &schema::MemfdCreateEvent) {
-        for alert in self.rule_state.lock().unwrap().on_memfd_create(event) {
+        for alert in self.rule_state.lock_recovering().on_memfd_create(event) {
             self.emit(alert.technique, &alert.message);
         }
     }
@@ -1794,7 +1786,7 @@ impl DetectionSink {
         self.record_rule_alerts(wrapped, rules::evaluate_ldap_search(event));
         self.record_rule_alerts(
             wrapped,
-            self.rule_state.lock().unwrap().on_ldap_search(event),
+            self.rule_state.lock_recovering().on_ldap_search(event),
         );
     }
 
@@ -1894,8 +1886,7 @@ impl DetectionSink {
         }
         let outcome = self
             .verdict
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .suppress(verdict::EntityKey::new(ppid, comm), technique);
         match outcome {
             verdict::SuppressOutcome::Added => {
@@ -1918,8 +1909,7 @@ impl DetectionSink {
     pub(crate) fn unsuppress_verdict(&self, ppid: u32, comm: &str, technique: &str) -> bool {
         let removed = self
             .verdict
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .unsuppress(&verdict::EntityKey::new(ppid, comm), technique);
         if removed {
             self.emit(
@@ -1934,8 +1924,7 @@ impl DetectionSink {
     /// agent status (issue #613).
     pub(crate) fn suppressions(&self) -> Vec<(u32, String, String)> {
         self.verdict
-            .lock()
-            .unwrap()
+            .lock_recovering()
             .suppressions()
             .into_iter()
             .map(|(entity, technique)| (entity.ppid, entity.comm, technique))
@@ -1945,7 +1934,7 @@ impl DetectionSink {
     /// Same posture as the rule directories for the snapshot: absent unloads (the evidence is
     /// withheld), broken keeps the previous one (its failure is logged by the loader).
     fn swap_common_set(&self, loaded: Load<ml::features::common_set::CommonSetSnapshot>) {
-        let mut slot = self.common_set.lock().unwrap();
+        let mut slot = self.common_set.lock_recovering();
         let old = match loaded {
             Load::Loaded(snapshot) => slot.replace(Arc::new(snapshot)),
             Load::Absent => slot.take(),
@@ -1966,7 +1955,7 @@ impl DetectionSink {
     /// #76), which is why it is not compiled otherwise.
     #[cfg(test)]
     fn common_set(&self) -> Option<Arc<ml::features::common_set::CommonSetSnapshot>> {
-        self.common_set.lock().unwrap().clone()
+        self.common_set.lock_recovering().clone()
     }
 
     /// The rarity evidence counters, for the health beacon (ADR-0020, #76).
@@ -2144,7 +2133,7 @@ fn note_image_rarity(
 ) {
     // A snapshot past its maximum age counts as absent: the evidence is withheld, so a server
     // that stopped publishing cannot keep a stale set in force (ADR-0033 decision 3).
-    let snapshot = common_set.lock().unwrap().clone().filter(|s| {
+    let snapshot = common_set.lock_recovering().clone().filter(|s| {
         !updater::snapshot::is_expired(s.header().built_at, now_secs, MAX_SNAPSHOT_AGE_SECS)
     });
     match rarity_evidence(
@@ -2158,8 +2147,7 @@ fn note_image_rarity(
         }
         Rarity::NotInCommonSet => {
             let applied = correlator
-                .lock()
-                .unwrap()
+                .lock_recovering()
                 .apply_rarity_evidence(exec.meta.pid, exec.meta.process_generation);
             let counter = if applied {
                 &stats.applied
@@ -2393,8 +2381,7 @@ fn fuse_yara_match(
     let entity = verdict::EntityKey::new(context.ppid, context.comm.clone())
         .with_parent_generation(context.parent_generation);
     verdict
-        .lock()
-        .unwrap()
+        .lock_recovering()
         .record(entity, &rule.technique, detection, context.timestamp_ns)
 }
 
@@ -2405,7 +2392,7 @@ fn quarantine_matched_payload(
     path: &std::path::Path,
     alert_log: &AlertLog,
 ) {
-    let guard = response.lock().unwrap();
+    let guard = response.lock_recovering();
     let Some(hooks) = guard.as_ref() else {
         return;
     };
@@ -2485,7 +2472,7 @@ impl EventSink for DetectionSink {
             Event::Exec(e) => self.detect_exec(&event, e),
             Event::FileOpen(e) => self.detect_file_open(&event, e),
             Event::UnitStop(e) => {
-                self.rule_state.lock().unwrap().on_unit_stop(e);
+                self.rule_state.lock_recovering().on_unit_stop(e);
                 self.record_due_unit_stops();
             }
             Event::Connect(e) => self.detect_connect(&event, e),
@@ -2502,7 +2489,7 @@ impl EventSink for DetectionSink {
             Event::FileRename(e) => self.detect_file_rename(&event, e),
             Event::FileSetTime(e) => {
                 // Bound first: `record_rule_alerts` takes the lock again.
-                let alerts = self.rule_state.lock().unwrap().on_file_set_time(e);
+                let alerts = self.rule_state.lock_recovering().on_file_set_time(e);
                 self.record_rule_alerts(&event, alerts);
             }
             Event::RawVolumeOpen(e) => {
@@ -2528,12 +2515,12 @@ impl EventSink for DetectionSink {
             }
             Event::ProcessAccess(e) => {
                 // Bound first: `record_rule_alerts` takes the lock again.
-                let alerts = self.rule_state.lock().unwrap().on_process_access(e);
+                let alerts = self.rule_state.lock_recovering().on_process_access(e);
                 self.record_rule_alerts(&event, alerts);
             }
             Event::RemoteThread(e) => {
                 // Bound first: `record_rule_alerts` takes the lock again.
-                let alerts = self.rule_state.lock().unwrap().on_remote_thread(e);
+                let alerts = self.rule_state.lock_recovering().on_remote_thread(e);
                 self.record_rule_alerts(&event, alerts);
             }
             // New telemetry categories reach the engines as they land; until a rule
@@ -2543,7 +2530,7 @@ impl EventSink for DetectionSink {
         // Enrichment + the high-volume raw-event write happen off this thread, and
         // with them the findings that wait for the image's signature (#441).
         let gated = match &event {
-            Event::Exec(e) => self.rule_state.lock().unwrap().on_exec_signature_gated(e),
+            Event::Exec(e) => self.rule_state.lock_recovering().on_exec_signature_gated(e),
             _ => None,
         };
         if let Some((event, gated)) = self.enrich_queue.enqueue(event, gated) {
@@ -2601,7 +2588,7 @@ impl EventSink for BaselineSink {
                 // from the baseline (they are exactly what the model must not learn
                 // as normal).
                 let det_alerts = rules::evaluate_exec(e);
-                let mut rule_state = self.rule_state.lock().unwrap();
+                let mut rule_state = self.rule_state.lock_recovering();
                 // Conservative: a gated finding excludes the cmdline whatever the
                 // signature would have said.
                 let gated = rule_state.on_exec_signature_gated(e);
@@ -2633,7 +2620,7 @@ impl EventSink for BaselineSink {
             // File events feed the stateful rules' history (download tracking) so
             // exclusion decisions stay accurate; connects are irrelevant here.
             Event::FileOpen(e) => {
-                self.rule_state.lock().unwrap().on_file_open(e);
+                self.rule_state.lock_recovering().on_file_open(e);
             }
             _ => {}
         }
