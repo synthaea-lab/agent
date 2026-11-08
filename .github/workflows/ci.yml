@@ -42,6 +42,8 @@ jobs:
           cargo +nightly fmt --all --check
       - name: dependency direction
         run: python3 tools/check-deps.py
+      - name: docs links, anchors and capability tracking issues
+        run: python3 tools/check-docs.py
       # tools/attack-coverage.py --check needs the `rules` sibling: it runs in the
       # `content` job, which checks it out.
       - name: PowerShell scripts ASCII-only
