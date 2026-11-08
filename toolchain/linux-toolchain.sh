@@ -75,9 +75,9 @@ source "$HOME/.cargo/env"
 # The probe toolchain is pinned in ebpf-toolchain.txt at the repo root (the one
 # source for build.rs, CI and these scripts); fall back to plain nightly only
 # when the tree isn't mounted, with a warning.
-_ebpf_tc=$(tr -d '[:space:]' 2>/dev/null < "${SYNTHAEA_SRC:-/synthaea}/ebpf-toolchain.txt" || true)
+_ebpf_tc=$(tr -d '[:space:]' 2>/dev/null < "${SYNTHAEA_SRC:-/synthaea/agent}/ebpf-toolchain.txt" || true)
 if [ -z "${_ebpf_tc:-}" ]; then
-  echo "[warn] ${SYNTHAEA_SRC:-/synthaea}/ebpf-toolchain.txt not found — installing plain nightly; build.rs will ask for the pinned one" >&2
+  echo "[warn] ${SYNTHAEA_SRC:-/synthaea/agent}/ebpf-toolchain.txt not found — installing plain nightly; build.rs will ask for the pinned one" >&2
   _ebpf_tc=nightly
 fi
 rustup toolchain install "$_ebpf_tc" --component rust-src
@@ -86,7 +86,7 @@ rustup toolchain install "$_ebpf_tc" --component rust-src
 # the first `cargo` inside the tree doesn't download a toolchain mid-build — a
 # transient DNS failure there fails a whole validation run (same class of gap as
 # the bpf-linker fetch above).
-_pinned=$(grep -oE 'channel *= *"[^"]+"' "${SYNTHAEA_SRC:-/synthaea}/rust-toolchain.toml" 2>/dev/null | cut -d'"' -f2)
+_pinned=$(grep -oE 'channel *= *"[^"]+"' "${SYNTHAEA_SRC:-/synthaea/agent}/rust-toolchain.toml" 2>/dev/null | cut -d'"' -f2)
 if [ -n "${_pinned:-}" ]; then
   echo "[info] rust-toolchain.toml pins $_pinned — installing it now"
   rustup toolchain install "$_pinned" --component rustfmt --component clippy
@@ -137,7 +137,7 @@ install_bpf_linker() {
 # already on PATH (cargo itself lives there) and only the linker binary appeared
 # — so cargo replays the stale "no embedded eBPF" build script output forever.
 bust_stale_sensor_linux_build() {
-  local src="${SYNTHAEA_SRC:-/synthaea}" d
+  local src="${SYNTHAEA_SRC:-/synthaea/agent}" d
   for d in "$src"/target/*/build "$src"/target/*/.fingerprint; do
     [ -d "$d" ] || continue
     find "$d" -maxdepth 1 -name 'sensor-linux-*' -exec rm -rf {} + 2>/dev/null || true
