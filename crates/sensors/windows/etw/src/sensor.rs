@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{Receiver, SyncSender},
     },
 };
@@ -330,9 +330,9 @@ pub(crate) struct SharedState {
     pub(crate) remote_threads: Mutex<budget::KeyDedup>,
     /// #720: remote threads, per creating process.
     pub(crate) remote_thread_budget: Mutex<budget::PidBudget>,
-    /// #720: LSASS's pid, 0 until found. Only ever a process whose image is
-    /// `cross_process::lsass_image(system_root)`.
-    pub(crate) lsass_pid: AtomicU32,
+    /// #720: LSASS's pid, 0 until found. Only ever a process
+    /// `cross_process::is_system_lsass` confirmed.
+    pub(crate) lsass: cross_process::LsassTracker,
     /// #720: opens of LSASS, one per (caller, mask, status) per minute.
     pub(crate) lsass_opens: Mutex<budget::KeyDedup>,
     /// `%SystemRoot%` (`C:\Windows`), where LSASS's image is looked for.
@@ -483,7 +483,7 @@ fn probe_silo(pid: u32, image: &str) -> Option<u32> {
 /// the very first `ConnectEvent`, and parent lineage/exclusions apply to them.
 fn seed_pid_store(state: &SharedState) {
     let mut pids = state.pids.lock().unwrap();
-    for (pid, name) in winapi::snapshot_processes() {
+    for winapi::ProcessEntry { pid, name, .. } in winapi::snapshot_processes() {
         pids.insert(
             pid,
             name,
@@ -494,25 +494,35 @@ fn seed_pid_store(state: &SharedState) {
     tracing::info!(processes = pids.len(), "pid store seeded");
 }
 
-/// #720: the pid of the system's LSASS among the seeded processes, found by name and
-/// confirmed by its full image path, so an `lsass.exe` started from elsewhere is not taken
-/// for it. 0 when none is found: opens of LSASS are then not reported until a
-/// `ProcessStart` of the real one (a reboot) sets it.
-fn find_lsass(state: &SharedState) -> u32 {
-    let candidates: Vec<u32> = winapi::snapshot_processes()
-        .into_iter()
-        .filter(|(_, name)| name.eq_ignore_ascii_case("lsass.exe"))
-        .map(|(pid, _)| pid)
-        .collect();
-    let found = candidates.into_iter().find(|&pid| {
-        winapi::resolve_pid_live(pid)
-            .is_some_and(|path| cross_process::is_lsass_image(&path, &state.system_root))
-    });
+/// #720: the pid of the system's LSASS among the running processes, found by name and
+/// confirmed by `cross_process::is_system_lsass` (its full image path, session 0, wininit
+/// as its parent), so neither an `lsass.exe` started from elsewhere nor a copy of the real
+/// file started by hand is taken for it. Called at start and when the tracked LSASS ends.
+/// 0 when none is found: opens of LSASS are then not reported until a `ProcessStart` of
+/// the real one (a reboot) sets it.
+pub(crate) fn find_lsass(state: &SharedState) -> u32 {
+    let processes = winapi::snapshot_processes();
+    let found = processes
+        .iter()
+        .filter(|entry| entry.name.eq_ignore_ascii_case("lsass.exe"))
+        .find(|entry| {
+            let Some(image_path) = winapi::resolve_pid_live(entry.pid) else {
+                return false;
+            };
+            let parent_image_path = winapi::resolve_pid_live(entry.parent_pid);
+            let claim = cross_process::LsassClaim {
+                image_path: &image_path,
+                session_id: winapi::process_session_id(entry.pid),
+                parent_image_path: parent_image_path.as_deref(),
+            };
+            cross_process::is_system_lsass(&claim, &state.system_root)
+        })
+        .map(|entry| entry.pid);
     match found {
         Some(pid) => tracing::info!(pid, "LSASS found: opens of it are watched"),
         None => tracing::warn!(
             system_root = %state.system_root,
-            "LSASS not found at its system path: opens of it are not reported"
+            "system LSASS not found: opens of it are not reported"
         ),
     }
     found.unwrap_or(0)
@@ -670,7 +680,7 @@ impl Sensor for WindowsSensor {
                 REMOTE_THREAD_PER_PID_LIMIT,
                 REMOTE_THREAD_PER_PID_WINDOW_NS,
             )),
-            lsass_pid: AtomicU32::new(0),
+            lsass: cross_process::LsassTracker::default(),
             lsass_opens: Mutex::new(budget::KeyDedup::new(
                 "lsass-open",
                 LSASS_OPEN_DEDUP_WINDOW_NS,
@@ -683,7 +693,7 @@ impl Sensor for WindowsSensor {
         });
 
         seed_pid_store(&state);
-        state.lsass_pid.store(find_lsass(&state), Ordering::Relaxed);
+        state.lsass.set(find_lsass(&state));
 
         let prefix = self.names.session_prefix.as_str();
         stop_all_orphaned_sessions(prefix);

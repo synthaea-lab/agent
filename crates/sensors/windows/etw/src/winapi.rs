@@ -9,7 +9,7 @@ use std::{
 
 use schema::User;
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
+    Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE},
     Security::{
         Authorization::ConvertSidToStringSidW, GetTokenInformation, TOKEN_MANDATORY_LABEL,
         TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenUser,
@@ -23,9 +23,10 @@ use windows_sys::Win32::{
                 TH32CS_SNAPPROCESS,
             },
         },
+        RemoteDesktop::ProcessIdToSessionId,
         Threading::{
-            OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-            PROCESS_VM_READ, QueryFullProcessImageNameW,
+            GetProcessTimes, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
+            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ, QueryFullProcessImageNameW,
         },
     },
 };
@@ -326,10 +327,20 @@ pub(crate) fn long_path_name(path: &str) -> Option<String> {
 
 // ── Process-table seeding + live lookup (carried over from the old sensor) ───
 
-/// Fills the pid→image table with every process running at call time (before the
-/// trace starts), so network events from already-running processes resolve — and
-/// the rules' parent-side exclusions apply to pre-existing parents.
-pub(crate) fn snapshot_processes() -> Vec<(u32, String)> {
+/// One process of a toolhelp snapshot.
+pub(crate) struct ProcessEntry {
+    pub(crate) pid: u32,
+    /// The pid of the process that created it (it may have exited since, and its pid
+    /// been reused).
+    pub(crate) parent_pid: u32,
+    /// The image's file name, no directory.
+    pub(crate) name: String,
+}
+
+/// Every process running at call time (before the trace starts): fills the pid→image
+/// table, so network events from already-running processes resolve — and the rules'
+/// parent-side exclusions apply to pre-existing parents — and finds LSASS (#720).
+pub(crate) fn snapshot_processes() -> Vec<ProcessEntry> {
     let mut out = Vec::new();
     // SAFETY: the snapshot handle is checked against INVALID_HANDLE_VALUE and
     // closed; PROCESSENTRY32W is zeroed with dwSize set before the first call,
@@ -349,10 +360,11 @@ pub(crate) fn snapshot_processes() -> Vec<(u32, String)> {
                     .iter()
                     .position(|&c| c == 0)
                     .unwrap_or(entry.szExeFile.len());
-                out.push((
-                    entry.th32ProcessID,
-                    String::from_utf16_lossy(&entry.szExeFile[..end]),
-                ));
+                out.push(ProcessEntry {
+                    pid: entry.th32ProcessID,
+                    parent_pid: entry.th32ParentProcessID,
+                    name: String::from_utf16_lossy(&entry.szExeFile[..end]),
+                });
                 if Process32NextW(snap, &mut entry) == 0 {
                     break;
                 }
@@ -412,6 +424,42 @@ pub(crate) fn resolve_pid_live(pid: u32) -> Option<String> {
         }
         let path = String::from_utf16_lossy(&buf[..len as usize]);
         Some(path)
+    }
+}
+
+/// The session the process runs in (#720: the system LSASS runs in session 0). `None`
+/// when it cannot be queried (exited, or access refused).
+pub(crate) fn process_session_id(pid: u32) -> Option<u32> {
+    let mut session = 0u32;
+    // SAFETY: ProcessIdToSessionId writes one u32 through a valid pointer to a local.
+    let ok = unsafe { ProcessIdToSessionId(pid, &mut session) };
+    (ok != 0).then_some(session)
+}
+
+/// When the process was created, in Unix nanoseconds (#720: whether the owner of a thread
+/// existed before the thread could be its initial one). `None` when it cannot be opened.
+/// `PROCESS_QUERY_LIMITED_INFORMATION` is enough, protected processes included.
+pub(crate) fn process_create_time_ns(pid: u32) -> Option<u64> {
+    // SAFETY: the handle is null-checked and closed on every path; GetProcessTimes
+    // writes four FILETIMEs through valid pointers to locals.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        let ok = GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user);
+        CloseHandle(process);
+        if ok == 0 {
+            return None;
+        }
+        let raw = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+        let raw = i64::try_from(raw).ok()?;
+        Some(crate::normalize::filetime_to_ns(raw))
     }
 }
 
