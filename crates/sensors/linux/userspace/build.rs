@@ -4,7 +4,7 @@
 //! - non-Linux target: skipped (the crate compiles to a stub there anyway);
 //! - Linux without `bpf-linker` on PATH (plain CI runners): skipped with a warning —
 //!   the crate then compiles WITHOUT embedded probes and `load_ebpf()` returns an
-//!   error at runtime. `lab/provisioning/linux-toolchain.sh` installs the full
+//!   error at runtime. `toolchain/linux-toolchain.sh` installs the full
 //!   toolchain (the nightly pinned in `ebpf-toolchain.txt` + bpf-linker with the
 //!   LLVM-major alignment), so lab VMs and
 //!   release builds embed the probes automatically.
@@ -26,7 +26,7 @@ fn main() -> anyhow::Result<()> {
     if which::which("bpf-linker").is_err() {
         println!(
             "cargo:warning=bpf-linker not found — building sensor-linux WITHOUT embedded \
-             eBPF probes (load_ebpf() will error at runtime); see lab/provisioning/"
+             eBPF probes (load_ebpf() will error at runtime); see toolchain/"
         );
         return Ok(());
     }
