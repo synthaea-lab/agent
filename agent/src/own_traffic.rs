@@ -9,14 +9,16 @@
 //!   name is its host, or the connected address is one that host resolved to;
 //! - the process is the agent: this process, or a *sibling* (a second process on the agent's
 //!   own executable, `agent apply-content-manifest`) whose `Exec` the agent saw, of the same
-//!   incarnation (`process_generation`) as the event, run by the agent's own uid.
+//!   incarnation (`process_generation`) as the event, run by the agent's own uid, outside any
+//!   container, and that has not exec'd another image since.
 //!
 //! The destination half is what keeps the skip from being a channel: the agent's binary pointed
 //! at any other host (`apply-content-manifest --server https://<listed host>`, code running
 //! inside the agent) still raises. Everything that cannot be established fails toward raising:
 //! no control plane configured, its host not resolved yet or resolved to other addresses than
 //! the ones connected to, a sibling the agent did not see start, a sensor without incarnation
-//! stamps (macOS), a platform without a uid (Windows: only this process is the agent).
+//! stamps (macOS), a platform without a uid (Windows: only this process is the agent), a
+//! containerized process (its image path names a file in another mount namespace).
 
 use std::{
     net::{IpAddr, ToSocketAddrs as _},
@@ -165,29 +167,41 @@ impl OwnTraffic {
     }
 
     /// Remembers an `Exec` of the agent's own executable, so that process's traffic can be
-    /// told apart from a later holder of the same pid.
+    /// told apart from a later holder of the same pid. Any other exec at a remembered pid
+    /// forgets it: `process_generation` is stamped at fork and survives an exec, so the image
+    /// that pid now runs is no longer the agent's even though its incarnation stamp is.
     pub(crate) fn record_exec(&self, exec: &schema::ExecEvent) {
+        let sibling = self.sibling_of(exec);
+        let mut siblings = self.siblings.lock().unwrap_or_else(PoisonError::into_inner);
+        match sibling {
+            Some(sibling) => siblings.insert(exec.meta.pid, sibling),
+            None => {
+                siblings.remove(&exec.meta.pid);
+            }
+        }
+    }
+
+    /// The sibling `exec` starts, if its image is the agent's own executable on the agent's own
+    /// filesystem.
+    fn sibling_of(&self, exec: &schema::ExecEvent) -> Option<Sibling> {
         let (Some(own), Some(generation)) = (&self.own_exe, exec.meta.process_generation) else {
-            return;
+            return None;
         };
+        // `image_path` is a path in the process's mount namespace, and it is canonicalized
+        // here in the agent's: a container's own file at the agent's path would resolve to the
+        // agent's binary. A containerized exec is never a sibling.
+        if exec.meta.container.is_some() {
+            return None;
+        }
         // The cheap test first: only an exec whose file name is the agent's is canonicalized.
         let image = std::path::Path::new(&exec.image_path);
         if image.file_name() != own.file_name() {
-            return;
+            return None;
         }
-        if std::fs::canonicalize(image).ok().as_ref() != Some(own) {
-            return;
-        }
-        self.siblings
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(
-                exec.meta.pid,
-                Sibling {
-                    generation,
-                    exec_ns: exec.meta.timestamp_ns,
-                },
-            );
+        (std::fs::canonicalize(image).ok().as_ref() == Some(own)).then_some(Sibling {
+            generation,
+            exec_ns: exec.meta.timestamp_ns,
+        })
     }
 
     /// Whether the process that made `meta` is the agent, judged from what was captured with the
@@ -204,6 +218,7 @@ impl OwnTraffic {
             .get(&meta.pid)?;
         (sibling.generation == generation
             && sibling.exec_ns <= meta.timestamp_ns
+            && meta.container.is_none()
             && runs_as_the_agent(&meta.user))
         .then_some(AgentOrigin::Sibling)
     }
@@ -403,6 +418,41 @@ mod tests {
             None,
             "another user running the agent's binary is not the agent"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sibling_that_execs_another_binary_is_no_longer_the_agent() {
+        let own = OwnTraffic::new();
+        let exe = std::env::current_exe().unwrap();
+        own.record_exec(&exec_of(exe.to_str().unwrap(), 4646, Some(3), 1_000));
+        assert_eq!(
+            own.origin(&meta_of(4646, Some(3), 1_500, own_user())),
+            Some(AgentOrigin::Sibling)
+        );
+        // Same pid, same fork-time stamp: only the image changed.
+        own.record_exec(&exec_of("/usr/bin/curl", 4646, Some(3), 2_000));
+        assert_eq!(
+            own.origin(&meta_of(4646, Some(3), 3_000, own_user())),
+            None,
+            "the image that pid runs now is not the agent's"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exec_of_the_agents_path_inside_a_container_is_not_the_agent() {
+        let own = OwnTraffic::new();
+        let exe = std::env::current_exe().unwrap();
+        let mut exec = exec_of(exe.to_str().unwrap(), 4747, Some(5), 1_000);
+        exec.meta.container = Some(schema::ContainerContext {
+            id: "c0ffee".into(),
+            image: None,
+            name: None,
+        });
+        own.record_exec(&exec);
+        assert!(own.siblings.lock().unwrap().is_empty());
+        assert_eq!(own.origin(&meta_of(4747, Some(5), 2_000, own_user())), None);
     }
 
     #[test]
