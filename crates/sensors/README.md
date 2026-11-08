@@ -9,7 +9,7 @@ dependencies are allowed; each sensor compiles to an empty stub on foreign targe
 | Path | Package | Mechanism | Notes |
 | --- | --- | --- | --- |
 | `linux/userspace` | `sensor-linux` | eBPF userspace loader | pairs with `linux/ebpf` |
-| `linux/ebpf` | `sensor-linux-ebpf` | eBPF kernel probes | GPLv2, excluded from workspace, eBPF toolchain |
+| `linux/ebpf` | `sensor-linux-ebpf` | eBPF kernel probes | GPL-2.0-only OR MIT ("Dual MIT/GPL"), not a default member, eBPF toolchain |
 | `linux/audit` | `sensor-linux-audit` | auditd + fanotify | fallback where eBPF is unavailable |
 | `linux/uprobes` | `sensor-linux-uprobes` | eBPF uprobes | TLS plaintext taps, shell readline |
 | `linux/lsm` | `sensor-linux-lsm` | BPF-LSM hooks | io_uring-proof observation + inline blocking |

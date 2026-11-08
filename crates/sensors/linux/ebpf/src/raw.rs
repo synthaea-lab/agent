@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! Raw tracepoint entrypoints for kernels where perf-event tracepoints are
 //! blocked by `perf_event_paranoid`. The syscall router reconstructs the
 //! regular syscall tracepoint record expected by the existing event handlers.
