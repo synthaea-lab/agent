@@ -33,6 +33,17 @@ on:
       - "rust-toolchain.toml"
       - ".github/workflows/windows-static-agent.yml"
   workflow_dispatch:
+  workflow_call:
+    # The release workflow (release.yml) runs this exact job and collects its package.
+    inputs:
+      ref:
+        description: "Git ref to build (empty: the caller's ref)"
+        type: string
+        default: ""
+      upload-artifact:
+        description: "Upload the built package as a workflow artifact for release.yml"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -53,6 +64,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref }}
 
       # Only the .lib files are cached (about 1.1 GB, against 3.4 GB for the whole build
       # directory): the link needs nothing else. They are copied out of the build tree
@@ -125,3 +137,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "agent.exe --help exited $LASTEXITCODE" }
           $size = (Get-Item target/release/agent.exe).Length / 1MB
           "agent.exe (static onnxruntime): {0:N1} MB" -f $size >> $env:GITHUB_STEP_SUMMARY
+
+      # Only when release.yml calls this workflow: the statically linked agent.exe checked
+      # above. A bare executable, not the MSI: packaging/windows/build.ps1 needs WiX and a
+      # watchdog build, and no CI job runs it yet.
+      - name: Upload agent.exe for the release
+        if: inputs.upload-artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-windows-agent
+          path: target/release/agent.exe
+          if-no-files-found: error
+          retention-days: 7
