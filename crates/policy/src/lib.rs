@@ -200,6 +200,49 @@ pub fn service_main_path_is_trusted(path: &str) -> bool {
     !(EXACT.contains(&name) || is_family_interpreter)
 }
 
+/// Whether an exec of `image_path` under a parent running `parent_image_path` is the
+/// process that holds one interactive login session: the per-connection process the
+/// `sshd` listener execs for each SSH login (#1142). Killing it cuts the operator's
+/// session; what an attacker runs lives in its children, which stay killable. Two
+/// shapes, depending on the OpenSSH version:
+/// - 9.8 and later: `sshd-session` exec'd by `sshd` (Alpine, where #1142 was seen).
+/// - before 9.8 (Debian 12, Ubuntu 22.04/24.04, Rocky 9): there is no
+///   `sshd-session`; the listener re-execs its own binary (`sshd -R`), so the
+///   pair is `sshd` exec'd by `sshd` (2026-11-08 lab run, OpenSSH 9.2: BAYES
+///   named the operator's own `comm=sshd` session).
+///
+/// The listener itself is never one: its parent is init, not `sshd`, so it stays a
+/// service main (`ppid == 1`), and so does its own re-exec on `SIGHUP`.
+///
+/// Name-keyed on both sides, so both images must pass [`service_main_path_is_trusted`]:
+/// a `/tmp/sshd-session`, a parent `sshd` living in `/tmp`, or the real binary
+/// exec'd from a shell, is not one. The parent is identified by its image, not by
+/// having been seen started by init: the listener usually starts at boot, before
+/// the agent, so its exec is never seen, while the sensor still resolves its image
+/// (from `/proc` for a process that predates it). A user running their own copy of
+/// the real `sshd` gets its per-connection processes shielded too; those run no
+/// code the user chose, and everything under them stays killable.
+///
+/// `login` is not listed: getty execs it in place, so it is a service main itself
+/// (`ppid == 1`) where its image passes the path check.
+#[must_use]
+pub fn is_login_session(image_path: &str, parent_image_path: Option<&str>) -> bool {
+    /// (session image, the image that execs it).
+    const LOGIN_SESSIONS: &[(&str, &str)] = &[("sshd-session", "sshd"), ("sshd", "sshd")];
+    fn name(path: &str) -> &str {
+        path.rsplit(['/', '\\']).next().unwrap_or(path)
+    }
+    let Some(parent_image_path) = parent_image_path else {
+        return false;
+    };
+    let (image, parent) = (name(image_path), name(parent_image_path));
+    LOGIN_SESSIONS
+        .iter()
+        .any(|&(i, p)| image == i && parent == p)
+        && service_main_path_is_trusted(image_path)
+        && service_main_path_is_trusted(parent_image_path)
+}
+
 /// The port of the address-selection probe `sshd-session`/`sshd-auth` run on every
 /// login: a `connect()` to the unspecified address (`0.0.0.0`, `::`) on this port
 /// reaches no remote peer (#525).
@@ -378,6 +421,65 @@ mod eventlog_policy_tests {
         assert!(policy.scheduled_tasks_enabled);
         assert!(policy.account_creations_enabled);
         assert!(policy.logon_events_enabled);
+    }
+}
+
+#[cfg(test)]
+mod login_session_tests {
+    use super::is_login_session;
+
+    const SSHD: Option<&str> = Some("/usr/sbin/sshd");
+
+    #[test]
+    fn an_sshd_session_execd_by_sshd_holds_a_login() {
+        assert!(is_login_session("/usr/lib/ssh/sshd-session", SSHD));
+    }
+
+    #[test]
+    fn an_sshd_reexecd_by_the_sshd_listener_holds_a_login_before_openssh_9_8() {
+        // OpenSSH 9.2 (Debian 12), 2026-11-08 lab run: no `sshd-session`, the
+        // listener re-execs `/usr/sbin/sshd -R` per connection.
+        assert!(is_login_session("/usr/sbin/sshd", SSHD));
+    }
+
+    #[test]
+    fn the_sshd_listener_started_by_init_is_not_a_login_session() {
+        for init in ["/usr/lib/systemd/systemd", "/sbin/init"] {
+            assert!(!is_login_session("/usr/sbin/sshd", Some(init)), "{init}");
+        }
+    }
+
+    #[test]
+    fn sshd_started_from_a_users_shell_is_not_a_login_session() {
+        assert!(!is_login_session("/usr/sbin/sshd", Some("/bin/bash")));
+        assert!(!is_login_session(
+            "/usr/lib/ssh/sshd-session",
+            Some("/bin/sh")
+        ));
+    }
+
+    #[test]
+    fn a_login_session_pair_outside_a_system_path_does_not_qualify() {
+        // A parent named sshd living in /tmp.
+        assert!(!is_login_session("/usr/sbin/sshd", Some("/tmp/sshd")));
+        assert!(!is_login_session(
+            "/usr/lib/ssh/sshd-session",
+            Some("/tmp/sshd")
+        ));
+        // The image itself outside a system path, under the real listener.
+        assert!(!is_login_session("/tmp/sshd", SSHD));
+        assert!(!is_login_session("/usr/local/sbin/sshd", SSHD));
+        assert!(!is_login_session("/usr/../tmp/sshd", SSHD));
+    }
+
+    #[test]
+    fn an_unresolved_parent_is_not_a_login_session() {
+        assert!(!is_login_session("/usr/sbin/sshd", None));
+    }
+
+    #[test]
+    fn a_shell_under_sshd_is_not_a_login_session() {
+        assert!(!is_login_session("/bin/bash", SSHD));
     }
 }
 
