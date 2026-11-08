@@ -2,7 +2,7 @@ Synthaea
 Copyright 2026 The Synthaea Authors
 
 This product includes software developed by The Synthaea Authors and
-contributors to the Synthaea project.
+contributors to the Synthaea project (https://github.com/synthaea-lab).
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may not
 use this file except in compliance with the License. You may obtain a copy of
@@ -10,40 +10,44 @@ the License in the accompanying LICENSE file or at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+
 --------------------------------------------------------------------------------
 LICENSING EXCEPTION: LINUX eBPF PROBES
 --------------------------------------------------------------------------------
 
-Components under the Linux eBPF probe directories are licensed under the
-GNU General Public License, version 2 ("GPL-2.0"), and not under Apache-2.0.
+The Linux eBPF probes in crates/sensors/linux/ebpf/ are dual-licensed under
+the GNU General Public License, version 2 only, OR the MIT License, at your
+option (SPDX: GPL-2.0-only OR MIT). Their in-kernel license string is
+"Dual MIT/GPL".
 
-This is a technical constraint, not a policy preference. The Linux kernel BPF
-verifier restricts the majority of BPF helper functions -- including those this
-project fundamentally requires -- to programs that declare a GPL-compatible
-license in their `license` ELF section. A non-GPL eBPF probe would be rejected
-at load time.
+This is a technical constraint, not a policy preference: the Linux kernel BPF
+verifier restricts most BPF helper functions, including those these probes
+require, to programs that declare a GPL-compatible license. The exception
+covers only the programs that run inside the kernel. The userspace loader, the
+event normalizer and every other component of the agent are Apache-2.0.
 
-The exception is scoped as narrowly as possible: it covers only the eBPF
-programs that execute inside the kernel. The userspace loader, the event
-normalizer, and every other component of the agent remain Apache-2.0.
+Each source file under crates/sensors/linux/ebpf/ carries an
+SPDX-License-Identifier line, which is authoritative for that file.
+--------------------------------------------------------------------------------
+CONTRIBUTIONS
+--------------------------------------------------------------------------------
 
-Each affected source file carries its own SPDX identifier. The SPDX identifier
-in a file is authoritative for that file.
+Contributions are accepted under the same license as the project ("inbound =
+outbound", Apache License 2.0, section 5). There is no Contributor License
+Agreement: each contributor keeps the copyright in their contribution.
+"The Synthaea Authors" is the collective designation of the project's
+contributors; the authorship of each change is recorded in the git history.
+Because there is no CLA, relicensing any part of the project requires the
+agreement of every contributor to that part.
 
 --------------------------------------------------------------------------------
 THIRD-PARTY SOFTWARE
 --------------------------------------------------------------------------------
 
-This project is currently in the design phase and vendors no third-party
-source. When dependencies are introduced, their licenses and attributions will
-be enumerated here and in a generated dependency manifest.
-
---------------------------------------------------------------------------------
-COPYRIGHT HOLDER
---------------------------------------------------------------------------------
-
-"The Synthaea Authors" is used as the collective copyright designation. If the
-project is to be held by a single legal entity, replace this designation
-consistently across LICENSE, NOTICE, and all source headers BEFORE accepting
-external contributions -- changing it afterwards requires the agreement of
-every contributor, as there is no CLA. See docs/adr/0003-apache-license-no-cla.md.
+This repository vendors no third-party source code. Dependencies are fetched
+by the build tooling and remain under their own licenses; the set of licenses
+allowed for Rust crates is enforced in CI by cargo-deny (deny.toml). Release
+artifacts are to ship a generated third-party license report.
