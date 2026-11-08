@@ -79,6 +79,8 @@ mod providers;
 mod sensor;
 #[cfg(any(windows, test))]
 mod silo;
+#[cfg(any(windows, test))]
+mod sync;
 #[cfg(windows)]
 mod winapi;
 pub mod zone_identifier;

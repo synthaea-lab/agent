@@ -24,7 +24,9 @@ use crate::{
     cross_process::{self, ThreadOrigin},
     normalize,
     sensor::{SharedState, basename, find_lsass},
-    silo, winapi, zone_identifier,
+    silo,
+    sync::LockExt,
+    winapi, zone_identifier,
 };
 
 const KERNEL_PROCESS_GUID: &str = "22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716";
@@ -143,8 +145,8 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
 
         if eid == 2 {
             if pid != 0 {
-                state.pids.lock().unwrap().remove(pid);
-                state.threads.lock().unwrap().process_ended(pid);
+                state.pids.lock_or_recover().remove(pid);
+                state.threads.lock_or_recover().process_ended(pid);
                 // LSASS does not end short of a crash (and reboot): look it up again
                 // rather than leave the slot empty. A copy's end changes nothing.
                 state.lsass.process_ended(pid, || find_lsass(&state));
@@ -156,7 +158,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             // https://github.com/synthaea-lab/agent/issues/39: a server silo is created or torn down, so whichever
             // container its id named is stale.
             if let Ok(silo) = parser.try_parse::<u32>("Job ID") {
-                state.silos.lock().unwrap().forget(silo);
+                state.silos.lock_or_recover().forget(silo);
             }
             return;
         }
@@ -166,7 +168,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             // Only emit for tracked PIDs — the store is seeded at startup and
             // populated by EID 1, so a missing PID is a kernel/driver load that
             // we intentionally ignore at userland tier.
-            let Some(comm) = state.pids.lock().unwrap().get(pid).map(basename) else {
+            let Some(comm) = state.pids.lock_or_recover().get(pid).map(basename) else {
                 return;
             };
             let raw_image: String = parser
@@ -196,8 +198,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         // https://github.com/synthaea-lab/agent/issues/41: the initial thread of this process is not an injection.
         state
             .threads
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .process_started(pid, timestamp_ns);
         if cross_process::is_lsass_image(&image_path, &state.system_root) {
             take_lsass_slot(&parser, pid, ppid, &image_path, &state);
@@ -209,11 +210,11 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         let parent_generation = sequence_number(&parser, "ParentProcessSequenceNumber");
 
         // https://github.com/synthaea-lab/agent/issues/39: read while the process most likely still runs; one already
-        // gone is in its parent's silo.
-        let parent_silo = state.pids.lock().unwrap().silo(ppid);
-        let silo = silo::exec_silo(winapi::read_server_silo_id(pid), parent_silo);
-        {
-            let mut pids = state.pids.lock().unwrap();
+        // gone is in its parent's silo. Read before taking the lock: it is a system call.
+        let own_silo = winapi::read_server_silo_id(pid);
+        let parent_image_path = {
+            let mut pids = state.pids.lock_or_recover();
+            let silo = silo::exec_silo(own_silo, pids.silo(ppid));
             // Never cache "<unknown>" as the image: a hit on it would suppress
             // live lookups. The silo is kept either way, or the process's
             // events would read as the host's.
@@ -222,10 +223,10 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             } else {
                 pids.insert(pid, image_path.clone(), generation, silo);
             }
-        }
-        // Lineage at exec time (schema parent fields): the parent is usually alive
-        // and already in the store.
-        let parent_image_path = state.pids.lock().unwrap().get(ppid).map(str::to_owned);
+            // Lineage at exec time (schema parent fields): the parent is usually alive
+            // and already in the store.
+            pids.get(ppid).map(str::to_owned)
+        };
         let parent_comm = parent_image_path.as_deref().map(basename);
 
         // F-1: the REAL command line from the target's PEB, unbounded (F-4);
@@ -329,10 +330,9 @@ fn forward_remote_thread(
     let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
     let origin = state
         .threads
-        .lock()
-        .unwrap()
+        .lock_or_recover()
         .classify(creator, owner, timestamp_ns, || {
-            state.pids.lock().unwrap().contains(owner)
+            state.pids.lock_or_recover().contains(owner)
                 || winapi::process_create_time_ns(owner).is_some_and(|created| {
                     cross_process::created_before_window(created, timestamp_ns)
                 })
@@ -350,8 +350,8 @@ fn forward_remote_thread(
     let key = cross_process::remote_thread_key(creator, owner, start_address);
     // Lock order: dedup, then budget; neither is taken elsewhere with the other.
     let admitted = cross_process::admit_remote_thread(
-        &mut state.remote_threads.lock().unwrap(),
-        &mut state.remote_thread_budget.lock().unwrap(),
+        &mut state.remote_threads.lock_or_recover(),
+        &mut state.remote_thread_budget.lock_or_recover(),
         &key,
         creator,
         state.lsass.is(owner),
@@ -360,7 +360,7 @@ fn forward_remote_thread(
     if !admitted {
         return;
     }
-    let target_image_path = state.pids.lock().unwrap().get(owner).map(str::to_owned);
+    let target_image_path = state.pids.lock_or_recover().get(owner).map(str::to_owned);
     let comm = state.comm_for(creator).unwrap_or_default();
     sink.on_event(Event::RemoteThread(RemoteThreadEvent {
         meta: state.meta(creator, 0, comm, timestamp_ns),
@@ -377,7 +377,7 @@ fn forward_remote_thread(
 /// file names (toolhelp), and a bare name is exactly what a renamed dumper controls, so it
 /// is never returned as a path.
 fn full_image_path(pid: u32, state: &SharedState) -> Option<String> {
-    let cached = state.pids.lock().unwrap().get(pid).map(str::to_owned);
+    let cached = state.pids.lock_or_recover().get(pid).map(str::to_owned);
     cached
         .filter(|path| path.contains('\\'))
         .or_else(|| winapi::resolve_pid_live(pid).map(|path| state.normalize_path(&path)))
@@ -420,7 +420,11 @@ pub(crate) fn audit_api_provider(sink: Arc<dyn EventSink>, state: Arc<SharedStat
         let status: u32 = parser.try_parse("ReturnCode").unwrap_or(0);
         let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
         let key = format!("{caller}:{desired_access:x}:{status:x}");
-        if !state.lsass_opens.lock().unwrap().first(&key, timestamp_ns) {
+        if !state
+            .lsass_opens
+            .lock_or_recover()
+            .first(&key, timestamp_ns)
+        {
             return;
         }
         let comm = state.comm_for(caller).unwrap_or_default();
@@ -511,8 +515,7 @@ pub(crate) fn network_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         // parallel connections stay distinct and chatty flows never re-emit.
         if state
             .dedup
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .is_duplicate(pid, sport, daddr, dport, timestamp_ns)
         {
             return;
@@ -552,7 +555,7 @@ pub(crate) fn file_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
 
         // Tracked PIDs only: discards pure kernel ops and untracked churn (the
         // volume filter the old sensor validated in the lab).
-        let Some(comm) = state.pids.lock().unwrap().get(pid).map(basename) else {
+        let Some(comm) = state.pids.lock_or_recover().get(pid).map(basename) else {
             return;
         };
         if eid == 26 {
@@ -867,8 +870,7 @@ pub(crate) fn amsi_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
         // costs one map probe on the consumer thread (#408).
         if let Err(refusal) = state
             .amsi
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .admit(pid, &content_hash, timestamp_ns)
         {
             tracing::trace!(pid, ?refusal, "AMSI scan not reported");
@@ -932,7 +934,7 @@ pub(crate) fn ldap_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
             .try_parse::<u32>("ProcessId")
             .unwrap_or_else(|_| record.process_id());
         let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
-        if !state.ldap.lock().unwrap().spend(pid, timestamp_ns) {
+        if !state.ldap.lock_or_recover().spend(pid, timestamp_ns) {
             return;
         }
         let attributes: String = parser.try_parse("AttributeList").unwrap_or_default();
@@ -1012,7 +1014,7 @@ pub(crate) fn ntlm_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
             &ntlm_version,
             status.as_deref(),
         );
-        if !state.ntlm.lock().unwrap().first(&key, timestamp_ns) {
+        if !state.ntlm.lock_or_recover().first(&key, timestamp_ns) {
             return;
         }
         // Only `NTLMv2` was ever observed; the weak-version rule matches the other
@@ -1250,13 +1252,12 @@ pub(crate) fn bits_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
                 .collect(),
             4 => state
                 .bits
-                .lock()
-                .unwrap()
+                .lock_or_recover()
                 .completed(&job_id, timestamp_ns, bytes_transferred),
             5 => match client_meta(&parser, &state, timestamp_ns) {
-                Some(canceller) => state.bits.lock().unwrap().cancelled(&job_id, &canceller),
+                Some(canceller) => state.bits.lock_or_recover().cancelled(&job_id, &canceller),
                 None => {
-                    state.bits.lock().unwrap().record_missing_client();
+                    state.bits.lock_or_recover().record_missing_client();
                     Vec::new()
                 }
             },
@@ -1265,8 +1266,7 @@ pub(crate) fn bits_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
                 let url: Option<String> = parser.try_parse("url").ok();
                 state
                     .bits
-                    .lock()
-                    .unwrap()
+                    .lock_or_recover()
                     .transfer_error(
                         &job_id,
                         url.as_deref(),
@@ -1298,7 +1298,7 @@ fn bits_file_added(
     timestamp_ns: u64,
 ) -> Option<schema::BitsJobEvent> {
     let Some(client) = client_meta(parser, state, timestamp_ns) else {
-        let mut jobs = state.bits.lock().unwrap();
+        let mut jobs = state.bits.lock_or_recover();
         jobs.record_missing_client();
         tracing::debug!(
             missing_client = jobs.missing_client(),
@@ -1310,7 +1310,7 @@ fn bits_file_added(
     let url: String = parser.try_parse("RemoteName").unwrap_or_default();
     let local_name: String = parser.try_parse("LocalName").unwrap_or_default();
     let local_path = state.normalize_path(&crate::bits::local_path_for_join(&local_name));
-    let mut jobs = state.bits.lock().unwrap();
+    let mut jobs = state.bits.lock_or_recover();
     let (filtered, evicted) = (jobs.filtered(), jobs.evicted());
     let event = jobs.file_added(client, job_id, job_title, url, local_path);
     if jobs.filtered() > filtered {
