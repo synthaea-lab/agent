@@ -90,8 +90,7 @@ technique wins, and our documented defense is kernel-level protection plus serve
 because agent silence is itself a detection.
 
 This matters for triage: *"I was already SYSTEM with a loaded malicious driver and I killed the
-agent"* is a known and documented limitation
-([docs/architecture/threat-model.md](docs/architecture/threat-model.md)), not a vulnerability.
+agent"* is a known and documented limitation of the threat model, not a vulnerability.
 
 *"I disabled the agent from a normal user account,"* or *"I derived a reliable kill primitive
 against one tenant's variant and it worked against another tenant's,"* **is** a vulnerability, and

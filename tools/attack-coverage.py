@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generates docs/detection/attack-coverage.md from ATT&CK technique identifiers
-tagged in source — issue #74. Static scan, stdlib only, same posture as
+"""Generates docs/attack-coverage.md from ATT&CK technique identifiers
+tagged in source. Static scan, stdlib only, same posture as
 tools/check-deps.py: no third-party deps, shells out to nothing, exits non-zero
 naming the problem on any error.
 
@@ -15,8 +15,9 @@ What it scans:
 Every discovered id is validated against T\\d{4}(\\.\\d{3})? — a malformed match
 is a hard error naming the file, not a silently-dropped row.
 
-Layer per technique is a static table below the `SOURCES` list, taken from
-docs/detection/layers.md's "What implements it" column.
+Layer per technique is fixed per source in the `SOURCES` list (the detection
+stack's numbering: 1 signatures/hashes, 3 behavioral rules, 6 attack-chain
+correlation).
 
 Tactic per technique is the one piece this script cannot derive from our own
 source — ATT&CK tactic membership is external MITRE taxonomy. TECHNIQUE_TACTIC
@@ -28,16 +29,17 @@ stale table is visible in the output.
 The generated file only proves positive coverage (what IS tagged) — it does
 not attempt the roadmap-style gap analysis (what's planned, what's out of
 scope and why) the hand-written predecessor doc carried; that lives in the
-coverage-pack issues (#376-#381) instead.
+issue tracker instead.
 
-The scan spans repos: `crates/` is this one, while `rules/` and `docs/` are the
-umbrella checkout's sibling directories, found under $SYNTHAEA_ROOT when set and
-the parent of this repo otherwise (the same lookup as `crates/siblings`). A
-missing sibling is a hard error, never a partial matrix. Paths in the output stay
-relative to their own repo (`crates/...`, `rules/...`).
+The scan spans repos: `crates/` is this one, while `rules/` is a sibling
+checkout of synthaea-lab/rules next to this repo, found under $SYNTHAEA_ROOT
+when set and the parent of this repo otherwise (the same lookup as
+`crates/siblings`). A missing sibling is a hard error, never a partial matrix.
+Paths in the output stay relative to their own repo (`crates/...`, `rules/...`).
+The output, docs/attack-coverage.md, lives in this repo.
 
 Usage:
-    python3 tools/attack-coverage.py          # regenerate docs/detection/attack-coverage.md
+    python3 tools/attack-coverage.py          # regenerate docs/attack-coverage.md
     python3 tools/attack-coverage.py --check  # verify it's up to date; exit 1 if stale (CI)
 """
 
@@ -48,9 +50,9 @@ import re
 import sys
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-# The umbrella directory holding this repo's siblings (`rules/`, `docs/`).
-UMBRELLA_ROOT = pathlib.Path(os.environ.get("SYNTHAEA_ROOT") or REPO_ROOT.parent).resolve()
-OUTPUT = UMBRELLA_ROOT / "docs/detection/attack-coverage.md"
+# The directory holding this repo's sibling checkouts (`rules/`).
+SIBLINGS_ROOT = pathlib.Path(os.environ.get("SYNTHAEA_ROOT") or REPO_ROOT.parent).resolve()
+OUTPUT = REPO_ROOT / "docs/attack-coverage.md"
 
 TECHNIQUE_RE = re.compile(r"^T\d{4}(\.\d{3})?$")
 BAYES_SENTINEL = "BAYES"
@@ -94,26 +96,25 @@ def yara_meta(path: pathlib.Path) -> set[str]:
     return {match.group(1)} if match else set()
 
 
-# (source label, root the glob is relative to, glob, extractor, layer per
-# docs/detection/layers.md)
+# (source label, root the glob is relative to, glob, extractor, detection layer)
 SOURCES = [
     ("rules", REPO_ROOT, "crates/rules/src/*.rs", rust_technique_field, 3),
     ("correlator", REPO_ROOT, "crates/correlator/src/rules.rs", rust_technique_field, 6),
-    ("sigma", UMBRELLA_ROOT, "rules/sigma/**/*.yml", sigma_tags, 3),
-    ("yara", UMBRELLA_ROOT, "rules/yara/**/*.yar", yara_meta, 1),
+    ("sigma", SIBLINGS_ROOT, "rules/sigma/**/*.yml", sigma_tags, 3),
+    ("yara", SIBLINGS_ROOT, "rules/yara/**/*.yar", yara_meta, 1),
 ]
 
 # Sibling directories the scan and the output need; checked up front.
-REQUIRED_SIBLINGS = ["rules/sigma", "rules/yara", "docs/detection"]
+REQUIRED_SIBLINGS = ["rules/sigma", "rules/yara"]
 
 
 def require_siblings() -> None:
-    missing = [d for d in REQUIRED_SIBLINGS if not (UMBRELLA_ROOT / d).is_dir()]
+    missing = [d for d in REQUIRED_SIBLINGS if not (SIBLINGS_ROOT / d).is_dir()]
     if missing:
         print(
-            f"error: sibling repo directories missing under {UMBRELLA_ROOT}: "
-            f"{', '.join(missing)} — check out the `rules` and `docs` siblings via "
-            "the umbrella repo, or set SYNTHAEA_ROOT to the directory holding them",
+            f"error: sibling repo directories missing under {SIBLINGS_ROOT}: "
+            f"{', '.join(missing)} — check out synthaea-lab/rules next to this "
+            "repo as rules/, or set SYNTHAEA_ROOT to the directory holding it",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -244,7 +245,8 @@ UNVERIFIED_NOTES = [
     "**not verified** either. Hypothesis: the opened attachment is copied under the "
     "`Content.Outlook` folder; whether it carries a mark, and which process writes "
     "it, is still to be observed. Thunderbird is not verified. Neither is in the "
-    "rule until a lab capture shows the mark and its writer (#376).",
+    "rule until a lab capture shows the mark and its writer "
+    "(https://github.com/synthaea-lab/agent/issues/17).",
 ]
 
 
@@ -263,10 +265,10 @@ def render(findings: dict[str, dict[str, set]]) -> str:
         "Generated from ATT&CK technique identifiers tagged in source "
         "(`crates/rules`, `crates/correlator`, `rules/sigma/`, `rules/yara/`) — "
         "what has named detection content today, grouped by MITRE tactic and "
-        "by layer (`docs/detection/layers.md`). This proves positive coverage "
+        "by detection layer (1 signatures/hashes, 3 behavioral rules, "
+        "6 attack-chain correlation). This proves positive coverage "
         "only: a technique absent here may still be planned, tracked, or out "
-        "of scope for other reasons — see the coverage-pack issues "
-        "(#376-#381) for that roadmap view.",
+        "of scope for other reasons — see the issue tracker for that roadmap view.",
         "",
     ]
 

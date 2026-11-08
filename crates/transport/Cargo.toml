@@ -27,7 +27,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-# Cross-repo contract fixtures (the umbrella's sibling repos), skipped when absent.
+# Cross-repo contract fixtures (sibling checkouts of the other public repos), skipped when absent.
 siblings = { path = "../siblings" }
 tempfile = "3"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

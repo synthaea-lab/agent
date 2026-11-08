@@ -79,7 +79,7 @@ fn fetch_table(family: u16, label: &'static str) -> Result<Vec<u8>, SocketsError
 
 /// Fetches one `GetExtendedUdpTable` table into an owned byte buffer. Unlike
 /// the TCP table there is no "listener" filter — `UDP_TABLE_OWNER_PID` returns
-/// every bound UDP endpoint, server and client alike (issue #676's noise
+/// every bound UDP endpoint, server and client alike (<https://github.com/synthaea-lab/agent/issues/40>'s noise
 /// problem; [`snapshot_for_drift`] is where the filter sits).
 fn fetch_udp_table(family: u16, label: &'static str) -> Result<Vec<u8>, SocketsError> {
     let mut size: u32 = 0;
@@ -330,7 +330,7 @@ pub fn snapshot() -> Result<Vec<ListenerEntry>, SocketsError> {
 
 /// [`snapshot`] with the client sockets taken out: every TCP listener, and
 /// the UDP sockets bound outside the ephemeral port range
-/// ([`crate::raw::is_drift_relevant`], issue #676). What the agent seeds the
+/// ([`crate::raw::is_drift_relevant`], <https://github.com/synthaea-lab/agent/issues/40>). What the agent seeds the
 /// LISTENER-DRIFT baseline from and polls.
 ///
 /// # Errors

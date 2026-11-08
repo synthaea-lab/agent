@@ -61,7 +61,7 @@ const MARK_QUEUE_CAPACITY: usize = 256;
 /// this to fire, the cap only bounds a runaway client.
 const LDAP_PER_PID_LIMIT: u32 = 128;
 const LDAP_PER_PID_WINDOW_NS: u64 = 10_000_000_000;
-/// Silos waiting for a container lookup (#371). A full queue loses nothing:
+/// Silos waiting for a container lookup (<https://github.com/synthaea-lab/agent/issues/39>). A full queue loses nothing:
 /// the pass already queued maps every pending silo, and a dropped request is
 /// asked again on that silo's next event.
 const SILO_REQUEST_CAPACITY: usize = 16;
@@ -69,16 +69,16 @@ const SILO_REQUEST_CAPACITY: usize = 16;
 /// reported once per this window (#364): most come from pid 4, so there is no per-process
 /// budget.
 const NTLM_DEDUP_WINDOW_NS: u64 = 60_000_000_000;
-/// One remote thread is reported per (creator, owner) pair per window (#720): an injector
+/// One remote thread is reported per (creator, owner) pair per window (<https://github.com/synthaea-lab/agent/issues/41>): an injector
 /// that starts many threads in one target is one fact, and #715 found no dominant pair on
 /// an idle host, so the window only bounds a repeat.
 const REMOTE_THREAD_DEDUP_WINDOW_NS: u64 = 60_000_000_000;
-/// Remote threads reported per creating process per window (#720): one process starting
+/// Remote threads reported per creating process per window (<https://github.com/synthaea-lab/agent/issues/41>): one process starting
 /// threads in many targets (a debugger attaching widely, a spray) is capped, counted.
 const REMOTE_THREAD_PER_PID_LIMIT: u32 = 32;
 const REMOTE_THREAD_PER_PID_WINDOW_NS: u64 = 10_000_000_000;
 /// An identical open of LSASS (caller, access mask, status) is reported once per window
-/// (#720): security products and the service host re-open it on a schedule.
+/// (<https://github.com/synthaea-lab/agent/issues/41>): security products and the service host re-open it on a schedule.
 const LSASS_OPEN_DEDUP_WINDOW_NS: u64 = 60_000_000_000;
 
 /// Stops an orphaned ETW session. Named sessions are kernel objects that outlive
@@ -317,23 +317,23 @@ pub(crate) struct SharedState {
     /// LDAP search budget (#364): per process, no dedup (the burst rule
     /// counts distinct searches).
     pub(crate) ldap: Mutex<budget::PidBudget>,
-    /// #371: server silo → container, shared with the lookup thread.
+    /// <https://github.com/synthaea-lab/agent/issues/39>: server silo → container, shared with the lookup thread.
     pub(crate) silos: Arc<Mutex<SiloDirectory>>,
     /// Silos the lookup thread should name.
     silo_requests: SyncSender<u32>,
     /// NTLM dedup (#364): one event per (direction, account, target,
     /// address, version) per minute.
     pub(crate) ntlm: Mutex<budget::KeyDedup>,
-    /// #720: which cross-process thread starts are a new process's initial thread.
+    /// <https://github.com/synthaea-lab/agent/issues/41>: which cross-process thread starts are a new process's initial thread.
     pub(crate) threads: Mutex<cross_process::ThreadOrigins>,
-    /// #720: remote threads, one per (creator, owner) per minute.
+    /// <https://github.com/synthaea-lab/agent/issues/41>: remote threads, one per (creator, owner) per minute.
     pub(crate) remote_threads: Mutex<budget::KeyDedup>,
-    /// #720: remote threads, per creating process.
+    /// <https://github.com/synthaea-lab/agent/issues/41>: remote threads, per creating process.
     pub(crate) remote_thread_budget: Mutex<budget::PidBudget>,
-    /// #720: LSASS's pid, 0 until found. Only ever a process
+    /// <https://github.com/synthaea-lab/agent/issues/41>: LSASS's pid, 0 until found. Only ever a process
     /// `cross_process::is_system_lsass` confirmed.
     pub(crate) lsass: cross_process::LsassTracker,
-    /// #720: opens of LSASS, one per (caller, mask, status) per minute.
+    /// <https://github.com/synthaea-lab/agent/issues/41>: opens of LSASS, one per (caller, mask, status) per minute.
     pub(crate) lsass_opens: Mutex<budget::KeyDedup>,
     /// `%SystemRoot%` (`C:\Windows`), where LSASS's image is looked for.
     pub(crate) system_root: String,
@@ -347,7 +347,7 @@ pub(crate) struct SharedState {
 
 impl SharedState {
     /// The identity of the process an event is about: its token user (F-3),
-    /// its container (#371) and the incarnation stamps of it and its parent
+    /// its container (<https://github.com/synthaea-lab/agent/issues/39>) and the incarnation stamps of it and its parent
     /// (#725), as the pid store recorded them. `ppid` 0 (an event that names no parent) has no stamp.
     pub(crate) fn meta(&self, pid: u32, ppid: u32, comm: String, timestamp_ns: u64) -> EventMeta {
         let (process_generation, parent_process_generation) = {
@@ -453,7 +453,7 @@ fn spawn_mark_reader(
         .map_err(|e| -> SensorError { format!("Zone.Identifier reader thread: {e}").into() })
 }
 
-/// Starts the container lookup worker (#371). Like the mark reader, it exits
+/// Starts the container lookup worker (<https://github.com/synthaea-lab/agent/issues/39>). Like the mark reader, it exits
 /// by itself once this run's [`SharedState`] (the only request sender) is
 /// dropped.
 fn spawn_silo_resolver(
@@ -494,7 +494,7 @@ fn seed_pid_store(state: &SharedState) {
     tracing::info!(processes = pids.len(), "pid store seeded");
 }
 
-/// #720: the pid of the system's LSASS among the running processes, found by name and
+/// <https://github.com/synthaea-lab/agent/issues/41>: the pid of the system's LSASS among the running processes, found by name and
 /// confirmed by `cross_process::is_system_lsass` (its full image path, session 0, wininit
 /// as its parent), so neither an `lsass.exe` started from elsewhere nor a copy of the real
 /// file started by hand is taken for it. Called at start and when the tracked LSASS ends.

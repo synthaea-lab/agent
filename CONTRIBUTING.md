@@ -1,12 +1,11 @@
 # Contributing to Synthaea
 
 Synthaea has a working Linux implementation (validated live in the lab — see `crates/`,
-`agent/`, `ml/`) while much of the system described in [`docs/`](docs/) and the
-[roadmap](docs/roadmap.md) is still **design-phase** — the foundations are still cheap to argue
-about.
+`agent/`, and the sibling repos) while much of the wider system is still **design-phase** — the
+foundations are still cheap to argue about.
 
-**One of the most valuable contributions is still a well-argued objection to something in
-[`docs/`](docs/).** If you think the schema design is wrong, the metamorphism claims are
+**One of the most valuable contributions is still a well-argued objection to a design
+decision.** If you think the schema design is wrong, the metamorphism claims are
 overstated, the ML tiering won't hold its latency budget, or the roadmap's dependency order is
 broken — say so. Those arguments are cheap today and ruinously expensive in eighteen months.
 
@@ -65,7 +64,7 @@ purpose.
 ### Licensing of your contribution
 
 Contributions are accepted under **Apache-2.0**, except contributions to the Linux eBPF probes,
-which must be **GPL-2.0** for the kernel verifier to accept them. See [`NOTICE`](NOTICE) and [`LICENSE`](LICENSE) — a
+which are dual-licensed **GPL-2.0-only OR MIT** because the kernel verifier requires a GPL-compatible license. See [`NOTICE`](NOTICE) and [`LICENSE`](LICENSE) — a
 deliberate, recorded decision carried over from the project's start.
 
 Because there is no CLA, **the project cannot relicense your contribution without your consent.**
@@ -78,8 +77,10 @@ permanent. Please make sure you're comfortable with them before submitting.
 
 ### Challenging a design decision
 
-Locked decisions live in [`docs/adr/`](docs/adr/) as Architecture Decision Records. Each ADR states
-its context, the decision, the alternatives rejected, and the consequences accepted.
+Locked decisions are recorded as Architecture Decision Records (cited as `ADR-00xx` in code
+comments and PRs). Each ADR states its context, the decision, the alternatives rejected, and the
+consequences accepted; where a comment's reasoning matters to the code, it is stated in the
+comment itself.
 
 To challenge one, **open an issue that engages with the recorded consequences.** An ADR is not
 sacred — several will be superseded — but reopening one costs the team real time, so the bar is:
@@ -97,26 +98,26 @@ Superseding an ADR means writing a new one that references the old — we don't 
 
 Documentation PRs are welcome immediately. Particularly wanted:
 
-- **Correctness of platform claims.** The telemetry-source inventory
-  ([`docs/sensors/sources.md`](docs/sensors/sources.md)) and the per-platform coverage matrices
+- **Correctness of platform claims.** The telemetry-source inventory and the per-platform coverage
+  matrices
   ([`crates/sensors/`](crates/sensors/README.md)) make specific assertions about Windows kernel
   callbacks, BPF-LSM availability, and EndpointSecurity events. If one is wrong or out of date,
   that's a high-value fix — the roadmap depends on it.
 - **Prior art we've mischaracterized.** The comparison table in the README makes claims about
   other projects. If we've been unfair to OSQuery, Velociraptor, Wazuh, or Falco, correct us. We'd
   rather be accurate than flattering to ourselves.
-- **Threat-model gaps.** Especially in
-  [`docs/architecture/threat-model.md`](docs/architecture/threat-model.md), where the honest
-  limitations sections matter more than the capability lists.
+- **Threat-model gaps.** Especially where the honest limitations matter more than the
+  capability lists.
 
 ### Detection content
 
-Accepted — content is code here ([`docs/detection/detection-as-code.md`](docs/detection/detection-as-code.md)).
+Accepted — content is code here; the content itself lives in
+[synthaea-lab/rules](https://github.com/synthaea-lab/rules).
 Every shipped rule must compile/validate in its engine AND fire on a crafted matching sample
 (CI-enforced by the content suites — add your sample with your rule). Coming requirements as the
 pipeline hardens: a MITRE ATT&CK technique mapping, negative (must-NOT-fire) samples, and a
-false-positive assessment — see [`docs/detection/ml.md`](docs/detection/ml.md) for why FP
-governance is strict.
+false-positive assessment — an alert that fires on benign activity costs every operator's trust,
+so FP governance is strict.
 
 ---
 
@@ -189,7 +190,7 @@ Recorded early so they're not invented under deadline pressure.
 
 - **Rust** throughout the agent — including the eBPF probes (aya); **C only where the Windows
   kernel driver requires it**. The control plane is TypeScript/Next.js
-  ([ADR-0001](docs/adr/0001-server-stack-nextjs-postgres.md)).
+  (ADR-0001).
 - **`unsafe` is confined to per-platform FFI shims** behind safe interfaces, and every `unsafe`
   block carries a `// SAFETY:` comment justifying it.
 - **No allocation on the hot path.** The probe path and on-device inference carry documented
@@ -198,7 +199,7 @@ Recorded early so they're not invented under deadline pressure.
   degrades to *allow*. An EDR that bricks the machine is worse than no EDR. (To be re-adopted as
   an ADR when the first blocking path — BPF-LSM `response` — lands.)
 - **Content is code.** Rules and models ship through the same canary rings as binaries. No
-  exceptions, ever. → [docs/detection/detection-as-code.md](docs/detection/detection-as-code.md)
+  exceptions, ever.
 
 ## Commit and PR conventions
 

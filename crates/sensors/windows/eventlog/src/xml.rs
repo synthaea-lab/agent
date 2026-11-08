@@ -328,7 +328,7 @@ pub fn task_leaf_name(task_name: &str) -> String {
 /// Field names are the standard, publicly documented Microsoft Security-auditing
 /// schema for these four event IDs. Reconciled against a real
 /// `wevtutil qe Security /f:xml` capture on 2026-09-21 (Windows 11 lab VM
-/// `Sandbox`, issue #224 — see `lab/eventlog-captures/2026-09-21-sandbox/*.xml`); the fixtures in this
+/// `Sandbox`); the fixtures in this
 /// module's tests are trimmed but otherwise faithful to that capture.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LogonEvent {
@@ -418,7 +418,7 @@ pub fn parse_logon_block(block: &str) -> Option<LogonEvent> {
 /// which are out of scope) — kept out of the struct to avoid duplication.
 ///
 /// Reconciled against a real `wevtutil qe Security /f:xml` capture on 2026-09-21
-/// (Windows 11 lab VM `Sandbox`, issue #224 — see `lab/eventlog-captures/2026-09-21-sandbox/4720.xml`);
+/// (Windows 11 lab VM `Sandbox`);
 /// the fixture in this module's tests is faithful to that capture.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AccountCreatedEvent {
@@ -1430,9 +1430,9 @@ mod tests {
 
     // ── Logon events (4624/4625/4648/4672) ───────────────────────────────────
     //
-    // Fixtures reconciled 2026-09-21 (issue #224) against a real
-    // `wevtutil qe Security /f:xml` capture on Windows 11 lab VM `Sandbox` —
-    // see `lab/eventlog-captures/2026-09-21-sandbox/*.xml`. UTF-16-LE from wevtutil normalised to UTF-8
+    // Fixtures reconciled 2026-09-21 against a real
+    // `wevtutil qe Security /f:xml` capture on Windows 11 lab VM `Sandbox`.
+    // UTF-16-LE from wevtutil normalised to UTF-8
     // via iconv (a stray `Système`-mojibake artefact from that pipeline was
     // corrected back to `Système` here; the parser reads neither the field nor
     // the surrounding text, so the round-trip is safe).
@@ -1552,9 +1552,9 @@ mod tests {
 
     // ── Account creation (4720) ──────────────────────────────────────────────
     //
-    // Fixture reconciled 2026-09-21 (issue #224) against a real
-    // `wevtutil qe Security /f:xml` capture on Windows 11 lab VM `Sandbox` —
-    // see `lab/eventlog-captures/2026-09-21-sandbox/4720.xml`. Note that `UserAccountControl` is
+    // Fixture reconciled 2026-09-21 against a real
+    // `wevtutil qe Security /f:xml` capture on Windows 11 lab VM `Sandbox`.
+    // Note that `UserAccountControl` is
     // multi-line (indented `%%2080/%%2082/%%2084`, one per line); the parser
     // ignores this field, so the whitespace shape does not affect correctness
     // but is preserved here to stay faithful to what wevtutil rendered.

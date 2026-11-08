@@ -2,8 +2,9 @@
 
 Windows kernel-mode components of Synthaea. Not a Cargo workspace member:
 kernel drivers have their own build and signing pipeline (WDK). Language and
-framework choice: [ADR-0012](../../../../docs/adr/0012-windows-driver-framework-language-choice.md)
-(C against the classic WDK).
+framework choice (ADR-0012): C against the classic WDK, because the Rust driver
+bindings did not yet support the filter manager (`FltMgr`) for production use; only the
+kernel-mode binary is C — everything past the IPC boundary stays Rust.
 
 ## Layout
 
@@ -80,8 +81,8 @@ fltmc unload SynthaeaFilter
 ## Roadmap
 
 - Minifilter: file deletes/renames (ransomware signal), named pipes, quarantine (#136)
-- Kernel callbacks: process/thread/image notify, handle access (#137)
-- ELAM + PPL: Threat-Intelligence ETW provider and agent self-protection (#39,
+- Kernel callbacks: process/thread/image notify, handle access (https://github.com/synthaea-lab/agent/issues/32)
+- ELAM + PPL: Threat-Intelligence ETW provider and agent self-protection (https://github.com/synthaea-lab/agent/issues/27,
   gated on Microsoft Virus Initiative membership)
 
 ## License

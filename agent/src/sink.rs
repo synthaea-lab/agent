@@ -68,7 +68,7 @@ pub(crate) struct DetectionSink {
     /// enrichment worker, connect destinations on the capture thread. Shared with the worker,
     /// which is the only place an exec's hash is known.
     ioc: Arc<crate::ioc::IocMatcher>,
-    /// What tells the agent's own control-plane traffic from everything else (#1061).
+    /// What tells the agent's own control-plane traffic from everything else (<https://github.com/synthaea-lab/agent/issues/47>).
     own_traffic: Arc<crate::own_traffic::OwnTraffic>,
     /// What became of the rarity judgements, for the health beacon.
     rarity_stats: Arc<RarityStats>,
@@ -490,7 +490,7 @@ fn crosses_kill_gate(technique: &str) -> bool {
 // "package-owned" as verified.
 const SERVICE_MAIN_REFUSAL: &str = "main process of a system service (image under a system path, started by init); escalated, not killed";
 
-/// Why the kill gate refuses the process holding a login session (#1142, ADR-0028).
+/// Why the kill gate refuses the process holding a login session (<https://github.com/synthaea-lab/agent/issues/50>, ADR-0028).
 /// Same care as [`SERVICE_MAIN_REFUSAL`]: it states what was checked (the image and
 /// its parent's image), not that the session is legitimate, nor that the parent was
 /// started by init: the listener's exec is usually never seen.
@@ -572,12 +572,12 @@ impl DetectionSink {
         // only from the per-event path below (`CorrelationEngine::bayes_alert`'s one call
         // site), never from `advance_time`'s window-expiry alerts — so `shield`
         // is never read on this path, and `None` is a placeholder, not a real claim
-        // about any pid here (issues #652, #1142).
+        // about any pid here (issues #652, https://github.com/synthaea-lab/agent/issues/50).
         self.emit_correlator_alerts(&alerts, None, None);
     }
 
     /// `shield` is the correlator's provenance verdict for the event this batch of
-    /// alerts was produced from (issues #652, #1142) — meaningful only when a `BAYES` alert is
+    /// alerts was produced from (issues #652, <https://github.com/synthaea-lab/agent/issues/50>) — meaningful only when a `BAYES` alert is
     /// among them, since that is the only technique [`crosses_kill_gate`] recognizes, and
     /// `CorrelationAlert::trigger_event` is always `None` for it (so it always resolves to
     /// `default_event`, never to a different pid than the one `shield` was computed
@@ -1029,7 +1029,7 @@ impl DetectionSink {
         let _ = self.tripwires.set(tripwires);
     }
 
-    /// Tells the rules the host's UTC offset in minutes (#376); false when it is not a real one.
+    /// Tells the rules the host's UTC offset in minutes (<https://github.com/synthaea-lab/agent/issues/17>); false when it is not a real one.
     pub(crate) fn set_local_utc_offset_minutes(&self, minutes: i32) -> bool {
         self.rule_state
             .lock()
@@ -1037,12 +1037,12 @@ impl DetectionSink {
             .set_local_utc_offset_minutes(minutes)
     }
 
-    /// Declares the ordinary local hours (#1089); false when they are not a window.
+    /// Declares the ordinary local hours (<https://github.com/synthaea-lab/agent/issues/64>); false when they are not a window.
     pub(crate) fn set_work_hours(&self, start: u32, end: u32) -> bool {
         self.rule_state.lock().unwrap().set_work_hours(start, end)
     }
 
-    /// Declares the accounts whose odd-hour logons are expected (#1089).
+    /// Declares the accounts whose odd-hour logons are expected (<https://github.com/synthaea-lab/agent/issues/64>).
     pub(crate) fn set_odd_hour_exempt_accounts(&self, accounts: &[String]) -> usize {
         self.rule_state
             .lock()
@@ -1050,7 +1050,7 @@ impl DetectionSink {
             .set_odd_hour_exempt_accounts(accounts)
     }
 
-    /// Gives the rules the platform's time zone (#1088); false when it has no answer for `now_secs`.
+    /// Gives the rules the platform's time zone (<https://github.com/synthaea-lab/agent/issues/15>); false when it has no answer for `now_secs`.
     pub(crate) fn set_local_zone(&self, zone: rules::LocalOffsetAt, now_secs: i64) -> bool {
         self.rule_state
             .lock()
@@ -1469,7 +1469,7 @@ impl DetectionSink {
     /// Issue #25: policy-gates killing the process behind a high-confidence
     /// correlated verdict. A no-op whenever `enable_response` was never called.
     ///
-    /// `shield` is the correlator's provenance verdict for `pid` (issues #652, #1142): a
+    /// `shield` is the correlator's provenance verdict for `pid` (issues #652, <https://github.com/synthaea-lab/agent/issues/50>): a
     /// system service's main process (its image under a system path, started by init —
     /// see the comment above `SERVICE_MAIN_REFUSAL`'s definition for why this is not
     /// phrased as "package-owned"), or the process holding a login, exec'd by `sshd`
@@ -1830,7 +1830,7 @@ impl DetectionSink {
     }
 
     /// IOC matches skipped as the agent's own control-plane traffic: made by this process, and by
-    /// a second process on the agent's executable (#1061).
+    /// a second process on the agent's executable (<https://github.com/synthaea-lab/agent/issues/47>).
     pub(crate) fn ioc_own_skips(&self) -> (u64, u64) {
         let stats = self.ioc.stats();
         (
@@ -1839,7 +1839,7 @@ impl DetectionSink {
         )
     }
 
-    /// Names the control plane whose traffic, from the agent, an IOC match skips (#1061), and
+    /// Names the control plane whose traffic, from the agent, an IOC match skips (<https://github.com/synthaea-lab/agent/issues/47>), and
     /// starts following the addresses its host resolves to. `false` when the URL names no host.
     pub(crate) fn set_control_plane(&self, url: &str) -> bool {
         let set = self.own_traffic.set_control_plane(url);
@@ -3122,8 +3122,8 @@ mod tests {
 
     /// The response chain through the real detection path, in-process: real
     /// correlator, real YARA queue and rule set, real filesystem; only the
-    /// kernel-level `terminate` call is a recorder. The stream is the shape of
-    /// `lab/scenarios/response.sh`: an implant that connects out quickly and keeps
+    /// kernel-level `terminate` call is a recorder. The stream is the shape of the
+    /// lab's response scenario: an implant that connects out quickly and keeps
     /// beaconing, while a payload carrying a YARA marker is written to disk.
     const RESPONSE_MARKER_RULE: &str = r#"
 rule response_marker {
@@ -4225,7 +4225,7 @@ rule response_marker {
     }
 
     /// Execs the `sshd-session` that holds one login under the `sshd` listener, as on
-    /// Alpine (#1142). The listener's own exec is not sent: it started at boot, before
+    /// Alpine (<https://github.com/synthaea-lab/agent/issues/50>). The listener's own exec is not sent: it started at boot, before
     /// the agent, so only its image (resolved by the sensor) is known.
     fn exec_ssh_login(sink: &DetectionSink, listener: u32, session: u32) {
         exec_under_sshd_listener(
@@ -4238,7 +4238,7 @@ rule response_marker {
     }
 
     /// Execs the `sshd` the listener re-execs (`sshd -R`) for one login before
-    /// OpenSSH 9.8, as on Debian 12 (#1142, 2026-11-08 lab run).
+    /// OpenSSH 9.8, as on Debian 12 (<https://github.com/synthaea-lab/agent/issues/50>, 2026-11-08 lab run).
     fn exec_reexecd_sshd_login(sink: &DetectionSink, listener: u32, session: u32) {
         exec_under_sshd_listener(sink, listener, session, "sshd -R", "/usr/sbin/sshd");
     }
@@ -4259,7 +4259,7 @@ rule response_marker {
         sink.on_event(Event::Exec(e));
     }
 
-    /// Issue #1142: on a stock Alpine VM, BAYES named the `sshd-session` of an
+    /// <https://github.com/synthaea-lab/agent/issues/50>: on a stock Alpine VM, BAYES named the `sshd-session` of an
     /// interactive SSH login as a kill target; with kill enabled the agent would cut
     /// the operator's session. It is refused like a service main, and audited as such.
     #[test]
@@ -4278,7 +4278,7 @@ rule response_marker {
         assert!(killed.lock().unwrap().is_empty());
     }
 
-    /// Issue #1142, lab run on Debian 12 (OpenSSH 9.2): no `sshd-session` there, the
+    /// <https://github.com/synthaea-lab/agent/issues/50>, lab run on Debian 12 (OpenSSH 9.2): no `sshd-session` there, the
     /// listener re-execs `/usr/sbin/sshd`, and BAYES named that `comm=sshd` session.
     #[test]
     fn an_sshd_reexecd_for_a_login_crossing_bayes_is_refused_not_killed() {
@@ -6438,7 +6438,7 @@ rule reload_content_test_marker {
 
     #[test]
     fn the_agents_own_connection_to_its_control_plane_neither_alerts_nor_hides_the_next_one() {
-        // #1061: the lab feed listed the control plane's address; the agent alerted on its own
+        // https://github.com/synthaea-lab/agent/issues/47: the lab feed listed the control plane's address; the agent alerted on its own
         // fetch, and that finding started the cooldown a real process would then fall inside.
         let dir = tmp("ioc-own");
         let sink = ioc_sink(&dir, "ip:203.0.113.9\n");

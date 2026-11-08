@@ -131,7 +131,7 @@ fn exec_cmdline_truncated_golden() {
 
 #[test]
 fn exec_argv_omitted_bytes_golden() {
-    // v68 (#1118, ADR-0045): the Linux exec probe read a head and a tail window and
+    // v68 (https://github.com/synthaea-lab/agent/issues/48, ADR-0045): the Linux exec probe read a head and a tail window and
     // says how many bytes lay between them; the field only appears when known.
     assert_golden(
         &Event::Exec(ExecEvent {
@@ -960,7 +960,7 @@ fn image_load_golden() {
 
 #[test]
 fn remote_thread_golden() {
-    // v67 (#720): a thread started in another process, from Kernel-Process EID 3.
+    // v67 (https://github.com/synthaea-lab/agent/issues/41): a thread started in another process, from Kernel-Process EID 3.
     assert_golden(
         &Event::RemoteThread(RemoteThreadEvent {
             meta: EventMeta {
@@ -987,7 +987,7 @@ fn remote_thread_golden() {
 
 #[test]
 fn process_access_golden() {
-    // v67 (#720): an open of LSASS that can reach its memory, from Kernel-Audit-API-Calls EID 5.
+    // v67 (https://github.com/synthaea-lab/agent/issues/41): an open of LSASS that can reach its memory, from Kernel-Audit-API-Calls EID 5.
     assert_golden(
         &Event::ProcessAccess(ProcessAccessEvent {
             meta: EventMeta {
@@ -1188,7 +1188,7 @@ fn listen_port_golden() {
 
 #[test]
 fn listen_port_without_protocol_defaults_to_tcp() {
-    // A record from before issue #676 (spooled events, server storage, the ML
+    // A record from before https://github.com/synthaea-lab/agent/issues/40 (spooled events, server storage, the ML
     // corpus, every fixture under v40-v48) has no `protocol` field at all —
     // every collector was TCP-only back then, so that is what it actually was.
     // A literal here, not a read of `fixtures/v48/listen_port.json`: that file

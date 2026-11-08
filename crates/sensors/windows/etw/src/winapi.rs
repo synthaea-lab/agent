@@ -1,6 +1,6 @@
 //! Win32/NT API access for enrichment of ETW events: real command lines (F-1),
 //! token identity (F-3), the volume map (F-5), process-table seeding, and server
-//! silo membership (#371). Every function here is best-effort — a failure degrades one field, never the event.
+//! silo membership (<https://github.com/synthaea-lab/agent/issues/39>). Every function here is best-effort — a failure degrades one field, never the event.
 
 use std::{
     collections::HashMap,
@@ -339,7 +339,7 @@ pub(crate) struct ProcessEntry {
 
 /// Every process running at call time (before the trace starts): fills the pid→image
 /// table, so network events from already-running processes resolve — and the rules'
-/// parent-side exclusions apply to pre-existing parents — and finds LSASS (#720).
+/// parent-side exclusions apply to pre-existing parents — and finds LSASS (<https://github.com/synthaea-lab/agent/issues/41>).
 pub(crate) fn snapshot_processes() -> Vec<ProcessEntry> {
     let mut out = Vec::new();
     // SAFETY: the snapshot handle is checked against INVALID_HANDLE_VALUE and
@@ -427,7 +427,7 @@ pub(crate) fn resolve_pid_live(pid: u32) -> Option<String> {
     }
 }
 
-/// The session the process runs in (#720: the system LSASS runs in session 0). `None`
+/// The session the process runs in (<https://github.com/synthaea-lab/agent/issues/41>: the system LSASS runs in session 0). `None`
 /// when it cannot be queried (exited, or access refused).
 pub(crate) fn process_session_id(pid: u32) -> Option<u32> {
     let mut session = 0u32;
@@ -436,7 +436,7 @@ pub(crate) fn process_session_id(pid: u32) -> Option<u32> {
     (ok != 0).then_some(session)
 }
 
-/// When the process was created, in Unix nanoseconds (#720: whether the owner of a thread
+/// When the process was created, in Unix nanoseconds (<https://github.com/synthaea-lab/agent/issues/41>: whether the owner of a thread
 /// existed before the thread could be its initial one). `None` when it cannot be opened.
 /// `PROCESS_QUERY_LIMITED_INFORMATION` is enough, protected processes included.
 pub(crate) fn process_create_time_ns(pid: u32) -> Option<u64> {
@@ -463,7 +463,7 @@ pub(crate) fn process_create_time_ns(pid: u32) -> Option<u64> {
     }
 }
 
-// ── #371: server silo membership ─────────────────────────────────────────────
+// ── https://github.com/synthaea-lab/agent/issues/39: server silo membership ─────────────────────────────────────────────
 
 /// `ProcessMembershipInformation`: a `PROCESS_MEMBERSHIP_INFORMATION`, one
 /// `ULONG ServerSiloId` (ntddk.h, Windows 11 22H2 and later).

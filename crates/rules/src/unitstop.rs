@@ -361,7 +361,7 @@ fn shutdown_effect(event: &ExecEvent) -> Option<Shutdown> {
     match program.as_str() {
         "reboot" | "poweroff" | "halt" => {
             // Fail towards an alert: with no argv captured (the usual case for a short-lived
-            // process, #1118) the options are unknown, so `reboot -w` or `reboot --help` cannot
+            // process, https://github.com/synthaea-lab/agent/issues/48) the options are unknown, so `reboot -w` or `reboot --help` cannot
             // be told from a real one. Count the command only when its options are all ones that
             // still bring the host down; anything else (`-w`, `--help`, a bad option) does not.
             if event.argv.is_empty() && event.cmdline.trim().is_empty() {

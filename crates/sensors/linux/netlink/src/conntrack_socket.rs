@@ -5,8 +5,8 @@
 //! snapshot per call.
 //!
 //! Unprivileged reachability: **not yet characterized** — every capture taken
-//! while building this module ran as root (this dev machine's `edr-lab`
-//! sandbox default). Unlike `sock_diag` (confirmed unprivileged) or proc
+//! while building this module ran as root (the development sandbox's
+//! default). Unlike `sock_diag` (confirmed unprivileged) or proc
 //! connector (confirmed root-only, `EPERM` from the kernel), whether an
 //! unprivileged caller can read the conntrack table depends on the running
 //! kernel's `net.netfilter.nf_conntrack_*` sysctls and namespace, which

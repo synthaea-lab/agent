@@ -45,7 +45,7 @@ cargo build --release --no-default-features --features agent/dynamic-onnx -p age
 ```
 
 `--no-default-features` is what keeps the public test signing key out of the MSI
-(ADR-0027, #753): the agent's default features include `test-key`, which embeds a key whose
+(ADR-0027, https://github.com/synthaea-lab/agent/issues/43): the agent's default features include `test-key`, which embeds a key whose
 seed is in the repository, so anyone who can serve the release routes could sign for it.
 `--features agent/dynamic-onnx` puts back the one other default feature, so the MSI keeps
 the onnxruntime it ships with today. `build.ps1` scans `agent.exe` and `watchdog.exe` for the
@@ -107,7 +107,7 @@ managed fleet.
 ## Containers
 
 A host install covers **process-isolated** containers: their processes run on the
-host kernel and carry the container id (#371, `docs/sensors/windows.md`). It does
+host kernel and carry the container id (https://github.com/synthaea-lab/agent/issues/39, `docs/sensors/windows.md`). It does
 not cover:
 
 - **Hyper-V-isolated containers**: each runs its own kernel in a utility VM. Treat

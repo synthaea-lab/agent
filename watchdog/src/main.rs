@@ -44,8 +44,8 @@ use paths::DEFAULT_ALERTS;
     about = "Installs and supervises the Synthaea agent as a system service"
 )]
 struct Cli {
-    /// Path to the agent configuration file (TOML). See ADR-0013 for the
-    /// discovery order (this flag, `SYNTHAEA_CONFIG` env, OS default).
+    /// Path to the agent configuration file (TOML). Discovery order: this
+    /// flag, then the `SYNTHAEA_CONFIG` env var, then the OS default path.
     /// The Windows service-mode entry point (`run_as_service`) skips this
     /// flag and always resolves the config via `SYNTHAEA_CONFIG`/OS
     /// default, since the SCM launches the binary without CLI args.

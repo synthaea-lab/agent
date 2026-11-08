@@ -42,9 +42,8 @@ jobs:
           cargo +nightly fmt --all --check
       - name: dependency direction
         run: python3 tools/check-deps.py
-      # tools/attack-coverage.py --check is not run here: it scans this repo and the
-      # `rules` sibling and checks a file in the umbrella's docs/, so it runs in the
-      # umbrella's CI, where all three are pinned together.
+      # tools/attack-coverage.py --check needs the `rules` sibling: it runs in the
+      # `content` job, which checks it out.
       - name: PowerShell scripts ASCII-only
         run: python3 tools/check-ps1-ascii.py
       - name: shell scripts with a shebang are executable in git
@@ -87,7 +86,7 @@ jobs:
   #
   # The cross-repo contract tests (golden fixtures from server/ and ml/, the shipped
   # content in rules/; see crates/siblings) need the sibling repos beside this one,
-  # laid out as in the umbrella checkout. They skip without them locally; here
+  # cloned side by side (agent/, server/, ml/, rules/). They skip without them locally; here
   # SYNTHAEA_REQUIRE_SIBLINGS=1 makes a missing sibling a failure, so they cannot
   # pass by not running. Siblings track their main branch: a change on either side
   # of a contract that the other cannot read fails the next run here.
@@ -109,7 +108,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: synthaea-lab/edr-server
+          repository: synthaea-lab/server
           ref: main
           path: server
           persist-credentials: false
@@ -118,14 +117,14 @@ jobs:
             tests/fixtures
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: synthaea-lab/edr-ml
+          repository: synthaea-lab/ml
           ref: main
           path: ml
           persist-credentials: false
           sparse-checkout: tests/fixtures
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: synthaea-lab/edr-rules
+          repository: synthaea-lab/rules
           ref: main
           path: rules
           persist-credentials: false
@@ -186,7 +185,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: synthaea-lab/edr-rules
+          repository: synthaea-lab/rules
           ref: main
           path: rules
           persist-credentials: false
@@ -204,6 +203,10 @@ jobs:
       # the server's list).
       - name: ioc content suite
         run: cargo test -p intel --test content
+      # docs/attack-coverage.md must match what this repo plus the `rules` sibling
+      # implement. SYNTHAEA_REQUIRE_SIBLINGS=1 (job env) makes a missing sibling fatal.
+      - name: ATT&CK coverage up to date
+        run: python3 tools/attack-coverage.py --check
 
   # Linux with the eBPF probes embedded, the configuration we actually ship.
   # The `test` runner has no bpf-linker, so there build.rs skips the probes: the
@@ -213,7 +216,7 @@ jobs:
   # pinned in ebpf-toolchain.txt + rust-src for aya-build, prebuilt bpf-linker at
   # the same pin) and fails if the
   # probes did not get embedded. No `cargo test` here: loading them needs a
-  # privileged kernel, which is what the lab VMs are for.
+  # privileged kernel, which needs a dedicated test VM.
   linux-ebpf:
     runs-on: ubuntu-latest
     env:

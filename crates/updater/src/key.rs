@@ -1,7 +1,7 @@
 //! The updater's embedded trust set: four Ed25519 public keys, each with one job
 //! (ADR-0027, ADR-0033). `release` verifies binary release manifests, `content` verifies content
 //! manifests, `snapshot` verifies the common-set snapshot manifest and nothing else (its custody
-//! is not decided, #753), `recovery` is held offline and reserved for a key-rotation release
+//! is not decided, <https://github.com/synthaea-lab/agent/issues/43>), `recovery` is held offline and reserved for a key-rotation release
 //! ([`crate::rotation`]).
 //!
 //! A production build embeds the keys in `crates/updater/keys/*.pub` (hex). Until the real
@@ -141,7 +141,7 @@ pub static CONTENT_PUBLIC_KEY: LazyLock<Option<[u8; 32]>> =
 
 /// Verifies the common-set snapshot manifest (ADR-0033) and nothing else. `None` when no key is
 /// provisioned, which also keeps the agent's snapshot fetch loop off (fail closed). Its custody is
-/// the open question of #753; until then only the test set provides one.
+/// the open question of <https://github.com/synthaea-lab/agent/issues/43>; until then only the test set provides one.
 pub static SNAPSHOT_PUBLIC_KEY: LazyLock<Option<[u8; 32]>> =
     LazyLock::new(|| embedded(Role::Snapshot, include_str!("../keys/snapshot.pub")));
 

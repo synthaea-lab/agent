@@ -6,7 +6,7 @@
 //! and written as the line format of [`intel::SetBuilder::add_lines`]; an optional `VERSION`
 //! file names the release they came from (`unversioned` without one). Signed delivery of these
 //! files through the content manifest is not built yet (it waits on the production signing keys,
-//! #753), so today a feed is a file somebody put there, which is why a match is Medium or High
+//! <https://github.com/synthaea-lab/agent/issues/43>), so today a feed is a file somebody put there, which is why a match is Medium or High
 //! and never kills anything.
 //!
 //! The set and its feed names are swapped together, so a match never reports another feed's
@@ -103,7 +103,7 @@ pub(crate) struct IocStats {
     pub(crate) raised: AtomicU64,
     /// Matches absorbed by the per-indicator cooldown.
     pub(crate) cooled_down: AtomicU64,
-    /// Address and domain matches to the control plane made by this process, skipped (#1061).
+    /// Address and domain matches to the control plane made by this process, skipped (<https://github.com/synthaea-lab/agent/issues/47>).
     pub(crate) own_skipped: AtomicU64,
     /// The same, made by a second process on the agent's executable (`apply-content-manifest`).
     pub(crate) sibling_skipped: AtomicU64,
@@ -195,7 +195,7 @@ impl IocMatcher {
     /// match only. A feed that lists the control plane's address (shared hosting, a CDN) would
     /// make every agent alert on itself at each fetch and upload, and, worse, its connection
     /// would start the indicator's cooldown and silence a real process reaching the same
-    /// address within it (#1061). So that match is skipped before the cooldown and counted.
+    /// address within it (<https://github.com/synthaea-lab/agent/issues/47>). So that match is skipped before the cooldown and counted.
     pub(crate) fn check_connect(
         &self,
         address: IpAddr,
@@ -610,7 +610,7 @@ mod tests {
 
     #[test]
     fn the_agents_own_match_is_skipped_and_counted_without_starting_the_cooldown() {
-        // #1061: the control plane's address was in the feed; the agent's own connection
+        // https://github.com/synthaea-lab/agent/issues/47: the control plane's address was in the feed; the agent's own connection
         // raised a finding and its cooldown would have hidden a real process behind it.
         let dir = dir_with(&[("f.txt", "ip:203.0.113.9\ndomain:evil.example\n")]);
         let matcher = IocMatcher::new(dir.path());

@@ -40,8 +40,8 @@ pub(crate) fn parse_proc_cmdline(blob: &[u8]) -> Vec<String> {
 ///
 /// Not usable on `WSL2`: kernel 6.6 returns `ENOENT` here for every pid, including
 /// a live `sleep 60` with a confirmed parent — the `WSL` interop layer between the
-/// eBPF context and the agent's `/proc` view, not the drain race. `WSL2` is out of
-/// `lab/MATRIX.md`; recorded so it is not re-investigated (Nikolas, 2026-09-10, #155).
+/// eBPF context and the agent's `/proc` view, not the drain race. `WSL2` is not a
+/// supported platform; recorded so it is not re-investigated (Nikolas, 2026-09-10).
 ///
 /// Reads at most one byte past [`schema::ARGV_CAPTURE_BUDGET`] (#1112): enough for
 /// `normalize::exec`'s cut to see the argv is over and flag it, without copying a
@@ -77,7 +77,7 @@ fn read_capped(path: &str, limit: usize) -> std::io::Result<Vec<u8>> {
 }
 
 /// The argv of an exec event and how many bytes of its argument block were not captured
-/// (#1118, ADR-0045's truth table).
+/// (<https://github.com/synthaea-lab/agent/issues/48>, ADR-0045's truth table).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExecArgvCapture {
     pub(crate) argv: Vec<String>,
@@ -86,7 +86,7 @@ pub(crate) struct ExecArgvCapture {
     pub(crate) omitted_bytes: Option<u32>,
 }
 
-/// argv of an exec event (#1118): the probe's exec-time windows when it read them, else
+/// argv of an exec event (<https://github.com/synthaea-lab/agent/issues/48>): the probe's exec-time windows when it read them, else
 /// [`read_proc_cmdline`] now (the fallback rows of ADR-0045's table). A block over the window
 /// is never completed from `/proc`: that read is not exec-time, and a process can rewrite its
 /// argument region before it (ADR-0045, Consequences).

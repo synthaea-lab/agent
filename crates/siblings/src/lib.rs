@@ -1,12 +1,16 @@
-//! Test support for cross-repo contract tests: find the sibling repos of the umbrella
-//! checkout this workspace lives in.
+//! Test support for cross-repo contract tests: find the sibling checkouts of the
+//! public Synthaea repos next to this workspace.
 //!
-//! The agent is one repo among siblings checked out side by side by the umbrella repo:
+//! The public repos that test against each other (`synthaea-lab/agent`, `server`,
+//! `ml`, `rules`, `scenarios`) are cloned side by side in one directory:
 //!
 //! ```text
-//! <umbrella>/
-//!   agent/   this workspace
-//!   server/  ml/  rules/  lab/  docs/
+//! <SYNTHAEA_ROOT>/
+//!   agent/      this workspace (synthaea-lab/agent)
+//!   server/     synthaea-lab/server
+//!   ml/         synthaea-lab/ml
+//!   rules/      synthaea-lab/rules
+//!   scenarios/  synthaea-lab/scenarios (attack scenarios; no contract test reads it yet)
 //! ```
 //!
 //! A contract test whose other half lives in a sibling (a golden fixture the server
@@ -26,7 +30,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Environment variable naming the umbrella directory that holds the sibling repos.
+/// Environment variable naming the directory that holds the sibling checkouts.
 /// Unset or empty: the parent directory of this workspace.
 pub const ROOT_ENV: &str = "SYNTHAEA_ROOT";
 
@@ -34,7 +38,7 @@ pub const ROOT_ENV: &str = "SYNTHAEA_ROOT";
 /// instead of a skip.
 pub const REQUIRE_ENV: &str = "SYNTHAEA_REQUIRE_SIBLINGS";
 
-/// The umbrella directory the sibling repos are checked out in: `$SYNTHAEA_ROOT` when
+/// The directory the sibling repos are checked out in: `$SYNTHAEA_ROOT` when
 /// set and non-empty, else the parent directory of this workspace. Canonicalized when
 /// the directory exists, returned as-is otherwise.
 #[must_use]
@@ -147,7 +151,7 @@ macro_rules! require_path {
 fn root_from(env: Option<OsString>) -> PathBuf {
     let root = match env {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        // agent/crates/siblings -> agent/crates -> agent -> <umbrella>
+        // agent/crates/siblings -> agent/crates -> agent -> <SYNTHAEA_ROOT>
         _ => Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.."),
     };
     root.canonicalize().unwrap_or(root)
@@ -163,7 +167,8 @@ fn is_required(env: Option<OsString>) -> bool {
 
 fn skip_message(repo: &str, rel: &str) -> String {
     format!(
-        "skipped: needs sibling repo `{repo}` ({}); check it out via the umbrella or set {ROOT_ENV}",
+        "skipped: needs sibling repo `{repo}` ({}); check out synthaea-lab/{repo} next to \
+         this repo as {repo}/ or set {ROOT_ENV}",
         expected_path(repo, rel).display()
     )
 }
@@ -182,7 +187,7 @@ mod tests {
 
     #[test]
     fn an_explicit_root_wins_and_is_kept_as_is_when_it_does_not_exist() {
-        let missing = PathBuf::from("/nonexistent/synthaea-umbrella");
+        let missing = PathBuf::from("/nonexistent/synthaea-siblings");
         assert_eq!(root_from(Some(missing.clone().into())), missing);
     }
 
@@ -216,6 +221,7 @@ mod tests {
                     .join("x.jsonl")
             )
         );
+        assert!(message.contains("check out synthaea-lab/ml next to this repo as ml/"));
         assert!(message.ends_with("set SYNTHAEA_ROOT"));
     }
 }

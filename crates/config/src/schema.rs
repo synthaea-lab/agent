@@ -1,11 +1,9 @@
 //! Types describing what the on-disk `agent.toml` file carries.
 //!
-//! Every field mirrors an [`ADR-0013`] decision or an obvious operational
+//! Every field mirrors an ADR-0013 decision or an obvious operational
 //! setting. The struct layout **is** the file format — a new field is a
 //! schema-visible change; a rename is a breaking change that requires a
 //! [`SCHEMA_VERSION`] bump.
-//!
-//! [`ADR-0013`]: ../../../docs/adr/0013-agent-local-configuration.md
 //!
 //! ## Absent-field policy
 //!
@@ -22,8 +20,8 @@ use serde::Deserialize;
 
 use crate::secret::SecretRef;
 
-/// The schema version this build understands. See ADR-0013 §Deferred on
-/// versioning. Bump only on a breaking change; additive fields with
+/// The schema version this build understands; a mismatching file fails the load
+/// rather than being half-read (ADR-0013). Bump only on a breaking change; additive fields with
 /// `#[serde(default)]` do not require a bump.
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -68,7 +66,7 @@ pub struct AgentConfig {
     pub detection: DetectionConfig,
 }
 
-/// The `[detection]` table (#376): what the operator knows about this host that no event
+/// The `[detection]` table (<https://github.com/synthaea-lab/agent/issues/17>): what the operator knows about this host that no event
 /// carries.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -76,18 +74,18 @@ pub struct DetectionConfig {
     /// The host's local time as minutes east of UTC (`120` for UTC+2, `-300` for UTC-5),
     /// between -720 and 840. Events carry UTC only, so the ODD-HOUR-LOGON rule (T1078) needs the
     /// host's local time: the agent asks the platform's time zone (daylight saving included,
-    /// #1088) and this setting **overrides** it, for a host whose zone is wrong or absent.
+    /// <https://github.com/synthaea-lab/agent/issues/15>) and this setting **overrides** it, for a host whose zone is wrong or absent.
     /// Fixed: it does not follow daylight saving, so set the offset the host is on for most of
     /// the year, or change it when the clocks do. Absent by default.
     #[serde(default)]
     pub utc_offset_minutes: Option<i32>,
-    /// The local hours `[start, end)` in which a logon is ordinary, for ODD-HOUR-LOGON (#1089):
+    /// The local hours `[start, end)` in which a logon is ordinary, for ODD-HOUR-LOGON (<https://github.com/synthaea-lab/agent/issues/64>):
     /// `[7, 20]` is the default. `start` is 0 to 23, `end` 1 to 24, and they differ. `start`
     /// greater than `end` is an overnight window (`[22, 6]` is a night shift: 22:00 to 06:00
     /// is ordinary and the day is not). Absent by default.
     #[serde(default)]
     pub work_hours: Option<[u32; 2]>,
-    /// Accounts whose odd-hour logons are expected, for ODD-HOUR-LOGON (#1089): on-call staff,
+    /// Accounts whose odd-hour logons are expected, for ODD-HOUR-LOGON (<https://github.com/synthaea-lab/agent/issues/64>): on-call staff,
     /// and the service or batch account of a schedule. Each entry is `NAME` or `NAME|SID`.
     /// `NAME` is matched against the account **as the logon reports it**, case aside. The
     /// Windows logon event (4624) reports the bare `TargetUserName` with no domain, so a bare

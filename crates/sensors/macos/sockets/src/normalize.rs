@@ -42,7 +42,7 @@ pub fn listen_port_event(entry: &SocketSnapshotEntry, timestamp_ns: u64) -> Opti
         },
         local_addr: entry.local.ip(),
         local_port: entry.local.port(),
-        protocol: schema::IPPROTO_TCP, // libproc TCP snapshot only, today (issue #676)
+        protocol: schema::IPPROTO_TCP, // libproc TCP snapshot only, today (https://github.com/synthaea-lab/agent/issues/40)
     }))
 }
 

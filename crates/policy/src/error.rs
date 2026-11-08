@@ -59,11 +59,9 @@ pub enum PolicyError {
     },
 
     /// An override document contains a partial version of a sub-object
-    /// that [ADR-0011] declared safety-critical (present in the hardcoded
+    /// that ADR-0011 declared safety-critical (present in the hardcoded
     /// [`crate::SAFETY_CRITICAL_PATHS`] list). The override is refused at
     /// parse time; the agent keeps its current effective policy.
-    ///
-    /// [ADR-0011]: ../../../docs/adr/0011-policy-override-granularity.md
     #[error(
         "safety-critical sub-object `{path}` in an override is incomplete: \
          missing field(s) {missing:?}. A safety-critical sub-object must be \

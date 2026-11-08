@@ -27,7 +27,7 @@ ring = "0.17"
 rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 
 [dev-dependencies]
-# Cross-repo contract fixtures (the umbrella's sibling repos), skipped when absent.
+# Cross-repo contract fixtures (sibling checkouts of the other public repos), skipped when absent.
 siblings = { path = "../siblings" }
 tempfile = "3"
 

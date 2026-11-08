@@ -1,4 +1,4 @@
-//! FIRST-SEEN-LOGON (T1078, #376): the baseline of accounts that have logged on to this host.
+//! FIRST-SEEN-LOGON (T1078, <https://github.com/synthaea-lab/agent/issues/17>): the baseline of accounts that have logged on to this host.
 //!
 //! The rule itself is [`crate::RuleState::check_first_seen_logon`]; this module holds the
 //! generic-account list and the bounded baseline it reads.

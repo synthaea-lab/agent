@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Provisioning for the lab's Linux VMs (Debian/RPM matrix, x86_64 or arm64):
+# Provisioning for Linux build/test machines (Debian/RPM matrix, x86_64 or arm64):
 # Rust + eBPF toolchain for building the agent and probes, plus the packages the
-# lab/scenarios/ scripts need. Provider-neutral — run by any harness (Vagrant
+# lab's attack scenarios need. Provider-neutral — run by any harness (Vagrant
 # shell provisioner, ssh, cloud-init). Idempotent: rerunnable via
 # `vagrant provision <machine>` or a plain re-run.
 #
 # bpf-linker comes from the upstream musl-static release (bundled LLVM matching
 # recent rustc nightly). If that download fails the script CONTINUES with a
-# warning — the VM is then replay-only (run scenarios against a binary built
-# elsewhere), matching the replay-only rows in lab/MATRIX.md.
+# warning — the machine is then replay-only (run scenarios against a binary
+# built elsewhere).
 set -euo pipefail
 
 # sudo does not propagate the environment: pass DEBIAN_FRONTEND explicitly,
@@ -172,4 +172,4 @@ for tool in bindgen aya-tool bpf-linker; do
 done
 
 echo "== Done =="
-echo "Source synced into /synthaea — see lab/vagrant/README.md for the build."
+echo "Toolchain ready: build the agent from the source tree (cargo build --release)."

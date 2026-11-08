@@ -51,9 +51,9 @@ ldd target/release/deps/ml-* | grep -i onnx  # Should return nothing
 #### Windows (MSVC)
 
 ```powershell
-.\lab\provisioning\build-onnxruntime-static.ps1
+.\toolchain\build-onnxruntime-static.ps1
 $env:ORT_LIB_LOCATION = "$PWD\onnxruntime\build\Windows\Release\Release"
-.\lab\provisioning\ort-static-link-flags.ps1 | Invoke-Expression
+.\toolchain\ort-static-link-flags.ps1 | Invoke-Expression
 cargo test -j 1 -p ml --release --no-default-features
 python tools\check-pe-imports.py target\release\deps\ml-*.exe   # no onnxruntime/directml/d3d12
 ```

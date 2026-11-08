@@ -213,8 +213,8 @@ fn respawn_connect_alerts() {
 
 /// Reproduces a real respawn (fork+exec): a new pid on each iteration, same
 /// (ppid, comm) — unlike `respawn_connect_alerts` above, which artificially reuses
-/// the same pid for the 3 execs. See lab/scenarios/respawn-beacon.sh, which
-/// documented the hypothesis that a per-pid rule would never trigger in this case.
+/// the same pid for the 3 execs. The lab's respawn-beacon scenario documented the
+/// hypothesis that a per-pid rule would never trigger in this case.
 #[test]
 fn respawn_connect_distinct_pids_alerts() {
     let mut engine = CorrelationEngine::new();

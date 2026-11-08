@@ -58,7 +58,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 getrandom = "0.4"
 
-# `commands::localzone` asks the platform for the host's time zone (#1088): platform code stays
+# `commands::localzone` asks the platform for the host's time zone (https://github.com/synthaea-lab/agent/issues/15): platform code stays
 # in the binary, not in the detection crates.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -99,7 +99,7 @@ sensor-linux-lsm = { path = "../crates/sensors/linux/lsm" }
 aya = { version = "0.16", default-features = false }
 
 [dev-dependencies]
-# Cross-repo contract fixtures (the umbrella's sibling repos), skipped when absent.
+# Cross-repo contract fixtures (sibling checkouts of the other public repos), skipped when absent.
 siblings = { path = "../crates/siblings" }
 tempfile = "3"
 proptest = "1"

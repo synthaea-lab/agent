@@ -66,7 +66,7 @@ pub(crate) fn plant_canaries(
     }
 }
 
-/// Hands the rules the host's local time, which turns ODD-HOUR-LOGON on (#376, #1088): the
+/// Hands the rules the host's local time, which turns ODD-HOUR-LOGON on (<https://github.com/synthaea-lab/agent/issues/17>, <https://github.com/synthaea-lab/agent/issues/15>): the
 /// platform's time zone when the host names one (daylight saving followed), and the operator's
 /// `[detection] utc_offset_minutes` over it when set. An offset no timezone has is logged and
 /// ignored rather than guessed; with neither the rule stays off.
@@ -100,7 +100,7 @@ fn backslash_exempt_entries(entries: &[String]) -> Vec<usize> {
         .collect()
 }
 
-/// The operator's declared ordinary hours and exempt accounts for ODD-HOUR-LOGON (#1089);
+/// The operator's declared ordinary hours and exempt accounts for ODD-HOUR-LOGON (<https://github.com/synthaea-lab/agent/issues/64>);
 /// nothing changes for a host that declared neither.
 fn apply_odd_hour_calibration(sink: &DetectionSink, detection: &config::DetectionConfig) {
     if let Some([start, end]) = detection.work_hours {
@@ -208,7 +208,7 @@ pub(crate) fn wire_run_pipeline(
         &crate::sink::model_root(&storage.state_dir),
     )?);
     sink.start_correlator_ticker()?;
-    // The agent's own control-plane traffic is not an IOC finding (#1061), and only that
+    // The agent's own control-plane traffic is not an IOC finding (https://github.com/synthaea-lab/agent/issues/47), and only that
     // destination is: the agent's binary pointed anywhere else still raises.
     if let Some(control_plane) = &server
         && !sink.set_control_plane(control_plane.url)

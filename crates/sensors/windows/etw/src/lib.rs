@@ -26,7 +26,7 @@
 //! - **F-6** (partial): `CreateNewFile` (EID 30) joins `NameCreate` (EID 12), and
 //!   `DeletePath` (EID 26) is kept for one case, a `:Zone.Identifier` stream
 //!   deletion (#442); full delete/rename semantics land with the ransomware pack
-//!   (#82) / driver (#39).
+//!   (#82) / driver (<https://github.com/synthaea-lab/agent/issues/27>).
 //! - **F-7**: IPv6 connects (EID 58/26) are first-class, and a short dedup window
 //!   prevents Connect+Send double-counting.
 //!
@@ -45,13 +45,13 @@
 //! does the network I/O from its own service), Microsoft update jobs dropped
 //! — see [`bits`].
 //!
-//! Cross-process activity without a driver (#720, ADR-0026 follow-up 6): a thread started in
+//! Cross-process activity without a driver (<https://github.com/synthaea-lab/agent/issues/41>, ADR-0026 follow-up 6): a thread started in
 //! another process (Kernel-Process `ThreadStart`) as `schema::RemoteThreadEvent`, and a
 //! memory-reading open of LSASS (Kernel-Audit-API-Calls `PsOpenProcess`) as
 //! `schema::ProcessAccessEvent` — the native equivalents of Sysmon 8 and 10. The filters
 //! live in `cross_process`.
 //!
-//! Container attribution (#371): a process in a process-isolated container
+//! Container attribution (<https://github.com/synthaea-lab/agent/issues/39>): a process in a process-isolated container
 //! (a server silo) carries `EventMeta::container`, its id named by the Host
 //! Compute Service — see `silo`. Hyper-V-isolated containers run their own
 //! kernel and are invisible to this sensor by design.

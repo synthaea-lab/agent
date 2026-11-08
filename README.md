@@ -1,9 +1,12 @@
 # Synthaea
 
-> Part of the Synthaea umbrella ([synthaea-lab/edr](https://github.com/synthaea-lab/edr)),
-> checked out at `<umbrella>/agent`. This repo is the Rust agent workspace; the control
-> plane, ML pipeline, detection content and test lab are sibling repos. Contract tests that
-> read a sibling skip when it is absent (see `crates/siblings`).
+> This repo is the Rust agent workspace. The control plane
+> ([synthaea-lab/server](https://github.com/synthaea-lab/server)), the ML pipeline
+> ([synthaea-lab/ml](https://github.com/synthaea-lab/ml)) and the detection content
+> ([synthaea-lab/rules](https://github.com/synthaea-lab/rules)) and the attack scenarios
+> ([synthaea-lab/scenarios](https://github.com/synthaea-lab/scenarios)) are separate public
+> repos. Contract tests that read one of them skip when it is not checked out next to this
+> repo (see [Sibling checkouts](#sibling-checkouts)).
 
 **An open-source, truly multi-platform EDR/XDR with on-device ML detection.**
 
@@ -11,8 +14,8 @@
 > pipeline runs end to end on real kernel telemetry — eBPF probes accepted by the
 > verifier, events normalized, four detection engines evaluating, alerts firing on
 > live attack scenarios in the lab, watchdog surviving SIGKILL. The remaining
-> platforms, the control plane, and the fleet features are structured, issue-tracked,
-> and dependency-ordered in **[docs/roadmap.md](docs/roadmap.md)**.
+> platforms, the control plane, and the fleet features are structured and
+> issue-tracked.
 
 ## Goals
 
@@ -29,13 +32,14 @@
 
 ## The detection stack
 
-Ten layers of defense in depth, mapped one-to-one to components in
-**[docs/detection/layers.md](docs/detection/layers.md)**: signatures/hashes → static
+Ten layers of defense in depth, mapped one-to-one to components: signatures/hashes → static
 ML → behavioral rules → behavioral ML → prevalence → attack-chain correlation →
 cross-endpoint correlation → identity/network/cloud → threat intel → human/MDR.
 Layers 1–4 and 6 run on-device (milliseconds, works offline); the rest is where the
 control plane earns its keep — including **retrospective detection**: new intel
 replayed over the telemetry lake, turning yesterday's unknown into today's case.
+The techniques with named detection content today are listed in
+[docs/attack-coverage.md](docs/attack-coverage.md) (generated, CI-checked).
 
 ## Architecture
 
@@ -90,8 +94,8 @@ is skeletoned with its design recorded in place and an issue per component.
   every shipped rule must compile *and* fire on a crafted sample (this pipeline has
   already caught a rule that was silently dead in the previous iteration).
 - **Honest engineering as a feature** — capability matrices generated from
-  conformance runs, telemetry-source inventory with *rejected-with-reason* entries
-  (`docs/sensors/sources.md`), observable loss counters on every bounded buffer,
+  conformance runs, telemetry-source inventory with *rejected-with-reason* entries,
+  observable loss counters on every bounded buffer,
   model cards required before any model ships, and ADRs for every locked decision.
 
 ## Repository layout
@@ -99,24 +103,41 @@ is skeletoned with its design recorded in place and an issue per component.
 | Path | Purpose |
 | --- | --- |
 | `crates/` | The agent's Rust modules — full table in [crates/README.md](crates/README.md) |
-| `crates/sensors/` | Platform sensors by mechanism — [coverage matrices](crates/sensors/README.md), [source inventory](docs/sensors/sources.md) |
+| `crates/sensors/` | Platform sensors by mechanism — [coverage matrices](crates/sensors/README.md) |
 | `agent/` · `watchdog/` · `cli/` | The agent binaries |
-| `server/` | Control plane — [module table](server/README.md) |
 | `ui/` | Endpoint tray/notifications (unprivileged ipc client) |
-| `packaging/` | MSI · notarized pkg · deb/rpm + service integration |
-| `ml/` | The ML space — datasets, training, calibration, evaluation, registry |
-| `rules/` | Detection content (Sigma, YARA) — CI-enforced |
-| `docs/` | Specification, [detection stack](docs/detection/layers.md), [roadmap](docs/roadmap.md), ADRs |
-| `lab/` | Machine matrix, provisioning, attack scenarios |
+| `packaging/` | MSI · notarized pkg · deb/rpm/apk + service integration |
+| `toolchain/` | Build-machine toolchain scripts (eBPF, ONNX Runtime) |
+| `docs/` | Generated [ATT&CK coverage matrix](docs/attack-coverage.md) |
 | `tools/` | check-deps and developer tooling |
 
 ## Building
 
 `cargo check` / `cargo test` build the default members on any OS (toolchain pinned).
 CI enforces fmt, dependency direction, cargo-deny, clippy `-D warnings`, and tests on
-Linux/Windows/macOS, plus content and ML pipelines. The eBPF probes build on a lab
-machine via `toolchain/`; the sibling `lab` repo (`../lab/vagrant/` in the umbrella) boots the
-validation matrix.
+Linux/Windows/macOS, plus the detection-content suites. The eBPF probes build on a
+Linux build machine provisioned with `toolchain/linux-toolchain.sh` (or the Alpine/Arch
+variants).
+
+### Sibling checkouts
+
+The public repos that test against each other are cloned side by side in one
+directory:
+
+```
+synthaea/
+  agent/      synthaea-lab/agent (this repo)
+  server/     synthaea-lab/server
+  ml/         synthaea-lab/ml
+  rules/      synthaea-lab/rules
+  scenarios/  synthaea-lab/scenarios (attack scenarios, optional)
+```
+
+Cross-repo contract tests (golden fixtures from `server/` and `ml/`, the shipped content
+in `rules/`) read the siblings through `crates/siblings`. `SYNTHAEA_ROOT` points at the
+directory holding them (default: this repo's parent); a missing sibling skips the test
+with one `skipped: ...` line, and `SYNTHAEA_REQUIRE_SIBLINGS=1` (set in CI) turns that
+skip into a failure. Everything else builds and tests with this repo alone.
 
 ## License
 

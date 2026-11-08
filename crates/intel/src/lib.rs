@@ -23,7 +23,7 @@
 //! stopping readers. The memory budget is enforced when a set is built. Domains (the second
 //! slice) match the listed name and every name beneath it, on label boundaries only, in at most
 //! [`MAX_DOMAIN_PROBES`] searches. Not here yet: wiring into the agent, signed delivery of sets,
-//! and the server-side feed pipeline. See ADR-0038.
+//! and the server-side feed pipeline (ADR-0038).
 
 mod engine;
 mod filter;

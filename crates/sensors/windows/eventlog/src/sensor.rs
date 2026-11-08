@@ -252,7 +252,7 @@ fn persistence_file_open(pid: u32, comm: String, path: String, flags: u32) -> Ev
             user: User::Unknown,
             timestamp_ns: now_ns(),
             comm,
-            container: None, // attributed by the ETW sensor only (#371)
+            container: None, // attributed by the ETW sensor only (https://github.com/synthaea-lab/agent/issues/39)
             process_generation: None,
             parent_process_generation: None,
         },
@@ -497,7 +497,7 @@ fn to_auth_event(logon: &LogonEvent) -> Option<Event> {
             user,
             timestamp_ns: logon.time_created_ns.unwrap_or_else(now_ns),
             comm: LSASS_COMM.to_string(),
-            container: None, // attributed by the ETW sensor only (#371)
+            container: None, // attributed by the ETW sensor only (https://github.com/synthaea-lab/agent/issues/39)
             process_generation: None,
             parent_process_generation: None,
         },
@@ -637,7 +637,7 @@ fn normalize_applocker_block(block: &str) -> ParsedBlock {
             user,
             timestamp_ns: now_ns(),
             comm: String::new(),
-            container: None, // attributed by the ETW sensor only (#371)
+            container: None, // attributed by the ETW sensor only (https://github.com/synthaea-lab/agent/issues/39)
             process_generation: None,
             parent_process_generation: None,
         },
@@ -861,7 +861,7 @@ fn defender_base(kind: DefenderEventKind) -> DefenderEvent {
             user: User::Unknown,
             timestamp_ns: now_ns(),
             comm: String::new(),
-            container: None, // attributed by the ETW sensor only (#371)
+            container: None, // attributed by the ETW sensor only (https://github.com/synthaea-lab/agent/issues/39)
             process_generation: None,
             parent_process_generation: None,
         },
@@ -1011,7 +1011,7 @@ fn normalize_wdac_block(block: &str) -> ParsedBlock {
             user: User::Unknown,
             timestamp_ns: now_ns(),
             comm: String::new(),
-            container: None, // attributed by the ETW sensor only (#371)
+            container: None, // attributed by the ETW sensor only (https://github.com/synthaea-lab/agent/issues/39)
             process_generation: None,
             parent_process_generation: None,
         },
@@ -1073,7 +1073,7 @@ fn session_event(ev: xml::TerminalSessionEvent, state: SessionState) -> Event {
             user: User::Unknown,
             timestamp_ns: ev.time_created_ns.unwrap_or_else(now_ns),
             comm: String::new(),
-            container: None, // attributed by the ETW sensor only (#371)
+            container: None, // attributed by the ETW sensor only (https://github.com/synthaea-lab/agent/issues/39)
             process_generation: None,
             parent_process_generation: None,
         },
@@ -1289,8 +1289,7 @@ static KERBEROS_DELEGATION_FAILURES: PollTarget = PollTarget {
 // `sensor-*` crates may depend only on `schema` (`tools/check-deps.py`), so
 // this sensor cannot read `policy::EventLogPolicy` itself — the agent binary
 // (unrestricted deps) reads that type and converts it into this crate's own
-// `EventLogConfig` when constructing the sensor. See
-// `docs/adr/0006-eventlog-channel-allowlist-and-volume-counters.md`.
+// `EventLogConfig` when constructing the sensor (ADR-0006).
 
 /// Which of this sensor's three independent poll targets are active. A
 /// disabled group is never even queried — not filtered after the fact — so a
@@ -1314,9 +1313,8 @@ static KERBEROS_DELEGATION_FAILURES: PollTarget = PollTarget {
 ///
 /// The default is [`Polling`](EventLogTransport::Polling): opt-in for
 /// `Subscribe` at the config layer, so a deployment picks it host-by-host
-/// after validation rather than the whole fleet flipping on merge. See
-/// `docs/adr/0004-windows-persistence-detection-via-eventlog-polling.md` for
-/// the original polling-vs-subscribe investigation.
+/// after validation rather than the whole fleet flipping on merge. Polling was the
+/// original transport (ADR-0004).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventLogTransport {
     /// Default `EvtQuery` poll loop, one thread per enabled target.

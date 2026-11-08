@@ -1,6 +1,5 @@
 //! Maps [`JournalEvent`]s into [`schema::AuthEvent`] — the shared logon/session
-//! shape Windows Security-log logons also normalize into (issue #94,
-//! `docs/adr/0005-windows-logon-events-shared-auth-event-type.md`). Deliberately
+//! shape Windows Security-log logons also normalize into (ADR-0005). Deliberately
 //! narrow, mirroring `sensor-windows-eventlog`'s own discipline (see its
 //! `sensor.rs`): a category with a field this mapping needs but can't extract is
 //! skipped (`None`) rather than fabricated.

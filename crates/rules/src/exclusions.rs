@@ -73,7 +73,7 @@ pub(crate) const MEMFD_EXEC_WINDOW_NS: u64 = 5_000_000_000; // 5s
 pub(crate) const QUARANTINE_EXEC_WINDOW_NS: u64 = 600_000_000_000; // 10 min
 
 /// Quarantine agents that are a mail client, for the T1566.001 tag on the
-/// provenance join ([`crate::RuleState`]'s `check_quarantined_exec`, #376).
+/// provenance join ([`crate::RuleState`]'s `check_quarantined_exec`, <https://github.com/synthaea-lab/agent/issues/17>).
 /// Apple Mail is listed on its expected quarantine string, **not on a capture**:
 /// it is expected to record itself as `Mail` in the `com.apple.quarantine`
 /// agent field, but no `xattr -p com.apple.quarantine` of a saved attachment
@@ -632,14 +632,14 @@ pub(crate) const EGRESS_DOMAIN_BROWSER_COMMS: &[&str] = &[
     "vivaldi",
 ];
 
-/// FIRST-SEEN-LOGON (T1078, #376): how long after its first successful logon the rule state
+/// FIRST-SEEN-LOGON (T1078, <https://github.com/synthaea-lab/agent/issues/17>): how long after its first successful logon the rule state
 /// only learns accounts. **Provisional**: 24 hours is one working day, long enough for the
 /// accounts that log on to a host in an ordinary day to be in the baseline, with no
 /// measurement behind it. The baseline is in memory only, so an agent restart begins a new
 /// learning window.
 pub(crate) const LOGON_LEARNING_NS: u64 = 86_400_000_000_000; // 24 h
 
-/// ODD-HOUR-LOGON (T1078, #376): the local hours `[start, end)` in which a logon is ordinary.
+/// ODD-HOUR-LOGON (T1078, <https://github.com/synthaea-lab/agent/issues/17>): the local hours `[start, end)` in which a logon is ordinary.
 /// The default window. **Provisional**: 07:00 to 20:00 is a plain working day, with no measurement
 /// behind it and no notion of weekends. An operator declares another window (`[detection]
 /// work_hours`, a night shift wraps midnight) and names accounts whose odd-hour logons are

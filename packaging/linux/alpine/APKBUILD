@@ -4,7 +4,7 @@ pkgname=synthaea-agent
 pkgver=0.1.0
 pkgrel=0
 pkgdesc="Synthaea EDR Agent - on-device eBPF detection and response"
-url="https://github.com/synthaea-lab/edr"
+url="https://github.com/synthaea-lab/agent"
 # Static-musl build, same constraint as packaging/linux/build-deb.sh (the
 # ONNX Runtime static-link flag discovery is written against that host).
 arch="x86_64"
@@ -14,7 +14,7 @@ license="Apache-2.0"
 # openrc>=0.45: synthaea-agent.initd's `capabilities=` directive (ambient
 # capabilities via supervise-daemon, the OpenRC equivalent of the systemd
 # unit's AmbientCapabilities=) needs that version or later. Every Alpine
-# release this package targets (3.19+, see lab/MATRIX.md) ships well above
+# release this package targets (3.19+) ships well above
 # it — this is a floor, not expected to bind — but it documents the
 # assumption instead of failing silently on an ancient host. No
 # libcap-utils/setcap: dropped in favor of that directive (review finding —

@@ -362,7 +362,7 @@ fn a_reexec_to_an_untrusted_image_clears_the_service_main_entry() {
     );
 }
 
-// ── Login session provenance (issue #1142) ─────────────────────────────────
+// ── Login session provenance (https://github.com/synthaea-lab/agent/issues/50) ─────────────────────────────────
 
 /// An exec of `image` whose parent the sensor resolved as running `parent_image`.
 fn exec_under(pid: u32, ppid: u32, comm: &str, image: &str, parent_image: Option<&str>) -> Event {
@@ -375,7 +375,7 @@ fn exec_under(pid: u32, ppid: u32, comm: &str, image: &str, parent_image: Option
 
 /// The per-connection `[priv]` process the `sshd` listener (pid 900) execs, at
 /// Alpine's paths (OpenSSH 10). The listener's own exec is never sent: it starts at
-/// boot, before the agent, as in the e2e run #1142 came from.
+/// boot, before the agent, as in the e2e run <https://github.com/synthaea-lab/agent/issues/50> came from.
 fn sshd_session(pid: u32) -> Event {
     exec_under(
         pid,
@@ -388,7 +388,7 @@ fn sshd_session(pid: u32) -> Event {
 
 #[test]
 fn the_sshd_session_holding_a_login_is_shielded_from_a_bayes_only_kill() {
-    // What #1142 observed: `sshd-session` pids under a listener that predates the
+    // What https://github.com/synthaea-lab/agent/issues/50 observed: `sshd-session` pids under a listener that predates the
     // agent crossed BAYES.
     let mut engine = CorrelationEngine::new();
     engine.on_event(sshd_session(901));

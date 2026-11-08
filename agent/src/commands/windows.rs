@@ -64,7 +64,7 @@ fn seeded_rule_state() -> rules::RuleState {
     // baseline, not a finding. Best-effort — a snapshot failure leaves the
     // baseline empty rather than failing startup.
     //
-    // TCP listeners and UDP sockets on a fixed port (#676): the UDP client
+    // TCP listeners and UDP sockets on a fixed port (https://github.com/synthaea-lab/agent/issues/40): the UDP client
     // sockets on ephemeral ports are left out by the sensor, the same filter
     // the poller reads through, so the baseline and the polls agree.
     match sensor_windows_sockets::snapshot_for_drift() {
@@ -152,7 +152,7 @@ impl EventSink for SharedSink {
 /// crate from depending on the other (`sensor-*` crates depend only on
 /// `schema`; `policy` depends only on `schema` too) — the binary is the one
 /// place both types are in scope, so it is the one place allowed to bridge
-/// them. See `docs/adr/0006-eventlog-channel-allowlist-and-volume-counters.md`.
+/// them (ADR-0006).
 fn eventlog_config(policy: &policy::EventLogPolicy) -> sensor_windows_eventlog::EventLogConfig {
     sensor_windows_eventlog::EventLogConfig {
         // Not yet policy-configurable (issue #322 v1): the transport defaults

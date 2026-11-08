@@ -10,9 +10,7 @@
 //!   1149 (#285, see the section below)
 //!
 //! Implements three persistence detections, ported from a spike validated
-//! end-to-end on a real Windows VM (see
-//! `docs/adr/0004-windows-persistence-detection-via-eventlog-polling.md` for the
-//! full investigation and rationale — summary below), plus logon/session-event
+//! end-to-end on a real Windows VM (ADR-0004; summary below), plus logon/session-event
 //! normalization:
 //!
 //! - **T1543.003** — Create or Modify System Process: Windows Service. System log,
@@ -34,7 +32,7 @@
 //!   classic RunAs/lateral-movement signal), and **4672** (special privileges
 //!   assigned to a new logon), normalized into `schema::Event::Auth` — the same
 //!   shape `sensor-linux-journal` (not yet implemented) is meant to emit its own
-//!   auth events as, per `docs/adr/0005-windows-logon-events-shared-auth-event-type.md`.
+//!   auth events as (ADR-0005).
 //!   Unlike the two persistence detections above, the field names this module
 //!   parses have not yet been reconciled against a real lab-VM capture — see
 //!   `xml::LogonEvent`'s doc before relying on this in production.
@@ -106,8 +104,7 @@
 //! Logon events are different: `schema::Event::Auth` is a real, dedicated
 //! variant (schema version bumped for #94) rather than another reuse of
 //! `FileOpenEvent` — deliberately, since it is meant to be shared with a future
-//! Linux sensor rather than staying Windows-only stopgap plumbing. See
-//! `docs/adr/0005-windows-logon-events-shared-auth-event-type.md`.
+//! Linux sensor rather than staying Windows-only stopgap plumbing (ADR-0005).
 //!
 //! ## Additional detection channels (#283)
 //!
@@ -215,7 +212,7 @@
 //! `policy` (`sensor-*` crates depend only on `schema` —
 //! `tools/check-deps.py`), so `EventLogConfig` is this crate's own type; the
 //! `agent` binary converts `policy::EventLogPolicy` into it at construction
-//! time. See `docs/adr/0006-eventlog-channel-allowlist-and-volume-counters.md`.
+//! time (ADR-0006).
 
 pub mod xml;
 

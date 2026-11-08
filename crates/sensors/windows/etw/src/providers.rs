@@ -70,7 +70,7 @@ const NTLM_GUID: &str = "ac43300d-5fcc-4800-8e99-1bd3f85f0320";
 const SMB_CLIENT_GUID: &str = "988C59C5-0A1C-45B6-A555-0C62276E327D";
 /// Microsoft-Windows-Bits-Client (EIDs 16403/4/5/61 — BITS jobs, #284)
 const BITS_CLIENT_GUID: &str = "EF1CC15B-46C1-414E-BB95-E76B077BD51E";
-/// Microsoft-Windows-Kernel-Audit-API-Calls (EID 5 `PsOpenProcess`, #720). The manifest
+/// Microsoft-Windows-Kernel-Audit-API-Calls (EID 5 `PsOpenProcess`, <https://github.com/synthaea-lab/agent/issues/41>). The manifest
 /// declares no keywords, so every id arrives and the callback keeps 5.
 const KERNEL_AUDIT_API_GUID: &str = "E02A841C-75A3-4FA7-AFC8-AE09CF9B7F23";
 /// Kernel-Audit-API-Calls `PsOpenProcess`: `TargetProcessId`, `DesiredAccess`,
@@ -103,10 +103,10 @@ fn sequence_number(parser: &Parser, field: &str) -> Option<u64> {
 }
 
 /// Kernel-Process keywords the sensor reads: `WINEVENT_KEYWORD_PROCESS` (0x10,
-/// EIDs 1/2), `WINEVENT_KEYWORD_THREAD` (0x20, EID 3 for remote threads, #720),
+/// EIDs 1/2), `WINEVENT_KEYWORD_THREAD` (0x20, EID 3 for remote threads, <https://github.com/synthaea-lab/agent/issues/41>),
 /// `WINEVENT_KEYWORD_IMAGE` (0x40, EID 5) and `WINEVENT_KEYWORD_JOB_SILO` (0x4000, the
-/// server silo EIDs 23-26, #371). Left unset, ferrisetw enables every keyword. #726 had
-/// taken THREAD out when nothing read thread starts; #720 reads them, and the thread
+/// server silo EIDs 23-26, <https://github.com/synthaea-lab/agent/issues/39>). Left unset, ferrisetw enables every keyword. #726 had
+/// taken THREAD out when nothing read thread starts; <https://github.com/synthaea-lab/agent/issues/41> reads them, and the thread
 /// stops (EID 4) the keyword brings along are dropped on their id before any parsing
 /// (#715: 55 to 71 starts per second on an idle host).
 const KERNEL_PROCESS_KEYWORDS: u64 = 0x10 | 0x20 | 0x40 | 0x4000;
@@ -122,9 +122,9 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         let eid = record.event_id();
         // 1=ProcessStart (new spawn → ExecEvent), 2=ProcessEnd (prune the store —
         // PID recycling), 5=ImageLoad (DLL/EXE mapped into a process), 23-26=server
-        // silo create/terminate callbacks (#371). Processes already running come from
+        // silo create/terminate callbacks (https://github.com/synthaea-lab/agent/issues/39). Processes already running come from
         // the pid-store seed, not from a rundown (that would be EID 15). 3=ThreadStart,
-        // for a thread started in another process (#720); its sibling 4=ThreadStop is
+        // for a thread started in another process (https://github.com/synthaea-lab/agent/issues/41); its sibling 4=ThreadStop is
         // dropped here.
         if !matches!(eid, 1 | 2 | 5 | THREAD_START | 23..=26) {
             return;
@@ -153,7 +153,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         }
 
         if eid >= 23 {
-            // #371: a server silo is created or torn down, so whichever
+            // https://github.com/synthaea-lab/agent/issues/39: a server silo is created or torn down, so whichever
             // container its id named is stale.
             if let Ok(silo) = parser.try_parse::<u32>("Job ID") {
                 state.silos.lock().unwrap().forget(silo);
@@ -193,7 +193,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             .unwrap_or_else(|_| String::from("<unknown>"));
         let image_path = state.normalize_path(&raw_image);
         let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
-        // #720: the initial thread of this process is not an injection.
+        // https://github.com/synthaea-lab/agent/issues/41: the initial thread of this process is not an injection.
         state
             .threads
             .lock()
@@ -208,7 +208,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         let generation = sequence_number(&parser, "ProcessSequenceNumber");
         let parent_generation = sequence_number(&parser, "ParentProcessSequenceNumber");
 
-        // #371: read while the process most likely still runs; one already
+        // https://github.com/synthaea-lab/agent/issues/39: read while the process most likely still runs; one already
         // gone is in its parent's silo.
         let parent_silo = state.pids.lock().unwrap().silo(ppid);
         let silo = silo::exec_silo(winapi::read_server_silo_id(pid), parent_silo);
@@ -275,7 +275,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         .build()
 }
 
-/// #720: a `ProcessStart` of LSASS's image takes the tracked-LSASS slot only when the
+/// <https://github.com/synthaea-lab/agent/issues/41>: a `ProcessStart` of LSASS's image takes the tracked-LSASS slot only when the
 /// process is the system LSASS (session 0, started by wininit) and the slot is empty
 /// (#1150 review: a copy started by hand must not take it, nor end it).
 fn take_lsass_slot(
@@ -306,7 +306,7 @@ fn take_lsass_slot(
 }
 
 /// Kernel-Process 3 (`ThreadStart`): forwards a thread started in another user process
-/// as a [`RemoteThreadEvent`] (#720, the native Sysmon 8). `owner` is the record's
+/// as a [`RemoteThreadEvent`] (<https://github.com/synthaea-lab/agent/issues/41>, the native Sysmon 8). `owner` is the record's
 /// `ProcessID`, the process the thread belongs to; the creator is the header pid.
 /// [`cross_process::ThreadOrigins`] drops the own-process, kernel and initial threads;
 /// what is left is deduplicated per (creator, owner, start-address bucket) and budgeted
@@ -371,8 +371,8 @@ fn forward_remote_thread(
     }));
 }
 
-/// The full image path of `pid` (#960: what the LSASS rule decides an expected reader on;
-/// #720: LSASS's parent):
+/// The full image path of `pid` (<https://github.com/synthaea-lab/agent/issues/45>: what the LSASS rule decides an expected reader on;
+/// <https://github.com/synthaea-lab/agent/issues/41>: LSASS's parent):
 /// the pid store's when it holds a path, else a live lookup. The startup seed stores only
 /// file names (toolhelp), and a bare name is exactly what a renamed dumper controls, so it
 /// is never returned as a path.
@@ -383,7 +383,7 @@ fn full_image_path(pid: u32, state: &SharedState) -> Option<String> {
         .or_else(|| winapi::resolve_pid_live(pid).map(|path| state.normalize_path(&path)))
 }
 
-/// Opens of LSASS that can reach its memory (#720, the native Sysmon 10, T1003.001), from
+/// Opens of LSASS that can reach its memory (<https://github.com/synthaea-lab/agent/issues/41>, the native Sysmon 10, T1003.001), from
 /// Microsoft-Windows-Kernel-Audit-API-Calls EID 5 (`PsOpenProcess`). Every other id, and
 /// every open of another process, is dropped before anything else: #715 counted 280 to
 /// 330 opens per second on an idle host, about half of them with `PROCESS_VM_READ`, so
@@ -1358,7 +1358,7 @@ mod process_keyword_tests {
 
     /// Guards the constant; whether the provider really keeps ids 3 and 4 out under this
     /// mask is checked against a real session by `tests/kernel_process_keyword_mask.rs`
-    /// (`#[ignore]`, elevated; lab phase G of `lab/validate-windows-admin.ps1`).
+    /// (`#[ignore]`, elevated; run as part of the lab's elevated Windows validation).
     #[test]
     fn kernel_process_reads_process_thread_image_and_silo_events() {
         const PROCESS: u64 = 0x10;
@@ -1376,8 +1376,8 @@ mod file_keyword_tests {
     /// Guards the table's own arithmetic and that no dispatched id loses its keyword;
     /// it compares the table with literals it also contains, so it cannot tell whether
     /// the manifest really maps these ids to these keywords. That is checked against a
-    /// real session by `tests/kernel_file_keyword_mask.rs` (`#[ignore]`, elevated; lab
-    /// phase F of `lab/validate-windows-admin.ps1`).
+    /// real session by `tests/kernel_file_keyword_mask.rs` (`#[ignore]`, elevated; run
+    /// as part of the lab's elevated Windows validation).
     #[test]
     fn every_dispatched_file_event_is_enabled_by_its_keyword() {
         for (event_id, keyword) in FILE_EVENT_KEYWORDS {

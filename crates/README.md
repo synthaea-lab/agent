@@ -44,9 +44,9 @@ see `CLAUDE.md`.
 | `updater` | Agent self-update + content/model distribution client (canary rings) | skeleton | new development |
 | `conformance` | Sensor conformance suite — generates the capability matrix | skeleton | new development |
 | `tamper` | Runtime tamper protection: self-integrity, sensor-silence, protected resources | partial | new development, primitives shipped; wiring open |
-| `mesh` | Agent peer mesh: signed attestation heartbeats + heighten-only posture gossip | skeleton | new development (issue #79) |
+| `mesh` | Agent peer mesh: signed attestation heartbeats + heighten-only posture gossip | skeleton | new development (https://github.com/synthaea-lab/agent/issues/29) |
 | `deception` | Per-host canaries and decoy credentials — near-zero-FP tripwires | skeleton | new development |
-| `device-control` | Removable-media telemetry + policy-gated control (USB first) | skeleton | new development (issue #84) |
+| `device-control` | Removable-media telemetry + policy-gated control (USB first) | skeleton | new development (https://github.com/synthaea-lab/agent/issues/30) |
 | `inventory` | Diffed asset inventory: packages, services, autoruns, ports | skeleton | new development (issue #87) |
 
 The binaries live outside this folder: `agent/` (the pipeline host), `watchdog/`, and

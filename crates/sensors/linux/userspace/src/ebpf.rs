@@ -85,7 +85,7 @@ fn load_embedded(tamper_pin: Option<&std::path::Path>) -> Result<aya::Ebpf, Sens
             tracing::warn!(error = %e, "inode_setattr offsets unavailable: timestamp hook disabled");
         })
         .ok();
-    // argv at exec (#1118) is optional the same way: without the offsets the probe reads none
+    // argv at exec (https://github.com/synthaea-lab/agent/issues/48) is optional the same way: without the offsets the probe reads none
     // and the drain falls back to `/proc/<pid>/cmdline`.
     let argv = crate::btf::read_exec_argv_offsets()
         .map_err(|e| {

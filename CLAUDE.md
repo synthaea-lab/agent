@@ -4,17 +4,19 @@ Multi-platform EDR/XDR (Windows/Linux/macOS) with on-device ML. Rust agent works
 Python training pipeline (`ml/`) + control plane (`server/`: Next.js + PostgreSQL, ADR-0001).
 Everything — code, comments, docs, commits — is in **English**.
 
-The previous iteration lived in a local `old/` clone during migration (now deleted; its
-history and final working-tree translations are on github.com/synthaea-lab/edr, branch
-`pre-migration-translations` — the source for the remaining #20/#67 migrations).
+The previous iteration lived in a local `old/` clone during migration (now deleted).
 `old/...` paths in code comments are historical provenance. Docs are written fresh,
-never copied (`docs/README.md` has the index).
+never copied.
 
 ## Repository layout / siblings
 
-This repo is the agent workspace, one of several sibling repos the umbrella repo checks
-out side by side (`agent/` = this repo, `server/`, `ml/`, `rules/`, `lab/`, `docs/`).
-The ONNX Runtime and VM toolchain scripts live here under `toolchain/`.
+This repo is the agent workspace. The public repos that test against each other are
+cloned side by side in one directory as sibling checkouts: `agent/` (this repo,
+synthaea-lab/agent), `server/` (synthaea-lab/server), `ml/` (synthaea-lab/ml),
+`rules/` (synthaea-lab/rules), and `scenarios/` (synthaea-lab/scenarios, the attack
+scenarios).
+This repo must never depend on anything outside those public repos. The ONNX Runtime
+and build-machine toolchain scripts live here under `toolchain/`.
 
 - Cross-repo contract tests (golden fixtures in `server/tests/fixtures` and
   `ml/tests/fixtures`, the shipped content in `rules/`, the server's routes) read the
@@ -23,12 +25,13 @@ The ONNX Runtime and VM toolchain scripts live here under `toolchain/`.
   `skipped: needs sibling repo ...` line and return from the test. Never reach into a
   sibling by relative path or `include_str!` — the agent must build and test alone.
 - `SYNTHAEA_ROOT` points at the directory holding the siblings (default: this repo's
-  parent directory, i.e. the umbrella).
+  parent directory).
 - `SYNTHAEA_REQUIRE_SIBLINGS=1` turns every such skip into a panic; CI's `test` and
   `content` jobs check the siblings out and set it, so a contract test cannot pass by
   not running.
-- `tools/attack-coverage.py` scans this repo plus `rules/` and writes `docs/`, resolved
-  the same way; its `--check` runs in the umbrella's CI.
+- `tools/attack-coverage.py` scans this repo plus the `rules/` sibling (resolved the
+  same way) and writes `docs/attack-coverage.md` in this repo; its `--check` runs in
+  CI's `content` job. Regenerate it when a rule's ATT&CK technique changes.
 
 ## Dependency direction (enforced by `tools/check-deps.py`, run in CI)
 
@@ -79,9 +82,11 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
 - Config: TOML `agent.toml` per ADR-0013 — the agent **fails fast** on a missing or
   invalid file (`config::load`, discovery order in `crates/config`); `RUST_LOG` still
   overrides the configured log level for ad-hoc debugging.
-- Cross-cutting decisions get an ADR (`docs/adr/template.md`) at the time they're made.
+- Cross-cutting decisions get an ADR at the time they're made. ADRs are not in this
+  repo: a code comment may cite `ADR-00xx`, but must state the reason itself — never
+  "see ADR-00xx for why", never a path or link to one.
 
-## Code quality (full reference: `docs/development/code-style.md`)
+## Code quality
 
 - Curated lint bar in root `[workspace.lints]`; clippy runs `-D warnings`, so every
   listed lint is enforced: `dbg_macro`/`todo`/`unimplemented` and
@@ -122,11 +127,12 @@ New crate? Add it to the rules in `tools/check-deps.py` in the same change.
   linux target + the Windows sensor crates, tests, cargo-deny, docs). `--fast`
   skips the cross-target/docs passes; opt-in pre-push gate:
   `git config core.hooksPath tools/hooks`. CI (`ci.yml`) is the enforcement
-  again on every push and PR (#318); the gauntlet is the pre-push convenience
+  again on every push and PR; the gauntlet is the pre-push convenience
   that catches the same failures on one machine before CI does.
 - `cargo check` / `cargo test` (default members) — works on any OS; with `--workspace`, add `--exclude sensor-linux-ebpf` (bpfel target).
 - `cargo clippy --workspace --exclude sensor-linux-ebpf --all-targets -- -D warnings` — must stay clean.
 - `python3 tools/check-deps.py` — dependency direction check.
+- `python3 tools/attack-coverage.py [--check]` — regenerate / verify `docs/attack-coverage.md` (needs the `rules/` sibling).
 - `cargo +nightly fuzz run audit_parse` / `netlink_parse` — coverage-guided parser
   fuzzing (`fuzz/README.md`; workspace-excluded, needs `cargo-fuzz`).
 

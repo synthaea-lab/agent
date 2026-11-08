@@ -883,8 +883,8 @@ mod tests {
         assert_eq!(resolve_ca_cert(None, &server), None);
         // Flag only.
         assert_eq!(
-            resolve_ca_cert(ca("/lab/ca.pem"), &server),
-            ca("/lab/ca.pem")
+            resolve_ca_cert(ca("/pki/ca.pem"), &server),
+            ca("/pki/ca.pem")
         );
         // Config only.
         server.ca_cert = ca("/etc/synthaea/certs/ca.pem");
@@ -894,8 +894,8 @@ mod tests {
         );
         // Both: the flag wins.
         assert_eq!(
-            resolve_ca_cert(ca("/lab/ca.pem"), &server),
-            ca("/lab/ca.pem")
+            resolve_ca_cert(ca("/pki/ca.pem"), &server),
+            ca("/pki/ca.pem")
         );
     }
 

@@ -84,7 +84,7 @@ fn seeded_rule_state() -> rules::RuleState {
                             entry.local.port(),
                             sensor_linux_netlink::IPPROTO_TCP,
                         )
-                    }), // sock_diag TCP dump only, today (issue #676)
+                    }), // sock_diag TCP dump only, today (https://github.com/synthaea-lab/agent/issues/40)
             );
         }
         Err(e) => tracing::warn!(error = %e, "listen-port baseline: sock_diag snapshot failed"),

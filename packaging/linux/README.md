@@ -2,7 +2,6 @@
 
 This directory contains packaging infrastructure for distributing the Synthaea EDR agent on Linux distributions.
 
-**Issue:** #36
 **Status:** Complete (Debian + RPM with systemd integration)
 
 ---
@@ -130,7 +129,7 @@ ls -la /var/lib/synthaea
 
 ## Testing
 
-### Test Checklist (Issue #36 Acceptance Criteria)
+### Test Checklist
 
 **1. Fresh Installation**
 - [ ] User `synthaea` exists: `id synthaea`
@@ -188,14 +187,6 @@ Verify:
 - [ ] `/var/lib/synthaea` and `/var/log/synthaea` preserved on a plain remove, gone only after the manual full-cleanup command above
 - [ ] No residue: `systemctl list-unit-files | grep -v synthaea`
 
-**5. Lab Scenario Integration**
-```bash
-# After package install, run walking-skeleton scenario (the `lab` sibling repo)
-cd "${SYNTHAEA_ROOT:-..}/lab/scenarios"
-./beacon.sh
-cat /var/log/synthaea/alerts.ndjson | grep T1071
-```
-
 ### Test Matrix
 
 | Distribution | Version | systemd | Status |
@@ -247,7 +238,7 @@ The binaries live under `/var/lib/synthaea`, whose default type is `var_lib_t`,
 and `init_t` may not execute that type: an unlabelled install dies with
 `status=203/EXEC`, `Permission denied`. The RPM's `%post` therefore adds file-context
 rules that label the binaries `bin_t` (`semanage fcontext`, then `restorecon`); the
-service then runs as `unconfined_service_t`. A custom policy is still deferred (#112).
+service then runs as `unconfined_service_t`. A custom policy is still deferred.
 
 **Check for denials.** `ausearch` reads `/var/log/audit/audit.log`, which does not
 exist unless `auditd` runs (it does not on a default Fedora cloud image), so it
@@ -312,23 +303,21 @@ packaging/linux/
 
 ---
 
-## Future Work (Out of Scope for #36)
+## Future Work
 
 1. **Package Signing** - GPG signatures for production deployment
 2. **APT/YUM Repository** - Host packages in proper repos for `apt install synthaea-agent`
 3. **musl Static Builds** - `.tar.gz` distribution for containers
-4. **SELinux Custom Policy** - RHEL hardening (deferred to issue #112)
+4. **SELinux Custom Policy** - RHEL hardening (deferred)
 5. **Capability Management** - The unit grants a minimal ambient capability set (ADR-0014); `CAP_SYS_PTRACE`, `CAP_CHOWN`/`CAP_FOWNER` and the audit capabilities are added with the features that need them
 
 ---
 
 ## References
 
-- **Issue #36:** Packaging: Linux (deb/rpm + systemd)
 - **CLAUDE.md:** Project conventions and dependency rules
 - **packaging/README.md:** Cross-platform packaging overview
-- **Plan file:** `/home/emile/.claude/plans/fuzzy-humming-bengio.md`
 
 ---
 
-For questions or issues, file a GitHub issue at https://github.com/synthaea-lab/edr/issues
+For questions or issues, file a GitHub issue at https://github.com/synthaea-lab/agent/issues

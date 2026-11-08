@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Provisioning for the lab's Alpine VM (musl/BusyBox, x86_64): Rust + eBPF
-# toolchain for building the agent and probes, plus the packages the
-# lab/scenarios/ scripts need. Companion to linux-toolchain.sh (Debian/RPM) —
-# see issue #123. Idempotent: rerunnable via `vagrant provision <machine>` or
+# Provisioning for an Alpine build/test machine (musl/BusyBox, x86_64): Rust +
+# eBPF toolchain for building the agent and probes, plus the packages the lab's
+# attack scenarios need. Companion to linux-toolchain.sh (Debian/RPM).
+# Idempotent: rerunnable via `vagrant provision <machine>` or
 # a plain re-run.
 #
 # Unlike linux-toolchain.sh, this script does NOT need to align bpf-linker's
@@ -13,9 +13,8 @@
 # (musl-static, bundles its own LLVM) sidesteps that entirely and was
 # verified to work against BOTH the pinned nightly (LLVM 22) and a plain
 # `rustup toolchain install nightly` (LLVM 23) on Alpine 3.24 — no alignment
-# dance needed. Full source-build post-mortem (three stacked bugs, how each
-# was diagnosed) is in the #123 PR discussion if a future bpf-linker release
-# regresses this and the prebuilt-release workaround stops being enough.
+# dance needed. (A source build hit three stacked bugs; if a future bpf-linker
+# release regresses the prebuilt workaround, expect to re-diagnose them.)
 set -euo pipefail
 
 APK="sudo apk"
@@ -125,15 +124,11 @@ for tool in bindgen aya-tool bpf-linker; do
 done
 
 echo "== Done =="
-echo "Source synced into /synthaea — see lab/vagrant/README.md for the build."
+echo "Toolchain ready: build the agent from the source tree (cargo build --release)."
 echo
-echo "Known caveats not resolved by this script (see issue #123):"
-echo "  - lab/scenarios/beacon.sh: verified against BusyBox's own nc applet"
-echo "    (not netcat-openbsd — that package isn't installed by this script)."
-echo "    Its listener fallback (nc -l -p PORT || nc -l PORT, from issue #113)"
-echo "    handles the BusyBox/OpenBSD flag difference correctly; the full"
-echo "    T1071/T1041 walking-skeleton scenario fires as expected. Other"
-echo "    lab/scenarios/*.sh scripts (wget/sh usage) remain unverified."
+echo "Known caveats not resolved by this script:"
+echo "  - nc is BusyBox's own applet (netcat-openbsd is not installed); scripts"
+echo "    that listen must handle both flag styles (nc -l -p PORT || nc -l PORT)."
 echo "  - ml/ (ONNX Runtime) is out of scope here: it needs a newer onnxruntime"
 echo "    than Alpine's stable branch ships (API version mismatch), plus"
 echo "    ORT_LIB_LOCATION/ORT_PREFER_DYNAMIC_LINK and a non-static-pie build"

@@ -19,7 +19,7 @@ pub const ENV_CONFIG_PATH: &str = "SYNTHAEA_CONFIG";
 
 /// Absolute path the agent falls back to when no `--config` and no
 /// `SYNTHAEA_CONFIG` are set. Chosen for consistency with EDR industry
-/// conventions (see ADR-0013 §Consequences).
+/// conventions (ADR-0013).
 #[cfg(target_os = "linux")]
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/synthaea/agent.toml";
 
