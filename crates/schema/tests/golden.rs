@@ -19,12 +19,12 @@ use schema::{
     KernelModuleAction, KernelModuleEvent, LdapSearchEvent, ListenPortEvent, LogClearedEvent,
     MemfdCreateEvent, MountEvent, NamespaceEvent, NamespaceSyscall, NetworkFlowEvent,
     NtlmAuthEvent, NtlmDirection, POLICY_MECHANISM_SELINUX, PackageChangeEvent, PackageChangeKind,
-    PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
-    RawVolumeOpenEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent,
-    SessionState, ShellType, SignalEvent, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
-    SocketCreateEvent, SocketListenEvent, TccDecisionEvent, TlsCaptureEvent, TlsDirection,
-    TlsLibraryType, UdpRecvEvent, UdpSendEvent, UnitStopEvent, User, WmiActivityEvent,
-    XpcConnectEvent,
+    PolicyDenialEvent, PrctlEvent, ProcessAccessEvent, ProcessVmReadEvent, ProcessVmWriteEvent,
+    PtraceEvent, RawVolumeOpenEvent, ReadlineInputEvent, RegistrySetEvent, RemoteThreadEvent,
+    ScriptBlockEvent, SessionEvent, SessionState, ShellType, SignalEvent, SmbConnectEvent,
+    SocketAcceptEvent, SocketBindEvent, SocketCreateEvent, SocketListenEvent, TccDecisionEvent,
+    TlsCaptureEvent, TlsDirection, TlsLibraryType, UdpRecvEvent, UdpSendEvent, UnitStopEvent, User,
+    WmiActivityEvent, XpcConnectEvent,
     detection::{Detection, DetectionSource, IocKind, ScoreAttribution, Severity},
 };
 
@@ -907,6 +907,61 @@ fn image_load_golden() {
             image_path: r"C:\Windows\System32\amsi.dll".into(),
         }),
         "image_load",
+    );
+}
+
+#[test]
+fn remote_thread_golden() {
+    // v67 (#720): a thread started in another process, from Kernel-Process EID 3.
+    assert_golden(
+        &Event::RemoteThread(RemoteThreadEvent {
+            meta: EventMeta {
+                pid: 4242,
+                ppid: 0,
+                user: User::Windows {
+                    sid: "S-1-5-21-1-2-3-1001".into(),
+                    integrity_level: Some(0x3000),
+                },
+                timestamp_ns: 1_756_900_030_000_000_000,
+                comm: "injector.exe".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            target_pid: 5150,
+            target_image_path: Some(r"C:\Windows\explorer.exe".into()),
+            thread_id: 9001,
+            start_address: 0x7ffb_1c2d_3e40,
+        }),
+        "remote_thread",
+    );
+}
+
+#[test]
+fn process_access_golden() {
+    // v67 (#720): an open of LSASS that can reach its memory, from Kernel-Audit-API-Calls EID 5.
+    assert_golden(
+        &Event::ProcessAccess(ProcessAccessEvent {
+            meta: EventMeta {
+                pid: 4242,
+                ppid: 0,
+                user: User::Windows {
+                    sid: "S-1-5-21-1-2-3-500".into(),
+                    integrity_level: Some(0x3000),
+                },
+                timestamp_ns: 1_756_900_030_000_000_000,
+                comm: "procdump64.exe".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            caller_image_path: Some(r"C:\Users\Public\procdump64.exe".into()),
+            target_pid: 812,
+            target_image_path: Some(r"C:\Windows\System32\lsass.exe".into()),
+            desired_access: 0x1410,
+            status: 0,
+        }),
+        "process_access",
     );
 }
 
@@ -3006,6 +3061,21 @@ fn meta_accessor_covers_all_variants() {
         Event::UnitStop(UnitStopEvent {
             meta: meta.clone(),
             unit: "auditd.service".into(),
+        }),
+        Event::RemoteThread(RemoteThreadEvent {
+            meta: meta.clone(),
+            target_pid: 8,
+            target_image_path: None,
+            thread_id: 9,
+            start_address: 0x10,
+        }),
+        Event::ProcessAccess(ProcessAccessEvent {
+            meta: meta.clone(),
+            caller_image_path: None,
+            target_pid: 8,
+            target_image_path: None,
+            desired_access: 0x10,
+            status: 0,
         }),
     ];
     for e in &events {
