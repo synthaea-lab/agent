@@ -123,14 +123,30 @@ impl KeyDedup {
 
     /// `true` the first time `key` is seen within the window.
     pub(crate) fn first(&mut self, key: &str, now_ns: u64) -> bool {
+        if self.is_repeat(key, now_ns) {
+            return false;
+        }
+        self.record(key, now_ns);
+        true
+    }
+
+    /// Whether `key` was already recorded within the window (counted as a duplicate),
+    /// without recording it: for a caller that has another check to pass before the key
+    /// may count as reported (#1150 review: a refused event must not mark its key).
+    pub(crate) fn is_repeat(&mut self, key: &str, now_ns: u64) -> bool {
         if self
             .seen
             .get(key)
             .is_some_and(|&t| now_ns.saturating_sub(t) < self.window_ns)
         {
             self.duplicates += 1;
-            return false;
+            return true;
         }
+        false
+    }
+
+    /// Records `key` as reported at `now_ns`, bounded like [`PidBudget`].
+    pub(crate) fn record(&mut self, key: &str, now_ns: u64) {
         if self.seen.len() >= KEY_DEDUP_CAP {
             let window_ns = self.window_ns;
             self.seen
@@ -152,7 +168,6 @@ impl KeyDedup {
             }
         }
         self.seen.insert(key.to_string(), now_ns);
-        true
     }
 }
 

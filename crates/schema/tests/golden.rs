@@ -939,7 +939,7 @@ fn remote_thread_golden() {
 
 #[test]
 fn process_access_golden() {
-    // v67 (#720): a memory-reading open of LSASS, from Kernel-Audit-API-Calls EID 5.
+    // v67 (#720): an open of LSASS that can reach its memory, from Kernel-Audit-API-Calls EID 5.
     assert_golden(
         &Event::ProcessAccess(ProcessAccessEvent {
             meta: EventMeta {
@@ -955,6 +955,7 @@ fn process_access_golden() {
                 process_generation: None,
                 parent_process_generation: None,
             },
+            caller_image_path: Some(r"C:\Users\Public\procdump64.exe".into()),
             target_pid: 812,
             target_image_path: Some(r"C:\Windows\System32\lsass.exe".into()),
             desired_access: 0x1410,
@@ -3070,6 +3071,7 @@ fn meta_accessor_covers_all_variants() {
         }),
         Event::ProcessAccess(ProcessAccessEvent {
             meta: meta.clone(),
+            caller_image_path: None,
             target_pid: 8,
             target_image_path: None,
             desired_access: 0x10,
