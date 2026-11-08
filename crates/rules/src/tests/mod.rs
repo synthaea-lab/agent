@@ -411,6 +411,7 @@ mod egressdomain;
 mod impact_context;
 mod linux;
 mod logon;
+mod lsass;
 mod motw_removal;
 mod osascript;
 mod persistence;

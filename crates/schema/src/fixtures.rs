@@ -37,11 +37,11 @@ use crate::{
     KerberosDelegationFailureKind, KernelModuleAction, KernelModuleEvent, LdapSearchEvent,
     ListenPortEvent, LogClearedEvent, MemfdCreateEvent, NamespaceEvent, NamespaceSyscall,
     NetworkFlowEvent, NtlmAuthEvent, NtlmDirection, PackageChangeEvent, PackageChangeKind,
-    PolicyDenialEvent, PrctlEvent, ProcessVmReadEvent, ProcessVmWriteEvent, PtraceEvent,
-    RawVolumeOpenEvent, ReadlineInputEvent, RegistrySetEvent, ScriptBlockEvent, SessionEvent,
-    SessionState, ShellType, SmbConnectEvent, SocketAcceptEvent, SocketBindEvent,
-    SocketCreateEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection, TlsLibraryType,
-    UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
+    PolicyDenialEvent, PrctlEvent, ProcessAccessEvent, ProcessVmReadEvent, ProcessVmWriteEvent,
+    PtraceEvent, RawVolumeOpenEvent, ReadlineInputEvent, RegistrySetEvent, RemoteThreadEvent,
+    ScriptBlockEvent, SessionEvent, SessionState, ShellType, SmbConnectEvent, SocketAcceptEvent,
+    SocketBindEvent, SocketCreateEvent, SocketListenEvent, TlsCaptureEvent, TlsDirection,
+    TlsLibraryType, UdpRecvEvent, UdpSendEvent, User, WmiActivityEvent,
 };
 
 /// The TEST-NET-1 address every address-carrying fixture defaults to.
@@ -618,6 +618,31 @@ pub fn process_vm_write() -> ProcessVmWriteEvent {
         local_iov_count: 0,
         remote_iov_count: 0,
         remote_iov_len: 0,
+    }
+}
+
+/// Neutral [`RemoteThreadEvent`].
+#[must_use]
+pub fn remote_thread() -> RemoteThreadEvent {
+    RemoteThreadEvent {
+        meta: meta(),
+        target_pid: 0,
+        target_image_path: None,
+        thread_id: 0,
+        start_address: 0,
+    }
+}
+
+/// Neutral [`ProcessAccessEvent`].
+#[must_use]
+pub fn process_access() -> ProcessAccessEvent {
+    ProcessAccessEvent {
+        meta: meta(),
+        caller_image_path: None,
+        target_pid: 0,
+        target_image_path: None,
+        desired_access: 0,
+        status: 0,
     }
 }
 

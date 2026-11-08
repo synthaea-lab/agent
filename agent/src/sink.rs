@@ -2525,6 +2525,16 @@ impl EventSink for DetectionSink {
             Event::PackageChange(e) => {
                 self.record_rule_alerts(&event, rules::evaluate_package_change(e));
             }
+            Event::ProcessAccess(e) => {
+                // Bound first: `record_rule_alerts` takes the lock again.
+                let alerts = self.rule_state.lock().unwrap().on_process_access(e);
+                self.record_rule_alerts(&event, alerts);
+            }
+            Event::RemoteThread(e) => {
+                // Bound first: `record_rule_alerts` takes the lock again.
+                let alerts = self.rule_state.lock().unwrap().on_remote_thread(e);
+                self.record_rule_alerts(&event, alerts);
+            }
             // New telemetry categories reach the engines as they land; until a rule
             // consumes them, logging below is the whole treatment.
             _ => {}
