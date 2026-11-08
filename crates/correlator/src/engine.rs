@@ -146,7 +146,8 @@ pub struct CorrelationEngine {
     /// belief never look at it.
     service_mains: BoundedMap<u32, Option<u64>>,
     /// Pids whose `ExecEvent` showed a login-session image exec'd by its listener
-    /// (`sshd-session` under `sshd`, see `policy::is_login_session`, #1142). Same
+    /// (`sshd-session` under `sshd`, or `sshd` re-exec'd under `sshd` before OpenSSH
+    /// 9.8, see `policy::is_login_session`, #1142). Same
     /// lifecycle and same single reader (the kill gate) as `service_mains`.
     login_sessions: BoundedMap<u32, Option<u64>>,
 }
@@ -159,8 +160,9 @@ pub enum KillShield {
     /// The main process of a system service, started by init (#652).
     ServiceMain,
     /// The process holding an interactive login session (`sshd-session` exec'd by
-    /// `sshd`, `policy::is_login_session`): killing it cuts the operator's session
-    /// (#1142). Its children are not shielded.
+    /// `sshd`, or `sshd` re-exec'd by `sshd` before OpenSSH 9.8,
+    /// `policy::is_login_session`): killing it cuts the operator's session (#1142).
+    /// Its children are not shielded.
     LoginSession,
 }
 
@@ -303,7 +305,8 @@ impl CorrelationEngine {
             // before the agent, so its exec is never seen (the 2026-11-05 e2e run:
             // `parent_image_path` resolved from /proc, no exec for pid 2529). A copy
             // of the real binary exec'd from a user's shell has that shell as parent
-            // and qualifies for nothing. Re-exec clears, as for `service_mains`.
+            // and qualifies for nothing; the listener's parent is init, so it stays
+            // only a service main. Re-exec clears, as for `service_mains`.
             if policy::is_login_session(exec.image_path.as_str(), exec.parent_image_path.as_deref())
             {
                 self.login_sessions.insert(pid, generation);

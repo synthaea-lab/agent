@@ -492,7 +492,7 @@ const SERVICE_MAIN_REFUSAL: &str = "main process of a system service (image unde
 /// Same care as [`SERVICE_MAIN_REFUSAL`]: it states what was checked (the image and
 /// its parent's image), not that the session is legitimate, nor that the parent was
 /// started by init: the listener's exec is usually never seen.
-const LOGIN_SESSION_REFUSAL: &str = "holds a login session (sshd-session exec'd by sshd, both images under a system path); escalated, not killed";
+const LOGIN_SESSION_REFUSAL: &str = "holds a login session (sshd-session, or sshd before OpenSSH 9.8, exec'd by sshd, both images under a system path); escalated, not killed";
 
 /// The refusal reason the kill gate records for `shield`.
 fn shield_refusal(shield: correlator::KillShield) -> &'static str {
@@ -1469,7 +1469,8 @@ impl DetectionSink {
     /// `shield` is the correlator's provenance verdict for `pid` (issues #652, #1142): a
     /// system service's main process (its image under a system path, started by init —
     /// see the comment above `SERVICE_MAIN_REFUSAL`'s definition for why this is not
-    /// phrased as "package-owned"), or the `sshd-session` holding a login, exec'd by `sshd`.
+    /// phrased as "package-owned"), or the process holding a login, exec'd by `sshd`
+    /// (`sshd-session`, or `sshd` itself before OpenSSH 9.8).
     /// A Bayesian crossing alone does not justify killing either, so it is refused, in
     /// observe mode too, and the verdict still escalates. Corroborating evidence does
     /// not lift it: the refusal is about what the process is, not how much evidence
@@ -4157,7 +4158,30 @@ rule response_marker {
     /// Alpine (#1142). The listener's own exec is not sent: it started at boot, before
     /// the agent, so only its image (resolved by the sensor) is known.
     fn exec_ssh_login(sink: &DetectionSink, listener: u32, session: u32) {
-        let Event::Exec(mut e) = exec(session, "sshd-session", "/usr/lib/ssh/sshd-session") else {
+        exec_under_sshd_listener(
+            sink,
+            listener,
+            session,
+            "sshd-session",
+            "/usr/lib/ssh/sshd-session",
+        );
+    }
+
+    /// Execs the `sshd` the listener re-execs (`sshd -R`) for one login before
+    /// OpenSSH 9.8, as on Debian 12 (#1142, 2026-11-08 lab run).
+    fn exec_reexecd_sshd_login(sink: &DetectionSink, listener: u32, session: u32) {
+        exec_under_sshd_listener(sink, listener, session, "sshd -R", "/usr/sbin/sshd");
+    }
+
+    /// Execs `image` as `pid` under the `sshd` listener, whose image the sensor resolved.
+    fn exec_under_sshd_listener(
+        sink: &DetectionSink,
+        listener: u32,
+        pid: u32,
+        cmdline: &str,
+        image: &str,
+    ) {
+        let Event::Exec(mut e) = exec(pid, cmdline, image) else {
             unreachable!("exec() builds an Exec event");
         };
         e.meta.ppid = listener;
@@ -4182,6 +4206,59 @@ rule response_marker {
             "the refusal must be audited with its reason: {alerts}"
         );
         assert!(killed.lock().unwrap().is_empty());
+    }
+
+    /// Issue #1142, lab run on Debian 12 (OpenSSH 9.2): no `sshd-session` there, the
+    /// listener re-execs `/usr/sbin/sshd`, and BAYES named that `comm=sshd` session.
+    #[test]
+    fn an_sshd_reexecd_for_a_login_crossing_bayes_is_refused_not_killed() {
+        let dir = tmp("bayes-sshd-reexec");
+        let sink = sink_in(&dir);
+        let killed = enable_recording_kill(&sink, &dir);
+        exec_reexecd_sshd_login(&sink, 6120, 6121);
+        drive_bayes_connects(&sink, 6121);
+        let alerts = alerts_in(&dir);
+        assert!(alerts.contains("BAYES"), "{alerts}");
+        assert!(
+            alerts.contains("refused to kill pid 6121") && alerts.contains("holds a login session"),
+            "the refusal must be audited with its reason: {alerts}"
+        );
+        assert!(killed.lock().unwrap().is_empty());
+    }
+
+    /// The control for the pre-9.8 shape: a shell under the re-exec'd `sshd` is still
+    /// killed.
+    #[test]
+    fn a_shell_inside_a_reexecd_sshd_login_crossing_bayes_is_still_killed() {
+        let dir = tmp("bayes-sshd-reexec-shell");
+        let sink = sink_in(&dir);
+        let killed = enable_recording_kill(&sink, &dir);
+        exec_reexecd_sshd_login(&sink, 6130, 6131);
+        let Event::Exec(mut shell) = exec(6132, "bash", "/bin/bash") else {
+            unreachable!("exec() builds an Exec event");
+        };
+        shell.meta.ppid = 6131;
+        shell.parent_image_path = Some("/usr/sbin/sshd".into());
+        sink.on_event(Event::Exec(shell));
+        drive_bayes_connects(&sink, 6132);
+        assert_eq!(*killed.lock().unwrap(), vec![6132]);
+    }
+
+    /// The real `sshd` binary started from a user's shell is not a login session: it
+    /// crosses BAYES and is killed like anything else.
+    #[test]
+    fn an_sshd_started_from_a_shell_crossing_bayes_is_still_killed() {
+        let dir = tmp("bayes-sshd-from-shell");
+        let sink = sink_in(&dir);
+        let killed = enable_recording_kill(&sink, &dir);
+        let Event::Exec(mut e) = exec(6142, "sshd -R", "/usr/sbin/sshd") else {
+            unreachable!("exec() builds an Exec event");
+        };
+        e.meta.ppid = 6141;
+        e.parent_image_path = Some("/bin/bash".into());
+        sink.on_event(Event::Exec(e));
+        drive_bayes_connects(&sink, 6142);
+        assert_eq!(*killed.lock().unwrap(), vec![6142]);
     }
 
     /// The control: a shell inside that login session crossing BAYES is still killed.
