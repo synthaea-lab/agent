@@ -2,7 +2,7 @@ name: DCO
 
 # Every commit in a pull request must carry a Developer Certificate of Origin sign-off
 # (`Signed-off-by: Name <email>`, added by `git commit -s`) whose email is the commit
-# author's. CONTRIBUTING.md explains why; ADR-0047 records the licensing it supports.
+# author's. CONTRIBUTING.md explains why (see "Licensing of your contribution").
 # Merge commits and bot commits (Dependabot) are exempt.
 
 on:
