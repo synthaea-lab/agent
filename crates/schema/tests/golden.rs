@@ -82,9 +82,48 @@ fn exec_unix_golden() {
             file_description: None,
             product_name: None,
             image_file_id: None,
+            cmdline_truncated: false,
             env_security: Vec::new(),
         }),
         "exec",
+    );
+}
+
+#[test]
+fn exec_cmdline_truncated_golden() {
+    // A sensor cut argv to ARGV_CAPTURE_BUDGET at capture (#1112); the flag only
+    // appears on the wire when set.
+    assert_golden(
+        &Event::Exec(ExecEvent {
+            meta: EventMeta {
+                pid: 4242,
+                ppid: 1337,
+                user: User::Unix {
+                    uid: 1000,
+                    gid: 1000,
+                },
+                timestamp_ns: 1_756_900_000_123_456_789,
+                comm: "sh".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            image_path: "/bin/sh".into(),
+            cmdline: "sh -c echo QUFB".into(),
+            argv: ["sh", "-c", "echo QUFB"].map(String::from).into(),
+            parent_comm: None,
+            parent_image_path: None,
+            sha256: None,
+            signature: None,
+            original_file_name: None,
+            company_name: None,
+            file_description: None,
+            product_name: None,
+            image_file_id: None,
+            cmdline_truncated: true,
+            env_security: Vec::new(),
+        }),
+        "exec_cmdline_truncated",
     );
 }
 
@@ -121,6 +160,7 @@ fn exec_process_generation_golden() {
             file_description: None,
             product_name: None,
             image_file_id: None,
+            cmdline_truncated: false,
             env_security: Vec::new(),
         }),
         "exec_process_generation",
@@ -156,6 +196,7 @@ fn exec_ld_preload_golden() {
             file_description: None,
             product_name: None,
             image_file_id: None,
+            cmdline_truncated: false,
             env_security: vec![("LD_PRELOAD".into(), "/tmp/evil.so".into())],
         }),
         "exec_ld_preload",
@@ -191,6 +232,7 @@ fn exec_windows_golden() {
             file_description: None,
             product_name: None,
             image_file_id: None,
+            cmdline_truncated: false,
             env_security: Vec::new(),
         }),
         "exec_windows",
@@ -226,6 +268,7 @@ fn exec_windows_image_file_id_golden() {
             file_description: None,
             product_name: None,
             image_file_id: Some("00000000a1b2c3d4:0000000000000000000300000000beef".into()),
+            cmdline_truncated: false,
             env_security: Vec::new(),
         }),
         "exec_image_file_id",
@@ -265,6 +308,7 @@ fn exec_lineage_golden() {
             file_description: None,
             product_name: None,
             image_file_id: None,
+            cmdline_truncated: false,
             env_security: Vec::new(),
         }),
         "exec_lineage",
@@ -324,6 +368,7 @@ fn detection_ml_golden() {
             file_description: None,
             product_name: None,
             image_file_id: None,
+            cmdline_truncated: false,
             env_security: Vec::new(),
         })],
     };
@@ -364,6 +409,7 @@ fn sample_exec_event() -> Event {
         file_description: None,
         product_name: None,
         image_file_id: None,
+        cmdline_truncated: false,
         env_security: Vec::new(),
     })
 }
@@ -866,7 +912,7 @@ fn image_load_golden() {
 
 #[test]
 fn remote_thread_golden() {
-    // v63 (#720): a thread started in another process, from Kernel-Process EID 3.
+    // v67 (#720): a thread started in another process, from Kernel-Process EID 3.
     assert_golden(
         &Event::RemoteThread(RemoteThreadEvent {
             meta: EventMeta {
@@ -893,7 +939,7 @@ fn remote_thread_golden() {
 
 #[test]
 fn process_access_golden() {
-    // v63 (#720): a memory-reading open of LSASS, from Kernel-Audit-API-Calls EID 5.
+    // v67 (#720): an open of LSASS that can reach its memory, from Kernel-Audit-API-Calls EID 5.
     assert_golden(
         &Event::ProcessAccess(ProcessAccessEvent {
             meta: EventMeta {
@@ -909,6 +955,7 @@ fn process_access_golden() {
                 process_generation: None,
                 parent_process_generation: None,
             },
+            caller_image_path: Some(r"C:\Users\Public\procdump64.exe".into()),
             target_pid: 812,
             target_image_path: Some(r"C:\Windows\System32\lsass.exe".into()),
             desired_access: 0x1410,
@@ -1179,6 +1226,7 @@ fn exec_enriched_golden() {
             file_description: None,
             product_name: None,
             image_file_id: None,
+            cmdline_truncated: false,
             env_security: Vec::new(),
         }),
         "exec_enriched",
@@ -1213,6 +1261,7 @@ fn exec_windows_pe_info_golden() {
             company_name: Some("Microsoft Corporation".into()),
             file_description: Some("Windows Command Processor".into()),
             product_name: Some("Microsoft® Windows® Operating System".into()),
+            cmdline_truncated: false,
             env_security: Vec::new(),
             image_file_id: None,
         }),
@@ -1252,6 +1301,7 @@ fn exec_container_golden() {
             file_description: None,
             product_name: None,
             image_file_id: None,
+            cmdline_truncated: false,
             env_security: Vec::new(),
         }),
         "exec_container",
@@ -1847,8 +1897,81 @@ fn signal_golden() {
             signal: 9,
             target_pid: 400,
             target_image_path: Some("/usr/local/bin/synthaea-agent".into()),
+            target_unit: None,
+            sender_unreliable: false,
+            signals_lost: 0,
         }),
         "signal",
+    );
+    // v66 (#1103): a signal to a listed security tool names its systemd unit.
+    assert_golden(
+        &Event::Signal(SignalEvent {
+            meta: EventMeta {
+                pid: 7001,
+                ppid: 1,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_000_123_456_789,
+                comm: "pkill".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            signal: 9,
+            target_pid: 612,
+            target_image_path: Some("/usr/sbin/auditd".into()),
+            target_unit: Some("auditd".into()),
+            sender_unreliable: false,
+            signals_lost: 0,
+        }),
+        "signal_unit",
+    );
+    // v66 (#1103): the sender is marked unreliable (`si_code` of interrupt or completion context).
+    assert_golden(
+        &Event::Signal(SignalEvent {
+            meta: EventMeta {
+                pid: 7001,
+                ppid: 1,
+                user: User::Unix { uid: 0, gid: 0 },
+                timestamp_ns: 1_756_900_000_123_456_789,
+                comm: "python3".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            signal: 9,
+            target_pid: 612,
+            target_image_path: Some("/usr/sbin/auditd".into()),
+            target_unit: Some("auditd".into()),
+            sender_unreliable: true,
+            signals_lost: 0,
+        }),
+        "signal_unreliable",
+    );
+}
+
+#[test]
+fn signal_events_lost_golden() {
+    // v66 (#1103): the sensor's report of signals it had no room for, no signal and no target.
+    assert_golden(
+        &Event::Signal(SignalEvent {
+            meta: EventMeta {
+                pid: 900,
+                ppid: 0,
+                user: User::Unknown,
+                timestamp_ns: 1_756_900_000_123_456_789,
+                comm: "signal_generate".into(),
+                container: None,
+                process_generation: None,
+                parent_process_generation: None,
+            },
+            signal: 0,
+            target_pid: 0,
+            target_image_path: None,
+            target_unit: None,
+            sender_unreliable: false,
+            signals_lost: 19_182,
+        }),
+        "signal_events_lost",
     );
 }
 
@@ -2499,6 +2622,7 @@ fn unbounded_cmdline_survives() {
         file_description: None,
         product_name: None,
         image_file_id: None,
+        cmdline_truncated: false,
         env_security: Vec::new(),
     });
     let back: Event = serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
@@ -2537,6 +2661,7 @@ fn ml_cmdline_is_the_canonical_nul_joined_form() {
         file_description: None,
         product_name: None,
         image_file_id: None,
+        cmdline_truncated: false,
         env_security: Vec::new(),
     };
 
@@ -2599,6 +2724,7 @@ fn meta_accessor_covers_all_variants() {
             file_description: None,
             product_name: None,
             image_file_id: None,
+            cmdline_truncated: false,
             env_security: Vec::new(),
         }),
         Event::FileOpen(FileOpenEvent {
@@ -2850,6 +2976,9 @@ fn meta_accessor_covers_all_variants() {
             signal: 0,
             target_pid: 0,
             target_image_path: None,
+            target_unit: None,
+            sender_unreliable: false,
+            signals_lost: 0,
         }),
         Event::XpcConnect(XpcConnectEvent {
             meta: meta.clone(),
@@ -2942,6 +3071,7 @@ fn meta_accessor_covers_all_variants() {
         }),
         Event::ProcessAccess(ProcessAccessEvent {
             meta: meta.clone(),
+            caller_image_path: None,
             target_pid: 8,
             target_image_path: None,
             desired_access: 0x10,

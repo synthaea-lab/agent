@@ -10,6 +10,26 @@ history and final working-tree translations are on github.com/synthaea-lab/edr, 
 `old/...` paths in code comments are historical provenance. Docs are written fresh,
 never copied (`docs/README.md` has the index).
 
+## Repository layout / siblings
+
+This repo is the agent workspace, one of several sibling repos the umbrella repo checks
+out side by side (`agent/` = this repo, `server/`, `ml/`, `rules/`, `lab/`, `docs/`).
+The ONNX Runtime and VM toolchain scripts live here under `toolchain/`.
+
+- Cross-repo contract tests (golden fixtures in `server/tests/fixtures` and
+  `ml/tests/fixtures`, the shipped content in `rules/`, the server's routes) read the
+  sibling through the dev-only `crates/siblings` crate: `siblings::require!(repo, rel)`
+  (file text) / `siblings::require_path!(repo, rel)` return the value or print one
+  `skipped: needs sibling repo ...` line and return from the test. Never reach into a
+  sibling by relative path or `include_str!` — the agent must build and test alone.
+- `SYNTHAEA_ROOT` points at the directory holding the siblings (default: this repo's
+  parent directory, i.e. the umbrella).
+- `SYNTHAEA_REQUIRE_SIBLINGS=1` turns every such skip into a panic; CI's `test` and
+  `content` jobs check the siblings out and set it, so a contract test cannot pass by
+  not running.
+- `tools/attack-coverage.py` scans this repo plus `rules/` and writes `docs/`, resolved
+  the same way; its `--check` runs in the umbrella's CI.
+
 ## Dependency direction (enforced by `tools/check-deps.py`, run in CI)
 
 - `schema` is the platform boundary: event types + `Sensor`/`EventSink` contract.

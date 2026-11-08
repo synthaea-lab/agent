@@ -30,18 +30,27 @@ not attempt the roadmap-style gap analysis (what's planned, what's out of
 scope and why) the hand-written predecessor doc carried; that lives in the
 coverage-pack issues (#376-#381) instead.
 
+The scan spans repos: `crates/` is this one, while `rules/` and `docs/` are the
+umbrella checkout's sibling directories, found under $SYNTHAEA_ROOT when set and
+the parent of this repo otherwise (the same lookup as `crates/siblings`). A
+missing sibling is a hard error, never a partial matrix. Paths in the output stay
+relative to their own repo (`crates/...`, `rules/...`).
+
 Usage:
     python3 tools/attack-coverage.py          # regenerate docs/detection/attack-coverage.md
     python3 tools/attack-coverage.py --check  # verify it's up to date; exit 1 if stale (CI)
 """
 
 import argparse
+import os
 import pathlib
 import re
 import sys
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUTPUT = REPO_ROOT / "docs/detection/attack-coverage.md"
+# The umbrella directory holding this repo's siblings (`rules/`, `docs/`).
+UMBRELLA_ROOT = pathlib.Path(os.environ.get("SYNTHAEA_ROOT") or REPO_ROOT.parent).resolve()
+OUTPUT = UMBRELLA_ROOT / "docs/detection/attack-coverage.md"
 
 TECHNIQUE_RE = re.compile(r"^T\d{4}(\.\d{3})?$")
 BAYES_SENTINEL = "BAYES"
@@ -85,13 +94,29 @@ def yara_meta(path: pathlib.Path) -> set[str]:
     return {match.group(1)} if match else set()
 
 
-# (source label, glob relative to repo root, extractor, layer per docs/detection/layers.md)
+# (source label, root the glob is relative to, glob, extractor, layer per
+# docs/detection/layers.md)
 SOURCES = [
-    ("rules", "crates/rules/src/*.rs", rust_technique_field, 3),
-    ("correlator", "crates/correlator/src/rules.rs", rust_technique_field, 6),
-    ("sigma", "rules/sigma/**/*.yml", sigma_tags, 3),
-    ("yara", "rules/yara/**/*.yar", yara_meta, 1),
+    ("rules", REPO_ROOT, "crates/rules/src/*.rs", rust_technique_field, 3),
+    ("correlator", REPO_ROOT, "crates/correlator/src/rules.rs", rust_technique_field, 6),
+    ("sigma", UMBRELLA_ROOT, "rules/sigma/**/*.yml", sigma_tags, 3),
+    ("yara", UMBRELLA_ROOT, "rules/yara/**/*.yar", yara_meta, 1),
 ]
+
+# Sibling directories the scan and the output need; checked up front.
+REQUIRED_SIBLINGS = ["rules/sigma", "rules/yara", "docs/detection"]
+
+
+def require_siblings() -> None:
+    missing = [d for d in REQUIRED_SIBLINGS if not (UMBRELLA_ROOT / d).is_dir()]
+    if missing:
+        print(
+            f"error: sibling repo directories missing under {UMBRELLA_ROOT}: "
+            f"{', '.join(missing)} — check out the `rules` and `docs` siblings via "
+            "the umbrella repo, or set SYNTHAEA_ROOT to the directory holding them",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
 TACTIC_ORDER = [
     "Reconnaissance",
@@ -181,6 +206,7 @@ TECHNIQUE_TACTIC = {
     "T1021.004": "Lateral Movement",
     "T1518.001": "Discovery",
     "T1489": "Impact",
+    "T1529": "Impact",
     "T1016": "Discovery",
     "T1057": "Discovery",
     "T1082": "Discovery",
@@ -192,11 +218,11 @@ UNMAPPED_TACTIC = "Unmapped — add to TECHNIQUE_TACTIC"
 
 def discover() -> dict[str, dict[str, set]]:
     findings: dict[str, dict[str, set]] = {}
-    for label, pattern, extractor, layer in SOURCES:
-        for path in sorted(REPO_ROOT.glob(pattern)):
+    for label, root, pattern, extractor, layer in SOURCES:
+        for path in sorted(root.glob(pattern)):
             for technique_id in extractor(path):
                 if not TECHNIQUE_RE.match(technique_id):
-                    rel = path.relative_to(REPO_ROOT)
+                    rel = path.relative_to(root)
                     print(
                         f"error: malformed technique id {technique_id!r} in {rel}",
                         file=sys.stderr,
@@ -204,7 +230,7 @@ def discover() -> dict[str, dict[str, set]]:
                     sys.exit(1)
                 entry = findings.setdefault(technique_id, {"layers": set(), "sources": set()})
                 entry["layers"].add(layer)
-                entry["sources"].add(f"{label}:{path.relative_to(REPO_ROOT).as_posix()}")
+                entry["sources"].add(f"{label}:{path.relative_to(root).as_posix()}")
     return findings
 
 
@@ -277,6 +303,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    require_siblings()
     findings = discover()
     content = render(findings)
 

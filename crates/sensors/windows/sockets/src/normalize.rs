@@ -21,7 +21,7 @@ pub fn listen_port_event(entry: &ListenerEntry, timestamp_ns: u64) -> Event {
             user: User::Unknown,
             timestamp_ns,
             comm: entry.process_name.clone().unwrap_or_default(),
-            container: None, // Windows: no container support
+            container: None, // attributed by the ETW sensor only (#371)
             process_generation: None,
             parent_process_generation: None,
         },

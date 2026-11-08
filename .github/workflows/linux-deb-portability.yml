@@ -8,7 +8,7 @@ on:
       - "crates/sensors/linux/**"
       - "crates/updater/**"
       - "packaging/linux/**"
-      - "lab/provisioning/**"
+      - "toolchain/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".cargo/config.toml"
@@ -23,7 +23,7 @@ on:
       - "crates/sensors/linux/**"
       - "crates/updater/**"
       - "packaging/linux/**"
-      - "lab/provisioning/**"
+      - "toolchain/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".cargo/config.toml"
@@ -64,7 +64,7 @@ jobs:
               apk add --no-cache sudo bash
               export SYNTHAEA_SRC=/work
               export SYNTHAEA_ALLOW_ORT_ROOT_BUILD=1
-              bash ./lab/provisioning/alpine-toolchain.sh
+              bash ./toolchain/alpine-toolchain.sh
               bash ./packaging/linux/build-deb.sh
               chown -R "$(stat -c %u /work)":"$(stat -c %g /work)" /work/target /work/onnxruntime
             '

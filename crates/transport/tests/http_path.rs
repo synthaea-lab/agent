@@ -25,7 +25,7 @@ use std::{
     net::{TcpListener, TcpStream},
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -267,6 +267,9 @@ impl DetectionDrain for CountingDetectionDrain {
         self.records.clear();
         Ok(())
     }
+    fn ack_dropping(&mut self, _dropped: u64) -> std::io::Result<()> {
+        self.ack()
+    }
     fn skip(&mut self) -> std::io::Result<()> {
         self.skipped.fetch_add(1, Ordering::SeqCst);
         self.records.clear();
@@ -318,6 +321,480 @@ fn detection_uploader_redelivers_the_same_keys_after_partial_failure() {
     for (headers, key) in seen.iter().zip([a, b, a, b]) {
         assert!(headers.contains(&format!("idempotency-key: {key}")));
     }
+}
+
+/// A drain that also records what `ack_dropping` was told, for the per-record drops (#1119).
+struct RecordingDetectionDrain {
+    records: Vec<QueuedDetection>,
+    acked: Arc<AtomicU32>,
+    skipped: Arc<AtomicU32>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl DetectionDrain for RecordingDetectionDrain {
+    fn drain(&mut self) -> std::io::Result<Vec<QueuedDetection>> {
+        Ok(self.records.clone())
+    }
+    fn ack(&mut self) -> std::io::Result<()> {
+        self.ack_dropping(0)
+    }
+    fn ack_dropping(&mut self, dropped: u64) -> std::io::Result<()> {
+        self.acked.fetch_add(1, Ordering::SeqCst);
+        self.dropped.fetch_add(dropped, Ordering::SeqCst);
+        self.records.clear();
+        Ok(())
+    }
+    fn skip(&mut self) -> std::io::Result<()> {
+        self.skipped.fetch_add(1, Ordering::SeqCst);
+        self.records.clear();
+        Ok(())
+    }
+}
+
+type DetectionCounters = (Arc<AtomicU32>, Arc<AtomicU32>, Arc<AtomicU64>);
+
+fn recording_uploader(
+    url: &str,
+    records: Vec<QueuedDetection>,
+) -> (
+    DetectionUploader<RecordingDetectionDrain>,
+    DetectionCounters,
+) {
+    let acked = Arc::new(AtomicU32::new(0));
+    let skipped = Arc::new(AtomicU32::new(0));
+    let dropped = Arc::new(AtomicU64::new(0));
+    let drain = RecordingDetectionDrain {
+        records,
+        acked: Arc::clone(&acked),
+        skipped: Arc::clone(&skipped),
+        dropped: Arc::clone(&dropped),
+    };
+    let client = TransportClient::new(TransportConfig::new(url)).unwrap();
+    (
+        DetectionUploader::new(client, drain),
+        (acked, skipped, dropped),
+    )
+}
+
+fn queued(key: &str, detection: Detection) -> QueuedDetection {
+    QueuedDetection {
+        key: key.into(),
+        detection,
+    }
+}
+
+const KEY_A: &str = "b9628fc1-2134-4d4d-bbe6-83fdd1929d7a";
+const KEY_B: &str = "b9628fc1-2134-4d4d-bbe6-83fdd1929d7b";
+const KEY_C: &str = "b9628fc1-2134-4d4d-bbe6-83fdd1929d7c";
+
+/// A server that answers the given statuses in order, one connection each, and returns the
+/// request headers it saw. A `400` carries the detection route's `Invalid payload` (a refusal
+/// of that record); other errors a generic reason.
+fn sequence_server(statuses: Vec<u16>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    sequence_server_with(
+        statuses
+            .into_iter()
+            .map(|status| {
+                let body = match status {
+                    200 => r#"{"status":"accepted"}"#,
+                    400 => r#"{"error":"Invalid payload"}"#,
+                    409 => r#"{"error":"Idempotency key reused for a different detection"}"#,
+                    _ => r#"{"error":"refused"}"#,
+                };
+                (status, body)
+            })
+            .collect(),
+    )
+}
+
+/// The same with the body of each answer chosen by the test.
+fn sequence_server_with(
+    responses: Vec<(u16, &'static str)>,
+) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for (status, body) in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            seen.push(read_request(&mut stream).to_ascii_lowercase());
+            write_response(&mut stream, status, body);
+        }
+        seen
+    });
+    (url, server)
+}
+
+fn content_length(headers: &str) -> usize {
+    headers
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap()
+}
+
+#[test]
+fn a_record_the_server_refuses_for_good_does_not_stop_the_others_of_its_segment() {
+    let (url, server) = sequence_server(vec![200, 400, 200]);
+    let (mut uploader, (acked, skipped, dropped)) = recording_uploader(
+        &url,
+        vec![
+            queued(KEY_A, detection()),
+            queued(KEY_B, detection()),
+            queued(KEY_C, detection()),
+        ],
+    );
+    assert_eq!(
+        uploader.upload_once().unwrap(),
+        3,
+        "three were handled: two accepted, one dropped"
+    );
+    assert_eq!(
+        acked.load(Ordering::SeqCst),
+        1,
+        "the segment is acknowledged"
+    );
+    assert_eq!(
+        skipped.load(Ordering::SeqCst),
+        0,
+        "the segment is not skipped"
+    );
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "the refused one is counted"
+    );
+    let seen = server.join().unwrap();
+    for (headers, key) in seen.iter().zip([KEY_A, KEY_B, KEY_C]) {
+        assert!(
+            headers.contains(&format!("idempotency-key: {key}")),
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn a_record_over_the_server_body_limit_is_shortened_and_sent_not_dropped() {
+    // A process padded its own argv: the detection is megabytes. It must reach the server, cut
+    // down, with its key and its title; erasing it on the host would let the process do that.
+    let (url, server) = sequence_server(vec![200, 200, 200]);
+    let mut huge = detection();
+    huge.events = vec![Event::Exec(ExecEvent {
+        cmdline: "A".repeat(transport::MAX_DETECTION_BODY_BYTES + 1),
+        ..schema::fixtures::exec()
+    })];
+    let (mut uploader, (acked, skipped, dropped)) = recording_uploader(
+        &url,
+        vec![
+            queued(KEY_A, detection()),
+            queued(KEY_B, huge),
+            queued(KEY_C, detection()),
+        ],
+    );
+    assert_eq!(uploader.upload_once().unwrap(), 3, "all three were sent");
+    assert_eq!(acked.load(Ordering::SeqCst), 1);
+    assert_eq!(skipped.load(Ordering::SeqCst), 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 0, "nothing was dropped");
+    let seen = server.join().unwrap();
+    assert!(seen[1].contains(&format!("idempotency-key: {KEY_B}")));
+    assert!(
+        content_length(&seen[1]) <= transport::MAX_DETECTION_BODY_BYTES,
+        "shortened to fit: {}",
+        content_length(&seen[1])
+    );
+}
+
+#[test]
+fn shortening_keeps_the_title_techniques_and_source_and_says_how_much_was_cut() {
+    let mut huge = detection();
+    huge.events = vec![Event::Exec(ExecEvent {
+        cmdline: "A".repeat(transport::MAX_DETECTION_BODY_BYTES + 1),
+        ..schema::fixtures::exec()
+    })];
+    let body = transport::fit_detection_to_limit(&huge).unwrap();
+    assert!(body.len() <= transport::MAX_DETECTION_BODY_BYTES);
+    let back: Detection = serde_json::from_slice(&body).expect("still a valid detection");
+    assert!(
+        back.title.starts_with("[events shortened from "),
+        "the note comes first, so a title cut by the server keeps it: {}",
+        back.title
+    );
+    assert!(
+        back.title.ends_with("Unusual process chain"),
+        "{}",
+        back.title
+    );
+    assert_eq!(back.techniques, huge.techniques);
+    assert_eq!(back.severity, huge.severity);
+    assert_eq!(back.source, huge.source);
+    assert_eq!(back.events.len(), 1);
+    // The same detection always gives the same bytes: a retry sends what the first try did.
+    assert_eq!(body, transport::fit_detection_to_limit(&huge).unwrap());
+    // A detection that fits is untouched.
+    let small = detection();
+    assert_eq!(
+        transport::fit_detection_to_limit(&small).unwrap(),
+        serde_json::to_vec(&small).unwrap()
+    );
+}
+
+fn fits_and_parses(detection: &Detection) -> Detection {
+    let body = transport::fit_detection_to_limit(detection).unwrap();
+    assert!(
+        body.len() <= transport::MAX_DETECTION_BODY_BYTES,
+        "never over the limit: {}",
+        body.len()
+    );
+    serde_json::from_slice(&body).expect("still a valid detection")
+}
+
+#[test]
+fn a_title_over_the_limit_is_cut_to_the_servers_limit_and_keeps_its_note_first() {
+    let mut huge = detection();
+    huge.title = "T".repeat(transport::MAX_DETECTION_BODY_BYTES + 1);
+    let back = fits_and_parses(&huge);
+    assert!(back.title.len() <= 64 * 1024, "{}", back.title.len());
+    assert!(back.title.starts_with("[events shortened from "));
+}
+
+#[test]
+fn a_large_argv_array_is_cut_but_the_image_hash_and_path_stay_whole() {
+    let mut huge = detection();
+    let mut exec = ExecEvent {
+        argv: vec!["a".repeat(30); 300_000],
+        cmdline: "x".repeat(1024),
+        ..schema::fixtures::exec()
+    };
+    exec.sha256 = Some("ab".repeat(32));
+    exec.image_path = "/usr/bin/python3".into();
+    huge.events = vec![Event::Exec(exec)];
+    let back = fits_and_parses(&huge);
+    let Event::Exec(kept) = &back.events[0] else {
+        panic!("the exec event is kept")
+    };
+    assert!(
+        kept.argv.len() <= 1024,
+        "the array is cut: {}",
+        kept.argv.len()
+    );
+    assert_eq!(kept.sha256.as_deref(), Some("ab".repeat(32).as_str()));
+    assert_eq!(kept.image_path, "/usr/bin/python3");
+}
+
+#[test]
+fn a_single_event_that_stays_too_big_is_reduced_to_its_identity_and_still_fits() {
+    // The image path is an identity field, never cut by the first step: a nine-megabyte one
+    // leaves no room for even one whole event, so the event is reduced to its identity.
+    let mut huge = detection();
+    let mut exec = schema::fixtures::exec();
+    exec.image_path = "p".repeat(transport::MAX_DETECTION_BODY_BYTES + 1);
+    huge.events = vec![Event::Exec(exec)];
+    let body = transport::fit_detection_to_limit(&huge).unwrap();
+    assert!(body.len() <= transport::MAX_DETECTION_BODY_BYTES);
+    // The stub keeps only identity keys, so it is not a whole `ExecEvent` any more: read it as
+    // JSON (the server takes an event as a free-form record).
+    let back: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let events = back["events"].as_array().expect("events");
+    assert_eq!(events.len(), 1, "one event, identity only");
+    assert_eq!(events[0]["type"], "exec");
+    assert!(events[0].get("cmdline").is_none(), "{}", events[0]);
+    assert!(
+        events[0]["image_path"].as_str().unwrap().len() <= 260,
+        "cut to the identity cap"
+    );
+}
+
+#[test]
+fn many_events_are_dropped_from_the_end_and_measured_once() {
+    let mut huge = detection();
+    // The image path is an identity field and is never cut, so these events stay big after the
+    // strings are shortened: the body only fits by dropping events.
+    huge.events = (0..40_000)
+        .map(|i| {
+            Event::Exec(ExecEvent {
+                cmdline: format!("cmd-{i}"),
+                argv: vec![format!("arg-{i}")],
+                image_path: "i".repeat(200),
+                ..schema::fixtures::exec()
+            })
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    let back = fits_and_parses(&huge);
+    assert!(!back.events.is_empty());
+    assert!(back.events.len() < 40_000, "{}", back.events.len());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "not quadratic: {:?}",
+        started.elapsed()
+    );
+    // The first event is kept, in order.
+    let Event::Exec(first) = &back.events[0] else {
+        panic!()
+    };
+    assert_eq!(first.cmdline, "cmd-0");
+}
+
+#[test]
+fn a_segment_of_refused_records_is_acknowledged_and_counted() {
+    let (url, server) = sequence_server(vec![400, 413]);
+    let (mut uploader, (acked, skipped, dropped)) = recording_uploader(
+        &url,
+        vec![queued(KEY_A, detection()), queued(KEY_B, detection())],
+    );
+    // Handled, not accepted: `0` would read as an empty spool and make the upload loop sleep.
+    assert_eq!(uploader.upload_once().unwrap(), 2);
+    assert_eq!(acked.load(Ordering::SeqCst), 1);
+    assert_eq!(skipped.load(Ordering::SeqCst), 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    server.join().unwrap();
+}
+
+#[test]
+fn refused_records_are_counted_once_when_a_retry_follows_a_transient_failure() {
+    // First pass: A refused for good, B hits a 500, the segment stays spooled and nothing is
+    // counted. Second pass: A is refused again, B goes through, the segment is acknowledged
+    // and A is counted once.
+    let (url, server) = sequence_server(vec![400, 500, 400, 200]);
+    let (mut uploader, (acked, skipped, dropped)) = recording_uploader(
+        &url,
+        vec![queued(KEY_A, detection()), queued(KEY_B, detection())],
+    );
+    assert!(uploader.upload_once().unwrap_err().is_retryable());
+    assert_eq!(acked.load(Ordering::SeqCst), 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 0, "nothing counted yet");
+    assert_eq!(uploader.upload_once().unwrap(), 2);
+    assert_eq!(acked.load(Ordering::SeqCst), 1);
+    assert_eq!(skipped.load(Ordering::SeqCst), 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1, "counted once");
+    server.join().unwrap();
+}
+
+#[test]
+fn an_error_that_is_not_about_one_record_keeps_the_segment_spooled_and_backs_off() {
+    // 401 says the agent is not accepted, not that this record is bad: skipping would erase the
+    // detection (and, one by one, every one behind it during a certificate rotation).
+    let (url, server) = sequence_server(vec![401]);
+    let (mut uploader, (acked, skipped, dropped)) = recording_uploader(
+        &url,
+        vec![queued(KEY_A, detection()), queued(KEY_B, detection())],
+    );
+    let err = uploader.upload_once().unwrap_err();
+    assert!(!err.is_retryable());
+    assert_eq!(skipped.load(Ordering::SeqCst), 0, "not skipped");
+    assert_eq!(acked.load(Ordering::SeqCst), 0, "not acknowledged");
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        0,
+        "not blamed on the records"
+    );
+    assert!(
+        !uploader.backoff_duration().is_zero(),
+        "the loop backs off before the next pass"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn a_409_idempotency_conflict_is_about_one_record_and_does_not_skip_the_segment() {
+    let (url, server) = sequence_server(vec![409, 200]);
+    let (mut uploader, (acked, skipped, dropped)) = recording_uploader(
+        &url,
+        vec![queued(KEY_A, detection()), queued(KEY_B, detection())],
+    );
+    assert_eq!(uploader.upload_once().unwrap(), 2);
+    assert_eq!(acked.load(Ordering::SeqCst), 1);
+    assert_eq!(skipped.load(Ordering::SeqCst), 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    server.join().unwrap();
+}
+
+#[test]
+fn a_422_is_about_one_record() {
+    let (url, server) = sequence_server(vec![422, 200]);
+    let (mut uploader, (acked, skipped, dropped)) = recording_uploader(
+        &url,
+        vec![queued(KEY_A, detection()), queued(KEY_B, detection())],
+    );
+    assert_eq!(uploader.upload_once().unwrap(), 2);
+    assert_eq!(
+        (acked.load(Ordering::SeqCst), skipped.load(Ordering::SeqCst)),
+        (1, 0)
+    );
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    server.join().unwrap();
+}
+
+#[test]
+fn a_400_about_the_agents_certificate_is_not_about_the_record() {
+    // `400 Invalid certificate subject` (route.ts) and a proxy's HTML 400 for a client
+    // certificate that does not verify describe the whole agent: the segment stays spooled and
+    // the loop backs off; the records are not blamed one by one and nothing is erased.
+    for body in [
+        r#"{"error":"Invalid certificate subject"}"#,
+        "<html><body>400 The SSL certificate error</body></html>",
+    ] {
+        let (url, server) = sequence_server_with(vec![(400, body)]);
+        let (mut uploader, (acked, skipped, dropped)) = recording_uploader(
+            &url,
+            vec![queued(KEY_A, detection()), queued(KEY_B, detection())],
+        );
+        let err = uploader.upload_once().unwrap_err();
+        assert!(!err.is_retryable(), "{body}");
+        assert_eq!(skipped.load(Ordering::SeqCst), 0, "{body}");
+        assert_eq!(acked.load(Ordering::SeqCst), 0, "{body}");
+        assert_eq!(dropped.load(Ordering::SeqCst), 0, "{body}");
+        assert!(!uploader.backoff_duration().is_zero(), "{body}");
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn a_refused_record_is_posted_once_per_pass_and_once_more_on_the_retry_only() {
+    // Pass one: A refused (400 Invalid payload), B hits a 500. Pass two re-posts A once and B.
+    let (url, server) = sequence_server(vec![400, 500, 400, 200]);
+    let (mut uploader, _) = recording_uploader(
+        &url,
+        vec![queued(KEY_A, detection()), queued(KEY_B, detection())],
+    );
+    assert!(uploader.upload_once().is_err());
+    assert_eq!(uploader.upload_once().unwrap(), 2);
+    let seen = server.join().unwrap();
+    let posts_of_a = seen
+        .iter()
+        .filter(|h| h.contains(&format!("idempotency-key: {KEY_A}")))
+        .count();
+    assert_eq!(posts_of_a, 2, "once per pass, never twice in one pass");
+}
+
+#[test]
+fn a_validation_400_with_long_details_is_still_about_the_record() {
+    // The route answers `{"error":"Invalid payload","details":[...Zod issues...]}`; thirty issues
+    // pass the 2 KiB cap on the error body, so the JSON arrives cut and only its start can be read.
+    let details = format!(
+        r#"{{"error":"Invalid payload","details":[{}]}}"#,
+        vec![
+            r#"{"code":"invalid_string","validation":"regex","message":"Invalid","path":["attributions",0,"feature"]}"#;
+            30
+        ]
+        .join(",")
+    );
+    let body: &'static str = Box::leak(details.into_boxed_str());
+    assert!(body.len() > 2048);
+    let (url, server) = sequence_server_with(vec![(400, body), (200, r#"{"status":"accepted"}"#)]);
+    let (mut uploader, (acked, skipped, dropped)) = recording_uploader(
+        &url,
+        vec![queued(KEY_A, detection()), queued(KEY_B, detection())],
+    );
+    assert_eq!(uploader.upload_once().unwrap(), 2);
+    assert_eq!(acked.load(Ordering::SeqCst), 1);
+    assert_eq!(skipped.load(Ordering::SeqCst), 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        server.join().unwrap().len(),
+        2,
+        "the second record was posted"
+    );
 }
 
 #[test]

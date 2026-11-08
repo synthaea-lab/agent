@@ -1,8 +1,8 @@
 //! Content regression suite: loads the real detection content from `rules/sigma/`
 //! and asserts that every shipped rule (a) parses and validates inside the engine's
 //! supported subset, (b) fires on its matching sample and (c) ignores its benign
-//! lookalike. Run by CI's content workflow on every rules/ change: a rule nothing can
-//! trigger is dead content and fails here.
+//! lookalike. Run by CI's content job against the `rules` sibling repo: a rule nothing
+//! can trigger is dead content and fails here.
 //!
 //! The samples are data, not test code: `<rule>.yml` has a sibling `<rule>.samples.json`
 //! holding one matching and one non-matching event (ADR-0031). A rule file alone is then
@@ -37,8 +37,9 @@ struct Samples {
     non_matching: Sample,
 }
 
-fn content_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rules/sigma")
+/// The shipped content in the `rules` sibling repo, or `None` (the test skips) without it.
+fn content_dir() -> Option<PathBuf> {
+    Some(siblings::require_path!("rules", "sigma", None))
 }
 
 fn exec(sample: &Sample) -> ExecEvent {
@@ -133,14 +134,16 @@ fn pairing_errors(dir: &Path) -> Vec<String> {
 
 #[test]
 fn every_shipped_rule_has_exactly_its_samples_file() {
-    let errors = pairing_errors(&content_dir());
+    let Some(dir) = content_dir() else { return };
+    let errors = pairing_errors(&dir);
     assert!(errors.is_empty(), "{}", errors.join("\n"));
 }
 
 #[test]
 fn every_shipped_rule_ignores_its_negative_sample() {
-    let engine = SigmaEngine::load_dir(&content_dir()).unwrap();
-    for rule in rule_files(&content_dir()) {
+    let Some(dir) = content_dir() else { return };
+    let engine = SigmaEngine::load_dir(&dir).unwrap();
+    for rule in rule_files(&dir) {
         let title = SigmaEngine::load_rule(&rule).unwrap().title;
         let samples = load_samples(&rule).unwrap_or_else(|e| panic!("{e}"));
         let hits = engine.eval_exec(&exec(&samples.non_matching));
@@ -155,7 +158,7 @@ fn every_shipped_rule_ignores_its_negative_sample() {
 
 #[test]
 fn every_shipped_rule_loads() {
-    let dir = content_dir();
+    let Some(dir) = content_dir() else { return };
     let files = rule_files(&dir);
     assert!(
         !files.is_empty(),
@@ -177,8 +180,9 @@ fn every_shipped_rule_loads() {
 
 #[test]
 fn every_shipped_rule_fires_on_its_sample() {
-    let engine = SigmaEngine::load_dir(&content_dir()).unwrap();
-    for rule in rule_files(&content_dir()) {
+    let Some(dir) = content_dir() else { return };
+    let engine = SigmaEngine::load_dir(&dir).unwrap();
+    for rule in rule_files(&dir) {
         let title = SigmaEngine::load_rule(&rule).unwrap().title;
         let samples = load_samples(&rule).unwrap_or_else(|e| panic!("{e}"));
         let hits = engine.eval_exec(&exec(&samples.matching));
@@ -238,7 +242,8 @@ fn a_samples_file_with_an_unknown_field_or_a_missing_half_is_refused() {
 /// and the rule file it must (or must not) raise.
 #[test]
 fn the_storage_and_paste_rules_cover_each_listed_domain_and_upload_shape() {
-    let engine = SigmaEngine::load_dir(&content_dir()).unwrap();
+    let Some(dir) = content_dir() else { return };
+    let engine = SigmaEngine::load_dir(&dir).unwrap();
     let storage = "Linux curl uploads a file to a cloud storage endpoint";
     let paste = "Linux curl uploads a file to a paste service";
     let fires = |title: &str, cmdline: &str| {
@@ -336,7 +341,8 @@ fn the_storage_and_paste_rules_cover_each_listed_domain_and_upload_shape() {
 fn the_local_and_remote_shell_service_rules_split_on_the_unc_argument() {
     const LOCAL: &str = "Service created with a command-shell binary path";
     const REMOTE: &str = "Remote service created with a command-shell binary path";
-    let engine = SigmaEngine::load_dir(&content_dir()).unwrap();
+    let Some(dir) = content_dir() else { return };
+    let engine = SigmaEngine::load_dir(&dir).unwrap();
     let titles = |cmdline: &str| -> Vec<String> {
         let sample = Sample {
             image: "C:\\Windows\\System32\\sc.exe".into(),
@@ -394,7 +400,8 @@ fn titles_for(engine: &SigmaEngine, parent: Option<&str>, image: &str) -> Vec<St
 fn the_web_server_lineage_rules_cover_every_listed_parent_and_interpreter() {
     const WINDOWS: &str = "Web server or application server spawned a command interpreter";
     const MACOS: &str = "Web server spawned a shell on macOS";
-    let engine = SigmaEngine::load_dir(&content_dir()).unwrap();
+    let Some(dir) = content_dir() else { return };
+    let engine = SigmaEngine::load_dir(&dir).unwrap();
     for parent in [
         "httpd.exe",
         "nginx.exe",
@@ -438,7 +445,8 @@ fn the_web_server_lineage_rules_cover_every_listed_parent_and_interpreter() {
 fn the_web_server_lineage_rules_ignore_lookalikes_and_a_missing_lineage() {
     const WINDOWS: &str = "Web server or application server spawned a command interpreter";
     const MACOS: &str = "Web server spawned a shell on macOS";
-    let engine = SigmaEngine::load_dir(&content_dir()).unwrap();
+    let Some(dir) = content_dir() else { return };
+    let engine = SigmaEngine::load_dir(&dir).unwrap();
     let silent = |parent: Option<&str>, image: &str| {
         let hits = titles_for(&engine, parent, image);
         assert!(

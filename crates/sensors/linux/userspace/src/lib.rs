@@ -32,6 +32,9 @@ mod proc;
 mod sensor;
 #[cfg(all(target_os = "linux", any(ebpf_embedded, test)))]
 mod syscall;
+// Which processes belong to a listed security unit, for the `signal_generate` probe (#1103).
+#[cfg(target_os = "linux")]
+mod unit_procs;
 #[cfg(target_os = "linux")]
 pub use ebpf::{RAW_TRACEPOINTS, load_ebpf, load_program};
 #[cfg(target_os = "linux")]

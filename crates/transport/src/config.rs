@@ -67,6 +67,11 @@ pub struct TransportConfig {
     /// blip means the server was never reached, so it deserves a longer
     /// allowance than a segment the server actively rejected.
     pub max_network_drain_attempts: u32,
+
+    /// The `User-Agent` header the agent sends. `None` leaves the HTTP
+    /// client's own default: the name the agent goes by is the caller's
+    /// identity to choose (#596), not this crate's.
+    pub user_agent: Option<String>,
 }
 
 impl Default for TransportConfig {
@@ -88,6 +93,7 @@ impl Default for TransportConfig {
             heartbeat_interval: Duration::from_secs(30),
             max_drain_attempts: DEFAULT_MAX_DRAIN_ATTEMPTS,
             max_network_drain_attempts: DEFAULT_MAX_NETWORK_DRAIN_ATTEMPTS,
+            user_agent: None,
         }
     }
 }
@@ -115,6 +121,13 @@ impl TransportConfig {
     #[must_use]
     pub fn with_ca_cert(mut self, ca_cert_path: PathBuf) -> Self {
         self.ca_cert_path = Some(ca_cert_path);
+        self
+    }
+
+    /// Sets the `User-Agent` header.
+    #[must_use]
+    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = Some(user_agent.into());
         self
     }
 

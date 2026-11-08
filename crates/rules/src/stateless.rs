@@ -144,6 +144,52 @@ pub(crate) fn check_persistence_write(event: &FileOpenEvent) -> Option<Alert> {
     })
 }
 
+/// Bytes of the kept command line quoted in a [`check_truncated_cmdline`] alert:
+/// enough to recognise the interpreter and the shape of the padding, without
+/// putting up to 32 KiB of attacker-chosen text into every alert message.
+const TRUNCATED_CMDLINE_QUOTE_BYTES: usize = 256;
+
+/// T1027.010 — Obfuscated Files or Information: Command Obfuscation, sub-case a
+/// command line padded past [`schema::ARGV_CAPTURE_BUDGET`] (#1112).
+///
+/// The sensor keeps only the head of such an argv, so every content rule (the
+/// `base64` decode, encoded `PowerShell`, the Sigma content) is blind to what
+/// follows the cut. Padding is attacker-controlled on both sides, so no fixed
+/// window (head, or head and tail) can guarantee the payload is kept; the cut
+/// itself is the signal. Benign data behind the threshold (#1112, one Alpine lab
+/// VM, 3,451 execs): p99.9 347 B, max 1,661 B, none over 4 KiB. Medium, not High:
+/// that sample is one host, and generated build lines or large `docker run`
+/// invocations elsewhere were not measured.
+///
+/// `cmdline_truncated == false` means "no cut seen", not "the whole command line
+/// was seen": a process gone before its argv was read has an empty argv and no
+/// flag (#1118), so this rule cannot see that case.
+#[must_use]
+pub(crate) fn check_truncated_cmdline(event: &ExecEvent) -> Option<Alert> {
+    if !event.cmdline_truncated {
+        return None;
+    }
+    let mut quote_end = event.cmdline.len().min(TRUNCATED_CMDLINE_QUOTE_BYTES);
+    while !event.cmdline.is_char_boundary(quote_end) {
+        quote_end -= 1;
+    }
+    Some(Alert {
+        technique: "T1027.010",
+        severity: Severity::Medium,
+        message: format!(
+            "pid={} comm={} image={}: command line over {} bytes, cut at capture; content \
+             rules did not see its tail ({} bytes kept, {} args): {}",
+            event.meta.pid,
+            event.meta.comm,
+            event.image_path,
+            schema::ARGV_CAPTURE_BUDGET,
+            event.cmdline.len(),
+            event.argv.len(),
+            &event.cmdline[..quote_end],
+        ),
+    })
+}
+
 /// Evaluates all stateless rules applicable to an `ExecEvent`. T1620 memfd-exec
 /// (`RuleState::check_memfd_exec`) is not among them: it now needs
 /// `MemfdCreateEvent` correlation state, see that method's doc (#497).
@@ -158,6 +204,8 @@ pub fn evaluate_exec(event: &ExecEvent) -> Vec<Alert> {
         .chain(check_event_logging_disable_exec(event))
         .chain(crate::osascript::check_osascript_password_prompt(event))
         .chain(crate::securitytool::check_security_tool_stop(event))
+        .chain(crate::securitytool::check_security_tool_throttle(event))
+        .chain(check_truncated_cmdline(event))
         .collect()
 }
 
@@ -745,6 +793,7 @@ pub fn evaluate_file_open(event: &FileOpenEvent) -> Vec<Alert> {
         .chain(check_systemd_service_persistence(event))
         .chain(check_btm_launch_item_persistence(event))
         .chain(check_alternate_data_stream_write(event))
+        .chain(crate::securitytool::check_security_tool_cgroup_write(event))
         .collect()
 }
 
@@ -1252,6 +1301,9 @@ pub fn evaluate_log_cleared(event: &schema::LogClearedEvent) -> Vec<Alert> {
     }]
 }
 
+/// `SIGKILL`: the same on Linux and macOS.
+const SIGKILL: u32 = 9;
+
 /// `SIGSTOP`'s platform-native number: the one signal of
 /// [`tamper_signal_name`]'s set that differs between Linux and macOS. Signal
 /// events carry the sending host's numbering, and rules run on that same host.
@@ -1274,6 +1326,26 @@ fn tamper_signal_name(signal: u32) -> Option<&'static str> {
     }
 }
 
+/// Linux signals that neither end nor stop a process by default (`signal(7)`): `SIGCHLD`,
+/// `SIGCONT`, `SIGURG`, `SIGWINCH`. Every other number from 1 to 64 ends or stops one with no
+/// handler, `SIGUSR1`, `SIGSEGV`, `SIGPIPE` and the real-time signals included.
+const LINUX_BENIGN_SIGNALS: [u32; 4] = [17, 18, 23, 28];
+
+/// The label of `signal` when it is worth an alert for `tool_event`, an event naming a listed
+/// security tool (Linux, #1103): the listed signals by name, any other default-terminating one
+/// as `signal` with its number in parentheses. A tool dies of any of them unless it handles it, and which ones each tool
+/// handles is not known here.
+fn signal_label(signal: u32, tool_event: bool) -> Option<std::borrow::Cow<'static, str>> {
+    if let Some(name) = tamper_signal_name(signal) {
+        return Some(name.into());
+    }
+    (cfg!(target_os = "linux")
+        && tool_event
+        && (1..=64).contains(&signal)
+        && !LINUX_BENIGN_SIGNALS.contains(&signal))
+    .then(|| "signal".into())
+}
+
 /// The process id of the service manager: `systemd` on Linux, `launchd` on macOS. The Linux probe
 /// reports the sender's thread-group id from the **initial** pid namespace, so a container's own
 /// init is not 1 here, and only the host's manager is.
@@ -1282,8 +1354,8 @@ const INIT_PID: u32 = 1;
 /// T1562.001 — Impair Defenses: Disable or Modify Tools, the process-termination
 /// half (issue #362). Every [`schema::SignalEvent`] already targets a protected
 /// security process: the sensors filter at the source (Linux: the eBPF
-/// `SIGNAL_WATCH_PID` gate on the agent's own pid; macOS: the Endpoint Security
-/// client gate). This rule only keeps the signals that end or freeze the target, and
+/// `SIGNAL_WATCH_PID` gate on the agent's own pid, and `SIGNAL_WATCH_TOOLS` for the processes of
+/// the listed security units (#1103); macOS: the Endpoint Security client gate). This rule only keeps the signals that end or freeze the target, and
 /// then looks at the **sender** (#1103), which is all the event says about the actor:
 /// `meta` is the sender's pid, parent, comm, uid and container, with no cgroup or unit.
 ///
@@ -1296,7 +1368,21 @@ const INIT_PID: u32 = 1;
 ///   say who asked the manager. Who did is the exec rule's (`check_security_tool_stop`,
 ///   which parses `systemctl stop` and `systemctl kill`) and the journal's, not this rule's.
 ///   A D-Bus stop has no exec: only the journal sees it.
-/// - Anyone else: High, as before.
+/// - Anyone else: High, as before, **for the agent itself**. For a listed security tool (the
+///   event carries `target_unit`, Linux, #1103) the signal decides:
+///   - **Caught reload signals**: a daemon that catches `SIGHUP`, `SIGUSR1`, `SIGUSR2` or a
+///     real-time signal takes it as "reload" or "reopen your logs" (logrotate's `postrotate`,
+///     `ExecReload=`, `systemctl reload`), the commonest benign signals a tool gets. The Linux
+///     sensor drops them in the kernel for such a tool (the process's `SigCgt` at scan time), so
+///     one that reaches this rule was sent to a tool with **no handler** for it, which ends it:
+///     Medium like the other catchable signals. The agent keeps `SIGHUP` as High, it does not
+///     reload on it.
+///   - `SIGKILL` and `SIGSTOP`, which cannot be handled, are **High**.
+///   - The catchable ones that end a daemon (`SIGTERM`, `SIGINT`, `SIGQUIT`, `SIGABRT`, and any
+///     other signal whose default action terminates: `SIGUSR1`, `SIGPIPE`, `SIGALRM`, a
+///     real-time signal, reported as `signal N`) are **Medium**: an administrator's `kill <pid>`, or `service auditd stop` (whose helper sends
+///     the `SIGTERM` itself, not pid 1), is indistinguishable from an attacker's, exactly as
+///     `systemctl stop auditd` is Medium in `check_security_tool_stop`.
 ///
 /// What it **cannot** tell: whether a sender other than pid 1 is the agent's own
 /// supervisor (the watchdog) or another process of the same unit, since the event has
@@ -1309,7 +1395,12 @@ const INIT_PID: u32 = 1;
 /// restarted agent, so that alert arrives one restart late.
 #[must_use]
 pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Option<Alert> {
-    let name = tamper_signal_name(event.signal)?;
+    if event.signals_lost != 0 {
+        // The sensor's loss report, not a signal: `check_signal_events_lost`.
+        return None;
+    }
+    let tool = event.target_unit.is_some();
+    let name = signal_label(event.signal, tool)?;
     if event.meta.pid == event.target_pid {
         return None;
     }
@@ -1318,16 +1409,32 @@ pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Opti
         schema::User::Unix { uid, .. } => format!(" uid={uid}"),
         _ => String::new(),
     };
-    let from_manager = event.meta.pid == INIT_PID;
+    // The unit the source resolved (Linux, #1103): which tool it was, not only which image.
+    let unit = event
+        .target_unit
+        .as_deref()
+        .map(|unit| format!(" of unit {unit}"))
+        .unwrap_or_default();
+    // With an unreliable sender, `meta` may be a bystander that happens to be pid 1.
+    let from_manager = event.meta.pid == INIT_PID && !event.sender_unreliable;
+    // `si_code` of interrupt or completion context (or forged): `meta` may be a bystander.
+    let unreliable = if event.sender_unreliable {
+        ": the sender is not reliable (the siginfo carries a code the kernel sets from interrupt \
+         context, which a process can also forge)"
+    } else {
+        ""
+    };
     Some(Alert {
         technique: "T1562.001",
         severity: if from_manager {
             Severity::Low
+        } else if tool && event.signal != SIGKILL && event.signal != SIGSTOP {
+            Severity::Medium
         } else {
             Severity::High
         },
         message: format!(
-            "pid={} comm={}{sender_uid}: sent {name} ({}) to security process pid={} ({target}){}",
+            "pid={} comm={}{sender_uid}: sent {name} ({}) to security process pid={} ({target}){unit}{}",
             event.meta.pid,
             event.meta.comm,
             event.signal,
@@ -1338,6 +1445,31 @@ pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Opti
             } else {
                 ""
             },
+        ) + unreliable,
+    })
+}
+
+/// T1562.001: signals to security tools were lost to a full ring buffer (Linux, #1103). A flood
+/// of signals ahead of a kill is how a tool is ended unseen, so the loss is a finding by itself.
+/// **High**, like the `SIGKILL` it can hide: what was lost may be the kill, and nothing after the
+/// fact says which signals they were (measured: 20,000 ignored `SIGPIPE` ahead of a `kill -9`
+/// left no `SIGKILL` event, only this report).
+///
+/// The count is `SignalEvent::signals_lost`, a field only the sensor's own report sets: not a bit
+/// of `FileOpenEvent::flags`, which an unprivileged `open(2)` can set (`O_TMPFILE` did).
+#[must_use]
+pub(crate) fn check_signal_events_lost(event: &schema::SignalEvent) -> Option<Alert> {
+    if event.signals_lost == 0 {
+        return None;
+    }
+    Some(Alert {
+        technique: "T1562.001",
+        severity: Severity::High,
+        message: format!(
+            "{} signals to security tools lost, signal ring buffer full: a flood of signals to a \
+             security tool, or one too busy to read them, can hide a kill, and the lost signals \
+             may include the SIGKILL, so this is High",
+            event.signals_lost
         ),
     })
 }
@@ -1345,7 +1477,10 @@ pub(crate) fn check_security_process_signal(event: &schema::SignalEvent) -> Opti
 /// Evaluates all stateless rules applicable to a `SignalEvent`.
 #[must_use]
 pub fn evaluate_signal(event: &schema::SignalEvent) -> Vec<Alert> {
-    check_security_process_signal(event).into_iter().collect()
+    check_security_process_signal(event)
+        .into_iter()
+        .chain(check_signal_events_lost(event))
+        .collect()
 }
 
 /// Outbound ports [`check_service_unusual_outbound`] (T1071, issue #478)

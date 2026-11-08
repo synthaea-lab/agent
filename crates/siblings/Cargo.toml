@@ -1,0 +1,14 @@
+[package]
+name = "siblings"
+version = "0.1.0"
+description = "Test support: locate sibling repos (server, ml, rules, ...) of the umbrella checkout for cross-repo contract tests"
+license.workspace = true
+edition.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# No dependencies by design: this crate is a dev-dependency of anything in the
+# workspace (tools/check-deps.py), so it must not pull anything in.
+[dependencies]

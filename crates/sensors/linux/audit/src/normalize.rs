@@ -25,6 +25,9 @@ pub fn exec_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
         panic!("normalize::exec_event called on non-Exec event");
     };
 
+    let mut argv = argv.clone();
+    let cmdline_truncated = schema::bound_argv(&mut argv);
+
     Event::Exec(ExecEvent {
         meta: EventMeta {
             timestamp_ns,
@@ -41,7 +44,8 @@ pub fn exec_event(evt: &AuditEvent, timestamp_ns: u64) -> Event {
         },
         image_path: image_path.clone(),
         cmdline: argv.join(" "),
-        argv: argv.clone(),
+        argv,
+        cmdline_truncated,
         parent_comm: None, // HONEST: audit doesn't track parent
         parent_image_path: None,
         sha256: None, // Filled by enrichment
@@ -163,11 +167,30 @@ mod tests {
                 assert_eq!(e.image_path, "/bin/ls");
                 assert_eq!(e.cmdline, "/bin/ls -la");
                 assert_eq!(e.argv, vec!["/bin/ls", "-la"]);
+                assert!(!e.cmdline_truncated);
                 assert_eq!(e.parent_comm, None);
                 assert_eq!(e.parent_image_path, None);
             }
             _ => panic!("expected Event::Exec"),
         }
+    }
+
+    #[test]
+    fn exec_event_cuts_a_padded_argv_and_flags_it() {
+        // #1112, auditd side: EXECVE records carry the whole argv too.
+        let audit_evt = AuditEvent::Exec {
+            pid: 1234,
+            uid: 1000,
+            gid: 1000,
+            image_path: "/bin/sh".to_string(),
+            argv: vec!["/bin/sh".into(), "-c".into(), "Q".repeat(2 * 1024 * 1024)],
+        };
+        let Event::Exec(e) = exec_event(&audit_evt, 0) else {
+            panic!("expected Event::Exec");
+        };
+        assert!(e.cmdline_truncated);
+        assert_eq!(e.argv[..2], ["/bin/sh", "-c"], "the head is kept");
+        assert!(e.cmdline.len() < schema::ARGV_CAPTURE_BUDGET);
     }
 
     #[test]

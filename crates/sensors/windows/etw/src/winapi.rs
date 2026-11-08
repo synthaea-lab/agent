@@ -1,12 +1,15 @@
 //! Win32/NT API access for enrichment of ETW events: real command lines (F-1),
-//! token identity (F-3), the volume map (F-5), and process-table seeding. Every
-//! function here is best-effort — a failure degrades one field, never the event.
+//! token identity (F-3), the volume map (F-5), process-table seeding, and server
+//! silo membership (#371). Every function here is best-effort — a failure degrades one field, never the event.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use schema::User;
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
+    Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE},
     Security::{
         Authorization::ConvertSidToStringSidW, GetTokenInformation, TOKEN_MANDATORY_LABEL,
         TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenUser,
@@ -20,9 +23,10 @@ use windows_sys::Win32::{
                 TH32CS_SNAPPROCESS,
             },
         },
+        RemoteDesktop::ProcessIdToSessionId,
         Threading::{
-            OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-            PROCESS_VM_READ, QueryFullProcessImageNameW,
+            GetProcessTimes, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
+            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ, QueryFullProcessImageNameW,
         },
     },
 };
@@ -323,10 +327,20 @@ pub(crate) fn long_path_name(path: &str) -> Option<String> {
 
 // ── Process-table seeding + live lookup (carried over from the old sensor) ───
 
-/// Fills the pid→image table with every process running at call time (before the
-/// trace starts), so network events from already-running processes resolve — and
-/// the rules' parent-side exclusions apply to pre-existing parents.
-pub(crate) fn snapshot_processes() -> Vec<(u32, String)> {
+/// One process of a toolhelp snapshot.
+pub(crate) struct ProcessEntry {
+    pub(crate) pid: u32,
+    /// The pid of the process that created it (it may have exited since, and its pid
+    /// been reused).
+    pub(crate) parent_pid: u32,
+    /// The image's file name, no directory.
+    pub(crate) name: String,
+}
+
+/// Every process running at call time (before the trace starts): fills the pid→image
+/// table, so network events from already-running processes resolve — and the rules'
+/// parent-side exclusions apply to pre-existing parents — and finds LSASS (#720).
+pub(crate) fn snapshot_processes() -> Vec<ProcessEntry> {
     let mut out = Vec::new();
     // SAFETY: the snapshot handle is checked against INVALID_HANDLE_VALUE and
     // closed; PROCESSENTRY32W is zeroed with dwSize set before the first call,
@@ -346,10 +360,11 @@ pub(crate) fn snapshot_processes() -> Vec<(u32, String)> {
                     .iter()
                     .position(|&c| c == 0)
                     .unwrap_or(entry.szExeFile.len());
-                out.push((
-                    entry.th32ProcessID,
-                    String::from_utf16_lossy(&entry.szExeFile[..end]),
-                ));
+                out.push(ProcessEntry {
+                    pid: entry.th32ProcessID,
+                    parent_pid: entry.th32ParentProcessID,
+                    name: String::from_utf16_lossy(&entry.szExeFile[..end]),
+                });
                 if Process32NextW(snap, &mut entry) == 0 {
                     break;
                 }
@@ -412,6 +427,97 @@ pub(crate) fn resolve_pid_live(pid: u32) -> Option<String> {
     }
 }
 
+/// The session the process runs in (#720: the system LSASS runs in session 0). `None`
+/// when it cannot be queried (exited, or access refused).
+pub(crate) fn process_session_id(pid: u32) -> Option<u32> {
+    let mut session = 0u32;
+    // SAFETY: ProcessIdToSessionId writes one u32 through a valid pointer to a local.
+    let ok = unsafe { ProcessIdToSessionId(pid, &mut session) };
+    (ok != 0).then_some(session)
+}
+
+/// When the process was created, in Unix nanoseconds (#720: whether the owner of a thread
+/// existed before the thread could be its initial one). `None` when it cannot be opened.
+/// `PROCESS_QUERY_LIMITED_INFORMATION` is enough, protected processes included.
+pub(crate) fn process_create_time_ns(pid: u32) -> Option<u64> {
+    // SAFETY: the handle is null-checked and closed on every path; GetProcessTimes
+    // writes four FILETIMEs through valid pointers to locals.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        let ok = GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user);
+        CloseHandle(process);
+        if ok == 0 {
+            return None;
+        }
+        let raw = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+        let raw = i64::try_from(raw).ok()?;
+        Some(crate::normalize::filetime_to_ns(raw))
+    }
+}
+
+// ── #371: server silo membership ─────────────────────────────────────────────
+
+/// `ProcessMembershipInformation`: a `PROCESS_MEMBERSHIP_INFORMATION`, one
+/// `ULONG ServerSiloId` (ntddk.h, Windows 11 22H2 and later).
+const PROCESS_MEMBERSHIP_INFORMATION: u32 = 109;
+const STATUS_INVALID_INFO_CLASS: i32 = 0xC000_0003_u32 as i32;
+
+/// Set by the first "unknown class" answer: an older build never learns it.
+static SILO_QUERY_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+
+/// The server silo the process runs in, 0 for the host. `None` when it cannot
+/// be opened (exited, protected) or the build predates the query; after one
+/// "unsupported" answer the query is not tried again.
+pub(crate) fn read_server_silo_id(pid: u32) -> Option<u32> {
+    if SILO_QUERY_UNSUPPORTED.load(Ordering::Relaxed) {
+        return None;
+    }
+    match query_server_silo(pid)? {
+        Ok(silo) => Some(silo),
+        Err(STATUS_INVALID_INFO_CLASS) => {
+            if !SILO_QUERY_UNSUPPORTED.swap(true, Ordering::Relaxed) {
+                tracing::info!(
+                    "server silo query unsupported on this build: no container attribution"
+                );
+            }
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+/// The raw query: `None` when the process cannot be opened, else the silo or
+/// the failing `NTSTATUS`.
+fn query_server_silo(pid: u32) -> Option<Result<u32, i32>> {
+    // SAFETY: the handle is null-checked and closed on every path;
+    // NtQueryInformationProcess writes at most the 4 bytes of the local u32.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let mut silo = 0u32;
+        let mut ret_len = 0u32;
+        let status = NtQueryInformationProcess(
+            process,
+            PROCESS_MEMBERSHIP_INFORMATION,
+            (&mut silo as *mut u32).cast(),
+            size_of::<u32>() as u32,
+            &mut ret_len,
+        );
+        CloseHandle(process);
+        Some(if status == 0 { Ok(silo) } else { Err(status) })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
@@ -441,6 +547,17 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(expanded, long);
         assert!(expanded.unwrap().ends_with(r"\a long file name.exe"));
+    }
+
+    #[test]
+    fn a_host_process_is_in_no_server_silo() {
+        // Silo 0 on Windows 11 22H2 / Server 2025 and later, "unknown class" on
+        // an older build. Any other status (a wrong buffer size, access denied
+        // on our own process) or a non-zero silo is a broken query.
+        match query_server_silo(std::process::id()) {
+            Some(Ok(0) | Err(STATUS_INVALID_INFO_CLASS)) => {}
+            other => panic!("unexpected server silo query result: {other:?}"),
+        }
     }
 
     #[test]

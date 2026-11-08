@@ -112,6 +112,40 @@ pub(crate) fn wherefroms_urls(bytes: &[u8]) -> (Option<String>, Option<String>) 
     (strings.next(), strings.next())
 }
 
+/// The shim caps argv at `SYN_ES_MAX_ARGV` *entries*, which bounds the count but
+/// not the bytes: macOS still admits about 1 MiB of argv in one exec, so the byte
+/// budget applies here as on Linux (#1112), and either cut sets the flag.
+fn exec(
+    meta: &RawMeta,
+    image_path: &str,
+    argv: &[String],
+    shim_truncated: bool,
+    cs_flags: u32,
+    parent_path: Option<&str>,
+) -> Event {
+    let mut argv = argv.to_vec();
+    let cut = schema::bound_argv(&mut argv);
+    Event::Exec(ExecEvent {
+        meta: event_meta(meta),
+        image_path: image_path.to_owned(),
+        // Display/Sigma-friendly form, same choice as the Linux userspace
+        // sensor; ML consumers use ExecEvent::ml_cmdline (NUL-joined argv).
+        cmdline: argv.join(" "),
+        argv,
+        cmdline_truncated: shim_truncated || cut,
+        parent_comm: parent_path.map(basename),
+        parent_image_path: parent_path.map(str::to_owned),
+        sha256: None,
+        signature: Some(signature_from_cs_flags(cs_flags)),
+        original_file_name: None, // Filled by enrichment (#983); Mach-O has no PE resource
+        company_name: None,
+        file_description: None,
+        product_name: None,
+        image_file_id: None,
+        env_security: Vec::new(),
+    })
+}
+
 /// Maps one raw ES record to its schema event.
 ///
 /// Total today (every [`RawEsEvent`] variant produces an event) but kept
@@ -124,30 +158,20 @@ pub fn normalize(raw: &RawEsEvent) -> Option<Event> {
             meta,
             image_path,
             argv,
-            argv_truncated: _,
+            argv_truncated,
             signing_id: _,
             team_id: _,
             cs_flags,
             is_platform_binary: _,
             parent_path,
-        } => Some(Event::Exec(ExecEvent {
-            meta: event_meta(meta),
-            image_path: image_path.clone(),
-            // Display/Sigma-friendly form, same choice as the Linux userspace
-            // sensor; ML consumers use ExecEvent::ml_cmdline (NUL-joined argv).
-            cmdline: argv.join(" "),
-            argv: argv.clone(),
-            parent_comm: parent_path.as_deref().map(basename),
-            parent_image_path: parent_path.clone(),
-            sha256: None,
-            signature: Some(signature_from_cs_flags(*cs_flags)),
-            original_file_name: None, // Filled by enrichment (#983); Mach-O has no PE resource
-            company_name: None,
-            file_description: None,
-            product_name: None,
-            image_file_id: None,
-            env_security: Vec::new(),
-        })),
+        } => Some(exec(
+            meta,
+            image_path,
+            argv,
+            *argv_truncated,
+            *cs_flags,
+            parent_path.as_deref(),
+        )),
         RawEsEvent::Open { meta, path, fflag } => Some(Event::FileOpen(FileOpenEvent {
             meta: event_meta(meta),
             path: path.clone(),
@@ -284,6 +308,9 @@ pub fn normalize(raw: &RawEsEvent) -> Option<Event> {
             signal: *signal,
             target_pid: *target_pid,
             target_image_path: target_path.clone(),
+            target_unit: None,
+            sender_unreliable: false,
+            signals_lost: 0,
         })),
         RawEsEvent::XpcConnect {
             meta,
@@ -395,6 +422,41 @@ mod tests {
         assert_eq!(exec.signature, Some(Signature::Valid));
         // ML canonical form stays NUL-joined regardless of the display cmdline.
         assert_eq!(exec.ml_cmdline(), "zsh\0-c\0id\0");
+        assert!(!exec.cmdline_truncated);
+    }
+
+    fn raw_exec(argv: Vec<String>, argv_truncated: bool) -> RawEsEvent {
+        RawEsEvent::Exec {
+            meta: meta(),
+            image_path: "/bin/sh".to_string(),
+            argv,
+            argv_truncated,
+            signing_id: None,
+            team_id: None,
+            cs_flags: CS_VALID,
+            is_platform_binary: true,
+            parent_path: None,
+        }
+    }
+
+    #[test]
+    fn exec_flags_the_shims_entry_cap() {
+        // The shim's SYN_ES_MAX_ARGV cut was computed and then dropped (#1112).
+        let Some(Event::Exec(exec)) = normalize(&raw_exec(vec!["sh".to_string()], true)) else {
+            panic!("exec must normalize to Event::Exec");
+        };
+        assert!(exec.cmdline_truncated);
+    }
+
+    #[test]
+    fn exec_cuts_a_padded_argv_within_the_entry_cap() {
+        // 3 entries pass the shim's 128-entry cap; ~1 MiB of bytes must not (#1112).
+        let argv = vec!["sh".to_string(), "-c".into(), "Q".repeat(1024 * 1024)];
+        let Some(Event::Exec(exec)) = normalize(&raw_exec(argv, false)) else {
+            panic!("exec must normalize to Event::Exec");
+        };
+        assert!(exec.cmdline_truncated);
+        assert!(exec.cmdline.len() < schema::ARGV_CAPTURE_BUDGET);
     }
 
     #[test]

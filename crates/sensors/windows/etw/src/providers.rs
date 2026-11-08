@@ -23,8 +23,8 @@ use crate::{
     amsi,
     cross_process::{self, ThreadOrigin},
     normalize,
-    sensor::{SharedState, basename},
-    winapi, zone_identifier,
+    sensor::{SharedState, basename, find_lsass},
+    silo, winapi, zone_identifier,
 };
 
 const KERNEL_PROCESS_GUID: &str = "22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716";
@@ -103,12 +103,13 @@ fn sequence_number(parser: &Parser, field: &str) -> Option<u64> {
 }
 
 /// Kernel-Process keywords the sensor reads: `WINEVENT_KEYWORD_PROCESS` (0x10,
-/// EIDs 1/2), `WINEVENT_KEYWORD_THREAD` (0x20, EID 3 for remote threads, #720) and
-/// `WINEVENT_KEYWORD_IMAGE` (0x40, EID 5). Left unset, ferrisetw enables every
-/// keyword. #726 had taken THREAD out when nothing read thread starts; #720 reads
-/// them, and the thread stops (EID 4) the keyword brings along are dropped on their
-/// id before any parsing (#715: 55 to 71 starts per second on an idle host).
-const KERNEL_PROCESS_KEYWORDS: u64 = 0x10 | 0x20 | 0x40;
+/// EIDs 1/2), `WINEVENT_KEYWORD_THREAD` (0x20, EID 3 for remote threads, #720),
+/// `WINEVENT_KEYWORD_IMAGE` (0x40, EID 5) and `WINEVENT_KEYWORD_JOB_SILO` (0x4000, the
+/// server silo EIDs 23-26, #371). Left unset, ferrisetw enables every keyword. #726 had
+/// taken THREAD out when nothing read thread starts; #720 reads them, and the thread
+/// stops (EID 4) the keyword brings along are dropped on their id before any parsing
+/// (#715: 55 to 71 starts per second on an idle host).
+const KERNEL_PROCESS_KEYWORDS: u64 = 0x10 | 0x20 | 0x40 | 0x4000;
 /// Kernel-Process `ThreadStart`.
 const THREAD_START: u16 = 3;
 
@@ -120,11 +121,12 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
         let eid = record.event_id();
         // 1=ProcessStart (new spawn → ExecEvent), 2=ProcessEnd (prune the store —
-        // PID recycling), 5=ImageLoad (DLL/EXE mapped into a process). Processes
-        // already running come from the pid-store seed, not from a rundown (that
-        // would be EID 15). 3=ThreadStart, for a thread started in another process
-        // (#720); its sibling 4=ThreadStop is dropped here.
-        if eid != 1 && eid != 2 && eid != 5 && eid != THREAD_START {
+        // PID recycling), 5=ImageLoad (DLL/EXE mapped into a process), 23-26=server
+        // silo create/terminate callbacks (#371). Processes already running come from
+        // the pid-store seed, not from a rundown (that would be EID 15). 3=ThreadStart,
+        // for a thread started in another process (#720); its sibling 4=ThreadStop is
+        // dropped here.
+        if !matches!(eid, 1 | 2 | 5 | THREAD_START | 23..=26) {
             return;
         }
         state.events_seen.fetch_add(1, Ordering::Relaxed);
@@ -143,11 +145,18 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             if pid != 0 {
                 state.pids.lock().unwrap().remove(pid);
                 state.threads.lock().unwrap().process_ended(pid);
-                // LSASS does not end short of a reboot; a recycled pid is not it.
-                let _ =
-                    state
-                        .lsass_pid
-                        .compare_exchange(pid, 0, Ordering::Relaxed, Ordering::Relaxed);
+                // LSASS does not end short of a crash (and reboot): look it up again
+                // rather than leave the slot empty. A copy's end changes nothing.
+                state.lsass.process_ended(pid, || find_lsass(&state));
+            }
+            return;
+        }
+
+        if eid >= 23 {
+            // #371: a server silo is created or torn down, so whichever
+            // container its id named is stale.
+            if let Ok(silo) = parser.try_parse::<u32>("Job ID") {
+                state.silos.lock().unwrap().forget(silo);
             }
             return;
         }
@@ -191,7 +200,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             .unwrap()
             .process_started(pid, timestamp_ns);
         if cross_process::is_lsass_image(&image_path, &state.system_root) {
-            state.lsass_pid.store(pid, Ordering::Relaxed);
+            take_lsass_slot(&parser, pid, ppid, &image_path, &state);
         }
 
         // #725: ProcessStart v4+ carries both incarnation stamps; an older
@@ -199,13 +208,20 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         let generation = sequence_number(&parser, "ProcessSequenceNumber");
         let parent_generation = sequence_number(&parser, "ParentProcessSequenceNumber");
 
-        // Never store "<unknown>": a cache hit on it would suppress live lookups.
-        if image_path != "<unknown>" {
-            state
-                .pids
-                .lock()
-                .unwrap()
-                .insert(pid, image_path.clone(), generation);
+        // #371: read while the process most likely still runs; one already
+        // gone is in its parent's silo.
+        let parent_silo = state.pids.lock().unwrap().silo(ppid);
+        let silo = silo::exec_silo(winapi::read_server_silo_id(pid), parent_silo);
+        {
+            let mut pids = state.pids.lock().unwrap();
+            // Never cache "<unknown>" as the image: a hit on it would suppress
+            // live lookups. The silo is kept either way, or the process's
+            // events would read as the host's.
+            if image_path == "<unknown>" {
+                pids.insert_without_image(pid, generation, silo);
+            } else {
+                pids.insert(pid, image_path.clone(), generation, silo);
+            }
         }
         // Lineage at exec time (schema parent fields): the parent is usually alive
         // and already in the store.
@@ -239,6 +255,7 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
             image_path,
             cmdline,
             argv: vec![], // Windows has a flat command line; consumers fall back
+            cmdline_truncated: false, // CreateProcess caps it at 32,766 UTF-16 units (#1112)
             env_security: Vec::new(), // no exec-environment capture on Windows yet (#363 is Linux-only)
             parent_comm,
             parent_image_path,
@@ -257,11 +274,43 @@ pub(crate) fn process_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>
         .build()
 }
 
+/// #720: a `ProcessStart` of LSASS's image takes the tracked-LSASS slot only when the
+/// process is the system LSASS (session 0, started by wininit) and the slot is empty
+/// (#1150 review: a copy started by hand must not take it, nor end it).
+fn take_lsass_slot(
+    parser: &Parser<'_, '_>,
+    pid: u32,
+    ppid: u32,
+    image_path: &str,
+    state: &SharedState,
+) {
+    let session_id = parser.try_parse::<u32>("SessionID").ok();
+    let parent_image_path = full_image_path(ppid, state);
+    let claim = cross_process::LsassClaim {
+        image_path,
+        session_id,
+        parent_image_path: parent_image_path.as_deref(),
+    };
+    if state.lsass.process_started(pid, &claim, &state.system_root) {
+        tracing::info!(pid, "LSASS started: opens of it are watched");
+    } else if state.lsass.pid() != pid {
+        tracing::warn!(
+            pid,
+            ppid,
+            session_id,
+            tracked = state.lsass.pid(),
+            "a process started from LSASS's image is not the system LSASS: not tracked"
+        );
+    }
+}
+
 /// Kernel-Process 3 (`ThreadStart`): forwards a thread started in another user process
 /// as a [`RemoteThreadEvent`] (#720, the native Sysmon 8). `owner` is the record's
 /// `ProcessID`, the process the thread belongs to; the creator is the header pid.
 /// [`cross_process::ThreadOrigins`] drops the own-process, kernel and initial threads;
-/// what is left is deduplicated per (creator, owner) and budgeted per creator.
+/// what is left is deduplicated per (creator, owner, start-address bucket) and budgeted
+/// per creator, a thread into LSASS excepted from the budget
+/// ([`cross_process::admit_remote_thread`]).
 ///
 /// # Field notes (manifest, Windows 11 build 26300, 2026-11-05)
 ///
@@ -283,25 +332,11 @@ fn forward_remote_thread(
         .unwrap()
         .classify(creator, owner, timestamp_ns, || {
             state.pids.lock().unwrap().contains(owner)
+                || winapi::process_create_time_ns(owner).is_some_and(|created| {
+                    cross_process::created_before_window(created, timestamp_ns)
+                })
         });
     if origin != ThreadOrigin::Remote {
-        return;
-    }
-    let pair = format!("{creator}>{owner}");
-    if !state
-        .remote_threads
-        .lock()
-        .unwrap()
-        .first(&pair, timestamp_ns)
-    {
-        return;
-    }
-    if !state
-        .remote_thread_budget
-        .lock()
-        .unwrap()
-        .spend(creator, timestamp_ns)
-    {
         return;
     }
     let pointer = |name: &str| {
@@ -311,6 +346,19 @@ fn forward_remote_thread(
     };
     let start_address =
         cross_process::start_address(pointer("Win32StartAddr"), pointer("StartAddr"));
+    let key = cross_process::remote_thread_key(creator, owner, start_address);
+    // Lock order: dedup, then budget; neither is taken elsewhere with the other.
+    let admitted = cross_process::admit_remote_thread(
+        &mut state.remote_threads.lock().unwrap(),
+        &mut state.remote_thread_budget.lock().unwrap(),
+        &key,
+        creator,
+        state.lsass.is(owner),
+        timestamp_ns,
+    );
+    if !admitted {
+        return;
+    }
     let target_image_path = state.pids.lock().unwrap().get(owner).map(str::to_owned);
     let comm = state.comm_for(creator).unwrap_or_default();
     sink.on_event(Event::RemoteThread(RemoteThreadEvent {
@@ -322,7 +370,19 @@ fn forward_remote_thread(
     }));
 }
 
-/// Opens of LSASS that can read its memory (#720, the native Sysmon 10, T1003.001), from
+/// The full image path of `pid` (#960: what the LSASS rule decides an expected reader on;
+/// #720: LSASS's parent):
+/// the pid store's when it holds a path, else a live lookup. The startup seed stores only
+/// file names (toolhelp), and a bare name is exactly what a renamed dumper controls, so it
+/// is never returned as a path.
+fn full_image_path(pid: u32, state: &SharedState) -> Option<String> {
+    let cached = state.pids.lock().unwrap().get(pid).map(str::to_owned);
+    cached
+        .filter(|path| path.contains('\\'))
+        .or_else(|| winapi::resolve_pid_live(pid).map(|path| state.normalize_path(&path)))
+}
+
+/// Opens of LSASS that can reach its memory (#720, the native Sysmon 10, T1003.001), from
 /// Microsoft-Windows-Kernel-Audit-API-Calls EID 5 (`PsOpenProcess`). Every other id, and
 /// every open of another process, is dropped before anything else: #715 counted 280 to
 /// 330 opens per second on an idle host, about half of them with `PROCESS_VM_READ`, so
@@ -340,7 +400,7 @@ pub(crate) fn audit_api_provider(sink: Arc<dyn EventSink>, state: Arc<SharedStat
             return;
         }
         state.events_seen.fetch_add(1, Ordering::Relaxed);
-        let lsass = state.lsass_pid.load(Ordering::Relaxed);
+        let lsass = state.lsass.pid();
         if lsass == 0 {
             return;
         }
@@ -363,10 +423,12 @@ pub(crate) fn audit_api_provider(sink: Arc<dyn EventSink>, state: Arc<SharedStat
             return;
         }
         let comm = state.comm_for(caller).unwrap_or_default();
+        let caller_image_path = full_image_path(caller, &state);
         sink.on_event(Event::ProcessAccess(ProcessAccessEvent {
             meta: state.meta(caller, 0, comm, timestamp_ns),
+            caller_image_path,
             target_pid: lsass,
-            // `lsass_pid` is only ever set to a process whose image is this path.
+            // The tracked LSASS is only ever a process whose image is this path.
             target_image_path: Some(cross_process::lsass_image(&state.system_root)),
             desired_access,
             status,
@@ -1297,11 +1359,12 @@ mod process_keyword_tests {
     /// mask is checked against a real session by `tests/kernel_process_keyword_mask.rs`
     /// (`#[ignore]`, elevated; lab phase G of `lab/validate-windows-admin.ps1`).
     #[test]
-    fn kernel_process_reads_process_thread_and_image_events_only() {
+    fn kernel_process_reads_process_thread_image_and_silo_events() {
         const PROCESS: u64 = 0x10;
         const THREAD: u64 = 0x20;
         const IMAGE: u64 = 0x40;
-        assert_eq!(KERNEL_PROCESS_KEYWORDS, PROCESS | THREAD | IMAGE);
+        const JOB_SILO: u64 = 0x4000;
+        assert_eq!(KERNEL_PROCESS_KEYWORDS, PROCESS | THREAD | IMAGE | JOB_SILO);
     }
 }
 

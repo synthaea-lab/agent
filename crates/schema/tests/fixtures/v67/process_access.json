@@ -7,6 +7,7 @@
     "timestamp_ns": 1756900030000000000,
     "comm": "procdump64.exe"
   },
+  "caller_image_path": "C:\\Users\\Public\\procdump64.exe",
   "target_pid": 812,
   "target_image_path": "C:\\Windows\\System32\\lsass.exe",
   "desired_access": 5136,

@@ -199,19 +199,21 @@ mod tests {
         m
     }
 
-    /// The file the TypeScript signer's tests read too (`server/lib/snapshot-manifest.ts`).
-    fn golden() -> (String, SnapshotManifest) {
+    /// The file the TypeScript signer's tests read too (`server/lib/snapshot-manifest.ts`), in
+    /// the `server` sibling repo; `None` (the test skips) without it.
+    fn golden() -> Option<(String, SnapshotManifest)> {
         #[derive(Deserialize)]
         struct Golden {
             public_key: String,
             manifest: SnapshotManifest,
         }
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../server/tests/fixtures/snapshot-manifest-golden.json"
+        let text = siblings::require!(
+            "server",
+            "tests/fixtures/snapshot-manifest-golden.json",
+            None
         );
-        let g: Golden = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        (g.public_key, g.manifest)
+        let g: Golden = serde_json::from_str(&text).unwrap();
+        Some((g.public_key, g.manifest))
     }
 
     #[test]
@@ -221,7 +223,9 @@ mod tests {
 
     #[test]
     fn the_golden_fixture_from_the_server_verifies_against_the_key_derived_from_the_seed() {
-        let (public_key, golden) = golden();
+        let Some((public_key, golden)) = golden() else {
+            return;
+        };
         let derived = hex_encode(test_snapshot_key_pair().public_key().as_ref());
         assert_eq!(
             public_key, derived,
@@ -234,7 +238,7 @@ mod tests {
     fn signing_the_golden_manifest_here_gives_the_servers_signature() {
         // Ed25519 is deterministic: the same canonical bytes under the same key give the same
         // signature, so any drift in the canonical form fails here and in the TypeScript test.
-        let (_, golden) = golden();
+        let Some((_, golden)) = golden() else { return };
         let mut resigned = golden.clone();
         resigned.sign(&test_snapshot_key_pair());
         assert_eq!(resigned.signature, golden.signature);

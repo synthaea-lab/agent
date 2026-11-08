@@ -7,19 +7,41 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
+use config::identity::{
+    LINUX_SERVICE, SERVICE_DESCRIPTION, UNIX_WATCHDOG_LOG, WATCHDOG_SYSLOG_IDENTIFIER,
+};
 
-use super::{SERVICE_DESC, resolve_paths};
+use super::resolve_paths;
 
-const SYSTEMD_UNIT: &str = "/etc/systemd/system/synthaea-agent.service";
-const OPENRC_SCRIPT: &str = "/etc/init.d/synthaea-agent";
+/// `<service>.service`, the unit name `systemctl` takes.
+fn systemd_unit() -> String {
+    format!("{LINUX_SERVICE}.service")
+}
+
+/// Where a manual install writes the unit; packages ship theirs under
+/// `/usr/lib/systemd/system` instead (#36).
+fn systemd_unit_path() -> String {
+    format!("/etc/systemd/system/{}", systemd_unit())
+}
+
+fn openrc_script_path() -> String {
+    format!("/etc/init.d/{LINUX_SERVICE}")
+}
 
 /// Symlink `systemctl enable` creates for our unit's `WantedBy=multi-user.target`
 /// (see `install_systemd`) — its disappearance means the service was disabled.
-const SYSTEMD_ENABLE_LINK: &str =
-    "/etc/systemd/system/multi-user.target.wants/synthaea-agent.service";
-/// Symlink `rc-update add synthaea-agent default` creates — its disappearance
+fn systemd_enable_link() -> String {
+    format!(
+        "/etc/systemd/system/multi-user.target.wants/{}",
+        systemd_unit()
+    )
+}
+
+/// Symlink `rc-update add <service> default` creates — its disappearance
 /// means `rc-update del`/equivalent ran.
-const OPENRC_ENABLE_LINK: &str = "/etc/runlevels/default/synthaea-agent";
+fn openrc_enable_link() -> String {
+    format!("/etc/runlevels/default/{LINUX_SERVICE}")
+}
 
 enum InitSystem {
     Systemd,
@@ -59,12 +81,12 @@ pub(crate) struct DefinitionSnapshot {
 pub(crate) fn snapshot_definition() -> anyhow::Result<DefinitionSnapshot> {
     let (definition_path, enable_link) = match detect_init_system()? {
         InitSystem::Systemd => (
-            PathBuf::from(SYSTEMD_UNIT),
-            PathBuf::from(SYSTEMD_ENABLE_LINK),
+            PathBuf::from(systemd_unit_path()),
+            PathBuf::from(systemd_enable_link()),
         ),
         InitSystem::OpenRc => (
-            PathBuf::from(OPENRC_SCRIPT),
-            PathBuf::from(OPENRC_ENABLE_LINK),
+            PathBuf::from(openrc_script_path()),
+            PathBuf::from(openrc_enable_link()),
         ),
     };
     let digest = crate::tamper::sha256_file(&definition_path).ok();
@@ -130,15 +152,16 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
 fn install_systemd(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Result<()> {
     // Check if running from package installation (issue #36)
     // Package-managed units are in /usr/lib/systemd/system/, manual installs in /etc/systemd/system/
-    let packaged_unit = Path::new("/usr/lib/systemd/system/synthaea-agent.service");
+    let unit_name = systemd_unit();
+    let packaged_unit = PathBuf::from(format!("/usr/lib/systemd/system/{unit_name}"));
 
     if packaged_unit.exists() {
         // Package already installed the unit - just enable it
         run("systemctl", &["daemon-reload"])?;
-        run("systemctl", &["enable", "--now", "synthaea-agent.service"])?;
+        run("systemctl", &["enable", "--now", &unit_name])?;
         println!("[watchdog] Using package-installed systemd unit.");
-        println!("  Status: systemctl status synthaea-agent");
-        println!("  Logs:   journalctl -u synthaea-agent -f");
+        println!("  Status: systemctl status {LINUX_SERVICE}");
+        println!("  Logs:   journalctl -u {LINUX_SERVICE} -f");
         return Ok(());
     }
 
@@ -151,45 +174,49 @@ fn install_systemd(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Resul
          ExecStart=\"{watchdog}\" run --agent-bin \"{agent}\" --alerts \"{out}\"\n\
          Restart=always\nRestartSec=5s\nUser=root\n\
          StandardOutput=journal\nStandardError=journal\n\
-         SyslogIdentifier=synthaea-watchdog\n\n\
+         SyslogIdentifier={syslog_id}\n\n\
          [Install]\nWantedBy=multi-user.target\n",
-        desc = SERVICE_DESC,
+        desc = SERVICE_DESCRIPTION,
+        syslog_id = WATCHDOG_SYSLOG_IDENTIFIER,
         watchdog = paths.watchdog_abs.display(),
         agent = paths.agent_abs.display(),
         out = paths.alerts_abs.display(),
     );
 
-    std::fs::write(SYSTEMD_UNIT, &unit)
-        .with_context(|| format!("writing {SYSTEMD_UNIT} (root required)"))?;
+    let unit_path = systemd_unit_path();
+    std::fs::write(&unit_path, &unit)
+        .with_context(|| format!("writing {unit_path} (root required)"))?;
     // #103: don't rely on umask for a root-owned service definition's permissions.
-    crate::tamper::harden_permissions(std::path::Path::new(SYSTEMD_UNIT), 0o644)
-        .with_context(|| format!("hardening permissions on {SYSTEMD_UNIT}"))?;
-    crate::tamper::harden_ownership(std::path::Path::new(SYSTEMD_UNIT))
-        .with_context(|| format!("hardening ownership on {SYSTEMD_UNIT}"))?;
+    crate::tamper::harden_permissions(Path::new(&unit_path), 0o644)
+        .with_context(|| format!("hardening permissions on {unit_path}"))?;
+    crate::tamper::harden_ownership(Path::new(&unit_path))
+        .with_context(|| format!("hardening ownership on {unit_path}"))?;
     run("systemctl", &["daemon-reload"])?;
-    run("systemctl", &["enable", "--now", "synthaea-agent.service"])?;
+    run("systemctl", &["enable", "--now", &unit_name])?;
 
     println!("[watchdog] systemd service installed and started (development mode).");
     println!("  Alerts: {}", paths.alerts_abs.display());
     println!("  Check: watchdog status");
-    println!("  Logs : journalctl -u synthaea-agent -f (watchdog and agent output)");
+    println!("  Logs : journalctl -u {LINUX_SERVICE} -f (watchdog and agent output)");
     Ok(())
 }
 
 fn uninstall_systemd() -> anyhow::Result<()> {
-    let _ = run("systemctl", &["stop", "synthaea-agent.service"]);
-    run("systemctl", &["disable", "synthaea-agent.service"])?;
-    if std::path::Path::new(SYSTEMD_UNIT).exists() {
-        std::fs::remove_file(SYSTEMD_UNIT).with_context(|| format!("removing {SYSTEMD_UNIT}"))?;
+    let unit_name = systemd_unit();
+    let unit_path = systemd_unit_path();
+    let _ = run("systemctl", &["stop", &unit_name]);
+    run("systemctl", &["disable", &unit_name])?;
+    if Path::new(&unit_path).exists() {
+        std::fs::remove_file(&unit_path).with_context(|| format!("removing {unit_path}"))?;
     }
     run("systemctl", &["daemon-reload"])?;
-    println!("[watchdog] synthaea-agent service uninstalled.");
+    println!("[watchdog] {LINUX_SERVICE} service uninstalled.");
     Ok(())
 }
 
 fn status_systemd() -> anyhow::Result<()> {
     let status = std::process::Command::new("systemctl")
-        .args(["status", "synthaea-agent.service", "--no-pager"])
+        .args(["status", &systemd_unit(), "--no-pager"])
         .status()
         .context("cannot launch systemctl")?;
     if !status.success() {
@@ -217,48 +244,51 @@ fn install_openrc(agent_bin: Option<PathBuf>, alerts: PathBuf) -> anyhow::Result
          command_args=\"run --agent-bin \\\"{agent}\\\" --alerts \\\"{out}\\\"\"\n\
          pidfile=\"/run/${{RC_SVCNAME}}.pid\"\n\
          respawn_max=\"0\"\n\
-         output_log=\"/var/log/synthaea-watchdog.log\"\n\
-         error_log=\"/var/log/synthaea-watchdog.log\"\n\n\
+         output_log=\"{log}\"\n\
+         error_log=\"{log}\"\n\n\
          depend() {{\n\
          \tneed net\n\
          \tafter net\n\
          }}\n",
-        desc = SERVICE_DESC,
+        desc = SERVICE_DESCRIPTION,
+        log = UNIX_WATCHDOG_LOG,
         watchdog = paths.watchdog_abs.display(),
         agent = paths.agent_abs.display(),
         out = paths.alerts_abs.display(),
     );
 
-    std::fs::write(OPENRC_SCRIPT, &script)
-        .with_context(|| format!("writing {OPENRC_SCRIPT} (root required)"))?;
-    set_executable(OPENRC_SCRIPT)?;
+    let script_path = openrc_script_path();
+    std::fs::write(&script_path, &script)
+        .with_context(|| format!("writing {script_path} (root required)"))?;
+    set_executable(&script_path)?;
     // #103: same ownership hardening the systemd unit gets above.
-    crate::tamper::harden_ownership(std::path::Path::new(OPENRC_SCRIPT))
-        .with_context(|| format!("hardening ownership on {OPENRC_SCRIPT}"))?;
+    crate::tamper::harden_ownership(Path::new(&script_path))
+        .with_context(|| format!("hardening ownership on {script_path}"))?;
 
-    run("rc-update", &["add", "synthaea-agent", "default"])?;
-    run("rc-service", &["synthaea-agent", "start"])?;
+    run("rc-update", &["add", LINUX_SERVICE, "default"])?;
+    run("rc-service", &[LINUX_SERVICE, "start"])?;
 
     println!("[watchdog] OpenRC service installed and started.");
     println!("  Alerts: {}", paths.alerts_abs.display());
     println!("  Check: watchdog status");
-    println!("  Logs : /var/log/synthaea-watchdog.log (watchdog and agent output)");
+    println!("  Logs : {UNIX_WATCHDOG_LOG} (watchdog and agent output)");
     Ok(())
 }
 
 fn uninstall_openrc() -> anyhow::Result<()> {
-    let _ = run("rc-service", &["synthaea-agent", "stop"]);
-    let _ = run("rc-update", &["del", "synthaea-agent", "default"]);
-    if std::path::Path::new(OPENRC_SCRIPT).exists() {
-        std::fs::remove_file(OPENRC_SCRIPT).with_context(|| format!("removing {OPENRC_SCRIPT}"))?;
+    let script_path = openrc_script_path();
+    let _ = run("rc-service", &[LINUX_SERVICE, "stop"]);
+    let _ = run("rc-update", &["del", LINUX_SERVICE, "default"]);
+    if Path::new(&script_path).exists() {
+        std::fs::remove_file(&script_path).with_context(|| format!("removing {script_path}"))?;
     }
-    println!("[watchdog] synthaea-agent OpenRC service uninstalled.");
+    println!("[watchdog] {LINUX_SERVICE} OpenRC service uninstalled.");
     Ok(())
 }
 
 fn status_openrc() -> anyhow::Result<()> {
     let status = std::process::Command::new("rc-service")
-        .args(["synthaea-agent", "status"])
+        .args([LINUX_SERVICE, "status"])
         .status()
         .context("cannot launch rc-service")?;
     if !status.success() {
