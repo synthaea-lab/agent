@@ -1,5 +1,10 @@
 # Synthaea
 
+> Part of the Synthaea umbrella ([synthaea-lab/edr](https://github.com/synthaea-lab/edr)),
+> checked out at `<umbrella>/agent`. This repo is the Rust agent workspace; the control
+> plane, ML pipeline, detection content and test lab are sibling repos. Contract tests that
+> read a sibling skip when it is absent (see `crates/siblings`).
+
 **An open-source, truly multi-platform EDR/XDR with on-device ML detection.**
 
 > **Status: Linux walking skeleton proven, detection depth landing.** The Linux
@@ -110,7 +115,8 @@ is skeletoned with its design recorded in place and an issue per component.
 `cargo check` / `cargo test` build the default members on any OS (toolchain pinned).
 CI enforces fmt, dependency direction, cargo-deny, clippy `-D warnings`, and tests on
 Linux/Windows/macOS, plus content and ML pipelines. The eBPF probes build on a lab
-machine via `lab/provisioning/`; `lab/vagrant/` boots the validation matrix.
+machine via `toolchain/`; the sibling `lab` repo (`../lab/vagrant/` in the umbrella) boots the
+validation matrix.
 
 ## License
 
