@@ -348,7 +348,14 @@ pub mod time;
 /// process, so an alert on a signal to a security tool names the tool and not only an image path;
 /// and for [`SignalEvent::signals_lost`], the report of signals the sensor had no room for.
 /// First claimed 60, then 63; #1116 took 65, so this takes 66.
-pub const SCHEMA_VERSION: u32 = 66;
+///
+/// Bumped 66 → 67 for [`Event::RemoteThread`] and [`Event::ProcessAccess`] (#720): a thread
+/// created in another process and a memory-reading open of LSASS, from the driver-free ETW
+/// providers ADR-0026's lab capture (#715) confirmed, as the native equivalents of Sysmon 8
+/// and 10. Windows only. [`ProcessAccessEvent::caller_image_path`] carries the caller's
+/// full image, for the LSASS rule's expected readers (#960). First claimed 63, then 64; #1112 and #1103 merged first and took 65
+/// and 66, so this takes 67.
+pub const SCHEMA_VERSION: u32 = 67;
 
 /// Bytes of argv, one separator per token included, a sensor keeps for one exec
 /// ([`bound_argv`], #1112).
@@ -1622,6 +1629,67 @@ pub struct ImageLoadEvent {
     pub image_path: String,
 }
 
+/// A thread created in another process (#720): the native equivalent of Sysmon event 8
+/// (`CreateRemoteThread`), the classic injection primitive (T1055).
+///
+/// On Windows: a Microsoft-Windows-Kernel-Process `ThreadStart` (EID 3) whose creating
+/// process, the record header's pid, is not the process that owns the new thread. `meta`
+/// is the creating process. The sensor drops the thread starts that are not injections by
+/// construction before building this event: a thread started by its own process, one
+/// started by the kernel (pid 0 or 4), and the initial thread of a new process (its creator
+/// already appears as the [`ExecEvent`]'s parent). What is left is cross-process but not
+/// necessarily hostile: debuggers, installers and services that start threads in their
+/// clients look the same (#715 measured about 1 to 2 per second on an idle host).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteThreadEvent {
+    pub meta: EventMeta,
+    /// The process that owns the new thread.
+    pub target_pid: u32,
+    /// The owning process's image, as the sensor's pid store knew it; `None` when it did not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_image_path: Option<String>,
+    /// The new thread's id.
+    pub thread_id: u32,
+    /// The address the thread starts at, in the owning process: the user-mode start
+    /// address (`Win32StartAddr`, what `CreateRemoteThread` was given), or the kernel's
+    /// `StartAddr` when the former is 0. Not resolved to a module.
+    ///
+    /// Chosen by the creator: an injector can start the thread at an `ntdll` or
+    /// `kernel32` routine and redirect it from there, so an address inside a module is no
+    /// evidence the thread is benign, and a rule must not read it as such.
+    pub start_address: u64,
+}
+
+/// One process opening another for access (#720): the native equivalent of Sysmon event 10
+/// (`ProcessAccess`).
+///
+/// On Windows: a Microsoft-Windows-Kernel-Audit-API-Calls `PsOpenProcess` (EID 5), whose
+/// caller is the record header's pid. The sensor reports only opens of LSASS that ask for
+/// a right that reaches its memory, the credential-dumping step (T1003.001): read or write
+/// it (`PROCESS_VM_READ`, `PROCESS_VM_WRITE`, `PROCESS_VM_OPERATION`), run code in it
+/// (`PROCESS_CREATE_THREAD`), get a full handle out of it (`PROCESS_DUP_HANDLE`) or clone it
+/// (`PROCESS_CREATE_PROCESS`), or a generic or maximum right that includes one of them.
+/// Every other open is dropped before this event is built. Denied opens are reported too,
+/// with their status: a refused attempt on a protected LSASS is still an attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessAccessEvent {
+    pub meta: EventMeta,
+    /// The caller's full image path, when the sensor could resolve it: the evidence an
+    /// expected-reader exclusion decides on (#960), since `meta.comm` is only its file
+    /// name, which a renamed tool chooses. `None` when unresolved; never a bare name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_image_path: Option<String>,
+    /// The process that was opened.
+    pub target_pid: u32,
+    /// The opened process's image, when the sensor knew it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_image_path: Option<String>,
+    /// The access mask the caller asked for, as passed (generic bits not mapped).
+    pub desired_access: u32,
+    /// The `NTSTATUS` of the open: 0 when it succeeded.
+    pub status: u32,
+}
+
 /// Registry value write — the primary signal for persistence and configuration
 /// manipulation detections.
 ///
@@ -2788,6 +2856,8 @@ pub enum Event {
     PackageChange(PackageChangeEvent),
     BitsJob(BitsJobEvent),
     UnitStop(UnitStopEvent),
+    RemoteThread(RemoteThreadEvent),
+    ProcessAccess(ProcessAccessEvent),
 }
 
 impl Event {
@@ -2858,6 +2928,8 @@ impl Event {
             Event::PackageChange(e) => &e.meta,
             Event::BitsJob(e) => &e.meta,
             Event::UnitStop(e) => &e.meta,
+            Event::RemoteThread(e) => &e.meta,
+            Event::ProcessAccess(e) => &e.meta,
             // No wildcard arm, on purpose: #[non_exhaustive] has no effect inside
             // the defining crate, so a new variant without its arm here is a
             // compile error — the reminder the doc comment above promises.
