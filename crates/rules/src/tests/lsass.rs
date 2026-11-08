@@ -4,7 +4,7 @@
 use schema::{ProcessAccessEvent, RemoteThreadEvent, detection::Severity};
 
 use super::*;
-use crate::{evaluate_remote_thread, lsass::LSASS_ACCESS_ALERT_WINDOW_NS};
+use crate::lsass::{LSASS_ACCESS_ALERT_WINDOW_NS, LSASS_THREAD_ALERT_WINDOW_NS};
 
 const SECOND_NS: u64 = 1_000_000_000;
 const LSASS_PID: u32 = 812;
@@ -122,15 +122,128 @@ fn the_known_image_decides_not_the_comm() {
     );
 }
 
+/// An open of LSASS whose event carries the caller's full image (the sensor resolved it).
+fn open_with_caller_image(pid: u32, comm: &str, image: &str) -> ProcessAccessEvent {
+    ProcessAccessEvent {
+        caller_image_path: Some(image.to_string()),
+        ..open_of_lsass(pid, comm, 0, 0)
+    }
+}
+
 #[test]
-fn a_reader_that_predates_the_agent_is_excluded_on_its_name() {
-    // No exec seen: the sensor's name is the only evidence, and a sensor limitation is not
-    // evidence of masquerade (policy::name_exclusion_applies).
+fn a_reader_that_predates_the_agent_is_excluded_on_the_image_the_sensor_carries() {
     let mut state = RuleState::new();
     assert!(
         state
-            .on_process_access(&open_of_lsass(640, "csrss.exe", 0, 0))
+            .on_process_access(&open_with_caller_image(
+                640,
+                "csrss.exe",
+                r"C:\Windows\System32\csrss.exe"
+            ))
             .is_empty()
+    );
+}
+
+#[test]
+fn a_dumper_named_like_a_reader_whose_exec_was_not_seen_alerts_on_its_image() {
+    let mut state = RuleState::new();
+    let alerts = state.on_process_access(&open_with_caller_image(
+        641,
+        "csrss.exe",
+        r"C:\Users\Public\csrss.exe",
+    ));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].severity, Severity::High);
+}
+
+#[test]
+fn a_reader_name_with_no_image_known_alerts_medium_and_says_so() {
+    // Neither the exec nor a sensor-resolved image: the name alone is what a renamed dumper
+    // controls, so it excludes nothing (#1152 review).
+    let mut state = RuleState::new();
+    let alerts = state.on_process_access(&open_of_lsass(642, "csrss.exe", 0, 0));
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].severity, Severity::Medium);
+    assert!(
+        alerts[0].message.contains("caller image unknown"),
+        "{}",
+        alerts[0].message
+    );
+}
+
+#[test]
+fn a_reader_name_elsewhere_under_program_files_still_alerts() {
+    for image in [
+        r"C:\Program Files\x\csrss.exe",
+        r"C:\Program Files (x86)\Windows Defender\MsMpEng.exe",
+        r"C:\Program Files\Windows Defender\sub\MsMpEng.exe",
+        r"C:\Windows\System32\drivers\wininit.exe",
+    ] {
+        let comm = image.rsplit('\\').next().unwrap();
+        let mut state = state_with_exec(643, comm, image);
+        assert_eq!(
+            state
+                .on_process_access(&open_of_lsass(643, comm, 0, 0))
+                .len(),
+            1,
+            "{image}"
+        );
+    }
+}
+
+#[test]
+fn defender_for_endpoint_from_its_directory_is_silent() {
+    let mut state = RuleState::new();
+    assert!(
+        state
+            .on_process_access(&open_with_caller_image(
+                644,
+                "MsSense.exe",
+                r"C:\Program Files\Windows Defender Advanced Threat Protection\MsSense.exe"
+            ))
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_granted_open_whose_only_memory_right_is_maximum_allowed_alerts_medium() {
+    let mut state = RuleState::new();
+    let event = ProcessAccessEvent {
+        desired_access: 0x0200_0000,
+        ..open_of_lsass(4242, "viewer.exe", 0, 0)
+    };
+    let alerts = state.on_process_access(&event);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].severity, Severity::Medium);
+    assert!(
+        alerts[0].message.contains("granted access unknown"),
+        "{}",
+        alerts[0].message
+    );
+    let mut state = RuleState::new();
+    let with_read = ProcessAccessEvent {
+        desired_access: 0x0200_0010,
+        ..open_of_lsass(4242, "viewer.exe", 0, 0)
+    };
+    assert_eq!(
+        state.on_process_access(&with_read)[0].severity,
+        Severity::High
+    );
+}
+
+#[test]
+fn rights_that_reach_memory_without_reading_it_are_named() {
+    let mut state = RuleState::new();
+    let event = ProcessAccessEvent {
+        desired_access: 0x1040,
+        ..open_of_lsass(4242, "dup.exe", 0, 0)
+    };
+    let alerts = state.on_process_access(&event);
+    assert_eq!(alerts[0].severity, Severity::High);
+    assert!(
+        alerts[0].message.contains("PROCESS_DUP_HANDLE"),
+        "{}",
+        alerts[0].message
     );
 }
 
@@ -209,19 +322,59 @@ fn one_alert_per_caller_and_outcome_per_window() {
 }
 
 #[test]
-fn a_thread_started_inside_lsass_alerts_high() {
-    let event = RemoteThreadEvent {
+fn a_new_process_on_a_recycled_pid_is_not_inside_the_previous_ones_window() {
+    let mut state = RuleState::new();
+    let first = ProcessAccessEvent {
         meta: EventMeta {
-            pid: 4242,
+            process_generation: Some(10),
+            ..open_of_lsass(4242, "dumper.exe", 0, 0).meta
+        },
+        ..open_of_lsass(4242, "dumper.exe", 0, 0)
+    };
+    assert_eq!(state.on_process_access(&first).len(), 1);
+    let reused = ProcessAccessEvent {
+        meta: EventMeta {
+            process_generation: Some(11),
+            ..open_of_lsass(4242, "other.exe", 0, SECOND_NS).meta
+        },
+        ..open_of_lsass(4242, "other.exe", 0, SECOND_NS)
+    };
+    assert_eq!(
+        state.on_process_access(&reused).len(),
+        1,
+        "another generation on the same pid is another caller"
+    );
+    let same = ProcessAccessEvent {
+        meta: EventMeta {
+            process_generation: Some(11),
+            ..open_of_lsass(4242, "other.exe", 0, 2 * SECOND_NS).meta
+        },
+        ..open_of_lsass(4242, "other.exe", 0, 2 * SECOND_NS)
+    };
+    assert!(state.on_process_access(&same).is_empty());
+}
+
+/// A thread started inside LSASS by `pid` (generation `generation`) at `at_ns`.
+fn thread_into_lsass(pid: u32, generation: Option<u64>, at_ns: u64) -> RemoteThreadEvent {
+    RemoteThreadEvent {
+        meta: EventMeta {
+            pid,
             comm: "injector.exe".to_string(),
+            timestamp_ns: at_ns,
+            process_generation: generation,
             ..meta()
         },
         target_pid: LSASS_PID,
         target_image_path: Some(LSASS.to_string()),
         start_address: 0x7ffd_0000_1000,
         ..schema::fixtures::remote_thread()
-    };
-    let alerts = evaluate_remote_thread(&event);
+    }
+}
+
+#[test]
+fn a_thread_started_inside_lsass_alerts_high() {
+    let mut state = RuleState::new();
+    let alerts = state.on_remote_thread(&thread_into_lsass(4242, None, 0));
     assert_eq!(alerts.len(), 1);
     assert_eq!(alerts[0].technique, "T1055");
     assert_eq!(alerts[0].severity, Severity::High);
@@ -233,10 +386,49 @@ fn a_thread_started_inside_lsass_alerts_high() {
 }
 
 #[test]
+fn one_lsass_thread_alert_per_injector_per_window() {
+    let mut state = RuleState::new();
+    assert_eq!(
+        state
+            .on_remote_thread(&thread_into_lsass(4242, Some(1), 0))
+            .len(),
+        1
+    );
+    let elsewhere = RemoteThreadEvent {
+        start_address: 0x01d0_0000,
+        ..thread_into_lsass(4242, Some(1), SECOND_NS)
+    };
+    assert!(
+        state.on_remote_thread(&elsewhere).is_empty(),
+        "another start address from the same injector is the same finding"
+    );
+    assert_eq!(
+        state
+            .on_remote_thread(&thread_into_lsass(4242, Some(2), SECOND_NS))
+            .len(),
+        1,
+        "a new process on the recycled pid is its own finding"
+    );
+    assert_eq!(
+        state
+            .on_remote_thread(&thread_into_lsass(
+                4242,
+                Some(1),
+                LSASS_THREAD_ALERT_WINDOW_NS + SECOND_NS
+            ))
+            .len(),
+        1,
+        "a new window alerts again"
+    );
+}
+
+#[test]
 fn a_thread_started_in_another_process_or_an_unknown_one_is_telemetry_only() {
+    let mut state = RuleState::new();
     for target in [
         Some(r"C:\Windows\System32\notepad.exe".to_string()),
         Some(r"C:\Users\Public\lsass.exe".to_string()),
+        Some(r"C:\Windows\System32\spool\drivers\color\System32\lsass.exe".to_string()),
         None,
     ] {
         let event = RemoteThreadEvent {
@@ -244,6 +436,6 @@ fn a_thread_started_in_another_process_or_an_unknown_one_is_telemetry_only() {
             target_image_path: target.clone(),
             ..schema::fixtures::remote_thread()
         };
-        assert!(evaluate_remote_thread(&event).is_empty(), "{target:?}");
+        assert!(state.on_remote_thread(&event).is_empty(), "{target:?}");
     }
 }
