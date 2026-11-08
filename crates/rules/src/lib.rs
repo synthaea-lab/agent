@@ -21,6 +21,7 @@ mod inventory;
 mod ld_trust;
 mod ldap;
 mod logon;
+mod lsass;
 mod ntlm;
 mod osascript;
 mod privesc;
