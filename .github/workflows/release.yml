@@ -1,0 +1,342 @@
+name: Release
+
+# Builds the per-OS artifacts with the same jobs that guard them on main (each one builds,
+# then installs or runs what it built), collects them, writes SHA256SUMS and publishes a
+# GitHub release. A tag with a pre-release suffix (`-alpha`, `-beta`, `-rc`, anything after a
+# `-`) becomes a pre-release; while Synthaea is in beta, every tag should carry one.
+#
+# What this does NOT do (ADR-0015, ADR-0027): it signs no updater release or content manifest.
+# Those are signed offline from a hardware token by the holders ADR-0027 names, never in CI.
+# The artifacts here are code-unsigned (no Authenticode, no Developer ID, no package-repository
+# key); the only optional signature is a detached GPG signature over SHA256SUMS, made when the
+# `release` environment holds the key (packaging/README.md, "Release workflow"). Without it the
+# release is still published and its notes say, at the top, that nothing in it is signed.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish (for example v0.1.0-beta.1)"
+        required: true
+        type: string
+      draft:
+        description: "Create the release as a draft (not visible on the website until published)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One run per tag; a second push of the same tag waits rather than racing the upload.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      ref: ${{ steps.tag.outputs.ref }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - name: Resolve and validate the tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = workflow_dispatch ]; then tag="$INPUT_TAG"; else tag="$REF_NAME"; fi
+          # vMAJOR.MINOR.PATCH with an optional pre-release suffix; nothing a shell or a
+          # file name could misread.
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::'$tag' is not a release tag (expected vX.Y.Z or vX.Y.Z-beta.N)"
+            exit 1
+          fi
+          prerelease=false
+          [[ "$tag" == *-* ]] && prerelease=true
+          {
+            echo "tag=$tag"
+            echo "ref=refs/tags/$tag"
+            echo "prerelease=$prerelease"
+            echo "version=${tag#v}"
+          } >> "$GITHUB_OUTPUT"
+
+      # workflow_dispatch builds an existing tag, never a branch head under a tag's name.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ steps.tag.outputs.ref }}
+
+      # The packages take their version from Cargo.toml / APKBUILD, not from the tag. A
+      # mismatch does not stop the release (a beta tag over 0.1.0 is expected), but it is
+      # surfaced so nobody is surprised by the file names.
+      - name: Compare the tag with the package versions
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' agent/Cargo.toml | head -n1)"
+          apk_version="$(sed -n 's/^pkgver=//p' packaging/linux/alpine/APKBUILD)"
+          core="${VERSION%%-*}"
+          for v in "$cargo_version" "$apk_version"; do
+            if [ "$v" != "$core" ]; then
+              echo "::warning::tag version $core differs from a package version ($v): agent/Cargo.toml=$cargo_version, APKBUILD=$apk_version"
+            fi
+          done
+
+  # The same ADR-0027 guard ci.yml runs on every push, on the exact tagged tree: the
+  # packaged feature set must leave updater/test-key off on every target.
+  test-key-guard:
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.meta.outputs.ref }}
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+      - name: Packaged build carries no test signing key (ADR-0027)
+        run: tools/check-no-test-key.sh
+
+  linux-deb:
+    needs: meta
+    permissions:
+      contents: read
+    uses: ./.github/workflows/linux-deb-portability.yml
+    with:
+      ref: ${{ needs.meta.outputs.ref }}
+      upload-artifact: true
+
+  linux-apk:
+    needs: meta
+    permissions:
+      contents: read
+    uses: ./.github/workflows/linux-apk-portability.yml
+    with:
+      ref: ${{ needs.meta.outputs.ref }}
+      upload-artifact: true
+
+  windows:
+    needs: meta
+    permissions:
+      contents: read
+    uses: ./.github/workflows/windows-static-agent.yml
+    with:
+      ref: ${{ needs.meta.outputs.ref }}
+      upload-artifact: true
+
+  macos:
+    needs: meta
+    permissions:
+      contents: read
+    uses: ./.github/workflows/macos-static-agent.yml
+    with:
+      ref: ${{ needs.meta.outputs.ref }}
+      upload-artifact: true
+      intel: false
+
+  publish:
+    needs: [meta, test-key-guard, linux-deb, linux-apk, windows, macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Secrets for the optional SHA256SUMS signature live in this environment, so required
+    # reviewers can be put in front of every publish (Settings > Environments > release).
+    environment: release
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.meta.outputs.tag }}
+      VERSION: ${{ needs.meta.outputs.version }}
+      PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+      DRAFT: ${{ inputs.draft || false }}
+    steps:
+      # The tools only (assert-no-test-key.sh); nothing is built here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.meta.outputs.ref }}
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          path: collected
+
+      - name: Stage the release files
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          shopt -s nullglob
+          debs=(collected/release-linux-deb/*.deb)
+          apks=(collected/release-linux-apk/*.apk)
+          exes=(collected/release-windows-agent/agent.exe)
+          macs=(collected/release-macos-agent-*/*.tar.gz)
+          [ "${#debs[@]}" -eq 1 ] || { echo "::error::expected one .deb, got ${#debs[@]}"; exit 1; }
+          [ "${#apks[@]}" -eq 1 ] || { echo "::error::expected one .apk, got ${#apks[@]}"; exit 1; }
+          [ "${#exes[@]}" -eq 1 ] || { echo "::error::expected agent.exe, got ${#exes[@]}"; exit 1; }
+          [ "${#macs[@]}" -ge 1 ] || { echo "::error::no macOS tarball"; exit 1; }
+          # Package files keep the names their package manager gave them (they carry the
+          # package version); the bare binaries get the tag in their name.
+          cp "${debs[0]}" "${apks[0]}" dist/
+          cp "${exes[0]}" "dist/synthaea-agent-${VERSION}-windows-x86_64.exe"
+          for m in "${macs[@]}"; do
+            base="$(basename "$m")"   # synthaea-agent-macos-<arch>.tar.gz
+            cp "$m" "dist/synthaea-agent-${VERSION}-${base#synthaea-agent-}"
+          done
+          ls -l dist
+
+      # Each build job already scanned what it built; this scans what is about to be
+      # published, after the artifact store, so a mix-up between jobs cannot ship the key.
+      - name: Check no published binary carries the test signing key (ADR-0027)
+        run: |
+          set -euo pipefail
+          scan="$RUNNER_TEMP/scan"
+          mkdir -p "$scan/deb" "$scan/apk" "$scan/mac"
+          dpkg-deb -x dist/*.deb "$scan/deb"
+          # An .apk is concatenated gzip tar streams; GNU tar reads through them (as the
+          # apk workflow's own extraction does).
+          tar -xzf dist/*.apk -C "$scan/apk"
+          for t in dist/*-macos-*.tar.gz; do tar -xzf "$t" -C "$scan/mac"; done
+          bins=()
+          for root in "$scan/deb" "$scan/apk"; do
+            for b in agent watchdog cli; do
+              f="$root/var/lib/synthaea/bootstrap/$b"
+              [ -f "$f" ] || { echo "::error::$b missing from ${root##*/} package"; exit 1; }
+              bins+=("$f")
+            done
+          done
+          bins+=("$scan/mac/agent" dist/*-windows-x86_64.exe)
+          bash tools/assert-no-test-key.sh "${bins[@]}"
+          echo "scanned ${#bins[@]} binaries"
+
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS"
+          mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
+          cat SHA256SUMS
+
+      # Optional: a detached signature over SHA256SUMS, which covers every file. Skipped,
+      # not failed, when the key is absent; the notes then say the release is unsigned.
+      - name: Sign SHA256SUMS (when the release environment holds a key)
+        id: sign
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GPG_PRIVATE_KEY" ]; then
+            echo "::warning::RELEASE_GPG_PRIVATE_KEY is not set: publishing an UNSIGNED release"
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -m 700 "$GNUPGHOME"
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --quiet --import
+          gpg --batch --yes --pinentry-mode loopback --passphrase "${GPG_PASSPHRASE:-}" \
+            --armor --detach-sign --output dist/SHA256SUMS.asc dist/SHA256SUMS
+          gpg --batch --verify dist/SHA256SUMS.asc dist/SHA256SUMS
+          gpg --batch --armor --export > dist/synthaea-release-key.asc
+          fingerprint="$(gpg --batch --with-colons --list-secret-keys | awk -F: '/^fpr:/ {print $10; exit}')"
+          rm -rf "$GNUPGHOME"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+
+      - name: Write the release notes
+        env:
+          SIGNED: ${{ steps.sign.outputs.signed }}
+          FINGERPRINT: ${{ steps.sign.outputs.fingerprint }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          deb="$(cd dist && ls -- *.deb)"
+          apk="$(cd dist && ls -- *.apk)"
+          exe="$(cd dist && ls -- *-windows-x86_64.exe)"
+          {
+            if [ "$SIGNED" = true ]; then
+              echo "> **Checksums signed, binaries not code-signed.** \`SHA256SUMS\` carries a detached GPG"
+              echo "> signature (\`SHA256SUMS.asc\`, key fingerprint \`$FINGERPRINT\`). No binary or package in"
+              echo "> this release is code-signed (no Authenticode, no Apple Developer ID, no repository key)."
+            else
+              echo "> **UNSIGNED BUILD.** Nothing in this release is signed: not the binaries, not the"
+              echo "> packages, not \`SHA256SUMS\`. Verify downloads against \`SHA256SUMS\` and treat this as a"
+              echo "> test build for lab machines, not for production endpoints."
+            fi
+            echo
+            if [ "$PRERELEASE" = true ]; then
+              echo "**Synthaea $TAG is a beta pre-release.** Expect breaking changes, missing features and"
+              echo "rough edges. Do not deploy it on machines you cannot afford to rebuild."
+              echo
+            fi
+            echo "Built from \`$SHA\` by the release workflow."
+            echo
+            echo "## What is in this release"
+            echo
+            echo "| Platform | File | What it is |"
+            echo "| --- | --- | --- |"
+            echo "| Debian / Ubuntu (x86_64) | \`$deb\` | Package: static musl agent, watchdog and \`synthaea-ctl\`, systemd unit. Installed and started on Ubuntu 22.04 / Debian 12 in CI. |"
+            echo "| Alpine (x86_64) | \`$apk\` | Package with an OpenRC service. Signed only by a throwaway build key: install with \`--allow-untrusted\`. |"
+            echo "| Windows (x86_64) | \`$exe\` | The agent executable alone (static ONNX Runtime), **not an installer**: no watchdog, no service registration. |"
+            for t in dist/*-macos-*.tar.gz; do
+              echo "| macOS ($(basename "$t" .tar.gz | sed 's/.*-macos-//')) | \`$(basename "$t")\` | The agent executable alone (static ONNX Runtime), **not a .pkg**, not notarized. Endpoint Security sensors need an Apple entitlement this build does not have. |"
+            done
+            echo
+            echo "Not in this release yet: the \`.rpm\` (packaging/linux/build-rpm.sh has no CI job),"
+            echo "the Windows MSI (packaging/windows/build.ps1 needs WiX, no CI job) and the macOS \`.pkg\`"
+            echo "(no package script yet)."
+            echo
+            echo "## Install"
+            echo
+            echo '```sh'
+            echo "# Debian / Ubuntu"
+            echo "sudo apt install ./$deb"
+            echo "# Alpine"
+            echo "sudo apk add --allow-untrusted ./$apk"
+            echo '```'
+            echo
+            echo "The installed agent runs standalone with the shipped \`/etc/synthaea/agent.toml\`"
+            echo "(\`offline_fallback = true\`); see \`packaging/linux/README.md\` for the layout and removal."
+            echo
+            echo "## Verify"
+            echo
+            echo '```sh'
+            echo "sha256sum --check --ignore-missing SHA256SUMS"
+            if [ "$SIGNED" = true ]; then
+              echo "gpg --import synthaea-release-key.asc   # then compare the fingerprint above"
+              echo "gpg --verify SHA256SUMS.asc SHA256SUMS"
+            fi
+            echo '```'
+            echo
+            echo "Report security issues privately: https://github.com/$REPO/security/policy"
+          } > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md" >> "$GITHUB_STEP_SUMMARY"
+
+      # Re-running a failed publish updates the same release instead of failing on "already
+      # exists"; assets of the same name are replaced.
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          flags=()
+          [ "$PRERELEASE" = true ] && flags+=(--prerelease)
+          [ "$DRAFT" = true ] && flags+=(--draft)
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$REPO" --notes-file "$RUNNER_TEMP/notes.md" \
+              --prerelease="$PRERELEASE"
+            gh release upload "$TAG" --repo "$REPO" --clobber dist/*
+          else
+            gh release create "$TAG" --repo "$REPO" --verify-tag \
+              --title "Synthaea $TAG" --notes-file "$RUNNER_TEMP/notes.md" "${flags[@]}" dist/*
+          fi
