@@ -174,16 +174,21 @@ fn on_process_start(
         take_lsass_slot(parser, pid, process.ppid, &process.image_path, state);
     }
     let parent_image_path = remember_process(&process, state);
+    // Read the PEB command line and the image identity (#688) before `meta`: both race the
+    // process (a short-lived one exits, a dropper renames itself), `meta` does not.
+    let cmdline = winapi::read_process_cmdline(pid);
+    let image_file_id = image_file_id(&process.image_path);
+    let meta = state.meta(
+        pid,
+        process.ppid,
+        normalize::basename(&process.image_path),
+        process.timestamp_ns,
+    );
     let context = ExecContext {
-        meta: state.meta(
-            pid,
-            process.ppid,
-            normalize::basename(&process.image_path),
-            process.timestamp_ns,
-        ),
+        meta,
         parent_image_path,
-        cmdline: winapi::read_process_cmdline(pid),
-        image_file_id: image_file_id(&process.image_path),
+        cmdline,
+        image_file_id,
     };
     sink.on_event(Event::Exec(process.exec_event(context)));
 }
@@ -254,12 +259,13 @@ fn on_image_load(
     else {
         return;
     };
+    let image_path = state.normalize_path(&raw_image);
     let timestamp_ns = normalize::filetime_to_ns(record.raw_timestamp());
     // EID 5 carries no parent pid.
     let ppid = 0;
     sink.on_event(Event::ImageLoad(ImageLoadEvent {
         meta: state.meta(pid, ppid, comm, timestamp_ns),
-        image_path: state.normalize_path(&raw_image),
+        image_path,
     }));
 }
 
