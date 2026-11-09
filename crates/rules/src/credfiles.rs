@@ -1,13 +1,21 @@
-//! Credential-file reads (#377): which paths hold credentials, and which readers have a
-//! reason to open them. The decision that needs process history (the pid's exec-time image,
-//! its parent's name) lives in `RuleState::check_credential_file_read`; this module is the
-//! part that needs none.
+//! Credential-file reads (#377): which paths hold credentials, which readers have a reason to
+//! open them, and the per-pid alert window of CREDENTIAL-READ ([`CredentialReads::check`]).
 //!
 //! The sensor reports the raw `openat` argument, so only an **absolute** path is classified:
 //! `cd /etc && cat shadow` opens the relative `shadow` and is not seen, and neither is a read
 //! through a symlink (`/tmp/x` → `/etc/shadow`). Both are gaps of the telemetry, not of the
 //! rule. Absolute paths are normalised lexically (`//`, `/./`, `/../`, a `/proc/<pid>/root`
 //! alias) so the cheap evasions of the exact string do not work.
+
+use schema::{FileOpenEvent, detection::Severity};
+use store::BoundedMap;
+
+use crate::{
+    Alert,
+    exclusions::{CREDENTIAL_READ_ALERT_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS},
+    sliding::SlidingCounter,
+    state::{COUNTER_CAP, PidFact},
+};
 
 /// A kind of credential file, which decides the technique and the question asked of the reader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -374,6 +382,124 @@ pub(crate) fn is_auth_stack(comm: &str, image: Option<&str>) -> bool {
 /// path is not "outside": the absence of evidence is not evidence.
 pub(crate) fn image_outside_system_dirs(image: Option<&str>) -> bool {
     image.is_some_and(|p| !p.is_empty() && !policy::name_exclusion_applies(Some(p)))
+}
+
+/// (pid, kind of credential file) → the last CREDENTIAL-READ alert: one alert per window, not
+/// one per open. LRU-bounded like every other counter.
+pub(crate) struct CredentialReads {
+    alerts: BoundedMap<(u32, CredFile), SlidingCounter>,
+}
+
+impl CredentialReads {
+    pub(crate) fn new() -> Self {
+        Self {
+            alerts: BoundedMap::new(COUNTER_CAP),
+        }
+    }
+
+    /// CREDENTIAL-READ (#377), on the file opens of a Unix host: T1003.008 for the shadow files,
+    /// T1552.004 for an SSH private key, T1552.001 for the other credential files of a home
+    /// directory, and on macOS T1555.001 for a keychain database and T1555.003 for a browser's
+    /// saved-login and cookie stores (see this module for the paths and what the sensor cannot
+    /// see).
+    ///
+    /// Only a read counts: a write-only open (`ssh-keygen` writing a key, `passwd` rewriting
+    /// the file) is not one. Who may read differs by file, because who legitimately does
+    /// differs:
+    /// - The **shadow files** have a short, fixed list of readers (the authentication stack,
+    ///   `AUTH_STACK`); anything else that opens them alerts. Medium, not High:
+    ///   an administrator's `cat`, a backup or integrity tool (`tar`, `rsync`, `rpm -V`,
+    ///   AIDE) and a PAM service the list lacks look the same, and none is excluded here
+    ///   because each is also what an attacker runs.
+    /// - A **home credential file, keychain or browser store** has no fixed list: `python3` with `boto3`, `terraform`,
+    ///   `kubectl`, `git` and `ssh` all read their own, from `/usr/bin`. So a read alerts only
+    ///   when the reader is *unexpected* in a way the telemetry can show: a web or database
+    ///   service (or a child of one), or a binary run from outside the system directories
+    ///   (`/tmp`, a home directory, `/dev/shm`). Not caught: a system binary (`cat`, `tar`) run
+    ///   by an intruder, and a tool a developer installed under their home (`~/.local/bin`,
+    ///   `~/go/bin`) alerts although it is theirs, its own credentials read by its own
+    ///   binary. Both are the price of not alerting on every `aws` call. On macOS the Apple
+    ///   daemons that read a keychain and the browsers installed in `/Applications` run from
+    ///   the system directories, so they should stay quiet (not observed on a Mac); a browser
+    ///   installed under `~/Applications` alerts on its own store.
+    ///
+    /// One alert per (pid, kind) per [`CREDENTIAL_READ_ALERT_WINDOW_NS`]. No file content and
+    /// no command line goes into the message, only the path the process asked for.
+    pub(crate) fn check(
+        &mut self,
+        event: &FileOpenEvent,
+        pid_comm: &BoundedMap<u32, PidFact>,
+        pid_image_path: &BoundedMap<u32, PidFact>,
+    ) -> Option<Alert> {
+        if !can_read(event.flags) {
+            return None;
+        }
+        let kind = classify(&event.path)?;
+        let image = reader_image(pid_image_path, &event.meta);
+        let comm = event.meta.comm.as_str();
+        let why = match kind {
+            CredFile::Shadow if is_auth_stack(comm, image) => return None,
+            CredFile::Shadow => "outside the authentication stack",
+            CredFile::PrivateKey
+            | CredFile::HomeCredentials
+            | CredFile::Keychain
+            | CredFile::BrowserStore => {
+                if reader_under_service(pid_comm, &event.meta) {
+                    "a web or database service or its child"
+                } else if image_outside_system_dirs(image) {
+                    "a binary outside the system directories"
+                } else {
+                    return None;
+                }
+            }
+        };
+        let ts = event.meta.timestamp_ns;
+        let counter = self
+            .alerts
+            .get_or_insert_with((event.meta.pid, kind), SlidingCounter::default);
+        if !counter.try_alert(ts, CREDENTIAL_READ_ALERT_WINDOW_NS) {
+            return None;
+        }
+        Some(Alert {
+            technique: kind.technique(),
+            severity: Severity::Medium,
+            message: format!(
+                "pid={} comm={comm}: opened {} for reading from {why}",
+                event.meta.pid, event.path,
+            ),
+        })
+    }
+}
+
+/// The image the pid was exec'd from, else its parent's: a child that forked and never
+/// exec'd (an older `sshd`'s privilege-separated child) is the same binary as its parent,
+/// and is in no exec table of its own.
+fn reader_image<'a>(
+    pid_image_path: &'a BoundedMap<u32, PidFact>,
+    meta: &schema::EventMeta,
+) -> Option<&'a str> {
+    PidFact::current(pid_image_path, meta.pid, meta.process_generation)
+        .or_else(|| PidFact::current(pid_image_path, meta.ppid, meta.parent_process_generation))
+}
+
+/// Whether `pid`'s own name, or its parent's, is a web or database service: a daemon with
+/// no business in a user's credential files, and the process a webshell runs under. The
+/// name comes from the exec table, not from the event's `comm`, which is the thread's
+/// (`one_connection` for a `mysqld` worker).
+fn reader_under_service(pid_comm: &BoundedMap<u32, PidFact>, meta: &schema::EventMeta) -> bool {
+    let is_service = |comm: &str| {
+        SERVICE_COMMS.contains(&comm)
+            || SERVICE_COMM_PREFIXES
+                .iter()
+                .any(|prefix| comm.starts_with(prefix))
+    };
+    [
+        PidFact::current(pid_comm, meta.pid, meta.process_generation),
+        PidFact::current(pid_comm, meta.ppid, meta.parent_process_generation),
+    ]
+    .into_iter()
+    .flatten()
+    .any(is_service)
 }
 
 #[cfg(test)]

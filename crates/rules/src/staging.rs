@@ -1,24 +1,147 @@
-//! STAGING-DIR (T1074.001, #380): path classification and the per-pid state of the rule.
-//!
-//! The rule itself is [`crate::RuleState::check_staging_dir`]; this module holds what it
-//! reads paths with: which opens count as a read of user data, which directory a created file
-//! is staged in, and the bounded per-pid history.
+//! STAGING-DIR (T1074.001, #380): path classification and the per-pid state of the rule,
+//! [`StagingState::check`].
+
+use schema::{FileOpenEvent, O_CREAT, detection::Severity};
+use store::BoundedMap;
 
 use crate::{
-    exclusions::{STAGING_EXCLUDED_DIR_NAMES, STAGING_PROFILE_TEMP_ROOTS, STAGING_TEMP_ROOTS},
+    Alert,
+    exclusions::{
+        STAGING_EXCLUDED_DIR_NAMES, STAGING_PID_CAP, STAGING_PROFILE_TEMP_ROOTS, STAGING_READ_DIRS,
+        STAGING_READ_FILES, STAGING_TEMP_ROOTS, STAGING_WINDOW_NS, STAGING_WRITE_FILES,
+    },
+    has_write_intent,
     sliding::SlidingDistinct,
+    state::same_incarnation,
 };
 
 /// Distinct user-data files a pid has opened for reading (newest window only).
-pub(crate) struct StagingReads {
-    pub(crate) generation: Option<u64>,
-    pub(crate) files: SlidingDistinct<String>,
+struct StagingReads {
+    generation: Option<u64>,
+    files: SlidingDistinct<String>,
 }
 
 /// Distinct files a pid created in one staging directory.
-pub(crate) struct StagingDir {
-    pub(crate) generation: Option<u64>,
-    pub(crate) files: SlidingDistinct<String>,
+struct StagingDir {
+    generation: Option<u64>,
+    files: SlidingDistinct<String>,
+}
+
+/// The reads and creates STAGING-DIR joins, per pid.
+pub(crate) struct StagingState {
+    /// pid → the distinct user-data files it opened for reading. LRU-bounded by
+    /// [`STAGING_PID_CAP`].
+    reads: BoundedMap<u32, StagingReads>,
+    /// (pid, directory) → the distinct files the pid created there. Only staging directories
+    /// are recorded (see [`staging_dir`]). LRU-bounded by [`STAGING_PID_CAP`].
+    dirs: BoundedMap<(u32, String), StagingDir>,
+}
+
+impl StagingState {
+    pub(crate) fn new() -> Self {
+        Self {
+            reads: BoundedMap::new(STAGING_PID_CAP),
+            dirs: BoundedMap::new(STAGING_PID_CAP),
+        }
+    }
+
+    /// STAGING-DIR (T1074.001, #380) — one pid reads at least [`STAGING_READ_FILES`] distinct
+    /// user-data files spread over [`STAGING_READ_DIRS`] directories and creates at least
+    /// [`STAGING_WRITE_FILES`] distinct files in one staging directory (a subdirectory of a
+    /// temp root or a hidden directory, see [`staging_dir`]), all inside
+    /// [`STAGING_WINDOW_NS`]. One alert per directory and window. Medium: the shape is also a
+    /// folder copy, a backup tool and an indexer, and no allowlist of those exists yet (it
+    /// needs a lab capture of the host's ordinary copies and builds).
+    ///
+    /// The evaluation runs on a create, so the last read must precede the last create it
+    /// counts: a copy loop that interleaves reads and creates qualifies, a sweep that reads
+    /// everything and then creates fewer than the threshold does not. `FileWriteEvent`
+    /// carries no path, so the creating `open` is the signal, never a byte count: a staging
+    /// file written to by another pid, or opened without `O_CREAT`, is a stated gap, and so
+    /// is a collection that stages in `~/.cache` or a macOS per-user temp directory. The
+    /// reader and the creator must be the same pid: `tar | gzip` style pipelines spread the
+    /// two over processes and are not seen.
+    pub(crate) fn check(&mut self, event: &FileOpenEvent) -> Option<Alert> {
+        let meta = &event.meta;
+        let ts = meta.timestamp_ns;
+        if !has_write_intent(event.flags) {
+            self.record_staging_read(meta, ts, &event.path);
+            return None;
+        }
+        if event.flags & O_CREAT == 0 {
+            return None;
+        }
+        let dir = staging_dir(&event.path)?;
+        let key = (meta.pid, dir.clone());
+        if self
+            .dirs
+            .peek(&key)
+            .is_some_and(|d| !same_incarnation(d.generation, meta.process_generation))
+        {
+            self.dirs.remove(&key);
+        }
+        let entry = self.dirs.get_or_insert_with(key, || StagingDir {
+            generation: meta.process_generation,
+            files: SlidingDistinct::default(),
+        });
+        let created = entry
+            .files
+            .record(event.path.clone(), ts, STAGING_WINDOW_NS);
+        if created < STAGING_WRITE_FILES {
+            return None;
+        }
+        let (read_files, read_dirs) = self.staging_read_summary(meta, ts)?;
+        let entry = self.dirs.get_mut(&(meta.pid, dir.clone()))?;
+        if !entry.files.try_alert(ts, STAGING_WINDOW_NS) {
+            return None;
+        }
+        Some(Alert {
+            technique: "T1074.001",
+            severity: Severity::Medium,
+            message: format!(
+                "pid={} comm={} read {read_files} user files from {read_dirs} directories and created {created} files in the staging directory /{dir}",
+                meta.pid, meta.comm,
+            ),
+        })
+    }
+
+    /// STAGING-DIR, read half: remembers a user-data file the pid opened without write intent.
+    fn record_staging_read(&mut self, meta: &schema::EventMeta, ts: u64, path: &str) {
+        let Some((file, _)) = user_data_file(path) else {
+            return;
+        };
+        if self
+            .reads
+            .peek(&meta.pid)
+            .is_some_and(|r| !same_incarnation(r.generation, meta.process_generation))
+        {
+            self.reads.remove(&meta.pid);
+        }
+        self.reads
+            .get_or_insert_with(meta.pid, || StagingReads {
+                generation: meta.process_generation,
+                files: SlidingDistinct::default(),
+            })
+            .files
+            .record(file, ts, STAGING_WINDOW_NS);
+    }
+
+    /// STAGING-DIR: how many distinct user files, over how many directories, the pid read in
+    /// the window — `None` when that is below the read thresholds.
+    fn staging_read_summary(&mut self, meta: &schema::EventMeta, ts: u64) -> Option<(u32, usize)> {
+        let reads = self.reads.get_mut(&meta.pid)?;
+        if !same_incarnation(reads.generation, meta.process_generation) {
+            return None;
+        }
+        let files = reads.files.count(ts, STAGING_WINDOW_NS);
+        let dirs: std::collections::HashSet<&str> = reads
+            .files
+            .values()
+            .filter_map(|f| f.rsplit_once('/').map(|(dir, _)| dir))
+            .collect();
+        (files >= STAGING_READ_FILES && dirs.len() >= STAGING_READ_DIRS)
+            .then_some((files, dirs.len()))
+    }
 }
 
 /// The path as `/`-separated, lowercase-insensitive segments, `.` and `..` resolved, or

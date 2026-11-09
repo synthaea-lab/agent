@@ -110,7 +110,7 @@ Generated from ATT&CK technique identifiers tagged in source (`crates/rules`, `c
 
 | Technique | Layer(s) | Source(s) |
 | --- | --- | --- |
-| T1074.001 | 3 | `rules:crates/rules/src/state.rs` |
+| T1074.001 | 3 | `rules:crates/rules/src/staging.rs` |
 
 ## Command and Control
 

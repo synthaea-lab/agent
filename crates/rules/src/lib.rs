@@ -42,6 +42,7 @@ mod staging;
 mod state;
 mod stateless;
 mod sudo;
+mod task_registration;
 mod unitstop;
 
 // AMSI content rules (#282): the dispatcher for `AmsiContent` events.
