@@ -131,8 +131,8 @@ with what its parent was running.
 
 The probe captures `bpf_get_current_cgroup_id()` while the process is still in the syscall.
 Userspace maps that id to a container id by finding the cgroupfs directory with the same inode
-under `/sys/fs/cgroup` ([`container_id_from_cgroupfs`](../../../crates/sensors/linux/userspace/src/container.rs))
-and matching a container id in its path ([`extract_container_id`](../../../crates/sensors/linux/userspace/src/container.rs)):
+under `/sys/fs/cgroup` ([`container_id_from_cgroupfs`](../../../crates/sensors/linux/container/src/lib.rs))
+and matching a container id in its path ([`extract_container_id`](../../../crates/sensors/linux/container/src/lib.rs)):
 
 - a 64-hex-character segment (`/docker/<id>`, cgroup v1 naming);
 - `docker-<id>.scope`, `cri-containerd-<id>.scope`, or podman's `libpod-<id>.scope` (podman puts
@@ -140,12 +140,12 @@ and matching a container id in its path ([`extract_container_id`](../../../crate
 
 A container's cgroup directory lives as long as the container, so this does not race a
 short-lived process the way a `/proc/<pid>/cgroup` read did. Results are cached per cgroup id
-([`CgroupIdCache`](../../../crates/sensors/linux/userspace/src/container.rs), 4096 entries, FIFO).
+([`CgroupIdCache`](../../../crates/sensors/linux/container/src/lib.rs), 4096 entries, FIFO).
 The walk is bounded to depth 12.
 
 Image and name come from Docker: on the first sighting of a container id, a background task asks
 `/var/run/docker.sock` for `GET /containers/<id>/json` with a 500 ms timeout
-([`lookup`](../../../crates/sensors/linux/userspace/src/docker.rs)). The event that triggered it goes
+([`lookup`](../../../crates/sensors/linux/container/src/docker.rs)). The event that triggered it goes
 out with the id only; later events carry the image and name. Any failure (no Docker, containerd
 only, permission, timeout) leaves them `None`. That cache is not bounded; the number of containers
 over a host's uptime is expected to stay small.

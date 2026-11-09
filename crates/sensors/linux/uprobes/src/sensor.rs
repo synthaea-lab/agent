@@ -16,13 +16,13 @@ use aya::{
     programs::{UProbe, uprobe::UProbeScope},
 };
 use schema::sensor::{Capabilities, EventSink, Sensor, SensorError};
+use sensor_linux_container::{CgroupIdCache, DockerInfoCache, container_context};
 use sensor_linux_wire::{GetAddrInfoEvent, ReadlineInputEvent, TlsCaptureEvent, comm_str};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use crate::{
     config::{TlsConfig, UprobesConfig},
-    container::{CgroupIdCache, DockerInfoCache, container_context},
     normalize,
     symbol_resolver::{self, SymbolInfo},
 };

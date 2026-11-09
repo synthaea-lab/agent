@@ -22,12 +22,6 @@ pub mod config;
 pub mod symbol_resolver;
 
 #[cfg(target_os = "linux")]
-mod container;
-
-#[cfg(target_os = "linux")]
-mod docker;
-
-#[cfg(target_os = "linux")]
 mod sensor;
 
 #[cfg(target_os = "linux")]

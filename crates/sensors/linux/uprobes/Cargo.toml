@@ -15,16 +15,14 @@ tracing = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sensor-linux-wire = { path = "../wire", features = ["user"] }
+sensor-linux-container = { path = "../container" }
 aya = { version = "0.16", default-features = false }
 aya-log = { version = "0.4", default-features = false }
 goblin = { version = "0.10", default-features = false, features = ["elf64", "elf32", "endian_fd", "std"] }
 thiserror = "2.0"
-tokio = { version = "1", default-features = false, features = ["sync", "signal", "macros", "rt", "net", "time", "io-util"] }
+tokio = { version = "1", default-features = false, features = ["sync", "signal", "macros", "rt", "net"] }
 libc = "0.2"
 regex = { version = "1.11", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
-# Docker socket container-attribution lookup (`docker.rs`, issue #312).
-serde = { workspace = true }
-serde_json = { workspace = true }
 
 [build-dependencies]
 anyhow = "1.0"

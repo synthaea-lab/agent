@@ -4,7 +4,8 @@
 Rules (see CLAUDE.md):
   - `schema` depends on no workspace crate; `policy` depends only on `schema`.
     Together they are the BASE tier every other crate may use.
-  - Sensor crates (`sensor-*`) depend only on `schema`.
+  - Sensor crates (`sensor-*`) depend only on `schema`, plus their own platform's
+    shared crates (`sensor-linux-wire`, `sensor-linux-container`).
   - Detection crates (rules, sigma, correlator, verdict, ml, yara, enrich) depend on
     the base tier, each other, and `store` — never on a sensor crate.
   - Leaf crates (response, transport, ipc, sinks, updater, config, store, conformance)
@@ -29,7 +30,12 @@ DETECTION = {"rules", "sigma", "correlator", "verdict", "ml", "yara", "enrich",
 LEAF = {"response", "transport", "ipc", "sinks", "updater", "config", "store",
         "conformance", "tamper", "mesh", "device-control", "inventory", "redact"}
 BINARIES = {"agent", "watchdog", "cli", "release-tool"}
-WIRE_CRATES = {"sensor-linux-wire"}
+# Crates shared by one platform's sensors, keyed to that platform's package prefix:
+# the wire crate (kernel<->userspace ABI) and the container-attribution runtime.
+PLATFORM_SHARED = {
+    "sensor-linux-wire": "sensor-linux",
+    "sensor-linux-container": "sensor-linux",
+}
 # Dev-only helpers: leaves with no workspace deps, usable as a dev-dependency anywhere.
 TEST_SUPPORT = {"siblings"}
 
@@ -43,9 +49,10 @@ def allowed(crate: str) -> set[str] | None:
     if crate == "policy":
         return {SCHEMA}
     if crate.startswith("sensor-"):
-        # A platform's wire crate (its kernel<->userspace ABI) is shared within that
-        # platform's sensor pair — e.g. sensor-linux -> sensor-linux-wire.
-        return {SCHEMA} | {c for c in WIRE_CRATES if crate.startswith(c.removesuffix("-wire"))}
+        # Shared crates depend only on `schema`, so they never pull a sibling sensor in.
+        if crate in PLATFORM_SHARED:
+            return {SCHEMA}
+        return {SCHEMA} | {c for c, prefix in PLATFORM_SHARED.items() if crate.startswith(prefix)}
     if crate in DETECTION:
         return BASE | DETECTION | {"store"}
     if crate in LEAF:

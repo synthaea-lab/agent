@@ -7,6 +7,7 @@ cover, and `audit` takes over on hosts where eBPF is unavailable.
 | --- | --- | --- |
 | `ebpf/` | `sensor-linux-ebpf` | Kernel programs (raw tracepoints, BPF-LSM, uprobes), target `bpfel-unknown-none` |
 | `wire/` | `sensor-linux-wire` | Ring-buffer record layout shared by the probes and the loader |
+| `container/` | `sensor-linux-container` | Container attribution (cgroup id to container id, Docker image and name) shared by `userspace` and `uprobes` |
 | `userspace/` | `sensor-linux` | Loads and attaches the probes, drains the ring buffers, normalizes events |
 | `lsm/` | `sensor-linux-lsm` | BPF-LSM `file_open` and `inode_setattr` |
 | `uprobes/` | `sensor-linux-uprobes` | TLS plaintext, shell readline and `getaddrinfo` |

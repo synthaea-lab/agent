@@ -434,7 +434,8 @@ They must fail closed when the target is wrong.
   an ignore cannot go stale. Licenses come from an allow-list, and wildcard version
   requirements are denied.
 - Dependency direction is enforced by `tools/check-deps.py`. Sensor crates depend only on
-  `schema`, so a sensor cannot reach the transport or the updater.
+  `schema` and their platform's shared crates, so a sensor cannot reach the transport or the
+  updater.
 - Platform-specific code is confined to sensors, the updater, and the narrow quarantine
   descriptor helpers.
 - GitHub Actions are pinned by commit SHA, and checkout does not persist credentials.

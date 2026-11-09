@@ -15,5 +15,6 @@ normalization code is tested on all three operating systems.
 | [`windows/`](windows/README.md) | ETW, Event Log, socket-table snapshots, minifilter client and kernel driver | [docs/sensors/windows](../../docs/sensors/windows/README.md) |
 | [`macos/`](macos/README.md) | EndpointSecurity, unified log, socket-table snapshots, Network Extension | [docs/sensors/macos](../../docs/sensors/macos/README.md) |
 
-Sensors depend only on `schema`, never on a detection crate or on each other;
+Sensors depend only on `schema` (plus their platform's shared crates, such as
+`sensor-linux-wire`), never on a detection crate or on each other;
 [`tools/check-deps.py`](../../tools/check-deps.py) enforces it.

@@ -16,7 +16,6 @@ runtime, enriches each record from `/proc` and cgroupfs, and hands a `schema::Ev
 | [`drain.rs`](../../../crates/sensors/linux/userspace/src/drain.rs) | One drain: cap, self-exclusion, wire record reads; container attribution of drained events |
 | [`normalize.rs`](../../../crates/sensors/linux/userspace/src/normalize.rs) | Pure wire → schema mapping, tested on every OS |
 | [`proc.rs`](../../../crates/sensors/linux/userspace/src/proc.rs) | `/proc` parsing: cmdline, environ, stat |
-| [`container.rs`](../../../crates/sensors/linux/userspace/src/container.rs), [`docker.rs`](../../../crates/sensors/linux/userspace/src/docker.rs) | Container attribution |
 | [`parent_image.rs`](../../../crates/sensors/linux/userspace/src/parent_image.rs) | Parent image cache |
 | [`unit_procs.rs`](../../../crates/sensors/linux/userspace/src/unit_procs.rs) | Security-tool processes for the signal probe |
 | [`dns_udp.rs`](../../../crates/sensors/linux/userspace/src/dns_udp.rs) | DNS question parser for the UDP/53 capture |

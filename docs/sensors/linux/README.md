@@ -28,13 +28,15 @@ This page is the map. Each component has its own page:
 ## Crates
 
 All crates live under [`crates/sensors/linux`](../../../crates/sensors/linux/README.md). A
-sensor crate depends only on `schema` and its own wire crate; anything that needs two sensors
+sensor crate depends only on `schema`, the wire crate and the container-attribution crate;
+anything that needs two sensors
 or the rules lives in the agent.
 
 | Crate (package) | Role | Runs |
 | --- | --- | --- |
 | `ebpf` (`sensor-linux-ebpf`) | Kernel programs, `no_std`, target `bpfel-unknown-none`, licensed GPL-2.0-only OR MIT | In the kernel |
 | `wire` (`sensor-linux-wire`) | `repr(C)` record layouts, the exec-record parser, the path filter shared by both sides | Both sides |
+| `container` (`sensor-linux-container`) | cgroup id to container id, Docker image and name; used by `userspace` and `uprobes` | Called per event |
 | `userspace` (`sensor-linux`) | `LinuxSensor`: loads the object, drains rings, enriches, normalizes | Primary sensor thread |
 | `uprobes` (`sensor-linux-uprobes`) | `UprobesSensor`: TLS/readline/`getaddrinfo` uprobes, off by default | Own thread, supervised |
 | `lsm` (`sensor-linux-lsm`) | Attaches the `file_open` BPF-LSM hook and reads its hit counter | Attached at start |
