@@ -127,7 +127,7 @@ With a control plane configured, [`upload::start`](../apps/agent/src/upload.rs) 
 | --- | --- | --- | --- |
 | main (primary sensor) | all | `cmd_run`: `LinuxSensor`/`AuditSensor` (own tokio runtime), ETW, or ES | Returns on Ctrl-C or sensor failure |
 | `enrich` | all | `DetectionSink::new` | When the queue is dropped, i.e. with the process |
-| `correlator-tick` | all | [`start_correlator_ticker`](../apps/agent/src/sink/mod.rs). Advances the correlator clock every second so window-expiry alerts fire without new events. Holds only a `Weak` reference to the sink. | When the sink is dropped |
+| `correlator-tick` | all | [`start_correlator_ticker`](../apps/agent/src/sink/correlation.rs). Advances the correlator clock every second so window-expiry alerts fire without new events. Holds only a `Weak` reference to the sink. | When the sink is dropped |
 | `yara-scan`, `yara-memscan` | all (memscan Linux only) | `start_yara` / `start_memscan` when `rules/yara` exists | With the process |
 | `transport-upload`, `detection-upload` | all, with a control plane | [`upload::start`](../apps/agent/src/upload.rs) | `ShutdownPlan` on Linux (with a 3 s final drain), otherwise with the process |
 | `heartbeat` | all | `wire_run_pipeline` | With the process |

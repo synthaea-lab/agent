@@ -77,7 +77,7 @@ anything: on Windows and macOS the flags are accepted and ignored, and no
 Exactly two triggers reach [`DetectionSink::kill_for`](../apps/agent/src/sink/response.rs):
 
 1. **A `BAYES` alert raised by this event.** In
-   [`emit_correlator_alerts`](../apps/agent/src/sink/mod.rs), after every correlator alert has
+   [`emit_correlator_alerts`](../apps/agent/src/sink/correlation.rs), after every correlator alert has
    been recorded, the pid of the last alert for which
    [`crosses_kill_gate`](../apps/agent/src/sink/response.rs) is true (technique `BAYES`) is passed to
    [`maybe_kill`](../apps/agent/src/sink/response.rs). The audit reason is "a high-confidence
@@ -104,7 +104,7 @@ but that is incidental. Pinned by `a_critical_sigma_hit_never_triggers_a_kill`,
 
 ### Shields: refusing by what the process is
 
-[`DetectionSink::correlate`](../apps/agent/src/sink/mod.rs) asks the correlator for
+[`DetectionSink::correlate`](../apps/agent/src/sink/correlation.rs) asks the correlator for
 [`CorrelationEngine::kill_shield`](../crates/correlator/src/engine.rs) for the event's
 pid and incarnation, before releasing the correlator lock. If a shield is set,
 `kill_for` reports [`KillOutcome::Refused`](../crates/response/src/kill.rs) with a

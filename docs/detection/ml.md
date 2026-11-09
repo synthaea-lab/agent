@@ -136,7 +136,7 @@ yet. The T2 path uses `score` only.
 
 ### Loading and degraded mode
 
-At construction, [`DetectionSink::load_correlation_scorer`](../../apps/agent/src/sink/mod.rs) looks for
+At construction, [`load_correlation_scorer`](../../apps/agent/src/sink/correlation.rs) looks for
 `correlation-iforest-{linux,windows,macos}/0.1.0/model.onnx` under
 `<state_dir>/ml/registry` (`model_root`), then under `ml/registry` relative to the working
 directory (for a source checkout). The `model_metadata.json` next to it is optional. On any
@@ -146,7 +146,7 @@ failure it logs `ML correlation scorer unavailable — agent works without ML` a
 
 ### Per event
 
-[`DetectionSink::correlate`](../../apps/agent/src/sink/mod.rs) runs on the capture thread, inside the
+[`DetectionSink::correlate`](../../apps/agent/src/sink/correlation.rs) runs on the capture thread, inside the
 correlator lock (inference takes microseconds):
 
 | `score()` result | Effect |

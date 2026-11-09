@@ -15,8 +15,6 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    thread,
-    time::Duration,
 };
 
 use schema::{Event, sensor::EventSink};
@@ -30,12 +28,14 @@ use crate::{
 
 mod baseline;
 mod canary;
+mod correlation;
 mod recording;
 mod response;
 
 pub(crate) use baseline::BaselineSink;
+pub(crate) use correlation::model_root;
 use recording::{Finding, record_ioc_hit, record_rule_alert, spool_on_worker};
-use response::{DAMAGE_MANIFEST_MAX, ResponseCell, crosses_kill_gate};
+use response::{DAMAGE_MANIFEST_MAX, ResponseCell};
 
 /// Dispatches every event to the detection engines and the output sinks. `Mutex`
 /// around the mutable state (`RuleState`) rather than no synchronization: the
@@ -185,16 +185,6 @@ fn image_signature(event: &Event) -> rules::ImageSignature {
     }
 }
 
-/// The `case_id` of a correlator finding: `{ppid}:{comm}`, with `@{generation}` of the
-/// parent appended when it is known, so two incarnations of a recycled parent pid do not
-/// share one case. The server treats it as an opaque string.
-fn correlator_case_id(entity: &verdict::EntityKey) -> String {
-    match entity.parent_generation {
-        Some(generation) => format!("{}:{}@{generation}", entity.ppid, entity.comm),
-        None => format!("{}:{}", entity.ppid, entity.comm),
-    }
-}
-
 /// How long a technique already recorded for an entity stays "the same finding":
 /// a second engine (or the same engine again) reporting it inside this window
 /// folds in silently instead of producing a second alert. Matches the
@@ -222,98 +212,7 @@ fn techniques_from(technique: &str) -> Vec<String> {
     }
 }
 
-/// Where the agent looks for ML model families first: under the state directory,
-/// like the content and the updater's files, not the process's working directory
-/// (#559). Lab runs and source checkouts keep working through the relative
-/// `ml/registry` fallback in [`DetectionSink::load_correlation_scorer`].
-pub(crate) fn model_root(state_dir: &Path) -> std::path::PathBuf {
-    state_dir.join("ml").join("registry")
-}
-
-/// The version directory of `family` under the first of `roots` that holds a
-/// `model.onnx`. When none does, the first root's directory: it is the one the
-/// "scorer unavailable" warning should name, where an operator would put the model.
-fn locate_model_dir(roots: &[&Path], family: &str) -> std::path::PathBuf {
-    let dirs: Vec<std::path::PathBuf> = roots
-        .iter()
-        .map(|root| root.join(family).join("0.1.0"))
-        .collect();
-    dirs.iter()
-        .find(|dir| dir.join("model.onnx").is_file())
-        .unwrap_or(&dirs[0])
-        .clone()
-}
-
 impl DetectionSink {
-    /// Starts the one-second clock that expires pending web-shell correlations even
-    /// when the sensor has stopped producing events. The worker holds only a `Weak`
-    /// reference while sleeping, and releases the correlator mutex before log I/O.
-    pub(crate) fn start_correlator_ticker(self: &Arc<Self>) -> std::io::Result<()> {
-        let sink = Arc::downgrade(self);
-        thread::Builder::new()
-            .name("correlator-tick".into())
-            .spawn(move || {
-                loop {
-                    thread::sleep(Duration::from_secs(1));
-                    let Some(sink) = sink.upgrade() else {
-                        break;
-                    };
-                    sink.advance_correlation_time(schema::time::now_ns());
-                }
-            })?;
-        Ok(())
-    }
-
-    fn advance_correlation_time(&self, now_ns: u64) {
-        let alerts = {
-            let mut correlator = self.correlator.lock_recovering();
-            correlator.advance_time(now_ns)
-        };
-        // BAYES is the only technique `crosses_kill_gate` recognizes, and it is raised
-        // only from the per-event path below (`CorrelationEngine::bayes_alert`'s one call
-        // site), never from `advance_time`'s window-expiry alerts — so `shield`
-        // is never read on this path, and `None` is a placeholder, not a real claim
-        // about any pid here (issues #652, https://github.com/synthaea-lab/agent/issues/50).
-        self.emit_correlator_alerts(&alerts, None, None);
-    }
-
-    /// `shield` is the correlator's provenance verdict for the event this batch of
-    /// alerts was produced from (issues #652, <https://github.com/synthaea-lab/agent/issues/50>) — meaningful only when a `BAYES` alert is
-    /// among them, since that is the only technique [`crosses_kill_gate`] recognizes, and
-    /// `CorrelationAlert::trigger_event` is always `None` for it (so it always resolves to
-    /// `default_event`, never to a different pid than the one `shield` was computed
-    /// for).
-    fn emit_correlator_alerts(
-        &self,
-        alerts: &[correlator::CorrelationAlert],
-        default_event: Option<&Event>,
-        shield: Option<correlator::KillShield>,
-    ) {
-        let mut high_confidence_pid = None;
-        for alert in alerts {
-            let Some(event) = alert.trigger_event.as_deref().or(default_event) else {
-                continue;
-            };
-            let entity = entity_key(event.meta());
-            let case_id = correlator_case_id(&entity);
-            let source = schema::detection::DetectionSource::Correlator { case_id };
-            let finding = Finding {
-                entity: &entity,
-                technique: alert.technique,
-                message: &alert.message,
-                source,
-                severity: alert.severity,
-            };
-            self.record(finding, event, Vec::new());
-            if crosses_kill_gate(alert.technique) {
-                high_confidence_pid = Some(event.meta().pid);
-            }
-        }
-        if let Some(pid) = high_confidence_pid {
-            self.maybe_kill(pid, shield);
-        }
-    }
-
     /// `rule_state` arrives already seeded by the caller (from /proc or the
     /// platform's process list — see `commands`). `spool` is the transport
     /// spool (`run --server`), `None` when the agent runs standalone.
@@ -406,7 +305,7 @@ impl DetectionSink {
         Ok(Self {
             rule_state: Mutex::new(rule_state),
             correlator,
-            ml_scorer: Mutex::new(Self::load_correlation_scorer(model_root)),
+            ml_scorer: Mutex::new(correlation::load_correlation_scorer(model_root)),
             sigma: Mutex::new(load_sigma_rules(&content_root).into_option()),
             common_set,
             ioc,
@@ -513,59 +412,6 @@ impl DetectionSink {
             sigma_reload_failed,
             yara_reload_failed,
         }
-    }
-
-    /// Loads the ML correlation scorer from the registry (issue #46 Phase 3, #47 Phase 2).
-    ///
-    /// Returns `None` when the model is unavailable (missing directory, load error) —
-    /// the agent works without ML (hand-calibrated Bayesian features still function).
-    /// Logs a warning on load failure so the operator sees the degradation.
-    ///
-    /// Model location: `<model_root>/correlation-iforest-{linux,windows,macos}/0.1.0/`,
-    /// where `model_root` is [`model_root`] (`<state_dir>/ml/registry`), then the
-    /// relative `ml/registry` of the current working directory, which is where a
-    /// source checkout (lab, ML calibration) keeps it. A packaged service has no
-    /// useful working directory, so the first location is the one it can rely on.
-    fn load_correlation_scorer(model_root: &Path) -> Option<ml::CorrelationScorer> {
-        /// Platform-specific model family names.
-        #[cfg(target_os = "linux")]
-        const MODEL_FAMILY: &str = "correlation-iforest-linux";
-        #[cfg(target_os = "windows")]
-        const MODEL_FAMILY: &str = "correlation-iforest-windows";
-        #[cfg(target_os = "macos")]
-        const MODEL_FAMILY: &str = "correlation-iforest-macos";
-
-        let model_dir = locate_model_dir(&[model_root, Path::new("ml/registry")], MODEL_FAMILY);
-
-        match Self::try_load_scorer(&model_dir) {
-            Ok(scorer) => {
-                tracing::info!(
-                    model_dir = %model_dir.display(),
-                    "ML correlation scorer loaded"
-                );
-                Some(scorer)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    model_dir = %model_dir.display(),
-                    error = %e,
-                    "ML correlation scorer unavailable — agent works without ML"
-                );
-                None
-            }
-        }
-    }
-
-    fn try_load_scorer(
-        model_dir: &std::path::Path,
-    ) -> Result<ml::CorrelationScorer, Box<dyn std::error::Error>> {
-        let model_bytes = std::fs::read(model_dir.join("model.onnx"))?;
-        let meta_bytes = std::fs::read(model_dir.join("model_metadata.json")).ok();
-
-        Ok(ml::CorrelationScorer::from_onnx_bytes_with_metadata(
-            &model_bytes,
-            meta_bytes.as_deref(),
-        )?)
     }
 
     /// Returns a reference to the enrichment queue for health telemetry.
@@ -703,72 +549,6 @@ impl DetectionSink {
                 self.ransomware_reflex(event.meta().pid);
             }
         }
-    }
-
-    /// Cross-event correlation (co-occurrence rules + Bayesian belief).
-    ///
-    /// ML correlation scorer (issue #46 Phase 3, #47 Phase 2): if available, scores
-    /// the pid's behavior over the correlator window and updates the belief state with
-    /// the resulting log-likelihood ratio. Scoring happens in the correlator lock —
-    /// ONNX inference is fast (~microseconds) and the capture thread is single-threaded.
-    fn correlate(&self, event: &Event) {
-        let mut engine = self.correlator.lock_recovering();
-        let alerts = engine.on_event(event.clone());
-
-        // ML scoring: score the pid's behavior and update belief with the LLR.
-        // The scorer lock is held briefly (load Option, score if present). Scoring
-        // itself accesses the bus while still holding the correlator lock, which is
-        // acceptable — inference is fast and this is the capture thread.
-        let pid = event.meta().pid;
-        let generation = event.meta().process_generation;
-        if let Some(ref mut scorer) = *self.ml_scorer.lock_recovering() {
-            let ml_llr = match scorer.score(engine.bus(), pid, generation) {
-                Ok(Some(score)) => {
-                    // Scored successfully: convert to log-likelihood ratio.
-                    Some(ml::score_to_llr(score))
-                }
-                Ok(None) => {
-                    // Gated: fewer than MIN_EVENT_COUNT events in the window for this pid.
-                    // No score available yet, not an error.
-                    None
-                }
-                Err(ml::ScorerError::FeatureOutOfBounds {
-                    feature,
-                    value,
-                    min,
-                    max,
-                }) => {
-                    // OOD rejection: feature value outside training bounds, score unreliable.
-                    tracing::warn!(
-                        pid = pid,
-                        feature = feature,
-                        value = value,
-                        min = min,
-                        max = max,
-                        "ML scorer OOD rejection"
-                    );
-                    None
-                }
-                Err(e) => {
-                    // Other error (ONNX runtime, model parse): fail open, log and continue.
-                    tracing::error!(pid = pid, error = %e, "ML scorer error");
-                    None
-                }
-            };
-
-            // Update belief with the ML LLR (None = no ML evidence, not "benign").
-            if let Err(()) = engine.update_belief_with_ml(pid, generation, ml_llr) {
-                // No behavior vector available yet for this pid — not enough events.
-                // Silent: this is normal for the first few events of a new pid.
-            }
-        }
-
-        let shield = engine.kill_shield(pid, generation);
-        drop(engine); // Unlock correlator before alert emission (log I/O).
-
-        // The kill gate reads this event's own alerts, never the entity's sticky fused
-        // verdict (PR #502 review; docs/response.md, "What can trigger a kill").
-        self.emit_correlator_alerts(&alerts, Some(event), shield);
     }
 
     /// Exec events: stateless rules, stateful rules, then Sigma.
