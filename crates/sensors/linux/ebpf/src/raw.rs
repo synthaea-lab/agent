@@ -78,8 +78,8 @@ const EXIT_SOCKET: u32 = 5;
 static SYSCALL_DISPATCH: Array<u32> = Array::with_max_entries(MAX_SYSCALL_ID, 0);
 
 /// Handler tag and syscall number of an in-flight call whose event needs its
-/// return value. Five syscalls use this path: accept, accept4, memfd_create,
-/// recvfrom and socket. An LRU bounds blocked entries; sys_exit checks the actual
+/// return value. Five syscalls use this path: accept, accept4, `memfd_create`,
+/// recvfrom and socket. An LRU bounds blocked entries; `sys_exit` checks the actual
 /// syscall number before dispatch so stale tags cannot route unrelated exits.
 #[map]
 static PENDING_SYSCALL_EXIT: LruHashMap<u64, u64> = LruHashMap::with_max_entries(4096, 0);
@@ -141,6 +141,11 @@ const SEND_SIG_PRIV: usize = 1;
 /// architecture (the layout is userspace ABI).
 const SIGINFO_CODE_OFFSET: usize = 8;
 
+/// The bit of signal `sig` (1..=64) in a `SigCgt`-style set.
+const fn sig_bit(sig: u32) -> u64 {
+    1u64 << (sig - 1)
+}
+
 /// The signals a daemon commonly catches to reload or rotate (`SIGHUP`, `SIGUSR1`, `SIGUSR2`,
 /// the real-time range 32..=64), as a bit set (bit `sig - 1`). For a tool whose `SigCgt` (the
 /// value of its `SIGNAL_WATCH_TOOLS` entry, taken at scan time) has the bit, the signal is a
@@ -148,10 +153,10 @@ const SIGINFO_CODE_OFFSET: usize = 8;
 /// `SIGKILL`. `SIGTERM`, `SIGINT`, `SIGQUIT` and `SIGABRT` are never in this set: a handler for
 /// them is how a daemon shuts down.
 const RELOAD_SIGNALS: u64 = {
-    let mut set = (1u64 << (1 - 1)) | (1u64 << (10 - 1)) | (1u64 << (12 - 1));
+    let mut set = sig_bit(1) | sig_bit(10) | sig_bit(12);
     let mut sig = 32;
     while sig <= 64 {
-        set |= 1u64 << (sig - 1);
+        set |= sig_bit(sig);
         sig += 1;
     }
     set

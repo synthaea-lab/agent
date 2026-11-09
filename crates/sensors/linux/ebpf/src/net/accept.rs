@@ -1,15 +1,15 @@
 //! Socket accept (issue #263 Phase 2)
 //!
-//! First paired sys_enter/sys_exit probe in this crate. Every other probe here is
-//! sys_enter_*: it reads syscall arguments before the call runs, which is enough
+//! First paired `sys_enter/sys_exit` probe in this crate. Every other probe here is
+//! `sys_enter`_*: it reads syscall arguments before the call runs, which is enough
 //! because the kernel hasn't touched anything yet. accept(2)/accept4(2) are
 //! different — the caller passes a sockaddr buffer that the kernel fills in DURING
-//! the call, so the peer address does not exist yet at sys_enter time. The standard
-//! sys_exit_* tracepoint format carries only __syscall_nr and the return value, not
-//! the original arguments, so sys_enter_accept{,4} stashes the caller's
-//! (fd, addr_ptr) in ACCEPT_ARGS (keyed by pid_tgid, the same entry/exit
-//! correlation pattern already used by the uprobes crate's SSL_READ_ARGS for
-//! SSL_read's output buffer), and sys_exit_accept{,4} reads it back once the kernel
+//! the call, so the peer address does not exist yet at `sys_enter` time. The standard
+//! `sys_exit`_* tracepoint format carries only __`syscall_nr` and the return value, not
+//! the original arguments, so `sys_enter_accept{,4`} stashes the caller's
+//! (fd, `addr_ptr`) in `ACCEPT_ARGS` (keyed by `pid_tgid`, the same entry/exit
+//! correlation pattern already used by the uprobes crate's `SSL_READ_ARGS` for
+//! `SSL_read`'s output buffer), and `sys_exit_accept{,4`} reads it back once the kernel
 //! has actually written the peer address.
 
 use aya_ebpf::{
@@ -48,9 +48,9 @@ struct AcceptArgs {
 static ACCEPT_ARGS: LruHashMap<u64, AcceptArgs> = LruHashMap::with_max_entries(1024, 0);
 
 /// Offsets of the `syscalls:sys_enter_accept`/`sys_enter_accept4` tracepoints
-/// (x86_64/aarch64): `fd`(16), `upeer_sockaddr`(24) — identical shape for both
+/// (`x86_64/aarch64)`: `fd`(16), `upeer_sockaddr`(24) — identical shape for both
 /// (accept4's extra `flags` argument trails at 40, not needed here). Verified on
-/// 2026-09-22 on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// 2026-09-22 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_accept{,4}/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const ACCEPT_FD_OFFSET: usize = 16;

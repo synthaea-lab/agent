@@ -20,9 +20,9 @@ static SOCKET_BIND_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static BIND_SCRATCH: PerCpuArray<SocketBindEvent> = PerCpuArray::with_max_entries(1, 0);
 
-/// Offsets of the `syscalls:sys_enter_bind` tracepoint (x86_64/aarch64): `fd`(16),
+/// Offsets of the `syscalls:sys_enter_bind` tracepoint (`x86_64/aarch64)`: `fd`(16),
 /// `umyaddr`(24), `addrlen`(32) — identical shape to `sys_enter_connect` above.
-/// Verified on 2026-09-21 on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// Verified on 2026-09-21 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_bind/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const BIND_FD_OFFSET: usize = 16;

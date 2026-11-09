@@ -1,7 +1,7 @@
 //! Uprobes: DNS resolution capture (issue #267 Phase 1)
 //!
 //! getaddrinfo(3) uprobe/uretprobe pair, attached from userspace (sensor-linux-uprobes)
-//! after resolving the symbol in libc with goblin — same shape as the SSL_read
+//! after resolving the symbol in libc with goblin — same shape as the `SSL_read`
 //! entry/exit pair in `tls.rs`: the resolved address is only in `*res` once the call
 //! returns, so entry stashes what's needed to read it back at exit.
 
@@ -28,7 +28,7 @@ static DNS_QUERY_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 static DNS_SCRATCH: PerCpuArray<GetAddrInfoEvent> = PerCpuArray::with_max_entries(1, 0);
 
 /// Tracks `getaddrinfo(3)` arguments between entry and return:
-/// pid_tgid → (node_ptr, res_ptr_ptr). `getaddrinfo(const char *node, const char
+/// `pid_tgid` → (`node_ptr`, `res_ptr_ptr`). `getaddrinfo(const char *node, const char
 /// *service, const struct addrinfo *hints, struct addrinfo **res)` only populates
 /// `*res` on success, so the entry probe stashes the query-name pointer and the
 /// address OF the caller's `res` output variable (not what it points to yet) — the

@@ -35,9 +35,9 @@ static FILE_RENAME_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static RENAME_SCRATCH: PerCpuArray<FileRenameEvent> = PerCpuArray::with_max_entries(1, 0);
 
-/// Offsets of the `syscalls:sys_enter_write` tracepoint (x86_64/aarch64). Standard
+/// Offsets of the `syscalls:sys_enter_write` tracepoint (`x86_64/aarch64`). Standard
 /// `syscalls:*` layout (see `sys_enter_openat` in `open.rs`): `fd`(16), `buf`(24),
-/// `count`(32). Verified on 2026-09-21 on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// `count`(32). Verified on 2026-09-21 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_write/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 pub(crate) const WRITE_FD_OFFSET: usize = 16;
@@ -96,8 +96,8 @@ fn try_sys_enter_write(ctx: TracePointContext) -> Result<u32, u32> {
     Ok(0)
 }
 
-/// Offsets of the `syscalls:sys_enter_unlink` tracepoint (x86_64/aarch64):
-/// `pathname`(16). Verified on 2026-09-21 on Alpine (kernel 6.18.50-0-virt, x86_64)
+/// Offsets of the `syscalls:sys_enter_unlink` tracepoint (`x86_64/aarch64)`:
+/// `pathname`(16). Verified on 2026-09-21 on Alpine (kernel 6.18.50-0-virt, `x86_64`)
 /// via `/sys/kernel/tracing/events/syscalls/sys_enter_unlink/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const UNLINK_PATHNAME_PTR_OFFSET: usize = 16;
@@ -105,9 +105,9 @@ const UNLINK_PATHNAME_PTR_OFFSET: usize = 16;
 #[cfg(bpf_target_arch = "x86")]
 const UNLINK_PATHNAME_PTR_OFFSET: usize = 12;
 
-/// Offsets of the `syscalls:sys_enter_unlinkat` tracepoint (x86_64/aarch64):
+/// Offsets of the `syscalls:sys_enter_unlinkat` tracepoint (`x86_64/aarch64)`:
 /// `dfd`(16), `pathname`(24), `flag`(32). Verified on 2026-09-21 on Alpine
-/// (kernel 6.18.50-0-virt, x86_64) via
+/// (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_unlinkat/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const UNLINKAT_PATHNAME_PTR_OFFSET: usize = 24;
@@ -165,15 +165,14 @@ fn emit_file_delete_event(ctx: &TracePointContext, pathname_ptr: u64) -> Result<
             &comm,
         );
 
-        if pathname_ptr != 0 {
-            if let Ok(path) =
+        if pathname_ptr != 0
+            && let Ok(path) =
                 bpf_probe_read_user_str_bytes(pathname_ptr as *const u8, &mut (*e).path)
-            {
-                if is_filtered_path(path, 0, true) {
-                    return Ok(0);
-                }
-                (*e).path_len = path.len() as u16;
+        {
+            if is_filtered_path(path, 0, true) {
+                return Ok(0);
             }
+            (*e).path_len = path.len() as u16;
         }
 
         if FILE_DELETE_EVENTS
@@ -195,9 +194,9 @@ fn emit_file_delete_event(ctx: &TracePointContext, pathname_ptr: u64) -> Result<
 /// path against the renaming process's cwd when it sees it.
 const AT_FDCWD: i32 = -100;
 
-/// Offsets of the `syscalls:sys_enter_rename` tracepoint (x86_64/aarch64):
+/// Offsets of the `syscalls:sys_enter_rename` tracepoint (`x86_64/aarch64)`:
 /// `oldname`(16), `newname`(24). Verified on 2026-09-21 on Alpine
-/// (kernel 6.18.50-0-virt, x86_64) via
+/// (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_rename/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const RENAME_OLDNAME_PTR_OFFSET: usize = 16;
@@ -209,9 +208,9 @@ const RENAME_OLDNAME_PTR_OFFSET: usize = 12;
 #[cfg(bpf_target_arch = "x86")]
 const RENAME_NEWNAME_PTR_OFFSET: usize = 16;
 
-/// Offsets of the `syscalls:sys_enter_renameat` tracepoint (x86_64/aarch64):
+/// Offsets of the `syscalls:sys_enter_renameat` tracepoint (`x86_64/aarch64)`:
 /// `olddfd`(16), `oldname`(24), `newdfd`(32), `newname`(40). Verified on 2026-09-21
-/// on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_renameat/format`.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const RENAMEAT_OLDDFD_OFFSET: usize = 16;
@@ -231,9 +230,9 @@ const RENAMEAT_OLDNAME_PTR_OFFSET: usize = 16;
 #[cfg(bpf_target_arch = "x86")]
 const RENAMEAT_NEWNAME_PTR_OFFSET: usize = 24;
 
-/// Offsets of the `syscalls:sys_enter_renameat2` tracepoint (x86_64/aarch64):
+/// Offsets of the `syscalls:sys_enter_renameat2` tracepoint (`x86_64/aarch64)`:
 /// `olddfd`(16), `oldname`(24), `newdfd`(32), `newname`(40), `flags`(48). Verified on
-/// 2026-09-21 on Alpine (kernel 6.18.50-0-virt, x86_64) via
+/// 2026-09-21 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_renameat2/format`. Same
 /// oldname/newname offsets as `renameat` above (the trailing `flags` field doesn't
 /// shift them).
@@ -399,25 +398,23 @@ fn emit_file_rename_event(
         (*e).old_dfd = olddfd;
         (*e).new_dfd = newdfd;
 
-        if oldname_ptr != 0 {
-            if let Ok(path) =
+        if oldname_ptr != 0
+            && let Ok(path) =
                 bpf_probe_read_user_str_bytes(oldname_ptr as *const u8, &mut (*e).old_path)
-            {
-                if is_filtered_path(path, 0, true) {
-                    return Ok(0);
-                }
-                (*e).old_path_len = path.len() as u16;
+        {
+            if is_filtered_path(path, 0, true) {
+                return Ok(0);
             }
+            (*e).old_path_len = path.len() as u16;
         }
-        if newname_ptr != 0 {
-            if let Ok(path) =
+        if newname_ptr != 0
+            && let Ok(path) =
                 bpf_probe_read_user_str_bytes(newname_ptr as *const u8, &mut (*e).new_path)
-            {
-                if is_filtered_path(path, 0, true) {
-                    return Ok(0);
-                }
-                (*e).new_path_len = path.len() as u16;
+        {
+            if is_filtered_path(path, 0, true) {
+                return Ok(0);
             }
+            (*e).new_path_len = path.len() as u16;
         }
 
         if FILE_RENAME_EVENTS

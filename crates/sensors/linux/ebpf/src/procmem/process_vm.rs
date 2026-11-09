@@ -28,9 +28,9 @@ static PROCESS_VM_WRITE_SCRATCH: PerCpuArray<ProcessVmWriteEvent> =
     PerCpuArray::with_max_entries(1, 0);
 
 /// Offsets of the `syscalls:sys_enter_process_vm_readv`/`sys_enter_process_vm_writev`
-/// tracepoints (x86_64/aarch64, identical shape on both): `pid`(16), `lvec`(24),
+/// tracepoints (`x86_64/aarch64`, identical shape on both): `pid`(16), `lvec`(24),
 /// `liovcnt`(32), `rvec`(40), `riovcnt`(48). Verified on 2026-09-22 on Arch
-/// (kernel 6.6.9-arch1-1, x86_64) via
+/// (kernel 6.6.9-arch1-1, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_process_vm_readv/format` (and
 /// `..._writev/format`, identical layout).
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
@@ -51,7 +51,7 @@ const PROCESS_VM_REMOTE_IOV_OFFSET: usize = 28;
 #[cfg(bpf_target_arch = "x86")]
 const PROCESS_VM_RIOVCNT_OFFSET: usize = 32;
 
-/// Reads `iovec[0].iov_len` from a user-space `struct iovec *`. On x86_64/aarch64
+/// Reads `iovec[0].iov_len` from a user-space `struct iovec *`. On `x86_64/aarch64`
 /// `iov_base` (a pointer, unread here) occupies the first 8 bytes and `iov_len`
 /// (`size_t`) the next 8. On i686 the whole struct is 4+4 — a 32-bit userspace
 /// process's `struct iovec` has no 8-byte fields — so `iov_len` sits at offset 4,

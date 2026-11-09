@@ -23,7 +23,7 @@ static BPF_SCRATCH: PerCpuArray<BpfEvent> = PerCpuArray::with_max_entries(1, 0);
 /// command — `BPF_MAP_LOOKUP_ELEM`/`BPF_MAP_UPDATE_ELEM`/etc., the overwhelming
 /// majority of real `bpf(2)` traffic, including this agent's own sensor's
 /// map reads/writes at runtime — is filtered in-kernel before touching the ring
-/// buffer (see this crate's WIRE_VERSION v12 changelog).
+/// buffer (see this crate's `WIRE_VERSION` v12 changelog).
 const BPF_CMD_MAP_CREATE: u32 = 0;
 const BPF_CMD_PROG_LOAD: u32 = 5;
 const BPF_CMD_PROG_ATTACH: u32 = 8;

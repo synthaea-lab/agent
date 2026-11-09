@@ -1,7 +1,7 @@
 //! Explicit timestamp requests: `inode_setattr` LSM hook (#1036, #1044)
 //!
 //! Fires for every attribute change that reaches `notify_change`, whichever syscall (or
-//! io_uring op) asked: `utimensat`, `utimes`, `futimens`. `ia_valid` tells which attributes
+//! `io_uring` op) asked: `utimensat`, `utimes`, `futimens`. `ia_valid` tells which attributes
 //! the caller named; `ATTR_ATIME_SET`/`ATTR_MTIME_SET` mean the caller chose the time itself,
 //! as opposed to `ATTR_ATIME`/`ATTR_MTIME` alone, which the kernel fills with "now" (a write,
 //! `touch` without `-d`, `UTIME_NOW`). Only the former is timestomping.

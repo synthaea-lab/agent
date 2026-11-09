@@ -16,8 +16,8 @@ sensor-linux-wire = { path = "../wire" }
 aya-ebpf = { version = "0.3", default-features = false }
 aya-log-ebpf = { version = "0.3", default-features = false }
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bpf_target_arch, values("x86", "x86_64", "aarch64"))'] }
+[lints]
+workspace = true
 
 
 [[bin]]

@@ -30,7 +30,7 @@ const IDENTITY_KIND_SETFSGID: u8 = 5;
 
 /// Offset of `setuid(2)`/`setgid(2)`/`setfsuid(2)`/`setfsgid(2)`'s single
 /// `uid_t`/`gid_t` argument — identical shape across all four, assumed
-/// standard layout (16-byte header + 8 bytes/arg on x86_64/aarch64);
+/// standard layout (16-byte header + 8 bytes/arg on `x86_64/aarch64`);
 /// re-verify against `/format` on any newly supported kernel,
 /// same posture as every other offset const in this file.
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
@@ -45,7 +45,7 @@ const SINGLE_ID_OFFSET: usize = 12;
 /// register width apart each, and `try_sys_enter_setres` reads all three in
 /// a single `read_at::<[_; 3]>` instead of three separate reads at three
 /// separate offsets: three reads, each with its own early-return `?`, was
-/// enough extra verifier state to fail this function with "R2 !read_ok" at
+/// enough extra verifier state to fail this function with "R2 !`read_ok`" at
 /// its call sites under a forced `-O2` build (abuild's default.conf was
 /// overriding Cargo's resolved opt-level for the Alpine package — see
 /// packaging/linux/alpine/APKBUILD; the real fix was unsetting that
