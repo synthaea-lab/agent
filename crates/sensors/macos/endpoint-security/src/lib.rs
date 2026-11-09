@@ -51,7 +51,10 @@
 pub mod normalize;
 pub mod raw;
 
-#[cfg(target_os = "macos")]
+// The record conversion in `ffi` is plain Rust over `repr(C)` structs, so its
+// tests run on any host; only the extern calls need macOS.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod ffi;
 #[cfg(target_os = "macos")]
 mod sensor;
