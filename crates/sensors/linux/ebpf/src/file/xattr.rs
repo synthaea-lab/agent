@@ -30,7 +30,7 @@ static FILE_REMOVEXATTR_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0)
 #[map]
 static REMOVEXATTR_SCRATCH: PerCpuArray<FileRemovexattrEvent> = PerCpuArray::with_max_entries(1, 0);
 
-/// Offsets of the `syscalls:sys_enter_setxattr` tracepoint (`x86_64/aarch64)`:
+/// Offsets of the `syscalls:sys_enter_setxattr` tracepoint (`x86_64`/`aarch64`):
 /// `pathname`(16), `name`(24), `value`(32, unused), `size`(40, unused), `flags`(48,
 /// unused). Verified on 2026-09-22 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_setxattr/format`.
@@ -96,7 +96,7 @@ fn try_sys_enter_setxattr(ctx: TracePointContext) -> Result<u32, u32> {
     Ok(0)
 }
 
-/// Offsets of the `syscalls:sys_enter_removexattr` tracepoint (`x86_64/aarch64)`:
+/// Offsets of the `syscalls:sys_enter_removexattr` tracepoint (`x86_64`/`aarch64`):
 /// `pathname`(16), `name`(24). Verified on 2026-09-22 on Alpine (kernel
 /// 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_removexattr/format`.

@@ -86,14 +86,14 @@ fn try_sys_enter_write(ctx: TracePointContext) -> Result<u32, u32> {
     Ok(0)
 }
 
-/// Offsets of the `syscalls:sys_enter_unlink` tracepoint (`x86_64/aarch64)`:
+/// Offsets of the `syscalls:sys_enter_unlink` tracepoint (`x86_64`/`aarch64`):
 /// `pathname`(16). Verified on 2026-09-21 on Alpine (kernel 6.18.50-0-virt, `x86_64`)
 /// via `/sys/kernel/tracing/events/syscalls/sys_enter_unlink/format`.
 ///
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
 const UNLINK_PATHNAME_PTR_OFFSET: usize = arg_offset(0);
 
-/// Offsets of the `syscalls:sys_enter_unlinkat` tracepoint (`x86_64/aarch64)`:
+/// Offsets of the `syscalls:sys_enter_unlinkat` tracepoint (`x86_64`/`aarch64`):
 /// `dfd`(16), `pathname`(24), `flag`(32). Verified on 2026-09-21 on Alpine
 /// (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_unlinkat/format`.
@@ -171,7 +171,7 @@ fn emit_file_delete_event(ctx: &TracePointContext, pathname_ptr: u64) -> Result<
 /// path against the renaming process's cwd when it sees it.
 const AT_FDCWD: i32 = -100;
 
-/// Offsets of the `syscalls:sys_enter_rename` tracepoint (`x86_64/aarch64)`:
+/// Offsets of the `syscalls:sys_enter_rename` tracepoint (`x86_64`/`aarch64`):
 /// `oldname`(16), `newname`(24). Verified on 2026-09-21 on Alpine
 /// (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_rename/format`.
@@ -180,7 +180,7 @@ const AT_FDCWD: i32 = -100;
 const RENAME_OLDNAME_PTR_OFFSET: usize = arg_offset(0);
 const RENAME_NEWNAME_PTR_OFFSET: usize = arg_offset(1);
 
-/// Offsets of the `syscalls:sys_enter_renameat` tracepoint (`x86_64/aarch64)`:
+/// Offsets of the `syscalls:sys_enter_renameat` tracepoint (`x86_64`/`aarch64`):
 /// `olddfd`(16), `oldname`(24), `newdfd`(32), `newname`(40). Verified on 2026-09-21
 /// on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_renameat/format`.
@@ -191,7 +191,7 @@ const RENAMEAT_NEWDFD_OFFSET: usize = arg_offset(2);
 const RENAMEAT_OLDNAME_PTR_OFFSET: usize = arg_offset(1);
 const RENAMEAT_NEWNAME_PTR_OFFSET: usize = arg_offset(3);
 
-/// Offsets of the `syscalls:sys_enter_renameat2` tracepoint (`x86_64/aarch64)`:
+/// Offsets of the `syscalls:sys_enter_renameat2` tracepoint (`x86_64`/`aarch64`):
 /// `olddfd`(16), `oldname`(24), `newdfd`(32), `newname`(40), `flags`(48). Verified on
 /// 2026-09-21 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_renameat2/format`. Same
