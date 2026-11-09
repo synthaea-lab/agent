@@ -30,17 +30,26 @@ use crate::{
         prctl::sys_enter_prctl,
     },
     dns_udp_connect, dns_udp_sendto, dns_udp_write, emit_tool_signal_event,
+    file::{
+        chmod_chown::{
+            sys_enter_chmod, sys_enter_chown, sys_enter_fchmodat, sys_enter_fchownat,
+            sys_enter_lchown,
+        },
+        open::{sys_enter_open, sys_enter_openat},
+        write_delete_rename::{
+            sys_enter_rename, sys_enter_renameat, sys_enter_renameat2, sys_enter_unlink,
+            sys_enter_unlinkat, sys_enter_write,
+        },
+        xattr::{sys_enter_removexattr, sys_enter_setxattr},
+    },
     kernel::{
         bpf::sys_enter_bpf,
         module::{sys_enter_delete_module, sys_enter_finit_module, sys_enter_init_module},
     },
-    sys_enter_accept, sys_enter_accept4, sys_enter_bind, sys_enter_chmod, sys_enter_chown,
-    sys_enter_connect, sys_enter_fchmodat, sys_enter_fchownat, sys_enter_kill, sys_enter_lchown,
-    sys_enter_listen, sys_enter_memfd_create, sys_enter_mount, sys_enter_open, sys_enter_openat,
-    sys_enter_process_vm_readv, sys_enter_process_vm_writev, sys_enter_ptrace, sys_enter_recvfrom,
-    sys_enter_removexattr, sys_enter_rename, sys_enter_renameat, sys_enter_renameat2,
-    sys_enter_sendto, sys_enter_setxattr, sys_enter_socket, sys_enter_tgkill, sys_enter_umount,
-    sys_enter_unlink, sys_enter_unlinkat, sys_enter_write, sys_exit_accept, sys_exit_accept4,
+    sys_enter_accept, sys_enter_accept4, sys_enter_bind, sys_enter_connect, sys_enter_kill,
+    sys_enter_listen, sys_enter_memfd_create, sys_enter_mount, sys_enter_process_vm_readv,
+    sys_enter_process_vm_writev, sys_enter_ptrace, sys_enter_recvfrom, sys_enter_sendto,
+    sys_enter_socket, sys_enter_tgkill, sys_enter_umount, sys_exit_accept, sys_exit_accept4,
     sys_exit_memfd_create, sys_exit_recvfrom, sys_exit_socket, watched_tool_sigcgt,
 };
 
