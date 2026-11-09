@@ -22,6 +22,7 @@ use crate::{
     proc_events::{
         CN_IDX_PROC, CN_MSG_HDR_LEN, CN_VAL_PROC, CnMsgHeader, PROC_CN_MCAST_LISTEN, ProcEvent,
     },
+    socket::nlmsg_error_errno,
     wire::{NLMSG_DONE, NLMSG_ERROR, NLMSG_HDR_LEN, NlMsgHeader},
 };
 
@@ -106,12 +107,7 @@ impl ProcEventSubscription {
 
             match header.msg_type {
                 NLMSG_ERROR => {
-                    // Byte-by-byte, not `try_into().unwrap()` — no explicit
-                    // panic point to document, matching `wire::DiagMsg::parse`.
-                    let errno = match payload {
-                        [a, b, c, d, ..] => i32::from_ne_bytes([*a, *b, *c, *d]),
-                        _ => -1,
-                    };
+                    let errno = nlmsg_error_errno(payload);
                     if errno != 0 {
                         return Err(NetlinkError::Kernel(errno));
                     }
