@@ -10,7 +10,7 @@ quarantine, escalate) is on [Response](response.md).
 
 Every normalized event reaches [`DetectionSink::on_event`](../apps/agent/src/sink/mod.rs) on
 the sensor's capture thread. The first thing it does is call
-[`DetectionSink::correlate`](../apps/agent/src/sink/mod.rs); the stateless and stateful rules,
+[`DetectionSink::correlate`](../apps/agent/src/sink/correlation.rs); the stateless and stateful rules,
 Sigma, IOC matching and the canary checks run afterwards. Every finding from every
 engine then goes through one funnel, [`record_detection`](../apps/agent/src/sink/recording.rs), which
 writes the alert log and folds the finding into the fused verdict.
@@ -173,7 +173,7 @@ sequenceDiagram
   stamped in the future cannot expire its own grace period. When the stream is idle,
   the sink's `correlator-tick` thread calls
   [`CorrelationEngine::advance_time`](../crates/correlator/src/engine.rs) every second
-  ([`DetectionSink::start_correlator_ticker`](../apps/agent/src/sink/mod.rs)). The thread holds
+  ([`DetectionSink::start_correlator_ticker`](../apps/agent/src/sink/correlation.rs)). The thread holds
   only a `Weak` reference to the sink and releases the correlator lock before writing
   alerts.
 - **Bounds.** At most 256 pending shells (`MAX_PENDING_WEB_SHELLS`; past that a shell
@@ -421,7 +421,7 @@ runs on. What differs is the telemetry:
 There are no runtime knobs for the correlator: the window, thresholds, LLR table,
 exclusion lists and caps are compile-time constants listed above. What changes
 behavior at runtime is content: the ML model (`<state_dir>/ml/registry/...`, loaded by
-[`DetectionSink`](../apps/agent/src/sink/mod.rs); without it the hand-calibrated features still
+[`load_correlation_scorer`](../apps/agent/src/sink/correlation.rs); without it the hand-calibrated features still
 work) and the common-set snapshot (`<content_root>/snapshots/common-set.bin`).
 
 ## Testing

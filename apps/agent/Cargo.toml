@@ -49,6 +49,7 @@ ipc = { path = "../../crates/ipc" }
 tokio = { workspace = true }
 
 anyhow = "1"
+thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { version = "4", features = ["derive"] }

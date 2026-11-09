@@ -9,7 +9,8 @@ use schema::{ConnectEvent, Event, EventMeta, ExecEvent, User, sensor::EventSink 
 use super::{
     DetectionSink, Load,
     canary::{CANARY_EXEC_HOLD_NS, MAX_HELD_CANARY_TOUCHES},
-    correlator_case_id, entity_key, load_sigma_rules,
+    correlation::{ScorerLoadError, correlator_case_id, locate_model_dir, try_load_scorer},
+    entity_key, load_sigma_rules,
 };
 
 /// A content root with one Sigma rule per platform directory, each titled after it.
@@ -2325,7 +2326,7 @@ fn the_model_is_found_under_the_state_directory_before_the_working_directory() {
     std::fs::create_dir_all(&under_cwd).unwrap();
     std::fs::write(under_cwd.join("model.onnx"), b"y").unwrap();
 
-    let found = super::locate_model_dir(&[&super::model_root(&state), &cwd_root], "fam");
+    let found = locate_model_dir(&[&super::model_root(&state), &cwd_root], "fam");
     assert_eq!(found, under_state);
 }
 
@@ -2337,7 +2338,7 @@ fn the_working_directory_registry_is_the_fallback_for_a_source_checkout() {
     std::fs::create_dir_all(&under_cwd).unwrap();
     std::fs::write(under_cwd.join("model.onnx"), b"y").unwrap();
 
-    let found = super::locate_model_dir(&[&super::model_root(&state), &cwd_root], "fam");
+    let found = locate_model_dir(&[&super::model_root(&state), &cwd_root], "fam");
     assert_eq!(found, under_cwd);
 }
 
@@ -2345,8 +2346,25 @@ fn the_working_directory_registry_is_the_fallback_for_a_source_checkout() {
 fn with_no_model_anywhere_the_state_directory_is_the_one_named() {
     let state = tmp("model-none");
     let cwd_root = tmp("model-none-cwd");
-    let found = super::locate_model_dir(&[&super::model_root(&state), &cwd_root], "fam");
+    let found = locate_model_dir(&[&super::model_root(&state), &cwd_root], "fam");
     assert_eq!(found, super::model_root(&state).join("fam").join("0.1.0"));
+}
+
+#[test]
+fn a_model_directory_without_a_model_is_a_read_error() {
+    let dir = tmp("scorer-missing");
+    let error = try_load_scorer(&dir)
+        .err()
+        .expect("no model.onnx must not load");
+    assert!(matches!(error, ScorerLoadError::ReadModel(_)), "{error:?}");
+}
+
+#[test]
+fn a_model_the_scorer_cannot_parse_is_a_scorer_error() {
+    let dir = tmp("scorer-garbage");
+    std::fs::write(dir.join("model.onnx"), b"not an onnx model").unwrap();
+    let error = try_load_scorer(&dir).err().expect("garbage must not load");
+    assert!(matches!(error, ScorerLoadError::Scorer(_)), "{error:?}");
 }
 
 /// A counting sink for wiring tests elsewhere would go through `EventSink`;
