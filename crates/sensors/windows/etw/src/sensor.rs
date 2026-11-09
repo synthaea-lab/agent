@@ -3,13 +3,10 @@
 //! wiring and its lab-earned notes (`TcpClient` emits no eid=42 — 2026-08-25; PID
 //! recycling; orphan named sessions) carry over, the audit findings are fixed here.
 
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{Receiver, SyncSender},
-    },
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc::{Receiver, SyncSender},
 };
 
 use ferrisetw::trace::UserTrace;
@@ -21,9 +18,8 @@ use schema::{
 use crate::{
     amsi,
     bits::BitsJobs,
-    budget, cross_process, etw_sessions, hcs,
-    long_path::{self, LongPathCache},
-    normalize,
+    budget, cross_process, etw_sessions, hcs, normalize,
+    path_normalizer::PathNormalizer,
     pid_cache::PidCache,
     providers::{
         ALL_PROVIDERS, amsi_provider, audit_api_provider, bits_provider, dns_provider,
@@ -299,10 +295,9 @@ pub(crate) struct SharedState {
     /// pid → full image path; populated by seed + `ProcessStart`, pruned on
     /// `ProcessEnd` (PID recycling), bounded as a backstop (see [`PidCache`]).
     pub(crate) pids: Mutex<PidCache>,
-    /// F-5: live device→drive map, refreshed on normalization misses.
-    pub(crate) volumes: Mutex<HashMap<String, String>>,
-    /// #489: short-form directory → long form, so one file has one path.
-    pub(crate) long_paths: Mutex<LongPathCache>,
+    /// F-5 + #489: device→drive map and short→long directory cache, so one
+    /// file has one path.
+    paths: PathNormalizer,
     /// F-7: Connect/Send dedup.
     pub(crate) dedup: Mutex<normalize::ConnectDedup>,
     /// #365/#439: `Zone.Identifier` writes, queued for the read-back worker
@@ -389,20 +384,7 @@ impl SharedState {
     }
 
     pub(crate) fn normalize_path(&self, raw: &str) -> String {
-        let dos = self.to_dos_path(raw);
-        long_path::expand(&dos, &self.long_paths, winapi::long_path_name)
-    }
-
-    fn to_dos_path(&self, raw: &str) -> String {
-        let normalized = normalize::normalize_nt_path(raw, &self.volumes.lock_or_recover());
-        if normalized.starts_with(r"\Device\") {
-            // Unknown device: refresh the map once (a newly mounted volume) and retry.
-            let fresh = winapi::build_volume_map();
-            let mut volumes = self.volumes.lock_or_recover();
-            *volumes = fresh;
-            return normalize::normalize_nt_path(raw, &volumes);
-        }
-        normalized
+        self.paths.normalize(raw)
     }
 
     pub(crate) fn comm_for(&self, pid: u32) -> Option<String> {
@@ -654,8 +636,11 @@ impl Sensor for WindowsSensor {
         spawn_silo_resolver(silo_rx, Arc::clone(&silos))?;
         let state = Arc::new(SharedState {
             pids: Mutex::new(PidCache::new(PID_CACHE_CAP)),
-            volumes: Mutex::new(winapi::build_volume_map()),
-            long_paths: Mutex::new(LongPathCache::new(LONG_PATH_CACHE_CAP)),
+            paths: PathNormalizer::new(
+                winapi::build_volume_map,
+                winapi::long_path_name,
+                LONG_PATH_CACHE_CAP,
+            ),
             dedup: Mutex::new(normalize::ConnectDedup::new(60_000_000_000)),
             marks,
             bits: Mutex::new(BitsJobs::default()),
