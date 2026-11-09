@@ -134,7 +134,7 @@ Sigma rules, YARA rules, IOC feeds and the common-set snapshot are content under
 | Absent (directory or file missing) | engine unloaded, which is not an error |
 | Failed (content present but broken) | **previous engine kept**, error logged |
 
-[`DetectionSink::reload_content`](../../apps/agent/src/sink/mod.rs) parses and compiles everything
+[`DetectionSink::reload_content`](../../apps/agent/src/sink/content.rs) parses and compiles everything
 before it takes any lock, and holds each lock only for the swap. The capture thread takes the
 same locks for every exec and write-open, so loading under them would stall capture. The
 replaced engines are dropped after the locks are released, because dropping a `ScanQueue`

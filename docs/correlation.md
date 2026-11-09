@@ -265,7 +265,7 @@ feature sum, which would count the same evidence twice:
 - **Fleet rarity.** When the enrichment worker learns an exec's hash and the fleet's
   common-set snapshot says the image is not common, it calls
   [`CorrelationEngine::apply_rarity_evidence`](../crates/correlator/src/engine.rs)
-  ([`apply_rarity_evidence` caller in the sink](../apps/agent/src/sink/mod.rs)). Each call adds
+  ([`apply_rarity_evidence` caller in the sink](../apps/agent/src/sink/rarity.rs)). Each call adds
   `RARITY_LLR` (0.35) within a total allowance of `RARITY_MAX_TOTAL_LLR` (1.0) that
   decays with the belief ([`apply_rarity_llr`](../crates/correlator/src/bayes.rs)).
   Together with the prior this keeps rarity alone about 7 log-odds under the

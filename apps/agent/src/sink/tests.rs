@@ -7,10 +7,11 @@ use std::{
 use schema::{ConnectEvent, Event, EventMeta, ExecEvent, User, sensor::EventSink as _};
 
 use super::{
-    DetectionSink, Load,
+    DetectionSink,
     canary::{CANARY_EXEC_HOLD_NS, MAX_HELD_CANARY_TOUCHES},
+    content::{Load, load_sigma_rules, resolve_content_root},
     correlation::{ScorerLoadError, correlator_case_id, locate_model_dir, try_load_scorer},
-    entity_key, load_sigma_rules,
+    entity_key,
 };
 
 /// A content root with one Sigma rule per platform directory, each titled after it.
@@ -75,6 +76,26 @@ fn a_content_root_named_after_another_platform_does_not_change_which_rules_load(
     };
     let expected = if cfg!(target_os = "macos") { 2 } else { 1 };
     assert_eq!(engine.rule_count(), expected, "{:?}", engine.rule_titles());
+}
+
+#[test]
+fn a_content_root_without_sigma_rules_is_absent_not_failed() {
+    let root = tempfile::tempdir().unwrap();
+    assert!(matches!(load_sigma_rules(root.path()), Load::Absent));
+}
+
+#[test]
+fn an_absolute_content_dir_is_used_as_given() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("not-created");
+    assert_eq!(resolve_content_root(root.path()), root.path());
+    assert_eq!(resolve_content_root(&missing), missing);
+}
+
+#[test]
+fn a_relative_content_dir_absent_next_to_the_executable_stays_relative_to_the_cwd() {
+    let relative = std::path::Path::new("no-such-content-dir-next-to-the-test-binary");
+    assert_eq!(resolve_content_root(relative), relative);
 }
 
 #[test]
@@ -3203,12 +3224,12 @@ fn a_common_set_file_over_the_size_cap_is_refused_unread() {
     let root = dir.join("content");
 
     assert!(matches!(
-        super::load_common_set_capped(&root, u64::try_from(bytes.len()).unwrap()),
-        super::Load::Loaded(_)
+        super::content::load_common_set_capped(&root, u64::try_from(bytes.len()).unwrap()),
+        super::content::Load::Loaded(_)
     ));
     assert!(matches!(
-        super::load_common_set_capped(&root, u64::try_from(bytes.len()).unwrap() - 1),
-        super::Load::Failed
+        super::content::load_common_set_capped(&root, u64::try_from(bytes.len()).unwrap() - 1),
+        super::content::Load::Failed
     ));
 }
 
@@ -3244,40 +3265,40 @@ fn rarity_evidence_follows_the_snapshot_the_hash_and_the_coverage() {
     let absent = golden_non_member(&golden, "fifty_hashes_one_percent");
 
     assert_eq!(
-        super::rarity_evidence(Some(&member), Some(&wide), 10),
-        super::Rarity::InCommonSet
+        super::rarity::rarity_evidence(Some(&member), Some(&wide), 10),
+        super::rarity::Rarity::InCommonSet
     );
     assert_eq!(
-        super::rarity_evidence(Some(&absent), Some(&wide), 10),
-        super::Rarity::NotInCommonSet
+        super::rarity::rarity_evidence(Some(&absent), Some(&wide), 10),
+        super::rarity::Rarity::NotInCommonSet
     );
     // Coverage exactly at the minimum counts, one below withholds.
     assert_eq!(
-        super::rarity_evidence(Some(&absent), Some(&wide), 12),
-        super::Rarity::NotInCommonSet
+        super::rarity::rarity_evidence(Some(&absent), Some(&wide), 12),
+        super::rarity::Rarity::NotInCommonSet
     );
     assert_eq!(
-        super::rarity_evidence(Some(&absent), Some(&wide), 13),
-        super::Rarity::Withheld
+        super::rarity::rarity_evidence(Some(&absent), Some(&wide), 13),
+        super::rarity::Rarity::Withheld
     );
     // A snapshot built from 4 hosts is too thin to call anything rare.
     let thin = load("one_hash");
     assert_eq!(
-        super::rarity_evidence(Some(&absent), Some(&thin), 10),
-        super::Rarity::Withheld
+        super::rarity::rarity_evidence(Some(&absent), Some(&thin), 10),
+        super::rarity::Rarity::Withheld
     );
     // No snapshot, no hash, or something that is not a hash: nothing to say.
     assert_eq!(
-        super::rarity_evidence(Some(&absent), None, 10),
-        super::Rarity::Withheld
+        super::rarity::rarity_evidence(Some(&absent), None, 10),
+        super::rarity::Rarity::Withheld
     );
     assert_eq!(
-        super::rarity_evidence(None, Some(&wide), 10),
-        super::Rarity::Withheld
+        super::rarity::rarity_evidence(None, Some(&wide), 10),
+        super::rarity::Rarity::Withheld
     );
     assert_eq!(
-        super::rarity_evidence(Some("not-a-hash"), Some(&wide), 10),
-        super::Rarity::Withheld
+        super::rarity::rarity_evidence(Some("not-a-hash"), Some(&wide), 10),
+        super::rarity::Rarity::Withheld
     );
 }
 
@@ -3312,8 +3333,8 @@ fn rarity_counts_after(
     if correlated {
         engine.on_event(Event::Exec(exec.clone()));
     }
-    let stats = super::RarityStats::default();
-    super::note_image_rarity(
+    let stats = super::rarity::RarityStats::default();
+    super::rarity::note_image_rarity(
         &Mutex::new(engine),
         &Mutex::new(Some(Arc::new(snapshot))),
         &stats,
@@ -3375,8 +3396,8 @@ fn rarity_counts_nothing_for_an_image_the_fleet_knows() {
 #[test]
 fn rarity_counts_withheld_with_no_snapshot_at_all() {
     use crate::health::RarityStatsSource as _;
-    let stats = super::RarityStats::default();
-    super::note_image_rarity(
+    let stats = super::rarity::RarityStats::default();
+    super::rarity::note_image_rarity(
         &Mutex::new(correlator::CorrelationEngine::new()),
         &Mutex::new(None),
         &stats,
@@ -3403,8 +3424,8 @@ fn a_snapshot_past_its_maximum_age_withholds_the_evidence() {
         let mut engine = correlator::CorrelationEngine::new();
         let exec = exec_hashed(7_003, Some(&absent));
         engine.on_event(Event::Exec(exec.clone()));
-        let stats = super::RarityStats::default();
-        super::note_image_rarity(
+        let stats = super::rarity::RarityStats::default();
+        super::rarity::note_image_rarity(
             &Mutex::new(engine),
             &Mutex::new(Some(Arc::new(
                 ml::features::common_set::CommonSetSnapshot::parse(
@@ -3418,7 +3439,7 @@ fn a_snapshot_past_its_maximum_age_withholds_the_evidence() {
         );
         stats.rarity_counts()
     };
-    let max = super::MAX_SNAPSHOT_AGE_SECS;
+    let max = super::rarity::MAX_SNAPSHOT_AGE_SECS;
     assert_eq!(
         counts_at(built_at + max).applied,
         1,
@@ -3455,7 +3476,7 @@ fn snapshot_holding(hashes: &[&str], hosts_covered: u32) -> Vec<u8> {
     out.extend(BITS.to_le_bytes());
     // Built just now: the worker judges against the real clock, and a snapshot past its
     // maximum age is withheld (ADR-0033).
-    out.extend(super::unix_now_secs().to_le_bytes());
+    out.extend(super::rarity::unix_now_secs().to_le_bytes());
     out.extend(body);
     out
 }

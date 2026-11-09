@@ -28,7 +28,7 @@ flowchart LR
     EV -->|SigmaAlert| SINK[DetectionSink]
 ```
 
-1. **Load.** [`load_sigma_rules`](../../apps/agent/src/sink/mod.rs) in the agent calls
+1. **Load.** [`load_sigma_rules`](../../apps/agent/src/sink/content.rs) in the agent calls
    `SigmaEngine::load_dir_for(<content_root>/rules/sigma, Platform::host())`. A rule that fails
    to parse or validate is skipped with a warning naming the file and the reason. The rest of
    the set loads. Only an unreadable directory is an error (`Load::Failed`, and the previous
