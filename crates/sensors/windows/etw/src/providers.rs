@@ -1275,10 +1275,12 @@ pub(crate) fn bits_provider(sink: Arc<dyn EventSink>, state: Arc<SharedState>) -
                     .lock_or_recover()
                     .transfer_error(
                         &job_id,
-                        url.as_deref(),
-                        timestamp_ns,
-                        bytes_transferred,
-                        hresult,
+                        &crate::bits::TransferFailure {
+                            url: url.as_deref(),
+                            timestamp_ns,
+                            bytes_transferred,
+                            hresult,
+                        },
                     )
                     .into_iter()
                     .collect()
@@ -1318,7 +1320,15 @@ fn bits_file_added(
     let local_path = state.normalize_path(&crate::bits::local_path_for_join(&local_name));
     let mut jobs = state.bits.lock_or_recover();
     let (filtered, evicted) = (jobs.filtered(), jobs.evicted());
-    let event = jobs.file_added(client, job_id, job_title, url, local_path);
+    let event = jobs.file_added(
+        client,
+        crate::bits::AddedFile {
+            job_id,
+            job_title,
+            url,
+            local_path,
+        },
+    );
     if jobs.filtered() > filtered {
         tracing::debug!(
             filtered = jobs.filtered(),

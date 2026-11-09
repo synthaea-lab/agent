@@ -131,6 +131,30 @@ pub fn local_path_for_join(raw: &str) -> String {
     }
 }
 
+/// What an EID 16403 record says about the file it adds.
+pub struct AddedFile {
+    pub job_id: String,
+    pub job_title: String,
+    pub url: String,
+    pub local_path: String,
+}
+
+/// What an EID 61 record says about the failed transfer.
+pub struct TransferFailure<'a> {
+    /// The failing file's URL, when the record names one.
+    pub url: Option<&'a str>,
+    pub timestamp_ns: u64,
+    pub bytes_transferred: Option<u64>,
+    pub hresult: u32,
+}
+
+/// The per-record part of a [`BitsJobEvent`], next to the file it reports on.
+struct JobOutcome {
+    state: BitsJobState,
+    bytes_transferred: Option<u64>,
+    hresult: Option<u32>,
+}
+
 /// One file of a job, as its file-added record described it.
 struct JobFile {
     /// The client that added it.
@@ -165,18 +189,17 @@ pub struct BitsJobs {
 }
 
 impl BitsJobs {
-    /// EID 16403: `client` added `url` → `local_path` to the job. Forwarded
-    /// and remembered, unless the URL is a Microsoft update host. A Microsoft
-    /// file never drops the job's other files (#577 review: adding one used to
-    /// forget the job, and with it the payload's completion).
-    pub fn file_added(
-        &mut self,
-        client: EventMeta,
-        job_id: String,
-        job_title: String,
-        url: String,
-        local_path: String,
-    ) -> Option<BitsJobEvent> {
+    /// EID 16403: `client` added `file.url` → `file.local_path` to the job.
+    /// Forwarded and remembered, unless the URL is a Microsoft update host. A
+    /// Microsoft file never drops the job's other files (#577 review: adding
+    /// one used to forget the job, and with it the payload's completion).
+    pub fn file_added(&mut self, client: EventMeta, file: AddedFile) -> Option<BitsJobEvent> {
+        let AddedFile {
+            job_id,
+            job_title,
+            url,
+            local_path,
+        } = file;
         if is_microsoft_update_url(&url) {
             self.filtered += 1;
             return None;
@@ -233,9 +256,11 @@ impl BitsJobs {
                     file,
                     file.meta.clone(),
                     timestamp_ns,
-                    BitsJobState::Completed,
-                    bytes_transferred,
-                    None,
+                    JobOutcome {
+                        state: BitsJobState::Completed,
+                        bytes_transferred,
+                        hresult: None,
+                    },
                 )
             })
             .collect()
@@ -255,37 +280,40 @@ impl BitsJobs {
                     file,
                     canceller.clone(),
                     canceller.timestamp_ns,
-                    BitsJobState::Cancelled,
-                    None,
-                    None,
+                    JobOutcome {
+                        state: BitsJobState::Cancelled,
+                        bytes_transferred: None,
+                        hresult: None,
+                    },
                 )
             })
             .collect()
     }
 
-    /// EID 61: a transfer of the job failed with `hresult`, on the file whose
-    /// URL is `url` when the record names one (the job's latest file
-    /// otherwise). BITS retries on its own, so the job stays remembered.
+    /// EID 61: a transfer of the job failed with `failure.hresult`, on the
+    /// file whose URL is `failure.url` when the record names one (the job's
+    /// latest file otherwise). BITS retries on its own, so the job stays
+    /// remembered.
     pub fn transfer_error(
         &mut self,
         job_id: &str,
-        url: Option<&str>,
-        timestamp_ns: u64,
-        bytes_transferred: Option<u64>,
-        hresult: u32,
+        failure: &TransferFailure<'_>,
     ) -> Option<BitsJobEvent> {
         let job = self.jobs.get(job_id)?;
-        let file = url
+        let file = failure
+            .url
             .and_then(|url| job.files.iter().rev().find(|file| file.url == url))
             .or_else(|| job.files.last())?;
         Some(job.event(
             job_id,
             file,
             file.meta.clone(),
-            timestamp_ns,
-            BitsJobState::TransferError,
-            bytes_transferred,
-            Some(hresult),
+            failure.timestamp_ns,
+            JobOutcome {
+                state: BitsJobState::TransferError,
+                bytes_transferred: failure.bytes_transferred,
+                hresult: Some(failure.hresult),
+            },
         ))
     }
 
@@ -327,16 +355,13 @@ impl BitsJobs {
 }
 
 impl TrackedJob {
-    #[allow(clippy::too_many_arguments)]
     fn event(
         &self,
         job_id: &str,
         file: &JobFile,
         meta: EventMeta,
         timestamp_ns: u64,
-        state: BitsJobState,
-        bytes_transferred: Option<u64>,
-        hresult: Option<u32>,
+        outcome: JobOutcome,
     ) -> BitsJobEvent {
         BitsJobEvent {
             meta: EventMeta {
@@ -345,11 +370,11 @@ impl TrackedJob {
             },
             job_id: job_id.to_string(),
             job_title: self.job_title.clone(),
-            state,
+            state: outcome.state,
             url: file.url.clone(),
             local_path: file.local_path.clone(),
-            bytes_transferred,
-            hresult,
+            bytes_transferred: outcome.bytes_transferred,
+            hresult: outcome.hresult,
         }
     }
 }
@@ -376,11 +401,27 @@ mod tests {
     fn add(jobs: &mut BitsJobs, job_id: &str, url: &str) -> Option<BitsJobEvent> {
         jobs.file_added(
             client(6412, 1),
-            job_id.into(),
-            "update".into(),
-            url.into(),
-            PAYLOAD.into(),
+            AddedFile {
+                job_id: job_id.into(),
+                job_title: "update".into(),
+                url: url.into(),
+                local_path: PAYLOAD.into(),
+            },
         )
+    }
+
+    fn failure(
+        url: Option<&str>,
+        timestamp_ns: u64,
+        bytes_transferred: Option<u64>,
+        hresult: u32,
+    ) -> TransferFailure<'_> {
+        TransferFailure {
+            url,
+            timestamp_ns,
+            bytes_transferred,
+            hresult,
+        }
     }
 
     #[test]
@@ -482,7 +523,7 @@ mod tests {
         let mut jobs = BitsJobs::default();
         assert!(add(&mut jobs, JOB, UPDATE_URL).is_none());
         assert!(
-            jobs.transfer_error(JOB, None, 2, None, 0x8019_0194)
+            jobs.transfer_error(JOB, &failure(None, 2, None, 0x8019_0194))
                 .is_none()
         );
         assert!(jobs.completed(JOB, 3, None).is_empty());
@@ -507,10 +548,12 @@ mod tests {
         for i in 0..3 {
             jobs.file_added(
                 client(6412, i),
-                JOB.into(),
-                "update".into(),
-                format!("https://example.test/{i}.exe"),
-                format!(r"C:\Users\Public\{i}.exe"),
+                AddedFile {
+                    job_id: JOB.into(),
+                    job_title: "update".into(),
+                    url: format!("https://example.test/{i}.exe"),
+                    local_path: format!(r"C:\Users\Public\{i}.exe"),
+                },
             );
         }
         let done = jobs.completed(JOB, 9, None);
@@ -532,7 +575,10 @@ mod tests {
         let mut jobs = BitsJobs::default();
         assert!(jobs.completed(JOB, 1, None).is_empty());
         assert!(jobs.cancelled(JOB, &client(1, 1)).is_empty());
-        assert!(jobs.transfer_error(JOB, None, 1, None, 1).is_none());
+        assert!(
+            jobs.transfer_error(JOB, &failure(None, 1, None, 1))
+                .is_none()
+        );
     }
 
     #[test]
@@ -553,14 +599,14 @@ mod tests {
         add(&mut jobs, JOB, PAYLOAD_URL);
         add(&mut jobs, JOB, "https://example.test/second.exe");
         let failed = jobs
-            .transfer_error(JOB, Some(PAYLOAD_URL), 5, Some(1917), 0x8019_0194)
+            .transfer_error(JOB, &failure(Some(PAYLOAD_URL), 5, Some(1917), 0x8019_0194))
             .expect("forwarded");
         assert_eq!(failed.state, BitsJobState::TransferError);
         assert_eq!(failed.url, PAYLOAD_URL);
         assert_eq!(failed.hresult, Some(0x8019_0194));
         assert_eq!(failed.bytes_transferred, Some(1917));
         let unnamed = jobs
-            .transfer_error(JOB, None, 6, None, 1)
+            .transfer_error(JOB, &failure(None, 6, None, 1))
             .expect("forwarded");
         assert_eq!(
             unnamed.url, "https://example.test/second.exe",
