@@ -16,7 +16,11 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::SocketCreateEvent;
 
-use crate::{SYS_EXIT_RET_OFFSET, fill_event_meta, into_ret};
+use crate::{
+    SYS_EXIT_RET_OFFSET,
+    arch::{SyscallRecord, arg_offset},
+    fill_event_meta, into_ret,
+};
 
 /// Ring buffer shared with userspace for `socket` events.
 #[map]
@@ -65,41 +69,24 @@ const AF_UNIX: i32 = 1;
 /// layout also verified for `tgkill`'s `(tgid, tid, sig)`. Verified on 2026-10-07
 /// on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_socket/format`.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const SOCKET_DOMAIN_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const SOCKET_TYPE_OFFSET: usize = 24;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const SOCKET_PROTOCOL_OFFSET: usize = 32;
+///
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
-#[cfg(bpf_target_arch = "x86")]
-const SOCKET_DOMAIN_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-const SOCKET_TYPE_OFFSET: usize = 16;
-#[cfg(bpf_target_arch = "x86")]
-const SOCKET_PROTOCOL_OFFSET: usize = 20;
+const SOCKET_DOMAIN_OFFSET: usize = arg_offset(0);
+const SOCKET_TYPE_OFFSET: usize = arg_offset(1);
+const SOCKET_PROTOCOL_OFFSET: usize = arg_offset(2);
 
 pub fn sys_enter_socket(ctx: TracePointContext) -> u32 {
     into_ret(try_sys_enter_socket(&ctx))
 }
 
 fn try_sys_enter_socket(ctx: &TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let domain: i64 = unsafe { ctx.read_at(SOCKET_DOMAIN_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let domain: i64 = unsafe { ctx.read_at::<i32>(SOCKET_DOMAIN_OFFSET).map_err(|_| 1u32)? as i64 };
+    let domain: i64 = unsafe { ctx.read_long_arg(SOCKET_DOMAIN_OFFSET).map_err(|_| 1u32)? };
 
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let raw_type: i64 = unsafe { ctx.read_at(SOCKET_TYPE_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let raw_type: i64 = unsafe { ctx.read_at::<i32>(SOCKET_TYPE_OFFSET).map_err(|_| 1u32)? as i64 };
+    let raw_type: i64 = unsafe { ctx.read_long_arg(SOCKET_TYPE_OFFSET).map_err(|_| 1u32)? };
 
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let protocol: i64 = unsafe { ctx.read_at(SOCKET_PROTOCOL_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let protocol: i64 = unsafe {
-        ctx.read_at::<i32>(SOCKET_PROTOCOL_OFFSET)
-            .map_err(|_| 1u32)? as i64
+        ctx.read_long_arg(SOCKET_PROTOCOL_OFFSET)
+            .map_err(|_| 1u32)?
     };
 
     let pid_tgid = bpf_get_current_pid_tgid();
@@ -118,10 +105,7 @@ pub fn sys_exit_socket(ctx: TracePointContext) -> u32 {
 }
 
 fn try_sys_exit_socket(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let ret: i64 = unsafe { ctx.read_at(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let ret: i64 = unsafe { ctx.read_at::<i32>(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? as i64 };
+    let ret: i64 = unsafe { ctx.read_long_arg(SYS_EXIT_RET_OFFSET).map_err(|_| 1u32)? };
 
     let pid_tgid = bpf_get_current_pid_tgid();
     let args = match unsafe { SOCKET_CREATE_ARGS.get(&pid_tgid) } {

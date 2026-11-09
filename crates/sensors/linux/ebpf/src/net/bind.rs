@@ -10,7 +10,11 @@ use aya_ebpf::{
 use aya_log_ebpf::warn;
 use sensor_linux_wire::SocketBindEvent;
 
-use crate::{AF_INET, AF_INET6, fill_event_meta, into_ret};
+use crate::{
+    AF_INET, AF_INET6,
+    arch::{SyscallRecord, arg_offset},
+    fill_event_meta, into_ret,
+};
 
 /// Ring buffer shared with userspace for `bind` events.
 #[map]
@@ -24,15 +28,10 @@ static BIND_SCRATCH: PerCpuArray<SocketBindEvent> = PerCpuArray::with_max_entrie
 /// `umyaddr`(24), `addrlen`(32) — identical shape to `sys_enter_connect` above.
 /// Verified on 2026-09-21 on Alpine (kernel 6.18.50-0-virt, `x86_64`) via
 /// `/sys/kernel/tracing/events/syscalls/sys_enter_bind/format`.
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const BIND_FD_OFFSET: usize = 16;
-#[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-const BIND_UMYADDR_PTR_OFFSET: usize = 24;
+///
 /// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
-#[cfg(bpf_target_arch = "x86")]
-const BIND_FD_OFFSET: usize = 12;
-#[cfg(bpf_target_arch = "x86")]
-const BIND_UMYADDR_PTR_OFFSET: usize = 16;
+const BIND_FD_OFFSET: usize = arg_offset(0);
+const BIND_UMYADDR_PTR_OFFSET: usize = arg_offset(1);
 
 /// Key into [`BIND_ADDR_MAP`]: a process's fd table entry is per-process, so the
 /// same fd number on two different pids is a different socket.
@@ -78,17 +77,11 @@ pub fn sys_enter_bind(ctx: TracePointContext) -> u32 {
 /// (`laddr`/`lport` vs `daddr`/`dport`) differ. Also records the address into
 /// [`BIND_ADDR_MAP`] for `sys_enter_listen` to correlate against later.
 fn try_sys_enter_bind(ctx: TracePointContext) -> Result<u32, u32> {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let fd: u64 = unsafe { ctx.read_at(BIND_FD_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let fd: u64 = unsafe { ctx.read_at::<u32>(BIND_FD_OFFSET).map_err(|_| 1u32)? as u64 };
+    let fd: u64 = unsafe { ctx.read_ulong_arg(BIND_FD_OFFSET).map_err(|_| 1u32)? };
 
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let umyaddr_ptr: u64 = unsafe { ctx.read_at(BIND_UMYADDR_PTR_OFFSET).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
     let umyaddr_ptr: u64 = unsafe {
-        ctx.read_at::<u32>(BIND_UMYADDR_PTR_OFFSET)
-            .map_err(|_| 1u32)? as u64
+        ctx.read_ulong_arg(BIND_UMYADDR_PTR_OFFSET)
+            .map_err(|_| 1u32)?
     };
     if umyaddr_ptr == 0 {
         return Ok(0);

@@ -26,6 +26,7 @@ use super::{
 };
 use crate::{
     AF_INET, AF_INET6,
+    arch::SyscallRecord,
     file::write_delete_rename::{WRITE_BUF_OFFSET, WRITE_COUNT_OFFSET, WRITE_FD_OFFSET},
     fill_event_meta,
     mount_signal::signal::is_agent_own_pid,
@@ -97,10 +98,7 @@ fn emit_dns_udp_query(
     if len < DNS_HEADER_LEN {
         return Ok(0);
     }
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let buf_ptr: u64 = unsafe { ctx.read_at(buf_offset).map_err(|_| 1u32)? };
-    #[cfg(bpf_target_arch = "x86")]
-    let buf_ptr: u64 = unsafe { ctx.read_at::<u32>(buf_offset).map_err(|_| 1u32)? as u64 };
+    let buf_ptr: u64 = unsafe { ctx.read_ulong_arg(buf_offset).map_err(|_| 1u32)? };
     if buf_ptr == 0 {
         return Ok(0);
     }
@@ -189,21 +187,10 @@ fn read_inet_dest(addr_ptr: u64) -> Option<(DnsFdEntry, u16)> {
 /// fails leaves an entry behind. It is bounded (the map is an LRU) and harmless, because userspace
 /// drops any payload that is not a DNS query.
 pub fn dns_udp_connect(ctx: TracePointContext) -> u32 {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let Ok(fd) = (unsafe { ctx.read_at::<u64>(CONNECT_FD_OFFSET) }) else {
+    let Ok(fd) = (unsafe { ctx.read_ulong_arg(CONNECT_FD_OFFSET) }) else {
         return 1;
     };
-    #[cfg(bpf_target_arch = "x86")]
-    let Ok(fd) = (unsafe { ctx.read_at::<u32>(CONNECT_FD_OFFSET) }).map(u64::from) else {
-        return 1;
-    };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let Ok(addr_ptr) = (unsafe { ctx.read_at::<u64>(CONNECT_USERVADDR_PTR_OFFSET) }) else {
-        return 1;
-    };
-    #[cfg(bpf_target_arch = "x86")]
-    let Ok(addr_ptr) = (unsafe { ctx.read_at::<u32>(CONNECT_USERVADDR_PTR_OFFSET) }).map(u64::from)
-    else {
+    let Ok(addr_ptr) = (unsafe { ctx.read_ulong_arg(CONNECT_USERVADDR_PTR_OFFSET) }) else {
         return 1;
     };
     let key = dns_fd_key(bpf_get_current_pid_tgid(), fd);
@@ -221,20 +208,10 @@ pub fn dns_udp_connect(ctx: TracePointContext) -> u32 {
 /// `write(2)` on a socket this process connected to port 53 (Go's resolver does `connect` then
 /// `write`).
 pub fn dns_udp_write(ctx: TracePointContext) -> u32 {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let Ok(fd) = (unsafe { ctx.read_at::<u64>(WRITE_FD_OFFSET) }) else {
+    let Ok(fd) = (unsafe { ctx.read_ulong_arg(WRITE_FD_OFFSET) }) else {
         return 1;
     };
-    #[cfg(bpf_target_arch = "x86")]
-    let Ok(fd) = (unsafe { ctx.read_at::<u32>(WRITE_FD_OFFSET) }).map(u64::from) else {
-        return 1;
-    };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let Ok(count) = (unsafe { ctx.read_at::<u64>(WRITE_COUNT_OFFSET) }) else {
-        return 1;
-    };
-    #[cfg(bpf_target_arch = "x86")]
-    let Ok(count) = (unsafe { ctx.read_at::<u32>(WRITE_COUNT_OFFSET) }).map(u64::from) else {
+    let Ok(count) = (unsafe { ctx.read_ulong_arg(WRITE_COUNT_OFFSET) }) else {
         return 1;
     };
     let _ = emit_dns_on_connected_socket(&ctx, fd, WRITE_BUF_OFFSET, count);
@@ -244,30 +221,14 @@ pub fn dns_udp_write(ctx: TracePointContext) -> u32 {
 /// `sendto(2)`: with an address, an unconnected query to port 53 (musl, Rust, `dig`); without
 /// one (`send(2)` is `sendto` with a NULL address), a query on a socket connected to port 53.
 pub fn dns_udp_sendto(ctx: TracePointContext) -> u32 {
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let Ok(len) = (unsafe { ctx.read_at::<u64>(SENDTO_LEN_OFFSET) }) else {
+    let Ok(len) = (unsafe { ctx.read_ulong_arg(SENDTO_LEN_OFFSET) }) else {
         return 1;
     };
-    #[cfg(bpf_target_arch = "x86")]
-    let Ok(len) = (unsafe { ctx.read_at::<u32>(SENDTO_LEN_OFFSET) }).map(u64::from) else {
-        return 1;
-    };
-    #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-    let Ok(addr_ptr) = (unsafe { ctx.read_at::<u64>(SENDTO_ADDR_PTR_OFFSET) }) else {
-        return 1;
-    };
-    #[cfg(bpf_target_arch = "x86")]
-    let Ok(addr_ptr) = (unsafe { ctx.read_at::<u32>(SENDTO_ADDR_PTR_OFFSET) }).map(u64::from)
-    else {
+    let Ok(addr_ptr) = (unsafe { ctx.read_ulong_arg(SENDTO_ADDR_PTR_OFFSET) }) else {
         return 1;
     };
     if addr_ptr == 0 {
-        #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
-        let Ok(fd) = (unsafe { ctx.read_at::<u64>(SENDTO_FD_OFFSET) }) else {
-            return 1;
-        };
-        #[cfg(bpf_target_arch = "x86")]
-        let Ok(fd) = (unsafe { ctx.read_at::<u32>(SENDTO_FD_OFFSET) }).map(u64::from) else {
+        let Ok(fd) = (unsafe { ctx.read_ulong_arg(SENDTO_FD_OFFSET) }) else {
             return 1;
         };
         let _ = emit_dns_on_connected_socket(&ctx, fd, SENDTO_BUF_OFFSET, len);
