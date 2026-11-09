@@ -1,9 +1,9 @@
 //! The agent's own `EventSink`s: `DetectionSink`, which runs every event through the
 //! detection engines (rules, Sigma, IOC, YARA, deception canaries, the correlator and
 //! the ML correlation scorer), fuses verdicts and records alerts, detections and
-//! responses; and `BaselineSink`, which stores the redacted exec corpus used for ML
-//! training. Raw capture needs no sink of its own: it uses `sinks::JsonlEventSink`
-//! directly.
+//! responses; and [`BaselineSink`] (in `baseline`), which stores the redacted exec
+//! corpus used for ML training. Raw capture needs no sink of its own: it uses
+//! `sinks::JsonlEventSink` directly.
 
 // Production locks go through `LockExt::lock_recovering` (the agent's poisoned-lock policy,
 // `crate::sync`); a bare `unwrap` here would bring the panic-on-poison back.
@@ -29,6 +29,10 @@ use crate::{
     enrich_queue::EnrichQueue,
     sync::LockExt as _,
 };
+
+mod baseline;
+
+pub(crate) use baseline::BaselineSink;
 
 /// Wires issue #25's automated response into the sink once `enable_response` sets it
 /// (Linux only for this pass — see `commands::linux::cmd_run`). Held behind
@@ -2540,90 +2544,6 @@ impl EventSink for DetectionSink {
         // completed for this event (#102) — a hang anywhere above (a poisoned
         // lock, a wedged Sigma/YARA call) stops the heartbeat from advancing.
         self.progress.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-// ── BaselineSink ──────────────────────────────────────────────────────────────
-
-/// Minimal sink for ML baseline capture: records the exec events that trigger NO
-/// deterministic rule — the "known benign under current rules" corpus consumed by
-/// `synthaea_ml` training. Migrated from the old agent's `BaselineSink`, now
-/// platform-neutral (any sensor speaking the contract feeds it).
-pub(crate) struct BaselineSink {
-    rule_state: Mutex<rules::RuleState>,
-    out: JsonlWriter,
-    count: std::sync::atomic::AtomicU64,
-}
-
-/// One baseline record — the format `synthaea_ml` training consumes.
-///
-/// `argv` is the canonical form: the training side joins it with NUL exactly as
-/// [`schema::ExecEvent::ml_cmdline`] does, so the model trains on the vectors the
-/// agent will score. `cmdline` is kept alongside it for human inspection of the
-/// capture and as the documented fallback when `argv` is empty (Windows/ETW).
-#[derive(serde::Serialize)]
-struct BaselineRecord<'a> {
-    argv: &'a [String],
-    cmdline: &'a str,
-}
-
-impl BaselineSink {
-    pub(crate) fn new(
-        rule_state: rules::RuleState,
-        output: &std::path::Path,
-    ) -> std::io::Result<Self> {
-        Ok(Self {
-            rule_state: Mutex::new(rule_state),
-            out: JsonlWriter::open(output)?,
-            count: std::sync::atomic::AtomicU64::new(0),
-        })
-    }
-}
-
-impl EventSink for BaselineSink {
-    fn on_event(&self, event: Event) {
-        match &event {
-            Event::Exec(e) => {
-                // Evaluate the deterministic rules — alerting cmdlines are excluded
-                // from the baseline (they are exactly what the model must not learn
-                // as normal).
-                let det_alerts = rules::evaluate_exec(e);
-                let mut rule_state = self.rule_state.lock_recovering();
-                // Conservative: a gated finding excludes the cmdline whatever the
-                // signature would have said.
-                let gated = rule_state.on_exec_signature_gated(e);
-                let state_alerts = rule_state.on_exec(e);
-                drop(rule_state);
-                if !det_alerts.is_empty() || !state_alerts.is_empty() || gated.is_some() {
-                    return;
-                }
-                // Baselines leave the process and are used as a training corpus;
-                // store the same redacted canonical argv that inference can derive.
-                let safe = e.clone();
-                let mut safe_event = Event::Exec(safe);
-                crate::redact::redact_event(&mut safe_event);
-                let Event::Exec(safe) = safe_event else {
-                    unreachable!()
-                };
-                self.out.write(&BaselineRecord {
-                    argv: &safe.argv,
-                    cmdline: &safe.cmdline,
-                });
-                let n = self
-                    .count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    + 1;
-                if n.is_multiple_of(10) {
-                    eprintln!("[baseline] {n} cmdlines captured...");
-                }
-            }
-            // File events feed the stateful rules' history (download tracking) so
-            // exclusion decisions stay accurate; connects are irrelevant here.
-            Event::FileOpen(e) => {
-                self.rule_state.lock_recovering().on_file_open(e);
-            }
-            _ => {}
-        }
     }
 }
 

@@ -362,22 +362,6 @@ fn redacted_detection_message_keeps_messages_with_an_empty_command_line_intact()
 }
 
 #[test]
-fn baseline_corpus_stores_redacted_command_line_and_argv() {
-    let dir = tmp("baseline-cmdline-redaction");
-    let path = dir.join("baseline.jsonl");
-    let sink = super::BaselineSink::new(rules::RuleState::new(), &path).unwrap();
-    let mut exec = schema::fixtures::exec();
-    exec.image_path = "/usr/bin/mysql".into();
-    exec.cmdline = "mysql --password=S3cret".into();
-    exec.argv = vec!["mysql".into(), "--password=S3cret".into()];
-    sink.on_event(Event::Exec(exec));
-
-    let record = std::fs::read_to_string(path).unwrap();
-    assert!(record.contains("--password=REDACTED"), "{record}");
-    assert!(!record.contains("S3cret"), "{record}");
-}
-
-#[test]
 fn advancing_the_correlator_clock_emits_a_silent_shell_alert() {
     let dir = tmp("correlator-tick");
     let sink = sink_in(&dir);
