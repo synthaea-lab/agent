@@ -90,9 +90,13 @@ the download-to-execution joins (`recent_writes`, `recent_quarantines`,
 `recent_bits_downloads`, `recent_motw_removals`) in
 [`DownloadState`](../../crates/rules/src/download_state.rs), the T1620 memfd-exec
 correlation (`recent_memfd_creates`, `pending_proc_fd_exec`) in
-[`MemfdState`](../../crates/rules/src/memfd_state.rs), and LISTENER-DRIFT and
+[`MemfdState`](../../crates/rules/src/memfd_state.rs), LISTENER-DRIFT and
 POLICY-DENIAL-DRIFT (`known_listeners`, `known_policy_denials`, `policy_denial_budgets`) in
-[`DriftState`](../../crates/rules/src/drift_state.rs). The main families:
+[`DriftState`](../../crates/rules/src/drift_state.rs), and the file-open readers in their rule's
+module: STAGING-DIR's reads and creates in
+[`StagingState`](../../crates/rules/src/staging.rs), CREDENTIAL-READ's alert windows in
+[`CredentialReads`](../../crates/rules/src/credfiles.rs), and the T1053.005 registration dedup
+in [`TaskRegistrations`](../../crates/rules/src/task_registration.rs). The main families:
 
 | Family | Fields (examples) | Key | Feeds |
 | --- | --- | --- | --- |
@@ -100,7 +104,7 @@ POLICY-DENIAL-DRIFT (`known_listeners`, `known_policy_denials`, `policy_denial_b
 | Download provenance | `recent_writes`, `recent_quarantines`, `recent_bits_downloads`, `recent_motw_removals` | case-folded path | T1105, T1204.002, T1197, T1553.005 |
 | Sliding counters | `self_spawn`, `beacon`, `auth_failures`, `ransomware_rename`, `credential_reads`, `lsass_access` | rule-specific | threshold-in-window rules |
 | Distinct sets | `scan_vertical`, `scan_spread`, `ssh_fanout`, `security_discovery`, `service_stop` | pid or lineage | N distinct things in a window |
-| Exfiltration chain | `archive_writers`, `staged_archives`, `archive_readers`, `egress_flow_last`, `egress_volume`, `dns_class`, `staging_*` | pid / path / (comm, addr) | ARCHIVE-EXFIL, EGRESS-VOLUME, EGRESS-DOMAIN, STAGING-DIR |
+| Exfiltration chain | `archive_writers`, `staged_archives`, `archive_readers`, `egress_flow_last`, `egress_volume`, `dns_class`, `staging` | pid / path / (comm, addr) | ARCHIVE-EXFIL, EGRESS-VOLUME, EGRESS-DOMAIN, STAGING-DIR |
 | First-seen shapes | `known_listeners`, `known_policy_denials`, `logon_baseline` | shape tuple | LISTENER-DRIFT, POLICY-DENIAL-DRIFT, FIRST-SEEN-LOGON |
 | Joins | `rdp_success`, `sudo_success`, `session_hijack`, `unit_stops`, `pending_identity` | per module | failure-then-success, deferred judgements |
 

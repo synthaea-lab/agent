@@ -5,28 +5,25 @@
 use std::{collections::HashMap, net::IpAddr};
 
 use schema::{
-    AuthEvent, BitsJobEvent, ConnectEvent, DnsQueryEvent, Event, ExecEvent,
-    FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN, FileDeleteEvent, FileOpenEvent, FileQuarantineEvent,
-    FileRenameEvent, FileWriteEvent, ListenPortEvent, MemfdCreateEvent, NetworkFlowEvent, O_CREAT,
-    PolicyDenialEvent, SessionEvent, UnitStopEvent, User, detection::Severity,
+    AuthEvent, BitsJobEvent, ConnectEvent, DnsQueryEvent, Event, ExecEvent, FileDeleteEvent,
+    FileOpenEvent, FileQuarantineEvent, FileRenameEvent, FileWriteEvent, ListenPortEvent,
+    MemfdCreateEvent, NetworkFlowEvent, PolicyDenialEvent, SessionEvent, UnitStopEvent, User,
+    detection::Severity,
 };
 use store::BoundedMap;
 
 use crate::{
     Alert,
     auth_state::AuthState,
-    credfiles::{self, CredFile},
+    credfiles::CredentialReads,
     download_state::DownloadState,
     drift_state::DriftState,
     exclusions::{
-        AGENT_CHILD_EXCLUSIONS, CREDENTIAL_READ_ALERT_WINDOW_NS, LOLBIN_LEGIT_PARENTS, LOLBINS,
-        SELF_SPAWN_EXCLUSIONS, SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS,
-        SELF_SPAWN_THRESHOLD, SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS,
-        SERVICE_COMM_PREFIXES, SERVICE_COMMS, SHELL_COMMS, STAGING_PID_CAP, STAGING_READ_DIRS,
-        STAGING_READ_FILES, STAGING_WINDOW_NS, STAGING_WRITE_FILES, SUSPECT_CHILDREN_WIN,
-        SUSPECT_PARENTS_WIN, TASK_REGISTRATION_DEDUP_WINDOW_NS,
+        AGENT_CHILD_EXCLUSIONS, LOLBIN_LEGIT_PARENTS, LOLBINS, SELF_SPAWN_EXCLUSIONS,
+        SELF_SPAWN_PARENT_EXCLUSIONS, SELF_SPAWN_SCRIPT_HOSTS, SELF_SPAWN_THRESHOLD,
+        SELF_SPAWN_TRUSTED_THRESHOLD, SELF_SPAWN_WINDOW_NS, SERVICE_COMM_PREFIXES, SERVICE_COMMS,
+        SHELL_COMMS, SUSPECT_CHILDREN_WIN, SUSPECT_PARENTS_WIN,
     },
-    has_write_intent,
     impact_state::ImpactState,
     lsass::{self, LSASS_ACCESS_ALERT_WINDOW_NS, LSASS_THREAD_ALERT_WINDOW_NS},
     memfd_state::MemfdState,
@@ -34,20 +31,14 @@ use crate::{
     privesc::IdentityRequests,
     signature_gate::SignatureGatedAlert,
     sliding::{SlidingCounter, SlidingDistinct},
-    staging::{self, StagingDir, StagingReads},
+    staging::StagingState,
+    task_registration::TaskRegistrations,
 };
 
 /// False only when both generation stamps exist and differ: the same rule as
 /// [`PidFact::current`], a pid reused by another process must not inherit a fact.
 pub(crate) fn same_incarnation(recorded: Option<u64>, wanted: Option<u64>) -> bool {
     !matches!((recorded, wanted), (Some(a), Some(b)) if a != b)
-}
-
-struct ReportedTaskRegistration {
-    timestamp_ns: u64,
-    /// The reported action list, `None` for an unknown-action report (its path
-    /// is only the sensor's placeholder).
-    actions: Option<String>,
 }
 
 /// What the rules remember about a pid, and for which incarnation of it.
@@ -131,13 +122,8 @@ pub struct RuleState {
     /// pid → the lineage its children belong to, for each one-shot shell wrapper
     /// (`sh -c`, `cmd /c`) seen running. LRU-bounded.
     recon_wrappers: BoundedMap<u32, crate::recon::Wrapper>,
-    /// pid → the distinct user-data files it opened for reading, for STAGING-DIR (T1074.001,
-    /// #380). LRU-bounded by [`STAGING_PID_CAP`].
-    staging_reads: BoundedMap<u32, StagingReads>,
-    /// (pid, directory) → the distinct files the pid created there, for STAGING-DIR. Only
-    /// staging directories are recorded (see [`staging::staging_dir`]). LRU-bounded by
-    /// [`STAGING_PID_CAP`].
-    staging_dirs: BoundedMap<(u32, String), StagingDir>,
+    /// STAGING-DIR (T1074.001, #380): see [`StagingState`].
+    staging: StagingState,
     /// pid → the lineage it was exec'd under, for the rules that see a process later
     /// (SSH-FANOUT reads it on the process's connects). LRU-bounded.
     exec_lineage: BoundedMap<u32, crate::recon::ExecLineage>,
@@ -163,10 +149,8 @@ pub struct RuleState {
     /// FIRST-SEEN-LOGON, ODD-HOUR-LOGON, the T1110 failure burst and the RDP, `sudo`/`su` and
     /// session-reconnect joins: see [`AuthState`].
     auth: AuthState,
-    /// (pid, kind of credential file) → the last alert, for CREDENTIAL-READ (T1003.008,
-    /// T1552, #377): one alert per window, not one per open. LRU-bounded like every other
-    /// counter.
-    credential_reads: BoundedMap<(u32, CredFile), SlidingCounter>,
+    /// CREDENTIAL-READ (T1003.008, T1552, T1555, #377): see [`CredentialReads`].
+    credential_reads: CredentialReads,
     /// (caller pid, process generation, granted) → the last alert, for LSASS-ACCESS
     /// (T1003.001, <https://github.com/synthaea-lab/agent/issues/45>): one alert per outcome per window, whatever masks the caller tries;
     /// the generation keeps a new process on a recycled pid from inheriting the window.
@@ -178,10 +162,8 @@ pub struct RuleState {
     /// Distinct LDAP searches per process for the enumeration-sweep rule
     /// (T1087.002, #364).
     ldap_burst: crate::ldap::LdapBurst,
-    /// Task leaf name → last reported T1053.005 registration, so one registration
-    /// seen on both Security 4698 and TaskScheduler/Operational 106 alerts once
-    /// (#422). LRU-bounded like the counters.
-    task_registrations: BoundedMap<String, ReportedTaskRegistration>,
+    /// T1053.005 creation, deduplicated across its two channels: see [`TaskRegistrations`].
+    task_registrations: TaskRegistrations,
     /// The agent's own pid, for [`Self::check_self_spawn`]'s narrow exclusion of
     /// its own known children (issue #403). `None` until [`Self::seed_own_pid`] is
     /// called — `sensor-*` crates stay `schema`-only (`tools/check-deps.py`), so
@@ -219,8 +201,7 @@ impl RuleState {
             impact: ImpactState::new(),
             ldap_burst: crate::ldap::LdapBurst::new(),
             network: NetworkState::new(),
-            staging_reads: BoundedMap::new(STAGING_PID_CAP),
-            staging_dirs: BoundedMap::new(STAGING_PID_CAP),
+            staging: StagingState::new(),
             recon_burst: BoundedMap::new(COUNTER_CAP),
             recon_wrappers: BoundedMap::new(COUNTER_CAP),
             exec_lineage: BoundedMap::new(PID_COMM_CAP),
@@ -232,10 +213,10 @@ impl RuleState {
             impact_marks: BoundedMap::new(COUNTER_CAP),
             drift: DriftState::new(),
             auth: AuthState::new(),
-            credential_reads: BoundedMap::new(COUNTER_CAP),
+            credential_reads: CredentialReads::new(),
             lsass_access: BoundedMap::new(COUNTER_CAP),
             lsass_threads: BoundedMap::new(COUNTER_CAP),
-            task_registrations: BoundedMap::new(COUNTER_CAP),
+            task_registrations: TaskRegistrations::new(),
             own_pid: None,
             ld_trust_extra: Vec::new(),
             memfd: MemfdState::new(),
@@ -1090,256 +1071,24 @@ impl RuleState {
 
     /// To be called for every `FileOpenEvent` in the stream. Reports T1053.005
     /// scheduled-task creation (deduplicated, see
-    /// [`Self::check_task_registration`]) and updates the history of downloader
+    /// [`TaskRegistrations::check`]) and updates the history of downloader
     /// writes, consumed by [`DownloadState::check_download_then_exec`].
     pub fn on_file_open(&mut self, event: &FileOpenEvent) -> Vec<Alert> {
         self.unit_stops.advance_clock(event.meta.timestamp_ns);
-        let mut alerts: Vec<Alert> = self.check_task_registration(event).into_iter().collect();
+        let mut alerts: Vec<Alert> = self.task_registrations.check(event).into_iter().collect();
         alerts.extend(crate::stateless::check_service_write_outside_datadir(
             event,
             |pid, generation| self.resolve_comm(pid, generation),
         ));
-        alerts.extend(self.check_credential_file_read(event));
+        alerts.extend(
+            self.credential_reads
+                .check(event, &self.pid_comm, &self.pid_image_path),
+        );
         alerts.extend(self.impact.record_create(event, &self.pid_image_path));
         self.downloads.record_downloader_write(event);
         self.network.record_archive_open(event);
-        alerts.extend(self.check_staging_dir(event));
+        alerts.extend(self.staging.check(event));
         alerts
-    }
-
-    /// STAGING-DIR (T1074.001, #380) — one pid reads at least [`STAGING_READ_FILES`] distinct
-    /// user-data files spread over [`STAGING_READ_DIRS`] directories and creates at least
-    /// [`STAGING_WRITE_FILES`] distinct files in one staging directory (a subdirectory of a
-    /// temp root or a hidden directory, see [`staging::staging_dir`]), all inside
-    /// [`STAGING_WINDOW_NS`]. One alert per directory and window. Medium: the shape is also a
-    /// folder copy, a backup tool and an indexer, and no allowlist of those exists yet (it
-    /// needs a lab capture of the host's ordinary copies and builds).
-    ///
-    /// The evaluation runs on a create, so the last read must precede the last create it
-    /// counts: a copy loop that interleaves reads and creates qualifies, a sweep that reads
-    /// everything and then creates fewer than the threshold does not. `FileWriteEvent`
-    /// carries no path, so the creating `open` is the signal, never a byte count: a staging
-    /// file written to by another pid, or opened without `O_CREAT`, is a stated gap, and so
-    /// is a collection that stages in `~/.cache` or a macOS per-user temp directory. The
-    /// reader and the creator must be the same pid: `tar | gzip` style pipelines spread the
-    /// two over processes and are not seen.
-    fn check_staging_dir(&mut self, event: &FileOpenEvent) -> Option<Alert> {
-        let meta = &event.meta;
-        let ts = meta.timestamp_ns;
-        if !has_write_intent(event.flags) {
-            self.record_staging_read(meta, ts, &event.path);
-            return None;
-        }
-        if event.flags & O_CREAT == 0 {
-            return None;
-        }
-        let dir = staging::staging_dir(&event.path)?;
-        let key = (meta.pid, dir.clone());
-        if self
-            .staging_dirs
-            .peek(&key)
-            .is_some_and(|d| !same_incarnation(d.generation, meta.process_generation))
-        {
-            self.staging_dirs.remove(&key);
-        }
-        let entry = self.staging_dirs.get_or_insert_with(key, || StagingDir {
-            generation: meta.process_generation,
-            files: SlidingDistinct::default(),
-        });
-        let created = entry
-            .files
-            .record(event.path.clone(), ts, STAGING_WINDOW_NS);
-        if created < STAGING_WRITE_FILES {
-            return None;
-        }
-        let (read_files, read_dirs) = self.staging_read_summary(meta, ts)?;
-        let entry = self.staging_dirs.get_mut(&(meta.pid, dir.clone()))?;
-        if !entry.files.try_alert(ts, STAGING_WINDOW_NS) {
-            return None;
-        }
-        Some(Alert {
-            technique: "T1074.001",
-            severity: Severity::Medium,
-            message: format!(
-                "pid={} comm={} read {read_files} user files from {read_dirs} directories and created {created} files in the staging directory /{dir}",
-                meta.pid, meta.comm,
-            ),
-        })
-    }
-
-    /// STAGING-DIR, read half: remembers a user-data file the pid opened without write intent.
-    fn record_staging_read(&mut self, meta: &schema::EventMeta, ts: u64, path: &str) {
-        let Some((file, _)) = staging::user_data_file(path) else {
-            return;
-        };
-        if self
-            .staging_reads
-            .peek(&meta.pid)
-            .is_some_and(|r| !same_incarnation(r.generation, meta.process_generation))
-        {
-            self.staging_reads.remove(&meta.pid);
-        }
-        self.staging_reads
-            .get_or_insert_with(meta.pid, || StagingReads {
-                generation: meta.process_generation,
-                files: SlidingDistinct::default(),
-            })
-            .files
-            .record(file, ts, STAGING_WINDOW_NS);
-    }
-
-    /// STAGING-DIR: how many distinct user files, over how many directories, the pid read in
-    /// the window — `None` when that is below the read thresholds.
-    fn staging_read_summary(&mut self, meta: &schema::EventMeta, ts: u64) -> Option<(u32, usize)> {
-        let reads = self.staging_reads.get_mut(&meta.pid)?;
-        if !same_incarnation(reads.generation, meta.process_generation) {
-            return None;
-        }
-        let files = reads.files.count(ts, STAGING_WINDOW_NS);
-        let dirs: std::collections::HashSet<&str> = reads
-            .files
-            .values()
-            .filter_map(|f| f.rsplit_once('/').map(|(dir, _)| dir))
-            .collect();
-        (files >= STAGING_READ_FILES && dirs.len() >= STAGING_READ_DIRS)
-            .then_some((files, dirs.len()))
-    }
-
-    /// The image the pid was exec'd from, else its parent's: a child that forked and never
-    /// exec'd (an older `sshd`'s privilege-separated child) is the same binary as its parent,
-    /// and is in no exec table of its own.
-    fn reader_image(&self, meta: &schema::EventMeta) -> Option<&str> {
-        PidFact::current(&self.pid_image_path, meta.pid, meta.process_generation).or_else(|| {
-            PidFact::current(
-                &self.pid_image_path,
-                meta.ppid,
-                meta.parent_process_generation,
-            )
-        })
-    }
-
-    /// Whether `pid`'s own name, or its parent's, is a web or database service: a daemon with
-    /// no business in a user's credential files, and the process a webshell runs under. The
-    /// name comes from the exec table, not from the event's `comm`, which is the thread's
-    /// (`one_connection` for a `mysqld` worker).
-    fn reader_under_service(&self, meta: &schema::EventMeta) -> bool {
-        let is_service = |comm: &str| {
-            SERVICE_COMMS.contains(&comm)
-                || SERVICE_COMM_PREFIXES
-                    .iter()
-                    .any(|prefix| comm.starts_with(prefix))
-        };
-        [
-            PidFact::current(&self.pid_comm, meta.pid, meta.process_generation),
-            PidFact::current(&self.pid_comm, meta.ppid, meta.parent_process_generation),
-        ]
-        .into_iter()
-        .flatten()
-        .any(is_service)
-    }
-
-    /// CREDENTIAL-READ (#377), on the file opens of a Unix host: T1003.008 for the shadow files,
-    /// T1552.004 for an SSH private key, T1552.001 for the other credential files of a home
-    /// directory, and on macOS T1555.001 for a keychain database and T1555.003 for a browser's
-    /// saved-login and cookie stores (see `credfiles` for the paths and what the sensor cannot
-    /// see).
-    ///
-    /// Only a read counts: a write-only open (`ssh-keygen` writing a key, `passwd` rewriting
-    /// the file) is not one. Who may read differs by file, because who legitimately does
-    /// differs:
-    /// - The **shadow files** have a short, fixed list of readers (the authentication stack,
-    ///   `credfiles::AUTH_STACK`); anything else that opens them alerts. Medium, not High:
-    ///   an administrator's `cat`, a backup or integrity tool (`tar`, `rsync`, `rpm -V`,
-    ///   AIDE) and a PAM service the list lacks look the same, and none is excluded here
-    ///   because each is also what an attacker runs.
-    /// - A **home credential file, keychain or browser store** has no fixed list: `python3` with `boto3`, `terraform`,
-    ///   `kubectl`, `git` and `ssh` all read their own, from `/usr/bin`. So a read alerts only
-    ///   when the reader is *unexpected* in a way the telemetry can show: a web or database
-    ///   service (or a child of one), or a binary run from outside the system directories
-    ///   (`/tmp`, a home directory, `/dev/shm`). Not caught: a system binary (`cat`, `tar`) run
-    ///   by an intruder, and a tool a developer installed under their home (`~/.local/bin`,
-    ///   `~/go/bin`) alerts although it is theirs, its own credentials read by its own
-    ///   binary. Both are the price of not alerting on every `aws` call. On macOS the Apple
-    ///   daemons that read a keychain and the browsers installed in `/Applications` run from
-    ///   the system directories, so they should stay quiet (not observed on a Mac); a browser
-    ///   installed under `~/Applications` alerts on its own store.
-    ///
-    /// One alert per (pid, kind) per [`CREDENTIAL_READ_ALERT_WINDOW_NS`]. No file content and
-    /// no command line goes into the message, only the path the process asked for.
-    fn check_credential_file_read(&mut self, event: &FileOpenEvent) -> Option<Alert> {
-        if !credfiles::can_read(event.flags) {
-            return None;
-        }
-        let kind = credfiles::classify(&event.path)?;
-        let image = self.reader_image(&event.meta);
-        let comm = event.meta.comm.as_str();
-        let why = match kind {
-            CredFile::Shadow if credfiles::is_auth_stack(comm, image) => return None,
-            CredFile::Shadow => "outside the authentication stack",
-            CredFile::PrivateKey
-            | CredFile::HomeCredentials
-            | CredFile::Keychain
-            | CredFile::BrowserStore => {
-                if self.reader_under_service(&event.meta) {
-                    "a web or database service or its child"
-                } else if credfiles::image_outside_system_dirs(image) {
-                    "a binary outside the system directories"
-                } else {
-                    return None;
-                }
-            }
-        };
-        let ts = event.meta.timestamp_ns;
-        let counter = self
-            .credential_reads
-            .get_or_insert_with((event.meta.pid, kind), SlidingCounter::default);
-        if !counter.try_alert(ts, CREDENTIAL_READ_ALERT_WINDOW_NS) {
-            return None;
-        }
-        Some(Alert {
-            technique: kind.technique(),
-            severity: Severity::Medium,
-            message: format!(
-                "pid={} comm={comm}: opened {} for reading from {why}",
-                event.meta.pid, event.path,
-            ),
-        })
-    }
-
-    /// T1053.005 creation (`check_scheduled_task_persistence`), reported once per
-    /// registration. With both channels up, one `schtasks /Create` yields a 4698 and
-    /// a 106 for the same task, in either order a few seconds apart; the sensor
-    /// reads the 106's actions back from the task file, so the two usually match.
-    ///
-    /// A registration of an already-reported task inside
-    /// [`TASK_REGISTRATION_DEDUP_WINDOW_NS`] is suppressed only when it adds
-    /// nothing: an unknown-action report, or the same action list. A different
-    /// action list alerts (a re-registration with a new payload), and so does a
-    /// known action list after an unknown-action report, so the first-arriving
-    /// 106 whose task file was unreadable never hides the 4698's actions.
-    fn check_task_registration(&mut self, event: &FileOpenEvent) -> Option<Alert> {
-        let alert = crate::stateless::check_scheduled_task_persistence(event)?;
-        let actions =
-            (event.flags & FLAG_PERSISTENCE_TASK_ACTION_UNKNOWN == 0).then(|| event.path.clone());
-        let now = event.meta.timestamp_ns;
-        let duplicate = self
-            .task_registrations
-            .peek(&event.meta.comm)
-            .is_some_and(|previous| {
-                previous.timestamp_ns.abs_diff(now) <= TASK_REGISTRATION_DEDUP_WINDOW_NS
-                    && (actions.is_none() || actions == previous.actions)
-            });
-        if duplicate {
-            return None;
-        }
-        self.task_registrations.insert(
-            event.meta.comm.clone(),
-            ReportedTaskRegistration {
-                timestamp_ns: now,
-                actions,
-            },
-        );
-        Some(alert)
     }
 
     /// To be called for every `FileDeleteEvent` in the stream: the unlink half of the

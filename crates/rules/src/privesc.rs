@@ -21,7 +21,7 @@
 //!   request as the real one: silent.
 //! - A pid whose exec the agent did not see (it started before the agent) has no image: silent,
 //!   since "unknown" is not evidence against `sudo`. A child that forked and never exec'd takes
-//!   its **parent's** image (`RuleState::reader_image`): the `fork()`ed winner of a race-window
+//!   its **parent's** image (`credfiles::reader_image`): the `fork()`ed winner of a race-window
 //!   exploit alerts as the exploit, and `sshd`'s privilege-separated children resolve to
 //!   `sshd-session`. Only **one** level is followed: a grandchild forked twice without an exec
 //!   has no image and is silent.
