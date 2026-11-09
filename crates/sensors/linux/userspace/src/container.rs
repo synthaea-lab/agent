@@ -1,6 +1,6 @@
 //! Container attribution: cgroup id → container id (cgroupfs walk, bounded
 //! LRU cache) and container id → image/name (background Docker socket lookup,
-//! shared cache). Everything here serves [`container_context`]; the drain loop
+//! shared cache). Everything here serves [`ContainerResolver`]; the drain loop
 //! calls it per event. Split out of `sensor.rs` when that file had accumulated
 //! five concerns.
 
@@ -237,6 +237,28 @@ pub(crate) fn container_context(
         image: info.as_ref().and_then(|i| i.image.clone()),
         name: info.as_ref().and_then(|i| i.name.clone()),
     })
+}
+
+/// Container attribution for drained events (issues #80/#204): `meta.cgroup_id` resolved
+/// against cgroupfs (see `CgroupIdCache`), never `/proc`, plus the Docker details looked up
+/// in the background.
+pub(crate) struct ContainerResolver {
+    container_ids: CgroupIdCache,
+    docker_cache: DockerInfoCache,
+}
+
+impl ContainerResolver {
+    pub(crate) fn new() -> Self {
+        Self {
+            container_ids: CgroupIdCache::new(),
+            docker_cache: DockerInfoCache::default(),
+        }
+    }
+
+    /// The container `cgroup_id` belongs to, if any.
+    pub(crate) fn resolve(&mut self, cgroup_id: u64) -> Option<ContainerContext> {
+        container_context(cgroup_id, &mut self.container_ids, &self.docker_cache)
+    }
 }
 
 #[cfg(test)]

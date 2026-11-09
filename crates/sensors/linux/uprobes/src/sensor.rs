@@ -284,9 +284,10 @@ fn read_wire_event<T: Copy>(item: &[u8]) -> Option<T> {
 }
 
 /// Upper bound on items one drain call takes from a ring buffer before returning
-/// control to `select!` — see `sensor_linux::MAX_ITEMS_PER_DRAIN` (issue #326) for
-/// why an unbounded `while let Some(item) = rb.next()` loop can starve this sensor's
-/// other branch (and the reactor) indefinitely under sustained producer load.
+/// control to `select!` — see `MAX_ITEMS_PER_DRAIN` in `sensor-linux`'s `drain.rs`
+/// (issue #326) for why an unbounded `while let Some(item) = rb.next()` loop can
+/// starve this sensor's other branch (and the reactor) indefinitely under sustained
+/// producer load.
 const MAX_ITEMS_PER_DRAIN: usize = 256;
 
 /// Drains up to [`MAX_ITEMS_PER_DRAIN`] TLS capture events from the ring buffer and
@@ -331,7 +332,7 @@ macro_rules! drain_tls {
                 $sink.on_event(schema_event);
             }
         }
-        // See `drain!` in `sensor_linux::sensor` (issue #326): only clear readiness
+        // See `drain_ready` in `sensor-linux`'s `rings.rs` (issue #326): only clear readiness
         // once the buffer actually ran dry, so a buffer still at the cap keeps
         // getting re-polled on the next `select!` iteration instead of starving.
         if drained < MAX_ITEMS_PER_DRAIN {
