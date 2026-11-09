@@ -1,6 +1,6 @@
 [package]
 name = "sensor-linux-lsm"
-version = "0.1.0"
+version.workspace = true
 description = "Linux BPF-LSM telemetry and inline blocking"
 license.workspace = true
 edition.workspace = true

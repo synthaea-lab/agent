@@ -1,6 +1,6 @@
 [package]
 name = "siblings"
-version = "0.1.0"
+version.workspace = true
 description = "Test support: locate sibling repos (server, ml, rules, ...) checked out side by side, for cross-repo contract tests"
 license.workspace = true
 edition.workspace = true

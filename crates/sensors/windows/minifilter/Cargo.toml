@@ -1,6 +1,6 @@
 [package]
 name = "sensor-windows-minifilter"
-version = "0.1.0"
+version.workspace = true
 description = "User-mode client of the SynthaeaFilter minifilter's communication port (#136)"
 license.workspace = true
 edition.workspace = true

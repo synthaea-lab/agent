@@ -1,6 +1,6 @@
 [package]
 name = "sigma"
-version = "0.1.0"
+version.workspace = true
 description = "Sigma rule parsing and compilation for on-device evaluation"
 license.workspace = true
 edition.workspace = true

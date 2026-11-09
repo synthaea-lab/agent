@@ -23,21 +23,23 @@ Rules every package follows:
 
 ## Release workflow
 
-Pushing a tag `vX.Y.Z[-suffix]`, or running
-[`release.yml`](../.github/workflows/release.yml) by hand for an existing tag, builds every
-artifact and publishes a GitHub release.
-A tag with a `-` suffix (`-beta.1`, `-rc.1`) is published as a pre-release. The workflow never
-creates a tag.
+A release is cut by merging the release PR that release-please keeps open on `main`; the tag
+it creates runs [`release.yml`](../.github/workflows/release.yml), which builds every artifact
+below, signs each platform whose secrets are configured, and publishes a GitHub release.
+Without signing secrets the release is published as an unsigned alpha pre-release, which is
+only allowed for 0.0.x versions. The flow, every secret and how to cut a release are in
+[docs/release.md](../docs/release.md).
 
 | Platform | Published file | Notes |
 | --- | --- | --- |
 | Debian and Ubuntu, x86_64 | `synthaea-agent_<version>-1_amd64.deb` | static musl, installed and started in CI first |
 | Alpine, x86_64 | `synthaea-agent-<version>-r0.apk` | signed only by a throwaway `abuild` key: `apk add --allow-untrusted` |
-| Windows, x86_64 | `synthaea-agent-<tag>-windows-x86_64.exe` | the agent executable alone, no MSI yet |
-| macOS, arm64 | `synthaea-agent-<tag>-macos-arm64.tar.gz` | the agent executable alone, no `.pkg` yet, not notarized |
+| Windows, x86_64 | `synthaea-agent-<version>-windows-x86_64.exe` | the agent executable alone, no MSI yet; Authenticode-signed when configured |
+| macOS, arm64 | `synthaea-agent-<version>-macos-arm64.tar.gz` | the agent executable alone, no `.pkg` yet; Developer ID signed and notarized when configured |
+| all | `synthaea-{agent,watchdog,cli}-<version>.cdx.json` | CycloneDX SBOM per binary |
 | all | `SHA256SUMS`, plus `SHA256SUMS.asc` and `synthaea-release-key.asc` when signed | covers every file above |
 
-Package file names carry the version from `apps/agent/Cargo.toml` and `APKBUILD`, not the
-tag. No artifact is code-signed yet; `SHA256SUMS` carries a detached GPG signature when the
-release is signed. The jobs, the test-key scan and the signing model are described in
+The version comes from `[workspace.package]` in `Cargo.toml`; the release PR updates it with
+`APKBUILD`, the rpm spec and `Product.wxs`. Every file has a build provenance attestation. The
+jobs and the test-key scan are described in
 [docs/packaging.md](../docs/packaging.md#release-workflow).

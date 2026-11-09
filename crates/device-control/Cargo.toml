@@ -1,6 +1,6 @@
 [package]
 name = "device-control"
-version = "0.1.0"
+version.workspace = true
 description = "Removable-media and peripheral telemetry with policy-gated control"
 license.workspace = true
 edition.workspace = true

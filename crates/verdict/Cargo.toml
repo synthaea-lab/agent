@@ -1,6 +1,6 @@
 [package]
 name = "verdict"
-version = "0.1.0"
+version.workspace = true
 description = "Cross-engine verdict fusion: one scored finding per entity (issue #131)"
 license.workspace = true
 edition.workspace = true

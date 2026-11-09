@@ -1,27 +1,42 @@
 name: Release
 
 # Builds the per-OS artifacts with the same jobs that guard them on main (each one builds,
-# then installs or runs what it built), collects them, writes SHA256SUMS and publishes a
-# GitHub release. A tag with a pre-release suffix (`-alpha`, `-beta`, `-rc`, anything after a
-# `-`) becomes a pre-release; while Synthaea is in beta, every tag should carry one.
+# then installs or runs what it built), signs what it has keys for, writes an SBOM, a
+# SHA256SUMS and a build-provenance attestation for every file, and publishes the GitHub
+# release. The whole flow, every secret and variable, and how to cut a release are in
+# docs/release.md.
+#
+# Signing is per platform and optional: each platform signs when all of its secrets are set
+# (Windows: Azure Trusted Signing; macOS: Developer ID + notarization; Linux: GPG over
+# SHA256SUMS). When any platform is unsigned the release is published as a pre-release
+# titled "vX.Y.Z — Alpha (unsigned)" with a warning at the top of its notes, and the
+# `signing-policy` job refuses that for any version above 0.0.x.
 #
 # What this does NOT do (ADR-0015, ADR-0027): it signs no updater release or content manifest.
 # Those are signed offline from a hardware token by the holders ADR-0027 names, never in CI.
-# The artifacts here are code-unsigned (no Authenticode, no Developer ID, no package-repository
-# key); the only optional signature is a detached GPG signature over SHA256SUMS, made when the
-# `release` environment holds the key (packaging/README.md, "Release workflow"). Without it the
-# release is still published and its notes say, at the top, that nothing in it is signed.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and publish (for example v0.1.0-beta.1)"
+        description: "Existing tag to build and publish (for example v0.0.1)"
         required: true
         type: string
       draft:
-        description: "Create the release as a draft (not visible on the website until published)"
+        description: "Leave the release as a draft (not visible until published by hand)"
+        type: boolean
+        default: false
+  # release-please.yml calls this when it tagged with GITHUB_TOKEN (a tag pushed that way
+  # starts no workflow on its own).
+  workflow_call:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish"
+        required: true
+        type: string
+      draft:
+        description: "Leave the release as a draft"
         type: boolean
         default: false
 
@@ -40,31 +55,38 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       ref: ${{ steps.tag.outputs.ref }}
-      prerelease: ${{ steps.tag.outputs.prerelease }}
+      suffix: ${{ steps.tag.outputs.suffix }}
       version: ${{ steps.tag.outputs.version }}
+      alpha-line: ${{ steps.tag.outputs.alpha-line }}
     steps:
       - name: Resolve and validate the tag
         id: tag
         env:
           INPUT_TAG: ${{ inputs.tag }}
           REF_NAME: ${{ github.ref_name }}
-          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          if [ "$EVENT" = workflow_dispatch ]; then tag="$INPUT_TAG"; else tag="$REF_NAME"; fi
+          # Dispatched or called: the input. Tag push: the ref.
+          tag="${INPUT_TAG:-$REF_NAME}"
           # vMAJOR.MINOR.PATCH with an optional pre-release suffix; nothing a shell or a
           # file name could misread.
-          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
-            echo "::error::'$tag' is not a release tag (expected vX.Y.Z or vX.Y.Z-beta.N)"
+          if ! [[ "$tag" =~ ^v([0-9]+)\.([0-9]+)\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::'$tag' is not a release tag (expected vX.Y.Z or vX.Y.Z-rc.N)"
             exit 1
           fi
-          prerelease=false
-          [[ "$tag" == *-* ]] && prerelease=true
+          major="${BASH_REMATCH[1]}"
+          minor="${BASH_REMATCH[2]}"
+          suffix=false
+          [[ "$tag" == *-* ]] && suffix=true
+          # 0.0.x is the alpha line: the only versions that may ship unsigned.
+          alpha_line=false
+          [ "$major" -eq 0 ] && [ "$minor" -eq 0 ] && alpha_line=true
           {
             echo "tag=$tag"
             echo "ref=refs/tags/$tag"
-            echo "prerelease=$prerelease"
+            echo "suffix=$suffix"
             echo "version=${tag#v}"
+            echo "alpha-line=$alpha_line"
           } >> "$GITHUB_OUTPUT"
 
       # workflow_dispatch builds an existing tag, never a branch head under a tag's name.
@@ -73,22 +95,104 @@ jobs:
           persist-credentials: false
           ref: ${{ steps.tag.outputs.ref }}
 
-      # The packages take their version from Cargo.toml / APKBUILD, not from the tag. A
-      # mismatch does not stop the release (a beta tag over 0.1.0 is expected), but it is
-      # surfaced so nobody is surprised by the file names.
-      - name: Compare the tag with the package versions
+      # The release PR moves the workspace version and the packaging files together
+      # (release-please-config.json); package file names carry that version. A tag that does
+      # not match them would publish files named after another version, so it fails here.
+      - name: Check the tag against the package versions
         env:
           VERSION: ${{ steps.tag.outputs.version }}
         run: |
           set -euo pipefail
-          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' apps/agent/Cargo.toml | head -n1)"
-          apk_version="$(sed -n 's/^pkgver=//p' packaging/linux/alpine/APKBUILD)"
           core="${VERSION%%-*}"
-          for v in "$cargo_version" "$apk_version"; do
-            if [ "$v" != "$core" ]; then
-              echo "::warning::tag version $core differs from a package version ($v): apps/agent/Cargo.toml=$cargo_version, APKBUILD=$apk_version"
+          cargo_version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
+          apk_version="$(sed -n 's/^pkgver=//p' packaging/linux/alpine/APKBUILD)"
+          rpm_version="$(sed -n 's/^Version: *//p' packaging/linux/rpm/synthaea-agent.spec.template)"
+          bad=0
+          for pair in "Cargo.toml:$cargo_version" "APKBUILD:$apk_version" "rpm spec:$rpm_version"; do
+            if [ "${pair#*:}" != "$core" ]; then
+              echo "::error::tag version $core differs from ${pair%%:*} (${pair#*:}); merge the release PR instead of tagging by hand"
+              bad=1
             fi
           done
+          exit "$bad"
+
+  # Which platforms can sign, decided once from which secrets exist (their values never leave
+  # this step), and the rule that only the 0.0.x alpha line may ship unsigned.
+  signing-policy:
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The signing secrets live in this environment; required reviewers on it put a person in
+    # front of every release (Settings > Environments > release).
+    environment: release
+    outputs:
+      windows: ${{ steps.policy.outputs.windows }}
+      macos: ${{ steps.policy.outputs.macos }}
+      linux: ${{ steps.policy.outputs.linux }}
+      all-signed: ${{ steps.policy.outputs.all-signed }}
+    steps:
+      - name: Detect the configured signers and apply the alpha rule
+        id: policy
+        env:
+          ALPHA_LINE: ${{ needs.meta.outputs.alpha-line }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_PROFILE: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          RELEASE_GPG_PRIVATE_KEY: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          # Prints true (every secret set) or false (none set). Some but not all is a
+          # misconfiguration, not an unsigned release: it fails. Only names are printed.
+          configured() {
+            local platform="$1" present=0 missing=()
+            shift
+            for name in "$@"; do
+              if [ -n "${!name:-}" ]; then present=$((present + 1)); else missing+=("$name"); fi
+            done
+            if [ "$present" -eq "$#" ]; then echo true; return; fi
+            if [ "$present" -eq 0 ]; then echo false; return; fi
+            echo "::error::$platform signing is half configured, missing: ${missing[*]}" >&2
+            return 1
+          }
+          windows="$(configured Windows AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET \
+            AZURE_SIGNING_ENDPOINT AZURE_SIGNING_ACCOUNT AZURE_SIGNING_PROFILE)"
+          macos="$(configured macOS APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+            APPLE_API_KEY_P8 APPLE_API_KEY_ID APPLE_API_ISSUER)"
+          linux="$(configured Linux RELEASE_GPG_PRIVATE_KEY)"
+          all=true
+          for v in "$windows" "$macos" "$linux"; do [ "$v" = true ] || all=false; done
+          {
+            echo "windows=$windows"
+            echo "macos=$macos"
+            echo "linux=$linux"
+            echo "all-signed=$all"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Signing for $VERSION"
+            echo
+            echo "| Platform | Signed |"
+            echo "| --- | --- |"
+            echo "| Windows (Authenticode, Azure Trusted Signing) | $windows |"
+            echo "| macOS (Developer ID, notarized) | $macos |"
+            echo "| Linux (GPG over SHA256SUMS) | $linux |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$all" != true ]; then
+            if [ "$ALPHA_LINE" != true ]; then
+              echo "::error::$VERSION is above 0.0.x and not every platform can sign. Only the 0.0.x alpha line may ship unsigned (docs/release.md)."
+              exit 1
+            fi
+            echo "::warning::not every platform can sign: $VERSION is published as an UNSIGNED alpha pre-release"
+          fi
 
   # The same ADR-0027 guard ci.yml runs on every push, on the exact tagged tree: the
   # packaged feature set must leave updater/test-key off on every target.
@@ -144,20 +248,222 @@ jobs:
       upload-artifact: true
       intel: false
 
-  publish:
-    needs: [meta, test-key-guard, linux-deb, linux-apk, windows, macos]
+  # CycloneDX SBOMs of the three shipped binaries, resolved with the packaged feature set
+  # (--no-default-features) for every target, so the Linux, Windows and macOS dependencies
+  # are all listed.
+  sbom:
+    needs: meta
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Secrets for the optional SHA256SUMS signature live in this environment, so required
-    # reviewers can be put in front of every publish (Settings > Environments > release).
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.meta.outputs.ref }}
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+      - name: Generate the SBOMs
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo cyclonedx --format json --spec-version 1.5 --no-default-features --target all \
+            --override-filename sbom
+          mkdir -p sbom-out
+          for bin in agent watchdog cli; do
+            cp "apps/$bin/sbom.json" "sbom-out/synthaea-$bin-$VERSION.cdx.json"
+          done
+          ls -l sbom-out
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-sbom
+          path: sbom-out/*.cdx.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # Authenticode through Azure Trusted Signing (trusted-signing-cli drives signtool with the
+  # Azure dlib). Only when signing-policy found every AZURE_* secret; otherwise the unsigned
+  # agent.exe from the build job is what ships.
+  sign-windows:
+    needs: [meta, signing-policy, windows]
+    if: needs.signing-policy.outputs.windows == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 30
+    environment: release
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-windows-agent
+          path: in
+
+      - name: Install trusted-signing-cli
+        run: cargo install trusted-signing-cli --version 0.11.0 --locked
+
+      # Also signs an .msi once the Windows build produces one (packaging/windows/build.ps1).
+      - name: Sign agent.exe
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_PROFILE: ${{ secrets.AZURE_SIGNING_PROFILE }}
+        run: |
+          $files = @(Get-ChildItem in -File | Where-Object { $_.Extension -in '.exe', '.msi' })
+          if ($files.Count -eq 0) { throw 'nothing to sign' }
+          foreach ($f in $files) {
+            trusted-signing-cli -e $env:AZURE_SIGNING_ENDPOINT -a $env:AZURE_SIGNING_ACCOUNT `
+              -c $env:AZURE_SIGNING_PROFILE -d 'Synthaea agent' $f.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signing $($f.Name) exited $LASTEXITCODE" }
+          }
+
+      - name: Verify the signatures
+        run: |
+          foreach ($f in Get-ChildItem in -File | Where-Object { $_.Extension -in '.exe', '.msi' }) {
+            $sig = Get-AuthenticodeSignature $f.FullName
+            "$($f.Name): $($sig.Status) $($sig.SignerCertificate.Subject)"
+            if ($sig.Status -ne 'Valid') { throw "$($f.Name) signature is $($sig.Status)" }
+          }
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-windows-agent
+          path: in/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # Developer ID signature with the hardened runtime, then notarization. The agent ships as a
+  # bare executable in a tarball, which cannot carry a stapled ticket (Gatekeeper looks the
+  # ticket up online); a .pkg, once the macOS build produces one, is productsigned with the
+  # Developer ID Installer identity, notarized and stapled.
+  sign-macos:
+    needs: [meta, signing-policy, macos]
+    if: needs.signing-policy.outputs.macos == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    environment: release
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-macos-agent-*
+          path: in
+          merge-multiple: true
+
+      # A throwaway keychain holding only the Developer ID identities, deleted at the end.
+      - name: Import the signing identities
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/release-signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/productsign
+          rm -f "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
+          # shellcheck disable=SC2046 # the existing search list, one path per word
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary-key.p8"
+          echo "KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: Sign and notarize
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_INSTALLER_SIGNING_IDENTITY: ${{ secrets.APPLE_INSTALLER_SIGNING_IDENTITY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          notarize() {
+            local result status id
+            result="$(xcrun notarytool submit "$1" --key "$RUNNER_TEMP/notary-key.p8" \
+              --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" --wait --output-format json)"
+            status="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("status", ""))' <<<"$result")"
+            id="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("id", ""))' <<<"$result")"
+            echo "notarization of $(basename "$1"): $status ($id)"
+            if [ "$status" != Accepted ]; then
+              xcrun notarytool log "$id" --key "$RUNNER_TEMP/notary-key.p8" \
+                --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" || true
+              return 1
+            fi
+          }
+          mkdir -p out
+          shopt -s nullglob
+          tarballs=(in/*.tar.gz)
+          [ "${#tarballs[@]}" -ge 1 ] || { echo "::error::no macOS tarball to sign"; exit 1; }
+          for t in "${tarballs[@]}"; do
+            work="$RUNNER_TEMP/work-$(basename "$t" .tar.gz)"
+            mkdir -p "$work"
+            tar -xzf "$t" -C "$work"
+            codesign --force --timestamp --options runtime --keychain "$KEYCHAIN" \
+              --sign "$APPLE_SIGNING_IDENTITY" "$work/agent"
+            codesign --verify --strict --verbose=2 "$work/agent"
+            (cd "$work" && zip -q "$work.zip" agent)
+            notarize "$work.zip"
+            tar -czf "out/$(basename "$t")" -C "$work" agent
+          done
+          for p in in/*.pkg; do
+            if [ -z "$APPLE_INSTALLER_SIGNING_IDENTITY" ]; then
+              echo "::error::$(basename "$p") needs APPLE_INSTALLER_SIGNING_IDENTITY (Developer ID Installer)"
+              exit 1
+            fi
+            productsign --keychain "$KEYCHAIN" --timestamp --sign "$APPLE_INSTALLER_SIGNING_IDENTITY" \
+              "$p" "out/$(basename "$p")"
+            notarize "out/$(basename "$p")"
+            xcrun stapler staple "out/$(basename "$p")"
+            spctl --assess --type install -vv "out/$(basename "$p")"
+          done
+          ls -l out
+
+      - name: Remove the keychain and the notary key
+        if: always()
+        run: |
+          [ -z "${KEYCHAIN:-}" ] || security delete-keychain "$KEYCHAIN" || true
+          rm -f "$RUNNER_TEMP/notary-key.p8"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-macos-agent
+          path: out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [meta, signing-policy, test-key-guard, linux-deb, linux-apk, windows, macos, sbom, sign-windows, sign-macos]
+    # The sign-* jobs are skipped when their platform has no secrets; publish still runs then,
+    # but never after a failure anywhere upstream.
+    if: ${{ !cancelled() && !failure() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     environment: release
     permissions:
-      contents: write
+      contents: write # create, upload to and publish the release
+      id-token: write # Sigstore certificate for the provenance attestation
+      attestations: write # store the attestation
+    outputs:
+      published: ${{ steps.publish.outputs.published }}
+      prerelease: ${{ steps.notes.outputs.prerelease }}
     env:
       TAG: ${{ needs.meta.outputs.tag }}
       VERSION: ${{ needs.meta.outputs.version }}
-      PRERELEASE: ${{ needs.meta.outputs.prerelease }}
-      DRAFT: ${{ inputs.draft || false }}
+      SUFFIX: ${{ needs.meta.outputs.suffix }}
+      DRAFT: ${{ inputs.draft == true }}
+      WINDOWS_SIGNED: ${{ needs.signing-policy.outputs.windows }}
+      MACOS_SIGNED: ${{ needs.signing-policy.outputs.macos }}
+      LINUX_SIGNED: ${{ needs.signing-policy.outputs.linux }}
+      ALL_SIGNED: ${{ needs.signing-policy.outputs.all-signed }}
     steps:
       # The tools only (assert-no-test-key.sh); nothing is built here.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -165,9 +471,10 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.meta.outputs.ref }}
 
+      # Every artifact of the run, one directory each: release-* from the builds and the
+      # SBOM, signed-* from the signing jobs that ran.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: release-*
           path: collected
 
       - name: Stage the release files
@@ -177,15 +484,25 @@ jobs:
           shopt -s nullglob
           debs=(collected/release-linux-deb/*.deb)
           apks=(collected/release-linux-apk/*.apk)
-          exes=(collected/release-windows-agent/agent.exe)
-          macs=(collected/release-macos-agent-*/*.tar.gz)
+          sboms=(collected/release-sbom/*.cdx.json)
+          if [ "$WINDOWS_SIGNED" = true ]; then
+            exes=(collected/signed-windows-agent/agent.exe)
+          else
+            exes=(collected/release-windows-agent/agent.exe)
+          fi
+          if [ "$MACOS_SIGNED" = true ]; then
+            macs=(collected/signed-macos-agent/*.tar.gz)
+          else
+            macs=(collected/release-macos-agent-*/*.tar.gz)
+          fi
           [ "${#debs[@]}" -eq 1 ] || { echo "::error::expected one .deb, got ${#debs[@]}"; exit 1; }
           [ "${#apks[@]}" -eq 1 ] || { echo "::error::expected one .apk, got ${#apks[@]}"; exit 1; }
           [ "${#exes[@]}" -eq 1 ] || { echo "::error::expected agent.exe, got ${#exes[@]}"; exit 1; }
           [ "${#macs[@]}" -ge 1 ] || { echo "::error::no macOS tarball"; exit 1; }
+          [ "${#sboms[@]}" -eq 3 ] || { echo "::error::expected three SBOMs, got ${#sboms[@]}"; exit 1; }
           # Package files keep the names their package manager gave them (they carry the
-          # package version); the bare binaries get the tag in their name.
-          cp "${debs[0]}" "${apks[0]}" dist/
+          # package version); the bare binaries get the version in their name.
+          cp "${debs[0]}" "${apks[0]}" "${sboms[@]}" dist/
           cp "${exes[0]}" "dist/synthaea-agent-${VERSION}-windows-x86_64.exe"
           for m in "${macs[@]}"; do
             base="$(basename "$m")"   # synthaea-agent-macos-<arch>.tar.gz
@@ -194,7 +511,8 @@ jobs:
           ls -l dist
 
       # Each build job already scanned what it built; this scans what is about to be
-      # published, after the artifact store, so a mix-up between jobs cannot ship the key.
+      # published, after the artifact store and the signing jobs, so a mix-up between jobs
+      # cannot ship the key.
       - name: Check no published binary carries the test signing key (ADR-0027)
         run: |
           set -euo pipefail
@@ -225,20 +543,16 @@ jobs:
           mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
           cat SHA256SUMS
 
-      # Optional: a detached signature over SHA256SUMS, which covers every file. Skipped,
-      # not failed, when the key is absent; the notes then say the release is unsigned.
-      - name: Sign SHA256SUMS (when the release environment holds a key)
-        id: sign
+      # A detached signature over SHA256SUMS, which covers every file. Only when
+      # signing-policy found the key; the notes then say which platforms are signed.
+      - name: Sign SHA256SUMS (GPG)
+        id: gpg
+        if: env.LINUX_SIGNED == 'true'
         env:
           GPG_PRIVATE_KEY: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
           GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
         run: |
           set -euo pipefail
-          if [ -z "$GPG_PRIVATE_KEY" ]; then
-            echo "::warning::RELEASE_GPG_PRIVATE_KEY is not set: publishing an UNSIGNED release"
-            echo "signed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           export GNUPGHOME="$RUNNER_TEMP/gnupg"
           mkdir -m 700 "$GNUPGHOME"
           printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --quiet --import
@@ -248,13 +562,20 @@ jobs:
           gpg --batch --armor --export > dist/synthaea-release-key.asc
           fingerprint="$(gpg --batch --with-colons --list-secret-keys | awk -F: '/^fpr:/ {print $10; exit}')"
           rm -rf "$GNUPGHOME"
-          echo "signed=true" >> "$GITHUB_OUTPUT"
           echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
 
+      # SLSA build provenance for every published file, verifiable with
+      # `gh attestation verify <file> --repo synthaea-lab/agent`. Keyless (Sigstore, from
+      # this run's OIDC identity): no secret involved.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+
       - name: Write the release notes
+        id: notes
         env:
-          SIGNED: ${{ steps.sign.outputs.signed }}
-          FINGERPRINT: ${{ steps.sign.outputs.fingerprint }}
+          FINGERPRINT: ${{ steps.gpg.outputs.fingerprint }}
+          GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
         run: |
@@ -262,20 +583,42 @@ jobs:
           deb="$(cd dist && ls -- *.deb)"
           apk="$(cd dist && ls -- *.apk)"
           exe="$(cd dist && ls -- *-windows-x86_64.exe)"
-          {
-            if [ "$SIGNED" = true ]; then
-              echo "> **Checksums signed, binaries not code-signed.** \`SHA256SUMS\` carries a detached GPG"
-              echo "> signature (\`SHA256SUMS.asc\`, key fingerprint \`$FINGERPRINT\`). No binary or package in"
-              echo "> this release is code-signed (no Authenticode, no Apple Developer ID, no repository key)."
-            else
-              echo "> **UNSIGNED BUILD.** Nothing in this release is signed: not the binaries, not the"
-              echo "> packages, not \`SHA256SUMS\`. Verify downloads against \`SHA256SUMS\` and treat this as a"
-              echo "> test build for lab machines, not for production endpoints."
+          # Any unsigned platform makes the release an alpha pre-release; signing-policy has
+          # already refused that above 0.0.x.
+          prerelease="$SUFFIX"
+          if [ "$ALL_SIGNED" = true ]; then
+            title="Synthaea $TAG"
+          else
+            title="$TAG — Alpha (unsigned)"
+            prerelease=true
+          fi
+          # The changelog section release-please wrote into the draft, kept below the marker
+          # so a re-run replaces everything above it instead of stacking banners.
+          marker='<!-- release-please changelog -->'
+          changelog=""
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            changelog="$(gh release view "$TAG" --repo "$REPO" --json body --jq .body)"
+            if grep -qF -- "$marker" <<<"$changelog"; then
+              changelog="$(sed -n "/$marker/,\$p" <<<"$changelog" | tail -n +2)"
             fi
-            echo
-            if [ "$PRERELEASE" = true ]; then
-              echo "**Synthaea $TAG is a beta pre-release.** Expect breaking changes, missing features and"
-              echo "rough edges. Do not deploy it on machines you cannot afford to rebuild."
+          fi
+          status() { if [ "$1" = true ]; then echo "$2"; else echo "**unsigned**"; fi; }
+          {
+            if [ "$ALL_SIGNED" != true ]; then
+              echo "> [!WARNING]"
+              echo "> **Alpha, unsigned build.** Some or all of this release is not signed. Windows"
+              echo "> SmartScreen and macOS Gatekeeper will warn or refuse, and nothing but"
+              echo "> \`SHA256SUMS\` and the build attestations below ties a download to this"
+              echo "> repository. Use it on lab machines you can rebuild, not on production endpoints."
+              echo ">"
+              echo "> - Windows: $(status "$WINDOWS_SIGNED" "Authenticode (Azure Trusted Signing)")"
+              echo "> - macOS: $(status "$MACOS_SIGNED" "Developer ID, notarized")"
+              echo "> - Linux packages and \`SHA256SUMS\`: $(status "$LINUX_SIGNED" "GPG signature over SHA256SUMS")"
+              echo
+            fi
+            if [ "$SUFFIX" = true ] || [ "$prerelease" = true ]; then
+              echo "**Synthaea $TAG is a pre-release.** Expect breaking changes, missing features and"
+              echo "rough edges."
               echo
             fi
             echo "Built from \`$SHA\` by the release workflow."
@@ -286,10 +629,11 @@ jobs:
             echo "| --- | --- | --- |"
             echo "| Debian / Ubuntu (x86_64) | \`$deb\` | Package: static musl agent, watchdog and \`synthaea-ctl\`, systemd unit. Installed and started on Ubuntu 22.04 / Debian 12 in CI. |"
             echo "| Alpine (x86_64) | \`$apk\` | Package with an OpenRC service. Signed only by a throwaway build key: install with \`--allow-untrusted\`. |"
-            echo "| Windows (x86_64) | \`$exe\` | The agent executable alone (static ONNX Runtime), **not an installer**: no watchdog, no service registration. |"
+            echo "| Windows (x86_64) | \`$exe\` | The agent executable alone (static ONNX Runtime), **not an installer**: no watchdog, no service registration. $(status "$WINDOWS_SIGNED" "Authenticode-signed.") |"
             for t in dist/*-macos-*.tar.gz; do
-              echo "| macOS ($(basename "$t" .tar.gz | sed 's/.*-macos-//')) | \`$(basename "$t")\` | The agent executable alone (static ONNX Runtime), **not a .pkg**, not notarized. Endpoint Security sensors need an Apple entitlement this build does not have. |"
+              echo "| macOS ($(basename "$t" .tar.gz | sed 's/.*-macos-//')) | \`$(basename "$t")\` | The agent executable alone (static ONNX Runtime), **not a .pkg**. $(status "$MACOS_SIGNED" "Developer ID signed and notarized.") Endpoint Security sensors need an Apple entitlement this build does not have. |"
             done
+            echo "| all | \`synthaea-{agent,watchdog,cli}-$VERSION.cdx.json\` | CycloneDX SBOM of each binary (packaged feature set, every target). |"
             echo
             echo "Not in this release yet: the \`.rpm\` (packaging/linux/build-rpm.sh has no CI job),"
             echo "the Windows MSI (packaging/windows/build.ps1 needs WiX, no CI job) and the macOS \`.pkg\`"
@@ -311,32 +655,65 @@ jobs:
             echo
             echo '```sh'
             echo "sha256sum --check --ignore-missing SHA256SUMS"
-            if [ "$SIGNED" = true ]; then
-              echo "gpg --import synthaea-release-key.asc   # then compare the fingerprint above"
+            echo "gh attestation verify <file> --repo $REPO"
+            if [ "$LINUX_SIGNED" = true ]; then
+              echo "gpg --import synthaea-release-key.asc   # fingerprint $FINGERPRINT"
               echo "gpg --verify SHA256SUMS.asc SHA256SUMS"
             fi
             echo '```'
             echo
             echo "Report security issues privately: https://github.com/$REPO/security/policy"
+            if [ -n "$changelog" ]; then
+              echo
+              echo "$marker"
+              echo "$changelog"
+            fi
           } > "$RUNNER_TEMP/notes.md"
           cat "$RUNNER_TEMP/notes.md" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "title=$title"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
 
-      # Re-running a failed publish updates the same release instead of failing on "already
-      # exists"; assets of the same name are replaced.
-      - name: Publish the GitHub release
+      # release-please has normally created the draft already; a hand-pushed tag has none
+      # yet. Files go up while the release is a draft, then it is published in one step, so
+      # nobody sees a half-uploaded release. Re-running replaces assets of the same name.
+      - name: Upload and publish the GitHub release
+        id: publish
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          TITLE: ${{ steps.notes.outputs.title }}
+          PRERELEASE: ${{ steps.notes.outputs.prerelease }}
         run: |
           set -euo pipefail
-          flags=()
-          [ "$PRERELEASE" = true ] && flags+=(--prerelease)
-          [ "$DRAFT" = true ] && flags+=(--draft)
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            gh release edit "$TAG" --repo "$REPO" --notes-file "$RUNNER_TEMP/notes.md" \
-              --prerelease="$PRERELEASE"
-            gh release upload "$TAG" --repo "$REPO" --clobber dist/*
+            gh release edit "$TAG" --repo "$REPO" --title "$TITLE" \
+              --notes-file "$RUNNER_TEMP/notes.md" --prerelease="$PRERELEASE"
           else
-            gh release create "$TAG" --repo "$REPO" --verify-tag \
-              --title "Synthaea $TAG" --notes-file "$RUNNER_TEMP/notes.md" "${flags[@]}" dist/*
+            gh release create "$TAG" --repo "$REPO" --verify-tag --draft --title "$TITLE" \
+              --notes-file "$RUNNER_TEMP/notes.md" --prerelease="$PRERELEASE"
           fi
+          gh release upload "$TAG" --repo "$REPO" --clobber dist/*
+          if [ "$DRAFT" = true ]; then
+            echo "::notice::left as a draft (draft input): publish it from the Releases page"
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          latest=true
+          [ "$PRERELEASE" = true ] && latest=false
+          gh release edit "$TAG" --repo "$REPO" --draft=false --latest="$latest"
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
+  # Homebrew, apt/yum and winget, each only when its variables are set (distribute.yml).
+  # Called directly: a release published with GITHUB_TOKEN fires no `release` event.
+  distribute:
+    needs: [meta, publish]
+    if: ${{ !cancelled() && needs.publish.outputs.published == 'true' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/distribute.yml
+    with:
+      tag: ${{ needs.meta.outputs.tag }}
+      prerelease: ${{ needs.publish.outputs.prerelease == 'true' }}
+    secrets: inherit

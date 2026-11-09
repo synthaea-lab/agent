@@ -1,6 +1,6 @@
 [package]
 name = "release-tool"
-version = "0.1.0"
+version.workspace = true
 description = "Offline release tooling: build and sign the manifests the updater verifies (ADR-0015, ADR-0016)"
 license.workspace = true
 edition.workspace = true

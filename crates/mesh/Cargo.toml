@@ -1,6 +1,6 @@
 [package]
 name = "mesh"
-version = "0.1.0"
+version.workspace = true
 description = "Agent peer mesh: mutual attestation and posture gossip between nearby agents"
 license.workspace = true
 edition.workspace = true

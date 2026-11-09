@@ -1,6 +1,6 @@
 [package]
 name = "store"
-version = "0.1.0"
+version.workspace = true
 description = "Bounded local state: LRU-bounded maps for detection state, durable event spool"
 license.workspace = true
 edition.workspace = true

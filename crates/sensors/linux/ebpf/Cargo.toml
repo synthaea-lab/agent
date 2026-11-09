@@ -3,7 +3,7 @@
 # bpf-linker required — packaging/toolchain/linux-toolchain.sh installs them).
 [package]
 name = "sensor-linux-ebpf"
-version = "0.1.0"
+version.workspace = true
 description = "Linux kernel probes (eBPF): exec, file open, connect tracepoints"
 # The in-kernel license string is "Dual MIT/GPL" (see main.rs) — GPL-compatible, as
 # required by the verifier for most helpers. A kernel constraint, not a preference.

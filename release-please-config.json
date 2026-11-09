@@ -1,0 +1,40 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/v17.6.0/schemas/config.json",
+  "release-type": "simple",
+  "bootstrap-sha": "3fa219724968dd54ac65e36d06fff3d2ab9e0cc3",
+  "include-component-in-tag": false,
+  "include-v-in-tag": true,
+  "initial-version": "0.0.1",
+  "bump-minor-pre-major": true,
+  "bump-patch-for-minor-pre-major": true,
+  "draft": true,
+  "force-tag-creation": true,
+  "pull-request-title-pattern": "chore: release ${version}",
+  "pull-request-header": "This PR was opened by release-please. Merging it tags the release and starts the release workflow: see docs/release.md.",
+  "changelog-sections": [
+    { "type": "feat", "section": "Features" },
+    { "type": "fix", "section": "Bug Fixes" },
+    { "type": "perf", "section": "Performance" },
+    { "type": "revert", "section": "Reverts" },
+    { "type": "deps", "section": "Dependencies" },
+    { "type": "build", "section": "Packaging and release" },
+    { "type": "ci", "section": "Packaging and release" },
+    { "type": "docs", "section": "Documentation", "hidden": true },
+    { "type": "refactor", "section": "Refactoring", "hidden": true },
+    { "type": "test", "section": "Tests", "hidden": true },
+    { "type": "style", "section": "Style", "hidden": true },
+    { "type": "chore", "section": "Miscellaneous", "hidden": true }
+  ],
+  "packages": {
+    ".": {
+      "package-name": "synthaea-agent",
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        { "type": "toml", "path": "Cargo.toml", "jsonpath": "$.workspace.package.version" },
+        { "type": "generic", "path": "packaging/linux/alpine/APKBUILD" },
+        { "type": "generic", "path": "packaging/linux/rpm/synthaea-agent.spec.template" },
+        { "type": "generic", "path": "packaging/windows/Product.wxs" }
+      ]
+    }
+  }
+}

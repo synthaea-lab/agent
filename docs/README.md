@@ -72,6 +72,7 @@ Start with the architecture, then the page for the area you are changing.
 - [transport.md](transport.md): the control-plane channel, spooling, retries and degraded behavior.
 - [updates-and-releases.md](updates-and-releases.md): signed releases, content rings, key rotation, rollback, `release-tool`.
 - [packaging.md](packaging.md): packages per OS, the bootstrap layout, the release workflow.
+- [release.md](release.md): cutting a release, the release PR, signing, the unsigned-alpha rule, every release secret.
 - [configuration.md](configuration.md): every `agent.toml` key and environment override.
 - [local-interfaces.md](local-interfaces.md): `cli` commands and the local output files.
 - [capabilities.md](capabilities.md) and [roadmap.md](roadmap.md): what works today and what comes next.

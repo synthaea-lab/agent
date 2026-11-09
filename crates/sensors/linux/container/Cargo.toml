@@ -1,6 +1,6 @@
 [package]
 name = "sensor-linux-container"
-version = "0.1.0"
+version.workspace = true
 description = "Linux container attribution: cgroup id to container id, Docker socket lookup for image and name"
 license.workspace = true
 edition.workspace = true

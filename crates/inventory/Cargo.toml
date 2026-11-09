@@ -1,6 +1,6 @@
 [package]
 name = "inventory"
-version = "0.1.0"
+version.workspace = true
 description = "Software and asset inventory: packages, services, autoruns, listening ports"
 license.workspace = true
 edition.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "sinks"
-version = "0.1.0"
+version.workspace = true
 description = "Local event outputs: JSONL today, syslog/CEF as follow-up sinks"
 license.workspace = true
 edition.workspace = true

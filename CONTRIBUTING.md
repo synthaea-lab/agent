@@ -176,7 +176,9 @@ between two copies of the same logic silently produces wrong verdicts.
 
 ## Commit and PR conventions
 
-- Conventional Commits (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`).
+- Conventional Commits (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`). Pull requests
+  are squash-merged, so the PR title is the commit subject: release-please builds the changelog
+  and the next version from it ([docs/release.md](docs/release.md)).
 - Every commit signed off (`git commit -s`).
 - PRs describe *why*, not just *what*. The diff already says what.
 - PRs that change a documented design decision say so and update the documentation in the

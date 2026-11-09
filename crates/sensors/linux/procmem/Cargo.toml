@@ -1,6 +1,6 @@
 [package]
 name = "sensor-linux-procmem"
-version = "0.1.0"
+version.workspace = true
 description = "Linux process-memory access over /proc: the maps parser and a bounded reader (ADR-0023)"
 license.workspace = true
 edition.workspace = true

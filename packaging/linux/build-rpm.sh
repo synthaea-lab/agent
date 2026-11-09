@@ -10,8 +10,9 @@ echo "==> Building Synthaea Agent .rpm package"
 RPMBUILD_DIR="$REPO_ROOT/target/rpmbuild"
 mkdir -p "$RPMBUILD_DIR"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 
-# Extract version
-VERSION=$(grep -m1 '^version' apps/agent/Cargo.toml | cut -d'"' -f2)
+# Extract version: every crate inherits [workspace.package] version from the root manifest.
+VERSION=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+[ -n "$VERSION" ] || { echo "no [workspace.package] version in Cargo.toml" >&2; exit 1; }
 echo "Version: $VERSION"
 
 # Build binaries

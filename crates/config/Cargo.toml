@@ -1,6 +1,6 @@
 [package]
 name = "config"
-version = "0.1.0"
+version.workspace = true
 description = "Agent configuration loading and validation"
 license.workspace = true
 edition.workspace = true
