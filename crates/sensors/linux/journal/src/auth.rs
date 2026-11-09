@@ -77,23 +77,10 @@ pub fn to_auth_event(record: &JournalRecord, event: &JournalEvent) -> Option<Aut
             } else {
                 AuthKind::ExplicitCredentials
             };
-            // Reports the real `-u` target, per `AuthEvent::target_user`'s own
-            // contract ("the account being authenticated as/into" — differing
-            // from `meta.user` "is the whole signal"). A prior version of this
-            // mapping swapped in the invoking account instead, so a sudo success
-            // would key identically to the `pam_unix(sudo:auth)` failures that
-            // preceded it (PAM only ever authenticates *sudo's invoker*, never
-            // learning the `-u` target on a failure) — but `target_user` is also
-            // what an analyst reads as "who this event is about", and silently
-            // meaning the invoker there, for every ordinary `sudo -u x` success,
-            // was wrong (review of #838, Sollykhan 2026-10-19, point
-            // 4: `sudo -u postgres psql` reported `target_user="solka"`, the
-            // invoker, with `postgres` nowhere in the event). The join this swap
-            // existed for now keys on `meta.user`'s uid instead (trusted, from
-            // `_UID` — confirmed by a live capture, same for the PAM failure line
-            // and this `COMMAND=` line, across a real wrong-then-right sudo on
-            // Fedora 43/sudo 1.9.17p2 — see `rules::sudo`), so this field is free
-            // to mean what the schema says again.
+            // `target_user` is the real `-u` target, never the invoker. The join
+            // with the preceding `pam_unix(sudo:auth)` failures keys on
+            // `meta.user`'s uid (from `_UID`, the same on both lines; checked on
+            // Fedora 43 / sudo 1.9.17p2), see `rules::sudo`.
             (AuthOutcome::Success, kind, real_target, None)
         }
         JournalEvent::PamSessionOpened {
