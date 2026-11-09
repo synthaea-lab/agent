@@ -5,7 +5,7 @@ use schema::{
     time::now_ns,
 };
 
-use super::ParsedBlock;
+use super::BlockOutcome;
 use crate::xml;
 
 /// `Microsoft-Windows-Kerberos/Operational` into a [`KerberosDelegationFailureEvent`] (#364):
@@ -18,13 +18,15 @@ use crate::xml;
 /// enable, nothing here turns it on — same open question as #786's point 1 for
 /// `TaskScheduler/Operational`, not duplicated here. A disabled channel is still reported, not
 /// silently idle, by the sensor's start-up check (`warn_about_disabled_channels`).
-pub(crate) fn normalize_kerberos_delegation_failure_block(block: &str) -> ParsedBlock {
-    let record = xml::parse_kerberos_delegation_failure_block(block)?;
+pub(crate) fn normalize_kerberos_delegation_failure_block(block: &str) -> BlockOutcome {
+    let Some(record) = xml::parse_kerberos_delegation_failure_block(block) else {
+        return BlockOutcome::Unparseable;
+    };
     let record_id = record.record_id;
     let kind = match record.event_id {
         201 => KerberosDelegationFailureKind::UnconstrainedDelegationDenied,
         202 => KerberosDelegationFailureKind::TgtSessionKeyExportDenied,
-        _ => return Some((record_id, None)),
+        _ => return BlockOutcome::Filtered { record_id },
     };
     let comm = record
         .process_name
@@ -50,7 +52,7 @@ pub(crate) fn normalize_kerberos_delegation_failure_block(block: &str) -> Parsed
         caller_user: record.client_user_name.unwrap_or_default(),
         caller_domain: record.client_domain_name.unwrap_or_default(),
     });
-    Some((record_id, Some(event)))
+    BlockOutcome::Event { record_id, event }
 }
 
 #[cfg(test)]
@@ -81,7 +83,10 @@ mod tests {
 
     fn kerberos_failure(block: &str) -> KerberosDelegationFailureEvent {
         match normalize_kerberos_delegation_failure_block(block) {
-            Some((_, Some(Event::KerberosDelegationFailure(e)))) => e,
+            BlockOutcome::Event {
+                event: Event::KerberosDelegationFailure(e),
+                ..
+            } => e,
             other => panic!("expected a KerberosDelegationFailure event, got {other:?}"),
         }
     }
@@ -141,7 +146,7 @@ mod tests {
         let other = BLOCK_201.replace("<EventID>201</EventID>", "<EventID>203</EventID>");
         assert!(matches!(
             normalize_kerberos_delegation_failure_block(&other),
-            Some((5201, None))
+            BlockOutcome::Filtered { record_id: 5201 }
         ));
     }
 

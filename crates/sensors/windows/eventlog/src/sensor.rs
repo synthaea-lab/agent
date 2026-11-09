@@ -30,7 +30,7 @@ use crate::{
     error::EventQueryError,
     query::{Direction, query_events},
     targets::{
-        ParsedBlock,
+        BlockOutcome,
         kerberos::normalize_kerberos_delegation_failure_block,
         log_cleared::normalize_log_cleared_block,
         session::{normalize_rdp_connection_block, normalize_session_lifecycle_block},
@@ -107,11 +107,8 @@ pub(crate) struct PollTarget {
     pub(crate) id_filter: &'static str,
     /// Which volume counter this target increments.
     pub(crate) counter: fn(&EventLogCounters) -> &AtomicU64,
-    /// Parses one `<Event>` XML block — see [`ParsedBlock`] for the three
-    /// outcomes. An unparseable block does not advance the record cursor; a
-    /// parsed-but-unusable one advances it without counting (a block missing
-    /// required fields is noise the sensor filtered out, not volume).
-    pub(crate) parse_block: fn(&str) -> ParsedBlock,
+    /// Parses one `<Event>` XML block into a [`BlockOutcome`].
+    pub(crate) parse_block: fn(&str) -> BlockOutcome,
     /// `auditpol` enablement to run once before polling starts, for targets
     /// whose audit subcategory may be off (see each target's enable fn doc).
     pub(crate) enable_audit: Option<fn()>,
@@ -131,15 +128,15 @@ fn last_known_record_id(target: &PollTarget) -> Result<u64, EventQueryError> {
     )?;
     Ok(blocks
         .first()
-        .and_then(|block| (target.parse_block)(block))
-        .map_or(0, |(record_id, _)| record_id))
+        .and_then(|block| (target.parse_block)(block).record_id())
+        .unwrap_or(0))
 }
 
-/// Parsed blocks newer than `since_record_id` (exclusive), oldest to newest.
+/// Blocks newer than `since_record_id` (exclusive), oldest to newest.
 fn new_blocks(
     target: &PollTarget,
     since_record_id: u64,
-) -> Result<Vec<(u64, Option<Event>)>, EventQueryError> {
+) -> Result<Vec<BlockOutcome>, EventQueryError> {
     let blocks = query_events(
         target.channel,
         &target_xpath(target, Some(since_record_id)),
@@ -148,7 +145,7 @@ fn new_blocks(
     )?;
     Ok(blocks
         .iter()
-        .filter_map(|block| (target.parse_block)(block))
+        .map(|block| (target.parse_block)(block))
         .collect())
 }
 
@@ -176,11 +173,15 @@ fn poll_once(
         return last_known_record_id(target);
     };
     let mut newest = since;
-    for (record_id, event) in new_blocks(target, since)? {
-        newest = newest.max(record_id);
-        if let Some(event) = event {
-            (target.counter)(counters).fetch_add(1, Ordering::Relaxed);
-            sink.on_event(event);
+    for outcome in new_blocks(target, since)? {
+        match outcome {
+            BlockOutcome::Unparseable => {}
+            BlockOutcome::Filtered { record_id } => newest = newest.max(record_id),
+            BlockOutcome::Event { record_id, event } => {
+                newest = newest.max(record_id);
+                (target.counter)(counters).fetch_add(1, Ordering::Relaxed);
+                sink.on_event(event);
+            }
         }
     }
     Ok(newest)
@@ -301,11 +302,13 @@ fn enable_audit_subcategory(label: &str, guid: &str, consequence: &str) {
 
 /// A 7045 without a service name or image path is unusable — the alert quotes
 /// them as `comm`/`path`. Skip, advancing the cursor.
-fn normalize_service_install(block: &str) -> ParsedBlock {
-    let install = xml::parse_service_install_block(block)?;
+fn normalize_service_install(block: &str) -> BlockOutcome {
+    let Some(install) = xml::parse_service_install_block(block) else {
+        return BlockOutcome::Unparseable;
+    };
     let record_id = install.record_id;
     if install.service_name.is_empty() || install.image_path.is_empty() {
-        return Some((record_id, None));
+        return BlockOutcome::Filtered { record_id };
     }
     let event = persistence_file_open(
         install.pid,
@@ -313,7 +316,7 @@ fn normalize_service_install(block: &str) -> ParsedBlock {
         install.image_path,
         FLAG_PERSISTENCE_ARTIFACT,
     );
-    Some((record_id, Some(event)))
+    BlockOutcome::Event { record_id, event }
 }
 
 static SERVICE_INSTALLS: PollTarget = PollTarget {
@@ -346,18 +349,20 @@ fn enable_scheduled_task_audit() {
 }
 
 /// Same tolerance rule as [`normalize_service_install`].
-fn normalize_scheduled_task(block: &str) -> ParsedBlock {
-    let task = xml::parse_scheduled_task_block(block)?;
-    Some(normalize_task(task, FLAG_PERSISTENCE_TASK_ARTIFACT))
+fn normalize_scheduled_task(block: &str) -> BlockOutcome {
+    let Some(task) = xml::parse_scheduled_task_block(block) else {
+        return BlockOutcome::Unparseable;
+    };
+    normalize_task(task, FLAG_PERSISTENCE_TASK_ARTIFACT)
 }
 
 /// Shared by 4698 (creation) and 4702 (update): only the parser and the flag
-/// differ between the two. `(record_id, None)` for a task with no name — skipped,
-/// cursor still advanced; an unreadable action is reported, not skipped.
-fn normalize_task(task: xml::ScheduledTaskEvent, flag: u32) -> (u64, Option<Event>) {
+/// differ between the two. A task with no name is filtered; an unreadable action
+/// is reported, not skipped.
+fn normalize_task(task: xml::ScheduledTaskEvent, flag: u32) -> BlockOutcome {
     let record_id = task.record_id;
     if task.task_name.is_empty() {
-        return (record_id, None);
+        return BlockOutcome::Filtered { record_id };
     }
     // A task whose action we cannot read is still a persistence artifact: report
     // it with a placeholder path instead of dropping it (#422). Every action is
@@ -371,7 +376,7 @@ fn normalize_task(task: xml::ScheduledTaskEvent, flag: u32) -> (u64, Option<Even
         ),
     };
     let event = persistence_file_open(task.pid, xml::task_leaf_name(&task.task_name), path, flags);
-    (record_id, Some(event))
+    BlockOutcome::Event { record_id, event }
 }
 
 static SCHEDULED_TASKS: PollTarget = PollTarget {
@@ -387,9 +392,11 @@ static SCHEDULED_TASKS: PollTarget = PollTarget {
 
 // ── Event 4702 — scheduled task update (T1053.005 task-hijack) ───────────────
 
-fn normalize_scheduled_task_update(block: &str) -> ParsedBlock {
-    let task = xml::parse_scheduled_task_update_block(block)?;
-    Some(normalize_task(task, FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT))
+fn normalize_scheduled_task_update(block: &str) -> BlockOutcome {
+    let Some(task) = xml::parse_scheduled_task_update_block(block) else {
+        return BlockOutcome::Unparseable;
+    };
+    normalize_task(task, FLAG_PERSISTENCE_TASK_UPDATE_ARTIFACT)
 }
 
 /// Own target rather than `EventID=4698 or EventID=4702` on [`SCHEDULED_TASKS`]:
@@ -423,9 +430,11 @@ fn enable_logon_audit() {
     }
 }
 
-fn normalize_logon(block: &str) -> ParsedBlock {
-    let logon = xml::parse_logon_block(block)?;
-    Some((logon.record_id, to_auth_event(&logon)))
+fn normalize_logon(block: &str) -> BlockOutcome {
+    let Some(logon) = xml::parse_logon_block(block) else {
+        return BlockOutcome::Unparseable;
+    };
+    BlockOutcome::from_optional(logon.record_id, to_auth_event(&logon))
 }
 
 static LOGON_EVENTS: PollTarget = PollTarget {
@@ -526,11 +535,13 @@ fn enable_account_creation_audit() {
 
 /// A 4720 without a target user name is not usable — the alert message quotes
 /// it as `comm`. Skip, advancing the cursor.
-fn normalize_account_created(block: &str) -> ParsedBlock {
-    let account = xml::parse_account_created_block(block)?;
+fn normalize_account_created(block: &str) -> BlockOutcome {
+    let Some(account) = xml::parse_account_created_block(block) else {
+        return BlockOutcome::Unparseable;
+    };
     let record_id = account.record_id;
     let Some(target_name) = account.target_user_name else {
-        return Some((record_id, None));
+        return BlockOutcome::Filtered { record_id };
     };
     // TargetSid is preferred as `path` (the persistence artifact's canonical
     // identifier — survives an account rename). Falling back to the leaf name
@@ -546,7 +557,7 @@ fn normalize_account_created(block: &str) -> ParsedBlock {
         sid,
         FLAG_PERSISTENCE_ACCOUNT_ARTIFACT,
     );
-    Some((record_id, Some(event)))
+    BlockOutcome::Event { record_id, event }
 }
 
 static ACCOUNT_CREATIONS: PollTarget = PollTarget {
@@ -606,8 +617,10 @@ const APPLOCKER_PACKAGED_DEPLOY_BLOCKED: u32 = 8025;
 /// app's `Package` identity (nothing to attribute), and any event id outside
 /// the audit/enforced allowlist that an `XPath` filter let through — don't guess
 /// a verdict for an event we haven't seen the shape of.
-fn normalize_applocker_block(block: &str) -> ParsedBlock {
-    let ev = xml::parse_applocker_event(block)?;
+fn normalize_applocker_block(block: &str) -> BlockOutcome {
+    let Some(ev) = xml::parse_applocker_event(block) else {
+        return BlockOutcome::Unparseable;
+    };
     let record_id = ev.record_id;
     let enforced = match ev.event_id {
         APPLOCKER_EVENT_BLOCKED
@@ -618,10 +631,10 @@ fn normalize_applocker_block(block: &str) -> ParsedBlock {
         | APPLOCKER_MSI_AUDITED
         | APPLOCKER_PACKAGED_EXEC_AUDITED
         | APPLOCKER_PACKAGED_DEPLOY_AUDITED => false,
-        _ => return Some((record_id, None)),
+        _ => return BlockOutcome::Filtered { record_id },
     };
     if ev.file_path.is_empty() {
-        return Some((record_id, None));
+        return BlockOutcome::Filtered { record_id };
     }
     let path = ev.full_file_path.unwrap_or_else(|| {
         xml::expand_applocker_path(&ev.file_path, |name| std::env::var(name).ok())
@@ -659,7 +672,7 @@ fn normalize_applocker_block(block: &str) -> ParsedBlock {
         enforced,
         object_path: Some(path),
     });
-    Some((record_id, Some(event)))
+    BlockOutcome::Event { record_id, event }
 }
 
 static APPLOCKER_BLOCKS: PollTarget = PollTarget {
@@ -730,7 +743,7 @@ static APPLOCKER_PACKAGED_DEPLOYMENT: PollTarget = PollTarget {
 /// task *name* as the action path, and the rule printed it as an executable
 /// (#422). A task already deleted by the time of the read, or one the sensor
 /// may not read, is reported as action-unknown rather than dropped.
-fn normalize_task_scheduler_op_registered(block: &str) -> ParsedBlock {
+fn normalize_task_scheduler_op_registered(block: &str) -> BlockOutcome {
     let tasks_dir =
         std::env::var_os("SystemRoot").map(|root| Path::new(&root).join("System32").join("Tasks"));
     normalize_task_registered_from(block, tasks_dir.as_deref())
@@ -738,12 +751,14 @@ fn normalize_task_scheduler_op_registered(block: &str) -> ParsedBlock {
 
 /// [`normalize_task_scheduler_op_registered`] with the Tasks directory passed
 /// in, so tests can point it at a temporary tree.
-fn normalize_task_registered_from(block: &str, tasks_dir: Option<&Path>) -> ParsedBlock {
-    let ev = xml::parse_task_scheduler_op_registered_block(block)?;
+fn normalize_task_registered_from(block: &str, tasks_dir: Option<&Path>) -> BlockOutcome {
+    let Some(ev) = xml::parse_task_scheduler_op_registered_block(block) else {
+        return BlockOutcome::Unparseable;
+    };
     let task_content = tasks_dir
         .and_then(|dir| read_task_definition(dir, &ev.task_name))
         .unwrap_or_default();
-    Some(normalize_task(
+    normalize_task(
         xml::ScheduledTaskEvent {
             record_id: ev.record_id,
             task_name: ev.task_name,
@@ -751,7 +766,7 @@ fn normalize_task_registered_from(block: &str, tasks_dir: Option<&Path>) -> Pars
             pid: ev.pid,
         },
         FLAG_PERSISTENCE_TASK_ARTIFACT,
-    ))
+    )
 }
 
 /// Task `task_name`'s definition, read from `tasks_dir`
@@ -885,13 +900,15 @@ fn defender_base(kind: DefenderEventKind) -> DefenderEvent {
 /// Skipped (cursor still advances): a detection without a threat name, a
 /// 5007 about a setting no rule watches, and any event id the `XPath` filter
 /// let through that this function has no shape for.
-fn normalize_defender_block(block: &str) -> ParsedBlock {
-    let ev = xml::parse_defender_event(block)?;
+fn normalize_defender_block(block: &str) -> BlockOutcome {
+    let Some(ev) = xml::parse_defender_event(block) else {
+        return BlockOutcome::Unparseable;
+    };
     let record_id = ev.record_id;
     let event = match ev.event_id {
         DEFENDER_DETECTED | DEFENDER_REMEDIATED => {
             let Some(threat_name) = ev.threat_name else {
-                return Some((record_id, None));
+                return BlockOutcome::Filtered { record_id };
             };
             let kind = if ev.event_id == DEFENDER_DETECTED {
                 DefenderEventKind::Detection
@@ -934,10 +951,10 @@ fn normalize_defender_block(block: &str) -> ParsedBlock {
                 .filter(|p| !p.is_empty())
                 .or_else(|| old.map(|(path, _)| path))
             else {
-                return Some((record_id, None));
+                return BlockOutcome::Filtered { record_id };
             };
             if !is_security_relevant_setting(path) {
-                return Some((record_id, None));
+                return BlockOutcome::Filtered { record_id };
             }
             let value = |side: Option<(&str, &str)>| {
                 side.map(|(_, data)| data.to_string())
@@ -950,9 +967,12 @@ fn normalize_defender_block(block: &str) -> ParsedBlock {
                 ..defender_base(DefenderEventKind::ConfigChanged)
             }
         }
-        _ => return Some((record_id, None)),
+        _ => return BlockOutcome::Filtered { record_id },
     };
-    Some((record_id, Some(Event::Defender(event))))
+    BlockOutcome::Event {
+        record_id,
+        event: Event::Defender(event),
+    }
 }
 
 static DEFENDER_OP: PollTarget = PollTarget {
@@ -988,16 +1008,18 @@ const WDAC_EVENT_AUDITED: u32 = 3076;
 /// not subscribed: 584 of them on one lab host in a day, all Chrome loading
 /// its own DLLs. Skipped (cursor advances): a block without a file name, and
 /// any other event id the filter let through.
-fn normalize_wdac_block(block: &str) -> ParsedBlock {
-    let ev = xml::parse_code_integrity_event(block)?;
+fn normalize_wdac_block(block: &str) -> BlockOutcome {
+    let Some(ev) = xml::parse_code_integrity_event(block) else {
+        return BlockOutcome::Unparseable;
+    };
     let record_id = ev.record_id;
     let enforced = match ev.event_id {
         WDAC_EVENT_ENFORCED => true,
         WDAC_EVENT_AUDITED => false,
-        _ => return Some((record_id, None)),
+        _ => return BlockOutcome::Filtered { record_id },
     };
     let Some(file_name) = ev.file_name else {
-        return Some((record_id, None));
+        return BlockOutcome::Filtered { record_id };
     };
     let object_class = match ev.signing_scenario {
         Some(0) => Some("kernel-mode".to_string()),
@@ -1023,7 +1045,7 @@ fn normalize_wdac_block(block: &str) -> ParsedBlock {
         enforced,
         object_path: Some(file_name),
     });
-    Some((record_id, Some(event)))
+    BlockOutcome::Event { record_id, event }
 }
 
 static WDAC_OP: PollTarget = PollTarget {
@@ -1817,7 +1839,10 @@ mod query_tests {
                  </EventData></Event>"
             );
             match normalize_logon(&block) {
-                Some((7, Some(Event::Auth(auth)))) => auth.target_user,
+                BlockOutcome::Event {
+                    record_id: 7,
+                    event: Event::Auth(auth),
+                } => auth.target_user,
                 other => panic!("{name}: {other:?}"),
             }
         };
@@ -1957,7 +1982,11 @@ mod scheduled_task_tests {
         let block = block_4698(
             "&lt;Task&gt;&lt;Actions&gt;&lt;ComHandler/&gt;&lt;/Actions&gt;&lt;/Task&gt;",
         );
-        let Some((42, Some(Event::FileOpen(event)))) = normalize_scheduled_task(&block) else {
+        let BlockOutcome::Event {
+            record_id: 42,
+            event: Event::FileOpen(event),
+        } = normalize_scheduled_task(&block)
+        else {
             panic!("a 4698 must never be dropped (#422)");
         };
         assert_eq!(event.path, xml::TASK_ACTION_UNKNOWN);
@@ -1974,7 +2003,11 @@ mod scheduled_task_tests {
         let block = block_4698(
             "&lt;Actions&gt;&lt;Exec&gt;&lt;Command&gt;a.exe&lt;/Command&gt;&lt;/Exec&gt;&lt;ComHandler&gt;&lt;ClassId&gt;{X}&lt;/ClassId&gt;&lt;/ComHandler&gt;&lt;/Actions&gt;",
         );
-        let Some((42, Some(Event::FileOpen(event)))) = normalize_scheduled_task(&block) else {
+        let BlockOutcome::Event {
+            record_id: 42,
+            event: Event::FileOpen(event),
+        } = normalize_scheduled_task(&block)
+        else {
             panic!("expected a FileOpen event");
         };
         assert_eq!(event.path, "a.exe | com:{X}");
@@ -1993,7 +2026,10 @@ mod scheduled_task_tests {
         let block = block_4702(
             "&lt;Actions&gt;&lt;Exec&gt;&lt;Command&gt;C:\\legit\\backup.exe&lt;/Command&gt;&lt;/Exec&gt;&lt;Exec&gt;&lt;Command&gt;C:\\Users\\Public\\evil.exe&lt;/Command&gt;&lt;/Exec&gt;&lt;/Actions&gt;",
         );
-        let Some((43, Some(Event::FileOpen(event)))) = normalize_scheduled_task_update(&block)
+        let BlockOutcome::Event {
+            record_id: 43,
+            event: Event::FileOpen(event),
+        } = normalize_scheduled_task_update(&block)
         else {
             panic!("expected a FileOpen event");
         };
@@ -2010,7 +2046,10 @@ mod scheduled_task_tests {
         let block = block_4702(
             "&lt;Task&gt;&lt;Actions&gt;&lt;ComHandler/&gt;&lt;/Actions&gt;&lt;/Task&gt;",
         );
-        let Some((43, Some(Event::FileOpen(event)))) = normalize_scheduled_task_update(&block)
+        let BlockOutcome::Event {
+            record_id: 43,
+            event: Event::FileOpen(event),
+        } = normalize_scheduled_task_update(&block)
         else {
             panic!("an unreadable 4702 must be reported, not dropped");
         };
@@ -2044,8 +2083,10 @@ mod scheduled_task_tests {
             r"<Task><Actions><Exec><Command>C:\Users\Public\evil.exe</Command><Arguments>-q</Arguments></Exec></Actions></Task>",
         );
         let block = block_106(r"\Folder\EvilTask");
-        let Some((44, Some(Event::FileOpen(event)))) =
-            normalize_task_registered_from(&block, Some(tasks.path()))
+        let BlockOutcome::Event {
+            record_id: 44,
+            event: Event::FileOpen(event),
+        } = normalize_task_registered_from(&block, Some(tasks.path()))
         else {
             panic!("expected a FileOpen event");
         };
@@ -2061,8 +2102,10 @@ mod scheduled_task_tests {
         let tasks = tempfile::tempdir().expect("tempdir");
         for name in [r"\GoneTask", r"\..\outside"] {
             let block = block_106(name);
-            let Some((44, Some(Event::FileOpen(event)))) =
-                normalize_task_registered_from(&block, Some(tasks.path()))
+            let BlockOutcome::Event {
+                record_id: 44,
+                event: Event::FileOpen(event),
+            } = normalize_task_registered_from(&block, Some(tasks.path()))
             else {
                 panic!("a 106 must be reported, not dropped: {name}");
             };
@@ -2084,8 +2127,10 @@ mod scheduled_task_tests {
                 "<Task><Actions><Exec><Command>a.exe</Command></Exec></Actions>{padding}</Task>"
             ),
         );
-        let Some((44, Some(Event::FileOpen(event)))) =
-            normalize_task_registered_from(&block_106(r"\Huge"), Some(tasks.path()))
+        let BlockOutcome::Event {
+            record_id: 44,
+            event: Event::FileOpen(event),
+        } = normalize_task_registered_from(&block_106(r"\Huge"), Some(tasks.path()))
         else {
             panic!("expected a FileOpen event");
         };
@@ -2107,13 +2152,13 @@ mod applocker_tests {
     }
 
     fn policy_denial(event_id: u32) -> PolicyDenialEvent {
-        let (record_id, event) =
-            normalize_applocker_block(&applocker_block(event_id)).expect("should parse");
-        assert_eq!(record_id, 7);
-        let Some(Event::PolicyDenial(denial)) = event else {
-            panic!("expected a PolicyDenial event, got {event:?}");
-        };
-        denial
+        match normalize_applocker_block(&applocker_block(event_id)) {
+            BlockOutcome::Event {
+                record_id: 7,
+                event: Event::PolicyDenial(denial),
+            } => denial,
+            other => panic!("expected a PolicyDenial event, got {other:?}"),
+        }
     }
 
     fn applocker_decision_xml(event_id: u32, channel: &str, policy_name: &str) -> String {
@@ -2191,10 +2236,11 @@ mod applocker_tests {
             ),
         ] {
             let block = applocker_decision_xml(event_id, channel, policy_name);
-            let (record_id, event) =
-                normalize_applocker_block(&block).expect("valid Event Log XML");
-            assert_eq!(record_id, 991, "event id {event_id}");
-            let Some(Event::PolicyDenial(denial)) = event else {
+            let BlockOutcome::Event {
+                record_id: 991,
+                event: Event::PolicyDenial(denial),
+            } = normalize_applocker_block(&block)
+            else {
                 panic!("event {event_id} should reuse PolicyDenial");
             };
             assert_eq!(denial.mechanism, POLICY_MECHANISM_APPLOCKER);
@@ -2223,13 +2269,16 @@ mod applocker_tests {
     #[test]
     fn applocker_allow_events_and_unrecognized_ids_are_skipped() {
         for event_id in [8005, 8020, 8023, 8035, 8028, 8029, 8999] {
-            let (_, event) = normalize_applocker_block(&applocker_decision_xml(
+            let outcome = normalize_applocker_block(&applocker_decision_xml(
                 event_id,
                 "localized channel name",
                 "APPX",
-            ))
-            .expect("the record id remains usable");
-            assert!(event.is_none(), "event id {event_id} is not a denial");
+            ));
+            assert_eq!(
+                outcome,
+                BlockOutcome::Filtered { record_id: 991 },
+                "event id {event_id} is not a denial"
+            );
         }
     }
 
@@ -2271,9 +2320,13 @@ mod applocker_tests {
             <FilePath>%OSDRIVE%\\USERS\\PUBLIC\\TEST8003.EXE</FilePath>\
             <FullFilePath>C:\\Users\\Public\\test8003.exe</FullFilePath>\
             </RuleAndFileData></UserData></Event>";
-        let (_, event) = normalize_applocker_block(block).expect("should parse");
-        let Some(Event::PolicyDenial(denial)) = event else {
-            panic!("expected a PolicyDenial event, got {event:?}");
+        let outcome = normalize_applocker_block(block);
+        let BlockOutcome::Event {
+            event: Event::PolicyDenial(denial),
+            ..
+        } = outcome
+        else {
+            panic!("expected a PolicyDenial event, got {outcome:?}");
         };
         assert!(!denial.enforced);
         assert_eq!(
@@ -2292,10 +2345,13 @@ mod applocker_tests {
             <FileHashLength>0</FileHashLength><FileHash></FileHash><Fqbn>-</Fqbn>\
             <FullFilePath>C:\\Users\\Public\\test8004.exe</FullFilePath>\
             </RuleAndFileData></UserData></Event>";
-        let (record_id, event) = normalize_applocker_block(block).expect("should parse");
-        assert_eq!(record_id, 29);
-        let Some(Event::PolicyDenial(denial)) = event else {
-            panic!("expected a PolicyDenial event, got {event:?}");
+        let outcome = normalize_applocker_block(block);
+        let BlockOutcome::Event {
+            record_id: 29,
+            event: Event::PolicyDenial(denial),
+        } = outcome
+        else {
+            panic!("expected a PolicyDenial event, got {outcome:?}");
         };
         assert!(denial.enforced);
         assert_eq!(
@@ -2314,17 +2370,20 @@ mod applocker_tests {
 
     #[test]
     fn applocker_unknown_event_id_is_skipped_but_advances_the_cursor() {
-        let (record_id, event) =
-            normalize_applocker_block(&applocker_block(8002)).expect("should parse");
-        assert_eq!(record_id, 7);
-        assert!(event.is_none());
+        assert_eq!(
+            normalize_applocker_block(&applocker_block(8002)),
+            BlockOutcome::Filtered { record_id: 7 }
+        );
     }
 
     #[test]
     fn applocker_without_file_path_is_skipped() {
         let block = "<Event><System><EventID>8004</EventID><EventRecordID>9</EventRecordID></System>\
             <UserData><RuleAndFileData><PolicyName>EXE</PolicyName></RuleAndFileData></UserData></Event>";
-        assert_eq!(normalize_applocker_block(block), Some((9, None)));
+        assert_eq!(
+            normalize_applocker_block(block),
+            BlockOutcome::Filtered { record_id: 9 }
+        );
     }
 }
 
@@ -2339,16 +2398,20 @@ mod defender_wdac_tests {
     }
 
     fn defender_event(block: &str) -> DefenderEvent {
-        let (record_id, event) = normalize_defender_block(block).expect("should parse");
-        assert_eq!(record_id, 31);
-        match event.expect("should normalize") {
-            Event::Defender(e) => e,
+        match normalize_defender_block(block) {
+            BlockOutcome::Event {
+                record_id: 31,
+                event: Event::Defender(e),
+            } => e,
             other => panic!("expected a DefenderEvent, got {other:?}"),
         }
     }
 
     fn skipped(block: &str) -> bool {
-        matches!(normalize_defender_block(block), Some((31, None)))
+        matches!(
+            normalize_defender_block(block),
+            BlockOutcome::Filtered { record_id: 31 }
+        )
     }
 
     const DETECTION: &str = "<Data Name='Detection ID'>{AAAA}</Data><Data Name='Threat Name'>Trojan:Win32/Lab.A</Data><Data Name='Severity ID'>5</Data><Data Name='Category ID'>8</Data><Data Name='Process Name'>Unknown</Data><Data Name='Detection User'>LAB\\alice</Data><Data Name='Path'>file:_C:\\Users\\Public\\x.exe</Data><Data Name='Action ID'>9</Data>";
@@ -2471,12 +2534,11 @@ mod defender_wdac_tests {
     const WDAC_DATA: &str = r"<Data Name='File Name'>\Device\HarddiskVolume3\Users\Public\x.dll</Data><Data Name='Process Name'>\Device\HarddiskVolume3\Windows\System32\rundll32.exe</Data><Data Name='SI Signing Scenario'>1</Data>";
 
     fn wdac_denial(event_id: u32, data: &str) -> PolicyDenialEvent {
-        match normalize_wdac_block(&wdac_block(event_id, data))
-            .expect("should parse")
-            .1
-            .expect("should normalize")
-        {
-            Event::PolicyDenial(e) => e,
+        match normalize_wdac_block(&wdac_block(event_id, data)) {
+            BlockOutcome::Event {
+                event: Event::PolicyDenial(e),
+                ..
+            } => e,
             other => panic!("expected a PolicyDenialEvent, got {other:?}"),
         }
     }
@@ -2514,13 +2576,13 @@ mod defender_wdac_tests {
                 3077,
                 "<Data Name='SI Signing Scenario'>1</Data>"
             )),
-            Some((8, None))
+            BlockOutcome::Filtered { record_id: 8 }
         ));
         // 3033 (a DLL failed a signing level) is Chrome noise: not subscribed,
         // and refused here if the filter ever let one through.
         assert!(matches!(
             normalize_wdac_block(&wdac_block(3033, WDAC_DATA)),
-            Some((8, None))
+            BlockOutcome::Filtered { record_id: 8 }
         ));
     }
 
@@ -2666,7 +2728,7 @@ mod subscribe_tests {
             // An ID no provider emits: the subscription registers, nothing fires.
             id_filter: "EventID=65000",
             counter: |c| &c.service_installs,
-            parse_block: |_| None,
+            parse_block: |_| BlockOutcome::Unparseable,
             enable_audit: None,
             enabled: |_| true,
         }

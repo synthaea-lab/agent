@@ -7,7 +7,7 @@
 
 use schema::{Event, EventMeta, LogClearedEvent, User, time::now_ns};
 
-use super::ParsedBlock;
+use super::BlockOutcome;
 use crate::xml;
 
 const SECURITY_LOG_CLEARED: u32 = 1102;
@@ -18,16 +18,18 @@ const LOG_FILE_CLEARED: u32 = 104;
 /// Skipped (cursor still advances): any other id the filter let through, and
 /// a 104 that does not name the channel it cleared — an alert that cannot say
 /// which log is gone is not worth guessing at.
-pub(crate) fn normalize_log_cleared_block(block: &str) -> ParsedBlock {
-    let record = xml::parse_log_cleared_event(block)?;
+pub(crate) fn normalize_log_cleared_block(block: &str) -> BlockOutcome {
+    let Some(record) = xml::parse_log_cleared_event(block) else {
+        return BlockOutcome::Unparseable;
+    };
     let record_id = record.record_id;
     let channel = match record.event_id {
         SECURITY_LOG_CLEARED => "Security".to_string(),
         LOG_FILE_CLEARED => match record.cleared_channel {
             Some(channel) => channel,
-            None => return Some((record_id, None)),
+            None => return BlockOutcome::Filtered { record_id },
         },
-        _ => return Some((record_id, None)),
+        _ => return BlockOutcome::Filtered { record_id },
     };
     let subject_user = match (record.subject_domain_name, record.subject_user_name) {
         (Some(domain), Some(name)) => format!("{domain}\\{name}"),
@@ -56,7 +58,7 @@ pub(crate) fn normalize_log_cleared_block(block: &str) -> ParsedBlock {
         subject_logon_id: record.subject_logon_id,
         backup_path: record.backup_path,
     });
-    Some((record_id, Some(event)))
+    BlockOutcome::Event { record_id, event }
 }
 
 #[cfg(test)]
@@ -80,7 +82,10 @@ mod tests {
 
     fn log_cleared(block: &str) -> LogClearedEvent {
         match normalize_log_cleared_block(block) {
-            Some((_, Some(Event::LogCleared(e)))) => e,
+            BlockOutcome::Event {
+                event: Event::LogCleared(e),
+                ..
+            } => e,
             other => panic!("expected a LogCleared event, got {other:?}"),
         }
     }
@@ -140,12 +145,14 @@ mod tests {
         let no_channel = BLOCK_104.replace("<Channel>OpenSSH/Operational</Channel>", "");
         assert!(matches!(
             normalize_log_cleared_block(&no_channel),
-            Some((78381, None))
+            BlockOutcome::Filtered { record_id: 78381 }
         ));
         let other_id = BLOCK_1102.replace("<EventID>1102</EventID>", "<EventID>1100</EventID>");
         assert!(matches!(
             normalize_log_cleared_block(&other_id),
-            Some((1_399_119, None))
+            BlockOutcome::Filtered {
+                record_id: 1_399_119
+            }
         ));
     }
 }
