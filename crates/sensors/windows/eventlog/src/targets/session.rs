@@ -10,7 +10,7 @@ use std::net::IpAddr;
 
 use schema::{Event, EventMeta, SessionEvent, SessionState, User, time::now_ns};
 
-use super::ParsedBlock;
+use super::BlockOutcome;
 use crate::xml;
 
 const SESSION_LOGON: u32 = 21;
@@ -57,20 +57,25 @@ fn session_event(ev: xml::TerminalSessionEvent, state: SessionState) -> Event {
 /// consumer keys on it), and any event id the `XPath` filter let through
 /// that this function has no state for. 22 (shell start) is not subscribed:
 /// it repeats the 21 it follows.
-pub(crate) fn normalize_session_lifecycle_block(block: &str) -> ParsedBlock {
-    let ev = xml::parse_local_session_event(block)?;
+pub(crate) fn normalize_session_lifecycle_block(block: &str) -> BlockOutcome {
+    let Some(ev) = xml::parse_local_session_event(block) else {
+        return BlockOutcome::Unparseable;
+    };
     let record_id = ev.record_id;
     let state = match ev.event_id {
         SESSION_LOGON => SessionState::Logon,
         SESSION_LOGOFF => SessionState::Logoff,
         SESSION_DISCONNECT => SessionState::Disconnect,
         SESSION_RECONNECT => SessionState::Reconnect,
-        _ => return Some((record_id, None)),
+        _ => return BlockOutcome::Filtered { record_id },
     };
     if ev.session_id.is_none() {
-        return Some((record_id, None));
+        return BlockOutcome::Filtered { record_id };
     }
-    Some((record_id, Some(session_event(ev, state))))
+    BlockOutcome::Event {
+        record_id,
+        event: session_event(ev, state),
+    }
 }
 
 /// Normalizes a `RemoteConnectionManager` 1149 (a client authenticated to the
@@ -80,13 +85,18 @@ pub(crate) fn normalize_session_lifecycle_block(block: &str) -> ParsedBlock {
 /// attempts land, and it carries the source address too.
 ///
 /// Skipped: a block naming neither a user nor a client, and any other id.
-pub(crate) fn normalize_rdp_connection_block(block: &str) -> ParsedBlock {
-    let ev = xml::parse_remote_connection_event(block)?;
+pub(crate) fn normalize_rdp_connection_block(block: &str) -> BlockOutcome {
+    let Some(ev) = xml::parse_remote_connection_event(block) else {
+        return BlockOutcome::Unparseable;
+    };
     let record_id = ev.record_id;
     if ev.event_id != RDP_AUTHENTICATED || (ev.user.is_none() && ev.address.is_none()) {
-        return Some((record_id, None));
+        return BlockOutcome::Filtered { record_id };
     }
-    Some((record_id, Some(session_event(ev, SessionState::Connect))))
+    BlockOutcome::Event {
+        record_id,
+        event: session_event(ev, SessionState::Connect),
+    }
 }
 
 #[cfg(test)]
@@ -99,11 +109,12 @@ mod tests {
         )
     }
 
-    fn session(parsed: ParsedBlock) -> SessionEvent {
-        let (record_id, event) = parsed.expect("should parse");
-        assert_eq!(record_id, 40);
-        match event.expect("should normalize") {
-            Event::Session(e) => e,
+    fn session(parsed: BlockOutcome) -> SessionEvent {
+        match parsed {
+            BlockOutcome::Event {
+                record_id: 40,
+                event: Event::Session(e),
+            } => e,
             other => panic!("expected a SessionEvent, got {other:?}"),
         }
     }
@@ -167,7 +178,7 @@ mod tests {
         let block = lsm_block(25, r"<User>LAB\alice</User><Address>LOCAL</Address>");
         assert!(matches!(
             normalize_session_lifecycle_block(&block),
-            Some((40, None))
+            BlockOutcome::Filtered { record_id: 40 }
         ));
     }
 
@@ -177,7 +188,7 @@ mod tests {
         let block = lsm_block(59, "<SessionId>0</SessionId>");
         assert!(matches!(
             normalize_session_lifecycle_block(&block),
-            Some((40, None))
+            BlockOutcome::Filtered { record_id: 40 }
         ));
     }
 
@@ -199,7 +210,7 @@ mod tests {
         let block = lsm_block(1149, "<Param1></Param1><Param2></Param2><Param3></Param3>");
         assert!(matches!(
             normalize_rdp_connection_block(&block),
-            Some((40, None))
+            BlockOutcome::Filtered { record_id: 40 }
         ));
     }
 }

@@ -56,7 +56,10 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::sensor::{EventLogCounters, PollTarget};
+use crate::{
+    sensor::{EventLogCounters, PollTarget},
+    targets::BlockOutcome,
+};
 
 /// State shared between one subscription's `EvtSubscribe` call and the
 /// callback thread the OS invokes for every event it delivers. Passed to the
@@ -136,7 +139,7 @@ unsafe extern "system" fn subscribe_callback(
 
     // `record_id` only drives the polling transport's `EventRecordID` cursor;
     // a push subscription has no cursor to advance, so it is ignored here.
-    if let Some((_record_id, Some(event))) = (ctx.target.parse_block)(&xml) {
+    if let BlockOutcome::Event { event, .. } = (ctx.target.parse_block)(&xml) {
         // Same counter-then-sink order as the polling loop, so the two
         // transports produce identical metric traces given identical input.
         (ctx.target.counter)(&ctx.counters).fetch_add(1, Ordering::Relaxed);
