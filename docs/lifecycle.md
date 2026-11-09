@@ -60,7 +60,7 @@ The Linux `run` path does not put a `RedactingSink` in front of the detection si
    - Out-of-distribution features are logged and give no evidence.
    - Scorer errors fail open.
    - `kill_shield` is read while the correlator lock is still held. The lock is released before any alert I/O.
-2. **Canary hold expiry and tripwires** (`expire_held_canary`, `detect_canary`). Expiry runs only for events from the primary capture stream (exec and file events), because the hold window is measured on that stream's clock.
+2. **Canary hold expiry and tripwires** (`CanaryGate::on_event`, in [`sink/canary.rs`](../apps/agent/src/sink/canary.rs)). Expiry runs only for events from the primary capture stream (exec and file events), because the hold window is measured on that stream's clock.
 3. **Per-type dispatch** (`detect_exec`, `detect_file_open`, …). For an exec, the order is: stateless rules (`rules::evaluate_exec`), stateful rules (`RuleState::on_exec`), due identity and unit-stop alerts, then Sigma. A file open with write intent also enqueues a budgeted YARA scan ([`yara::ScanQueue`](../crates/yara/src/queue.rs)), which runs on the `yara-scan` thread.
 4. **Signature-gated findings.** Some exec findings depend on the image's signature, which is not known yet. `RuleState::on_exec_signature_gated` returns them, and they travel with the event into the enrichment queue.
 5. **Progress.** Only after all of the above does `on_event` increment the progress counter. A hang anywhere above, such as a poisoned lock or a wedged engine call, therefore stops the watchdog heartbeat.

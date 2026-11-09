@@ -16,7 +16,8 @@ The work is split in two:
 - The agent holds the wiring: seed storage, planting at start, the hourly refresh, metadata
   matching, the allow list and decoy registration
   ([`apps/agent/src/deception.rs`](../../apps/agent/src/deception.rs)), and the detection path in
-  [`DetectionSink`](../../apps/agent/src/sink/mod.rs).
+  [`CanaryGate`](../../apps/agent/src/sink/canary.rs), whose findings
+  [`DetectionSink`](../../apps/agent/src/sink/mod.rs) records.
 
 ## Configuration
 
@@ -116,8 +117,9 @@ agent warns that a stolen decoy will not raise an alarm for this host.
 
 ## Detection path
 
-[`DetectionSink::detect_canary`](../../apps/agent/src/sink/mod.rs) runs on every event, before the
-per-type dispatch.
+[`CanaryGate::on_event`](../../apps/agent/src/sink/canary.rs) runs on every event, before the
+per-type dispatch. It returns the touches to report; `DetectionSink` records them and reports
+each to the ransomware join.
 
 1. [`Tripwires::matches`](../../crates/deception/src/tripwire.rs) looks the event up: a
    `FileOpen` (with its flags), a `FileDelete`, or a `FileRename` from or onto a canary path.
@@ -127,10 +129,11 @@ per-type dispatch.
    name match is nearly collision-free. A name shared by two canaries matches neither. A
    `FileWrite` names a descriptor, not a path, so a write shows up as the open before it.
 2. Touches by the agent's own pid are ignored (it plants and verifies the canaries).
-3. The allow list decides (`canary_verdict`): **Allowed** (dropped), **Raise**, or **Unknown**
+3. The allow list decides (`verdict`): **Allowed** (dropped), **Raise**, or **Unknown**
    (held, see below).
-4. `raise_canary` records a `DetectionSource::Rule { rule_id: "DECEPTION-CANARY" }` detection
-   with technique `T1083` and severity High.
+4. `raise` hands the touch to the sink, which records a
+   `DetectionSource::Rule { rule_id: "DECEPTION-CANARY" }` detection with technique `T1083` and
+   severity High.
 
 ### Allow list
 

@@ -7,8 +7,9 @@ use std::{
 use schema::{ConnectEvent, Event, EventMeta, ExecEvent, User, sensor::EventSink as _};
 
 use super::{
-    CANARY_EXEC_HOLD_NS, DetectionSink, Load, MAX_HELD_CANARY_TOUCHES, correlator_case_id,
-    entity_key, load_sigma_rules,
+    DetectionSink, Load,
+    canary::{CANARY_EXEC_HOLD_NS, MAX_HELD_CANARY_TOUCHES},
+    correlator_case_id, entity_key, load_sigma_rules,
 };
 
 /// A content root with one Sigma rule per platform directory, each titled after it.
@@ -628,11 +629,11 @@ fn a_process_reopening_a_canary_raises_one_detection_per_cooldown() {
         sink.on_event(open_event_at(&canary, pid, t0 + i * 1_000_000_000));
     }
     assert_eq!(canary_alert_count(&dir), 1);
-    assert_eq!(sink.canary_hits_absorbed.load(Ordering::Relaxed), 4);
+    assert_eq!(sink.canary.hits_absorbed(), 4);
     sink.on_event(open_event_at(
         &canary,
         pid,
-        t0 + super::CANARY_COOLDOWN_NS + 1,
+        t0 + super::canary::CANARY_COOLDOWN_NS + 1,
     ));
     assert_eq!(canary_alert_count(&dir), 2);
 }
@@ -687,7 +688,7 @@ fn a_delete_rename_or_write_open_after_a_read_open_is_not_absorbed() {
             2,
             "{destructive} must not hide behind the read open"
         );
-        assert_eq!(sink.canary_hits_absorbed.load(Ordering::Relaxed), 0);
+        assert_eq!(sink.canary.hits_absorbed(), 0);
     }
 }
 
@@ -745,7 +746,7 @@ fn an_exec_is_recorded_only_when_an_executable_may_be_allowed() {
         exec.meta.process_generation = Some(3);
         exec.image_path = "/usr/bin/updatedb".into();
         sink.on_event(Event::Exec(exec));
-        sink.exec_images.lock().unwrap().image_of(pid, Some(3))
+        sink.canary.exec_image_of(pid, Some(3))
     };
     let dir = tmp("exec-record-none");
     let (sink, _canary) = sink_watching_canary(&dir);
@@ -922,7 +923,7 @@ fn a_touch_whose_exec_never_comes_is_raised_once_the_hold_has_passed() {
     sink.on_event(tick_at(10_000 + CANARY_EXEC_HOLD_NS));
     assert_eq!(canary_alert_count(&dir), 1, "the hold is bounded");
     assert_eq!(
-        sink.canary_hold_expired.load(Ordering::Relaxed),
+        sink.canary.hold_expired(),
         1,
         "a hold that ended with no exec is counted"
     );
@@ -1099,7 +1100,7 @@ fn a_full_hold_queue_raises_the_touch_instead_of_holding_it() {
         "beyond the bound it is raised at once"
     );
     assert_eq!(
-        sink.canary_hold_overflow.load(Ordering::Relaxed),
+        sink.canary.hold_overflow(),
         1,
         "and the overflow is counted"
     );

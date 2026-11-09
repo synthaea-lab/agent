@@ -10,11 +10,10 @@
 #![cfg_attr(not(test), warn(clippy::unwrap_used))]
 
 use std::{
-    collections::VecDeque,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     thread,
     time::Duration,
@@ -31,6 +30,7 @@ use crate::{
 };
 
 mod baseline;
+mod canary;
 mod recording;
 
 pub(crate) use baseline::BaselineSink;
@@ -136,30 +136,8 @@ pub(crate) struct DetectionSink {
     /// runtime, so re-resolving on every reload would add nothing but a
     /// syscall.
     content_root: PathBuf,
-    /// The planted canary files (#81), set once at start by [`Self::set_tripwires`]; empty
-    /// of effect when the operator configured no `[deception]` directories.
-    tripwires: std::sync::OnceLock<deception::Tripwires>,
-    /// Executables allowed to touch a canary without a detection (`[deception] allow_exe`),
-    /// set once with the tripwires.
-    canary_allow: std::sync::OnceLock<crate::deception::CanaryAllow>,
-    /// The image each process was seen to execute, so `canary_allow` need not read `/proc`.
-    exec_images: Mutex<crate::deception::ExecImages>,
-    /// Canary touches by a process whose `Exec` was not recorded yet, waiting for it (#81),
-    /// oldest first. Only filled when `canary_allow` lists an executable.
-    held_canary: Mutex<VecDeque<HeldTouch>>,
-    /// Length of `held_canary`, so the common empty case costs no lock per event.
-    held_canary_len: AtomicUsize,
-    /// When each `(canary, pid, incarnation of pid)` last raised a detection (event time,
-    /// ns), so a tool that reads the same canary again and again raises one finding per
-    /// cooldown, not one per open. Only read opens are absorbed (see [`absorbable`]);
-    /// bounded; the hits it absorbs are counted in `canary_hits_absorbed`.
-    canary_last_hit: Mutex<store::BoundedMap<CanaryKey, u64>>,
-    canary_hits_absorbed: AtomicU64,
-    /// Touches judged at once because the hold queue was full, and touches raised after a hold
-    /// that ended with no allowed exec: the two outcomes of the hold that bring the false
-    /// positive back, counted and logged like `canary_hits_absorbed` (#81 review).
-    canary_hold_overflow: AtomicU64,
-    canary_hold_expired: AtomicU64,
+    /// Which canary touches become findings (#81).
+    canary: canary::CanaryGate,
     /// The ransomware reflex's trigger (#82): a process that raised the burst rule and
     /// touched a canary inside one window. See [`crate::ransomware_join`].
     ransomware_join: Mutex<crate::ransomware_join::RansomwareJoin>,
@@ -181,83 +159,11 @@ const MEMFD_EXEC_TECHNIQUE: &str = "T1620";
 /// damage manifest of the process's recent renames and deletions (#82).
 const RANSOMWARE_TECHNIQUE: &str = "T1486";
 
-/// The ATT&CK technique a canary hit reports: someone looked through files nothing
-/// legitimate reads (T1083 file and directory discovery). The rule id names the provenance.
-const CANARY_TECHNIQUE: &str = "T1083";
-
-/// `(canary path, pid, process incarnation)`: the incarnation, when the sensor stamps one,
-/// keeps a process that reuses the pid inside the cooldown from being absorbed as its
-/// predecessor.
-type CanaryKey = (PathBuf, u32, Option<u64>);
-
-/// Open flags that mean write intent on Linux (`O_WRONLY | O_RDWR | O_CREAT`), the same
-/// mask the YARA trigger uses. On a platform whose flags mean something else the mask can
-/// only let more opens through, never absorb more.
-const WRITE_INTENT_FLAGS: u32 = 0o103;
-
-/// Whether a repeat of this touch may be absorbed by the cooldown. Only a read open may: a
-/// delete, a rename or a write-intent open is the destructive touch an encryptor makes after
-/// reading, and absorbing it behind the first open would hide the one finding an analyst
-/// needs. Those always raise a detection (bounded by the number of canaries).
-fn absorbable(touch: &deception::Touch) -> bool {
-    matches!(touch, deception::Touch::Open { flags } if flags & WRITE_INTENT_FLAGS == 0)
-}
-
-/// How long one process's repeat touches of one canary are absorbed after a detection.
-const CANARY_COOLDOWN_NS: u64 = 60 * 1_000_000_000;
-
-/// How long (event time) a canary touch by a process whose `Exec` the sink has not recorded
-/// waits for it before it is judged on what is known. The sensor stamps an `exec` before the
-/// open that follows it, but the merged stream can deliver the open first: on the lab VM the
-/// open of a cron-started `tar` came about 80 events before its own `exec`, and the process had
-/// already exited, so `/proc` said nothing and the allow list refused it (#81). Half a second
-/// is far longer than that lag and short for a detection that is not corroborated by anything.
-const CANARY_EXEC_HOLD_NS: u64 = 500_000_000;
-
-/// Most touches held at once. A host with an allow list under an open flood must not grow
-/// this without bound, and a flood must not be a way to delay findings: past the bound a
-/// touch is judged at once, as it was before the hold existed.
-const MAX_HELD_CANARY_TOUCHES: usize = 256;
-
-/// Most `(canary, pid)` pairs the cooldown remembers; the oldest are evicted first, which
-/// at worst lets one more detection through.
-const CANARY_COOLDOWN_KEYS: usize = 1024;
-
 /// The reason the audit line gives when the ransomware reflex kills (#82). A trigger of its
 /// own, never severity or the Bayes gate: it needs both the burst rule and a canary touch
 /// from the same process (`crate::ransomware_join`).
 const RANSOMWARE_REFLEX_REASON: &str =
     "a corroborated ransomware signal (burst rule + canary touch)";
-
-/// `DetectionSource::Rule` id of a canary hit. `DetectionSource` is part of the
-/// semi-frozen schema, so deception provenance rides in the rule id until a dedicated
-/// variant is decided (#81).
-const CANARY_RULE_ID: &str = "DECEPTION-CANARY";
-
-/// What the allow list makes of a canary touch.
-enum CanaryVerdict {
-    /// The toucher runs an allowed executable.
-    Allowed,
-    /// Not allowed by what the sink knows, and `/proc` names no executable (the process already
-    /// exited): an `Exec` may still be on its way, either the first (none recorded) or the last of
-    /// several. A process `/proc` shows running something else is not unknown, it is not allowed:
-    /// `/proc` is read after the touch, so it shows the image the touch was made by or a later one.
-    Unknown,
-    /// Not allowed, and nothing more to wait for.
-    Raise,
-}
-
-/// A canary touch waiting for the `Exec` of its process (#81).
-struct HeldTouch {
-    event: Event,
-    /// Event time of the touch, ns: the hold runs from it, and only an `exec` at or before it
-    /// can excuse the touch.
-    since_ns: u64,
-    /// The latest image of this incarnation exec'd at or before the touch, as far as the sink has
-    /// seen one. The final verdict is taken on it, not on the table's newest entry, which a
-    /// later `exec` (one the touch cannot have been made by) may have replaced.
-    image: Option<crate::deception::ExecImage>,
-}
 
 /// Most renames and deletions a ransomware detection carries beyond its triggering event.
 /// A bound on the size of one detection: the correlator window is 60 s, and a fast
@@ -586,15 +492,7 @@ impl DetectionSink {
             response,
             verdict,
             content_root,
-            tripwires: std::sync::OnceLock::new(),
-            canary_allow: std::sync::OnceLock::new(),
-            exec_images: Mutex::new(crate::deception::ExecImages::new()),
-            held_canary: Mutex::new(VecDeque::new()),
-            held_canary_len: AtomicUsize::new(0),
-            canary_last_hit: Mutex::new(store::BoundedMap::new(CANARY_COOLDOWN_KEYS)),
-            canary_hits_absorbed: AtomicU64::new(0),
-            canary_hold_overflow: AtomicU64::new(0),
-            canary_hold_expired: AtomicU64::new(0),
+            canary: canary::CanaryGate::new(),
             ransomware_join: Mutex::new(crate::ransomware_join::RansomwareJoin::new()),
         })
     }
@@ -795,7 +693,7 @@ impl DetectionSink {
     /// Installs the planted canaries (#81). Called once, before the sensor starts; a second
     /// call is ignored.
     pub(crate) fn set_tripwires(&self, tripwires: deception::Tripwires) {
-        let _ = self.tripwires.set(tripwires);
+        self.canary.set_tripwires(tripwires);
     }
 
     /// Tells the rules the host's UTC offset in minutes (<https://github.com/synthaea-lab/agent/issues/17>); false when it is not a real one.
@@ -827,256 +725,36 @@ impl DetectionSink {
     /// Installs the executables allowed to touch a canary (#81). Called once, with the
     /// tripwires.
     pub(crate) fn set_canary_allow(&self, allow: crate::deception::CanaryAllow) {
-        let _ = self.canary_allow.set(allow);
+        self.canary.set_allow(allow);
     }
 
-    /// A touch of a planted canary by any process but the agent itself is a detection:
-    /// nothing legitimate reads these files. The agent's own pid is skipped because it
-    /// writes them at start and verifies them later.
-    ///
-    /// When the process is unknown (no `Exec` recorded for this incarnation) and an
-    /// executable is allowed, the decision waits up to [`CANARY_EXEC_HOLD_NS`] for its `Exec`
-    /// ([`Self::hold_canary`]): the stream can deliver the open before the exec it follows.
-    fn detect_canary(&self, event: &Event) {
-        let Some(tripwires) = self.tripwires.get() else {
-            return;
-        };
-        let Some(hit) = tripwires.matches(event) else {
-            return;
-        };
-        if hit.pid == std::process::id() {
-            return;
-        }
-        let seen = self.image_before(hit.pid, event);
-        match self.canary_verdict(hit.pid, seen.as_ref()) {
-            CanaryVerdict::Allowed => {
-                tracing::debug!(
-                    pid = hit.pid,
-                    "deception: canary touch by an allowed executable"
-                );
-                return;
-            }
-            CanaryVerdict::Unknown if self.hold_canary(event, seen) => return,
-            CanaryVerdict::Unknown | CanaryVerdict::Raise => {}
-        }
-        self.raise_canary(event, false);
-    }
-
-    /// The image the table holds for the process that made `event`, when it exec'd at or before
-    /// the touch: a later `exec` of the same process (an allowed `tar` run after an open by
-    /// something else) must not excuse a touch it did not make.
-    fn image_before(&self, pid: u32, event: &Event) -> Option<crate::deception::ExecImage> {
-        let meta = event.meta();
-        // Cloned out so the lock is not held across the `/proc` fallback inside `allows`:
-        // `detect_exec` takes it for every exec event.
-        self.exec_images.lock_recovering().image_of_not_after(
-            pid,
-            meta.process_generation,
-            meta.timestamp_ns,
-        )
-    }
-
-    /// What the allow list says about the process `pid`, given the image it was seen to exec.
-    fn canary_verdict(
-        &self,
-        pid: u32,
-        seen: Option<&crate::deception::ExecImage>,
-    ) -> CanaryVerdict {
-        let Some(allow) = self.canary_allow.get() else {
-            return CanaryVerdict::Raise;
-        };
-        if allow.allows(pid, seen) {
-            CanaryVerdict::Allowed
-        } else if !allow.is_empty()
-            && !allow.refuses_outright(pid, seen)
-            && !allow.proc_names_an_exe(pid)
-        {
-            CanaryVerdict::Unknown
-        } else {
-            CanaryVerdict::Raise
-        }
-    }
-
-    /// Holds `event` until the hold runs out, for the `Exec` of its process to be recorded.
-    /// False when the queue is full: the caller then judges the touch at once, and the
-    /// overflow is counted (it brings the false positive back without a trace otherwise).
-    fn hold_canary(&self, event: &Event, image: Option<crate::deception::ExecImage>) -> bool {
-        let mut held = self.held_canary.lock_recovering();
-        if held.len() >= MAX_HELD_CANARY_TOUCHES {
-            let overflowed = self.canary_hold_overflow.fetch_add(1, Ordering::Relaxed) + 1;
-            if overflowed.is_power_of_two() {
-                tracing::warn!(
-                    overflowed_total = overflowed,
-                    "deception: canary hold queue full, touch judged without waiting for its exec"
-                );
-            }
-            return false;
-        }
-        held.push_back(HeldTouch {
-            event: event.clone(),
-            since_ns: event.meta().timestamp_ns,
-            image,
-        });
-        self.held_canary_len.store(held.len(), Ordering::Relaxed);
-        true
-    }
-
-    /// Records, on the held touches of the incarnation that has just exec'd, the image of this
-    /// exec when it happened at or before the touch (the latest such one wins: a process may exec
-    /// more than once, `bash -c "tar ..."` is `bash`, then `tar` in one pid). An exec after the
-    /// touch says nothing about who made it and is ignored. The decision itself is taken when
-    /// the hold ends ([`Self::judge_held`]).
-    ///
-    /// An exec without a generation never counts: a pid reused within the hold would match the
-    /// touch of its previous life.
-    fn record_exec_on_held(&self, exec: &schema::ExecEvent) {
-        let generation = exec.meta.process_generation;
-        if generation.is_none() || self.held_canary_len.load(Ordering::Relaxed) == 0 {
-            return;
-        }
-        let image = crate::deception::ExecImage::from_exec(exec);
-        let mut held = self.held_canary.lock_recovering();
-        for touch in held.iter_mut() {
-            let meta = touch.event.meta();
-            if meta.pid == exec.meta.pid
-                && meta.process_generation == generation
-                && image.precedes(touch.since_ns)
-                && touch
-                    .image
-                    .as_ref()
-                    .is_none_or(|previous| previous.precedes(image.timestamp_ns()))
-            {
-                touch.image = Some(image.clone());
-            }
-        }
-    }
-
-    /// Judges the held touches older than the hold, at event time `now_ns`.
-    fn expire_held_canary(&self, now_ns: u64) {
-        if self.held_canary_len.load(Ordering::Relaxed) == 0 {
-            return;
-        }
-        let due =
-            self.take_held(|held| now_ns.saturating_sub(held.since_ns) >= CANARY_EXEC_HOLD_NS);
-        self.judge_held(due);
-    }
-
-    /// Removes and returns the held touches `pick` selects, oldest first.
-    fn take_held(&self, pick: impl Fn(&HeldTouch) -> bool) -> Vec<HeldTouch> {
-        let mut held = self.held_canary.lock_recovering();
-        let mut taken = Vec::new();
-        let mut kept = VecDeque::new();
-        for touch in held.drain(..) {
-            if pick(&touch) {
-                taken.push(touch);
-            } else {
-                kept.push_back(touch);
-            }
-        }
-        *held = kept;
-        self.held_canary_len.store(held.len(), Ordering::Relaxed);
-        taken
-    }
-
-    /// The final decision on touches that waited: allowed ones are dropped, every other is
-    /// raised (and counted as expired), whether its exec arrived or not.
-    fn judge_held(&self, touches: Vec<HeldTouch>) {
-        for held in touches {
-            let pid = held.event.meta().pid;
-            if matches!(
-                self.canary_verdict(pid, held.image.as_ref()),
-                CanaryVerdict::Allowed
-            ) {
-                tracing::debug!(pid, "deception: held canary touch by an allowed executable");
-                continue;
-            }
-            let expired = self.canary_hold_expired.fetch_add(1, Ordering::Relaxed) + 1;
-            if expired.is_power_of_two() {
-                tracing::info!(
-                    expired_total = expired,
-                    "deception: held canary touch raised, no allowed exec before it"
-                );
-            }
-            self.raise_canary(&held.event, true);
-        }
-    }
-
-    /// Records the detection for a canary touch that no allow-list entry excuses, and the
-    /// ransomware reflex when the same process also burst.
-    ///
-    /// `late` is a touch that waited out the hold. The ransomware reflex does not kill from it:
-    /// `/proc` named nothing for the process when it was held, so by now it is gone or its pid
-    /// is someone else's, and the reflex kills by pid.
-    fn raise_canary(&self, event: &Event, late: bool) {
-        let Some(tripwires) = self.tripwires.get() else {
-            return;
-        };
-        let Some(hit) = tripwires.matches(event) else {
-            return;
-        };
-        let meta = event.meta();
+    /// Records a canary touch the gate did not excuse, and runs the ransomware join on it: the
+    /// reflex kills when the same process also burst, unless the touch was judged late.
+    fn record_canary_touch(&self, touch: canary::CanaryTouch<'_>) {
+        let meta = touch.event.meta();
         let corroborated = self.ransomware_join.lock_recovering().note_canary(
-            hit.pid,
+            touch.pid,
             meta.process_generation,
             meta.timestamp_ns,
         );
-        if absorbable(&hit.touch)
-            && self.canary_in_cooldown(
-                (hit.canary.path.clone(), hit.pid, meta.process_generation),
-                meta.timestamp_ns,
-            )
-        {
-            let absorbed = self.canary_hits_absorbed.fetch_add(1, Ordering::Relaxed) + 1;
-            tracing::debug!(
-                pid = hit.pid,
-                absorbed,
-                "deception: repeat canary touch absorbed"
-            );
+        let raised = match &touch.outcome {
+            canary::TouchOutcome::Raise { message } => {
+                let entity = entity_key(meta);
+                self.record(Finding::canary(&entity, message), &touch.event, Vec::new());
+                true
+            }
             // The finding was raised by the touch that started the cooldown; the reflex
             // does not wait for a new one.
-            if corroborated && !late {
-                self.ransomware_reflex(hit.pid);
-            }
-            return;
-        }
-        let message = format!(
-            "canary file touched: {} ({:?}) by pid {} ({})",
-            hit.canary.path.display(),
-            hit.touch,
-            hit.pid,
-            meta.comm
-        );
-        let finding = Finding {
-            entity: &entity_key(meta),
-            technique: CANARY_TECHNIQUE,
-            message: &message,
-            source: schema::detection::DetectionSource::Rule {
-                rule_id: CANARY_RULE_ID.to_string(),
-            },
-            severity: schema::detection::Severity::High,
+            canary::TouchOutcome::Absorbed => false,
         };
-        self.record(finding, event, Vec::new());
-        if corroborated && !late {
-            self.ransomware_reflex(hit.pid);
-        } else if corroborated {
+        if corroborated && !touch.late {
+            self.ransomware_reflex(touch.pid);
+        } else if corroborated && raised {
             tracing::info!(
-                pid = hit.pid,
+                pid = touch.pid,
                 "deception: ransomware reflex skipped for a canary touch judged after the hold"
             );
         }
-    }
-
-    /// True when `key` already raised a detection within the cooldown; otherwise records
-    /// this touch as the one that did.
-    fn canary_in_cooldown(&self, key: CanaryKey, now_ns: u64) -> bool {
-        let mut last = self.canary_last_hit.lock_recovering();
-        if let Some(&at) = last.peek(&key)
-            && now_ns.saturating_sub(at) < CANARY_COOLDOWN_NS
-        {
-            return true;
-        }
-        last.insert(key, now_ns);
-        false
     }
 
     /// An IOC match found on the capture thread (a connect's destination, #60).
@@ -1273,16 +951,7 @@ impl DetectionSink {
     /// Exec events: stateless rules, stateful rules, then Sigma.
     fn detect_exec(&self, wrapped: &Event, event: &schema::ExecEvent) {
         self.own_traffic.record_exec(event);
-        // The table is read only when an executable may be allowed: recording every exec of a
-        // host that allows none would take a lock and clone a path for nothing.
-        if self
-            .canary_allow
-            .get()
-            .is_some_and(|allow| !allow.is_empty())
-        {
-            self.exec_images.lock_recovering().record(event);
-            self.record_exec_on_held(event);
-        }
+        self.canary.on_exec(event);
         self.record_rule_alerts(wrapped, rules::evaluate_exec(event));
         self.record_rule_alerts(wrapped, self.rule_state.lock_recovering().on_exec(event));
         // This exec moved the stream clock: identity requests waiting for it may be due (#1041).
@@ -2173,44 +1842,14 @@ fn quarantine_matched_payload(
     alert_log.record("RESPONSE-QUARANTINE", message);
 }
 
-impl Drop for DetectionSink {
-    /// Touches still held when the sink goes away are not judged (the hold runs on event time and
-    /// nothing flushes it); say how many, so the loss is not silent.
-    fn drop(&mut self) {
-        let held = self
-            .held_canary
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len();
-        if held > 0 {
-            tracing::warn!(
-                held,
-                "deception: canary touches still held at shutdown are not reported"
-            );
-        }
-    }
-}
-
 impl EventSink for DetectionSink {
     fn on_event(&self, event: Event) {
         // Detection runs in memory on the capture thread — no engine needs the hash
         // or signature synchronously (issue #126).
         self.correlate(&event);
-        // The hold runs on the clock of the stream that carries both the exec and the touch. The
-        // netlink poller, uprobes and log sources call this from their own threads with their own
-        // clocks: letting them expire the hold would end it before the exec had a chance to come.
-        if matches!(
-            event,
-            Event::Exec(_)
-                | Event::FileOpen(_)
-                | Event::FileDelete(_)
-                | Event::FileRename(_)
-                | Event::FileSetTime(_)
-                | Event::RawVolumeOpen(_)
-        ) {
-            self.expire_held_canary(event.meta().timestamp_ns);
+        for touch in self.canary.on_event(&event) {
+            self.record_canary_touch(touch);
         }
-        self.detect_canary(&event);
         match &event {
             Event::Exec(e) => self.detect_exec(&event, e),
             Event::FileOpen(e) => self.detect_file_open(&event, e),

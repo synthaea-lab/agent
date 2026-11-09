@@ -33,6 +33,19 @@ impl<'a> Finding<'a> {
         }
     }
 
+    /// A canary touch the deception gate did not excuse (#81).
+    pub(super) fn canary(entity: &'a verdict::EntityKey, message: &'a str) -> Self {
+        Self {
+            entity,
+            technique: super::canary::CANARY_TECHNIQUE,
+            message,
+            source: schema::detection::DetectionSource::Rule {
+                rule_id: super::canary::CANARY_RULE_ID.to_string(),
+            },
+            severity: schema::detection::Severity::High,
+        }
+    }
+
     /// An IOC match (#60); `message` is `hit.message(comm)`.
     pub(super) fn ioc(
         entity: &'a verdict::EntityKey,
