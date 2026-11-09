@@ -41,15 +41,18 @@ const PROCESS_VM_LIOVCNT_OFFSET: usize = 32;
 const PROCESS_VM_REMOTE_IOV_OFFSET: usize = 40;
 #[cfg(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64"))]
 const PROCESS_VM_RIOVCNT_OFFSET: usize = 48;
-/// i686: inferred, not independently verified (see `sys_enter_open`'s i686 note).
+/// i686: argument `i` at `12 + 4*i`, the `sys_enter_openat` i686 layout (8-byte
+/// `trace_entry`, 4-byte `__syscall_nr`, then 4-byte `unsigned long` arguments). Derived,
+/// not read from an i686 kernel; the first version started at 16 and read every argument
+/// one slot late. `tools/check-ebpf-offsets.py` holds every pair to this rule.
 #[cfg(bpf_target_arch = "x86")]
-const PROCESS_VM_PID_OFFSET: usize = 16;
+const PROCESS_VM_PID_OFFSET: usize = 12;
 #[cfg(bpf_target_arch = "x86")]
-const PROCESS_VM_LIOVCNT_OFFSET: usize = 24;
+const PROCESS_VM_LIOVCNT_OFFSET: usize = 20;
 #[cfg(bpf_target_arch = "x86")]
-const PROCESS_VM_REMOTE_IOV_OFFSET: usize = 28;
+const PROCESS_VM_REMOTE_IOV_OFFSET: usize = 24;
 #[cfg(bpf_target_arch = "x86")]
-const PROCESS_VM_RIOVCNT_OFFSET: usize = 32;
+const PROCESS_VM_RIOVCNT_OFFSET: usize = 28;
 
 /// Reads `iovec[0].iov_len` from a user-space `struct iovec *`. On `x86_64/aarch64`
 /// `iov_base` (a pointer, unread here) occupies the first 8 bytes and `iov_len`
