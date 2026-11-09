@@ -19,7 +19,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "aya",
@@ -31,7 +31,7 @@ dependencies = [
  "enrich",
  "getrandom 0.4.3",
  "intel",
- "inventory 0.0.0",
+ "inventory 0.0.1",
  "ipc",
  "libc",
  "ml",
@@ -604,7 +604,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cli"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -631,7 +631,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "config"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "serde",
  "tempfile",
@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "conformance"
-version = "0.0.0"
+version = "0.0.1"
 
 [[package]]
 name = "const-oid"
@@ -686,7 +686,7 @@ checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
 
 [[package]]
 name = "correlator"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "policy",
  "proptest",
@@ -1002,7 +1002,7 @@ dependencies = [
 
 [[package]]
 name = "deception"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "schema",
  "serde",
@@ -1020,7 +1020,7 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
 name = "device-control"
-version = "0.0.0"
+version = "0.0.1"
 
 [[package]]
 name = "digest"
@@ -1118,7 +1118,7 @@ dependencies = [
 
 [[package]]
 name = "enrich"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "schema",
  "sha2 0.11.1",
@@ -1608,7 +1608,7 @@ checksum = "8eca9188c1b20836bb561bc09bb2f54e9ca99b271031b5f3ff183a00c08c98c8"
 
 [[package]]
 name = "intel"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "proptest",
  "siblings",
@@ -1617,7 +1617,7 @@ dependencies = [
 
 [[package]]
 name = "inventory"
-version = "0.0.0"
+version = "0.0.1"
 
 [[package]]
 name = "inventory"
@@ -1630,7 +1630,7 @@ dependencies = [
 
 [[package]]
 name = "ipc"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1833,7 +1833,7 @@ dependencies = [
 
 [[package]]
 name = "mesh"
-version = "0.0.0"
+version = "0.0.1"
 
 [[package]]
 name = "miniz_oxide"
@@ -1858,7 +1858,7 @@ dependencies = [
 
 [[package]]
 name = "ml"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "correlator",
  "ort",
@@ -2123,7 +2123,7 @@ dependencies = [
 
 [[package]]
 name = "policy"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "ring",
  "serde",
@@ -2341,7 +2341,7 @@ dependencies = [
 
 [[package]]
 name = "redact"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "proptest",
 ]
@@ -2392,7 +2392,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "release-tool"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2405,7 +2405,7 @@ dependencies = [
 
 [[package]]
 name = "response"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "libc",
  "policy",
@@ -2446,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "rules"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "policy",
  "proptest",
@@ -2560,7 +2560,7 @@ dependencies = [
 
 [[package]]
 name = "schema"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2613,7 +2613,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-linux"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "aya",
@@ -2634,7 +2634,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-linux-audit"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "libc",
  "schema",
@@ -2645,7 +2645,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-linux-container"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "schema",
  "serde",
@@ -2656,7 +2656,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-linux-ebpf"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "aya-ebpf",
  "aya-log-ebpf",
@@ -2665,7 +2665,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-linux-journal"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "schema",
  "serde",
@@ -2675,7 +2675,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-linux-logs"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "schema",
  "serde_json",
@@ -2685,7 +2685,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-linux-lsm"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "aya",
  "aya-obj",
@@ -2694,7 +2694,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-linux-netlink"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "libc",
  "schema",
@@ -2703,7 +2703,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-linux-procmem"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "libc",
  "tempfile",
@@ -2712,7 +2712,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-linux-uprobes"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "aya",
@@ -2734,7 +2734,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-linux-wire"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "libc",
  "tracing",
@@ -2742,7 +2742,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-macos"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cc",
  "plist",
@@ -2753,7 +2753,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-macos-network-extension"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "schema",
  "serde",
@@ -2764,7 +2764,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-macos-sockets"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cc",
  "schema",
@@ -2774,7 +2774,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-macos-unifiedlog"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "schema",
  "serde",
@@ -2785,7 +2785,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-windows"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "ferrisetw",
  "proptest",
@@ -2798,7 +2798,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-windows-eventlog"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "proptest",
  "schema",
@@ -2812,7 +2812,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-windows-minifilter"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "proptest",
  "schema",
@@ -2823,7 +2823,7 @@ dependencies = [
 
 [[package]]
 name = "sensor-windows-sockets"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "schema",
  "thiserror 2.0.21",
@@ -2938,11 +2938,11 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "siblings"
-version = "0.0.0"
+version = "0.0.1"
 
 [[package]]
 name = "sigma"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "proptest",
  "schema",
@@ -2989,7 +2989,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "sinks"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "schema",
  "serde",
@@ -3029,7 +3029,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "store"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "schema",
  "serde",
@@ -3096,7 +3096,7 @@ dependencies = [
 
 [[package]]
 name = "tamper"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "schema",
  "sha2 0.11.1",
@@ -3372,7 +3372,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "rustls",
  "schema",
@@ -3423,7 +3423,7 @@ checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
 
 [[package]]
 name = "updater"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "ring",
  "rustix",
@@ -3505,7 +3505,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "verdict"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "schema",
  "store",
@@ -3849,7 +3849,7 @@ dependencies = [
 
 [[package]]
 name = "watchdog"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -4075,7 +4075,7 @@ dependencies = [
 
 [[package]]
 name = "yara"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "libc",
  "schema",
