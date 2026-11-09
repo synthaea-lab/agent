@@ -27,7 +27,8 @@ use super::{
 use crate::{
     AF_INET, AF_INET6,
     file::write_delete_rename::{WRITE_BUF_OFFSET, WRITE_COUNT_OFFSET, WRITE_FD_OFFSET},
-    fill_lineage, is_agent_own_pid,
+    fill_lineage,
+    mount_signal::signal::is_agent_own_pid,
 };
 
 /// Ring buffer shared with userspace for DNS query datagrams.

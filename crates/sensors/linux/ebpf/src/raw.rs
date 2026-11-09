@@ -29,7 +29,6 @@ use crate::{
         namespace::{sys_enter_setns, sys_enter_unshare},
         prctl::sys_enter_prctl,
     },
-    emit_tool_signal_event,
     file::{
         chmod_chown::{
             sys_enter_chmod, sys_enter_chown, sys_enter_fchmodat, sys_enter_fchownat,
@@ -46,6 +45,10 @@ use crate::{
         bpf::sys_enter_bpf,
         module::{sys_enter_delete_module, sys_enter_finit_module, sys_enter_init_module},
     },
+    mount_signal::{
+        mount::{sys_enter_mount, sys_enter_umount},
+        signal::{emit_tool_signal_event, sys_enter_kill, sys_enter_tgkill, watched_tool_sigcgt},
+    },
     net::{
         accept::{sys_enter_accept, sys_enter_accept4, sys_exit_accept, sys_exit_accept4},
         bind::sys_enter_bind,
@@ -61,7 +64,6 @@ use crate::{
         process_vm::{sys_enter_process_vm_readv, sys_enter_process_vm_writev},
         ptrace::sys_enter_ptrace,
     },
-    sys_enter_kill, sys_enter_mount, sys_enter_tgkill, sys_enter_umount, watched_tool_sigcgt,
 };
 
 const MAX_SYSCALL_ID: u32 = 1024;
