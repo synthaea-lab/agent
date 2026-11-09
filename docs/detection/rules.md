@@ -79,7 +79,10 @@ concern. Each field is a [`store::BoundedMap`](../../crates/store/src/bounded.rs
 dedicated type. The struct's field docs say which rule reads each table. A family that has been
 split out keeps its tables in its own type, held by `RuleState` as one field: the network rules
 (`beacon`, `beacon_flow_dedup`, `scan_*`, `egress_*`, `dns_class`, `archive_*`, `staged_archives`)
-live in [`NetworkState`](../../crates/rules/src/network_state.rs). The main families:
+live in [`NetworkState`](../../crates/rules/src/network_state.rs), and the file-impact rules
+(`ransomware_*`, `recent_creates`, `pending_unlinks`, `write_volume`, `rename_count`,
+`touched_files`, `set_time_alerted`) in [`ImpactState`](../../crates/rules/src/impact_state.rs).
+The main families:
 
 | Family | Fields (examples) | Key | Feeds |
 | --- | --- | --- | --- |
