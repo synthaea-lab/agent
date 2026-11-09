@@ -120,8 +120,9 @@ the cost of the local logs' forensic value.
 Build: `cargo build --release --no-default-features --features agent/dynamic-onnx -p agent -p watchdog`
 then [`build.ps1`](../packaging/windows/build.ps1), which refuses binaries carrying the test-key
 marker. There is no binary self-update on Windows yet
-([#60](https://github.com/synthaea-lab/agent/issues/60)), and the MSI and binaries are unsigned
-([#55](https://github.com/synthaea-lab/agent/issues/55)).
+([#60](https://github.com/synthaea-lab/agent/issues/60)). The release signs `agent.exe` with
+Authenticode when the Azure Trusted Signing secrets are set ([Signing](release.md#signing)); the MSI
+is not built in CI yet ([#55](https://github.com/synthaea-lab/agent/issues/55)).
 
 [`windows-static-agent.yml`](../.github/workflows/windows-static-agent.yml) builds ONNX Runtime from
 source (cached by build-script hash), links the agent statically, and fails if
@@ -160,27 +161,30 @@ Feature unification is how the key would sneak back in (any crate in the build a
 
 ## Release workflow
 
-[`release.yml`](../.github/workflows/release.yml) runs on a pushed `vX.Y.Z[-suffix]` tag or by hand
-for an existing tag; it never creates a tag. A tag with a `-` suffix becomes a pre-release.
+Releases are cut by merging the release PR that release-please keeps open; the tag it creates
+starts [`release.yml`](../.github/workflows/release.yml). [Releasing](release.md) covers the whole
+flow, the signing secrets and the unsigned-alpha rule; this section covers only how the release
+reuses the packaging jobs above.
 
 ```mermaid
 flowchart LR
-  T[tag v*] --> M[meta: validate tag,<br/>compare with package versions]
-  M --> G[test-key-guard]
-  M --> D[linux-deb] & A[linux-apk] & W[windows] & X[macos]
-  G & D & A & W & X --> P[publish: stage files, re-scan for test key,<br/>SHA256SUMS, optional GPG, GitHub release]
+  T[tag v*] --> M[meta: validate tag,<br/>match package versions]
+  M --> G[test-key-guard] & D[linux-deb] & A[linux-apk] & W[windows] & X[macos] & S[sbom] & SP[signing-policy]
+  W & SP --> SW[sign-windows]
+  X & SP --> SM[sign-macos]
+  G & D & A & SW & SM & S --> P[publish: re-scan for test key,<br/>SHA256SUMS, GPG, attestations, release]
+  P --> DI[distribute]
 ```
 
 - The four packaging workflows are reused through `workflow_call` with `upload-artifact: true`, so
   the release builds exactly what guards `main`.
-- `meta` warns (does not fail) when the tag differs from the version in `apps/agent/Cargo.toml` or
-  `APKBUILD`; package file names carry the package version, bare binaries carry the tag.
+- `meta` fails when the tag differs from the workspace version in `Cargo.toml`, `APKBUILD` or the
+  rpm spec; the release PR moves all of them together.
+- The signing jobs replace the Windows executable and the macOS tarball with signed copies when
+  their platform's secrets exist; otherwise the unsigned build output ships, as an alpha
+  pre-release.
 - `publish` re-scans every binary it is about to publish (extracted from the `.deb`, `.apk` and
-  macOS tarball, plus the `.exe`), so a mix-up between jobs cannot ship the test key.
-- `SHA256SUMS` covers every file. If the `release` environment holds `RELEASE_GPG_PRIVATE_KEY`
-  (and optionally `RELEASE_GPG_PASSPHRASE`), a detached `SHA256SUMS.asc` and the public key are
-  published; otherwise the release is still published with an "UNSIGNED BUILD" banner. Required
-  reviewers on that environment put a second person in front of every publish.
+  macOS tarball, plus the `.exe`), after signing, so a mix-up between jobs cannot ship the test key.
 - The workflow signs **no** updater or content manifest: those are signed offline from hardware
   tokens with [`release-tool`](updates-and-releases.md#building-and-signing-releases-release-tool).
 

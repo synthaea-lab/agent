@@ -32,12 +32,16 @@
   correctly for InstallService/UninstallService.
 -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <!-- The release PR bumps Version with the workspace version (release-please-config.json):
+       X.Y.Z.0, the fourth field stays 0. -->
+  <!-- x-release-please-start-version -->
   <Product Id="*"
            Name="Synthaea Agent"
            Language="1033"
-           Version="0.1.0.0"
+           Version="0.0.0.0"
            Manufacturer="Synthaea"
            UpgradeCode="D79BAF8F-91AC-4018-8274-297161F7F57F">
+  <!-- x-release-please-end -->
     <!--
       UpgradeCode must never change across versions (it is what ties future
       releases together for MajorUpgrade below) - Product/Id="*" (a fresh GUID

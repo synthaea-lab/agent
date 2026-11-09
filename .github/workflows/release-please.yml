@@ -1,0 +1,126 @@
+name: Release PR
+
+# release-please keeps one release PR open against main (docs/release.md). It reads the
+# Conventional Commits merged since the last release, proposes the next version, and writes
+# CHANGELOG.md, the workspace version in Cargo.toml and the packaging files listed in
+# release-please-config.json. Merging that PR is how a release is cut: on the next run
+# release-please creates the tag and a draft GitHub release, and the release workflow
+# (release.yml) builds, signs when it can, and publishes.
+#
+# While the version is 0.0.x the config keeps every bump a patch bump (0.0.1, 0.0.2, ...);
+# leaving 0.0.x is a deliberate decision, and release.yml refuses it until every platform's
+# signing secrets are set.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# release-please force-pushes its branch and edits one PR: two runs at once would race.
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # release branch, CHANGELOG commit, tag and draft release
+      pull-requests: write # open and update the release PR
+      issues: write # the `autorelease: pending` / `tagged` labels go through the issues API
+    outputs:
+      release-created: ${{ steps.rp.outputs.release_created }}
+      tag: ${{ steps.rp.outputs.tag_name }}
+      pr-branch: ${{ steps.rp.outputs.pr && fromJSON(steps.rp.outputs.pr).headBranchName || '' }}
+    steps:
+      # With the release app configured, the release PR and the tag are made by the app, so
+      # they trigger workflows: CI runs on the release PR, and the tag push starts
+      # release.yml. Without it, GITHUB_TOKEN does the same work but triggers nothing, so CI
+      # does not run on the release PR and the `release` job below calls release.yml itself.
+      - name: Mint a release app token
+        id: app
+        if: vars.RELEASE_APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: rp
+        with:
+          token: ${{ steps.app.outputs.token || github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # release-please bumps [workspace.package] version in Cargo.toml but cannot regenerate
+  # Cargo.lock, which records every workspace crate's version; the package builds run with
+  # --locked and would refuse the stale lock. `cargo update --workspace` rewrites the
+  # workspace entries only (no dependency moves) and the result is pushed onto the release
+  # branch. It reruns every time release-please rewrites that branch.
+  lockfile:
+    needs: release-please
+    if: needs.release-please.outputs.pr-branch != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # push the Cargo.lock commit to the release branch
+    steps:
+      - name: Mint a release app token
+        id: app
+        if: vars.RELEASE_APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      # Credentials persist on purpose: this job pushes. It runs only on main, on code that
+      # is already merged, and executes nothing from the release branch but cargo's resolver.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-please.outputs.pr-branch }}
+          token: ${{ steps.app.outputs.token || github.token }}
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+
+      - name: Refresh the workspace entries of Cargo.lock
+        run: cargo update --workspace
+
+      # A bot identity: the DCO check exempts *[bot]@users.noreply.github.com authors.
+      - name: Commit and push Cargo.lock
+        env:
+          BRANCH: ${{ needs.release-please.outputs.pr-branch }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock already matches the release version"
+            exit 0
+          fi
+          git diff --stat -- Cargo.lock
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -s -m "chore: refresh Cargo.lock for the release version" -- Cargo.lock
+          git push origin "HEAD:refs/heads/$BRANCH"
+
+  # Only without the release app: a tag created with GITHUB_TOKEN starts no workflow, so the
+  # release workflow is called directly. With the app, the tag push starts it instead (and
+  # calling it here as well would build the release twice).
+  release:
+    needs: release-please
+    if: needs.release-please.outputs.release-created == 'true' && vars.RELEASE_APP_CLIENT_ID == ''
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.release-please.outputs.tag }}
+    secrets: inherit

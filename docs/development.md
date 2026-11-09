@@ -112,7 +112,9 @@ Other workflows:
 | [`fuzz.yml`](../.github/workflows/fuzz.yml) | twice a week; 30 s smoke when the fuzz setup changes | coverage-guided fuzzing resuming from a cached corpus; not a merge gate. |
 | [`linux-deb-portability.yml`](../.github/workflows/linux-deb-portability.yml), [`linux-apk-portability.yml`](../.github/workflows/linux-apk-portability.yml) | changes to the agent, Linux sensor, updater, packaging or toolchain | build, install and start the static packages. |
 | [`windows-static-agent.yml`](../.github/workflows/windows-static-agent.yml), [`macos-static-agent.yml`](../.github/workflows/macos-static-agent.yml) | `main`, and changes to `ml`, the ONNX Runtime scripts, the lockfile or toolchain | static ONNX Runtime link and import checks. |
-| [`release.yml`](../.github/workflows/release.yml) | `v*` tags | see [Packaging](packaging.md#release-workflow). |
+| [`release-please.yml`](../.github/workflows/release-please.yml) | `main` | keeps the release PR open; tags when it is merged. See [Releasing](release.md). |
+| [`release.yml`](../.github/workflows/release.yml) | `v*` tags, or called by `release-please.yml` | builds, signs when configured, publishes. See [Releasing](release.md). |
+| [`distribute.yml`](../.github/workflows/distribute.yml) | after a release is published | Homebrew, apt/yum and winget, each only when its variables are set. See [Releasing](release.md#distribution-channels). |
 
 ### Workspace rules CI enforces
 
