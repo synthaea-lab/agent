@@ -1,14 +1,16 @@
-//! Container attribution: cgroup id → container id (cgroupfs walk, bounded
-//! LRU cache) and container id → image/name (background Docker socket lookup,
-//! shared cache). Everything here serves [`container_context`]; the drain loop
-//! calls it per event.
+//! # sensor-linux-container
 //!
-//! Deliberately duplicated from `sensor-linux`'s module of the same name (issue
-//! #312), not shared via a crate dependency: `sensor-*` crates may depend only on
-//! `schema` (+ their own wire crate) per `tools/check-deps.py`, and this module's
-//! ~300 lines of stateful caching + Docker socket I/O don't belong in the
-//! `sensor-linux-wire` ABI crate either. Keep the two copies in sync by hand if one
-//! changes — same tradeoff already accepted for `MAX_ITEMS_PER_DRAIN` (issue #326).
+//! Container attribution shared by `sensor-linux` and `sensor-linux-uprobes`: cgroup id →
+//! container id (cgroupfs walk, bounded FIFO cache) and container id → image/name
+//! (background Docker socket lookup, shared cache). Everything here serves
+//! [`container_context`] and [`ContainerResolver`]; each sensor's drain loop calls it per
+//! event.
+//!
+//! Linux-only: on other targets the crate is empty.
+
+#![cfg(target_os = "linux")]
+
+mod docker;
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -17,9 +19,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+pub use docker::DockerContainerInfo;
 use schema::ContainerContext;
-
-use crate::docker::DockerContainerInfo;
 
 /// Extracts a container id from one `/proc/<pid>/cgroup` line's path (the part after
 /// the last `:` — format is `hierarchy-id:controller-list:path`, and cgroup v2's
@@ -122,7 +123,8 @@ const CGROUPFS_ROOT: &str = "/sys/fs/cgroup";
 /// kernel-side at syscall time is already the process's real cgroup membership at
 /// that exact instant, not a value that needs time to "settle" the way a later
 /// `/proc` read did — there is nothing here to retry.
-pub(crate) struct CgroupIdCache {
+#[derive(Default)]
+pub struct CgroupIdCache {
     entries: HashMap<u64, Option<String>>,
     order: VecDeque<u64>,
 }
@@ -134,7 +136,8 @@ pub(crate) struct CgroupIdCache {
 const CGROUP_ID_CACHE_CAP: usize = 4096;
 
 impl CgroupIdCache {
-    pub(crate) fn new() -> Self {
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
             order: VecDeque::new(),
@@ -179,7 +182,7 @@ impl CgroupIdCache {
 /// One entry in [`DockerInfoCache`]: either a lookup is already running for this
 /// container id (don't start a second one), or it finished with whatever it found
 /// (`DockerContainerInfo`'s fields are already `Option` for "asked, got nothing").
-pub(crate) enum DockerLookupState {
+pub enum DockerLookupState {
     Pending,
     Done(DockerContainerInfo),
 }
@@ -202,7 +205,7 @@ pub(crate) enum DockerLookupState {
 /// revisit if a host doing heavy container churn (a CI runner, say) ever makes
 /// this show up in profiling, same as the pid-keyed cache was itself once a
 /// deferred concern (issue #199).
-pub(crate) type DockerInfoCache = Arc<Mutex<HashMap<String, DockerLookupState>>>;
+pub type DockerInfoCache = Arc<Mutex<HashMap<String, DockerLookupState>>>;
 
 /// Resolves `cgroup_id`'s full [`ContainerContext`] (id, plus image/name if the
 /// Docker socket lookup for that id has completed): the id comes from
@@ -210,7 +213,11 @@ pub(crate) type DockerInfoCache = Arc<Mutex<HashMap<String, DockerLookupState>>>
 /// sighting this spawns a background lookup into `docker_cache` and returns the id
 /// alone for now — image/name catch up on the *next* event for the same
 /// container, not this one.
-pub(crate) fn container_context(
+///
+/// # Panics
+///
+/// If `docker_cache`'s mutex is poisoned.
+pub fn container_context(
     cgroup_id: u64,
     container_ids: &mut CgroupIdCache,
     docker_cache: &DockerInfoCache,
@@ -243,6 +250,34 @@ pub(crate) fn container_context(
         image: info.as_ref().and_then(|i| i.image.clone()),
         name: info.as_ref().and_then(|i| i.name.clone()),
     })
+}
+
+/// Container attribution for drained events (issues #80/#204): `meta.cgroup_id` resolved
+/// against cgroupfs (see `CgroupIdCache`), never `/proc`, plus the Docker details looked up
+/// in the background.
+#[derive(Default)]
+pub struct ContainerResolver {
+    container_ids: CgroupIdCache,
+    docker_cache: DockerInfoCache,
+}
+
+impl ContainerResolver {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            container_ids: CgroupIdCache::new(),
+            docker_cache: DockerInfoCache::default(),
+        }
+    }
+
+    /// The container `cgroup_id` belongs to, if any.
+    ///
+    /// # Panics
+    ///
+    /// If the Docker cache's mutex is poisoned (see [`container_context`]).
+    pub fn resolve(&mut self, cgroup_id: u64) -> Option<ContainerContext> {
+        container_context(cgroup_id, &mut self.container_ids, &self.docker_cache)
+    }
 }
 
 #[cfg(test)]

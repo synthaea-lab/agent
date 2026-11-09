@@ -40,7 +40,8 @@ and build-machine toolchain scripts live here under `packaging/toolchain/`.
   semi-frozen — changes there ripple everywhere and need explicit justification.
 - `policy` sits next to `schema` as the base tier (shared agent/server types); it
   depends only on `schema`, everything else may depend on both.
-- Sensor crates (`crates/sensors/*`) depend **only** on `schema`.
+- Sensor crates (`crates/sensors/*`) depend **only** on `schema`, plus their own
+  platform's shared crates (`sensor-linux-wire`, `sensor-linux-container`).
 - Detection crates (`rules`, `sigma`, `correlator`, `verdict`, `ml`, `yara`, `enrich`)
   depend on the base tier, each other, and `store` — **never on a sensor**.
 - Leaf crates (`response`, `transport`, `ipc`, `sinks`, `updater`, `config`, `store`,

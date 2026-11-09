@@ -18,6 +18,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+sensor-linux-container = { path = "../container" }
 aya = { version = "0.16", default-features = false }
 aya-log = { version = "0.4", default-features = false }
 libc = { version = "0.2", default-features = false }

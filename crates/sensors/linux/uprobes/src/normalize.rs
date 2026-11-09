@@ -78,7 +78,7 @@ use crate::redact;
 /// v27 (#1036) added `FileSetTimeEvent` — not imported here either (`sensor-linux`'s `normalize`).
 const _: () = assert!(wire::WIRE_VERSION == 28);
 
-/// `container` is resolved by the caller (`crate::container::container_context`,
+/// `container` is resolved by the caller (`sensor_linux_container::container_context`,
 /// issue #312) from `EventMeta::cgroup_id` against cgroupfs, with image/name filled
 /// in once the background Docker socket lookup for that container id completes —
 /// same fidelity as the main sensor's events.
@@ -441,7 +441,7 @@ mod tests {
     }
 
     /// A full [`ContainerContext`] — id, image, and name — the shape
-    /// `crate::container::container_context` produces once its background Docker
+    /// `sensor_linux_container::container_context` produces once its background Docker
     /// lookup has completed (issue #312: same fidelity as the main sensor's events,
     /// not just the id).
     fn full_container_context() -> ContainerContext {

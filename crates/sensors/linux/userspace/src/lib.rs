@@ -19,10 +19,6 @@ mod tls_client_hello;
 #[cfg(all(target_os = "linux", any(ebpf_embedded, test)))]
 mod btf;
 #[cfg(target_os = "linux")]
-mod container;
-#[cfg(target_os = "linux")]
-mod docker;
-#[cfg(target_os = "linux")]
 mod drain;
 #[cfg(target_os = "linux")]
 mod ebpf;

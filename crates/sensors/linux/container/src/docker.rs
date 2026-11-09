@@ -19,15 +19,16 @@ use tokio::{
 const DOCKER_SOCKET: &str = "/var/run/docker.sock";
 
 /// Round-trip budget: this runs on the sensor's single event-processing task
-/// (spawned off it, see `sensor.rs`), so a hung/overloaded daemon must not stall
-/// indefinitely. Local Unix socket to a daemon on the same host — a few hundred ms
-/// is already generous.
+/// (spawned off it by [`container_context`](crate::container_context)), so a
+/// hung/overloaded daemon must not stall indefinitely. Local Unix socket to a daemon on
+/// the same host — a few hundred ms is already generous.
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// What the Docker daemon reported for one container. `None` means it did not say.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct DockerContainerInfo {
-    pub(crate) image: Option<String>,
-    pub(crate) name: Option<String>,
+pub struct DockerContainerInfo {
+    pub image: Option<String>,
+    pub name: Option<String>,
 }
 
 /// Only the two fields of `/containers/<id>/json`'s (large) response this cares

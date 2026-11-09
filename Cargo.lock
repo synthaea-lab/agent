@@ -2620,6 +2620,7 @@ dependencies = [
  "aya-log",
  "libc",
  "schema",
+ "sensor-linux-container",
  "sensor-linux-wire",
  "serde",
  "serde_json",
@@ -2636,6 +2637,17 @@ dependencies = [
  "libc",
  "schema",
  "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "sensor-linux-container"
+version = "0.1.0"
+dependencies = [
+ "schema",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
@@ -2709,9 +2721,8 @@ dependencies = [
  "proptest",
  "regex",
  "schema",
+ "sensor-linux-container",
  "sensor-linux-wire",
- "serde",
- "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

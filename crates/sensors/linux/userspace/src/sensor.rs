@@ -9,12 +9,12 @@
 use std::{sync::Arc, time::Duration};
 
 use schema::sensor::{Capabilities, EventSink, Sensor, SensorError};
+use sensor_linux_container::ContainerResolver;
 use sensor_linux_wire as wire;
 use tokio::sync::Notify;
 use tracing::warn;
 
 use crate::{
-    container::ContainerResolver,
     drain::exec_record,
     ebpf::{
         DNS_UDP_PROGRAM, RAW_TRACEPOINTS, TamperSlot, attach_inode_setattr, attach_raw_tracepoint,

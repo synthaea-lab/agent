@@ -44,7 +44,7 @@ All crates live under `crates/`. Platform sensors live under `crates/sensors/<pl
 | Tier | Crates | Responsibility |
 | --- | --- | --- |
 | Base | `schema`, `policy` | `schema` holds the normalized `Event` enum, `Detection`, `HealthBeacon`, and the `Sensor`/`EventSink` contract ([`sensor.rs`](../crates/schema/src/sensor.rs)). `policy` holds the policy types shared with the control plane, such as `ResponsePolicy` and `EventLogPolicy`. |
-| Sensors | `sensor-linux` (eBPF userspace), `sensor-linux-ebpf` (kernel probes, own target), `sensor-linux-wire` (ring-buffer ABI), `sensor-linux-audit`, `-netlink`, `-journal`, `-uprobes`, `-lsm`, `-logs`, `-procmem`; `sensor-windows` (ETW), `-eventlog`, `-sockets`, `-minifilter`; `sensor-macos` (EndpointSecurity), `-unifiedlog`, `-sockets`, `-network-extension` | Turn one OS facility into `schema::Event`s. Each crate either implements `Sensor` or exposes poll/stream functions that a caller drives. |
+| Sensors | `sensor-linux` (eBPF userspace), `sensor-linux-ebpf` (kernel probes, own target), `sensor-linux-wire` (ring-buffer ABI), `sensor-linux-container` (container attribution), `sensor-linux-audit`, `-netlink`, `-journal`, `-uprobes`, `-lsm`, `-logs`, `-procmem`; `sensor-windows` (ETW), `-eventlog`, `-sockets`, `-minifilter`; `sensor-macos` (EndpointSecurity), `-unifiedlog`, `-sockets`, `-network-extension` | Turn one OS facility into `schema::Event`s. Each crate either implements `Sensor` or exposes poll/stream functions that a caller drives. |
 | Detection | `rules`, `sigma`, `correlator`, `verdict`, `ml`, `yara`, `enrich`, `intel`, `deception` | Detection engines and the work they need. `rules` holds the stateless and stateful rules. `correlator` holds co-occurrence and Bayesian belief per process. `verdict` fuses findings per entity. `ml` does ONNX scoring. `yara` holds the budgeted file and memory scan queues. `enrich` handles hashing and signature verdicts. `deception` handles canary tripwires. |
 | Leaf | `store`, `transport`, `sinks`, `ipc`, `response`, `updater`, `config`, `tamper`, `redact`, `inventory`, `mesh`, `device-control`, `conformance` | Self-contained services. `store` holds bounded maps and the on-disk spool. `transport` holds the mTLS client and upload loops. `sinks` holds the JSONL writers. `ipc` holds the local control-channel protocol. `response` holds the kill/quarantine/escalate decisions. `updater` handles manifest verification and the release layout. `tamper` handles heartbeats, the silence monitor and integrity checks. `redact` holds pure redaction functions. |
 | Test support | `siblings` | Dev-only helper. Any crate may use it as a dev-dependency, never as a normal one. |
@@ -61,7 +61,7 @@ flowchart BT
   schema[schema]
   policy[policy] --> schema
   sensors["sensor-*"] --> schema
-  sensors -.->|own platform only| wire["sensor-*-wire"]
+  sensors -.->|own platform only| wire["sensor-linux-wire,<br/>sensor-linux-container"]
   detection["rules, sigma, correlator, verdict,<br/>ml, yara, enrich, intel, deception"] --> schema & policy
   detection --> store[store]
   detection --> detection
@@ -72,7 +72,7 @@ flowchart BT
 The rules:
 
 - `schema` depends on no workspace crate. `policy` depends only on `schema`.
-- A `sensor-*` crate depends on `schema`, plus its own platform's wire crate. For example, `sensor-linux` and `sensor-linux-uprobes` may use `sensor-linux-wire`.
+- A `sensor-*` crate depends on `schema`, plus its own platform's shared crates. For example, `sensor-linux` and `sensor-linux-uprobes` may use `sensor-linux-wire` and `sensor-linux-container`. A shared crate depends only on `schema`.
 - Detection crates may use the base tier, each other, and `store`. They may never use a sensor crate.
 - Leaf crates may use only the base tier. In particular, `transport` and `store` do not know each other, `updater` does not know `transport`, and `response` does not call the OS.
 - Only binaries may depend on anything. No crate depends on a binary.

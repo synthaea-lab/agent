@@ -14,7 +14,7 @@ tested without a kernel is pure and compiles on every OS:
 | [`proc.rs`](../../../crates/sensors/linux/userspace/src/proc.rs) | cmdline/environ/stat parsing, argv windows to tokens, comm with spaces and `)` |
 | [`btf.rs`](../../../crates/sensors/linux/userspace/src/btf.rs) | Synthetic BTF blobs, refusal of truncated or incomplete BTF, the running kernel's BTF when present |
 | [`syscall.rs`](../../../crates/sensors/linux/userspace/src/syscall.rs) | Dispatch handler ids unique and in range |
-| [`parent_image.rs`](../../../crates/sensors/linux/userspace/src/parent_image.rs), [`container.rs`](../../../crates/sensors/linux/userspace/src/container.rs), [`unit_procs.rs`](../../../crates/sensors/linux/userspace/src/unit_procs.rs) | Caches and scans over fake `/proc` and cgroup trees, injected liveness tests |
+| [`parent_image.rs`](../../../crates/sensors/linux/userspace/src/parent_image.rs), [`sensor-linux-container`](../../../crates/sensors/linux/container/src/lib.rs), [`unit_procs.rs`](../../../crates/sensors/linux/userspace/src/unit_procs.rs) | Caches and scans over fake `/proc` and cgroup trees, injected liveness tests |
 | [`dns_udp.rs`](../../../crates/sensors/linux/userspace/src/dns_udp.rs), [`tls_client_hello.rs`](../../../crates/sensors/linux/userspace/src/tls_client_hello.rs) | Wire parsers on valid, truncated and hostile input |
 | [`path_filter.rs`](../../../crates/sensors/linux/wire/src/path_filter.rs) | The filter's decision table, run as ordinary Rust |
 | audit, netlink, journal, logs, procmem, uprobes | Parsers and mappings on captured and synthetic input |
