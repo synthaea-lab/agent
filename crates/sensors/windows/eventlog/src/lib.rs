@@ -210,7 +210,7 @@ mod query;
 mod sensor;
 // The `EvtSubscribe` transport (issue #322) — enabled per-host via
 // `EventLogConfig::transport`. Gated `#[cfg(windows)]` because it binds
-// against `windows-sys`; the Linux CI leg keeps compiling `xml.rs`.
+// against `windows-sys`; the Linux CI leg keeps compiling `xml`.
 #[cfg(windows)]
 mod subscribe;
 #[cfg(windows)]

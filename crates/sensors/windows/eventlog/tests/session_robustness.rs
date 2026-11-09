@@ -8,12 +8,12 @@ use sensor_windows_eventlog::xml::{
     parse_local_session_event, parse_remote_connection_event, split_event_blocks,
 };
 
-/// The real console logon (21) from `src/xml.rs`'s unit tests (Windows 11
+/// The real console logon (21) from `src/xml/records/session.rs`'s unit tests (Windows 11
 /// 26200, 2026-10-05, computer and account renamed), with a multi-byte user
 /// name so the truncation sweep crosses char boundaries.
 const CAPTURE_21: &str = r"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-TerminalServices-LocalSessionManager' Guid='{5d896912-022d-40aa-a3a8-4fa5515c76d7}'/><EventID>21</EventID><Version>0</Version><Level>4</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x1000000000000000</Keywords><TimeCreated SystemTime='2026-10-05T11:46:09.8088735Z'/><EventRecordID>16693</EventRecordID><Correlation ActivityID='{f48050f4-5382-4583-b7f5-6c0251ba0000}'/><Execution ProcessID='2312' ThreadID='2324'/><Channel>Microsoft-Windows-TerminalServices-LocalSessionManager/Operational</Channel><Computer>SANDBOX</Computer><Security UserID='S-1-5-18'/></System><UserData><EventXML xmlns='Event_NS'><User>SANDBOX\élodie</User><SessionID>1</SessionID><Address>LOCAL</Address></EventXML></UserData></Event>";
 
-/// 1149 in its documented shape, from `src/xml.rs`'s unit tests.
+/// 1149 in its documented shape, from `src/xml/records/session.rs`'s unit tests.
 const SHAPE_1149: &str = r"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-TerminalServices-RemoteConnectionManager' Guid='{c76baa63-ae81-421c-b425-340b4b24157f}'/><EventID>1149</EventID><Version>0</Version><Level>4</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x1000000000000000</Keywords><TimeCreated SystemTime='2026-10-05T12:00:00.0000000Z'/><EventRecordID>77</EventRecordID><Correlation ActivityID='{f420c0f4-1e2f-4b29-8a3c-4f6d0e3a0000}'/><Execution ProcessID='1180' ThreadID='2044'/><Channel>Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational</Channel><Computer>SANDBOX</Computer><Security UserID='S-1-5-20'/></System><UserData><EventXML xmlns='Event_NS'><Param1>ünïcödé</Param1><Param2>LAB</Param2><Param3>198.51.100.40</Param3></EventXML></UserData></Event>";
 
 fn assert_every_truncation_is_handled(
