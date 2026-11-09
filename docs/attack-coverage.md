@@ -69,7 +69,7 @@ Generated from ATT&CK technique identifiers tagged in source (`crates/rules`, `c
 | T1562.001 | 3 | `rules:crates/rules/src/amsi.rs`, `rules:crates/rules/src/defender.rs`, `rules:crates/rules/src/securitytool.rs`, `rules:crates/rules/src/stateless.rs`, `rules:crates/rules/src/unitstop.rs`, `sigma:rules/sigma/linux/audit_collection_disabled.yml`, `sigma:rules/sigma/linux/audit_service_masked_now.yml`, `sigma:rules/sigma/windows/defender_realtime_disable.yml`, `sigma:rules/sigma/windows/security_service_start_disabled.yml` |
 | T1562.004 | 3 | `sigma:rules/sigma/windows/firewall_allprofiles_disabled.yml` |
 | T1574.006 | 3 | `rules:crates/rules/src/stateless.rs` |
-| T1620 | 3, 6 | `correlator:crates/correlator/src/rules.rs`, `rules:crates/rules/src/amsi.rs`, `rules:crates/rules/src/state.rs` |
+| T1620 | 3, 6 | `correlator:crates/correlator/src/rules.rs`, `rules:crates/rules/src/amsi.rs`, `rules:crates/rules/src/memfd_state.rs` |
 
 ## Credential Access
 

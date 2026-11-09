@@ -205,7 +205,7 @@ pub(crate) fn check_truncated_cmdline(event: &ExecEvent) -> Option<Alert> {
 }
 
 /// Evaluates all stateless rules applicable to an `ExecEvent`. T1620 memfd-exec
-/// (`RuleState::check_memfd_exec`) is not among them: it now needs
+/// (`MemfdState::check_memfd_exec`) is not among them: it now needs
 /// `MemfdCreateEvent` correlation state, see that method's doc (#497).
 #[must_use]
 pub fn evaluate_exec(event: &ExecEvent) -> Vec<Alert> {
