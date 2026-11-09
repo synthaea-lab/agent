@@ -16,6 +16,9 @@
 //! (passwords, tokens, credentials) before event emission.
 
 #[cfg(target_os = "linux")]
+mod budget;
+
+#[cfg(target_os = "linux")]
 pub mod config;
 
 #[cfg(target_os = "linux")]

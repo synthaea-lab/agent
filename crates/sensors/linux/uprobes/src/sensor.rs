@@ -7,7 +7,6 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
 };
 
 use aya::{
@@ -22,6 +21,7 @@ use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use crate::{
+    budget::SlidingBudget,
     config::{TlsConfig, UprobesConfig},
     normalize,
     symbol_resolver::{self, SymbolInfo},
@@ -34,143 +34,6 @@ fn err(msg: String) -> SensorError {
 /// See `sensor_linux_wire::boot_epoch_offset_ns` — computed once at startup.
 fn boot_epoch_offset_ns() -> u64 {
     sensor_linux_wire::boot_epoch_offset_ns()
-}
-
-/// Per-process budget tracking for TLS capture (sliding window).
-struct TlsBudgetTracker {
-    /// Budget: bytes per process per second.
-    bytes_per_sec: u32,
-    /// Sliding window: `(pid, timestamp, bytes_captured)`.
-    windows: HashMap<u32, Vec<(Instant, u32)>>,
-    /// Cleanup interval (remove old entries every N checks).
-    cleanup_counter: u32,
-}
-
-impl TlsBudgetTracker {
-    fn new(bytes_per_sec: u32) -> Self {
-        Self {
-            bytes_per_sec,
-            windows: HashMap::new(),
-            cleanup_counter: 0,
-        }
-    }
-
-    /// Check if pid can capture `bytes` without exceeding budget.
-    /// Returns true if allowed, false if budget exceeded.
-    fn check_and_record(&mut self, pid: u32, bytes: u32) -> bool {
-        self.check_and_record_at(pid, bytes, Instant::now())
-    }
-
-    fn check_and_record_at(&mut self, pid: u32, bytes: u32, now: Instant) -> bool {
-        let window = Duration::from_secs(1);
-
-        let entries = self.windows.entry(pid).or_default();
-        entries.retain(|(ts, _)| now.duration_since(*ts) < window);
-        let bytes_in_window: u32 = entries.iter().map(|(_, b)| b).sum();
-
-        if bytes_in_window + bytes > self.bytes_per_sec {
-            return false;
-        }
-
-        entries.push((now, bytes));
-
-        self.cleanup_counter += 1;
-        if self.cleanup_counter >= 100 {
-            self.cleanup_counter = 0;
-            self.windows.retain(|_, entries| !entries.is_empty());
-        }
-
-        true
-    }
-}
-
-/// Per-process budget tracking for readline capture (sliding window).
-struct ReadlineBudgetTracker {
-    /// Budget: commands per process per second.
-    commands_per_sec: u32,
-    /// Sliding window: (pid, timestamps).
-    windows: HashMap<u32, Vec<Instant>>,
-    /// Cleanup interval.
-    cleanup_counter: u32,
-}
-
-impl ReadlineBudgetTracker {
-    fn new(commands_per_sec: u32) -> Self {
-        Self {
-            commands_per_sec,
-            windows: HashMap::new(),
-            cleanup_counter: 0,
-        }
-    }
-
-    /// Check if pid can capture one more command without exceeding budget.
-    fn check_and_record(&mut self, pid: u32) -> bool {
-        self.check_and_record_at(pid, Instant::now())
-    }
-
-    fn check_and_record_at(&mut self, pid: u32, now: Instant) -> bool {
-        let window = Duration::from_secs(1);
-
-        let entries = self.windows.entry(pid).or_default();
-        entries.retain(|ts| now.duration_since(*ts) < window);
-
-        if entries.len() >= self.commands_per_sec as usize {
-            return false;
-        }
-
-        entries.push(now);
-
-        self.cleanup_counter += 1;
-        if self.cleanup_counter >= 100 {
-            self.cleanup_counter = 0;
-            self.windows.retain(|_, entries| !entries.is_empty());
-        }
-
-        true
-    }
-}
-
-/// Per-process budget tracking for DNS capture (sliding window). Same shape as
-/// [`ReadlineBudgetTracker`] — one query "unit" per event, not bytes.
-struct DnsBudgetTracker {
-    queries_per_sec: u32,
-    windows: HashMap<u32, Vec<Instant>>,
-    cleanup_counter: u32,
-}
-
-impl DnsBudgetTracker {
-    fn new(queries_per_sec: u32) -> Self {
-        Self {
-            queries_per_sec,
-            windows: HashMap::new(),
-            cleanup_counter: 0,
-        }
-    }
-
-    fn check_and_record(&mut self, pid: u32) -> bool {
-        self.check_and_record_at(pid, Instant::now())
-    }
-
-    fn check_and_record_at(&mut self, pid: u32, now: Instant) -> bool {
-        let window = Duration::from_secs(1);
-
-        let entries = self.windows.entry(pid).or_default();
-        entries.retain(|ts| now.duration_since(*ts) < window);
-
-        if entries.len() >= self.queries_per_sec as usize {
-            return false;
-        }
-
-        entries.push(now);
-
-        self.cleanup_counter += 1;
-        if self.cleanup_counter >= 100 {
-            self.cleanup_counter = 0;
-            self.windows.retain(|_, entries| !entries.is_empty());
-        }
-
-        true
-    }
 }
 
 /// Loads the embedded eBPF object from the main sensor-linux-ebpf crate.
@@ -323,8 +186,7 @@ macro_rules! drain_tls {
                     }
                 }
 
-                // Budget enforcement: check if pid hasn't exceeded bytes/sec budget
-                if !$budget.check_and_record(event.meta.pid, event.bytes_len) {
+                if !$budget.try_spend(event.meta.pid, event.bytes_len) {
                     debug!(
                         pid = event.meta.pid,
                         bytes = event.bytes_len,
@@ -375,8 +237,7 @@ macro_rules! drain_readline {
                     }
                 }
 
-                // Budget enforcement: check if pid hasn't exceeded commands/sec budget
-                if !$budget.check_and_record(event.meta.pid) {
+                if !$budget.try_spend(event.meta.pid, 1) {
                     debug!(
                         pid = event.meta.pid,
                         "sensor-linux-uprobes: readline dropped (budget)"
@@ -421,7 +282,7 @@ macro_rules! drain_dns {
                     }
                 }
 
-                if !$budget.check_and_record(event.meta.pid) {
+                if !$budget.try_spend(event.meta.pid, 1) {
                     debug!(
                         pid = event.meta.pid,
                         "sensor-linux-uprobes: DNS query dropped (budget)"
@@ -636,11 +497,10 @@ impl UprobesSensor {
         let mut ebpf = load_ebpf()?;
         let offset = boot_epoch_offset_ns();
 
-        // Initialize budget trackers
-        let mut tls_budget = TlsBudgetTracker::new(self.config.tls.bytes_per_process_per_sec);
+        let mut tls_budget = SlidingBudget::per_second(self.config.tls.bytes_per_process_per_sec);
         let mut readline_budget =
-            ReadlineBudgetTracker::new(self.config.readline.commands_per_process_per_sec);
-        let mut dns_budget = DnsBudgetTracker::new(self.config.dns.queries_per_process_per_sec);
+            SlidingBudget::per_second(self.config.readline.commands_per_process_per_sec);
+        let mut dns_budget = SlidingBudget::per_second(self.config.dns.queries_per_process_per_sec);
         let mut tls_dropped = 0u64;
         let mut readline_dropped = 0u64;
         let mut dns_dropped = 0u64;
@@ -800,130 +660,5 @@ impl Sensor for UprobesSensor {
 
     fn stop(&mut self) {
         self.stop.notify_one();
-    }
-}
-
-#[cfg(test)]
-mod budget_tests {
-    use super::*;
-
-    const PID: u32 = 42;
-    const OTHER_PID: u32 = 7;
-
-    fn after(start: Instant, millis: u64) -> Instant {
-        start + Duration::from_millis(millis)
-    }
-
-    #[test]
-    fn tls_admits_bytes_up_to_the_budget_and_denies_the_overflow() {
-        let start = Instant::now();
-        let mut budget = TlsBudgetTracker::new(100);
-        assert!(budget.check_and_record_at(PID, 60, start));
-        assert!(budget.check_and_record_at(PID, 40, after(start, 1)));
-        assert!(!budget.check_and_record_at(PID, 1, after(start, 2)));
-    }
-
-    #[test]
-    fn tls_denied_capture_does_not_consume_budget() {
-        let start = Instant::now();
-        let mut budget = TlsBudgetTracker::new(100);
-        assert!(budget.check_and_record_at(PID, 60, start));
-        assert!(!budget.check_and_record_at(PID, 50, after(start, 1)));
-        assert!(budget.check_and_record_at(PID, 40, after(start, 2)));
-    }
-
-    #[test]
-    fn tls_capture_larger_than_the_whole_budget_is_denied() {
-        let mut budget = TlsBudgetTracker::new(100);
-        assert!(!budget.check_and_record_at(PID, 101, Instant::now()));
-    }
-
-    #[test]
-    fn tls_bytes_leave_the_window_exactly_one_second_after_capture() {
-        let start = Instant::now();
-        let mut budget = TlsBudgetTracker::new(100);
-        assert!(budget.check_and_record_at(PID, 100, start));
-        assert!(!budget.check_and_record_at(PID, 1, after(start, 999)));
-        assert!(budget.check_and_record_at(PID, 100, after(start, 1000)));
-    }
-
-    #[test]
-    fn tls_window_slides_per_capture_instead_of_resetting() {
-        let start = Instant::now();
-        let mut budget = TlsBudgetTracker::new(100);
-        assert!(budget.check_and_record_at(PID, 50, start));
-        assert!(budget.check_and_record_at(PID, 50, after(start, 500)));
-        assert!(budget.check_and_record_at(PID, 50, after(start, 1000)));
-        assert!(!budget.check_and_record_at(PID, 1, after(start, 1499)));
-    }
-
-    #[test]
-    fn tls_budget_is_tracked_per_pid() {
-        let start = Instant::now();
-        let mut budget = TlsBudgetTracker::new(100);
-        assert!(budget.check_and_record_at(PID, 100, start));
-        assert!(budget.check_and_record_at(OTHER_PID, 100, start));
-        assert!(!budget.check_and_record_at(PID, 1, start));
-    }
-
-    #[test]
-    fn tls_zero_byte_capture_is_admitted_even_on_an_exhausted_budget() {
-        let start = Instant::now();
-        let mut budget = TlsBudgetTracker::new(100);
-        assert!(budget.check_and_record_at(PID, 100, start));
-        assert!(budget.check_and_record_at(PID, 0, start));
-    }
-
-    #[test]
-    fn readline_admits_commands_up_to_the_budget_and_denies_the_next() {
-        let start = Instant::now();
-        let mut budget = ReadlineBudgetTracker::new(3);
-        for millis in 0..3 {
-            assert!(budget.check_and_record_at(PID, after(start, millis)));
-        }
-        assert!(!budget.check_and_record_at(PID, after(start, 3)));
-        assert!(budget.check_and_record_at(OTHER_PID, after(start, 3)));
-    }
-
-    #[test]
-    fn readline_command_leaves_the_window_exactly_one_second_after_capture() {
-        let start = Instant::now();
-        let mut budget = ReadlineBudgetTracker::new(1);
-        assert!(budget.check_and_record_at(PID, start));
-        assert!(!budget.check_and_record_at(PID, after(start, 999)));
-        assert!(budget.check_and_record_at(PID, after(start, 1000)));
-    }
-
-    #[test]
-    fn readline_zero_budget_denies_every_command() {
-        let mut budget = ReadlineBudgetTracker::new(0);
-        assert!(!budget.check_and_record_at(PID, Instant::now()));
-    }
-
-    #[test]
-    fn dns_admits_queries_up_to_the_budget_and_denies_the_next() {
-        let start = Instant::now();
-        let mut budget = DnsBudgetTracker::new(2);
-        assert!(budget.check_and_record_at(PID, start));
-        assert!(budget.check_and_record_at(PID, after(start, 1)));
-        assert!(!budget.check_and_record_at(PID, after(start, 2)));
-        assert!(budget.check_and_record_at(OTHER_PID, after(start, 2)));
-    }
-
-    #[test]
-    fn dns_window_slides_per_query_instead_of_resetting() {
-        let start = Instant::now();
-        let mut budget = DnsBudgetTracker::new(2);
-        assert!(budget.check_and_record_at(PID, start));
-        assert!(budget.check_and_record_at(PID, after(start, 500)));
-        assert!(budget.check_and_record_at(PID, after(start, 1000)));
-        assert!(!budget.check_and_record_at(PID, after(start, 1499)));
-        assert!(budget.check_and_record_at(PID, after(start, 1500)));
-    }
-
-    #[test]
-    fn dns_zero_budget_denies_every_query() {
-        let mut budget = DnsBudgetTracker::new(0);
-        assert!(!budget.check_and_record_at(PID, Instant::now()));
     }
 }
