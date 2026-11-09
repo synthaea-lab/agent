@@ -1,6 +1,6 @@
 [package]
 name = "enrich"
-version = "0.1.0"
+version.workspace = true
 description = "Cross-platform enrichment: SHA-256 hashing (cached), code-signature verification"
 license.workspace = true
 edition.workspace = true

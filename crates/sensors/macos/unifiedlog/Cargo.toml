@@ -1,6 +1,6 @@
 [package]
 name = "sensor-macos-unifiedlog"
-version = "0.1.0"
+version.workspace = true
 description = "macOS unified log telemetry (OSLog predicates)"
 license.workspace = true
 edition.workspace = true

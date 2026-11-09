@@ -1,6 +1,6 @@
 [package]
 name = "deception"
-version = "0.1.0"
+version.workspace = true
 description = "Deception: per-host canary files, credentials, and tripwires with near-zero-FP detections"
 license.workspace = true
 edition.workspace = true

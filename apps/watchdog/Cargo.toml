@@ -1,6 +1,6 @@
 [package]
 name = "watchdog"
-version = "0.1.0"
+version.workspace = true
 description = "Watchdog: installs and supervises the agent as a system service (systemd / Windows SCM / launchd)"
 license.workspace = true
 edition.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "sensor-linux"
-version = "0.1.0"
+version.workspace = true
 description = "Linux sensor: loads the eBPF probes, drains ring buffers, normalizes into schema events"
 license.workspace = true
 edition.workspace = true

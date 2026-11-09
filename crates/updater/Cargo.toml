@@ -1,6 +1,6 @@
 [package]
 name = "updater"
-version = "0.1.0"
+version.workspace = true
 description = "Agent self-update and content/model distribution client"
 license.workspace = true
 edition.workspace = true

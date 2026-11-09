@@ -1,6 +1,6 @@
 [package]
 name = "sensor-windows-sockets"
-version = "0.1.0"
+version.workspace = true
 description = "Windows socket-table snapshots (GetExtendedTcpTable, GetExtendedUdpTable): listening ports + baseline"
 license.workspace = true
 edition.workspace = true

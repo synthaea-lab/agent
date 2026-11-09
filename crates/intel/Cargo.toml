@@ -1,6 +1,6 @@
 [package]
 name = "intel"
-version = "0.1.0"
+version.workspace = true
 description = "IOC matching engine: hashes, IPs, domains from distributed indicator sets"
 license.workspace = true
 edition.workspace = true

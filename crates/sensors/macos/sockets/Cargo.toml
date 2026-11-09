@@ -1,6 +1,6 @@
 [package]
 name = "sensor-macos-sockets"
-version = "0.1.0"
+version.workspace = true
 description = "macOS socket-table snapshots (libproc): listening ports + baseline, no entitlement"
 license.workspace = true
 edition.workspace = true

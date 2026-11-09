@@ -1,6 +1,6 @@
 [package]
 name = "response"
-version = "0.1.0"
+version.workspace = true
 description = "Response actions: kill, quarantine, isolate"
 license.workspace = true
 edition.workspace = true

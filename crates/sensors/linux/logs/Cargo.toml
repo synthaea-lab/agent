@@ -1,6 +1,6 @@
 [package]
 name = "sensor-linux-logs"
-version = "0.1.0"
+version.workspace = true
 description = "Linux service-log parsing: web access logs and MySQL/MariaDB failed logins (ADR-0022)"
 license.workspace = true
 edition.workspace = true

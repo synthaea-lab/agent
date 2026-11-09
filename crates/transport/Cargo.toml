@@ -1,6 +1,6 @@
 [package]
 name = "transport"
-version = "0.1.0"
+version.workspace = true
 description = "Agent to control-plane communication"
 license.workspace = true
 edition.workspace = true
