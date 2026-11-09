@@ -1469,6 +1469,7 @@ impl EventSink for DetectionSink {
             Event::Signal(e) => self.detect_signal(&event, e),
             Event::FileQuarantine(e) => self.detect_file_quarantine(e),
             Event::BitsJob(e) => self.detect_bits_job(e),
+            Event::FileSetxattr(e) => self.rule_state.lock_recovering().on_file_setxattr(e),
             Event::FileRename(e) => self.detect_file_rename(&event, e),
             Event::FileSetTime(e) => {
                 // Bound first: `record_rule_alerts` takes the lock again.

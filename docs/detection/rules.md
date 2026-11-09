@@ -26,7 +26,7 @@ crate-internal; they are re-exported under `#[cfg(test)]` only, for the tests un
 | `evaluate_file_open`, `evaluate_file_delete`, `evaluate_file_set_time`, `evaluate_raw_volume_open` | file events | stateless |
 | `evaluate_connect`, `evaluate_signal`, `evaluate_log_cleared`, `evaluate_kerberos_delegation_failure` | as named | stateless |
 | [`evaluate_amsi_content`](../../crates/rules/src/amsi.rs), [`evaluate_defender_event`](../../crates/rules/src/defender.rs), [`evaluate_ldap_search`](../../crates/rules/src/ldap.rs), [`evaluate_ntlm_auth`](../../crates/rules/src/ntlm.rs), [`evaluate_package_change`](../../crates/rules/src/inventory.rs) | Windows/inventory events | stateless |
-| `RuleState::on_exec`, `on_connect`, `on_network_flow`, `on_dns_query`, `on_listen_port`, `on_file_open`, `on_file_delete`, `on_file_rename`, `on_file_write`, `on_file_set_time`, `on_memfd_create`, `on_auth`, `on_session`, `on_policy_denial`, `on_ldap_search`, `on_process_access`, `on_remote_thread`, `on_file_quarantine`, `on_bits_job`, `on_unit_stop`, `on_identity_change` | as named | stateful |
+| `RuleState::on_exec`, `on_connect`, `on_network_flow`, `on_dns_query`, `on_listen_port`, `on_file_open`, `on_file_delete`, `on_file_rename`, `on_file_write`, `on_file_set_time`, `on_memfd_create`, `on_auth`, `on_session`, `on_policy_denial`, `on_ldap_search`, `on_process_access`, `on_remote_thread`, `on_file_quarantine`, `on_file_setxattr`, `on_bits_job`, `on_unit_stop`, `on_identity_change` | as named | stateful |
 | `RuleState::on_exec_signature_gated` | `ExecEvent` | stateful, waits for the signature |
 | `RuleState::take_due_unit_stops`, `take_due_identity_alerts` | none (clock-driven) | deferred findings |
 
@@ -265,6 +265,7 @@ verification and window calibration are tracked in
 | Parent not in the cache and gone from `/proc` | parent-name rules cannot fire for that exec |
 | Linux `comm` truncated to 15 bytes | T1105 compares `comm` to the downloaded file's basename, so a longer name does not match |
 | A downloaded script run through an interpreter | image is the interpreter; T1204.002 and T1105 do not join |
+| Linux download mark (T1204.002) | `on_file_setxattr` maps a `user.xdg.origin.url` set to a `FileQuarantine` mark and the macOS/Windows join runs unchanged. The sensor sends the xattr name, not its value, so the finding says `origin: unrecorded`, and `marked by` is the writer's `comm`. `fsetxattr`/`lsetxattr` are not hooked, so a browser using them leaves no mark. `cp -a`, `rsync -X` and restores copy the xattr and re-mark a file. Unit-tested only; no real Linux capture |
 | Events out of order across sensor threads | windows tolerate it; deferred findings wait for the clock |
 | No generation stamp (macOS) | pid-only behaviour, recycled pids possible |
 

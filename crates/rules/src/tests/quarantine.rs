@@ -300,3 +300,100 @@ fn a_valid_signature_of_a_file_that_is_not_the_image_that_ran_does_not_silence_t
     assert_eq!(alert.technique, "T1204.002");
     assert!(alert.message.contains("not verified"), "{}", alert.message);
 }
+
+// Linux producer (#17): a `user.xdg.origin.url` setxattr is the mark.
+
+const LINUX_DOWNLOAD: &str = "/home/u/Downloads/tool";
+
+fn setxattr(path: &str, name: &str, timestamp_ns: u64) -> schema::FileSetxattrEvent {
+    schema::FileSetxattrEvent {
+        meta: schema::EventMeta {
+            timestamp_ns,
+            comm: "firefox".into(),
+            ..meta()
+        },
+        path: path.into(),
+        name: name.into(),
+    }
+}
+
+fn linux_run(image_path: &str, timestamp_ns: u64) -> ExecEvent {
+    ExecEvent {
+        meta: schema::EventMeta {
+            pid: 4242,
+            timestamp_ns,
+            comm: "tool".into(),
+            ..meta()
+        },
+        image_path: image_path.into(),
+        ..schema::fixtures::exec()
+    }
+}
+
+/// Linux has no code-signing verdict: the gate resolves to "not verified".
+const LINUX_UNSUPPORTED: ImageSignature = ImageSignature {
+    verdict: Some(Signature::Unsupported),
+    chain_verified: false,
+};
+
+#[test]
+fn browser_origin_xattr_then_exec_alerts_t1204_002() {
+    let mut state = RuleState::new();
+    state.on_file_setxattr(&setxattr(LINUX_DOWNLOAD, "user.xdg.origin.url", 0));
+    let alerts = exec_with(
+        &mut state,
+        &linux_run(LINUX_DOWNLOAD, 30_000_000_000),
+        LINUX_UNSUPPORTED,
+    );
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].technique, "T1204.002");
+    assert!(alerts[0].message.contains("marked by firefox"));
+    assert!(alerts[0].message.contains("origin: unrecorded"));
+    assert!(alerts[0].message.ends_with("[signature not verified]"));
+}
+
+#[test]
+fn other_xattrs_do_not_mark_a_file() {
+    for name in [
+        "security.capability",
+        "user.xdg.referrer.url",
+        "user.comment",
+        "security.selinux",
+    ] {
+        let mut state = RuleState::new();
+        state.on_file_setxattr(&setxattr(LINUX_DOWNLOAD, name, 0));
+        assert!(
+            exec_with(&mut state, &linux_run(LINUX_DOWNLOAD, 1), LINUX_UNSUPPORTED).is_empty(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn origin_xattr_exec_of_another_file_or_past_the_window_stays_silent() {
+    let mut state = RuleState::new();
+    state.on_file_setxattr(&setxattr(LINUX_DOWNLOAD, "user.xdg.origin.url", 0));
+    assert!(exec_with(&mut state, &linux_run("/usr/bin/ls", 1), LINUX_UNSUPPORTED).is_empty());
+    assert!(
+        exec_with(
+            &mut state,
+            &linux_run(LINUX_DOWNLOAD, QUARANTINE_EXEC_WINDOW_NS + 1),
+            LINUX_UNSUPPORTED
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn origin_xattr_mapping_is_a_file_quarantine_event() {
+    let mapped = crate::download_state::quarantine_from_setxattr(&setxattr(
+        LINUX_DOWNLOAD,
+        "user.xdg.origin.url",
+        7,
+    ))
+    .expect("the origin xattr is the mark");
+    assert_eq!(mapped.path, LINUX_DOWNLOAD);
+    assert_eq!(mapped.agent.as_deref(), Some("firefox"));
+    assert_eq!(mapped.meta.timestamp_ns, 7);
+    assert!(mapped.origin_url.is_none() && mapped.referrer_url.is_none());
+}

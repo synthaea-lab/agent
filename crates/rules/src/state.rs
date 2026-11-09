@@ -1006,6 +1006,14 @@ impl RuleState {
         self.downloads.on_file_quarantine(event);
     }
 
+    /// To be called for every `FileSetxattrEvent` in the stream (Linux). A
+    /// `user.xdg.origin.url` set is the Linux download-provenance mark: it is recorded
+    /// as a `FileQuarantine` mark for `check_quarantined_exec` (T1204.002). No alert
+    /// on its own; other xattr names are ignored here.
+    pub fn on_file_setxattr(&mut self, event: &schema::FileSetxattrEvent) {
+        self.downloads.on_file_setxattr(event);
+    }
+
     /// To be called for every `BitsJobEvent` in the stream: records the job's
     /// file for the T1197 download→exec join
     /// ([`DownloadState::check_bits_download_exec`]). No alert on its own: BITS is

@@ -5,7 +5,7 @@
 
 use schema::{
     BitsJobEvent, BitsJobState, ExecEvent, FileDeleteEvent, FileOpenEvent, FileQuarantineEvent,
-    FileRenameEvent, User, detection::Severity,
+    FileRenameEvent, FileSetxattrEvent, User, detection::Severity,
 };
 use store::BoundedMap;
 
@@ -34,6 +34,11 @@ struct RecentWrite {
 const USER_EXECUTION_TECHNIQUE: &str = "T1204.002";
 const MAIL_ATTACHMENT_TECHNIQUE: &str = "T1566.001/T1204.002";
 
+/// The freedesktop.org "Common extended attributes" xattr holding a downloaded file's URL.
+/// `wget` and `curl --xattr` set it; which browsers do is not verified (no Linux capture).
+/// The Linux download-provenance mark (<https://github.com/synthaea-lab/agent/issues/17>).
+pub(crate) const XDG_ORIGIN_URL_XATTR: &str = "user.xdg.origin.url";
+
 /// A download-provenance mark, as [`crate::RuleState::on_file_quarantine`] saw it.
 struct RecentQuarantine {
     timestamp_ns: u64,
@@ -41,6 +46,20 @@ struct RecentQuarantine {
     origin_url: Option<String>,
     /// Set by the first exec that alerted: one alert per mark, not per run.
     alerted: bool,
+}
+
+/// The [`FileQuarantineEvent`] a `setxattr` of [`XDG_ORIGIN_URL_XATTR`] stands for,
+/// `None` for any other xattr. The sensor reports the attribute's name, not its value
+/// (see [`FileSetxattrEvent`]): `origin_url` and `referrer_url` stay `None` ("unrecorded"
+/// in the finding) and `agent` is the writing process's `comm`, the browser.
+pub(crate) fn quarantine_from_setxattr(event: &FileSetxattrEvent) -> Option<FileQuarantineEvent> {
+    (event.name == XDG_ORIGIN_URL_XATTR).then(|| FileQuarantineEvent {
+        meta: event.meta.clone(),
+        path: event.path.clone(),
+        agent: Some(event.meta.comm.clone()),
+        origin_url: None,
+        referrer_url: None,
+    })
 }
 
 /// A file a BITS job downloads, as [`crate::RuleState::on_bits_job`] saw it.
@@ -273,6 +292,16 @@ impl DownloadState {
                 alerted: false,
             },
         );
+    }
+
+    /// Linux producer of the same mark: a `setxattr` of [`XDG_ORIGIN_URL_XATTR`] is
+    /// mapped to a [`FileQuarantineEvent`] and recorded like any other, so
+    /// [`Self::check_quarantined_exec`] joins it unchanged. Any other xattr name is
+    /// ignored. See [`quarantine_from_setxattr`] for what the mark carries.
+    pub(crate) fn on_file_setxattr(&mut self, event: &FileSetxattrEvent) {
+        if let Some(mark) = quarantine_from_setxattr(event) {
+            self.on_file_quarantine(&mark);
+        }
     }
 
     /// Arms, re-arms or drops the path of a BITS job's file for
