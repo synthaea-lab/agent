@@ -58,7 +58,10 @@ impl TlsBudgetTracker {
     /// Check if pid can capture `bytes` without exceeding budget.
     /// Returns true if allowed, false if budget exceeded.
     fn check_and_record(&mut self, pid: u32, bytes: u32) -> bool {
-        let now = Instant::now();
+        self.check_and_record_at(pid, bytes, Instant::now())
+    }
+
+    fn check_and_record_at(&mut self, pid: u32, bytes: u32, now: Instant) -> bool {
         let window = Duration::from_secs(1);
 
         let entries = self.windows.entry(pid).or_default();
@@ -102,7 +105,10 @@ impl ReadlineBudgetTracker {
 
     /// Check if pid can capture one more command without exceeding budget.
     fn check_and_record(&mut self, pid: u32) -> bool {
-        let now = Instant::now();
+        self.check_and_record_at(pid, Instant::now())
+    }
+
+    fn check_and_record_at(&mut self, pid: u32, now: Instant) -> bool {
         let window = Duration::from_secs(1);
 
         let entries = self.windows.entry(pid).or_default();
@@ -142,7 +148,10 @@ impl DnsBudgetTracker {
     }
 
     fn check_and_record(&mut self, pid: u32) -> bool {
-        let now = Instant::now();
+        self.check_and_record_at(pid, Instant::now())
+    }
+
+    fn check_and_record_at(&mut self, pid: u32, now: Instant) -> bool {
         let window = Duration::from_secs(1);
 
         let entries = self.windows.entry(pid).or_default();
@@ -791,5 +800,130 @@ impl Sensor for UprobesSensor {
 
     fn stop(&mut self) {
         self.stop.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    const PID: u32 = 42;
+    const OTHER_PID: u32 = 7;
+
+    fn after(start: Instant, millis: u64) -> Instant {
+        start + Duration::from_millis(millis)
+    }
+
+    #[test]
+    fn tls_admits_bytes_up_to_the_budget_and_denies_the_overflow() {
+        let start = Instant::now();
+        let mut budget = TlsBudgetTracker::new(100);
+        assert!(budget.check_and_record_at(PID, 60, start));
+        assert!(budget.check_and_record_at(PID, 40, after(start, 1)));
+        assert!(!budget.check_and_record_at(PID, 1, after(start, 2)));
+    }
+
+    #[test]
+    fn tls_denied_capture_does_not_consume_budget() {
+        let start = Instant::now();
+        let mut budget = TlsBudgetTracker::new(100);
+        assert!(budget.check_and_record_at(PID, 60, start));
+        assert!(!budget.check_and_record_at(PID, 50, after(start, 1)));
+        assert!(budget.check_and_record_at(PID, 40, after(start, 2)));
+    }
+
+    #[test]
+    fn tls_capture_larger_than_the_whole_budget_is_denied() {
+        let mut budget = TlsBudgetTracker::new(100);
+        assert!(!budget.check_and_record_at(PID, 101, Instant::now()));
+    }
+
+    #[test]
+    fn tls_bytes_leave_the_window_exactly_one_second_after_capture() {
+        let start = Instant::now();
+        let mut budget = TlsBudgetTracker::new(100);
+        assert!(budget.check_and_record_at(PID, 100, start));
+        assert!(!budget.check_and_record_at(PID, 1, after(start, 999)));
+        assert!(budget.check_and_record_at(PID, 100, after(start, 1000)));
+    }
+
+    #[test]
+    fn tls_window_slides_per_capture_instead_of_resetting() {
+        let start = Instant::now();
+        let mut budget = TlsBudgetTracker::new(100);
+        assert!(budget.check_and_record_at(PID, 50, start));
+        assert!(budget.check_and_record_at(PID, 50, after(start, 500)));
+        assert!(budget.check_and_record_at(PID, 50, after(start, 1000)));
+        assert!(!budget.check_and_record_at(PID, 1, after(start, 1499)));
+    }
+
+    #[test]
+    fn tls_budget_is_tracked_per_pid() {
+        let start = Instant::now();
+        let mut budget = TlsBudgetTracker::new(100);
+        assert!(budget.check_and_record_at(PID, 100, start));
+        assert!(budget.check_and_record_at(OTHER_PID, 100, start));
+        assert!(!budget.check_and_record_at(PID, 1, start));
+    }
+
+    #[test]
+    fn tls_zero_byte_capture_is_admitted_even_on_an_exhausted_budget() {
+        let start = Instant::now();
+        let mut budget = TlsBudgetTracker::new(100);
+        assert!(budget.check_and_record_at(PID, 100, start));
+        assert!(budget.check_and_record_at(PID, 0, start));
+    }
+
+    #[test]
+    fn readline_admits_commands_up_to_the_budget_and_denies_the_next() {
+        let start = Instant::now();
+        let mut budget = ReadlineBudgetTracker::new(3);
+        for millis in 0..3 {
+            assert!(budget.check_and_record_at(PID, after(start, millis)));
+        }
+        assert!(!budget.check_and_record_at(PID, after(start, 3)));
+        assert!(budget.check_and_record_at(OTHER_PID, after(start, 3)));
+    }
+
+    #[test]
+    fn readline_command_leaves_the_window_exactly_one_second_after_capture() {
+        let start = Instant::now();
+        let mut budget = ReadlineBudgetTracker::new(1);
+        assert!(budget.check_and_record_at(PID, start));
+        assert!(!budget.check_and_record_at(PID, after(start, 999)));
+        assert!(budget.check_and_record_at(PID, after(start, 1000)));
+    }
+
+    #[test]
+    fn readline_zero_budget_denies_every_command() {
+        let mut budget = ReadlineBudgetTracker::new(0);
+        assert!(!budget.check_and_record_at(PID, Instant::now()));
+    }
+
+    #[test]
+    fn dns_admits_queries_up_to_the_budget_and_denies_the_next() {
+        let start = Instant::now();
+        let mut budget = DnsBudgetTracker::new(2);
+        assert!(budget.check_and_record_at(PID, start));
+        assert!(budget.check_and_record_at(PID, after(start, 1)));
+        assert!(!budget.check_and_record_at(PID, after(start, 2)));
+        assert!(budget.check_and_record_at(OTHER_PID, after(start, 2)));
+    }
+
+    #[test]
+    fn dns_window_slides_per_query_instead_of_resetting() {
+        let start = Instant::now();
+        let mut budget = DnsBudgetTracker::new(2);
+        assert!(budget.check_and_record_at(PID, start));
+        assert!(budget.check_and_record_at(PID, after(start, 500)));
+        assert!(budget.check_and_record_at(PID, after(start, 1000)));
+        assert!(!budget.check_and_record_at(PID, after(start, 1499)));
+        assert!(budget.check_and_record_at(PID, after(start, 1500)));
+    }
+
+    #[test]
+    fn dns_zero_budget_denies_every_query() {
+        let mut budget = DnsBudgetTracker::new(0);
+        assert!(!budget.check_and_record_at(PID, Instant::now()));
     }
 }
