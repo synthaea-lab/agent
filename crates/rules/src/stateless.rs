@@ -1513,7 +1513,7 @@ const SERVICE_OUTBOUND_STANDARD_PORTS: &[u16] = &[
 
 /// T1071 — Application Layer Protocol: a web or database service process
 /// connecting outbound to a port outside its routine set (issue #478, Level
-/// 1). Unlike `RuleState::check_beacon` (repeated connections, a threshold +
+/// 1). Unlike `NetworkState::check_beacon` (repeated connections, a threshold +
 /// window), this fires on a *single* connection: these specific service
 /// accounts have such a narrow legitimate outbound footprint that even one
 /// connection outside it is a strong post-exploitation signal — a reverse

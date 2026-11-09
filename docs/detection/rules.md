@@ -76,7 +76,10 @@ The sink binds the alerts to a local first, then records them.
 
 [`RuleState`](../../crates/rules/src/state.rs) is one struct with one field per stateful
 concern. Each field is a [`store::BoundedMap`](../../crates/store/src/bounded.rs) or a small
-dedicated type. The struct's field docs say which rule reads each table. The main families:
+dedicated type. The struct's field docs say which rule reads each table. A family that has been
+split out keeps its tables in its own type, held by `RuleState` as one field: the network rules
+(`beacon`, `beacon_flow_dedup`, `scan_*`, `egress_*`, `dns_class`, `archive_*`, `staged_archives`)
+live in [`NetworkState`](../../crates/rules/src/network_state.rs). The main families:
 
 | Family | Fields (examples) | Key | Feeds |
 | --- | --- | --- | --- |

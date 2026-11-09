@@ -22,6 +22,7 @@ mod ld_trust;
 mod ldap;
 mod logon;
 mod lsass;
+mod network_state;
 mod ntlm;
 mod osascript;
 mod privesc;
